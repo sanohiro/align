@@ -3,8 +3,8 @@ use crate::validate_hir::{body_core_metadata_is_valid, body_ty_mangle};
 use align_sema::{
     AggregateArrayElem, ArrayBuilderElem, FloatTy, FnEffect, IntTy, Layout, PrimScalar, Scalar, Ty,
     hir::{
-        self, EnumDef, EnumVariant, FieldDef, FnTy, ImportedFn, ReturnBorrowSummary,
-        ReturnRegionSummary, StructDef, TaggedType, TupleDef,
+        self, EnumDef, EnumVariant, FieldDef, FnTy, ImportedFn, ResourceDef,
+        ReturnBorrowSummary, ReturnRegionSummary, StructDef, TaggedType, TupleDef,
     },
 };
 use align_diag::Diagnostics;
@@ -12343,11 +12343,23 @@ fn hir_body_validator_statement_inventory() {
 
 #[test]
 fn hir_body_type_mangle_golden_vectors() {
-    let program = baseline_program();
+    let mut program = baseline_program();
+    program.resources.push(ResourceDef {
+        name: "pkg.db$rows$Row".to_string(),
+        source_name: "pkg.db$rows$Row".to_string(),
+        declaring_module: "pkg.db".to_string(),
+        generic_arity: 1,
+        drop_hook: "pkg.db.internal.resource$drop_rows".to_string(),
+        drop_thunk: "__align_resource_drop$pkg.db$rows".to_string(),
+        representation_version: 1,
+        drop_abi_fingerprint: [0; 16],
+    });
     let vectors = [
         (Ty::Int(IntTy { bits: 64, signed: true }), "i64"),
         (Ty::Struct(0), "S6_Record"),
         (Ty::Enum(0), "E6_Choice"),
+        (Ty::Resource(0), "W15_pkg_db_rows_Row"),
+        (Ty::ResourceRef(0), "J_W15_pkg_db_rows_Row"),
         (Ty::Tagged(0), "O_i64"),
         (Ty::Option(scalar_int(64)), "O_i64"),
         (Ty::Result(scalar_int(64), Scalar::Enum(0)), "R_i64_E6_Choice"),
@@ -12387,6 +12399,161 @@ fn hir_body_type_mangle_golden_vectors() {
         body_ty_mangle(Ty::Fn(0), &provenance_program),
         "F0_vstr_str_bp0_c_rp0_c"
     );
+}
+
+#[test]
+fn hir_body_validator_prepared_binder_bridge_fails_closed() {
+    let mut program = baseline_program();
+    let params = Ty::Struct(0);
+    let statement_id = program.resources.len() as u32;
+    program.resources.push(ResourceDef {
+        name: "pkg.db$stmt$S6_Record$S6_Record".to_string(),
+        source_name: "pkg.db$stmt$S6_Record$S6_Record".to_string(),
+        declaring_module: "pkg.db".to_string(),
+        generic_arity: 2,
+        drop_hook: "pkg.db.internal.resource$drop_stmt".to_string(),
+        drop_thunk: "__align_resource_drop$pkg.db$stmt$S6_Record$S6_Record".to_string(),
+        representation_version: 1,
+        drop_abi_fingerprint: *b"align-res-drop-1",
+    });
+    let statement = Ty::Resource(statement_id);
+    let statement_ref = Ty::ResourceRef(statement_id);
+    let i32_ty = Ty::Int(IntTy {
+        bits: 32,
+        signed: true,
+    });
+    let reference = body_test_expr(
+        hir::ExprKind::ResourceBorrow {
+            owner: Box::new(body_test_expr(hir::ExprKind::Local(0), statement)),
+            resource: statement_id,
+        },
+        statement_ref,
+    );
+    let wrapper = body_test_expr(
+        hir::ExprKind::ResourceRaw {
+            reference: Box::new(reference),
+            resource: statement_id,
+        },
+        Ty::Raw,
+    );
+    let callee = body_test_expr(
+        hir::ExprKind::RawPointerLoad {
+            ptr: Box::new(wrapper),
+            offset: Box::new(body_test_expr(
+                hir::ExprKind::Int(24),
+                Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                }),
+            )),
+        },
+        Ty::Raw,
+    );
+    let call = body_test_expr(
+        hir::ExprKind::RawCall {
+            callee: Box::new(callee),
+            args: vec![
+                body_test_expr(hir::ExprKind::Local(1), Ty::Raw),
+                body_test_expr(hir::ExprKind::Local(2), params),
+            ],
+            param_tys: vec![Ty::Raw, params],
+            param_modes: vec![
+                align_ast::ParamMode::ByValue,
+                align_ast::ParamMode::Borrow,
+            ],
+            return_borrow: ReturnBorrowSummary::None,
+            return_region: ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
+        },
+        i32_ty,
+    );
+    let mut function = body_test_named_function(
+        "pkg.db.internal.sqlite$prepared_binder_owner",
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::Unsafe(hir::Block {
+                    stmts: Vec::new(),
+                    value: Some(Box::new(call)),
+                }),
+                i32_ty,
+            ))),
+        },
+        vec![
+            body_test_local(0, "statement", statement, true, true),
+            body_test_local(1, "context", Ty::Raw, false, true),
+            body_test_local(2, "params", params, false, true),
+        ],
+        i32_ty,
+    );
+    function.params = vec![0, 1, 2];
+    function.param_modes = vec![
+        align_ast::ParamMode::BorrowMut,
+        align_ast::ParamMode::ByValue,
+        align_ast::ParamMode::ByValue,
+    ];
+    program.fns.push(function);
+    let global = validate_hir::global_type_metadata_is_valid(&program);
+    let placement = validate_hir::type_placement_metadata_is_valid(&program);
+    let nominal = validate_hir::nominal_link_metadata_is_valid(&program);
+    let body = validate_hir::body_only_metadata_is_valid(&program);
+    assert!(
+        global && placement && nominal && body,
+        "the exact prepared binder bridge must survive HIR validation: global={global} placement={placement} nominal={nominal} body={body}"
+    );
+
+    fn raw_call(candidate: &mut hir::Program) -> &mut hir::Expr {
+        let unsafe_expression = candidate
+            .fns
+            .last_mut()
+            .and_then(|function| function.body.value.as_deref_mut())
+            .expect("prepared binder unsafe expression");
+        let hir::ExprKind::Unsafe(block) = &mut unsafe_expression.kind else {
+            panic!("prepared binder unsafe block")
+        };
+        block
+            .value
+            .as_deref_mut()
+            .expect("prepared binder expression")
+    }
+
+    let mut wrong_offset = program.clone();
+    {
+        let expression = raw_call(&mut wrong_offset);
+        let hir::ExprKind::RawCall { callee, .. } = &mut expression.kind else {
+            panic!("prepared binder raw call")
+        };
+        let hir::ExprKind::RawPointerLoad { offset, .. } = &mut callee.kind else {
+            panic!("prepared binder pointer load")
+        };
+        offset.kind = hir::ExprKind::Int(32);
+    }
+    assert!(!body_core_metadata_is_valid(&wrong_offset));
+
+    let mut wrong_params_mode = program.clone();
+    {
+        let expression = raw_call(&mut wrong_params_mode);
+        let hir::ExprKind::RawCall { param_modes, .. } = &mut expression.kind else {
+            unreachable!()
+        };
+        param_modes[1] = align_ast::ParamMode::ByValue;
+    }
+    assert!(!body_core_metadata_is_valid(&wrong_params_mode));
+
+    let mut wrong_params_type = program.clone();
+    {
+        let expression = raw_call(&mut wrong_params_type);
+        let hir::ExprKind::RawCall { param_tys, .. } = &mut expression.kind else {
+            unreachable!()
+        };
+        param_tys[1] = Ty::Bool;
+    }
+    assert!(!body_core_metadata_is_valid(&wrong_params_type));
+
+    let mut wrong_resource_identity = program;
+    wrong_resource_identity.resources[statement_id as usize].name =
+        "pkg.db$stmt$S5_Other$S6_Record".to_string();
+    assert!(!body_core_metadata_is_valid(&wrong_resource_identity));
 }
 
 #[test]

@@ -26,14 +26,14 @@ invented exact counts here.
 
 | Root-cause key | Events | PRs | Prevention status |
 |---|---:|---:|---|
-| `validation-phase-completeness` | 6 | 2 | Promoted: exact phase order and complete state/header fields are mandatory; discriminator-only dispatch is insufficient. |
+| `validation-phase-completeness` | 7 | 3 | Automated owner added: exact phase order and complete state/header fields are mandatory; poisoned wrong-driver cases pin restriction-before-live precedence for both database drivers. |
 | `cross-stage-abi-exactness` | 4 | 1 | Covered by Gate 4 and exact ABI owner matrices. |
 | `native-api-version-boundary` | 4 | 1 | Covered by Gate 2 plus version/conversion goldens. |
 | `ownership-allocation-owner` | 3 | 1 | Covered by Gates 1, 2, and 4; every allocation and thunk needs one named owner. |
 | `sql-scanner-lexical-closure` | 3 | 2 | Promoted: parameterized lexical-mode and token-free-tail owners are mandatory. |
 | `native-link-order-closure` | 3 | 1 | Promoted: preserve caller order around the dependency closure and test arbitrary prefix/suffix libraries. |
 | `producer-evidence-propagation` | 1 | 1 | Watch; exact producer-to-consumer evidence owner required. |
-| `public-surface-completeness` | 1 | 1 | Watch; compare exact signatures and constructor forms. |
+| `public-surface-completeness` | 2 | 2 | Promoted: compare the complete exported surface to the ledger and require an internal/sealed boundary for cross-module helpers. |
 | `operation-matrix-completeness` | 1 | 1 | Watch; enumerate every driver/operation/result arm. |
 | `error-contract-identity` | 1 | 1 | Watch; pin error class, query identity, and precedence. |
 | `source-of-truth-drift` | 1 | 1 | Watch; run ledger-to-prose and stale-obligation search. |
@@ -41,6 +41,7 @@ invented exact counts here.
 | `test-global-state-isolation` | 1 | 1 | Watch; prefer child-scoped environment and RAII restoration. |
 | `test-entry-abi-exactness` | 1 | 1 | Watch; compile fixtures through the real entry ABI. |
 | `mutation-noop-idempotency` | 1 | 1 | Watch; prove unchanged input performs no write. |
+| `native-evidence-applicability` | 1 | 1 | Watch; project optional native evidence only for engines/access methods whose semantics are proved. |
 
 ## Event log
 
@@ -78,6 +79,9 @@ invented exact counts here.
 | #723 | `8a66fbf2` | P1 | `sql-scanner-lexical-closure` | Ignore token-free tails after the final SQLite statement. |
 | #723 | `8a66fbf2` | P1 | `mutation-noop-idempotency` | Avoid rewriting unchanged SQLite history. |
 | #724 | `2f18d6ca` | P2 | `validation-phase-completeness` | Reject poisoned execution targets before QueryMeta materialization. |
+| #726 | `7a4a8094` | P2 | `native-evidence-applicability` | Leave PostgreSQL sort/null fields absent for non-B-tree index methods. |
+| #726 | `7a4a8094` | P2 | `public-surface-completeness` | Seal cross-module catalog adapters behind the package's internal boundary. |
+| #726 | `7a4a8094` | P2 | `validation-phase-completeness` | Check native metadata driver restriction before complete live-state validity. |
 
 ## Rejected claims
 

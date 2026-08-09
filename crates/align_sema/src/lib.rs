@@ -6262,6 +6262,24 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                 }) {
                     resource.drop_hook = canonical_hook.clone();
                 }
+                // A generic resource can remain wholly dormant in its producer unit and be
+                // instantiated only while a public generic function is monomorphized in a
+                // consumer. Keep one type-erased producer record so codegen still defines the
+                // declaration-owned shared Drop thunk beside the validated hook. Consumer-side
+                // concrete instances carry the same thunk identity and therefore emit declares
+                // only; no arbitrary anchor monomorph or public compatibility type is required.
+                if !resources.iter().any(|resource| resource.name == canonical_resource) {
+                    resources.push(hir::ResourceDef {
+                        source_name: canonical_resource.clone(),
+                        name: canonical_resource.clone(),
+                        declaring_module: template.declaring_module.clone(),
+                        generic_arity: declaration.type_params.len() as u32,
+                        drop_hook: canonical_hook.clone(),
+                        drop_thunk: template.drop_thunk.clone(),
+                        representation_version: template.representation_version,
+                        drop_abi_fingerprint: template.drop_abi_fingerprint,
+                    });
+                }
             }
         }
     }
@@ -17769,6 +17787,25 @@ impl<'a> MoveCheck<'a> {
         roots
     }
 
+    /// A mutable borrow of a resource advances only that resource owner's generation. Its
+    /// dependency roots identify parents that must outlive it; they are not storage mutated by an
+    /// operation on the child. Keeping the two sets distinct lets `rows_stmt(borrow mut stmt, ...)`
+    /// invalidate an earlier rows child while preserving the stmt's conn/tx parent generation.
+    fn borrow_mut_invalidation_roots(&self, argument: &Expr) -> BorrowRoots {
+        if matches!(argument.ty, Ty::Resource(_))
+            && let ExprKind::Local(local) = argument.kind
+        {
+            let mut roots = BorrowRoots::new();
+            if let Some(position) = self.borrowed_param_position(local) {
+                roots.insert(BorrowRoot::Param(position));
+            } else {
+                roots.insert(BorrowRoot::Local(local));
+            }
+            return roots;
+        }
+        self.storage_roots(argument)
+    }
+
     /// Flatten the owner-local provenance carried by a borrow-producing expression. Producers are
     /// classified once here; control flow and invalidation share MoveCheck's existing dataflow.
     /// The classification in [`Self::borrow_sources_inner`] is **exhaustive** — no `_` tail —
@@ -21486,7 +21523,7 @@ impl<'a> MoveCheck<'a> {
                 }
                 Post::BorrowMutCall(argument) => {
                     if falls_through {
-                        let roots = self.storage_roots(argument);
+                        let roots = self.borrow_mut_invalidation_roots(argument);
                         self.reject_live_resource_dependents_of_roots(
                             &roots,
                             moved,
@@ -22564,7 +22601,7 @@ impl<'a> MoveCheck<'a> {
                         if mode == ast::ParamMode::BorrowMut
                             && let Some(argument) = args.get(index)
                         {
-                            let roots = self.storage_roots(argument);
+                            let roots = self.borrow_mut_invalidation_roots(argument);
                             self.reject_live_resource_dependents_of_roots(
                                 &roots,
                                 moved,
@@ -22620,7 +22657,7 @@ impl<'a> MoveCheck<'a> {
                     if mode == ast::ParamMode::BorrowMut
                         && let Some(argument) = args.get(index)
                     {
-                        let roots = self.storage_roots(argument);
+                        let roots = self.borrow_mut_invalidation_roots(argument);
                         self.reject_live_resource_dependents_of_roots(
                             &roots,
                             moved,
@@ -25107,6 +25144,15 @@ impl<'a, 't> Checker<'a, 't> {
     /// scalar substitution helper owns builtin composites; this layer materializes the exact
     /// struct/sum/resource instance once its ordered application arguments are known.
     fn subst_type(&mut self, ty: Ty, args: &[Ty], span: Span) -> Ty {
+        // A Q4a prepared statement returns `Result<stmt<P,R>, Error>`. The generic resource
+        // application is represented by a sema-only nominal id inside the Result scalar, so it
+        // must be materialized recursively at the same monomorph boundary as a top-level nominal.
+        if let Ty::Result(ok, err) = ty {
+            return Ty::Result(
+                self.subst_payload_scalar(ok, args, span),
+                self.subst_payload_scalar(err, args, span),
+            );
+        }
         let instance = match ty {
             Ty::Struct(id) => self
                 .struct_instances
@@ -25196,6 +25242,48 @@ impl<'a, 't> Checker<'a, 't> {
                 })
                 .unwrap_or(Ty::Error),
             _ => Ty::Error,
+        }
+    }
+
+    fn subst_payload_scalar(&mut self, scalar: Scalar, args: &[Ty], span: Span) -> Scalar {
+        let normalized = |ty: Ty, tagged_types: &mut Vec<hir::TaggedType>| match ty {
+            Ty::Option(payload) => Scalar::Tagged(intern_tagged_type(
+                tagged_types,
+                hir::TaggedType::Option(payload),
+            )),
+            Ty::Result(ok, err) => Scalar::Tagged(intern_tagged_type(
+                tagged_types,
+                hir::TaggedType::Result(ok, err),
+            )),
+            other => ty_to_scalar(other).unwrap_or(scalar),
+        };
+        match scalar {
+            Scalar::Tagged(id) => match self.tagged_types.get(id as usize).copied() {
+                Some(hir::TaggedType::Option(payload)) => {
+                    let payload = self.subst_payload_scalar(payload, args, span);
+                    Scalar::Tagged(intern_tagged_type(
+                        self.tagged_types,
+                        hir::TaggedType::Option(payload),
+                    ))
+                }
+                Some(hir::TaggedType::Result(ok, err)) => {
+                    let ok = self.subst_payload_scalar(ok, args, span);
+                    let err = self.subst_payload_scalar(err, args, span);
+                    Scalar::Tagged(intern_tagged_type(
+                        self.tagged_types,
+                        hir::TaggedType::Result(ok, err),
+                    ))
+                }
+                None => scalar,
+            },
+            Scalar::Param(index) => {
+                let ty = args.get(index as usize).copied().unwrap_or(Ty::Error);
+                normalized(ty, self.tagged_types)
+            }
+            other => {
+                let ty = self.subst_type(scalar_to_ty(other), args, span);
+                normalized(ty, self.tagged_types)
+            }
         }
     }
 
@@ -28050,6 +28138,8 @@ impl<'a, 't> Checker<'a, 't> {
             self.bind_param(p, scalar_to_ty(actual), subst, span);
         } else if matches!(declared, Scalar::Tagged(_))
             || matches!(actual, Scalar::Tagged(_))
+            || self.nominal_instance(scalar_to_ty(declared)).is_some()
+            || self.nominal_instance(scalar_to_ty(actual)).is_some()
         {
             self.match_param_in_context(
                 scalar_to_ty(declared),
@@ -29425,6 +29515,15 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         }
+        if method == "bind_prepared" {
+            return self.check_prepared_bind_op(args, expected, span);
+        }
+        if matches!(method, "prepare_sqlite" | "prepare_postgres") {
+            return self.check_prepare_dispatch_op(method, args, expected, span);
+        }
+        if matches!(method, "rows_stmt_sqlite" | "rows_stmt_postgres") {
+            return self.check_rows_stmt_dispatch_op(method, args, expected, span);
+        }
         let expected_arity = match method {
             "data"
             | "q1_plan"
@@ -29438,10 +29537,12 @@ impl<'a, 't> Checker<'a, 't> {
             | "static_validator"
             | "row_validator"
             | "decoder"
-            | "meta_materializer" => 1,
+            | "meta_materializer"
+            | "parameter_resolver"
+            | "parameter_count" => 1,
             "validate_static" | "validate_row" | "decode" => 2,
             "bind" => 3,
-            "parameter_known" => 2,
+            "parameter_known" | "parameter_ordinal" => 2,
             "materialize_meta" => 4,
             "execute_sqlite" | "execute_postgres" => 4,
             "one_sqlite" | "one_postgres" | "explain_sqlite" | "explain_postgres" => 5,
@@ -29842,6 +29943,32 @@ impl<'a, 't> Checker<'a, 't> {
                 span,
             };
         }
+        if method == "parameter_count" {
+            let ret = Ty::Int(IntTy {
+                bits: 32,
+                signed: false,
+            });
+            self.constrain(ret, expected, span);
+            return Expr {
+                kind: ExprKind::RawLoad {
+                    ptr: Box::new(data),
+                    offset: Box::new(Expr {
+                        kind: ExprKind::Int(112),
+                        ty: Ty::Int(IntTy {
+                            bits: 64,
+                            signed: true,
+                        }),
+                        span,
+                    }),
+                    scalar: Scalar::Int(IntTy {
+                        bits: 32,
+                        signed: false,
+                    }),
+                },
+                ty: ret,
+                span,
+            };
+        }
         let offset = match method {
             "q1_plan" => 8,
             "descriptor_id_pointer" => 16,
@@ -29852,6 +29979,7 @@ impl<'a, 't> Checker<'a, 't> {
             "row_validator" | "validate_row" => 80,
             "decoder" | "decode" => 88,
             "meta_materializer" | "materialize_meta" => 96,
+            "parameter_resolver" | "parameter_ordinal" => 104,
             _ => unreachable!(),
         };
         let pointer_offset = Expr {
@@ -29881,6 +30009,7 @@ impl<'a, 't> Checker<'a, 't> {
                 | "row_validator"
                 | "decoder"
                 | "meta_materializer"
+                | "parameter_resolver"
         ) {
             self.constrain(Ty::Raw, expected, span);
             return callee;
@@ -29923,6 +30052,41 @@ impl<'a, 't> Checker<'a, 't> {
                     args: vec![driver, detail, index],
                     param_tys: vec![u8_ty, u8_ty, i64_ty],
                     param_modes: vec![ast::ParamMode::ByValue; 3],
+                    return_borrow: hir::ReturnBorrowSummary::None,
+                    return_region: hir::ReturnRegionSummary::None,
+                    return_cleanup: hir::ReturnCleanupAbi::None,
+                },
+                ty: ret,
+                span,
+            };
+        }
+
+        if method == "parameter_ordinal" {
+            let name = self.check_str_init(&args[1]);
+            if name.ty == Ty::Error {
+                return err;
+            }
+            if !self.source_ty_matches(name.ty, Ty::Str) {
+                self.diags.error(
+                    format!(
+                        "database parameter name must be `str`, got {}",
+                        self.ty_display(name.ty)
+                    ),
+                    args[1].span,
+                );
+                return err;
+            }
+            let ret = Ty::Int(IntTy {
+                bits: 32,
+                signed: true,
+            });
+            self.constrain(ret, expected, span);
+            return Expr {
+                kind: ExprKind::RawCall {
+                    callee: Box::new(callee),
+                    args: vec![name],
+                    param_tys: vec![Ty::Str],
+                    param_modes: vec![ast::ParamMode::ByValue],
                     return_borrow: hir::ReturnBorrowSummary::None,
                     return_region: hir::ReturnRegionSummary::None,
                     return_cleanup: hir::ReturnCleanupAbi::None,
@@ -29982,6 +30146,397 @@ impl<'a, 't> Checker<'a, 't> {
                 return_cleanup: hir::ReturnCleanupAbi::None,
             },
             ty: ret,
+            span,
+        }
+    }
+
+    /// Q4a bridge from a concrete dependent `stmt<P,R>` resource to the producer-owned Params
+    /// binder retained in its private wrapper. Applications cannot form this operation: the caller
+    /// has already passed the pkg.db-descendant/import/unsafe gates in `check_static_descriptor_op`.
+    fn check_prepared_bind_op(
+        &mut self,
+        args: &[ast::Expr],
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Expr {
+        let err = || Expr {
+            kind: ExprKind::Bool(false),
+            ty: Ty::Error,
+            span,
+        };
+        let [reference_ast, context_ast, params_ast] = args else {
+            self.diags.error(
+                format!(
+                    "static descriptor operation 'bind_prepared' expects 3 argument(s), got {}",
+                    args.len()
+                ),
+                span,
+            );
+            return err();
+        };
+        let reference = self.check_expr(reference_ast, None);
+        let Ty::ResourceRef(resource) = self.resolve(reference.ty) else {
+            if reference.ty != Ty::Error {
+                self.diags.error(
+                    format!(
+                        "prepared binding requires `resource_ref<db.stmt<P,R>>`, got {}",
+                        self.ty_display(reference.ty)
+                    ),
+                    reference_ast.span,
+                );
+            }
+            return err();
+        };
+        let Some(instance) = self.resource_instances.get(&resource).cloned() else {
+            self.diags
+                .error("prepared binding requires a concrete statement resource".to_owned(), span);
+            return err();
+        };
+        if instance.canonical != "pkg.db$stmt" || instance.args.len() != 2 {
+            self.diags.error(
+                format!(
+                    "prepared binding requires `resource_ref<db.stmt<P,R>>`, got {}",
+                    self.ty_display(reference.ty)
+                ),
+                reference_ast.span,
+            );
+            return err();
+        }
+        let params_ty = instance.args[0];
+        let context = self.check_expr(context_ast, Some(Ty::Raw));
+        if context.ty == Ty::Error {
+            return err();
+        }
+        if !self.source_ty_matches(context.ty, Ty::Raw) {
+            self.diags.error(
+                format!(
+                    "prepared binder context must be `raw`, got {}",
+                    self.ty_display(context.ty)
+                ),
+                context_ast.span,
+            );
+            return err();
+        }
+        let params = self.check_expr(params_ast, Some(params_ty));
+        if params.ty == Ty::Error {
+            return err();
+        }
+        if !self.source_ty_matches(params.ty, params_ty) {
+            self.diags.error(
+                format!(
+                    "prepared parameters mismatch: expected {}, got {}",
+                    self.ty_display(params_ty),
+                    self.ty_display(params.ty)
+                ),
+                params_ast.span,
+            );
+            return err();
+        }
+        if !matches!(params.kind, ExprKind::Local(_) | ExprKind::Field { .. }) {
+            self.diags.error(
+                "prepared Params must be a bound place so the generated binder can borrow it"
+                    .to_owned(),
+                params_ast.span,
+            );
+            return err();
+        }
+        let wrapper = Expr {
+            kind: ExprKind::ResourceRaw {
+                reference: Box::new(reference),
+                resource,
+            },
+            ty: Ty::Raw,
+            span: reference_ast.span,
+        };
+        let offset = Expr {
+            kind: ExprKind::Int(24),
+            ty: Ty::Int(IntTy {
+                bits: 64,
+                signed: true,
+            }),
+            span,
+        };
+        let callee = Expr {
+            kind: ExprKind::RawPointerLoad {
+                ptr: Box::new(wrapper),
+                offset: Box::new(offset),
+            },
+            ty: Ty::Raw,
+            span,
+        };
+        let ret = Ty::Int(IntTy {
+            bits: 32,
+            signed: true,
+        });
+        self.constrain(ret, expected, span);
+        Expr {
+            kind: ExprKind::RawCall {
+                callee: Box::new(callee),
+                args: vec![context, params],
+                param_tys: vec![Ty::Raw, params_ty],
+                param_modes: vec![ast::ParamMode::ByValue, ast::ParamMode::Borrow],
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
+                return_cleanup: hir::ReturnCleanupAbi::None,
+            },
+            ty: ret,
+            span,
+        }
+    }
+
+    fn concrete_resource(&self, canonical: &str, args: &[Ty]) -> Option<u32> {
+        self.resource_instances.iter().find_map(|(&id, instance)| {
+            (instance.canonical == canonical && instance.args == args).then_some(id)
+        })
+    }
+
+    /// Queue the selected Q4a native prepare monomorph after P/R are concrete, just like the
+    /// existing common execute bridge. SQLite carries normalized flags; PostgreSQL carries an
+    /// optional package-owned OID vector and its exact count.
+    fn check_prepare_dispatch_op(
+        &mut self,
+        method: &str,
+        args: &[ast::Expr],
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Expr {
+        let err = || Expr {
+            kind: ExprKind::Bool(false),
+            ty: Ty::Error,
+            span,
+        };
+        let postgres = method == "prepare_postgres";
+        let required = if postgres { 5 } else { 4 };
+        if args.len() != required {
+            self.diags.error(
+                format!(
+                    "static descriptor operation '{method}' expects {required} argument(s), got {}",
+                    args.len()
+                ),
+                span,
+            );
+            return err();
+        }
+        let statement = self.check_expr(&args[0], None);
+        let ExprKind::Local(_) = statement.kind else {
+            if statement.ty != Ty::Error {
+                self.diags.error(
+                    "database prepare requires a bound Query value".to_owned(),
+                    args[0].span,
+                );
+            }
+            return err();
+        };
+        let Ty::Struct(struct_id) = self.resolve(statement.ty) else {
+            if statement.ty != Ty::Error {
+                self.diags
+                    .error("database prepare requires `db.query<P,R>`".to_owned(), args[0].span);
+            }
+            return err();
+        };
+        let Some(instance) = self.struct_instances.get(&struct_id).cloned() else {
+            self.diags.error("database prepare requires a concrete Query".to_owned(), args[0].span);
+            return err();
+        };
+        if instance.canonical != "pkg.db$query" || instance.args.len() != 2 {
+            self.diags.error("database prepare requires `db.query<P,R>`".to_owned(), args[0].span);
+            return err();
+        }
+        let exec_ty = self
+            .enum_ids
+            .get("pkg.db$exec")
+            .copied()
+            .map(Ty::Enum)
+            .unwrap_or(Ty::Error);
+        let target = self.check_expr(&args[1], Some(exec_ty));
+        if target.ty == Ty::Error || !self.source_ty_matches(target.ty, exec_ty) {
+            if target.ty != Ty::Error {
+                self.diags.error(
+                    format!("database prepare requires `pkg.db.exec`, got {}", self.ty_display(target.ty)),
+                    args[1].span,
+                );
+            }
+            return err();
+        }
+        let query_id = self.check_str_init(&args[2]);
+        if query_id.ty == Ty::Error || !self.source_ty_matches(query_id.ty, Ty::Str) {
+            if query_id.ty != Ty::Error {
+                self.diags.error("database Query identity must be `str`".to_owned(), args[2].span);
+            }
+            return err();
+        }
+        let mut call_args = vec![target, statement, query_id.clone()];
+        if postgres {
+            let oid_pointer = self.check_expr(&args[3], Some(Ty::Raw));
+            let count_ty = Ty::Int(IntTy { bits: 32, signed: false });
+            let oid_count = self.check_expr(&args[4], Some(count_ty));
+            if oid_pointer.ty == Ty::Error || oid_count.ty == Ty::Error {
+                return err();
+            }
+            if !self.source_ty_matches(oid_pointer.ty, Ty::Raw)
+                || !self.source_ty_matches(oid_count.ty, count_ty)
+            {
+                self.diags.error(
+                    "PostgreSQL prepare normalization requires `(raw, u32)` OID storage"
+                        .to_owned(),
+                    span,
+                );
+                return err();
+            }
+            call_args.extend([oid_pointer, oid_count]);
+        } else {
+            let flags_ty = Ty::Int(IntTy { bits: 32, signed: false });
+            let flags = self.check_expr(&args[3], Some(flags_ty));
+            if flags.ty == Ty::Error || !self.source_ty_matches(flags.ty, flags_ty) {
+                self.diags.error("SQLite prepare flags must be `u32`".to_owned(), args[3].span);
+                return err();
+            }
+            call_args.push(flags);
+        }
+        let Some(stmt_id) = self.concrete_resource("pkg.db$stmt", &instance.args) else {
+            self.diags.error("pkg.db stmt resource is unavailable".to_owned(), span);
+            return err();
+        };
+        let error_id = self
+            .enum_ids
+            .get("pkg.db$Error")
+            .copied()
+            .unwrap_or(self.error_enum_id);
+        let result_ty = Ty::Result(Scalar::Resource(stmt_id), Scalar::Enum(error_id));
+        let base = if postgres {
+            "pkg.db.internal.postgres$prepare_prevalidated"
+        } else {
+            "pkg.db.internal.sqlite$prepare_prevalidated"
+        };
+        let (func, type_args, final_args) = if self.sigs.contains_key(base) || self.mono_args.is_empty() {
+            (base.to_owned(), instance.args.clone(), call_args)
+        } else {
+            (
+                "pkg.db$unsupported".to_owned(),
+                vec![Ty::Resource(stmt_id)],
+                vec![query_id],
+            )
+        };
+        self.constrain(result_ty, expected, span);
+        Expr {
+            kind: ExprKind::Call {
+                func,
+                args: final_args,
+                type_args,
+            },
+            ty: result_ty,
+            span,
+        }
+    }
+
+    fn check_rows_stmt_dispatch_op(
+        &mut self,
+        method: &str,
+        args: &[ast::Expr],
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Expr {
+        let err = || Expr {
+            kind: ExprKind::Bool(false),
+            ty: Ty::Error,
+            span,
+        };
+        let [statement_ast, params_ast, options_ast] = args else {
+            self.diags.error(
+                format!(
+                    "static descriptor operation '{method}' expects 3 argument(s), got {}",
+                    args.len()
+                ),
+                span,
+            );
+            return err();
+        };
+        let statement = self.check_expr(statement_ast, None);
+        let Ty::Resource(stmt_id) = self.resolve(statement.ty) else {
+            if statement.ty != Ty::Error {
+                self.diags.error("rows_stmt requires `db.stmt<P,R>`".to_owned(), statement_ast.span);
+            }
+            return err();
+        };
+        let Some(instance) = self.resource_instances.get(&stmt_id).cloned() else {
+            self.diags.error("rows_stmt requires a concrete statement".to_owned(), statement_ast.span);
+            return err();
+        };
+        if instance.canonical != "pkg.db$stmt" || instance.args.len() != 2 {
+            self.diags.error("rows_stmt requires `db.stmt<P,R>`".to_owned(), statement_ast.span);
+            return err();
+        }
+        self.validate_borrow_argument(&statement, ast::ParamMode::BorrowMut, "rows_stmt");
+        let params_ty = instance.args[0];
+        let params = self.check_expr(params_ast, Some(params_ty));
+        if params.ty == Ty::Error || !self.source_ty_matches(params.ty, params_ty) {
+            if params.ty != Ty::Error {
+                self.diags.error(
+                    format!(
+                        "prepared parameters mismatch: expected {}, got {}",
+                        self.ty_display(params_ty),
+                        self.ty_display(params.ty)
+                    ),
+                    params_ast.span,
+                );
+            }
+            return err();
+        }
+        let execute_option = self
+            .enum_ids
+            .get("pkg.db$ExecuteOption")
+            .copied()
+            .map(Scalar::Enum)
+            .map(Ty::Slice)
+            .unwrap_or(Ty::Error);
+        let options = self.check_expr(options_ast, Some(execute_option));
+        if options.ty == Ty::Error || !self.source_ty_matches(options.ty, execute_option) {
+            if options.ty != Ty::Error {
+                self.diags.error("rows_stmt options must be `slice<db.ExecuteOption>`".to_owned(), options_ast.span);
+            }
+            return err();
+        }
+        let row_ty = instance.args[1];
+        let Some(rows_id) = self.concrete_resource("pkg.db$rows", &[row_ty]) else {
+            self.diags.error("pkg.db rows resource is unavailable".to_owned(), span);
+            return err();
+        };
+        let error_id = self
+            .enum_ids
+            .get("pkg.db$Error")
+            .copied()
+            .unwrap_or(self.error_enum_id);
+        let result_ty = Ty::Result(Scalar::Resource(rows_id), Scalar::Enum(error_id));
+        let base = if method == "rows_stmt_postgres" {
+            "pkg.db.internal.postgres$rows_stmt_prevalidated"
+        } else {
+            "pkg.db.internal.sqlite$rows_stmt_prevalidated"
+        };
+        let (func, type_args, final_args) = if self.sigs.contains_key(base) || self.mono_args.is_empty() {
+            (
+                base.to_owned(),
+                instance.args.clone(),
+                vec![statement, params, options],
+            )
+        } else {
+            (
+                "pkg.db$unsupported".to_owned(),
+                vec![Ty::Resource(rows_id)],
+                vec![Expr {
+                    kind: ExprKind::Str("prepared statement".to_owned()),
+                    ty: Ty::Str,
+                    span,
+                }],
+            )
+        };
+        self.constrain(result_ty, expected, span);
+        Expr {
+            kind: ExprKind::Call {
+                func,
+                args: final_args,
+                type_args,
+            },
+            ty: result_ty,
             span,
         }
     }
@@ -42460,9 +43015,16 @@ fn resolve_type(
                     return Ty::Error;
                 }
             };
-            if reject_abstract_nominal_container(ok, "Result", cx, span, diags)
-                || reject_abstract_nominal_container(err, "Result", cx, span, diags)
-            {
+            let unsupported_abstract = |ty: Ty, cx: &TyCx<'_>| {
+                abstract_nominal_application(ty, cx)
+                    && !matches!(ty, Ty::Resource(_) | Ty::ResourceRef(_))
+            };
+            if unsupported_abstract(ok, cx) || unsupported_abstract(err, cx) {
+                diags.error(
+                    "only an abstract generic resource application may be nested inside `Result` yet"
+                        .to_string(),
+                    span,
+                );
                 return Ty::Error;
             }
             match (
@@ -43398,6 +43960,37 @@ mod tests {
             .collect::<Vec<_>>();
         let checked = check_program_with_static_descriptors(&modules, &mut diagnostics);
         (checked, diagnostics)
+    }
+
+    #[test]
+    fn generic_resource_application_materializes_inside_result() {
+        let internal = concat!(
+            "module pkg.db.internal\n",
+            "pub fn drop_stmt(state: raw) { unsafe { if !state.is_null() { raw.free(state) } } }\n",
+        );
+        let common = concat!(
+            "module pkg.db\n",
+            "pub Error { Invalid }\n",
+            "pub resource stmt<P, R> = pkg.db.internal.drop_stmt\n",
+            "pub fn pass<P, R>(value: Result<stmt<P, R>, Error>) -> Result<stmt<P, R>, Error> = value\n",
+        );
+        let app = concat!(
+            "module app\n",
+            "import pkg.db\n",
+            "Params { id: i64 }\n",
+            "Row { id: i64 }\n",
+            "fn use(value: Result<pkg.db.stmt<Params, Row>, pkg.db.Error>) -> Result<pkg.db.stmt<Params, Row>, pkg.db.Error> = pkg.db.pass(value)\n",
+        );
+        let (_, diagnostics) = check_modules(&[
+            ("pkg.db.internal", internal, false),
+            ("pkg.db", common, false),
+            ("app", app, true),
+        ]);
+        assert!(
+            !diagnostics.has_errors(),
+            "generic resource Result must materialize at the concrete call boundary: {:?}",
+            diagnostics.iter().collect::<Vec<_>>()
+        );
     }
 
     #[test]

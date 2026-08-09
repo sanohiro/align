@@ -2529,6 +2529,31 @@ commit/rollback consume、Drop rollback+close、success/error/panic相当exitの
 public traitなし。§11〜§14のexact common/両driver transaction option sum、SQLite begin
 mode、PostgreSQL isolation/access/deferrableのBEGIN前conflict rejectionもここで実装する。
 
+#### Q4a/D6+D7 implementation closure matrix
+
+Q4aはprepared reuseとtransactionを一緒にpublishする。両方が同じphysical-connection resource
+prefix、dependent generation、generic execution dispatch、native cleanup、whole/per-unit ABIを
+拡張するためである。このcapabilityはおよそ1,000 hand-written lineを超える見込みだが、分割すると
+connection move-in/move-out、child-before-parent、driver dispatch、Drop proofを反復し、prepared
+またはtransactional reuseの片方がsettled common execution modelなしで残る。
+
+| Closure cell | Required implementation closure | Exact owner evidence |
+|---|---|---|
+| exact public surface | §§6、11〜14のexact option-slice順で`stmt<P,R>`、`rows<R>`、`PrepareOption`、`TxOption`、`prepare`、`rows_stmt`、`begin`、`commit`、`rollback`と対応するSQLite/PostgreSQL native prepare/begin formだけをpublishする。execution view constructorは`exec_conn`/`exec_tx`だけとする。 | Q4a public whole/per-unit interface golden、wrong-scope/wrong-arity/sealed-helper negative |
+| statement formationとvalidation | complete Query descriptor、common option、native option、driver restriction、live targetをnative prepare前にvalidateする。exact conn/tx generationにdependentなMove `stmt<P,R>`を1つconstructし、package-owned native state、generated binder identity、owned diagnostic identityだけを保持する。 | malformed descriptor/no-send、wrong driver/no-send、conn/tx parent-move negative、whole/per-unit prepare owner |
+| prepared bindとexecution | `rows_stmt(borrow mut stmt, params, [])`はfresh dependent `rows<R>` generationを1つ作り、reflectionなしでproducer-owned Params thunkを呼び、全native bind/result allocationをrows Dropまで保持する。partial bind failureは全installed bindingをclearし、moved Paramsをexactly once Dropする。 | sequential prepare/reuse、text/blob source invalidation/rebind、injected partial-bind cleanup count |
+| SQLite prepared lifecycle | `Persistent`/`Normalize`を各最大1回native prepare flagへ適用し、`rows_stmt`からrows Dropまでconnection execution leaseを保持する。全end pathでreset後clear bindingsし、stmt Dropでexactly once finalizeする。cleanup failureはdependency解放前にconnectionをpoison/closeする。 | SQLite option disposition、overlap、reset/clear/finalize counter、error/early-Drop owner |
+| PostgreSQL prepared lifecycle | concrete Params contractに対して各`ParameterOid(name, oid)`を`PQprepare`前にvalidateし、unknown/duplicate/zero OIDをrejectする。connection-local collision-free statement nameを1つallocateし、`PQexecPrepared`を使い、全result/contextを1回clearし、stmt Dropでbest-effort `DEALLOCATE`する。process/global cacheはない。 | PostgreSQL required prepare/reuse/option ownerとnative stub lifecycle counter |
+| transaction formationとoption | common option、次にdriver optionをsource orderで`BEGIN`前にvalidateする。`begin`はnative begin成功後だけconnをconsumeし、exact SQLite mode SQLとexact PostgreSQL isolation/access/deferrable clauseを使う。invalid PostgreSQL combinationはsend前にrejectする。 | common/native option precedence、SQLite 3 mode owner、required PostgreSQL combination/no-send owner |
+| transaction executionとjoin | live txはconnと同じvalidated connection prefixを持つ。既存common/native execution/inspection pathはsecond trait/ABIなしで`exec.Tx`を受ける。use-after-end、conn/tx alias、live stmt/rows child中のcommit/rollbackはcompile-time errorにする。 | 両driver transaction内common command/Query、metadata/EXPLAIN tx owner、compile-fail alias/child matrix |
+| commit、rollback、Drop | `commit`/`rollback`はtxをconsumeし、certain native success後だけconnを返す。end errorはfail-safe rollback+closeのためtx ownerをliveに保つ。implicit Dropはcommitせず、best-effort rollback、exactly once close、transferred state null、wrapper freeをnative orderで行う。 | success/error/early-return/branch/`?` end matrixとclose/rollback/commit counter |
+| generic/ABI closure | fixed 8-aligned execution descriptorを104-byte v2から120-byte v3へbumpし、offset 0〜103は不変とする。offset 104はQuery/commandでnon-nullのproducer-owned `fn(name: str) -> i32` parameter-ordinal resolver、offset 112はexact `u32` distinct-parameter count、offset 116はreserved zeroである。generic stmt binder bridgeはpackage-privateで、concrete `stmt<P,R>` referenceとmatching Pを要求し、exact borrow modeでretained producer thunkへlowerする。application sourceまたはmalformed HIRからの使用をrejectする。whole/per-unit linkageはreachableな時だけproducer thunkとnative libraryを保持する。 | sema/MIR fail-closed bridge owner、exact descriptor size/offset/signature owner、whole/per-unit runtime parity |
+| explicit later cells | Q4aは`next`、borrowed current-row view、common deadline enforcement、cancellation、portal、statement cacheをpublishしない。D8がtyped row delivery/generationとfull bind/decode type matrix、D9がdeadline/cancel completionを所有する。Q4aはそのconsumerに必要なrows cleanupとprepared text/blob copy lifetimeをcloseする。 | absence/interface goldenとQ4b/D8+D9 matrix |
+
+candidate review前にauthor-side matrix-to-diff passで全applicable rowを1 source pathと1 ownerへ
+対応させる。bind/end/cleanupの1 branchにfindingが出た場合、coherent fix commit前に両driverと
+conn/tx parentの同じroot-cause classをauditする。
+
 ### D8 — typed row streaming
 
 `db.rows<Row>`、`next` generation、text/blob owner-tied view、old-view compile rejection、

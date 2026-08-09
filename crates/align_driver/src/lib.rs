@@ -224,7 +224,9 @@ fn install_static_descriptor_data(
             .map_err(|_| format!("generated static descriptor symbol `{name}` is invalid"))
     };
     let callback = |name: &str| program_call(&format!("pkg.db.internal${name}"));
-    let bind_callback = callback("bind_i64_v1")?;
+    let bind_i64_callback = callback("bind_i64_v1")?;
+    let bind_text_callback = callback("bind_text_v1")?;
+    let bind_bytes_callback = callback("bind_bytes_v1")?;
     let sqlite_version_callback = callback("require_sqlite_version_v1")?;
     let postgres_type_callback = callback("set_postgres_i64_type_v1")?;
     let row_count_callback = callback("validate_row_count_v1")?;
@@ -247,7 +249,16 @@ fn install_static_descriptor_data(
             return_cleanup: no_cleanup,
         });
     };
-    ensure_import(bind_callback.clone(), vec![Ty::Raw, u32_ty, i64_ty], i32_ty);
+    ensure_import(bind_i64_callback.clone(), vec![Ty::Raw, u32_ty, i64_ty], i32_ty);
+    ensure_import(bind_text_callback.clone(), vec![Ty::Raw, u32_ty, Ty::Str], i32_ty);
+    ensure_import(
+        bind_bytes_callback.clone(),
+        vec![Ty::Raw, u32_ty, Ty::Slice(align_sema::Scalar::Int(IntTy {
+            bits: 8,
+            signed: false,
+        }))],
+        i32_ty,
+    );
     ensure_import(
         sqlite_version_callback.clone(),
         vec![Ty::Raw, u32_ty, u32_ty, u32_ty],
@@ -346,8 +357,34 @@ fn install_static_descriptor_data(
                 descriptor.descriptor_id
             ));
         }
-        let binder_supported = !first_binder.iter().any(|field| {
-            field.shape.kind != GeneratedValueKind::I64 || field.shape.nullable
+        let params_field_tys = match descriptor.params_ty {
+            Ty::Struct(id) => mir
+                .structs
+                .get(id as usize)
+                .map(|definition| {
+                    definition.fields.iter().map(|field| field.ty).collect::<Vec<_>>()
+                })
+                .ok_or_else(|| "generated descriptor Params struct is absent".to_string())?,
+            _ => return Err("generated descriptor Params contract is not a struct".to_string()),
+        };
+        let binder_supported = first_binder.iter().all(|field| {
+            if field.shape.nullable {
+                return false;
+            }
+            let Some(source_ty) = params_field_tys.get(field.params_field_ordinal as usize) else {
+                return false;
+            };
+            match field.shape.kind {
+                GeneratedValueKind::I64 => *source_ty == i64_ty,
+                GeneratedValueKind::Text => *source_ty == Ty::Str,
+                GeneratedValueKind::Bytes => {
+                    *source_ty == Ty::Slice(align_sema::Scalar::Int(IntTy {
+                        bits: 8,
+                        signed: false,
+                    }))
+                }
+                _ => false,
+            }
         });
         let row_supported = match &artifact.runtime {
             GeneratedStaticRuntime::Query(runtime) => !runtime.decoder.fields.iter().any(|field| {
@@ -366,6 +403,7 @@ fn install_static_descriptor_data(
         let static_name = program_call(&format!("{symbol}$static_validate_v1"))?;
         let row_name = program_call(&format!("{symbol}$row_validate_v1"))?;
         let decode_name = program_call(&format!("{symbol}$decode_v1"))?;
+        let parameter_ordinal_name = program_call(&format!("{symbol}$parameter_ordinal_v1"))?;
         let query_meta_name = if descriptor.consumer == StaticDescriptorConsumer::Query {
             let (name, function) =
                 query_meta_codegen::generate_query_meta_thunk(mir, &symbol, artifact)?;
@@ -376,12 +414,21 @@ fn install_static_descriptor_data(
         };
 
         let mut binder_blocks = Vec::new();
+        let mut binder_value_tys = Vec::new();
         for (index, field) in emitted_binder_fields.iter().enumerate() {
             let field_value = (index * 3) as u32;
             let status_value = field_value + 1;
             let success_value = field_value + 2;
             let next = (index + 1) as u32;
             let fail = (emitted_binder_fields.len() + index + 1) as u32;
+            let source_ty = params_field_tys[field.params_field_ordinal as usize];
+            let bind_callback = match field.shape.kind {
+                GeneratedValueKind::I64 => bind_i64_callback.clone(),
+                GeneratedValueKind::Text => bind_text_callback.clone(),
+                GeneratedValueKind::Bytes => bind_bytes_callback.clone(),
+                _ => return Err("unsupported generated binder field reached emission".to_string()),
+            };
+            binder_value_tys.extend([source_ty, i32_ty, Ty::Bool]);
             binder_blocks.push(Block {
                 id: index as u32,
                 stmts: vec![
@@ -445,11 +492,90 @@ fn install_static_descriptor_data(
             return_cleanup: no_cleanup,
             slots: vec![Ty::Raw, descriptor.params_ty],
             slot_align: vec![None, None],
-            value_tys: emitted_binder_fields
-                .iter()
-                .flat_map(|_| [i64_ty, i32_ty, Ty::Bool])
-                .collect(),
+            value_tys: binder_value_tys,
             blocks: binder_blocks,
+            entry: 0,
+            exportable: false,
+        });
+
+        let align_sema::StaticContractType::Named { path, args } =
+            &descriptor.params_contract.root
+        else {
+            return Err("generated parameter contract root is not nominal".to_string());
+        };
+        let parameter_fields = descriptor
+            .params_contract
+            .definitions
+            .iter()
+            .find(|definition| definition.path == *path && definition.args == *args)
+            .and_then(|definition| match &definition.kind {
+                align_sema::StaticContractDefinitionBody::Struct { fields } => {
+                    Some(fields.as_slice())
+                }
+                align_sema::StaticContractDefinitionBody::Sum { .. } => None,
+            })
+            .ok_or_else(|| "generated parameter contract is not a struct".to_string())?;
+        let mut ordinal_blocks = Vec::new();
+        let mut ordinal_value_tys = Vec::new();
+        let miss_block = first_binder.len() as u32;
+        for (index, field) in first_binder.iter().enumerate() {
+            let name = parameter_fields
+                .get(field.params_field_ordinal as usize)
+                .ok_or_else(|| "generated binder field ordinal is out of range".to_string())?
+                .name
+                .clone();
+            let literal = (index * 2) as u32;
+            let equal = literal + 1;
+            ordinal_value_tys.extend([Ty::Str, Ty::Bool]);
+            ordinal_blocks.push(Block {
+                id: index as u32,
+                stmts: vec![
+                    Stmt::Let(literal, Rvalue::StrLit(name)),
+                    Stmt::Let(
+                        equal,
+                        Rvalue::Bin(BinOp::Eq, Operand::Arg(0), Operand::Value(literal)),
+                    ),
+                ],
+                stmt_lines: Vec::new(),
+                term: Term::Branch(
+                    Operand::Value(equal),
+                    miss_block + 1 + index as u32,
+                    index as u32 + 1,
+                ),
+            });
+        }
+        ordinal_blocks.push(Block {
+            id: miss_block,
+            stmts: Vec::new(),
+            stmt_lines: Vec::new(),
+            term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
+        });
+        for (index, field) in first_binder.iter().enumerate() {
+            let ordinal = i32::try_from(field.protocol_ordinal)
+                .map_err(|_| "generated parameter ordinal exceeds i32::MAX".to_string())?;
+            ordinal_blocks.push(Block {
+                id: miss_block + 1 + index as u32,
+                stmts: Vec::new(),
+                stmt_lines: Vec::new(),
+                term: Term::Return(Some(Operand::Const(Const::Int(
+                    i128::from(ordinal),
+                    i32_ty,
+                )))),
+            });
+        }
+        generated_functions.push(Function {
+            name: parameter_ordinal_name.clone(),
+            params: vec![0],
+            param_modes: vec![ParamMode::ByValue],
+            borrow_mut_cleanup_slots: vec![None],
+            ret: i32_ty,
+            return_borrow: none_borrow.clone(),
+            return_region: none_region.clone(),
+            return_cleanup: no_cleanup,
+            slots: vec![Ty::Str],
+            slot_align: vec![None],
+            value_tys: ordinal_value_tys,
+            blocks: ordinal_blocks,
             entry: 0,
             exportable: false,
         });
@@ -594,8 +720,8 @@ fn install_static_descriptor_data(
             exportable: false,
         });
 
-        let mut header = vec![0u8; 104];
-        header[0..4].copy_from_slice(&2u32.to_le_bytes());
+        let mut header = vec![0u8; 120];
+        header[0..4].copy_from_slice(&3u32.to_le_bytes());
         header[4] = match descriptor.consumer {
             StaticDescriptorConsumer::Query => 0,
             StaticDescriptorConsumer::Command => 1,
@@ -617,6 +743,11 @@ fn install_static_descriptor_data(
         }
         header[5] = driver_mask;
         header[24..32].copy_from_slice(&(descriptor.descriptor_id.len() as i64).to_le_bytes());
+        header[112..116].copy_from_slice(
+            &u32::try_from(first_binder.len())
+                .map_err(|_| "generated parameter count exceeds u32::MAX".to_string())?
+                .to_le_bytes(),
+        );
         if let Some(sql) = &sqlite_sql {
             header[40..48].copy_from_slice(&(sql.len() as i64).to_le_bytes());
         }
@@ -645,6 +776,10 @@ fn install_static_descriptor_data(
             StaticDataRelocation {
                 offset: 72,
                 target: StaticDataTarget::Function(static_name),
+            },
+            StaticDataRelocation {
+                offset: 104,
+                target: StaticDataTarget::Function(parameter_ordinal_name),
             },
         ];
         if let Some(sql) = sqlite_sql {
@@ -838,6 +973,7 @@ fn install_static_descriptor_data(
                 target: StaticDataTarget::Function(query_meta_name),
             });
         }
+        relocations.sort_by_key(|relocation| relocation.offset);
 
         let function = &mut mir.fns[function_index];
         function.params.clear();

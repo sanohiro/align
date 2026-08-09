@@ -3,11 +3,15 @@ module pkg.db.internal.resource
 extern "C" link("sqlite3") {
   fn sqlite3_close_v2(database: raw) -> i32
   fn sqlite3_finalize(statement: raw) -> i32
+  fn sqlite3_reset(statement: raw) -> i32
+  fn sqlite3_clear_bindings(statement: raw) -> i32
+  fn sqlite3_exec(database: raw, sql: raw, callback: raw, argument: raw, error_out: raw) -> i32
 }
 
 extern "C" link("pq") {
   fn PQfinish(connection: raw)
   fn PQclear(result: raw)
+  fn PQexec(connection: raw, command: raw) -> raw
 }
 
 // The state is private to pkg.db descendants. Its fixed Q2 prefix is:
@@ -18,13 +22,14 @@ extern "C" link("pq") {
 //   8: raw native connection
 //  16: i32 SQLite busy timeout in native milliseconds
 //  20: u8  active execution lease
-//  21: u8  reserved
+//  21: u8  active transaction owner
 //  22: u16 reserved
+//  24: i64 next connection-local prepared-statement ordinal
 // The native pointer stays an actual pointer. The package never integer-casts it and the runtime
 // owns neither this layout nor either database handle.
 pub fn new_conn_state(driver: u8, native: raw, sqlite_busy_ms: i32) -> raw {
   unsafe {
-    state := raw.alloc(24)
+    state := raw.alloc(32)
     version: u32 := 1
     clear: u8 := 0
     reserved: u16 := 0
@@ -37,7 +42,47 @@ pub fn new_conn_state(driver: u8, native: raw, sqlite_busy_ms: i32) -> raw {
     raw.store(state, 20, clear)
     raw.store(state, 21, clear)
     raw.store(state, 22, reserved)
+    next_statement: i64 := 0
+    raw.store(state, 24, next_statement)
     return state
+  }
+}
+
+fn c_string(value: str) -> raw {
+  unsafe {
+    bytes := value.bytes()
+    output := raw.alloc(bytes.len() + 1)
+    mut i := 0
+    loop {
+      if i >= bytes.len() { break }
+      raw.store(output, i, bytes[i])
+      i = i + 1
+    }
+    raw.store(output, bytes.len(), 0 as u8)
+    return output
+  }
+}
+
+fn rollback_state(state: raw) {
+  unsafe {
+    if state.is_null() { return }
+    version: u32 := raw.load(state, 0)
+    driver: u8 := raw.load(state, 4)
+    closed: u8 := raw.load(state, 5)
+    active: u8 := raw.load(state, 21)
+    native: raw := raw.load(state, 8)
+    if version != 1 || closed != 0 || active == 0 || native.is_null() { return }
+    sql := c_string("ROLLBACK")
+    if driver == 1 {
+      ignored := sqlite3_exec(native, sql, raw.null(), raw.null(), raw.null())
+    } else {
+      if driver == 2 {
+        result := PQexec(native, sql)
+        if !result.is_null() { PQclear(result) }
+      }
+    }
+    raw.free(sql)
+    raw.store(state, 21, 0 as u8)
   }
 }
 
@@ -65,10 +110,290 @@ pub fn drop_conn(state: raw) {
 }
 
 pub fn drop_tx(state: raw) {
-  // D7 extends the private transaction state. Until then a transaction cannot be constructed, but
-  // the settled resource type uses the same fail-closed native dispatch if malformed trusted HIR
-  // ever supplies one.
-  unsafe { drop_state(state) }
+  unsafe {
+    rollback_state(state)
+    drop_state(state)
+  }
+}
+
+pub fn transaction_active(state: raw) -> bool {
+  unsafe {
+    if state.is_null() { return false }
+    version: u32 := raw.load(state, 0)
+    closed: u8 := raw.load(state, 5)
+    active: u8 := raw.load(state, 21)
+    native: raw := raw.load(state, 8)
+    return version == 1 && closed == 0 && active != 0 && !native.is_null()
+  }
+}
+
+pub fn set_transaction_active(state: raw, active: bool) {
+  unsafe {
+    if state.is_null() { return }
+    raw.store(state, 21, if active { 1 as u8 } else { 0 as u8 })
+  }
+}
+
+pub fn next_statement_ordinal(state: raw) -> i64 {
+  unsafe {
+    if state.is_null() { return -1 }
+    current: i64 := raw.load(state, 24)
+    if current < 0 || current == 9223372036854775807 { return -1 }
+    raw.store(state, 24, current + 1)
+    return current
+  }
+}
+
+pub fn poison_conn_state(state: raw) {
+  unsafe {
+    if state.is_null() { return }
+    version: u32 := raw.load(state, 0)
+    driver: u8 := raw.load(state, 4)
+    closed: u8 := raw.load(state, 5)
+    native: raw := raw.load(state, 8)
+    if version != 1 || closed != 0 || native.is_null() { return }
+    raw.store(state, 5, 1 as u8)
+    raw.store(state, 8, raw.null())
+    raw.store(state, 20, 0 as u8)
+    raw.store(state, 21, 0 as u8)
+    if driver == 1 {
+      ignored := sqlite3_close_v2(native)
+    } else {
+      if driver == 2 { PQfinish(native) }
+    }
+  }
+}
+
+// A prepared statement wrapper is dependent on the conn/tx resource generation that created it.
+//   0: u32 version (= 1)
+//   4: u8  driver
+//   5: u8  closed
+//   6: u16 reserved
+//   8: raw sqlite3_stmt / PostgreSQL prepared-name C string
+//  16: raw connection state
+//  24: raw generated Params binder
+//  32: raw owned Query-ID bytes with a trailing NUL
+//  40: i64 Query-ID byte length
+//  48: raw PostgreSQL DEALLOCATE command C string, null for SQLite
+pub fn new_stmt_state(
+  driver: u8,
+  native: raw,
+  connection_state: raw,
+  binder: raw,
+  query_id: raw,
+  query_id_len: i64,
+  deallocate_sql: raw,
+) -> raw {
+  unsafe {
+    statement := raw.alloc(56)
+    raw.store(statement, 0, 1 as u32)
+    raw.store(statement, 4, driver)
+    raw.store(statement, 5, 0 as u8)
+    raw.store(statement, 6, 0 as u16)
+    raw.store(statement, 8, native)
+    raw.store(statement, 16, connection_state)
+    raw.store(statement, 24, binder)
+    raw.store(statement, 32, query_id)
+    raw.store(statement, 40, query_id_len)
+    raw.store(statement, 48, deallocate_sql)
+    return statement
+  }
+}
+
+pub fn stmt_driver(statement: raw) -> u8 {
+  unsafe {
+    if statement.is_null() { return 0 }
+    version: u32 := raw.load(statement, 0)
+    driver: u8 := raw.load(statement, 4)
+    closed: u8 := raw.load(statement, 5)
+    reserved: u16 := raw.load(statement, 6)
+    if version != 1 || (driver != 1 && driver != 2) || closed != 0 || reserved != 0 {
+      return 0
+    }
+    return driver
+  }
+}
+
+pub fn stmt_native(statement: raw) -> raw {
+  unsafe {
+    if stmt_driver(statement) == 0 { return raw.null() }
+    return raw.load(statement, 8)
+  }
+}
+
+pub fn stmt_connection_state(statement: raw) -> raw {
+  unsafe {
+    if stmt_driver(statement) == 0 { return raw.null() }
+    return raw.load(statement, 16)
+  }
+}
+
+pub fn stmt_query_id_pointer(statement: raw) -> raw {
+  unsafe {
+    if stmt_driver(statement) == 0 { return raw.null() }
+    return raw.load(statement, 32)
+  }
+}
+
+pub fn stmt_query_id_length(statement: raw) -> i64 {
+  unsafe {
+    if stmt_driver(statement) == 0 { return -1 }
+    return raw.load(statement, 40)
+  }
+}
+
+pub fn close_stmt(statement: raw) -> i32 {
+  unsafe {
+    driver := stmt_driver(statement)
+    if driver == 0 { return 0 }
+    native: raw := raw.load(statement, 8)
+    connection_state: raw := raw.load(statement, 16)
+    mut status: i32 := 0
+    if driver == 1 {
+      if !native.is_null() { status = sqlite3_finalize(native) }
+      if status != 0 { poison_conn_state(connection_state) }
+    } else {
+      if driver == 2 && !connection_state.is_null() {
+        closed: u8 := raw.load(connection_state, 5)
+        connection: raw := raw.load(connection_state, 8)
+        deallocate_sql: raw := raw.load(statement, 48)
+        if closed == 0 && !connection.is_null() && !deallocate_sql.is_null() {
+          result := PQexec(connection, deallocate_sql)
+          if !result.is_null() { PQclear(result) }
+        }
+      }
+      if !native.is_null() { raw.free(native) }
+    }
+    query_id: raw := raw.load(statement, 32)
+    deallocate_sql: raw := raw.load(statement, 48)
+    if !query_id.is_null() { raw.free(query_id) }
+    if !deallocate_sql.is_null() { raw.free(deallocate_sql) }
+    raw.store(statement, 5, 1 as u8)
+    raw.store(statement, 8, raw.null())
+    raw.store(statement, 16, raw.null())
+    raw.store(statement, 24, raw.null())
+    raw.store(statement, 32, raw.null())
+    raw.store(statement, 40, 0 as i64)
+    raw.store(statement, 48, raw.null())
+    return status
+  }
+}
+
+pub fn drop_stmt(statement: raw) {
+  unsafe {
+    if statement.is_null() { return }
+    ignored := close_stmt(statement)
+    raw.free(statement)
+  }
+}
+
+fn free_bind_context(driver: u8, context: raw) {
+  unsafe {
+    if context.is_null() { return }
+    cache: raw := raw.load(context, 24)
+    if !cache.is_null() { raw.free(cache) }
+    if driver == 1 {
+      values: raw := raw.load(context, 40)
+      count: u32 := raw.load(context, 48)
+      if !values.is_null() {
+        mut i: u32 := 0
+        loop {
+          if i >= count { break }
+          value: raw := raw.load(values, (i as i64) * 8)
+          if !value.is_null() { raw.free(value) }
+          i = i + 1
+        }
+        raw.free(values)
+      }
+    } else {
+      if driver == 2 {
+        values: raw := raw.load(context, 40)
+        types: raw := raw.load(context, 48)
+        lengths: raw := raw.load(context, 56)
+        formats: raw := raw.load(context, 64)
+        count: u32 := raw.load(context, 72)
+        if !values.is_null() {
+          mut i: u32 := 0
+          loop {
+            if i >= count { break }
+            value: raw := raw.load(values, (i as i64) * 8)
+            if !value.is_null() { raw.free(value) }
+            i = i + 1
+          }
+          raw.free(values)
+        }
+        if !types.is_null() { raw.free(types) }
+        if !lengths.is_null() { raw.free(lengths) }
+        if !formats.is_null() { raw.free(formats) }
+      }
+    }
+    raw.free(context)
+  }
+}
+
+// One prepared execution. SQLite borrows the stmt handle and owns only reset/bind cleanup;
+// PostgreSQL owns one PGresult. Both remain dependent on the statement generation.
+//   0: u32 version (= 1), 4: driver, 5: closed, 6: reserved
+//   8: sqlite3_stmt / PGresult, 16: stmt wrapper, 24: bind context, 32: conn state
+pub fn new_rows_state(
+  driver: u8,
+  native: raw,
+  statement: raw,
+  context: raw,
+  connection_state: raw,
+) -> raw {
+  unsafe {
+    rows := raw.alloc(40)
+    raw.store(rows, 0, 1 as u32)
+    raw.store(rows, 4, driver)
+    raw.store(rows, 5, 0 as u8)
+    raw.store(rows, 6, 0 as u16)
+    raw.store(rows, 8, native)
+    raw.store(rows, 16, statement)
+    raw.store(rows, 24, context)
+    raw.store(rows, 32, connection_state)
+    return rows
+  }
+}
+
+pub fn drop_rows(rows: raw) {
+  unsafe {
+    if rows.is_null() { return }
+    version: u32 := raw.load(rows, 0)
+    driver: u8 := raw.load(rows, 4)
+    closed: u8 := raw.load(rows, 5)
+    reserved: u16 := raw.load(rows, 6)
+    if version == 1 && closed == 0 && reserved == 0 {
+      native: raw := raw.load(rows, 8)
+      context: raw := raw.load(rows, 24)
+      connection_state: raw := raw.load(rows, 32)
+      if driver == 1 {
+        mut reset_status: i32 := 0
+        mut clear_status: i32 := 0
+        if !native.is_null() {
+          reset_status = sqlite3_reset(native)
+          clear_status = sqlite3_clear_bindings(native)
+        }
+        free_bind_context(driver, context)
+        if reset_status != 0 || clear_status != 0 {
+          poison_conn_state(connection_state)
+        } else {
+          if !connection_state.is_null() { raw.store(connection_state, 20, 0 as u8) }
+        }
+      } else {
+        if driver == 2 {
+          if !native.is_null() { PQclear(native) }
+          free_bind_context(driver, context)
+        }
+      }
+      raw.store(rows, 5, 1 as u8)
+      raw.store(rows, 8, raw.null())
+      raw.store(rows, 16, raw.null())
+      raw.store(rows, 24, raw.null())
+      raw.store(rows, 32, raw.null())
+    }
+    raw.free(rows)
+  }
 }
 
 // A synchronous D12 catalog/EXPLAIN cursor owns one SQLite statement or PostgreSQL result while

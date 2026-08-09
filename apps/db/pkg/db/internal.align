@@ -2,6 +2,8 @@ module pkg.db.internal
 
 extern "C" link("sqlite3") {
   fn sqlite3_bind_int64(statement: raw, index: i32, value: i64) -> i32
+  fn sqlite3_bind_text(statement: raw, index: i32, value: raw, bytes: i32, destructor: raw) -> i32
+  fn sqlite3_bind_blob(statement: raw, index: i32, value: raw, bytes: i32, destructor: raw) -> i32
   fn sqlite3_column_count(statement: raw) -> i32
   fn sqlite3_column_name(statement: raw, index: i32) -> raw
   fn sqlite3_column_type(statement: raw, index: i32) -> i32
@@ -31,6 +33,7 @@ FAILURE_NONE: u8 := 0
 FAILURE_NATIVE: u8 := 1
 FAILURE_UNSUPPORTED: u8 := 2
 FAILURE_ROW: u8 := 3
+FAILURE_ENCODE: u8 := 4
 SQLITE_OK: i32 := 0
 SQLITE_INTEGER: i32 := 1
 POSTGRES_INT8_OID: u32 := 20
@@ -60,6 +63,10 @@ pub PostgresCatalogControls {
 //  24: raw cached decoded i64 values
 //  32: u32 cached value count
 //  36: u32 reserved
+// SQLite prepared binding extends the allocation:
+//  40: raw retained text/blob pointer vector
+//  48: u32 retained pointer vector length
+//  52: u32 reserved
 // PostgreSQL extends the allocation while binding:
 //  40: raw parameter value-pointer vector
 //  48: raw parameter OID vector
@@ -156,6 +163,200 @@ pub fn bind_i64_v1(context: raw, protocol_ordinal: u32, value: i64) -> i32 {
   }
 }
 
+fn ensure_sqlite_slots(context: raw, required: u32) -> bool {
+  unsafe {
+    if !context_base_valid(context, DRIVER_SQLITE) || required == 0 { return false }
+    old_count: u32 := raw.load(context, 48)
+    if required <= old_count { return true }
+    values := raw.alloc((required as i64) * 8)
+    old_values: raw := raw.load(context, 40)
+    mut i: u32 := 0
+    loop {
+      if i >= required { break }
+      value: raw := if i < old_count {
+        raw.load(old_values, (i as i64) * 8)
+      } else { raw.null() }
+      raw.store(values, (i as i64) * 8, value)
+      i = i + 1
+    }
+    if !old_values.is_null() { raw.free(old_values) }
+    raw.store(context, 40, values)
+    raw.store(context, 48, required)
+    return true
+  }
+}
+
+fn copy_str_bytes(value: str) -> raw {
+  unsafe {
+    bytes := value.bytes()
+    output := raw.alloc(bytes.len() + 1)
+    mut i := 0
+    loop {
+      if i >= bytes.len() { break }
+      raw.store(output, i, bytes[i])
+      i = i + 1
+    }
+    raw.store(output, bytes.len(), 0 as u8)
+    return output
+  }
+}
+
+fn copy_slice_bytes(value: slice<u8>) -> raw {
+  unsafe {
+    output := raw.alloc(value.len() + 1)
+    mut i := 0
+    loop {
+      if i >= value.len() { break }
+      raw.store(output, i, value[i])
+      i = i + 1
+    }
+    raw.store(output, value.len(), 0 as u8)
+    return output
+  }
+}
+
+fn postgres_text_has_nul(value: str) -> bool {
+  bytes := value.bytes()
+  mut i := 0
+  loop {
+    if i >= bytes.len() { break false }
+    if bytes[i] == 0 { break true }
+    i = i + 1
+  }
+}
+
+fn postgres_bytea_hex(value: slice<u8>) -> raw {
+  unsafe {
+    length := value.len() * 2 + 2
+    output := raw.alloc(length + 1)
+    raw.store(output, 0, 92 as u8)
+    raw.store(output, 1, 120 as u8)
+    mut i := 0
+    loop {
+      if i >= value.len() { break }
+      byte := value[i]
+      high := byte / 16
+      low := byte % 16
+      raw.store(output, i * 2 + 2, if high < 10 { 48 + high } else { 87 + high })
+      raw.store(output, i * 2 + 3, if low < 10 { 48 + low } else { 87 + low })
+      i = i + 1
+    }
+    raw.store(output, length, 0 as u8)
+    return output
+  }
+}
+
+pub fn bind_text_v1(context: raw, protocol_ordinal: u32, value: str) -> i32 {
+  unsafe {
+    if protocol_ordinal == 0 || protocol_ordinal > 2147483647 || value.len() > 2147483647 {
+      record_failure(context, FAILURE_ENCODE)
+      return 1
+    }
+    if context_ready(context, DRIVER_SQLITE) {
+      if !ensure_sqlite_slots(context, protocol_ordinal) {
+        record_failure(context, FAILURE_NATIVE)
+        return 1
+      }
+      statement: raw := raw.load(context, 8)
+      copied := copy_str_bytes(value)
+      status := sqlite3_bind_text(
+        statement, protocol_ordinal as i32, copied, value.len() as i32, raw.null(),
+      )
+      if status != SQLITE_OK {
+        raw.free(copied)
+        record_failure(context, FAILURE_NATIVE)
+        return 1
+      }
+      values: raw := raw.load(context, 40)
+      offset := ((protocol_ordinal as i64) - 1) * 8
+      old: raw := raw.load(values, offset)
+      if !old.is_null() { raw.free(old) }
+      raw.store(values, offset, copied)
+      return 0
+    }
+    if context_ready(context, DRIVER_POSTGRES) {
+      if postgres_text_has_nul(value) {
+        record_failure(context, FAILURE_ENCODE)
+        return 1
+      }
+      if !ensure_postgres_slots(context, protocol_ordinal) {
+        record_failure(context, FAILURE_NATIVE)
+        return 1
+      }
+      copied := copy_str_bytes(value)
+      values: raw := raw.load(context, 40)
+      lengths: raw := raw.load(context, 56)
+      formats: raw := raw.load(context, 64)
+      offset := (protocol_ordinal as i64) - 1
+      old: raw := raw.load(values, offset * 8)
+      if !old.is_null() { raw.free(old) }
+      raw.store(values, offset * 8, copied)
+      raw.store(lengths, offset * 4, value.len() as i32)
+      raw.store(formats, offset * 4, 0 as i32)
+      return 0
+    }
+    return 1
+  }
+}
+
+pub fn bind_bytes_v1(context: raw, protocol_ordinal: u32, value: slice<u8>) -> i32 {
+  unsafe {
+    if protocol_ordinal == 0 || protocol_ordinal > 2147483647 {
+      record_failure(context, FAILURE_NATIVE)
+      return 1
+    }
+    if context_ready(context, DRIVER_SQLITE) {
+      if value.len() > 2147483647 {
+        record_failure(context, FAILURE_ENCODE)
+        return 1
+      }
+      if !ensure_sqlite_slots(context, protocol_ordinal) {
+        record_failure(context, FAILURE_NATIVE)
+        return 1
+      }
+      statement: raw := raw.load(context, 8)
+      copied := copy_slice_bytes(value)
+      status := sqlite3_bind_blob(
+        statement, protocol_ordinal as i32, copied, value.len() as i32, raw.null(),
+      )
+      if status != SQLITE_OK {
+        raw.free(copied)
+        record_failure(context, FAILURE_NATIVE)
+        return 1
+      }
+      values: raw := raw.load(context, 40)
+      offset := ((protocol_ordinal as i64) - 1) * 8
+      old: raw := raw.load(values, offset)
+      if !old.is_null() { raw.free(old) }
+      raw.store(values, offset, copied)
+      return 0
+    }
+    if context_ready(context, DRIVER_POSTGRES) {
+      if value.len() > 1073741822 {
+        record_failure(context, FAILURE_ENCODE)
+        return 1
+      }
+      if !ensure_postgres_slots(context, protocol_ordinal) {
+        record_failure(context, FAILURE_NATIVE)
+        return 1
+      }
+      encoded := postgres_bytea_hex(value)
+      encoded_length := value.len() * 2 + 2
+      values: raw := raw.load(context, 40)
+      lengths: raw := raw.load(context, 56)
+      formats: raw := raw.load(context, 64)
+      offset := (protocol_ordinal as i64) - 1
+      old: raw := raw.load(values, offset * 8)
+      if !old.is_null() { raw.free(old) }
+      raw.store(values, offset * 8, encoded)
+      raw.store(lengths, offset * 4, encoded_length as i32)
+      raw.store(formats, offset * 4, 0 as i32)
+      return 0
+    }
+    return 1
+  }
+}
+
 fn ensure_postgres_slots(context: raw, required: u32) -> bool {
   unsafe {
     if !context_base_valid(context, DRIVER_POSTGRES) || required == 0 { return false }
@@ -199,6 +400,13 @@ fn ensure_postgres_slots(context: raw, required: u32) -> bool {
     raw.store(context, 72, required)
     return true
   }
+}
+
+// Q4a's PostgreSQL prepare engine sizes the opaque parameter vectors before the static option
+// thunk writes inferred OIDs. The layout remains owned here rather than duplicated by the driver.
+pub fn ensure_postgres_parameters_v1(context: raw, required: u32) -> bool {
+  if required == 0 { return context_base_valid(context, DRIVER_POSTGRES) }
+  return ensure_postgres_slots(context, required)
 }
 
 fn postgres_i64_text(value: i64) -> raw {

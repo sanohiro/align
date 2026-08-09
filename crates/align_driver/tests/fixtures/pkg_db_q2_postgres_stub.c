@@ -20,6 +20,7 @@ typedef struct {
 
 typedef struct {
   int status;
+  const char *command_status;
   int rows;
   int fields;
   const char *names[2];
@@ -42,6 +43,13 @@ static int execute_calls;
 static int clear_calls;
 static int protocol_ok;
 static int last_timeout;
+static int prepare_calls;
+static int execute_prepared_calls;
+static int control_calls;
+static int deallocate_calls;
+static int fail_next_control;
+static int rollback_next_commit;
+static char prepared_name[64];
 
 static char *copy_text(const char *text) {
   size_t n = strlen(text) + 1;
@@ -62,6 +70,13 @@ void align_pg_reset(void) {
   clear_calls = 0;
   protocol_ok = 1;
   last_timeout = -1;
+  prepare_calls = 0;
+  execute_prepared_calls = 0;
+  control_calls = 0;
+  deallocate_calls = 0;
+  fail_next_control = 0;
+  rollback_next_commit = 0;
+  prepared_name[0] = '\0';
 }
 
 int align_pg_connect_calls(void) { return connect_calls; }
@@ -71,6 +86,12 @@ int align_pg_execute_calls(void) { return execute_calls; }
 int align_pg_clear_calls(void) { return clear_calls; }
 int align_pg_protocol_ok(void) { return protocol_ok; }
 int align_pg_last_timeout(void) { return last_timeout; }
+int align_pg_prepare_calls(void) { return prepare_calls; }
+int align_pg_execute_prepared_calls(void) { return execute_prepared_calls; }
+int align_pg_control_calls(void) { return control_calls; }
+int align_pg_deallocate_calls(void) { return deallocate_calls; }
+void align_pg_fail_next_control(void) { fail_next_control = 1; }
+void align_pg_rollback_next_commit(void) { rollback_next_commit = 1; }
 
 PQconninfoOption *PQconninfoParse(const char *connection_info, char **error_out) {
   if (error_out != NULL) *error_out = NULL;
@@ -164,6 +185,7 @@ static FakeResult *new_result(void) {
   FakeResult *result = (FakeResult *)calloc(1, sizeof(FakeResult));
   if (result == NULL) return NULL;
   result->status = 2;
+  result->command_status = "";
   result->rows = 1;
   result->fields = 1;
   result->names[0] = "value";
@@ -176,6 +198,108 @@ static FakeResult *new_result(void) {
   result->constraint_name = "stub_constraint";
   result->table_name = "stub_table";
   result->column_name = "stub_column";
+  return result;
+}
+
+FakeResult *PQprepare(
+    FakeConn *connection,
+    const char *name,
+    const char *command,
+    int parameter_count,
+    const uint32_t *parameter_types) {
+  (void)connection;
+  prepare_calls++;
+  int common_types = prepare_calls == 1 && parameter_types != NULL &&
+                     parameter_types[0] == 20 && parameter_types[1] == 0 &&
+                     parameter_types[2] == 0;
+  int overridden_types = prepare_calls == 2 && parameter_types != NULL &&
+                         parameter_types[0] == 20 && parameter_types[1] == 25 &&
+                         parameter_types[2] == 17;
+  if (name == NULL || strncmp(name, "__align_pkg_db_", 15) != 0 || command == NULL ||
+      parameter_count != 3 || (!common_types && !overridden_types)) {
+    protocol_ok = 0;
+  }
+  if (name != NULL) {
+    size_t length = strlen(name);
+    if (length >= sizeof(prepared_name)) {
+      protocol_ok = 0;
+    } else {
+      memcpy(prepared_name, name, length + 1);
+    }
+  }
+  FakeResult *result = new_result();
+  if (result != NULL) {
+    result->status = 1;
+    result->rows = 0;
+    result->fields = 0;
+  }
+  return result;
+}
+
+FakeResult *PQexecPrepared(
+    FakeConn *connection,
+    const char *name,
+    int parameter_count,
+    const char *const *parameter_values,
+    const int *parameter_lengths,
+    const int *parameter_formats,
+    int result_format) {
+  (void)connection;
+  execute_prepared_calls++;
+  if (name == NULL || strcmp(name, prepared_name) != 0 || parameter_count != 3 ||
+      parameter_values == NULL || parameter_lengths == NULL || parameter_formats == NULL ||
+      result_format != 0 || parameter_values[0] == NULL || parameter_values[1] == NULL ||
+      parameter_values[2] == NULL ||
+      !(strcmp(parameter_values[0], "7") == 0 || strcmp(parameter_values[0], "8") == 0) ||
+      !((strcmp(parameter_values[0], "7") == 0 && strcmp(parameter_values[1], "first") == 0) ||
+        (strcmp(parameter_values[0], "8") == 0 && strcmp(parameter_values[1], "second") == 0)) ||
+      strcmp(parameter_values[2], "\\x010203") != 0) {
+    protocol_ok = 0;
+  }
+  for (int i = 0; i < parameter_count; i++) {
+    if (parameter_values == NULL || parameter_lengths == NULL || parameter_formats == NULL ||
+        parameter_values[i] == NULL || parameter_formats[i] != 0 ||
+        parameter_lengths[i] != (int)strlen(parameter_values[i])) {
+      protocol_ok = 0;
+    }
+  }
+  FakeResult *result = new_result();
+  if (result != NULL) result->names[0] = "id";
+  return result;
+}
+
+FakeResult *PQexec(FakeConn *connection, const char *command) {
+  (void)connection;
+  if (command == NULL) protocol_ok = 0;
+  if (command != NULL && strncmp(command, "DEALLOCATE __align_pkg_db_", 26) == 0) {
+    deallocate_calls++;
+    if (prepared_name[0] == '\0' || strcmp(command + 11, prepared_name) != 0) protocol_ok = 0;
+  } else {
+    control_calls++;
+    if (command == NULL ||
+        (strcmp(command, "BEGIN ISOLATION LEVEL READ COMMITTED READ WRITE NOT DEFERRABLE") != 0 &&
+         strcmp(command, "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE") != 0 &&
+         strcmp(command, "COMMIT") != 0 && strcmp(command, "ROLLBACK") != 0)) {
+      protocol_ok = 0;
+    }
+  }
+  FakeResult *result = new_result();
+  if (result != NULL) {
+    result->status = fail_next_control ? 7 : 1;
+    if (command != NULL && strncmp(command, "BEGIN ", 6) == 0) {
+      result->command_status = "BEGIN";
+    } else if (command != NULL && strcmp(command, "COMMIT") == 0) {
+      result->command_status = rollback_next_commit ? "ROLLBACK" : "COMMIT";
+    } else if (command != NULL && strcmp(command, "ROLLBACK") == 0) {
+      result->command_status = "ROLLBACK";
+    } else if (command != NULL && strncmp(command, "DEALLOCATE ", 11) == 0) {
+      result->command_status = "DEALLOCATE";
+    }
+    result->rows = 0;
+    result->fields = 0;
+  }
+  fail_next_control = 0;
+  rollback_next_commit = 0;
   return result;
 }
 
@@ -245,6 +369,9 @@ FakeResult *PQexecParams(
 }
 
 int PQresultStatus(const FakeResult *result) { return result == NULL ? 7 : result->status; }
+char *PQcmdStatus(const FakeResult *result) {
+  return (char *)(result == NULL ? NULL : result->command_status);
+}
 int PQntuples(const FakeResult *result) { return result == NULL ? -1 : result->rows; }
 int PQnfields(const FakeResult *result) { return result == NULL ? -1 : result->fields; }
 char *PQfname(const FakeResult *result, int column) {
