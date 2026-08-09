@@ -182,6 +182,10 @@ jobs:
         if: matrix.lint
         run: scripts/cargo.sh clippy --workspace --lib --bins --locked -- -D warnings
 
+      - name: Lint ratchet
+        if: matrix.lint
+        run: bash scripts/lint-ratchet.sh
+
       - name: Build compiler and runtime
         if: ${{ !matrix.lint }}
         run: scripts/cargo.sh build --workspace --locked

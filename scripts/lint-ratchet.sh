@@ -20,6 +20,16 @@ count() {
   case "$2" in
     panics) pattern='\.unwrap\(\)|\.expect\(|unreachable!' ;;
     casts) pattern=' as usize| as u32| as i32' ;;
+    # A test that compiles a `.align` source through alignc must read it at RUNTIME
+    # (common::fixture), never include_str! it: baking the source in makes every `.align`
+    # edit rebuild+relink the whole test crate (measured ~6x slower edit->test on pkg.db).
+    # Scanned across every crate's tests/ so a new bake is caught wherever it lands.
+    fixture-bake)
+      n=$(grep -rE 'include_str!\("[^"]*\.align"' crates/*/tests --include='*.rs' 2>/dev/null \
+        | grep -cv '^[^:]*:[[:space:]]*//') || n=0
+      echo "$n"
+      return 0
+      ;;
     *) echo "unknown ratchet kind: $2" >&2; exit 2 ;;
   esac
   [[ -d "$dir" ]] || {
@@ -32,7 +42,8 @@ count() {
 
 rows="align_mir panics
 align_codegen_llvm panics
-align_runtime casts"
+align_runtime casts
+workspace fixture-bake"
 
 if [[ "${1:-}" == "--update" ]]; then
   {
@@ -58,6 +69,7 @@ while IFS=' ' read -r crate kind; do
     case "$kind" in
       panics) echo "  New unwrap()/expect()/unreachable! in $crate. User-input-reachable code must diagnose, never panic (Gate 3): return an error via .get()/.ok_or_else()/checked_sub instead. For a genuine internal invariant, justify it in a comment at the call site — then run scripts/lint-ratchet.sh --update in the same commit." >&2 ;;
       casts) echo "  New 'as usize/u32/i32' in $crate. Incoming lengths/counts must use usize::try_from + checked_mul/checked_add (Gate 2). For a proven-lossless cast, justify it in a comment — then run scripts/lint-ratchet.sh --update in the same commit." >&2 ;;
+      fixture-bake) echo "  New include_str! of a .align source in a test. Read it at RUNTIME via common::fixture(\"path/from/repo/root.align\") instead — baking it in makes every .align edit rebuild+relink the whole test crate (~6x slower edit->test, measured on pkg.db)." >&2 ;;
     esac
     status=1
   elif [[ "$current" -lt "$pinned" ]]; then
