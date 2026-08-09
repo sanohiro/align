@@ -28,6 +28,12 @@
 use std::path::{Path, PathBuf};
 use std::ffi::OsString;
 use std::process::ExitCode;
+
+/// The compiler is an allocation-heavy workload; mimalloc measurably beats the
+/// system allocator for it (same reason rustc ships jemalloc). Binary-only:
+/// tests use the `align_driver` library and keep the default allocator.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use align_driver::{
