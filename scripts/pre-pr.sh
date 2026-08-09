@@ -130,7 +130,12 @@ if [[ $# -gt 0 ]]; then
 fi
 if [[ "$rust_changed" == true ]]; then
   scripts/test-pr.sh
-  scripts/cargo.sh clippy --workspace --lib --bins --locked -- -D warnings
+  # Clippy keeps its own target dir: clippy and build/test record incompatible
+  # fingerprints in a shared dir, so alternating them forces a near-full
+  # rebuild in both directions. A dedicated dir makes the warm clippy pass
+  # incremental and stops it from invalidating the test build cache.
+  CARGO_TARGET_DIR=target/clippy \
+    scripts/cargo.sh clippy --workspace --lib --bins --locked -- -D warnings
 fi
 [[ "$(git rev-parse HEAD)" == "$head_sha" && -z "$(git status --porcelain)" ]] || {
   echo "HEAD or worktree changed during preflight" >&2

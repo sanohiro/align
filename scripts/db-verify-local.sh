@@ -26,12 +26,13 @@ docker run -d --name "$name" \
   -e POSTGRES_DB=align -e POSTGRES_USER=align -e POSTGRES_PASSWORD=align \
   -p "127.0.0.1:${port}:5432" "$image" >/dev/null
 
-# postgres's init entrypoint restarts the server once, so a single successful
-# probe can race the restart; require three consecutive ready probes.
+# postgres's init entrypoint starts a temporary server (unix socket only,
+# listen_addresses='') and then restarts. Probe over TCP: the temp server has
+# no TCP listener, so three consecutive TCP successes prove the final server.
 ready=0
 attempt=0
 while [ "$attempt" -lt 90 ]; do
-  if docker exec "$name" pg_isready -U align -d align >/dev/null 2>&1; then
+  if docker exec "$name" pg_isready -h 127.0.0.1 -U align -d align >/dev/null 2>&1; then
     ready=$((ready + 1))
     [ "$ready" -ge 3 ] && break
   else
@@ -48,7 +49,7 @@ fi
 export ALIGN_DB_POSTGRES_REQUIRED=1
 export ALIGN_DB_POSTGRES_URL="postgresql://align:align@127.0.0.1:${port}/align"
 
-docker exec "$name" psql -U align -d align -Atqc 'SHOW server_version'
+docker exec "$name" psql -h 127.0.0.1 -U align -d align -Atqc 'SHOW server_version'
 
 # Step 1 (inverted, as in CI): required mode with a missing URL must FAIL.
 set +e

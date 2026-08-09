@@ -56,15 +56,25 @@ prepend_library_path() {
   esac
 }
 
-# Homebrew keeps LLVM and OpenSSL keg-only. Debian/Ubuntu packages install
-# their link libraries in compiler-default paths, so Linux needs no mutation.
+# Homebrew keeps LLVM, OpenSSL, and libpq keg-only (keg-only kegs are not
+# symlinked into /opt/homebrew/lib). Debian/Ubuntu packages install their link
+# libraries in compiler-default paths, so Linux needs no mutation.
 if [[ "$(uname -s)" == Darwin ]]; then
   prepend_library_path "$llvm_prefix/lib"
   prepend_library_path /opt/homebrew/lib
   prepend_library_path /opt/homebrew/opt/openssl@3/lib
+  prepend_library_path /opt/homebrew/opt/libpq/lib
   prepend_library_path /usr/local/lib
   prepend_library_path /usr/local/opt/openssl@3/lib
+  prepend_library_path /usr/local/opt/libpq/lib
   export LIBRARY_PATH
+  # Some macOS hosts intermittently park freshly linked test binaries at 0% CPU
+  # in _dyld_start against the shared dyld cache (recurring HANDOFF incidents,
+  # historically dodged per-run with dedicated target dirs). A private region
+  # avoids the stall. Respect an explicit override, and leave CI untouched.
+  if [[ -z "${CI:-}" ]]; then
+    export DYLD_SHARED_REGION="${DYLD_SHARED_REGION:-private}"
+  fi
 fi
 
 exec cargo "$@"
