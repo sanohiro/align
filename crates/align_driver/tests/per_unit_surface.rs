@@ -364,7 +364,10 @@ fn emit_llvm_n1_has_no_banner_and_matches_whole_program() {
     }
     let src = "fn main() -> i32 {\n  return [1, 2, 3].sum() as i32\n}\n";
     let proj = Proj::new("emit-llvm-n1", &[("solo.align", src)]);
-    let cli = proj.run(&["emit-llvm", "solo.align"]);
+    // rt-LTO defaults ON at the CLI's release profile; the whole-program `emit_llvm` helper lowers
+    // without it. This test pins N=1-vs-whole-program parity, which is orthogonal to rt-LTO, so
+    // hold the CLI side at the helper's setting explicitly.
+    let cli = proj.run(&["emit-llvm", "--no-rt-lto", "solo.align"]);
     assert!(cli.status.success(), "emit-llvm failed: {}", String::from_utf8_lossy(&cli.stderr));
     let cli_ir = String::from_utf8_lossy(&cli.stdout);
     assert!(!cli_ir.contains("==== unit:"), "a single-unit program must have no banner:\n{cli_ir}");
@@ -554,6 +557,25 @@ fn cli_rt_lto_multi_file_inlines_in_non_entry_unit() {
         "under per-unit --rt-lto align_rt_str_eq must inline in the non-entry unit:\n{hot_section}"
     );
 
+    // The 2026-08-09 default flip: an absent flag at the (default) release profile behaves like
+    // `--rt-lto`, and `--no-rt-lto` restores the call. Pin both directions of the new contract.
+    let default_on = proj.run(&["emit-llvm", "main.align", "--stage", "optimized"]);
+    assert!(default_on.status.success(), "default emit-llvm failed: {}", String::from_utf8_lossy(&default_on.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&default_on.stdout),
+        text,
+        "flagless release emit-llvm must equal the explicit --rt-lto output (default ON)"
+    );
+    let off = proj.run(&["emit-llvm", "--no-rt-lto", "main.align", "--stage", "optimized"]);
+    assert!(off.status.success(), "emit-llvm --no-rt-lto failed: {}", String::from_utf8_lossy(&off.stderr));
+    let off_text = String::from_utf8_lossy(&off.stdout);
+    let off_hot_start = off_text.find("; ==== unit: hot ====").expect("hot section (off)");
+    let off_hot = &off_text[off_hot_start..off_text[off_hot_start + 1..].find("; ==== unit:").map(|i| off_hot_start + 1 + i).unwrap_or(off_text.len())];
+    assert!(
+        off_hot.contains("call i32 @align_rt_str_eq"),
+        "--no-rt-lto must keep the runtime call:\n{off_hot}"
+    );
+
     // The flag is still rejected on `dev` (needs an inlining pipeline).
     let dev = proj.run(&["build", "--rt-lto", "--profile", "dev", "main.align"]);
     assert!(!dev.status.success(), "--rt-lto on dev must be rejected");
@@ -567,6 +589,9 @@ fn cli_rt_lto_multi_file_inlines_in_non_entry_unit() {
     let non_build = proj.run(&["emit-mir", "--rt-lto", "main.align"]);
     assert!(!non_build.status.success(), "--rt-lto on emit-mir must be rejected");
     let nb_err = String::from_utf8_lossy(&non_build.stderr);
-    assert!(nb_err.contains("--rt-lto is only valid"), "non-build rejection text: {nb_err}");
+    assert!(
+        nb_err.contains("--rt-lto/--no-rt-lto are only valid"),
+        "non-build rejection text: {nb_err}"
+    );
     assert!(!nb_err.contains("build-per-unit"), "the rejection text must not mention the removed verb: {nb_err}");
 }

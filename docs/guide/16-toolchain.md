@@ -42,11 +42,11 @@ alignc size file.align --profile tiny
 ```text
 --profile dev|release|fast|small|tiny   # O0, O2, O3, Os, Oz
 --target-cpu baseline|native|<LLVM CPU>
---rt-lto                               # inline selected runtime bitcode
+--rt-lto / --no-rt-lto                 # force runtime-bitcode LTO on/off (default: on at release/fast)
 --thin-lto                             # cross-unit ThinLTO
 ```
 
-The default is portable `baseline` plus `release`. `native` is for the current machine; a named LLVM CPU such as `x86-64-v3` is useful for a known deployment fleet. `--rt-lto` and `--thin-lto` are explicit because they change compile cost and optimization scope. Both require `release` or `fast`; ThinLTO applies to linked `build`/`run`/`size` operations, is parallel and cached, and composes with runtime LTO.
+The default is portable `baseline` plus `release`. `native` is for the current machine; a named LLVM CPU such as `x86-64-v3` is useful for a known deployment fleet. Runtime LTO is **on by default** under the optimizing `release`/`fast` profiles (measured 2-3× on string-predicate pipelines, non-regressing elsewhere, +1-2ms compile) and off under `dev`/`small`/`tiny`; `--no-rt-lto` / `--rt-lto` force either direction. `--thin-lto` stays explicit because it changes compile cost and optimization scope; it requires `release` or `fast`, applies to linked `build`/`run`/`size` operations, is parallel and cached, and composes with runtime LTO.
 
 For a representative production workload, instrumented PGO is available:
 

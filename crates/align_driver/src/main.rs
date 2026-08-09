@@ -30,8 +30,10 @@ use std::ffi::OsString;
 use std::process::ExitCode;
 
 /// The compiler is an allocation-heavy workload; mimalloc measurably beats the
-/// system allocator for it (same reason rustc ships jemalloc). Binary-only:
-/// tests use the `align_driver` library and keep the default allocator.
+/// system allocator for it (same reason rustc ships jemalloc). Declared on the
+/// `alignc` binary only: in-process library consumers keep the default
+/// allocator, while tests that spawn the real binary (`CARGO_BIN_EXE_alignc`)
+/// exercise the shipped configuration, mimalloc included.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -106,10 +108,12 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // Pull the boolean `--rt-lto` flag (M14 Slice 2): opt-in in-process link of the fast-path string
-    // primitives' bitcode into the program module before the one opt run. Orthogonal to `--profile`
-    // (Nothing-hidden: the mechanism is named, not folded into `fast`).
-    let (rt_lto, args) = parse_rt_lto(&args);
+    // Pull the `--rt-lto` / `--no-rt-lto` override (M14 Slice 2; default flipped 2026-08-09):
+    // in-process link of the fast-path string primitives' bitcode into the program module before
+    // the one opt run. Defaults ON for the optimizing `release`/`fast` profiles (measured 2.1x
+    // aarch64 / 2.9x x86-64 on string-predicate kernels, non-regressing numeric control, +1-2ms
+    // compile) and OFF for `dev`/`small`/`tiny`; the flags force either direction explicitly.
+    let (rt_lto_flag, args) = parse_rt_lto(&args);
     // Pull the boolean `--thin-lto` flag: opt-in cross-unit optimization. Its prelink and backend
     // phases are cached and parallel; release/fast only; composable with `--rt-lto`.
     let (thin_lto, args) = parse_thin_lto(&args);
@@ -136,29 +140,32 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // `--rt-lto` only means something where codegen runs the optimizer over a real build/lens.
-    if rt_lto {
-        if !matches!(
+    // The explicit flags only mean something where codegen runs the optimizer over a real
+    // build/lens; a defaulted value is simply unused elsewhere (`check` etc. never read it).
+    if rt_lto_flag.is_some()
+        && !matches!(
             cmd,
             Some("build") | Some("run") | Some("emit-obj") | Some("size") | Some("emit-llvm")
-        ) {
-            eprintln!(
-                "alignc: --rt-lto is only valid for `build`/`run`/`emit-obj`/`size`/`emit-llvm` (got `{}`)",
-                cmd.unwrap_or("<none>")
-            );
-            return ExitCode::FAILURE;
-        }
-        // `dev` is O0 (nothing inlines, so LTO buys nothing); `small`/`tiny` run the `optsize`/
-        // `minsize` sweep, which conflicts with fast-path inlining. Reject rather than silently no-op.
-        if matches!(profile, Profile::Dev | Profile::Small | Profile::Tiny) {
-            eprintln!(
-                "alignc: --rt-lto is incompatible with the `{}` profile (it needs an inlining \
-                 pipeline; use `release` or `fast`)",
-                profile.name()
-            );
-            return ExitCode::FAILURE;
-        }
+        )
+    {
+        eprintln!(
+            "alignc: --rt-lto/--no-rt-lto are only valid for `build`/`run`/`emit-obj`/`size`/`emit-llvm` (got `{}`)",
+            cmd.unwrap_or("<none>")
+        );
+        return ExitCode::FAILURE;
     }
+    // `dev` is O0 (nothing inlines, so LTO buys nothing); `small`/`tiny` run the `optsize`/
+    // `minsize` sweep, which conflicts with fast-path inlining. An explicit `--rt-lto` there is
+    // rejected rather than silently no-opped; the default resolves to OFF for those profiles.
+    if rt_lto_flag == Some(true) && matches!(profile, Profile::Dev | Profile::Small | Profile::Tiny) {
+        eprintln!(
+            "alignc: --rt-lto is incompatible with the `{}` profile (it needs an inlining \
+             pipeline; use `release` or `fast`)",
+            profile.name()
+        );
+        return ExitCode::FAILURE;
+    }
+    let rt_lto = rt_lto_flag.unwrap_or_else(|| align_driver::default_rt_lto(profile));
 
     // `--thin-lto` links N per-unit objects with cross-unit optimization, so it only means something
     // on the build-producing verbs that link a whole program (`build`/`run`/`size`). `emit-obj` /
@@ -303,14 +310,18 @@ fn parse_exports(args: &[String]) -> Result<(Vec<String>, Vec<String>), ()> {
     Ok((exports, rest))
 }
 
-/// Pull the boolean `--rt-lto` flag out of `args` (M14 Slice 2), returning whether it was present and
-/// the remaining arguments. A valueless flag — repeated occurrences are idempotent.
-fn parse_rt_lto(args: &[String]) -> (bool, Vec<String>) {
-    let mut rt_lto = false;
+/// Pull the `--rt-lto` / `--no-rt-lto` override out of `args` (M14 Slice 2; profile-based default
+/// since 2026-08-09), returning `Some(true)` / `Some(false)` when a flag is present (`None` = use
+/// the profile default) and the remaining arguments. Valueless flags; repeated occurrences are
+/// idempotent and the last occurrence wins when both appear.
+fn parse_rt_lto(args: &[String]) -> (Option<bool>, Vec<String>) {
+    let mut rt_lto = None;
     let mut rest = Vec::new();
     for a in args {
         if a == "--rt-lto" {
-            rt_lto = true;
+            rt_lto = Some(true);
+        } else if a == "--no-rt-lto" {
+            rt_lto = Some(false);
         } else {
             rest.push(a.clone());
         }

@@ -59,15 +59,17 @@ run_pass() {  # $1 = label, $2... = extra alignc args
 }
 
 echo "target: $mode"
-echo "== OFF (no --rt-lto) =="
-OFF=$(run_pass off)
+# rt-LTO defaults ON at the default `release` profile since 2026-08-09, so the
+# OFF arm must disable it explicitly or it silently measures ON vs ON.
+echo "== OFF (--no-rt-lto) =="
+OFF=$(run_pass off --no-rt-lto)
 echo "$OFF"
 echo "== ON (--rt-lto) =="
 ON=$(run_pass on --rt-lto)
 echo "$ON"
 
 echo "== compile-time (emit-obj, best of 5) =="
-OFF_MS=$(compile_ms)
+OFF_MS=$(compile_ms --no-rt-lto)
 ON_MS=$(compile_ms --rt-lto)
 echo "off=${OFF_MS}ms on=${ON_MS}ms delta=$(( ON_MS - OFF_MS ))ms"
 

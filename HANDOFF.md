@@ -29,6 +29,16 @@ schema tooling/inspection path is complete. Q4a closes D6/D7 with reusable
 prepared statements, shared connection/transaction execution, and exact
 failure-safe native cleanup. The next product work is Q4b streaming resilience.
 
+Known pre-existing failure for the pkg.db owner (found 2026-08-09, present on
+`main`, unrelated to the toolchain work that surfaced it):
+`per_unit_surface::emit_llvm_n1_has_no_banner_and_matches_whole_program` fails
+because the CLI emits ~8 `align_fn$…pkg.db.internal$…` extern declarations into
+every program — including one with no database usage — while the library
+`emit_llvm` helper does not. Decide whether unconditional static-constructor
+declaration emission is intended (then update the parity test) or a leak from
+the static-input discovery wave (then gate the declarations on actual use). The
+suite is not in the bounded CI gate, which is why this went unnoticed.
+
 The completed prerequisite waves and current product boundary are:
 
 ```text

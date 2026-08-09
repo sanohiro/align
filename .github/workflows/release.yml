@@ -56,6 +56,10 @@ jobs:
         run: |
           rustup toolchain install "$RUST_VERSION" --profile minimal
           rustup default "$RUST_VERSION"
+          # llvm-tools supplies the toolchain's own llvm-profdata, guaranteeing
+          # the profraw/profdata format matches rustc's bundled LLVM (a system
+          # llvm-profdata can silently mismatch across version bumps).
+          rustup component add llvm-tools
 
       - name: Install LLVM and native libraries (Linux)
         if: runner.os == 'Linux'
@@ -97,14 +101,28 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/pgo-cwd"
           cd "$RUNNER_TEMP/pgo-cwd"
+          # Canary WITHOUT || true: instrumented build scripts also write
+          # profraw during phase 1, so a non-empty merge glob proves nothing.
+          # At least one real compiler run must demonstrably succeed or the
+          # release must fail here, not ship a build-script-noise profile.
+          "$GITHUB_WORKSPACE/target/pgogen/dist/alignc" build \
+            "$GITHUB_WORKSPACE/examples/hello.align" >/dev/null
           for f in "$GITHUB_WORKSPACE"/examples/*.align; do
             "$GITHUB_WORKSPACE/target/pgogen/dist/alignc" build "$f" >/dev/null 2>&1 || true
           done
-          for _ in 1 2 3 4 5; do
-            "$GITHUB_WORKSPACE/target/pgogen/dist/alignc" check \
-              "$GITHUB_WORKSPACE/apps/db/pkg/db.align" >/dev/null 2>&1 || true
-          done
-          llvm-profdata merge -o "$RUNNER_TEMP/merged.profdata" "$RUNNER_TEMP/pgo-data"/*.profraw
+          # The check corpus intentionally exits non-zero (it emits diagnostics);
+          # guard its presence so a workflow_dispatch on an older tag stays valid.
+          if [ -f "$GITHUB_WORKSPACE/apps/db/pkg/db.align" ]; then
+            for _ in 1 2 3 4 5; do
+              "$GITHUB_WORKSPACE/target/pgogen/dist/alignc" check \
+                "$GITHUB_WORKSPACE/apps/db/pkg/db.align" >/dev/null 2>&1 || true
+            done
+          fi
+          # The toolchain's own llvm-profdata (see Install Rust), never the
+          # system one: the format must match rustc's bundled LLVM.
+          PROFDATA="$(find "$(rustc --print sysroot)" -name llvm-profdata -type f | head -1)"
+          test -n "$PROFDATA"
+          "$PROFDATA" merge -o "$RUNNER_TEMP/merged.profdata" "$RUNNER_TEMP/pgo-data"/*.profraw
 
       - name: Build compiler (PGO phase 3)
         shell: bash
