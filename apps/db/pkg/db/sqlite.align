@@ -428,6 +428,7 @@ pub fn connect(path: str, options: slice<ConnectOption>) -> Result<pkg.db.conn, 
 }
 
 fn common_tx_options_valid(options: slice<pkg.db.TxOption>) -> Result<(), pkg.db.Error> {
+  mut saw_timeout := false
   mut i := 0
   loop {
     if i >= options.len() { break }
@@ -439,13 +440,22 @@ fn common_tx_options_valid(options: slice<pkg.db.TxOption>) -> Result<(), pkg.db
             "database transaction begin timeout must be positive",
           ))
         }
-        return Err(contract_error(
-          "db.transaction.begin_timeout_ns",
-          "database transaction begin deadlines are not available in this milestone",
-        ))
+        if saw_timeout {
+          return Err(contract_error(
+            "db.transaction.begin_timeout_ns",
+            "duplicate database transaction begin timeout",
+          ))
+        }
+        saw_timeout = true
       }
     }
     i = i + 1
+  }
+  if saw_timeout {
+    return Err(contract_error(
+      "db.transaction.begin_timeout_ns",
+      "SQLite does not support common transaction begin deadlines",
+    ))
   }
   return Ok(())
 }
@@ -461,6 +471,7 @@ pub fn prepare_native<P, R>(
   }
   unsafe {
     query_id := pkg.db.internal.descriptor.descriptor_id(statement)
+    mut saw_common_timeout := false
     mut common_index := 0
     loop {
       if common_index >= options.len() { break }
@@ -473,14 +484,24 @@ pub fn prepare_native<P, R>(
               "database prepare timeout must be positive",
             ))
           }
-          return Err(pkg.db.internal.sqlite.descriptor_error(
-            query_id,
-            "db.prepare.timeout_ns",
-            "database prepare deadlines are not available in this milestone",
-          ))
+          if saw_common_timeout {
+            return Err(pkg.db.internal.sqlite.descriptor_error(
+              query_id,
+              "db.prepare.timeout_ns",
+              "duplicate database prepare timeout",
+            ))
+          }
+          saw_common_timeout = true
         }
       }
       common_index = common_index + 1
+    }
+    if saw_common_timeout {
+      return Err(pkg.db.internal.sqlite.descriptor_error(
+        query_id,
+        "db.prepare.timeout_ns",
+        "SQLite does not support common prepare deadlines",
+      ))
     }
     mut flags: u32 := 0
     mut i := 0
@@ -599,7 +620,7 @@ pub fn execute_native<P>(
   }
 }
 
-pub fn one_native<P, R>(
+pub fn one_native<P, R: RegionPlain>(
   target: pkg.db.exec,
   statement: pkg.db.query<P, R>,
   params: P,
@@ -607,6 +628,34 @@ pub fn one_native<P, R>(
   options: slice<pkg.db.ExecuteOption>,
   native: slice<ExecuteOption>,
 ) -> Result<R, pkg.db.Error> {
+  mut stream := rows_native(target, statement, params, options, native)?
+  first := pkg.db.next(stream)?
+  row := first else {
+    return Err(pkg.db.Error.Cardinality(pkg.db.CardinalityError {
+      expected_min: 1,
+      expected_max: 1,
+      observed_at_least: 0,
+    }))
+  }
+  result := row.clone_in(out)
+  has_second := unsafe { pkg.db.internal.descriptor.has_next_sqlite(stream) }?
+  if has_second {
+    return Err(pkg.db.Error.Cardinality(pkg.db.CardinalityError {
+      expected_min: 1,
+      expected_max: 1,
+      observed_at_least: 2,
+    }))
+  }
+  return Ok(result)
+}
+
+pub fn rows_native<P, R>(
+  target: pkg.db.exec,
+  statement: pkg.db.query<P, R>,
+  params: P,
+  options: slice<pkg.db.ExecuteOption>,
+  native: slice<ExecuteOption>,
+) -> Result<pkg.db.rows<R>, pkg.db.Error> {
   if !pkg.db.internal.sqlite.query_header_valid(statement) {
     return Err(pkg.db.internal.sqlite.invalid_descriptor_error())
   }
@@ -634,10 +683,9 @@ pub fn one_native<P, R>(
       }
       i = i + 1
     }
-    result: Result<R, pkg.db.Error> := pkg.db.internal.sqlite.one_prevalidated(
-      target, params, statement, out, query_id, timeout,
+    return pkg.db.internal.sqlite.rows_prevalidated(
+      target, params, statement, query_id, timeout,
     )
-    return result
   }
 }
 
@@ -687,7 +735,7 @@ fn metadata_controls(
   if saw_timeout {
     return Err(contract_error(
       "db.meta.timeout_ns",
-      "database metadata deadlines are not available in this milestone",
+      "SQLite does not support common metadata deadlines",
     ))
   }
 
@@ -961,7 +1009,7 @@ pub fn explain_native<P, R>(
       return Err(pkg.db.internal.sqlite.descriptor_error(
         query_id,
         "db.explain.timeout_ns",
-        "database EXPLAIN deadlines are not available in this milestone",
+        "SQLite does not support common EXPLAIN deadlines",
       ))
     }
     mut saw_mode := false

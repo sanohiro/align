@@ -1003,10 +1003,13 @@ fn generated_runtime_data_is_producer_owned() {
             else {
                 panic!("descriptor constructor must start with relocation-bearing static data");
             };
-            assert_eq!(data.bytes.len(), 120);
+            assert_eq!(data.bytes.len(), 128);
             assert_eq!(data.align, 8);
-            assert_eq!(&data.bytes[0..4], &3u32.to_le_bytes());
-            assert_eq!(data.bytes[4], u8::from(descriptor.consumer == StaticDescriptorConsumer::Command));
+            assert_eq!(&data.bytes[0..4], &4u32.to_le_bytes());
+            assert_eq!(
+                data.bytes[4],
+                u8::from(descriptor.consumer == StaticDescriptorConsumer::Command)
+            );
             assert_eq!(&data.bytes[6..8], &[0, 0]);
             let q1 = data
                 .relocations
@@ -1029,7 +1032,7 @@ fn generated_runtime_data_is_producer_owned() {
                 ).then_some(relocation.offset))
                 .collect::<Vec<_>>();
             if descriptor.consumer == StaticDescriptorConsumer::Query {
-                assert_eq!(thunk_offsets, vec![64, 72, 80, 88, 96, 104]);
+                assert_eq!(thunk_offsets, vec![64, 72, 80, 88, 96, 104, 120]);
                 let materializer = data
                     .relocations
                     .iter()
@@ -1040,9 +1043,20 @@ fn generated_runtime_data_is_producer_owned() {
                     align_mir::StaticDataTarget::Function(name)
                         if name.as_str().ends_with("$query_meta_v1")
                 ));
+                let stream_decoder = data
+                    .relocations
+                    .iter()
+                    .find(|relocation| relocation.offset == 120)
+                    .expect("D8 streaming decoder relocation");
+                assert!(matches!(
+                    &stream_decoder.target,
+                    align_mir::StaticDataTarget::Function(name)
+                        if name.as_str().ends_with("$stream_decode_v1")
+                ));
             } else {
                 assert_eq!(thunk_offsets, vec![64, 72, 104]);
                 assert_eq!(&data.bytes[96..104], &[0; 8]);
+                assert_eq!(&data.bytes[120..128], &[0; 8]);
             }
             let parameter_count = match &artifact.runtime {
                 GeneratedStaticRuntime::Query(runtime) => runtime.drivers[0].binder.fields.len(),
@@ -1105,17 +1119,15 @@ fn generated_runtime_data_is_producer_owned() {
                 .iter()
                 .find(|function| function.name.as_str() == format!("{symbol}$static_validate_v1"))
                 .expect("generated static validator");
-            if descriptor.descriptor_id == "app.users.query" {
                 assert!(matches!(
                     static_validator.blocks.as_slice(),
                     [align_mir::Block {
                         term: align_mir::Term::Return(Some(align_mir::Operand::Const(
-                            align_mir::Const::Int(-1, _)
+                        align_mir::Const::Int(0, _)
                         ))),
                         ..
                     }]
                 ));
-            }
             let magic = match &artifact.runtime {
                 GeneratedStaticRuntime::Query(_) => "ALIGNQST",
                 GeneratedStaticRuntime::Command(_) => "ALIGNCST",

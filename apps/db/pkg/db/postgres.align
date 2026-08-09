@@ -617,6 +617,7 @@ pub fn connect(url: str, options: slice<ConnectOption>) -> Result<pkg.db.conn, p
 }
 
 fn common_tx_options_valid(options: slice<pkg.db.TxOption>) -> Result<(), pkg.db.Error> {
+  mut saw_timeout := false
   mut i := 0
   loop {
     if i >= options.len() { break }
@@ -628,13 +629,22 @@ fn common_tx_options_valid(options: slice<pkg.db.TxOption>) -> Result<(), pkg.db
             "database transaction begin timeout must be positive",
           ))
         }
-        return Err(contract_error(
-          "db.transaction.begin_timeout_ns",
-          "database transaction begin deadlines are not available in this milestone",
-        ))
+        if saw_timeout {
+          return Err(contract_error(
+            "db.transaction.begin_timeout_ns",
+            "duplicate database transaction begin timeout",
+          ))
+        }
+        saw_timeout = true
       }
     }
     i = i + 1
+  }
+  if saw_timeout {
+    return Err(contract_error(
+      "db.transaction.begin_timeout_ns",
+      "PostgreSQL transaction begin deadlines are not supported in v1",
+    ))
   }
   return Ok(())
 }
@@ -650,6 +660,7 @@ pub fn prepare_native<P, R>(
   }
   unsafe {
     query_id := pkg.db.internal.descriptor.descriptor_id(statement)
+    mut saw_common_timeout := false
     mut common_index := 0
     loop {
       if common_index >= options.len() { break }
@@ -662,14 +673,24 @@ pub fn prepare_native<P, R>(
               "database prepare timeout must be positive",
             ))
           }
-          return Err(pkg.db.internal.postgres.descriptor_error(
-            query_id,
-            "db.prepare.timeout_ns",
-            "database prepare deadlines are not available in this milestone",
-          ))
+          if saw_common_timeout {
+            return Err(pkg.db.internal.postgres.descriptor_error(
+              query_id,
+              "db.prepare.timeout_ns",
+              "duplicate database prepare timeout",
+            ))
+          }
+          saw_common_timeout = true
         }
       }
       common_index = common_index + 1
+    }
+    if saw_common_timeout {
+      return Err(pkg.db.internal.postgres.descriptor_error(
+        query_id,
+        "db.prepare.timeout_ns",
+        "PostgreSQL prepare deadlines are not supported in v1",
+      ))
     }
     count := pkg.db.internal.descriptor.parameter_count(statement)
     if count > 2147483647 {
@@ -881,7 +902,7 @@ pub fn execute_native<P>(
   }
   unsafe {
     query_id := pkg.db.internal.descriptor.descriptor_id(statement)
-    pkg.db.internal.postgres.common_options_valid(options, query_id)?
+    timeout := pkg.db.internal.postgres.common_options_valid(options, query_id)?
     mut saw_result := false
     mut native_index := 0
     loop {
@@ -951,11 +972,13 @@ pub fn execute_native<P>(
       }
       native_index = native_index + 1
     }
-    return pkg.db.internal.postgres.execute_prevalidated(target, params, statement, query_id)
+    return pkg.db.internal.postgres.execute_prevalidated(
+      target, params, statement, query_id, timeout,
+    )
   }
 }
 
-pub fn one_native<P, R>(
+pub fn one_native<P, R: RegionPlain>(
   target: pkg.db.exec,
   statement: pkg.db.query<P, R>,
   params: P,
@@ -963,12 +986,40 @@ pub fn one_native<P, R>(
   options: slice<pkg.db.ExecuteOption>,
   native: slice<ExecuteOption>,
 ) -> Result<R, pkg.db.Error> {
+  mut stream := rows_native(target, statement, params, options, native)?
+  first := pkg.db.next(stream)?
+  row := first else {
+    return Err(pkg.db.Error.Cardinality(pkg.db.CardinalityError {
+      expected_min: 1,
+      expected_max: 1,
+      observed_at_least: 0,
+    }))
+  }
+  result := row.clone_in(out)
+  has_second := unsafe { pkg.db.internal.descriptor.has_next_postgres(stream) }?
+  if has_second {
+    return Err(pkg.db.Error.Cardinality(pkg.db.CardinalityError {
+      expected_min: 1,
+      expected_max: 1,
+      observed_at_least: 2,
+    }))
+  }
+  return Ok(result)
+}
+
+pub fn rows_native<P, R>(
+  target: pkg.db.exec,
+  statement: pkg.db.query<P, R>,
+  params: P,
+  options: slice<pkg.db.ExecuteOption>,
+  native: slice<ExecuteOption>,
+) -> Result<pkg.db.rows<R>, pkg.db.Error> {
   if !pkg.db.internal.postgres.query_header_valid(statement) {
     return Err(pkg.db.internal.postgres.invalid_descriptor_error())
   }
   unsafe {
     query_id := pkg.db.internal.descriptor.descriptor_id(statement)
-    pkg.db.internal.postgres.common_options_valid(options, query_id)?
+    timeout := pkg.db.internal.postgres.common_options_valid(options, query_id)?
     mut saw_result := false
     mut native_index := 0
     loop {
@@ -1029,7 +1080,7 @@ pub fn one_native<P, R>(
               return Err(pkg.db.internal.postgres.descriptor_error(
                 query_id,
                 "postgres.execute.parameter_format",
-                "binary PostgreSQL i64 parameters are unavailable",
+                "binary PostgreSQL parameters are unavailable for this execution milestone",
               ))
             }
             Text => {}
@@ -1038,10 +1089,9 @@ pub fn one_native<P, R>(
       }
       native_index = native_index + 1
     }
-    result: Result<R, pkg.db.Error> := pkg.db.internal.postgres.one_prevalidated(
-      target, params, statement, out, query_id,
+    return pkg.db.internal.postgres.rows_prevalidated(
+      target, params, statement, query_id, timeout,
     )
-    return result
   }
 }
 
@@ -1091,7 +1141,7 @@ fn metadata_controls(
   if saw_timeout {
     return Err(contract_error(
       "db.meta.timeout_ns",
-      "database metadata deadlines are not available in this milestone",
+      "PostgreSQL metadata deadlines are not supported in v1",
     ))
   }
 
@@ -1370,7 +1420,7 @@ pub fn explain_native<P, R>(
       return Err(pkg.db.internal.postgres.descriptor_error(
         query_id,
         "db.explain.timeout_ns",
-        "database EXPLAIN deadlines are not available in this milestone",
+        "PostgreSQL EXPLAIN deadlines are not supported in v1",
       ))
     }
 

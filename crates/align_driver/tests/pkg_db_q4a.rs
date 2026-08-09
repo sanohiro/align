@@ -106,13 +106,14 @@ fn execute_once(
 "#;
 
 #[test]
-fn q4a_public_surface_is_exact_and_later_runtime_cells_remain_absent() {
+fn q4a_public_surface_remains_exact_after_q4b_streaming_extension() {
     for required in [
         "pub resource stmt<P, R> = pkg.db.internal.resource.drop_stmt",
         "pub resource rows<R> = pkg.db.internal.resource.drop_rows",
         "pub fn prepare<P, R>(",
         "pub fn rows_stmt<P, R>(",
         "  borrow mut statement: stmt<P, R>,",
+        "pub fn next<R>(borrow mut stream: rows<R>) -> Result<Option<R>, Error>",
         "pub fn begin(connection: conn, options: slice<TxOption>) -> Result<tx, Error>",
         "pub fn commit(transaction: tx) -> Result<conn, Error>",
         "pub fn rollback(transaction: tx) -> Result<conn, Error>",
@@ -130,35 +131,84 @@ fn q4a_public_surface_is_exact_and_later_runtime_cells_remain_absent() {
     assert!(POSTGRES.contains(
         "pub TxOption {\n  Isolation(Isolation)\n  Access(Access)\n  Deferrable(bool)\n}"
     ));
-    for deferred in [
-        "pub fn next",
-        "pub fn cancel",
-        "pub fn portal",
-        "pub fn statement_cache",
-    ] {
+    for deferred in ["pub fn cancel", "pub fn portal", "pub fn statement_cache"] {
         assert!(
             !DB.contains(deferred),
             "Q4a must not publish deferred surface `{deferred}`"
         );
     }
     for (module, source, expected) in [
-        ("pkg.db", DB, 5),
-        ("pkg.db.internal.sqlite", INTERNAL_SQLITE, 2),
-        ("pkg.db.internal.postgres", INTERNAL_POSTGRES, 2),
+        ("pkg.db", DB, 2),
+        ("pkg.db.internal.sqlite", INTERNAL_SQLITE, 0),
+        ("pkg.db.internal.postgres", INTERNAL_POSTGRES, 0),
     ] {
         assert_eq!(
             source
                 .matches("tail_reserved: u32 := raw.load(data, 116)")
                 .count(),
             expected,
-            "{module} must load the v3 tail-reserved field in every header validator"
+            "{module} must delegate to the two shared v4 header validators"
         );
         assert_eq!(
             source.matches("tail_reserved == 0").count(),
             expected,
-            "{module} must reject the v3 tail-reserved field in every header validator"
+            "{module} must not duplicate the v4 tail-reserved check"
         );
     }
+    for source in [INTERNAL_SQLITE, INTERNAL_POSTGRES] {
+        assert!(source.contains(
+            "return pkg.db.command_header_valid(statement, pkg.db.internal.descriptor_header_control())"
+        ));
+        assert!(source.contains(
+            "return pkg.db.query_header_valid(statement, pkg.db.internal.descriptor_header_control())"
+        ));
+    }
+}
+
+#[test]
+fn q4b_prepared_next_typechecks_whole_and_per_unit() {
+    let main = format!(
+        "{Q4A_SURFACE_PREFIX}\n{}",
+        r#"
+fn consume(
+  borrow mut statement: pkg.db.stmt<app.q4a_query.Params, app.q4a_query.Row>,
+) -> i32 {
+  bytes := [1 as u8, 2 as u8]
+  opened := pkg.db.rows_stmt(statement, app.q4a_query.Params {
+    id: 7,
+    label: "stream",
+    payload: bytes[..],
+  }, [])
+  return match opened {
+    Err(_) => 2
+    Ok(stream_value) => {
+      mut stream := stream_value
+      first := pkg.db.next(stream)
+      match first {
+        Err(_) => 3
+        Ok(value) => match value {
+          None => 4
+          Some(row) => row.id as i32
+        }
+      }
+    }
+  }
+}
+
+fn main() -> i32 = 0
+"#
+    );
+    let checked = diff_check_multi(
+        "pkg-db-q4b-prepared-next-surface",
+        &package_files(&main),
+        "main.align",
+    );
+    assert!(
+        !checked.whole_errors && !checked.per_unit_errors,
+        "unexpected whole-program diagnostics:\n{}\nunexpected per-unit diagnostics:\n{}",
+        checked.whole_diags,
+        checked.per_unit_diags,
+    );
 }
 
 #[test]
@@ -238,6 +288,26 @@ fn main() -> i32 = 0
     assert!(
         diagnostics.contains("static descriptor operations are compiler-private to `pkg.db`"),
         "unexpected diagnostics:\n{diagnostics}"
+    );
+
+    let header_bypass = r#"module main
+import pkg.db
+import app.q4a_query
+
+fn bad(statement: pkg.db.query<app.q4a_query.Params, app.q4a_query.Row>) -> bool {
+  return pkg.db.query_header_valid(statement, true)
+}
+
+fn main() -> i32 = 0
+"#;
+    let diagnostics = check_multi_diagnostics(
+        "pkg-db-q4b-sealed-descriptor-header",
+        &package_files(header_bypass),
+        "main.align",
+    );
+    assert!(
+        diagnostics.contains("type mismatch: bool vs pkg.db.internal$DescriptorHeaderControl"),
+        "application source reached the shared descriptor validator:\n{diagnostics}"
     );
 }
 
@@ -502,11 +572,24 @@ fn execute_once(
   result := pkg.db.rows_stmt(statement, params, [])
   return match result {
     Err(_) => 2
-    Ok(rows) => {
+    Ok(rows_value) => {
+      mut rows := rows_value
       label = "source storage replaced".clone()
       bytes[0] = 9
       if label.len() == 0 || bytes[0] != 9 { return 3 }
-      0
+      first := pkg.db.next(rows)
+      match first {
+        Err(_) => { return 7 }
+        Ok(value) => match value {
+          None => { return 8 }
+          Some(row) => if row.id != id { return 9 }
+        }
+      }
+      second := pkg.db.next(rows)
+      match second {
+        Err(_) => 10
+        Ok(value) => match value { None => 0, Some(_) => 11 }
+      }
     }
   }
 }
@@ -592,7 +675,7 @@ fn main() -> i32 {
 }
 
 #[test]
-fn sqlite_unsupported_prepared_shape_fails_before_native_prepare() {
+fn sqlite_newly_supported_prepared_shape_reaches_native_prepare() {
     if !backend_available() || !cc_available() {
         return;
     }
@@ -620,15 +703,10 @@ extern "C" {
   fn align_sqlite_q4a_protocol_ok() -> i32
 }
 
-fn is_shape_error(error: pkg.db.Error) -> bool = match error {
-  Unsupported(contract) => contract.item == "db.descriptor.shape"
-  _ => false
-}
-
 fn main() -> i32 {
   unsafe { align_sqlite_q4a_reset() }
   opened := pkg.db.sqlite.connect(":memory:", [])
-  rejected := match opened {
+  prepared_ok := match opened {
     Err(_) => false
     Ok(connection) => {
       prepared := pkg.db.sqlite.prepare_native(
@@ -637,12 +715,12 @@ fn main() -> i32 {
         [],
         [pkg.db.sqlite.PrepareOption.Persistent, pkg.db.sqlite.PrepareOption.Normalize],
       )
-      match prepared { Ok(_) => false, Err(error) => is_shape_error(error) }
+      match prepared { Ok(_) => true, Err(_) => false }
     }
   }
   return unsafe {
-    if rejected && align_sqlite_q4a_protocol_ok() == 1
-      && align_sqlite_q4a_prepare_calls() == 0 { 42 } else { 1 }
+    if prepared_ok && align_sqlite_q4a_protocol_ok() == 1
+      && align_sqlite_q4a_prepare_calls() == 1 { 42 } else { 1 }
   }
 }
 "#;

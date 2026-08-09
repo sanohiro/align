@@ -1,6 +1,8 @@
+#define _POSIX_C_SOURCE 200809L
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef struct {
   char *keyword;
@@ -15,6 +17,7 @@ typedef struct {
 typedef struct {
   int status;
   int encoding;
+  int transaction_status;
   const char *message;
 } FakeConn;
 
@@ -23,10 +26,10 @@ typedef struct {
   const char *command_status;
   int rows;
   int fields;
-  const char *names[2];
-  uint32_t oids[2];
-  const char *values[2][2];
-  int nulls[2][2];
+  const char *names[16];
+  uint32_t oids[16];
+  const char *values[2][16];
+  int nulls[2][16];
   const char *affected;
   const char *sqlstate;
   const char *message;
@@ -34,7 +37,12 @@ typedef struct {
   const char *constraint_name;
   const char *table_name;
   const char *column_name;
+  int row_fault;
 } FakeResult;
+
+typedef struct {
+  FakeConn *connection;
+} FakeCancel;
 
 static int connect_calls;
 static int finish_calls;
@@ -42,6 +50,7 @@ static int encoding_calls;
 static int execute_calls;
 static int clear_calls;
 static int protocol_ok;
+static int protocol_error;
 static int last_timeout;
 static int prepare_calls;
 static int execute_prepared_calls;
@@ -50,6 +59,22 @@ static int deallocate_calls;
 static int fail_next_control;
 static int rollback_next_commit;
 static char prepared_name[64];
+static FakeResult *async_result;
+static int async_busy;
+static int async_cancelled;
+static int async_cancel_fail;
+static int async_drain_fail;
+static int async_flush_fail;
+static int async_consume_fail;
+static int async_cancel_resource_fail;
+static int async_transaction_unknown;
+static int fail_next_nonblocking_enable;
+static int fail_next_nonblocking_restore;
+static int delay_next_nonblocking_enable;
+static int prepared_timeout_wait;
+static int nonblocking_calls;
+static int cancel_calls;
+static int consume_calls;
 
 static char *copy_text(const char *text) {
   size_t n = strlen(text) + 1;
@@ -69,6 +94,7 @@ void align_pg_reset(void) {
   execute_calls = 0;
   clear_calls = 0;
   protocol_ok = 1;
+  protocol_error = 0;
   last_timeout = -1;
   prepare_calls = 0;
   execute_prepared_calls = 0;
@@ -77,6 +103,22 @@ void align_pg_reset(void) {
   fail_next_control = 0;
   rollback_next_commit = 0;
   prepared_name[0] = '\0';
+  async_result = NULL;
+  async_busy = 0;
+  async_cancelled = 0;
+  async_cancel_fail = 0;
+  async_drain_fail = 0;
+  async_flush_fail = 0;
+  async_consume_fail = 0;
+  async_cancel_resource_fail = 0;
+  async_transaction_unknown = 0;
+  fail_next_nonblocking_enable = 0;
+  fail_next_nonblocking_restore = 0;
+  delay_next_nonblocking_enable = 0;
+  prepared_timeout_wait = 0;
+  nonblocking_calls = 0;
+  cancel_calls = 0;
+  consume_calls = 0;
 }
 
 int align_pg_connect_calls(void) { return connect_calls; }
@@ -85,6 +127,10 @@ int align_pg_encoding_calls(void) { return encoding_calls; }
 int align_pg_execute_calls(void) { return execute_calls; }
 int align_pg_clear_calls(void) { return clear_calls; }
 int align_pg_protocol_ok(void) { return protocol_ok; }
+int align_pg_protocol_error(void) { return protocol_error; }
+int align_pg_nonblocking_calls(void) { return nonblocking_calls; }
+int align_pg_cancel_calls(void) { return cancel_calls; }
+int align_pg_consume_calls(void) { return consume_calls; }
 int align_pg_last_timeout(void) { return last_timeout; }
 int align_pg_prepare_calls(void) { return prepare_calls; }
 int align_pg_execute_prepared_calls(void) { return execute_prepared_calls; }
@@ -92,6 +138,9 @@ int align_pg_control_calls(void) { return control_calls; }
 int align_pg_deallocate_calls(void) { return deallocate_calls; }
 void align_pg_fail_next_control(void) { fail_next_control = 1; }
 void align_pg_rollback_next_commit(void) { rollback_next_commit = 1; }
+void align_pg_fail_next_nonblocking_enable(void) { fail_next_nonblocking_enable = 1; }
+void align_pg_fail_next_nonblocking_restore(void) { fail_next_nonblocking_restore = 1; }
+void align_pg_delay_next_nonblocking_enable(void) { delay_next_nonblocking_enable = 1; }
 
 PQconninfoOption *PQconninfoParse(const char *connection_info, char **error_out) {
   if (error_out != NULL) *error_out = NULL;
@@ -161,6 +210,7 @@ FakeConn *PQconnectdbParams(const char *const *keywords, const char *const *valu
   if (connection == NULL) return NULL;
   connection->status = has(dbname, "bad-connection") ? 1 : 0;
   connection->encoding = has(dbname, "bad-encoding") ? -1 : 6;
+  connection->transaction_status = 0;
   connection->message = "stub connection failure";
   return connection;
 }
@@ -174,6 +224,11 @@ int PQclientEncoding(const FakeConn *connection) {
 
 void PQfinish(FakeConn *connection) {
   finish_calls++;
+  if (async_result != NULL) {
+    clear_calls++;
+    free(async_result);
+    async_result = NULL;
+  }
   free(connection);
 }
 
@@ -227,6 +282,7 @@ FakeResult *PQprepare(
       memcpy(prepared_name, name, length + 1);
     }
   }
+  prepared_timeout_wait = has(command, "TIMEOUT_WAIT");
   FakeResult *result = new_result();
   if (result != NULL) {
     result->status = 1;
@@ -269,7 +325,6 @@ FakeResult *PQexecPrepared(
 }
 
 FakeResult *PQexec(FakeConn *connection, const char *command) {
-  (void)connection;
   if (command == NULL) protocol_ok = 0;
   if (command != NULL && strncmp(command, "DEALLOCATE __align_pkg_db_", 26) == 0) {
     deallocate_calls++;
@@ -288,10 +343,13 @@ FakeResult *PQexec(FakeConn *connection, const char *command) {
     result->status = fail_next_control ? 7 : 1;
     if (command != NULL && strncmp(command, "BEGIN ", 6) == 0) {
       result->command_status = "BEGIN";
+      if (connection != NULL) connection->transaction_status = 2;
     } else if (command != NULL && strcmp(command, "COMMIT") == 0) {
       result->command_status = rollback_next_commit ? "ROLLBACK" : "COMMIT";
+      if (connection != NULL) connection->transaction_status = 0;
     } else if (command != NULL && strcmp(command, "ROLLBACK") == 0) {
       result->command_status = "ROLLBACK";
+      if (connection != NULL) connection->transaction_status = 0;
     } else if (command != NULL && strncmp(command, "DEALLOCATE ", 11) == 0) {
       result->command_status = "DEALLOCATE";
     }
@@ -315,16 +373,92 @@ FakeResult *PQexecParams(
   (void)connection;
   execute_calls++;
   if (command == NULL || result_format != 0) protocol_ok = 0;
-  if (parameter_count != 1 || parameter_types == NULL || parameter_values == NULL ||
-      parameter_lengths == NULL || parameter_formats == NULL || parameter_types[0] != 20 ||
-      parameter_values[0] == NULL || parameter_formats[0] != 0 ||
-      parameter_lengths[0] != (int)strlen(parameter_values[0])) {
-    protocol_ok = 0;
+  int full_matrix = has(command, "FULL_MATRIX");
+  int view_fault = has(command, "VIEW_FAULT");
+  if (full_matrix) {
+    static const uint32_t expected_types[16] = {
+        16, 16, 21, 21, 23, 23, 20, 20, 700, 700, 701, 701, 25, 25, 17, 17,
+    };
+    if (parameter_count != 16 || parameter_types == NULL || parameter_values == NULL ||
+        parameter_lengths == NULL || parameter_formats == NULL) {
+      protocol_ok = 0;
+      if (protocol_error == 0) protocol_error = 1;
+    } else {
+      for (int i = 0; i < 16; i++) {
+        if (parameter_types[i] != expected_types[i]) {
+          protocol_ok = 0;
+          if (protocol_error == 0) protocol_error = 10 + i;
+        }
+        if (parameter_formats[i] != 0) {
+          protocol_ok = 0;
+          if (protocol_error == 0) protocol_error = 30 + i;
+        }
+        if (parameter_values[i] == NULL) {
+          if ((i & 1) == 0 || parameter_lengths[i] != 0) {
+            protocol_ok = 0;
+            if (protocol_error == 0) protocol_error = 50 + i;
+          }
+        } else if (parameter_lengths[i] != (int)strlen(parameter_values[i])) {
+          protocol_ok = 0;
+          if (protocol_error == 0) protocol_error = 70 + i;
+        }
+      }
+    }
+  } else if (view_fault) {
+    static const uint32_t expected_types[3] = {25, 17, 20};
+    if (parameter_count != 3 || parameter_types == NULL || parameter_values == NULL ||
+        parameter_lengths == NULL || parameter_formats == NULL) {
+      protocol_ok = 0;
+    } else {
+      for (int i = 0; i < 3; i++) {
+        if (parameter_types[i] != expected_types[i] || parameter_values[i] == NULL ||
+            parameter_formats[i] != 0 ||
+            parameter_lengths[i] != (int)strlen(parameter_values[i])) {
+          protocol_ok = 0;
+        }
+      }
+    }
+  } else if (parameter_count != 1 || parameter_types == NULL || parameter_values == NULL ||
+             parameter_lengths == NULL || parameter_formats == NULL || parameter_types[0] != 20 ||
+             parameter_values[0] == NULL || parameter_formats[0] != 0 ||
+             parameter_lengths[0] != (int)strlen(parameter_values[0])) {
+      protocol_ok = 0;
   }
   if (has(command, "NULL_RESULT")) return NULL;
   FakeResult *result = new_result();
   if (result == NULL) return NULL;
-  result->values[0][0] = parameter_values != NULL && parameter_count > 0 ? parameter_values[0] : "0";
+  if (full_matrix && parameter_values != NULL && parameter_count == 16) {
+    static const char *names[16] = {
+        "b", "nb", "i16v", "ni16", "i32v", "ni32", "i64v", "ni64",
+        "f32v", "nf32", "f64v", "nf64", "textv", "ntext", "bytesv", "nbytes",
+    };
+    static const uint32_t oids[16] = {
+        16, 16, 21, 21, 23, 23, 20, 20, 700, 700, 701, 701, 25, 25, 17, 17,
+    };
+    result->fields = 16;
+    for (int i = 0; i < 16; i++) {
+      result->names[i] = names[i];
+      result->oids[i] = oids[i];
+      result->values[0][i] = parameter_values[i] == NULL ? "" : parameter_values[i];
+      result->nulls[0][i] = parameter_values[i] == NULL;
+    }
+  } else {
+    result->values[0][0] = parameter_values != NULL && parameter_count > 0 ? parameter_values[0] : "0";
+  }
+  if (view_fault) {
+    static const char invalid_utf8[] = {(char)0xff, 0};
+    result->fields = 2;
+    result->names[0] = "label";
+    result->names[1] = "payload";
+    result->oids[0] = 25;
+    result->oids[1] = 17;
+    result->values[0][0] = has(command, "TEXT_UTF8") ? invalid_utf8 : "view";
+    result->values[0][1] = has(command, "BYTES_HEX") ? "\\x0g" : "\\x010203";
+    if (has(command, "TEXT_NULL")) result->row_fault = 1;
+    if (has(command, "TEXT_LENGTH")) result->row_fault = 2;
+    if (has(command, "BYTES_NULL")) result->row_fault = 4;
+    if (has(command, "BYTES_LENGTH")) result->row_fault = 5;
+  }
   if (has(command, "COMMAND_OK")) {
     result->status = 1;
     result->rows = 0;
@@ -368,6 +502,136 @@ FakeResult *PQexecParams(
   return result;
 }
 
+int PQsendQueryParams(
+    FakeConn *connection,
+    const char *command,
+    int parameter_count,
+    const uint32_t *parameter_types,
+    const char *const *parameter_values,
+    const int *parameter_lengths,
+    const int *parameter_formats,
+    int result_format) {
+  if (has(command, "SEND_FAIL")) return 0;
+  async_result = PQexecParams(
+      connection,
+      command,
+      parameter_count,
+      parameter_types,
+      parameter_values,
+      parameter_lengths,
+      parameter_formats,
+      result_format);
+  async_busy = has(command, "TIMEOUT_WAIT");
+  async_cancel_fail = has(command, "CANCEL_FAIL");
+  async_drain_fail = has(command, "DRAIN_FAIL");
+  async_flush_fail = has(command, "FLUSH_FAIL");
+  async_consume_fail = has(command, "CONSUME_FAIL");
+  async_cancel_resource_fail = has(command, "CANCEL_RESOURCE_FAIL");
+  async_transaction_unknown = has(command, "TX_UNKNOWN");
+  async_cancelled = 0;
+  return async_result == NULL ? 0 : 1;
+}
+
+int PQsendQueryPrepared(
+    FakeConn *connection,
+    const char *name,
+    int parameter_count,
+    const char *const *parameter_values,
+    const int *parameter_lengths,
+    const int *parameter_formats,
+    int result_format) {
+  async_result = PQexecPrepared(
+      connection,
+      name,
+      parameter_count,
+      parameter_values,
+      parameter_lengths,
+      parameter_formats,
+      result_format);
+  async_busy = prepared_timeout_wait;
+  async_cancel_fail = 0;
+  async_drain_fail = 0;
+  async_flush_fail = 0;
+  async_consume_fail = 0;
+  async_cancel_resource_fail = 0;
+  async_transaction_unknown = 0;
+  async_cancelled = 0;
+  return async_result == NULL ? 0 : 1;
+}
+
+int PQsetnonblocking(FakeConn *connection, int enabled) {
+  (void)connection;
+  nonblocking_calls++;
+  if (enabled == 1 && fail_next_nonblocking_enable) {
+    fail_next_nonblocking_enable = 0;
+    return -1;
+  }
+  if (enabled == 1 && delay_next_nonblocking_enable) {
+    struct timespec delay = {0, 2000000};
+    delay_next_nonblocking_enable = 0;
+    (void)nanosleep(&delay, NULL);
+  }
+  if (enabled == 0 && fail_next_nonblocking_restore) {
+    fail_next_nonblocking_restore = 0;
+    return -1;
+  }
+  return enabled == 0 || enabled == 1 ? 0 : -1;
+}
+
+int PQflush(FakeConn *connection) {
+  (void)connection;
+  return async_flush_fail ? -1 : 0;
+}
+
+int PQconsumeInput(FakeConn *connection) {
+  (void)connection;
+  consume_calls++;
+  if (async_consume_fail || (async_cancelled && async_drain_fail)) return 0;
+  return 1;
+}
+
+int PQisBusy(FakeConn *connection) {
+  (void)connection;
+  return async_busy;
+}
+
+FakeResult *PQgetResult(FakeConn *connection) {
+  (void)connection;
+  if (async_busy) return NULL;
+  FakeResult *result = async_result;
+  async_result = NULL;
+  return result;
+}
+
+int PQtransactionStatus(FakeConn *connection) {
+  if (async_transaction_unknown) return 4;
+  return connection == NULL ? 4 : connection->transaction_status;
+}
+
+FakeCancel *PQgetCancel(FakeConn *connection) {
+  if (async_cancel_resource_fail) return NULL;
+  FakeCancel *cancel = (FakeCancel *)malloc(sizeof(FakeCancel));
+  if (cancel != NULL) cancel->connection = connection;
+  return cancel;
+}
+
+int PQcancel(FakeCancel *cancel, char *error_buffer, int error_buffer_size) {
+  (void)error_buffer;
+  (void)error_buffer_size;
+  cancel_calls++;
+  if (cancel == NULL || async_cancel_fail) return 0;
+  async_cancelled = 1;
+  async_busy = async_drain_fail;
+  if (async_result != NULL) {
+    async_result->status = 7;
+    async_result->sqlstate = "57014";
+    async_result->message = "cancelled by deadline";
+  }
+  return 1;
+}
+
+void PQfreeCancel(FakeCancel *cancel) { free(cancel); }
+
 int PQresultStatus(const FakeResult *result) { return result == NULL ? 7 : result->status; }
 char *PQcmdStatus(const FakeResult *result) {
   return (char *)(result == NULL ? NULL : result->command_status);
@@ -387,9 +651,16 @@ int PQgetisnull(const FakeResult *result, int row, int column) {
 }
 char *PQgetvalue(const FakeResult *result, int row, int column) {
   if (result == NULL || row < 0 || row >= result->rows || column < 0 || column >= result->fields) return NULL;
-  return (char *)(result->values[row][column] == NULL ? "" : result->values[row][column]);
+  if ((result->row_fault == 1 && column == 0) || (result->row_fault == 4 && column == 1)) {
+    return NULL;
+  }
+  return (char *)result->values[row][column];
 }
 int PQgetlength(const FakeResult *result, int row, int column) {
+  if (result != NULL && ((result->row_fault == 2 && column == 0) ||
+                         (result->row_fault == 5 && column == 1))) {
+    return -1;
+  }
   char *value = PQgetvalue(result, row, column);
   return value == NULL ? 0 : (int)strlen(value);
 }

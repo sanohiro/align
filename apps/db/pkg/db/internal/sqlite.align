@@ -1,6 +1,7 @@
 module pkg.db.internal.sqlite
 
 import pkg.db
+import pkg.db.internal
 import pkg.db.internal.descriptor
 import pkg.db.internal.resource
 
@@ -39,11 +40,15 @@ pub SQLITE_INTEGER: i32 := 1
 pub SQLITE_TEXT: i32 := 3
 pub SQLITE_NULL: i32 := 5
 pub DRIVER_SQLITE: u8 := 1
-CONTEXT_VERSION: u32 := 1
+CONTEXT_VERSION: u32 := 2
 FAILURE_NATIVE: u8 := 1
 FAILURE_UNSUPPORTED: u8 := 2
 FAILURE_ROW: u8 := 3
 FAILURE_ENCODE: u8 := 4
+
+pub fn rows_step(native: raw) -> i32 {
+  unsafe { return sqlite3_step(native) }
+}
 
 pub fn descriptor_error(query_id: str, item: str, message: str) -> pkg.db.Error =
   pkg.db.Error.Unsupported(pkg.db.ContractError {
@@ -141,6 +146,7 @@ pub fn execution_timeout_ms(ns: i64, query_id: str) -> Result<i32, pkg.db.Error>
 }
 
 pub fn common_options_valid(options: slice<pkg.db.ExecuteOption>, query_id: str) -> Result<(), pkg.db.Error> {
+  mut saw_timeout := false
   mut i := 0
   loop {
     if i >= options.len() { break }
@@ -153,14 +159,24 @@ pub fn common_options_valid(options: slice<pkg.db.ExecuteOption>, query_id: str)
             "database execution timeout must be positive",
           ))
         }
-        return Err(descriptor_error(
-          query_id,
-          "db.execute.timeout_ns",
-          "database execution deadlines are not available in this milestone",
-        ))
+        if saw_timeout {
+          return Err(descriptor_error(
+            query_id,
+            "db.execute.timeout_ns",
+            "duplicate database execution timeout",
+          ))
+        }
+        saw_timeout = true
       }
     }
     i = i + 1
+  }
+  if saw_timeout {
+    return Err(descriptor_error(
+      query_id,
+      "db.execute.timeout_ns",
+      "SQLite does not support common execution deadlines",
+    ))
   }
   return Ok(())
 }
@@ -241,8 +257,7 @@ pub fn new_context(native: raw) -> raw {
 pub fn free_context(context: raw) {
   unsafe {
     if context.is_null() { return }
-    cache: raw := raw.load(context, 24)
-    if !cache.is_null() { raw.free(cache) }
+    pkg.db.internal.release_row_cache_v2(context)
     values: raw := raw.load(context, 40)
     count: u32 := raw.load(context, 48)
     if !values.is_null() {
@@ -350,77 +365,11 @@ pub fn acquire_lease(state: raw, query_id: str) -> Result<(), pkg.db.Error> {
 }
 
 pub fn command_header_valid<P>(statement: pkg.db.command<P>) -> bool {
-  unsafe {
-    data := pkg.db.internal.descriptor.data(statement)
-    if data.is_null() { return false }
-    version: u32 := raw.load(data, 0)
-    kind: u8 := raw.load(data, 4)
-    mask: u8 := raw.load(data, 5)
-    reserved: u16 := raw.load(data, 6)
-    tail_reserved: u32 := raw.load(data, 116)
-    id_len: i64 := raw.load(data, 24)
-    sqlite_len: i64 := raw.load(data, 40)
-    postgres_len: i64 := raw.load(data, 56)
-    q1 := pkg.db.internal.descriptor.q1_plan(statement)
-    id := pkg.db.internal.descriptor.descriptor_id_pointer(statement)
-    sqlite_sql := pkg.db.internal.descriptor.sqlite_sql_pointer(statement)
-    postgres_sql := pkg.db.internal.descriptor.postgres_sql_pointer(statement)
-    binder := pkg.db.internal.descriptor.binder(statement)
-    validate_static := pkg.db.internal.descriptor.static_validator(statement)
-    validate_row := pkg.db.internal.descriptor.row_validator(statement)
-    decode := pkg.db.internal.descriptor.decoder(statement)
-    materializer := pkg.db.internal.descriptor.meta_materializer(statement)
-    parameter_resolver := pkg.db.internal.descriptor.parameter_resolver(statement)
-    base := version == 3 && kind == 1 && reserved == 0 && tail_reserved == 0
-      && !q1.is_null()
-      && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
-      && validate_row.is_null() && decode.is_null() && materializer.is_null()
-      && !parameter_resolver.is_null()
-    sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
-      && postgres_sql.is_null() && postgres_len == 0
-    postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0
-      && !postgres_sql.is_null() && postgres_len > 0
-    portable := mask == 3 && !sqlite_sql.is_null() && sqlite_len > 0
-      && !postgres_sql.is_null() && postgres_len > 0
-    return base && (sqlite_only || postgres_only || portable)
-  }
+  return pkg.db.command_header_valid(statement, pkg.db.internal.descriptor_header_control())
 }
 
 pub fn query_header_valid<P, R>(statement: pkg.db.query<P, R>) -> bool {
-  unsafe {
-    data := pkg.db.internal.descriptor.data(statement)
-    if data.is_null() { return false }
-    version: u32 := raw.load(data, 0)
-    kind: u8 := raw.load(data, 4)
-    mask: u8 := raw.load(data, 5)
-    reserved: u16 := raw.load(data, 6)
-    tail_reserved: u32 := raw.load(data, 116)
-    id_len: i64 := raw.load(data, 24)
-    sqlite_len: i64 := raw.load(data, 40)
-    postgres_len: i64 := raw.load(data, 56)
-    q1 := pkg.db.internal.descriptor.q1_plan(statement)
-    id := pkg.db.internal.descriptor.descriptor_id_pointer(statement)
-    sqlite_sql := pkg.db.internal.descriptor.sqlite_sql_pointer(statement)
-    postgres_sql := pkg.db.internal.descriptor.postgres_sql_pointer(statement)
-    binder := pkg.db.internal.descriptor.binder(statement)
-    validate_static := pkg.db.internal.descriptor.static_validator(statement)
-    validate_row := pkg.db.internal.descriptor.row_validator(statement)
-    decode := pkg.db.internal.descriptor.decoder(statement)
-    materializer := pkg.db.internal.descriptor.meta_materializer(statement)
-    parameter_resolver := pkg.db.internal.descriptor.parameter_resolver(statement)
-    base := version == 3 && kind == 0 && reserved == 0 && tail_reserved == 0
-      && !q1.is_null()
-      && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
-      && !validate_row.is_null() && !decode.is_null() && !materializer.is_null()
-      && !parameter_resolver.is_null()
-    sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
-      && postgres_sql.is_null() && postgres_len == 0
-    postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0
-      && !postgres_sql.is_null() && postgres_len > 0
-    portable := mask == 3 && !sqlite_sql.is_null() && sqlite_len > 0
-      && !postgres_sql.is_null() && postgres_len > 0
-    return base && (sqlite_only || postgres_only || portable)
-  }
+  return pkg.db.query_header_valid(statement, pkg.db.internal.descriptor_header_control())
 }
 
 pub fn cleanup_execution(
@@ -606,6 +555,8 @@ pub fn prepare_prevalidated<P, R>(
     }
     owned_id := copy_bytes(query_id)
     binder := pkg.db.internal.descriptor.binder(statement)
+    row_validator := pkg.db.internal.descriptor.row_validator(statement)
+    stream_decoder := pkg.db.internal.descriptor.stream_decoder(statement)
     wrapper := pkg.db.internal.resource.new_stmt_state(
       DRIVER_SQLITE,
       native,
@@ -614,6 +565,8 @@ pub fn prepare_prevalidated<P, R>(
       owned_id,
       query_id.len(),
       raw.null(),
+      row_validator,
+      stream_decoder,
     )
     raw.store(state, 20, 0 as u8)
     prepared: pkg.db.stmt<P, R> := match target {
@@ -667,12 +620,270 @@ pub fn rows_stmt_prevalidated<P, R>(
       return Err(failure)
     }
     rows_wrapper := pkg.db.internal.resource.new_rows_state(
-      DRIVER_SQLITE, native, wrapper, context, state,
+      DRIVER_SQLITE,
+      native,
+      wrapper,
+      context,
+      state,
+      pkg.db.internal.resource.stmt_row_validator(wrapper),
+      pkg.db.internal.resource.stmt_stream_decoder(wrapper),
+      id_pointer,
+      id_length,
+      false,
+      false,
+      false,
+      0,
     )
     output: pkg.db.rows<R> := resource.from_raw_borrowed(
       rows_wrapper, resource.borrow(statement),
     )
     return Ok(output)
+  }
+}
+
+pub fn rows_prevalidated<P, R>(
+  target: pkg.db.exec,
+  params: P,
+  statement: pkg.db.query<P, R>,
+  query_id: str,
+  timeout: Option<i32>,
+) -> Result<pkg.db.rows<R>, pkg.db.Error> {
+  unsafe {
+    if !query_header_valid(statement) { return Err(invalid_descriptor_error()) }
+    data := pkg.db.internal.descriptor.data(statement)
+    mask: u8 := raw.load(data, 5)
+    if mask & 1 == 0 { return Err(driver_mismatch_error(query_id)) }
+    state := state_for(target)
+    if state.is_null() {
+      return Err(descriptor_error(
+        query_id,
+        "db.exec.state",
+        "SQLite execution requires an idle connection or active transaction",
+      ))
+    }
+    database := sqlite_connection(state)
+    if database.is_null() {
+      return Err(descriptor_error(
+        query_id,
+        "db.connection.state",
+        "SQLite connection is closed or poisoned",
+      ))
+    }
+    context := new_context(raw.null())
+    static_status := pkg.db.internal.descriptor.validate_static(statement, context)
+    if static_status != 0 {
+      failure := if static_status == -1 {
+        descriptor_error(
+          query_id,
+          "db.descriptor.shape",
+          "static database descriptor uses a field shape unsupported by streaming execution",
+        )
+      } else { context_error(context, database, query_id) }
+      free_context(context)
+      return Err(failure)
+    }
+    lease := acquire_lease(state, query_id)
+    match lease {
+      Err(error) => {
+        free_context(context)
+        return Err(error)
+      }
+      Ok(_) => {}
+    }
+
+    prior_timeout: i32 := raw.load(state, 16)
+    mut restore_timeout := false
+    match timeout {
+      Some(milliseconds) => {
+        restore_timeout = true
+        status := execution_busy_timeout(database, milliseconds)
+        if status != SQLITE_OK {
+          failure := sqlite_error(database)
+          cleaned := cleanup_execution(
+            state, database, raw.null(), context, restore_timeout, prior_timeout,
+          )
+          return Err(failure)
+        }
+      }
+      None => {}
+    }
+
+    statement_out := raw.alloc(8)
+    tail_out := raw.alloc(8)
+    raw.store(statement_out, 0, raw.null())
+    raw.store(tail_out, 0, raw.null())
+    sql := pkg.db.internal.descriptor.sqlite_sql_pointer(statement)
+    prepare_status := execution_prepare(database, sql, statement_out, tail_out)
+    native_statement: raw := raw.load(statement_out, 0)
+    tail: raw := raw.load(tail_out, 0)
+    raw.free(statement_out)
+    raw.free(tail_out)
+    if prepare_status != SQLITE_OK || native_statement.is_null() {
+      failure := sqlite_error(database)
+      cleaned := cleanup_execution(
+        state, database, native_statement, context, restore_timeout, prior_timeout,
+      )
+      return Err(failure)
+    }
+    if !tail_is_empty(tail) {
+      failure := invalid_query_error(
+        query_id,
+        "db.statement.tail",
+        "static Query must contain exactly one SQL statement",
+      )
+      cleaned := cleanup_execution(
+        state, database, native_statement, context, restore_timeout, prior_timeout,
+      )
+      return Err(failure)
+    }
+    raw.store(context, 8, native_statement)
+    bind_status := pkg.db.internal.descriptor.bind(statement, context, params)
+    if bind_status != 0 {
+      failure := context_error(context, database, query_id)
+      cleaned := cleanup_execution(
+        state, database, native_statement, context, restore_timeout, prior_timeout,
+      )
+      return Err(failure)
+    }
+    owned_id := copy_bytes(query_id)
+    rows_wrapper := pkg.db.internal.resource.new_rows_state(
+      DRIVER_SQLITE,
+      native_statement,
+      raw.null(),
+      context,
+      state,
+      pkg.db.internal.descriptor.row_validator(statement),
+      pkg.db.internal.descriptor.stream_decoder(statement),
+      owned_id,
+      query_id.len(),
+      true,
+      true,
+      restore_timeout,
+      prior_timeout,
+    )
+    output: pkg.db.rows<R> := match target {
+      Conn(reference) => resource.from_raw_borrowed(rows_wrapper, reference)
+      Tx(reference) => resource.from_raw_borrowed(rows_wrapper, reference)
+    }
+    return Ok(output)
+  }
+}
+
+pub fn next_prevalidated<R>(
+  borrow mut rows: pkg.db.rows<R>,
+) -> Result<Option<R>, pkg.db.Error> {
+  unsafe {
+    reference := resource.borrow(rows)
+    wrapper := resource.raw(reference)
+    if pkg.db.internal.resource.rows_driver(wrapper) != DRIVER_SQLITE {
+      return Err(invalid_descriptor_error())
+    }
+    terminal := pkg.db.internal.resource.rows_terminal(wrapper)
+    if terminal == 1 { return Ok(None) }
+    if terminal != 0 {
+      return Err(invalid_query_error(
+        "database rows",
+        "db.rows.state",
+        "database rows cannot advance after a failed execution",
+      ))
+    }
+    id_pointer := pkg.db.internal.resource.rows_query_id_pointer(wrapper)
+    id_length := pkg.db.internal.resource.rows_query_id_length(wrapper)
+    query_id: str := resource.view_from_raw(reference, id_pointer, id_length) else {
+      ignored := pkg.db.internal.resource.close_rows(wrapper, 2)
+      return Err(invalid_descriptor_error())
+    }
+    native := pkg.db.internal.resource.rows_native(wrapper)
+    context := pkg.db.internal.resource.rows_context(wrapper)
+    state := pkg.db.internal.resource.rows_connection_state(wrapper)
+    database := sqlite_connection(state)
+    if native.is_null() || context.is_null() || database.is_null() {
+      ignored := pkg.db.internal.resource.close_rows(wrapper, 2)
+      return Err(descriptor_error(
+        query_id,
+        "db.rows.state",
+        "SQLite rows are closed or poisoned",
+      ))
+    }
+    step_status := rows_step(native)
+    if step_status == SQLITE_DONE {
+      cleanup_status := pkg.db.internal.resource.close_rows(wrapper, 1)
+      if cleanup_status != SQLITE_OK {
+        return Err(descriptor_error(
+          query_id,
+          "db.rows.cleanup",
+          "SQLite rows cleanup failed and the connection was closed",
+        ))
+      }
+      return Ok(None)
+    }
+    if step_status != SQLITE_ROW {
+      failure := sqlite_error(database)
+      ignored := pkg.db.internal.resource.close_rows(wrapper, 2)
+      return Err(failure)
+    }
+    validate_status := pkg.db.internal.descriptor.validate_current_row(reference, context)
+    if validate_status != 0 {
+      failure := context_error(context, database, query_id)
+      ignored := pkg.db.internal.resource.close_rows(wrapper, 2)
+      return Err(failure)
+    }
+    decoded := pkg.db.internal.descriptor.decode_current_row(reference, context)
+    return Ok(Some(decoded))
+  }
+}
+
+pub fn has_next_prevalidated<R>(
+  borrow mut rows: pkg.db.rows<R>,
+) -> Result<bool, pkg.db.Error> {
+  unsafe {
+    reference := resource.borrow(rows)
+    wrapper := resource.raw(reference)
+    if pkg.db.internal.resource.rows_driver(wrapper) != DRIVER_SQLITE {
+      return Err(invalid_descriptor_error())
+    }
+    terminal := pkg.db.internal.resource.rows_terminal(wrapper)
+    if terminal == 1 { return Ok(false) }
+    if terminal != 0 {
+      return Err(invalid_query_error(
+        "database rows",
+        "db.rows.state",
+        "database rows cannot advance after a failed execution",
+      ))
+    }
+    id_pointer := pkg.db.internal.resource.rows_query_id_pointer(wrapper)
+    id_length := pkg.db.internal.resource.rows_query_id_length(wrapper)
+    query_id: str := resource.view_from_raw(reference, id_pointer, id_length) else {
+      ignored := pkg.db.internal.resource.close_rows(wrapper, 2)
+      return Err(invalid_descriptor_error())
+    }
+    native := pkg.db.internal.resource.rows_native(wrapper)
+    state := pkg.db.internal.resource.rows_connection_state(wrapper)
+    database := sqlite_connection(state)
+    if native.is_null() || database.is_null() {
+      ignored := pkg.db.internal.resource.close_rows(wrapper, 2)
+      return Err(descriptor_error(
+        query_id,
+        "db.rows.state",
+        "SQLite rows are closed or poisoned",
+      ))
+    }
+    step_status := rows_step(native)
+    if step_status == SQLITE_ROW { return Ok(true) }
+    if step_status == SQLITE_DONE {
+      cleanup_status := pkg.db.internal.resource.close_rows(wrapper, 1)
+      if cleanup_status != SQLITE_OK {
+        return Err(descriptor_error(
+          query_id,
+          "db.rows.cleanup",
+          "SQLite rows cleanup failed and the connection was closed",
+        ))
+      }
+      return Ok(false)
+    }
+    failure := sqlite_error(database)
+    ignored := pkg.db.internal.resource.close_rows(wrapper, 2)
+    return Err(failure)
   }
 }
 

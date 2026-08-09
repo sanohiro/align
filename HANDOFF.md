@@ -27,7 +27,10 @@ lifecycle tooling and Q5b1's producer-owned static Query metadata consumer have
 also shipped; Q5b2 completes D12 native catalog inspection and EXPLAIN. The
 schema tooling/inspection path is complete. Q4a closes D6/D7 with reusable
 prepared statements, shared connection/transaction execution, and exact
-failure-safe native cleanup. The next product work is Q4b streaming resilience.
+failure-safe native cleanup. Q4b closes D8/D9 with one-pass typed rows,
+generation-bound borrowed views, complete bind/decode parity, scoped deadline
+enforcement, cancellation drain/recovery, and failure-safe stream cleanup. The
+next product work is Q6 compound product closure.
 
 Known pre-existing failure for the pkg.db owner (found 2026-08-09, present on
 `main`, unrelated to the toolchain work that surfaced it):
@@ -52,8 +55,9 @@ Q1 static Query vertical         complete through D1
 Q2 dual-driver scalar parity     complete through D2 + D4
 Q3 checked/offline parity        complete through D3 + D5
 Q4a reusable execution           complete through D6 + D7
-next: Q4b streaming resilience   D8 + D9
+Q4b streaming resilience         complete through D8 + D9
 Q5 schema tooling/inspection     complete through D11 + D12
+next: Q6 compound product closure D10
 ```
 
 The exact cell contracts and owner matrices remain in

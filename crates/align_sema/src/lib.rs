@@ -3321,8 +3321,17 @@ fn decode_static_options(
                             canonical_type_name: right_type,
                         },
                     ) => left_name
-                        .cmp(right_name)
-                        .then_with(|| left_type.cmp(right_type)),
+                        .len()
+                        .to_le_bytes()
+                        .cmp(&right_name.len().to_le_bytes())
+                        .then_with(|| left_name.as_bytes().cmp(right_name.as_bytes()))
+                        .then_with(|| {
+                            left_type
+                                .len()
+                                .to_le_bytes()
+                                .cmp(&right_type.len().to_le_bytes())
+                        })
+                        .then_with(|| left_type.as_bytes().cmp(right_type.as_bytes())),
                     _ => std::cmp::Ordering::Equal,
                 })
         });
@@ -7195,6 +7204,11 @@ fn compact_abstract_nominal_instances(
         match &mut expr.kind {
             ExprKind::Call { type_args, .. } => {
                 for ty in type_args {
+                    remap_ty(ty, remap, valid);
+                }
+            }
+            ExprKind::RawCall { param_tys, .. } => {
+                for ty in param_tys {
                     remap_ty(ty, remap, valid);
                 }
             }
@@ -12303,6 +12317,22 @@ impl<'a> EscapeCheck<'a> {
         }
     }
 
+    /// Resolve one return-region root at a call site. A borrowed Move/resource parameter exposes
+    /// storage owned by the caller's place, not merely the value's inherited dependency region.
+    /// Cap that storage at the caller frame unless the place is itself a borrowed parameter.
+    fn call_return_root_region(&self, argument: &Expr, mode: ast::ParamMode, depth: u32) -> Region {
+        let region = self.region_of(argument, depth);
+        self.call_return_root_cap(argument, mode)
+            .map_or(region, |cap| region.shorter(cap))
+    }
+
+    fn call_return_root_cap(&self, argument: &Expr, mode: ast::ParamMode) -> Option<Region> {
+        (matches!(mode, ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
+            && (is_owned_droppable(argument.ty, self.structs, self.enums, self.tagged_types)
+                || ty_tuple_is_move(argument.ty, self.tuples)))
+        .then(|| self.borrowed_storage_cap(argument))
+    }
+
     fn check(&mut self) {
         for (position, &param) in self.f.params.iter().enumerate() {
             let Some(local) = self.f.locals.get(param as usize) else {
@@ -12609,7 +12639,16 @@ impl<'a> EscapeCheck<'a> {
             let Ty::Result(_, err) = result.ty else {
                 continue;
             };
-            if !self.region_bearing(scalar_to_ty(err)) {
+            // Arena ownership is checked independently by `try_error_contains_arena_owned`.
+            // This lane is only for borrowed payloads: an owned `string`-bearing error may share
+            // the Result's flat region with an Ok-row view without borrowing that row generation.
+            if !ty_may_borrow(
+                scalar_to_ty(err),
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            ) {
                 continue;
             }
             match &result.kind {
@@ -13752,7 +13791,12 @@ impl<'a> EscapeCheck<'a> {
                 };
                 params.iter().fold(initial, |region, &index| {
                     args.get(index as usize).map_or(region, |argument| {
-                        region.shorter(self.region_of(argument, depth))
+                        let mode = function
+                            .params
+                            .get(index as usize)
+                            .map(|(mode, _)| *mode)
+                            .unwrap_or(ast::ParamMode::ByValue);
+                        region.shorter(self.call_return_root_region(argument, mode, depth))
                     })
                 })
             }
@@ -14494,14 +14538,56 @@ impl<'a> EscapeCheck<'a> {
                 let children = match self.named_return_region.get(func) {
                     Some(hir::ReturnRegionSummary::Roots { params, .. }) => params
                         .iter()
-                        .filter_map(|&index| args.get(index as usize))
-                        .map(|argument| (argument, depth, None))
+                        .filter_map(|&index| {
+                            let argument = args.get(index as usize)?;
+                            let mode = self
+                                .named_param_modes
+                                .get(func)
+                                .and_then(|modes| modes.get(index as usize))
+                                .copied()
+                                .unwrap_or(ast::ParamMode::ByValue);
+                            Some((
+                                argument,
+                                depth,
+                                self.call_return_root_cap(argument, mode),
+                            ))
+                        })
                         .collect(),
                     Some(hir::ReturnRegionSummary::None) => Vec::new(),
                     None => args
                         .iter()
                         .map(|argument| (argument, depth, None))
                         .collect(),
+                };
+                push_fold(&mut work, Region::Static, children);
+            }
+            // Compiler-private raw calls carry the same exact return-region summary and parameter
+            // modes as ordinary calls. This is required for descriptor callbacks that decode views
+            // into a mutable resource generation: treating every raw result as `Static` would let
+            // the view escape or survive the next exclusive borrow.
+            ExprKind::RawCall {
+                args,
+                param_modes,
+                return_region,
+                ..
+            } => {
+                let children = match return_region {
+                    hir::ReturnRegionSummary::Roots { params, .. } => params
+                        .iter()
+                        .filter_map(|&index| {
+                            let argument = args.get(index as usize)?;
+                            let mode = param_modes
+                                .get(index as usize)
+                                .copied()
+                                .unwrap_or(ast::ParamMode::ByValue);
+                            Some((
+                                argument,
+                                depth,
+                                self.call_return_root_cap(argument, mode),
+                            ))
+                        })
+                        .collect(),
+                    hir::ReturnRegionSummary::None => Vec::new(),
                 };
                 push_fold(&mut work, Region::Static, children);
             }
@@ -14576,7 +14662,6 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::RawLoad { .. }
             | ExprKind::RawPointerLoad { .. }
             | ExprKind::StaticDescriptorView { .. }
-            | ExprKind::RawCall { .. }
             | ExprKind::RawStore { .. }
             | ExprKind::RawOffset { .. }
             | ExprKind::RawIsNull(..)
@@ -14859,6 +14944,20 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::ResourceViewFromRaw { owner, .. }
             | ExprKind::ResourceBorrow { owner, .. } => work.push(owner),
+            ExprKind::RawCall {
+                args,
+                return_region,
+                ..
+            } => {
+                if let hir::ReturnRegionSummary::Roots { params, .. } = return_region {
+                    work.extend(
+                        params
+                            .iter()
+                            .rev()
+                            .filter_map(|&index| args.get(index as usize)),
+                    );
+                }
+            }
             // A `loop` yields one of its `break` values, but they are scattered as `Stmt::Break` in
             // the body, not reachable from this node. Each `break` value is escape-checked directly
             // (`check_break_escape`), which rejects a local-backed slice at the `break` — so a loop's
@@ -14893,7 +14992,6 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::RawLoad { .. }
             | ExprKind::RawPointerLoad { .. }
             | ExprKind::StaticDescriptorView { .. }
-            | ExprKind::RawCall { .. }
             | ExprKind::RawStore { .. }
             | ExprKind::RawOffset { .. }
             | ExprKind::RawIsNull(..)
@@ -18098,6 +18196,59 @@ impl<'a> MoveCheck<'a> {
         )
     }
 
+    /// A `borrow mut` argument is deliberately advanced by the call itself. When that call returns
+    /// a value rooted in the fresh post-call generation (for example `db.next(rows)`), validating
+    /// the argument's pre-call snapshot after the mutation would reject the intended generation
+    /// transition. Other eager arguments remain ordinary snapshots and are still checked.
+    fn intentional_borrow_mut_snapshot(&self, expression: &Expr, snapshot: usize) -> bool {
+        let belongs_to_argument = |argument: &Expr| {
+            if Self::expr_key(argument) == snapshot {
+                return true;
+            }
+            let advanced = self.borrow_mut_invalidation_roots(argument);
+            if self
+                .ended_value_snapshot(snapshot)
+                .is_some_and(|(root, _)| advanced.contains(&root))
+            {
+                return true;
+            }
+            self.walked_value_facts.get(&snapshot).is_some_and(|fact| {
+                let retained = fact.flatten();
+                !retained.is_empty() && retained.iter().all(|root| advanced.contains(root))
+            })
+        };
+        match &expression.kind {
+            ExprKind::Call { func, args, .. } => {
+                self.named_param_modes.get(func).is_some_and(|modes| {
+                    if args.len() == 1 && modes.first() == Some(&ast::ParamMode::BorrowMut) {
+                        return true;
+                    }
+                    args.iter().enumerate().any(|(index, argument)| {
+                        modes.get(index) == Some(&ast::ParamMode::BorrowMut)
+                            && belongs_to_argument(argument)
+                    })
+                })
+            }
+            ExprKind::CallFnValue { callee, args } => match callee.ty {
+                Ty::Fn(id) => self.fn_types.get(id as usize).is_some_and(|function| {
+                    if args.len() == 1
+                        && function.params.first().map(|(mode, _)| *mode)
+                            == Some(ast::ParamMode::BorrowMut)
+                    {
+                        return true;
+                    }
+                    args.iter().enumerate().any(|(index, argument)| {
+                        function.params.get(index).map(|(mode, _)| *mode)
+                            == Some(ast::ParamMode::BorrowMut)
+                            && belongs_to_argument(argument)
+                    })
+                }),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     fn project_fact_or_flatten(
         &self,
         ty: Ty,
@@ -20127,8 +20278,10 @@ impl<'a> MoveCheck<'a> {
             && !Self::defers_child_snapshot_validation(&e.kind)
         {
             for snapshot in child_snapshots {
+                if !self.intentional_borrow_mut_snapshot(e, snapshot) {
                 self.validate_value_snapshot(key, snapshot, e.span);
             }
+        }
         }
         if !falls_through {
             self.non_fallthrough.insert(e.span);
@@ -20280,11 +20433,9 @@ impl<'a> MoveCheck<'a> {
                         )
                     {
                         for snapshot in child_snapshots {
-                            self.validate_value_snapshot(
-                                key,
-                                snapshot,
-                                expression.span,
-                            );
+                            if !self.intentional_borrow_mut_snapshot(expression, snapshot) {
+                                self.validate_value_snapshot(key, snapshot, expression.span);
+                            }
                         }
                     }
                     if !falls_through {
@@ -22154,11 +22305,9 @@ impl<'a> MoveCheck<'a> {
                 }
                 if !Self::defers_child_snapshot_validation(&wrapper.kind) {
                     for snapshot in child_snapshots {
-                        self.validate_value_snapshot(
-                            key,
-                            snapshot,
-                            wrapper.span,
-                        );
+                        if !self.intentional_borrow_mut_snapshot(wrapper, snapshot) {
+                            self.validate_value_snapshot(key, snapshot, wrapper.span);
+                        }
                     }
                 }
                 if ty_may_borrow(
@@ -29648,6 +29797,15 @@ impl<'a, 't> Checker<'a, 't> {
         if matches!(method, "rows_stmt_sqlite" | "rows_stmt_postgres") {
             return self.check_rows_stmt_dispatch_op(method, args, expected, span);
         }
+        if matches!(
+            method,
+            "next_sqlite" | "next_postgres" | "has_next_sqlite" | "has_next_postgres"
+        ) {
+            return self.check_rows_next_dispatch_op(method, args, expected, span);
+        }
+        if matches!(method, "validate_current_row" | "decode_current_row") {
+            return self.check_rows_current_op(method, args, expected, span);
+        }
         let expected_arity = match method {
             "data"
             | "q1_plan"
@@ -29661,6 +29819,7 @@ impl<'a, 't> Checker<'a, 't> {
             | "static_validator"
             | "row_validator"
             | "decoder"
+            | "stream_decoder"
             | "meta_materializer"
             | "parameter_resolver"
             | "parameter_count" => 1,
@@ -29668,7 +29827,8 @@ impl<'a, 't> Checker<'a, 't> {
             "bind" => 3,
             "parameter_known" | "parameter_ordinal" => 2,
             "materialize_meta" => 4,
-            "execute_sqlite" | "execute_postgres" => 4,
+            "execute_sqlite" | "rows_sqlite" => 4,
+            "execute_postgres" | "rows_postgres" => 5,
             "one_sqlite" | "one_postgres" | "explain_sqlite" | "explain_postgres" => 5,
             "explain_sqlite_native" => 6,
             "explain_postgres_native" => 8,
@@ -29739,6 +29899,8 @@ impl<'a, 't> Checker<'a, 't> {
             "validate_row"
                 | "decode"
                 | "materialize_meta"
+                | "rows_sqlite"
+                | "rows_postgres"
                 | "explain_sqlite"
                 | "explain_postgres"
                 | "explain_sqlite_native"
@@ -29810,6 +29972,8 @@ impl<'a, 't> Checker<'a, 't> {
             method,
             "execute_sqlite"
                 | "execute_postgres"
+                | "rows_sqlite"
+                | "rows_postgres"
                 | "one_sqlite"
                 | "one_postgres"
                 | "explain_sqlite"
@@ -29852,6 +30016,29 @@ impl<'a, 't> Checker<'a, 't> {
             if query_id.ty == Ty::Error {
                 return err;
             }
+            let postgres_timeout = if matches!(method, "execute_postgres" | "rows_postgres") {
+                let timeout_ty = Ty::Option(Scalar::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                }));
+                let timeout = self.check_expr(&args[4], Some(timeout_ty));
+                if timeout.ty == Ty::Error {
+                    return err;
+                }
+                if !self.source_ty_matches(timeout.ty, timeout_ty) {
+                    self.diags.error(
+                        format!(
+                            "PostgreSQL execution timeout must be `Option<i64>`, got {}",
+                            self.ty_display(timeout.ty)
+                        ),
+                        args[4].span,
+                    );
+                    return err;
+                }
+                Some(timeout)
+            } else {
+                None
+            };
             if !self.source_ty_matches(query_id.ty, Ty::Str) {
                 self.diags.error(
                     format!("database query id must be `str`, got {}", self.ty_display(query_id.ty)),
@@ -29904,6 +30091,14 @@ impl<'a, 't> Checker<'a, 't> {
                     return err;
                 };
                 Ty::Struct(plan_id)
+            } else if method.starts_with("rows_") {
+                let row_ty = instance.args[1];
+                let Some(rows_id) = self.concrete_resource("pkg.db$rows", &[row_ty]) else {
+                    self.diags
+                        .error("pkg.db rows resource is unavailable".to_owned(), span);
+                    return err;
+                };
+                Ty::Resource(rows_id)
             } else if command {
                 let Some(&result_id) = self.struct_ids.get("pkg.db$exec_result") else {
                     self.diags.error("pkg.db execution result type is unavailable".to_owned(), span);
@@ -29934,6 +30129,8 @@ impl<'a, 't> Checker<'a, 't> {
             let base = if sqlite {
                 if method.starts_with("explain_") {
                     "pkg.db.internal.sqlite$explain_prevalidated"
+                } else if method.starts_with("rows_") {
+                    "pkg.db.internal.sqlite$rows_prevalidated"
                 } else if method.starts_with("one_") {
                     "pkg.db.internal.sqlite$one_prevalidated"
                 } else {
@@ -29941,6 +30138,8 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             } else if method.starts_with("explain_") {
                 "pkg.db.internal.postgres$explain_prevalidated"
+            } else if method.starts_with("rows_") {
+                "pkg.db.internal.postgres$rows_prevalidated"
             } else if method.starts_with("one_") {
                 "pkg.db.internal.postgres$one_prevalidated"
             } else {
@@ -29963,6 +30162,8 @@ impl<'a, 't> Checker<'a, 't> {
             let (func, type_args, call_args) = if available || self.mono_args.is_empty() {
                 let type_args = if method.starts_with("explain_") {
                     vec![params_ty, instance.args[1]]
+                } else if method.starts_with("rows_") {
+                    vec![params_ty, instance.args[1]]
                 } else if method.starts_with("one_") {
                     vec![params_ty, payload]
                 } else {
@@ -29983,6 +30184,9 @@ impl<'a, 't> Checker<'a, 't> {
                             span,
                         },
                     );
+                }
+                if let Some(timeout) = postgres_timeout {
+                    call_args.push(timeout);
                 }
                 if sqlite {
                     if method.starts_with("explain_") {
@@ -30102,6 +30306,7 @@ impl<'a, 't> Checker<'a, 't> {
             "static_validator" | "validate_static" => 72,
             "row_validator" | "validate_row" => 80,
             "decoder" | "decode" => 88,
+            "stream_decoder" => 120,
             "meta_materializer" | "materialize_meta" => 96,
             "parameter_resolver" | "parameter_ordinal" => 104,
             _ => unreachable!(),
@@ -30132,6 +30337,7 @@ impl<'a, 't> Checker<'a, 't> {
                 | "static_validator"
                 | "row_validator"
                 | "decoder"
+                | "stream_decoder"
                 | "meta_materializer"
                 | "parameter_resolver"
         ) {
@@ -30414,6 +30620,156 @@ impl<'a, 't> Checker<'a, 't> {
         })
     }
 
+    /// Q4b current-row bridge. The rows wrapper retains the producer-owned validator and streaming
+    /// decoder pointers, while the checked call roots any returned Row views in the exact mutable
+    /// rows generation supplied by the package implementation.
+    fn check_rows_current_op(
+        &mut self,
+        method: &str,
+        args: &[ast::Expr],
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Expr {
+        let err = || Expr {
+            kind: ExprKind::Bool(false),
+            ty: Ty::Error,
+            span,
+        };
+        let [reference_ast, context_ast] = args else {
+            self.diags.error(
+                format!(
+                    "static descriptor operation '{method}' expects 2 argument(s), got {}",
+                    args.len()
+                ),
+                span,
+            );
+            return err();
+        };
+        let reference = self.check_expr(reference_ast, None);
+        let Ty::ResourceRef(rows_id) = self.resolve(reference.ty) else {
+            if reference.ty != Ty::Error {
+                self.diags.error(
+                    "current-row operations require `resource_ref<db.rows<R>>`".to_owned(),
+                    reference_ast.span,
+                );
+            }
+            return err();
+        };
+        let Some(instance) = self.resource_instances.get(&rows_id).cloned() else {
+            self.diags.error(
+                "current-row operations require concrete db.rows".to_owned(),
+                span,
+            );
+            return err();
+        };
+        if instance.canonical != "pkg.db$rows" || instance.args.len() != 1 {
+            self.diags.error(
+                "current-row operations require `resource_ref<db.rows<R>>`".to_owned(),
+                reference_ast.span,
+            );
+            return err();
+        }
+        let context = self.check_expr(context_ast, Some(Ty::Raw));
+        if context.ty == Ty::Error || !self.source_ty_matches(context.ty, Ty::Raw) {
+            if context.ty != Ty::Error {
+                self.diags.error(
+                    "current-row context must be `raw`".to_owned(),
+                    context_ast.span,
+                );
+            }
+            return err();
+        }
+        let wrapper = Expr {
+            kind: ExprKind::ResourceRaw {
+                reference: Box::new(reference.clone()),
+                resource: rows_id,
+            },
+            ty: Ty::Raw,
+            span,
+        };
+        let offset = if method == "validate_current_row" {
+            40
+        } else {
+            48
+        };
+        let callee = Expr {
+            kind: ExprKind::RawPointerLoad {
+                ptr: Box::new(wrapper),
+                offset: Box::new(Expr {
+                    kind: ExprKind::Int(offset),
+                    ty: Ty::Int(IntTy {
+                        bits: 64,
+                        signed: true,
+                    }),
+                    span,
+                }),
+            },
+            ty: Ty::Raw,
+            span,
+        };
+        let (ret, call_args, param_tys, param_modes, return_borrow, return_region) =
+            if method == "validate_current_row" {
+                (
+                    Ty::Int(IntTy {
+                        bits: 32,
+                        signed: true,
+                    }),
+                    vec![context],
+                    vec![Ty::Raw],
+                    vec![ast::ParamMode::ByValue],
+                    hir::ReturnBorrowSummary::None,
+                    hir::ReturnRegionSummary::None,
+                )
+            } else {
+                let row_ty = instance.args[0];
+                let borrows = ty_may_borrow(
+                    row_ty,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                );
+                let borrow = if borrows {
+                    hir::ReturnBorrowSummary::Roots {
+                        params: vec![1],
+                        captures: Vec::new(),
+                    }
+                } else {
+                    hir::ReturnBorrowSummary::None
+                };
+                let region = if borrows {
+                    hir::ReturnRegionSummary::Roots {
+                        params: vec![1],
+                        captures: Vec::new(),
+                    }
+                } else {
+                    hir::ReturnRegionSummary::None
+                };
+                (
+                    row_ty,
+                    vec![context, reference],
+                    vec![Ty::Raw, Ty::ResourceRef(rows_id)],
+                    vec![ast::ParamMode::ByValue, ast::ParamMode::ByValue],
+                    borrow,
+                    region,
+                )
+            };
+        self.constrain(ret, expected, span);
+        Expr {
+            kind: ExprKind::RawCall {
+                callee: Box::new(callee),
+                args: call_args,
+                param_tys,
+                param_modes,
+                return_borrow,
+                return_region,
+                return_cleanup: hir::ReturnCleanupAbi::None,
+            },
+            ty: ret,
+            span,
+        }
+    }
+
     /// Queue the selected Q4a native prepare monomorph after P/R are concrete, just like the
     /// existing common execute bridge. SQLite carries normalized flags; PostgreSQL carries an
     /// optional package-owned OID vector and its exact count.
@@ -30653,6 +31009,110 @@ impl<'a, 't> Checker<'a, 't> {
                 }],
             )
         };
+        self.constrain(result_ty, expected, span);
+        Expr {
+            kind: ExprKind::Call {
+                func,
+                args: final_args,
+                type_args,
+            },
+            ty: result_ty,
+            span,
+        }
+    }
+
+    fn check_rows_next_dispatch_op(
+        &mut self,
+        method: &str,
+        args: &[ast::Expr],
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Expr {
+        let err = || Expr {
+            kind: ExprKind::Bool(false),
+            ty: Ty::Error,
+            span,
+        };
+        let [rows_ast] = args else {
+            self.diags.error(
+                format!(
+                    "static descriptor operation '{method}' expects 1 argument(s), got {}",
+                    args.len()
+                ),
+                span,
+            );
+            return err();
+        };
+        let rows = self.check_expr(rows_ast, None);
+        let Ty::Resource(rows_id) = self.resolve(rows.ty) else {
+            if rows.ty != Ty::Error {
+                self.diags
+                    .error("next requires `db.rows<R>`".to_owned(), rows_ast.span);
+            }
+            return err();
+        };
+        let Some(instance) = self.resource_instances.get(&rows_id).cloned() else {
+            self.diags
+                .error("next requires concrete db.rows".to_owned(), rows_ast.span);
+            return err();
+        };
+        if instance.canonical != "pkg.db$rows" || instance.args.len() != 1 {
+            self.diags
+                .error("next requires `db.rows<R>`".to_owned(), rows_ast.span);
+            return err();
+        }
+        self.validate_borrow_argument(&rows, ast::ParamMode::BorrowMut, "next");
+        let row_ty = instance.args[0];
+        let Some(row_scalar) = ty_to_scalar(row_ty) else {
+            self.diags.error(
+                format!(
+                    "database Row type is not representable: {}",
+                    self.ty_display(row_ty)
+                ),
+                span,
+            );
+            return err();
+        };
+        let option_id = intern_tagged_type(
+            self.tagged_types,
+            hir::TaggedType::Option(row_scalar),
+        );
+        let option = Scalar::Tagged(option_id);
+        let error_id = self
+            .enum_ids
+            .get("pkg.db$Error")
+            .copied()
+            .unwrap_or(self.error_enum_id);
+        let probes_only = method.starts_with("has_next_");
+        let result_value = if probes_only { Scalar::Bool } else { option };
+        let result_ty = Ty::Result(result_value, Scalar::Enum(error_id));
+        let base = if method.ends_with("_postgres") && probes_only {
+            "pkg.db.internal.postgres$has_next_prevalidated"
+        } else if method.ends_with("_sqlite") && probes_only {
+            "pkg.db.internal.sqlite$has_next_prevalidated"
+        } else if method == "next_postgres" {
+            "pkg.db.internal.postgres$next_prevalidated"
+        } else {
+            "pkg.db.internal.sqlite$next_prevalidated"
+        };
+        let (func, type_args, final_args) =
+            if self.sigs.contains_key(base) || self.mono_args.is_empty() {
+                (base.to_owned(), vec![row_ty], vec![rows])
+            } else {
+                (
+                    "pkg.db$unsupported".to_owned(),
+                    vec![if probes_only {
+                        Ty::Bool
+                    } else {
+                        Ty::Tagged(option_id)
+                    }],
+                    vec![Expr {
+                        kind: ExprKind::Str("database rows".to_owned()),
+                        ty: Ty::Str,
+                        span,
+                    }],
+                )
+            };
         self.constrain(result_ty, expected, span);
         Expr {
             kind: ExprKind::Call {
@@ -33243,7 +33703,11 @@ impl<'a, 't> Checker<'a, 't> {
                     Ty::Str,
                 )
             }
-            Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })) => (recv, recv_ty),
+            Ty::Slice(Scalar::Int(IntTy {
+                bits: 8,
+                signed: false,
+            })) => (recv, recv_ty),
+            Ty::Param(index) if self.param_bound(index) == Bound::RegionPlain => (recv, recv_ty),
             ty @ Ty::Struct(_) => {
                 if let Some(reason) = self.region_plain_error(ty) {
                     self.diags.error(

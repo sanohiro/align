@@ -219,6 +219,11 @@ fn install_static_descriptor_data(
     let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
     let u32_ty = Ty::Int(IntTy { bits: 32, signed: false });
     let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+    let u8_ty = Ty::Int(IntTy { bits: 8, signed: false });
+    let i16_ty = Ty::Int(IntTy { bits: 16, signed: true });
+    let f32_ty = Ty::Float(align_sema::FloatTy { bits: 32 });
+    let f64_ty = Ty::Float(align_sema::FloatTy { bits: 64 });
+    let bytes_ty = Ty::Slice(align_sema::Scalar::Int(IntTy { bits: 8, signed: false }));
     let none_borrow = hir::ReturnBorrowSummary::None;
     let none_region = hir::ReturnRegionSummary::None;
     let no_cleanup = hir::ReturnCleanupAbi::None;
@@ -227,14 +232,55 @@ fn install_static_descriptor_data(
             .map_err(|_| format!("generated static descriptor symbol `{name}` is invalid"))
     };
     let callback = |name: &str| program_call(&format!("pkg.db.internal${name}"));
-    let bind_i64_callback = callback("bind_i64_v1")?;
-    let bind_text_callback = callback("bind_text_v1")?;
-    let bind_bytes_callback = callback("bind_bytes_v1")?;
+    let bind_callbacks = [
+        callback("bind_bool_v2")?,
+        callback("bind_i16_v2")?,
+        callback("bind_i32_v2")?,
+        callback("bind_i64_v2")?,
+        callback("bind_f32_v2")?,
+        callback("bind_f64_v2")?,
+        callback("bind_text_v2")?,
+        callback("bind_bytes_v2")?,
+    ];
     let sqlite_version_callback = callback("require_sqlite_version_v1")?;
-    let postgres_type_callback = callback("set_postgres_i64_type_v1")?;
-    let row_count_callback = callback("validate_row_count_v1")?;
-    let validate_i64_callback = callback("validate_i64_v1")?;
-    let read_i64_callback = callback("read_i64_v1")?;
+    let postgres_type_callback = callback("set_postgres_type_v2")?;
+    let row_count_callback = callback("validate_row_count_v2")?;
+    let validate_field_callback = callback("validate_field_v2")?;
+    let read_callbacks = [
+        callback("read_bool_v2")?,
+        callback("read_i16_v2")?,
+        callback("read_i32_v2")?,
+        callback("read_i64_v2")?,
+        callback("read_f32_v2")?,
+        callback("read_f64_v2")?,
+    ];
+    let read_view_pointer_callback = callback("read_view_pointer_v2")?;
+    let read_view_length_callback = callback("read_view_length_v2")?;
+    let value_ty = |kind: GeneratedValueKind| match kind {
+        GeneratedValueKind::Bool => Ty::Bool,
+        GeneratedValueKind::I16 => i16_ty,
+        GeneratedValueKind::I32 => i32_ty,
+        GeneratedValueKind::I64 => i64_ty,
+        GeneratedValueKind::F32 => f32_ty,
+        GeneratedValueKind::F64 => f64_ty,
+        GeneratedValueKind::Text => Ty::Str,
+        GeneratedValueKind::Bytes => bytes_ty,
+    };
+    let value_tag = |kind: GeneratedValueKind| match kind {
+        GeneratedValueKind::Bool => 0_i128,
+        GeneratedValueKind::I16 => 1,
+        GeneratedValueKind::I32 => 2,
+        GeneratedValueKind::I64 => 3,
+        GeneratedValueKind::F32 => 4,
+        GeneratedValueKind::F64 => 5,
+        GeneratedValueKind::Text => 6,
+        GeneratedValueKind::Bytes => 7,
+    };
+    let option_ty = |ty: Ty| {
+        align_sema::ty_to_scalar(ty)
+            .map(Ty::Option)
+            .ok_or_else(|| "generated database field is not an Option scalar".to_string())
+    };
 
     let mut ensure_import = |name: ProgramCall, params: Vec<Ty>, ret: Ty| {
         if mir.fns.iter().any(|function| function.name == name)
@@ -252,16 +298,25 @@ fn install_static_descriptor_data(
             return_cleanup: no_cleanup,
         });
     };
-    ensure_import(bind_i64_callback.clone(), vec![Ty::Raw, u32_ty, i64_ty], i32_ty);
-    ensure_import(bind_text_callback.clone(), vec![Ty::Raw, u32_ty, Ty::Str], i32_ty);
-    ensure_import(
-        bind_bytes_callback.clone(),
-        vec![Ty::Raw, u32_ty, Ty::Slice(align_sema::Scalar::Int(IntTy {
-            bits: 8,
-            signed: false,
-        }))],
-        i32_ty,
-    );
+    for (kind, callback) in [
+        GeneratedValueKind::Bool,
+        GeneratedValueKind::I16,
+        GeneratedValueKind::I32,
+        GeneratedValueKind::I64,
+        GeneratedValueKind::F32,
+        GeneratedValueKind::F64,
+        GeneratedValueKind::Text,
+        GeneratedValueKind::Bytes,
+    ]
+    .into_iter()
+    .zip(bind_callbacks.iter().cloned())
+    {
+        ensure_import(
+            callback,
+            vec![Ty::Raw, u32_ty, option_ty(value_ty(kind))?],
+            i32_ty,
+        );
+    }
     ensure_import(
         sqlite_version_callback.clone(),
         vec![Ty::Raw, u32_ty, u32_ty, u32_ty],
@@ -274,11 +329,33 @@ fn install_static_descriptor_data(
     );
     ensure_import(row_count_callback.clone(), vec![Ty::Raw, u32_ty], i32_ty);
     ensure_import(
-        validate_i64_callback.clone(),
-        vec![Ty::Raw, u32_ty, Ty::Str],
+        validate_field_callback.clone(),
+        vec![Ty::Raw, u32_ty, Ty::Str, u8_ty, Ty::Bool],
         i32_ty,
     );
-    ensure_import(read_i64_callback.clone(), vec![Ty::Raw, u32_ty], i64_ty);
+    for (kind, callback) in [
+        GeneratedValueKind::Bool,
+        GeneratedValueKind::I16,
+        GeneratedValueKind::I32,
+        GeneratedValueKind::I64,
+        GeneratedValueKind::F32,
+        GeneratedValueKind::F64,
+    ]
+    .into_iter()
+    .zip(read_callbacks.iter().cloned())
+    {
+        ensure_import(callback, vec![Ty::Raw, u32_ty], option_ty(value_ty(kind))?);
+    }
+    ensure_import(
+        read_view_pointer_callback.clone(),
+        vec![Ty::Raw, u32_ty],
+        Ty::Raw,
+    );
+    ensure_import(
+        read_view_length_callback.clone(),
+        vec![Ty::Raw, u32_ty],
+        i64_ty,
+    );
     let static_constructor_monomorph = |name: &str| {
         [
             "pkg.db$query_file$",
@@ -371,27 +448,45 @@ fn install_static_descriptor_data(
             _ => return Err("generated descriptor Params contract is not a struct".to_string()),
         };
         let binder_supported = first_binder.iter().all(|field| {
-            if field.shape.nullable {
-                return false;
-            }
             let Some(source_ty) = params_field_tys.get(field.params_field_ordinal as usize) else {
                 return false;
             };
-            match field.shape.kind {
-                GeneratedValueKind::I64 => *source_ty == i64_ty,
-                GeneratedValueKind::Text => *source_ty == Ty::Str,
-                GeneratedValueKind::Bytes => {
-                    *source_ty == Ty::Slice(align_sema::Scalar::Int(IntTy {
-                        bits: 8,
-                        signed: false,
-                    }))
-                }
-                _ => false,
+            let base = value_ty(field.shape.kind);
+            let expected = if field.shape.nullable {
+                option_ty(base).ok()
+            } else {
+                Some(base)
+            };
+            if expected == Some(*source_ty) {
+                return true;
+            }
+            let owned = match field.shape.kind {
+                GeneratedValueKind::Text => Ty::String,
+                GeneratedValueKind::Bytes => Ty::DynArray(align_sema::Scalar::Int(IntTy {
+                    bits: 8,
+                    signed: false,
+                })),
+                _ => return false,
+            };
+            if field.shape.nullable {
+                option_ty(owned).ok() == Some(*source_ty)
+            } else {
+                *source_ty == owned
             }
         });
         let row_supported = match &artifact.runtime {
-            GeneratedStaticRuntime::Query(runtime) => !runtime.decoder.fields.iter().any(|field| {
-                field.shape.kind != GeneratedValueKind::I64 || field.shape.nullable
+            GeneratedStaticRuntime::Query(runtime) => runtime.decoder.fields.iter().all(|field| {
+                matches!(
+                    field.shape.kind,
+                    GeneratedValueKind::Bool
+                        | GeneratedValueKind::I16
+                        | GeneratedValueKind::I32
+                        | GeneratedValueKind::I64
+                        | GeneratedValueKind::F32
+                        | GeneratedValueKind::F64
+                        | GeneratedValueKind::Text
+                        | GeneratedValueKind::Bytes
+                )
             }),
             GeneratedStaticRuntime::Command(_) => true,
         };
@@ -406,6 +501,7 @@ fn install_static_descriptor_data(
         let static_name = program_call(&format!("{symbol}$static_validate_v1"))?;
         let row_name = program_call(&format!("{symbol}$row_validate_v1"))?;
         let decode_name = program_call(&format!("{symbol}$decode_v1"))?;
+        let stream_decode_name = program_call(&format!("{symbol}$stream_decode_v1"))?;
         let parameter_ordinal_name = program_call(&format!("{symbol}$parameter_ordinal_v1"))?;
         let query_meta_name = if descriptor.consumer == StaticDescriptorConsumer::Query {
             let (name, function) =
@@ -419,25 +515,38 @@ fn install_static_descriptor_data(
         let mut binder_blocks = Vec::new();
         let mut binder_value_tys = Vec::new();
         for (index, field) in emitted_binder_fields.iter().enumerate() {
-            let field_value = (index * 3) as u32;
-            let status_value = field_value + 1;
-            let success_value = field_value + 2;
+            let field_value = (index * 5) as u32;
+            let normalized_value = field_value + 1;
+            let option_value = field_value + 2;
+            let status_value = field_value + 3;
+            let success_value = field_value + 4;
             let next = (index + 1) as u32;
             let fail = (emitted_binder_fields.len() + index + 1) as u32;
             let source_ty = params_field_tys[field.params_field_ordinal as usize];
-            let bind_callback = match field.shape.kind {
-                GeneratedValueKind::I64 => bind_i64_callback.clone(),
-                GeneratedValueKind::Text => bind_text_callback.clone(),
-                GeneratedValueKind::Bytes => bind_bytes_callback.clone(),
-                _ => return Err("unsupported generated binder field reached emission".to_string()),
+            let base_ty = value_ty(field.shape.kind);
+            let normalized_ty = if field.shape.nullable {
+                option_ty(base_ty)?
+            } else {
+                base_ty
             };
-            binder_value_tys.extend([source_ty, i32_ty, Ty::Bool]);
+            let option_value_ty = option_ty(base_ty)?;
+            let bind_callback = bind_callbacks[value_tag(field.shape.kind) as usize].clone();
+            binder_value_tys.extend([source_ty, normalized_ty, option_value_ty, i32_ty, Ty::Bool]);
             binder_blocks.push(Block {
                 id: index as u32,
                 stmts: vec![
                     Stmt::Let(
                         field_value,
                         Rvalue::Field(1, vec![field.params_field_ordinal]),
+                    ),
+                    Stmt::Let(normalized_value, Rvalue::Use(Operand::Value(field_value))),
+                    Stmt::Let(
+                        option_value,
+                        if field.shape.nullable {
+                            Rvalue::Use(Operand::Value(normalized_value))
+                        } else {
+                            Rvalue::OptionSome(Operand::Value(normalized_value))
+                        },
                     ),
                     Stmt::Let(
                         status_value,
@@ -449,7 +558,7 @@ fn install_static_descriptor_data(
                                     i128::from(field.protocol_ordinal),
                                     u32_ty,
                                 )),
-                                Operand::Value(field_value),
+                                Operand::Value(option_value),
                             ],
                         ),
                     ),
@@ -723,8 +832,8 @@ fn install_static_descriptor_data(
             exportable: false,
         });
 
-        let mut header = vec![0u8; 120];
-        header[0..4].copy_from_slice(&3u32.to_le_bytes());
+        let mut header = vec![0u8; 128];
+        header[0..4].copy_from_slice(&4u32.to_le_bytes());
         header[4] = match descriptor.consumer {
             StaticDescriptorConsumer::Query => 0,
             StaticDescriptorConsumer::Command => 1,
@@ -828,11 +937,13 @@ fn install_static_descriptor_data(
                     .source_alias
                     .clone();
                 validation_calls.push((
-                    validate_i64_callback.clone(),
+                    validate_field_callback.clone(),
                     vec![
                         Operand::Arg(0),
                         Operand::Const(Const::Int(i128::from(field.row_field_ordinal), u32_ty)),
                         Operand::Value(0),
+                        Operand::Const(Const::Int(value_tag(field.shape.kind), u8_ty)),
+                        Operand::Const(Const::Bool(field.shape.nullable)),
                     ],
                     Some(expected_name),
                 ));
@@ -844,7 +955,10 @@ fn install_static_descriptor_data(
                 let mut stmts = Vec::new();
                 if let Some(name) = name {
                     stmts.push(Stmt::Let(base, Rvalue::StrLit(name)));
-                    *args.last_mut().expect("row callback has name") = Operand::Value(base);
+                    let Some(name_argument) = args.get_mut(2) else {
+                        return Err("generated row field callback has no name argument".to_string());
+                    };
+                    *name_argument = Operand::Value(base);
                     values.push(Ty::Str);
                 } else {
                     values.push(Ty::Unit);
@@ -911,30 +1025,237 @@ fn install_static_descriptor_data(
             let row_ty = descriptor
                 .row_ty
                 .ok_or_else(|| "query descriptor has no row type".to_string())?;
+            let Ty::Struct(row_struct_id) = row_ty else {
+                return Err("generated query Row contract is not a struct".to_string());
+            };
+            let row_definition = mir
+                .structs
+                .get(row_struct_id as usize)
+                .ok_or_else(|| "generated query Row struct is absent".to_string())?;
+            let row_mangle = format!("S{}_{}", row_definition.name.len(), row_definition.name);
+            let rows_name = format!("pkg.db$rows${row_mangle}");
+            let rows_resource = if let Some(index) = mir
+                .resources
+                .iter()
+                .position(|resource| resource.name == rows_name)
+            {
+                index as u32
+            } else {
+                let mut resource = mir
+                    .resources
+                    .iter()
+                    .find(|resource| resource.name == "pkg.db$rows")
+                    .cloned()
+                    .unwrap_or_else(|| hir::ResourceDef {
+                        name: "pkg.db$rows".to_string(),
+                        source_name: "pkg.db$rows".to_string(),
+                        declaring_module: "pkg.db".to_string(),
+                        generic_arity: 1,
+                        // The descriptor producer needs only the one-pointer ResourceRef type for
+                        // current-row provenance. The canonical pkg.db unit owns the shared Drop
+                        // thunk definition; keeping this hook unresolved makes this consumer-side
+                        // record emit a declaration rather than a duplicate definition.
+                        drop_hook: "__align_db_stream_owner_drop".to_string(),
+                        drop_thunk: "__align_resource_drop$pkg.db$rows".to_string(),
+                        representation_version: 1,
+                        drop_abi_fingerprint: *b"align-res-drop-1",
+                    });
+                resource.name = rows_name.clone();
+                resource.source_name = rows_name;
+                let id = mir.resources.len() as u32;
+                mir.resources.push(resource);
+                id
+            };
+            let row_borrows = align_sema::ty_may_borrow(
+                row_ty,
+                &mir.structs,
+                &mir.tuples,
+                &mir.enums,
+                &mir.tagged_types,
+            );
+            let stream_return_borrow = if row_borrows {
+                hir::ReturnBorrowSummary::Roots {
+                    params: vec![1],
+                    captures: Vec::new(),
+                }
+            } else {
+                none_borrow.clone()
+            };
+            let stream_return_region = if row_borrows {
+                hir::ReturnRegionSummary::Roots {
+                    params: vec![1],
+                    captures: Vec::new(),
+                }
+            } else {
+                none_region.clone()
+            };
+            let materialized_supported = row_supported
+                && runtime.decoder.fields.iter().all(|field| {
+                    !matches!(
+                        field.shape.kind,
+                        GeneratedValueKind::Text | GeneratedValueKind::Bytes
+                    )
+                });
             let mut decode_stmts = Vec::new();
             let mut decode_values = Vec::new();
-            for (index, field) in runtime.decoder.fields.iter().filter(|_| row_supported).enumerate() {
-                decode_values.push(i64_ty);
+            for field in runtime
+                .decoder
+                .fields
+                .iter()
+                .filter(|_| materialized_supported)
+            {
+                let base_ty = value_ty(field.shape.kind);
+                let option_value_ty = option_ty(base_ty)?;
+                let option_value = decode_values.len() as u32;
+                decode_values.push(option_value_ty);
                 decode_stmts.push(Stmt::Let(
-                    index as u32,
+                    option_value,
                     Rvalue::Call(
-                        DirectCall::Program(read_i64_callback.clone()),
+                        DirectCall::Program(
+                            read_callbacks[value_tag(field.shape.kind) as usize].clone(),
+                        ),
                         vec![
                             Operand::Arg(0),
                             Operand::Const(Const::Int(i128::from(field.row_field_ordinal), u32_ty)),
                         ],
                     ),
                 ));
+                let field_value = if field.shape.nullable {
+                    Operand::Value(option_value)
+                } else {
+                    let value = decode_values.len() as u32;
+                    decode_values.push(base_ty);
+                    decode_stmts.push(Stmt::Let(
+                        value,
+                        Rvalue::OptionUnwrap(Operand::Value(option_value)),
+                    ));
+                    Operand::Value(value)
+                };
                 decode_stmts.push(Stmt::StoreField(
                     1,
                     vec![field.row_field_ordinal],
-                    Operand::Value(index as u32),
+                    field_value,
                 ));
             }
             let result_value = decode_values.len() as u32;
-            if row_supported {
+            if materialized_supported {
                 decode_values.push(row_ty);
                 decode_stmts.push(Stmt::Let(result_value, Rvalue::Load(1)));
+            }
+            let mut stream_decode_stmts = Vec::new();
+            let mut stream_decode_values = Vec::new();
+            for field in runtime.decoder.fields.iter().filter(|_| row_supported) {
+                let base_ty = value_ty(field.shape.kind);
+                let option_value_ty = option_ty(base_ty)?;
+                let option_value = if matches!(
+                    field.shape.kind,
+                    GeneratedValueKind::Text | GeneratedValueKind::Bytes
+                ) {
+                    let pointer = stream_decode_values.len() as u32;
+                    stream_decode_values.push(Ty::Raw);
+                    stream_decode_stmts.push(Stmt::Let(
+                        pointer,
+                        Rvalue::Call(
+                            DirectCall::Program(read_view_pointer_callback.clone()),
+                            vec![
+                                Operand::Arg(0),
+                                Operand::Const(Const::Int(
+                                    i128::from(field.row_field_ordinal),
+                                    u32_ty,
+                                )),
+                            ],
+                        ),
+                    ));
+                    let length = stream_decode_values.len() as u32;
+                    stream_decode_values.push(i64_ty);
+                    stream_decode_stmts.push(Stmt::Let(
+                        length,
+                        Rvalue::Call(
+                            DirectCall::Program(read_view_length_callback.clone()),
+                            vec![
+                                Operand::Arg(0),
+                                Operand::Const(Const::Int(
+                                    i128::from(field.row_field_ordinal),
+                                    u32_ty,
+                                )),
+                            ],
+                        ),
+                    ));
+                    let option_value = stream_decode_values.len() as u32;
+                    stream_decode_values.push(option_value_ty);
+                    let (view, check_utf8) = match field.shape.kind {
+                        GeneratedValueKind::Text => (hir::ResourceViewKind::StrUtf8, true),
+                        GeneratedValueKind::Bytes => {
+                            (
+                                hir::ResourceViewKind::Slice(align_sema::Scalar::Int(IntTy {
+                                    bits: 8,
+                                    signed: false,
+                                })),
+                                false,
+                            )
+                        }
+                        _ => {
+                            return Err(
+                                "generated streaming view field has a non-view kind".to_string(),
+                            );
+                        }
+                    };
+                    stream_decode_stmts.push(Stmt::Let(
+                        option_value,
+                        Rvalue::ResourceViewFromRaw {
+                            owner: Operand::Arg(1),
+                            ptr: Operand::Value(pointer),
+                            len: Operand::Value(length),
+                            resource: rows_resource,
+                            view,
+                            allow_null_if_empty: true,
+                            check_nonnegative_len: true,
+                            check_alignment: 1,
+                            check_utf8,
+                        },
+                    ));
+                    option_value
+                } else {
+                    let option_value = stream_decode_values.len() as u32;
+                    stream_decode_values.push(option_value_ty);
+                    stream_decode_stmts.push(Stmt::Let(
+                        option_value,
+                        Rvalue::Call(
+                            DirectCall::Program(
+                                read_callbacks[value_tag(field.shape.kind) as usize].clone(),
+                            ),
+                            vec![
+                                Operand::Arg(0),
+                                Operand::Const(Const::Int(
+                                    i128::from(field.row_field_ordinal),
+                                    u32_ty,
+                                )),
+                            ],
+                        ),
+                    ));
+                    option_value
+                };
+                let field_value = if field.shape.nullable {
+                    Operand::Value(option_value)
+                } else {
+                    let value = stream_decode_values.len() as u32;
+                    stream_decode_values.push(base_ty);
+                    stream_decode_stmts.push(Stmt::Let(
+                        value,
+                        Rvalue::OptionUnwrap(Operand::Value(option_value)),
+                    ));
+                    Operand::Value(value)
+                };
+                stream_decode_stmts.push(Stmt::StoreField(
+                    2,
+                    vec![field.row_field_ordinal],
+                    field_value,
+                ));
+            }
+            let stream_result_value = stream_decode_values.len() as u32;
+            if row_supported {
+                stream_decode_values.push(row_ty);
+                stream_decode_stmts.push(Stmt::Let(stream_result_value, Rvalue::Load(2)));
             }
             generated_functions.push(Function {
                 name: decode_name.clone(),
@@ -952,8 +1273,33 @@ fn install_static_descriptor_data(
                     id: 0,
                     stmts: decode_stmts,
                     stmt_lines: Vec::new(),
-                    term: if row_supported {
+                    term: if materialized_supported {
                         Term::Return(Some(Operand::Value(result_value)))
+                    } else {
+                        Term::Unreachable
+                    },
+                }],
+                entry: 0,
+                exportable: false,
+            });
+            generated_functions.push(Function {
+                name: stream_decode_name.clone(),
+                params: vec![0, 1],
+                param_modes: vec![ParamMode::ByValue, ParamMode::ByValue],
+                borrow_mut_cleanup_slots: vec![None, None],
+                ret: row_ty,
+                return_borrow: stream_return_borrow,
+                return_region: stream_return_region,
+                return_cleanup: no_cleanup,
+                slots: vec![Ty::Raw, Ty::ResourceRef(rows_resource), row_ty],
+                slot_align: vec![None, None, None],
+                value_tys: stream_decode_values,
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: stream_decode_stmts,
+                    stmt_lines: Vec::new(),
+                    term: if row_supported {
+                        Term::Return(Some(Operand::Value(stream_result_value)))
                     } else {
                         Term::Unreachable
                     },
@@ -968,6 +1314,10 @@ fn install_static_descriptor_data(
             relocations.push(StaticDataRelocation {
                 offset: 88,
                 target: StaticDataTarget::Function(decode_name),
+            });
+            relocations.push(StaticDataRelocation {
+                offset: 120,
+                target: StaticDataTarget::Function(stream_decode_name),
             });
         }
         if let Some(query_meta_name) = query_meta_name {
