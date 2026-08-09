@@ -159,6 +159,22 @@ work runs the corresponding real-resource target in an unrestricted
 environment. A test should be added to an existing owner target when possible;
 do not create another cross-cutting integration matrix for a unit-level rule.
 
+### Service-dependent required suites run locally first
+
+The required `PostgreSQL integration` CI job gates its suites on
+`ALIGN_DB_POSTGRES_REQUIRED=1`, so without a configured database they skip
+locally and their first execution silently moves to CI. That made CI the
+discovery loop: recent `pkg.db` waves paid repeated push→wait→read-log
+round-trips for failures that reproduce locally in seconds.
+
+`scripts/db-verify-local.sh` is the CI-parity local gate: it starts a
+disposable Docker `postgres:16.4` with CI's exact credentials and environment,
+runs the same inverted required-mode self-test and the same
+`pkg_db_q2`/`pkg_db_q3`/`pkg_db_q5a` suites, and tears the container down. A
+diff touching `apps/db` or a `pkg_db_*` test must pass it before push. The
+same rule generalizes: a new env-gated required CI suite ships with a matching
+local Docker script in the same PR.
+
 ## Benchmarks are not tests
 
 A benchmark measures one named performance path against a baseline or control.

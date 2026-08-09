@@ -258,7 +258,10 @@ scripts/cargo.sh clippy --workspace --lib --bins
 
 Use `scripts/cargo.sh` for local Cargo work. It resolves LLVM 22 on Apple
 Silicon/Intel Homebrew and Debian/Ubuntu/WSL2 layouts, validates the major
-version, and supplies keg-only macOS library paths. It respects explicit
+version, and supplies keg-only macOS library paths (including libpq). Run
+workspace Clippy under `CARGO_TARGET_DIR=target/clippy` (as `pre-pr.sh` does):
+clippy and build/test record incompatible fingerprints, so sharing one target
+dir forces a near-full rebuild in both directions on every alternation. It respects explicit
 `LLVM_CONFIG`, `LLVM_SYS_221_PREFIX`, and `LIBRARY_PATH` overrides. Repository
 shell scripts require Bash and must remain compatible with the macOS-provided
 Bash 3.2 and current Debian/Ubuntu Bash; do not invoke them through `sh`.
@@ -269,6 +272,39 @@ and integration targets run only when they own the changed boundary.
 Benchmarks are separate local measurements run only for the changed
 performance path or an explicit performance/resource claim. See
 `docs/impl/16-test-policy.md` for selection and growth rules.
+
+**CI is the final guard, never the discovery loop.** In any implementation
+flow — human or agent-driven — do not push a change to find out whether
+required verification passes; behavior verification happens locally before the
+push, using Docker for service- or platform-dependent suites. Concretely: a
+diff touching `apps/db` or the `pkg_db_*` driver tests must pass
+`scripts/db-verify-local.sh` (a CI-parity disposable PostgreSQL container
+running the same required suites) before it is pushed, and when a new
+required CI job is added, the matching local script ships in the same PR. An
+explicit investigation phase (reproducing a CI-only failure, gathering
+platform data) may use CI runs as an instrument; ordinary implementation may
+not.
+
+**Independent review and local gates may run concurrently.** The one fresh
+full-diff review is inspection-only (no builds or tests), so on a committed
+candidate it can run in parallel with the owner tests, the bounded gate, and
+`scripts/db-verify-local.sh` without interference. Start both on the same
+candidate SHA instead of serializing them; apply the finding fixes and any
+gate failures in the one coherent fix commit afterward.
+
+**The preflight stamp binds the exact pushed HEAD.** Run `scripts/pre-pr.sh`
+on the final commit immediately before pushing; any later commit, amend, or
+rebase invalidates the stamp and requires a rerun. Push and open/update the PR
+as one uninterrupted step — three recent Preflight CI failures were stamps
+belonging to a different SHA, each costing a full round-trip.
+
+**Recurred finding classes are closed by machinery, not prose.** When
+`.claude/skills/align-self-review/FINDINGS.md` reaches its two-event threshold
+the class becomes an explicit checklist question; at three events it must get a
+compile-time tripwire, lint, structural assertion, or parameterized owner where
+feasible (for example, `align_sema`'s `variant_sweep_tripwire` turns a missed
+Gate-1 enum sweep into a build failure). Adding another checklist sentence for
+an already-recurred class is not closure.
 
 Consult `HANDOFF.md` and the roadmap for the current Rust and LLVM versions,
 milestone gates, and specialized verification bundles.

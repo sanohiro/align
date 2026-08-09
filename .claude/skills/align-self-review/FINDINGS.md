@@ -26,7 +26,7 @@ invented exact counts here.
 
 | Root-cause key | Events | PRs | Prevention status |
 |---|---:|---:|---|
-| `validation-phase-completeness` | 7 | 3 | Automated owner added: exact phase order and complete state/header fields are mandatory; poisoned wrong-driver cases pin restriction-before-live precedence for both database drivers. |
+| `validation-phase-completeness` | 9 | 4 | Recurred past the added owner (#727: static-validation-after-native-prepare; unvalidated v3 tail-reserved field). Required next: deduplicate the copied header validators into one shared function so an ABI version bump has one owner, and extend the parameterized phase-order owner across prepared/transaction paths. |
 | `cross-stage-abi-exactness` | 4 | 1 | Covered by Gate 4 and exact ABI owner matrices. |
 | `native-api-version-boundary` | 4 | 1 | Covered by Gate 2 plus version/conversion goldens. |
 | `ownership-allocation-owner` | 3 | 1 | Covered by Gates 1, 2, and 4; every allocation and thunk needs one named owner. |
@@ -34,7 +34,7 @@ invented exact counts here.
 | `native-link-order-closure` | 3 | 1 | Promoted: preserve caller order around the dependency closure and test arbitrary prefix/suffix libraries. |
 | `producer-evidence-propagation` | 1 | 1 | Watch; exact producer-to-consumer evidence owner required. |
 | `public-surface-completeness` | 2 | 2 | Promoted: compare the complete exported surface to the ledger and require an internal/sealed boundary for cross-module helpers. |
-| `operation-matrix-completeness` | 1 | 1 | Watch; enumerate every driver/operation/result arm. |
+| `operation-matrix-completeness` | 3 | 2 | Three events: automation required. Add one parameterized dual-driver parity owner that runs the same descriptor/status/sentinel matrix through both drivers and asserts identical error-class mapping; also check native command tags (PostgreSQL answers `COMMIT` in an aborted transaction with `PGRES_COMMAND_OK` and a `ROLLBACK` tag). |
 | `error-contract-identity` | 1 | 1 | Watch; pin error class, query identity, and precedence. |
 | `source-of-truth-drift` | 1 | 1 | Watch; run ledger-to-prose and stale-obligation search. |
 | `owner-test-topology` | 1 | 1 | Watch; retain whole/per-unit owners when refactoring fixtures. |
@@ -82,6 +82,10 @@ invented exact counts here.
 | #726 | `7a4a8094` | P2 | `native-evidence-applicability` | Leave PostgreSQL sort/null fields absent for non-B-tree index methods. |
 | #726 | `7a4a8094` | P2 | `public-surface-completeness` | Seal cross-module catalog adapters behind the package's internal boundary. |
 | #726 | `7a4a8094` | P2 | `validation-phase-completeness` | Check native metadata driver restriction before complete live-state validity. |
+| #727 | `3c4de7a8` | P1 | `operation-matrix-completeness` | Reject PostgreSQL's implicit rollback on commit (check the command tag, not only the status). |
+| #727 | `3c4de7a8` | P2 | `validation-phase-completeness` | Run SQLite static validation before lease acquisition and native prepare. |
+| #727 | `3c4de7a8` | P2 | `operation-matrix-completeness` | Map SQLite's unsupported-shape sentinel like the PostgreSQL path already does. |
+| #727 | `3c4de7a8` | P2 | `validation-phase-completeness` | Validate the v3 tail-reserved field in every duplicated header validator. |
 
 ## Rejected claims
 
