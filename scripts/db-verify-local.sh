@@ -15,7 +15,7 @@ name="align-db-verify-$$"
 
 command -v docker >/dev/null 2>&1 || { echo "docker is required" >&2; exit 2; }
 docker info >/dev/null 2>&1 || {
-  echo "docker daemon is not running (start Docker Desktop first)" >&2
+  echo "docker daemon is not running (start Docker Desktop on macOS/WSL2, or 'systemctl start docker' on Linux)" >&2
   exit 2
 }
 
