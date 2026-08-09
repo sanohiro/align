@@ -496,3 +496,351 @@ pub fn one_native<P, R>(
     return result
   }
 }
+
+SqliteMetaControls {
+  include_system: bool,
+  include_internal: bool,
+  include_hidden: bool,
+}
+
+fn metadata_controls(
+  options: slice<pkg.db.MetaOption>,
+  native: slice<MetaOption>,
+) -> Result<SqliteMetaControls, pkg.db.Error> {
+  mut saw_timeout := false
+  mut include_system := false
+  mut common_index := 0
+  loop {
+    if common_index >= options.len() { break }
+    match options[common_index] {
+      TimeoutNs(ns) => {
+        if ns <= 0 {
+          return Err(contract_error(
+            "db.meta.timeout_ns",
+            "database metadata timeout must be positive",
+          ))
+        }
+        if saw_timeout {
+          return Err(contract_error(
+            "db.meta.timeout_ns",
+            "duplicate database metadata timeout",
+          ))
+        }
+        saw_timeout = true
+      }
+      IncludeSystem => {
+        if include_system {
+          return Err(contract_error(
+            "db.meta.include_system",
+            "duplicate include-system metadata option",
+          ))
+        }
+        include_system = true
+      }
+    }
+    common_index = common_index + 1
+  }
+  if saw_timeout {
+    return Err(contract_error(
+      "db.meta.timeout_ns",
+      "database metadata deadlines are not available in this milestone",
+    ))
+  }
+
+  mut include_internal := false
+  mut include_hidden := false
+  mut native_index := 0
+  loop {
+    if native_index >= native.len() { break }
+    match native[native_index] {
+      IncludeInternalObjects => {
+        if include_internal {
+          return Err(contract_error(
+            "sqlite.meta.include_internal_objects",
+            "duplicate SQLite internal-object metadata option",
+          ))
+        }
+        include_internal = true
+      }
+      IncludeHiddenColumns => {
+        if include_hidden {
+          return Err(contract_error(
+            "sqlite.meta.include_hidden_columns",
+            "duplicate SQLite hidden-column metadata option",
+          ))
+        }
+        include_hidden = true
+      }
+    }
+    native_index = native_index + 1
+  }
+  return Ok(SqliteMetaControls {
+    include_system: include_system,
+    include_internal: include_internal,
+    include_hidden: include_hidden,
+  })
+}
+
+fn metadata_schema_valid(reference: pkg.db.SchemaRef) -> Result<(), pkg.db.Error> {
+  if contains_nul(reference.name) {
+    return Err(pkg.db.Error.Encode(pkg.db.ContractError {
+      query_id: None,
+      item: "metadata.schema".clone(),
+      message: "metadata identifier contains U+0000".clone(),
+    }))
+  }
+  return Ok(())
+}
+
+fn metadata_table_valid(reference: pkg.db.TableRef) -> Result<(), pkg.db.Error> {
+  if contains_nul(reference.schema) {
+    return Err(pkg.db.Error.Encode(pkg.db.ContractError {
+      query_id: None,
+      item: "metadata.table.schema".clone(),
+      message: "metadata identifier contains U+0000".clone(),
+    }))
+  }
+  if contains_nul(reference.name) {
+    return Err(pkg.db.Error.Encode(pkg.db.ContractError {
+      query_id: None,
+      item: "metadata.table.name".clone(),
+      message: "metadata identifier contains U+0000".clone(),
+    }))
+  }
+  return Ok(())
+}
+
+fn metadata_live(target: pkg.db.exec) -> Result<(), pkg.db.Error> {
+  unsafe {
+    state := pkg.db.internal.sqlite.state_for(target)
+    if state.is_null() {
+      return Err(contract_error(
+        "db.meta.exec",
+        "database metadata requires a live SQLite connection",
+      ))
+    }
+    version: u32 := raw.load(state, 0)
+    driver: u8 := raw.load(state, 4)
+    closed: u8 := raw.load(state, 5)
+    reserved: u16 := raw.load(state, 6)
+    native: raw := raw.load(state, 8)
+    if version != 1 || closed != 0 || reserved != 0 || native.is_null() {
+      return Err(contract_error(
+        "db.meta.exec",
+        "database metadata requires a live SQLite connection",
+      ))
+    }
+    if driver != 1 {
+      return Err(pkg.db.Error.DriverMismatch(pkg.db.ContractError {
+        query_id: None,
+        item: "db.meta.driver".clone(),
+        message: "SQLite metadata requires a SQLite connection".clone(),
+      }))
+    }
+    return Ok(())
+  }
+}
+
+pub fn meta_database_native(
+  target: pkg.db.exec,
+  detail: pkg.db.MetaDetail,
+  out: region,
+  options: slice<pkg.db.MetaOption>,
+  native: slice<MetaOption>,
+) -> Result<pkg.db.DatabaseMeta, pkg.db.Error> {
+  controls := metadata_controls(options, native)?
+  metadata_live(target)?
+  return pkg.db.meta_database(target, detail, out, options)
+}
+
+pub fn meta_schemas_native(
+  target: pkg.db.exec,
+  detail: pkg.db.MetaDetail,
+  out: region,
+  options: slice<pkg.db.MetaOption>,
+  native: slice<MetaOption>,
+) -> Result<array<pkg.db.SchemaMeta>, pkg.db.Error> {
+  controls := metadata_controls(options, native)?
+  metadata_live(target)?
+  return pkg.db.catalog_sqlite_schemas(
+    target, detail, out, controls.include_system,
+  )
+}
+
+pub fn meta_tables_native(
+  target: pkg.db.exec,
+  schema_filter: Option<pkg.db.SchemaRef>,
+  detail: pkg.db.MetaDetail,
+  out: region,
+  options: slice<pkg.db.MetaOption>,
+  native: slice<MetaOption>,
+) -> Result<array<pkg.db.TableMeta>, pkg.db.Error> {
+  controls := metadata_controls(options, native)?
+  match schema_filter { Some(reference) => { metadata_schema_valid(reference)? } None => {} }
+  metadata_live(target)?
+  return pkg.db.catalog_sqlite_tables(
+    target,
+    schema_filter,
+    detail,
+    out,
+    controls.include_system,
+    controls.include_system || controls.include_internal,
+  )
+}
+
+pub fn meta_table_native(
+  target: pkg.db.exec,
+  table_ref: pkg.db.TableRef,
+  detail: pkg.db.MetaDetail,
+  out: region,
+  options: slice<pkg.db.MetaOption>,
+  native: slice<MetaOption>,
+) -> Result<pkg.db.TableMeta, pkg.db.Error> {
+  controls := metadata_controls(options, native)?
+  metadata_table_valid(table_ref)?
+  metadata_live(target)?
+  return pkg.db.catalog_sqlite_table(
+    target,
+    table_ref,
+    detail,
+    out,
+    controls.include_system,
+    controls.include_system || controls.include_internal,
+  )
+}
+
+pub fn meta_columns_native(
+  target: pkg.db.exec,
+  table_ref: pkg.db.TableRef,
+  detail: pkg.db.MetaDetail,
+  out: region,
+  options: slice<pkg.db.MetaOption>,
+  native: slice<MetaOption>,
+) -> Result<array<pkg.db.ColumnMeta>, pkg.db.Error> {
+  controls := metadata_controls(options, native)?
+  metadata_table_valid(table_ref)?
+  metadata_live(target)?
+  return pkg.db.catalog_sqlite_columns(
+    target,
+    table_ref,
+    detail,
+    out,
+    controls.include_system,
+    controls.include_system || controls.include_internal,
+    controls.include_hidden,
+  )
+}
+
+pub fn meta_keys_native(
+  target: pkg.db.exec,
+  table_ref: pkg.db.TableRef,
+  detail: pkg.db.MetaDetail,
+  out: region,
+  options: slice<pkg.db.MetaOption>,
+  native: slice<MetaOption>,
+) -> Result<array<pkg.db.KeyMeta>, pkg.db.Error> {
+  controls := metadata_controls(options, native)?
+  metadata_table_valid(table_ref)?
+  metadata_live(target)?
+  return pkg.db.catalog_sqlite_keys(
+    target,
+    table_ref,
+    detail,
+    out,
+    controls.include_system,
+    controls.include_system || controls.include_internal,
+  )
+}
+
+pub fn meta_indexes_native(
+  target: pkg.db.exec,
+  table_ref: pkg.db.TableRef,
+  detail: pkg.db.MetaDetail,
+  out: region,
+  options: slice<pkg.db.MetaOption>,
+  native: slice<MetaOption>,
+) -> Result<array<pkg.db.IndexMeta>, pkg.db.Error> {
+  controls := metadata_controls(options, native)?
+  metadata_table_valid(table_ref)?
+  metadata_live(target)?
+  return pkg.db.catalog_sqlite_indexes(
+    target,
+    table_ref,
+    detail,
+    out,
+    controls.include_system,
+    controls.include_system || controls.include_internal,
+  )
+}
+
+pub fn explain_native<P, R>(
+  target: pkg.db.exec,
+  statement: pkg.db.query<P, R>,
+  params: P,
+  out: region,
+  options: slice<pkg.db.ExplainOption>,
+  native: slice<ExplainOption>,
+) -> Result<pkg.db.QueryPlan, pkg.db.Error> {
+  if !pkg.db.internal.sqlite.query_header_valid(statement) {
+    return Err(pkg.db.internal.sqlite.invalid_descriptor_error())
+  }
+  unsafe {
+    query_id := pkg.db.internal.descriptor.descriptor_id(statement)
+    mut saw_timeout := false
+    mut common_index := 0
+    loop {
+      if common_index >= options.len() { break }
+      match options[common_index] {
+        TimeoutNs(ns) => {
+          if ns <= 0 {
+            return Err(pkg.db.internal.sqlite.descriptor_error(
+              query_id,
+              "db.explain.timeout_ns",
+              "database EXPLAIN timeout must be positive",
+            ))
+          }
+          if saw_timeout {
+            return Err(pkg.db.internal.sqlite.descriptor_error(
+              query_id,
+              "db.explain.timeout_ns",
+              "duplicate database EXPLAIN timeout",
+            ))
+          }
+          saw_timeout = true
+        }
+      }
+      common_index = common_index + 1
+    }
+    if saw_timeout {
+      return Err(pkg.db.internal.sqlite.descriptor_error(
+        query_id,
+        "db.explain.timeout_ns",
+        "database EXPLAIN deadlines are not available in this milestone",
+      ))
+    }
+    mut saw_mode := false
+    mut mode: u8 := 0
+    mut native_index := 0
+    loop {
+      if native_index >= native.len() { break }
+      if saw_mode {
+        return Err(pkg.db.internal.sqlite.descriptor_error(
+          query_id,
+          "sqlite.explain.mode",
+          "duplicate SQLite EXPLAIN mode",
+        ))
+      }
+      match native[native_index] {
+        QueryPlan => { mode = 0 }
+        Bytecode => { mode = 1 }
+      }
+      saw_mode = true
+      native_index = native_index + 1
+    }
+    result: Result<pkg.db.QueryPlan, pkg.db.Error> :=
+      pkg.db.internal.descriptor.explain_sqlite_native(
+      statement, target, params, out, query_id, mode,
+    )
+    return result
+  }
+}

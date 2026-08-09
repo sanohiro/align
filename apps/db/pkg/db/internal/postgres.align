@@ -16,6 +16,10 @@ extern "C" link("pq") {
   ) -> raw
   fn PQresultStatus(result: raw) -> i32
   fn PQntuples(result: raw) -> i32
+  fn PQnfields(result: raw) -> i32
+  fn PQgetisnull(result: raw, row: i32, column: i32) -> i32
+  fn PQgetvalue(result: raw, row: i32, column: i32) -> raw
+  fn PQgetlength(result: raw, row: i32, column: i32) -> i32
   fn PQcmdTuples(result: raw) -> raw
   fn PQclear(result: raw)
   fn PQerrorMessage(connection: raw) -> raw
@@ -160,6 +164,22 @@ fn copy_c_string(pointer: raw) -> string {
     }
     text := output.bytes().as_str() else "invalid UTF-8 in PostgreSQL error"
     return text.clone()
+  }
+}
+
+pub fn c_string(value: str) -> raw {
+  unsafe {
+    bytes := value.bytes()
+    pointer := raw.alloc(bytes.len() + 1)
+    mut i := 0
+    loop {
+      if i >= bytes.len() { break }
+      raw.store(pointer, i, bytes[i])
+      i = i + 1
+    }
+    terminal: u8 := 0
+    raw.store(pointer, bytes.len(), terminal)
+    return pointer
   }
 }
 
@@ -465,6 +485,22 @@ pub fn result_rows(result: raw) -> i32 {
   unsafe { return PQntuples(result) }
 }
 
+pub fn result_fields(result: raw) -> i32 {
+  unsafe { return PQnfields(result) }
+}
+
+pub fn result_is_null(result: raw, row: i32, column: i32) -> bool {
+  unsafe { return PQgetisnull(result, row, column) != 0 }
+}
+
+pub fn result_value(result: raw, row: i32, column: i32) -> raw {
+  unsafe { return PQgetvalue(result, row, column) }
+}
+
+pub fn result_length(result: raw, row: i32, column: i32) -> i32 {
+  unsafe { return PQgetlength(result, row, column) }
+}
+
 pub fn command_affected(result: raw) -> raw {
   unsafe { return PQcmdTuples(result) }
 }
@@ -659,5 +695,194 @@ pub fn one_prevalidated<P, R>(
     decoded := pkg.db.internal.descriptor.decode(statement, context)
     clear_result_and_context(result, context)
     return Ok(decoded)
+  }
+}
+
+pub fn explain_prevalidated<P, R>(
+  target: pkg.db.exec,
+  params: P,
+  statement: pkg.db.query<P, R>,
+  row_type: Option<R>,
+  out: region,
+  query_id: str,
+  format: u8,
+  option_mask: u8,
+  option_values: u8,
+) -> Result<pkg.db.QueryPlan, pkg.db.Error> {
+  unsafe {
+    if format > 2 || option_mask & 128 != 0 || option_values & ~option_mask != 0 {
+      return Err(descriptor_error(
+        query_id,
+        "postgres.explain.options",
+        "invalid normalized PostgreSQL EXPLAIN options",
+      ))
+    }
+    if option_mask & 1 != option_values & 1 {
+      return Err(descriptor_error(
+        query_id,
+        "postgres.explain.analyze",
+        "PostgreSQL Analyze normalization is inconsistent",
+      ))
+    }
+    if option_mask & 88 != 0 && option_mask & 1 == 0 {
+      return Err(descriptor_error(
+        query_id,
+        "postgres.explain.analyze",
+        "PostgreSQL Buffers, Timing, and Wal require Analyze",
+      ))
+    }
+    data := pkg.db.internal.descriptor.data(statement)
+    mask: u8 := raw.load(data, 5)
+    if mask & 2 == 0 { return Err(driver_mismatch_error(query_id)) }
+    state := state_for(target)
+    if state.is_null() {
+      return Err(descriptor_error(
+        query_id,
+        "db.exec.transaction",
+        "transaction execution is not available in this milestone",
+      ))
+    }
+    state_driver: u8 := raw.load(state, 4)
+    if state_driver != DRIVER_POSTGRES { return Err(driver_mismatch_error(query_id)) }
+    connection := postgres_connection(state)
+    if connection.is_null() {
+      return Err(descriptor_error(
+        query_id,
+        "db.connection.state",
+        "PostgreSQL connection is closed or poisoned",
+      ))
+    }
+    context := new_context(connection)
+    static_status := pkg.db.internal.descriptor.validate_static(statement, context)
+    if static_status != 0 {
+      failure := if static_status == -1 {
+        descriptor_error(
+          query_id,
+          "db.descriptor.shape",
+          "static database descriptor uses a field shape unsupported by EXPLAIN",
+        )
+      } else { context_error(context, connection, raw.null(), query_id) }
+      free_context(context)
+      return Err(failure)
+    }
+    bind_status := pkg.db.internal.descriptor.bind(statement, context, params)
+    if bind_status != 0 {
+      failure := context_error(context, connection, raw.null(), query_id)
+      free_context(context)
+      return Err(failure)
+    }
+
+    mut sql_builder := builder()
+    sql_builder.write("EXPLAIN")
+    if option_mask != 0 || format != 0 {
+      sql_builder.write(" (")
+      mut wrote := false
+      if option_mask & 1 != 0 {
+        sql_builder.write("ANALYZE TRUE")
+        wrote = true
+      }
+      names := ["VERBOSE", "COSTS", "BUFFERS", "TIMING", "SETTINGS", "WAL"]
+      mut bit: u8 := 2
+      mut name_index := 0
+      loop {
+        if name_index >= names.len() { break }
+        if option_mask & bit != 0 {
+          if wrote { sql_builder.write(", ") }
+          sql_builder.write(names[name_index])
+          if option_values & bit != 0 {
+            sql_builder.write(" TRUE")
+          } else { sql_builder.write(" FALSE") }
+          wrote = true
+        }
+        bit = bit * 2
+        name_index = name_index + 1
+      }
+      if format != 0 {
+        if wrote { sql_builder.write(", ") }
+        if format == 1 { sql_builder.write("FORMAT TEXT") }
+        if format == 2 { sql_builder.write("FORMAT JSON") }
+      }
+      sql_builder.write(")")
+    }
+    sql_builder.write(" ")
+    sql_builder.write(pkg.db.internal.descriptor.postgres_sql(statement))
+    sql := sql_builder.to_string()
+    sql_pointer := c_string(sql)
+    result := execute_params(connection, sql_pointer, context)
+    raw.free(sql_pointer)
+    if result.is_null() {
+      failure := connection_error(connection)
+      free_context(context)
+      return Err(failure)
+    }
+    status := result_status(result)
+    if status != PGRES_TUPLES_OK {
+      failure := execution_error(connection, result)
+      clear_result_and_context(result, context)
+      return Err(failure)
+    }
+    rows := result_rows(result)
+    if rows <= 0 || result_fields(result) != 1 {
+      failure := pkg.db.Error.Decode(pkg.db.ContractError {
+        query_id: Some(query_id.clone()),
+        item: "db.explain.row".clone(),
+        message: "PostgreSQL EXPLAIN returned an invalid result shape".clone(),
+      })
+      clear_result_and_context(result, context)
+      return Err(failure)
+    }
+    mut body_builder := builder()
+    mut row: i32 := 0
+    loop {
+      if row >= rows { break }
+      if result_is_null(result, row, 0) {
+        failure := pkg.db.Error.Decode(pkg.db.ContractError {
+          query_id: Some(query_id.clone()),
+          item: "db.explain.row".clone(),
+          message: "PostgreSQL EXPLAIN returned a null plan row".clone(),
+        })
+        clear_result_and_context(result, context)
+        return Err(failure)
+      }
+      pointer := result_value(result, row, 0)
+      length := result_length(result, row, 0)
+      if length < 0 || (pointer.is_null() && length != 0) {
+        failure := pkg.db.Error.Decode(pkg.db.ContractError {
+          query_id: Some(query_id.clone()),
+          item: "db.explain.row".clone(),
+          message: "PostgreSQL EXPLAIN returned an invalid text field".clone(),
+        })
+        clear_result_and_context(result, context)
+        return Err(failure)
+      }
+      mut text_buffer := buffer(length as i64)
+      mut i: i32 := 0
+      loop {
+        if i >= length { break }
+        byte: u8 := raw.load(pointer, i as i64)
+        text_buffer.put_u8(byte)
+        i = i + 1
+      }
+      text := text_buffer.bytes().as_str() else {
+        failure := pkg.db.Error.Decode(pkg.db.ContractError {
+          query_id: Some(query_id.clone()),
+          item: "db.explain.row".clone(),
+          message: "PostgreSQL EXPLAIN output is not valid UTF-8".clone(),
+        })
+        clear_result_and_context(result, context)
+        return Err(failure)
+      }
+      if row > 0 { body_builder.write("\n") }
+      body_builder.write(text)
+      row = row + 1
+    }
+    body := body_builder.to_string()
+    clear_result_and_context(result, context)
+    return Ok(pkg.db.QueryPlan {
+      driver: pkg.db.Driver.PostgreSQL,
+      format: if format == 2 { pkg.db.PlanFormat.Json } else { pkg.db.PlanFormat.Text },
+      analyzed: option_mask & 1 != 0,
+      body: body.clone_in(out),
+    })
   }
 }

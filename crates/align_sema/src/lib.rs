@@ -29444,7 +29444,9 @@ impl<'a, 't> Checker<'a, 't> {
             "parameter_known" => 2,
             "materialize_meta" => 4,
             "execute_sqlite" | "execute_postgres" => 4,
-            "one_sqlite" | "one_postgres" => 5,
+            "one_sqlite" | "one_postgres" | "explain_sqlite" | "explain_postgres" => 5,
+            "explain_sqlite_native" => 6,
+            "explain_postgres_native" => 8,
             _ => {
                 self.diags.error(
                     format!("unknown static descriptor operation '{method}'"),
@@ -29507,7 +29509,16 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         }
-        if matches!(method, "validate_row" | "decode" | "materialize_meta") && !query {
+        if matches!(
+            method,
+            "validate_row"
+                | "decode"
+                | "materialize_meta"
+                | "explain_sqlite"
+                | "explain_postgres"
+                | "explain_sqlite_native"
+                | "explain_postgres_native"
+        ) && !query {
             self.diags.error(
                 format!("static descriptor operation '{method}' requires a Query"),
                 args[0].span,
@@ -29566,11 +29577,21 @@ impl<'a, 't> Checker<'a, 't> {
         }
 
         // The common execution surface is intentionally unable to import the public driver
-        // modules (that would create a cycle).  These four compiler-private operations therefore
+        // modules (that would create a cycle). These compiler-private operations therefore
         // turn into an ordinary generic call only after P/R are concrete.  The finalization pass
         // queues the existing driver-engine monomorph in the consumer unit, preserving normal
         // per-unit generic visibility and the exact native engine ownership boundary.
-        if matches!(method, "execute_sqlite" | "execute_postgres" | "one_sqlite" | "one_postgres") {
+        if matches!(
+            method,
+            "execute_sqlite"
+                | "execute_postgres"
+                | "one_sqlite"
+                | "one_postgres"
+                | "explain_sqlite"
+                | "explain_postgres"
+                | "explain_sqlite_native"
+                | "explain_postgres_native"
+        ) {
             let exec_ty = self
                 .enum_ids
                 .get("pkg.db$exec")
@@ -29578,7 +29599,10 @@ impl<'a, 't> Checker<'a, 't> {
                 .map(Ty::Enum)
                 .unwrap_or(Ty::Error);
             let target = self.check_expr(&args[1], Some(exec_ty));
-            if target.ty != Ty::Error && !self.source_ty_matches(target.ty, exec_ty) {
+            if target.ty == Ty::Error {
+                return err;
+            }
+            if !self.source_ty_matches(target.ty, exec_ty) {
                 self.diags.error(
                     format!("database execution requires `pkg.db.exec`, got {}", self.ty_display(target.ty)),
                     args[1].span,
@@ -29587,25 +29611,35 @@ impl<'a, 't> Checker<'a, 't> {
             }
             let params_ty = instance.args[0];
             let params = self.check_expr(&args[2], Some(params_ty));
-            if params.ty != Ty::Error && !self.source_ty_matches(params.ty, params_ty) {
+            if params.ty == Ty::Error {
+                return err;
+            }
+            if !self.source_ty_matches(params.ty, params_ty) {
                 self.diags.error(
                     format!("database parameters mismatch: expected {}, got {}", self.ty_display(params_ty), self.ty_display(params.ty)),
                     args[2].span,
                 );
                 return err;
             }
-            let query_id_index = if method.starts_with("one_") { 4 } else { 3 };
+            let has_out = method.starts_with("one_") || method.starts_with("explain_");
+            let query_id_index = if has_out { 4 } else { 3 };
             let query_id = self.check_str_init(&args[query_id_index]);
-            if query_id.ty != Ty::Error && !self.source_ty_matches(query_id.ty, Ty::Str) {
+            if query_id.ty == Ty::Error {
+                return err;
+            }
+            if !self.source_ty_matches(query_id.ty, Ty::Str) {
                 self.diags.error(
                     format!("database query id must be `str`, got {}", self.ty_display(query_id.ty)),
                     args[query_id_index].span,
                 );
                 return err;
             }
-            let out = if method.starts_with("one_") {
+            let out = if has_out {
                 let out = self.check_expr(&args[3], Some(Ty::ArenaHandle));
-                if out.ty != Ty::Error && !self.source_ty_matches(out.ty, Ty::ArenaHandle) {
+                if out.ty == Ty::Error {
+                    return err;
+                }
+                if !self.source_ty_matches(out.ty, Ty::ArenaHandle) {
                     self.diags.error(
                         format!("database row output requires `region`, got {}", self.ty_display(out.ty)),
                         args[3].span,
@@ -29616,8 +29650,36 @@ impl<'a, 't> Checker<'a, 't> {
             } else {
                 None
             };
+            let native_explain = method.ends_with("_native");
+            let mut native_explain_args = Vec::new();
+            if native_explain {
+                let u8_ty = Ty::Int(IntTy { bits: 8, signed: false });
+                for argument in &args[5..] {
+                    let checked = self.check_expr(argument, Some(u8_ty));
+                    if checked.ty == Ty::Error {
+                        return err;
+                    }
+                    if !self.source_ty_matches(checked.ty, u8_ty) {
+                        self.diags.error(
+                            format!(
+                                "database EXPLAIN normalized option must be `u8`, got {}",
+                                self.ty_display(checked.ty)
+                            ),
+                            argument.span,
+                        );
+                        return err;
+                    }
+                    native_explain_args.push(checked);
+                }
+            }
 
-            let payload = if command {
+            let payload = if method.starts_with("explain_") {
+                let Some(&plan_id) = self.struct_ids.get("pkg.db$QueryPlan") else {
+                    self.diags.error("pkg.db QueryPlan type is unavailable".to_owned(), span);
+                    return err;
+                };
+                Ty::Struct(plan_id)
+            } else if command {
                 let Some(&result_id) = self.struct_ids.get("pkg.db$exec_result") else {
                     self.diags.error("pkg.db execution result type is unavailable".to_owned(), span);
                     return err;
@@ -29643,21 +29705,40 @@ impl<'a, 't> Checker<'a, 't> {
                 .copied()
                 .unwrap_or(self.error_enum_id);
             let result_ty = Ty::Result(payload_scalar, Scalar::Enum(error_id));
-            let sqlite = method.ends_with("sqlite");
+            let sqlite = method.contains("sqlite");
             let base = if sqlite {
-                if method.starts_with("one_") {
+                if method.starts_with("explain_") {
+                    "pkg.db.internal.sqlite$explain_prevalidated"
+                } else if method.starts_with("one_") {
                     "pkg.db.internal.sqlite$one_prevalidated"
                 } else {
                     "pkg.db.internal.sqlite$execute_prevalidated"
                 }
+            } else if method.starts_with("explain_") {
+                "pkg.db.internal.postgres$explain_prevalidated"
             } else if method.starts_with("one_") {
                 "pkg.db.internal.postgres$one_prevalidated"
             } else {
                 "pkg.db.internal.postgres$execute_prevalidated"
             };
             let available = self.sigs.contains_key(base);
+            let explain_row_scalar = if method.starts_with("explain_") {
+                let Some(row_scalar) = ty_to_scalar(instance.args[1]) else {
+                    self.diags.error(
+                        "database EXPLAIN row type cannot be represented by the native engine"
+                            .to_owned(),
+                        args[0].span,
+                    );
+                    return err;
+                };
+                Some(row_scalar)
+            } else {
+                None
+            };
             let (func, type_args, call_args) = if available || self.mono_args.is_empty() {
-                let type_args = if method.starts_with("one_") {
+                let type_args = if method.starts_with("explain_") {
+                    vec![params_ty, instance.args[1]]
+                } else if method.starts_with("one_") {
                     vec![params_ty, payload]
                 } else {
                     vec![params_ty]
@@ -29668,12 +29749,46 @@ impl<'a, 't> Checker<'a, 't> {
                     // query id. SQLite additionally receives an explicit `None` timeout.
                     call_args = vec![call_args[0].clone(), call_args[1].clone(), call_args[2].clone(), out, call_args[3].clone()];
                 }
+                if let Some(row_scalar) = explain_row_scalar {
+                    call_args.insert(
+                        3,
+                        Expr {
+                            kind: ExprKind::OptionNone,
+                            ty: Ty::Option(row_scalar),
+                            span,
+                        },
+                    );
+                }
                 if sqlite {
-                    call_args.push(Expr {
-                        kind: ExprKind::OptionNone,
-                        ty: Ty::Option(Scalar::Int(IntTy { bits: 32, signed: true })),
-                        span,
-                    });
+                    if method.starts_with("explain_") {
+                        if native_explain {
+                            call_args.extend(native_explain_args);
+                        } else {
+                            call_args.push(Expr {
+                                kind: ExprKind::Int(0),
+                                ty: Ty::Int(IntTy { bits: 8, signed: false }),
+                                span,
+                            });
+                        }
+                    } else {
+                        call_args.push(Expr {
+                            kind: ExprKind::OptionNone,
+                            ty: Ty::Option(Scalar::Int(IntTy { bits: 32, signed: true })),
+                            span,
+                        });
+                    }
+                } else if method.starts_with("explain_") {
+                    if native_explain {
+                        call_args.extend(native_explain_args);
+                    } else {
+                        for value in [0_i128, 0, 0] {
+                            call_args.push(Expr {
+                                kind: ExprKind::Int(value),
+                                ty: Ty::Int(IntTy { bits: 8, signed: false }),
+                                span,
+                            });
+                        }
+                    }
                 }
                 (base.to_owned(), type_args, call_args)
             } else {
