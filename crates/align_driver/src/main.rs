@@ -1186,8 +1186,9 @@ fn usage() {
          --export      (emit-obj/emit-llvm only; repeatable) keep an entry-file top-level function\n  \
                        name's linkage external instead of the default internal, so a no-`main`\n  \
                        library/benchmark object exposes it to the linker\n  \
-         --rt-lto      (build/run/emit-obj/size/emit-llvm; release/fast only) link the fast-path\n  \
-                       string primitives' bitcode into the program and inline it before the opt run\n  \
+         --rt-lto      (build/run/emit-obj/size/emit-llvm) force runtime-bitcode LTO ON — the\n  \
+                       default at release/fast; explicit ON still requires release/fast\n  \
+         --no-rt-lto   (same verbs) force runtime-bitcode LTO OFF on any profile\n  \
          --thin-lto    (build/run/size; release/fast only) cross-unit ThinLTO — cached, parallel\n  \
                        prelink/backend phases with a serial thin-link; composes with --rt-lto\n  \
          --pgo-instrument (build/run/size; release/fast only) build a profile-generating binary; run\n  \
