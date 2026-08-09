@@ -59,6 +59,17 @@ pub ExecuteOption {
   BusyTimeoutNs(i64)
 }
 
+pub PrepareOption {
+  Persistent
+  Normalize
+}
+
+pub TxOption {
+  Deferred
+  Immediate
+  Exclusive
+}
+
 pub MetaOption {
   IncludeInternalObjects
   IncludeHiddenColumns
@@ -413,6 +424,138 @@ pub fn connect(path: str, options: slice<ConnectOption>) -> Result<pkg.db.conn, 
     state := pkg.db.internal.resource.new_conn_state(1, database, busy_ms)
     connection: pkg.db.conn := resource.from_raw(state)
     return Ok(connection)
+  }
+}
+
+fn common_tx_options_valid(options: slice<pkg.db.TxOption>) -> Result<(), pkg.db.Error> {
+  mut i := 0
+  loop {
+    if i >= options.len() { break }
+    match options[i] {
+      BeginTimeoutNs(ns) => {
+        if ns <= 0 {
+          return Err(contract_error(
+            "db.transaction.begin_timeout_ns",
+            "database transaction begin timeout must be positive",
+          ))
+        }
+        return Err(contract_error(
+          "db.transaction.begin_timeout_ns",
+          "database transaction begin deadlines are not available in this milestone",
+        ))
+      }
+    }
+    i = i + 1
+  }
+  return Ok(())
+}
+
+pub fn prepare_native<P, R>(
+  target: pkg.db.exec,
+  statement: pkg.db.query<P, R>,
+  options: slice<pkg.db.PrepareOption>,
+  native: slice<PrepareOption>,
+) -> Result<pkg.db.stmt<P, R>, pkg.db.Error> {
+  if !pkg.db.internal.sqlite.query_header_valid(statement) {
+    return Err(pkg.db.internal.sqlite.invalid_descriptor_error())
+  }
+  unsafe {
+    query_id := pkg.db.internal.descriptor.descriptor_id(statement)
+    mut common_index := 0
+    loop {
+      if common_index >= options.len() { break }
+      match options[common_index] {
+        TimeoutNs(ns) => {
+          if ns <= 0 {
+            return Err(pkg.db.internal.sqlite.descriptor_error(
+              query_id,
+              "db.prepare.timeout_ns",
+              "database prepare timeout must be positive",
+            ))
+          }
+          return Err(pkg.db.internal.sqlite.descriptor_error(
+            query_id,
+            "db.prepare.timeout_ns",
+            "database prepare deadlines are not available in this milestone",
+          ))
+        }
+      }
+      common_index = common_index + 1
+    }
+    mut flags: u32 := 0
+    mut i := 0
+    loop {
+      if i >= native.len() { break }
+      bit := match native[i] {
+        Persistent => 1 as u32
+        Normalize => 2 as u32
+      }
+      if flags & bit != 0 {
+        return Err(pkg.db.internal.sqlite.descriptor_error(
+          query_id,
+          "sqlite.prepare.option",
+          "duplicate SQLite prepare option",
+        ))
+      }
+      flags = flags | bit
+      i = i + 1
+    }
+    return pkg.db.internal.descriptor.prepare_sqlite(statement, target, query_id, flags)
+  }
+}
+
+pub fn begin_native(
+  connection: pkg.db.conn,
+  options: slice<pkg.db.TxOption>,
+  native: slice<TxOption>,
+) -> Result<pkg.db.tx, pkg.db.Error> {
+  common_tx_options_valid(options)?
+  mut mode: i32 := 0
+  mut i := 0
+  loop {
+    if i >= native.len() { break }
+    selected := match native[i] { Deferred => 0, Immediate => 1, Exclusive => 2 }
+    if mode != 0 || (i > 0 && selected == 0) {
+      return Err(contract_error(
+        "sqlite.transaction.mode",
+        "SQLite transaction mode conflicts with another mode",
+      ))
+    }
+    mode = selected + 1
+    i = i + 1
+  }
+  unsafe {
+    state := resource.raw(resource.borrow(connection))
+    if state.is_null() || pkg.db.internal.resource.transaction_active(state) {
+      return Err(contract_error(
+        "sqlite.transaction.connection",
+        "SQLite transaction requires an idle live connection",
+      ))
+    }
+    version: u32 := raw.load(state, 0)
+    driver: u8 := raw.load(state, 4)
+    closed: u8 := raw.load(state, 5)
+    reserved: u16 := raw.load(state, 6)
+    database: raw := raw.load(state, 8)
+    lease: u8 := raw.load(state, 20)
+    if version != 1 || driver != 1 || closed != 0 || reserved != 0
+      || database.is_null() || lease != 0 {
+      return Err(contract_error(
+        "sqlite.transaction.connection",
+        "SQLite transaction requires an idle live SQLite connection",
+      ))
+    }
+    sql := if mode == 2 { "BEGIN IMMEDIATE" } else {
+      if mode == 3 { "BEGIN EXCLUSIVE" } else { "BEGIN DEFERRED" }
+    }
+    command := c_string(sql)
+    status := sqlite3_exec(database, command, raw.null(), raw.null(), raw.null())
+    raw.free(command)
+    if status != SQLITE_OK { return Err(sqlite_error(database)) }
+    pkg.db.internal.resource.set_transaction_active(state, true)
+    transferred := resource.into_raw(connection)
+    transaction: pkg.db.tx := resource.from_raw(transferred)
+    return Ok(transaction)
   }
 }
 

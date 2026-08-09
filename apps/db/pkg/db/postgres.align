@@ -15,11 +15,15 @@ extern "C" link("pq") {
   fn PQstatus(connection: raw) -> i32
   fn PQclientEncoding(connection: raw) -> i32
   fn PQfinish(connection: raw)
+  fn PQexec(connection: raw, command: raw) -> raw
+  fn PQresultStatus(result: raw) -> i32
+  fn PQclear(result: raw)
 }
 
 CONNECTION_OK: i32 := 0
 PG_UTF8: i32 := 6
 PG_TIMEOUT_MAX_SECONDS: i64 := 2147483647
+PGRES_COMMAND_OK: i32 := 1
 
 pub QueryOption {
   ParameterType(str, str)
@@ -61,6 +65,27 @@ pub ConnectOption {
 pub ExecuteOption {
   ParameterFormat(str, Format)
   ResultFormat(Format)
+}
+
+pub PrepareOption {
+  ParameterOid(str, u32)
+}
+
+pub Isolation {
+  ReadCommitted
+  RepeatableRead
+  Serializable
+}
+
+pub Access {
+  ReadOnly
+  ReadWrite
+}
+
+pub TxOption {
+  Isolation(Isolation)
+  Access(Access)
+  Deferrable(bool)
 }
 
 pub MetaOption {
@@ -587,6 +612,244 @@ pub fn connect(url: str, options: slice<ConnectOption>) -> Result<pkg.db.conn, p
     state := pkg.db.internal.resource.new_conn_state(2, connection, 0)
     result: pkg.db.conn := resource.from_raw(state)
     return Ok(result)
+  }
+}
+
+fn common_tx_options_valid(options: slice<pkg.db.TxOption>) -> Result<(), pkg.db.Error> {
+  mut i := 0
+  loop {
+    if i >= options.len() { break }
+    match options[i] {
+      BeginTimeoutNs(ns) => {
+        if ns <= 0 {
+          return Err(contract_error(
+            "db.transaction.begin_timeout_ns",
+            "database transaction begin timeout must be positive",
+          ))
+        }
+        return Err(contract_error(
+          "db.transaction.begin_timeout_ns",
+          "database transaction begin deadlines are not available in this milestone",
+        ))
+      }
+    }
+    i = i + 1
+  }
+  return Ok(())
+}
+
+pub fn prepare_native<P, R>(
+  target: pkg.db.exec,
+  statement: pkg.db.query<P, R>,
+  options: slice<pkg.db.PrepareOption>,
+  native: slice<PrepareOption>,
+) -> Result<pkg.db.stmt<P, R>, pkg.db.Error> {
+  if !pkg.db.internal.postgres.query_header_valid(statement) {
+    return Err(pkg.db.internal.postgres.invalid_descriptor_error())
+  }
+  unsafe {
+    query_id := pkg.db.internal.descriptor.descriptor_id(statement)
+    mut common_index := 0
+    loop {
+      if common_index >= options.len() { break }
+      match options[common_index] {
+        TimeoutNs(ns) => {
+          if ns <= 0 {
+            return Err(pkg.db.internal.postgres.descriptor_error(
+              query_id,
+              "db.prepare.timeout_ns",
+              "database prepare timeout must be positive",
+            ))
+          }
+          return Err(pkg.db.internal.postgres.descriptor_error(
+            query_id,
+            "db.prepare.timeout_ns",
+            "database prepare deadlines are not available in this milestone",
+          ))
+        }
+      }
+      common_index = common_index + 1
+    }
+    count := pkg.db.internal.descriptor.parameter_count(statement)
+    if count > 2147483647 {
+      return Err(pkg.db.internal.postgres.descriptor_error(
+        query_id,
+        "postgres.prepare.parameter_count",
+        "PostgreSQL parameter count exceeds the native i32 range",
+      ))
+    }
+    mut oids := raw.null()
+    if count > 0 {
+      oids = raw.alloc((count as i64) * 4)
+      mut clear: u32 := 0
+      loop {
+        if clear >= count { break }
+        raw.store(oids, (clear as i64) * 4, 0 as u32)
+        clear = clear + 1
+      }
+    }
+    mut i := 0
+    loop {
+      if i >= native.len() { break }
+      match native[i] {
+        ParameterOid(name, oid) => {
+          name_bytes := name.bytes()
+          mut name_has_nul := false
+          mut name_index := 0
+          loop {
+            if name_index >= name_bytes.len() { break }
+            if name_bytes[name_index] == 0 {
+              name_has_nul = true
+              break
+            }
+            name_index = name_index + 1
+          }
+          if name_has_nul {
+            if !oids.is_null() { raw.free(oids) }
+            return Err(pkg.db.Error.Encode(pkg.db.ContractError {
+              query_id: Some(query_id.clone()),
+              item: "postgres.prepare.parameter_oid.name".clone(),
+              message: "PostgreSQL parameter name contains U+0000".clone(),
+            }))
+          }
+          if oid == 0 {
+            if !oids.is_null() { raw.free(oids) }
+            return Err(pkg.db.internal.postgres.descriptor_error(
+              query_id,
+              "postgres.prepare.parameter_oid",
+              "PostgreSQL parameter OID must be nonzero",
+            ))
+          }
+          ordinal := pkg.db.internal.descriptor.parameter_ordinal(statement, name)
+          if ordinal <= 0 || (ordinal as u32) > count {
+            if !oids.is_null() { raw.free(oids) }
+            return Err(pkg.db.internal.postgres.descriptor_error(
+              query_id,
+              "postgres.prepare.parameter_oid.name",
+              "PostgreSQL prepare option names an unknown Params field",
+            ))
+          }
+          offset := ((ordinal as i64) - 1) * 4
+          existing: u32 := raw.load(oids, offset)
+          if existing != 0 {
+            raw.free(oids)
+            return Err(pkg.db.internal.postgres.descriptor_error(
+              query_id,
+              "postgres.prepare.parameter_oid.name",
+              "duplicate PostgreSQL parameter OID option",
+            ))
+          }
+          raw.store(oids, offset, oid)
+        }
+      }
+      i = i + 1
+    }
+    prepared := pkg.db.internal.descriptor.prepare_postgres(
+      statement, target, query_id, oids, count,
+    )
+    if !oids.is_null() { raw.free(oids) }
+    return prepared
+  }
+}
+
+pub fn begin_native(
+  connection: pkg.db.conn,
+  options: slice<pkg.db.TxOption>,
+  native: slice<TxOption>,
+) -> Result<pkg.db.tx, pkg.db.Error> {
+  common_tx_options_valid(options)?
+  mut isolation: i32 := 0
+  mut access: i32 := 0
+  mut deferrable: i32 := 0
+  mut i := 0
+  loop {
+    if i >= native.len() { break }
+    match native[i] {
+      Isolation(value) => {
+        if isolation != 0 {
+          return Err(contract_error(
+            "postgres.transaction.isolation",
+            "duplicate PostgreSQL transaction isolation option",
+          ))
+        }
+        isolation = match value { ReadCommitted => 1, RepeatableRead => 2, Serializable => 3 }
+      }
+      Access(value) => {
+        if access != 0 {
+          return Err(contract_error(
+            "postgres.transaction.access",
+            "duplicate PostgreSQL transaction access option",
+          ))
+        }
+        access = match value { ReadOnly => 1, ReadWrite => 2 }
+      }
+      Deferrable(value) => {
+        if deferrable != 0 {
+          return Err(contract_error(
+            "postgres.transaction.deferrable",
+            "duplicate PostgreSQL transaction deferrable option",
+          ))
+        }
+        deferrable = if value { 2 } else { 1 }
+      }
+    }
+    i = i + 1
+  }
+  if isolation == 0 { isolation = 1 }
+  if access == 0 { access = 2 }
+  if deferrable == 0 { deferrable = 1 }
+  if deferrable == 2 && (isolation != 3 || access != 1) {
+    return Err(contract_error(
+      "postgres.transaction.deferrable",
+      "PostgreSQL DEFERRABLE requires SERIALIZABLE READ ONLY",
+    ))
+  }
+  unsafe {
+    state := resource.raw(resource.borrow(connection))
+    if state.is_null() || pkg.db.internal.resource.transaction_active(state) {
+      return Err(contract_error(
+        "postgres.transaction.connection",
+        "PostgreSQL transaction requires an idle live connection",
+      ))
+    }
+    version: u32 := raw.load(state, 0)
+    driver: u8 := raw.load(state, 4)
+    closed: u8 := raw.load(state, 5)
+    reserved: u16 := raw.load(state, 6)
+    native_connection: raw := raw.load(state, 8)
+    lease: u8 := raw.load(state, 20)
+    if version != 1 || driver != 2 || closed != 0 || reserved != 0
+      || native_connection.is_null() || lease != 0 {
+      return Err(contract_error(
+        "postgres.transaction.connection",
+        "PostgreSQL transaction requires an idle live PostgreSQL connection",
+      ))
+    }
+    mut sql := builder()
+    sql.write("BEGIN ISOLATION LEVEL ")
+    if isolation == 1 { sql.write("READ COMMITTED") }
+    if isolation == 2 { sql.write("REPEATABLE READ") }
+    if isolation == 3 { sql.write("SERIALIZABLE") }
+    if access == 1 { sql.write(" READ ONLY") } else { sql.write(" READ WRITE") }
+    if deferrable == 2 { sql.write(" DEFERRABLE") } else { sql.write(" NOT DEFERRABLE") }
+    command_text := sql.to_string()
+    command := c_string(command_text)
+    result := PQexec(native_connection, command)
+    raw.free(command)
+    if result.is_null() {
+      return Err(pkg.db.internal.postgres.connection_error(native_connection))
+    }
+    status := PQresultStatus(result)
+    if status != PGRES_COMMAND_OK {
+      failure := pkg.db.internal.postgres.execution_error(native_connection, result)
+      PQclear(result)
+      return Err(failure)
+    }
+    PQclear(result)
+    pkg.db.internal.resource.set_transaction_active(state, true)
+    transferred := resource.into_raw(connection)
+    transaction: pkg.db.tx := resource.from_raw(transferred)
+    return Ok(transaction)
   }
 }
 

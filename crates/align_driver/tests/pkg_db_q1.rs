@@ -950,7 +950,11 @@ fn generated_runtime_data_is_producer_owned() {
         entry_path.to_str().expect("UTF-8 entry path"),
         &entry,
     );
-    assert!(!walk.diags.has_errors());
+    assert!(
+        !walk.diags.has_errors(),
+        "{:?}",
+        walk.diags.iter().collect::<Vec<_>>()
+    );
     for unit in walk
         .units
         .iter()
@@ -999,9 +1003,9 @@ fn generated_runtime_data_is_producer_owned() {
             else {
                 panic!("descriptor constructor must start with relocation-bearing static data");
             };
-            assert_eq!(data.bytes.len(), 104);
+            assert_eq!(data.bytes.len(), 120);
             assert_eq!(data.align, 8);
-            assert_eq!(&data.bytes[0..4], &2u32.to_le_bytes());
+            assert_eq!(&data.bytes[0..4], &3u32.to_le_bytes());
             assert_eq!(data.bytes[4], u8::from(descriptor.consumer == StaticDescriptorConsumer::Command));
             assert_eq!(&data.bytes[6..8], &[0, 0]);
             let q1 = data
@@ -1025,7 +1029,7 @@ fn generated_runtime_data_is_producer_owned() {
                 ).then_some(relocation.offset))
                 .collect::<Vec<_>>();
             if descriptor.consumer == StaticDescriptorConsumer::Query {
-                assert_eq!(thunk_offsets, vec![64, 72, 80, 88, 96]);
+                assert_eq!(thunk_offsets, vec![64, 72, 80, 88, 96, 104]);
                 let materializer = data
                     .relocations
                     .iter()
@@ -1037,9 +1041,18 @@ fn generated_runtime_data_is_producer_owned() {
                         if name.as_str().ends_with("$query_meta_v1")
                 ));
             } else {
-                assert_eq!(thunk_offsets, vec![64, 72]);
+                assert_eq!(thunk_offsets, vec![64, 72, 104]);
                 assert_eq!(&data.bytes[96..104], &[0; 8]);
             }
+            let parameter_count = match &artifact.runtime {
+                GeneratedStaticRuntime::Query(runtime) => runtime.drivers[0].binder.fields.len(),
+                GeneratedStaticRuntime::Command(runtime) => runtime.drivers[0].binder.fields.len(),
+            };
+            assert_eq!(
+                &data.bytes[112..116],
+                &(parameter_count as u32).to_le_bytes()
+            );
+            assert_eq!(&data.bytes[116..120], &[0; 4]);
             assert!(matches!(
                 statements.get(1),
                 Some(align_mir::Stmt::StoreField(
@@ -1065,6 +1078,26 @@ fn generated_runtime_data_is_producer_owned() {
             assert_eq!(
                 binder.param_modes,
                 vec![align_ast::ParamMode::ByValue, align_ast::ParamMode::Borrow]
+            );
+            let parameter_resolver = unit
+                .mir
+                .fns
+                .iter()
+                .find(|function| {
+                    function.name.as_str() == format!("{symbol}$parameter_ordinal_v1")
+                })
+                .expect("generated parameter ordinal resolver");
+            assert_eq!(parameter_resolver.slots, vec![align_sema::Ty::Str]);
+            assert_eq!(
+                parameter_resolver.param_modes,
+                vec![align_ast::ParamMode::ByValue]
+            );
+            assert_eq!(
+                parameter_resolver.ret,
+                align_sema::Ty::Int(align_sema::IntTy {
+                    bits: 32,
+                    signed: true,
+                })
             );
             let static_validator = unit
                 .mir

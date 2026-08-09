@@ -102,6 +102,12 @@ The same concept is encoded independently in 2–4 places; you update one and a 
   version, reserved byte, closed/poisoned flag, pointer, length, thunk, and
   lease field before the first losing-phase allocation, native side effect, or
   indirect call. Pin multi-invalid precedence with a parameterized owner.
+- [ ] **The exported surface is exactly the reviewed ledger.** Inventory every
+  `pub` function and constructor in changed package modules. A cross-module
+  implementation helper must live under the settled `internal` import boundary
+  or require a sealed internal capability that application code cannot
+  construct; a distinctive name is not access control. Add a negative owner
+  that attempts the shortest bypass from application source.
 - [ ] **Native link closures preserve surrounding order.** Normalize at the
   earliest existing closure member, keep unrelated prefix and suffix libraries
   in caller order, and append prerequisites only after dependents. Test an

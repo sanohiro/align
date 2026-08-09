@@ -24,9 +24,10 @@ checked-metadata regeneration and offline consumption across both drivers
 (D3 + D5), including exact schema identities, fail-closed native description,
 atomic publication, and required PostgreSQL CI coverage. Q5a/D11 migration
 lifecycle tooling and Q5b1's producer-owned static Query metadata consumer have
-also shipped; Q5b2 completes D12 native catalog inspection and EXPLAIN. The next
-product work may proceed independently along the Q4a runtime and remaining Q5b
-inspection paths.
+also shipped; Q5b2 completes D12 native catalog inspection and EXPLAIN. The
+schema tooling/inspection path is complete. Q4a closes D6/D7 with reusable
+prepared statements, shared connection/transaction execution, and exact
+failure-safe native cleanup. The next product work is Q4b streaming resilience.
 
 The completed prerequisite waves and current product boundary are:
 
@@ -40,8 +41,9 @@ F-D package integration          complete through L7
 Q1 static Query vertical         complete through D1
 Q2 dual-driver scalar parity     complete through D2 + D4
 Q3 checked/offline parity        complete through D3 + D5
-next: Q4a reusable execution     D6 + D7
-Q5 schema tooling/inspection     D11 + Q5b1 complete; next Q5b2/D12
+Q4a reusable execution           complete through D6 + D7
+next: Q4b streaming resilience   D8 + D9
+Q5 schema tooling/inspection     complete through D11 + D12
 ```
 
 The exact cell contracts and owner matrices remain in

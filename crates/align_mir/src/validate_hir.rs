@@ -6136,7 +6136,23 @@ impl<'a> BodyValidator<'a> {
                 let hir::ExprKind::RawPointerLoad { ptr, offset } = &callee.kind else {
                     return None;
                 };
-                let query = self.static_descriptor_data_kind(context, ptr)?;
+                let descriptor_kind = self.static_descriptor_data_kind(context, ptr);
+                let prepared_resource = match &ptr.kind {
+                    hir::ExprKind::ResourceRaw { resource, .. } => self
+                        .program
+                        .resources
+                        .get(*resource as usize)
+                        .filter(|definition| {
+                            definition.declaring_module == "pkg.db"
+                                && definition.generic_arity == 2
+                                && definition.name.starts_with("pkg.db$stmt$")
+                        })
+                        .map(|_| *resource),
+                    _ => None,
+                };
+                if descriptor_kind.is_none() && prepared_resource.is_none() {
+                    return None;
+                }
                 let hir::ExprKind::Int(offset) = &offset.kind else {
                     return None;
                 };
@@ -6173,28 +6189,47 @@ impl<'a> BodyValidator<'a> {
                     signed: true,
                 });
                 let signature_ok = match offset {
-                    64 => {
+                    24 => {
+                        let resource = prepared_resource?;
+                        let params_ty = param_tys.get(1).copied()?;
+                        let definition = self.program.resources.get(resource as usize)?;
+                        let expected_prefix =
+                            format!("pkg.db$stmt${}$", body_ty_mangle(params_ty, self.program));
                         args.len() == 2
+                            && matches!(params_ty, Ty::Struct(_))
+                            && definition
+                                .name
+                                .strip_prefix(&expected_prefix)
+                                .is_some_and(|row| !row.is_empty())
+                            && param_tys.first() == Some(&Ty::Raw)
+                            && param_modes.as_slice()
+                                == [align_ast::ParamMode::ByValue, align_ast::ParamMode::Borrow]
+                            && expression.ty == i32_ty
+                    }
+                    64 => {
+                        descriptor_kind.is_some()
+                            && args.len() == 2
                             && param_tys.first() == Some(&Ty::Raw)
                             && param_modes.as_slice()
                                 == [align_ast::ParamMode::ByValue, align_ast::ParamMode::Borrow]
                             && expression.ty == i32_ty
                     }
                     72 => {
-                        args.len() == 1
+                        descriptor_kind.is_some()
+                            && args.len() == 1
                             && param_tys.as_slice() == [Ty::Raw]
                             && param_modes.as_slice() == [align_ast::ParamMode::ByValue]
                             && expression.ty == i32_ty
                     }
                     80 => {
-                        query
+                        descriptor_kind == Some(true)
                             && args.len() == 1
                             && param_tys.as_slice() == [Ty::Raw]
                             && param_modes.as_slice() == [align_ast::ParamMode::ByValue]
                             && expression.ty == i32_ty
                     }
                     88 => {
-                        query
+                        descriptor_kind == Some(true)
                             && args.len() == 1
                             && param_tys.as_slice() == [Ty::Raw]
                             && param_modes.as_slice() == [align_ast::ParamMode::ByValue]
@@ -6202,7 +6237,7 @@ impl<'a> BodyValidator<'a> {
                     96 => {
                         let u8_ty = Ty::Int(align_sema::IntTy { bits: 8, signed: false });
                         let i64_ty = Ty::Int(align_sema::IntTy { bits: 64, signed: true });
-                        query
+                        descriptor_kind == Some(true)
                             && args.len() == 3
                             && param_tys.as_slice() == [u8_ty, u8_ty, i64_ty]
                             && param_modes.as_slice()
@@ -6216,6 +6251,13 @@ impl<'a> BodyValidator<'a> {
                                 Ty::Option(align_sema::Scalar::Struct(id))
                                     if self.query_meta_type_ok(id)
                             )
+                    }
+                    104 => {
+                        descriptor_kind.is_some()
+                            && args.len() == 1
+                            && param_tys.as_slice() == [Ty::Str]
+                            && param_modes.as_slice() == [align_ast::ParamMode::ByValue]
+                            && expression.ty == i32_ty
                     }
                     _ => false,
                 };
@@ -9949,6 +9991,14 @@ pub(crate) fn body_ty_mangle(ty: Ty, program: &hir::Program) -> String {
                     || "E_invalid".to_string(),
                     |definition| format!("E{}_{}", definition.name.len(), definition.name),
                 )),
+                Ty::Resource(id) => output.push_str(&program.resources.get(id as usize).map_or_else(
+                    || "W_invalid".to_string(),
+                    |definition| format!("W{}_{}", definition.name.len(), definition.name),
+                )),
+                Ty::ResourceRef(id) => push_sequence(
+                    &mut work,
+                    vec![Work::Text("J_".to_string()), Work::Type(Ty::Resource(id))],
+                ),
                 Ty::Tagged(id) if tagged_visiting.insert(id) => {
                     let sequence = match program.tagged_types.get(id as usize).copied() {
                         Some(hir::TaggedType::Option(payload)) => vec![

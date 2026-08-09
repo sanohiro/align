@@ -3977,6 +3977,32 @@ this path first lands or changes.
 - PostgreSQL isolation/read-only/deferrable combinations and pre-BEGIN conflict rejection;
 - use-after-end and conn/tx alias rejection.
 
+#### Q4a/D6+D7 implementation closure matrix
+
+Q4a publishes prepared reuse and transactions together because both extend the same physical-
+connection resource prefix, dependent-generation rules, generic execution dispatch, native cleanup,
+and whole/per-unit ABI. This capability is expected to exceed roughly 1,000 hand-written lines:
+splitting it would repeat the connection move-in/move-out, child-before-parent, driver dispatch, and
+Drop proof while leaving either prepared or transactional reuse without the settled common execution
+model.
+
+| Closure cell | Required implementation closure | Exact owner evidence |
+|---|---|---|
+| exact public surface | Publish only `stmt<P,R>`, `rows<R>`, `PrepareOption`, `TxOption`, `prepare`, `rows_stmt`, `begin`, `commit`, `rollback`, and the corresponding SQLite/PostgreSQL native prepare/begin forms with the exact option-slice order from §§6 and 11–14. Keep `exec_conn`/`exec_tx` as the sole execution-view constructors. | Q4a public whole/per-unit interface golden plus wrong-scope, wrong-arity, and sealed-helper negatives |
+| statement formation and validation | Validate the complete Query descriptor, common options, native options, driver restriction, and live target before native prepare. Construct one Move `stmt<P,R>` dependent on the exact conn/tx generation and retain only package-owned native state, generated binder identity, and owned diagnostic identity. | malformed-descriptor/no-send, wrong-driver/no-send, conn/tx parent-move negatives, whole/per-unit prepare owner |
+| prepared bind and execution | `rows_stmt(borrow mut stmt, params, [])` creates one fresh dependent `rows<R>` generation, binds through the producer-owned Params thunk without reflection, and holds every native bind/result allocation until rows Drop. Partial bind failure clears all installed bindings and drops moved Params exactly once. | sequential prepare/reuse, text/blob source invalidation and rebind, injected partial-bind cleanup count |
+| SQLite prepared lifecycle | Apply each `Persistent`/`Normalize` tag at most once through the native prepare flags, hold the connection execution lease from `rows_stmt` through rows Drop, reset then clear bindings on every end path, and finalize exactly once on stmt Drop. Cleanup failure poisons/closes the connection before releasing dependencies. | SQLite option disposition, overlap, reset/clear/finalize counters, error/early-Drop owner |
+| PostgreSQL prepared lifecycle | Validate each `ParameterOid(name, oid)` against the concrete Params contract before `PQprepare`, reject unknown/duplicate/zero OIDs, allocate one connection-local collision-free statement name, use `PQexecPrepared`, clear every result/context once, and best-effort `DEALLOCATE` on stmt Drop. No process/global cache exists. | PostgreSQL required prepare/reuse and option owner plus native stub lifecycle counters |
+| transaction formation and options | Validate common options first and driver options in source order before `BEGIN`. `begin` consumes conn only after successful native begin, uses exact SQLite mode SQL and exact PostgreSQL isolation/access/deferrable clause, and rejects invalid PostgreSQL combinations before send. | common/native option precedence, SQLite three-mode owner, required PostgreSQL combination/no-send owner |
+| transaction execution and joins | A live tx carries the same validated connection prefix as conn. Every existing common/native execution and inspection path accepts `exec.Tx` without a second trait/ABI; use-after-end, conn/tx aliases, and commit/rollback while a stmt/rows child is live are compile-time errors. | common command/Query inside both driver transactions, metadata/EXPLAIN tx owner, compile-fail alias/child matrix |
+| commit, rollback, and Drop | `commit`/`rollback` consume tx and return conn only after certain native success. An end error leaves the tx owner live for fail-safe rollback+close. Implicit Drop never commits: it best-effort rolls back, closes once, nulls transferred state, and frees the wrapper in native order. | success/error/early-return/branch/`?` end matrix and close/rollback/commit counters |
+| generic and ABI closure | Bump the fixed 8-aligned execution descriptor from 104-byte v2 to 120-byte v3 while leaving offsets 0–103 unchanged. Offset 104 is one non-null producer-owned `fn(name: str) -> i32` parameter-ordinal resolver for Query and command, offset 112 is the exact `u32` distinct-parameter count, and offset 116 is reserved zero. The generic stmt binder bridge is package-private, requires a concrete `stmt<P,R>` reference and matching P, lowers to the retained producer thunk with exact borrow modes, and is rejected from application source or malformed HIR. Whole-program and per-unit linkage retain the producer thunk and both native libraries only when reachable. | sema/MIR fail-closed bridge owner, exact descriptor-size/offset/signature owner, whole/per-unit runtime parity |
+| explicit later cells | Q4a does not publish `next`, borrowed current-row views, common deadline enforcement, cancellation, portals, or a statement cache. D8 owns typed row delivery/generation and the full bind/decode type matrix; D9 owns deadline/cancel completion. Q4a nevertheless closes rows resource cleanup and prepared text/blob copy lifetime needed by those consumers. | absence/interface golden plus the Q4b/D8+D9 matrix |
+
+Before candidate review, the author-side matrix-to-diff pass maps every applicable row to one source
+path and one owner. A finding in one bind, end, or cleanup branch triggers the same root-cause audit
+across both drivers and both conn/tx parents before the coherent fix commit.
+
 ### D8 — typed row streaming
 
 - dependent `db.rows<R>` resource;

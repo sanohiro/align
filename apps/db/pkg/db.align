@@ -18,6 +18,7 @@ extern "C" link("sqlite3") {
   fn sqlite3_errcode(database: raw) -> i32
   fn sqlite3_extended_errcode(database: raw) -> i32
   fn sqlite3_errmsg(database: raw) -> raw
+  fn sqlite3_exec(database: raw, sql: raw, callback: raw, argument: raw, error_out: raw) -> i32
 }
 
 extern "C" link("pq") {
@@ -39,6 +40,8 @@ extern "C" link("pq") {
   fn PQgetlength(result: raw, row: i32, column: i32) -> i32
   fn PQerrorMessage(connection: raw) -> raw
   fn PQresultErrorField(result: raw, field: i32) -> raw
+  fn PQexec(connection: raw, command: raw) -> raw
+  fn PQclear(result: raw)
 }
 
 SQLITE_OK: i32 := 0
@@ -48,6 +51,7 @@ SQLITE_NULL: i32 := 5
 SQLITE_ROW: i32 := 100
 SQLITE_DONE: i32 := 101
 PGRES_TUPLES_OK: i32 := 2
+PGRES_COMMAND_OK: i32 := 1
 
 // Static statement descriptors are compiler-produced Copy values. These source declarations own
 // their public type surface; a constructor body is unreachable after descriptor lowering.
@@ -58,9 +62,14 @@ pub command<P> {}
 // dispatch; public code never receives its native pointer.
 pub resource conn = pkg.db.internal.resource.drop_conn
 
-// D7 constructs transactions. Q2 publishes the settled type so db.exec has its final closed shape,
-// but no Q2 operation can construct this arm.
+// A transaction owns the same physical connection state until commit/rollback returns it or Drop
+// performs fail-safe rollback and close.
 pub resource tx = pkg.db.internal.resource.drop_tx
+
+// Q4a prepared execution resources. A stmt depends on the conn/tx generation that prepared it;
+// one rows value in turn depends on the current mutable statement generation.
+pub resource stmt<P, R> = pkg.db.internal.resource.drop_stmt
+pub resource rows<R> = pkg.db.internal.resource.drop_rows
 
 // Private synchronous owner for one D12 native result. It is borrowed from the connection so no
 // cursor can outlive or overlap a move of that connection. The drop hook finalizes/clears the
@@ -358,6 +367,14 @@ pub ExecuteOption {
   TimeoutNs(i64)
 }
 
+pub PrepareOption {
+  TimeoutNs(i64)
+}
+
+pub TxOption {
+  BeginTimeoutNs(i64)
+}
+
 pub MetaOption {
   TimeoutNs(i64)
   IncludeSystem
@@ -450,8 +467,14 @@ fn metadata_table_valid(reference: TableRef) -> Result<(), Error> {
 fn execution_state(target: exec) -> raw {
   unsafe {
     state := match target {
-      Conn(reference) => resource.raw(reference)
-      Tx(_) => raw.null()
+      Conn(reference) => {
+        candidate := resource.raw(reference)
+        if pkg.db.internal.resource.transaction_active(candidate) { raw.null() } else { candidate }
+      }
+      Tx(reference) => {
+        candidate := resource.raw(reference)
+        if pkg.db.internal.resource.transaction_active(candidate) { candidate } else { raw.null() }
+      }
     }
     if state.is_null() { return raw.null() }
     version: u32 := raw.load(state, 0)
@@ -631,7 +654,7 @@ fn sqlite_open_cursor(
     )
     cursor: catalog_cursor := match target {
       Conn(reference) => resource.from_raw_borrowed(wrapper, reference)
-      Tx(_) => process.abort()
+      Tx(reference) => resource.from_raw_borrowed(wrapper, reference)
     }
     if !first_pointer.is_null() {
       first_value := match first { Some(value) => value None => "" }
@@ -886,7 +909,7 @@ fn postgres_open_cursor(
     )
     cursor: catalog_cursor := match target {
       Conn(reference) => resource.from_raw_borrowed(wrapper, reference)
-      Tx(_) => process.abort()
+      Tx(reference) => resource.from_raw_borrowed(wrapper, reference)
     }
     return Ok(cursor)
   }
@@ -1101,9 +1124,8 @@ pub fn exec_tx(borrow t: tx) -> exec = exec.Tx(resource.borrow(t))
 
 // The common layer owns the closed resource prefix.  Reading only its driver tag keeps the
 // dispatch decision in the package boundary; the native engines still own every connection-state
-// and cleanup rule.  A transaction carries the same prefix when D7 constructs it, so the selected
-// engine can return the settled transaction-unsupported error rather than being mistaken for an
-// unknown driver.
+// and cleanup rule. An active transaction carries that same prefix, so common operations retain
+// one driver dispatch path while the native engine validates the conn/tx execution state.
 pub fn driver_tag(target: exec) -> u8 {
   unsafe {
     state := match target {
@@ -2829,9 +2851,11 @@ pub fn meta_query<P, R>(
     validate_row := pkg.db.internal.descriptor.row_validator(statement)
     decode := pkg.db.internal.descriptor.decoder(statement)
     materializer := pkg.db.internal.descriptor.meta_materializer(statement)
-    base_valid := version == 2 && kind == 0 && reserved == 0 && !q1.is_null()
+    parameter_resolver := pkg.db.internal.descriptor.parameter_resolver(statement)
+    base_valid := version == 3 && kind == 0 && reserved == 0 && !q1.is_null()
       && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
       && !validate_row.is_null() && !decode.is_null() && !materializer.is_null()
+      && !parameter_resolver.is_null()
     sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
       && postgres_sql.is_null() && postgres_len == 0
     postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0
@@ -2927,8 +2951,14 @@ pub fn meta_query<P, R>(
       }
     }
     connection_state := match target {
-      Conn(reference) => resource.raw(reference)
-      Tx(reference) => resource.raw(reference)
+      Conn(reference) => {
+        candidate := resource.raw(reference)
+        if pkg.db.internal.resource.transaction_active(candidate) { raw.null() } else { candidate }
+      }
+      Tx(reference) => {
+        candidate := resource.raw(reference)
+        if pkg.db.internal.resource.transaction_active(candidate) { candidate } else { raw.null() }
+      }
     }
     mut live_exec := false
     if !connection_state.is_null() {
@@ -3006,9 +3036,11 @@ pub fn explain<P, R>(
     validate_row := pkg.db.internal.descriptor.row_validator(statement)
     decode := pkg.db.internal.descriptor.decoder(statement)
     materializer := pkg.db.internal.descriptor.meta_materializer(statement)
-    base_valid := version == 2 && kind == 0 && reserved == 0 && !q1.is_null()
+    parameter_resolver := pkg.db.internal.descriptor.parameter_resolver(statement)
+    base_valid := version == 3 && kind == 0 && reserved == 0 && !q1.is_null()
       && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
       && !validate_row.is_null() && !decode.is_null() && !materializer.is_null()
+      && !parameter_resolver.is_null()
     sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
       && postgres_sql.is_null() && postgres_len == 0
     postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0
@@ -3071,8 +3103,14 @@ pub fn explain<P, R>(
       }))
     }
     state := match target {
-      Conn(reference) => resource.raw(reference)
-      Tx(reference) => resource.raw(reference)
+      Conn(reference) => {
+        candidate := resource.raw(reference)
+        if pkg.db.internal.resource.transaction_active(candidate) { raw.null() } else { candidate }
+      }
+      Tx(reference) => {
+        candidate := resource.raw(reference)
+        if pkg.db.internal.resource.transaction_active(candidate) { candidate } else { raw.null() }
+      }
     }
     mut live_exec := false
     if !state.is_null() {
@@ -3151,9 +3189,11 @@ pub fn execute<P>(
     validate_row := pkg.db.internal.descriptor.row_validator(statement)
     decode := pkg.db.internal.descriptor.decoder(statement)
     materializer := pkg.db.internal.descriptor.meta_materializer(statement)
-    base_valid := version == 2 && kind == 1 && reserved == 0 && !q1.is_null()
+    parameter_resolver := pkg.db.internal.descriptor.parameter_resolver(statement)
+    base_valid := version == 3 && kind == 1 && reserved == 0 && !q1.is_null()
       && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
       && validate_row.is_null() && decode.is_null() && materializer.is_null()
+      && !parameter_resolver.is_null()
     sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
       && postgres_sql.is_null() && postgres_len == 0
     postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0
@@ -3179,6 +3219,111 @@ pub fn execute<P>(
       return pkg.db.internal.descriptor.execute_postgres(statement, target, params, query_id)
     }
     return unsupported(query_id)
+  }
+}
+
+pub fn prepare<P, R>(
+  target: exec,
+  statement: query<P, R>,
+  options: slice<PrepareOption>,
+) -> Result<stmt<P, R>, Error> {
+  unsafe {
+    data := pkg.db.internal.descriptor.data(statement)
+    if data.is_null() {
+      return Err(Error.InvalidQuery(ContractError {
+        query_id: None,
+        item: "db.descriptor.header".clone(),
+        message: "invalid static database descriptor".clone(),
+      }))
+    }
+    version: u32 := raw.load(data, 0)
+    kind: u8 := raw.load(data, 4)
+    mask: u8 := raw.load(data, 5)
+    reserved: u16 := raw.load(data, 6)
+    id_len: i64 := raw.load(data, 24)
+    sqlite_len: i64 := raw.load(data, 40)
+    postgres_len: i64 := raw.load(data, 56)
+    q1 := pkg.db.internal.descriptor.q1_plan(statement)
+    id := pkg.db.internal.descriptor.descriptor_id_pointer(statement)
+    sqlite_sql := pkg.db.internal.descriptor.sqlite_sql_pointer(statement)
+    postgres_sql := pkg.db.internal.descriptor.postgres_sql_pointer(statement)
+    binder := pkg.db.internal.descriptor.binder(statement)
+    validate_static := pkg.db.internal.descriptor.static_validator(statement)
+    validate_row := pkg.db.internal.descriptor.row_validator(statement)
+    decode := pkg.db.internal.descriptor.decoder(statement)
+    materializer := pkg.db.internal.descriptor.meta_materializer(statement)
+    parameter_resolver := pkg.db.internal.descriptor.parameter_resolver(statement)
+    base_valid := version == 3 && kind == 0 && reserved == 0 && !q1.is_null()
+      && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
+      && !validate_row.is_null() && !decode.is_null() && !materializer.is_null()
+      && !parameter_resolver.is_null()
+    sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
+      && postgres_sql.is_null() && postgres_len == 0
+    postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0
+      && !postgres_sql.is_null() && postgres_len > 0
+    portable := mask == 3 && !sqlite_sql.is_null() && sqlite_len > 0
+      && !postgres_sql.is_null() && postgres_len > 0
+    if !(base_valid && (sqlite_only || postgres_only || portable)) {
+      return Err(Error.InvalidQuery(ContractError {
+        query_id: None,
+        item: "db.descriptor.header".clone(),
+        message: "invalid static database descriptor".clone(),
+      }))
+    }
+    query_id := pkg.db.internal.descriptor.descriptor_id(statement)
+    mut i := 0
+    loop {
+      if i >= options.len() { break }
+      match options[i] {
+        TimeoutNs(ns) => {
+          if ns <= 0 {
+            return Err(Error.Unsupported(ContractError {
+              query_id: Some(query_id.clone()),
+              item: "db.prepare.timeout_ns".clone(),
+              message: "database prepare timeout must be positive".clone(),
+            }))
+          }
+          return Err(Error.Unsupported(ContractError {
+            query_id: Some(query_id.clone()),
+            item: "db.prepare.timeout_ns".clone(),
+            message: "database prepare deadlines are not available in this milestone".clone(),
+          }))
+        }
+      }
+      i = i + 1
+    }
+    driver := driver_tag(target)
+    if driver == 1 {
+      return pkg.db.internal.descriptor.prepare_sqlite(statement, target, query_id, 0 as u32)
+    }
+    if driver == 2 {
+      return pkg.db.internal.descriptor.prepare_postgres(
+        statement, target, query_id, raw.null(), 0 as u32,
+      )
+    }
+    return unsupported(query_id)
+  }
+}
+
+pub fn rows_stmt<P, R>(
+  borrow mut statement: stmt<P, R>,
+  params: P,
+  options: slice<ExecuteOption>,
+) -> Result<rows<R>, Error> {
+  unsafe {
+    wrapper := resource.raw(resource.borrow(statement))
+    driver := pkg.db.internal.resource.stmt_driver(wrapper)
+    if driver == 1 {
+      return pkg.db.internal.descriptor.rows_stmt_sqlite(statement, params, options)
+    }
+    if driver == 2 {
+      return pkg.db.internal.descriptor.rows_stmt_postgres(statement, params, options)
+    }
+    return Err(Error.InvalidQuery(ContractError {
+      query_id: None,
+      item: "db.statement.header".clone(),
+      message: "invalid prepared statement".clone(),
+    }))
   }
 }
 
@@ -3214,9 +3359,11 @@ pub fn one<P, R>(
     validate_row := pkg.db.internal.descriptor.row_validator(statement)
     decode := pkg.db.internal.descriptor.decoder(statement)
     materializer := pkg.db.internal.descriptor.meta_materializer(statement)
-    base_valid := version == 2 && kind == 0 && reserved == 0 && !q1.is_null()
+    parameter_resolver := pkg.db.internal.descriptor.parameter_resolver(statement)
+    base_valid := version == 3 && kind == 0 && reserved == 0 && !q1.is_null()
       && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
       && !validate_row.is_null() && !decode.is_null() && !materializer.is_null()
+      && !parameter_resolver.is_null()
     sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
       && postgres_sql.is_null() && postgres_len == 0
     postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0
@@ -3242,5 +3389,135 @@ pub fn one<P, R>(
       return pkg.db.internal.descriptor.one_postgres(statement, target, params, out, query_id)
     }
     return unsupported(query_id)
+  }
+}
+
+fn tx_options_valid(options: slice<TxOption>) -> Result<(), Error> {
+  mut i := 0
+  loop {
+    if i >= options.len() { break }
+    match options[i] {
+      BeginTimeoutNs(ns) => {
+        if ns <= 0 {
+          return Err(queryless_contract(
+            "db.transaction.begin_timeout_ns",
+            "database transaction begin timeout must be positive",
+          ))
+        }
+        return Err(queryless_contract(
+          "db.transaction.begin_timeout_ns",
+          "database transaction begin deadlines are not available in this milestone",
+        ))
+      }
+    }
+    i = i + 1
+  }
+  return Ok(())
+}
+
+fn transaction_state_valid(state: raw, active: bool) -> bool {
+  unsafe {
+    if state.is_null() { return false }
+    version: u32 := raw.load(state, 0)
+    driver: u8 := raw.load(state, 4)
+    closed: u8 := raw.load(state, 5)
+    reserved: u16 := raw.load(state, 6)
+    native: raw := raw.load(state, 8)
+    lease: u8 := raw.load(state, 20)
+    transaction: u8 := raw.load(state, 21)
+    return version == 1 && (driver == 1 || driver == 2) && closed == 0 && reserved == 0
+      && !native.is_null() && lease == 0 && ((transaction != 0) == active)
+  }
+}
+
+fn transaction_control(state: raw, sql: str) -> Result<(), Error> {
+  unsafe {
+    driver: u8 := raw.load(state, 4)
+    native: raw := raw.load(state, 8)
+    command := c_string(sql)
+    if driver == 1 {
+      status := sqlite3_exec(native, command, raw.null(), raw.null(), raw.null())
+      raw.free(command)
+      if status != SQLITE_OK { return Err(sqlite_native_error(native)) }
+      return Ok(())
+    }
+    if driver == 2 {
+      result := PQexec(native, command)
+      raw.free(command)
+      if result.is_null() { return Err(postgres_native_error(native, raw.null())) }
+      status := PQresultStatus(result)
+      if status != PGRES_COMMAND_OK {
+        failure := postgres_native_error(native, result)
+        PQclear(result)
+        return Err(failure)
+      }
+      PQclear(result)
+      return Ok(())
+    }
+    raw.free(command)
+    return Err(queryless_contract(
+      "db.transaction.driver",
+      "database transaction requires a SQLite or PostgreSQL connection",
+    ))
+  }
+}
+
+pub fn begin(connection: conn, options: slice<TxOption>) -> Result<tx, Error> {
+  tx_options_valid(options)?
+  unsafe {
+    state := resource.raw(resource.borrow(connection))
+    if !transaction_state_valid(state, false) {
+      return Err(queryless_contract(
+        "db.transaction.connection",
+        "database transaction requires an idle live connection",
+      ))
+    }
+    driver: u8 := raw.load(state, 4)
+    if driver == 1 {
+      transaction_control(state, "BEGIN DEFERRED")?
+    } else {
+      transaction_control(
+        state,
+        "BEGIN ISOLATION LEVEL READ COMMITTED READ WRITE NOT DEFERRABLE",
+      )?
+    }
+    pkg.db.internal.resource.set_transaction_active(state, true)
+    transferred := resource.into_raw(connection)
+    transaction: tx := resource.from_raw(transferred)
+    return Ok(transaction)
+  }
+}
+
+pub fn commit(transaction: tx) -> Result<conn, Error> {
+  unsafe {
+    state := resource.raw(resource.borrow(transaction))
+    if !transaction_state_valid(state, true) {
+      return Err(queryless_contract(
+        "db.transaction.state",
+        "database transaction is not active",
+      ))
+    }
+    transaction_control(state, "COMMIT")?
+    pkg.db.internal.resource.set_transaction_active(state, false)
+    transferred := resource.into_raw(transaction)
+    connection: conn := resource.from_raw(transferred)
+    return Ok(connection)
+  }
+}
+
+pub fn rollback(transaction: tx) -> Result<conn, Error> {
+  unsafe {
+    state := resource.raw(resource.borrow(transaction))
+    if !transaction_state_valid(state, true) {
+      return Err(queryless_contract(
+        "db.transaction.state",
+        "database transaction is not active",
+      ))
+    }
+    transaction_control(state, "ROLLBACK")?
+    pkg.db.internal.resource.set_transaction_active(state, false)
+    transferred := resource.into_raw(transaction)
+    connection: conn := resource.from_raw(transferred)
+    return Ok(connection)
   }
 }

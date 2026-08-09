@@ -487,6 +487,54 @@ pub fn expose(reference: resource_ref<stmt<i64>>) -> raw { unsafe { return resou
 }
 
 #[test]
+fn dormant_generic_resource_producer_owns_the_shared_drop_thunk() {
+    let root = "\
+module pkg.db
+import pkg.db.internal.resource
+pub resource stmt<T> = pkg.db.internal.resource.drop_conn
+pub fn open<T>() -> stmt<T> { unsafe { return resource.from_raw(raw.alloc(8)) } }
+";
+    let project = [
+        ("pkg/db/internal/resource.align", INTERNAL),
+        ("pkg/db.align", root),
+        (
+            "main.align",
+            "module main\nimport pkg.db\nfn main() -> i32 { owner: pkg.db.stmt<i64> := pkg.db.open(); return 42 }\n",
+        ),
+    ];
+    let built = build_per_unit_multi("resource-dormant-generic-thunk", &project, "main.align");
+    if backend_available() {
+        let producer_ir = emit_llvm_ir(
+            &built.unit("pkg.db").mir,
+            BuildTarget::Baseline,
+            false,
+            &[],
+            false,
+        )
+        .expect("producer LLVM");
+        let consumer_ir = emit_llvm_ir(
+            &built.unit("main").mir,
+            BuildTarget::Baseline,
+            false,
+            &[],
+            false,
+        )
+        .expect("consumer LLVM");
+        let thunk = "__align_resource_drop$pkg.db$stmt";
+        assert!(
+            producer_ir.contains(&format!("define hidden void @\"{thunk}\"(ptr")),
+            "{producer_ir}"
+        );
+        assert!(
+            consumer_ir.contains(&format!("declare hidden void @\"{thunk}\"(ptr")),
+            "{consumer_ir}"
+        );
+        let output = built.link_and_run();
+        assert_eq!(output.status.code(), Some(42));
+    }
+}
+
+#[test]
 fn native_views_validate_every_pointer_length_and_encoding_state() {
     let root = "\
 module pkg.db
