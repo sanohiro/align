@@ -82,13 +82,13 @@ jobs:
           echo "LIBRARY_PATH=$(brew --prefix openssl@3)/lib:$(brew --prefix zstd)/lib" >> "$GITHUB_ENV"
 
       - name: Build compiler
-        run: scripts/cargo.sh build --locked --release -p align_runtime -p align_driver
+        run: scripts/cargo.sh build --locked --profile dist -p align_runtime -p align_driver
 
       - name: Smoke test compiler
         shell: bash
         run: |
-          ./target/release/alignc --version
-          ./target/release/alignc build examples/hello.align
+          ./target/dist/alignc --version
+          ./target/dist/alignc build examples/hello.align
           ./hello
 
       - name: Create archive
@@ -97,8 +97,8 @@ jobs:
           ARTIFACT: ${{ matrix.artifact }}
         run: |
           mkdir -p package
-          cp target/release/alignc package/
-          cp target/release/libalign_runtime.a package/
+          cp target/dist/alignc package/
+          cp target/dist/libalign_runtime.a package/
           cp LICENSE-APACHE LICENSE-MIT README.md README.ja.md package/
           tar -C package -czf "$ARTIFACT.tar.gz" \
             alignc libalign_runtime.a LICENSE-APACHE LICENSE-MIT README.md README.ja.md

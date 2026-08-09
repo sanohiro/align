@@ -303,8 +303,10 @@ belonging to a different SHA, each costing a full round-trip.
 the class becomes an explicit checklist question; at three events it must get a
 compile-time tripwire, lint, structural assertion, or parameterized owner where
 feasible (for example, `align_sema`'s `variant_sweep_tripwire` turns a missed
-Gate-1 enum sweep into a build failure). Adding another checklist sentence for
-an already-recurred class is not closure.
+Gate-1 enum sweep into a build failure, and `scripts/lint-ratchet.sh` pins the
+panic-source and lossy-cast counts so a new Gate-2/Gate-3 violation fails the
+gate immediately while the legacy count only ratchets down). Adding another
+checklist sentence for an already-recurred class is not closure.
 
 Consult `HANDOFF.md` and the roadmap for the current Rust and LLVM versions,
 milestone gates, and specialized verification bundles.
@@ -329,7 +331,10 @@ A **release build** only produces optimized local artifacts. A versioned
 **release** is different and happens only when the user explicitly asks to
 release: bump `Cargo.toml` and `Cargo.lock`, write matching release notes,
 commit `chore(release): Align vX.Y.Z` on `main`, then tag and push `vX.Y.Z`.
-Never infer the publish flow from “build” or “release build.”
+Never infer the publish flow from “build” or “release build.” Versioned
+release artifacts build with `--profile dist` (thin LTO, one codegen unit —
+wired in `release.yml`); ordinary `--release` builds stay on the untuned
+default so routine batch builds never pay the LTO link time.
 
 ## Long-running work and progress monitoring
 

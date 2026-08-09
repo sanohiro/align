@@ -12,3 +12,11 @@ license = "MIT OR Apache-2.0"
 # Pipeline: align_lexer -> align_parser -> align_sema -> align_mir
 #           -> align_codegen_llvm -> (linked with align_runtime)
 # Cross-cutting: align_span / align_diag
+
+# Versioned-release artifacts only (release.yml / the tagged release flow).
+# Ordinary `--release` builds (align-llm batches, local artifacts) stay on the
+# untuned default profile so iteration never pays the LTO link time.
+[profile.dist]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
