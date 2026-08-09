@@ -13,12 +13,20 @@ extern "C" link("sqlite3") {
   fn sqlite3_finalize(statement: raw) -> i32
   fn sqlite3_close_v2(database: raw) -> i32
   fn sqlite3_changes64(database: raw) -> i64
+  fn sqlite3_column_count(statement: raw) -> i32
+  fn sqlite3_column_type(statement: raw, index: i32) -> i32
+  fn sqlite3_column_int64(statement: raw, index: i32) -> i64
+  fn sqlite3_column_text(statement: raw, index: i32) -> raw
+  fn sqlite3_column_bytes(statement: raw, index: i32) -> i32
 }
 
 pub SQLITE_OK: i32 := 0
 SQLITE_TIMEOUT_MAX_MS: i64 := 2147483647
 pub SQLITE_ROW: i32 := 100
 pub SQLITE_DONE: i32 := 101
+pub SQLITE_INTEGER: i32 := 1
+pub SQLITE_TEXT: i32 := 3
+pub SQLITE_NULL: i32 := 5
 pub DRIVER_SQLITE: u8 := 1
 CONTEXT_VERSION: u32 := 1
 FAILURE_NATIVE: u8 := 1
@@ -423,6 +431,26 @@ pub fn execution_step(statement: raw) -> i32 {
   unsafe { return sqlite3_step(statement) }
 }
 
+pub fn execution_column_count(statement: raw) -> i32 {
+  unsafe { return sqlite3_column_count(statement) }
+}
+
+pub fn execution_column_type(statement: raw, column: i32) -> i32 {
+  unsafe { return sqlite3_column_type(statement, column) }
+}
+
+pub fn execution_column_i64(statement: raw, column: i32) -> i64 {
+  unsafe { return sqlite3_column_int64(statement, column) }
+}
+
+pub fn execution_column_text(statement: raw, column: i32) -> raw {
+  unsafe { return sqlite3_column_text(statement, column) }
+}
+
+pub fn execution_column_bytes(statement: raw, column: i32) -> i32 {
+  unsafe { return sqlite3_column_bytes(statement, column) }
+}
+
 pub fn execution_changes(database: raw) -> i64 {
   unsafe { return sqlite3_changes64(database) }
 }
@@ -712,5 +740,231 @@ pub fn one_prevalidated<P, R>(
       state, database, native_statement, context, restore_timeout, prior_timeout,
     )?
     return Ok(decoded)
+  }
+}
+
+pub fn explain_prevalidated<P, R>(
+  target: pkg.db.exec,
+  params: P,
+  statement: pkg.db.query<P, R>,
+  row_type: Option<R>,
+  out: region,
+  query_id: str,
+  mode: u8,
+) -> Result<pkg.db.QueryPlan, pkg.db.Error> {
+  unsafe {
+    if mode > 1 {
+      return Err(descriptor_error(
+        query_id,
+        "sqlite.explain.mode",
+        "unknown SQLite EXPLAIN mode",
+      ))
+    }
+    data := pkg.db.internal.descriptor.data(statement)
+    mask: u8 := raw.load(data, 5)
+    if mask & 1 == 0 { return Err(driver_mismatch_error(query_id)) }
+    state := state_for(target)
+    if state.is_null() {
+      return Err(descriptor_error(
+        query_id,
+        "db.exec.transaction",
+        "transaction execution is not available in this milestone",
+      ))
+    }
+    state_driver: u8 := raw.load(state, 4)
+    if state_driver != DRIVER_SQLITE { return Err(driver_mismatch_error(query_id)) }
+    database := sqlite_connection(state)
+    if database.is_null() {
+      return Err(descriptor_error(
+        query_id,
+        "db.connection.state",
+        "SQLite connection is closed or poisoned",
+      ))
+    }
+    context := new_context(raw.null())
+    static_status := pkg.db.internal.descriptor.validate_static(statement, context)
+    if static_status != 0 {
+      failure := if static_status == -1 {
+        descriptor_error(
+          query_id,
+          "db.descriptor.shape",
+          "static database descriptor uses a field shape unsupported by EXPLAIN",
+        )
+      } else { context_error(context, database, query_id) }
+      free_context(context)
+      return Err(failure)
+    }
+    lease := acquire_lease(state, query_id)
+    match lease {
+      Err(error) => {
+        free_context(context)
+        return Err(error)
+      }
+      Ok(_) => {}
+    }
+
+    prefix := if mode == 0 { "EXPLAIN QUERY PLAN " } else { "EXPLAIN " }
+    sql_length: i64 := raw.load(data, 40)
+    if sql_length <= 0 || sql_length > 2147483647 - prefix.len() {
+      failure := invalid_query_error(
+        query_id,
+        "db.explain.sql",
+        "SQLite EXPLAIN SQL exceeds the native length range",
+      )
+      cleaned := cleanup_execution(state, database, raw.null(), context, false, 0)
+      return Err(failure)
+    }
+    source := pkg.db.internal.descriptor.sqlite_sql_pointer(statement)
+    combined := raw.alloc(prefix.len() + sql_length + 1)
+    prefix_bytes := prefix.bytes()
+    mut i := 0
+    loop {
+      if i >= prefix_bytes.len() { break }
+      raw.store(combined, i, prefix_bytes[i])
+      i = i + 1
+    }
+    mut source_index := 0
+    loop {
+      if source_index >= sql_length { break }
+      byte: u8 := raw.load(source, source_index)
+      raw.store(combined, prefix.len() + source_index, byte)
+      source_index = source_index + 1
+    }
+    terminal: u8 := 0
+    raw.store(combined, prefix.len() + sql_length, terminal)
+    statement_out := raw.alloc(8)
+    tail_out := raw.alloc(8)
+    raw.store(statement_out, 0, raw.null())
+    raw.store(tail_out, 0, raw.null())
+    prepare_status := execution_prepare(database, combined, statement_out, tail_out)
+    native_statement: raw := raw.load(statement_out, 0)
+    tail: raw := raw.load(tail_out, 0)
+    raw.free(statement_out)
+    raw.free(tail_out)
+    if prepare_status != SQLITE_OK || native_statement.is_null() {
+      raw.free(combined)
+      failure := sqlite_error(database)
+      cleaned := cleanup_execution(
+        state, database, native_statement, context, false, 0,
+      )
+      return Err(failure)
+    }
+    if !tail_is_empty(tail) {
+      raw.free(combined)
+      failure := invalid_query_error(
+        query_id,
+        "db.statement.tail",
+        "static Query must contain exactly one SQL statement",
+      )
+      cleaned := cleanup_execution(
+        state, database, native_statement, context, false, 0,
+      )
+      return Err(failure)
+    }
+    raw.free(combined)
+    raw.store(context, 8, native_statement)
+    bind_status := pkg.db.internal.descriptor.bind(statement, context, params)
+    if bind_status != 0 {
+      failure := context_error(context, database, query_id)
+      cleaned := cleanup_execution(
+        state, database, native_statement, context, false, 0,
+      )
+      return Err(failure)
+    }
+
+    expected_columns: i32 := if mode == 0 { 4 } else { 8 }
+    mut body_builder := builder()
+    mut rows: i64 := 0
+    loop {
+      step_status := execution_step(native_statement)
+      if step_status == SQLITE_DONE { break }
+      if step_status != SQLITE_ROW {
+        failure := sqlite_error(database)
+        cleaned := cleanup_execution(
+          state, database, native_statement, context, false, 0,
+        )
+        return Err(failure)
+      }
+      if execution_column_count(native_statement) != expected_columns {
+        failure := pkg.db.Error.Decode(pkg.db.ContractError {
+          query_id: Some(query_id.clone()),
+          item: "db.explain.row".clone(),
+          message: "SQLite EXPLAIN row has an invalid column count".clone(),
+        })
+        cleaned := cleanup_execution(
+          state, database, native_statement, context, false, 0,
+        )
+        return Err(failure)
+      }
+      mut column: i32 := 0
+      loop {
+        if column >= expected_columns { break }
+        if column > 0 { body_builder.write("|") }
+        kind := execution_column_type(native_statement, column)
+        if kind == SQLITE_NULL {
+          body_builder.write("null")
+        } else {
+          if kind == SQLITE_INTEGER {
+            body_builder.write_int(execution_column_i64(native_statement, column))
+          } else {
+            pointer := execution_column_text(native_statement, column)
+            length := execution_column_bytes(native_statement, column)
+            if length < 0 || (pointer.is_null() && length != 0) {
+              failure := pkg.db.Error.Decode(pkg.db.ContractError {
+                query_id: Some(query_id.clone()),
+                item: "db.explain.row".clone(),
+                message: "SQLite EXPLAIN row has an invalid text field".clone(),
+              })
+              cleaned := cleanup_execution(
+                state, database, native_statement, context, false, 0,
+              )
+              return Err(failure)
+            }
+            mut text_buffer := buffer(length as i64)
+            mut byte_index: i32 := 0
+            loop {
+              if byte_index >= length { break }
+              byte: u8 := raw.load(pointer, byte_index as i64)
+              text_buffer.put_u8(byte)
+              byte_index = byte_index + 1
+            }
+            text := text_buffer.bytes().as_str() else {
+              failure := pkg.db.Error.Decode(pkg.db.ContractError {
+                query_id: Some(query_id.clone()),
+                item: "db.explain.row".clone(),
+                message: "SQLite EXPLAIN row is not valid UTF-8".clone(),
+              })
+              cleaned := cleanup_execution(
+                state, database, native_statement, context, false, 0,
+              )
+              return Err(failure)
+            }
+            body_builder.write(text)
+          }
+        }
+        column = column + 1
+      }
+      body_builder.write("\n")
+      rows = rows + 1
+    }
+    if rows == 0 {
+      failure := pkg.db.Error.Decode(pkg.db.ContractError {
+        query_id: Some(query_id.clone()),
+        item: "db.explain.row".clone(),
+        message: "SQLite EXPLAIN returned no plan rows".clone(),
+      })
+      cleaned := cleanup_execution(
+        state, database, native_statement, context, false, 0,
+      )
+      return Err(failure)
+    }
+    body := body_builder.to_string()
+    cleanup_execution(state, database, native_statement, context, false, 0)?
+    return Ok(pkg.db.QueryPlan {
+      driver: pkg.db.Driver.SQLite,
+      format: if mode == 0 { pkg.db.PlanFormat.Text } else { pkg.db.PlanFormat.Native },
+      analyzed: false,
+      body: body.clone_in(out),
+    })
   }
 }

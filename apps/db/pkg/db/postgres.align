@@ -2,6 +2,7 @@ module pkg.db.postgres
 
 import std.process
 import pkg.db
+import pkg.db.internal
 import pkg.db.internal.resource
 import pkg.db.internal.descriptor
 import pkg.db.internal.postgres
@@ -760,6 +761,399 @@ pub fn one_native<P, R>(
     }
     result: Result<R, pkg.db.Error> := pkg.db.internal.postgres.one_prevalidated(
       target, params, statement, out, query_id,
+    )
+    return result
+  }
+}
+
+PostgresMetaControls {
+  include_system: bool,
+  search_path_only: bool,
+  include_system_catalogs: bool,
+}
+
+fn metadata_controls(
+  options: slice<pkg.db.MetaOption>,
+  native: slice<MetaOption>,
+) -> Result<PostgresMetaControls, pkg.db.Error> {
+  mut saw_timeout := false
+  mut include_system := false
+  mut common_index := 0
+  loop {
+    if common_index >= options.len() { break }
+    match options[common_index] {
+      TimeoutNs(ns) => {
+        if ns <= 0 {
+          return Err(contract_error(
+            "db.meta.timeout_ns",
+            "database metadata timeout must be positive",
+          ))
+        }
+        if saw_timeout {
+          return Err(contract_error(
+            "db.meta.timeout_ns",
+            "duplicate database metadata timeout",
+          ))
+        }
+        saw_timeout = true
+      }
+      IncludeSystem => {
+        if include_system {
+          return Err(contract_error(
+            "db.meta.include_system",
+            "duplicate include-system metadata option",
+          ))
+        }
+        include_system = true
+      }
+    }
+    common_index = common_index + 1
+  }
+  if saw_timeout {
+    return Err(contract_error(
+      "db.meta.timeout_ns",
+      "database metadata deadlines are not available in this milestone",
+    ))
+  }
+
+  mut search_path_only := false
+  mut include_system_catalogs := false
+  mut native_index := 0
+  loop {
+    if native_index >= native.len() { break }
+    match native[native_index] {
+      SearchPathOnly => {
+        if search_path_only {
+          return Err(contract_error(
+            "postgres.meta.search_path_only",
+            "duplicate PostgreSQL search-path metadata option",
+          ))
+        }
+        search_path_only = true
+      }
+      IncludeSystemCatalogs => {
+        if include_system_catalogs {
+          return Err(contract_error(
+            "postgres.meta.include_system_catalogs",
+            "duplicate PostgreSQL system-catalog metadata option",
+          ))
+        }
+        include_system_catalogs = true
+      }
+    }
+    native_index = native_index + 1
+  }
+  if search_path_only && include_system_catalogs {
+    return Err(contract_error(
+      "postgres.meta.options",
+      "PostgreSQL SearchPathOnly conflicts with IncludeSystemCatalogs",
+    ))
+  }
+  return Ok(PostgresMetaControls {
+    include_system: include_system,
+    search_path_only: search_path_only,
+    include_system_catalogs: include_system_catalogs,
+  })
+}
+
+fn metadata_schema_valid(reference: pkg.db.SchemaRef) -> Result<(), pkg.db.Error> {
+  if contains_nul(reference.name) {
+    return Err(encode_error(
+      "metadata.schema",
+      "metadata identifier contains U+0000",
+    ))
+  }
+  return Ok(())
+}
+
+fn metadata_table_valid(reference: pkg.db.TableRef) -> Result<(), pkg.db.Error> {
+  if contains_nul(reference.schema) {
+    return Err(encode_error(
+      "metadata.table.schema",
+      "metadata identifier contains U+0000",
+    ))
+  }
+  if contains_nul(reference.name) {
+    return Err(encode_error(
+      "metadata.table.name",
+      "metadata identifier contains U+0000",
+    ))
+  }
+  return Ok(())
+}
+
+fn metadata_live(target: pkg.db.exec) -> Result<(), pkg.db.Error> {
+  unsafe {
+    state := pkg.db.internal.postgres.state_for(target)
+    if state.is_null() {
+      return Err(contract_error(
+        "db.meta.exec",
+        "database metadata requires a live PostgreSQL connection",
+      ))
+    }
+    version: u32 := raw.load(state, 0)
+    driver: u8 := raw.load(state, 4)
+    closed: u8 := raw.load(state, 5)
+    reserved: u16 := raw.load(state, 6)
+    native: raw := raw.load(state, 8)
+    if driver != 2 {
+      return Err(pkg.db.Error.DriverMismatch(pkg.db.ContractError {
+        query_id: None,
+        item: "db.meta.driver".clone(),
+        message: "PostgreSQL metadata requires a PostgreSQL connection".clone(),
+      }))
+    }
+    if version != 1 || closed != 0 || reserved != 0 || native.is_null() {
+      return Err(contract_error(
+        "db.meta.exec",
+        "database metadata requires a live PostgreSQL connection",
+      ))
+    }
+    return Ok(())
+  }
+}
+
+fn seal_metadata_controls(controls: PostgresMetaControls) -> pkg.db.internal.PostgresCatalogControls {
+  return pkg.db.internal.PostgresCatalogControls {
+    include_system: controls.include_system || controls.include_system_catalogs,
+    search_path_only: controls.search_path_only,
+  }
+}
+
+pub fn meta_database_native(
+  target: pkg.db.exec,
+  detail: pkg.db.MetaDetail,
+  out: region,
+  options: slice<pkg.db.MetaOption>,
+  native: slice<MetaOption>,
+) -> Result<pkg.db.DatabaseMeta, pkg.db.Error> {
+  controls := metadata_controls(options, native)?
+  metadata_live(target)?
+  return pkg.db.meta_database(target, detail, out, options)
+}
+
+pub fn meta_schemas_native(
+  target: pkg.db.exec,
+  detail: pkg.db.MetaDetail,
+  out: region,
+  options: slice<pkg.db.MetaOption>,
+  native: slice<MetaOption>,
+) -> Result<array<pkg.db.SchemaMeta>, pkg.db.Error> {
+  controls := metadata_controls(options, native)?
+  metadata_live(target)?
+  return pkg.db.catalog_postgres_schemas(
+    target,
+    detail,
+    out,
+    seal_metadata_controls(controls),
+  )
+}
+
+pub fn meta_tables_native(
+  target: pkg.db.exec,
+  schema_filter: Option<pkg.db.SchemaRef>,
+  detail: pkg.db.MetaDetail,
+  out: region,
+  options: slice<pkg.db.MetaOption>,
+  native: slice<MetaOption>,
+) -> Result<array<pkg.db.TableMeta>, pkg.db.Error> {
+  controls := metadata_controls(options, native)?
+  match schema_filter { Some(reference) => { metadata_schema_valid(reference)? } None => {} }
+  metadata_live(target)?
+  return pkg.db.catalog_postgres_tables(
+    target,
+    schema_filter,
+    detail,
+    out,
+    seal_metadata_controls(controls),
+  )
+}
+
+pub fn meta_table_native(
+  target: pkg.db.exec,
+  table_ref: pkg.db.TableRef,
+  detail: pkg.db.MetaDetail,
+  out: region,
+  options: slice<pkg.db.MetaOption>,
+  native: slice<MetaOption>,
+) -> Result<pkg.db.TableMeta, pkg.db.Error> {
+  controls := metadata_controls(options, native)?
+  metadata_table_valid(table_ref)?
+  metadata_live(target)?
+  return pkg.db.catalog_postgres_table(
+    target,
+    table_ref,
+    detail,
+    out,
+    seal_metadata_controls(controls),
+  )
+}
+
+pub fn meta_columns_native(
+  target: pkg.db.exec,
+  table_ref: pkg.db.TableRef,
+  detail: pkg.db.MetaDetail,
+  out: region,
+  options: slice<pkg.db.MetaOption>,
+  native: slice<MetaOption>,
+) -> Result<array<pkg.db.ColumnMeta>, pkg.db.Error> {
+  controls := metadata_controls(options, native)?
+  metadata_table_valid(table_ref)?
+  metadata_live(target)?
+  return pkg.db.catalog_postgres_columns(
+    target,
+    table_ref,
+    detail,
+    out,
+    seal_metadata_controls(controls),
+  )
+}
+
+pub fn meta_keys_native(
+  target: pkg.db.exec,
+  table_ref: pkg.db.TableRef,
+  detail: pkg.db.MetaDetail,
+  out: region,
+  options: slice<pkg.db.MetaOption>,
+  native: slice<MetaOption>,
+) -> Result<array<pkg.db.KeyMeta>, pkg.db.Error> {
+  controls := metadata_controls(options, native)?
+  metadata_table_valid(table_ref)?
+  metadata_live(target)?
+  return pkg.db.catalog_postgres_keys(
+    target,
+    table_ref,
+    detail,
+    out,
+    seal_metadata_controls(controls),
+  )
+}
+
+pub fn meta_indexes_native(
+  target: pkg.db.exec,
+  table_ref: pkg.db.TableRef,
+  detail: pkg.db.MetaDetail,
+  out: region,
+  options: slice<pkg.db.MetaOption>,
+  native: slice<MetaOption>,
+) -> Result<array<pkg.db.IndexMeta>, pkg.db.Error> {
+  controls := metadata_controls(options, native)?
+  metadata_table_valid(table_ref)?
+  metadata_live(target)?
+  return pkg.db.catalog_postgres_indexes(
+    target,
+    table_ref,
+    detail,
+    out,
+    seal_metadata_controls(controls),
+  )
+}
+
+pub fn explain_native<P, R>(
+  target: pkg.db.exec,
+  statement: pkg.db.query<P, R>,
+  params: P,
+  out: region,
+  options: slice<pkg.db.ExplainOption>,
+  native: slice<ExplainOption>,
+) -> Result<pkg.db.QueryPlan, pkg.db.Error> {
+  if !pkg.db.internal.postgres.query_header_valid(statement) {
+    return Err(pkg.db.internal.postgres.invalid_descriptor_error())
+  }
+  unsafe {
+    query_id := pkg.db.internal.descriptor.descriptor_id(statement)
+    mut saw_timeout := false
+    mut common_index := 0
+    loop {
+      if common_index >= options.len() { break }
+      match options[common_index] {
+        TimeoutNs(ns) => {
+          if ns <= 0 {
+            return Err(pkg.db.internal.postgres.descriptor_error(
+              query_id,
+              "db.explain.timeout_ns",
+              "database EXPLAIN timeout must be positive",
+            ))
+          }
+          if saw_timeout {
+            return Err(pkg.db.internal.postgres.descriptor_error(
+              query_id,
+              "db.explain.timeout_ns",
+              "duplicate database EXPLAIN timeout",
+            ))
+          }
+          saw_timeout = true
+        }
+      }
+      common_index = common_index + 1
+    }
+    if saw_timeout {
+      return Err(pkg.db.internal.postgres.descriptor_error(
+        query_id,
+        "db.explain.timeout_ns",
+        "database EXPLAIN deadlines are not available in this milestone",
+      ))
+    }
+
+    mut format: u8 := 0
+    mut saw_format := false
+    mut option_mask: u8 := 0
+    mut option_values: u8 := 0
+    mut native_index := 0
+    loop {
+      if native_index >= native.len() { break }
+      mut bit: u8 := 0
+      mut value := true
+      match native[native_index] {
+        Analyze => { bit = 1 }
+        Format(selected) => {
+          if saw_format {
+            return Err(pkg.db.internal.postgres.descriptor_error(
+              query_id,
+              "postgres.explain.format",
+              "duplicate PostgreSQL EXPLAIN format",
+            ))
+          }
+          saw_format = true
+          format = match selected { Text => 1 Json => 2 }
+        }
+        Verbose(enabled) => { bit = 2; value = enabled }
+        Costs(enabled) => { bit = 4; value = enabled }
+        Buffers(enabled) => { bit = 8; value = enabled }
+        Timing(enabled) => { bit = 16; value = enabled }
+        Settings(enabled) => { bit = 32; value = enabled }
+        Wal(enabled) => { bit = 64; value = enabled }
+      }
+      if bit != 0 {
+        if option_mask & bit != 0 {
+          return Err(pkg.db.internal.postgres.descriptor_error(
+            query_id,
+            "postgres.explain.options",
+            "duplicate PostgreSQL EXPLAIN option",
+          ))
+        }
+        option_mask = option_mask | bit
+        if value { option_values = option_values | bit }
+      }
+      native_index = native_index + 1
+    }
+    if option_mask & 88 != 0 && option_mask & 1 == 0 {
+      return Err(pkg.db.internal.postgres.descriptor_error(
+        query_id,
+        "postgres.explain.analyze",
+        "PostgreSQL Buffers, Timing, and Wal require Analyze",
+      ))
+    }
+    result: Result<pkg.db.QueryPlan, pkg.db.Error> :=
+      pkg.db.internal.descriptor.explain_postgres_native(
+      statement,
+      target,
+      params,
+      out,
+      query_id,
+      format,
+      option_mask,
+      option_values,
     )
     return result
   }

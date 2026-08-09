@@ -2,10 +2,12 @@ module pkg.db.internal.resource
 
 extern "C" link("sqlite3") {
   fn sqlite3_close_v2(database: raw) -> i32
+  fn sqlite3_finalize(statement: raw) -> i32
 }
 
 extern "C" link("pq") {
   fn PQfinish(connection: raw)
+  fn PQclear(result: raw)
 }
 
 // The state is private to pkg.db descendants. Its fixed Q2 prefix is:
@@ -67,4 +69,96 @@ pub fn drop_tx(state: raw) {
   // the settled resource type uses the same fail-closed native dispatch if malformed trusted HIR
   // ever supplies one.
   unsafe { drop_state(state) }
+}
+
+// A synchronous D12 catalog/EXPLAIN cursor owns one SQLite statement or PostgreSQL result while
+// returned text is validated and copied into the caller's region.  SQLite additionally owns the
+// connection-wide execution lease.  Bound SQLite text is SQLITE_STATIC, so its two optional C
+// buffers remain in this wrapper until statement finalization.
+//   0: u32 version (= 1)
+//   4: u8  driver (1 SQLite, 2 PostgreSQL)
+//   5: u8  closed
+//   6: u16 reserved (= 0)
+//   8: raw sqlite3_stmt / PGresult
+//  16: raw connection state (SQLite lease owner; null for PostgreSQL)
+//  24: raw first retained SQLite bind buffer
+//  32: raw second retained SQLite bind buffer
+pub fn new_catalog_cursor(
+  driver: u8,
+  native: raw,
+  state: raw,
+  first_bind: raw,
+  second_bind: raw,
+) -> raw {
+  unsafe {
+    cursor := raw.alloc(40)
+    version: u32 := 1
+    clear: u8 := 0
+    reserved: u16 := 0
+    raw.store(cursor, 0, version)
+    raw.store(cursor, 4, driver)
+    raw.store(cursor, 5, clear)
+    raw.store(cursor, 6, reserved)
+    raw.store(cursor, 8, native)
+    raw.store(cursor, 16, state)
+    raw.store(cursor, 24, first_bind)
+    raw.store(cursor, 32, second_bind)
+    return cursor
+  }
+}
+
+pub fn catalog_native(cursor: raw) -> raw {
+  unsafe {
+    if cursor.is_null() { return raw.null() }
+    version: u32 := raw.load(cursor, 0)
+    closed: u8 := raw.load(cursor, 5)
+    reserved: u16 := raw.load(cursor, 6)
+    if version != 1 || closed != 0 || reserved != 0 { return raw.null() }
+    return raw.load(cursor, 8)
+  }
+}
+
+pub fn close_catalog_cursor(cursor: raw) -> i32 {
+  unsafe {
+    if cursor.is_null() { return 0 }
+    version: u32 := raw.load(cursor, 0)
+    driver: u8 := raw.load(cursor, 4)
+    closed: u8 := raw.load(cursor, 5)
+    reserved: u16 := raw.load(cursor, 6)
+    if version != 1 || reserved != 0 || closed != 0 { return 0 }
+
+    native: raw := raw.load(cursor, 8)
+    state: raw := raw.load(cursor, 16)
+    mut status: i32 := 0
+    if !native.is_null() {
+      if driver == 1 {
+        status = sqlite3_finalize(native)
+      } else {
+        if driver == 2 { PQclear(native) }
+      }
+    }
+    first_bind: raw := raw.load(cursor, 24)
+    second_bind: raw := raw.load(cursor, 32)
+    if !first_bind.is_null() { raw.free(first_bind) }
+    if !second_bind.is_null() { raw.free(second_bind) }
+    if driver == 1 && !state.is_null() {
+      inactive: u8 := 0
+      raw.store(state, 20, inactive)
+    }
+    one: u8 := 1
+    raw.store(cursor, 5, one)
+    raw.store(cursor, 8, raw.null())
+    raw.store(cursor, 16, raw.null())
+    raw.store(cursor, 24, raw.null())
+    raw.store(cursor, 32, raw.null())
+    return status
+  }
+}
+
+pub fn drop_catalog_cursor(cursor: raw) {
+  unsafe {
+    if cursor.is_null() { return }
+    ignored := close_catalog_cursor(cursor)
+    raw.free(cursor)
+  }
 }

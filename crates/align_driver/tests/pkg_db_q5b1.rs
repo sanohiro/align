@@ -279,7 +279,7 @@ fn non_live_package_files() -> Vec<(&'static str, &'static str)> {
 }
 
 #[test]
-fn q5b1_publishes_exact_query_surface_without_catalog_stubs() {
+fn q5b1_query_surface_remains_exact_after_catalog_consumers_land() {
     for required in [
         "pub DriverRestriction {",
         "pub MetaDetail {",
@@ -298,21 +298,6 @@ fn q5b1_publishes_exact_query_surface_without_catalog_stubs() {
         assert!(
             DB.contains(required),
             "missing public D12 surface `{required}`"
-        );
-    }
-    for deferred in [
-        "pub fn meta_database(",
-        "pub fn meta_schemas(",
-        "pub fn meta_tables(",
-        "pub fn meta_table(",
-        "pub fn meta_columns(",
-        "pub fn meta_keys(",
-        "pub fn meta_indexes(",
-        "pub fn explain<",
-    ] {
-        assert!(
-            !DB.contains(deferred),
-            "Q5b2 operation acquired a placeholder `{deferred}`"
         );
     }
     assert!(

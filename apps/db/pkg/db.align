@@ -5,6 +5,50 @@ import pkg.db.internal
 import pkg.db.internal.resource
 import pkg.db.internal.descriptor
 
+extern "C" link("sqlite3") {
+  fn sqlite3_prepare_v2(database: raw, sql: raw, bytes: i32, statement_out: raw, tail_out: raw) -> i32
+  fn sqlite3_bind_text(statement: raw, index: i32, value: raw, bytes: i32, destructor: raw) -> i32
+  fn sqlite3_step(statement: raw) -> i32
+  fn sqlite3_column_count(statement: raw) -> i32
+  fn sqlite3_column_type(statement: raw, index: i32) -> i32
+  fn sqlite3_column_int64(statement: raw, index: i32) -> i64
+  fn sqlite3_column_text(statement: raw, index: i32) -> raw
+  fn sqlite3_column_bytes(statement: raw, index: i32) -> i32
+  fn sqlite3_db_readonly(database: raw, schema: raw) -> i32
+  fn sqlite3_errcode(database: raw) -> i32
+  fn sqlite3_extended_errcode(database: raw) -> i32
+  fn sqlite3_errmsg(database: raw) -> raw
+}
+
+extern "C" link("pq") {
+  fn PQexecParams(
+    connection: raw,
+    command: raw,
+    parameter_count: i32,
+    parameter_types: raw,
+    parameter_values: raw,
+    parameter_lengths: raw,
+    parameter_formats: raw,
+    result_format: i32,
+  ) -> raw
+  fn PQresultStatus(result: raw) -> i32
+  fn PQntuples(result: raw) -> i32
+  fn PQnfields(result: raw) -> i32
+  fn PQgetisnull(result: raw, row: i32, column: i32) -> i32
+  fn PQgetvalue(result: raw, row: i32, column: i32) -> raw
+  fn PQgetlength(result: raw, row: i32, column: i32) -> i32
+  fn PQerrorMessage(connection: raw) -> raw
+  fn PQresultErrorField(result: raw, field: i32) -> raw
+}
+
+SQLITE_OK: i32 := 0
+SQLITE_INTEGER: i32 := 1
+SQLITE_TEXT: i32 := 3
+SQLITE_NULL: i32 := 5
+SQLITE_ROW: i32 := 100
+SQLITE_DONE: i32 := 101
+PGRES_TUPLES_OK: i32 := 2
+
 // Static statement descriptors are compiler-produced Copy values. These source declarations own
 // their public type surface; a constructor body is unreachable after descriptor lowering.
 pub query<P, R> {}
@@ -17,6 +61,11 @@ pub resource conn = pkg.db.internal.resource.drop_conn
 // D7 constructs transactions. Q2 publishes the settled type so db.exec has its final closed shape,
 // but no Q2 operation can construct this arm.
 pub resource tx = pkg.db.internal.resource.drop_tx
+
+// Private synchronous owner for one D12 native result. It is borrowed from the connection so no
+// cursor can outlive or overlap a move of that connection. The drop hook finalizes/clears the
+// native result and releases SQLite's connection-wide execution lease.
+pub resource catalog_cursor = pkg.db.internal.resource.drop_catalog_cursor
 
 pub exec {
   Conn(resource_ref<conn>)
@@ -318,6 +367,726 @@ pub ExplainOption {
   TimeoutNs(i64)
 }
 
+MetaControls {
+  include_system: bool,
+}
+
+fn queryless_contract(item: str, message: str) -> Error = Error.Unsupported(ContractError {
+  query_id: None,
+  item: item.clone(),
+  message: message.clone(),
+})
+
+fn queryless_encode(item: str) -> Error = Error.Encode(ContractError {
+  query_id: None,
+  item: item.clone(),
+  message: "metadata identifier contains U+0000".clone(),
+})
+
+fn contains_nul(value: str) -> bool {
+  bytes := value.bytes()
+  mut i := 0
+  loop {
+    if i >= bytes.len() { break false }
+    if bytes[i] == 0 { break true }
+    i = i + 1
+  }
+}
+
+fn metadata_controls(options: slice<MetaOption>) -> Result<MetaControls, Error> {
+  mut saw_timeout := false
+  mut saw_system := false
+  mut i := 0
+  loop {
+    if i >= options.len() { break }
+    match options[i] {
+      TimeoutNs(ns) => {
+        if ns <= 0 {
+          return Err(queryless_contract(
+            "db.meta.timeout_ns",
+            "database metadata timeout must be positive",
+          ))
+        }
+        if saw_timeout {
+          return Err(queryless_contract(
+            "db.meta.timeout_ns",
+            "duplicate database metadata timeout",
+          ))
+        }
+        saw_timeout = true
+      }
+      IncludeSystem => {
+        if saw_system {
+          return Err(queryless_contract(
+            "db.meta.include_system",
+            "duplicate include-system metadata option",
+          ))
+        }
+        saw_system = true
+      }
+    }
+    i = i + 1
+  }
+  if saw_timeout {
+    return Err(queryless_contract(
+      "db.meta.timeout_ns",
+      "database metadata deadlines are not available in this milestone",
+    ))
+  }
+  return Ok(MetaControls { include_system: saw_system })
+}
+
+fn metadata_schema_valid(reference: SchemaRef) -> Result<(), Error> {
+  if contains_nul(reference.name) { return Err(queryless_encode("metadata.schema")) }
+  return Ok(())
+}
+
+fn metadata_table_valid(reference: TableRef) -> Result<(), Error> {
+  if contains_nul(reference.schema) { return Err(queryless_encode("metadata.table.schema")) }
+  if contains_nul(reference.name) { return Err(queryless_encode("metadata.table.name")) }
+  return Ok(())
+}
+
+fn execution_state(target: exec) -> raw {
+  unsafe {
+    state := match target {
+      Conn(reference) => resource.raw(reference)
+      Tx(_) => raw.null()
+    }
+    if state.is_null() { return raw.null() }
+    version: u32 := raw.load(state, 0)
+    driver: u8 := raw.load(state, 4)
+    closed: u8 := raw.load(state, 5)
+    reserved: u16 := raw.load(state, 6)
+    native: raw := raw.load(state, 8)
+    if version != 1 || (driver != 1 && driver != 2) || closed != 0 || reserved != 0
+      || native.is_null() {
+      return raw.null()
+    }
+    return state
+  }
+}
+
+fn catalog_driver_valid(target: exec, driver: u8, message: str) -> Result<(), Error> {
+  unsafe {
+    state := execution_state(target)
+    if state.is_null() {
+      return Err(queryless_contract("db.meta.exec", "database metadata requires a live connection"))
+    }
+    actual: u8 := raw.load(state, 4)
+    if actual != driver { return Err(queryless_contract("db.meta.driver", message)) }
+    return Ok(())
+  }
+}
+
+fn c_string(value: str) -> raw {
+  unsafe {
+    bytes := value.bytes()
+    output := raw.alloc(bytes.len() + 1)
+    mut i := 0
+    loop {
+      if i >= bytes.len() { break }
+      raw.store(output, i, bytes[i])
+      i = i + 1
+    }
+    terminal: u8 := 0
+    raw.store(output, bytes.len(), terminal)
+    return output
+  }
+}
+
+fn copy_c_string(pointer: raw) -> string {
+  unsafe {
+    if pointer.is_null() { return "".clone() }
+    mut output := buffer(64)
+    mut i := 0
+    loop {
+      byte: u8 := raw.load(pointer, i)
+      if byte == 0 { break }
+      output.put_u8(byte)
+      i = i + 1
+    }
+    text := output.bytes().as_str() else "invalid UTF-8 in database error"
+    return text.clone()
+  }
+}
+
+fn sqlite_native_error(database: raw) -> Error {
+  unsafe {
+    primary := sqlite3_errcode(database)
+    extended := sqlite3_extended_errcode(database)
+    mut code_builder := builder()
+    code_builder.write_int(primary)
+    return Error.Native(NativeError {
+      driver: Driver.SQLite,
+      code: Some(code_builder.to_string()),
+      extended_code: Some(extended as i64),
+      sqlstate: None,
+      message: copy_c_string(sqlite3_errmsg(database)),
+      detail: None,
+      constraint: None,
+      table: None,
+      column: None,
+    })
+  }
+}
+
+fn sqlite_cursor_shape(item: str) -> Error = Error.Decode(ContractError {
+  query_id: None,
+  item: item.clone(),
+  message: "SQLite catalog row has an invalid text or numeric shape".clone(),
+})
+
+fn sqlite_open_cursor(
+  target: exec,
+  sql: str,
+  first: Option<str>,
+  second: Option<str>,
+) -> Result<catalog_cursor, Error> {
+  unsafe {
+    state := execution_state(target)
+    if state.is_null() {
+      return Err(queryless_contract("db.meta.exec", "database metadata requires a live connection"))
+    }
+    driver: u8 := raw.load(state, 4)
+    if driver != 1 {
+      return Err(queryless_contract(
+        "db.meta.driver",
+        "SQLite metadata requires a SQLite connection",
+      ))
+    }
+    active: u8 := raw.load(state, 20)
+    if active != 0 {
+      return Err(queryless_contract(
+        "sqlite.connection.active_execution",
+        "SQLite connection already has an active execution",
+      ))
+    }
+    leased: u8 := 1
+    raw.store(state, 20, leased)
+    database: raw := raw.load(state, 8)
+    sql_pointer := c_string(sql)
+    statement_out := raw.alloc(8)
+    raw.store(statement_out, 0, raw.null())
+    prepare_status := sqlite3_prepare_v2(
+      database, sql_pointer, -1, statement_out, raw.null(),
+    )
+    statement: raw := raw.load(statement_out, 0)
+    raw.free(statement_out)
+    raw.free(sql_pointer)
+    if prepare_status != SQLITE_OK || statement.is_null() {
+      failure := sqlite_native_error(database)
+      if !statement.is_null() {
+        wrapper := pkg.db.internal.resource.new_catalog_cursor(
+          1, statement, state, raw.null(), raw.null(),
+        )
+        ignored := pkg.db.internal.resource.close_catalog_cursor(wrapper)
+        raw.free(wrapper)
+      } else {
+        inactive: u8 := 0
+        raw.store(state, 20, inactive)
+      }
+      return Err(failure)
+    }
+
+    mut first_pointer := raw.null()
+    mut second_pointer := raw.null()
+    match first {
+      Some(value) => {
+        if value.len() > 2147483647 {
+          wrapper := pkg.db.internal.resource.new_catalog_cursor(
+            1, statement, state, raw.null(), raw.null(),
+          )
+          ignored := pkg.db.internal.resource.close_catalog_cursor(wrapper)
+          raw.free(wrapper)
+          return Err(queryless_contract(
+            "metadata.identifier",
+            "metadata identifier exceeds the native SQLite length range",
+          ))
+        }
+        first_pointer = c_string(value)
+      }
+      None => {}
+    }
+    match second {
+      Some(value) => {
+        if value.len() > 2147483647 {
+          if !first_pointer.is_null() { raw.free(first_pointer) }
+          wrapper := pkg.db.internal.resource.new_catalog_cursor(
+            1, statement, state, raw.null(), raw.null(),
+          )
+          ignored := pkg.db.internal.resource.close_catalog_cursor(wrapper)
+          raw.free(wrapper)
+          return Err(queryless_contract(
+            "metadata.identifier",
+            "metadata identifier exceeds the native SQLite length range",
+          ))
+        }
+        second_pointer = c_string(value)
+      }
+      None => {}
+    }
+    wrapper := pkg.db.internal.resource.new_catalog_cursor(
+      1, statement, state, first_pointer, second_pointer,
+    )
+    cursor: catalog_cursor := match target {
+      Conn(reference) => resource.from_raw_borrowed(wrapper, reference)
+      Tx(_) => process.abort()
+    }
+    if !first_pointer.is_null() {
+      first_value := match first { Some(value) => value None => "" }
+      status := sqlite3_bind_text(
+        statement, 1, first_pointer, first_value.len() as i32, raw.null(),
+      )
+      if status != SQLITE_OK {
+        failure := sqlite_native_error(database)
+        ignored := pkg.db.internal.resource.close_catalog_cursor(resource.raw(resource.borrow(cursor)))
+        return Err(failure)
+      }
+    }
+    if !second_pointer.is_null() {
+      second_value := match second { Some(value) => value None => "" }
+      status := sqlite3_bind_text(
+        statement, 2, second_pointer, second_value.len() as i32, raw.null(),
+      )
+      if status != SQLITE_OK {
+        failure := sqlite_native_error(database)
+        ignored := pkg.db.internal.resource.close_catalog_cursor(resource.raw(resource.borrow(cursor)))
+        return Err(failure)
+      }
+    }
+    return Ok(cursor)
+  }
+}
+
+fn sqlite_cursor_native(reference: resource_ref<catalog_cursor>) -> raw {
+  unsafe {
+    return pkg.db.internal.resource.catalog_native(resource.raw(reference))
+  }
+}
+
+fn sqlite_cursor_close(borrow cursor: catalog_cursor) -> i32 {
+  unsafe {
+    return pkg.db.internal.resource.close_catalog_cursor(resource.raw(resource.borrow(cursor)))
+  }
+}
+
+fn sqlite_text(
+  reference: resource_ref<catalog_cursor>,
+  column: i32,
+  out: region,
+  item: str,
+) -> Result<Option<str>, Error> {
+  unsafe {
+    statement := sqlite_cursor_native(reference)
+    kind := sqlite3_column_type(statement, column)
+    if kind == SQLITE_NULL { return Ok(None) }
+    if kind != SQLITE_TEXT {
+      return Err(sqlite_cursor_shape(item))
+    }
+    pointer := sqlite3_column_text(statement, column)
+    length := sqlite3_column_bytes(statement, column)
+    if length < 0 || (pointer.is_null() && length != 0) {
+      return Err(sqlite_cursor_shape(item))
+    }
+    view: str := resource.view_from_raw(reference, pointer, length as i64) else {
+      return Err(sqlite_cursor_shape(item))
+    }
+    return Ok(Some(view.clone_in(out)))
+  }
+}
+
+fn sqlite_row_shape(
+  reference: resource_ref<catalog_cursor>,
+  expected_columns: i32,
+  item: str,
+) -> Result<(), Error> {
+  unsafe {
+    statement := sqlite_cursor_native(reference)
+    if sqlite3_column_count(statement) != expected_columns {
+      return Err(sqlite_cursor_shape(item))
+    }
+    return Ok(())
+  }
+}
+
+fn sqlite_required_text(
+  reference: resource_ref<catalog_cursor>,
+  column: i32,
+  out: region,
+  item: str,
+) -> Result<str, Error> {
+  value := sqlite_text(reference, column, out, item)?
+  return match value {
+    Some(text) => Ok(text)
+    None => Err(sqlite_cursor_shape(item))
+  }
+}
+
+fn sqlite_required_i64(
+  reference: resource_ref<catalog_cursor>,
+  column: i32,
+  item: str,
+) -> Result<i64, Error> {
+  unsafe {
+    statement := sqlite_cursor_native(reference)
+    if sqlite3_column_type(statement, column) != SQLITE_INTEGER {
+      return Err(sqlite_cursor_shape(item))
+    }
+    return Ok(sqlite3_column_int64(statement, column))
+  }
+}
+
+fn sqlite_finish(borrow cursor: catalog_cursor, database: raw) -> Result<(), Error> {
+  status := sqlite_cursor_close(cursor)
+  if status != SQLITE_OK { return Err(sqlite_native_error(database)) }
+  return Ok(())
+}
+
+fn optional_c_string(pointer: raw) -> Option<string> {
+  unsafe {
+    if pointer.is_null() { return None }
+    return Some(copy_c_string(pointer))
+  }
+}
+
+fn postgres_native_error(connection: raw, result: raw) -> Error {
+  unsafe {
+    mut sqlstate: Option<string> := None
+    mut message := "PostgreSQL native operation failed".clone()
+    if !result.is_null() {
+      sqlstate = optional_c_string(PQresultErrorField(result, 67))
+      native_message := PQresultErrorField(result, 77)
+      if !native_message.is_null() { message = copy_c_string(native_message) }
+    } else {
+      native_message := PQerrorMessage(connection)
+      if !native_message.is_null() { message = copy_c_string(native_message) }
+    }
+    return Error.Native(NativeError {
+      driver: Driver.PostgreSQL,
+      code: None,
+      extended_code: None,
+      sqlstate: sqlstate,
+      message: message,
+      detail: if result.is_null() { None } else {
+        optional_c_string(PQresultErrorField(result, 68))
+      },
+      constraint: if result.is_null() { None } else {
+        optional_c_string(PQresultErrorField(result, 110))
+      },
+      table: if result.is_null() { None } else {
+        optional_c_string(PQresultErrorField(result, 116))
+      },
+      column: if result.is_null() { None } else {
+        optional_c_string(PQresultErrorField(result, 99))
+      },
+    })
+  }
+}
+
+fn postgres_cursor_shape(item: str) -> Error = Error.Decode(ContractError {
+  query_id: None,
+  item: item.clone(),
+  message: "PostgreSQL catalog row has an invalid text or numeric shape".clone(),
+})
+
+fn postgres_open_cursor(
+  target: exec,
+  sql: str,
+  first: Option<str>,
+  second: Option<str>,
+) -> Result<catalog_cursor, Error> {
+  unsafe {
+    state := execution_state(target)
+    if state.is_null() {
+      return Err(queryless_contract("db.meta.exec", "database metadata requires a live connection"))
+    }
+    driver: u8 := raw.load(state, 4)
+    if driver != 2 {
+      return Err(queryless_contract(
+        "db.meta.driver",
+        "PostgreSQL metadata requires a PostgreSQL connection",
+      ))
+    }
+    connection: raw := raw.load(state, 8)
+    mut count: i32 := 0
+    mut first_pointer := raw.null()
+    mut second_pointer := raw.null()
+    match first {
+      Some(value) => {
+        if contains_nul(value) {
+          return Err(queryless_contract(
+            "metadata.identifier",
+            "metadata identifier contains U+0000",
+          ))
+        }
+        if value.len() > 2147483647 {
+          return Err(queryless_contract(
+            "metadata.identifier",
+            "metadata identifier exceeds the native PostgreSQL length range",
+          ))
+        }
+        first_pointer = c_string(value)
+        count = 1
+      }
+      None => {}
+    }
+    match second {
+      Some(value) => {
+        if count != 1 {
+          if !first_pointer.is_null() { raw.free(first_pointer) }
+          return Err(postgres_cursor_shape("metadata.parameters"))
+        }
+        if contains_nul(value) {
+          raw.free(first_pointer)
+          return Err(queryless_contract(
+            "metadata.identifier",
+            "metadata identifier contains U+0000",
+          ))
+        }
+        if value.len() > 2147483647 {
+          raw.free(first_pointer)
+          return Err(queryless_contract(
+            "metadata.identifier",
+            "metadata identifier exceeds the native PostgreSQL length range",
+          ))
+        }
+        second_pointer = c_string(value)
+        count = 2
+      }
+      None => {}
+    }
+    mut values := raw.null()
+    if count > 0 {
+      values = raw.alloc((count as i64) * 8)
+      raw.store(values, 0, first_pointer)
+      if count == 2 { raw.store(values, 8, second_pointer) }
+    }
+    sql_pointer := c_string(sql)
+    result := PQexecParams(
+      connection, sql_pointer, count, raw.null(), values, raw.null(), raw.null(), 0,
+    )
+    raw.free(sql_pointer)
+    if !values.is_null() { raw.free(values) }
+    if !first_pointer.is_null() { raw.free(first_pointer) }
+    if !second_pointer.is_null() { raw.free(second_pointer) }
+    if result.is_null() { return Err(postgres_native_error(connection, raw.null())) }
+    status := PQresultStatus(result)
+    if status != PGRES_TUPLES_OK {
+      failure := postgres_native_error(connection, result)
+      wrapper := pkg.db.internal.resource.new_catalog_cursor(
+        2, result, raw.null(), raw.null(), raw.null(),
+      )
+      ignored := pkg.db.internal.resource.close_catalog_cursor(wrapper)
+      raw.free(wrapper)
+      return Err(failure)
+    }
+    wrapper := pkg.db.internal.resource.new_catalog_cursor(
+      2, result, raw.null(), raw.null(), raw.null(),
+    )
+    cursor: catalog_cursor := match target {
+      Conn(reference) => resource.from_raw_borrowed(wrapper, reference)
+      Tx(_) => process.abort()
+    }
+    return Ok(cursor)
+  }
+}
+
+fn postgres_cursor_native(reference: resource_ref<catalog_cursor>) -> raw {
+  unsafe {
+    return pkg.db.internal.resource.catalog_native(resource.raw(reference))
+  }
+}
+
+fn postgres_text(
+  reference: resource_ref<catalog_cursor>,
+  row: i32,
+  column: i32,
+  out: region,
+  item: str,
+) -> Result<Option<str>, Error> {
+  unsafe {
+    result := postgres_cursor_native(reference)
+    if PQgetisnull(result, row, column) != 0 { return Ok(None) }
+    pointer := PQgetvalue(result, row, column)
+    length := PQgetlength(result, row, column)
+    if length < 0 || (pointer.is_null() && length != 0) {
+      return Err(postgres_cursor_shape(item))
+    }
+    view: str := resource.view_from_raw(reference, pointer, length as i64) else {
+      return Err(postgres_cursor_shape(item))
+    }
+    return Ok(Some(view.clone_in(out)))
+  }
+}
+
+fn postgres_required_text(
+  reference: resource_ref<catalog_cursor>,
+  row: i32,
+  column: i32,
+  out: region,
+  item: str,
+) -> Result<str, Error> {
+  value := postgres_text(reference, row, column, out, item)?
+  return match value {
+    Some(text) => Ok(text)
+    None => Err(postgres_cursor_shape(item))
+  }
+}
+
+fn parse_i64(value: str) -> Result<i64, ()> {
+  bytes := value.bytes()
+  if bytes.len() == 0 { return Err(()) }
+  mut negative := false
+  mut i := 0
+  if bytes[0] == 45 {
+    negative = true
+    i = 1
+    if i >= bytes.len() { return Err(()) }
+  }
+  mut parsed: i64 := 0
+  loop {
+    if i >= bytes.len() { break }
+    byte := bytes[i]
+    if byte < 48 || byte > 57 { return Err(()) }
+    digit := (byte - 48) as i64
+    if parsed > (9223372036854775807 - digit) / 10 { return Err(()) }
+    parsed = parsed * 10 + digit
+    i = i + 1
+  }
+  if negative { return Ok(0 - parsed) }
+  return Ok(parsed)
+}
+
+fn postgres_required_i64(
+  reference: resource_ref<catalog_cursor>,
+  row: i32,
+  column: i32,
+  item: str,
+) -> Result<i64, Error> {
+  unsafe {
+    result := postgres_cursor_native(reference)
+    if PQgetisnull(result, row, column) != 0 {
+      return Err(postgres_cursor_shape(item))
+    }
+    pointer := PQgetvalue(result, row, column)
+    length := PQgetlength(result, row, column)
+    if length < 0 || (pointer.is_null() && length != 0) {
+      return Err(postgres_cursor_shape(item))
+    }
+    view: str := resource.view_from_raw(reference, pointer, length as i64) else {
+      return Err(postgres_cursor_shape(item))
+    }
+    parsed := parse_i64(view)
+    return match parsed {
+      Ok(value) => Ok(value)
+      Err(_) => Err(postgres_cursor_shape(item))
+    }
+  }
+}
+
+fn postgres_result_shape(
+  reference: resource_ref<catalog_cursor>,
+  expected_columns: i32,
+  item: str,
+) -> Result<i32, Error> {
+  unsafe {
+    result := postgres_cursor_native(reference)
+    rows := PQntuples(result)
+    columns := PQnfields(result)
+    if rows < 0 || columns != expected_columns {
+      return Err(postgres_cursor_shape(item))
+    }
+    return Ok(rows)
+  }
+}
+
+fn postgres_finish(borrow cursor: catalog_cursor) {
+  ignored := sqlite_cursor_close(cursor)
+}
+
+fn detail_has_summary(detail: MetaDetail) -> bool = match detail {
+  Names => false
+  Summary => true
+  Full => true
+}
+
+fn detail_is_full(detail: MetaDetail) -> bool = match detail {
+  Full => true
+  _ => false
+}
+
+fn optional_text_equal(left: Option<str>, right: Option<str>) -> bool = match left {
+  Some(left_value) => match right {
+    Some(right_value) => left_value == right_value
+    None => false
+  }
+  None => match right {
+    Some(_) => false
+    None => true
+  }
+}
+
+fn ascii_lower(byte: u8) -> u8 {
+  if byte >= 65 && byte <= 90 { return byte + 32 }
+  return byte
+}
+
+fn ascii_contains_fold(value: str, needle: str) -> bool {
+  source := value.bytes()
+  target := needle.bytes()
+  if target.len() == 0 { return true }
+  if source.len() < target.len() { return false }
+  mut start := 0
+  loop {
+    if start + target.len() > source.len() { break false }
+    mut matched := true
+    mut i := 0
+    loop {
+      if i >= target.len() { break }
+      if ascii_lower(source[start + i]) != ascii_lower(target[i]) {
+        matched = false
+        break
+      }
+      i = i + 1
+    }
+    if matched { break true }
+    start = start + 1
+  }
+}
+
+fn sqlite_logical_type(native: str) -> str {
+  if ascii_contains_fold(native, "int") { return "i64" }
+  if ascii_contains_fold(native, "char") || ascii_contains_fold(native, "clob")
+    || ascii_contains_fold(native, "text") { return "str" }
+  if ascii_contains_fold(native, "real") || ascii_contains_fold(native, "floa")
+    || ascii_contains_fold(native, "doub") { return "f64" }
+  if ascii_contains_fold(native, "blob") || native.len() == 0 { return "slice<u8>" }
+  return "native"
+}
+
+fn sqlite_internal_name(value: str) -> bool {
+  bytes := value.bytes()
+  prefix := "sqlite_".bytes()
+  if bytes.len() < prefix.len() { return false }
+  mut i := 0
+  loop {
+    if i >= prefix.len() { break true }
+    if bytes[i] != prefix[i] { break false }
+    i = i + 1
+  }
+}
+
+fn sqlite_table_allowed(
+  table_ref: TableRef,
+  include_system: bool,
+  include_internal: bool,
+) -> bool {
+  if !include_system && table_ref.schema == "temp" { return false }
+  if !include_internal && sqlite_internal_name(table_ref.name) { return false }
+  return true
+}
+
 pub fn query_file<P, R>(options: slice<QueryOption>) -> query<P, R> = process.abort()
 
 pub fn query<P, R>(sql: str, options: slice<QueryOption>) -> query<P, R> = process.abort()
@@ -372,6 +1141,1660 @@ pub fn execute_options_valid(
     i = i + 1
   }
   return Ok(())
+}
+
+fn sqlite_meta_database(
+  target: exec,
+  detail: MetaDetail,
+  out: region,
+) -> Result<DatabaseMeta, Error> {
+  unsafe {
+    state := execution_state(target)
+    if state.is_null() {
+      return Err(queryless_contract("db.meta.exec", "database metadata requires a live connection"))
+    }
+    database: raw := raw.load(state, 8)
+    sql := if detail_is_full(detail) {
+      "SELECT COALESCE((SELECT file FROM pragma_database_list WHERE name = 'main'), ''), sqlite_version(), (SELECT encoding FROM pragma_encoding)"
+    } else {
+      "SELECT COALESCE((SELECT file FROM pragma_database_list WHERE name = 'main'), ''), sqlite_version()"
+    }
+    cursor := sqlite_open_cursor(target, sql, None, None)?
+    reference := resource.borrow(cursor)
+    statement := sqlite_cursor_native(reference)
+    if sqlite3_step(statement) != SQLITE_ROW {
+      failure := sqlite_native_error(database)
+      ignored := sqlite_cursor_close(cursor)
+      return Err(failure)
+    }
+    sqlite_row_shape(reference, if detail_is_full(detail) { 3 } else { 2 }, "metadata.database")?
+    name := sqlite_required_text(reference, 0, out, "metadata.database.name")?
+    version := sqlite_required_text(reference, 1, out, "metadata.database.engine_version")?
+    mut encoding: Option<str> := None
+    if detail_is_full(detail) {
+      encoding = sqlite_text(reference, 2, out, "metadata.database.encoding")?
+    }
+    if sqlite3_step(statement) != SQLITE_DONE {
+      failure := sqlite_native_error(database)
+      ignored := sqlite_cursor_close(cursor)
+      return Err(failure)
+    }
+    mut default_schema: Option<str> := None
+    mut read_only: Option<bool> := None
+    mut transactional_ddl: Option<bool> := None
+    if detail_has_summary(detail) {
+      default_schema = Some("main".clone_in(out))
+      schema := c_string("main")
+      readonly_tag := sqlite3_db_readonly(database, schema)
+      raw.free(schema)
+      if readonly_tag < 0 {
+        ignored := sqlite_cursor_close(cursor)
+        return Err(sqlite_cursor_shape("metadata.database.read_only"))
+      }
+      read_only = Some(readonly_tag != 0)
+      transactional_ddl = Some(true)
+    }
+    sqlite_finish(cursor, database)?
+    return Ok(DatabaseMeta {
+      driver: Driver.SQLite,
+      name: name,
+      engine_version: version,
+      default_schema: default_schema,
+      encoding: encoding,
+      collation: None,
+      read_only: read_only,
+      transactional_ddl: transactional_ddl,
+    })
+  }
+}
+
+fn sqlite_meta_schemas(
+  target: exec,
+  detail: MetaDetail,
+  out: region,
+  include_system: bool,
+) -> Result<array<SchemaMeta>, Error> {
+  unsafe {
+    state := execution_state(target)
+    if state.is_null() {
+      return Err(queryless_contract("db.meta.exec", "database metadata requires a live connection"))
+    }
+    database: raw := raw.load(state, 8)
+    sql := if include_system {
+      "SELECT name FROM pragma_database_list ORDER BY CAST(name AS BLOB)"
+    } else {
+      "SELECT name FROM pragma_database_list WHERE name <> 'temp' ORDER BY CAST(name AS BLOB)"
+    }
+    cursor := sqlite_open_cursor(target, sql, None, None)?
+    reference := resource.borrow(cursor)
+    statement := sqlite_cursor_native(reference)
+    mut rows: array_builder<SchemaMeta> := array_builder(out)
+    loop {
+      status := sqlite3_step(statement)
+      if status == SQLITE_DONE { break }
+      if status != SQLITE_ROW {
+        failure := sqlite_native_error(database)
+        ignored := sqlite_cursor_close(cursor)
+        return Err(failure)
+      }
+      sqlite_row_shape(reference, 1, "metadata.schemas")?
+      name := sqlite_required_text(reference, 0, out, "metadata.schema.name")?
+      rows.push(SchemaMeta {
+        name: name,
+        owner: None,
+        visible: true,
+        system: name == "temp",
+      })
+    }
+    sqlite_finish(cursor, database)?
+    return Ok(rows.build())
+  }
+}
+
+fn sqlite_table_kind(value: str) -> MetaTableKind {
+  if value == "table" { return MetaTableKind.Table }
+  if value == "view" { return MetaTableKind.View }
+  return MetaTableKind.Native
+}
+
+fn sqlite_meta_tables(
+  target: exec,
+  schema_filter: Option<SchemaRef>,
+  detail: MetaDetail,
+  out: region,
+  include_system: bool,
+  include_internal: bool,
+) -> Result<array<TableMeta>, Error> {
+  unsafe {
+    state := execution_state(target)
+    if state.is_null() {
+      return Err(queryless_contract("db.meta.exec", "database metadata requires a live connection"))
+    }
+    database: raw := raw.load(state, 8)
+    mut schema_name: Option<str> := None
+    match schema_filter {
+      Some(reference) => { schema_name = Some(reference.name) }
+      None => {}
+    }
+    sql := match schema_name {
+      Some(_) => if include_system {
+        "SELECT schema, name, type FROM pragma_table_list WHERE schema = ?1 AND name NOT IN ('sqlite_schema', 'sqlite_temp_schema') ORDER BY CAST(schema AS BLOB), CAST(name AS BLOB)"
+      } else if include_internal {
+        "SELECT schema, name, type FROM pragma_table_list WHERE schema = ?1 AND schema <> 'temp' AND name NOT IN ('sqlite_schema', 'sqlite_temp_schema') AND type IN ('table', 'view', 'virtual', 'shadow') ORDER BY CAST(schema AS BLOB), CAST(name AS BLOB)"
+      } else {
+        "SELECT schema, name, type FROM pragma_table_list WHERE schema = ?1 AND schema <> 'temp' AND name NOT LIKE 'sqlite_%' AND type IN ('table', 'view', 'virtual') ORDER BY CAST(schema AS BLOB), CAST(name AS BLOB)"
+      }
+      None => if include_system {
+        "SELECT schema, name, type FROM pragma_table_list WHERE name NOT IN ('sqlite_schema', 'sqlite_temp_schema') ORDER BY CAST(schema AS BLOB), CAST(name AS BLOB)"
+      } else if include_internal {
+        "SELECT schema, name, type FROM pragma_table_list WHERE schema <> 'temp' AND name NOT IN ('sqlite_schema', 'sqlite_temp_schema') AND type IN ('table', 'view', 'virtual', 'shadow') ORDER BY CAST(schema AS BLOB), CAST(name AS BLOB)"
+      } else {
+        "SELECT schema, name, type FROM pragma_table_list WHERE schema <> 'temp' AND name NOT LIKE 'sqlite_%' AND type IN ('table', 'view', 'virtual') ORDER BY CAST(schema AS BLOB), CAST(name AS BLOB)"
+      }
+    }
+    cursor := sqlite_open_cursor(target, sql, schema_name, None)?
+    reference := resource.borrow(cursor)
+    statement := sqlite_cursor_native(reference)
+    mut rows: array_builder<TableMeta> := array_builder(out)
+    loop {
+      status := sqlite3_step(statement)
+      if status == SQLITE_DONE { break }
+      if status != SQLITE_ROW {
+        failure := sqlite_native_error(database)
+        ignored := sqlite_cursor_close(cursor)
+        return Err(failure)
+      }
+      sqlite_row_shape(reference, 3, "metadata.tables")?
+      schema := sqlite_required_text(reference, 0, out, "metadata.table.schema")?
+      name := sqlite_required_text(reference, 1, out, "metadata.table.name")?
+      native_kind := sqlite_required_text(reference, 2, out, "metadata.table.kind")?
+      mut projected_kind: Option<str> := None
+      if detail_has_summary(detail) { projected_kind = Some(native_kind) }
+      rows.push(TableMeta {
+        schema: schema,
+        name: name,
+        kind: sqlite_table_kind(native_kind),
+        native_kind: projected_kind,
+        owner: None,
+        comment: None,
+        estimated_rows: None,
+      })
+    }
+    sqlite_finish(cursor, database)?
+    return Ok(rows.build())
+  }
+}
+
+fn sqlite_meta_table(
+  target: exec,
+  table_ref: TableRef,
+  detail: MetaDetail,
+  out: region,
+  include_system: bool,
+  include_internal: bool,
+) -> Result<TableMeta, Error> {
+  unsafe {
+    catalog_driver_valid(target, 1, "SQLite metadata requires a SQLite connection")?
+    state := execution_state(target)
+    database: raw := raw.load(state, 8)
+    if !sqlite_table_allowed(table_ref, include_system, include_internal) {
+      return Err(Error.NotFound)
+    }
+    sql := if include_system {
+      "SELECT schema, name, type FROM pragma_table_list WHERE schema = ?1 AND name = ?2 AND name NOT IN ('sqlite_schema', 'sqlite_temp_schema')"
+    } else if include_internal {
+      "SELECT schema, name, type FROM pragma_table_list WHERE schema = ?1 AND name = ?2 AND schema <> 'temp' AND name NOT IN ('sqlite_schema', 'sqlite_temp_schema') AND type IN ('table', 'view', 'virtual', 'shadow')"
+    } else {
+      "SELECT schema, name, type FROM pragma_table_list WHERE schema = ?1 AND name = ?2 AND schema <> 'temp' AND name NOT LIKE 'sqlite_%' AND type IN ('table', 'view', 'virtual')"
+    }
+    cursor := sqlite_open_cursor(target, sql, Some(table_ref.schema), Some(table_ref.name))?
+    reference := resource.borrow(cursor)
+    statement := sqlite_cursor_native(reference)
+    status := sqlite3_step(statement)
+    if status == SQLITE_DONE {
+      sqlite_finish(cursor, database)?
+      return Err(Error.NotFound)
+    }
+    if status != SQLITE_ROW {
+      failure := sqlite_native_error(database)
+      ignored := sqlite_cursor_close(cursor)
+      return Err(failure)
+    }
+    sqlite_row_shape(reference, 3, "metadata.table")?
+    schema := sqlite_required_text(reference, 0, out, "metadata.table.schema")?
+    name := sqlite_required_text(reference, 1, out, "metadata.table.name")?
+    native_kind := sqlite_required_text(reference, 2, out, "metadata.table.kind")?
+    mut projected_kind: Option<str> := None
+    if detail_has_summary(detail) { projected_kind = Some(native_kind) }
+    result := TableMeta {
+      schema: schema,
+      name: name,
+      kind: sqlite_table_kind(native_kind),
+      native_kind: projected_kind,
+      owner: None,
+      comment: None,
+      estimated_rows: None,
+    }
+    if sqlite3_step(statement) != SQLITE_DONE {
+      failure := sqlite_native_error(database)
+      ignored := sqlite_cursor_close(cursor)
+      return Err(failure)
+    }
+    sqlite_finish(cursor, database)?
+    return Ok(result)
+  }
+}
+
+fn sqlite_meta_columns_configured(
+  target: exec,
+  table_ref: TableRef,
+  detail: MetaDetail,
+  out: region,
+  include_system: bool,
+  include_internal: bool,
+  include_hidden: bool,
+) -> Result<array<ColumnMeta>, Error> {
+  unsafe {
+    catalog_driver_valid(target, 1, "SQLite metadata requires a SQLite connection")?
+    state := execution_state(target)
+    if !sqlite_table_allowed(table_ref, include_system, include_internal) {
+      rows: array_builder<ColumnMeta> := array_builder(out)
+      return Ok(rows.build())
+    }
+    database: raw := raw.load(state, 8)
+    sql := if include_hidden {
+      "SELECT cid, name, type, \"notnull\", dflt_value, hidden FROM pragma_table_xinfo(?1, ?2) ORDER BY cid"
+    } else {
+      "SELECT cid, name, type, \"notnull\", dflt_value, hidden FROM pragma_table_xinfo(?1, ?2) WHERE hidden = 0 ORDER BY cid"
+    }
+    cursor := sqlite_open_cursor(target, sql, Some(table_ref.name), Some(table_ref.schema))?
+    reference := resource.borrow(cursor)
+    statement := sqlite_cursor_native(reference)
+    mut rows: array_builder<ColumnMeta> := array_builder(out)
+    mut previous_ordinal: i64 := -1
+    loop {
+      status := sqlite3_step(statement)
+      if status == SQLITE_DONE { break }
+      if status != SQLITE_ROW {
+        failure := sqlite_native_error(database)
+        ignored := sqlite_cursor_close(cursor)
+        return Err(failure)
+      }
+      sqlite_row_shape(reference, 6, "metadata.columns")?
+      native_ordinal := sqlite_required_i64(reference, 0, "metadata.column.ordinal")?
+      if native_ordinal < 0 || native_ordinal <= previous_ordinal {
+        ignored := sqlite_cursor_close(cursor)
+        return Err(sqlite_cursor_shape("metadata.column.ordinal"))
+      }
+      name := sqlite_required_text(reference, 1, out, "metadata.column.name")?
+      native_type := sqlite_required_text(reference, 2, out, "metadata.column.native_type")?
+      not_null := sqlite_required_i64(reference, 3, "metadata.column.nullable")?
+      default_sql := sqlite_text(reference, 4, out, "metadata.column.default_sql")?
+      hidden := sqlite_required_i64(reference, 5, "metadata.column.hidden")?
+      if (not_null != 0 && not_null != 1) || hidden < 0 || hidden > 3 {
+        ignored := sqlite_cursor_close(cursor)
+        return Err(sqlite_cursor_shape("metadata.column"))
+      }
+      mut logical_projection: Option<str> := None
+      mut native_projection: Option<str> := None
+      mut nullable := MetaNullability.Unknown
+      mut default_projection: Option<str> := None
+      if detail_has_summary(detail) {
+        logical_projection = Some(sqlite_logical_type(native_type).clone_in(out))
+        native_projection = Some(native_type)
+        nullable = if not_null == 0 { MetaNullability.Yes } else { MetaNullability.No }
+      }
+      if detail_is_full(detail) { default_projection = default_sql }
+      rows.push(ColumnMeta {
+        schema: table_ref.schema.clone_in(out),
+        table: table_ref.name.clone_in(out),
+        name: name,
+        ordinal: native_ordinal,
+        logical_type: logical_projection,
+        native_type: native_projection,
+        native_type_id: None,
+        nullable: nullable,
+        default_sql: default_projection,
+        generated_sql: None,
+        identity_kind: None,
+        collation: None,
+        comment: None,
+        origin_schema: None,
+        origin_table: None,
+        origin_column: None,
+      })
+      previous_ordinal = native_ordinal
+    }
+    sqlite_finish(cursor, database)?
+    return Ok(rows.build())
+  }
+}
+
+fn sqlite_key_kind(tag: i64) -> Result<MetaKeyKind, Error> {
+  if tag == 0 { return Ok(MetaKeyKind.Primary) }
+  if tag == 1 { return Ok(MetaKeyKind.Unique) }
+  if tag == 2 { return Ok(MetaKeyKind.Foreign) }
+  return Err(sqlite_cursor_shape("metadata.key.kind"))
+}
+
+fn sqlite_match_policy(value: Option<str>) -> Result<Option<MetaForeignKeyMatch>, Error> {
+  return match value {
+    None => Ok(None)
+    Some(text) => {
+      if text == "NONE" || text == "SIMPLE" { return Ok(Some(MetaForeignKeyMatch.Simple)) }
+      if text == "FULL" { return Ok(Some(MetaForeignKeyMatch.Full)) }
+      if text == "PARTIAL" { return Ok(Some(MetaForeignKeyMatch.Partial)) }
+      Err(sqlite_cursor_shape("metadata.key.match_policy"))
+    }
+  }
+}
+
+fn sqlite_referential_action(
+  value: Option<str>,
+  item: str,
+) -> Result<Option<MetaReferentialAction>, Error> {
+  return match value {
+    None => Ok(None)
+    Some(text) => {
+      if text == "NO ACTION" { return Ok(Some(MetaReferentialAction.NoAction)) }
+      if text == "RESTRICT" { return Ok(Some(MetaReferentialAction.Restrict)) }
+      if text == "CASCADE" { return Ok(Some(MetaReferentialAction.Cascade)) }
+      if text == "SET NULL" { return Ok(Some(MetaReferentialAction.SetNull)) }
+      if text == "SET DEFAULT" { return Ok(Some(MetaReferentialAction.SetDefault)) }
+      Err(sqlite_cursor_shape(item))
+    }
+  }
+}
+
+fn sqlite_meta_keys_configured(
+  target: exec,
+  table_ref: TableRef,
+  detail: MetaDetail,
+  out: region,
+  include_system: bool,
+  include_internal: bool,
+) -> Result<array<KeyMeta>, Error> {
+  unsafe {
+    catalog_driver_valid(target, 1, "SQLite metadata requires a SQLite connection")?
+    state := execution_state(target)
+    if !sqlite_table_allowed(table_ref, include_system, include_internal) {
+      rows: array_builder<KeyMeta> := array_builder(out)
+      return Ok(rows.build())
+    }
+    database: raw := raw.load(state, 8)
+    sql := "WITH pk_terms AS (SELECT 0 AS kind_tag, 'pk' AS native_group, NULL AS name, x.pk - 1 AS term_ordinal, x.name AS local_column, NULL AS referenced_schema, NULL AS referenced_table, NULL AS referenced_column, NULL AS expression, NULL AS match_policy, NULL AS on_update, NULL AS on_delete FROM pragma_table_xinfo(?1, ?2) AS x WHERE x.pk > 0), unique_terms AS (SELECT 1 AS kind_tag, il.name AS native_group, il.name AS name, xi.seqno AS term_ordinal, xi.name AS local_column, NULL AS referenced_schema, NULL AS referenced_table, NULL AS referenced_column, NULL AS expression, NULL AS match_policy, NULL AS on_update, NULL AS on_delete FROM pragma_index_list(?1, ?2) AS il, pragma_index_xinfo(il.name, ?2) AS xi WHERE il.\"unique\" = 1 AND il.origin = 'u' AND xi.key = 1), foreign_terms AS (SELECT 2 AS kind_tag, CAST(f.id AS TEXT) AS native_group, NULL AS name, f.seq AS term_ordinal, f.\"from\" AS local_column, ?2 AS referenced_schema, f.\"table\" AS referenced_table, f.\"to\" AS referenced_column, NULL AS expression, f.\"match\" AS match_policy, f.on_update AS on_update, f.on_delete AS on_delete FROM pragma_foreign_key_list(?1, ?2) AS f), terms AS (SELECT * FROM pk_terms UNION ALL SELECT * FROM unique_terms UNION ALL SELECT * FROM foreign_terms), foreign_signatures AS (SELECT native_group, group_concat(CASE WHEN local_column IS NULL THEN '0!' ELSE '1' || hex(CAST(local_column AS BLOB)) || '!' END || CASE WHEN referenced_schema IS NULL THEN '0!' ELSE '1' || hex(CAST(referenced_schema AS BLOB)) || '!' END || CASE WHEN referenced_table IS NULL THEN '0!' ELSE '1' || hex(CAST(referenced_table AS BLOB)) || '!' END || CASE WHEN referenced_column IS NULL THEN '0!' ELSE '1' || hex(CAST(referenced_column AS BLOB)) || '!' END || CASE WHEN expression IS NULL THEN '0!' ELSE '1' || hex(CAST(expression AS BLOB)) || '!' END, ' ') AS term_signature, min(match_policy) AS min_match, max(match_policy) AS max_match, min(on_update) AS min_update, max(on_update) AS max_update, min(on_delete) AS min_delete, max(on_delete) AS max_delete FROM (SELECT * FROM foreign_terms ORDER BY native_group, term_ordinal) GROUP BY native_group), groups AS (SELECT DISTINCT kind_tag, native_group, CASE kind_tag WHEN 0 THEN '0!0!' WHEN 1 THEN '1!1' || hex(CAST(name AS BLOB)) || '!' ELSE '2!0!' || (SELECT term_signature FROM foreign_signatures f WHERE f.native_group = t.native_group) || hex(CAST(COALESCE(match_policy, '') AS BLOB)) || '!' || hex(CAST(COALESCE(on_update, '') AS BLOB)) || '!' || hex(CAST(COALESCE(on_delete, '') AS BLOB)) || '!' END AS group_sort, CASE WHEN kind_tag <> 2 THEN 1 ELSE (SELECT min_match = max_match AND min_update = max_update AND min_delete = max_delete FROM foreign_signatures f WHERE f.native_group = t.native_group) END AS consistent FROM terms t), ordered_groups AS (SELECT kind_tag, native_group, row_number() OVER (ORDER BY group_sort, native_group) - 1 AS key_ordinal, consistent FROM groups) SELECT t.kind_tag, t.name, g.key_ordinal, t.term_ordinal, t.local_column, t.referenced_schema, t.referenced_table, t.referenced_column, t.expression, t.match_policy, t.on_update, t.on_delete, g.consistent FROM terms t JOIN ordered_groups g USING(kind_tag, native_group) ORDER BY g.key_ordinal, t.term_ordinal"
+    cursor := sqlite_open_cursor(target, sql, Some(table_ref.name), Some(table_ref.schema))?
+    reference := resource.borrow(cursor)
+    statement := sqlite_cursor_native(reference)
+    mut rows: array_builder<KeyMeta> := array_builder(out)
+    mut previous_key_ordinal: i64 := -1
+    mut previous_term_ordinal: i64 := -1
+    mut previous_kind_tag: i64 := -1
+    mut previous_name: Option<str> := None
+    mut previous_expression: Option<str> := None
+    mut previous_match: Option<str> := None
+    mut previous_update: Option<str> := None
+    mut previous_delete: Option<str> := None
+    loop {
+      status := sqlite3_step(statement)
+      if status == SQLITE_DONE { break }
+      if status != SQLITE_ROW {
+        failure := sqlite_native_error(database)
+        ignored := sqlite_cursor_close(cursor)
+        return Err(failure)
+      }
+      sqlite_row_shape(reference, 13, "metadata.keys")?
+      kind_tag := sqlite_required_i64(reference, 0, "metadata.key.kind")?
+      name := sqlite_text(reference, 1, out, "metadata.key.name")?
+      key_ordinal := sqlite_required_i64(reference, 2, "metadata.key.key_ordinal")?
+      term_ordinal := sqlite_required_i64(reference, 3, "metadata.key.term_ordinal")?
+      local_column := sqlite_text(reference, 4, out, "metadata.key.local_column")?
+      referenced_schema := sqlite_text(reference, 5, out, "metadata.key.referenced_schema")?
+      referenced_table := sqlite_text(reference, 6, out, "metadata.key.referenced_table")?
+      referenced_column := sqlite_text(reference, 7, out, "metadata.key.referenced_column")?
+      expression := sqlite_text(reference, 8, out, "metadata.key.expression")?
+      match_text := sqlite_text(reference, 9, out, "metadata.key.match_policy")?
+      update_text := sqlite_text(reference, 10, out, "metadata.key.on_update")?
+      delete_text := sqlite_text(reference, 11, out, "metadata.key.on_delete")?
+      consistent := sqlite_required_i64(reference, 12, "metadata.key.consistent")?
+      if key_ordinal < 0 || term_ordinal < 0 || consistent != 1 {
+        ignored := sqlite_cursor_close(cursor)
+        return Err(sqlite_cursor_shape("metadata.key.group"))
+      }
+      same_group := previous_key_ordinal == key_ordinal
+      if previous_key_ordinal < 0 {
+        if key_ordinal != 0 || term_ordinal != 0 {
+          ignored := sqlite_cursor_close(cursor)
+          return Err(sqlite_cursor_shape("metadata.key.order"))
+        }
+      } else {
+        if same_group {
+          if term_ordinal <= previous_term_ordinal
+            || term_ordinal - previous_term_ordinal != 1
+            || kind_tag != previous_kind_tag
+            || !optional_text_equal(name, previous_name)
+            || !optional_text_equal(expression, previous_expression)
+            || !optional_text_equal(match_text, previous_match)
+            || !optional_text_equal(update_text, previous_update)
+            || !optional_text_equal(delete_text, previous_delete) {
+            ignored := sqlite_cursor_close(cursor)
+            return Err(sqlite_cursor_shape("metadata.key.group"))
+          }
+        } else {
+          if key_ordinal <= previous_key_ordinal
+            || key_ordinal - previous_key_ordinal != 1 || term_ordinal != 0 {
+            ignored := sqlite_cursor_close(cursor)
+            return Err(sqlite_cursor_shape("metadata.key.order"))
+          }
+        }
+      }
+      if !same_group {
+        previous_kind_tag = kind_tag
+        previous_name = name
+        previous_expression = expression
+        previous_match = match_text
+        previous_update = update_text
+        previous_delete = delete_text
+      }
+      previous_key_ordinal = key_ordinal
+      previous_term_ordinal = term_ordinal
+      mut local_projection: Option<str> := None
+      mut schema_projection: Option<str> := None
+      mut table_projection: Option<str> := None
+      mut column_projection: Option<str> := None
+      mut expression_projection: Option<str> := None
+      mut match_projection: Option<MetaForeignKeyMatch> := None
+      mut update_projection: Option<MetaReferentialAction> := None
+      mut delete_projection: Option<MetaReferentialAction> := None
+      if detail_has_summary(detail) {
+        local_projection = local_column
+        schema_projection = referenced_schema
+        table_projection = referenced_table
+        column_projection = referenced_column
+        expression_projection = expression
+      }
+      if detail_is_full(detail) {
+        match_projection = sqlite_match_policy(match_text)?
+        update_projection = sqlite_referential_action(update_text, "metadata.key.on_update")?
+        delete_projection = sqlite_referential_action(delete_text, "metadata.key.on_delete")?
+      }
+      rows.push(KeyMeta {
+        schema: table_ref.schema.clone_in(out),
+        table: table_ref.name.clone_in(out),
+        name: name,
+        kind: sqlite_key_kind(kind_tag)?,
+        key_ordinal: key_ordinal,
+        term_ordinal: term_ordinal,
+        local_column: local_projection,
+        referenced_schema: schema_projection,
+        referenced_table: table_projection,
+        referenced_column: column_projection,
+        expression: expression_projection,
+        match_policy: match_projection,
+        on_update: update_projection,
+        on_delete: delete_projection,
+        deferrable: None,
+        initially_deferred: None,
+        validated: None,
+      })
+    }
+    sqlite_finish(cursor, database)?
+    return Ok(rows.build())
+  }
+}
+
+fn sqlite_meta_indexes_configured(
+  target: exec,
+  table_ref: TableRef,
+  detail: MetaDetail,
+  out: region,
+  include_system: bool,
+  include_internal: bool,
+) -> Result<array<IndexMeta>, Error> {
+  unsafe {
+    catalog_driver_valid(target, 1, "SQLite metadata requires a SQLite connection")?
+    state := execution_state(target)
+    if !sqlite_table_allowed(table_ref, include_system, include_internal) {
+      rows: array_builder<IndexMeta> := array_builder(out)
+      return Ok(rows.build())
+    }
+    database: raw := raw.load(state, 8)
+    sql := "WITH terms AS (SELECT il.name AS index_name, il.\"unique\" AS is_unique, il.origin AS origin, il.partial AS partial, xi.seqno AS native_ordinal, xi.cid AS column_id, xi.name AS column_name, xi.\"desc\" AS descending, xi.coll AS collation, xi.key AS is_key, row_number() OVER (PARTITION BY il.name ORDER BY CASE WHEN xi.key = 1 THEN 0 ELSE 1 END, xi.seqno) - 1 AS term_ordinal FROM pragma_index_list(?1, ?2) AS il, pragma_index_xinfo(il.name, ?2) AS xi WHERE xi.key = 1 OR xi.cid >= 0) SELECT index_name, is_unique, origin, partial, term_ordinal, column_id, column_name, descending, collation, is_key FROM terms ORDER BY CAST(index_name AS BLOB), term_ordinal"
+    cursor := sqlite_open_cursor(target, sql, Some(table_ref.name), Some(table_ref.schema))?
+    reference := resource.borrow(cursor)
+    statement := sqlite_cursor_native(reference)
+    mut rows: array_builder<IndexMeta> := array_builder(out)
+    mut previous_name: Option<str> := None
+    mut previous_ordinal: i64 := -1
+    mut previous_unique: i64 := -1
+    mut previous_origin: Option<str> := None
+    mut previous_partial: i64 := -1
+    mut previous_included := false
+    loop {
+      status := sqlite3_step(statement)
+      if status == SQLITE_DONE { break }
+      if status != SQLITE_ROW {
+        failure := sqlite_native_error(database)
+        ignored := sqlite_cursor_close(cursor)
+        return Err(failure)
+      }
+      sqlite_row_shape(reference, 10, "metadata.indexes")?
+      name := sqlite_required_text(reference, 0, out, "metadata.index.name")?
+      unique_tag := sqlite_required_i64(reference, 1, "metadata.index.unique")?
+      origin := sqlite_required_text(reference, 2, out, "metadata.index.origin")?
+      partial_tag := sqlite_required_i64(reference, 3, "metadata.index.partial")?
+      term_ordinal := sqlite_required_i64(reference, 4, "metadata.index.term_ordinal")?
+      column_id := sqlite_required_i64(reference, 5, "metadata.index.column_id")?
+      column := sqlite_text(reference, 6, out, "metadata.index.column")?
+      descending := sqlite_required_i64(reference, 7, "metadata.index.sort_order")?
+      collation := sqlite_text(reference, 8, out, "metadata.index.collation")?
+      is_key := sqlite_required_i64(reference, 9, "metadata.index.term_kind")?
+      if (unique_tag != 0 && unique_tag != 1) || (partial_tag != 0 && partial_tag != 1)
+        || (descending != 0 && descending != 1) || (is_key != 0 && is_key != 1)
+        || term_ordinal < 0 || column_id < -2 {
+        ignored := sqlite_cursor_close(cursor)
+        return Err(sqlite_cursor_shape("metadata.index"))
+      }
+      same_index := match previous_name {
+        Some(prior_name) => prior_name == name
+        None => false
+      }
+      match previous_name {
+        None => {
+          if term_ordinal != 0 {
+            ignored := sqlite_cursor_close(cursor)
+            return Err(sqlite_cursor_shape("metadata.index.order"))
+          }
+        }
+        Some(prior_name) => {
+          if same_index {
+            if term_ordinal <= previous_ordinal || term_ordinal - previous_ordinal != 1
+              || unique_tag != previous_unique
+              || !optional_text_equal(Some(origin), previous_origin)
+              || partial_tag != previous_partial
+              || (previous_included && is_key == 1) {
+              ignored := sqlite_cursor_close(cursor)
+              return Err(sqlite_cursor_shape("metadata.index.group"))
+            }
+          } else {
+            if name < prior_name || name == prior_name || term_ordinal != 0 {
+              ignored := sqlite_cursor_close(cursor)
+              return Err(sqlite_cursor_shape("metadata.index.order"))
+            }
+          }
+        }
+      }
+      if !same_index {
+        previous_name = Some(name)
+        previous_unique = unique_tag
+        previous_origin = Some(origin)
+        previous_partial = partial_tag
+        previous_included = false
+      }
+      if is_key == 0 { previous_included = true }
+      previous_ordinal = term_ordinal
+      mut unique_projection: Option<bool> := None
+      mut primary_projection: Option<bool> := None
+      mut column_projection: Option<str> := None
+      mut expression_projection: Option<str> := None
+      mut sort_projection: Option<MetaSortOrder> := None
+      mut null_projection: Option<MetaNullOrder> := None
+      if detail_has_summary(detail) {
+        unique_projection = Some(unique_tag != 0)
+        primary_projection = Some(origin == "pk")
+        column_projection = column
+        if is_key == 1 {
+          sort_projection = if descending == 0 {
+            Some(MetaSortOrder.Asc)
+          } else { Some(MetaSortOrder.Desc) }
+          null_projection = if descending == 0 {
+            Some(MetaNullOrder.First)
+          } else { Some(MetaNullOrder.Last) }
+        }
+      }
+      rows.push(IndexMeta {
+        schema: table_ref.schema.clone_in(out),
+        table: table_ref.name.clone_in(out),
+        name: name,
+        unique: unique_projection,
+        primary_backed: primary_projection,
+        term_ordinal: term_ordinal,
+        term_kind: if is_key == 1 { MetaIndexTermKind.Key } else { MetaIndexTermKind.Included },
+        column: column_projection,
+        expression: expression_projection,
+        predicate: None,
+        native_method: None,
+        native_opclass: None,
+        sort_order: sort_projection,
+        null_order: null_projection,
+        valid: None,
+        ready: None,
+      })
+    }
+    sqlite_finish(cursor, database)?
+    return Ok(rows.build())
+  }
+}
+
+fn postgres_table_kind(value: str) -> MetaTableKind {
+  if value == "r" || value == "p" { return MetaTableKind.Table }
+  if value == "v" { return MetaTableKind.View }
+  if value == "m" { return MetaTableKind.MaterializedView }
+  return MetaTableKind.Native
+}
+
+fn postgres_logical_type(native: str) -> str {
+  if native == "smallint" { return "i16" }
+  if native == "integer" { return "i32" }
+  if native == "bigint" { return "i64" }
+  if native == "real" { return "f32" }
+  if native == "double precision" { return "f64" }
+  if native == "boolean" { return "bool" }
+  if native == "text" || ascii_contains_fold(native, "character") { return "str" }
+  if native == "bytea" { return "slice<u8>" }
+  return "native"
+}
+
+fn postgres_system_schema(value: str) -> bool {
+  if value == "information_schema" { return true }
+  bytes := value.bytes()
+  if bytes.len() < 3 { return false }
+  return bytes[0] == 112 && bytes[1] == 103 && bytes[2] == 95
+}
+
+fn postgres_table_allowed(table_ref: TableRef, include_system: bool) -> bool =
+  include_system || !postgres_system_schema(table_ref.schema)
+
+fn postgres_meta_database(
+  target: exec,
+  detail: MetaDetail,
+  out: region,
+) -> Result<DatabaseMeta, Error> {
+  sql := match detail {
+    Names => "SELECT current_database(), current_setting('server_version')"
+    Summary => "SELECT current_database(), current_setting('server_version'), current_schema(), CASE WHEN current_setting('transaction_read_only') = 'on' THEN 1 ELSE 0 END"
+    Full => "SELECT current_database(), current_setting('server_version'), current_schema(), getdatabaseencoding(), d.datcollate, CASE WHEN current_setting('transaction_read_only') = 'on' THEN 1 ELSE 0 END FROM pg_catalog.pg_database AS d WHERE d.datname = current_database()"
+  }
+  cursor := postgres_open_cursor(target, sql, None, None)?
+  reference := resource.borrow(cursor)
+  expected_columns := match detail { Names => 2 Summary => 4 Full => 6 }
+  rows := postgres_result_shape(reference, expected_columns, "metadata.database")?
+  if rows != 1 {
+    postgres_finish(cursor)
+    return Err(postgres_cursor_shape("metadata.database.rows"))
+  }
+  name := postgres_required_text(reference, 0, 0, out, "metadata.database.name")?
+  version := postgres_required_text(reference, 0, 1, out, "metadata.database.engine_version")?
+  mut default_schema: Option<str> := None
+  mut encoding: Option<str> := None
+  mut collation: Option<str> := None
+  mut read_only: Option<bool> := None
+  mut transactional_ddl: Option<bool> := None
+  if detail_has_summary(detail) {
+    default_schema = postgres_text(reference, 0, 2, out, "metadata.database.default_schema")?
+    read_only_tag := if detail_is_full(detail) {
+      postgres_required_i64(reference, 0, 5, "metadata.database.read_only")?
+    } else { postgres_required_i64(reference, 0, 3, "metadata.database.read_only")? }
+    if read_only_tag != 0 && read_only_tag != 1 {
+      postgres_finish(cursor)
+      return Err(postgres_cursor_shape("metadata.database.read_only"))
+    }
+    read_only = Some(read_only_tag != 0)
+    transactional_ddl = Some(true)
+  }
+  if detail_is_full(detail) {
+    encoding = postgres_text(reference, 0, 3, out, "metadata.database.encoding")?
+    collation = postgres_text(reference, 0, 4, out, "metadata.database.collation")?
+  }
+  postgres_finish(cursor)
+  return Ok(DatabaseMeta {
+    driver: Driver.PostgreSQL,
+    name: name,
+    engine_version: version,
+    default_schema: default_schema,
+    encoding: encoding,
+    collation: collation,
+    read_only: read_only,
+    transactional_ddl: transactional_ddl,
+  })
+}
+
+fn postgres_meta_schemas_configured(
+  target: exec,
+  detail: MetaDetail,
+  out: region,
+  include_system: bool,
+  search_path_only: bool,
+) -> Result<array<SchemaMeta>, Error> {
+  sql := if include_system {
+    if search_path_only {
+      "SELECT n.nspname, pg_catalog.pg_get_userbyid(n.nspowner), CASE WHEN n.nspname = ANY (pg_catalog.current_schemas(true)) THEN 1 ELSE 0 END, CASE WHEN n.nspname = 'information_schema' OR pg_catalog.left(n.nspname, 3) = 'pg_' THEN 1 ELSE 0 END FROM pg_catalog.pg_namespace AS n WHERE n.nspname = ANY (pg_catalog.current_schemas(true)) ORDER BY n.nspname COLLATE \"C\""
+    } else {
+      "SELECT n.nspname, pg_catalog.pg_get_userbyid(n.nspowner), CASE WHEN n.nspname = ANY (pg_catalog.current_schemas(true)) THEN 1 ELSE 0 END, CASE WHEN n.nspname = 'information_schema' OR pg_catalog.left(n.nspname, 3) = 'pg_' THEN 1 ELSE 0 END FROM pg_catalog.pg_namespace AS n ORDER BY n.nspname COLLATE \"C\""
+    }
+  } else {
+    if search_path_only {
+      "SELECT n.nspname, pg_catalog.pg_get_userbyid(n.nspowner), CASE WHEN n.nspname = ANY (pg_catalog.current_schemas(true)) THEN 1 ELSE 0 END, 0 FROM pg_catalog.pg_namespace AS n WHERE n.nspname <> 'information_schema' AND pg_catalog.left(n.nspname, 3) <> 'pg_' AND n.nspname = ANY (pg_catalog.current_schemas(true)) ORDER BY n.nspname COLLATE \"C\""
+    } else {
+      "SELECT n.nspname, pg_catalog.pg_get_userbyid(n.nspowner), CASE WHEN n.nspname = ANY (pg_catalog.current_schemas(true)) THEN 1 ELSE 0 END, 0 FROM pg_catalog.pg_namespace AS n WHERE n.nspname <> 'information_schema' AND pg_catalog.left(n.nspname, 3) <> 'pg_' ORDER BY n.nspname COLLATE \"C\""
+    }
+  }
+  cursor := postgres_open_cursor(target, sql, None, None)?
+  reference := resource.borrow(cursor)
+  count := postgres_result_shape(reference, 4, "metadata.schemas")?
+  mut rows: array_builder<SchemaMeta> := array_builder(out)
+  mut row: i32 := 0
+  loop {
+    if row >= count { break }
+    name := postgres_required_text(reference, row, 0, out, "metadata.schema.name")?
+    owner := postgres_text(reference, row, 1, out, "metadata.schema.owner")?
+    visible := postgres_required_i64(reference, row, 2, "metadata.schema.visible")?
+    system := postgres_required_i64(reference, row, 3, "metadata.schema.system")?
+    if (visible != 0 && visible != 1) || (system != 0 && system != 1) {
+      postgres_finish(cursor)
+      return Err(postgres_cursor_shape("metadata.schema"))
+    }
+    rows.push(SchemaMeta {
+      name: name,
+      owner: if detail_has_summary(detail) { owner } else { None },
+      visible: visible != 0,
+      system: system != 0,
+    })
+    row = row + 1
+  }
+  postgres_finish(cursor)
+  return Ok(rows.build())
+}
+
+fn postgres_meta_tables_configured(
+  target: exec,
+  schema_filter: Option<SchemaRef>,
+  detail: MetaDetail,
+  out: region,
+  include_system: bool,
+  search_path_only: bool,
+) -> Result<array<TableMeta>, Error> {
+  mut schema_name: Option<str> := None
+  match schema_filter { Some(reference) => { schema_name = Some(reference.name) } None => {} }
+  sql := match schema_name {
+    Some(_) => if include_system {
+      if search_path_only {
+        "SELECT n.nspname, c.relname, c.relkind::text, pg_catalog.pg_get_userbyid(c.relowner), c.reltuples::bigint, pg_catalog.obj_description(c.oid, 'pg_class') FROM pg_catalog.pg_class AS c JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relkind IN ('r','p','v','m','f') AND n.nspname = ANY (pg_catalog.current_schemas(true)) ORDER BY n.nspname COLLATE \"C\", c.relname COLLATE \"C\""
+      } else {
+        "SELECT n.nspname, c.relname, c.relkind::text, pg_catalog.pg_get_userbyid(c.relowner), c.reltuples::bigint, pg_catalog.obj_description(c.oid, 'pg_class') FROM pg_catalog.pg_class AS c JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relkind IN ('r','p','v','m','f') ORDER BY n.nspname COLLATE \"C\", c.relname COLLATE \"C\""
+      }
+    } else {
+      if search_path_only {
+        "SELECT n.nspname, c.relname, c.relkind::text, pg_catalog.pg_get_userbyid(c.relowner), c.reltuples::bigint, pg_catalog.obj_description(c.oid, 'pg_class') FROM pg_catalog.pg_class AS c JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND n.nspname <> 'information_schema' AND pg_catalog.left(n.nspname, 3) <> 'pg_' AND c.relkind IN ('r','p','v','m','f') AND n.nspname = ANY (pg_catalog.current_schemas(true)) ORDER BY n.nspname COLLATE \"C\", c.relname COLLATE \"C\""
+      } else {
+        "SELECT n.nspname, c.relname, c.relkind::text, pg_catalog.pg_get_userbyid(c.relowner), c.reltuples::bigint, pg_catalog.obj_description(c.oid, 'pg_class') FROM pg_catalog.pg_class AS c JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND n.nspname <> 'information_schema' AND pg_catalog.left(n.nspname, 3) <> 'pg_' AND c.relkind IN ('r','p','v','m','f') ORDER BY n.nspname COLLATE \"C\", c.relname COLLATE \"C\""
+      }
+    }
+    None => if include_system {
+      if search_path_only {
+        "SELECT n.nspname, c.relname, c.relkind::text, pg_catalog.pg_get_userbyid(c.relowner), c.reltuples::bigint, pg_catalog.obj_description(c.oid, 'pg_class') FROM pg_catalog.pg_class AS c JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace WHERE c.relkind IN ('r','p','v','m','f') AND n.nspname = ANY (pg_catalog.current_schemas(true)) ORDER BY n.nspname COLLATE \"C\", c.relname COLLATE \"C\""
+      } else {
+        "SELECT n.nspname, c.relname, c.relkind::text, pg_catalog.pg_get_userbyid(c.relowner), c.reltuples::bigint, pg_catalog.obj_description(c.oid, 'pg_class') FROM pg_catalog.pg_class AS c JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace WHERE c.relkind IN ('r','p','v','m','f') ORDER BY n.nspname COLLATE \"C\", c.relname COLLATE \"C\""
+      }
+    } else {
+      if search_path_only {
+        "SELECT n.nspname, c.relname, c.relkind::text, pg_catalog.pg_get_userbyid(c.relowner), c.reltuples::bigint, pg_catalog.obj_description(c.oid, 'pg_class') FROM pg_catalog.pg_class AS c JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname <> 'information_schema' AND pg_catalog.left(n.nspname, 3) <> 'pg_' AND c.relkind IN ('r','p','v','m','f') AND n.nspname = ANY (pg_catalog.current_schemas(true)) ORDER BY n.nspname COLLATE \"C\", c.relname COLLATE \"C\""
+      } else {
+        "SELECT n.nspname, c.relname, c.relkind::text, pg_catalog.pg_get_userbyid(c.relowner), c.reltuples::bigint, pg_catalog.obj_description(c.oid, 'pg_class') FROM pg_catalog.pg_class AS c JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname <> 'information_schema' AND pg_catalog.left(n.nspname, 3) <> 'pg_' AND c.relkind IN ('r','p','v','m','f') ORDER BY n.nspname COLLATE \"C\", c.relname COLLATE \"C\""
+      }
+    }
+  }
+  cursor := postgres_open_cursor(target, sql, schema_name, None)?
+  reference := resource.borrow(cursor)
+  count := postgres_result_shape(reference, 6, "metadata.tables")?
+  mut rows: array_builder<TableMeta> := array_builder(out)
+  mut row: i32 := 0
+  loop {
+    if row >= count { break }
+    schema := postgres_required_text(reference, row, 0, out, "metadata.table.schema")?
+    name := postgres_required_text(reference, row, 1, out, "metadata.table.name")?
+    native_kind := postgres_required_text(reference, row, 2, out, "metadata.table.kind")?
+    owner := postgres_text(reference, row, 3, out, "metadata.table.owner")?
+    estimate := postgres_required_i64(reference, row, 4, "metadata.table.estimated_rows")?
+    comment := postgres_text(reference, row, 5, out, "metadata.table.comment")?
+    mut native_projection: Option<str> := None
+    mut owner_projection: Option<str> := None
+    mut estimate_projection: Option<f64> := None
+    mut comment_projection: Option<str> := None
+    if detail_has_summary(detail) {
+      native_projection = Some(native_kind)
+      owner_projection = owner
+      if estimate >= 0 { estimate_projection = Some(estimate as f64) }
+    }
+    if detail_is_full(detail) { comment_projection = comment }
+    rows.push(TableMeta {
+      schema: schema,
+      name: name,
+      kind: postgres_table_kind(native_kind),
+      native_kind: native_projection,
+      owner: owner_projection,
+      comment: comment_projection,
+      estimated_rows: estimate_projection,
+    })
+    row = row + 1
+  }
+  postgres_finish(cursor)
+  return Ok(rows.build())
+}
+
+fn postgres_meta_table_configured(
+  target: exec,
+  table_ref: TableRef,
+  detail: MetaDetail,
+  out: region,
+  include_system: bool,
+) -> Result<TableMeta, Error> {
+  sql := if include_system {
+    "SELECT n.nspname, c.relname, c.relkind::text, pg_catalog.pg_get_userbyid(c.relowner), c.reltuples::bigint, pg_catalog.obj_description(c.oid, 'pg_class') FROM pg_catalog.pg_class AS c JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r','p','v','m','f')"
+  } else {
+    "SELECT n.nspname, c.relname, c.relkind::text, pg_catalog.pg_get_userbyid(c.relowner), c.reltuples::bigint, pg_catalog.obj_description(c.oid, 'pg_class') FROM pg_catalog.pg_class AS c JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2 AND n.nspname <> 'information_schema' AND pg_catalog.left(n.nspname, 3) <> 'pg_' AND c.relkind IN ('r','p','v','m','f')"
+  }
+  cursor := postgres_open_cursor(target, sql, Some(table_ref.schema), Some(table_ref.name))?
+  reference := resource.borrow(cursor)
+  count := postgres_result_shape(reference, 6, "metadata.table")?
+  if count == 0 {
+    postgres_finish(cursor)
+    return Err(Error.NotFound)
+  }
+  if count != 1 {
+    postgres_finish(cursor)
+    return Err(postgres_cursor_shape("metadata.table.rows"))
+  }
+  schema := postgres_required_text(reference, 0, 0, out, "metadata.table.schema")?
+  name := postgres_required_text(reference, 0, 1, out, "metadata.table.name")?
+  native_kind := postgres_required_text(reference, 0, 2, out, "metadata.table.kind")?
+  owner := postgres_text(reference, 0, 3, out, "metadata.table.owner")?
+  estimate := postgres_required_i64(reference, 0, 4, "metadata.table.estimated_rows")?
+  comment := postgres_text(reference, 0, 5, out, "metadata.table.comment")?
+  mut native_projection: Option<str> := None
+  mut owner_projection: Option<str> := None
+  mut estimate_projection: Option<f64> := None
+  mut comment_projection: Option<str> := None
+  if detail_has_summary(detail) {
+    native_projection = Some(native_kind)
+    owner_projection = owner
+    if estimate >= 0 { estimate_projection = Some(estimate as f64) }
+  }
+  if detail_is_full(detail) { comment_projection = comment }
+  result := TableMeta {
+    schema: schema,
+    name: name,
+    kind: postgres_table_kind(native_kind),
+    native_kind: native_projection,
+    owner: owner_projection,
+    comment: comment_projection,
+    estimated_rows: estimate_projection,
+  }
+  postgres_finish(cursor)
+  return Ok(result)
+}
+
+fn postgres_meta_columns_configured(
+  target: exec,
+  table_ref: TableRef,
+  detail: MetaDetail,
+  out: region,
+  include_system: bool,
+) -> Result<array<ColumnMeta>, Error> {
+  catalog_driver_valid(
+    target, 2, "PostgreSQL metadata requires a PostgreSQL connection",
+  )?
+  if !postgres_table_allowed(table_ref, include_system) {
+    rows: array_builder<ColumnMeta> := array_builder(out)
+    return Ok(rows.build())
+  }
+  sql := "SELECT row_number() OVER (ORDER BY a.attnum) - 1, a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), a.atttypid::bigint, CASE WHEN a.attnotnull THEN 1 ELSE 0 END, CASE WHEN a.attgenerated::text <> '' OR a.attidentity::text <> '' THEN NULL ELSE pg_catalog.pg_get_expr(d.adbin, d.adrelid) END, CASE WHEN a.attgenerated::text <> '' THEN pg_catalog.pg_get_expr(d.adbin, d.adrelid) ELSE NULL END, CASE a.attidentity::text WHEN 'a' THEN 'always' WHEN 'd' THEN 'by_default' ELSE NULL END, coll.collname, pg_catalog.col_description(a.attrelid, a.attnum) FROM pg_catalog.pg_attribute AS a JOIN pg_catalog.pg_class AS c ON c.oid = a.attrelid JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace LEFT JOIN pg_catalog.pg_attrdef AS d ON d.adrelid = a.attrelid AND d.adnum = a.attnum LEFT JOIN pg_catalog.pg_collation AS coll ON coll.oid = a.attcollation WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum"
+  cursor := postgres_open_cursor(target, sql, Some(table_ref.schema), Some(table_ref.name))?
+  reference := resource.borrow(cursor)
+  count := postgres_result_shape(reference, 10, "metadata.columns")?
+  mut rows: array_builder<ColumnMeta> := array_builder(out)
+  mut row: i32 := 0
+  loop {
+    if row >= count { break }
+    ordinal := postgres_required_i64(reference, row, 0, "metadata.column.ordinal")?
+    if ordinal < 0 {
+      postgres_finish(cursor)
+      return Err(postgres_cursor_shape("metadata.column.ordinal"))
+    }
+    name := postgres_required_text(reference, row, 1, out, "metadata.column.name")?
+    native_type := postgres_required_text(reference, row, 2, out, "metadata.column.native_type")?
+    native_type_id := postgres_required_i64(reference, row, 3, "metadata.column.native_type_id")?
+    not_null := postgres_required_i64(reference, row, 4, "metadata.column.nullable")?
+    default_sql := postgres_text(reference, row, 5, out, "metadata.column.default_sql")?
+    generated_sql := postgres_text(reference, row, 6, out, "metadata.column.generated_sql")?
+    identity_kind := postgres_text(reference, row, 7, out, "metadata.column.identity_kind")?
+    collation := postgres_text(reference, row, 8, out, "metadata.column.collation")?
+    comment := postgres_text(reference, row, 9, out, "metadata.column.comment")?
+    if not_null != 0 && not_null != 1 {
+      postgres_finish(cursor)
+      return Err(postgres_cursor_shape("metadata.column.nullable"))
+    }
+    mut logical_projection: Option<str> := None
+    mut native_projection: Option<str> := None
+    mut id_projection: Option<i64> := None
+    mut nullable := MetaNullability.Unknown
+    mut default_projection: Option<str> := None
+    mut generated_projection: Option<str> := None
+    mut identity_projection: Option<str> := None
+    mut collation_projection: Option<str> := None
+    mut comment_projection: Option<str> := None
+    if detail_has_summary(detail) {
+      logical_projection = Some(postgres_logical_type(native_type).clone_in(out))
+      native_projection = Some(native_type)
+      nullable = if not_null == 0 { MetaNullability.Yes } else { MetaNullability.No }
+    }
+    if detail_is_full(detail) {
+      id_projection = Some(native_type_id)
+      default_projection = default_sql
+      generated_projection = generated_sql
+      identity_projection = identity_kind
+      collation_projection = collation
+      comment_projection = comment
+    }
+    rows.push(ColumnMeta {
+      schema: table_ref.schema.clone_in(out),
+      table: table_ref.name.clone_in(out),
+      name: name,
+      ordinal: ordinal,
+      logical_type: logical_projection,
+      native_type: native_projection,
+      native_type_id: id_projection,
+      nullable: nullable,
+      default_sql: default_projection,
+      generated_sql: generated_projection,
+      identity_kind: identity_projection,
+      collation: collation_projection,
+      comment: comment_projection,
+      origin_schema: None,
+      origin_table: None,
+      origin_column: None,
+    })
+    row = row + 1
+  }
+  postgres_finish(cursor)
+  return Ok(rows.build())
+}
+
+fn postgres_key_kind(tag: i64) -> Result<MetaKeyKind, Error> {
+  if tag == 0 { return Ok(MetaKeyKind.Primary) }
+  if tag == 1 { return Ok(MetaKeyKind.Unique) }
+  if tag == 2 { return Ok(MetaKeyKind.Foreign) }
+  if tag == 3 { return Ok(MetaKeyKind.Check) }
+  if tag == 4 { return Ok(MetaKeyKind.Exclusion) }
+  return Err(postgres_cursor_shape("metadata.key.kind"))
+}
+
+fn postgres_meta_keys_configured(
+  target: exec,
+  table_ref: TableRef,
+  detail: MetaDetail,
+  out: region,
+  include_system: bool,
+) -> Result<array<KeyMeta>, Error> {
+  catalog_driver_valid(
+    target, 2, "PostgreSQL metadata requires a PostgreSQL connection",
+  )?
+  if !postgres_table_allowed(table_ref, include_system) {
+    rows: array_builder<KeyMeta> := array_builder(out)
+    return Ok(rows.build())
+  }
+  sql := "WITH constraints AS (SELECT con.*, CASE con.contype::text WHEN 'p' THEN 0 WHEN 'u' THEN 1 WHEN 'f' THEN 2 WHEN 'c' THEN 3 WHEN 'x' THEN 4 ELSE 5 END AS kind_tag FROM pg_catalog.pg_constraint AS con JOIN pg_catalog.pg_class AS c ON c.oid = con.conrelid JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2 AND con.contype::text IN ('p','u','f','c','x')), term_rows AS (SELECT con.oid AS constraint_oid, con.kind_tag, con.conname, term.n - 1 AS term_ordinal, local_att.attname AS local_column, ref_n.nspname AS referenced_schema, ref_c.relname AS referenced_table, ref_att.attname AS referenced_column, CASE WHEN con.contype::text IN ('c','x') THEN pg_catalog.pg_get_constraintdef(con.oid, true) ELSE NULL END AS expression, CASE con.confmatchtype::text WHEN 's' THEN 'SIMPLE' WHEN 'f' THEN 'FULL' WHEN 'p' THEN 'PARTIAL' ELSE NULL END AS match_policy, CASE con.confupdtype::text WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT' WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' ELSE NULL END AS on_update, CASE con.confdeltype::text WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT' WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' ELSE NULL END AS on_delete, CASE WHEN con.contype::text IN ('p','u','f','x') THEN CASE WHEN con.condeferrable THEN 1 ELSE 0 END ELSE NULL END AS deferrable, CASE WHEN con.contype::text IN ('p','u','f','x') THEN CASE WHEN con.condeferred THEN 1 ELSE 0 END ELSE NULL END AS initially_deferred, CASE WHEN con.convalidated THEN 1 ELSE 0 END AS validated FROM constraints AS con CROSS JOIN LATERAL generate_series(1, GREATEST(COALESCE(array_length(con.conkey, 1), 0), 1)) AS term(n) LEFT JOIN pg_catalog.pg_attribute AS local_att ON local_att.attrelid = con.conrelid AND local_att.attnum = con.conkey[term.n] LEFT JOIN pg_catalog.pg_class AS ref_c ON ref_c.oid = con.confrelid LEFT JOIN pg_catalog.pg_namespace AS ref_n ON ref_n.oid = ref_c.relnamespace LEFT JOIN pg_catalog.pg_attribute AS ref_att ON ref_att.attrelid = con.confrelid AND ref_att.attnum = con.confkey[term.n]), group_rows AS (SELECT constraint_oid, kind_tag, conname, string_agg(CASE WHEN local_column IS NULL THEN '0!' ELSE '1' || encode(convert_to(local_column, 'UTF8'), 'hex') || '!' END || CASE WHEN referenced_schema IS NULL THEN '0!' ELSE '1' || encode(convert_to(referenced_schema, 'UTF8'), 'hex') || '!' END || CASE WHEN referenced_table IS NULL THEN '0!' ELSE '1' || encode(convert_to(referenced_table, 'UTF8'), 'hex') || '!' END || CASE WHEN referenced_column IS NULL THEN '0!' ELSE '1' || encode(convert_to(referenced_column, 'UTF8'), 'hex') || '!' END || CASE WHEN expression IS NULL THEN '0!' ELSE '1' || encode(convert_to(expression, 'UTF8'), 'hex') || '!' END, '' ORDER BY term_ordinal) AS term_signature, min(match_policy) AS match_policy, min(on_update) AS on_update, min(on_delete) AS on_delete, min(deferrable) AS deferrable, min(initially_deferred) AS initially_deferred, min(validated) AS validated FROM term_rows GROUP BY constraint_oid, kind_tag, conname), ordered_groups AS (SELECT constraint_oid, row_number() OVER (ORDER BY (kind_tag::text || '!1' || encode(convert_to(conname, 'UTF8'), 'hex') || '!' || term_signature || CASE WHEN match_policy IS NULL THEN '0!' ELSE '1' || encode(convert_to(match_policy, 'UTF8'), 'hex') || '!' END || CASE WHEN on_update IS NULL THEN '0!' ELSE '1' || encode(convert_to(on_update, 'UTF8'), 'hex') || '!' END || CASE WHEN on_delete IS NULL THEN '0!' ELSE '1' || encode(convert_to(on_delete, 'UTF8'), 'hex') || '!' END || CASE WHEN deferrable IS NULL THEN '0!' WHEN deferrable = 0 THEN '10!' ELSE '11!' END || CASE WHEN initially_deferred IS NULL THEN '0!' WHEN initially_deferred = 0 THEN '10!' ELSE '11!' END || CASE WHEN validated IS NULL THEN '0!' WHEN validated = 0 THEN '10!' ELSE '11!' END) COLLATE \"C\", constraint_oid) - 1 AS key_ordinal FROM group_rows) SELECT t.kind_tag, t.conname, g.key_ordinal, t.term_ordinal, t.local_column, t.referenced_schema, t.referenced_table, t.referenced_column, t.expression, t.match_policy, t.on_update, t.on_delete, t.deferrable, t.initially_deferred, t.validated FROM term_rows AS t JOIN ordered_groups AS g USING (constraint_oid) ORDER BY g.key_ordinal, t.term_ordinal"
+  cursor := postgres_open_cursor(target, sql, Some(table_ref.schema), Some(table_ref.name))?
+  reference := resource.borrow(cursor)
+  count := postgres_result_shape(reference, 15, "metadata.keys")?
+  mut rows: array_builder<KeyMeta> := array_builder(out)
+  mut row: i32 := 0
+  mut previous_key_ordinal: i64 := -1
+  mut previous_term_ordinal: i64 := -1
+  mut previous_kind_tag: i64 := -1
+  mut previous_name: Option<str> := None
+  mut previous_expression: Option<str> := None
+  mut previous_match: Option<str> := None
+  mut previous_update: Option<str> := None
+  mut previous_delete: Option<str> := None
+  mut previous_deferrable: i64 := -2
+  mut previous_deferred: i64 := -2
+  mut previous_validated: i64 := -2
+  loop {
+    if row >= count { break }
+    kind_tag := postgres_required_i64(reference, row, 0, "metadata.key.kind")?
+    name := postgres_text(reference, row, 1, out, "metadata.key.name")?
+    key_ordinal := postgres_required_i64(reference, row, 2, "metadata.key.key_ordinal")?
+    term_ordinal := postgres_required_i64(reference, row, 3, "metadata.key.term_ordinal")?
+    if key_ordinal < 0 || term_ordinal < 0 {
+      postgres_finish(cursor)
+      return Err(postgres_cursor_shape("metadata.key.ordinal"))
+    }
+    local_column := postgres_text(reference, row, 4, out, "metadata.key.local_column")?
+    referenced_schema := postgres_text(reference, row, 5, out, "metadata.key.referenced_schema")?
+    referenced_table := postgres_text(reference, row, 6, out, "metadata.key.referenced_table")?
+    referenced_column := postgres_text(reference, row, 7, out, "metadata.key.referenced_column")?
+    expression := postgres_text(reference, row, 8, out, "metadata.key.expression")?
+    match_text := postgres_text(reference, row, 9, out, "metadata.key.match_policy")?
+    update_text := postgres_text(reference, row, 10, out, "metadata.key.on_update")?
+    delete_text := postgres_text(reference, row, 11, out, "metadata.key.on_delete")?
+    deferrable_tag := if unsafe { PQgetisnull(postgres_cursor_native(reference), row, 12) != 0 } {
+      -1
+    } else { postgres_required_i64(reference, row, 12, "metadata.key.deferrable")? }
+    deferred_tag := if unsafe { PQgetisnull(postgres_cursor_native(reference), row, 13) != 0 } {
+      -1
+    } else { postgres_required_i64(reference, row, 13, "metadata.key.initially_deferred")? }
+    validated_tag := if unsafe { PQgetisnull(postgres_cursor_native(reference), row, 14) != 0 } {
+      -1
+    } else { postgres_required_i64(reference, row, 14, "metadata.key.validated")? }
+    if deferrable_tag < -1 || deferrable_tag > 1 || deferred_tag < -1 || deferred_tag > 1
+      || validated_tag < -1 || validated_tag > 1 {
+      postgres_finish(cursor)
+      return Err(postgres_cursor_shape("metadata.key.policy"))
+    }
+    same_group := previous_key_ordinal == key_ordinal
+    if previous_key_ordinal < 0 {
+      if key_ordinal != 0 || term_ordinal != 0 {
+        postgres_finish(cursor)
+        return Err(postgres_cursor_shape("metadata.key.order"))
+      }
+    } else {
+      if same_group {
+        if term_ordinal <= previous_term_ordinal
+          || term_ordinal - previous_term_ordinal != 1
+          || kind_tag != previous_kind_tag
+          || !optional_text_equal(name, previous_name)
+          || !optional_text_equal(expression, previous_expression)
+          || !optional_text_equal(match_text, previous_match)
+          || !optional_text_equal(update_text, previous_update)
+          || !optional_text_equal(delete_text, previous_delete)
+          || deferrable_tag != previous_deferrable
+          || deferred_tag != previous_deferred
+          || validated_tag != previous_validated {
+          postgres_finish(cursor)
+          return Err(postgres_cursor_shape("metadata.key.group"))
+        }
+      } else {
+        if key_ordinal <= previous_key_ordinal
+          || key_ordinal - previous_key_ordinal != 1 || term_ordinal != 0 {
+          postgres_finish(cursor)
+          return Err(postgres_cursor_shape("metadata.key.order"))
+        }
+      }
+    }
+    if !same_group {
+      previous_kind_tag = kind_tag
+      previous_name = name
+      previous_expression = expression
+      previous_match = match_text
+      previous_update = update_text
+      previous_delete = delete_text
+      previous_deferrable = deferrable_tag
+      previous_deferred = deferred_tag
+      previous_validated = validated_tag
+    }
+    previous_key_ordinal = key_ordinal
+    previous_term_ordinal = term_ordinal
+    mut local_projection: Option<str> := None
+    mut schema_projection: Option<str> := None
+    mut table_projection: Option<str> := None
+    mut column_projection: Option<str> := None
+    mut expression_projection: Option<str> := None
+    mut match_projection: Option<MetaForeignKeyMatch> := None
+    mut update_projection: Option<MetaReferentialAction> := None
+    mut delete_projection: Option<MetaReferentialAction> := None
+    mut deferrable_projection: Option<bool> := None
+    mut deferred_projection: Option<bool> := None
+    mut validated_projection: Option<bool> := None
+    if detail_has_summary(detail) {
+      local_projection = local_column
+      schema_projection = referenced_schema
+      table_projection = referenced_table
+      column_projection = referenced_column
+      expression_projection = expression
+    }
+    if detail_is_full(detail) {
+      match_projection = sqlite_match_policy(match_text)?
+      update_projection = sqlite_referential_action(update_text, "metadata.key.on_update")?
+      delete_projection = sqlite_referential_action(delete_text, "metadata.key.on_delete")?
+      if deferrable_tag >= 0 { deferrable_projection = Some(deferrable_tag != 0) }
+      if deferred_tag >= 0 { deferred_projection = Some(deferred_tag != 0) }
+      if validated_tag >= 0 { validated_projection = Some(validated_tag != 0) }
+    }
+    rows.push(KeyMeta {
+      schema: table_ref.schema.clone_in(out),
+      table: table_ref.name.clone_in(out),
+      name: name,
+      kind: postgres_key_kind(kind_tag)?,
+      key_ordinal: key_ordinal,
+      term_ordinal: term_ordinal,
+      local_column: local_projection,
+      referenced_schema: schema_projection,
+      referenced_table: table_projection,
+      referenced_column: column_projection,
+      expression: expression_projection,
+      match_policy: match_projection,
+      on_update: update_projection,
+      on_delete: delete_projection,
+      deferrable: deferrable_projection,
+      initially_deferred: deferred_projection,
+      validated: validated_projection,
+    })
+    row = row + 1
+  }
+  postgres_finish(cursor)
+  return Ok(rows.build())
+}
+
+fn postgres_meta_indexes_configured(
+  target: exec,
+  table_ref: TableRef,
+  detail: MetaDetail,
+  out: region,
+  include_system: bool,
+) -> Result<array<IndexMeta>, Error> {
+  catalog_driver_valid(
+    target, 2, "PostgreSQL metadata requires a PostgreSQL connection",
+  )?
+  if !postgres_table_allowed(table_ref, include_system) {
+    rows: array_builder<IndexMeta> := array_builder(out)
+    return Ok(rows.build())
+  }
+  sql := "SELECT idx.relname, CASE WHEN i.indisunique THEN 1 ELSE 0 END, CASE WHEN i.indisprimary THEN 1 ELSE 0 END, term.n - 1, CASE WHEN term.n <= i.indnkeyatts THEN 1 ELSE 0 END, att.attname, CASE WHEN i.indkey[term.n - 1] = 0 THEN pg_catalog.pg_get_indexdef(i.indexrelid, term.n, true) ELSE NULL END, pg_catalog.pg_get_expr(i.indpred, i.indrelid), am.amname, opc.opcname, CASE WHEN term.n <= i.indnkeyatts AND (i.indoption[term.n - 1] & 1) <> 0 THEN 1 ELSE 0 END, CASE WHEN term.n <= i.indnkeyatts AND (i.indoption[term.n - 1] & 2) <> 0 THEN 1 ELSE 0 END, CASE WHEN i.indisvalid THEN 1 ELSE 0 END, CASE WHEN i.indisready THEN 1 ELSE 0 END FROM pg_catalog.pg_index AS i JOIN pg_catalog.pg_class AS tbl ON tbl.oid = i.indrelid JOIN pg_catalog.pg_namespace AS n ON n.oid = tbl.relnamespace JOIN pg_catalog.pg_class AS idx ON idx.oid = i.indexrelid JOIN pg_catalog.pg_am AS am ON am.oid = idx.relam CROSS JOIN LATERAL generate_series(1, i.indnatts) AS term(n) LEFT JOIN pg_catalog.pg_attribute AS att ON att.attrelid = i.indrelid AND att.attnum = i.indkey[term.n - 1] LEFT JOIN pg_catalog.pg_opclass AS opc ON opc.oid = i.indclass[term.n - 1] WHERE n.nspname = $1 AND tbl.relname = $2 ORDER BY idx.relname COLLATE \"C\", term.n"
+  cursor := postgres_open_cursor(target, sql, Some(table_ref.schema), Some(table_ref.name))?
+  reference := resource.borrow(cursor)
+  count := postgres_result_shape(reference, 14, "metadata.indexes")?
+  mut rows: array_builder<IndexMeta> := array_builder(out)
+  mut row: i32 := 0
+  mut previous_name: Option<str> := None
+  mut previous_ordinal: i64 := -1
+  mut previous_unique: i64 := -1
+  mut previous_primary: i64 := -1
+  mut previous_predicate: Option<str> := None
+  mut previous_method: Option<str> := None
+  mut previous_valid: i64 := -1
+  mut previous_ready: i64 := -1
+  mut previous_included := false
+  loop {
+    if row >= count { break }
+    name := postgres_required_text(reference, row, 0, out, "metadata.index.name")?
+    unique_tag := postgres_required_i64(reference, row, 1, "metadata.index.unique")?
+    primary_tag := postgres_required_i64(reference, row, 2, "metadata.index.primary")?
+    ordinal := postgres_required_i64(reference, row, 3, "metadata.index.term_ordinal")?
+    key_tag := postgres_required_i64(reference, row, 4, "metadata.index.term_kind")?
+    column := postgres_text(reference, row, 5, out, "metadata.index.column")?
+    expression := postgres_text(reference, row, 6, out, "metadata.index.expression")?
+    predicate := postgres_text(reference, row, 7, out, "metadata.index.predicate")?
+    method := postgres_text(reference, row, 8, out, "metadata.index.method")?
+    opclass := postgres_text(reference, row, 9, out, "metadata.index.opclass")?
+    descending := postgres_required_i64(reference, row, 10, "metadata.index.sort_order")?
+    nulls_first := postgres_required_i64(reference, row, 11, "metadata.index.null_order")?
+    valid_tag := postgres_required_i64(reference, row, 12, "metadata.index.valid")?
+    ready_tag := postgres_required_i64(reference, row, 13, "metadata.index.ready")?
+    if ordinal < 0 || (unique_tag != 0 && unique_tag != 1)
+      || (primary_tag != 0 && primary_tag != 1) || (key_tag != 0 && key_tag != 1)
+      || (descending != 0 && descending != 1) || (nulls_first != 0 && nulls_first != 1)
+      || (valid_tag != 0 && valid_tag != 1) || (ready_tag != 0 && ready_tag != 1) {
+      postgres_finish(cursor)
+      return Err(postgres_cursor_shape("metadata.index"))
+    }
+    same_index := match previous_name {
+      Some(prior_name) => prior_name == name
+      None => false
+    }
+    match previous_name {
+      None => {
+        if ordinal != 0 {
+          postgres_finish(cursor)
+          return Err(postgres_cursor_shape("metadata.index.order"))
+        }
+      }
+      Some(prior_name) => {
+        if same_index {
+          if ordinal <= previous_ordinal || ordinal - previous_ordinal != 1
+            || unique_tag != previous_unique || primary_tag != previous_primary
+            || !optional_text_equal(predicate, previous_predicate)
+            || !optional_text_equal(method, previous_method)
+            || valid_tag != previous_valid || ready_tag != previous_ready
+            || (previous_included && key_tag != 0) {
+            postgres_finish(cursor)
+            return Err(postgres_cursor_shape("metadata.index.group"))
+          }
+        } else {
+          if name < prior_name || name == prior_name || ordinal != 0 {
+            postgres_finish(cursor)
+            return Err(postgres_cursor_shape("metadata.index.order"))
+          }
+        }
+      }
+    }
+    if !same_index {
+      previous_name = Some(name)
+      previous_unique = unique_tag
+      previous_primary = primary_tag
+      previous_predicate = predicate
+      previous_method = method
+      previous_valid = valid_tag
+      previous_ready = ready_tag
+      previous_included = false
+    }
+    if key_tag == 0 { previous_included = true }
+    previous_ordinal = ordinal
+    mut unique_projection: Option<bool> := None
+    mut primary_projection: Option<bool> := None
+    mut column_projection: Option<str> := None
+    mut expression_projection: Option<str> := None
+    mut predicate_projection: Option<str> := None
+    mut sort_projection: Option<MetaSortOrder> := None
+    mut null_projection: Option<MetaNullOrder> := None
+    mut method_projection: Option<str> := None
+    mut opclass_projection: Option<str> := None
+    mut valid_projection: Option<bool> := None
+    mut ready_projection: Option<bool> := None
+    if detail_has_summary(detail) {
+      unique_projection = Some(unique_tag != 0)
+      primary_projection = Some(primary_tag != 0)
+      column_projection = column
+      expression_projection = expression
+      predicate_projection = predicate
+      btree_sort := match method {
+        Some(native_method) => native_method == "btree"
+        None => false
+      }
+      if key_tag != 0 && btree_sort {
+        sort_projection = if descending == 0 {
+          Some(MetaSortOrder.Asc)
+        } else { Some(MetaSortOrder.Desc) }
+        null_projection = if nulls_first == 0 {
+          Some(MetaNullOrder.Last)
+        } else { Some(MetaNullOrder.First) }
+      }
+    }
+    if detail_is_full(detail) {
+      method_projection = method
+      opclass_projection = opclass
+      valid_projection = Some(valid_tag != 0)
+      ready_projection = Some(ready_tag != 0)
+    }
+    rows.push(IndexMeta {
+      schema: table_ref.schema.clone_in(out),
+      table: table_ref.name.clone_in(out),
+      name: name,
+      unique: unique_projection,
+      primary_backed: primary_projection,
+      term_ordinal: ordinal,
+      term_kind: if key_tag == 0 { MetaIndexTermKind.Included } else { MetaIndexTermKind.Key },
+      column: column_projection,
+      expression: expression_projection,
+      predicate: predicate_projection,
+      native_method: method_projection,
+      native_opclass: opclass_projection,
+      sort_order: sort_projection,
+      null_order: null_projection,
+      valid: valid_projection,
+      ready: ready_projection,
+    })
+    row = row + 1
+  }
+  postgres_finish(cursor)
+  return Ok(rows.build())
+}
+
+// Driver-qualified metadata entry points validate their public option phases in the driver module,
+// then enter these package-owned catalog implementations with a sealed `pkg.db.internal` control.
+// Consumer modules cannot import or construct that control, so these cross-module adapters do not
+// expose a raw-boolean path around the supported `meta_*` option surface.
+pub fn catalog_sqlite_schemas(
+  target: exec,
+  detail: MetaDetail,
+  out: region,
+  controls: pkg.db.internal.SqliteCatalogControls,
+) -> Result<array<SchemaMeta>, Error> {
+  catalog_driver_valid(target, 1, "SQLite metadata requires a SQLite connection")?
+  return sqlite_meta_schemas(target, detail, out, controls.include_system)
+}
+
+pub fn catalog_sqlite_tables(
+  target: exec,
+  schema_filter: Option<SchemaRef>,
+  detail: MetaDetail,
+  out: region,
+  controls: pkg.db.internal.SqliteCatalogControls,
+) -> Result<array<TableMeta>, Error> {
+  match schema_filter { Some(reference) => { metadata_schema_valid(reference)? } None => {} }
+  catalog_driver_valid(target, 1, "SQLite metadata requires a SQLite connection")?
+  return sqlite_meta_tables(
+    target,
+    schema_filter,
+    detail,
+    out,
+    controls.include_system,
+    controls.include_system || controls.include_internal,
+  )
+}
+
+pub fn catalog_sqlite_table(
+  target: exec,
+  table_ref: TableRef,
+  detail: MetaDetail,
+  out: region,
+  controls: pkg.db.internal.SqliteCatalogControls,
+) -> Result<TableMeta, Error> {
+  metadata_table_valid(table_ref)?
+  return sqlite_meta_table(
+    target,
+    table_ref,
+    detail,
+    out,
+    controls.include_system,
+    controls.include_system || controls.include_internal,
+  )
+}
+
+pub fn catalog_sqlite_columns(
+  target: exec,
+  table_ref: TableRef,
+  detail: MetaDetail,
+  out: region,
+  controls: pkg.db.internal.SqliteCatalogControls,
+) -> Result<array<ColumnMeta>, Error> {
+  metadata_table_valid(table_ref)?
+  return sqlite_meta_columns_configured(
+    target,
+    table_ref,
+    detail,
+    out,
+    controls.include_system,
+    controls.include_system || controls.include_internal,
+    controls.include_hidden,
+  )
+}
+
+pub fn catalog_sqlite_keys(
+  target: exec,
+  table_ref: TableRef,
+  detail: MetaDetail,
+  out: region,
+  controls: pkg.db.internal.SqliteCatalogControls,
+) -> Result<array<KeyMeta>, Error> {
+  metadata_table_valid(table_ref)?
+  return sqlite_meta_keys_configured(
+    target,
+    table_ref,
+    detail,
+    out,
+    controls.include_system,
+    controls.include_system || controls.include_internal,
+  )
+}
+
+pub fn catalog_sqlite_indexes(
+  target: exec,
+  table_ref: TableRef,
+  detail: MetaDetail,
+  out: region,
+  controls: pkg.db.internal.SqliteCatalogControls,
+) -> Result<array<IndexMeta>, Error> {
+  metadata_table_valid(table_ref)?
+  return sqlite_meta_indexes_configured(
+    target,
+    table_ref,
+    detail,
+    out,
+    controls.include_system,
+    controls.include_system || controls.include_internal,
+  )
+}
+
+pub fn catalog_postgres_schemas(
+  target: exec,
+  detail: MetaDetail,
+  out: region,
+  controls: pkg.db.internal.PostgresCatalogControls,
+) -> Result<array<SchemaMeta>, Error> {
+  catalog_driver_valid(target, 2, "PostgreSQL metadata requires a PostgreSQL connection")?
+  return postgres_meta_schemas_configured(
+    target, detail, out, controls.include_system, controls.search_path_only,
+  )
+}
+
+pub fn catalog_postgres_tables(
+  target: exec,
+  schema_filter: Option<SchemaRef>,
+  detail: MetaDetail,
+  out: region,
+  controls: pkg.db.internal.PostgresCatalogControls,
+) -> Result<array<TableMeta>, Error> {
+  match schema_filter { Some(reference) => { metadata_schema_valid(reference)? } None => {} }
+  catalog_driver_valid(target, 2, "PostgreSQL metadata requires a PostgreSQL connection")?
+  return postgres_meta_tables_configured(
+    target,
+    schema_filter,
+    detail,
+    out,
+    controls.include_system,
+    controls.search_path_only,
+  )
+}
+
+pub fn catalog_postgres_table(
+  target: exec,
+  table_ref: TableRef,
+  detail: MetaDetail,
+  out: region,
+  controls: pkg.db.internal.PostgresCatalogControls,
+) -> Result<TableMeta, Error> {
+  metadata_table_valid(table_ref)?
+  catalog_driver_valid(target, 2, "PostgreSQL metadata requires a PostgreSQL connection")?
+  return postgres_meta_table_configured(
+    target, table_ref, detail, out, controls.include_system,
+  )
+}
+
+pub fn catalog_postgres_columns(
+  target: exec,
+  table_ref: TableRef,
+  detail: MetaDetail,
+  out: region,
+  controls: pkg.db.internal.PostgresCatalogControls,
+) -> Result<array<ColumnMeta>, Error> {
+  metadata_table_valid(table_ref)?
+  return postgres_meta_columns_configured(
+    target, table_ref, detail, out, controls.include_system,
+  )
+}
+
+pub fn catalog_postgres_keys(
+  target: exec,
+  table_ref: TableRef,
+  detail: MetaDetail,
+  out: region,
+  controls: pkg.db.internal.PostgresCatalogControls,
+) -> Result<array<KeyMeta>, Error> {
+  metadata_table_valid(table_ref)?
+  return postgres_meta_keys_configured(target, table_ref, detail, out, controls.include_system)
+}
+
+pub fn catalog_postgres_indexes(
+  target: exec,
+  table_ref: TableRef,
+  detail: MetaDetail,
+  out: region,
+  controls: pkg.db.internal.PostgresCatalogControls,
+) -> Result<array<IndexMeta>, Error> {
+  metadata_table_valid(table_ref)?
+  return postgres_meta_indexes_configured(
+    target, table_ref, detail, out, controls.include_system,
+  )
+}
+
+pub fn meta_database(
+  target: exec,
+  detail: MetaDetail,
+  out: region,
+  options: slice<MetaOption>,
+) -> Result<DatabaseMeta, Error> {
+  controls := metadata_controls(options)?
+  driver := driver_tag(target)
+  if driver == 1 { return sqlite_meta_database(target, detail, out) }
+  if driver == 2 { return postgres_meta_database(target, detail, out) }
+  return Err(queryless_contract("db.meta.exec", "database metadata requires a live connection"))
+}
+
+pub fn meta_schemas(
+  target: exec,
+  detail: MetaDetail,
+  out: region,
+  options: slice<MetaOption>,
+) -> Result<array<SchemaMeta>, Error> {
+  controls := metadata_controls(options)?
+  driver := driver_tag(target)
+  if driver == 1 { return sqlite_meta_schemas(target, detail, out, controls.include_system) }
+  if driver == 2 {
+    return postgres_meta_schemas_configured(
+      target, detail, out, controls.include_system, false,
+    )
+  }
+  return Err(queryless_contract("db.meta.exec", "database metadata requires a live connection"))
+}
+
+pub fn meta_tables(
+  target: exec,
+  schema_filter: Option<SchemaRef>,
+  detail: MetaDetail,
+  out: region,
+  options: slice<MetaOption>,
+) -> Result<array<TableMeta>, Error> {
+  controls := metadata_controls(options)?
+  match schema_filter {
+    Some(reference) => { metadata_schema_valid(reference)? }
+    None => {}
+  }
+  driver := driver_tag(target)
+  if driver == 1 {
+    return sqlite_meta_tables(
+      target,
+      schema_filter,
+      detail,
+      out,
+      controls.include_system,
+      controls.include_system,
+    )
+  }
+  if driver == 2 {
+    return postgres_meta_tables_configured(
+      target, schema_filter, detail, out, controls.include_system, false,
+    )
+  }
+  return Err(queryless_contract("db.meta.exec", "database metadata requires a live connection"))
+}
+
+pub fn meta_table(
+  target: exec,
+  table_ref: TableRef,
+  detail: MetaDetail,
+  out: region,
+  options: slice<MetaOption>,
+) -> Result<TableMeta, Error> {
+  controls := metadata_controls(options)?
+  metadata_table_valid(table_ref)?
+  driver := driver_tag(target)
+  if driver == 1 {
+    return sqlite_meta_table(
+      target, table_ref, detail, out, controls.include_system, controls.include_system,
+    )
+  }
+  if driver == 2 {
+    return postgres_meta_table_configured(
+      target, table_ref, detail, out, controls.include_system,
+    )
+  }
+  return Err(queryless_contract("db.meta.exec", "database metadata requires a live connection"))
+}
+
+pub fn meta_columns(
+  target: exec,
+  table_ref: TableRef,
+  detail: MetaDetail,
+  out: region,
+  options: slice<MetaOption>,
+) -> Result<array<ColumnMeta>, Error> {
+  controls := metadata_controls(options)?
+  metadata_table_valid(table_ref)?
+  driver := driver_tag(target)
+  if driver == 1 {
+    return sqlite_meta_columns_configured(
+      target,
+      table_ref,
+      detail,
+      out,
+      controls.include_system,
+      controls.include_system,
+      false,
+    )
+  }
+  if driver == 2 {
+    return postgres_meta_columns_configured(
+      target, table_ref, detail, out, controls.include_system,
+    )
+  }
+  return Err(queryless_contract("db.meta.exec", "database metadata requires a live connection"))
+}
+
+pub fn meta_keys(
+  target: exec,
+  table_ref: TableRef,
+  detail: MetaDetail,
+  out: region,
+  options: slice<MetaOption>,
+) -> Result<array<KeyMeta>, Error> {
+  controls := metadata_controls(options)?
+  metadata_table_valid(table_ref)?
+  driver := driver_tag(target)
+  if driver == 1 {
+    return sqlite_meta_keys_configured(
+      target,
+      table_ref,
+      detail,
+      out,
+      controls.include_system,
+      controls.include_system,
+    )
+  }
+  if driver == 2 {
+    return postgres_meta_keys_configured(
+      target, table_ref, detail, out, controls.include_system,
+    )
+  }
+  return Err(queryless_contract("db.meta.exec", "database metadata requires a live connection"))
+}
+
+pub fn meta_indexes(
+  target: exec,
+  table_ref: TableRef,
+  detail: MetaDetail,
+  out: region,
+  options: slice<MetaOption>,
+) -> Result<array<IndexMeta>, Error> {
+  controls := metadata_controls(options)?
+  metadata_table_valid(table_ref)?
+  driver := driver_tag(target)
+  if driver == 1 {
+    return sqlite_meta_indexes_configured(
+      target,
+      table_ref,
+      detail,
+      out,
+      controls.include_system,
+      controls.include_system,
+    )
+  }
+  if driver == 2 {
+    return postgres_meta_indexes_configured(
+      target, table_ref, detail, out, controls.include_system,
+    )
+  }
+  return Err(queryless_contract("db.meta.exec", "database metadata requires a live connection"))
 }
 
 pub fn meta_query<P, R>(
@@ -548,6 +2971,141 @@ pub fn meta_query<P, R>(
       }))
     }
     return Ok(rows.build())
+  }
+}
+
+pub fn explain<P, R>(
+  target: exec,
+  statement: query<P, R>,
+  params: P,
+  out: region,
+  options: slice<ExplainOption>,
+) -> Result<QueryPlan, Error> {
+  unsafe {
+    data := pkg.db.internal.descriptor.data(statement)
+    if data.is_null() {
+      return Err(Error.InvalidQuery(ContractError {
+        query_id: None,
+        item: "db.descriptor.header".clone(),
+        message: "invalid static database descriptor".clone(),
+      }))
+    }
+    version: u32 := raw.load(data, 0)
+    kind: u8 := raw.load(data, 4)
+    mask: u8 := raw.load(data, 5)
+    reserved: u16 := raw.load(data, 6)
+    id_len: i64 := raw.load(data, 24)
+    sqlite_len: i64 := raw.load(data, 40)
+    postgres_len: i64 := raw.load(data, 56)
+    q1 := pkg.db.internal.descriptor.q1_plan(statement)
+    id := pkg.db.internal.descriptor.descriptor_id_pointer(statement)
+    sqlite_sql := pkg.db.internal.descriptor.sqlite_sql_pointer(statement)
+    postgres_sql := pkg.db.internal.descriptor.postgres_sql_pointer(statement)
+    binder := pkg.db.internal.descriptor.binder(statement)
+    validate_static := pkg.db.internal.descriptor.static_validator(statement)
+    validate_row := pkg.db.internal.descriptor.row_validator(statement)
+    decode := pkg.db.internal.descriptor.decoder(statement)
+    materializer := pkg.db.internal.descriptor.meta_materializer(statement)
+    base_valid := version == 2 && kind == 0 && reserved == 0 && !q1.is_null()
+      && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
+      && !validate_row.is_null() && !decode.is_null() && !materializer.is_null()
+    sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
+      && postgres_sql.is_null() && postgres_len == 0
+    postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0
+      && !postgres_sql.is_null() && postgres_len > 0
+    portable := mask == 3 && !sqlite_sql.is_null() && sqlite_len > 0
+      && !postgres_sql.is_null() && postgres_len > 0
+    if !(base_valid && (sqlite_only || postgres_only || portable)) {
+      return Err(Error.InvalidQuery(ContractError {
+        query_id: None,
+        item: "db.descriptor.header".clone(),
+        message: "invalid static database descriptor".clone(),
+      }))
+    }
+    query_id := pkg.db.internal.descriptor.descriptor_id(statement)
+    mut saw_timeout := false
+    mut option_index := 0
+    loop {
+      if option_index >= options.len() { break }
+      match options[option_index] {
+        TimeoutNs(ns) => {
+          if ns <= 0 {
+            return Err(Error.Unsupported(ContractError {
+              query_id: Some(query_id.clone()),
+              item: "db.explain.timeout_ns".clone(),
+              message: "database EXPLAIN timeout must be positive".clone(),
+            }))
+          }
+          if saw_timeout {
+            return Err(Error.Unsupported(ContractError {
+              query_id: Some(query_id.clone()),
+              item: "db.explain.timeout_ns".clone(),
+              message: "duplicate database EXPLAIN timeout".clone(),
+            }))
+          }
+          saw_timeout = true
+        }
+      }
+      option_index = option_index + 1
+    }
+    if saw_timeout {
+      return Err(Error.Unsupported(ContractError {
+        query_id: Some(query_id.clone()),
+        item: "db.explain.timeout_ns".clone(),
+        message: "database EXPLAIN deadlines are not available in this milestone".clone(),
+      }))
+    }
+    driver := driver_tag(target)
+    if driver == 1 && mask & 1 == 0 {
+      return Err(Error.DriverMismatch(ContractError {
+        query_id: Some(query_id.clone()),
+        item: "db.descriptor.driver".clone(),
+        message: "static database descriptor does not support SQLite".clone(),
+      }))
+    }
+    if driver == 2 && mask & 2 == 0 {
+      return Err(Error.DriverMismatch(ContractError {
+        query_id: Some(query_id.clone()),
+        item: "db.descriptor.driver".clone(),
+        message: "static database descriptor does not support PostgreSQL".clone(),
+      }))
+    }
+    state := match target {
+      Conn(reference) => resource.raw(reference)
+      Tx(reference) => resource.raw(reference)
+    }
+    mut live_exec := false
+    if !state.is_null() {
+      state_version: u32 := raw.load(state, 0)
+      state_driver: u8 := raw.load(state, 4)
+      state_closed: u8 := raw.load(state, 5)
+      state_reserved: u16 := raw.load(state, 6)
+      state_native: raw := raw.load(state, 8)
+      live_exec = state_version == 1 && state_driver == driver && state_closed == 0
+        && state_reserved == 0 && !state_native.is_null()
+    }
+    if !live_exec {
+      return Err(Error.Unsupported(ContractError {
+        query_id: Some(query_id.clone()),
+        item: "db.explain.exec".clone(),
+        message: "database EXPLAIN requires a live execution target".clone(),
+      }))
+    }
+    if driver == 1 {
+      return pkg.db.internal.descriptor.explain_sqlite(
+        statement, target, params, out, query_id,
+      )
+    }
+    if driver == 2 {
+      return pkg.db.internal.descriptor.explain_postgres(
+        statement, target, params, out, query_id,
+      )
+    }
+    return Err(Error.Unsupported(ContractError {
+      query_id: Some(query_id.clone()),
+      item: "db.explain.exec".clone(),
+      message: "database EXPLAIN requires a live execution target".clone(),
+    }))
   }
 }
 
