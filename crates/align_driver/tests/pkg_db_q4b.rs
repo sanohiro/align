@@ -2,15 +2,22 @@
 
 mod common;
 use common::*;
+use std::sync::LazyLock;
 
-const DB: &str = include_str!("../../../apps/db/pkg/db.align");
-const SQLITE: &str = include_str!("../../../apps/db/pkg/db/sqlite.align");
-const POSTGRES: &str = include_str!("../../../apps/db/pkg/db/postgres.align");
-const INTERNAL: &str = include_str!("../../../apps/db/pkg/db/internal.align");
-const RESOURCE: &str = include_str!("../../../apps/db/pkg/db/internal/resource.align");
-const DESCRIPTOR: &str = include_str!("../../../apps/db/pkg/db/internal/descriptor.align");
-const INTERNAL_SQLITE: &str = include_str!("../../../apps/db/pkg/db/internal/sqlite.align");
-const INTERNAL_POSTGRES: &str = include_str!("../../../apps/db/pkg/db/internal/postgres.align");
+// The pkg.db package sources are read at RUNTIME (common::fixture), not `include_str!`d, so editing
+// a `.align` file no longer rebuilds+relinks this test crate. See common/mod.rs for the rationale.
+static DB: LazyLock<&str> = LazyLock::new(|| fixture("apps/db/pkg/db.align"));
+static SQLITE: LazyLock<&str> = LazyLock::new(|| fixture("apps/db/pkg/db/sqlite.align"));
+static POSTGRES: LazyLock<&str> = LazyLock::new(|| fixture("apps/db/pkg/db/postgres.align"));
+static INTERNAL: LazyLock<&str> = LazyLock::new(|| fixture("apps/db/pkg/db/internal.align"));
+static RESOURCE: LazyLock<&str> = LazyLock::new(|| fixture("apps/db/pkg/db/internal/resource.align"));
+static DESCRIPTOR: LazyLock<&str> =
+    LazyLock::new(|| fixture("apps/db/pkg/db/internal/descriptor.align"));
+static INTERNAL_SQLITE: LazyLock<&str> =
+    LazyLock::new(|| fixture("apps/db/pkg/db/internal/sqlite.align"));
+static INTERNAL_POSTGRES: LazyLock<&str> =
+    LazyLock::new(|| fixture("apps/db/pkg/db/internal/postgres.align"));
+// C stubs change rarely; keeping them baked costs nothing on `.align` edits.
 const POSTGRES_STUB: &str = include_str!("fixtures/pkg_db_q2_postgres_stub.c");
 const SQLITE_STUB: &str = include_str!("fixtures/pkg_db_q4a_sqlite_stub.c");
 
@@ -285,14 +292,14 @@ pub fn malformed_postgres() -> pkg.db.query<DeadlineParams, DeadlineRow> = pkg.d
 
 fn package_files(main: &str) -> Vec<(&'static str, &str)> {
     vec![
-        ("pkg/db.align", DB),
-        ("pkg/db/sqlite.align", SQLITE),
-        ("pkg/db/postgres.align", POSTGRES),
-        ("pkg/db/internal.align", INTERNAL),
-        ("pkg/db/internal/resource.align", RESOURCE),
-        ("pkg/db/internal/descriptor.align", DESCRIPTOR),
-        ("pkg/db/internal/sqlite.align", INTERNAL_SQLITE),
-        ("pkg/db/internal/postgres.align", INTERNAL_POSTGRES),
+        ("pkg/db.align", *DB),
+        ("pkg/db/sqlite.align", *SQLITE),
+        ("pkg/db/postgres.align", *POSTGRES),
+        ("pkg/db/internal.align", *INTERNAL),
+        ("pkg/db/internal/resource.align", *RESOURCE),
+        ("pkg/db/internal/descriptor.align", *DESCRIPTOR),
+        ("pkg/db/internal/sqlite.align", *INTERNAL_SQLITE),
+        ("pkg/db/internal/postgres.align", *INTERNAL_POSTGRES),
         ("app/q4b_query.align", QUERY),
         ("main.align", main),
     ]
@@ -403,14 +410,14 @@ fn postgres_parameter_type_must_match_the_params_field_shape() {
     );
     let main = "module main\nimport app.q4b_query\nfn main() -> i32 = 0\n";
     let files = [
-        ("pkg/db.align", DB),
-        ("pkg/db/sqlite.align", SQLITE),
-        ("pkg/db/postgres.align", POSTGRES),
-        ("pkg/db/internal.align", INTERNAL),
-        ("pkg/db/internal/resource.align", RESOURCE),
-        ("pkg/db/internal/descriptor.align", DESCRIPTOR),
-        ("pkg/db/internal/sqlite.align", INTERNAL_SQLITE),
-        ("pkg/db/internal/postgres.align", INTERNAL_POSTGRES),
+        ("pkg/db.align", *DB),
+        ("pkg/db/sqlite.align", *SQLITE),
+        ("pkg/db/postgres.align", *POSTGRES),
+        ("pkg/db/internal.align", *INTERNAL),
+        ("pkg/db/internal/resource.align", *RESOURCE),
+        ("pkg/db/internal/descriptor.align", *DESCRIPTOR),
+        ("pkg/db/internal/sqlite.align", *INTERNAL_SQLITE),
+        ("pkg/db/internal/postgres.align", *INTERNAL_POSTGRES),
         ("app/q4b_query.align", mismatched_query.as_str()),
         ("main.align", main),
     ];

@@ -1163,3 +1163,17 @@ impl ThinBuilt {
         String::from_utf8_lossy(&Command::new(&exe).output().expect("run").stdout).into_owned()
     }
 }
+
+/// Read a repository fixture (typically a `.align` package source) at RUNTIME and leak it to
+/// `'static` so `&str` call sites are unchanged. `rel` is relative to the repo root.
+///
+/// Prefer this over `include_str!` for any source a test compiles through `alignc`: baking a large
+/// package into the test binary makes cargo treat every `.align` edit as a Rust source change and
+/// rebuild+relink the whole test crate, even though only Align data — checked by the test, not
+/// compiled into it — changed. Reading at run time decouples the two (measured ~6× faster
+/// edit→result on pkg.db). `scripts/lint-ratchet.sh` guards against new `include_str!` of `.align`.
+pub fn fixture(rel: &str) -> &'static str {
+    let path = format!("{}/../../{rel}", env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read fixture {rel}: {e}"));
+    Box::leak(text.into_boxed_str())
+}
