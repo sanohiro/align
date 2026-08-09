@@ -4094,6 +4094,43 @@ the coherent fix commit.
 
 Compound Query support is part of the first product contract, not a later ORM enhancement.
 
+#### Q6/D10 implementation closure matrix
+
+Q6 publishes no new database or compiler primitive. It closes the already-reviewed compound
+contract by composing the shipped typed stream, exclusive borrow, region, builder, and `clone_in`
+surfaces in ordinary Query-local Align code. The transaction/master projection and User + Groups
+examples land together because they are the two required compound consumers and share one proof of
+visible execution, Pure shaping, row-view retention, and explicit destination allocation.
+This capability may exceed roughly 1,000 hand-written lines because the first consumer exposed one
+missing analysis-local proof at the L2e/L6 seam: the compiler currently assumes that every
+view-bearing argument may be retained by every `borrow mut` destination. Splitting that proof from
+its compound consumer would publish a dormant compiler relaxation without the only end-to-end owner,
+while splitting the two examples would duplicate the same provenance, execution, and builder matrix.
+
+| Closure cell | Required implementation closure | Exact owner evidence |
+|---|---|---|
+| exact Query-local surface | Add one transaction/master projection and one User + Groups Query module. Each module exposes its flat `Params`/`Row`, logical output records, one static Query constructor, a Pure `step`, and an Impure `run(exec, params, out)` built only from the existing public `rows`/`next` surface. Add no `db.fold`, relationship, lazy-load, iterator, hidden materializer, or package-private execution path. | `pkg_db_q6::compound_query_modules_are_exact_and_typecheck_whole_and_per_unit` plus explicit absence/source-shape assertions |
+| exact mutable-retention proof | For same-program direct calls only, infer a least-fixed-point relation from each `borrow mut` destination to the exact parameter roots actually stored by whole-value/field/element replacement, builder push/append, and transitive direct calls. `clone_in(out)` therefore retains `out`, not its source row generation. Keep imported, indirect, missing-body, malformed, and unresolved calls on the existing conservative all-view-argument fallback. Distinguish mutation of a builder or immutable-view aggregate place from mutation reachable through a slice/resource dependency, so sharing one allocation region does not imply storage alias while real nested mutable aliases still reject. Recompute this analysis-local fact during checked-HIR replay; add no HIR/interface/MIR/ABI field or runtime work. | `pkg_db_q6::borrow_mut_shaper_retention_is_exact_and_fail_closed` across direct/wrapped/recursive/control-flow stores, clone versus raw-row retention, same-region distinct places, nested slice/resource aliases, imported/indirect fallback, malformed indices, and whole/per-unit parity; cumulative L2e all-peer and L6 wrong-region owners |
+| Pure shaping boundary | Keep database handles and row advancement in `run`. A `step` receives only `borrow mut` state, zero or more separate `borrow mut` region builders, one current `Row`, and `out`; it remains inferred Pure while a same-shape step that calls database I/O is rejected in whole-program and per-unit checking. Builders never enter State fields or cross an ordinary by-value call. | `pkg_db_q6::shapers_are_pure_and_cannot_reach_database_io` and cumulative L2e/L6 effect and arena-call owners |
+| one-parent consistency and nullable child | On the first row, copy the parent name into `out`; on later rows, require identical parent ID and name before appending a child. Treat `(None,None)` as no child and reject both partial `(Some,None)` and `(None,Some)` shapes in the same deterministic field order. Zero rows returns `None`; every error exits through normal rows/builder cleanup. | `pkg_db_q6::user_groups_one_parent_matrix_is_exact` across zero/one/repeated/inconsistent/complete-null/both-partial inputs and both common driver dispatches |
+| segmented many-parent output | Consume only adjacent parent groups from SQL ordered by parent and child key. Build separate users, groups, and offsets arrays in `out`, starting offsets with zero and appending one final offset. Treat only `(None,None)` as an absent child; reject `(Some,None)` before `(None,Some)` in declared child-field order without appending a child or finalizing an incorrect offset. Reject a parent key that reappears after a later key and repeated-parent field disagreement; do not sort, hash, deduplicate, or create one child array per parent. | `pkg_db_q6::segmented_many_parent_output_is_adjacent_and_exact` with empty, empty-child, both partial-child directions and precedence, high-fanout, parent transition, disagreement, and non-adjacent-key cases |
+| transaction/master projection | Map each flat transaction plus status-master row to one nested region-owned output row in one pass. The same `run` executes through `exec_conn` and `exec_tx`; transaction ownership and commit/rollback stay at the caller and no relationship field can issue a follow-up read. | `pkg_db_q6::transaction_master_projection_runs_on_connection_and_transaction` with exact nested values, transaction lifecycle counters, and one execution per call |
+| ownership, allocation, and compilation parity | Clone each retained streamed text field exactly once into `out`, push every aggregate through a region builder, and build each final array inline in `run`. No heap array builder, reflection, row materialization, or generated extra Query enters the loop. Whole-program and per-unit compilation retain the same Query descriptors, steps, stream ownership, cleanup, and generic instantiations. | `pkg_db_q6::compound_shaping_uses_region_builders_and_exact_visible_copies`, MIR/LLVM call counts, whole/per-unit execution, and cumulative Q4b row-generation/Drop owners |
+| execution and scale closure | After successful stream formation, each `run` owns exactly one rows resource and completes exactly one native SQL execution, independent of row or fanout count. Validation or binding failures before send perform zero executions; a native-send failure attempts at most one execution, constructs no rows resource, and never retries. Pin row delivery, child push, parent push, text-copy, builder-build, rows-resource, execution-attempt, and completed-execution counts. Record a local high-fanout one-to-many measurement; timing is non-gating, while every count is correctness evidence. | all Q6 runtime owners, pre-send/send-failure counter owners, and ignored `pkg_db_q6::high_fanout_shaping_measurement_reports_one_execution` |
+
+Before candidate review, the author-side matrix-to-diff pass maps every row above to the Query-local
+source and one exact owner. A defect in parent consistency, nullable-child handling, adjacency,
+copy/allocation, execution count, or cleanup triggers the same root-cause audit across both compound
+examples, common driver dispatches, connection/transaction parents, and whole/per-unit compilation.
+
+The pre-implementation adversarial review closed these contract gaps before source work:
+
+| Finding | Contract closure |
+|---|---|
+| P1 exact direct retention conflicted with L6's all-argument rule | L2e and L6 now own the same analysis-local exact same-program relation and preserve the conservative fallback whenever a body cannot be proven. |
+| P2 segmented output omitted partial-child rows | The segmented owner covers both partial-NULL directions, their declared-field precedence, and no child/offset mutation on rejection. |
+| P2 one-execution wording included pre-stream failures | Successful stream formation owns one rows resource and one completed execution; pre-send and send-failure paths have separate zero/at-most-one attempt and no-retry counts. |
+
 ### D11 — SQL migrations
 
 - SQL migration discovery/order;
