@@ -13,7 +13,8 @@ cd "$(dirname "$0")/.."
 baseline_file="scripts/lint-ratchet-baseline.txt"
 
 # count CRATE KIND — occurrences outside pure comment lines. The patterns
-# deliberately match the align-self-review Gate greps.
+# approximate the align-self-review Gate 2/3 greps. grep -r emits
+# `path:content`, so the comment filter must skip past the filename prefix.
 count() {
   local dir="crates/$1/src" pattern n
   case "$2" in
@@ -21,7 +22,11 @@ count() {
     casts) pattern=' as usize| as u32| as i32' ;;
     *) echo "unknown ratchet kind: $2" >&2; exit 2 ;;
   esac
-  n=$(grep -rE "$pattern" "$dir" --include='*.rs' | grep -cv '^[[:space:]]*//') || n=0
+  [[ -d "$dir" ]] || {
+    echo "missing $dir (crate moved or renamed? fix the rows in scripts/lint-ratchet.sh)" >&2
+    exit 2
+  }
+  n=$(grep -rE "$pattern" "$dir" --include='*.rs' | grep -cv '^[^:]*:[[:space:]]*//') || n=0
   echo "$n"
 }
 
