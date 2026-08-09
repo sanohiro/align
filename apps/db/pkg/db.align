@@ -41,6 +41,7 @@ extern "C" link("pq") {
   fn PQerrorMessage(connection: raw) -> raw
   fn PQresultErrorField(result: raw, field: i32) -> raw
   fn PQexec(connection: raw, command: raw) -> raw
+  fn PQcmdStatus(result: raw) -> raw
   fn PQclear(result: raw)
 }
 
@@ -2839,6 +2840,7 @@ pub fn meta_query<P, R>(
     kind: u8 := raw.load(data, 4)
     mask: u8 := raw.load(data, 5)
     reserved: u16 := raw.load(data, 6)
+    tail_reserved: u32 := raw.load(data, 116)
     id_len: i64 := raw.load(data, 24)
     sqlite_len: i64 := raw.load(data, 40)
     postgres_len: i64 := raw.load(data, 56)
@@ -2852,7 +2854,8 @@ pub fn meta_query<P, R>(
     decode := pkg.db.internal.descriptor.decoder(statement)
     materializer := pkg.db.internal.descriptor.meta_materializer(statement)
     parameter_resolver := pkg.db.internal.descriptor.parameter_resolver(statement)
-    base_valid := version == 3 && kind == 0 && reserved == 0 && !q1.is_null()
+    base_valid := version == 3 && kind == 0 && reserved == 0 && tail_reserved == 0
+      && !q1.is_null()
       && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
       && !validate_row.is_null() && !decode.is_null() && !materializer.is_null()
       && !parameter_resolver.is_null()
@@ -3024,6 +3027,7 @@ pub fn explain<P, R>(
     kind: u8 := raw.load(data, 4)
     mask: u8 := raw.load(data, 5)
     reserved: u16 := raw.load(data, 6)
+    tail_reserved: u32 := raw.load(data, 116)
     id_len: i64 := raw.load(data, 24)
     sqlite_len: i64 := raw.load(data, 40)
     postgres_len: i64 := raw.load(data, 56)
@@ -3037,7 +3041,8 @@ pub fn explain<P, R>(
     decode := pkg.db.internal.descriptor.decoder(statement)
     materializer := pkg.db.internal.descriptor.meta_materializer(statement)
     parameter_resolver := pkg.db.internal.descriptor.parameter_resolver(statement)
-    base_valid := version == 3 && kind == 0 && reserved == 0 && !q1.is_null()
+    base_valid := version == 3 && kind == 0 && reserved == 0 && tail_reserved == 0
+      && !q1.is_null()
       && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
       && !validate_row.is_null() && !decode.is_null() && !materializer.is_null()
       && !parameter_resolver.is_null()
@@ -3177,6 +3182,7 @@ pub fn execute<P>(
     kind: u8 := raw.load(data, 4)
     mask: u8 := raw.load(data, 5)
     reserved: u16 := raw.load(data, 6)
+    tail_reserved: u32 := raw.load(data, 116)
     id_len: i64 := raw.load(data, 24)
     sqlite_len: i64 := raw.load(data, 40)
     postgres_len: i64 := raw.load(data, 56)
@@ -3190,7 +3196,8 @@ pub fn execute<P>(
     decode := pkg.db.internal.descriptor.decoder(statement)
     materializer := pkg.db.internal.descriptor.meta_materializer(statement)
     parameter_resolver := pkg.db.internal.descriptor.parameter_resolver(statement)
-    base_valid := version == 3 && kind == 1 && reserved == 0 && !q1.is_null()
+    base_valid := version == 3 && kind == 1 && reserved == 0 && tail_reserved == 0
+      && !q1.is_null()
       && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
       && validate_row.is_null() && decode.is_null() && materializer.is_null()
       && !parameter_resolver.is_null()
@@ -3240,6 +3247,7 @@ pub fn prepare<P, R>(
     kind: u8 := raw.load(data, 4)
     mask: u8 := raw.load(data, 5)
     reserved: u16 := raw.load(data, 6)
+    tail_reserved: u32 := raw.load(data, 116)
     id_len: i64 := raw.load(data, 24)
     sqlite_len: i64 := raw.load(data, 40)
     postgres_len: i64 := raw.load(data, 56)
@@ -3253,7 +3261,8 @@ pub fn prepare<P, R>(
     decode := pkg.db.internal.descriptor.decoder(statement)
     materializer := pkg.db.internal.descriptor.meta_materializer(statement)
     parameter_resolver := pkg.db.internal.descriptor.parameter_resolver(statement)
-    base_valid := version == 3 && kind == 0 && reserved == 0 && !q1.is_null()
+    base_valid := version == 3 && kind == 0 && reserved == 0 && tail_reserved == 0
+      && !q1.is_null()
       && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
       && !validate_row.is_null() && !decode.is_null() && !materializer.is_null()
       && !parameter_resolver.is_null()
@@ -3347,6 +3356,7 @@ pub fn one<P, R>(
     kind: u8 := raw.load(data, 4)
     mask: u8 := raw.load(data, 5)
     reserved: u16 := raw.load(data, 6)
+    tail_reserved: u32 := raw.load(data, 116)
     id_len: i64 := raw.load(data, 24)
     sqlite_len: i64 := raw.load(data, 40)
     postgres_len: i64 := raw.load(data, 56)
@@ -3360,7 +3370,8 @@ pub fn one<P, R>(
     decode := pkg.db.internal.descriptor.decoder(statement)
     materializer := pkg.db.internal.descriptor.meta_materializer(statement)
     parameter_resolver := pkg.db.internal.descriptor.parameter_resolver(statement)
-    base_valid := version == 3 && kind == 0 && reserved == 0 && !q1.is_null()
+    base_valid := version == 3 && kind == 0 && reserved == 0 && tail_reserved == 0
+      && !q1.is_null()
       && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
       && !validate_row.is_null() && !decode.is_null() && !materializer.is_null()
       && !parameter_resolver.is_null()
@@ -3448,6 +3459,25 @@ fn transaction_control(state: raw, sql: str) -> Result<(), Error> {
       status := PQresultStatus(result)
       if status != PGRES_COMMAND_OK {
         failure := postgres_native_error(native, result)
+        PQclear(result)
+        return Err(failure)
+      }
+      expected_status := if sql == "COMMIT" { "COMMIT" } else {
+        if sql == "ROLLBACK" { "ROLLBACK" } else { "BEGIN" }
+      }
+      actual_status := copy_c_string(PQcmdStatus(result))
+      if actual_status != expected_status {
+        failure := Error.Native(NativeError {
+          driver: Driver.PostgreSQL,
+          code: None,
+          extended_code: None,
+          sqlstate: None,
+          message: "PostgreSQL transaction control returned an unexpected command status".clone(),
+          detail: Some(actual_status),
+          constraint: None,
+          table: None,
+          column: None,
+        })
         PQclear(result)
         return Err(failure)
       }

@@ -20,6 +20,7 @@ typedef struct {
 
 typedef struct {
   int status;
+  const char *command_status;
   int rows;
   int fields;
   const char *names[2];
@@ -47,6 +48,7 @@ static int execute_prepared_calls;
 static int control_calls;
 static int deallocate_calls;
 static int fail_next_control;
+static int rollback_next_commit;
 static char prepared_name[64];
 
 static char *copy_text(const char *text) {
@@ -73,6 +75,7 @@ void align_pg_reset(void) {
   control_calls = 0;
   deallocate_calls = 0;
   fail_next_control = 0;
+  rollback_next_commit = 0;
   prepared_name[0] = '\0';
 }
 
@@ -88,6 +91,7 @@ int align_pg_execute_prepared_calls(void) { return execute_prepared_calls; }
 int align_pg_control_calls(void) { return control_calls; }
 int align_pg_deallocate_calls(void) { return deallocate_calls; }
 void align_pg_fail_next_control(void) { fail_next_control = 1; }
+void align_pg_rollback_next_commit(void) { rollback_next_commit = 1; }
 
 PQconninfoOption *PQconninfoParse(const char *connection_info, char **error_out) {
   if (error_out != NULL) *error_out = NULL;
@@ -181,6 +185,7 @@ static FakeResult *new_result(void) {
   FakeResult *result = (FakeResult *)calloc(1, sizeof(FakeResult));
   if (result == NULL) return NULL;
   result->status = 2;
+  result->command_status = "";
   result->rows = 1;
   result->fields = 1;
   result->names[0] = "value";
@@ -281,10 +286,20 @@ FakeResult *PQexec(FakeConn *connection, const char *command) {
   FakeResult *result = new_result();
   if (result != NULL) {
     result->status = fail_next_control ? 7 : 1;
+    if (command != NULL && strncmp(command, "BEGIN ", 6) == 0) {
+      result->command_status = "BEGIN";
+    } else if (command != NULL && strcmp(command, "COMMIT") == 0) {
+      result->command_status = rollback_next_commit ? "ROLLBACK" : "COMMIT";
+    } else if (command != NULL && strcmp(command, "ROLLBACK") == 0) {
+      result->command_status = "ROLLBACK";
+    } else if (command != NULL && strncmp(command, "DEALLOCATE ", 11) == 0) {
+      result->command_status = "DEALLOCATE";
+    }
     result->rows = 0;
     result->fields = 0;
   }
   fail_next_control = 0;
+  rollback_next_commit = 0;
   return result;
 }
 
@@ -354,6 +369,9 @@ FakeResult *PQexecParams(
 }
 
 int PQresultStatus(const FakeResult *result) { return result == NULL ? 7 : result->status; }
+char *PQcmdStatus(const FakeResult *result) {
+  return (char *)(result == NULL ? NULL : result->command_status);
+}
 int PQntuples(const FakeResult *result) { return result == NULL ? -1 : result->rows; }
 int PQnfields(const FakeResult *result) { return result == NULL ? -1 : result->fields; }
 char *PQfname(const FakeResult *result, int column) {

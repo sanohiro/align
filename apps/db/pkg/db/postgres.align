@@ -17,6 +17,7 @@ extern "C" link("pq") {
   fn PQfinish(connection: raw)
   fn PQexec(connection: raw, command: raw) -> raw
   fn PQresultStatus(result: raw) -> i32
+  fn PQcmdStatus(result: raw) -> raw
   fn PQclear(result: raw)
 }
 
@@ -842,6 +843,21 @@ pub fn begin_native(
     status := PQresultStatus(result)
     if status != PGRES_COMMAND_OK {
       failure := pkg.db.internal.postgres.execution_error(native_connection, result)
+      PQclear(result)
+      return Err(failure)
+    }
+    if !c_string_matches(PQcmdStatus(result), "BEGIN") {
+      failure := pkg.db.Error.Native(pkg.db.NativeError {
+        driver: pkg.db.Driver.PostgreSQL,
+        code: None,
+        extended_code: None,
+        sqlstate: None,
+        message: "PostgreSQL BEGIN returned an unexpected command status".clone(),
+        detail: None,
+        constraint: None,
+        table: None,
+        column: None,
+      })
       PQclear(result)
       return Err(failure)
     }

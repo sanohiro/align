@@ -141,6 +141,24 @@ fn q4a_public_surface_is_exact_and_later_runtime_cells_remain_absent() {
             "Q4a must not publish deferred surface `{deferred}`"
         );
     }
+    for (module, source, expected) in [
+        ("pkg.db", DB, 5),
+        ("pkg.db.internal.sqlite", INTERNAL_SQLITE, 2),
+        ("pkg.db.internal.postgres", INTERNAL_POSTGRES, 2),
+    ] {
+        assert_eq!(
+            source
+                .matches("tail_reserved: u32 := raw.load(data, 116)")
+                .count(),
+            expected,
+            "{module} must load the v3 tail-reserved field in every header validator"
+        );
+        assert_eq!(
+            source.matches("tail_reserved == 0").count(),
+            expected,
+            "{module} must reject the v3 tail-reserved field in every header validator"
+        );
+    }
 }
 
 #[test]
@@ -560,6 +578,79 @@ fn main() -> i32 {
     let fixture = format!("{POSTGRES_STUB}\n{SQLITE_PREPARED_STUB}");
     let output = build_and_run_multi_with_c(
         "pkg-db-q4a-sqlite-prepared-reuse",
+        &files,
+        "main.align",
+        &fixture,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn sqlite_unsupported_prepared_shape_fails_before_native_prepare() {
+    if !backend_available() || !cc_available() {
+        return;
+    }
+    let unsupported = r#"module app.q4a_unsupported
+import pkg.db
+import pkg.db.sqlite
+
+pub Params { enabled: bool }
+pub Row { value: i64 }
+
+pub fn selected() -> pkg.db.query<Params, Row> = pkg.db.sqlite.query(
+  "SELECT :enabled AS value",
+  [],
+  [],
+)
+"#;
+    let main = r#"module main
+import pkg.db
+import pkg.db.sqlite
+import app.q4a_unsupported
+
+extern "C" {
+  fn align_sqlite_q4a_reset()
+  fn align_sqlite_q4a_prepare_calls() -> i32
+  fn align_sqlite_q4a_protocol_ok() -> i32
+}
+
+fn is_shape_error(error: pkg.db.Error) -> bool = match error {
+  Unsupported(contract) => contract.item == "db.descriptor.shape"
+  _ => false
+}
+
+fn main() -> i32 {
+  unsafe { align_sqlite_q4a_reset() }
+  opened := pkg.db.sqlite.connect(":memory:", [])
+  rejected := match opened {
+    Err(_) => false
+    Ok(connection) => {
+      prepared := pkg.db.sqlite.prepare_native(
+        pkg.db.exec_conn(connection),
+        app.q4a_unsupported.selected(),
+        [],
+        [pkg.db.sqlite.PrepareOption.Persistent, pkg.db.sqlite.PrepareOption.Normalize],
+      )
+      match prepared { Ok(_) => false, Err(error) => is_shape_error(error) }
+    }
+  }
+  return unsafe {
+    if rejected && align_sqlite_q4a_protocol_ok() == 1
+      && align_sqlite_q4a_prepare_calls() == 0 { 42 } else { 1 }
+  }
+}
+"#;
+    let mut files = package_files(main);
+    files.push(("app/q4a_unsupported.align", unsupported));
+    let fixture = format!("{POSTGRES_STUB}\n{SQLITE_PREPARED_STUB}");
+    let output = build_and_run_multi_with_c(
+        "pkg-db-q4a-sqlite-unsupported-shape",
         &files,
         "main.align",
         &fixture,
@@ -1166,6 +1257,66 @@ fn main() -> i32 {
     let files = package_files(main);
     let output = build_and_run_multi_with_c(
         "pkg-db-q4a-postgres-failed-commit",
+        &files,
+        "main.align",
+        POSTGRES_STUB,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn postgres_implicit_rollback_command_tag_never_returns_a_connection() {
+    if !backend_available() || !cc_available() {
+        return;
+    }
+    let main = r#"module main
+import pkg.db
+import pkg.db.postgres
+
+extern "C" {
+  fn align_pg_reset()
+  fn align_pg_rollback_next_commit()
+  fn align_pg_control_calls() -> i32
+  fn align_pg_finish_calls() -> i32
+  fn align_pg_protocol_ok() -> i32
+}
+
+fn commit_aborted(transaction: pkg.db.tx) -> bool {
+  unsafe { align_pg_rollback_next_commit() }
+  ended := pkg.db.commit(transaction)
+  return match ended {
+    Ok(_) => false
+    Err(error) => match error { Native(_) => true, _ => false }
+  }
+}
+
+fn main() -> i32 {
+  unsafe { align_pg_reset() }
+  opened := pkg.db.postgres.connect("postgresql://stub/q4a", [])
+  rejected := match opened {
+    Err(_) => false
+    Ok(connection) => match pkg.db.begin(connection, []) {
+      Err(_) => false
+      Ok(transaction) => commit_aborted(transaction)
+    }
+  }
+  if !rejected { return 1 }
+  return unsafe {
+    if align_pg_protocol_ok() == 1
+      && align_pg_control_calls() == 3
+      && align_pg_finish_calls() == 1 { 42 } else { 2 }
+  }
+}
+"#;
+    let files = package_files(main);
+    let output = build_and_run_multi_with_c(
+        "pkg-db-q4a-postgres-implicit-rollback",
         &files,
         "main.align",
         POSTGRES_STUB,

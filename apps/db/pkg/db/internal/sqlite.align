@@ -357,6 +357,7 @@ pub fn command_header_valid<P>(statement: pkg.db.command<P>) -> bool {
     kind: u8 := raw.load(data, 4)
     mask: u8 := raw.load(data, 5)
     reserved: u16 := raw.load(data, 6)
+    tail_reserved: u32 := raw.load(data, 116)
     id_len: i64 := raw.load(data, 24)
     sqlite_len: i64 := raw.load(data, 40)
     postgres_len: i64 := raw.load(data, 56)
@@ -370,7 +371,8 @@ pub fn command_header_valid<P>(statement: pkg.db.command<P>) -> bool {
     decode := pkg.db.internal.descriptor.decoder(statement)
     materializer := pkg.db.internal.descriptor.meta_materializer(statement)
     parameter_resolver := pkg.db.internal.descriptor.parameter_resolver(statement)
-    base := version == 3 && kind == 1 && reserved == 0 && !q1.is_null()
+    base := version == 3 && kind == 1 && reserved == 0 && tail_reserved == 0
+      && !q1.is_null()
       && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
       && validate_row.is_null() && decode.is_null() && materializer.is_null()
       && !parameter_resolver.is_null()
@@ -392,6 +394,7 @@ pub fn query_header_valid<P, R>(statement: pkg.db.query<P, R>) -> bool {
     kind: u8 := raw.load(data, 4)
     mask: u8 := raw.load(data, 5)
     reserved: u16 := raw.load(data, 6)
+    tail_reserved: u32 := raw.load(data, 116)
     id_len: i64 := raw.load(data, 24)
     sqlite_len: i64 := raw.load(data, 40)
     postgres_len: i64 := raw.load(data, 56)
@@ -405,7 +408,8 @@ pub fn query_header_valid<P, R>(statement: pkg.db.query<P, R>) -> bool {
     decode := pkg.db.internal.descriptor.decoder(statement)
     materializer := pkg.db.internal.descriptor.meta_materializer(statement)
     parameter_resolver := pkg.db.internal.descriptor.parameter_resolver(statement)
-    base := version == 3 && kind == 0 && reserved == 0 && !q1.is_null()
+    base := version == 3 && kind == 0 && reserved == 0 && tail_reserved == 0
+      && !q1.is_null()
       && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
       && !validate_row.is_null() && !decode.is_null() && !materializer.is_null()
       && !parameter_resolver.is_null()
@@ -556,6 +560,20 @@ pub fn prepare_prevalidated<P, R>(
     }
     sql := pkg.db.internal.descriptor.sqlite_sql_pointer(statement)
     if sql.is_null() { return Err(driver_mismatch_error(query_id)) }
+    context := new_context(database)
+    static_status := pkg.db.internal.descriptor.validate_static(statement, context)
+    if static_status != 0 {
+      failure := if static_status == -1 {
+        descriptor_error(
+          query_id,
+          "db.descriptor.shape",
+          "static database descriptor uses a field shape unsupported by prepared execution",
+        )
+      } else { context_error(context, database, query_id) }
+      free_context(context)
+      return Err(failure)
+    }
+    free_context(context)
     acquire_lease(state, query_id)?
     statement_out := raw.alloc(8)
     tail_out := raw.alloc(8)
@@ -586,18 +604,6 @@ pub fn prepare_prevalidated<P, R>(
         "static Query must contain exactly one SQLite statement",
       ))
     }
-    context := new_context(native)
-    static_status := pkg.db.internal.descriptor.validate_static(statement, context)
-    if static_status != 0 {
-      failure := context_error(context, database, query_id)
-      free_context(context)
-      cleanup_ok := prepared_finalize(native) == SQLITE_OK
-      if cleanup_ok { raw.store(state, 20, 0 as u8) } else {
-        pkg.db.internal.resource.poison_conn_state(state)
-      }
-      return Err(failure)
-    }
-    free_context(context)
     owned_id := copy_bytes(query_id)
     binder := pkg.db.internal.descriptor.binder(statement)
     wrapper := pkg.db.internal.resource.new_stmt_state(
