@@ -2472,7 +2472,10 @@ would let a backend hit serve a stale-promotion object, caught by the cold-vs-hi
 And the digest is NOT a field inside the shared codegen key: prelink and backend are separate phase
 keys with their own CAS namespaces (`prelink`/`thinbackend`), which is why the M15 reserved
 `cross_unit_opt_digest` field was removed outright at S2 — see "ThinLTO S2 SHIPPED".] **(c) Flag = opt-in `--thin-lto`**, legal only on
-`release`/`fast` (the `--rt-lto` precedent), never folded into a profile in v1. **(d) N=1 skips
+`release`/`fast`, never folded into a profile in v1. (Historical note: this cited `--rt-lto` as the
+explicit-flag precedent; on 2026-08-09 `--rt-lto` flipped to a profile-based default — ON at
+`release`/`fast`, `--no-rt-lto` to disable — on cross-arch bench evidence. `--thin-lto` itself
+stays explicit: its compile-cost profile is materially different.) **(d) N=1 skips
 all three phases** → byte-identical to today; the flag-off path stays byte-identical.
 **(e) Preserve set fail-closed in v1** = {`main`} ∪ `--export` ∪ all `pub` fns; cross-unit `pub`
 internalization is a deferred follow-up win. **(f) `--rt-lto` composes**: its merge keeps the
@@ -2925,6 +2928,15 @@ additions). End-to-end through the real driver: **`eq_count` 2.95× under `--rt-
 (bound ≤ ~100 ms), flag-off objects proven byte-identical to pre-change main, `bench/rt_lto/`
 records the numbers, `bench/binary_size` unaffected. Mutation teeth verified both directions
 twice (implementer + independent adversarial gate; gate verdict SHIP, zero confirmed defects).
+
+**Default flipped 2026-08-09 (owner decision).** The CLI now resolves an absent flag to ON for
+the optimizing `release`/`fast` profiles and OFF for `dev`/`small`/`tiny`
+(`align_driver::default_rt_lto`, pinned by an owner test); `--no-rt-lto` is the explicit
+opt-out and `--rt-lto` the explicit opt-in (unchanged guards: explicit ON still rejects
+`dev`/`small`/`tiny` and non-codegen verbs). Evidence: `bench/rt_lto` on both architectures —
+2.9×/2.95× (x86-64 Zen 3 / WSL2) and 2.10× (Apple Silicon) on the string-predicate kernel,
+numeric control 1.01×/1.04×, compile-time delta +1–2 ms. The library API is unchanged
+(`rt_lto: bool` stays explicit at every `emit_*` call); only the CLI default moved.
 Three recorded deviations from the settlement, all verified: (a) inkwell 0.9's
 `MemoryBuffer::create_from_memory_range[_copy]` asserts a trailing nul and passes `len-1` to
 LLVM — a raw `include_bytes!` slice would lose its last bitcode byte, so the parse path

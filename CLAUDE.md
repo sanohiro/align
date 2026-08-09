@@ -332,9 +332,11 @@ A **release build** only produces optimized local artifacts. A versioned
 release: bump `Cargo.toml` and `Cargo.lock`, write matching release notes,
 commit `chore(release): Align vX.Y.Z` on `main`, then tag and push `vX.Y.Z`.
 Never infer the publish flow from “build” or “release build.” Versioned
-release artifacts build with `--profile dist` (thin LTO, one codegen unit —
-wired in `release.yml`); ordinary `--release` builds stay on the untuned
-default so routine batch builds never pay the LTO link time.
+release artifacts build with `--profile dist` (thin LTO, one codegen unit)
+plus two-phase PGO over the examples/`pkg.db` corpus — both wired in
+`release.yml`; ordinary `--release` builds stay on the untuned default so
+routine batch builds never pay the LTO/PGO cost. The `alignc` binary itself
+uses mimalloc in every profile (a measured ~30% frontend win).
 
 ## Long-running work and progress monitoring
 

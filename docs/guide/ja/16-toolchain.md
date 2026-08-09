@@ -42,12 +42,12 @@ alignc size file.align --profile tiny
 ```text
 --profile dev|release|fast|small|tiny   # O0, O2, O3, Os, Oz
 --target-cpu baseline|native|<LLVM CPU>
---rt-lto                               # 選択した runtime bitcode を inline
+--rt-lto / --no-rt-lto                 # runtime bitcode LTO の強制 on/off（既定: release/fast で on）
 --thin-lto                             # cross-unit ThinLTO
 ```
 
 デフォルトのターゲットとプロファイルは、ポータブルな `baseline` および `release` です。`native` はコンパイルを実行している現在のマシンに最適化されたターゲットであり、`x86-64-v3` のような名前付きの LLVM CPU アーキテクチャ指定は、デプロイ先のハードウェア環境（フリート）が既知の場合に推奨されます。
-`--rt-lto`（ランタイムの LTO）と `--thin-lto`（クロスモジュールの ThinLTO）は、コンパイル時間（コスト）と最適化の適用範囲を大きく変えるため、デフォルトでは無効になっており明示的な指定が必要です。どちらも `release` または `fast` プロファイルでのみ機能します。ThinLTO はリンク処理を伴う `build`、`run`、`size` コマンドに適用され、並列処理やキャッシュ機構の恩恵を受けながら、ランタイム LTO と組み合わせることが可能です。
+ランタイム LTO は、最適化プロファイル（`release`/`fast`）では**デフォルトで有効**です（文字列述語パイプラインで実測 2〜3 倍、他は非退行、コンパイル時間 +1〜2ms）。`dev`/`small`/`tiny` では無効で、`--no-rt-lto` / `--rt-lto` でどちらの方向にも強制できます。`--thin-lto`（クロスモジュールの ThinLTO）は、コンパイル時間（コスト）と最適化の適用範囲を大きく変えるため、引き続き明示的な指定が必要です。`release` または `fast` プロファイルでのみ機能し、リンク処理を伴う `build`、`run`、`size` コマンドに適用され、並列処理やキャッシュ機構の恩恵を受けながら、ランタイム LTO と組み合わせることが可能です。
 
 代表的な production workload には instrumented PGO が使えます。
 

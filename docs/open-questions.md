@@ -13,6 +13,19 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### Runtime-bitcode LTO defaults on under optimizing profiles (SETTLED 2026-08-09)
+
+`--rt-lto` (M14 Slice 2) was designed opt-in. The default now resolves per profile: **ON for
+`release`/`fast`, OFF for `dev`/`small`/`tiny`**, with `--no-rt-lto` / `--rt-lto` as explicit
+overrides (`align_driver::default_rt_lto`, owner-test-pinned). Rationale: `bench/rt_lto` on both
+architectures shows 2.9× (x86-64) / 2.1× (Apple Silicon) on string-predicate kernels, a
+non-regressing numeric control (1.01×/1.04×), and +1–2 ms compile-time — a large win with no
+observed downside at the profiles whose whole purpose is optimization. Nothing-hidden holds: the
+mechanism stays a named, greppable flag pair, the guide documents the default, and `dev` keeps the
+fastest-build/no-inline behavior. `--thin-lto` deliberately remains explicit (materially different
+compile-cost profile). The library API is unchanged — every `emit_*` entry point still takes
+`rt_lto: bool` explicitly; only the CLI default moved.
+
 ### Builtin type aliases do not monopolize module namespaces (SETTLED 2026-08-07)
 
 **Decision:** a non-entry module may declare a local type whose bare name is also one of the closed

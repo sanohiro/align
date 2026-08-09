@@ -363,7 +363,7 @@ fn cli_rt_lto_rejects_non_build_verb() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "--rt-lto on `check` must fail:\n{err}");
     assert!(
-        err.contains("alignc: --rt-lto is only valid for `build`/`run`/`emit-obj`/`size`/`emit-llvm`"),
+        err.contains("alignc: --rt-lto/--no-rt-lto are only valid for `build`/`run`/`emit-obj`/`size`/`emit-llvm`"),
         "diagnostic must name the valid verb set:\n{err}"
     );
 }

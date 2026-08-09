@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # M14 Slice 2 --rt-lto benchmark (docs/impl/07-roadmap.md). Builds ONE kernel object twice through
-# the REAL driver — once without `--rt-lto`, once with — links each into the harness, and reports the
+# the REAL driver — once with `--no-rt-lto`, once with `--rt-lto` (rt-LTO defaults ON at the
+# default release profile since 2026-08-09, so the OFF arm must disable it explicitly) — links each
+# into the harness, and reports the
 # OFF/ON ratio on the `eq_count` (str_eq fast-path) kernel plus the `sum_sq_pos` numeric control.
 # Also reports the compile-time delta of the emit-obj step (target: <= ~100 ms over flag-off).
 #
@@ -59,15 +61,17 @@ run_pass() {  # $1 = label, $2... = extra alignc args
 }
 
 echo "target: $mode"
-echo "== OFF (no --rt-lto) =="
-OFF=$(run_pass off)
+# rt-LTO defaults ON at the default `release` profile since 2026-08-09, so the
+# OFF arm must disable it explicitly or it silently measures ON vs ON.
+echo "== OFF (--no-rt-lto) =="
+OFF=$(run_pass off --no-rt-lto)
 echo "$OFF"
 echo "== ON (--rt-lto) =="
 ON=$(run_pass on --rt-lto)
 echo "$ON"
 
 echo "== compile-time (emit-obj, best of 5) =="
-OFF_MS=$(compile_ms)
+OFF_MS=$(compile_ms --no-rt-lto)
 ON_MS=$(compile_ms --rt-lto)
 echo "off=${OFF_MS}ms on=${ON_MS}ms delta=$(( ON_MS - OFF_MS ))ms"
 

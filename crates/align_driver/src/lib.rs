@@ -1903,6 +1903,16 @@ pub fn rt_lto_bitcode() -> &'static [u8] {
     RT_LTO_BITCODE
 }
 
+/// The CLI's runtime-LTO default per optimization profile (settled 2026-08-09; the flip is
+/// recorded in `docs/impl/07-roadmap.md` M14 Slice 2 and `docs/open-questions.md`): ON for the
+/// optimizing `release`/`fast` profiles — bench/rt_lto measures 2.1x (aarch64) / 2.9x (x86-64) on
+/// string-predicate kernels with a non-regressing numeric control and +1-2ms compile — and OFF for
+/// `dev` (O0: nothing inlines) and `small`/`tiny` (the size sweeps conflict with fast-path
+/// inlining). `--rt-lto` / `--no-rt-lto` override in either direction.
+pub fn default_rt_lto(profile: Profile) -> bool {
+    matches!(profile, Profile::Release | Profile::Fast)
+}
+
 pub fn emit_object_file(mir: &align_mir::Program, obj: &std::path::Path, target: BuildTarget, profile: Profile, exports: &[String], rt_lto: bool) -> Result<(), String> {
     align_codegen_llvm::emit_object(mir, obj, &target, profile, exports, rt_lto_bytes(rt_lto)).map_err(|e| e.to_string())
 }
@@ -3197,6 +3207,18 @@ pub fn format_diagnostics(source_map: &SourceMap, diags: &Diagnostics) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- rt-LTO profile default (settled 2026-08-09) -----------------------------------------------
+    // The CLI resolves an absent --rt-lto/--no-rt-lto flag through this exact mapping; pin all five
+    // profiles so a new profile variant must decide its default here explicitly.
+    #[test]
+    fn rt_lto_defaults_on_for_optimizing_profiles_only() {
+        assert!(default_rt_lto(Profile::Release));
+        assert!(default_rt_lto(Profile::Fast));
+        assert!(!default_rt_lto(Profile::Dev));
+        assert!(!default_rt_lto(Profile::Small));
+        assert!(!default_rt_lto(Profile::Tiny));
+    }
 
     // ---- fix #1 mechanism gate: the profdata snapshot ----------------------------------------------
     // The cache-poisoning fix routes libLLVM to a private snapshot, not the user's live path. These

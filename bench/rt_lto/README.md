@@ -2,7 +2,8 @@
 
 Measures the runtime-bitcode LTO win for the fast-path string primitives
 (`docs/impl/07-roadmap.md`, "M14 Slice 2"). The SAME Align kernel object is built twice through the
-real driver — once without `--rt-lto`, once with — linked into a Rust timing harness, and compared.
+real driver — once with `--no-rt-lto`, once with `--rt-lto` (rt-LTO defaults ON at release since
+2026-08-09, so the OFF arm disables it explicitly) — linked into a Rust timing harness, and compared.
 
 - `eq_count = s.where(x == "hello").count()` — the constant-length equality filter. Under `--rt-lto`
   `align_rt_str_eq`'s body is linked in and inlined, so the literal's length (5) folds into an
