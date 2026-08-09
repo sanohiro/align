@@ -1099,8 +1099,10 @@ fn main() -> i32 {
         "common execute did not lower to the SQLite engine:\n{main_mir}"
     );
     assert!(
-        main_mir.contains("call_with_cleanup program pkg.db.internal.sqlite$one_prevalidated$"),
-        "common one did not lower to the SQLite engine:\n{main_mir}"
+        main_mir.contains("call_with_cleanup program pkg.db.internal.sqlite$rows_prevalidated$")
+            && main_mir
+                .contains("call_with_cleanup program pkg.db.internal.sqlite$next_prevalidated$"),
+        "common one did not lower through SQLite streaming:\n{main_mir}"
     );
 }
 

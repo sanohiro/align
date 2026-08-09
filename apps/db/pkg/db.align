@@ -72,6 +72,93 @@ pub resource tx = pkg.db.internal.resource.drop_tx
 pub resource stmt<P, R> = pkg.db.internal.resource.drop_stmt
 pub resource rows<R> = pkg.db.internal.resource.drop_rows
 
+// All common and native execution entry points use these two sealed validators before option
+// allocation, lease acquisition, or native work. Keeping the v4 header in one owner prevents a
+// descriptor version/field bump from drifting across copied validators.
+pub fn query_header_valid<P, R>(
+  statement: query<P, R>,
+  control: pkg.db.internal.DescriptorHeaderControl,
+) -> bool {
+  if !control.seal { return false }
+  unsafe {
+    data := pkg.db.internal.descriptor.data(statement)
+    if data.is_null() { return false }
+    version: u32 := raw.load(data, 0)
+    kind: u8 := raw.load(data, 4)
+    mask: u8 := raw.load(data, 5)
+    reserved: u16 := raw.load(data, 6)
+    tail_reserved: u32 := raw.load(data, 116)
+    id_len: i64 := raw.load(data, 24)
+    sqlite_len: i64 := raw.load(data, 40)
+    postgres_len: i64 := raw.load(data, 56)
+    q1 := pkg.db.internal.descriptor.q1_plan(statement)
+    id := pkg.db.internal.descriptor.descriptor_id_pointer(statement)
+    sqlite_sql := pkg.db.internal.descriptor.sqlite_sql_pointer(statement)
+    postgres_sql := pkg.db.internal.descriptor.postgres_sql_pointer(statement)
+    binder := pkg.db.internal.descriptor.binder(statement)
+    validate_static := pkg.db.internal.descriptor.static_validator(statement)
+    validate_row := pkg.db.internal.descriptor.row_validator(statement)
+    decode := pkg.db.internal.descriptor.decoder(statement)
+    materializer := pkg.db.internal.descriptor.meta_materializer(statement)
+    parameter_resolver := pkg.db.internal.descriptor.parameter_resolver(statement)
+    stream_decoder := pkg.db.internal.descriptor.stream_decoder(statement)
+    base_valid := version == 4 && kind == 0 && reserved == 0 && tail_reserved == 0
+      && !q1.is_null()
+      && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
+      && !validate_row.is_null() && !decode.is_null() && !materializer.is_null()
+      && !parameter_resolver.is_null() && !stream_decoder.is_null()
+    sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
+      && postgres_sql.is_null() && postgres_len == 0
+    postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0
+      && !postgres_sql.is_null() && postgres_len > 0
+    portable := mask == 3 && !sqlite_sql.is_null() && sqlite_len > 0
+      && !postgres_sql.is_null() && postgres_len > 0
+    return base_valid && (sqlite_only || postgres_only || portable)
+  }
+}
+
+pub fn command_header_valid<P>(
+  statement: command<P>,
+  control: pkg.db.internal.DescriptorHeaderControl,
+) -> bool {
+  if !control.seal { return false }
+  unsafe {
+    data := pkg.db.internal.descriptor.data(statement)
+    if data.is_null() { return false }
+    version: u32 := raw.load(data, 0)
+    kind: u8 := raw.load(data, 4)
+    mask: u8 := raw.load(data, 5)
+    reserved: u16 := raw.load(data, 6)
+    tail_reserved: u32 := raw.load(data, 116)
+    id_len: i64 := raw.load(data, 24)
+    sqlite_len: i64 := raw.load(data, 40)
+    postgres_len: i64 := raw.load(data, 56)
+    q1 := pkg.db.internal.descriptor.q1_plan(statement)
+    id := pkg.db.internal.descriptor.descriptor_id_pointer(statement)
+    sqlite_sql := pkg.db.internal.descriptor.sqlite_sql_pointer(statement)
+    postgres_sql := pkg.db.internal.descriptor.postgres_sql_pointer(statement)
+    binder := pkg.db.internal.descriptor.binder(statement)
+    validate_static := pkg.db.internal.descriptor.static_validator(statement)
+    validate_row := pkg.db.internal.descriptor.row_validator(statement)
+    decode := pkg.db.internal.descriptor.decoder(statement)
+    materializer := pkg.db.internal.descriptor.meta_materializer(statement)
+    parameter_resolver := pkg.db.internal.descriptor.parameter_resolver(statement)
+    stream_decoder := pkg.db.internal.descriptor.stream_decoder(statement)
+    base_valid := version == 4 && kind == 1 && reserved == 0 && tail_reserved == 0
+      && !q1.is_null()
+      && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
+      && validate_row.is_null() && decode.is_null() && materializer.is_null()
+      && !parameter_resolver.is_null() && stream_decoder.is_null()
+    sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
+      && postgres_sql.is_null() && postgres_len == 0
+    postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0
+      && !postgres_sql.is_null() && postgres_len > 0
+    portable := mask == 3 && !sqlite_sql.is_null() && sqlite_len > 0
+      && !postgres_sql.is_null() && postgres_len > 0
+    return base_valid && (sqlite_only || postgres_only || portable)
+  }
+}
+
 // Private synchronous owner for one D12 native result. It is borrowed from the connection so no
 // cursor can outlive or overlap a move of that connection. The drop hook finalizes/clears the
 // native result and releases SQLite's connection-wide execution lease.
@@ -448,7 +535,7 @@ fn metadata_controls(options: slice<MetaOption>) -> Result<MetaControls, Error> 
   if saw_timeout {
     return Err(queryless_contract(
       "db.meta.timeout_ns",
-      "database metadata deadlines are not available in this milestone",
+      "common metadata deadlines are not supported in v1",
     ))
   }
   return Ok(MetaControls { include_system: saw_system })
@@ -1141,7 +1228,8 @@ pub fn driver_tag(target: exec) -> u8 {
 pub fn execute_options_valid(
   options: slice<ExecuteOption>,
   query_id: str,
-) -> Result<(), Error> {
+) -> Result<Option<i64>, Error> {
+  mut timeout: Option<i64> := None
   mut i := 0
   loop {
     if i >= options.len() { break }
@@ -1154,16 +1242,21 @@ pub fn execute_options_valid(
             message: "database execution timeout must be positive".clone(),
           }))
         }
-        return Err(Error.Unsupported(ContractError {
-          query_id: Some(query_id.clone()),
-          item: "db.execute.timeout_ns".clone(),
-          message: "database execution deadlines are not available in this milestone".clone(),
-        }))
+        match timeout {
+          Some(_) => {
+            return Err(Error.Unsupported(ContractError {
+              query_id: Some(query_id.clone()),
+              item: "db.execute.timeout_ns".clone(),
+              message: "duplicate database execution timeout".clone(),
+            }))
+          }
+          None => { timeout = Some(ns) }
+        }
       }
     }
     i = i + 1
   }
-  return Ok(())
+  return Ok(timeout)
 }
 
 fn sqlite_meta_database(
@@ -2828,50 +2921,15 @@ pub fn meta_query<P, R>(
   options: slice<MetaOption>,
 ) -> Result<array<QueryMeta>, Error> {
   unsafe {
+    if !query_header_valid(statement, pkg.db.internal.descriptor_header_control()) {
+      return Err(Error.InvalidQuery(ContractError {
+        query_id: None,
+        item: "db.descriptor.header".clone(),
+        message: "invalid static database descriptor".clone(),
+      }))
+    }
     data := pkg.db.internal.descriptor.data(statement)
-    if data.is_null() {
-      return Err(Error.InvalidQuery(ContractError {
-        query_id: None,
-        item: "db.descriptor.header".clone(),
-        message: "invalid static database descriptor".clone(),
-      }))
-    }
-    version: u32 := raw.load(data, 0)
-    kind: u8 := raw.load(data, 4)
     mask: u8 := raw.load(data, 5)
-    reserved: u16 := raw.load(data, 6)
-    tail_reserved: u32 := raw.load(data, 116)
-    id_len: i64 := raw.load(data, 24)
-    sqlite_len: i64 := raw.load(data, 40)
-    postgres_len: i64 := raw.load(data, 56)
-    q1 := pkg.db.internal.descriptor.q1_plan(statement)
-    id := pkg.db.internal.descriptor.descriptor_id_pointer(statement)
-    sqlite_sql := pkg.db.internal.descriptor.sqlite_sql_pointer(statement)
-    postgres_sql := pkg.db.internal.descriptor.postgres_sql_pointer(statement)
-    binder := pkg.db.internal.descriptor.binder(statement)
-    validate_static := pkg.db.internal.descriptor.static_validator(statement)
-    validate_row := pkg.db.internal.descriptor.row_validator(statement)
-    decode := pkg.db.internal.descriptor.decoder(statement)
-    materializer := pkg.db.internal.descriptor.meta_materializer(statement)
-    parameter_resolver := pkg.db.internal.descriptor.parameter_resolver(statement)
-    base_valid := version == 3 && kind == 0 && reserved == 0 && tail_reserved == 0
-      && !q1.is_null()
-      && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
-      && !validate_row.is_null() && !decode.is_null() && !materializer.is_null()
-      && !parameter_resolver.is_null()
-    sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
-      && postgres_sql.is_null() && postgres_len == 0
-    postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0
-      && !postgres_sql.is_null() && postgres_len > 0
-    portable := mask == 3 && !sqlite_sql.is_null() && sqlite_len > 0
-      && !postgres_sql.is_null() && postgres_len > 0
-    if !(base_valid && (sqlite_only || postgres_only || portable)) {
-      return Err(Error.InvalidQuery(ContractError {
-        query_id: None,
-        item: "db.descriptor.header".clone(),
-        message: "invalid static database descriptor".clone(),
-      }))
-    }
 
     query_id := pkg.db.internal.descriptor.descriptor_id(statement)
     mut saw_timeout := false
@@ -3015,50 +3073,15 @@ pub fn explain<P, R>(
   options: slice<ExplainOption>,
 ) -> Result<QueryPlan, Error> {
   unsafe {
+    if !query_header_valid(statement, pkg.db.internal.descriptor_header_control()) {
+      return Err(Error.InvalidQuery(ContractError {
+        query_id: None,
+        item: "db.descriptor.header".clone(),
+        message: "invalid static database descriptor".clone(),
+      }))
+    }
     data := pkg.db.internal.descriptor.data(statement)
-    if data.is_null() {
-      return Err(Error.InvalidQuery(ContractError {
-        query_id: None,
-        item: "db.descriptor.header".clone(),
-        message: "invalid static database descriptor".clone(),
-      }))
-    }
-    version: u32 := raw.load(data, 0)
-    kind: u8 := raw.load(data, 4)
     mask: u8 := raw.load(data, 5)
-    reserved: u16 := raw.load(data, 6)
-    tail_reserved: u32 := raw.load(data, 116)
-    id_len: i64 := raw.load(data, 24)
-    sqlite_len: i64 := raw.load(data, 40)
-    postgres_len: i64 := raw.load(data, 56)
-    q1 := pkg.db.internal.descriptor.q1_plan(statement)
-    id := pkg.db.internal.descriptor.descriptor_id_pointer(statement)
-    sqlite_sql := pkg.db.internal.descriptor.sqlite_sql_pointer(statement)
-    postgres_sql := pkg.db.internal.descriptor.postgres_sql_pointer(statement)
-    binder := pkg.db.internal.descriptor.binder(statement)
-    validate_static := pkg.db.internal.descriptor.static_validator(statement)
-    validate_row := pkg.db.internal.descriptor.row_validator(statement)
-    decode := pkg.db.internal.descriptor.decoder(statement)
-    materializer := pkg.db.internal.descriptor.meta_materializer(statement)
-    parameter_resolver := pkg.db.internal.descriptor.parameter_resolver(statement)
-    base_valid := version == 3 && kind == 0 && reserved == 0 && tail_reserved == 0
-      && !q1.is_null()
-      && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
-      && !validate_row.is_null() && !decode.is_null() && !materializer.is_null()
-      && !parameter_resolver.is_null()
-    sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
-      && postgres_sql.is_null() && postgres_len == 0
-    postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0
-      && !postgres_sql.is_null() && postgres_len > 0
-    portable := mask == 3 && !sqlite_sql.is_null() && sqlite_len > 0
-      && !postgres_sql.is_null() && postgres_len > 0
-    if !(base_valid && (sqlite_only || postgres_only || portable)) {
-      return Err(Error.InvalidQuery(ContractError {
-        query_id: None,
-        item: "db.descriptor.header".clone(),
-        message: "invalid static database descriptor".clone(),
-      }))
-    }
     query_id := pkg.db.internal.descriptor.descriptor_id(statement)
     mut saw_timeout := false
     mut option_index := 0
@@ -3089,7 +3112,7 @@ pub fn explain<P, R>(
       return Err(Error.Unsupported(ContractError {
         query_id: Some(query_id.clone()),
         item: "db.explain.timeout_ns".clone(),
-        message: "database EXPLAIN deadlines are not available in this milestone".clone(),
+        message: "common EXPLAIN deadlines are not supported in v1".clone(),
       }))
     }
     driver := driver_tag(target)
@@ -3170,44 +3193,7 @@ pub fn execute<P>(
   options: slice<ExecuteOption>,
 ) -> Result<exec_result, Error> {
   unsafe {
-    data := pkg.db.internal.descriptor.data(statement)
-    if data.is_null() {
-      return Err(Error.InvalidQuery(ContractError {
-        query_id: None,
-        item: "db.descriptor.header".clone(),
-        message: "invalid static database descriptor".clone(),
-      }))
-    }
-    version: u32 := raw.load(data, 0)
-    kind: u8 := raw.load(data, 4)
-    mask: u8 := raw.load(data, 5)
-    reserved: u16 := raw.load(data, 6)
-    tail_reserved: u32 := raw.load(data, 116)
-    id_len: i64 := raw.load(data, 24)
-    sqlite_len: i64 := raw.load(data, 40)
-    postgres_len: i64 := raw.load(data, 56)
-    q1 := pkg.db.internal.descriptor.q1_plan(statement)
-    id := pkg.db.internal.descriptor.descriptor_id_pointer(statement)
-    sqlite_sql := pkg.db.internal.descriptor.sqlite_sql_pointer(statement)
-    postgres_sql := pkg.db.internal.descriptor.postgres_sql_pointer(statement)
-    binder := pkg.db.internal.descriptor.binder(statement)
-    validate_static := pkg.db.internal.descriptor.static_validator(statement)
-    validate_row := pkg.db.internal.descriptor.row_validator(statement)
-    decode := pkg.db.internal.descriptor.decoder(statement)
-    materializer := pkg.db.internal.descriptor.meta_materializer(statement)
-    parameter_resolver := pkg.db.internal.descriptor.parameter_resolver(statement)
-    base_valid := version == 3 && kind == 1 && reserved == 0 && tail_reserved == 0
-      && !q1.is_null()
-      && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
-      && validate_row.is_null() && decode.is_null() && materializer.is_null()
-      && !parameter_resolver.is_null()
-    sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
-      && postgres_sql.is_null() && postgres_len == 0
-    postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0
-      && !postgres_sql.is_null() && postgres_len > 0
-    portable := mask == 3 && !sqlite_sql.is_null() && sqlite_len > 0
-      && !postgres_sql.is_null() && postgres_len > 0
-    if !(base_valid && (sqlite_only || postgres_only || portable)) {
+    if !command_header_valid(statement, pkg.db.internal.descriptor_header_control()) {
       return Err(Error.InvalidQuery(ContractError {
         query_id: None,
         item: "db.descriptor.header".clone(),
@@ -3217,13 +3203,25 @@ pub fn execute<P>(
   }
   unsafe {
     query_id := pkg.db.internal.descriptor.descriptor_id(statement)
-    execute_options_valid(options, query_id)?
+    timeout := execute_options_valid(options, query_id)?
     driver := driver_tag(target)
     if driver == 1 {
+      match timeout {
+        Some(_) => {
+          return Err(Error.Unsupported(ContractError {
+            query_id: Some(query_id.clone()),
+            item: "db.execute.timeout_ns".clone(),
+            message: "SQLite does not support common execution deadlines".clone(),
+          }))
+        }
+        None => {}
+      }
       return pkg.db.internal.descriptor.execute_sqlite(statement, target, params, query_id)
     }
     if driver == 2 {
-      return pkg.db.internal.descriptor.execute_postgres(statement, target, params, query_id)
+      return pkg.db.internal.descriptor.execute_postgres(
+        statement, target, params, query_id, timeout,
+      )
     }
     return unsupported(query_id)
   }
@@ -3235,44 +3233,7 @@ pub fn prepare<P, R>(
   options: slice<PrepareOption>,
 ) -> Result<stmt<P, R>, Error> {
   unsafe {
-    data := pkg.db.internal.descriptor.data(statement)
-    if data.is_null() {
-      return Err(Error.InvalidQuery(ContractError {
-        query_id: None,
-        item: "db.descriptor.header".clone(),
-        message: "invalid static database descriptor".clone(),
-      }))
-    }
-    version: u32 := raw.load(data, 0)
-    kind: u8 := raw.load(data, 4)
-    mask: u8 := raw.load(data, 5)
-    reserved: u16 := raw.load(data, 6)
-    tail_reserved: u32 := raw.load(data, 116)
-    id_len: i64 := raw.load(data, 24)
-    sqlite_len: i64 := raw.load(data, 40)
-    postgres_len: i64 := raw.load(data, 56)
-    q1 := pkg.db.internal.descriptor.q1_plan(statement)
-    id := pkg.db.internal.descriptor.descriptor_id_pointer(statement)
-    sqlite_sql := pkg.db.internal.descriptor.sqlite_sql_pointer(statement)
-    postgres_sql := pkg.db.internal.descriptor.postgres_sql_pointer(statement)
-    binder := pkg.db.internal.descriptor.binder(statement)
-    validate_static := pkg.db.internal.descriptor.static_validator(statement)
-    validate_row := pkg.db.internal.descriptor.row_validator(statement)
-    decode := pkg.db.internal.descriptor.decoder(statement)
-    materializer := pkg.db.internal.descriptor.meta_materializer(statement)
-    parameter_resolver := pkg.db.internal.descriptor.parameter_resolver(statement)
-    base_valid := version == 3 && kind == 0 && reserved == 0 && tail_reserved == 0
-      && !q1.is_null()
-      && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
-      && !validate_row.is_null() && !decode.is_null() && !materializer.is_null()
-      && !parameter_resolver.is_null()
-    sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
-      && postgres_sql.is_null() && postgres_len == 0
-    postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0
-      && !postgres_sql.is_null() && postgres_len > 0
-    portable := mask == 3 && !sqlite_sql.is_null() && sqlite_len > 0
-      && !postgres_sql.is_null() && postgres_len > 0
-    if !(base_valid && (sqlite_only || postgres_only || portable)) {
+    if !query_header_valid(statement, pkg.db.internal.descriptor_header_control()) {
       return Err(Error.InvalidQuery(ContractError {
         query_id: None,
         item: "db.descriptor.header".clone(),
@@ -3280,6 +3241,7 @@ pub fn prepare<P, R>(
       }))
     }
     query_id := pkg.db.internal.descriptor.descriptor_id(statement)
+    mut saw_timeout := false
     mut i := 0
     loop {
       if i >= options.len() { break }
@@ -3292,14 +3254,24 @@ pub fn prepare<P, R>(
               message: "database prepare timeout must be positive".clone(),
             }))
           }
-          return Err(Error.Unsupported(ContractError {
-            query_id: Some(query_id.clone()),
-            item: "db.prepare.timeout_ns".clone(),
-            message: "database prepare deadlines are not available in this milestone".clone(),
-          }))
+          if saw_timeout {
+            return Err(Error.Unsupported(ContractError {
+              query_id: Some(query_id.clone()),
+              item: "db.prepare.timeout_ns".clone(),
+              message: "duplicate database prepare timeout".clone(),
+            }))
+          }
+          saw_timeout = true
         }
       }
       i = i + 1
+    }
+    if saw_timeout {
+      return Err(Error.Unsupported(ContractError {
+        query_id: Some(query_id.clone()),
+        item: "db.prepare.timeout_ns".clone(),
+        message: "common prepare deadlines are not supported in v1".clone(),
+      }))
     }
     driver := driver_tag(target)
     if driver == 1 {
@@ -3336,74 +3308,106 @@ pub fn rows_stmt<P, R>(
   }
 }
 
-pub fn one<P, R>(
+pub fn rows<P, R>(
+  target: exec,
+  statement: query<P, R>,
+  params: P,
+  options: slice<ExecuteOption>,
+) -> Result<rows<R>, Error> {
+  unsafe {
+    if !query_header_valid(statement, pkg.db.internal.descriptor_header_control()) {
+      return Err(Error.InvalidQuery(ContractError {
+        query_id: None,
+        item: "db.descriptor.header".clone(),
+        message: "invalid static database descriptor".clone(),
+      }))
+    }
+    query_id := pkg.db.internal.descriptor.descriptor_id(statement)
+    timeout := execute_options_valid(options, query_id)?
+    driver := driver_tag(target)
+    if driver == 1 {
+      match timeout {
+        Some(_) => {
+          return Err(Error.Unsupported(ContractError {
+            query_id: Some(query_id.clone()),
+            item: "db.execute.timeout_ns".clone(),
+            message: "SQLite does not support common execution deadlines".clone(),
+          }))
+        }
+        None => {}
+      }
+      return pkg.db.internal.descriptor.rows_sqlite(statement, target, params, query_id)
+    }
+    if driver == 2 {
+      return pkg.db.internal.descriptor.rows_postgres(
+        statement, target, params, query_id, timeout,
+      )
+    }
+    return unsupported(query_id)
+  }
+}
+
+pub fn next<R>(borrow mut stream: rows<R>) -> Result<Option<R>, Error> {
+  unsafe {
+    driver := pkg.db.internal.resource.rows_driver(resource.raw(resource.borrow(stream)))
+    if driver == 1 {
+      return pkg.db.internal.descriptor.next_sqlite(stream)
+    }
+    if driver == 2 {
+      return pkg.db.internal.descriptor.next_postgres(stream)
+    }
+    return Err(Error.InvalidQuery(ContractError {
+      query_id: None,
+      item: "db.rows.header".clone(),
+      message: "invalid database rows resource".clone(),
+    }))
+  }
+}
+
+pub fn one<P, R: RegionPlain>(
   target: exec,
   statement: query<P, R>,
   params: P,
   out: region,
   options: slice<ExecuteOption>,
 ) -> Result<R, Error> {
-  unsafe {
-    data := pkg.db.internal.descriptor.data(statement)
-    if data.is_null() {
-      return Err(Error.InvalidQuery(ContractError {
-        query_id: None,
-        item: "db.descriptor.header".clone(),
-        message: "invalid static database descriptor".clone(),
-      }))
-    }
-    version: u32 := raw.load(data, 0)
-    kind: u8 := raw.load(data, 4)
-    mask: u8 := raw.load(data, 5)
-    reserved: u16 := raw.load(data, 6)
-    tail_reserved: u32 := raw.load(data, 116)
-    id_len: i64 := raw.load(data, 24)
-    sqlite_len: i64 := raw.load(data, 40)
-    postgres_len: i64 := raw.load(data, 56)
-    q1 := pkg.db.internal.descriptor.q1_plan(statement)
-    id := pkg.db.internal.descriptor.descriptor_id_pointer(statement)
-    sqlite_sql := pkg.db.internal.descriptor.sqlite_sql_pointer(statement)
-    postgres_sql := pkg.db.internal.descriptor.postgres_sql_pointer(statement)
-    binder := pkg.db.internal.descriptor.binder(statement)
-    validate_static := pkg.db.internal.descriptor.static_validator(statement)
-    validate_row := pkg.db.internal.descriptor.row_validator(statement)
-    decode := pkg.db.internal.descriptor.decoder(statement)
-    materializer := pkg.db.internal.descriptor.meta_materializer(statement)
-    parameter_resolver := pkg.db.internal.descriptor.parameter_resolver(statement)
-    base_valid := version == 3 && kind == 0 && reserved == 0 && tail_reserved == 0
-      && !q1.is_null()
-      && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
-      && !validate_row.is_null() && !decode.is_null() && !materializer.is_null()
-      && !parameter_resolver.is_null()
-    sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
-      && postgres_sql.is_null() && postgres_len == 0
-    postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0
-      && !postgres_sql.is_null() && postgres_len > 0
-    portable := mask == 3 && !sqlite_sql.is_null() && sqlite_len > 0
-      && !postgres_sql.is_null() && postgres_len > 0
-    if !(base_valid && (sqlite_only || postgres_only || portable)) {
-      return Err(Error.InvalidQuery(ContractError {
-        query_id: None,
-        item: "db.descriptor.header".clone(),
-        message: "invalid static database descriptor".clone(),
-      }))
-    }
+  mut stream := rows(target, statement, params, options)?
+  first := next(stream)?
+  row := first else {
+    return Err(Error.Cardinality(CardinalityError {
+      expected_min: 1,
+      expected_max: 1,
+      observed_at_least: 0,
+    }))
   }
-  unsafe {
-    query_id := pkg.db.internal.descriptor.descriptor_id(statement)
-    execute_options_valid(options, query_id)?
-    driver := driver_tag(target)
+  result := row.clone_in(out)
+  has_second := unsafe {
+    driver := pkg.db.internal.resource.rows_driver(resource.raw(resource.borrow(stream)))
+    if driver == 0 {
+      return Err(Error.InvalidQuery(ContractError {
+        query_id: None,
+        item: "db.rows.header".clone(),
+        message: "invalid database rows resource".clone(),
+      }))
+    }
     if driver == 1 {
-      return pkg.db.internal.descriptor.one_sqlite(statement, target, params, out, query_id)
+      pkg.db.internal.descriptor.has_next_sqlite(stream)
+    } else {
+      pkg.db.internal.descriptor.has_next_postgres(stream)
     }
-    if driver == 2 {
-      return pkg.db.internal.descriptor.one_postgres(statement, target, params, out, query_id)
-    }
-    return unsupported(query_id)
+  }?
+  if has_second {
+    return Err(Error.Cardinality(CardinalityError {
+      expected_min: 1,
+      expected_max: 1,
+      observed_at_least: 2,
+    }))
   }
+  return Ok(result)
 }
 
 fn tx_options_valid(options: slice<TxOption>) -> Result<(), Error> {
+  mut saw_timeout := false
   mut i := 0
   loop {
     if i >= options.len() { break }
@@ -3415,13 +3419,22 @@ fn tx_options_valid(options: slice<TxOption>) -> Result<(), Error> {
             "database transaction begin timeout must be positive",
           ))
         }
-        return Err(queryless_contract(
-          "db.transaction.begin_timeout_ns",
-          "database transaction begin deadlines are not available in this milestone",
-        ))
+        if saw_timeout {
+          return Err(queryless_contract(
+            "db.transaction.begin_timeout_ns",
+            "duplicate database transaction begin timeout",
+          ))
+        }
+        saw_timeout = true
       }
     }
     i = i + 1
+  }
+  if saw_timeout {
+    return Err(queryless_contract(
+      "db.transaction.begin_timeout_ns",
+      "common transaction begin deadlines are not supported in v1",
+    ))
   }
   return Ok(())
 }

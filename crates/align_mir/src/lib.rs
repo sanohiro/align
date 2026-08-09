@@ -2901,7 +2901,7 @@ impl Builder {
             self.push(Stmt::TgWait(Operand::Value(h)));
             self.push(Stmt::TgEnd(Operand::Value(h)));
         }
-        for s in self.drop_locals.clone() {
+        for s in self.drop_locals.clone().into_iter().rev() {
             self.emit_drop_if_live(s);
         }
         let handles = self.arenas.clone();
@@ -4170,7 +4170,7 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             // cleanup cannot drop the same values again. A moved-out `break` value already has a
             // clear flag. Sema forbids a
             // `break` inside an `arena`/`task_group` nested in the loop, so no region unwinding here.
-            for s in &iter_drops {
+            for s in iter_drops.iter().rev() {
                 b.emit_drop_if_live(*s);
             }
             b.terminate(Term::Goto(exit));
@@ -14842,8 +14842,13 @@ fn lower_loop(b: &mut Builder, e: &hir::Expr) -> Operand {
     if lowering_continues(b) {
         // Lowering may have discovered synthetic owners inside the body. Read the final frame
         // rather than the pre-body snapshot so those owners are also released on the back-edge.
-        let iter_drops = b.loops.last().expect("loop frame remains active").iter_drops.clone();
-        for s in &iter_drops {
+        let iter_drops = b
+            .loops
+            .last()
+            .expect("loop frame remains active")
+            .iter_drops
+            .clone();
+        for s in iter_drops.iter().rev() {
             b.emit_drop_if_live(*s);
         }
         b.terminate(Term::Goto(header));
@@ -15328,6 +15333,78 @@ fn main() -> i32 {
         assert!(
             !validate_hir::body_only_metadata_is_valid(&malformed),
             "an ABI-incompatible QueryMeta record must fail before MIR lowering",
+        );
+    }
+
+    #[test]
+    fn streaming_decoder_bridge_rejects_malformed_rows_generation_provenance() {
+        let resource = r#"module pkg.db.internal.resource
+pub fn drop_rows(state: raw) { unsafe { if !state.is_null() { raw.free(state) } } }
+"#;
+        let descriptor = "module pkg.db.internal.descriptor\n";
+        let db = r#"module pkg.db
+pub BorrowedRow { value: str }
+pub resource rows<R> = pkg.db.internal.resource.drop_rows
+"#;
+        let sqlite = r#"module pkg.db.internal.sqlite
+import pkg.db
+import pkg.db.internal.descriptor
+
+pub fn decode_current(
+  borrow mut stream: pkg.db.rows<pkg.db.BorrowedRow>, context: raw,
+) -> pkg.db.BorrowedRow {
+  unsafe {
+    reference := resource.borrow(stream)
+    return pkg.db.internal.descriptor.decode_current_row(reference, context)
+  }
+}
+"#;
+        let main = "module main\nfn main() -> i32 = 0\n";
+        let (hir, diagnostics) = check_modules(&[
+            ("pkg.db.internal.resource", false, resource),
+            ("pkg.db.internal.descriptor", false, descriptor),
+            ("pkg.db", false, db),
+            ("pkg.db.internal.sqlite", false, sqlite),
+            ("main", true, main),
+        ]);
+        assert!(
+            !diagnostics.has_errors(),
+            "streaming decoder fixture failed: {:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            hir_program_is_valid(&hir),
+            "the exact rows-generation decoder provenance must pass the HIR gate",
+        );
+
+        let mut malformed = hir.clone();
+        let Some(function) = malformed
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "pkg.db.internal.sqlite$decode_current")
+        else {
+            panic!("concrete streaming decoder bridge must remain present")
+        };
+        let Some(outer) = function.body.value.as_deref_mut() else {
+            panic!("decoder bridge must retain its unsafe block value")
+        };
+        let hir::ExprKind::Unsafe(block) = &mut outer.kind else {
+            panic!("decoder bridge expression must retain its unsafe block")
+        };
+        let [hir::Stmt::Let { .. }, hir::Stmt::Return(Some(call))] = block.stmts.as_mut_slice()
+        else {
+            panic!("decoder bridge unsafe block must retain its resource borrow and return")
+        };
+        let hir::ExprKind::RawCall { return_region, .. } = &mut call.kind else {
+            panic!("decoder bridge return must retain the raw call")
+        };
+        *return_region = hir::ReturnRegionSummary::None;
+        assert!(
+            !validate_hir::body_only_metadata_is_valid(&malformed),
+            "a decoder result that drops its rows-generation region root must fail before MIR lowering",
         );
     }
 

@@ -6150,7 +6150,23 @@ impl<'a> BodyValidator<'a> {
                         .map(|_| *resource),
                     _ => None,
                 };
-                if descriptor_kind.is_none() && prepared_resource.is_none() {
+                    let rows_resource = match &ptr.kind {
+                        hir::ExprKind::ResourceRaw { resource, .. } => self
+                            .program
+                            .resources
+                            .get(*resource as usize)
+                            .filter(|definition| {
+                                definition.declaring_module == "pkg.db"
+                                    && definition.generic_arity == 1
+                                    && definition.name.starts_with("pkg.db$rows$")
+                            })
+                            .map(|_| *resource),
+                        _ => None,
+                    };
+                    if descriptor_kind.is_none()
+                        && prepared_resource.is_none()
+                        && rows_resource.is_none()
+                    {
                     return None;
                 }
                 let hir::ExprKind::Int(offset) = &offset.kind else {
@@ -6164,8 +6180,10 @@ impl<'a> BodyValidator<'a> {
                     || callee_flow.ty != Ty::Raw
                     || args.len() != param_tys.len()
                     || args.len() != param_modes.len()
-                    || *return_borrow != hir::ReturnBorrowSummary::None
-                    || *return_region != hir::ReturnRegionSummary::None
+                        || (!matches!(offset, 48)
+                            && *return_borrow != hir::ReturnBorrowSummary::None)
+                        || (!matches!(offset, 48)
+                            && *return_region != hir::ReturnRegionSummary::None)
                     || *return_cleanup != hir::ReturnCleanupAbi::None
                     || arg_flows
                         .iter()
@@ -6189,6 +6207,55 @@ impl<'a> BodyValidator<'a> {
                     signed: true,
                 });
                 let signature_ok = match offset {
+                        40 => {
+                            rows_resource.is_some()
+                                && args.len() == 1
+                                && param_tys.as_slice() == [Ty::Raw]
+                                && param_modes.as_slice() == [align_ast::ParamMode::ByValue]
+                                && expression.ty == i32_ty
+                                && summary_is_none(return_borrow, return_region)
+                        }
+                        48 => {
+                            let resource = rows_resource?;
+                            let definition = self.program.resources.get(resource as usize)?;
+                            let expected_name = format!(
+                                "pkg.db$rows${}",
+                                body_ty_mangle(expression.ty, self.program)
+                            );
+                            let borrows = align_sema::ty_may_borrow(
+                                expression.ty,
+                                &self.program.structs,
+                                &self.program.tuples,
+                                &self.program.enums,
+                                &self.program.tagged_types,
+                            );
+                            let expected_borrow = if borrows {
+                                hir::ReturnBorrowSummary::Roots {
+                                    params: vec![1],
+                                    captures: Vec::new(),
+                                }
+                            } else {
+                                hir::ReturnBorrowSummary::None
+                            };
+                            let expected_region = if borrows {
+                                hir::ReturnRegionSummary::Roots {
+                                    params: vec![1],
+                                    captures: Vec::new(),
+                                }
+                            } else {
+                                hir::ReturnRegionSummary::None
+                            };
+                            definition.name == expected_name
+                                && args.len() == 2
+                                && param_tys.as_slice() == [Ty::Raw, Ty::ResourceRef(resource)]
+                                && param_modes.as_slice()
+                                    == [
+                                        align_ast::ParamMode::ByValue,
+                                        align_ast::ParamMode::ByValue,
+                                    ]
+                                && *return_borrow == expected_borrow
+                                && *return_region == expected_region
+                        }
                     24 => {
                         let resource = prepared_resource?;
                         let params_ty = param_tys.get(1).copied()?;
@@ -6259,6 +6326,7 @@ impl<'a> BodyValidator<'a> {
                             && param_modes.as_slice() == [align_ast::ParamMode::ByValue]
                             && expression.ty == i32_ty
                     }
+                        120 => false,
                     _ => false,
                 };
                 if !signature_ok {

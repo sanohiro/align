@@ -759,6 +759,106 @@ pub fn transfer() {
 }
 
 #[test]
+fn dependent_resources_drop_child_before_parent_on_every_scope_exit() {
+    let internal = r#"module pkg.db.internal.resource
+pub fn drop_parent(handle: raw) {
+  unsafe {
+    print(1)
+    raw.free(handle)
+  }
+}
+
+pub fn drop_child(handle: raw) {
+  unsafe {
+    parent: raw := raw.load(handle, 0)
+    marker: i64 := raw.load(parent, 0)
+    print(if marker == 42 { 2 } else { 9 })
+    raw.free(handle)
+  }
+}
+"#;
+    let root = r#"module pkg.db
+import pkg.db.internal.resource
+
+pub resource parent = pkg.db.internal.resource.drop_parent
+pub resource stmt = pkg.db.internal.resource.drop_child
+
+pub fn open_parent() -> parent {
+  unsafe {
+    handle := raw.alloc(8)
+    raw.store(handle, 0, 42 as i64)
+    return resource.from_raw(handle)
+  }
+}
+
+pub fn open_child(owner: resource_ref<parent>) -> stmt {
+  unsafe {
+    handle := raw.alloc(8)
+    raw.store(handle, 0, resource.raw(owner))
+    output: stmt := resource.from_raw_borrowed(handle, owner)
+    return output
+  }
+}
+
+pub fn fallthrough() {
+  owner := open_parent()
+  dependent := open_child(resource.borrow(owner))
+}
+
+pub fn early() {
+  owner := open_parent()
+  dependent := open_child(resource.borrow(owner))
+  return
+}
+
+fn fail() -> Result<(), Error> = Err(error(7))
+
+pub fn try_exit() -> Result<(), Error> {
+  owner := open_parent()
+  dependent := open_child(resource.borrow(owner))
+  fail()?
+  return Ok(())
+}
+
+pub fn loop_edges() {
+  mut iteration := 0
+  loop {
+    owner := open_parent()
+    dependent := open_child(resource.borrow(owner))
+    iteration = iteration + 1
+    if iteration == 2 { break }
+  }
+}
+"#;
+    let project = [
+        ("pkg/db/internal/resource.align", internal),
+        ("pkg/db.align", root),
+        (
+            "main.align",
+            "module main\nimport pkg.db\nfn main() -> i32 { pkg.db.fallthrough(); pkg.db.early(); result := pkg.db.try_exit(); pkg.db.loop_edges(); return 42 }\n",
+        ),
+    ];
+    let differential = diff_check_multi("resource-drop-order", &project, "main.align");
+    assert_eq!(
+        differential.whole_errors, differential.per_unit_errors,
+        "whole:\n{}\nper-unit:\n{}",
+        differential.whole_diags, differential.per_unit_diags
+    );
+    assert!(!differential.whole_errors, "{}", differential.whole_diags);
+    if backend_available() {
+        let expected = "2\n1\n".repeat(5);
+        let whole = build_and_run_multi("resource-drop-order-whole", &project, "main.align");
+        assert_eq!(whole.status.code(), Some(42));
+        assert_eq!(String::from_utf8_lossy(&whole.stdout), expected);
+
+        let per_unit = build_per_unit_multi("resource-drop-order-units", &project, "main.align")
+            .link_and_run();
+        assert_eq!(per_unit.status.code(), Some(42));
+        assert_eq!(String::from_utf8_lossy(&per_unit.stdout), expected);
+    }
+}
+
+#[test]
 fn declaration_construction_and_transfer_contracts_fail_closed() {
     let non_public = [
         ("pkg/db/internal/resource.align", INTERNAL),
