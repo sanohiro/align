@@ -57,6 +57,28 @@ pub use static_runtime::{
 // to depend on the interface crate just to construct a static input request.
 pub use align_interface::{Driver, DriverRestriction};
 
+/// Whether a PostgreSQL native parameter type is the exact wire mapping for the generated Align
+/// binder shape. Keep this decision on the closed generated tag: source `str`/`string` and
+/// `slice<u8>`/`array<u8>` have already converged to their one runtime representation here, while
+/// nullability remains an orthogonal `Option` bit.
+fn postgres_parameter_type_matches(
+    kind: GeneratedValueKind,
+    canonical_type_name: &str,
+) -> bool {
+    match kind {
+        GeneratedValueKind::Bool => canonical_type_name == "bool",
+        GeneratedValueKind::I16 => canonical_type_name == "int2",
+        GeneratedValueKind::I32 => canonical_type_name == "int4",
+        GeneratedValueKind::I64 => canonical_type_name == "int8",
+        GeneratedValueKind::F32 => canonical_type_name == "float4",
+        GeneratedValueKind::F64 => canonical_type_name == "float8",
+        GeneratedValueKind::Text => {
+            matches!(canonical_type_name, "text" | "varchar" | "name")
+        }
+        GeneratedValueKind::Bytes => canonical_type_name == "bytea",
+    }
+}
+
 /// Result of running the pipeline through sema.
 pub struct Checked {
     pub hir: align_sema::Program,
@@ -746,6 +768,15 @@ fn install_static_descriptor_data(
                                 descriptor.descriptor_id
                             )
                         })?;
+                    if !postgres_parameter_type_matches(
+                        field.shape.kind,
+                        canonical_type_name,
+                    ) {
+                        return Err(format!(
+                            "static descriptor `{}` maps PostgreSQL parameter `{parameter_name}` to incompatible native type `{canonical_type_name}`",
+                            descriptor.descriptor_id,
+                        ));
+                    }
                     static_calls.push((
                         postgres_type_callback.clone(),
                         vec![
@@ -3560,6 +3591,37 @@ pub fn format_diagnostics(source_map: &SourceMap, diags: &Diagnostics) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn postgres_parameter_types_match_only_the_exact_generated_shape() {
+        let admitted = [
+            (GeneratedValueKind::Bool, &["bool"][..]),
+            (GeneratedValueKind::I16, &["int2"][..]),
+            (GeneratedValueKind::I32, &["int4"][..]),
+            (GeneratedValueKind::I64, &["int8"][..]),
+            (GeneratedValueKind::F32, &["float4"][..]),
+            (GeneratedValueKind::F64, &["float8"][..]),
+            (GeneratedValueKind::Text, &["text", "varchar", "name"][..]),
+            (GeneratedValueKind::Bytes, &["bytea"][..]),
+        ];
+        let canonical = [
+            "bool", "int2", "int4", "int8", "float4", "float8", "text", "varchar", "name",
+            "bytea",
+        ];
+        for (kind, accepted) in admitted {
+            for candidate in canonical {
+                assert_eq!(
+                    postgres_parameter_type_matches(kind, candidate),
+                    accepted.contains(&candidate),
+                    "{kind:?} / {candidate} must follow the exact PostgreSQL mapping",
+                );
+            }
+            assert!(
+                !postgres_parameter_type_matches(kind, "numeric"),
+                "deferred PostgreSQL types must stay unavailable for {kind:?}",
+            );
+        }
+    }
 
     // ---- rt-LTO profile default (settled 2026-08-09) -----------------------------------------------
     // The CLI resolves an absent --rt-lto/--no-rt-lto flag through this exact mapping; pin all five

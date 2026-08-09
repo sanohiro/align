@@ -395,6 +395,38 @@ fn main() -> i32 = 0
 }
 
 #[test]
+fn postgres_parameter_type_must_match_the_params_field_shape() {
+    let mismatched_query = QUERY.replacen(
+        "pkg.db.postgres.QueryOption.ParameterType(\"id\", \"int8\")",
+        "pkg.db.postgres.QueryOption.ParameterType(\"id\", \"text\")",
+        1,
+    );
+    let main = "module main\nimport app.q4b_query\nfn main() -> i32 = 0\n";
+    let files = [
+        ("pkg/db.align", DB),
+        ("pkg/db/sqlite.align", SQLITE),
+        ("pkg/db/postgres.align", POSTGRES),
+        ("pkg/db/internal.align", INTERNAL),
+        ("pkg/db/internal/resource.align", RESOURCE),
+        ("pkg/db/internal/descriptor.align", DESCRIPTOR),
+        ("pkg/db/internal/sqlite.align", INTERNAL_SQLITE),
+        ("pkg/db/internal/postgres.align", INTERNAL_POSTGRES),
+        ("app/q4b_query.align", mismatched_query.as_str()),
+        ("main.align", main),
+    ];
+    let diagnostics = build_per_unit_multi_diagnostics(
+        "pkg-db-q4b-postgres-parameter-type-mismatch",
+        &files,
+        "main.align",
+    );
+    assert!(
+        diagnostics
+            .contains("maps PostgreSQL parameter `id` to incompatible native type `text`"),
+        "the generated runtime boundary must reject an incompatible ParameterType:\n{diagnostics}",
+    );
+}
+
+#[test]
 fn streamed_views_cannot_cross_generation_or_escape() {
     let cases = [
         (

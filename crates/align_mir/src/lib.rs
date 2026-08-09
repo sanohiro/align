@@ -15381,16 +15381,16 @@ pub fn decode_current(
         );
 
         let mut malformed = hir.clone();
-        let function = malformed
+        let Some(function) = malformed
             .fns
             .iter_mut()
             .find(|function| function.name == "pkg.db.internal.sqlite$decode_current")
-            .expect("concrete streaming decoder bridge");
-        let outer = function
-            .body
-            .value
-            .as_deref_mut()
-            .expect("decoder bridge must retain its unsafe block value");
+        else {
+            panic!("concrete streaming decoder bridge must remain present")
+        };
+        let Some(outer) = function.body.value.as_deref_mut() else {
+            panic!("decoder bridge must retain its unsafe block value")
+        };
         let hir::ExprKind::Unsafe(block) = &mut outer.kind else {
             panic!("decoder bridge expression must retain its unsafe block")
         };

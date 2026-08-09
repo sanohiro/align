@@ -794,6 +794,22 @@ pub fn build_per_unit_multi(name: &str, files: &[(&str, &str)], entry: &str) -> 
     }
 }
 
+/// Run the per-unit build and return its rendered diagnostics without requiring a clean result.
+/// Negative owner tests use this to exercise failures that arise after checking, while installing
+/// compiler-generated static runtime data.
+pub fn build_per_unit_multi_diagnostics(
+    name: &str,
+    files: &[(&str, &str)],
+    entry: &str,
+) -> String {
+    let proj = TempProject::new(name, files);
+    let entry_path = proj.entry(entry);
+    let entry_src = std::fs::read_to_string(&entry_path).expect("read entry");
+    let mut sm = SourceMap::new();
+    let walk = build_per_unit(&mut sm, &entry_path.display().to_string(), &entry_src);
+    align_driver::format_diagnostics(&sm, &walk.diags)
+}
+
 /// The defined/undefined symbols of an object file via `llvm-nm`, one `(kind, name)` per line
 /// (kind is nm's single-letter type: `T`/`t` text, `U` undefined, etc.). `None` if `llvm-nm` is
 /// not discoverable (the caller skips the assertion).

@@ -17786,6 +17786,36 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
+    /// An indirect call evaluates its function value before its explicit arguments. A capturing
+    /// closure is therefore another eager peer of every argument, and an exclusive argument may
+    /// not advance an owner generation retained by that callee environment.
+    fn check_indirect_call_callee_aliases(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        modes: &[ast::ParamMode],
+    ) {
+        let callee_roots = self.borrow_sources(callee);
+        if callee_roots.is_empty() {
+            return;
+        }
+        for (index, argument) in args.iter().enumerate() {
+            if modes.get(index) != Some(&ast::ParamMode::BorrowMut) {
+                continue;
+            }
+            let advanced = self.borrow_mut_invalidation_roots(argument);
+            if callee_roots.iter().any(|root| advanced.contains(root)) {
+                self.diags.error(
+                    format!(
+                        "function value captures an owner invalidated by exclusive argument {}",
+                        index + 1,
+                    ),
+                    callee.span,
+                );
+            }
+        }
+    }
+
     fn local_storage_roots(&self, id: LocalId) -> BorrowRoots {
         let mut roots = self.borrows.sources.get(&id).cloned().unwrap_or_default();
         let region_param = self
@@ -18199,48 +18229,25 @@ impl<'a> MoveCheck<'a> {
     /// A `borrow mut` argument is deliberately advanced by the call itself. When that call returns
     /// a value rooted in the fresh post-call generation (for example `db.next(rows)`), validating
     /// the argument's pre-call snapshot after the mutation would reject the intended generation
-    /// transition. Other eager arguments remain ordinary snapshots and are still checked.
+    /// transition. Only the exact mutable argument snapshot is exempt: a callee or another eager
+    /// value may retain the same pre-call roots and must still be rejected after the advancement.
     fn intentional_borrow_mut_snapshot(&self, expression: &Expr, snapshot: usize) -> bool {
-        let belongs_to_argument = |argument: &Expr| {
-            if Self::expr_key(argument) == snapshot {
-                return true;
-            }
-            let advanced = self.borrow_mut_invalidation_roots(argument);
-            if self
-                .ended_value_snapshot(snapshot)
-                .is_some_and(|(root, _)| advanced.contains(&root))
-            {
-                return true;
-            }
-            self.walked_value_facts.get(&snapshot).is_some_and(|fact| {
-                let retained = fact.flatten();
-                !retained.is_empty() && retained.iter().all(|root| advanced.contains(root))
-            })
-        };
+        let is_exact_snapshot = |argument: &Expr| Self::expr_key(argument) == snapshot;
         match &expression.kind {
             ExprKind::Call { func, args, .. } => {
                 self.named_param_modes.get(func).is_some_and(|modes| {
-                    if args.len() == 1 && modes.first() == Some(&ast::ParamMode::BorrowMut) {
-                        return true;
-                    }
                     args.iter().enumerate().any(|(index, argument)| {
                         modes.get(index) == Some(&ast::ParamMode::BorrowMut)
-                            && belongs_to_argument(argument)
+                            && is_exact_snapshot(argument)
                     })
                 })
             }
             ExprKind::CallFnValue { callee, args } => match callee.ty {
                 Ty::Fn(id) => self.fn_types.get(id as usize).is_some_and(|function| {
-                    if args.len() == 1
-                        && function.params.first().map(|(mode, _)| *mode)
-                            == Some(ast::ParamMode::BorrowMut)
-                    {
-                        return true;
-                    }
                     args.iter().enumerate().any(|(index, argument)| {
                         function.params.get(index).map(|(mode, _)| *mode)
                             == Some(ast::ParamMode::BorrowMut)
-                            && belongs_to_argument(argument)
+                            && is_exact_snapshot(argument)
                     })
                 }),
                 _ => false,
@@ -22903,6 +22910,7 @@ impl<'a> MoveCheck<'a> {
                     _ => None,
                 };
                 if let Some(modes) = &modes {
+                    self.check_indirect_call_callee_aliases(callee, args, modes);
                     self.check_call_borrow_aliases("function value", args, modes);
                 }
                 let mode_count = modes.as_ref().map_or(0, Vec::len);
@@ -30160,9 +30168,9 @@ impl<'a, 't> Checker<'a, 't> {
                 None
             };
             let (func, type_args, call_args) = if available || self.mono_args.is_empty() {
-                let type_args = if method.starts_with("explain_") {
-                    vec![params_ty, instance.args[1]]
-                } else if method.starts_with("rows_") {
+                let type_args = if method.starts_with("explain_")
+                    || method.starts_with("rows_")
+                {
                     vec![params_ty, instance.args[1]]
                 } else if method.starts_with("one_") {
                     vec![params_ty, payload]
@@ -45196,6 +45204,126 @@ fn main() -> i32 = 0
                 "a malformed product write must retain old and incoming parameter and local-generation roots"
             );
         }
+    }
+
+    #[test]
+    fn indirect_borrow_mut_exempts_only_argument_and_rejects_callee_capture() {
+        let (program, diagnostics) = check(
+            "\
+fn replace(borrow mut value: string) {}
+fn probe() {
+  mut value := \"before\".clone()
+  apply := replace
+  apply(value)
+}
+fn main() -> i32 = 0
+",
+        );
+        assert!(!diagnostics.has_errors());
+        let function = program
+            .fns
+            .iter()
+            .find(|function| function.name == "probe")
+            .expect("probe function");
+        let call = function
+            .body
+            .value
+            .as_deref()
+            .filter(|expression| matches!(expression.kind, ExprKind::CallFnValue { .. }))
+            .or_else(|| {
+                function.body.stmts.iter().find_map(|statement| match statement {
+                    hir::Stmt::Expr(
+                        expression @ Expr {
+                            kind: ExprKind::CallFnValue { .. },
+                            ..
+                        },
+                    ) => Some(expression),
+                    _ => None,
+                })
+            })
+            .expect("indirect call");
+        let ExprKind::CallFnValue { callee, args } = &call.kind else {
+            unreachable!("selected an indirect call")
+        };
+        let ExprKind::Local(callee_local) = &callee.kind else {
+            panic!("function value must be a local")
+        };
+        let ExprKind::Local(argument_local) = &args[0].kind else {
+            panic!("exclusive argument must be a local")
+        };
+        let named = program
+            .fns
+            .iter()
+            .map(|function| (function.name.clone(), function.return_borrow.clone()))
+            .collect();
+        let named_modes = program
+            .fns
+            .iter()
+            .map(|function| (function.name.clone(), function.param_modes.clone()))
+            .collect();
+        let callable_targets = vec![CallableTargetSet::new(); program.fn_types.len()];
+        let callable_target_ids = std::collections::HashMap::new();
+        let mut sink = Diagnostics::new();
+        let mut checker = MoveCheck {
+            f: function,
+            diags: &mut sink,
+            named_return_borrow: &named,
+            named_param_modes: &named_modes,
+            summary_dependencies: None,
+            tuples: &program.tuples,
+            structs: &program.structs,
+            enums: &program.enums,
+            tagged_types: &program.tagged_types,
+            fn_types: &program.fn_types,
+            callable_targets: &callable_targets,
+            callable_target_ids: &callable_target_ids,
+            loop_breaks: Vec::new(),
+            borrows: BorrowState::default(),
+            next_pipeline_snapshot: 0,
+            loop_borrow_breaks: Vec::new(),
+            loop_value_breaks: Vec::new(),
+            loop_value_facts: std::collections::HashMap::new(),
+            control_value_facts: std::collections::HashMap::new(),
+            walked_value_facts: std::collections::HashMap::new(),
+            value_snapshot_frames: Vec::new(),
+            reported_invalid_value_actions: std::collections::HashSet::new(),
+            loop_iter_drops: Vec::new(),
+            arena_depth: 0,
+            return_roots: BorrowRoots::new(),
+            non_fallthrough: std::collections::HashSet::new(),
+            borrow_fact_cache: std::cell::RefCell::new(None),
+            collecting_move_children: false,
+            move_children: Vec::new(),
+        };
+        assert!(
+            checker.intentional_borrow_mut_snapshot(call, MoveCheck::expr_key(&args[0])),
+            "the exact exclusive-argument snapshot is the one intentional generation transition",
+        );
+        assert!(
+            !checker.intentional_borrow_mut_snapshot(call, MoveCheck::expr_key(callee)),
+            "a single borrow-mut argument must not suppress the callee snapshot",
+        );
+
+        checker.borrows.assign(
+            *callee_local,
+            BorrowFact::from_direct([BorrowRoot::Local(*argument_local)].into_iter().collect()),
+        );
+        let Ty::Fn(function_type) = callee.ty else {
+            panic!("callee must have a function-value type")
+        };
+        let modes = checker.fn_types[function_type as usize]
+            .params
+            .iter()
+            .map(|(mode, _)| *mode)
+            .collect::<Vec<_>>();
+        checker.check_indirect_call_callee_aliases(callee, args, &modes);
+        drop(checker);
+        assert!(
+            sink.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("function value captures an owner invalidated by exclusive argument 1")),
+            "a callee environment retaining the exclusive argument's owner must be rejected",
+        );
     }
 
     #[test]
