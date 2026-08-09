@@ -2,6 +2,7 @@ module pkg.db.sqlite
 
 import std.process
 import pkg.db
+import pkg.db.internal
 import pkg.db.internal.resource
 import pkg.db.internal.descriptor
 import pkg.db.internal.sqlite
@@ -624,12 +625,6 @@ fn metadata_live(target: pkg.db.exec) -> Result<(), pkg.db.Error> {
     closed: u8 := raw.load(state, 5)
     reserved: u16 := raw.load(state, 6)
     native: raw := raw.load(state, 8)
-    if version != 1 || closed != 0 || reserved != 0 || native.is_null() {
-      return Err(contract_error(
-        "db.meta.exec",
-        "database metadata requires a live SQLite connection",
-      ))
-    }
     if driver != 1 {
       return Err(pkg.db.Error.DriverMismatch(pkg.db.ContractError {
         query_id: None,
@@ -637,7 +632,21 @@ fn metadata_live(target: pkg.db.exec) -> Result<(), pkg.db.Error> {
         message: "SQLite metadata requires a SQLite connection".clone(),
       }))
     }
+    if version != 1 || closed != 0 || reserved != 0 || native.is_null() {
+      return Err(contract_error(
+        "db.meta.exec",
+        "database metadata requires a live SQLite connection",
+      ))
+    }
     return Ok(())
+  }
+}
+
+fn seal_metadata_controls(controls: SqliteMetaControls) -> pkg.db.internal.SqliteCatalogControls {
+  return pkg.db.internal.SqliteCatalogControls {
+    include_system: controls.include_system,
+    include_internal: controls.include_internal,
+    include_hidden: controls.include_hidden,
   }
 }
 
@@ -663,7 +672,7 @@ pub fn meta_schemas_native(
   controls := metadata_controls(options, native)?
   metadata_live(target)?
   return pkg.db.catalog_sqlite_schemas(
-    target, detail, out, controls.include_system,
+    target, detail, out, seal_metadata_controls(controls),
   )
 }
 
@@ -683,8 +692,7 @@ pub fn meta_tables_native(
     schema_filter,
     detail,
     out,
-    controls.include_system,
-    controls.include_system || controls.include_internal,
+    seal_metadata_controls(controls),
   )
 }
 
@@ -704,8 +712,7 @@ pub fn meta_table_native(
     table_ref,
     detail,
     out,
-    controls.include_system,
-    controls.include_system || controls.include_internal,
+    seal_metadata_controls(controls),
   )
 }
 
@@ -725,9 +732,7 @@ pub fn meta_columns_native(
     table_ref,
     detail,
     out,
-    controls.include_system,
-    controls.include_system || controls.include_internal,
-    controls.include_hidden,
+    seal_metadata_controls(controls),
   )
 }
 
@@ -747,8 +752,7 @@ pub fn meta_keys_native(
     table_ref,
     detail,
     out,
-    controls.include_system,
-    controls.include_system || controls.include_internal,
+    seal_metadata_controls(controls),
   )
 }
 
@@ -768,8 +772,7 @@ pub fn meta_indexes_native(
     table_ref,
     detail,
     out,
-    controls.include_system,
-    controls.include_system || controls.include_internal,
+    seal_metadata_controls(controls),
   )
 }
 

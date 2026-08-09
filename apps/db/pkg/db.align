@@ -2397,7 +2397,11 @@ fn postgres_meta_indexes_configured(
       column_projection = column
       expression_projection = expression
       predicate_projection = predicate
-      if key_tag != 0 {
+      btree_sort := match method {
+        Some(native_method) => native_method == "btree"
+        None => false
+      }
+      if key_tag != 0 && btree_sort {
         sort_projection = if descending == 0 {
           Some(MetaSortOrder.Asc)
         } else { Some(MetaSortOrder.Desc) }
@@ -2436,18 +2440,18 @@ fn postgres_meta_indexes_configured(
   return Ok(rows.build())
 }
 
-// Driver-qualified metadata entry points validate their public option phases in the driver
-// module, then enter these package-owned catalog implementations. Align has no package-private
-// visibility yet, so these deliberately avoid the public `meta_*` namespace used by the supported
-// API while keeping all cursor, projection, and cleanup logic single-owned here.
+// Driver-qualified metadata entry points validate their public option phases in the driver module,
+// then enter these package-owned catalog implementations with a sealed `pkg.db.internal` control.
+// Consumer modules cannot import or construct that control, so these cross-module adapters do not
+// expose a raw-boolean path around the supported `meta_*` option surface.
 pub fn catalog_sqlite_schemas(
   target: exec,
   detail: MetaDetail,
   out: region,
-  include_system: bool,
+  controls: pkg.db.internal.SqliteCatalogControls,
 ) -> Result<array<SchemaMeta>, Error> {
   catalog_driver_valid(target, 1, "SQLite metadata requires a SQLite connection")?
-  return sqlite_meta_schemas(target, detail, out, include_system)
+  return sqlite_meta_schemas(target, detail, out, controls.include_system)
 }
 
 pub fn catalog_sqlite_tables(
@@ -2455,13 +2459,17 @@ pub fn catalog_sqlite_tables(
   schema_filter: Option<SchemaRef>,
   detail: MetaDetail,
   out: region,
-  include_system: bool,
-  include_internal: bool,
+  controls: pkg.db.internal.SqliteCatalogControls,
 ) -> Result<array<TableMeta>, Error> {
   match schema_filter { Some(reference) => { metadata_schema_valid(reference)? } None => {} }
   catalog_driver_valid(target, 1, "SQLite metadata requires a SQLite connection")?
   return sqlite_meta_tables(
-    target, schema_filter, detail, out, include_system, include_internal,
+    target,
+    schema_filter,
+    detail,
+    out,
+    controls.include_system,
+    controls.include_system || controls.include_internal,
   )
 }
 
@@ -2470,11 +2478,17 @@ pub fn catalog_sqlite_table(
   table_ref: TableRef,
   detail: MetaDetail,
   out: region,
-  include_system: bool,
-  include_internal: bool,
+  controls: pkg.db.internal.SqliteCatalogControls,
 ) -> Result<TableMeta, Error> {
   metadata_table_valid(table_ref)?
-  return sqlite_meta_table(target, table_ref, detail, out, include_system, include_internal)
+  return sqlite_meta_table(
+    target,
+    table_ref,
+    detail,
+    out,
+    controls.include_system,
+    controls.include_system || controls.include_internal,
+  )
 }
 
 pub fn catalog_sqlite_columns(
@@ -2482,13 +2496,17 @@ pub fn catalog_sqlite_columns(
   table_ref: TableRef,
   detail: MetaDetail,
   out: region,
-  include_system: bool,
-  include_internal: bool,
-  include_hidden: bool,
+  controls: pkg.db.internal.SqliteCatalogControls,
 ) -> Result<array<ColumnMeta>, Error> {
   metadata_table_valid(table_ref)?
   return sqlite_meta_columns_configured(
-    target, table_ref, detail, out, include_system, include_internal, include_hidden,
+    target,
+    table_ref,
+    detail,
+    out,
+    controls.include_system,
+    controls.include_system || controls.include_internal,
+    controls.include_hidden,
   )
 }
 
@@ -2497,12 +2515,16 @@ pub fn catalog_sqlite_keys(
   table_ref: TableRef,
   detail: MetaDetail,
   out: region,
-  include_system: bool,
-  include_internal: bool,
+  controls: pkg.db.internal.SqliteCatalogControls,
 ) -> Result<array<KeyMeta>, Error> {
   metadata_table_valid(table_ref)?
   return sqlite_meta_keys_configured(
-    target, table_ref, detail, out, include_system, include_internal,
+    target,
+    table_ref,
+    detail,
+    out,
+    controls.include_system,
+    controls.include_system || controls.include_internal,
   )
 }
 
@@ -2511,12 +2533,16 @@ pub fn catalog_sqlite_indexes(
   table_ref: TableRef,
   detail: MetaDetail,
   out: region,
-  include_system: bool,
-  include_internal: bool,
+  controls: pkg.db.internal.SqliteCatalogControls,
 ) -> Result<array<IndexMeta>, Error> {
   metadata_table_valid(table_ref)?
   return sqlite_meta_indexes_configured(
-    target, table_ref, detail, out, include_system, include_internal,
+    target,
+    table_ref,
+    detail,
+    out,
+    controls.include_system,
+    controls.include_system || controls.include_internal,
   )
 }
 
@@ -2524,12 +2550,11 @@ pub fn catalog_postgres_schemas(
   target: exec,
   detail: MetaDetail,
   out: region,
-  include_system: bool,
-  search_path_only: bool,
+  controls: pkg.db.internal.PostgresCatalogControls,
 ) -> Result<array<SchemaMeta>, Error> {
   catalog_driver_valid(target, 2, "PostgreSQL metadata requires a PostgreSQL connection")?
   return postgres_meta_schemas_configured(
-    target, detail, out, include_system, search_path_only,
+    target, detail, out, controls.include_system, controls.search_path_only,
   )
 }
 
@@ -2538,13 +2563,17 @@ pub fn catalog_postgres_tables(
   schema_filter: Option<SchemaRef>,
   detail: MetaDetail,
   out: region,
-  include_system: bool,
-  search_path_only: bool,
+  controls: pkg.db.internal.PostgresCatalogControls,
 ) -> Result<array<TableMeta>, Error> {
   match schema_filter { Some(reference) => { metadata_schema_valid(reference)? } None => {} }
   catalog_driver_valid(target, 2, "PostgreSQL metadata requires a PostgreSQL connection")?
   return postgres_meta_tables_configured(
-    target, schema_filter, detail, out, include_system, search_path_only,
+    target,
+    schema_filter,
+    detail,
+    out,
+    controls.include_system,
+    controls.search_path_only,
   )
 }
 
@@ -2553,11 +2582,13 @@ pub fn catalog_postgres_table(
   table_ref: TableRef,
   detail: MetaDetail,
   out: region,
-  include_system: bool,
+  controls: pkg.db.internal.PostgresCatalogControls,
 ) -> Result<TableMeta, Error> {
   metadata_table_valid(table_ref)?
   catalog_driver_valid(target, 2, "PostgreSQL metadata requires a PostgreSQL connection")?
-  return postgres_meta_table_configured(target, table_ref, detail, out, include_system)
+  return postgres_meta_table_configured(
+    target, table_ref, detail, out, controls.include_system,
+  )
 }
 
 pub fn catalog_postgres_columns(
@@ -2565,10 +2596,12 @@ pub fn catalog_postgres_columns(
   table_ref: TableRef,
   detail: MetaDetail,
   out: region,
-  include_system: bool,
+  controls: pkg.db.internal.PostgresCatalogControls,
 ) -> Result<array<ColumnMeta>, Error> {
   metadata_table_valid(table_ref)?
-  return postgres_meta_columns_configured(target, table_ref, detail, out, include_system)
+  return postgres_meta_columns_configured(
+    target, table_ref, detail, out, controls.include_system,
+  )
 }
 
 pub fn catalog_postgres_keys(
@@ -2576,10 +2609,10 @@ pub fn catalog_postgres_keys(
   table_ref: TableRef,
   detail: MetaDetail,
   out: region,
-  include_system: bool,
+  controls: pkg.db.internal.PostgresCatalogControls,
 ) -> Result<array<KeyMeta>, Error> {
   metadata_table_valid(table_ref)?
-  return postgres_meta_keys_configured(target, table_ref, detail, out, include_system)
+  return postgres_meta_keys_configured(target, table_ref, detail, out, controls.include_system)
 }
 
 pub fn catalog_postgres_indexes(
@@ -2587,10 +2620,12 @@ pub fn catalog_postgres_indexes(
   table_ref: TableRef,
   detail: MetaDetail,
   out: region,
-  include_system: bool,
+  controls: pkg.db.internal.PostgresCatalogControls,
 ) -> Result<array<IndexMeta>, Error> {
   metadata_table_valid(table_ref)?
-  return postgres_meta_indexes_configured(target, table_ref, detail, out, include_system)
+  return postgres_meta_indexes_configured(
+    target, table_ref, detail, out, controls.include_system,
+  )
 }
 
 pub fn meta_database(

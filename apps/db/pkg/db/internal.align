@@ -35,6 +35,20 @@ SQLITE_OK: i32 := 0
 SQLITE_INTEGER: i32 := 1
 POSTGRES_INT8_OID: u32 := 20
 
+// Sealed catalog controls cross from the public driver descendants into the common root without
+// exposing a second raw-boolean metadata API. The `internal` path rule prevents application and
+// sibling-package code from importing or constructing these values.
+pub SqliteCatalogControls {
+  include_system: bool,
+  include_internal: bool,
+  include_hidden: bool,
+}
+
+pub PostgresCatalogControls {
+  include_system: bool,
+  search_path_only: bool,
+}
+
 // The Q2 call-scoped execution context is package-owned raw storage:
 //   0: u32 version (= 1)
 //   4: u8  driver (1 SQLite, 2 PostgreSQL)

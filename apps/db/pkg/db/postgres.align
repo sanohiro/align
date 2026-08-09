@@ -2,6 +2,7 @@ module pkg.db.postgres
 
 import std.process
 import pkg.db
+import pkg.db.internal
 import pkg.db.internal.resource
 import pkg.db.internal.descriptor
 import pkg.db.internal.postgres
@@ -895,12 +896,6 @@ fn metadata_live(target: pkg.db.exec) -> Result<(), pkg.db.Error> {
     closed: u8 := raw.load(state, 5)
     reserved: u16 := raw.load(state, 6)
     native: raw := raw.load(state, 8)
-    if version != 1 || closed != 0 || reserved != 0 || native.is_null() {
-      return Err(contract_error(
-        "db.meta.exec",
-        "database metadata requires a live PostgreSQL connection",
-      ))
-    }
     if driver != 2 {
       return Err(pkg.db.Error.DriverMismatch(pkg.db.ContractError {
         query_id: None,
@@ -908,7 +903,20 @@ fn metadata_live(target: pkg.db.exec) -> Result<(), pkg.db.Error> {
         message: "PostgreSQL metadata requires a PostgreSQL connection".clone(),
       }))
     }
+    if version != 1 || closed != 0 || reserved != 0 || native.is_null() {
+      return Err(contract_error(
+        "db.meta.exec",
+        "database metadata requires a live PostgreSQL connection",
+      ))
+    }
     return Ok(())
+  }
+}
+
+fn seal_metadata_controls(controls: PostgresMetaControls) -> pkg.db.internal.PostgresCatalogControls {
+  return pkg.db.internal.PostgresCatalogControls {
+    include_system: controls.include_system || controls.include_system_catalogs,
+    search_path_only: controls.search_path_only,
   }
 }
 
@@ -937,8 +945,7 @@ pub fn meta_schemas_native(
     target,
     detail,
     out,
-    controls.include_system || controls.include_system_catalogs,
-    controls.search_path_only,
+    seal_metadata_controls(controls),
   )
 }
 
@@ -958,8 +965,7 @@ pub fn meta_tables_native(
     schema_filter,
     detail,
     out,
-    controls.include_system || controls.include_system_catalogs,
-    controls.search_path_only,
+    seal_metadata_controls(controls),
   )
 }
 
@@ -979,7 +985,7 @@ pub fn meta_table_native(
     table_ref,
     detail,
     out,
-    controls.include_system || controls.include_system_catalogs,
+    seal_metadata_controls(controls),
   )
 }
 
@@ -999,7 +1005,7 @@ pub fn meta_columns_native(
     table_ref,
     detail,
     out,
-    controls.include_system || controls.include_system_catalogs,
+    seal_metadata_controls(controls),
   )
 }
 
@@ -1019,7 +1025,7 @@ pub fn meta_keys_native(
     table_ref,
     detail,
     out,
-    controls.include_system || controls.include_system_catalogs,
+    seal_metadata_controls(controls),
   )
 }
 
@@ -1039,7 +1045,7 @@ pub fn meta_indexes_native(
     table_ref,
     detail,
     out,
-    controls.include_system || controls.include_system_catalogs,
+    seal_metadata_controls(controls),
   )
 }
 

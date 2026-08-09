@@ -328,6 +328,17 @@ pub fn sqlite(target: pkg.db.exec) -> bool {
   }
 }
 
+pub fn set_closed(target: pkg.db.exec, closed: bool) {
+  unsafe {
+    state := match target {
+      Conn(reference) => resource.raw(reference)
+      Tx(_) => { return }
+    }
+    tag: u8 := if closed { 1 } else { 0 }
+    raw.store(state, 5, tag)
+  }
+}
+
 pub fn postgres(target: pkg.db.exec) -> bool {
   unsafe {
     state := match target {
@@ -335,7 +346,7 @@ pub fn postgres(target: pkg.db.exec) -> bool {
       Tx(_) => { return false }
     }
     connection: raw := raw.load(state, 8)
-    sql := c_string("DROP SCHEMA IF EXISTS align_q5b2 CASCADE; DROP SCHEMA IF EXISTS pguser_q5b2 CASCADE; CREATE SCHEMA align_q5b2; CREATE SCHEMA pguser_q5b2; SET search_path = align_q5b2; CREATE TABLE align_q5b2.counter (value BIGINT NOT NULL); INSERT INTO align_q5b2.counter VALUES (0); CREATE TABLE align_q5b2.parent (id BIGINT PRIMARY KEY); CREATE TABLE align_q5b2.child (a BIGINT, b TEXT, generated BIGINT GENERATED ALWAYS AS (a + 1) STORED, PRIMARY KEY (a, b), UNIQUE (b), FOREIGN KEY (a) REFERENCES align_q5b2.parent(id) ON DELETE CASCADE); CREATE INDEX align_q5b2_child_b ON align_q5b2.child (b DESC) INCLUDE (generated)")
+    sql := c_string("DROP SCHEMA IF EXISTS align_q5b2 CASCADE; DROP SCHEMA IF EXISTS pguser_q5b2 CASCADE; CREATE SCHEMA align_q5b2; CREATE SCHEMA pguser_q5b2; SET search_path = align_q5b2; CREATE TABLE align_q5b2.counter (value BIGINT NOT NULL); INSERT INTO align_q5b2.counter VALUES (0); CREATE TABLE align_q5b2.parent (id BIGINT PRIMARY KEY); CREATE TABLE align_q5b2.child (a BIGINT, b TEXT, generated BIGINT GENERATED ALWAYS AS (a + 1) STORED, PRIMARY KEY (a, b), UNIQUE (b), FOREIGN KEY (a) REFERENCES align_q5b2.parent(id) ON DELETE CASCADE); CREATE INDEX align_q5b2_child_b ON align_q5b2.child (b DESC) INCLUDE (generated); CREATE INDEX align_q5b2_child_b_hash ON align_q5b2.child USING hash (b)")
     result := PQexec(connection, sql)
     raw.free(sql)
     if result.is_null() { return false }
@@ -752,6 +763,7 @@ fn main() -> i32 {
 
 const POSTGRES_MAIN: &str = r#"module main
 import pkg.db
+import pkg.db.sqlite
 import pkg.db.postgres
 import pkg.db.q5b2_setup
 import app.pg_inspect
@@ -759,6 +771,31 @@ import app.pg_inspect
 fn json_plan(value: pkg.db.PlanFormat) -> bool = match value {
   Json => true
   _ => false
+}
+
+fn mismatch<T>(result: Result<T, pkg.db.Error>) -> bool = match result {
+  Err(error) => match error { DriverMismatch(_) => true _ => false }
+  Ok(_) => false
+}
+
+fn descending(value: Option<pkg.db.MetaSortOrder>) -> bool = match value {
+  Some(Desc) => true
+  _ => false
+}
+
+fn nulls_first(value: Option<pkg.db.MetaNullOrder>) -> bool = match value {
+  Some(First) => true
+  _ => false
+}
+
+fn no_sort(value: Option<pkg.db.MetaSortOrder>) -> bool = match value {
+  None => true
+  Some(_) => false
+}
+
+fn no_null_order(value: Option<pkg.db.MetaNullOrder>) -> bool = match value {
+  None => true
+  Some(_) => false
 }
 
 fn contract_item<T>(result: Result<T, pkg.db.Error>, expected: str) -> bool = match result {
@@ -868,10 +905,26 @@ fn run(url: str) -> i32 {
     indexes := pkg.db.postgres.meta_indexes_native(
       target, child, pkg.db.MetaDetail.Full, out, [], [],
     ) else { return 15 }
-    if indexes.len() != 5 || indexes[0].name != "align_q5b2_child_b"
+    if indexes.len() != 6 || indexes[0].name != "align_q5b2_child_b"
       || indexes[0].term_ordinal != 0 || indexes[1].term_ordinal != 1 {
       return 16
     }
+    if !descending(indexes[0].sort_order) || !nulls_first(indexes[0].null_order) {
+      return 38
+    }
+    hash := indexes[2]
+    hash_method := hash.native_method else { return 39 }
+    if hash.name != "align_q5b2_child_b_hash" || hash_method != "hash"
+      || !no_sort(hash.sort_order) || !no_null_order(hash.null_order) {
+      return 40
+    }
+
+    pkg.db.q5b2_setup.set_closed(target, true)
+    wrong_driver := pkg.db.sqlite.meta_schemas_native(
+      target, pkg.db.MetaDetail.Names, out, [], [],
+    )
+    pkg.db.q5b2_setup.set_closed(target, false)
+    if !mismatch(wrong_driver) { return 41 }
 
     conflict := pkg.db.postgres.meta_table_native(
       target,
@@ -953,6 +1006,7 @@ const POSTGRES_BRIDGE_MAIN: &str = r#"module main
 import pkg.db
 import pkg.db.sqlite
 import pkg.db.postgres
+import pkg.db.q5b2_setup
 import pkg.db.bad_normalized_explain
 import app.pg_inspect
 
@@ -974,6 +1028,12 @@ fn main() -> i32 {
   connection := opened else { return 1 }
   target := pkg.db.exec_conn(connection)
   arena out {
+    pkg.db.q5b2_setup.set_closed(target, true)
+    poisoned_wrong_driver := pkg.db.postgres.meta_schemas_native(
+      target, pkg.db.MetaDetail.Names, out, [], [],
+    )
+    pkg.db.q5b2_setup.set_closed(target, false)
+    if !mismatch(poisoned_wrong_driver) { return 7 }
     settings := pkg.db.postgres.explain_native(
       target,
       app.pg_inspect.mutate(),
@@ -1118,6 +1178,41 @@ fn q5b2_publishes_exact_common_and_native_surface() {
             );
         }
     }
+}
+
+#[test]
+fn catalog_adapters_require_an_internal_sealed_control() {
+    for sealed in [
+        "controls: pkg.db.internal.SqliteCatalogControls",
+        "controls: pkg.db.internal.PostgresCatalogControls",
+    ] {
+        assert!(
+            DB.contains(sealed),
+            "catalog adapter lacks sealed control `{sealed}`"
+        );
+    }
+
+    let bypass = r#"module main
+import pkg.db
+
+fn bypass(
+  target: pkg.db.exec,
+  out: region,
+) -> Result<array<pkg.db.SchemaMeta>, pkg.db.Error> {
+  return pkg.db.catalog_sqlite_schemas(target, pkg.db.MetaDetail.Names, out, true)
+}
+
+fn main() -> i32 = 0
+"#;
+    let mut files = package_files();
+    files.retain(|(path, _)| *path != "main.align");
+    files.push(("main.align", bypass));
+    let diagnostics =
+        check_multi_diagnostics("pkg-db-q5b2-sealed-catalog-adapter", &files, "main.align");
+    assert!(
+        diagnostics.contains("type mismatch: bool vs pkg.db.internal$SqliteCatalogControls"),
+        "a raw boolean must not reach the internal catalog adapter:\n{diagnostics}"
+    );
 }
 
 #[test]
@@ -1285,6 +1380,13 @@ fn postgres_required_catalog_and_explain_contract_is_exact() {
     if !backend_available() {
         return;
     }
+    let files = postgres_package_files();
+    let diagnostics =
+        check_multi_diagnostics("pkg-db-q5b2-postgres-typecheck", &files, "main.align");
+    assert!(
+        !diagnostics.lines().any(|line| line.contains(": error:")),
+        "PostgreSQL Q5b2 fixture must type-check before live execution:\n{diagnostics}"
+    );
     let required = std::env::var_os("ALIGN_DB_POSTGRES_REQUIRED").is_some();
     let Some(url) = std::env::var("ALIGN_DB_POSTGRES_URL")
         .ok()
@@ -1299,7 +1401,7 @@ fn postgres_required_catalog_and_explain_contract_is_exact() {
     };
     let output = build_and_run_multi_with_static_descriptors_args_with_env(
         "pkg-db-q5b2-postgres",
-        &postgres_package_files(),
+        &files,
         "main.align",
         &[url.as_str()],
         &[],
