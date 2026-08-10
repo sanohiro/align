@@ -2472,7 +2472,9 @@ fn scalar(
             Scalar::Fn(id) => node!(33, Fn, id),
             Scalar::Resource(id) => node!(34, Resource, id),
             Scalar::ResourceRef(id) => node!(35, Resource, id),
-            Scalar::Param(_) => Err(CanonicalGraphError::InvalidGraph),
+            Scalar::Param(_) | Scalar::SoaParam(_) => {
+                Err(CanonicalGraphError::InvalidGraph)
+            }
         }
     })
 }
@@ -2690,7 +2692,7 @@ fn ty(
                     ordinal,
                 )
             }
-            Ty::Param(_) | Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error => {
+            Ty::Param(_) | Ty::SoaParam(_) | Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error => {
                 Err(CanonicalGraphError::InvalidGraph)
             }
         }
@@ -4071,7 +4073,17 @@ mod tests {
             encoded_scalar(Scalar::Param(0)),
             CanonicalGraphError::InvalidGraph
         );
-        for value in [Ty::Param(0), Ty::IntVar(0), Ty::FloatVar(0), Ty::Error] {
+        error!(
+            encoded_scalar(Scalar::SoaParam(0)),
+            CanonicalGraphError::InvalidGraph
+        );
+        for value in [
+            Ty::Param(0),
+            Ty::SoaParam(0),
+            Ty::IntVar(0),
+            Ty::FloatVar(0),
+            Ty::Error,
+        ] {
             error!(encoded_ty(value), CanonicalGraphError::InvalidGraph);
         }
         let mut modes = Vec::new();

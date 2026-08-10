@@ -115,6 +115,9 @@ pub enum Scalar {
     /// storage, never dropped). Lets `Result<soa<T>, Error>` carry a decoded soa — the result type
     /// of `s: soa<User> := json.decode(d)?`. Non-recursive (just the id), so `Scalar` stays `Copy`.
     Soa(u32),
+    /// A symbolic `soa<T>` payload inside a generic template whose `T` has the closed `SoaPlain`
+    /// bound. The parameter index is substituted to [`Scalar::Soa`] before emitted HIR/MIR.
+    SoaParam(u32),
     /// A `json.doc` view payload (`Result<json.doc, Error>` from `json.doc(s)`, J4). A Copy
     /// `{ tape, node }` handle — **Copy, not Move** (it owns nothing; the tape lives in the arena)
     /// but **region-tracked** (like [`Scalar::Soa`]: it borrows the arena tape + the JSON input,
@@ -404,6 +407,9 @@ pub enum Ty {
     /// fields it reads — the cache lever that beats an array-of-structs (`draft.md` §3.4/§9). The
     /// id indexes `Program::structs`.
     Soa(u32),
+    /// Template-only symbolic `soa<T>` where the payload is generic parameter `T`. Concrete
+    /// instantiation substitutes this to [`Ty::Soa`] before emitted HIR/MIR.
+    SoaParam(u32),
     /// `array<slice<T>>` — an *owned*, dynamic-length array whose elements are `slice<T>` views
     /// (each `{ T* ptr, i64 len }`). Laid out like a slice (`{ slice* ptr, i64 count }`), Move
     /// (owns the buffer of slice headers, freed at scope exit), and region-tracked (the element
@@ -719,6 +725,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Ty::DynStructArray { .. }
         | Ty::Slice { .. }
         | Ty::Soa { .. }
+        | Ty::SoaParam { .. }
         | Ty::DynSliceArray { .. }
         | Ty::DynArray { .. }
         | Ty::DynVecArray { .. }
@@ -789,6 +796,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Scalar::Enum { .. }
         | Scalar::Tagged { .. }
         | Scalar::Soa { .. }
+        | Scalar::SoaParam { .. }
         | Scalar::JsonDoc
         | Scalar::Param { .. }
         | Scalar::Reader
@@ -880,6 +888,7 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         // A `soa<Struct>` borrowed view can be a `Result`/`Option` payload (the `json.decode →
         // soa` result). Region-tracked, never dropped — like `Str`.
         Ty::Soa(id) => Some(Scalar::Soa(id)),
+        Ty::SoaParam(index) => Some(Scalar::SoaParam(index)),
         // A `json.doc` view is the `Ok` payload of `json.doc(s)`'s `Result`. Region-tracked, never
         // dropped — like `Soa` / `Str`.
         Ty::JsonDoc => Some(Scalar::JsonDoc),
@@ -933,6 +942,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::Enum(id) => Ty::Enum(id),
         Scalar::Tagged(id) => Ty::Tagged(id),
         Scalar::Soa(id) => Ty::Soa(id),
+        Scalar::SoaParam(index) => Ty::SoaParam(index),
         Scalar::JsonDoc => Ty::JsonDoc,
         Scalar::Param(i) => Ty::Param(i),
         Scalar::Reader => Ty::Reader,
@@ -1937,6 +1947,7 @@ pub fn ty_may_borrow(
             | Ty::Reader
             | Ty::Writer
             | Ty::Soa(_)
+            | Ty::SoaParam(_)
             // A `http_headers` view IS the request context's pointer — it borrows the ctx's parsed
             // buffer, so a `Let` binding it must record the ctx's borrow provenance.
             | Ty::HttpHeaders
@@ -2650,8 +2661,8 @@ impl Ty {
 }
 
 /// A builtin generic bound — the only constraints (no user-defined trait bounds). `Num` ⊃ `Ord` ⊃
-/// `Eq` is the scalar-operation hierarchy. `RegionPlain` is an orthogonal closed structural bound
-/// for explicit-region construction and grants no scalar operation. `Unconstrained` grants nothing
+/// `Eq` is the scalar-operation hierarchy. `RegionPlain` and `SoaPlain` are orthogonal closed
+/// structural bounds and grant no scalar operation. `Unconstrained` grants nothing
 /// (the parameter is opaque — pass / return / store only). A concrete type argument is checked
 /// against the bound at instantiation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2661,6 +2672,7 @@ enum Bound {
     Ord,
     Num,
     RegionPlain,
+    SoaPlain,
 }
 
 impl Bound {
@@ -2680,6 +2692,7 @@ impl Bound {
             Bound::Ord => "Ord",
             Bound::Num => "Num",
             Bound::RegionPlain => "RegionPlain",
+            Bound::SoaPlain => "SoaPlain",
         }
     }
     fn from_name(s: &str) -> Option<Bound> {
@@ -2688,6 +2701,7 @@ impl Bound {
             "Ord" => Some(Bound::Ord),
             "Num" => Some(Bound::Num),
             "RegionPlain" => Some(Bound::RegionPlain),
+            "SoaPlain" => Some(Bound::SoaPlain),
             _ => None,
         }
     }
@@ -2702,7 +2716,7 @@ impl Bound {
             Bound::Num => ty.is_numeric(),
             // RegionPlain is structural and needs the complete nominal definition tables.  Its
             // concrete check is owned by generic-call finalization, not this scalar predicate.
-            Bound::RegionPlain => false,
+            Bound::RegionPlain | Bound::SoaPlain => false,
         }
     }
 }
@@ -6214,7 +6228,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
             let bound = match &t.bound {
                 None => Bound::Unconstrained,
                 Some(id) => Bound::from_name(&id.name).unwrap_or_else(|| {
-                    diags.error(format!("unknown bound '{}' (expected `Eq`, `Ord`, `Num`, or `RegionPlain`)", id.name), id.span);
+                    diags.error(format!("unknown bound '{}' (expected `Eq`, `Ord`, `Num`, `RegionPlain`, or `SoaPlain`)", id.name), id.span);
                     Bound::Unconstrained
                 }),
             };
@@ -6228,6 +6242,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         let mut params: Vec<Ty> = Vec::with_capacity(f.params.len());
         for p in &f.params {
             let ty = resolve_type(&p.ty, tcx!(&module, imports), &tparams, diags);
+            validate_abstract_soa_bounds(ty, &bounds, &tparams, &tagged_types, p.ty.span(), diags);
             if let Ty::ArrayBuilder(Scalar::Param(index)) = ty
                 && bounds.get(index as usize) != Some(&Bound::RegionPlain)
             {
@@ -6255,6 +6270,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         let ret = match &f.ret {
             Some(t) => {
                 let r = resolve_type(t, tcx!(&module, imports), &tparams, diags);
+                validate_abstract_soa_bounds(r, &bounds, &tparams, &tagged_types, t.span(), diags);
                 if let Ty::ArrayBuilder(Scalar::Param(index)) = r
                     && bounds.get(index as usize) != Some(&Bound::RegionPlain)
                 {
@@ -7015,7 +7031,7 @@ fn abstract_nominal_instances(
         active_tagged: &mut HashSet<u32>,
     ) -> bool {
         match scalar {
-            Scalar::Param(_) => true,
+            Scalar::Param(_) | Scalar::SoaParam(_) => true,
             Scalar::Struct(id) | Scalar::DynStructArray(id) | Scalar::Soa(id) => {
                 ids.structs.contains(&id)
             }
@@ -7041,7 +7057,7 @@ fn abstract_nominal_instances(
 
     fn ty_is_abstract(ty: Ty, program: &Program, ids: &AbstractNominalIds) -> bool {
         match ty {
-            Ty::Param(_) => true,
+            Ty::Param(_) | Ty::SoaParam(_) => true,
             Ty::Struct(id)
             | Ty::StructArray(id, _)
             | Ty::DynStructArray(id, _)
@@ -13055,7 +13071,7 @@ impl<'a> EscapeCheck<'a> {
             Ty::DictEncoded(..) => return true,
             // A `soa<Struct>` view borrows its column buffer (arena-allocated by `to_soa`), so it is
             // region-tracked — it must not outlive the arena that owns the buffer.
-            Ty::Soa(_) => return true,
+            Ty::Soa(_) | Ty::SoaParam(_) => return true,
             // A `http_headers` view borrows the request context's parsed buffer, so it is
             // region-tracked — it (and any `hs.get(name)` read of it) must not outlive the ctx.
             Ty::HttpHeaders => return true,
@@ -25341,6 +25357,11 @@ impl<'a, 't> Checker<'a, 't> {
                         work.push(Work::Type(Ty::Struct(id)));
                         work.push(Work::Text("soa<".to_string()));
                     }
+                    Ty::SoaParam(index) => {
+                        work.push(Work::Text(">".to_string()));
+                        work.push(Work::Type(Ty::Param(index)));
+                        work.push(Work::Text("soa<".to_string()));
+                    }
                     Ty::JsonScanner(id) => {
                         work.push(Work::Text(">".to_string()));
                         work.push(Work::Type(Ty::Struct(id)));
@@ -26051,6 +26072,13 @@ impl<'a, 't> Checker<'a, 't> {
                         state.unbound = true;
                     }
                 }
+                Ty::SoaParam(parameter) => {
+                    if subst.get(parameter as usize).is_some_and(Option::is_some) {
+                        state.bound = true;
+                    } else {
+                        state.unbound = true;
+                    }
+                }
                 Ty::Option(value)
                 | Ty::Box(value)
                 | Ty::Slice(value)
@@ -26087,6 +26115,11 @@ impl<'a, 't> Checker<'a, 't> {
                     }
                 }
                 Ty::Param(_) => {}
+                Ty::SoaParam(parameter) => {
+                    if let Some(slot) = nested.get_mut(parameter as usize) {
+                        *slot = true;
+                    }
+                }
                 Ty::Option(value)
                 | Ty::Box(value)
                 | Ty::Slice(value)
@@ -26145,6 +26178,16 @@ impl<'a, 't> Checker<'a, 't> {
             tagged_types: self.tagged_types,
         };
         let ty = resolve_type(t, &mut cx, &self.type_params, self.diags);
+        if self.mono_args.is_empty() {
+            validate_abstract_soa_bounds(
+                ty,
+                &self.param_bounds,
+                &self.type_params,
+                self.tagged_types,
+                t.span(),
+                self.diags,
+            );
+        }
         // In monomorph mode a type-parameter annotation (`let x: T`) resolves to the concrete arg.
         if self.mono_args.is_empty() {
             if let Ty::ArrayBuilder(Scalar::Param(index)) = ty
@@ -29025,6 +29068,9 @@ impl<'a, 't> Checker<'a, 't> {
         }
         match (declared, a) {
             (Ty::Param(p), _) => self.bind_param(p, a, subst, span),
+            (Ty::SoaParam(p), Ty::Soa(id)) => {
+                self.bind_param(p, Ty::Struct(id), subst, span)
+            }
             (Ty::Tagged(_), _) => self.match_param_in_context(
                 expand_tagged_ty(declared, self.tagged_types),
                 a,
@@ -29158,7 +29204,11 @@ impl<'a, 't> Checker<'a, 't> {
         span: Span,
         context: GenericMatchContext,
     ) {
-        if let Scalar::Param(p) = declared {
+        if let Scalar::SoaParam(p) = declared
+            && let Scalar::Soa(id) = actual
+        {
+            self.bind_param(p, Ty::Struct(id), subst, span);
+        } else if let Scalar::Param(p) = declared {
             self.bind_param(p, scalar_to_ty(actual), subst, span);
         } else if matches!(declared, Scalar::Tagged(_))
             || matches!(actual, Scalar::Tagged(_))
@@ -34739,6 +34789,31 @@ impl<'a, 't> Checker<'a, 't> {
                 | Ty::FixedArrayBuilder(..)
                 | Ty::FixedStructArrayBuilder(..) => return Some(at("is a builder")),
                 other => return Some(at(&format!("has unsupported type {}", ty_name(other)))),
+            }
+        }
+        None
+    }
+
+    fn soa_plain_error(&self, ty: Ty) -> Option<String> {
+        let Ty::Struct(id) = ty else {
+            return Some(format!("{} is not a struct", self.ty_display(ty)));
+        };
+        let Some(definition) = self.structs.get(id as usize) else {
+            return Some("the struct definition is unavailable".to_string());
+        };
+        if definition.fields.is_empty() {
+            return Some("the struct has no fields".to_string());
+        }
+        for field in &definition.fields {
+            if !matches!(
+                field.ty,
+                Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str
+            ) {
+                return Some(format!(
+                    "field '{}' has unsupported type {}",
+                    field.name,
+                    self.ty_display(field.ty)
+                ));
             }
         }
         None
@@ -40697,12 +40772,14 @@ impl<'a, 't> Checker<'a, 't> {
                         // Each concrete type argument must satisfy its parameter's bound.
                         if let Some(bounds) = self.sigs.get(func).map(|s| s.bounds.clone()) {
                             for (i, (arg, bound)) in type_args.iter().zip(&bounds).enumerate() {
-                                let failure = if *bound == Bound::RegionPlain {
-                                    self.region_plain_error(*arg)
-                                } else if bound.satisfied_by(*arg) {
-                                    None
-                                } else {
-                                    Some(format!("{} is outside the bound's scalar domain", self.ty_display(*arg)))
+                                let failure = match *bound {
+                                    Bound::RegionPlain => self.region_plain_error(*arg),
+                                    Bound::SoaPlain => self.soa_plain_error(*arg),
+                                    _ if bound.satisfied_by(*arg) => None,
+                                    _ => Some(format!(
+                                        "{} is outside the bound's scalar domain",
+                                        self.ty_display(*arg)
+                                    )),
                                 };
                                 if let Some(reason) = failure {
                                     self.diags.error(
@@ -42055,6 +42132,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::DynSliceArray(p) => format!("array<slice<{}>>", scalar_name(prim_to_scalar(p))),
         Ty::Slice(s) => format!("slice<{}>", scalar_name(s)),
         Ty::Soa(id) => format!("soa<struct#{id}>"),
+        Ty::SoaParam(index) => format!("soa<T{index}>"),
         Ty::DynArray(s) => format!("array<{}>", scalar_name(s)),
         ty @ (Ty::DynVecArray(..)
         | Ty::DynMaskArray(..)
@@ -42230,6 +42308,7 @@ fn resolved_type_source_spelling(
                     next,
                 )
             ),
+            Ty::SoaParam(index) => format!("soa<T{index}>"),
             Ty::Enum(id) => enum_source_spellings
                 .get(&id)
                 .cloned()
@@ -42797,6 +42876,10 @@ fn subst_param_ty(
     // nominal applications remain outside L7 and are rejected during source type formation.
     match ty {
         Ty::Param(i) => args.get(i as usize).copied().unwrap_or(Ty::Error),
+        Ty::SoaParam(i) => match args.get(i as usize).copied().unwrap_or(Ty::Error) {
+            Ty::Struct(id) => Ty::Soa(id),
+            _ => Ty::Error,
+        },
         Ty::Option(s) => Ty::Option(subst_scalar(s, args, tagged_types)),
         Ty::Result(o, e) => {
             let o = subst_scalar(o, args, tagged_types);
@@ -42927,6 +43010,13 @@ fn subst_scalar(s: Scalar, args: &[Ty], tagged_types: &mut Vec<hir::TaggedType>)
                 };
                 values.push(value);
             }
+            Work::Enter(Scalar::SoaParam(index)) => {
+                let value = match args.get(index as usize).copied().unwrap_or(Ty::Error) {
+                    Ty::Struct(id) => Scalar::Soa(id),
+                    _ => Scalar::SoaParam(index),
+                };
+                values.push(value);
+            }
             Work::Enter(Scalar::Tagged(id)) if visiting.insert(id) => {
                 match tagged_types.get(id as usize).copied() {
                     Some(hir::TaggedType::Option(payload)) => {
@@ -42968,6 +43058,66 @@ fn subst_scalar(s: Scalar, args: &[Ty], tagged_types: &mut Vec<hir::TaggedType>)
     values.pop().unwrap_or(s)
 }
 
+fn validate_abstract_soa_bounds(
+    ty: Ty,
+    bounds: &[Bound],
+    type_params: &[String],
+    tagged_types: &[hir::TaggedType],
+    span: Span,
+    diags: &mut Diagnostics,
+) {
+    let mut work = vec![ty];
+    let mut seen_types = HashSet::new();
+    let mut seen_tagged = HashSet::new();
+    let mut reported = HashSet::new();
+    while let Some(ty) = work.pop() {
+        if !seen_types.insert(ty) {
+            continue;
+        }
+        match ty {
+            Ty::SoaParam(index) => {
+                if bounds.get(index as usize) != Some(&Bound::SoaPlain)
+                    && reported.insert(index)
+                {
+                    let name = type_params
+                        .get(index as usize)
+                        .map(String::as_str)
+                        .unwrap_or("T");
+                    diags.error(
+                        format!(
+                            "an abstract `soa` element requires the `SoaPlain` bound (declare `<{name}: SoaPlain>`)"
+                        ),
+                        span,
+                    );
+                }
+            }
+            Ty::Option(value)
+            | Ty::Box(value)
+            | Ty::Slice(value)
+            | Ty::Array(value, _)
+            | Ty::DynArray(value)
+            | Ty::ArrayBuilder(value)
+            | Ty::Task(value) => work.push(scalar_to_ty(value)),
+            Ty::Result(ok, err) => {
+                work.push(scalar_to_ty(err));
+                work.push(scalar_to_ty(ok));
+            }
+            Ty::Tagged(id) if seen_tagged.insert(id) => {
+                if let Some(tagged) = tagged_types.get(id as usize) {
+                    match *tagged {
+                        hir::TaggedType::Option(value) => work.push(scalar_to_ty(value)),
+                        hir::TaggedType::Result(ok, err) => {
+                            work.push(scalar_to_ty(err));
+                            work.push(scalar_to_ty(ok));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Whether a type carries a generic `Param` — bare, or nested one level in a scalar-payload
 /// composite. Used to decide whether a call argument applies a coercion (it does not when the
 /// parameter type is generic).
@@ -42975,7 +43125,7 @@ fn subst_scalar(s: Scalar, args: &[Ty], tagged_types: &mut Vec<hir::TaggedType>)
 /// such a parameter must resolve to a concrete scalar at the call (a `Scalar` can't hold an
 /// inference variable).
 fn ty_mentions_param(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
-    if matches!(ty, Ty::Param(_)) {
+    if matches!(ty, Ty::Param(_) | Ty::SoaParam(_)) {
         return true;
     }
     let mut work = Vec::new();
@@ -42999,7 +43149,7 @@ fn ty_mentions_param(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
     let mut visited = HashSet::new();
     while let Some(scalar) = work.pop() {
         match scalar {
-            Scalar::Param(_) => return true,
+            Scalar::Param(_) | Scalar::SoaParam(_) => return true,
             Scalar::Tagged(id) if visited.insert(id) => {
                 if let Some(tagged) = tagged_types.get(id as usize) {
                     match *tagged {
@@ -43297,6 +43447,7 @@ fn ty_mangle_impl(
                         Work::Type(Ty::Struct(id)),
                     ],
                 ),
+                Ty::SoaParam(index) => output.push_str(&format!("QP{index}")),
                 Ty::Tuple(id) => match tuples.get(id as usize) {
                     None => output.push_str("U_invalid"),
                     Some(tuple) => {
@@ -44247,6 +44398,7 @@ fn resolve_type(
                 }
             };
             match inner {
+                Ty::Param(index) => Ty::SoaParam(index),
                 Ty::Struct(id) => {
                     // Fields must be primitive scalars or `str`. Mixed widths are fine: each column's
                     // start is padded to the field's alignment in codegen, so `soa<{active: bool,

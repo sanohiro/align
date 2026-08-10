@@ -8,6 +8,7 @@
 
 mod common;
 use common::*;
+use align_interface::IType;
 
 #[test]
 fn identity_and_pick() {
@@ -192,6 +193,117 @@ fn region_plain_builder_remaps_a_concrete_generic_struct_element() {
 fn region_plain_does_not_grant_equality() {
     let src = "fn same<T: RegionPlain>(a: T, b: T) -> bool = a == b\nfn main() -> i32 = 0\n";
     assert!(check_errs("gen-region-plain-eq", src));
+}
+
+#[test]
+fn soa_plain_bound_preserves_symbolic_soa_through_result_substitution() {
+    if !backend_available() {
+        return;
+    }
+    let src = "Row { id: i32, score: i32 }\nfn keep<R: SoaPlain>(values: Result<soa<R>, Error>) -> Result<soa<R>, Error> = values\nfn main() -> i32 {\n  arena {\n    rows := [Row { id: 40, score: 2 }].to_soa()\n    input: Result<soa<Row>, Error> := Ok(rows)\n    kept := keep(input) else { return 1 }\n    return kept.id[0] + kept.score[0]\n  }\n}\n";
+    let out = build_and_run("gen-soa-plain-result", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
+fn soa_plain_bound_rejects_non_soa_struct_at_concrete_instantiation() {
+    for (name, src) in [
+        (
+            "owned",
+            "Owned { value: string }\nfn require<R: SoaPlain>(value: R) -> i32 = 0\nfn main() -> i32 = require(Owned { value: \"owned\".clone() })\n",
+        ),
+        (
+            "nullable",
+            "Maybe { value: Option<i32> }\nfn require<R: SoaPlain>(value: R) -> i32 = 0\nfn main() -> i32 = require(Maybe { value: Some(1) })\n",
+        ),
+    ] {
+        let rendered = check_diagnostics(&format!("gen-soa-plain-{name}"), src);
+        assert!(
+            rendered.contains("does not satisfy the `SoaPlain` bound"),
+            "expected SoaPlain diagnostic for {name}, got:\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn symbolic_soa_formation_requires_the_soa_plain_bound() {
+    let src = "fn keep<R>(values: soa<R>) -> soa<R> = values\nfn main() -> i32 = 0\n";
+    let rendered = check_diagnostics("gen-soa-plain-required", src);
+    assert!(
+        rendered.contains("an abstract `soa` element requires the `SoaPlain` bound"),
+        "expected symbolic SoA bound diagnostic, got:\n{rendered}"
+    );
+}
+
+fn soa_plain_interface_files() -> [(&'static str, &'static str); 2] {
+    let package = "module pkg.columns\npub fn keep<R: SoaPlain>(values: Result<soa<R>, Error>) -> Result<soa<R>, Error> = values\n";
+    let main = "module main\nimport pkg.columns\nRow { id: i32, score: i32 }\nfn main() -> i32 { arena { rows := [Row { id: 40, score: 2 }].to_soa(); input: Result<soa<Row>, Error> := Ok(rows); kept := pkg.columns.keep(input) else { return 1 }; return kept.id[0] + kept.score[0] } }\n";
+    [("pkg/columns.align", package), ("main.align", main)]
+}
+
+#[test]
+fn soa_plain_generic_interface_matches_whole_and_per_unit_checking() {
+    let files = soa_plain_interface_files();
+    let checked = diff_check_multi("gen-soa-plain-units-check", &files, "main.align");
+    assert!(
+        !checked.whole_errors && !checked.per_unit_errors,
+        "symbolic SoA must survive interface reconstruction:\nwhole:\n{}\nper-unit:\n{}",
+        checked.whole_diags,
+        checked.per_unit_diags
+    );
+    let package = checked
+        .per_unit
+        .summaries
+        .iter()
+        .find(|summary| summary.unit == "pkg.columns")
+        .expect("package interface summary");
+    let keep = package
+        .fns
+        .iter()
+        .find(|function| function.name == "keep")
+        .expect("generic keep interface");
+    assert_eq!(keep.type_params[0].bound.as_deref(), Some("SoaPlain"));
+    assert_eq!(
+        keep.ret,
+        IType::Named {
+            path: "Result".to_string(),
+            args: vec![
+                IType::Named {
+                    path: "soa".to_string(),
+                    args: vec![IType::Named {
+                        path: "R".to_string(),
+                        args: Vec::new(),
+                    }],
+                },
+                IType::Named {
+                    path: "Error".to_string(),
+                    args: Vec::new(),
+                },
+            ],
+        },
+        "the interface must retain canonical symbolic soa<R>"
+    );
+}
+
+#[test]
+fn soa_plain_generic_interface_executes_whole_and_per_unit() {
+    if !backend_available() {
+        return;
+    }
+    let files = soa_plain_interface_files();
+    assert_eq!(
+        build_and_run_multi("gen-soa-plain-whole", &files, "main.align")
+            .status
+            .code(),
+        Some(42)
+    );
+    assert_eq!(
+        build_per_unit_multi("gen-soa-plain-units", &files, "main.align")
+            .link_and_run()
+            .status
+            .code(),
+        Some(42)
+    );
 }
 
 #[test]

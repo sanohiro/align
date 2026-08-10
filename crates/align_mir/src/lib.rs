@@ -11270,6 +11270,7 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         | Scalar::Enum(_)
         | Scalar::Tagged(_)
         | Scalar::Soa(_)
+        | Scalar::SoaParam(_)
         | Scalar::JsonDoc
         | Scalar::Param(_)
         | Scalar::Reader
@@ -15023,7 +15024,9 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Task(_) => "Task".to_string(),
         Ty::DictEncoded(id, _) => format!("dict_encoded<struct#{id}>"),
         // Monomorphization substitutes every `Ty::Param` before MIR; reaching here is a compiler bug.
-        Ty::Param(_) => unreachable!("Ty::Param survived monomorphization"),
+        Ty::Param(_) | Ty::SoaParam(_) => {
+            unreachable!("abstract generic type survived monomorphization")
+        }
         Ty::Unit => "()".to_string(),
         Ty::Error => "<error>".to_string(),
     }

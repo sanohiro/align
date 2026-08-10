@@ -1118,6 +1118,11 @@ impl<'a> PlacementValidator<'a> {
                 ScalarPlacement::Payload { allow_param: true }
                     | ScalarPlacement::FnParameter { allow_param: true }
             ),
+            Scalar::SoaParam(_) => matches!(
+                mode,
+                ScalarPlacement::Payload { allow_param: true }
+                    | ScalarPlacement::FnParameter { allow_param: true }
+            ),
             Scalar::Struct(id) => self.program.structs.get(id as usize).is_some(),
             Scalar::Resource(id) => {
                 !matches!(mode, ScalarPlacement::Collection)
@@ -1211,7 +1216,7 @@ impl<'a> PlacementValidator<'a> {
 
     fn resolve_type_ok(&self, ty: Ty, allow_param: bool) -> bool {
         match ty {
-            Ty::Param(_) => allow_param,
+            Ty::Param(_) | Ty::SoaParam(_) => allow_param,
             Ty::Int(integer) => valid_int(integer.bits),
             Ty::Float(float) => valid_float(float.bits),
             Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Unit | Ty::Raw | Ty::ArenaHandle => true,
@@ -1686,6 +1691,10 @@ impl<'a> Validator<'a> {
                 facts.has_param = true;
                 true
             }
+            Ty::SoaParam(_) => {
+                facts.has_param = true;
+                true
+            }
             Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error | Ty::StrFinder => false,
             Ty::Option(payload) | Ty::Array(payload, _) => {
                 self.inspect_scalar(payload, edge, facts)
@@ -1780,6 +1789,10 @@ impl<'a> Validator<'a> {
             Scalar::Int(integer) => valid_int(integer.bits),
             Scalar::Float(float) => valid_float(float.bits),
             Scalar::Param(_) => {
+                facts.has_param = true;
+                true
+            }
+            Scalar::SoaParam(_) => {
                 facts.has_param = true;
                 true
             }
@@ -2759,6 +2772,7 @@ impl<'a> BodyValidator<'a> {
             | Ty::HttpStream
             | Ty::JsonDoc => true,
             Ty::Param(_)
+            | Ty::SoaParam(_)
             | Ty::IntVar(_)
             | Ty::FloatVar(_)
             | Ty::StrFinder
@@ -3056,7 +3070,7 @@ impl<'a> BodyValidator<'a> {
             | Scalar::ResponseBuilder
             | Scalar::HttpStream
             | Scalar::RunOutput => true,
-            Scalar::Param(_) => false,
+            Scalar::Param(_) | Scalar::SoaParam(_) => false,
         }
     }
 
@@ -7555,6 +7569,7 @@ impl<'a> BodyValidator<'a> {
             | Ty::ResponseBuilder
             | Ty::HttpStream
             | Ty::Param(_)
+            | Ty::SoaParam(_)
             | Ty::IntVar(_)
             | Ty::FloatVar(_)
             | Ty::StrFinder

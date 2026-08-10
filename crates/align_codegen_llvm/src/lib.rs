@@ -2307,6 +2307,9 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                 Scalar::Param(id) => Err(Self::invalid(format!(
                     "abstract tagged payload parameter {id} survived into MIR"
                 ))),
+                Scalar::SoaParam(id) => Err(Self::invalid(format!(
+                    "abstract soa payload parameter {id} survived into MIR"
+                ))),
                 Scalar::Int(_)
                 | Scalar::Float(_)
                 | Scalar::Bool
@@ -2350,6 +2353,11 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                         Ty::Param(id) => {
                             return Err(Self::invalid(format!(
                                 "abstract type parameter {id} survived into MIR"
+                            )));
+                        }
+                        Ty::SoaParam(id) => {
+                            return Err(Self::invalid(format!(
+                                "abstract soa type parameter {id} survived into MIR"
                             )));
                         }
                         Ty::IntVar(id) => {
@@ -4899,6 +4907,9 @@ fn scalar_bytes(s: Scalar) -> u64 {
         // box/array payload today (it only rides an `Option`/`Result`), but sized correctly for totality.
         Scalar::JsonDoc => 16,
         Scalar::Soa(_) => unreachable!("a soa view is not a box payload"),
+        Scalar::SoaParam(_) => {
+            unreachable!("an abstract soa is substituted before codegen")
+        }
         Scalar::Enum(_) => unreachable!("a sum type is not a box payload"),
         Scalar::Tagged(_) => unreachable!("a nested tagged value is not a box/array payload"),
         Scalar::Param(_) => unreachable!("a generic parameter is substituted before codegen"),

@@ -4567,11 +4567,13 @@ fn deep_type_consumer_closure_matrix() {
 fn malformed_hir_global_type_metadata_fails_closed() {
     for (label, ty) in [
         ("param", Ty::Param(0)),
+        ("soa-param", Ty::SoaParam(0)),
         ("int-var", Ty::IntVar(0)),
         ("float-var", Ty::FloatVar(0)),
         ("str-finder", Ty::StrFinder),
         ("error", Ty::Error),
         ("scalar-param", Ty::Option(Scalar::Param(0))),
+        ("scalar-soa-param", Ty::Option(Scalar::SoaParam(0))),
         ("missing-struct", Ty::Struct(99)),
         ("missing-enum", Ty::Enum(99)),
         ("missing-tuple", Ty::Tuple(99)),
