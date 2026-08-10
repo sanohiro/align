@@ -1487,3 +1487,18 @@ Historical session journal           docs/archive/HANDOFF-2026-07-25.md
   than growing the live handoff indefinitely.
 - Keep release and review procedures in `CLAUDE.md`; link to them instead of
   duplicating them here.
+
+The first nightly full-suite run (2026-08-10) found one real failure, and it
+is a long-standing one the bounded gate cannot see:
+`apps_web_multipart::the_documented_handler_example_compiles_against_the_real_pkg_web`
+fails because `apps/web/pkg/web.align` cannot compile under the L2a
+open-world callback rule introduced in #672. The middleware chain calls a
+function value out of an array (`pre := hs[i]; pre(c)`, web.align:206) and the
+streaming path calls a bound callback (`pump(c, s)`, web.align:345); both are
+rejected with "an exportable callback-bearing function cannot route an
+open-world callback through an unresolved function-value target". `web.align`
+last changed in #631 and the test in #619, so #672 tightened the rule under a
+shipped package surface without an owner test in the bounded gate to catch it.
+Deciding between relaxing the rule for these shapes and redesigning pkg.web's
+middleware dispatch is a public-contract decision for the design gate, not a
+local fix; `pkg.web` documentation examples do not compile until then.
