@@ -1691,7 +1691,11 @@ pub fn drop_plan(
 /// tuple table to read the element scalars. (Such tuples are restricted to temporaries in this
 /// cut — returned or destructured — so they never occupy a drop slot; see `check`/`check_fn`.)
 fn ty_tuple_is_move(ty: Ty, tuples: &[hir::TupleDef]) -> bool {
-    matches!(ty, Ty::Tuple(id) if tuples[id as usize].elems.iter().any(|s| s.is_move()))
+    // Reached from the public Move authorities, so a malformed id must answer, never panic.
+    matches!(ty, Ty::Tuple(id)
+        if tuples
+            .get(id as usize)
+            .is_some_and(|tuple| tuple.elems.iter().any(|scalar| scalar.is_move())))
 }
 
 /// Whether `ty` **is**, or transitively contains through a `Result` / `Option` / tuple / struct, a
@@ -2241,6 +2245,22 @@ pub fn ty_capture_is_move(
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> bool {
+    let scalar_is_move = |scalar: Scalar| {
+        scalar.is_move()
+            || matches!(scalar, Scalar::Struct(id) if struct_is_move(id, structs, enums, tagged_types))
+            || matches!(scalar, Scalar::Enum(id) if enum_is_move(id, structs, enums, tagged_types))
+            || matches!(scalar, Scalar::Tagged(id)
+                if drop_plan(Ty::Tagged(id), structs, enums, tagged_types).needs_drop())
+    };
+    // A tuple of Move aggregates owns them exactly as a fixed array does; `ty_tuple_is_move`
+    // only sees scalar-level Move-ness, so capture asks the recursive question here.
+    if let Ty::Tuple(id) = ty
+        && tuples
+            .get(id as usize)
+            .is_some_and(|tuple| tuple.elems.iter().copied().any(scalar_is_move))
+    {
+        return true;
+    }
     ty_is_move(ty, structs, tuples, enums, tagged_types)
         || matches!(
             ty,

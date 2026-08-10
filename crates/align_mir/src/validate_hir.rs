@@ -9588,9 +9588,13 @@ impl<'a> BodyValidator<'a> {
     /// times (owned `string` array elements, the `str` view demotion, and a captured
     /// `slice<fn(..)>`, whose element is not a primitive and so had no `Scalar` mapping).
     /// Delegate instead of re-deriving, so the producer and this gate cannot disagree again.
+    ///
+    /// The authority is `ty_capture_is_move`, not the plain Move question: a fixed array or
+    /// tuple of owned values is Copy as a *value* while still being uncapturable, and every
+    /// use of this predicate is a capture-shaped one.
     fn ty_copy_ok(&self, ty: Ty, _: &BodyContext) -> bool {
         self.body_ty_ok(ty)
-            && !align_sema::ty_is_move(
+            && !align_sema::ty_capture_is_move(
                 ty,
                 &self.program.structs,
                 &self.program.tuples,

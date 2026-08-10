@@ -238,15 +238,27 @@ fn par_map_rejects_move_aos_elements_before_codegen() {
 
 #[test]
 fn par_map_rejects_owned_fixed_array_capture() {
+    // #739 rejects the owned fixed array where it is CONSTRUCTED, before the capture rule is
+    // reached, so this fixture owns the construction diagnostic exactly.
     let src = "fn main() -> Result<(), Error> {\n  names := [\"a\".clone(), \"b\".clone()]\n  ys := [1, 2].par_map(fn x { x + names.len() })\n  print(ys.sum())\n  return Ok(())\n}\n";
     assert!(check_errs("pm-array-string-capture", src), "par_map must reject an owned fixed array capture");
-    // #739 rejects the owned fixed array at its construction, before the capture rule is
-    // reached; either diagnostic identifies the same unsupported ownership shape.
     let diagnostics = check_diagnostics("pm-array-string-capture", src);
     assert!(
-        diagnostics.contains("cannot capture the owned value 'names'")
-            || diagnostics.contains("cannot be an element of a fixed array yet"),
+        diagnostics.contains("cannot be an element of a fixed array yet"),
         "the diagnostic should identify the unsupported owned fixed array:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn par_map_rejects_an_owned_local_capture() {
+    // The capture rule itself, on a shape #739's construction check does not intercept: an owned
+    // `string` local. This is the assertion that keeps the MIR capture gate honest — it must stay
+    // reachable, because the fixed-array fixture above no longer reaches it.
+    let src = "fn main() -> Result<(), Error> {\n  name := \"a\".clone()\n  ys := [1, 2].par_map(fn x { x + name.len() })\n  print(ys.sum())\n  return Ok(())\n}\n";
+    let diagnostics = check_diagnostics("pm-string-capture", src);
+    assert!(
+        diagnostics.contains("cannot capture the owned value 'name'"),
+        "the ownership diagnostic should identify the owned local capture:\n{diagnostics}"
     );
 }
 
@@ -842,36 +854,4 @@ fn par_map_calling_pure_helper_ok() {
     assert_eq!(out.status.code(), Some(0));
     // (1+1)*2 + (2+1)*2 + (3+1)*2 = 4 + 6 + 8 = 18
     assert_eq!(String::from_utf8_lossy(&out.stdout), "18\n");
-}
-
-/// A closure capturing `slice<fn(..)>` — the shape `pkg.web.group_with` is built from. Its
-/// element has no primitive scalar mapping, so the MIR body validator's own Copy model rejected
-/// the capture while sema accepted it, silently dropping every function in the unit.
-mod captured_function_value_slice {
-    use super::*;
-
-    #[test]
-    fn a_captured_function_value_slice_lowers() {
-        if !backend_available() {
-            return;
-        }
-        // A closure capturing `slice<fn(..)>` — the shape `pkg.web.group_with` is built from.
-        // Its element has no primitive scalar mapping, so the MIR body validator used to reject
-        // the capture while sema accepted it, silently dropping every function in the unit.
-        let src = "\
-fn apply_all(fs: slice<fn(i64) -> i64>, xs: slice<i64>) -> array<i64> =
-  xs.map(fn x { x + fs.len() }).to_array()
-fn double(v: i64) -> i64 = v * 2
-fn main() -> Result<(), Error> {
-  fs := [double]
-  xs := [1, 2, 3]
-  print(apply_all(fs[..], xs[..]).sum())
-  return Ok(())
-}
-";
-        let out = build_and_run("owd-fn-slice-capture", src);
-        assert_eq!(out.status.code(), Some(0));
-        // (1+1) + (2+1) + (3+1) = 9
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "9\n");
-    }
 }

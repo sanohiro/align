@@ -1505,16 +1505,16 @@ nightly's finding, both found while fixing it (2026-08-11):
   rot silently; the nightly full-suite workflow now runs them daily.
 
 The first nightly full-suite run (2026-08-10) found one real failure, and it
-is a long-standing one the bounded gate cannot see:
+was a long-standing one the bounded gate cannot see:
 `apps_web_multipart::the_documented_handler_example_compiles_against_the_real_pkg_web`
-fails because `apps/web/pkg/web.align` cannot compile under the L2a
-open-world callback rule introduced in #672. The middleware chain calls a
+failed because `apps/web/pkg/web.align` had not compiled under the L2a
+open-world callback rule since #672 tightened it — the middleware chain calls a
 function value out of an array (`pre := hs[i]; pre(c)`, web.align:206) and the
-streaming path calls a bound callback (`pump(c, s)`, web.align:345); both are
-rejected with "an exportable callback-bearing function cannot route an
-open-world callback through an unresolved function-value target". `web.align`
-last changed in #631 and the test in #619, so #672 tightened the rule under a
-shipped package surface without an owner test in the bounded gate to catch it.
-Deciding between relaxing the rule for these shapes and redesigning pkg.web's
-middleware dispatch is a public-contract decision for the design gate, not a
-local fix; `pkg.web` documentation examples do not compile until then.
+streaming path calls a bound callback (`pump(c, s)`, web.align:345), the shape
+every router is built from. Fixed 2026-08-11 by scoping that rule to units that
+carry a `par_map` purity obligation, since a spawned task may be Impure
+(`docs/impl/15-pkg-web-plan.md` §4 and `17-library-boundary-prerequisites.md`).
+The same capability closed a second, independent break of the silent-empty-MIR
+class in the same package: the MIR body validator kept its own Copy model,
+which had no mapping for a captured `slice<fn(..)>`, so `pkg.web.group_with`
+dropped all 35 functions of its unit without a diagnostic.
