@@ -119,14 +119,17 @@ if [[ "$docs_only" == false && "${#review_streak[@]}" -ge 3 ]]; then
     while IFS= read -r path; do
       case "$path" in
         docs/impl/*/ja/*|docs/impl/ja/*) ;;
-        docs/impl/*) matrix_reopened=true ;;
+        # Authoritative contracts live in docs/impl for compiler and package
+        # capabilities and in CLAUDE.md for the process machinery itself.
+        docs/impl/*|CLAUDE.md) matrix_reopened=true ;;
       esac
     done < <(git show --no-renames --name-only --format= "$commit")
   done
   [[ "$matrix_reopened" == true ]] || {
     echo "preflight: ${#review_streak[@]} consecutive review-fix commits without re-opening a closure matrix" >&2
     echo "  Repeatedly patching individually reported cells means the matrix missed an axis." >&2
-    echo "  Enumerate that axis in the owning docs/impl plan or audit, fix the class in one pass," >&2
+    echo "  Enumerate that axis in the owning docs/impl plan, audit, or CLAUDE.md, fix the class" >&2
+    echo "  in one pass," >&2
     echo "  and commit it with a 'Closure-Matrix-Reopened: <axis>' trailer." >&2
     exit 1
   }

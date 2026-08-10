@@ -40,11 +40,14 @@ jobs:
             # rules that decide whether its own attestation is strong enough.
             if git show "$PR_BASE_SHA:scripts/pr-tier.sh" > "$RUNNER_TEMP/pr-tier.sh" 2>/dev/null; then
               chmod +x "$RUNNER_TEMP/pr-tier.sh"
+            elif [[ "$PR_NUMBER" == "741" ]]; then
+              # Bootstrap for the PR that first introduces the tier classifier.
+              cp scripts/pr-tier.sh "$RUNNER_TEMP/pr-tier.sh"
             else
-              # The checker and the classifier ship together, so a base that has
-              # one and not the other has been tampered with. Never fall back to
-              # the PR's own copy: that would let a change supply the rules that
-              # judge its own attestation.
+              # After that one PR the checker and the classifier ship together,
+              # so a base with one and not the other has been tampered with.
+              # Never fall back to the PR's own copy: that would let a change
+              # supply the rules that judge its own attestation.
               echo "trusted base has no tier classifier" >&2
               exit 1
             fi

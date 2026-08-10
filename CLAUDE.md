@@ -378,6 +378,11 @@ code       everything else                 one fresh review, owner check,
                                            bounded gate, Clippy
 ```
 
+Machinery that CI fetches from the trusted base needs one explicit
+bootstrap arm in `preflight.yml` for the PR that introduces it, keyed on that
+PR number: the base has no copy yet, and falling back to the PR's own copy
+would let a change supply the rules that judge it.
+
 The classifier fails closed in every direction: an unknown path shape, an
 uncomputable diff, and any deletion are all code tier — removing a file takes
 away coverage, so it can never be light.
@@ -425,8 +430,10 @@ second review.
 **The one-review/one-fix cycle is enforced, not merely stated.** Preflight
 counts the consecutive `fix` commits following the implementation on the
 branch; at three it fails unless one of them both changed an authoritative
-`docs/impl` plan or audit (translated `ja/` mirrors do not count) and carried a
-`Closure-Matrix-Reopened: <axis>` trailer. Three rounds of patching
+contract document — a `docs/impl` plan or audit for a compiler or package
+capability, or this file for the process machinery itself, with translated
+`ja/` mirrors excluded — and carried a `Closure-Matrix-Reopened: <axis>`
+trailer. Three rounds of patching
 individually reported cells is the signature of a matrix that missed an axis —
 the required response is to enumerate that axis, fix the class in one pass, and
 commit the updated matrix with that trailer. Measured cost of ignoring this:
