@@ -16,6 +16,7 @@ concurrency:
 
 env:
   RUST_VERSION: 1.96.0
+  CARGO_INCREMENTAL: "0"
   OPENSSL_VERSION: 3.5.7
   OPENSSL_SHA256: a8c0d28a529ca480f9f36cf5792e2cd21984552a3c8e4aa11a24aa31aeac98e8
   CARGO_TERM_COLOR: always
@@ -51,6 +52,17 @@ jobs:
         run: |
           rustup toolchain install "$RUST_VERSION" --profile minimal
           rustup default "$RUST_VERSION"
+
+      - name: Restore Cargo caches
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-db-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-db-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-
 
       - name: Install LLVM and database libraries
         shell: bash
@@ -105,6 +117,16 @@ jobs:
         run: |
           scripts/cargo.sh test --locked -p align_driver --test pkg_db_q5a -- --nocapture
 
+      - name: Save Cargo caches
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-db-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
   build-and-test:
     name: ${{ matrix.name }}
     strategy:
@@ -131,6 +153,15 @@ jobs:
           rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt,clippy
           rustup default "$RUST_VERSION"
 
+      # The pinned OpenSSL takes ~2 minutes to build from source; its output is
+      # deterministic for a given version, so cache the installed prefix.
+      - name: Restore OpenSSL cache
+        if: runner.os == 'Linux'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/openssl-${{ env.OPENSSL_VERSION }}
+          key: openssl-${{ env.OPENSSL_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
       - name: Install LLVM and native libraries (Linux)
         if: runner.os == 'Linux'
         shell: bash
@@ -140,17 +171,19 @@ jobs:
           sudo ./llvm.sh 22
           sudo apt-get install -y llvm-22-dev clang-22 libclang-rt-22-dev \
             libssl-dev zlib1g-dev libzstd-dev make perl
-          curl -fsSLO \
-            "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
-          echo "${OPENSSL_SHA256}  openssl-${OPENSSL_VERSION}.tar.gz" | sha256sum -c -
-          tar -xzf "openssl-${OPENSSL_VERSION}.tar.gz"
           OPENSSL_PREFIX="$RUNNER_TEMP/openssl-${OPENSSL_VERSION}"
-          (
-            cd "openssl-${OPENSSL_VERSION}"
-            ./Configure --prefix="$OPENSSL_PREFIX" --libdir=lib shared no-tests
-            make -j"$(nproc)"
-            make install_sw
-          )
+          if [ ! -x "$OPENSSL_PREFIX/bin/openssl" ]; then
+            curl -fsSLO \
+              "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+            echo "${OPENSSL_SHA256}  openssl-${OPENSSL_VERSION}.tar.gz" | sha256sum -c -
+            tar -xzf "openssl-${OPENSSL_VERSION}.tar.gz"
+            (
+              cd "openssl-${OPENSSL_VERSION}"
+              ./Configure --prefix="$OPENSSL_PREFIX" --libdir=lib shared no-tests
+              make -j"$(nproc)"
+              make install_sw
+            )
+          fi
           echo "LLVM_SYS_221_PREFIX=/usr/lib/llvm-22" >> "$GITHUB_ENV"
           echo "LLVM_CONFIG=/usr/lib/llvm-22/bin/llvm-config" >> "$GITHUB_ENV"
           echo "LIBRARY_PATH=$OPENSSL_PREFIX/lib" >> "$GITHUB_ENV"
@@ -178,8 +211,28 @@ jobs:
           openssl version
           cc --version
 
+      # Test-binary compilation dominates the bounded gate; restore build
+      # artifacts from the last main run. Saving happens only on main (below),
+      # so PR runs never spend wall-clock uploading a multi-gigabyte cache.
+      - name: Restore Cargo caches
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            target/clippy
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-lint${{ matrix.lint }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-lint${{ matrix.lint }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-
+
+      # Clippy keeps its own target dir exactly as scripts/pre-pr.sh does: clippy
+      # and build/test record incompatible fingerprints, and sharing one dir
+      # would invalidate the restored cache in both directions every run.
       - name: Lint
         if: matrix.lint
+        env:
+          CARGO_TARGET_DIR: target/clippy
         run: scripts/cargo.sh clippy --workspace --lib --bins --locked -- -D warnings
 
       - name: Lint ratchet
@@ -194,12 +247,28 @@ jobs:
         if: matrix.lint
         run: scripts/test-pr.sh
 
+      # The lint job is the critical path; its release-profile check moved to
+      # the nightly workflow, while the shorter ARM64/macOS jobs keep covering
+      # the release build and packaged smoke test on every PR.
       - name: Build release compiler
+        if: ${{ !matrix.lint }}
         run: scripts/cargo.sh build --locked --release -p align_runtime -p align_driver
 
       - name: Smoke test packaged command
+        if: ${{ !matrix.lint }}
         shell: bash
         run: |
           ./target/release/alignc --version
           ./target/release/alignc build examples/hello.align
           ./hello
+
+      - name: Save Cargo caches
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            target/clippy
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-lint${{ matrix.lint }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}
