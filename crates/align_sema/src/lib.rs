@@ -2362,7 +2362,10 @@ fn is_ffi_safe_param(ty: Ty) -> bool {
         || matches!(ty, Ty::Slice(elem) if matches!(elem, Scalar::Int(_) | Scalar::Float(_)))
 }
 
-fn ty_is_move(
+/// Whether a value of this type is Move (owns something dropped) rather than Copy. The one
+/// authority for the question: the MIR body validator delegates to it so a second model cannot
+/// drift from the producer's contract.
+pub fn ty_is_move(
     ty: Ty,
     structs: &[StructDef],
     tuples: &[hir::TupleDef],
@@ -8611,6 +8614,15 @@ fn check_parallelism_impl(
         })
         .map(|function| function.name.clone())
         .collect();
+    // The open-world dispatch restriction exists to keep an externally supplied Impure callback
+    // from reaching a `par_map`, whose callables must be Pure (draft.md §11). A `spawn`ed task
+    // deliberately may be Impure, so `task_group` imposes no such obligation. When the whole
+    // program contains no `par_map` site, no purity obligation exists for an erased target to
+    // launder, and rejecting the dispatch only refuses correct sequential code — the shape every
+    // callback-dispatching library (a middleware chain, a streaming pump) is built from. Keep the
+    // conservative rejection the moment one `par_map` appears anywhere: an erased target may then
+    // be the internal function that par_maps the laundered callback.
+    let program_has_parmap = !closed.parmaps.is_empty();
     let mut reported_open_indirect = Vec::new();
     for root in exports {
         let open = solve_fn_type_effects(
@@ -8622,7 +8634,8 @@ fn check_parallelism_impl(
         for (owner, span, callback_actual, internal_target) in
             &open.unresolved_dispatches
         {
-            if reachable.contains(owner)
+            if program_has_parmap
+                && reachable.contains(owner)
                 && (*callback_actual || *internal_target)
                 && !reported_open_indirect.contains(span)
             {

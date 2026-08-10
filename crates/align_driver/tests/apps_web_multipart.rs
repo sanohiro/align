@@ -483,3 +483,33 @@ fn the_documented_handler_example_compiles_against_the_real_pkg_web() {
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n");
 }
+
+#[test]
+fn a_par_map_in_the_program_restores_the_open_world_dispatch_rejection() {
+    // The L2a open-world rule keeps an externally supplied Impure callback out of a `par_map`,
+    // whose callables must be Pure; a `spawn`ed task may be Impure, so `task_group` imposes no
+    // such obligation. pkg.web dispatches middleware and stream pumps through function values,
+    // which the rule rejected in every program — including ones with no `par_map` at all, where
+    // no purity obligation exists to launder. The narrowing is scoped, not removed: adding one
+    // `par_map` anywhere brings the conservative rejection straight back.
+    let main = format!(
+        "module main\nimport pkg.web\nimport pkg.web.types\nimport pkg.web.multipart\n\n{}\n         fn inc(x: i64) -> i64 = x + 1\n         fn main() -> Result<(), Error> {{\n           routes := [pkg.web.post(\"/upload\", upload)]\n  print(routes.len())\n           print([1, 2].par_map(inc).sum())\n  return Ok(())\n}}\n",
+        doc_example("## multipart/form-data")
+    );
+    let diagnostics = check_multi_diagnostics(
+        "multipart-doc-example-parmap",
+        &[
+            ("pkg/web.align", WEB_ROOT),
+            ("pkg/web/types.align", TYPES),
+            ("pkg/web/internal/router.align", ROUTER),
+            ("pkg/web/internal/query.align", QUERY),
+            ("pkg/web/multipart.align", MULTIPART),
+            ("main.align", &main),
+        ],
+        "main.align",
+    );
+    assert!(
+        diagnostics.contains("cannot route an open-world callback"),
+        "a par_map in the program must restore the conservative rejection:\n{diagnostics}",
+    );
+}
