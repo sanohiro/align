@@ -4682,11 +4682,14 @@ fn validate_static_data_record(
             }
             cursor = end;
         }
-        let query_descriptor_v5 = record.bytes.len() == 136
-            && record.align == 8
-            && static_u32(&record.bytes, 0) == Some(5)
+        let query_descriptor_v5 = static_u32(&record.bytes, 0) == Some(5)
             && record.bytes.get(4).copied() == Some(0);
         if query_descriptor_v5 {
+            if record.bytes.len() != 136 || record.align != 8 {
+                return Err(malformed(
+                    "v5 Query descriptor size or alignment is invalid",
+                ));
+            }
             let plan = relocations
                 .iter()
                 .find(|relocation| relocation.offset == 128)
@@ -17451,6 +17454,22 @@ mod tests {
             )
         };
         assert!(emit_descriptor(plan.clone()).is_ok());
+
+        for (length, align) in [(128, 8), (135, 8), (137, 8), (136, 16)] {
+            let mut header = vec![0; length];
+            header[0..4].copy_from_slice(&5u32.to_le_bytes());
+            let malformed = StaticData {
+                bytes: header,
+                align,
+                relocations: Vec::new(),
+            };
+            let error = emit(malformed, Ty::Raw)
+                .expect_err("wrong-shaped v5 Query descriptor must fail before LLVM");
+            assert!(
+                error.to_string().contains("v5 Query descriptor"),
+                "length {length}, align {align} produced unexpected diagnostic: {error}"
+            );
+        }
         for offset in [16, 24, 32, 40, 48, 56] {
             let mut malformed = plan.clone();
             let relocation = malformed

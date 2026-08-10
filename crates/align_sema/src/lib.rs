@@ -29138,6 +29138,9 @@ impl<'a, 't> Checker<'a, 't> {
             (Ty::SoaParam(p), Ty::Soa(id)) => {
                 self.bind_param(p, Ty::Struct(id), subst, span)
             }
+            (Ty::SoaParam(p), Ty::SoaParam(outer)) => {
+                self.bind_param(p, Ty::Param(outer), subst, span)
+            }
             (Ty::Tagged(_), _) => self.match_param_in_context(
                 expand_tagged_ty(declared, self.tagged_types),
                 a,
@@ -29271,10 +29274,21 @@ impl<'a, 't> Checker<'a, 't> {
         span: Span,
         context: GenericMatchContext,
     ) {
-        if let Scalar::SoaParam(p) = declared
-            && let Scalar::Soa(id) = actual
-        {
-            self.bind_param(p, Ty::Struct(id), subst, span);
+        if let Scalar::SoaParam(p) = declared {
+            match actual {
+                Scalar::Soa(id) => self.bind_param(p, Ty::Struct(id), subst, span),
+                Scalar::SoaParam(outer) => {
+                    self.bind_param(p, Ty::Param(outer), subst, span)
+                }
+                _ => match context {
+                    GenericMatchContext::Argument => {
+                        self.unify(scalar_to_ty(actual), scalar_to_ty(declared), span);
+                    }
+                    GenericMatchContext::ExpectedReturn => {
+                        self.unify(scalar_to_ty(declared), scalar_to_ty(actual), span);
+                    }
+                },
+            }
         } else if let Scalar::Param(p) = declared {
             self.bind_param(p, scalar_to_ty(actual), subst, span);
         } else if matches!(declared, Scalar::Tagged(_))
@@ -43401,6 +43415,7 @@ fn subst_param_ty(
         Ty::Param(i) => args.get(i as usize).copied().unwrap_or(Ty::Error),
         Ty::SoaParam(i) => match args.get(i as usize).copied().unwrap_or(Ty::Error) {
             Ty::Struct(id) => Ty::Soa(id),
+            Ty::Param(index) => Ty::SoaParam(index),
             _ => Ty::Error,
         },
         Ty::Option(s) => Ty::Option(subst_scalar(s, args, tagged_types)),
@@ -43536,6 +43551,7 @@ fn subst_scalar(s: Scalar, args: &[Ty], tagged_types: &mut Vec<hir::TaggedType>)
             Work::Enter(Scalar::SoaParam(index)) => {
                 let value = match args.get(index as usize).copied().unwrap_or(Ty::Error) {
                     Ty::Struct(id) => Scalar::Soa(id),
+                    Ty::Param(outer) => Scalar::SoaParam(outer),
                     _ => Scalar::SoaParam(index),
                 };
                 values.push(value);

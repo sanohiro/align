@@ -206,6 +206,16 @@ fn soa_plain_bound_preserves_symbolic_soa_through_result_substitution() {
 }
 
 #[test]
+fn soa_plain_forwarding_remaps_different_generic_parameter_indices() {
+    if !backend_available() {
+        return;
+    }
+    let src = "Row { id: i32, score: i32 }\nfn direct<P: SoaPlain>(values: soa<P>) -> soa<P> = values\nfn tagged<P: SoaPlain>(values: Result<soa<P>, Error>) -> Result<soa<P>, Error> = values\nfn forward<X, R: SoaPlain>(unused: X, values: soa<R>) -> Result<soa<R>, Error> = tagged(Ok(direct(values)))\nfn main() -> i32 {\n  arena {\n    rows := [Row { id: 40, score: 2 }].to_soa()\n    kept := forward(true, rows) else { return 1 }\n    return kept.id[0] + kept.score[0]\n  }\n}\n";
+    let out = build_and_run("gen-soa-plain-forward-remap", src);
+    assert_eq!(out.status.code(), Some(42));
+}
+
+#[test]
 fn soa_plain_bound_rejects_non_soa_struct_at_concrete_instantiation() {
     for (name, src) in [
         (
