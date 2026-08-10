@@ -62,6 +62,11 @@ case "$review_state" in
   docs-only)
     [[ "$review_head" == "$head_sha" && "$reviewer" == docs-only ]] || exit 1
     ;;
+  tooling)
+    # Tooling tier: no library source changed, so an independent review is
+    # optional and the focused owner check recorded in the stamp is the gate.
+    [[ "$review_head" == "$head_sha" && "$reviewer" == tooling ]] || exit 1
+    ;;
   *) echo "invalid review state in preflight stamp" >&2; exit 1 ;;
 esac
 [[ "$(git rev-parse --verify "${base_ref}^{commit}")" == "$base_sha" ]] || {

@@ -36,5 +36,6 @@ case "$state" in
       git merge-base --is-ancestor "$review_head" "$head_sha"
     ;;
   docs-only) [[ "$review_head" == "$head_sha" && "$reviewer" == docs-only ]] ;;
+  tooling) [[ "$review_head" == "$head_sha" && "$reviewer" == tooling ]] ;;
   *) false ;;
 esac || { echo "invalid review state: $state" >&2; exit 1; }

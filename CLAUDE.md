@@ -362,6 +362,27 @@ contradictory, or changed areas.
 
 ## Review before merging
 
+Verification is proportional to blast radius. `scripts/pre-pr.sh` classifies
+every diff into one of three tiers and enforces the matching gate, so the tier
+is a property of the changed paths, not a judgement call:
+
+```text
+docs-only  Markdown and docs/ only          no reviewer, no owner check
+tooling    scripts/, .github/, bench/,      review OPTIONAL, one focused owner
+           individual crates/*/tests/*,     check, cheap ratchet, no bounded gate
+           and prose
+code       crates/*/src, Cargo.*,           full flow below: one fresh review,
+           .cargo/, apps/, and the shared   owner check, bounded gate, Clippy
+           crates/*/tests/common harness
+```
+
+The tooling tier exists because a script, a workflow, a benchmark, or one test
+file cannot change compiled behavior beyond what its own focused owner check
+exercises. The shared test harness stays in the code tier: one file there
+breaks every suite. Passing `--reviewer` with a log in the tooling tier still
+records a review exactly as the code tier does — the tier removes the
+requirement, not the option.
+
 The PR is a publication checkpoint, not a second implementation loop. The
 normal code path is exactly:
 
@@ -388,6 +409,16 @@ layers, or responds to a P1 by redesigning the implementation. A local
 ownership, cleanup, FFI, ABI, diagnostic, or test correction closes against
 the original finding and its owner check. The user may explicitly request a
 second review.
+
+**The one-review/one-fix cycle is enforced, not merely stated.** Preflight
+counts the consecutive `fix` commits following the implementation on the
+branch; at three it fails unless one of them also changed the owning
+`docs/impl` plan or audit. Three rounds of patching individually reported
+cells is the signature of a matrix that missed an axis — the required response
+is to enumerate that axis, fix the class in one pass, and commit the updated
+matrix with the fix. Measured cost of ignoring this: 24–36 minutes per round,
+and the two capabilities that ran four and nine rounds spent 3.5 and 4.75
+hours respectively inside the loop.
 
 Finish ordinary PR-body prose before opening. If a later code push is actually
 required, rerun preflight for the new SHA and refresh the existing PR with

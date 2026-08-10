@@ -287,6 +287,80 @@ set -e
   exit 1
 }
 
+# Tier classification and the review-round tripwire.
+tier_repo="$tmp_dir/tier-repo"
+mkdir -p "$tier_repo/crates/thing/src" "$tier_repo/crates/thing/tests" \
+  "$tier_repo/docs/impl" "$tier_repo/scripts"
+# The fixture stands in for the real repository, whose crates/ changes always
+# run the cheap ratchet; stub it so the tier logic is what is under test.
+printf '#!/usr/bin/env bash\nexit 0\n' >"$tier_repo/scripts/lint-ratchet.sh"
+chmod +x "$tier_repo/scripts/lint-ratchet.sh"
+git -C "$tier_repo" init -q -b main
+git -C "$tier_repo" config user.name workflow-test
+git -C "$tier_repo" config user.email workflow-test@example.invalid
+git -C "$tier_repo" config commit.gpgsign false
+printf 'fn main() {}\n' >"$tier_repo/crates/thing/src/lib.rs"
+printf '# plan\n' >"$tier_repo/docs/impl/00-plan.md"
+git -C "$tier_repo" add .
+git -C "$tier_repo" commit -qm baseline
+
+# A test-only change is the tooling tier: no reviewer required, and the stamp
+# records the tier so the PR wrappers accept the lighter attestation.
+git -C "$tier_repo" switch -qc tooling-change
+printf '#[test]\nfn t() {}\n' >"$tier_repo/crates/thing/tests/owner.rs"
+git -C "$tier_repo" add crates/thing/tests/owner.rs
+git -C "$tier_repo" commit -qm 'test: add owner'
+(
+  cd "$tier_repo"
+  "$repo_root/scripts/pre-pr.sh" --base main --owner-test tier -- true >/dev/null
+)
+tooling_head="$(git -C "$tier_repo" rev-parse HEAD)"
+grep -Fqx 'kind=tooling' "$tier_repo/.git/align-preflight/$tooling_head"
+grep -Fqx 'review_state=tooling' "$tier_repo/.git/align-preflight/$tooling_head"
+
+# The shared test harness is library-tier even though it lives under tests/:
+# one harness file breaks every suite, so it keeps the full review requirement.
+git -C "$tier_repo" switch -q main
+git -C "$tier_repo" switch -qc harness-change
+mkdir -p "$tier_repo/crates/thing/tests/common"
+printf 'pub fn helper() {}\n' >"$tier_repo/crates/thing/tests/common/mod.rs"
+git -C "$tier_repo" add crates/thing/tests/common/mod.rs
+git -C "$tier_repo" commit -qm 'test: add harness'
+if (
+  cd "$tier_repo"
+  "$repo_root/scripts/pre-pr.sh" --base main --owner-test tier -- true >/dev/null 2>&1
+); then
+  echo "shared test harness change unexpectedly took the tooling tier" >&2
+  exit 1
+fi
+
+# Three consecutive review-fix commits without re-opening a closure matrix is
+# the review-as-discovery-loop pattern and must fail; adding the matrix change
+# to the streak releases it.
+git -C "$tier_repo" switch -q main
+git -C "$tier_repo" switch -qc rounds-change
+mkdir -p "$tier_repo/crates/thing/tests"
+printf '#[test]\nfn a() {}\n' >"$tier_repo/crates/thing/tests/rounds.rs"
+git -C "$tier_repo" add crates/thing/tests/rounds.rs
+git -C "$tier_repo" commit -qm 'feat: add rounds owner'
+for round in 1 2 3; do
+  printf '#[test]\nfn r%s() {}\n' "$round" >>"$tier_repo/crates/thing/tests/rounds.rs"
+  git -C "$tier_repo" commit -qam "fix: close review finding $round"
+done
+if (
+  cd "$tier_repo"
+  "$repo_root/scripts/pre-pr.sh" --base main --owner-test tier -- true >/dev/null 2>&1
+); then
+  echo "three review-fix rounds unexpectedly passed without a matrix re-open" >&2
+  exit 1
+fi
+printf '\n## reopened axis\n' >>"$tier_repo/docs/impl/00-plan.md"
+git -C "$tier_repo" commit -qam 'fix: re-open the closure matrix axis'
+(
+  cd "$tier_repo"
+  "$repo_root/scripts/pre-pr.sh" --base main --owner-test tier -- true >/dev/null
+)
+
 for script in \
   scripts/cargo.sh \
   scripts/check-pr-preflight.sh \
