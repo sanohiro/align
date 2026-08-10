@@ -1,0 +1,72 @@
+module app.transaction_master
+
+import pkg.db
+import pkg.db.postgres
+import pkg.db.sqlite
+
+pub Params { account_id: i64 }
+
+pub Row {
+  transaction_id: i64,
+  posted_at: str,
+  amount_cents: i64,
+  status_id: i64,
+  status_code: str,
+  status_name: str,
+  customer_id: i64,
+  customer_name: str,
+}
+
+pub Transaction { id: i64, posted_at: str, amount_cents: i64 }
+pub Status { id: i64, code: str, name: str }
+pub Customer { id: i64, name: str }
+
+pub OutputRow {
+  transaction: Transaction,
+  status: Status,
+  customer: Customer,
+}
+
+pub fn query() -> pkg.db.query<Params, Row> = pkg.db.query(
+  "SELECT t.id AS transaction_id, t.posted_at, t.amount_cents, s.id AS status_id, s.code AS status_code, s.name AS status_name, c.id AS customer_id, c.name AS customer_name FROM transactions AS t JOIN transaction_status AS s ON s.id = t.status_id JOIN customers AS c ON c.id = t.customer_id WHERE t.account_id = :account_id ORDER BY t.posted_at DESC, t.id DESC /* Q6_TRANSACTION_MASTER */",
+  [],
+)
+
+fn step(
+  borrow mut output: array_builder<OutputRow>,
+  row: Row,
+  out: region,
+) -> Result<(), pkg.db.Error> {
+  output.push(OutputRow {
+    transaction: Transaction {
+      id: row.transaction_id,
+      posted_at: row.posted_at.clone_in(out),
+      amount_cents: row.amount_cents,
+    },
+    status: Status {
+      id: row.status_id,
+      code: row.status_code.clone_in(out),
+      name: row.status_name.clone_in(out),
+    },
+    customer: Customer {
+      id: row.customer_id,
+      name: row.customer_name.clone_in(out),
+    },
+  })
+  return Ok(())
+}
+
+pub fn run(
+  target: pkg.db.exec,
+  params: Params,
+  out: region,
+) -> Result<array<OutputRow>, pkg.db.Error> {
+  mut output: array_builder<OutputRow> := array_builder(out)
+  mut stream := pkg.db.rows(target, query(), params, [])?
+  loop {
+    row := pkg.db.next(stream)? else { break }
+    step(output, row, out)?
+  }
+  result := output.build()
+  return Ok(result)
+}

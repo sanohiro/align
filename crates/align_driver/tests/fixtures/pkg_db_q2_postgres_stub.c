@@ -28,8 +28,9 @@ typedef struct {
   int fields;
   const char *names[16];
   uint32_t oids[16];
-  const char *values[2][16];
-  int nulls[2][16];
+  const char *values[64][16];
+  int nulls[64][16];
+  int delivered[64];
   const char *affected;
   const char *sqlstate;
   const char *message;
@@ -75,6 +76,8 @@ static int prepared_timeout_wait;
 static int nonblocking_calls;
 static int cancel_calls;
 static int consume_calls;
+static int q6_delivered_rows;
+static int q6_fail_next_execute;
 
 static char *copy_text(const char *text) {
   size_t n = strlen(text) + 1;
@@ -119,6 +122,8 @@ void align_pg_reset(void) {
   nonblocking_calls = 0;
   cancel_calls = 0;
   consume_calls = 0;
+  q6_delivered_rows = 0;
+  q6_fail_next_execute = 0;
 }
 
 int align_pg_connect_calls(void) { return connect_calls; }
@@ -131,6 +136,8 @@ int align_pg_protocol_error(void) { return protocol_error; }
 int align_pg_nonblocking_calls(void) { return nonblocking_calls; }
 int align_pg_cancel_calls(void) { return cancel_calls; }
 int align_pg_consume_calls(void) { return consume_calls; }
+int align_pg_q6_delivered_rows(void) { return q6_delivered_rows; }
+void align_pg_q6_fail_next_execute(void) { q6_fail_next_execute = 1; }
 int align_pg_last_timeout(void) { return last_timeout; }
 int align_pg_prepare_calls(void) { return prepare_calls; }
 int align_pg_execute_prepared_calls(void) { return execute_prepared_calls; }
@@ -187,16 +194,25 @@ void PQfreemem(void *pointer) { free(pointer); }
 
 FakeConn *PQconnectdbParams(const char *const *keywords, const char *const *values, int expand_dbname) {
   connect_calls++;
-  if (expand_dbname != 1 || keywords == NULL || values == NULL) protocol_ok = 0;
+  if (expand_dbname != 1 || keywords == NULL || values == NULL) {
+    protocol_ok = 0;
+    if (protocol_error == 0) protocol_error = 82;
+  }
   const char *dbname = NULL;
   int client_count = 0;
   int pair_count = 0;
   for (; keywords != NULL && keywords[pair_count] != NULL; pair_count++) {
-    if (values[pair_count] == NULL) protocol_ok = 0;
+    if (values[pair_count] == NULL) {
+      protocol_ok = 0;
+      if (protocol_error == 0) protocol_error = 83;
+    }
     if (strcmp(keywords[pair_count], "dbname") == 0) dbname = values[pair_count];
     if (strcmp(keywords[pair_count], "client_encoding") == 0) {
       client_count++;
-      if (strcmp(values[pair_count], "UTF8") != 0) protocol_ok = 0;
+      if (strcmp(values[pair_count], "UTF8") != 0) {
+        protocol_ok = 0;
+        if (protocol_error == 0) protocol_error = 84;
+      }
     }
     if (strcmp(keywords[pair_count], "connect_timeout") == 0) {
       last_timeout = atoi(values[pair_count]);
@@ -204,6 +220,7 @@ FakeConn *PQconnectdbParams(const char *const *keywords, const char *const *valu
   }
   if (pair_count == 0 || strcmp(keywords[pair_count - 1], "client_encoding") != 0 || client_count != 1) {
     protocol_ok = 0;
+    if (protocol_error == 0) protocol_error = 85;
   }
   if (has(dbname, "null-connection")) return NULL;
   FakeConn *connection = (FakeConn *)calloc(1, sizeof(FakeConn));
@@ -273,11 +290,13 @@ FakeResult *PQprepare(
   if (name == NULL || strncmp(name, "__align_pkg_db_", 15) != 0 || command == NULL ||
       parameter_count != 3 || (!common_types && !overridden_types)) {
     protocol_ok = 0;
+    if (protocol_error == 0) protocol_error = 88;
   }
   if (name != NULL) {
     size_t length = strlen(name);
     if (length >= sizeof(prepared_name)) {
       protocol_ok = 0;
+      if (protocol_error == 0) protocol_error = 89;
     } else {
       memcpy(prepared_name, name, length + 1);
     }
@@ -311,12 +330,14 @@ FakeResult *PQexecPrepared(
         (strcmp(parameter_values[0], "8") == 0 && strcmp(parameter_values[1], "second") == 0)) ||
       strcmp(parameter_values[2], "\\x010203") != 0) {
     protocol_ok = 0;
+    if (protocol_error == 0) protocol_error = 90;
   }
   for (int i = 0; i < parameter_count; i++) {
     if (parameter_values == NULL || parameter_lengths == NULL || parameter_formats == NULL ||
         parameter_values[i] == NULL || parameter_formats[i] != 0 ||
         parameter_lengths[i] != (int)strlen(parameter_values[i])) {
       protocol_ok = 0;
+      if (protocol_error == 0) protocol_error = 91;
     }
   }
   FakeResult *result = new_result();
@@ -325,10 +346,16 @@ FakeResult *PQexecPrepared(
 }
 
 FakeResult *PQexec(FakeConn *connection, const char *command) {
-  if (command == NULL) protocol_ok = 0;
+  if (command == NULL) {
+    protocol_ok = 0;
+    if (protocol_error == 0) protocol_error = 92;
+  }
   if (command != NULL && strncmp(command, "DEALLOCATE __align_pkg_db_", 26) == 0) {
     deallocate_calls++;
-    if (prepared_name[0] == '\0' || strcmp(command + 11, prepared_name) != 0) protocol_ok = 0;
+    if (prepared_name[0] == '\0' || strcmp(command + 11, prepared_name) != 0) {
+      protocol_ok = 0;
+      if (protocol_error == 0) protocol_error = 93;
+    }
   } else {
     control_calls++;
     if (command == NULL ||
@@ -336,6 +363,7 @@ FakeResult *PQexec(FakeConn *connection, const char *command) {
          strcmp(command, "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE") != 0 &&
          strcmp(command, "COMMIT") != 0 && strcmp(command, "ROLLBACK") != 0)) {
       protocol_ok = 0;
+      if (protocol_error == 0) protocol_error = 86;
     }
   }
   FakeResult *result = new_result();
@@ -361,6 +389,96 @@ FakeResult *PQexec(FakeConn *connection, const char *command) {
   return result;
 }
 
+static void q6_user_result(FakeResult *result, int parameter, int last_parameter) {
+  static const char *names[4] = {"user_id", "user_name", "group_id", "group_name"};
+  static const uint32_t oids[4] = {20, 25, 20, 25};
+  result->fields = 4;
+  for (int column = 0; column < 4; column++) {
+    result->names[column] = names[column];
+    result->oids[column] = oids[column];
+  }
+  if (parameter == 0) {
+    result->rows = 0;
+    return;
+  }
+  if (parameter == 1 && last_parameter == 3) {
+    static const char *values[4][4] = {
+        {"1", "Alice", "10", "Admin"},
+        {"1", "Alice", "20", "Dev"},
+        {"2", "Bob", "", ""},
+        {"3", "Cara", "40", "Ops"},
+    };
+    result->rows = 4;
+    for (int row = 0; row < 4; row++) {
+      for (int column = 0; column < 4; column++) result->values[row][column] = values[row][column];
+    }
+    result->nulls[2][2] = 1;
+    result->nulls[2][3] = 1;
+    return;
+  }
+  if (parameter == 1) {
+    result->rows = 2;
+    result->values[0][0] = "1";
+    result->values[0][1] = "Alice";
+    result->values[0][2] = "10";
+    result->values[0][3] = "Admin";
+    result->values[1][0] = "1";
+    result->values[1][1] = "Alice";
+    result->values[1][2] = "20";
+    result->values[1][3] = "Dev";
+    return;
+  }
+  if (parameter == 2) {
+    result->rows = 1;
+    result->values[0][0] = "2";
+    result->values[0][1] = "Bob";
+    result->values[0][2] = "";
+    result->values[0][3] = "";
+    result->nulls[0][2] = 1;
+    result->nulls[0][3] = 1;
+    return;
+  }
+  if (parameter == 7) {
+    static const char *values[3][4] = {
+        {"1", "Alice", "10", "Admin"},
+        {"2", "Bob", "20", "Dev"},
+        {"1", "Alice", "30", "Ops"},
+    };
+    result->rows = 3;
+    for (int row = 0; row < 3; row++) {
+      for (int column = 0; column < 4; column++) result->values[row][column] = values[row][column];
+    }
+    return;
+  }
+  result->rows = 1;
+  result->values[0][0] = "3";
+  result->values[0][1] = "Cara";
+  result->values[0][2] = parameter == 4 ? "" : "30";
+  result->values[0][3] = parameter == 3 ? "" : "Ops";
+  result->nulls[0][2] = parameter == 4;
+  result->nulls[0][3] = parameter == 3;
+}
+
+static void q6_transaction_result(FakeResult *result) {
+  static const char *names[8] = {
+      "transaction_id", "posted_at", "amount_cents", "status_id",
+      "status_code", "status_name", "customer_id", "customer_name",
+  };
+  static const uint32_t oids[8] = {20, 25, 20, 20, 25, 25, 20, 25};
+  static const char *values[2][8] = {
+      {"100", "2026-08-10", "5000", "7", "posted", "Posted", "900", "Ada"},
+      {"101", "2026-08-09", "5001", "7", "posted", "Posted", "901", "Linus"},
+  };
+  result->rows = 2;
+  result->fields = 8;
+  for (int column = 0; column < 8; column++) {
+    result->names[column] = names[column];
+    result->oids[column] = oids[column];
+    result->values[0][column] = values[0][column];
+    result->values[1][column] = values[1][column];
+  }
+}
+
 FakeResult *PQexecParams(
     FakeConn *connection,
     const char *command,
@@ -372,9 +490,18 @@ FakeResult *PQexecParams(
     int result_format) {
   (void)connection;
   execute_calls++;
-  if (command == NULL || result_format != 0) protocol_ok = 0;
+  if (q6_fail_next_execute) {
+    q6_fail_next_execute = 0;
+    return NULL;
+  }
+  if (command == NULL || result_format != 0) {
+    protocol_ok = 0;
+    if (protocol_error == 0) protocol_error = 87;
+  }
   int full_matrix = has(command, "FULL_MATRIX");
   int view_fault = has(command, "VIEW_FAULT");
+  int q6_user = has(command, "Q6_USER_GROUPS");
+  int q6_transaction = has(command, "Q6_TRANSACTION_MASTER");
   if (full_matrix) {
     static const uint32_t expected_types[16] = {
         16, 16, 21, 21, 23, 23, 20, 20, 700, 700, 701, 701, 25, 25, 17, 17,
@@ -409,13 +536,32 @@ FakeResult *PQexecParams(
     if (parameter_count != 3 || parameter_types == NULL || parameter_values == NULL ||
         parameter_lengths == NULL || parameter_formats == NULL) {
       protocol_ok = 0;
+      if (protocol_error == 0) protocol_error = 94;
     } else {
       for (int i = 0; i < 3; i++) {
         if (parameter_types[i] != expected_types[i] || parameter_values[i] == NULL ||
             parameter_formats[i] != 0 ||
             parameter_lengths[i] != (int)strlen(parameter_values[i])) {
           protocol_ok = 0;
+          if (protocol_error == 0) protocol_error = 95;
         }
+      }
+    }
+  } else if (q6_user || q6_transaction) {
+    int expected_parameters = q6_user ? 2 : 1;
+    if (parameter_count != expected_parameters || parameter_types == NULL || parameter_values == NULL ||
+        parameter_lengths == NULL || parameter_formats == NULL ||
+        parameter_values[0] == NULL || parameter_formats[0] != 0 ||
+        parameter_lengths[0] != (int)strlen(parameter_values[0])) {
+      protocol_ok = 0;
+      if (protocol_error == 0) protocol_error = 81;
+    }
+    for (int index = 0; index < parameter_count; index++) {
+      if ((parameter_types[index] != 0 && parameter_types[index] != 20) ||
+          parameter_values[index] == NULL || parameter_formats[index] != 0 ||
+          parameter_lengths[index] != (int)strlen(parameter_values[index])) {
+        protocol_ok = 0;
+        if (protocol_error == 0) protocol_error = 81;
       }
     }
   } else if (parameter_count != 1 || parameter_types == NULL || parameter_values == NULL ||
@@ -423,11 +569,19 @@ FakeResult *PQexecParams(
              parameter_values[0] == NULL || parameter_formats[0] != 0 ||
              parameter_lengths[0] != (int)strlen(parameter_values[0])) {
       protocol_ok = 0;
+      if (protocol_error == 0) protocol_error = 96;
   }
   if (has(command, "NULL_RESULT")) return NULL;
   FakeResult *result = new_result();
   if (result == NULL) return NULL;
-  if (full_matrix && parameter_values != NULL && parameter_count == 16) {
+  if (q6_user) {
+    q6_user_result(
+        result,
+        parameter_values == NULL ? 0 : atoi(parameter_values[0]),
+        parameter_values == NULL || parameter_count < 2 ? 0 : atoi(parameter_values[1]));
+  } else if (q6_transaction) {
+    q6_transaction_result(result);
+  } else if (full_matrix && parameter_values != NULL && parameter_count == 16) {
     static const char *names[16] = {
         "b", "nb", "i16v", "ni16", "i32v", "ni32", "i64v", "ni64",
         "f32v", "nf32", "f64v", "nf64", "textv", "ntext", "bytesv", "nbytes",
@@ -651,6 +805,15 @@ int PQgetisnull(const FakeResult *result, int row, int column) {
 }
 char *PQgetvalue(const FakeResult *result, int row, int column) {
   if (result == NULL || row < 0 || row >= result->rows || column < 0 || column >= result->fields) return NULL;
+  if (column == 0 && result->names[0] != NULL &&
+      (strcmp(result->names[0], "user_id") == 0 ||
+       strcmp(result->names[0], "transaction_id") == 0)) {
+    FakeResult *mutable_result = (FakeResult *)result;
+    if (!mutable_result->delivered[row]) {
+      mutable_result->delivered[row] = 1;
+      q6_delivered_rows++;
+    }
+  }
   if ((result->row_fault == 1 && column == 0) || (result->row_fault == 4 && column == 1)) {
     return NULL;
   }

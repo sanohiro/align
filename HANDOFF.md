@@ -5,7 +5,7 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-09._ The C-B borrow/ownership capability is complete
+_Last updated: 2026-08-10._ The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit
 region materialization is complete through L4 and L6. Direct, captured,
 imported, and function-value returns preserve exact owner provenance;
@@ -30,7 +30,12 @@ prepared statements, shared connection/transaction execution, and exact
 failure-safe native cleanup. Q4b closes D8/D9 with one-pass typed rows,
 generation-bound borrowed views, complete bind/decode parity, scoped deadline
 enforcement, cancellation drain/recovery, and failure-safe stream cleanup. The
-next product work is Q6 compound product closure.
+Q6 compound product closure now completes D10 with ordinary Query-local Pure
+shapers for transaction/master and User + Groups outputs, exact one-execution
+stream ownership, one-parent and adjacent segmented shaping, visible region
+allocation/copies, and whole/per-unit mutable-retention parity. The next product
+work is the first independently useful A1/D13 throughput rail: common bounded
+batch/SoA delivery.
 
 Known pre-existing failure for the pkg.db owner (found 2026-08-09, present on
 `main`, unrelated to the toolchain work that surfaced it):
@@ -57,7 +62,8 @@ Q3 checked/offline parity        complete through D3 + D5
 Q4a reusable execution           complete through D6 + D7
 Q4b streaming resilience         complete through D8 + D9
 Q5 schema tooling/inspection     complete through D11 + D12
-next: Q6 compound product closure D10
+Q6 compound product closure      complete through D10
+next: A1 common batch/SoA rail   D13
 ```
 
 The exact cell contracts and owner matrices remain in

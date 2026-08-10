@@ -2,5 +2,7 @@ module main
 
 import app.users
 import app.prune
+import app.user_groups
+import app.transaction_master
 
 fn main() -> i32 = 0
