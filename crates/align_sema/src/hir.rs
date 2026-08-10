@@ -609,6 +609,9 @@ pub enum ExprKind {
     /// Compiler-trusted call through a bare native function pointer. The full logical signature is
     /// retained here and in MIR; unlike a function value, the callee has no closure environment.
     RawCall {
+        /// An optional compiler-owned safety predicate evaluated before the callee pointer is
+        /// loaded. A false predicate aborts without calling through the raw pointer.
+        guard: Option<Box<Expr>>,
         callee: Box<Expr>,
         args: Vec<Expr>,
         param_tys: Vec<Ty>,

@@ -27,7 +27,7 @@ mod runtime_abi;
 
 use align_ast::{BinOp, UnOp};
 use align_mir::{
-    Block, CanonicalFnAbi, CanonicalTy, Const, ConstElem, DirectCall, Function, GeneratedId,
+    Block, CanonicalFnAbi, CanonicalTy, ColumnBatchInput, Const, ConstElem, DirectCall, Function, GeneratedId,
     Operand, ParMapStage, ParMapStageKind, ParallelGeneratedId, ParallelKernelMode,
     ParallelStageId, Program, ProgramCall, RuntimeKey, Rvalue, Slot, StaticData, StaticDataTarget,
     Stmt, Term, ValueId,
@@ -63,6 +63,12 @@ use inkwell::values::{
     ArrayValue, BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, IntValue,
     PointerValue, StructValue,
 };
+
+type ColumnBatchLayout<'c> = (
+    Vec<IntValue<'c>>,
+    Vec<Option<IntValue<'c>>>,
+    IntValue<'c>,
+);
 
 pub fn is_available() -> bool {
     true
@@ -1559,6 +1565,40 @@ fn build_module<'c>(
 /// Recheck package-resource operations at the cached/hand-built MIR boundary. HIR validation
 /// proves these facts for normal lowering, but resource ids and safety discriminators live directly
 /// on MIR nodes and must fail closed before LLVM construction if an external producer corrupts them.
+fn db_resource_matches_row(
+    program: &Program,
+    resource: u32,
+    struct_id: u32,
+    kind: &str,
+) -> bool {
+    let Some(row) = program.structs.get(struct_id as usize) else {
+        return false;
+    };
+    let direct = format!("pkg.db${kind}$S{}_{}", row.name.len(), row.name);
+    let reconstructed_row = row
+        .name
+        .chars()
+        .map(|character| match character {
+            '.' | '$' => '_',
+            other => other,
+        })
+        .collect::<String>();
+    let reconstructed = format!(
+        "pkg.db${kind}$S{}_{}",
+        reconstructed_row.len(),
+        reconstructed_row
+    );
+    program.resources.get(resource as usize).is_some_and(|definition| {
+        definition.declaring_module == "pkg.db"
+            && definition.generic_arity == 1
+            && matches!(
+                definition.name.as_str(),
+                name if name == direct || name == reconstructed
+            )
+            && definition.source_name == definition.name
+    })
+}
+
 fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
     fn operand_ty(function: &align_mir::Function, operand: &align_mir::Operand) -> Option<Ty> {
         Some(match operand {
@@ -1583,9 +1623,64 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
             function.name
         ))
     };
+    let i32_ty = Ty::Int(IntTy {
+        bits: 32,
+        signed: true,
+    });
+    let i64_ty = Ty::Int(IntTy {
+        bits: 64,
+        signed: true,
+    });
+    let batch_fields = |struct_id: u32| {
+        program.structs.get(struct_id as usize).and_then(|definition| {
+            definition
+                .fields
+                .iter()
+                .map(|field| {
+                    let (base, nullable) = match field.ty {
+                        Ty::Option(payload) => (scalar_to_ty(payload), true),
+                        ty => (ty, false),
+                    };
+                    let view = matches!(
+                        base,
+                        Ty::Str
+                            | Ty::Slice(Scalar::Int(IntTy {
+                                bits: 8,
+                                signed: false,
+                            }))
+                    );
+                    matches!(
+                        base,
+                        Ty::Bool | Ty::Char | Ty::Int(_) | Ty::Float(_) | Ty::Str
+                    )
+                    .then_some((base, nullable, view))
+                    .or_else(|| {
+                        matches!(
+                            base,
+                            Ty::Slice(Scalar::Int(IntTy {
+                                bits: 8,
+                                signed: false,
+                            }))
+                        )
+                        .then_some((base, nullable, view))
+                    })
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+    };
     for function in &program.fns {
         for block in &function.blocks {
             for statement in &block.stmts {
+                match statement {
+                    Stmt::ColumnBatchFinish { payload, struct_id }
+                    | Stmt::ColumnBatchDrop { payload, struct_id }
+                        if operand_ty(function, payload) != Some(Ty::Raw)
+                            || batch_fields(*struct_id).is_none() =>
+                    {
+                        return Err(fail(function, "column-batch statement contract mismatch"));
+                    }
+                    _ => {}
+                }
                 let align_mir::Stmt::Let(value, rvalue) = statement else {
                     continue;
                 };
@@ -1681,6 +1776,79 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                                 && *check_utf8 == utf8
                         })
                     }
+                    Rvalue::ColumnBatchCreate {
+                        max_rows,
+                        struct_id,
+                    } => {
+                        batch_fields(*struct_id).is_some()
+                            && operand_ty(function, max_rows) == Some(i64_ty)
+                            && result == Ty::Raw
+                    }
+                    Rvalue::ColumnBatchAppend {
+                        payload,
+                        inputs,
+                        struct_id,
+                    } => batch_fields(*struct_id).is_some_and(|fields| {
+                        operand_ty(function, payload) == Some(Ty::Raw)
+                            && result == i32_ty
+                            && inputs.len() == fields.len()
+                            && inputs.iter().zip(fields).all(|(input, (base, _, view))| {
+                                match input {
+                                    align_mir::ColumnBatchInput::Scalar(value) => {
+                                        !view
+                                            && align_sema::ty_to_scalar(base).is_some_and(|base| {
+                                                operand_ty(function, value)
+                                                    == Some(Ty::Option(base))
+                                            })
+                                    }
+                                    align_mir::ColumnBatchInput::View { ptr, len } => {
+                                        view
+                                            && operand_ty(function, ptr) == Some(Ty::Raw)
+                                            && operand_ty(function, len) == Some(i64_ty)
+                                    }
+                                }
+                            })
+                    }),
+                    Rvalue::ColumnBatchRow {
+                        payload,
+                        owner,
+                        index,
+                        struct_id,
+                        resource,
+                    } => {
+                        batch_fields(*struct_id).is_some()
+                            && db_resource_matches_row(program, *resource, *struct_id, "batch")
+                            && operand_ty(function, payload) == Some(Ty::Raw)
+                            && operand_ty(function, owner)
+                                == Some(Ty::ResourceRef(*resource))
+                            && operand_ty(function, index) == Some(i64_ty)
+                            && result == Ty::Struct(*struct_id)
+                    }
+                    Rvalue::ColumnBatchSoa {
+                        payload,
+                        owner,
+                        struct_id,
+                        resource,
+                    } => batch_fields(*struct_id).is_some()
+                        && program.structs.get(*struct_id as usize).is_some_and(|definition| {
+                            !definition.fields.is_empty()
+                                && definition.fields.iter().all(|field| {
+                                    matches!(
+                                        field.ty,
+                                        Ty::Bool
+                                            | Ty::Char
+                                            | Ty::Int(_)
+                                            | Ty::Float(_)
+                                            | Ty::Str
+                                    )
+                                })
+                        })
+                            && db_resource_matches_row(program, *resource, *struct_id, "batch")
+                            && operand_ty(function, payload) == Some(Ty::Raw)
+                            && operand_ty(function, owner)
+                                == Some(Ty::ResourceRef(*resource))
+                            && result == Ty::Soa(*struct_id)
+                    ,
                     _ => continue,
                 };
                 if !valid {
@@ -2307,6 +2475,9 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                 Scalar::Param(id) => Err(Self::invalid(format!(
                     "abstract tagged payload parameter {id} survived into MIR"
                 ))),
+                Scalar::SoaParam(id) => Err(Self::invalid(format!(
+                    "abstract soa payload parameter {id} survived into MIR"
+                ))),
                 Scalar::Int(_)
                 | Scalar::Float(_)
                 | Scalar::Bool
@@ -2350,6 +2521,11 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                         Ty::Param(id) => {
                             return Err(Self::invalid(format!(
                                 "abstract type parameter {id} survived into MIR"
+                            )));
+                        }
+                        Ty::SoaParam(id) => {
+                            return Err(Self::invalid(format!(
+                                "abstract soa type parameter {id} survived into MIR"
                             )));
                         }
                         Ty::IntVar(id) => {
@@ -4144,6 +4320,7 @@ fn callable_preflight(
                         validate_static_data_record(
                             function.value_tys.get(*value as usize).copied(),
                             data,
+                            program,
                             &declarations,
                         )?;
                     }
@@ -4217,9 +4394,528 @@ fn callable_preflight(
     })
 }
 
+fn static_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let value: [u8; 4] = bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
+    Some(u32::from_le_bytes(value))
+}
+
+fn static_i64(bytes: &[u8], offset: usize) -> Option<i64> {
+    let value: [u8; 8] = bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?;
+    Some(i64::from_le_bytes(value))
+}
+
+fn static_plan_callback<'a>(
+    plan: &'a StaticData,
+    offset: u32,
+    declarations: &'a HashMap<ProgramCall, ProgramDeclaration>,
+) -> Result<(&'a ProgramCall, &'a ProgramDeclaration), CodegenError> {
+    let malformed = |detail: &str| {
+        CodegenError::Lowering(format!("static-data batch plan is malformed: {detail}"))
+    };
+    let relocation = plan
+        .relocations
+        .iter()
+        .find(|relocation| relocation.offset == offset)
+        .ok_or_else(|| malformed("callback ordinal is absent"))?;
+    let StaticDataTarget::Function(target) = &relocation.target else {
+        return Err(malformed("callback target is not a function"));
+    };
+    let declaration = declarations
+        .get(target)
+        .ok_or_else(|| callable_target_error(target))?;
+    if !declaration.classes.contains(&ProgramDeclarationClass::Stored)
+        || declaration.classes.contains(&ProgramDeclarationClass::Extern)
+    {
+        return Err(malformed("callback is not a stored program declaration"));
+    }
+    Ok((target, declaration))
+}
+
+fn static_plan_signature_matches(
+    declaration: &ProgramDeclaration,
+    params: Vec<Ty>,
+    ret: Ty,
+    borrow: hir::ReturnBorrowSummary,
+    region: hir::ReturnRegionSummary,
+) -> bool {
+    declaration.signature
+        == (ProgramSignature {
+            modes: vec![align_ast::ParamMode::ByValue; params.len()],
+            params,
+            ret,
+            borrow,
+            region,
+            cleanup: hir::ReturnCleanupAbi::None,
+        })
+}
+
+#[derive(Clone, Copy)]
+enum StaticBatchCallbackKind {
+    Create,
+    Append { rows_resource: u32 },
+    Finish,
+    Row { batch_resource: u32 },
+    Soa { batch_resource: u32 },
+    Drop,
+}
+
+fn static_batch_reader_result(statement: &Stmt, target: &str, ordinal: usize) -> Option<ValueId> {
+    let ordinal = i128::try_from(ordinal).ok()?;
+    let Stmt::Let(
+        value,
+        Rvalue::Call(
+            DirectCall::Program(actual_target),
+            args,
+        ),
+    ) = statement
+    else {
+        return None;
+    };
+    let [Operand::Arg(1), Operand::Const(Const::Int(actual_ordinal, ordinal_ty))] =
+        args.as_slice()
+    else {
+        return None;
+    };
+    let u32_ty = Ty::Int(IntTy {
+        bits: 32,
+        signed: false,
+    });
+    (actual_target.as_str() == target && *actual_ordinal == ordinal && *ordinal_ty == u32_ty)
+        .then_some(*value)
+}
+
+fn static_batch_append_prefix_matches(
+    program: &Program,
+    row_struct: u32,
+    prefix: &[Stmt],
+    inputs: &[ColumnBatchInput],
+) -> bool {
+    let Some(row) = usize::try_from(row_struct)
+        .ok()
+        .and_then(|row_struct| program.structs.get(row_struct))
+    else {
+        return false;
+    };
+    if row.fields.len() != inputs.len() {
+        return false;
+    }
+    let mut statements = prefix.iter();
+    for (ordinal, (field, input)) in row.fields.iter().zip(inputs).enumerate() {
+        let base = match field.ty {
+            Ty::Option(payload) => scalar_to_ty(payload),
+            ty => ty,
+        };
+        match base {
+            Ty::Str
+            | Ty::Slice(Scalar::Int(IntTy {
+                bits: 8,
+                signed: false,
+            })) => {
+                let Some(pointer) = statements.next().and_then(|statement| {
+                    static_batch_reader_result(
+                        statement,
+                        "pkg.db.internal$read_view_pointer_v2",
+                        ordinal,
+                    )
+                }) else {
+                    return false;
+                };
+                let Some(length) = statements.next().and_then(|statement| {
+                    static_batch_reader_result(
+                        statement,
+                        "pkg.db.internal$read_view_length_v2",
+                        ordinal,
+                    )
+                }) else {
+                    return false;
+                };
+                if !matches!(
+                    input,
+                    ColumnBatchInput::View {
+                        ptr: Operand::Value(actual_pointer),
+                        len: Operand::Value(actual_length),
+                    } if *actual_pointer == pointer && *actual_length == length
+                ) {
+                    return false;
+                }
+            }
+            base => {
+                let target = match base {
+                    Ty::Bool => "pkg.db.internal$read_bool_v2",
+                    Ty::Int(IntTy {
+                        bits: 16,
+                        signed: true,
+                    }) => "pkg.db.internal$read_i16_v2",
+                    Ty::Int(IntTy {
+                        bits: 32,
+                        signed: true,
+                    }) => "pkg.db.internal$read_i32_v2",
+                    Ty::Int(IntTy {
+                        bits: 64,
+                        signed: true,
+                    }) => "pkg.db.internal$read_i64_v2",
+                    Ty::Float(FloatTy { bits: 32 }) => "pkg.db.internal$read_f32_v2",
+                    Ty::Float(FloatTy { bits: 64 }) => "pkg.db.internal$read_f64_v2",
+                    _ => return false,
+                };
+                let Some(value) = statements
+                    .next()
+                    .and_then(|statement| static_batch_reader_result(statement, target, ordinal))
+                else {
+                    return false;
+                };
+                if !matches!(input, ColumnBatchInput::Scalar(Operand::Value(actual)) if *actual == value)
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    statements.next().is_none()
+}
+
+fn static_batch_callback_body_matches(
+    program: &Program,
+    target: &ProgramCall,
+    row_struct: u32,
+    kind: StaticBatchCallbackKind,
+) -> bool {
+    let Some(function) = program.fns.iter().find(|function| &function.name == target) else {
+        return false;
+    };
+    let [block] = function.blocks.as_slice() else {
+        return false;
+    };
+    if function.entry != block.id {
+        return false;
+    }
+    let Some((operation, prefix)) = block.stmts.split_last() else {
+        return false;
+    };
+    match (kind, operation, &block.term) {
+        (
+            StaticBatchCallbackKind::Create,
+            Stmt::Let(
+                value,
+                Rvalue::ColumnBatchCreate {
+                    max_rows: Operand::Arg(0),
+                    struct_id,
+                },
+            ),
+            Term::Return(Some(Operand::Value(result))),
+        ) => prefix.is_empty() && *struct_id == row_struct && value == result,
+        (
+            StaticBatchCallbackKind::Append { rows_resource },
+            Stmt::Let(
+                value,
+                Rvalue::ColumnBatchAppend {
+                    payload: Operand::Arg(0),
+                    inputs,
+                    struct_id,
+                },
+            ),
+            Term::Return(Some(Operand::Value(result))),
+        ) => {
+            *struct_id == row_struct
+                && value == result
+                && function.slots.get(2) == Some(&Ty::ResourceRef(rows_resource))
+                && static_batch_append_prefix_matches(program, row_struct, prefix, inputs)
+        }
+        (
+            StaticBatchCallbackKind::Finish,
+            Stmt::ColumnBatchFinish {
+                payload: Operand::Arg(0),
+                struct_id,
+            },
+            Term::Return(None),
+        ) => prefix.is_empty() && *struct_id == row_struct,
+        (
+            StaticBatchCallbackKind::Row { batch_resource },
+            Stmt::Let(
+                value,
+                Rvalue::ColumnBatchRow {
+                    payload: Operand::Arg(0),
+                    owner: Operand::Arg(1),
+                    index: Operand::Arg(2),
+                    struct_id,
+                    resource,
+                },
+            ),
+            Term::Return(Some(Operand::Value(result))),
+        ) => {
+            *struct_id == row_struct
+                && *resource == batch_resource
+                && value == result
+                && prefix.is_empty()
+        }
+        (
+            StaticBatchCallbackKind::Soa { batch_resource },
+            Stmt::Let(
+                value,
+                Rvalue::ColumnBatchSoa {
+                    payload: Operand::Arg(0),
+                    owner: Operand::Arg(1),
+                    struct_id,
+                    resource,
+                },
+            ),
+            Term::Return(Some(Operand::Value(result))),
+        ) => {
+            *struct_id == row_struct
+                && *resource == batch_resource
+                && value == result
+                && prefix.is_empty()
+        }
+        (
+            StaticBatchCallbackKind::Drop,
+            Stmt::ColumnBatchDrop {
+                payload: Operand::Arg(0),
+                struct_id,
+            },
+            Term::Return(None),
+        ) => prefix.is_empty() && *struct_id == row_struct,
+        _ => false,
+    }
+}
+
+fn validate_batch_plan_record(
+    plan: &StaticData,
+    program: &Program,
+    declarations: &HashMap<ProgramCall, ProgramDeclaration>,
+) -> Result<(), CodegenError> {
+    let malformed = |detail: &str| {
+        CodegenError::Lowering(format!("static-data batch plan is malformed: {detail}"))
+    };
+    if plan.bytes.len() != 72 || plan.align != 8 {
+        return Err(malformed("record size or alignment is invalid"));
+    }
+    let Some(version) = static_u32(&plan.bytes, 0) else {
+        return Err(malformed("version is absent"));
+    };
+    let Some(flags) = plan.bytes.get(4).copied() else {
+        return Err(malformed("flags are absent"));
+    };
+    let Some(field_count) = static_u32(&plan.bytes, 8) else {
+        return Err(malformed("field count is absent"));
+    };
+    if version != 1
+        || flags & !1 != 0
+        || plan.bytes.get(5..8) != Some(&[0, 0, 0])
+        || static_u32(&plan.bytes, 12) != Some(0)
+        || static_i64(&plan.bytes, 64) != Some(0)
+    {
+        return Err(malformed("header scalar or reserved field is invalid"));
+    }
+    let soa = flags & 1 != 0;
+    if soa && field_count == 0 {
+        return Err(malformed("zero-field plan advertises SoA"));
+    }
+    let mut expected_offsets = vec![16, 24, 32, 40, 56];
+    if soa {
+        expected_offsets.push(48);
+    }
+    expected_offsets.sort_unstable();
+    let mut actual_offsets = plan
+        .relocations
+        .iter()
+        .map(|relocation| relocation.offset)
+        .collect::<Vec<_>>();
+    actual_offsets.sort_unstable();
+    if actual_offsets != expected_offsets {
+        return Err(malformed("callback ordinal set is invalid"));
+    }
+
+    let i32_ty = Ty::Int(IntTy {
+        bits: 32,
+        signed: true,
+    });
+    let i64_ty = Ty::Int(IntTy {
+        bits: 64,
+        signed: true,
+    });
+    let none_borrow = hir::ReturnBorrowSummary::None;
+    let none_region = hir::ReturnRegionSummary::None;
+    let (create_target, create) = static_plan_callback(plan, 16, declarations)?;
+    if !static_plan_signature_matches(
+        create,
+        vec![i64_ty],
+        Ty::Raw,
+        none_borrow.clone(),
+        none_region.clone(),
+    ) {
+        return Err(malformed("create callback signature is invalid"));
+    }
+    let (finish_target, finish) = static_plan_callback(plan, 32, declarations)?;
+    if !static_plan_signature_matches(
+        finish,
+        vec![Ty::Raw, i64_ty],
+        Ty::Unit,
+        none_borrow.clone(),
+        none_region.clone(),
+    ) {
+        return Err(malformed("finish callback signature is invalid"));
+    }
+    let (drop_target, drop_payload) = static_plan_callback(plan, 56, declarations)?;
+    if !static_plan_signature_matches(
+        drop_payload,
+        vec![Ty::Raw],
+        Ty::Unit,
+        none_borrow.clone(),
+        none_region.clone(),
+    ) {
+        return Err(malformed("drop callback signature is invalid"));
+    }
+
+    let (row_target, row) = static_plan_callback(plan, 40, declarations)?;
+    let Some(Ty::ResourceRef(batch_resource)) = row.signature.params.get(1).copied() else {
+        return Err(malformed("row callback batch resource is invalid"));
+    };
+    let Ty::Struct(row_struct) = row.signature.ret else {
+        return Err(malformed("row callback result is not a struct"));
+    };
+    if !db_resource_matches_row(program, batch_resource, row_struct, "batch") {
+        return Err(malformed("row callback batch resource does not match its Row"));
+    }
+    let row_borrows = align_sema::ty_may_borrow(
+        Ty::Struct(row_struct),
+        &program.structs,
+        &program.tuples,
+        &program.enums,
+        &program.tagged_types,
+    );
+    let row_borrow = if row_borrows {
+        hir::ReturnBorrowSummary::Roots {
+            params: vec![1],
+            captures: Vec::new(),
+        }
+    } else {
+        none_borrow.clone()
+    };
+    let row_region = if row_borrows {
+        hir::ReturnRegionSummary::Roots {
+            params: vec![1],
+            captures: Vec::new(),
+        }
+    } else {
+        none_region.clone()
+    };
+    if !static_plan_signature_matches(
+        row,
+        vec![Ty::Raw, Ty::ResourceRef(batch_resource), i64_ty],
+        Ty::Struct(row_struct),
+        row_borrow,
+        row_region,
+    ) {
+        return Err(malformed("row callback signature is invalid"));
+    }
+    let Some(row_definition) = program.structs.get(row_struct as usize) else {
+        return Err(malformed("row callback struct is absent"));
+    };
+    let Some(exact_field_count) = u32::try_from(row_definition.fields.len()).ok() else {
+        return Err(malformed("row field count exceeds u32"));
+    };
+    if field_count != exact_field_count {
+        return Err(malformed("field count does not match the Row"));
+    }
+    let soa_plain = !row_definition.fields.is_empty()
+        && row_definition.fields.iter().all(|field| {
+            matches!(
+                field.ty,
+                Ty::Bool | Ty::Char | Ty::Int(_) | Ty::Float(_) | Ty::Str
+            )
+        });
+    if soa != soa_plain {
+        return Err(malformed("SoA flag does not match the Row"));
+    }
+
+    let (append_target, append) = static_plan_callback(plan, 24, declarations)?;
+    let Some(Ty::ResourceRef(rows_resource)) = append.signature.params.get(2).copied() else {
+        return Err(malformed("append callback rows resource is invalid"));
+    };
+    if !db_resource_matches_row(program, rows_resource, row_struct, "rows")
+        || !static_plan_signature_matches(
+            append,
+            vec![Ty::Raw, Ty::Raw, Ty::ResourceRef(rows_resource)],
+            i32_ty,
+            none_borrow.clone(),
+            none_region.clone(),
+        )
+    {
+        return Err(malformed("append callback signature is invalid"));
+    }
+
+    let soa_callback = if soa {
+        let (soa_target, soa_callback) = static_plan_callback(plan, 48, declarations)?;
+        let roots_borrow = hir::ReturnBorrowSummary::Roots {
+            params: vec![1],
+            captures: Vec::new(),
+        };
+        let roots_region = hir::ReturnRegionSummary::Roots {
+            params: vec![1],
+            captures: Vec::new(),
+        };
+        if !static_plan_signature_matches(
+            soa_callback,
+            vec![Ty::Raw, Ty::ResourceRef(batch_resource)],
+            Ty::Soa(row_struct),
+            roots_borrow,
+            roots_region,
+        ) {
+            return Err(malformed("SoA callback signature is invalid"));
+        }
+        Some((soa_target, soa_callback))
+    } else {
+        None
+    };
+
+    for (target, kind, detail) in [
+        (
+            create_target,
+            StaticBatchCallbackKind::Create,
+            "create callback body does not match the Row",
+        ),
+        (
+            append_target,
+            StaticBatchCallbackKind::Append { rows_resource },
+            "append callback body does not match the Row",
+        ),
+        (
+            finish_target,
+            StaticBatchCallbackKind::Finish,
+            "finish callback body does not match the Row",
+        ),
+        (
+            row_target,
+            StaticBatchCallbackKind::Row { batch_resource },
+            "row callback body does not match the Row",
+        ),
+        (
+            drop_target,
+            StaticBatchCallbackKind::Drop,
+            "drop callback body does not match the Row",
+        ),
+    ] {
+        if !static_batch_callback_body_matches(program, target, row_struct, kind) {
+            return Err(malformed(detail));
+        }
+    }
+    if let Some((target, _)) = soa_callback
+        && !static_batch_callback_body_matches(
+            program,
+            target,
+            row_struct,
+            StaticBatchCallbackKind::Soa { batch_resource },
+        )
+    {
+        return Err(malformed("SoA callback body does not match the Row"));
+    }
+    Ok(())
+}
+
 fn validate_static_data_record(
     result: Option<Ty>,
     data: &StaticData,
+    program: &Program,
     declarations: &HashMap<ProgramCall, ProgramDeclaration>,
 ) -> Result<(), CodegenError> {
     let malformed = |detail: &str| {
@@ -4228,35 +4924,60 @@ fn validate_static_data_record(
     if result != Some(Ty::Raw) {
         return Err(malformed("result type is not raw"));
     }
-    if data.bytes.is_empty() {
-        return Err(malformed("byte image is empty"));
-    }
-    if !data.align.is_power_of_two() || data.align > (1 << 29) {
-        return Err(malformed("alignment is not a supported power of two"));
-    }
-    let mut relocations = data.relocations.iter().collect::<Vec<_>>();
-    relocations.sort_by_key(|relocation| relocation.offset);
-    let mut cursor = 0usize;
-    for relocation in relocations {
-        let offset = usize::try_from(relocation.offset)
-            .map_err(|_| malformed("relocation offset does not fit the target"))?;
-        let end = offset
-            .checked_add(8)
-            .ok_or_else(|| malformed("relocation offset overflows"))?;
-        if offset % 8 != 0 || offset < cursor || end > data.bytes.len() {
-            return Err(malformed(
-                "relocation is unaligned, out of bounds, or overlaps",
-            ));
+    let mut work = vec![(data, 0u32)];
+    while let Some((record, depth)) = work.pop() {
+        if depth > 64 {
+            return Err(malformed("nested record depth exceeds 64"));
         }
-        if data.bytes[offset..end].iter().any(|byte| *byte != 0) {
-            return Err(malformed("relocation window is not zero"));
+        if record.bytes.is_empty() {
+            return Err(malformed("byte image is empty"));
         }
-        if let StaticDataTarget::Function(target) = &relocation.target
-            && !declarations.contains_key(target)
-        {
-            return Err(callable_target_error(target));
+        if !record.align.is_power_of_two() || record.align > (1 << 29) {
+            return Err(malformed("alignment is not a supported power of two"));
         }
-        cursor = end;
+        let mut relocations = record.relocations.iter().collect::<Vec<_>>();
+        relocations.sort_by_key(|relocation| relocation.offset);
+        let mut cursor = 0usize;
+        for relocation in &relocations {
+            let offset = usize::try_from(relocation.offset)
+                .map_err(|_| malformed("relocation offset does not fit the target"))?;
+            let end = offset
+                .checked_add(8)
+                .ok_or_else(|| malformed("relocation offset overflows"))?;
+            if offset % 8 != 0 || offset < cursor || end > record.bytes.len() {
+                return Err(malformed(
+                    "relocation is unaligned, out of bounds, or overlaps",
+                ));
+            }
+            if record.bytes[offset..end].iter().any(|byte| *byte != 0) {
+                return Err(malformed("relocation window is not zero"));
+            }
+            match &relocation.target {
+                StaticDataTarget::Function(target) if !declarations.contains_key(target) => {
+                    return Err(callable_target_error(target));
+                }
+                StaticDataTarget::Record(nested) => work.push((nested, depth + 1)),
+                StaticDataTarget::Bytes { .. } | StaticDataTarget::Function(_) => {}
+            }
+            cursor = end;
+        }
+        let query_descriptor_v5 = static_u32(&record.bytes, 0) == Some(5)
+            && record.bytes.get(4).copied() == Some(0);
+        if query_descriptor_v5 {
+            if record.bytes.len() != 136 || record.align != 8 {
+                return Err(malformed(
+                    "v5 Query descriptor size or alignment is invalid",
+                ));
+            }
+            let plan = relocations
+                .iter()
+                .find(|relocation| relocation.offset == 128)
+                .ok_or_else(|| malformed("v5 Query descriptor has no batch plan"))?;
+            let StaticDataTarget::Record(plan) = &plan.target else {
+                return Err(malformed("v5 Query descriptor batch plan is not a record"));
+            };
+            validate_batch_plan_record(plan, program, declarations)?;
+        }
     }
     Ok(())
 }
@@ -4898,7 +5619,9 @@ fn scalar_bytes(s: Scalar) -> u64 {
         // A `json.doc` handle is a `{tape,node}` = `{ptr,i64}`, 16 bytes (like `Str`/`Slice`). Never a
         // box/array payload today (it only rides an `Option`/`Result`), but sized correctly for totality.
         Scalar::JsonDoc => 16,
-        Scalar::Soa(_) => unreachable!("a soa view is not a box payload"),
+        Scalar::Soa(_) | Scalar::SoaParam(_) => {
+            unreachable!("a concrete or abstract soa view is not a box payload")
+        }
         Scalar::Enum(_) => unreachable!("a sum type is not a box payload"),
         Scalar::Tagged(_) => unreachable!("a nested tagged value is not a box/array payload"),
         Scalar::Param(_) => unreachable!("a generic parameter is substituted before codegen"),
@@ -6380,6 +7103,1111 @@ impl<'c, 'a> FnGen<'c, 'a> {
         Ok(off)
     }
 
+    fn column_batch_fields(&self, struct_id: u32) -> Result<Vec<(Ty, bool, bool)>, CodegenError> {
+        let definition = self
+            .structs
+            .get(struct_id as usize)
+            .ok_or_else(|| self.err("column batch struct id is out of bounds"))?;
+        definition
+            .fields
+            .iter()
+            .map(|field| {
+                let (base, nullable) = match field.ty {
+                    Ty::Option(payload) => (scalar_to_ty(payload), true),
+                    ty => (ty, false),
+                };
+                let view = matches!(base, Ty::Str | Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })));
+                if !matches!(base, Ty::Bool | Ty::Char | Ty::Int(_) | Ty::Float(_) | Ty::Str | Ty::Slice(_))
+                    || matches!(base, Ty::Slice(scalar) if scalar != Scalar::Int(IntTy { bits: 8, signed: false }))
+                {
+                    return Err(self.err("column batch field is outside the supported scalar/view domain"));
+                }
+                Ok((base, nullable, view))
+            })
+            .collect()
+    }
+
+    fn column_batch_layout(
+        &self,
+        capacity: IntValue<'c>,
+        struct_id: u32,
+    ) -> Result<ColumnBatchLayout<'c>, CodegenError> {
+        let i64t = self.ctx.i64_type();
+        let fields = self.column_batch_fields(struct_id)?;
+        let sizes = fields
+            .iter()
+            .map(|(base, _, _)| {
+                ty_to_scalar(*base)
+                    .map(scalar_bytes)
+                    .ok_or_else(|| self.err("column batch field has no scalar ABI size"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut offsets = Vec::with_capacity(fields.len());
+        let mut cursor = i64t.const_zero();
+        for (index, size) in sizes.iter().copied().enumerate() {
+            if index != 0 && size > 1 {
+                let bumped = self
+                    .builder
+                    .build_int_add(cursor, i64t.const_int(size - 1, false), "batch.col.bump")
+                    .map_err(|error| self.err(error))?;
+                cursor = self
+                    .builder
+                    .build_and(bumped, i64t.const_int(!(size - 1), false), "batch.col.align")
+                    .map_err(|error| self.err(error))?;
+            }
+            offsets.push(cursor);
+            let bytes = self
+                .builder
+                .build_int_mul(capacity, i64t.const_int(size, false), "batch.col.bytes")
+                .map_err(|error| self.err(error))?;
+            cursor = self
+                .builder
+                .build_int_add(cursor, bytes, "batch.col.end")
+                .map_err(|error| self.err(error))?;
+        }
+        let bitmap_bytes = self
+            .builder
+            .build_int_unsigned_div(
+                self.builder
+                    .build_int_add(capacity, i64t.const_int(7, false), "batch.bitmap.bump")
+                    .map_err(|error| self.err(error))?,
+                i64t.const_int(8, false),
+                "batch.bitmap.bytes",
+            )
+            .map_err(|error| self.err(error))?;
+        let mut bitmaps = Vec::with_capacity(fields.len());
+        for (_, nullable, _) in fields {
+            if nullable {
+                bitmaps.push(Some(cursor));
+                cursor = self
+                    .builder
+                    .build_int_add(cursor, bitmap_bytes, "batch.bitmap.end")
+                    .map_err(|error| self.err(error))?;
+            } else {
+                bitmaps.push(None);
+            }
+        }
+        Ok((offsets, bitmaps, cursor))
+    }
+
+    fn column_batch_byte_ptr(
+        &self,
+        base: PointerValue<'c>,
+        offset: IntValue<'c>,
+        name: &str,
+    ) -> Result<PointerValue<'c>, CodegenError> {
+        unsafe {
+            self.builder
+                .build_gep(self.ctx.i8_type(), base, &[offset], name)
+                .map_err(|error| self.err(error))
+        }
+    }
+
+    fn column_batch_const_ptr(
+        &self,
+        base: PointerValue<'c>,
+        offset: u64,
+        name: &str,
+    ) -> Result<PointerValue<'c>, CodegenError> {
+        self.column_batch_byte_ptr(base, self.ctx.i64_type().const_int(offset, false), name)
+    }
+
+    fn column_batch_alloc(&self, size: IntValue<'c>, name: &str) -> Result<PointerValue<'c>, CodegenError> {
+        Ok(self
+            .builder
+            .build_call(self.runtime(RuntimeKey::Alloc), &[size.into()], name)
+            .map_err(|error| self.err(error))?
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| self.err("column batch allocator returned void"))?
+            .into_pointer_value())
+    }
+
+    fn column_batch_load_ptr(
+        &self,
+        base: PointerValue<'c>,
+        offset: u64,
+        name: &str,
+    ) -> Result<PointerValue<'c>, CodegenError> {
+        let address = self.column_batch_const_ptr(base, offset, name)?;
+        Ok(self
+            .builder
+            .build_load(self.ctx.ptr_type(AddressSpace::default()), address, name)
+            .map_err(|error| self.err(error))?
+            .into_pointer_value())
+    }
+
+    fn column_batch_load_i64(
+        &self,
+        base: PointerValue<'c>,
+        offset: u64,
+        name: &str,
+    ) -> Result<IntValue<'c>, CodegenError> {
+        let address = self.column_batch_const_ptr(base, offset, name)?;
+        Ok(self
+            .builder
+            .build_load(self.ctx.i64_type(), address, name)
+            .map_err(|error| self.err(error))?
+            .into_int_value())
+    }
+
+    fn column_batch_store(
+        &self,
+        base: PointerValue<'c>,
+        offset: u64,
+        value: BasicValueEnum<'c>,
+    ) -> Result<(), CodegenError> {
+        let address = self.column_batch_const_ptr(base, offset, "batch.header.ptr")?;
+        self.builder
+            .build_store(address, value)
+            .map_err(|error| self.err(error))?;
+        Ok(())
+    }
+
+    fn column_batch_resize(
+        &self,
+        payload: PointerValue<'c>,
+        new_capacity: IntValue<'c>,
+        struct_id: u32,
+    ) -> Result<PointerValue<'c>, CodegenError> {
+        let old = self.column_batch_load_ptr(payload, 0, "batch.fixed.old")?;
+        let old_capacity = self.column_batch_load_i64(payload, 16, "batch.capacity.old")?;
+        let len = self.column_batch_load_i64(payload, 8, "batch.len")?;
+        let fields = self.column_batch_fields(struct_id)?;
+        let (old_offsets, old_bitmaps, _) = self.column_batch_layout(old_capacity, struct_id)?;
+        let (new_offsets, new_bitmaps, new_bytes) = self.column_batch_layout(new_capacity, struct_id)?;
+        let new = self.column_batch_alloc(new_bytes, "batch.fixed.new")?;
+        self.builder
+            .build_memset(new, 1, self.ctx.i8_type().const_zero(), new_bytes)
+            .map_err(|error| self.err(error))?;
+        for (index, (base, nullable, _)) in fields.iter().copied().enumerate() {
+            let size = ty_to_scalar(base)
+                .map(scalar_bytes)
+                .ok_or_else(|| self.err("column batch field has no scalar ABI size"))?;
+            let copy_bytes = self
+                .builder
+                .build_int_mul(len, self.ctx.i64_type().const_int(size, false), "batch.copy.bytes")
+                .map_err(|error| self.err(error))?;
+            let source = self.column_batch_byte_ptr(old, old_offsets[index], "batch.copy.src")?;
+            let destination = self.column_batch_byte_ptr(new, new_offsets[index], "batch.copy.dst")?;
+            self.builder
+                .build_memcpy(destination, size as u32, source, size as u32, copy_bytes)
+                .map_err(|error| self.err(error))?;
+            if nullable {
+                let bitmap_bytes = self
+                    .builder
+                    .build_int_unsigned_div(
+                        self.builder
+                            .build_int_add(len, self.ctx.i64_type().const_int(7, false), "batch.copy.bitmap.bump")
+                            .map_err(|error| self.err(error))?,
+                        self.ctx.i64_type().const_int(8, false),
+                        "batch.copy.bitmap.bytes",
+                    )
+                    .map_err(|error| self.err(error))?;
+                let source_offset = old_bitmaps
+                    .get(index)
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| self.err("nullable column batch source bitmap is absent"))?;
+                let destination_offset = new_bitmaps
+                    .get(index)
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| self.err("nullable column batch destination bitmap is absent"))?;
+                let source = self.column_batch_byte_ptr(
+                    old,
+                    source_offset,
+                    "batch.copy.bitmap.src",
+                )?;
+                let destination = self.column_batch_byte_ptr(
+                    new,
+                    destination_offset,
+                    "batch.copy.bitmap.dst",
+                )?;
+                self.builder
+                    .build_memcpy(destination, 1, source, 1, bitmap_bytes)
+                    .map_err(|error| self.err(error))?;
+            }
+        }
+        self.builder
+            .build_call(self.runtime(RuntimeKey::Free), &[old.into()], "")
+            .map_err(|error| self.err(error))?;
+        self.column_batch_store(payload, 0, new.into())?;
+        self.column_batch_store(payload, 16, new_capacity.into())?;
+        Ok(new)
+    }
+
+    fn column_batch_create(
+        &self,
+        max_rows: &Operand,
+        struct_id: u32,
+    ) -> Result<PointerValue<'c>, CodegenError> {
+        let i64t = self.ctx.i64_type();
+        let maximum = self.operand(max_rows)?.into_int_value();
+        let fields = self.column_batch_fields(struct_id)?;
+        let sizes = fields
+            .iter()
+            .map(|(base, _, _)| {
+                ty_to_scalar(*base)
+                    .map(scalar_bytes)
+                    .map(u128::from)
+                    .ok_or_else(|| self.err("column batch field has no scalar ABI size"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut lo = 0u64;
+        let mut hi = i32::MAX as u64;
+        let fits = |rows: u64| {
+            let mut cursor = 0u128;
+            for (index, size) in sizes.iter().copied().enumerate() {
+                if index != 0 && size > 1 {
+                    cursor = (cursor + size - 1) & !(size - 1);
+                }
+                cursor = cursor.saturating_add(u128::from(rows).saturating_mul(size));
+            }
+            let bitmap = u128::from(rows).div_ceil(8);
+            cursor = cursor.saturating_add(
+                bitmap.saturating_mul(fields.iter().filter(|(_, nullable, _)| *nullable).count() as u128),
+            );
+            cursor <= i64::MAX as u128
+        };
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if fits(mid) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let invalid_low = self
+            .builder
+            .build_int_compare(IntPredicate::SLT, maximum, i64t.const_int(1, false), "batch.max.low")
+            .map_err(|error| self.err(error))?;
+        let invalid_high = self
+            .builder
+            .build_int_compare(IntPredicate::SGT, maximum, i64t.const_int(lo, false), "batch.max.high")
+            .map_err(|error| self.err(error))?;
+        let invalid = self
+            .builder
+            .build_or(invalid_low, invalid_high, "batch.max.invalid")
+            .map_err(|error| self.err(error))?;
+        let invalid_block = self.ctx.append_basic_block(self.func, "batch.create.invalid");
+        let valid_block = self.ctx.append_basic_block(self.func, "batch.create.valid");
+        let join = self.ctx.append_basic_block(self.func, "batch.create.join");
+        self.builder
+            .build_conditional_branch(invalid, invalid_block, valid_block)
+            .map_err(|error| self.err(error))?;
+        self.builder.position_at_end(invalid_block);
+        let null = self.ctx.ptr_type(AddressSpace::default()).const_null();
+        self.builder
+            .build_unconditional_branch(join)
+            .map_err(|error| self.err(error))?;
+        let invalid_end = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| self.err("column batch invalid block is absent"))?;
+        self.builder.position_at_end(valid_block);
+        let initial = self
+            .builder
+            .build_select(
+                self.builder
+                    .build_int_compare(IntPredicate::SLT, maximum, i64t.const_int(16, false), "batch.initial.small")
+                    .map_err(|error| self.err(error))?,
+                maximum,
+                i64t.const_int(16, false),
+                "batch.initial.capacity",
+            )
+            .map_err(|error| self.err(error))?
+            .into_int_value();
+        let (_, _, fixed_bytes) = self.column_batch_layout(initial, struct_id)?;
+        let fixed = self.column_batch_alloc(fixed_bytes, "batch.fixed")?;
+        self.builder
+            .build_memset(fixed, 1, self.ctx.i8_type().const_zero(), fixed_bytes)
+            .map_err(|error| self.err(error))?;
+        let view_count = fields.iter().filter(|(_, _, view)| *view).count() as u64;
+        let payload_bytes = i64t.const_int(40 + view_count * 40, false);
+        let payload = self.column_batch_alloc(payload_bytes, "batch.payload")?;
+        self.builder
+            .build_memset(payload, 8, self.ctx.i8_type().const_zero(), payload_bytes)
+            .map_err(|error| self.err(error))?;
+        self.column_batch_store(payload, 0, fixed.into())?;
+        self.column_batch_store(payload, 8, i64t.const_zero().into())?;
+        self.column_batch_store(payload, 16, initial.into())?;
+        self.column_batch_store(payload, 24, maximum.into())?;
+        self.builder
+            .build_unconditional_branch(join)
+            .map_err(|error| self.err(error))?;
+        let valid_end = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| self.err("column batch valid block is absent"))?;
+        self.builder.position_at_end(join);
+        let phi = self
+            .builder
+            .build_phi(self.ctx.ptr_type(AddressSpace::default()), "batch.create")
+            .map_err(|error| self.err(error))?;
+        phi.add_incoming(&[(&null, invalid_end), (&payload, valid_end)]);
+        Ok(phi.as_basic_value().into_pointer_value())
+    }
+
+    fn column_batch_finish(&self, payload: &Operand, struct_id: u32) -> Result<(), CodegenError> {
+        let payload = self.operand(payload)?.into_pointer_value();
+        let len = self.column_batch_load_i64(payload, 8, "batch.finish.len")?;
+        let capacity = self.column_batch_load_i64(payload, 16, "batch.finish.capacity")?;
+        let compact = self
+            .builder
+            .build_int_compare(IntPredicate::SLT, len, capacity, "batch.finish.compact")
+            .map_err(|error| self.err(error))?;
+        let compact_block = self.ctx.append_basic_block(self.func, "batch.finish.resize");
+        let done = self.ctx.append_basic_block(self.func, "batch.finish.done");
+        self.builder
+            .build_conditional_branch(compact, compact_block, done)
+            .map_err(|error| self.err(error))?;
+        self.builder.position_at_end(compact_block);
+        self.column_batch_resize(payload, len, struct_id)?;
+        self.builder
+            .build_unconditional_branch(done)
+            .map_err(|error| self.err(error))?;
+        self.builder.position_at_end(done);
+        self.column_batch_store(payload, 32, self.ctx.i64_type().const_int(1, false).into())?;
+        Ok(())
+    }
+
+    fn column_batch_drop(&self, payload: &Operand, struct_id: u32) -> Result<(), CodegenError> {
+        let payload = self.operand(payload)?.into_pointer_value();
+        let fields = self.column_batch_fields(struct_id)?;
+        let mut view_index = 0u64;
+        for (_, _, view) in fields {
+            if !view {
+                continue;
+            }
+            let entry = 40 + view_index * 40;
+            let head = self.column_batch_load_ptr(payload, entry, "batch.child.head")?;
+            let header = self.ctx.append_basic_block(self.func, "batch.drop.child.header");
+            let body = self.ctx.append_basic_block(self.func, "batch.drop.child.body");
+            let done = self.ctx.append_basic_block(self.func, "batch.drop.child.done");
+            let predecessor = self
+                .builder
+                .get_insert_block()
+                .ok_or_else(|| self.err("column batch drop predecessor is absent"))?;
+            self.builder
+                .build_unconditional_branch(header)
+                .map_err(|error| self.err(error))?;
+            self.builder.position_at_end(header);
+            let phi = self
+                .builder
+                .build_phi(self.ctx.ptr_type(AddressSpace::default()), "batch.child")
+                .map_err(|error| self.err(error))?;
+            phi.add_incoming(&[(&head, predecessor)]);
+            let current = phi.as_basic_value().into_pointer_value();
+            let live = self
+                .builder
+                .build_is_not_null(current, "batch.child.live")
+                .map_err(|error| self.err(error))?;
+            self.builder
+                .build_conditional_branch(live, body, done)
+                .map_err(|error| self.err(error))?;
+            self.builder.position_at_end(body);
+            let next = self.column_batch_load_ptr(current, 0, "batch.child.next")?;
+            self.builder
+                .build_call(self.runtime(RuntimeKey::Free), &[current.into()], "")
+                .map_err(|error| self.err(error))?;
+            self.builder
+                .build_unconditional_branch(header)
+                .map_err(|error| self.err(error))?;
+            let body_end = self
+                .builder
+                .get_insert_block()
+                .ok_or_else(|| self.err("column batch drop body is absent"))?;
+            phi.add_incoming(&[(&next, body_end)]);
+            self.builder.position_at_end(done);
+            view_index += 1;
+        }
+        let fixed = self.column_batch_load_ptr(payload, 0, "batch.fixed.drop")?;
+        self.builder
+            .build_call(self.runtime(RuntimeKey::Free), &[fixed.into()], "")
+            .map_err(|error| self.err(error))?;
+        self.builder
+            .build_call(self.runtime(RuntimeKey::Free), &[payload.into()], "")
+            .map_err(|error| self.err(error))?;
+        Ok(())
+    }
+
+    fn column_batch_soa(
+        &self,
+        payload: &Operand,
+        struct_id: u32,
+    ) -> Result<StructValue<'c>, CodegenError> {
+        let payload = self.operand(payload)?.into_pointer_value();
+        let fixed = self.column_batch_load_ptr(payload, 0, "batch.soa.ptr")?;
+        let len = self.column_batch_load_i64(payload, 8, "batch.soa.len")?;
+        let view = self
+            .builder
+            .build_insert_value(slice_struct_type(self.ctx).const_zero(), fixed, 0, "batch.soa.ptr")
+            .map_err(|error| self.err(error))?
+            .into_struct_value();
+        let view = self
+            .builder
+            .build_insert_value(view, len, 1, "batch.soa.len")
+            .map_err(|error| self.err(error))?
+            .into_struct_value();
+        let _ = struct_id;
+        Ok(view)
+    }
+
+    fn column_batch_row(
+        &self,
+        payload: &Operand,
+        index: &Operand,
+        struct_id: u32,
+    ) -> Result<StructValue<'c>, CodegenError> {
+        let payload = self.operand(payload)?.into_pointer_value();
+        let index = self.operand(index)?.into_int_value();
+        let fixed = self.column_batch_load_ptr(payload, 0, "batch.row.ptr")?;
+        let len = self.column_batch_load_i64(payload, 8, "batch.row.len")?;
+        let (offsets, bitmaps, _) = self.column_batch_layout(len, struct_id)?;
+        let fields = self.column_batch_fields(struct_id)?;
+        let mut row = self.struct_types[struct_id as usize].const_zero();
+        for (logical, (base, nullable, _)) in fields.iter().copied().enumerate() {
+            let llvm_ty = scalar_type(
+                self.ctx,
+                base,
+                self.struct_types,
+                self.enum_types,
+                self.tagged_types,
+            );
+            let column = self.column_batch_byte_ptr(fixed, offsets[logical], "batch.row.column")?;
+            let element = unsafe {
+                self.builder
+                    .build_in_bounds_gep(llvm_ty, column, &[index], "batch.row.element")
+                    .map_err(|error| self.err(error))?
+            };
+            let value = if nullable {
+                let bitmap_offset = bitmaps
+                    .get(logical)
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| self.err("nullable column batch row bitmap is absent"))?;
+                let bitmap = self.column_batch_byte_ptr(
+                    fixed,
+                    bitmap_offset,
+                    "batch.row.bitmap",
+                )?;
+                let byte_index = self
+                    .builder
+                    .build_int_unsigned_div(index, self.ctx.i64_type().const_int(8, false), "batch.row.byte")
+                    .map_err(|error| self.err(error))?;
+                let bit_index = self
+                    .builder
+                    .build_int_unsigned_rem(index, self.ctx.i64_type().const_int(8, false), "batch.row.bit")
+                    .map_err(|error| self.err(error))?;
+                let byte_ptr = self.column_batch_byte_ptr(bitmap, byte_index, "batch.row.bitmap.byte")?;
+                let byte = self
+                    .builder
+                    .build_load(self.ctx.i8_type(), byte_ptr, "batch.row.bitmap.value")
+                    .map_err(|error| self.err(error))?
+                    .into_int_value();
+                let mask = self
+                    .builder
+                    .build_left_shift(
+                        self.ctx.i8_type().const_int(1, false),
+                        self.builder
+                            .build_int_cast(bit_index, self.ctx.i8_type(), "batch.row.bit8")
+                            .map_err(|error| self.err(error))?,
+                        "batch.row.mask",
+                    )
+                    .map_err(|error| self.err(error))?;
+                let present = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::NE,
+                        self.builder
+                            .build_and(byte, mask, "batch.row.present.bit")
+                            .map_err(|error| self.err(error))?,
+                        self.ctx.i8_type().const_zero(),
+                        "batch.row.present",
+                    )
+                    .map_err(|error| self.err(error))?;
+                let some_block = self.ctx.append_basic_block(self.func, "batch.row.some");
+                let none_block = self.ctx.append_basic_block(self.func, "batch.row.none");
+                let join = self.ctx.append_basic_block(self.func, "batch.row.option.join");
+                self.builder
+                    .build_conditional_branch(present, some_block, none_block)
+                    .map_err(|error| self.err(error))?;
+                let Ty::Option(payload_scalar) = self.structs[struct_id as usize].fields[logical].ty else {
+                    return Err(self.err("nullable batch field lost its Option type"));
+                };
+                let option_ty = option_struct_type(
+                    self.ctx,
+                    payload_scalar,
+                    self.struct_types,
+                    self.enum_types,
+                    self.tagged_types,
+                );
+                self.builder.position_at_end(some_block);
+                let loaded = self
+                    .builder
+                    .build_load(llvm_ty, element, "batch.row.value")
+                    .map_err(|error| self.err(error))?;
+                let some = self
+                    .builder
+                    .build_insert_value(
+                        option_ty.const_zero(),
+                        self.ctx.i8_type().const_int(1, false),
+                        0,
+                        "batch.row.some.tag",
+                    )
+                    .map_err(|error| self.err(error))?
+                    .into_struct_value();
+                let some = self
+                    .builder
+                    .build_insert_value(some, loaded, 1, "batch.row.some.value")
+                    .map_err(|error| self.err(error))?
+                    .into_struct_value();
+                self.builder
+                    .build_unconditional_branch(join)
+                    .map_err(|error| self.err(error))?;
+                let some_end = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or_else(|| self.err("column batch row some block is absent"))?;
+                self.builder.position_at_end(none_block);
+                let none = option_ty.const_zero();
+                self.builder
+                    .build_unconditional_branch(join)
+                    .map_err(|error| self.err(error))?;
+                let none_end = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or_else(|| self.err("column batch row none block is absent"))?;
+                self.builder.position_at_end(join);
+                let phi = self
+                    .builder
+                    .build_phi(option_ty, "batch.row.option")
+                    .map_err(|error| self.err(error))?;
+                phi.add_incoming(&[(&some, some_end), (&none, none_end)]);
+                phi.as_basic_value()
+            } else {
+                self.builder
+                    .build_load(llvm_ty, element, "batch.row.value")
+                    .map_err(|error| self.err(error))?
+            };
+            row = self
+                .builder
+                .build_insert_value(row, value, self.pfield(struct_id, logical as u32), "batch.row.field")
+                .map_err(|error| self.err(error))?
+                .into_struct_value();
+        }
+        Ok(row)
+    }
+
+    fn column_batch_append(
+        &self,
+        payload: &Operand,
+        inputs: &[ColumnBatchInput],
+        struct_id: u32,
+    ) -> Result<IntValue<'c>, CodegenError> {
+        let i64t = self.ctx.i64_type();
+        let i32t = self.ctx.i32_type();
+        let payload = self.operand(payload)?.into_pointer_value();
+        let fields = self.column_batch_fields(struct_id)?;
+        if fields.len() != inputs.len() {
+            return Err(self.err("column batch append input count does not match Row fields"));
+        }
+        let len = self.column_batch_load_i64(payload, 8, "batch.append.len")?;
+        let capacity = self.column_batch_load_i64(payload, 16, "batch.append.capacity")?;
+        let maximum = self.column_batch_load_i64(payload, 24, "batch.append.maximum")?;
+        let mut invalid = self.ctx.bool_type().const_zero();
+        let mut view_index = 0u64;
+        let mut view_states = Vec::new();
+        for (field_index, ((_, _, view), input)) in
+            fields.iter().copied().zip(inputs).enumerate()
+        {
+            if !view {
+                if !matches!(input, ColumnBatchInput::Scalar(_)) {
+                    return Err(self.err("column batch scalar field received a view input"));
+                }
+                continue;
+            }
+            let ColumnBatchInput::View { ptr, len } = input else {
+                return Err(self.err("column batch view field received a scalar input"));
+            };
+            let pointer = self.operand(ptr)?.into_pointer_value();
+            let source_len = self.operand(len)?.into_int_value();
+            let below_null = self
+                .builder
+                .build_int_compare(
+                    IntPredicate::SLT,
+                    source_len,
+                    i64t.const_int((-1_i64) as u64, true),
+                    "batch.view.length.invalid",
+                )
+                .map_err(|error| self.err(error))?;
+            invalid = self
+                .builder
+                .build_or(invalid, below_null, "batch.append.invalid")
+                .map_err(|error| self.err(error))?;
+            let nonnull = self
+                .builder
+                .build_int_compare(IntPredicate::SGE, source_len, i64t.const_zero(), "batch.view.nonnull")
+                .map_err(|error| self.err(error))?;
+            let effective_len = self
+                .builder
+                .build_select(nonnull, source_len, i64t.const_zero(), "batch.view.length")
+                .map_err(|error| self.err(error))?
+                .into_int_value();
+            let entry = 40 + view_index * 40;
+            let tail_capacity = self.column_batch_load_i64(payload, entry + 16, "batch.child.capacity")?;
+            let tail_used = self.column_batch_load_i64(payload, entry + 24, "batch.child.used")?;
+            let total = self.column_batch_load_i64(payload, entry + 32, "batch.child.total")?;
+            let total_sum = self
+                .call_overflow_intrinsic("llvm.uadd.with.overflow", i64t, total, effective_len)?
+                .into_struct_value();
+            let new_total = self
+                .builder
+                .build_extract_value(total_sum, 0, "batch.child.total.next")
+                .map_err(|error| self.err(error))?
+                .into_int_value();
+            let total_overflow = self
+                .builder
+                .build_extract_value(total_sum, 1, "batch.child.total.overflow")
+                .map_err(|error| self.err(error))?
+                .into_int_value();
+            invalid = self
+                .builder
+                .build_or(invalid, total_overflow, "batch.append.invalid")
+                .map_err(|error| self.err(error))?;
+            let space = self
+                .builder
+                .build_int_sub(tail_capacity, tail_used, "batch.child.space")
+                .map_err(|error| self.err(error))?;
+            let need_chunk = self
+                .builder
+                .build_int_compare(IntPredicate::UGT, effective_len, space, "batch.child.grow")
+                .map_err(|error| self.err(error))?;
+            let maximum_chunk = i64::MAX as u64 - 24;
+            let can_double = self
+                .builder
+                .build_int_compare(
+                    IntPredicate::ULE,
+                    tail_capacity,
+                    i64t.const_int(maximum_chunk / 2, false),
+                    "batch.child.can.double",
+                )
+                .map_err(|error| self.err(error))?;
+            let doubled = self
+                .builder
+                .build_int_mul(tail_capacity, i64t.const_int(2, false), "batch.child.double")
+                .map_err(|error| self.err(error))?;
+            let geometric = self
+                .builder
+                .build_select(
+                    self.builder
+                        .build_int_compare(IntPredicate::EQ, tail_capacity, i64t.const_zero(), "batch.child.first")
+                        .map_err(|error| self.err(error))?,
+                    i64t.const_int(64, false),
+                    self.builder
+                        .build_select(
+                            can_double,
+                            doubled,
+                            i64t.const_int(maximum_chunk, false),
+                            "batch.child.geometric.saturated",
+                        )
+                        .map_err(|error| self.err(error))?
+                        .into_int_value(),
+                    "batch.child.geometric",
+                )
+                .map_err(|error| self.err(error))?
+                .into_int_value();
+            let new_capacity = self
+                .builder
+                .build_select(
+                    self.builder
+                        .build_int_compare(IntPredicate::UGT, effective_len, geometric, "batch.child.large")
+                        .map_err(|error| self.err(error))?,
+                    effective_len,
+                    geometric,
+                    "batch.child.new.capacity",
+                )
+                .map_err(|error| self.err(error))?
+                .into_int_value();
+            let chunk_too_large = self
+                .builder
+                .build_int_compare(
+                    IntPredicate::UGT,
+                    new_capacity,
+                    i64t.const_int(maximum_chunk, false),
+                    "batch.child.too.large",
+                )
+                .map_err(|error| self.err(error))?;
+            invalid = self
+                .builder
+                .build_or(
+                    invalid,
+                    self.builder
+                        .build_and(need_chunk, chunk_too_large, "batch.child.invalid")
+                        .map_err(|error| self.err(error))?,
+                    "batch.append.invalid",
+                )
+                .map_err(|error| self.err(error))?;
+            view_states.push((
+                field_index,
+                pointer,
+                source_len,
+                effective_len,
+                entry,
+                need_chunk,
+                new_capacity,
+                new_total,
+            ));
+            view_index += 1;
+        }
+        let failed = self.ctx.append_basic_block(self.func, "batch.append.failed");
+        let success = self.ctx.append_basic_block(self.func, "batch.append.success");
+        let join = self.ctx.append_basic_block(self.func, "batch.append.join");
+        self.builder
+            .build_conditional_branch(invalid, failed, success)
+            .map_err(|error| self.err(error))?;
+        self.builder.position_at_end(failed);
+        let failure_status = i32t.const_int(1, false);
+        self.builder
+            .build_unconditional_branch(join)
+            .map_err(|error| self.err(error))?;
+        let failed_end = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| self.err("column batch append failed block is absent"))?;
+        self.builder.position_at_end(success);
+
+        let fixed_before = self.column_batch_load_ptr(payload, 0, "batch.fixed.current")?;
+        let full = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, len, capacity, "batch.fixed.full")
+            .map_err(|error| self.err(error))?;
+        let grow = self.ctx.append_basic_block(self.func, "batch.fixed.grow");
+        let keep = self.ctx.append_basic_block(self.func, "batch.fixed.keep");
+        let fixed_join = self.ctx.append_basic_block(self.func, "batch.fixed.join");
+        self.builder
+            .build_conditional_branch(full, grow, keep)
+            .map_err(|error| self.err(error))?;
+        self.builder.position_at_end(grow);
+        let doubled = self
+            .builder
+            .build_int_mul(capacity, i64t.const_int(2, false), "batch.fixed.double")
+            .map_err(|error| self.err(error))?;
+        let grown_capacity = self
+            .builder
+            .build_select(
+                self.builder
+                    .build_int_compare(IntPredicate::UGT, doubled, maximum, "batch.fixed.cap")
+                    .map_err(|error| self.err(error))?,
+                maximum,
+                doubled,
+                "batch.fixed.new.capacity",
+            )
+            .map_err(|error| self.err(error))?
+            .into_int_value();
+        let grown = self.column_batch_resize(payload, grown_capacity, struct_id)?;
+        self.builder
+            .build_unconditional_branch(fixed_join)
+            .map_err(|error| self.err(error))?;
+        let grow_end = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| self.err("column batch fixed grow block is absent"))?;
+        self.builder.position_at_end(keep);
+        self.builder
+            .build_unconditional_branch(fixed_join)
+            .map_err(|error| self.err(error))?;
+        let keep_end = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| self.err("column batch fixed keep block is absent"))?;
+        self.builder.position_at_end(fixed_join);
+        let fixed_phi = self
+            .builder
+            .build_phi(self.ctx.ptr_type(AddressSpace::default()), "batch.fixed")
+            .map_err(|error| self.err(error))?;
+        fixed_phi.add_incoming(&[(&grown, grow_end), (&fixed_before, keep_end)]);
+        let fixed = fixed_phi.as_basic_value().into_pointer_value();
+        let current_capacity = self.column_batch_load_i64(payload, 16, "batch.capacity.current")?;
+        let (offsets, bitmaps, _) = self.column_batch_layout(current_capacity, struct_id)?;
+
+        let mut view_state_index = 0usize;
+        for (field_index, ((base, nullable, view), input)) in
+            fields.iter().copied().zip(inputs).enumerate()
+        {
+            let llvm_ty = scalar_type(
+                self.ctx,
+                base,
+                self.struct_types,
+                self.enum_types,
+                self.tagged_types,
+            );
+            let column = self.column_batch_byte_ptr(fixed, offsets[field_index], "batch.append.column")?;
+            let element = unsafe {
+                self.builder
+                    .build_in_bounds_gep(llvm_ty, column, &[len], "batch.append.element")
+                    .map_err(|error| self.err(error))?
+            };
+            let present = if view {
+                let (_, source, source_len, effective_len, entry, need_chunk, new_capacity, new_total) =
+                    view_states[view_state_index];
+                view_state_index += 1;
+                let nonnull = self
+                    .builder
+                    .build_int_compare(IntPredicate::SGE, source_len, i64t.const_zero(), "batch.append.view.present")
+                    .map_err(|error| self.err(error))?;
+                let nonempty = self
+                    .builder
+                    .build_int_compare(IntPredicate::UGT, effective_len, i64t.const_zero(), "batch.append.view.nonempty")
+                    .map_err(|error| self.err(error))?;
+                let allocate = self.ctx.append_basic_block(self.func, "batch.child.allocate");
+                let retain = self.ctx.append_basic_block(self.func, "batch.child.retain");
+                let tail_join = self.ctx.append_basic_block(self.func, "batch.child.tail.join");
+                self.builder
+                    .build_conditional_branch(need_chunk, allocate, retain)
+                    .map_err(|error| self.err(error))?;
+                self.builder.position_at_end(allocate);
+                let chunk_bytes = self
+                    .builder
+                    .build_int_add(new_capacity, i64t.const_int(24, false), "batch.child.bytes")
+                    .map_err(|error| self.err(error))?;
+                let new_chunk = self.column_batch_alloc(chunk_bytes, "batch.child")?;
+                self.builder
+                    .build_memset(new_chunk, 8, self.ctx.i8_type().const_zero(), i64t.const_int(24, false))
+                    .map_err(|error| self.err(error))?;
+                self.column_batch_store(new_chunk, 8, new_capacity.into())?;
+                let old_tail = self.column_batch_load_ptr(payload, entry + 8, "batch.child.old.tail")?;
+                let first = self
+                    .builder
+                    .build_is_null(old_tail, "batch.child.first")
+                    .map_err(|error| self.err(error))?;
+                let set_head = self.ctx.append_basic_block(self.func, "batch.child.set.head");
+                let link = self.ctx.append_basic_block(self.func, "batch.child.link");
+                let linked = self.ctx.append_basic_block(self.func, "batch.child.linked");
+                self.builder
+                    .build_conditional_branch(first, set_head, link)
+                    .map_err(|error| self.err(error))?;
+                self.builder.position_at_end(set_head);
+                self.column_batch_store(payload, entry, new_chunk.into())?;
+                self.builder
+                    .build_unconditional_branch(linked)
+                    .map_err(|error| self.err(error))?;
+                self.builder.position_at_end(link);
+                self.column_batch_store(old_tail, 0, new_chunk.into())?;
+                self.builder
+                    .build_unconditional_branch(linked)
+                    .map_err(|error| self.err(error))?;
+                self.builder.position_at_end(linked);
+                self.column_batch_store(payload, entry + 8, new_chunk.into())?;
+                self.column_batch_store(payload, entry + 16, new_capacity.into())?;
+                self.column_batch_store(payload, entry + 24, i64t.const_zero().into())?;
+                self.builder
+                    .build_unconditional_branch(tail_join)
+                    .map_err(|error| self.err(error))?;
+                self.builder.position_at_end(retain);
+                self.builder
+                    .build_unconditional_branch(tail_join)
+                    .map_err(|error| self.err(error))?;
+                self.builder.position_at_end(tail_join);
+                let tail = self.column_batch_load_ptr(payload, entry + 8, "batch.child.tail")?;
+                let used = self.column_batch_load_i64(payload, entry + 24, "batch.child.used")?;
+                let copy_block = self.ctx.append_basic_block(self.func, "batch.child.copy");
+                let empty_block = self.ctx.append_basic_block(self.func, "batch.child.empty");
+                let copy_join = self.ctx.append_basic_block(self.func, "batch.child.copy.join");
+                self.builder
+                    .build_conditional_branch(nonempty, copy_block, empty_block)
+                    .map_err(|error| self.err(error))?;
+                self.builder.position_at_end(copy_block);
+                let data = self.column_batch_const_ptr(tail, 24, "batch.child.data")?;
+                let destination = self.column_batch_byte_ptr(data, used, "batch.child.destination")?;
+                self.builder
+                    .build_memcpy(destination, 1, source, 1, effective_len)
+                    .map_err(|error| self.err(error))?;
+                let used_next = self
+                    .builder
+                    .build_int_add(used, effective_len, "batch.child.used.next")
+                    .map_err(|error| self.err(error))?;
+                self.column_batch_store(tail, 16, used_next.into())?;
+                self.column_batch_store(payload, entry + 24, used_next.into())?;
+                self.column_batch_store(payload, entry + 32, new_total.into())?;
+                let header = self
+                    .builder
+                    .build_insert_value(slice_struct_type(self.ctx).const_zero(), destination, 0, "batch.view.ptr")
+                    .map_err(|error| self.err(error))?
+                    .into_struct_value();
+                let copied = self
+                    .builder
+                    .build_insert_value(header, effective_len, 1, "batch.view.len")
+                    .map_err(|error| self.err(error))?
+                    .into_struct_value();
+                self.builder
+                    .build_unconditional_branch(copy_join)
+                    .map_err(|error| self.err(error))?;
+                let copy_end = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or_else(|| self.err("column batch child copy block is absent"))?;
+                self.builder.position_at_end(empty_block);
+                let empty = slice_struct_type(self.ctx).const_zero();
+                self.column_batch_store(payload, entry + 32, new_total.into())?;
+                self.builder
+                    .build_unconditional_branch(copy_join)
+                    .map_err(|error| self.err(error))?;
+                let empty_end = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or_else(|| self.err("column batch child empty block is absent"))?;
+                self.builder.position_at_end(copy_join);
+                let header_phi = self
+                    .builder
+                    .build_phi(slice_struct_type(self.ctx), "batch.view.header")
+                    .map_err(|error| self.err(error))?;
+                header_phi.add_incoming(&[(&copied, copy_end), (&empty, empty_end)]);
+                let store_block = self.ctx.append_basic_block(self.func, "batch.view.store");
+                let skip_block = self.ctx.append_basic_block(self.func, "batch.view.skip");
+                let store_join = self.ctx.append_basic_block(self.func, "batch.view.store.join");
+                self.builder
+                    .build_conditional_branch(nonnull, store_block, skip_block)
+                    .map_err(|error| self.err(error))?;
+                self.builder.position_at_end(store_block);
+                self.builder
+                    .build_store(element, header_phi.as_basic_value())
+                    .map_err(|error| self.err(error))?;
+                self.builder
+                    .build_unconditional_branch(store_join)
+                    .map_err(|error| self.err(error))?;
+                self.builder.position_at_end(skip_block);
+                self.builder
+                    .build_unconditional_branch(store_join)
+                    .map_err(|error| self.err(error))?;
+                self.builder.position_at_end(store_join);
+                nonnull
+            } else {
+                let ColumnBatchInput::Scalar(value) = input else {
+                    return Err(self.err("column batch scalar input mismatch"));
+                };
+                let option = self.operand(value)?.into_struct_value();
+                let tag = self
+                    .builder
+                    .build_extract_value(option, 0, "batch.scalar.tag")
+                    .map_err(|error| self.err(error))?
+                    .into_int_value();
+                let present = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::EQ,
+                        tag,
+                        self.ctx.i8_type().const_int(1, false),
+                        "batch.scalar.present",
+                    )
+                    .map_err(|error| self.err(error))?;
+                let store = self.ctx.append_basic_block(self.func, "batch.scalar.store");
+                let skip = self.ctx.append_basic_block(self.func, "batch.scalar.skip");
+                let store_join = self.ctx.append_basic_block(self.func, "batch.scalar.join");
+                self.builder
+                    .build_conditional_branch(present, store, skip)
+                    .map_err(|error| self.err(error))?;
+                self.builder.position_at_end(store);
+                let value = self
+                    .builder
+                    .build_extract_value(option, 1, "batch.scalar.value")
+                    .map_err(|error| self.err(error))?;
+                self.builder
+                    .build_store(element, value)
+                    .map_err(|error| self.err(error))?;
+                self.builder
+                    .build_unconditional_branch(store_join)
+                    .map_err(|error| self.err(error))?;
+                self.builder.position_at_end(skip);
+                self.builder
+                    .build_unconditional_branch(store_join)
+                    .map_err(|error| self.err(error))?;
+                self.builder.position_at_end(store_join);
+                present
+            };
+            if nullable {
+                let mark = self.ctx.append_basic_block(self.func, "batch.bitmap.mark");
+                let skip = self.ctx.append_basic_block(self.func, "batch.bitmap.skip");
+                let bitmap_join = self.ctx.append_basic_block(self.func, "batch.bitmap.join");
+                self.builder
+                    .build_conditional_branch(present, mark, skip)
+                    .map_err(|error| self.err(error))?;
+                self.builder.position_at_end(mark);
+                let bitmap_offset = bitmaps
+                    .get(field_index)
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| self.err("nullable column batch append bitmap is absent"))?;
+                let bitmap = self.column_batch_byte_ptr(
+                    fixed,
+                    bitmap_offset,
+                    "batch.bitmap",
+                )?;
+                let byte_index = self
+                    .builder
+                    .build_int_unsigned_div(len, i64t.const_int(8, false), "batch.bitmap.byte")
+                    .map_err(|error| self.err(error))?;
+                let bit_index = self
+                    .builder
+                    .build_int_unsigned_rem(len, i64t.const_int(8, false), "batch.bitmap.bit")
+                    .map_err(|error| self.err(error))?;
+                let address = self.column_batch_byte_ptr(bitmap, byte_index, "batch.bitmap.address")?;
+                let old = self
+                    .builder
+                    .build_load(self.ctx.i8_type(), address, "batch.bitmap.old")
+                    .map_err(|error| self.err(error))?
+                    .into_int_value();
+                let shift = self
+                    .builder
+                    .build_int_cast(bit_index, self.ctx.i8_type(), "batch.bitmap.shift")
+                    .map_err(|error| self.err(error))?;
+                let mask = self
+                    .builder
+                    .build_left_shift(self.ctx.i8_type().const_int(1, false), shift, "batch.bitmap.mask")
+                    .map_err(|error| self.err(error))?;
+                let value = self
+                    .builder
+                    .build_or(old, mask, "batch.bitmap.value")
+                    .map_err(|error| self.err(error))?;
+                self.builder
+                    .build_store(address, value)
+                    .map_err(|error| self.err(error))?;
+                self.builder
+                    .build_unconditional_branch(bitmap_join)
+                    .map_err(|error| self.err(error))?;
+                self.builder.position_at_end(skip);
+                self.builder
+                    .build_unconditional_branch(bitmap_join)
+                    .map_err(|error| self.err(error))?;
+                self.builder.position_at_end(bitmap_join);
+            }
+        }
+        let next_len = self
+            .builder
+            .build_int_add(len, i64t.const_int(1, false), "batch.len.next")
+            .map_err(|error| self.err(error))?;
+        self.column_batch_store(payload, 8, next_len.into())?;
+        let success_status = i32t.const_zero();
+        self.builder
+            .build_unconditional_branch(join)
+            .map_err(|error| self.err(error))?;
+        let success_end = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| self.err("column batch append success block is absent"))?;
+        self.builder.position_at_end(join);
+        let status = self
+            .builder
+            .build_phi(i32t, "batch.append.status")
+            .map_err(|error| self.err(error))?;
+        status.add_incoming(&[
+            (&failure_status, failed_end),
+            (&success_status, success_end),
+        ]);
+        Ok(status.as_basic_value().into_int_value())
+    }
+
     /// Allocate stack storage hoisted to the top of the entry block (so an alloca inside a loop
     /// does not grow the stack each iteration), then restore the builder to the current position.
     fn alloca_at_entry(&self, ty: BasicTypeEnum<'c>, name: &str) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
@@ -7264,6 +9092,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     self.builder
                         .build_call(self.runtime(RuntimeKey::Free), &[p], "")
                         .map_err(|e| self.err(e))?;
+                }
+                Stmt::ColumnBatchFinish { payload, struct_id } => {
+                    self.column_batch_finish(payload, *struct_id)?;
+                }
+                Stmt::ColumnBatchDrop { payload, struct_id } => {
+                    self.column_batch_drop(payload, *struct_id)?;
                 }
                 Stmt::RawStore { ptr, offset, value } => {
                     // `raw.store(p, off, v)` → store `v` at `p + off` bytes. GEP by the i8 (byte)
@@ -8306,6 +10140,25 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .basic()
                     .expect("align_rt_alloc returns a pointer")
             }
+            Rvalue::ColumnBatchCreate { max_rows, struct_id } => {
+                self.column_batch_create(max_rows, *struct_id)?.into()
+            }
+            Rvalue::ColumnBatchAppend { payload, inputs, struct_id } => self
+                .column_batch_append(payload, inputs, *struct_id)?
+                .into(),
+            Rvalue::ColumnBatchRow {
+                payload,
+                owner: _,
+                index,
+                struct_id,
+                resource: _,
+            } => self.column_batch_row(payload, index, *struct_id)?.into(),
+            Rvalue::ColumnBatchSoa {
+                payload,
+                owner: _,
+                struct_id,
+                resource: _,
+            } => self.column_batch_soa(payload, *struct_id)?.into(),
             Rvalue::RawNull => self.ctx.ptr_type(AddressSpace::default()).const_null().into(),
             Rvalue::RawLoad { ptr, offset, scalar } => {
                 // `raw.load(p, off)` → load the scalar at `p + off` bytes. GEP by the byte offset,
@@ -12865,6 +14718,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .ok_or_else(|| callable_target_error(target))?
                     .as_global_value()
                     .as_pointer_value(),
+                StaticDataTarget::Record(record) => self.static_data_global(record)?,
             };
             field_types.push(ptr_ty.as_basic_type_enum());
             field_values.push(pointer.as_basic_value_enum());
@@ -15702,6 +17556,705 @@ mod tests {
         missing_function.relocations[0].target =
             StaticDataTarget::Function(program_call("missing$thunk"));
         rejected(missing_function, Ty::Raw, "callable target invalid");
+
+        let nested = StaticData {
+            bytes: vec![0; 8],
+            align: 8,
+            relocations: vec![align_mir::StaticDataRelocation {
+                offset: 0,
+                target: StaticDataTarget::Record(Box::new(StaticData {
+                    bytes: vec![0; 8],
+                    align: 8,
+                    relocations: vec![align_mir::StaticDataRelocation {
+                        offset: 0,
+                        target: StaticDataTarget::Bytes {
+                            bytes: vec![9, 8, 7],
+                            nul_terminated: false,
+                        },
+                    }],
+                })),
+            }],
+        };
+        assert!(emit(nested.clone(), Ty::Raw).is_ok());
+
+        let mut empty_nested = nested.clone();
+        let StaticDataTarget::Record(record) = &mut empty_nested.relocations[0].target else {
+            panic!("test nested static-data record")
+        };
+        record.bytes.clear();
+        record.relocations.clear();
+        rejected(empty_nested, Ty::Raw, "byte image is empty");
+
+        let mut missing_nested_function = nested;
+        let StaticDataTarget::Record(record) =
+            &mut missing_nested_function.relocations[0].target
+        else {
+            panic!("test missing nested static-data function")
+        };
+        record.relocations[0].target =
+            StaticDataTarget::Function(program_call("missing$nested$thunk"));
+        rejected(
+            missing_nested_function,
+            Ty::Raw,
+            "callable target invalid",
+        );
+
+        let mut too_deep = StaticData {
+            bytes: vec![0; 8],
+            align: 8,
+            relocations: Vec::new(),
+        };
+        for _ in 0..66 {
+            too_deep = StaticData {
+                bytes: vec![0; 8],
+                align: 8,
+                relocations: vec![align_mir::StaticDataRelocation {
+                    offset: 0,
+                    target: StaticDataTarget::Record(Box::new(too_deep)),
+                }],
+            };
+        }
+        rejected(too_deep, Ty::Raw, "nested record depth exceeds 64");
+
+        let i32_ty = Ty::Int(IntTy {
+            bits: 32,
+            signed: true,
+        });
+        let u32_ty = Ty::Int(IntTy {
+            bits: 32,
+            signed: false,
+        });
+        let i64_ty = Ty::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        let none_borrow = hir::ReturnBorrowSummary::None;
+        let none_region = hir::ReturnRegionSummary::None;
+        let roots_borrow = hir::ReturnBorrowSummary::Roots {
+            params: vec![1],
+            captures: Vec::new(),
+        };
+        let roots_region = hir::ReturnRegionSummary::Roots {
+            params: vec![1],
+            captures: Vec::new(),
+        };
+        let callback = |name: &str,
+                        slots: Vec<Ty>,
+                        ret: Ty,
+                        return_borrow: hir::ReturnBorrowSummary,
+                        return_region: hir::ReturnRegionSummary,
+                        value_tys: Vec<Ty>,
+                        stmts: Vec<Stmt>,
+                        term: Term| {
+            let params = (0..slots.len() as u32).collect::<Vec<_>>();
+            Function {
+                name: program_call(name),
+                param_modes: vec![align_ast::ParamMode::ByValue; slots.len()],
+                borrow_mut_cleanup_slots: vec![None; slots.len()],
+                slot_align: vec![None; slots.len()],
+                params,
+                ret,
+                return_borrow,
+                return_region,
+                return_cleanup: hir::ReturnCleanupAbi::None,
+                slots,
+                value_tys,
+                blocks: vec![Block {
+                    id: 0,
+                    stmts,
+                    stmt_lines: Vec::new(),
+                    term,
+                }],
+                entry: 0,
+                exportable: false,
+            }
+        };
+        let mut callbacks = vec![
+            callback(
+                "batch_create",
+                vec![i64_ty],
+                Ty::Raw,
+                none_borrow.clone(),
+                none_region.clone(),
+                vec![Ty::Raw],
+                vec![Stmt::Let(
+                    0,
+                    Rvalue::ColumnBatchCreate {
+                        max_rows: Operand::Arg(0),
+                        struct_id: 0,
+                    },
+                )],
+                Term::Return(Some(Operand::Value(0))),
+            ),
+            callback(
+                "batch_append",
+                vec![Ty::Raw, Ty::Raw, Ty::ResourceRef(0)],
+                i32_ty,
+                none_borrow.clone(),
+                none_region.clone(),
+                vec![
+                    Ty::Option(Scalar::Int(IntTy {
+                        bits: 64,
+                        signed: true,
+                    })),
+                    i32_ty,
+                ],
+                vec![
+                    Stmt::Let(
+                        0,
+                        Rvalue::Call(
+                            DirectCall::Program(program_call("pkg.db.internal$read_i64_v2")),
+                            vec![
+                                Operand::Arg(1),
+                                Operand::Const(Const::Int(0, u32_ty)),
+                            ],
+                        ),
+                    ),
+                    Stmt::Let(
+                        1,
+                        Rvalue::ColumnBatchAppend {
+                            payload: Operand::Arg(0),
+                            inputs: vec![ColumnBatchInput::Scalar(Operand::Value(0))],
+                            struct_id: 0,
+                        },
+                    ),
+                ],
+                Term::Return(Some(Operand::Value(1))),
+            ),
+            callback(
+                "batch_finish",
+                vec![Ty::Raw, i64_ty],
+                Ty::Unit,
+                none_borrow.clone(),
+                none_region.clone(),
+                Vec::new(),
+                vec![Stmt::ColumnBatchFinish {
+                    payload: Operand::Arg(0),
+                    struct_id: 0,
+                }],
+                Term::Return(None),
+            ),
+            callback(
+                "batch_row",
+                vec![Ty::Raw, Ty::ResourceRef(1), i64_ty],
+                Ty::Struct(0),
+                none_borrow.clone(),
+                none_region.clone(),
+                vec![Ty::Struct(0)],
+                vec![Stmt::Let(
+                    0,
+                    Rvalue::ColumnBatchRow {
+                        payload: Operand::Arg(0),
+                        owner: Operand::Arg(1),
+                        index: Operand::Arg(2),
+                        struct_id: 0,
+                        resource: 1,
+                    },
+                )],
+                Term::Return(Some(Operand::Value(0))),
+            ),
+            callback(
+                "batch_soa",
+                vec![Ty::Raw, Ty::ResourceRef(1)],
+                Ty::Soa(0),
+                roots_borrow.clone(),
+                roots_region.clone(),
+                vec![Ty::Soa(0)],
+                vec![Stmt::Let(
+                    0,
+                    Rvalue::ColumnBatchSoa {
+                        payload: Operand::Arg(0),
+                        owner: Operand::Arg(1),
+                        struct_id: 0,
+                        resource: 1,
+                    },
+                )],
+                Term::Return(Some(Operand::Value(0))),
+            ),
+            callback(
+                "batch_drop",
+                vec![Ty::Raw],
+                Ty::Unit,
+                none_borrow.clone(),
+                none_region.clone(),
+                Vec::new(),
+                vec![Stmt::ColumnBatchDrop {
+                    payload: Operand::Arg(0),
+                    struct_id: 0,
+                }],
+                Term::Return(None),
+            ),
+        ];
+        callbacks.extend([
+            callback(
+                "other_create",
+                vec![i64_ty],
+                Ty::Raw,
+                none_borrow.clone(),
+                none_region.clone(),
+                vec![Ty::Raw],
+                vec![Stmt::Let(
+                    0,
+                    Rvalue::ColumnBatchCreate {
+                        max_rows: Operand::Arg(0),
+                        struct_id: 1,
+                    },
+                )],
+                Term::Return(Some(Operand::Value(0))),
+            ),
+            callback(
+                "other_finish",
+                vec![Ty::Raw, i64_ty],
+                Ty::Unit,
+                none_borrow.clone(),
+                none_region.clone(),
+                Vec::new(),
+                vec![Stmt::ColumnBatchFinish {
+                    payload: Operand::Arg(0),
+                    struct_id: 1,
+                }],
+                Term::Return(None),
+            ),
+            callback(
+                "other_drop",
+                vec![Ty::Raw],
+                Ty::Unit,
+                none_borrow,
+                none_region,
+                Vec::new(),
+                vec![Stmt::ColumnBatchDrop {
+                    payload: Operand::Arg(0),
+                    struct_id: 1,
+                }],
+                Term::Return(None),
+            ),
+        ]);
+        let mut wrong_ordinal_append = callbacks[1].clone();
+        wrong_ordinal_append.name = program_call("wrong_ordinal_append");
+        let Stmt::Let(_, Rvalue::Call(_, args)) = &mut wrong_ordinal_append.blocks[0].stmts[0]
+        else {
+            panic!("test append reader topology");
+        };
+        args[1] = Operand::Const(Const::Int(1, u32_ty));
+        callbacks.push(wrong_ordinal_append);
+        for (index, name) in [
+            (1, "prefixed_append"),
+            (2, "prefixed_finish"),
+            (3, "prefixed_row"),
+            (4, "prefixed_soa"),
+            (5, "prefixed_drop"),
+        ] {
+            let mut callback = callbacks[index].clone();
+            callback.name = program_call(name);
+            callback.blocks[0]
+                .stmts
+                .insert(0, Stmt::RawFree(Operand::Arg(0)));
+            callbacks.push(callback);
+        }
+        let resource = |kind: &str| hir::ResourceDef {
+            name: format!("pkg.db${kind}$S3_Row"),
+            source_name: format!("pkg.db${kind}$S3_Row"),
+            declaring_module: "pkg.db".to_owned(),
+            generic_arity: 1,
+            drop_hook: format!("pkg.db.internal.resource$drop_{kind}"),
+            drop_thunk: format!("__align_resource_drop$pkg.db${kind}"),
+            representation_version: 1,
+            drop_abi_fingerprint: *b"align-res-drop-1",
+        };
+        let row = StructDef {
+            name: "Row".to_owned(),
+            source_name: "Row".to_owned(),
+            fields: vec![align_sema::hir::FieldDef {
+                name: "id".to_owned(),
+                ty: i64_ty,
+            }],
+            align: None,
+            c_repr: false,
+        };
+        let other = StructDef {
+            name: "Other".to_owned(),
+            source_name: "Other".to_owned(),
+            fields: vec![
+                align_sema::hir::FieldDef {
+                    name: "left".to_owned(),
+                    ty: i64_ty,
+                },
+                align_sema::hir::FieldDef {
+                    name: "right".to_owned(),
+                    ty: i64_ty,
+                },
+            ],
+            align: None,
+            c_repr: false,
+        };
+        let mut plan_bytes = vec![0; 72];
+        plan_bytes[0..4].copy_from_slice(&1u32.to_le_bytes());
+        plan_bytes[4] = 1;
+        plan_bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let plan = StaticData {
+            bytes: plan_bytes,
+            align: 8,
+            relocations: [
+                (16, "batch_create"),
+                (24, "batch_append"),
+                (32, "batch_finish"),
+                (40, "batch_row"),
+                (48, "batch_soa"),
+                (56, "batch_drop"),
+            ]
+            .into_iter()
+            .map(|(offset, target)| align_mir::StaticDataRelocation {
+                offset,
+                target: StaticDataTarget::Function(program_call(target)),
+            })
+            .collect(),
+        };
+        let emit_descriptor = |plan: StaticData| {
+            let mut header = vec![0; 136];
+            header[0..4].copy_from_slice(&5u32.to_le_bytes());
+            let descriptor = StaticData {
+                bytes: header,
+                align: 8,
+                relocations: vec![align_mir::StaticDataRelocation {
+                    offset: 128,
+                    target: StaticDataTarget::Record(Box::new(plan)),
+                }],
+            };
+            let main = Function {
+                name: program_call("main"),
+                params: Vec::new(),
+                param_modes: Vec::new(),
+                borrow_mut_cleanup_slots: Vec::new(),
+                ret: i32_ty,
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
+                return_cleanup: hir::ReturnCleanupAbi::None,
+                slots: Vec::new(),
+                slot_align: Vec::new(),
+                value_tys: vec![Ty::Raw],
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: vec![Stmt::Let(0, Rvalue::StaticData(Box::new(descriptor)))],
+                    stmt_lines: Vec::new(),
+                    term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
+                }],
+                entry: 0,
+                exportable: false,
+            };
+            emit_llvm_ir(
+                &Program {
+                    fns: std::iter::once(main)
+                        .chain(callbacks.iter().cloned())
+                        .collect(),
+                    externs: Vec::new(),
+                    imported_fns: vec![align_mir::ImportedFn {
+                        name: program_call("pkg.db.internal$read_i64_v2"),
+                        params: vec![Ty::Raw, u32_ty],
+                        param_modes: vec![align_ast::ParamMode::ByValue; 2],
+                        ret: Ty::Option(Scalar::Int(IntTy {
+                            bits: 64,
+                            signed: true,
+                        })),
+                        return_borrow: hir::ReturnBorrowSummary::None,
+                        return_region: hir::ReturnRegionSummary::None,
+                        return_cleanup: hir::ReturnCleanupAbi::None,
+                    }],
+                    link_libs: Vec::new(),
+                    structs: vec![row.clone(), other.clone()],
+                    enums: Vec::new(),
+                    resources: vec![resource("rows"), resource("batch")],
+                    tagged_types: Vec::new(),
+                    fn_types: Vec::new(),
+                    tuples: Vec::new(),
+                },
+                &BuildTarget::Baseline,
+                false,
+                &[],
+                None,
+            )
+        };
+        assert!(emit_descriptor(plan.clone()).is_ok());
+
+        for (length, align) in [(128, 8), (135, 8), (137, 8), (136, 16)] {
+            let mut header = vec![0; length];
+            header[0..4].copy_from_slice(&5u32.to_le_bytes());
+            let malformed = StaticData {
+                bytes: header,
+                align,
+                relocations: Vec::new(),
+            };
+            let error = emit(malformed, Ty::Raw)
+                .expect_err("wrong-shaped v5 Query descriptor must fail before LLVM");
+            assert!(
+                error.to_string().contains("v5 Query descriptor"),
+                "length {length}, align {align} produced unexpected diagnostic: {error}"
+            );
+        }
+        for offset in [16, 24, 32, 40, 48, 56] {
+            let mut malformed = plan.clone();
+            let relocation = malformed
+                .relocations
+                .iter_mut()
+                .find(|relocation| relocation.offset == offset)
+                .unwrap_or_else(|| panic!("test callback ordinal"));
+            relocation.target = StaticDataTarget::Function(program_call(if offset == 56 {
+                "batch_create"
+            } else {
+                "batch_drop"
+            }));
+            let error = emit_descriptor(malformed)
+                .expect_err("wrong-signature batch callback must fail before LLVM");
+            assert!(
+                error
+                    .to_string()
+                    .contains("static-data batch plan is malformed"),
+                "offset {offset} produced unexpected diagnostic: {error}"
+            );
+        }
+        for (offset, target) in [
+            (16, "other_create"),
+            (32, "other_finish"),
+            (56, "other_drop"),
+        ] {
+            let mut malformed = plan.clone();
+            malformed
+                .relocations
+                .iter_mut()
+                .find(|relocation| relocation.offset == offset)
+                .unwrap_or_else(|| panic!("raw-only callback ordinal"))
+                .target = StaticDataTarget::Function(program_call(target));
+            let error = emit_descriptor(malformed)
+                .expect_err("cross-Row raw-only batch callback must fail before LLVM");
+            assert!(
+                error
+                    .to_string()
+                    .contains("static-data batch plan is malformed"),
+                "offset {offset} produced unexpected cross-Row diagnostic: {error}"
+            );
+        }
+        for (offset, target) in [
+            (24, "prefixed_append"),
+            (32, "prefixed_finish"),
+            (40, "prefixed_row"),
+            (48, "prefixed_soa"),
+            (56, "prefixed_drop"),
+        ] {
+            let mut malformed = plan.clone();
+            malformed
+                .relocations
+                .iter_mut()
+                .find(|relocation| relocation.offset == offset)
+                .unwrap_or_else(|| panic!("payload callback ordinal"))
+                .target = StaticDataTarget::Function(program_call(target));
+            let error = emit_descriptor(malformed)
+                .expect_err("batch callback prefix mutation must fail before LLVM");
+            assert!(
+                error
+                    .to_string()
+                    .contains("callback body does not match the Row"),
+                "offset {offset} produced unexpected prefix diagnostic: {error}"
+            );
+        }
+        let mut malformed = plan.clone();
+        malformed
+            .relocations
+            .iter_mut()
+            .find(|relocation| relocation.offset == 24)
+            .unwrap_or_else(|| panic!("append callback ordinal"))
+            .target = StaticDataTarget::Function(program_call("wrong_ordinal_append"));
+        let error = emit_descriptor(malformed)
+            .expect_err("append reader ordinal mismatch must fail before LLVM");
+        assert!(
+            error
+                .to_string()
+                .contains("append callback body does not match the Row"),
+            "unexpected append reader topology diagnostic: {error}"
+        );
+    }
+
+    #[test]
+    fn column_batch_mir_contract_fails_closed_before_llvm() {
+        let i32_ty = Ty::Int(IntTy {
+            bits: 32,
+            signed: true,
+        });
+        let i64_ty = Ty::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        let row = StructDef {
+            name: "Row".to_string(),
+            source_name: "Row".to_string(),
+            fields: vec![align_sema::hir::FieldDef {
+                name: "id".to_string(),
+                ty: i64_ty,
+            }],
+            align: None,
+            c_repr: false,
+        };
+        let create = |max_rows, struct_id, result, row: StructDef| {
+            codegen_program(
+                vec![Stmt::Let(
+                    0,
+                    Rvalue::ColumnBatchCreate {
+                        max_rows,
+                        struct_id,
+                    },
+                )],
+                vec![result],
+                vec![],
+                vec![row],
+                vec![],
+                vec![],
+            )
+        };
+        let max_rows = Operand::Const(Const::Int(4, i64_ty));
+        assert!(create(max_rows.clone(), 0, Ty::Raw, row.clone()).is_ok());
+
+        for malformed in [
+            create(max_rows.clone(), 1, Ty::Raw, row.clone()),
+            create(max_rows.clone(), 0, i64_ty, row.clone()),
+            create(
+                Operand::Const(Const::Int(4, i32_ty)),
+                0,
+                Ty::Raw,
+                row.clone(),
+            ),
+            create(
+                max_rows,
+                0,
+                Ty::Raw,
+                StructDef {
+                    fields: vec![align_sema::hir::FieldDef {
+                        name: "owned".to_string(),
+                        ty: Ty::String,
+                    }],
+                    ..row.clone()
+                },
+            ),
+        ] {
+            let error = malformed.expect_err("malformed column-batch MIR must fail");
+            assert!(
+                error.to_string().contains("resource operation contract mismatch"),
+                "unexpected diagnostic: {error}"
+            );
+        }
+
+        let batch_read = |soa: bool, resource_name: &str, row: StructDef| {
+            let resource = hir::ResourceDef {
+                name: resource_name.to_owned(),
+                source_name: resource_name.to_owned(),
+                declaring_module: "pkg.db".to_owned(),
+                generic_arity: 1,
+                drop_hook: "pkg.db.internal.resource$drop_batch".to_owned(),
+                drop_thunk: "__align_resource_drop$pkg.db$batch".to_owned(),
+                representation_version: 1,
+                drop_abi_fingerprint: *b"align-res-drop-1",
+            };
+            let mut slots = vec![Ty::Raw, Ty::ResourceRef(0)];
+            let mut params = vec![0, 1];
+            let rvalue = if soa {
+                Rvalue::ColumnBatchSoa {
+                    payload: Operand::Arg(0),
+                    owner: Operand::Arg(1),
+                    struct_id: 0,
+                    resource: 0,
+                }
+            } else {
+                slots.push(i64_ty);
+                params.push(2);
+                Rvalue::ColumnBatchRow {
+                    payload: Operand::Arg(0),
+                    owner: Operand::Arg(1),
+                    index: Operand::Arg(2),
+                    struct_id: 0,
+                    resource: 0,
+                }
+            };
+            let ret = if soa { Ty::Soa(0) } else { Ty::Struct(0) };
+            let function = Function {
+                name: program_call("batch_read"),
+                params,
+                param_modes: vec![align_ast::ParamMode::ByValue; slots.len()],
+                borrow_mut_cleanup_slots: vec![None; slots.len()],
+                ret,
+                return_borrow: if soa {
+                    hir::ReturnBorrowSummary::Roots {
+                        params: vec![1],
+                        captures: Vec::new(),
+                    }
+                } else {
+                    hir::ReturnBorrowSummary::None
+                },
+                return_region: if soa {
+                    hir::ReturnRegionSummary::Roots {
+                        params: vec![1],
+                        captures: Vec::new(),
+                    }
+                } else {
+                    hir::ReturnRegionSummary::None
+                },
+                return_cleanup: hir::ReturnCleanupAbi::None,
+                slot_align: vec![None; slots.len()],
+                slots,
+                value_tys: vec![ret],
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: vec![Stmt::Let(0, rvalue)],
+                    stmt_lines: Vec::new(),
+                    term: Term::Return(Some(Operand::Value(0))),
+                }],
+                entry: 0,
+                exportable: false,
+            };
+            emit_llvm_ir(
+                &Program {
+                    fns: vec![function],
+                    externs: Vec::new(),
+                    imported_fns: Vec::new(),
+                    link_libs: Vec::new(),
+                    structs: vec![row],
+                    enums: Vec::new(),
+                    resources: vec![resource],
+                    tagged_types: Vec::new(),
+                    fn_types: Vec::new(),
+                    tuples: Vec::new(),
+                },
+                &BuildTarget::Baseline,
+                false,
+                &[],
+                None,
+            )
+        };
+        for valid in [
+            batch_read(false, "pkg.db$batch$S3_Row", row.clone()),
+            batch_read(true, "pkg.db$batch$S3_Row", row.clone()),
+        ] {
+            assert!(valid.is_ok(), "valid batch read rejected: {valid:?}");
+        }
+        for malformed in [
+            batch_read(false, "pkg.db$batch$S5_Other", row.clone()),
+            batch_read(true, "pkg.db$batch$S5_Other", row.clone()),
+            batch_read(
+                true,
+                "pkg.db$batch$S5_Empty",
+                StructDef {
+                    name: "Empty".to_owned(),
+                    source_name: "Empty".to_owned(),
+                    fields: Vec::new(),
+                    align: None,
+                    c_repr: false,
+                },
+            ),
+        ] {
+            let error = malformed.expect_err("mismatched batch resource/Row must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("resource operation contract mismatch"),
+                "unexpected diagnostic: {error}"
+            );
+        }
     }
 
     fn raw_call_program() -> Program {

@@ -923,6 +923,7 @@ pub fn prepare_prevalidated<P, R>(
     binder := pkg.db.internal.descriptor.binder(statement)
     row_validator := pkg.db.internal.descriptor.row_validator(statement)
     stream_decoder := pkg.db.internal.descriptor.stream_decoder(statement)
+    batch_plan := pkg.db.internal.descriptor.batch_plan(statement)
     wrapper := pkg.db.internal.resource.new_stmt_state(
       DRIVER_POSTGRES,
       name,
@@ -933,6 +934,7 @@ pub fn prepare_prevalidated<P, R>(
       deallocate,
       row_validator,
       stream_decoder,
+      batch_plan,
     )
     prepared: pkg.db.stmt<P, R> := match target {
       Conn(reference) => resource.from_raw_borrowed(wrapper, reference)
@@ -1025,6 +1027,7 @@ pub fn rows_stmt_prevalidated<P, R>(
       false,
       false,
       0,
+      pkg.db.internal.resource.stmt_batch_plan(wrapper),
     )
     output: pkg.db.rows<R> := resource.from_raw_borrowed(
       rows_wrapper, resource.borrow(statement),
@@ -1132,6 +1135,7 @@ pub fn rows_prevalidated<P, R>(
       false,
       false,
       0,
+      pkg.db.internal.descriptor.batch_plan(statement),
     )
     output: pkg.db.rows<R> := match target {
       Conn(reference) => resource.from_raw_borrowed(rows_wrapper, reference)
@@ -1197,6 +1201,121 @@ pub fn next_prevalidated<R>(
     decoded := pkg.db.internal.descriptor.decode_current_row(reference, context)
     raw.store(context, 16, row + 1)
     return Ok(Some(decoded))
+  }
+}
+
+pub fn next_batch_prevalidated<R>(
+  borrow mut rows: pkg.db.rows<R>,
+  max_rows: i64,
+) -> Result<Option<pkg.db.batch<R>>, pkg.db.Error> {
+  unsafe {
+    reference := resource.borrow(rows)
+    wrapper := resource.raw(reference)
+    if pkg.db.internal.resource.rows_driver(wrapper) != DRIVER_POSTGRES
+      || !pkg.db.internal.resource.rows_batch_header_valid(wrapper) {
+      return Err(pkg.db.Error.InvalidQuery(pkg.db.ContractError {
+        query_id: None,
+        item: "db.rows.header".clone(),
+        message: "invalid database rows resource".clone(),
+      }))
+    }
+    id_pointer := pkg.db.internal.resource.rows_query_id_pointer(wrapper)
+    id_length := pkg.db.internal.resource.rows_query_id_length(wrapper)
+    plan := pkg.db.internal.resource.rows_batch_plan(wrapper)
+    query_id: str := resource.view_from_raw(reference, id_pointer, id_length) else {
+      return Err(pkg.db.Error.InvalidQuery(pkg.db.ContractError {
+        query_id: None,
+        item: "db.rows.header".clone(),
+        message: "invalid database rows resource".clone(),
+      }))
+    }
+    if plan.is_null() {
+      return Err(pkg.db.Error.InvalidQuery(pkg.db.ContractError {
+        query_id: None,
+        item: "db.rows.header".clone(),
+        message: "invalid database rows resource".clone(),
+      }))
+    }
+    if max_rows <= 0 || max_rows > 2147483647 {
+      return Err(descriptor_error(
+        query_id,
+        "db.batch.max_rows",
+        "database batch size must be between 1 and 2147483647 rows",
+      ))
+    }
+    terminal := pkg.db.internal.resource.rows_terminal(wrapper)
+    if terminal == 1 { return Ok(None) }
+    if terminal != 0 {
+      return Err(invalid_query_error(
+        query_id,
+        "db.rows.state",
+        "database rows cannot advance after a failed execution",
+      ))
+    }
+    result := pkg.db.internal.resource.rows_native(wrapper)
+    context := pkg.db.internal.resource.rows_context(wrapper)
+    state := pkg.db.internal.resource.rows_connection_state(wrapper)
+    connection := postgres_connection(state)
+    if result.is_null() || context.is_null() || connection.is_null() {
+      ignored := pkg.db.internal.resource.close_rows(wrapper, 2)
+      return Err(descriptor_error(
+        query_id,
+        "db.rows.state",
+        "PostgreSQL rows are closed or poisoned",
+      ))
+    }
+    count := rows_count(result)
+    if count < 0 {
+      failure := execution_error(connection, result)
+      ignored := pkg.db.internal.resource.close_rows(wrapper, 2)
+      return Err(failure)
+    }
+    mut row: u32 := raw.load(context, 16)
+    if row >= (count as u32) {
+      ignored := pkg.db.internal.resource.close_rows(wrapper, 1)
+      return Ok(None)
+    }
+    payload := pkg.db.internal.descriptor.create_batch(plan, max_rows)
+    if payload.is_null() {
+      return Err(descriptor_error(
+        query_id,
+        "db.batch.layout",
+        "database batch layout exceeds the supported address range",
+      ))
+    }
+    mut length := 0
+    loop {
+      if length >= max_rows || row >= (count as u32) { break }
+      validate_status := pkg.db.internal.descriptor.validate_current_row(reference, context)
+      if validate_status != 0 {
+        failure := context_error(context, connection, result, query_id)
+        pkg.db.internal.descriptor.drop_batch_payload(plan, payload)
+        ignored := pkg.db.internal.resource.close_rows(wrapper, 2)
+        return Err(failure)
+      }
+      append_status := pkg.db.internal.descriptor.append_current_batch(
+        plan, payload, context, reference,
+      )
+      if append_status != 0 {
+        pkg.db.internal.descriptor.drop_batch_payload(plan, payload)
+        ignored := pkg.db.internal.resource.close_rows(wrapper, 2)
+        return Err(descriptor_error(
+          query_id,
+          "db.batch.storage",
+          "database batch variable-width storage exceeds the supported address range",
+        ))
+      }
+      row = row + 1
+      raw.store(context, 16, row)
+      length = length + 1
+    }
+    if row >= (count as u32) {
+      ignored := pkg.db.internal.resource.close_rows(wrapper, 1)
+    }
+    pkg.db.internal.descriptor.finish_batch(plan, payload, length)
+    batch_wrapper := pkg.db.internal.resource.new_batch_state(plan, payload, length, max_rows)
+    output: pkg.db.batch<R> := resource.from_raw(batch_wrapper)
+    return Ok(Some(output))
   }
 }
 

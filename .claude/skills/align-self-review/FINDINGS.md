@@ -29,7 +29,7 @@ invented exact counts here.
 | `validation-phase-completeness` | 9 | 4 | Recurred past the added owner (#727: static-validation-after-native-prepare; unvalidated v3 tail-reserved field). Required next: deduplicate the copied header validators into one shared function so an ABI version bump has one owner, and extend the parameterized phase-order owner across prepared/transaction paths. |
 | `cross-stage-abi-exactness` | 4 | 1 | Covered by Gate 4 and exact ABI owner matrices. |
 | `native-api-version-boundary` | 4 | 1 | Covered by Gate 2 plus version/conversion goldens. |
-| `ownership-allocation-owner` | 3 | 1 | Covered by Gates 1, 2, and 4; every allocation and thunk needs one named owner. |
+| `ownership-allocation-owner` | 4 | 2 | Three-plus events: scalar fixed-array admission now routes through the canonical recursive `DropPlan`, with source and handcrafted-HIR owners rejecting every non-struct element that lacks per-element cleanup. Gates 1, 2, and 4 still require every allocation, Drop path, and thunk to have one named owner. |
 | `sql-scanner-lexical-closure` | 3 | 2 | Promoted: parameterized lexical-mode and token-free-tail owners are mandatory. |
 | `native-link-order-closure` | 3 | 1 | Promoted: preserve caller order around the dependency closure and test arbitrary prefix/suffix libraries. |
 | `producer-evidence-propagation` | 1 | 1 | Watch; exact producer-to-consumer evidence owner required. |
@@ -99,6 +99,7 @@ invented exact counts here.
 | #734 | `1c5167ae` | P1 | `analysis-fact-consumer-sweep` | Keep mutable `resource_ref` peers rooted in their common owner for alias checks. |
 | #734 | `c84bb3d4` | P1 | `analysis-fact-consumer-sweep` | Preserve the typed storage edge through escape-flow region selection. |
 | #734 | `c84bb3d4` | P1 | `analysis-fact-consumer-sweep` | Expand unavailable-call fallbacks to both contained and storage edges in one shared operation. |
+| #739 | `334775fe` | P1 | `ownership-allocation-owner` | Reject owned strings until fixed-array element Drop exists. |
 
 ## Rejected claims
 

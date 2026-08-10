@@ -359,6 +359,7 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             | Scalar::DynArray(_)
             | Scalar::Slice(_)
             | Scalar::Param(_)
+            | Scalar::SoaParam(_)
             | Scalar::Bool
             | Scalar::Char
             | Scalar::Unit
@@ -489,6 +490,7 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             Ty::Int(_)
             | Ty::Float(_)
             | Ty::Param(_)
+            | Ty::SoaParam(_)
             | Ty::IntVar(_)
             | Ty::FloatVar(_)
             | Ty::DynSliceArray(_)
@@ -808,7 +810,8 @@ pub(super) mod tests {
         unequal!(
             Ty::Int(i(8)) => Ty::Int(IntTy { bits: 8, signed: false }),
             Ty::Float(FloatTy { bits: 32 }) => Ty::Float(FloatTy { bits: 64 }),
-            Ty::Param(0) => Ty::Param(1), Ty::IntVar(0) => Ty::IntVar(1),
+            Ty::Param(0) => Ty::Param(1), Ty::SoaParam(0) => Ty::SoaParam(1),
+            Ty::IntVar(0) => Ty::IntVar(1),
             Ty::FloatVar(0) => Ty::FloatVar(1),
             Ty::Array(Scalar::Bool, 2) => Ty::Array(Scalar::Bool, 3),
             Ty::Vec(Scalar::Int(i(8)), 2) => Ty::Vec(Scalar::Int(i(8)), 4),
@@ -816,11 +819,22 @@ pub(super) mod tests {
             Ty::DictEncoded(0, 1) => Ty::DictEncoded(0, 2),
             Ty::Option(Scalar::Int(i(8))) => Ty::Option(Scalar::Int(i(16))),
             Ty::Option(Scalar::Param(0)) => Ty::Option(Scalar::Param(1)),
+            Ty::Option(Scalar::SoaParam(0)) => Ty::Option(Scalar::SoaParam(1)),
         );
-        assert_ty_matrix(&[Ty::Param(0), Ty::IntVar(0), Ty::FloatVar(0), Ty::Error]);
+        assert_ty_matrix(&[
+            Ty::Param(0),
+            Ty::SoaParam(0),
+            Ty::IntVar(0),
+            Ty::FloatVar(0),
+            Ty::Error,
+        ]);
         assert!(ty_equal(
             Ty::Option(Scalar::Param(0)),
             Ty::Option(Scalar::Param(0))
+        ));
+        assert!(ty_equal(
+            Ty::Option(Scalar::SoaParam(0)),
+            Ty::Option(Scalar::SoaParam(0))
         ));
         unequal!(
             Ty::Tagged(0) => Ty::Tagged(99), Ty::StructArray(0, 1) => Ty::StructArray(99, 1),

@@ -680,8 +680,11 @@ and `str`/`string` — byte-lexicographic, § Equality and Ordering); `Eq` grant
 satisfy a parameter's bound is a compile error at the call. There are **no user-defined
 trait-style bounds** — deliberately, for AI-friendliness and *one way*.
 
-`RegionPlain` is the one separate closed structural bound used by region-backed construction. It is
-not part of the numeric hierarchy and grants no arithmetic or equality operation.
+`RegionPlain` and `SoaPlain` are the two separate closed structural bounds. Neither is part of the
+numeric hierarchy or grants arithmetic/equality operations. `RegionPlain` admits recursively plain
+values for region-backed construction. `SoaPlain` is narrower: it admits exactly a nonempty struct
+whose fields are primitive integer/float/`bool`/`char` scalars or `str`, and grants only symbolic
+`soa<T>` formation at a generic boundary.
 
 Concrete `string` and `str` both satisfy `Eq` and `Ord`; an owned value is borrowed, not moved, by
 the comparison inside a monomorphized function.
@@ -727,6 +730,12 @@ template is checked, then are fully substituted and monomorphized before Move/es
 MIR. This adds no runtime dictionary, reflection, turbofish, or definition nested inside a
 function, and does not make a concrete container element legal when that container otherwise
 rejects it.
+
+`soa<T>` may likewise remain symbolic only as `soa<R>` inside a template that declares
+`R: SoaPlain`. A public template interface preserves that canonical symbolic application and bound
+for separate compilation. Concrete substitution must satisfy the ordinary `soa<T>` field rule and
+happens before Move/escape analysis and emitted HIR/MIR; no abstract SoA or runtime type test
+survives monomorphization.
 
 After substitution, a struct field may be Copy or recursively Move when its finite, non-recursive
 Drop plan is known. Move fields participate in the aggregate's one-owner cleanup bit and allocation
@@ -1264,6 +1273,12 @@ form is the analytics win: idiomatic Rust decodes to a `Vec<User>` (AoS) and des
 field, while Align produces a column-major `soa<User>` and a scan reads only the fields it touches.
 (The guarantee is the **result** — a `soa<T>` laid out column-major; the decoder parses straight
 into the columns, with no AoS intermediate or transpose pass.)
+
+An owning package resource may also expose a borrowed `soa<T>` view over its own exact-length
+column buffer. The resource, not an implicit arena, is then the view's lifetime root. In
+particular, `pkg.db.batch<T>` uses this form only through `batch_soa<T: SoaPlain>`; moving or dropping
+the batch invalidates the view. This does not add an owned `soa<T>` language value or permit
+Move-fielded columns.
 
 `json.decode` only parses the fields you declare — any other key in the input is skipped
 structurally (no value conversion, no copy). To read just a few columns of a wide record, declare a

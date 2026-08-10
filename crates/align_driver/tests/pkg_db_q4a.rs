@@ -147,12 +147,12 @@ fn q4a_public_surface_remains_exact_after_q4b_streaming_extension() {
                 .matches("tail_reserved: u32 := raw.load(data, 116)")
                 .count(),
             expected,
-            "{module} must delegate to the two shared v4 header validators"
+            "{module} must delegate to the two shared v5 header validators"
         );
         assert_eq!(
             source.matches("tail_reserved == 0").count(),
             expected,
-            "{module} must not duplicate the v4 tail-reserved check"
+            "{module} must not duplicate the v5 tail-reserved check"
         );
     }
     for source in [INTERNAL_SQLITE, INTERNAL_POSTGRES] {

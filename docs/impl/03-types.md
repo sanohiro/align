@@ -424,7 +424,7 @@ purity, and result lifetime can all be checked through a function value.
 
 ---
 
-## 9. Generics (minimal) — shipped core; L7 composition pending
+## 9. Generics (minimal) — shipped core and L7 composition
 
 Monomorphization (specialize per use site). No Rust/C++ trait/template complexity (`non-goals.md`).
 
@@ -462,7 +462,7 @@ Monomorphization (specialize per use site). No Rust/C++ trait/template complexit
   `enums` table grows during resolution (reserved slots + `enum_mono` dedup); `resolve_type` interns
   a monomorph `EnumDef` for `Opt<i32>` (`instantiate_enum`); variant construction `Opt.Some(7)`
   infers the args from the payload (`match_param`) then monomorphizes.
-- L7 (required before `pkg.db`, not yet shipped): retain nested symbolic type applications in a
+- L7 (shipped): retain nested symbolic type applications in a
   generic template, add recursive inference/substitution for `array`, `slice`, and top-level
   generic struct/sum/resource applications, and add the closed structural `RegionPlain` bound.
 ```
@@ -478,8 +478,12 @@ turbofish.
 
 `RegionPlain` is an additional closed builtin structural bound. It grants only region-plain
 construction/builder operations, and concrete instantiation recursively rejects resources,
-independently owned fields, raw/function values, and builders. There are still no user traits,
-runtime dictionaries, reflection, or new concrete container element capabilities. Generic
+independently owned fields, raw/function values, and builders. A1/D13 adds the one narrower
+`SoaPlain` bound: exactly a nonempty struct of integer/float/`bool`/`char`/`str` fields. It grants
+only symbolic `soa<R>` formation in a template. A public template interface preserves the canonical
+symbolic application and bound; each instantiation substitutes concrete `Ty::Soa(id)` before
+MoveCheck/EscapeCheck/emitted HIR/MIR. There are still no user traits, runtime dictionaries, reflection, or
+new concrete container element capabilities. Generic
 **containers beyond this symbolic composition** remain on their owning tracks; **`vecN<T>`** remains
 M6, and `Opt.None` expected-type decomposition remains an additive inference refinement.
 
@@ -527,7 +531,7 @@ AST that passes the checks becomes the **typed HIR**. Almost the same shape as t
 - implement package-defined resources/resource references
 - implement named region parameters and destination substitution
 - implement recursive tagged Move payloads
-- implement nested generic package applications and the RegionPlain bound
+- add the A1 `SoaPlain` symbolic-template/interface completion
 ```
 
 Error propagation uses explicit `map_err`; match exhaustiveness is checked; struct Copy/Move is

@@ -152,6 +152,20 @@ fn block_to_string(out: &mut String, b: &Block) {
             Stmt::RawFree(op) => {
                 let _ = writeln!(out, "    raw_free {}", operand_str(op));
             }
+            Stmt::ColumnBatchFinish { payload, struct_id } => {
+                let _ = writeln!(
+                    out,
+                    "    column_batch_finish {} (struct#{struct_id})",
+                    operand_str(payload)
+                );
+            }
+            Stmt::ColumnBatchDrop { payload, struct_id } => {
+                let _ = writeln!(
+                    out,
+                    "    column_batch_drop {} (struct#{struct_id})",
+                    operand_str(payload)
+                );
+            }
             Stmt::RawStore { ptr, offset, value } => {
                 let _ = writeln!(out, "    raw_store {}[{}] <- {}", operand_str(ptr), operand_str(offset), operand_str(value));
             }
@@ -326,6 +340,24 @@ fn rvalue_str(rv: &Rvalue) -> String {
         }
         Rvalue::HeapAlloc(h, init) => format!("heap_alloc({}, {})", operand_str(h), operand_str(init)),
         Rvalue::RawAlloc(size) => format!("raw_alloc({})", operand_str(size)),
+        Rvalue::ColumnBatchCreate { max_rows, struct_id } => format!(
+            "column_batch_create({}, struct#{struct_id})",
+            operand_str(max_rows)
+        ),
+        Rvalue::ColumnBatchAppend { payload, inputs, struct_id } => format!(
+            "column_batch_append({}, {} fields, struct#{struct_id})",
+            operand_str(payload),
+            inputs.len()
+        ),
+        Rvalue::ColumnBatchRow { payload, index, struct_id, .. } => format!(
+            "column_batch_row({}, {}, struct#{struct_id})",
+            operand_str(payload),
+            operand_str(index)
+        ),
+        Rvalue::ColumnBatchSoa { payload, struct_id, .. } => format!(
+            "column_batch_soa({}, struct#{struct_id})",
+            operand_str(payload)
+        ),
         Rvalue::RawNull => "raw_null()".to_string(),
         Rvalue::RawLoad { ptr, offset, .. } => format!("raw_load({}[{}])", operand_str(ptr), operand_str(offset)),
         Rvalue::RawPointerLoad { ptr, offset } => {

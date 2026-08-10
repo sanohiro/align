@@ -115,6 +115,9 @@ pub enum Scalar {
     /// storage, never dropped). Lets `Result<soa<T>, Error>` carry a decoded soa — the result type
     /// of `s: soa<User> := json.decode(d)?`. Non-recursive (just the id), so `Scalar` stays `Copy`.
     Soa(u32),
+    /// A symbolic `soa<T>` payload inside a generic template whose `T` has the closed `SoaPlain`
+    /// bound. The parameter index is substituted to [`Scalar::Soa`] before emitted HIR/MIR.
+    SoaParam(u32),
     /// A `json.doc` view payload (`Result<json.doc, Error>` from `json.doc(s)`, J4). A Copy
     /// `{ tape, node }` handle — **Copy, not Move** (it owns nothing; the tape lives in the arena)
     /// but **region-tracked** (like [`Scalar::Soa`]: it borrows the arena tape + the JSON input,
@@ -404,6 +407,9 @@ pub enum Ty {
     /// fields it reads — the cache lever that beats an array-of-structs (`draft.md` §3.4/§9). The
     /// id indexes `Program::structs`.
     Soa(u32),
+    /// Template-only symbolic `soa<T>` where the payload is generic parameter `T`. Concrete
+    /// instantiation substitutes this to [`Ty::Soa`] before emitted HIR/MIR.
+    SoaParam(u32),
     /// `array<slice<T>>` — an *owned*, dynamic-length array whose elements are `slice<T>` views
     /// (each `{ T* ptr, i64 len }`). Laid out like a slice (`{ slice* ptr, i64 count }`), Move
     /// (owns the buffer of slice headers, freed at scope exit), and region-tracked (the element
@@ -719,6 +725,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Ty::DynStructArray { .. }
         | Ty::Slice { .. }
         | Ty::Soa { .. }
+        | Ty::SoaParam { .. }
         | Ty::DynSliceArray { .. }
         | Ty::DynArray { .. }
         | Ty::DynVecArray { .. }
@@ -789,6 +796,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Scalar::Enum { .. }
         | Scalar::Tagged { .. }
         | Scalar::Soa { .. }
+        | Scalar::SoaParam { .. }
         | Scalar::JsonDoc
         | Scalar::Param { .. }
         | Scalar::Reader
@@ -880,6 +888,7 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         // A `soa<Struct>` borrowed view can be a `Result`/`Option` payload (the `json.decode →
         // soa` result). Region-tracked, never dropped — like `Str`.
         Ty::Soa(id) => Some(Scalar::Soa(id)),
+        Ty::SoaParam(index) => Some(Scalar::SoaParam(index)),
         // A `json.doc` view is the `Ok` payload of `json.doc(s)`'s `Result`. Region-tracked, never
         // dropped — like `Soa` / `Str`.
         Ty::JsonDoc => Some(Scalar::JsonDoc),
@@ -933,6 +942,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::Enum(id) => Ty::Enum(id),
         Scalar::Tagged(id) => Ty::Tagged(id),
         Scalar::Soa(id) => Ty::Soa(id),
+        Scalar::SoaParam(index) => Ty::SoaParam(index),
         Scalar::JsonDoc => Ty::JsonDoc,
         Scalar::Param(i) => Ty::Param(i),
         Scalar::Reader => Ty::Reader,
@@ -1937,6 +1947,7 @@ pub fn ty_may_borrow(
             | Ty::Reader
             | Ty::Writer
             | Ty::Soa(_)
+            | Ty::SoaParam(_)
             // A `http_headers` view IS the request context's pointer — it borrows the ctx's parsed
             // buffer, so a `Let` binding it must record the ctx's borrow provenance.
             | Ty::HttpHeaders
@@ -2650,8 +2661,8 @@ impl Ty {
 }
 
 /// A builtin generic bound — the only constraints (no user-defined trait bounds). `Num` ⊃ `Ord` ⊃
-/// `Eq` is the scalar-operation hierarchy. `RegionPlain` is an orthogonal closed structural bound
-/// for explicit-region construction and grants no scalar operation. `Unconstrained` grants nothing
+/// `Eq` is the scalar-operation hierarchy. `RegionPlain` and `SoaPlain` are orthogonal closed
+/// structural bounds and grant no scalar operation. `Unconstrained` grants nothing
 /// (the parameter is opaque — pass / return / store only). A concrete type argument is checked
 /// against the bound at instantiation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2661,6 +2672,7 @@ enum Bound {
     Ord,
     Num,
     RegionPlain,
+    SoaPlain,
 }
 
 impl Bound {
@@ -2680,6 +2692,7 @@ impl Bound {
             Bound::Ord => "Ord",
             Bound::Num => "Num",
             Bound::RegionPlain => "RegionPlain",
+            Bound::SoaPlain => "SoaPlain",
         }
     }
     fn from_name(s: &str) -> Option<Bound> {
@@ -2688,6 +2701,7 @@ impl Bound {
             "Ord" => Some(Bound::Ord),
             "Num" => Some(Bound::Num),
             "RegionPlain" => Some(Bound::RegionPlain),
+            "SoaPlain" => Some(Bound::SoaPlain),
             _ => None,
         }
     }
@@ -2702,7 +2716,7 @@ impl Bound {
             Bound::Num => ty.is_numeric(),
             // RegionPlain is structural and needs the complete nominal definition tables.  Its
             // concrete check is owned by generic-call finalization, not this scalar predicate.
-            Bound::RegionPlain => false,
+            Bound::RegionPlain | Bound::SoaPlain => false,
         }
     }
 }
@@ -6214,7 +6228,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
             let bound = match &t.bound {
                 None => Bound::Unconstrained,
                 Some(id) => Bound::from_name(&id.name).unwrap_or_else(|| {
-                    diags.error(format!("unknown bound '{}' (expected `Eq`, `Ord`, `Num`, or `RegionPlain`)", id.name), id.span);
+                    diags.error(format!("unknown bound '{}' (expected `Eq`, `Ord`, `Num`, `RegionPlain`, or `SoaPlain`)", id.name), id.span);
                     Bound::Unconstrained
                 }),
             };
@@ -6228,6 +6242,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         let mut params: Vec<Ty> = Vec::with_capacity(f.params.len());
         for p in &f.params {
             let ty = resolve_type(&p.ty, tcx!(&module, imports), &tparams, diags);
+            validate_abstract_soa_bounds(ty, &bounds, &tparams, &tagged_types, p.ty.span(), diags);
             if let Ty::ArrayBuilder(Scalar::Param(index)) = ty
                 && bounds.get(index as usize) != Some(&Bound::RegionPlain)
             {
@@ -6255,6 +6270,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         let ret = match &f.ret {
             Some(t) => {
                 let r = resolve_type(t, tcx!(&module, imports), &tparams, diags);
+                validate_abstract_soa_bounds(r, &bounds, &tparams, &tagged_types, t.span(), diags);
                 if let Ty::ArrayBuilder(Scalar::Param(index)) = r
                     && bounds.get(index as usize) != Some(&Bound::RegionPlain)
                 {
@@ -7015,7 +7031,7 @@ fn abstract_nominal_instances(
         active_tagged: &mut HashSet<u32>,
     ) -> bool {
         match scalar {
-            Scalar::Param(_) => true,
+            Scalar::Param(_) | Scalar::SoaParam(_) => true,
             Scalar::Struct(id) | Scalar::DynStructArray(id) | Scalar::Soa(id) => {
                 ids.structs.contains(&id)
             }
@@ -7041,7 +7057,7 @@ fn abstract_nominal_instances(
 
     fn ty_is_abstract(ty: Ty, program: &Program, ids: &AbstractNominalIds) -> bool {
         match ty {
-            Ty::Param(_) => true,
+            Ty::Param(_) | Ty::SoaParam(_) => true,
             Ty::Struct(id)
             | Ty::StructArray(id, _)
             | Ty::DynStructArray(id, _)
@@ -7126,6 +7142,7 @@ struct NominalRemap {
     structs: Vec<Option<u32>>,
     enums: Vec<Option<u32>>,
     resources: Vec<Option<u32>>,
+    tagged: Vec<Option<u32>>,
 }
 
 fn compact_abstract_nominal_instances(
@@ -7155,10 +7172,44 @@ fn compact_abstract_nominal_instances(
             .collect()
     }
 
+    let mut abstract_tagged = HashSet::new();
+    loop {
+        let before = abstract_tagged.len();
+        let scalar_is_abstract = |scalar: Scalar, tagged: &HashSet<u32>| match scalar {
+            Scalar::Param(_) | Scalar::SoaParam(_) => true,
+            Scalar::Struct(id) | Scalar::DynStructArray(id) | Scalar::Soa(id) => {
+                abstract_ids.structs.contains(&id)
+            }
+            Scalar::Enum(id) => abstract_ids.enums.contains(&id),
+            Scalar::Resource(id) | Scalar::ResourceRef(id) => {
+                abstract_ids.resources.contains(&id)
+            }
+            Scalar::Tagged(id) => tagged.contains(&id),
+            _ => false,
+        };
+        for (id, definition) in program.tagged_types.iter().enumerate() {
+            let abstract_ = match definition {
+                hir::TaggedType::Option(payload) => {
+                    scalar_is_abstract(*payload, &abstract_tagged)
+                }
+                hir::TaggedType::Result(ok, err) => {
+                    scalar_is_abstract(*ok, &abstract_tagged)
+                        || scalar_is_abstract(*err, &abstract_tagged)
+                }
+            };
+            if abstract_ {
+                abstract_tagged.insert(id as u32);
+            }
+        }
+        if before == abstract_tagged.len() {
+            break;
+        }
+    }
     let remap = NominalRemap {
         structs: table_remap(program.structs.len(), &abstract_ids.structs),
         enums: table_remap(program.enums.len(), &abstract_ids.enums),
         resources: table_remap(program.resources.len(), &abstract_ids.resources),
+        tagged: table_remap(program.tagged_types.len(), &abstract_tagged),
     };
     let mut candidate = program.clone();
     let mut candidate_descriptors = static_descriptors.to_vec();
@@ -7180,6 +7231,7 @@ fn compact_abstract_nominal_instances(
             Scalar::Resource(id) | Scalar::ResourceRef(id) => {
                 remap_id(id, &remap.resources, valid)
             }
+            Scalar::Tagged(id) => remap_id(id, &remap.tagged, valid),
             _ => {}
         }
     }
@@ -7198,6 +7250,7 @@ fn compact_abstract_nominal_instances(
             Ty::Resource(id) | Ty::ResourceRef(id) => {
                 remap_id(id, &remap.resources, valid)
             }
+            Ty::Tagged(id) => remap_id(id, &remap.tagged, valid),
             Ty::Option(scalar)
             | Ty::Box(scalar)
             | Ty::Slice(scalar)
@@ -7439,15 +7492,25 @@ fn compact_abstract_nominal_instances(
         .enumerate()
         .filter_map(|(old, definition)| remap.resources[old].map(|_| definition))
         .collect();
-    for definition in &mut candidate.tagged_types {
-        match definition {
-            hir::TaggedType::Option(payload) => remap_scalar(payload, &remap, &mut valid),
-            hir::TaggedType::Result(ok, err) => {
-                remap_scalar(ok, &remap, &mut valid);
-                remap_scalar(err, &remap, &mut valid);
-            }
-        }
-    }
+    candidate.tagged_types = candidate
+        .tagged_types
+        .into_iter()
+        .enumerate()
+        .filter_map(|(old, mut definition)| {
+            remap.tagged[old].map(|_| {
+                match &mut definition {
+                    hir::TaggedType::Option(payload) => {
+                        remap_scalar(payload, &remap, &mut valid)
+                    }
+                    hir::TaggedType::Result(ok, err) => {
+                        remap_scalar(ok, &remap, &mut valid);
+                        remap_scalar(err, &remap, &mut valid);
+                    }
+                }
+                definition
+            })
+        })
+        .collect();
     for tuple in &mut candidate.tuples {
         for element in &mut tuple.elems {
             remap_scalar(element, &remap, &mut valid);
@@ -11864,7 +11927,15 @@ impl EffectScan<'_> {
                 walk!(ptr);
                 self.impure_direct = true;
             }
-            ExprKind::RawCall { callee, args, .. } => {
+            ExprKind::RawCall {
+                guard,
+                callee,
+                args,
+                ..
+            } => {
+                if let Some(guard) = guard.as_deref() {
+                    walk!(guard);
+                }
                 walk!(callee);
                 for arg in args {
                     walk!(arg);
@@ -13055,7 +13126,7 @@ impl<'a> EscapeCheck<'a> {
             Ty::DictEncoded(..) => return true,
             // A `soa<Struct>` view borrows its column buffer (arena-allocated by `to_soa`), so it is
             // region-tracked — it must not outlive the arena that owns the buffer.
-            Ty::Soa(_) => return true,
+            Ty::Soa(_) | Ty::SoaParam(_) => return true,
             // A `http_headers` view borrows the request context's parsed buffer, so it is
             // region-tracked — it (and any `hs.get(name)` read of it) must not outlive the ctx.
             Ty::HttpHeaders => return true,
@@ -16663,7 +16734,15 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(offset, depth);
             }
             ExprKind::StaticDescriptorView { ptr, .. } => self.walk(ptr, depth),
-            ExprKind::RawCall { callee, args, .. } => {
+            ExprKind::RawCall {
+                guard,
+                callee,
+                args,
+                ..
+            } => {
+                if let Some(guard) = guard.as_deref() {
+                    self.walk(guard, depth);
+                }
                 self.walk(callee, depth);
                 for arg in args {
                     self.walk(arg, depth);
@@ -24055,11 +24134,15 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, ptr, moved, false, false);
             }
             ExprKind::RawCall {
+                guard,
                 callee,
                 args,
                 param_modes,
                 ..
             } => {
+                if let Some(guard) = guard.as_deref() {
+                    move_expr!(self, guard, moved, false, false);
+                }
                 move_expr!(self, callee, moved, false, false);
                 for (index, argument) in args.iter().enumerate() {
                     let consuming = !matches!(
@@ -25341,6 +25424,11 @@ impl<'a, 't> Checker<'a, 't> {
                         work.push(Work::Type(Ty::Struct(id)));
                         work.push(Work::Text("soa<".to_string()));
                     }
+                    Ty::SoaParam(index) => {
+                        work.push(Work::Text(">".to_string()));
+                        work.push(Work::Type(Ty::Param(index)));
+                        work.push(Work::Text("soa<".to_string()));
+                    }
                     Ty::JsonScanner(id) => {
                         work.push(Work::Text(">".to_string()));
                         work.push(Work::Type(Ty::Struct(id)));
@@ -26051,6 +26139,13 @@ impl<'a, 't> Checker<'a, 't> {
                         state.unbound = true;
                     }
                 }
+                Ty::SoaParam(parameter) => {
+                    if subst.get(parameter as usize).is_some_and(Option::is_some) {
+                        state.bound = true;
+                    } else {
+                        state.unbound = true;
+                    }
+                }
                 Ty::Option(value)
                 | Ty::Box(value)
                 | Ty::Slice(value)
@@ -26087,6 +26182,11 @@ impl<'a, 't> Checker<'a, 't> {
                     }
                 }
                 Ty::Param(_) => {}
+                Ty::SoaParam(parameter) => {
+                    if let Some(slot) = nested.get_mut(parameter as usize) {
+                        *slot = true;
+                    }
+                }
                 Ty::Option(value)
                 | Ty::Box(value)
                 | Ty::Slice(value)
@@ -26145,6 +26245,16 @@ impl<'a, 't> Checker<'a, 't> {
             tagged_types: self.tagged_types,
         };
         let ty = resolve_type(t, &mut cx, &self.type_params, self.diags);
+        if self.mono_args.is_empty() {
+            validate_abstract_soa_bounds(
+                ty,
+                &self.param_bounds,
+                &self.type_params,
+                self.tagged_types,
+                t.span(),
+                self.diags,
+            );
+        }
         // In monomorph mode a type-parameter annotation (`let x: T`) resolves to the concrete arg.
         if self.mono_args.is_empty() {
             if let Ty::ArrayBuilder(Scalar::Param(index)) = ty
@@ -29025,6 +29135,12 @@ impl<'a, 't> Checker<'a, 't> {
         }
         match (declared, a) {
             (Ty::Param(p), _) => self.bind_param(p, a, subst, span),
+            (Ty::SoaParam(p), Ty::Soa(id)) => {
+                self.bind_param(p, Ty::Struct(id), subst, span)
+            }
+            (Ty::SoaParam(p), Ty::SoaParam(outer)) => {
+                self.bind_param(p, Ty::Param(outer), subst, span)
+            }
             (Ty::Tagged(_), _) => self.match_param_in_context(
                 expand_tagged_ty(declared, self.tagged_types),
                 a,
@@ -29158,7 +29274,22 @@ impl<'a, 't> Checker<'a, 't> {
         span: Span,
         context: GenericMatchContext,
     ) {
-        if let Scalar::Param(p) = declared {
+        if let Scalar::SoaParam(p) = declared {
+            match actual {
+                Scalar::Soa(id) => self.bind_param(p, Ty::Struct(id), subst, span),
+                Scalar::SoaParam(outer) => {
+                    self.bind_param(p, Ty::Param(outer), subst, span)
+                }
+                _ => match context {
+                    GenericMatchContext::Argument => {
+                        self.unify(scalar_to_ty(actual), scalar_to_ty(declared), span);
+                    }
+                    GenericMatchContext::ExpectedReturn => {
+                        self.unify(scalar_to_ty(declared), scalar_to_ty(actual), span);
+                    }
+                },
+            }
+        } else if let Scalar::Param(p) = declared {
             self.bind_param(p, scalar_to_ty(actual), subst, span);
         } else if matches!(declared, Scalar::Tagged(_))
             || matches!(actual, Scalar::Tagged(_))
@@ -30539,6 +30670,74 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         }
+        if method == "drop_batch_payload" {
+            let [plan_ast, payload_ast] = args else {
+                self.diags.error(
+                    format!(
+                        "static descriptor operation 'drop_batch_payload' expects 2 argument(s), got {}",
+                        args.len()
+                    ),
+                    span,
+                );
+                return err;
+            };
+            let plan = self.check_expr(plan_ast, Some(Ty::Raw));
+            let payload = self.check_expr(payload_ast, Some(Ty::Raw));
+            if plan.ty == Ty::Error || payload.ty == Ty::Error {
+                return err;
+            }
+            if !self.source_ty_matches(plan.ty, Ty::Raw)
+                || !self.source_ty_matches(payload.ty, Ty::Raw)
+            {
+                self.diags.error(
+                    "batch payload Drop requires raw plan and payload pointers".to_owned(),
+                    span,
+                );
+                return err;
+            }
+            let guard_plan = plan.clone();
+            let callee = Expr {
+                kind: ExprKind::RawPointerLoad {
+                    ptr: Box::new(plan),
+                    offset: Box::new(Expr {
+                        kind: ExprKind::Int(56),
+                        ty: Ty::Int(IntTy {
+                            bits: 64,
+                            signed: true,
+                        }),
+                        span,
+                    }),
+                },
+                ty: Ty::Raw,
+                span,
+            };
+            self.constrain(Ty::Unit, expected, span);
+            let call = Expr {
+                kind: ExprKind::RawCall {
+                    guard: Some(Box::new(Self::batch_plan_guard(guard_plan, span))),
+                    callee: Box::new(callee),
+                    args: vec![payload],
+                    param_tys: vec![Ty::Raw],
+                    param_modes: vec![ast::ParamMode::ByValue],
+                    return_borrow: hir::ReturnBorrowSummary::None,
+                    return_region: hir::ReturnRegionSummary::None,
+                    return_cleanup: hir::ReturnCleanupAbi::None,
+                },
+                ty: Ty::Unit,
+                span,
+            };
+            return call;
+        }
+        if matches!(
+            method,
+            "create_batch"
+                | "append_current_batch"
+                | "finish_batch"
+                | "read_batch_row"
+                | "read_batch_soa"
+        ) {
+            return self.check_batch_plan_op(method, args, expected, span);
+        }
         if method == "bind_prepared" {
             return self.check_prepared_bind_op(args, expected, span);
         }
@@ -30553,6 +30752,9 @@ impl<'a, 't> Checker<'a, 't> {
             "next_sqlite" | "next_postgres" | "has_next_sqlite" | "has_next_postgres"
         ) {
             return self.check_rows_next_dispatch_op(method, args, expected, span);
+        }
+        if matches!(method, "next_batch_sqlite" | "next_batch_postgres") {
+            return self.check_rows_batch_dispatch_op(method, args, expected, span);
         }
         if matches!(method, "validate_current_row" | "decode_current_row") {
             return self.check_rows_current_op(method, args, expected, span);
@@ -30571,6 +30773,7 @@ impl<'a, 't> Checker<'a, 't> {
             | "row_validator"
             | "decoder"
             | "stream_decoder"
+            | "batch_plan"
             | "meta_materializer"
             | "parameter_resolver"
             | "parameter_count" => 1,
@@ -31058,6 +31261,7 @@ impl<'a, 't> Checker<'a, 't> {
             "row_validator" | "validate_row" => 80,
             "decoder" | "decode" => 88,
             "stream_decoder" => 120,
+            "batch_plan" => 128,
             "meta_materializer" | "materialize_meta" => 96,
             "parameter_resolver" | "parameter_ordinal" => 104,
             _ => unreachable!(),
@@ -31089,6 +31293,7 @@ impl<'a, 't> Checker<'a, 't> {
                 | "row_validator"
                 | "decoder"
                 | "stream_decoder"
+                | "batch_plan"
                 | "meta_materializer"
                 | "parameter_resolver"
         ) {
@@ -31129,6 +31334,7 @@ impl<'a, 't> Checker<'a, 't> {
             self.constrain(ret, expected, span);
             return Expr {
                 kind: ExprKind::RawCall {
+                    guard: None,
                     callee: Box::new(callee),
                     args: vec![driver, detail, index],
                     param_tys: vec![u8_ty, u8_ty, i64_ty],
@@ -31164,6 +31370,7 @@ impl<'a, 't> Checker<'a, 't> {
             self.constrain(ret, expected, span);
             return Expr {
                 kind: ExprKind::RawCall {
+                    guard: None,
                     callee: Box::new(callee),
                     args: vec![name],
                     param_tys: vec![Ty::Str],
@@ -31218,6 +31425,7 @@ impl<'a, 't> Checker<'a, 't> {
         self.constrain(ret, expected, span);
         Expr {
             kind: ExprKind::RawCall {
+                guard: None,
                 callee: Box::new(callee),
                 args: call_args,
                 param_tys,
@@ -31352,6 +31560,7 @@ impl<'a, 't> Checker<'a, 't> {
         self.constrain(ret, expected, span);
         Expr {
             kind: ExprKind::RawCall {
+                guard: None,
                 callee: Box::new(callee),
                 args: vec![context, params],
                 param_tys: vec![Ty::Raw, params_ty],
@@ -31369,6 +31578,270 @@ impl<'a, 't> Checker<'a, 't> {
         self.resource_instances.iter().find_map(|(&id, instance)| {
             (instance.canonical == canonical && instance.args == args).then_some(id)
         })
+    }
+
+    /// Keep every producer-plan indirect call control-dependent on the exact structural validator
+    /// for the same raw local. HIR validation recognizes only this synthesized edge; malformed HIR
+    /// cannot reuse the closed thunk ABI with an unvalidated pointer.
+    fn batch_plan_guard(plan: Expr, span: Span) -> Expr {
+        Expr {
+            kind: ExprKind::Call {
+                func: "pkg.db.internal.resource$batch_plan_valid".to_owned(),
+                args: vec![plan],
+                type_args: Vec::new(),
+            },
+            ty: Ty::Bool,
+            span,
+        }
+    }
+
+    /// A1 bridge from a validated producer batch plan to its typed thunks. The plan remains an
+    /// ordinary immutable raw record; this compiler-private operation supplies only the checked
+    /// raw-function signature and the exact rows/batch generation provenance.
+    fn check_batch_plan_op(
+        &mut self,
+        method: &str,
+        args: &[ast::Expr],
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Expr {
+        let err = || Expr {
+            kind: ExprKind::Bool(false),
+            ty: Ty::Error,
+            span,
+        };
+        let required = match method {
+            "create_batch" => 2,
+            "append_current_batch" => 4,
+            "finish_batch" => 3,
+            "read_batch_row" => 4,
+            "read_batch_soa" => 3,
+            _ => unreachable!(),
+        };
+        if args.len() != required {
+            self.diags.error(
+                format!(
+                    "static descriptor operation '{method}' expects {required} argument(s), got {}",
+                    args.len()
+                ),
+                span,
+            );
+            return err();
+        }
+        let plan = self.check_expr(&args[0], Some(Ty::Raw));
+        if plan.ty == Ty::Error || !self.source_ty_matches(plan.ty, Ty::Raw) {
+            if plan.ty != Ty::Error {
+                self.diags
+                    .error("batch plan must be a raw pointer".to_owned(), args[0].span);
+            }
+            return err();
+        }
+        let (offset, call_args, param_tys, resource_arg, ret) = match method {
+            "create_batch" => {
+                let i64_ty = Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                });
+                let max_rows = self.check_expr(&args[1], Some(i64_ty));
+                if max_rows.ty == Ty::Error || !self.source_ty_matches(max_rows.ty, i64_ty) {
+                    if max_rows.ty != Ty::Error {
+                        self.diags.error(
+                            "batch maximum row count must be i64".to_owned(),
+                            args[1].span,
+                        );
+                    }
+                    return err();
+                }
+                (16, vec![max_rows], vec![i64_ty], None, Ty::Raw)
+            }
+            "finish_batch" => {
+                let payload = self.check_expr(&args[1], Some(Ty::Raw));
+                let i64_ty = Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                });
+                let len = self.check_expr(&args[2], Some(i64_ty));
+                if payload.ty == Ty::Error || len.ty == Ty::Error {
+                    return err();
+                }
+                if !self.source_ty_matches(payload.ty, Ty::Raw)
+                    || !self.source_ty_matches(len.ty, i64_ty)
+                {
+                    self.diags.error(
+                        "batch finish requires raw payload and i64 length".to_owned(),
+                        span,
+                    );
+                    return err();
+                }
+                (32, vec![payload, len], vec![Ty::Raw, i64_ty], None, Ty::Unit)
+            }
+            "append_current_batch" => {
+                let payload = self.check_expr(&args[1], Some(Ty::Raw));
+                let context = self.check_expr(&args[2], Some(Ty::Raw));
+                let reference = self.check_expr(&args[3], None);
+                let Ty::ResourceRef(resource) = self.resolve(reference.ty) else {
+                    if reference.ty != Ty::Error {
+                        self.diags.error(
+                            "batch append requires resource_ref<db.rows<R>>".to_owned(),
+                            args[3].span,
+                        );
+                    }
+                    return err();
+                };
+                let valid = self.resource_instances.get(&resource).is_some_and(|instance| {
+                    instance.canonical == "pkg.db$rows" && instance.args.len() == 1
+                });
+                if payload.ty == Ty::Error
+                    || context.ty == Ty::Error
+                    || !self.source_ty_matches(payload.ty, Ty::Raw)
+                    || !self.source_ty_matches(context.ty, Ty::Raw)
+                    || !valid
+                {
+                    if payload.ty != Ty::Error && context.ty != Ty::Error && !valid {
+                        self.diags.error(
+                            "batch append requires resource_ref<db.rows<R>>".to_owned(),
+                            args[3].span,
+                        );
+                    }
+                    return err();
+                }
+                (
+                    24,
+                    vec![payload, context, reference],
+                    vec![Ty::Raw, Ty::Raw, Ty::ResourceRef(resource)],
+                    None,
+                    Ty::Int(IntTy {
+                        bits: 32,
+                        signed: true,
+                    }),
+                )
+            }
+            "read_batch_row" | "read_batch_soa" => {
+                let payload = self.check_expr(&args[1], Some(Ty::Raw));
+                let reference_index = 2;
+                let reference = self.check_expr(&args[reference_index], None);
+                let Ty::ResourceRef(resource) = self.resolve(reference.ty) else {
+                    if reference.ty != Ty::Error {
+                        self.diags.error(
+                            "batch read requires resource_ref<db.batch<R>>".to_owned(),
+                            args[reference_index].span,
+                        );
+                    }
+                    return err();
+                };
+                let Some(instance) = self.resource_instances.get(&resource).cloned() else {
+                    self.diags.error(
+                        "batch read requires a concrete db.batch resource".to_owned(),
+                        args[reference_index].span,
+                    );
+                    return err();
+                };
+                if instance.canonical != "pkg.db$batch" || instance.args.len() != 1 {
+                    self.diags.error(
+                        "batch read requires resource_ref<db.batch<R>>".to_owned(),
+                        args[reference_index].span,
+                    );
+                    return err();
+                }
+                if payload.ty == Ty::Error || !self.source_ty_matches(payload.ty, Ty::Raw) {
+                    return err();
+                }
+                let row_ty = instance.args[0];
+                if method == "read_batch_row" {
+                    let i64_ty = Ty::Int(IntTy {
+                        bits: 64,
+                        signed: true,
+                    });
+                    let index = self.check_expr(&args[3], Some(i64_ty));
+                    if index.ty == Ty::Error || !self.source_ty_matches(index.ty, i64_ty) {
+                        return err();
+                    }
+                    let resource_root = ty_may_borrow(
+                        row_ty,
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    )
+                    .then_some(1);
+                    (
+                        40,
+                        vec![payload, reference, index],
+                        vec![Ty::Raw, Ty::ResourceRef(resource), i64_ty],
+                        resource_root,
+                        row_ty,
+                    )
+                } else {
+                    let soa_ty = match self.resolve(row_ty) {
+                        Ty::Struct(id) => Ty::Soa(id),
+                        Ty::Param(index) => Ty::SoaParam(index),
+                        _ => {
+                            self.diags.error(
+                                "batch SoA projection requires a struct Row".to_owned(),
+                                span,
+                            );
+                            return err();
+                        }
+                    };
+                    (
+                        48,
+                        vec![payload, reference],
+                        vec![Ty::Raw, Ty::ResourceRef(resource)],
+                        Some(1),
+                        soa_ty,
+                    )
+                }
+            }
+            _ => unreachable!(),
+        };
+        let guard_plan = plan.clone();
+        let callee = Expr {
+            kind: ExprKind::RawPointerLoad {
+                ptr: Box::new(plan),
+                offset: Box::new(Expr {
+                    kind: ExprKind::Int(offset),
+                    ty: Ty::Int(IntTy {
+                        bits: 64,
+                        signed: true,
+                    }),
+                    span,
+                }),
+            },
+            ty: Ty::Raw,
+            span,
+        };
+        let (return_borrow, return_region) = if let Some(parameter) = resource_arg {
+            (
+                hir::ReturnBorrowSummary::Roots {
+                    params: vec![parameter],
+                    captures: Vec::new(),
+                },
+                hir::ReturnRegionSummary::Roots {
+                    params: vec![parameter],
+                    captures: Vec::new(),
+                },
+            )
+        } else {
+            (
+                hir::ReturnBorrowSummary::None,
+                hir::ReturnRegionSummary::None,
+            )
+        };
+        self.constrain(ret, expected, span);
+        Expr {
+            kind: ExprKind::RawCall {
+                guard: Some(Box::new(Self::batch_plan_guard(guard_plan, span))),
+                callee: Box::new(callee),
+                param_modes: vec![ast::ParamMode::ByValue; param_tys.len()],
+                args: call_args,
+                param_tys,
+                return_borrow,
+                return_region,
+                return_cleanup: hir::ReturnCleanupAbi::None,
+            },
+            ty: ret,
+            span,
+        }
     }
 
     /// Q4b current-row bridge. The rows wrapper retains the producer-owned validator and streaming
@@ -31508,6 +31981,7 @@ impl<'a, 't> Checker<'a, 't> {
         self.constrain(ret, expected, span);
         Expr {
             kind: ExprKind::RawCall {
+                guard: None,
                 callee: Box::new(callee),
                 args: call_args,
                 param_tys,
@@ -31857,6 +32331,114 @@ impl<'a, 't> Checker<'a, 't> {
                     } else {
                         Ty::Tagged(option_id)
                     }],
+                    vec![Expr {
+                        kind: ExprKind::Str("database rows".to_owned()),
+                        ty: Ty::Str,
+                        span,
+                    }],
+                )
+            };
+        self.constrain(result_ty, expected, span);
+        Expr {
+            kind: ExprKind::Call {
+                func,
+                args: final_args,
+                type_args,
+            },
+            ty: result_ty,
+            span,
+        }
+    }
+
+    fn check_rows_batch_dispatch_op(
+        &mut self,
+        method: &str,
+        args: &[ast::Expr],
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Expr {
+        let err = || Expr {
+            kind: ExprKind::Bool(false),
+            ty: Ty::Error,
+            span,
+        };
+        let [rows_ast, max_rows_ast] = args else {
+            self.diags.error(
+                format!(
+                    "static descriptor operation '{method}' expects 2 argument(s), got {}",
+                    args.len()
+                ),
+                span,
+            );
+            return err();
+        };
+        let rows = self.check_expr(rows_ast, None);
+        let Ty::Resource(rows_id) = self.resolve(rows.ty) else {
+            if rows.ty != Ty::Error {
+                self.diags.error(
+                    "next_batch requires `db.rows<R>`".to_owned(),
+                    rows_ast.span,
+                );
+            }
+            return err();
+        };
+        let Some(instance) = self.resource_instances.get(&rows_id).cloned() else {
+            self.diags.error(
+                "next_batch requires concrete db.rows".to_owned(),
+                rows_ast.span,
+            );
+            return err();
+        };
+        if instance.canonical != "pkg.db$rows" || instance.args.len() != 1 {
+            self.diags.error(
+                "next_batch requires `db.rows<R>`".to_owned(),
+                rows_ast.span,
+            );
+            return err();
+        }
+        self.validate_borrow_argument(&rows, ast::ParamMode::BorrowMut, "next_batch");
+        let i64_ty = Ty::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        let max_rows = self.check_expr(max_rows_ast, Some(i64_ty));
+        if max_rows.ty == Ty::Error || !self.source_ty_matches(max_rows.ty, i64_ty) {
+            if max_rows.ty != Ty::Error {
+                self.diags.error(
+                    "next_batch maximum row count must be i64".to_owned(),
+                    max_rows_ast.span,
+                );
+            }
+            return err();
+        }
+        let row_ty = instance.args[0];
+        let Some(batch_id) = self.concrete_resource("pkg.db$batch", &[row_ty]) else {
+            self.diags
+                .error("pkg.db batch resource is unavailable".to_owned(), span);
+            return err();
+        };
+        let option_id = intern_tagged_type(
+            self.tagged_types,
+            hir::TaggedType::Option(Scalar::Resource(batch_id)),
+        );
+        let error_id = self
+            .enum_ids
+            .get("pkg.db$Error")
+            .copied()
+            .unwrap_or(self.error_enum_id);
+        let result_ty = Ty::Result(Scalar::Tagged(option_id), Scalar::Enum(error_id));
+        let base = if method == "next_batch_postgres" {
+            "pkg.db.internal.postgres$next_batch_prevalidated"
+        } else {
+            "pkg.db.internal.sqlite$next_batch_prevalidated"
+        };
+        let (func, type_args, final_args) =
+            if self.sigs.contains_key(base) || self.mono_args.is_empty() {
+                (base.to_owned(), vec![row_ty], vec![rows, max_rows])
+            } else {
+                (
+                    "pkg.db$unsupported".to_owned(),
+                    vec![Ty::Tagged(option_id)],
                     vec![Expr {
                         kind: ExprKind::Str("database rows".to_owned()),
                         ty: Ty::Str,
@@ -34739,6 +35321,31 @@ impl<'a, 't> Checker<'a, 't> {
                 | Ty::FixedArrayBuilder(..)
                 | Ty::FixedStructArrayBuilder(..) => return Some(at("is a builder")),
                 other => return Some(at(&format!("has unsupported type {}", ty_name(other)))),
+            }
+        }
+        None
+    }
+
+    fn soa_plain_error(&self, ty: Ty) -> Option<String> {
+        let Ty::Struct(id) = ty else {
+            return Some(format!("{} is not a struct", self.ty_display(ty)));
+        };
+        let Some(definition) = self.structs.get(id as usize) else {
+            return Some("the struct definition is unavailable".to_string());
+        };
+        if definition.fields.is_empty() {
+            return Some("the struct has no fields".to_string());
+        }
+        for field in &definition.fields {
+            if !matches!(
+                field.ty,
+                Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str
+            ) {
+                return Some(format!(
+                    "field '{}' has unsupported type {}",
+                    field.name,
+                    self.ty_display(field.ty)
+                ));
             }
         }
         None
@@ -40697,12 +41304,14 @@ impl<'a, 't> Checker<'a, 't> {
                         // Each concrete type argument must satisfy its parameter's bound.
                         if let Some(bounds) = self.sigs.get(func).map(|s| s.bounds.clone()) {
                             for (i, (arg, bound)) in type_args.iter().zip(&bounds).enumerate() {
-                                let failure = if *bound == Bound::RegionPlain {
-                                    self.region_plain_error(*arg)
-                                } else if bound.satisfied_by(*arg) {
-                                    None
-                                } else {
-                                    Some(format!("{} is outside the bound's scalar domain", self.ty_display(*arg)))
+                                let failure = match *bound {
+                                    Bound::RegionPlain => self.region_plain_error(*arg),
+                                    Bound::SoaPlain => self.soa_plain_error(*arg),
+                                    _ if bound.satisfied_by(*arg) => None,
+                                    _ => Some(format!(
+                                        "{} is outside the bound's scalar domain",
+                                        self.ty_display(*arg)
+                                    )),
                                 };
                                 if let Some(reason) = failure {
                                     self.diags.error(
@@ -40767,11 +41376,15 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ExprKind::StaticDescriptorView { ptr, .. } => self.finalize_expr(ptr),
             ExprKind::RawCall {
+                guard,
                 callee,
                 args,
                 param_tys,
                 ..
             } => {
+                if let Some(guard) = guard.as_deref_mut() {
+                    self.finalize_expr(guard);
+                }
                 self.finalize_expr(callee);
                 for argument in args {
                     self.finalize_expr(argument);
@@ -42055,6 +42668,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::DynSliceArray(p) => format!("array<slice<{}>>", scalar_name(prim_to_scalar(p))),
         Ty::Slice(s) => format!("slice<{}>", scalar_name(s)),
         Ty::Soa(id) => format!("soa<struct#{id}>"),
+        Ty::SoaParam(index) => format!("soa<T{index}>"),
         Ty::DynArray(s) => format!("array<{}>", scalar_name(s)),
         ty @ (Ty::DynVecArray(..)
         | Ty::DynMaskArray(..)
@@ -42230,6 +42844,7 @@ fn resolved_type_source_spelling(
                     next,
                 )
             ),
+            Ty::SoaParam(index) => format!("soa<T{index}>"),
             Ty::Enum(id) => enum_source_spellings
                 .get(&id)
                 .cloned()
@@ -42797,6 +43412,11 @@ fn subst_param_ty(
     // nominal applications remain outside L7 and are rejected during source type formation.
     match ty {
         Ty::Param(i) => args.get(i as usize).copied().unwrap_or(Ty::Error),
+        Ty::SoaParam(i) => match args.get(i as usize).copied().unwrap_or(Ty::Error) {
+            Ty::Struct(id) => Ty::Soa(id),
+            Ty::Param(index) => Ty::SoaParam(index),
+            _ => Ty::Error,
+        },
         Ty::Option(s) => Ty::Option(subst_scalar(s, args, tagged_types)),
         Ty::Result(o, e) => {
             let o = subst_scalar(o, args, tagged_types);
@@ -42927,6 +43547,14 @@ fn subst_scalar(s: Scalar, args: &[Ty], tagged_types: &mut Vec<hir::TaggedType>)
                 };
                 values.push(value);
             }
+            Work::Enter(Scalar::SoaParam(index)) => {
+                let value = match args.get(index as usize).copied().unwrap_or(Ty::Error) {
+                    Ty::Struct(id) => Scalar::Soa(id),
+                    Ty::Param(outer) => Scalar::SoaParam(outer),
+                    _ => Scalar::SoaParam(index),
+                };
+                values.push(value);
+            }
             Work::Enter(Scalar::Tagged(id)) if visiting.insert(id) => {
                 match tagged_types.get(id as usize).copied() {
                     Some(hir::TaggedType::Option(payload)) => {
@@ -42968,6 +43596,66 @@ fn subst_scalar(s: Scalar, args: &[Ty], tagged_types: &mut Vec<hir::TaggedType>)
     values.pop().unwrap_or(s)
 }
 
+fn validate_abstract_soa_bounds(
+    ty: Ty,
+    bounds: &[Bound],
+    type_params: &[String],
+    tagged_types: &[hir::TaggedType],
+    span: Span,
+    diags: &mut Diagnostics,
+) {
+    let mut work = vec![ty];
+    let mut seen_types = HashSet::new();
+    let mut seen_tagged = HashSet::new();
+    let mut reported = HashSet::new();
+    while let Some(ty) = work.pop() {
+        if !seen_types.insert(ty) {
+            continue;
+        }
+        match ty {
+            Ty::SoaParam(index) => {
+                if bounds.get(index as usize) != Some(&Bound::SoaPlain)
+                    && reported.insert(index)
+                {
+                    let name = type_params
+                        .get(index as usize)
+                        .map(String::as_str)
+                        .unwrap_or("T");
+                    diags.error(
+                        format!(
+                            "an abstract `soa` element requires the `SoaPlain` bound (declare `<{name}: SoaPlain>`)"
+                        ),
+                        span,
+                    );
+                }
+            }
+            Ty::Option(value)
+            | Ty::Box(value)
+            | Ty::Slice(value)
+            | Ty::Array(value, _)
+            | Ty::DynArray(value)
+            | Ty::ArrayBuilder(value)
+            | Ty::Task(value) => work.push(scalar_to_ty(value)),
+            Ty::Result(ok, err) => {
+                work.push(scalar_to_ty(err));
+                work.push(scalar_to_ty(ok));
+            }
+            Ty::Tagged(id) if seen_tagged.insert(id) => {
+                if let Some(tagged) = tagged_types.get(id as usize) {
+                    match *tagged {
+                        hir::TaggedType::Option(value) => work.push(scalar_to_ty(value)),
+                        hir::TaggedType::Result(ok, err) => {
+                            work.push(scalar_to_ty(err));
+                            work.push(scalar_to_ty(ok));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Whether a type carries a generic `Param` — bare, or nested one level in a scalar-payload
 /// composite. Used to decide whether a call argument applies a coercion (it does not when the
 /// parameter type is generic).
@@ -42975,7 +43663,7 @@ fn subst_scalar(s: Scalar, args: &[Ty], tagged_types: &mut Vec<hir::TaggedType>)
 /// such a parameter must resolve to a concrete scalar at the call (a `Scalar` can't hold an
 /// inference variable).
 fn ty_mentions_param(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
-    if matches!(ty, Ty::Param(_)) {
+    if matches!(ty, Ty::Param(_) | Ty::SoaParam(_)) {
         return true;
     }
     let mut work = Vec::new();
@@ -42999,7 +43687,7 @@ fn ty_mentions_param(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
     let mut visited = HashSet::new();
     while let Some(scalar) = work.pop() {
         match scalar {
-            Scalar::Param(_) => return true,
+            Scalar::Param(_) | Scalar::SoaParam(_) => return true,
             Scalar::Tagged(id) if visited.insert(id) => {
                 if let Some(tagged) = tagged_types.get(id as usize) {
                     match *tagged {
@@ -43297,6 +43985,7 @@ fn ty_mangle_impl(
                         Work::Type(Ty::Struct(id)),
                     ],
                 ),
+                Ty::SoaParam(index) => output.push_str(&format!("QP{index}")),
                 Ty::Tuple(id) => match tuples.get(id as usize) {
                     None => output.push_str("U_invalid"),
                     Some(tuple) => {
@@ -43783,6 +44472,17 @@ fn reject_abstract_nominal_container(
     true
 }
 
+/// A1's sole recursive generic-container exception. The public `next_batch` signature needs the
+/// abstract producer resource under `Option`, but L7 still rejects every other abstract nominal
+/// application nested in a builtin container.
+fn abstract_pkg_db_batch_application(ty: Ty, cx: &TyCx<'_>) -> bool {
+    let Ty::Resource(id) = ty else { return false };
+    cx.resource_instances.get(&id).is_some_and(|instance| {
+        instance.canonical == "pkg.db$batch"
+            && matches!(instance.args.as_slice(), [Ty::Param(_)])
+    })
+}
+
 fn resolve_type(
     t: &ast::Type,
     cx: &mut TyCx,
@@ -44211,7 +44911,12 @@ fn resolve_type(
                     return Ty::Error;
                 }
             };
-            if reject_abstract_nominal_container(inner, "Option", cx, span, diags) {
+            // A1 needs the exact producer-owned `Option<pkg.db.batch<R>>` result. Checker-side
+            // payload substitution closes that one resource shape recursively; every other
+            // abstract nominal application retains the narrower L7 restriction.
+            if !abstract_pkg_db_batch_application(inner, cx)
+                && reject_abstract_nominal_container(inner, "Option", cx, span, diags)
+            {
                 return Ty::Error;
             }
             match scalar_arg(inner, "Option payload", true, cx.tagged_types, span, diags) {
@@ -44247,6 +44952,7 @@ fn resolve_type(
                 }
             };
             match inner {
+                Ty::Param(index) => Ty::SoaParam(index),
                 Ty::Struct(id) => {
                     // Fields must be primitive scalars or `str`. Mixed widths are fine: each column's
                     // start is padded to the field's alignment in codegen, so `soa<{active: bool,

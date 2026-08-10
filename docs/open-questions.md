@@ -3684,7 +3684,7 @@ and variant construction (`Opt.Some(7)`) infers the type arguments from the payl
 then monomorphizes. A no-payload variant (`Opt.None`) is uninferable on its own (no expected-type
 decomposition yet). Payloads are scalars / plain structs (same as a non-generic enum).
 
-**L7 nested package composition — SETTLED 2026-07-27, required before `pkg.db`, not yet built.**
+**L7 nested package composition — SETTLED 2026-07-27.**
 Ordinary first-party packages need generic functions whose signatures and locals contain
 `array<R>`, `slice<R>`, and top-level generic struct/sum/resource applications such as
 `query<P,R>`, `stmt<P,R>`, and `rows<R>`. `Ty::Param` therefore composes recursively through those
@@ -3694,8 +3694,18 @@ and monomorphization keys encode the canonical nested type applications and boun
 and interface-only instantiation must agree. No user traits, runtime dictionaries, reflection,
 turbofish, nested declarations, or newly legal concrete container element categories are added.
 
-**Generics is closed — the shipped surface plus L7 is the whole feature.** The minimal-generics goal is met:
-generic functions, builtin bounds (`Num`/`Ord`/`Eq`), generic structs, and generic sum types, all
+**A1 abstract SoA boundary — SETTLED 2026-08-10.** D13's `batch_soa<R>` needs one symbolic
+`soa<R>` return without widening concrete SoA or adding DB-named compiler behavior. Add the closed
+structural `SoaPlain` bound, satisfied exactly by a nonempty struct of integer/float/`bool`/`char`/
+`str` fields. It grants only template formation of `soa<R>`; concrete substitution reuses the
+ordinary SoA admission rule before MoveCheck/EscapeCheck/emitted HIR/MIR. Public template
+interfaces preserve the canonical symbolic `soa<Param(R)>` application and bound for separate
+compilation; emitted HIR/MIR does not. There is no runtime dictionary, reflection, abstract runtime
+type, owned SoA language value, or fallback for Rows that do not satisfy the bound.
+
+**Generics is closed — the shipped surface plus L7 and the A1 abstract-SoA boundary is the whole
+feature.** The minimal-generics goal is met: generic functions, builtin bounds
+(`Num`/`Ord`/`Eq`/`RegionPlain`/`SoaPlain`), generic structs, and generic sum types, all
 monomorphized, no turbofish, no user trait bounds. That covers ordinary generic code; further
 extension is explicitly **not** pursued, to keep generics minimal and Align data-oriented.
 

@@ -459,6 +459,7 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             offset: *offset,
         },
         ExprKind::RawCall {
+            guard,
             callee,
             args,
             param_tys,
@@ -466,15 +467,22 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             return_borrow,
             return_region,
             return_cleanup,
-        } => ExprKind::RawCall {
-            callee: boxed!(callee),
-            args: take_exprs(clones, args.len())?,
-            param_tys: param_tys.clone(),
-            param_modes: param_modes.clone(),
-            return_borrow: return_borrow.clone(),
-            return_region: return_region.clone(),
-            return_cleanup: *return_cleanup,
-        },
+        } => {
+            let guard = match guard {
+                Some(_) => Some(Box::new(clones.expr()?)),
+                None => None,
+            };
+            ExprKind::RawCall {
+                guard,
+                callee: boxed!(callee),
+                args: take_exprs(clones, args.len())?,
+                param_tys: param_tys.clone(),
+                param_modes: param_modes.clone(),
+                return_borrow: return_borrow.clone(),
+                return_region: return_region.clone(),
+                return_cleanup: *return_cleanup,
+            }
+        }
         ExprKind::RawStore { ptr, offset, value } => ExprKind::RawStore {
             ptr: boxed!(ptr),
             offset: boxed!(offset),
@@ -2068,7 +2076,15 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             one!(callee);
             many!(args);
         }
-        ExprKind::RawCall { callee, args, .. } => {
+        ExprKind::RawCall {
+            guard,
+            callee,
+            args,
+            ..
+        } => {
+            if let Some(guard) = guard {
+                one!(guard);
+            }
             one!(callee);
             many!(args);
         }

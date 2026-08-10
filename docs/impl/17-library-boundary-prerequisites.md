@@ -1103,6 +1103,14 @@ template. A monomorphization key is the defining item identity plus the canonica
 type-argument tuple and compiler schema version. Whole-program and interface-only instantiation
 must produce identical keys, `RegionPlain` decisions, Drop plans, diagnostics, and ABI.
 
+A1/D13 adds one narrow completion without reopening L7's container surface. `soa<R>` may occur in a
+generic template exactly when `R: SoaPlain`, where `SoaPlain` accepts a nonempty struct of
+integer/float/`bool`/`char`/`str` fields. The public template interface serializes the canonical
+symbolic `soa<Param(R)>` expression and bound so a separate consumer can reconstruct it. Concrete
+instantiation reruns the ordinary SoA admission rule and substitutes `Ty::Soa(struct_id)` before
+MoveCheck, EscapeCheck, and emitted HIR/MIR. No abstract SoA, generic thunk, dictionary, reflection,
+or DB-named compiler operation reaches runtime code.
+
 ## 8. Recursive tagged Move payloads
 
 ### 8.1 Required surface

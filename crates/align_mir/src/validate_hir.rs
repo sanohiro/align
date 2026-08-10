@@ -1118,6 +1118,11 @@ impl<'a> PlacementValidator<'a> {
                 ScalarPlacement::Payload { allow_param: true }
                     | ScalarPlacement::FnParameter { allow_param: true }
             ),
+            Scalar::SoaParam(_) => matches!(
+                mode,
+                ScalarPlacement::Payload { allow_param: true }
+                    | ScalarPlacement::FnParameter { allow_param: true }
+            ),
             Scalar::Struct(id) => self.program.structs.get(id as usize).is_some(),
             Scalar::Resource(id) => {
                 !matches!(mode, ScalarPlacement::Collection)
@@ -1211,7 +1216,7 @@ impl<'a> PlacementValidator<'a> {
 
     fn resolve_type_ok(&self, ty: Ty, allow_param: bool) -> bool {
         match ty {
-            Ty::Param(_) => allow_param,
+            Ty::Param(_) | Ty::SoaParam(_) => allow_param,
             Ty::Int(integer) => valid_int(integer.bits),
             Ty::Float(float) => valid_float(float.bits),
             Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Unit | Ty::Raw | Ty::ArenaHandle => true,
@@ -1686,6 +1691,10 @@ impl<'a> Validator<'a> {
                 facts.has_param = true;
                 true
             }
+            Ty::SoaParam(_) => {
+                facts.has_param = true;
+                true
+            }
             Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error | Ty::StrFinder => false,
             Ty::Option(payload) | Ty::Array(payload, _) => {
                 self.inspect_scalar(payload, edge, facts)
@@ -1780,6 +1789,10 @@ impl<'a> Validator<'a> {
             Scalar::Int(integer) => valid_int(integer.bits),
             Scalar::Float(float) => valid_float(float.bits),
             Scalar::Param(_) => {
+                facts.has_param = true;
+                true
+            }
+            Scalar::SoaParam(_) => {
                 facts.has_param = true;
                 true
             }
@@ -2027,6 +2040,19 @@ struct BodyContext {
     /// Only the direct integer-literal child of unary `-` may carry the positive magnitude one
     /// past the signed maximum. Sema uses that exact HIR shape for `INT_MIN`.
     signed_min_magnitude: bool,
+}
+
+struct BatchPlanCall<'a> {
+    context: &'a BodyContext,
+    guard: Option<&'a hir::Expr>,
+    plan: &'a hir::Expr,
+    offset: u32,
+    args: &'a [hir::Expr],
+    param_tys: &'a [Ty],
+    param_modes: &'a [align_ast::ParamMode],
+    return_ty: Ty,
+    return_borrow: &'a hir::ReturnBorrowSummary,
+    return_region: &'a hir::ReturnRegionSummary,
 }
 
 #[derive(Clone, Copy)]
@@ -2759,6 +2785,7 @@ impl<'a> BodyValidator<'a> {
             | Ty::HttpStream
             | Ty::JsonDoc => true,
             Ty::Param(_)
+            | Ty::SoaParam(_)
             | Ty::IntVar(_)
             | Ty::FloatVar(_)
             | Ty::StrFinder
@@ -3056,7 +3083,7 @@ impl<'a> BodyValidator<'a> {
             | Scalar::ResponseBuilder
             | Scalar::HttpStream
             | Scalar::RunOutput => true,
-            Scalar::Param(_) => false,
+            Scalar::Param(_) | Scalar::SoaParam(_) => false,
         }
     }
 
@@ -4890,11 +4917,19 @@ impl<'a> BodyValidator<'a> {
                 }
                 push_expr!(callee, context.clone());
             }
-            hir::ExprKind::RawCall { callee, args, .. } => {
+            hir::ExprKind::RawCall {
+                guard,
+                callee,
+                args,
+                ..
+            } => {
                 for arg in args.iter().rev() {
                     push_expr!(arg, context.clone());
                 }
                 push_expr!(callee, context.clone());
+                if let Some(guard) = guard.as_deref() {
+                    push_expr!(guard, context.clone());
+                }
             }
             hir::ExprKind::TaskGroup(block) => {
                 let mut child = context.clone();
@@ -6149,6 +6184,7 @@ impl<'a> BodyValidator<'a> {
                 Some((Ty::Str, pointer.falls, pointer.breaks))
             }
             hir::ExprKind::RawCall {
+                guard,
                 callee,
                 args,
                 param_tys,
@@ -6157,6 +6193,13 @@ impl<'a> BodyValidator<'a> {
                 return_region,
                 return_cleanup,
             } => {
+                let guard_flow = match guard.as_deref() {
+                    Some(guard) => Some(self.expr_flow(guard)?),
+                    None => None,
+                };
+                if guard_flow.as_ref().is_some_and(|flow| flow.ty != Ty::Bool) {
+                    return None;
+                }
                 let callee_flow = self.expr_flow(callee)?;
                 let hir::ExprKind::RawPointerLoad { ptr, offset } = &callee.kind else {
                     return None;
@@ -6188,12 +6231,6 @@ impl<'a> BodyValidator<'a> {
                             .map(|_| *resource),
                         _ => None,
                     };
-                    if descriptor_kind.is_none()
-                        && prepared_resource.is_none()
-                        && rows_resource.is_none()
-                    {
-                    return None;
-                }
                 let hir::ExprKind::Int(offset) = &offset.kind else {
                     return None;
                 };
@@ -6205,9 +6242,9 @@ impl<'a> BodyValidator<'a> {
                     || callee_flow.ty != Ty::Raw
                     || args.len() != param_tys.len()
                     || args.len() != param_modes.len()
-                        || (!matches!(offset, 48)
+                        || (!matches!(offset, 40 | 48)
                             && *return_borrow != hir::ReturnBorrowSummary::None)
-                        || (!matches!(offset, 48)
+                        || (!matches!(offset, 40 | 48)
                             && *return_region != hir::ReturnRegionSummary::None)
                     || *return_cleanup != hir::ReturnCleanupAbi::None
                     || arg_flows
@@ -6231,7 +6268,29 @@ impl<'a> BodyValidator<'a> {
                     bits: 32,
                     signed: true,
                 });
-                let signature_ok = match offset {
+                let batch_signature_ok = self.batch_plan_call_signature_ok(BatchPlanCall {
+                    context,
+                    guard: guard.as_deref(),
+                    plan: ptr,
+                    offset,
+                    args,
+                    param_tys,
+                    param_modes,
+                    return_ty: expression.ty,
+                    return_borrow,
+                    return_region,
+                });
+                if descriptor_kind.is_none()
+                    && prepared_resource.is_none()
+                    && rows_resource.is_none()
+                    && !batch_signature_ok
+                {
+                    return None;
+                }
+                if !batch_signature_ok && guard.is_some() {
+                    return None;
+                }
+                let signature_ok = batch_signature_ok || match offset {
                         40 => {
                             rows_resource.is_some()
                                 && args.len() == 1
@@ -6357,7 +6416,9 @@ impl<'a> BodyValidator<'a> {
                 if !signature_ok {
                     return None;
                 }
-                let mut flows = vec![callee_flow];
+                let mut flows = Vec::with_capacity(arg_flows.len() + 2);
+                flows.extend(guard_flow);
+                flows.push(callee_flow);
                 flows.extend(arg_flows);
                 let (falls, breaks) = strict_flow(&flows);
                 Some((expression.ty, falls, breaks))
@@ -7555,6 +7616,7 @@ impl<'a> BodyValidator<'a> {
             | Ty::ResponseBuilder
             | Ty::HttpStream
             | Ty::Param(_)
+            | Ty::SoaParam(_)
             | Ty::IntVar(_)
             | Ty::FloatVar(_)
             | Ty::StrFinder
@@ -9657,6 +9719,168 @@ impl<'a> BodyValidator<'a> {
                 let name = function.name.as_str();
                 name.starts_with("pkg.db$") || name.starts_with("pkg.db.")
             })
+    }
+
+    /// Validate the complete closed ABI of an A1 producer batch-plan thunk. Unlike descriptor
+    /// header callbacks, a plan pointer is copied through stmt/rows/batch resource state before it
+    /// is called, so it cannot remain syntactically rooted in the original `$static` field. Sema is
+    /// the only HIR producer for `RawCall`; this exact signature/resource check and same-local
+    /// structural guard keep the trusted package bridge closed while allowing that producer-owned
+    /// pointer to cross generations.
+    fn batch_plan_call_signature_ok(&self, call: BatchPlanCall<'_>) -> bool {
+        let BatchPlanCall {
+            context,
+            guard,
+            plan,
+            offset,
+            args,
+            param_tys,
+            param_modes,
+            return_ty,
+            return_borrow,
+            return_region,
+        } = call;
+        let hir::ExprKind::Local(plan) = plan.kind else {
+            return false;
+        };
+        let Some(hir::Expr {
+            kind:
+                hir::ExprKind::Call {
+                    func,
+                    args: guard_args,
+                    type_args,
+                },
+            ty: Ty::Bool,
+            ..
+        }) = guard
+        else {
+            return false;
+        };
+        let guard_matches = func == "pkg.db.internal.resource$batch_plan_valid"
+            && type_args.is_empty()
+            && guard_args.len() == 1
+            && guard_args[0].ty == Ty::Raw
+            && matches!(guard_args[0].kind, hir::ExprKind::Local(local) if local == plan);
+        if !self.static_descriptor_body_ok(context)
+            || !guard_matches
+            || param_modes
+                .iter()
+                .any(|mode| *mode != align_ast::ParamMode::ByValue)
+        {
+            return false;
+        }
+        let i32_ty = Ty::Int(align_sema::IntTy {
+            bits: 32,
+            signed: true,
+        });
+        let i64_ty = Ty::Int(align_sema::IntTy {
+            bits: 64,
+            signed: true,
+        });
+        let no_borrow = summary_is_none(return_borrow, return_region);
+        let resource = |index: usize, canonical: &str| {
+            let Some(Ty::ResourceRef(id)) = param_tys.get(index).copied() else {
+                return None;
+            };
+            self.program
+                .resources
+                .get(id as usize)
+                .filter(|definition| {
+                    definition.declaring_module == "pkg.db"
+                        && definition.generic_arity == 1
+                        && definition.name.starts_with(canonical)
+                })
+                .map(|_| id)
+        };
+        let roots_one = |index| {
+            *return_borrow
+                == hir::ReturnBorrowSummary::Roots {
+                    params: vec![index],
+                    captures: Vec::new(),
+                }
+                && *return_region
+                    == hir::ReturnRegionSummary::Roots {
+                        params: vec![index],
+                        captures: Vec::new(),
+                    }
+        };
+        match offset {
+            16 => {
+                args.len() == 1
+                    && param_tys == [i64_ty]
+                    && return_ty == Ty::Raw
+                    && no_borrow
+            }
+            24 => {
+                args.len() == 3
+                    && param_tys.first() == Some(&Ty::Raw)
+                    && param_tys.get(1) == Some(&Ty::Raw)
+                    && resource(2, "pkg.db$rows$").is_some()
+                    && return_ty == i32_ty
+                    && no_borrow
+            }
+            32 => {
+                args.len() == 2
+                    && param_tys == [Ty::Raw, i64_ty]
+                    && return_ty == Ty::Unit
+                    && no_borrow
+            }
+            40 => {
+                let Some(resource) = resource(1, "pkg.db$batch$") else {
+                    return false;
+                };
+                let Some(definition) = self.program.resources.get(resource as usize) else {
+                    return false;
+                };
+                args.len() == 3
+                    && param_tys.first() == Some(&Ty::Raw)
+                    && param_tys.get(2) == Some(&i64_ty)
+                    && definition.name
+                        == format!(
+                            "pkg.db$batch${}",
+                            body_ty_mangle(return_ty, self.program)
+                        )
+                    && if align_sema::ty_may_borrow(
+                        return_ty,
+                        &self.program.structs,
+                        &self.program.tuples,
+                        &self.program.enums,
+                        &self.program.tagged_types,
+                    ) {
+                        roots_one(1)
+                    } else {
+                        no_borrow
+                    }
+            }
+            48 => {
+                let Some(resource) = resource(1, "pkg.db$batch$") else {
+                    return false;
+                };
+                let Some(definition) = self.program.resources.get(resource as usize) else {
+                    return false;
+                };
+                let row_suffix = definition.name.strip_prefix("pkg.db$batch$");
+                let row_ty = match return_ty {
+                    Ty::Soa(id) => Some(Ty::Struct(id)),
+                    Ty::SoaParam(index) => Some(Ty::Param(index)),
+                    _ => None,
+                };
+                let return_matches = row_ty.is_some_and(|row_ty| {
+                    row_suffix == Some(body_ty_mangle(row_ty, self.program).as_str())
+                });
+                args.len() == 2
+                    && param_tys.first() == Some(&Ty::Raw)
+                    && return_matches
+                    && roots_one(1)
+            }
+            56 => {
+                args.len() == 1
+                    && param_tys == [Ty::Raw]
+                    && return_ty == Ty::Unit
+                    && no_borrow
+            }
+            _ => false,
+        }
     }
 
     fn unit_enum_ty_ok(&self, ty: Ty, source_name: &str, variants: &[&str]) -> bool {
