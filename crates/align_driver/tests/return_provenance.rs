@@ -2244,6 +2244,29 @@ mod dyn_storage_locality {
     }
 
     #[test]
+    fn mixed_provenance_aggregate_slice_rejected() {
+        assert!(
+            check_errs(
+                "dyn-storage-mixed-aggregate",
+                "State { text: str }\nWrap { items: array<i64>, text: str }\nfn leak(borrow mut s: State) -> slice<i64> {\n  w := Wrap { items: [1, 2, 3].to_array(), text: s.text }\n  return w.items[..]\n}\nfn main() -> i32 {\n  mut s := State { text: \"\" }\n  values := leak(s)\n  if values.sum() == 6 { return 0 }\n  return 1\n}\n",
+            ),
+            "a caller view beside a frame-owned array must not launder the array's storage locality",
+        );
+    }
+
+    #[test]
+    fn region_built_aggregate_slice_stays_returnable() {
+        let diagnostics = check_diagnostics(
+            "dyn-storage-region-aggregate-control",
+            "Wrap { items: array<i64> }\nfn make(out: region) -> slice<i64> {\n  mut builder: array_builder<i64> := array_builder(out)\n  builder.push(1)\n  w := Wrap { items: builder.build() }\n  return w.items[..]\n}\nfn main() -> i32 {\n  arena out {\n    values := make(out)\n    if values.sum() == 1 { return 0 }\n    return 1\n  }\n}\n",
+        );
+        assert!(
+            diagnostics.is_empty(),
+            "an aggregate built wholly from a caller region must stay returnable:\n{diagnostics}",
+        );
+    }
+
+    #[test]
     fn outer_array_sliced_inside_arena_stays_valid() {
         let diagnostics = check_diagnostics(
             "dyn-storage-arena-slice-control",

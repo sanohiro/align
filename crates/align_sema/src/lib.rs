@@ -1765,11 +1765,13 @@ fn ty_owns_dyn_array_storage(
     ty: Ty,
     structs: &[StructDef],
     tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> bool {
     let mut work = vec![ty];
     let mut visited_structs = HashSet::new();
     let mut visited_tuples = HashSet::new();
+    let mut visited_enums = HashSet::new();
     let mut visited_tagged = HashSet::new();
     while let Some(ty) = work.pop() {
         match ty {
@@ -1805,6 +1807,18 @@ fn ty_owns_dyn_array_storage(
             Ty::Struct(id) if visited_structs.insert(id) => {
                 if let Some(structure) = structs.get(id as usize) {
                     work.extend(structure.fields.iter().rev().map(|field| field.ty));
+                }
+            }
+            Ty::Enum(id) if visited_enums.insert(id) => {
+                if let Some(sum) = enums.get(id as usize) {
+                    work.extend(
+                        sum.variants
+                            .iter()
+                            .rev()
+                            .flat_map(|variant| variant.payload.iter().rev())
+                            .copied()
+                            .map(scalar_to_ty),
+                    );
                 }
             }
             _ => {}
@@ -12457,6 +12471,7 @@ impl<'a> EscapeCheck<'a> {
                     local.ty,
                     self.structs,
                     self.tuples,
+                    self.enums,
                     self.tagged_types,
                 )
             {
@@ -15847,12 +15862,16 @@ impl<'a> EscapeCheck<'a> {
         self.mutable_root_storage_region(root, depth)
     }
 
-    /// Whether this binding owns dynamic-array storage that dies with the enclosing frame. A
-    /// caller-region initializer (`array_builder(out).build()`) allocates in the caller's region
-    /// capability, so its views remain valid past this frame and the binding stays unmarked.
-    fn dyn_storage_binding_is_local(&self, ty: Ty, init_region: Region) -> bool {
-        ty_owns_dyn_array_storage(ty, self.structs, self.tuples, self.tagged_types)
-            && !matches!(init_region, Region::Caller(_))
+    /// Whether this binding owns dynamic-array storage that dies with the enclosing frame. The
+    /// deciding fact is the storage's *allocation provenance* (`drop_may_be_individual`), not the
+    /// folded value region: a mixed aggregate holding a caller view plus a frame-owned array
+    /// folds to a caller region while its array buffer is still individually freed at frame
+    /// exit, and only the drop side tracks that. A pure region allocation
+    /// (`array_builder(out).build()`, arena collections) is bulk-freed by its region and stays
+    /// unmarked, so its views remain governed by the region checks.
+    fn dyn_storage_binding_is_local(&mut self, ty: Ty, init: &Expr, depth: u32) -> bool {
+        ty_owns_dyn_array_storage(ty, self.structs, self.tuples, self.enums, self.tagged_types)
+            && self.drop_may_be_individual(init, depth)
     }
 
     /// Region of storage selected by an exact `storage(parameter)` retention edge. The value's
@@ -15870,7 +15889,9 @@ impl<'a> EscapeCheck<'a> {
             let mut cursor = argument;
             loop {
                 match &cursor.kind {
-                    ExprKind::SliceRange { recv, .. } => cursor = recv,
+                    ExprKind::SliceRange { recv, .. }
+                    | ExprKind::TupleIndex { recv, .. }
+                    | ExprKind::Index { recv, .. } => cursor = recv,
                     ExprKind::ArrayToSlice(inner) => cursor = inner,
                     ExprKind::Local(local) => break Some(*local),
                     ExprKind::Field { root, .. } => break Some(*root),
@@ -16067,8 +16088,8 @@ impl<'a> EscapeCheck<'a> {
                 }
                 // An owned dynamic array's heap buffer (and any aggregate owning one) is
                 // individually dropped at frame exit, so its views are frame-local exactly like a
-                // fixed array's — unless the storage came from a caller region capability.
-                if self.dyn_storage_binding_is_local(init.ty, self.region_of(init, depth)) {
+                // fixed array's — unless the storage is a pure region allocation.
+                if self.dyn_storage_binding_is_local(init.ty, init, depth) {
                     self.state.local_backed_slice.insert(*local);
                 }
             }
@@ -16179,13 +16200,19 @@ impl<'a> EscapeCheck<'a> {
                 // storage-locality authority because reassignment can change their provenance
                 // (a caller-region build overwritten by a frame-owned `.to_array()`, or back).
                 let owns_dyn_storage = self.f.locals.get(*local as usize).is_some_and(|l| {
-                    ty_owns_dyn_array_storage(l.ty, self.structs, self.tuples, self.tagged_types)
+                    ty_owns_dyn_array_storage(
+                        l.ty,
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    )
                 });
                 if self.local_mentions_slice(*local) || owns_dyn_storage {
                     let slice_local =
                         self.mentions_slice(value.ty) && self.slice_is_local(value);
-                    let dyn_local = owns_dyn_storage
-                        && !matches!(self.region_of(value, depth), Region::Caller(_));
+                    let dyn_local =
+                        owns_dyn_storage && self.drop_may_be_individual(value, depth);
                     if slice_local || dyn_local {
                         self.state.local_backed_slice.insert(*local);
                     } else {
@@ -16316,14 +16343,22 @@ impl<'a> EscapeCheck<'a> {
                 }
                 // Tuple-destructured owned dynamic arrays (`(evens, odds) := xs.partition(f)`)
                 // are frame-owned storage like their `Let`-bound duals; mark each element binding
-                // through the same storage-locality authority.
-                let tuple_region = self.region_of(init, depth);
-                for l in locals.iter().flatten() {
-                    let owns = self.f.locals.get(*l as usize).is_some_and(|declared| {
-                        self.dyn_storage_binding_is_local(declared.ty, tuple_region)
-                    });
-                    if owns {
-                        self.state.local_backed_slice.insert(*l);
+                // through the same storage-locality authority, reusing the tuple's already
+                // computed allocation provenance.
+                if may_individual {
+                    for l in locals.iter().flatten() {
+                        let owns = self.f.locals.get(*l as usize).is_some_and(|declared| {
+                            ty_owns_dyn_array_storage(
+                                declared.ty,
+                                self.structs,
+                                self.tuples,
+                                self.enums,
+                                self.tagged_types,
+                            )
+                        });
+                        if owns {
+                            self.state.local_backed_slice.insert(*l);
+                        }
                     }
                 }
                 let callable = self.callable_region_fact(init, depth);
@@ -16368,7 +16403,6 @@ impl<'a> EscapeCheck<'a> {
         let may_individual = self.drop_may_be_individual(scrutinee, depth);
         let local_slice =
             self.mentions_slice(scrutinee.ty) && self.slice_is_local(scrutinee);
-        let scrutinee_region = self.region_of(scrutinee, depth);
         for binding in bindings {
             self.decl_depth.insert(*binding, depth);
             if self.f.locals.get(*binding as usize).is_some_and(|local| {
@@ -16387,10 +16421,18 @@ impl<'a> EscapeCheck<'a> {
                 self.state.local_backed_slice.insert(*binding);
             }
             // A match binding of an owned dynamic-array payload views storage that dies with the
-            // scrutinee's frame; mark it through the same storage-locality authority as `Let`.
-            let owns = self.f.locals.get(*binding as usize).is_some_and(|declared| {
-                self.dyn_storage_binding_is_local(declared.ty, scrutinee_region)
-            });
+            // scrutinee's frame; mark it through the same storage-locality authority as `Let`,
+            // reusing the scrutinee's already computed allocation provenance.
+            let owns = may_individual
+                && self.f.locals.get(*binding as usize).is_some_and(|declared| {
+                    ty_owns_dyn_array_storage(
+                        declared.ty,
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    )
+                });
             if owns {
                 self.state.local_backed_slice.insert(*binding);
             }

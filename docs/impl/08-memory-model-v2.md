@@ -748,13 +748,19 @@ Three shared authorities, each consumed by every store, return, and break path:
   outer-frame array sliced inside an arena keeps its declaration depth instead
   of inheriting the use-site arena.
 - Storage-locality authority — one recursive `owns dyn-array storage`
-  classifier drives local-backed marking at every binding form: `Let`,
-  `LetTuple`, match bindings, and `Assign` re-marking (whose
-  `local_mentions_slice` gate today excludes dyn arrays entirely). A binding
-  whose initializer region is `Region::Caller(_)` stays unmarked, keeping
-  caller-region-built arrays returnable. Aggregate locals (structs and tuples
-  owning dyn-array storage) are marked through the same classifier so
-  `Field`/`TupleIndex` projections resolve locality from the root local.
+  classifier (structs, tuples, sums, and `Option`/`Result`/tagged payloads)
+  drives local-backed marking at every binding form: `Let`, `LetTuple`, match
+  bindings, `Assign` re-marking (whose `local_mentions_slice` gate today
+  excludes dyn arrays entirely), and by-value parameters. The marking
+  exclusion is keyed on the storage's **allocation provenance**
+  (`drop_may_be_individual`), never on the folded value region: a mixed
+  aggregate holding a caller view plus a frame-owned array folds to a caller
+  region while its buffer is still individually freed at frame exit, and only
+  the drop side tracks that. A pure region allocation
+  (`array_builder(out).build()`) is bulk-freed by its region, stays unmarked,
+  and keeps caller-region-built arrays returnable. Aggregate locals are
+  marked through the same classifier so `Field`/`TupleIndex` projections
+  resolve locality from the root local.
 
 ### 15.2 Closure matrix
 
@@ -776,11 +782,15 @@ Three shared authorities, each consumed by every store, return, and break path:
 | caller-region built slice | slice of an `array_builder(out).build()` array returned to the caller | accepted | stays accepted (caller-region initializers stay unmarked at every binding form) | `return_provenance::dyn_storage_locality::caller_region_built_slice_stays_returnable` |
 | arena-sliced outer array | outer-frame array sliced and stored inside an `arena` block | accepted | stays accepted via wrapper-aware declaration depth | `return_provenance::dyn_storage_locality::outer_array_sliced_inside_arena_stays_valid` |
 | forwarding caps | f61d1299/7f5520a8 forwarding and fallback rejections | rejected | stay rejected through the shared authorities | existing `forwarded_owned_storage`, `forwarded_fixed_storage`, `imported_storage_fallback`, `indirect_storage_fallback` |
+| mixed-provenance aggregate | `Wrap { items: [..].to_array(), text: s.text }` under a `borrow mut` caller view: the value fold reports a caller region while the array buffer is individually freed at frame exit | accepted; runtime UAF (found by the implementation review) | key the marking exclusion on `drop_may_be_individual`, not the folded region | `return_provenance::dyn_storage_locality::mixed_provenance_aggregate_slice_rejected` plus the region-built aggregate control `region_built_aggregate_slice_stays_returnable` |
+| callable capture channel | a closure capturing a local-backed numeric slice, called indirectly | unreachable: a lambda value rejects non-scalar returns ("a lambda value supports only scalar parameters, and a scalar or `Result` return"), so no view of frame storage can exit through a fn value | none now; if lambdas ever gain view returns, propagate `local_backed_slice` through `callable_capture_region` before shipping | probe-verified rejection recorded here; the lambda-surface restriction is the guarding contract |
 
-Every changed comparison moves in the conservative direction (shorter incoming,
-longer target, wider marking), so a mistake surfaces as a new diagnostic on
-previously accepted code rather than a new silent acceptance; the two known
-false-positive risks (arena-sliced outer arrays, mixed-region aggregates) are
-pinned by the controls above or accepted as a diagnostic-side trade recorded
-here. The stale `ty_mentions_slice` comment claiming struct fields cannot be
+The store-path comparisons move in the conservative direction (shorter
+incoming, longer target), so a mistake there surfaces as a new diagnostic on
+previously accepted code. The marking exclusion is the one acceptance-direction
+gate, which is why it is keyed on allocation provenance rather than the
+imprecise value-region fold (see the mixed-provenance row). The known
+false-positive residual (arena-sliced outer arrays and tuple projections at
+exact storage edges) is pinned by the wrapper-aware declaration-depth controls
+above. The stale `ty_mentions_slice` comment claiming struct fields cannot be
 slices is corrected alongside.
