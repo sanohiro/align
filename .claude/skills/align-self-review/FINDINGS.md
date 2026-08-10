@@ -34,9 +34,9 @@ invented exact counts here.
 | `native-link-order-closure` | 3 | 1 | Promoted: preserve caller order around the dependency closure and test arbitrary prefix/suffix libraries. |
 | `producer-evidence-propagation` | 1 | 1 | Watch; exact producer-to-consumer evidence owner required. |
 | `public-surface-completeness` | 2 | 2 | Promoted: compare the complete exported surface to the ledger and require an internal/sealed boundary for cross-module helpers. |
-| `operation-matrix-completeness` | 3 | 2 | Three events: automation required. Add one parameterized dual-driver parity owner that runs the same descriptor/status/sentinel matrix through both drivers and asserts identical error-class mapping; also check native command tags (PostgreSQL answers `COMMIT` in an aborted transaction with `PGRES_COMMAND_OK` and a `ROLLBACK` tag). |
+| `operation-matrix-completeness` | 4 | 3 | Three-plus events: automation required. Add one parameterized dual-driver parity owner that runs the same descriptor/status/sentinel matrix through both drivers and asserts identical error-class mapping; also check native command tags (PostgreSQL answers `COMMIT` in an aborted transaction with `PGRES_COMMAND_OK` and a `ROLLBACK` tag). |
 | `error-contract-identity` | 1 | 1 | Watch; pin error class, query identity, and precedence. |
-| `source-of-truth-drift` | 1 | 1 | Watch; run ledger-to-prose and stale-obligation search. |
+| `source-of-truth-drift` | 3 | 2 | Three events: the mandatory ledger-to-diff extraction pass in `SKILL.md` is the owner — extract every `must`/`exact`/`every`/`before`/`reject`/`required` line from the touched design sections and point each at implementation or an explicit deferral. A lexical lint is not sound here because the drift is semantic (conflicting rules, stale scope wording), so the extraction pass is mandatory rather than automated. |
 | `owner-test-topology` | 1 | 1 | Watch; retain whole/per-unit owners when refactoring fixtures. |
 | `test-global-state-isolation` | 1 | 1 | Watch; prefer child-scoped environment and RAII restoration. |
 | `test-entry-abi-exactness` | 1 | 1 | Watch; compile fixtures through the real entry ABI. |

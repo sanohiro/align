@@ -822,21 +822,21 @@ fn counts(prepare: i32, steps: i32, delivered: i32, finalized: i32) -> bool = un
 
 fn error_code(error: pkg.db.Error) -> i32 {
   return match error {
-    Connection(_) => 31
-    Timeout(_) => 32
-    Cancelled(_) => 33
-    NotFound => 34
-    Cardinality(_) => 35
-    Constraint(_) => 36
-    Serialization(_) => 37
-    Deadlock(_) => 38
-    SchemaMismatch(_) => 39
-    DriverMismatch(_) => 40
-    Decode(_) => 41
-    Encode(_) => 42
-    InvalidQuery(_) => 43
-    Unsupported(_) => 44
-    Native(_) => 45
+    Connection(_) => 101
+    Timeout(_) => 102
+    Cancelled(_) => 103
+    NotFound => 104
+    Cardinality(_) => 105
+    Constraint(_) => 106
+    Serialization(_) => 107
+    Deadlock(_) => 108
+    SchemaMismatch(_) => 109
+    DriverMismatch(_) => 110
+    Decode(_) => 111
+    Encode(_) => 112
+    InvalidQuery(_) => 113
+    Unsupported(_) => 114
+    Native(_) => 115
   }
 }
 
