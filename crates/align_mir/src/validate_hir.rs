@@ -2042,6 +2042,19 @@ struct BodyContext {
     signed_min_magnitude: bool,
 }
 
+struct BatchPlanCall<'a> {
+    context: &'a BodyContext,
+    guard: Option<&'a hir::Expr>,
+    plan: &'a hir::Expr,
+    offset: u32,
+    args: &'a [hir::Expr],
+    param_tys: &'a [Ty],
+    param_modes: &'a [align_ast::ParamMode],
+    return_ty: Ty,
+    return_borrow: &'a hir::ReturnBorrowSummary,
+    return_region: &'a hir::ReturnRegionSummary,
+}
+
 #[derive(Clone, Copy)]
 struct LoopTarget {
     ty: Ty,
@@ -6255,18 +6268,18 @@ impl<'a> BodyValidator<'a> {
                     bits: 32,
                     signed: true,
                 });
-                let batch_signature_ok = self.batch_plan_call_signature_ok(
+                let batch_signature_ok = self.batch_plan_call_signature_ok(BatchPlanCall {
                     context,
-                    guard.as_deref(),
-                    ptr,
+                    guard: guard.as_deref(),
+                    plan: ptr,
                     offset,
                     args,
                     param_tys,
                     param_modes,
-                    expression.ty,
+                    return_ty: expression.ty,
                     return_borrow,
                     return_region,
-                );
+                });
                 if descriptor_kind.is_none()
                     && prepared_resource.is_none()
                     && rows_resource.is_none()
@@ -9714,19 +9727,19 @@ impl<'a> BodyValidator<'a> {
     /// the only HIR producer for `RawCall`; this exact signature/resource check and same-local
     /// structural guard keep the trusted package bridge closed while allowing that producer-owned
     /// pointer to cross generations.
-    fn batch_plan_call_signature_ok(
-        &self,
-        context: &BodyContext,
-        guard: Option<&hir::Expr>,
-        plan: &hir::Expr,
-        offset: u32,
-        args: &[hir::Expr],
-        param_tys: &[Ty],
-        param_modes: &[align_ast::ParamMode],
-        return_ty: Ty,
-        return_borrow: &hir::ReturnBorrowSummary,
-        return_region: &hir::ReturnRegionSummary,
-    ) -> bool {
+    fn batch_plan_call_signature_ok(&self, call: BatchPlanCall<'_>) -> bool {
+        let BatchPlanCall {
+            context,
+            guard,
+            plan,
+            offset,
+            args,
+            param_tys,
+            param_modes,
+            return_ty,
+            return_borrow,
+            return_region,
+        } = call;
         let hir::ExprKind::Local(plan) = plan.kind else {
             return false;
         };
