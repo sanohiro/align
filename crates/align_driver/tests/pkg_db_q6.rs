@@ -493,6 +493,54 @@ fn main() -> i32 {
         "retaining a slice of a borrowed owned array must preserve its storage root:\n{owned_storage_diagnostics}",
     );
 
+    let forwarding_storage = r#"State { values: slice<i64> }
+fn retain_slice(borrow mut state: State, borrow source: array<i64>) {
+  state.values = source[..]
+}
+fn forward(borrow mut state: State) {
+  source := [1, 2, 3].to_array()
+  retain_slice(state, source)
+}
+fn main() -> i32 {
+  mut state := State { values: [] }
+  forward(state)
+  values := state.values
+  return values.sum() as i32
+}
+"#;
+    let forwarding_storage_diagnostics =
+        check_diagnostics("pkg-db-q6-forwarded-owned-storage", forwarding_storage);
+    assert!(
+        forwarding_storage_diagnostics
+            .contains("cannot retain a shorter-lived view through this mutable borrow"),
+        "a forwarding helper must not retain its local owned-array storage in a caller destination:\n{forwarding_storage_diagnostics}",
+    );
+
+    let forwarding_fixed_storage = r#"State { values: slice<i64> }
+fn retain_slice(borrow mut state: State, source: slice<i64>) {
+  state.values = source
+}
+fn forward(borrow mut state: State) {
+  source := [1, 2, 3]
+  retain_slice(state, source[..])
+}
+fn main() -> i32 {
+  mut state := State { values: [] }
+  forward(state)
+  values := state.values
+  return values.sum() as i32
+}
+"#;
+    let forwarding_fixed_diagnostics = check_diagnostics(
+        "pkg-db-q6-forwarded-fixed-storage",
+        forwarding_fixed_storage,
+    );
+    assert!(
+        forwarding_fixed_diagnostics
+            .contains("cannot retain a shorter-lived view through this mutable borrow"),
+        "the contained-edge control must keep fixed-array lexical storage frame-bounded:\n{forwarding_fixed_diagnostics}",
+    );
+
     let contained_field = r#"Holder { text: str }
 State { text: str }
 fn retain_field(borrow mut state: State, borrow source: Holder) {

@@ -15762,6 +15762,37 @@ impl<'a> EscapeCheck<'a> {
         }
     }
 
+    /// Region of storage selected by an exact `storage(parameter)` retention edge. The value's
+    /// region still bounds arena-owned contents, while the caller place bounds free-standing and
+    /// inline storage that `region_of(Local)` otherwise classifies as `Static`.
+    fn retained_storage_region(&self, argument: &Expr, depth: u32) -> Region {
+        let value_region = self.region_of(argument, depth);
+        if self.borrowed_param_place(argument) {
+            return value_region;
+        }
+        let root = match argument.kind {
+            ExprKind::Local(local) => Some(local),
+            ExprKind::Field { root, .. } => Some(root),
+            _ => None,
+        };
+        let declaration_depth = root
+            .and_then(|root| self.decl_depth.get(&root).copied())
+            .unwrap_or(depth);
+        value_region.shorter(Region::Frame.shorter(Region::arena(declaration_depth)))
+    }
+
+    /// Contained provenance normally uses the value region directly. Numeric slices also carry a
+    /// separate local-storage bit because their element type has no region; fold that parallel fact
+    /// into the same lexical cap before a mutable destination can retain the slice.
+    fn retained_contained_region(&self, argument: &Expr, depth: u32) -> Region {
+        let value_region = self.region_of(argument, depth);
+        if self.slice_is_local(argument) {
+            value_region.shorter(self.retained_storage_region(argument, depth))
+        } else {
+            value_region
+        }
+    }
+
     fn apply_borrow_mut_calls(
         &mut self,
         args: &[Expr],
@@ -15789,10 +15820,19 @@ impl<'a> EscapeCheck<'a> {
                 let source_regions = sources
                     .iter()
                     .filter_map(|&source| {
-                        let source = source.index();
-                        let argument = args.get(source)?;
-                        self.region_bearing(argument.ty)
-                            .then(|| (source, self.region_of(argument, depth)))
+                        let index = source.index();
+                        let argument = args.get(index)?;
+                        self.region_bearing(argument.ty).then(|| {
+                            let region = match source {
+                                BorrowMutRetentionSource::Contained(_) => {
+                                    self.retained_contained_region(argument, depth)
+                                }
+                                BorrowMutRetentionSource::Storage(_) => {
+                                    self.retained_storage_region(argument, depth)
+                                }
+                            };
+                            (index, region)
+                        })
                     })
                     .collect::<Vec<_>>();
                 Some((destination, destination_region, source_regions))
