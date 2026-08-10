@@ -216,9 +216,10 @@ plain construction; it is not a user trait. Definitions nested inside functions,
 turbofish, runtime dictionaries/reflection, and new concrete container element capabilities remain
 absent.
 
-`soa<R>` is an additional symbolic template form only when `R: SoaPlain`; it substitutes to the
-ordinary concrete `soa<Struct>` before Move/escape analysis and MIR. No abstract SoA or runtime
-type test survives monomorphization.
+`soa<R>` is an additional symbolic template form only when `R: SoaPlain`. A public template
+interface preserves that canonical symbolic application and bound for separate compilation. Each
+instantiation substitutes the ordinary concrete `soa<Struct>` before Move/escape analysis and
+emitted HIR/MIR. No abstract SoA or runtime type test survives monomorphization.
 
 ```align
 fn id<T>(x: T) -> T = x                  // unconstrained: pass/return only

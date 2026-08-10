@@ -3698,9 +3698,10 @@ turbofish, nested declarations, or newly legal concrete container element catego
 `soa<R>` return without widening concrete SoA or adding DB-named compiler behavior. Add the closed
 structural `SoaPlain` bound, satisfied exactly by a nonempty struct of integer/float/`bool`/`char`/
 `str` fields. It grants only template formation of `soa<R>`; concrete substitution reuses the
-ordinary SoA admission rule before MoveCheck/EscapeCheck/HIR/MIR. There is no runtime dictionary,
-reflection, abstract HIR/MIR type, owned SoA language value, or fallback for Rows that do not
-satisfy the bound.
+ordinary SoA admission rule before MoveCheck/EscapeCheck/emitted HIR/MIR. Public template
+interfaces preserve the canonical symbolic `soa<Param(R)>` application and bound for separate
+compilation; emitted HIR/MIR does not. There is no runtime dictionary, reflection, abstract runtime
+type, owned SoA language value, or fallback for Rows that do not satisfy the bound.
 
 **Generics is closed — the shipped surface plus L7 and the A1 abstract-SoA boundary is the whole
 feature.** The minimal-generics goal is met: generic functions, builtin bounds

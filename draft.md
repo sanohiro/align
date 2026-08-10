@@ -732,9 +732,10 @@ function, and does not make a concrete container element legal when that contain
 rejects it.
 
 `soa<T>` may likewise remain symbolic only as `soa<R>` inside a template that declares
-`R: SoaPlain`. Concrete substitution must satisfy the ordinary `soa<T>` field rule and happens
-before Move/escape analysis and MIR; no abstract SoA or runtime type test survives
-monomorphization.
+`R: SoaPlain`. A public template interface preserves that canonical symbolic application and bound
+for separate compilation. Concrete substitution must satisfy the ordinary `soa<T>` field rule and
+happens before Move/escape analysis and emitted HIR/MIR; no abstract SoA or runtime type test
+survives monomorphization.
 
 After substitution, a struct field may be Copy or recursively Move when its finite, non-recursive
 Drop plan is known. Move fields participate in the aggregate's one-owner cleanup bit and allocation

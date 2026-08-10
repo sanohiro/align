@@ -300,6 +300,15 @@ applications of the existing generic/container types and adds one closed structu
 `RegionPlain` bound. Full substitution still precedes ownership/escape/MIR; there are no runtime
 dictionaries, user traits, reflection, or newly legal concrete element categories.
 
+**`SoaPlain` is a narrow layout proof, not a second generic paradigm.** D13 needs an ordinary
+package function to return `soa<R>` while its public template is still abstract. Reusing
+`RegionPlain` would be unsoundly broad because nullable and byte-view Rows are valid region values
+but not valid concrete SoA element shapes. A separate closed `SoaPlain` bound states exactly the
+existing nonempty primitive/`str` struct rule and grants only symbolic SoA formation; the template
+interface carries that symbol for separate compilation, then concrete substitution precedes emitted
+HIR/MIR. The batch remains the one Move owner and `soa<R>` remains the same borrowed view rooted in
+that resource generation. This adds neither an owned SoA value nor a DB-specific compiler API.
+
 **A named `region` is a destination capability, not an allocator abstraction.** Compound
 database reads and streaming decoders need ordinary library functions to construct caller-owned
 arrays and strings without falling back to hidden heap allocation. `arena out {}` exposes only
