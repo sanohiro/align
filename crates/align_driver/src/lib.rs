@@ -1676,6 +1676,19 @@ pub fn build_interface_summaries(
     }
     let hir = checked.program;
     let mir = lower_to_mir(&hir);
+    // Same loud-failure rule as the CLI walk: summaries and impl hashes derived from the
+    // fail-closed empty program would publish wrong cache identity silently.
+    if mir.fns.is_empty() && !hir.fns.is_empty() {
+        diags.error(
+            format!(
+                "internal error: program passed checking but failed HIR validation at the MIR \
+                 boundary; {} checked function(s) were not lowered — report this program shape",
+                hir.fns.len()
+            ),
+            align_span::Span::new(0, 0, 0),
+        );
+        return (Vec::new(), diags);
+    }
     let sources: std::collections::HashMap<String, String> = loaded
         .iter()
         .map(|l| (l.path.clone(), l.src.clone()))
@@ -1960,7 +1973,9 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
             // for a CHECKED unit that still has functions this is a compiler defect, and shipping
             // it silently produced an empty object (`_main` undefined at link) with exit 0.
             // Surface it as a loud internal error at the one walk every CLI verb shares.
-            if mir.fns.is_empty() && !program.fns.is_empty() {
+            if (mir.fns.is_empty() && !program.fns.is_empty())
+                || (mir.structs.is_empty() && !program.structs.is_empty())
+            {
                 diags.error(
                     format!(
                         "internal error: unit `{}` passed checking but failed HIR validation at \

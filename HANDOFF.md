@@ -53,7 +53,15 @@ including a build without this branch's validator change, both at CPU 0 for
 never completes. Its generators are integer-only Result chains, untouched by
 the owned-string validator work; triage the hang (likely a generated binary
 blocking) before relying on the nightly full-suite signal, which it will
-otherwise consume up to the job timeout.
+otherwise consume up to the job timeout (the nightly workflow skips it by name
+until then).
+
+Follow-up triage from the validator-alignment review: sema appears to admit a
+fixed array literal of owned `array<T>` elements (`reject_fixed_array_element`
+does not name plain `DynArray`) while the validator's Move-scalar arm rejects
+it. If reachable end-to-end, such a program now dies as the new loud internal
+error instead of a silent empty binary; probe it and align whichever side is
+wrong.
 
 Fixed on this branch (was present on `main` since the 62f48771 checked-HIR
 validation activation): the body validator contradicted sema on owned-`string`

@@ -15400,7 +15400,10 @@ fn main() -> i32 {
         );
 
         // Near-miss 2: a Move element other than `string` (a box) in an array literal must
-        // still fail — the relaxation admits only sema's owned-`string` exception.
+        // still fail — the relaxation admits only sema's owned-`string` exception. Retype the
+        // literal AND its element expressions consistently (a `HeapNew` producing the box), so
+        // the failure can only come from the element-admission rule, not a type mismatch.
+        let boxed = Ty::Box(Scalar::Int(IntTy { bits: 64, signed: true }));
         let mut boxed_element = hir.clone();
         let function = boxed_element
             .fns
@@ -15410,9 +15413,18 @@ fn main() -> i32 {
         let mut flipped = false;
         for statement in function.body.stmts.iter_mut() {
             if let hir::Stmt::Let { init, .. } = statement {
-                if let hir::ExprKind::ArrayLit { elem, .. } = &mut init.kind {
+                if let hir::ExprKind::ArrayLit { elems, elem, .. } = &mut init.kind {
                     if *elem == Ty::String {
-                        *elem = Ty::Box(Scalar::Int(IntTy { bits: 64, signed: true }));
+                        *elem = boxed;
+                        for element in elems.iter_mut() {
+                            let payload = hir::Expr {
+                                kind: hir::ExprKind::Int(1),
+                                ty: Ty::Int(IntTy { bits: 64, signed: true }),
+                                span: element.span,
+                            };
+                            element.kind = hir::ExprKind::HeapNew(Box::new(payload));
+                            element.ty = boxed;
+                        }
                         flipped = true;
                     }
                 }

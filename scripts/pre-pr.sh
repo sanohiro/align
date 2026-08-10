@@ -15,7 +15,7 @@ A code PR needs all of:
 
 The review log must contain, in this order:
   ALIGN_REVIEW_HEAD=<40-hex reviewed candidate SHA>
-  ALIGN_REVIEW_BASE=<40-hex merge-base SHA of --base>
+  ALIGN_REVIEW_BASE=<40-hex SHA of --base's TIP (git rev-parse origin/main), not the merge-base>
   ...free-form review record...
   ALIGN_REVIEW_VERDICT=CLEAN | ALIGN_REVIEW_VERDICT=FINDINGS   (last non-empty line)
 

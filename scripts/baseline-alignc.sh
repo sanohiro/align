@@ -22,8 +22,20 @@ if [[ -x "$binary" ]]; then
 fi
 
 worktree="$cache_dir/src"
-mkdir -p "$cache_dir"
+mkdir -p "$root/target/baseline"
+# One build per baseline at a time: mkdir is atomic, so a concurrent invocation
+# fails here instead of tearing down this invocation's live worktree.
+if ! mkdir "$cache_dir" 2>/dev/null; then
+  if [[ -x "$binary" ]]; then
+    echo "$binary"
+    exit 0
+  fi
+  echo "baseline build for $sha already in progress (or stale: rm -rf $cache_dir)" >&2
+  exit 1
+fi
 trap 'git -C "$root" worktree remove --force "$worktree" >/dev/null 2>&1 || true' EXIT
+# Clear orphaned worktree registrations left by an earlier interrupted build.
+git -C "$root" worktree prune >/dev/null 2>&1 || true
 git -C "$root" worktree add --detach "$worktree" "$sha" >/dev/null
 
 (cd "$worktree" && CARGO_TARGET_DIR="$cache_dir/target" scripts/cargo.sh build -p align_driver >&2)
