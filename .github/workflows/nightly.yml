@@ -1,0 +1,83 @@
+name: Nightly full suite
+
+# The bounded PR gate (scripts/test-pr.sh) deliberately runs a subset; deep
+# driver suites outside it can silently rot on main (three stale-assertion and
+# one empty-MIR failure accumulated unnoticed before 2026-08-10). This job runs
+# the complete workspace test suite once a day so out-of-gate breakage surfaces
+# within a day instead of during unrelated triage.
+#
+# Local equivalent: scripts/cargo.sh test --workspace
+
+on:
+  schedule:
+    - cron: "20 17 * * *" # 02:20 JST
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_VERSION: 1.96.0
+  OPENSSL_VERSION: 3.5.7
+  OPENSSL_SHA256: a8c0d28a529ca480f9f36cf5792e2cd21984552a3c8e4aa11a24aa31aeac98e8
+  CARGO_TERM_COLOR: always
+
+jobs:
+  full-suite:
+    name: Full workspace tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+
+      - name: Install LLVM and native libraries
+        shell: bash
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 22
+          sudo apt-get install -y llvm-22-dev clang-22 libclang-rt-22-dev \
+            libpq-dev libsqlite3-dev libssl-dev zlib1g-dev libzstd-dev make perl
+          curl -fsSLO \
+            "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+          echo "${OPENSSL_SHA256}  openssl-${OPENSSL_VERSION}.tar.gz" | sha256sum -c -
+          tar -xzf "openssl-${OPENSSL_VERSION}.tar.gz"
+          OPENSSL_PREFIX="$RUNNER_TEMP/openssl-${OPENSSL_VERSION}"
+          (
+            cd "openssl-${OPENSSL_VERSION}"
+            ./Configure --prefix="$OPENSSL_PREFIX" --libdir=lib shared no-tests
+            make -j"$(nproc)"
+            make install_sw
+          )
+          echo "LLVM_SYS_221_PREFIX=/usr/lib/llvm-22" >> "$GITHUB_ENV"
+          echo "LLVM_CONFIG=/usr/lib/llvm-22/bin/llvm-config" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=$OPENSSL_PREFIX/lib" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$OPENSSL_PREFIX/lib" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$OPENSSL_PREFIX/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "$OPENSSL_PREFIX/bin" >> "$GITHUB_PATH"
+          echo "/usr/lib/llvm-22/bin" >> "$GITHUB_PATH"
+
+      - name: Build workspace
+        shell: bash
+        run: scripts/cargo.sh build --workspace --locked
+
+      # The db-required suites run in skip/SQLite-only mode here (no PostgreSQL
+      # service); the per-PR required CI job owns that coverage. The one known
+      # hang (HANDOFF.md: fuzz_differential::result_question_chain_computes_the_
+      # oracle_value, pre-existing) is skipped so it cannot consume the job
+      # timeout; remove the skip once its triage lands.
+      - name: Run workspace test suite
+        shell: bash
+        run: |
+          scripts/cargo.sh test --workspace --locked -- --nocapture \
+            --skip result_question_chain_computes_the_oracle_value

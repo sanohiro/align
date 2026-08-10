@@ -3091,6 +3091,9 @@ impl<'a> BodyValidator<'a> {
             Ty::Struct(id) => self.program.structs.get(id as usize).is_some(),
             Ty::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
             Ty::Slice(_) => false,
+            // Sema's `reject_fixed_array_element` admits owned `string` as the one Move element
+            // form (`["a".clone()]`); every other Move shape stays rejected below.
+            Ty::String => true,
             Ty::Enum(id) => {
                 self.program.enums.get(id as usize).is_some()
                     && !align_sema::enum_is_move(
@@ -8282,7 +8285,13 @@ impl<'a> BodyValidator<'a> {
                 {
                     return None;
                 }
-                let leaf = self.field_path_ty(Some(Ty::Struct(*struct_id)), path)?;
+                let mut leaf = self.field_path_ty(Some(Ty::Struct(*struct_id)), path)?;
+                // Sema reads an owned `string` field of a struct-array element as a borrowed
+                // `str` view (Slice 4b); mirror the demotion the element-field *store* rule
+                // already applies, so the derived type matches the checked expression type.
+                if leaf == Ty::String {
+                    leaf = Ty::Str;
+                }
                 if !self.ty_copy_ok(leaf, context) {
                     return None;
                 }

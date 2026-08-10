@@ -1435,6 +1435,15 @@ pub fn lower_to_mir_with_static_descriptors(
     project_root: &std::path::Path,
 ) -> Result<align_mir::Program, String> {
     let mut mir = lower_to_mir(&checked.hir);
+    // Same loud-failure rule as the per-unit walk: a checked program with functions must never
+    // lower to the fail-closed empty program.
+    if mir.fns.is_empty() && !checked.hir.fns.is_empty() {
+        return Err(format!(
+            "internal error: program passed checking but failed HIR validation at the MIR \
+             boundary; {} checked function(s) were not lowered — report this program shape",
+            checked.hir.fns.len()
+        ));
+    }
     if checked.static_descriptors.is_empty() {
         return Ok(mir);
     }
@@ -1667,6 +1676,19 @@ pub fn build_interface_summaries(
     }
     let hir = checked.program;
     let mir = lower_to_mir(&hir);
+    // Same loud-failure rule as the CLI walk: summaries and impl hashes derived from the
+    // fail-closed empty program would publish wrong cache identity silently.
+    if mir.fns.is_empty() && !hir.fns.is_empty() {
+        diags.error(
+            format!(
+                "internal error: program passed checking but failed HIR validation at the MIR \
+                 boundary; {} checked function(s) were not lowered — report this program shape",
+                hir.fns.len()
+            ),
+            align_span::Span::new(0, 0, 0),
+        );
+        return (Vec::new(), diags);
+    }
     let sources: std::collections::HashMap<String, String> = loaded
         .iter()
         .map(|l| (l.path.clone(), l.src.clone()))
@@ -1947,6 +1969,25 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
             } else {
                 lower_to_mir_per_unit(&program)
             };
+            // MIR lowering fails closed on validator-rejected HIR by returning an empty program;
+            // for a CHECKED unit that still has functions this is a compiler defect, and shipping
+            // it silently produced an empty object (`_main` undefined at link) with exit 0.
+            // Surface it as a loud internal error at the one walk every CLI verb shares.
+            if (mir.fns.is_empty() && !program.fns.is_empty())
+                || (mir.structs.is_empty() && !program.structs.is_empty())
+            {
+                diags.error(
+                    format!(
+                        "internal error: unit `{}` passed checking but failed HIR validation at \
+                         the MIR boundary; {} checked function(s) were not lowered — report this \
+                         program shape",
+                        u.path,
+                        program.fns.len()
+                    ),
+                    align_span::Span::new(0, 0, 0),
+                );
+                continue;
+            }
             let sources: HashMap<String, String> = HashMap::from([(u.path.clone(), u.src.clone())]);
             let mut built = align_interface::build_summaries_with_effects(
                 &unit_module,
@@ -3618,6 +3659,21 @@ pub fn format_diagnostics(source_map: &SourceMap, diags: &Diagnostics) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_descriptor_set_installs_no_static_callback_imports() {
+        // #731 regression owner: a unit with no static descriptors must not receive the
+        // pkg.db.internal callback import set (pre-fix, every no-db unit's IR grew the full
+        // extern family and broke CLI/library emit-llvm parity).
+        let mut mir = align_mir::Program::default();
+        install_static_descriptor_data(&mut mir, None, &[], &[]).expect("empty install");
+        assert!(
+            mir.imported_fns.is_empty(),
+            "no-descriptor install must leave imported_fns untouched: {:?}",
+            mir.imported_fns.iter().map(|f| &f.name).collect::<Vec<_>>(),
+        );
+        assert!(mir.fns.is_empty(), "no-descriptor install must add no functions");
+    }
 
     #[test]
     fn descriptor_rows_resource_names_cover_whole_and_reconstructed_nominals() {

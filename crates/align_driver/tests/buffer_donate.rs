@@ -7,7 +7,7 @@
 //!
 //! - fires on the positive shape (a fresh owned scalar source: a `-> array<T>` call, a nested
 //!   materializing terminal outside an arena) — the output storage is `slice_ptr(source)` with NO
-//!   fresh `heap_alloc` and NO source `drop_value`;
+//!   fresh `heap_alloc` and NO source drop (the dynamic-bit `drop _n` form);
 //! - does NOT fire on the negatives — a borrowed named source, an arena collect, a `chunks`
 //!   (`slice` element) source, a `str` element, or a mismatched element layout (`i64 -> i32`) all
 //!   keep the allocate-then-copy-then-free shape;
@@ -55,8 +55,8 @@ fn donation_fires_on_fresh_owned_map() {
         "donation must NOT allocate a fresh output buffer:\n{body}"
     );
     assert!(
-        !body.contains("drop_value"),
-        "donation transfers ownership to the result — no source drop_value:\n{body}"
+        !body.contains("drop _"),
+        "donation transfers ownership to the result — no source drop:\n{body}"
     );
 }
 
@@ -68,7 +68,7 @@ fn donation_fires_on_fresh_owned_where() {
     let body = fn_f_body(&mir_of("donate_where", src));
     assert!(body.contains("slice_ptr("), "where must donate:\n{body}");
     assert!(!body.contains("heap_alloc"), "where donation must not allocate:\n{body}");
-    assert!(!body.contains("drop_value"), "where donation must not drop the source:\n{body}");
+    assert!(!body.contains("drop _"), "where donation must not drop the source:\n{body}");
 }
 
 #[test]
@@ -101,7 +101,8 @@ fn no_donation_for_mismatched_layout() {
     let body = fn_f_body(&mir_of("mismatch", src));
     assert!(!body.contains("slice_ptr("), "a size mismatch must NOT donate:\n{body}");
     assert!(body.contains("heap_alloc"), "a size mismatch allocates fresh:\n{body}");
-    assert!(body.contains("drop_value"), "a size mismatch still frees the source:\n{body}");
+    // Cleanup lowers through the dynamic-bit `drop _n` form (not the old `drop_value`).
+    assert!(body.contains("drop _"), "a size mismatch still frees the source:\n{body}");
 }
 
 #[test]
@@ -147,7 +148,7 @@ fn toggle_off_reverts_to_allocate_and_free() {
     let body = fn_f_body(&String::from_utf8_lossy(&out.stdout));
     assert!(!body.contains("slice_ptr("), "toggle off must NOT donate:\n{body}");
     assert!(body.contains("heap_alloc"), "toggle off allocates fresh:\n{body}");
-    assert!(body.contains("drop_value"), "toggle off frees the source:\n{body}");
+    assert!(body.contains("drop _"), "toggle off frees the source:\n{body}");
 }
 
 // ── Differential execution: donation-on vs donation-off compute identical results ────────────────
