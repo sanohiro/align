@@ -7209,6 +7209,22 @@ fn hir_body_validator_storage_vector_array() {
             Ty::Struct(0),
         )
     };
+    let move_struct = 1;
+    let move_record = || {
+        body_test_expr(
+            hir::ExprKind::StructLit {
+                struct_id: move_struct,
+                fields: vec![body_test_expr(
+                    hir::ExprKind::StrClone(Box::new(body_test_expr(
+                        hir::ExprKind::Str("owned".to_string()),
+                        Ty::Str,
+                    ))),
+                    Ty::String,
+                )],
+            },
+            Ty::Struct(move_struct),
+        )
+    };
     let array_i64 = |values: &[i128]| {
         body_test_expr(
             hir::ExprKind::ArrayLit {
@@ -7223,6 +7239,16 @@ fn hir_body_validator_storage_vector_array() {
         )
     };
     let mut program = baseline_program();
+    program.structs.push(StructDef {
+        name: "MoveRecord".to_string(),
+        source_name: "MoveRecord".to_string(),
+        fields: vec![FieldDef {
+            name: "owned".to_string(),
+            ty: Ty::String,
+        }],
+        align: None,
+        c_repr: false,
+    });
     program.fns.extend([
         body_unit_case("array_literal_case", array_i64(&[1, 2])),
         body_unit_case(
@@ -7234,6 +7260,17 @@ fn hir_body_validator_storage_vector_array() {
                     pooled: false,
                 },
                 Ty::StructArray(0, 2),
+            ),
+        ),
+        body_unit_case(
+            "move_struct_array_literal_case",
+            body_test_expr(
+                hir::ExprKind::ArrayLit {
+                    elems: vec![move_record()],
+                    elem: Ty::Struct(move_struct),
+                    pooled: false,
+                },
+                Ty::StructArray(move_struct, 1),
             ),
         ),
         body_unit_case(
@@ -7401,6 +7438,118 @@ fn hir_body_validator_storage_vector_array() {
     ));
 
     assert!(body_core_metadata_is_valid(&program));
+
+    // Sema admits a Move struct only when every element is a direct struct literal, which lets MIR
+    // construct owned fields in their final slots. A typed wrapper around the same value would
+    // require a whole-value move/null path, so handcrafted HIR must not widen that contract.
+    let mut wrapped_move_struct = program.clone();
+    let expression = body_statement_expression_mut(
+        &mut wrapped_move_struct,
+        "move_struct_array_literal_case",
+    );
+    let mut wrapped = false;
+    if let hir::ExprKind::ArrayLit { elems, .. } = &mut expression.kind
+        && let Some(direct) = elems.pop()
+    {
+        elems.push(body_test_expr(
+            hir::ExprKind::Block(hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(direct)),
+            }),
+            Ty::Struct(move_struct),
+        ));
+        wrapped = true;
+    }
+    assert!(wrapped, "Move-struct fixture must contain one array element");
+    assert!(
+        !body_core_metadata_is_valid(&wrapped_move_struct),
+        "a wrapped Move-struct fixed-array element must fail before MIR lowering",
+    );
+
+    // No scalar Move value has a fixed-array element Drop path. This handcrafted HIR keeps the
+    // validator-side string rejection independent from sema, whose source gate rejects it first.
+    let owned_string = || {
+        body_test_expr(
+            hir::ExprKind::StrClone(Box::new(body_test_expr(
+                hir::ExprKind::Str("owned".to_string()),
+                Ty::Str,
+            ))),
+            Ty::String,
+        )
+    };
+    let mut owned_string_program = program.clone();
+    owned_string_program.fns.push(body_unit_case(
+        "owned_string_array_rejected",
+        body_test_expr(
+            hir::ExprKind::ArrayLit {
+                elems: vec![owned_string()],
+                elem: Ty::String,
+                pooled: false,
+            },
+            Ty::Array(Scalar::String, 1),
+        ),
+    ));
+    assert!(
+        !body_core_metadata_is_valid(&owned_string_program),
+        "an owned-string fixed array must fail closed at the HIR boundary",
+    );
+
+    // Resource owners and checked refs are excluded from fixed arrays recursively. Keep this
+    // validator-side negative independent from sema so handcrafted HIR cannot bypass the source
+    // admission rule and copy one generation-bearing value into multiple element slots.
+    let mut resource_program = baseline_program();
+    resource_program.resources.push(ResourceDef {
+        name: "pkg.test$owner".to_string(),
+        source_name: "pkg.test$owner".to_string(),
+        declaring_module: "pkg.test".to_string(),
+        generic_arity: 0,
+        drop_hook: "pkg.test$drop_owner".to_string(),
+        drop_thunk: "__align_resource_drop$pkg.test$owner".to_string(),
+        representation_version: 1,
+        drop_abi_fingerprint: *b"align-res-drop-1",
+    });
+    let reference = Ty::ResourceRef(0);
+    resource_program.fns.push(body_test_parameter_function(
+        "resource_ref_control",
+        reference,
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit))),
+        },
+        Ty::Unit,
+    ));
+    assert!(
+        body_core_metadata_is_valid(&resource_program),
+        "a standalone resource_ref parameter must remain producer-valid",
+    );
+    let locals = vec![
+        body_test_local(0, "first", reference, false, true),
+        body_test_local(1, "second", reference, false, true),
+    ];
+    resource_program.fns.push(body_test_function_with_params(
+        "resource_ref_array_rejected",
+        locals,
+        vec![0, 1],
+        hir::Block {
+            stmts: vec![hir::Stmt::Expr(body_test_expr(
+                hir::ExprKind::ArrayLit {
+                    elems: vec![
+                        body_test_expr(hir::ExprKind::Local(0), reference),
+                        body_test_expr(hir::ExprKind::Local(1), reference),
+                    ],
+                    elem: reference,
+                    pooled: false,
+                },
+                Ty::Array(Scalar::ResourceRef(0), 2),
+            ))],
+            value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit))),
+        },
+        Ty::Unit,
+    ));
+    assert!(
+        !body_core_metadata_is_valid(&resource_program),
+        "a resource_ref fixed array must fail closed at the HIR boundary",
+    );
 
     let mut reject = program.clone();
     match &mut body_statement_expression_mut(&mut reject, "array_literal_case").kind {
