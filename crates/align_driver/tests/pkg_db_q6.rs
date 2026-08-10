@@ -541,6 +541,56 @@ fn main() -> i32 {
         "the contained-edge control must keep fixed-array lexical storage frame-bounded:\n{forwarding_fixed_diagnostics}",
     );
 
+    let imported_storage_fallback = [
+        (
+            "shaper.align",
+            "module shaper\npub State { values: slice<i64> }\npub fn ignore(borrow mut state: State, borrow source: array<i64>) {}\n",
+        ),
+        (
+            "main.align",
+            "module main\nimport shaper\nfn forward(borrow mut state: shaper.State) { source := [1, 2, 3].to_array(); shaper.ignore(state, source) }\nfn main() -> i32 { mut state := shaper.State { values: [] }; forward(state); values := state.values; return values.sum() as i32 }\n",
+        ),
+    ];
+    let imported_storage_checked = diff_check_multi(
+        "pkg-db-q6-imported-storage-fallback",
+        &imported_storage_fallback,
+        "main.align",
+    );
+    assert!(
+        !imported_storage_checked.whole_errors
+            && imported_storage_checked
+                .per_unit_diags
+                .contains("cannot retain a shorter-lived view through this mutable borrow"),
+        "an interface-only call must conservatively retain owned argument storage:\nwhole={}\nper-unit={}",
+        imported_storage_checked.whole_diags,
+        imported_storage_checked.per_unit_diags,
+    );
+
+    let indirect_storage_fallback = r#"State { values: slice<i64> }
+fn ignore(borrow mut state: State, borrow source: array<i64>) {
+}
+fn forward(borrow mut state: State) {
+  source := [1, 2, 3].to_array()
+  apply := ignore
+  apply(state, source)
+}
+fn main() -> i32 {
+  mut state := State { values: [] }
+  forward(state)
+  values := state.values
+  return values.sum() as i32
+}
+"#;
+    let indirect_storage_diagnostics = check_diagnostics(
+        "pkg-db-q6-indirect-storage-fallback",
+        indirect_storage_fallback,
+    );
+    assert!(
+        indirect_storage_diagnostics
+            .contains("cannot retain a shorter-lived view through this mutable borrow"),
+        "an indirect call must conservatively retain owned argument storage:\n{indirect_storage_diagnostics}",
+    );
+
     let contained_field = r#"Holder { text: str }
 State { text: str }
 fn retain_field(borrow mut state: State, borrow source: Holder) {

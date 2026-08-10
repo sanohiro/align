@@ -15904,12 +15904,7 @@ impl<'a> EscapeCheck<'a> {
             if !self.region_bearing(destination.ty) {
                 continue;
             }
-            let sources = exact_borrow_mut_source_indices(summary, index, args.len())
-                .unwrap_or_else(|| {
-                    (0..args.len())
-                        .map(BorrowMutRetentionSource::Contained)
-                        .collect()
-                });
+            let sources = borrow_mut_source_indices(summary, index, args.len());
             destinations.push((index, sources));
         }
         if !destinations.is_empty() {
@@ -17450,6 +17445,27 @@ fn exact_borrow_mut_source_indices(
         .collect()
 }
 
+/// Select one complete typed source set for every mutable-retention consumer. An unavailable or
+/// malformed summary must conservatively expose both the value contained by each argument and
+/// storage reachable by borrowing that argument; selecting only one edge kind is fail-open for
+/// either aggregate projections or owned-array storage.
+fn borrow_mut_source_indices(
+    summary: Option<&BorrowMutRetentionSummary>,
+    destination: usize,
+    argument_count: usize,
+) -> Vec<BorrowMutRetentionSource> {
+    exact_borrow_mut_source_indices(summary, destination, argument_count).unwrap_or_else(|| {
+        (0..argument_count)
+            .flat_map(|index| {
+                [
+                    BorrowMutRetentionSource::Contained(index),
+                    BorrowMutRetentionSource::Storage(index),
+                ]
+            })
+            .collect()
+    })
+}
+
 struct MoveCheckResult {
     return_roots: BorrowRoots,
     borrow_mut_retention: BorrowMutRetentionSummary,
@@ -18081,7 +18097,7 @@ impl<'a> MoveCheck<'a> {
                 Some((
                     index,
                     self.borrow_mut_invalidation_roots(argument),
-                    exact_borrow_mut_source_indices(summary, index, args.len()),
+                    borrow_mut_source_indices(summary, index, args.len()),
                 ))
             })
             .collect::<Vec<_>>();
@@ -18094,13 +18110,13 @@ impl<'a> MoveCheck<'a> {
         for (_, roots, _) in &destinations {
             self.borrows.invalidate_roots(roots, BorrowEnd::Consumed);
         }
-        for (index, _, exact_sources) in destinations {
+        for (index, _, sources) in destinations {
             if let Some(argument) = args.get(index) {
                 self.refresh_borrow_mut_call(
                     argument,
                     &contained_argument_facts,
                     &storage_argument_facts,
-                    exact_sources.as_deref(),
+                    &sources,
                 );
             }
         }
@@ -18115,7 +18131,7 @@ impl<'a> MoveCheck<'a> {
         argument: &Expr,
         contained_argument_facts: &[BorrowFact],
         storage_argument_facts: &[BorrowFact],
-        exact_sources: Option<&[BorrowMutRetentionSource]>,
+        sources: &[BorrowMutRetentionSource],
     ) {
         self.refresh_borrow_mut_place(argument);
         if !ty_may_borrow(
@@ -18160,19 +18176,9 @@ impl<'a> MoveCheck<'a> {
             incoming = incoming.join(source_fact);
             true
         };
-        if let Some(sources) = exact_sources {
-            for &source in sources {
-                if !join_source(source) {
-                    break;
-                }
-            }
-        } else {
-            for index in 0..contained_argument_facts.len() {
-                if !join_source(BorrowMutRetentionSource::Contained(index))
-                    || !join_source(BorrowMutRetentionSource::Storage(index))
-                {
-                    break;
-                }
+        for &source in sources {
+            if !join_source(source) {
+                break;
             }
         }
         if path.is_empty() {
@@ -45808,6 +45814,24 @@ fn main() -> i32 = 0
         );
         assert_eq!(exact_borrow_mut_source_indices(Some(&valid), 1, 2), None);
         assert_eq!(exact_borrow_mut_source_indices(None, 0, 2), None);
+
+        assert_eq!(
+            borrow_mut_source_indices(Some(&valid), 0, 2),
+            vec![BorrowMutRetentionSource::Contained(1)],
+            "a valid exact summary must not be widened",
+        );
+        let conservative = vec![
+            BorrowMutRetentionSource::Contained(0),
+            BorrowMutRetentionSource::Storage(0),
+            BorrowMutRetentionSource::Contained(1),
+            BorrowMutRetentionSource::Storage(1),
+        ];
+        assert_eq!(borrow_mut_source_indices(None, 0, 2), conservative);
+        assert_eq!(
+            borrow_mut_source_indices(Some(&out_of_range), 0, 2),
+            conservative,
+            "a malformed exact summary must supply both conservative edge kinds",
+        );
     }
 
     #[test]
