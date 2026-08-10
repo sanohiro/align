@@ -1559,6 +1559,40 @@ fn build_module<'c>(
 /// Recheck package-resource operations at the cached/hand-built MIR boundary. HIR validation
 /// proves these facts for normal lowering, but resource ids and safety discriminators live directly
 /// on MIR nodes and must fail closed before LLVM construction if an external producer corrupts them.
+fn db_resource_matches_row(
+    program: &Program,
+    resource: u32,
+    struct_id: u32,
+    kind: &str,
+) -> bool {
+    let Some(row) = program.structs.get(struct_id as usize) else {
+        return false;
+    };
+    let direct = format!("pkg.db${kind}$S{}_{}", row.name.len(), row.name);
+    let reconstructed_row = row
+        .name
+        .chars()
+        .map(|character| match character {
+            '.' | '$' => '_',
+            other => other,
+        })
+        .collect::<String>();
+    let reconstructed = format!(
+        "pkg.db${kind}$S{}_{}",
+        reconstructed_row.len(),
+        reconstructed_row
+    );
+    program.resources.get(resource as usize).is_some_and(|definition| {
+        definition.declaring_module == "pkg.db"
+            && definition.generic_arity == 1
+            && matches!(
+                definition.name.as_str(),
+                name if name == direct || name == reconstructed
+            )
+            && definition.source_name == definition.name
+    })
+}
+
 fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
     fn operand_ty(function: &align_mir::Function, operand: &align_mir::Operand) -> Option<Ty> {
         Some(match operand {
@@ -1626,34 +1660,6 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                     })
                 })
                 .collect::<Option<Vec<_>>>()
-        })
-    };
-    let batch_resource = |resource: u32, struct_id: u32| {
-        let Some(row) = program.structs.get(struct_id as usize) else {
-            return false;
-        };
-        let direct = format!("pkg.db$batch$S{}_{}", row.name.len(), row.name);
-        let reconstructed_row = row
-            .name
-            .chars()
-            .map(|character| match character {
-                '.' | '$' => '_',
-                other => other,
-            })
-            .collect::<String>();
-        let reconstructed = format!(
-            "pkg.db$batch$S{}_{}",
-            reconstructed_row.len(),
-            reconstructed_row
-        );
-        program.resources.get(resource as usize).is_some_and(|definition| {
-            definition.declaring_module == "pkg.db"
-                && definition.generic_arity == 1
-                && matches!(
-                    definition.name.as_str(),
-                    name if name == direct || name == reconstructed
-                )
-                && definition.source_name == definition.name
         })
     };
     for function in &program.fns {
@@ -1806,7 +1812,7 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                         resource,
                     } => {
                         batch_fields(*struct_id).is_some()
-                            && batch_resource(*resource, *struct_id)
+                            && db_resource_matches_row(program, *resource, *struct_id, "batch")
                             && operand_ty(function, payload) == Some(Ty::Raw)
                             && operand_ty(function, owner)
                                 == Some(Ty::ResourceRef(*resource))
@@ -1832,7 +1838,7 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                                     )
                                 })
                         })
-                            && batch_resource(*resource, *struct_id)
+                            && db_resource_matches_row(program, *resource, *struct_id, "batch")
                             && operand_ty(function, payload) == Some(Ty::Raw)
                             && operand_ty(function, owner)
                                 == Some(Ty::ResourceRef(*resource))
@@ -4309,6 +4315,7 @@ fn callable_preflight(
                         validate_static_data_record(
                             function.value_tys.get(*value as usize).copied(),
                             data,
+                            program,
                             &declarations,
                         )?;
                     }
@@ -4382,9 +4389,254 @@ fn callable_preflight(
     })
 }
 
+fn static_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let value: [u8; 4] = bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
+    Some(u32::from_le_bytes(value))
+}
+
+fn static_i64(bytes: &[u8], offset: usize) -> Option<i64> {
+    let value: [u8; 8] = bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?;
+    Some(i64::from_le_bytes(value))
+}
+
+fn static_plan_callback<'a>(
+    plan: &'a StaticData,
+    offset: u32,
+    declarations: &'a HashMap<ProgramCall, ProgramDeclaration>,
+) -> Result<&'a ProgramDeclaration, CodegenError> {
+    let malformed = |detail: &str| {
+        CodegenError::Lowering(format!("static-data batch plan is malformed: {detail}"))
+    };
+    let relocation = plan
+        .relocations
+        .iter()
+        .find(|relocation| relocation.offset == offset)
+        .ok_or_else(|| malformed("callback ordinal is absent"))?;
+    let StaticDataTarget::Function(target) = &relocation.target else {
+        return Err(malformed("callback target is not a function"));
+    };
+    let declaration = declarations
+        .get(target)
+        .ok_or_else(|| callable_target_error(target))?;
+    if !declaration.classes.contains(&ProgramDeclarationClass::Stored)
+        || declaration.classes.contains(&ProgramDeclarationClass::Extern)
+    {
+        return Err(malformed("callback is not a stored program declaration"));
+    }
+    Ok(declaration)
+}
+
+fn static_plan_signature_matches(
+    declaration: &ProgramDeclaration,
+    params: Vec<Ty>,
+    ret: Ty,
+    borrow: hir::ReturnBorrowSummary,
+    region: hir::ReturnRegionSummary,
+) -> bool {
+    declaration.signature
+        == (ProgramSignature {
+            modes: vec![align_ast::ParamMode::ByValue; params.len()],
+            params,
+            ret,
+            borrow,
+            region,
+            cleanup: hir::ReturnCleanupAbi::None,
+        })
+}
+
+fn validate_batch_plan_record(
+    plan: &StaticData,
+    program: &Program,
+    declarations: &HashMap<ProgramCall, ProgramDeclaration>,
+) -> Result<(), CodegenError> {
+    let malformed = |detail: &str| {
+        CodegenError::Lowering(format!("static-data batch plan is malformed: {detail}"))
+    };
+    if plan.bytes.len() != 72 || plan.align != 8 {
+        return Err(malformed("record size or alignment is invalid"));
+    }
+    let Some(version) = static_u32(&plan.bytes, 0) else {
+        return Err(malformed("version is absent"));
+    };
+    let Some(flags) = plan.bytes.get(4).copied() else {
+        return Err(malformed("flags are absent"));
+    };
+    let Some(field_count) = static_u32(&plan.bytes, 8) else {
+        return Err(malformed("field count is absent"));
+    };
+    if version != 1
+        || flags & !1 != 0
+        || plan.bytes.get(5..8) != Some(&[0, 0, 0])
+        || static_u32(&plan.bytes, 12) != Some(0)
+        || static_i64(&plan.bytes, 64) != Some(0)
+    {
+        return Err(malformed("header scalar or reserved field is invalid"));
+    }
+    let soa = flags & 1 != 0;
+    if soa && field_count == 0 {
+        return Err(malformed("zero-field plan advertises SoA"));
+    }
+    let mut expected_offsets = vec![16, 24, 32, 40, 56];
+    if soa {
+        expected_offsets.push(48);
+    }
+    expected_offsets.sort_unstable();
+    let mut actual_offsets = plan
+        .relocations
+        .iter()
+        .map(|relocation| relocation.offset)
+        .collect::<Vec<_>>();
+    actual_offsets.sort_unstable();
+    if actual_offsets != expected_offsets {
+        return Err(malformed("callback ordinal set is invalid"));
+    }
+
+    let i32_ty = Ty::Int(IntTy {
+        bits: 32,
+        signed: true,
+    });
+    let i64_ty = Ty::Int(IntTy {
+        bits: 64,
+        signed: true,
+    });
+    let none_borrow = hir::ReturnBorrowSummary::None;
+    let none_region = hir::ReturnRegionSummary::None;
+    let create = static_plan_callback(plan, 16, declarations)?;
+    if !static_plan_signature_matches(
+        create,
+        vec![i64_ty],
+        Ty::Raw,
+        none_borrow.clone(),
+        none_region.clone(),
+    ) {
+        return Err(malformed("create callback signature is invalid"));
+    }
+    let finish = static_plan_callback(plan, 32, declarations)?;
+    if !static_plan_signature_matches(
+        finish,
+        vec![Ty::Raw, i64_ty],
+        Ty::Unit,
+        none_borrow.clone(),
+        none_region.clone(),
+    ) {
+        return Err(malformed("finish callback signature is invalid"));
+    }
+    let drop_payload = static_plan_callback(plan, 56, declarations)?;
+    if !static_plan_signature_matches(
+        drop_payload,
+        vec![Ty::Raw],
+        Ty::Unit,
+        none_borrow.clone(),
+        none_region.clone(),
+    ) {
+        return Err(malformed("drop callback signature is invalid"));
+    }
+
+    let row = static_plan_callback(plan, 40, declarations)?;
+    let Some(Ty::ResourceRef(batch_resource)) = row.signature.params.get(1).copied() else {
+        return Err(malformed("row callback batch resource is invalid"));
+    };
+    let Ty::Struct(row_struct) = row.signature.ret else {
+        return Err(malformed("row callback result is not a struct"));
+    };
+    if !db_resource_matches_row(program, batch_resource, row_struct, "batch") {
+        return Err(malformed("row callback batch resource does not match its Row"));
+    }
+    let row_borrows = align_sema::ty_may_borrow(
+        Ty::Struct(row_struct),
+        &program.structs,
+        &program.tuples,
+        &program.enums,
+        &program.tagged_types,
+    );
+    let row_borrow = if row_borrows {
+        hir::ReturnBorrowSummary::Roots {
+            params: vec![1],
+            captures: Vec::new(),
+        }
+    } else {
+        none_borrow.clone()
+    };
+    let row_region = if row_borrows {
+        hir::ReturnRegionSummary::Roots {
+            params: vec![1],
+            captures: Vec::new(),
+        }
+    } else {
+        none_region.clone()
+    };
+    if !static_plan_signature_matches(
+        row,
+        vec![Ty::Raw, Ty::ResourceRef(batch_resource), i64_ty],
+        Ty::Struct(row_struct),
+        row_borrow,
+        row_region,
+    ) {
+        return Err(malformed("row callback signature is invalid"));
+    }
+    let Some(row_definition) = program.structs.get(row_struct as usize) else {
+        return Err(malformed("row callback struct is absent"));
+    };
+    let Some(exact_field_count) = u32::try_from(row_definition.fields.len()).ok() else {
+        return Err(malformed("row field count exceeds u32"));
+    };
+    if field_count != exact_field_count {
+        return Err(malformed("field count does not match the Row"));
+    }
+    let soa_plain = !row_definition.fields.is_empty()
+        && row_definition.fields.iter().all(|field| {
+            matches!(
+                field.ty,
+                Ty::Bool | Ty::Char | Ty::Int(_) | Ty::Float(_) | Ty::Str
+            )
+        });
+    if soa != soa_plain {
+        return Err(malformed("SoA flag does not match the Row"));
+    }
+
+    let append = static_plan_callback(plan, 24, declarations)?;
+    let Some(Ty::ResourceRef(rows_resource)) = append.signature.params.get(2).copied() else {
+        return Err(malformed("append callback rows resource is invalid"));
+    };
+    if !db_resource_matches_row(program, rows_resource, row_struct, "rows")
+        || !static_plan_signature_matches(
+            append,
+            vec![Ty::Raw, Ty::Raw, Ty::ResourceRef(rows_resource)],
+            i32_ty,
+            none_borrow.clone(),
+            none_region.clone(),
+        )
+    {
+        return Err(malformed("append callback signature is invalid"));
+    }
+
+    if soa {
+        let soa_callback = static_plan_callback(plan, 48, declarations)?;
+        let roots_borrow = hir::ReturnBorrowSummary::Roots {
+            params: vec![1],
+            captures: Vec::new(),
+        };
+        let roots_region = hir::ReturnRegionSummary::Roots {
+            params: vec![1],
+            captures: Vec::new(),
+        };
+        if !static_plan_signature_matches(
+            soa_callback,
+            vec![Ty::Raw, Ty::ResourceRef(batch_resource)],
+            Ty::Soa(row_struct),
+            roots_borrow,
+            roots_region,
+        ) {
+            return Err(malformed("SoA callback signature is invalid"));
+        }
+    }
+    Ok(())
+}
+
 fn validate_static_data_record(
     result: Option<Ty>,
     data: &StaticData,
+    program: &Program,
     declarations: &HashMap<ProgramCall, ProgramDeclaration>,
 ) -> Result<(), CodegenError> {
     let malformed = |detail: &str| {
@@ -4407,7 +4659,7 @@ fn validate_static_data_record(
         let mut relocations = record.relocations.iter().collect::<Vec<_>>();
         relocations.sort_by_key(|relocation| relocation.offset);
         let mut cursor = 0usize;
-        for relocation in relocations {
+        for relocation in &relocations {
             let offset = usize::try_from(relocation.offset)
                 .map_err(|_| malformed("relocation offset does not fit the target"))?;
             let end = offset
@@ -4429,6 +4681,20 @@ fn validate_static_data_record(
                 StaticDataTarget::Bytes { .. } | StaticDataTarget::Function(_) => {}
             }
             cursor = end;
+        }
+        let query_descriptor_v5 = record.bytes.len() == 136
+            && record.align == 8
+            && static_u32(&record.bytes, 0) == Some(5)
+            && record.bytes.get(4).copied() == Some(0);
+        if query_descriptor_v5 {
+            let plan = relocations
+                .iter()
+                .find(|relocation| relocation.offset == 128)
+                .ok_or_else(|| malformed("v5 Query descriptor has no batch plan"))?;
+            let StaticDataTarget::Record(plan) = &plan.target else {
+                return Err(malformed("v5 Query descriptor batch plan is not a record"));
+            };
+            validate_batch_plan_record(plan, program, declarations)?;
         }
     }
     Ok(())
@@ -16998,6 +17264,214 @@ mod tests {
             };
         }
         rejected(too_deep, Ty::Raw, "nested record depth exceeds 64");
+
+        let i32_ty = Ty::Int(IntTy {
+            bits: 32,
+            signed: true,
+        });
+        let i64_ty = Ty::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        let none_borrow = hir::ReturnBorrowSummary::None;
+        let none_region = hir::ReturnRegionSummary::None;
+        let roots_borrow = hir::ReturnBorrowSummary::Roots {
+            params: vec![1],
+            captures: Vec::new(),
+        };
+        let roots_region = hir::ReturnRegionSummary::Roots {
+            params: vec![1],
+            captures: Vec::new(),
+        };
+        let callback = |name: &str,
+                        slots: Vec<Ty>,
+                        ret: Ty,
+                        return_borrow: hir::ReturnBorrowSummary,
+                        return_region: hir::ReturnRegionSummary| {
+            let params = (0..slots.len() as u32).collect::<Vec<_>>();
+            Function {
+                name: program_call(name),
+                param_modes: vec![align_ast::ParamMode::ByValue; slots.len()],
+                borrow_mut_cleanup_slots: vec![None; slots.len()],
+                slot_align: vec![None; slots.len()],
+                params,
+                ret,
+                return_borrow,
+                return_region,
+                return_cleanup: hir::ReturnCleanupAbi::None,
+                slots,
+                value_tys: Vec::new(),
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: Vec::new(),
+                    stmt_lines: Vec::new(),
+                    term: Term::Unreachable,
+                }],
+                entry: 0,
+                exportable: false,
+            }
+        };
+        let callbacks = vec![
+            callback(
+                "batch_create",
+                vec![i64_ty],
+                Ty::Raw,
+                none_borrow.clone(),
+                none_region.clone(),
+            ),
+            callback(
+                "batch_append",
+                vec![Ty::Raw, Ty::Raw, Ty::ResourceRef(0)],
+                i32_ty,
+                none_borrow.clone(),
+                none_region.clone(),
+            ),
+            callback(
+                "batch_finish",
+                vec![Ty::Raw, i64_ty],
+                Ty::Unit,
+                none_borrow.clone(),
+                none_region.clone(),
+            ),
+            callback(
+                "batch_row",
+                vec![Ty::Raw, Ty::ResourceRef(1), i64_ty],
+                Ty::Struct(0),
+                none_borrow.clone(),
+                none_region.clone(),
+            ),
+            callback(
+                "batch_soa",
+                vec![Ty::Raw, Ty::ResourceRef(1)],
+                Ty::Soa(0),
+                roots_borrow,
+                roots_region,
+            ),
+            callback(
+                "batch_drop",
+                vec![Ty::Raw],
+                Ty::Unit,
+                none_borrow,
+                none_region,
+            ),
+        ];
+        let resource = |kind: &str| hir::ResourceDef {
+            name: format!("pkg.db${kind}$S3_Row"),
+            source_name: format!("pkg.db${kind}$S3_Row"),
+            declaring_module: "pkg.db".to_owned(),
+            generic_arity: 1,
+            drop_hook: format!("pkg.db.internal.resource$drop_{kind}"),
+            drop_thunk: format!("__align_resource_drop$pkg.db${kind}"),
+            representation_version: 1,
+            drop_abi_fingerprint: *b"align-res-drop-1",
+        };
+        let row = StructDef {
+            name: "Row".to_owned(),
+            source_name: "Row".to_owned(),
+            fields: vec![align_sema::hir::FieldDef {
+                name: "id".to_owned(),
+                ty: i64_ty,
+            }],
+            align: None,
+            c_repr: false,
+        };
+        let mut plan_bytes = vec![0; 72];
+        plan_bytes[0..4].copy_from_slice(&1u32.to_le_bytes());
+        plan_bytes[4] = 1;
+        plan_bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let plan = StaticData {
+            bytes: plan_bytes,
+            align: 8,
+            relocations: [
+                (16, "batch_create"),
+                (24, "batch_append"),
+                (32, "batch_finish"),
+                (40, "batch_row"),
+                (48, "batch_soa"),
+                (56, "batch_drop"),
+            ]
+            .into_iter()
+            .map(|(offset, target)| align_mir::StaticDataRelocation {
+                offset,
+                target: StaticDataTarget::Function(program_call(target)),
+            })
+            .collect(),
+        };
+        let emit_descriptor = |plan: StaticData| {
+            let mut header = vec![0; 136];
+            header[0..4].copy_from_slice(&5u32.to_le_bytes());
+            let descriptor = StaticData {
+                bytes: header,
+                align: 8,
+                relocations: vec![align_mir::StaticDataRelocation {
+                    offset: 128,
+                    target: StaticDataTarget::Record(Box::new(plan)),
+                }],
+            };
+            let main = Function {
+                name: program_call("main"),
+                params: Vec::new(),
+                param_modes: Vec::new(),
+                borrow_mut_cleanup_slots: Vec::new(),
+                ret: i32_ty,
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
+                return_cleanup: hir::ReturnCleanupAbi::None,
+                slots: Vec::new(),
+                slot_align: Vec::new(),
+                value_tys: vec![Ty::Raw],
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: vec![Stmt::Let(0, Rvalue::StaticData(Box::new(descriptor)))],
+                    stmt_lines: Vec::new(),
+                    term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
+                }],
+                entry: 0,
+                exportable: false,
+            };
+            emit_llvm_ir(
+                &Program {
+                    fns: std::iter::once(main)
+                        .chain(callbacks.iter().cloned())
+                        .collect(),
+                    externs: Vec::new(),
+                    imported_fns: Vec::new(),
+                    link_libs: Vec::new(),
+                    structs: vec![row.clone()],
+                    enums: Vec::new(),
+                    resources: vec![resource("rows"), resource("batch")],
+                    tagged_types: Vec::new(),
+                    fn_types: Vec::new(),
+                    tuples: Vec::new(),
+                },
+                &BuildTarget::Baseline,
+                false,
+                &[],
+                None,
+            )
+        };
+        assert!(emit_descriptor(plan.clone()).is_ok());
+        for offset in [16, 24, 32, 40, 48, 56] {
+            let mut malformed = plan.clone();
+            let relocation = malformed
+                .relocations
+                .iter_mut()
+                .find(|relocation| relocation.offset == offset)
+                .expect("test callback ordinal");
+            relocation.target = StaticDataTarget::Function(program_call(if offset == 56 {
+                "batch_create"
+            } else {
+                "batch_drop"
+            }));
+            let error = emit_descriptor(malformed)
+                .expect_err("wrong-signature batch callback must fail before LLVM");
+            assert!(
+                error
+                    .to_string()
+                    .contains("static-data batch plan is malformed"),
+                "offset {offset} produced unexpected diagnostic: {error}"
+            );
+        }
     }
 
     #[test]
