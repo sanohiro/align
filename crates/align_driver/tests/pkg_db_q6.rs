@@ -473,6 +473,49 @@ fn main() -> i32 {
         "a two-destination swap must validate every source against the pre-call regions:\n{simultaneous_diagnostics}",
     );
 
+    let owned_storage = r#"State { values: slice<i64> }
+fn retain_slice(borrow mut state: State, borrow source: array<i64>) {
+  state.values = source[..]
+}
+fn main() -> i32 {
+  mut source := [1, 2, 3].to_array()
+  mut state := State { values: [] }
+  retain_slice(state, source)
+  source = [4, 5, 6].to_array()
+  values := state.values
+  return values.sum() as i32
+}
+"#;
+    let owned_storage_diagnostics =
+        check_diagnostics("pkg-db-q6-retained-owned-storage", owned_storage);
+    assert!(
+        owned_storage_diagnostics.contains("use of invalidated borrow 'state'"),
+        "retaining a slice of a borrowed owned array must preserve its storage root:\n{owned_storage_diagnostics}",
+    );
+
+    let contained_field = r#"Holder { text: str }
+State { text: str }
+fn retain_field(borrow mut state: State, borrow source: Holder) {
+  state.text = source.text
+}
+fn main() -> i32 {
+  owner := "source".clone()
+  view: str := owner
+  mut source := Holder { text: view }
+  mut state := State { text: "" }
+  retain_field(state, source)
+  source = Holder { text: "other" }
+  if source.text == "other" && state.text == "source" { return 42 }
+  return 0
+}
+"#;
+    let contained_field_diagnostics =
+        check_diagnostics("pkg-db-q6-contained-field-retention", contained_field);
+    assert!(
+        contained_field_diagnostics.is_empty(),
+        "contained-field retention must not pin the source aggregate header:\n{contained_field_diagnostics}",
+    );
+
     let indirect = r#"State { text: str }
 fn copy(borrow mut state: State, source: str, out: region) {
   state.text = source.clone_in(out)
@@ -559,6 +602,32 @@ fn main() -> i32 {
         "a mutable resource and its dependent reference must reject in both modes:\nwhole={}\nper-unit={}",
         resource_checked.whole_diags,
         resource_checked.per_unit_diags,
+    );
+
+    let resource_reference_alias = [
+        (
+            "pkg/resource/internal.align",
+            "module pkg.resource.internal\npub fn drop_handle(handle: raw) { unsafe { raw.free(handle) } }\n",
+        ),
+        (
+            "pkg/resource.align",
+            "module pkg.resource\nimport pkg.resource.internal\npub resource Handle = pkg.resource.internal.drop_handle\npub fn open() -> Handle { unsafe { return resource.from_raw(raw.alloc(8)) } }\npub fn touch_refs(borrow mut first: resource_ref<Handle>, borrow mut second: resource_ref<Handle>) {}\n",
+        ),
+        (
+            "main.align",
+            "module main\nimport pkg.resource\nfn main() -> i32 { owner := pkg.resource.open(); mut first := resource.borrow(owner); mut second := resource.borrow(owner); pkg.resource.touch_refs(first, second); return 0 }\n",
+        ),
+    ];
+    let resource_reference_checked = diff_check_multi(
+        "pkg-db-q6-resource-reference-alias",
+        &resource_reference_alias,
+        "main.align",
+    );
+    assert!(
+        resource_reference_checked.whole_errors && resource_reference_checked.per_unit_errors,
+        "two mutable reference slots with one resource owner must reject in both modes:\nwhole={}\nper-unit={}",
+        resource_reference_checked.whole_diags,
+        resource_reference_checked.per_unit_diags,
     );
 }
 

@@ -7812,15 +7812,23 @@ fn summary_from_roots(roots: &BorrowRoots, explicit_params: u32) -> hir::ReturnB
     let mut captures = Vec::new();
     for root in roots {
         match root {
-            BorrowRoot::Param(index) if *index < explicit_params => params.push(*index),
-            BorrowRoot::Param(index) => captures.push(index - explicit_params),
+            BorrowRoot::Param(index) | BorrowRoot::ParamStorage(index)
+                if *index < explicit_params => params.push(*index),
+            BorrowRoot::Param(index) | BorrowRoot::ParamStorage(index) => {
+                captures.push(index - explicit_params)
+            }
             BorrowRoot::Local(_)
             | BorrowRoot::IterTemp(_)
             | BorrowRoot::EndedLocal(_, _)
             | BorrowRoot::EndedIterTemp(_, _)
-            | BorrowRoot::EndedParam(_, _) => {}
+            | BorrowRoot::EndedParam(_, _)
+            | BorrowRoot::EndedParamStorage(_, _) => {}
         }
     }
+    params.sort_unstable();
+    params.dedup();
+    captures.sort_unstable();
+    captures.dedup();
     if params.is_empty() && captures.is_empty() {
         hir::ReturnBorrowSummary::None
     } else {
@@ -12148,7 +12156,7 @@ enum EscapeFlowOp<'a> {
     /// changes so retaining the old destination is well-defined.
     BorrowMutCall {
         args: &'a [Expr],
-        destinations: Vec<(usize, Vec<usize>)>,
+        destinations: Vec<(usize, Vec<BorrowMutRetentionSource>)>,
         depth: u32,
     },
     /// Region-backed builders may cross a call boundary only through `borrow mut`; a shared or out
@@ -15757,7 +15765,7 @@ impl<'a> EscapeCheck<'a> {
     fn apply_borrow_mut_calls(
         &mut self,
         args: &[Expr],
-        destinations: &[(usize, Vec<usize>)],
+        destinations: &[(usize, Vec<BorrowMutRetentionSource>)],
         depth: u32,
     ) {
         // Every summary source denotes the pre-call value. Snapshot the complete call before
@@ -15781,6 +15789,7 @@ impl<'a> EscapeCheck<'a> {
                 let source_regions = sources
                     .iter()
                     .filter_map(|&source| {
+                        let source = source.index();
                         let argument = args.get(source)?;
                         self.region_bearing(argument.ty)
                             .then(|| (source, self.region_of(argument, depth)))
@@ -15856,7 +15865,11 @@ impl<'a> EscapeCheck<'a> {
                 continue;
             }
             let sources = exact_borrow_mut_source_indices(summary, index, args.len())
-                .unwrap_or_else(|| (0..args.len()).collect());
+                .unwrap_or_else(|| {
+                    (0..args.len())
+                        .map(BorrowMutRetentionSource::Contained)
+                        .collect()
+                });
             destinations.push((index, sources));
         }
         if !destinations.is_empty() {
@@ -17339,12 +17352,17 @@ enum BorrowRoot {
     IterTemp(u32),
     /// Source-visible parameter whose embedded view provenance reaches the return.
     Param(u32),
+    /// Caller-owned storage reached by borrowing a parameter. This stays distinct from contained
+    /// provenance so an exact mutable-retention summary can translate it through the call-site
+    /// argument's storage roots without pinning an unrelated aggregate header.
+    ParamStorage(u32),
     /// An already-ended root carried by a completion-time value snapshot. Keeping this marker in
     /// the fact lets projection and named-summary selection transport the invalidation without
     /// widening it to an unselected sibling.
     EndedLocal(LocalId, BorrowEnd),
     EndedIterTemp(u32, BorrowEnd),
     EndedParam(u32, BorrowEnd),
+    EndedParamStorage(u32, BorrowEnd),
 }
 
 type BorrowRoots = std::collections::BTreeSet<BorrowRoot>;
@@ -17358,17 +17376,34 @@ type BorrowMutRetentionSummary = Vec<BorrowRoots>;
 type BorrowMutRetentionMap =
     std::collections::HashMap<String, BorrowMutRetentionSummary>;
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BorrowMutRetentionSource {
+    Contained(usize),
+    Storage(usize),
+}
+
+impl BorrowMutRetentionSource {
+    fn index(self) -> usize {
+        match self {
+            Self::Contained(index) | Self::Storage(index) => index,
+        }
+    }
+}
+
 fn exact_borrow_mut_source_indices(
     summary: Option<&BorrowMutRetentionSummary>,
     destination: usize,
     argument_count: usize,
-) -> Option<Vec<usize>> {
+) -> Option<Vec<BorrowMutRetentionSource>> {
     summary?
         .get(destination)?
         .iter()
         .map(|root| match *root {
             BorrowRoot::Param(source) if (source as usize) < argument_count => {
-                Some(source as usize)
+                Some(BorrowMutRetentionSource::Contained(source as usize))
+            }
+            BorrowRoot::ParamStorage(source) if (source as usize) < argument_count => {
+                Some(BorrowMutRetentionSource::Storage(source as usize))
             }
             _ => None,
         })
@@ -17386,16 +17421,21 @@ impl BorrowRoot {
             Self::Local(local) => Self::EndedLocal(local, how),
             Self::IterTemp(depth) => Self::EndedIterTemp(depth, how),
             Self::Param(param) => Self::EndedParam(param, how),
+            Self::ParamStorage(param) => Self::EndedParamStorage(param, how),
             already @ (Self::EndedLocal(..)
             | Self::EndedIterTemp(..)
-            | Self::EndedParam(..)) => already,
+            | Self::EndedParam(..)
+            | Self::EndedParamStorage(..)) => already,
         }
     }
 
     fn live(self) -> Option<Self> {
         match self {
-            Self::Local(_) | Self::IterTemp(_) | Self::Param(_) => Some(self),
-            Self::EndedLocal(..) | Self::EndedIterTemp(..) | Self::EndedParam(..) => None,
+            Self::Local(_) | Self::IterTemp(_) | Self::Param(_) | Self::ParamStorage(_) => Some(self),
+            Self::EndedLocal(..)
+            | Self::EndedIterTemp(..)
+            | Self::EndedParam(..)
+            | Self::EndedParamStorage(..) => None,
         }
     }
 
@@ -17404,7 +17444,8 @@ impl BorrowRoot {
             Self::EndedLocal(local, how) => Some((Self::Local(local), how)),
             Self::EndedIterTemp(depth, how) => Some((Self::IterTemp(depth), how)),
             Self::EndedParam(param, how) => Some((Self::Param(param), how)),
-            Self::Local(_) | Self::IterTemp(_) | Self::Param(_) => None,
+            Self::EndedParamStorage(param, how) => Some((Self::ParamStorage(param), how)),
+            Self::Local(_) | Self::IterTemp(_) | Self::Param(_) | Self::ParamStorage(_) => None,
         }
     }
 }
@@ -17879,7 +17920,7 @@ impl<'a> MoveCheck<'a> {
                 .map(BorrowFact::flatten)
                 .unwrap_or_default();
             summary.extend(roots.into_iter().filter(|root| {
-                matches!(root, BorrowRoot::Param(_))
+                matches!(root, BorrowRoot::Param(_) | BorrowRoot::ParamStorage(_))
             }));
         }
     }
@@ -17977,12 +18018,16 @@ impl<'a> MoveCheck<'a> {
         summary: Option<&BorrowMutRetentionSummary>,
         moved: &MovedSet,
     ) {
-        let argument_facts = args
+        let contained_argument_facts = args
             .iter()
             .map(|argument| {
                 let fallback = self.borrow_fact(argument);
                 self.stored_argument_fact(argument, &fallback)
             })
+            .collect::<Vec<_>>();
+        let storage_argument_facts = args
+            .iter()
+            .map(|argument| BorrowFact::from_direct(self.storage_roots(argument)))
             .collect::<Vec<_>>();
         let destinations = modes
             .iter()
@@ -18011,7 +18056,12 @@ impl<'a> MoveCheck<'a> {
         }
         for (index, _, exact_sources) in destinations {
             if let Some(argument) = args.get(index) {
-                self.refresh_borrow_mut_call(argument, &argument_facts, exact_sources.as_deref());
+                self.refresh_borrow_mut_call(
+                    argument,
+                    &contained_argument_facts,
+                    &storage_argument_facts,
+                    exact_sources.as_deref(),
+                );
             }
         }
     }
@@ -18023,8 +18073,9 @@ impl<'a> MoveCheck<'a> {
     fn refresh_borrow_mut_call(
         &mut self,
         argument: &Expr,
-        argument_facts: &[BorrowFact],
-        exact_sources: Option<&[usize]>,
+        contained_argument_facts: &[BorrowFact],
+        storage_argument_facts: &[BorrowFact],
+        exact_sources: Option<&[BorrowMutRetentionSource]>,
     ) {
         self.refresh_borrow_mut_place(argument);
         if !ty_may_borrow(
@@ -18047,24 +18098,42 @@ impl<'a> MoveCheck<'a> {
             ),
             _ => return,
         };
-        let fallback;
-        let sources = if let Some(exact) = exact_sources {
-            exact
-        } else {
-            fallback = (0..argument_facts.len()).collect::<Vec<_>>();
-            &fallback
-        };
         let mut incoming = BorrowFact::default();
-        for &source in sources {
-            let Some(source_fact) = argument_facts.get(source) else {
+        let mut join_source = |source: BorrowMutRetentionSource| {
+            let source_fact = match source {
+                BorrowMutRetentionSource::Contained(index) => {
+                    contained_argument_facts.get(index)
+                }
+                BorrowMutRetentionSource::Storage(index) => storage_argument_facts.get(index),
+            };
+            let Some(source_fact) = source_fact else {
                 // A malformed exact fact must not become an empty, fail-open update.
                 incoming = BorrowFact::default();
-                for fact in argument_facts {
-                    incoming = incoming.join(fact);
+                for (contained, storage) in contained_argument_facts
+                    .iter()
+                    .zip(storage_argument_facts)
+                {
+                    incoming = incoming.join(contained).join(storage);
                 }
-                break;
+                return false;
             };
             incoming = incoming.join(source_fact);
+            true
+        };
+        if let Some(sources) = exact_sources {
+            for &source in sources {
+                if !join_source(source) {
+                    break;
+                }
+            }
+        } else {
+            for index in 0..contained_argument_facts.len() {
+                if !join_source(BorrowMutRetentionSource::Contained(index))
+                    || !join_source(BorrowMutRetentionSource::Storage(index))
+                {
+                    break;
+                }
+            }
         }
         if path.is_empty() {
             let ty = self.f.locals.get(local as usize).map(|local| local.ty);
@@ -18155,7 +18224,7 @@ impl<'a> MoveCheck<'a> {
         if argument.ty.is_array_builder()
             || matches!(
                 expand_tagged_ty(argument.ty, self.tagged_types),
-                Ty::Resource(_) | Ty::ResourceRef(_)
+                Ty::Resource(_)
             )
             || !self.borrow_mut_uses_reachable_storage(argument)
         {
@@ -18278,8 +18347,14 @@ impl<'a> MoveCheck<'a> {
             .position(|&param| param == id)
             .filter(|_| self.f.locals.get(id as usize).is_some_and(|local| local.ty == Ty::ArenaHandle))
             .map(|position| position as u32);
-        if let Some(position) = region_param.or_else(|| self.borrowed_param_position(id)) {
+        if let Some(position) = region_param {
             roots.insert(BorrowRoot::Param(position));
+        } else if let Some(position) = self.borrowed_param_position(id) {
+            if self.local_owns_view_storage(id) {
+                roots.insert(BorrowRoot::ParamStorage(position));
+            } else {
+                roots.insert(BorrowRoot::Param(position));
+            }
         } else if self.local_owns_view_storage(id) || self.local_may_borrow(id) {
             roots.insert(BorrowRoot::Local(id));
         }
@@ -18636,12 +18711,13 @@ impl<'a> MoveCheck<'a> {
             BorrowRoot::IterTemp(_) => {
                 "value snapshot was invalidated before the enclosing operation: its temporary owner was dropped".to_string()
             }
-            BorrowRoot::Param(_) => {
+            BorrowRoot::Param(_) | BorrowRoot::ParamStorage(_) => {
                 "value snapshot was invalidated before the enclosing operation: its external owner ended unexpectedly".to_string()
             }
             BorrowRoot::EndedLocal(..)
             | BorrowRoot::EndedIterTemp(..)
-            | BorrowRoot::EndedParam(..) => {
+            | BorrowRoot::EndedParam(..)
+            | BorrowRoot::EndedParamStorage(..) => {
                 "value snapshot was invalidated before the enclosing operation".to_string()
             }
         };
@@ -19959,10 +20035,11 @@ impl<'a> MoveCheck<'a> {
             // Deeper temporaries are already dead — an inner loop's own edges ended them — but
             // saying so here keeps the rule independent of that ordering.
             BorrowRoot::IterTemp(d) => d >= depth,
-            BorrowRoot::Param(_) => false,
+            BorrowRoot::Param(_) | BorrowRoot::ParamStorage(_) => false,
             BorrowRoot::EndedLocal(..)
             | BorrowRoot::EndedIterTemp(..)
-            | BorrowRoot::EndedParam(..) => false,
+            | BorrowRoot::EndedParam(..)
+            | BorrowRoot::EndedParamStorage(..) => false,
         });
     }
 
@@ -20008,13 +20085,14 @@ impl<'a> MoveCheck<'a> {
             ),
             // Parameter roots outlive this frame and are never inserted into `invalid`.
             // Keep the malformed-state fallback diagnostic-only and fail closed.
-            (BorrowRoot::Param(_), _) => format!(
+            (BorrowRoot::Param(_) | BorrowRoot::ParamStorage(_), _) => format!(
                 "use of invalidated borrow '{borrower}': its external provenance ended unexpectedly"
             ),
             (
                 BorrowRoot::EndedLocal(..)
                 | BorrowRoot::EndedIterTemp(..)
-                | BorrowRoot::EndedParam(..),
+                | BorrowRoot::EndedParam(..)
+                | BorrowRoot::EndedParamStorage(..),
                 _,
             ) => format!(
                 "use of invalidated borrow '{borrower}': its source generation ended unexpectedly"
@@ -20157,12 +20235,13 @@ impl<'a> MoveCheck<'a> {
             BorrowRoot::IterTemp(_) => {
                 "pipeline source snapshot was invalidated before terminal action: its temporary owner was dropped".to_string()
             }
-            BorrowRoot::Param(_) => {
+            BorrowRoot::Param(_) | BorrowRoot::ParamStorage(_) => {
                 "pipeline source snapshot was invalidated before terminal action: its external owner ended unexpectedly".to_string()
             }
             BorrowRoot::EndedLocal(..)
             | BorrowRoot::EndedIterTemp(..)
-            | BorrowRoot::EndedParam(..) => {
+            | BorrowRoot::EndedParam(..)
+            | BorrowRoot::EndedParamStorage(..) => {
                 "pipeline source snapshot was invalidated before terminal action: its source generation had already ended".to_string()
             }
         };
@@ -45659,7 +45738,15 @@ fn main() -> i32 = 0
         let valid = vec![valid_roots];
         assert_eq!(
             exact_borrow_mut_source_indices(Some(&valid), 0, 2),
-            Some(vec![1])
+            Some(vec![BorrowMutRetentionSource::Contained(1)])
+        );
+
+        let mut storage_roots = BorrowRoots::new();
+        storage_roots.insert(BorrowRoot::ParamStorage(1));
+        let storage = vec![storage_roots];
+        assert_eq!(
+            exact_borrow_mut_source_indices(Some(&storage), 0, 2),
+            Some(vec![BorrowMutRetentionSource::Storage(1)]),
         );
 
         let mut out_of_range_roots = BorrowRoots::new();
