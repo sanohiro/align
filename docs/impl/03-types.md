@@ -478,8 +478,11 @@ turbofish.
 
 `RegionPlain` is an additional closed builtin structural bound. It grants only region-plain
 construction/builder operations, and concrete instantiation recursively rejects resources,
-independently owned fields, raw/function values, and builders. There are still no user traits,
-runtime dictionaries, reflection, or new concrete container element capabilities. Generic
+independently owned fields, raw/function values, and builders. A1/D13 adds the one narrower
+`SoaPlain` bound: exactly a nonempty struct of integer/float/`bool`/`char`/`str` fields. It grants
+only symbolic `soa<R>` formation in a template and substitutes to concrete `Ty::Soa(id)` before
+MoveCheck/EscapeCheck/HIR/MIR. There are still no user traits, runtime dictionaries, reflection, or
+new concrete container element capabilities. Generic
 **containers beyond this symbolic composition** remain on their owning tracks; **`vecN<T>`** remains
 M6, and `Opt.None` expected-type decomposition remains an additive inference refinement.
 

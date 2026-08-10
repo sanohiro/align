@@ -809,6 +809,11 @@ rows(exec, query, params, options: slice<db.ExecuteOption>)
   -> Result<db.rows<R>, db.Error>
 prepare(exec, query, options: slice<db.PrepareOption>)
   -> Result<db.stmt<P,R>, db.Error>
+next_batch<R>(borrow mut rows: db.rows<R>, max_rows: i64)
+  -> Result<Option<db.batch<R>>, db.Error>
+batch_len<R>(borrow values: db.batch<R>) -> Result<i64, db.Error>
+batch_row<R>(borrow values: db.batch<R>, index: i64) -> Result<Option<R>, db.Error>
+batch_soa<R: SoaPlain>(borrow values: db.batch<R>) -> Result<soa<R>, db.Error>
 ```
 
 Semantics:
@@ -825,6 +830,9 @@ Semantics:
   builtin structural bound, not a public/user-defined trait hierarchy; every v1 static Query Row
   already satisfies it.
 - `rows`: one-pass stream; no implicit materialization.
+- `next_batch`: one bounded, independently owned columnar materialization from the existing rows
+  stream; its row and eligible SoA projections borrow the batch generation. The exact D13 surface,
+  allocation, validation order, and ABI are fixed by the A1 ledger in §23.
 - `execute`: never decodes rows.
 
 The package MUST NOT provide a convenience call whose name hides whether it materializes or streams.
@@ -1356,8 +1364,7 @@ prerequisite, not an excuse for a private database-only container.
 
 ### 9.5 Batch and SoA path
 
-The first correct implementation may decode rows into ordinary structs. The design must preserve a
-future direct path:
+The D13 common batch path is:
 
 ```text
 database protocol rows
@@ -1368,8 +1375,12 @@ database protocol rows
 
 Direct `soa<T>` decode must not build an intermediate `array<T>` and transpose it.
 
-Nullable primitive columns SHOULD use a values buffer plus a validity bitmap internally rather than
-one tagged `Option` object per lane, while preserving `Option<T>` semantics at the language surface.
+The exact public operations, ownership, validation order, generated-plan ABI, and cleanup matrix are
+recorded by the A1 ledger in §23. Nullable columns use a values/header buffer plus a validity bitmap
+rather than one tagged `Option` object per lane, while preserving `Option<T>` semantics at the
+language surface. Text/blob bytes live in batch-owned segmented child buffers. A `SoaPlain` Row is
+projectable as the existing `soa<Row>` view; other valid static Rows remain available through
+`batch_row` and are not silently downgraded or transposed.
 
 ---
 
@@ -4349,6 +4360,80 @@ owner for every applicable cell. A finding in any validation, native-row, or cle
 one sibling-path audit for the same root-cause class before the coherent fix commit.
 
 ### D13 — batch, SoA, and high-value native paths
+
+#### A1 common batch/SoA public-contract ledger
+
+This ledger is the source of truth for the first independently useful D13 rail. The rail is one
+capability boundary even though it crosses generic type formation, generated Query artifacts, both
+drivers, and resource cleanup: none of those producer seams has a stable consumer without the
+others, while splitting them would duplicate the same ownership and malformed-input proof. The
+expected implementation is larger than 1,000 hand-written lines for that reason. It does not change
+physical PostgreSQL delivery from `BufferedFull` or add a native delivery option; those remain a
+separate A1 rail.
+
+The exact application-callable surface is:
+
+```align
+pub resource batch<R> = pkg.db.internal.resource.drop_batch
+
+pub fn next_batch<R>(
+  borrow mut stream: rows<R>,
+  max_rows: i64,
+) -> Result<Option<batch<R>>, Error>
+
+pub fn batch_len<R>(borrow values: batch<R>) -> Result<i64, Error>
+
+pub fn batch_row<R>(
+  borrow values: batch<R>,
+  index: i64,
+) -> Result<Option<R>, Error>
+
+pub fn batch_soa<R: SoaPlain>(
+  borrow values: batch<R>,
+) -> Result<soa<R>, Error>
+```
+
+`SoaPlain` is one closed builtin structural bound, parallel to but narrower than `RegionPlain`.
+It accepts exactly a nonempty concrete struct whose fields, in declaration order, are `bool`,
+`char`, an integer, a float, or `str`. It grants only formation and return of `soa<R>` in a generic
+template. It adds no user-defined trait, dictionary, reflection, implicit conversion, or operation
+on an abstract `R`. `soa<R>` is template-only while `R` is abstract and is substituted to the
+existing concrete `Ty::Soa(struct_id)` before MoveCheck, EscapeCheck, HIR validation, MIR, interface
+serialization, and code generation. A non-`SoaPlain` Row can still use `next_batch`, `batch_len`, and
+`batch_row`; `batch_soa` is rejected at the call during generic instantiation and never performs a
+runtime downgrade.
+
+| Public record | Exact contract |
+|---|---|
+| input and defaults | `next_batch` consumes no new Query, Params, options, region, or ambient configuration. `max_rows` has no default and must be in `1..=2_147_483_647`. It advances only the supplied live `rows<R>` generation and sends no additional SQL. SQLite retains `Step`; PostgreSQL retains the already-buffered `BufferedFull` result. |
+| result and row order | One call decodes at most `max_rows` consecutive rows in native delivery order. Zero decoded rows at end returns `Ok(None)`; every `Some` batch is nonempty. Hitting the bound returns `Some` without probing one row past it. SQLite may therefore observe exact-bound exhaustion only on the next call; PostgreSQL may use its already-known buffered row count. |
+| validation and error precedence | Validate the complete rows wrapper, its Query identity, and the producer batch-plan header first; malformed state returns query-less `InvalidQuery` with item `db.rows.header`. Validate `max_rows` second; an out-of-range value returns query-specific `Unsupported`, item `db.batch.max_rows`, message `database batch size must be between 1 and 2147483647 rows`. Inspect failed/exhausted state third, before allocation or native advancement. Checked fixed-layout arithmetic that cannot represent the requested bound returns query-specific `Unsupported`, item `db.batch.layout`, message `database batch layout exceeds the supported address range`. Per-row native validation retains the existing driver-specific `Decode`/`Native` error. Aggregate variable-child length overflow returns query-specific `Unsupported`, item `db.batch.storage`, message `database batch variable-width storage exceeds the supported address range`. Each accessor validates the complete batch/plan state before its first load or thunk call and returns query-less `InvalidQuery`, item `db.batch.header`, message `invalid database batch resource` on failure. This order also governs multi-invalid input. |
+| ownership and lifetime | `batch<R>` is an independently owned Move resource. Success copies every text/blob byte needed by the batch before the native row may advance, so multiple batches may coexist and the rows stream may be advanced or dropped. After successful header validation, `batch_row` returns `Ok(None)` for a negative or out-of-range index; otherwise it reconstructs one `R` in declaration order. Every returned `str`, `slice<u8>`, or enclosing `Option` view is rooted only in the borrowed batch generation. `batch_soa` returns the existing borrowed `{ptr,len}` `soa<R>` view rooted only in that generation. Moving or dropping the batch invalidates both kinds of view; neither can escape through a longer-lived owner. |
+| allocation and layout | The package visibly materializes a batch but chooses no caller region. The resource owns one geometrically grown fixed-column block plus zero or more geometrically grown child chunks, one chain per variable-width Row field. Primitive values and text/blob `{ptr,len}` headers occupy typed columns; each nullable field has a separate packed validity bitmap and a null lane's value/header bytes are never read. Child bytes are appended once and are not compacted or copied again. Fixed columns grow by capacity and, when the final length is below capacity, are compacted in place once to the existing exact-length `soa<R>` offset rule. There is no intermediate `array<R>`, AoS buffer, or transpose. Checked add/multiply/alignment/bitmap arithmetic precedes its allocation or write. Allocation failure follows Align's normal allocation abort rather than becoming `db.Error`. |
+| failure atomicity and cleanup | A generated append validates every native value and all child growth before mutating the batch lane. Any error after earlier lanes destroys the unpublished partial batch, then closes/poisons the rows/native state in the same first-error-preserving order as `next`; no partial batch is returned. On zero-row exhaustion the rows resource closes before `None`. On a partial final batch the rows resource closes before `Some`. Drop frees each live child chain, the fixed block, the producer payload, and the public wrapper exactly once; partial construction uses the same order. |
+| producers and runtime inspection | The static Query producer emits all layout and decode behavior. Runtime package code dispatches only through producer-owned, typed thunks retained in the linked program; it performs no field-name lookup, reflection, source/artifact/cache I/O, or Query-body instantiation. The common package owns validation, driver advancement, publication, and first-error cleanup. SQLite/libpq own only native row delivery and value access. |
+| artifacts, ABI, and cache identity | Query execution descriptors become 136-byte, 8-aligned v5 records. Offsets 0--127 retain v4 meaning; query offset 128 is a non-null pointer to the exact batch-plan v1 record, while command offset 128 is null. The 72-byte, 8-aligned batch-plan record is: `u32 version=1` at 0; `u8 flags` at 4 (`bit0 = SoaPlain`, all other bits zero); zero reserved bytes 5--7; nonzero `u32 field_count` at 8; zero `u32 reserved` at 12; non-null generated `create`, `append`, `finish`, `row`, and `drop` thunk pointers at 16, 24, 32, 40, and 56; `soa` at 48, non-null exactly when bit0 is set; and zero `u64 tail_reserved` at 64. Prepared-statement state becomes 80-byte v2 with offsets 0--71 unchanged and the non-null plan at 72. Rows state becomes 96-byte v2 with offsets 0--87 unchanged and the non-null plan at 88. The public resource owns one 48-byte, 8-aligned batch state: `u32 version=1` at 0; live/closed `u8` at 4; copied plan flags at 5; zero `u16 reserved` at 6; non-null plan and payload pointers at 8 and 16; nonzero `i64 len` at 24; requested `i64 max_rows` at 32 with `len <= max_rows <= 2_147_483_647`; and zero `u64 tail_reserved` at 40. Flags must equal the validated plan flags. Descriptor bytes, plan bytes, field kind/nullability/order, thunk bodies, row structural fingerprint, compiler implementation hash, and dependency interface hashes participate in the existing static artifact/object/cache identities. Whole-program and per-unit compilation retain the plan, all thunks, and the selected native driver. Independent semantic-to-byte and byte-to-semantic goldens pin both records, every field ordinal/tag, malformed reserved/tag/pointer rejection, and sequence order. |
+| internal thunk ABI | `create(max_rows: i64) -> raw` checks complete fixed-layout representability before allocation and returns null only for that representational failure; allocation itself aborts on OOM. `append(payload: raw, context: raw, owner: resource_ref<rows<R>>) -> i32` returns 0 after one atomic direct-column append, 1 for aggregate child-length overflow, and cannot publish a partial lane. `finish(payload: raw, len: i64)` performs the at-most-once fixed-column compaction. `row(payload: raw, owner: resource_ref<batch<R>>, index: i64) -> R` reconstructs one validated in-range row with owner-rooted views. `soa(payload: raw, owner: resource_ref<batch<R>>) -> soa<R>` exists only for `SoaPlain`; `drop(payload: raw)` releases producer storage. No abstract `R`, generic thunk, or unvalidated raw function signature reaches HIR/MIR. |
+| prerequisites and acceptance | Requires shipped L2 return provenance/cleanup, L3 package resources, L7 generic package composition, D8 rows generations, and the existing concrete SoA ABI. The rail adds the narrow `SoaPlain`/abstract-SoA completion and descriptor/statement/rows/batch state version bumps together. Correctness owners are the exact surface/bound/whole-per-unit test, descriptor and plan byte/signature goldens, fake-driver direct-column/layout test, SQLite batch lifecycle/error/cleanup test, PostgreSQL buffered batch lifecycle/error/cleanup test, malformed HIR/state fail-closed tests, and alloc-count Drop balance probe. The existing local `direct SoA/batch decode` measurement records allocation/copy/compact counts and direct-driver overhead after correctness closes; it is not a correctness or PR gate. |
+
+The implementation closure matrix is:
+
+| Closure cell | Required implementation closure | Exact owner evidence |
+|---|---|---|
+| formation and validation | Form symbolic `soa<R>` only under `R: SoaPlain`; substitute it before analysis; validate the concrete struct and every descriptor, plan, statement, rows, and batch version/reserved/pointer invariant before dispatch. Commands never gain a plan. | sema formation/substitution/instantiation tests; HIR malformed abstract/concrete SoA and raw-signature owners; exact v5/plan goldens |
+| construction and move-in | Create one unpublished payload only after rows/max/terminal validation. Decode each delivered row directly into typed columns; validate every field and all per-lane growth before committing the lane. Text uses the native length-aware bytes, must be valid UTF-8, and preserves embedded U+0000 byte-exact; blobs preserve every byte including zero. Invalid pointer/length/UTF-8 fails before allocation growth or lane mutation. | fake-driver all-kind/nullable/empty/partial/exact-cap owners; SQLite and PostgreSQL direct-column owners |
+| move-out and returned views | `batch_row` gathers one row without moving storage; `batch_soa` exposes the same fixed columns only for `SoaPlain`. Returned views carry the batch resource generation through immediate/delayed Option and generic return constraints. | whole/per-unit lifetime tests covering direct row, Option row, SoA column, branch/`?`/return escape, and post-move/post-Drop rejection |
+| source nulling, replacement, return | Moving `batch<R>` nulls the source cleanup bit exactly once. Return through block/`if`/`match`/`else`/`?` and replacement transfers one resource owner; no generic or driver path duplicates its payload. | cumulative L3 resource-move matrix plus batch-specific branch, replacement, and early-return alloc-count cases |
+| Drop and partial cleanup | Drop is valid for empty unpublished payloads, every partial lane count, compacted/uncompacted success, and both driver terminal states. It frees child chains before the fixed block/payload/wrapper and cannot call a malformed/null thunk. | parameterized failpoint/alloc-count owner and malformed batch-header owner |
+| driver control paths | SQLite never steps beyond the cap and closes on DONE/error; PostgreSQL never decodes beyond the cap and uses its known buffered count without another send. Both preserve the first owned error while destroying partial batch then native rows state. | driver-specific zero/partial/exact-cap/multi-batch/decode-error/native-error/Drop owners with send/step/decode counters |
+| nullable and variable-width layout | Cross every value kind with nullable/non-nullable, empty/nonempty text/blob, null/empty distinction, child growth, fixed growth, and compact/no-compact. A null lane never reads stale value bytes; gathered rows and eligible SoA columns agree with source order. | generated-plan matrix and driver fixtures; bitmap/header/offset byte goldens; UTF-8 and native-length malformed owners |
+| generic and separate compilation | Infer `R` from `batch<R>` for all four operations, reject the bound at concrete instantiation, serialize no abstract SoA, and retain plan/thunks under whole-program and per-unit compilation. | public interface goldens, wrong-bound diagnostic, and whole/per-unit executable owners |
+| allocation and ABI parity | Query direct/prepared paths carry the same plan into v2 statement and rows states; fake, SQLite, and PostgreSQL use one v1 batch state and one producer plan layout. Every size/offset/signature and cleanup provenance agrees across producer, package, HIR validator, MIR, and LLVM lowering. | descriptor/plan/state byte goldens, static-data relocation tests, HIR ABI tests, and alloc-count parity probe |
+
+Before implementation, perform one author-side ledger-to-prose and matrix pass, then one fresh
+independent adversarial review of this contract and capability boundary. Before the code review,
+repeat the matrix-to-diff pass: every applicable cell must name its implementation path and an owner,
+or be explicitly deferred to another A1 rail.
 
 - bounded `next_batch` and batch generations;
 - PostgreSQL binary parameter/result formats;

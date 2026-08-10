@@ -524,6 +524,7 @@ one        正確に1行。0/2+はerror
 maybe_one  0または1行。2+はerror
 all        supplied regionへ全行materialize
 rows       one-pass stream
+next_batch bounded owned column batch
 ```
 
 `one`/`maybe_one` はcardinality判定に最大2 delivered rowsをdecodeするが、§2.4の
@@ -532,7 +533,13 @@ definitionは `P, R: RegionPlain` のgeneric functionである。`all` はregion
 growthと1回のcompact passを使う。`RegionPlain` は
 L7のclosed builtin structural boundであり、public/user-defined trait hierarchyではない。
 v1 static Rowはすべて満たす。
-bounded `next_batch` はD13の追加APIであり、D1〜D12の初期common operationには含めない。
+bounded `next_batch` はD13の追加APIである。exact surfaceは
+`next_batch<R>(borrow mut rows<R>, i64) -> Result<Option<batch<R>>, Error>`、
+`batch_len<R>(borrow batch<R>) -> Result<i64, Error>`、
+`batch_row<R>(borrow batch<R>, i64) -> Result<Option<R>, Error>`、
+`batch_soa<R: SoaPlain>(borrow batch<R>) -> Result<soa<R>, Error>` である。batchはcolumn/child storageを
+独立所有し、row/SoA viewはそのresource generationをborrowする。region、追加Query execution、
+hidden pagination、optionless overloadはない。D1〜D12の初期common operationには含めない。
 名前からmaterialize/streamが分からない
 convenience APIは作らない。
 
@@ -692,9 +699,12 @@ compactする。hidden heapは使わない。heap builderのzero-copy freezeは�
 
 ### 9.5 batch/SoA
 
-後続D13でbounded batch generation、validity bitmap、segmented child buffer、eligibleな
-`soa<Row>` 直接decodeを追加できる。初期Query契約を変更せず、intermediate AoSを
-必須にしない。
+D13はdatabase protocol rowをtyped column bufferへ直接decodeし、eligibleな`soa<Row>`へ
+projectする。intermediate `array<Row>`、AoS、transposeは作らない。nullable columnは
+value/header columnとvalidity bitmap、text/blobはbatch-owned segmented child bufferを使う。
+exact operation、ownership、validation order、generated-plan ABI、cleanup matrixは§23 A1 ledger
+をsource of truthとする。`SoaPlain`でないvalid static Rowも`batch_row`で利用でき、silent
+downgradeしない。
 
 ## 10. SQL type
 
@@ -2843,6 +2853,61 @@ candidate review前にauthor-side matrix-to-diff passで全applicable cellへ1 s
 classのsibling-path auditを1回行う。
 
 ### D13 — batch、SoA、高価値native path
+
+#### A1 common batch/SoA public-contract ledger
+
+これは最初のindependently useful D13 railのsource of truthである。generic type formation、
+generated Query artifact、両driver、resource cleanupを横断するが、どのproducer seamも他を
+欠くとstable consumerを持たず、分割は同じownership/malformed-input proofを重複させるため
+1 capability boundaryとする。1,000 hand-written lines超を見込む理由もこれである。
+PostgreSQL deliveryはこのrailでは`BufferedFull`のままで、native delivery optionは別rail。
+
+```align
+pub resource batch<R> = pkg.db.internal.resource.drop_batch
+pub fn next_batch<R>(borrow mut stream: rows<R>, max_rows: i64)
+  -> Result<Option<batch<R>>, Error>
+pub fn batch_len<R>(borrow values: batch<R>) -> Result<i64, Error>
+pub fn batch_row<R>(borrow values: batch<R>, index: i64) -> Result<Option<R>, Error>
+pub fn batch_soa<R: SoaPlain>(borrow values: batch<R>) -> Result<soa<R>, Error>
+```
+
+`SoaPlain`は`RegionPlain`より狭いclosed builtin structural boundで、nonempty concrete structの
+fieldがdeclaration orderで`bool`、`char`、integer、float、`str`だけの場合にexactly成立する。
+generic template内のsymbolic `soa<R>` formation/returnだけを許可し、user trait、dictionary、
+reflection、implicit conversion、abstract `R` operationを追加しない。concrete call時に既存
+`Ty::Soa(struct_id)`へsubstituteし、MoveCheck/EscapeCheck/HIR/MIR/interface/codegen前に通常の
+SoA field ruleを再検証する。non-`SoaPlain` Rowは他のbatch operationを使えるが`batch_soa`は
+compile-time rejectされ、runtime downgradeしない。
+
+| Public record | Exact contract |
+|---|---|
+| input/default | `max_rows`はdefaultなしで`1..=2_147_483_647`。supplied live `rows<R>`だけをadvanceし、追加SQLをsendしない。SQLiteは`Step`、PostgreSQLは既存`BufferedFull`。 |
+| result/order | native delivery orderの連続rowを最大`max_rows` decodeする。endで0 rowなら`Ok(None)`、`Some`は必ずnonempty。capを超えてprobeしないためSQLiteのexact-cap exhaustionは次callで観測可能。PostgreSQLは既知buffered countを利用できる。 |
+| validation/error precedence | complete rows wrapper、Query identity、producer batch-plan headerを最初に検証し、malformedはQuery-less `InvalidQuery` item `db.rows.header`。次に`max_rows`を検証し、範囲外はquery-specific `Unsupported` item `db.batch.max_rows`、message `database batch size must be between 1 and 2147483647 rows`。その後terminal state、layout arithmetic、native validationの順。layout/storage overflowはそれぞれitem `db.batch.layout` / `db.batch.storage`とEnglish ledgerのexact messageを返す。各accessorは最初のload/thunk call前にcomplete batch/planを検証し、failureはQuery-less `InvalidQuery` item `db.batch.header`、message `invalid database batch resource`。この順序がmulti-invalidにも適用される。 |
+| ownership/lifetime | `batch<R>`はindependent Move resource。text/blob bytesをbatch-owned storageへcopyしてからnative rowをadvanceするので複数batch coexistとrows advance/Dropが可能。header成功後、`batch_row`はnegative/out-of-rangeで`Ok(None)`、それ以外でdeclaration-orderの`R`を再構築し、全viewをbatch generationだけへrootする。`batch_soa`も同じroot。batch move/Drop後は使用不可。 |
+| allocation/layout | 1つのgeometric fixed-column blockとvariable fieldごとのgeometric child chainをresourceが所有する。primitive/value/headerはtyped column、nullableはpacked validity bitmap。null laneのvalue/header bytesを読まない。child bytesはappend後に再copy/compactしない。final lenがcapacity未満ならfixed columnだけを既存exact-length SoA offset ruleへin-placeで1回compactする。AoS/transposeなし。checked arithmeticはallocation/write前。OOMは通常のAlign allocation abort。 |
+| failure/cleanup | generated appendは全native valueとchild growthをlane mutation前に検証する。error時はpartial batchを非公開のままdestroy後、`next`と同じfirst-error-preserving orderでrows/nativeをclose/poisonする。0-row/partial-final exhaustionではreturn前にrowsをclose。Dropはchild chain、fixed block、producer payload、wrapperをexactly once解放し、partial constructionも同じ順。 |
+| producer/cache | static Query producerだけがlayout/decodeを生成し、packageはproducer-owned typed thunk経由でdispatchする。field-name lookup/reflection/source/artifact/cache I/O/consumer instantiationなし。descriptor/plan bytes、field kind/nullability/order、thunk body、row structural fingerprint、compiler/dependency hashesは既存artifact/object/cache identityへ入る。whole/per-unitでplan/thunk/selected driverをretainする。 |
+| ABI | Query descriptorは136-byte、8-align v5。offset 0--127はv4と同じ、query offset 128はnonnull batch-plan v1 pointer、commandはnull。planは72-byte、8-align: version u32=1@0、flags u8@4(bit0=`SoaPlain`のみ)、reserved 5--7=0、nonzero field_count u32@8、reserved u32@12=0、nonnull `create`/`append`/`finish`/`row`/`drop` pointer@16/24/32/40/56、`soa`@48はbit0とexactly一致、tail_reserved u64@64=0。prepared statementは80-byte v2で0--71 unchanged、plan@72。rowsは96-byte v2で0--87 unchanged、plan@88。batch stateは48-byte、8-align v1: version u32=1@0、live/closed u8@4、copied plan flags u8@5、reserved u16@6=0、nonnull plan/payload@8/16、nonzero len i64@24、requested max_rows i64@32 (`len <= max_rows <= 2_147_483_647`)、tail_reserved u64@40=0。flagsはvalidated planと一致する。independent semantic-to-byte/byte-to-semantic goldenが両record、field ordinal/tag、malformed reserved/tag/pointer rejection、sequence orderを固定する。 |
+| thunk ABI | `create(i64)->raw`はcomplete fixed-layout representabilityをallocation前にcheckし、そのfailureだけnull。`append(raw,raw,resource_ref<rows<R>>)->i32`はatomic direct-column append成功で0、aggregate child overflowで1。`finish(raw,i64)`はfixed compactを最大1回。`row(raw,resource_ref<batch<R>>,i64)->R`、eligible時だけ`soa(raw,resource_ref<batch<R>>)->soa<R>`、`drop(raw)`。abstract `R`/generic thunk/unvalidated signatureはHIR/MIRへ到達しない。 |
+| prerequisite/acceptance | shipped L2/L3/L7/D8とconcrete SoA ABIが前提。ownerはexact public surface/bound whole-per-unit、descriptor/plan byte+signature golden、fake direct-column/layout、SQLite/PostgreSQL lifecycle/error/cleanup、malformed HIR/state、alloc-count Drop balance。direct SoA/batch measurementはcorrectness後にallocation/copy/compact countを記録するだけでgateではない。 |
+
+Implementation closure matrix:
+
+| Cell | Closure | Owner evidence |
+|---|---|---|
+| formation/validation | `R: SoaPlain`時だけsymbolic SoAを形成しanalysis前にconcrete化。descriptor/plan/statement/rows/batchのversion/reserved/pointerをdispatch前に検証しcommandはplanを持たない。 | sema substitution/instantiation、malformed HIR、v5/plan golden |
+| construction/move-in | rows/max/terminal後に1 unpublished payloadをcreateし、全field/growthを検証してtyped columnへ直接commit。textはnative length-aware bytesを使いvalid UTF-8を要求し、embedded U+0000をbyte-exactに保持する。blobはzeroを含む全byteを保持。invalid pointer/length/UTF-8はgrowth/lane mutation前にfail。 | fake all-kind/nullable/empty/partial/exact-cap、両driver direct-column owner |
+| move-out/view | row gatherとeligible SoA viewをbatch rootで返し、Option/generic/branch/`?`を通してprovenanceを保持。 | whole/per-unit lifetime、post-move/post-Drop rejection owner |
+| owner transfer/Drop | block/`if`/`match`/`else`/`?`/replacement/returnで1 ownerだけtransferし、empty/partial/compact/uncompact/terminalの全stateをexactly once cleanup。 | L3 matrix、batch branch/replacement/failpoint/alloc-count owner |
+| driver path | SQLiteはcap超過stepなし、PostgreSQLはcap超過decode/sendなし。partial errorはbatch後native rowsをfirst-error orderでclose。 | zero/partial/exact/multi/decode/native/Drop counter owner |
+| nullable/variable layout | 全value kind×nullable、empty/nonempty text/blob、null/empty、child/fixed growth、compact有無をcrossし、gather/SoA order一致。 | plan matrix、bitmap/header/offset golden、UTF-8/length malformed owner |
+| generic/separate compile | 全operationで`batch<R>`からR inference、concrete bound reject、abstract SoA serializationなし、whole/per-unit retain。 | interface golden、wrong-bound diagnostic、whole/per-unit executable |
+| ABI/allocation parity | direct/preparedが同planをv2 stateへ運び、fake/SQLite/PostgreSQLが同じv1 batch stateを使う。producer/package/HIR/MIR/LLVMでsize/offset/signature/cleanup provenance一致。 | byte/relocation/HIR ABI goldenとalloc-count parity |
+
+implementation前にauthor-side ledger-to-prose/matrix passとfresh independent adversarial reviewを
+1回行う。code review前にmatrix-to-diff passを再実施し、全cellへimplementation pathとownerを
+対応させるか別A1 railへのexplicit deferを記す。
 
 bounded batch generation、PostgreSQL binary format、segmented child/validity bitmap、
 eligible direct SoA、COPY/pipeline/single-row/LISTEN-NOTIFY、SQLite backup/blob/FTS、

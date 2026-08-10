@@ -199,8 +199,10 @@ own (`x + x` on a bare `T` is rejected). A **builtin bound** grants capabilities
 — in a fixed `Num ⊃ Ord ⊃ Eq` hierarchy: `Num` = arithmetic+ordering+equality (numbers), `Ord` =
 ordering+equality (numbers, `char`, `str`), `Eq` = equality (numbers, `char`, `bool`, `str`). A type
 argument that does not satisfy the bound is a compile error. No user-defined trait bounds.
-`RegionPlain` is the separate closed structural bound for region-backed plain construction; it is
-not in the numeric hierarchy and grants no arithmetic/equality operation.
+`RegionPlain` and `SoaPlain` are separate closed structural bounds outside the numeric hierarchy.
+`RegionPlain` grants region-backed plain construction. `SoaPlain` accepts exactly a nonempty struct
+of integer/float/`bool`/`char`/`str` fields and grants only symbolic `soa<T>` formation at a generic
+boundary. Neither grants arithmetic/equality operations.
 
 A type parameter may also appear nested in an `Option<T>` / `Result<T, E>` (parameter or return
 position) — generic combinators like `fn unwrap_or<T>(o: Option<T>, d: T) -> T`. **Structs and sum types may
@@ -213,6 +215,10 @@ Move/escape analysis and MIR. `RegionPlain` is a closed builtin structural bound
 plain construction; it is not a user trait. Definitions nested inside functions, call-site
 turbofish, runtime dictionaries/reflection, and new concrete container element capabilities remain
 absent.
+
+`soa<R>` is an additional symbolic template form only when `R: SoaPlain`; it substitutes to the
+ordinary concrete `soa<Struct>` before Move/escape analysis and MIR. No abstract SoA or runtime
+type test survives monomorphization.
 
 ```align
 fn id<T>(x: T) -> T = x                  // unconstrained: pass/return only
@@ -425,8 +431,13 @@ restriction does not narrow ordinary JSON behavior. A field may also
 be an owned `array<Struct>` (the `messages: array<Message>` shape) — decode fills an owned
 array-of-structs in the field (freed by the struct's drop) and encode renders it back, so a full
 OpenAI request/response round-trips. The element struct may itself be Move and is deep-dropped;
-bare `array<string>` fields remain deferred. `soa<T>` columns stay primitive/`str`. The settled
-completeness design (draft §14): a JSON `oneOf` maps to a sum
+bare `array<string>` fields remain deferred. `soa<T>` columns stay primitive/`str`.
+
+An owning package resource may expose a borrowed `soa<T>` view over its exact-length column buffer;
+that resource generation is then the lifetime root. `pkg.db.batch_soa<T: SoaPlain>` uses this form.
+It does not create an owned `soa<T>` value or admit Move-fielded columns.
+
+The settled completeness design (draft §14): a JSON `oneOf` maps to a sum
 type discriminated by pairwise-distinct **shape classes** (compile-checked; O(1) dispatch, encode
 writes the live payload bare); schema-unknown JSON is read through the zero-copy arena-backed
 `json.doc` view (no serde-style value tree, no map type) — `d := json.doc(s)?` in an `arena {}`, then
