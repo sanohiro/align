@@ -3,7 +3,27 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: scripts/pre-pr.sh [--docs-only | --reviewer ID --review-log FILE [--findings-fixed]] [--base REF] [--owner-test LABEL] [-- COMMAND ...]" >&2
+  cat >&2 << 'USAGE'
+usage: scripts/pre-pr.sh [--docs-only | --reviewer ID --review-log FILE [--findings-fixed]] [--base REF] [--owner-test LABEL] [-- COMMAND ...]
+
+A code PR needs all of:
+  --reviewer ID            reviewer identity ([A-Za-z0-9._-]+)
+  --review-log FILE        review evidence file, kept OUTSIDE the repository
+                           (an untracked file here fails the clean-worktree check)
+  -- COMMAND ...           one focused owner verification command, e.g.
+                           -- scripts/cargo.sh test -p align_driver --test pkg_db_q6
+
+The review log must contain, in this order:
+  ALIGN_REVIEW_HEAD=<40-hex reviewed candidate SHA>
+  ALIGN_REVIEW_BASE=<40-hex merge-base SHA of --base>
+  ...free-form review record...
+  ALIGN_REVIEW_VERDICT=CLEAN | ALIGN_REVIEW_VERDICT=FINDINGS   (last non-empty line)
+
+A CLEAN verdict must belong to the exact final HEAD. FINDINGS requires
+--findings-fixed and a later fix commit descending from the reviewed HEAD.
+The recorded stamp binds the final HEAD: push and open the PR immediately,
+without amending, rebasing, or committing in between.
+USAGE
   exit 2
 }
 

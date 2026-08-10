@@ -37,38 +37,34 @@ allocation/copies, and whole/per-unit mutable-retention parity. The next product
 work is the first independently useful A1/D13 throughput rail: common bounded
 batch/SoA delivery.
 
-Known pre-existing failure for the pkg.db owner (found 2026-08-09, present on
-`main`, unrelated to the toolchain work that surfaced it):
-`per_unit_surface::emit_llvm_n1_has_no_banner_and_matches_whole_program` fails
-because the CLI emits ~8 `align_fn$…pkg.db.internal$…` extern declarations into
-every program — including one with no database usage — while the library
-`emit_llvm` helper does not. Decide whether unconditional static-constructor
-declaration emission is intended (then update the parity test) or a leak from
-the static-input discovery wave (then gate the declarations on actual use). The
-suite is not in the bounded CI gate, which is why this went unnoticed.
+Out-of-gate suite status (suites outside the bounded CI gate; a nightly
+full-suite workflow now runs them daily so this class cannot rot silently):
 
-A second pre-existing failure of the same "outside the bounded gate" class
-(found 2026-08-10, present on `main`):
-`buffer_donate::no_donation_for_mismatched_layout` and
-`buffer_donate::toggle_off_reverts_to_allocate_and_free` assert the source
-array's free as a `drop_value` MIR substring, but cleanup now lowers through
-the dynamic-bit `drop _n` / `return_with_cleanup` form, so the source is freed
-and only the assertion spelling is stale. Update the two assertions to the
-current cleanup spelling (or assert the absence of a leak structurally).
-`m4::pipeline_fuses_into_one_loop` is the same class: the pipeline is fused
-correctly, but the assertion greps the pre-qualification `call double`
-spelling while the printer now writes `call program double`.
+- The 2026-08-09 `per_unit_surface` CLI/library parity failure was fixed on
+  `main` by #731 (gate-on-use in `install_static_descriptor_data`); a unit
+  regression owner inside the bounded gate now pins the empty-descriptor path.
+- The stale `drop_value` and `call double` MIR-spelling assertions in
+  `buffer_donate` and `m4` are updated to the current cleanup and
+  call-qualification spellings.
 
-Higher-priority pre-existing failure (found 2026-08-10, present on `main`,
-verified against a clean baseline build): three `owned_structs_arrays` owners
-(`element_owned_field_reassign_drops_old`,
-`element_nested_owned_field_reassign_drops_old`,
-`reading_string_field_of_element_as_a_view`) fail because `emit-mir` produces
-an **empty program** for a fixed struct-literal array with Move `string`
-fields plus an element-field reassignment — check passes, no MIR is emitted,
-codegen produces no `_main`, and the link fails. This is not a stale
-assertion; triage which recent `main` change silenced MIR lowering for this
-shape before the next release.
+Known remaining pre-existing hang (found 2026-08-10, reproduced twice
+including a build without this branch's validator change, both at CPU 0 for
+40+ minutes): `fuzz_differential::result_question_chain_computes_the_oracle_value`
+never completes. Its generators are integer-only Result chains, untouched by
+the owned-string validator work; triage the hang (likely a generated binary
+blocking) before relying on the nightly full-suite signal, which it will
+otherwise consume up to the job timeout.
+
+Fixed on this branch (was present on `main` since the 62f48771 checked-HIR
+validation activation): the body validator contradicted sema on owned-`string`
+fixed-array elements and on reading a `string` element field as a borrowed
+`str` view, so `emit-mir` silently produced an **empty program** (check ok, no
+`_main`, link failure) for those shapes. The validator now mirrors sema's
+contract, the three `owned_structs_arrays` owners are green again, and a
+checked unit whose functions vanish at the MIR boundary is now a loud internal
+error in the shared CLI walk instead of a silent empty binary; the library
+lowering entry points keep their tested fail-closed empty-program contract for
+hand-constructed HIR.
 
 The completed prerequisite waves and current product boundary are:
 

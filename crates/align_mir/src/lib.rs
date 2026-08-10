@@ -104,7 +104,7 @@ pub struct ImportedFn {
     pub return_cleanup: hir::ReturnCleanupAbi,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Program {
     pub fns: Vec<Function>,
     /// Foreign (`extern "C"`) declarations, passed through from HIR unchanged; codegen emits an
@@ -1691,6 +1691,11 @@ pub fn lower_program(program: &hir::Program) -> Program {
 /// [`lower_program`]. The only difference is populated `Block::stmt_lines`.
 pub fn lower_program_located(program: &hir::Program, sm: &SourceMap) -> Program {
     if !hir_program_is_valid(program) {
+        // Fail closed: hand-constructed or malformed HIR lowers to an empty program rather than
+        // proceeding into lowering invariants that assume checked input (`assert_rejected` pins
+        // this for every entry point). The DRIVER is responsible for making this loud: a checked
+        // program with functions that lowers to an empty program is a compiler defect and the
+        // CLI refuses to emit it (previously it silently shipped an empty binary with exit 0).
         return empty_program();
     }
     lower_program_unchecked(
@@ -1720,6 +1725,11 @@ pub fn lower_program_per_unit(program: &hir::Program) -> Program {
 /// and the per-unit boundary (so a cross-unit call stays an opaque call).
 pub fn lower_program_per_unit_located(program: &hir::Program, sm: &SourceMap) -> Program {
     if !hir_program_is_valid(program) {
+        // Fail closed: hand-constructed or malformed HIR lowers to an empty program rather than
+        // proceeding into lowering invariants that assume checked input (`assert_rejected` pins
+        // this for every entry point). The DRIVER is responsible for making this loud: a checked
+        // program with functions that lowers to an empty program is a compiler defect and the
+        // CLI refuses to emit it (previously it silently shipped an empty binary with exit 0).
         return empty_program();
     }
     lower_program_unchecked(
@@ -1734,6 +1744,11 @@ pub fn lower_program_per_unit_located(program: &hir::Program, sm: &SourceMap) ->
 #[inline]
 fn lower_program_impl(program: &hir::Program, lines: Option<Rc<SourceLines>>, per_unit: bool) -> Program {
     if !hir_program_is_valid(program) {
+        // Fail closed: hand-constructed or malformed HIR lowers to an empty program rather than
+        // proceeding into lowering invariants that assume checked input (`assert_rejected` pins
+        // this for every entry point). The DRIVER is responsible for making this loud: a checked
+        // program with functions that lowers to an empty program is a compiler defect and the
+        // CLI refuses to emit it (previously it silently shipped an empty binary with exit 0).
         return empty_program();
     }
     lower_program_unchecked(program, lines, per_unit)
@@ -1751,18 +1766,7 @@ fn hir_program_is_valid(program: &hir::Program) -> bool {
 }
 
 fn empty_program() -> Program {
-    Program {
-        fns: Vec::new(),
-        externs: Vec::new(),
-        imported_fns: Vec::new(),
-        link_libs: Vec::new(),
-        structs: Vec::new(),
-        enums: Vec::new(),
-        resources: Vec::new(),
-        tagged_types: Vec::new(),
-        fn_types: Vec::new(),
-        tuples: Vec::new(),
-    }
+    Program::default()
 }
 
 fn lower_program_unchecked(
@@ -15333,6 +15337,91 @@ fn main() -> i32 {
         assert!(
             !validate_hir::body_only_metadata_is_valid(&malformed),
             "an ABI-incompatible QueryMeta record must fail before MIR lowering",
+        );
+    }
+
+    #[test]
+    fn owned_string_array_shapes_pass_the_hir_gate_and_near_misses_fail() {
+        // Regression owner for the 62f48771 activation gap: sema admits owned-`string` fixed
+        // array elements and reads a `string` element field as a borrowed `str` view, but the
+        // body validator rejected both, silently dropping every checked function (empty binary,
+        // `_main` link failure). The valid shapes must pass the gate; the mutated near-misses
+        // pin that the relaxation admits exactly sema's contract and nothing wider.
+        let main = r#"module main
+User { name: string, age: i64 }
+fn main() -> i32 {
+  ss := ["aaaa".clone()]
+  mut us := [User{name: "bee".clone(), age: 1}, User{name: "cee".clone(), age: 2}]
+  us[0].name = "cc".clone()
+  name0: str := us[0].name
+  return (name0.len() + us[1].name.len() + ss.len()) as i32
+}
+"#;
+        let (hir, diagnostics) = check_modules(&[("main", true, main)]);
+        assert!(
+            !diagnostics.has_errors(),
+            "owned-string array fixture failed: {:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            hir_program_is_valid(&hir),
+            "owned-string array literals and element-field views must pass the HIR gate",
+        );
+        let lowered = lower_program(&hir);
+        assert!(
+            !lowered.fns.is_empty(),
+            "a valid checked program must never lower to an empty MIR program",
+        );
+
+        // Near-miss 1: an element-field read whose checked type claims the owned `String`
+        // instead of the demoted `str` view must still fail the gate.
+        let mut claimed_owned = hir.clone();
+        let function = claimed_owned
+            .fns
+            .iter_mut()
+            .find(|function| function.name.as_str().ends_with("main"))
+            .expect("main function present");
+        let mut flipped = false;
+        for statement in function.body.stmts.iter_mut() {
+            if let hir::Stmt::Let { init, .. } = statement {
+                if matches!(init.kind, hir::ExprKind::ElemField { .. }) && init.ty == Ty::Str {
+                    init.ty = Ty::String;
+                    flipped = true;
+                }
+            }
+        }
+        assert!(flipped, "fixture must contain a direct element-field view binding");
+        assert!(
+            !validate_hir::body_only_metadata_is_valid(&claimed_owned),
+            "an element-field read typed as the owned string must fail before MIR lowering",
+        );
+
+        // Near-miss 2: a Move element other than `string` (a box) in an array literal must
+        // still fail — the relaxation admits only sema's owned-`string` exception.
+        let mut boxed_element = hir.clone();
+        let function = boxed_element
+            .fns
+            .iter_mut()
+            .find(|function| function.name.as_str().ends_with("main"))
+            .expect("main function present");
+        let mut flipped = false;
+        for statement in function.body.stmts.iter_mut() {
+            if let hir::Stmt::Let { init, .. } = statement {
+                if let hir::ExprKind::ArrayLit { elem, .. } = &mut init.kind {
+                    if *elem == Ty::String {
+                        *elem = Ty::Box(Scalar::Int(IntTy { bits: 64, signed: true }));
+                        flipped = true;
+                    }
+                }
+            }
+        }
+        assert!(flipped, "fixture must contain an owned-string array literal");
+        assert!(
+            !validate_hir::body_only_metadata_is_valid(&boxed_element),
+            "a Move box element in an array literal must fail before MIR lowering",
         );
     }
 

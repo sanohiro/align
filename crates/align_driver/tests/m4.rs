@@ -46,7 +46,10 @@ fn pipeline_fuses_into_one_loop() {
     let text = align_mir::print::program_to_string(&lower_to_mir(&checked.hir));
     // Fusion: the map and where calls appear inside the loop body, and there is no
     // intermediate array store of mapped results (only the source literal is stored).
-    assert!(text.contains("call double") && text.contains("call big"), "stages not inlined:\n{text}");
+    assert!(
+        text.contains("call program double") && text.contains("call program big"),
+        "stages not inlined:\n{text}"
+    );
     // Exactly one loop back-edge target reused (single loop): the source is stored once.
     assert_eq!(text.matches("<- 1_i32").count(), 1, "source stored once:\n{text}");
 }
