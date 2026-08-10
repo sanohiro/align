@@ -362,6 +362,44 @@ contradictory, or changed areas.
 
 ## Review before merging
 
+Verification is proportional to blast radius. `scripts/pre-pr.sh` classifies
+every diff through one shared classifier (`scripts/pr-tier.sh`, which the CI
+attestation checker also runs against the same diff) and enforces the matching
+gate, so the tier is a property of the changed paths and cannot be claimed:
+
+```text
+docs-only  *.md and docs/ only, with       no reviewer, no owner check
+           --docs-only
+tooling    leaf owner tests that are not   review OPTIONAL, one focused owner
+           bounded-gate content, and       check (plus the cheap ratchet when
+           prose that is not compiled      Rust changed); no bounded gate,
+           into a binary                   no Clippy
+code       everything else                 one fresh review, owner check,
+                                           bounded gate, Clippy
+```
+
+Machinery that CI fetches from the trusted base needs one explicit
+bootstrap arm in `preflight.yml` for the PR that introduces it, keyed on that
+PR number: the base has no copy yet, and falling back to the PR's own copy
+would let a change supply the rules that judge it.
+
+The classifier fails closed in every direction: an unknown path shape, an
+uncomputable diff, and any deletion are all code tier — removing a file takes
+away coverage, so it can never be light.
+That deliberately keeps `scripts/` and `.github/` — which compile nothing but
+gate every future PR — under the full review, and keeps shared test
+infrastructure (`tests/common*`, `tests/helpers/`, `tests/fixtures/`,
+`tests/golden/`, and any nested module under `tests/`) out of the light tier,
+because one file there reaches every suite. Only a leaf owner test, whose
+blast radius is the target its own owner check compiles and runs, takes the
+light path. Path shape alone is not enough evidence: the test targets
+`scripts/test-pr.sh` names *are* the bounded gate, and a document reached by
+`include_str!` is a source input to a test binary, so `scripts/pr-tier.sh`
+lists both and `scripts/test-pr-workflow.sh` recomputes those sets from the
+repository and fails when a list goes stale. Passing `--reviewer` with a log in
+a light tier still records a review exactly as the code tier does — the tier
+removes the requirement, not the option.
+
 The PR is a publication checkpoint, not a second implementation loop. The
 normal code path is exactly:
 
@@ -388,6 +426,21 @@ layers, or responds to a P1 by redesigning the implementation. A local
 ownership, cleanup, FFI, ABI, diagnostic, or test correction closes against
 the original finding and its owner check. The user may explicitly request a
 second review.
+
+**The one-review/one-fix cycle is enforced, not merely stated.** Preflight
+counts the consecutive `fix` commits following the implementation on the
+branch; at three it fails unless one of them both changed an authoritative
+contract document — a `docs/impl` plan or audit for a compiler or package
+capability, or this file for the process machinery itself, with translated
+`ja/` mirrors excluded — and carried a `Closure-Matrix-Reopened: <axis>`
+trailer. Three rounds of patching
+individually reported cells is the signature of a matrix that missed an axis —
+the required response is to enumerate that axis, fix the class in one pass, and
+commit the updated matrix with that trailer. Measured cost of ignoring this:
+24–36 minutes per round, and the two capabilities that ran four and nine rounds
+spent 3.5 and 4.75 hours respectively inside the loop. Naming a commit outside
+the `fix` prefix also resets the counter; that is a visible choice in the
+history, and reviewers should read a renamed streak as the same smell.
 
 Finish ordinary PR-body prose before opening. If a later code push is actually
 required, rerun preflight for the new SHA and refresh the existing PR with

@@ -40,7 +40,6 @@ sed 's/align-preflight-reviewer:docs-only/align-preflight-reviewer:reviewer-1/' 
 sed "s/$good_sha/ffffffffffffffffffffffffffffffffffffffff/" "$good_body" >"$stale_body"
 
 "$repo_root/scripts/check-pr-preflight.sh" "$good_sha" "$base_ref" "$base_sha" "$good_body"
-"$repo_root/scripts/check-pr-preflight.sh" "$good_sha" "$base_ref" "$base_sha" "$docs_body"
 if "$repo_root/scripts/check-pr-preflight.sh" \
   "$good_sha" "$base_ref" "$base_sha" "$bad_docs_body" >/dev/null 2>&1
 then
@@ -55,13 +54,20 @@ then
 fi
 
 docs_repo="$tmp_dir/docs-repo"
-mkdir -p "$docs_repo/docs"
+mkdir -p "$docs_repo/docs" "$docs_repo/scripts"
+cp "$repo_root/scripts/pr-tier.sh" "$docs_repo/scripts/pr-tier.sh"
+# A root-level tool script is library tier, so this fixture reaches the gate
+# commands; stub them to keep the guard logic under test.
+for stub in lint-ratchet.sh test-pr.sh cargo.sh; do
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$docs_repo/scripts/$stub"
+  chmod +x "$docs_repo/scripts/$stub"
+done
 git -C "$docs_repo" init -q -b main
 git -C "$docs_repo" config user.name workflow-test
 git -C "$docs_repo" config user.email workflow-test@example.invalid
 git -C "$docs_repo" config commit.gpgsign false
 printf '# baseline\n' >"$docs_repo/docs/note.md"
-git -C "$docs_repo" add docs/note.md
+git -C "$docs_repo" add docs/note.md scripts
 git -C "$docs_repo" commit -qm baseline
 git -C "$docs_repo" switch -qc docs-change
 printf '\nupdated\n' >>"$docs_repo/docs/note.md"
@@ -287,10 +293,271 @@ set -e
   exit 1
 }
 
+# The classifier's two evidence lists must stay equal to what the machinery
+# actually references; recompute both from the repository so adding a gate
+# target or embedding a new document cannot silently widen the light tier.
+# shellcheck source=scripts/pr-tier.sh
+. "$repo_root/scripts/pr-tier.sh"
+actual_gate_tests="$(grep -oE '\-\-test [a-z0-9_]+' "$repo_root/scripts/test-pr.sh" |
+  awk '{print $2}' | sort -u | tr '\n' ' ')"
+declared_gate_tests="$(printf '%s\n' $PR_TIER_GATE_TESTS | sort -u | tr '\n' ' ')"
+[[ "$actual_gate_tests" == "$declared_gate_tests" ]] || {
+  echo "PR_TIER_GATE_TESTS is stale" >&2
+  echo "  scripts/test-pr.sh names: $actual_gate_tests" >&2
+  echo "  scripts/pr-tier.sh lists: $declared_gate_tests" >&2
+  exit 1
+}
+actual_prose="$(
+  cd "$repo_root" || exit 1
+  grep -rhoE 'include_(str|bytes)!\("[^"]*\.md"\)' crates 2>/dev/null |
+    sed -E 's/.*!\("([^"]+)"\)/\1/' |
+    sed -E 's#^(\.\./)+##' |
+    sort -u | tr '\n' ' '
+)"
+declared_prose="$(printf '%s\n' $PR_TIER_COMPILED_PROSE | sort -u | tr '\n' ' ')"
+[[ "$actual_prose" == "$declared_prose" ]] || {
+  echo "PR_TIER_COMPILED_PROSE is stale" >&2
+  echo "  crates embed: $actual_prose" >&2
+  echo "  pr-tier.sh lists: $declared_prose" >&2
+  exit 1
+}
+for gate_test in $PR_TIER_GATE_TESTS; do
+  pr_tier_path_is_library "crates/align_driver/tests/${gate_test}.rs" || {
+    echo "bounded-gate test $gate_test classified as tooling" >&2
+    exit 1
+  }
+done
+for embedded_doc in $PR_TIER_COMPILED_PROSE; do
+  pr_tier_path_is_library "$embedded_doc" || {
+    echo "compiled document $embedded_doc classified as tooling" >&2
+    exit 1
+  }
+done
+pr_tier_path_is_library "crates/align_driver/tests/pkg_db_q6.rs" && {
+  echo "an ordinary leaf owner test must stay in the tooling tier" >&2
+  exit 1
+}
+
+# Tier classification and the review-round tripwire.
+tier_repo="$tmp_dir/tier-repo"
+mkdir -p "$tier_repo/crates/thing/src" "$tier_repo/crates/thing/tests" \
+  "$tier_repo/docs/impl" "$tier_repo/scripts"
+cp "$repo_root/scripts/pr-tier.sh" "$tier_repo/scripts/pr-tier.sh"
+# The fixture stands in for the real repository, whose crates/ changes always
+# run the cheap ratchet; stub it so the tier logic is what is under test.
+for stub in lint-ratchet.sh test-pr.sh cargo.sh; do
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$tier_repo/scripts/$stub"
+  chmod +x "$tier_repo/scripts/$stub"
+done
+git -C "$tier_repo" init -q -b main
+git -C "$tier_repo" config user.name workflow-test
+git -C "$tier_repo" config user.email workflow-test@example.invalid
+git -C "$tier_repo" config commit.gpgsign false
+printf 'fn main() {}\n' >"$tier_repo/crates/thing/src/lib.rs"
+printf '#[test]\nfn baseline() {}\n' >"$tier_repo/crates/thing/tests/baseline_owner.rs"
+printf '# plan\n' >"$tier_repo/docs/impl/00-plan.md"
+git -C "$tier_repo" add .
+git -C "$tier_repo" commit -qm baseline
+
+tier_preflight() { (cd "$tier_repo" && "$repo_root/scripts/pre-pr.sh" "$@"); }
+tier_branch() {
+  git -C "$tier_repo" switch -q main
+  git -C "$tier_repo" switch -qc "$1"
+}
+
+# A leaf owner test is the tooling tier: no reviewer required, and the stamp
+# records the tier so the PR wrappers accept the lighter attestation.
+tier_branch tooling-change
+mkdir -p "$tier_repo/crates/thing/tests"
+printf '#[test]\nfn t() {}\n' >"$tier_repo/crates/thing/tests/owner.rs"
+git -C "$tier_repo" add crates/thing/tests/owner.rs
+git -C "$tier_repo" commit -qm 'test: add owner'
+tier_preflight --base main --owner-test tier -- true >/dev/null
+tooling_head="$(git -C "$tier_repo" rev-parse HEAD)"
+grep -Fqx 'kind=tooling' "$tier_repo/.git/align-preflight/$tooling_head"
+grep -Fqx 'review_state=tooling' "$tier_repo/.git/align-preflight/$tooling_head"
+
+# Everything the light tier must NOT swallow. Each of these reaches beyond one
+# owner check, so each must demand the full review.
+library_case() {
+  local label="$1" path="$2"
+  tier_branch "lib-${label}"
+  mkdir -p "$tier_repo/$(dirname "$path")"
+  printf 'shared\n' >"$tier_repo/$path"
+  git -C "$tier_repo" add "$path"
+  git -C "$tier_repo" commit -qm "add $label"
+  local status=0
+  tier_preflight --base main --owner-test tier -- true >/dev/null 2>"$tmp_dir/tier-err" || status=$?
+  [[ "$status" -eq 2 ]] || {
+    echo "$label unexpectedly took the tooling tier (status $status)" >&2
+    exit 1
+  }
+  grep -q 'requires --reviewer' "$tmp_dir/tier-err" || {
+    echo "$label failed for the wrong reason:" >&2
+    cat "$tmp_dir/tier-err" >&2
+    exit 1
+  }
+}
+library_case harness crates/thing/tests/common/mod.rs
+library_case harness-file crates/thing/tests/common.rs
+library_case helpers crates/thing/tests/helpers/mod.rs
+library_case fixture crates/thing/tests/fixtures/stub.c
+library_case golden crates/thing/tests/golden/expected.ll
+library_case nested-src crates/thing/src/tests/mod.rs
+library_case script scripts/new-gate.sh
+library_case workflow .github/workflows/new.yml
+library_case unknown-tree newcrate/src/lib.rs
+
+# Deleting a leaf owner test removes coverage: never the light tier.
+tier_branch delete-change
+git -C "$tier_repo" rm -q crates/thing/tests/baseline_owner.rs
+git -C "$tier_repo" commit -qm 'test: remove a leaf owner'
+delete_status=0
+tier_preflight --base main --owner-test tier -- true >/dev/null 2>&1 || delete_status=$?
+[[ "$delete_status" -ne 0 ]] || {
+  echo "deleting a leaf owner test unexpectedly took the tooling tier" >&2
+  exit 1
+}
+
+# A library source change classifies as code and keeps the full attestation.
+tier_branch code-change
+printf 'fn added() {}\n' >>"$tier_repo/crates/thing/src/lib.rs"
+git -C "$tier_repo" commit -qam 'feat: extend the library'
+code_log="$tmp_dir/code-review.log"
+{
+  printf 'ALIGN_REVIEW_HEAD=%s\n' "$(git -C "$tier_repo" rev-parse HEAD)"
+  printf 'ALIGN_REVIEW_BASE=%s\n' "$(git -C "$tier_repo" rev-parse 'main^{commit}')"
+  printf 'ALIGN_REVIEW_VERDICT=CLEAN\n'
+} >"$code_log"
+tier_preflight --reviewer reviewer-1 --review-log "$code_log" --base main \
+  --owner-test tier -- true >/dev/null
+code_head="$(git -C "$tier_repo" rev-parse HEAD)"
+grep -Fqx 'kind=code' "$tier_repo/.git/align-preflight/$code_head"
+
+# Three consecutive review-fix commits without re-opening a closure matrix is
+# the review-as-discovery-loop pattern and must fail. Neither a translated
+# mirror nor an untrailered docs/impl edit releases it; the trailer plus an
+# authoritative matrix change does.
+tier_branch rounds-change
+mkdir -p "$tier_repo/crates/thing/tests" "$tier_repo/docs/impl/ja"
+printf '#[test]\nfn a() {}\n' >"$tier_repo/crates/thing/tests/rounds.rs"
+printf '# mirror\n' >"$tier_repo/docs/impl/ja/00-plan.md"
+git -C "$tier_repo" add crates/thing/tests/rounds.rs docs/impl/ja/00-plan.md
+git -C "$tier_repo" commit -qm 'feat: add rounds owner'
+for round in 1 2 3; do
+  printf '#[test]\nfn r%s() {}\n' "$round" >>"$tier_repo/crates/thing/tests/rounds.rs"
+  git -C "$tier_repo" commit -qam "fix: close review finding $round"
+done
+if tier_preflight --base main --owner-test tier -- true >/dev/null 2>&1; then
+  echo "three review-fix rounds unexpectedly passed without a matrix re-open" >&2
+  exit 1
+fi
+printf '\nmirror update\n' >>"$tier_repo/docs/impl/ja/00-plan.md"
+git -C "$tier_repo" commit -qam 'fix: update the translated mirror
+
+Closure-Matrix-Reopened: mirror only'
+if tier_preflight --base main --owner-test tier -- true >/dev/null 2>&1; then
+  echo "a translated mirror unexpectedly released the review-round gate" >&2
+  exit 1
+fi
+printf '\n## reopened axis\n' >>"$tier_repo/docs/impl/00-plan.md"
+git -C "$tier_repo" commit -qam 'fix: touch the plan without declaring the axis'
+if tier_preflight --base main --owner-test tier -- true >/dev/null 2>&1; then
+  echo "an untrailered docs/impl edit unexpectedly released the review-round gate" >&2
+  exit 1
+fi
+printf '\n## second axis\n' >>"$tier_repo/docs/impl/00-plan.md"
+git -C "$tier_repo" commit -qam 'fix: re-open the closure matrix
+
+Closure-Matrix-Reopened: callback ABI'
+tier_preflight --base main --owner-test tier -- true >/dev/null
+
+# A docs-only branch is never subject to the review-round gate, and its
+# attestation survives the CI-side tier recomputation.
+tier_branch docs-rounds
+for round in 1 2 3; do
+  printf 'line %s\n' "$round" >>"$tier_repo/docs/impl/00-plan.md"
+  git -C "$tier_repo" commit -qam "fix: prose $round"
+done
+tier_preflight --docs-only --base main >/dev/null
+(
+  cd "$tier_repo"
+  docs_claim_head="$(git rev-parse HEAD)"
+  docs_claim_base="$(git rev-parse main)"
+  real_docs_body="$tmp_dir/real-docs-body"
+  {
+    printf '<!-- align-preflight-version:1 -->\n'
+    printf '<!-- align-preflight-head:%s -->\n' "$docs_claim_head"
+    printf '<!-- align-preflight-base-ref:main -->\n'
+    printf '<!-- align-preflight-base-sha:%s -->\n' "$docs_claim_base"
+    printf '<!-- align-preflight-review:docs-only -->\n'
+    printf '<!-- align-preflight-review-head:%s -->\n' "$docs_claim_head"
+    printf '<!-- align-preflight-reviewer:docs-only -->\n'
+  } >"$real_docs_body"
+  "$repo_root/scripts/check-pr-preflight.sh" \
+    "$docs_claim_head" main "$docs_claim_base" "$real_docs_body" >/dev/null
+)
+
+# Body-level attestation checks for the light state, including the
+# recomputation that stops a library diff from claiming it.
+tooling_body="$tmp_dir/tooling-body"
+{
+  printf '<!-- align-preflight-version:1 -->\n'
+  printf '<!-- align-preflight-head:%s -->\n' "$good_sha"
+  printf '<!-- align-preflight-base-ref:%s -->\n' "$base_ref"
+  printf '<!-- align-preflight-base-sha:%s -->\n' "$base_sha"
+  printf '<!-- align-preflight-review:tooling -->\n'
+  printf '<!-- align-preflight-review-head:%s -->\n' "$good_sha"
+  printf '<!-- align-preflight-reviewer:tooling -->\n'
+} >"$tooling_body"
+sed 's/align-preflight-reviewer:tooling/align-preflight-reviewer:reviewer-1/' \
+  "$tooling_body" >"$tmp_dir/bad-tooling-body"
+if "$repo_root/scripts/check-pr-preflight.sh" \
+  "$good_sha" "$base_ref" "$base_sha" "$tmp_dir/bad-tooling-body" >/dev/null 2>&1
+then
+  echo "tooling attestation with a named reviewer unexpectedly passed" >&2
+  exit 1
+fi
+(
+  cd "$tier_repo"
+  claim_head="$(git rev-parse code-change)"
+  claim_base="$(git rev-parse main)"
+  claim_body="$tmp_dir/claim-body"
+  {
+    printf '<!-- align-preflight-version:1 -->\n'
+    printf '<!-- align-preflight-head:%s -->\n' "$claim_head"
+    printf '<!-- align-preflight-base-ref:main -->\n'
+    printf '<!-- align-preflight-base-sha:%s -->\n' "$claim_base"
+    printf '<!-- align-preflight-review:tooling -->\n'
+    printf '<!-- align-preflight-review-head:%s -->\n' "$claim_head"
+    printf '<!-- align-preflight-reviewer:tooling -->\n'
+  } >"$claim_body"
+  if "$repo_root/scripts/check-pr-preflight.sh" \
+    "$claim_head" main "$claim_base" "$claim_body" >/dev/null 2>&1
+  then
+    echo "a library diff unexpectedly passed under a tooling attestation" >&2
+    exit 1
+  fi
+  tooling_claim_head="$(git rev-parse tooling-change)"
+  ok_body="$tmp_dir/ok-tooling-body"
+  {
+    printf '<!-- align-preflight-version:1 -->\n'
+    printf '<!-- align-preflight-head:%s -->\n' "$tooling_claim_head"
+    printf '<!-- align-preflight-base-ref:main -->\n'
+    printf '<!-- align-preflight-base-sha:%s -->\n' "$claim_base"
+    printf '<!-- align-preflight-review:tooling -->\n'
+    printf '<!-- align-preflight-review-head:%s -->\n' "$tooling_claim_head"
+    printf '<!-- align-preflight-reviewer:tooling -->\n'
+  } >"$ok_body"
+  "$repo_root/scripts/check-pr-preflight.sh" \
+    "$tooling_claim_head" main "$claim_base" "$ok_body" >/dev/null
+)
+
 for script in \
   scripts/cargo.sh \
   scripts/check-pr-preflight.sh \
   scripts/open-pr.sh \
+  scripts/pr-tier.sh \
   scripts/pre-pr.sh \
   scripts/review-bounded.sh \
   scripts/test-pr-workflow.sh

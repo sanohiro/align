@@ -6,6 +6,15 @@ usage() {
   cat >&2 << 'USAGE'
 usage: scripts/pre-pr.sh [--docs-only | --reviewer ID --review-log FILE [--findings-fixed]] [--base REF] [--owner-test LABEL] [-- COMMAND ...]
 
+The tier follows the changed paths (scripts/pr-tier.sh, fail-closed):
+  docs-only  *.md and docs/ only           pass --docs-only; no owner command
+  tooling    leaf crates/*/tests/*.rs      review optional; one owner command
+             that is not gate content,     (plus the ratchet when Rust changed)
+             and uncompiled prose
+  code       everything else, including    review required; owner command, then
+             scripts/, .github/, shared    the bounded gate and Clippy
+             test harnesses and fixtures
+
 A code PR needs all of:
   --reviewer ID            reviewer identity ([A-Za-z0-9._-]+)
   --review-log FILE        review evidence file, kept OUTSIDE the repository
@@ -65,15 +74,89 @@ git diff --quiet "$base_sha"...HEAD && {
 
 review_head="$head_sha"
 review_state="docs-only"
+rust_changed=false
+non_documentation_changed=false
+# shellcheck source=scripts/pr-tier.sh
+. "$(dirname "$0")/pr-tier.sh"
+library_changed=false
+pr_tier_library_changed "$base_sha" "$head_sha" && library_changed=true
+while IFS= read -r path; do
+  case "$path" in *.md|docs/*) ;; *) non_documentation_changed=true ;; esac
+  case "$path" in
+    crates/*|Cargo.toml|Cargo.lock|rust-toolchain*|.cargo/*) rust_changed=true ;;
+  esac
+  case "$path" in *.sh) [[ ! -f "$path" ]] || bash -n "$path" ;; esac
+done < <(git diff --no-renames --name-only "$base_sha"...HEAD)
+
+# Review-round tripwire. Consecutive `fix` commits after the implementation are
+# review rounds; three of them means the review has become the discovery loop
+# for one root-cause class, which CLAUDE.md requires closing by re-opening the
+# closure matrix instead of patching the next reported cell. Releasing the gate
+# takes a deliberate, auditable act: a commit inside the streak that both
+# changes an authoritative docs/impl plan or audit (not a translated mirror)
+# and records a `Closure-Matrix-Reopened:` trailer naming the axis. Renaming a
+# commit away from `fix` also silences the counter — that is a visible choice in
+# the history, not a hidden one.
+review_streak=()
+seen_implementation=false
+while IFS= read -r entry; do
+  case "${entry#* }" in
+    fix*|Fix*)
+      if [[ "$seen_implementation" == true ]]; then
+        review_streak+=("${entry%% *}")
+      else
+        seen_implementation=true
+        review_streak=()
+      fi
+      ;;
+    *) seen_implementation=true; review_streak=() ;;
+  esac
+done < <(git log --reverse --format='%H %s' "$base_sha"..HEAD)
+if [[ "$docs_only" == false && "${#review_streak[@]}" -ge 3 ]]; then
+  matrix_reopened=false
+  for commit in "${review_streak[@]}"; do
+    git log -1 --format='%B' "$commit" | grep -q '^Closure-Matrix-Reopened:' || continue
+    while IFS= read -r path; do
+      case "$path" in
+        docs/impl/*/ja/*|docs/impl/ja/*) ;;
+        # Authoritative contracts live in docs/impl for compiler and package
+        # capabilities and in CLAUDE.md for the process machinery itself.
+        docs/impl/*|CLAUDE.md) matrix_reopened=true ;;
+      esac
+    done < <(git show --no-renames --name-only --format= "$commit")
+  done
+  [[ "$matrix_reopened" == true ]] || {
+    echo "preflight: ${#review_streak[@]} consecutive review-fix commits without re-opening a closure matrix" >&2
+    echo "  Repeatedly patching individually reported cells means the matrix missed an axis." >&2
+    echo "  Enumerate that axis in the owning docs/impl plan, audit, or CLAUDE.md, fix the class" >&2
+    echo "  in one pass," >&2
+    echo "  and commit it with a 'Closure-Matrix-Reopened: <axis>' trailer." >&2
+    exit 1
+  }
+fi
+
+
 if [[ "$docs_only" == true ]]; then
   [[ -z "$reviewer" && -z "$review_log" && "$findings_fixed" == false ]] || {
     echo "--docs-only does not accept review arguments" >&2
     exit 2
   }
   reviewer="docs-only"
+elif [[ "$library_changed" == false && -z "$reviewer" && -z "$review_log" ]]; then
+  # Tooling tier: a leaf owner test that is not bounded-gate content, or prose
+  # that is not compiled into a test binary. Its blast radius is the target the
+  # focused owner check already compiles and runs, so an independent review is
+  # optional here. Passing --reviewer with a log still records one exactly as
+  # the library tier does.
+  [[ "$findings_fixed" == false ]] || {
+    echo "--findings-fixed requires a review log" >&2
+    exit 2
+  }
+  reviewer="tooling"
+  review_state="tooling"
 else
   [[ "$reviewer" =~ ^[A-Za-z0-9._-]+$ && -f "$review_log" ]] || {
-    echo "code preflight requires --reviewer ID and --review-log FILE" >&2
+    echo "preflight requires --reviewer ID and --review-log FILE for a library change" >&2
     exit 2
   }
   last_nonempty="$(awk 'NF { line=$0 } END { print line }' "$review_log")"
@@ -124,16 +207,6 @@ else
       ;;
   esac
 fi
-
-rust_changed=false
-non_documentation_changed=false
-while IFS= read -r path; do
-  case "$path" in *.md|docs/*) ;; *) non_documentation_changed=true ;; esac
-  case "$path" in
-    crates/*|Cargo.toml|Cargo.lock|rust-toolchain*|.cargo/*) rust_changed=true ;;
-  esac
-  case "$path" in *.sh) [[ ! -f "$path" ]] || bash -n "$path" ;; esac
-done < <(git diff --no-renames --name-only "$base_sha"...HEAD)
 [[ "$docs_only" == false || "$non_documentation_changed" == false ]] || {
   echo "--docs-only requires Markdown/documentation changes only" >&2
   exit 1
@@ -150,6 +223,10 @@ if [[ $# -gt 0 ]]; then
 fi
 if [[ "$rust_changed" == true ]]; then
   scripts/lint-ratchet.sh
+fi
+# The cumulative Rust gate is worth its cost only when the diff can change
+# compiled behavior: library tier AND actual Rust build inputs.
+if [[ "$library_changed" == true && "$rust_changed" == true ]]; then
   scripts/test-pr.sh
   # Clippy keeps its own target dir: clippy and build/test record incompatible
   # fingerprints in a shared dir, so alternating them forces a near-full
@@ -163,12 +240,19 @@ fi
   exit 1
 }
 
+if [[ "$docs_only" == true ]]; then
+  tier=docs-only
+elif [[ "$library_changed" == true ]]; then
+  tier=code
+else
+  tier=tooling
+fi
 stamp_dir="$(git rev-parse --git-path align-preflight)"
 mkdir -p "$stamp_dir"
 stamp="$stamp_dir/$head_sha"
 {
   printf 'version=1\n'
-  printf 'kind=%s\n' "$([[ "$docs_only" == true ]] && echo docs-only || echo code)"
+  printf 'kind=%s\n' "$tier"
   printf 'head=%s\n' "$head_sha"
   printf 'base_ref=%s\n' "$base"
   printf 'base_sha=%s\n' "$base_sha"
@@ -179,4 +263,4 @@ stamp="$stamp_dir/$head_sha"
   printf 'created_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 } >"$stamp"
 
-echo "preflight recorded for $head_sha ($review_state; reviewer $reviewer; owner $owner_test)"
+echo "preflight recorded for $head_sha ($tier tier; $review_state; reviewer $reviewer; owner $owner_test)"
