@@ -9580,45 +9580,27 @@ impl<'a> BodyValidator<'a> {
         }
     }
 
+    /// Whether a value of `ty` may be copied — the rule a closure capture and the
+    /// element-field read both need.
+    ///
+    /// Structural validity is this validator's own business, but Move-ness is **sema's**:
+    /// a second model of it here is what produced the silent empty-program class three
+    /// times (owned `string` array elements, the `str` view demotion, and a captured
+    /// `slice<fn(..)>`, whose element is not a primitive and so had no `Scalar` mapping).
+    /// Delegate instead of re-deriving, so the producer and this gate cannot disagree again.
+    ///
+    /// The authority is `ty_capture_is_move`, not the plain Move question: a fixed array or
+    /// tuple of owned values is Copy as a *value* while still being uncapturable, and every
+    /// use of this predicate is a capture-shaped one.
     fn ty_copy_ok(&self, ty: Ty, _: &BodyContext) -> bool {
-        match ty {
-            Ty::Struct(id) => !align_sema::struct_is_move(
-                id,
+        self.body_ty_ok(ty)
+            && !align_sema::ty_capture_is_move(
+                ty,
                 &self.program.structs,
+                &self.program.tuples,
                 &self.program.enums,
                 &self.program.tagged_types,
-            ),
-            Ty::Enum(id) => !align_sema::enum_is_move(
-                id,
-                &self.program.structs,
-                &self.program.enums,
-                &self.program.tagged_types,
-            ),
-            Ty::Tuple(id) => self.program.tuples.get(id as usize).is_some_and(|tuple| {
-                tuple.elems.iter().all(|scalar| self.scalar_copy_ok(*scalar))
-            }),
-            Ty::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
-            Ty::Vec(scalar, lanes) | Ty::Mask(scalar, lanes) => {
-                valid_vector_lanes(lanes)
-                    && valid_vector_scalar(scalar)
-                    && self.scalar_copy_ok(scalar)
-            }
-            Ty::Array(scalar, length) => length > 0 && self.scalar_copy_ok(scalar),
-            Ty::Option(payload) => self.scalar_copy_ok(payload),
-            Ty::Result(ok, error) => self.scalar_copy_ok(ok) && self.scalar_copy_ok(error),
-            Ty::StructArray(id, length) => {
-                length > 0
-                    && self.program.structs.get(id as usize).is_some()
-                    && !align_sema::struct_is_move(
-                        id,
-                        &self.program.structs,
-                        &self.program.enums,
-                        &self.program.tagged_types,
-                    )
-            }
-            Ty::Box(_) | Ty::String | Ty::DynArray(_) | Ty::DynStructArray(..) => false,
-            other => align_sema::ty_to_scalar(other).is_some_and(|scalar| self.scalar_copy_ok(scalar)),
-        }
+            )
     }
 
     fn error_id(&self) -> Option<u32> {

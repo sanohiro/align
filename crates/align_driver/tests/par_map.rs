@@ -238,11 +238,27 @@ fn par_map_rejects_move_aos_elements_before_codegen() {
 
 #[test]
 fn par_map_rejects_owned_fixed_array_capture() {
+    // #739 rejects the owned fixed array where it is CONSTRUCTED, before the capture rule is
+    // reached, so this fixture owns the construction diagnostic exactly.
     let src = "fn main() -> Result<(), Error> {\n  names := [\"a\".clone(), \"b\".clone()]\n  ys := [1, 2].par_map(fn x { x + names.len() })\n  print(ys.sum())\n  return Ok(())\n}\n";
     assert!(check_errs("pm-array-string-capture", src), "par_map must reject an owned fixed array capture");
+    let diagnostics = check_diagnostics("pm-array-string-capture", src);
     assert!(
-        check_diagnostics("pm-array-string-capture", src).contains("cannot capture the owned value 'names'"),
-        "the ownership diagnostic should identify the fixed array capture"
+        diagnostics.contains("cannot be an element of a fixed array yet"),
+        "the diagnostic should identify the unsupported owned fixed array:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn par_map_rejects_an_owned_local_capture() {
+    // The capture rule itself, on a shape #739's construction check does not intercept: an owned
+    // `string` local. This is the assertion that keeps the MIR capture gate honest — it must stay
+    // reachable, because the fixed-array fixture above no longer reaches it.
+    let src = "fn main() -> Result<(), Error> {\n  name := \"a\".clone()\n  ys := [1, 2].par_map(fn x { x + name.len() })\n  print(ys.sum())\n  return Ok(())\n}\n";
+    let diagnostics = check_diagnostics("pm-string-capture", src);
+    assert!(
+        diagnostics.contains("cannot capture the owned value 'name'"),
+        "the ownership diagnostic should identify the owned local capture:\n{diagnostics}"
     );
 }
 

@@ -149,3 +149,33 @@ normal; designing to one consumer is not.
 - **DB drivers (`pkg.db.*`)** — api-server-db.md §2 activates with their first consumer.
 - **Fetch tool / registry / compiled distribution** — pkg-foundation D11/D12, consumer-gated.
 - **A separate repo** — pre-release monorepo per D-A.
+
+## 4. Open-world callback dispatch (2026-08-11)
+
+`pkg.web` dispatches middleware and stream pumps through function values, which is the whole
+shape of a router: `pre := hs[i]; pre(c)` (`web.align:206`) and `pump(c, s)` (`web.align:345`).
+The L2a open-world rule introduced in #672 rejected every such dispatch inside an exportable
+callback-bearing function, so `apps/web/pkg/web.align` stopped compiling and the documented
+handler example failed to build. Nothing in `pkg.web` changed; the rule tightened underneath it,
+and `apps_web_multipart` sits outside the bounded gate, so the breakage went unnoticed until the
+first nightly full-suite run.
+
+The rule exists to keep an externally supplied Impure callback from reaching a `par_map`, whose
+callables must be Pure (`draft.md` §11). A `spawn`ed task deliberately **may** be Impure
+(`draft.md` §11), so `task_group` — the only parallel construct `pkg.web` uses — imposes no such
+obligation. The restriction is therefore scoped to programs that actually carry the obligation.
+
+| Closure cell | Rule | Owner evidence |
+|---|---|---|
+| no `par_map` in the program | An erased dispatch cannot launder a purity obligation that does not exist; accept it, so ordinary sequential callback dispatch compiles | `apps_web_multipart::the_documented_handler_example_compiles_against_the_real_pkg_web` |
+| one `par_map` anywhere | The conservative rejection returns unchanged: an erased target may be the internal function that `par_map`s the laundered callback | `apps_web_multipart::a_par_map_in_the_program_restores_the_open_world_dispatch_rejection` |
+| existing `par_map` purity owners | Unchanged in both directions | the cumulative `par_map` suite |
+
+The same capability closes a second, independent break of the silent-empty-MIR class: the MIR
+body validator kept its own model of Copy-ness, and that model had no mapping for a
+`slice<fn(..)>` element, so a closure capturing one — `pkg.web.group_with` — failed validation and
+dropped all 35 functions of the unit without a diagnostic. This is the third instance of a
+validator model disagreeing with sema's contract (after owned `string` fixed-array elements and
+the element-field `str` demotion), so it is closed by machinery rather than another arm:
+`ty_copy_ok` now delegates Move-ness to `align_sema::ty_is_move` and keeps only structural
+validity of its own. Owner: `par_map::captured_function_value_slice`.

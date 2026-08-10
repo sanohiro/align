@@ -1604,7 +1604,14 @@ a function value is bound, moved, or joined:
 an indirect call or `map_err` with a callback-bearing actual remains legal in sequential code but
 fails closed when its enclosing function must prove `Pure`. The same unresolved dispatch is rejected
 when reachable from an exportable callback-bearing root if it carries a callback-bearing actual or
-the erased target can be an internally constructed function value. The latter covers zero-argument
+the erased target can be an internally constructed function value **and the unit contains at least
+one `par_map` site**. The purity obligation this protects belongs to `par_map`, whose callables must
+be `Pure`; a spawned task deliberately may be `Impure`, so a unit with no `par_map` has no
+obligation for an erased target to launder and the dispatch is accepted (2026-08-11 — `pkg.web`
+routes middleware and stream pumps exactly this way). Whole-program checking sees every `par_map`
+in the program while per-unit checking sees only its own unit's, so a program whose `par_map` and
+whose callback-dispatching library live in different units is accepted per-unit and rejected
+whole-program; both directions stay conservative with respect to the obligation. The latter covers zero-argument
 closures whose captures feed an internal parallel boundary even when unrelated side effects make
 both the closed and open-world effects `Impure`; a direct external callback parameter or parameter
 field call remains legal. L2b replaces those conservative boundaries with recursive target-relative
