@@ -1820,16 +1820,17 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                         resource,
                     } => batch_fields(*struct_id).is_some()
                         && program.structs.get(*struct_id as usize).is_some_and(|definition| {
-                            definition.fields.iter().all(|field| {
-                                matches!(
-                                    field.ty,
-                                    Ty::Bool
-                                        | Ty::Char
-                                        | Ty::Int(_)
-                                        | Ty::Float(_)
-                                        | Ty::Str
-                                )
-                            })
+                            !definition.fields.is_empty()
+                                && definition.fields.iter().all(|field| {
+                                    matches!(
+                                        field.ty,
+                                        Ty::Bool
+                                            | Ty::Char
+                                            | Ty::Int(_)
+                                            | Ty::Float(_)
+                                            | Ty::Str
+                                    )
+                                })
                         })
                             && batch_resource(*resource, *struct_id)
                             && operand_ty(function, payload) == Some(Ty::Raw)
@@ -17067,7 +17068,7 @@ mod tests {
             );
         }
 
-        let batch_read = |soa: bool, resource_name: &str| {
+        let batch_read = |soa: bool, resource_name: &str, row: StructDef| {
             let resource = hir::ResourceDef {
                 name: resource_name.to_owned(),
                 source_name: resource_name.to_owned(),
@@ -17140,7 +17141,7 @@ mod tests {
                     externs: Vec::new(),
                     imported_fns: Vec::new(),
                     link_libs: Vec::new(),
-                    structs: vec![row.clone()],
+                    structs: vec![row],
                     enums: Vec::new(),
                     resources: vec![resource],
                     tagged_types: Vec::new(),
@@ -17154,14 +17155,25 @@ mod tests {
             )
         };
         for valid in [
-            batch_read(false, "pkg.db$batch$S3_Row"),
-            batch_read(true, "pkg.db$batch$S3_Row"),
+            batch_read(false, "pkg.db$batch$S3_Row", row.clone()),
+            batch_read(true, "pkg.db$batch$S3_Row", row.clone()),
         ] {
             assert!(valid.is_ok(), "valid batch read rejected: {valid:?}");
         }
         for malformed in [
-            batch_read(false, "pkg.db$batch$S5_Other"),
-            batch_read(true, "pkg.db$batch$S5_Other"),
+            batch_read(false, "pkg.db$batch$S5_Other", row.clone()),
+            batch_read(true, "pkg.db$batch$S5_Other", row.clone()),
+            batch_read(
+                true,
+                "pkg.db$batch$S5_Empty",
+                StructDef {
+                    name: "Empty".to_owned(),
+                    source_name: "Empty".to_owned(),
+                    fields: Vec::new(),
+                    align: None,
+                    c_repr: false,
+                },
+            ),
         ] {
             let error = malformed.expect_err("mismatched batch resource/Row must fail");
             assert!(

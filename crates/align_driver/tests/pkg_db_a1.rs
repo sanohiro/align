@@ -31,6 +31,39 @@ pub fn set_batch_tail<R>(borrow values: pkg.db.batch<R>, tail: i64) {
   unsafe { raw.store(resource.raw(resource.borrow(values)), 40, tail) }
 }
 
+pub fn clone_batch_plan(plan: raw) -> raw {
+  unsafe {
+    copied := raw.alloc(72)
+    version: u32 := raw.load(plan, 0)
+    flags: u8 := raw.load(plan, 4)
+    reserved8: u8 := raw.load(plan, 5)
+    reserved16: u16 := raw.load(plan, 6)
+    fields: u32 := raw.load(plan, 8)
+    reserved32: u32 := raw.load(plan, 12)
+    create: raw := raw.load(plan, 16)
+    append: raw := raw.load(plan, 24)
+    finish: raw := raw.load(plan, 32)
+    row: raw := raw.load(plan, 40)
+    soa: raw := raw.load(plan, 48)
+    drop_payload: raw := raw.load(plan, 56)
+    tail: i64 := raw.load(plan, 64)
+    raw.store(copied, 0, version)
+    raw.store(copied, 4, flags)
+    raw.store(copied, 5, reserved8)
+    raw.store(copied, 6, reserved16)
+    raw.store(copied, 8, fields)
+    raw.store(copied, 12, reserved32)
+    raw.store(copied, 16, create)
+    raw.store(copied, 24, append)
+    raw.store(copied, 32, finish)
+    raw.store(copied, 40, row)
+    raw.store(copied, 48, soa)
+    raw.store(copied, 56, drop_payload)
+    raw.store(copied, 64, tail)
+    return copied
+  }
+}
+
 pub fn zero_column_plan_valid<P, R>(statement: pkg.db.query<P, R>) -> bool {
   unsafe {
     plan := pkg.db.internal.descriptor.batch_plan(statement)
@@ -39,6 +72,43 @@ pub fn zero_column_plan_valid<P, R>(statement: pkg.db.query<P, R>) -> bool {
     fields: u32 := raw.load(plan, 8)
     soa: raw := raw.load(plan, 48)
     return flags == 0 && fields == 0 && soa.is_null()
+  }
+}
+
+pub fn zero_column_plan_rejects_soa<P, R>(statement: pkg.db.query<P, R>) -> bool {
+  unsafe {
+    plan := pkg.db.internal.descriptor.batch_plan(statement)
+    forged := clone_batch_plan(plan)
+    row: raw := raw.load(forged, 40)
+    raw.store(forged, 4, 1 as u8)
+    raw.store(forged, 48, row)
+    accepted := pkg.db.internal.resource.batch_plan_valid(forged)
+    raw.free(forged)
+    return !accepted
+  }
+}
+
+pub fn install_non_soa_batch_plan<R>(borrow values: pkg.db.batch<R>) -> raw {
+  unsafe {
+    wrapper := resource.raw(resource.borrow(values))
+    plan: raw := raw.load(wrapper, 8)
+    forged := clone_batch_plan(plan)
+    raw.store(forged, 4, 0 as u8)
+    raw.store(forged, 48, raw.null())
+    raw.store(wrapper, 5, 0 as u8)
+    raw.store(wrapper, 8, forged)
+    return plan
+  }
+}
+
+pub fn restore_batch_plan<R>(borrow values: pkg.db.batch<R>, plan: raw) {
+  unsafe {
+    wrapper := resource.raw(resource.borrow(values))
+    forged: raw := raw.load(wrapper, 8)
+    flags: u8 := raw.load(plan, 4)
+    raw.store(wrapper, 8, plan)
+    raw.store(wrapper, 5, flags)
+    raw.free(forged)
   }
 }
 "#;
@@ -217,6 +287,29 @@ fn main() -> i32 = 0
 }
 
 #[test]
+fn nested_abstract_batch_row_application_is_rejected() {
+    let main = r#"module main
+import pkg.db
+
+Wrap<T> { value: T }
+
+fn keep<T>(value: Option<pkg.db.batch<Wrap<T>>>) -> Option<pkg.db.batch<Wrap<T>>> = value
+fn main() -> i32 = 0
+"#;
+    let checked = diff_check_multi(
+        "pkg-db-a1-nested-abstract-batch-row",
+        &package_files(main),
+        "main.align",
+    );
+    assert!(
+        checked.whole_errors && checked.per_unit_errors,
+        "nested abstract batch Row unexpectedly accepted:\nwhole diagnostics:\n{}\nper-unit diagnostics:\n{}",
+        checked.whole_diags,
+        checked.per_unit_diags,
+    );
+}
+
+#[test]
 fn zero_column_query_keeps_a_valid_non_soa_batch_plan() {
     if !backend_available() {
         return;
@@ -231,8 +324,9 @@ fn read_empty(borrow values: pkg.db.batch<app.batch_query.EmptyRow>) -> Result<O
 }
 
 fn main() -> i32 {
-  if pkg.db.a1_test.zero_column_plan_valid(app.batch_query.zero_column()) { return 42 }
-  return 1
+  if !pkg.db.a1_test.zero_column_plan_valid(app.batch_query.zero_column()) { return 1 }
+  if !pkg.db.a1_test.zero_column_plan_rejects_soa(app.batch_query.zero_column()) { return 2 }
+  return 42
 }
 "#;
     let output = build_and_run_multi_with_static_descriptors(
@@ -388,6 +482,17 @@ fn main() -> i32 {
 
   columns := pkg.db.batch_soa(first) else { return 29 }
   if columns.id.sum() != 201 || columns[1].label != "medium-label" { return 30 }
+  soa_plan := pkg.db.a1_test.install_non_soa_batch_plan(first)
+  malformed_soa := pkg.db.batch_soa(first)
+  pkg.db.a1_test.restore_batch_plan(first, soa_plan)
+  malformed_soa_ok := match malformed_soa {
+    Err(error) => match error {
+      InvalidQuery(contract) => contract.item == "db.batch.header"
+      _ => false
+    }
+    Ok(_) => false
+  }
+  if !malformed_soa_ok { return 44 }
 
   rich_result := pkg.db.rows(
     pkg.db.exec_conn(connection),

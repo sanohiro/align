@@ -616,7 +616,11 @@ pub fn batch_plan_valid(plan: raw) -> bool {
     soa: raw := raw.load(plan, 48)
     drop_payload: raw := raw.load(plan, 56)
     tail_reserved: i64 := raw.load(plan, 64)
-    soa_valid := if flags & 1 == 0 { soa.is_null() } else { !soa.is_null() }
+    soa_valid := if flags & 1 == 0 {
+      soa.is_null()
+    } else {
+      field_count > 0 && !soa.is_null()
+    }
     return version == 1 && flags & 254 == 0 && reserved8 == 0 && reserved16 == 0
       && reserved32 == 0 && !create.is_null() && !append.is_null()
       && !finish.is_null() && !row.is_null() && soa_valid && !drop_payload.is_null()
@@ -691,6 +695,14 @@ pub fn batch_length(wrapper: raw) -> i64 {
   unsafe {
     if !batch_live(wrapper) { return -1 }
     return raw.load(wrapper, 24)
+  }
+}
+
+pub fn batch_soa_capable(wrapper: raw) -> bool {
+  unsafe {
+    if !batch_live(wrapper) { return false }
+    flags: u8 := raw.load(wrapper, 5)
+    return flags & 1 != 0
   }
 }
 

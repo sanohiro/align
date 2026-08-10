@@ -44457,6 +44457,17 @@ fn reject_abstract_nominal_container(
     true
 }
 
+/// A1's sole recursive generic-container exception. The public `next_batch` signature needs the
+/// abstract producer resource under `Option`, but L7 still rejects every other abstract nominal
+/// application nested in a builtin container.
+fn abstract_pkg_db_batch_application(ty: Ty, cx: &TyCx<'_>) -> bool {
+    let Ty::Resource(id) = ty else { return false };
+    cx.resource_instances.get(&id).is_some_and(|instance| {
+        instance.canonical == "pkg.db$batch"
+            && matches!(instance.args.as_slice(), [Ty::Param(_)])
+    })
+}
+
 fn resolve_type(
     t: &ast::Type,
     cx: &mut TyCx,
@@ -44885,11 +44896,14 @@ fn resolve_type(
                     return Ty::Error;
                 }
             };
-            // A1 needs `Option<batch<R>>` in the public generic `next_batch` result. Checker-side
-            // payload substitution already walks tagged Option/Result payloads and materializes a
-            // concrete resource instance before body analysis, so this one nominal container is
-            // now closed recursively. Other collection/nominal containers retain their narrower
-            // L7 restriction until they have an owner.
+            // A1 needs the exact producer-owned `Option<pkg.db.batch<R>>` result. Checker-side
+            // payload substitution closes that one resource shape recursively; every other
+            // abstract nominal application retains the narrower L7 restriction.
+            if !abstract_pkg_db_batch_application(inner, cx)
+                && reject_abstract_nominal_container(inner, "Option", cx, span, diags)
+            {
+                return Ty::Error;
+            }
             match scalar_arg(inner, "Option payload", true, cx.tagged_types, span, diags) {
                 Some(s) => Ty::Option(s),
                 None => Ty::Error,

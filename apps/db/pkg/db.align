@@ -3433,7 +3433,8 @@ pub fn batch_soa<R: SoaPlain>(borrow values: batch<R>) -> Result<soa<R>, Error> 
     length := pkg.db.internal.resource.batch_length(wrapper)
     plan := pkg.db.internal.resource.batch_plan(wrapper)
     payload := pkg.db.internal.resource.batch_payload(wrapper)
-    if length < 0 || plan.is_null() || payload.is_null() {
+    if length < 0 || plan.is_null() || payload.is_null()
+      || !pkg.db.internal.resource.batch_soa_capable(wrapper) {
       return Err(Error.InvalidQuery(ContractError {
         query_id: None,
         item: "db.batch.header".clone(),

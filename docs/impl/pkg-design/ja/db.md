@@ -2901,14 +2901,14 @@ Implementation closure matrix:
 
 | Cell | Closure | Owner evidence |
 |---|---|---|
-| formation/validation | `R: SoaPlain`時だけsymbolic SoAを形成しanalysis前にconcrete化。descriptor/plan/statement/rows/batchのversion/reserved/pointerをdispatch前に検証しcommandはplanを持たない。 | sema substitution/instantiation、malformed HIR、v5/plan golden |
+| formation/validation | `R: SoaPlain`時だけsymbolic SoAを形成しanalysis前にconcrete化。新しいrecursive generic-container例外はexact abstract producer resource `Option<pkg.db.batch<R>>`だけで、他の`Option`内abstract nominalはL7 rejectを維持する。descriptor/plan/statement/rows/batchのversion/reserved/pointerをdispatch前に検証する。zero-field planはSoA bit clearかつSoA thunk null、SoA-capable planはfield count nonzeroでなければならず、commandはplanを持たない。 | accepted `Option<batch<R>>` surfaceとcumulative rejected `Option<Wrap<T>>` owner、malformed HIR、zero-field/SoA-bit/thunk v5/plan golden |
 | construction/move-in | rows/max/terminal後に1 unpublished payloadをcreateし、既存row validator成功後にtrusted contextをtyped columnへ直接decodeし、aggregate growthを検証してcommit。textはnative length-aware bytesを使いvalid UTF-8を要求し、embedded U+0000をbyte-exactに保持する。blobはzeroを含む全byteを保持。invalid pointer/length/UTF-8はgrowth/lane mutation前にfail。 | fake all-kind/nullable/empty/partial/exact-cap、両driver direct-column owner |
-| move-out/view | row gatherとeligible SoA viewをbatch rootで返し、Option/generic/branch/`?`を通してprovenanceを保持。 | whole/per-unit lifetime、post-move/post-Drop rejection owner |
+| move-out/view | row gatherとeligible SoA viewをbatch rootで返す。`batch_soa`はSoA thunk load前にcomplete live batchをvalidateし、copied plan flagsがSoA capabilityを示すことを要求する。valid non-SoA planはindirect dispatchせず`InvalidQuery`を返す。Option/generic/branch/`?`を通してprovenanceを保持。 | whole/per-unit lifetime、post-move/post-Drop rejection、malformed non-SoA batch no-dispatch owner |
 | owner transfer/Drop | block/`if`/`match`/`else`/`?`/replacement/returnで1 ownerだけtransferし、empty/partial/compact/uncompact/terminalの全stateをexactly once cleanup。 | L3 matrix、batch branch/replacement/failpoint/alloc-count owner |
 | driver path | SQLiteはcap超過stepなし、PostgreSQLはcap超過decode/sendなし。partial errorはbatch後native rowsをfirst-error orderでclose。 | zero/partial/exact/multi/decode/native/Drop counter owner |
 | nullable/variable layout | 全value kind×nullable、empty/nonempty text/blob、null/empty、child/fixed growth、compact有無をcrossし、gather/SoA order一致。 | plan matrix、bitmap/header/offset golden、UTF-8/length malformed owner |
 | generic/separate compile | 全operationで`batch<R>`からR inference、public template interfaceだけにcanonical symbolic `soa<Param(R)>`+`SoaPlain`をserialize、concrete bound reject、HIR/MIRへabstract SoA publicationなし、whole/per-unit retain。 | interface golden、wrong-bound diagnostic、whole/per-unit executable |
-| ABI/allocation parity | direct/preparedが同planをv2 stateへ運び、fake/SQLite/PostgreSQLが同じv1 batch stateを使う。producer/package/HIR/MIR/LLVMでsize/offset/signature/cleanup provenance一致。 | byte/relocation/HIR ABI goldenとalloc-count parity |
+| ABI/allocation parity | direct/preparedが同planをv2 stateへ運び、fake/SQLite/PostgreSQLが同じv1 batch stateを使う。producer/package/HIR/MIR/LLVMでsize/offset/signature/cleanup provenance一致。LLVM preflightはsemaと同じnonempty concrete `SoaPlain` structだけに`ColumnBatchSoa`を許可し、vacuous field iterationでzero fieldsを通さない。 | byte/relocation/HIR ABI golden、empty-struct `ColumnBatchSoa` rejection、alloc-count parity |
 
 `7bddab67` independent design reviewの7 findingはledger-firstの1 passで閉じた。symbolic SoAは
 template interfaceに保存しemitted HIR/MIRだけから除外、native validationは既存row validatorを
