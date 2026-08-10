@@ -12784,16 +12784,19 @@ fn hir_body_validator_batch_plan_guard_fails_closed() {
             .fns
             .last_mut()
             .and_then(|function| function.body.value.as_deref_mut())
-            .expect("batch plan unsafe expression");
+            .unwrap_or_else(|| panic!("batch plan unsafe expression"));
         let hir::ExprKind::Unsafe(block) = &mut unsafe_expression.kind else {
             panic!("batch plan unsafe block")
         };
-        block.value.as_deref_mut().expect("batch plan raw call")
+        block
+            .value
+            .as_deref_mut()
+            .unwrap_or_else(|| panic!("batch plan raw call"))
     }
 
     let mut missing_guard = program.clone();
     let hir::ExprKind::RawCall { guard, .. } = &mut batch_raw_call(&mut missing_guard).kind else {
-        unreachable!()
+        panic!("test batch plan raw call")
     };
     *guard = None;
     assert!(!body_core_metadata_is_valid(&missing_guard));
@@ -12803,17 +12806,17 @@ fn hir_body_validator_batch_plan_guard_fails_closed() {
         guard: Some(guard), ..
     } = &mut batch_raw_call(&mut mismatched_plan).kind
     else {
-        unreachable!()
+        panic!("test guarded batch plan raw call")
     };
     let hir::ExprKind::Call { args, .. } = &mut guard.kind else {
-        unreachable!()
+        panic!("test batch plan guard call")
     };
     args[0].kind = hir::ExprKind::Local(1);
     assert!(!body_core_metadata_is_valid(&mismatched_plan));
 
     let mut forged_predicate = program;
     let hir::ExprKind::RawCall { guard, .. } = &mut batch_raw_call(&mut forged_predicate).kind else {
-        unreachable!()
+        panic!("test forged batch plan raw call")
     };
     *guard = Some(Box::new(body_test_expr(
         hir::ExprKind::Bool(true),

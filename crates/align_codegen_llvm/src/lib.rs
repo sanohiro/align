@@ -5614,9 +5614,8 @@ fn scalar_bytes(s: Scalar) -> u64 {
         // A `json.doc` handle is a `{tape,node}` = `{ptr,i64}`, 16 bytes (like `Str`/`Slice`). Never a
         // box/array payload today (it only rides an `Option`/`Result`), but sized correctly for totality.
         Scalar::JsonDoc => 16,
-        Scalar::Soa(_) => unreachable!("a soa view is not a box payload"),
-        Scalar::SoaParam(_) => {
-            unreachable!("an abstract soa is substituted before codegen")
+        Scalar::Soa(_) | Scalar::SoaParam(_) => {
+            unreachable!("a concrete or abstract soa view is not a box payload")
         }
         Scalar::Enum(_) => unreachable!("a sum type is not a box payload"),
         Scalar::Tagged(_) => unreachable!("a nested tagged value is not a box/array payload"),
@@ -7132,8 +7131,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let fields = self.column_batch_fields(struct_id)?;
         let sizes = fields
             .iter()
-            .map(|(base, _, _)| scalar_bytes(ty_to_scalar(*base).expect("batch base is scalar")))
-            .collect::<Vec<_>>();
+            .map(|(base, _, _)| {
+                ty_to_scalar(*base)
+                    .map(scalar_bytes)
+                    .ok_or_else(|| self.err("column batch field has no scalar ABI size"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut offsets = Vec::with_capacity(fields.len());
         let mut cursor = i64t.const_zero();
         for (index, size) in sizes.iter().copied().enumerate() {
@@ -7211,7 +7214,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .map_err(|error| self.err(error))?
             .try_as_basic_value()
             .basic()
-            .expect("allocator returns a pointer")
+            .ok_or_else(|| self.err("column batch allocator returned void"))?
             .into_pointer_value())
     }
 
@@ -7273,7 +7276,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .build_memset(new, 1, self.ctx.i8_type().const_zero(), new_bytes)
             .map_err(|error| self.err(error))?;
         for (index, (base, nullable, _)) in fields.iter().copied().enumerate() {
-            let size = scalar_bytes(ty_to_scalar(base).expect("batch base is scalar"));
+            let size = ty_to_scalar(base)
+                .map(scalar_bytes)
+                .ok_or_else(|| self.err("column batch field has no scalar ABI size"))?;
             let copy_bytes = self
                 .builder
                 .build_int_mul(len, self.ctx.i64_type().const_int(size, false), "batch.copy.bytes")
@@ -7294,14 +7299,24 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         "batch.copy.bitmap.bytes",
                     )
                     .map_err(|error| self.err(error))?;
+                let source_offset = old_bitmaps
+                    .get(index)
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| self.err("nullable column batch source bitmap is absent"))?;
+                let destination_offset = new_bitmaps
+                    .get(index)
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| self.err("nullable column batch destination bitmap is absent"))?;
                 let source = self.column_batch_byte_ptr(
                     old,
-                    old_bitmaps[index].expect("nullable field bitmap"),
+                    source_offset,
                     "batch.copy.bitmap.src",
                 )?;
                 let destination = self.column_batch_byte_ptr(
                     new,
-                    new_bitmaps[index].expect("nullable field bitmap"),
+                    destination_offset,
                     "batch.copy.bitmap.dst",
                 )?;
                 self.builder
@@ -7325,12 +7340,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let i64t = self.ctx.i64_type();
         let maximum = self.operand(max_rows)?.into_int_value();
         let fields = self.column_batch_fields(struct_id)?;
+        let sizes = fields
+            .iter()
+            .map(|(base, _, _)| {
+                ty_to_scalar(*base)
+                    .map(scalar_bytes)
+                    .map(u128::from)
+                    .ok_or_else(|| self.err("column batch field has no scalar ABI size"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut lo = 0u64;
         let mut hi = i32::MAX as u64;
         let fits = |rows: u64| {
             let mut cursor = 0u128;
-            for (index, (base, _, _)) in fields.iter().copied().enumerate() {
-                let size = u128::from(scalar_bytes(ty_to_scalar(base).expect("batch base scalar")));
+            for (index, size) in sizes.iter().copied().enumerate() {
                 if index != 0 && size > 1 {
                     cursor = (cursor + size - 1) & !(size - 1);
                 }
@@ -7373,7 +7396,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
         self.builder
             .build_unconditional_branch(join)
             .map_err(|error| self.err(error))?;
-        let invalid_end = self.builder.get_insert_block().expect("batch invalid block");
+        let invalid_end = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| self.err("column batch invalid block is absent"))?;
         self.builder.position_at_end(valid_block);
         let initial = self
             .builder
@@ -7405,7 +7431,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
         self.builder
             .build_unconditional_branch(join)
             .map_err(|error| self.err(error))?;
-        let valid_end = self.builder.get_insert_block().expect("batch valid block");
+        let valid_end = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| self.err("column batch valid block is absent"))?;
         self.builder.position_at_end(join);
         let phi = self
             .builder
@@ -7451,7 +7480,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
             let header = self.ctx.append_basic_block(self.func, "batch.drop.child.header");
             let body = self.ctx.append_basic_block(self.func, "batch.drop.child.body");
             let done = self.ctx.append_basic_block(self.func, "batch.drop.child.done");
-            let predecessor = self.builder.get_insert_block().expect("batch drop predecessor");
+            let predecessor = self
+                .builder
+                .get_insert_block()
+                .ok_or_else(|| self.err("column batch drop predecessor is absent"))?;
             self.builder
                 .build_unconditional_branch(header)
                 .map_err(|error| self.err(error))?;
@@ -7477,7 +7509,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
             self.builder
                 .build_unconditional_branch(header)
                 .map_err(|error| self.err(error))?;
-            let body_end = self.builder.get_insert_block().expect("batch drop body");
+            let body_end = self
+                .builder
+                .get_insert_block()
+                .ok_or_else(|| self.err("column batch drop body is absent"))?;
             phi.add_incoming(&[(&next, body_end)]);
             self.builder.position_at_end(done);
             view_index += 1;
@@ -7542,9 +7577,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|error| self.err(error))?
             };
             let value = if nullable {
+                let bitmap_offset = bitmaps
+                    .get(logical)
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| self.err("nullable column batch row bitmap is absent"))?;
                 let bitmap = self.column_batch_byte_ptr(
                     fixed,
-                    bitmaps[logical].expect("nullable bitmap"),
+                    bitmap_offset,
                     "batch.row.bitmap",
                 )?;
                 let byte_index = self
@@ -7621,13 +7661,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder
                     .build_unconditional_branch(join)
                     .map_err(|error| self.err(error))?;
-                let some_end = self.builder.get_insert_block().expect("batch row some");
+                let some_end = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or_else(|| self.err("column batch row some block is absent"))?;
                 self.builder.position_at_end(none_block);
                 let none = option_ty.const_zero();
                 self.builder
                     .build_unconditional_branch(join)
                     .map_err(|error| self.err(error))?;
-                let none_end = self.builder.get_insert_block().expect("batch row none");
+                let none_end = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or_else(|| self.err("column batch row none block is absent"))?;
                 self.builder.position_at_end(join);
                 let phi = self
                     .builder
@@ -7821,7 +7867,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
         self.builder
             .build_unconditional_branch(join)
             .map_err(|error| self.err(error))?;
-        let failed_end = self.builder.get_insert_block().expect("batch append failed");
+        let failed_end = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| self.err("column batch append failed block is absent"))?;
         self.builder.position_at_end(success);
 
         let fixed_before = self.column_batch_load_ptr(payload, 0, "batch.fixed.current")?;
@@ -7856,12 +7905,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
         self.builder
             .build_unconditional_branch(fixed_join)
             .map_err(|error| self.err(error))?;
-        let grow_end = self.builder.get_insert_block().expect("batch fixed grow");
+        let grow_end = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| self.err("column batch fixed grow block is absent"))?;
         self.builder.position_at_end(keep);
         self.builder
             .build_unconditional_branch(fixed_join)
             .map_err(|error| self.err(error))?;
-        let keep_end = self.builder.get_insert_block().expect("batch fixed keep");
+        let keep_end = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| self.err("column batch fixed keep block is absent"))?;
         self.builder.position_at_end(fixed_join);
         let fixed_phi = self
             .builder
@@ -7984,14 +8039,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder
                     .build_unconditional_branch(copy_join)
                     .map_err(|error| self.err(error))?;
-                let copy_end = self.builder.get_insert_block().expect("batch child copy");
+                let copy_end = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or_else(|| self.err("column batch child copy block is absent"))?;
                 self.builder.position_at_end(empty_block);
                 let empty = slice_struct_type(self.ctx).const_zero();
                 self.column_batch_store(payload, entry + 32, new_total.into())?;
                 self.builder
                     .build_unconditional_branch(copy_join)
                     .map_err(|error| self.err(error))?;
-                let empty_end = self.builder.get_insert_block().expect("batch child empty");
+                let empty_end = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or_else(|| self.err("column batch child empty block is absent"))?;
                 self.builder.position_at_end(copy_join);
                 let header_phi = self
                     .builder
@@ -8068,9 +8129,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_conditional_branch(present, mark, skip)
                     .map_err(|error| self.err(error))?;
                 self.builder.position_at_end(mark);
+                let bitmap_offset = bitmaps
+                    .get(field_index)
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| self.err("nullable column batch append bitmap is absent"))?;
                 let bitmap = self.column_batch_byte_ptr(
                     fixed,
-                    bitmaps[field_index].expect("nullable batch bitmap"),
+                    bitmap_offset,
                     "batch.bitmap",
                 )?;
                 let byte_index = self
@@ -8121,7 +8187,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
         self.builder
             .build_unconditional_branch(join)
             .map_err(|error| self.err(error))?;
-        let success_end = self.builder.get_insert_block().expect("batch append success");
+        let success_end = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| self.err("column batch append success block is absent"))?;
         self.builder.position_at_end(join);
         let status = self
             .builder
@@ -17505,7 +17574,7 @@ mod tests {
 
         let mut empty_nested = nested.clone();
         let StaticDataTarget::Record(record) = &mut empty_nested.relocations[0].target else {
-            unreachable!()
+            panic!("test nested static-data record")
         };
         record.bytes.clear();
         record.relocations.clear();
@@ -17515,7 +17584,7 @@ mod tests {
         let StaticDataTarget::Record(record) =
             &mut missing_nested_function.relocations[0].target
         else {
-            unreachable!()
+            panic!("test missing nested static-data function")
         };
         record.relocations[0].target =
             StaticDataTarget::Function(program_call("missing$nested$thunk"));
@@ -17922,7 +17991,7 @@ mod tests {
                 .relocations
                 .iter_mut()
                 .find(|relocation| relocation.offset == offset)
-                .expect("test callback ordinal");
+                .unwrap_or_else(|| panic!("test callback ordinal"));
             relocation.target = StaticDataTarget::Function(program_call(if offset == 56 {
                 "batch_create"
             } else {
@@ -17947,7 +18016,7 @@ mod tests {
                 .relocations
                 .iter_mut()
                 .find(|relocation| relocation.offset == offset)
-                .expect("raw-only callback ordinal")
+                .unwrap_or_else(|| panic!("raw-only callback ordinal"))
                 .target = StaticDataTarget::Function(program_call(target));
             let error = emit_descriptor(malformed)
                 .expect_err("cross-Row raw-only batch callback must fail before LLVM");
@@ -17970,7 +18039,7 @@ mod tests {
                 .relocations
                 .iter_mut()
                 .find(|relocation| relocation.offset == offset)
-                .expect("payload callback ordinal")
+                .unwrap_or_else(|| panic!("payload callback ordinal"))
                 .target = StaticDataTarget::Function(program_call(target));
             let error = emit_descriptor(malformed)
                 .expect_err("batch callback prefix mutation must fail before LLVM");
@@ -17986,7 +18055,7 @@ mod tests {
             .relocations
             .iter_mut()
             .find(|relocation| relocation.offset == 24)
-            .expect("append callback ordinal")
+            .unwrap_or_else(|| panic!("append callback ordinal"))
             .target = StaticDataTarget::Function(program_call("wrong_ordinal_append"));
         let error = emit_descriptor(malformed)
             .expect_err("append reader ordinal mismatch must fail before LLVM");
