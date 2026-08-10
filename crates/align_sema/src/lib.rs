@@ -31828,7 +31828,7 @@ impl<'a, 't> Checker<'a, 't> {
             )
         };
         self.constrain(ret, expected, span);
-        let call = Expr {
+        Expr {
             kind: ExprKind::RawCall {
                 guard: Some(Box::new(Self::batch_plan_guard(guard_plan, span))),
                 callee: Box::new(callee),
@@ -31841,8 +31841,7 @@ impl<'a, 't> Checker<'a, 't> {
             },
             ty: ret,
             span,
-        };
-        call
+        }
     }
 
     /// Q4b current-row bridge. The rows wrapper retains the producer-owned validator and streaming
