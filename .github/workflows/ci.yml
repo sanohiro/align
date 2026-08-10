@@ -16,6 +16,7 @@ concurrency:
 
 env:
   RUST_VERSION: 1.96.0
+  CARGO_INCREMENTAL: "0"
   OPENSSL_VERSION: 3.5.7
   OPENSSL_SHA256: a8c0d28a529ca480f9f36cf5792e2cd21984552a3c8e4aa11a24aa31aeac98e8
   CARGO_TERM_COLOR: always
@@ -220,12 +221,18 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-lint${{ matrix.lint }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+            target/clippy
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-lint${{ matrix.lint }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-${{ runner.arch }}-lint${{ matrix.lint }}-${{ env.RUST_VERSION }}-
+            cargo-${{ runner.os }}-${{ runner.arch }}-lint${{ matrix.lint }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-
 
+      # Clippy keeps its own target dir exactly as scripts/pre-pr.sh does: clippy
+      # and build/test record incompatible fingerprints, and sharing one dir
+      # would invalidate the restored cache in both directions every run.
       - name: Lint
         if: matrix.lint
+        env:
+          CARGO_TARGET_DIR: target/clippy
         run: scripts/cargo.sh clippy --workspace --lib --bins --locked -- -D warnings
 
       - name: Lint ratchet
@@ -263,4 +270,5 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-lint${{ matrix.lint }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+            target/clippy
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-lint${{ matrix.lint }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}
