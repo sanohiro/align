@@ -64,6 +64,12 @@ use inkwell::values::{
     PointerValue, StructValue,
 };
 
+type ColumnBatchLayout<'c> = (
+    Vec<IntValue<'c>>,
+    Vec<Option<IntValue<'c>>>,
+    IntValue<'c>,
+);
+
 pub fn is_available() -> bool {
     true
 }
@@ -1667,12 +1673,11 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
             for statement in &block.stmts {
                 match statement {
                     Stmt::ColumnBatchFinish { payload, struct_id }
-                    | Stmt::ColumnBatchDrop { payload, struct_id } => {
+                    | Stmt::ColumnBatchDrop { payload, struct_id }
                         if operand_ty(function, payload) != Some(Ty::Raw)
-                            || batch_fields(*struct_id).is_none()
-                        {
-                            return Err(fail(function, "column-batch statement contract mismatch"));
-                        }
+                            || batch_fields(*struct_id).is_none() =>
+                    {
+                        return Err(fail(function, "column-batch statement contract mismatch"));
                     }
                     _ => {}
                 }
@@ -7126,7 +7131,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         &self,
         capacity: IntValue<'c>,
         struct_id: u32,
-    ) -> Result<(Vec<IntValue<'c>>, Vec<Option<IntValue<'c>>>, IntValue<'c>), CodegenError> {
+    ) -> Result<ColumnBatchLayout<'c>, CodegenError> {
         let i64t = self.ctx.i64_type();
         let fields = self.column_batch_fields(struct_id)?;
         let sizes = fields
