@@ -49,7 +49,10 @@ fn lambda_lifts_to_a_called_function() {
     let mir = lower_to_mir(&check(&mut sm, "m", src).hir);
     let text = align_mir::print::program_to_string(&mir);
     assert!(text.contains("$lambda"), "lambda should be lifted to a synthetic function:\n{text}");
-    assert!(text.contains("call main$lambda0"), "the fused loop should call the lifted lambda:\n{text}");
+    assert!(
+        text.contains("call program main$lambda0"),
+        "the fused loop should call the lifted lambda:\n{text}"
+    );
 }
 
 #[test]
