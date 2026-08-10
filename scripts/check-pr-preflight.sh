@@ -39,3 +39,19 @@ case "$state" in
   tooling) [[ "$review_head" == "$head_sha" && "$reviewer" == tooling ]] ;;
   *) false ;;
 esac || { echo "invalid review state: $state" >&2; exit 1; }
+
+# The attestation states what tier the author claimed; recompute it here so a
+# hand-written body cannot carry a library change under the light attestation.
+# Both this checker and the classifier it sources come from the trusted base.
+case "$state" in
+  docs-only|tooling)
+    tier_lib="$(dirname "$0")/pr-tier.sh"
+    [[ -r "$tier_lib" ]] || { echo "missing tier classifier" >&2; exit 1; }
+    # shellcheck source=scripts/pr-tier.sh
+    . "$tier_lib"
+    if pr_tier_library_changed "$base_sha" "$head_sha"; then
+      echo "attestation claims '$state' but the diff changes library-tier paths" >&2
+      exit 1
+    fi
+    ;;
+esac

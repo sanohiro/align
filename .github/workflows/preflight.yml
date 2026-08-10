@@ -35,6 +35,16 @@ jobs:
             cp scripts/check-pr-preflight.sh "$RUNNER_TEMP/check-pr-preflight.sh"
           elif git show "$PR_BASE_SHA:scripts/check-pr-preflight.sh" > "$RUNNER_TEMP/check-pr-preflight.sh" 2>/dev/null; then
             chmod +x "$RUNNER_TEMP/check-pr-preflight.sh"
+            # The checker sources the tier classifier from its own directory;
+            # take that from the trusted base too, so a PR cannot supply the
+            # rules that decide whether its own attestation is strong enough.
+            if git show "$PR_BASE_SHA:scripts/pr-tier.sh" > "$RUNNER_TEMP/pr-tier.sh" 2>/dev/null; then
+              chmod +x "$RUNNER_TEMP/pr-tier.sh"
+            else
+              # Bootstrap: the base predates the classifier, so it also predates
+              # the light attestations that need one.
+              cp scripts/pr-tier.sh "$RUNNER_TEMP/pr-tier.sh"
+            fi
           elif [[ "$PR_NUMBER" == "659" ]]; then
             # Bootstrap for the PR that first introduces the base-controlled checker.
             cp scripts/check-pr-preflight.sh "$RUNNER_TEMP/check-pr-preflight.sh"

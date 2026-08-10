@@ -363,25 +363,30 @@ contradictory, or changed areas.
 ## Review before merging
 
 Verification is proportional to blast radius. `scripts/pre-pr.sh` classifies
-every diff into one of three tiers and enforces the matching gate, so the tier
-is a property of the changed paths, not a judgement call:
+every diff through one shared classifier (`scripts/pr-tier.sh`, which the CI
+attestation checker also runs against the same diff) and enforces the matching
+gate, so the tier is a property of the changed paths and cannot be claimed:
 
 ```text
-docs-only  Markdown and docs/ only          no reviewer, no owner check
-tooling    scripts/, .github/, bench/,      review OPTIONAL, one focused owner
-           individual crates/*/tests/*,     check, cheap ratchet, no bounded gate
+docs-only  *.md and docs/ only, with       no reviewer, no owner check
+           --docs-only
+tooling    leaf owner tests                review OPTIONAL, one focused owner
+           crates/<crate>/tests/<name>.rs  check; no bounded gate, no Clippy
            and prose
-code       crates/*/src, Cargo.*,           full flow below: one fresh review,
-           .cargo/, apps/, and the shared   owner check, bounded gate, Clippy
-           crates/*/tests/common harness
+code       everything else                 one fresh review, owner check,
+                                           bounded gate, Clippy
 ```
 
-The tooling tier exists because a script, a workflow, a benchmark, or one test
-file cannot change compiled behavior beyond what its own focused owner check
-exercises. The shared test harness stays in the code tier: one file there
-breaks every suite. Passing `--reviewer` with a log in the tooling tier still
-records a review exactly as the code tier does — the tier removes the
-requirement, not the option.
+The classifier fails closed: a path matching no tooling shape is code tier.
+That deliberately keeps `scripts/` and `.github/` — which compile nothing but
+gate every future PR — under the full review, and keeps shared test
+infrastructure (`tests/common*`, `tests/helpers/`, `tests/fixtures/`,
+`tests/golden/`, and any nested module under `tests/`) out of the light tier,
+because one file there reaches every suite. Only a leaf owner test, whose
+blast radius is the target its own owner check compiles and runs, takes the
+light path. Passing `--reviewer` with a log in a light tier still records a
+review exactly as the code tier does — the tier removes the requirement, not
+the option.
 
 The PR is a publication checkpoint, not a second implementation loop. The
 normal code path is exactly:
@@ -412,13 +417,16 @@ second review.
 
 **The one-review/one-fix cycle is enforced, not merely stated.** Preflight
 counts the consecutive `fix` commits following the implementation on the
-branch; at three it fails unless one of them also changed the owning
-`docs/impl` plan or audit. Three rounds of patching individually reported
-cells is the signature of a matrix that missed an axis — the required response
-is to enumerate that axis, fix the class in one pass, and commit the updated
-matrix with the fix. Measured cost of ignoring this: 24–36 minutes per round,
-and the two capabilities that ran four and nine rounds spent 3.5 and 4.75
-hours respectively inside the loop.
+branch; at three it fails unless one of them both changed an authoritative
+`docs/impl` plan or audit (translated `ja/` mirrors do not count) and carried a
+`Closure-Matrix-Reopened: <axis>` trailer. Three rounds of patching
+individually reported cells is the signature of a matrix that missed an axis —
+the required response is to enumerate that axis, fix the class in one pass, and
+commit the updated matrix with that trailer. Measured cost of ignoring this:
+24–36 minutes per round, and the two capabilities that ran four and nine rounds
+spent 3.5 and 4.75 hours respectively inside the loop. Naming a commit outside
+the `fix` prefix also resets the counter; that is a visible choice in the
+history, and reviewers should read a renamed streak as the same smell.
 
 Finish ordinary PR-body prose before opening. If a later code push is actually
 required, rerun preflight for the new SHA and refresh the existing PR with

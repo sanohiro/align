@@ -6,12 +6,13 @@ usage() {
   cat >&2 << 'USAGE'
 usage: scripts/pre-pr.sh [--docs-only | --reviewer ID --review-log FILE [--findings-fixed]] [--base REF] [--owner-test LABEL] [-- COMMAND ...]
 
-The tier follows the changed paths:
-  docs-only  Markdown/docs only            pass --docs-only; no owner command
-  tooling    scripts, workflows, bench,    review optional; one owner command
-             individual tests, prose
-  code       crates/*/src, Cargo.*, apps,  review required; owner command, then
-             tests/common harness          the bounded gate and Clippy
+The tier follows the changed paths (scripts/pr-tier.sh, fail-closed):
+  docs-only  *.md and docs/ only           pass --docs-only; no owner command
+  tooling    leaf crates/*/tests/*.rs      review optional; one owner command
+             and prose
+  code       everything else, including    review required; owner command, then
+             scripts/, .github/, shared    the bounded gate and Clippy
+             test harnesses and fixtures
 
 A code PR needs all of:
   --reviewer ID            reviewer identity ([A-Za-z0-9._-]+)
@@ -74,22 +75,14 @@ review_head="$head_sha"
 review_state="docs-only"
 rust_changed=false
 non_documentation_changed=false
-# Tier classification. `library_changed` means the diff can alter compiled
-# behavior anywhere in the workspace: library/binary sources, build inputs, the
-# Align library sources the suites compile, or the shared test harness one file
-# of which breaks every suite. Anything else — an individual test, a script, a
-# workflow, a benchmark, prose — is tooling: its blast radius is covered by the
-# focused owner verification, so it does not pay the cumulative bounded gate.
+# shellcheck source=scripts/pr-tier.sh
+. "$(dirname "$0")/pr-tier.sh"
 library_changed=false
+pr_tier_library_changed "$base_sha" "$head_sha" && library_changed=true
 while IFS= read -r path; do
   case "$path" in *.md|docs/*) ;; *) non_documentation_changed=true ;; esac
   case "$path" in
     crates/*|Cargo.toml|Cargo.lock|rust-toolchain*|.cargo/*) rust_changed=true ;;
-  esac
-  case "$path" in
-    crates/*/tests/common/*) library_changed=true ;;
-    crates/*/tests/*) ;;
-    crates/*|Cargo.toml|Cargo.lock|rust-toolchain*|.cargo/*|apps/*) library_changed=true ;;
   esac
   case "$path" in *.sh) [[ ! -f "$path" ]] || bash -n "$path" ;; esac
 done < <(git diff --no-renames --name-only "$base_sha"...HEAD)
@@ -97,37 +90,47 @@ done < <(git diff --no-renames --name-only "$base_sha"...HEAD)
 # Review-round tripwire. Consecutive `fix` commits after the implementation are
 # review rounds; three of them means the review has become the discovery loop
 # for one root-cause class, which CLAUDE.md requires closing by re-opening the
-# closure matrix instead of patching the next reported cell. A change to the
-# owning plan or audit document inside the streak is that evidence.
-review_rounds=0
+# closure matrix instead of patching the next reported cell. Releasing the gate
+# takes a deliberate, auditable act: a commit inside the streak that both
+# changes an authoritative docs/impl plan or audit (not a translated mirror)
+# and records a `Closure-Matrix-Reopened:` trailer naming the axis. Renaming a
+# commit away from `fix` also silences the counter — that is a visible choice in
+# the history, not a hidden one.
+review_streak=()
 seen_implementation=false
-while IFS= read -r subject; do
-  case "$subject" in
+while IFS= read -r entry; do
+  case "${entry#* }" in
     fix*|Fix*)
       if [[ "$seen_implementation" == true ]]; then
-        review_rounds=$((review_rounds + 1))
+        review_streak+=("${entry%% *}")
       else
         seen_implementation=true
+        review_streak=()
       fi
       ;;
-    *) seen_implementation=true; review_rounds=0 ;;
+    *) seen_implementation=true; review_streak=() ;;
   esac
-done < <(git log --reverse --format='%s' "$base_sha"..HEAD)
-if [[ "$review_rounds" -ge 3 ]]; then
+done < <(git log --reverse --format='%H %s' "$base_sha"..HEAD)
+if [[ "$docs_only" == false && "${#review_streak[@]}" -ge 3 ]]; then
   matrix_reopened=false
-  while IFS= read -r path; do
-    case "$path" in docs/impl/*) matrix_reopened=true ;; esac
-  done < <(git log --format='%H' "$base_sha"..HEAD |
-    head -n "$review_rounds" |
-    while IFS= read -r commit; do git show --no-renames --name-only --format= "$commit"; done)
+  for commit in "${review_streak[@]}"; do
+    git log -1 --format='%B' "$commit" | grep -q '^Closure-Matrix-Reopened:' || continue
+    while IFS= read -r path; do
+      case "$path" in
+        docs/impl/*/ja/*|docs/impl/ja/*) ;;
+        docs/impl/*) matrix_reopened=true ;;
+      esac
+    done < <(git show --no-renames --name-only --format= "$commit")
+  done
   [[ "$matrix_reopened" == true ]] || {
-    echo "preflight: $review_rounds consecutive review-fix commits without re-opening a closure matrix" >&2
-    echo "  Repeated fixes for one reported cell mean the matrix missed an axis. Enumerate that" >&2
-    echo "  axis in the owning docs/impl plan or audit, fix the class in one pass, and commit the" >&2
-    echo "  updated matrix with the fix — a matrix change inside the streak satisfies this gate." >&2
+    echo "preflight: ${#review_streak[@]} consecutive review-fix commits without re-opening a closure matrix" >&2
+    echo "  Repeatedly patching individually reported cells means the matrix missed an axis." >&2
+    echo "  Enumerate that axis in the owning docs/impl plan or audit, fix the class in one pass," >&2
+    echo "  and commit it with a 'Closure-Matrix-Reopened: <axis>' trailer." >&2
     exit 1
   }
 fi
+
 
 if [[ "$docs_only" == true ]]; then
   [[ -z "$reviewer" && -z "$review_log" && "$findings_fixed" == false ]] || {
