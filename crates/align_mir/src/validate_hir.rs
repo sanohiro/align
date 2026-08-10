@@ -3087,6 +3087,15 @@ impl<'a> BodyValidator<'a> {
         if !self.body_ty_ok(ty) {
             return false;
         }
+        if align_sema::ty_mentions_resource(
+            ty,
+            &self.program.structs,
+            &self.program.tuples,
+            &self.program.enums,
+            &self.program.tagged_types,
+        ) {
+            return false;
+        }
         match ty {
             Ty::Struct(id) => self.program.structs.get(id as usize).is_some(),
             Ty::Fn(id) => self.program.fn_types.get(id as usize).is_some(),

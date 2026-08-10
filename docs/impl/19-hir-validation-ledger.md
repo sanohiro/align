@@ -666,7 +666,7 @@ means:
 
 | Discriminator | Exact envelope, children, and postcondition |
 |---|---|
-| `ArrayLit` | `env[elems.len,elem,pooled]`: `elem` is one fixed-literal producer type; when `elems` is empty the producer must have obtained that exact type from an enclosing expected `slice<T>` context. Scalar arrays reject every owned handle including File, every slice-bearing non-struct, and Move enum; fixed struct arrays permit over-aligned structs. `child[elems]`; `post[all elements exactly elem; result Array(s,n) or StructArray(id,n), n==len and fits u32, including n==0 only for the expected-type form; pooled iff immutable unaligned let-bound nonempty/all-constant primitive scalar literal under the producer's pool predicate; element ownership transfers exactly]`. |
+| `ArrayLit` | `env[elems.len,elem,pooled]`: `elem` is one fixed-literal producer type; when `elems` is empty the producer must have obtained that exact type from an enclosing expected `slice<T>` context. Scalar arrays admit Copy payloads plus owned `string`; they reject every other scalar Move value including owned `array<T>`, every owned handle including File, every slice-bearing non-struct, and Move enum. Fixed struct arrays permit over-aligned structs and recursively Move structs constructed in place. `child[elems]`; `post[all elements exactly elem; result Array(s,n) or StructArray(id,n), n==len and fits u32, including n==0 only for the expected-type form; pooled iff immutable unaligned let-bound nonempty/all-constant primitive scalar literal under the producer's pool predicate; element ownership transfers exactly]`. |
 | `ConstArray` | `env[elems.len,elem,len]`: elem is primitive scalar or Str accepted by top-level constants; `len==elems.len` and fits u32. `child[elems]`; `post[each child is the exact folded literal form and type elem; result Slice(elem); static view, no ownership record]`. |
 | `ArrayZip` | `env[sources.len,tuple_id]`: at least two sources; tuple arity equals source count and every tuple element is the source element type. `child[sources]`; `post[each source is a Copy-scalar fixed/dynamic array or slice with equal runtime length contract; result Tuple(tuple_id) only as a pipeline source; sources borrowed]`. |
 | `Select` | `env[]`; `child[mask,a,b]`; `post[mask K(s,n), a/b same V(s,n); result V(s,n); copy]`. |
@@ -718,6 +718,19 @@ means:
 | `ArrayGroupAgg` | `env[base,struct_id,key_field,value_field,op,source]`: base/source/struct agree by GroupSource row; key/value ordinals in range; Count iff value_field None, other ops iff Some exact i64 field. `child[]`; `post[result exact tuple: (array<i64>,array<i64>) for SoaI64, otherwise (array<str>,array<i64>); arrays are owned and Str keys borrow base]`. |
 | `ArrayGroupAggMulti` | `env[base,struct_id,key_field,aggs,source]`: source is producer-supported AosStr first cut; key is Str; nonempty aggs and each GroupAgg1 row valid. `child[]`; `post[result exact tuple of key array followed by one i64 array per agg; one fused pass; ownership/provenance as single aggregate]`. |
 | `ArrayDictEncode` | `env[base,struct_id,key_field]`: base is exactly DynStructArray(struct_id,Aos), key field is Str. `child[]`; `post[result DictEncoded(struct_id,key_field); dense ids owned, dictionary/source slices borrow base]`. |
+
+#### Fixed-array element admission closure
+
+The `ArrayLit` producer and validator close the ownership boundary by element class:
+
+| Element class | Producer and validator disposition | Ownership owner |
+|---|---|---|
+| Copy scalar, `str`, or function value | Admit; copy each element into the fixed slot. | cumulative array/closure owners |
+| owned `string` | Admit; initialize/null/drop every element through the dedicated fixed-array string path. | `align_mir::tests::owned_string_array_shapes_pass_the_hir_gate_and_near_misses_fail` |
+| recursively Move struct | Admit only when each element is constructed in place; reject copying a pre-existing value. | `owned_structs_arrays` |
+| owned `array<T>` or another scalar Move value | Reject before checked HIR; no fixed-array per-element null/drop lowering exists. | `align_mir::tests::owned_string_array_shapes_pass_the_hir_gate_and_near_misses_fail` |
+| Move enum, resource/ref, or owned native handle | Reject before checked HIR; the fixed collection has no tag/resource-specific per-element transfer path. | `align_mir::validate_hir_tests::hir_body_validator_storage_vector_array` plus cumulative tagged/resource owners |
+| slice-bearing non-struct | Reject before checked HIR; per-element view provenance is not representable. | cumulative borrow-liveness owners |
 
 ### am-b2 nested records
 

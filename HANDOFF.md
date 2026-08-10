@@ -56,12 +56,14 @@ blocking) before relying on the nightly full-suite signal, which it will
 otherwise consume up to the job timeout (the nightly workflow skips it by name
 until then).
 
-Follow-up triage from the validator-alignment review: sema appears to admit a
-fixed array literal of owned `array<T>` elements (`reject_fixed_array_element`
-does not name plain `DynArray`) while the validator's Move-scalar arm rejects
-it. If reachable end-to-end, such a program now dies as the new loud internal
-error instead of a silent empty binary; probe it and align whichever side is
-wrong.
+The fixed-array follow-up from the validator-alignment review is closed. The
+suspected owned `array<T>` element is source-reachable: sema admitted it even
+though fixed arrays have no per-element null/drop lowering for that Move
+shape. Sema now rejects the complete scalar-Move element class except for the
+existing owned-`string` path, and the HIR validator uses the same recursive
+resource/ref exclusion as the producer. Focused owners preserve Copy values,
+owned strings, and in-place Move structs while rejecting owned arrays and
+resource-bearing near-misses before MIR construction.
 
 Fixed on this branch (was present on `main` since the 62f48771 checked-HIR
 validation activation): the body validator contradicted sema on owned-`string`

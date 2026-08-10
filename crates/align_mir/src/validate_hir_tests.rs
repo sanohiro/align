@@ -7402,6 +7402,63 @@ fn hir_body_validator_storage_vector_array() {
 
     assert!(body_core_metadata_is_valid(&program));
 
+    // Resource owners and checked refs are excluded from fixed arrays recursively. Keep this
+    // validator-side negative independent from sema so handcrafted HIR cannot bypass the source
+    // admission rule and copy one generation-bearing value into multiple element slots.
+    let mut resource_program = baseline_program();
+    resource_program.resources.push(ResourceDef {
+        name: "pkg.test$owner".to_string(),
+        source_name: "pkg.test$owner".to_string(),
+        declaring_module: "pkg.test".to_string(),
+        generic_arity: 0,
+        drop_hook: "pkg.test$drop_owner".to_string(),
+        drop_thunk: "__align_resource_drop$pkg.test$owner".to_string(),
+        representation_version: 1,
+        drop_abi_fingerprint: *b"align-res-drop-1",
+    });
+    let reference = Ty::ResourceRef(0);
+    resource_program.fns.push(body_test_parameter_function(
+        "resource_ref_control",
+        reference,
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit))),
+        },
+        Ty::Unit,
+    ));
+    assert!(
+        body_core_metadata_is_valid(&resource_program),
+        "a standalone resource_ref parameter must remain producer-valid",
+    );
+    let locals = vec![
+        body_test_local(0, "first", reference, false, true),
+        body_test_local(1, "second", reference, false, true),
+    ];
+    resource_program.fns.push(body_test_function_with_params(
+        "resource_ref_array_rejected",
+        locals,
+        vec![0, 1],
+        hir::Block {
+            stmts: vec![hir::Stmt::Expr(body_test_expr(
+                hir::ExprKind::ArrayLit {
+                    elems: vec![
+                        body_test_expr(hir::ExprKind::Local(0), reference),
+                        body_test_expr(hir::ExprKind::Local(1), reference),
+                    ],
+                    elem: reference,
+                    pooled: false,
+                },
+                Ty::Array(Scalar::ResourceRef(0), 2),
+            ))],
+            value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit))),
+        },
+        Ty::Unit,
+    ));
+    assert!(
+        !body_core_metadata_is_valid(&resource_program),
+        "a resource_ref fixed array must fail closed at the HIR boundary",
+    );
+
     let mut reject = program.clone();
     match &mut body_statement_expression_mut(&mut reject, "array_literal_case").kind {
         hir::ExprKind::ArrayLit { elem, .. } => *elem = Ty::Bool,

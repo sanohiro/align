@@ -1831,7 +1831,7 @@ fn ty_owns_dyn_array_storage(
 /// values are legal in one-owner structs/sums, but v1 excludes every such shape from fixed arrays,
 /// pipeline elements, and spawned-task captures. Keep this recursive classifier shared by those
 /// gates so an aggregate wrapper cannot turn the restriction into a shallow type-name check.
-fn ty_mentions_resource(
+pub fn ty_mentions_resource(
     ty: Ty,
     structs: &[StructDef],
     tuples: &[hir::TupleDef],
@@ -32159,6 +32159,22 @@ impl<'a, 't> Checker<'a, 't> {
         ) {
             self.diags.error(
                 format!("`{}` cannot be an array element — an owned I/O handle/buffer is bound to one local, not collected (bind it to a local)", ty_name(elem_ty)),
+                span,
+            );
+            return true;
+        }
+        // Fixed arrays have element-wise cleanup only for owned `string` and Move structs
+        // constructed in place. Every other scalar Move value (including an owned `array<T>`)
+        // would be copied into the stack aggregate without a matching per-element null/drop path.
+        // Reject that complete class before `payload_scalar` can turn it into `Ty::Array`.
+        if elem_ty != Ty::String
+            && ty_to_scalar(elem_ty).is_some_and(Scalar::is_move)
+        {
+            self.diags.error(
+                format!(
+                    "`{}` cannot be an element of a fixed array yet — its per-element Move/drop path is not supported",
+                    self.ty_display(elem_ty)
+                ),
                 span,
             );
             return true;

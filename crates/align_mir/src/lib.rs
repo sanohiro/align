@@ -15435,6 +15435,37 @@ fn main() -> i32 {
             !validate_hir::body_only_metadata_is_valid(&boxed_element),
             "a Move box element in an array literal must fail before MIR lowering",
         );
+
+        // Near-miss 3: an owned `array<T>` is also a scalar Move value, but unlike `string` it has
+        // no fixed-array element-wise null/drop lowering. Sema must reject the source before the
+        // active HIR validator turns the producer/consumer disagreement into an internal error.
+        let nested_owned = r#"module main
+fn owned() -> array<i64> = [1, 2].to_array()
+fn main() -> i32 {
+  arrays := [owned()]
+  return arrays.len() as i32
+}
+"#;
+        let (nested_hir, diagnostics) = check_modules(&[("main", true, nested_owned)]);
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            diagnostics.has_errors(),
+            "an owned array element must be rejected before checked HIR: {messages:?}",
+        );
+        assert!(
+            messages.iter().any(|message| {
+                message.contains("cannot be an element of a fixed array yet")
+                    && message.contains("per-element Move/drop path")
+            }),
+            "the diagnostic must identify the missing fixed-array ownership path: {messages:?}",
+        );
+        assert!(
+            !hir_program_is_valid(&nested_hir),
+            "diagnosed HIR must remain fail-closed if a caller bypasses the semantic gate",
+        );
     }
 
     #[test]
