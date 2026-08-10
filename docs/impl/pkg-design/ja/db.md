@@ -2659,6 +2659,16 @@ pre-implementation adversarial reviewはsource work前に次のcontract gapを�
 | P2 segmented outputにpartial-child rowがなかった | segmented ownerはpartial-NULL両方向、declared-field precedence、reject時にchild/offsetをmutateしないことをcoverする。 |
 | P2 one-execution wordingがpre-stream failureを含んだ | successful stream formationはrows resource 1つとcompleted execution 1回を所有し、pre-send/send-failure pathはzero/at-most-one attemptとno-retry countを別に持つ。 |
 
+implementation reviewは1つのmissed invariantを中心にmutable-retention cellを再開した。call
+effectはoptimized traversal pathを含め、argument評価後のatomic transition 1つである。
+
+| Finding | Root-cause closure | Owner evidence |
+|---|---|---|
+| P1 transparent `?`/return pathがdestination retentionを欠いた | child call effect後のtransparent error/return edgeで全mutable destinationをcollectし、general HIR walkと一致させる。 | `pkg_db_q6::borrow_mut_shaper_retention_is_exact_and_fail_closed` のtry-error/direct-return forwarding case |
+| P1 eager argument factをcontrol-expression completion前にcaptureした | 全eager argument完了後だけcall effectをapplyし、その時点で各argumentのcontained factをsnapshotする。 | 同ownerのinline `if` argument case |
+| P1 複数mutable destinationが順次変更済みregionを読んだ | destination update前に全exact source regionとdestination storage regionをsnapshotし、1つのpre-call stateからvalidateしてupdateをjoinする。 | 同ownerのcross-arena two-destination swap case |
+| P2 unary direct callがexact summaryをbypassした | unary transparent-spine post actionをeager worklistと同じatomic direct-call transitionへrouteする。 | 同ownerのunary whole-field clear case |
+
 2026-08-10のmacOS/ARM64 local Q6 recordでは、User + Groups child 10,000件を
 16,253,542 ns（約1.63 us/child）でshapeし、native execution 1回、delivered row 10,000件、
 child push 10,000回、rows-resource finalization 1回をexactに記録した。timingはnon-gatingな

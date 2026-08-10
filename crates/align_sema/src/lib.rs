@@ -12147,9 +12147,8 @@ enum EscapeFlowOp<'a> {
     /// the body/fact is unavailable. The source regions are captured before the destination state
     /// changes so retaining the old destination is well-defined.
     BorrowMutCall {
-        destination: &'a Expr,
         args: &'a [Expr],
-        sources: Vec<usize>,
+        destinations: Vec<(usize, Vec<usize>)>,
         depth: u32,
     },
     /// Region-backed builders may cross a call boundary only through `borrow mut`; a shared or out
@@ -12550,11 +12549,10 @@ impl<'a> EscapeCheck<'a> {
                 }
             }
             EscapeFlowOp::BorrowMutCall {
-                destination,
                 args,
-                sources,
+                destinations,
                 depth,
-            } => self.apply_borrow_mut_call(destination, args, &sources, depth),
+            } => self.apply_borrow_mut_calls(args, &destinations, depth),
             EscapeFlowOp::RegionBuilderNonMutBorrow { builder, depth } => {
                 if !self.drop_is_individual(builder, depth) {
                     self.diags.error(
@@ -15756,53 +15754,75 @@ impl<'a> EscapeCheck<'a> {
         }
     }
 
-    fn apply_borrow_mut_call(
+    fn apply_borrow_mut_calls(
         &mut self,
-        destination: &Expr,
         args: &[Expr],
-        sources: &[usize],
+        destinations: &[(usize, Vec<usize>)],
         depth: u32,
     ) {
-        // A resource's region is the lifetime of its opaque parent handle. Mutating the native
-        // resource state cannot replace that parent provenance with an ordinary call argument;
-        // doing so would misclassify a child resource as region-owned and suppress its Drop hook.
-        if matches!(
-            expand_tagged_ty(destination.ty, self.tagged_types),
-            Ty::Resource(_)
-        ) {
-            return;
-        }
-        let destination_region = self.mutable_destination_storage_region(destination, depth);
-        let source_regions = sources
+        // Every summary source denotes the pre-call value. Snapshot the complete call before
+        // changing any destination: a callee may swap two mutable view-bearing places, and reading
+        // the second source after updating the first would validate the wrong arena lifetime.
+        let snapshots = destinations
             .iter()
-            .filter_map(|&source| args.get(source))
-            .filter(|source| self.region_bearing(source.ty))
-            .map(|source| (source, self.region_of(source, depth)))
+            .filter_map(|(destination, sources)| {
+                let destination = args.get(*destination)?;
+                // A resource's region is the lifetime of its opaque parent handle. Mutating native
+                // resource state cannot replace that provenance with an ordinary call argument;
+                // doing so would suppress a child resource's Drop hook.
+                if matches!(
+                    expand_tagged_ty(destination.ty, self.tagged_types),
+                    Ty::Resource(_)
+                ) {
+                    return None;
+                }
+                let destination_region =
+                    self.mutable_destination_storage_region(destination, depth);
+                let source_regions = sources
+                    .iter()
+                    .filter_map(|&source| {
+                        let argument = args.get(source)?;
+                        self.region_bearing(argument.ty)
+                            .then(|| (source, self.region_of(argument, depth)))
+                    })
+                    .collect::<Vec<_>>();
+                Some((destination, destination_region, source_regions))
+            })
             .collect::<Vec<_>>();
-        for (source, region) in &source_regions {
-            if !region.outlives(destination_region) {
-                self.diags.error(
-                    "cannot retain a shorter-lived view through this mutable borrow; copy it into the destination region first"
-                        .to_string(),
-                    source.span,
-                );
+
+        let mut updates = std::collections::HashMap::<LocalId, Region>::new();
+        for (destination, destination_region, source_regions) in snapshots {
+            for (source, region) in &source_regions {
+                if !region.outlives(destination_region)
+                    && let Some(source) = args.get(*source)
+                {
+                    self.diags.error(
+                        "cannot retain a shorter-lived view through this mutable borrow; copy it into the destination region first"
+                            .to_string(),
+                        source.span,
+                    );
+                }
             }
+            if destination.ty.is_array_builder() {
+                continue;
+            }
+            let Some((root, whole_place)) = self.mutable_destination_root(destination) else {
+                continue;
+            };
+            let mut retained = if whole_place {
+                Region::Static
+            } else {
+                self.state.region.get(&root).copied().unwrap_or(Region::Static)
+            };
+            for (_, region) in source_regions {
+                retained = retained.shorter(region);
+            }
+            updates
+                .entry(root)
+                .and_modify(|current| *current = current.shorter(retained))
+                .or_insert(retained);
         }
-        if destination.ty.is_array_builder() {
-            return;
-        }
-        let Some((root, whole_place)) = self.mutable_destination_root(destination) else {
-            return;
-        };
-        let mut retained = if whole_place {
-            Region::Static
-        } else {
-            self.state.region.get(&root).copied().unwrap_or(Region::Static)
-        };
-        for (_, region) in source_regions {
-            retained = retained.shorter(region);
-        }
-        self.state.region.insert(root, retained);
+        self.state.region.extend(updates);
     }
 
     /// Record concrete caller-region checks for every region-bearing mutable destination. Exact
@@ -15815,6 +15835,7 @@ impl<'a> EscapeCheck<'a> {
         summary: Option<&BorrowMutRetentionSummary>,
         depth: u32,
     ) {
+        let mut destinations = Vec::new();
         for (index, mode) in modes.iter().copied().enumerate() {
             let Some(destination) = args.get(index) else {
                 continue;
@@ -15836,10 +15857,12 @@ impl<'a> EscapeCheck<'a> {
             }
             let sources = exact_borrow_mut_source_indices(summary, index, args.len())
                 .unwrap_or_else(|| (0..args.len()).collect());
+            destinations.push((index, sources));
+        }
+        if !destinations.is_empty() {
             self.push_flow_op(EscapeFlowOp::BorrowMutCall {
-                destination,
                 args,
-                sources,
+                destinations,
                 depth,
             });
         }
@@ -17930,20 +17953,67 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
-    /// Resolve the exact source-argument positions retained by one same-program mutable
-    /// destination. A missing or malformed fact returns `None`, selecting the conservative
-    /// all-argument fallback used for imported, indirect, and unavailable bodies.
-    fn direct_borrow_mut_sources(
-        &self,
+    fn apply_direct_borrow_mut_call_effects(
+        &mut self,
         function: &str,
-        destination: usize,
-        argument_count: usize,
-    ) -> Option<Vec<usize>> {
-        exact_borrow_mut_source_indices(
-            self.named_borrow_mut_retention.get(function),
-            destination,
-            argument_count,
-        )
+        args: &[Expr],
+        moved: &MovedSet,
+    ) {
+        let Some(modes) = self.named_param_modes.get(function).cloned() else {
+            return;
+        };
+        let summary = self.named_borrow_mut_retention.get(function).cloned();
+        self.apply_borrow_mut_call_effects(args, &modes, summary.as_ref(), moved);
+    }
+
+    /// Apply one returning call as an atomic mutable-place transition. Argument evaluation has
+    /// completed, but no destination generation has changed yet. Snapshot every contained fact and
+    /// invalidation root first so multiple mutable destinations (including swaps) all observe the
+    /// same pre-call values.
+    fn apply_borrow_mut_call_effects(
+        &mut self,
+        args: &[Expr],
+        modes: &[ast::ParamMode],
+        summary: Option<&BorrowMutRetentionSummary>,
+        moved: &MovedSet,
+    ) {
+        let argument_facts = args
+            .iter()
+            .map(|argument| {
+                let fallback = self.borrow_fact(argument);
+                self.stored_argument_fact(argument, &fallback)
+            })
+            .collect::<Vec<_>>();
+        let destinations = modes
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(index, mode)| {
+                if mode != ast::ParamMode::BorrowMut {
+                    return None;
+                }
+                let argument = args.get(index)?;
+                Some((
+                    index,
+                    self.borrow_mut_invalidation_roots(argument),
+                    exact_borrow_mut_source_indices(summary, index, args.len()),
+                ))
+            })
+            .collect::<Vec<_>>();
+
+        for (index, roots, _) in &destinations {
+            if let Some(argument) = args.get(*index) {
+                self.reject_live_resource_dependents_of_roots(roots, moved, argument.span);
+            }
+        }
+        for (_, roots, _) in &destinations {
+            self.borrows.invalidate_roots(roots, BorrowEnd::Consumed);
+        }
+        for (index, _, exact_sources) in destinations {
+            if let Some(argument) = args.get(index) {
+                self.refresh_borrow_mut_call(argument, &argument_facts, exact_sources.as_deref());
+            }
+        }
     }
 
     /// Refresh one caller place with the roots a returning mutable callee may have installed.
@@ -17952,9 +18022,7 @@ impl<'a> MoveCheck<'a> {
     /// the destination place's own generation as though it were backing storage.
     fn refresh_borrow_mut_call(
         &mut self,
-        _destination_index: usize,
         argument: &Expr,
-        args: &[Expr],
         argument_facts: &[BorrowFact],
         exact_sources: Option<&[usize]>,
     ) {
@@ -17983,14 +18051,12 @@ impl<'a> MoveCheck<'a> {
         let sources = if let Some(exact) = exact_sources {
             exact
         } else {
-            fallback = (0..args.len()).collect::<Vec<_>>();
+            fallback = (0..argument_facts.len()).collect::<Vec<_>>();
             &fallback
         };
         let mut incoming = BorrowFact::default();
         for &source in sources {
-            let (Some(source_fact), Some(source_argument)) =
-                (argument_facts.get(source), args.get(source))
-            else {
+            let Some(source_fact) = argument_facts.get(source) else {
                 // A malformed exact fact must not become an empty, fail-open update.
                 incoming = BorrowFact::default();
                 for fact in argument_facts {
@@ -17998,8 +18064,7 @@ impl<'a> MoveCheck<'a> {
                 }
                 break;
             };
-            let source_fact = self.stored_argument_fact(source_argument, source_fact);
-            incoming = incoming.join(&source_fact);
+            incoming = incoming.join(source_fact);
         }
         if path.is_empty() {
             let ty = self.f.locals.get(local as usize).map(|local| local.ty);
@@ -20814,7 +20879,7 @@ impl<'a> MoveCheck<'a> {
                     let falls_through =
                         values.pop().expect("Move expression result");
                     if falls_through {
-                        self.finish_eager_move_action(expression);
+                        self.finish_eager_move_action(expression, moved);
                     }
                     let child_snapshots = self
                         .value_snapshot_frames
@@ -20851,8 +20916,26 @@ impl<'a> MoveCheck<'a> {
         values.pop().expect("Move root result")
     }
 
-    fn finish_eager_move_action(&mut self, expression: &Expr) {
+    fn finish_eager_move_action(&mut self, expression: &Expr, moved: &MovedSet) {
         match &expression.kind {
+            ExprKind::Call { func, args, .. } => {
+                self.apply_direct_borrow_mut_call_effects(func, args, moved);
+            }
+            ExprKind::CallFnValue { callee, args } => {
+                let modes = match callee.ty {
+                    Ty::Fn(id) => self.fn_types.get(id as usize).map(|function| {
+                        function
+                            .params
+                            .iter()
+                            .map(|(mode, _)| *mode)
+                            .collect::<Vec<_>>()
+                    }),
+                    _ => None,
+                };
+                if let Some(modes) = modes {
+                    self.apply_borrow_mut_call_effects(args, &modes, None, moved);
+                }
+            }
             ExprKind::ReaderReadLine { buffer, .. } => {
                 self.invalidate_storage(buffer);
             }
@@ -20884,7 +20967,10 @@ impl<'a> MoveCheck<'a> {
                 snapshots_source: bool,
                 snapshot: Option<Option<usize>>,
             },
-            BorrowMutCall(&'e Expr),
+            DirectBorrowMutCall {
+                function: &'e str,
+                args: &'e [Expr],
+            },
             IfAfterCondition {
                 then: &'e Block,
                 els: &'e Block,
@@ -21819,10 +21905,16 @@ impl<'a> MoveCheck<'a> {
                             .and_then(|modes| modes.first())
                             .copied()
                             .unwrap_or(ast::ParamMode::ByValue);
+                        if let Some(modes) = self.named_param_modes.get(func).cloned() {
+                            self.check_call_borrow_aliases(func, args, &modes);
+                        }
                         let consumes = func != "print"
                             && !matches!(mode, ast::ParamMode::Borrow | ast::ParamMode::BorrowMut);
                         let post = if mode == ast::ParamMode::BorrowMut {
-                            Post::BorrowMutCall(&args[0])
+                            Post::DirectBorrowMutCall {
+                                function: func,
+                                args,
+                            }
                         } else {
                             Post::None
                         };
@@ -22150,7 +22242,12 @@ impl<'a> MoveCheck<'a> {
                     }
                     None
                 }
-                Post::Try(error_roots) => Some(error_roots),
+                Post::Try(error_roots) => {
+                    if falls_through {
+                        self.collect_borrow_mut_exit_roots();
+                    }
+                    Some(error_roots)
+                }
                 Post::LoopBreak(value) => {
                     if falls_through {
                         let fact = value.map_or_else(
@@ -22189,16 +22286,9 @@ impl<'a> MoveCheck<'a> {
                     }
                     None
                 }
-                Post::BorrowMutCall(argument) => {
+                Post::DirectBorrowMutCall { function, args } => {
                     if falls_through {
-                        let roots = self.borrow_mut_invalidation_roots(argument);
-                        self.reject_live_resource_dependents_of_roots(
-                            &roots,
-                            moved,
-                            argument.span,
-                        );
-                        self.borrows.invalidate_roots(&roots, BorrowEnd::Consumed);
-                        self.refresh_borrow_mut_place(argument);
+                        self.apply_direct_borrow_mut_call_effects(function, args, moved);
                     }
                     None
                 }
@@ -22477,6 +22567,7 @@ impl<'a> MoveCheck<'a> {
                         );
                         self.return_roots
                             .extend(self.borrow_sources(value));
+                        self.collect_borrow_mut_exit_roots();
                     }
                     falls_through = false;
                     None
@@ -23261,38 +23352,6 @@ impl<'a> MoveCheck<'a> {
                         );
                     move_expr!(self, a, moved, consuming, consuming);
                 }
-                let argument_facts = args
-                    .iter()
-                    .map(|argument| self.borrow_fact(argument))
-                    .collect::<Vec<_>>();
-                if let Some(mode_count) = self.named_param_modes.get(func).map(Vec::len) {
-                    for index in 0..mode_count {
-                        let mode = self.named_param_modes[func][index];
-                        if mode == ast::ParamMode::BorrowMut
-                            && let Some(argument) = args.get(index)
-                        {
-                            let roots = self.borrow_mut_invalidation_roots(argument);
-                            self.reject_live_resource_dependents_of_roots(
-                                &roots,
-                                moved,
-                                argument.span,
-                            );
-                            self.borrows.invalidate_roots(&roots, BorrowEnd::Consumed);
-                            let exact_sources = self.direct_borrow_mut_sources(
-                                func,
-                                index,
-                                args.len(),
-                            );
-                            self.refresh_borrow_mut_call(
-                                index,
-                                argument,
-                                args,
-                                &argument_facts,
-                                exact_sources.as_deref(),
-                            );
-                        }
-                    }
-                }
             }
             // A fn value is Copy (a pointer); an indirect call's callee + args are reads.
             ExprKind::FnValue(_) => {}
@@ -23314,8 +23373,6 @@ impl<'a> MoveCheck<'a> {
                     self.check_indirect_call_callee_aliases(callee, args, modes);
                     self.check_call_borrow_aliases("function value", args, modes);
                 }
-                let mode_count = modes.as_ref().map_or(0, Vec::len);
-                drop(modes);
                 for (index, a) in args.iter().enumerate() {
                     let mode = match callee.ty {
                         Ty::Fn(id) => self
@@ -23330,34 +23387,6 @@ impl<'a> MoveCheck<'a> {
                         Some(ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
                     );
                     move_expr!(self, a, moved, consuming, consuming);
-                }
-                let argument_facts = args
-                    .iter()
-                    .map(|argument| self.borrow_fact(argument))
-                    .collect::<Vec<_>>();
-                for index in 0..mode_count {
-                    let mode = match callee.ty {
-                        Ty::Fn(id) => self.fn_types[id as usize].params[index].0,
-                        _ => ast::ParamMode::ByValue,
-                    };
-                    if mode == ast::ParamMode::BorrowMut
-                        && let Some(argument) = args.get(index)
-                    {
-                        let roots = self.borrow_mut_invalidation_roots(argument);
-                        self.reject_live_resource_dependents_of_roots(
-                            &roots,
-                            moved,
-                            argument.span,
-                        );
-                        self.borrows.invalidate_roots(&roots, BorrowEnd::Consumed);
-                        self.refresh_borrow_mut_call(
-                            index,
-                            argument,
-                            args,
-                            &argument_facts,
-                            None,
-                        );
-                    }
                 }
             }
             ExprKind::StructLit { fields, .. } => {

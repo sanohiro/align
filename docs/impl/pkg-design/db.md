@@ -4131,6 +4131,16 @@ The pre-implementation adversarial review closed these contract gaps before sour
 | P2 segmented output omitted partial-child rows | The segmented owner covers both partial-NULL directions, their declared-field precedence, and no child/offset mutation on rejection. |
 | P2 one-execution wording included pre-stream failures | Successful stream formation owns one rows resource and one completed execution; pre-send and send-failure paths have separate zero/at-most-one attempt and no-retry counts. |
 
+The implementation review reopened the mutable-retention cell around one missed invariant: a call
+effect is one atomic post-argument transition, including optimized traversal paths.
+
+| Finding | Root-cause closure | Owner evidence |
+|---|---|---|
+| P1 transparent `?` and return paths omitted destination retention | Collect every mutable destination at the transparent error/return edge after its child call effect, matching the general HIR walk. | try-error and direct-return forwarding cases in `pkg_db_q6::borrow_mut_shaper_retention_is_exact_and_fail_closed` |
+| P1 eager argument facts were captured before control-expression completion | Apply call effects only after all eager arguments finish, and snapshot each argument's contained fact at that point. | inline `if` argument case in the same owner |
+| P1 multiple mutable destinations read sequentially changed regions | Snapshot all exact source regions and destination storage regions before any destination update, then validate and join the updates from that one pre-call state. | cross-arena two-destination swap case in the same owner |
+| P2 unary direct calls bypassed exact summaries | Route the unary transparent-spine post action through the same atomic direct-call transition as the eager worklist. | unary whole-field clear case in the same owner |
+
 The 2026-08-10 macOS/ARM64 local Q6 record shaped 10,000 User + Groups children in
 16,253,542 ns (about 1.63 us/child), with exactly one native execution, 10,000 delivered rows,
 10,000 child pushes, and one rows-resource finalization. The timing is a non-gating machine-local

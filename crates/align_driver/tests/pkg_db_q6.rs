@@ -356,6 +356,123 @@ fn main() -> i32 {
         "whole raw replacement must retain its source owner",
     );
 
+    let unary = r#"State { text: str }
+fn clear(borrow mut state: State) { state.text = "" }
+fn main() -> i32 {
+  mut owner := "source".clone()
+  view: str := owner
+  mut state := State { text: view }
+  clear(state)
+  owner = "replaced".clone()
+  if owner.len() == 8 && state.text == "" { return 42 }
+  return 0
+}
+"#;
+    let unary_diagnostics = check_diagnostics("pkg-db-q6-unary-exact-retention", unary);
+    assert!(
+        unary_diagnostics.is_empty(),
+        "a unary direct replacement must clear the obsolete owner fact:\n{unary_diagnostics}",
+    );
+
+    let eager_argument = r#"State { text: str }
+fn retain(borrow mut state: State, source: str) { state.text = source }
+fn main() -> i32 {
+  mut owner := "source".clone()
+  view: str := owner
+  mut state := State { text: "" }
+  retain(state, if true { view } else { "" })
+  owner = "replaced".clone()
+  return state.text.len() as i32
+}
+"#;
+    let eager_diagnostics = check_diagnostics("pkg-db-q6-eager-argument-retention", eager_argument);
+    assert!(
+        eager_diagnostics.contains("use of invalidated borrow 'state'"),
+        "a retained control-expression argument must preserve its completion-time owner:\n{eager_diagnostics}",
+    );
+
+    let try_exit = r#"State { text: str }
+fn retain_then_try(
+  borrow mut state: State,
+  source: str,
+  pass: bool,
+) -> Result<(), i64> {
+  state.text = source
+  result: Result<(), i64> := if pass { Ok(()) } else { Err(1) }
+  _ := result?
+  state.text = ""
+  return Ok(())
+}
+fn main() -> i32 {
+  mut owner := "source".clone()
+  view: str := owner
+  mut state := State { text: "" }
+  attempted := retain_then_try(state, view, false)
+  _ := match attempted { Ok(_) => 0 Err(_) => 1 }
+  owner = "replaced".clone()
+  return state.text.len() as i32
+}
+"#;
+    let try_diagnostics = check_diagnostics("pkg-db-q6-try-exit-retention", try_exit);
+    assert!(
+        try_diagnostics.contains("use of invalidated borrow 'state'"),
+        "the transparent `?` error edge must publish its mutable destination state:\n{try_diagnostics}",
+    );
+
+    let return_forward = r#"State { text: str }
+fn retain(borrow mut state: State, source: str) -> Result<(), i64> {
+  state.text = source
+  return Ok(())
+}
+fn forward(borrow mut state: State, source: str) -> Result<(), i64> {
+  return retain(state, source)
+}
+fn main() -> i32 {
+  mut owner := "source".clone()
+  view: str := owner
+  mut state := State { text: "" }
+  attempted := forward(state, view)
+  _ := match attempted { Ok(_) => 0 Err(_) => 1 }
+  owner = "replaced".clone()
+  return state.text.len() as i32
+}
+"#;
+    let return_diagnostics =
+        check_diagnostics("pkg-db-q6-return-forward-retention", return_forward);
+    assert!(
+        return_diagnostics.contains("use of invalidated borrow 'state'"),
+        "a transparent return wrapper must publish transitive mutable retention:\n{return_diagnostics}",
+    );
+
+    let simultaneous_regions = r#"State { text: str }
+fn swap(borrow mut first: State, borrow mut second: State) {
+  saved := first
+  first = second
+  second = saved
+}
+fn main() -> i32 {
+  arena outer {
+    outer_text := "outer".clone_in(outer)
+    mut outer_state := State { text: outer_text }
+    arena inner {
+      inner_text := "inner".clone_in(inner)
+      mut inner_state := State { text: inner_text }
+      swap(inner_state, outer_state)
+    }
+    return outer_state.text.len() as i32
+  }
+}
+"#;
+    let simultaneous_diagnostics = check_diagnostics(
+        "pkg-db-q6-simultaneous-region-snapshot",
+        simultaneous_regions,
+    );
+    assert!(
+        simultaneous_diagnostics
+            .contains("cannot retain a shorter-lived view through this mutable borrow",),
+        "a two-destination swap must validate every source against the pre-call regions:\n{simultaneous_diagnostics}",
+    );
+
     let indirect = r#"State { text: str }
 fn copy(borrow mut state: State, source: str, out: region) {
   state.text = source.clone_in(out)
