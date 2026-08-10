@@ -4454,6 +4454,121 @@ enum StaticBatchCallbackKind {
     Drop,
 }
 
+fn static_batch_reader_result(statement: &Stmt, target: &str, ordinal: usize) -> Option<ValueId> {
+    let ordinal = i128::try_from(ordinal).ok()?;
+    let Stmt::Let(
+        value,
+        Rvalue::Call(
+            DirectCall::Program(actual_target),
+            args,
+        ),
+    ) = statement
+    else {
+        return None;
+    };
+    let [Operand::Arg(1), Operand::Const(Const::Int(actual_ordinal, ordinal_ty))] =
+        args.as_slice()
+    else {
+        return None;
+    };
+    let u32_ty = Ty::Int(IntTy {
+        bits: 32,
+        signed: false,
+    });
+    (actual_target.as_str() == target && *actual_ordinal == ordinal && *ordinal_ty == u32_ty)
+        .then_some(*value)
+}
+
+fn static_batch_append_prefix_matches(
+    program: &Program,
+    row_struct: u32,
+    prefix: &[Stmt],
+    inputs: &[ColumnBatchInput],
+) -> bool {
+    let Some(row) = usize::try_from(row_struct)
+        .ok()
+        .and_then(|row_struct| program.structs.get(row_struct))
+    else {
+        return false;
+    };
+    if row.fields.len() != inputs.len() {
+        return false;
+    }
+    let mut statements = prefix.iter();
+    for (ordinal, (field, input)) in row.fields.iter().zip(inputs).enumerate() {
+        let base = match field.ty {
+            Ty::Option(payload) => scalar_to_ty(payload),
+            ty => ty,
+        };
+        match base {
+            Ty::Str
+            | Ty::Slice(Scalar::Int(IntTy {
+                bits: 8,
+                signed: false,
+            })) => {
+                let Some(pointer) = statements.next().and_then(|statement| {
+                    static_batch_reader_result(
+                        statement,
+                        "pkg.db.internal$read_view_pointer_v2",
+                        ordinal,
+                    )
+                }) else {
+                    return false;
+                };
+                let Some(length) = statements.next().and_then(|statement| {
+                    static_batch_reader_result(
+                        statement,
+                        "pkg.db.internal$read_view_length_v2",
+                        ordinal,
+                    )
+                }) else {
+                    return false;
+                };
+                if !matches!(
+                    input,
+                    ColumnBatchInput::View {
+                        ptr: Operand::Value(actual_pointer),
+                        len: Operand::Value(actual_length),
+                    } if *actual_pointer == pointer && *actual_length == length
+                ) {
+                    return false;
+                }
+            }
+            base => {
+                let target = match base {
+                    Ty::Bool => "pkg.db.internal$read_bool_v2",
+                    Ty::Int(IntTy {
+                        bits: 16,
+                        signed: true,
+                    }) => "pkg.db.internal$read_i16_v2",
+                    Ty::Int(IntTy {
+                        bits: 32,
+                        signed: true,
+                    }) => "pkg.db.internal$read_i32_v2",
+                    Ty::Int(IntTy {
+                        bits: 64,
+                        signed: true,
+                    }) => "pkg.db.internal$read_i64_v2",
+                    Ty::Float(FloatTy { bits: 32 }) => "pkg.db.internal$read_f32_v2",
+                    Ty::Float(FloatTy { bits: 64 }) => "pkg.db.internal$read_f64_v2",
+                    _ => return false,
+                };
+                let Some(value) = statements
+                    .next()
+                    .and_then(|statement| static_batch_reader_result(statement, target, ordinal))
+                else {
+                    return false;
+                };
+                if !matches!(input, ColumnBatchInput::Scalar(Operand::Value(actual)) if *actual == value)
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    statements.next().is_none()
+}
+
 fn static_batch_callback_body_matches(
     program: &Program,
     target: &ProgramCall,
@@ -4472,22 +4587,6 @@ fn static_batch_callback_body_matches(
     let Some((operation, prefix)) = block.stmts.split_last() else {
         return false;
     };
-    if prefix.iter().any(|statement| {
-        matches!(
-            statement,
-            Stmt::ColumnBatchFinish { .. }
-                | Stmt::ColumnBatchDrop { .. }
-                | Stmt::Let(
-                    _,
-                    Rvalue::ColumnBatchCreate { .. }
-                        | Rvalue::ColumnBatchAppend { .. }
-                        | Rvalue::ColumnBatchRow { .. }
-                        | Rvalue::ColumnBatchSoa { .. }
-                )
-        )
-    }) {
-        return false;
-    }
     match (kind, operation, &block.term) {
         (
             StaticBatchCallbackKind::Create,
@@ -4499,15 +4598,15 @@ fn static_batch_callback_body_matches(
                 },
             ),
             Term::Return(Some(Operand::Value(result))),
-        ) => *struct_id == row_struct && value == result,
+        ) => prefix.is_empty() && *struct_id == row_struct && value == result,
         (
             StaticBatchCallbackKind::Append { rows_resource },
             Stmt::Let(
                 value,
                 Rvalue::ColumnBatchAppend {
                     payload: Operand::Arg(0),
+                    inputs,
                     struct_id,
-                    ..
                 },
             ),
             Term::Return(Some(Operand::Value(result))),
@@ -4515,6 +4614,7 @@ fn static_batch_callback_body_matches(
             *struct_id == row_struct
                 && value == result
                 && function.slots.get(2) == Some(&Ty::ResourceRef(rows_resource))
+                && static_batch_append_prefix_matches(program, row_struct, prefix, inputs)
         }
         (
             StaticBatchCallbackKind::Finish,
@@ -4523,7 +4623,7 @@ fn static_batch_callback_body_matches(
                 struct_id,
             },
             Term::Return(None),
-        ) => *struct_id == row_struct,
+        ) => prefix.is_empty() && *struct_id == row_struct,
         (
             StaticBatchCallbackKind::Row { batch_resource },
             Stmt::Let(
@@ -4541,6 +4641,7 @@ fn static_batch_callback_body_matches(
             *struct_id == row_struct
                 && *resource == batch_resource
                 && value == result
+                && prefix.is_empty()
         }
         (
             StaticBatchCallbackKind::Soa { batch_resource },
@@ -4558,6 +4659,7 @@ fn static_batch_callback_body_matches(
             *struct_id == row_struct
                 && *resource == batch_resource
                 && value == result
+                && prefix.is_empty()
         }
         (
             StaticBatchCallbackKind::Drop,
@@ -4566,7 +4668,7 @@ fn static_batch_callback_body_matches(
                 struct_id,
             },
             Term::Return(None),
-        ) => *struct_id == row_struct,
+        ) => prefix.is_empty() && *struct_id == row_struct,
         _ => false,
     }
 }
@@ -17444,6 +17546,10 @@ mod tests {
             bits: 32,
             signed: true,
         });
+        let u32_ty = Ty::Int(IntTy {
+            bits: 32,
+            signed: false,
+        });
         let i64_ty = Ty::Int(IntTy {
             bits: 64,
             signed: true,
@@ -17522,7 +17628,13 @@ mod tests {
                 vec![
                     Stmt::Let(
                         0,
-                        Rvalue::OptionSome(Operand::Const(Const::Int(0, i64_ty))),
+                        Rvalue::Call(
+                            DirectCall::Program(program_call("pkg.db.internal$read_i64_v2")),
+                            vec![
+                                Operand::Arg(1),
+                                Operand::Const(Const::Int(0, u32_ty)),
+                            ],
+                        ),
                     ),
                     Stmt::Let(
                         1,
@@ -17643,6 +17755,28 @@ mod tests {
                 Term::Return(None),
             ),
         ]);
+        let mut wrong_ordinal_append = callbacks[1].clone();
+        wrong_ordinal_append.name = program_call("wrong_ordinal_append");
+        let Stmt::Let(_, Rvalue::Call(_, args)) = &mut wrong_ordinal_append.blocks[0].stmts[0]
+        else {
+            panic!("test append reader topology");
+        };
+        args[1] = Operand::Const(Const::Int(1, u32_ty));
+        callbacks.push(wrong_ordinal_append);
+        for (index, name) in [
+            (1, "prefixed_append"),
+            (2, "prefixed_finish"),
+            (3, "prefixed_row"),
+            (4, "prefixed_soa"),
+            (5, "prefixed_drop"),
+        ] {
+            let mut callback = callbacks[index].clone();
+            callback.name = program_call(name);
+            callback.blocks[0]
+                .stmts
+                .insert(0, Stmt::RawFree(Operand::Arg(0)));
+            callbacks.push(callback);
+        }
         let resource = |kind: &str| hir::ResourceDef {
             name: format!("pkg.db${kind}$S3_Row"),
             source_name: format!("pkg.db${kind}$S3_Row"),
@@ -17739,7 +17873,18 @@ mod tests {
                         .chain(callbacks.iter().cloned())
                         .collect(),
                     externs: Vec::new(),
-                    imported_fns: Vec::new(),
+                    imported_fns: vec![align_mir::ImportedFn {
+                        name: program_call("pkg.db.internal$read_i64_v2"),
+                        params: vec![Ty::Raw, u32_ty],
+                        param_modes: vec![align_ast::ParamMode::ByValue; 2],
+                        ret: Ty::Option(Scalar::Int(IntTy {
+                            bits: 64,
+                            signed: true,
+                        })),
+                        return_borrow: hir::ReturnBorrowSummary::None,
+                        return_region: hir::ReturnRegionSummary::None,
+                        return_cleanup: hir::ReturnCleanupAbi::None,
+                    }],
                     link_libs: Vec::new(),
                     structs: vec![row.clone(), other.clone()],
                     enums: Vec::new(),
@@ -17813,6 +17958,44 @@ mod tests {
                 "offset {offset} produced unexpected cross-Row diagnostic: {error}"
             );
         }
+        for (offset, target) in [
+            (24, "prefixed_append"),
+            (32, "prefixed_finish"),
+            (40, "prefixed_row"),
+            (48, "prefixed_soa"),
+            (56, "prefixed_drop"),
+        ] {
+            let mut malformed = plan.clone();
+            malformed
+                .relocations
+                .iter_mut()
+                .find(|relocation| relocation.offset == offset)
+                .expect("payload callback ordinal")
+                .target = StaticDataTarget::Function(program_call(target));
+            let error = emit_descriptor(malformed)
+                .expect_err("batch callback prefix mutation must fail before LLVM");
+            assert!(
+                error
+                    .to_string()
+                    .contains("callback body does not match the Row"),
+                "offset {offset} produced unexpected prefix diagnostic: {error}"
+            );
+        }
+        let mut malformed = plan.clone();
+        malformed
+            .relocations
+            .iter_mut()
+            .find(|relocation| relocation.offset == 24)
+            .expect("append callback ordinal")
+            .target = StaticDataTarget::Function(program_call("wrong_ordinal_append"));
+        let error = emit_descriptor(malformed)
+            .expect_err("append reader ordinal mismatch must fail before LLVM");
+        assert!(
+            error
+                .to_string()
+                .contains("append callback body does not match the Row"),
+            "unexpected append reader topology diagnostic: {error}"
+        );
     }
 
     #[test]
