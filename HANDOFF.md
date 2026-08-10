@@ -1488,6 +1488,22 @@ Historical session journal           docs/archive/HANDOFF-2026-07-25.md
 - Keep release and review procedures in `CLAUDE.md`; link to them instead of
   duplicating them here.
 
+Two more out-of-gate suites are red on `main` for reasons unrelated to the
+nightly's finding, both found while fixing it (2026-08-11):
+
+- `apps_web_router::best_path_route_tree_agrees_with_the_linear_oracle` and
+  `route_tree_handles_deep_long_and_empty_tables` build a fixed `array<Route>`
+  and slice it (`routes[0..0]`). `check_slice_range` accepts only
+  `str`/`array<scalar>`/`slice`, never `StructArray`, and a pre-#739 baseline
+  compiler rejects the same shape — so this is older than both recent pkg.web
+  changes. Decide whether fixed struct-array slicing is in scope (the router
+  needs it) or the tests should build the table differently.
+- The stale MIR-spelling class had two more members outside the bounded gate,
+  `m4::pipeline_fuses_into_one_loop` and `lambda::lambda_lifts_to_a_called_function`
+  (both now fixed), plus `par_map::par_map_rejects_owned_fixed_array_capture`,
+  whose expected diagnostic #739 replaced. Suites outside `scripts/test-pr.sh`
+  rot silently; the nightly full-suite workflow now runs them daily.
+
 The first nightly full-suite run (2026-08-10) found one real failure, and it
 is a long-standing one the bounded gate cannot see:
 `apps_web_multipart::the_documented_handler_example_compiles_against_the_real_pkg_web`
