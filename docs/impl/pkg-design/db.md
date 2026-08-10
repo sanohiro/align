@@ -4094,6 +4094,76 @@ the coherent fix commit.
 
 Compound Query support is part of the first product contract, not a later ORM enhancement.
 
+#### Q6/D10 implementation closure matrix
+
+Q6 publishes no new database or compiler primitive. It closes the already-reviewed compound
+contract by composing the shipped typed stream, exclusive borrow, region, builder, and `clone_in`
+surfaces in ordinary Query-local Align code. The transaction/master projection and User + Groups
+examples land together because they are the two required compound consumers and share one proof of
+visible execution, Pure shaping, row-view retention, and explicit destination allocation.
+This capability may exceed roughly 1,000 hand-written lines because the first consumer exposed one
+missing analysis-local proof at the L2e/L6 seam: the compiler currently assumes that every
+view-bearing argument may be retained by every `borrow mut` destination. Splitting that proof from
+its compound consumer would publish a dormant compiler relaxation without the only end-to-end owner,
+while splitting the two examples would duplicate the same provenance, execution, and builder matrix.
+
+| Closure cell | Required implementation closure | Exact owner evidence |
+|---|---|---|
+| exact Query-local surface | Add one transaction/master projection and one User + Groups Query module. Each module exposes its flat `Params`/`Row`, logical output records, one static Query constructor, and an Impure `run(exec, params, out)`, and defines one private Pure `step`, all built only from the existing public `rows`/`next` surface. Add no `db.fold`, relationship, lazy-load, iterator, hidden materializer, or package-private execution path. | `pkg_db_q6::compound_query_modules_are_exact_and_typecheck_whole_and_per_unit` plus explicit absence/source-shape assertions |
+| exact mutable-retention proof | For same-program direct calls only, infer a least-fixed-point relation from each `borrow mut` destination to the exact parameter roots actually stored by whole-value/field replacement, builder push/append, and transitive direct calls. Each retained parameter root distinguishes contained provenance from storage reached by borrowing an owned parameter; carry that typed edge through both borrow liveness and escape analysis, translating the former through the argument's projected contained fact and the latter through its storage roots and exact lexical storage region. `clone_in(out)` therefore retains `out`, not its source row generation, while a retained slice of a borrowed owned array keeps that array owner live and cannot escape a forwarding helper that drops the owner. Imported, indirect, missing-body, malformed, and unresolved calls use one shared conservative expansion that supplies both contained and storage edges for every compatible argument to every consumer. Distinguish mutation of a builder or immutable-view aggregate place from mutation reachable through a slice/resource dependency, so sharing one allocation region does not imply storage alias while real nested mutable aliases still reject. A mutable `resource_ref` remains rooted in its owner generation for peer-alias checks even though the mutable place itself is a distinct Copy slot. Recompute this analysis-local fact during checked-HIR replay; add no HIR/interface/MIR/ABI field or runtime work. | `pkg_db_q6::borrow_mut_shaper_retention_is_exact_and_fail_closed` across direct/wrapped/recursive/control-flow stores, clone versus raw-row retention, borrowed-owned storage versus contained aggregate fields, direct and forwarding storage-region escapes, same-region distinct places, nested slice/resource/resource-reference aliases, imported/indirect fallback with owned-storage forwarding, malformed indices, and whole/per-unit parity; cumulative L2e all-peer and L6 wrong-region owners |
+| Pure shaping boundary | Keep database handles and row advancement in `run`. A `step` receives only `borrow mut` state, zero or more separate `borrow mut` region builders, one current `Row`, and `out`; it remains inferred Pure while a same-shape step that calls database I/O is rejected in whole-program and per-unit checking. Builders never enter State fields or cross an ordinary by-value call. | `pkg_db_q6::shapers_are_pure_and_cannot_reach_database_io` and cumulative L2e/L6 effect and arena-call owners |
+| one-parent consistency and nullable child | On the first row, copy the parent name into `out`; on later rows, require identical parent ID and name before appending a child. Treat `(None,None)` as no child and reject both partial `(Some,None)` and `(None,Some)` shapes in the same deterministic field order. Zero rows returns `None`; every error exits through normal rows/builder cleanup. | `pkg_db_q6::sqlite_user_groups_one_parent_and_segmented_matrices_are_exact` plus `pkg_db_q6::postgres_compound_shaping_dispatches_once_on_connection_and_transaction` across zero/one/repeated/inconsistent/complete-null/both-partial inputs and both common driver dispatches |
+| segmented many-parent output | Consume only adjacent parent groups from SQL ordered by parent and child key. Build separate users, groups, and offsets arrays in `out`, starting offsets with zero and appending one final offset. Treat only `(None,None)` as an absent child; reject `(Some,None)` before `(None,Some)` in declared child-field order without appending a child or finalizing an incorrect offset. Reject a parent key that reappears after a later key and repeated-parent field disagreement; do not sort, hash, deduplicate, or create one child array per parent. | `pkg_db_q6::sqlite_user_groups_one_parent_and_segmented_matrices_are_exact` with empty, empty-child, both partial-child directions and precedence, high-fanout, parent transition, disagreement, and non-adjacent-key cases |
+| transaction/master projection | Map each flat transaction plus status-master row to one nested region-owned output row in one pass. The same `run` executes through `exec_conn` and `exec_tx`; transaction ownership and commit/rollback stay at the caller and no relationship field can issue a follow-up read. | `pkg_db_q6::sqlite_transaction_master_runs_on_connection_and_transaction` plus `pkg_db_q6::postgres_compound_shaping_dispatches_once_on_connection_and_transaction` with exact nested values, transaction lifecycle counters, and one execution per call |
+| ownership, allocation, and compilation parity | Clone each retained streamed text field exactly once into `out`, push every aggregate through a region builder, and build each final array inline in `run`. No heap array builder, reflection, row materialization, or generated extra Query enters the loop. Whole-program and per-unit compilation retain the same Query descriptors, steps, stream ownership, cleanup, and generic instantiations. | `pkg_db_q6::compound_shaping_uses_region_builders_and_exact_visible_copies`, MIR/LLVM call counts, whole/per-unit execution, and cumulative Q4b row-generation/Drop owners |
+| execution and scale closure | After successful stream formation, each `run` owns exactly one rows resource and completes exactly one native SQL execution, independent of row or fanout count. Validation or binding failures before send perform zero executions; a native-send failure attempts at most one execution, constructs no rows resource, and never retries. Pin row delivery, child push, parent push, text-copy, builder-build, rows-resource, execution-attempt, and completed-execution counts. Record a local high-fanout one-to-many measurement; timing is non-gating, while every count is correctness evidence. | all Q6 runtime owners, pre-send/send-failure counter owners, and ignored `pkg_db_q6::high_fanout_shaping_measurement_reports_one_execution` |
+
+Before candidate review, the author-side matrix-to-diff pass maps every row above to the Query-local
+source and one exact owner. A defect in parent consistency, nullable-child handling, adjacency,
+copy/allocation, execution count, or cleanup triggers the same root-cause audit across both compound
+examples, common driver dispatches, connection/transaction parents, and whole/per-unit compilation.
+
+The pre-implementation adversarial review closed these contract gaps before source work:
+
+| Finding | Contract closure |
+|---|---|
+| P1 exact direct retention conflicted with L6's all-argument rule | L2e and L6 now own the same analysis-local exact same-program relation and preserve the conservative fallback whenever a body cannot be proven. |
+| P2 segmented output omitted partial-child rows | The segmented owner covers both partial-NULL directions, their declared-field precedence, and no child/offset mutation on rejection. |
+| P2 one-execution wording included pre-stream failures | Successful stream formation owns one rows resource and one completed execution; pre-send and send-failure paths have separate zero/at-most-one attempt and no-retry counts. |
+
+The implementation review reopened the mutable-retention cell around one missed invariant: a call
+effect is one atomic post-argument transition, including optimized traversal paths.
+
+| Finding | Root-cause closure | Owner evidence |
+|---|---|---|
+| P1 transparent `?` and return paths omitted destination retention | Collect every mutable destination at the transparent error/return edge after its child call effect, matching the general HIR walk. | try-error and direct-return forwarding cases in `pkg_db_q6::borrow_mut_shaper_retention_is_exact_and_fail_closed` |
+| P1 eager argument facts were captured before control-expression completion | Apply call effects only after all eager arguments finish, and snapshot each argument's contained fact at that point. | inline `if` argument case in the same owner |
+| P1 multiple mutable destinations read sequentially changed regions | Snapshot all exact source regions and destination storage regions before any destination update, then validate and join the updates from that one pre-call state. | cross-arena two-destination swap case in the same owner |
+| P2 unary direct calls bypassed exact summaries | Route the unary transparent-spine post action through the same atomic direct-call transition as the eager worklist. | unary whole-field clear case in the same owner |
+
+The required P1 re-review reopened that cell again and changed the analysis boundary rather than
+adding another call-site exception. Exact retention now transports a typed source edge:
+`contained(parameter)` or `storage(parameter)`.
+
+| Finding | Root-cause closure | Owner evidence |
+|---|---|---|
+| P1 exact transfer discarded owned source storage | Mark roots introduced by borrowing caller-owned parameter storage separately from roots contained in a parameter value. Translate only storage edges through `storage_roots`; keep contained edges projection-precise. | borrowed owned-array slice retention plus the aggregate-contained-field non-pinning control in the same owner |
+| P1 mutable `resource_ref` peers discarded their common owner | Treat `resource_ref` as a reachable resource dependency for exclusive alias roots; only owning resources retain the distinct mutable-place exception. | two mutable reference slots derived from one resource owner in the same owner |
+
+The next required review found that the typed edge still terminated before escape solving. The
+closure rule is therefore end-to-end: no consumer may reduce a `storage(parameter)` edge to its
+argument index before both the liveness fact and lexical storage region have been selected.
+
+| Finding | Root-cause closure | Owner evidence |
+|---|---|---|
+| P1 escape checking erased retained storage lifetime | Preserve the typed source through the escape-flow operation. Use the argument value region for a contained edge; for a storage edge, intersect that value region with the exact caller-place lexical storage region before validating or updating any destination. | forwarding helper with a local owned array plus direct-call and fixed-array storage controls in the same owner |
+| P1 unavailable-call fallback emitted contained edges only | Select exact or conservative source edges in one shared operation used by both liveness and escape consumers. The conservative result expands every argument to both contained and storage edges, including malformed-summary fallback. | interface-only and indirect calls that may retain a forwarding helper's local owned-array storage, plus the existing cloned-string fallback controls |
+
+The 2026-08-10 macOS/ARM64 local Q6 record shaped 10,000 User + Groups children in
+16,253,542 ns (about 1.63 us/child), with exactly one native execution, 10,000 delivered rows,
+10,000 child pushes, and one rows-resource finalization. The timing is a non-gating machine-local
+observation; the exact execution, delivery, push, and cleanup counts are correctness evidence.
+
 ### D11 — SQL migrations
 
 - SQL migration discovery/order;

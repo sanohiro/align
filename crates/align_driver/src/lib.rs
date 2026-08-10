@@ -219,6 +219,29 @@ fn static_implementation_hash(
 /// Replace each source-level static descriptor function with the producer-owned immutable data
 /// constructor that D1 executes. The private descriptor field is a raw pointer to a canonical,
 /// codegen-owned byte global; application source cannot spell or inspect that field.
+fn rows_resource_names_for_descriptor(row: &align_sema::hir::StructDef) -> [String; 2] {
+    let direct = format!("pkg.db$rows$S{}_{}", row.name.len(), row.name);
+    // Per-unit generic-body reconstruction spells an application nominal through an ordinary
+    // source identifier before substituting it into `rows<R>` (`app.users$Row` becomes
+    // `app_users_Row`). Static-descriptor installation runs afterward against the producer's
+    // canonical dotted/$ type table. Recognize both spellings so the generated streaming decoder
+    // reuses the one semantic resource instance and its producer-owned Drop hook.
+    let reconstructed_name = row
+        .name
+        .chars()
+        .map(|character| match character {
+            '.' | '$' => '_',
+            other => other,
+        })
+        .collect::<String>();
+    let reconstructed = format!(
+        "pkg.db$rows$S{}_{}",
+        reconstructed_name.len(),
+        reconstructed_name
+    );
+    [direct, reconstructed]
+}
+
 fn install_static_descriptor_data(
     mir: &mut align_mir::Program,
     entry_unit: Option<&str>,
@@ -1063,12 +1086,16 @@ fn install_static_descriptor_data(
                 .structs
                 .get(row_struct_id as usize)
                 .ok_or_else(|| "generated query Row struct is absent".to_string())?;
-            let row_mangle = format!("S{}_{}", row_definition.name.len(), row_definition.name);
-            let rows_name = format!("pkg.db$rows${row_mangle}");
+            let rows_names = rows_resource_names_for_descriptor(row_definition);
             let rows_resource = if let Some(index) = mir
                 .resources
                 .iter()
-                .position(|resource| resource.name == rows_name)
+                .position(|resource| resource.name == rows_names[0])
+                .or_else(|| {
+                    mir.resources
+                        .iter()
+                        .position(|resource| resource.name == rows_names[1])
+                })
             {
                 index as u32
             } else {
@@ -1091,8 +1118,8 @@ fn install_static_descriptor_data(
                         representation_version: 1,
                         drop_abi_fingerprint: *b"align-res-drop-1",
                     });
-                resource.name = rows_name.clone();
-                resource.source_name = rows_name;
+                resource.name = rows_names[0].clone();
+                resource.source_name = rows_names[0].clone();
                 let id = mir.resources.len() as u32;
                 mir.resources.push(resource);
                 id
@@ -3591,6 +3618,24 @@ pub fn format_diagnostics(source_map: &SourceMap, diags: &Diagnostics) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn descriptor_rows_resource_names_cover_whole_and_reconstructed_nominals() {
+        let row = align_sema::hir::StructDef {
+            name: "app.user_groups$Row".to_string(),
+            source_name: "app.user_groups$Row".to_string(),
+            fields: Vec::new(),
+            align: None,
+            c_repr: false,
+        };
+        assert_eq!(
+            rows_resource_names_for_descriptor(&row),
+            [
+                "pkg.db$rows$S19_app.user_groups$Row",
+                "pkg.db$rows$S19_app_user_groups_Row",
+            ]
+        );
+    }
 
     #[test]
     fn postgres_parameter_types_match_only_the_exact_generated_shape() {

@@ -1,0 +1,188 @@
+module app.user_groups
+
+import pkg.db
+import pkg.db.postgres
+import pkg.db.sqlite
+
+pub Params { first_user_id: i64, last_user_id: i64 }
+
+pub Row {
+  user_id: i64,
+  user_name: str,
+  group_id: Option<i64>,
+  group_name: Option<str>,
+}
+
+pub User { id: i64, name: str }
+pub Group { id: i64, name: str }
+
+pub Output {
+  user: User,
+  groups: array<Group>,
+}
+
+pub SegmentedOutput {
+  users: array<User>,
+  groups: array<Group>,
+  group_offsets: array<i64>,
+}
+
+State {
+  seen: bool,
+  user_id: i64,
+  user_name: str,
+}
+
+SegmentState {
+  seen: bool,
+  user_id: i64,
+  user_name: str,
+  group_count: i64,
+}
+
+pub fn query() -> pkg.db.query<Params, Row> = pkg.db.query(
+  "SELECT u.id AS user_id, u.name AS user_name, g.id AS group_id, g.name AS group_name FROM users AS u LEFT JOIN user_groups AS ug ON ug.user_id = u.id LEFT JOIN groups AS g ON g.id = ug.group_id WHERE u.id >= :first_user_id AND u.id <= :last_user_id ORDER BY u.id, g.id /* Q6_USER_GROUPS */",
+  [],
+)
+
+fn shape_error(item: str, message: str) -> pkg.db.Error =
+  pkg.db.Error.Decode(pkg.db.ContractError {
+    query_id: None,
+    item: item.clone(),
+    message: message.clone(),
+  })
+
+fn inconsistent_parent_id() -> pkg.db.Error = shape_error(
+  "app.user_groups.user_id",
+  "joined rows disagree on the parent user id",
+)
+
+fn inconsistent_parent_name() -> pkg.db.Error = shape_error(
+  "app.user_groups.user_name",
+  "joined rows disagree on the parent user name",
+)
+
+fn partial_child() -> pkg.db.Error = shape_error(
+  "app.user_groups.group",
+  "group_id and group_name must both be NULL or both be present",
+)
+
+fn non_adjacent_parent() -> pkg.db.Error = shape_error(
+  "app.user_groups.order",
+  "parent rows must be adjacent and ordered by user id",
+)
+
+fn step(
+  borrow mut state: State,
+  borrow mut groups: array_builder<Group>,
+  row: Row,
+  out: region,
+) -> Result<(), pkg.db.Error> {
+  if state.seen {
+    if row.user_id != state.user_id { return Err(inconsistent_parent_id()) }
+    if row.user_name != state.user_name { return Err(inconsistent_parent_name()) }
+  } else {
+    state.seen = true
+    state.user_id = row.user_id
+    state.user_name = row.user_name.clone_in(out)
+  }
+
+  group_id := row.group_id else {
+    _ := row.group_name else { return Ok(()) }
+    return Err(partial_child())
+  }
+  group_name := row.group_name else { return Err(partial_child()) }
+  groups.push(Group { id: group_id, name: group_name.clone_in(out) })
+  return Ok(())
+}
+
+pub fn run(
+  target: pkg.db.exec,
+  params: Params,
+  out: region,
+) -> Result<Option<Output>, pkg.db.Error> {
+  mut state := State { seen: false, user_id: 0, user_name: "" }
+  mut groups: array_builder<Group> := array_builder(out)
+  mut stream := pkg.db.rows(target, query(), params, [])?
+  loop {
+    row := pkg.db.next(stream)? else { break }
+    step(state, groups, row, out)?
+  }
+  if !state.seen { return Ok(None) }
+  groups_out := groups.build()
+  return Ok(Some(Output {
+    user: User { id: state.user_id, name: state.user_name },
+    groups: groups_out,
+  }))
+}
+
+fn finish_segment(
+  borrow mut state: SegmentState,
+  borrow mut users: array_builder<User>,
+  borrow mut offsets: array_builder<i64>,
+) {
+  users.push(User { id: state.user_id, name: state.user_name })
+  offsets.push(state.group_count)
+}
+
+fn segmented_step(
+  borrow mut state: SegmentState,
+  borrow mut users: array_builder<User>,
+  borrow mut groups: array_builder<Group>,
+  borrow mut offsets: array_builder<i64>,
+  row: Row,
+  out: region,
+) -> Result<(), pkg.db.Error> {
+  if state.seen && row.user_id != state.user_id {
+    if row.user_id < state.user_id { return Err(non_adjacent_parent()) }
+    finish_segment(state, users, offsets)
+    state.user_id = row.user_id
+    state.user_name = row.user_name.clone_in(out)
+  } else if state.seen {
+    if row.user_name != state.user_name { return Err(inconsistent_parent_name()) }
+  } else {
+    state.seen = true
+    state.user_id = row.user_id
+    state.user_name = row.user_name.clone_in(out)
+  }
+
+  group_id := row.group_id else {
+    _ := row.group_name else { return Ok(()) }
+    return Err(partial_child())
+  }
+  group_name := row.group_name else { return Err(partial_child()) }
+  groups.push(Group { id: group_id, name: group_name.clone_in(out) })
+  state.group_count = state.group_count + 1
+  return Ok(())
+}
+
+pub fn run_segmented(
+  target: pkg.db.exec,
+  params: Params,
+  out: region,
+) -> Result<SegmentedOutput, pkg.db.Error> {
+  mut state := SegmentState {
+    seen: false,
+    user_id: 0,
+    user_name: "",
+    group_count: 0,
+  }
+  mut users: array_builder<User> := array_builder(out)
+  mut groups: array_builder<Group> := array_builder(out)
+  mut offsets: array_builder<i64> := array_builder(out)
+  offsets.push(0)
+  mut stream := pkg.db.rows(target, query(), params, [])?
+  loop {
+    row := pkg.db.next(stream)? else { break }
+    segmented_step(state, users, groups, offsets, row, out)?
+  }
+  if state.seen { finish_segment(state, users, offsets) }
+  users_out := users.build()
+  groups_out := groups.build()
+  offsets_out := offsets.build()
+  return Ok(SegmentedOutput {
+    users: users_out,
+    groups: groups_out,
+    group_offsets: offsets_out,
+  })
+}

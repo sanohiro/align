@@ -2219,6 +2219,7 @@ mod tests {
                     let mut diagnostics = crate::Diagnostics::new();
                     let named_return_borrow = std::collections::HashMap::new();
                     let named_param_modes = std::collections::HashMap::new();
+                    let named_borrow_mut_retention = std::collections::HashMap::new();
                     let callable_targets =
                         vec![crate::CallableTargetSet::new(); move_program.fn_types.len()];
                     let callable_target_ids = std::collections::HashMap::new();
@@ -2227,6 +2228,7 @@ mod tests {
                         diags: &mut diagnostics,
                         named_return_borrow: &named_return_borrow,
                         named_param_modes: &named_param_modes,
+                        named_borrow_mut_retention: &named_borrow_mut_retention,
                         summary_dependencies: None,
                         tuples: &move_program.tuples,
                         structs: &move_program.structs,
@@ -2248,6 +2250,10 @@ mod tests {
                         loop_iter_drops: Vec::new(),
                         arena_depth: 0,
                         return_roots: crate::BorrowRoots::new(),
+                        borrow_mut_retention: vec![
+                            crate::BorrowRoots::new();
+                            move_program.fns[0].params.len()
+                        ],
                         non_fallthrough: std::collections::HashSet::new(),
                         borrow_fact_cache: std::cell::RefCell::new(None),
                         collecting_move_children: false,
@@ -2263,6 +2269,7 @@ mod tests {
                 let mut diagnostics = crate::Diagnostics::new();
                 let named_return_region = std::collections::HashMap::new();
                 let named_param_modes = std::collections::HashMap::new();
+                let named_borrow_mut_retention = std::collections::HashMap::new();
                 {
                     let function = &program.fns[0];
                     let mut escape = crate::EscapeCheck {
@@ -2270,6 +2277,7 @@ mod tests {
                         diags: &mut diagnostics,
                         named_return_region: &named_return_region,
                         named_param_modes: &named_param_modes,
+                        named_borrow_mut_retention: &named_borrow_mut_retention,
                         fn_types: &program.fn_types,
                         tuples: &program.tuples,
                         structs: &program.structs,

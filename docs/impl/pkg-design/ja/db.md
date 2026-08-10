@@ -2622,6 +2622,76 @@ Pure step（`borrow mut state`、0個以上の独立した `borrow mut` builder�
 1 execution、hidden SQL 0、copy/allocation countを固定する。builderはState fieldにしない。
 初期DB releaseの必須項目。
 
+#### Q6/D10 implementation closure matrix
+
+Q6は新しいdatabase/compiler primitiveを公開しない。既にreview済みのcompound contractを、shipped
+typed stream、exclusive borrow、region、builder、`clone_in` surfaceをordinary Query-local Align codeで
+合成して閉じる。transaction/master projectionとUser + Groups exampleは、visible execution、Pure
+shaping、row-view retention、explicit destination allocationの1つのproofを共有する必須compound consumer
+2つであるため一緒にlandする。
+このcapabilityは手書き約1,000行を超える可能性がある。first consumerがL2e/L6 seamに1つの不足した
+analysis-local proofを露出したためである。現compilerは全view-bearing argumentが全`borrow mut`
+destinationへ保持され得ると仮定する。このproofをcompound consumerから分割すると唯一のend-to-end
+ownerなしにdormant compiler relaxationを公開し、exampleを2つに分割すると同じprovenance、execution、
+builder matrixを重複させる。
+
+| Closure cell | Required implementation closure | Exact owner evidence |
+|---|---|---|
+| exact Query-local surface | transaction/master projectionとUser + GroupsのQuery moduleを1つずつ追加する。各moduleはflat `Params`/`Row`、logical output record、static Query constructor 1つ、既存public `rows`/`next` surfaceだけで構成するImpure `run(exec, params, out)`を公開し、private Pure `step` 1つを定義する。`db.fold`、relationship、lazy-load、iterator、hidden materializer、package-private execution pathは追加しない。 | `pkg_db_q6::compound_query_modules_are_exact_and_typecheck_whole_and_per_unit` とexplicit absence/source-shape assertion |
+| exact mutable-retention proof | same-program direct callだけで、各`borrow mut` destinationからwhole-value/field replacement、builder push/append、transitive direct callによって実際にstoreされるexact parameter rootへのrelationをleast fixed pointでinferする。各retained parameter rootはcontained provenanceとborrowed owned parameterから到達するstorageを区別し、そのtyped edgeをborrow livenessとescape analysisの両方へ通し、前者をargumentのprojected contained fact、後者をstorage rootとexact lexical storage regionへtranslateする。したがって`clone_in(out)`はsource row generationではなく`out`をretainし、borrowed owned arrayのretained sliceはarray ownerをliveに保ち、ownerをdropするforwarding helperからescapeできない。imported/indirect/missing-body/malformed/unresolved callは1つのshared conservative expansionを使い、compatibleな全argumentのcontained/storage両edgeを全consumerへ渡す。builderまたはimmutable-view aggregate placeのmutationとslice/resource dependencyを介して到達するmutationを区別し、同じallocation regionの共有をstorage aliasと見なさず、実際のnested mutable aliasはrejectする。mutable `resource_ref`はmutable place自体が別のCopy slotでもpeer-alias checkではowner generationにrootedしたままにする。checked-HIR replayでこのanalysis-local factを再計算し、HIR/interface/MIR/ABI fieldとruntime workは追加しない。 | direct/wrapped/recursive/control-flow store、clone対raw-row retention、borrowed-owned storage対contained aggregate field、direct/forwarding storage-region escape、same-region distinct place、nested slice/resource/resource-reference alias、owned-storage forwardingを含むimported/indirect fallback、malformed index、whole/per-unit parityをcrossする `pkg_db_q6::borrow_mut_shaper_retention_is_exact_and_fail_closed`、およびcumulative L2e all-peer/L6 wrong-region owner |
+| Pure shaping boundary | database handleとrow advancementは`run`に置く。`step`は`borrow mut` state、0個以上の独立した`borrow mut` region builder、current `Row` 1つ、`out`だけを受け取り、inferred Pureを維持する。同shapeでdatabase I/Oを呼ぶstepはwhole-program/per-unit checkでrejectされる。builderはState fieldに入れずordinary by-value callをcrossしない。 | `pkg_db_q6::shapers_are_pure_and_cannot_reach_database_io` とcumulative L2e/L6 effect/arena-call owner |
+| one-parent consistency/nullable child | first rowでparent nameを`out`へcopyし、later rowではchild append前に同一parent ID/nameを要求する。`(None,None)`だけをno childとし、partial `(Some,None)`/`(None,Some)`を同じdeterministic field orderでrejectする。zero rowは`None`を返し、全errorはnormal rows/builder cleanupを通る。 | zero/one/repeated/inconsistent/complete-null/both-partial inputと両common driver dispatchをcrossする `pkg_db_q6::sqlite_user_groups_one_parent_and_segmented_matrices_are_exact` および `pkg_db_q6::postgres_compound_shaping_dispatches_once_on_connection_and_transaction` |
+| segmented many-parent output | parent key、child key順のSQLからadjacent parent groupだけをconsumeする。`out`内にusers/groups/offsetsの独立arrayをbuildし、offsetは0で始めfinal offsetを1つ追加する。`(None,None)`だけをabsent childとし、`(Some,None)`を`(None,Some)`より先にdeclared child-field orderでrejectしてchild appendもincorrect final offset確定も行わない。later key後にparent keyが再出現する場合とrepeated-parent field disagreementをrejectし、sort/hash/deduplicate/per-parent child arrayを作らない。 | empty/empty-child/both partial-child directionとprecedence/high-fanout/parent transition/disagreement/non-adjacent-key caseを持つ `pkg_db_q6::sqlite_user_groups_one_parent_and_segmented_matrices_are_exact` |
+| transaction/master projection | flat transaction + status-master rowを1 passでnested region-owned output rowへmapする。同じ`run`が`exec_conn`と`exec_tx`で実行され、transaction ownershipとcommit/rollbackはcallerに残り、relationship fieldはfollow-up readを発行できない。 | exact nested value、transaction lifecycle counter、callごとの1 executionを持つ `pkg_db_q6::sqlite_transaction_master_runs_on_connection_and_transaction` および `pkg_db_q6::postgres_compound_shaping_dispatches_once_on_connection_and_transaction` |
+| ownership/allocation/compilation parity | retained streamed text fieldを各1回だけ`out`へcloneし、全aggregateをregion builderへpushし、各final arrayを`run`内でinline buildする。heap array builder、reflection、row materialization、generated extra Queryはloopに入らない。whole-program/per-unit compilationは同じQuery descriptor、step、stream ownership、cleanup、generic instantiationをretainする。 | `pkg_db_q6::compound_shaping_uses_region_builders_and_exact_visible_copies`、MIR/LLVM call count、whole/per-unit execution、cumulative Q4b row-generation/Drop owner |
+| execution/scale closure | stream formation成功後、各`run`はrows resourceをexactly 1つ所有し、row/fanout countによらずnative SQL executionをexactly 1回完了する。send前のvalidation/binding failureはexecution 0、native send failureはexecution attempt最大1回、rows resource 0、retryなしとする。row delivery、child push、parent push、text copy、builder build、rows-resource、execution-attempt、completed-execution countを固定する。local high-fanout one-to-many measurementを記録する。timingはnon-gatingだが全countはcorrectness evidenceである。 | 全Q6 runtime owner、pre-send/send-failure counter owner、ignored `pkg_db_q6::high_fanout_shaping_measurement_reports_one_execution` |
+
+candidate review前にauthor-side matrix-to-diff passで上の全rowをQuery-local sourceとexact owner 1つへ
+対応させる。parent consistency、nullable-child、adjacency、copy/allocation、execution count、cleanupの
+defectは、両compound example、common driver dispatch、connection/transaction parent、whole/per-unit
+compilationを跨いで同じroot-cause classをauditする。
+
+pre-implementation adversarial reviewはsource work前に次のcontract gapを閉じた。
+
+| Finding | Contract closure |
+|---|---|
+| P1 exact direct retentionがL6のall-argument ruleと衝突した | L2e/L6は同じanalysis-local exact same-program relationを所有し、bodyを証明できない場合はconservative fallbackを維持する。 |
+| P2 segmented outputにpartial-child rowがなかった | segmented ownerはpartial-NULL両方向、declared-field precedence、reject時にchild/offsetをmutateしないことをcoverする。 |
+| P2 one-execution wordingがpre-stream failureを含んだ | successful stream formationはrows resource 1つとcompleted execution 1回を所有し、pre-send/send-failure pathはzero/at-most-one attemptとno-retry countを別に持つ。 |
+
+implementation reviewは1つのmissed invariantを中心にmutable-retention cellを再開した。call
+effectはoptimized traversal pathを含め、argument評価後のatomic transition 1つである。
+
+| Finding | Root-cause closure | Owner evidence |
+|---|---|---|
+| P1 transparent `?`/return pathがdestination retentionを欠いた | child call effect後のtransparent error/return edgeで全mutable destinationをcollectし、general HIR walkと一致させる。 | `pkg_db_q6::borrow_mut_shaper_retention_is_exact_and_fail_closed` のtry-error/direct-return forwarding case |
+| P1 eager argument factをcontrol-expression completion前にcaptureした | 全eager argument完了後だけcall effectをapplyし、その時点で各argumentのcontained factをsnapshotする。 | 同ownerのinline `if` argument case |
+| P1 複数mutable destinationが順次変更済みregionを読んだ | destination update前に全exact source regionとdestination storage regionをsnapshotし、1つのpre-call stateからvalidateしてupdateをjoinする。 | 同ownerのcross-arena two-destination swap case |
+| P2 unary direct callがexact summaryをbypassした | unary transparent-spine post actionをeager worklistと同じatomic direct-call transitionへrouteする。 | 同ownerのunary whole-field clear case |
+
+required P1 re-reviewはこのcellを再度開き、call-site exception追加ではなくanalysis boundaryを
+変更した。exact retentionは`contained(parameter)`または`storage(parameter)`というtyped source
+edgeをtransportする。
+
+| Finding | Root-cause closure | Owner evidence |
+|---|---|---|
+| P1 exact transferがowned source storageをdiscardした | caller-owned parameter storageをborrowして導入されたrootをparameter valueにcontainedするrootと別にmarkする。storage edgeだけを`storage_roots`へtranslateし、contained edgeはprojection precisionを維持する。 | 同ownerのborrowed owned-array slice retentionとaggregate-contained-field non-pinning control |
+| P1 mutable `resource_ref` peerが共通ownerをdiscardした | exclusive alias rootで`resource_ref`をreachable resource dependencyとして扱い、distinct mutable-place exceptionはowning resourceだけに限定する。 | 同ownerの1 resource owner由来の2 mutable reference slot |
+
+次のrequired reviewでtyped edgeがescape solve前に終了していることが判明した。closure ruleは
+end-to-endであり、liveness factとlexical storage regionの両方をselectする前に
+`storage(parameter)` edgeをargument indexへ縮退させてはならない。
+
+| Finding | Root-cause closure | Owner evidence |
+|---|---|---|
+| P1 escape checkingがretained storage lifetimeをeraseした | typed sourceをescape-flow operation全体で維持する。contained edgeはargument value regionを使い、storage edgeはdestinationのvalidate/update前にvalue regionとexact caller-place lexical storage regionをintersectする。 | 同ownerのlocal owned arrayを持つforwarding helper、およびdirect-call/fixed-array storage control |
+| P1 unavailable-call fallbackがcontained edgeだけをemitした | liveness/escape両consumerが使う1つのshared operationでexact/conservative source edgeをselectする。conservative resultはmalformed-summary fallbackを含め、全argumentをcontained/storage両edgeへexpandする。 | forwarding helperのlocal owned-array storageをretainし得るinterface-only/indirect call、および既存cloned-string fallback control |
+
+2026-08-10のmacOS/ARM64 local Q6 recordでは、User + Groups child 10,000件を
+16,253,542 ns（約1.63 us/child）でshapeし、native execution 1回、delivered row 10,000件、
+child push 10,000回、rows-resource finalization 1回をexactに記録した。timingはnon-gatingな
+machine-local observationであり、execution、delivery、push、cleanupのexact countがcorrectness evidenceである。
+
 ### D11 — SQL migration
 
 ordered SQL file、D3と共有するexact `ALIGNMIG`/`ALIGNSID` byte/digest golden、
