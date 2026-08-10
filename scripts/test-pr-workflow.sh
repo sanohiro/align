@@ -293,6 +293,51 @@ set -e
   exit 1
 }
 
+# The classifier's two evidence lists must stay equal to what the machinery
+# actually references; recompute both from the repository so adding a gate
+# target or embedding a new document cannot silently widen the light tier.
+# shellcheck source=scripts/pr-tier.sh
+. "$repo_root/scripts/pr-tier.sh"
+actual_gate_tests="$(grep -oE '\-\-test [a-z0-9_]+' "$repo_root/scripts/test-pr.sh" |
+  awk '{print $2}' | sort -u | tr '\n' ' ')"
+declared_gate_tests="$(printf '%s\n' $PR_TIER_GATE_TESTS | sort -u | tr '\n' ' ')"
+[[ "$actual_gate_tests" == "$declared_gate_tests" ]] || {
+  echo "PR_TIER_GATE_TESTS is stale" >&2
+  echo "  scripts/test-pr.sh names: $actual_gate_tests" >&2
+  echo "  scripts/pr-tier.sh lists: $declared_gate_tests" >&2
+  exit 1
+}
+actual_prose="$(
+  cd "$repo_root" || exit 1
+  grep -rhoE 'include_(str|bytes)!\("[^"]*\.md"\)' crates 2>/dev/null |
+    sed -E 's/.*!\("([^"]+)"\)/\1/' |
+    sed -E 's#^(\.\./)+##' |
+    sort -u | tr '\n' ' '
+)"
+declared_prose="$(printf '%s\n' $PR_TIER_COMPILED_PROSE | sort -u | tr '\n' ' ')"
+[[ "$actual_prose" == "$declared_prose" ]] || {
+  echo "PR_TIER_COMPILED_PROSE is stale" >&2
+  echo "  crates embed: $actual_prose" >&2
+  echo "  pr-tier.sh lists: $declared_prose" >&2
+  exit 1
+}
+for gate_test in $PR_TIER_GATE_TESTS; do
+  pr_tier_path_is_library "crates/align_driver/tests/${gate_test}.rs" || {
+    echo "bounded-gate test $gate_test classified as tooling" >&2
+    exit 1
+  }
+done
+for embedded_doc in $PR_TIER_COMPILED_PROSE; do
+  pr_tier_path_is_library "$embedded_doc" || {
+    echo "compiled document $embedded_doc classified as tooling" >&2
+    exit 1
+  }
+done
+pr_tier_path_is_library "crates/align_driver/tests/pkg_db_q6.rs" && {
+  echo "an ordinary leaf owner test must stay in the tooling tier" >&2
+  exit 1
+}
+
 # Tier classification and the review-round tripwire.
 tier_repo="$tmp_dir/tier-repo"
 mkdir -p "$tier_repo/crates/thing/src" "$tier_repo/crates/thing/tests" \
@@ -309,6 +354,7 @@ git -C "$tier_repo" config user.name workflow-test
 git -C "$tier_repo" config user.email workflow-test@example.invalid
 git -C "$tier_repo" config commit.gpgsign false
 printf 'fn main() {}\n' >"$tier_repo/crates/thing/src/lib.rs"
+printf '#[test]\nfn baseline() {}\n' >"$tier_repo/crates/thing/tests/baseline_owner.rs"
 printf '# plan\n' >"$tier_repo/docs/impl/00-plan.md"
 git -C "$tier_repo" add .
 git -C "$tier_repo" commit -qm baseline
@@ -361,6 +407,17 @@ library_case nested-src crates/thing/src/tests/mod.rs
 library_case script scripts/new-gate.sh
 library_case workflow .github/workflows/new.yml
 library_case unknown-tree newcrate/src/lib.rs
+
+# Deleting a leaf owner test removes coverage: never the light tier.
+tier_branch delete-change
+git -C "$tier_repo" rm -q crates/thing/tests/baseline_owner.rs
+git -C "$tier_repo" commit -qm 'test: remove a leaf owner'
+delete_status=0
+tier_preflight --base main --owner-test tier -- true >/dev/null 2>&1 || delete_status=$?
+[[ "$delete_status" -ne 0 ]] || {
+  echo "deleting a leaf owner test unexpectedly took the tooling tier" >&2
+  exit 1
+}
 
 # A library source change classifies as code and keeps the full attestation.
 tier_branch code-change

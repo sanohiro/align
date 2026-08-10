@@ -9,7 +9,8 @@ usage: scripts/pre-pr.sh [--docs-only | --reviewer ID --review-log FILE [--findi
 The tier follows the changed paths (scripts/pr-tier.sh, fail-closed):
   docs-only  *.md and docs/ only           pass --docs-only; no owner command
   tooling    leaf crates/*/tests/*.rs      review optional; one owner command
-             and prose
+             that is not gate content,     (plus the ratchet when Rust changed)
+             and uncompiled prose
   code       everything else, including    review required; owner command, then
              scripts/, .github/, shared    the bounded gate and Clippy
              test harnesses and fixtures
@@ -139,10 +140,11 @@ if [[ "$docs_only" == true ]]; then
   }
   reviewer="docs-only"
 elif [[ "$library_changed" == false && -z "$reviewer" && -z "$review_log" ]]; then
-  # Tooling tier: scripts, workflows, benchmarks, individual tests, and prose
-  # cannot change compiled behavior beyond what the focused owner check
-  # exercises, so an independent review is optional here. Passing --reviewer
-  # with a log still records one exactly as the library tier does.
+  # Tooling tier: a leaf owner test that is not bounded-gate content, or prose
+  # that is not compiled into a test binary. Its blast radius is the target the
+  # focused owner check already compiles and runs, so an independent review is
+  # optional here. Passing --reviewer with a log still records one exactly as
+  # the library tier does.
   [[ "$findings_fixed" == false ]] || {
     echo "--findings-fixed requires a review log" >&2
     exit 2
@@ -219,7 +221,9 @@ fi
 if [[ "$rust_changed" == true ]]; then
   scripts/lint-ratchet.sh
 fi
-if [[ "$library_changed" == true ]]; then
+# The cumulative Rust gate is worth its cost only when the diff can change
+# compiled behavior: library tier AND actual Rust build inputs.
+if [[ "$library_changed" == true && "$rust_changed" == true ]]; then
   scripts/test-pr.sh
   # Clippy keeps its own target dir: clippy and build/test record incompatible
   # fingerprints in a shared dir, so alternating them forces a near-full

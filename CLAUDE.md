@@ -370,23 +370,30 @@ gate, so the tier is a property of the changed paths and cannot be claimed:
 ```text
 docs-only  *.md and docs/ only, with       no reviewer, no owner check
            --docs-only
-tooling    leaf owner tests                review OPTIONAL, one focused owner
-           crates/<crate>/tests/<name>.rs  check; no bounded gate, no Clippy
-           and prose
+tooling    leaf owner tests that are not   review OPTIONAL, one focused owner
+           bounded-gate content, and       check (plus the cheap ratchet when
+           prose that is not compiled      Rust changed); no bounded gate,
+           into a binary                   no Clippy
 code       everything else                 one fresh review, owner check,
                                            bounded gate, Clippy
 ```
 
-The classifier fails closed: a path matching no tooling shape is code tier.
+The classifier fails closed in every direction: an unknown path shape, an
+uncomputable diff, and any deletion are all code tier — removing a file takes
+away coverage, so it can never be light.
 That deliberately keeps `scripts/` and `.github/` — which compile nothing but
 gate every future PR — under the full review, and keeps shared test
 infrastructure (`tests/common*`, `tests/helpers/`, `tests/fixtures/`,
 `tests/golden/`, and any nested module under `tests/`) out of the light tier,
 because one file there reaches every suite. Only a leaf owner test, whose
 blast radius is the target its own owner check compiles and runs, takes the
-light path. Passing `--reviewer` with a log in a light tier still records a
-review exactly as the code tier does — the tier removes the requirement, not
-the option.
+light path. Path shape alone is not enough evidence: the test targets
+`scripts/test-pr.sh` names *are* the bounded gate, and a document reached by
+`include_str!` is a source input to a test binary, so `scripts/pr-tier.sh`
+lists both and `scripts/test-pr-workflow.sh` recomputes those sets from the
+repository and fails when a list goes stale. Passing `--reviewer` with a log in
+a light tier still records a review exactly as the code tier does — the tier
+removes the requirement, not the option.
 
 The PR is a publication checkpoint, not a second implementation loop. The
 normal code path is exactly:
