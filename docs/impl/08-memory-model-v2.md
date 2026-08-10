@@ -713,3 +713,84 @@ The implementation must cover direct and aggregate view provenance through norma
 A mutable borrow kills the old generation on every continuing and error result path. Every new
 type/HIR/MIR/interface variant participates in the exhaustive region, move, cleanup, effect, task,
 ABI, print, and codec classifications; a catch-all default is a soundness defect.
+
+## 15. Escape region-computation unification (2026-08-10)
+
+### 15.1 Defect class and strategy
+
+PR #734's exact mutable-retention work added call-site region caps
+(`retained_storage_region`/`retained_contained_region`) while the callee-side
+store checks kept independent copies of the same computation: the `AssignField`
+arm reads raw `region_of`, the whole-`Assign` arm lacks the `Region::Caller`
+destination branch entirely, and local-backed-slice marking covers only fixed
+arrays at `Let`. Probe programs verified fail-open acceptance with runtime
+use-after-free at 7f5520a8 for field stores, whole-assign stores, returns,
+tuple bindings, and match bindings. This is the third-plus recurrence of the
+`analysis-fact-consumer-sweep` class, so the closure is shared machinery, not
+per-site patches. One pre-implementation adversarial review of this matrix
+rejected an earlier draft's deferral of the tuple/match binding forms as
+unsound (both are reachable today through `partition` and enum array payloads)
+and required the aggregate rows below; this section is the amended plan of
+record.
+
+Three shared authorities, each consumed by every store, return, and break path:
+
+- Destination authority — `mutable_root_storage_region(root, depth)`: the
+  caller place for a `borrow mut` parameter root, else the root's lexical
+  frame/arena scope with the longer default depth when the declaration is
+  unrecorded. Used by `mutable_destination_storage_region`, the `AssignField`
+  target, and the whole-`Assign` target (whose rejection message gains
+  caller-target wording).
+- Incoming authority — `retained_contained_region` becomes the incoming-value
+  region for `AssignField`, whole-`Assign`, and element stores (incoming side
+  only; the element-store target keeps its stricter owned-array rule). Its
+  root extraction looks through `SliceRange`/`ArrayToSlice` wrappers so an
+  outer-frame array sliced inside an arena keeps its declaration depth instead
+  of inheriting the use-site arena.
+- Storage-locality authority — one recursive `owns dyn-array storage`
+  classifier (structs, tuples, sums, and `Option`/`Result`/tagged payloads)
+  drives local-backed marking at every binding form: `Let`, `LetTuple`, match
+  bindings, `Assign` re-marking (whose `local_mentions_slice` gate today
+  excludes dyn arrays entirely), and by-value parameters. The marking
+  exclusion is keyed on the storage's **allocation provenance**
+  (`drop_may_be_individual`), never on the folded value region: a mixed
+  aggregate holding a caller view plus a frame-owned array folds to a caller
+  region while its buffer is still individually freed at frame exit, and only
+  the drop side tracks that. A pure region allocation
+  (`array_builder(out).build()`) is bulk-freed by its region, stays unmarked,
+  and keeps caller-region-built arrays returnable. Aggregate locals are
+  marked through the same classifier so `Field`/`TupleIndex` projections
+  resolve locality from the root local.
+
+### 15.2 Closure matrix
+
+| Cell | Program shape | At 7f5520a8 | Required | Owner evidence |
+|---|---|---|---|---|
+| dyn-array slice field store | `borrow mut` callee stores `source[..]` of a frame-owned `.to_array()` local into a caller destination field | accepted; runtime UAF | reject via incoming + locality authorities | `pkg_db_q6::borrow_mut_shaper_retention::direct_local_dyn_storage` |
+| fixed-array slice field store | same store with a fixed `[1, 2, 3]` local; MoveCheck has no root (numeric fixed array is Copy), so only EscapeCheck can see it | accepted; runtime UAF | reject via the incoming authority consulting existing marking | `pkg_db_q6::borrow_mut_shaper_retention::direct_local_fixed_storage` |
+| whole-`Assign` view escape | `state = State { text: view-of-frame string }` (destination authority alone) and `state = State { values: source[..] }` (all three authorities jointly) through a `borrow mut` param | accepted; runtime UAF | the `Assign` target uses the caller-place region; the owner pins both variants to keep the joint dependency visible | `pkg_db_q6::borrow_mut_shaper_retention::whole_assign_frame_view` and `whole_assign_frame_storage` |
+| return-path dyn slice | `fn leak() -> slice<i64>` returns `source[..]` of a frame-owned `.to_array()` local | accepted; runtime UAF (fixed-array twin already rejected) | reject via the locality authority | `return_provenance::dyn_storage_locality::return_of_dyn_array_slice_rejected` |
+| break-path dyn slice | the same view escaping a `loop` through value-carrying `break` past its array's scope | accepted | reject via the shared locality fact in `check_break_escape` | `return_provenance::dyn_storage_locality::break_of_dyn_array_slice_rejected` |
+| LetTuple binding | `(evens, odds) := xs.partition(f)` then `return evens[..]` | accepted; runtime UAF | mark tuple-bound dyn arrays at `LetTuple` | `return_provenance::dyn_storage_locality::tuple_destructured_partition_slice_rejected` |
+| match binding | enum array payload bound in a `match` arm, `return arr[..]` | accepted; runtime UAF | mark match-bound dyn arrays | `return_provenance::dyn_storage_locality::match_bound_array_payload_slice_rejected` |
+| `Assign` re-marking | `mut arr := builder(out).build()` (unmarked, correct) then `arr = [1, 2, 3].to_array()`, `return arr[..]` | accepted after reassignment | re-mark through the same classifier on `Assign`; clearing direction (frame-owned reassigned from caller-region value) also follows it | `return_provenance::dyn_storage_locality::reassigned_dyn_array_re_marks_storage` |
+| by-value Move parameter | `fn leak(xs: array<i64>) -> slice<i64> { return xs[..] }` — the callee owns and drops the array at frame exit; borrowed modes stay returnable through provenance | accepted; runtime UAF | mark by-value dyn-owning parameters at function entry; record parameter declaration depth 0 | `return_provenance::dyn_storage_locality::by_value_param_dyn_storage_slice_rejected` |
+| aggregate-owned storage | `Holder { items: array<i64> }` local, `return h.items[..]` or the borrow-mut field store; tuple local `t := (xs.to_array(), 1)`, `return t.0[..]` | accepted; runtime UAF | mark aggregate locals owning dyn-array storage; `Field`/`TupleIndex` locality resolves from the root | `return_provenance::dyn_storage_locality::struct_field_dyn_storage_slice_rejected` and `tuple_element_dyn_storage_slice_rejected` |
+| contained dyn forwarding twin | forwarding helper passes `source[..]` of a local `.to_array()` as a slice argument to a borrow-mut retainer | accepted (contained edge saw `Static`) | flips to rejected under the locality authority; pinned so the behavior change is owned | `pkg_db_q6::borrow_mut_shaper_retention::forwarded_dyn_storage` |
+| exact clone stays exact | `clone_in(out)` stores through field and whole replacement | accepted | stays accepted (`CloneIn` region is the `out` capability's caller place) | existing `whole_replacement`, `direct_and_wrapped_store` |
+| two-destination swap | cross-arena swap through two `borrow mut` destinations | rejected | stays rejected from the one pre-call snapshot; the callee's whole-assigns stay accepted | existing `two_destination_region_snapshot` |
+| caller-region built slice | slice of an `array_builder(out).build()` array returned to the caller | accepted | stays accepted (caller-region initializers stay unmarked at every binding form) | `return_provenance::dyn_storage_locality::caller_region_built_slice_stays_returnable` |
+| arena-sliced outer array | outer-frame array sliced and stored inside an `arena` block | accepted | stays accepted via wrapper-aware declaration depth | `return_provenance::dyn_storage_locality::outer_array_sliced_inside_arena_stays_valid` |
+| forwarding caps | f61d1299/7f5520a8 forwarding and fallback rejections | rejected | stay rejected through the shared authorities | existing `forwarded_owned_storage`, `forwarded_fixed_storage`, `imported_storage_fallback`, `indirect_storage_fallback` |
+| mixed-provenance aggregate | `Wrap { items: [..].to_array(), text: s.text }` under a `borrow mut` caller view: the value fold reports a caller region while the array buffer is individually freed at frame exit | accepted; runtime UAF (found by the implementation review) | key the marking exclusion on `drop_may_be_individual`, not the folded region | `return_provenance::dyn_storage_locality::mixed_provenance_aggregate_slice_rejected` plus the region-built aggregate control `region_built_aggregate_slice_stays_returnable` |
+| callable capture channel | a closure capturing a local-backed numeric slice, called indirectly | unreachable: a lambda value rejects non-scalar returns ("a lambda value supports only scalar parameters, and a scalar or `Result` return"), so no view of frame storage can exit through a fn value | none now; if lambdas ever gain view returns, propagate `local_backed_slice` through `callable_capture_region` before shipping | probe-verified rejection recorded here; the lambda-surface restriction is the guarding contract |
+
+The store-path comparisons move in the conservative direction (shorter
+incoming, longer target), so a mistake there surfaces as a new diagnostic on
+previously accepted code. The marking exclusion is the one acceptance-direction
+gate, which is why it is keyed on allocation provenance rather than the
+imprecise value-region fold (see the mixed-provenance row). The known
+false-positive residual (arena-sliced outer arrays and tuple projections at
+exact storage edges) is pinned by the wrapper-aware declaration-depth controls
+above. The stale `ty_mentions_slice` comment claiming struct fields cannot be
+slices is corrected alongside.

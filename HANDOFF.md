@@ -47,6 +47,29 @@ declaration emission is intended (then update the parity test) or a leak from
 the static-input discovery wave (then gate the declarations on actual use). The
 suite is not in the bounded CI gate, which is why this went unnoticed.
 
+A second pre-existing failure of the same "outside the bounded gate" class
+(found 2026-08-10, present on `main`):
+`buffer_donate::no_donation_for_mismatched_layout` and
+`buffer_donate::toggle_off_reverts_to_allocate_and_free` assert the source
+array's free as a `drop_value` MIR substring, but cleanup now lowers through
+the dynamic-bit `drop _n` / `return_with_cleanup` form, so the source is freed
+and only the assertion spelling is stale. Update the two assertions to the
+current cleanup spelling (or assert the absence of a leak structurally).
+`m4::pipeline_fuses_into_one_loop` is the same class: the pipeline is fused
+correctly, but the assertion greps the pre-qualification `call double`
+spelling while the printer now writes `call program double`.
+
+Higher-priority pre-existing failure (found 2026-08-10, present on `main`,
+verified against a clean baseline build): three `owned_structs_arrays` owners
+(`element_owned_field_reassign_drops_old`,
+`element_nested_owned_field_reassign_drops_old`,
+`reading_string_field_of_element_as_a_view`) fail because `emit-mir` produces
+an **empty program** for a fixed struct-literal array with Move `string`
+fields plus an element-field reassignment — check passes, no MIR is emitted,
+codegen produces no `_main`, and the link fails. This is not a stale
+assertion; triage which recent `main` change silenced MIR lowering for this
+shape before the next release.
+
 The completed prerequisite waves and current product boundary are:
 
 ```text

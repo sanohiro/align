@@ -2136,3 +2136,145 @@ fn main() -> i32 {
         "a closure projected from a struct field must retain its captured owner"
     );
 }
+
+/// Frame-owned dynamic-array storage: every binding form marks the owner through the shared
+/// storage-locality authority, so slices of it cannot escape by return, break, or reassignment,
+/// while caller-region-built arrays stay returnable. One test per closure-matrix cell.
+mod dyn_storage_locality {
+    use super::*;
+
+    #[test]
+    fn return_of_dyn_array_slice_rejected() {
+        assert!(
+            check_errs(
+                "dyn-storage-return",
+                "fn leak() -> slice<i64> {\n  source := [1, 2, 3].to_array()\n  return source[..]\n}\nfn main() -> i32 {\n  values := leak()\n  return values.sum() as i32\n}\n",
+            ),
+            "a slice of a frame-owned dynamic array must not be returned",
+        );
+    }
+
+    #[test]
+    fn break_of_dyn_array_slice_rejected() {
+        assert!(
+            check_errs(
+                "dyn-storage-break",
+                "fn leak() -> slice<i64> {\n  values := loop {\n    source := [1, 2, 3].to_array()\n    break source[..]\n  }\n  return values\n}\nfn main() -> i32 {\n  values := leak()\n  return values.sum() as i32\n}\n",
+            ),
+            "a slice of a loop-local dynamic array must not escape through break",
+        );
+    }
+
+    #[test]
+    fn tuple_destructured_partition_slice_rejected() {
+        assert!(
+            check_errs(
+                "dyn-storage-lettuple",
+                "fn leak() -> slice<i64> {\n  xs := [1, 2, 3, 4].to_array()\n  (evens, odds) := xs.partition(fn x: i64 { x % 2 == 0 })\n  return evens[..]\n}\nfn main() -> i32 {\n  values := leak()\n  return values.sum() as i32\n}\n",
+            ),
+            "a slice of a tuple-destructured dynamic array must not be returned",
+        );
+    }
+
+    #[test]
+    fn match_bound_array_payload_slice_rejected() {
+        assert!(
+            check_errs(
+                "dyn-storage-match-binding",
+                "Content { Empty, Data(array<i64>) }\nfn pick(fallback: slice<i64>) -> slice<i64> {\n  c := Content.Data([1, 2, 3].to_array())\n  return match c {\n    Data(arr) => arr[..]\n    Empty => fallback\n  }\n}\nfn main() -> i32 {\n  fixed := [9]\n  values := pick(fixed[..])\n  return values.sum() as i32\n}\n",
+            ),
+            "a slice of a match-bound dynamic-array payload must not be returned",
+        );
+    }
+
+    #[test]
+    fn reassigned_dyn_array_re_marks_storage() {
+        assert!(
+            check_errs(
+                "dyn-storage-reassign",
+                "fn leak(out: region) -> slice<i64> {\n  mut builder: array_builder<i64> := array_builder(out)\n  builder.push(1)\n  mut arr := builder.build()\n  arr = [1, 2, 3].to_array()\n  return arr[..]\n}\nfn main() -> i32 {\n  arena out {\n    values := leak(out)\n    return values.sum() as i32\n  }\n}\n",
+            ),
+            "reassigning a caller-region array local to frame-owned storage must re-mark it",
+        );
+    }
+
+    #[test]
+    fn caller_region_built_slice_stays_returnable() {
+        let diagnostics = check_diagnostics(
+            "dyn-storage-caller-region-control",
+            "fn make(out: region) -> slice<i64> {\n  mut builder: array_builder<i64> := array_builder(out)\n  builder.push(1)\n  arr := builder.build()\n  return arr[..]\n}\nfn main() -> i32 {\n  arena out {\n    values := make(out)\n    if values.sum() == 1 { return 0 }\n    return 1\n  }\n}\n",
+        );
+        assert!(
+            diagnostics.is_empty(),
+            "a slice of a caller-region-built array must stay returnable:\n{diagnostics}",
+        );
+    }
+
+    #[test]
+    fn struct_field_dyn_storage_slice_rejected() {
+        assert!(
+            check_errs(
+                "dyn-storage-struct-field",
+                "Holder { items: array<i64> }\nfn leak() -> slice<i64> {\n  h := Holder { items: [1, 2, 3].to_array() }\n  return h.items[..]\n}\nfn main() -> i32 {\n  values := leak()\n  return values.sum() as i32\n}\n",
+            ),
+            "a slice of a struct-owned dynamic array must not be returned",
+        );
+    }
+
+    #[test]
+    fn tuple_element_dyn_storage_slice_rejected() {
+        assert!(
+            check_errs(
+                "dyn-storage-tuple-element",
+                "fn leak() -> slice<i64> {\n  t := ([1, 2, 3].to_array(), 1)\n  return t.0[..]\n}\nfn main() -> i32 {\n  values := leak()\n  return values.sum() as i32\n}\n",
+            ),
+            "a slice of a tuple-owned dynamic array must not be returned",
+        );
+    }
+
+    #[test]
+    fn by_value_param_dyn_storage_slice_rejected() {
+        assert!(
+            check_errs(
+                "dyn-storage-by-value-param",
+                "fn leak(xs: array<i64>) -> slice<i64> {\n  return xs[..]\n}\nfn main() -> i32 {\n  source := [1, 2, 3].to_array()\n  values := leak(source)\n  return values.sum() as i32\n}\n",
+            ),
+            "a slice of a by-value Move array parameter must not be returned",
+        );
+    }
+
+    #[test]
+    fn mixed_provenance_aggregate_slice_rejected() {
+        assert!(
+            check_errs(
+                "dyn-storage-mixed-aggregate",
+                "State { text: str }\nWrap { items: array<i64>, text: str }\nfn leak(borrow mut s: State) -> slice<i64> {\n  w := Wrap { items: [1, 2, 3].to_array(), text: s.text }\n  return w.items[..]\n}\nfn main() -> i32 {\n  mut s := State { text: \"\" }\n  values := leak(s)\n  if values.sum() == 6 { return 0 }\n  return 1\n}\n",
+            ),
+            "a caller view beside a frame-owned array must not launder the array's storage locality",
+        );
+    }
+
+    #[test]
+    fn region_built_aggregate_slice_stays_returnable() {
+        let diagnostics = check_diagnostics(
+            "dyn-storage-region-aggregate-control",
+            "Wrap { items: array<i64> }\nfn make(out: region) -> slice<i64> {\n  mut builder: array_builder<i64> := array_builder(out)\n  builder.push(1)\n  w := Wrap { items: builder.build() }\n  return w.items[..]\n}\nfn main() -> i32 {\n  arena out {\n    values := make(out)\n    if values.sum() == 1 { return 0 }\n    return 1\n  }\n}\n",
+        );
+        assert!(
+            diagnostics.is_empty(),
+            "an aggregate built wholly from a caller region must stay returnable:\n{diagnostics}",
+        );
+    }
+
+    #[test]
+    fn outer_array_sliced_inside_arena_stays_valid() {
+        let diagnostics = check_diagnostics(
+            "dyn-storage-arena-slice-control",
+            "State { values: slice<i64> }\nfn main() -> i32 {\n  xs := [1, 2, 3]\n  mut state := State { values: [] }\n  arena scratch {\n    state.values = xs[..]\n  }\n  values := state.values\n  if values.sum() == 6 { return 0 }\n  return 1\n}\n",
+        );
+        assert!(
+            diagnostics.is_empty(),
+            "slicing an outer-frame array inside an arena must keep its declaration scope:\n{diagnostics}",
+        );
+    }
+}

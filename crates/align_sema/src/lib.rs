@@ -694,7 +694,9 @@ pub enum Ty {
 /// wildcard) in every pass that matches over these enums — the align-self-review Gate-1
 /// list: `region_of`, `tracks_region`, `null_moved_source`, `is_move`/`ret_is_move`,
 /// `MoveCheck`/`EscapeCheck`, drop insertion, `ty_to_scalar`/`scalar_to_ty`, MIR lowering,
-/// and codegen's `abi_type`/`scalar_bytes`/`int_type`/`int_bits`. A variant carrying an
+/// and codegen's `abi_type`/`scalar_bytes`/`int_type`/`int_bits`. A variant that owns
+/// individually-dropped dynamic-array storage must also join `ty_owns_dyn_array_storage`,
+/// or slices of it silently regain the closed frame-escape class. A variant carrying an
 /// owned or region payload additionally needs a use-after-free / double-free owner test.
 #[allow(dead_code)]
 const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
@@ -1685,13 +1687,10 @@ fn ty_tuple_is_move(ty: Ty, tuples: &[hir::TupleDef]) -> bool {
 /// Whether `ty` **is**, or transitively contains through a `Result` / `Option` / tuple / struct, a
 /// `slice` view. A slice is always a borrow whose escape is decided by `region_of`; this routes the
 /// arena-escape check ([`EscapeCheck::region_bearing`]) and the array-literal reject for an
-/// arena-backed `bytes` view that rides a wrapper. **Defensive on `Ty::Struct`:** a struct field
-/// cannot be a `slice` today (construction rejects it — "struct fields must be a primitive scalar,
-/// str, or a plain struct"), so this arm is currently unreachable, but walking fields keeps the
-/// check fail-safe (not fail-open) should struct slice fields ever land — the same "defensive /
-/// currently-dead" spirit as the tuple arm. Recursion terminates: a struct without a `box`
-/// indirection cannot contain itself (rejected at declaration), and `box` fields are scalars, never
-/// slices.
+/// arena-backed `bytes` view that rides a wrapper. The `Ty::Struct` arm is live: struct fields may
+/// be slices (`State { values: slice<i64> }` is a shipped pkg.db shaper surface). Recursion
+/// terminates: a struct without a `box` indirection cannot contain itself (rejected at
+/// declaration), and `box` fields are scalars, never slices.
 fn ty_mentions_slice(
     ty: Ty,
     structs: &[StructDef],
@@ -1748,6 +1747,80 @@ fn ty_mentions_slice(
             }
             // Missing ids and malformed cycles terminate defensively. Keep aggregate arms explicit
             // so a future aggregate cannot bypass escape checking through a recursive default.
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether `ty` **is**, or transitively contains through a `Result` / `Option` / tagged wrapper /
+/// tuple / struct, an owned dynamic array whose heap buffer is individually dropped when its
+/// owner's frame exits. A slice viewing that storage is frame-local exactly like a slice of a
+/// fixed array, but the storage is heap memory `region_of` classifies as `Static`, so escape
+/// checking needs this classifier to mark the owning binding in `local_backed_slice`. This is the
+/// one storage-locality authority consumed by every binding form (`Let`, `LetTuple`, match
+/// bindings, `Assign` re-marking, and by-value parameters); adding a binding form without
+/// consulting it re-opens the fail-open escape class this closes.
+fn ty_owns_dyn_array_storage(
+    ty: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    let mut work = vec![ty];
+    let mut visited_structs = HashSet::new();
+    let mut visited_tuples = HashSet::new();
+    let mut visited_enums = HashSet::new();
+    let mut visited_tagged = HashSet::new();
+    while let Some(ty) = work.pop() {
+        match ty {
+            Ty::DynArray(_)
+            | Ty::DynStructArray(..)
+            | Ty::DynSliceArray(_)
+            | Ty::DynVecArray(..)
+            | Ty::DynMaskArray(..)
+            | Ty::DynFixedArray(..)
+            | Ty::DynFixedStructArray(..)
+            | Ty::DynResponseArray => return true,
+            Ty::Tagged(id) if visited_tagged.insert(id) => {
+                if let Some(tagged) = tagged_types.get(id as usize) {
+                    match *tagged {
+                        hir::TaggedType::Option(payload) => work.push(scalar_to_ty(payload)),
+                        hir::TaggedType::Result(ok, err) => {
+                            work.push(scalar_to_ty(err));
+                            work.push(scalar_to_ty(ok));
+                        }
+                    }
+                }
+            }
+            Ty::Option(payload) => work.push(scalar_to_ty(payload)),
+            Ty::Result(ok, err) => {
+                work.push(scalar_to_ty(err));
+                work.push(scalar_to_ty(ok));
+            }
+            Ty::Tuple(id) if visited_tuples.insert(id) => {
+                if let Some(tuple) = tuples.get(id as usize) {
+                    work.extend(tuple.elems.iter().rev().copied().map(scalar_to_ty));
+                }
+            }
+            Ty::Struct(id) if visited_structs.insert(id) => {
+                if let Some(structure) = structs.get(id as usize) {
+                    work.extend(structure.fields.iter().rev().map(|field| field.ty));
+                }
+            }
+            Ty::Enum(id) if visited_enums.insert(id) => {
+                if let Some(sum) = enums.get(id as usize) {
+                    work.extend(
+                        sum.variants
+                            .iter()
+                            .rev()
+                            .flat_map(|variant| variant.payload.iter().rev())
+                            .copied()
+                            .map(scalar_to_ty),
+                    );
+                }
+            }
             _ => {}
         }
     }
@@ -12387,6 +12460,23 @@ impl<'a> EscapeCheck<'a> {
             let Some(local) = self.f.locals.get(param as usize) else {
                 continue;
             };
+            // Parameters live the whole frame; recording depth 0 keeps the lexical-storage caps
+            // from inheriting a use-site arena depth when a parameter is sliced inside one.
+            self.decl_depth.insert(param, 0);
+            // A by-value Move parameter owning dynamic-array storage is dropped at this frame's
+            // exit, so its views are frame-local; borrowed modes view caller storage and stay
+            // returnable through provenance.
+            if self.f.param_modes.get(position) == Some(&ast::ParamMode::ByValue)
+                && ty_owns_dyn_array_storage(
+                    local.ty,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                )
+            {
+                self.state.local_backed_slice.insert(param);
+            }
             let borrowed_builder = local.ty.is_array_builder()
                 && matches!(
                     self.f.param_modes.get(position),
@@ -15738,13 +15828,13 @@ impl<'a> EscapeCheck<'a> {
         }
     }
 
-    fn mutable_destination_storage_region(&self, destination: &Expr, depth: u32) -> Region {
-        if destination.ty.is_array_builder() {
-            return self.region_of(destination, depth);
-        }
-        let Some((root, _)) = self.mutable_destination_root(destination) else {
-            return Region::Frame;
-        };
+    /// Storage region of a mutable place rooted at `root`: the symbolic caller place for a
+    /// `borrow mut` parameter, else the root's lexical frame/arena scope. This is the one
+    /// destination-side authority; every store path (`Assign`, `AssignField`, and call-site
+    /// destination snapshots) must derive its target from here so the caller-place branch cannot
+    /// be forgotten in one copy. An unrecorded declaration defaults to the *use-site* depth — the
+    /// shorter, rejecting direction — never to the whole frame.
+    fn mutable_root_storage_region(&self, root: LocalId, depth: u32) -> Region {
         if let Some(position) = self
             .f
             .params
@@ -15762,6 +15852,28 @@ impl<'a> EscapeCheck<'a> {
         }
     }
 
+    fn mutable_destination_storage_region(&self, destination: &Expr, depth: u32) -> Region {
+        if destination.ty.is_array_builder() {
+            return self.region_of(destination, depth);
+        }
+        let Some((root, _)) = self.mutable_destination_root(destination) else {
+            return Region::Frame;
+        };
+        self.mutable_root_storage_region(root, depth)
+    }
+
+    /// Whether this binding owns dynamic-array storage that dies with the enclosing frame. The
+    /// deciding fact is the storage's *allocation provenance* (`drop_may_be_individual`), not the
+    /// folded value region: a mixed aggregate holding a caller view plus a frame-owned array
+    /// folds to a caller region while its array buffer is still individually freed at frame
+    /// exit, and only the drop side tracks that. A pure region allocation
+    /// (`array_builder(out).build()`, arena collections) is bulk-freed by its region and stays
+    /// unmarked, so its views remain governed by the region checks.
+    fn dyn_storage_binding_is_local(&mut self, ty: Ty, init: &Expr, depth: u32) -> bool {
+        ty_owns_dyn_array_storage(ty, self.structs, self.tuples, self.enums, self.tagged_types)
+            && self.drop_may_be_individual(init, depth)
+    }
+
     /// Region of storage selected by an exact `storage(parameter)` retention edge. The value's
     /// region still bounds arena-owned contents, while the caller place bounds free-standing and
     /// inline storage that `region_of(Local)` otherwise classifies as `Static`.
@@ -15770,10 +15882,22 @@ impl<'a> EscapeCheck<'a> {
         if self.borrowed_param_place(argument) {
             return value_region;
         }
-        let root = match argument.kind {
-            ExprKind::Local(local) => Some(local),
-            ExprKind::Field { root, .. } => Some(root),
-            _ => None,
+        // Look through view wrappers to the storage owner's declaration: an outer-frame array
+        // sliced inside an arena block keeps its own scope instead of inheriting the use-site
+        // arena, which would reject the valid store of a longer-lived view.
+        let root = {
+            let mut cursor = argument;
+            loop {
+                match &cursor.kind {
+                    ExprKind::SliceRange { recv, .. }
+                    | ExprKind::TupleIndex { recv, .. }
+                    | ExprKind::Index { recv, .. } => cursor = recv,
+                    ExprKind::ArrayToSlice(inner) => cursor = inner,
+                    ExprKind::Local(local) => break Some(*local),
+                    ExprKind::Field { root, .. } => break Some(*root),
+                    _ => break None,
+                }
+            }
         };
         let declaration_depth = root
             .and_then(|root| self.decl_depth.get(&root).copied())
@@ -15956,9 +16080,16 @@ impl<'a> EscapeCheck<'a> {
                 }
                 // A local bound to a *fixed* array (`xs := [1, 2, 3]`) owns frame storage, so any
                 // slice viewing it (`xs[0..2]`, `xs` coerced) is frame-local and must not escape.
-                // Array *parameters* borrow the caller and are never `Let`-bound, so they stay out
-                // of this set (returnable), matching the slice-parameter convention above.
+                // Borrowed array parameters view the caller and are never `Let`-bound, so they
+                // stay out of this set (returnable through provenance), matching the
+                // slice-parameter convention above.
                 if matches!(init.ty, Ty::Array(..) | Ty::StructArray(..)) {
+                    self.state.local_backed_slice.insert(*local);
+                }
+                // An owned dynamic array's heap buffer (and any aggregate owning one) is
+                // individually dropped at frame exit, so its views are frame-local exactly like a
+                // fixed array's — unless the storage is a pure region allocation.
+                if self.dyn_storage_binding_is_local(init.ty, init, depth) {
                     self.state.local_backed_slice.insert(*local);
                 }
             }
@@ -16012,7 +16143,7 @@ impl<'a> EscapeCheck<'a> {
                 }
                 if self.region_bearing(value.ty) {
                     let target = self.state.region.get(base).copied().unwrap_or(Region::Static);
-                    if !self.region_of(value, depth).outlives(target) {
+                    if !self.retained_contained_region(value, depth).outlives(target) {
                         self.diags.error(
                             "this value cannot be stored into a longer-lived array element (it would escape its region)".to_string(),
                             value.span,
@@ -16064,28 +16195,49 @@ impl<'a> EscapeCheck<'a> {
                 }
                 // Assignment is a strong update on this path. Branch/loop joins below restore the
                 // conservative may-property when another reaching path still holds a local borrow.
-                // Fixed-array owner markers are not slice-bearing locals and therefore remain set.
-                if self.local_mentions_slice(*local) {
-                    if self.mentions_slice(value.ty) && self.slice_is_local(value) {
+                // Fixed-array owner markers are not slice-bearing locals and therefore remain set
+                // (the local *is* its frame storage); dyn-array owners re-classify through the
+                // storage-locality authority because reassignment can change their provenance
+                // (a caller-region build overwritten by a frame-owned `.to_array()`, or back).
+                let owns_dyn_storage = self.f.locals.get(*local as usize).is_some_and(|l| {
+                    ty_owns_dyn_array_storage(
+                        l.ty,
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    )
+                });
+                if self.local_mentions_slice(*local) || owns_dyn_storage {
+                    let slice_local =
+                        self.mentions_slice(value.ty) && self.slice_is_local(value);
+                    let dyn_local =
+                        owns_dyn_storage && self.drop_may_be_individual(value, depth);
+                    if slice_local || dyn_local {
                         self.state.local_backed_slice.insert(*local);
                     } else {
                         self.state.local_backed_slice.remove(local);
                     }
                 }
                 if self.region_bearing(value.ty) {
-                    let r = self.region_of(value, depth);
-                    // The binding's scope: at least the frame (a depth-0 binding lives the whole
-                    // frame, region `Frame`), or the enclosing arena if declared inside one. Using
-                    // `Frame` rather than `Static` here lets a `Frame`-region borrow (a `str` view
-                    // of a local `string`, slice 7e) be held by a frame binding — escape past the
-                    // frame is still caught by the return / struct-field-store checks. A deeper
-                    // arena value assigned to a shallower binding stays rejected.
-                    let target = Region::Frame.shorter(Region::arena(*self.decl_depth.get(local).unwrap_or(&0)));
+                    let r = self.retained_contained_region(value, depth);
+                    // The binding's scope through the one destination authority: the symbolic
+                    // caller place for a `borrow mut` parameter, else at least the frame (a
+                    // depth-0 binding lives the whole frame, region `Frame`), or the enclosing
+                    // arena if declared inside one. Using `Frame` rather than `Static` lets a
+                    // `Frame`-region borrow (a `str` view of a local `string`, slice 7e) be held
+                    // by a frame binding — escape past the frame is still caught by the return /
+                    // struct-field-store checks. A deeper arena value assigned to a shallower
+                    // binding stays rejected, and a frame-local view assigned whole into a
+                    // `borrow mut` parameter place is rejected against its caller lifetime.
+                    let target = self.mutable_root_storage_region(*local, depth);
                     if !r.outlives(target) {
-                        self.diags.error(
-                            "this value is bound to an arena block and cannot escape it".to_string(),
-                            value.span,
-                        );
+                        let message = if matches!(target, Region::Caller(_)) {
+                            "this value cannot be stored into a longer-lived mutable destination (it would escape its region)"
+                        } else {
+                            "this value is bound to an arena block and cannot escape it"
+                        };
+                        self.diags.error(message.to_string(), value.span);
                     } else {
                         // Assignment is a strong update on this path. A later control-flow join takes
                         // the shorter region from all reaching paths, while a straight-line overwrite
@@ -16126,25 +16278,12 @@ impl<'a> EscapeCheck<'a> {
                 // Validate against the destination place's storage lifetime, not the region of
                 // its previous contents. A borrowed aggregate uses a symbolic caller place; a
                 // local aggregate lives only to its declaration scope. Then retain the shorter
-                // content region so later reads/calls observe the installed field.
+                // content region so later reads/calls observe the installed field. Both sides go
+                // through the shared authorities so this arm cannot diverge from `Assign` or the
+                // call-site caps again.
                 if self.region_bearing(value.ty) {
-                    let target = if let Some(position) = self
-                        .f
-                        .params
-                        .iter()
-                        .position(|&parameter| parameter == *root)
-                        .filter(|&position| {
-                            self.f.param_modes.get(position)
-                                == Some(&ast::ParamMode::BorrowMut)
-                        })
-                    {
-                        Region::Caller(position as u32)
-                    } else {
-                        Region::Frame.shorter(Region::arena(
-                            *self.decl_depth.get(root).unwrap_or(&depth),
-                        ))
-                    };
-                    let incoming = self.region_of(value, depth);
+                    let target = self.mutable_root_storage_region(*root, depth);
+                    let incoming = self.retained_contained_region(value, depth);
                     if !incoming.outlives(target) {
                         self.diags.error(
                             "this value cannot be stored into a longer-lived struct field (it would escape its region)".to_string(),
@@ -16198,6 +16337,26 @@ impl<'a> EscapeCheck<'a> {
                 if self.mentions_slice(init.ty) && self.slice_is_local(init) {
                     for l in locals.iter().flatten() {
                         if self.local_mentions_slice(*l) {
+                            self.state.local_backed_slice.insert(*l);
+                        }
+                    }
+                }
+                // Tuple-destructured owned dynamic arrays (`(evens, odds) := xs.partition(f)`)
+                // are frame-owned storage like their `Let`-bound duals; mark each element binding
+                // through the same storage-locality authority, reusing the tuple's already
+                // computed allocation provenance.
+                if may_individual {
+                    for l in locals.iter().flatten() {
+                        let owns = self.f.locals.get(*l as usize).is_some_and(|declared| {
+                            ty_owns_dyn_array_storage(
+                                declared.ty,
+                                self.structs,
+                                self.tuples,
+                                self.enums,
+                                self.tagged_types,
+                            )
+                        });
+                        if owns {
                             self.state.local_backed_slice.insert(*l);
                         }
                     }
@@ -16259,6 +16418,22 @@ impl<'a> EscapeCheck<'a> {
                 self.drop_region.insert(*binding, region);
             }
             if local_slice && self.local_mentions_slice(*binding) {
+                self.state.local_backed_slice.insert(*binding);
+            }
+            // A match binding of an owned dynamic-array payload views storage that dies with the
+            // scrutinee's frame; mark it through the same storage-locality authority as `Let`,
+            // reusing the scrutinee's already computed allocation provenance.
+            let owns = may_individual
+                && self.f.locals.get(*binding as usize).is_some_and(|declared| {
+                    ty_owns_dyn_array_storage(
+                        declared.ty,
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    )
+                });
+            if owns {
                 self.state.local_backed_slice.insert(*binding);
             }
         }

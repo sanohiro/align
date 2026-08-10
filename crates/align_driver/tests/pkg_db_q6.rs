@@ -791,6 +791,114 @@ fn main() -> i32 {
             resource_reference_checked.per_unit_diags,
         );
     }
+
+    #[test]
+    fn direct_local_dyn_storage() {
+        let direct = r#"State { values: slice<i64> }
+fn retain_local(borrow mut state: State) {
+  source := [1, 2, 3].to_array()
+  state.values = source[..]
+}
+fn main() -> i32 {
+  mut state := State { values: [] }
+  retain_local(state)
+  values := state.values
+  return values.sum() as i32
+}
+"#;
+        let diagnostics = check_diagnostics("pkg-db-q6-direct-local-dyn-storage", direct);
+        assert!(
+            diagnostics.contains("cannot be stored into a longer-lived struct field"),
+            "a borrow-mut callee must not retain a slice of its frame-owned dynamic array:\n{diagnostics}",
+        );
+    }
+
+    #[test]
+    fn direct_local_fixed_storage() {
+        let direct = r#"State { values: slice<i64> }
+fn retain_local(borrow mut state: State) {
+  source := [1, 2, 3]
+  state.values = source[..]
+}
+fn main() -> i32 {
+  mut state := State { values: [] }
+  retain_local(state)
+  values := state.values
+  return values.sum() as i32
+}
+"#;
+        let diagnostics = check_diagnostics("pkg-db-q6-direct-local-fixed-storage", direct);
+        assert!(
+            diagnostics.contains("cannot be stored into a longer-lived struct field"),
+            "a borrow-mut callee must not retain a slice of its fixed stack array:\n{diagnostics}",
+        );
+    }
+
+    #[test]
+    fn whole_assign_frame_view() {
+        let whole = r#"State { text: str }
+fn retain_whole(borrow mut state: State) {
+  owner := "frame".clone()
+  view: str := owner
+  state = State { text: view }
+}
+fn main() -> i32 {
+  mut state := State { text: "" }
+  retain_whole(state)
+  return state.text.len() as i32
+}
+"#;
+        let diagnostics = check_diagnostics("pkg-db-q6-whole-assign-frame-view", whole);
+        assert!(
+            diagnostics.contains("cannot be stored into a longer-lived mutable destination"),
+            "a whole-parameter replacement must not retain a frame-local view:\n{diagnostics}",
+        );
+    }
+
+    #[test]
+    fn whole_assign_frame_storage() {
+        let whole = r#"State { values: slice<i64> }
+fn retain_whole(borrow mut state: State) {
+  source := [1, 2, 3].to_array()
+  state = State { values: source[..] }
+}
+fn main() -> i32 {
+  mut state := State { values: [] }
+  retain_whole(state)
+  values := state.values
+  return values.sum() as i32
+}
+"#;
+        let diagnostics = check_diagnostics("pkg-db-q6-whole-assign-frame-storage", whole);
+        assert!(
+            diagnostics.contains("cannot be stored into a longer-lived mutable destination"),
+            "a whole-parameter replacement must not retain frame-owned dynamic-array storage:\n{diagnostics}",
+        );
+    }
+
+    #[test]
+    fn forwarded_dyn_storage() {
+        let forwarded = r#"State { values: slice<i64> }
+fn retain_slice(borrow mut state: State, source: slice<i64>) {
+  state.values = source
+}
+fn forward(borrow mut state: State) {
+  source := [1, 2, 3].to_array()
+  retain_slice(state, source[..])
+}
+fn main() -> i32 {
+  mut state := State { values: [] }
+  forward(state)
+  values := state.values
+  return values.sum() as i32
+}
+"#;
+        let diagnostics = check_diagnostics("pkg-db-q6-forwarded-dyn-storage", forwarded);
+        assert!(
+            diagnostics.contains("cannot retain a shorter-lived view through this mutable borrow"),
+            "a forwarding helper must not retain a slice of its local dynamic array through the contained edge:\n{diagnostics}",
+        );
+    }
 }
 
 #[test]
