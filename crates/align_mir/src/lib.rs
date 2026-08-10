@@ -15341,26 +15341,25 @@ fn main() -> i32 {
     }
 
     #[test]
-    fn owned_string_array_shapes_pass_the_hir_gate_and_near_misses_fail() {
-        // Regression owner for the 62f48771 activation gap: sema admits owned-`string` fixed
-        // array elements and reads a `string` element field as a borrowed `str` view, but the
-        // body validator rejected both, silently dropping every checked function (empty binary,
-        // `_main` link failure). The valid shapes must pass the gate; the mutated near-misses
-        // pin that the relaxation admits exactly sema's contract and nothing wider.
+    fn fixed_array_move_shapes_match_the_hir_gate() {
+        // Regression owner for the 62f48771 activation gap: sema reads a `string` element field
+        // from an in-place Move-struct array as a borrowed `str` view, but the body validator
+        // rejected it, silently dropping every checked function (empty binary, `_main` link
+        // failure). The valid struct shape must pass while scalar Move arrays fail before checked
+        // HIR because no per-element scalar Drop exists.
         let main = r#"module main
 User { name: string, age: i64 }
 fn main() -> i32 {
-  ss := ["aaaa".clone()]
   mut us := [User{name: "bee".clone(), age: 1}, User{name: "cee".clone(), age: 2}]
   us[0].name = "cc".clone()
   name0: str := us[0].name
-  return (name0.len() + us[1].name.len() + ss.len()) as i32
+  return (name0.len() + us[1].name.len()) as i32
 }
 "#;
         let (hir, diagnostics) = check_modules(&[("main", true, main)]);
         assert!(
             !diagnostics.has_errors(),
-            "owned-string array fixture failed: {:?}",
+            "Move-struct array fixture failed: {:?}",
             diagnostics
                 .iter()
                 .map(|diagnostic| diagnostic.message.as_str())
@@ -15368,7 +15367,7 @@ fn main() -> i32 {
         );
         assert!(
             hir_program_is_valid(&hir),
-            "owned-string array literals and element-field views must pass the HIR gate",
+            "Move-struct array literals and borrowed element-field views must pass the HIR gate",
         );
         let lowered = lower_program(&hir);
         assert!(
@@ -15399,73 +15398,52 @@ fn main() -> i32 {
             "an element-field read typed as the owned string must fail before MIR lowering",
         );
 
-        // Near-miss 2: a Move element other than `string` (a box) in an array literal must
-        // still fail — the relaxation admits only sema's owned-`string` exception. Retype the
-        // literal AND its element expressions consistently (a `HeapNew` producing the box), so
-        // the failure can only come from the element-admission rule, not a type mismatch.
-        let boxed = Ty::Box(Scalar::Int(IntTy { bits: 64, signed: true }));
-        let mut boxed_element = hir.clone();
-        let function = boxed_element
-            .fns
-            .iter_mut()
-            .find(|function| function.name.as_str().ends_with("main"))
-            .expect("main function present");
-        let mut flipped = false;
-        for statement in function.body.stmts.iter_mut() {
-            if let hir::Stmt::Let { init, .. } = statement {
-                if let hir::ExprKind::ArrayLit { elems, elem, .. } = &mut init.kind {
-                    if *elem == Ty::String {
-                        *elem = boxed;
-                        for element in elems.iter_mut() {
-                            let payload = hir::Expr {
-                                kind: hir::ExprKind::Int(1),
-                                ty: Ty::Int(IntTy { bits: 64, signed: true }),
-                                span: element.span,
-                            };
-                            element.kind = hir::ExprKind::HeapNew(Box::new(payload));
-                            element.ty = boxed;
-                        }
-                        flipped = true;
-                    }
-                }
-            }
-        }
-        assert!(flipped, "fixture must contain an owned-string array literal");
-        assert!(
-            !validate_hir::body_only_metadata_is_valid(&boxed_element),
-            "a Move box element in an array literal must fail before MIR lowering",
-        );
-
-        // Near-miss 3: an owned `array<T>` is also a scalar Move value, but unlike `string` it has
-        // no fixed-array element-wise null/drop lowering. Sema must reject the source before the
-        // active HIR validator turns the producer/consumer disagreement into an internal error.
-        let nested_owned = r#"module main
+        // Scalar Move elements have no fixed-array element-wise Drop. Sema must reject both the
+        // direct owned-string case and the nested owned-array case before the active HIR validator
+        // turns a producer/consumer disagreement into an internal error.
+        let scalar_move_cases = [
+            (
+                "owned string",
+                r#"module main
+fn main() -> i32 {
+  strings := ["owned".clone()]
+  return strings.len() as i32
+}
+"#,
+            ),
+            (
+                "owned array",
+                r#"module main
 fn owned() -> array<i64> = [1, 2].to_array()
 fn main() -> i32 {
   arrays := [owned()]
   return arrays.len() as i32
 }
-"#;
-        let (nested_hir, diagnostics) = check_modules(&[("main", true, nested_owned)]);
-        let messages = diagnostics
-            .iter()
-            .map(|diagnostic| diagnostic.message.as_str())
-            .collect::<Vec<_>>();
-        assert!(
-            diagnostics.has_errors(),
-            "an owned array element must be rejected before checked HIR: {messages:?}",
-        );
-        assert!(
-            messages.iter().any(|message| {
-                message.contains("cannot be an element of a fixed array yet")
-                    && message.contains("per-element Move/drop path")
-            }),
-            "the diagnostic must identify the missing fixed-array ownership path: {messages:?}",
-        );
-        assert!(
-            !hir_program_is_valid(&nested_hir),
-            "diagnosed HIR must remain fail-closed if a caller bypasses the semantic gate",
-        );
+"#,
+            ),
+        ];
+        for (label, source) in scalar_move_cases {
+            let (rejected_hir, diagnostics) = check_modules(&[("main", true, source)]);
+            let messages = diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>();
+            assert!(
+                diagnostics.has_errors(),
+                "{label} element must be rejected before checked HIR: {messages:?}",
+            );
+            assert!(
+                messages.iter().any(|message| {
+                    message.contains("cannot be an element of a fixed array yet")
+                        && message.contains("per-element Move/drop path")
+                }),
+                "the {label} diagnostic must identify the missing ownership path: {messages:?}",
+            );
+            assert!(
+                !hir_program_is_valid(&rejected_hir),
+                "diagnosed {label} HIR must remain fail-closed if a caller bypasses sema",
+            );
+        }
     }
 
     #[test]

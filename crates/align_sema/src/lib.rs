@@ -32163,12 +32163,12 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return true;
         }
-        // Fixed arrays have element-wise cleanup only for owned `string` and Move structs
-        // constructed in place. Every other scalar Move value (including an owned `array<T>`)
-        // would be copied into the stack aggregate without a matching per-element null/drop path.
-        // Reject that complete class before `payload_scalar` can turn it into `Ty::Array`.
-        if elem_ty != Ty::String
-            && ty_to_scalar(elem_ty).is_some_and(Scalar::is_move)
+        // Fixed arrays have element-wise cleanup only for Move structs constructed in place. A
+        // scalar Move value (including owned `string` and `array<T>`) would be copied into the
+        // stack aggregate without a matching per-element null/drop path. Reject that complete
+        // class before `payload_scalar` can turn it into `Ty::Array`.
+        if !matches!(elem_ty, Ty::Struct(_))
+            && drop_plan(elem_ty, self.structs, self.enums, self.tagged_types).needs_drop()
         {
             self.diags.error(
                 format!(

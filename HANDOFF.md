@@ -59,22 +59,24 @@ until then).
 The fixed-array follow-up from the validator-alignment review is closed. The
 suspected owned `array<T>` element is source-reachable: sema admitted it even
 though fixed arrays have no per-element null/drop lowering for that Move
-shape. Sema now rejects the complete scalar-Move element class except for the
-existing owned-`string` path, and the HIR validator uses the same recursive
-resource/ref exclusion as the producer. Focused owners preserve Copy values,
-owned strings, and in-place Move structs while rejecting owned arrays and
-resource-bearing near-misses before MIR construction.
+shape. Sema now rejects the complete scalar-Move element class, including owned
+`string`, because fixed arrays have no per-element scalar Drop path. The HIR
+validator uses the same recursive resource/ref exclusion as the producer.
+Focused owners preserve Copy values and in-place Move structs while rejecting
+owned strings, owned arrays, and resource-bearing near-misses before MIR
+construction.
 
 Fixed on this branch (was present on `main` since the 62f48771 checked-HIR
-validation activation): the body validator contradicted sema on owned-`string`
-fixed-array elements and on reading a `string` element field as a borrowed
-`str` view, so `emit-mir` silently produced an **empty program** (check ok, no
-`_main`, link failure) for those shapes. The validator now mirrors sema's
-contract, the three `owned_structs_arrays` owners are green again, and a
-checked unit whose functions vanish at the MIR boundary is now a loud internal
-error in the shared CLI walk instead of a silent empty binary; the library
-lowering entry points keep their tested fail-closed empty-program contract for
-hand-constructed HIR.
+validation activation): the body validator contradicted sema when reading a
+`string` element field from a Move-struct array as a borrowed `str` view, so
+`emit-mir` silently produced an **empty program** (check ok, no `_main`, link
+failure). Sema also admitted owned-`string` scalar fixed arrays despite their
+missing element Drop. The validator now mirrors the closed producer contract,
+the three `owned_structs_arrays` owners are green again, and a checked unit
+whose functions vanish at the MIR boundary is now a loud internal error in the
+shared CLI walk instead of a silent empty binary; the library lowering entry
+points keep their tested fail-closed empty-program contract for hand-constructed
+HIR.
 
 The completed prerequisite waves and current product boundary are:
 

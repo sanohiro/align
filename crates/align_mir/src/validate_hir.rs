@@ -3100,9 +3100,6 @@ impl<'a> BodyValidator<'a> {
             Ty::Struct(id) => self.program.structs.get(id as usize).is_some(),
             Ty::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
             Ty::Slice(_) => false,
-            // Sema's `reject_fixed_array_element` admits owned `string` as the one Move element
-            // form (`["a".clone()]`); every other Move shape stays rejected below.
-            Ty::String => true,
             Ty::Enum(id) => {
                 self.program.enums.get(id as usize).is_some()
                     && !align_sema::enum_is_move(
@@ -5788,8 +5785,24 @@ impl<'a> BodyValidator<'a> {
             } => {
                 let flows = self.expr_flows(elems)?;
                 let length = u32::try_from(elems.len()).ok()?;
+                let move_struct_elements_are_in_place = match *elem {
+                    Ty::Struct(id)
+                        if align_sema::struct_is_move(
+                            id,
+                            &self.program.structs,
+                            &self.program.enums,
+                            &self.program.tagged_types,
+                        ) => elems.iter().all(|element| {
+                            matches!(
+                                element.kind,
+                                hir::ExprKind::StructLit { struct_id, .. } if struct_id == id
+                            )
+                        }),
+                    _ => true,
+                };
                 if flows.iter().any(|flow| !self.body_ty_matches(flow.ty, *elem))
                     || !self.array_literal_element_ok(*elem)
+                    || !move_struct_elements_are_in_place
                 {
                     return None;
                 }
