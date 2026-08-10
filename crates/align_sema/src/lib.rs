@@ -7142,6 +7142,7 @@ struct NominalRemap {
     structs: Vec<Option<u32>>,
     enums: Vec<Option<u32>>,
     resources: Vec<Option<u32>>,
+    tagged: Vec<Option<u32>>,
 }
 
 fn compact_abstract_nominal_instances(
@@ -7171,10 +7172,44 @@ fn compact_abstract_nominal_instances(
             .collect()
     }
 
+    let mut abstract_tagged = HashSet::new();
+    loop {
+        let before = abstract_tagged.len();
+        let scalar_is_abstract = |scalar: Scalar, tagged: &HashSet<u32>| match scalar {
+            Scalar::Param(_) | Scalar::SoaParam(_) => true,
+            Scalar::Struct(id) | Scalar::DynStructArray(id) | Scalar::Soa(id) => {
+                abstract_ids.structs.contains(&id)
+            }
+            Scalar::Enum(id) => abstract_ids.enums.contains(&id),
+            Scalar::Resource(id) | Scalar::ResourceRef(id) => {
+                abstract_ids.resources.contains(&id)
+            }
+            Scalar::Tagged(id) => tagged.contains(&id),
+            _ => false,
+        };
+        for (id, definition) in program.tagged_types.iter().enumerate() {
+            let abstract_ = match definition {
+                hir::TaggedType::Option(payload) => {
+                    scalar_is_abstract(*payload, &abstract_tagged)
+                }
+                hir::TaggedType::Result(ok, err) => {
+                    scalar_is_abstract(*ok, &abstract_tagged)
+                        || scalar_is_abstract(*err, &abstract_tagged)
+                }
+            };
+            if abstract_ {
+                abstract_tagged.insert(id as u32);
+            }
+        }
+        if before == abstract_tagged.len() {
+            break;
+        }
+    }
     let remap = NominalRemap {
         structs: table_remap(program.structs.len(), &abstract_ids.structs),
         enums: table_remap(program.enums.len(), &abstract_ids.enums),
         resources: table_remap(program.resources.len(), &abstract_ids.resources),
+        tagged: table_remap(program.tagged_types.len(), &abstract_tagged),
     };
     let mut candidate = program.clone();
     let mut candidate_descriptors = static_descriptors.to_vec();
@@ -7196,6 +7231,7 @@ fn compact_abstract_nominal_instances(
             Scalar::Resource(id) | Scalar::ResourceRef(id) => {
                 remap_id(id, &remap.resources, valid)
             }
+            Scalar::Tagged(id) => remap_id(id, &remap.tagged, valid),
             _ => {}
         }
     }
@@ -7214,6 +7250,7 @@ fn compact_abstract_nominal_instances(
             Ty::Resource(id) | Ty::ResourceRef(id) => {
                 remap_id(id, &remap.resources, valid)
             }
+            Ty::Tagged(id) => remap_id(id, &remap.tagged, valid),
             Ty::Option(scalar)
             | Ty::Box(scalar)
             | Ty::Slice(scalar)
@@ -7455,15 +7492,25 @@ fn compact_abstract_nominal_instances(
         .enumerate()
         .filter_map(|(old, definition)| remap.resources[old].map(|_| definition))
         .collect();
-    for definition in &mut candidate.tagged_types {
-        match definition {
-            hir::TaggedType::Option(payload) => remap_scalar(payload, &remap, &mut valid),
-            hir::TaggedType::Result(ok, err) => {
-                remap_scalar(ok, &remap, &mut valid);
-                remap_scalar(err, &remap, &mut valid);
-            }
-        }
-    }
+    candidate.tagged_types = candidate
+        .tagged_types
+        .into_iter()
+        .enumerate()
+        .filter_map(|(old, mut definition)| {
+            remap.tagged[old].map(|_| {
+                match &mut definition {
+                    hir::TaggedType::Option(payload) => {
+                        remap_scalar(payload, &remap, &mut valid)
+                    }
+                    hir::TaggedType::Result(ok, err) => {
+                        remap_scalar(ok, &remap, &mut valid);
+                        remap_scalar(err, &remap, &mut valid);
+                    }
+                }
+                definition
+            })
+        })
+        .collect();
     for tuple in &mut candidate.tuples {
         for element in &mut tuple.elems {
             remap_scalar(element, &remap, &mut valid);
@@ -30589,6 +30636,71 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         }
+        if method == "drop_batch_payload" {
+            let [plan_ast, payload_ast] = args else {
+                self.diags.error(
+                    format!(
+                        "static descriptor operation 'drop_batch_payload' expects 2 argument(s), got {}",
+                        args.len()
+                    ),
+                    span,
+                );
+                return err;
+            };
+            let plan = self.check_expr(plan_ast, Some(Ty::Raw));
+            let payload = self.check_expr(payload_ast, Some(Ty::Raw));
+            if plan.ty == Ty::Error || payload.ty == Ty::Error {
+                return err;
+            }
+            if !self.source_ty_matches(plan.ty, Ty::Raw)
+                || !self.source_ty_matches(payload.ty, Ty::Raw)
+            {
+                self.diags.error(
+                    "batch payload Drop requires raw plan and payload pointers".to_owned(),
+                    span,
+                );
+                return err;
+            }
+            let callee = Expr {
+                kind: ExprKind::RawPointerLoad {
+                    ptr: Box::new(plan),
+                    offset: Box::new(Expr {
+                        kind: ExprKind::Int(56),
+                        ty: Ty::Int(IntTy {
+                            bits: 64,
+                            signed: true,
+                        }),
+                        span,
+                    }),
+                },
+                ty: Ty::Raw,
+                span,
+            };
+            self.constrain(Ty::Unit, expected, span);
+            return Expr {
+                kind: ExprKind::RawCall {
+                    callee: Box::new(callee),
+                    args: vec![payload],
+                    param_tys: vec![Ty::Raw],
+                    param_modes: vec![ast::ParamMode::ByValue],
+                    return_borrow: hir::ReturnBorrowSummary::None,
+                    return_region: hir::ReturnRegionSummary::None,
+                    return_cleanup: hir::ReturnCleanupAbi::None,
+                },
+                ty: Ty::Unit,
+                span,
+            };
+        }
+        if matches!(
+            method,
+            "create_batch"
+                | "append_current_batch"
+                | "finish_batch"
+                | "read_batch_row"
+                | "read_batch_soa"
+        ) {
+            return self.check_batch_plan_op(method, args, expected, span);
+        }
         if method == "bind_prepared" {
             return self.check_prepared_bind_op(args, expected, span);
         }
@@ -30603,6 +30715,9 @@ impl<'a, 't> Checker<'a, 't> {
             "next_sqlite" | "next_postgres" | "has_next_sqlite" | "has_next_postgres"
         ) {
             return self.check_rows_next_dispatch_op(method, args, expected, span);
+        }
+        if matches!(method, "next_batch_sqlite" | "next_batch_postgres") {
+            return self.check_rows_batch_dispatch_op(method, args, expected, span);
         }
         if matches!(method, "validate_current_row" | "decode_current_row") {
             return self.check_rows_current_op(method, args, expected, span);
@@ -30621,6 +30736,7 @@ impl<'a, 't> Checker<'a, 't> {
             | "row_validator"
             | "decoder"
             | "stream_decoder"
+            | "batch_plan"
             | "meta_materializer"
             | "parameter_resolver"
             | "parameter_count" => 1,
@@ -31108,6 +31224,7 @@ impl<'a, 't> Checker<'a, 't> {
             "row_validator" | "validate_row" => 80,
             "decoder" | "decode" => 88,
             "stream_decoder" => 120,
+            "batch_plan" => 128,
             "meta_materializer" | "materialize_meta" => 96,
             "parameter_resolver" | "parameter_ordinal" => 104,
             _ => unreachable!(),
@@ -31139,6 +31256,7 @@ impl<'a, 't> Checker<'a, 't> {
                 | "row_validator"
                 | "decoder"
                 | "stream_decoder"
+                | "batch_plan"
                 | "meta_materializer"
                 | "parameter_resolver"
         ) {
@@ -31419,6 +31537,245 @@ impl<'a, 't> Checker<'a, 't> {
         self.resource_instances.iter().find_map(|(&id, instance)| {
             (instance.canonical == canonical && instance.args == args).then_some(id)
         })
+    }
+
+    /// A1 bridge from a validated producer batch plan to its typed thunks. The plan remains an
+    /// ordinary immutable raw record; this compiler-private operation supplies only the checked
+    /// raw-function signature and the exact rows/batch generation provenance.
+    fn check_batch_plan_op(
+        &mut self,
+        method: &str,
+        args: &[ast::Expr],
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Expr {
+        let err = || Expr {
+            kind: ExprKind::Bool(false),
+            ty: Ty::Error,
+            span,
+        };
+        let required = match method {
+            "create_batch" => 2,
+            "append_current_batch" => 4,
+            "finish_batch" => 3,
+            "read_batch_row" => 4,
+            "read_batch_soa" => 3,
+            _ => unreachable!(),
+        };
+        if args.len() != required {
+            self.diags.error(
+                format!(
+                    "static descriptor operation '{method}' expects {required} argument(s), got {}",
+                    args.len()
+                ),
+                span,
+            );
+            return err();
+        }
+        let plan = self.check_expr(&args[0], Some(Ty::Raw));
+        if plan.ty == Ty::Error || !self.source_ty_matches(plan.ty, Ty::Raw) {
+            if plan.ty != Ty::Error {
+                self.diags
+                    .error("batch plan must be a raw pointer".to_owned(), args[0].span);
+            }
+            return err();
+        }
+        let (offset, call_args, param_tys, resource_arg, ret) = match method {
+            "create_batch" => {
+                let i64_ty = Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                });
+                let max_rows = self.check_expr(&args[1], Some(i64_ty));
+                if max_rows.ty == Ty::Error || !self.source_ty_matches(max_rows.ty, i64_ty) {
+                    if max_rows.ty != Ty::Error {
+                        self.diags.error(
+                            "batch maximum row count must be i64".to_owned(),
+                            args[1].span,
+                        );
+                    }
+                    return err();
+                }
+                (16, vec![max_rows], vec![i64_ty], None, Ty::Raw)
+            }
+            "finish_batch" => {
+                let payload = self.check_expr(&args[1], Some(Ty::Raw));
+                let i64_ty = Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                });
+                let len = self.check_expr(&args[2], Some(i64_ty));
+                if payload.ty == Ty::Error || len.ty == Ty::Error {
+                    return err();
+                }
+                if !self.source_ty_matches(payload.ty, Ty::Raw)
+                    || !self.source_ty_matches(len.ty, i64_ty)
+                {
+                    self.diags.error(
+                        "batch finish requires raw payload and i64 length".to_owned(),
+                        span,
+                    );
+                    return err();
+                }
+                (32, vec![payload, len], vec![Ty::Raw, i64_ty], None, Ty::Unit)
+            }
+            "append_current_batch" => {
+                let payload = self.check_expr(&args[1], Some(Ty::Raw));
+                let context = self.check_expr(&args[2], Some(Ty::Raw));
+                let reference = self.check_expr(&args[3], None);
+                let Ty::ResourceRef(resource) = self.resolve(reference.ty) else {
+                    if reference.ty != Ty::Error {
+                        self.diags.error(
+                            "batch append requires resource_ref<db.rows<R>>".to_owned(),
+                            args[3].span,
+                        );
+                    }
+                    return err();
+                };
+                let valid = self.resource_instances.get(&resource).is_some_and(|instance| {
+                    instance.canonical == "pkg.db$rows" && instance.args.len() == 1
+                });
+                if payload.ty == Ty::Error
+                    || context.ty == Ty::Error
+                    || !self.source_ty_matches(payload.ty, Ty::Raw)
+                    || !self.source_ty_matches(context.ty, Ty::Raw)
+                    || !valid
+                {
+                    if payload.ty != Ty::Error && context.ty != Ty::Error && !valid {
+                        self.diags.error(
+                            "batch append requires resource_ref<db.rows<R>>".to_owned(),
+                            args[3].span,
+                        );
+                    }
+                    return err();
+                }
+                (
+                    24,
+                    vec![payload, context, reference],
+                    vec![Ty::Raw, Ty::Raw, Ty::ResourceRef(resource)],
+                    None,
+                    Ty::Int(IntTy {
+                        bits: 32,
+                        signed: true,
+                    }),
+                )
+            }
+            "read_batch_row" | "read_batch_soa" => {
+                let payload = self.check_expr(&args[1], Some(Ty::Raw));
+                let reference_index = 2;
+                let reference = self.check_expr(&args[reference_index], None);
+                let Ty::ResourceRef(resource) = self.resolve(reference.ty) else {
+                    if reference.ty != Ty::Error {
+                        self.diags.error(
+                            "batch read requires resource_ref<db.batch<R>>".to_owned(),
+                            args[reference_index].span,
+                        );
+                    }
+                    return err();
+                };
+                let Some(instance) = self.resource_instances.get(&resource).cloned() else {
+                    self.diags.error(
+                        "batch read requires a concrete db.batch resource".to_owned(),
+                        args[reference_index].span,
+                    );
+                    return err();
+                };
+                if instance.canonical != "pkg.db$batch" || instance.args.len() != 1 {
+                    self.diags.error(
+                        "batch read requires resource_ref<db.batch<R>>".to_owned(),
+                        args[reference_index].span,
+                    );
+                    return err();
+                }
+                if payload.ty == Ty::Error || !self.source_ty_matches(payload.ty, Ty::Raw) {
+                    return err();
+                }
+                let row_ty = instance.args[0];
+                if method == "read_batch_row" {
+                    let i64_ty = Ty::Int(IntTy {
+                        bits: 64,
+                        signed: true,
+                    });
+                    let index = self.check_expr(&args[3], Some(i64_ty));
+                    if index.ty == Ty::Error || !self.source_ty_matches(index.ty, i64_ty) {
+                        return err();
+                    }
+                    (
+                        40,
+                        vec![payload, reference, index],
+                        vec![Ty::Raw, Ty::ResourceRef(resource), i64_ty],
+                        Some(1),
+                        row_ty,
+                    )
+                } else {
+                    let soa_ty = match self.resolve(row_ty) {
+                        Ty::Struct(id) => Ty::Soa(id),
+                        Ty::Param(index) => Ty::SoaParam(index),
+                        _ => {
+                            self.diags.error(
+                                "batch SoA projection requires a struct Row".to_owned(),
+                                span,
+                            );
+                            return err();
+                        }
+                    };
+                    (
+                        48,
+                        vec![payload, reference],
+                        vec![Ty::Raw, Ty::ResourceRef(resource)],
+                        Some(1),
+                        soa_ty,
+                    )
+                }
+            }
+            _ => unreachable!(),
+        };
+        let callee = Expr {
+            kind: ExprKind::RawPointerLoad {
+                ptr: Box::new(plan),
+                offset: Box::new(Expr {
+                    kind: ExprKind::Int(offset),
+                    ty: Ty::Int(IntTy {
+                        bits: 64,
+                        signed: true,
+                    }),
+                    span,
+                }),
+            },
+            ty: Ty::Raw,
+            span,
+        };
+        let (return_borrow, return_region) = if let Some(parameter) = resource_arg {
+            (
+                hir::ReturnBorrowSummary::Roots {
+                    params: vec![parameter],
+                    captures: Vec::new(),
+                },
+                hir::ReturnRegionSummary::Roots {
+                    params: vec![parameter],
+                    captures: Vec::new(),
+                },
+            )
+        } else {
+            (
+                hir::ReturnBorrowSummary::None,
+                hir::ReturnRegionSummary::None,
+            )
+        };
+        self.constrain(ret, expected, span);
+        Expr {
+            kind: ExprKind::RawCall {
+                callee: Box::new(callee),
+                param_modes: vec![ast::ParamMode::ByValue; param_tys.len()],
+                args: call_args,
+                param_tys,
+                return_borrow,
+                return_region,
+                return_cleanup: hir::ReturnCleanupAbi::None,
+            },
+            ty: ret,
+            span,
+        }
     }
 
     /// Q4b current-row bridge. The rows wrapper retains the producer-owned validator and streaming
@@ -31907,6 +32264,114 @@ impl<'a, 't> Checker<'a, 't> {
                     } else {
                         Ty::Tagged(option_id)
                     }],
+                    vec![Expr {
+                        kind: ExprKind::Str("database rows".to_owned()),
+                        ty: Ty::Str,
+                        span,
+                    }],
+                )
+            };
+        self.constrain(result_ty, expected, span);
+        Expr {
+            kind: ExprKind::Call {
+                func,
+                args: final_args,
+                type_args,
+            },
+            ty: result_ty,
+            span,
+        }
+    }
+
+    fn check_rows_batch_dispatch_op(
+        &mut self,
+        method: &str,
+        args: &[ast::Expr],
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Expr {
+        let err = || Expr {
+            kind: ExprKind::Bool(false),
+            ty: Ty::Error,
+            span,
+        };
+        let [rows_ast, max_rows_ast] = args else {
+            self.diags.error(
+                format!(
+                    "static descriptor operation '{method}' expects 2 argument(s), got {}",
+                    args.len()
+                ),
+                span,
+            );
+            return err();
+        };
+        let rows = self.check_expr(rows_ast, None);
+        let Ty::Resource(rows_id) = self.resolve(rows.ty) else {
+            if rows.ty != Ty::Error {
+                self.diags.error(
+                    "next_batch requires `db.rows<R>`".to_owned(),
+                    rows_ast.span,
+                );
+            }
+            return err();
+        };
+        let Some(instance) = self.resource_instances.get(&rows_id).cloned() else {
+            self.diags.error(
+                "next_batch requires concrete db.rows".to_owned(),
+                rows_ast.span,
+            );
+            return err();
+        };
+        if instance.canonical != "pkg.db$rows" || instance.args.len() != 1 {
+            self.diags.error(
+                "next_batch requires `db.rows<R>`".to_owned(),
+                rows_ast.span,
+            );
+            return err();
+        }
+        self.validate_borrow_argument(&rows, ast::ParamMode::BorrowMut, "next_batch");
+        let i64_ty = Ty::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        let max_rows = self.check_expr(max_rows_ast, Some(i64_ty));
+        if max_rows.ty == Ty::Error || !self.source_ty_matches(max_rows.ty, i64_ty) {
+            if max_rows.ty != Ty::Error {
+                self.diags.error(
+                    "next_batch maximum row count must be i64".to_owned(),
+                    max_rows_ast.span,
+                );
+            }
+            return err();
+        }
+        let row_ty = instance.args[0];
+        let Some(batch_id) = self.concrete_resource("pkg.db$batch", &[row_ty]) else {
+            self.diags
+                .error("pkg.db batch resource is unavailable".to_owned(), span);
+            return err();
+        };
+        let option_id = intern_tagged_type(
+            self.tagged_types,
+            hir::TaggedType::Option(Scalar::Resource(batch_id)),
+        );
+        let error_id = self
+            .enum_ids
+            .get("pkg.db$Error")
+            .copied()
+            .unwrap_or(self.error_enum_id);
+        let result_ty = Ty::Result(Scalar::Tagged(option_id), Scalar::Enum(error_id));
+        let base = if method == "next_batch_postgres" {
+            "pkg.db.internal.postgres$next_batch_prevalidated"
+        } else {
+            "pkg.db.internal.sqlite$next_batch_prevalidated"
+        };
+        let (func, type_args, final_args) =
+            if self.sigs.contains_key(base) || self.mono_args.is_empty() {
+                (base.to_owned(), vec![row_ty], vec![rows, max_rows])
+            } else {
+                (
+                    "pkg.db$unsupported".to_owned(),
+                    vec![Ty::Tagged(option_id)],
                     vec![Expr {
                         kind: ExprKind::Str("database rows".to_owned()),
                         ty: Ty::Str,
@@ -44362,9 +44827,11 @@ fn resolve_type(
                     return Ty::Error;
                 }
             };
-            if reject_abstract_nominal_container(inner, "Option", cx, span, diags) {
-                return Ty::Error;
-            }
+            // A1 needs `Option<batch<R>>` in the public generic `next_batch` result. Checker-side
+            // payload substitution already walks tagged Option/Result payloads and materializes a
+            // concrete resource instance before body analysis, so this one nominal container is
+            // now closed recursively. Other collection/nominal containers retain their narrower
+            // L7 restriction until they have an owner.
             match scalar_arg(inner, "Option payload", true, cx.tagged_types, span, diags) {
                 Some(s) => Ty::Option(s),
                 None => Ty::Error,

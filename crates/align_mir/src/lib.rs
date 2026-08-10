@@ -350,6 +350,9 @@ pub enum Stmt {
     ArenaEnd(Operand),
     /// `raw.free(p)` (unsafe): free a `raw` pointer from [`Rvalue::RawAlloc`]. Side-effecting, unit.
     RawFree(Operand),
+    /// Finalize or destroy one generated direct-column batch payload.
+    ColumnBatchFinish { payload: Operand, struct_id: u32 },
+    ColumnBatchDrop { payload: Operand, struct_id: u32 },
     /// `raw.store(p, offset, v)` (unsafe): write the primitive scalar `value` at `ptr + offset` bytes.
     RawStore { ptr: Operand, offset: Operand, value: Operand },
     /// Run all deferred tasks of a `task_group` and clear the list (`wait()`). Operand = the
@@ -439,6 +442,10 @@ pub struct StaticDataRelocation {
 pub enum StaticDataTarget {
     Bytes { bytes: Vec<u8>, nul_terminated: bool },
     Function(ProgramCall),
+    /// Another immutable relocation-bearing record. The containing relocation receives the
+    /// nested record's address; records are trees (never back-references), so lowering and
+    /// validation remain finite and deterministic.
+    Record(Box<StaticData>),
 }
 
 /// An immutable, target-native record whose pointer is exposed as `raw`.
@@ -451,6 +458,15 @@ pub struct StaticData {
     pub bytes: Vec<u8>,
     pub align: u32,
     pub relocations: Vec<StaticDataRelocation>,
+}
+
+/// One already validated current-row input supplied to a generated column-batch append. Scalar
+/// readers return `Option<T>` for both required and nullable fields; variable-width readers retain
+/// `-1` as the null length until the append atomically commits the lane.
+#[derive(Clone, Debug)]
+pub enum ColumnBatchInput {
+    Scalar(Operand),
+    View { ptr: Operand, len: Operand },
 }
 
 #[derive(Clone, Debug)]
@@ -569,6 +585,27 @@ pub enum Rvalue {
     /// `raw.alloc(size)` (unsafe): flat-heap-allocate `size` bytes, yield a `raw` byte pointer.
     /// Manually managed (freed by [`Stmt::RawFree`]); no arena handle, no auto-drop.
     RawAlloc(Operand),
+    /// Generated direct-column batch storage. The static producer supplies a concrete struct id;
+    /// no package name, reflection, or artifact lookup reaches lowering.
+    ColumnBatchCreate { max_rows: Operand, struct_id: u32 },
+    ColumnBatchAppend {
+        payload: Operand,
+        inputs: Vec<ColumnBatchInput>,
+        struct_id: u32,
+    },
+    ColumnBatchRow {
+        payload: Operand,
+        owner: Operand,
+        index: Operand,
+        struct_id: u32,
+        resource: u32,
+    },
+    ColumnBatchSoa {
+        payload: Operand,
+        owner: Operand,
+        struct_id: u32,
+        resource: u32,
+    },
     /// `raw.null()` (unsafe): the null raw pointer constant for a native ABI argument or sentinel.
     RawNull,
     /// `raw.load(p, offset)` (unsafe): read the primitive `scalar` at `ptr + offset` bytes.

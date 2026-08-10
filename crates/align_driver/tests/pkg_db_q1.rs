@@ -1003,9 +1003,9 @@ fn generated_runtime_data_is_producer_owned() {
             else {
                 panic!("descriptor constructor must start with relocation-bearing static data");
             };
-            assert_eq!(data.bytes.len(), 128);
+            assert_eq!(data.bytes.len(), 136);
             assert_eq!(data.align, 8);
-            assert_eq!(&data.bytes[0..4], &4u32.to_le_bytes());
+            assert_eq!(&data.bytes[0..4], &5u32.to_le_bytes());
             assert_eq!(
                 data.bytes[4],
                 u8::from(descriptor.consumer == StaticDescriptorConsumer::Command)
@@ -1053,10 +1053,41 @@ fn generated_runtime_data_is_producer_owned() {
                     align_mir::StaticDataTarget::Function(name)
                         if name.as_str().ends_with("$stream_decode_v1")
                 ));
+                let batch_plan = data
+                    .relocations
+                    .iter()
+                    .find(|relocation| relocation.offset == 128)
+                    .expect("D13 batch-plan relocation");
+                let align_mir::StaticDataTarget::Record(batch_plan) = &batch_plan.target else {
+                    panic!("D13 batch plan must be one nested relocation-bearing record");
+                };
+                assert_eq!(batch_plan.bytes.len(), 72);
+                assert_eq!(batch_plan.align, 8);
+                assert_eq!(&batch_plan.bytes[0..4], &1u32.to_le_bytes());
+                assert!(batch_plan.bytes[4] <= 1);
+                assert_eq!(&batch_plan.bytes[5..8], &[0; 3]);
+                assert_ne!(&batch_plan.bytes[8..12], &[0; 4]);
+                assert_eq!(&batch_plan.bytes[12..16], &[0; 4]);
+                assert_eq!(&batch_plan.bytes[64..72], &[0; 8]);
+                let batch_thunk_offsets = batch_plan
+                    .relocations
+                    .iter()
+                    .filter_map(|relocation| matches!(
+                        relocation.target,
+                        align_mir::StaticDataTarget::Function(_)
+                    ).then_some(relocation.offset))
+                    .collect::<Vec<_>>();
+                let expected = if batch_plan.bytes[4] == 1 {
+                    vec![16, 24, 32, 40, 48, 56]
+                } else {
+                    vec![16, 24, 32, 40, 56]
+                };
+                assert_eq!(batch_thunk_offsets, expected);
             } else {
                 assert_eq!(thunk_offsets, vec![64, 72, 104]);
                 assert_eq!(&data.bytes[96..104], &[0; 8]);
                 assert_eq!(&data.bytes[120..128], &[0; 8]);
+                assert_eq!(&data.bytes[128..136], &[0; 8]);
             }
             let parameter_count = match &artifact.runtime {
                 GeneratedStaticRuntime::Query(runtime) => runtime.drivers[0].binder.fields.len(),

@@ -6202,12 +6202,6 @@ impl<'a> BodyValidator<'a> {
                             .map(|_| *resource),
                         _ => None,
                     };
-                    if descriptor_kind.is_none()
-                        && prepared_resource.is_none()
-                        && rows_resource.is_none()
-                    {
-                    return None;
-                }
                 let hir::ExprKind::Int(offset) = &offset.kind else {
                     return None;
                 };
@@ -6219,9 +6213,9 @@ impl<'a> BodyValidator<'a> {
                     || callee_flow.ty != Ty::Raw
                     || args.len() != param_tys.len()
                     || args.len() != param_modes.len()
-                        || (!matches!(offset, 48)
+                        || (!matches!(offset, 40 | 48)
                             && *return_borrow != hir::ReturnBorrowSummary::None)
-                        || (!matches!(offset, 48)
+                        || (!matches!(offset, 40 | 48)
                             && *return_region != hir::ReturnRegionSummary::None)
                     || *return_cleanup != hir::ReturnCleanupAbi::None
                     || arg_flows
@@ -6245,7 +6239,24 @@ impl<'a> BodyValidator<'a> {
                     bits: 32,
                     signed: true,
                 });
-                let signature_ok = match offset {
+                let batch_signature_ok = self.batch_plan_call_signature_ok(
+                    context,
+                    offset,
+                    args,
+                    param_tys,
+                    param_modes,
+                    expression.ty,
+                    return_borrow,
+                    return_region,
+                );
+                if descriptor_kind.is_none()
+                    && prepared_resource.is_none()
+                    && rows_resource.is_none()
+                    && !batch_signature_ok
+                {
+                    return None;
+                }
+                let signature_ok = batch_signature_ok || match offset {
                         40 => {
                             rows_resource.is_some()
                                 && args.len() == 1
@@ -9672,6 +9683,133 @@ impl<'a> BodyValidator<'a> {
                 let name = function.name.as_str();
                 name.starts_with("pkg.db$") || name.starts_with("pkg.db.")
             })
+    }
+
+    /// Validate the complete closed ABI of an A1 producer batch-plan thunk. Unlike descriptor
+    /// header callbacks, a plan pointer is copied through stmt/rows/batch resource state before it
+    /// is called, so it cannot remain syntactically rooted in the original `$static` field. Sema is
+    /// the only HIR producer for `RawCall`; this exact signature/resource check keeps the trusted
+    /// package bridge closed while allowing that producer-owned pointer to cross generations.
+    fn batch_plan_call_signature_ok(
+        &self,
+        context: &BodyContext,
+        offset: u32,
+        args: &[hir::Expr],
+        param_tys: &[Ty],
+        param_modes: &[align_ast::ParamMode],
+        return_ty: Ty,
+        return_borrow: &hir::ReturnBorrowSummary,
+        return_region: &hir::ReturnRegionSummary,
+    ) -> bool {
+        if !self.static_descriptor_body_ok(context)
+            || param_modes
+                .iter()
+                .any(|mode| *mode != align_ast::ParamMode::ByValue)
+        {
+            return false;
+        }
+        let i32_ty = Ty::Int(align_sema::IntTy {
+            bits: 32,
+            signed: true,
+        });
+        let i64_ty = Ty::Int(align_sema::IntTy {
+            bits: 64,
+            signed: true,
+        });
+        let no_borrow = summary_is_none(return_borrow, return_region);
+        let resource = |index: usize, canonical: &str| {
+            let Some(Ty::ResourceRef(id)) = param_tys.get(index).copied() else {
+                return None;
+            };
+            self.program
+                .resources
+                .get(id as usize)
+                .filter(|definition| {
+                    definition.declaring_module == "pkg.db"
+                        && definition.generic_arity == 1
+                        && definition.name.starts_with(canonical)
+                })
+                .map(|_| id)
+        };
+        let roots_one = |index| {
+            *return_borrow
+                == hir::ReturnBorrowSummary::Roots {
+                    params: vec![index],
+                    captures: Vec::new(),
+                }
+                && *return_region
+                    == hir::ReturnRegionSummary::Roots {
+                        params: vec![index],
+                        captures: Vec::new(),
+                    }
+        };
+        match offset {
+            16 => {
+                args.len() == 1
+                    && param_tys == [i64_ty]
+                    && return_ty == Ty::Raw
+                    && no_borrow
+            }
+            24 => {
+                args.len() == 3
+                    && param_tys.first() == Some(&Ty::Raw)
+                    && param_tys.get(1) == Some(&Ty::Raw)
+                    && resource(2, "pkg.db$rows$").is_some()
+                    && return_ty == i32_ty
+                    && no_borrow
+            }
+            32 => {
+                args.len() == 2
+                    && param_tys == [Ty::Raw, i64_ty]
+                    && return_ty == Ty::Unit
+                    && no_borrow
+            }
+            40 => {
+                let Some(resource) = resource(1, "pkg.db$batch$") else {
+                    return false;
+                };
+                let Some(definition) = self.program.resources.get(resource as usize) else {
+                    return false;
+                };
+                args.len() == 3
+                    && param_tys.first() == Some(&Ty::Raw)
+                    && param_tys.get(2) == Some(&i64_ty)
+                    && definition.name
+                        == format!(
+                            "pkg.db$batch${}",
+                            body_ty_mangle(return_ty, self.program)
+                        )
+                    && roots_one(1)
+            }
+            48 => {
+                let Some(resource) = resource(1, "pkg.db$batch$") else {
+                    return false;
+                };
+                let Some(definition) = self.program.resources.get(resource as usize) else {
+                    return false;
+                };
+                let row_suffix = definition.name.strip_prefix("pkg.db$batch$");
+                let row_ty = match return_ty {
+                    Ty::Soa(id) => Some(Ty::Struct(id)),
+                    Ty::SoaParam(index) => Some(Ty::Param(index)),
+                    _ => None,
+                };
+                let return_matches = row_ty.is_some_and(|row_ty| {
+                    row_suffix == Some(body_ty_mangle(row_ty, self.program).as_str())
+                });
+                args.len() == 2
+                    && param_tys.first() == Some(&Ty::Raw)
+                    && return_matches
+                    && roots_one(1)
+            }
+            56 => {
+                args.len() == 1
+                    && param_tys == [Ty::Raw]
+                    && return_ty == Ty::Unit
+                    && no_borrow
+            }
+            _ => false,
+        }
     }
 
     fn unit_enum_ty_ok(&self, ty: Ty, source_name: &str, variants: &[&str]) -> bool {

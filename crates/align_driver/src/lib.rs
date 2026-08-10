@@ -220,7 +220,18 @@ fn static_implementation_hash(
 /// constructor that D1 executes. The private descriptor field is a raw pointer to a canonical,
 /// codegen-owned byte global; application source cannot spell or inspect that field.
 fn rows_resource_names_for_descriptor(row: &align_sema::hir::StructDef) -> [String; 2] {
-    let direct = format!("pkg.db$rows$S{}_{}", row.name.len(), row.name);
+    db_resource_names_for_descriptor("rows", row)
+}
+
+fn batch_resource_names_for_descriptor(row: &align_sema::hir::StructDef) -> [String; 2] {
+    db_resource_names_for_descriptor("batch", row)
+}
+
+fn db_resource_names_for_descriptor(
+    resource: &str,
+    row: &align_sema::hir::StructDef,
+) -> [String; 2] {
+    let direct = format!("pkg.db${resource}$S{}_{}", row.name.len(), row.name);
     // Per-unit generic-body reconstruction spells an application nominal through an ordinary
     // source identifier before substituting it into `rows<R>` (`app.users$Row` becomes
     // `app_users_Row`). Static-descriptor installation runs afterward against the producer's
@@ -235,7 +246,7 @@ fn rows_resource_names_for_descriptor(row: &align_sema::hir::StructDef) -> [Stri
         })
         .collect::<String>();
     let reconstructed = format!(
-        "pkg.db$rows$S{}_{}",
+        "pkg.db${resource}$S{}_{}",
         reconstructed_name.len(),
         reconstructed_name
     );
@@ -250,8 +261,8 @@ fn install_static_descriptor_data(
 ) -> Result<(), String> {
     use align_ast::{BinOp, ParamMode};
     use align_mir::{
-        Block, Const, DirectCall, Function, ImportedFn, Operand, ProgramCall, Rvalue, StaticData,
-        StaticDataRelocation, StaticDataTarget, Stmt, Term,
+        Block, ColumnBatchInput, Const, DirectCall, Function, ImportedFn, Operand, ProgramCall,
+        Rvalue, StaticData, StaticDataRelocation, StaticDataTarget, Stmt, Term,
     };
     use align_sema::{IntTy, StaticDescriptorConsumer, StaticDescriptorOption, Ty, hir};
 
@@ -886,8 +897,8 @@ fn install_static_descriptor_data(
             exportable: false,
         });
 
-        let mut header = vec![0u8; 128];
-        header[0..4].copy_from_slice(&4u32.to_le_bytes());
+        let mut header = vec![0u8; 136];
+        header[0..4].copy_from_slice(&5u32.to_le_bytes());
         header[4] = match descriptor.consumer {
             StaticDescriptorConsumer::Query => 0,
             StaticDescriptorConsumer::Command => 1,
@@ -1346,8 +1357,8 @@ fn install_static_descriptor_data(
                 param_modes: vec![ParamMode::ByValue, ParamMode::ByValue],
                 borrow_mut_cleanup_slots: vec![None, None],
                 ret: row_ty,
-                return_borrow: stream_return_borrow,
-                return_region: stream_return_region,
+                return_borrow: stream_return_borrow.clone(),
+                return_region: stream_return_region.clone(),
                 return_cleanup: no_cleanup,
                 slots: vec![Ty::Raw, Ty::ResourceRef(rows_resource), row_ty],
                 slot_align: vec![None, None, None],
@@ -1364,6 +1375,330 @@ fn install_static_descriptor_data(
                 }],
                 entry: 0,
                 exportable: false,
+            });
+
+            let batch_names = batch_resource_names_for_descriptor(row_definition);
+            let batch_resource = if let Some(index) = mir
+                .resources
+                .iter()
+                .position(|resource| resource.name == batch_names[0])
+                .or_else(|| {
+                    mir.resources
+                        .iter()
+                        .position(|resource| resource.name == batch_names[1])
+                })
+            {
+                index as u32
+            } else {
+                let mut resource = mir
+                    .resources
+                    .iter()
+                    .find(|resource| resource.name == "pkg.db$batch")
+                    .cloned()
+                    .unwrap_or_else(|| hir::ResourceDef {
+                        name: "pkg.db$batch".to_string(),
+                        source_name: "pkg.db$batch".to_string(),
+                        declaring_module: "pkg.db".to_string(),
+                        generic_arity: 1,
+                        drop_hook: "__align_db_batch_owner_drop".to_string(),
+                        drop_thunk: "__align_resource_drop$pkg.db$batch".to_string(),
+                        representation_version: 1,
+                        drop_abi_fingerprint: *b"align-res-drop-1",
+                    });
+                resource.name = batch_names[0].clone();
+                resource.source_name = batch_names[0].clone();
+                let id = mir.resources.len() as u32;
+                mir.resources.push(resource);
+                id
+            };
+            let soa_plain = row_definition.fields.iter().all(|field| {
+                matches!(field.ty, Ty::Bool | Ty::Char | Ty::Int(_) | Ty::Float(_) | Ty::Str)
+            });
+            let batch_create_name = program_call(&format!("{symbol}$batch_create_v1"))?;
+            let batch_append_name = program_call(&format!("{symbol}$batch_append_v1"))?;
+            let batch_finish_name = program_call(&format!("{symbol}$batch_finish_v1"))?;
+            let batch_row_name = program_call(&format!("{symbol}$batch_row_v1"))?;
+            let batch_soa_name = program_call(&format!("{symbol}$batch_soa_v1"))?;
+            let batch_drop_name = program_call(&format!("{symbol}$batch_drop_v1"))?;
+            generated_functions.push(Function {
+                name: batch_create_name.clone(),
+                params: vec![0],
+                param_modes: vec![ParamMode::ByValue],
+                borrow_mut_cleanup_slots: vec![None],
+                ret: Ty::Raw,
+                return_borrow: none_borrow.clone(),
+                return_region: none_region.clone(),
+                return_cleanup: no_cleanup,
+                slots: vec![i64_ty],
+                slot_align: vec![None],
+                value_tys: vec![Ty::Raw],
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: vec![Stmt::Let(
+                        0,
+                        Rvalue::ColumnBatchCreate {
+                            max_rows: Operand::Arg(0),
+                            struct_id: row_struct_id,
+                        },
+                    )],
+                    stmt_lines: Vec::new(),
+                    term: Term::Return(Some(Operand::Value(0))),
+                }],
+                entry: 0,
+                exportable: false,
+            });
+            let mut batch_append_stmts = Vec::new();
+            let mut batch_append_values = Vec::new();
+            let mut batch_append_inputs = Vec::new();
+            for field in &runtime.decoder.fields {
+                let base_ty = value_ty(field.shape.kind);
+                if matches!(field.shape.kind, GeneratedValueKind::Text | GeneratedValueKind::Bytes)
+                {
+                    let pointer = batch_append_values.len() as u32;
+                    batch_append_values.push(Ty::Raw);
+                    batch_append_stmts.push(Stmt::Let(
+                        pointer,
+                        Rvalue::Call(
+                            DirectCall::Program(read_view_pointer_callback.clone()),
+                            vec![
+                                Operand::Arg(1),
+                                Operand::Const(Const::Int(
+                                    i128::from(field.row_field_ordinal),
+                                    u32_ty,
+                                )),
+                            ],
+                        ),
+                    ));
+                    let length = batch_append_values.len() as u32;
+                    batch_append_values.push(i64_ty);
+                    batch_append_stmts.push(Stmt::Let(
+                        length,
+                        Rvalue::Call(
+                            DirectCall::Program(read_view_length_callback.clone()),
+                            vec![
+                                Operand::Arg(1),
+                                Operand::Const(Const::Int(
+                                    i128::from(field.row_field_ordinal),
+                                    u32_ty,
+                                )),
+                            ],
+                        ),
+                    ));
+                    batch_append_inputs.push(ColumnBatchInput::View {
+                        ptr: Operand::Value(pointer),
+                        len: Operand::Value(length),
+                    });
+                } else {
+                    let value = batch_append_values.len() as u32;
+                    batch_append_values.push(option_ty(base_ty)?);
+                    batch_append_stmts.push(Stmt::Let(
+                        value,
+                        Rvalue::Call(
+                            DirectCall::Program(
+                                read_callbacks[value_tag(field.shape.kind) as usize].clone(),
+                            ),
+                            vec![
+                                Operand::Arg(1),
+                                Operand::Const(Const::Int(
+                                    i128::from(field.row_field_ordinal),
+                                    u32_ty,
+                                )),
+                            ],
+                        ),
+                    ));
+                    batch_append_inputs.push(ColumnBatchInput::Scalar(Operand::Value(value)));
+                }
+            }
+            let batch_append_result = batch_append_values.len() as u32;
+            batch_append_values.push(i32_ty);
+            batch_append_stmts.push(Stmt::Let(
+                batch_append_result,
+                Rvalue::ColumnBatchAppend {
+                    payload: Operand::Arg(0),
+                    inputs: batch_append_inputs,
+                    struct_id: row_struct_id,
+                },
+            ));
+            generated_functions.push(Function {
+                name: batch_append_name.clone(),
+                params: vec![0, 1, 2],
+                param_modes: vec![ParamMode::ByValue; 3],
+                borrow_mut_cleanup_slots: vec![None; 3],
+                ret: i32_ty,
+                return_borrow: none_borrow.clone(),
+                return_region: none_region.clone(),
+                return_cleanup: no_cleanup,
+                slots: vec![Ty::Raw, Ty::Raw, Ty::ResourceRef(rows_resource)],
+                slot_align: vec![None; 3],
+                value_tys: batch_append_values,
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: batch_append_stmts,
+                    stmt_lines: Vec::new(),
+                    term: Term::Return(Some(Operand::Value(batch_append_result))),
+                }],
+                entry: 0,
+                exportable: false,
+            });
+            generated_functions.push(Function {
+                name: batch_finish_name.clone(),
+                params: vec![0, 1],
+                param_modes: vec![ParamMode::ByValue; 2],
+                borrow_mut_cleanup_slots: vec![None; 2],
+                ret: Ty::Unit,
+                return_borrow: none_borrow.clone(),
+                return_region: none_region.clone(),
+                return_cleanup: no_cleanup,
+                slots: vec![Ty::Raw, i64_ty],
+                slot_align: vec![None; 2],
+                value_tys: Vec::new(),
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: vec![Stmt::ColumnBatchFinish {
+                        payload: Operand::Arg(0),
+                        struct_id: row_struct_id,
+                    }],
+                    stmt_lines: Vec::new(),
+                    term: Term::Return(None),
+                }],
+                entry: 0,
+                exportable: false,
+            });
+            generated_functions.push(Function {
+                name: batch_row_name.clone(),
+                params: vec![0, 1, 2],
+                param_modes: vec![ParamMode::ByValue; 3],
+                borrow_mut_cleanup_slots: vec![None; 3],
+                ret: row_ty,
+                return_borrow: stream_return_borrow.clone(),
+                return_region: stream_return_region.clone(),
+                return_cleanup: no_cleanup,
+                slots: vec![Ty::Raw, Ty::ResourceRef(batch_resource), i64_ty],
+                slot_align: vec![None; 3],
+                value_tys: vec![row_ty],
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: vec![Stmt::Let(
+                        0,
+                        Rvalue::ColumnBatchRow {
+                            payload: Operand::Arg(0),
+                            owner: Operand::Arg(1),
+                            index: Operand::Arg(2),
+                            struct_id: row_struct_id,
+                            resource: batch_resource,
+                        },
+                    )],
+                    stmt_lines: Vec::new(),
+                    term: Term::Return(Some(Operand::Value(0))),
+                }],
+                entry: 0,
+                exportable: false,
+            });
+            if soa_plain {
+                generated_functions.push(Function {
+                    name: batch_soa_name.clone(),
+                    params: vec![0, 1],
+                    param_modes: vec![ParamMode::ByValue; 2],
+                    borrow_mut_cleanup_slots: vec![None; 2],
+                    ret: Ty::Soa(row_struct_id),
+                    return_borrow: hir::ReturnBorrowSummary::Roots {
+                        params: vec![1],
+                        captures: Vec::new(),
+                    },
+                    return_region: hir::ReturnRegionSummary::Roots {
+                        params: vec![1],
+                        captures: Vec::new(),
+                    },
+                    return_cleanup: no_cleanup,
+                    slots: vec![Ty::Raw, Ty::ResourceRef(batch_resource)],
+                    slot_align: vec![None; 2],
+                    value_tys: vec![Ty::Soa(row_struct_id)],
+                    blocks: vec![Block {
+                        id: 0,
+                        stmts: vec![Stmt::Let(
+                            0,
+                            Rvalue::ColumnBatchSoa {
+                                payload: Operand::Arg(0),
+                                owner: Operand::Arg(1),
+                                struct_id: row_struct_id,
+                                resource: batch_resource,
+                            },
+                        )],
+                        stmt_lines: Vec::new(),
+                        term: Term::Return(Some(Operand::Value(0))),
+                    }],
+                    entry: 0,
+                    exportable: false,
+                });
+            }
+            generated_functions.push(Function {
+                name: batch_drop_name.clone(),
+                params: vec![0],
+                param_modes: vec![ParamMode::ByValue],
+                borrow_mut_cleanup_slots: vec![None],
+                ret: Ty::Unit,
+                return_borrow: none_borrow.clone(),
+                return_region: none_region.clone(),
+                return_cleanup: no_cleanup,
+                slots: vec![Ty::Raw],
+                slot_align: vec![None],
+                value_tys: Vec::new(),
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: vec![Stmt::ColumnBatchDrop {
+                        payload: Operand::Arg(0),
+                        struct_id: row_struct_id,
+                    }],
+                    stmt_lines: Vec::new(),
+                    term: Term::Return(None),
+                }],
+                entry: 0,
+                exportable: false,
+            });
+            let mut batch_plan_bytes = vec![0u8; 72];
+            batch_plan_bytes[0..4].copy_from_slice(&1u32.to_le_bytes());
+            batch_plan_bytes[4] = u8::from(soa_plain);
+            batch_plan_bytes[8..12].copy_from_slice(
+                &u32::try_from(row_definition.fields.len())
+                    .map_err(|_| "generated batch field count exceeds u32::MAX".to_string())?
+                    .to_le_bytes(),
+            );
+            let mut batch_plan_relocations = vec![
+                StaticDataRelocation {
+                    offset: 16,
+                    target: StaticDataTarget::Function(batch_create_name),
+                },
+                StaticDataRelocation {
+                    offset: 24,
+                    target: StaticDataTarget::Function(batch_append_name),
+                },
+                StaticDataRelocation {
+                    offset: 32,
+                    target: StaticDataTarget::Function(batch_finish_name),
+                },
+                StaticDataRelocation {
+                    offset: 40,
+                    target: StaticDataTarget::Function(batch_row_name),
+                },
+                StaticDataRelocation {
+                    offset: 56,
+                    target: StaticDataTarget::Function(batch_drop_name),
+                },
+            ];
+            if soa_plain {
+                batch_plan_relocations.push(StaticDataRelocation {
+                    offset: 48,
+                    target: StaticDataTarget::Function(batch_soa_name),
+                });
+            }
+            batch_plan_relocations.sort_by_key(|relocation| relocation.offset);
+            relocations.push(StaticDataRelocation {
+                offset: 128,
+                target: StaticDataTarget::Record(Box::new(StaticData {
+                    bytes: batch_plan_bytes,
+                    align: 8,
+                    relocations: batch_plan_relocations,
+                })),
             });
             relocations.push(StaticDataRelocation {
                 offset: 80,

@@ -1,5 +1,7 @@
 module pkg.db.internal.resource
 
+import pkg.db.internal.descriptor
+
 extern "C" link("sqlite3") {
   fn sqlite3_close_v2(database: raw) -> i32
   fn sqlite3_finalize(statement: raw) -> i32
@@ -16,7 +18,7 @@ extern "C" link("pq") {
 }
 
 // The state is private to pkg.db descendants. Its fixed Q2 prefix is:
-//   0: u32 version (= 1)
+//   0: u32 version (= 2)
 //   4: u8  driver (1 = SQLite, 2 = PostgreSQL)
 //   5: u8  poisoned/closed
 //   6: u16 reserved (= 0)
@@ -178,6 +180,7 @@ pub fn poison_conn_state(state: raw) {
 //  48: raw PostgreSQL DEALLOCATE command C string, null for SQLite
 //  56: raw generated Row validator
 //  64: raw generated streaming Row decoder
+//  72: raw generated batch plan
 pub fn new_stmt_state(
   driver: u8,
   native: raw,
@@ -188,10 +191,11 @@ pub fn new_stmt_state(
   deallocate_sql: raw,
   row_validator: raw,
   stream_decoder: raw,
+  batch_plan: raw,
 ) -> raw {
   unsafe {
-    statement := raw.alloc(72)
-    raw.store(statement, 0, 1 as u32)
+    statement := raw.alloc(80)
+    raw.store(statement, 0, 2 as u32)
     raw.store(statement, 4, driver)
     raw.store(statement, 5, 0 as u8)
     raw.store(statement, 6, 0 as u16)
@@ -203,6 +207,7 @@ pub fn new_stmt_state(
     raw.store(statement, 48, deallocate_sql)
     raw.store(statement, 56, row_validator)
     raw.store(statement, 64, stream_decoder)
+    raw.store(statement, 72, batch_plan)
     return statement
   }
 }
@@ -214,7 +219,9 @@ pub fn stmt_driver(statement: raw) -> u8 {
     driver: u8 := raw.load(statement, 4)
     closed: u8 := raw.load(statement, 5)
     reserved: u16 := raw.load(statement, 6)
-    if version != 1 || (driver != 1 && driver != 2) || closed != 0 || reserved != 0 {
+    batch_plan: raw := raw.load(statement, 72)
+    if version != 2 || (driver != 1 && driver != 2) || closed != 0 || reserved != 0
+      || !batch_plan_valid(batch_plan) {
       return 0
     }
     return driver
@@ -263,6 +270,13 @@ pub fn stmt_stream_decoder(statement: raw) -> raw {
   }
 }
 
+pub fn stmt_batch_plan(statement: raw) -> raw {
+  unsafe {
+    if stmt_driver(statement) == 0 { return raw.null() }
+    return raw.load(statement, 72)
+  }
+}
+
 pub fn close_stmt(statement: raw) -> i32 {
   unsafe {
     driver := stmt_driver(statement)
@@ -301,6 +315,7 @@ pub fn close_stmt(statement: raw) -> i32 {
     raw.store(statement, 48, raw.null())
     raw.store(statement, 56, raw.null())
     raw.store(statement, 64, raw.null())
+    raw.store(statement, 72, raw.null())
     return status
   }
 }
@@ -360,7 +375,7 @@ fn free_bind_context(driver: u8, context: raw) {
 // One streamed execution. SQLite borrows a prepared stmt handle or owns a direct stmt;
 // PostgreSQL owns one buffered PGresult. A prepared stream remains dependent on the statement
 // generation; a direct stream is dependent on the conn/tx generation.
-//   0: u32 version (= 1), 4: driver, 5: terminal (0 active, 1 exhausted, 2 failed), 6: reserved
+//   0: u32 version (= 2), 4: driver, 5: terminal (0 active, 1 exhausted, 2 failed), 6: reserved
 //   8: sqlite3_stmt / PGresult
 //  16: prepared stmt wrapper, null for direct execution
 //  24: bind/decode context
@@ -375,6 +390,7 @@ fn free_bind_context(driver: u8, context: raw) {
 //  76: i32 saved SQLite busy timeout in native milliseconds
 //  80: u8 restore saved SQLite busy timeout (0 no, 1 yes)
 //  81: u8[7] reserved
+//  88: raw generated batch plan
 pub fn new_rows_state(
   driver: u8,
   native: raw,
@@ -389,10 +405,11 @@ pub fn new_rows_state(
   owns_statement: bool,
   restore_timeout: bool,
   prior_timeout: i32,
+  batch_plan: raw,
 ) -> raw {
   unsafe {
-    rows := raw.alloc(88)
-    raw.store(rows, 0, 1 as u32)
+    rows := raw.alloc(96)
+    raw.store(rows, 0, 2 as u32)
     raw.store(rows, 4, driver)
     raw.store(rows, 5, 0 as u8)
     raw.store(rows, 6, 0 as u16)
@@ -412,6 +429,7 @@ pub fn new_rows_state(
     raw.store(rows, 81, 0 as u8)
     raw.store(rows, 82, 0 as u16)
     raw.store(rows, 84, 0 as u32)
+    raw.store(rows, 88, batch_plan)
     return rows
   }
 }
@@ -426,8 +444,10 @@ pub fn rows_driver(rows: raw) -> u8 {
     timeout_reserved: u8 := raw.load(rows, 81)
     timeout_reserved16: u16 := raw.load(rows, 82)
     timeout_reserved32: u32 := raw.load(rows, 84)
-    if version != 1 || (driver != 1 && driver != 2) || reserved != 0 || tail_reserved != 0
-      || timeout_reserved != 0 || timeout_reserved16 != 0 || timeout_reserved32 != 0 {
+    batch_plan: raw := raw.load(rows, 88)
+    if version != 2 || (driver != 1 && driver != 2) || reserved != 0 || tail_reserved != 0
+      || timeout_reserved != 0 || timeout_reserved16 != 0 || timeout_reserved32 != 0
+      || !batch_plan_valid(batch_plan) {
       return 0
     }
     return driver
@@ -473,6 +493,45 @@ pub fn rows_query_id_length(rows: raw) -> i64 {
   unsafe {
     if rows_driver(rows) == 0 { return -1 }
     return raw.load(rows, 64)
+  }
+}
+
+pub fn rows_batch_plan(rows: raw) -> raw {
+  unsafe {
+    if rows_driver(rows) == 0 { return raw.null() }
+    return raw.load(rows, 88)
+  }
+}
+
+// The complete structural header accepted by batch advancement. Active rows retain every native
+// and generated callback pointer; terminal rows retain only their immutable Query identity and
+// batch plan. Query-ID UTF-8 is validated by the caller through its resource reference.
+pub fn rows_batch_header_valid(rows: raw) -> bool {
+  unsafe {
+    if rows_driver(rows) == 0 { return false }
+    terminal: u8 := raw.load(rows, 5)
+    owns_query_id: u8 := raw.load(rows, 72)
+    owns_statement: u8 := raw.load(rows, 73)
+    restore_timeout: u8 := raw.load(rows, 80)
+    query_id: raw := raw.load(rows, 56)
+    query_id_len: i64 := raw.load(rows, 64)
+    if terminal > 2 || owns_query_id > 1 || owns_statement > 1 || restore_timeout > 1
+      || query_id.is_null() || query_id_len <= 0 {
+      return false
+    }
+    native: raw := raw.load(rows, 8)
+    statement: raw := raw.load(rows, 16)
+    context: raw := raw.load(rows, 24)
+    connection_state: raw := raw.load(rows, 32)
+    row_validator: raw := raw.load(rows, 40)
+    stream_decoder: raw := raw.load(rows, 48)
+    if terminal == 0 {
+      return !native.is_null() && !context.is_null() && !connection_state.is_null()
+        && !row_validator.is_null() && !stream_decoder.is_null()
+    }
+    return native.is_null() && statement.is_null() && context.is_null()
+      && connection_state.is_null() && row_validator.is_null() && stream_decoder.is_null()
+      && owns_statement == 0 && restore_timeout == 0
   }
 }
 
@@ -536,6 +595,116 @@ pub fn close_rows(rows: raw, terminal: u8) -> i32 {
       raw.store(rows, 76, 0 as i32)
       raw.store(rows, 80, 0 as u8)
       return cleanup_status
+  }
+}
+
+// A producer-owned v1 batch plan. The public wrapper, prepared statement, and rows state all
+// validate this complete record before loading a thunk from it.
+pub fn batch_plan_valid(plan: raw) -> bool {
+  unsafe {
+    if plan.is_null() { return false }
+    version: u32 := raw.load(plan, 0)
+    flags: u8 := raw.load(plan, 4)
+    reserved8: u8 := raw.load(plan, 5)
+    reserved16: u16 := raw.load(plan, 6)
+    field_count: u32 := raw.load(plan, 8)
+    reserved32: u32 := raw.load(plan, 12)
+    create: raw := raw.load(plan, 16)
+    append: raw := raw.load(plan, 24)
+    finish: raw := raw.load(plan, 32)
+    row: raw := raw.load(plan, 40)
+    soa: raw := raw.load(plan, 48)
+    drop_payload: raw := raw.load(plan, 56)
+    tail_reserved: i64 := raw.load(plan, 64)
+    soa_valid := if flags & 1 == 0 { soa.is_null() } else { !soa.is_null() }
+    return version == 1 && flags & 254 == 0 && reserved8 == 0 && reserved16 == 0
+      && field_count > 0 && reserved32 == 0 && !create.is_null() && !append.is_null()
+      && !finish.is_null() && !row.is_null() && soa_valid && !drop_payload.is_null()
+      && tail_reserved == 0
+  }
+}
+
+// One independently owned published batch generation.
+//   0: u32 version (= 1)
+//   4: u8 state (0 live, 1 closed)
+//   5: u8 copied plan flags
+//   6: u16 reserved (= 0)
+//   8: raw batch plan
+//  16: raw producer payload
+//  24: i64 nonzero row count
+//  32: i64 requested maximum row count
+//  40: i64 reserved (= 0)
+pub fn new_batch_state(plan: raw, payload: raw, len: i64, max_rows: i64) -> raw {
+  unsafe {
+    wrapper := raw.alloc(48)
+    flags: u8 := raw.load(plan, 4)
+    raw.store(wrapper, 0, 1 as u32)
+    raw.store(wrapper, 4, 0 as u8)
+    raw.store(wrapper, 5, flags)
+    raw.store(wrapper, 6, 0 as u16)
+    raw.store(wrapper, 8, plan)
+    raw.store(wrapper, 16, payload)
+    raw.store(wrapper, 24, len)
+    raw.store(wrapper, 32, max_rows)
+    raw.store(wrapper, 40, 0 as i64)
+    return wrapper
+  }
+}
+
+pub fn batch_live(wrapper: raw) -> bool {
+  unsafe {
+    if wrapper.is_null() { return false }
+    version: u32 := raw.load(wrapper, 0)
+    state: u8 := raw.load(wrapper, 4)
+    flags: u8 := raw.load(wrapper, 5)
+    reserved: u16 := raw.load(wrapper, 6)
+    plan: raw := raw.load(wrapper, 8)
+    payload: raw := raw.load(wrapper, 16)
+    len: i64 := raw.load(wrapper, 24)
+    max_rows: i64 := raw.load(wrapper, 32)
+    tail_reserved: i64 := raw.load(wrapper, 40)
+    if version != 1 || state != 0 || reserved != 0 || !batch_plan_valid(plan)
+      || payload.is_null() || len <= 0 || max_rows <= 0 || max_rows > 2147483647
+      || len > max_rows || tail_reserved != 0 {
+      return false
+    }
+    plan_flags: u8 := raw.load(plan, 4)
+    return flags == plan_flags
+  }
+}
+
+pub fn batch_plan(wrapper: raw) -> raw {
+  unsafe {
+    if !batch_live(wrapper) { return raw.null() }
+    return raw.load(wrapper, 8)
+  }
+}
+
+pub fn batch_payload(wrapper: raw) -> raw {
+  unsafe {
+    if !batch_live(wrapper) { return raw.null() }
+    return raw.load(wrapper, 16)
+  }
+}
+
+pub fn batch_length(wrapper: raw) -> i64 {
+  unsafe {
+    if !batch_live(wrapper) { return -1 }
+    return raw.load(wrapper, 24)
+  }
+}
+
+pub fn drop_batch(wrapper: raw) {
+  unsafe {
+    if wrapper.is_null() { return }
+    if batch_live(wrapper) {
+      plan: raw := raw.load(wrapper, 8)
+      payload: raw := raw.load(wrapper, 16)
+      raw.store(wrapper, 4, 1 as u8)
+      raw.store(wrapper, 16, raw.null())
+      pkg.db.internal.descriptor.drop_batch_payload(plan, payload)
+    }
+    raw.free(wrapper)
   }
 }
 

@@ -71,9 +71,10 @@ pub resource tx = pkg.db.internal.resource.drop_tx
 // one rows value in turn depends on the current mutable statement generation.
 pub resource stmt<P, R> = pkg.db.internal.resource.drop_stmt
 pub resource rows<R> = pkg.db.internal.resource.drop_rows
+pub resource batch<R> = pkg.db.internal.resource.drop_batch
 
 // All common and native execution entry points use these two sealed validators before option
-// allocation, lease acquisition, or native work. Keeping the v4 header in one owner prevents a
+// allocation, lease acquisition, or native work. Keeping the v5 header in one owner prevents a
 // descriptor version/field bump from drifting across copied validators.
 pub fn query_header_valid<P, R>(
   statement: query<P, R>,
@@ -102,11 +103,13 @@ pub fn query_header_valid<P, R>(
     materializer := pkg.db.internal.descriptor.meta_materializer(statement)
     parameter_resolver := pkg.db.internal.descriptor.parameter_resolver(statement)
     stream_decoder := pkg.db.internal.descriptor.stream_decoder(statement)
-    base_valid := version == 4 && kind == 0 && reserved == 0 && tail_reserved == 0
+    batch_plan := pkg.db.internal.descriptor.batch_plan(statement)
+    base_valid := version == 5 && kind == 0 && reserved == 0 && tail_reserved == 0
       && !q1.is_null()
       && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
       && !validate_row.is_null() && !decode.is_null() && !materializer.is_null()
       && !parameter_resolver.is_null() && !stream_decoder.is_null()
+      && pkg.db.internal.resource.batch_plan_valid(batch_plan)
     sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
       && postgres_sql.is_null() && postgres_len == 0
     postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0
@@ -144,11 +147,12 @@ pub fn command_header_valid<P>(
     materializer := pkg.db.internal.descriptor.meta_materializer(statement)
     parameter_resolver := pkg.db.internal.descriptor.parameter_resolver(statement)
     stream_decoder := pkg.db.internal.descriptor.stream_decoder(statement)
-    base_valid := version == 4 && kind == 1 && reserved == 0 && tail_reserved == 0
+    batch_plan := pkg.db.internal.descriptor.batch_plan(statement)
+    base_valid := version == 5 && kind == 1 && reserved == 0 && tail_reserved == 0
       && !q1.is_null()
       && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
       && validate_row.is_null() && decode.is_null() && materializer.is_null()
-      && !parameter_resolver.is_null() && stream_decoder.is_null()
+      && !parameter_resolver.is_null() && stream_decoder.is_null() && batch_plan.is_null()
     sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
       && postgres_sql.is_null() && postgres_len == 0
     postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0
@@ -3361,6 +3365,82 @@ pub fn next<R>(borrow mut stream: rows<R>) -> Result<Option<R>, Error> {
       item: "db.rows.header".clone(),
       message: "invalid database rows resource".clone(),
     }))
+  }
+}
+
+pub fn next_batch<R>(
+  borrow mut stream: rows<R>,
+  max_rows: i64,
+) -> Result<Option<batch<R>>, Error> {
+  unsafe {
+    driver := pkg.db.internal.resource.rows_driver(resource.raw(resource.borrow(stream)))
+    if driver == 1 {
+      return pkg.db.internal.descriptor.next_batch_sqlite(stream, max_rows)
+    }
+    if driver == 2 {
+      return pkg.db.internal.descriptor.next_batch_postgres(stream, max_rows)
+    }
+    return Err(Error.InvalidQuery(ContractError {
+      query_id: None,
+      item: "db.rows.header".clone(),
+      message: "invalid database rows resource".clone(),
+    }))
+  }
+}
+
+pub fn batch_len<R>(borrow values: batch<R>) -> Result<i64, Error> {
+  unsafe {
+    wrapper := resource.raw(resource.borrow(values))
+    length := pkg.db.internal.resource.batch_length(wrapper)
+    if length < 0 {
+      return Err(Error.InvalidQuery(ContractError {
+        query_id: None,
+        item: "db.batch.header".clone(),
+        message: "invalid database batch resource".clone(),
+      }))
+    }
+    return Ok(length)
+  }
+}
+
+pub fn batch_row<R>(
+  borrow values: batch<R>,
+  index: i64,
+) -> Result<Option<R>, Error> {
+  unsafe {
+    reference := resource.borrow(values)
+    wrapper := resource.raw(reference)
+    length := pkg.db.internal.resource.batch_length(wrapper)
+    plan := pkg.db.internal.resource.batch_plan(wrapper)
+    payload := pkg.db.internal.resource.batch_payload(wrapper)
+    if length < 0 || plan.is_null() || payload.is_null() {
+      return Err(Error.InvalidQuery(ContractError {
+        query_id: None,
+        item: "db.batch.header".clone(),
+        message: "invalid database batch resource".clone(),
+      }))
+    }
+    if index < 0 || index >= length { return Ok(None) }
+    row := pkg.db.internal.descriptor.read_batch_row(plan, payload, reference, index)
+    return Ok(Some(row))
+  }
+}
+
+pub fn batch_soa<R: SoaPlain>(borrow values: batch<R>) -> Result<soa<R>, Error> {
+  unsafe {
+    reference := resource.borrow(values)
+    wrapper := resource.raw(reference)
+    length := pkg.db.internal.resource.batch_length(wrapper)
+    plan := pkg.db.internal.resource.batch_plan(wrapper)
+    payload := pkg.db.internal.resource.batch_payload(wrapper)
+    if length < 0 || plan.is_null() || payload.is_null() {
+      return Err(Error.InvalidQuery(ContractError {
+        query_id: None,
+        item: "db.batch.header".clone(),
+        message: "invalid database batch resource".clone(),
+      }))
+    }
+    return Ok(pkg.db.internal.descriptor.read_batch_soa(plan, payload, reference))
   }
 }
 
