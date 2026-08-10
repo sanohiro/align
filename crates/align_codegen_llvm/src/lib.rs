@@ -4403,7 +4403,7 @@ fn static_plan_callback<'a>(
     plan: &'a StaticData,
     offset: u32,
     declarations: &'a HashMap<ProgramCall, ProgramDeclaration>,
-) -> Result<&'a ProgramDeclaration, CodegenError> {
+) -> Result<(&'a ProgramCall, &'a ProgramDeclaration), CodegenError> {
     let malformed = |detail: &str| {
         CodegenError::Lowering(format!("static-data batch plan is malformed: {detail}"))
     };
@@ -4423,7 +4423,7 @@ fn static_plan_callback<'a>(
     {
         return Err(malformed("callback is not a stored program declaration"));
     }
-    Ok(declaration)
+    Ok((target, declaration))
 }
 
 fn static_plan_signature_matches(
@@ -4442,6 +4442,133 @@ fn static_plan_signature_matches(
             region,
             cleanup: hir::ReturnCleanupAbi::None,
         })
+}
+
+#[derive(Clone, Copy)]
+enum StaticBatchCallbackKind {
+    Create,
+    Append { rows_resource: u32 },
+    Finish,
+    Row { batch_resource: u32 },
+    Soa { batch_resource: u32 },
+    Drop,
+}
+
+fn static_batch_callback_body_matches(
+    program: &Program,
+    target: &ProgramCall,
+    row_struct: u32,
+    kind: StaticBatchCallbackKind,
+) -> bool {
+    let Some(function) = program.fns.iter().find(|function| &function.name == target) else {
+        return false;
+    };
+    let [block] = function.blocks.as_slice() else {
+        return false;
+    };
+    if function.entry != block.id {
+        return false;
+    }
+    let Some((operation, prefix)) = block.stmts.split_last() else {
+        return false;
+    };
+    if prefix.iter().any(|statement| {
+        matches!(
+            statement,
+            Stmt::ColumnBatchFinish { .. }
+                | Stmt::ColumnBatchDrop { .. }
+                | Stmt::Let(
+                    _,
+                    Rvalue::ColumnBatchCreate { .. }
+                        | Rvalue::ColumnBatchAppend { .. }
+                        | Rvalue::ColumnBatchRow { .. }
+                        | Rvalue::ColumnBatchSoa { .. }
+                )
+        )
+    }) {
+        return false;
+    }
+    match (kind, operation, &block.term) {
+        (
+            StaticBatchCallbackKind::Create,
+            Stmt::Let(
+                value,
+                Rvalue::ColumnBatchCreate {
+                    max_rows: Operand::Arg(0),
+                    struct_id,
+                },
+            ),
+            Term::Return(Some(Operand::Value(result))),
+        ) => *struct_id == row_struct && value == result,
+        (
+            StaticBatchCallbackKind::Append { rows_resource },
+            Stmt::Let(
+                value,
+                Rvalue::ColumnBatchAppend {
+                    payload: Operand::Arg(0),
+                    struct_id,
+                    ..
+                },
+            ),
+            Term::Return(Some(Operand::Value(result))),
+        ) => {
+            *struct_id == row_struct
+                && value == result
+                && function.slots.get(2) == Some(&Ty::ResourceRef(rows_resource))
+        }
+        (
+            StaticBatchCallbackKind::Finish,
+            Stmt::ColumnBatchFinish {
+                payload: Operand::Arg(0),
+                struct_id,
+            },
+            Term::Return(None),
+        ) => *struct_id == row_struct,
+        (
+            StaticBatchCallbackKind::Row { batch_resource },
+            Stmt::Let(
+                value,
+                Rvalue::ColumnBatchRow {
+                    payload: Operand::Arg(0),
+                    owner: Operand::Arg(1),
+                    index: Operand::Arg(2),
+                    struct_id,
+                    resource,
+                },
+            ),
+            Term::Return(Some(Operand::Value(result))),
+        ) => {
+            *struct_id == row_struct
+                && *resource == batch_resource
+                && value == result
+        }
+        (
+            StaticBatchCallbackKind::Soa { batch_resource },
+            Stmt::Let(
+                value,
+                Rvalue::ColumnBatchSoa {
+                    payload: Operand::Arg(0),
+                    owner: Operand::Arg(1),
+                    struct_id,
+                    resource,
+                },
+            ),
+            Term::Return(Some(Operand::Value(result))),
+        ) => {
+            *struct_id == row_struct
+                && *resource == batch_resource
+                && value == result
+        }
+        (
+            StaticBatchCallbackKind::Drop,
+            Stmt::ColumnBatchDrop {
+                payload: Operand::Arg(0),
+                struct_id,
+            },
+            Term::Return(None),
+        ) => *struct_id == row_struct,
+        _ => false,
+    }
 }
 
 fn validate_batch_plan_record(
@@ -4501,7 +4628,7 @@ fn validate_batch_plan_record(
     });
     let none_borrow = hir::ReturnBorrowSummary::None;
     let none_region = hir::ReturnRegionSummary::None;
-    let create = static_plan_callback(plan, 16, declarations)?;
+    let (create_target, create) = static_plan_callback(plan, 16, declarations)?;
     if !static_plan_signature_matches(
         create,
         vec![i64_ty],
@@ -4511,7 +4638,7 @@ fn validate_batch_plan_record(
     ) {
         return Err(malformed("create callback signature is invalid"));
     }
-    let finish = static_plan_callback(plan, 32, declarations)?;
+    let (finish_target, finish) = static_plan_callback(plan, 32, declarations)?;
     if !static_plan_signature_matches(
         finish,
         vec![Ty::Raw, i64_ty],
@@ -4521,7 +4648,7 @@ fn validate_batch_plan_record(
     ) {
         return Err(malformed("finish callback signature is invalid"));
     }
-    let drop_payload = static_plan_callback(plan, 56, declarations)?;
+    let (drop_target, drop_payload) = static_plan_callback(plan, 56, declarations)?;
     if !static_plan_signature_matches(
         drop_payload,
         vec![Ty::Raw],
@@ -4532,7 +4659,7 @@ fn validate_batch_plan_record(
         return Err(malformed("drop callback signature is invalid"));
     }
 
-    let row = static_plan_callback(plan, 40, declarations)?;
+    let (row_target, row) = static_plan_callback(plan, 40, declarations)?;
     let Some(Ty::ResourceRef(batch_resource)) = row.signature.params.get(1).copied() else {
         return Err(malformed("row callback batch resource is invalid"));
     };
@@ -4594,7 +4721,7 @@ fn validate_batch_plan_record(
         return Err(malformed("SoA flag does not match the Row"));
     }
 
-    let append = static_plan_callback(plan, 24, declarations)?;
+    let (append_target, append) = static_plan_callback(plan, 24, declarations)?;
     let Some(Ty::ResourceRef(rows_resource)) = append.signature.params.get(2).copied() else {
         return Err(malformed("append callback rows resource is invalid"));
     };
@@ -4610,8 +4737,8 @@ fn validate_batch_plan_record(
         return Err(malformed("append callback signature is invalid"));
     }
 
-    if soa {
-        let soa_callback = static_plan_callback(plan, 48, declarations)?;
+    let soa_callback = if soa {
+        let (soa_target, soa_callback) = static_plan_callback(plan, 48, declarations)?;
         let roots_borrow = hir::ReturnBorrowSummary::Roots {
             params: vec![1],
             captures: Vec::new(),
@@ -4629,6 +4756,51 @@ fn validate_batch_plan_record(
         ) {
             return Err(malformed("SoA callback signature is invalid"));
         }
+        Some((soa_target, soa_callback))
+    } else {
+        None
+    };
+
+    for (target, kind, detail) in [
+        (
+            create_target,
+            StaticBatchCallbackKind::Create,
+            "create callback body does not match the Row",
+        ),
+        (
+            append_target,
+            StaticBatchCallbackKind::Append { rows_resource },
+            "append callback body does not match the Row",
+        ),
+        (
+            finish_target,
+            StaticBatchCallbackKind::Finish,
+            "finish callback body does not match the Row",
+        ),
+        (
+            row_target,
+            StaticBatchCallbackKind::Row { batch_resource },
+            "row callback body does not match the Row",
+        ),
+        (
+            drop_target,
+            StaticBatchCallbackKind::Drop,
+            "drop callback body does not match the Row",
+        ),
+    ] {
+        if !static_batch_callback_body_matches(program, target, row_struct, kind) {
+            return Err(malformed(detail));
+        }
+    }
+    if let Some((target, _)) = soa_callback
+        && !static_batch_callback_body_matches(
+            program,
+            target,
+            row_struct,
+            StaticBatchCallbackKind::Soa { batch_resource },
+        )
+    {
+        return Err(malformed("SoA callback body does not match the Row"));
     }
     Ok(())
 }
@@ -17290,7 +17462,10 @@ mod tests {
                         slots: Vec<Ty>,
                         ret: Ty,
                         return_borrow: hir::ReturnBorrowSummary,
-                        return_region: hir::ReturnRegionSummary| {
+                        return_region: hir::ReturnRegionSummary,
+                        value_tys: Vec<Ty>,
+                        stmts: Vec<Stmt>,
+                        term: Term| {
             let params = (0..slots.len() as u32).collect::<Vec<_>>();
             Function {
                 name: program_call(name),
@@ -17303,24 +17478,33 @@ mod tests {
                 return_region,
                 return_cleanup: hir::ReturnCleanupAbi::None,
                 slots,
-                value_tys: Vec::new(),
+                value_tys,
                 blocks: vec![Block {
                     id: 0,
-                    stmts: Vec::new(),
+                    stmts,
                     stmt_lines: Vec::new(),
-                    term: Term::Unreachable,
+                    term,
                 }],
                 entry: 0,
                 exportable: false,
             }
         };
-        let callbacks = vec![
+        let mut callbacks = vec![
             callback(
                 "batch_create",
                 vec![i64_ty],
                 Ty::Raw,
                 none_borrow.clone(),
                 none_region.clone(),
+                vec![Ty::Raw],
+                vec![Stmt::Let(
+                    0,
+                    Rvalue::ColumnBatchCreate {
+                        max_rows: Operand::Arg(0),
+                        struct_id: 0,
+                    },
+                )],
+                Term::Return(Some(Operand::Value(0))),
             ),
             callback(
                 "batch_append",
@@ -17328,6 +17512,28 @@ mod tests {
                 i32_ty,
                 none_borrow.clone(),
                 none_region.clone(),
+                vec![
+                    Ty::Option(Scalar::Int(IntTy {
+                        bits: 64,
+                        signed: true,
+                    })),
+                    i32_ty,
+                ],
+                vec![
+                    Stmt::Let(
+                        0,
+                        Rvalue::OptionSome(Operand::Const(Const::Int(0, i64_ty))),
+                    ),
+                    Stmt::Let(
+                        1,
+                        Rvalue::ColumnBatchAppend {
+                            payload: Operand::Arg(0),
+                            inputs: vec![ColumnBatchInput::Scalar(Operand::Value(0))],
+                            struct_id: 0,
+                        },
+                    ),
+                ],
+                Term::Return(Some(Operand::Value(1))),
             ),
             callback(
                 "batch_finish",
@@ -17335,6 +17541,12 @@ mod tests {
                 Ty::Unit,
                 none_borrow.clone(),
                 none_region.clone(),
+                Vec::new(),
+                vec![Stmt::ColumnBatchFinish {
+                    payload: Operand::Arg(0),
+                    struct_id: 0,
+                }],
+                Term::Return(None),
             ),
             callback(
                 "batch_row",
@@ -17342,22 +17554,95 @@ mod tests {
                 Ty::Struct(0),
                 none_borrow.clone(),
                 none_region.clone(),
+                vec![Ty::Struct(0)],
+                vec![Stmt::Let(
+                    0,
+                    Rvalue::ColumnBatchRow {
+                        payload: Operand::Arg(0),
+                        owner: Operand::Arg(1),
+                        index: Operand::Arg(2),
+                        struct_id: 0,
+                        resource: 1,
+                    },
+                )],
+                Term::Return(Some(Operand::Value(0))),
             ),
             callback(
                 "batch_soa",
                 vec![Ty::Raw, Ty::ResourceRef(1)],
                 Ty::Soa(0),
-                roots_borrow,
-                roots_region,
+                roots_borrow.clone(),
+                roots_region.clone(),
+                vec![Ty::Soa(0)],
+                vec![Stmt::Let(
+                    0,
+                    Rvalue::ColumnBatchSoa {
+                        payload: Operand::Arg(0),
+                        owner: Operand::Arg(1),
+                        struct_id: 0,
+                        resource: 1,
+                    },
+                )],
+                Term::Return(Some(Operand::Value(0))),
             ),
             callback(
                 "batch_drop",
                 vec![Ty::Raw],
                 Ty::Unit,
-                none_borrow,
-                none_region,
+                none_borrow.clone(),
+                none_region.clone(),
+                Vec::new(),
+                vec![Stmt::ColumnBatchDrop {
+                    payload: Operand::Arg(0),
+                    struct_id: 0,
+                }],
+                Term::Return(None),
             ),
         ];
+        callbacks.extend([
+            callback(
+                "other_create",
+                vec![i64_ty],
+                Ty::Raw,
+                none_borrow.clone(),
+                none_region.clone(),
+                vec![Ty::Raw],
+                vec![Stmt::Let(
+                    0,
+                    Rvalue::ColumnBatchCreate {
+                        max_rows: Operand::Arg(0),
+                        struct_id: 1,
+                    },
+                )],
+                Term::Return(Some(Operand::Value(0))),
+            ),
+            callback(
+                "other_finish",
+                vec![Ty::Raw, i64_ty],
+                Ty::Unit,
+                none_borrow.clone(),
+                none_region.clone(),
+                Vec::new(),
+                vec![Stmt::ColumnBatchFinish {
+                    payload: Operand::Arg(0),
+                    struct_id: 1,
+                }],
+                Term::Return(None),
+            ),
+            callback(
+                "other_drop",
+                vec![Ty::Raw],
+                Ty::Unit,
+                none_borrow,
+                none_region,
+                Vec::new(),
+                vec![Stmt::ColumnBatchDrop {
+                    payload: Operand::Arg(0),
+                    struct_id: 1,
+                }],
+                Term::Return(None),
+            ),
+        ]);
         let resource = |kind: &str| hir::ResourceDef {
             name: format!("pkg.db${kind}$S3_Row"),
             source_name: format!("pkg.db${kind}$S3_Row"),
@@ -17375,6 +17660,22 @@ mod tests {
                 name: "id".to_owned(),
                 ty: i64_ty,
             }],
+            align: None,
+            c_repr: false,
+        };
+        let other = StructDef {
+            name: "Other".to_owned(),
+            source_name: "Other".to_owned(),
+            fields: vec![
+                align_sema::hir::FieldDef {
+                    name: "left".to_owned(),
+                    ty: i64_ty,
+                },
+                align_sema::hir::FieldDef {
+                    name: "right".to_owned(),
+                    ty: i64_ty,
+                },
+            ],
             align: None,
             c_repr: false,
         };
@@ -17440,7 +17741,7 @@ mod tests {
                     externs: Vec::new(),
                     imported_fns: Vec::new(),
                     link_libs: Vec::new(),
-                    structs: vec![row.clone()],
+                    structs: vec![row.clone(), other.clone()],
                     enums: Vec::new(),
                     resources: vec![resource("rows"), resource("batch")],
                     tagged_types: Vec::new(),
@@ -17489,6 +17790,27 @@ mod tests {
                     .to_string()
                     .contains("static-data batch plan is malformed"),
                 "offset {offset} produced unexpected diagnostic: {error}"
+            );
+        }
+        for (offset, target) in [
+            (16, "other_create"),
+            (32, "other_finish"),
+            (56, "other_drop"),
+        ] {
+            let mut malformed = plan.clone();
+            malformed
+                .relocations
+                .iter_mut()
+                .find(|relocation| relocation.offset == offset)
+                .expect("raw-only callback ordinal")
+                .target = StaticDataTarget::Function(program_call(target));
+            let error = emit_descriptor(malformed)
+                .expect_err("cross-Row raw-only batch callback must fail before LLVM");
+            assert!(
+                error
+                    .to_string()
+                    .contains("static-data batch plan is malformed"),
+                "offset {offset} produced unexpected cross-Row diagnostic: {error}"
             );
         }
     }
