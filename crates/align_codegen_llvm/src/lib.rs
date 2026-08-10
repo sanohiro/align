@@ -1628,12 +1628,32 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                 .collect::<Option<Vec<_>>>()
         })
     };
-    let batch_resource = |resource: u32| {
+    let batch_resource = |resource: u32, struct_id: u32| {
+        let Some(row) = program.structs.get(struct_id as usize) else {
+            return false;
+        };
+        let direct = format!("pkg.db$batch$S{}_{}", row.name.len(), row.name);
+        let reconstructed_row = row
+            .name
+            .chars()
+            .map(|character| match character {
+                '.' | '$' => '_',
+                other => other,
+            })
+            .collect::<String>();
+        let reconstructed = format!(
+            "pkg.db$batch$S{}_{}",
+            reconstructed_row.len(),
+            reconstructed_row
+        );
         program.resources.get(resource as usize).is_some_and(|definition| {
             definition.declaring_module == "pkg.db"
                 && definition.generic_arity == 1
-                && definition.name.starts_with("pkg.db$batch$")
-                && definition.source_name.starts_with("pkg.db$batch$")
+                && matches!(
+                    definition.name.as_str(),
+                    name if name == direct || name == reconstructed
+                )
+                && definition.source_name == definition.name
         })
     };
     for function in &program.fns {
@@ -1786,7 +1806,7 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                         resource,
                     } => {
                         batch_fields(*struct_id).is_some()
-                            && batch_resource(*resource)
+                            && batch_resource(*resource, *struct_id)
                             && operand_ty(function, payload) == Some(Ty::Raw)
                             && operand_ty(function, owner)
                                 == Some(Ty::ResourceRef(*resource))
@@ -1811,7 +1831,7 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                                 )
                             })
                         })
-                            && batch_resource(*resource)
+                            && batch_resource(*resource, *struct_id)
                             && operand_ty(function, payload) == Some(Ty::Raw)
                             && operand_ty(function, owner)
                                 == Some(Ty::ResourceRef(*resource))
@@ -17036,13 +17056,118 @@ mod tests {
                         name: "owned".to_string(),
                         ty: Ty::String,
                     }],
-                    ..row
+                    ..row.clone()
                 },
             ),
         ] {
             let error = malformed.expect_err("malformed column-batch MIR must fail");
             assert!(
                 error.to_string().contains("resource operation contract mismatch"),
+                "unexpected diagnostic: {error}"
+            );
+        }
+
+        let batch_read = |soa: bool, resource_name: &str| {
+            let resource = hir::ResourceDef {
+                name: resource_name.to_owned(),
+                source_name: resource_name.to_owned(),
+                declaring_module: "pkg.db".to_owned(),
+                generic_arity: 1,
+                drop_hook: "pkg.db.internal.resource$drop_batch".to_owned(),
+                drop_thunk: "__align_resource_drop$pkg.db$batch".to_owned(),
+                representation_version: 1,
+                drop_abi_fingerprint: *b"align-res-drop-1",
+            };
+            let mut slots = vec![Ty::Raw, Ty::ResourceRef(0)];
+            let mut params = vec![0, 1];
+            let rvalue = if soa {
+                Rvalue::ColumnBatchSoa {
+                    payload: Operand::Arg(0),
+                    owner: Operand::Arg(1),
+                    struct_id: 0,
+                    resource: 0,
+                }
+            } else {
+                slots.push(i64_ty);
+                params.push(2);
+                Rvalue::ColumnBatchRow {
+                    payload: Operand::Arg(0),
+                    owner: Operand::Arg(1),
+                    index: Operand::Arg(2),
+                    struct_id: 0,
+                    resource: 0,
+                }
+            };
+            let ret = if soa { Ty::Soa(0) } else { Ty::Struct(0) };
+            let function = Function {
+                name: program_call("batch_read"),
+                params,
+                param_modes: vec![align_ast::ParamMode::ByValue; slots.len()],
+                borrow_mut_cleanup_slots: vec![None; slots.len()],
+                ret,
+                return_borrow: if soa {
+                    hir::ReturnBorrowSummary::Roots {
+                        params: vec![1],
+                        captures: Vec::new(),
+                    }
+                } else {
+                    hir::ReturnBorrowSummary::None
+                },
+                return_region: if soa {
+                    hir::ReturnRegionSummary::Roots {
+                        params: vec![1],
+                        captures: Vec::new(),
+                    }
+                } else {
+                    hir::ReturnRegionSummary::None
+                },
+                return_cleanup: hir::ReturnCleanupAbi::None,
+                slot_align: vec![None; slots.len()],
+                slots,
+                value_tys: vec![ret],
+                blocks: vec![Block {
+                    id: 0,
+                    stmts: vec![Stmt::Let(0, rvalue)],
+                    stmt_lines: Vec::new(),
+                    term: Term::Return(Some(Operand::Value(0))),
+                }],
+                entry: 0,
+                exportable: false,
+            };
+            emit_llvm_ir(
+                &Program {
+                    fns: vec![function],
+                    externs: Vec::new(),
+                    imported_fns: Vec::new(),
+                    link_libs: Vec::new(),
+                    structs: vec![row.clone()],
+                    enums: Vec::new(),
+                    resources: vec![resource],
+                    tagged_types: Vec::new(),
+                    fn_types: Vec::new(),
+                    tuples: Vec::new(),
+                },
+                &BuildTarget::Baseline,
+                false,
+                &[],
+                None,
+            )
+        };
+        for valid in [
+            batch_read(false, "pkg.db$batch$S3_Row"),
+            batch_read(true, "pkg.db$batch$S3_Row"),
+        ] {
+            assert!(valid.is_ok(), "valid batch read rejected: {valid:?}");
+        }
+        for malformed in [
+            batch_read(false, "pkg.db$batch$S5_Other"),
+            batch_read(true, "pkg.db$batch$S5_Other"),
+        ] {
+            let error = malformed.expect_err("mismatched batch resource/Row must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("resource operation contract mismatch"),
                 "unexpected diagnostic: {error}"
             );
         }

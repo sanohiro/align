@@ -7525,6 +7525,7 @@ fn lower_call_fn_value(b: &mut Builder, e: &hir::Expr) -> Operand {
 #[inline(never)]
 fn lower_raw_call(b: &mut Builder, e: &hir::Expr) -> Operand {
     let hir::ExprKind::RawCall {
+        guard,
         callee,
         args,
         param_tys,
@@ -7536,6 +7537,23 @@ fn lower_raw_call(b: &mut Builder, e: &hir::Expr) -> Operand {
     else {
         unreachable!("lower_raw_call on a non-raw-call expression");
     };
+    if let Some(guard) = guard.as_deref() {
+        let valid = lower_expr(b, guard);
+        if !lowering_continues(b) {
+            return Operand::Const(Const::Unit);
+        }
+        let ok = b.new_block();
+        let fail = b.new_block();
+        b.terminate(Term::Branch(valid, ok, fail));
+        b.cur = fail;
+        let aborted = b.fresh_value(Ty::Unit);
+        b.push(Stmt::Let(
+            aborted,
+            Rvalue::Call(DirectCall::Runtime(RuntimeKey::ProcessAbort), vec![]),
+        ));
+        b.terminate(Term::Unreachable);
+        b.cur = ok;
+    }
     let callee = lower_expr(b, callee);
     if !lowering_continues(b) {
         return Operand::Const(Const::Unit);

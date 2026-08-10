@@ -12602,6 +12602,7 @@ fn hir_body_validator_prepared_binder_bridge_fails_closed() {
     );
     let call = body_test_expr(
         hir::ExprKind::RawCall {
+            guard: None,
             callee: Box::new(callee),
             args: vec![
                 body_test_expr(hir::ExprKind::Local(1), Ty::Raw),
@@ -12705,6 +12706,120 @@ fn hir_body_validator_prepared_binder_bridge_fails_closed() {
     wrong_resource_identity.resources[statement_id as usize].name =
         "pkg.db$stmt$S5_Other$S6_Record".to_string();
     assert!(!body_core_metadata_is_valid(&wrong_resource_identity));
+}
+
+#[test]
+fn hir_body_validator_batch_plan_guard_fails_closed() {
+    let mut program = baseline_program();
+    program.fns.push(body_test_parameter_function(
+        "pkg.db.internal.resource$batch_plan_valid",
+        Ty::Raw,
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::Bool(true),
+                Ty::Bool,
+            ))),
+        },
+        Ty::Bool,
+    ));
+    let i64_ty = Ty::Int(IntTy {
+        bits: 64,
+        signed: true,
+    });
+    let plan = || body_test_expr(hir::ExprKind::Local(0), Ty::Raw);
+    let guard = body_test_expr(
+        hir::ExprKind::Call {
+            func: "pkg.db.internal.resource$batch_plan_valid".to_string(),
+            args: vec![plan()],
+            type_args: Vec::new(),
+        },
+        Ty::Bool,
+    );
+    let callee = body_test_expr(
+        hir::ExprKind::RawPointerLoad {
+            ptr: Box::new(plan()),
+            offset: Box::new(body_test_expr(hir::ExprKind::Int(16), i64_ty)),
+        },
+        Ty::Raw,
+    );
+    let raw_call = body_test_expr(
+        hir::ExprKind::RawCall {
+            guard: Some(Box::new(guard)),
+            callee: Box::new(callee),
+            args: vec![body_test_expr(hir::ExprKind::Int(64), i64_ty)],
+            param_tys: vec![i64_ty],
+            param_modes: vec![align_ast::ParamMode::ByValue],
+            return_borrow: ReturnBorrowSummary::None,
+            return_region: ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
+        },
+        Ty::Raw,
+    );
+    let mut owner = body_test_named_function(
+        "pkg.db.internal.resource$batch_plan_owner",
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::Unsafe(hir::Block {
+                    stmts: Vec::new(),
+                    value: Some(Box::new(raw_call)),
+                }),
+                Ty::Raw,
+            ))),
+        },
+        vec![
+            body_test_local(0, "plan", Ty::Raw, false, true),
+            body_test_local(1, "other", Ty::Raw, false, true),
+        ],
+        Ty::Raw,
+    );
+    owner.params = vec![0, 1];
+    owner.param_modes = vec![align_ast::ParamMode::ByValue, align_ast::ParamMode::ByValue];
+    program.fns.push(owner);
+    assert!(body_core_metadata_is_valid(&program));
+
+    fn batch_raw_call(candidate: &mut hir::Program) -> &mut hir::Expr {
+        let unsafe_expression = candidate
+            .fns
+            .last_mut()
+            .and_then(|function| function.body.value.as_deref_mut())
+            .expect("batch plan unsafe expression");
+        let hir::ExprKind::Unsafe(block) = &mut unsafe_expression.kind else {
+            panic!("batch plan unsafe block")
+        };
+        block.value.as_deref_mut().expect("batch plan raw call")
+    }
+
+    let mut missing_guard = program.clone();
+    let hir::ExprKind::RawCall { guard, .. } = &mut batch_raw_call(&mut missing_guard).kind else {
+        unreachable!()
+    };
+    *guard = None;
+    assert!(!body_core_metadata_is_valid(&missing_guard));
+
+    let mut mismatched_plan = program.clone();
+    let hir::ExprKind::RawCall {
+        guard: Some(guard), ..
+    } = &mut batch_raw_call(&mut mismatched_plan).kind
+    else {
+        unreachable!()
+    };
+    let hir::ExprKind::Call { args, .. } = &mut guard.kind else {
+        unreachable!()
+    };
+    args[0].kind = hir::ExprKind::Local(1);
+    assert!(!body_core_metadata_is_valid(&mismatched_plan));
+
+    let mut forged_predicate = program;
+    let hir::ExprKind::RawCall { guard, .. } = &mut batch_raw_call(&mut forged_predicate).kind else {
+        unreachable!()
+    };
+    *guard = Some(Box::new(body_test_expr(
+        hir::ExprKind::Bool(true),
+        Ty::Bool,
+    )));
+    assert!(!body_core_metadata_is_valid(&forged_predicate));
 }
 
 #[test]

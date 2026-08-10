@@ -665,7 +665,15 @@ fn walk_body_records<'a>(
                     work.push((BodyRecord::Expr(callee), child_depth));
                     work.extend(args.iter().map(|arg| (BodyRecord::Expr(arg), child_depth)));
                 }
-                ExprKind::RawCall { callee, args, .. } => {
+                ExprKind::RawCall {
+                    guard,
+                    callee,
+                    args,
+                    ..
+                } => {
+                    if let Some(guard) = guard.as_deref() {
+                        work.push((BodyRecord::Expr(guard), child_depth));
+                    }
                     work.push((BodyRecord::Expr(callee), child_depth));
                     work.extend(args.iter().map(|arg| (BodyRecord::Expr(arg), child_depth)));
                 }

@@ -618,7 +618,7 @@ pub fn batch_plan_valid(plan: raw) -> bool {
     tail_reserved: i64 := raw.load(plan, 64)
     soa_valid := if flags & 1 == 0 { soa.is_null() } else { !soa.is_null() }
     return version == 1 && flags & 254 == 0 && reserved8 == 0 && reserved16 == 0
-      && field_count > 0 && reserved32 == 0 && !create.is_null() && !append.is_null()
+      && reserved32 == 0 && !create.is_null() && !append.is_null()
       && !finish.is_null() && !row.is_null() && soa_valid && !drop_payload.is_null()
       && tail_reserved == 0
   }

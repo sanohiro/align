@@ -1411,9 +1411,10 @@ fn install_static_descriptor_data(
                 mir.resources.push(resource);
                 id
             };
-            let soa_plain = row_definition.fields.iter().all(|field| {
-                matches!(field.ty, Ty::Bool | Ty::Char | Ty::Int(_) | Ty::Float(_) | Ty::Str)
-            });
+            let soa_plain = !row_definition.fields.is_empty()
+                && row_definition.fields.iter().all(|field| {
+                    matches!(field.ty, Ty::Bool | Ty::Char | Ty::Int(_) | Ty::Float(_) | Ty::Str)
+                });
             let batch_create_name = program_call(&format!("{symbol}$batch_create_v1"))?;
             let batch_append_name = program_call(&format!("{symbol}$batch_append_v1"))?;
             let batch_finish_name = program_call(&format!("{symbol}$batch_finish_v1"))?;

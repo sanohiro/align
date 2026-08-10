@@ -4904,11 +4904,19 @@ impl<'a> BodyValidator<'a> {
                 }
                 push_expr!(callee, context.clone());
             }
-            hir::ExprKind::RawCall { callee, args, .. } => {
+            hir::ExprKind::RawCall {
+                guard,
+                callee,
+                args,
+                ..
+            } => {
                 for arg in args.iter().rev() {
                     push_expr!(arg, context.clone());
                 }
                 push_expr!(callee, context.clone());
+                if let Some(guard) = guard.as_deref() {
+                    push_expr!(guard, context.clone());
+                }
             }
             hir::ExprKind::TaskGroup(block) => {
                 let mut child = context.clone();
@@ -6163,6 +6171,7 @@ impl<'a> BodyValidator<'a> {
                 Some((Ty::Str, pointer.falls, pointer.breaks))
             }
             hir::ExprKind::RawCall {
+                guard,
                 callee,
                 args,
                 param_tys,
@@ -6171,6 +6180,13 @@ impl<'a> BodyValidator<'a> {
                 return_region,
                 return_cleanup,
             } => {
+                let guard_flow = match guard.as_deref() {
+                    Some(guard) => Some(self.expr_flow(guard)?),
+                    None => None,
+                };
+                if guard_flow.as_ref().is_some_and(|flow| flow.ty != Ty::Bool) {
+                    return None;
+                }
                 let callee_flow = self.expr_flow(callee)?;
                 let hir::ExprKind::RawPointerLoad { ptr, offset } = &callee.kind else {
                     return None;
@@ -6241,6 +6257,8 @@ impl<'a> BodyValidator<'a> {
                 });
                 let batch_signature_ok = self.batch_plan_call_signature_ok(
                     context,
+                    guard.as_deref(),
+                    ptr,
                     offset,
                     args,
                     param_tys,
@@ -6254,6 +6272,9 @@ impl<'a> BodyValidator<'a> {
                     && rows_resource.is_none()
                     && !batch_signature_ok
                 {
+                    return None;
+                }
+                if !batch_signature_ok && guard.is_some() {
                     return None;
                 }
                 let signature_ok = batch_signature_ok || match offset {
@@ -6382,7 +6403,9 @@ impl<'a> BodyValidator<'a> {
                 if !signature_ok {
                     return None;
                 }
-                let mut flows = vec![callee_flow];
+                let mut flows = Vec::with_capacity(arg_flows.len() + 2);
+                flows.extend(guard_flow);
+                flows.push(callee_flow);
                 flows.extend(arg_flows);
                 let (falls, breaks) = strict_flow(&flows);
                 Some((expression.ty, falls, breaks))
@@ -9688,11 +9711,14 @@ impl<'a> BodyValidator<'a> {
     /// Validate the complete closed ABI of an A1 producer batch-plan thunk. Unlike descriptor
     /// header callbacks, a plan pointer is copied through stmt/rows/batch resource state before it
     /// is called, so it cannot remain syntactically rooted in the original `$static` field. Sema is
-    /// the only HIR producer for `RawCall`; this exact signature/resource check keeps the trusted
-    /// package bridge closed while allowing that producer-owned pointer to cross generations.
+    /// the only HIR producer for `RawCall`; this exact signature/resource check and same-local
+    /// structural guard keep the trusted package bridge closed while allowing that producer-owned
+    /// pointer to cross generations.
     fn batch_plan_call_signature_ok(
         &self,
         context: &BodyContext,
+        guard: Option<&hir::Expr>,
+        plan: &hir::Expr,
         offset: u32,
         args: &[hir::Expr],
         param_tys: &[Ty],
@@ -9701,7 +9727,29 @@ impl<'a> BodyValidator<'a> {
         return_borrow: &hir::ReturnBorrowSummary,
         return_region: &hir::ReturnRegionSummary,
     ) -> bool {
+        let hir::ExprKind::Local(plan) = plan.kind else {
+            return false;
+        };
+        let Some(hir::Expr {
+            kind:
+                hir::ExprKind::Call {
+                    func,
+                    args: guard_args,
+                    type_args,
+                },
+            ty: Ty::Bool,
+            ..
+        }) = guard
+        else {
+            return false;
+        };
+        let guard_matches = func == "pkg.db.internal.resource$batch_plan_valid"
+            && type_args.is_empty()
+            && guard_args.len() == 1
+            && guard_args[0].ty == Ty::Raw
+            && matches!(guard_args[0].kind, hir::ExprKind::Local(local) if local == plan);
         if !self.static_descriptor_body_ok(context)
+            || !guard_matches
             || param_modes
                 .iter()
                 .any(|mode| *mode != align_ast::ParamMode::ByValue)
@@ -9779,7 +9827,17 @@ impl<'a> BodyValidator<'a> {
                             "pkg.db$batch${}",
                             body_ty_mangle(return_ty, self.program)
                         )
-                    && roots_one(1)
+                    && if align_sema::ty_may_borrow(
+                        return_ty,
+                        &self.program.structs,
+                        &self.program.tuples,
+                        &self.program.enums,
+                        &self.program.tagged_types,
+                    ) {
+                        roots_one(1)
+                    } else {
+                        no_borrow
+                    }
             }
             48 => {
                 let Some(resource) = resource(1, "pkg.db$batch$") else {

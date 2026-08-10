@@ -20,6 +20,8 @@ const POSTGRES_STUB: &str = include_str!("fixtures/pkg_db_q2_postgres_stub.c");
 
 const TEST_HELPER: &str = r#"module pkg.db.a1_test
 import pkg.db
+import pkg.db.internal.descriptor
+import pkg.db.internal.resource
 
 pub fn set_rows_terminal<R>(borrow mut rows: pkg.db.rows<R>, state: u8) {
   unsafe { raw.store(resource.raw(resource.borrow(rows)), 5, state) }
@@ -27,6 +29,17 @@ pub fn set_rows_terminal<R>(borrow mut rows: pkg.db.rows<R>, state: u8) {
 
 pub fn set_batch_tail<R>(borrow values: pkg.db.batch<R>, tail: i64) {
   unsafe { raw.store(resource.raw(resource.borrow(values)), 40, tail) }
+}
+
+pub fn zero_column_plan_valid<P, R>(statement: pkg.db.query<P, R>) -> bool {
+  unsafe {
+    plan := pkg.db.internal.descriptor.batch_plan(statement)
+    if !pkg.db.internal.resource.batch_plan_valid(plan) { return false }
+    flags: u8 := raw.load(plan, 4)
+    fields: u32 := raw.load(plan, 8)
+    soa: raw := raw.load(plan, 48)
+    return flags == 0 && fields == 0 && soa.is_null()
+  }
 }
 "#;
 
@@ -36,6 +49,7 @@ import pkg.db.postgres
 import pkg.db.sqlite
 
 pub Params { base: i64 }
+pub EmptyRow {}
 pub PgParams { first_user_id: i64, last_user_id: i64 }
 pub PgViewParams { id: i64, label: str, payload: slice<u8> }
 
@@ -107,6 +121,12 @@ pub fn plain() -> pkg.db.query<Params, PlainRow> = pkg.db.sqlite.query(
 
 pub fn rich() -> pkg.db.query<Params, RichRow> = pkg.db.sqlite.query(
   "SELECT CAST(:base AS INTEGER) AS id, 'zero' AS label, X'00FF' AS payload, NULL AS note UNION ALL SELECT CAST(:base + 1 AS INTEGER), 'one-label-longer-than-sixty-four-bytes-to-force-child-block-growth-abcdefghij', X'01020300', 'present'",
+  [],
+  [],
+)
+
+pub fn zero_column() -> pkg.db.query<Params, EmptyRow> = pkg.db.sqlite.query(
+  "SELECT 1 WHERE :base = 0",
   [],
   [],
 )
@@ -197,6 +217,40 @@ fn main() -> i32 = 0
 }
 
 #[test]
+fn zero_column_query_keeps_a_valid_non_soa_batch_plan() {
+    if !backend_available() {
+        return;
+    }
+    let main = r#"module main
+import pkg.db.a1_test
+import pkg.db
+import app.batch_query
+
+fn read_empty(borrow values: pkg.db.batch<app.batch_query.EmptyRow>) -> Result<Option<app.batch_query.EmptyRow>, pkg.db.Error> {
+  return pkg.db.batch_row(values, 0)
+}
+
+fn main() -> i32 {
+  if pkg.db.a1_test.zero_column_plan_valid(app.batch_query.zero_column()) { return 42 }
+  return 1
+}
+"#;
+    let output = build_and_run_multi_with_static_descriptors(
+        "pkg-db-a1-zero-column-plan",
+        &package_files(main),
+        "main.align",
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "status: {:?}; stdout: {}; stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
 fn batch_rows_and_soa_views_cannot_escape_or_survive_move() {
     let cases = [
         (
@@ -255,7 +309,11 @@ fn bad(borrow connection: pkg.db.conn) -> i32 {
         );
         assert!(
             checked.whole_errors && checked.per_unit_errors,
-            "{name} unexpectedly accepted in whole/per-unit checking"
+            "{name} unexpectedly accepted (whole_errors={}, per_unit_errors={}):\nwhole diagnostics:\n{}\nper-unit diagnostics:\n{}",
+            checked.whole_errors,
+            checked.per_unit_errors,
+            checked.whole_diags,
+            checked.per_unit_diags,
         );
     }
 }

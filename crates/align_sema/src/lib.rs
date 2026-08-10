@@ -11927,7 +11927,15 @@ impl EffectScan<'_> {
                 walk!(ptr);
                 self.impure_direct = true;
             }
-            ExprKind::RawCall { callee, args, .. } => {
+            ExprKind::RawCall {
+                guard,
+                callee,
+                args,
+                ..
+            } => {
+                if let Some(guard) = guard.as_deref() {
+                    walk!(guard);
+                }
                 walk!(callee);
                 for arg in args {
                     walk!(arg);
@@ -16726,7 +16734,15 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(offset, depth);
             }
             ExprKind::StaticDescriptorView { ptr, .. } => self.walk(ptr, depth),
-            ExprKind::RawCall { callee, args, .. } => {
+            ExprKind::RawCall {
+                guard,
+                callee,
+                args,
+                ..
+            } => {
+                if let Some(guard) = guard.as_deref() {
+                    self.walk(guard, depth);
+                }
                 self.walk(callee, depth);
                 for arg in args {
                     self.walk(arg, depth);
@@ -24118,11 +24134,15 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, ptr, moved, false, false);
             }
             ExprKind::RawCall {
+                guard,
                 callee,
                 args,
                 param_modes,
                 ..
             } => {
+                if let Some(guard) = guard.as_deref() {
+                    move_expr!(self, guard, moved, false, false);
+                }
                 move_expr!(self, callee, moved, false, false);
                 for (index, argument) in args.iter().enumerate() {
                     let consuming = !matches!(
@@ -30661,6 +30681,7 @@ impl<'a, 't> Checker<'a, 't> {
                 );
                 return err;
             }
+            let guard_plan = plan.clone();
             let callee = Expr {
                 kind: ExprKind::RawPointerLoad {
                     ptr: Box::new(plan),
@@ -30677,8 +30698,9 @@ impl<'a, 't> Checker<'a, 't> {
                 span,
             };
             self.constrain(Ty::Unit, expected, span);
-            return Expr {
+            let call = Expr {
                 kind: ExprKind::RawCall {
+                    guard: Some(Box::new(Self::batch_plan_guard(guard_plan, span))),
                     callee: Box::new(callee),
                     args: vec![payload],
                     param_tys: vec![Ty::Raw],
@@ -30690,6 +30712,7 @@ impl<'a, 't> Checker<'a, 't> {
                 ty: Ty::Unit,
                 span,
             };
+            return call;
         }
         if matches!(
             method,
@@ -31297,6 +31320,7 @@ impl<'a, 't> Checker<'a, 't> {
             self.constrain(ret, expected, span);
             return Expr {
                 kind: ExprKind::RawCall {
+                    guard: None,
                     callee: Box::new(callee),
                     args: vec![driver, detail, index],
                     param_tys: vec![u8_ty, u8_ty, i64_ty],
@@ -31332,6 +31356,7 @@ impl<'a, 't> Checker<'a, 't> {
             self.constrain(ret, expected, span);
             return Expr {
                 kind: ExprKind::RawCall {
+                    guard: None,
                     callee: Box::new(callee),
                     args: vec![name],
                     param_tys: vec![Ty::Str],
@@ -31386,6 +31411,7 @@ impl<'a, 't> Checker<'a, 't> {
         self.constrain(ret, expected, span);
         Expr {
             kind: ExprKind::RawCall {
+                guard: None,
                 callee: Box::new(callee),
                 args: call_args,
                 param_tys,
@@ -31520,6 +31546,7 @@ impl<'a, 't> Checker<'a, 't> {
         self.constrain(ret, expected, span);
         Expr {
             kind: ExprKind::RawCall {
+                guard: None,
                 callee: Box::new(callee),
                 args: vec![context, params],
                 param_tys: vec![Ty::Raw, params_ty],
@@ -31537,6 +31564,21 @@ impl<'a, 't> Checker<'a, 't> {
         self.resource_instances.iter().find_map(|(&id, instance)| {
             (instance.canonical == canonical && instance.args == args).then_some(id)
         })
+    }
+
+    /// Keep every producer-plan indirect call control-dependent on the exact structural validator
+    /// for the same raw local. HIR validation recognizes only this synthesized edge; malformed HIR
+    /// cannot reuse the closed thunk ABI with an unvalidated pointer.
+    fn batch_plan_guard(plan: Expr, span: Span) -> Expr {
+        Expr {
+            kind: ExprKind::Call {
+                func: "pkg.db.internal.resource$batch_plan_valid".to_owned(),
+                args: vec![plan],
+                type_args: Vec::new(),
+            },
+            ty: Ty::Bool,
+            span,
+        }
     }
 
     /// A1 bridge from a validated producer batch plan to its typed thunks. The plan remains an
@@ -31700,11 +31742,19 @@ impl<'a, 't> Checker<'a, 't> {
                     if index.ty == Ty::Error || !self.source_ty_matches(index.ty, i64_ty) {
                         return err();
                     }
+                    let resource_root = ty_may_borrow(
+                        row_ty,
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    )
+                    .then_some(1);
                     (
                         40,
                         vec![payload, reference, index],
                         vec![Ty::Raw, Ty::ResourceRef(resource), i64_ty],
-                        Some(1),
+                        resource_root,
                         row_ty,
                     )
                 } else {
@@ -31730,6 +31780,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
             _ => unreachable!(),
         };
+        let guard_plan = plan.clone();
         let callee = Expr {
             kind: ExprKind::RawPointerLoad {
                 ptr: Box::new(plan),
@@ -31763,8 +31814,9 @@ impl<'a, 't> Checker<'a, 't> {
             )
         };
         self.constrain(ret, expected, span);
-        Expr {
+        let call = Expr {
             kind: ExprKind::RawCall {
+                guard: Some(Box::new(Self::batch_plan_guard(guard_plan, span))),
                 callee: Box::new(callee),
                 param_modes: vec![ast::ParamMode::ByValue; param_tys.len()],
                 args: call_args,
@@ -31775,7 +31827,8 @@ impl<'a, 't> Checker<'a, 't> {
             },
             ty: ret,
             span,
-        }
+        };
+        call
     }
 
     /// Q4b current-row bridge. The rows wrapper retains the producer-owned validator and streaming
@@ -31915,6 +31968,7 @@ impl<'a, 't> Checker<'a, 't> {
         self.constrain(ret, expected, span);
         Expr {
             kind: ExprKind::RawCall {
+                guard: None,
                 callee: Box::new(callee),
                 args: call_args,
                 param_tys,
@@ -41309,11 +41363,15 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ExprKind::StaticDescriptorView { ptr, .. } => self.finalize_expr(ptr),
             ExprKind::RawCall {
+                guard,
                 callee,
                 args,
                 param_tys,
                 ..
             } => {
+                if let Some(guard) = guard.as_deref_mut() {
+                    self.finalize_expr(guard);
+                }
                 self.finalize_expr(callee);
                 for argument in args {
                     self.finalize_expr(argument);
