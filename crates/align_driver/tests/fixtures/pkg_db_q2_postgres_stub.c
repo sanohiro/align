@@ -397,10 +397,6 @@ static void q6_user_result(FakeResult *result, int parameter, int last_parameter
     result->names[column] = names[column];
     result->oids[column] = oids[column];
   }
-  if (parameter == 0) {
-    result->rows = 0;
-    return;
-  }
   if (parameter == 1 && last_parameter == 3) {
     static const char *values[4][4] = {
         {"1", "Alice", "10", "Admin"},
@@ -428,35 +424,9 @@ static void q6_user_result(FakeResult *result, int parameter, int last_parameter
     result->values[1][3] = "Dev";
     return;
   }
-  if (parameter == 2) {
-    result->rows = 1;
-    result->values[0][0] = "2";
-    result->values[0][1] = "Bob";
-    result->values[0][2] = "";
-    result->values[0][3] = "";
-    result->nulls[0][2] = 1;
-    result->nulls[0][3] = 1;
-    return;
-  }
-  if (parameter == 7) {
-    static const char *values[3][4] = {
-        {"1", "Alice", "10", "Admin"},
-        {"2", "Bob", "20", "Dev"},
-        {"1", "Alice", "30", "Ops"},
-    };
-    result->rows = 3;
-    for (int row = 0; row < 3; row++) {
-      for (int column = 0; column < 4; column++) result->values[row][column] = values[row][column];
-    }
-    return;
-  }
-  result->rows = 1;
-  result->values[0][0] = "3";
-  result->values[0][1] = "Cara";
-  result->values[0][2] = parameter == 4 ? "" : "30";
-  result->values[0][3] = parameter == 3 ? "" : "Ops";
-  result->nulls[0][2] = parameter == 4;
-  result->nulls[0][3] = parameter == 3;
+  result->rows = 0;
+  protocol_ok = 0;
+  if (protocol_error == 0) protocol_error = 97;
 }
 
 static void q6_transaction_result(FakeResult *result) {

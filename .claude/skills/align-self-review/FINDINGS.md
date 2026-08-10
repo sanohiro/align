@@ -42,6 +42,8 @@ invented exact counts here.
 | `test-entry-abi-exactness` | 1 | 1 | Watch; compile fixtures through the real entry ABI. |
 | `mutation-noop-idempotency` | 1 | 1 | Watch; prove unchanged input performs no write. |
 | `native-evidence-applicability` | 1 | 1 | Watch; project optional native evidence only for engines/access methods whose semantics are proved. |
+| `analysis-control-path-completeness` | 4 | 1 | Three-plus events: automation required and shipped in #734 — call effects route through one shared atomic post-argument transition (`apply_borrow_mut_calls`/`apply_borrow_mut_call_effects`) used by the exhaustive walk, the eager worklist, and the transparent spine, with the parameterized `borrow_mut_shaper_retention` owner module covering each control path. |
+| `analysis-fact-consumer-sweep` | 4 | 1 | Three-plus events: automation required. #734 closed the exact/fallback selection into one shared `borrow_mut_source_indices` used by both liveness and escape consumers. Remaining open cell: EscapeCheck still carries three unshared destination/incoming region computations (`mutable_destination_storage_region`, the `AssignField` arm, the whole-`Assign` arm); consolidation into one shared authority is the next capability, with four verified fail-open probes recorded in its plan. |
 
 ## Event log
 
@@ -86,6 +88,17 @@ invented exact counts here.
 | #727 | `3c4de7a8` | P2 | `validation-phase-completeness` | Run SQLite static validation before lease acquisition and native prepare. |
 | #727 | `3c4de7a8` | P2 | `operation-matrix-completeness` | Map SQLite's unsupported-shape sentinel like the PostgreSQL path already does. |
 | #727 | `3c4de7a8` | P2 | `validation-phase-completeness` | Validate the v3 tail-reserved field in every duplicated header validator. |
+| #734 | `709feeba` | P1 | `source-of-truth-drift` | Reconcile exact direct retention with L6's all-argument conservative rule before implementation. |
+| #734 | `709feeba` | P2 | `operation-matrix-completeness` | Cover both partial-NULL child directions and their precedence in the segmented contract. |
+| #734 | `709feeba` | P2 | `source-of-truth-drift` | Scope one-execution counting to post-stream-formation, separating pre-send and send-failure counts. |
+| #734 | `6912e79b` | P1 | `analysis-control-path-completeness` | Collect mutable destinations on transparent `?` and return edges after the child call effect. |
+| #734 | `6912e79b` | P1 | `analysis-control-path-completeness` | Apply call effects only after all eager arguments complete, snapshotting facts at that point. |
+| #734 | `6912e79b` | P1 | `analysis-control-path-completeness` | Snapshot all source and destination regions before any multi-destination update. |
+| #734 | `6912e79b` | P2 | `analysis-control-path-completeness` | Route unary transparent-spine calls through the same atomic direct-call transition. |
+| #734 | `1c5167ae` | P1 | `analysis-fact-consumer-sweep` | Distinguish owned-storage roots from contained roots in the retention summary. |
+| #734 | `1c5167ae` | P1 | `analysis-fact-consumer-sweep` | Keep mutable `resource_ref` peers rooted in their common owner for alias checks. |
+| #734 | `c84bb3d4` | P1 | `analysis-fact-consumer-sweep` | Preserve the typed storage edge through escape-flow region selection. |
+| #734 | `c84bb3d4` | P1 | `analysis-fact-consumer-sweep` | Expand unavailable-call fallbacks to both contained and storage edges in one shared operation. |
 
 ## Rejected claims
 
