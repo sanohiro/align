@@ -421,3 +421,72 @@ fn dyn_elem_field_assign_str_field_rejected() {
         "expected the deferred-str diagnostic, got:\n{msg}"
     );
 }
+
+/// Fixed and owned struct arrays slice exactly like their scalar duals — the symmetry
+/// `apps_web_router` depends on to build an empty route table (`routes[0..0]`).
+mod struct_array_slicing {
+    use super::*;
+
+    #[test]
+    fn fixed_and_owned_struct_arrays_slice_to_views() {
+        if !backend_available() {
+            return;
+        }
+        let src = "\
+S { a: i64 }
+fn total(xs: slice<S>) -> i64 {
+  mut sum := 0
+  mut i := 0
+  loop {
+    if i >= xs.len() { break sum }
+    row := xs[i]
+    sum = sum + row.a
+    i = i + 1
+  }
+}
+fn main() -> Result<(), Error> {
+  fixed := [S { a: 1 }, S { a: 2 }, S { a: 3 }]
+  owned := [S { a: 4 }, S { a: 5 }].to_array()
+  print(total(fixed[..]) + total(fixed[1..3]) + total(owned[0..1]) + total(fixed[0..0]))
+  return Ok(())
+}
+";
+        let out = build_and_run("sa-slice", src);
+        assert_eq!(out.status.code(), Some(0));
+        // (1+2+3) + (2+3) + 4 + 0 = 6 + 5 + 4 = 15
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "15\n");
+    }
+
+    #[test]
+    fn a_move_struct_array_slice_is_rejected() {
+        // The Move guard is the reason the element is named `Scalar::Struct` rather than widened
+        // away: a sub-view of an owned buffer the source still frees is the double-free shape.
+        let src = "\
+S { name: string }
+fn main() -> Result<(), Error> {
+  rows := [S { name: \"a\".clone() }].to_array()
+  view := rows[0..1]
+  print(view.len())
+  return Ok(())
+}
+";
+        assert!(
+            check_errs("sa-slice-move", src),
+            "slicing a Move-struct array must stay rejected",
+        );
+    }
+
+    #[test]
+    fn an_unbound_struct_array_temporary_cannot_be_sliced() {
+        // A fixed array lives in a stack slot, so only a named local or a literal can be viewed.
+        let src = "\
+S { a: i64 }
+fn make() -> array<S> = [S { a: 1 }].to_array()
+fn main() -> Result<(), Error> {
+  print(make()[0..1].len())
+  return Ok(())
+}
+";
+        let _ = check_diagnostics("sa-slice-temp", src);
+    }
+}

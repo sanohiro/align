@@ -37100,6 +37100,23 @@ impl<'a, 't> Checker<'a, 't> {
                 let rspan = r.span;
                 (Expr { kind: ExprKind::StrBorrow(Box::new(r)), ty: Ty::Str, span: rspan }, Ty::Str)
             }
+            // A fixed or owned struct array slices exactly like its scalar dual: contiguous
+            // storage viewed as `{ptr,len}`. Naming the element `Scalar::Struct` keeps the one
+            // Move guard below in force, so a Move-struct element is still rejected.
+            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => {
+                let element = Scalar::Struct(id);
+                if struct_is_move(id, self.structs, self.enums, self.tagged_types) {
+                    self.diags.error(
+                        format!(
+                            "slicing a collection of the Move type {} is not supported yet",
+                            ty_name(Ty::Struct(id))
+                        ),
+                        span,
+                    );
+                    return err;
+                }
+                (r, Ty::Slice(element))
+            }
             Ty::Slice(s) | Ty::Array(s, _) | Ty::DynArray(s) => {
                 // A Move element would let the sub-slice alias an owned buffer the source still
                 // frees — same double-free reasoning as `check_index`. Slices are read-only views,

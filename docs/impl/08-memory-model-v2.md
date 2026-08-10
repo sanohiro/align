@@ -794,3 +794,24 @@ false-positive residual (arena-sliced outer arrays and tuple projections at
 exact storage edges) is pinned by the wrapper-aware declaration-depth controls
 above. The stale `ty_mentions_slice` comment claiming struct fields cannot be
 slices is corrected alongside.
+
+## 16. Fixed and owned struct-array range slicing (2026-08-11)
+
+`recv[a..b]` accepted `str`, `array<scalar>`, `slice<T>`, and owned `array<scalar>`, but never
+`array<Struct>` — for no stated reason: a struct array is the same contiguous storage viewed as
+`{ptr,len}`, and `slice<Struct>` is already a first-class parameter type (`pkg.web` passes route
+tables that way). The asymmetry left `apps_web_router`'s two table owners red, because an empty
+route table is spelled `routes[0..0]`.
+
+| Closure cell | Rule | Owner evidence |
+|---|---|---|
+| fixed `array<Struct>` | Slices to `slice<Struct>`; the receiver must be a named local or a literal, since the storage is a stack slot | `struct_index::struct_array_slicing::fixed_and_owned_struct_arrays_slice_to_views` |
+| owned `array<Struct>` | Already `{ptr,len}`; slices like its scalar dual | same owner |
+| Move-struct element | Stays rejected: a sub-view of a buffer the source still frees is the double-free shape the scalar rule already guards | `struct_index::struct_array_slicing::a_move_struct_array_slice_is_rejected` |
+| unbound temporary | Stays rejected for a fixed array, matching the scalar rule | `struct_index::struct_array_slicing::an_unbound_struct_array_temporary_cannot_be_sliced` |
+| empty range | `routes[0..0]` yields a zero-length view | the router table owners |
+
+The element is named `Scalar::Struct(id)` in all three layers rather than widening the element
+question, so the existing Move guard keeps applying unchanged. Reading a field directly off a
+`slice<Struct>` element (`xs[i].field`) remains unsupported — a whole-element read (`row := xs[i]`)
+is the shape both this capability and `pkg.web` use.

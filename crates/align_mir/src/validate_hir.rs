@@ -8319,11 +8319,28 @@ impl<'a> BodyValidator<'a> {
                 }
                 let result = match receiver.ty {
                     Ty::Str | Ty::String => Ty::Str,
-                    Ty::Array(scalar, _) | Ty::Slice(scalar) | Ty::DynArray(scalar) => {
+                    // A struct array views the same contiguous storage as its scalar dual; sema
+                    // names the element `Scalar::Struct`, so the Move guard below still applies.
+                    Ty::Array(..)
+                    | Ty::Slice(_)
+                    | Ty::DynArray(_)
+                    | Ty::StructArray(..)
+                    | Ty::DynStructArray(..) => {
+                        let scalar = match receiver.ty {
+                            Ty::Array(element, _)
+                            | Ty::Slice(element)
+                            | Ty::DynArray(element) => element,
+                            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => {
+                                Scalar::Struct(id)
+                            }
+                            _ => unreachable!("sliceable collection"),
+                        };
                         if !self.scalar_copy_ok(scalar) {
                             return None;
                         }
-                        if matches!(receiver.ty, Ty::Array(..))
+                        // A fixed array is a stack slot, so only a named local or a literal can
+                        // be viewed; an owned dynamic array is already `{ptr,len}`.
+                        if matches!(receiver.ty, Ty::Array(..) | Ty::StructArray(..))
                             && !matches!(
                                 recv.kind,
                                 hir::ExprKind::Local(_) | hir::ExprKind::ArrayLit { .. }
