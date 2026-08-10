@@ -2,7 +2,6 @@
 //! pointer (`Ty::Fn`), and calling such a local is an indirect call. Non-capturing only — no
 //! environment yet (lambda-as-value and captures are later slices).
 
-
 mod common;
 use common::*;
 
@@ -229,6 +228,21 @@ fn capturing_closure_in_a_struct_field_cannot_escape_the_frame() {
             "R { f: fn(i64) -> i64 }\nfn make(base: i64) -> R = R { f: fn x: i64 { x + base } }\nfn main() -> i32 = 0\n"
         ),
         "returning a struct whose fn field is a frame-capturing closure must be rejected (UAF)"
+    );
+}
+
+#[test]
+fn capturing_closure_call_after_owner_invalidation_rejected() {
+    // SOUNDNESS: binding a closure records its capture roots, so reassigning the owner of a
+    // captured view must invalidate the fn value itself; the later indirect call is then a read
+    // of an invalidated borrow rather than a silent stale-view use.
+    let diagnostics = check_diagnostics(
+        "fv-capture-stale-owner",
+        "fn main() -> i32 {\n  mut owned := \"captured\".clone()\n  view: str := owned\n  f := fn unused: i64 { view }\n  owned = \"replacement\".clone()\n  result := f(0)\n  return result.len() as i32\n}\n",
+    );
+    assert!(
+        diagnostics.contains("use of invalidated borrow 'f'"),
+        "calling a capturing closure after its captured owner was reassigned must reject:\n{diagnostics}",
     );
 }
 
