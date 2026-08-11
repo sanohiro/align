@@ -62,6 +62,6 @@ pub use run::{
     live_postgres_decision, should_clear_env,
 };
 pub use runner::{
-    RUNNER_PER_UNIT_C, RUNNER_STATIC_DESCRIPTORS, expect_checks_clean, expect_checks_rejected,
-    run_per_unit_c, run_static_descriptors,
+    RUNNER_PER_UNIT_C, RUNNER_STATIC_DESCRIPTORS, RUNNER_WHOLE_PROGRAM, expect_checks_clean,
+    expect_checks_rejected, run_per_unit_c, run_static_descriptors, run_whole_program,
 };

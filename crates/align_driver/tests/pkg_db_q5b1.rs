@@ -355,6 +355,7 @@ const CASE_QUERY_META_WHOLE: Case = Case {
     modules: q5b1_modules,
     main: MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -367,6 +368,7 @@ const CASE_QUERY_META_LIVE_EXEC: Case = Case {
     modules: q5b1_non_live_modules,
     main: NON_LIVE_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -564,8 +566,8 @@ fn checked_query_metadata_projection_uses_only_selected_driver_evidence() {
 ///
 /// Regenerate ONLY with a reviewed reason, from the panic message this emits.
 const LAYER1_FINGERPRINT_GOLDEN: &str = "\
-pkg-db-q5b1-query-meta-live-exec 70bcef27b0f611af
-pkg-db-q5b1-query-meta-whole 726cb2177e792df7
+pkg-db-q5b1-query-meta-live-exec cbf36595394bb847
+pkg-db-q5b1-query-meta-whole 769ff1aafc4c99cf
 ";
 
 #[test]

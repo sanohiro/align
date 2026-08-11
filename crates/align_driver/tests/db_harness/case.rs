@@ -21,6 +21,8 @@ pub enum RunnerKind {
     StaticDescriptors,
     /// Per-unit walk + a linked C fixture; the only pipeline that can substitute the libpq stub.
     PerUnitC,
+    /// Whole-program front end without static descriptors.
+    WholeProgram,
 }
 
 impl RunnerKind {
@@ -28,6 +30,7 @@ impl RunnerKind {
         match self {
             RunnerKind::StaticDescriptors => super::runner::RUNNER_STATIC_DESCRIPTORS,
             RunnerKind::PerUnitC => super::runner::RUNNER_PER_UNIT_C,
+            RunnerKind::WholeProgram => super::runner::RUNNER_WHOLE_PROGRAM,
         }
     }
 }
@@ -48,6 +51,9 @@ pub struct Case {
     /// (`common::fixture`) can still declare its cases as `const`.
     pub modules: fn() -> Vec<(&'static str, &'static str)>,
     pub main: &'static str,
+    /// Environment applied to the child. Part of the record, so it lands in the fingerprint: a
+    /// variable added or changed alters what the case exercises.
+    pub envs: &'static [(&'static str, &'static str)],
     pub expected_exit: i32,
     /// Native counter expectations asserted after a successful run, as `(name, value)`.
     ///
@@ -98,8 +104,19 @@ impl Case {
         }
         let layout = self.layout();
         let run = match self.runner {
-            RunnerKind::StaticDescriptors => run_static_descriptors(self.label, &layout),
+            RunnerKind::StaticDescriptors => {
+                assert!(
+                    self.envs.is_empty(),
+                    "`{}` declares a child environment, which only the whole-program runner \
+                     applies; the descriptor runner would silently drop it",
+                    self.label
+                );
+                run_static_descriptors(self.label, &layout)
+            }
             RunnerKind::PerUnitC => run_per_unit_c(self.label, &layout),
+            RunnerKind::WholeProgram => {
+                super::runner::run_whole_program(self.label, &layout, self.envs)
+            }
         };
         run.expect_exit(self.expected_exit);
         if !self.expect_counters.is_empty() {
@@ -123,6 +140,7 @@ impl Case {
                 ("counters", &stub_ids(self.counters)),
                 ("needs", self.needs.id()),
                 ("expect_counters", &counter_ids(self.expect_counters)),
+                ("child_env", &env_ids(self.envs)),
             ])
             .expected_exit(self.expected_exit)
     }
@@ -144,4 +162,11 @@ fn counter_ids(pairs: &[(&'static str, i64)]) -> String {
         .map(|(name, value)| format!("{name}={value}"))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// Stable identity for a child environment, for the fingerprint.
+fn env_ids(envs: &[(&'static str, &'static str)]) -> String {
+    let mut pairs: Vec<String> = envs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    pairs.sort();
+    pairs.join(",")
 }

@@ -1629,6 +1629,7 @@ const CASE_SQLITE_DIRECT_STREAM: Case = Case {
     modules: q4b_modules,
     main: SQLITE_DIRECT_STREAM_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -1641,6 +1642,7 @@ const CASE_SQLITE_COMPLETE_MATRIX: Case = Case {
     modules: q4b_modules,
     main: SQLITE_COMPLETE_MATRIX_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -1653,6 +1655,7 @@ const CASE_POSTGRES_DEADLINE_CANCEL: Case = Case {
     modules: q4b_modules,
     main: POSTGRES_DEADLINE_CANCEL_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -1665,6 +1668,7 @@ const CASE_OWNED_PARAMS: Case = Case {
     modules: q4b_modules,
     main: OWNED_PARAMS_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -1677,6 +1681,7 @@ const CASE_SQLITE_STREAM_LIFECYCLE: Case = Case {
     modules: q4b_modules,
     main: SQLITE_STREAM_LIFECYCLE_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -1689,6 +1694,7 @@ const CASE_POSTGRES_BUFFERED_LIFECYCLE: Case = Case {
     modules: q4b_modules,
     main: POSTGRES_BUFFERED_LIFECYCLE_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -1701,6 +1707,7 @@ const CASE_POSTGRES_PREPARED_DEADLINE: Case = Case {
     modules: q4b_modules,
     main: POSTGRES_PREPARED_DEADLINE_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -1713,6 +1720,7 @@ const CASE_POSTGRES_COMMAND_DEADLINE: Case = Case {
     modules: q4b_modules,
     main: POSTGRES_COMMAND_DEADLINE_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -1725,6 +1733,7 @@ const CASE_POSTGRES_MALFORMED_VIEWS: Case = Case {
     modules: q4b_modules,
     main: POSTGRES_MALFORMED_VIEWS_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -1737,6 +1746,7 @@ const CASE_SQLITE_MALFORMED_VIEWS: Case = Case {
     modules: q4b_modules,
     main: SQLITE_MALFORMED_VIEWS_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -1749,6 +1759,7 @@ const CASE_DEADLINE_DISPOSITION: Case = Case {
     modules: q4b_modules,
     main: DEADLINE_DISPOSITION_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -1761,6 +1772,7 @@ const CASE_POSTGRES_DEADLINE_FAULT_PHASES: Case = Case {
     modules: q4b_modules,
     main: POSTGRES_DEADLINE_FAULT_PHASES_MAIN,
     expected_exit: 45,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -3159,18 +3171,18 @@ fn materialized_projects_are_removed_on_drop() {
 ///
 /// Regenerate ONLY with a reviewed reason, from the panic message this emits.
 const LAYER1_FINGERPRINT_GOLDEN: &str = "\
-pkg-db-q4b-deadline-disposition feaa91247d2ff844
-pkg-db-q4b-owned-params f659b165042e0f15
-pkg-db-q4b-postgres-buffered-lifecycle 8fe4205270f1a911
-pkg-db-q4b-postgres-command-deadline f8a01a9da37234fc
-pkg-db-q4b-postgres-deadline-cancel 5badd2000b084e0b
-pkg-db-q4b-postgres-deadline-fault-phases 944018e7a8df2d3a
-pkg-db-q4b-postgres-malformed-views b2ae414b2e832bf3
-pkg-db-q4b-postgres-prepared-deadline 0e24bea5240ebdc8
-pkg-db-q4b-sqlite-complete-matrix 76d3af1f660a699f
-pkg-db-q4b-sqlite-direct-stream 629651e44e0063f7
-pkg-db-q4b-sqlite-malformed-views b822aa7f25062b62
-pkg-db-q4b-sqlite-stream-lifecycle 6e9e14e2c7046bad
+pkg-db-q4b-deadline-disposition 6f38d49e84b8bcb6
+pkg-db-q4b-owned-params fb2498e6f5ad6909
+pkg-db-q4b-postgres-buffered-lifecycle a3f0fc348ca1e0d1
+pkg-db-q4b-postgres-command-deadline 7fd12c3f5881702a
+pkg-db-q4b-postgres-deadline-cancel 42dc3901b32bfd87
+pkg-db-q4b-postgres-deadline-fault-phases 6e35e28e51d6bf72
+pkg-db-q4b-postgres-malformed-views 45929779913f034f
+pkg-db-q4b-postgres-prepared-deadline c116ce709ac486ee
+pkg-db-q4b-sqlite-complete-matrix dcde0b8a6ef9d397
+pkg-db-q4b-sqlite-direct-stream 9e23a2b6b843f93f
+pkg-db-q4b-sqlite-malformed-views a50d4daae76ae810
+pkg-db-q4b-sqlite-stream-lifecycle a4746af8bec88901
 ";
 
 #[test]
