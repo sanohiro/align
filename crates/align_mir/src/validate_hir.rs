@@ -169,7 +169,7 @@ pub(crate) fn body_only_metadata_is_valid(program: &hir::Program) -> bool {
 }
 
 #[cfg(test)]
-pub(crate) use body_core::body_ty_mangle;
+pub(crate) use body_core::{DelegatedGates, body_ty_mangle};
 
 struct DeclarationValidator<'a> {
     program: &'a hir::Program,
@@ -1413,19 +1413,9 @@ impl<'a> PlacementValidator<'a> {
             .is_some_and(|definition| definition.align.is_none())
     }
 
+    /// The `SoaPlain` shape is sema's rule (`soa_plain_ok`), not a fifth copy of the field list.
     fn soa_ok(&self, id: u32) -> bool {
-        self.program
-            .structs
-            .get(id as usize)
-            .is_some_and(|definition| {
-                !definition.fields.is_empty()
-                    && definition.fields.iter().all(|field| {
-                        matches!(
-                            field.ty,
-                            Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str
-                        )
-                    })
-            })
+        align_sema::soa_plain_ok(id, &self.program.structs)
     }
 
     fn inline_structs_unaligned(&self, ty: Ty) -> bool {
@@ -3227,18 +3217,29 @@ impl<'a> BodyValidator<'a> {
             || matches!(ty, Ty::Bool | Ty::Char)
     }
 
+    /// A stored scalar's width is this validator's own structural business; anything else is
+    /// already fixed-width by construction.
+    fn store_width_ok(&self, ty: Ty) -> bool {
+        match ty {
+            Ty::Int(integer) => valid_int(integer.bits),
+            Ty::Float(float) => valid_float(float.bits),
+            _ => true,
+        }
+    }
+
+    /// A `soa` column type: sema decides the admitted field class, this gate proves its width.
     fn soa_scalar_ty_ok(&self, ty: Ty) -> bool {
-        self.primitive_store_ty_ok(ty) || ty == Ty::Str
+        align_sema::soa_plain_field_ok(ty) && self.store_width_ok(ty)
     }
 
     fn soa_type_ok(&self, id: u32) -> bool {
-        self.program.structs.get(id as usize).is_some_and(|definition| {
-            !definition.fields.is_empty()
-                && definition
+        align_sema::soa_plain_ok(id, &self.program.structs)
+            && self.program.structs.get(id as usize).is_some_and(|definition| {
+                definition
                     .fields
                     .iter()
-                    .all(|field| self.soa_scalar_ty_ok(field.ty))
-        })
+                    .all(|field| self.store_width_ok(field.ty))
+            })
     }
 
     fn struct_array_store_ok(&self, id: u32, soa: bool) -> bool {
@@ -4503,16 +4504,9 @@ impl<'a> BodyValidator<'a> {
         }
     }
 
+    /// A decoded `soa<T>` row struct is exactly a `SoaPlain` struct with stored-width fields.
     fn json_soa_struct_ok(&self, id: u32) -> bool {
-        self.program.structs.get(id as usize).is_some_and(|definition| {
-            !definition.fields.is_empty()
-                && definition.fields.iter().all(|field| match field.ty {
-                    Ty::Int(integer) => valid_int(integer.bits),
-                    Ty::Float(float) => valid_float(float.bits),
-                    Ty::Bool | Ty::Char | Ty::Str => true,
-                    _ => false,
-                })
-        })
+        self.soa_type_ok(id)
     }
 
     fn json_struct_descriptor_ok(&self, id: u32, encode: bool) -> bool {
@@ -4631,17 +4625,19 @@ impl<'a> BodyValidator<'a> {
                         work.push(BodyJsonWork::Union(frame));
                         continue;
                     };
-                    if variant.payload.len() != 1
-                        || !match payload {
-                            Scalar::Int(integer) => valid_int(integer.bits),
-                            Scalar::Float(float) => valid_float(float.bits),
-                            Scalar::Bool | Scalar::Str => true,
-                            Scalar::Struct(id) | Scalar::DynStructArray(id) => {
-                                self.program.structs.get(id as usize).is_some()
-                            }
-                            _ => false,
+                    // Which payload *classes* a JSON union admits is `union_shape_class`'s answer
+                    // (checked just below); this gate only proves the payload's own structural
+                    // validity — a second class list here could admit a payload the decoder has no
+                    // descriptor arm for, or refuse one it does.
+                    let payload_structurally_ok = match payload {
+                        Scalar::Int(integer) => valid_int(integer.bits),
+                        Scalar::Float(float) => valid_float(float.bits),
+                        Scalar::Struct(id) | Scalar::DynStructArray(id) => {
+                            self.program.structs.get(id as usize).is_some()
                         }
-                    {
+                        _ => true,
+                    };
+                    if variant.payload.len() != 1 || !payload_structurally_ok {
                         frame.ok = false;
                         work.push(BodyJsonWork::Union(frame));
                         continue;
@@ -8190,9 +8186,11 @@ impl<'a> BodyValidator<'a> {
             }
             hir::ExprKind::ArrayToSlice(source) => {
                 let flow = self.expr_flow(source)?;
+                // The view's elements must be readable through it, so the borrow asks the same
+                // sema-owned element rule the index / slice-range guards ask.
                 let result = match flow.ty {
                     Ty::Array(scalar, _) => {
-                        if !self.scalar_copy_ok(scalar) {
+                        if !self.collection_element_read_ok(align_sema::scalar_to_ty(scalar)) {
                             return None;
                         }
                         if !matches!(
@@ -8204,7 +8202,7 @@ impl<'a> BodyValidator<'a> {
                         Ty::Slice(scalar)
                     }
                     Ty::StructArray(id, _) => {
-                        if !self.scalar_copy_ok(Scalar::Struct(id)) {
+                        if !self.collection_element_read_ok(Ty::Struct(id)) {
                             return None;
                         }
                         if !matches!(
@@ -8215,9 +8213,13 @@ impl<'a> BodyValidator<'a> {
                         }
                         Ty::Slice(Scalar::Struct(id))
                     }
-                    Ty::DynArray(scalar) if self.scalar_copy_ok(scalar) => Ty::Slice(scalar),
+                    Ty::DynArray(scalar)
+                        if self.collection_element_read_ok(align_sema::scalar_to_ty(scalar)) =>
+                    {
+                        Ty::Slice(scalar)
+                    }
                     Ty::DynStructArray(id, Layout::Aos)
-                        if self.scalar_copy_ok(Scalar::Struct(id)) =>
+                        if self.collection_element_read_ok(Ty::Struct(id)) =>
                     {
                         Ty::Slice(Scalar::Struct(id))
                     }
@@ -8296,7 +8298,7 @@ impl<'a> BodyValidator<'a> {
                 }
                 let response_element_borrow =
                     receiver.ty == Ty::DynResponseArray && result == Ty::HttpResponse;
-                if !response_element_borrow && !self.ty_copy_ok(result, context) {
+                if !response_element_borrow && !self.collection_element_read_ok(result) {
                     return None;
                 }
                 let (falls, breaks) = strict_flow(&[receiver, index_flow]);
@@ -8333,7 +8335,7 @@ impl<'a> BodyValidator<'a> {
                     Ty::Str | Ty::String => Ty::Str,
                     _ => {
                         let scalar = sliced_element?;
-                        if !self.scalar_copy_ok(scalar) {
+                        if !self.collection_element_read_ok(align_sema::scalar_to_ty(scalar)) {
                             return None;
                         }
                         // A fixed array is a stack slot, so only a named local or a literal can
@@ -8985,18 +8987,7 @@ impl<'a> BodyValidator<'a> {
     }
 
     fn soa_struct_ok(&self, id: u32) -> bool {
-        self.program
-            .structs
-            .get(id as usize)
-            .is_some_and(|definition| {
-                !definition.fields.is_empty()
-                    && definition.fields.iter().all(|field| {
-                        matches!(
-                            field.ty,
-                            Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str
-                        )
-                    })
-            })
+        align_sema::soa_plain_ok(id, &self.program.structs)
     }
 
     fn finish_block(&mut self, block: &hir::Block, _: &BodyContext) -> bool {
@@ -9566,32 +9557,31 @@ impl<'a> BodyValidator<'a> {
         true
     }
 
+    /// Whether a payload/element scalar may be copied. Move-ness is **sema's** question
+    /// (`scalar_is_move`), not a second model here: this gate reached the same answer by
+    /// re-listing the nominal arms, and every arm the two spellings did not share was a program
+    /// sema accepted and this validator silently refused to lower.
     fn scalar_copy_ok(&self, scalar: Scalar) -> bool {
-        if scalar.is_move() {
-            return false;
-        }
-        match scalar {
-            Scalar::Struct(id) => !align_sema::struct_is_move(
-                id,
+        !align_sema::scalar_is_move(
+            scalar,
+            &self.program.structs,
+            &self.program.enums,
+            &self.program.tagged_types,
+        )
+    }
+
+    /// Whether an element read (`xs[i]`) or view (`xs[a..b]`) of `elem` is admissible: structural
+    /// validity is this validator's own business, the Move rule is sema's
+    /// (`collection_element_read_ok` — the producer's own index / slice-range guard).
+    fn collection_element_read_ok(&self, elem: Ty) -> bool {
+        self.body_ty_ok(elem)
+            && align_sema::collection_element_read_ok(
+                elem,
                 &self.program.structs,
-                &self.program.enums,
-                &self.program.tagged_types,
-            ),
-            Scalar::Enum(id) => !align_sema::enum_is_move(
-                id,
-                &self.program.structs,
-                &self.program.enums,
-                &self.program.tagged_types,
-            ),
-            Scalar::Tagged(id) => !align_sema::drop_plan(
-                Ty::Tagged(id),
-                &self.program.structs,
+                &self.program.tuples,
                 &self.program.enums,
                 &self.program.tagged_types,
             )
-            .needs_drop(),
-            _ => true,
-        }
     }
 
     /// Whether a value of `ty` may be copied — the rule a closure capture and the
@@ -10280,6 +10270,42 @@ pub(crate) fn body_ty_mangle(ty: Ty, program: &hir::Program) -> String {
         &program.resources,
     )
 }
+
+/// Test-only window onto the gates that delegate an ownership or shape rule to the producer, so
+/// the equivalence sweep can compare them against `align_sema` for every constructible type.
+#[cfg(test)]
+pub(crate) struct DelegatedGates<'a>(BodyValidator<'a>);
+
+#[cfg(test)]
+impl<'a> DelegatedGates<'a> {
+    pub(crate) fn new(program: &'a hir::Program) -> Self {
+        Self(BodyValidator::new(program))
+    }
+
+    pub(crate) fn scalar_copy_ok(&self, scalar: Scalar) -> bool {
+        self.0.scalar_copy_ok(scalar)
+    }
+
+    pub(crate) fn collection_element_read_ok(&self, elem: Ty) -> bool {
+        self.0.collection_element_read_ok(elem)
+    }
+
+    /// The four soa shape gates, in the order `soa_ok` (placement), `soa_type_ok`,
+    /// `json_soa_struct_ok`, `soa_struct_ok`.
+    pub(crate) fn soa_gates(&self, id: u32) -> [bool; 4] {
+        [
+            self.0.placement.soa_ok(id),
+            self.0.soa_type_ok(id),
+            self.0.json_soa_struct_ok(id),
+            self.0.soa_struct_ok(id),
+        ]
+    }
+
+    pub(crate) fn body_ty_ok(&self, ty: Ty) -> bool {
+        self.0.body_ty_ok(ty)
+    }
+}
+
 fn ptr_key<T>(value: &T) -> usize {
     value as *const T as usize
 }

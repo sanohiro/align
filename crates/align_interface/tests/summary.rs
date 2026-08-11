@@ -907,6 +907,61 @@ fn return_cleanup_metadata_is_exact_for_functions_and_nested_function_values() {
     );
 }
 
+/// Import validation compares a recorded `ReturnCleanupAbi` against a re-derivation, so the two
+/// must be one rule. The re-derivation used to be a hand-written table of droppable builtin
+/// spellings here; it is now `align_sema`'s ownership authority reached through its spelling
+/// bridge. Pin the classification of every builtin spelling an interface can carry, so a bridge
+/// that stops recognising one (or starts calling a borrow owned) fails here rather than rejecting
+/// a valid interface as a return-cleanup mismatch.
+#[test]
+fn builtin_spelling_ownership_matches_the_producer_for_every_interface_spelling() {
+    for owned in [
+        "array",
+        "array_builder",
+        "string",
+        "reader",
+        "writer",
+        "buffer",
+        "file",
+        "regex",
+        "captures",
+        "tcp_conn",
+        "tcp_listener",
+        "udp_socket",
+        "child",
+        "http_request_ctx",
+        "response_builder",
+        "http_stream",
+    ] {
+        assert_eq!(
+            align_sema::builtin_spelling_needs_return_cleanup(owned),
+            Some(true),
+            "`{owned}` owns droppable storage, so a function returning it needs the cleanup bit"
+        );
+    }
+    for plain in [
+        "()", "bool", "char", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64",
+        "str", "raw", "region", "rng", "slice", "http_headers", "json.doc",
+        // `box<T>` / `Task<R>` are freed with their region, never by a per-return cleanup bit.
+        "box",
+    ] {
+        assert_eq!(
+            align_sema::builtin_spelling_needs_return_cleanup(plain),
+            Some(false),
+            "`{plain}` carries no return-cleanup obligation"
+        );
+    }
+    // A user-defined or nominal-argument spelling is not the bridge's business; the analysis
+    // answers those from its own definition index.
+    for local in ["Route", "pkg.db.conn", "soa", "json.scanner", "Option", "Result"] {
+        assert_eq!(
+            align_sema::builtin_spelling_needs_return_cleanup(local),
+            None,
+            "`{local}` must be resolved by the importing analysis, not the builtin bridge"
+        );
+    }
+}
+
 #[test]
 fn semantic_import_rejects_return_roots_incapable_of_borrowing() {
     let mut non_borrowing_return =

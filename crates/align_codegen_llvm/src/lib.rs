@@ -5658,11 +5658,19 @@ fn is_signed(ty: Ty) -> bool {
 ///
 /// **One source of truth for two drop sites:** the standalone-local `Stmt::Drop` and the struct-field
 /// drop (`drop_struct_fields`, F1②) both route through this, so a bare handle local and a handle
-/// *field* free identically. The set here MUST equal the handle types `align_sema::is_field_ok`
-/// admits as fields (`is_move_handle`) — a type allowed as a field but missing here would leak.
-/// `Builder`/`StrFinder`/`ArrayBuilder` are Move but NOT here (distinct non-pointer drops); they are
-/// correspondingly rejected as fields.
+/// *field* free identically.
+///
+/// The **set** is not decided here: it is exactly `align_sema::is_move_handle`, the same predicate
+/// that admits a handle as a struct field and gives it a pointer layout. This function only maps
+/// that set to each handle's runtime free symbol. Re-listing the set was the leak risk — a handle
+/// sema admitted but this list forgot returned `None`, and a missing drop is silent. A new handle
+/// without a symbol row now fails `move_handles_all_have_a_runtime_free_symbol` instead.
+/// `Builder`/`StrFinder`/`ArrayBuilder` are Move but not handles (distinct non-pointer drops); they
+/// are correspondingly rejected as fields.
 fn handle_free_key(ty: Ty) -> Option<RuntimeKey> {
+    if !align_sema::is_move_handle(ty) {
+        return None;
+    }
     Some(match ty {
         Ty::Writer => RuntimeKey::IoWriterFree,
         Ty::Reader => RuntimeKey::IoReaderFree,
@@ -5685,6 +5693,8 @@ fn handle_free_key(ty: Ty) -> Option<RuntimeKey> {
         Ty::HttpRequestCtx => RuntimeKey::HttpCtxFree,
         Ty::ResponseBuilder => RuntimeKey::HttpResponseFree,
         Ty::HttpStream => RuntimeKey::HttpStreamFree,
+        // Unreachable while every `align_sema::MOVE_HANDLE_TYPES` entry has a row above, which is
+        // what the sweep test asserts. Kept fail-closed rather than panicking in a compiler.
         _ => return None,
     })
 }
@@ -16420,6 +16430,44 @@ mod tests {
 
     fn program_call(name: &str) -> ProgramCall {
         ProgramCall::try_from_logical(name).expect("valid test program call")
+    }
+
+    /// The handle **set** belongs to `align_sema::is_move_handle`; this file only maps it to each
+    /// handle's runtime free symbol. A handle sema admits with no row in that map used to return
+    /// `None`, which emits no drop at all — a silent leak at every drop site. Sweep the producer's
+    /// set so a new handle fails here instead.
+    #[test]
+    fn move_handles_all_have_a_runtime_free_symbol() {
+        for &ty in align_sema::MOVE_HANDLE_TYPES {
+            assert!(
+                align_sema::is_move_handle(ty),
+                "{ty:?} is listed in MOVE_HANDLE_TYPES but is_move_handle rejects it"
+            );
+            assert!(
+                handle_free_key(ty).is_some(),
+                "handle {ty:?} has no runtime free symbol — its drop would emit nothing"
+            );
+        }
+        // The converse: nothing outside the producer's set may claim a handle free.
+        for ty in [
+            Ty::String,
+            Ty::Builder,
+            Ty::StrFinder,
+            Ty::ArrayBuilder(Scalar::Int(IntTy {
+                bits: 64,
+                signed: true,
+            })),
+            Ty::Str,
+            Ty::Rng,
+            Ty::HttpHeaders,
+            Ty::Resource(0),
+            Ty::ResourceRef(0),
+        ] {
+            assert!(
+                handle_free_key(ty).is_none(),
+                "{ty:?} is not a bare Move handle but claims a handle free"
+            );
+        }
     }
 
     fn direct_program(name: &str) -> DirectCall {

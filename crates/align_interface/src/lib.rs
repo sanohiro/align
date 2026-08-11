@@ -1324,19 +1324,19 @@ impl<'a> CapabilityAnalysis<'a> {
                         result.params[index] = true;
                         continue;
                     }
-                    match path.as_str() {
-                        "Option" | "Result" => {
-                            work.extend(args);
-                            continue;
-                        }
-                        "array" | "array_builder" | "string" | "reader" | "writer"
-                        | "buffer" | "file" | "regex" | "captures" | "tcp_conn"
-                        | "tcp_listener" | "udp_socket" | "child" | "http_request_ctx"
-                        | "response_builder" | "http_stream" => {
-                            result.intrinsic = true;
-                            continue;
-                        }
-                        _ => {}
+                    if matches!(path.as_str(), "Option" | "Result") {
+                        work.extend(args);
+                        continue;
+                    }
+                    // Whether a builtin owns droppable storage is sema's `needs_drop_flag`, reached
+                    // through its spelling bridge. A hand-written name table here was a second model
+                    // of the very bit this analysis validates, so a new droppable builtin surface
+                    // type would have rejected every valid interface that returns it.
+                    if let Some(owns_droppable) =
+                        align_sema::builtin_spelling_needs_return_cleanup(path)
+                    {
+                        result.intrinsic |= owns_droppable;
+                        continue;
                     }
                     if builtin_capability_after_local(&self.index, path).is_some() {
                         continue;
