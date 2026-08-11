@@ -1,5 +1,85 @@
 # History of Align
 
+## 2026-08-11: PostgreSQL streamed delivery is one explicit native rail
+
+The first D13 rail shipped common bounded batches and direct SoA projection while retaining
+PostgreSQL `BufferedFull`. The next rail fixes `SingleRow` and `PortalBatch(n)` as explicit runtime
+delivery options shared by direct and prepared Query execution. It uses one result/cancel/Drop
+state machine, retains parameter copies until protocol synchronization, and leaves static Query
+artifacts unchanged. libpq 17 is the client floor for chunked rows and nonblocking cancellation;
+the required server compatibility floor remains PostgreSQL 16.4. Binary formats, COPY, pipeline
+mode, and LISTEN/NOTIFY remain independent rails rather than one oversized native PR.
+
+The second design review exposed a pre-existing asymmetry: D12 gave SQLite catalog and EXPLAIN the
+connection execution lease but allowed their PostgreSQL siblings to call libpq after only a live
+state check. Streamed delivery therefore cannot land directly. One public/ABI-neutral prerequisite
+first makes every PostgreSQL catalog and common/native EXPLAIN call share the typed-execution lease;
+direct delivery follows after that independently testable safety closure merges. Prepared parity is
+a third PR because exact `ParameterFormat(name, ...)` validation must retain the producer resolver
+in statement v3. The direct rail preserves absent Delivery on both shipped BufferedFull timeout
+subpaths and drains a multiplicity result to clean completion instead of canceling an effectful DML
+`RETURNING`.
+
+The next fresh review reopened the stream matrix a third time: validation, decode, and batch-storage
+errors had no effect-aware pending-protocol cleanup, and rows state retained the absolute deadline
+but not the original recovery duration. Those errors now normal-drain without decoding under the
+original deadline, cancel only on expiry, preserve the first error, and pin Conn/Tx effect races.
+Rows v3 uses offset 112 for the original duration. Chunking bounds rows per result and peak result
+buffering, never total query transport.
+
+The following review reopened the matrix a fourth time. COPY results cannot be completed by generic
+`PQgetResult` drain, so deferred COPY support now fails closed: clear the current result, immediately
+poison/close, make no later COPY/drain/cancel/state/restore call, and preserve any earlier primary
+error. The same pass restored direct execution's settled phase order of live state, context-backed
+generated static validation, lease, and then bind/native work. Both changes belong to the direct
+stream state machine, so the three independently mergeable PR boundaries remain unchanged.
+
+The clean-up review of that fourth redesign found three P2 consistency gaps but no new P1. The
+ledger now exposes the monotonic caller-region cost of `one_native`: once a valid first Row is cloned,
+the same bytes remain allocated on Cardinality or any later error. Delivery validation follows the
+canonical §13.4 payload-before-duplicate order, superseding the earlier local choice, and the option
+is inventoried as post-release D13 rather than part of initial D1--D12. None changes the three PR
+boundaries.
+
+The base-refreshed review reopened the matrix a fifth time. The earlier COPY closure was too narrow:
+shipped synchronous and timeout PostgreSQL consumers can already receive COPY results and release a
+connection that libpq still considers protocol-busy. A second public/ABI-neutral prerequisite now
+audits every package-owned PGresult consumer and makes COPY plus unknown numeric statuses clear once
+and close with no later protocol call. Direct and prepared explicit delivery also preserve D9's
+clock recheck after enabling nonblocking mode and before send. The implementation sequence is now
+four mergeable PRs: lease repair, result-status safety, direct delivery, and prepared parity.
+
+The final preflight review found two P2 consistency gaps. `PGRES_PIPELINE_SYNC` and
+`PGRES_PIPELINE_ABORTED` had been classified as ordinary invalid streamed sequences even though a
+connection remains in pipeline mode until `PQexitPipelineMode`; because pipeline exit is outside
+this rail, both statuses now share the immediate-clear-and-close branch at every PGresult consumer.
+The section introduction now also names both prerequisites and the exact four-PR sequence.
+
+The following preflight review found one further P2 in the same root-cause class. PostgreSQL
+migration files could contain top-level COPY; the synchronous migration executor would receive a
+COPY status and then attempt rollback on the protocol-busy connection. The status prerequisite now
+audits both Rust PGresult modules and extends the existing driver-aware migration screen to reject
+first-token COPY before URL access, target open, lock, history publication, or libpq. Preparation
+cannot execute COPY through `PQprepare`; all remaining tool SQL is fixed producer-owned text. This
+closes the tooling path without changing the four implementation boundaries.
+
+The next review found one P2 in the same tool closure. Merely inventorying prepare/migration SQL
+origins left their PGresult decoders free to clear an unknown or deferred status and then issue
+`ROLLBACK`, `DEALLOCATE`, or another query. The status prerequisite now adds one private exhaustive
+Rust tool classifier and routes every prepare/migration result consumer through it. Null results,
+COPY, partial single/chunk rows, pipeline statuses, and unknown numeric statuses close and null the
+connection owner before return; later row access and every follow-up libpq call are forbidden. One
+parameterized synthetic-result owner fixes current-clear, close, first-error, and no-follow-up-call
+behavior. This P2 closes inside the same prerequisite without reopening the matrix or adding a PR.
+
+The final base-bound review found three P2 contract gaps and no new P1. Stream protocol state now
+precedes ordinary status-to-error mapping, so every result after the zero-row terminal reports the
+invalid sequence while its status still chooses drain or immediate close. PostgreSQL migration
+screening is explicitly one statement-ordered classification pass and owns both `BEGIN; COPY` and
+`COPY; BEGIN` precedence. Runtime Delivery remains outside static Query semantics, but landing its
+public enum and the rows/statement ABI deterministically invalidates affected dependency-interface
+and implementation cache keys once. These closures do not change the four implementation PRs.
+
 ## 2026-08-07: shared borrow accepts stable Copy storage
 
 Shared `borrow` now accepts a stable bound Copy or Move place. Copy values still pass by value by

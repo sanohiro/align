@@ -534,8 +534,31 @@ idea is rejected.
   transported/buffered/decoded counts, and make the initial PostgreSQL path explicitly
   `BufferedFull`. D13 adds explicitly selected single-row/portal delivery; requested unsupported
   modes fail instead of downgrading.
-- **v1 impact:** not a correctness blocker for the D4 baseline after disclosure; bounded PostgreSQL
-  transport is a scheduled D13 capability and must not be falsely promised earlier.
+- **v1 impact:** not a correctness blocker for the D4 baseline after disclosure; bounded
+  per-result delivery and peak result buffering are a scheduled D13 capability and must not be
+  falsely described as a bound on total transport. The second A1 ledger in `pkg-design/db.md` §23
+  now fixes that direct/prepared streamed-delivery rail. Its
+  reopened closure matrix first lands independently mergeable PostgreSQL catalog/EXPLAIN lease and
+  shipped-result-status safety prerequisites. The latter audits every current PGresult consumer and
+  closes on COPY, pipeline, or an unknown numeric status without another protocol or pipeline-exit
+  call. The same prerequisite routes every Rust prepare/migration result consumer through one
+  private exhaustive classifier; null, COPY, partial row-mode, pipeline, and unknown results close
+  and null the connection before rollback, deallocation, row access, or later libpq. It also rejects
+  top-level PostgreSQL migration COPY during canonical screening before URL/native work. Direct
+  delivery follows with normal-drain cardinality, exact BufferedFull default preservation, and a post-nonblocking
+  pre-send deadline check; prepared parity then retains parameter-name authority in statement v3. Binary
+  formats and other native paths remain separate. Because COPY termination and pipeline exit are not
+  in this rail, observing a COPY, pipeline, or unknown status clears only that result and immediately
+  poisons/closes instead of entering
+  generic drain; direct construction also retains Q2's live-state/context/static-validation/lease
+  phase order. Query Delivery validation retains §13.4 payload-before-duplicate precedence, and
+  `one_native` records the monotonic caller-region bytes left by its first-Row clone when a later
+  failure wins. The final base-bound review then closed three P2 consistency gaps: protocol-state
+  validation now makes every post-terminal result an invalid sequence before ordinary status error
+  mapping while retaining status-specific drain/close safety; migration screening is one
+  statement-ordered classification pass with both `BEGIN; COPY` and `COPY; BEGIN` owners; and the
+  cache contract distinguishes unchanged static descriptor semantics from the one-time
+  interface/implementation-key invalidation caused when the public option and resource ABI land.
 
 ### F32 — L1a and L1b both claimed `Option<MoveStruct>`
 

@@ -180,6 +180,73 @@ diff touching `apps/db` or a `pkg_db_*` test must pass it before push. The
 same rule generalizes: a new env-gated required CI suite ships with a matching
 local Docker script in the same PR.
 
+The D13 PostgreSQL streamed-delivery rail keeps server 16.4 as the compatibility
+floor but requires libpq client/development files at version 17 or newer. Its
+implementation PR must make both CI and `db-verify-local.sh` assert the client
+version and run the new required direct-delivery suite; the prepared-parity PR
+then adds its statement-resolver and prepared-delivery cases to the same local
+and CI job. A newer server image must not hide an accidental client-version
+dependency. The preceding libpq-consumer lease and result-status safety
+prerequisites keep the current client floor. The same local database gate must
+first run the catalog/EXPLAIN overlap suite and prove zero libpq calls on a
+rejected live-stream overlap. The status prerequisite then injects every COPY
+status, both pipeline statuses, and an unknown numeric status into every shipped synchronous,
+timeout-completion, timeout-recovery, direct/prepared rows/one/command/prepare,
+transaction, catalog/EXPLAIN, and silent-cleanup PGresult consumer. It requires
+one current-result clear, physical close, zero subsequent
+result/COPY/pipeline-exit/cancel/transaction-state/blocking-restore calls, correct first-error
+or silent-Drop behavior, balanced owners/lease, and no reuse.
+The Rust tool half uses one parameterized
+`postgres_tool_results_fail_closed_before_followup_native_work` owner. It crosses migration
+command/query and preparation command/query/prepare/describe consumers with null, all COPY,
+`PGRES_SINGLE_TUPLE`, `PGRES_TUPLES_CHUNK`, both pipeline, and unknown numeric results. A non-null
+result is cleared once, the connection is finished once and nulled before return, the first copied
+diagnostic remains primary, and row access, rollback, deallocation, result retrieval, and every
+later libpq call remain zero. Expected success and known complete error controls preserve their
+current mapping and cleanup.
+The same prerequisite retains Q5a's canonical PostgreSQL statement-screening owner. It crosses
+Required/Forbidden top-level COPY, lowercase and comment-leading spelling, COPY after an ordinary
+statement, quoted/comment/dollar-body near-misses, transaction control before later COPY, COPY
+before later transaction control, Forbidden-count precedence, and unchanged SQLite behavior. The
+two prohibited-order cases prove one source-ordered statement-classification pass. Every rejected
+case proves zero URL-environment reads, target opens, locks, history publication, connection opens,
+and libpq calls. A checked inventory
+records that prepare uses `PQprepare`/`PQdescribePrepared`, migration is the only compiler-side path
+that sends complete user SQL through `PQexec`, and all remaining tool SQL is fixed; that inventory
+does not weaken the Rust tool fail-closed matrix above.
+
+The direct-delivery suite crosses validation/decode/storage failure with no
+timeout, time remaining, and deadline expiry on both connection and transaction
+targets. It pins first-error retention, no further decode, completion-versus-
+cancel SQL effects, the rows-v3 absolute-deadline/original-duration pair, and
+recovery-budget use. Chunk owners report total transported rows separately from
+maximum rows per `PGresult`; the latter is not asserted as a total-transport
+bound. Every `PGRES_COPY_IN`/`PGRES_COPY_OUT`/`PGRES_COPY_BOTH`, both pipeline
+statuses, and unknown-status injection is a fail-closed owner, including first-result, after-data, row/decode/storage error,
+deadline recovery, mode failure, and Drop on connection and transaction targets.
+Those owners assert one current-result clear and physical close, zero subsequent
+result/COPY/pipeline-exit/cancel/transaction-state/blocking-restore calls, first-error retention,
+balanced package-owner cleanup, and no reuse. Direct construction also retains a
+pairwise phase-order owner with context allocation/free, lease, binder, and libpq
+counters for live-state, generated-static-validation, and overlap failures. Its
+option matrix checks Query payload-before-duplicate with both invalid orderings
+and a valid duplicate, plus command tag rejection and the separate initial versus
+post-release surface inventories. Its `one_native` region owner records zero
+caller-region allocation before a valid first Row and the exact same one-clone
+byte/alignment delta for singleton success, Cardinality, and every later error;
+no case rewinds the arena or clones a second Row.
+Direct and prepared explicit-delivery owners delay the test clock across
+nonblocking enablement and require expired-before-send to produce zero
+send/selector/cancel calls, exact Timeout, and blocking restoration or close.
+Their result-sequence matrix also injects every ordinary error, invalid,
+COPY, pipeline, and unknown status after a valid zero-row terminal. It asserts
+that protocol state selects the invalid-sequence error before ordinary status
+mapping, while status class still selects ordinary drain versus immediate
+close. Whole/per-unit cache owners separately require the public `Delivery`
+and rows/statement implementation changes to invalidate affected interface and
+implementation keys once, with identical static descriptor semantics and no
+runtime-mode-specific cache identity.
+
 ## Benchmarks are not tests
 
 A benchmark measures one named performance path against a baseline or control.

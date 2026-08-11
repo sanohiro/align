@@ -309,6 +309,94 @@ interface carries that symbol for separate compilation, then concrete substituti
 HIR/MIR. The batch remains the one Move owner and `soa<R>` remains the same borrowed view rooted in
 that resource generation. This adds neither an owned SoA value nor a DB-specific compiler API.
 
+**PostgreSQL delivery mode is an execution cost choice, not a Query identity.** A static Query's
+SQL, Params/Row contract, binder, decoder, batch plan, and semantic fingerprint do not change when
+one execution selects `SingleRow` or `PortalBatch(n)`. The public `Delivery` addition and the
+rows/statement ABI implementation still change their owning interface/implementation hashes once,
+so affected per-unit dependency keys and object caches invalidate when those changes land; runtime
+mode selection creates no further cache identity. The choice therefore stays in the explicit
+driver-qualified execution-option slice. Both direct and prepared execution enter one libpq result
+state machine, retain Params until protocol completion, and expose partial-server-failure timing
+instead of pretending bounded delivery is atomic. A direct `one_native` multiplicity remains
+pending until clean protocol completion: normal drain preserves the SQL effects of DML `RETURNING`,
+while a late server failure or explicit timeout wins. Absence of Delivery never enters this live
+state machine and retains the shipped caller-synchronous BufferedFull timing, including its existing
+nonblocking deadline completion. Prepared parity is a separate
+formation rail because its statement state must retain the producer parameter-name resolver.
+Binary wire formats remain a separate rail because they change bind/decode representation rather
+than result delivery lifetime.
+
+**A caller-supplied arena is monotonic across a late error.** `one_native` must clone a validated
+first Row before mutating the rows generation to probe multiplicity. That copy is visible through
+the required `out` argument and happens exactly once. If Cardinality 2 or a later protocol,
+deadline, COPY, or cleanup error wins, no Row is returned, but those exact first-Row clone bytes stay
+allocated until the caller's arena scope ends. The package neither hides a scratch arena nor
+pretends it can rewind caller storage; zero rows and an invalid first Row allocate nothing in `out`.
+
+**A row error does not silently choose transaction effects.** A streamed validation, decode, or
+batch-storage error is already the primary caller-visible failure, but libpq may still own an
+effectful `RETURNING` protocol. Align destroys unpublished values and drains without further decode
+under the original absolute deadline, preserving normal completion effects when time remains. Only
+deadline expiry cancels; the first row/storage error remains primary, while the connection or
+transaction state exposes whether completion or cancellation won. Rows therefore retain both the
+absolute deadline and the original duration needed by recovery.
+
+**A deferred or unknown native subprotocol fails closed at every result consumer.** A COPY result is
+not an ordinary invalid rows result: libpq cannot reach the terminal result until the COPY exchange
+itself is consumed or terminated. Shipped synchronous and timeout executors can already observe it;
+the rule is therefore a pre-stream PostgreSQL result-status closure, not only a streamed-rows arm.
+Pipeline sync/aborted results likewise leave connection-global pipeline mode until an explicit
+pipeline-exit operation, which this rail does not own. Every package-owned PGresult consumer clears
+COPY, pipeline, or an unknown numeric status once, immediately poisons/closes, preserves an earlier
+owned error or silent Drop, and then releases package owners. No later result drain, COPY operation,
+pipeline exit, cancel, transaction probe, or blocking restoration runs on that connection.
+Supporting libpq 17 or newer does not mean assuming a future status is drainable.
+The separate Rust prepare and migration executors are part of the same consumer audit. One private
+Rust classifier exhaustively identifies the complete libpq 17 numeric status set before a tool
+reads result rows or issues follow-up SQL; this pure classification loads no new symbol and does not
+raise the current client floor. A null result, COPY status, partial single/chunk row result, pipeline status,
+or unknown numeric status copies the available diagnostic, clears the current result when present,
+immediately finishes and nulls the connection owner, and permits no rollback, deallocation, row
+access, or later libpq call. Known complete results retain their existing tool error mapping.
+Because migration sends complete user SQL through synchronous `PQexec` but owns no COPY exchange,
+canonical PostgreSQL migration screening also rejects a top-level first-token `COPY` before URL
+access, target open, or native work. The screen classifies each complete statement once in source
+order, so `COPY; BEGIN` reports COPY while `BEGIN; COPY` reports transaction control; only after
+that pass can Forbidden-count validation win. Preparation uses `PQprepare`/`PQdescribePrepared` and
+does not execute COPY; other tool SQL is fixed, but neither fact substitutes for fail-closed status
+handling.
+
+**Stream protocol state precedes status-to-error mapping.** The zero-row `PGRES_TUPLES_OK` terminal
+changes the expected next event to null. Any later non-null result is therefore the streamed-sequence
+error even when its ordinary standalone status would map to a native execution error. Its status
+still chooses cleanup: ordinary known statuses clear and drain, while COPY, pipeline, and unknown
+statuses clear and close immediately. This separates deterministic error precedence from the
+safety action required by the native subprotocol.
+
+**Context-backed static validation stays in the settled execution phase.** The generated
+static-option validator needs an execution context, while overlap is deliberately checked only
+after static validity. Direct PostgreSQL delivery therefore preserves the shipped order: validate
+descriptor/options/restriction and live state, allocate the context, run generated static
+validation, acquire the lease, then bind and call libpq. Moving static validation before live state
+or moving the lease before it would change observable error precedence and allocation behavior.
+
+**A deadline is checked at the last reversible pre-send point.** Enabling libpq nonblocking mode may
+consume the remaining operation budget. Direct and prepared explicit delivery therefore re-read the
+monotonic clock immediately afterward and before send. Expiry restores blocking mode and returns
+Timeout with zero send, selector, and cancel calls; failed restoration poisons/closes. This preserves
+the shipped D9 rule that effectful SQL never starts after its deadline has already expired.
+
+**A live native protocol requires a complete consumer lease inventory.** PostgreSQL catalog and
+EXPLAIN originally used synchronous full-result libpq calls, so D12 checked their live connection
+but did not give them the typed-execution lease. That was harmless only while every PostgreSQL rows
+constructor also completed its libpq protocol synchronously. Single-row/chunked delivery keeps the
+connection protocol-busy after return, exposing the omission. The lease fix is one smaller prerequisite,
+not a delivery special case: every catalog and common/native EXPLAIN call acquires the same lease,
+holds it through result/context cleanup, and rejects overlap before libpq. Both subsequent direct
+and prepared streamed-delivery PRs depend on that general closure. The separate shipped-result
+status prerequisite follows it because that safety repair is independently useful without a public
+surface, ABI, or libpq-version change.
+
 **A named `region` is a destination capability, not an allocator abstraction.** Compound
 database reads and streaming decoders need ordinary library functions to construct caller-owned
 arrays and strings without falling back to hidden heap allocation. `arena out {}` exposes only
