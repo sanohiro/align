@@ -356,7 +356,20 @@ impl CacheContext {
     /// root verbatim (schema skew inside a shared root is handled by the fail-closed key/manifest
     /// versions). If the default root cannot be resolved (no `HOME`/`XDG_CACHE_HOME`), the on/unset
     /// case degrades to disabled rather than guessing a root.
+    /// Fail-closed on an unidentifiable compiler: when the running executable cannot be hashed there
+    /// is no id that distinguishes this compiler build from another, so the cache is off entirely
+    /// (see [`compiler_build_id`]).
     pub fn from_env() -> CacheContext {
+        CacheContext::from_env_when(compiler_build_id_available())
+    }
+
+    /// [`CacheContext::from_env`] with the build-id availability supplied — the seam its owner test
+    /// drives, since a real host always has a readable executable.
+    fn from_env_when(build_id_available: bool) -> CacheContext {
+        if !build_id_available {
+            note_unidentifiable_compiler();
+            return CacheContext::Disabled;
+        }
         // Fail-closed measurement guard: the `ALIGN_SORT_ADAPTIVE` (doc-12 §4.1),
         // `ALIGN_NEEDLE_HOIST` (doc-13 §6.6), `ALIGN_BUFFER_DONATE` (doc-10 §8.1), and
         // `ALIGN_CONST_POOL` (doc-13 §8.4) toggles change emitted codegen for `.sort()`/
@@ -386,9 +399,21 @@ impl CacheContext {
         }
     }
 
-    /// Construct an enabled cache rooted at `root` (used by tests and the `on` path).
+    /// Construct an enabled cache rooted at `root` (used by tests and the `on` path). Subject to the
+    /// same fail-closed compiler-identity rule as [`CacheContext::from_env`]: an unidentifiable
+    /// compiler yields [`CacheContext::Disabled`], never an enabled cache under a guessed id.
     pub fn at(root: PathBuf) -> CacheContext {
-        CacheContext::Enabled { root }
+        CacheContext::at_when(root, compiler_build_id_available())
+    }
+
+    /// [`CacheContext::at`] with the build-id availability supplied — the owner-test seam.
+    fn at_when(root: PathBuf, build_id_available: bool) -> CacheContext {
+        if build_id_available {
+            CacheContext::Enabled { root }
+        } else {
+            note_unidentifiable_compiler();
+            CacheContext::Disabled
+        }
     }
 
     /// Whether the cache is on. The caller gates key construction on this so a disabled build (the
@@ -530,23 +555,64 @@ fn publish(root: &Path, key: &CodegenKey, obj_out: &Path) {
     }
 }
 
-/// The compiler build id: the hash of the running `alignc` binary bytes, memoized once per process.
-/// Covers dev rebuilds where the crate version is unchanged — any codegen/lowering source change
-/// rebuilds the binary and flips this. Falls back to a version-derived constant only if the executable
-/// cannot be read (which never happens on the supported platforms); a fallback id lives in a disjoint
-/// namespace, so it can never collide with a real-id entry.
-pub fn compiler_build_id() -> Hash128 {
-    static ID: OnceLock<Hash128> = OnceLock::new();
+/// The compiler build id and whether it is a REAL identity, memoized once per process.
+///
+/// A cache entry is only as sound as this component: it is the sole thing separating one compiler
+/// build's artifacts from another's. The real id is the hash of the running executable's bytes,
+/// which covers dev rebuilds at an unchanged crate version — any codegen/lowering source change
+/// rebuilds the binary and flips it.
+///
+/// **There is deliberately no stable fallback.** A version-derived constant is shared by *every*
+/// build of that version, so two different compilers that both failed to read their executable would
+/// address the same entries and one could be served the other's object — a miscompile, not a missed
+/// optimization. When the executable cannot be read, the id is therefore unique to this process (it
+/// can collide with nothing) and [`compiler_build_id_available`] reports `false`, which turns the
+/// cache off at every construction site.
+fn build_id() -> (Hash128, bool) {
+    static ID: OnceLock<(Hash128, bool)> = OnceLock::new();
     *ID.get_or_init(|| {
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| std::fs::read(p).ok())
-            .map(|b| Hash128::of(&b))
-            .unwrap_or_else(|| {
-                let fallback = format!("alignc-build-id-fallback-{}", env!("CARGO_PKG_VERSION"));
-                Hash128::of(fallback.as_bytes())
-            })
+        match std::env::current_exe().ok().and_then(|p| std::fs::read(p).ok()) {
+            Some(bytes) => (Hash128::of(&bytes), true),
+            None => {
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                let nonce = STAGE_NONCE.fetch_add(1, Ordering::Relaxed);
+                let unique = format!(
+                    "alignc-build-id-unidentified-{}-{stamp}-{nonce}",
+                    std::process::id()
+                );
+                (Hash128::of(unique.as_bytes()), false)
+            }
+        }
     })
+}
+
+/// The compiler build id (see [`build_id`]). Only meaningful when
+/// [`compiler_build_id_available`] is `true`; every enabled [`CacheContext`] guarantees that.
+pub fn compiler_build_id() -> Hash128 {
+    build_id().0
+}
+
+/// Whether the compiler build id is a real identity derived from the running executable's bytes.
+/// `false` means the compiler cannot be distinguished from another build, so the cache must stay
+/// off — enforced by [`CacheContext::from_env`] and [`CacheContext::at`].
+pub fn compiler_build_id_available() -> bool {
+    build_id().1
+}
+
+/// The always-on note for a cache disabled because the compiler cannot be identified. Printed once
+/// per process: this is a persistent-state decision the user should see, but repeating it per unit
+/// would bury the build's real output.
+fn note_unidentifiable_compiler() {
+    static NOTED: OnceLock<()> = OnceLock::new();
+    NOTED.get_or_init(|| {
+        eprintln!(
+            "alignc: cache disabled (cannot read the running executable, so this compiler build \
+             cannot be identified)"
+        );
+    });
 }
 
 /// `${XDG_CACHE_HOME:-~/.cache}/alignc/<schema>`, or `None` if neither `XDG_CACHE_HOME` nor `HOME` is
@@ -1630,6 +1696,32 @@ mod tests {
         k.impl_hash = Hash128 { lo: 1, hi: 1 };
         k.exports = vec!["z".to_string()];
         assert_eq!(first_diff(&base, &k), FirstDiff::MirDigest);
+    }
+
+    #[test]
+    fn an_unidentifiable_compiler_disables_the_cache() {
+        // An explicit root must NOT yield an enabled cache when the build id is not a real identity:
+        // without a distinguishing id, two different compiler builds address one namespace and one
+        // can be served the other's object.
+        let root = std::env::temp_dir().join("align-buildid-fail-closed");
+        assert!(matches!(CacheContext::at_when(root.clone(), false), CacheContext::Disabled));
+        assert!(matches!(CacheContext::at_when(root, true), CacheContext::Enabled { .. }));
+        // The same rule outranks every `ALIGNC_CACHE` value, and is decided before the environment
+        // is consulted at all (so this assertion is independent of the ambient environment).
+        assert!(matches!(CacheContext::from_env_when(false), CacheContext::Disabled));
+    }
+
+    #[test]
+    fn the_build_id_is_never_a_version_derived_constant() {
+        // The removed fallback was `Hash128::of("alignc-build-id-fallback-<version>")` — identical in
+        // every build of one crate version. Pin that no such shared constant is reachable: the id is
+        // either the real executable hash or a process-unique value that collides with nothing.
+        let banned = Hash128::of(
+            format!("alignc-build-id-fallback-{}", env!("CARGO_PKG_VERSION")).as_bytes(),
+        );
+        assert_ne!(compiler_build_id(), banned);
+        // A test binary can always read its own executable, so the real identity is in force here.
+        assert!(compiler_build_id_available());
     }
 
     #[test]
