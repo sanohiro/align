@@ -37041,7 +37041,31 @@ impl<'a, 't> Checker<'a, 't> {
         // the load copies the element's `{ptr,len}` without transferring ownership, so the array
         // and the copy would both free the same buffer (double-free). Such element reads need a
         // borrow / move-out design (a later slice) — reject cleanly until then.
-        if matches!(
+        if self.collection_element_is_unsupported_move(elem) {
+            self.diags.error(
+                format!("indexing an array of the Move type {} is not supported yet (it would copy the element without transferring ownership)", ty_name(elem)),
+                span,
+            );
+            return err;
+        }
+        // A slot-backed fixed array must be a literal or a variable (same restriction as a
+        // pipeline source — MIR addresses it through a slot). A `{ptr,len}` view is fine as a value.
+        if self.collection_receiver_needs_slot_binding(&r) {
+            self.diags.error(
+                "indexing a fixed array requires an array literal or a variable (an arbitrary array expression is not supported yet)".to_string(),
+                span,
+            );
+            return err;
+        }
+        Expr { kind: ExprKind::Index { recv: Box::new(r), index: Box::new(i) }, ty: elem, span }
+    }
+
+    /// Whether `elem` is a Move element that a read (index) or a view (range slice) cannot
+    /// produce yet: the copy would duplicate ownership of the same buffer. The one predicate for
+    /// both readers — `check_index` and `check_slice_range` kept partial copies of this list, and
+    /// a gap between them is a program sema accepts and the MIR boundary rejects.
+    fn collection_element_is_unsupported_move(&self, elem: Ty) -> bool {
+        matches!(
             elem,
             Ty::Box(_)
                 | Ty::DynArray(_)
@@ -37062,24 +37086,15 @@ impl<'a, 't> Checker<'a, 't> {
                 | Ty::Child
         ) || (matches!(elem, Ty::Option(_) | Ty::Result(..))
             && drop_plan(elem, self.structs, self.enums, self.tagged_types).needs_drop())
-            || matches!(elem, Ty::Struct(id) if struct_is_move(id, self.structs, self.enums, self.tagged_types))
-        {
-            self.diags.error(
-                format!("indexing an array of the Move type {} is not supported yet (it would copy the element without transferring ownership)", ty_name(elem)),
-                span,
-            );
-            return err;
-        }
-        // A slot-backed fixed array must be a literal or a variable (same restriction as a
-        // pipeline source — MIR addresses it through a slot). A `{ptr,len}` view is fine as a value.
-        if matches!(r.ty, Ty::Array(..) | Ty::StructArray(..)) && !matches!(r.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
-            self.diags.error(
-                "indexing a fixed array requires an array literal or a variable (an arbitrary array expression is not supported yet)".to_string(),
-                span,
-            );
-            return err;
-        }
-        Expr { kind: ExprKind::Index { recv: Box::new(r), index: Box::new(i) }, ty: elem, span }
+            || matches!(elem, Ty::Struct(id)
+                if struct_is_move(id, self.structs, self.enums, self.tagged_types))
+    }
+
+    /// Whether a receiver's storage is a stack slot MIR addresses directly, so only a literal or
+    /// a named local can be read or viewed. Shared for the same reason as the predicate above.
+    fn collection_receiver_needs_slot_binding(&self, receiver: &Expr) -> bool {
+        matches!(receiver.ty, Ty::Array(..) | Ty::StructArray(..))
+            && !matches!(receiver.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_))
     }
 
     /// `recv[start..end]` — a half-open range slice of a `str` / `array<T>` / `slice<T>`. Yields a
@@ -37100,37 +37115,29 @@ impl<'a, 't> Checker<'a, 't> {
                 let rspan = r.span;
                 (Expr { kind: ExprKind::StrBorrow(Box::new(r)), ty: Ty::Str, span: rspan }, Ty::Str)
             }
+            // A fixed or owned struct array slices exactly like its scalar dual: contiguous
+            // storage viewed as `{ptr,len}`. Naming the element `Scalar::Struct` keeps the one
+            // Move guard below in force, so a Move-struct element is still rejected.
+            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => {
+                let element = Scalar::Struct(id);
+                if struct_is_move(id, self.structs, self.enums, self.tagged_types) {
+                    self.diags.error(
+                        format!(
+                            "slicing a collection of the Move type {} is not supported yet",
+                            ty_name(Ty::Struct(id))
+                        ),
+                        span,
+                    );
+                    return err;
+                }
+                (r, Ty::Slice(element))
+            }
             Ty::Slice(s) | Ty::Array(s, _) | Ty::DynArray(s) => {
                 // A Move element would let the sub-slice alias an owned buffer the source still
-                // frees — same double-free reasoning as `check_index`. Slices are read-only views,
-                // so a `slice<scalar>` is fine; reject Move-element collections until a borrow design.
+                // frees — the same double-free reasoning as `check_index`, so the same predicate
+                // decides it. Slices are read-only views, so a `slice<scalar>` is fine.
                 let elem = scalar_to_ty(s);
-                // `Ty::TcpConn` / `Ty::TcpListener` / `Ty::UdpSocket` are defensive parity with
-                // `check_index`'s guard above: a `slice<tcp_conn>` / `array<udp_socket>` (etc.) is
-                // unconstructible today (each handle is rejected as an array element at construction),
-                // so this arm can't currently be reached — kept in sync so a future array-of-handle
-                // path can't slip past this guard silently.
-                if matches!(
-                    elem,
-                    Ty::Box(_)
-                        | Ty::DynArray(_)
-                        | Ty::String
-                        | Ty::Builder
-                        | Ty::Reader
-                        | Ty::Writer
-                        | Ty::Buffer
-                        | Ty::ArrayBuilder(_)
-                        | Ty::VecArrayBuilder(..)
-                        | Ty::MaskArrayBuilder(..)
-                        | Ty::FixedArrayBuilder(..)
-                        | Ty::FixedStructArrayBuilder(..)
-                        | Ty::TcpConn
-                        | Ty::TcpListener
-                        | Ty::UdpSocket
-                        | Ty::Child
-                ) || (matches!(elem, Ty::Option(_) | Ty::Result(..))
-                    && drop_plan(elem, self.structs, self.enums, self.tagged_types).needs_drop())
-                {
+                if self.collection_element_is_unsupported_move(elem) {
                     self.diags.error(
                         format!("slicing a collection of the Move type {} is not supported yet", ty_name(elem)),
                         span,
@@ -37149,7 +37156,7 @@ impl<'a, 't> Checker<'a, 't> {
         };
         // A slot-backed fixed array must be a literal or a variable (same restriction as indexing /
         // pipeline sources — MIR addresses it through its slot to take a base pointer).
-        if matches!(recv_expr.ty, Ty::Array(..)) && !matches!(recv_expr.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
+        if self.collection_receiver_needs_slot_binding(&recv_expr) {
             self.diags.error(
                 "slicing a fixed array requires an array literal or a variable (an arbitrary array expression is not supported yet)".to_string(),
                 span,

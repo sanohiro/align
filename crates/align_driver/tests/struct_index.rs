@@ -421,3 +421,78 @@ fn dyn_elem_field_assign_str_field_rejected() {
         "expected the deferred-str diagnostic, got:\n{msg}"
     );
 }
+
+/// Fixed and owned struct arrays slice exactly like their scalar duals — the symmetry
+/// `apps_web_router` depends on to build an empty route table (`routes[0..0]`).
+mod struct_array_slicing {
+    use super::*;
+
+    #[test]
+    fn fixed_and_owned_struct_arrays_slice_to_views() {
+        if !backend_available() {
+            return;
+        }
+        let src = "\
+S { a: i64 }
+fn total(xs: slice<S>) -> i64 {
+  mut sum := 0
+  mut i := 0
+  loop {
+    if i >= xs.len() { break sum }
+    row := xs[i]
+    sum = sum + row.a
+    i = i + 1
+  }
+}
+fn main() -> Result<(), Error> {
+  fixed := [S { a: 1 }, S { a: 2 }, S { a: 3 }]
+  owned := [S { a: 4 }, S { a: 5 }].to_array()
+  print(total(fixed[..]) + total(fixed[1..3]) + total(owned[0..1]) + total(fixed[0..0]))
+  return Ok(())
+}
+";
+        let out = build_and_run("sa-slice", src);
+        assert_eq!(out.status.code(), Some(0));
+        // (1+2+3) + (2+3) + 4 + 0 = 6 + 5 + 4 = 15
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "15\n");
+    }
+
+    #[test]
+    fn a_slot_backed_struct_array_expression_cannot_be_sliced() {
+        // A fixed array lives in a stack slot MIR addresses directly, so only a literal or a
+        // named local can be viewed. sema owns this diagnostic; without it the program reached
+        // the MIR boundary and died as an internal error.
+        let src = "\
+S { a: i64 }
+fn total(xs: slice<S>) -> i64 = xs.len()
+fn main() -> Result<(), Error> {
+  c := true
+  xs := [S { a: 1 }]
+  ys := [S { a: 2 }]
+  print(total((if c { xs } else { ys })[0..1]))
+  return Ok(())
+}
+";
+        let diagnostics = check_diagnostics("sa-slice-temp", src);
+        assert!(
+            diagnostics.contains("slicing a fixed array requires an array literal or a variable"),
+            "an arbitrary struct-array expression should get the slot diagnostic:\n{diagnostics}",
+        );
+    }
+
+    #[test]
+    fn a_move_struct_slice_receiver_is_rejected() {
+        // `slice<MoveStruct>` is declarable, and the shared element guard must reject viewing it
+        // — the validator always did, so a sema gap here was an internal error, not a diagnostic.
+        let src = "\
+S { name: string }
+fn first(xs: slice<S>) -> i64 = xs[0..1].len()
+fn main() -> Result<(), Error> = Ok(())
+";
+        let diagnostics = check_diagnostics("sa-slice-move-recv", src);
+        assert!(
+            diagnostics.contains("slicing a collection of the Move type"),
+            "a Move-struct slice receiver should be rejected in sema:\n{diagnostics}",
+        );
+    }
+}

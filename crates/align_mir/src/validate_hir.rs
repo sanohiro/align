@@ -8317,13 +8317,28 @@ impl<'a> BodyValidator<'a> {
                 {
                     return None;
                 }
+                // The element the view addresses. A struct array views the same contiguous
+                // storage as its scalar dual; layout is pinned so a future column-major form is
+                // a compile error rather than a reinterpreted `{ptr,len}`.
+                let sliced_element = match receiver.ty {
+                    Ty::Array(element, _) | Ty::Slice(element) | Ty::DynArray(element) => {
+                        Some(element)
+                    }
+                    Ty::StructArray(id, _) | Ty::DynStructArray(id, Layout::Aos) => {
+                        Some(Scalar::Struct(id))
+                    }
+                    _ => None,
+                };
                 let result = match receiver.ty {
                     Ty::Str | Ty::String => Ty::Str,
-                    Ty::Array(scalar, _) | Ty::Slice(scalar) | Ty::DynArray(scalar) => {
+                    _ => {
+                        let scalar = sliced_element?;
                         if !self.scalar_copy_ok(scalar) {
                             return None;
                         }
-                        if matches!(receiver.ty, Ty::Array(..))
+                        // A fixed array is a stack slot, so only a named local or a literal can
+                        // be viewed; an owned dynamic array is already `{ptr,len}`.
+                        if matches!(receiver.ty, Ty::Array(..) | Ty::StructArray(..))
                             && !matches!(
                                 recv.kind,
                                 hir::ExprKind::Local(_) | hir::ExprKind::ArrayLit { .. }
@@ -8333,7 +8348,6 @@ impl<'a> BodyValidator<'a> {
                         }
                         Ty::Slice(scalar)
                     }
-                    _ => return None,
                 };
                 let mut flows = vec![receiver];
                 if let Some(flow) = start_flow {

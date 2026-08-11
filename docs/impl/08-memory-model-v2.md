@@ -794,3 +794,31 @@ false-positive residual (arena-sliced outer arrays and tuple projections at
 exact storage edges) is pinned by the wrapper-aware declaration-depth controls
 above. The stale `ty_mentions_slice` comment claiming struct fields cannot be
 slices is corrected alongside.
+
+## 16. Fixed and owned struct-array range slicing (2026-08-11)
+
+`recv[a..b]` accepted `str`, `array<scalar>`, `slice<T>`, and owned `array<scalar>`, but never
+`array<Struct>` — for no stated reason: a struct array is the same contiguous storage viewed as
+`{ptr,len}`, and `slice<Struct>` is already a first-class parameter type (`pkg.web` passes route
+tables that way). The asymmetry left `apps_web_router`'s two table owners red, because an empty
+route table is spelled `routes[0..0]`.
+
+| Closure cell | Rule | Owner evidence |
+|---|---|---|
+| fixed `array<Struct>` | Slices to `slice<Struct>` | `struct_index::struct_array_slicing::fixed_and_owned_struct_arrays_slice_to_views` |
+| owned `array<Struct>` | Already `{ptr,len}`; slices like its scalar dual | same owner |
+| slot-backed receiver | A fixed array is a stack slot, so an arbitrary expression is rejected **in sema**, with the same diagnostic indexing gives | `struct_index::struct_array_slicing::a_slot_backed_struct_array_expression_cannot_be_sliced` |
+| Move-struct element | Stays rejected: a sub-view of a buffer the source still frees is the double-free shape, including a declared `slice<MoveStruct>` receiver | `struct_index::struct_array_slicing::a_move_struct_slice_receiver_is_rejected` |
+| empty range | `routes[0..0]` yields a zero-length view | `fixed[0..0]` in the first owner, plus `apps_web_router`'s two table owners |
+| SoA layout | The validator pins `Layout::Aos`, so a future column-major layout is a compile error rather than a reinterpreted `{ptr,len}` | the layout-typed match arm itself |
+
+The element is named `Scalar::Struct(id)` in all three layers rather than widening the element
+question, so the existing Move guard keeps applying unchanged. The guards themselves are now one
+predicate each — `collection_element_is_unsupported_move` and
+`collection_receiver_needs_slot_binding` — shared by indexing and slicing: the first attempt at
+this capability copied only part of `check_index`'s list into `check_slice_range`, and the gap
+between sema and the MIR body validator was a program sema accepted and the boundary rejected as
+an internal error. That is the same drift class the validator's Copy delegation closed, so it is
+closed the same way. Reading a field directly off a
+`slice<Struct>` element (`xs[i].field`) remains unsupported — a whole-element read (`row := xs[i]`)
+is the shape both this capability and `pkg.web` use.
