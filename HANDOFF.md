@@ -49,8 +49,15 @@ and absent Delivery stays on the caller-synchronous BufferedFull implementation,
 including its existing nonblocking deadline subpath. Validation/decode/storage
 errors normal-drain without further decoding under the original deadline; only
 deadline expiry cancels, with Conn/Tx effect races explicit. Rows v3 retains
-both the absolute deadline and original duration needed for recovery. The
-exact three-PR boundary and public contract are in
+both the absolute deadline and original duration needed for recovery. A fourth
+design-matrix reopen closes the deferred-COPY state: any observed COPY result is
+cleared and the physical connection is immediately poisoned/closed, with no
+generic result drain, COPY operation, cancel, transaction probe, or blocking
+restore afterward. It also restores direct execution's settled phase order:
+live state, context-backed generated static validation, lease, then bind/native
+work. Neither correction forms an independently useful prerequisite, so the
+three-PR boundary remains unchanged. The exact boundary and public contract are
+in
 `docs/impl/pkg-design/db.md` §23; binary formats remain the following rail.
 
 Out-of-gate suite status (suites outside the bounded CI gate; a nightly

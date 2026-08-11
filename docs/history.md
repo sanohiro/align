@@ -27,6 +27,13 @@ original deadline, cancel only on expiry, preserve the first error, and pin Conn
 Rows v3 uses offset 112 for the original duration. Chunking bounds rows per result and peak result
 buffering, never total query transport.
 
+The following review reopened the matrix a fourth time. COPY results cannot be completed by generic
+`PQgetResult` drain, so deferred COPY support now fails closed: clear the current result, immediately
+poison/close, make no later COPY/drain/cancel/state/restore call, and preserve any earlier primary
+error. The same pass restored direct execution's settled phase order of live state, context-backed
+generated static validation, lease, and then bind/native work. Both changes belong to the direct
+stream state machine, so the three independently mergeable PR boundaries remain unchanged.
+
 ## 2026-08-07: shared borrow accepts stable Copy storage
 
 Shared `borrow` now accepts a stable bound Copy or Move place. Copy values still pass by value by

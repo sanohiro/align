@@ -67,7 +67,10 @@ rail is the exact PostgreSQL `SingleRow` / `PortalBatch` direct delivery
 contract recorded by the adjacent A1 ledger. Prepared parity follows in its own
 rail with the statement-v3 parameter resolver needed for exact native-option
 validation. PostgreSQL binary formats, COPY, pipeline mode, and LISTEN/NOTIFY
-remain later independent rails rather than enlarging any of those PRs.
+remain later independent rails rather than enlarging any of those PRs. Until the
+COPY rail exists, any COPY status observed by streamed rows clears its current
+result and immediately poisons/closes the connection; it is never sent through a
+generic result drain.
 For planning language, **initial `pkg.db` release** means L1a–L7 plus D1–D12;
 **complete committed `pkg.db` roadmap** means those plus D13 and D14. D0 is
 disposable native evidence and may run in parallel at any time.

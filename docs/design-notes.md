@@ -331,6 +331,20 @@ deadline expiry cancels; the first row/storage error remains primary, while the 
 transaction state exposes whether completion or cancellation won. Rows therefore retain both the
 absolute deadline and the original duration needed by recovery.
 
+**A deferred native subprotocol fails closed.** A COPY result is not an ordinary invalid rows
+result: libpq cannot reach the terminal result until the COPY exchange itself is consumed or
+terminated. COPY is a later rail, so streamed rows do not add a partial COPY API or wait forever in
+generic drain. They clear the observed result, immediately poison/close the connection, preserve an
+earlier owned error, and then release package owners. No later result drain, cancel, transaction
+probe, or blocking restoration runs on that connection.
+
+**Context-backed static validation stays in the settled execution phase.** The generated
+static-option validator needs an execution context, while overlap is deliberately checked only
+after static validity. Direct PostgreSQL delivery therefore preserves the shipped order: validate
+descriptor/options/restriction and live state, allocate the context, run generated static
+validation, acquire the lease, then bind and call libpq. Moving static validation before live state
+or moving the lease before it would change observable error precedence and allocation behavior.
+
 **A live native protocol requires a complete consumer lease inventory.** PostgreSQL catalog and
 EXPLAIN originally used synchronous full-result libpq calls, so D12 checked their live connection
 but did not give them the typed-execution lease. That was harmless only while every PostgreSQL rows

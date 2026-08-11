@@ -542,7 +542,10 @@ idea is rejected.
   prerequisite, because those shipped libpq consumers must reject overlap before a live stream can
   be sound. Direct delivery follows with normal-drain cardinality and exact BufferedFull default
   preservation; prepared parity then retains parameter-name authority in statement v3. Binary
-  formats and other native paths remain separate.
+  formats and other native paths remain separate. Because COPY termination is not in this rail,
+  observing a COPY status clears only that result and immediately poisons/closes instead of entering
+  generic drain; direct construction also retains Q2's live-state/context/static-validation/lease
+  phase order.
 
 ### F32 — L1a and L1b both claimed `Option<MoveStruct>`
 
