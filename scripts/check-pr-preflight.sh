@@ -10,7 +10,46 @@ head_sha="$1"
 base_ref="$2"
 base_sha="$3"
 body_file="$4"
+# The BASE_SHA argument keeps its shape check for interface compatibility only.
+# It is NOT authoritative: see the derivation below.
 [[ "$head_sha" =~ ^[0-9a-f]{40}$ && "$base_sha" =~ ^[0-9a-f]{40}$ && -f "$body_file" ]] || exit 2
+[[ "$base_ref" =~ ^[A-Za-z0-9._/-]+$ ]] || {
+  echo "invalid base ref: $base_ref" >&2
+  exit 2
+}
+
+# The attestation binds the branch's MERGE BASE with the base branch, not the
+# base branch tip: `github.event.pull_request.base.sha` moves whenever another
+# PR lands on main, which would otherwise invalidate a stamp for a branch whose
+# own content never changed.
+#
+# Derive that base here instead of trusting the caller's SHA. This checker ships
+# from the trusted base, but the workflow that invokes it does not: on a
+# pull_request event GitHub runs the PR's own copy of the YAML. A one-word edit
+# there (passing the head SHA as the base, say) would otherwise hand this script
+# an empty range, which classifies as no library change and would green-light an
+# unreviewed compiler diff under a docs-only or tooling attestation. The
+# repository the runner checked out is the authority, so resolve the base branch
+# from it and compute the merge base ourselves.
+base_remote_ref="refs/remotes/origin/$base_ref"
+merge_base=""
+if git rev-parse --verify --quiet "${base_remote_ref}^{commit}" >/dev/null 2>&1; then
+  merge_base="$(git merge-base "$head_sha" "$base_remote_ref" 2>/dev/null || true)"
+fi
+[[ "$merge_base" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "cannot derive the merge base of $head_sha and $base_remote_ref" >&2
+  echo "  The checkout must have the base branch and full history:" >&2
+  echo "  actions/checkout with fetch-depth: 0." >&2
+  exit 1
+}
+# An empty range attests nothing, and a merge base equal to HEAD means the base
+# branch already contains this head — a stale PR, or a forged base argument
+# trying to classify a real diff as no diff at all.
+[[ "$merge_base" != "$head_sha" ]] || {
+  echo "$base_ref already contains $head_sha: there is nothing to attest" >&2
+  exit 1
+}
+base_sha="$merge_base"
 
 required=(
   "<!-- align-preflight-version:1 -->"

@@ -28,14 +28,18 @@ A code PR needs all of:
 
 The review log must contain, in this order:
   ALIGN_REVIEW_HEAD=<40-hex reviewed candidate SHA>
-  ALIGN_REVIEW_BASE=<40-hex SHA of --base's TIP (git rev-parse origin/main), not the merge-base>
+  ALIGN_REVIEW_BASE=<40-hex merge base of HEAD and --base (git merge-base HEAD
+                     origin/main), not the base branch tip>
   ...free-form review record...
   ALIGN_REVIEW_VERDICT=CLEAN | ALIGN_REVIEW_VERDICT=FINDINGS   (last non-empty line)
 
 A CLEAN verdict must belong to the exact final HEAD. FINDINGS requires
 --findings-fixed and a later fix commit descending from the reviewed HEAD.
 The recorded stamp binds the final HEAD: push and open the PR immediately,
-without amending, rebasing, or committing in between.
+without amending, rebasing, or committing in between. It binds the branch's
+merge base, not the base branch tip, so another PR landing on main does not
+invalidate it; rebasing or merging main in does, because that changes the
+branch.
 USAGE
   exit 2
 }
@@ -60,7 +64,21 @@ while [[ $# -gt 0 ]]; do
 done
 
 git rev-parse --is-inside-work-tree >/dev/null
-base_sha="$(git rev-parse --verify "${base}^{commit}")"
+# Every base binding below is the MERGE BASE of HEAD and the base branch, never
+# the base branch tip. The tip is not a property of this branch: an unrelated PR
+# merging into main would otherwise invalidate an attestation and a review for a
+# branch whose own content never changed, forcing a rebase and a full CI rerun.
+# The merge base only moves when the branch itself moves (rebase, amend, or a
+# merge of main into the branch), which is exactly when the evidence really is
+# stale. It is also the basis of the `base...HEAD` diffs used throughout, so the
+# reviewed diff, the classified diff, and the recorded base now share one
+# definition.
+base_tip="$(git rev-parse --verify "${base}^{commit}")"
+base_sha="$(git merge-base HEAD "$base_tip" 2>/dev/null || true)"
+[[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "preflight cannot compute the merge base of HEAD and $base" >&2
+  exit 1
+}
 head_sha="$(git rev-parse HEAD)"
 branch="$(git branch --show-current)"
 [[ -n "$branch" && "$branch" != "main" ]] || {
@@ -190,7 +208,10 @@ else
     exit 1
   }
   [[ "$review_base" == "$base_sha" ]] || {
-    echo "review log belongs to another base" >&2
+    echo "review log belongs to another base: it records $review_base, and this" >&2
+    echo "  branch's merge base with $base is $base_sha. Main advancing does not" >&2
+    echo "  cause this; rebasing or merging main into the branch does, and that" >&2
+    echo "  really does change the reviewed diff." >&2
     exit 1
   }
   case "$verdict:$findings_fixed" in
