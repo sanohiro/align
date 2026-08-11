@@ -1488,6 +1488,23 @@ Historical session journal           docs/archive/HANDOFF-2026-07-25.md
 - Keep release and review procedures in `CLAUDE.md`; link to them instead of
   duplicating them here.
 
+The nightly full-suite sweep found a Gate-3 defect the bounded gate cannot
+see: `fuzz_frontend::frontend_never_panics_on_token_soup_in_a_function_body`
+(seed 2561) tripped a debug assertion in `borrow_sources_inner`, because a
+rejected unary operand kept its own type as the result type. A view-bearing
+operand therefore produced a unary node the provenance walk classifies as
+borrowing nothing. Fixed 2026-08-11 by returning the error sentinel on the
+rejecting paths — the rule the `align-self-review` skill's Gate 3 already
+states — for the whole class the review enumerated: unary `-`/`~`, arithmetic
+and bitwise binaries, and casts to a non-numeric target. Verified pre-existing
+against a clean baseline compiler.
+
+Two `m5` owners (`json_scalar_array_str_element_rejected`,
+`json_scan_generic_return_context_inference_matrix`) expect rejections the
+compiler does not emit, identically on a pre-today baseline: another
+out-of-gate suite whose expectations drifted from the implementation. Triage
+whether the rule was intentionally relaxed or the tests are stale.
+
 The silent-empty-MIR class reached a fourth instance and is now closed at its
 root: `cache_codegen::json_scan_generic_return_context_no_publication` failed
 because the MIR body validator kept its own copy of the monomorph-name
