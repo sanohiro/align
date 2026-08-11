@@ -474,6 +474,37 @@ pr_tier_path_is_library "crates/align_driver/tests/pkg_db_q6.rs" && {
   exit 1
 }
 
+# preflight.yml runs the PR's own copy of the workflow, so where it fetches the
+# checker and the classifier from is itself a guard. Pin that source to the live
+# default-branch tip: `github.event.pull_request.base.sha` is frozen at PR
+# creation and no event the workflow listens to refreshes it, so machinery fixed
+# on main would never reach an already-open PR (PR #746, 2026-08-11), and a
+# stacked PR's own base branch is author-controlled. Recompute the assertion
+# from the workflow rather than trusting a remembered string.
+preflight_workflow="$repo_root/.github/workflows/preflight.yml"
+grep -Fq 'TRUSTED_TIP_SHA="$(git rev-parse --verify --quiet "refs/remotes/origin/main^{commit}")"' \
+  "$preflight_workflow" || {
+  echo "preflight.yml no longer resolves the trusted tip from refs/remotes/origin/main" >&2
+  exit 1
+}
+for trusted_machinery in check-pr-preflight.sh pr-tier.sh; do
+  grep -Fq "git show \"\$TRUSTED_TIP_SHA:scripts/$trusted_machinery\"" "$preflight_workflow" || {
+    echo "preflight.yml no longer fetches scripts/$trusted_machinery from the trusted tip" >&2
+    exit 1
+  }
+done
+if grep -qE '\$\{?PR_BASE_SHA\}?:scripts/' "$preflight_workflow"; then
+  echo "preflight.yml fetches machinery from the frozen pull_request.base.sha again" >&2
+  exit 1
+fi
+untrusted_fetch="$(grep -oE 'git show "\$\{?[A-Za-z_][A-Za-z0-9_]*\}?:' "$preflight_workflow" |
+  grep -Fv 'git show "$TRUSTED_TIP_SHA:' || true)"
+[[ -z "$untrusted_fetch" ]] || {
+  echo "preflight.yml fetches machinery from a source other than the trusted tip:" >&2
+  echo "  $untrusted_fetch" >&2
+  exit 1
+}
+
 # Tier classification and the review-round tripwire.
 tier_repo="$tmp_dir/tier-repo"
 mkdir -p "$tier_repo/crates/thing/src" "$tier_repo/crates/thing/tests" \
