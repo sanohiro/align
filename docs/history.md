@@ -1,5 +1,15 @@
 # History of Align
 
+## 2026-08-11: PostgreSQL streamed delivery is one explicit native rail
+
+The first D13 rail shipped common bounded batches and direct SoA projection while retaining
+PostgreSQL `BufferedFull`. The next rail fixes `SingleRow` and `PortalBatch(n)` as explicit runtime
+delivery options shared by direct and prepared Query execution. It uses one result/cancel/Drop
+state machine, retains parameter copies until protocol synchronization, and leaves static Query
+artifacts unchanged. libpq 17 is the client floor for chunked rows and nonblocking cancellation;
+the required server compatibility floor remains PostgreSQL 16.4. Binary formats, COPY, pipeline
+mode, and LISTEN/NOTIFY remain independent rails rather than one oversized native PR.
+
 ## 2026-08-07: shared borrow accepts stable Copy storage
 
 Shared `borrow` now accepts a stable bound Copy or Move place. Copy values still pass by value by

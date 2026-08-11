@@ -157,7 +157,9 @@ buffer reuse, or another internal mechanism. The public contract must still make
 Driver tests/bench observations label physical delivery as `Step`, `BufferedFull`, `SingleRow`, or
 `PortalBatch` and pin transported/buffered/decoded row counts where the native API exposes them.
 The baseline D4/D8 PostgreSQL path is `BufferedFull`; D13 adds explicitly selected single-row/portal
-paths. A requested delivery option is applied or rejected as unsupported, never silently downgraded.
+paths. Absence of a PostgreSQL delivery option retains `BufferedFull`; `SingleRow` and
+`PortalBatch(n)` map exactly to libpq single-row and chunked-row mode. A requested delivery option
+is applied or rejected, never silently downgraded.
 
 ### 2.5 Thin common layer, explicit native extensions
 
@@ -652,8 +654,9 @@ Version 1 SQLite binding is exact:
   exactly once.
 
 The baseline PostgreSQL `BufferedFull` path completes parameter transmission through the synchronous
-libpq call before returning its owned result. Any later single-row, portal, pipeline, or asynchronous
-path must retain its own parameter bytes until the native protocol no longer uses them.
+libpq call before returning its owned result. The D13 `SingleRow` and `PortalBatch` paths retain
+their parameter bytes in execution-owned context storage until `PQgetResult` returns null and the
+protocol is synchronized. A later pipeline or other asynchronous path has the same obligation.
 The v1 PostgreSQL Text binder materializes a NUL-terminated execution-owned copy and rejects an
 embedded U+0000 in `text`/`varchar`/`name` with `db.Error.Encode` before SQL send. A `bytea`
 parameter in Text format is encoded as the PostgreSQL `\x` form with two lowercase hex digits per
@@ -930,6 +933,10 @@ options: slice<db.ExecuteOption>) -> Result<db.rows<R>,db.Error>` returns a row 
 statement's fresh generation. The compiler therefore rejects reuse/finalization of the statement
 until that row resource drops; after Drop, another execution may borrow the statement again. Direct
 `rows(exec, query, ...)` similarly returns a resource dependent on the underlying connection.
+PostgreSQL's D13 native delivery path adds only
+`postgres.rows_stmt_native(borrow mut stmt, params, common_options, native_options)` with the same
+dependency and cleanup rules. It is the prepared counterpart of `postgres.rows_native`; it does
+not change common `db.rows_stmt` or create a statement cache.
 
 A future cache is explicit and must expose its scope and capacity.
 
@@ -1606,6 +1613,7 @@ postgres.PrepareOption.ParameterOid(name, oid)
 
 postgres.ExecuteOption.ParameterFormat(name, Text|Binary)
 postgres.ExecuteOption.ResultFormat(Text|Binary)
+postgres.ExecuteOption.Delivery(SingleRow|PortalBatch(max_rows))
 
 postgres.TxOption.Isolation(ReadCommitted|RepeatableRead|Serializable)
 postgres.TxOption.Access(ReadOnly|ReadWrite)
@@ -1633,6 +1641,11 @@ Unknown fields/types/OIDs, duplicate field controls, and conflicting formats are
 hints. The first implementation may support only `Text`; requesting an unavailable binary mapping
 returns `Unsupported` before sending SQL. Text-format `bytea` uses the exact hex encoding from
 §5.6.1; Binary-format `bytea` alone passes raw bytes with an explicit libpq length.
+
+`Delivery` is a row-producing execution option. Its exact operation set, default, size bound,
+streaming/error semantics, and ABI are fixed by the A1 PostgreSQL delivery ledger in §23. It does
+not apply to commands. Native prepared-row execution uses the ledger's explicit
+`postgres.rows_stmt_native`; common `db.rows_stmt` continues to accept common options only.
 
 The first-release connection sum is:
 
@@ -1695,7 +1708,8 @@ The design must not block:
 - detailed `EXPLAIN` formats.
 
 The initial public release requires the common Query/transaction path, native options, checked
-metadata, and basic plan access. COPY/pipeline/notify are scheduled in D13.
+metadata, and basic plan access. D13's first PostgreSQL-native rail adds single-row and chunked-row
+delivery. COPY, pipeline mode, and LISTEN/NOTIFY remain later independently specified D13 rails.
 
 ---
 
@@ -4452,13 +4466,99 @@ review completed at `7bddab67`; the table above closes its complete finding set 
 implementation. Before the later code review, repeat only the matrix-to-diff pass: every applicable
 cell must name its implementation path and an owner, or be explicitly deferred to another A1 rail.
 
-- bounded `next_batch` and batch generations;
+#### A1 PostgreSQL streamed-delivery public-contract ledger
+
+This ledger is the source of truth for the second independently useful D13 rail. It adds explicit
+PostgreSQL single-row and bounded chunk delivery without changing the common `db.rows<R>` or
+`db.batch<R>` surface. PostgreSQL binary parameter/result formats are a later independent rail:
+they do not share this rail's PGresult lifetime or cancellation state machine and must not enlarge
+this implementation boundary. COPY, pipeline mode, and LISTEN/NOTIFY remain separately gated.
+
+The direct and prepared forms ship together because both must enter one connection-owned libpq
+result sequence and then use the same `next`, `next_batch`, timeout, cancellation, and Drop state
+machine. Splitting them would publish two option semantics around one mutable native protocol or
+duplicate that protocol proof. This boundary may exceed 1,000 changed hand-written lines for that
+reason; it adds no compiler IR variant or driver-independent abstraction.
+
+The exact added application-callable surface is:
+
+```align
+pub Delivery {
+  SingleRow
+  PortalBatch(i64)
+}
+
+pub ExecuteOption {
+  ParameterFormat(str, Format)
+  ResultFormat(Format)
+  Delivery(Delivery)
+}
+
+pub fn rows_stmt_native<P, R>(
+  borrow mut statement: db.stmt<P, R>,
+  params: P,
+  options: slice<db.ExecuteOption>,
+  native: slice<postgres.ExecuteOption>,
+) -> Result<db.rows<R>, db.Error>
+```
+
+`postgres.rows_native` and `postgres.one_native` retain their existing signatures and accept the
+new option. `postgres.execute_native` retains its signature but rejects `Delivery` because a command
+cannot publish rows. There is no native option on a common operation, no optionless overload, and no
+new `maybe_one_native`, `all_native`, cursor, portal, or cancellation resource. Absence of
+`Delivery` means exactly the shipped synchronous `BufferedFull` path. `SingleRow` maps to
+`PQsetSingleRowMode`; `PortalBatch(max_rows)` maps to `PQsetChunkedRowsMode` and is the public
+`PortalBatch` observation label even though libpq names the mechanism chunked-row mode.
+
+This rail raises the supported PostgreSQL client-library baseline to libpq 17.0 because
+`PQsetChunkedRowsMode` and the nonblocking cancel-connection API first exist there. The library is
+linked directly; there is no `dlsym` fallback, older-client downgrade, or ambient feature probe.
+The required CI and local evidence must print a client version at least 17 while retaining
+PostgreSQL server 16.4 as the compatibility floor. libpq's stable ABI major remains 5.
+
+| Public record | Exact contract |
+|---|---|
+| inputs and defaults | `Delivery` is accepted only by `postgres.rows_native`, `postgres.rows_stmt_native`, and `postgres.one_native`. At most one delivery option may occur. `PortalBatch(max_rows)` has no default and requires `1 <= max_rows <= 2_147_483_647`; the checked value is passed as native `int`. Common `TimeoutNs` and every existing Text-format option retain their current meaning. `[]` selects `BufferedFull`. No environment variable, connection parameter, server setting, benchmark result, or row-count heuristic changes the selection or chunk size. |
+| operation and result | After validation, streamed direct execution calls `PQsendQueryParams`; prepared execution calls `PQsendQueryPrepared`. The selected mode call occurs immediately after a successful send and before flush, input consumption, or result retrieval. `rows_native`/`rows_stmt_native` return the live `db.rows<R>` after successful send and mode selection, without waiting for or buffering the first row. `one_native` consumes that same stream, clones the first Row into `out`, probes exactly one more delivered row for cardinality, and drains/cancels the remainder before returning. |
+| physical delivery and order | `SingleRow` accepts only `PGRES_SINGLE_TUPLE` data results containing exactly one row. `PortalBatch(n)` accepts only `PGRES_TUPLES_CHUNK` data results containing `1..=n` rows. Both preserve server row order. After zero or more data results, require one zero-row `PGRES_TUPLES_OK`, clear it, then call `PQgetResult` until null before declaring exhaustion. A cross-mode status, empty/oversized data result, nonempty terminal result, missing terminal result, or extra result after the terminal one is an invalid streamed sequence. COPY, command, pipeline, and multi-statement statuses are never reinterpreted as rows. |
+| `next` and view lifetime | `next` returns at most one validated Row and never fetches a new PGresult while the current result has an unread row. A mutating advance invalidates the previous rows generation before clearing that result; therefore no returned `str`, `slice<u8>`, or enclosing view remains usable after the next advance. Reaching the end of one data result clears it exactly once before waiting for the next. Zero-row completion returns `Ok(None)` only after the terminal result and null protocol marker are consumed and the connection is synchronized. |
+| `next_batch` and atomicity | `next_batch(rows, max_rows)` preserves the common A1 validation and materialization contract. It may consume part of one PGresult or span several PGresults, but stops exactly at the caller's `max_rows` without probing the next native row. Every view-bearing field is copied into the unpublished batch before its source result is cleared. A native/decode/storage error before the caller bound destroys that whole unpublished batch and returns the first error. If the caller bound is reached before a later server error becomes observable, the completed batch is published and that later error is returned by a subsequent advance; earlier published rows/batches are never retracted or implicitly rolled back. |
+| partial server failure | libpq may deliver data results followed by a fatal result. The advance that observes the fatal result copies the exact existing SQLSTATE/native detail, clears the result, drains to null, and marks rows failed. Already returned rows or batches remain caller-visible; the package performs no hidden compensation, transaction rollback, or memory mutation. `one_native` returns the later native failure rather than publishing its cloned first row when failure arrives before clean completion. |
+| parameter ownership and allocation | The generated binder still performs one execution-owned Text copy per parameter according to §5.6.1. The context retains all parameter pointer/length/format arrays and every copied payload from send through terminal `PQgetResult == null`, mode-selection failure cleanup, timeout cleanup, or early Drop. Original text/blob source owners may be moved, mutated, or dropped after the rows constructor returns. The delivery rail allocates no per-row container and no hidden whole-result buffer; it owns at most the binder context, the current PGresult, libpq's native transport storage, Query-ID storage for direct execution, and an explicitly requested common batch. |
+| validation and error precedence | Direct Query execution validates the complete descriptor header before reading Query identity, then common options in source order, native options in source order, static Query/binder shape, exact live exec state, connection lease, bind values, deadline representability, send, and mode selection. Prepared execution validates the complete statement/plan header and Query identity, then the same option/state/lease/bind/deadline suffix. `Delivery` validation at its source position rejects a duplicate with query-specific `Unsupported`, item `postgres.execute.delivery`, message `duplicate PostgreSQL row delivery option`; an invalid PortalBatch size uses the same item and message `PostgreSQL portal batch size must be between 1 and 2147483647 rows`. `execute_native` rejects its first `Delivery` with the same item and message `PostgreSQL row delivery requires a Query result`. All three occur before lease, execution-context allocation, bind, or send. Existing earlier Text-format and common-option errors retain their exact category and precedence. |
+| post-send invariant failures | Send failure retains the existing connection error. If libpq rejects the immediately selected mode, cancel/drain using the cleanup rule below and return query-specific `InvalidQuery`, item `postgres.rows.delivery`, message `PostgreSQL client rejected the selected row delivery mode`. An invalid result sequence uses the same category/item and message `PostgreSQL streamed result sequence is invalid`. The connection is reusable only if drain, transaction-state synchronization, and blocking-mode restoration all succeed; otherwise it is poisoned/closed before return. |
+| deadline, cancellation, and Drop | One requested common `TimeoutNs` becomes one overflow-checked monotonic absolute deadline before send and remains attached to the streamed rows until clean protocol completion. Caller think time counts; every flush/consume/result wait uses only the remaining interval. Expiry returns the existing `Timeout` after nonblocking native cancel and drain. A non-timeout server cancellation remains `Cancelled`. Early Drop and `one_native` cardinality cleanup issue the same cancel protocol, then allow exactly `1_000_000_000` ns of monotonic recovery; mode-selection failure uses that same fixed recovery budget. Timeout recovery retains D9's `max(original_duration, 1_000_000 ns)` budget. Every non-null PGresult is cleared while draining. Failed cancel dispatch, recovery expiry, I/O failure, unexpected transaction state, or failure to restore blocking mode poisons/closes the connection before releasing the lease. No cleanup path issues SQL or overwrites the first owned error. |
+| overlap and global state | A streamed rows resource owns the connection-global active-execution lease from before bind/send until synchronized exhaustion, failure cleanup, or Drop. A second command, Query, prepare, transaction boundary, catalog operation, or stream on that physical connection fails through the existing overlap contract without touching libpq. Direct and prepared paths do not change process-global state. The nonblocking flag is connection-global: it is set only while the lease is held and restored before the lease is released; restoration failure poisons the connection first. |
+| artifacts, ABI, and cache identity | Query/command descriptors, batch plans, checked metadata, static Query bytes, and their cache identities do not change: delivery is a runtime execution option. Rows state becomes one 120-byte, 8-aligned v3 record. Offsets 0--95 retain v2 meaning. Offset 96 is delivery `u8` (`0=BufferedFull`, `1=SingleRow`, `2=PortalBatch`); 97 is protocol-pending `u8` (`0/1`); 98--99 are zero `u16`; 100 is `i32 portal_max_rows` (zero except positive for PortalBatch); 104 is `i64 deadline_ns` (`-1` absent, otherwise nonnegative); and 112 is zero `u64` tail-reserved. Active BufferedFull requires delivery 0, pending 0, non-null current result, portal size 0, and deadline -1. Active streamed rows require delivery 1/2, pending 1, portal size respectively zero/positive, and a null-or-live current result mirrored at binder-context offset 8. Terminal rows clear delivery/pending/portal/result/context/deadline state while retaining the existing immutable Query identity and batch plan. Every accessor/Drop path validates the complete mode-dependent record before native use. Exact semantic-to-byte and byte-to-semantic goldens pin every valid state plus malformed version/tag/reserved/size/deadline/pointer combination. |
+| runtime producers and inspection | Static producer thunks remain the sole bind/row-validate/decode/batch authority. The PostgreSQL package owns option normalization and the streamed-result state machine; libpq owns protocol delivery. Runtime code performs no reflection, field-name lookup, source/artifact/cache I/O, or Query-body instantiation. Existing Query metadata continues to describe static bind/decode facts; runtime delivery inspection/bench evidence is labeled separately and does not alter artifact identity. |
+| acceptance and measurement | Requires shipped D8/D9 row generations, deadline/cancel recovery, A1 common batch, and libpq >=17. Correctness owners cross direct/prepared x conn/tx x SingleRow/PortalBatch with zero/one/many rows, `next`/`next_batch`/`one_native`, exact/partial/multi-result boundaries, timeout before/after rows, fatal-after-data, decode/storage failure, early Drop, statement/connection reuse, malformed v3 state, and whole/per-unit linking. The required PostgreSQL job runs against server 16.4 with client >=17 and is non-skippable. After correctness, the direct-libpq comparison records time-to-first-row, full-scan throughput, peak native/package bytes, PGresult count/max rows, transported/decoded/published rows, batch copy counts, and cancellation/Drop recovery; it is not a semantic gate. |
+
+The implementation closure matrix is:
+
+| Closure cell | Required implementation closure | Exact owner evidence |
+|---|---|---|
+| public surface and option disposition | Add exactly `Delivery`, the one `ExecuteOption.Delivery` variant, and `rows_stmt_native`; route `rows_native`, `rows_stmt_native`, and `one_native` through one delivery validator. Commands reject delivery and common calls cannot name it. Text/Binary option behavior is otherwise unchanged. | exact exported-surface owner; parameterized common/native source-order and command/query disposition owner |
+| direct/prepared construction and move-in | Validate all public/static inputs before lease, allocate one context, bind once, compute/check the absolute deadline, set nonblocking, send once, immediately select the requested mode, then publish one rows owner dependent on the selected conn/tx or statement generation. Every send/mode failpoint frees Params/context/Query ID once and recovers or poisons before lease release. | direct/prepared x conn/tx send/mode failpoint counters; Params Move/Drop and post-constructor mutation owners |
+| result advancement | Put PGresult acquisition/status/count/current-row transitions in one helper used by `next`, `has_next`, and `next_batch`. Clear each result exactly once, require the mode-specific status sequence, and never fetch past a caller-visible bound. Audit all three consumers whenever this helper changes. | parameterized synthetic status/count sequence owner plus required live PostgreSQL zero/one/many owners |
+| returned views and batch copies | Invalidate the rows generation before clearing a result that backed a returned view. Keep unread rows in the current PGresult. Copy every variable child into batch ownership before clear and destroy an unpublished partial batch on every late error. | compile-time delayed-view rejection; live text/blob `next` and cross-result batch owner; batch allocation/Drop counter |
+| failure, timeout, and cleanup | Deduplicate mode failure, deadline expiry, fatal result, early Drop, and cardinality cleanup around one cancel/drain/synchronize/restore helper. Preserve the first error, clear all results, restore then release or poison then release, and handle active transaction states exactly as D9. Audit existing BufferedFull timeout paths when this helper changes. | cancel start/poll/drain/reset failpoint matrix; fatal-after-data; pre/post-row timeout; early Drop; conn/tx/prepared reuse-or-poison owners |
+| rows ABI and malformed input | Construct and validate the exact 120-byte v3 state in one shared authority. Mode-specific native-pointer rules replace the old unconditional active-result requirement. All consumers validate before field loads that can dispatch or touch native state; terminal transitions zero the complete mutable suffix. | semantic/byte goldens; parameterized field mutation with no native-call counters; v2 rejection; active/terminal state cross-product |
+| FFI and native-version closure | Declare the exact libpq 17 send, row-mode, result, nonblocking cancel-connection, transaction-state, and cleanup signatures/constants. Pin signedness for native `int` chunk size and every polling/status tag with compiled C signature probes. Keep ordered `pq`/`ssl`/`crypto` closure on whole/per-unit Linux and macOS links; reject a client below 17 at build/evidence setup rather than at first request. | C signature/status probe; client-version assertion; whole/per-unit link inventory; x86_64/ARM64/macOS build owners |
+| operation matrix and allocation parity | Run the full direct/prepared x conn/tx x mode matrix through the same fake counters and required PostgreSQL integration. Assert one send, no hidden SQL, one active lease, bounded live PGresult count, exact parameter retention, balanced context/result/rows/batch allocation, and the same error class/Query identity across sibling paths. | parameterized operation-matrix owner plus required provisioned PostgreSQL suite and direct-libpq measurement |
+
+Before implementation, run one fresh independent adversarial review of this ledger and proposed PR
+boundary. Close findings in the ledger first. Before the code review, extract every normative
+`must`/`exact`/`every`/`before`/`reject`/`required` statement from this section and point it to one
+implementation path and one owner; a finding in result advancement, cancellation, or v3 validation
+requires a complete sibling-consumer audit, not a line-local patch.
+
+- bounded `next_batch`, batch generations, segmented child buffers, nullable validity bitmaps, and
+  direct eligible `soa<Row>` decode with no intermediate AoS — shipped by the first A1 rail;
+- PostgreSQL single-row and portal-batch delivery — specified by the ledger above;
 - PostgreSQL binary parameter/result formats;
-- segmented child buffers and nullable validity bitmaps;
-- direct eligible `soa<Row>` decode with no intermediate AoS;
 - a separately specified owned-Row/owned-collection materializer only if a measured consumer needs
   `string`/dynamic-array Row storage; it must not weaken the v1 `RegionPlain` path;
-- PostgreSQL COPY/pipeline/single-row/LISTEN-NOTIFY;
+- PostgreSQL COPY/pipeline/LISTEN-NOTIFY;
 - SQLite backup/incremental blob/FTS helpers;
 - explicit pool package;
 - additional drivers only after the common contracts are proven.

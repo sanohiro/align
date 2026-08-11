@@ -180,6 +180,12 @@ diff touching `apps/db` or a `pkg_db_*` test must pass it before push. The
 same rule generalizes: a new env-gated required CI suite ships with a matching
 local Docker script in the same PR.
 
+The D13 PostgreSQL streamed-delivery rail keeps server 16.4 as the compatibility
+floor but requires libpq client/development files at version 17 or newer. Its
+implementation PR must make both CI and `db-verify-local.sh` assert the client
+version and run the new required delivery suite; a newer server image must not
+hide an accidental client-version dependency.
+
 ## Benchmarks are not tests
 
 A benchmark measures one named performance path against a baseline or control.

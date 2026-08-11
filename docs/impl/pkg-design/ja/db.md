@@ -123,7 +123,8 @@ libsqlite3/libpq、binary decode、buffer reuseなどの内部機構は選択で
 transport/bufferした後に最大2行をdecodeする。`rows` はone-pass consumptionでありnetwork
 streaming保証ではない。test/bench observationは `Step` / `BufferedFull` / `SingleRow` /
 `PortalBatch` とtransported/buffered/decoded countを固定する。D13のsingle-row/portalは明示
-optionで選び、unsupportedならerrorで、黙ってdowngradeしない。
+optionで選ぶ。optionなしは`BufferedFull`、`SingleRow`と`PortalBatch(n)`はlibpqの
+single-row/chunked-row modeへexactly mapし、適用不能ならerrorで黙ってdowngradeしない。
 
 ### 2.5 薄い共通層と明示的native extension
 
@@ -460,8 +461,9 @@ resetを禁止する。partial-bind/native errorもtemporaryを全て解放し�
 exactly onceでconsume/dropする。
 
 初期PostgreSQL `BufferedFull` pathは同期libpq callのreturn前にparameter transmissionを完了
-する。将来のsingle-row/portal/pipeline/async pathはnative protocolが不要になるまで自身の
-parameter bytesを保持する。これはper-execution bind copyでありper-row copyではない。
+する。D13 `SingleRow`/`PortalBatch`は`PQgetResult`がnullを返してprotocol synchronizationが
+完了するまでexecution-owned contextに全parameter bytesを保持する。将来のpipeline/async pathも
+同じ義務を持つ。これはper-execution bind copyでありper-row copyではない。
 v1 PostgreSQL Text binderはNUL-terminated execution-owned copyを作り、text/varchar/nameの
 embedded U+0000をSQL送信前に `db.Error.Encode` とする。Text formatのbyteaはPostgreSQL
 `\x` formへinput byteごとにlowercase hex 2桁でencodeし、raw byteをlibpq Text parameterへ
@@ -571,6 +573,10 @@ rows := db.rows_stmt(stmt, params, [])?
 
 stmtはprepare元connectionへdependentである。rowsはstmtのfresh generationへdependentで、
 rows Dropまでstmtを再利用/reset/finalizeできない。global implicit statement cacheはない。
+PostgreSQL D13 native deliveryは同じdependency/cleanup ruleを持つ
+`postgres.rows_stmt_native(borrow mut stmt, params, common_options, native_options)`だけを追加する。
+これは`postgres.rows_native`のprepared counterpartで、common `db.rows_stmt`やstatement cacheを
+変更しない。
 
 ### 6.5 connection/transaction reuse
 
@@ -857,6 +863,7 @@ postgres.CommandOption.ParameterType(name, canonical_type_name)
 postgres.PrepareOption.ParameterOid(name, oid)
 postgres.ExecuteOption.ParameterFormat(name, Text|Binary)
 postgres.ExecuteOption.ResultFormat(Text|Binary)
+postgres.ExecuteOption.Delivery(SingleRow|PortalBatch(max_rows))
 postgres.TxOption.Isolation(ReadCommitted|RepeatableRead|Serializable)
 postgres.TxOption.Access(ReadOnly|ReadWrite)
 postgres.TxOption.Deferrable(bool)
@@ -874,6 +881,10 @@ explicit libpq lengthを使う。未実装のbinary mapping要求はSQL送信前
 初期実装がtext中心でもbinaryを閉ざさない。unknown/conflicting OIDをignored hintにせず
 errorにする。ParameterTypeはstatic artifact/public contractへ入りPostgreSQLへpinする。
 field別controlのunknown/duplicateもerror。binary mapping未実装ならSQL送信前にUnsupported。
+`Delivery`はrow-producing executionだけのoptionで、operation set/default/size bound/
+streaming/error/ABIは§23のA1 PostgreSQL delivery ledgerが固定する。commandには適用しない。
+prepared rowsはexplicit `postgres.rows_stmt_native`を使い、common `db.rows_stmt`はcommon
+optionだけを受け続ける。
 
 connection sumは `ApplicationName`、`ConnectTimeoutNs`、`SslMode`、
 `TargetSessionAttrs`、`Parameter(name,value)` で固定する。URLとoptionのsemantic key重複は
@@ -883,6 +894,9 @@ SearchPathOnlyとIncludeSystemCatalogsはconflict。Buffers/Timing/Walはnative 
 なければ実行前にconflictする。
 
 ### 12.3 native feature
+
+初期release後の最初のPostgreSQL-native D13 railはsingle-row/chunked-row deliveryを追加する。
+COPY、pipeline mode、LISTEN/NOTIFYは独立してspecifyする後続D13 railである。
 
 PostgreSQL array、UUID、JSONB、enum/domain、range、explicit composite mapping、COPY、
 pipeline/single-row、LISTEN/NOTIFY、LATERAL、DISTINCT ON、custom operator/extension、
@@ -2923,8 +2937,91 @@ required author-side ledger-to-prose/matrix passとfresh independent adversarial
 matrix-to-diff passだけを再実施し、全cellへimplementation pathとownerを対応させるか別A1
 railへのexplicit deferを記す。
 
-bounded batch generation、PostgreSQL binary format、segmented child/validity bitmap、
-eligible direct SoA、COPY/pipeline/single-row/LISTEN-NOTIFY、SQLite backup/blob/FTS、
+#### A1 PostgreSQL streamed-delivery public-contract ledger
+
+これは2番目のindependently useful D13 railのsource of truthである。common `db.rows<R>` /
+`db.batch<R>`を変えず、explicit PostgreSQL single-rowとbounded chunk deliveryを追加する。
+PostgreSQL binary parameter/result formatはPGresult lifetime/cancellation state machineを共有しない
+後続railとし、このimplementation boundaryへ含めない。COPY、pipeline、LISTEN/NOTIFYも別railである。
+
+direct/preparedはどちらも1 connection-owned libpq result sequenceへ入り、同じ`next`、
+`next_batch`、timeout、cancellation、Drop state machineを使うため同時にshipする。分割すると1つの
+mutable native protocolの周囲へ2つのoption semanticsを公開するかprotocol proofを重複させる。
+この理由で1,000 changed hand-written linesを超え得るが、compiler IR variantやdriver-independent
+abstractionは追加しない。
+
+exact added surface:
+
+```align
+pub Delivery {
+  SingleRow
+  PortalBatch(i64)
+}
+
+pub ExecuteOption {
+  ParameterFormat(str, Format)
+  ResultFormat(Format)
+  Delivery(Delivery)
+}
+
+pub fn rows_stmt_native<P, R>(
+  borrow mut statement: db.stmt<P, R>,
+  params: P,
+  options: slice<db.ExecuteOption>,
+  native: slice<postgres.ExecuteOption>,
+) -> Result<db.rows<R>, db.Error>
+```
+
+既存signatureの`postgres.rows_native`/`postgres.one_native`はnew optionを受理する。
+`postgres.execute_native`はsignatureを保つがcommandはrowをpublishしないため`Delivery`をrejectする。
+common operationへのnative option、optionless overload、new `maybe_one_native`/`all_native`/cursor/
+portal/cancel resourceはない。Deliveryなしはexactly shipped synchronous `BufferedFull`。
+`SingleRow`は`PQsetSingleRowMode`、`PortalBatch(max_rows)`は`PQsetChunkedRowsMode`へmapする。
+libpq側の名称はchunked-row modeだがpublic observation labelは`PortalBatch`である。
+
+`PQsetChunkedRowsMode`とnonblocking cancel-connection APIを必要とするためsupported PostgreSQL
+client baselineはlibpq 17.0へ上がる。direct linkを使い、`dlsym` fallback、older-client downgrade、
+ambient feature probeは行わない。required CI/local evidenceはclient >=17を表示し、PostgreSQL server
+16.4をcompatibility floorとして維持する。stable libpq ABI majorは5のままである。
+
+| Public record | Exact contract |
+|---|---|
+| input/default | `Delivery`は`postgres.rows_native`、`postgres.rows_stmt_native`、`postgres.one_native`だけが受理し、最大1個。`PortalBatch(max_rows)`はdefaultなしで`1 <= max_rows <= 2_147_483_647`、checked valueをnative `int`で渡す。common `TimeoutNs`と既存Text optionのmeaningは不変。`[]`は`BufferedFull`。environment/connection/server/benchmark/row-count heuristicでmode/chunk sizeを変えない。 |
+| operation/result | validation後、directは`PQsendQueryParams`、preparedは`PQsendQueryPrepared`。successful send直後かつflush/input consume/result retrieve前にmode callを行う。rows constructorはfirst rowをwait/bufferせずsuccessful send+mode selection後にlive `db.rows<R>`を返す。`one_native`は同じstreamでfirst Rowを`out`へcloneし、cardinalityのためexactly one more delivered rowをprobeしてremainderをdrain/cancel後にreturnする。 |
+| physical delivery/order | `SingleRow`はexactly 1 rowの`PGRES_SINGLE_TUPLE` data resultだけを受理。`PortalBatch(n)`は`1..=n` rowsの`PGRES_TUPLES_CHUNK`だけを受理。server orderを保持する。0個以上のdata result後にzero-row `PGRES_TUPLES_OK`を1個要求してclearし、exhaustion前に`PQgetResult`がnullになるまで呼ぶ。cross-mode status、empty/oversized data、nonempty/missing terminal、terminal後のextra resultはinvalid sequence。COPY/command/pipeline/multi-statement statusをrowとしてreinterpretしない。 |
+| `next`/view lifetime | `next`は最大1 validated Rowを返し、current resultにunread rowがある間new PGresultをfetchしない。mutating advanceはそのresultをclearする前にprevious rows generationをinvalidateするため、previous `str`/`slice<u8>`/enclosing viewは次advance後に使用不可。data result endでexactly once clearしてから次をwaitする。terminal resultとnull protocol markerをconsumeしconnection synchronized後だけ`Ok(None)`。 |
+| `next_batch`/atomicity | common A1 validation/materializationを維持する。1 PGresultの一部または複数resultをconsumeできるがcaller `max_rows`でexactly stopしnext native rowをprobeしない。source result clear前に全view-bearing fieldをunpublished batchへcopyする。bound前のnative/decode/storage errorはwhole unpublished batchをdestroyしfirst errorを返す。bound到達後にlater server errorが判明する場合はbatchをpublishし、subsequent advanceがerrorを返す。以前publishしたrow/batchをretract/implicit rollbackしない。 |
+| partial server failure | data result後にfatal resultが来得る。観測したadvanceは既存exact SQLSTATE/native detailをcopyし、result clear、nullまでdrain、rows failed化する。以前returnしたrow/batchはcaller-visibleのままでhidden compensation/transaction rollback/memory mutationなし。`one_native`はclean completion前にlater native failureを見たらcloned first rowをpublishせずfailureを返す。 |
+| parameter ownership/allocation | generated binderは§5.6.1どおりparameterごとに1 execution-owned Text copyを作る。contextはsendからterminal null、mode-selection cleanup、timeout、early Dropまで全pointer/length/format arrayとcopy payloadを保持する。constructor return後にoriginal text/blob source ownerをmove/mutate/dropできる。per-row container/hidden whole-result bufferなし。binder context、current PGresult、libpq transport storage、direct Query-ID、explicit common batchだけをownし得る。 |
+| validation/error precedence | direct Queryはcomplete descriptor header、Query identity、common options source order、native options source order、static Query/binder shape、exact live exec state、lease、bind、deadline representability、send、mode selectionの順。preparedはcomplete statement/plan header+Query identity後に同じoption/state/lease/bind/deadline suffix。source positionのduplicate Deliveryはquery-specific `Unsupported` item `postgres.execute.delivery`、message `duplicate PostgreSQL row delivery option`。invalid Portal sizeは同item、message `PostgreSQL portal batch size must be between 1 and 2147483647 rows`。`execute_native`のfirst Deliveryは同item、message `PostgreSQL row delivery requires a Query result`。3つともlease/execution-context allocation/bind/send前。既存earlier Text/common errorのcategory/precedenceは不変。 |
+| post-send invariant failure | send failureは既存connection error。immediate mode selection rejectはcleanup ruleでcancel/drainしquery-specific `InvalidQuery` item `postgres.rows.delivery`、message `PostgreSQL client rejected the selected row delivery mode`。invalid result sequenceは同category/item、message `PostgreSQL streamed result sequence is invalid`。drain、transaction synchronization、blocking-mode restoreが全成功した時だけreuseし、失敗ならreturn前にpoison/closeする。 |
+| deadline/cancellation/Drop | common `TimeoutNs`はsend前に1 overflow-checked monotonic absolute deadlineとなりclean protocol completionまでrowsに付く。caller think timeもcountし、全flush/consume/result waitはremaining intervalだけを使う。expiryはnonblocking native cancel+drain後に既存`Timeout`、別server cancelは`Cancelled`。early Dropと`one_native` cardinality cleanupは同cancel protocolとexact `1_000_000_000` ns recovery budget、mode-selection failureも同budget。timeout recoveryはD9の`max(original_duration, 1_000_000 ns)`を維持する。drain中の全nonnull PGresultをclearする。cancel dispatch/recovery/I/O/transaction state/blocking restore failureはlease release前にpoison/close。cleanupはSQLを発行せずfirst owned errorを上書きしない。 |
+| overlap/global state | streamed rowsはbind/send前からsynchronized exhaustion/failure cleanup/Dropまでconnection-global execution leaseをownする。同physical connectionのsecond command/Query/prepare/transaction boundary/catalog/streamは既存overlap errorでlibpqへ触れずfail。process-global stateは変更しない。connection-global nonblocking flagはlease中だけsetし、release前にrestore、restore failureは先にpoisonする。 |
+| artifact/ABI/cache | Query/command descriptor、batch plan、checked metadata、static Query bytes/cache identityはruntime optionなので不変。Rows stateは120-byte、8-align v3。0--95はv2 meaning。96 delivery u8 (`0=BufferedFull`,`1=SingleRow`,`2=PortalBatch`)、97 protocol-pending u8 (`0/1`)、98--99 zero u16、100 `i32 portal_max_rows`（PortalBatchだけpositive）、104 `i64 deadline_ns`（absent `-1`、他nonnegative）、112 zero u64 tail-reserved。active BufferedFullはdelivery 0/pending 0/non-null current result/portal 0/deadline -1。active streamedはdelivery 1/2、pending 1、portal size 0/positive、current result null-or-liveかつbinder-context offset 8とmirror。terminalはexisting immutable Query identity/batch plan以外のdelivery/pending/portal/result/context/deadlineをclear。全accessor/Dropはnative use前にcomplete mode-dependent recordをvalidate。semantic-to-byte/byte-to-semantic goldenでvalid stateとmalformed version/tag/reserved/size/deadline/pointerをpinする。 |
+| producer/runtime inspection | static producer thunkだけがbind/row validate/decode/batch authority。PostgreSQL packageはoption normalizationとstream state machine、libpqはprotocol deliveryをownする。reflection/field-name lookup/source/artifact/cache I/O/Query-body instantiationなし。static Query metadataはstatic factsだけを記録し、runtime delivery observationはartifact identityを変えない別label。 |
+| acceptance/measurement | shipped D8/D9 rows+deadline/cancel、common A1 batch、libpq >=17が前提。direct/prepared x conn/tx x SingleRow/PortalBatchにzero/one/many、`next`/`next_batch`/`one_native`、exact/partial/multi-result boundary、pre/post-row timeout、fatal-after-data、decode/storage failure、early Drop、reuse、malformed v3、whole/per-unit linkをcrossする。required PostgreSQLはserver 16.4/client >=17でnon-skippable。correctness後のdirect-libpq比較はtime-to-first-row、full-scan throughput、peak bytes、PGresult count/max rows、transported/decoded/published rows、batch copy、cancel/Drop recoveryを記録するがsemantic gateではない。 |
+
+Implementation closure matrix:
+
+| Cell | Closure | Owner evidence |
+|---|---|---|
+| public/option | exact `Delivery`、1 ExecuteOption variant、`rows_stmt_native`を追加し、3 Query operationを1 validatorへroute。commandはreject、common callからname不可、Text/Binary behaviorは不変。 | exported-surface owner、common/native source-orderとcommand/query disposition matrix |
+| direct/prepared construction | 全public/static input validation→lease→1 context/bind→absolute deadline compute/check→nonblocking→1 send→immediate mode→conn/tx/stmt dependent rows publication。send/mode failpointでParams/context/IDをonce freeしrecover/poison後にlease release。 | direct/prepared x conn/tx failpoint、Params Move/Drop/post-return mutation |
+| result advancement | PGresult acquire/status/count/row transitionを`next`/`has_next`/`next_batch`共通helperへ置く。各resultをonce clear、mode-specific sequence、bound超fetchなし。変更時3 consumerをaudit。 | parameterized synthetic sequence + live zero/one/many |
+| view/batch | backing result clear前にrows generation invalidate。unread rowはcurrent resultへ保持し、batch childはclear前にcopy。late errorでunpublished partial batch destroy。 | delayed-view compile rejection、live text/blob/cross-result batch、allocation/Drop counter |
+| failure/timeout/cleanup | mode failure、deadline、fatal、Drop、cardinalityを1 cancel/drain/synchronize/restore helperへ集約。first error、all-result clear、restore→releaseまたはpoison→release。existing BufferedFull timeout siblingもaudit。 | cancel start/poll/drain/reset failpoint、fatal-after-data、pre/post-row timeout、Drop、reuse-or-poison |
+| rows ABI/malformed | exact 120-byte v3を1 shared authorityでconstruct/validateし、old unconditional active-result ruleをmode-dependentにする。dispatch/native field load前validate、terminalでmutable suffix全zero。 | byte golden、field mutation no-native-call、v2 reject、active/terminal cross-product |
+| FFI/version | exact libpq17 send/row-mode/result/nonblocking cancel/transaction/cleanup signaturesとconstantをdeclare。native `int` chunk size/polling status signednessをC probeでpin。whole/per-unit Linux/macOSのordered pq/ssl/crypto closureを保持し、client <17はfirst requestでなくbuild/evidence setupでreject。 | C signature/status、client version、link inventory、x86_64/ARM64/macOS build |
+| operation/allocation parity | full direct/prepared x conn/tx x modeをsame fake counters+required PostgreSQLで実行し、one send/no hidden SQL/one lease/bounded live PGresult/exact parameter retention/balanced allocation/sibling error class+Query identityをassert。 | parameterized operation matrix、provisioned suite、direct-libpq measurement |
+
+implementation前にfresh independent adversarial reviewでledgerとPR boundaryをreviewし、findingは
+ledger-firstで閉じる。code review前にこのsectionの全normative `must`/`exact`/`every`/`before`/
+`reject`/`required`をimplementation path+ownerへ対応させる。result advancement、cancellation、
+v3 validation findingはline patchでなくcomplete sibling-consumer auditを要求する。
+
+bounded batch generation、segmented child/validity bitmap、eligible direct SoAはfirst A1でshipped。
+PostgreSQL single-row/portal-batchは上記ledgerでspecified。PostgreSQL binary format、
+COPY/pipeline/LISTEN-NOTIFY、SQLite backup/blob/FTS、
 explicit pool、common contract実証後の追加driver。
 
 ### D14 — dynamic SQLとnative callback

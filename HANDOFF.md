@@ -5,7 +5,7 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-10._ The C-B borrow/ownership capability is complete
+_Last updated: 2026-08-11._ The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit
 region materialization is complete through L4 and L6. Direct, captured,
 imported, and function-value returns preserve exact owner provenance;
@@ -33,9 +33,15 @@ enforcement, cancellation drain/recovery, and failure-safe stream cleanup. The
 Q6 compound product closure now completes D10 with ordinary Query-local Pure
 shapers for transaction/master and User + Groups outputs, exact one-execution
 stream ownership, one-parent and adjacent segmented shaping, visible region
-allocation/copies, and whole/per-unit mutable-retention parity. The next product
-work is the first independently useful A1/D13 throughput rail: common bounded
-batch/SoA delivery.
+allocation/copies, and whole/per-unit mutable-retention parity. #740 ships the
+first independently useful A1/D13 throughput rail: common bounded batch/SoA
+delivery with the v5 Query batch plan on both drivers. #741 tiers verification,
+#742 restores the scoped `pkg.web` dispatch rule, and #743 completes fixed and
+owned struct-array slicing. The next product work is the independently useful
+PostgreSQL `SingleRow` / `PortalBatch` direct-and-prepared delivery rail. Its
+public contract and implementation closure matrix are the second A1 ledger in
+`docs/impl/pkg-design/db.md` §23; binary formats remain the following separate
+rail.
 
 Out-of-gate suite status (suites outside the bounded CI gate; a nightly
 full-suite workflow now runs them daily so this class cannot rot silently):
@@ -56,7 +62,7 @@ blocking) before relying on the nightly full-suite signal, which it will
 otherwise consume up to the job timeout (the test now carries `#[ignore]` so
 `cargo test` excludes it by default until then).
 
-The fixed-array follow-up from the validator-alignment review is closed. The
+The fixed-array follow-up from the validator-alignment review is closed by #739. The
 suspected owned `array<T>` element is source-reachable: sema admitted it even
 though fixed arrays have no per-element null/drop lowering for that Move
 shape. Sema now rejects the complete scalar-Move element class, including owned
@@ -66,8 +72,8 @@ Focused owners preserve Copy values and in-place Move structs while rejecting
 owned strings, owned arrays, and resource-bearing near-misses before MIR
 construction.
 
-Fixed on this branch (was present on `main` since the 62f48771 checked-HIR
-validation activation): the body validator contradicted sema when reading a
+Fixed on `main` by #743 (was present since the 62f48771 checked-HIR validation
+activation): the body validator contradicted sema when reading a
 `string` element field from a Move-struct array as a borrowed `str` view, so
 `emit-mir` silently produced an **empty program** (check ok, no `_main`, link
 failure). Sema also admitted owned-`string` scalar fixed arrays despite their
@@ -94,7 +100,8 @@ Q4a reusable execution           complete through D6 + D7
 Q4b streaming resilience         complete through D8 + D9
 Q5 schema tooling/inspection     complete through D11 + D12
 Q6 compound product closure      complete through D10
-next: A1 common batch/SoA rail   D13
+A1 common batch/SoA rail         complete through #740 / D13
+next: A1 PostgreSQL delivery     SingleRow + PortalBatch / D13
 ```
 
 The exact cell contracts and owner matrices remain in

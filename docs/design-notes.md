@@ -309,6 +309,14 @@ interface carries that symbol for separate compilation, then concrete substituti
 HIR/MIR. The batch remains the one Move owner and `soa<R>` remains the same borrowed view rooted in
 that resource generation. This adds neither an owned SoA value nor a DB-specific compiler API.
 
+**PostgreSQL delivery mode is an execution cost choice, not a Query identity.** A static Query's
+SQL, Params/Row contract, binder, decoder, batch plan, and cache identity do not change when one
+execution selects `SingleRow` or `PortalBatch(n)`. The choice therefore stays in the explicit
+driver-qualified execution-option slice. Both direct and prepared execution enter one libpq result
+state machine, retain Params until protocol completion, and expose partial-server-failure timing
+instead of pretending bounded delivery is atomic. Binary wire formats remain a separate rail
+because they change bind/decode representation rather than result delivery lifetime.
+
 **A named `region` is a destination capability, not an allocator abstraction.** Compound
 database reads and streaming decoders need ordinary library functions to construct caller-owned
 arrays and strings without falling back to hidden heap allocation. `arena out {}` exposes only

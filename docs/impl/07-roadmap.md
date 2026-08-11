@@ -57,10 +57,13 @@ builds on the typed streaming/cancellation/compound paths; A2/D14 builds on both
 drivers and the proved cancellation/callback rules and does not depend on D13.
 Their independently useful common/driver rails may proceed in parallel; no
 unrelated native surface waits merely for an earlier bullet in the same D label.
-The first rail is the exact common `batch<R>` / bounded `next_batch` / row and
-`SoaPlain` projection contract plus v5 Query batch plan recorded by
-`pkg-design/db.md` §23. It retains SQLite `Step` and PostgreSQL `BufferedFull`;
-native delivery modes remain a later independent A1 rail.
+The first rail, shipped by #740, is the exact common `batch<R>` / bounded
+`next_batch` / row and `SoaPlain` projection contract plus v5 Query batch plan
+recorded by `pkg-design/db.md` §23. It retains SQLite `Step` and PostgreSQL
+`BufferedFull`. The next independently useful rail is the exact PostgreSQL
+`SingleRow` / `PortalBatch` direct-and-prepared delivery contract recorded by
+the adjacent A1 ledger. PostgreSQL binary formats, COPY, pipeline mode, and
+LISTEN/NOTIFY remain later independent rails rather than enlarging that PR.
 For planning language, **initial `pkg.db` release** means L1a–L7 plus D1–D12;
 **complete committed `pkg.db` roadmap** means those plus D13 and D14. D0 is
 disposable native evidence and may run in parallel at any time.

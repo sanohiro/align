@@ -535,7 +535,9 @@ idea is rejected.
   `BufferedFull`. D13 adds explicitly selected single-row/portal delivery; requested unsupported
   modes fail instead of downgrading.
 - **v1 impact:** not a correctness blocker for the D4 baseline after disclosure; bounded PostgreSQL
-  transport is a scheduled D13 capability and must not be falsely promised earlier.
+  transport is a scheduled D13 capability and must not be falsely promised earlier. The second A1
+  ledger in `pkg-design/db.md` §23 now fixes that independent direct/prepared streamed-delivery rail;
+  binary formats and other native paths remain separate.
 
 ### F32 — L1a and L1b both claimed `Option<MoveStruct>`
 
