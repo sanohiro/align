@@ -82,13 +82,14 @@ jobs:
       # The db-required suites run in skip/SQLite-only mode here (no PostgreSQL
       # service); the per-PR required CI job owns that coverage. The one known
       # hang (HANDOFF.md: fuzz_differential::result_question_chain_computes_the_
-      # oracle_value, pre-existing) is skipped so it cannot consume the job
-      # timeout; remove the skip once its triage lands.
+      # oracle_value, pre-existing) now carries #[ignore] at its definition, so
+      # `cargo test` already excludes it by default; the former `--skip` here
+      # is redundant and was removed. Re-add `--ignored` once its triage lands
+      # and the attribute comes off.
       - name: Run workspace test suite
         shell: bash
         run: |
-          scripts/cargo.sh test --workspace --locked -- --nocapture \
-            --skip result_question_chain_computes_the_oracle_value
+          scripts/cargo.sh test --workspace --locked -- --nocapture
 
       # x86 release-profile coverage moved here from the per-PR lint job; the
       # per-PR ARM64/macOS jobs still build and smoke the release compiler.

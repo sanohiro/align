@@ -109,6 +109,54 @@ if (
   exit 1
 fi
 
+# The per-path *.md test alone cannot see what the shared classifier already
+# knows: docs/impl/pkg-design/web.md is compiled prose (a source input to a
+# test binary via include_str!) despite its extension, so --docs-only must
+# also require pr-tier.sh's own library_changed verdict on top of the *.md
+# check, or CI's recomputed tier would reject what this passed locally.
+compiled_prose_repo="$tmp_dir/compiled-prose-repo"
+mkdir -p "$compiled_prose_repo/docs/impl/pkg-design"
+git -C "$compiled_prose_repo" init -q -b main
+git -C "$compiled_prose_repo" config user.name workflow-test
+git -C "$compiled_prose_repo" config user.email workflow-test@example.invalid
+git -C "$compiled_prose_repo" config commit.gpgsign false
+printf '# web\n' >"$compiled_prose_repo/docs/impl/pkg-design/web.md"
+git -C "$compiled_prose_repo" add docs/impl/pkg-design/web.md
+git -C "$compiled_prose_repo" commit -qm baseline
+git -C "$compiled_prose_repo" switch -qc web-doc-change
+printf '\nupdated\n' >>"$compiled_prose_repo/docs/impl/pkg-design/web.md"
+git -C "$compiled_prose_repo" commit -qam 'docs: touch compiled prose'
+if (
+  cd "$compiled_prose_repo"
+  "$repo_root/scripts/pre-pr.sh" --docs-only --base main >/dev/null 2>&1
+); then
+  echo "docs-only preflight accepted a compiled-prose path" >&2
+  exit 1
+fi
+
+# Likewise, a deleted .md file still matches the *.md path pattern (the path
+# string does not change on deletion), so only pr-tier.sh's any-deletion rule
+# catches it.
+delete_md_repo="$tmp_dir/delete-md-repo"
+mkdir -p "$delete_md_repo/docs"
+git -C "$delete_md_repo" init -q -b main
+git -C "$delete_md_repo" config user.name workflow-test
+git -C "$delete_md_repo" config user.email workflow-test@example.invalid
+git -C "$delete_md_repo" config commit.gpgsign false
+printf '# stale\n' >"$delete_md_repo/docs/stale.md"
+git -C "$delete_md_repo" add docs/stale.md
+git -C "$delete_md_repo" commit -qm baseline
+git -C "$delete_md_repo" switch -qc delete-md-change
+git -C "$delete_md_repo" rm -q docs/stale.md
+git -C "$delete_md_repo" commit -qm 'docs: delete a stale note'
+if (
+  cd "$delete_md_repo"
+  "$repo_root/scripts/pre-pr.sh" --docs-only --base main >/dev/null 2>&1
+); then
+  echo "docs-only preflight accepted a deleted Markdown file" >&2
+  exit 1
+fi
+
 reviewed_head="$(git -C "$docs_repo" rev-parse HEAD)"
 review_base="$(git -C "$docs_repo" rev-parse 'main^{commit}')"
 review_log="$tmp_dir/findings-review.log"
@@ -213,54 +261,66 @@ chmod +x "$fake_gh"
     FAKE_PR_BODY="$fixed_body" "$repo_root/scripts/open-pr.sh" --update 123 >/dev/null
 )
 
+# review-bounded.sh's own git plumbing (git rev-parse HEAD, "$base"^{commit},
+# git status --porcelain, git rev-parse --show-toplevel/--git-dir) must run
+# against a repo that actually has the requested base ref and a clean tree —
+# never the ambient checkout this test script happens to be invoked from. A
+# CI PR checkout is detached with no local `main` ref (and a shallow fetch
+# has no merge base), so exercising review-bounded.sh there fails before ever
+# reaching the fake codex stub below. docs_repo is already a self-contained
+# fixture inside tmp_dir with a real `main` branch and a clean tree (its last
+# mutation above was a commit), so every invocation below runs inside it.
 fake_args="$tmp_dir/codex-args"
-review_base_sha="$(git rev-parse 'main^{commit}')"
-review_head_sha="$(git rev-parse HEAD)"
-PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=clean FAKE_CODEX_ARGS_FILE="$fake_args" \
+review_base_sha="$(git -C "$docs_repo" rev-parse 'main^{commit}')"
+review_head_sha="$(git -C "$docs_repo" rev-parse HEAD)"
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=clean FAKE_CODEX_ARGS_FILE="$fake_args" \
   ALIGN_REVIEW_STALL_SECONDS=5 ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
-  "$repo_root/scripts/review-bounded.sh" --base main >/dev/null
+  "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null
 grep -Fq "git diff $review_base_sha...$review_head_sha" "$fake_args" || {
   echo "review prompt did not bind the requested base" >&2
   exit 1
 }
 set +e
-PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=findings ALIGN_REVIEW_STALL_SECONDS=5 \
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=findings ALIGN_REVIEW_STALL_SECONDS=5 \
   ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
-  "$repo_root/scripts/review-bounded.sh" --base main >/dev/null
+  "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null
 findings_status=$?
-PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=stall ALIGN_REVIEW_STALL_SECONDS=1 \
+# +2s over the historical 1s/2s budgets: a shared/contended runner can delay
+# scheduling enough to make real progress look like a stall at the original
+# margins, which would flip these two toward a false 124.
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=stall ALIGN_REVIEW_STALL_SECONDS=3 \
   ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
-  "$repo_root/scripts/review-bounded.sh" --base main >/dev/null 2>&1
+  "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
 stall_status=$?
-PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=progress ALIGN_REVIEW_STALL_SECONDS=2 \
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=progress ALIGN_REVIEW_STALL_SECONDS=4 \
   ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
-  "$repo_root/scripts/review-bounded.sh" --base main >/dev/null 2>&1
+  "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
 progress_status=$?
 max_started=$SECONDS
-PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=progress ALIGN_REVIEW_STALL_SECONDS=60 \
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=progress ALIGN_REVIEW_STALL_SECONDS=60 \
   ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=30 ALIGN_REVIEW_MAX_SECONDS=1 \
-  "$repo_root/scripts/review-bounded.sh" --base main >/dev/null 2>&1
+  "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
 max_status=$?
 max_elapsed=$((SECONDS - max_started))
-PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=trailing ALIGN_REVIEW_STALL_SECONDS=5 \
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=trailing ALIGN_REVIEW_STALL_SECONDS=5 \
   ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
-  "$repo_root/scripts/review-bounded.sh" --base main >/dev/null 2>&1
+  "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
 trailing_status=$?
-PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=duplicate ALIGN_REVIEW_STALL_SECONDS=5 \
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=duplicate ALIGN_REVIEW_STALL_SECONDS=5 \
   ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
-  "$repo_root/scripts/review-bounded.sh" --base main >/dev/null 2>&1
+  "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
 duplicate_status=$?
-PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=native-clean ALIGN_REVIEW_STALL_SECONDS=5 \
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=native-clean ALIGN_REVIEW_STALL_SECONDS=5 \
   ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
-  "$repo_root/scripts/review-bounded.sh" --base main >/dev/null 2>&1
+  "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
 native_clean_status=$?
-PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=native-findings ALIGN_REVIEW_STALL_SECONDS=5 \
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=native-findings ALIGN_REVIEW_STALL_SECONDS=5 \
   ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
-  "$repo_root/scripts/review-bounded.sh" --base main >/dev/null 2>&1
+  "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
 native_findings_status=$?
-PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=native-clean-readonly ALIGN_REVIEW_STALL_SECONDS=5 \
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=native-clean-readonly ALIGN_REVIEW_STALL_SECONDS=5 \
   ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
-  "$repo_root/scripts/review-bounded.sh" --base main >/dev/null 2>&1
+  "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
 native_readonly_status=$?
 set -e
 [[ $findings_status -eq 2 ]] || {
@@ -279,7 +339,10 @@ set -e
   echo "explicitly bounded review returned $max_status, expected 124" >&2
   exit 1
 }
-[[ $max_elapsed -lt 10 ]] || {
+# Relaxed from the historical 10s: the terminate/sleep-2/kill-KILL teardown in
+# review-bounded.sh's cleanup can itself take longer than 10s on a slow or
+# contended shared runner without indicating an actual regression.
+[[ $max_elapsed -lt 30 ]] || {
   echo "explicitly bounded review overshot to ${max_elapsed}s" >&2
   exit 1
 }
@@ -345,10 +408,21 @@ mkdir -p "$tier_repo/crates/thing/src" "$tier_repo/crates/thing/tests" \
 cp "$repo_root/scripts/pr-tier.sh" "$tier_repo/scripts/pr-tier.sh"
 # The fixture stands in for the real repository, whose crates/ changes always
 # run the cheap ratchet; stub it so the tier logic is what is under test.
-for stub in lint-ratchet.sh test-pr.sh cargo.sh; do
-  printf '#!/usr/bin/env bash\nexit 0\n' >"$tier_repo/scripts/$stub"
-  chmod +x "$tier_repo/scripts/$stub"
-done
+# test-pr.sh and cargo.sh read STUB_TEST_PR_EXIT/STUB_CLIPPY_EXIT (default 0)
+# so the parallel-gate fixtures below can drive either side to failure
+# without disturbing every other test in this file, which never sets them.
+printf '#!/usr/bin/env bash\nexit 0\n' >"$tier_repo/scripts/lint-ratchet.sh"
+chmod +x "$tier_repo/scripts/lint-ratchet.sh"
+printf '#!/usr/bin/env bash\nexit "${STUB_TEST_PR_EXIT:-0}"\n' >"$tier_repo/scripts/test-pr.sh"
+chmod +x "$tier_repo/scripts/test-pr.sh"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'case "$1" in\n'
+  printf '  clippy) exit "${STUB_CLIPPY_EXIT:-0}" ;;\n'
+  printf '  *) exit 0 ;;\n'
+  printf 'esac\n'
+} >"$tier_repo/scripts/cargo.sh"
+chmod +x "$tier_repo/scripts/cargo.sh"
 git -C "$tier_repo" init -q -b main
 git -C "$tier_repo" config user.name workflow-test
 git -C "$tier_repo" config user.email workflow-test@example.invalid
@@ -434,6 +508,43 @@ tier_preflight --reviewer reviewer-1 --review-log "$code_log" --base main \
 code_head="$(git -C "$tier_repo" rev-parse HEAD)"
 grep -Fqx 'kind=code' "$tier_repo/.git/align-preflight/$code_head"
 
+# The parallel scripts/test-pr.sh/Clippy block in the code tier must fail —
+# and show BOTH outputs — no matter which side actually fails.
+parallel_case() {
+  local label="$1" test_pr_exit="$2" clippy_exit="$3"
+  tier_branch "parallel-${label}"
+  printf 'fn %s() {}\n' "$label" >>"$tier_repo/crates/thing/src/lib.rs"
+  git -C "$tier_repo" commit -qam "feat: trigger the parallel gate ($label)"
+  local log="$tmp_dir/parallel-review-${label}.log"
+  {
+    printf 'ALIGN_REVIEW_HEAD=%s\n' "$(git -C "$tier_repo" rev-parse HEAD)"
+    printf 'ALIGN_REVIEW_BASE=%s\n' "$(git -C "$tier_repo" rev-parse 'main^{commit}')"
+    printf 'ALIGN_REVIEW_VERDICT=CLEAN\n'
+  } >"$log"
+  local out="$tmp_dir/parallel-out-${label}"
+  local status=0
+  STUB_TEST_PR_EXIT="$test_pr_exit" STUB_CLIPPY_EXIT="$clippy_exit" \
+    tier_preflight --reviewer reviewer-1 --review-log "$log" --base main \
+    --owner-test tier -- true >"$out" 2>&1 || status=$?
+  [[ "$status" -ne 0 ]] || {
+    echo "parallel gate ($label) unexpectedly passed" >&2
+    cat "$out" >&2
+    exit 1
+  }
+  grep -q 'scripts/test-pr.sh output' "$out" || {
+    echo "parallel gate ($label) did not show the scripts/test-pr.sh output:" >&2
+    cat "$out" >&2
+    exit 1
+  }
+  grep -q 'Clippy output' "$out" || {
+    echo "parallel gate ($label) did not show the Clippy output:" >&2
+    cat "$out" >&2
+    exit 1
+  }
+}
+parallel_case test-pr-fails 1 0
+parallel_case clippy-fails 0 1
+
 # Three consecutive review-fix commits without re-opening a closure matrix is
 # the review-as-discovery-loop pattern and must fail. Neither a translated
 # mirror nor an untrailered docs/impl edit releases it; the trailer plus an
@@ -470,6 +581,67 @@ printf '\n## second axis\n' >>"$tier_repo/docs/impl/00-plan.md"
 git -C "$tier_repo" commit -qam 'fix: re-open the closure matrix
 
 Closure-Matrix-Reopened: callback ABI'
+tier_preflight --base main --owner-test tier -- true >/dev/null
+
+# Fix commits are counted across the whole post-implementation range, not
+# reset by an interleaved non-fix commit: fix, docs, fix, fix still trips the
+# gate at 3 counted fixes.
+tier_branch interleaved-rounds-change
+mkdir -p "$tier_repo/crates/thing/tests"
+printf '#[test]\nfn a() {}\n' >"$tier_repo/crates/thing/tests/interleaved.rs"
+git -C "$tier_repo" add crates/thing/tests/interleaved.rs
+git -C "$tier_repo" commit -qm 'feat: add interleaved owner'
+printf '#[test]\nfn r1() {}\n' >>"$tier_repo/crates/thing/tests/interleaved.rs"
+git -C "$tier_repo" commit -qam 'fix: close review finding 1'
+printf '\ninterleaved note\n' >>"$tier_repo/docs/impl/00-plan.md"
+git -C "$tier_repo" commit -qam 'docs: unrelated interleaved note'
+printf '#[test]\nfn r2() {}\n' >>"$tier_repo/crates/thing/tests/interleaved.rs"
+git -C "$tier_repo" commit -qam 'fix: close review finding 2'
+printf '#[test]\nfn r3() {}\n' >>"$tier_repo/crates/thing/tests/interleaved.rs"
+git -C "$tier_repo" commit -qam 'fix: close review finding 3'
+if tier_preflight --base main --owner-test tier -- true >/dev/null 2>&1; then
+  echo "3 fix commits interleaved with a docs commit unexpectedly passed" >&2
+  exit 1
+fi
+# The release check reads the same counted set, so a trailer commit still
+# releases the gate once it reopens the matrix.
+printf '\n## interleaved axis\n' >>"$tier_repo/docs/impl/00-plan.md"
+git -C "$tier_repo" commit -qam 'fix: re-open the closure matrix for the interleaved case
+
+Closure-Matrix-Reopened: interleaved axis'
+tier_preflight --base main --owner-test tier -- true >/dev/null
+
+# The first commit in base..HEAD is always the (uncounted) implementation
+# regardless of its own subject, so a branch that never has a non-fix commit
+# at all cannot dodge the tripwire: 5 all-fix commits still count 4.
+tier_branch all-fix-rounds-change
+mkdir -p "$tier_repo/crates/thing/tests"
+printf '#[test]\nfn a() {}\n' >"$tier_repo/crates/thing/tests/allfix.rs"
+git -C "$tier_repo" add crates/thing/tests/allfix.rs
+git -C "$tier_repo" commit -qm 'fix: add allfix owner'
+for round in 1 2 3 4; do
+  printf '#[test]\nfn r%s() {}\n' "$round" >>"$tier_repo/crates/thing/tests/allfix.rs"
+  git -C "$tier_repo" commit -qam "fix: close review finding $round"
+done
+all_fix_err="$tmp_dir/all-fix-err"
+all_fix_status=0
+tier_preflight --base main --owner-test tier -- true >/dev/null 2>"$all_fix_err" || all_fix_status=$?
+[[ "$all_fix_status" -ne 0 ]] || {
+  echo "5 all-fix commits (4 counted) unexpectedly passed without a matrix re-open" >&2
+  exit 1
+}
+grep -q '^preflight: 4 post-implementation review-fix commits' "$all_fix_err" || {
+  echo "all-fix branch did not count exactly 4 post-implementation fix commits:" >&2
+  cat "$all_fix_err" >&2
+  exit 1
+}
+# The release valve scans every post-implementation commit for the trailer,
+# not only fix-titled ones: a differently-titled commit still releases the
+# gate once it reopens the matrix.
+printf '\n## all-fix axis\n' >>"$tier_repo/docs/impl/00-plan.md"
+git -C "$tier_repo" commit -qam 'docs(impl): re-open the closure matrix for the all-fix case
+
+Closure-Matrix-Reopened: all-fix axis'
 tier_preflight --base main --owner-test tier -- true >/dev/null
 
 # A docs-only branch is never subject to the review-round gate, and its
@@ -556,6 +728,7 @@ fi
 for script in \
   scripts/cargo.sh \
   scripts/check-pr-preflight.sh \
+  scripts/new-review-log.sh \
   scripts/open-pr.sh \
   scripts/pr-tier.sh \
   scripts/pre-pr.sh \

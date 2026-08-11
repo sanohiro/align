@@ -32,7 +32,11 @@ reviewer="$(sed -n 's/^<!-- align-preflight-reviewer:\([^[:space:]<>]*\) -->$/\1
 case "$state" in
   clean) [[ "$review_head" == "$head_sha" && "$reviewer" != docs-only ]] ;;
   fixed)
-    [[ "$review_head" != "$head_sha" && "$reviewer" != docs-only ]] &&
+    # The reviewed candidate must be a strict descendant of base and an
+    # ancestor of the final HEAD: a log claiming a review of the branch point
+    # itself is a review of nothing.
+    [[ "$review_head" != "$head_sha" && "$review_head" != "$base_sha" && "$reviewer" != docs-only ]] &&
+      git merge-base --is-ancestor "$base_sha" "$review_head" &&
       git merge-base --is-ancestor "$review_head" "$head_sha"
     ;;
   docs-only) [[ "$review_head" == "$head_sha" && "$reviewer" == docs-only ]] ;;
