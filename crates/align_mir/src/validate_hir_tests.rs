@@ -12760,10 +12760,16 @@ fn delegation_program() -> hir::Program {
     program
 }
 
-/// Every checked-HIR gate that re-derived a producer rule must now *ask* that rule. Sweep the
-/// constructible type space and assert the two sides are the same function, not merely two lists
-/// that agree today: a `Scalar`/`Ty` variant or a sema rule change that moves them apart fails
-/// here instead of turning a checked program into an empty unit at the MIR boundary.
+/// Sweep the constructible type space through the checked-HIR gates that delegate an ownership or
+/// shape rule to the producer.
+///
+/// What this proves, exactly: each gate is still a thin wrapper over the sema predicate it
+/// delegates to (a re-introduced local rule diverges here), the scalar-level and `Ty`-level element
+/// rules still coincide (their divergence is the defect this closes), and the literal expectations
+/// below pin today's classification of the aggregate and soa shapes. Because both sides are read
+/// from the same producer, it does **not** detect a change to the producer's rule itself — that is
+/// what the pinned literal rows and the driver owner tests are for. The `Scalar` tripwire above is
+/// the part that fails on a new variant.
 #[test]
 fn delegated_ownership_and_shape_gates_agree_with_sema() {
     let program = delegation_program();

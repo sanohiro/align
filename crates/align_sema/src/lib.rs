@@ -2284,12 +2284,14 @@ pub fn scalar_is_move(
 /// element's representation without transferring ownership, so the collection and the copy would
 /// both free the same storage (double free / double close).
 ///
-/// The single owner of that rule for `check_index`, `check_slice_range`, and the HIR validator's
-/// index / slice-range / array-to-slice guards. It was a hand-written deny-list of Move `Ty`s here
-/// while the validator asked the real Move question, so every Move shape missing from the list —
-/// a Move sum type (`E { A(string), B }` in a `slice<E>`), a package resource handle — was accepted
-/// by sema and rejected at the MIR boundary, which surfaced as "passed checking but failed HIR
-/// validation" instead of a diagnostic. Asking the ownership authority cannot drift again.
+/// The single owner of that rule for all three producer readers — `check_index`,
+/// `check_slice_range`, and the array → slice borrow in `check_slice_init` — and for the HIR
+/// validator's matching index / slice-range / array-to-slice guards. It was a hand-written deny-list
+/// of Move `Ty`s here while the validator asked the real Move question, so every Move shape missing
+/// from the list — a Move sum type (`E { A(string), B }` in a `slice<E>`), a package resource handle
+/// — was accepted by sema and rejected at the MIR boundary, which surfaced as "passed checking but
+/// failed HIR validation" instead of a diagnostic. Asking the ownership authority cannot drift
+/// again.
 pub fn collection_element_read_ok(
     elem: Ty,
     structs: &[StructDef],
@@ -2560,60 +2562,57 @@ pub fn needs_drop_flag(
 ///
 /// A generic head is represented by one concrete instantiation because the question asked through
 /// it ([`builtin_spelling_needs_return_cleanup`]) is argument-independent by construction.
-fn builtin_spelling_ty(head: &str) -> Option<Ty> {
-    let i64_scalar = Scalar::Int(IntTy { bits: 64, signed: true });
-    Some(match head {
-        "()" => Ty::Unit,
-        "bool" => Ty::Bool,
-        "char" => Ty::Char,
-        "f32" => Ty::Float(FloatTy { bits: 32 }),
-        "f64" => Ty::Float(FloatTy { bits: 64 }),
-        "raw" => Ty::Raw,
-        "region" => Ty::ArenaHandle,
-        "rng" => Ty::Rng,
-        "str" => Ty::Str,
-        "string" => Ty::String,
-        "json.doc" => Ty::JsonDoc,
-        "http_headers" => Ty::HttpHeaders,
-        "reader" => Ty::Reader,
-        "writer" => Ty::Writer,
-        "buffer" => Ty::Buffer,
-        "file" => Ty::File,
-        "regex" => Ty::Regex,
-        "captures" => Ty::Captures,
-        "tcp_conn" => Ty::TcpConn,
-        "tcp_listener" => Ty::TcpListener,
-        "udp_socket" => Ty::UdpSocket,
-        "child" => Ty::Child,
-        "http_request_ctx" => Ty::HttpRequestCtx,
-        "response_builder" => Ty::ResponseBuilder,
-        "http_stream" => Ty::HttpStream,
-        "array" => Ty::DynArray(i64_scalar),
-        "array_builder" => Ty::ArrayBuilder(i64_scalar),
-        "box" => Ty::Box(i64_scalar),
-        "slice" => Ty::Slice(i64_scalar),
-        _ => {
-            let integer = parse_int_ty_name(head)?;
-            Ty::Int(integer)
-        }
-    })
-}
+///
+/// Exposed as data so a consumer can sweep the exact domain both ways against its own builtin-name
+/// set, instead of trusting that two hand-written tables still describe the same language.
+pub const BUILTIN_SPELLING_TYS: &[(&str, Ty)] = &[
+    ("()", Ty::Unit),
+    ("bool", Ty::Bool),
+    ("char", Ty::Char),
+    ("f32", Ty::Float(FloatTy { bits: 32 })),
+    ("f64", Ty::Float(FloatTy { bits: 64 })),
+    ("raw", Ty::Raw),
+    ("region", Ty::ArenaHandle),
+    ("rng", Ty::Rng),
+    ("str", Ty::Str),
+    ("string", Ty::String),
+    ("json.doc", Ty::JsonDoc),
+    ("http_headers", Ty::HttpHeaders),
+    ("reader", Ty::Reader),
+    ("writer", Ty::Writer),
+    ("buffer", Ty::Buffer),
+    ("file", Ty::File),
+    ("regex", Ty::Regex),
+    ("captures", Ty::Captures),
+    ("tcp_conn", Ty::TcpConn),
+    ("tcp_listener", Ty::TcpListener),
+    ("udp_socket", Ty::UdpSocket),
+    ("child", Ty::Child),
+    ("http_request_ctx", Ty::HttpRequestCtx),
+    ("response_builder", Ty::ResponseBuilder),
+    ("http_stream", Ty::HttpStream),
+    ("array", Ty::DynArray(BRIDGE_ELEM)),
+    ("array_builder", Ty::ArrayBuilder(BRIDGE_ELEM)),
+    ("box", Ty::Box(BRIDGE_ELEM)),
+    ("slice", Ty::Slice(BRIDGE_ELEM)),
+];
 
-/// The integer type a builtin integer spelling denotes (`i8` … `u64`), else `None`.
-fn parse_int_ty_name(head: &str) -> Option<IntTy> {
-    let (signed, bits) = match head.split_at_checked(1)? {
-        ("i", bits) => (true, bits),
-        ("u", bits) => (false, bits),
-        _ => return None,
-    };
-    let bits = match bits {
-        "8" => 8,
-        "16" => 16,
-        "32" => 32,
-        "64" => 64,
-        _ => return None,
-    };
-    Some(IntTy { bits, signed })
+/// The stand-in element of a generic builtin head in [`BUILTIN_SPELLING_TYS`]. Only the head's
+/// ownership is asked through it, and that answer is the same for every element.
+const BRIDGE_ELEM: Scalar = Scalar::Int(IntTy {
+    bits: 64,
+    signed: true,
+});
+
+fn builtin_spelling_ty(head: &str) -> Option<Ty> {
+    if let Some((_, ty)) = BUILTIN_SPELLING_TYS
+        .iter()
+        .find(|(spelling, _)| *spelling == head)
+    {
+        return Some(*ty);
+    }
+    // The resolver's own integer-name parser, so `i08` is not a type here and a name there.
+    Some(Ty::Int(parse_int_name(head)?))
 }
 
 /// Whether a function returning the builtin type spelling `head` must carry the dynamic
@@ -29548,9 +29547,29 @@ impl<'a, 't> Checker<'a, 't> {
         e
     }
 
+    /// Report the array → slice borrow of a Move element and answer whether it was rejected. The
+    /// view makes the source's elements readable, so it is gated by the same producer-owned rule as
+    /// `xs[i]` and `xs[a..b]` — and the MIR boundary has always enforced exactly that, so an
+    /// unguarded borrow here is an internal error rather than a diagnostic.
+    fn slice_borrow_element_rejected(&mut self, elem: Ty, span: Span) -> bool {
+        if !self.collection_element_is_unsupported_move(elem) {
+            return false;
+        }
+        self.diags.error(
+            format!(
+                "slicing a collection of the Move type {} is not supported yet",
+                self.ty_display(elem)
+            ),
+            span,
+        );
+        true
+    }
+
     /// Check an expression expected to be a `slice<T>`, applying the array → slice borrow
-    /// (`ArrayToSlice`) when the source is a matching array. Shared by call arguments and
-    /// slice-annotated `let` bindings so both produce a real slice value (not a bare array).
+    /// (`ArrayToSlice`) when the source is a matching array. Shared by call arguments, struct-field
+    /// initializers, and slice-annotated `let` bindings so all of them produce a real slice value
+    /// (not a bare array) — and so the Move-element guard below covers every array → slice borrow
+    /// in the language.
     fn check_slice_init(&mut self, a: &ast::Expr, ps: Scalar) -> Expr {
         // An inline array literal takes the slice's element type.
         let e = match &a.kind {
@@ -29566,6 +29585,9 @@ impl<'a, 't> Checker<'a, 't> {
             (Ty::StructArray(aid, _), Scalar::Struct(pid))
                 if self.source_ty_matches(Ty::Struct(aid), Ty::Struct(pid)));
         if struct_arr_match {
+            if self.slice_borrow_element_rejected(scalar_to_ty(ps), e.span) {
+                return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span: e.span };
+            }
             if !matches!(e.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
                 self.diags.error(
                     "an array coerced to a slice must be an array literal or a variable (an arbitrary array expression is not supported yet)".to_string(),
@@ -29582,11 +29604,17 @@ impl<'a, 't> Checker<'a, 't> {
         let dyn_scalar_match = matches!(e.ty, Ty::DynArray(es)
             if self.payload_ty_matches(scalar_to_ty(es), scalar_to_ty(ps)));
         if dyn_struct_match || dyn_scalar_match {
+            if self.slice_borrow_element_rejected(scalar_to_ty(ps), e.span) {
+                return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span: e.span };
+            }
             let span = e.span;
             return Expr { kind: ExprKind::ArrayToSlice(Box::new(e)), ty: Ty::Slice(ps), span };
         }
         if let Ty::Array(es, _) = e.ty
             && self.payload_ty_matches(scalar_to_ty(es), scalar_to_ty(ps)) {
+                if self.slice_borrow_element_rejected(scalar_to_ty(ps), e.span) {
+                    return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span: e.span };
+                }
                 // The borrow lowers via the same slot-materialization as a pipeline source,
                 // so the same restriction applies: only a literal or a named local.
                 if !matches!(e.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
@@ -45452,10 +45480,12 @@ fn instantiate_resource(
 /// closes/frees it (a reader/writer/buffer, a socket, a file, an http request/response/client/
 /// server/ctx/stream, a cli command/parsed). Admitted as a struct field (F1②, the pkg.web request
 /// `Ctx` owning its `http_request_ctx`); the enclosing struct becomes Move (the canonical DropPlan
-/// classifies the handle as a leaf), and its recursive drop closes the handle exactly once. This set MUST
-/// stay in lockstep with `align_codegen_llvm::handle_free_fn` (a field type allowed here but not
-/// freed there would leak). Excludes `Builder`/`StrFinder`/`ArrayBuilder` (distinct non-pointer
-/// drops) and the `{ptr,len}` owned collections (`string`/`array` — their own field arms).
+/// classifies the handle as a leaf), and its recursive drop closes the handle exactly once. This is
+/// the **producer-owned set**: `align_codegen_llvm::handle_free_key` maps it to each runtime
+/// `*_free`, and `DropFlagInit` keys the one-pointer null initialisation off it, so a handle
+/// admitted here can neither leak nor be zeroed as a wider `{ptr,len}`. Excludes
+/// `Builder`/`StrFinder`/`ArrayBuilder` (distinct non-pointer drops) and the `{ptr,len}` owned
+/// collections (`string`/`array` — their own field arms).
 pub fn is_move_handle(ty: Ty) -> bool {
     MOVE_HANDLE_TYPES.contains(&ty)
 }
@@ -45523,7 +45553,7 @@ fn is_field_ok(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
         // request/response/client/server/stream, a cli command/parsed) makes the enclosing struct a
         // Move type whose recursive drop closes/frees the handle exactly once (`drop_struct_fields`'s
         // handle arm → the null-safe `*_free`; the DropPlan leaf makes the struct Move). The admitted
-        // set matches codegen's `handle_free_fn`.
+        // set IS `MOVE_HANDLE_TYPES`, which codegen's `handle_free_key` maps to the free symbols.
         _ if is_move_handle(ty) => {}
         // A **`http_headers` view** field (`Ctx { headers: http_headers }`, http.md item 10 — the whole
         // reason the type exists). A Copy, non-owning bare pointer (8 bytes / 8-align) that owns no

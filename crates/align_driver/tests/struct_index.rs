@@ -529,6 +529,61 @@ fn main() -> Result<(), Error> = Ok(())
     }
 
     #[test]
+    fn an_array_to_slice_borrow_of_a_move_element_is_rejected_at_every_init_site() {
+        // The array → slice borrow is the third element reader: the view makes the source's
+        // elements readable, and the MIR boundary has always refused it for a Move element. Sema
+        // built the borrow unguarded at all three init sites, so an owned `array<string>` reaching
+        // a `slice<string>` position was an internal error instead of a diagnostic.
+        for (label, source) in [
+            (
+                "call-argument",
+                "fn take(xs: slice<string>) -> i64 = xs.len()\nfn main() -> Result<(), Error> {\n  mut b: array_builder<string> := array_builder()\n  b.push(\"a\".clone())\n  built := b.build()\n  print(take(built))\n  return Ok(())\n}\n",
+            ),
+            (
+                "struct-field",
+                "Holder { names: slice<string> }\nfn main() -> Result<(), Error> {\n  mut b: array_builder<string> := array_builder()\n  b.push(\"a\".clone())\n  built := b.build()\n  h := Holder { names: built }\n  print(h.names.len())\n  return Ok(())\n}\n",
+            ),
+            (
+                "let-annotation",
+                "fn main() -> Result<(), Error> {\n  mut b: array_builder<string> := array_builder()\n  b.push(\"a\".clone())\n  built := b.build()\n  view: slice<string> := built\n  print(view.len())\n  return Ok(())\n}\n",
+            ),
+        ] {
+            let diagnostics = check_diagnostics(&format!("sa-slice-borrow-{label}"), source);
+            assert!(
+                diagnostics.contains("slicing a collection of the Move type string"),
+                "an owned `array<string>` borrowed as a slice should be rejected in sema ({label}):\n{diagnostics}",
+            );
+            assert!(
+                !diagnostics.contains("failed HIR validation"),
+                "the borrow must be a diagnostic, not an internal error ({label}):\n{diagnostics}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_move_element_slice_type_is_still_declarable_and_passable() {
+        // Only the element *read* and the array → slice *borrow* are rejected. Declaring the view
+        // type, taking its length, and forwarding an existing view stay legal — over-rejecting here
+        // would take the whole `slice<E>` surface away.
+        for (label, source) in [
+            (
+                "move-enum",
+                "E { A(string), B }\nfn take(xs: slice<E>) -> i64 = xs.len()\nfn forward(xs: slice<E>) -> i64 = take(xs)\nfn main() -> i32 = 0\n",
+            ),
+            (
+                "owned-string",
+                "fn take(xs: slice<string>) -> i64 = xs.len()\nfn forward(xs: slice<string>) -> i64 = take(xs)\nfn main() -> i32 = 0\n",
+            ),
+        ] {
+            let diagnostics = check_diagnostics(&format!("sa-move-slice-ok-{label}"), source);
+            assert!(
+                diagnostics.is_empty(),
+                "a Move-element slice parameter must still check ({label}):\n{diagnostics}",
+            );
+        }
+    }
+
+    #[test]
     fn a_copy_sum_type_element_still_reads() {
         if !backend_available() {
             return;

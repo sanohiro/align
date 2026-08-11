@@ -5667,6 +5667,50 @@ fn is_signed(ty: Ty) -> bool {
 /// without a symbol row now fails `move_handles_all_have_a_runtime_free_symbol` instead.
 /// `Builder`/`StrFinder`/`ArrayBuilder` are Move but not handles (distinct non-pointer drops); they
 /// are correspondingly rejected as fields.
+/// The constant `DropFlagInit` stores into a slot so a drop on a never-allocated / moved-out path
+/// is a no-op. Pure and separate from the emitter so the classification can be swept.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SlotZeroShape {
+    /// One opaque handle pointer — a null pointer, 8 bytes.
+    HandlePointer,
+    /// A fixed array of Move structs — the whole `[N x %Struct]` zeroed.
+    Array,
+    /// A whole aggregate (`{tag,payload}` / struct / tuple / enum / dict) zeroed.
+    Aggregate,
+    /// The default owned collection header, `{ptr,len}` zeroed.
+    SliceHeader,
+}
+
+/// Classify a slot for [`SlotZeroShape`]. `tagged_needs_drop` is the caller's `drop_plan` answer
+/// for an `Option`/`Result`/`Tagged` slot (computed only where it matters).
+///
+/// The handle question is asked **first**, and asked of `align_sema::is_move_handle` rather than a
+/// local list. This site used to re-list the handles, and the failure mode is worse than a missed
+/// drop: a handle missing from the list falls through to the `{ptr,len}` default, storing 16 bytes
+/// into an 8-byte pointer slot — an out-of-bounds stack write past the alloca.
+fn slot_zero_shape(ty: Ty, tagged_needs_drop: bool) -> SlotZeroShape {
+    if align_sema::is_move_handle(ty)
+        // Move values that are also a single pointer but deliberately not handles: they have
+        // non-pointer drops (`builder_free` / boxed searcher / the resource drop thunk).
+        || ty.is_array_builder()
+        || matches!(ty, Ty::Builder | Ty::StrFinder | Ty::Resource(_))
+    {
+        return SlotZeroShape::HandlePointer;
+    }
+    if matches!(ty, Ty::StructArray(..)) {
+        return SlotZeroShape::Array;
+    }
+    if tagged_needs_drop
+        || matches!(
+            ty,
+            Ty::Tuple(_) | Ty::Struct(_) | Ty::Enum(_) | Ty::DictEncoded(..)
+        )
+    {
+        return SlotZeroShape::Aggregate;
+    }
+    SlotZeroShape::SliceHeader
+}
+
 fn handle_free_key(ty: Ty) -> Option<RuntimeKey> {
     if !align_sema::is_move_handle(ty) {
         return None;
@@ -9137,29 +9181,34 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     // an owned payload zeroes the whole aggregate (so its payload reads {null,0});
                     // the owned `{ptr,len}` collections store `{null, 0}`.
                     let ty = self.f.slots[*slot as usize];
-                    let z: BasicValueEnum = if ty.is_array_builder() || matches!(ty, Ty::Builder | Ty::StrFinder | Ty::Writer | Ty::Reader | Ty::Buffer | Ty::Regex | Ty::Captures | Ty::CliCommand | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpRequest | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::ResponseBuilder | Ty::HttpStream | Ty::Command | Ty::RunOutput | Ty::Resource(_)) {
-                        // A builder / writer / reader / buffer / cli / tcp_conn / tcp_listener / udp_socket handle slot holds a bare (nullable) handle pointer.
-                        self.ctx.ptr_type(AddressSpace::default()).const_null().into()
-                    } else if matches!(ty, Ty::StructArray(..)) {
+                    let tagged_needs_drop = matches!(
+                        ty,
+                        Ty::Option(_) | Ty::Result(..) | Ty::Tagged(_)
+                    ) && drop_plan(ty, self.structs, self.enums, self.tagged_defs)
+                        .needs_drop();
+                    let z: BasicValueEnum = match slot_zero_shape(ty, tagged_needs_drop) {
+                        // A builder / writer / reader / buffer / cli / socket / resource handle slot
+                        // holds a bare (nullable) handle pointer.
+                        SlotZeroShape::HandlePointer => {
+                            self.ctx.ptr_type(AddressSpace::default()).const_null().into()
+                        }
                         // A fixed array of a Move struct: zero the whole `[N x %Struct]` so every
                         // element's owned fields read {null,0} until constructed — its per-element
                         // `Drop` then frees nulls on an unwritten element (no-op). (Slice 4a.)
-                        self.llvm_type(ty).into_array_type().const_zero().into()
-                    } else if (matches!(ty, Ty::Option(_) | Ty::Result(..) | Ty::Tagged(_))
-                        && drop_plan(ty, self.structs, self.enums, self.tagged_defs).needs_drop())
-                        || matches!(
-                            ty,
-                            Ty::Tuple(_) | Ty::Struct(_) | Ty::Enum(_) | Ty::DictEncoded(..)
-                        )
-                    {
+                        SlotZeroShape::Array => {
+                            self.llvm_type(ty).into_array_type().const_zero().into()
+                        }
                         // Zero the whole aggregate so each owned field/element reads {null,0}. A Move
                         // struct is zeroed wholesale here; its recursive `Drop` then frees nulls on an
                         // unconstructed / moved-out path (no-op) — see `drop_struct_fields`. A Move enum
                         // (J2) zeroes to tag 0 + null payloads, so its tag-switched `Drop` frees null
                         // (no-op) on an unconstructed / moved-out path — see `drop_enum`.
-                        self.llvm_type(ty).into_struct_type().const_zero().into()
-                    } else {
-                        slice_struct_type(self.ctx).const_zero().into()
+                        SlotZeroShape::Aggregate => {
+                            self.llvm_type(ty).into_struct_type().const_zero().into()
+                        }
+                        SlotZeroShape::SliceHeader => {
+                            slice_struct_type(self.ctx).const_zero().into()
+                        }
                     };
                     self.builder.build_store(self.slots[slot], z).map_err(|e| self.err(e))?;
                 }
@@ -16468,6 +16517,52 @@ mod tests {
                 "{ty:?} is not a bare Move handle but claims a handle free"
             );
         }
+    }
+
+    /// The same set decides how `DropFlagInit` zeroes a slot. A handle missing from that
+    /// classification does not merely skip a drop: it takes the `{ptr,len}` default and stores 16
+    /// bytes into an 8-byte pointer alloca.
+    #[test]
+    fn move_handle_slots_are_zeroed_as_one_pointer() {
+        for &ty in align_sema::MOVE_HANDLE_TYPES {
+            assert_eq!(
+                slot_zero_shape(ty, false),
+                SlotZeroShape::HandlePointer,
+                "{ty:?} must be null-initialised as one pointer, not a {{ptr,len}} header"
+            );
+        }
+        // The pointer-shaped Move values that are deliberately not handles still init as pointers.
+        for ty in [
+            Ty::Builder,
+            Ty::StrFinder,
+            Ty::Resource(0),
+            Ty::ArrayBuilder(Scalar::Int(IntTy {
+                bits: 64,
+                signed: true,
+            })),
+        ] {
+            assert_eq!(slot_zero_shape(ty, false), SlotZeroShape::HandlePointer);
+        }
+        // The other shapes are unchanged by that reordering.
+        assert_eq!(
+            slot_zero_shape(Ty::StructArray(0, 2), false),
+            SlotZeroShape::Array
+        );
+        assert_eq!(slot_zero_shape(Ty::Struct(0), false), SlotZeroShape::Aggregate);
+        assert_eq!(slot_zero_shape(Ty::Enum(0), false), SlotZeroShape::Aggregate);
+        assert_eq!(
+            slot_zero_shape(Ty::Option(Scalar::String), true),
+            SlotZeroShape::Aggregate
+        );
+        assert_eq!(
+            slot_zero_shape(Ty::Option(Scalar::Int(IntTy { bits: 64, signed: true })), false),
+            SlotZeroShape::SliceHeader
+        );
+        assert_eq!(slot_zero_shape(Ty::String, false), SlotZeroShape::SliceHeader);
+        assert_eq!(
+            slot_zero_shape(Ty::DynArray(Scalar::Int(IntTy { bits: 64, signed: true })), false),
+            SlotZeroShape::SliceHeader
+        );
     }
 
     fn direct_program(name: &str) -> DirectCall {
