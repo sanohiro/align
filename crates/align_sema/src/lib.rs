@@ -27017,22 +27017,34 @@ impl<'a, 't> Checker<'a, 't> {
             ast::ExprKind::Path(p) => self.check_path(p, expected, e.span),
             ast::ExprKind::Unary { op, expr } => {
                 let inner = self.check_expr(expr, expected);
+                // A rejected operand must yield the error sentinel, never its own type: the
+                // later passes classify a unary result as borrowing nothing, so propagating a
+                // view-bearing operand type here builds a typed node the provenance walk cannot
+                // explain (it asserts, on malformed input, in a debug build).
                 let ty = match op {
                     UnOp::Neg => {
-                        if !inner.ty.is_numeric() && inner.ty != Ty::Error {
+                        if inner.ty == Ty::Error {
+                            Ty::Error
+                        } else if inner.ty.is_numeric() {
+                            inner.ty
+                        } else {
                             self.diags.error("unary '-' expects a number", e.span);
+                            Ty::Error
                         }
-                        inner.ty
                     }
                     UnOp::Not => {
                         self.unify(inner.ty, Ty::Bool, e.span);
                         Ty::Bool
                     }
                     UnOp::BitNot => {
-                        if !inner.ty.is_int_like() && inner.ty != Ty::Error {
+                        if inner.ty == Ty::Error {
+                            Ty::Error
+                        } else if inner.ty.is_int_like() {
+                            inner.ty
+                        } else {
                             self.diags.error("unary '~' expects an integer", e.span);
+                            Ty::Error
                         }
-                        inner.ty
                     }
                 };
                 Expr { kind: ExprKind::Unary { op: *op, expr: Box::new(inner) }, ty, span: e.span }

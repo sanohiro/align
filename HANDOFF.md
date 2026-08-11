@@ -1488,6 +1488,15 @@ Historical session journal           docs/archive/HANDOFF-2026-07-25.md
 - Keep release and review procedures in `CLAUDE.md`; link to them instead of
   duplicating them here.
 
+The nightly full-suite sweep found a Gate-3 defect the bounded gate cannot
+see: `fuzz_frontend::frontend_never_panics_on_token_soup_in_a_function_body`
+(seed 2561) tripped a debug assertion in `borrow_sources_inner`, because a
+rejected unary operand kept its own type as the result type. A view-bearing
+operand therefore produced a unary node the provenance walk classifies as
+borrowing nothing. Fixed 2026-08-11 by returning the error sentinel on the
+rejecting paths, which is what CLAUDE.md's Gate 3 already required; verified
+pre-existing against a clean baseline compiler.
+
 The silent-empty-MIR class reached a fourth instance and is now closed at its
 root: `cache_codegen::json_scan_generic_return_context_no_publication` failed
 because the MIR body validator kept its own copy of the monomorph-name

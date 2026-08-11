@@ -76,3 +76,34 @@ fn non_numeric_receiver_rejected() {
     // abs/min/max are numeric-only.
     assert!(check_errs("sm-bool", "fn main() -> i32 {\n  b := true\n  if b.abs() == 1 { return 1 }\n  return 0\n}\n"));
 }
+
+/// A rejected unary operand must yield the error sentinel, not its own type. Propagating a
+/// view-bearing operand type built a typed node whose borrow provenance the later walk cannot
+/// explain — a debug-build assertion on malformed input, found by the nightly fuzz sweep.
+#[test]
+fn a_rejected_unary_operand_does_not_propagate_its_type() {
+    for (src, expected) in [
+        (
+            "fn main() -> i32 {\n  s := \"text\"\n  v := -s\n  return 0\n}\n",
+            "unary '-' expects a number",
+        ),
+        (
+            "fn main() -> i32 {\n  s := \"text\"\n  v := ~s\n  return 0\n}\n",
+            "unary '~' expects an integer",
+        ),
+        (
+            "fn main() -> i32 {\n  xs := [1, 2]\n  v := -xs[..]\n  return 0\n}\n",
+            "unary '-' expects a number",
+        ),
+    ] {
+        let diagnostics = check_diagnostics("unary-sentinel", src);
+        assert!(
+            diagnostics.contains(expected),
+            "expected `{expected}`:\n{diagnostics}"
+        );
+        assert!(
+            !diagnostics.contains("borrow_sources_inner"),
+            "the rejected operand must not reach the provenance walk:\n{diagnostics}"
+        );
+    }
+}
