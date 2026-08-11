@@ -55,6 +55,14 @@ connection remains in pipeline mode until `PQexitPipelineMode`; because pipeline
 this rail, both statuses now share the immediate-clear-and-close branch at every PGresult consumer.
 The section introduction now also names both prerequisites and the exact four-PR sequence.
 
+The following preflight review found one further P2 in the same root-cause class. PostgreSQL
+migration files could contain top-level COPY; the synchronous migration executor would receive a
+COPY status and then attempt rollback on the protocol-busy connection. The status prerequisite now
+audits both Rust PGresult modules and extends the existing driver-aware migration screen to reject
+first-token COPY before URL access, target open, lock, history publication, or libpq. Preparation
+cannot execute COPY through `PQprepare`; all remaining tool SQL is fixed producer-owned text. This
+closes the tooling path without changing the four implementation boundaries.
+
 ## 2026-08-07: shared borrow accepts stable Copy storage
 
 Shared `borrow` now accepts a stable bound Copy or Move place. Copy values still pass by value by

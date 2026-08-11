@@ -61,11 +61,13 @@ The first rail, shipped by #740, is the exact common `batch<R>` / bounded
 `next_batch` / row and `SoaPlain` projection contract plus v5 Query batch plan
 recorded by `pkg-design/db.md` §23. It retains SQLite `Step` and PostgreSQL
 `BufferedFull`. Before streamed delivery, two independently mergeable,
-public/ABI-neutral prerequisites close shipped PostgreSQL correctness gaps. The
-first gives catalog/EXPLAIN the execution lease; the second makes every existing
+application-package-surface/ABI-neutral prerequisites close shipped PostgreSQL
+correctness gaps. The first gives catalog/EXPLAIN the execution lease; the second makes every existing
 PGresult consumer clear and close on COPY, pipeline, or an unknown numeric status
-without another protocol or pipeline-exit call. The following independently useful
-rail is the exact PostgreSQL `SingleRow` / `PortalBatch` direct delivery
+without another protocol or pipeline-exit call. It also inventories the Rust tool
+consumers and rejects top-level PostgreSQL migration COPY during canonical
+statement screening before URL access or native work. The following independently
+useful rail is the exact PostgreSQL `SingleRow` / `PortalBatch` direct delivery
 contract recorded by the adjacent A1 ledger. Prepared parity follows in its own
 rail with the statement-v3 parameter resolver needed for exact native-option
 validation. `Delivery` is therefore a post-release D13 addition, not part of the
@@ -75,7 +77,8 @@ COPY or pipeline rail exists, any COPY, pipeline, or unknown numeric status obse
 PostgreSQL result consumer clears its current result and immediately poisons/closes the
 connection; it is never sent through a generic result drain or pipeline-exit attempt. Explicit
 direct and prepared delivery also recheck deadline expiry after nonblocking enablement and before
-send.
+send. The migration runner owns no COPY protocol and rejects every top-level PostgreSQL COPY
+statement before target open; quoted, commented, or dollar-quoted COPY text remains ordinary data.
 For planning language, **initial `pkg.db` release** means L1a–L7 plus D1–D12;
 **complete committed `pkg.db` roadmap** means those plus D13 and D14. D0 is
 disposable native evidence and may run in parallel at any time.

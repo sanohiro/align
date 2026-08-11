@@ -348,6 +348,10 @@ COPY, pipeline, or an unknown numeric status once, immediately poisons/closes, p
 owned error or silent Drop, and then releases package owners. No later result drain, COPY operation,
 pipeline exit, cancel, transaction probe, or blocking restoration runs on that connection.
 Supporting libpq 17 or newer does not mean assuming a future status is drainable.
+The separate Rust migration executor is part of the same consumer audit. Because it sends complete
+user SQL through synchronous `PQexec` but owns no COPY exchange, canonical PostgreSQL migration
+screening rejects a top-level first-token `COPY` before URL access, target open, or native work.
+Preparation uses `PQprepare`/`PQdescribePrepared` and does not execute COPY; other tool SQL is fixed.
 
 **Context-backed static validation stays in the settled execution phase.** The generated
 static-option validator needs an execution context, while overlap is deliberately checked only

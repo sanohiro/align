@@ -41,10 +41,13 @@ owned struct-array slicing. Design review reopened the second A1 matrix after
 finding that the shipped PostgreSQL catalog and EXPLAIN paths did not share the
 typed-execution lease. The next product work is therefore one independently
 mergeable libpq-consumer lease prerequisite with no public/ABI change. A second
-public/ABI-neutral prerequisite then makes every shipped PostgreSQL PGresult
-consumer fail closed on COPY, pipeline, and unknown numeric statuses; current
+application-package-surface/ABI-neutral prerequisite then makes every shipped
+PostgreSQL PGresult consumer fail closed on COPY, pipeline, and unknown numeric statuses; current
 synchronous and timeout paths can already observe a result that requires an
 unsupported protocol transition and must not release that connection for reuse.
+The same prerequisite audits Rust tool PGresult consumers and rejects every
+top-level PostgreSQL migration `COPY` during canonical statement screening,
+before URL access, target open, lock, history publication, or libpq.
 The independently useful PostgreSQL `SingleRow` / `PortalBatch` direct delivery
 rail follows; prepared parity is a fourth PR because it must
 retain parameter-name authority in statement v3. Cardinality drains to clean
@@ -70,8 +73,12 @@ nonblocking mode and before send, and that unknown future libpq statuses cannot
 enter ordinary drain. The final clean-up review moved `PGRES_PIPELINE_SYNC` and
 `PGRES_PIPELINE_ABORTED` to the same immediate-close branch because this rail
 does not own `PQexitPipelineMode`, and synchronized the introductory staging
-with the four-PR matrix. The four implementation PR boundaries and exact public
-contract are in
+with the four-PR matrix. The next review closed the same deferred-subprotocol
+class in shipped migration tooling: user SQL could enter COPY mode through
+`PQexec` and then attempt rollback on the protocol-busy connection, so the
+status prerequisite now adds pre-native PostgreSQL migration COPY rejection and
+a complete prepare/migration SQL-origin inventory. The four implementation PR
+boundaries and exact public contract are in
 `docs/impl/pkg-design/db.md` §23; binary formats remain the following rail.
 
 Out-of-gate suite status (suites outside the bounded CI gate; a nightly
@@ -133,7 +140,7 @@ Q5 schema tooling/inspection     complete through D11 + D12
 Q6 compound product closure      complete through D10
 A1 common batch/SoA rail         complete through #740 / D13
 A1 PostgreSQL lease prerequisite next / catalog + EXPLAIN overlap closure / D13
-then: A1 PostgreSQL status       shipped COPY + pipeline + unknown fail-close / D13
+then: A1 PostgreSQL status       package fail-close + migration COPY preflight / D13
 then: A1 PostgreSQL direct       SingleRow + PortalBatch / D13
 then: A1 PostgreSQL prepared     streamed parity + stmt v3 resolver / D13
 ```

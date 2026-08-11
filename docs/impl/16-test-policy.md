@@ -196,6 +196,13 @@ transaction, catalog/EXPLAIN, and silent-cleanup PGresult consumer. It requires
 one current-result clear, physical close, zero subsequent
 result/COPY/pipeline-exit/cancel/transaction-state/blocking-restore calls, correct first-error
 or silent-Drop behavior, balanced owners/lease, and no reuse.
+The same prerequisite retains Q5a's canonical PostgreSQL statement-screening owner. It crosses
+Required/Forbidden top-level COPY, lowercase and comment-leading spelling, COPY after an ordinary
+statement, quoted/comment/dollar-body near-misses, transaction-control and Forbidden-count
+precedence, and unchanged SQLite behavior. Every rejected case proves zero URL-environment reads,
+target opens, locks, history publication, connection opens, and libpq calls. A checked inventory
+records that prepare uses `PQprepare`/`PQdescribePrepared`, migration is the only compiler-side path
+that sends complete user SQL through `PQexec`, and all remaining tool SQL is fixed.
 
 The direct-delivery suite crosses validation/decode/storage failure with no
 timeout, time remaining, and deadline expiry on both connection and transaction
