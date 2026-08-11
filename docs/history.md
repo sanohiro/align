@@ -41,6 +41,14 @@ canonical §13.4 payload-before-duplicate order, superseding the earlier local c
 is inventoried as post-release D13 rather than part of initial D1--D12. None changes the three PR
 boundaries.
 
+The base-refreshed review reopened the matrix a fifth time. The earlier COPY closure was too narrow:
+shipped synchronous and timeout PostgreSQL consumers can already receive COPY results and release a
+connection that libpq still considers protocol-busy. A second public/ABI-neutral prerequisite now
+audits every package-owned PGresult consumer and makes COPY plus unknown numeric statuses clear once
+and close with no later protocol call. Direct and prepared explicit delivery also preserve D9's
+clock recheck after enabling nonblocking mode and before send. The implementation sequence is now
+four mergeable PRs: lease repair, result-status safety, direct delivery, and prepared parity.
+
 ## 2026-08-07: shared borrow accepts stable Copy storage
 
 Shared `borrow` now accepts a stable bound Copy or Move place. Copy values still pass by value by

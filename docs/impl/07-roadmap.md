@@ -60,18 +60,22 @@ unrelated native surface waits merely for an earlier bullet in the same D label.
 The first rail, shipped by #740, is the exact common `batch<R>` / bounded
 `next_batch` / row and `SoaPlain` projection contract plus v5 Query batch plan
 recorded by `pkg-design/db.md` §23. It retains SQLite `Step` and PostgreSQL
-`BufferedFull`. Before streamed delivery, one independently mergeable
-prerequisite closes the shipped PostgreSQL catalog/EXPLAIN execution-lease gap
-without changing a public surface or ABI. The following independently useful
+`BufferedFull`. Before streamed delivery, two independently mergeable,
+public/ABI-neutral prerequisites close shipped PostgreSQL correctness gaps. The
+first gives catalog/EXPLAIN the execution lease; the second makes every existing
+PGresult consumer clear and close on COPY or an unknown numeric status without
+another protocol call. The following independently useful
 rail is the exact PostgreSQL `SingleRow` / `PortalBatch` direct delivery
 contract recorded by the adjacent A1 ledger. Prepared parity follows in its own
 rail with the statement-v3 parameter resolver needed for exact native-option
 validation. `Delivery` is therefore a post-release D13 addition, not part of the
 initial D1--D12 option inventory. PostgreSQL binary formats, COPY, pipeline mode, and LISTEN/NOTIFY
 remain later independent rails rather than enlarging any of those PRs. Until the
-COPY rail exists, any COPY status observed by streamed rows clears its current
-result and immediately poisons/closes the connection; it is never sent through a
-generic result drain.
+COPY rail exists, any COPY or unknown numeric status observed by any PostgreSQL
+result consumer clears its current result and immediately poisons/closes the
+connection; it is never sent through a generic result drain. Explicit direct and
+prepared delivery also recheck deadline expiry after nonblocking enablement and
+before send.
 For planning language, **initial `pkg.db` release** means L1a–L7 plus D1–D12;
 **complete committed `pkg.db` roadmap** means those plus D13 and D14. D0 is
 disposable native evidence and may run in parallel at any time.

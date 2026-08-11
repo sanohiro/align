@@ -338,12 +338,14 @@ deadline expiry cancels; the first row/storage error remains primary, while the 
 transaction state exposes whether completion or cancellation won. Rows therefore retain both the
 absolute deadline and the original duration needed by recovery.
 
-**A deferred native subprotocol fails closed.** A COPY result is not an ordinary invalid rows
-result: libpq cannot reach the terminal result until the COPY exchange itself is consumed or
-terminated. COPY is a later rail, so streamed rows do not add a partial COPY API or wait forever in
-generic drain. They clear the observed result, immediately poison/close the connection, preserve an
-earlier owned error, and then release package owners. No later result drain, cancel, transaction
-probe, or blocking restoration runs on that connection.
+**A deferred or unknown native subprotocol fails closed at every result consumer.** A COPY result is
+not an ordinary invalid rows result: libpq cannot reach the terminal result until the COPY exchange
+itself is consumed or terminated. Shipped synchronous and timeout executors can already observe it;
+the rule is therefore a pre-stream PostgreSQL result-status closure, not only a streamed-rows arm.
+Every package-owned PGresult consumer clears COPY or an unknown numeric status once, immediately
+poisons/closes, preserves an earlier owned error or silent Drop, and then releases package owners.
+No later result drain, COPY operation, cancel, transaction probe, or blocking restoration runs on
+that connection. Supporting libpq 17 or newer does not mean assuming a future status is drainable.
 
 **Context-backed static validation stays in the settled execution phase.** The generated
 static-option validator needs an execution context, while overlap is deliberately checked only
@@ -352,14 +354,22 @@ descriptor/options/restriction and live state, allocate the context, run generat
 validation, acquire the lease, then bind and call libpq. Moving static validation before live state
 or moving the lease before it would change observable error precedence and allocation behavior.
 
+**A deadline is checked at the last reversible pre-send point.** Enabling libpq nonblocking mode may
+consume the remaining operation budget. Direct and prepared explicit delivery therefore re-read the
+monotonic clock immediately afterward and before send. Expiry restores blocking mode and returns
+Timeout with zero send, selector, and cancel calls; failed restoration poisons/closes. This preserves
+the shipped D9 rule that effectful SQL never starts after its deadline has already expired.
+
 **A live native protocol requires a complete consumer lease inventory.** PostgreSQL catalog and
 EXPLAIN originally used synchronous full-result libpq calls, so D12 checked their live connection
 but did not give them the typed-execution lease. That was harmless only while every PostgreSQL rows
 constructor also completed its libpq protocol synchronously. Single-row/chunked delivery keeps the
-connection protocol-busy after return, exposing the omission. The fix is a smaller prerequisite,
+connection protocol-busy after return, exposing the omission. The lease fix is one smaller prerequisite,
 not a delivery special case: every catalog and common/native EXPLAIN call acquires the same lease,
 holds it through result/context cleanup, and rejects overlap before libpq. Both subsequent direct
-and prepared streamed-delivery PRs depend on that general closure.
+and prepared streamed-delivery PRs depend on that general closure. The separate shipped-result
+status prerequisite follows it because that safety repair is independently useful without a public
+surface, ABI, or libpq-version change.
 
 **A named `region` is a destination capability, not an allocator abstraction.** Compound
 database reads and streaming decoders need ordinary library functions to construct caller-owned

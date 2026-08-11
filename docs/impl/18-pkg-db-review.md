@@ -538,12 +538,13 @@ idea is rejected.
   per-result delivery and peak result buffering are a scheduled D13 capability and must not be
   falsely described as a bound on total transport. The second A1 ledger in `pkg-design/db.md` §23
   now fixes that direct/prepared streamed-delivery rail. Its
-  reopened closure matrix first lands an independently mergeable PostgreSQL catalog/EXPLAIN lease
-  prerequisite, because those shipped libpq consumers must reject overlap before a live stream can
-  be sound. Direct delivery follows with normal-drain cardinality and exact BufferedFull default
-  preservation; prepared parity then retains parameter-name authority in statement v3. Binary
+  reopened closure matrix first lands independently mergeable PostgreSQL catalog/EXPLAIN lease and
+  shipped-result-status safety prerequisites. The latter audits every current PGresult consumer and
+  closes on COPY or an unknown numeric status without another protocol call. Direct delivery follows
+  with normal-drain cardinality, exact BufferedFull default preservation, and a post-nonblocking
+  pre-send deadline check; prepared parity then retains parameter-name authority in statement v3. Binary
   formats and other native paths remain separate. Because COPY termination is not in this rail,
-  observing a COPY status clears only that result and immediately poisons/closes instead of entering
+  observing a COPY or unknown status clears only that result and immediately poisons/closes instead of entering
   generic drain; direct construction also retains Q2's live-state/context/static-validation/lease
   phase order. Query Delivery validation retains §13.4 payload-before-duplicate precedence, and
   `one_native` records the monotonic caller-region bytes left by its first-Row clone when a later

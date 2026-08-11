@@ -186,10 +186,16 @@ implementation PR must make both CI and `db-verify-local.sh` assert the client
 version and run the new required direct-delivery suite; the prepared-parity PR
 then adds its statement-resolver and prepared-delivery cases to the same local
 and CI job. A newer server image must not hide an accidental client-version
-dependency. The preceding libpq-consumer lease prerequisite keeps the current
-client floor, but the same local database gate must run its catalog/EXPLAIN
-overlap suite and prove zero libpq calls on a rejected live-stream overlap
-before that prerequisite is pushed.
+dependency. The preceding libpq-consumer lease and result-status safety
+prerequisites keep the current client floor. The same local database gate must
+first run the catalog/EXPLAIN overlap suite and prove zero libpq calls on a
+rejected live-stream overlap. The status prerequisite then injects every COPY
+status and an unknown numeric status into every shipped synchronous,
+timeout-completion, timeout-recovery, direct/prepared rows/one/command/prepare,
+transaction, catalog/EXPLAIN, and silent-cleanup PGresult consumer. It requires
+one current-result clear, physical close, zero subsequent
+result/COPY/cancel/transaction-state/blocking-restore calls, correct first-error
+or silent-Drop behavior, balanced owners/lease, and no reuse.
 
 The direct-delivery suite crosses validation/decode/storage failure with no
 timeout, time remaining, and deadline expiry on both connection and transaction
@@ -197,8 +203,8 @@ targets. It pins first-error retention, no further decode, completion-versus-
 cancel SQL effects, the rows-v3 absolute-deadline/original-duration pair, and
 recovery-budget use. Chunk owners report total transported rows separately from
 maximum rows per `PGresult`; the latter is not asserted as a total-transport
-bound. Every `PGRES_COPY_IN`/`PGRES_COPY_OUT`/`PGRES_COPY_BOTH` injection is a
-fail-closed owner, including first-result, after-data, row/decode/storage error,
+bound. Every `PGRES_COPY_IN`/`PGRES_COPY_OUT`/`PGRES_COPY_BOTH` and unknown-status
+injection is a fail-closed owner, including first-result, after-data, row/decode/storage error,
 deadline recovery, mode failure, and Drop on connection and transaction targets.
 Those owners assert one current-result clear and physical close, zero subsequent
 result/COPY/cancel/transaction-state/blocking-restore calls, first-error retention,
@@ -211,6 +217,9 @@ post-release surface inventories. Its `one_native` region owner records zero
 caller-region allocation before a valid first Row and the exact same one-clone
 byte/alignment delta for singleton success, Cardinality, and every later error;
 no case rewinds the arena or clones a second Row.
+Direct and prepared explicit-delivery owners delay the test clock across
+nonblocking enablement and require expired-before-send to produce zero
+send/selector/cancel calls, exact Timeout, and blocking restoration or close.
 
 ## Benchmarks are not tests
 

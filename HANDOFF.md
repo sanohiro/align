@@ -40,9 +40,12 @@ delivery with the v5 Query batch plan on both drivers. #741 tiers verification,
 owned struct-array slicing. Design review reopened the second A1 matrix after
 finding that the shipped PostgreSQL catalog and EXPLAIN paths did not share the
 typed-execution lease. The next product work is therefore one independently
-mergeable libpq-consumer lease prerequisite with no public/ABI change. After it
-merges, the independently useful PostgreSQL `SingleRow` / `PortalBatch`
-direct delivery rail follows; prepared parity is a third PR because it must
+mergeable libpq-consumer lease prerequisite with no public/ABI change. A second
+public/ABI-neutral prerequisite then makes every shipped PostgreSQL PGresult
+consumer fail closed on COPY and unknown numeric statuses; current synchronous
+and timeout paths can already observe them and must not release an undrainable
+connection for reuse. The independently useful PostgreSQL `SingleRow` /
+`PortalBatch` direct delivery rail follows; prepared parity is a fourth PR because it must
 retain parameter-name authority in statement v3. Cardinality drains to clean
 completion rather than canceling a possibly effectful `RETURNING` statement,
 and absent Delivery stays on the caller-synchronous BufferedFull implementation,
@@ -55,13 +58,16 @@ cleared and the physical connection is immediately poisoned/closed, with no
 generic result drain, COPY operation, cancel, transaction probe, or blocking
 restore afterward. It also restores direct execution's settled phase order:
 live state, context-backed generated static validation, lease, then bind/native
-work. Neither correction forms an independently useful prerequisite, so the
-three-PR boundary remains unchanged. The following consistency review found no
+work. The following consistency review found no
 new P1: `one_native` now states that a first-Row `clone_in(out)` remains allocated
 on Cardinality or any later error because caller arenas are monotonic; Query
 Delivery follows §13.4 payload-before-duplicate order; and Delivery is listed as
-post-release D13 rather than in the initial D1--D12 inventory. The exact boundary
-and public contract are in
+post-release D13 rather than in the initial D1--D12 inventory. A fifth matrix
+reopen then found that the COPY closure had omitted shipped result consumers,
+that explicit direct/prepared delivery must recheck expiry after enabling
+nonblocking mode and before send, and that unknown future libpq statuses cannot
+enter ordinary drain. The four implementation PR boundaries and exact public
+contract are in
 `docs/impl/pkg-design/db.md` §23; binary formats remain the following rail.
 
 Out-of-gate suite status (suites outside the bounded CI gate; a nightly
@@ -123,6 +129,7 @@ Q5 schema tooling/inspection     complete through D11 + D12
 Q6 compound product closure      complete through D10
 A1 common batch/SoA rail         complete through #740 / D13
 A1 PostgreSQL lease prerequisite next / catalog + EXPLAIN overlap closure / D13
+then: A1 PostgreSQL status       shipped COPY + unknown result fail-close / D13
 then: A1 PostgreSQL direct       SingleRow + PortalBatch / D13
 then: A1 PostgreSQL prepared     streamed parity + stmt v3 resolver / D13
 ```
