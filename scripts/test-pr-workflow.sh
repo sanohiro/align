@@ -472,6 +472,34 @@ git -C "$tier_repo" commit -qam 'fix: re-open the closure matrix
 Closure-Matrix-Reopened: callback ABI'
 tier_preflight --base main --owner-test tier -- true >/dev/null
 
+# Fix commits are counted across the whole post-implementation range, not
+# reset by an interleaved non-fix commit: fix, docs, fix, fix still trips the
+# gate at 3 counted fixes.
+tier_branch interleaved-rounds-change
+mkdir -p "$tier_repo/crates/thing/tests"
+printf '#[test]\nfn a() {}\n' >"$tier_repo/crates/thing/tests/interleaved.rs"
+git -C "$tier_repo" add crates/thing/tests/interleaved.rs
+git -C "$tier_repo" commit -qm 'feat: add interleaved owner'
+printf '#[test]\nfn r1() {}\n' >>"$tier_repo/crates/thing/tests/interleaved.rs"
+git -C "$tier_repo" commit -qam 'fix: close review finding 1'
+printf '\ninterleaved note\n' >>"$tier_repo/docs/impl/00-plan.md"
+git -C "$tier_repo" commit -qam 'docs: unrelated interleaved note'
+printf '#[test]\nfn r2() {}\n' >>"$tier_repo/crates/thing/tests/interleaved.rs"
+git -C "$tier_repo" commit -qam 'fix: close review finding 2'
+printf '#[test]\nfn r3() {}\n' >>"$tier_repo/crates/thing/tests/interleaved.rs"
+git -C "$tier_repo" commit -qam 'fix: close review finding 3'
+if tier_preflight --base main --owner-test tier -- true >/dev/null 2>&1; then
+  echo "3 fix commits interleaved with a docs commit unexpectedly passed" >&2
+  exit 1
+fi
+# The release check reads the same counted set, so a trailer commit still
+# releases the gate once it reopens the matrix.
+printf '\n## interleaved axis\n' >>"$tier_repo/docs/impl/00-plan.md"
+git -C "$tier_repo" commit -qam 'fix: re-open the closure matrix for the interleaved case
+
+Closure-Matrix-Reopened: interleaved axis'
+tier_preflight --base main --owner-test tier -- true >/dev/null
+
 # A docs-only branch is never subject to the review-round gate, and its
 # attestation survives the CI-side tier recomputation.
 tier_branch docs-rounds

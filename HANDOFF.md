@@ -53,8 +53,8 @@ including a build without this branch's validator change, both at CPU 0 for
 never completes. Its generators are integer-only Result chains, untouched by
 the owned-string validator work; triage the hang (likely a generated binary
 blocking) before relying on the nightly full-suite signal, which it will
-otherwise consume up to the job timeout (the nightly workflow skips it by name
-until then).
+otherwise consume up to the job timeout (the test now carries `#[ignore]` so
+`cargo test` excludes it by default until then).
 
 The fixed-array follow-up from the validator-alignment review is closed. The
 suspected owned `array<T>` element is source-reachable: sema admitted it even

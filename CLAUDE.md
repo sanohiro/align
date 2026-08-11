@@ -368,7 +368,7 @@ attestation checker also runs against the same diff) and enforces the matching
 gate, so the tier is a property of the changed paths and cannot be claimed:
 
 ```text
-docs-only  *.md and docs/ only, with       no reviewer, no owner check
+docs-only  *.md files only, with           no reviewer, no owner check
            --docs-only
 tooling    leaf owner tests that are not   review OPTIONAL, one focused owner
            bounded-gate content, and       check (plus the cheap ratchet when
@@ -377,6 +377,10 @@ tooling    leaf owner tests that are not   review OPTIONAL, one focused owner
 code       everything else                 one fresh review, owner check,
                                            bounded gate, Clippy
 ```
+
+A non-Markdown file under `docs/` (a fixture, a script, a generated asset) is
+not documentation for this classification; only `*.md` is. `scripts/pre-pr.sh`
+and `scripts/pr-tier.sh` share that exact definition.
 
 Machinery that CI fetches from the trusted base needs one explicit
 bootstrap arm in `preflight.yml` for the PR that introduces it, keyed on that
@@ -419,6 +423,17 @@ normal code path is exactly:
 5. Push and open the draft with `scripts/open-pr.sh`, wait for CI, then merge.
    Opening the PR does not invalidate or duplicate the pre-open review. Direct
    `gh pr create` is prohibited for agent-driven work.
+
+### Review log
+
+`scripts/new-review-log.sh [OUTPUT_PATH]` scaffolds a review-log file: it
+writes the required `ALIGN_REVIEW_HEAD` (current `HEAD`) and `ALIGN_REVIEW_BASE`
+(`origin/main`) keys, a template body, and a trailing `ALIGN_REVIEW_VERDICT=FINDINGS`
+line, then prints the matching `scripts/pre-pr.sh` invocation. `git status
+--porcelain` never reports paths under `.git/`, so an untracked review log
+placed there does not fail `scripts/pre-pr.sh`'s clean-worktree check; the
+scaffolder defaults there (matching `scripts/review-bounded.sh`'s own default
+log location) and also accepts any path entirely outside the repository.
 
 A complete re-review is required only when the fix changes a public contract
 or strategy, changes an IR shape, materially crosses three or more compiler
