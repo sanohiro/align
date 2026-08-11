@@ -1998,7 +1998,7 @@ fn check_program_memoized(
             .iter()
             .map(|unit| (unit.path.as_str(), unit.is_entry, unit.src.as_str()))
             .collect();
-        memo::program_key(&units)
+        memo::program_key(&units, diags)
     });
     if let Some(key) = key
         && let Some(hit) = memo::program_lookup(key)
@@ -2011,13 +2011,22 @@ fn check_program_memoized(
             static_descriptors: hit.static_descriptors,
         };
     }
-    // Collect this step's own diagnostics separately: the caller's `diags` already holds the loader's
-    // (which are recomputed on every call and must not be retained twice).
-    let mut own = Diagnostics::new();
-    let checked = align_sema::check_program_with_static_descriptors(modules, &mut own);
+    // Sema READS the sink it is given: `declaration_has_prior_error` suppresses static-descriptor
+    // discovery for a function the loader already reported a lexer/parser error inside. It must
+    // therefore see exactly what it saw before this memo existed — the loader's diagnostics. The sink
+    // is seeded with them and only the TAIL past `seeded` is this step's own output, so nothing is
+    // pushed back to the caller (or retained) twice. `memo::program_key` folds the seeded set for the
+    // same reason: it is an input to the step being memoized.
+    let seeded = diags.len();
+    let mut sink = Diagnostics::new();
+    for diagnostic in diags.iter() {
+        sink.push(diagnostic.clone());
+    }
+    let checked = align_sema::check_program_with_static_descriptors(modules, &mut sink);
+    let own: Vec<align_diag::Diagnostic> = sink.iter().skip(seeded).cloned().collect();
     // Retain only an error-free result whose every diagnostic points into one of the units the key
     // pins; a span outside that range names a file the replaying run may not have.
-    let replayable = !own.has_errors()
+    let replayable = !sink.has_errors()
         && own
             .iter()
             .all(|diagnostic| diagnostic.span.is_some_and(|span| (span.file as usize) < loaded.len()));
@@ -2029,12 +2038,12 @@ fn check_program_memoized(
             memo::CachedProgram {
                 program: checked.program.clone(),
                 static_descriptors: checked.static_descriptors.clone(),
-                diagnostics: own.iter().cloned().collect(),
+                diagnostics: own.clone(),
             },
         );
     }
-    for diagnostic in own.iter() {
-        diags.push(diagnostic.clone());
+    for diagnostic in own {
+        diags.push(diagnostic);
     }
     checked
 }
@@ -2339,7 +2348,7 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
         // `SourceMap`, so its MIR is a function of the project's file paths and line tables as well
         // as of the sema input keyed here. That mode is the `explain-opt` reporting lens, not a
         // build path, so it opts out entirely rather than growing the key to cover a source map.
-        let memo_key = (!located && memo::enabled()).then(|| {
+        let memo_keyed = (!located && memo::enabled()).then(|| {
             memo::unit_key(
                 &u.path,
                 u.is_entry,
@@ -2353,7 +2362,7 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
                 },
             )
         });
-        if let Some(key) = memo_key
+        if let Some((key, _)) = memo_keyed
             && let Some(hit) = memo::unit_lookup(key)
         {
             // Replay the unit's diagnostics first, in the same position in `diags` a recomputed unit
@@ -2572,7 +2581,7 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
                 // Retain the frontend result for the rest of the process. A descriptor-owning unit is
                 // excluded: its result depends on files under the project root and on a publication
                 // lock, neither of which a replay re-establishes.
-                if let Some(key) = memo_key
+                if let Some((key, material_len)) = memo_keyed
                     && let Some(diagnostics) = replayable_diags
                     && static_descriptors.is_empty()
                 {
@@ -2584,6 +2593,7 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
                             static_inputs: resolved.manifest.clone(),
                             diagnostics,
                         },
+                        material_len,
                     );
                 }
                 summaries.insert(u.path.clone(), s.clone());
@@ -2790,15 +2800,15 @@ fn lower_memoized(
     variant: &str,
     produce: impl FnOnce(&align_sema::Program) -> align_mir::Program,
 ) -> align_mir::Program {
-    let key = memo::enabled().then(|| memo::lowering_key(hir, variant));
-    if let Some(key) = key
+    let keyed = memo::enabled().then(|| memo::lowering_key(hir, variant));
+    if let Some((key, _)) = keyed
         && let Some(hit) = memo::lowering_lookup(key)
     {
         return hit;
     }
     let mir = produce(hir);
-    if let Some(key) = key {
-        memo::lowering_store(key, &mir);
+    if let Some((key, material_len)) = keyed {
+        memo::lowering_store(key, &mir, material_len);
     }
     mir
 }
@@ -2893,10 +2903,17 @@ pub fn emit_object_file(mir: &align_mir::Program, obj: &std::path::Path, target:
         return std::fs::write(obj, bytes.as_slice())
             .map_err(|e| format!("cannot write object file '{}': {e}", obj.display()));
     }
+    // Retention reads the bytes BACK from the file codegen just wrote rather than having codegen hand
+    // them over: `write_to_file` is the one seam every byte-identity gate is baselined on, and the
+    // measured saving of switching to an in-memory buffer is one page-cache read (~0.6 MB, well under
+    // a millisecond) after a stage that just spent seconds in LLVM. The read is only trustworthy if
+    // no other thread wrote this same path meanwhile, which `EmitGuard` establishes.
+    let emitting = key.map(|_| memo::begin_emit(obj));
     align_codegen_llvm::emit_object(mir, obj, &target, profile, exports, rt_lto_bytes(rt_lto)).map_err(|e| e.to_string())?;
-    // Retain what codegen just wrote. A read-back failure is not a compilation failure: the object
-    // is already on disk and the build proceeds exactly as it would without the memo.
+    // A read-back failure is not a compilation failure: the object is already on disk and the build
+    // proceeds exactly as it would without the memo.
     if let Some(key) = key
+        && emitting.as_ref().is_some_and(memo::EmitGuard::exclusive)
         && let Ok(bytes) = std::fs::read(obj)
     {
         memo::object_store(key, bytes);

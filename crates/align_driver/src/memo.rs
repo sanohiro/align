@@ -26,7 +26,7 @@
 //! mutex and are safe to use from the parallel per-unit codegen workers.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use align_interface::{Hash128, InterfaceSummary};
@@ -35,17 +35,38 @@ use align_interface::{Hash128, InterfaceSummary};
 /// encoding can never be confused with a new one within one process image.
 const KEY_FORMAT_VERSION: u32 = 1;
 
-/// Retained object bytes are capped so a pathological build cannot trade unbounded RSS for compile
-/// time. Objects are small in practice (the whole eight-module `pkg.db` per-unit build is under one
-/// megabyte), so this bound is never reached by a normal workload; it exists to make the worst case
-/// stated rather than discovered. Insertion simply stops once the budget is spent — there is no
-/// eviction, which keeps a hit deterministic for the process's whole life.
-const OBJECT_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+/// Default retention budget, in ESTIMATED retained bytes across all four maps
+/// ([`set_budget`] overrides it).
+///
+/// A one-shot `alignc` run exits long before any bound matters, but an embedder — align-llm today,
+/// a language server later — keeps one process alive across thousands of compilations, so the bound
+/// has to be denominated in memory rather than in entries. Insertion simply stops once the budget is
+/// spent: there is no eviction, which keeps a hit deterministic for the process's whole life and
+/// keeps a refusal from changing any output.
+///
+/// **How an entry is charged.** Objects are charged their exact byte length. The three frontend maps
+/// are charged a *proxy*: the length of the canonical rendering the store site already holds.
+///
+/// ```text
+/// program    the HIR's `Debug` rendering        the retained artifact itself
+/// lowering   the HIR rendering built for the    the MIR is derived from it and of the same order
+///            key (free)
+/// unit       the unit's key material (free)     contains the unit's full source and every
+///                                               dependency interface it was checked against
+/// object     exact byte length                  exact
+/// ```
+///
+/// The proxy is an estimate, not a measurement — a rendering is wider than the structure it prints,
+/// and a `Vec` reserves beyond its length — so the budget bounds retention within a constant factor,
+/// not exactly. That is the point: retention must be bounded and must stop at the bound. Measured
+/// scale for the eight-module `pkg.db` package: one whole-program HIR renders to 1.8 MB, one
+/// per-unit key is a few hundred kilobytes, and one per-unit object set is under a megabyte, so the
+/// default admits roughly two hundred distinct whole-program compilations before it binds — past the
+/// largest owner suite (44 distinct programs) and far short of a long-lived embedder's lifetime.
+const DEFAULT_BUDGET_BYTES: u64 = 768 * 1024 * 1024;
 
-/// Retained frontend artifacts are capped by COUNT rather than bytes: an HIR or MIR program has no
-/// cheap size, and the population is bounded by the distinct units and programs a process compiles
-/// (tens, in the largest driver test binary). One budget per map.
-const ENTRY_BUDGET: usize = 512;
+/// The retention budget in estimated bytes. Configuration, not content: [`clear`] does not reset it.
+static BUDGET_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_BUDGET_BYTES);
 
 /// Whether the memo is active. On by default: every in-process consumer that compiles the same
 /// input twice benefits, and a consumer that never repeats pays only one structural hash per
@@ -105,27 +126,33 @@ pub(crate) fn unit_diagnostics(
 }
 
 /// Hit/miss and retention counters. Cumulative for the process (or since the last [`clear`]).
+///
+/// Every stage has a `hits` / `misses` pair, where a MISS is a LOOKUP that found nothing. A stage
+/// the memo declines outright — the memo off, a located lowering, a non-canonical file-id
+/// assignment — performs no lookup and is counted in neither.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoStats {
     /// Whole-program sema results served from memory.
     pub program_hits: u64,
-    /// Whole-program sema results computed (whether or not they were then retained).
+    /// Lookups of a whole-program sema result that found nothing.
     pub program_misses: u64,
     /// Per-unit frontend results served from memory.
     pub unit_hits: u64,
-    /// Per-unit frontend results computed (whether or not they were then retained).
+    /// Lookups of a per-unit frontend result that found nothing.
     pub unit_misses: u64,
     /// HIR-to-MIR lowerings served from memory.
     pub lowering_hits: u64,
-    /// HIR-to-MIR lowerings computed (whether or not they were then retained).
+    /// Lookups of a lowering that found nothing.
     pub lowering_misses: u64,
     /// Object files served from memory.
     pub object_hits: u64,
-    /// Object files produced by codegen (whether or not they were then retained).
+    /// Lookups of object bytes that found nothing.
     pub object_misses: u64,
-    /// Retained object bytes.
-    pub object_bytes: u64,
-    /// Artifacts not retained because a budget was already spent.
+    /// Estimated bytes currently retained across all four maps, charged as documented on
+    /// [`DEFAULT_BUDGET_BYTES`].
+    pub retained_bytes: u64,
+    /// Artifacts not retained because the budget was already spent, or because a concurrent
+    /// emission to the same object path made the read-back untrustworthy.
     pub refused: u64,
 }
 
@@ -150,6 +177,16 @@ struct Store {
     /// `Arc`: `emit_object_file` runs on the parallel per-unit codegen workers, and copying a
     /// multi-megabyte object while holding the store mutex would serialize them.
     objects: HashMap<Hash128, Arc<Vec<u8>>>,
+    /// Object paths with an emission in flight: `(concurrent emitters, ever contended)`.
+    ///
+    /// `emit_object_file` retains the bytes it reads BACK from the file codegen just wrote. If two
+    /// threads emitted different programs to one path, that read could observe the other emission
+    /// and retain foreign bytes under this key. No caller does that — `codegen_units_parallel` gives
+    /// each unit its own path and the test harnesses embed the pid and a per-test name — but the
+    /// consequence would be silent and wrong, so the invariant is enforced rather than assumed:
+    /// while a path is contended, BOTH emissions skip retention. The build itself is untouched, so
+    /// this can never turn a working caller into a failing one.
+    emitting: HashMap<std::path::PathBuf, (u32, bool)>,
     stats: MemoStats,
 }
 
@@ -181,6 +218,29 @@ pub fn stats() -> MemoStats {
     store().stats
 }
 
+/// Override the retention budget, in estimated bytes (see [`DEFAULT_BUDGET_BYTES`] for how an entry
+/// is charged). Lowering it below what is already retained refuses every FURTHER insertion; it never
+/// drops or invalidates an entry, because a refusal must not change any output. Configuration, not
+/// content — [`clear`] does not reset it.
+pub fn set_budget(bytes: u64) {
+    BUDGET_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// The retention budget currently in force.
+pub fn budget() -> u64 {
+    BUDGET_BYTES.load(Ordering::Relaxed)
+}
+
+/// Reserve `charge` estimated bytes, or report that the budget is spent. Callers hold `guard`.
+fn reserve(guard: &mut Store, charge: u64) -> bool {
+    if guard.stats.retained_bytes.saturating_add(charge) > budget() {
+        guard.stats.refused += 1;
+        return false;
+    }
+    guard.stats.retained_bytes += charge;
+    true
+}
+
 /// Drop every retained artifact and reset the counters.
 pub fn clear() {
     let mut guard = store();
@@ -188,6 +248,8 @@ pub fn clear() {
     guard.units.clear();
     guard.lowerings.clear();
     guard.objects.clear();
+    // `emitting` is in-flight state owned by live `EmitGuard`s, not retained content: clearing it
+    // would leave a guard removing an entry it no longer owns.
     guard.stats = MemoStats::default();
 }
 
@@ -206,13 +268,12 @@ fn env_toggles(out: &mut String) {
         "ALIGN_BUFFER_DONATE",
         "ALIGN_SORT_ADAPTIVE",
     ] {
-        out.push_str(name);
-        out.push('=');
+        // Through `field`, like every other component: a bare `NAME=value` line is not injective
+        // (a value containing a newline could impersonate the next toggle).
         match std::env::var(name) {
-            Ok(value) => out.push_str(&value),
-            Err(_) => out.push_str("\u{1}unset"),
+            Ok(value) => field(out, name, &value),
+            Err(_) => field(out, name, "\u{1}unset"),
         }
-        out.push('\n');
     }
 }
 
@@ -233,11 +294,19 @@ fn field(out: &mut String, name: &str, value: &str) {
 /// module path, entry flag, and AST, and an AST is a pure function of its source text. `units` is
 /// that list in the order it is passed to sema.
 ///
+/// `seeded` is the diagnostic sink sema is handed. It is key material, not just context: sema READS
+/// the sink — `declaration_has_prior_error` suppresses static-descriptor discovery for a function the
+/// loader already reported an error inside — so two runs whose prior diagnostics differ can produce
+/// different descriptors from the same sources.
+///
 /// The caller must additionally have established the CANONICAL file-id assignment (unit `i` owns
 /// `FileId` `i`) before using this key, because the retained HIR and diagnostics carry file ids
 /// verbatim. Without that precondition the same source list could be checked under a different
 /// id assignment, and a replayed span would name the wrong file.
-pub(crate) fn program_key(units: &[(&str, bool, &str)]) -> Hash128 {
+pub(crate) fn program_key(
+    units: &[(&str, bool, &str)],
+    seeded: &align_diag::Diagnostics,
+) -> Hash128 {
     let mut material = String::with_capacity(4096);
     material.push_str("align-inproc-program-v");
     material.push_str(&KEY_FORMAT_VERSION.to_string());
@@ -249,6 +318,12 @@ pub(crate) fn program_key(units: &[(&str, bool, &str)]) -> Hash128 {
         field(&mut material, "entry", if *is_entry { "1" } else { "0" });
         field(&mut material, "src", src);
     }
+    field(&mut material, "seeded", &seeded.len().to_string());
+    for diagnostic in seeded.iter() {
+        field(&mut material, "sev", &format!("{:?}", diagnostic.severity));
+        field(&mut material, "span", &format!("{:?}", diagnostic.span));
+        field(&mut material, "msg", &diagnostic.message);
+    }
     Hash128::of(material.as_bytes())
 }
 
@@ -258,7 +333,7 @@ pub(crate) fn program_key(units: &[(&str, bool, &str)]) -> Hash128 {
 /// HIR differently. The HIR itself is fingerprinted with its total derived `Debug`, the same
 /// technique `align_interface::codegen_impl_hash` uses for MIR: a field added to any HIR node
 /// appears in the rendering automatically, so a new field cannot silently escape the key.
-pub(crate) fn lowering_key(hir: &align_sema::hir::Program, variant: &str) -> Hash128 {
+pub(crate) fn lowering_key(hir: &align_sema::hir::Program, variant: &str) -> (Hash128, u64) {
     let mut material = String::with_capacity(64);
     material.push_str("align-inproc-lowering-v");
     material.push_str(&KEY_FORMAT_VERSION.to_string());
@@ -266,7 +341,7 @@ pub(crate) fn lowering_key(hir: &align_sema::hir::Program, variant: &str) -> Has
     env_toggles(&mut material);
     field(&mut material, "variant", variant);
     field(&mut material, "hir", &format!("{hir:?}"));
-    Hash128::of(material.as_bytes())
+    (Hash128::of(material.as_bytes()), material.len() as u64)
 }
 
 /// The canonical key for one per-unit frontend result.
@@ -287,7 +362,7 @@ pub(crate) fn unit_key(
     src: &str,
     interfaces: &[(&str, &str)],
     external: ExternalFacts<'_>,
-) -> Hash128 {
+) -> (Hash128, u64) {
     let mut material = String::with_capacity(src.len() + 4096);
     material.push_str("align-inproc-unit-v");
     material.push_str(&KEY_FORMAT_VERSION.to_string());
@@ -305,7 +380,7 @@ pub(crate) fn unit_key(
     facts(&mut material, "provenance", external.return_provenance);
     facts(&mut material, "resources", external.resources);
     facts(&mut material, "hooks", external.resource_hooks);
-    Hash128::of(material.as_bytes())
+    (Hash128::of(material.as_bytes()), material.len() as u64)
 }
 
 /// The four cross-unit fact maps the per-unit check is seeded with, borrowed together so the key
@@ -390,16 +465,18 @@ pub(crate) fn program_lookup(key: Hash128) -> Option<CachedProgram> {
 
 /// Retain one whole-program sema result. The caller must have established the canonical file-id
 /// assignment and that the program checked without errors.
+///
+/// The retention charge is the HIR's own `Debug` length. Rendering it costs about 4 ms for the
+/// eight-module `pkg.db` program — 0.3% of the ~1.5 s sema step this insertion follows — and unlike
+/// the source length (which the retained HIR exceeds sevenfold) it tracks the artifact actually
+/// held.
 pub(crate) fn program_store(key: Hash128, program: CachedProgram) {
     if !enabled() {
         return;
     }
+    let charge = format!("{:?}", program.program).len() as u64;
     let mut guard = store();
-    if guard.programs.contains_key(&key) {
-        return;
-    }
-    if guard.programs.len() >= ENTRY_BUDGET {
-        guard.stats.refused += 1;
+    if guard.programs.contains_key(&key) || !reserve(&mut guard, charge) {
         return;
     }
     guard.programs.insert(key, program);
@@ -420,17 +497,14 @@ pub(crate) fn lowering_lookup(key: Hash128) -> Option<align_mir::Program> {
     Some(cloned)
 }
 
-/// Retain one lowering result.
-pub(crate) fn lowering_store(key: Hash128, mir: &align_mir::Program) {
+/// Retain one lowering result. `hir_render_len` is the length of the HIR rendering
+/// [`lowering_key`] already built, which the derived MIR is of the same order as.
+pub(crate) fn lowering_store(key: Hash128, mir: &align_mir::Program, hir_render_len: u64) {
     if !enabled() {
         return;
     }
     let mut guard = store();
-    if guard.lowerings.contains_key(&key) {
-        return;
-    }
-    if guard.lowerings.len() >= ENTRY_BUDGET {
-        guard.stats.refused += 1;
+    if guard.lowerings.contains_key(&key) || !reserve(&mut guard, hir_render_len) {
         return;
     }
     guard.lowerings.insert(key, mir.clone());
@@ -467,16 +541,15 @@ pub(crate) fn unit_lookup(key: Hash128) -> Option<CachedUnit> {
 
 /// Retain one per-unit result. The caller must have established that the unit checked without
 /// errors, owns no static descriptors, and has replayable diagnostics ([`unit_diagnostics`]).
-pub(crate) fn unit_store(key: Hash128, unit: CachedUnit) {
+/// `key_material_len` is the length of the canonical key material [`unit_key`] already built: it
+/// contains the unit's full source and every dependency interface it was checked against, which is
+/// what the retained summary and MIR are derived from.
+pub(crate) fn unit_store(key: Hash128, unit: CachedUnit, key_material_len: u64) {
     if !enabled() {
         return;
     }
     let mut guard = store();
-    if guard.units.contains_key(&key) {
-        return;
-    }
-    if guard.units.len() >= ENTRY_BUDGET {
-        guard.stats.refused += 1;
+    if guard.units.contains_key(&key) || !reserve(&mut guard, key_material_len) {
         return;
     }
     guard.units.insert(key, unit);
@@ -497,22 +570,62 @@ pub(crate) fn object_lookup(key: Hash128) -> Option<Arc<Vec<u8>>> {
     Some(hit)
 }
 
-/// Retain one object's bytes.
+/// Retain one object's bytes, charged exactly.
 pub(crate) fn object_store(key: Hash128, bytes: Vec<u8>) {
     if !enabled() {
-        return;
-    }
-    let mut guard = store();
-    if guard.objects.contains_key(&key) {
         return;
     }
     // Widening only: `usize` is at most 64 bits on every supported host, and the running total is
     // compared in `u64` so a 32-bit host cannot wrap the budget check.
     let len = bytes.len() as u64;
-    if guard.stats.object_bytes.saturating_add(len) > OBJECT_BUDGET_BYTES {
-        guard.stats.refused += 1;
+    let mut guard = store();
+    if guard.objects.contains_key(&key) || !reserve(&mut guard, len) {
         return;
     }
-    guard.stats.object_bytes += len;
     guard.objects.insert(key, Arc::new(bytes));
+}
+
+/// Claim `path` for the duration of one object emission, so [`EmitGuard::exclusive`] can tell
+/// whether the bytes read back from it are certainly this emission's own.
+pub(crate) fn begin_emit(path: &std::path::Path) -> EmitGuard {
+    let mut guard = store();
+    let entry = guard.emitting.entry(path.to_path_buf()).or_insert((0, false));
+    entry.0 += 1;
+    if entry.0 > 1 {
+        entry.1 = true;
+    }
+    EmitGuard {
+        path: path.to_path_buf(),
+    }
+}
+
+/// Releases one in-flight object emission. See `Store::emitting`.
+pub(crate) struct EmitGuard {
+    path: std::path::PathBuf,
+}
+
+impl EmitGuard {
+    /// Whether this path had exactly one emitter for the whole emission. `false` means another
+    /// thread was writing the same file, so the read-back may not be this emission's bytes and
+    /// nothing may be retained — by either emitter, since both observe the contended flag.
+    pub(crate) fn exclusive(&self) -> bool {
+        let guard = store();
+        guard
+            .emitting
+            .get(&self.path)
+            .is_none_or(|(_, contended)| !*contended)
+    }
+}
+
+impl Drop for EmitGuard {
+    fn drop(&mut self) {
+        let mut guard = store();
+        let Some(entry) = guard.emitting.get_mut(&self.path) else {
+            return;
+        };
+        entry.0 = entry.0.saturating_sub(1);
+        if entry.0 == 0 {
+            guard.emitting.remove(&self.path);
+        }
+    }
 }
