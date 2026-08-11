@@ -105,11 +105,19 @@ if [[ -n "$update_pr" ]]; then
       exit 1
       ;;
   esac
+  if ! git rev-parse --verify --quiet "${pr_base_sha}^{commit}" >/dev/null 2>&1; then
+    git fetch --quiet origin "$pr_base" >/dev/null 2>&1 || true
+  fi
   if git rev-parse --verify --quiet "${pr_base_sha}^{commit}" >/dev/null 2>&1; then
     [[ "$(git merge-base "$head_sha" "$pr_base_sha" 2>/dev/null || true)" == "$base_sha" ]] || {
       echo "PR base does not share the preflight merge base" >&2
       exit 1
     }
+  else
+    echo "warning: could not verify the PR's base tip $pr_base_sha locally" >&2
+    echo "  (fetching origin/$pr_base did not produce it). The local merge-base" >&2
+    echo "  check above still bound this branch to $base_ref; a genuine mismatch" >&2
+    echo "  would then be caught by CI instead of here." >&2
   fi
   base="$pr_base"
   gh pr view "$update_pr" --json body --jq '.body // ""' >"$tmp_old"

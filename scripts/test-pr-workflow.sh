@@ -24,6 +24,11 @@ git -C "$attest_repo" config commit.gpgsign false
 printf '# baseline\n' >"$attest_repo/note.md"
 git -C "$attest_repo" add note.md
 git -C "$attest_repo" commit -qm baseline
+# The checker derives its base from refs/remotes/origin/<base ref> rather than
+# trusting the SHA it is handed, so every fixture it runs in needs that
+# remote-tracking ref — which is exactly what actions/checkout writes with
+# fetch-depth: 0.
+git -C "$attest_repo" update-ref refs/remotes/origin/main main
 base_sha="$(git -C "$attest_repo" rev-parse HEAD)"
 git -C "$attest_repo" switch -qc attested
 printf '\nupdated\n' >>"$attest_repo/note.md"
@@ -70,14 +75,55 @@ then
   echo "stale preflight unexpectedly passed" >&2
   exit 1
 fi
-# An unresolvable base fails closed rather than skipping the merge-base check.
+# The BASE_SHA argument is not authoritative: the checker derives the base from
+# the checked-out base branch. A body agreeing with a bogus argument must still
+# be rejected (an argument-trusting checker would accept this pair) ...
+forged_base_body="$tmp_dir/forged-base-body"
+sed "s/align-preflight-base-sha:$base_sha/align-preflight-base-sha:1111111111111111111111111111111111111111/" \
+  "$good_body" >"$forged_base_body"
 if (cd "$attest_repo" && "$repo_root/scripts/check-pr-preflight.sh" \
   "$good_sha" "$base_ref" "1111111111111111111111111111111111111111" \
-  "$good_body" >/dev/null 2>&1)
+  "$forged_base_body" >/dev/null 2>&1)
 then
-  echo "an attestation against an unknown base unexpectedly passed" >&2
+  echo "a body agreeing with a forged base argument unexpectedly passed" >&2
   exit 1
 fi
+# ... and a body carrying the derived base must pass even when the argument is
+# nonsense, because the argument is only shape-checked.
+(cd "$attest_repo" && "$repo_root/scripts/check-pr-preflight.sh" \
+  "$good_sha" "$base_ref" "1111111111111111111111111111111111111111" \
+  "$good_body" >/dev/null)
+# A base branch the checkout does not have fails closed, with the fetch-depth
+# hint that tells CI how to fix it.
+unknown_ref_err="$tmp_dir/unknown-ref-err"
+unknown_ref_status=0
+(cd "$attest_repo" && "$repo_root/scripts/check-pr-preflight.sh" \
+  "$good_sha" release "$base_sha" "$good_body" >/dev/null 2>"$unknown_ref_err") ||
+  unknown_ref_status=$?
+[[ "$unknown_ref_status" -ne 0 ]] || {
+  echo "an attestation against an unfetched base branch unexpectedly passed" >&2
+  exit 1
+}
+grep -q 'fetch-depth: 0' "$unknown_ref_err" || {
+  echo "the unresolvable-base error lacks the fetch-depth hint:" >&2
+  cat "$unknown_ref_err" >&2
+  exit 1
+}
+# A head the base branch already contains attests an empty range.
+contained_err="$tmp_dir/contained-err"
+contained_status=0
+(cd "$attest_repo" && "$repo_root/scripts/check-pr-preflight.sh" \
+  "$base_sha" "$base_ref" "$base_sha" "$good_body" >/dev/null 2>"$contained_err") ||
+  contained_status=$?
+[[ "$contained_status" -ne 0 ]] || {
+  echo "an attestation for a head already on the base branch unexpectedly passed" >&2
+  exit 1
+}
+grep -q 'already contains' "$contained_err" || {
+  echo "an empty attested range failed for the wrong reason:" >&2
+  cat "$contained_err" >&2
+  exit 1
+}
 
 docs_repo="$tmp_dir/docs-repo"
 mkdir -p "$docs_repo/docs" "$docs_repo/scripts"
@@ -95,6 +141,7 @@ git -C "$docs_repo" config commit.gpgsign false
 printf '# baseline\n' >"$docs_repo/docs/note.md"
 git -C "$docs_repo" add docs/note.md scripts
 git -C "$docs_repo" commit -qm baseline
+git -C "$docs_repo" update-ref refs/remotes/origin/main main
 git -C "$docs_repo" switch -qc docs-change
 printf '\nupdated\n' >>"$docs_repo/docs/note.md"
 git -C "$docs_repo" commit -qam docs
@@ -271,7 +318,7 @@ fake_gh="$fake_bin/gh"
 {
   printf '#!/usr/bin/env bash\n'
   printf 'case "$1:$2:$5" in\n'
-  printf '  pr:view:headRefOid,baseRefName,baseRefOid) printf "%%s\\tmain\\t%%s\\n" "$FAKE_PR_HEAD" "$FAKE_PR_BASE" ;;\n'
+  printf '  pr:view:headRefOid,baseRefName,baseRefOid) printf "%%s\\t%%s\\t%%s\\n" "$FAKE_PR_HEAD" "${FAKE_PR_BASE_NAME:-main}" "$FAKE_PR_BASE" ;;\n'
   printf '  pr:view:body) cat "$FAKE_PR_BODY" ;;\n'
   printf '  pr:view:url) printf "https://example.invalid/pr/123\\n" ;;\n'
   printf '  pr:edit:*) exit 0 ;;\n'
@@ -458,6 +505,7 @@ printf '#[test]\nfn baseline() {}\n' >"$tier_repo/crates/thing/tests/baseline_ow
 printf '# plan\n' >"$tier_repo/docs/impl/00-plan.md"
 git -C "$tier_repo" add .
 git -C "$tier_repo" commit -qm baseline
+git -C "$tier_repo" update-ref refs/remotes/origin/main main
 
 tier_preflight() { (cd "$tier_repo" && "$repo_root/scripts/pre-pr.sh" "$@"); }
 tier_branch() {
@@ -779,6 +827,7 @@ printf 'unrelated\n' >"$advance_repo/other.txt"
 git -C "$advance_repo" add other.txt
 git -C "$advance_repo" commit -qm 'feat: unrelated main change'
 main_tip="$(git -C "$advance_repo" rev-parse main)"
+git -C "$advance_repo" update-ref refs/remotes/origin/main main
 git -C "$advance_repo" switch -q feature
 
 advance_log="$tmp_dir/advance-review.log"
@@ -822,12 +871,86 @@ advance_body="$tmp_dir/advance-body"
   printf '<!-- align-preflight-reviewer:reviewer-1 -->\n'
 } >"$advance_body"
 # CI hands the checker github.event.pull_request.base.sha, which is the ADVANCED
-# tip; the checker must normalize it to the merge base the body records.
+# tip; the derived base is still the merge base the body records.
 (cd "$advance_repo" && "$repo_root/scripts/check-pr-preflight.sh" \
   "$advance_head" main "$main_tip" "$advance_body" >/dev/null)
-# preflight.yml now resolves the merge base itself; passing it is idempotent.
+# preflight.yml also resolves the merge base; passing it changes nothing.
 (cd "$advance_repo" && "$repo_root/scripts/check-pr-preflight.sh" \
   "$advance_head" main "$fork_sha" "$advance_body" >/dev/null)
+
+# The attack the derivation closes: preflight.yml is the PR's own file, so a
+# one-word edit there could hand the checker the head SHA as the base. The range
+# would then be empty, no library path would appear in it, and an unreviewed
+# compiler diff could ride in under a tooling attestation. tool.txt is library
+# tier, so this body is a lie in both directions.
+forged_tooling_body="$tmp_dir/advance-forged-tooling-body"
+{
+  printf '<!-- align-preflight-version:1 -->\n'
+  printf '<!-- align-preflight-head:%s -->\n' "$advance_head"
+  printf '<!-- align-preflight-base-ref:main -->\n'
+  printf '<!-- align-preflight-base-sha:%s -->\n' "$advance_head"
+  printf '<!-- align-preflight-review:tooling -->\n'
+  printf '<!-- align-preflight-review-head:%s -->\n' "$advance_head"
+  printf '<!-- align-preflight-reviewer:tooling -->\n'
+} >"$forged_tooling_body"
+if (cd "$advance_repo" && "$repo_root/scripts/check-pr-preflight.sh" \
+  "$advance_head" main "$advance_head" "$forged_tooling_body" >/dev/null 2>&1)
+then
+  echo "a forged empty-range base unexpectedly passed a library diff as tooling" >&2
+  exit 1
+fi
+# The sharper version of the same attack, which the empty-range guard alone does
+# NOT catch: pass the branch's own first commit as the base so the attested
+# range is only the harmless second commit. Only deriving the base from the
+# checked-out base branch rejects this.
+forge_repo="$tmp_dir/forge-repo"
+mkdir -p "$forge_repo/crates/thing/src"
+git -C "$forge_repo" init -q -b main
+git -C "$forge_repo" config user.name workflow-test
+git -C "$forge_repo" config user.email workflow-test@example.invalid
+git -C "$forge_repo" config commit.gpgsign false
+printf '# doc\n' >"$forge_repo/note.md"
+git -C "$forge_repo" add note.md
+git -C "$forge_repo" commit -qm baseline
+git -C "$forge_repo" update-ref refs/remotes/origin/main main
+git -C "$forge_repo" switch -qc feature
+printf 'fn unreviewed() {}\n' >"$forge_repo/crates/thing/src/lib.rs"
+git -C "$forge_repo" add crates/thing/src/lib.rs
+git -C "$forge_repo" commit -qm 'feat: unreviewed library change'
+forge_library_sha="$(git -C "$forge_repo" rev-parse HEAD)"
+printf '\ntweak\n' >>"$forge_repo/note.md"
+git -C "$forge_repo" commit -qam 'docs: harmless tweak'
+forge_head="$(git -C "$forge_repo" rev-parse HEAD)"
+forged_range_body="$tmp_dir/forged-range-body"
+{
+  printf '<!-- align-preflight-version:1 -->\n'
+  printf '<!-- align-preflight-head:%s -->\n' "$forge_head"
+  printf '<!-- align-preflight-base-ref:main -->\n'
+  printf '<!-- align-preflight-base-sha:%s -->\n' "$forge_library_sha"
+  printf '<!-- align-preflight-review:docs-only -->\n'
+  printf '<!-- align-preflight-review-head:%s -->\n' "$forge_head"
+  printf '<!-- align-preflight-reviewer:docs-only -->\n'
+} >"$forged_range_body"
+if (cd "$forge_repo" && "$repo_root/scripts/check-pr-preflight.sh" \
+  "$forge_head" main "$forge_library_sha" "$forged_range_body" >/dev/null 2>&1)
+then
+  echo "a forged truncated range hid an unreviewed library commit" >&2
+  exit 1
+fi
+
+# Transition: an attestation an OLD pre-pr.sh recorded against the base branch
+# tip no longer verifies once the tip has moved past the fork point. This is
+# intentional — recovery is one pre-pr.sh rerun plus open-pr.sh --update — and
+# it is pinned here so the behavior is not mistaken for a regression later.
+legacy_tip_body="$tmp_dir/advance-legacy-tip-body"
+sed "s/align-preflight-base-sha:$fork_sha/align-preflight-base-sha:$main_tip/" \
+  "$advance_body" >"$legacy_tip_body"
+if (cd "$advance_repo" && "$repo_root/scripts/check-pr-preflight.sh" \
+  "$advance_head" main "$main_tip" "$legacy_tip_body" >/dev/null 2>&1)
+then
+  echo "a legacy tip-bound attestation unexpectedly verified" >&2
+  exit 1
+fi
 
 advance_remote="$tmp_dir/advance-remote.git"
 git init -q --bare "$advance_remote"
@@ -840,6 +963,40 @@ git -C "$advance_repo" push -qu origin feature
   PATH="$fake_bin:$PATH" FAKE_PR_HEAD="$advance_head" FAKE_PR_BASE="$main_tip" \
     FAKE_PR_BODY="$advance_body" "$repo_root/scripts/open-pr.sh" --update 123 >/dev/null
 )
+# baseRefOid can name a tip this clone has never fetched. open-pr.sh tries one
+# fetch and, when that still cannot produce the object, says so instead of
+# silently skipping the check.
+absent_base_err="$tmp_dir/advance-absent-base-err"
+(
+  cd "$advance_repo"
+  PATH="$fake_bin:$PATH" FAKE_PR_HEAD="$advance_head" \
+    FAKE_PR_BASE="2222222222222222222222222222222222222222" \
+    FAKE_PR_BODY="$advance_body" "$repo_root/scripts/open-pr.sh" --update 123 \
+    >/dev/null 2>"$absent_base_err"
+)
+grep -q 'could not verify the PR' "$absent_base_err" || {
+  echo "open-pr.sh silently skipped an unverifiable PR base tip:" >&2
+  cat "$absent_base_err" >&2
+  exit 1
+}
+# A PR opened against a different branch than the stamp's base is rejected.
+wrong_base_err="$tmp_dir/advance-wrong-base-err"
+wrong_base_status=0
+(
+  cd "$advance_repo"
+  PATH="$fake_bin:$PATH" FAKE_PR_HEAD="$advance_head" FAKE_PR_BASE="$main_tip" \
+    FAKE_PR_BASE_NAME=release FAKE_PR_BODY="$advance_body" \
+    "$repo_root/scripts/open-pr.sh" --update 123 >/dev/null 2>"$wrong_base_err"
+) || wrong_base_status=$?
+[[ "$wrong_base_status" -ne 0 ]] || {
+  echo "open-pr.sh accepted a PR opened against another base branch" >&2
+  exit 1
+}
+grep -q 'does not match the preflight base' "$wrong_base_err" || {
+  echo "the wrong PR base branch was rejected for the wrong reason:" >&2
+  cat "$wrong_base_err" >&2
+  exit 1
+}
 
 # The other direction: changing the branch moves its merge base, so everything
 # bound to the old one must stop applying.
@@ -905,6 +1062,23 @@ moved_status=0
 grep -q 'merge base with main moved' "$moved_err" || {
   echo "open-pr.sh rejected the moved merge base for the wrong reason:" >&2
   cat "$moved_err" >&2
+  exit 1
+}
+# CI reaches the same verdict from the other side: once main contains the head,
+# the derived merge base IS the head and there is no range left to attest.
+git -C "$advance_repo" update-ref refs/remotes/origin/main main
+absorbed_err="$tmp_dir/advance-absorbed-err"
+absorbed_status=0
+(cd "$advance_repo" && "$repo_root/scripts/check-pr-preflight.sh" \
+  "$merged_head" main "$main_tip" "$merged_body" >/dev/null 2>"$absorbed_err") ||
+  absorbed_status=$?
+[[ "$absorbed_status" -ne 0 ]] || {
+  echo "an attestation for a head main already contains unexpectedly passed" >&2
+  exit 1
+}
+grep -q 'already contains' "$absorbed_err" || {
+  echo "an absorbed branch was rejected for the wrong reason:" >&2
+  cat "$absorbed_err" >&2
   exit 1
 }
 

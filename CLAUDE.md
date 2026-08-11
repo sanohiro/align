@@ -303,8 +303,13 @@ belonging to a different SHA, each costing a full round-trip.
 `scripts/open-pr.sh`, and the CI attestation checker all resolve the base as
 `git merge-base HEAD origin/main` — the basis of the `origin/main...HEAD` diff
 they already review and classify. Another PR landing on main therefore leaves
-an open PR's review log, stamp, and body attestation valid; only a change to
-the branch itself (a rebase, an amend, or merging main in) invalidates them.
+an open PR's review log, stamp, and body attestation valid; a change to the
+branch itself (a rebase, an amend, or merging main in) invalidates them. So
+does main coming to contain this branch's commits: the merge base then advances
+to HEAD, the attested range is empty, and both `scripts/open-pr.sh` and the CI
+checker refuse it rather than attest nothing. The checker derives that base from
+the checked-out base branch itself, never from an argument its (PR-supplied)
+workflow passes in.
 
 **Recurred finding classes are closed by machinery, not prose.** When
 `.claude/skills/align-self-review/FINDINGS.md` reaches its two-event threshold
