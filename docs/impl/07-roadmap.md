@@ -80,7 +80,13 @@ PostgreSQL result consumer clears its current result and immediately poisons/clo
 connection; it is never sent through a generic result drain or pipeline-exit attempt. Explicit
 direct and prepared delivery also recheck deadline expiry after nonblocking enablement and before
 send. The migration runner owns no COPY protocol and rejects every top-level PostgreSQL COPY
-statement before target open; quoted, commented, or dollar-quoted COPY text remains ordinary data.
+statement before target open; one statement-ordered pass makes the first of transaction control or
+COPY win before Forbidden-count validation, while quoted, commented, or dollar-quoted COPY text
+remains ordinary data. In streamed delivery, protocol-state validation precedes ordinary status
+mapping after the zero-row terminal, while each status still selects ordinary drain or immediate
+fail-closed connection close. Runtime mode selection does not alter static Query semantics, but the
+public Delivery and rows/statement implementation changes invalidate affected interface and
+implementation cache keys once when they land.
 For planning language, **initial `pkg.db` release** means L1a–L7 plus D1–D12;
 **complete committed `pkg.db` roadmap** means those plus D13 and D14. D0 is
 disposable native evidence and may run in parallel at any time.

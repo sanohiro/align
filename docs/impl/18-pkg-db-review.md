@@ -553,7 +553,12 @@ idea is rejected.
   generic drain; direct construction also retains Q2's live-state/context/static-validation/lease
   phase order. Query Delivery validation retains §13.4 payload-before-duplicate precedence, and
   `one_native` records the monotonic caller-region bytes left by its first-Row clone when a later
-  failure wins.
+  failure wins. The final base-bound review then closed three P2 consistency gaps: protocol-state
+  validation now makes every post-terminal result an invalid sequence before ordinary status error
+  mapping while retaining status-specific drain/close safety; migration screening is one
+  statement-ordered classification pass with both `BEGIN; COPY` and `COPY; BEGIN` owners; and the
+  cache contract distinguishes unchanged static descriptor semantics from the one-time
+  interface/implementation-key invalidation caused when the public option and resource ABI land.
 
 ### F32 — L1a and L1b both claimed `Option<MoveStruct>`
 

@@ -72,6 +72,14 @@ connection owner before return; later row access and every follow-up libpq call 
 parameterized synthetic-result owner fixes current-clear, close, first-error, and no-follow-up-call
 behavior. This P2 closes inside the same prerequisite without reopening the matrix or adding a PR.
 
+The final base-bound review found three P2 contract gaps and no new P1. Stream protocol state now
+precedes ordinary status-to-error mapping, so every result after the zero-row terminal reports the
+invalid sequence while its status still chooses drain or immediate close. PostgreSQL migration
+screening is explicitly one statement-ordered classification pass and owns both `BEGIN; COPY` and
+`COPY; BEGIN` precedence. Runtime Delivery remains outside static Query semantics, but landing its
+public enum and the rows/statement ABI deterministically invalidates affected dependency-interface
+and implementation cache keys once. These closures do not change the four implementation PRs.
+
 ## 2026-08-07: shared borrow accepts stable Copy storage
 
 Shared `borrow` now accepts a stable bound Copy or Move place. Copy values still pass by value by

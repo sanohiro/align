@@ -206,9 +206,11 @@ later libpq call remain zero. Expected success and known complete error controls
 current mapping and cleanup.
 The same prerequisite retains Q5a's canonical PostgreSQL statement-screening owner. It crosses
 Required/Forbidden top-level COPY, lowercase and comment-leading spelling, COPY after an ordinary
-statement, quoted/comment/dollar-body near-misses, transaction-control and Forbidden-count
-precedence, and unchanged SQLite behavior. Every rejected case proves zero URL-environment reads,
-target opens, locks, history publication, connection opens, and libpq calls. A checked inventory
+statement, quoted/comment/dollar-body near-misses, transaction control before later COPY, COPY
+before later transaction control, Forbidden-count precedence, and unchanged SQLite behavior. The
+two prohibited-order cases prove one source-ordered statement-classification pass. Every rejected
+case proves zero URL-environment reads, target opens, locks, history publication, connection opens,
+and libpq calls. A checked inventory
 records that prepare uses `PQprepare`/`PQdescribePrepared`, migration is the only compiler-side path
 that sends complete user SQL through `PQexec`, and all remaining tool SQL is fixed; that inventory
 does not weaken the Rust tool fail-closed matrix above.
@@ -236,6 +238,14 @@ no case rewinds the arena or clones a second Row.
 Direct and prepared explicit-delivery owners delay the test clock across
 nonblocking enablement and require expired-before-send to produce zero
 send/selector/cancel calls, exact Timeout, and blocking restoration or close.
+Their result-sequence matrix also injects every ordinary error, invalid,
+COPY, pipeline, and unknown status after a valid zero-row terminal. It asserts
+that protocol state selects the invalid-sequence error before ordinary status
+mapping, while status class still selects ordinary drain versus immediate
+close. Whole/per-unit cache owners separately require the public `Delivery`
+and rows/statement implementation changes to invalidate affected interface and
+implementation keys once, with identical static descriptor semantics and no
+runtime-mode-specific cache identity.
 
 ## Benchmarks are not tests
 

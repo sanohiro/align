@@ -310,8 +310,11 @@ HIR/MIR. The batch remains the one Move owner and `soa<R>` remains the same borr
 that resource generation. This adds neither an owned SoA value nor a DB-specific compiler API.
 
 **PostgreSQL delivery mode is an execution cost choice, not a Query identity.** A static Query's
-SQL, Params/Row contract, binder, decoder, batch plan, and cache identity do not change when one
-execution selects `SingleRow` or `PortalBatch(n)`. The choice therefore stays in the explicit
+SQL, Params/Row contract, binder, decoder, batch plan, and semantic fingerprint do not change when
+one execution selects `SingleRow` or `PortalBatch(n)`. The public `Delivery` addition and the
+rows/statement ABI implementation still change their owning interface/implementation hashes once,
+so affected per-unit dependency keys and object caches invalidate when those changes land; runtime
+mode selection creates no further cache identity. The choice therefore stays in the explicit
 driver-qualified execution-option slice. Both direct and prepared execution enter one libpq result
 state machine, retain Params until protocol completion, and expose partial-server-failure timing
 instead of pretending bounded delivery is atomic. A direct `one_native` multiplicity remains
@@ -357,8 +360,18 @@ immediately finishes and nulls the connection owner, and permits no rollback, de
 access, or later libpq call. Known complete results retain their existing tool error mapping.
 Because migration sends complete user SQL through synchronous `PQexec` but owns no COPY exchange,
 canonical PostgreSQL migration screening also rejects a top-level first-token `COPY` before URL
-access, target open, or native work. Preparation uses `PQprepare`/`PQdescribePrepared` and does not
-execute COPY; other tool SQL is fixed, but neither fact substitutes for fail-closed status handling.
+access, target open, or native work. The screen classifies each complete statement once in source
+order, so `COPY; BEGIN` reports COPY while `BEGIN; COPY` reports transaction control; only after
+that pass can Forbidden-count validation win. Preparation uses `PQprepare`/`PQdescribePrepared` and
+does not execute COPY; other tool SQL is fixed, but neither fact substitutes for fail-closed status
+handling.
+
+**Stream protocol state precedes status-to-error mapping.** The zero-row `PGRES_TUPLES_OK` terminal
+changes the expected next event to null. Any later non-null result is therefore the streamed-sequence
+error even when its ordinary standalone status would map to a native execution error. Its status
+still chooses cleanup: ordinary known statuses clear and drain, while COPY, pipeline, and unknown
+statuses clear and close immediately. This separates deterministic error precedence from the
+safety action required by the native subprotocol.
 
 **Context-backed static validation stays in the settled execution phase.** The generated
 static-option validator needs an execution context, while overlap is deliberately checked only

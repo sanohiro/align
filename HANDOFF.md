@@ -51,7 +51,9 @@ status, or unknown numeric status clears the current result when present,
 closes and nulls the connection owner, and permits no rollback, deallocation,
 row access, or later libpq call. Canonical screening separately rejects every
 top-level PostgreSQL migration `COPY` before URL access, target open, lock,
-history publication, or libpq.
+history publication, or libpq. Screening uses one statement-ordered
+classification pass, so `BEGIN; COPY` and `COPY; BEGIN` select their respective
+first prohibited statements before Forbidden-count validation.
 The independently useful PostgreSQL `SingleRow` / `PortalBatch` direct delivery
 rail follows; prepared parity is a fourth PR because it must
 retain parameter-name authority in statement v3. Cardinality drains to clean
@@ -89,6 +91,13 @@ tools from null or unexpected deferred results before rollback/deallocation.
 The prerequisite now gives every tool result consumer the same fail-closed
 postcondition and a parameterized synthetic-status owner; this remains a P2
 closure inside the existing status PR, not another matrix reopen or PR split.
+The final base-bound review closed three further P2 consistency gaps without
+changing those boundaries: protocol state now makes every post-terminal result
+an invalid sequence before ordinary status mapping while retaining its
+drain-or-close safety action; the migration owner pins both prohibited-statement
+orders above; and runtime mode selection leaves static Query semantics unchanged
+while the public option and rows/statement implementation correctly invalidate
+affected dependency-interface and implementation cache keys once when landed.
 
 Out-of-gate suite status (suites outside the bounded CI gate; a nightly
 full-suite workflow now runs them daily so this class cannot rot silently):
