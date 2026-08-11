@@ -8,7 +8,9 @@ This file preserves the independent design review and its F1–F95 finding
 register. It is not the live implementation sequence. Current status is in
 `HANDOFF.md`; current prerequisite dependencies are in
 `17-library-boundary-prerequisites.md`; the complete product roadmap is in
-`pkg-design/db.md` §23.
+`pkg-design/db.md` §23. The shared owner-test harness these suites are built on,
+including the dual-driver parity rule, is specified in
+[`16-test-policy.md`](16-test-policy.md) under "pkg.db owner-test harness".
 
 Reviewed design:
 

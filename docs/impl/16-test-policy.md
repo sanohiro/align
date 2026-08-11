@@ -361,6 +361,136 @@ still request `scripts/cargo.sh test --workspace --locked` as a background healt
 but its result is informational: it does not block a PR, release, or milestone,
 and it must not cause already-green owner targets to be rerun.
 
+## pkg.db owner-test harness
+
+The `pkg.db` end-to-end suites (`pkg_db_a1`, `q2`, `q4a`, `q4b`, `q5b1`, `q5b2`,
+`q6`) share one harness at `crates/align_driver/tests/db_harness/`. The
+Rust-API suites (`q1`, `q3`, `q5a`) drive `align_driver` directly and are out of
+its scope.
+
+`db_harness` is a shared module, not a test binary: Cargo auto-discovers only
+`tests/*.rs` and `tests/*/main.rs`. It deliberately does not live in
+`tests/common/`, which every one of the ~167 driver binaries compiles; only the
+E2E suites include it. It depends on `common` being declared first in the
+including file and refers to it as `crate::common::…`.
+
+### What it replaces
+
+Four blocks were hand-written per suite, ~1,319 duplicated lines in total: the
+eight-module package layout (72 declarations across 9 files, plus 13
+`package_files` builders), 56 tool-availability guards, 55 exit-code assertions
+in **four incompatible shapes**, and 87 trailing stub-counter checks encoded as
+hand-numbered sentinel exit codes. Twelve assertion sites printed only stderr
+and eighteen dropped the exit status, so a signal-killed child reported nothing
+useful.
+
+### Layers
+
+```text
+Layout      the 8 package modules; module() REPLACES by path; materialize()
+            creates parent directories (common::Proj::write does not)
+Run         check_exit / check_payload return a Mismatch; expect_* are the
+            panicking wrappers; every report carries the RAW status, stdout,
+            stderr, and the run label
+gate        Needs::{Backend, BackendAndCc, LivePostgres}; LivePostgres ASSERTS
+            under ALIGN_DB_POSTGRES_REQUIRED=1 rather than skipping
+counters    the stub prints `#db-counters-begin` / name / value / … and the
+            Rust table reports EVERY mismatching counter by name
+parity      one program, both drivers, one compile, one child per case
+fingerprint a case digest over label, runner, files, env, argv, expected exit
+```
+
+Counter checks move to the table only when they sit in the trailing epilogue of
+`fn main`, which is where 87 of the corpus's 92 are. The other five are mid-run
+deltas against a value captured earlier — a different assertion — and stay in
+Align.
+
+### The dual-driver parity owner
+
+`FINDINGS.md` records `operation-matrix-completeness` at four events across
+three PRs, past the three-event threshold at which CLAUDE.md requires a
+mechanism rather than another checklist line. The mechanism is one parity owner
+per wave, built on `db_harness::parity`:
+
+- both drivers return `Result<pkg.db.conn, pkg.db.Error>` and both query
+  constructors produce the same `pkg.db.query<P, R>`, so the driver is a runtime
+  branch **inside one program** and the shared body cannot drift;
+- selection is by environment variable, because `align_sema` rejects an `-> i32`
+  argv `main` (argv requires `Result<(), Error>`) and argv would therefore force
+  every matrix program off the exit-code protocol;
+- Align `match` has no string-literal pattern, so case dispatch is an `if`/`else`
+  chain whose final `else` returns the unknown-case sentinel `99`; the engine
+  asserts no case reaches it;
+- `ALIGN_DB_CASE=__list__` makes the program enumerate its own cases, and the
+  engine diffs that list against the Rust table **in both directions**;
+- the engine sets both selectors explicitly and clears every other inherited
+  `ALIGN_DB_*` key. There is no implicit default;
+- divergence is declared, never implicit: `Expect::Same`, `Expect::Differs
+  { why }`, `Expect::DriverOnly { why }`. The number of `Differs` rows is pinned
+  by a per-table budget constant that must be raised in the same diff.
+
+`DriverOnly` is for a row inside an otherwise shared matrix. A surface with no
+cross-driver counterpart at all keeps its conventional standalone owner.
+
+The parity engine lives in `db_harness`; each wave instantiates its table inside
+its existing owner file. No new test binary and no change to
+`scripts/db-verify-local.sh` or `ci.yml`.
+
+### Pipeline retention
+
+A parity program must use ONE compile pipeline for both drivers, and only the
+per-unit + C-fixture pipeline can link the libpq stub. Converting a pair whose
+SQLite member used `build_and_run_multi_with_static_descriptors` therefore drops
+the whole-program static-descriptor path for that matrix. That path must be
+**retained by a separate owner** in the same change; `FINDINGS.md` records
+`owner-test-topology` ("Retain the whole-program execution owner") for exactly
+this mistake. `pkg_db_q4b`'s
+`sqlite_full_matrix_retains_the_whole_program_static_descriptor_path` is the
+worked example.
+
+### Migration equivalence
+
+A migration must prove the same defect still fails:
+
+1. **Backward** — the new layout builder is asserted equal to the retired
+   `package_files`, path by path and source by source
+   (`layout_reproduces_the_pre_harness_package_files_exactly`), and the migrated
+   suite passes unchanged.
+2. **Forward** — a case-fingerprint golden over label, runner, test-owned files,
+   environment, argv, and expected exit. Hashing sources alone is not enough: a
+   refactor can preserve the file set while changing the runner, environment,
+   argv, or expected code, and each of those changes what the case proves. The
+   eight package sources are excluded from the digest — they are product code
+   with their own owners, and including them would break the golden on every
+   `apps/db` edit.
+3. **Fail-open probes** — every converted assertion class has an owner that
+   deliberately breaks it and requires the exact report: off-by-one counter,
+   absent counter, wrong parity class, mis-declared divergence, over-budget
+   divergence, one-character case-name typo, signal termination, accumulated
+   multi-row failure, missing package module, and required-mode gating.
+4. **Test inventory** — the post-migration name set must be a superset of the
+   pre-migration set *minus explicitly folded names*, with a correspondence
+   table in the PR body mapping each folded name to its new owner and case.
+
+### Resource and isolation rules
+
+Every case spawns its own process, which also isolates stub counters. Each spawn
+has a wall-clock cap (default 120 s); on expiry the child is killed, the case is
+recorded as a timeout, **and the remaining cases still run**. Outcomes are
+collected before any assertion, so a mid-table failure never hides later rows. A
+table declares `Limits` for case and child-run counts so a generated Cartesian
+product cannot silently become a many-thousand-spawn suite.
+
+Decisions that depend on process-global state — the live-PostgreSQL gate and the
+`ALIGN_DB_*` clearing rule — are pure functions (`live_postgres_decision`,
+`should_clear_env`) so they are testable without `set_var`; mutating the
+environment from a parallel test is the recorded `test-global-state-isolation`
+finding.
+
+A diff touching these suites still runs `scripts/db-verify-local.sh` before
+push. When Docker is unavailable that script exits 2, and the change must not be
+pushed: CI is the final guard, never the discovery loop.
+
 ## Growth rule
 
 Every new integration test must name the boundary or regression it protects.

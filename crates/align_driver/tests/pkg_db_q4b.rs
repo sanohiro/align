@@ -2,6 +2,8 @@
 
 mod common;
 use common::*;
+mod db_harness;
+use db_harness::{counters, *};
 use std::sync::LazyLock;
 
 // The pkg.db package sources are read at RUNTIME (common::fixture), not `include_str!`d, so editing
@@ -19,7 +21,6 @@ static INTERNAL_POSTGRES: LazyLock<&str> =
     LazyLock::new(|| fixture("apps/db/pkg/db/internal/postgres.align"));
 // C stubs change rarely; keeping them baked costs nothing on `.align` edits.
 const POSTGRES_STUB: &str = include_str!("fixtures/pkg_db_q2_postgres_stub.c");
-const SQLITE_STUB: &str = include_str!("fixtures/pkg_db_q4a_sqlite_stub.c");
 
 const QUERY: &str = r#"module app.q4b_query
 import pkg.db
@@ -290,7 +291,18 @@ pub fn malformed_postgres() -> pkg.db.query<DeadlineParams, DeadlineRow> = pkg.d
 )
 "#;
 
-fn package_files(main: &str) -> Vec<(&'static str, &str)> {
+/// The `pkg.db` package plus this suite's query module and one `main`.
+fn q4b(main: &str) -> Layout {
+    Layout::new()
+        .module("app/q4b_query.align", QUERY)
+        .main(main)
+}
+
+/// The pre-harness layout builder, kept ONLY as the oracle for
+/// `layout_reproduces_the_pre_harness_package_files_exactly`. It is the backward-looking half of
+/// the migration proof: the forward-looking half is the case-fingerprint golden. Do not call it
+/// from a test.
+fn legacy_package_files(main: &str) -> Vec<(&'static str, &str)> {
     vec![
         ("pkg/db.align", *DB),
         ("pkg/db/sqlite.align", *SQLITE),
@@ -374,20 +386,10 @@ fn propagate(borrow connection: pkg.db.conn) -> Result<(), pkg.db.Error> {
 
 fn main() -> i32 = 0
 "#;
-    let checked = diff_check_multi(
-        "pkg-db-q4b-direct-rows-surface",
-        &package_files(main),
-        "main.align",
-    );
-    assert!(
-        !checked.whole_errors && !checked.per_unit_errors,
-        "unexpected whole-program diagnostics:\n{}\nunexpected per-unit diagnostics:\n{}",
-        checked.whole_diags,
-        checked.per_unit_diags,
-    );
+    expect_checks_clean("pkg-db-q4b-direct-rows-surface", &q4b(main));
     let built = build_per_unit_multi(
         "pkg-db-q4b-direct-rows-mir",
-        &package_files(main),
+        &q4b(main).files(),
         "main.align",
     );
     assert!(
@@ -512,23 +514,13 @@ fn streamed_views_cannot_cross_generation_or_escape() {
         let main = format!(
             "module main\nimport pkg.db\nimport app.q4b_query\n{body}\nfn main() -> i32 = 0\n"
         );
-        let checked = diff_check_multi(
-            &format!("pkg-db-q4b-stream-view-{name}"),
-            &package_files(&main),
-            "main.align",
-        );
-        assert!(
-            checked.whole_errors && checked.per_unit_errors,
-            "{name} unexpectedly accepted in whole/per-unit checking"
-        );
+        expect_checks_rejected(&format!("pkg-db-q4b-stream-view-{name}"), &q4b(&main));
     }
 }
 
 #[test]
 fn sqlite_direct_stream_retains_binds_and_releases_each_native_phase_once() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
+    let Some(_gate) = gate(Needs::BackendAndCc) else { return };
     let main = r#"module main
 import pkg.db
 import pkg.db.sqlite
@@ -603,28 +595,24 @@ fn main() -> i32 {
   }
 }
 "#;
-    let fixture = format!("{POSTGRES_STUB}\n{SQLITE_STUB}");
-    let output = build_and_run_multi_with_c(
+    run_per_unit_c(
         "pkg-db-q4b-sqlite-direct-stream",
-        &package_files(main),
-        "main.align",
-        &fixture,
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "status: {:?}; stdout: {}; stderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+        &q4b(main).linking_pg_stub().linking_sqlite_stub(),
+    )
+    .expect_exit(42);
 }
 
+/// The 16-field parameter/row round trip on the WHOLE-PROGRAM static-descriptor pipeline.
+///
+/// `full_matrix_parity_is_exact_on_both_drivers` now covers the same round trip on both drivers,
+/// but it must use the per-unit + C-fixture pipeline because that is the only one that can link the
+/// libpq stub. That leaves this pipeline — whole-program `check` plus
+/// `lower_to_mir_with_static_descriptors` — uncovered for this matrix unless it is retained here.
+/// `FINDINGS.md` records `owner-test-topology` ("Retain the whole-program execution owner") for
+/// exactly this mistake, so this owner is deliberately kept rather than folded into the table.
 #[test]
-fn complete_sqlite_parameter_and_row_matrix_is_exact() {
-    if !backend_available() {
-        return;
-    }
+fn sqlite_full_matrix_retains_the_whole_program_static_descriptor_path() {
+    let Some(_gate) = gate(Needs::Backend) else { return };
     let main = r#"module main
 import pkg.db
 import pkg.db.sqlite
@@ -739,39 +727,41 @@ fn main() -> i32 {
   return 42
 }
 "#;
-    let output = build_and_run_multi_with_static_descriptors(
-        "pkg-db-q4b-sqlite-complete-matrix",
-        &package_files(main),
-        "main.align",
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "status: {:?}; stdout: {}; stderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    run_static_descriptors("pkg-db-q4b-sqlite-complete-matrix", &q4b(main)).expect_exit(42);
 }
 
-#[test]
-fn complete_postgres_parameter_and_row_matrix_is_exact() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
-    let main = r#"module main
+
+// ================================================================================================
+// The dual-driver parity owner for the 16-field parameter/row matrix.
+//
+// This replaces `complete_postgres_parameter_and_row_matrix_is_exact`, which was a hand-maintained
+// copy of the SQLite member: 134 and 136 lines differing in 52, part of that difference being pure
+// formatting drift of the same struct literal. One program now carries the body and selects its
+// driver at run time, so the two members cannot drift apart; the table declares, per case, whether
+// the drivers must agree.
+// ================================================================================================
+
+/// One program, both drivers. `statement` and `open` are the ONLY driver-dependent points; the body
+/// under test below them is shared by construction.
+const PARITY_MAIN: &str = r#"module main
+import std.env
 import pkg.db
 import pkg.db.postgres
+import pkg.db.sqlite
+import pkg.db.testkit.pg
 import app.q4b_query
 
-extern "C" {
-  fn align_pg_reset()
-  fn align_pg_execute_calls() -> i32
-  fn align_pg_protocol_ok() -> i32
-  fn align_pg_protocol_error() -> i32
-}
+fn statement(driver: str) -> pkg.db.query<app.q4b_query.FullParams, app.q4b_query.FullRow> =
+  if driver == "postgres" { app.q4b_query.full_postgres() } else { app.q4b_query.full() }
 
-fn execute_once(borrow connection: pkg.db.conn, present: bool) -> i32 {
+fn open(driver: str) -> Result<pkg.db.conn, pkg.db.Error> =
+  if driver == "postgres" {
+    pkg.db.postgres.connect("postgresql://stub/db", [])
+  } else {
+    pkg.db.sqlite.connect(":memory:", [])
+  }
+
+fn execute_once(borrow connection: pkg.db.conn, driver: str, present: bool) -> i32 {
   bytes := [0 as u8, 127 as u8, 255 as u8]
   nb: Option<bool> := if present { Some(true) } else { None }
   ni16: Option<i16> := if present { Some(-1234 as i16) } else { None }
@@ -783,7 +773,7 @@ fn execute_once(borrow connection: pkg.db.conn, present: bool) -> i32 {
   nbytes: Option<slice<u8>> := if present { Some(bytes[..]) } else { None }
   opened := pkg.db.rows(
     pkg.db.exec_conn(connection),
-    app.q4b_query.full_postgres(),
+    statement(driver),
     app.q4b_query.FullParams {
       b: true,
       nb: nb,
@@ -837,25 +827,29 @@ fn execute_once(borrow connection: pkg.db.conn, present: bool) -> i32 {
   return match exhausted { Some(_) => 24, None => 0 }
 }
 
-fn main() -> i32 {
-  unsafe { align_pg_reset() }
-  opened := pkg.db.postgres.connect("postgresql://stub/db", [])
-  connection := opened else { return 30 }
-  first := execute_once(connection, true)
-  if first != 0 { return first }
-  second := execute_once(connection, false)
-  if second != 0 { return second }
-  arena out {
+fn retained(borrow connection: pkg.db.conn, driver: str) -> i32 {
+  return arena out {
     bytes := [4 as u8, 0 as u8, 255 as u8]
     selected := pkg.db.one(
       pkg.db.exec_conn(connection),
-      app.q4b_query.full_postgres(),
+      statement(driver),
       app.q4b_query.FullParams {
-        b: true, nb: Some(false), i16v: -2 as i16, ni16: Some(3 as i16),
-        i32v: -4 as i32, ni32: Some(5 as i32), i64v: -6, ni64: Some(7),
-        f32v: -1.25 as f32, nf32: Some(2.75 as f32),
-        f64v: -3.5, nf64: Some(4.5), textv: "retained", ntext: Some("optional"),
-        bytesv: bytes[..], nbytes: Some(bytes[..]),
+        b: true,
+        nb: Some(false),
+        i16v: -2 as i16,
+        ni16: Some(3 as i16),
+        i32v: -4 as i32,
+        ni32: Some(5 as i32),
+        i64v: -6,
+        ni64: Some(7),
+        f32v: -1.25 as f32,
+        nf32: Some(2.75 as f32),
+        f64v: -3.5,
+        nf64: Some(4.5),
+        textv: "retained",
+        ntext: Some("optional"),
+        bytesv: bytes[..],
+        nbytes: Some(bytes[..]),
       },
       out,
       [],
@@ -866,35 +860,96 @@ fn main() -> i32 {
     if row.textv != "retained" || retained_text != "optional"
       || row.bytesv.len() != 3 || row.bytesv[1] != 0 || row.bytesv[2] != 255
       || retained_bytes.len() != 3 || retained_bytes[0] != 4 { return 34 }
+    0
   }
-  return unsafe {
-    if align_pg_protocol_ok() != 1 { return 40 + align_pg_protocol_error() }
-    if align_pg_execute_calls() != 3 { return 36 }
+}
+
+fn main() -> i32 {
+  driver := env.get("ALIGN_DB_DRIVER") else { return 90 }
+  case := env.get("ALIGN_DB_CASE") else { return 91 }
+  if case == "__list__" {
+    print("present_values")
+    print("absent_values")
+    print("one_retained_bytes")
+    print("counters")
     return 42
+  }
+  pkg.db.testkit.pg.reset()
+  opened := open(driver)
+  connection := opened else { return 30 }
+  if case == "present_values" {
+    return execute_once(connection, driver, true)
+  } else {
+    if case == "absent_values" {
+      return execute_once(connection, driver, false)
+    } else {
+      if case == "one_retained_bytes" {
+        return retained(connection, driver)
+      } else {
+        if case == "counters" {
+          present := execute_once(connection, driver, true)
+          if present != 0 { return present }
+          absent := execute_once(connection, driver, false)
+          if absent != 0 { return absent }
+          one := retained(connection, driver)
+          if one != 0 { return one }
+          pkg.db.testkit.pg.dump()
+          return 42
+        } else {
+          return 99
+        }
+      }
+    }
   }
 }
 "#;
-    let output = build_and_run_multi_with_c(
-        "pkg-db-q4b-postgres-complete-matrix",
-        &package_files(main),
-        "main.align",
-        POSTGRES_STUB,
+
+/// How many rows of [`PARITY_CASES`] may declare a cross-driver divergence.
+///
+/// A ratchet: raising it must happen in the same diff that adds the divergence, so the increase is
+/// visible in review. Lowering it is always allowed. The 16-field matrix is fully portable today,
+/// so the budget is zero.
+const PARITY_DIFFERS_BUDGET: usize = 0;
+
+const PARITY_CASES: &[ParityCase] = &[
+    // 0 is `execute_once`/`retained` reporting success; any other value is one of their numbered
+    // failure points, and the table requires BOTH drivers to reach the same one.
+    ParityCase::same("present_values", 0),
+    ParityCase::same("absent_values", 0),
+    ParityCase::same("one_retained_bytes", 0),
+    // Native call counts are a libpq-stub property; SQLite has no counterpart to compare against,
+    // so this row runs on PostgreSQL only and its counter table is asserted below.
+    ParityCase::driver_only(
+        "counters",
+        Driver::Postgres,
+        42,
+        "libpq call counts have no SQLite counterpart to compare against",
+    ),
+];
+
+#[test]
+fn full_matrix_parity_is_exact_on_both_drivers() {
+    let Some(_gate) = gate(Needs::BackendAndCc) else { return };
+    let program = ParityProgram::build(
+        "pkg-db-q4b-full-matrix-parity",
+        &q4b(PARITY_MAIN).with_pg_counters(),
     );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "status: {:?}; stdout: {}; stderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
+    let runs = run_parity(
+        &program,
+        PARITY_CASES,
+        &[Driver::Sqlite, Driver::Postgres],
+        PARITY_DIFFERS_BUDGET,
     );
+    // The same three operations the parity rows ran, in one process: two `rows` executions and one
+    // `one`. This is what the retired PostgreSQL twin asserted as `execute_calls != 3`.
+    counters::pg()
+        .pg_execute(3)
+        .assert(run_of(&runs, "counters", Driver::Postgres));
 }
 
 #[test]
 fn postgres_deadline_cancel_drain_and_poisoning_are_exact() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
+    let Some(_gate) = gate(Needs::BackendAndCc) else { return };
     let main = r#"module main
 import pkg.db
 import pkg.db.postgres
@@ -1006,27 +1061,12 @@ fn main() -> i32 {
   }
 }
 "#;
-    let output = build_and_run_multi_with_c(
-        "pkg-db-q4b-postgres-deadline-cancel",
-        &package_files(main),
-        "main.align",
-        POSTGRES_STUB,
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "status: {:?}; stdout: {}; stderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    run_per_unit_c("pkg-db-q4b-postgres-deadline-cancel", &q4b(main).linking_pg_stub()).expect_exit(42);
 }
 
 #[test]
 fn owned_text_and_bytes_params_bind_before_their_sources_drop() {
-    if !backend_available() {
-        return;
-    }
+    let Some(_gate) = gate(Needs::Backend) else { return };
     let main = r#"module main
 import pkg.db
 import pkg.db.sqlite
@@ -1069,26 +1109,12 @@ fn main() -> i32 {
   return match exhausted { Some(_) => 11, None => 42 }
 }
 "#;
-    let output = build_and_run_multi_with_static_descriptors(
-        "pkg-db-q4b-owned-params",
-        &package_files(main),
-        "main.align",
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "status: {:?}; stdout: {}; stderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    run_static_descriptors("pkg-db-q4b-owned-params", &q4b(main)).expect_exit(42);
 }
 
 #[test]
 fn sqlite_stream_lifecycle_and_overlap_are_exact() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
+    let Some(_gate) = gate(Needs::BackendAndCc) else { return };
     let main = r#"module main
 import pkg.db
 import pkg.db.sqlite
@@ -1230,28 +1256,16 @@ fn main() -> i32 {
   }
 }
 "#;
-    let fixture = format!("{POSTGRES_STUB}\n{SQLITE_STUB}");
-    let output = build_and_run_multi_with_c(
+    run_per_unit_c(
         "pkg-db-q4b-sqlite-stream-lifecycle",
-        &package_files(main),
-        "main.align",
-        &fixture,
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "status: {:?}; stdout: {}; stderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+        &q4b(main).linking_pg_stub().linking_sqlite_stub(),
+    )
+    .expect_exit(42);
 }
 
 #[test]
 fn postgres_buffered_stream_lifecycle_is_exact() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
+    let Some(_gate) = gate(Needs::BackendAndCc) else { return };
     let main = r#"module main
 import pkg.db
 import pkg.db.postgres
@@ -1408,27 +1422,12 @@ fn main() -> i32 {
   }
 }
 "#;
-    let output = build_and_run_multi_with_c(
-        "pkg-db-q4b-postgres-buffered-lifecycle",
-        &package_files(main),
-        "main.align",
-        POSTGRES_STUB,
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "status: {:?}; stdout: {}; stderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    run_per_unit_c("pkg-db-q4b-postgres-buffered-lifecycle", &q4b(main).linking_pg_stub()).expect_exit(42);
 }
 
 #[test]
 fn postgres_prepared_deadline_recovers_for_reuse() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
+    let Some(_gate) = gate(Needs::BackendAndCc) else { return };
     let main = r#"module main
 import pkg.db
 import pkg.db.postgres
@@ -1507,27 +1506,12 @@ fn main() -> i32 {
   }
 }
 "#;
-    let output = build_and_run_multi_with_c(
-        "pkg-db-q4b-postgres-prepared-deadline",
-        &package_files(main),
-        "main.align",
-        POSTGRES_STUB,
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "status: {:?}; stdout: {}; stderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    run_per_unit_c("pkg-db-q4b-postgres-prepared-deadline", &q4b(main).linking_pg_stub()).expect_exit(42);
 }
 
 #[test]
 fn postgres_command_deadline_is_enforced_and_recovers_for_reuse() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
+    let Some(_gate) = gate(Needs::BackendAndCc) else { return };
     let main = r#"module main
 import pkg.db
 import pkg.db.postgres
@@ -1588,27 +1572,12 @@ fn main() -> i32 {
   }
 }
 "#;
-    let output = build_and_run_multi_with_c(
-        "pkg-db-q4b-postgres-command-deadline",
-        &package_files(main),
-        "main.align",
-        POSTGRES_STUB,
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "status: {:?}; stdout: {}; stderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    run_per_unit_c("pkg-db-q4b-postgres-command-deadline", &q4b(main).linking_pg_stub()).expect_exit(42);
 }
 
 #[test]
 fn malformed_native_view_values_fail_before_safe_view_formation() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
+    let Some(_gate) = gate(Needs::BackendAndCc) else { return };
     let sqlite_main = r#"module main
 import pkg.db
 import pkg.db.sqlite
@@ -1668,21 +1637,11 @@ fn main() -> i32 {
   }
 }
 "#;
-    let sqlite_fixture = format!("{POSTGRES_STUB}\n{SQLITE_STUB}");
-    let sqlite = build_and_run_multi_with_c(
+    run_per_unit_c(
         "pkg-db-q4b-sqlite-malformed-views",
-        &package_files(sqlite_main),
-        "main.align",
-        &sqlite_fixture,
-    );
-    assert_eq!(
-        sqlite.status.code(),
-        Some(42),
-        "SQLite status: {:?}; stdout: {}; stderr: {}",
-        sqlite.status,
-        String::from_utf8_lossy(&sqlite.stdout),
-        String::from_utf8_lossy(&sqlite.stderr),
-    );
+        &q4b(sqlite_main).linking_pg_stub().linking_sqlite_stub(),
+    )
+    .expect_exit(42);
 
     let postgres_main = r#"module main
 import pkg.db
@@ -1747,28 +1706,17 @@ fn main() -> i32 {
   }
 }
 "#;
-    let postgres = build_and_run_multi_with_c(
+    run_per_unit_c(
         "pkg-db-q4b-postgres-malformed-views",
-        &package_files(postgres_main),
-        "main.align",
-        POSTGRES_STUB,
-    );
-    assert_eq!(
-        postgres.status.code(),
-        Some(42),
-        "PostgreSQL status: {:?}; stdout: {}; stderr: {}",
-        postgres.status,
-        String::from_utf8_lossy(&postgres.stdout),
-        String::from_utf8_lossy(&postgres.stderr),
-    );
+        &q4b(postgres_main).linking_pg_stub(),
+    )
+    .expect_exit(42);
 }
 
 #[test]
 #[ignore = "local D8 scalar/text streaming measurement; not a correctness or CI gate"]
 fn million_row_streaming_measurement_reports_delivery_counts() {
-    if !backend_available() {
-        return;
-    }
+    let Some(_gate) = gate(Needs::Backend) else { return };
     let queries = r#"module app.q4b_bench
 import pkg.db
 import pkg.db.sqlite
@@ -1844,11 +1792,10 @@ fn main() -> i32 {
   return 0
 }
 "#;
-    let mut files = package_files(main);
-    files.push(("app/q4b_bench.align", queries));
+    let layout = q4b(main).module("app/q4b_bench.align", queries);
     let output = build_and_run_multi_with_static_descriptors(
         "pkg-db-q4b-million-row-measurement",
-        &files,
+        &layout.files(),
         "main.align",
     );
     assert!(
@@ -1877,9 +1824,7 @@ fn main() -> i32 {
 #[test]
 #[ignore = "local D9 deadline/cancellation measurement; not a correctness or CI gate"]
 fn postgres_deadline_overhead_measurement_reports_native_counts() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
+    let Some(_gate) = gate(Needs::BackendAndCc) else { return };
     let main = r#"module main
 import pkg.db
 import pkg.db.postgres
@@ -1962,7 +1907,7 @@ fn main() -> i32 {
 "#;
     let output = build_and_run_multi_with_c(
         "pkg-db-q4b-deadline-measurement",
-        &package_files(main),
+        &q4b(main).files(),
         "main.align",
         POSTGRES_STUB,
     );
@@ -1988,9 +1933,7 @@ fn main() -> i32 {
 
 #[test]
 fn deadline_disposition_and_precedence_are_exact() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
+    let Some(_gate) = gate(Needs::BackendAndCc) else { return };
     let main = r#"module main
 import pkg.db
 import pkg.db.sqlite
@@ -2184,28 +2127,16 @@ fn main() -> i32 {
   }
 }
 "#;
-    let fixture = format!("{POSTGRES_STUB}\n{SQLITE_STUB}");
-    let output = build_and_run_multi_with_c(
+    run_per_unit_c(
         "pkg-db-q4b-deadline-disposition",
-        &package_files(main),
-        "main.align",
-        &fixture,
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "status: {:?}; stdout: {}; stderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+        &q4b(main).linking_pg_stub().linking_sqlite_stub(),
+    )
+    .expect_exit(42);
 }
 
 #[test]
 fn postgres_deadline_fault_phases_are_exact() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
+    let Some(_gate) = gate(Needs::BackendAndCc) else { return };
     let main = r#"module main
 import pkg.db
 import pkg.db.postgres
@@ -2424,18 +2355,533 @@ fn main() -> i32 {
   }
 }
 "#;
-    let output = build_and_run_multi_with_c(
-        "pkg-db-q4b-postgres-deadline-fault-phases",
-        &package_files(main),
+    run_per_unit_c("pkg-db-q4b-postgres-deadline-fault-phases", &q4b(main).linking_pg_stub()).expect_exit(45);
+}
+
+// ================================================================================================
+// Harness self-tests and fail-open probes.
+//
+// A migration is only as trustworthy as the machinery it migrates onto, so every harness invariant
+// has an owner here, and every converted assertion class has a probe that deliberately breaks it
+// and requires the harness to report the break precisely. These live in `pkg_db_q4b.rs` rather than
+// a new test binary because q4b is the harness's first consumer and a new binary would cost a
+// ~25 MB link and ~25 s of startup for no additional coverage.
+// ================================================================================================
+mod harness_selftest {
+    use super::*;
+    use db_harness::counters::Counters;
+    use db_harness::run::{LiveDecision, live_postgres_decision, should_clear_env};
+    use db_harness::{CaseFingerprint, FingerprintLog, Mismatch, assert_no_mismatches};
+
+    /// Build a `Run` from canned output, so the pure checking logic can be probed without paying a
+    /// compile.
+    fn canned(label: &str, stdout: &str, code: i32) -> Run {
+        Run::new(
+            label,
+            std::process::Output {
+                status: exit_status(code),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            },
+        )
+    }
+
+    #[cfg(unix)]
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    #[cfg(unix)]
+    fn signalled_status(signal: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(signal)
+    }
+
+    const DUMP: &str = "\
+#db-counters-begin
+pg.execute_calls
+3
+pg.clear_calls
+3
+pg.protocol_ok
+1
+pg.protocol_error
+0
+#db-counters-end
+";
+
+    // ---- H1: layout composition ---------------------------------------------------------------
+
+    /// The backward-looking half of the migration proof: the new builder reproduces the retired
+    /// `package_files` list EXACTLY — same paths, same sources, same order.
+    #[test]
+    fn layout_reproduces_the_pre_harness_package_files_exactly() {
+        let main = "module main\nfn main() -> i32 = 0\n";
+        let legacy = legacy_package_files(main);
+        let built = q4b(main);
+        let built = built.files();
+        assert_eq!(
+            legacy.len(),
+            built.len(),
+            "module count changed: {:?} vs {:?}",
+            legacy.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+            built.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+        );
+        for (index, ((lp, ls), (bp, bs))) in legacy.iter().zip(built.iter()).enumerate() {
+            assert_eq!(lp, bp, "module {index} path");
+            assert_eq!(ls, bs, "module {index} source ({lp})");
+        }
+    }
+
+    #[test]
+    fn layout_module_replaces_rather_than_appends() {
+        let layout = Layout::new().module("app/x.align", "one").module("app/x.align", "two");
+        let files = layout.files();
+        assert_eq!(
+            files.iter().filter(|(p, _)| *p == "app/x.align").count(),
+            1,
+            "replacing a path must not leave a duplicate entry"
+        );
+        assert_eq!(
+            files.iter().find(|(p, _)| *p == "app/x.align").unwrap().1,
+            "two"
+        );
+    }
+
+    /// `common::Proj::write` does not create parent directories; `Layout::materialize` must.
+    #[test]
+    fn layout_materializes_nested_module_paths() {
+        let proj = q4b("module main\nfn main() -> i32 = 0\n")
+            .materialize("pkg-db-q4b-selftest-materialize");
+        for relative in [
+            "pkg/db.align",
+            "pkg/db/internal/resource.align",
+            "app/q4b_query.align",
+            "main.align",
+        ] {
+            assert!(
+                proj.dir.join(relative).is_file(),
+                "{relative} was not written"
+            );
+        }
+    }
+
+    /// H9: the counters module can only arrive together with the C source that defines its symbols.
+    #[test]
+    fn pg_counters_always_arrive_with_their_stub() {
+        let layout = Layout::new().with_pg_counters();
+        assert!(
+            layout.has_c_fixture(),
+            "with_pg_counters must also link the stub that defines the counters"
+        );
+        assert!(
+            layout.paths().contains(&"pkg/db/testkit/pg.align"),
+            "with_pg_counters must add the Align counters module"
+        );
+        assert!(
+            !Layout::new()
+                .linking_pg_stub()
+                .paths()
+                .contains(&"pkg/db/testkit/pg.align"),
+            "linking the stub alone must NOT inject the counters module: a pure-refactor migration \
+             depends on the compiled module set being unchanged"
+        );
+    }
+
+    // ---- H2 / P5: exit reporting ---------------------------------------------------------------
+
+    #[test]
+    fn exit_check_accepts_the_expected_code() {
+        assert!(canned("ok", "", 42).check_exit(42).is_ok());
+    }
+
+    /// P5: a signal-killed child has `code() == None`; the report must still be legible.
+    #[cfg(unix)]
+    #[test]
+    fn exit_report_survives_signal_termination() {
+        let run = Run::new(
+            "killed",
+            std::process::Output {
+                status: signalled_status(9),
+                stdout: b"partial".to_vec(),
+                stderr: Vec::new(),
+            },
+        );
+        let mismatch = run.check_exit(42).expect_err("a killed child cannot be exit 42");
+        assert!(mismatch.actual.contains("None"), "{mismatch}");
+        let described = run.describe();
+        assert!(described.contains("status:"), "{described}");
+        assert!(described.contains("partial"), "{described}");
+    }
+
+    // ---- H3 / P1 / P2: counter table ------------------------------------------------------------
+
+    #[test]
+    fn counter_table_accepts_matching_counters() {
+        let run = canned("pg", DUMP, 42);
+        assert!(counters::pg().pg_execute(3).pg_clear(3).check(&run).is_empty());
+    }
+
+    /// P1: one counter off by one is reported BY NAME, with expected and actual.
+    #[test]
+    fn counter_table_names_an_off_by_one_counter() {
+        let run = canned("pg", DUMP, 42);
+        let found = counters::pg().pg_execute(4).check(&run);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].what.contains("pg.execute_calls"), "{:?}", found[0]);
+        assert_eq!(found[0].expected, "4");
+        assert_eq!(found[0].actual, "3");
+    }
+
+    /// P2: a counter the stub never reported is "absent", not silently zero.
+    #[test]
+    fn counter_table_reports_an_absent_counter_as_absent() {
+        let run = canned("pg", DUMP, 42);
+        let found = counters::pg().pg_finish(1).check(&run);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].actual.starts_with("absent"), "{:?}", found[0]);
+    }
+
+    /// H3: EVERY mismatch is reported, not just the first.
+    #[test]
+    fn counter_table_reports_every_mismatch() {
+        let run = canned("pg", DUMP, 42);
+        let found = counters::pg().pg_execute(9).pg_clear(9).check(&run);
+        assert_eq!(found.len(), 2, "both wrong counters must be reported: {found:?}");
+    }
+
+    // ---- H5: dump format ------------------------------------------------------------------------
+
+    #[test]
+    fn counter_dump_parses_name_value_pairs() {
+        let parsed = Counters::parse(DUMP).expect("well-formed dump");
+        assert_eq!(parsed.get("pg.execute_calls"), Some(3));
+        assert_eq!(parsed.get("pg.protocol_error"), Some(0));
+    }
+
+    #[test]
+    fn counter_dump_rejects_malformed_input() {
+        // No dump at all: a program that forgot to call dump() must not read as "zero counters".
+        assert!(Counters::parse("42\n").is_err());
+        // Truncated: the end sentinel makes this detectable.
+        assert!(Counters::parse("#db-counters-begin\npg.execute_calls\n3\n").is_err());
+        // A name with no value.
+        assert!(Counters::parse("#db-counters-begin\npg.execute_calls\n#db-counters-end\n").is_err());
+        // Non-numeric value.
+        assert!(Counters::parse("#db-counters-begin\npg.x\nnope\n#db-counters-end\n").is_err());
+        // Same name twice with different values.
+        assert!(
+            Counters::parse("#db-counters-begin\npg.x\n1\npg.x\n2\n#db-counters-end\n").is_err()
+        );
+    }
+
+    /// A program's own `print` output must survive alongside a counter dump.
+    #[test]
+    fn payload_lines_exclude_the_counter_dump() {
+        let run = canned("pg", &format!("hello\n{DUMP}world\n"), 42);
+        assert_eq!(run.payload_lines(), vec!["hello", "world"]);
+    }
+
+    // ---- H10 / P6: accumulation -----------------------------------------------------------------
+
+    /// P6: one broken row does not hide the others.
+    #[test]
+    fn accumulated_failures_all_appear_in_the_message() {
+        let mismatches: Vec<Mismatch> = (0..3)
+            .map(|i| Mismatch {
+                what: format!("row{i}"),
+                expected: "x".into(),
+                actual: "y".into(),
+            })
+            .collect();
+        let panicked = std::panic::catch_unwind(|| assert_no_mismatches("table", &mismatches))
+            .expect_err("must panic");
+        let message = panic_message(&panicked);
+        for i in 0..3 {
+            assert!(message.contains(&format!("row{i}")), "{message}");
+        }
+        assert!(message.contains("3 expectation(s) failed"), "{message}");
+    }
+
+    fn panic_message(panicked: &Box<dyn std::any::Any + Send>) -> String {
+        panicked
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panicked.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .unwrap_or_else(|| "<non-string panic>".to_string())
+    }
+
+    // ---- H7 / P8: required-mode gating ----------------------------------------------------------
+
+    /// P8: required mode with no URL is a FAILURE, never a skip. Tested through the pure decision
+    /// so no test mutates process-global environment.
+    #[test]
+    fn required_live_postgres_without_a_url_fails_rather_than_skipping() {
+        assert_eq!(live_postgres_decision(true, None), LiveDecision::Fail);
+        assert_eq!(live_postgres_decision(true, Some("")), LiveDecision::Fail);
+        assert_eq!(live_postgres_decision(false, None), LiveDecision::Skip);
+        assert_eq!(
+            live_postgres_decision(true, Some("postgresql://x")),
+            LiveDecision::Run("postgresql://x".to_string())
+        );
+    }
+
+    // ---- H12: selector hygiene -------------------------------------------------------------------
+
+    #[test]
+    fn engine_clears_foreign_align_db_variables() {
+        let passthrough = vec!["ALIGN_DB_POSTGRES_URL".to_string()];
+        assert!(should_clear_env("ALIGN_DB_STRAY", &passthrough));
+        assert!(!should_clear_env("ALIGN_DB_DRIVER", &passthrough));
+        assert!(!should_clear_env("ALIGN_DB_CASE", &passthrough));
+        assert!(!should_clear_env("ALIGN_DB_POSTGRES_URL", &passthrough));
+        assert!(!should_clear_env("PATH", &passthrough));
+    }
+
+    // ---- fingerprint ------------------------------------------------------------------------------
+
+    /// Every axis of the fingerprint must change the digest. A file-only hash would miss the last
+    /// four, and each of them changes what the case proves.
+    #[test]
+    fn fingerprint_covers_every_axis_of_a_case() {
+        let base = || {
+            CaseFingerprint::new("case", RUNNER_PER_UNIT_C)
+                .files(&[("main.align", "a")])
+                .env(&[("K", "V")])
+                .argv(&["one"])
+                .expected_exit(42)
+        };
+        let reference = base().digest();
+        assert_eq!(base().digest(), reference, "the digest must be stable");
+        assert_ne!(
+            CaseFingerprint::new("case", RUNNER_STATIC_DESCRIPTORS)
+                .files(&[("main.align", "a")])
+                .env(&[("K", "V")])
+                .argv(&["one"])
+                .expected_exit(42)
+                .digest(),
+            reference,
+            "a changed RUNNER must change the digest"
+        );
+        assert_ne!(
+            base().files(&[("main.align", "b")]).digest(),
+            reference,
+            "changed sources must change the digest"
+        );
+        assert_ne!(
+            base().env(&[("K", "W")]).digest(),
+            reference,
+            "a changed ENVIRONMENT must change the digest"
+        );
+        assert_ne!(
+            base().argv(&["two"]).digest(),
+            reference,
+            "changed ARGV must change the digest"
+        );
+        assert_ne!(
+            base().expected_exit(7).digest(),
+            reference,
+            "a changed EXPECTED EXIT must change the digest"
+        );
+    }
+
+    /// Environment order must not perturb the digest; file order must.
+    #[test]
+    fn fingerprint_is_stable_under_environment_order() {
+        let a = CaseFingerprint::new("c", RUNNER_PER_UNIT_C).env(&[("A", "1"), ("B", "2")]);
+        let b = CaseFingerprint::new("c", RUNNER_PER_UNIT_C).env(&[("B", "2"), ("A", "1")]);
+        assert_eq!(a.digest(), b.digest());
+        let f1 = CaseFingerprint::new("c", RUNNER_PER_UNIT_C)
+            .files(&[("a", "1"), ("b", "2")])
+            .digest();
+        let f2 = CaseFingerprint::new("c", RUNNER_PER_UNIT_C)
+            .files(&[("b", "2"), ("a", "1")])
+            .digest();
+        assert_ne!(f1, f2, "module ORDER is part of what the driver sees");
+    }
+
+    #[test]
+    fn fingerprint_log_reports_added_removed_and_changed_rows() {
+        let mut log = FingerprintLog::new();
+        log.record(&CaseFingerprint::new("kept", RUNNER_PER_UNIT_C));
+        log.record(&CaseFingerprint::new("added", RUNNER_PER_UNIT_C));
+        let golden = {
+            let mut other = FingerprintLog::new();
+            other.record(&CaseFingerprint::new("kept", RUNNER_PER_UNIT_C));
+            other.record(&CaseFingerprint::new("removed", RUNNER_PER_UNIT_C));
+            other.render()
+        };
+        let panicked =
+            std::panic::catch_unwind(move || log.assert_matches(&golden)).expect_err("must panic");
+        let message = panic_message(&panicked);
+        assert!(message.contains("added:   added"), "{message}");
+        assert!(message.contains("removed: removed"), "{message}");
+    }
+}
+
+// ================================================================================================
+// Parity-engine fail-open probes (P3, P4, P9).
+//
+// These need a real compiled program, so they share ONE build and deliberately feed it wrong
+// tables. Each probe proves the engine reports the specific break rather than passing quietly —
+// which is the whole reason the parity table replaces two hand-maintained twins.
+// ================================================================================================
+#[test]
+fn parity_engine_detects_table_and_program_disagreement() {
+    let Some(_gate) = gate(Needs::BackendAndCc) else { return };
+    let program = ParityProgram::build(
+        "pkg-db-q4b-parity-probes",
+        &q4b(PARITY_MAIN).with_pg_counters(),
+    );
+    let drivers = [Driver::Sqlite, Driver::Postgres];
+
+    let message = |cases: &'static [ParityCase], budget: usize| -> String {
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_parity(&program, cases, &drivers, budget);
+        }))
+        .expect_err("the probe table must be rejected");
+        panicked
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panicked.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .unwrap_or_else(|| "<non-string panic>".to_string())
+    };
+
+    // P3: a case whose declared class is wrong must be reported on BOTH drivers, by name.
+    const WRONG_CLASS: &[ParityCase] = &[
+        ParityCase::same("present_values", 7),
+        ParityCase::same("absent_values", 0),
+        ParityCase::same("one_retained_bytes", 0),
+        ParityCase::driver_only("counters", Driver::Postgres, 42, "libpq only"),
+    ];
+    let report = message(WRONG_CLASS, 0);
+    assert!(report.contains("present_values"), "{report}");
+    assert!(report.contains("sqlite"), "{report}");
+    assert!(report.contains("postgres"), "{report}");
+    assert!(report.contains("Some(7)"), "{report}");
+
+    // P4a: a divergence declared where the drivers actually agree is still checked per driver, so
+    // the wrong half is reported with its justification attached.
+    const FALSE_DIVERGENCE: &[ParityCase] = &[
+        ParityCase::differs("present_values", 0, 7, "probe: not a real divergence"),
+        ParityCase::same("absent_values", 0),
+        ParityCase::same("one_retained_bytes", 0),
+        ParityCase::driver_only("counters", Driver::Postgres, 42, "libpq only"),
+    ];
+    let report = message(FALSE_DIVERGENCE, 1);
+    assert!(report.contains("declared divergence"), "{report}");
+    assert!(report.contains("probe: not a real divergence"), "{report}");
+
+    // P4b: the divergence budget is a ratchet — the same table over budget fails before it runs.
+    let report = message(FALSE_DIVERGENCE, 0);
+    assert!(report.contains("budget"), "{report}");
+
+    // P9: a case name changed by ONE character is caught twice over — the bidirectional `__list__`
+    // diff sees a table row the program does not have AND a program case the table does not have,
+    // and the run itself hits the unknown-case sentinel.
+    const TYPO: &[ParityCase] = &[
+        ParityCase::same("present_value", 0),
+        ParityCase::same("absent_values", 0),
+        ParityCase::same("one_retained_bytes", 0),
+        ParityCase::driver_only("counters", Driver::Postgres, 42, "libpq only"),
+    ];
+    let report = message(TYPO, 0);
+    assert!(report.contains("present_value`"), "{report}");
+    assert!(
+        report.contains("present_values`"),
+        "the program's own case must be reported as absent from the table: {report}"
+    );
+    assert!(
+        report.contains(&format!("sentinel {}", db_harness::parity::UNKNOWN_CASE)),
+        "the typo must also hit the unknown-case sentinel: {report}"
+    );
+}
+
+/// P7: a layout missing a package module must produce a compile diagnostic, never a silent pass.
+#[test]
+fn a_layout_missing_a_package_module_is_rejected() {
+    let main = "module main\nimport pkg.db\nfn main() -> i32 = 0\n";
+    let complete = diff_check_multi(
+        "pkg-db-q4b-probe-layout-complete",
+        &q4b(main).files(),
         "main.align",
-        POSTGRES_STUB,
     );
-    assert_eq!(
-        output.status.code(),
-        Some(45),
-        "status: {:?}; stdout: {}; stderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
+    assert!(
+        !complete.whole_errors && !complete.per_unit_errors,
+        "the control layout must check cleanly:\n{}",
+        complete.whole_diags
     );
+    let missing = diff_check_multi(
+        "pkg-db-q4b-probe-layout-missing",
+        &q4b(main).without("pkg/db/internal.align").files(),
+        "main.align",
+    );
+    assert!(
+        missing.whole_errors && missing.per_unit_errors,
+        "a layout missing pkg/db/internal.align must be REJECTED, not silently checked as a \
+         smaller program (whole={}, per_unit={})",
+        missing.whole_errors,
+        missing.per_unit_errors,
+    );
+}
+
+/// The parity table's case fingerprint golden.
+///
+/// This pins what the parity owner actually exercises: the case set, the pipeline, the selector
+/// environment, and the expected class per driver. A silent edit to any of them — renaming a case,
+/// switching the runner, changing an expected class — changes a digest and fails here with the row
+/// named, which is exactly the "the file set still matches so it must be the same test" blind spot
+/// a source-only hash has.
+///
+/// The eight `pkg.db` package sources are deliberately NOT part of the digest: they are product
+/// code with their own owners, and including them would break this golden on every `apps/db` edit
+/// without saying anything about the parity owner.
+///
+/// Regenerate ONLY with a reviewed reason, by printing `log.render()` from this test.
+const PARITY_FINGERPRINT_GOLDEN: &str = "\
+pkg-db-q4b-full-matrix-parity/absent_values/postgres ec61f97163fb426e
+pkg-db-q4b-full-matrix-parity/absent_values/sqlite a0c3f1256f797be4
+pkg-db-q4b-full-matrix-parity/counters/postgres 17833e8112c666ee
+pkg-db-q4b-full-matrix-parity/one_retained_bytes/postgres 00029e1d32fbb498
+pkg-db-q4b-full-matrix-parity/one_retained_bytes/sqlite ebd3c5440d20030c
+pkg-db-q4b-full-matrix-parity/present_values/postgres fafe721a49cf9464
+pkg-db-q4b-full-matrix-parity/present_values/sqlite b3cb905db2f0ef98
+";
+
+#[test]
+fn parity_case_fingerprints_match_the_golden() {
+    let mut log = FingerprintLog::new();
+    for case in PARITY_CASES {
+        for driver in [Driver::Sqlite, Driver::Postgres] {
+            let (expected, applicable) = match case.expect {
+                Expect::Same(code) => (code, true),
+                Expect::Differs { sqlite, postgres, .. } => (
+                    if driver == Driver::Sqlite { sqlite } else { postgres },
+                    true,
+                ),
+                Expect::DriverOnly { driver: only, code, .. } => (code, only == driver),
+            };
+            if !applicable {
+                continue;
+            }
+            log.record(
+                &CaseFingerprint::new(
+                    format!(
+                        "pkg-db-q4b-full-matrix-parity/{}/{}",
+                        case.name,
+                        driver.name()
+                    ),
+                    RUNNER_PER_UNIT_C,
+                )
+                .files(&q4b(PARITY_MAIN).with_pg_counters().test_owned_files())
+                .env(&[
+                    ("ALIGN_DB_DRIVER", driver.env_value()),
+                    ("ALIGN_DB_CASE", case.name),
+                ])
+                .expected_exit(expected),
+            );
+        }
+    }
+    log.assert_matches(PARITY_FINGERPRINT_GOLDEN);
 }
