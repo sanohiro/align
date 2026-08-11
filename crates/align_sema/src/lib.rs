@@ -43757,7 +43757,11 @@ struct GenericParamState {
 /// The mangled symbol name of a monomorph instance: `name` + `$` + each concrete type argument
 /// (`pick` with `[i32]` → `pick$i32`). Deterministic and collision-free across instantiations.
 #[allow(clippy::too_many_arguments)]
-fn mangle_mono(
+/// The symbol name of one generic instantiation: the base name followed by each type argument
+/// under [`ty_mangle`], separated by `$`. Every consumer — the producer that mints the name and
+/// any validator that checks one — must call this rather than re-joining the parts, so the
+/// convention has a single owner.
+pub fn mangle_mono(
     name: &str,
     args: &[Ty],
     tagged_types: &[hir::TaggedType],
@@ -43813,11 +43817,13 @@ fn mangle_mono_source(
 }
 
 /// A compact, identifier-safe spelling of a concrete type for use in a mangled symbol name.
-/// The monomorph-name mangling every generic instantiation is keyed by. Public so the MIR body
-/// validator can check a call's mangled target against the producer's own scheme instead of
-/// keeping a second copy: the copies drifted on `json.scanner<T>` (the producer sanitizes
-/// `ty_name`, the copy had a hand-written arm without its trailing separator), which made a valid
-/// program fail validation and lower to an empty unit.
+/// Backend-identity spelling of one type inside a mangled symbol name.
+///
+/// This string is part of a monomorph's symbol identity, so it must be computed from the tables
+/// of the same program the name was minted in, and changing it invalidates cached artifacts.
+/// It is the backend spelling, not the source spelling ([`source_ty_mangle`]'s job). Prefer
+/// [`mangle_mono`] when building or checking a whole monomorph name: that keeps the separator
+/// convention in one place too.
 pub fn ty_mangle(
     ty: Ty,
     tagged_types: &[hir::TaggedType],

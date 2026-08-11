@@ -12522,13 +12522,34 @@ fn hir_body_type_mangle_golden_vectors() {
         (Ty::DynStructArray(0, Layout::Aos), "D_S6_Record"),
         (Ty::Soa(0), "Q_S6_Record"),
         (Ty::Tuple(0), "U2_i64_bool"),
-        (Ty::Vec(scalar_int(32), 4), "vec4_i32"),
-        (Ty::Mask(scalar_int(32), 4), "mask4_i32"),
+        // Types the producer spells through its sanitized display form; the validator's own
+        // copy of this scheme spelled them without the trailing separator and turned valid
+        // programs into empty units, so pin the producer's exact output.
+        (Ty::Vec(scalar_int(32), 4), "vec4_i32_"),
+        (Ty::Mask(scalar_int(32), 4), "mask4_i32_"),
+        (Ty::JsonScanner(0), "json_scanner_struct_0_"),
+        (Ty::ArrayBuilder(scalar_int(64)), "array_builder_i64_"),
+        (Ty::Param(2), "_type_param_2_"),
         (Ty::Task(scalar_int(64)), "K_i64"),
         (Ty::Fn(0), "F0_____bn_rn"),
     ];
     for (ty, expected) in vectors {
         assert_eq!(body_ty_mangle(ty, &program), expected, "mangle for {ty:?}");
+        // The validator must never hold a second model of this scheme: every name it checks was
+        // minted by the producer, so the two must be the same function, not merely agree today.
+        assert_eq!(
+            body_ty_mangle(ty, &program),
+            align_sema::ty_mangle(
+                ty,
+                &program.tagged_types,
+                &program.structs,
+                &program.enums,
+                &program.tuples,
+                &program.fn_types,
+                &program.resources,
+            ),
+            "the validator must ask the producer for {ty:?}"
+        );
     }
 
     let mut provenance_program = baseline_program();
