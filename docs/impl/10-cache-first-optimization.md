@@ -410,6 +410,154 @@ form:
 The exact CLI surface is an M15 decision. The data model is required from the first slice so tests
 can assert invalidation rather than infer it from elapsed time.
 
+### 6.6 SHIPPED 2026-08-12 — process-in-memory memoization
+
+The on-disk cache above makes a *second process* cheap. It does nothing for a **second identical
+compilation inside one process**, which is the dominant shape of the driver test corpus: one
+`pkg_db_*` test binary compiles the same eight-module 138 KB `pkg.db` package, against a different
+small `main`, a dozen or more times through `align_driver`'s library entry points. Measured on this
+corpus, one such compilation costs ~1.5 s whole-program sema, ~1.5 s whole-program lowering, ~3.4 s
+per-unit frontend, and ~9 s per-unit codegen. A four-core CI runner is saturated by exactly this
+work.
+
+`crates/align_driver/src/memo.rs` memoizes four stages in process memory, keyed only by content:
+
+```text
+program   whole-program sema (`check`)              ordered (unit path, is_entry, source) + the
+                                                    seeded diagnostic sink
+unit      one per-unit frontend result              own path/entry/source + each interface-only
+                                                    dependency's RENDERED source + the four
+                                                    external fact maps
+lowering  HIR -> MIR (`lower_to_mir`, per-unit)     total `Debug` of the HIR + visibility variant
+object    MIR -> object bytes                       `codegen_impl_hash` + target + profile +
+                                                    exports + rt_lto
+```
+
+The program key's "seeded diagnostic sink" component is not defensive padding. `align_sema` READS
+the sink it is handed: `declaration_has_prior_error` suppresses static-descriptor discovery for a
+function the loader already reported a lexer/parser error inside. The memoized step therefore hands
+sema a sink seeded with the loader's diagnostics — exactly what it saw before this memo existed —
+takes only the tail past the seed as its own output, and folds the seeded set into the key because
+it is an input to the step. A memo that quietly gave sema an empty sink would change which
+descriptors a malformed program discovers, with or without a hit.
+
+Every key additionally folds the four process-global compiler toggles (`ALIGN_CONST_POOL`,
+`ALIGN_NEEDLE_HOIST`, `ALIGN_BUFFER_DONATE`, `ALIGN_SORT_ADAPTIVE`). They are read at each lowering,
+not once per process, and the measurement suites flip them with `set_var` inside one test binary, so
+they are genuine key material and not ambient configuration the memo may ignore.
+
+The remaining components of the on-disk object key — compiler build id, LLVM version, resolved
+target identity, object format, cache-format version — are constants of the running process image,
+so they cannot differ between two calls in it. Only `target`, which the caller passes, is keyed.
+
+**This is a pure optimization: a hit must be indistinguishable from a miss.** The memo therefore
+never retains an artifact whose replay would have to reproduce a side effect. Two consequences are
+load-bearing:
+
+- **Diagnostics are replayed, not used to disqualify.** An early draft cached only
+  diagnostic-silent units, which excluded exactly the expensive modules — `pkg.db` and friends emit
+  sixteen `lossy conversion` warnings — and left the per-unit memo nearly useless. A per-unit
+  diagnostic is stored WITHOUT its `FileId` (a walk-local index) and reattached to the replaying
+  walk's own unit file; a unit with any diagnostic that does not point into its own source is not
+  retained at all. A whole-program diagnostic keeps its id verbatim, because that memo is used only
+  under the canonical `unit i owns FileId i` assignment that a fresh `SourceMap` produces, and the
+  key pins the ordered unit list.
+- **Anything that touches the project root stays uncached.** A unit owning L5c static descriptors
+  resolves files under the project root and takes the metadata publication lock; those units are
+  never retained. With an empty descriptor set every one of those steps is already a no-op, which is
+  what makes the exclusion sufficient rather than merely conservative.
+
+Lifetime is the process, so there is no invalidation model: nothing a key does not already cover can
+change while the process runs.
+
+**Retention is bounded in bytes, not in entries.** A one-shot `alignc` run exits long before any
+bound matters, but an embedder — align-llm today, a language server later — keeps one process alive
+across thousands of compilations, so the bound has to be denominated in memory. Objects are charged
+their exact length; the three frontend maps are charged the length of a rendering the store site
+already holds — the HIR's own `Debug` for `program`, the HIR rendering the key already built for
+`lowering`, and the unit's key material (its full source plus every dependency interface) for
+`unit`. That is an estimate within a constant factor, not a measurement, and deliberately so: what
+must hold is that retention is bounded and stops at the bound. Insertion simply stops there — there
+is no eviction, so a hit stays deterministic for the process's life and a refusal changes nothing
+but the counters. The default is 768 MiB of charge; measured scale is one whole-program `pkg.db` HIR
+rendering to 1.8 MB and one per-unit object set under a megabyte, so roughly two hundred distinct
+whole-program compilations fit — past the largest owner suite (44 distinct programs) and far short
+of a long-lived embedder's lifetime.
+
+`align_driver::memo` exposes `enabled`/`set_enabled`, `budget`/`set_budget`, `stats`, and `clear`.
+The memo is ON by default; `set_enabled(false)` lets the owner tests compare a replay against the
+uncached pipeline, and `set_budget` lets them drive the refusal path. Each stage's counters are a
+`hits` / `misses` pair where a MISS is a LOOKUP that found nothing; a stage the memo declines
+outright (off, located, non-canonical file ids) performs no lookup and is counted in neither.
+
+`alignc` deliberately keeps the same default rather than opting out. A one-shot CLI build never
+hits, so it pays only the key hashes and the store-side copies. Measured on a cold
+`alignc build --no-rt-lto` of the eight-module `pkg.db` package plus a `main` (`ALIGNC_CACHE=off`,
+six runs each, debug compiler): 11.353 s median with the memo off, 11.326 s with it on — a
+difference smaller than the ±0.1 s run-to-run spread, so the overhead is under 0.5% and not
+separable from noise. One default keeps the CLI and the library on the same code path, which is what
+makes the on/off owner comparison meaningful for both.
+
+Only the object bytes are handed out behind an `Arc`. A checked HIR carries `Cell<FnEffect>` and is
+neither `Sync` nor safely shared, and a deep clone is what makes a hit indistinguishable from a miss:
+the caller owns its program outright and cannot reach the retained snapshot. Objects are plain bytes
+and are copied by the parallel per-unit codegen workers, so sharing them keeps a multi-megabyte copy
+out of the store mutex.
+
+Object retention reads the bytes back from the file codegen just wrote rather than having codegen
+hand them over in memory. `TargetMachine::write_to_file` is the one emission seam every byte-identity
+gate is baselined on, and switching it to an in-memory buffer would save a single page-cache read
+(~0.6 MB, well under a millisecond) after a stage that just spent seconds in LLVM — not a trade worth
+moving that seam for. The read is only sound while no other thread writes the same path, so the
+invariant is enforced rather than assumed: `emit_object_file` registers the output path for the
+duration of the emission, and if a second emission to the same path overlaps, BOTH skip retention.
+The build itself is untouched, so the guard can never turn a working caller into a failing one.
+
+#### Closure matrix
+
+Owners are in `crates/align_driver/tests/inprocess_memo.rs` unless stated otherwise.
+
+| # | Cell | Rule | Owner |
+|---|---|---|---|
+| M1 | key completeness — sources | identical ordered sources hit; any source edit misses | `identical_sources_replay_every_unit_and_object`, `whole_program_check_and_lowering_replay`, `private_body_edit_misses_only_its_own_unit` |
+| M2 | key completeness — paths | the key is content-only, so a different project directory still hits | every test builds each project in a fresh temp directory |
+| M3 | key completeness — interfaces | a dependency's PUBLIC surface change misses its reverse dependents; a private body change does not | `public_surface_edit_misses_its_reverse_dependents`, `private_body_edit_misses_only_its_own_unit` |
+| M4 | diagnostics | replayed verbatim — severity, message, offsets, order — and rendered against the replaying project's file | `warning_bearing_unit_replays_its_warnings` |
+| M5 | key completeness — compiler toggles | flipping a toggle misses every unit; restoring it re-addresses the originals | `compiler_env_toggle_is_key_material` |
+| M6 | memo on == memo off | a replayed build equals the uncached build in unit order, MIR fingerprint, interface/impl hash, object BYTES, and diagnostics | `identical_sources_replay_every_unit_and_object`, `whole_program_check_and_lowering_replay`, `disabled_memo_is_a_complete_bypass` |
+| M7 | concurrency | the maps are shared by the parallel per-unit codegen workers; concurrent builds agree with the serial result | `concurrent_builds_agree_with_the_serial_result` |
+| M8 | disable | a disabled memo performs no lookup, retention, or accounting | `disabled_memo_is_a_complete_bypass` |
+| M9 | accounting | hit/miss counters and retained bytes are exact | hit/miss deltas asserted in every test above |
+| M10 | invalidation | none needed: process lifetime, content keys | stated here; no owner (nothing to invalidate) |
+| M10b | file-id assignment | the program memo replays `FileId`-bearing HIR and diagnostics, so it declines any walk whose `SourceMap` is not the canonical `unit i owns file i` — and still compiles correctly | `non_canonical_source_map_declines_the_program_memo` |
+| M11 | generics / monomorphization | a consumer's in-unit monomorphs are part of ITS MIR and its key includes the dependency's rendered interface (which carries generic template bodies), so a template edit misses the consumer | `public_surface_edit_misses_its_reverse_dependents`; whole-corpus `generics*` suites |
+| M12 | whole-program vs per-unit | separate key namespaces (`program` / `unit`) and a `variant` component on the lowering key, so the two visibility models can never serve each other | `lowering_key`'s variant tag; `per_unit_*` suites |
+| M13 | static descriptors | a descriptor-owning unit is never retained; whole-program descriptor installation runs on the caller's own MIR copy after the lowering memo | `descriptor_owning_unit_is_never_retained` (real `pkg.db` package); `pkg_db_q1`/`q3`/`q6` |
+| M14 | located lowering | `explain-opt`'s located MIR depends on the `SourceMap`, which the key does not cover, so both located entry points opt out | `located_walk_neither_serves_nor_retains` |
+| M15 | error paths | a program or unit that fails to check is never retained | `failing_program_and_unit_are_never_retained` |
+| M16 | interaction with the on-disk cache | the memo sits INSIDE `emit_object_file`, i.e. inside the disk cache's miss producer, so a disk hit still skips codegen entirely and a disk miss is served identical bytes | `cache_codegen.rs`, `cache_parallel.rs` |
+| M17 | retention and memory | retention is charged in bytes, the bound is reachable, and reaching it refuses further retention without changing any output | `a_spent_budget_refuses_retention_without_changing_output` |
+| M18 | sema's diagnostic sink | sema reads the sink it is handed, so the memoized step seeds it with the loader's diagnostics and folds them into the key; a parse error inside a descriptor-owning function suppresses discovery identically with the memo on and off | `parse_error_inside_a_descriptor_function_suppresses_discovery_on_both_paths` |
+| M19 | object read-back | retention reads back the file codegen wrote, so an overlapping emission to the same path makes BOTH emissions skip retention | `EmitGuard`; `cache_parallel.rs` (distinct per-unit paths) |
+
+Measured effect on the `pkg.db` owner suites (this machine, 4 test threads, debug compiler;
+wall / CPU seconds, before → after):
+
+```text
+pkg_db_q1     26.4 / 86.2   ->  13.2 / 42.1
+pkg_db_q2     55.3 / 132.6  ->  40.0 / 99.9
+pkg_db_q3     28.5 / 94.4   ->  15.8 / 48.0
+pkg_db_q4b   112.7 / 380.2  ->  35.9 / 110.8
+```
+
+CPU falls 2.3x across those four suites. The gain is largest where a suite recompiles one layout
+many times (`q4b`'s parity corpus, 3.4x) and smallest where every test has a genuinely distinct
+`main` compiled once (`q2`, 1.3x) — there the shared `pkg.db` portion is still recompiled, because
+the whole-program front end has no unit-level reuse. Closing that remaining gap is the on-disk
+package cache, not this slice. A saturated four-core CI runner is CPU-bound on exactly this work, so
+the wall-clock effect there should track the CPU column rather than the (partly parallel) local wall
+column.
+
 ---
 
 ## 7. Cache validation matrix
