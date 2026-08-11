@@ -34,6 +34,13 @@ error. The same pass restored direct execution's settled phase order of live sta
 generated static validation, lease, and then bind/native work. Both changes belong to the direct
 stream state machine, so the three independently mergeable PR boundaries remain unchanged.
 
+The clean-up review of that fourth redesign found three P2 consistency gaps but no new P1. The
+ledger now exposes the monotonic caller-region cost of `one_native`: once a valid first Row is cloned,
+the same bytes remain allocated on Cardinality or any later error. Delivery validation follows the
+canonical §13.4 payload-before-duplicate order, superseding the earlier local choice, and the option
+is inventoried as post-release D13 rather than part of initial D1--D12. None changes the three PR
+boundaries.
+
 ## 2026-08-07: shared borrow accepts stable Copy storage
 
 Shared `borrow` now accepts a stable bound Copy or Move place. Copy values still pass by value by

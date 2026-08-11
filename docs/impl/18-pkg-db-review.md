@@ -545,7 +545,9 @@ idea is rejected.
   formats and other native paths remain separate. Because COPY termination is not in this rail,
   observing a COPY status clears only that result and immediately poisons/closes instead of entering
   generic drain; direct construction also retains Q2's live-state/context/static-validation/lease
-  phase order.
+  phase order. Query Delivery validation retains §13.4 payload-before-duplicate precedence, and
+  `one_native` records the monotonic caller-region bytes left by its first-Row clone when a later
+  failure wins.
 
 ### F32 — L1a and L1b both claimed `Option<MoveStruct>`
 

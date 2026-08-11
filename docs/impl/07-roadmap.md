@@ -66,7 +66,8 @@ without changing a public surface or ABI. The following independently useful
 rail is the exact PostgreSQL `SingleRow` / `PortalBatch` direct delivery
 contract recorded by the adjacent A1 ledger. Prepared parity follows in its own
 rail with the statement-v3 parameter resolver needed for exact native-option
-validation. PostgreSQL binary formats, COPY, pipeline mode, and LISTEN/NOTIFY
+validation. `Delivery` is therefore a post-release D13 addition, not part of the
+initial D1--D12 option inventory. PostgreSQL binary formats, COPY, pipeline mode, and LISTEN/NOTIFY
 remain later independent rails rather than enlarging any of those PRs. Until the
 COPY rail exists, any COPY status observed by streamed rows clears its current
 result and immediately poisons/closes the connection; it is never sent through a

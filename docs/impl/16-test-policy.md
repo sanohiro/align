@@ -204,7 +204,13 @@ Those owners assert one current-result clear and physical close, zero subsequent
 result/COPY/cancel/transaction-state/blocking-restore calls, first-error retention,
 balanced package-owner cleanup, and no reuse. Direct construction also retains a
 pairwise phase-order owner with context allocation/free, lease, binder, and libpq
-counters for live-state, generated-static-validation, and overlap failures.
+counters for live-state, generated-static-validation, and overlap failures. Its
+option matrix checks Query payload-before-duplicate with both invalid orderings
+and a valid duplicate, plus command tag rejection and the separate initial versus
+post-release surface inventories. Its `one_native` region owner records zero
+caller-region allocation before a valid first Row and the exact same one-clone
+byte/alignment delta for singleton success, Cardinality, and every later error;
+no case rewinds the arena or clones a second Row.
 
 ## Benchmarks are not tests
 

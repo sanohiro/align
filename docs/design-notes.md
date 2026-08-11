@@ -323,6 +323,13 @@ formation rail because its statement state must retain the producer parameter-na
 Binary wire formats remain a separate rail because they change bind/decode representation rather
 than result delivery lifetime.
 
+**A caller-supplied arena is monotonic across a late error.** `one_native` must clone a validated
+first Row before mutating the rows generation to probe multiplicity. That copy is visible through
+the required `out` argument and happens exactly once. If Cardinality 2 or a later protocol,
+deadline, COPY, or cleanup error wins, no Row is returned, but those exact first-Row clone bytes stay
+allocated until the caller's arena scope ends. The package neither hides a scratch arena nor
+pretends it can rewind caller storage; zero rows and an invalid first Row allocate nothing in `out`.
+
 **A row error does not silently choose transaction effects.** A streamed validation, decode, or
 batch-storage error is already the primary caller-visible failure, but libpq may still own an
 effectful `RETURNING` protocol. Align destroys unpublished values and drains without further decode

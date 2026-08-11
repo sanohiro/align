@@ -56,8 +56,12 @@ generic result drain, COPY operation, cancel, transaction probe, or blocking
 restore afterward. It also restores direct execution's settled phase order:
 live state, context-backed generated static validation, lease, then bind/native
 work. Neither correction forms an independently useful prerequisite, so the
-three-PR boundary remains unchanged. The exact boundary and public contract are
-in
+three-PR boundary remains unchanged. The following consistency review found no
+new P1: `one_native` now states that a first-Row `clone_in(out)` remains allocated
+on Cardinality or any later error because caller arenas are monotonic; Query
+Delivery follows §13.4 payload-before-duplicate order; and Delivery is listed as
+post-release D13 rather than in the initial D1--D12 inventory. The exact boundary
+and public contract are in
 `docs/impl/pkg-design/db.md` §23; binary formats remain the following rail.
 
 Out-of-gate suite status (suites outside the bounded CI gate; a nightly
