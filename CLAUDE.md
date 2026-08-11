@@ -298,6 +298,14 @@ rebase invalidates the stamp and requires a rerun. Push and open/update the PR
 as one uninterrupted step — three recent Preflight CI failures were stamps
 belonging to a different SHA, each costing a full round-trip.
 
+**Every base binding is the merge base, never the base branch tip.**
+`scripts/pre-pr.sh`, `scripts/review-bounded.sh`, `scripts/new-review-log.sh`,
+`scripts/open-pr.sh`, and the CI attestation checker all resolve the base as
+`git merge-base HEAD origin/main` — the basis of the `origin/main...HEAD` diff
+they already review and classify. Another PR landing on main therefore leaves
+an open PR's review log, stamp, and body attestation valid; only a change to
+the branch itself (a rebase, an amend, or merging main in) invalidates them.
+
 **Recurred finding classes are closed by machinery, not prose.** When
 `.claude/skills/align-self-review/FINDINGS.md` reaches its two-event threshold
 the class becomes an explicit checklist question; at three events it must get a
@@ -482,7 +490,8 @@ inspection, and verification is selected separately.
 
 `scripts/new-review-log.sh [--base REF] [OUTPUT_PATH]` scaffolds a review-log
 file: it writes the required `ALIGN_REVIEW_HEAD` (current `HEAD`) and
-`ALIGN_REVIEW_BASE` (`--base`'s tip, default `origin/main`) keys, a template
+`ALIGN_REVIEW_BASE` (`git merge-base HEAD <--base>`, default base
+`origin/main`) keys, a template
 body, and a trailing `ALIGN_REVIEW_VERDICT=FINDINGS` line, then prints both
 matching `scripts/pre-pr.sh` invocations — the CLEAN form and the
 `--findings-fixed` form for after a later fix commit. It refuses to overwrite

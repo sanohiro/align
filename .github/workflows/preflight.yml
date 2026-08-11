@@ -18,6 +18,9 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          # Full history, not a shallow clone: the attestation binds the merge
+          # base of the PR head and the base branch, and `git merge-base` needs
+          # both sides' history to compute it.
           fetch-depth: 0
 
       - name: Verify pre-PR gate belongs to current HEAD and base
@@ -45,5 +48,19 @@ jobs:
             echo "trusted base has no preflight checker" >&2
             exit 1
           fi
+          # The attestation binds the branch's merge base with the base branch,
+          # not the base branch tip. `github.event.pull_request.base.sha` is the
+          # tip and moves every time another PR lands on main, so resolve the
+          # merge base here and hand the checker the value the stamp actually
+          # records. The trusted-base checker normalizes this again, which is a
+          # no-op for a merge base; passing it explicitly also keeps the
+          # previous trusted-base checker — the one judging the PR that
+          # introduces this binding — comparing against the right SHA.
+          if ! MERGE_BASE_SHA="$(git merge-base "$PR_HEAD_SHA" "$PR_BASE_SHA")"; then
+            echo "cannot compute the merge base of $PR_HEAD_SHA and $PR_BASE_SHA" >&2
+            echo "  (this job needs the checkout above to keep fetch-depth: 0)" >&2
+            exit 1
+          fi
+          echo "attestation base: merge-base($PR_HEAD_SHA, $PR_BASE_SHA) = $MERGE_BASE_SHA"
           "$RUNNER_TEMP/check-pr-preflight.sh" \
-            "$PR_HEAD_SHA" "$PR_BASE_REF" "$PR_BASE_SHA" "$RUNNER_TEMP/pr-body.txt"
+            "$PR_HEAD_SHA" "$PR_BASE_REF" "$MERGE_BASE_SHA" "$RUNNER_TEMP/pr-body.txt"

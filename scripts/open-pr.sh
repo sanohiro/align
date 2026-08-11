@@ -69,8 +69,15 @@ case "$review_state" in
     ;;
   *) echo "invalid review state in preflight stamp" >&2; exit 1 ;;
 esac
-[[ "$(git rev-parse --verify "${base_ref}^{commit}")" == "$base_sha" ]] || {
-  echo "preflight base moved; rerun scripts/pre-pr.sh" >&2
+# The stamp records the branch's merge base with the base branch, so recompute
+# that same merge base rather than comparing against the base branch tip. An
+# unrelated PR merging into main between scripts/pre-pr.sh and this call leaves
+# the merge base — and therefore the attested diff — unchanged; only a rebase,
+# an amend, or a merge of main into the branch moves it.
+base_tip="$(git rev-parse --verify "${base_ref}^{commit}")"
+current_merge_base="$(git merge-base HEAD "$base_tip" 2>/dev/null || true)"
+[[ "$current_merge_base" == "$base_sha" ]] || {
+  echo "the branch's merge base with $base_ref moved; rerun scripts/pre-pr.sh" >&2
   exit 1
 }
 
@@ -82,17 +89,37 @@ if [[ -n "$update_pr" ]]; then
   pr_meta="$(gh pr view "$update_pr" --json headRefOid,baseRefName,baseRefOid \
     --jq '[.headRefOid, .baseRefName, .baseRefOid] | @tsv')"
   IFS=$'\t' read -r pr_head pr_base pr_base_sha <<<"$pr_meta"
-  [[ "$pr_head" == "$head_sha" && "$pr_base_sha" == "$base_sha" ]] || {
-    echo "PR head or base does not match the preflight stamp" >&2
+  # baseRefOid is the base branch's CURRENT tip, which legitimately advances
+  # while a PR is open. Require the same base branch, then prove the merge base
+  # against that tip whenever the object is present locally; when it is not
+  # (main advanced remotely and this clone has not fetched it), the local
+  # merge-base check above already bound the same branch.
+  [[ "$pr_head" == "$head_sha" ]] || {
+    echo "PR head does not match the preflight stamp" >&2
     exit 1
   }
+  case "$base_ref" in
+    "$pr_base" | "origin/$pr_base") ;;
+    *)
+      echo "PR base branch $pr_base does not match the preflight base $base_ref" >&2
+      exit 1
+      ;;
+  esac
+  if git rev-parse --verify --quiet "${pr_base_sha}^{commit}" >/dev/null 2>&1; then
+    [[ "$(git merge-base "$head_sha" "$pr_base_sha" 2>/dev/null || true)" == "$base_sha" ]] || {
+      echo "PR base does not share the preflight merge base" >&2
+      exit 1
+    }
+  fi
   base="$pr_base"
   gh pr view "$update_pr" --json body --jq '.body // ""' >"$tmp_old"
 else
   requested_ref="$base"
   git rev-parse --verify --quiet "refs/remotes/origin/${base}^{commit}" >/dev/null && requested_ref="origin/$base"
-  [[ "$(git rev-parse --verify "${requested_ref}^{commit}")" == "$base_sha" ]] || {
-    echo "requested PR base does not match the preflight base" >&2
+  requested_tip="$(git rev-parse --verify "${requested_ref}^{commit}")"
+  requested_merge_base="$(git merge-base HEAD "$requested_tip" 2>/dev/null || true)"
+  [[ "$requested_merge_base" == "$base_sha" ]] || {
+    echo "requested PR base does not share the preflight merge base" >&2
     exit 1
   }
   cp "$body_file" "$tmp_old"

@@ -114,7 +114,16 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 head_sha="$(git rev-parse HEAD)"
-base_sha="$(git rev-parse "${base}^{commit}")"
+# Bind the review to the merge base of HEAD and the base branch, matching
+# scripts/pre-pr.sh's ALIGN_REVIEW_BASE check. Recording the base branch tip
+# would orphan this log the moment an unrelated PR merges into main, even
+# though the reviewed `base...HEAD` diff is unchanged.
+base_tip="$(git rev-parse "${base}^{commit}")"
+base_sha="$(git merge-base HEAD "$base_tip" 2>/dev/null || true)"
+[[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "cannot compute the merge base of HEAD and $base" >&2
+  exit 1
+}
 prompt="Review git diff ${base_sha}...${head_sha} for soundness and regression risks. Inspect only: do not modify files and do not run cargo, tests, builds, benchmarks, or network commands. Use read-only git/rg/sed inspection as needed. Report actionable findings first. End with exactly one line: ALIGN_REVIEW_VERDICT=CLEAN when there are no actionable findings, or ALIGN_REVIEW_VERDICT=FINDINGS when there are any."
 {
   printf 'ALIGN_REVIEW_KIND=HOST\n'

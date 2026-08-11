@@ -10,8 +10,25 @@ cleanup() {
 }
 trap cleanup EXIT
 
-good_sha="0123456789abcdef0123456789abcdef01234567"
-base_sha="1111111111111111111111111111111111111111"
+# scripts/check-pr-preflight.sh resolves the merge base of the HEAD and base it
+# is handed, so its arguments must be real commits in the repository it runs in.
+# The ambient checkout cannot supply them — CI checks PRs out shallow and
+# detached with no local main — so body-shape assertions run against this
+# self-contained fixture instead.
+attest_repo="$tmp_dir/attest-repo"
+mkdir -p "$attest_repo"
+git -C "$attest_repo" init -q -b main
+git -C "$attest_repo" config user.name workflow-test
+git -C "$attest_repo" config user.email workflow-test@example.invalid
+git -C "$attest_repo" config commit.gpgsign false
+printf '# baseline\n' >"$attest_repo/note.md"
+git -C "$attest_repo" add note.md
+git -C "$attest_repo" commit -qm baseline
+base_sha="$(git -C "$attest_repo" rev-parse HEAD)"
+git -C "$attest_repo" switch -qc attested
+printf '\nupdated\n' >>"$attest_repo/note.md"
+git -C "$attest_repo" commit -qam 'docs: update the note'
+good_sha="$(git -C "$attest_repo" rev-parse HEAD)"
 base_ref="main"
 good_body="$tmp_dir/good-body"
 docs_body="$tmp_dir/docs-body"
@@ -39,17 +56,26 @@ sed 's/align-preflight-reviewer:docs-only/align-preflight-reviewer:reviewer-1/' 
   "$docs_body" >"$bad_docs_body"
 sed "s/$good_sha/ffffffffffffffffffffffffffffffffffffffff/" "$good_body" >"$stale_body"
 
-"$repo_root/scripts/check-pr-preflight.sh" "$good_sha" "$base_ref" "$base_sha" "$good_body"
-if "$repo_root/scripts/check-pr-preflight.sh" \
-  "$good_sha" "$base_ref" "$base_sha" "$bad_docs_body" >/dev/null 2>&1
+(cd "$attest_repo" && "$repo_root/scripts/check-pr-preflight.sh" \
+  "$good_sha" "$base_ref" "$base_sha" "$good_body")
+if (cd "$attest_repo" && "$repo_root/scripts/check-pr-preflight.sh" \
+  "$good_sha" "$base_ref" "$base_sha" "$bad_docs_body" >/dev/null 2>&1)
 then
   echo "docs-only attestation with a reviewer unexpectedly passed" >&2
   exit 1
 fi
-if "$repo_root/scripts/check-pr-preflight.sh" \
-  "$good_sha" "$base_ref" "$base_sha" "$stale_body" >/dev/null 2>&1
+if (cd "$attest_repo" && "$repo_root/scripts/check-pr-preflight.sh" \
+  "$good_sha" "$base_ref" "$base_sha" "$stale_body" >/dev/null 2>&1)
 then
   echo "stale preflight unexpectedly passed" >&2
+  exit 1
+fi
+# An unresolvable base fails closed rather than skipping the merge-base check.
+if (cd "$attest_repo" && "$repo_root/scripts/check-pr-preflight.sh" \
+  "$good_sha" "$base_ref" "1111111111111111111111111111111111111111" \
+  "$good_body" >/dev/null 2>&1)
+then
+  echo "an attestation against an unknown base unexpectedly passed" >&2
   exit 1
 fi
 
@@ -684,8 +710,8 @@ tooling_body="$tmp_dir/tooling-body"
 } >"$tooling_body"
 sed 's/align-preflight-reviewer:tooling/align-preflight-reviewer:reviewer-1/' \
   "$tooling_body" >"$tmp_dir/bad-tooling-body"
-if "$repo_root/scripts/check-pr-preflight.sh" \
-  "$good_sha" "$base_ref" "$base_sha" "$tmp_dir/bad-tooling-body" >/dev/null 2>&1
+if (cd "$attest_repo" && "$repo_root/scripts/check-pr-preflight.sh" \
+  "$good_sha" "$base_ref" "$base_sha" "$tmp_dir/bad-tooling-body" >/dev/null 2>&1)
 then
   echo "tooling attestation with a named reviewer unexpectedly passed" >&2
   exit 1
@@ -724,6 +750,163 @@ fi
   "$repo_root/scripts/check-pr-preflight.sh" \
     "$tooling_claim_head" main "$claim_base" "$ok_body" >/dev/null
 )
+
+# Every base binding is the branch's merge base with the base branch, never the
+# base branch tip. Both directions matter: an unrelated PR landing on main must
+# leave the review log, the stamp, the PR-body marker, and the CI recomputation
+# valid (the tip binding forced a rebase and a full CI rerun on every such
+# merge), while a change to the branch itself must still invalidate all of them.
+advance_repo="$tmp_dir/advance-repo"
+mkdir -p "$advance_repo"
+git -C "$advance_repo" init -q -b main
+git -C "$advance_repo" config user.name workflow-test
+git -C "$advance_repo" config user.email workflow-test@example.invalid
+git -C "$advance_repo" config commit.gpgsign false
+printf '# baseline\n' >"$advance_repo/README.md"
+git -C "$advance_repo" add README.md
+git -C "$advance_repo" commit -qm baseline
+fork_sha="$(git -C "$advance_repo" rev-parse HEAD)"
+git -C "$advance_repo" switch -qc feature
+# An unknown top-level path is library tier without being a Rust build input, so
+# this exercises the full review-log binding without reaching the cargo gate.
+printf 'tool\n' >"$advance_repo/tool.txt"
+git -C "$advance_repo" add tool.txt
+git -C "$advance_repo" commit -qm 'feat: add a tool'
+advance_head="$(git -C "$advance_repo" rev-parse HEAD)"
+# Meanwhile another PR merges into main.
+git -C "$advance_repo" switch -q main
+printf 'unrelated\n' >"$advance_repo/other.txt"
+git -C "$advance_repo" add other.txt
+git -C "$advance_repo" commit -qm 'feat: unrelated main change'
+main_tip="$(git -C "$advance_repo" rev-parse main)"
+git -C "$advance_repo" switch -q feature
+
+advance_log="$tmp_dir/advance-review.log"
+(cd "$advance_repo" && "$repo_root/scripts/new-review-log.sh" --base main "$advance_log" >/dev/null)
+grep -Fqx "ALIGN_REVIEW_BASE=$fork_sha" "$advance_log" || {
+  echo "new-review-log.sh bound the base branch tip instead of the merge base" >&2
+  exit 1
+}
+advance_args="$tmp_dir/advance-codex-args"
+(cd "$advance_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=clean \
+  FAKE_CODEX_ARGS_FILE="$advance_args" ALIGN_REVIEW_STALL_SECONDS=5 \
+  ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
+  "$repo_root/scripts/review-bounded.sh" --base main) >/dev/null
+grep -Fq "git diff $fork_sha...$advance_head" "$advance_args" || {
+  echo "review-bounded.sh bound the base branch tip instead of the merge base" >&2
+  exit 1
+}
+advance_clean_log="$tmp_dir/advance-review-clean.log"
+sed 's/^ALIGN_REVIEW_VERDICT=FINDINGS$/ALIGN_REVIEW_VERDICT=CLEAN/' "$advance_log" \
+  >"$advance_clean_log"
+(
+  cd "$advance_repo"
+  "$repo_root/scripts/pre-pr.sh" --reviewer reviewer-1 --review-log "$advance_clean_log" \
+    --base main --owner-test advance -- true >/dev/null
+)
+advance_stamp="$advance_repo/.git/align-preflight/$advance_head"
+grep -Fqx "base_sha=$fork_sha" "$advance_stamp" || {
+  echo "pre-pr.sh recorded the base branch tip instead of the merge base" >&2
+  exit 1
+}
+grep -Fqx 'kind=code' "$advance_stamp"
+
+advance_body="$tmp_dir/advance-body"
+{
+  printf '<!-- align-preflight-version:1 -->\n'
+  printf '<!-- align-preflight-head:%s -->\n' "$advance_head"
+  printf '<!-- align-preflight-base-ref:main -->\n'
+  printf '<!-- align-preflight-base-sha:%s -->\n' "$fork_sha"
+  printf '<!-- align-preflight-review:clean -->\n'
+  printf '<!-- align-preflight-review-head:%s -->\n' "$advance_head"
+  printf '<!-- align-preflight-reviewer:reviewer-1 -->\n'
+} >"$advance_body"
+# CI hands the checker github.event.pull_request.base.sha, which is the ADVANCED
+# tip; the checker must normalize it to the merge base the body records.
+(cd "$advance_repo" && "$repo_root/scripts/check-pr-preflight.sh" \
+  "$advance_head" main "$main_tip" "$advance_body" >/dev/null)
+# preflight.yml now resolves the merge base itself; passing it is idempotent.
+(cd "$advance_repo" && "$repo_root/scripts/check-pr-preflight.sh" \
+  "$advance_head" main "$fork_sha" "$advance_body" >/dev/null)
+
+advance_remote="$tmp_dir/advance-remote.git"
+git init -q --bare "$advance_remote"
+git -C "$advance_repo" remote add origin "$advance_remote"
+git -C "$advance_repo" push -qu origin feature
+# Local main is already ahead of the fork point here, which is exactly what used
+# to abort open-pr.sh with "preflight base moved".
+(
+  cd "$advance_repo"
+  PATH="$fake_bin:$PATH" FAKE_PR_HEAD="$advance_head" FAKE_PR_BASE="$main_tip" \
+    FAKE_PR_BODY="$advance_body" "$repo_root/scripts/open-pr.sh" --update 123 >/dev/null
+)
+
+# The other direction: changing the branch moves its merge base, so everything
+# bound to the old one must stop applying.
+git -C "$advance_repo" merge -q --no-edit main
+merged_head="$(git -C "$advance_repo" rev-parse HEAD)"
+merged_err="$tmp_dir/advance-merged-err"
+merged_status=0
+(
+  cd "$advance_repo"
+  "$repo_root/scripts/pre-pr.sh" --reviewer reviewer-1 --review-log "$advance_clean_log" \
+    --base main --owner-test advance -- true >/dev/null 2>"$merged_err"
+) || merged_status=$?
+[[ "$merged_status" -ne 0 ]] || {
+  echo "a review log bound to the old merge base survived merging main in" >&2
+  exit 1
+}
+grep -q 'review log belongs to another base' "$merged_err" || {
+  echo "merging main in failed for the wrong reason:" >&2
+  cat "$merged_err" >&2
+  exit 1
+}
+merged_body="$tmp_dir/advance-merged-body"
+sed "s/$advance_head/$merged_head/g" "$advance_body" >"$merged_body"
+if (cd "$advance_repo" && "$repo_root/scripts/check-pr-preflight.sh" \
+  "$merged_head" main "$main_tip" "$merged_body" >/dev/null 2>&1)
+then
+  echo "an attestation bound to the old merge base survived merging main in" >&2
+  exit 1
+fi
+
+# open-pr.sh must still refuse a genuinely moved merge base. Attest the merged
+# head, then let main absorb the branch: the merge base becomes HEAD itself.
+merged_log="$tmp_dir/advance-merged-review.log"
+(cd "$advance_repo" && "$repo_root/scripts/new-review-log.sh" --base main "$merged_log" >/dev/null)
+grep -Fqx "ALIGN_REVIEW_BASE=$main_tip" "$merged_log" || {
+  echo "the merge base did not follow the branch's merge of main" >&2
+  exit 1
+}
+merged_clean_log="$tmp_dir/advance-merged-clean.log"
+sed 's/^ALIGN_REVIEW_VERDICT=FINDINGS$/ALIGN_REVIEW_VERDICT=CLEAN/' "$merged_log" \
+  >"$merged_clean_log"
+(
+  cd "$advance_repo"
+  "$repo_root/scripts/pre-pr.sh" --reviewer reviewer-1 --review-log "$merged_clean_log" \
+    --base main --owner-test advance -- true >/dev/null
+)
+git -C "$advance_repo" push -q origin feature
+git -C "$advance_repo" switch -q main
+git -C "$advance_repo" merge -q --no-edit feature
+git -C "$advance_repo" switch -q feature
+moved_err="$tmp_dir/advance-moved-err"
+moved_status=0
+(
+  cd "$advance_repo"
+  PATH="$fake_bin:$PATH" FAKE_PR_HEAD="$merged_head" FAKE_PR_BASE="$main_tip" \
+    FAKE_PR_BODY="$merged_body" "$repo_root/scripts/open-pr.sh" --update 123 \
+    >/dev/null 2>"$moved_err"
+) || moved_status=$?
+[[ "$moved_status" -ne 0 ]] || {
+  echo "open-pr.sh accepted a stamp whose merge base had actually moved" >&2
+  exit 1
+}
+grep -q 'merge base with main moved' "$moved_err" || {
+  echo "open-pr.sh rejected the moved merge base for the wrong reason:" >&2
+  cat "$moved_err" >&2
+  exit 1
+}
 
 for script in \
   scripts/cargo.sh \

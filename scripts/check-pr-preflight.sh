@@ -12,6 +12,20 @@ base_sha="$3"
 body_file="$4"
 [[ "$head_sha" =~ ^[0-9a-f]{40}$ && "$base_sha" =~ ^[0-9a-f]{40}$ && -f "$body_file" ]] || exit 2
 
+# The attestation binds the branch's MERGE BASE with the base branch, not the
+# base branch tip: `github.event.pull_request.base.sha` moves whenever another
+# PR lands on main, which would otherwise invalidate a stamp for a branch whose
+# own content never changed. Normalize here so this trusted-base checker owns
+# the definition, whichever of the two the caller passed: the merge base of HEAD
+# and an ancestor merge base is that same merge base, so this is idempotent.
+# Fails closed — a base whose merge base cannot be computed is not attestable.
+merge_base="$(git merge-base "$head_sha" "$base_sha" 2>/dev/null || true)"
+[[ "$merge_base" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "cannot compute the merge base of $head_sha and $base_sha" >&2
+  exit 1
+}
+base_sha="$merge_base"
+
 required=(
   "<!-- align-preflight-version:1 -->"
   "<!-- align-preflight-head:$head_sha -->"

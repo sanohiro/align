@@ -14,7 +14,8 @@ usage() {
   cat >&2 <<'USAGE'
 usage: scripts/new-review-log.sh [--base REF] [OUTPUT_PATH]
 
---base REF   ref whose tip becomes ALIGN_REVIEW_BASE (default: origin/main).
+--base REF   ref whose MERGE BASE with HEAD becomes ALIGN_REVIEW_BASE
+             (default: origin/main), matching scripts/pre-pr.sh.
 OUTPUT_PATH  where to write the log (default: .git/align-review-<shortsha>.log).
              Refuses to overwrite an existing file at OUTPUT_PATH.
 USAGE
@@ -43,7 +44,15 @@ done
 git rev-parse --is-inside-work-tree >/dev/null
 
 head_sha="$(git rev-parse HEAD)"
-base_sha="$(git rev-parse "${base}^{commit}")"
+# The merge base, not the base branch tip: scripts/pre-pr.sh compares
+# ALIGN_REVIEW_BASE against `git merge-base HEAD <base>`, so that a PR landing
+# on main while this review runs does not orphan the log.
+base_tip="$(git rev-parse "${base}^{commit}")"
+base_sha="$(git merge-base HEAD "$base_tip" 2>/dev/null || true)"
+[[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "cannot compute the merge base of HEAD and $base" >&2
+  exit 1
+}
 short_sha="$(git rev-parse --short HEAD)"
 
 if [ -z "$output" ]; then
