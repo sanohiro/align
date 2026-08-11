@@ -348,10 +348,17 @@ COPY, pipeline, or an unknown numeric status once, immediately poisons/closes, p
 owned error or silent Drop, and then releases package owners. No later result drain, COPY operation,
 pipeline exit, cancel, transaction probe, or blocking restoration runs on that connection.
 Supporting libpq 17 or newer does not mean assuming a future status is drainable.
-The separate Rust migration executor is part of the same consumer audit. Because it sends complete
-user SQL through synchronous `PQexec` but owns no COPY exchange, canonical PostgreSQL migration
-screening rejects a top-level first-token `COPY` before URL access, target open, or native work.
-Preparation uses `PQprepare`/`PQdescribePrepared` and does not execute COPY; other tool SQL is fixed.
+The separate Rust prepare and migration executors are part of the same consumer audit. One private
+Rust classifier exhaustively identifies the complete libpq 17 numeric status set before a tool
+reads result rows or issues follow-up SQL; this pure classification loads no new symbol and does not
+raise the current client floor. A null result, COPY status, partial single/chunk row result, pipeline status,
+or unknown numeric status copies the available diagnostic, clears the current result when present,
+immediately finishes and nulls the connection owner, and permits no rollback, deallocation, row
+access, or later libpq call. Known complete results retain their existing tool error mapping.
+Because migration sends complete user SQL through synchronous `PQexec` but owns no COPY exchange,
+canonical PostgreSQL migration screening also rejects a top-level first-token `COPY` before URL
+access, target open, or native work. Preparation uses `PQprepare`/`PQdescribePrepared` and does not
+execute COPY; other tool SQL is fixed, but neither fact substitutes for fail-closed status handling.
 
 **Context-backed static validation stays in the settled execution phase.** The generated
 static-option validator needs an execution context, while overlap is deliberately checked only

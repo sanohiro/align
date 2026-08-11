@@ -196,13 +196,22 @@ transaction, catalog/EXPLAIN, and silent-cleanup PGresult consumer. It requires
 one current-result clear, physical close, zero subsequent
 result/COPY/pipeline-exit/cancel/transaction-state/blocking-restore calls, correct first-error
 or silent-Drop behavior, balanced owners/lease, and no reuse.
+The Rust tool half uses one parameterized
+`postgres_tool_results_fail_closed_before_followup_native_work` owner. It crosses migration
+command/query and preparation command/query/prepare/describe consumers with null, all COPY,
+`PGRES_SINGLE_TUPLE`, `PGRES_TUPLES_CHUNK`, both pipeline, and unknown numeric results. A non-null
+result is cleared once, the connection is finished once and nulled before return, the first copied
+diagnostic remains primary, and row access, rollback, deallocation, result retrieval, and every
+later libpq call remain zero. Expected success and known complete error controls preserve their
+current mapping and cleanup.
 The same prerequisite retains Q5a's canonical PostgreSQL statement-screening owner. It crosses
 Required/Forbidden top-level COPY, lowercase and comment-leading spelling, COPY after an ordinary
 statement, quoted/comment/dollar-body near-misses, transaction-control and Forbidden-count
 precedence, and unchanged SQLite behavior. Every rejected case proves zero URL-environment reads,
 target opens, locks, history publication, connection opens, and libpq calls. A checked inventory
 records that prepare uses `PQprepare`/`PQdescribePrepared`, migration is the only compiler-side path
-that sends complete user SQL through `PQexec`, and all remaining tool SQL is fixed.
+that sends complete user SQL through `PQexec`, and all remaining tool SQL is fixed; that inventory
+does not weaken the Rust tool fail-closed matrix above.
 
 The direct-delivery suite crosses validation/decode/storage failure with no
 timeout, time remaining, and deadline expiry on both connection and transaction

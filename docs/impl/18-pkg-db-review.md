@@ -541,10 +541,11 @@ idea is rejected.
   reopened closure matrix first lands independently mergeable PostgreSQL catalog/EXPLAIN lease and
   shipped-result-status safety prerequisites. The latter audits every current PGresult consumer and
   closes on COPY, pipeline, or an unknown numeric status without another protocol or pipeline-exit
-  call. The same prerequisite audits Rust tool consumers and rejects top-level PostgreSQL migration
-  COPY during canonical statement screening before URL/native work; prepare cannot execute COPY and
-  other tool SQL is fixed. Direct delivery follows
-  with normal-drain cardinality, exact BufferedFull default preservation, and a post-nonblocking
+  call. The same prerequisite routes every Rust prepare/migration result consumer through one
+  private exhaustive classifier; null, COPY, partial row-mode, pipeline, and unknown results close
+  and null the connection before rollback, deallocation, row access, or later libpq. It also rejects
+  top-level PostgreSQL migration COPY during canonical screening before URL/native work. Direct
+  delivery follows with normal-drain cardinality, exact BufferedFull default preservation, and a post-nonblocking
   pre-send deadline check; prepared parity then retains parameter-name authority in statement v3. Binary
   formats and other native paths remain separate. Because COPY termination and pipeline exit are not
   in this rail, observing a COPY, pipeline, or unknown status clears only that result and immediately

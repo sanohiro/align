@@ -64,10 +64,12 @@ recorded by `pkg-design/db.md` §23. It retains SQLite `Step` and PostgreSQL
 application-package-surface/ABI-neutral prerequisites close shipped PostgreSQL
 correctness gaps. The first gives catalog/EXPLAIN the execution lease; the second makes every existing
 PGresult consumer clear and close on COPY, pipeline, or an unknown numeric status
-without another protocol or pipeline-exit call. It also inventories the Rust tool
-consumers and rejects top-level PostgreSQL migration COPY during canonical
-statement screening before URL access or native work. The following independently
-useful rail is the exact PostgreSQL `SingleRow` / `PortalBatch` direct delivery
+without another protocol or pipeline-exit call. It also routes every Rust tool
+result consumer through one exhaustive private classifier: null, COPY, partial
+row-mode, pipeline, and unknown results close and null the connection before any
+rollback, deallocation, row access, or later libpq call. Canonical screening rejects
+top-level PostgreSQL migration COPY before URL access or native work. The following
+independently useful rail is the exact PostgreSQL `SingleRow` / `PortalBatch` direct delivery
 contract recorded by the adjacent A1 ledger. Prepared parity follows in its own
 rail with the statement-v3 parameter resolver needed for exact native-option
 validation. `Delivery` is therefore a post-release D13 addition, not part of the

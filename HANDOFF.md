@@ -45,9 +45,13 @@ application-package-surface/ABI-neutral prerequisite then makes every shipped
 PostgreSQL PGresult consumer fail closed on COPY, pipeline, and unknown numeric statuses; current
 synchronous and timeout paths can already observe a result that requires an
 unsupported protocol transition and must not release that connection for reuse.
-The same prerequisite audits Rust tool PGresult consumers and rejects every
-top-level PostgreSQL migration `COPY` during canonical statement screening,
-before URL access, target open, lock, history publication, or libpq.
+The same prerequisite routes every Rust tool PGresult consumer through one
+private status classifier. A null result, COPY, partial row-mode result, pipeline
+status, or unknown numeric status clears the current result when present,
+closes and nulls the connection owner, and permits no rollback, deallocation,
+row access, or later libpq call. Canonical screening separately rejects every
+top-level PostgreSQL migration `COPY` before URL access, target open, lock,
+history publication, or libpq.
 The independently useful PostgreSQL `SingleRow` / `PortalBatch` direct delivery
 rail follows; prepared parity is a fourth PR because it must
 retain parameter-name authority in statement v3. Cardinality drains to clean
@@ -80,6 +84,11 @@ status prerequisite now adds pre-native PostgreSQL migration COPY rejection and
 a complete prepare/migration SQL-origin inventory. The four implementation PR
 boundaries and exact public contract are in
 `docs/impl/pkg-design/db.md` §23; binary formats remain the following rail.
+The following review found that an inventory alone did not protect the Rust
+tools from null or unexpected deferred results before rollback/deallocation.
+The prerequisite now gives every tool result consumer the same fail-closed
+postcondition and a parameterized synthetic-status owner; this remains a P2
+closure inside the existing status PR, not another matrix reopen or PR split.
 
 Out-of-gate suite status (suites outside the bounded CI gate; a nightly
 full-suite workflow now runs them daily so this class cannot rot silently):
@@ -140,7 +149,7 @@ Q5 schema tooling/inspection     complete through D11 + D12
 Q6 compound product closure      complete through D10
 A1 common batch/SoA rail         complete through #740 / D13
 A1 PostgreSQL lease prerequisite next / catalog + EXPLAIN overlap closure / D13
-then: A1 PostgreSQL status       package fail-close + migration COPY preflight / D13
+then: A1 PostgreSQL status       package/tool fail-close + migration COPY preflight / D13
 then: A1 PostgreSQL direct       SingleRow + PortalBatch / D13
 then: A1 PostgreSQL prepared     streamed parity + stmt v3 resolver / D13
 ```

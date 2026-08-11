@@ -63,6 +63,15 @@ first-token COPY before URL access, target open, lock, history publication, or l
 cannot execute COPY through `PQprepare`; all remaining tool SQL is fixed producer-owned text. This
 closes the tooling path without changing the four implementation boundaries.
 
+The next review found one P2 in the same tool closure. Merely inventorying prepare/migration SQL
+origins left their PGresult decoders free to clear an unknown or deferred status and then issue
+`ROLLBACK`, `DEALLOCATE`, or another query. The status prerequisite now adds one private exhaustive
+Rust tool classifier and routes every prepare/migration result consumer through it. Null results,
+COPY, partial single/chunk rows, pipeline statuses, and unknown numeric statuses close and null the
+connection owner before return; later row access and every follow-up libpq call are forbidden. One
+parameterized synthetic-result owner fixes current-clear, close, first-error, and no-follow-up-call
+behavior. This P2 closes inside the same prerequisite without reopening the matrix or adding a PR.
+
 ## 2026-08-07: shared borrow accepts stable Copy storage
 
 Shared `borrow` now accepts a stable bound Copy or Move place. Copy values still pass by value by
