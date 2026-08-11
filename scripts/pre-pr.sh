@@ -95,35 +95,41 @@ while IFS= read -r path; do
   case "$path" in *.sh) [[ ! -f "$path" ]] || bash -n "$path" ;; esac
 done < <(git diff --no-renames --name-only "$base_sha"...HEAD)
 
-# Review-round tripwire. Every `fix` commit after the implementation is a
-# review round; three of them means the review has become the discovery loop
-# for one root-cause class, which CLAUDE.md requires closing by re-opening the
+# Review-round tripwire. The first commit in base..HEAD is always the
+# implementation, uncounted regardless of its subject — a branch whose every
+# commit happens to be fix-titled still has that first commit excluded, so it
+# cannot dodge the tripwire by simply never having a non-fix commit at all.
+# Every commit after that whose subject is fix-titled is a review round;
+# three of them means the review has become the discovery loop for one
+# root-cause class, which CLAUDE.md requires closing by re-opening the
 # closure matrix instead of patching the next reported cell. The count spans
-# the whole base..HEAD range once the implementation (the first non-fix
-# commit) has been seen — an interleaved non-fix commit (a docs tweak, a
-# rename) does not reset it, since the discovery-loop pattern is about how
-# many fix rounds a root cause absorbed in total, not whether they happened to
-# stay consecutive. Releasing the gate takes a deliberate, auditable act: a
-# commit anywhere in the counted set that both changes an authoritative
-# docs/impl plan or audit (not a translated mirror) and records a
-# `Closure-Matrix-Reopened:` trailer naming the axis. Renaming a commit away
-# from `fix` also silences the counter — that is a visible choice in the
-# history, not a hidden one.
+# the whole range and an interleaved non-fix commit (a docs tweak, a rename)
+# never resets it: the discovery-loop pattern is about how many fix rounds a
+# root cause absorbed in total, not whether they happened to stay
+# consecutive. Titling a review-round commit outside the `fix` prefix
+# excludes only that one commit from the count — it does not reset any other
+# counted commit — and an author who never uses `fix` for a review round
+# escapes the tripwire entirely; both are visible, auditable choices in the
+# history, not hidden ones. Releasing the gate takes a separate deliberate
+# act: ANY commit after the implementation (fix-titled or not) that both
+# changes an authoritative docs/impl plan or audit (not a translated mirror)
+# and records a `Closure-Matrix-Reopened:` trailer naming the axis.
 review_streak=()
+post_implementation_commits=()
 seen_implementation=false
 while IFS= read -r entry; do
+  if [[ "$seen_implementation" == false ]]; then
+    seen_implementation=true
+    continue
+  fi
+  post_implementation_commits+=("${entry%% *}")
   case "${entry#* }" in
-    fix*|Fix*)
-      if [[ "$seen_implementation" == true ]]; then
-        review_streak+=("${entry%% *}")
-      fi
-      ;;
-    *) seen_implementation=true ;;
+    fix*|Fix*) review_streak+=("${entry%% *}") ;;
   esac
 done < <(git log --reverse --format='%H %s' "$base_sha"..HEAD)
 if [[ "$docs_only" == false && "${#review_streak[@]}" -ge 3 ]]; then
   matrix_reopened=false
-  for commit in "${review_streak[@]}"; do
+  for commit in "${post_implementation_commits[@]}"; do
     git log -1 --format='%B' "$commit" | grep -q '^Closure-Matrix-Reopened:' || continue
     while IFS= read -r path; do
       case "$path" in
@@ -135,7 +141,7 @@ if [[ "$docs_only" == false && "${#review_streak[@]}" -ge 3 ]]; then
     done < <(git show --no-renames --name-only --format= "$commit")
   done
   [[ "$matrix_reopened" == true ]] || {
-    echo "preflight: ${#review_streak[@]} consecutive review-fix commits without re-opening a closure matrix" >&2
+    echo "preflight: ${#review_streak[@]} post-implementation review-fix commits without re-opening a closure matrix" >&2
     echo "  Repeatedly patching individually reported cells means the matrix missed an axis." >&2
     echo "  Enumerate that axis in the owning docs/impl plan, audit, or CLAUDE.md, fix the class" >&2
     echo "  in one pass," >&2
@@ -222,10 +228,22 @@ else
       ;;
   esac
 fi
-[[ "$docs_only" == false || "$non_documentation_changed" == false ]] || {
-  echo "--docs-only requires Markdown/documentation changes only" >&2
-  exit 1
-}
+if [[ "$docs_only" == true ]]; then
+  [[ "$non_documentation_changed" == false ]] || {
+    echo "--docs-only requires Markdown/documentation changes only" >&2
+    exit 1
+  }
+  # The per-path *.md check alone misses two things the shared classifier
+  # already knows: a compiled-prose document (PR_TIER_COMPILED_PROSE, e.g.
+  # docs/impl/pkg-design/web.md) is a source input to a test binary despite
+  # its extension, and any deletion is library tier regardless of path shape.
+  # Require its full verdict too, so a --docs-only PR that would fail CI's
+  # recomputed tier cannot pass here first.
+  [[ "$library_changed" == false ]] || {
+    echo "--docs-only requires Markdown/documentation changes only (scripts/pr-tier.sh still classifies this diff as library tier — a compiled-prose path or a deletion)" >&2
+    exit 1
+  }
+fi
 
 git diff --check "$base_sha"...HEAD
 if [[ "$docs_only" == false && $# -eq 0 ]]; then
@@ -247,13 +265,25 @@ if [[ "$library_changed" == true && "$rust_changed" == true ]]; then
   # running concurrently instead of paying their wall-clock cost twice.
   test_pr_log="$(mktemp)"
   clippy_log="$(mktemp)"
+  # Trap-based so the logs are removed on any exit from here on (success,
+  # gate failure, or an interrupted run), not only the two explicit paths
+  # below.
+  trap 'rm -f "$test_pr_log" "$clippy_log"' EXIT
+  echo "preflight: scripts/test-pr.sh log: $test_pr_log" >&2
+  echo "preflight: Clippy log: $clippy_log" >&2
   scripts/test-pr.sh >"$test_pr_log" 2>&1 &
   test_pr_pid=$!
   # Clippy keeps its own target dir: clippy and build/test record incompatible
   # fingerprints in a shared dir, so alternating them forces a near-full
   # rebuild in both directions. A dedicated dir makes the warm clippy pass
-  # incremental and stops it from invalidating the test build cache.
-  CARGO_TARGET_DIR=target/clippy \
+  # incremental and stops it from invalidating the test build cache. Cap its
+  # job count so it does not fight scripts/test-pr.sh for every core on the
+  # same machine while both run concurrently.
+  ncpu="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
+  [[ "$ncpu" =~ ^[0-9]+$ && "$ncpu" -ge 1 ]] || ncpu=4
+  clippy_jobs=$(( ncpu / 2 ))
+  [[ "$clippy_jobs" -ge 1 ]] || clippy_jobs=1
+  CARGO_TARGET_DIR=target/clippy CARGO_BUILD_JOBS="$clippy_jobs" \
     scripts/cargo.sh clippy --workspace --lib --bins --locked -- -D warnings \
     >"$clippy_log" 2>&1 &
   clippy_pid=$!
@@ -266,12 +296,12 @@ if [[ "$library_changed" == true && "$rust_changed" == true ]]; then
     cat "$test_pr_log" >&2
     echo "--- Clippy output (exit $clippy_status) ---" >&2
     cat "$clippy_log" >&2
-    rm -f "$test_pr_log" "$clippy_log"
     echo "preflight: scripts/test-pr.sh exited $test_pr_status, Clippy exited $clippy_status" >&2
     exit 1
   fi
   cat "$test_pr_log"
   cat "$clippy_log"
+  trap - EXIT
   rm -f "$test_pr_log" "$clippy_log"
 fi
 [[ "$(git rev-parse HEAD)" == "$head_sha" && -z "$(git status --porcelain)" ]] || {

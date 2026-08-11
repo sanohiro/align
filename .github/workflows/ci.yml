@@ -147,6 +147,16 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      # Fast (no cargo) and needs nothing beyond the checkout, so it runs here
+      # rather than after the toolchain install: keeps the pr-tier.sh
+      # staleness pins (PR_TIER_GATE_TESTS, PR_TIER_COMPILED_PROSE) and the
+      # review-round/tier fixtures actually enforced instead of only ever
+      # running when someone remembers to run it locally.
+      - name: PR workflow self-test
+        if: matrix.lint
+        shell: bash
+        run: bash scripts/test-pr-workflow.sh
+
       - name: Install Rust
         shell: bash
         run: |
@@ -225,14 +235,6 @@ jobs:
           key: cargo-${{ runner.os }}-${{ runner.arch }}-lint${{ matrix.lint }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-${{ runner.os }}-${{ runner.arch }}-lint${{ matrix.lint }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-
-
-      # Fast (no cargo) so it runs on the lint job's critical path: keeps the
-      # pr-tier.sh staleness pins (PR_TIER_GATE_TESTS, PR_TIER_COMPILED_PROSE)
-      # and the review-round/tier fixtures actually enforced instead of only
-      # ever running when someone remembers to run it locally.
-      - name: PR workflow self-test
-        if: matrix.lint
-        run: bash scripts/test-pr-workflow.sh
 
       # Clippy keeps its own target dir exactly as scripts/pre-pr.sh does: clippy
       # and build/test record incompatible fingerprints, and sharing one dir

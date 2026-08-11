@@ -379,13 +379,20 @@ code       everything else                 one fresh review, owner check,
 ```
 
 A non-Markdown file under `docs/` (a fixture, a script, a generated asset) is
-not documentation for this classification; only `*.md` is. `scripts/pre-pr.sh`
-and `scripts/pr-tier.sh` share that exact definition.
+not documentation for this classification; only `*.md` is, and
+`scripts/pre-pr.sh`'s per-path check uses that same `*.md` predicate. A
+`--docs-only` PR additionally needs `scripts/pr-tier.sh`'s full classifier
+verdict (`library_changed == false`): the per-path check alone cannot see a
+compiled-prose document (`docs/impl/pkg-design/web.md`, a source input to a
+test binary despite its extension) or a deletion, both of which the shared
+classifier already treats as library tier. The two checks are equivalent in
+outcome for `--docs-only`, not merely duplicated pattern text.
 
-Machinery that CI fetches from the trusted base needs one explicit
-bootstrap arm in `preflight.yml` for the PR that introduces it, keyed on that
-PR number: the base has no copy yet, and falling back to the PR's own copy
-would let a change supply the rules that judge it.
+Machinery newly fetched from the trusted base needs a one-PR bootstrap arm in
+`preflight.yml`, keyed on that PR's number: the base has no copy yet, and
+falling back to the PR's own copy would let a change supply the rules that
+judge it. None are currently present — remove a bootstrap arm once its PR is
+merged, since the trusted-base path works unconditionally from then on.
 
 The classifier fails closed in every direction: an unknown path shape, an
 uncomputable diff, and any deletion are all code tier — removing a file takes
@@ -424,17 +431,6 @@ normal code path is exactly:
    Opening the PR does not invalidate or duplicate the pre-open review. Direct
    `gh pr create` is prohibited for agent-driven work.
 
-### Review log
-
-`scripts/new-review-log.sh [OUTPUT_PATH]` scaffolds a review-log file: it
-writes the required `ALIGN_REVIEW_HEAD` (current `HEAD`) and `ALIGN_REVIEW_BASE`
-(`origin/main`) keys, a template body, and a trailing `ALIGN_REVIEW_VERDICT=FINDINGS`
-line, then prints the matching `scripts/pre-pr.sh` invocation. `git status
---porcelain` never reports paths under `.git/`, so an untracked review log
-placed there does not fail `scripts/pre-pr.sh`'s clean-worktree check; the
-scaffolder defaults there (matching `scripts/review-bounded.sh`'s own default
-log location) and also accepts any path entirely outside the repository.
-
 A complete re-review is required only when the fix changes a public contract
 or strategy, changes an IR shape, materially crosses three or more compiler
 layers, or responds to a P1 by redesigning the implementation. A local
@@ -443,19 +439,27 @@ the original finding and its owner check. The user may explicitly request a
 second review.
 
 **The one-review/one-fix cycle is enforced, not merely stated.** Preflight
-counts the consecutive `fix` commits following the implementation on the
-branch; at three it fails unless one of them both changed an authoritative
-contract document — a `docs/impl` plan or audit for a compiler or package
-capability, or this file for the process machinery itself, with translated
-`ja/` mirrors excluded — and carried a `Closure-Matrix-Reopened: <axis>`
-trailer. Three rounds of patching
+treats the first commit in `base..HEAD` as the implementation, uncounted
+regardless of its own subject — a branch whose every commit happens to be
+fix-titled still has that first commit excluded, so it cannot dodge the
+tripwire by simply never having a non-fix commit at all. Every commit after
+that whose subject is fix-titled is a review round; at three, preflight fails
+unless some commit anywhere after the implementation — fix-titled or not —
+both changed an authoritative contract document — a `docs/impl` plan or audit
+for a compiler or package capability, or this file for the process machinery
+itself, with translated `ja/` mirrors excluded — and carried a
+`Closure-Matrix-Reopened: <axis>` trailer. The count spans the whole range and
+is never reset by an interleaved non-fix commit. Three rounds of patching
 individually reported cells is the signature of a matrix that missed an axis —
 the required response is to enumerate that axis, fix the class in one pass, and
 commit the updated matrix with that trailer. Measured cost of ignoring this:
 24–36 minutes per round, and the two capabilities that ran four and nine rounds
-spent 3.5 and 4.75 hours respectively inside the loop. Naming a commit outside
-the `fix` prefix also resets the counter; that is a visible choice in the
-history, and reviewers should read a renamed streak as the same smell.
+spent 3.5 and 4.75 hours respectively inside the loop. Titling a review-round
+commit outside the `fix` prefix excludes only that one commit from the count —
+it does not reset any other counted commit — and an author who never uses
+`fix` for a review round escapes the tripwire entirely; both are visible,
+auditable choices in the history, and reviewers should read either pattern as
+the same smell.
 
 Finish ordinary PR-body prose before opening. If a later code push is actually
 required, rerun preflight for the new SHA and refresh the existing PR with
@@ -473,6 +477,21 @@ unfinished scope. Do not treat the missing verdict as CLEAN, and do not restart
 the complete review solely because the invocation stopped. Review automation
 must not launch builds, tests, benchmarks, or network work; review is
 inspection, and verification is selected separately.
+
+### Review log
+
+`scripts/new-review-log.sh [--base REF] [OUTPUT_PATH]` scaffolds a review-log
+file: it writes the required `ALIGN_REVIEW_HEAD` (current `HEAD`) and
+`ALIGN_REVIEW_BASE` (`--base`'s tip, default `origin/main`) keys, a template
+body, and a trailing `ALIGN_REVIEW_VERDICT=FINDINGS` line, then prints both
+matching `scripts/pre-pr.sh` invocations — the CLEAN form and the
+`--findings-fixed` form for after a later fix commit. It refuses to overwrite
+an existing file at `OUTPUT_PATH`. `git status --porcelain` never reports
+paths under `.git/`, so an untracked review log placed there does not fail
+`scripts/pre-pr.sh`'s clean-worktree check; the scaffolder defaults to a
+`.git/align-review-<shortsha>.log` path there (matching
+`scripts/review-bounded.sh`'s own default location and extension) and also
+accepts any path entirely outside the repository.
 
 ### Review operation guardrails
 
