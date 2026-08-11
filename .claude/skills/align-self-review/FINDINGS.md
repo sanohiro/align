@@ -36,14 +36,19 @@ invented exact counts here.
 | `public-surface-completeness` | 2 | 2 | Promoted: compare the complete exported surface to the ledger and require an internal/sealed boundary for cross-module helpers. |
 | `operation-matrix-completeness` | 4 | 3 | Three-plus events: automation required. Add one parameterized dual-driver parity owner that runs the same descriptor/status/sentinel matrix through both drivers and asserts identical error-class mapping; also check native command tags (PostgreSQL answers `COMMIT` in an aborted transaction with `PGRES_COMMAND_OK` and a `ROLLBACK` tag). |
 | `error-contract-identity` | 1 | 1 | Watch; pin error class, query identity, and precedence. |
-| `source-of-truth-drift` | 3 | 2 | Three events: the mandatory ledger-to-diff extraction pass in `SKILL.md` is the owner — extract every `must`/`exact`/`every`/`before`/`reject`/`required` line from the touched design sections and point each at implementation or an explicit deferral. A lexical lint is not sound here because the drift is semantic (conflicting rules, stale scope wording), so the extraction pass is mandatory rather than automated. |
-| `owner-test-topology` | 1 | 1 | Watch; retain whole/per-unit owners when refactoring fixtures. |
+| `source-of-truth-drift` | 5 | 3 | Three-plus events: the mandatory ledger-to-diff extraction pass in `SKILL.md` is the owner — extract every `must`/`exact`/`every`/`before`/`reject`/`required` line from the touched design sections and point each at implementation or an explicit deferral. Re-read adjacent comments and counter documentation against behavior. A lexical lint is not sound here because the drift is semantic, so the extraction pass is mandatory rather than automated. |
+| `owner-test-topology` | 2 | 2 | Promoted: every named closure-matrix cell must have a direct discriminating owner; retain whole/per-unit owners when refactoring fixtures. |
 | `test-global-state-isolation` | 1 | 1 | Watch; prefer child-scoped environment and RAII restoration. |
 | `test-entry-abi-exactness` | 1 | 1 | Watch; compile fixtures through the real entry ABI. |
 | `mutation-noop-idempotency` | 1 | 1 | Watch; prove unchanged input performs no write. |
 | `native-evidence-applicability` | 1 | 1 | Watch; project optional native evidence only for engines/access methods whose semantics are proved. |
 | `analysis-control-path-completeness` | 4 | 1 | Three-plus events: automation required and shipped in #734 — call effects route through one shared atomic post-argument transition (`apply_borrow_mut_calls`/`apply_borrow_mut_call_effects`) used by the exhaustive walk, the eager worklist, and the transparent spine, with the parameterized `borrow_mut_shaper_retention` owner module covering each control path. |
 | `analysis-fact-consumer-sweep` | 4 | 1 | Three-plus events: automation required. #734 closed the exact/fallback selection into one shared `borrow_mut_source_indices` used by both liveness and escape consumers. Remaining open cell: EscapeCheck still carries three unshared destination/incoming region computations (`mutable_destination_storage_region`, the `AssignField` arm, the whole-`Assign` arm); consolidation into one shared authority is the next capability, with four verified fail-open probes recorded in its plan. |
+| `memoized-input-completeness` | 1 | 1 | Watch; a memoized step must key every semantic input it reads, including caller-seeded diagnostics and process toggles. |
+| `resource-bound-completeness` | 1 | 1 | Watch; long-lived process caches require a byte-accounted retention bound and a reachable refusal owner. |
+| `canonical-key-encoding` | 1 | 1 | Watch; variable key fields must use one length-delimited canonical encoder rather than ad hoc separators. |
+| `shared-artifact-concurrency` | 1 | 1 | Watch; retention derived from emitted files must fail closed when emissions overlap on one path. |
+| `performance-evidence-completeness` | 1 | 1 | Watch; measure the unaffected one-shot path before enabling a process-wide performance optimization by default. |
 
 ## Event log
 
@@ -100,6 +105,14 @@ invented exact counts here.
 | #734 | `c84bb3d4` | P1 | `analysis-fact-consumer-sweep` | Preserve the typed storage edge through escape-flow region selection. |
 | #734 | `c84bb3d4` | P1 | `analysis-fact-consumer-sweep` | Expand unavailable-call fallbacks to both contained and storage edges in one shared operation. |
 | #739 | `334775fe` | P1 | `ownership-allocation-owner` | Reject owned strings until fixed-array element Drop exists. |
+| #757 | `89aed25b` | P2 | `memoized-input-completeness` | Include the caller-seeded diagnostic sink because sema reads it when deciding descriptor discovery. |
+| #757 | `89aed25b` | P2 | `resource-bound-completeness` | Replace the entry-count cap with byte-accounted memo retention and a reachable refusal path. |
+| #757 | `89aed25b` | P3 | `canonical-key-encoding` | Encode environment-toggle key fields through the canonical length-delimited field encoder. |
+| #757 | `89aed25b` | P3 | `shared-artifact-concurrency` | Skip object retention when two emissions overlap on the same output path. |
+| #757 | `89aed25b` | P3 | `owner-test-topology` | Add direct discriminating owners for the three previously paper-only closure cells. |
+| #757 | `89aed25b` | P3 | `source-of-truth-drift` | Align memo hit/miss counter documentation with the implemented accounting semantics. |
+| #757 | `89aed25b` | P3 | `performance-evidence-completeness` | Measure cold one-shot CLI overhead before keeping the memo enabled by default. |
+| #757 | `89aed25b` | P3 | `source-of-truth-drift` | Scope the test environment-lock safety comment to the isolation it actually proves. |
 
 ## Rejected claims
 

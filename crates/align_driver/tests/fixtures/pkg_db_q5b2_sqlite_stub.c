@@ -111,7 +111,13 @@ void *PQexecParams(
   postgres_key_query = strstr(command, "WITH constraints") != 0;
   return &fake_result;
 }
+void *PQexec(void *connection, const char *command) {
+  (void)connection;
+  (void)command;
+  return &fake_result;
+}
 int32_t PQresultStatus(void *result) { (void)result; return 2; }
+char *PQcmdStatus(void *result) { (void)result; return "ROLLBACK"; }
 int32_t PQntuples(void *result) {
   (void)result;
   if (pq_exec_calls == 1) return 1;

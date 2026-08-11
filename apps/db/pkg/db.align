@@ -971,6 +971,16 @@ fn postgres_open_cursor(
       }
       None => {}
     }
+    active: u8 := raw.load(state, 20)
+    if active != 0 {
+      if !first_pointer.is_null() { raw.free(first_pointer) }
+      if !second_pointer.is_null() { raw.free(second_pointer) }
+      return Err(queryless_contract(
+        "postgres.connection.active_execution",
+        "PostgreSQL connection already has an active execution",
+      ))
+    }
+    raw.store(state, 20, 1 as u8)
     mut values := raw.null()
     if count > 0 {
       values = raw.alloc((count as i64) * 8)
@@ -985,19 +995,23 @@ fn postgres_open_cursor(
     if !values.is_null() { raw.free(values) }
     if !first_pointer.is_null() { raw.free(first_pointer) }
     if !second_pointer.is_null() { raw.free(second_pointer) }
-    if result.is_null() { return Err(postgres_native_error(connection, raw.null())) }
+    if result.is_null() {
+      inactive: u8 := 0
+      raw.store(state, 20, inactive)
+      return Err(postgres_native_error(connection, raw.null()))
+    }
     status := PQresultStatus(result)
     if status != PGRES_TUPLES_OK {
       failure := postgres_native_error(connection, result)
       wrapper := pkg.db.internal.resource.new_catalog_cursor(
-        2, result, raw.null(), raw.null(), raw.null(),
+        2, result, state, raw.null(), raw.null(),
       )
       ignored := pkg.db.internal.resource.close_catalog_cursor(wrapper)
       raw.free(wrapper)
       return Err(failure)
     }
     wrapper := pkg.db.internal.resource.new_catalog_cursor(
-      2, result, raw.null(), raw.null(), raw.null(),
+      2, result, state, raw.null(), raw.null(),
     )
     cursor: catalog_cursor := match target {
       Conn(reference) => resource.from_raw_borrowed(wrapper, reference)

@@ -105,6 +105,152 @@ import pkg.db.shape_fixture
 fn main() -> i32 = pkg.db.shape_fixture.run()
 "#;
 
+const POSTGRES_LEASE_MODULE: &str = r#"module pkg.db.lease_fixture
+import pkg.db
+import pkg.db.postgres
+import pkg.db.internal.resource
+
+Params { id: i64 }
+Row { id: i64, again: i64 }
+
+fn query() -> pkg.db.query<Params, Row> = pkg.db.query(
+  "SELECT :id AS id, :id AS again",
+  [],
+)
+
+fn null_result_query() -> pkg.db.query<Params, Row> = pkg.db.query(
+  "SELECT :id AS id, :id AS again /* NULL_RESULT */",
+  [],
+)
+
+extern "C" {
+  fn align_pg_reset()
+  fn align_pg_execute_calls() -> i32
+}
+
+fn catalog_overlap<T>(result: Result<T, pkg.db.Error>) -> bool = match result {
+  Err(error) => match error {
+    Unsupported(contract) => contract.item == "postgres.connection.active_execution"
+      && match contract.query_id { None => true Some(_) => false }
+    _ => false
+  }
+  Ok(_) => false
+}
+
+fn explain_overlap<T>(result: Result<T, pkg.db.Error>) -> bool = match result {
+  Err(error) => match error {
+    Unsupported(contract) => contract.item == "postgres.connection.active_execution"
+      && match contract.query_id { Some(_) => true None => false }
+    _ => false
+  }
+  Ok(_) => false
+}
+
+fn lease_active(state: raw) -> bool {
+  unsafe {
+    active: u8 := raw.load(state, 20)
+    return active == 1
+  }
+}
+
+fn exercise(target: pkg.db.exec, state: raw) -> i32 {
+  unsafe {
+    align_pg_reset()
+    raw.store(state, 20, 1 as u8)
+    table := pkg.db.TableRef { schema: "public", name: "target" }
+    schema: Option<pkg.db.SchemaRef> := None
+    query := query()
+    arena out {
+      if !catalog_overlap(pkg.db.meta_database(target, pkg.db.MetaDetail.Names, out, [])) {
+        return 1
+      }
+      if !catalog_overlap(pkg.db.meta_schemas(target, pkg.db.MetaDetail.Names, out, [])) {
+        return 2
+      }
+      if !catalog_overlap(pkg.db.meta_tables(
+        target, schema, pkg.db.MetaDetail.Names, out, [],
+      )) { return 3 }
+      if !catalog_overlap(pkg.db.meta_table(target, table, pkg.db.MetaDetail.Names, out, [])) {
+        return 4
+      }
+      if !catalog_overlap(pkg.db.meta_columns(target, table, pkg.db.MetaDetail.Names, out, [])) {
+        return 5
+      }
+      if !catalog_overlap(pkg.db.meta_keys(target, table, pkg.db.MetaDetail.Names, out, [])) {
+        return 6
+      }
+      if !catalog_overlap(pkg.db.meta_indexes(target, table, pkg.db.MetaDetail.Names, out, [])) {
+        return 7
+      }
+
+      if !catalog_overlap(pkg.db.postgres.meta_database_native(
+        target, pkg.db.MetaDetail.Names, out, [], [],
+      )) { return 8 }
+      if !catalog_overlap(pkg.db.postgres.meta_schemas_native(
+        target, pkg.db.MetaDetail.Names, out, [], [],
+      )) { return 9 }
+      if !catalog_overlap(pkg.db.postgres.meta_tables_native(
+        target, schema, pkg.db.MetaDetail.Names, out, [], [],
+      )) { return 10 }
+      if !catalog_overlap(pkg.db.postgres.meta_table_native(
+        target, table, pkg.db.MetaDetail.Names, out, [], [],
+      )) { return 11 }
+      if !catalog_overlap(pkg.db.postgres.meta_columns_native(
+        target, table, pkg.db.MetaDetail.Names, out, [], [],
+      )) { return 12 }
+      if !catalog_overlap(pkg.db.postgres.meta_keys_native(
+        target, table, pkg.db.MetaDetail.Names, out, [], [],
+      )) { return 13 }
+      if !catalog_overlap(pkg.db.postgres.meta_indexes_native(
+        target, table, pkg.db.MetaDetail.Names, out, [], [],
+      )) { return 14 }
+
+      if !explain_overlap(pkg.db.explain(
+        target, query, Params { id: 1 }, out, [],
+      )) { return 15 }
+      if !explain_overlap(pkg.db.postgres.explain_native(
+        target, query, Params { id: 2 }, out, [], [],
+      )) { return 16 }
+      if !lease_active(state) { return 17 }
+      if align_pg_execute_calls() != 0 { return 18 }
+      raw.store(state, 20, 0 as u8)
+      failed := pkg.db.explain(
+        target, null_result_query(), Params { id: 3 }, out, [],
+      )
+      match failed { Ok(_) => { return 20 } Err(_) => {} }
+      if lease_active(state) { return 21 }
+      if align_pg_execute_calls() != 1 { return 22 }
+      return 0
+    }
+  }
+}
+
+pub fn run() -> i32 {
+  unsafe {
+    opened := pkg.db.postgres.connect("fake", [])
+    connection := opened else { return 23 }
+    connection_state := resource.raw(resource.borrow(connection))
+    connection_status := exercise(pkg.db.exec_conn(connection), connection_state)
+    if connection_status != 0 { return connection_status }
+
+    tx_opened := pkg.db.postgres.connect("fake", [])
+    tx_connection := tx_opened else { return 24 }
+    transaction_state := resource.into_raw(tx_connection)
+    pkg.db.internal.resource.set_transaction_active(transaction_state, true)
+    transaction: pkg.db.tx := resource.from_raw(transaction_state)
+    transaction_status := exercise(pkg.db.exec_tx(transaction), transaction_state)
+    if transaction_status != 0 { return 30 + transaction_status }
+    return 73
+  }
+}
+"#;
+
+const POSTGRES_LEASE_MAIN: &str = r#"module main
+import pkg.db.lease_fixture
+
+fn main() -> i32 = pkg.db.lease_fixture.run()
+"#;
+
 const LOOKUP: &str = r#"module app.lookup
 import pkg.db
 
@@ -968,6 +1114,14 @@ fn sqlite_shape_package_files() -> Vec<(&'static str, &'static str)> {
     files
 }
 
+fn postgres_lease_package_files() -> Vec<(&'static str, &'static str)> {
+    let mut files = package_files();
+    files.retain(|(path, _)| *path != "main.align");
+    files.push(("pkg/db/lease_fixture.align", POSTGRES_LEASE_MODULE));
+    files.push(("main.align", POSTGRES_LEASE_MAIN));
+    files
+}
+
 fn postgres_package_files() -> Vec<(&'static str, &'static str)> {
     let mut files = package_files();
     files.retain(|(path, _)| *path != "main.align");
@@ -1213,6 +1367,26 @@ fn malformed_native_catalog_rows_close_once_and_sqlite_releases_the_lease() {
     assert_eq!(
         output.status.code(),
         Some(42),
+        "stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn postgres_catalog_and_explain_share_the_execution_lease() {
+    if !backend_available() || !cc_available() {
+        return;
+    }
+    let output = build_and_run_multi_with_c(
+        "pkg-db-q5b2-postgres-lease",
+        &postgres_lease_package_files(),
+        "main.align",
+        db_harness::PG.c_source,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(73),
         "stdout: {}; stderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),

@@ -566,11 +566,26 @@ pub fn build_and_run_multi_with_c(
         )
         .unwrap_or_else(|error| panic!("codegen for unit `{}`: {error}", unit.unit));
         for library in &unit.mir.link_libs {
-            if library != "pq" && !link_libs.contains(library) {
+            if !link_libs.contains(library) {
                 link_libs.push(library.clone());
             }
         }
         objects.push(object);
+    }
+    // The C object substitutes only libpq itself. Preserve the complete dependent-first libpq
+    // closure before removing that one member: filtering `pq` first prevents `order_link_libs`
+    // from appending the suffix and can leave zlib before a later OpenSSL reference on ELF.
+    let substitutes_libpq = link_libs.iter().any(|library| library == "pq");
+    let mut link_libs: Vec<String> = order_link_libs(&link_libs)
+        .into_iter()
+        .filter(|library| library != "pq")
+        .collect();
+    if substitutes_libpq {
+        link_libs.extend(
+            ["ssl", "crypto", "zstd", "z"]
+                .into_iter()
+                .map(str::to_owned),
+        );
     }
     std::fs::write(&c_path, c_src).expect("write C fixture");
     let cc = std::process::Command::new("cc")
