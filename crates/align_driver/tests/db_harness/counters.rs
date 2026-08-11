@@ -74,10 +74,10 @@ impl Counters {
                 // An unknown name means the Align module and this registry have diverged. Accepting
                 // it would let a renamed counter read as "absent" at the expectation instead of as
                 // the schema break it is.
-                if !super::layout::PG_COUNTER_NAMES.contains(&name) {
+                if !super::stubs::is_known_counter(name) {
                     return Err(format!(
                         "counter `{name}` is not in the known registry {:?}",
-                        super::layout::PG_COUNTER_NAMES
+                        super::stubs::all_counter_names()
                     ));
                 }
                 match values.get(name) {
@@ -124,19 +124,20 @@ impl CounterExpect {
     /// as "counter absent from the dump", which reads like a product defect rather than a test bug.
     pub fn eq(mut self, name: &str, value: i64) -> CounterExpect {
         assert!(
-            super::layout::PG_COUNTER_NAMES.contains(&name),
+            super::stubs::is_known_counter(name),
             "`{name}` is not a known counter; the registry has {:?}",
-            super::layout::PG_COUNTER_NAMES
+            super::stubs::all_counter_names()
         );
         self.want.push((name.to_string(), value));
         self
     }
 
-    // ---- libpq shorthands ------------------------------------------------------------------
-    // Only the counters this suite actually asserts get a named method; everything else in
-    // PG_COUNTER_NAMES is reachable through `eq` without a dormant wrapper per counter.
-    /// The stub's own protocol self-check; also pins `pg.protocol_error` to 0 so a failure names
-    /// the reported error code instead of hiding it behind a sentinel offset.
+    // ---- shorthands ---------------------------------------------------------------------------
+    // Only the counters some suite actually asserts get a named method. Everything else in the
+    // registry is reachable through `eq`, which validates the name, so a wrapper per counter would
+    // be dormant surface with no added safety.
+    /// The libpq stub's own protocol self-check; also pins `pg.protocol_error` to 0 so a failure
+    /// names the reported error code instead of hiding it behind a sentinel offset.
     pub fn pg_protocol_ok(self) -> CounterExpect {
         self.eq("pg.protocol_ok", 1).eq("pg.protocol_error", 0)
     }

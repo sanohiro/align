@@ -1624,120 +1624,144 @@ const CASE_SQLITE_DIRECT_STREAM: Case = Case {
     label: "pkg-db-q4b-sqlite-direct-stream",
     runner: RunnerKind::PerUnitC,
     needs: Needs::BackendAndCc,
-    stubs: Stubs::PgAndSqlite,
-    modules: Q4B_MODULES,
+    links: &[&PG, &SQLITE_Q4A],
+    counters: &[],
+    modules: q4b_modules,
     main: SQLITE_DIRECT_STREAM_MAIN,
     expected_exit: 42,
+    expect_counters: &[],
 };
 
 const CASE_SQLITE_COMPLETE_MATRIX: Case = Case {
     label: "pkg-db-q4b-sqlite-complete-matrix",
     runner: RunnerKind::StaticDescriptors,
     needs: Needs::Backend,
-    stubs: Stubs::None,
-    modules: Q4B_MODULES,
+    links: &[],
+    counters: &[],
+    modules: q4b_modules,
     main: SQLITE_COMPLETE_MATRIX_MAIN,
     expected_exit: 42,
+    expect_counters: &[],
 };
 
 const CASE_POSTGRES_DEADLINE_CANCEL: Case = Case {
     label: "pkg-db-q4b-postgres-deadline-cancel",
     runner: RunnerKind::PerUnitC,
     needs: Needs::BackendAndCc,
-    stubs: Stubs::Pg,
-    modules: Q4B_MODULES,
+    links: &[&PG],
+    counters: &[],
+    modules: q4b_modules,
     main: POSTGRES_DEADLINE_CANCEL_MAIN,
     expected_exit: 42,
+    expect_counters: &[],
 };
 
 const CASE_OWNED_PARAMS: Case = Case {
     label: "pkg-db-q4b-owned-params",
     runner: RunnerKind::StaticDescriptors,
     needs: Needs::Backend,
-    stubs: Stubs::None,
-    modules: Q4B_MODULES,
+    links: &[],
+    counters: &[],
+    modules: q4b_modules,
     main: OWNED_PARAMS_MAIN,
     expected_exit: 42,
+    expect_counters: &[],
 };
 
 const CASE_SQLITE_STREAM_LIFECYCLE: Case = Case {
     label: "pkg-db-q4b-sqlite-stream-lifecycle",
     runner: RunnerKind::PerUnitC,
     needs: Needs::BackendAndCc,
-    stubs: Stubs::PgAndSqlite,
-    modules: Q4B_MODULES,
+    links: &[&PG, &SQLITE_Q4A],
+    counters: &[],
+    modules: q4b_modules,
     main: SQLITE_STREAM_LIFECYCLE_MAIN,
     expected_exit: 42,
+    expect_counters: &[],
 };
 
 const CASE_POSTGRES_BUFFERED_LIFECYCLE: Case = Case {
     label: "pkg-db-q4b-postgres-buffered-lifecycle",
     runner: RunnerKind::PerUnitC,
     needs: Needs::BackendAndCc,
-    stubs: Stubs::Pg,
-    modules: Q4B_MODULES,
+    links: &[&PG],
+    counters: &[],
+    modules: q4b_modules,
     main: POSTGRES_BUFFERED_LIFECYCLE_MAIN,
     expected_exit: 42,
+    expect_counters: &[],
 };
 
 const CASE_POSTGRES_PREPARED_DEADLINE: Case = Case {
     label: "pkg-db-q4b-postgres-prepared-deadline",
     runner: RunnerKind::PerUnitC,
     needs: Needs::BackendAndCc,
-    stubs: Stubs::Pg,
-    modules: Q4B_MODULES,
+    links: &[&PG],
+    counters: &[],
+    modules: q4b_modules,
     main: POSTGRES_PREPARED_DEADLINE_MAIN,
     expected_exit: 42,
+    expect_counters: &[],
 };
 
 const CASE_POSTGRES_COMMAND_DEADLINE: Case = Case {
     label: "pkg-db-q4b-postgres-command-deadline",
     runner: RunnerKind::PerUnitC,
     needs: Needs::BackendAndCc,
-    stubs: Stubs::Pg,
-    modules: Q4B_MODULES,
+    links: &[&PG],
+    counters: &[],
+    modules: q4b_modules,
     main: POSTGRES_COMMAND_DEADLINE_MAIN,
     expected_exit: 42,
+    expect_counters: &[],
 };
 
 const CASE_POSTGRES_MALFORMED_VIEWS: Case = Case {
     label: "pkg-db-q4b-postgres-malformed-views",
     runner: RunnerKind::PerUnitC,
     needs: Needs::BackendAndCc,
-    stubs: Stubs::Pg,
-    modules: Q4B_MODULES,
+    links: &[&PG],
+    counters: &[],
+    modules: q4b_modules,
     main: POSTGRES_MALFORMED_VIEWS_MAIN,
     expected_exit: 42,
+    expect_counters: &[],
 };
 
 const CASE_SQLITE_MALFORMED_VIEWS: Case = Case {
     label: "pkg-db-q4b-sqlite-malformed-views",
     runner: RunnerKind::PerUnitC,
     needs: Needs::BackendAndCc,
-    stubs: Stubs::PgAndSqlite,
-    modules: Q4B_MODULES,
+    links: &[&PG, &SQLITE_Q4A],
+    counters: &[],
+    modules: q4b_modules,
     main: SQLITE_MALFORMED_VIEWS_MAIN,
     expected_exit: 42,
+    expect_counters: &[],
 };
 
 const CASE_DEADLINE_DISPOSITION: Case = Case {
     label: "pkg-db-q4b-deadline-disposition",
     runner: RunnerKind::PerUnitC,
     needs: Needs::BackendAndCc,
-    stubs: Stubs::PgAndSqlite,
-    modules: Q4B_MODULES,
+    links: &[&PG, &SQLITE_Q4A],
+    counters: &[],
+    modules: q4b_modules,
     main: DEADLINE_DISPOSITION_MAIN,
     expected_exit: 42,
+    expect_counters: &[],
 };
 
 const CASE_POSTGRES_DEADLINE_FAULT_PHASES: Case = Case {
     label: "pkg-db-q4b-postgres-deadline-fault-phases",
     runner: RunnerKind::PerUnitC,
     needs: Needs::BackendAndCc,
-    stubs: Stubs::Pg,
-    modules: Q4B_MODULES,
+    links: &[&PG],
+    counters: &[],
+    modules: q4b_modules,
     main: POSTGRES_DEADLINE_FAULT_PHASES_MAIN,
     expected_exit: 45,
+    expect_counters: &[],
 };
 
 /// Every Layer-1 case, for the fingerprint golden.
@@ -1764,7 +1788,9 @@ fn q4b(main: &str) -> Layout {
 }
 
 /// The suite modules every q4b case adds on top of the `pkg.db` package.
-const Q4B_MODULES: &[(&str, &str)] = &[("app/q4b_query.align", QUERY)];
+fn q4b_modules() -> Vec<(&'static str, &'static str)> {
+    vec![("app/q4b_query.align", QUERY)]
+}
 
 /// The pre-harness layout builder, kept ONLY as the oracle for
 /// `layout_reproduces_the_pre_harness_package_files_exactly`. It is the backward-looking half of
@@ -2229,7 +2255,7 @@ fn full_matrix_parity_is_exact_on_both_drivers() {
     let Some(_gate) = gate(Needs::BackendAndCc) else { return };
     let program = ParityProgram::build(
         "pkg-db-q4b-full-matrix-parity",
-        &q4b(PARITY_MAIN).with_pg_counters(),
+        &q4b(PARITY_MAIN).with_counters(&PG),
     );
     let runs = run_parity(
         &program,
@@ -2657,20 +2683,17 @@ pg.protocol_error
     /// H9: the counters module can only arrive together with the C source that defines its symbols.
     #[test]
     fn pg_counters_always_arrive_with_their_stub() {
-        let layout = Layout::new().with_pg_counters();
+        let layout = Layout::new().with_counters(&PG);
         assert!(
             layout.has_c_fixture(),
-            "with_pg_counters must also link the stub that defines the counters"
+            "with_counters must also link the stub that defines the counters"
         );
         assert!(
-            layout.paths().contains(&"pkg/db/testkit/pg.align"),
-            "with_pg_counters must add the Align counters module"
+            layout.paths().contains(&PG.counters_path),
+            "with_counters must add the Align counters module"
         );
         assert!(
-            !Layout::new()
-                .linking_pg_stub()
-                .paths()
-                .contains(&"pkg/db/testkit/pg.align"),
+            !Layout::new().linking(&PG).paths().contains(&PG.counters_path),
             "linking the stub alone must NOT inject the counters module: a pure-refactor migration \
              depends on the compiled module set being unchanged"
         );
@@ -2837,17 +2860,25 @@ pg.protocol_error
         assert!(!should_clear_env("ALIGN_DB_POSTGRES_URL", &with_url));
     }
 
-    /// P3-5/P3-6: the counter registry and the Align module that prints the counters must agree.
-    /// Pure string comparison — no C compiler, no LLVM, milliseconds.
+    /// P3-5/P3-6, now parameterized over every stub: each registry and the Align module that
+    /// prints its counters must agree, in the same order. Pure string comparison — no C compiler,
+    /// no LLVM, milliseconds — so a counter added on one side and forgotten on the other fails
+    /// immediately rather than surviving until someone happens to assert on it.
     #[test]
-    fn pg_counter_registry_matches_the_align_module() {
-        let printed = pg_counter_names_in_module();
-        let registry: Vec<String> = PG_COUNTER_NAMES.iter().map(|n| (*n).to_string()).collect();
-        assert_eq!(
-            printed, registry,
-            "the Align counters module and PG_COUNTER_NAMES have diverged; \
-             the dump order is part of the contract"
-        );
+    fn counter_registries_match_their_align_modules() {
+        let mut mismatches = Vec::new();
+        for stub in db_harness::stubs::ALL {
+            let printed = stub.names_in_module();
+            let registry: Vec<String> = stub.names.iter().map(|n| (*n).to_string()).collect();
+            if printed != registry {
+                mismatches.push(Mismatch {
+                    what: format!("counter registry for stub `{}`", stub.id),
+                    expected: format!("{registry:?}"),
+                    actual: format!("{printed:?}"),
+                });
+            }
+        }
+        assert_no_mismatches("counter registries", &mismatches);
     }
 
     /// An expectation naming a counter outside the registry is a test bug, and must be reported as
@@ -2960,7 +2991,7 @@ fn parity_engine_detects_table_and_program_disagreement() {
     let Some(_gate) = gate(Needs::BackendAndCc) else { return };
     let program = ParityProgram::build(
         "pkg-db-q4b-parity-probes",
-        &q4b(PARITY_MAIN).with_pg_counters(),
+        &q4b(PARITY_MAIN).with_counters(&PG),
     );
     let drivers = [Driver::Sqlite, Driver::Postgres];
 
@@ -3085,7 +3116,7 @@ fn parity_engine_fails_a_row_that_never_runs() {
     let Some(_gate) = gate(Needs::BackendAndCc) else { return };
     let program = ParityProgram::build(
         "pkg-db-q4b-parity-unexecuted",
-        &q4b(PARITY_MAIN).with_pg_counters(),
+        &q4b(PARITY_MAIN).with_counters(&PG),
     );
     // Only SQLite runs, so the PostgreSQL-only `counters` row cannot execute.
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3128,18 +3159,18 @@ fn materialized_projects_are_removed_on_drop() {
 ///
 /// Regenerate ONLY with a reviewed reason, from the panic message this emits.
 const LAYER1_FINGERPRINT_GOLDEN: &str = "\
-pkg-db-q4b-deadline-disposition f664dbb6daccd2d9
-pkg-db-q4b-owned-params 6e6cefbf22ee4ca3
-pkg-db-q4b-postgres-buffered-lifecycle 6d29aa8f00f7a43f
-pkg-db-q4b-postgres-command-deadline 4fb8e0ab5b5c5334
-pkg-db-q4b-postgres-deadline-cancel 77ae16f4677e6acd
-pkg-db-q4b-postgres-deadline-fault-phases 074af1282ad43cd4
-pkg-db-q4b-postgres-malformed-views 2bb5c2d0e3cd9f65
-pkg-db-q4b-postgres-prepared-deadline 6efcdf587d262cd8
-pkg-db-q4b-sqlite-complete-matrix 6100bf9afac49c35
-pkg-db-q4b-sqlite-direct-stream a9aaedb72c0a0ff8
-pkg-db-q4b-sqlite-malformed-views 217457f771d60013
-pkg-db-q4b-sqlite-stream-lifecycle 19166d21a0854aaa
+pkg-db-q4b-deadline-disposition feaa91247d2ff844
+pkg-db-q4b-owned-params f659b165042e0f15
+pkg-db-q4b-postgres-buffered-lifecycle 8fe4205270f1a911
+pkg-db-q4b-postgres-command-deadline f8a01a9da37234fc
+pkg-db-q4b-postgres-deadline-cancel 5badd2000b084e0b
+pkg-db-q4b-postgres-deadline-fault-phases 944018e7a8df2d3a
+pkg-db-q4b-postgres-malformed-views b2ae414b2e832bf3
+pkg-db-q4b-postgres-prepared-deadline 0e24bea5240ebdc8
+pkg-db-q4b-sqlite-complete-matrix 76d3af1f660a699f
+pkg-db-q4b-sqlite-direct-stream 629651e44e0063f7
+pkg-db-q4b-sqlite-malformed-views b822aa7f25062b62
+pkg-db-q4b-sqlite-stream-lifecycle 6e9e14e2c7046bad
 ";
 
 #[test]
@@ -3149,4 +3180,97 @@ fn layer1_case_fingerprints_match_the_golden() {
         log.record(&case.fingerprint());
     }
     log.assert_matches(LAYER1_FINGERPRINT_GOLDEN);
+}
+
+/// A program whose `hang` case never finishes inside the cap.
+///
+/// The body is a serial LCG whose addend comes from a run-time string length, so `-O2` can neither
+/// close-form it nor delete it — a plain `acc = acc + i` sum was recognised and folded, and the
+/// case returned instantly. The bound is finite, so a runaway child still cannot outlive the suite
+/// if the kill path itself ever regresses.
+const TIMEOUT_MAIN: &str = r#"module main
+import std.env
+import pkg.db
+import pkg.db.postgres
+import pkg.db.sqlite
+
+fn main() -> i32 {
+  driver := env.get("ALIGN_DB_DRIVER") else { return 90 }
+  case := env.get("ALIGN_DB_CASE") else { return 91 }
+  if driver == "" { return 92 }
+  if case == "__list__" {
+    print("hang")
+    print("after_hang")
+    return 42
+  }
+  if case == "hang" {
+    mut i := 0
+    mut acc := 1
+    step := case.len() as i64
+    loop {
+      if i >= 8000000000 { break }
+      acc = (acc * 1103515245 + 12345 + step) % 2147483647
+      i = i + 1
+    }
+    return acc as i32
+  } else {
+    if case == "after_hang" {
+      return 8
+    } else {
+      return 99
+    }
+  }
+}
+"#;
+
+/// PR-1 deferred this cell: the timeout path was implemented but no owner drove a hanging case.
+///
+/// The 2-second cap is generous for a loop that needs minutes, but a sufficiently loaded machine
+/// could in principle let the kill land late. That direction fails LOUDLY (the hang row would
+/// report a value mismatch instead of a timeout) rather than passing a broken engine, so the
+/// failure mode is a visible flake, never a false green.
+///
+/// Two things must hold together, and only a real hang can show them: the timed-out case is
+/// reported as a timeout rather than as some arbitrary signal exit code, and the cases after it
+/// still run and still report. If `run_parity` asserted eagerly, the second row would vanish behind
+/// the first.
+#[test]
+fn parity_engine_reports_a_timed_out_case_and_keeps_going() {
+    let Some(_gate) = gate(Needs::BackendAndCc) else { return };
+    let program = ParityProgram::build(
+        "pkg-db-q4b-parity-timeout",
+        &q4b(TIMEOUT_MAIN).linking(&PG),
+    )
+    .with_timeout(std::time::Duration::from_secs(2));
+
+    const CASES: &[ParityCase] = &[
+        ParityCase::same("hang", 42),
+        // Deliberately wrong: the program returns 8. This row exists to prove it is still reached
+        // and still reported after the row before it timed out.
+        ParityCase::same("after_hang", 7),
+    ];
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_parity(&program, CASES, &[Driver::Sqlite], 0);
+    }))
+    .expect_err("a timed-out case must fail the table");
+    let report = panicked
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default();
+
+    // The exact string the engine emits, not a substring that `after_hang` would also satisfy:
+    // `contains("hang")` matches "after_hang" too, so it could pass with the hang row missing.
+    assert!(
+        report.contains("case `hang` on sqlite: expected completion within"),
+        "the hang row must be reported as a TIMEOUT, naming the case and driver: {report}"
+    );
+    assert!(
+        report.contains("timed out and was killed"),
+        "{report}"
+    );
+    assert!(
+        report.contains("case `after_hang` on sqlite: expected Some(7)"),
+        "the case after the hang must still have run and reported its OWN mismatch, which only \
+         holds if outcomes are collected before anything is asserted: {report}"
+    );
 }

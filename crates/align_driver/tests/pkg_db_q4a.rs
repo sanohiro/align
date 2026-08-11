@@ -2,17 +2,9 @@
 
 mod common;
 use common::*;
+mod db_harness;
+use db_harness::*;
 
-const DB: &str = include_str!("../../../apps/db/pkg/db.align");
-const SQLITE: &str = include_str!("../../../apps/db/pkg/db/sqlite.align");
-const POSTGRES: &str = include_str!("../../../apps/db/pkg/db/postgres.align");
-const INTERNAL: &str = include_str!("../../../apps/db/pkg/db/internal.align");
-const RESOURCE: &str = include_str!("../../../apps/db/pkg/db/internal/resource.align");
-const DESCRIPTOR: &str = include_str!("../../../apps/db/pkg/db/internal/descriptor.align");
-const INTERNAL_SQLITE: &str = include_str!("../../../apps/db/pkg/db/internal/sqlite.align");
-const INTERNAL_POSTGRES: &str = include_str!("../../../apps/db/pkg/db/internal/postgres.align");
-const POSTGRES_STUB: &str = include_str!("fixtures/pkg_db_q2_postgres_stub.c");
-const SQLITE_PREPARED_STUB: &str = include_str!("fixtures/pkg_db_q4a_sqlite_stub.c");
 const PREPARED_BENCH: &str = include_str!("fixtures/pkg_db_q4a_bench.c");
 
 const Q4A_QUERY: &str = r#"module app.q4a_query
@@ -75,20 +67,860 @@ pub fn touched() -> pkg.db.command<TxParams> = pkg.db.postgres.command(
 )
 "#;
 
-fn package_files(main: &str) -> Vec<(&'static str, &str)> {
+
+// ================================================================================================
+// Layer-1 migrated cases.
+//
+// Each is ONE record: the #[test] executes it and layer1_case_fingerprints_match_the_golden
+// hashes it, both through `Case`. Native call counts moved out of the Align epilogue into
+// `expect_counters`, so a mismatch now names the counter instead of collapsing eight of them
+// into a single sentinel exit code.
+// ================================================================================================
+const SQLITE_PREPARED_REUSE_MAIN: &str = r#"module main
+import pkg.db
+import pkg.db.sqlite
+import app.q4a_query
+import pkg.db.testkit.sqlite
+
+
+fn execute_once(
+  borrow mut statement: pkg.db.stmt<app.q4a_query.Params, app.q4a_query.Row>,
+  id: i64,
+  initial_label: str,
+) -> i32 {
+  mut label := initial_label.clone()
+  label_view: str := label
+  mut bytes := [1 as u8, 2 as u8, 3 as u8]
+  params := app.q4a_query.Params {
+    id: id,
+    label: label_view,
+    payload: bytes[..],
+  }
+  result := pkg.db.rows_stmt(statement, params, [])
+  return match result {
+    Err(_) => 2
+    Ok(rows_value) => {
+      mut rows := rows_value
+      label = "source storage replaced".clone()
+      bytes[0] = 9
+      if label.len() == 0 || bytes[0] != 9 { return 3 }
+      first := pkg.db.next(rows)
+      match first {
+        Err(_) => { return 7 }
+        Ok(value) => match value {
+          None => { return 8 }
+          Some(row) => if row.id != id { return 9 }
+        }
+      }
+      second := pkg.db.next(rows)
+      match second {
+        Err(_) => 10
+        Ok(value) => match value { None => 0, Some(_) => 11 }
+      }
+    }
+  }
+}
+
+fn is_unsupported_item(error: pkg.db.Error, expected: str) -> bool = match error {
+  Unsupported(contract) => contract.item == expected
+  _ => false
+}
+
+fn prepared_phase(borrow connection: pkg.db.conn) -> i32 {
+  common_invalid := pkg.db.sqlite.prepare_native(
+    pkg.db.exec_conn(connection),
+    app.q4a_query.selected(),
+    [pkg.db.PrepareOption.TimeoutNs(0)],
+    [pkg.db.sqlite.PrepareOption.Persistent, pkg.db.sqlite.PrepareOption.Persistent],
+  )
+  match common_invalid {
+    Ok(_) => { return 10 }
+    Err(error) => if !is_unsupported_item(error, "db.prepare.timeout_ns") { return 11 }
+  }
+  native_duplicate := pkg.db.sqlite.prepare_native(
+    pkg.db.exec_conn(connection),
+    app.q4a_query.selected(),
+    [],
+    [pkg.db.sqlite.PrepareOption.Normalize, pkg.db.sqlite.PrepareOption.Normalize],
+  )
+  match native_duplicate {
+    Ok(_) => { return 13 }
+    Err(error) => if !is_unsupported_item(error, "sqlite.prepare.option") { return 14 }
+  }
+  prepared := pkg.db.sqlite.prepare_native(
+    pkg.db.exec_conn(connection),
+    app.q4a_query.selected(),
+    [],
+    [pkg.db.sqlite.PrepareOption.Persistent, pkg.db.sqlite.PrepareOption.Normalize],
+  )
+  return match prepared {
+    Err(_) => 4
+    Ok(statement_value) => {
+      mut statement := statement_value
+      first := execute_once(statement, 7, "first")
+      if first != 0 { return first }
+      execute_once(statement, 8, "second")
+    }
+  }
+}
+
+fn main() -> i32 {
+  pkg.db.testkit.sqlite.reset()
+  opened := pkg.db.sqlite.connect(":memory:", [])
+  result := match opened {
+    Err(_) => 5
+    Ok(connection) => prepared_phase(connection)
+  }
+  if result != 0 { return result }
+  pkg.db.testkit.sqlite.dump()
+  return 42
+}
+"#;
+
+/// The extra app module this one case adds: a shape SQLite did not originally accept.
+const Q4A_UNSUPPORTED: &str = r#"module app.q4a_unsupported
+import pkg.db
+import pkg.db.sqlite
+
+pub Params { enabled: bool }
+pub Row { value: i64 }
+
+pub fn selected() -> pkg.db.query<Params, Row> = pkg.db.sqlite.query(
+  "SELECT :enabled AS value",
+  [],
+  [],
+)
+"#;
+
+/// `q4a_modules` plus that module. Per-case module lists are what `Case.modules` is for.
+fn q4a_unsupported_modules() -> Vec<(&'static str, &'static str)> {
+    let mut modules = q4a_modules();
+    modules.push(("app/q4a_unsupported.align", Q4A_UNSUPPORTED));
+    modules
+}
+
+const SQLITE_UNSUPPORTED_SHAPE_MAIN: &str = r#"module main
+import pkg.db
+import pkg.db.sqlite
+import app.q4a_unsupported
+import pkg.db.testkit.sqlite
+
+
+fn main() -> i32 {
+  pkg.db.testkit.sqlite.reset()
+  opened := pkg.db.sqlite.connect(":memory:", [])
+  prepared_ok := match opened {
+    Err(_) => false
+    Ok(connection) => {
+      prepared := pkg.db.sqlite.prepare_native(
+        pkg.db.exec_conn(connection),
+        app.q4a_unsupported.selected(),
+        [],
+        [pkg.db.sqlite.PrepareOption.Persistent, pkg.db.sqlite.PrepareOption.Normalize],
+      )
+      match prepared { Ok(_) => true, Err(_) => false }
+    }
+  }
+  if !prepared_ok { return 1 }
+  pkg.db.testkit.sqlite.dump()
+  return 42
+}
+"#;
+
+const SQLITE_BIND_RECOVERY_MAIN: &str = r#"module main
+import pkg.db
+import pkg.db.sqlite
+import app.q4a_query
+import pkg.db.testkit.sqlite
+
+extern "C" {
+  fn align_sqlite_q4a_fail_next_text()
+}
+
+fn run(borrow connection: pkg.db.conn) -> i32 {
+  prepared := pkg.db.sqlite.prepare_native(
+    pkg.db.exec_conn(connection),
+    app.q4a_query.selected(),
+    [],
+    [pkg.db.sqlite.PrepareOption.Persistent, pkg.db.sqlite.PrepareOption.Normalize],
+  )
+  return match prepared {
+    Err(_) => 1
+    Ok(statement_value) => {
+      mut statement := statement_value
+      first_bytes := [1 as u8, 2 as u8, 3 as u8]
+      unsafe { align_sqlite_q4a_fail_next_text() }
+      failed := pkg.db.rows_stmt(statement, app.q4a_query.Params {
+        id: 7,
+        label: "first",
+        payload: first_bytes[..],
+      }, [])
+      match failed { Ok(_) => { return 2 }, Err(_) => {} }
+      second_bytes := [1 as u8, 2 as u8, 3 as u8]
+      succeeded := pkg.db.rows_stmt(statement, app.q4a_query.Params {
+        id: 8,
+        label: "second",
+        payload: second_bytes[..],
+      }, [])
+      match succeeded { Err(_) => 3, Ok(_) => 0 }
+    }
+  }
+}
+
+fn main() -> i32 {
+  pkg.db.testkit.sqlite.reset()
+  opened := pkg.db.sqlite.connect(":memory:", [])
+  result := match opened { Err(_) => 4, Ok(connection) => run(connection) }
+  if result != 0 { return result }
+  pkg.db.testkit.sqlite.dump()
+  return 42
+}
+"#;
+
+const SQLITE_CLEANUP_POISON_MAIN: &str = r#"module main
+import pkg.db
+import pkg.db.sqlite
+import app.q4a_query
+import pkg.db.testkit.sqlite
+
+extern "C" {
+  fn align_sqlite_q4a_reset()
+  fn align_sqlite_q4a_fail_next_reset()
+}
+
+fn execute_once(
+  borrow mut statement: pkg.db.stmt<app.q4a_query.Params, app.q4a_query.Row>,
+  id: i64,
+  initial_label: str,
+) -> i32 {
+  mut label := initial_label.clone()
+  label_view: str := label
+  mut bytes := [1 as u8, 2 as u8, 3 as u8]
+  result := pkg.db.rows_stmt(statement, app.q4a_query.Params {
+    id: id, label: label_view, payload: bytes[..],
+  }, [])
+  return match result {
+    Err(_) => 2
+    Ok(rows) => {
+      label = "source storage replaced".clone()
+      bytes[0] = 9
+      if label.len() == 0 || bytes[0] != 9 { return 6 }
+      0
+    }
+  }
+}
+
+fn run(borrow connection: pkg.db.conn) -> i32 {
+  made := pkg.db.sqlite.prepare_native(
+    pkg.db.exec_conn(connection),
+    app.q4a_query.selected(),
+    [],
+    [pkg.db.sqlite.PrepareOption.Persistent, pkg.db.sqlite.PrepareOption.Normalize],
+  )
+  return match made {
+    Err(_) => 1
+    Ok(statement_value) => {
+      mut statement := statement_value
+      first := execute_once(statement, 7, "first")
+      if first != 0 { return first }
+      second := execute_once(statement, 8, "second")
+      if second == 2 { 0 } else { 3 }
+    }
+  }
+}
+
+fn main() -> i32 {
+  unsafe {
+    align_sqlite_q4a_reset()
+    align_sqlite_q4a_fail_next_reset()
+  }
+  opened := pkg.db.sqlite.connect(":memory:", [])
+  result := match opened { Err(_) => 4, Ok(connection) => run(connection) }
+  if result != 0 { return result }
+  pkg.db.testkit.sqlite.dump()
+  return 42
+}
+"#;
+
+const SQLITE_TRANSACTIONS_MAIN: &str = r#"module main
+import pkg.db
+import pkg.db.sqlite
+import app.q4a_query
+
+fn exclusive(connection: pkg.db.conn) -> i32 {
+  begun_exclusive := pkg.db.sqlite.begin_native(
+    connection, [], [pkg.db.sqlite.TxOption.Exclusive],
+  )
+  return match begun_exclusive {
+    Err(_) => 8
+    Ok(transaction) => match pkg.db.rollback(transaction) {
+      Err(_) => 9
+      Ok(connection_value) => 42
+    }
+  }
+}
+
+fn immediate(connection: pkg.db.conn) -> i32 {
+  begun_immediate := pkg.db.sqlite.begin_native(
+    connection, [], [pkg.db.sqlite.TxOption.Immediate],
+  )
+  return match begun_immediate {
+    Err(_) => 6
+    Ok(transaction) => match pkg.db.rollback(transaction) {
+      Err(_) => 7
+      Ok(connection_value) => exclusive(connection_value)
+    }
+  }
+}
+
+fn use_transaction(transaction: pkg.db.tx) -> i32 {
+  updated := pkg.db.execute(
+    pkg.db.exec_tx(transaction),
+    app.q4a_query.touched(),
+    app.q4a_query.TxParams { id: 9 },
+    [],
+  )
+  match updated { Err(_) => { return 3 }, Ok(_) => {} }
+  arena metadata_out {
+    metadata := pkg.db.meta_database(
+      pkg.db.exec_tx(transaction), pkg.db.MetaDetail.Names, metadata_out, [],
+    )
+    match metadata { Err(_) => { return 12 }, Ok(_) => {} }
+  }
+  arena plan_out {
+    plan_bytes := [1 as u8, 2 as u8, 3 as u8]
+    explained := pkg.db.explain(
+      pkg.db.exec_tx(transaction),
+      app.q4a_query.selected(),
+      app.q4a_query.Params { id: 9, label: "tx", payload: plan_bytes[..] },
+      plan_out,
+      [],
+    )
+    match explained { Err(_) => { return 13 }, Ok(_) => {} }
+  }
+  arena out {
+    bytes := [1 as u8, 2 as u8, 3 as u8]
+    selected := pkg.db.one(
+      pkg.db.exec_tx(transaction),
+      app.q4a_query.selected(),
+      app.q4a_query.Params { id: 9, label: "tx", payload: bytes[..] },
+      out,
+      [],
+    )
+    match selected {
+      Err(_) => { return 4 }
+      Ok(row) => if row.id != 9 { return 5 }
+    }
+  }
+  ended := pkg.db.commit(transaction)
+  return match ended { Err(_) => 10, Ok(connection) => immediate(connection) }
+}
+
+fn run(connection: pkg.db.conn) -> i32 {
+  setup := pkg.db.execute(
+    pkg.db.exec_conn(connection),
+    app.q4a_query.setup(),
+    app.q4a_query.TxParams { id: 0 },
+    [],
+  )
+  match setup { Err(_) => { return 1 }, Ok(_) => {} }
+  begun_common := pkg.db.begin(connection, [])
+  return match begun_common { Err(_) => 2, Ok(transaction) => use_transaction(transaction) }
+}
+
+fn main() -> i32 {
+  opened := pkg.db.sqlite.connect(":memory:", [])
+  return match opened { Err(_) => 11, Ok(connection) => run(connection) }
+}
+"#;
+
+const POSTGRES_PREPARED_TRANSACTIONS_MAIN: &str = r#"module main
+import pkg.db
+import pkg.db.postgres
+import app.q4a_postgres_query
+import pkg.db.testkit.pg
+
+
+fn execute_once(
+  borrow mut statement: pkg.db.stmt<
+    app.q4a_postgres_query.Params,
+    app.q4a_postgres_query.Row,
+  >,
+  id: i64,
+  label: str,
+) -> i32 {
+  bytes := [1 as u8, 2 as u8, 3 as u8]
+  result := pkg.db.rows_stmt(statement, app.q4a_postgres_query.Params {
+    id: id,
+    label: label,
+    payload: bytes[..],
+  }, [])
+  return match result { Err(_) => 1, Ok(_) => 0 }
+}
+
+fn common_prepared_phase(borrow connection: pkg.db.conn) -> i32 {
+  prepared := pkg.db.prepare(
+    pkg.db.exec_conn(connection),
+    app.q4a_postgres_query.selected(),
+    [],
+  )
+  return match prepared {
+    Err(_) => 10
+    Ok(statement_value) => {
+      mut statement := statement_value
+      execute_once(statement, 7, "first")
+    }
+  }
+}
+
+fn prepared_phase(borrow connection: pkg.db.conn) -> i32 {
+  common := common_prepared_phase(connection)
+  if common != 0 { return common }
+  prepared := pkg.db.postgres.prepare_native(
+    pkg.db.exec_conn(connection),
+    app.q4a_postgres_query.selected(),
+    [],
+    [
+      pkg.db.postgres.PrepareOption.ParameterOid("id", 20 as u32),
+      pkg.db.postgres.PrepareOption.ParameterOid("label", 25 as u32),
+      pkg.db.postgres.PrepareOption.ParameterOid("payload", 17 as u32),
+    ],
+  )
+  return match prepared {
+    Err(_) => 2
+    Ok(statement_value) => {
+      mut statement := statement_value
+      first := execute_once(statement, 7, "first")
+      if first != 0 { return first }
+      execute_once(statement, 8, "second")
+    }
+  }
+}
+
+fn common_end(connection: pkg.db.conn) -> i32 {
+  begun := pkg.db.begin(connection, [])
+  return match begun {
+    Err(_) => 7
+    Ok(transaction) => match pkg.db.rollback(transaction) {
+      Err(_) => 8
+      Ok(connection_value) => 0
+    }
+  }
+}
+
+fn transaction_phase(connection: pkg.db.conn) -> i32 {
+  begun := pkg.db.postgres.begin_native(
+    connection,
+    [],
+    [
+      pkg.db.postgres.TxOption.Isolation(pkg.db.postgres.Isolation.Serializable),
+      pkg.db.postgres.TxOption.Access(pkg.db.postgres.Access.ReadOnly),
+      pkg.db.postgres.TxOption.Deferrable(true),
+    ],
+  )
+  return match begun {
+    Err(_) => 3
+    Ok(transaction) => {
+      executed := pkg.db.execute(
+        pkg.db.exec_tx(transaction),
+        app.q4a_postgres_query.touched(),
+        app.q4a_postgres_query.TxParams { value: 9 },
+        [],
+      )
+      match executed { Err(_) => { return 4 }, Ok(_) => {} }
+      ended := pkg.db.commit(transaction)
+      match ended { Err(_) => 5, Ok(connection_value) => common_end(connection_value) }
+    }
+  }
+}
+
+fn run(connection: pkg.db.conn) -> i32 {
+  prepared := prepared_phase(connection)
+  if prepared != 0 { return prepared }
+  return transaction_phase(connection)
+}
+
+fn main() -> i32 {
+  pkg.db.testkit.pg.reset()
+  opened := pkg.db.postgres.connect("postgresql://stub/q4a", [])
+  result := match opened { Err(_) => 6, Ok(connection) => run(connection) }
+  if result != 0 { return result }
+  pkg.db.testkit.pg.dump()
+  return 42
+}
+"#;
+
+const POSTGRES_OPTION_PREFLIGHT_MAIN: &str = r#"module main
+import pkg.db
+import pkg.db.postgres
+import app.q4a_postgres_query
+import pkg.db.testkit.pg
+
+
+fn prepare_errors(borrow connection: pkg.db.conn) -> bool {
+  zero := pkg.db.postgres.prepare_native(
+    pkg.db.exec_conn(connection),
+    app.q4a_postgres_query.selected(),
+    [],
+    [pkg.db.postgres.PrepareOption.ParameterOid("id", 0 as u32)],
+  )
+  match zero { Ok(_) => { return false }, Err(_) => {} }
+  unknown := pkg.db.postgres.prepare_native(
+    pkg.db.exec_conn(connection),
+    app.q4a_postgres_query.selected(),
+    [],
+    [pkg.db.postgres.PrepareOption.ParameterOid("missing", 20 as u32)],
+  )
+  match unknown { Ok(_) => { return false }, Err(_) => {} }
+  duplicate := pkg.db.postgres.prepare_native(
+    pkg.db.exec_conn(connection),
+    app.q4a_postgres_query.selected(),
+    [],
+    [
+      pkg.db.postgres.PrepareOption.ParameterOid("id", 20 as u32),
+      pkg.db.postgres.PrepareOption.ParameterOid("id", 21 as u32),
+    ],
+  )
+  return match duplicate { Ok(_) => false, Err(_) => true }
+}
+
+fn common_precedes_native(error: pkg.db.Error) -> bool = match error {
+  Unsupported(contract) => contract.item == "db.transaction.begin_timeout_ns"
+  _ => false
+}
+
+fn main() -> i32 {
+  pkg.db.testkit.pg.reset()
+  opened := pkg.db.postgres.connect("postgresql://stub/q4a", [])
+  native_checked := match opened {
+    Err(_) => false
+    Ok(connection) => {
+      if !prepare_errors(connection) { return 1 }
+      begun := pkg.db.postgres.begin_native(
+        connection,
+        [],
+        [pkg.db.postgres.TxOption.Deferrable(true)],
+      )
+      match begun { Ok(_) => false, Err(_) => true }
+    }
+  }
+  if !native_checked { return 2 }
+  second_opened := pkg.db.postgres.connect("postgresql://stub/q4a", [])
+  common_checked := match second_opened {
+    Err(_) => false
+    Ok(second_connection) => {
+      second_begun := pkg.db.postgres.begin_native(
+        second_connection,
+        [pkg.db.TxOption.BeginTimeoutNs(0)],
+        [pkg.db.postgres.TxOption.Deferrable(true)],
+      )
+      match second_begun { Ok(_) => false, Err(error) => common_precedes_native(error) }
+    }
+  }
+  if !common_checked { return 3 }
+  pkg.db.testkit.pg.dump()
+  return 42
+}
+"#;
+
+const POSTGRES_FAILED_COMMIT_MAIN: &str = r#"module main
+import pkg.db
+import pkg.db.postgres
+import pkg.db.testkit.pg
+
+extern "C" {
+  fn align_pg_fail_next_control()
+}
+
+fn fail_commit(transaction: pkg.db.tx) -> bool {
+  unsafe { align_pg_fail_next_control() }
+  ended := pkg.db.commit(transaction)
+  return match ended { Ok(_) => false, Err(_) => true }
+}
+
+fn main() -> i32 {
+  pkg.db.testkit.pg.reset()
+  opened := pkg.db.postgres.connect("postgresql://stub/q4a", [])
+  failed := match opened {
+    Err(_) => false
+    Ok(connection) => match pkg.db.begin(connection, []) {
+      Err(_) => false
+      Ok(transaction) => fail_commit(transaction)
+    }
+  }
+  if !failed { return 1 }
+  pkg.db.testkit.pg.dump()
+  return 42
+}
+"#;
+
+const POSTGRES_IMPLICIT_ROLLBACK_MAIN: &str = r#"module main
+import pkg.db
+import pkg.db.postgres
+import pkg.db.testkit.pg
+
+extern "C" {
+  fn align_pg_rollback_next_commit()
+}
+
+fn commit_aborted(transaction: pkg.db.tx) -> bool {
+  unsafe { align_pg_rollback_next_commit() }
+  ended := pkg.db.commit(transaction)
+  return match ended {
+    Ok(_) => false
+    Err(error) => match error { Native(_) => true, _ => false }
+  }
+}
+
+fn main() -> i32 {
+  pkg.db.testkit.pg.reset()
+  opened := pkg.db.postgres.connect("postgresql://stub/q4a", [])
+  rejected := match opened {
+    Err(_) => false
+    Ok(connection) => match pkg.db.begin(connection, []) {
+      Err(_) => false
+      Ok(transaction) => commit_aborted(transaction)
+    }
+  }
+  if !rejected { return 1 }
+  pkg.db.testkit.pg.dump()
+  return 42
+}
+"#;
+
+const POSTGRES_FAILED_ROLLBACK_MAIN: &str = r#"module main
+import pkg.db
+import pkg.db.postgres
+import pkg.db.testkit.pg
+
+extern "C" {
+  fn align_pg_fail_next_control()
+}
+
+fn fail_rollback(transaction: pkg.db.tx) -> bool {
+  unsafe { align_pg_fail_next_control() }
+  ended := pkg.db.rollback(transaction)
+  return match ended { Ok(_) => false, Err(_) => true }
+}
+
+fn main() -> i32 {
+  pkg.db.testkit.pg.reset()
+  opened := pkg.db.postgres.connect("postgresql://stub/q4a", [])
+  failed := match opened {
+    Err(_) => false
+    Ok(connection) => match pkg.db.begin(connection, []) {
+      Err(_) => false
+      Ok(transaction) => fail_rollback(transaction)
+    }
+  }
+  if !failed { return 1 }
+  pkg.db.testkit.pg.dump()
+  return 42
+}
+"#;
+
+const CASE_SQLITE_PREPARED_REUSE: Case = Case {
+    label: "pkg-db-q4a-sqlite-prepared-reuse",
+    runner: RunnerKind::PerUnitC,
+    needs: Needs::BackendAndCc,
+    links: &[&PG, &SQLITE_Q4A],
+    counters: &[&SQLITE_Q4A],
+    modules: q4a_modules,
+    main: SQLITE_PREPARED_REUSE_MAIN,
+    expected_exit: 42,
+    expect_counters: &[
+        ("sqlite.protocol_ok", 1),
+        ("sqlite.prepare_calls", 1),
+        ("sqlite.bind_i64_calls", 2),
+        ("sqlite.bind_text_calls", 2),
+        ("sqlite.bind_blob_calls", 2),
+        ("sqlite.reset_calls", 2),
+        ("sqlite.clear_calls", 2),
+        ("sqlite.finalize_calls", 1),
+    ],
+};
+
+const CASE_SQLITE_UNSUPPORTED_SHAPE: Case = Case {
+    label: "pkg-db-q4a-sqlite-unsupported-shape",
+    runner: RunnerKind::PerUnitC,
+    needs: Needs::BackendAndCc,
+    links: &[&PG, &SQLITE_Q4A],
+    counters: &[&SQLITE_Q4A],
+    modules: q4a_unsupported_modules,
+    main: SQLITE_UNSUPPORTED_SHAPE_MAIN,
+    expected_exit: 42,
+    expect_counters: &[
+        ("sqlite.protocol_ok", 1),
+        ("sqlite.prepare_calls", 1),
+    ],
+};
+
+const CASE_SQLITE_BIND_RECOVERY: Case = Case {
+    label: "pkg-db-q4a-sqlite-bind-recovery",
+    runner: RunnerKind::PerUnitC,
+    needs: Needs::BackendAndCc,
+    links: &[&PG, &SQLITE_Q4A],
+    counters: &[&SQLITE_Q4A],
+    modules: q4a_modules,
+    main: SQLITE_BIND_RECOVERY_MAIN,
+    expected_exit: 42,
+    expect_counters: &[
+        ("sqlite.protocol_ok", 1),
+        ("sqlite.bind_i64_calls", 2),
+        ("sqlite.bind_text_calls", 2),
+        ("sqlite.bind_blob_calls", 1),
+        ("sqlite.reset_calls", 2),
+        ("sqlite.clear_calls", 2),
+        ("sqlite.finalize_calls", 1),
+    ],
+};
+
+const CASE_SQLITE_CLEANUP_POISON: Case = Case {
+    label: "pkg-db-q4a-sqlite-cleanup-poison",
+    runner: RunnerKind::PerUnitC,
+    needs: Needs::BackendAndCc,
+    links: &[&PG, &SQLITE_Q4A],
+    counters: &[&SQLITE_Q4A],
+    modules: q4a_modules,
+    main: SQLITE_CLEANUP_POISON_MAIN,
+    expected_exit: 42,
+    expect_counters: &[
+        ("sqlite.protocol_ok", 1),
+        ("sqlite.prepare_calls", 1),
+        ("sqlite.bind_i64_calls", 1),
+        ("sqlite.reset_calls", 1),
+        ("sqlite.clear_calls", 1),
+        ("sqlite.finalize_calls", 1),
+    ],
+};
+
+const CASE_SQLITE_TRANSACTIONS: Case = Case {
+    label: "pkg-db-q4a-sqlite-transactions",
+    runner: RunnerKind::PerUnitC,
+    needs: Needs::BackendAndCc,
+    links: &[&PG],
+    counters: &[],
+    modules: q4a_modules,
+    main: SQLITE_TRANSACTIONS_MAIN,
+    expected_exit: 42,
+    expect_counters: &[],
+};
+
+const CASE_POSTGRES_PREPARED_TRANSACTIONS: Case = Case {
+    label: "pkg-db-q4a-postgres-prepared-transactions",
+    runner: RunnerKind::PerUnitC,
+    needs: Needs::BackendAndCc,
+    links: &[&PG],
+    counters: &[&PG],
+    modules: q4a_modules,
+    main: POSTGRES_PREPARED_TRANSACTIONS_MAIN,
+    expected_exit: 42,
+    expect_counters: &[
+        ("pg.protocol_ok", 1),
+        ("pg.prepare_calls", 2),
+        ("pg.execute_prepared_calls", 3),
+        ("pg.execute_calls", 1),
+        ("pg.control_calls", 4),
+        ("pg.deallocate_calls", 2),
+        ("pg.finish_calls", 1),
+    ],
+};
+
+const CASE_POSTGRES_OPTION_PREFLIGHT: Case = Case {
+    label: "pkg-db-q4a-postgres-option-preflight",
+    runner: RunnerKind::PerUnitC,
+    needs: Needs::BackendAndCc,
+    links: &[&PG],
+    counters: &[&PG],
+    modules: q4a_modules,
+    main: POSTGRES_OPTION_PREFLIGHT_MAIN,
+    expected_exit: 42,
+    expect_counters: &[
+        ("pg.protocol_ok", 1),
+        ("pg.prepare_calls", 0),
+        ("pg.control_calls", 0),
+        ("pg.finish_calls", 2),
+    ],
+};
+
+const CASE_POSTGRES_FAILED_COMMIT: Case = Case {
+    label: "pkg-db-q4a-postgres-failed-commit",
+    runner: RunnerKind::PerUnitC,
+    needs: Needs::BackendAndCc,
+    links: &[&PG],
+    counters: &[&PG],
+    modules: q4a_modules,
+    main: POSTGRES_FAILED_COMMIT_MAIN,
+    expected_exit: 42,
+    expect_counters: &[
+        ("pg.protocol_ok", 1),
+        ("pg.control_calls", 3),
+        ("pg.finish_calls", 1),
+    ],
+};
+
+const CASE_POSTGRES_IMPLICIT_ROLLBACK: Case = Case {
+    label: "pkg-db-q4a-postgres-implicit-rollback",
+    runner: RunnerKind::PerUnitC,
+    needs: Needs::BackendAndCc,
+    links: &[&PG],
+    counters: &[&PG],
+    modules: q4a_modules,
+    main: POSTGRES_IMPLICIT_ROLLBACK_MAIN,
+    expected_exit: 42,
+    expect_counters: &[
+        ("pg.protocol_ok", 1),
+        ("pg.control_calls", 3),
+        ("pg.finish_calls", 1),
+    ],
+};
+
+const CASE_POSTGRES_FAILED_ROLLBACK: Case = Case {
+    label: "pkg-db-q4a-postgres-failed-rollback",
+    runner: RunnerKind::PerUnitC,
+    needs: Needs::BackendAndCc,
+    links: &[&PG],
+    counters: &[&PG],
+    modules: q4a_modules,
+    main: POSTGRES_FAILED_ROLLBACK_MAIN,
+    expected_exit: 42,
+    expect_counters: &[
+        ("pg.protocol_ok", 1),
+        ("pg.control_calls", 3),
+        ("pg.finish_calls", 1),
+    ],
+};
+
+/// Every Layer-1 case in this suite, for the fingerprint golden.
+const LAYER1_CASES: &[&Case] = &[
+    &CASE_SQLITE_PREPARED_REUSE,
+    &CASE_SQLITE_UNSUPPORTED_SHAPE,
+    &CASE_SQLITE_BIND_RECOVERY,
+    &CASE_SQLITE_CLEANUP_POISON,
+    &CASE_SQLITE_TRANSACTIONS,
+    &CASE_POSTGRES_PREPARED_TRANSACTIONS,
+    &CASE_POSTGRES_OPTION_PREFLIGHT,
+    &CASE_POSTGRES_FAILED_COMMIT,
+    &CASE_POSTGRES_IMPLICIT_ROLLBACK,
+    &CASE_POSTGRES_FAILED_ROLLBACK,
+];
+
+/// The suite modules every q4a case adds on top of the `pkg.db` package.
+fn q4a_modules() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("pkg/db.align", DB),
-        ("pkg/db/sqlite.align", SQLITE),
-        ("pkg/db/postgres.align", POSTGRES),
-        ("pkg/db/internal.align", INTERNAL),
-        ("pkg/db/internal/resource.align", RESOURCE),
-        ("pkg/db/internal/descriptor.align", DESCRIPTOR),
-        ("pkg/db/internal/sqlite.align", INTERNAL_SQLITE),
-        ("pkg/db/internal/postgres.align", INTERNAL_POSTGRES),
         ("app/q4a_query.align", Q4A_QUERY),
         ("app/q4a_postgres_query.align", Q4A_POSTGRES_QUERY),
-        ("main.align", main),
     ]
+}
+
+/// The layout the non-`Case` owners use: the same module list the cases use, plus one `main`.
+/// Derived from `q4a_modules` so the two cannot drift apart.
+fn package_files(main: &str) -> Layout {
+    let mut layout = Layout::new();
+    for (path, source) in q4a_modules() {
+        layout = layout.module(path, source);
+    }
+    layout.main(main)
 }
 
 const Q4A_SURFACE_PREFIX: &str = r#"module main
@@ -119,28 +951,28 @@ fn q4a_public_surface_remains_exact_after_q4b_streaming_extension() {
         "pub fn rollback(transaction: tx) -> Result<conn, Error>",
     ] {
         assert!(
-            DB.contains(required),
+            package_source("pkg/db.align").contains(required),
             "missing exact Q4a common surface `{required}`"
         );
     }
-    assert!(DB.contains("pub PrepareOption {\n  TimeoutNs(i64)\n}"));
-    assert!(DB.contains("pub TxOption {\n  BeginTimeoutNs(i64)\n}"));
-    assert!(SQLITE.contains("pub PrepareOption {\n  Persistent\n  Normalize\n}"));
-    assert!(SQLITE.contains("pub TxOption {\n  Deferred\n  Immediate\n  Exclusive\n}"));
-    assert!(POSTGRES.contains("pub PrepareOption {\n  ParameterOid(str, u32)\n}"));
-    assert!(POSTGRES.contains(
+    assert!(package_source("pkg/db.align").contains("pub PrepareOption {\n  TimeoutNs(i64)\n}"));
+    assert!(package_source("pkg/db.align").contains("pub TxOption {\n  BeginTimeoutNs(i64)\n}"));
+    assert!(package_source("pkg/db/sqlite.align").contains("pub PrepareOption {\n  Persistent\n  Normalize\n}"));
+    assert!(package_source("pkg/db/sqlite.align").contains("pub TxOption {\n  Deferred\n  Immediate\n  Exclusive\n}"));
+    assert!(package_source("pkg/db/postgres.align").contains("pub PrepareOption {\n  ParameterOid(str, u32)\n}"));
+    assert!(package_source("pkg/db/postgres.align").contains(
         "pub TxOption {\n  Isolation(Isolation)\n  Access(Access)\n  Deferrable(bool)\n}"
     ));
     for deferred in ["pub fn cancel", "pub fn portal", "pub fn statement_cache"] {
         assert!(
-            !DB.contains(deferred),
+            !package_source("pkg/db.align").contains(deferred),
             "Q4a must not publish deferred surface `{deferred}`"
         );
     }
     for (module, source, expected) in [
-        ("pkg.db", DB, 2),
-        ("pkg.db.internal.sqlite", INTERNAL_SQLITE, 0),
-        ("pkg.db.internal.postgres", INTERNAL_POSTGRES, 0),
+        ("pkg.db", package_source("pkg/db.align"), 2),
+        ("pkg.db.internal.sqlite", package_source("pkg/db/internal/sqlite.align"), 0),
+        ("pkg.db.internal.postgres", package_source("pkg/db/internal/postgres.align"), 0),
     ] {
         assert_eq!(
             source
@@ -155,7 +987,7 @@ fn q4a_public_surface_remains_exact_after_q4b_streaming_extension() {
             "{module} must not duplicate the v5 tail-reserved check"
         );
     }
-    for source in [INTERNAL_SQLITE, INTERNAL_POSTGRES] {
+    for source in [package_source("pkg/db/internal/sqlite.align"), package_source("pkg/db/internal/postgres.align")] {
         assert!(source.contains(
             "return pkg.db.command_header_valid(statement, pkg.db.internal.descriptor_header_control())"
         ));
@@ -200,7 +1032,7 @@ fn main() -> i32 = 0
     );
     let checked = diff_check_multi(
         "pkg-db-q4b-prepared-next-surface",
-        &package_files(&main),
+        &package_files(&main).files(),
         "main.align",
     );
     assert!(
@@ -226,7 +1058,7 @@ fn main() -> i32 = 0
 "#;
     let diagnostics = check_multi_diagnostics(
         "pkg-db-q4a-prepare-arity",
-        &package_files(wrong_arity),
+        &package_files(wrong_arity).files(),
         "main.align",
     );
     assert!(
@@ -252,7 +1084,7 @@ fn main() -> i32 = 0
 "#;
     let diagnostics = check_multi_diagnostics(
         "pkg-db-q4a-prepare-option-scope",
-        &package_files(wrong_scope),
+        &package_files(wrong_scope).files(),
         "main.align",
     );
     assert!(
@@ -282,7 +1114,7 @@ fn main() -> i32 = 0
 "#;
     let diagnostics = check_multi_diagnostics(
         "pkg-db-q4a-sealed-prepared-binder",
-        &package_files(sealed),
+        &package_files(sealed).files(),
         "main.align",
     );
     assert!(
@@ -302,7 +1134,7 @@ fn main() -> i32 = 0
 "#;
     let diagnostics = check_multi_diagnostics(
         "pkg-db-q4b-sealed-descriptor-header",
-        &package_files(header_bypass),
+        &package_files(header_bypass).files(),
         "main.align",
     );
     assert!(
@@ -443,7 +1275,7 @@ fn main() -> i32 = 0
         assert!(
             check_multi_errs(
                 &format!("pkg-db-q4a-{name}"),
-                &package_files(main),
+                &package_files(main).files(),
                 "main.align",
             ),
             "ownership case `{name}` must fail"
@@ -521,9 +1353,9 @@ fn main() -> i32 {
 "#;
     let main = format!("{Q4A_SURFACE_PREFIX}{suffix}");
     let files = package_files(&main);
-    let _whole = whole_mir_multi("pkg-db-q4a-surface-whole", &files, "main.align");
+    let _whole = whole_mir_multi("pkg-db-q4a-surface-whole", &files.files(), "main.align");
 
-    let per_unit = build_per_unit_multi("pkg-db-q4a-surface-unit", &files, "main.align");
+    let per_unit = build_per_unit_multi("pkg-db-q4a-surface-unit", &files.files(), "main.align");
     assert!(
         per_unit
             .walk
@@ -536,933 +1368,52 @@ fn main() -> i32 {
 
 #[test]
 fn sqlite_prepared_reuse_copies_views_and_closes_each_native_phase_once() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
-    let main = r#"module main
-import pkg.db
-import pkg.db.sqlite
-import app.q4a_query
-
-extern "C" {
-  fn align_sqlite_q4a_reset()
-  fn align_sqlite_q4a_prepare_calls() -> i32
-  fn align_sqlite_q4a_bind_i64_calls() -> i32
-  fn align_sqlite_q4a_bind_text_calls() -> i32
-  fn align_sqlite_q4a_bind_blob_calls() -> i32
-  fn align_sqlite_q4a_reset_calls() -> i32
-  fn align_sqlite_q4a_clear_calls() -> i32
-  fn align_sqlite_q4a_finalize_calls() -> i32
-  fn align_sqlite_q4a_protocol_ok() -> i32
-}
-
-fn execute_once(
-  borrow mut statement: pkg.db.stmt<app.q4a_query.Params, app.q4a_query.Row>,
-  id: i64,
-  initial_label: str,
-) -> i32 {
-  mut label := initial_label.clone()
-  label_view: str := label
-  mut bytes := [1 as u8, 2 as u8, 3 as u8]
-  params := app.q4a_query.Params {
-    id: id,
-    label: label_view,
-    payload: bytes[..],
-  }
-  result := pkg.db.rows_stmt(statement, params, [])
-  return match result {
-    Err(_) => 2
-    Ok(rows_value) => {
-      mut rows := rows_value
-      label = "source storage replaced".clone()
-      bytes[0] = 9
-      if label.len() == 0 || bytes[0] != 9 { return 3 }
-      first := pkg.db.next(rows)
-      match first {
-        Err(_) => { return 7 }
-        Ok(value) => match value {
-          None => { return 8 }
-          Some(row) => if row.id != id { return 9 }
-        }
-      }
-      second := pkg.db.next(rows)
-      match second {
-        Err(_) => 10
-        Ok(value) => match value { None => 0, Some(_) => 11 }
-      }
-    }
-  }
-}
-
-fn is_unsupported_item(error: pkg.db.Error, expected: str) -> bool = match error {
-  Unsupported(contract) => contract.item == expected
-  _ => false
-}
-
-fn prepared_phase(borrow connection: pkg.db.conn) -> i32 {
-  common_invalid := pkg.db.sqlite.prepare_native(
-    pkg.db.exec_conn(connection),
-    app.q4a_query.selected(),
-    [pkg.db.PrepareOption.TimeoutNs(0)],
-    [pkg.db.sqlite.PrepareOption.Persistent, pkg.db.sqlite.PrepareOption.Persistent],
-  )
-  match common_invalid {
-    Ok(_) => { return 10 }
-    Err(error) => if !is_unsupported_item(error, "db.prepare.timeout_ns") { return 11 }
-  }
-  native_duplicate := pkg.db.sqlite.prepare_native(
-    pkg.db.exec_conn(connection),
-    app.q4a_query.selected(),
-    [],
-    [pkg.db.sqlite.PrepareOption.Normalize, pkg.db.sqlite.PrepareOption.Normalize],
-  )
-  match native_duplicate {
-    Ok(_) => { return 13 }
-    Err(error) => if !is_unsupported_item(error, "sqlite.prepare.option") { return 14 }
-  }
-  prepared := pkg.db.sqlite.prepare_native(
-    pkg.db.exec_conn(connection),
-    app.q4a_query.selected(),
-    [],
-    [pkg.db.sqlite.PrepareOption.Persistent, pkg.db.sqlite.PrepareOption.Normalize],
-  )
-  return match prepared {
-    Err(_) => 4
-    Ok(statement_value) => {
-      mut statement := statement_value
-      first := execute_once(statement, 7, "first")
-      if first != 0 { return first }
-      execute_once(statement, 8, "second")
-    }
-  }
-}
-
-fn main() -> i32 {
-  unsafe { align_sqlite_q4a_reset() }
-  opened := pkg.db.sqlite.connect(":memory:", [])
-  result := match opened {
-    Err(_) => 5
-    Ok(connection) => prepared_phase(connection)
-  }
-  if result != 0 { return result }
-  return unsafe {
-    if align_sqlite_q4a_protocol_ok() == 1
-      && align_sqlite_q4a_prepare_calls() == 1
-      && align_sqlite_q4a_bind_i64_calls() == 2
-      && align_sqlite_q4a_bind_text_calls() == 2
-      && align_sqlite_q4a_bind_blob_calls() == 2
-      && align_sqlite_q4a_reset_calls() == 2
-      && align_sqlite_q4a_clear_calls() == 2
-      && align_sqlite_q4a_finalize_calls() == 1 { 42 } else { 6 }
-    }
-}
-"#;
-    let files = package_files(main);
-    let fixture = format!("{POSTGRES_STUB}\n{SQLITE_PREPARED_STUB}");
-    let output = build_and_run_multi_with_c(
-        "pkg-db-q4a-sqlite-prepared-reuse",
-        &files,
-        "main.align",
-        &fixture,
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "stdout: {}; stderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    CASE_SQLITE_PREPARED_REUSE.run();
 }
 
 #[test]
 fn sqlite_newly_supported_prepared_shape_reaches_native_prepare() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
-    let unsupported = r#"module app.q4a_unsupported
-import pkg.db
-import pkg.db.sqlite
-
-pub Params { enabled: bool }
-pub Row { value: i64 }
-
-pub fn selected() -> pkg.db.query<Params, Row> = pkg.db.sqlite.query(
-  "SELECT :enabled AS value",
-  [],
-  [],
-)
-"#;
-    let main = r#"module main
-import pkg.db
-import pkg.db.sqlite
-import app.q4a_unsupported
-
-extern "C" {
-  fn align_sqlite_q4a_reset()
-  fn align_sqlite_q4a_prepare_calls() -> i32
-  fn align_sqlite_q4a_protocol_ok() -> i32
-}
-
-fn main() -> i32 {
-  unsafe { align_sqlite_q4a_reset() }
-  opened := pkg.db.sqlite.connect(":memory:", [])
-  prepared_ok := match opened {
-    Err(_) => false
-    Ok(connection) => {
-      prepared := pkg.db.sqlite.prepare_native(
-        pkg.db.exec_conn(connection),
-        app.q4a_unsupported.selected(),
-        [],
-        [pkg.db.sqlite.PrepareOption.Persistent, pkg.db.sqlite.PrepareOption.Normalize],
-      )
-      match prepared { Ok(_) => true, Err(_) => false }
-    }
-  }
-  return unsafe {
-    if prepared_ok && align_sqlite_q4a_protocol_ok() == 1
-      && align_sqlite_q4a_prepare_calls() == 1 { 42 } else { 1 }
-  }
-}
-"#;
-    let mut files = package_files(main);
-    files.push(("app/q4a_unsupported.align", unsupported));
-    let fixture = format!("{POSTGRES_STUB}\n{SQLITE_PREPARED_STUB}");
-    let output = build_and_run_multi_with_c(
-        "pkg-db-q4a-sqlite-unsupported-shape",
-        &files,
-        "main.align",
-        &fixture,
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "stdout: {}; stderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    CASE_SQLITE_UNSUPPORTED_SHAPE.run();
 }
 
 #[test]
 fn sqlite_partial_bind_failure_cleans_native_state_and_statement_reuses() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
-    let main = r#"module main
-import pkg.db
-import pkg.db.sqlite
-import app.q4a_query
-
-extern "C" {
-  fn align_sqlite_q4a_reset()
-  fn align_sqlite_q4a_fail_next_text()
-  fn align_sqlite_q4a_bind_i64_calls() -> i32
-  fn align_sqlite_q4a_bind_text_calls() -> i32
-  fn align_sqlite_q4a_bind_blob_calls() -> i32
-  fn align_sqlite_q4a_reset_calls() -> i32
-  fn align_sqlite_q4a_clear_calls() -> i32
-  fn align_sqlite_q4a_finalize_calls() -> i32
-  fn align_sqlite_q4a_protocol_ok() -> i32
-}
-
-fn run(borrow connection: pkg.db.conn) -> i32 {
-  prepared := pkg.db.sqlite.prepare_native(
-    pkg.db.exec_conn(connection),
-    app.q4a_query.selected(),
-    [],
-    [pkg.db.sqlite.PrepareOption.Persistent, pkg.db.sqlite.PrepareOption.Normalize],
-  )
-  return match prepared {
-    Err(_) => 1
-    Ok(statement_value) => {
-      mut statement := statement_value
-      first_bytes := [1 as u8, 2 as u8, 3 as u8]
-      unsafe { align_sqlite_q4a_fail_next_text() }
-      failed := pkg.db.rows_stmt(statement, app.q4a_query.Params {
-        id: 7,
-        label: "first",
-        payload: first_bytes[..],
-      }, [])
-      match failed { Ok(_) => { return 2 }, Err(_) => {} }
-      second_bytes := [1 as u8, 2 as u8, 3 as u8]
-      succeeded := pkg.db.rows_stmt(statement, app.q4a_query.Params {
-        id: 8,
-        label: "second",
-        payload: second_bytes[..],
-      }, [])
-      match succeeded { Err(_) => 3, Ok(_) => 0 }
-    }
-  }
-}
-
-fn main() -> i32 {
-  unsafe { align_sqlite_q4a_reset() }
-  opened := pkg.db.sqlite.connect(":memory:", [])
-  result := match opened { Err(_) => 4, Ok(connection) => run(connection) }
-  if result != 0 { return result }
-  return unsafe {
-    if align_sqlite_q4a_protocol_ok() == 1
-      && align_sqlite_q4a_bind_i64_calls() == 2
-      && align_sqlite_q4a_bind_text_calls() == 2
-      && align_sqlite_q4a_bind_blob_calls() == 1
-      && align_sqlite_q4a_reset_calls() == 2
-      && align_sqlite_q4a_clear_calls() == 2
-      && align_sqlite_q4a_finalize_calls() == 1 { 42 } else { 5 }
-  }
-}
-"#;
-    let files = package_files(main);
-    let fixture = format!("{POSTGRES_STUB}\n{SQLITE_PREPARED_STUB}");
-    let output = build_and_run_multi_with_c(
-        "pkg-db-q4a-sqlite-bind-recovery",
-        &files,
-        "main.align",
-        &fixture,
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "stdout: {}; stderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    CASE_SQLITE_BIND_RECOVERY.run();
 }
 
 #[test]
 fn sqlite_rows_cleanup_failure_poisons_the_parent_before_statement_reuse() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
-    let main = r#"module main
-import pkg.db
-import pkg.db.sqlite
-import app.q4a_query
-
-extern "C" {
-  fn align_sqlite_q4a_reset()
-  fn align_sqlite_q4a_fail_next_reset()
-  fn align_sqlite_q4a_prepare_calls() -> i32
-  fn align_sqlite_q4a_bind_i64_calls() -> i32
-  fn align_sqlite_q4a_reset_calls() -> i32
-  fn align_sqlite_q4a_clear_calls() -> i32
-  fn align_sqlite_q4a_finalize_calls() -> i32
-  fn align_sqlite_q4a_protocol_ok() -> i32
-}
-
-fn execute_once(
-  borrow mut statement: pkg.db.stmt<app.q4a_query.Params, app.q4a_query.Row>,
-  id: i64,
-  initial_label: str,
-) -> i32 {
-  mut label := initial_label.clone()
-  label_view: str := label
-  mut bytes := [1 as u8, 2 as u8, 3 as u8]
-  result := pkg.db.rows_stmt(statement, app.q4a_query.Params {
-    id: id, label: label_view, payload: bytes[..],
-  }, [])
-  return match result {
-    Err(_) => 2
-    Ok(rows) => {
-      label = "source storage replaced".clone()
-      bytes[0] = 9
-      if label.len() == 0 || bytes[0] != 9 { return 6 }
-      0
-    }
-  }
-}
-
-fn run(borrow connection: pkg.db.conn) -> i32 {
-  made := pkg.db.sqlite.prepare_native(
-    pkg.db.exec_conn(connection),
-    app.q4a_query.selected(),
-    [],
-    [pkg.db.sqlite.PrepareOption.Persistent, pkg.db.sqlite.PrepareOption.Normalize],
-  )
-  return match made {
-    Err(_) => 1
-    Ok(statement_value) => {
-      mut statement := statement_value
-      first := execute_once(statement, 7, "first")
-      if first != 0 { return first }
-      second := execute_once(statement, 8, "second")
-      if second == 2 { 0 } else { 3 }
-    }
-  }
-}
-
-fn main() -> i32 {
-  unsafe {
-    align_sqlite_q4a_reset()
-    align_sqlite_q4a_fail_next_reset()
-  }
-  opened := pkg.db.sqlite.connect(":memory:", [])
-  result := match opened { Err(_) => 4, Ok(connection) => run(connection) }
-  if result != 0 { return result }
-  return unsafe {
-    if align_sqlite_q4a_protocol_ok() == 1
-      && align_sqlite_q4a_prepare_calls() == 1
-      && align_sqlite_q4a_bind_i64_calls() == 1
-      && align_sqlite_q4a_reset_calls() == 1
-      && align_sqlite_q4a_clear_calls() == 1
-      && align_sqlite_q4a_finalize_calls() == 1 { 42 } else { 5 }
-  }
-}
-"#;
-    let files = package_files(main);
-    let fixture = format!("{POSTGRES_STUB}\n{SQLITE_PREPARED_STUB}");
-    let output = build_and_run_multi_with_c(
-        "pkg-db-q4a-sqlite-cleanup-poison",
-        &files,
-        "main.align",
-        &fixture,
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "stdout: {}; stderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    CASE_SQLITE_CLEANUP_POISON.run();
 }
 
 #[test]
 fn sqlite_transactions_execute_through_common_views_and_cover_all_begin_modes() {
-    if !backend_available() {
-        return;
-    }
-    let main = r#"module main
-import pkg.db
-import pkg.db.sqlite
-import app.q4a_query
-
-fn exclusive(connection: pkg.db.conn) -> i32 {
-  begun_exclusive := pkg.db.sqlite.begin_native(
-    connection, [], [pkg.db.sqlite.TxOption.Exclusive],
-  )
-  return match begun_exclusive {
-    Err(_) => 8
-    Ok(transaction) => match pkg.db.rollback(transaction) {
-      Err(_) => 9
-      Ok(connection_value) => 42
-    }
-  }
-}
-
-fn immediate(connection: pkg.db.conn) -> i32 {
-  begun_immediate := pkg.db.sqlite.begin_native(
-    connection, [], [pkg.db.sqlite.TxOption.Immediate],
-  )
-  return match begun_immediate {
-    Err(_) => 6
-    Ok(transaction) => match pkg.db.rollback(transaction) {
-      Err(_) => 7
-      Ok(connection_value) => exclusive(connection_value)
-    }
-  }
-}
-
-fn use_transaction(transaction: pkg.db.tx) -> i32 {
-  updated := pkg.db.execute(
-    pkg.db.exec_tx(transaction),
-    app.q4a_query.touched(),
-    app.q4a_query.TxParams { id: 9 },
-    [],
-  )
-  match updated { Err(_) => { return 3 }, Ok(_) => {} }
-  arena metadata_out {
-    metadata := pkg.db.meta_database(
-      pkg.db.exec_tx(transaction), pkg.db.MetaDetail.Names, metadata_out, [],
-    )
-    match metadata { Err(_) => { return 12 }, Ok(_) => {} }
-  }
-  arena plan_out {
-    plan_bytes := [1 as u8, 2 as u8, 3 as u8]
-    explained := pkg.db.explain(
-      pkg.db.exec_tx(transaction),
-      app.q4a_query.selected(),
-      app.q4a_query.Params { id: 9, label: "tx", payload: plan_bytes[..] },
-      plan_out,
-      [],
-    )
-    match explained { Err(_) => { return 13 }, Ok(_) => {} }
-  }
-  arena out {
-    bytes := [1 as u8, 2 as u8, 3 as u8]
-    selected := pkg.db.one(
-      pkg.db.exec_tx(transaction),
-      app.q4a_query.selected(),
-      app.q4a_query.Params { id: 9, label: "tx", payload: bytes[..] },
-      out,
-      [],
-    )
-    match selected {
-      Err(_) => { return 4 }
-      Ok(row) => if row.id != 9 { return 5 }
-    }
-  }
-  ended := pkg.db.commit(transaction)
-  return match ended { Err(_) => 10, Ok(connection) => immediate(connection) }
-}
-
-fn run(connection: pkg.db.conn) -> i32 {
-  setup := pkg.db.execute(
-    pkg.db.exec_conn(connection),
-    app.q4a_query.setup(),
-    app.q4a_query.TxParams { id: 0 },
-    [],
-  )
-  match setup { Err(_) => { return 1 }, Ok(_) => {} }
-  begun_common := pkg.db.begin(connection, [])
-  return match begun_common { Err(_) => 2, Ok(transaction) => use_transaction(transaction) }
-}
-
-fn main() -> i32 {
-  opened := pkg.db.sqlite.connect(":memory:", [])
-  return match opened { Err(_) => 11, Ok(connection) => run(connection) }
-}
-"#;
-    let files = package_files(main);
-    let output = build_and_run_multi_with_c(
-        "pkg-db-q4a-sqlite-transactions",
-        &files,
-        "main.align",
-        POSTGRES_STUB,
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "stdout: {}; stderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    CASE_SQLITE_TRANSACTIONS.run();
 }
 
 #[test]
 fn postgres_prepared_reuse_and_transactions_share_the_connection_lifecycle() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
-    let main = r#"module main
-import pkg.db
-import pkg.db.postgres
-import app.q4a_postgres_query
-
-extern "C" {
-  fn align_pg_reset()
-  fn align_pg_prepare_calls() -> i32
-  fn align_pg_execute_prepared_calls() -> i32
-  fn align_pg_execute_calls() -> i32
-  fn align_pg_control_calls() -> i32
-  fn align_pg_deallocate_calls() -> i32
-  fn align_pg_finish_calls() -> i32
-  fn align_pg_protocol_ok() -> i32
-}
-
-fn execute_once(
-  borrow mut statement: pkg.db.stmt<
-    app.q4a_postgres_query.Params,
-    app.q4a_postgres_query.Row,
-  >,
-  id: i64,
-  label: str,
-) -> i32 {
-  bytes := [1 as u8, 2 as u8, 3 as u8]
-  result := pkg.db.rows_stmt(statement, app.q4a_postgres_query.Params {
-    id: id,
-    label: label,
-    payload: bytes[..],
-  }, [])
-  return match result { Err(_) => 1, Ok(_) => 0 }
-}
-
-fn common_prepared_phase(borrow connection: pkg.db.conn) -> i32 {
-  prepared := pkg.db.prepare(
-    pkg.db.exec_conn(connection),
-    app.q4a_postgres_query.selected(),
-    [],
-  )
-  return match prepared {
-    Err(_) => 10
-    Ok(statement_value) => {
-      mut statement := statement_value
-      execute_once(statement, 7, "first")
-    }
-  }
-}
-
-fn prepared_phase(borrow connection: pkg.db.conn) -> i32 {
-  common := common_prepared_phase(connection)
-  if common != 0 { return common }
-  prepared := pkg.db.postgres.prepare_native(
-    pkg.db.exec_conn(connection),
-    app.q4a_postgres_query.selected(),
-    [],
-    [
-      pkg.db.postgres.PrepareOption.ParameterOid("id", 20 as u32),
-      pkg.db.postgres.PrepareOption.ParameterOid("label", 25 as u32),
-      pkg.db.postgres.PrepareOption.ParameterOid("payload", 17 as u32),
-    ],
-  )
-  return match prepared {
-    Err(_) => 2
-    Ok(statement_value) => {
-      mut statement := statement_value
-      first := execute_once(statement, 7, "first")
-      if first != 0 { return first }
-      execute_once(statement, 8, "second")
-    }
-  }
-}
-
-fn common_end(connection: pkg.db.conn) -> i32 {
-  begun := pkg.db.begin(connection, [])
-  return match begun {
-    Err(_) => 7
-    Ok(transaction) => match pkg.db.rollback(transaction) {
-      Err(_) => 8
-      Ok(connection_value) => 0
-    }
-  }
-}
-
-fn transaction_phase(connection: pkg.db.conn) -> i32 {
-  begun := pkg.db.postgres.begin_native(
-    connection,
-    [],
-    [
-      pkg.db.postgres.TxOption.Isolation(pkg.db.postgres.Isolation.Serializable),
-      pkg.db.postgres.TxOption.Access(pkg.db.postgres.Access.ReadOnly),
-      pkg.db.postgres.TxOption.Deferrable(true),
-    ],
-  )
-  return match begun {
-    Err(_) => 3
-    Ok(transaction) => {
-      executed := pkg.db.execute(
-        pkg.db.exec_tx(transaction),
-        app.q4a_postgres_query.touched(),
-        app.q4a_postgres_query.TxParams { value: 9 },
-        [],
-      )
-      match executed { Err(_) => { return 4 }, Ok(_) => {} }
-      ended := pkg.db.commit(transaction)
-      match ended { Err(_) => 5, Ok(connection_value) => common_end(connection_value) }
-    }
-  }
-}
-
-fn run(connection: pkg.db.conn) -> i32 {
-  prepared := prepared_phase(connection)
-  if prepared != 0 { return prepared }
-  return transaction_phase(connection)
-}
-
-fn main() -> i32 {
-  unsafe { align_pg_reset() }
-  opened := pkg.db.postgres.connect("postgresql://stub/q4a", [])
-  result := match opened { Err(_) => 6, Ok(connection) => run(connection) }
-  if result != 0 { return result }
-  return unsafe {
-    if align_pg_protocol_ok() == 1
-      && align_pg_prepare_calls() == 2
-      && align_pg_execute_prepared_calls() == 3
-      && align_pg_execute_calls() == 1
-      && align_pg_control_calls() == 4
-      && align_pg_deallocate_calls() == 2
-      && align_pg_finish_calls() == 1 { 42 } else { 9 }
-  }
-}
-"#;
-    let files = package_files(main);
-    let output = build_and_run_multi_with_c(
-        "pkg-db-q4a-postgres-prepared-transactions",
-        &files,
-        "main.align",
-        POSTGRES_STUB,
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "stdout: {}; stderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    CASE_POSTGRES_PREPARED_TRANSACTIONS.run();
 }
 
 #[test]
 fn postgres_prepare_and_transaction_options_fail_before_native_work() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
-    let main = r#"module main
-import pkg.db
-import pkg.db.postgres
-import app.q4a_postgres_query
-
-extern "C" {
-  fn align_pg_reset()
-  fn align_pg_prepare_calls() -> i32
-  fn align_pg_control_calls() -> i32
-  fn align_pg_finish_calls() -> i32
-  fn align_pg_protocol_ok() -> i32
-}
-
-fn prepare_errors(borrow connection: pkg.db.conn) -> bool {
-  zero := pkg.db.postgres.prepare_native(
-    pkg.db.exec_conn(connection),
-    app.q4a_postgres_query.selected(),
-    [],
-    [pkg.db.postgres.PrepareOption.ParameterOid("id", 0 as u32)],
-  )
-  match zero { Ok(_) => { return false }, Err(_) => {} }
-  unknown := pkg.db.postgres.prepare_native(
-    pkg.db.exec_conn(connection),
-    app.q4a_postgres_query.selected(),
-    [],
-    [pkg.db.postgres.PrepareOption.ParameterOid("missing", 20 as u32)],
-  )
-  match unknown { Ok(_) => { return false }, Err(_) => {} }
-  duplicate := pkg.db.postgres.prepare_native(
-    pkg.db.exec_conn(connection),
-    app.q4a_postgres_query.selected(),
-    [],
-    [
-      pkg.db.postgres.PrepareOption.ParameterOid("id", 20 as u32),
-      pkg.db.postgres.PrepareOption.ParameterOid("id", 21 as u32),
-    ],
-  )
-  return match duplicate { Ok(_) => false, Err(_) => true }
-}
-
-fn common_precedes_native(error: pkg.db.Error) -> bool = match error {
-  Unsupported(contract) => contract.item == "db.transaction.begin_timeout_ns"
-  _ => false
-}
-
-fn main() -> i32 {
-  unsafe { align_pg_reset() }
-  opened := pkg.db.postgres.connect("postgresql://stub/q4a", [])
-  native_checked := match opened {
-    Err(_) => false
-    Ok(connection) => {
-      if !prepare_errors(connection) { return 1 }
-      begun := pkg.db.postgres.begin_native(
-        connection,
-        [],
-        [pkg.db.postgres.TxOption.Deferrable(true)],
-      )
-      match begun { Ok(_) => false, Err(_) => true }
-    }
-  }
-  if !native_checked { return 2 }
-  second_opened := pkg.db.postgres.connect("postgresql://stub/q4a", [])
-  common_checked := match second_opened {
-    Err(_) => false
-    Ok(second_connection) => {
-      second_begun := pkg.db.postgres.begin_native(
-        second_connection,
-        [pkg.db.TxOption.BeginTimeoutNs(0)],
-        [pkg.db.postgres.TxOption.Deferrable(true)],
-      )
-      match second_begun { Ok(_) => false, Err(error) => common_precedes_native(error) }
-    }
-  }
-  if !common_checked { return 3 }
-  return unsafe {
-    if align_pg_protocol_ok() == 1
-      && align_pg_prepare_calls() == 0
-      && align_pg_control_calls() == 0
-      && align_pg_finish_calls() == 2 { 42 } else { 4 }
-  }
-}
-"#;
-    let files = package_files(main);
-    let output = build_and_run_multi_with_c(
-        "pkg-db-q4a-postgres-option-preflight",
-        &files,
-        "main.align",
-        POSTGRES_STUB,
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "stdout: {}; stderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    CASE_POSTGRES_OPTION_PREFLIGHT.run();
 }
 
 #[test]
 fn failed_postgres_commit_drops_through_rollback_then_closes_once() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
-    let main = r#"module main
-import pkg.db
-import pkg.db.postgres
-
-extern "C" {
-  fn align_pg_reset()
-  fn align_pg_fail_next_control()
-  fn align_pg_control_calls() -> i32
-  fn align_pg_finish_calls() -> i32
-  fn align_pg_protocol_ok() -> i32
-}
-
-fn fail_commit(transaction: pkg.db.tx) -> bool {
-  unsafe { align_pg_fail_next_control() }
-  ended := pkg.db.commit(transaction)
-  return match ended { Ok(_) => false, Err(_) => true }
-}
-
-fn main() -> i32 {
-  unsafe { align_pg_reset() }
-  opened := pkg.db.postgres.connect("postgresql://stub/q4a", [])
-  failed := match opened {
-    Err(_) => false
-    Ok(connection) => match pkg.db.begin(connection, []) {
-      Err(_) => false
-      Ok(transaction) => fail_commit(transaction)
-    }
-  }
-  if !failed { return 1 }
-  return unsafe {
-    if align_pg_protocol_ok() == 1
-      && align_pg_control_calls() == 3
-      && align_pg_finish_calls() == 1 { 42 } else { 2 }
-  }
-}
-"#;
-    let files = package_files(main);
-    let output = build_and_run_multi_with_c(
-        "pkg-db-q4a-postgres-failed-commit",
-        &files,
-        "main.align",
-        POSTGRES_STUB,
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "stdout: {}; stderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    CASE_POSTGRES_FAILED_COMMIT.run();
 }
 
 #[test]
 fn postgres_implicit_rollback_command_tag_never_returns_a_connection() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
-    let main = r#"module main
-import pkg.db
-import pkg.db.postgres
-
-extern "C" {
-  fn align_pg_reset()
-  fn align_pg_rollback_next_commit()
-  fn align_pg_control_calls() -> i32
-  fn align_pg_finish_calls() -> i32
-  fn align_pg_protocol_ok() -> i32
-}
-
-fn commit_aborted(transaction: pkg.db.tx) -> bool {
-  unsafe { align_pg_rollback_next_commit() }
-  ended := pkg.db.commit(transaction)
-  return match ended {
-    Ok(_) => false
-    Err(error) => match error { Native(_) => true, _ => false }
-  }
-}
-
-fn main() -> i32 {
-  unsafe { align_pg_reset() }
-  opened := pkg.db.postgres.connect("postgresql://stub/q4a", [])
-  rejected := match opened {
-    Err(_) => false
-    Ok(connection) => match pkg.db.begin(connection, []) {
-      Err(_) => false
-      Ok(transaction) => commit_aborted(transaction)
-    }
-  }
-  if !rejected { return 1 }
-  return unsafe {
-    if align_pg_protocol_ok() == 1
-      && align_pg_control_calls() == 3
-      && align_pg_finish_calls() == 1 { 42 } else { 2 }
-  }
-}
-"#;
-    let files = package_files(main);
-    let output = build_and_run_multi_with_c(
-        "pkg-db-q4a-postgres-implicit-rollback",
-        &files,
-        "main.align",
-        POSTGRES_STUB,
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "stdout: {}; stderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    CASE_POSTGRES_IMPLICIT_ROLLBACK.run();
 }
 
 #[test]
 fn failed_postgres_rollback_retries_fail_safe_rollback_then_closes_once() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
-    let main = r#"module main
-import pkg.db
-import pkg.db.postgres
-
-extern "C" {
-  fn align_pg_reset()
-  fn align_pg_fail_next_control()
-  fn align_pg_control_calls() -> i32
-  fn align_pg_finish_calls() -> i32
-  fn align_pg_protocol_ok() -> i32
-}
-
-fn fail_rollback(transaction: pkg.db.tx) -> bool {
-  unsafe { align_pg_fail_next_control() }
-  ended := pkg.db.rollback(transaction)
-  return match ended { Ok(_) => false, Err(_) => true }
-}
-
-fn main() -> i32 {
-  unsafe { align_pg_reset() }
-  opened := pkg.db.postgres.connect("postgresql://stub/q4a", [])
-  failed := match opened {
-    Err(_) => false
-    Ok(connection) => match pkg.db.begin(connection, []) {
-      Err(_) => false
-      Ok(transaction) => fail_rollback(transaction)
-    }
-  }
-  if !failed { return 1 }
-  return unsafe {
-    if align_pg_protocol_ok() == 1
-      && align_pg_control_calls() == 3
-      && align_pg_finish_calls() == 1 { 42 } else { 2 }
-  }
-}
-"#;
-    let files = package_files(main);
-    let output = build_and_run_multi_with_c(
-        "pkg-db-q4a-postgres-failed-rollback",
-        &files,
-        "main.align",
-        POSTGRES_STUB,
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "stdout: {}; stderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    CASE_POSTGRES_FAILED_ROLLBACK.run();
 }
 
 #[test]
@@ -1550,10 +1501,10 @@ fn main() -> i32 {
 }
 "#;
     let files = package_files(main);
-    let fixture = format!("{POSTGRES_STUB}\n{PREPARED_BENCH}");
+    let fixture = format!("{}\n{PREPARED_BENCH}", PG.c_source);
     let output = build_and_run_multi_with_c(
         "pkg-db-q4a-prepared-benchmark",
-        &files,
+        &files.files(),
         "main.align",
         &fixture,
     );
@@ -1582,4 +1533,32 @@ fn main() -> i32 {
         "pkg-db-reprepare\t{:.2}\tns/op",
         totals[2] as f64 / ITERATIONS
     );
+}
+
+/// The Layer-1 migration's forward guard for this suite.
+///
+/// Observed from the same `Case` records the tests execute, so a changed pipeline, stub set, host
+/// requirement, module set, program text, expected exit, or expected counter moves a digest.
+///
+/// Regenerate ONLY with a reviewed reason, from the panic message this emits.
+const LAYER1_FINGERPRINT_GOLDEN: &str = "\
+pkg-db-q4a-postgres-failed-commit 68c5bc69b7fddf19
+pkg-db-q4a-postgres-failed-rollback f868e4504f7eaf8b
+pkg-db-q4a-postgres-implicit-rollback ea766a4153c4606d
+pkg-db-q4a-postgres-option-preflight 83531e565bf8c3cc
+pkg-db-q4a-postgres-prepared-transactions de8a0a78d62eac92
+pkg-db-q4a-sqlite-bind-recovery d08abb4d943b5a08
+pkg-db-q4a-sqlite-cleanup-poison 6030d2771fd80517
+pkg-db-q4a-sqlite-prepared-reuse e232dfbddce30d39
+pkg-db-q4a-sqlite-transactions e13ddda111625b6f
+pkg-db-q4a-sqlite-unsupported-shape 2e8f1a1f6b2de15f
+";
+
+#[test]
+fn layer1_case_fingerprints_match_the_golden() {
+    let mut log = FingerprintLog::new();
+    for case in LAYER1_CASES {
+        log.record(&case.fingerprint());
+    }
+    log.assert_matches(LAYER1_FINGERPRINT_GOLDEN);
 }

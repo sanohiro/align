@@ -8,7 +8,9 @@
 
 use super::fingerprint::CaseFingerprint;
 use super::layout::Layout;
+use super::counters::CounterExpect;
 use super::run::{Needs, gate};
+use super::stubs::Stub;
 use super::runner::{run_per_unit_c, run_static_descriptors};
 
 /// Which compile/execute pipeline a case uses. Part of what the case proves, so it is part of the
@@ -30,52 +32,63 @@ impl RunnerKind {
     }
 }
 
-/// Which native stubs a case links.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Stubs {
-    None,
-    Pg,
-    PgAndSqlite,
-}
-
-impl Stubs {
-    pub fn id(self) -> &'static str {
-        match self {
-            Stubs::None => "none",
-            Stubs::Pg => "pg",
-            Stubs::PgAndSqlite => "pg+sqlite",
-        }
-    }
-
-    fn apply(self, layout: Layout) -> Layout {
-        match self {
-            Stubs::None => layout,
-            Stubs::Pg => layout.linking_pg_stub(),
-            Stubs::PgAndSqlite => layout.linking_pg_stub().linking_sqlite_stub(),
-        }
-    }
-}
-
 /// A compiled-and-run owner case.
 pub struct Case {
     pub label: &'static str,
     pub runner: RunnerKind,
     pub needs: Needs,
-    pub stubs: Stubs,
+    /// Native stubs whose C source is linked.
+    pub links: &'static [&'static Stub],
+    /// Stubs whose Align counters module is also added. Must be a subset of `links`; the layout
+    /// builder enforces it, so a counters module can never reach a program without its definitions.
+    pub counters: &'static [&'static Stub],
     /// Suite modules beyond the `pkg.db` package, in layout order.
-    pub modules: &'static [(&'static str, &'static str)],
+    ///
+    /// A function rather than a slice so a suite whose modules are read from disk at run time
+    /// (`common::fixture`) can still declare its cases as `const`.
+    pub modules: fn() -> Vec<(&'static str, &'static str)>,
     pub main: &'static str,
     pub expected_exit: i32,
+    /// Native counter expectations asserted after a successful run, as `(name, value)`.
+    ///
+    /// Part of the record rather than the test body so the fingerprint covers them: silently
+    /// relaxing an expected call count is exactly the kind of change a golden should catch.
+    pub expect_counters: &'static [(&'static str, i64)],
 }
 
 impl Case {
     /// The exact layout both [`Case::run`] and [`Case::fingerprint`] use.
     pub fn layout(&self) -> Layout {
+        // Adding a counters module without expecting anything from it compiles and links happily
+        // while asserting nothing, which looks like coverage and is not. The converse — expecting
+        // counters with no module to print them — fails at parse time, but failing here names the
+        // case instead.
+        assert_eq!(
+            self.counters.is_empty(),
+            self.expect_counters.is_empty(),
+            "`{}` links {} counters module(s) but declares {} counter expectation(s); a counters \
+             module with nothing asserted against it is not coverage",
+            self.label,
+            self.counters.len(),
+            self.expect_counters.len(),
+        );
         let mut layout = Layout::new();
-        for (path, source) in self.modules {
+        for (path, source) in (self.modules)() {
             layout = layout.module(path, source);
         }
-        self.stubs.apply(layout).main(self.main)
+        for stub in self.links {
+            layout = layout.linking(stub);
+        }
+        for stub in self.counters {
+            assert!(
+                self.links.iter().any(|linked| linked.id == stub.id),
+                "`{}` asks for {}'s counters module without linking its C source",
+                self.label,
+                stub.id
+            );
+            layout = layout.with_counters(stub);
+        }
+        layout.main(self.main)
     }
 
     /// Gate, compile, run, and require the declared exit code.
@@ -89,15 +102,46 @@ impl Case {
             RunnerKind::PerUnitC => run_per_unit_c(self.label, &layout),
         };
         run.expect_exit(self.expected_exit);
+        if !self.expect_counters.is_empty() {
+            let mut expect = CounterExpect::new();
+            for (name, value) in self.expect_counters {
+                expect = expect.eq(name, *value);
+            }
+            expect.assert(&run);
+        }
     }
 
     /// The fingerprint of what [`Case::run`] would do — derived from the same fields, never
-    /// restated. `stubs` rides in the environment slot because it selects linked native code and so
-    /// changes what the case exercises, exactly like a runner swap does.
+    /// restated. `links` and `counters` ride in the environment slot because they select linked
+    /// native code and added modules, so they change what the case exercises exactly as a runner
+    /// swap does.
     pub fn fingerprint(&self) -> CaseFingerprint {
         CaseFingerprint::new(self.label, self.runner.id())
             .files(&self.layout().test_owned_files())
-            .env(&[("stubs", self.stubs.id()), ("needs", self.needs.id())])
+            .env(&[
+                ("links", &stub_ids(self.links)),
+                ("counters", &stub_ids(self.counters)),
+                ("needs", self.needs.id()),
+                ("expect_counters", &counter_ids(self.expect_counters)),
+            ])
             .expected_exit(self.expected_exit)
     }
+}
+
+/// Stable identity for a stub list, for the fingerprint.
+fn stub_ids(stubs: &[&'static Stub]) -> String {
+    stubs
+        .iter()
+        .map(|stub| stub.id)
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+/// Stable identity for a counter expectation list, for the fingerprint.
+fn counter_ids(pairs: &[(&'static str, i64)]) -> String {
+    pairs
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }

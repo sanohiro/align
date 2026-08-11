@@ -470,10 +470,14 @@ worked example.
 
 A migration must prove the same defect still fails:
 
-1. **Backward** — the new layout builder is asserted equal to the retired
-   `package_files`, path by path and source by source
-   (`layout_reproduces_the_pre_harness_package_files_exactly`), and the migrated
-   suite passes unchanged.
+1. **Backward** — `pkg_db_q4b` keeps the retired `package_files` as an oracle and
+   asserts `Layout` reproduces it path by path and source by source
+   (`layout_reproduces_the_pre_harness_package_files_exactly`). That pins the
+   shared eight-module package layout and its order for every suite, so a later
+   migration inherits the proof rather than repeating it; what each further
+   suite must then show is only that its own module list and `main` are
+   unchanged, which its fingerprint golden covers. Every migrated suite also
+   passes unchanged.
 2. **Forward** — a case-fingerprint golden over label, runner, test-owned files,
    environment, and expected exit. Hashing sources alone is not enough: a
    refactor can preserve the file set while changing the runner, environment, or
@@ -500,33 +504,51 @@ A migration must prove the same defect still fails:
    pre-migration set *minus explicitly folded names*, with a correspondence
    table in the PR body mapping each folded name to its new owner and case.
 
-### Counter registry
+### Stub and counter registry
 
-One registry (`PG_COUNTER_NAMES`) names every counter the Align dump module
-prints. The parser rejects a name outside it, `CounterExpect::eq` rejects an
-expectation naming one, and a string-only owner compares the registry against
-the names actually printed by the Align module. That owner needs no C compiler
-and no LLVM, so a counter added on one side and forgotten on the other fails in
-milliseconds rather than surviving until someone happens to assert on it.
+`db_harness::stubs` holds each native stub as one record: its C source, the
+Align module that prints its counters, and the registry of names that module
+prints. Counter names are namespaced (`pg.`, `sqlite.`, `sqlite6.`) so a program
+linking several stubs can dump them all into one stdout stream.
+
+The parser rejects a name outside the registry, `CounterExpect::eq` rejects an
+expectation naming one, and one parameterized owner compares every registry
+against the names actually printed by its Align module. That owner needs no C
+compiler and no LLVM, so a counter added on one side and forgotten on the other
+fails in milliseconds rather than surviving until someone happens to assert on
+it.
+
+A counters module is only ever added together with the C source that defines its
+symbols (`Layout::with_counters`), and `Case` asserts that its `counters` list is
+a subset of its `links` list, so a counters module can never reach a program
+whose stub is absent.
 
 ### Deferred cells
 
 Recorded so the gap is explicit rather than implied:
 
-- **Per-case timeout owner.** The timeout path (kill, record, keep running) is
-  implemented and its partial-result behaviour is exercised by every table, but
-  no owner drives a deliberately hanging case. Deferred to PR-2, which needs a
-  hanging fixture anyway.
+- ~~Per-case timeout owner~~ — **closed in PR-2** by
+  `parity_engine_reports_a_timed_out_case_and_keeps_going`, which drives a
+  genuinely hanging case and requires both that it is reported as a timeout and
+  that the case after it still runs and still reports. The hang body is a serial
+  LCG keyed on a run-time string length: a plain accumulator loop was recognised
+  and folded by `-O2`, and the case returned instantly.
 - **Live-PostgreSQL identity and cleanup** (unique per-run object names, drop
   what a case created, assert no survivors). No live parity case exists yet;
   deferred to PR-3 with the `q2` scalar table.
 - **SQLite storage-mode declaration** (`:memory:` versus file-backed). No table
   currently needs cross-connection state; deferred until one does.
-- **Layer-1 fingerprint coverage** is complete for all twelve migrated call
-  sites in `pkg_db_q4b`. The two `#[ignore]`d measurement probes are excluded:
-  they parse stdout numbers rather than asserting an exit code, so they are not
-  `Case`-shaped. They were checked by hand during review; mechanising them is
-  PR-2 work.
+- **`#[ignore]`d measurement probes** in `pkg_db_q4a`, `q4b`, and `q6` carry no
+  fingerprint: they parse stdout numbers rather than asserting an exit code, so
+  they are not `Case`-shaped. Checked by hand during review.
+- **`pkg_db_q5b2`'s five derived layout builders** — plus three further inline
+  `retain`+`push` sites in test bodies — still use that idiom. PR-2 extracted
+  only its inline C stub because `q5b2` is in the A1 catalog/EXPLAIN blast
+  radius; the builder rewrite is PR-3.
+- **`pkg_db_a1` and `pkg_db_q2`** are unmigrated, and `q2` still bakes its
+  package sources with `include_str!`. Both are PR-3, after the A1 waves.
+  `pkg_db_q1` and `q3` are Rust-API suites and out of the harness's scope; their
+  `include_str!` statics feed `Proj`-based API assertions, not a `Layout`.
 
 ### Resource and isolation rules
 

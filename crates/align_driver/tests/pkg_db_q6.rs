@@ -2,40 +2,527 @@
 
 mod common;
 use common::*;
+mod db_harness;
+use db_harness::*;
 use std::sync::LazyLock;
 
-static DB: LazyLock<&str> = LazyLock::new(|| fixture("apps/db/pkg/db.align"));
-static SQLITE: LazyLock<&str> = LazyLock::new(|| fixture("apps/db/pkg/db/sqlite.align"));
-static POSTGRES: LazyLock<&str> = LazyLock::new(|| fixture("apps/db/pkg/db/postgres.align"));
-static INTERNAL: LazyLock<&str> = LazyLock::new(|| fixture("apps/db/pkg/db/internal.align"));
-static RESOURCE: LazyLock<&str> =
-    LazyLock::new(|| fixture("apps/db/pkg/db/internal/resource.align"));
-static DESCRIPTOR: LazyLock<&str> =
-    LazyLock::new(|| fixture("apps/db/pkg/db/internal/descriptor.align"));
-static INTERNAL_SQLITE: LazyLock<&str> =
-    LazyLock::new(|| fixture("apps/db/pkg/db/internal/sqlite.align"));
-static INTERNAL_POSTGRES: LazyLock<&str> =
-    LazyLock::new(|| fixture("apps/db/pkg/db/internal/postgres.align"));
 static USER_GROUPS: LazyLock<&str> = LazyLock::new(|| fixture("apps/db/app/user_groups.align"));
 static TRANSACTION_MASTER: LazyLock<&str> =
     LazyLock::new(|| fixture("apps/db/app/transaction_master.align"));
-static POSTGRES_STUB: &str = include_str!("fixtures/pkg_db_q2_postgres_stub.c");
-static SQLITE_Q6_STUB: &str = include_str!("fixtures/pkg_db_q6_sqlite_stub.c");
 
-fn package_files(main: &str) -> Vec<(&'static str, &str)> {
+
+// ================================================================================================
+// Layer-1 migrated cases.
+//
+// Native call counts moved out of the Align epilogues into `expect_counters`, so a mismatch now
+// names the counter instead of returning a hand-numbered sentinel.
+// ================================================================================================
+const SQLITE_USER_GROUPS_MAIN: &str = r#"module main
+import pkg.db
+import pkg.db.sqlite
+import app.user_groups
+
+extern "C" {
+  fn align_sqlite_q6_reset()
+  fn align_sqlite_q6_prepare_calls() -> i32
+  fn align_sqlite_q6_step_calls() -> i32
+  fn align_sqlite_q6_delivered_rows() -> i32
+  fn align_sqlite_q6_finalize_calls() -> i32
+  fn align_sqlite_q6_protocol_ok() -> i32
+}
+
+fn counts(prepare: i32, steps: i32, delivered: i32, finalized: i32) -> bool = unsafe {
+  align_sqlite_q6_protocol_ok() == 1
+    && align_sqlite_q6_prepare_calls() == prepare
+    && align_sqlite_q6_step_calls() == steps
+    && align_sqlite_q6_delivered_rows() == delivered
+    && align_sqlite_q6_finalize_calls() == finalized
+}
+
+fn error_code(error: pkg.db.Error) -> i32 {
+  return match error {
+    Connection(_) => 101
+    Timeout(_) => 102
+    Cancelled(_) => 103
+    NotFound => 104
+    Cardinality(_) => 105
+    Constraint(_) => 106
+    Serialization(_) => 107
+    Deadlock(_) => 108
+    SchemaMismatch(_) => 109
+    DriverMismatch(_) => 110
+    Decode(_) => 111
+    Encode(_) => 112
+    InvalidQuery(_) => 113
+    Unsupported(_) => 114
+    Native(_) => 115
+  }
+}
+
+fn is_contract_error(error: pkg.db.Error, item: str) -> bool {
+  return match error {
+    Connection(_) => false
+    Timeout(_) => false
+    Cancelled(_) => false
+    NotFound => false
+    Cardinality(_) => false
+    Constraint(_) => false
+    Serialization(_) => false
+    Deadlock(_) => false
+    SchemaMismatch(_) => false
+    DriverMismatch(_) => false
+    Decode(contract) => contract.item == item
+    Encode(_) => false
+    InvalidQuery(_) => false
+    Unsupported(_) => false
+    Native(_) => false
+  }
+}
+
+fn one_parent(borrow connection: pkg.db.conn) -> i32 {
+  unsafe { align_sqlite_q6_reset() }
+  arena out {
+    attempted := app.user_groups.run(
+      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 0, last_user_id: 0 }, out,
+    )
+    empty := match attempted {
+      Err(error) => { return error_code(error) }
+      Ok(value) => value
+    }
+    if match empty { Some(_) => true, None => false } { return 2 }
+    if !counts(1, 1, 0, 1) { return 3 }
+  }
+
+  unsafe { align_sqlite_q6_reset() }
+  arena out {
+    shaped := app.user_groups.run(
+      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 1, last_user_id: 1 }, out,
+    ) else { return 4 }
+    value := shaped else { return 5 }
+    if value.user.id != 1 || value.user.name != "Alice" { return 6 }
+    if value.groups.len() != 2 { return 7 }
+    if value.groups[0].id != 10 || value.groups[0].name != "Admin" { return 8 }
+    if value.groups[1].id != 20 || value.groups[1].name != "Dev" { return 9 }
+    if !counts(1, 3, 2, 1) { return 10 }
+  }
+
+  unsafe { align_sqlite_q6_reset() }
+  arena out {
+    shaped := app.user_groups.run(
+      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 2, last_user_id: 2 }, out,
+    ) else { return 11 }
+    value := shaped else { return 12 }
+    if value.user.id != 2 || value.user.name != "Bob" || value.groups.len() != 0 {
+      return 13
+    }
+    if !counts(1, 2, 1, 1) { return 14 }
+  }
+
+  unsafe { align_sqlite_q6_reset() }
+  arena out {
+    partial_id := app.user_groups.run(
+      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 3, last_user_id: 3 }, out,
+    )
+    error := match partial_id { Ok(_) => { return 15 } Err(cause) => cause }
+    if !is_contract_error(error, "app.user_groups.group") { return 23 }
+    if !counts(1, 1, 1, 1) { return 16 }
+  }
+
+  unsafe { align_sqlite_q6_reset() }
+  arena out {
+    partial_name := app.user_groups.run(
+      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 4, last_user_id: 4 }, out,
+    )
+    error := match partial_name { Ok(_) => { return 17 } Err(cause) => cause }
+    if !is_contract_error(error, "app.user_groups.group") { return 24 }
+    if !counts(1, 1, 1, 1) { return 18 }
+  }
+
+  unsafe { align_sqlite_q6_reset() }
+  arena out {
+    inconsistent := app.user_groups.run(
+      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 5, last_user_id: 5 }, out,
+    )
+    error := match inconsistent { Ok(_) => { return 19 } Err(cause) => cause }
+    if !is_contract_error(error, "app.user_groups.user_name") { return 25 }
+    if !counts(1, 2, 2, 1) { return 20 }
+  }
+
+  unsafe { align_sqlite_q6_reset() }
+  arena out {
+    inconsistent_id := app.user_groups.run(
+      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 6, last_user_id: 6 }, out,
+    )
+    error := match inconsistent_id { Ok(_) => { return 21 } Err(cause) => cause }
+    if !is_contract_error(error, "app.user_groups.user_id") { return 26 }
+    if !counts(1, 2, 2, 1) { return 22 }
+  }
+  return 0
+}
+
+fn segmented(borrow connection: pkg.db.conn) -> i32 {
+  unsafe { align_sqlite_q6_reset() }
+  arena out {
+    empty := app.user_groups.run_segmented(
+      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 0, last_user_id: 0 }, out,
+    ) else { return 50 }
+    if empty.users.len() != 0 || empty.groups.len() != 0
+      || empty.group_offsets.len() != 1 || empty.group_offsets[0] != 0 { return 51 }
+    if !counts(1, 1, 0, 1) { return 52 }
+  }
+
+  unsafe { align_sqlite_q6_reset() }
+  arena out {
+    result := app.user_groups.run_segmented(
+      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 1, last_user_id: 3 }, out,
+    ) else { return 53 }
+    if result.users.len() != 3 || result.groups.len() != 3
+      || result.group_offsets.len() != 4 { return 54 }
+    if result.users[0].id != 1 || result.users[0].name != "Alice"
+      || result.users[1].id != 2 || result.users[1].name != "Bob"
+      || result.users[2].id != 3 || result.users[2].name != "Cara" { return 55 }
+    if result.group_offsets[0] != 0 || result.group_offsets[1] != 2
+      || result.group_offsets[2] != 2 || result.group_offsets[3] != 3 { return 56 }
+    if result.groups[0].id != 10 || result.groups[1].id != 20
+      || result.groups[2].id != 40 { return 57 }
+    if !counts(1, 5, 4, 1) { return 58 }
+  }
+
+  unsafe { align_sqlite_q6_reset() }
+  arena out {
+    partial_id := app.user_groups.run_segmented(
+      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 3, last_user_id: 3 }, out,
+    )
+    error := match partial_id { Ok(_) => { return 59 } Err(cause) => cause }
+    if !is_contract_error(error, "app.user_groups.group") { return 60 }
+    if !counts(1, 1, 1, 1) { return 61 }
+  }
+
+  unsafe { align_sqlite_q6_reset() }
+  arena out {
+    partial_name := app.user_groups.run_segmented(
+      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 4, last_user_id: 4 }, out,
+    )
+    error := match partial_name { Ok(_) => { return 62 } Err(cause) => cause }
+    if !is_contract_error(error, "app.user_groups.group") { return 63 }
+    if !counts(1, 1, 1, 1) { return 64 }
+  }
+
+  unsafe { align_sqlite_q6_reset() }
+  arena out {
+    disagreement := app.user_groups.run_segmented(
+      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 5, last_user_id: 5 }, out,
+    )
+    error := match disagreement { Ok(_) => { return 65 } Err(cause) => cause }
+    if !is_contract_error(error, "app.user_groups.user_name") { return 66 }
+    if !counts(1, 2, 2, 1) { return 67 }
+  }
+
+  unsafe { align_sqlite_q6_reset() }
+  arena out {
+    non_adjacent := app.user_groups.run_segmented(
+      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 7, last_user_id: 7 }, out,
+    )
+    error := match non_adjacent { Ok(_) => { return 68 } Err(cause) => cause }
+    if !is_contract_error(error, "app.user_groups.order") { return 69 }
+    if !counts(1, 3, 3, 1) { return 70 }
+  }
+
+  unsafe { align_sqlite_q6_reset() }
+  arena out {
+    partial_precedence := app.user_groups.run_segmented(
+      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 9, last_user_id: 9 }, out,
+    )
+    error := match partial_precedence { Ok(_) => { return 71 } Err(cause) => cause }
+    if !is_contract_error(error, "app.user_groups.group") { return 72 }
+    if !counts(1, 1, 1, 1) { return 73 }
+  }
+  return 0
+}
+
+fn main() -> i32 {
+  connection := pkg.db.sqlite.connect(":memory:", []) else { return 29 }
+  one := one_parent(connection)
+  if one != 0 { return one }
+  many := segmented(connection)
+  if many != 0 { return many }
+  return 42
+}
+"#;
+
+const SQLITE_TRANSACTION_MASTER_MAIN: &str = r#"module main
+import pkg.db
+import pkg.db.sqlite
+import app.transaction_master
+import pkg.db.testkit.sqlite6
+
+
+fn project(target: pkg.db.exec, out: region) -> i32 {
+  rows := app.transaction_master.run(
+    target, app.transaction_master.Params { account_id: 1 }, out,
+  ) else { return 1 }
+  if rows.len() != 2 { return 2 }
+  if rows[0].transaction.id != 100 || rows[0].transaction.posted_at != "2026-08-10"
+    || rows[0].transaction.amount_cents != 5000 { return 3 }
+  if rows[0].status.id != 7 || rows[0].status.code != "posted"
+    || rows[0].status.name != "Posted" { return 4 }
+  if rows[0].customer.id != 900 || rows[0].customer.name != "Ada" { return 5 }
+  if rows[1].transaction.id != 101 || rows[1].customer.id != 901
+    || rows[1].transaction.posted_at != "2026-08-09"
+    || rows[1].transaction.amount_cents != 5001
+    || rows[1].status.id != 7 || rows[1].status.code != "posted"
+    || rows[1].status.name != "Posted"
+    || rows[1].customer.name != "Linus" { return 6 }
+  return 0
+}
+
+fn main() -> i32 {
+  pkg.db.testkit.sqlite6.reset()
+  connection := pkg.db.sqlite.connect(":memory:", []) else { return 7 }
+  arena conn_out {
+    direct := project(pkg.db.exec_conn(connection), conn_out)
+    if direct != 0 { return direct }
+  }
+  transaction := pkg.db.begin(connection, []) else { return 8 }
+  arena tx_out {
+    nested := project(pkg.db.exec_tx(transaction), tx_out)
+    if nested != 0 { return nested }
+  }
+  returned := pkg.db.rollback(transaction) else { return 9 }
+  pkg.db.testkit.sqlite6.dump()
+  return 42
+}
+"#;
+
+const POSTGRES_COMPOUND_MAIN: &str = r#"module main
+import pkg.db
+import pkg.db.postgres
+import app.user_groups
+import app.transaction_master
+import pkg.db.testkit.pg
+
+
+fn one_parent(borrow connection: pkg.db.conn) -> i32 {
+  arena out {
+    shaped := app.user_groups.run(
+      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 1, last_user_id: 1 }, out,
+    ) else { return 1 }
+    value := shaped else { return 2 }
+    if value.user.id != 1 || value.user.name != "Alice" || value.groups.len() != 2 {
+      return 3
+    }
+    if value.groups[0].id != 10 || value.groups[0].name != "Admin"
+      || value.groups[1].id != 20 || value.groups[1].name != "Dev" { return 4 }
+  }
+  arena out {
+    segmented := app.user_groups.run_segmented(
+      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 1, last_user_id: 3 }, out,
+    ) else { return 5 }
+    if segmented.users.len() != 3 || segmented.groups.len() != 3
+      || segmented.group_offsets.len() != 4 { return 6 }
+    if segmented.group_offsets[0] != 0 || segmented.group_offsets[1] != 2
+      || segmented.group_offsets[2] != 2 || segmented.group_offsets[3] != 3 { return 7 }
+  }
+  return 0
+}
+
+fn project(target: pkg.db.exec, out: region) -> i32 {
+  rows := app.transaction_master.run(
+    target, app.transaction_master.Params { account_id: 1 }, out,
+  ) else { return 8 }
+  if rows.len() != 2 { return 9 }
+  if rows[0].transaction.id != 100 || rows[0].status.code != "posted"
+    || rows[0].customer.name != "Ada" { return 10 }
+  if rows[1].transaction.id != 101 || rows[1].customer.name != "Linus" { return 11 }
+  return 0
+}
+
+fn main() -> i32 {
+  pkg.db.testkit.pg.reset()
+  connection := pkg.db.postgres.connect("postgresql://stub/q6", []) else { return 12 }
+  grouped := one_parent(connection)
+  if grouped != 0 { return grouped }
+  arena direct_out {
+    direct := project(pkg.db.exec_conn(connection), direct_out)
+    if direct != 0 { return direct }
+  }
+  transaction := pkg.db.begin(connection, []) else { return 13 }
+  arena tx_out {
+    nested := project(pkg.db.exec_tx(transaction), tx_out)
+    if nested != 0 { return nested }
+  }
+  returned := pkg.db.rollback(transaction) else { return 14 }
+  pkg.db.testkit.pg.dump()
+  return 42
+}
+"#;
+
+const SQLITE_PRE_SEND_FAILURE_MAIN: &str = r#"module main
+import pkg.db
+import pkg.db.sqlite
+import app.user_groups
+import pkg.db.testkit.sqlite6
+
+extern "C" {
+  fn align_sqlite_q6_reset()
+  fn align_sqlite_q6_fail_next_bind()
+}
+
+fn main() -> i32 {
+  unsafe {
+    align_sqlite_q6_reset()
+    align_sqlite_q6_fail_next_bind()
+  }
+  connection := pkg.db.sqlite.connect(":memory:", []) else { return 1 }
+  arena out {
+    failed := app.user_groups.run(
+      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 1, last_user_id: 1 }, out,
+    )
+    if match failed { Ok(_) => true, Err(_) => false } { return 2 }
+  }
+  pkg.db.testkit.sqlite6.dump()
+  return 42
+}
+"#;
+
+const POSTGRES_SEND_FAILURE_MAIN: &str = r#"module main
+import pkg.db
+import pkg.db.postgres
+import app.user_groups
+import pkg.db.testkit.pg
+
+extern "C" {
+  fn align_pg_reset()
+  fn align_pg_q6_fail_next_execute()
+}
+
+fn main() -> i32 {
+  unsafe {
+    align_pg_reset()
+    align_pg_q6_fail_next_execute()
+  }
+  connection := pkg.db.postgres.connect("postgresql://stub/q6-fail", []) else { return 1 }
+  arena out {
+    failed := app.user_groups.run(
+      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 1, last_user_id: 1 }, out,
+    )
+    if match failed { Ok(_) => true, Err(_) => false } { return 2 }
+  }
+  pkg.db.testkit.pg.dump()
+  return 42
+}
+"#;
+
+const CASE_SQLITE_USER_GROUPS: Case = Case {
+    label: "pkg-db-q6-sqlite-user-groups",
+    runner: RunnerKind::PerUnitC,
+    needs: Needs::BackendAndCc,
+    links: &[&PG, &SQLITE_Q6],
+    counters: &[],
+    modules: q6_modules,
+    main: SQLITE_USER_GROUPS_MAIN,
+    expected_exit: 42,
+    expect_counters: &[],
+};
+
+const CASE_SQLITE_TRANSACTION_MASTER: Case = Case {
+    label: "pkg-db-q6-sqlite-transaction-master",
+    runner: RunnerKind::PerUnitC,
+    needs: Needs::BackendAndCc,
+    links: &[&PG, &SQLITE_Q6],
+    counters: &[&SQLITE_Q6],
+    modules: q6_modules,
+    main: SQLITE_TRANSACTION_MASTER_MAIN,
+    expected_exit: 42,
+    expect_counters: &[
+        ("sqlite6.protocol_ok", 1),
+        ("sqlite6.prepare_calls", 2),
+        ("sqlite6.step_calls", 6),
+        ("sqlite6.delivered_rows", 4),
+        ("sqlite6.finalize_calls", 2),
+    ],
+};
+
+const CASE_POSTGRES_COMPOUND: Case = Case {
+    label: "pkg-db-q6-postgres-compound",
+    runner: RunnerKind::PerUnitC,
+    needs: Needs::BackendAndCc,
+    links: &[&PG],
+    counters: &[&PG],
+    modules: q6_modules,
+    main: POSTGRES_COMPOUND_MAIN,
+    expected_exit: 42,
+    expect_counters: &[
+        ("pg.prepare_calls", 0),
+        ("pg.execute_prepared_calls", 0),
+        ("pg.protocol_ok", 1),
+        ("pg.execute_calls", 4),
+        ("pg.delivered_rows", 10),
+        ("pg.control_calls", 2),
+        ("pg.clear_calls", 6),
+    ],
+};
+
+const CASE_SQLITE_PRE_SEND_FAILURE: Case = Case {
+    label: "pkg-db-q6-sqlite-pre-send-failure",
+    runner: RunnerKind::PerUnitC,
+    needs: Needs::BackendAndCc,
+    links: &[&PG, &SQLITE_Q6],
+    counters: &[&SQLITE_Q6],
+    modules: q6_modules,
+    main: SQLITE_PRE_SEND_FAILURE_MAIN,
+    expected_exit: 42,
+    expect_counters: &[
+        ("sqlite6.protocol_ok", 1),
+        ("sqlite6.prepare_calls", 1),
+        ("sqlite6.step_calls", 0),
+        ("sqlite6.delivered_rows", 0),
+        ("sqlite6.finalize_calls", 1),
+    ],
+};
+
+const CASE_POSTGRES_SEND_FAILURE: Case = Case {
+    label: "pkg-db-q6-postgres-send-failure",
+    runner: RunnerKind::PerUnitC,
+    needs: Needs::BackendAndCc,
+    links: &[&PG],
+    counters: &[&PG],
+    modules: q6_modules,
+    main: POSTGRES_SEND_FAILURE_MAIN,
+    expected_exit: 42,
+    expect_counters: &[
+        ("pg.protocol_ok", 1),
+        ("pg.execute_calls", 1),
+        ("pg.clear_calls", 0),
+    ],
+};
+
+/// Every Layer-1 case in this suite, for the fingerprint golden.
+const LAYER1_CASES: &[&Case] = &[
+    &CASE_SQLITE_USER_GROUPS,
+    &CASE_SQLITE_TRANSACTION_MASTER,
+    &CASE_POSTGRES_COMPOUND,
+    &CASE_SQLITE_PRE_SEND_FAILURE,
+    &CASE_POSTGRES_SEND_FAILURE,
+];
+
+/// The suite modules every q6 case adds on top of the `pkg.db` package. Both are shipped demo app
+/// modules read from `apps/db/app/`, not test fixtures.
+fn q6_modules() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("pkg/db.align", *DB),
-        ("pkg/db/sqlite.align", *SQLITE),
-        ("pkg/db/postgres.align", *POSTGRES),
-        ("pkg/db/internal.align", *INTERNAL),
-        ("pkg/db/internal/resource.align", *RESOURCE),
-        ("pkg/db/internal/descriptor.align", *DESCRIPTOR),
-        ("pkg/db/internal/sqlite.align", *INTERNAL_SQLITE),
-        ("pkg/db/internal/postgres.align", *INTERNAL_POSTGRES),
         ("app/user_groups.align", *USER_GROUPS),
         ("app/transaction_master.align", *TRANSACTION_MASTER),
-        ("main.align", main),
     ]
+}
+
+/// The layout the non-`Case` owners use: the same module list the cases use, plus one `main`.
+/// Derived from `q6_modules` so the two cannot drift apart.
+fn package_files(main: &str) -> Layout {
+    let mut layout = Layout::new();
+    for (path, source) in q6_modules() {
+        layout = layout.module(path, source);
+    }
+    layout.main(main)
 }
 
 fn mir_function<'a>(mir: &'a str, name: &str) -> &'a str {
@@ -135,7 +622,7 @@ fn projected(target: pkg.db.exec, out: region) -> Result<array<app.transaction_m
 
 fn main() -> i32 = 0
 "#;
-    let checked = diff_check_multi("pkg-db-q6-modules", &package_files(main), "main.align");
+    let checked = diff_check_multi("pkg-db-q6-modules", &package_files(main).files(), "main.align");
     assert!(
         !checked.whole_errors && !checked.per_unit_errors,
         "whole-program diagnostics:\n{}\nper-unit diagnostics:\n{}",
@@ -163,10 +650,10 @@ import app.transaction_master
 fn main() -> i32 = 0
 "#;
     let files = package_files(main);
-    let whole = whole_mir_multi("pkg-db-q6-compound-mir-whole", &files, "main.align");
+    let whole = whole_mir_multi("pkg-db-q6-compound-mir-whole", &files.files(), "main.align");
     assert_compound_mir_shape(&whole);
 
-    let per_unit = build_per_unit_multi("pkg-db-q6-compound-mir-unit", &files, "main.align");
+    let per_unit = build_per_unit_multi("pkg-db-q6-compound-mir-unit", &files.files(), "main.align");
     let user_groups = align_mir::print::program_to_string(&per_unit.unit("app.user_groups").mir);
     let transaction =
         align_mir::print::program_to_string(&per_unit.unit("app.transaction_master").mir);
@@ -182,7 +669,7 @@ fn main() -> i32 = 0
 "#;
     let mir = whole_mir_multi(
         "pkg-db-q6-pure-shaper-boundary",
-        &package_files(main),
+        &package_files(main).files(),
         "main.align",
     );
     for function in [
@@ -903,542 +1390,23 @@ fn main() -> i32 {
 
 #[test]
 fn sqlite_user_groups_one_parent_and_segmented_matrices_are_exact() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
-    let main = r#"module main
-import pkg.db
-import pkg.db.sqlite
-import app.user_groups
-
-extern "C" {
-  fn align_sqlite_q6_reset()
-  fn align_sqlite_q6_prepare_calls() -> i32
-  fn align_sqlite_q6_step_calls() -> i32
-  fn align_sqlite_q6_delivered_rows() -> i32
-  fn align_sqlite_q6_finalize_calls() -> i32
-  fn align_sqlite_q6_protocol_ok() -> i32
-}
-
-fn counts(prepare: i32, steps: i32, delivered: i32, finalized: i32) -> bool = unsafe {
-  align_sqlite_q6_protocol_ok() == 1
-    && align_sqlite_q6_prepare_calls() == prepare
-    && align_sqlite_q6_step_calls() == steps
-    && align_sqlite_q6_delivered_rows() == delivered
-    && align_sqlite_q6_finalize_calls() == finalized
-}
-
-fn error_code(error: pkg.db.Error) -> i32 {
-  return match error {
-    Connection(_) => 101
-    Timeout(_) => 102
-    Cancelled(_) => 103
-    NotFound => 104
-    Cardinality(_) => 105
-    Constraint(_) => 106
-    Serialization(_) => 107
-    Deadlock(_) => 108
-    SchemaMismatch(_) => 109
-    DriverMismatch(_) => 110
-    Decode(_) => 111
-    Encode(_) => 112
-    InvalidQuery(_) => 113
-    Unsupported(_) => 114
-    Native(_) => 115
-  }
-}
-
-fn is_contract_error(error: pkg.db.Error, item: str) -> bool {
-  return match error {
-    Connection(_) => false
-    Timeout(_) => false
-    Cancelled(_) => false
-    NotFound => false
-    Cardinality(_) => false
-    Constraint(_) => false
-    Serialization(_) => false
-    Deadlock(_) => false
-    SchemaMismatch(_) => false
-    DriverMismatch(_) => false
-    Decode(contract) => contract.item == item
-    Encode(_) => false
-    InvalidQuery(_) => false
-    Unsupported(_) => false
-    Native(_) => false
-  }
-}
-
-fn one_parent(borrow connection: pkg.db.conn) -> i32 {
-  unsafe { align_sqlite_q6_reset() }
-  arena out {
-    attempted := app.user_groups.run(
-      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 0, last_user_id: 0 }, out,
-    )
-    empty := match attempted {
-      Err(error) => { return error_code(error) }
-      Ok(value) => value
-    }
-    if match empty { Some(_) => true, None => false } { return 2 }
-    if !counts(1, 1, 0, 1) { return 3 }
-  }
-
-  unsafe { align_sqlite_q6_reset() }
-  arena out {
-    shaped := app.user_groups.run(
-      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 1, last_user_id: 1 }, out,
-    ) else { return 4 }
-    value := shaped else { return 5 }
-    if value.user.id != 1 || value.user.name != "Alice" { return 6 }
-    if value.groups.len() != 2 { return 7 }
-    if value.groups[0].id != 10 || value.groups[0].name != "Admin" { return 8 }
-    if value.groups[1].id != 20 || value.groups[1].name != "Dev" { return 9 }
-    if !counts(1, 3, 2, 1) { return 10 }
-  }
-
-  unsafe { align_sqlite_q6_reset() }
-  arena out {
-    shaped := app.user_groups.run(
-      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 2, last_user_id: 2 }, out,
-    ) else { return 11 }
-    value := shaped else { return 12 }
-    if value.user.id != 2 || value.user.name != "Bob" || value.groups.len() != 0 {
-      return 13
-    }
-    if !counts(1, 2, 1, 1) { return 14 }
-  }
-
-  unsafe { align_sqlite_q6_reset() }
-  arena out {
-    partial_id := app.user_groups.run(
-      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 3, last_user_id: 3 }, out,
-    )
-    error := match partial_id { Ok(_) => { return 15 } Err(cause) => cause }
-    if !is_contract_error(error, "app.user_groups.group") { return 23 }
-    if !counts(1, 1, 1, 1) { return 16 }
-  }
-
-  unsafe { align_sqlite_q6_reset() }
-  arena out {
-    partial_name := app.user_groups.run(
-      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 4, last_user_id: 4 }, out,
-    )
-    error := match partial_name { Ok(_) => { return 17 } Err(cause) => cause }
-    if !is_contract_error(error, "app.user_groups.group") { return 24 }
-    if !counts(1, 1, 1, 1) { return 18 }
-  }
-
-  unsafe { align_sqlite_q6_reset() }
-  arena out {
-    inconsistent := app.user_groups.run(
-      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 5, last_user_id: 5 }, out,
-    )
-    error := match inconsistent { Ok(_) => { return 19 } Err(cause) => cause }
-    if !is_contract_error(error, "app.user_groups.user_name") { return 25 }
-    if !counts(1, 2, 2, 1) { return 20 }
-  }
-
-  unsafe { align_sqlite_q6_reset() }
-  arena out {
-    inconsistent_id := app.user_groups.run(
-      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 6, last_user_id: 6 }, out,
-    )
-    error := match inconsistent_id { Ok(_) => { return 21 } Err(cause) => cause }
-    if !is_contract_error(error, "app.user_groups.user_id") { return 26 }
-    if !counts(1, 2, 2, 1) { return 22 }
-  }
-  return 0
-}
-
-fn segmented(borrow connection: pkg.db.conn) -> i32 {
-  unsafe { align_sqlite_q6_reset() }
-  arena out {
-    empty := app.user_groups.run_segmented(
-      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 0, last_user_id: 0 }, out,
-    ) else { return 50 }
-    if empty.users.len() != 0 || empty.groups.len() != 0
-      || empty.group_offsets.len() != 1 || empty.group_offsets[0] != 0 { return 51 }
-    if !counts(1, 1, 0, 1) { return 52 }
-  }
-
-  unsafe { align_sqlite_q6_reset() }
-  arena out {
-    result := app.user_groups.run_segmented(
-      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 1, last_user_id: 3 }, out,
-    ) else { return 53 }
-    if result.users.len() != 3 || result.groups.len() != 3
-      || result.group_offsets.len() != 4 { return 54 }
-    if result.users[0].id != 1 || result.users[0].name != "Alice"
-      || result.users[1].id != 2 || result.users[1].name != "Bob"
-      || result.users[2].id != 3 || result.users[2].name != "Cara" { return 55 }
-    if result.group_offsets[0] != 0 || result.group_offsets[1] != 2
-      || result.group_offsets[2] != 2 || result.group_offsets[3] != 3 { return 56 }
-    if result.groups[0].id != 10 || result.groups[1].id != 20
-      || result.groups[2].id != 40 { return 57 }
-    if !counts(1, 5, 4, 1) { return 58 }
-  }
-
-  unsafe { align_sqlite_q6_reset() }
-  arena out {
-    partial_id := app.user_groups.run_segmented(
-      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 3, last_user_id: 3 }, out,
-    )
-    error := match partial_id { Ok(_) => { return 59 } Err(cause) => cause }
-    if !is_contract_error(error, "app.user_groups.group") { return 60 }
-    if !counts(1, 1, 1, 1) { return 61 }
-  }
-
-  unsafe { align_sqlite_q6_reset() }
-  arena out {
-    partial_name := app.user_groups.run_segmented(
-      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 4, last_user_id: 4 }, out,
-    )
-    error := match partial_name { Ok(_) => { return 62 } Err(cause) => cause }
-    if !is_contract_error(error, "app.user_groups.group") { return 63 }
-    if !counts(1, 1, 1, 1) { return 64 }
-  }
-
-  unsafe { align_sqlite_q6_reset() }
-  arena out {
-    disagreement := app.user_groups.run_segmented(
-      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 5, last_user_id: 5 }, out,
-    )
-    error := match disagreement { Ok(_) => { return 65 } Err(cause) => cause }
-    if !is_contract_error(error, "app.user_groups.user_name") { return 66 }
-    if !counts(1, 2, 2, 1) { return 67 }
-  }
-
-  unsafe { align_sqlite_q6_reset() }
-  arena out {
-    non_adjacent := app.user_groups.run_segmented(
-      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 7, last_user_id: 7 }, out,
-    )
-    error := match non_adjacent { Ok(_) => { return 68 } Err(cause) => cause }
-    if !is_contract_error(error, "app.user_groups.order") { return 69 }
-    if !counts(1, 3, 3, 1) { return 70 }
-  }
-
-  unsafe { align_sqlite_q6_reset() }
-  arena out {
-    partial_precedence := app.user_groups.run_segmented(
-      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 9, last_user_id: 9 }, out,
-    )
-    error := match partial_precedence { Ok(_) => { return 71 } Err(cause) => cause }
-    if !is_contract_error(error, "app.user_groups.group") { return 72 }
-    if !counts(1, 1, 1, 1) { return 73 }
-  }
-  return 0
-}
-
-fn main() -> i32 {
-  connection := pkg.db.sqlite.connect(":memory:", []) else { return 29 }
-  one := one_parent(connection)
-  if one != 0 { return one }
-  many := segmented(connection)
-  if many != 0 { return many }
-  return 42
-}
-"#;
-    let fixture = format!("{POSTGRES_STUB}\n{SQLITE_Q6_STUB}");
-    let output = build_and_run_multi_with_c(
-        "pkg-db-q6-sqlite-user-groups",
-        &package_files(main),
-        "main.align",
-        &fixture,
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "status: {:?}; stdout: {}; stderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    CASE_SQLITE_USER_GROUPS.run();
 }
 
 #[test]
 fn sqlite_transaction_master_runs_on_connection_and_transaction() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
-    let main = r#"module main
-import pkg.db
-import pkg.db.sqlite
-import app.transaction_master
-
-extern "C" {
-  fn align_sqlite_q6_reset()
-  fn align_sqlite_q6_prepare_calls() -> i32
-  fn align_sqlite_q6_step_calls() -> i32
-  fn align_sqlite_q6_delivered_rows() -> i32
-  fn align_sqlite_q6_finalize_calls() -> i32
-  fn align_sqlite_q6_protocol_ok() -> i32
-}
-
-fn project(target: pkg.db.exec, out: region) -> i32 {
-  rows := app.transaction_master.run(
-    target, app.transaction_master.Params { account_id: 1 }, out,
-  ) else { return 1 }
-  if rows.len() != 2 { return 2 }
-  if rows[0].transaction.id != 100 || rows[0].transaction.posted_at != "2026-08-10"
-    || rows[0].transaction.amount_cents != 5000 { return 3 }
-  if rows[0].status.id != 7 || rows[0].status.code != "posted"
-    || rows[0].status.name != "Posted" { return 4 }
-  if rows[0].customer.id != 900 || rows[0].customer.name != "Ada" { return 5 }
-  if rows[1].transaction.id != 101 || rows[1].customer.id != 901
-    || rows[1].transaction.posted_at != "2026-08-09"
-    || rows[1].transaction.amount_cents != 5001
-    || rows[1].status.id != 7 || rows[1].status.code != "posted"
-    || rows[1].status.name != "Posted"
-    || rows[1].customer.name != "Linus" { return 6 }
-  return 0
-}
-
-fn main() -> i32 {
-  unsafe { align_sqlite_q6_reset() }
-  connection := pkg.db.sqlite.connect(":memory:", []) else { return 7 }
-  arena conn_out {
-    direct := project(pkg.db.exec_conn(connection), conn_out)
-    if direct != 0 { return direct }
-  }
-  transaction := pkg.db.begin(connection, []) else { return 8 }
-  arena tx_out {
-    nested := project(pkg.db.exec_tx(transaction), tx_out)
-    if nested != 0 { return nested }
-  }
-  returned := pkg.db.rollback(transaction) else { return 9 }
-  return unsafe {
-    if align_sqlite_q6_protocol_ok() != 1 { return 10 }
-    if align_sqlite_q6_prepare_calls() != 2 { return 11 }
-    if align_sqlite_q6_step_calls() != 6 { return 12 }
-    if align_sqlite_q6_delivered_rows() != 4 { return 13 }
-    if align_sqlite_q6_finalize_calls() != 2 { return 14 }
-    42
-  }
-}
-"#;
-    let fixture = format!("{POSTGRES_STUB}\n{SQLITE_Q6_STUB}");
-    let output = build_and_run_multi_with_c(
-        "pkg-db-q6-sqlite-transaction-master",
-        &package_files(main),
-        "main.align",
-        &fixture,
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "status: {:?}; stdout: {}; stderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    CASE_SQLITE_TRANSACTION_MASTER.run();
 }
 
 #[test]
 fn postgres_compound_shaping_dispatches_once_on_connection_and_transaction() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
-    let main = r#"module main
-import pkg.db
-import pkg.db.postgres
-import app.user_groups
-import app.transaction_master
-
-extern "C" {
-  fn align_pg_reset()
-  fn align_pg_execute_calls() -> i32
-  fn align_pg_execute_prepared_calls() -> i32
-  fn align_pg_prepare_calls() -> i32
-  fn align_pg_clear_calls() -> i32
-  fn align_pg_control_calls() -> i32
-  fn align_pg_q6_delivered_rows() -> i32
-  fn align_pg_protocol_ok() -> i32
-  fn align_pg_protocol_error() -> i32
-}
-
-fn one_parent(borrow connection: pkg.db.conn) -> i32 {
-  arena out {
-    shaped := app.user_groups.run(
-      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 1, last_user_id: 1 }, out,
-    ) else { return 1 }
-    value := shaped else { return 2 }
-    if value.user.id != 1 || value.user.name != "Alice" || value.groups.len() != 2 {
-      return 3
-    }
-    if value.groups[0].id != 10 || value.groups[0].name != "Admin"
-      || value.groups[1].id != 20 || value.groups[1].name != "Dev" { return 4 }
-  }
-  arena out {
-    segmented := app.user_groups.run_segmented(
-      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 1, last_user_id: 3 }, out,
-    ) else { return 5 }
-    if segmented.users.len() != 3 || segmented.groups.len() != 3
-      || segmented.group_offsets.len() != 4 { return 6 }
-    if segmented.group_offsets[0] != 0 || segmented.group_offsets[1] != 2
-      || segmented.group_offsets[2] != 2 || segmented.group_offsets[3] != 3 { return 7 }
-  }
-  return 0
-}
-
-fn project(target: pkg.db.exec, out: region) -> i32 {
-  rows := app.transaction_master.run(
-    target, app.transaction_master.Params { account_id: 1 }, out,
-  ) else { return 8 }
-  if rows.len() != 2 { return 9 }
-  if rows[0].transaction.id != 100 || rows[0].status.code != "posted"
-    || rows[0].customer.name != "Ada" { return 10 }
-  if rows[1].transaction.id != 101 || rows[1].customer.name != "Linus" { return 11 }
-  return 0
-}
-
-fn main() -> i32 {
-  unsafe { align_pg_reset() }
-  connection := pkg.db.postgres.connect("postgresql://stub/q6", []) else { return 12 }
-  grouped := one_parent(connection)
-  if grouped != 0 { return grouped }
-  arena direct_out {
-    direct := project(pkg.db.exec_conn(connection), direct_out)
-    if direct != 0 { return direct }
-  }
-  transaction := pkg.db.begin(connection, []) else { return 13 }
-  arena tx_out {
-    nested := project(pkg.db.exec_tx(transaction), tx_out)
-    if nested != 0 { return nested }
-  }
-  returned := pkg.db.rollback(transaction) else { return 14 }
-  return unsafe {
-    if align_pg_prepare_calls() != 0 { return 21 }
-    if align_pg_execute_prepared_calls() != 0 { return 22 }
-    if align_pg_protocol_ok() != 1 { return 20 + align_pg_protocol_error() }
-    if align_pg_execute_calls() != 4 { return 16 }
-    if align_pg_q6_delivered_rows() != 10 { return 17 }
-    if align_pg_control_calls() != 2 { return 18 }
-    if align_pg_clear_calls() != 6 { return 19 }
-    42
-  }
-}
-"#;
-    let output = build_and_run_multi_with_c(
-        "pkg-db-q6-postgres-compound",
-        &package_files(main),
-        "main.align",
-        POSTGRES_STUB,
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "status: {:?}; stdout: {}; stderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    CASE_POSTGRES_COMPOUND.run();
 }
 
 #[test]
 fn compound_failures_do_not_retry_or_construct_rows() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
-    let sqlite_main = r#"module main
-import pkg.db
-import pkg.db.sqlite
-import app.user_groups
-
-extern "C" {
-  fn align_sqlite_q6_reset()
-  fn align_sqlite_q6_fail_next_bind()
-  fn align_sqlite_q6_prepare_calls() -> i32
-  fn align_sqlite_q6_step_calls() -> i32
-  fn align_sqlite_q6_delivered_rows() -> i32
-  fn align_sqlite_q6_finalize_calls() -> i32
-  fn align_sqlite_q6_protocol_ok() -> i32
-}
-
-fn main() -> i32 {
-  unsafe {
-    align_sqlite_q6_reset()
-    align_sqlite_q6_fail_next_bind()
-  }
-  connection := pkg.db.sqlite.connect(":memory:", []) else { return 1 }
-  arena out {
-    failed := app.user_groups.run(
-      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 1, last_user_id: 1 }, out,
-    )
-    if match failed { Ok(_) => true, Err(_) => false } { return 2 }
-  }
-  return unsafe {
-    if align_sqlite_q6_protocol_ok() != 1 { return 3 }
-    if align_sqlite_q6_prepare_calls() != 1 { return 4 }
-    if align_sqlite_q6_step_calls() != 0 { return 5 }
-    if align_sqlite_q6_delivered_rows() != 0 { return 6 }
-    if align_sqlite_q6_finalize_calls() != 1 { return 7 }
-    42
-  }
-}
-"#;
-    let sqlite_fixture = format!("{POSTGRES_STUB}\n{SQLITE_Q6_STUB}");
-    let sqlite = build_and_run_multi_with_c(
-        "pkg-db-q6-sqlite-pre-send-failure",
-        &package_files(sqlite_main),
-        "main.align",
-        &sqlite_fixture,
-    );
-    assert_eq!(
-        sqlite.status.code(),
-        Some(42),
-        "SQLite status: {:?}; stdout: {}; stderr: {}",
-        sqlite.status,
-        String::from_utf8_lossy(&sqlite.stdout),
-        String::from_utf8_lossy(&sqlite.stderr),
-    );
-
-    let postgres_main = r#"module main
-import pkg.db
-import pkg.db.postgres
-import app.user_groups
-
-extern "C" {
-  fn align_pg_reset()
-  fn align_pg_q6_fail_next_execute()
-  fn align_pg_execute_calls() -> i32
-  fn align_pg_clear_calls() -> i32
-  fn align_pg_protocol_ok() -> i32
-}
-
-fn main() -> i32 {
-  unsafe {
-    align_pg_reset()
-    align_pg_q6_fail_next_execute()
-  }
-  connection := pkg.db.postgres.connect("postgresql://stub/q6-fail", []) else { return 1 }
-  arena out {
-    failed := app.user_groups.run(
-      pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 1, last_user_id: 1 }, out,
-    )
-    if match failed { Ok(_) => true, Err(_) => false } { return 2 }
-  }
-  return unsafe {
-    if align_pg_protocol_ok() != 1 { return 3 }
-    if align_pg_execute_calls() != 1 { return 4 }
-    if align_pg_clear_calls() != 0 { return 5 }
-    42
-  }
-}
-"#;
-    let postgres = build_and_run_multi_with_c(
-        "pkg-db-q6-postgres-send-failure",
-        &package_files(postgres_main),
-        "main.align",
-        POSTGRES_STUB,
-    );
-    assert_eq!(
-        postgres.status.code(),
-        Some(42),
-        "PostgreSQL status: {:?}; stdout: {}; stderr: {}",
-        postgres.status,
-        String::from_utf8_lossy(&postgres.stdout),
-        String::from_utf8_lossy(&postgres.stderr),
-    );
+    CASE_SQLITE_PRE_SEND_FAILURE.run();
+    CASE_POSTGRES_SEND_FAILURE.run();
 }
 
 #[test]
@@ -1486,10 +1454,10 @@ fn main() -> i32 {
   }
 }
 "#;
-    let fixture = format!("{POSTGRES_STUB}\n{SQLITE_Q6_STUB}");
+    let fixture = format!("{}\n{}", PG.c_source, SQLITE_Q6.c_source);
     let output = build_and_run_multi_with_c(
         "pkg-db-q6-high-fanout",
-        &package_files(main),
+        &package_files(main).files(),
         "main.align",
         &fixture,
     );
@@ -1502,4 +1470,24 @@ fn main() -> i32 {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+}
+
+/// The Layer-1 migration's forward guard for this suite.
+///
+/// Regenerate ONLY with a reviewed reason, from the panic message this emits.
+const LAYER1_FINGERPRINT_GOLDEN: &str = "\
+pkg-db-q6-postgres-compound 106d86859e970e19
+pkg-db-q6-postgres-send-failure ae08532600fc7010
+pkg-db-q6-sqlite-pre-send-failure 5ec434a74adbd7ae
+pkg-db-q6-sqlite-transaction-master 744ac2d59a00d4f8
+pkg-db-q6-sqlite-user-groups 77007739f0587979
+";
+
+#[test]
+fn layer1_case_fingerprints_match_the_golden() {
+    let mut log = FingerprintLog::new();
+    for case in LAYER1_CASES {
+        log.record(&case.fingerprint());
+    }
+    log.assert_matches(LAYER1_FINGERPRINT_GOLDEN);
 }

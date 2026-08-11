@@ -169,7 +169,7 @@ impl ParityProgram {
     pub fn build(tag: &str, layout: &Layout) -> ParityProgram {
         assert!(
             layout.has_c_fixture(),
-            "a parity program must link a C fixture (call Layout::linking_pg_stub or with_pg_counters); \
+            "a parity program must link a C fixture (call Layout::linking or with_counters); \
              without it the PostgreSQL member cannot run"
         );
         let proj = layout.materialize(tag);
@@ -238,6 +238,16 @@ impl ParityProgram {
                 .collect(),
             _proj: proj,
         }
+    }
+
+    /// Override the per-case wall-clock cap.
+    ///
+    /// Re-added in PR-2 for `parity_engine_reports_a_timed_out_case_and_keeps_going`, which cannot
+    /// wait the 120-second default. PR-1 removed it as dormant surface on the bet that re-adding it
+    /// would be cheap; this is that bet settling.
+    pub fn with_timeout(mut self, timeout: Duration) -> ParityProgram {
+        self.timeout = timeout;
+        self
     }
 
     /// The pipeline this program was compiled through.
