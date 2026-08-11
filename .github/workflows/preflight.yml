@@ -31,14 +31,36 @@ jobs:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           jq -r '.pull_request.body // ""' "$GITHUB_EVENT_PATH" > "$RUNNER_TEMP/pr-body.txt"
+          # Trusted machinery is fetched from the LIVE base branch tip, never
+          # from `github.event.pull_request.base.sha`. That payload field is
+          # frozen when the PR is opened and is refreshed by none of the events
+          # this workflow listens to — not synchronize, reopened, edited, or a
+          # rerun of an existing run. PR #746 (2026-08-11) demonstrated the
+          # cost: after the checker fix in #748 merged, #746 kept being judged
+          # by the stale pre-#748 checker snapshot and failed permanently even
+          # though its body carried the correct merge-base marker; only
+          # recreating the PR cleared it. The checkout above is fetch-depth: 0,
+          # so the base branch's remote-tracking ref exists and is current.
+          # Fail closed if it cannot be resolved.
+          if ! BASE_TIP_SHA="$(git rev-parse --verify --quiet "refs/remotes/origin/$PR_BASE_REF^{commit}")"; then
+            echo "cannot resolve the live tip of base branch '$PR_BASE_REF'" >&2
+            echo "  (this job needs the checkout above to keep fetch-depth: 0)" >&2
+            exit 1
+          fi
+          echo "trusted machinery source: origin/$PR_BASE_REF = $BASE_TIP_SHA"
           # The checker and the tier classifier it sources both ship from the
           # trusted base now that PRs #659 (base-controlled checker) and #741
           # (tier classifier) are merged, so the trusted-base path always has
           # both files; never fall back to a PR's own copy, since that would
           # let a change supply the rules that judge its own attestation.
-          if git show "$PR_BASE_SHA:scripts/check-pr-preflight.sh" > "$RUNNER_TEMP/check-pr-preflight.sh" 2>/dev/null; then
+          # Machinery that main does not have yet is still absent from the live
+          # tip, so a PR introducing new trusted machinery keeps needing a
+          # one-PR bootstrap arm keyed on its own number; the live tip only
+          # guarantees that already-merged machinery reaches every open PR
+          # immediately.
+          if git show "$BASE_TIP_SHA:scripts/check-pr-preflight.sh" > "$RUNNER_TEMP/check-pr-preflight.sh" 2>/dev/null; then
             chmod +x "$RUNNER_TEMP/check-pr-preflight.sh"
-            if git show "$PR_BASE_SHA:scripts/pr-tier.sh" > "$RUNNER_TEMP/pr-tier.sh" 2>/dev/null; then
+            if git show "$BASE_TIP_SHA:scripts/pr-tier.sh" > "$RUNNER_TEMP/pr-tier.sh" 2>/dev/null; then
               chmod +x "$RUNNER_TEMP/pr-tier.sh"
             else
               echo "trusted base has no tier classifier" >&2
@@ -49,9 +71,9 @@ jobs:
             exit 1
           fi
           # The attestation binds the branch's merge base with the base branch,
-          # not the base branch tip. `github.event.pull_request.base.sha` is the
-          # tip and moves every time another PR lands on main, so resolve the
-          # merge base here too. This value is informational and for the
+          # not a base branch tip. `github.event.pull_request.base.sha` is a
+          # tip — the one frozen at PR creation — so resolve the merge base
+          # here too. This value is informational and for the
           # transition only — it keeps the previous trusted-base checker, the
           # one judging the PR that introduces this binding, comparing against
           # the right SHA. The current checker derives the base from the
