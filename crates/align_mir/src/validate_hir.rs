@@ -9995,9 +9995,24 @@ impl<'a> BodyValidator<'a> {
         type_args: &[Ty],
         signature: &BodySignature,
     ) -> bool {
+        // Ask the producer's mangler, never a copy of it: a monomorph name is the producer's
+        // output, so re-deriving it here with a second implementation only creates drift.
         let suffix = type_args
             .iter()
-            .map(|ty| format!("${}", body_ty_mangle(*ty, self.program)))
+            .map(|ty| {
+                format!(
+                    "${}",
+                    align_sema::ty_mangle(
+                        *ty,
+                        &self.program.tagged_types,
+                        &self.program.structs,
+                        &self.program.enums,
+                        &self.program.tuples,
+                        &self.program.fn_types,
+                        &self.program.resources,
+                    )
+                )
+            })
             .collect::<String>();
         signature.origin.is_some_and(|origin| {
             matches!(origin, hir::FnOrigin::Monomorph)

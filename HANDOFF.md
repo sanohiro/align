@@ -1488,6 +1488,17 @@ Historical session journal           docs/archive/HANDOFF-2026-07-25.md
 - Keep release and review procedures in `CLAUDE.md`; link to them instead of
   duplicating them here.
 
+The silent-empty-MIR class reached a fourth instance and is now closed at its
+root: `cache_codegen::json_scan_generic_return_context_no_publication` failed
+because the MIR body validator kept its own copy of the monomorph-name
+mangler, and that copy spelled `json.scanner<T>` without the trailing
+separator the producer's sanitized `ty_name` emits. A valid generic
+instantiation therefore failed validation and lowered to an empty unit. The
+validator now calls `align_sema::ty_mangle` directly. Every member of this
+class has been one model of a producer fact re-derived by a consumer —
+array-element admission, the `str` view demotion, `Copy`-ness, and now
+mangling — so prefer delegation to any new parallel implementation.
+
 Two more out-of-gate suites are red on `main` for reasons unrelated to the
 nightly's finding, both found while fixing it (2026-08-11):
 

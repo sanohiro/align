@@ -485,6 +485,31 @@ fn json_scan_per_unit_interface_row_ownership() {
     assert!(hot.all_hit(), "restoring the imported Copy row must hit both prior artifacts");
 }
 
+/// A monomorph name is the producer's output, so the MIR body validator must check a call
+/// against the producer's mangler rather than a second copy of it. The copies had drifted on
+/// `json.scanner<T>`, and the whole unit lowered to an empty program without a diagnostic.
+#[test]
+fn generic_instantiation_over_a_json_scanner_lowers() {
+    if !backend() {
+        return;
+    }
+    let src = "module main\nimport core.json\nRow { score: i64 }\nfn identity<T>(value: T) -> T = value\nfn main() -> Result<(), Error> {\n  rows: json.scanner<Row> := identity(json.scan(\"[]\"))\n  print(rows.count()?)\n  return Ok(())\n}\n";
+    let proj = Project::new("json-scan-generic-mangle", &[("main.align", src)], "main.align");
+    let entry = proj.entry_path();
+    let entry_src = std::fs::read_to_string(&entry).expect("read entry");
+    let mut sm = SourceMap::new();
+    let walk = build_per_unit(&mut sm, &entry.display().to_string(), &entry_src);
+    let diagnostics = align_driver::format_diagnostics(&sm, &walk.diags);
+    assert!(
+        !walk.diags.has_errors(),
+        "a generic instantiated over json.scanner must lower:\n{diagnostics}"
+    );
+    assert!(
+        !walk.units.is_empty(),
+        "the unit must produce per-unit artifacts rather than an empty program"
+    );
+}
+
 #[test]
 fn json_scan_generic_return_context_no_publication() {
     if !backend() {

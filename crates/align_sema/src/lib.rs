@@ -43813,7 +43813,12 @@ fn mangle_mono_source(
 }
 
 /// A compact, identifier-safe spelling of a concrete type for use in a mangled symbol name.
-fn ty_mangle(
+/// The monomorph-name mangling every generic instantiation is keyed by. Public so the MIR body
+/// validator can check a call's mangled target against the producer's own scheme instead of
+/// keeping a second copy: the copies drifted on `json.scanner<T>` (the producer sanitizes
+/// `ty_name`, the copy had a hand-written arm without its trailing separator), which made a valid
+/// program fail validation and lower to an empty unit.
+pub fn ty_mangle(
     ty: Ty,
     tagged_types: &[hir::TaggedType],
     structs: &[StructDef],
