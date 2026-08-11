@@ -14,7 +14,11 @@ The second design review exposed a pre-existing asymmetry: D12 gave SQLite catal
 connection execution lease but allowed their PostgreSQL siblings to call libpq after only a live
 state check. Streamed delivery therefore cannot land directly. One public/ABI-neutral prerequisite
 first makes every PostgreSQL catalog and common/native EXPLAIN call share the typed-execution lease;
-the delivery PR follows after that independently testable safety closure merges.
+direct delivery follows after that independently testable safety closure merges. Prepared parity is
+a third PR because exact `ParameterFormat(name, ...)` validation must retain the producer resolver
+in statement v3. The direct rail preserves absent Delivery on both shipped BufferedFull timeout
+subpaths and drains a multiplicity result to clean completion instead of canceling an effectful DML
+`RETURNING`.
 
 ## 2026-08-07: shared borrow accepts stable Copy storage
 

@@ -314,8 +314,14 @@ SQL, Params/Row contract, binder, decoder, batch plan, and cache identity do not
 execution selects `SingleRow` or `PortalBatch(n)`. The choice therefore stays in the explicit
 driver-qualified execution-option slice. Both direct and prepared execution enter one libpq result
 state machine, retain Params until protocol completion, and expose partial-server-failure timing
-instead of pretending bounded delivery is atomic. Binary wire formats remain a separate rail
-because they change bind/decode representation rather than result delivery lifetime.
+instead of pretending bounded delivery is atomic. A direct `one_native` multiplicity remains
+pending until clean protocol completion: normal drain preserves the SQL effects of DML `RETURNING`,
+while a late server failure or explicit timeout wins. Absence of Delivery never enters this live
+state machine and retains the shipped caller-synchronous BufferedFull timing, including its existing
+nonblocking deadline completion. Prepared parity is a separate
+formation rail because its statement state must retain the producer parameter-name resolver.
+Binary wire formats remain a separate rail because they change bind/decode representation rather
+than result delivery lifetime.
 
 **A live native protocol requires a complete consumer lease inventory.** PostgreSQL catalog and
 EXPLAIN originally used synchronous full-result libpq calls, so D12 checked their live connection
@@ -323,8 +329,8 @@ but did not give them the typed-execution lease. That was harmless only while ev
 constructor also completed its libpq protocol synchronously. Single-row/chunked delivery keeps the
 connection protocol-busy after return, exposing the omission. The fix is a smaller prerequisite,
 not a delivery special case: every catalog and common/native EXPLAIN call acquires the same lease,
-holds it through result/context cleanup, and rejects overlap before libpq. The streamed-delivery PR
-then depends on that general closure.
+holds it through result/context cleanup, and rejects overlap before libpq. Both subsequent direct
+and prepared streamed-delivery PRs depend on that general closure.
 
 **A named `region` is a destination capability, not an allocator abstraction.** Compound
 database reads and streaming decoders need ordinary library functions to construct caller-owned

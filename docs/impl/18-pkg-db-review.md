@@ -539,7 +539,9 @@ idea is rejected.
   ledger in `pkg-design/db.md` §23 now fixes that direct/prepared streamed-delivery rail. Its
   reopened closure matrix first lands an independently mergeable PostgreSQL catalog/EXPLAIN lease
   prerequisite, because those shipped libpq consumers must reject overlap before a live stream can
-  be sound. Binary formats and other native paths remain separate.
+  be sound. Direct delivery follows with normal-drain cardinality and exact BufferedFull default
+  preservation; prepared parity then retains parameter-name authority in statement v3. Binary
+  formats and other native paths remain separate.
 
 ### F32 — L1a and L1b both claimed `Option<MoveStruct>`
 

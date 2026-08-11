@@ -63,10 +63,11 @@ recorded by `pkg-design/db.md` §23. It retains SQLite `Step` and PostgreSQL
 `BufferedFull`. Before streamed delivery, one independently mergeable
 prerequisite closes the shipped PostgreSQL catalog/EXPLAIN execution-lease gap
 without changing a public surface or ABI. The following independently useful
-rail is the exact PostgreSQL `SingleRow` / `PortalBatch` direct-and-prepared
-delivery contract recorded by the adjacent A1 ledger. PostgreSQL binary
-formats, COPY, pipeline mode, and LISTEN/NOTIFY remain later independent rails
-rather than enlarging either PR.
+rail is the exact PostgreSQL `SingleRow` / `PortalBatch` direct delivery
+contract recorded by the adjacent A1 ledger. Prepared parity follows in its own
+rail with the statement-v3 parameter resolver needed for exact native-option
+validation. PostgreSQL binary formats, COPY, pipeline mode, and LISTEN/NOTIFY
+remain later independent rails rather than enlarging any of those PRs.
 For planning language, **initial `pkg.db` release** means L1a–L7 plus D1–D12;
 **complete committed `pkg.db` roadmap** means those plus D13 and D14. D0 is
 disposable native evidence and may run in parallel at any time.

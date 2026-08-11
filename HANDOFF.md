@@ -42,9 +42,13 @@ finding that the shipped PostgreSQL catalog and EXPLAIN paths did not share the
 typed-execution lease. The next product work is therefore one independently
 mergeable libpq-consumer lease prerequisite with no public/ABI change. After it
 merges, the independently useful PostgreSQL `SingleRow` / `PortalBatch`
-direct-and-prepared delivery rail follows. The exact two-PR boundary and public
-contract are in `docs/impl/pkg-design/db.md` §23; binary formats remain the
-following separate rail.
+direct delivery rail follows; prepared parity is a third PR because it must
+retain parameter-name authority in statement v3. Cardinality drains to clean
+completion rather than canceling a possibly effectful `RETURNING` statement,
+and absent Delivery stays on the caller-synchronous BufferedFull implementation,
+including its existing nonblocking deadline subpath. The
+exact three-PR boundary and public contract are in
+`docs/impl/pkg-design/db.md` §23; binary formats remain the following rail.
 
 Out-of-gate suite status (suites outside the bounded CI gate; a nightly
 full-suite workflow now runs them daily so this class cannot rot silently):
@@ -105,7 +109,8 @@ Q5 schema tooling/inspection     complete through D11 + D12
 Q6 compound product closure      complete through D10
 A1 common batch/SoA rail         complete through #740 / D13
 A1 PostgreSQL lease prerequisite next / catalog + EXPLAIN overlap closure / D13
-then: A1 PostgreSQL delivery     SingleRow + PortalBatch / D13
+then: A1 PostgreSQL direct       SingleRow + PortalBatch / D13
+then: A1 PostgreSQL prepared     streamed parity + stmt v3 resolver / D13
 ```
 
 The exact cell contracts and owner matrices remain in
