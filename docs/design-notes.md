@@ -323,6 +323,14 @@ formation rail because its statement state must retain the producer parameter-na
 Binary wire formats remain a separate rail because they change bind/decode representation rather
 than result delivery lifetime.
 
+**A row error does not silently choose transaction effects.** A streamed validation, decode, or
+batch-storage error is already the primary caller-visible failure, but libpq may still own an
+effectful `RETURNING` protocol. Align destroys unpublished values and drains without further decode
+under the original absolute deadline, preserving normal completion effects when time remains. Only
+deadline expiry cancels; the first row/storage error remains primary, while the connection or
+transaction state exposes whether completion or cancellation won. Rows therefore retain both the
+absolute deadline and the original duration needed by recovery.
+
 **A live native protocol requires a complete consumer lease inventory.** PostgreSQL catalog and
 EXPLAIN originally used synchronous full-result libpq calls, so D12 checked their live connection
 but did not give them the typed-execution lease. That was harmless only while every PostgreSQL rows

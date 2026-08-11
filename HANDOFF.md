@@ -46,7 +46,10 @@ direct delivery rail follows; prepared parity is a third PR because it must
 retain parameter-name authority in statement v3. Cardinality drains to clean
 completion rather than canceling a possibly effectful `RETURNING` statement,
 and absent Delivery stays on the caller-synchronous BufferedFull implementation,
-including its existing nonblocking deadline subpath. The
+including its existing nonblocking deadline subpath. Validation/decode/storage
+errors normal-drain without further decoding under the original deadline; only
+deadline expiry cancels, with Conn/Tx effect races explicit. Rows v3 retains
+both the absolute deadline and original duration needed for recovery. The
 exact three-PR boundary and public contract are in
 `docs/impl/pkg-design/db.md` §23; binary formats remain the following rail.
 

@@ -20,6 +20,13 @@ in statement v3. The direct rail preserves absent Delivery on both shipped Buffe
 subpaths and drains a multiplicity result to clean completion instead of canceling an effectful DML
 `RETURNING`.
 
+The next fresh review reopened the stream matrix a third time: validation, decode, and batch-storage
+errors had no effect-aware pending-protocol cleanup, and rows state retained the absolute deadline
+but not the original recovery duration. Those errors now normal-drain without decoding under the
+original deadline, cancel only on expiry, preserve the first error, and pin Conn/Tx effect races.
+Rows v3 uses offset 112 for the original duration. Chunking bounds rows per result and peak result
+buffering, never total query transport.
+
 ## 2026-08-07: shared borrow accepts stable Copy storage
 
 Shared `borrow` now accepts a stable bound Copy or Move place. Copy values still pass by value by

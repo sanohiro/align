@@ -191,6 +191,14 @@ client floor, but the same local database gate must run its catalog/EXPLAIN
 overlap suite and prove zero libpq calls on a rejected live-stream overlap
 before that prerequisite is pushed.
 
+The direct-delivery suite crosses validation/decode/storage failure with no
+timeout, time remaining, and deadline expiry on both connection and transaction
+targets. It pins first-error retention, no further decode, completion-versus-
+cancel SQL effects, the rows-v3 absolute-deadline/original-duration pair, and
+recovery-budget use. Chunk owners report total transported rows separately from
+maximum rows per `PGresult`; the latter is not asserted as a total-transport
+bound.
+
 ## Benchmarks are not tests
 
 A benchmark measures one named performance path against a baseline or control.
