@@ -8,6 +8,11 @@
 #   ALIGN_APT_PACKAGES="llvm-22-dev clang-22 ..." scripts/ci-apt-llvm.sh install
 #   <actions/cache/save, main only>
 #
+# A caller with no cache around it uses `install --uncached` instead. That mode
+# never restores, never leaves archives behind, and never applies the
+# cache-specific empty-resolve guard: "apt downloaded nothing" is only a defect
+# when an entry is about to be saved from it.
+#
 # `install` unpacks the restored archives with dpkg, which reads no package
 # lists at all, and otherwise performs the identical full apt install and
 # leaves the resolved archives behind for the cache to save. Measured on the
@@ -30,6 +35,10 @@
 # request whose closure conflicts with nothing preinstalled is dpkg-replayable
 # by construction, which is what makes the cache sound at all.
 #
+# That property is enforced, not documented: the authoritative install runs with
+# `--no-remove`, so the first request that needs a removal fails the job that
+# would have saved the entry instead of saving one no dpkg run can replay.
+#
 # What the key does and does not identify. It identifies the *request* — the
 # runner image, the LLVM major version, and the sorted package list — plus a
 # manual generation counter. It does not identify the resolved bytes:
@@ -43,12 +52,13 @@
 # change. Bump CACHE_GENERATION below to escape a bad entry without waiting for
 # the runner image to roll.
 #
-# nightly.yml and release.yml call this same script with no cache around it, so
+# nightly.yml and release.yml call this same script as `install --uncached`, so
 # a fresh snapshot is still exercised every night and release artifacts never
-# link one that only a cache still has, while all four workflows resolve one
-# package set from one repository definition. The two ci.yml jobs keep separate
-# package lists, and so separate entries, because giving the lint job libpq-dev
-# and libsqlite3-dev to share one entry would change what its build detects.
+# link one that only a cache still has. Three workflows and four install call
+# sites (two ci.yml jobs, nightly, release) therefore resolve one package set
+# from one repository definition. The two ci.yml jobs keep separate package
+# lists, and so separate entries, because giving the lint job libpq-dev and
+# libsqlite3-dev to share one entry would change what its build detects.
 #
 # Trust boundary. The manifest check below detects truncation and corruption,
 # not a hostile writer: installing archives with dpkg bypasses apt's repository
@@ -58,8 +68,10 @@
 # reusable workflows called from less trusted contexts, or any other path that
 # lets a fork populate an entry this workflow restores.
 #
-# On a hit the apt.llvm.org repository definition is never added, so any step
-# that needs to apt-install from it must run the full path itself.
+# On a clean hit the apt.llvm.org repository definition is never added, so any
+# step that needs to apt-install from it must run the full path itself. Every
+# other path — a miss, `--uncached`, and the recovery after a restored set
+# fails — does add it, and leaves it in place for the rest of the job.
 set -euo pipefail
 
 readonly LLVM_VERSION=22
@@ -76,9 +88,11 @@ readonly LLVM_KEY_FINGERPRINT=6084F3CF814B57C1CF12EFD515CF4D18AF4F7421
 readonly CACHE_GENERATION=g2
 
 usage() {
-  echo "usage: scripts/ci-apt-llvm.sh {key|install}" >&2
-  echo "  key      print the cache path and key for actions/cache" >&2
-  echo "  install  install the cached archive set, or resolve it through apt" >&2
+  echo "usage: scripts/ci-apt-llvm.sh {key | install [--uncached]}" >&2
+  echo "  key                 print the cache path and key for actions/cache" >&2
+  echo "  install             install the restored archive set, or resolve it" >&2
+  echo "                      through apt and leave the archives for the cache" >&2
+  echo "  install --uncached  resolve through apt for a caller with no cache" >&2
   echo "  ALIGN_APT_PACKAGES must list the packages to install." >&2
 }
 
@@ -108,8 +122,12 @@ cache_key() {
     "$digest"
 }
 
-# Every requested package configured, and the toolchain the build actually
-# resolves through, present. A restored set that fails this is discarded.
+# Every requested package configured, and the two things the build actually
+# resolves through — llvm-config and the C driver alignc links with — present.
+# A restored set that fails this is discarded. `cc` is checked because no
+# requested package names it: it comes from the runner image, and a repair that
+# was allowed to remove packages could take it away without any dpkg-query in
+# the loop above noticing.
 toolchain_complete() {
   local package status
   set -f
@@ -120,7 +138,8 @@ toolchain_complete() {
     status="$(dpkg-query --show --showformat='${db:Status-Status}' "$package" 2>/dev/null || true)"
     [[ "$status" == "installed" ]] || return 1
   done
-  [[ -x "/usr/lib/llvm-${LLVM_VERSION}/bin/llvm-config" ]]
+  [[ -x "/usr/lib/llvm-${LLVM_VERSION}/bin/llvm-config" ]] || return 1
+  command -v cc >/dev/null 2>&1
 }
 
 # Truncation and corruption check over the restored set. See the header for
@@ -139,13 +158,37 @@ verify_archives() {
   ( cd "$archives" && LC_ALL=C sha256sum --check --quiet --strict SHA256SUMS )
 }
 
+# Print the llvm-N-dev candidate version, but only when apt would fetch that
+# exact version from apt.llvm.org. A bare `Candidate:` is not evidence the
+# repository works: an llvm-22-dev already unpacked by a restored set answers it
+# out of /var/lib/dpkg/status, which would let a failed repository add look like
+# a success and skip the suite fallback. Walks the version table, finds the row
+# whose version is the candidate, and requires one of that row's origin lines to
+# name apt.llvm.org. Prints nothing when it does not.
+llvm_org_candidate() {
+  apt-cache policy "llvm-${LLVM_VERSION}-dev" 2>/dev/null | awk '
+    /^ *Candidate: / { candidate = $2; next }
+    /^ *Version table:/ { in_table = 1; next }
+    !in_table { next }
+    {
+      # A version row is "<version> <priority>", or "*** <version> <priority>"
+      # for the installed one. An origin row is "<priority> <uri-or-path> ...",
+      # whose second field is never a bare number.
+      version = ""
+      if ($1 == "***") { version = $2 }
+      else if ($2 ~ /^[0-9]+$/) { version = $1 }
+      if (version != "") { current = (version == candidate); next }
+      if (current && index($0, "apt.llvm.org") > 0) { print candidate; exit }
+    }'
+}
+
 # The minimum llvm.sh did that this script actually needs: the signing key and
 # one sources.list entry. Idempotent, because the recovery path adds the
 # repository before the authoritative install also asks for it.
 add_llvm_repository() {
   [[ "$llvm_repository_ready" -eq 1 ]] && return 0
 
-  local codename architecture fingerprint suite candidate
+  local codename architecture tool fingerprints suite candidate
   # Every capture below tolerates its own failure so the explicit check, not
   # `set -e`/`pipefail` on the assignment, reports what actually went wrong.
   codename="$(. /etc/os-release 2>/dev/null && printf '%s' "${VERSION_CODENAME:-}")" \
@@ -155,20 +198,26 @@ add_llvm_repository() {
     return 1
   fi
   architecture="$(dpkg --print-architecture)" || return 1
-  command -v gpg >/dev/null 2>&1 || {
-    echo "gpg is required to verify the apt.llvm.org signing key" >&2
-    return 1
-  }
+  for tool in gpg wget; do
+    command -v "$tool" >/dev/null 2>&1 || {
+      echo "$tool is required to add the apt.llvm.org repository" >&2
+      return 1
+    }
+  done
 
   [[ -n "$workdir" ]] || workdir="$(mktemp -d)" || return 1
   wget -q "$LLVM_KEY_URL" -O "$workdir/llvm-snapshot.asc" || {
     echo "cannot download the apt.llvm.org signing key from $LLVM_KEY_URL" >&2
     return 1
   }
-  fingerprint="$(gpg --show-keys --with-colons "$workdir/llvm-snapshot.asc" 2>/dev/null \
-    | awk -F: '$1 == "fpr" { print $10; exit }')" || fingerprint=""
-  if [[ "$fingerprint" != "$LLVM_KEY_FINGERPRINT" ]]; then
-    echo "apt.llvm.org signing key is ${fingerprint:-unreadable}, expected $LLVM_KEY_FINGERPRINT" >&2
+  # Any fpr record, not just the first: the file is a key block, and upstream
+  # may publish a rotation alongside the current key or reorder the two. Still
+  # fail closed — the pinned fingerprint must appear somewhere in it.
+  fingerprints="$(gpg --show-keys --with-colons "$workdir/llvm-snapshot.asc" 2>/dev/null \
+    | awk -F: '$1 == "fpr" { print $10 }')" || fingerprints=""
+  if ! printf '%s\n' "$fingerprints" | grep -qxF "$LLVM_KEY_FINGERPRINT"; then
+    echo "apt.llvm.org signing key does not carry $LLVM_KEY_FINGERPRINT" >&2
+    echo "  fingerprints offered: ${fingerprints:-none}" >&2
     return 1
   fi
   sudo install -d -m 0755 /etc/apt/keyrings || return 1
@@ -184,9 +233,8 @@ add_llvm_repository() {
     # A suite that does not exist 404s and fails the whole update; the
     # candidate probe below, not the exit status, decides whether it worked.
     sudo DEBIAN_FRONTEND=noninteractive apt-get update || true
-    candidate="$(apt-cache policy "llvm-${LLVM_VERSION}-dev" 2>/dev/null \
-      | awk '$1 == "Candidate:" { print $2; exit }')" || candidate=""
-    if [[ -n "$candidate" && "$candidate" != "(none)" ]]; then
+    candidate="$(llvm_org_candidate)" || candidate=""
+    if [[ -n "$candidate" ]]; then
       echo "apt.llvm.org $suite offers llvm-${LLVM_VERSION}-dev $candidate"
       llvm_repository_ready=1
       return 0
@@ -208,21 +256,28 @@ repair_dpkg_state() {
   add_llvm_repository || true
   # --no-remove first, so a repair cannot solve a conflict by deleting a
   # library the build then fails to link. If that cannot converge, allow the
-  # removal: a restored set breaks precisely when dpkg could not remove a
+  # removal: one way a restored set breaks is dpkg being unable to remove a
   # conflicting package that apt would have, and refusing the removal outright
-  # leaves no repair at all. The authoritative install below reinstates every
-  # requested package and toolchain_complete fails closed if it does not.
+  # leaves no repair at all. That second stage is a general safety net rather
+  # than a live path — retiring the g1 entries removed the only known set that
+  # needed it, and the `--no-remove` on the authoritative install keeps a new
+  # one from being saved. The authoritative install reinstates every requested
+  # package and toolchain_complete, which now also checks `cc`, fails closed if
+  # a removal took something the build needs.
   sudo DEBIAN_FRONTEND=noninteractive apt-get --fix-broken --no-remove --yes install \
     || sudo DEBIAN_FRONTEND=noninteractive apt-get --fix-broken --yes install \
     || true
 }
 
-# $1: 1 when an empty resolve must fail the job (this run started from a cache
-# miss, so its result is what gets saved). After a failed restore most packages
-# are already unpacked, so apt legitimately downloads nothing and the entry is
-# not saved anyway.
+# $1 is why this run is resolving through apt:
+#   cache-miss  an entry will be saved from the result, so an empty resolve is
+#               a defect and the manifest has to be written
+#   repair      a restored set failed; most packages are already unpacked, so
+#               downloading nothing is correct and no entry is saved
+#   uncached    the caller keeps no cache at all; same as repair, and the
+#               archives are discarded by install_packages afterwards
 install_from_apt() {
-  local strict="$1"
+  local purpose="$1"
   sudo rm -rf "$archives"
   sudo install -d -m 0755 "$archives"
   # apt drops privileges to _apt while fetching, so hand it a writable
@@ -240,7 +295,12 @@ install_from_apt() {
   # shellcheck disable=SC2086 # the package list is deliberately word-split.
   set -- $packages
   set +f
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+  # --no-remove turns "this request is dpkg-replayable" from a claim into a
+  # gate. An apt transaction that removes a package cannot be replayed by
+  # `dpkg --install` on a later hit, which is exactly how the g1 entries broke;
+  # failing here means main never saves such an entry in the first place. It is
+  # unconditional so nightly, the canary, hits it before any cached job does.
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-remove "$@"
 
   sudo rm -f "$APT_CONF"
   apt_conf_written=0
@@ -252,26 +312,43 @@ install_from_apt() {
   resolved=("$archives"/*.deb)
   shopt -u nullglob
   if [[ ${#resolved[@]} -eq 0 ]]; then
-    if [[ "$strict" -eq 1 ]]; then
+    if [[ "$purpose" == cache-miss ]]; then
       echo "apt resolved no archives into $archives, so the cache entry would be" >&2
       echo "empty and every later run would silently take the full install." >&2
       echo "If the runner image now ships the toolchain, drop the cache instead." >&2
       exit 1
     fi
-    # Repair path: the restored set already put most packages on disk, so
-    # downloading nothing is the correct outcome. The caller restored a hit, so
-    # no entry is saved from this run and there is nothing to manifest.
-    echo "apt resolved no archives; the repaired install needed no download"
+    # No entry is saved from a repair or an uncached run, so downloading
+    # nothing means the packages are already installed — the desired end state,
+    # not a defect, and there is nothing to write a manifest over.
+    echo "apt resolved no archives; every requested package was already installed"
     return 0
   fi
-  ( cd "$archives" \
-    && sha256sum ./*.deb > SHA256SUMS.partial \
-    && mv SHA256SUMS.partial SHA256SUMS )
-  echo "resolved ${#resolved[@]} archives ($(du -sh "$archives" | cut -f1)) for the cache"
+  if [[ "$purpose" == cache-miss ]]; then
+    ( cd "$archives" \
+      && sha256sum ./*.deb > SHA256SUMS.partial \
+      && mv SHA256SUMS.partial SHA256SUMS )
+    echo "resolved ${#resolved[@]} archives ($(du -sh "$archives" | cut -f1)) for the cache"
+  else
+    echo "resolved ${#resolved[@]} archives ($(du -sh "$archives" | cut -f1))"
+  fi
 }
 
 install_packages() {
   local restored=()
+
+  if [[ "$uncached" -eq 1 ]]; then
+    install_from_apt uncached
+    # Nothing will ever read these again, and release.yml already carries two
+    # Cargo target directories on the same runner disk.
+    sudo rm -rf "$archives"
+    toolchain_complete || {
+      echo "LLVM ${LLVM_VERSION} and $packages are not fully installed" >&2
+      exit 1
+    }
+    return 0
+  fi
+
   if [[ -d "$archives" ]]; then
     shopt -s nullglob
     restored=("$archives"/*.deb)
@@ -288,9 +365,9 @@ install_packages() {
   elif [[ ${#restored[@]} -gt 0 ]]; then
     echo "the cached package set is unusable; falling back to a full apt install" >&2
     repair_dpkg_state
-    install_from_apt 0
+    install_from_apt repair
   else
-    install_from_apt 1
+    install_from_apt cache-miss
   fi
 
   toolchain_complete || {
@@ -300,8 +377,19 @@ install_packages() {
 }
 
 mode="${1:-}"
+uncached=0
 case "$mode" in
-  key | install) ;;
+  key)
+    [[ $# -eq 1 ]] || { usage; exit 2; }
+    ;;
+  install)
+    case "${2:-}" in
+      "") ;;
+      --uncached) uncached=1 ;;
+      *) usage; exit 2 ;;
+    esac
+    [[ $# -le 2 ]] || { usage; exit 2; }
+    ;;
   *)
     usage
     exit 2
