@@ -57,6 +57,13 @@ failure, and prefixes each binary's output with its name, exit code, and
 duration. `ALIGN_GATE_JOBS` overrides the process count, which defaults to the
 host's CPU count.
 
+Each binary runs with `RUST_TEST_THREADS` set to the CPU count divided by that
+process count — 1 by default — so N concurrent binaries cannot start N libtest
+threads apiece and multiply the runnable-thread count and peak memory by the
+core count. A crate whose own tests could have overlapped therefore pays its
+serial time, which is the trade the gate makes: its wall clock is the slowest
+single binary either way.
+
 CI additionally builds release compiler/runtime artifacts and compiles and runs
 `examples/hello.align` on Linux x86-64, Linux ARM64, and Apple Silicon. This is
 the cross-platform packaged-command smoke path.

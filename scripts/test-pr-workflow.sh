@@ -443,6 +443,29 @@ declared_gate_tests="$(printf '%s\n' $PR_TIER_GATE_TESTS | sort -u | tr '\n' ' '
   echo "  scripts/pr-tier.sh lists: $declared_gate_tests" >&2
   exit 1
 }
+# scripts/test-pr.sh hands scripts/run-gate-binaries.sh the exact set of
+# binaries its cargo selection must produce, and the runner fails when the
+# compiled set differs either way. That check is only fail-closed while the
+# declared list still equals the selection, so derive the list from the `-p`
+# and `--test` flags and compare.
+declared_gate_binaries="$(
+  awk '/^gate_binaries="/ { inside = 1; next } inside && /^"/ { exit } inside { print }' \
+    "$repo_root/scripts/test-pr.sh" |
+    tr ' ' '\n' | grep -v '^$' | LC_ALL=C sort | tr '\n' ' '
+)"
+derived_gate_binaries="$(
+  {
+    grep -oE '^  -p [a-z0-9_]+' "$repo_root/scripts/test-pr.sh"
+    grep -oE '^  --test [a-z0-9_]+' "$repo_root/scripts/test-pr.sh"
+  } | awk '{ print $2 }' | LC_ALL=C sort | tr '\n' ' '
+)"
+[[ -n "$derived_gate_binaries" && "$declared_gate_binaries" == "$derived_gate_binaries" ]] || {
+  echo "scripts/test-pr.sh's declared gate_binaries list is stale" >&2
+  echo "  declared: $declared_gate_binaries" >&2
+  echo "  selected: $derived_gate_binaries" >&2
+  exit 1
+}
+
 actual_prose="$(
   cd "$repo_root" || exit 1
   grep -rhoE 'include_(str|bytes)!\("[^"]*\.md"\)' crates 2>/dev/null |
@@ -1113,15 +1136,149 @@ grep -q 'already contains' "$absorbed_err" || {
   exit 1
 }
 
+# scripts/run-gate-binaries.sh turns a cargo artifact stream into a set of
+# concurrently executed test binaries. Exercise discovery, the fail-closed set
+# check, and both failure paths against fixtures — no compilation involved, so
+# these run everywhere the rest of this file does.
+gate_dir="$tmp_dir/gate-runner"
+mkdir -p "$gate_dir/pkg" "$gate_dir/bin"
+gate_runner="$repo_root/scripts/run-gate-binaries.sh"
+
+# A stand-in test binary, named the way cargo names one: target, then a
+# disambiguating hash the runner has to strip back off.
+gate_binary() {
+  local path="$gate_dir/bin/$1-0123456789abcdef"
+  printf '#!/usr/bin/env bash\n%s\n' "$2" >"$path"
+  chmod +x "$path"
+  printf '%s\n' "$path"
+}
+gate_pass_one="$(gate_binary pass_one 'printf "cwd=%s\n" "$PWD"; exit 0')"
+gate_pass_two="$(gate_binary pass_two 'exit 0')"
+gate_failing="$(gate_binary failing 'echo boom >&2; exit 3')"
+# Kills the subshell that launched it, so no result is ever recorded — the one
+# way to reach the runner's "killed" path deterministically. The sleep only
+# runs if the kill did not land, turning a mis-fire into a fast wrong-output
+# failure instead of a hang.
+gate_killed="$(gate_binary suicidal 'kill -KILL "$PPID"; sleep 5')"
+
+gate_artifact() {
+  printf '{"reason":"compiler-artifact","manifest_path":"%s/pkg/Cargo.toml",' "$gate_dir"
+  printf '"target":{"kind":["lib"],"name":"x","test":true},'
+  printf '"profile":{"opt_level":"0","test":%s},"features":[],' "$2"
+  printf '"filenames":["x"],"executable":%s,"fresh":true}\n' "$1"
+}
+gate_stream() {
+  local out="$1"
+  shift
+  {
+    printf '{"reason":"build-script-executed","package_id":"x",'
+    printf '"linked_paths":["native=%s/bin"],"cfgs":[],"env":[]}\n' "$gate_dir"
+    local executable
+    for executable in "$@"; do
+      gate_artifact "\"$executable\"" true
+    done
+    # A dependency binary (alignc, in the real gate) carries profile test:false,
+    # and a plain library unit carries no executable at all. Neither may run.
+    gate_artifact "\"$gate_dir/bin/not_a_test-0123456789abcdef\"" false
+    gate_artifact null true
+  } >"$out"
+}
+
+gate_ok_json="$tmp_dir/gate-ok.json"
+gate_stream "$gate_ok_json" "$gate_pass_one" "$gate_pass_two"
+gate_ok_out="$tmp_dir/gate-ok-out"
+ALIGN_GATE_JOBS=2 "$gate_runner" "$gate_ok_json" pass_one pass_two \
+  >"$gate_ok_out" 2>&1 || {
+  echo "the gate runner failed on a clean fixture:" >&2
+  cat "$gate_ok_out" >&2
+  exit 1
+}
+for expected_line in '--- pass_one (exit 0' '--- pass_two (exit 0' 'gate: start pass_one'; do
+  grep -Fq -e "$expected_line" "$gate_ok_out" || {
+    echo "the gate runner output lacks '$expected_line':" >&2
+    cat "$gate_ok_out" >&2
+    exit 1
+  }
+done
+# Cargo runs a test binary from its package directory; the runner must too.
+grep -Fq "cwd=$gate_dir/pkg" "$gate_ok_out" || {
+  echo "the gate runner did not run a binary from its package directory:" >&2
+  cat "$gate_ok_out" >&2
+  exit 1
+}
+if grep -Fq 'not_a_test' "$gate_ok_out"; then
+  echo "the gate runner ran a non-test artifact:" >&2
+  cat "$gate_ok_out" >&2
+  exit 1
+fi
+
+# The declared set is fail-closed in both directions, on a multiset: a missing
+# binary, an extra one, and a duplicate target name all have to fail.
+gate_dup_json="$tmp_dir/gate-dup.json"
+gate_stream "$gate_dup_json" "$gate_pass_one" "$gate_pass_one" "$gate_pass_two"
+gate_mismatch_case() {
+  local label="$1" stream="$2"
+  shift 2
+  local out="$tmp_dir/gate-mismatch-$label"
+  local status=0
+  ALIGN_GATE_JOBS=2 "$gate_runner" "$stream" "$@" >"$out" 2>&1 || status=$?
+  [[ "$status" -ne 0 ]] || {
+    echo "the gate runner accepted a $label binary set" >&2
+    cat "$out" >&2
+    exit 1
+  }
+  grep -Fq 'do not match the declared gate set' "$out" || {
+    echo "the $label binary set failed for the wrong reason:" >&2
+    cat "$out" >&2
+    exit 1
+  }
+}
+gate_mismatch_case missing "$gate_ok_json" pass_one pass_two never_compiled
+gate_mismatch_case extra "$gate_ok_json" pass_one
+gate_mismatch_case duplicate "$gate_dup_json" pass_one pass_two
+
+# A failing binary fails the gate and reports its own exit code, and a child
+# that dies before recording one is reported rather than counted as a pass.
+gate_outcome_case() {
+  local label="$1" header="$2"
+  shift 2
+  local stream="$tmp_dir/gate-$label.json"
+  gate_stream "$stream" "$@"
+  local out="$tmp_dir/gate-$label-out"
+  local status=0
+  local names
+  names="$(printf '%s\n' "$@" | while IFS= read -r path; do
+    path="$(basename "$path")"
+    printf '%s ' "${path%-*}"
+  done)"
+  # shellcheck disable=SC2086
+  ALIGN_GATE_JOBS=2 "$gate_runner" "$stream" $names >"$out" 2>&1 || status=$?
+  [[ "$status" -ne 0 ]] || {
+    echo "the gate runner passed despite a $label binary" >&2
+    cat "$out" >&2
+    exit 1
+  }
+  grep -Fq -e "$header" "$out" || {
+    echo "the gate runner did not report the $label binary as '$header':" >&2
+    cat "$out" >&2
+    exit 1
+  }
+}
+gate_outcome_case failing '--- failing (exit 3' "$gate_pass_one" "$gate_failing"
+gate_outcome_case killed '--- suicidal (exit killed' "$gate_pass_one" "$gate_killed"
+
 for script in \
   scripts/cargo.sh \
   scripts/check-pr-preflight.sh \
+  scripts/dyld-env.sh \
   scripts/new-review-log.sh \
   scripts/open-pr.sh \
   scripts/pr-tier.sh \
   scripts/pre-pr.sh \
   scripts/review-bounded.sh \
-  scripts/test-pr-workflow.sh
+  scripts/run-gate-binaries.sh \
+  scripts/test-pr-workflow.sh \
+  scripts/test-pr.sh
 do
   bash -n "$repo_root/$script"
 done
