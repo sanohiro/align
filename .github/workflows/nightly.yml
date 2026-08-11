@@ -31,6 +31,10 @@ jobs:
     name: Full workspace tests
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    env:
+      ALIGN_APT_PACKAGES: >-
+        llvm-22-dev clang-22 libclang-rt-22-dev
+        libpq-dev libsqlite3-dev libssl-dev zlib1g-dev libzstd-dev make perl
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -49,11 +53,11 @@ jobs:
       - name: Install LLVM and native libraries
         shell: bash
         run: |
-          wget -q https://apt.llvm.org/llvm.sh
-          chmod +x llvm.sh
-          sudo ./llvm.sh 22
-          sudo apt-get install -y llvm-22-dev clang-22 libclang-rt-22-dev \
-            libpq-dev libsqlite3-dev libssl-dev zlib1g-dev libzstd-dev make perl
+          # No cache around it: this stays the canary that a fresh
+          # apt.llvm.org snapshot still builds, which ci.yml's cached x86_64
+          # jobs cannot be. Same script as CI, so the package set and the
+          # repository definition cannot drift between the two.
+          scripts/ci-apt-llvm.sh install
           OPENSSL_PREFIX="$RUNNER_TEMP/openssl-${OPENSSL_VERSION}"
           if [ ! -x "$OPENSSL_PREFIX/bin/openssl" ]; then
             curl -fsSLO \
