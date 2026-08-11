@@ -240,6 +240,16 @@ impl ParityProgram {
         }
     }
 
+    /// Override the per-case wall-clock cap.
+    ///
+    /// Re-added in PR-2 for `parity_engine_reports_a_timed_out_case_and_keeps_going`, which cannot
+    /// wait the 120-second default. PR-1 removed it as dormant surface on the bet that re-adding it
+    /// would be cheap; this is that bet settling.
+    pub fn with_timeout(mut self, timeout: Duration) -> ParityProgram {
+        self.timeout = timeout;
+        self
+    }
+
     /// The pipeline this program was compiled through.
     ///
     /// Exposed so a fingerprint golden reads the runner from the ENGINE instead of restating it. A

@@ -7,15 +7,9 @@ use align_interface::{
     MetaNullability, StaticArtifact, StaticOptionValue, VerificationState,
 };
 use common::*;
+mod db_harness;
+use db_harness::{Case, FingerprintLog, Layout, Needs, Run, RunnerKind, package_source};
 
-const DB: &str = include_str!("../../../apps/db/pkg/db.align");
-const SQLITE: &str = include_str!("../../../apps/db/pkg/db/sqlite.align");
-const POSTGRES: &str = include_str!("../../../apps/db/pkg/db/postgres.align");
-const INTERNAL: &str = include_str!("../../../apps/db/pkg/db/internal.align");
-const RESOURCE: &str = include_str!("../../../apps/db/pkg/db/internal/resource.align");
-const DESCRIPTOR: &str = include_str!("../../../apps/db/pkg/db/internal/descriptor.align");
-const INTERNAL_SQLITE: &str = include_str!("../../../apps/db/pkg/db/internal/sqlite.align");
-const INTERNAL_POSTGRES: &str = include_str!("../../../apps/db/pkg/db/internal/postgres.align");
 
 const LOOKUP: &str = r#"module app.lookup
 import pkg.db
@@ -255,27 +249,21 @@ fn main() -> i32 {
 }
 "#;
 
-fn package_files() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("pkg/db.align", DB),
-        ("pkg/db/sqlite.align", SQLITE),
-        ("pkg/db/postgres.align", POSTGRES),
-        ("pkg/db/internal.align", INTERNAL),
-        ("pkg/db/internal/resource.align", RESOURCE),
-        ("pkg/db/internal/descriptor.align", DESCRIPTOR),
-        ("pkg/db/internal/sqlite.align", INTERNAL_SQLITE),
-        ("pkg/db/internal/postgres.align", INTERNAL_POSTGRES),
-        ("app/lookup.align", LOOKUP),
-        ("main.align", MAIN),
-    ]
+/// The suite modules every q5b1 case adds on top of the `pkg.db` package.
+fn q5b1_modules() -> Vec<(&'static str, &'static str)> {
+    vec![("app/lookup.align", LOOKUP)]
 }
 
-fn non_live_package_files() -> Vec<(&'static str, &'static str)> {
-    let mut files = package_files();
-    files.retain(|(path, _)| *path != "main.align");
-    files.push(("pkg/db/q5b1_test.align", TEST_STATE));
-    files.push(("main.align", NON_LIVE_MAIN));
-    files
+fn package_files() -> Layout {
+    Layout::new().module("app/lookup.align", LOOKUP).main(MAIN)
+}
+
+/// The non-live variant: the same modules plus the state helper. `Layout::module` replaces by
+/// path, so no retain/push dance is needed for the differing `main`.
+fn q5b1_non_live_modules() -> Vec<(&'static str, &'static str)> {
+    let mut modules = q5b1_modules();
+    modules.push(("pkg/db/q5b1_test.align", TEST_STATE));
+    modules
 }
 
 #[test]
@@ -296,16 +284,16 @@ fn q5b1_query_surface_remains_exact_after_catalog_consumers_land() {
         "pub fn meta_query<P, R>(",
     ] {
         assert!(
-            DB.contains(required),
+            package_source("pkg/db.align").contains(required),
             "missing public D12 surface `{required}`"
         );
     }
     assert!(
-        SQLITE.contains("pub MetaOption {\n  IncludeInternalObjects\n  IncludeHiddenColumns\n}")
+        package_source("pkg/db/sqlite.align").contains("pub MetaOption {\n  IncludeInternalObjects\n  IncludeHiddenColumns\n}")
     );
-    assert!(SQLITE.contains("pub ExplainOption {\n  QueryPlan\n  Bytecode\n}"));
-    assert!(POSTGRES.contains("pub MetaOption {\n  SearchPathOnly\n  IncludeSystemCatalogs\n}"));
-    assert!(POSTGRES.contains("  Analyze\n  Format(PlanFormat)"));
+    assert!(package_source("pkg/db/sqlite.align").contains("pub ExplainOption {\n  QueryPlan\n  Bytecode\n}"));
+    assert!(package_source("pkg/db/postgres.align").contains("pub MetaOption {\n  SearchPathOnly\n  IncludeSystemCatalogs\n}"));
+    assert!(package_source("pkg/db/postgres.align").contains("  Analyze\n  Format(PlanFormat)"));
 }
 
 #[test]
@@ -320,13 +308,13 @@ pub fn bad(statement: pkg.db.command<Params>) -> Option<pkg.db.QueryMeta> {
   unsafe { return pkg.db.internal.descriptor.materialize_meta(statement, 0, 0, 0) }
 }
 "#;
-    let mut files = package_files();
-    files.push(("pkg/db/bad.align", bad_command));
     let main = "module badmain\nimport pkg.db.bad\nfn main() -> i32 = 0\n";
-    files.push(("badmain.align", main));
+    let files = package_files()
+        .module("pkg/db/bad.align", bad_command)
+        .module("badmain.align", main);
     assert!(check_multi_errs(
         "pkg-db-q5b1-materializer-command",
-        &files,
+        &files.files(),
         "badmain.align"
     ));
 
@@ -341,62 +329,59 @@ pub fn bad(statement: pkg.db.query<Params, Row>) -> Option<pkg.db.QueryMeta> {
   unsafe { return pkg.db.internal.descriptor.materialize_meta(statement, false, 0, 0) }
 }
 "#;
-    let mut files = package_files();
-    files.push(("pkg/db/badtype.align", bad_driver));
     let main = "module badtypemain\nimport pkg.db.badtype\nfn main() -> i32 = 0\n";
-    files.push(("badtypemain.align", main));
+    let files = package_files()
+        .module("pkg/db/badtype.align", bad_driver)
+        .module("badtypemain.align", main);
     assert!(check_multi_errs(
         "pkg-db-q5b1-materializer-type",
-        &files,
+        &files.files(),
         "badtypemain.align"
     ));
 }
 
+const CASE_QUERY_META_WHOLE: Case = Case {
+    label: "pkg-db-q5b1-query-meta-whole",
+    runner: RunnerKind::StaticDescriptors,
+    needs: Needs::Backend,
+    links: &[],
+    counters: &[],
+    modules: q5b1_modules,
+    main: MAIN,
+    expected_exit: 42,
+    expect_counters: &[],
+};
+
+const CASE_QUERY_META_LIVE_EXEC: Case = Case {
+    label: "pkg-db-q5b1-query-meta-live-exec",
+    runner: RunnerKind::StaticDescriptors,
+    needs: Needs::Backend,
+    links: &[],
+    counters: &[],
+    modules: q5b1_non_live_modules,
+    main: NON_LIVE_MAIN,
+    expected_exit: 42,
+    expect_counters: &[],
+};
+
+/// Every Layer-1 case in this suite, for the fingerprint golden.
+const LAYER1_CASES: &[&Case] = &[&CASE_QUERY_META_WHOLE, &CASE_QUERY_META_LIVE_EXEC];
+
 #[test]
 fn static_query_metadata_materializes_exact_declared_projections() {
-    if !backend_available() {
-        return;
-    }
-    let files = package_files();
-    let output = build_and_run_multi_with_static_descriptors(
-        "pkg-db-q5b1-query-meta-whole",
-        &files,
-        "main.align",
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    CASE_QUERY_META_WHOLE.run();
 }
 
 #[test]
 fn meta_query_rejects_non_live_execution_targets_before_materialization() {
-    if !backend_available() {
-        return;
-    }
-    let files = non_live_package_files();
-    let output = build_and_run_multi_with_static_descriptors(
-        "pkg-db-q5b1-query-meta-live-exec",
-        &files,
-        "main.align",
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    CASE_QUERY_META_LIVE_EXEC.run();
 }
 
 #[test]
 fn static_query_metadata_thunk_links_from_its_producer_unit() {
-    if !backend_available() {
-        return;
-    }
-    let files = package_files();
-    let built = build_per_unit_multi("pkg-db-q5b1-query-meta-unit", &files, "main.align");
+    let Some(_gate) = db_harness::gate(Needs::Backend) else { return };
+    let layout = package_files();
+    let built = build_per_unit_multi("pkg-db-q5b1-query-meta-unit", &layout.files(), "main.align");
     let producer = built.unit("app.lookup");
     let mir = align_mir::print::program_to_string(&producer.mir);
     assert!(
@@ -428,19 +413,17 @@ fn static_query_metadata_thunk_links_from_its_producer_unit() {
         block.term,
         align_mir::Term::Branch(..) | align_mir::Term::Return(..)
     )));
-    let output = built.link_and_run();
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    Run::new("pkg-db-q5b1-query-meta-unit", built.link_and_run()).expect_exit(42);
 }
 
 #[test]
 fn checked_query_metadata_projection_uses_only_selected_driver_evidence() {
-    let files = package_files();
-    let built = build_per_unit_multi("pkg-db-q5b1-query-meta-checked", &files, "main.align");
+    let layout = package_files();
+    let built = build_per_unit_multi(
+        "pkg-db-q5b1-query-meta-checked",
+        &layout.files(),
+        "main.align",
+    );
     let producer = built.unit("app.lookup");
     let artifact = producer
         .static_artifacts
@@ -566,4 +549,24 @@ fn checked_query_metadata_projection_uses_only_selected_driver_evidence() {
     assert_eq!(postgres[0].state, VerificationState::Declared);
     assert_eq!(postgres[0].metadata_fingerprint, None);
     assert!(postgres.iter().all(|row| row.native_type.is_none()));
+}
+
+/// The Layer-1 migration's forward guard for this suite.
+///
+/// Observed from the same `Case` records the tests execute, so a changed pipeline, stub set, host
+/// requirement, module set, program text, or expected exit moves a digest.
+///
+/// Regenerate ONLY with a reviewed reason, from the panic message this emits.
+const LAYER1_FINGERPRINT_GOLDEN: &str = "\
+pkg-db-q5b1-query-meta-live-exec 70bcef27b0f611af
+pkg-db-q5b1-query-meta-whole 726cb2177e792df7
+";
+
+#[test]
+fn layer1_case_fingerprints_match_the_golden() {
+    let mut log = FingerprintLog::new();
+    for case in LAYER1_CASES {
+        log.record(&case.fingerprint());
+    }
+    log.assert_matches(LAYER1_FINGERPRINT_GOLDEN);
 }

@@ -43,12 +43,14 @@ pub mod fingerprint;
 pub mod layout;
 pub mod parity;
 pub mod run;
+pub mod stubs;
 pub mod runner;
 
-pub use case::{Case, RunnerKind, Stubs};
+pub use case::{Case, RunnerKind};
 pub use counters::{CounterExpect, Counters};
 pub use fingerprint::{CaseFingerprint, FingerprintLog};
-pub use layout::{Layout, PG_COUNTER_NAMES, pg_counter_names_in_module};
+pub use layout::{Layout, package_source};
+pub use stubs::{PG, SQLITE_Q4A, SQLITE_Q6, Stub};
 pub use parity::{
     Driver, Expect, Limits, ParityCase, ParityProgram, run_of, run_parity,
     run_parity_with_limits,
