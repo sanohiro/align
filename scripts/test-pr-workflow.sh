@@ -1270,6 +1270,7 @@ gate_outcome_case killed '--- suicidal (exit killed' "$gate_pass_one" "$gate_kil
 for script in \
   scripts/cargo.sh \
   scripts/check-pr-preflight.sh \
+  scripts/ci-apt-llvm.sh \
   scripts/dyld-env.sh \
   scripts/new-review-log.sh \
   scripts/open-pr.sh \
@@ -1277,8 +1278,14 @@ for script in \
   scripts/pre-pr.sh \
   scripts/review-bounded.sh \
   scripts/run-gate-binaries.sh \
+  scripts/test-apt-llvm.sh \
   scripts/test-pr-workflow.sh \
   scripts/test-pr.sh
 do
   bash -n "$repo_root/$script"
 done
+
+# scripts/ci-apt-llvm.sh gates every Linux job's toolchain and broke CI twice in
+# one day; its branches are executed here, root-free and offline, so the same
+# self-test step that guards the PR machinery also guards the installer.
+bash "$repo_root/scripts/test-apt-llvm.sh"
