@@ -25,6 +25,7 @@ pub mod db_prepare_native;
 pub mod db_migrate;
 pub mod db_migrate_native;
 pub mod explain;
+pub mod memo;
 mod query_meta_codegen;
 pub mod static_artifacts;
 pub mod static_inputs;
@@ -1818,6 +1819,9 @@ struct LoadedUnit {
     /// `<dir>/<seg>.align`). Carried so a per-unit consumer (`explain-opt`) can build that unit's own
     /// `DebugInfo` (its basename is what LLVM's remark strings — and thus the report — attribute to).
     file: String,
+    /// The unit source's id in the walk's `SourceMap`. The per-unit memo reattaches it to a replayed
+    /// diagnostic, whose stored form deliberately drops the id (it is walk-local).
+    fid: align_span::FileId,
 }
 
 // A user-module import is one whose first segment is neither `core` nor `std` (builtins).
@@ -1874,7 +1878,8 @@ fn load_units(source_map: &mut SourceMap, name: &str, src: &str, diags: &mut Dia
     let entry_dir = std::path::Path::new(name).parent().map(|p| p.to_path_buf());
 
     // The entry module's own name is its `module` decl, or `main` by default.
-    let entry_tokens = align_lexer::tokenize(source_map.add_file(name, src), src, diags);
+    let entry_fid = source_map.add_file(name, src);
+    let entry_tokens = align_lexer::tokenize(entry_fid, src, diags);
     let entry_ast = align_parser::parse_file(entry_tokens, diags);
     let entry_path = entry_ast
         .module
@@ -1889,6 +1894,7 @@ fn load_units(source_map: &mut SourceMap, name: &str, src: &str, diags: &mut Dia
         is_entry: true,
         src: src.to_string(),
         file: name.to_string(),
+        fid: entry_fid,
     }];
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::from([entry_path.clone()]);
 
@@ -1954,6 +1960,7 @@ fn load_units(source_map: &mut SourceMap, name: &str, src: &str, diags: &mut Dia
                 is_entry: false,
                 src: msrc,
                 file: file_path.display().to_string(),
+                fid,
             });
         }
     }
@@ -1969,6 +1976,69 @@ fn load_units(source_map: &mut SourceMap, name: &str, src: &str, diags: &mut Dia
     loaded
 }
 
+/// The whole-program sema step, memoized in-process (`memo.rs`;
+/// `docs/impl/10-cache-first-optimization.md` §6.6).
+///
+/// Sema reads exactly `modules`, which is built one-to-one from `loaded`, and each module's AST is a
+/// pure function of its source text — so the ordered `(path, is_entry, src)` list is the complete
+/// key. The retained HIR, descriptors, and diagnostics carry `FileId`s, so the memo is used only
+/// under the CANONICAL assignment (unit `i` owns file `i`), which `load_units` produces whenever it
+/// is handed a fresh `SourceMap`. Under any other assignment the step simply runs.
+fn check_program_memoized(
+    loaded: &[LoadedUnit],
+    modules: &[align_sema::Module],
+    diags: &mut Diagnostics,
+) -> align_sema::CheckedProgram {
+    let canonical = loaded
+        .iter()
+        .enumerate()
+        .all(|(index, unit)| unit.fid as usize == index);
+    let key = (canonical && memo::enabled()).then(|| {
+        let units: Vec<(&str, bool, &str)> = loaded
+            .iter()
+            .map(|unit| (unit.path.as_str(), unit.is_entry, unit.src.as_str()))
+            .collect();
+        memo::program_key(&units)
+    });
+    if let Some(key) = key
+        && let Some(hit) = memo::program_lookup(key)
+    {
+        for diagnostic in hit.diagnostics {
+            diags.push(diagnostic);
+        }
+        return align_sema::CheckedProgram {
+            program: hit.program,
+            static_descriptors: hit.static_descriptors,
+        };
+    }
+    // Collect this step's own diagnostics separately: the caller's `diags` already holds the loader's
+    // (which are recomputed on every call and must not be retained twice).
+    let mut own = Diagnostics::new();
+    let checked = align_sema::check_program_with_static_descriptors(modules, &mut own);
+    // Retain only an error-free result whose every diagnostic points into one of the units the key
+    // pins; a span outside that range names a file the replaying run may not have.
+    let replayable = !own.has_errors()
+        && own
+            .iter()
+            .all(|diagnostic| diagnostic.span.is_some_and(|span| (span.file as usize) < loaded.len()));
+    if let Some(key) = key
+        && replayable
+    {
+        memo::program_store(
+            key,
+            memo::CachedProgram {
+                program: checked.program.clone(),
+                static_descriptors: checked.static_descriptors.clone(),
+                diagnostics: own.iter().cloned().collect(),
+            },
+        );
+    }
+    for diagnostic in own.iter() {
+        diags.push(diagnostic.clone());
+    }
+    checked
+}
+
 pub fn check(source_map: &mut SourceMap, name: &str, src: &str) -> Checked {
     let mut diags = Diagnostics::new();
     let loaded = load_units(source_map, name, src, &mut diags);
@@ -1976,7 +2046,7 @@ pub fn check(source_map: &mut SourceMap, name: &str, src: &str) -> Checked {
         .iter()
         .map(|l| align_sema::Module { path: l.path.clone(), file: &l.ast, is_entry: l.is_entry, interface_only: false })
         .collect();
-    let checked = align_sema::check_program_with_static_descriptors(&modules, &mut diags);
+    let checked = check_program_memoized(&loaded, &modules, &mut diags);
 
     Checked {
         hir: checked.program,
@@ -2006,7 +2076,7 @@ pub fn build_interface_summaries(
         .iter()
         .map(|l| align_sema::Module { path: l.path.clone(), file: &l.ast, is_entry: l.is_entry, interface_only: false })
         .collect();
-    let checked = align_sema::check_program_with_static_descriptors(&modules, &mut diags);
+    let checked = check_program_memoized(&loaded, &modules, &mut diags);
     if diags.has_errors() {
         return (Vec::new(), diags);
     }
@@ -2186,7 +2256,9 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
     // therefore the parsed AST) is importer-independent and safe to share across every unit that
     // imports it. Without this, the bottom-up walk below would re-render and re-parse every
     // transitive dependency's summary once per importer — O(N^2) in the DAG's fan-in.
-    let mut interface_ast_cache: HashMap<String, align_ast::File> = HashMap::new();
+    // The rendered source is retained alongside the AST: it is the exact text sema consumes for that
+    // dependency, and therefore the per-unit memo's dependency key material (`memo::unit_key`).
+    let mut interface_ast_cache: HashMap<String, (String, align_ast::File)> = HashMap::new();
     let mut publication_lock = None;
     let mut publication_lock_attempted = false;
     let mut publication_lock_span = None;
@@ -2235,7 +2307,7 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
                 let fid = source_map.add_file(format!("<interface:{d}>"), source.clone());
                 let toks = align_lexer::tokenize(fid, &source, &mut sink);
                 let ast = align_parser::parse_file(toks, &mut sink);
-                interface_ast_cache.insert(d.clone(), ast);
+                interface_ast_cache.insert(d.clone(), (source, ast));
             }
             external_effects.extend(align_interface::summary_effects(dep_summary, false));
             external_return_provenance.extend(align_interface::summary_return_provenance(
@@ -2249,10 +2321,72 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
             ));
         }
 
+        // Process-in-memory memoization of this unit's frontend result (`memo.rs`;
+        // `docs/impl/10-cache-first-optimization.md` §6.6). The key is the exact sema input: the
+        // unit's own path/entry-flag/source plus every interface-only dependency module in the order
+        // they are passed below, keyed by the rendered source each was parsed from, plus the four
+        // external fact maps seeded above. A hit therefore replays a result that this process
+        // already computed from byte-identical inputs.
+        let interfaces: Vec<(&str, &str)> = tdeps
+            .iter()
+            .filter_map(|d| {
+                interface_ast_cache
+                    .get(d)
+                    .map(|(source, _)| (d.as_str(), source.as_str()))
+            })
+            .collect();
+        // `located` lowering resolves every statement's (line, column) through THIS walk's
+        // `SourceMap`, so its MIR is a function of the project's file paths and line tables as well
+        // as of the sema input keyed here. That mode is the `explain-opt` reporting lens, not a
+        // build path, so it opts out entirely rather than growing the key to cover a source map.
+        let memo_key = (!located && memo::enabled()).then(|| {
+            memo::unit_key(
+                &u.path,
+                u.is_entry,
+                &u.src,
+                &interfaces,
+                memo::ExternalFacts {
+                    effects: &external_effects,
+                    return_provenance: &external_return_provenance,
+                    resources: &external_resources,
+                    resource_hooks: &external_resource_hooks,
+                },
+            )
+        });
+        if let Some(key) = memo_key
+            && let Some(hit) = memo::unit_lookup(key)
+        {
+            // Replay the unit's diagnostics first, in the same position in `diags` a recomputed unit
+            // would occupy, with each span reattached to this walk's file id for the unit. Only a
+            // unit that owns NO static descriptors is retained, so nothing else has to be replayed:
+            // the publication lock, static-input resolution, and artifact build are all no-ops for
+            // an empty descriptor set.
+            for diagnostic in &hit.diagnostics {
+                diags.push(align_diag::Diagnostic {
+                    severity: diagnostic.severity,
+                    message: diagnostic.message.clone(),
+                    span: Some(align_span::Span::new(u.fid, diagnostic.lo, diagnostic.hi)),
+                });
+            }
+            summaries.insert(u.path.clone(), hit.summary.clone());
+            mirs.insert(
+                u.path.clone(),
+                PendingPerUnitArtifact {
+                    summary: hit.summary,
+                    mir: hit.mir,
+                    is_entry: u.is_entry,
+                    static_descriptors: Vec::new(),
+                    static_inputs: hit.static_inputs,
+                    static_artifacts: Vec::new(),
+                },
+            );
+            continue;
+        }
+
         let mut modules: Vec<align_sema::Module> = tdeps
             .iter()
             .filter_map(|d| {
-                interface_ast_cache.get(d).map(|ast| align_sema::Module {
+                interface_ast_cache.get(d).map(|(_, ast)| align_sema::Module {
                     path: d.clone(),
                     file: ast,
                     is_entry: false,
@@ -2279,6 +2413,11 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
         let program = checked.program;
         let static_descriptors = checked.static_descriptors;
         let had_errors = u_diags.has_errors();
+        // The unit's diagnostics in replayable form, or `None` when one of them cannot be
+        // reattached in another walk (see `memo::unit_diagnostics`). A clean unit routinely warns —
+        // `pkg.db` emits sixteen `lossy conversion` warnings — so warnings are replayed rather than
+        // used to disqualify the unit, which would exclude exactly the expensive modules.
+        let replayable_diags = memo::unit_diagnostics(&u_diags, u.fid);
         for d in u_diags.iter() {
             diags.push(d.clone());
         }
@@ -2429,6 +2568,23 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
                             continue;
                         }
                     }
+                }
+                // Retain the frontend result for the rest of the process. A descriptor-owning unit is
+                // excluded: its result depends on files under the project root and on a publication
+                // lock, neither of which a replay re-establishes.
+                if let Some(key) = memo_key
+                    && let Some(diagnostics) = replayable_diags
+                    && static_descriptors.is_empty()
+                {
+                    memo::unit_store(
+                        key,
+                        memo::CachedUnit {
+                            summary: s.clone(),
+                            mir: mir.clone(),
+                            static_inputs: resolved.manifest.clone(),
+                            diagnostics,
+                        },
+                    );
                 }
                 summaries.insert(u.path.clone(), s.clone());
                 mirs.insert(
@@ -2623,9 +2779,33 @@ fn detect_import_cycles(
     visit(start, edges, &mut color, &mut path, diags);
 }
 
+/// Lower `hir` through `produce`, reusing the MIR this process already lowered from a
+/// byte-identical HIR (`memo.rs`; `docs/impl/10-cache-first-optimization.md` §6.6). Lowering is a
+/// pure function of the HIR and the `variant` visibility model, so a hit is the same program.
+///
+/// The LOCATED variants deliberately do not come through here: their MIR additionally depends on the
+/// `SourceMap` they resolve line/column through, which the key does not cover.
+fn lower_memoized(
+    hir: &align_sema::Program,
+    variant: &str,
+    produce: impl FnOnce(&align_sema::Program) -> align_mir::Program,
+) -> align_mir::Program {
+    let key = memo::enabled().then(|| memo::lowering_key(hir, variant));
+    if let Some(key) = key
+        && let Some(hit) = memo::lowering_lookup(key)
+    {
+        return hit;
+    }
+    let mir = produce(hir);
+    if let Some(key) = key {
+        memo::lowering_store(key, &mir);
+    }
+    mir
+}
+
 /// Lower the sema-checked HIR down to MIR.
 pub fn lower_to_mir(hir: &align_sema::Program) -> align_mir::Program {
-    align_mir::lower_program(hir)
+    lower_memoized(hir, "whole-program", align_mir::lower_program)
 }
 
 /// M15 S2 per-unit lowering: lower ONE unit's checked HIR to MIR under the separate-compilation
@@ -2634,7 +2814,7 @@ pub fn lower_to_mir(hir: &align_sema::Program) -> align_mir::Program {
 /// (`align_mir::lower_program_per_unit`). The whole-program [`lower_to_mir`] keeps every function
 /// `internal` and drops declares, so the default object stays byte-identical.
 pub fn lower_to_mir_per_unit(hir: &align_sema::Program) -> align_mir::Program {
-    align_mir::lower_program_per_unit(hir)
+    lower_memoized(hir, "per-unit", align_mir::lower_program_per_unit)
 }
 
 /// M15 S2b per-unit lowering **with source locations** — [`lower_to_mir_per_unit`] plus populated
@@ -2702,7 +2882,26 @@ pub fn default_rt_lto(profile: Profile) -> bool {
 }
 
 pub fn emit_object_file(mir: &align_mir::Program, obj: &std::path::Path, target: BuildTarget, profile: Profile, exports: &[String], rt_lto: bool) -> Result<(), String> {
-    align_codegen_llvm::emit_object(mir, obj, &target, profile, exports, rt_lto_bytes(rt_lto)).map_err(|e| e.to_string())
+    // Process-in-memory memoization (`memo.rs`; `docs/impl/10-cache-first-optimization.md` §6.6).
+    // `emit_object` is a pure function of the key material below, so replaying the retained bytes is
+    // byte-identical to rerunning codegen. Only the failure MESSAGE of an unwritable output path
+    // differs (an I/O error rather than an LLVM target error) — both fail, on the same input.
+    let key = memo::enabled().then(|| memo::object_key(mir, &target, profile, exports, rt_lto));
+    if let Some(key) = key
+        && let Some(bytes) = memo::object_lookup(key)
+    {
+        return std::fs::write(obj, bytes.as_slice())
+            .map_err(|e| format!("cannot write object file '{}': {e}", obj.display()));
+    }
+    align_codegen_llvm::emit_object(mir, obj, &target, profile, exports, rt_lto_bytes(rt_lto)).map_err(|e| e.to_string())?;
+    // Retain what codegen just wrote. A read-back failure is not a compilation failure: the object
+    // is already on disk and the build proceeds exactly as it would without the memo.
+    if let Some(key) = key
+        && let Ok(bytes) = std::fs::read(obj)
+    {
+        memo::object_store(key, bytes);
+    }
+    Ok(())
 }
 
 /// Build the S3 codegen cache key (`docs/impl/10-cache-first-optimization.md` §6.2) for one unit. The

@@ -1523,6 +1523,12 @@ Operational rules:
   can produce a stale-archive cascade in driver tests.
 - Do not pipe test output through a command that hides the original exit code.
 - Use `ALIGNC_CACHE=off` when a test specifically requires a cold build.
+- `align_driver` memoizes repeated identical compilations inside one process
+  (whole-program sema, per-unit frontend, HIR lowering, object bytes;
+  `docs/impl/10-cache-first-optimization.md` §6.6). It is content-keyed and
+  unobservable, and it cut the `pkg.db` owner suites' compile CPU 2.3x. A test
+  that must observe a genuinely cold in-process compile calls
+  `align_driver::memo::set_enabled(false)` / `memo::clear()`.
 - Network, TLS, filesystem, and fd tests may need an unrestricted local
   environment rather than a sandbox.
 

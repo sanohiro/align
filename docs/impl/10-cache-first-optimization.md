@@ -410,6 +410,115 @@ form:
 The exact CLI surface is an M15 decision. The data model is required from the first slice so tests
 can assert invalidation rather than infer it from elapsed time.
 
+### 6.6 SHIPPED 2026-08-12 — process-in-memory memoization
+
+The on-disk cache above makes a *second process* cheap. It does nothing for a **second identical
+compilation inside one process**, which is the dominant shape of the driver test corpus: one
+`pkg_db_*` test binary compiles the same eight-module 138 KB `pkg.db` package, against a different
+small `main`, a dozen or more times through `align_driver`'s library entry points. Measured on this
+corpus, one such compilation costs ~1.5 s whole-program sema, ~1.5 s whole-program lowering, ~3.4 s
+per-unit frontend, and ~9 s per-unit codegen. A four-core CI runner is saturated by exactly this
+work.
+
+`crates/align_driver/src/memo.rs` memoizes four stages in process memory, keyed only by content:
+
+```text
+program   whole-program sema (`check`)              ordered (unit path, is_entry, source)
+unit      one per-unit frontend result              own path/entry/source + each interface-only
+                                                    dependency's RENDERED source + the four
+                                                    external fact maps
+lowering  HIR -> MIR (`lower_to_mir`, per-unit)     total `Debug` of the HIR + visibility variant
+object    MIR -> object bytes                       `codegen_impl_hash` + target + profile +
+                                                    exports + rt_lto
+```
+
+Every key additionally folds the four process-global compiler toggles (`ALIGN_CONST_POOL`,
+`ALIGN_NEEDLE_HOIST`, `ALIGN_BUFFER_DONATE`, `ALIGN_SORT_ADAPTIVE`). They are read at each lowering,
+not once per process, and the measurement suites flip them with `set_var` inside one test binary, so
+they are genuine key material and not ambient configuration the memo may ignore.
+
+The remaining components of the on-disk object key — compiler build id, LLVM version, resolved
+target identity, object format, cache-format version — are constants of the running process image,
+so they cannot differ between two calls in it. Only `target`, which the caller passes, is keyed.
+
+**This is a pure optimization: a hit must be indistinguishable from a miss.** The memo therefore
+never retains an artifact whose replay would have to reproduce a side effect. Two consequences are
+load-bearing:
+
+- **Diagnostics are replayed, not used to disqualify.** An early draft cached only
+  diagnostic-silent units, which excluded exactly the expensive modules — `pkg.db` and friends emit
+  sixteen `lossy conversion` warnings — and left the per-unit memo nearly useless. A per-unit
+  diagnostic is stored WITHOUT its `FileId` (a walk-local index) and reattached to the replaying
+  walk's own unit file; a unit with any diagnostic that does not point into its own source is not
+  retained at all. A whole-program diagnostic keeps its id verbatim, because that memo is used only
+  under the canonical `unit i owns FileId i` assignment that a fresh `SourceMap` produces, and the
+  key pins the ordered unit list.
+- **Anything that touches the project root stays uncached.** A unit owning L5c static descriptors
+  resolves files under the project root and takes the metadata publication lock; those units are
+  never retained. With an empty descriptor set every one of those steps is already a no-op, which is
+  what makes the exclusion sufficient rather than merely conservative.
+
+Lifetime is the process, so there is no invalidation model: nothing a key does not already cover can
+change while the process runs. Retention is bounded (256 MiB of object bytes, 512 entries per
+frontend map) and insertion simply stops at the bound — no eviction, so a hit stays deterministic
+for the process's life. `align_driver::memo` exposes `enabled`/`set_enabled`/`stats`/`clear`; the
+memo is ON by default, and `set_enabled(false)` exists so the owner tests can compare a replay
+against the uncached pipeline.
+
+`alignc` deliberately keeps the same default rather than opting out. A one-shot CLI build never hits,
+so it pays the key hashes (measured ~11 ms to render and hash a 1.8 MB `pkg.db` HIR, ~5 ms for the
+largest MIR — under 1% of the cold stage each) and one extra retained copy of artifacts the per-unit
+walk already holds simultaneously anyway. One default keeps the CLI and the library on the same code
+path, which is what makes the on/off owner comparison meaningful for both.
+
+Only the object bytes are handed out behind an `Arc`. A checked HIR carries `Cell<FnEffect>` and is
+neither `Sync` nor safely shared, and a deep clone is what makes a hit indistinguishable from a miss:
+the caller owns its program outright and cannot reach the retained snapshot. Objects are plain bytes
+and are copied by the parallel per-unit codegen workers, so sharing them keeps a multi-megabyte copy
+out of the store mutex.
+
+#### Closure matrix
+
+Owners are in `crates/align_driver/tests/inprocess_memo.rs` unless stated otherwise.
+
+| # | Cell | Rule | Owner |
+|---|---|---|---|
+| M1 | key completeness — sources | identical ordered sources hit; any source edit misses | `identical_sources_replay_every_unit_and_object`, `whole_program_check_and_lowering_replay`, `private_body_edit_misses_only_its_own_unit` |
+| M2 | key completeness — paths | the key is content-only, so a different project directory still hits | every test builds each project in a fresh temp directory |
+| M3 | key completeness — interfaces | a dependency's PUBLIC surface change misses its reverse dependents; a private body change does not | `public_surface_edit_misses_its_reverse_dependents`, `private_body_edit_misses_only_its_own_unit` |
+| M4 | diagnostics | replayed verbatim — severity, message, offsets, order — and rendered against the replaying project's file | `warning_bearing_unit_replays_its_warnings` |
+| M5 | key completeness — compiler toggles | flipping a toggle misses every unit; restoring it re-addresses the originals | `compiler_env_toggle_is_key_material` |
+| M6 | memo on == memo off | a replayed build equals the uncached build in unit order, MIR fingerprint, interface/impl hash, object BYTES, and diagnostics | `identical_sources_replay_every_unit_and_object`, `whole_program_check_and_lowering_replay`, `disabled_memo_is_a_complete_bypass` |
+| M7 | concurrency | the maps are shared by the parallel per-unit codegen workers; concurrent builds agree with the serial result | `concurrent_builds_agree_with_the_serial_result` |
+| M8 | disable | a disabled memo performs no lookup, retention, or accounting | `disabled_memo_is_a_complete_bypass` |
+| M9 | accounting | hit/miss counters and retained bytes are exact | hit/miss deltas asserted in every test above |
+| M10 | invalidation | none needed: process lifetime, content keys | stated here; no owner (nothing to invalidate) |
+| M10b | file-id assignment | the program memo replays `FileId`-bearing HIR and diagnostics, so it declines any walk whose `SourceMap` is not the canonical `unit i owns file i` — and still compiles correctly | `non_canonical_source_map_declines_the_program_memo` |
+| M11 | generics / monomorphization | a consumer's in-unit monomorphs are part of ITS MIR and its key includes the dependency's rendered interface (which carries generic template bodies), so a template edit misses the consumer | `public_surface_edit_misses_its_reverse_dependents`; whole-corpus `generics*` suites |
+| M12 | whole-program vs per-unit | separate key namespaces (`program` / `unit`) and a `variant` component on the lowering key, so the two visibility models can never serve each other | `lowering_key`'s variant tag; `per_unit_*` suites |
+| M13 | static descriptors | a descriptor-owning unit is never retained; whole-program descriptor installation runs on the caller's own MIR copy after the lowering memo | `pkg_db_q1`/`q3`/`q6` descriptor identity and golden suites |
+| M14 | located lowering | `explain-opt`'s located MIR depends on the `SourceMap`, which the key does not cover, so both located entry points opt out | `explain*` suites |
+| M15 | error paths | a program or unit that fails to check is never retained | `check_program_memoized`'s `has_errors` guard; the existing negative-diagnostic suites |
+| M16 | interaction with the on-disk cache | the memo sits INSIDE `emit_object_file`, i.e. inside the disk cache's miss producer, so a disk hit still skips codegen entirely and a disk miss is served identical bytes | `cache_codegen.rs`, `cache_parallel.rs` |
+
+Measured effect on the `pkg.db` owner suites (this machine, 4 test threads, debug compiler;
+wall / CPU seconds, before → after):
+
+```text
+pkg_db_q1     26.4 / 86.2   ->  13.2 / 42.1
+pkg_db_q2     55.3 / 132.6  ->  40.0 / 99.9
+pkg_db_q3     28.5 / 94.4   ->  15.8 / 48.0
+pkg_db_q4b   112.7 / 380.2  ->  35.9 / 110.8
+```
+
+CPU falls 2.3x across those four suites. The gain is largest where a suite recompiles one layout
+many times (`q4b`'s parity corpus, 3.4x) and smallest where every test has a genuinely distinct
+`main` compiled once (`q2`, 1.3x) — there the shared `pkg.db` portion is still recompiled, because
+the whole-program front end has no unit-level reuse. Closing that remaining gap is the on-disk
+package cache, not this slice. A saturated four-core CI runner is CPU-bound on exactly this work, so
+the wall-clock effect there should track the CPU column rather than the (partly parallel) local wall
+column.
+
 ---
 
 ## 7. Cache validation matrix
