@@ -731,16 +731,16 @@ pub fn drop_rows(rows: raw) {
   }
 }
 
-// A synchronous D12 catalog/EXPLAIN cursor owns one SQLite statement or PostgreSQL result while
-// returned text is validated and copied into the caller's region.  SQLite additionally owns the
-// connection-wide execution lease.  Bound SQLite text is SQLITE_STATIC, so its two optional C
-// buffers remain in this wrapper until statement finalization.
+// A synchronous D12 catalog cursor owns one SQLite statement or PostgreSQL result while returned
+// text is validated and copied into the caller's region.  Both drivers own the connection-wide
+// execution lease.  Bound SQLite text is SQLITE_STATIC, so its two optional C buffers remain in
+// this wrapper until statement finalization.
 //   0: u32 version (= 1)
 //   4: u8  driver (1 SQLite, 2 PostgreSQL)
 //   5: u8  closed
 //   6: u16 reserved (= 0)
 //   8: raw sqlite3_stmt / PGresult
-//  16: raw connection state (SQLite lease owner; null for PostgreSQL)
+//  16: raw connection state (lease owner)
 //  24: raw first retained SQLite bind buffer
 //  32: raw second retained SQLite bind buffer
 pub fn new_catalog_cursor(
@@ -801,7 +801,7 @@ pub fn close_catalog_cursor(cursor: raw) -> i32 {
     second_bind: raw := raw.load(cursor, 32)
     if !first_bind.is_null() { raw.free(first_bind) }
     if !second_bind.is_null() { raw.free(second_bind) }
-    if driver == 1 && !state.is_null() {
+    if (driver == 1 || driver == 2) && !state.is_null() {
       inactive: u8 := 0
       raw.store(state, 20, inactive)
     }

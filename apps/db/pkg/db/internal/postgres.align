@@ -1643,6 +1643,14 @@ pub fn explain_prevalidated<P, R>(
       free_context(context)
       return Err(failure)
     }
+    lease := acquire_lease(state, query_id)
+    match lease {
+      Err(error) => {
+        free_context(context)
+        return Err(error)
+      }
+      Ok(_) => {}
+    }
 
     mut sql_builder := builder()
     sql_builder.write("EXPLAIN")
@@ -1685,12 +1693,14 @@ pub fn explain_prevalidated<P, R>(
     if result.is_null() {
       failure := connection_error(connection)
       free_context(context)
+      release_lease(state)
       return Err(failure)
     }
     status := result_status(result)
     if status != PGRES_TUPLES_OK {
       failure := execution_error(connection, result)
       clear_result_and_context(result, context)
+      release_lease(state)
       return Err(failure)
     }
     rows := result_rows(result)
@@ -1701,6 +1711,7 @@ pub fn explain_prevalidated<P, R>(
         message: "PostgreSQL EXPLAIN returned an invalid result shape".clone(),
       })
       clear_result_and_context(result, context)
+      release_lease(state)
       return Err(failure)
     }
     mut body_builder := builder()
@@ -1714,6 +1725,7 @@ pub fn explain_prevalidated<P, R>(
           message: "PostgreSQL EXPLAIN returned a null plan row".clone(),
         })
         clear_result_and_context(result, context)
+        release_lease(state)
         return Err(failure)
       }
       pointer := result_value(result, row, 0)
@@ -1725,6 +1737,7 @@ pub fn explain_prevalidated<P, R>(
           message: "PostgreSQL EXPLAIN returned an invalid text field".clone(),
         })
         clear_result_and_context(result, context)
+        release_lease(state)
         return Err(failure)
       }
       mut text_buffer := buffer(length as i64)
@@ -1742,6 +1755,7 @@ pub fn explain_prevalidated<P, R>(
           message: "PostgreSQL EXPLAIN output is not valid UTF-8".clone(),
         })
         clear_result_and_context(result, context)
+        release_lease(state)
         return Err(failure)
       }
       if row > 0 { body_builder.write("\n") }
@@ -1750,6 +1764,7 @@ pub fn explain_prevalidated<P, R>(
     }
     body := body_builder.to_string()
     clear_result_and_context(result, context)
+    release_lease(state)
     return Ok(pkg.db.QueryPlan {
       driver: pkg.db.Driver.PostgreSQL,
       format: if format == 2 { pkg.db.PlanFormat.Json } else { pkg.db.PlanFormat.Text },
