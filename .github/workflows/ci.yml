@@ -44,6 +44,9 @@ jobs:
       RUST_VERSION: 1.96.0
       ALIGN_DB_POSTGRES_REQUIRED: "1"
       ALIGN_DB_POSTGRES_URL: postgresql://align:align@127.0.0.1:5432/align
+      ALIGN_APT_PACKAGES: >-
+        llvm-22-dev clang-22 libclang-rt-22-dev
+        libpq-dev libsqlite3-dev libssl-dev zlib1g-dev libzstd-dev make perl
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -64,14 +67,26 @@ jobs:
           restore-keys: |
             cargo-db-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-
 
+      # The apt install costs ~23 s a run and only ~3 s of that is the 160 MB
+      # download: `apt-get update` and two package-list resolutions dominate.
+      # The resolved archive set is a pure function of the runner image and the
+      # requested packages, so cache it and unpack it with dpkg, which reads no
+      # package lists at all. A miss runs the identical full apt install.
+      - name: Resolve the apt package cache entry
+        id: apt-llvm
+        shell: bash
+        run: scripts/ci-apt-llvm.sh key >> "$GITHUB_OUTPUT"
+
+      - name: Cache LLVM and database packages
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ steps.apt-llvm.outputs.path }}
+          key: ${{ steps.apt-llvm.outputs.key }}
+
       - name: Install LLVM and database libraries
         shell: bash
         run: |
-          wget -q https://apt.llvm.org/llvm.sh
-          chmod +x llvm.sh
-          sudo ./llvm.sh 22
-          sudo apt-get install -y llvm-22-dev clang-22 libclang-rt-22-dev \
-            libpq-dev libsqlite3-dev libssl-dev zlib1g-dev libzstd-dev make perl
+          scripts/ci-apt-llvm.sh install
           echo "LLVM_SYS_221_PREFIX=/usr/lib/llvm-22" >> "$GITHUB_ENV"
           echo "LLVM_CONFIG=/usr/lib/llvm-22/bin/llvm-config" >> "$GITHUB_ENV"
           echo "/usr/lib/llvm-22/bin" >> "$GITHUB_PATH"
@@ -143,6 +158,10 @@ jobs:
             os: macos-15
             lint: false
     runs-on: ${{ matrix.os }}
+    env:
+      ALIGN_APT_PACKAGES: >-
+        llvm-22-dev clang-22 libclang-rt-22-dev
+        libssl-dev zlib1g-dev libzstd-dev make perl
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -172,15 +191,30 @@ jobs:
           path: ${{ runner.temp }}/openssl-${{ env.OPENSSL_VERSION }}
           key: openssl-${{ env.OPENSSL_VERSION }}-${{ runner.os }}-${{ runner.arch }}
 
+      # See the db-postgres job: the archive set is cached and unpacked with
+      # dpkg instead of re-resolved through apt every run. Only the x86_64 job
+      # caches it — ARM64 finishes in about half the critical path's time, so
+      # a third entry would spend repository cache quota the Cargo caches use
+      # far more profitably, and its plain install keeps the uncached path
+      # exercised on every run.
+      - name: Resolve the apt package cache entry
+        id: apt-llvm
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        shell: bash
+        run: scripts/ci-apt-llvm.sh key >> "$GITHUB_OUTPUT"
+
+      - name: Cache LLVM and native library packages
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ steps.apt-llvm.outputs.path }}
+          key: ${{ steps.apt-llvm.outputs.key }}
+
       - name: Install LLVM and native libraries (Linux)
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          wget -q https://apt.llvm.org/llvm.sh
-          chmod +x llvm.sh
-          sudo ./llvm.sh 22
-          sudo apt-get install -y llvm-22-dev clang-22 libclang-rt-22-dev \
-            libssl-dev zlib1g-dev libzstd-dev make perl
+          scripts/ci-apt-llvm.sh install
           OPENSSL_PREFIX="$RUNNER_TEMP/openssl-${OPENSSL_VERSION}"
           if [ ! -x "$OPENSSL_PREFIX/bin/openssl" ]; then
             curl -fsSLO \
