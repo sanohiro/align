@@ -9,7 +9,7 @@
 use super::layout::Layout;
 use super::run::Run;
 use crate::common::{
-    build_and_run_multi, build_and_run_multi_args_with_env, build_and_run_multi_with_c,
+    build_and_run_multi_args_with_env, build_and_run_multi_with_c,
     build_and_run_multi_with_static_descriptors, diff_check_multi,
 };
 

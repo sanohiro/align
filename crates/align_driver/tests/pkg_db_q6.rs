@@ -1481,11 +1481,11 @@ fn main() -> i32 {
 ///
 /// Regenerate ONLY with a reviewed reason, from the panic message this emits.
 const LAYER1_FINGERPRINT_GOLDEN: &str = "\
-pkg-db-q6-postgres-compound 68c94d617f64efcf
-pkg-db-q6-postgres-send-failure efb97996c122a45e
-pkg-db-q6-sqlite-pre-send-failure fb8e29b3576179ae
-pkg-db-q6-sqlite-transaction-master 8e489ee25112aa24
-pkg-db-q6-sqlite-user-groups 83788640f784c97b
+pkg-db-q6-postgres-compound 6b7ee85cc14d50cd
+pkg-db-q6-postgres-send-failure 86ad7ae32e02ef54
+pkg-db-q6-sqlite-pre-send-failure 52c3818f4776e225
+pkg-db-q6-sqlite-transaction-master 18e964c9f82314d3
+pkg-db-q6-sqlite-user-groups 5f1b6015b066bffa
 ";
 
 #[test]

@@ -748,8 +748,11 @@ const LAYER1_CASES: &[&Case] = &[
     &CASE_INHERITED_ENVIRONMENT,
 ];
 
-/// q2's cases add no shared suite module: they exercise the package surface directly, and the few
-/// cases that need an app module add their own.
+/// The shared suite module list — deliberately empty.
+///
+/// q2's owners exercise the package surface directly, and the minimality of each program is part of
+/// what it proves (see 16-test-policy.md, "Build-once/run-many is not applied to q2"). The few
+/// cases that need an app module add their own on top of this.
 fn q2_modules() -> Vec<(&'static str, &'static str)> {
     Vec::new()
 }
@@ -1453,14 +1456,14 @@ fn main(args: array<str>) -> Result<(), Error> {
 ///
 /// Regenerate ONLY with a reviewed reason, from the panic message this emits.
 const LAYER1_FINGERPRINT_GOLDEN: &str = "\
-pkg-db-q2-common-postgres 4e5d04d30d58e026
-pkg-db-q2-inherited-environment b9d43fda9bff9883
-pkg-db-q2-postgres-bytea 6839d4cb7e04dd6b
-pkg-db-q2-postgres-connect-options 2b8a97e109183c3a
-pkg-db-q2-postgres-native-scalar 86a34abced78840b
-pkg-db-q2-postgres-nul e10db4107cb611f2
-pkg-db-q2-sqlite-connect a81f94312b162a62
-pkg-db-q2-sqlite-invalid-connect 516c8024a1db867f
+pkg-db-q2-common-postgres a9428d3064bd4bbe
+pkg-db-q2-inherited-environment e683f9105f9dc29b
+pkg-db-q2-postgres-bytea 79d1dc83bbf8957c
+pkg-db-q2-postgres-connect-options 656bca47d6e7057a
+pkg-db-q2-postgres-native-scalar 3f9b8b531022f9fb
+pkg-db-q2-postgres-nul 8917c451b60242e7
+pkg-db-q2-sqlite-connect 5a2490e68e61e517
+pkg-db-q2-sqlite-invalid-connect cc4b62703c14a7e8
 ";
 
 #[test]

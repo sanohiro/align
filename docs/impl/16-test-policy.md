@@ -534,21 +534,54 @@ Recorded so the gap is explicit rather than implied:
   LCG keyed on a run-time string length: a plain accumulator loop was recognised
   and folded by `-O2`, and the case returned instantly.
 - **Live-PostgreSQL identity and cleanup** (unique per-run object names, drop
-  what a case created, assert no survivors). No live parity case exists yet;
-  deferred to PR-3 with the `q2` scalar table.
-- **SQLite storage-mode declaration** (`:memory:` versus file-backed). No table
-  currently needs cross-connection state; deferred until one does.
+  what a case created, assert no survivors). Carried over to the `pkg_db_a1`
+  migration: `q2`'s two live owners keep their existing gating and create no
+  server-side objects, so there is nothing yet for the rule to protect.
+- **`pkg_db_q2` keeps two hand-written copies of the `live_postgres_decision`
+  logic** (`postgres_required_mode_requires_configuration` and the guard inside
+  `postgres_required_portable_query_runs_against_both_drivers`). Routing them
+  through the harness helper would change what a required CI suite asserts about
+  its own gating, so it waits for the a1 wave that also brings the identity and
+  cleanup rules above.
 - **`#[ignore]`d measurement probes** in `pkg_db_q4a`, `q4b`, and `q6` carry no
   fingerprint: they parse stdout numbers rather than asserting an exit code, so
   they are not `Case`-shaped. Checked by hand during review.
 - **`pkg_db_q5b2`'s five derived layout builders** — plus three further inline
-  `retain`+`push` sites in test bodies — still use that idiom. PR-2 extracted
-  only its inline C stub because `q5b2` is in the A1 catalog/EXPLAIN blast
-  radius; the builder rewrite is PR-3.
-- **`pkg_db_a1` and `pkg_db_q2`** are unmigrated, and `q2` still bakes its
-  package sources with `include_str!`. Both are PR-3, after the A1 waves.
-  `pkg_db_q1` and `q3` are Rust-API suites and out of the harness's scope; their
-  `include_str!` statics feed `Proj`-based API assertions, not a `Layout`.
+  `retain`+`push` sites in test bodies — still use that idiom. Its inline C stub
+  was extracted in PR-2; the builder rewrite waits because `q5b2` is in the A1
+  catalog/EXPLAIN blast radius.
+- **`pkg_db_a1`** is unmigrated, after the A1 waves. `pkg_db_q1` and `q3` are
+  Rust-API suites and out of the harness's scope; their `include_str!` statics
+  feed `Proj`-based API assertions, not a `Layout`. Every other suite now reads
+  its package sources at run time.
+
+### Build-once/run-many is not applied to q2, deliberately
+
+The plan expected `pkg_db_q2`'s small connect/codec/environment owners to be
+folded into one env-dispatched program. They are not, and the reason is coverage
+rather than arithmetic.
+
+Each of those five owners compiles a **deliberately minimal program**, and the
+minimality is the assertion. `sqlite_connect_configures_and_drops_one_native_connection`
+imports `pkg.db.sqlite` alone, so it proves that the SQLite connect path links
+without dragging libpq into the closure; `postgres_connect_rejects_embedded_nul_before_libpq`
+proves the mirror property. Folding them into one program that imports both
+drivers destroys exactly the property each one exists to demonstrate — the merged
+program would pass whether or not the closures stayed separate.
+
+The wall-clock case for merging is also weak, which is why the coverage argument
+decides it. Measured locally, the suite takes 41.7 s and runs its tests in
+parallel; the single longest owner is 30.5 s, and deleting all five merge
+candidates outright measures 35.5 s. Merging is therefore worth at most about
+five seconds. That bound is a local four-plus-core measurement and does not
+transfer directly to a smaller CI runner, where the short owners are less well
+hidden behind the long one — but the closure-minimality argument holds
+regardless of machine.
+
+The measurement does point somewhere useful: q2's wall clock is bounded by its
+longest single owner, so the available lever is splitting that owner, not merging
+the short ones. Splitting adds compiles and touches the suite's densest
+assertions, so it is recorded here rather than done.
 
 ### Resource and isolation rules
 

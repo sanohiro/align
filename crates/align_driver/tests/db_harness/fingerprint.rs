@@ -72,6 +72,17 @@ impl CaseFingerprint {
         self
     }
 
+    /// [`CaseFingerprint::env`] for already-owned pairs.
+    ///
+    /// A list-valued attribute must arrive as ONE ENTRY PER ELEMENT (`links.0`, `links.1`, …) and
+    /// never as a single joined string. Joining reintroduces exactly the aliasing the `\0`
+    /// separators exist to prevent: `links="a+b"` and `links="a" , "+b"` would hash alike under a
+    /// separator that the joined value can itself contain.
+    pub fn env_pairs(mut self, pairs: Vec<(String, String)>) -> CaseFingerprint {
+        self.env = pairs.into_iter().collect();
+        self
+    }
+
     pub fn argv(mut self, argv: &[&str]) -> CaseFingerprint {
         self.argv = argv.iter().map(|a| (*a).to_string()).collect();
         self

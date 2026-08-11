@@ -566,8 +566,8 @@ fn checked_query_metadata_projection_uses_only_selected_driver_evidence() {
 ///
 /// Regenerate ONLY with a reviewed reason, from the panic message this emits.
 const LAYER1_FINGERPRINT_GOLDEN: &str = "\
-pkg-db-q5b1-query-meta-live-exec cbf36595394bb847
-pkg-db-q5b1-query-meta-whole 769ff1aafc4c99cf
+pkg-db-q5b1-query-meta-live-exec 67a385220c30f690
+pkg-db-q5b1-query-meta-whole ea8352ac404210f8
 ";
 
 #[test]

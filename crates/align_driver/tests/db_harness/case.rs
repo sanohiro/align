@@ -113,7 +113,15 @@ impl Case {
                 );
                 run_static_descriptors(self.label, &layout)
             }
-            RunnerKind::PerUnitC => run_per_unit_c(self.label, &layout),
+            RunnerKind::PerUnitC => {
+                assert!(
+                    self.envs.is_empty(),
+                    "`{}` declares a child environment, which only the whole-program runner \
+                     applies; the per-unit runner would silently drop it",
+                    self.label
+                );
+                run_per_unit_c(self.label, &layout)
+            }
             RunnerKind::WholeProgram => {
                 super::runner::run_whole_program(self.label, &layout, self.envs)
             }
@@ -133,40 +141,29 @@ impl Case {
     /// native code and added modules, so they change what the case exercises exactly as a runner
     /// swap does.
     pub fn fingerprint(&self) -> CaseFingerprint {
+        let mut attributes: Vec<(String, String)> = vec![("needs".to_string(), self.needs.id().to_string())];
+        push_indexed(&mut attributes, "links", self.links.iter().map(|s| s.id.to_string()));
+        push_indexed(&mut attributes, "counters", self.counters.iter().map(|s| s.id.to_string()));
+        for (name, value) in self.expect_counters {
+            attributes.push((format!("expect_counter.{name}"), value.to_string()));
+        }
+        for (key, value) in self.envs {
+            attributes.push((format!("child_env.{key}"), (*value).to_string()));
+        }
         CaseFingerprint::new(self.label, self.runner.id())
             .files(&self.layout().test_owned_files())
-            .env(&[
-                ("links", &stub_ids(self.links)),
-                ("counters", &stub_ids(self.counters)),
-                ("needs", self.needs.id()),
-                ("expect_counters", &counter_ids(self.expect_counters)),
-                ("child_env", &env_ids(self.envs)),
-            ])
+            .env_pairs(attributes)
             .expected_exit(self.expected_exit)
     }
 }
 
-/// Stable identity for a stub list, for the fingerprint.
-fn stub_ids(stubs: &[&'static Stub]) -> String {
-    stubs
-        .iter()
-        .map(|stub| stub.id)
-        .collect::<Vec<_>>()
-        .join("+")
-}
-
-/// Stable identity for a counter expectation list, for the fingerprint.
-fn counter_ids(pairs: &[(&'static str, i64)]) -> String {
-    pairs
-        .iter()
-        .map(|(name, value)| format!("{name}={value}"))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// Stable identity for a child environment, for the fingerprint.
-fn env_ids(envs: &[(&'static str, &'static str)]) -> String {
-    let mut pairs: Vec<String> = envs.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    pairs.sort();
-    pairs.join(",")
+/// Record a list attribute as one entry per element, so no join character can alias.
+fn push_indexed(
+    into: &mut Vec<(String, String)>,
+    name: &str,
+    values: impl Iterator<Item = String>,
+) {
+    for (index, value) in values.enumerate() {
+        into.push((format!("{name}.{index}"), value));
+    }
 }

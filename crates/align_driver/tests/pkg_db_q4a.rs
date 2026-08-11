@@ -1552,16 +1552,16 @@ fn main() -> i32 {
 ///
 /// Regenerate ONLY with a reviewed reason, from the panic message this emits.
 const LAYER1_FINGERPRINT_GOLDEN: &str = "\
-pkg-db-q4a-postgres-failed-commit 426fa3ca004545db
-pkg-db-q4a-postgres-failed-rollback 2fd23cf4de0c6c71
-pkg-db-q4a-postgres-implicit-rollback a2b977666f94ae17
-pkg-db-q4a-postgres-option-preflight ab4b2c71bd65c79a
-pkg-db-q4a-postgres-prepared-transactions 9604eaff28da71ae
-pkg-db-q4a-sqlite-bind-recovery cb3fdc1a94cbcdc8
-pkg-db-q4a-sqlite-cleanup-poison f6f7a451b11b022f
-pkg-db-q4a-sqlite-prepared-reuse 44bc92a512fff337
-pkg-db-q4a-sqlite-transactions b33e63f20cbe45e3
-pkg-db-q4a-sqlite-unsupported-shape 66fa72cb48e4c9bd
+pkg-db-q4a-postgres-failed-commit 570fa64d1c84ea29
+pkg-db-q4a-postgres-failed-rollback f6db834d0c05f47f
+pkg-db-q4a-postgres-implicit-rollback 72d27284639260b5
+pkg-db-q4a-postgres-option-preflight e03c9b5a568fbf17
+pkg-db-q4a-postgres-prepared-transactions 78cdb1f4270329f4
+pkg-db-q4a-sqlite-bind-recovery 0e0e7109009f13b7
+pkg-db-q4a-sqlite-cleanup-poison 3d212209510658e9
+pkg-db-q4a-sqlite-prepared-reuse 2aa0d97ef18d963f
+pkg-db-q4a-sqlite-transactions 8ea927cc49e1eb93
+pkg-db-q4a-sqlite-unsupported-shape 5f6072f8905b4bc3
 ";
 
 #[test]
