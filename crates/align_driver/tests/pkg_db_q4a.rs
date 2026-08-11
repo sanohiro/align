@@ -5,7 +5,6 @@ use common::*;
 mod db_harness;
 use db_harness::*;
 
-const POSTGRES_STUB: &str = include_str!("fixtures/pkg_db_q2_postgres_stub.c");
 const PREPARED_BENCH: &str = include_str!("fixtures/pkg_db_q4a_bench.c");
 
 const Q4A_QUERY: &str = r#"module app.q4a_query
@@ -914,11 +913,14 @@ fn q4a_modules() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// The layout the non-`Case` owners use: the same module list the cases use, plus one `main`.
+/// Derived from `q4a_modules` so the two cannot drift apart.
 fn package_files(main: &str) -> Layout {
-    Layout::new()
-        .module("app/q4a_query.align", Q4A_QUERY)
-        .module("app/q4a_postgres_query.align", Q4A_POSTGRES_QUERY)
-        .main(main)
+    let mut layout = Layout::new();
+    for (path, source) in q4a_modules() {
+        layout = layout.module(path, source);
+    }
+    layout.main(main)
 }
 
 const Q4A_SURFACE_PREFIX: &str = r#"module main
@@ -1499,7 +1501,7 @@ fn main() -> i32 {
 }
 "#;
     let files = package_files(main);
-    let fixture = format!("{POSTGRES_STUB}\n{PREPARED_BENCH}");
+    let fixture = format!("{}\n{PREPARED_BENCH}", PG.c_source);
     let output = build_and_run_multi_with_c(
         "pkg-db-q4a-prepared-benchmark",
         &files.files(),

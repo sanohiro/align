@@ -132,11 +132,12 @@ impl CounterExpect {
         self
     }
 
-    // ---- libpq shorthands ------------------------------------------------------------------
-    // Only the counters this suite actually asserts get a named method; everything else in
-    // PG_COUNTER_NAMES is reachable through `eq` without a dormant wrapper per counter.
-    /// The stub's own protocol self-check; also pins `pg.protocol_error` to 0 so a failure names
-    /// the reported error code instead of hiding it behind a sentinel offset.
+    // ---- shorthands ---------------------------------------------------------------------------
+    // Only the counters some suite actually asserts get a named method. Everything else in the
+    // registry is reachable through `eq`, which validates the name, so a wrapper per counter would
+    // be dormant surface with no added safety.
+    /// The libpq stub's own protocol self-check; also pins `pg.protocol_error` to 0 so a failure
+    /// names the reported error code instead of hiding it behind a sentinel offset.
     pub fn pg_protocol_ok(self) -> CounterExpect {
         self.eq("pg.protocol_ok", 1).eq("pg.protocol_error", 0)
     }
@@ -148,70 +149,6 @@ impl CounterExpect {
     }
     pub fn pg_finish(self, n: i64) -> CounterExpect {
         self.eq("pg.finish_calls", n)
-    }
-    pub fn pg_prepare(self, n: i64) -> CounterExpect {
-        self.eq("pg.prepare_calls", n)
-    }
-    pub fn pg_execute_prepared(self, n: i64) -> CounterExpect {
-        self.eq("pg.execute_prepared_calls", n)
-    }
-    pub fn pg_control(self, n: i64) -> CounterExpect {
-        self.eq("pg.control_calls", n)
-    }
-    pub fn pg_deallocate(self, n: i64) -> CounterExpect {
-        self.eq("pg.deallocate_calls", n)
-    }
-    pub fn pg_delivered_rows(self, n: i64) -> CounterExpect {
-        self.eq("pg.delivered_rows", n)
-    }
-
-    // ---- SQLite (q4a prepared-statement stub) -------------------------------------------------
-    pub fn sqlite_protocol_ok(self) -> CounterExpect {
-        self.eq("sqlite.protocol_ok", 1)
-    }
-    pub fn sqlite_prepare(self, n: i64) -> CounterExpect {
-        self.eq("sqlite.prepare_calls", n)
-    }
-    pub fn sqlite_finalize(self, n: i64) -> CounterExpect {
-        self.eq("sqlite.finalize_calls", n)
-    }
-    pub fn sqlite_reset(self, n: i64) -> CounterExpect {
-        self.eq("sqlite.reset_calls", n)
-    }
-    pub fn sqlite_clear(self, n: i64) -> CounterExpect {
-        self.eq("sqlite.clear_calls", n)
-    }
-    pub fn sqlite_bind_i64(self, n: i64) -> CounterExpect {
-        self.eq("sqlite.bind_i64_calls", n)
-    }
-    pub fn sqlite_bind_text(self, n: i64) -> CounterExpect {
-        self.eq("sqlite.bind_text_calls", n)
-    }
-    pub fn sqlite_bind_blob(self, n: i64) -> CounterExpect {
-        self.eq("sqlite.bind_blob_calls", n)
-    }
-    pub fn sqlite_busy_timeout(self, n: i64) -> CounterExpect {
-        self.eq("sqlite.busy_timeout_calls", n)
-    }
-    pub fn sqlite_last_busy_timeout(self, n: i64) -> CounterExpect {
-        self.eq("sqlite.last_busy_timeout", n)
-    }
-
-    // ---- SQLite (q6 compound-shaping stub) ------------------------------------------------------
-    pub fn sqlite6_protocol_ok(self) -> CounterExpect {
-        self.eq("sqlite6.protocol_ok", 1)
-    }
-    pub fn sqlite6_prepare(self, n: i64) -> CounterExpect {
-        self.eq("sqlite6.prepare_calls", n)
-    }
-    pub fn sqlite6_step(self, n: i64) -> CounterExpect {
-        self.eq("sqlite6.step_calls", n)
-    }
-    pub fn sqlite6_delivered_rows(self, n: i64) -> CounterExpect {
-        self.eq("sqlite6.delivered_rows", n)
-    }
-    pub fn sqlite6_finalize(self, n: i64) -> CounterExpect {
-        self.eq("sqlite6.finalize_calls", n)
     }
 
     /// Every mismatch, never just the first.
@@ -267,14 +204,4 @@ impl CounterExpect {
 /// Shorthand for a fresh libpq expectation that also pins the protocol self-check.
 pub fn pg() -> CounterExpect {
     CounterExpect::new().pg_protocol_ok()
-}
-
-/// Shorthand for the q4a SQLite stub, pinning its protocol self-check.
-pub fn sqlite() -> CounterExpect {
-    CounterExpect::new().sqlite_protocol_ok()
-}
-
-/// Shorthand for the q6 SQLite stub, pinning its protocol self-check.
-pub fn sqlite6() -> CounterExpect {
-    CounterExpect::new().sqlite6_protocol_ok()
 }

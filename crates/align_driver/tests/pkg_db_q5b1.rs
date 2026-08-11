@@ -254,8 +254,14 @@ fn q5b1_modules() -> Vec<(&'static str, &'static str)> {
     vec![("app/lookup.align", LOOKUP)]
 }
 
+/// The layout the non-`Case` owners use: the same module list the cases use, plus the live `main`.
+/// Derived from `q5b1_modules` so the two cannot drift apart.
 fn package_files() -> Layout {
-    Layout::new().module("app/lookup.align", LOOKUP).main(MAIN)
+    let mut layout = Layout::new();
+    for (path, source) in q5b1_modules() {
+        layout = layout.module(path, source);
+    }
+    layout.main(MAIN)
 }
 
 /// The non-live variant: the same modules plus the state helper. `Layout::module` replaces by

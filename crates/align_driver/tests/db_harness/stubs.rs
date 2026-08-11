@@ -28,13 +28,14 @@ impl Stub {
     /// namespaced literals in order ARE the emitted names. Reading them back keeps the check honest:
     /// it compares the registry against the source of truth rather than a second hand-written list.
     pub fn names_in_module(&self) -> Vec<String> {
-        let namespace = format!(
-            "{}.",
-            self.names
-                .first()
-                .and_then(|n| n.split('.').next())
-                .unwrap_or_default()
-        );
+        // The namespace is derived from the first registered name, so an empty registry would make
+        // this scan for the prefix `"."` and silently return nothing — which would then compare
+        // equal to the empty registry and report agreement. Refuse instead.
+        let first = self
+            .names
+            .first()
+            .unwrap_or_else(|| panic!("stub `{}` has an empty counter registry", self.id));
+        let namespace = format!("{}.", first.split('.').next().expect("namespaced counter name"));
         self.counters_align
             .lines()
             .filter_map(|line| {

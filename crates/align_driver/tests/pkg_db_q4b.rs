@@ -2686,11 +2686,11 @@ pg.protocol_error
         let layout = Layout::new().with_counters(&PG);
         assert!(
             layout.has_c_fixture(),
-            "with_pg_counters must also link the stub that defines the counters"
+            "with_counters must also link the stub that defines the counters"
         );
         assert!(
             layout.paths().contains(&PG.counters_path),
-            "with_pg_counters must add the Align counters module"
+            "with_counters must add the Align counters module"
         );
         assert!(
             !Layout::new().linking(&PG).paths().contains(&PG.counters_path),
@@ -3225,6 +3225,11 @@ fn main() -> i32 {
 
 /// PR-1 deferred this cell: the timeout path was implemented but no owner drove a hanging case.
 ///
+/// The 2-second cap is generous for a loop that needs minutes, but a sufficiently loaded machine
+/// could in principle let the kill land late. That direction fails LOUDLY (the hang row would
+/// report a value mismatch instead of a timeout) rather than passing a broken engine, so the
+/// failure mode is a visible flake, never a false green.
+///
 /// Two things must hold together, and only a real hang can show them: the timed-out case is
 /// reported as a timeout rather than as some arbitrary signal exit code, and the cases after it
 /// still run and still report. If `run_parity` asserted eagerly, the second row would vanish behind
@@ -3253,14 +3258,19 @@ fn parity_engine_reports_a_timed_out_case_and_keeps_going() {
         .cloned()
         .unwrap_or_default();
 
-    assert!(report.contains("hang"), "{report}");
-    assert!(report.contains("timed out"), "{report}");
+    // The exact string the engine emits, not a substring that `after_hang` would also satisfy:
+    // `contains("hang")` matches "after_hang" too, so it could pass with the hang row missing.
     assert!(
-        report.contains("after_hang"),
-        "the case after the hang must still have run and been reported: {report}"
+        report.contains("case `hang` on sqlite: expected completion within"),
+        "the hang row must be reported as a TIMEOUT, naming the case and driver: {report}"
     );
     assert!(
-        report.contains("Some(7)"),
-        "the later row's own mismatch must survive the earlier timeout: {report}"
+        report.contains("timed out and was killed"),
+        "{report}"
+    );
+    assert!(
+        report.contains("case `after_hang` on sqlite: expected Some(7)"),
+        "the case after the hang must still have run and reported its OWN mismatch, which only \
+         holds if outcomes are collected before anything is asserted: {report}"
     );
 }

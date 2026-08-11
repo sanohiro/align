@@ -515,11 +515,14 @@ fn q6_modules() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// The layout the non-`Case` owners use: the same module list the cases use, plus one `main`.
+/// Derived from `q6_modules` so the two cannot drift apart.
 fn package_files(main: &str) -> Layout {
-    Layout::new()
-        .module("app/user_groups.align", *USER_GROUPS)
-        .module("app/transaction_master.align", *TRANSACTION_MASTER)
-        .main(main)
+    let mut layout = Layout::new();
+    for (path, source) in q6_modules() {
+        layout = layout.module(path, source);
+    }
+    layout.main(main)
 }
 
 fn mir_function<'a>(mir: &'a str, name: &str) -> &'a str {

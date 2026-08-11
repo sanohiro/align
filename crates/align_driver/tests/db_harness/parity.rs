@@ -169,7 +169,7 @@ impl ParityProgram {
     pub fn build(tag: &str, layout: &Layout) -> ParityProgram {
         assert!(
             layout.has_c_fixture(),
-            "a parity program must link a C fixture (call Layout::linking_pg_stub or with_pg_counters); \
+            "a parity program must link a C fixture (call Layout::linking or with_counters); \
              without it the PostgreSQL member cannot run"
         );
         let proj = layout.materialize(tag);

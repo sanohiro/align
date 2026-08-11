@@ -30,8 +30,10 @@
 //! in that order.
 //!
 //! `dead_code` / `unused_imports` are allowed for the same reason `common/mod.rs` allows them: each
-//! test binary compiles this whole module but uses only the subset it needs. Do not "clean up" the
-//! attribute — it is load-bearing for every suite that uses a different subset.
+//! test binary compiles this whole module but uses only the subset it needs, and the subsets
+//! genuinely differ — q5b2 uses only `package_source`, q4b uses the parity engine, q4a and q6 use
+//! the counter tables. Do not "clean up" the attribute; without it every suite would need a
+//! hand-maintained import list that says nothing about correctness.
 //!
 //! Cargo auto-discovers only `tests/*.rs` and `tests/*/main.rs`, so this directory is a shared
 //! module and not an extra test binary (no extra link, no extra process startup).

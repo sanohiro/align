@@ -59,6 +59,19 @@ pub struct Case {
 impl Case {
     /// The exact layout both [`Case::run`] and [`Case::fingerprint`] use.
     pub fn layout(&self) -> Layout {
+        // Adding a counters module without expecting anything from it compiles and links happily
+        // while asserting nothing, which looks like coverage and is not. The converse — expecting
+        // counters with no module to print them — fails at parse time, but failing here names the
+        // case instead.
+        assert_eq!(
+            self.counters.is_empty(),
+            self.expect_counters.is_empty(),
+            "`{}` links {} counters module(s) but declares {} counter expectation(s); a counters \
+             module with nothing asserted against it is not coverage",
+            self.label,
+            self.counters.len(),
+            self.expect_counters.len(),
+        );
         let mut layout = Layout::new();
         for (path, source) in (self.modules)() {
             layout = layout.module(path, source);
@@ -68,7 +81,7 @@ impl Case {
         }
         for stub in self.counters {
             assert!(
-                self.links.iter().any(|linked| std::ptr::eq(*linked, *stub)),
+                self.links.iter().any(|linked| linked.id == stub.id),
                 "`{}` asks for {}'s counters module without linking its C source",
                 self.label,
                 stub.id

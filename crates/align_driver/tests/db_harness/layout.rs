@@ -2,7 +2,6 @@
 
 use super::stubs::Stub;
 use crate::common::{Proj, fixture};
-use std::path::PathBuf;
 use std::sync::LazyLock;
 
 /// The eight `pkg.db` package sources, read from disk ONCE.
@@ -101,7 +100,11 @@ impl Layout {
     /// module would put an extra module into the compiled program, so a migration meant to be a
     /// pure refactor must use this and not [`Layout::with_counters`].
     pub fn linking(mut self, stub: &'static Stub) -> Layout {
-        if !self.c_sources.iter().any(|s| std::ptr::eq(*s, stub)) {
+        // Keyed on `id`, not address: `&PG` is a reference to a `const`, which the compiler may
+        // promote to any number of distinct statics, so pointer identity between two `&PG`
+        // expressions is not guaranteed. `id` is the stub's declared identity and is what the
+        // fingerprint records too.
+        if !self.c_sources.iter().any(|linked| linked.id == stub.id) {
             self.c_sources.push(stub);
         }
         self

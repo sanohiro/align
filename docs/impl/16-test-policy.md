@@ -470,10 +470,14 @@ worked example.
 
 A migration must prove the same defect still fails:
 
-1. **Backward** — the new layout builder is asserted equal to the retired
-   `package_files`, path by path and source by source
-   (`layout_reproduces_the_pre_harness_package_files_exactly`), and the migrated
-   suite passes unchanged.
+1. **Backward** — `pkg_db_q4b` keeps the retired `package_files` as an oracle and
+   asserts `Layout` reproduces it path by path and source by source
+   (`layout_reproduces_the_pre_harness_package_files_exactly`). That pins the
+   shared eight-module package layout and its order for every suite, so a later
+   migration inherits the proof rather than repeating it; what each further
+   suite must then show is only that its own module list and `main` are
+   unchanged, which its fingerprint golden covers. Every migrated suite also
+   passes unchanged.
 2. **Forward** — a case-fingerprint golden over label, runner, test-owned files,
    environment, and expected exit. Hashing sources alone is not enough: a
    refactor can preserve the file set while changing the runner, environment, or
@@ -537,9 +541,10 @@ Recorded so the gap is explicit rather than implied:
 - **`#[ignore]`d measurement probes** in `pkg_db_q4a`, `q4b`, and `q6` carry no
   fingerprint: they parse stdout numbers rather than asserting an exit code, so
   they are not `Case`-shaped. Checked by hand during review.
-- **`pkg_db_q5b2`'s six derived layout builders** still use the `retain`+`push`
-  idiom. PR-2 extracted only its inline C stub because `q5b2` is in the A1
-  catalog/EXPLAIN blast radius; the builder rewrite is PR-3.
+- **`pkg_db_q5b2`'s five derived layout builders** — plus three further inline
+  `retain`+`push` sites in test bodies — still use that idiom. PR-2 extracted
+  only its inline C stub because `q5b2` is in the A1 catalog/EXPLAIN blast
+  radius; the builder rewrite is PR-3.
 - **`pkg_db_a1` and `pkg_db_q2`** are unmigrated, and `q2` still bakes its
   package sources with `include_str!`. Both are PR-3, after the A1 waves.
   `pkg_db_q1` and `q3` are Rust-API suites and out of the harness's scope; their
