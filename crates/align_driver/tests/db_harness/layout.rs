@@ -46,8 +46,49 @@ static PACKAGE: LazyLock<Vec<(&'static str, &'static str)>> = LazyLock::new(|| {
     ]
 });
 
-/// The number of modules the `pkg.db` package itself contributes.
-pub const PACKAGE_MODULE_COUNT: usize = 8;
+/// Every counter name `PG_COUNTERS_ALIGN` prints, in dump order.
+///
+/// One registry, three consumers: the Align module below prints these names, the parser rejects
+/// anything outside it, and `CounterExpect` validates that an expectation names a real counter.
+/// `pg_counter_registry_matches_the_align_module` keeps this list and the module in step without
+/// needing a C compiler or LLVM, so a counter added on one side and forgotten on the other fails in
+/// milliseconds instead of surviving until someone happens to assert on it.
+pub const PG_COUNTER_NAMES: &[&str] = &[
+    "pg.connect_calls",
+    "pg.finish_calls",
+    "pg.encoding_calls",
+    "pg.execute_calls",
+    "pg.clear_calls",
+    "pg.protocol_ok",
+    "pg.protocol_error",
+    "pg.nonblocking_calls",
+    "pg.cancel_calls",
+    "pg.consume_calls",
+    "pg.last_timeout",
+    "pg.prepare_calls",
+    "pg.execute_prepared_calls",
+    "pg.control_calls",
+    "pg.deallocate_calls",
+    "pg.delivered_rows",
+];
+
+/// The names `PG_COUNTERS_ALIGN` actually prints, recovered from its source.
+///
+/// A counter line is `print("pg.<name>")` immediately followed by `print(align_pg_...())`, so the
+/// quoted `pg.` literals in dump order ARE the emitted names. Reading them back from the module
+/// keeps the check honest: it compares the registry against the source of truth rather than against
+/// a second hand-written list.
+pub fn pg_counter_names_in_module() -> Vec<String> {
+    PG_COUNTERS_ALIGN
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let rest = line.strip_prefix("print(\"pg.")?;
+            let name = rest.strip_suffix("\")")?;
+            Some(format!("pg.{name}"))
+        })
+        .collect()
+}
 
 /// The Align module that reads the libpq stub's counters and prints them in the wire format
 /// [`crate::db_harness::counters`] parses.
@@ -122,55 +163,6 @@ pub fn dump() {
 }
 "##;
 
-/// The Align module for the shared SQLite prepared-statement stub's counters.
-const SQLITE_COUNTERS_ALIGN: &str = r##"module pkg.db.testkit.sqlite
-
-extern "C" {
-  fn align_sqlite_q4a_reset()
-  fn align_sqlite_q4a_prepare_calls() -> i32
-  fn align_sqlite_q4a_bind_i64_calls() -> i32
-  fn align_sqlite_q4a_bind_text_calls() -> i32
-  fn align_sqlite_q4a_bind_blob_calls() -> i32
-  fn align_sqlite_q4a_reset_calls() -> i32
-  fn align_sqlite_q4a_clear_calls() -> i32
-  fn align_sqlite_q4a_finalize_calls() -> i32
-  fn align_sqlite_q4a_busy_timeout_calls() -> i32
-  fn align_sqlite_q4a_last_busy_timeout() -> i32
-  fn align_sqlite_q4a_protocol_ok() -> i32
-}
-
-pub fn reset() {
-  unsafe { align_sqlite_q4a_reset() }
-}
-
-pub fn dump() {
-  unsafe {
-    print("#db-counters-begin")
-    print("sqlite.prepare_calls")
-    print(align_sqlite_q4a_prepare_calls())
-    print("sqlite.bind_i64_calls")
-    print(align_sqlite_q4a_bind_i64_calls())
-    print("sqlite.bind_text_calls")
-    print(align_sqlite_q4a_bind_text_calls())
-    print("sqlite.bind_blob_calls")
-    print(align_sqlite_q4a_bind_blob_calls())
-    print("sqlite.reset_calls")
-    print(align_sqlite_q4a_reset_calls())
-    print("sqlite.clear_calls")
-    print(align_sqlite_q4a_clear_calls())
-    print("sqlite.finalize_calls")
-    print(align_sqlite_q4a_finalize_calls())
-    print("sqlite.busy_timeout_calls")
-    print(align_sqlite_q4a_busy_timeout_calls())
-    print("sqlite.last_busy_timeout")
-    print(align_sqlite_q4a_last_busy_timeout())
-    print("sqlite.protocol_ok")
-    print(align_sqlite_q4a_protocol_ok())
-    print("#db-counters-end")
-  }
-}
-"##;
-
 /// A `pkg.db` multi-file project under construction.
 #[derive(Clone, Default)]
 pub struct Layout {
@@ -238,11 +230,6 @@ impl Layout {
             .module("pkg/db/testkit/pg.align", PG_COUNTERS_ALIGN)
     }
 
-    /// Link the shared SQLite prepared-statement stub and add its counters module.
-    pub fn with_sqlite_counters(self) -> Layout {
-        self.linking_sqlite_stub()
-            .module("pkg/db/testkit/sqlite.align", SQLITE_COUNTERS_ALIGN)
-    }
 
     /// Remove the module at `path`.
     ///

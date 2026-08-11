@@ -108,25 +108,6 @@ impl Run {
         self
     }
 
-    /// Non-panicking stdout check against the program's payload (counter dumps excluded).
-    pub fn check_payload(&self, expected: &[&str]) -> Result<(), Mismatch> {
-        let actual = self.payload_lines();
-        if actual.iter().map(String::as_str).eq(expected.iter().copied()) {
-            return Ok(());
-        }
-        Err(Mismatch {
-            what: format!("stdout payload of `{}`", self.label),
-            expected: format!("{expected:?}"),
-            actual: format!("{actual:?}"),
-        })
-    }
-
-    pub fn expect_payload(&self, expected: &[&str]) -> &Run {
-        if let Err(mismatch) = self.check_payload(expected) {
-            panic!("{mismatch}\n{}", self.describe());
-        }
-        self
-    }
 }
 
 /// What a test needs from the host before it can run.
@@ -140,10 +121,21 @@ pub enum Needs {
     LivePostgres,
 }
 
-/// Proof that the host satisfies a [`Needs`], carrying anything the test needs from it.
-pub struct Gate {
-    pub postgres_url: Option<String>,
+impl Needs {
+    pub fn id(self) -> &'static str {
+        match self {
+            Needs::Backend => "backend",
+            Needs::BackendAndCc => "backend+cc",
+            Needs::LivePostgres => "live-postgres",
+        }
+    }
 }
+
+/// Proof that the host satisfies a [`Needs`].
+///
+/// Deliberately empty: a live case reads its URL from [`live_postgres_decision`], which is also
+/// what the required-mode owner tests, so there is no second copy to keep in step.
+pub struct Gate;
 
 /// What to do about a live-PostgreSQL case, given the two environment inputs.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -167,16 +159,19 @@ pub fn live_postgres_decision(required: bool, url: Option<&str>) -> LiveDecision
     }
 }
 
-/// Whether the engine must clear `key` from a child's environment.
+/// Whether the engine must clear `key`, given the keys it is setting explicitly on this child.
 ///
-/// Pure for the same reason as [`live_postgres_decision`]. The engine sets both selectors itself
-/// and removes every other inherited `ALIGN_DB_*` key, so a stray variable in the developer's shell
-/// cannot silently change what a case does.
-pub fn should_clear_env(key: &str, passthrough: &[String]) -> bool {
-    key.starts_with("ALIGN_DB_")
-        && key != "ALIGN_DB_DRIVER"
-        && key != "ALIGN_DB_CASE"
-        && !passthrough.iter().any(|k| k == key)
+/// `explicitly_set` is the caller's actual `env(...)` key list, not a restatement of it: the engine
+/// builds the child's environment first and then derives the removals from what it just set. That
+/// way adding a variable to a child cannot desynchronise from a hardcoded exclusion list here —
+/// a stray `ALIGN_DB_*` in the developer's shell is still removed, and a key the engine itself set
+/// is never removed on top of setting it.
+///
+/// Pure for the same reason as [`live_postgres_decision`]: mutating process-global environment from
+/// a parallel test is the recorded `test-global-state-isolation` finding, so neither rule may need
+/// `set_var` in order to be testable.
+pub fn should_clear_env(key: &str, explicitly_set: &[&str]) -> bool {
+    key.starts_with("ALIGN_DB_") && !explicitly_set.contains(&key)
 }
 
 /// Gate a test on host capability.
@@ -197,9 +192,7 @@ pub fn gate(needs: Needs) -> Option<Gate> {
         let required = std::env::var("ALIGN_DB_POSTGRES_REQUIRED").ok().as_deref() == Some("1");
         let url = std::env::var("ALIGN_DB_POSTGRES_URL").ok();
         return match live_postgres_decision(required, url.as_deref()) {
-            LiveDecision::Run(url) => Some(Gate {
-                postgres_url: Some(url),
-            }),
+            LiveDecision::Run(_) => Some(Gate),
             LiveDecision::Skip => {
                 eprintln!("live PostgreSQL case skipped: ALIGN_DB_POSTGRES_URL is not set");
                 None
@@ -209,7 +202,7 @@ pub fn gate(needs: Needs) -> Option<Gate> {
             }
         };
     }
-    Some(Gate { postgres_url: None })
+    Some(Gate)
 }
 
 /// Assert an accumulated failure list is empty, reporting EVERY entry.

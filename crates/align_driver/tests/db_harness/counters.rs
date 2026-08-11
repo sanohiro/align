@@ -71,6 +71,15 @@ impl Counters {
                     .trim()
                     .parse()
                     .map_err(|_| format!("counter `{name}` has non-numeric value `{raw}`"))?;
+                // An unknown name means the Align module and this registry have diverged. Accepting
+                // it would let a renamed counter read as "absent" at the expectation instead of as
+                // the schema break it is.
+                if !super::layout::PG_COUNTER_NAMES.contains(&name) {
+                    return Err(format!(
+                        "counter `{name}` is not in the known registry {:?}",
+                        super::layout::PG_COUNTER_NAMES
+                    ));
+                }
                 match values.get(name) {
                     Some(previous) if *previous != value => {
                         return Err(format!(
@@ -109,23 +118,27 @@ impl CounterExpect {
         CounterExpect::default()
     }
 
-    /// Expect `name == value`. Unknown names are caught at check time against the parsed dump.
+    /// Expect `name == value`.
+    ///
+    /// The name is validated against the registry immediately: a typo would otherwise be reported
+    /// as "counter absent from the dump", which reads like a product defect rather than a test bug.
     pub fn eq(mut self, name: &str, value: i64) -> CounterExpect {
+        assert!(
+            super::layout::PG_COUNTER_NAMES.contains(&name),
+            "`{name}` is not a known counter; the registry has {:?}",
+            super::layout::PG_COUNTER_NAMES
+        );
         self.want.push((name.to_string(), value));
         self
     }
 
-    // ---- libpq shorthands -----------------------------------------------------------------
+    // ---- libpq shorthands ------------------------------------------------------------------
+    // Only the counters this suite actually asserts get a named method; everything else in
+    // PG_COUNTER_NAMES is reachable through `eq` without a dormant wrapper per counter.
     /// The stub's own protocol self-check; also pins `pg.protocol_error` to 0 so a failure names
     /// the reported error code instead of hiding it behind a sentinel offset.
     pub fn pg_protocol_ok(self) -> CounterExpect {
         self.eq("pg.protocol_ok", 1).eq("pg.protocol_error", 0)
-    }
-    pub fn pg_connect(self, n: i64) -> CounterExpect {
-        self.eq("pg.connect_calls", n)
-    }
-    pub fn pg_finish(self, n: i64) -> CounterExpect {
-        self.eq("pg.finish_calls", n)
     }
     pub fn pg_execute(self, n: i64) -> CounterExpect {
         self.eq("pg.execute_calls", n)
@@ -133,58 +146,8 @@ impl CounterExpect {
     pub fn pg_clear(self, n: i64) -> CounterExpect {
         self.eq("pg.clear_calls", n)
     }
-    pub fn pg_prepare(self, n: i64) -> CounterExpect {
-        self.eq("pg.prepare_calls", n)
-    }
-    pub fn pg_execute_prepared(self, n: i64) -> CounterExpect {
-        self.eq("pg.execute_prepared_calls", n)
-    }
-    pub fn pg_control(self, n: i64) -> CounterExpect {
-        self.eq("pg.control_calls", n)
-    }
-    pub fn pg_deallocate(self, n: i64) -> CounterExpect {
-        self.eq("pg.deallocate_calls", n)
-    }
-    pub fn pg_nonblocking(self, n: i64) -> CounterExpect {
-        self.eq("pg.nonblocking_calls", n)
-    }
-    pub fn pg_cancel(self, n: i64) -> CounterExpect {
-        self.eq("pg.cancel_calls", n)
-    }
-    pub fn pg_delivered_rows(self, n: i64) -> CounterExpect {
-        self.eq("pg.delivered_rows", n)
-    }
-
-    // ---- SQLite shorthands ----------------------------------------------------------------
-    pub fn sqlite_protocol_ok(self) -> CounterExpect {
-        self.eq("sqlite.protocol_ok", 1)
-    }
-    pub fn sqlite_prepare(self, n: i64) -> CounterExpect {
-        self.eq("sqlite.prepare_calls", n)
-    }
-    pub fn sqlite_finalize(self, n: i64) -> CounterExpect {
-        self.eq("sqlite.finalize_calls", n)
-    }
-    pub fn sqlite_reset(self, n: i64) -> CounterExpect {
-        self.eq("sqlite.reset_calls", n)
-    }
-    pub fn sqlite_clear(self, n: i64) -> CounterExpect {
-        self.eq("sqlite.clear_calls", n)
-    }
-    pub fn sqlite_bind_i64(self, n: i64) -> CounterExpect {
-        self.eq("sqlite.bind_i64_calls", n)
-    }
-    pub fn sqlite_bind_text(self, n: i64) -> CounterExpect {
-        self.eq("sqlite.bind_text_calls", n)
-    }
-    pub fn sqlite_bind_blob(self, n: i64) -> CounterExpect {
-        self.eq("sqlite.bind_blob_calls", n)
-    }
-    pub fn sqlite_busy_timeout(self, n: i64) -> CounterExpect {
-        self.eq("sqlite.busy_timeout_calls", n)
-    }
-    pub fn sqlite_last_busy_timeout(self, n: i64) -> CounterExpect {
-        self.eq("sqlite.last_busy_timeout", n)
+    pub fn pg_finish(self, n: i64) -> CounterExpect {
+        self.eq("pg.finish_calls", n)
     }
 
     /// Every mismatch, never just the first.
@@ -240,9 +203,4 @@ impl CounterExpect {
 /// Shorthand for a fresh libpq expectation that also pins the protocol self-check.
 pub fn pg() -> CounterExpect {
     CounterExpect::new().pg_protocol_ok()
-}
-
-/// Shorthand for a fresh SQLite expectation that also pins the protocol self-check.
-pub fn sqlite() -> CounterExpect {
-    CounterExpect::new().sqlite_protocol_ok()
 }

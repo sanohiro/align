@@ -37,6 +37,7 @@
 //! module and not an extra test binary (no extra link, no extra process startup).
 #![allow(dead_code, unused_imports)]
 
+pub mod case;
 pub mod counters;
 pub mod fingerprint;
 pub mod layout;
@@ -44,9 +45,10 @@ pub mod parity;
 pub mod run;
 pub mod runner;
 
+pub use case::{Case, RunnerKind, Stubs};
 pub use counters::{CounterExpect, Counters};
 pub use fingerprint::{CaseFingerprint, FingerprintLog};
-pub use layout::Layout;
+pub use layout::{Layout, PG_COUNTER_NAMES, pg_counter_names_in_module};
 pub use parity::{
     Driver, Expect, Limits, ParityCase, ParityProgram, run_of, run_parity,
     run_parity_with_limits,
@@ -56,6 +58,6 @@ pub use run::{
     live_postgres_decision, should_clear_env,
 };
 pub use runner::{
-    RUNNER_CHECK_ONLY, RUNNER_PER_UNIT_C, RUNNER_STATIC_DESCRIPTORS, expect_checks_clean,
-    expect_checks_rejected, run_per_unit_c, run_static_descriptors,
+    RUNNER_PER_UNIT_C, RUNNER_STATIC_DESCRIPTORS, expect_checks_clean, expect_checks_rejected,
+    run_per_unit_c, run_static_descriptors,
 };

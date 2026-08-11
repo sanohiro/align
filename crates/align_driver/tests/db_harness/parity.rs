@@ -39,8 +39,10 @@
 //! case dispatch is an `if`/`else` chain whose final `else` returns [`UNKNOWN_CASE`]. That arm is
 //! the drift detector: a table row whose name no longer exists in the program hits it.
 
+use super::fingerprint::CaseFingerprint;
 use super::layout::Layout;
 use super::run::{Mismatch, Run, assert_no_mismatches};
+use super::runner::RUNNER_PER_UNIT_C;
 use crate::common::{
     BuildTarget, Profile, Proj, SourceMap, build_per_unit, emit_object_file, link_objects,
 };
@@ -156,8 +158,9 @@ pub struct ParityProgram {
     exe: PathBuf,
     dir: PathBuf,
     timeout: Duration,
-    /// `ALIGN_DB_*` keys the table explicitly passes through to the child.
-    passthrough: Vec<String>,
+    /// The suite-owned modules this program was actually compiled from, kept so a fingerprint
+    /// reflects the built artifact rather than a layout rebuilt by the assertion.
+    test_owned: Vec<(String, String)>,
     _proj: Proj,
 }
 
@@ -228,21 +231,59 @@ impl ParityProgram {
             exe,
             dir: proj.dir.clone(),
             timeout: DEFAULT_CASE_TIMEOUT,
-            passthrough: Vec::new(),
+            test_owned: layout
+                .test_owned_files()
+                .into_iter()
+                .map(|(p, s)| (p.to_string(), s.to_string()))
+                .collect(),
             _proj: proj,
         }
     }
 
-    pub fn with_timeout(mut self, timeout: Duration) -> ParityProgram {
-        self.timeout = timeout;
-        self
+    /// The pipeline this program was compiled through.
+    ///
+    /// Exposed so a fingerprint golden reads the runner from the ENGINE instead of restating it. A
+    /// golden that hardcodes the pipeline cannot notice the pipeline changing, which is the one
+    /// substitution point most likely to change silently.
+    pub fn runner_id(&self) -> &'static str {
+        RUNNER_PER_UNIT_C
     }
 
-    /// Allow specific `ALIGN_DB_*` keys through to the child (for example the live-PostgreSQL URL).
-    /// Every other `ALIGN_DB_*` key in the parent environment is removed.
-    pub fn passing_through(mut self, keys: &[&str]) -> ParityProgram {
-        self.passthrough = keys.iter().map(|k| (*k).to_string()).collect();
-        self
+    /// The exact environment [`ParityProgram::run_case`] sets on a child.
+    ///
+    /// The single source of truth: `run_case` builds the child from this, and the fingerprint
+    /// golden hashes it, so a variable added to a child run shows up as a golden diff.
+    pub fn case_env(&self, driver: Driver, case: &str) -> Vec<(&'static str, String)> {
+        vec![
+            ("ALIGN_DB_DRIVER", driver.env_value().to_string()),
+            ("ALIGN_DB_CASE", case.to_string()),
+        ]
+    }
+
+    /// The fingerprint of one `(case, driver)` AS THIS PROGRAM WOULD RUN IT.
+    ///
+    /// Every field is read back from the engine — the pipeline from [`ParityProgram::runner_id`],
+    /// the child environment from [`ParityProgram::case_env`], the modules from the ones actually
+    /// compiled. Nothing is restated by the caller except the expected class, which the parity
+    /// table owns. A golden built this way notices a runner swap, a profile change, or a new child
+    /// variable; a golden that rebuilt the inputs by hand would agree with itself and notice none
+    /// of them.
+    pub fn fingerprint(&self, case: &str, driver: Driver, expected_exit: i32) -> CaseFingerprint {
+        let files: Vec<(&str, &str)> = self
+            .test_owned
+            .iter()
+            .map(|(p, s)| (p.as_str(), s.as_str()))
+            .collect();
+        let env = self.case_env(driver, case);
+        let env_pairs: Vec<(&str, &str)> =
+            env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        CaseFingerprint::new(
+            format!("{}/{}/{}", self.label, case, driver.name()),
+            self.runner_id(),
+        )
+        .files(&files)
+        .env(&env_pairs)
+        .expected_exit(expected_exit)
     }
 
     /// Spawn one child for `(driver, case)`.
@@ -252,20 +293,41 @@ impl ParityProgram {
     /// [`MISSING_DRIVER`]/[`MISSING_CASE`], which the engine treats as a failure rather than
     /// silently running "the default case".
     pub fn run_case(&self, driver: Driver, case: &str) -> Run {
+        self.run_case_at(driver, case, case)
+    }
+
+    /// [`ParityProgram::run_case`] with an explicit capture-file slot, so two cases whose names
+    /// sanitize to the same filename cannot overwrite each other's stdout.
+    fn run_case_at(&self, driver: Driver, case: &str, slot: &str) -> Run {
         let label = format!("{}[{}/{}]", self.label, driver.name(), case);
-        let stdout_path = self.dir.join(format!("out-{}-{}", driver.name(), sanitize(case)));
-        let stderr_path = self.dir.join(format!("err-{}-{}", driver.name(), sanitize(case)));
+        let stdout_path = self
+            .dir
+            .join(format!("out-{}-{}", driver.name(), sanitize(slot)));
+        let stderr_path = self
+            .dir
+            .join(format!("err-{}-{}", driver.name(), sanitize(slot)));
         let mut command = Command::new(&self.exe);
-        command
-            .env("ALIGN_DB_DRIVER", driver.env_value())
-            .env("ALIGN_DB_CASE", case)
-            .stdout(File::create(&stdout_path).expect("create stdout capture"))
-            .stderr(File::create(&stderr_path).expect("create stderr capture"));
-        for (key, _) in std::env::vars() {
-            if super::run::should_clear_env(&key, &self.passthrough) {
-                command.env_remove(&key);
+
+        // Set first, then derive the removals from what was actually set: the clearing rule reads
+        // the engine's own key list rather than a hardcoded copy of it.
+        let explicit = self.case_env(driver, case);
+        for (key, value) in &explicit {
+            command.env(key, value);
+        }
+        let explicit_keys: Vec<&str> = explicit.iter().map(|(key, _)| *key).collect();
+        // `vars_os` rather than `vars`: `vars` panics on a non-UTF-8 variable, and a developer's
+        // shell is not obliged to keep every variable UTF-8. A key we cannot read as UTF-8 cannot
+        // be an `ALIGN_DB_*` selector, so skipping it is correct.
+        for (key, _) in std::env::vars_os() {
+            let Some(key) = key.to_str() else { continue };
+            if super::run::should_clear_env(key, &explicit_keys) {
+                command.env_remove(key);
             }
         }
+
+        command
+            .stdout(File::create(&stdout_path).expect("create stdout capture"))
+            .stderr(File::create(&stderr_path).expect("create stderr capture"));
         let mut child = command.spawn().expect("spawn parity case");
         let started = Instant::now();
         let (status, timed_out) = loop {
@@ -288,9 +350,9 @@ impl ParityProgram {
         run
     }
 
-    /// The case names the program reports for itself.
+    /// The case names the program reports for itself, under `driver`.
     pub fn list_cases(&self, driver: Driver) -> Vec<String> {
-        let run = self.run_case(driver, LIST_CASE);
+        let run = self.run_case_at(driver, LIST_CASE, LIST_CASE);
         if run.check_exit(LIST_OK).is_err() {
             panic!(
                 "`{}` did not answer {LIST_CASE} with exit {LIST_OK}\n{}",
@@ -308,7 +370,9 @@ fn sanitize(case: &str) -> String {
         .collect()
 }
 
-/// Limits on a generated matrix, so a Cartesian product cannot silently become a 10,000-spawn suite.
+/// Limits on a generated matrix, so a Cartesian product cannot silently become a 10,000-spawn
+/// suite. [`run_parity`] applies [`Limits::default`]; a table that needs different ceilings calls
+/// [`run_parity_with_limits`].
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub max_cases: usize,
@@ -390,25 +454,50 @@ pub fn run_parity_with_limits(
         seen.push(case.name);
     }
 
-    // --- the table and the program must agree on the case set, in BOTH directions ---------------
-    let listing_driver = *drivers.first().expect("at least one driver");
-    let listed = program.list_cases(listing_driver);
-    for case in cases {
-        if !listed.iter().any(|n| n == case.name) {
-            mismatches.push(Mismatch {
-                what: format!("case `{}` in the Rust table", case.name),
-                expected: "present in the program's own case list".to_string(),
-                actual: format!("program lists {listed:?}"),
-            });
+    // --- capture-path collisions ------------------------------------------------------------------
+    // Case names become capture filenames through `sanitize`, which is not injective: `a.b` and
+    // `a-b` both become `a_b`. Two such cases would overwrite each other's stdout and the second
+    // would be checked against the first's counter dump.
+    for (index, case) in cases.iter().enumerate() {
+        for other in &cases[index + 1..] {
+            assert!(
+                sanitize(case.name) != sanitize(other.name),
+                "parity table `{}`: cases `{}` and `{}` sanitize to the same capture filename `{}`",
+                program.label,
+                case.name,
+                other.name,
+                sanitize(case.name),
+            );
         }
     }
-    for name in &listed {
-        if !cases.iter().any(|c| c.name == name) {
-            mismatches.push(Mismatch {
-                what: format!("case `{name}` in the program"),
-                expected: "present in the Rust parity table".to_string(),
-                actual: "absent from the table".to_string(),
-            });
+    assert!(
+        !cases.iter().any(|c| sanitize(c.name) == sanitize(LIST_CASE)),
+        "parity table `{}` has a case whose capture filename collides with the `{LIST_CASE}` run",
+        program.label,
+    );
+
+    // --- the table and the program must agree, on EVERY driver, in BOTH directions ----------------
+    // Listing from only one driver would leave the other side unchecked, and a program whose
+    // dispatch is itself driver-dependent could then hide a case from one of them.
+    for &driver in drivers {
+        let listed = program.list_cases(driver);
+        for case in cases {
+            if !listed.iter().any(|n| n == case.name) {
+                mismatches.push(Mismatch {
+                    what: format!("case `{}` in the Rust table", case.name),
+                    expected: format!("listed by the program on {}", driver.name()),
+                    actual: format!("{} lists {listed:?}", driver.name()),
+                });
+            }
+        }
+        for name in &listed {
+            if !cases.iter().any(|c| c.name == name) {
+                mismatches.push(Mismatch {
+                    what: format!("case `{name}` listed by the program on {}", driver.name()),
+                    expected: "present in the Rust parity table".to_string(),
+                    actual: "absent from the table".to_string(),
+                });
+            }
         }
     }
 
@@ -475,6 +564,29 @@ pub fn run_parity_with_limits(
             // Collected unconditionally and asserted only afterwards, so a failing or timed-out
             // case never hides the rows after it.
             runs.push((case.name.to_string(), driver, run));
+        }
+    }
+
+    // --- P2-3: every row must actually have run -------------------------------------------------
+    // A `DriverOnly` row whose driver is not in `drivers` matches nothing in the loop above and
+    // would otherwise be reported as passing while never executing once. Silent non-execution is
+    // the failure mode a parity table exists to prevent, so it is an error, not a skip.
+    for case in cases {
+        let executions = runs.iter().filter(|(name, _, _)| name == case.name).count();
+        if executions == 0 {
+            mismatches.push(Mismatch {
+                what: format!("case `{}`", case.name),
+                expected: "at least one execution".to_string(),
+                actual: match case.expect {
+                    Expect::DriverOnly { driver, .. } => format!(
+                        "never ran: it is declared {} only, and {} is not among the drivers {:?}",
+                        driver.name(),
+                        driver.name(),
+                        drivers.iter().map(|d| d.name()).collect::<Vec<_>>()
+                    ),
+                    _ => "never ran".to_string(),
+                },
+            });
         }
     }
 

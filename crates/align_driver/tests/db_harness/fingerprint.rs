@@ -171,15 +171,17 @@ impl FingerprintLog {
                 Some(_) => {}
             }
         }
-        for label in got.keys() {
+        for (label, digest) in &got {
             if !want.contains_key(label) {
-                let _ = writeln!(report, "  added:   {label}");
+                let _ = writeln!(report, "  added:   {label} {digest}");
             }
         }
         panic!(
-            "case fingerprints differ from the pre-migration golden\n{report}\n\
-             A changed row means the migration altered what that case exercises (files, runner, \
-             environment, argv, or expected exit), not just how it is written."
+            "case fingerprints differ from the golden\n{report}\n\
+             A changed row means the case now exercises something different (files, runner, \
+             environment, argv, or expected exit), not merely that it is written differently.\n\
+             If the change is intended, the reviewed replacement golden is exactly:\n\
+             ---8<---\n{actual}---8<---"
         );
     }
 }

@@ -422,9 +422,11 @@ per wave, built on `db_harness::parity`:
   chain whose final `else` returns the unknown-case sentinel `99`; the engine
   asserts no case reaches it;
 - `ALIGN_DB_CASE=__list__` makes the program enumerate its own cases, and the
-  engine diffs that list against the Rust table **in both directions**;
-- the engine sets both selectors explicitly and clears every other inherited
-  `ALIGN_DB_*` key. There is no implicit default;
+  engine diffs that list against the Rust table **in both directions, on every
+  driver** — listing from one driver only would leave the other side unchecked;
+- the engine sets both selectors explicitly and then derives the removals from
+  the keys it just set, clearing every other inherited `ALIGN_DB_*`. There is no
+  implicit default and no second hardcoded exclusion list to drift;
 - divergence is declared, never implicit: `Expect::Same`, `Expect::Differs
   { why }`, `Expect::DriverOnly { why }`. The number of `Differs` rows is pinned
   by a per-table budget constant that must be raised in the same diff.
@@ -457,12 +459,22 @@ A migration must prove the same defect still fails:
    (`layout_reproduces_the_pre_harness_package_files_exactly`), and the migrated
    suite passes unchanged.
 2. **Forward** — a case-fingerprint golden over label, runner, test-owned files,
-   environment, argv, and expected exit. Hashing sources alone is not enough: a
-   refactor can preserve the file set while changing the runner, environment,
-   argv, or expected code, and each of those changes what the case proves. The
-   eight package sources are excluded from the digest — they are product code
-   with their own owners, and including them would break the golden on every
+   environment, and expected exit. Hashing sources alone is not enough: a
+   refactor can preserve the file set while changing the runner, environment, or
+   expected code, and each of those changes what the case proves. The eight
+   package sources are excluded from the digest — they are product code with
+   their own owners, and including them would break the golden on every
    `apps/db` edit.
+
+   The golden must be **observed, not restated**. A case is one record (`Case`,
+   or the built `ParityProgram`), and the executor and the fingerprint both read
+   that record: `Case::run` runs exactly what `Case::fingerprint` hashes, and
+   `ParityProgram::fingerprint` reads the pipeline from `runner_id()`, the child
+   environment from `case_env()`, and the modules from the ones actually
+   compiled. A golden that rebuilds those inputs by hand agrees with itself and
+   notices nothing. Each covered axis is confirmed by mutation: swapping a
+   runner, adding a child variable, or changing an expected code must move a
+   digest.
 3. **Fail-open probes** — every converted assertion class has an owner that
    deliberately breaks it and requires the exact report: off-by-one counter,
    absent counter, wrong parity class, mis-declared divergence, over-budget
@@ -472,6 +484,34 @@ A migration must prove the same defect still fails:
    pre-migration set *minus explicitly folded names*, with a correspondence
    table in the PR body mapping each folded name to its new owner and case.
 
+### Counter registry
+
+One registry (`PG_COUNTER_NAMES`) names every counter the Align dump module
+prints. The parser rejects a name outside it, `CounterExpect::eq` rejects an
+expectation naming one, and a string-only owner compares the registry against
+the names actually printed by the Align module. That owner needs no C compiler
+and no LLVM, so a counter added on one side and forgotten on the other fails in
+milliseconds rather than surviving until someone happens to assert on it.
+
+### Deferred cells
+
+Recorded so the gap is explicit rather than implied:
+
+- **Per-case timeout owner.** The timeout path (kill, record, keep running) is
+  implemented and its partial-result behaviour is exercised by every table, but
+  no owner drives a deliberately hanging case. Deferred to PR-2, which needs a
+  hanging fixture anyway.
+- **Live-PostgreSQL identity and cleanup** (unique per-run object names, drop
+  what a case created, assert no survivors). No live parity case exists yet;
+  deferred to PR-3 with the `q2` scalar table.
+- **SQLite storage-mode declaration** (`:memory:` versus file-backed). No table
+  currently needs cross-connection state; deferred until one does.
+- **Layer-1 fingerprint coverage** is complete for all twelve migrated call
+  sites in `pkg_db_q4b`. The two `#[ignore]`d measurement probes are excluded:
+  they parse stdout numbers rather than asserting an exit code, so they are not
+  `Case`-shaped. They were checked by hand during review; mechanising them is
+  PR-2 work.
+
 ### Resource and isolation rules
 
 Every case spawns its own process, which also isolates stub counters. Each spawn
@@ -479,7 +519,14 @@ has a wall-clock cap (default 120 s); on expiry the child is killed, the case is
 recorded as a timeout, **and the remaining cases still run**. Outcomes are
 collected before any assertion, so a mid-table failure never hides later rows. A
 table declares `Limits` for case and child-run counts so a generated Cartesian
-product cannot silently become a many-thousand-spawn suite.
+product cannot silently become a many-thousand-spawn suite; `run_parity`
+applies the default ceilings and a table needing others calls
+`run_parity_with_limits`. Every declared row must execute at least once: a
+`DriverOnly` row whose driver is absent from the run set is a failure, not a
+skip, because a table whose coverage silently shrinks to nothing is the failure
+mode the table exists to prevent. Case names are also checked for capture-file
+collisions, since the sanitiser that turns a name into a filename is not
+injective.
 
 Decisions that depend on process-global state — the live-PostgreSQL gate and the
 `ALIGN_DB_*` clearing rule — are pure functions (`live_postgres_decision`,

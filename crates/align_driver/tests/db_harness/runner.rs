@@ -16,8 +16,6 @@ use crate::common::{
 pub const RUNNER_STATIC_DESCRIPTORS: &str = "static_descriptors";
 /// Per-unit walk + a linked C fixture (the only pipeline that can substitute the libpq stub).
 pub const RUNNER_PER_UNIT_C: &str = "per_unit_c";
-/// Whole-program and per-unit checking only, no codegen.
-pub const RUNNER_CHECK_ONLY: &str = "check_only";
 
 /// Compile through the whole-program static-descriptor pipeline, run, and wrap the result.
 pub fn run_static_descriptors(tag: &str, layout: &Layout) -> Run {
