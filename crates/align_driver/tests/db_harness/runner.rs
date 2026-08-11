@@ -9,13 +9,19 @@
 use super::layout::Layout;
 use super::run::Run;
 use crate::common::{
-    build_and_run_multi_with_c, build_and_run_multi_with_static_descriptors, diff_check_multi,
+    build_and_run_multi_args_with_env, build_and_run_multi_with_c,
+    build_and_run_multi_with_static_descriptors, diff_check_multi,
 };
 
 /// Whole-program front end + compiler-installed static descriptors. No C fixture.
 pub const RUNNER_STATIC_DESCRIPTORS: &str = "static_descriptors";
 /// Per-unit walk + a linked C fixture (the only pipeline that can substitute the libpq stub).
 pub const RUNNER_PER_UNIT_C: &str = "per_unit_c";
+/// Whole-program front end WITHOUT compiler-installed static descriptors.
+///
+/// Distinct from `static_descriptors`: a program that never constructs a Query descriptor exercises
+/// a different amount of the driver, so which of the two a case uses is part of what it proves.
+pub const RUNNER_WHOLE_PROGRAM: &str = "whole_program";
 
 /// Compile through the whole-program static-descriptor pipeline, run, and wrap the result.
 pub fn run_static_descriptors(tag: &str, layout: &Layout) -> Run {
@@ -25,6 +31,17 @@ pub fn run_static_descriptors(tag: &str, layout: &Layout) -> Run {
          one; use run_per_unit_c"
     );
     let output = build_and_run_multi_with_static_descriptors(tag, &layout.files(), "main.align");
+    Run::new(tag, output)
+}
+
+/// Compile through the plain whole-program pipeline, run, and wrap.
+pub fn run_whole_program(tag: &str, layout: &Layout, envs: &[(&str, &str)]) -> Run {
+    assert!(
+        !layout.has_c_fixture(),
+        "`{tag}` declares a C fixture but uses the whole-program pipeline, which cannot link one; \
+         use run_per_unit_c"
+    );
+    let output = build_and_run_multi_args_with_env(tag, &layout.files(), "main.align", &[], envs);
     Run::new(tag, output)
 }
 

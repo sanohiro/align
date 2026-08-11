@@ -728,6 +728,7 @@ const CASE_SQLITE_PREPARED_REUSE: Case = Case {
     modules: q4a_modules,
     main: SQLITE_PREPARED_REUSE_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[
         ("sqlite.protocol_ok", 1),
         ("sqlite.prepare_calls", 1),
@@ -749,6 +750,7 @@ const CASE_SQLITE_UNSUPPORTED_SHAPE: Case = Case {
     modules: q4a_unsupported_modules,
     main: SQLITE_UNSUPPORTED_SHAPE_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[
         ("sqlite.protocol_ok", 1),
         ("sqlite.prepare_calls", 1),
@@ -764,6 +766,7 @@ const CASE_SQLITE_BIND_RECOVERY: Case = Case {
     modules: q4a_modules,
     main: SQLITE_BIND_RECOVERY_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[
         ("sqlite.protocol_ok", 1),
         ("sqlite.bind_i64_calls", 2),
@@ -784,6 +787,7 @@ const CASE_SQLITE_CLEANUP_POISON: Case = Case {
     modules: q4a_modules,
     main: SQLITE_CLEANUP_POISON_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[
         ("sqlite.protocol_ok", 1),
         ("sqlite.prepare_calls", 1),
@@ -803,6 +807,7 @@ const CASE_SQLITE_TRANSACTIONS: Case = Case {
     modules: q4a_modules,
     main: SQLITE_TRANSACTIONS_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -815,6 +820,7 @@ const CASE_POSTGRES_PREPARED_TRANSACTIONS: Case = Case {
     modules: q4a_modules,
     main: POSTGRES_PREPARED_TRANSACTIONS_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[
         ("pg.protocol_ok", 1),
         ("pg.prepare_calls", 2),
@@ -835,6 +841,7 @@ const CASE_POSTGRES_OPTION_PREFLIGHT: Case = Case {
     modules: q4a_modules,
     main: POSTGRES_OPTION_PREFLIGHT_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[
         ("pg.protocol_ok", 1),
         ("pg.prepare_calls", 0),
@@ -852,6 +859,7 @@ const CASE_POSTGRES_FAILED_COMMIT: Case = Case {
     modules: q4a_modules,
     main: POSTGRES_FAILED_COMMIT_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[
         ("pg.protocol_ok", 1),
         ("pg.control_calls", 3),
@@ -868,6 +876,7 @@ const CASE_POSTGRES_IMPLICIT_ROLLBACK: Case = Case {
     modules: q4a_modules,
     main: POSTGRES_IMPLICIT_ROLLBACK_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[
         ("pg.protocol_ok", 1),
         ("pg.control_calls", 3),
@@ -884,6 +893,7 @@ const CASE_POSTGRES_FAILED_ROLLBACK: Case = Case {
     modules: q4a_modules,
     main: POSTGRES_FAILED_ROLLBACK_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[
         ("pg.protocol_ok", 1),
         ("pg.control_calls", 3),
@@ -1542,16 +1552,16 @@ fn main() -> i32 {
 ///
 /// Regenerate ONLY with a reviewed reason, from the panic message this emits.
 const LAYER1_FINGERPRINT_GOLDEN: &str = "\
-pkg-db-q4a-postgres-failed-commit 68c5bc69b7fddf19
-pkg-db-q4a-postgres-failed-rollback f868e4504f7eaf8b
-pkg-db-q4a-postgres-implicit-rollback ea766a4153c4606d
-pkg-db-q4a-postgres-option-preflight 83531e565bf8c3cc
-pkg-db-q4a-postgres-prepared-transactions de8a0a78d62eac92
-pkg-db-q4a-sqlite-bind-recovery d08abb4d943b5a08
-pkg-db-q4a-sqlite-cleanup-poison 6030d2771fd80517
-pkg-db-q4a-sqlite-prepared-reuse e232dfbddce30d39
-pkg-db-q4a-sqlite-transactions e13ddda111625b6f
-pkg-db-q4a-sqlite-unsupported-shape 2e8f1a1f6b2de15f
+pkg-db-q4a-postgres-failed-commit 570fa64d1c84ea29
+pkg-db-q4a-postgres-failed-rollback f6db834d0c05f47f
+pkg-db-q4a-postgres-implicit-rollback 72d27284639260b5
+pkg-db-q4a-postgres-option-preflight e03c9b5a568fbf17
+pkg-db-q4a-postgres-prepared-transactions 78cdb1f4270329f4
+pkg-db-q4a-sqlite-bind-recovery 0e0e7109009f13b7
+pkg-db-q4a-sqlite-cleanup-poison 3d212209510658e9
+pkg-db-q4a-sqlite-prepared-reuse 2aa0d97ef18d963f
+pkg-db-q4a-sqlite-transactions 8ea927cc49e1eb93
+pkg-db-q4a-sqlite-unsupported-shape 5f6072f8905b4bc3
 ";
 
 #[test]

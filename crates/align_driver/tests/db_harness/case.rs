@@ -21,6 +21,8 @@ pub enum RunnerKind {
     StaticDescriptors,
     /// Per-unit walk + a linked C fixture; the only pipeline that can substitute the libpq stub.
     PerUnitC,
+    /// Whole-program front end without static descriptors.
+    WholeProgram,
 }
 
 impl RunnerKind {
@@ -28,6 +30,7 @@ impl RunnerKind {
         match self {
             RunnerKind::StaticDescriptors => super::runner::RUNNER_STATIC_DESCRIPTORS,
             RunnerKind::PerUnitC => super::runner::RUNNER_PER_UNIT_C,
+            RunnerKind::WholeProgram => super::runner::RUNNER_WHOLE_PROGRAM,
         }
     }
 }
@@ -48,6 +51,9 @@ pub struct Case {
     /// (`common::fixture`) can still declare its cases as `const`.
     pub modules: fn() -> Vec<(&'static str, &'static str)>,
     pub main: &'static str,
+    /// Environment applied to the child. Part of the record, so it lands in the fingerprint: a
+    /// variable added or changed alters what the case exercises.
+    pub envs: &'static [(&'static str, &'static str)],
     pub expected_exit: i32,
     /// Native counter expectations asserted after a successful run, as `(name, value)`.
     ///
@@ -98,8 +104,27 @@ impl Case {
         }
         let layout = self.layout();
         let run = match self.runner {
-            RunnerKind::StaticDescriptors => run_static_descriptors(self.label, &layout),
-            RunnerKind::PerUnitC => run_per_unit_c(self.label, &layout),
+            RunnerKind::StaticDescriptors => {
+                assert!(
+                    self.envs.is_empty(),
+                    "`{}` declares a child environment, which only the whole-program runner \
+                     applies; the descriptor runner would silently drop it",
+                    self.label
+                );
+                run_static_descriptors(self.label, &layout)
+            }
+            RunnerKind::PerUnitC => {
+                assert!(
+                    self.envs.is_empty(),
+                    "`{}` declares a child environment, which only the whole-program runner \
+                     applies; the per-unit runner would silently drop it",
+                    self.label
+                );
+                run_per_unit_c(self.label, &layout)
+            }
+            RunnerKind::WholeProgram => {
+                super::runner::run_whole_program(self.label, &layout, self.envs)
+            }
         };
         run.expect_exit(self.expected_exit);
         if !self.expect_counters.is_empty() {
@@ -116,32 +141,29 @@ impl Case {
     /// native code and added modules, so they change what the case exercises exactly as a runner
     /// swap does.
     pub fn fingerprint(&self) -> CaseFingerprint {
+        let mut attributes: Vec<(String, String)> = vec![("needs".to_string(), self.needs.id().to_string())];
+        push_indexed(&mut attributes, "links", self.links.iter().map(|s| s.id.to_string()));
+        push_indexed(&mut attributes, "counters", self.counters.iter().map(|s| s.id.to_string()));
+        for (name, value) in self.expect_counters {
+            attributes.push((format!("expect_counter.{name}"), value.to_string()));
+        }
+        for (key, value) in self.envs {
+            attributes.push((format!("child_env.{key}"), (*value).to_string()));
+        }
         CaseFingerprint::new(self.label, self.runner.id())
             .files(&self.layout().test_owned_files())
-            .env(&[
-                ("links", &stub_ids(self.links)),
-                ("counters", &stub_ids(self.counters)),
-                ("needs", self.needs.id()),
-                ("expect_counters", &counter_ids(self.expect_counters)),
-            ])
+            .env_pairs(attributes)
             .expected_exit(self.expected_exit)
     }
 }
 
-/// Stable identity for a stub list, for the fingerprint.
-fn stub_ids(stubs: &[&'static Stub]) -> String {
-    stubs
-        .iter()
-        .map(|stub| stub.id)
-        .collect::<Vec<_>>()
-        .join("+")
-}
-
-/// Stable identity for a counter expectation list, for the fingerprint.
-fn counter_ids(pairs: &[(&'static str, i64)]) -> String {
-    pairs
-        .iter()
-        .map(|(name, value)| format!("{name}={value}"))
-        .collect::<Vec<_>>()
-        .join(",")
+/// Record a list attribute as one entry per element, so no join character can alias.
+fn push_indexed(
+    into: &mut Vec<(String, String)>,
+    name: &str,
+    values: impl Iterator<Item = String>,
+) {
+    for (index, value) in values.enumerate() {
+        into.push((format!("{name}.{index}"), value));
+    }
 }

@@ -2,64 +2,20 @@
 
 mod common;
 use common::*;
+mod db_harness;
+use db_harness::*;
 
-const DB: &str = include_str!("../../../apps/db/pkg/db.align");
-const SQLITE: &str = include_str!("../../../apps/db/pkg/db/sqlite.align");
-const POSTGRES: &str = include_str!("../../../apps/db/pkg/db/postgres.align");
-const INTERNAL: &str = include_str!("../../../apps/db/pkg/db/internal.align");
-const RESOURCE: &str = include_str!("../../../apps/db/pkg/db/internal/resource.align");
-const DESCRIPTOR: &str = include_str!("../../../apps/db/pkg/db/internal/descriptor.align");
-const INTERNAL_SQLITE: &str = include_str!("../../../apps/db/pkg/db/internal/sqlite.align");
-const INTERNAL_POSTGRES: &str = include_str!("../../../apps/db/pkg/db/internal/postgres.align");
-const POSTGRES_STUB: &str = include_str!("fixtures/pkg_db_q2_postgres_stub.c");
 
-fn package_files(main: &str) -> Vec<(&'static str, &str)> {
-    vec![
-        ("pkg/db.align", DB),
-        ("pkg/db/sqlite.align", SQLITE),
-        ("pkg/db/postgres.align", POSTGRES),
-        ("pkg/db/internal.align", INTERNAL),
-        ("pkg/db/internal/resource.align", RESOURCE),
-        ("pkg/db/internal/descriptor.align", DESCRIPTOR),
-        ("pkg/db/internal/sqlite.align", INTERNAL_SQLITE),
-        ("pkg/db/internal/postgres.align", INTERNAL_POSTGRES),
-        ("main.align", main),
-    ]
-}
 
-#[test]
-fn sqlite_connect_mir_retains_private_native_helpers() {
-    let main = r#"module main
-import pkg.db.sqlite
-
-fn main() -> i32 {
-  result := pkg.db.sqlite.connect(":memory:", [])
-  return match result { Ok(_) => 42, Err(_) => 1 }
-}
-"#;
-    let files = package_files(main);
-    let whole = whole_mir_multi("pkg-db-q2-sqlite-helper-whole", &files, "main.align");
-    assert!(whole.contains("fn pkg.db.sqlite$c_string("), "{whole}");
-    assert!(
-        whole.contains("call program pkg.db.sqlite$c_string("),
-        "{whole}"
-    );
-
-    let per_unit = build_per_unit_multi("pkg-db-q2-sqlite-helper-unit", &files, "main.align");
-    let sqlite = align_mir::print::program_to_string(&per_unit.unit("pkg.db.sqlite").mir);
-    assert!(sqlite.contains("fn pkg.db.sqlite$c_string("), "{sqlite}");
-    assert!(
-        sqlite.contains("call program pkg.db.sqlite$c_string("),
-        "{sqlite}"
-    );
-}
-
-#[test]
-fn sqlite_connect_configures_and_drops_one_native_connection() {
-    if !backend_available() {
-        return;
-    }
-    let main = r#"module main
+// ================================================================================================
+// Layer-1 migrated cases.
+//
+// Each is ONE record: the #[test] executes it and layer1_case_fingerprints_match_the_golden
+// hashes it, both through `Case`, so the pipeline, module set, child environment, and expected
+// exit cannot drift from what actually runs. Module constants are prefixed per case because two
+// different cases legitimately define a module named QUERY.
+// ================================================================================================
+const Q2_SQLITE_CONNECT_MAIN: &str = r#"module main
 import pkg.db.sqlite
 
 fn main() -> i32 {
@@ -76,22 +32,8 @@ fn main() -> i32 {
   }
 }
 "#;
-    let files = package_files(main);
-    let output = build_and_run_multi("pkg-db-q2-sqlite-connect", &files, "main.align");
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
 
-#[test]
-fn sqlite_connect_rejects_invalid_input_before_open() {
-    if !backend_available() {
-        return;
-    }
-    let main = r#"module main
+const Q2_SQLITE_INVALID_CONNECT_MAIN: &str = r#"module main
 import pkg.db
 import pkg.db.sqlite
 
@@ -119,22 +61,8 @@ fn main() -> i32 {
   return 1
 }
 "#;
-    let files = package_files(main);
-    let output = build_and_run_multi("pkg-db-q2-sqlite-invalid-connect", &files, "main.align");
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
 
-#[test]
-fn postgres_connect_rejects_embedded_nul_before_libpq() {
-    if !backend_available() {
-        return;
-    }
-    let main = r#"module main
+const Q2_POSTGRES_NUL_MAIN: &str = r#"module main
 import pkg.db
 import pkg.db.postgres
 
@@ -149,14 +77,735 @@ fn main() -> i32 {
   }
 }
 "#;
+
+const Q2_POSTGRES_NATIVE_SCALAR_COMMAND: &str = r#"module app.pg_command
+import pkg.db
+import pkg.db.postgres
+
+pub Params { value: i64 }
+
+pub fn command() -> pkg.db.command<Params> = pkg.db.postgres.command(
+  "UPDATE stub SET value = :value /* COMMAND_OK */",
+  [],
+  [pkg.db.postgres.CommandOption.ParameterType("value", "int8")],
+)
+
+pub fn row_command() -> pkg.db.command<Params> = pkg.db.postgres.command(
+  "SELECT :value AS value /* ROW_COMMAND */",
+  [],
+  [pkg.db.postgres.CommandOption.ParameterType("value", "int8")],
+)
+
+pub fn malformed_affected() -> pkg.db.command<Params> = pkg.db.postgres.command(
+  "UPDATE stub SET value = :value /* COMMAND_OK AFFECTED_MALFORMED */",
+  [],
+  [pkg.db.postgres.CommandOption.ParameterType("value", "int8")],
+)
+"#;
+
+const Q2_POSTGRES_NATIVE_SCALAR_QUERY: &str = r#"module app.pg_query
+import pkg.db
+import pkg.db.postgres
+
+pub Params { value: i64 }
+pub Row { value: i64 }
+
+pub fn one() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
+  "SELECT CAST(:value AS BIGINT) AS value",
+  [],
+  [pkg.db.postgres.QueryOption.ParameterType("value", "int8")],
+)
+
+pub fn zero() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
+  "SELECT CAST(:value AS BIGINT) AS value /* ZERO_ROWS */",
+  [],
+  [pkg.db.postgres.QueryOption.ParameterType("value", "int8")],
+)
+
+pub fn bad_first() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
+  "SELECT CAST(:value AS BIGINT) AS value /* BAD_FIRST */",
+  [],
+  [pkg.db.postgres.QueryOption.ParameterType("value", "int8")],
+)
+
+pub fn valid_first() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
+  "SELECT CAST(:value AS BIGINT) AS value /* VALID_FIRST */",
+  [],
+  [pkg.db.postgres.QueryOption.ParameterType("value", "int8")],
+)
+
+pub fn constraint() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
+  "SELECT CAST(:value AS BIGINT) AS value /* NATIVE_CONSTRAINT */",
+  [],
+  [pkg.db.postgres.QueryOption.ParameterType("value", "int8")],
+)
+
+pub fn serialization() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
+  "SELECT CAST(:value AS BIGINT) AS value /* NATIVE_SERIALIZATION */",
+  [],
+  [pkg.db.postgres.QueryOption.ParameterType("value", "int8")],
+)
+
+pub fn deadlock() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
+  "SELECT CAST(:value AS BIGINT) AS value /* NATIVE_DEADLOCK */",
+  [],
+  [pkg.db.postgres.QueryOption.ParameterType("value", "int8")],
+)
+
+pub fn cancelled() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
+  "SELECT CAST(:value AS BIGINT) AS value /* NATIVE_CANCELLED */",
+  [],
+  [pkg.db.postgres.QueryOption.ParameterType("value", "int8")],
+)
+
+pub fn null_result() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
+  "SELECT CAST(:value AS BIGINT) AS value /* NULL_RESULT */",
+  [],
+  [pkg.db.postgres.QueryOption.ParameterType("value", "int8")],
+)
+"#;
+
+const Q2_POSTGRES_NATIVE_SCALAR_MAIN: &str = r#"module main
+import pkg.db
+import pkg.db.postgres
+import app.pg_command
+import app.pg_query
+
+extern "C" {
+  fn align_pg_reset()
+  fn align_pg_connect_calls() -> i32
+  fn align_pg_finish_calls() -> i32
+  fn align_pg_execute_calls() -> i32
+  fn align_pg_clear_calls() -> i32
+  fn align_pg_protocol_ok() -> i32
+  fn align_pg_last_timeout() -> i32
+}
+
+fn exercise() -> i32 {
+  unsafe { align_pg_reset() }
+  connected := pkg.db.postgres.connect("postgresql://stub/db", [
+    pkg.db.postgres.ConnectOption.ApplicationName("align-q2"),
+    pkg.db.postgres.ConnectOption.ConnectTimeoutNs(1),
+    pkg.db.postgres.ConnectOption.Parameter("options", "-c statement_timeout=20"),
+  ])
+  return match connected {
+    Err(_) => 1
+    Ok(connection) => {
+      target := pkg.db.exec_conn(connection)
+      statement := app.pg_command.command()
+      command := pkg.db.postgres.execute_native(
+        target,
+        statement,
+        app.pg_command.Params { value: 7 },
+        [],
+        [],
+      )
+      command_ok := match command {
+        Ok(detail) => match detail.rows_affected { Some(value) => value == 2, None => false }
+        Err(_) => false
+      }
+      arena out {
+        selected := pkg.db.postgres.one_native(
+          target, app.pg_query.one(), app.pg_query.Params { value: 42 }, out, [], [],
+        )
+        selected_ok := match selected { Ok(row) => row.value == 42, Err(_) => false }
+        zero := pkg.db.postgres.one_native(
+          target, app.pg_query.zero(), app.pg_query.Params { value: 1 }, out, [], [],
+        )
+        zero_ok := match zero {
+          Err(error) => match error {
+            Cardinality(detail) => detail.observed_at_least == 0
+            _ => false
+          }
+          Ok(_) => false
+        }
+        bad_first := pkg.db.postgres.one_native(
+          target, app.pg_query.bad_first(), app.pg_query.Params { value: 5 }, out, [], [],
+        )
+        bad_first_ok := match bad_first {
+          Err(error) => match error { Decode(_) => true, _ => false }
+          Ok(_) => false
+        }
+        valid_first := pkg.db.postgres.one_native(
+          target, app.pg_query.valid_first(), app.pg_query.Params { value: 5 }, out, [], [],
+        )
+        valid_first_ok := match valid_first {
+          Err(error) => match error {
+            Cardinality(detail) => detail.observed_at_least == 2
+            _ => false
+          }
+          Ok(_) => false
+        }
+        row_command := pkg.db.postgres.execute_native(
+          target,
+          app.pg_command.row_command(),
+          app.pg_command.Params { value: 9 },
+          [],
+          [],
+        )
+        row_command_ok := match row_command {
+          Err(error) => match error {
+            InvalidQuery(contract) => contract.item == "db.command.row"
+            _ => false
+          }
+          Ok(_) => false
+        }
+        malformed_affected := pkg.db.postgres.execute_native(
+          target,
+          app.pg_command.malformed_affected(),
+          app.pg_command.Params { value: 9 },
+          [],
+          [],
+        )
+        malformed_affected_ok := match malformed_affected {
+          Err(error) => match error {
+            Native(native) => native.message == "stub execution failure"
+              && match native.sqlstate { Some(state) => state == "XX000", None => false }
+              && match native.detail { Some(detail) => detail == "stub detail", None => false }
+            _ => false
+          }
+          Ok(_) => false
+        }
+        constraint := pkg.db.postgres.one_native(
+          target, app.pg_query.constraint(), app.pg_query.Params { value: 1 }, out, [], [],
+        )
+        constraint_ok := match constraint {
+          Err(error) => match error {
+            Constraint(native) => match native.constraint {
+              Some(name) => name == "stub_constraint"
+              None => false
+            }
+            _ => false
+          }
+          Ok(_) => false
+        }
+        serialization := pkg.db.postgres.one_native(
+          target, app.pg_query.serialization(), app.pg_query.Params { value: 1 }, out, [], [],
+        )
+        serialization_ok := match serialization {
+          Err(error) => match error { Serialization(_) => true, _ => false }
+          Ok(_) => false
+        }
+        deadlock := pkg.db.postgres.one_native(
+          target, app.pg_query.deadlock(), app.pg_query.Params { value: 1 }, out, [], [],
+        )
+        deadlock_ok := match deadlock {
+          Err(error) => match error { Deadlock(_) => true, _ => false }
+          Ok(_) => false
+        }
+        cancelled := pkg.db.postgres.one_native(
+          target, app.pg_query.cancelled(), app.pg_query.Params { value: 1 }, out, [], [],
+        )
+        cancelled_ok := match cancelled {
+          Err(error) => match error { Cancelled(_) => true, _ => false }
+          Ok(_) => false
+        }
+        null_result := pkg.db.postgres.one_native(
+          target, app.pg_query.null_result(), app.pg_query.Params { value: 1 }, out, [], [],
+        )
+        null_result_ok := match null_result {
+          Err(error) => match error {
+            Connection(native) => native.message == "stub connection failure"
+            _ => false
+          }
+          Ok(_) => false
+        }
+        native_calls_ok := unsafe {
+          align_pg_connect_calls() == 1 && align_pg_execute_calls() == 12
+            && align_pg_clear_calls() == 11 && align_pg_protocol_ok() == 1
+            && align_pg_last_timeout() == 2 && align_pg_finish_calls() == 0
+        }
+        if command_ok && selected_ok && zero_ok && bad_first_ok && valid_first_ok
+          && row_command_ok && malformed_affected_ok && constraint_ok && serialization_ok
+          && deadlock_ok && cancelled_ok && null_result_ok && native_calls_ok { 42 } else { 2 }
+      }
+    }
+  }
+}
+
+fn main() -> i32 {
+  result := exercise()
+  if result != 42 { return result }
+  return unsafe { if align_pg_finish_calls() == 1 { 42 } else { 3 } }
+}
+"#;
+
+const Q2_POSTGRES_CONNECT_OPTIONS_MAIN: &str = r#"module main
+import pkg.db
+import pkg.db.postgres
+
+extern "C" {
+  fn align_pg_reset()
+  fn align_pg_connect_calls() -> i32
+  fn align_pg_finish_calls() -> i32
+  fn align_pg_encoding_calls() -> i32
+  fn align_pg_last_timeout() -> i32
+}
+
+fn rejected(url: str, options: slice<pkg.db.postgres.ConnectOption>, item: str) -> bool {
+  unsafe { align_pg_reset() }
+  result := pkg.db.postgres.connect(url, options)
+  error_ok := match result {
+    Err(error) => match error {
+      Unsupported(contract) => contract.item == item
+      Encode(contract) => contract.item == item
+      _ => false
+    }
+    Ok(_) => false
+  }
+  return unsafe { error_ok && align_pg_connect_calls() == 0 && align_pg_finish_calls() == 0 }
+}
+
+fn opens_with_timeout(ns: i64) -> bool {
+  result := pkg.db.postgres.connect(
+    "postgresql://stub/db",
+    [pkg.db.postgres.ConnectOption.ConnectTimeoutNs(ns)],
+  )
+  return match result { Ok(_) => true, Err(_) => false }
+}
+
+fn timeout_case(ns: i64, expected_seconds: i32) -> bool {
+  unsafe { align_pg_reset() }
+  connected := opens_with_timeout(ns)
+  return unsafe {
+    connected && align_pg_connect_calls() == 1 && align_pg_finish_calls() == 1
+      && align_pg_encoding_calls() == 1 && align_pg_last_timeout() == expected_seconds
+  }
+}
+
+fn connection_failures_close_in_status_order() -> bool {
+  unsafe { align_pg_reset() }
+  bad := pkg.db.postgres.connect("postgresql://stub/bad-connection", [])
+  bad_ok := match bad {
+    Err(error) => match error {
+      Connection(native) => native.message == "stub connection failure"
+      _ => false
+    }
+    Ok(_) => false
+  }
+  bad_counts := unsafe {
+    align_pg_connect_calls() == 1 && align_pg_finish_calls() == 1
+      && align_pg_encoding_calls() == 0
+  }
+  unsafe { align_pg_reset() }
+  encoding := pkg.db.postgres.connect("postgresql://stub/bad-encoding", [])
+  encoding_ok := match encoding {
+    Err(error) => match error {
+      Unsupported(contract) => contract.item == "postgres.connection.client_encoding"
+      _ => false
+    }
+    Ok(_) => false
+  }
+  encoding_counts := unsafe {
+    align_pg_connect_calls() == 1 && align_pg_finish_calls() == 1
+      && align_pg_encoding_calls() == 1
+  }
+  return bad_ok && bad_counts && encoding_ok && encoding_counts
+}
+
+fn main() -> i32 {
+  invalid_timeout := rejected(
+    "postgresql://stub/db",
+    [pkg.db.postgres.ConnectOption.ConnectTimeoutNs(0)],
+    "postgres.connect.connect_timeout_ns",
+  )
+  overflow_timeout := rejected(
+    "postgresql://stub/db",
+    [pkg.db.postgres.ConnectOption.ConnectTimeoutNs(2147483647000000001)],
+    "postgres.connect.connect_timeout_ns",
+  )
+  duplicate := rejected(
+    "postgresql://stub/db",
+    [
+      pkg.db.postgres.ConnectOption.ApplicationName("one"),
+      pkg.db.postgres.ConnectOption.ApplicationName("two"),
+    ],
+    "postgres.connect.parameter",
+  )
+  url_collision := rejected(
+    "postgresql://stub/db?application_name=url-app",
+    [pkg.db.postgres.ConnectOption.ApplicationName("option-app")],
+    "postgres.connect.parameter",
+  )
+  direct_encoding := rejected(
+    "postgresql://stub/db?client_encoding=LATIN1",
+    [],
+    "postgres.connection.client_encoding",
+  )
+  option_encoding_a := rejected(
+    "postgresql://stub/db",
+    [pkg.db.postgres.ConnectOption.Parameter("options", "-c client_encoding=LATIN1")],
+    "postgres.connection.client_encoding",
+  )
+  option_encoding_b := rejected(
+    "postgresql://stub/db",
+    [pkg.db.postgres.ConnectOption.Parameter("options", "-cCLIENT-ENCODING=LATIN1")],
+    "postgres.connection.client_encoding",
+  )
+  option_encoding_c := rejected(
+    "postgresql://stub/db",
+    [pkg.db.postgres.ConnectOption.Parameter("options", "--CLIENT_ENCODING=LATIN1")],
+    "postgres.connection.client_encoding",
+  )
+  malformed_c := rejected(
+    "postgresql://stub/db",
+    [pkg.db.postgres.ConnectOption.Parameter("options", "-c")],
+    "postgres.connect.options",
+  )
+  malformed_escape := rejected(
+    "postgresql://stub/db",
+    [pkg.db.postgres.ConnectOption.Parameter("options", "statement_timeout=20\\")],
+    "postgres.connect.options",
+  )
+  timeout_one := timeout_case(1, 2)
+  timeout_second := timeout_case(1000000000, 2)
+  timeout_two := timeout_case(2000000000, 2)
+  timeout_three := timeout_case(2000000001, 3)
+  if !invalid_timeout { return 10 }
+  if !overflow_timeout { return 11 }
+  if !duplicate { return 12 }
+  if !url_collision { return 13 }
+  if !direct_encoding { return 14 }
+  if !option_encoding_a { return 15 }
+  if !option_encoding_b { return 16 }
+  if !option_encoding_c { return 17 }
+  if !malformed_c { return 18 }
+  if !malformed_escape { return 19 }
+  if !timeout_one { return 20 }
+  if !timeout_second { return 22 }
+  if !timeout_two { return 23 }
+  if !timeout_three { return 24 }
+  if !connection_failures_close_in_status_order() { return 21 }
+  return 42
+}
+"#;
+
+const Q2_POSTGRES_BYTEA_CODEC: &str = r#"module pkg.db.codec_test
+import pkg.db.internal.postgres
+
+fn byte_at(pointer: raw, offset: i64) -> u8 {
+  unsafe { return raw.load(pointer, offset) }
+}
+
+pub fn run() -> i32 {
+  mut input := buffer(4)
+  input.put_u8(0)
+  input.put_u8(15)
+  input.put_u8(16)
+  input.put_u8(255)
+  bytes := input.bytes()
+  text := pkg.db.internal.postgres.encode_bytea_text(bytes)
+  binary := pkg.db.internal.postgres.encode_bytea_binary(bytes)
+  unsafe {
+    text_ok := pkg.db.internal.postgres.bytea_text_length(bytes) == 10
+      && byte_at(text, 0) == 92
+      && byte_at(text, 1) == 120
+      && byte_at(text, 2) == 48
+      && byte_at(text, 3) == 48
+      && byte_at(text, 4) == 48
+      && byte_at(text, 5) == 102
+      && byte_at(text, 6) == 49
+      && byte_at(text, 7) == 48
+      && byte_at(text, 8) == 102
+      && byte_at(text, 9) == 102
+      && byte_at(text, 10) == 0
+    binary_ok := pkg.db.internal.postgres.bytea_binary_length(bytes) == 4
+      && byte_at(binary, 0) == 0
+      && byte_at(binary, 1) == 15
+      && byte_at(binary, 2) == 16
+      && byte_at(binary, 3) == 255
+      && byte_at(binary, 4) == 0
+    pkg.db.internal.postgres.free_bytea_buffer(text)
+    pkg.db.internal.postgres.free_bytea_buffer(binary)
+    if text_ok && binary_ok { return 42 }
+    return 1
+  }
+}
+
+"#;
+
+const Q2_POSTGRES_BYTEA_MAIN: &str = r#"module main
+import pkg.db.codec_test
+
+fn main() -> i32 = pkg.db.codec_test.run()
+"#;
+
+const Q2_COMMON_POSTGRES_QUERY: &str = r#"module app.common_pg
+import pkg.db
+import pkg.db.postgres
+
+pub Params { value: i64 }
+pub Row { value: i64 }
+
+pub fn command() -> pkg.db.command<Params> = pkg.db.postgres.command(
+  "UPDATE stub SET value = :value /* COMMAND_OK */",
+  [],
+  [pkg.db.postgres.CommandOption.ParameterType("value", "int8")],
+)
+
+pub fn query() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
+  "SELECT CAST(:value AS BIGINT) AS value",
+  [],
+  [pkg.db.postgres.QueryOption.ParameterType("value", "int8")],
+)
+"#;
+
+const Q2_COMMON_POSTGRES_MAIN: &str = r#"module main
+import pkg.db
+import pkg.db.postgres
+import app.common_pg
+
+extern "C" {
+  fn align_pg_reset()
+  fn align_pg_connect_calls() -> i32
+  fn align_pg_execute_calls() -> i32
+  fn align_pg_clear_calls() -> i32
+}
+
+fn main() -> i32 {
+  unsafe { align_pg_reset() }
+  connected := pkg.db.postgres.connect("postgresql://stub/db", [])
+  return match connected {
+    Err(_) => 1
+    Ok(connection) => {
+      target := pkg.db.exec_conn(connection)
+      command := pkg.db.execute(
+        target,
+        app.common_pg.command(),
+        app.common_pg.Params { value: 7 },
+        [],
+      )
+      command_ok := match command {
+        Ok(result) => match result.rows_affected { Some(value) => value == 2, None => false }
+        Err(_) => false
+      }
+      arena out {
+        selected := pkg.db.one(
+          target,
+          app.common_pg.query(),
+          app.common_pg.Params { value: 42 },
+          out,
+          [],
+        )
+        selected_ok := match selected { Ok(row) => row.value == 42, Err(_) => false }
+        native_ok := unsafe {
+          align_pg_connect_calls() == 1 && align_pg_execute_calls() == 2
+            && align_pg_clear_calls() == 2
+        }
+        if command_ok && selected_ok && native_ok { 42 } else { 2 }
+      }
+    }
+  }
+}
+"#;
+
+const Q2_INHERITED_ENVIRONMENT_MAIN: &str = r#"module main
+import std.env
+import pkg.db
+import pkg.db.sqlite
+import pkg.db.postgres
+
+fn main() -> i32 {
+  return match env.get("ALIGN_DB_Q2_INHERITED") {
+    Some(value) => if value == "inherited-value" { 42 } else { 2 }
+    None => 1
+  }
+}
+"#;
+
+const CASE_SQLITE_CONNECT: Case = Case {
+    label: "pkg-db-q2-sqlite-connect",
+    runner: RunnerKind::WholeProgram,
+    needs: Needs::Backend,
+    links: &[],
+    counters: &[],
+    modules: q2_modules,
+    main: Q2_SQLITE_CONNECT_MAIN,
+    envs: &[],
+    expected_exit: 42,
+    expect_counters: &[],
+};
+
+const CASE_SQLITE_INVALID_CONNECT: Case = Case {
+    label: "pkg-db-q2-sqlite-invalid-connect",
+    runner: RunnerKind::WholeProgram,
+    needs: Needs::Backend,
+    links: &[],
+    counters: &[],
+    modules: q2_modules,
+    main: Q2_SQLITE_INVALID_CONNECT_MAIN,
+    envs: &[],
+    expected_exit: 42,
+    expect_counters: &[],
+};
+
+const CASE_POSTGRES_NUL: Case = Case {
+    label: "pkg-db-q2-postgres-nul",
+    runner: RunnerKind::WholeProgram,
+    needs: Needs::Backend,
+    links: &[],
+    counters: &[],
+    modules: q2_modules,
+    main: Q2_POSTGRES_NUL_MAIN,
+    envs: &[],
+    expected_exit: 42,
+    expect_counters: &[],
+};
+
+fn q2_postgres_native_scalar_modules() -> Vec<(&'static str, &'static str)> {
+    let mut modules = q2_modules();
+    modules.push(("app/pg_command.align", Q2_POSTGRES_NATIVE_SCALAR_COMMAND));
+    modules.push(("app/pg_query.align", Q2_POSTGRES_NATIVE_SCALAR_QUERY));
+    modules
+}
+
+const CASE_POSTGRES_NATIVE_SCALAR: Case = Case {
+    label: "pkg-db-q2-postgres-native-scalar",
+    runner: RunnerKind::PerUnitC,
+    needs: Needs::BackendAndCc,
+    links: &[&PG],
+    counters: &[],
+    modules: q2_postgres_native_scalar_modules,
+    main: Q2_POSTGRES_NATIVE_SCALAR_MAIN,
+    envs: &[],
+    expected_exit: 42,
+    expect_counters: &[],
+};
+
+const CASE_POSTGRES_CONNECT_OPTIONS: Case = Case {
+    label: "pkg-db-q2-postgres-connect-options",
+    runner: RunnerKind::PerUnitC,
+    needs: Needs::BackendAndCc,
+    links: &[&PG],
+    counters: &[],
+    modules: q2_modules,
+    main: Q2_POSTGRES_CONNECT_OPTIONS_MAIN,
+    envs: &[],
+    expected_exit: 42,
+    expect_counters: &[],
+};
+
+fn q2_postgres_bytea_modules() -> Vec<(&'static str, &'static str)> {
+    let mut modules = q2_modules();
+    modules.push(("pkg/db/codec_test.align", Q2_POSTGRES_BYTEA_CODEC));
+    modules
+}
+
+const CASE_POSTGRES_BYTEA: Case = Case {
+    label: "pkg-db-q2-postgres-bytea",
+    runner: RunnerKind::WholeProgram,
+    needs: Needs::Backend,
+    links: &[],
+    counters: &[],
+    modules: q2_postgres_bytea_modules,
+    main: Q2_POSTGRES_BYTEA_MAIN,
+    envs: &[],
+    expected_exit: 42,
+    expect_counters: &[],
+};
+
+fn q2_common_postgres_modules() -> Vec<(&'static str, &'static str)> {
+    let mut modules = q2_modules();
+    modules.push(("app/common_pg.align", Q2_COMMON_POSTGRES_QUERY));
+    modules
+}
+
+const CASE_COMMON_POSTGRES: Case = Case {
+    label: "pkg-db-q2-common-postgres",
+    runner: RunnerKind::PerUnitC,
+    needs: Needs::BackendAndCc,
+    links: &[&PG],
+    counters: &[],
+    modules: q2_common_postgres_modules,
+    main: Q2_COMMON_POSTGRES_MAIN,
+    envs: &[],
+    expected_exit: 42,
+    expect_counters: &[],
+};
+
+const CASE_INHERITED_ENVIRONMENT: Case = Case {
+    label: "pkg-db-q2-inherited-environment",
+    runner: RunnerKind::WholeProgram,
+    needs: Needs::Backend,
+    links: &[],
+    counters: &[],
+    modules: q2_modules,
+    main: Q2_INHERITED_ENVIRONMENT_MAIN,
+    envs: &[("ALIGN_DB_Q2_INHERITED", "inherited-value")],
+    expected_exit: 42,
+    expect_counters: &[],
+};
+
+/// Every Layer-1 case in this suite, for the fingerprint golden.
+const LAYER1_CASES: &[&Case] = &[
+    &CASE_SQLITE_CONNECT,
+    &CASE_SQLITE_INVALID_CONNECT,
+    &CASE_POSTGRES_NUL,
+    &CASE_POSTGRES_NATIVE_SCALAR,
+    &CASE_POSTGRES_CONNECT_OPTIONS,
+    &CASE_POSTGRES_BYTEA,
+    &CASE_COMMON_POSTGRES,
+    &CASE_INHERITED_ENVIRONMENT,
+];
+
+/// The shared suite module list — deliberately empty.
+///
+/// q2's owners exercise the package surface directly, and the minimality of each program is part of
+/// what it proves (see 16-test-policy.md, "Build-once/run-many is not applied to q2"). The few
+/// cases that need an app module add their own on top of this.
+fn q2_modules() -> Vec<(&'static str, &'static str)> {
+    Vec::new()
+}
+
+/// The layout the non-`Case` owners use, derived from the same module list the cases use.
+fn package_files(main: &str) -> Layout {
+    let mut layout = Layout::new();
+    for (path, source) in q2_modules() {
+        layout = layout.module(path, source);
+    }
+    layout.main(main)
+}
+
+#[test]
+fn sqlite_connect_mir_retains_private_native_helpers() {
+    let main = r#"module main
+import pkg.db.sqlite
+
+fn main() -> i32 {
+  result := pkg.db.sqlite.connect(":memory:", [])
+  return match result { Ok(_) => 42, Err(_) => 1 }
+}
+"#;
     let files = package_files(main);
-    let output = build_and_run_multi("pkg-db-q2-postgres-nul", &files, "main.align");
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+    let whole = whole_mir_multi("pkg-db-q2-sqlite-helper-whole", &files.files(), "main.align");
+    assert!(whole.contains("fn pkg.db.sqlite$c_string("), "{whole}");
+    assert!(
+        whole.contains("call program pkg.db.sqlite$c_string("),
+        "{whole}"
     );
+
+    let per_unit = build_per_unit_multi("pkg-db-q2-sqlite-helper-unit", &files.files(), "main.align");
+    let sqlite = align_mir::print::program_to_string(&per_unit.unit("pkg.db.sqlite").mir);
+    assert!(sqlite.contains("fn pkg.db.sqlite$c_string("), "{sqlite}");
+    assert!(
+        sqlite.contains("call program pkg.db.sqlite$c_string("),
+        "{sqlite}"
+    );
+}
+
+#[test]
+fn sqlite_connect_configures_and_drops_one_native_connection() {
+    CASE_SQLITE_CONNECT.run();
+}
+
+#[test]
+fn sqlite_connect_rejects_invalid_input_before_open() {
+    CASE_SQLITE_INVALID_CONNECT.run();
+}
+
+#[test]
+fn postgres_connect_rejects_embedded_nul_before_libpq() {
+    CASE_POSTGRES_NUL.run();
 }
 
 #[test]
@@ -487,14 +1136,14 @@ fn main() -> i32 {
   }
 }
 "#;
-    let mut files = package_files(main);
-    files.push(("app/setup.align", SETUP));
-    files.push(("app/read.align", READ));
-    files.push(("app/items.align", ITEMS));
-    files.push(("app/malformed.align", MALFORMED));
-    files.push(("app/timeout.align", TIMEOUT));
-    files.push(("app/invalid.align", INVALID));
-    let built = build_per_unit_multi("pkg-db-q2-sqlite-native-scalar", &files, "main.align");
+    let files = package_files(main)
+        .module("app/setup.align", SETUP)
+        .module("app/read.align", READ)
+        .module("app/items.align", ITEMS)
+        .module("app/malformed.align", MALFORMED)
+        .module("app/timeout.align", TIMEOUT)
+        .module("app/invalid.align", INVALID);
+    let built = build_per_unit_multi("pkg-db-q2-sqlite-native-scalar", &files.files(), "main.align");
     let main_mir = align_mir::print::program_to_string(&built.unit("main").mir);
     assert!(
         main_mir.contains("fn main("),
@@ -530,444 +1179,12 @@ fn main() -> i32 {
 
 #[test]
 fn postgres_native_command_and_one_own_buffered_results() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
-    const COMMAND: &str = r#"module app.pg_command
-import pkg.db
-import pkg.db.postgres
-
-pub Params { value: i64 }
-
-pub fn command() -> pkg.db.command<Params> = pkg.db.postgres.command(
-  "UPDATE stub SET value = :value /* COMMAND_OK */",
-  [],
-  [pkg.db.postgres.CommandOption.ParameterType("value", "int8")],
-)
-
-pub fn row_command() -> pkg.db.command<Params> = pkg.db.postgres.command(
-  "SELECT :value AS value /* ROW_COMMAND */",
-  [],
-  [pkg.db.postgres.CommandOption.ParameterType("value", "int8")],
-)
-
-pub fn malformed_affected() -> pkg.db.command<Params> = pkg.db.postgres.command(
-  "UPDATE stub SET value = :value /* COMMAND_OK AFFECTED_MALFORMED */",
-  [],
-  [pkg.db.postgres.CommandOption.ParameterType("value", "int8")],
-)
-"#;
-    const QUERY: &str = r#"module app.pg_query
-import pkg.db
-import pkg.db.postgres
-
-pub Params { value: i64 }
-pub Row { value: i64 }
-
-pub fn one() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
-  "SELECT CAST(:value AS BIGINT) AS value",
-  [],
-  [pkg.db.postgres.QueryOption.ParameterType("value", "int8")],
-)
-
-pub fn zero() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
-  "SELECT CAST(:value AS BIGINT) AS value /* ZERO_ROWS */",
-  [],
-  [pkg.db.postgres.QueryOption.ParameterType("value", "int8")],
-)
-
-pub fn bad_first() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
-  "SELECT CAST(:value AS BIGINT) AS value /* BAD_FIRST */",
-  [],
-  [pkg.db.postgres.QueryOption.ParameterType("value", "int8")],
-)
-
-pub fn valid_first() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
-  "SELECT CAST(:value AS BIGINT) AS value /* VALID_FIRST */",
-  [],
-  [pkg.db.postgres.QueryOption.ParameterType("value", "int8")],
-)
-
-pub fn constraint() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
-  "SELECT CAST(:value AS BIGINT) AS value /* NATIVE_CONSTRAINT */",
-  [],
-  [pkg.db.postgres.QueryOption.ParameterType("value", "int8")],
-)
-
-pub fn serialization() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
-  "SELECT CAST(:value AS BIGINT) AS value /* NATIVE_SERIALIZATION */",
-  [],
-  [pkg.db.postgres.QueryOption.ParameterType("value", "int8")],
-)
-
-pub fn deadlock() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
-  "SELECT CAST(:value AS BIGINT) AS value /* NATIVE_DEADLOCK */",
-  [],
-  [pkg.db.postgres.QueryOption.ParameterType("value", "int8")],
-)
-
-pub fn cancelled() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
-  "SELECT CAST(:value AS BIGINT) AS value /* NATIVE_CANCELLED */",
-  [],
-  [pkg.db.postgres.QueryOption.ParameterType("value", "int8")],
-)
-
-pub fn null_result() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
-  "SELECT CAST(:value AS BIGINT) AS value /* NULL_RESULT */",
-  [],
-  [pkg.db.postgres.QueryOption.ParameterType("value", "int8")],
-)
-"#;
-    let main = r#"module main
-import pkg.db
-import pkg.db.postgres
-import app.pg_command
-import app.pg_query
-
-extern "C" {
-  fn align_pg_reset()
-  fn align_pg_connect_calls() -> i32
-  fn align_pg_finish_calls() -> i32
-  fn align_pg_execute_calls() -> i32
-  fn align_pg_clear_calls() -> i32
-  fn align_pg_protocol_ok() -> i32
-  fn align_pg_last_timeout() -> i32
-}
-
-fn exercise() -> i32 {
-  unsafe { align_pg_reset() }
-  connected := pkg.db.postgres.connect("postgresql://stub/db", [
-    pkg.db.postgres.ConnectOption.ApplicationName("align-q2"),
-    pkg.db.postgres.ConnectOption.ConnectTimeoutNs(1),
-    pkg.db.postgres.ConnectOption.Parameter("options", "-c statement_timeout=20"),
-  ])
-  return match connected {
-    Err(_) => 1
-    Ok(connection) => {
-      target := pkg.db.exec_conn(connection)
-      statement := app.pg_command.command()
-      command := pkg.db.postgres.execute_native(
-        target,
-        statement,
-        app.pg_command.Params { value: 7 },
-        [],
-        [],
-      )
-      command_ok := match command {
-        Ok(detail) => match detail.rows_affected { Some(value) => value == 2, None => false }
-        Err(_) => false
-      }
-      arena out {
-        selected := pkg.db.postgres.one_native(
-          target, app.pg_query.one(), app.pg_query.Params { value: 42 }, out, [], [],
-        )
-        selected_ok := match selected { Ok(row) => row.value == 42, Err(_) => false }
-        zero := pkg.db.postgres.one_native(
-          target, app.pg_query.zero(), app.pg_query.Params { value: 1 }, out, [], [],
-        )
-        zero_ok := match zero {
-          Err(error) => match error {
-            Cardinality(detail) => detail.observed_at_least == 0
-            _ => false
-          }
-          Ok(_) => false
-        }
-        bad_first := pkg.db.postgres.one_native(
-          target, app.pg_query.bad_first(), app.pg_query.Params { value: 5 }, out, [], [],
-        )
-        bad_first_ok := match bad_first {
-          Err(error) => match error { Decode(_) => true, _ => false }
-          Ok(_) => false
-        }
-        valid_first := pkg.db.postgres.one_native(
-          target, app.pg_query.valid_first(), app.pg_query.Params { value: 5 }, out, [], [],
-        )
-        valid_first_ok := match valid_first {
-          Err(error) => match error {
-            Cardinality(detail) => detail.observed_at_least == 2
-            _ => false
-          }
-          Ok(_) => false
-        }
-        row_command := pkg.db.postgres.execute_native(
-          target,
-          app.pg_command.row_command(),
-          app.pg_command.Params { value: 9 },
-          [],
-          [],
-        )
-        row_command_ok := match row_command {
-          Err(error) => match error {
-            InvalidQuery(contract) => contract.item == "db.command.row"
-            _ => false
-          }
-          Ok(_) => false
-        }
-        malformed_affected := pkg.db.postgres.execute_native(
-          target,
-          app.pg_command.malformed_affected(),
-          app.pg_command.Params { value: 9 },
-          [],
-          [],
-        )
-        malformed_affected_ok := match malformed_affected {
-          Err(error) => match error {
-            Native(native) => native.message == "stub execution failure"
-              && match native.sqlstate { Some(state) => state == "XX000", None => false }
-              && match native.detail { Some(detail) => detail == "stub detail", None => false }
-            _ => false
-          }
-          Ok(_) => false
-        }
-        constraint := pkg.db.postgres.one_native(
-          target, app.pg_query.constraint(), app.pg_query.Params { value: 1 }, out, [], [],
-        )
-        constraint_ok := match constraint {
-          Err(error) => match error {
-            Constraint(native) => match native.constraint {
-              Some(name) => name == "stub_constraint"
-              None => false
-            }
-            _ => false
-          }
-          Ok(_) => false
-        }
-        serialization := pkg.db.postgres.one_native(
-          target, app.pg_query.serialization(), app.pg_query.Params { value: 1 }, out, [], [],
-        )
-        serialization_ok := match serialization {
-          Err(error) => match error { Serialization(_) => true, _ => false }
-          Ok(_) => false
-        }
-        deadlock := pkg.db.postgres.one_native(
-          target, app.pg_query.deadlock(), app.pg_query.Params { value: 1 }, out, [], [],
-        )
-        deadlock_ok := match deadlock {
-          Err(error) => match error { Deadlock(_) => true, _ => false }
-          Ok(_) => false
-        }
-        cancelled := pkg.db.postgres.one_native(
-          target, app.pg_query.cancelled(), app.pg_query.Params { value: 1 }, out, [], [],
-        )
-        cancelled_ok := match cancelled {
-          Err(error) => match error { Cancelled(_) => true, _ => false }
-          Ok(_) => false
-        }
-        null_result := pkg.db.postgres.one_native(
-          target, app.pg_query.null_result(), app.pg_query.Params { value: 1 }, out, [], [],
-        )
-        null_result_ok := match null_result {
-          Err(error) => match error {
-            Connection(native) => native.message == "stub connection failure"
-            _ => false
-          }
-          Ok(_) => false
-        }
-        native_calls_ok := unsafe {
-          align_pg_connect_calls() == 1 && align_pg_execute_calls() == 12
-            && align_pg_clear_calls() == 11 && align_pg_protocol_ok() == 1
-            && align_pg_last_timeout() == 2 && align_pg_finish_calls() == 0
-        }
-        if command_ok && selected_ok && zero_ok && bad_first_ok && valid_first_ok
-          && row_command_ok && malformed_affected_ok && constraint_ok && serialization_ok
-          && deadlock_ok && cancelled_ok && null_result_ok && native_calls_ok { 42 } else { 2 }
-      }
-    }
-  }
-}
-
-fn main() -> i32 {
-  result := exercise()
-  if result != 42 { return result }
-  return unsafe { if align_pg_finish_calls() == 1 { 42 } else { 3 } }
-}
-"#;
-    let mut files = package_files(main);
-    files.push(("app/pg_command.align", COMMAND));
-    files.push(("app/pg_query.align", QUERY));
-    let output = build_and_run_multi_with_c(
-        "pkg-db-q2-postgres-native-scalar",
-        &files,
-        "main.align",
-        POSTGRES_STUB,
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "stdout: {}; stderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    CASE_POSTGRES_NATIVE_SCALAR.run();
 }
 
 #[test]
 fn postgres_connect_options_validate_before_open_and_close_once() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
-    let main = r#"module main
-import pkg.db
-import pkg.db.postgres
-
-extern "C" {
-  fn align_pg_reset()
-  fn align_pg_connect_calls() -> i32
-  fn align_pg_finish_calls() -> i32
-  fn align_pg_encoding_calls() -> i32
-  fn align_pg_last_timeout() -> i32
-}
-
-fn rejected(url: str, options: slice<pkg.db.postgres.ConnectOption>, item: str) -> bool {
-  unsafe { align_pg_reset() }
-  result := pkg.db.postgres.connect(url, options)
-  error_ok := match result {
-    Err(error) => match error {
-      Unsupported(contract) => contract.item == item
-      Encode(contract) => contract.item == item
-      _ => false
-    }
-    Ok(_) => false
-  }
-  return unsafe { error_ok && align_pg_connect_calls() == 0 && align_pg_finish_calls() == 0 }
-}
-
-fn opens_with_timeout(ns: i64) -> bool {
-  result := pkg.db.postgres.connect(
-    "postgresql://stub/db",
-    [pkg.db.postgres.ConnectOption.ConnectTimeoutNs(ns)],
-  )
-  return match result { Ok(_) => true, Err(_) => false }
-}
-
-fn timeout_case(ns: i64, expected_seconds: i32) -> bool {
-  unsafe { align_pg_reset() }
-  connected := opens_with_timeout(ns)
-  return unsafe {
-    connected && align_pg_connect_calls() == 1 && align_pg_finish_calls() == 1
-      && align_pg_encoding_calls() == 1 && align_pg_last_timeout() == expected_seconds
-  }
-}
-
-fn connection_failures_close_in_status_order() -> bool {
-  unsafe { align_pg_reset() }
-  bad := pkg.db.postgres.connect("postgresql://stub/bad-connection", [])
-  bad_ok := match bad {
-    Err(error) => match error {
-      Connection(native) => native.message == "stub connection failure"
-      _ => false
-    }
-    Ok(_) => false
-  }
-  bad_counts := unsafe {
-    align_pg_connect_calls() == 1 && align_pg_finish_calls() == 1
-      && align_pg_encoding_calls() == 0
-  }
-  unsafe { align_pg_reset() }
-  encoding := pkg.db.postgres.connect("postgresql://stub/bad-encoding", [])
-  encoding_ok := match encoding {
-    Err(error) => match error {
-      Unsupported(contract) => contract.item == "postgres.connection.client_encoding"
-      _ => false
-    }
-    Ok(_) => false
-  }
-  encoding_counts := unsafe {
-    align_pg_connect_calls() == 1 && align_pg_finish_calls() == 1
-      && align_pg_encoding_calls() == 1
-  }
-  return bad_ok && bad_counts && encoding_ok && encoding_counts
-}
-
-fn main() -> i32 {
-  invalid_timeout := rejected(
-    "postgresql://stub/db",
-    [pkg.db.postgres.ConnectOption.ConnectTimeoutNs(0)],
-    "postgres.connect.connect_timeout_ns",
-  )
-  overflow_timeout := rejected(
-    "postgresql://stub/db",
-    [pkg.db.postgres.ConnectOption.ConnectTimeoutNs(2147483647000000001)],
-    "postgres.connect.connect_timeout_ns",
-  )
-  duplicate := rejected(
-    "postgresql://stub/db",
-    [
-      pkg.db.postgres.ConnectOption.ApplicationName("one"),
-      pkg.db.postgres.ConnectOption.ApplicationName("two"),
-    ],
-    "postgres.connect.parameter",
-  )
-  url_collision := rejected(
-    "postgresql://stub/db?application_name=url-app",
-    [pkg.db.postgres.ConnectOption.ApplicationName("option-app")],
-    "postgres.connect.parameter",
-  )
-  direct_encoding := rejected(
-    "postgresql://stub/db?client_encoding=LATIN1",
-    [],
-    "postgres.connection.client_encoding",
-  )
-  option_encoding_a := rejected(
-    "postgresql://stub/db",
-    [pkg.db.postgres.ConnectOption.Parameter("options", "-c client_encoding=LATIN1")],
-    "postgres.connection.client_encoding",
-  )
-  option_encoding_b := rejected(
-    "postgresql://stub/db",
-    [pkg.db.postgres.ConnectOption.Parameter("options", "-cCLIENT-ENCODING=LATIN1")],
-    "postgres.connection.client_encoding",
-  )
-  option_encoding_c := rejected(
-    "postgresql://stub/db",
-    [pkg.db.postgres.ConnectOption.Parameter("options", "--CLIENT_ENCODING=LATIN1")],
-    "postgres.connection.client_encoding",
-  )
-  malformed_c := rejected(
-    "postgresql://stub/db",
-    [pkg.db.postgres.ConnectOption.Parameter("options", "-c")],
-    "postgres.connect.options",
-  )
-  malformed_escape := rejected(
-    "postgresql://stub/db",
-    [pkg.db.postgres.ConnectOption.Parameter("options", "statement_timeout=20\\")],
-    "postgres.connect.options",
-  )
-  timeout_one := timeout_case(1, 2)
-  timeout_second := timeout_case(1000000000, 2)
-  timeout_two := timeout_case(2000000000, 2)
-  timeout_three := timeout_case(2000000001, 3)
-  if !invalid_timeout { return 10 }
-  if !overflow_timeout { return 11 }
-  if !duplicate { return 12 }
-  if !url_collision { return 13 }
-  if !direct_encoding { return 14 }
-  if !option_encoding_a { return 15 }
-  if !option_encoding_b { return 16 }
-  if !option_encoding_c { return 17 }
-  if !malformed_c { return 18 }
-  if !malformed_escape { return 19 }
-  if !timeout_one { return 20 }
-  if !timeout_second { return 22 }
-  if !timeout_two { return 23 }
-  if !timeout_three { return 24 }
-  if !connection_failures_close_in_status_order() { return 21 }
-  return 42
-}
-"#;
-    let files = package_files(main);
-    let output = build_and_run_multi_with_c(
-        "pkg-db-q2-postgres-connect-options",
-        &files,
-        "main.align",
-        POSTGRES_STUB,
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "stdout: {}; stderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    CASE_POSTGRES_CONNECT_OPTIONS.run();
 }
 
 #[test]
@@ -1051,12 +1268,12 @@ fn main() -> i32 {
 }
 
 "#;
-    let mut files = package_files(main);
-    files.push(("app/common_command.align", COMMAND));
-    files.push(("app/common_query.align", QUERY));
+    let files = package_files(main)
+        .module("app/common_command.align", COMMAND)
+        .module("app/common_query.align", QUERY);
     let whole = build_and_run_multi_with_static_descriptors(
         "pkg-db-q2-common-sqlite-whole",
-        &files,
+        &files.files(),
         "main.align",
     );
     assert_eq!(
@@ -1066,7 +1283,7 @@ fn main() -> i32 {
         String::from_utf8_lossy(&whole.stdout),
         String::from_utf8_lossy(&whole.stderr),
     );
-    let built = build_per_unit_multi("pkg-db-q2-common-sqlite", &files, "main.align");
+    let built = build_per_unit_multi("pkg-db-q2-common-sqlite", &files.files(), "main.align");
     let link_libs = built.link_libs_union();
     assert!(
         link_libs.iter().any(|linked| linked == "pq"),
@@ -1108,156 +1325,12 @@ fn main() -> i32 {
 
 #[test]
 fn postgres_bytea_codecs_preserve_text_and_binary_boundaries() {
-    if !backend_available() {
-        return;
-    }
-    const CODEC: &str = r#"module pkg.db.codec_test
-import pkg.db.internal.postgres
-
-fn byte_at(pointer: raw, offset: i64) -> u8 {
-  unsafe { return raw.load(pointer, offset) }
-}
-
-pub fn run() -> i32 {
-  mut input := buffer(4)
-  input.put_u8(0)
-  input.put_u8(15)
-  input.put_u8(16)
-  input.put_u8(255)
-  bytes := input.bytes()
-  text := pkg.db.internal.postgres.encode_bytea_text(bytes)
-  binary := pkg.db.internal.postgres.encode_bytea_binary(bytes)
-  unsafe {
-    text_ok := pkg.db.internal.postgres.bytea_text_length(bytes) == 10
-      && byte_at(text, 0) == 92
-      && byte_at(text, 1) == 120
-      && byte_at(text, 2) == 48
-      && byte_at(text, 3) == 48
-      && byte_at(text, 4) == 48
-      && byte_at(text, 5) == 102
-      && byte_at(text, 6) == 49
-      && byte_at(text, 7) == 48
-      && byte_at(text, 8) == 102
-      && byte_at(text, 9) == 102
-      && byte_at(text, 10) == 0
-    binary_ok := pkg.db.internal.postgres.bytea_binary_length(bytes) == 4
-      && byte_at(binary, 0) == 0
-      && byte_at(binary, 1) == 15
-      && byte_at(binary, 2) == 16
-      && byte_at(binary, 3) == 255
-      && byte_at(binary, 4) == 0
-    pkg.db.internal.postgres.free_bytea_buffer(text)
-    pkg.db.internal.postgres.free_bytea_buffer(binary)
-    if text_ok && binary_ok { return 42 }
-    return 1
-  }
-}
-
-"#;
-    let main = r#"module main
-import pkg.db.codec_test
-
-fn main() -> i32 = pkg.db.codec_test.run()
-"#;
-    let mut files = package_files(main);
-    files.push(("pkg/db/codec_test.align", CODEC));
-    let output = build_and_run_multi("pkg-db-q2-postgres-bytea", &files, "main.align");
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "stdout: {}; stderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    CASE_POSTGRES_BYTEA.run();
 }
 
 #[test]
 fn common_surface_dispatches_to_postgres_engine() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
-    const QUERY: &str = r#"module app.common_pg
-import pkg.db
-import pkg.db.postgres
-
-pub Params { value: i64 }
-pub Row { value: i64 }
-
-pub fn command() -> pkg.db.command<Params> = pkg.db.postgres.command(
-  "UPDATE stub SET value = :value /* COMMAND_OK */",
-  [],
-  [pkg.db.postgres.CommandOption.ParameterType("value", "int8")],
-)
-
-pub fn query() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
-  "SELECT CAST(:value AS BIGINT) AS value",
-  [],
-  [pkg.db.postgres.QueryOption.ParameterType("value", "int8")],
-)
-"#;
-    let main = r#"module main
-import pkg.db
-import pkg.db.postgres
-import app.common_pg
-
-extern "C" {
-  fn align_pg_reset()
-  fn align_pg_connect_calls() -> i32
-  fn align_pg_execute_calls() -> i32
-  fn align_pg_clear_calls() -> i32
-}
-
-fn main() -> i32 {
-  unsafe { align_pg_reset() }
-  connected := pkg.db.postgres.connect("postgresql://stub/db", [])
-  return match connected {
-    Err(_) => 1
-    Ok(connection) => {
-      target := pkg.db.exec_conn(connection)
-      command := pkg.db.execute(
-        target,
-        app.common_pg.command(),
-        app.common_pg.Params { value: 7 },
-        [],
-      )
-      command_ok := match command {
-        Ok(result) => match result.rows_affected { Some(value) => value == 2, None => false }
-        Err(_) => false
-      }
-      arena out {
-        selected := pkg.db.one(
-          target,
-          app.common_pg.query(),
-          app.common_pg.Params { value: 42 },
-          out,
-          [],
-        )
-        selected_ok := match selected { Ok(row) => row.value == 42, Err(_) => false }
-        native_ok := unsafe {
-          align_pg_connect_calls() == 1 && align_pg_execute_calls() == 2
-            && align_pg_clear_calls() == 2
-        }
-        if command_ok && selected_ok && native_ok { 42 } else { 2 }
-      }
-    }
-  }
-}
-"#;
-    let mut files = package_files(main);
-    files.push(("app/common_pg.align", QUERY));
-    let output = build_and_run_multi_with_c(
-        "pkg-db-q2-common-postgres",
-        &files,
-        "main.align",
-        POSTGRES_STUB,
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "stdout: {}; stderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    CASE_COMMON_POSTGRES.run();
 }
 
 #[test]
@@ -1275,35 +1348,7 @@ fn postgres_required_mode_requires_configuration() {
 
 #[test]
 fn inherited_environment_survives_pkg_db_link_closure() {
-    if !backend_available() {
-        return;
-    }
-    let main = r#"module main
-import std.env
-import pkg.db
-import pkg.db.sqlite
-import pkg.db.postgres
-
-fn main() -> i32 {
-  return match env.get("ALIGN_DB_Q2_INHERITED") {
-    Some(value) => if value == "inherited-value" { 42 } else { 2 }
-    None => 1
-  }
-}
-"#;
-    let output = build_and_run_multi_with_env(
-        "pkg-db-q2-inherited-environment",
-        &package_files(main),
-        "main.align",
-        &[("ALIGN_DB_Q2_INHERITED", "inherited-value")],
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "stdout: {}; stderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    CASE_INHERITED_ENVIRONMENT.run();
 }
 
 #[test]
@@ -1383,21 +1428,11 @@ fn main(args: array<str>) -> Result<(), Error> {
   return Ok(())
 }
 "#;
-    let files = [
-        ("pkg/db.align", DB),
-        ("pkg/db/sqlite.align", SQLITE),
-        ("pkg/db/postgres.align", POSTGRES),
-        ("pkg/db/internal.align", INTERNAL),
-        ("pkg/db/internal/resource.align", RESOURCE),
-        ("pkg/db/internal/descriptor.align", DESCRIPTOR),
-        ("pkg/db/internal/sqlite.align", INTERNAL_SQLITE),
-        ("pkg/db/internal/postgres.align", INTERNAL_POSTGRES),
-        ("app/portable_query.align", QUERY),
-        ("main.align", main),
-    ];
+    // The live case's own layout, through the same builder every other case uses.
+    let files = package_files(main).module("app/portable_query.align", QUERY);
     let output = build_and_run_multi_with_static_descriptors_args_with_env(
         "pkg-db-q2-required-postgres-portable",
-        &files,
+        &files.files(),
         "main.align",
         &[postgres_url.as_str()],
         &[],
@@ -1415,4 +1450,27 @@ fn main(args: array<str>) -> Result<(), Error> {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr),
     );
+}
+
+/// The Layer-1 migration's forward guard for this suite.
+///
+/// Regenerate ONLY with a reviewed reason, from the panic message this emits.
+const LAYER1_FINGERPRINT_GOLDEN: &str = "\
+pkg-db-q2-common-postgres a9428d3064bd4bbe
+pkg-db-q2-inherited-environment e683f9105f9dc29b
+pkg-db-q2-postgres-bytea 79d1dc83bbf8957c
+pkg-db-q2-postgres-connect-options 656bca47d6e7057a
+pkg-db-q2-postgres-native-scalar 3f9b8b531022f9fb
+pkg-db-q2-postgres-nul 8917c451b60242e7
+pkg-db-q2-sqlite-connect 5a2490e68e61e517
+pkg-db-q2-sqlite-invalid-connect cc4b62703c14a7e8
+";
+
+#[test]
+fn layer1_case_fingerprints_match_the_golden() {
+    let mut log = FingerprintLog::new();
+    for case in LAYER1_CASES {
+        log.record(&case.fingerprint());
+    }
+    log.assert_matches(LAYER1_FINGERPRINT_GOLDEN);
 }

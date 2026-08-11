@@ -1629,6 +1629,7 @@ const CASE_SQLITE_DIRECT_STREAM: Case = Case {
     modules: q4b_modules,
     main: SQLITE_DIRECT_STREAM_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -1641,6 +1642,7 @@ const CASE_SQLITE_COMPLETE_MATRIX: Case = Case {
     modules: q4b_modules,
     main: SQLITE_COMPLETE_MATRIX_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -1653,6 +1655,7 @@ const CASE_POSTGRES_DEADLINE_CANCEL: Case = Case {
     modules: q4b_modules,
     main: POSTGRES_DEADLINE_CANCEL_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -1665,6 +1668,7 @@ const CASE_OWNED_PARAMS: Case = Case {
     modules: q4b_modules,
     main: OWNED_PARAMS_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -1677,6 +1681,7 @@ const CASE_SQLITE_STREAM_LIFECYCLE: Case = Case {
     modules: q4b_modules,
     main: SQLITE_STREAM_LIFECYCLE_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -1689,6 +1694,7 @@ const CASE_POSTGRES_BUFFERED_LIFECYCLE: Case = Case {
     modules: q4b_modules,
     main: POSTGRES_BUFFERED_LIFECYCLE_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -1701,6 +1707,7 @@ const CASE_POSTGRES_PREPARED_DEADLINE: Case = Case {
     modules: q4b_modules,
     main: POSTGRES_PREPARED_DEADLINE_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -1713,6 +1720,7 @@ const CASE_POSTGRES_COMMAND_DEADLINE: Case = Case {
     modules: q4b_modules,
     main: POSTGRES_COMMAND_DEADLINE_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -1725,6 +1733,7 @@ const CASE_POSTGRES_MALFORMED_VIEWS: Case = Case {
     modules: q4b_modules,
     main: POSTGRES_MALFORMED_VIEWS_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -1737,6 +1746,7 @@ const CASE_SQLITE_MALFORMED_VIEWS: Case = Case {
     modules: q4b_modules,
     main: SQLITE_MALFORMED_VIEWS_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -1749,6 +1759,7 @@ const CASE_DEADLINE_DISPOSITION: Case = Case {
     modules: q4b_modules,
     main: DEADLINE_DISPOSITION_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -1761,6 +1772,7 @@ const CASE_POSTGRES_DEADLINE_FAULT_PHASES: Case = Case {
     modules: q4b_modules,
     main: POSTGRES_DEADLINE_FAULT_PHASES_MAIN,
     expected_exit: 45,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -2913,6 +2925,20 @@ pg.protocol_error
         };
         let reference = base().digest();
         assert_eq!(base().digest(), reference, "the digest must be stable");
+        // Every runner, not just one alternative: a third kind that hashed like an existing one
+        // would make a pipeline swap invisible in exactly the direction this axis exists to catch.
+        for other in [RUNNER_STATIC_DESCRIPTORS, RUNNER_WHOLE_PROGRAM] {
+            assert_ne!(
+                CaseFingerprint::new("case", other)
+                    .files(&[("main.align", "a")])
+                    .env(&[("K", "V")])
+                    .argv(&["one"])
+                    .expected_exit(42)
+                    .digest(),
+                reference,
+                "a changed RUNNER ({other}) must change the digest"
+            );
+        }
         assert_ne!(
             CaseFingerprint::new("case", RUNNER_STATIC_DESCRIPTORS)
                 .files(&[("main.align", "a")])
@@ -2920,8 +2946,13 @@ pg.protocol_error
                 .argv(&["one"])
                 .expected_exit(42)
                 .digest(),
-            reference,
-            "a changed RUNNER must change the digest"
+            CaseFingerprint::new("case", RUNNER_WHOLE_PROGRAM)
+                .files(&[("main.align", "a")])
+                .env(&[("K", "V")])
+                .argv(&["one"])
+                .expected_exit(42)
+                .digest(),
+            "the two non-default runners must not hash alike either"
         );
         assert_ne!(
             base().files(&[("main.align", "b")]).digest(),
@@ -3159,18 +3190,18 @@ fn materialized_projects_are_removed_on_drop() {
 ///
 /// Regenerate ONLY with a reviewed reason, from the panic message this emits.
 const LAYER1_FINGERPRINT_GOLDEN: &str = "\
-pkg-db-q4b-deadline-disposition feaa91247d2ff844
-pkg-db-q4b-owned-params f659b165042e0f15
-pkg-db-q4b-postgres-buffered-lifecycle 8fe4205270f1a911
-pkg-db-q4b-postgres-command-deadline f8a01a9da37234fc
-pkg-db-q4b-postgres-deadline-cancel 5badd2000b084e0b
-pkg-db-q4b-postgres-deadline-fault-phases 944018e7a8df2d3a
-pkg-db-q4b-postgres-malformed-views b2ae414b2e832bf3
-pkg-db-q4b-postgres-prepared-deadline 0e24bea5240ebdc8
-pkg-db-q4b-sqlite-complete-matrix 76d3af1f660a699f
-pkg-db-q4b-sqlite-direct-stream 629651e44e0063f7
-pkg-db-q4b-sqlite-malformed-views b822aa7f25062b62
-pkg-db-q4b-sqlite-stream-lifecycle 6e9e14e2c7046bad
+pkg-db-q4b-deadline-disposition f76981d6793fa0d1
+pkg-db-q4b-owned-params 5e455caea2840caa
+pkg-db-q4b-postgres-buffered-lifecycle 3a7a76c6f028bb6d
+pkg-db-q4b-postgres-command-deadline 7a4bb2c4f41be14a
+pkg-db-q4b-postgres-deadline-cancel 229550b0c45c3e0f
+pkg-db-q4b-postgres-deadline-fault-phases 6527ac1deff4966e
+pkg-db-q4b-postgres-malformed-views 2df18d48e45ab2d7
+pkg-db-q4b-postgres-prepared-deadline 39e85c2a1dc28ba6
+pkg-db-q4b-sqlite-complete-matrix 7d2480617e2517e0
+pkg-db-q4b-sqlite-direct-stream b74eae09080efa2c
+pkg-db-q4b-sqlite-malformed-views ea30ad6d3da4a703
+pkg-db-q4b-sqlite-stream-lifecycle 10c0297774a5bf8e
 ";
 
 #[test]
@@ -3273,4 +3304,60 @@ fn parity_engine_reports_a_timed_out_case_and_keeps_going() {
         "the case after the hang must still have run and reported its OWN mismatch, which only \
          holds if outcomes are collected before anything is asserted: {report}"
     );
+}
+
+/// P3-2: a child environment reaches the child only through the whole-program runner, so the two
+/// runners that cannot apply it must refuse rather than drop it.
+///
+/// Dropping it silently is the dangerous shape: the case would still pass while testing a program
+/// that never saw the variable it exists to test. Both arms are probed, because closing only one
+/// leaves the same hole behind the other.
+#[test]
+fn a_case_environment_is_refused_by_the_runners_that_cannot_apply_it() {
+    fn refuses(case: &Case) -> String {
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| case.run()))
+            .expect_err("a runner that cannot apply an environment must refuse it");
+        panicked
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panicked.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .unwrap_or_default()
+    }
+
+    const TRIVIAL: &str = "module main\nfn main() -> i32 = 42\n";
+    const WITH_ENV_DESCRIPTORS: Case = Case {
+        label: "pkg-db-q4b-probe-env-descriptors",
+        runner: RunnerKind::StaticDescriptors,
+        needs: Needs::Backend,
+        links: &[],
+        counters: &[],
+        modules: q4b_modules,
+        main: TRIVIAL,
+        envs: &[("ALIGN_DB_PROBE", "1")],
+        expected_exit: 42,
+        expect_counters: &[],
+    };
+    const WITH_ENV_PER_UNIT: Case = Case {
+        label: "pkg-db-q4b-probe-env-per-unit",
+        runner: RunnerKind::PerUnitC,
+        needs: Needs::BackendAndCc,
+        links: &[&PG],
+        counters: &[],
+        modules: q4b_modules,
+        main: TRIVIAL,
+        envs: &[("ALIGN_DB_PROBE", "1")],
+        expected_exit: 42,
+        expect_counters: &[],
+    };
+
+    if gate(Needs::Backend).is_some() {
+        let report = refuses(&WITH_ENV_DESCRIPTORS);
+        assert!(report.contains("silently drop it"), "{report}");
+        assert!(report.contains("pkg-db-q4b-probe-env-descriptors"), "{report}");
+    }
+    if gate(Needs::BackendAndCc).is_some() {
+        let report = refuses(&WITH_ENV_PER_UNIT);
+        assert!(report.contains("silently drop it"), "{report}");
+        assert!(report.contains("pkg-db-q4b-probe-env-per-unit"), "{report}");
+    }
 }

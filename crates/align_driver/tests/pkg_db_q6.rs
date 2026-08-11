@@ -422,6 +422,7 @@ const CASE_SQLITE_USER_GROUPS: Case = Case {
     modules: q6_modules,
     main: SQLITE_USER_GROUPS_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[],
 };
 
@@ -434,6 +435,7 @@ const CASE_SQLITE_TRANSACTION_MASTER: Case = Case {
     modules: q6_modules,
     main: SQLITE_TRANSACTION_MASTER_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[
         ("sqlite6.protocol_ok", 1),
         ("sqlite6.prepare_calls", 2),
@@ -452,6 +454,7 @@ const CASE_POSTGRES_COMPOUND: Case = Case {
     modules: q6_modules,
     main: POSTGRES_COMPOUND_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[
         ("pg.prepare_calls", 0),
         ("pg.execute_prepared_calls", 0),
@@ -472,6 +475,7 @@ const CASE_SQLITE_PRE_SEND_FAILURE: Case = Case {
     modules: q6_modules,
     main: SQLITE_PRE_SEND_FAILURE_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[
         ("sqlite6.protocol_ok", 1),
         ("sqlite6.prepare_calls", 1),
@@ -490,6 +494,7 @@ const CASE_POSTGRES_SEND_FAILURE: Case = Case {
     modules: q6_modules,
     main: POSTGRES_SEND_FAILURE_MAIN,
     expected_exit: 42,
+    envs: &[],
     expect_counters: &[
         ("pg.protocol_ok", 1),
         ("pg.execute_calls", 1),
@@ -1476,11 +1481,11 @@ fn main() -> i32 {
 ///
 /// Regenerate ONLY with a reviewed reason, from the panic message this emits.
 const LAYER1_FINGERPRINT_GOLDEN: &str = "\
-pkg-db-q6-postgres-compound 106d86859e970e19
-pkg-db-q6-postgres-send-failure ae08532600fc7010
-pkg-db-q6-sqlite-pre-send-failure 5ec434a74adbd7ae
-pkg-db-q6-sqlite-transaction-master 744ac2d59a00d4f8
-pkg-db-q6-sqlite-user-groups 77007739f0587979
+pkg-db-q6-postgres-compound 6b7ee85cc14d50cd
+pkg-db-q6-postgres-send-failure 86ad7ae32e02ef54
+pkg-db-q6-sqlite-pre-send-failure 52c3818f4776e225
+pkg-db-q6-sqlite-transaction-master 18e964c9f82314d3
+pkg-db-q6-sqlite-user-groups 5f1b6015b066bffa
 ";
 
 #[test]
