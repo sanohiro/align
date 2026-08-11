@@ -48,6 +48,15 @@ This gate is deliberately fixed and bounded:
    lowering, native object emission, linking, execution, and a rejected
    program.
 
+Those binaries are compiled in one `cargo test --no-run` build graph and then
+executed concurrently, because a few single-threaded stress tests own nearly all
+of the run time and separate `cargo test` invocations cannot overlap — cargo
+holds the target-directory lock across the test run, not only the build. The
+gate therefore reports every binary's result rather than stopping at the first
+failure, and prefixes each binary's output with its name, exit code, and
+duration. `ALIGN_GATE_JOBS` overrides the process count, which defaults to the
+host's CPU count.
+
 CI additionally builds release compiler/runtime artifacts and compiles and runs
 `examples/hello.align` on Linux x86-64, Linux ARM64, and Apple Silicon. This is
 the cross-platform packaged-command smoke path.
