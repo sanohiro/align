@@ -28190,7 +28190,7 @@ impl<'a, 't> Checker<'a, 't> {
                     // signed `INT_MIN/-1` lane wraps); float `%` is IEEE `frem`, lane-wise.
                     ty = Ty::Vec(s, n);
                 } else {
-                    let t = self.unify(l.ty, r.ty, span);
+                    let mut t = self.unify(l.ty, r.ty, span);
                     // String construction is deliberately not an arithmetic operation: `builder`
                     // is the one visible-allocation path. Reject `+` here instead of letting the
                     // old MIR `Template` lowering preserve the pre-settlement hidden allocation.
@@ -28211,6 +28211,10 @@ impl<'a, 't> Checker<'a, 't> {
                         return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
                     } else if !t.is_numeric() && t != Ty::Error {
                         self.diags.error("arithmetic expects numbers (int or float)", span);
+                        // The sentinel, never the rejected operand type: later passes classify a
+                        // binary result as borrowing nothing, so a view-bearing type here builds
+                        // a node the provenance walk cannot explain (Gate 3).
+                        t = Ty::Error;
                     }
                     ty = t;
                 }
@@ -28295,17 +28299,20 @@ impl<'a, 't> Checker<'a, 't> {
             BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
                 // Bitwise / shift: integer-only, no implicit coercion. The shift amount shares the
                 // value's type (unified like arithmetic), so the result is that integer type.
-                let t = self.unify(l.ty, r.ty, span);
+                let mut t = self.unify(l.ty, r.ty, span);
                 if matches!(t, Ty::Vec(..)) {
                     // Vectors carry only elementwise `+` `-` `*` `/` `%` (and comparisons → `mask`), not
                     // the bitwise/shift family. Reject explicitly here — not by relying on `is_int_like()`
                     // happening to be false for `Ty::Vec` — so the domain restriction is intentional and
                     // can't silently regress into a codegen `unreachable!` (self-review Gate 3 / #235).
                     self.diags.error("vectors do not support bitwise or shift operators (only `+` `-` `*` `/` `%` and comparisons)".to_string(), span);
+                    t = Ty::Error;
                 } else if let Ty::Param(_) = t {
                     self.diags.error("bitwise and shift operators need a concrete integer (not a generic type parameter)".to_string(), span);
+                    t = Ty::Error;
                 } else if !t.is_int_like() && t != Ty::Error {
                     self.diags.error("bitwise and shift operators expect integers".to_string(), span);
+                    t = Ty::Error;
                 }
                 ty = t;
             }
@@ -40460,6 +40467,10 @@ impl<'a, 't> Checker<'a, 't> {
         let inner = self.check_expr(expr, None);
         let src = self.resolve(inner.ty);
         let ok_target = matches!(target, Ty::Int(_) | Ty::Float(_) | Ty::Char);
+        // A rejected target must not become this node's type: later passes classify a cast as
+        // borrowing nothing, so a view-bearing target builds a node the provenance walk cannot
+        // explain (Gate 3). The operand subtree is kept so its own errors still surface.
+        let node_ty = if ok_target { target } else { Ty::Error };
         if !ok_target && target != Ty::Error {
             self.diags.error(
                 format!("cannot cast to `{}`: `as` converts only between numeric types and `char`", ty_name(target)),
@@ -40488,8 +40499,8 @@ impl<'a, 't> Checker<'a, 't> {
         // operand and target widths concrete (an unconstrained-default or forward-inferred source is
         // still an inference variable here). Classifying now would miss those and could misreport a
         // width later unified to something else (Gate 5: resolve fully before classifying).
-        self.constrain(target, expected, span);
-        Expr { kind: ExprKind::Cast(Box::new(inner)), ty: target, span }
+        self.constrain(node_ty, expected, span);
+        Expr { kind: ExprKind::Cast(Box::new(inner)), ty: node_ty, span }
     }
 
     /// `expr?` — propagate. The operand must be `Result<T, E>` and the enclosing
