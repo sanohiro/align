@@ -540,11 +540,13 @@ idea is rejected.
   now fixes that direct/prepared streamed-delivery rail. Its
   reopened closure matrix first lands independently mergeable PostgreSQL catalog/EXPLAIN lease and
   shipped-result-status safety prerequisites. The latter audits every current PGresult consumer and
-  closes on COPY or an unknown numeric status without another protocol call. Direct delivery follows
+  closes on COPY, pipeline, or an unknown numeric status without another protocol or pipeline-exit
+  call. Direct delivery follows
   with normal-drain cardinality, exact BufferedFull default preservation, and a post-nonblocking
   pre-send deadline check; prepared parity then retains parameter-name authority in statement v3. Binary
-  formats and other native paths remain separate. Because COPY termination is not in this rail,
-  observing a COPY or unknown status clears only that result and immediately poisons/closes instead of entering
+  formats and other native paths remain separate. Because COPY termination and pipeline exit are not
+  in this rail, observing a COPY, pipeline, or unknown status clears only that result and immediately
+  poisons/closes instead of entering
   generic drain; direct construction also retains Q2's live-state/context/static-validation/lease
   phase order. Query Delivery validation retains §13.4 payload-before-duplicate precedence, and
   `one_native` records the monotonic caller-region bytes left by its first-Row clone when a later

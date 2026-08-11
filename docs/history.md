@@ -49,6 +49,12 @@ and close with no later protocol call. Direct and prepared explicit delivery als
 clock recheck after enabling nonblocking mode and before send. The implementation sequence is now
 four mergeable PRs: lease repair, result-status safety, direct delivery, and prepared parity.
 
+The final preflight review found two P2 consistency gaps. `PGRES_PIPELINE_SYNC` and
+`PGRES_PIPELINE_ABORTED` had been classified as ordinary invalid streamed sequences even though a
+connection remains in pipeline mode until `PQexitPipelineMode`; because pipeline exit is outside
+this rail, both statuses now share the immediate-clear-and-close branch at every PGresult consumer.
+The section introduction now also names both prerequisites and the exact four-PR sequence.
+
 ## 2026-08-07: shared borrow accepts stable Copy storage
 
 Shared `borrow` now accepts a stable bound Copy or Move place. Copy values still pass by value by

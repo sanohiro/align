@@ -342,10 +342,12 @@ absolute deadline and the original duration needed by recovery.
 not an ordinary invalid rows result: libpq cannot reach the terminal result until the COPY exchange
 itself is consumed or terminated. Shipped synchronous and timeout executors can already observe it;
 the rule is therefore a pre-stream PostgreSQL result-status closure, not only a streamed-rows arm.
-Every package-owned PGresult consumer clears COPY or an unknown numeric status once, immediately
-poisons/closes, preserves an earlier owned error or silent Drop, and then releases package owners.
-No later result drain, COPY operation, cancel, transaction probe, or blocking restoration runs on
-that connection. Supporting libpq 17 or newer does not mean assuming a future status is drainable.
+Pipeline sync/aborted results likewise leave connection-global pipeline mode until an explicit
+pipeline-exit operation, which this rail does not own. Every package-owned PGresult consumer clears
+COPY, pipeline, or an unknown numeric status once, immediately poisons/closes, preserves an earlier
+owned error or silent Drop, and then releases package owners. No later result drain, COPY operation,
+pipeline exit, cancel, transaction probe, or blocking restoration runs on that connection.
+Supporting libpq 17 or newer does not mean assuming a future status is drainable.
 
 **Context-backed static validation stays in the settled execution phase.** The generated
 static-option validator needs an execution context, while overlap is deliberately checked only

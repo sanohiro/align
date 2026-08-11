@@ -42,10 +42,11 @@ finding that the shipped PostgreSQL catalog and EXPLAIN paths did not share the
 typed-execution lease. The next product work is therefore one independently
 mergeable libpq-consumer lease prerequisite with no public/ABI change. A second
 public/ABI-neutral prerequisite then makes every shipped PostgreSQL PGresult
-consumer fail closed on COPY and unknown numeric statuses; current synchronous
-and timeout paths can already observe them and must not release an undrainable
-connection for reuse. The independently useful PostgreSQL `SingleRow` /
-`PortalBatch` direct delivery rail follows; prepared parity is a fourth PR because it must
+consumer fail closed on COPY, pipeline, and unknown numeric statuses; current
+synchronous and timeout paths can already observe a result that requires an
+unsupported protocol transition and must not release that connection for reuse.
+The independently useful PostgreSQL `SingleRow` / `PortalBatch` direct delivery
+rail follows; prepared parity is a fourth PR because it must
 retain parameter-name authority in statement v3. Cardinality drains to clean
 completion rather than canceling a possibly effectful `RETURNING` statement,
 and absent Delivery stays on the caller-synchronous BufferedFull implementation,
@@ -66,7 +67,10 @@ post-release D13 rather than in the initial D1--D12 inventory. A fifth matrix
 reopen then found that the COPY closure had omitted shipped result consumers,
 that explicit direct/prepared delivery must recheck expiry after enabling
 nonblocking mode and before send, and that unknown future libpq statuses cannot
-enter ordinary drain. The four implementation PR boundaries and exact public
+enter ordinary drain. The final clean-up review moved `PGRES_PIPELINE_SYNC` and
+`PGRES_PIPELINE_ABORTED` to the same immediate-close branch because this rail
+does not own `PQexitPipelineMode`, and synchronized the introductory staging
+with the four-PR matrix. The four implementation PR boundaries and exact public
 contract are in
 `docs/impl/pkg-design/db.md` §23; binary formats remain the following rail.
 
@@ -129,7 +133,7 @@ Q5 schema tooling/inspection     complete through D11 + D12
 Q6 compound product closure      complete through D10
 A1 common batch/SoA rail         complete through #740 / D13
 A1 PostgreSQL lease prerequisite next / catalog + EXPLAIN overlap closure / D13
-then: A1 PostgreSQL status       shipped COPY + unknown result fail-close / D13
+then: A1 PostgreSQL status       shipped COPY + pipeline + unknown fail-close / D13
 then: A1 PostgreSQL direct       SingleRow + PortalBatch / D13
 then: A1 PostgreSQL prepared     streamed parity + stmt v3 resolver / D13
 ```

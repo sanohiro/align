@@ -190,11 +190,11 @@ dependency. The preceding libpq-consumer lease and result-status safety
 prerequisites keep the current client floor. The same local database gate must
 first run the catalog/EXPLAIN overlap suite and prove zero libpq calls on a
 rejected live-stream overlap. The status prerequisite then injects every COPY
-status and an unknown numeric status into every shipped synchronous,
+status, both pipeline statuses, and an unknown numeric status into every shipped synchronous,
 timeout-completion, timeout-recovery, direct/prepared rows/one/command/prepare,
 transaction, catalog/EXPLAIN, and silent-cleanup PGresult consumer. It requires
 one current-result clear, physical close, zero subsequent
-result/COPY/cancel/transaction-state/blocking-restore calls, correct first-error
+result/COPY/pipeline-exit/cancel/transaction-state/blocking-restore calls, correct first-error
 or silent-Drop behavior, balanced owners/lease, and no reuse.
 
 The direct-delivery suite crosses validation/decode/storage failure with no
@@ -203,11 +203,11 @@ targets. It pins first-error retention, no further decode, completion-versus-
 cancel SQL effects, the rows-v3 absolute-deadline/original-duration pair, and
 recovery-budget use. Chunk owners report total transported rows separately from
 maximum rows per `PGresult`; the latter is not asserted as a total-transport
-bound. Every `PGRES_COPY_IN`/`PGRES_COPY_OUT`/`PGRES_COPY_BOTH` and unknown-status
-injection is a fail-closed owner, including first-result, after-data, row/decode/storage error,
+bound. Every `PGRES_COPY_IN`/`PGRES_COPY_OUT`/`PGRES_COPY_BOTH`, both pipeline
+statuses, and unknown-status injection is a fail-closed owner, including first-result, after-data, row/decode/storage error,
 deadline recovery, mode failure, and Drop on connection and transaction targets.
 Those owners assert one current-result clear and physical close, zero subsequent
-result/COPY/cancel/transaction-state/blocking-restore calls, first-error retention,
+result/COPY/pipeline-exit/cancel/transaction-state/blocking-restore calls, first-error retention,
 balanced package-owner cleanup, and no reuse. Direct construction also retains a
 pairwise phase-order owner with context allocation/free, lease, binder, and libpq
 counters for live-state, generated-static-validation, and overlap failures. Its
