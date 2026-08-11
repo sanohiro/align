@@ -10,6 +10,12 @@ artifacts unchanged. libpq 17 is the client floor for chunked rows and nonblocki
 the required server compatibility floor remains PostgreSQL 16.4. Binary formats, COPY, pipeline
 mode, and LISTEN/NOTIFY remain independent rails rather than one oversized native PR.
 
+The second design review exposed a pre-existing asymmetry: D12 gave SQLite catalog and EXPLAIN the
+connection execution lease but allowed their PostgreSQL siblings to call libpq after only a live
+state check. Streamed delivery therefore cannot land directly. One public/ABI-neutral prerequisite
+first makes every PostgreSQL catalog and common/native EXPLAIN call share the typed-execution lease;
+the delivery PR follows after that independently testable safety closure merges.
+
 ## 2026-08-07: shared borrow accepts stable Copy storage
 
 Shared `borrow` now accepts a stable bound Copy or Move place. Copy values still pass by value by

@@ -317,6 +317,15 @@ state machine, retain Params until protocol completion, and expose partial-serve
 instead of pretending bounded delivery is atomic. Binary wire formats remain a separate rail
 because they change bind/decode representation rather than result delivery lifetime.
 
+**A live native protocol requires a complete consumer lease inventory.** PostgreSQL catalog and
+EXPLAIN originally used synchronous full-result libpq calls, so D12 checked their live connection
+but did not give them the typed-execution lease. That was harmless only while every PostgreSQL rows
+constructor also completed its libpq protocol synchronously. Single-row/chunked delivery keeps the
+connection protocol-busy after return, exposing the omission. The fix is a smaller prerequisite,
+not a delivery special case: every catalog and common/native EXPLAIN call acquires the same lease,
+holds it through result/context cleanup, and rejects overlap before libpq. The streamed-delivery PR
+then depends on that general closure.
+
 **A named `region` is a destination capability, not an allocator abstraction.** Compound
 database reads and streaming decoders need ordinary library functions to construct caller-owned
 arrays and strings without falling back to hidden heap allocation. `arena out {}` exposes only

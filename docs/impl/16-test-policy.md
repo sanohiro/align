@@ -184,7 +184,10 @@ The D13 PostgreSQL streamed-delivery rail keeps server 16.4 as the compatibility
 floor but requires libpq client/development files at version 17 or newer. Its
 implementation PR must make both CI and `db-verify-local.sh` assert the client
 version and run the new required delivery suite; a newer server image must not
-hide an accidental client-version dependency.
+hide an accidental client-version dependency. The preceding libpq-consumer
+lease prerequisite keeps the current client floor, but the same local database
+gate must run its catalog/EXPLAIN overlap suite and prove zero libpq calls on a
+rejected live-stream overlap before that prerequisite is pushed.
 
 ## Benchmarks are not tests
 

@@ -37,11 +37,14 @@ allocation/copies, and whole/per-unit mutable-retention parity. #740 ships the
 first independently useful A1/D13 throughput rail: common bounded batch/SoA
 delivery with the v5 Query batch plan on both drivers. #741 tiers verification,
 #742 restores the scoped `pkg.web` dispatch rule, and #743 completes fixed and
-owned struct-array slicing. The next product work is the independently useful
-PostgreSQL `SingleRow` / `PortalBatch` direct-and-prepared delivery rail. Its
-public contract and implementation closure matrix are the second A1 ledger in
-`docs/impl/pkg-design/db.md` §23; binary formats remain the following separate
-rail.
+owned struct-array slicing. Design review reopened the second A1 matrix after
+finding that the shipped PostgreSQL catalog and EXPLAIN paths did not share the
+typed-execution lease. The next product work is therefore one independently
+mergeable libpq-consumer lease prerequisite with no public/ABI change. After it
+merges, the independently useful PostgreSQL `SingleRow` / `PortalBatch`
+direct-and-prepared delivery rail follows. The exact two-PR boundary and public
+contract are in `docs/impl/pkg-design/db.md` §23; binary formats remain the
+following separate rail.
 
 Out-of-gate suite status (suites outside the bounded CI gate; a nightly
 full-suite workflow now runs them daily so this class cannot rot silently):
@@ -101,7 +104,8 @@ Q4b streaming resilience         complete through D8 + D9
 Q5 schema tooling/inspection     complete through D11 + D12
 Q6 compound product closure      complete through D10
 A1 common batch/SoA rail         complete through #740 / D13
-next: A1 PostgreSQL delivery     SingleRow + PortalBatch / D13
+A1 PostgreSQL lease prerequisite next / catalog + EXPLAIN overlap closure / D13
+then: A1 PostgreSQL delivery     SingleRow + PortalBatch / D13
 ```
 
 The exact cell contracts and owner matrices remain in
