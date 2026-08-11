@@ -346,6 +346,14 @@ pub enum CacheContext {
     /// Cache off — `codegen` runs the producer verbatim (today's byte-identical path, no lookup).
     Disabled,
     /// Cache on, rooted at this directory.
+    ///
+    /// `#[non_exhaustive]` so this variant can only be built inside the crate — every enabled cache
+    /// therefore comes from [`CacheContext::from_env`] or [`CacheContext::at`], which are the two
+    /// places that enforce the fail-closed compiler-identity rule. Without it, an external caller
+    /// could write `CacheContext::Enabled { root }` and obtain a cache under an unidentifiable
+    /// compiler, silently bypassing that rule. Nothing outside `cache.rs` constructs or matches this
+    /// variant today, so the attribute costs nothing.
+    #[non_exhaustive]
     Enabled { root: PathBuf },
 }
 
@@ -356,20 +364,21 @@ impl CacheContext {
     /// root verbatim (schema skew inside a shared root is handled by the fail-closed key/manifest
     /// versions). If the default root cannot be resolved (no `HOME`/`XDG_CACHE_HOME`), the on/unset
     /// case degrades to disabled rather than guessing a root.
+    ///
     /// Fail-closed on an unidentifiable compiler: when the running executable cannot be hashed there
     /// is no id that distinguishes this compiler build from another, so the cache is off entirely
-    /// (see [`compiler_build_id`]).
+    /// ([`compiler_build_id_available`]). That check is **deferred to the moment an enabled cache is
+    /// about to be built**, so a disabled build — `off`, a measurement toggle, or an unresolvable
+    /// default root — never pays the executable read and its two hash passes.
     pub fn from_env() -> CacheContext {
-        CacheContext::from_env_when(compiler_build_id_available())
+        CacheContext::from_env_when(compiler_build_id_available)
     }
 
-    /// [`CacheContext::from_env`] with the build-id availability supplied — the seam its owner test
-    /// drives, since a real host always has a readable executable.
-    fn from_env_when(build_id_available: bool) -> CacheContext {
-        if !build_id_available {
-            note_unidentifiable_compiler();
-            return CacheContext::Disabled;
-        }
+    /// [`CacheContext::from_env`] with the build-id availability supplied as a THUNK — the seam its
+    /// owner tests drive (a real host always has a readable executable), and the mechanism that
+    /// keeps the probe off the disabled paths: the thunk is called at most once, and only after a
+    /// root has actually been resolved.
+    fn from_env_when(build_id_available: impl FnOnce() -> bool) -> CacheContext {
         // Fail-closed measurement guard: the `ALIGN_SORT_ADAPTIVE` (doc-12 §4.1),
         // `ALIGN_NEEDLE_HOIST` (doc-13 §6.6), `ALIGN_BUFFER_DONATE` (doc-10 §8.1), and
         // `ALIGN_CONST_POOL` (doc-13 §8.4) toggles change emitted codegen for `.sort()`/
@@ -387,15 +396,17 @@ impl CacheContext {
         {
             return CacheContext::Disabled;
         }
-        let default_on = || match default_cache_root() {
-            Some(root) => CacheContext::Enabled { root },
-            None => CacheContext::Disabled,
+        // Resolve the ROOT first and probe the compiler identity only if one exists: every arm that
+        // yields no root returns here, before the thunk is ever called.
+        let resolved = match std::env::var("ALIGNC_CACHE") {
+            Err(_) => default_cache_root(),                    // unset ⇒ default-ON
+            Ok(v) if v.is_empty() || v == "off" => None,       // explicit off
+            Ok(v) if v == "on" => default_cache_root(),
+            Ok(path) => Some(PathBuf::from(path)),
         };
-        match std::env::var("ALIGNC_CACHE") {
-            Err(_) => default_on(),                                       // unset ⇒ default-ON
-            Ok(v) if v.is_empty() || v == "off" => CacheContext::Disabled, // explicit off
-            Ok(v) if v == "on" => default_on(),
-            Ok(path) => CacheContext::Enabled { root: PathBuf::from(path) },
+        match resolved {
+            Some(root) => enable_or_note(root, build_id_available()),
+            None => CacheContext::Disabled,
         }
     }
 
@@ -403,17 +414,13 @@ impl CacheContext {
     /// same fail-closed compiler-identity rule as [`CacheContext::from_env`]: an unidentifiable
     /// compiler yields [`CacheContext::Disabled`], never an enabled cache under a guessed id.
     pub fn at(root: PathBuf) -> CacheContext {
-        CacheContext::at_when(root, compiler_build_id_available())
+        CacheContext::at_when(root, compiler_build_id_available)
     }
 
-    /// [`CacheContext::at`] with the build-id availability supplied — the owner-test seam.
-    fn at_when(root: PathBuf, build_id_available: bool) -> CacheContext {
-        if build_id_available {
-            CacheContext::Enabled { root }
-        } else {
-            note_unidentifiable_compiler();
-            CacheContext::Disabled
-        }
+    /// [`CacheContext::at`] with the build-id availability supplied as a thunk — the owner-test
+    /// seam. `at` always intends an enabled cache, so the thunk is always called.
+    fn at_when(root: PathBuf, build_id_available: impl FnOnce() -> bool) -> CacheContext {
+        enable_or_note(root, build_id_available())
     }
 
     /// Whether the cache is on. The caller gates key construction on this so a disabled build (the
@@ -555,7 +562,62 @@ fn publish(root: &Path, key: &CodegenKey, obj_out: &Path) {
     }
 }
 
-/// The compiler build id and whether it is a REAL identity, memoized once per process.
+/// The always-on note text for a cache disabled because the compiler cannot be identified. A `const`
+/// so the decision that produces it is assertable without capturing stderr.
+const UNIDENTIFIABLE_COMPILER_NOTE: &str = "alignc: cache disabled (cannot read the running \
+     executable, so this compiler build cannot be identified)";
+
+/// The enable decision AS A VALUE: `Ok` the enabled cache, `Err` the note the caller must print.
+///
+/// Split from the printing on purpose. The rule under test is "an unidentifiable compiler yields no
+/// enabled cache", and a test for it must not depend on stderr capture or on which earlier test
+/// happened to consume the print-once latch.
+fn decide_enabled(root: PathBuf, build_id_available: bool) -> Result<CacheContext, &'static str> {
+    if build_id_available {
+        Ok(CacheContext::Enabled { root })
+    } else {
+        Err(UNIDENTIFIABLE_COMPILER_NOTE)
+    }
+}
+
+/// [`decide_enabled`], printing the note once per process on the disabled outcome. Once, because it
+/// is a persistent-state decision the user should see, but repeating it per unit would bury the
+/// build's real output.
+fn enable_or_note(root: PathBuf, build_id_available: bool) -> CacheContext {
+    decide_enabled(root, build_id_available).unwrap_or_else(|note| {
+        static NOTED: OnceLock<()> = OnceLock::new();
+        NOTED.get_or_init(|| eprintln!("{note}"));
+        CacheContext::Disabled
+    })
+}
+
+/// The running executable's bytes, or `None` when they cannot be read.
+///
+/// On Linux this reads `/proc/self/exe` **directly** instead of resolving it to a path first. The
+/// kernel keeps the running image reachable through that link even after the file is unlinked or
+/// replaced, so the bytes are provably this process's own image: both the resolve-then-read TOCTOU
+/// window and the "the binary was deleted mid-build" failure condition disappear together.
+///
+/// macOS (the only other supported target) has no equivalent, so it resolves `current_exe()` and
+/// reads that path. **Recorded residual risk:** between the resolve and the open, the path can be
+/// replaced — an atomic `rename` over it by a concurrent `cargo build` is the realistic case — and
+/// this process then fingerprints the INCOMING binary while running the old one. A later run of
+/// that incoming binary computes the same id and could be served objects the old compiler produced.
+/// That is a real, if narrow, soundness window, not merely a lost hit: it cannot be closed from
+/// user space without a `/proc/self/exe` equivalent. A build-time-baked compiler fingerprint (the
+/// recorded follow-up) closes it by not depending on the executable at all.
+fn exe_bytes() -> Option<Vec<u8>> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read("/proc/self/exe").ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::env::current_exe().ok().and_then(|p| std::fs::read(p).ok())
+    }
+}
+
+/// The compiler build id and whether it is a REAL identity, decided from the executable's bytes.
 ///
 /// A cache entry is only as sound as this component: it is the sole thing separating one compiler
 /// build's artifacts from another's. The real id is the hash of the running executable's bytes,
@@ -565,31 +627,38 @@ fn publish(root: &Path, key: &CodegenKey, obj_out: &Path) {
 /// **There is deliberately no stable fallback.** A version-derived constant is shared by *every*
 /// build of that version, so two different compilers that both failed to read their executable would
 /// address the same entries and one could be served the other's object — a miscompile, not a missed
-/// optimization. When the executable cannot be read, the id is therefore unique to this process (it
-/// can collide with nothing) and [`compiler_build_id_available`] reports `false`, which turns the
-/// cache off at every construction site.
-fn build_id() -> (Hash128, bool) {
-    static ID: OnceLock<(Hash128, bool)> = OnceLock::new();
-    *ID.get_or_init(|| {
-        match std::env::current_exe().ok().and_then(|p| std::fs::read(p).ok()) {
-            Some(bytes) => (Hash128::of(&bytes), true),
-            None => {
-                let stamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos();
-                let nonce = STAGE_NONCE.fetch_add(1, Ordering::Relaxed);
-                let unique = format!(
-                    "alignc-build-id-unidentified-{}-{stamp}-{nonce}",
-                    std::process::id()
-                );
-                (Hash128::of(unique.as_bytes()), false)
-            }
+/// optimization. When the bytes are absent the id is therefore unique to this process (it can
+/// collide with nothing) and the availability flag is `false`, which turns the cache off at every
+/// construction site.
+///
+/// Split from the I/O in [`build_id`] so both arms are exercised by the owner tests through the
+/// production code itself rather than a re-implementation of it.
+fn build_id_from(exe_bytes: Option<Vec<u8>>) -> (Hash128, bool) {
+    match exe_bytes {
+        Some(bytes) => (Hash128::of(&bytes), true),
+        None => {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let nonce = STAGE_NONCE.fetch_add(1, Ordering::Relaxed);
+            let unique = format!(
+                "alignc-build-id-unidentified-{}-{stamp}-{nonce}",
+                std::process::id()
+            );
+            (Hash128::of(unique.as_bytes()), false)
         }
-    })
+    }
 }
 
-/// The compiler build id (see [`build_id`]). Only meaningful when
+/// `build_id_from(exe_bytes())`, memoized once per process — the I/O half, kept thin so the decision
+/// half stays directly testable.
+fn build_id() -> (Hash128, bool) {
+    static ID: OnceLock<(Hash128, bool)> = OnceLock::new();
+    *ID.get_or_init(|| build_id_from(exe_bytes()))
+}
+
+/// The compiler build id: the hash of the running executable's bytes. Only meaningful when
 /// [`compiler_build_id_available`] is `true`; every enabled [`CacheContext`] guarantees that.
 pub fn compiler_build_id() -> Hash128 {
     build_id().0
@@ -600,19 +669,6 @@ pub fn compiler_build_id() -> Hash128 {
 /// off — enforced by [`CacheContext::from_env`] and [`CacheContext::at`].
 pub fn compiler_build_id_available() -> bool {
     build_id().1
-}
-
-/// The always-on note for a cache disabled because the compiler cannot be identified. Printed once
-/// per process: this is a persistent-state decision the user should see, but repeating it per unit
-/// would bury the build's real output.
-fn note_unidentifiable_compiler() {
-    static NOTED: OnceLock<()> = OnceLock::new();
-    NOTED.get_or_init(|| {
-        eprintln!(
-            "alignc: cache disabled (cannot read the running executable, so this compiler build \
-             cannot be identified)"
-        );
-    });
 }
 
 /// `${XDG_CACHE_HOME:-~/.cache}/alignc/<schema>`, or `None` if neither `XDG_CACHE_HOME` nor `HOME` is
@@ -1698,30 +1754,72 @@ mod tests {
         assert_eq!(first_diff(&base, &k), FirstDiff::MirDigest);
     }
 
+    /// The `Some` arm: real bytes are a real identity, and different bytes are different identities.
+    /// Exercised through the production decision function, not a re-implementation of it.
     #[test]
-    fn an_unidentifiable_compiler_disables_the_cache() {
-        // An explicit root must NOT yield an enabled cache when the build id is not a real identity:
-        // without a distinguishing id, two different compiler builds address one namespace and one
-        // can be served the other's object.
-        let root = std::env::temp_dir().join("align-buildid-fail-closed");
-        assert!(matches!(CacheContext::at_when(root.clone(), false), CacheContext::Disabled));
-        assert!(matches!(CacheContext::at_when(root, true), CacheContext::Enabled { .. }));
-        // The same rule outranks every `ALIGNC_CACHE` value, and is decided before the environment
-        // is consulted at all (so this assertion is independent of the ambient environment).
-        assert!(matches!(CacheContext::from_env_when(false), CacheContext::Disabled));
+    fn readable_executable_bytes_are_a_real_identity() {
+        let (id, available) = build_id_from(Some(b"pretend-compiler-bytes".to_vec()));
+        assert!(available, "readable bytes must report a REAL identity");
+        assert_eq!(id, Hash128::of(b"pretend-compiler-bytes"), "the id must be the bytes' hash");
+        // The whole point of the component: two different compiler builds must not share an id.
+        let (other, _) = build_id_from(Some(b"a different compiler build".to_vec()));
+        assert_ne!(id, other);
     }
 
+    /// The `None` arm: no shared constant, and the id is unique per computation, so two compilers
+    /// that both fail to read their executable can never address one namespace. This is the defect
+    /// being fixed — the removed fallback was `Hash128::of("alignc-build-id-fallback-<version>")`,
+    /// identical in every build of one crate version.
     #[test]
-    fn the_build_id_is_never_a_version_derived_constant() {
-        // The removed fallback was `Hash128::of("alignc-build-id-fallback-<version>")` — identical in
-        // every build of one crate version. Pin that no such shared constant is reachable: the id is
-        // either the real executable hash or a process-unique value that collides with nothing.
+    fn an_unreadable_executable_yields_a_unique_unavailable_id() {
+        let (first, first_available) = build_id_from(None);
+        let (second, second_available) = build_id_from(None);
+        assert!(!first_available && !second_available, "absent bytes are NOT a real identity");
+        assert_ne!(first, second, "the unavailable id must be unique, never a shared constant");
         let banned = Hash128::of(
             format!("alignc-build-id-fallback-{}", env!("CARGO_PKG_VERSION")).as_bytes(),
         );
-        assert_ne!(compiler_build_id(), banned);
-        // A test binary can always read its own executable, so the real identity is in force here.
-        assert!(compiler_build_id_available());
+        assert_ne!(first, banned);
+        assert_ne!(second, banned);
+    }
+
+    #[test]
+    fn an_unidentifiable_compiler_disables_the_cache() {
+        let root = std::env::temp_dir().join("align-buildid-fail-closed");
+        // The decision is a value, so the note is asserted without stderr capture and without
+        // depending on which earlier test consumed the print-once latch.
+        assert_eq!(
+            decide_enabled(root.clone(), false).err(),
+            Some(UNIDENTIFIABLE_COMPILER_NOTE),
+            "an unidentifiable compiler must yield the note, never an enabled cache"
+        );
+        assert!(decide_enabled(root.clone(), true).is_ok());
+        // Both construction seams are wired to that one decision.
+        assert!(matches!(CacheContext::at_when(root.clone(), || false), CacheContext::Disabled));
+        assert!(matches!(CacheContext::at_when(root, || true), CacheContext::Enabled { .. }));
+        // And it outranks every `ALIGNC_CACHE` value.
+        assert!(matches!(CacheContext::from_env_when(|| false), CacheContext::Disabled));
+    }
+
+    /// The executable read + two hash passes must not be paid by a build that ends up disabled —
+    /// the cost contract stated on `is_enabled` and at `emit_object_cached`'s disabled fast path.
+    /// Asserted as an invariant over whatever the ambient environment is, so no test has to mutate
+    /// `ALIGNC_CACHE` (which would race every other test in this binary).
+    #[test]
+    fn the_executable_is_probed_only_when_an_enabled_cache_is_produced() {
+        let probes = std::cell::Cell::new(0u32);
+        let context = CacheContext::from_env_when(|| {
+            probes.set(probes.get() + 1);
+            true
+        });
+        match context {
+            CacheContext::Enabled { .. } => {
+                assert_eq!(probes.get(), 1, "an enabled cache probes the executable exactly once")
+            }
+            CacheContext::Disabled => {
+                assert_eq!(probes.get(), 0, "a disabled cache must not read or hash the executable")
+            }
+        }
     }
 
     #[test]
