@@ -8317,24 +8317,22 @@ impl<'a> BodyValidator<'a> {
                 {
                     return None;
                 }
+                // The element the view addresses. A struct array views the same contiguous
+                // storage as its scalar dual; layout is pinned so a future column-major form is
+                // a compile error rather than a reinterpreted `{ptr,len}`.
+                let sliced_element = match receiver.ty {
+                    Ty::Array(element, _) | Ty::Slice(element) | Ty::DynArray(element) => {
+                        Some(element)
+                    }
+                    Ty::StructArray(id, _) | Ty::DynStructArray(id, Layout::Aos) => {
+                        Some(Scalar::Struct(id))
+                    }
+                    _ => None,
+                };
                 let result = match receiver.ty {
                     Ty::Str | Ty::String => Ty::Str,
-                    // A struct array views the same contiguous storage as its scalar dual; sema
-                    // names the element `Scalar::Struct`, so the Move guard below still applies.
-                    Ty::Array(..)
-                    | Ty::Slice(_)
-                    | Ty::DynArray(_)
-                    | Ty::StructArray(..)
-                    | Ty::DynStructArray(..) => {
-                        let scalar = match receiver.ty {
-                            Ty::Array(element, _)
-                            | Ty::Slice(element)
-                            | Ty::DynArray(element) => element,
-                            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => {
-                                Scalar::Struct(id)
-                            }
-                            _ => unreachable!("sliceable collection"),
-                        };
+                    _ => {
+                        let scalar = sliced_element?;
                         if !self.scalar_copy_ok(scalar) {
                             return None;
                         }
@@ -8350,7 +8348,6 @@ impl<'a> BodyValidator<'a> {
                         }
                         Ty::Slice(scalar)
                     }
-                    _ => return None,
                 };
                 let mut flows = vec![receiver];
                 if let Some(flow) = start_flow {

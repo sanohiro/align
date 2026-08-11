@@ -458,35 +458,41 @@ fn main() -> Result<(), Error> {
     }
 
     #[test]
-    fn a_move_struct_array_slice_is_rejected() {
-        // The Move guard is the reason the element is named `Scalar::Struct` rather than widened
-        // away: a sub-view of an owned buffer the source still frees is the double-free shape.
+    fn a_slot_backed_struct_array_expression_cannot_be_sliced() {
+        // A fixed array lives in a stack slot MIR addresses directly, so only a literal or a
+        // named local can be viewed. sema owns this diagnostic; without it the program reached
+        // the MIR boundary and died as an internal error.
         let src = "\
-S { name: string }
+S { a: i64 }
+fn total(xs: slice<S>) -> i64 = xs.len()
 fn main() -> Result<(), Error> {
-  rows := [S { name: \"a\".clone() }].to_array()
-  view := rows[0..1]
-  print(view.len())
+  c := true
+  xs := [S { a: 1 }]
+  ys := [S { a: 2 }]
+  print(total((if c { xs } else { ys })[0..1]))
   return Ok(())
 }
 ";
+        let diagnostics = check_diagnostics("sa-slice-temp", src);
         assert!(
-            check_errs("sa-slice-move", src),
-            "slicing a Move-struct array must stay rejected",
+            diagnostics.contains("slicing a fixed array requires an array literal or a variable"),
+            "an arbitrary struct-array expression should get the slot diagnostic:\n{diagnostics}",
         );
     }
 
     #[test]
-    fn an_unbound_struct_array_temporary_cannot_be_sliced() {
-        // A fixed array lives in a stack slot, so only a named local or a literal can be viewed.
+    fn a_move_struct_slice_receiver_is_rejected() {
+        // `slice<MoveStruct>` is declarable, and the shared element guard must reject viewing it
+        // — the validator always did, so a sema gap here was an internal error, not a diagnostic.
         let src = "\
-S { a: i64 }
-fn make() -> array<S> = [S { a: 1 }].to_array()
-fn main() -> Result<(), Error> {
-  print(make()[0..1].len())
-  return Ok(())
-}
+S { name: string }
+fn first(xs: slice<S>) -> i64 = xs[0..1].len()
+fn main() -> Result<(), Error> = Ok(())
 ";
-        let _ = check_diagnostics("sa-slice-temp", src);
+        let diagnostics = check_diagnostics("sa-slice-move-recv", src);
+        assert!(
+            diagnostics.contains("slicing a collection of the Move type"),
+            "a Move-struct slice receiver should be rejected in sema:\n{diagnostics}",
+        );
     }
 }

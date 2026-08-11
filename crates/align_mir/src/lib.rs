@@ -8636,13 +8636,14 @@ fn lower_slice_range(b: &mut Builder, recv: &hir::Expr, start: Option<&hir::Expr
     };
     // Base `{ptr,len}` value. A fixed array — scalar or struct element — lives in a stack slot
     // and becomes a view here; every other receiver is already `{ptr,len}`.
-    let base = match recv.ty {
-        Ty::Array(..) | Ty::StructArray(..) => {
-            let element = match recv.ty {
-                Ty::Array(scalar, _) => scalar,
-                Ty::StructArray(id, _) => Scalar::Struct(id),
-                _ => unreachable!("fixed-array receiver"),
-            };
+    // A fixed array — scalar or struct element — is a stack slot that becomes a view here.
+    let slot_element = match recv.ty {
+        Ty::Array(scalar, _) => Some(scalar),
+        Ty::StructArray(id, _) => Some(Scalar::Struct(id)),
+        _ => None,
+    };
+    let base = match slot_element {
+        Some(element) => {
             let (slot, n) = array_source_slot(b, recv);
             if !lowering_continues(b) {
                 return Operand::Const(Const::Unit);
@@ -8651,7 +8652,7 @@ fn lower_slice_range(b: &mut Builder, recv: &hir::Expr, start: Option<&hir::Expr
             b.push(Stmt::Let(v, Rvalue::MakeSlice(slot, n)));
             Operand::Value(v)
         }
-        _ => lower_borrowed_owned(b, recv),
+        None => lower_borrowed_owned(b, recv),
     };
     if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
