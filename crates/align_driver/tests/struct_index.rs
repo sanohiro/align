@@ -495,4 +495,103 @@ fn main() -> Result<(), Error> = Ok(())
             "a Move-struct slice receiver should be rejected in sema:\n{diagnostics}",
         );
     }
+
+    #[test]
+    fn a_move_sum_type_element_is_rejected_by_every_reader() {
+        // A sum type with an owned payload is Move exactly as a `string`-bearing struct is, and a
+        // `slice<E>` / `array<E>` parameter is declarable. Sema's element deny-list had no arm for
+        // it while the MIR gate asked the real Move question, so each of these read a Move element
+        // out of a collection, passed checking, and failed HIR validation as an internal error.
+        for (label, source) in [
+            (
+                "index",
+                "E { A(string), B }\nfn first(xs: slice<E>) -> i64 { y := xs[0]\n  return 0 }\nfn main() -> Result<(), Error> = Ok(())\n",
+            ),
+            (
+                "slice-range",
+                "E { A(string), B }\nfn view(xs: slice<E>) -> i64 = xs[0..1].len()\nfn main() -> Result<(), Error> = Ok(())\n",
+            ),
+            (
+                "owned-array-index",
+                "E { A(string), B }\nfn first(xs: array<E>) -> i64 { y := xs[0]\n  return 0 }\nfn main() -> Result<(), Error> = Ok(())\n",
+            ),
+        ] {
+            let diagnostics = check_diagnostics(&format!("sa-move-enum-{label}"), source);
+            assert!(
+                diagnostics.contains("the Move type E"),
+                "a Move sum-type element should be rejected in sema ({label}):\n{diagnostics}",
+            );
+            assert!(
+                !diagnostics.contains("failed HIR validation"),
+                "a Move sum-type element must be a diagnostic, not an internal error ({label}):\n{diagnostics}",
+            );
+        }
+    }
+
+    #[test]
+    fn an_array_to_slice_borrow_of_a_move_element_is_rejected_at_every_init_site() {
+        // The array → slice borrow is the third element reader: the view makes the source's
+        // elements readable, and the MIR boundary has always refused it for a Move element. Sema
+        // built the borrow unguarded at all three init sites, so an owned `array<string>` reaching
+        // a `slice<string>` position was an internal error instead of a diagnostic.
+        for (label, source) in [
+            (
+                "call-argument",
+                "fn take(xs: slice<string>) -> i64 = xs.len()\nfn main() -> Result<(), Error> {\n  mut b: array_builder<string> := array_builder()\n  b.push(\"a\".clone())\n  built := b.build()\n  print(take(built))\n  return Ok(())\n}\n",
+            ),
+            (
+                "struct-field",
+                "Holder { names: slice<string> }\nfn main() -> Result<(), Error> {\n  mut b: array_builder<string> := array_builder()\n  b.push(\"a\".clone())\n  built := b.build()\n  h := Holder { names: built }\n  print(h.names.len())\n  return Ok(())\n}\n",
+            ),
+            (
+                "let-annotation",
+                "fn main() -> Result<(), Error> {\n  mut b: array_builder<string> := array_builder()\n  b.push(\"a\".clone())\n  built := b.build()\n  view: slice<string> := built\n  print(view.len())\n  return Ok(())\n}\n",
+            ),
+        ] {
+            let diagnostics = check_diagnostics(&format!("sa-slice-borrow-{label}"), source);
+            assert!(
+                diagnostics.contains("slicing a collection of the Move type string"),
+                "an owned `array<string>` borrowed as a slice should be rejected in sema ({label}):\n{diagnostics}",
+            );
+            assert!(
+                !diagnostics.contains("failed HIR validation"),
+                "the borrow must be a diagnostic, not an internal error ({label}):\n{diagnostics}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_move_element_slice_type_is_still_declarable_and_passable() {
+        // Only the element *read* and the array → slice *borrow* are rejected. Declaring the view
+        // type, taking its length, and forwarding an existing view stay legal — over-rejecting here
+        // would take the whole `slice<E>` surface away.
+        for (label, source) in [
+            (
+                "move-enum",
+                "E { A(string), B }\nfn take(xs: slice<E>) -> i64 = xs.len()\nfn forward(xs: slice<E>) -> i64 = take(xs)\nfn main() -> i32 = 0\n",
+            ),
+            (
+                "owned-string",
+                "fn take(xs: slice<string>) -> i64 = xs.len()\nfn forward(xs: slice<string>) -> i64 = take(xs)\nfn main() -> i32 = 0\n",
+            ),
+        ] {
+            let diagnostics = check_diagnostics(&format!("sa-move-slice-ok-{label}"), source);
+            assert!(
+                diagnostics.is_empty(),
+                "a Move-element slice parameter must still check ({label}):\n{diagnostics}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_copy_sum_type_element_still_reads() {
+        if !backend_available() {
+            return;
+        }
+        // The widened rule must not reject a Copy sum type: its element read copies a tag.
+        let src = "C { A(i32), B }\nfn main() -> Result<(), Error> {\n  xs := [C.A(7), C.B]\n  print(match xs[0] { A(v) => v, B => 0 })\n  return Ok(())\n}\n";
+        let out = build_and_run("sa-copy-enum-index", src);
+        assert_eq!(out.status.code(), Some(0));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+    }
 }

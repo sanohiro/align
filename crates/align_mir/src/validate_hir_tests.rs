@@ -12573,6 +12573,311 @@ fn hir_body_type_mangle_golden_vectors() {
     );
 }
 
+/// Compile-time tripwire for the delegated-predicate sweep below: a new [`Scalar`] variant fails
+/// this match, which is the signal to add it to `delegation_scalar_samples`. A variant that only
+/// ever reaches one of the two models (sema's rule and the checked-HIR gate that must ask it) is
+/// how a checked program silently lowered to an empty unit three times.
+#[allow(dead_code)]
+const fn delegation_scalar_sweep_tripwire(scalar: &Scalar) {
+    match *scalar {
+        Scalar::Int { .. }
+        | Scalar::Float { .. }
+        | Scalar::Bool
+        | Scalar::Char
+        | Scalar::Unit
+        | Scalar::Struct { .. }
+        | Scalar::String
+        | Scalar::DynArray { .. }
+        | Scalar::DynStructArray { .. }
+        | Scalar::DynResponseArray
+        | Scalar::Str
+        | Scalar::Slice { .. }
+        | Scalar::Enum { .. }
+        | Scalar::Tagged { .. }
+        | Scalar::Soa { .. }
+        | Scalar::SoaParam { .. }
+        | Scalar::JsonDoc
+        | Scalar::Param { .. }
+        | Scalar::Reader
+        | Scalar::Writer
+        | Scalar::Buffer
+        | Scalar::Regex
+        | Scalar::Captures
+        | Scalar::CliParsed
+        | Scalar::TcpConn
+        | Scalar::TcpListener
+        | Scalar::UdpSocket
+        | Scalar::Child
+        | Scalar::File
+        | Scalar::HttpResponse
+        | Scalar::HttpServer
+        | Scalar::HttpRequestCtx
+        | Scalar::ResponseBuilder
+        | Scalar::HttpStream
+        | Scalar::RunOutput
+        | Scalar::Fn { .. }
+        | Scalar::Resource { .. }
+        | Scalar::ResourceRef { .. } => {}
+    }
+}
+
+/// One sample per [`Scalar`] variant, plus a Move and a Copy instance of every nominal variant,
+/// against `delegation_program`'s tables.
+fn delegation_scalar_samples() -> Vec<Scalar> {
+    vec![
+        scalar_int(8),
+        scalar_int(64),
+        Scalar::Int(IntTy {
+            bits: 32,
+            signed: false,
+        }),
+        Scalar::Float(FloatTy { bits: 32 }),
+        Scalar::Float(FloatTy { bits: 64 }),
+        Scalar::Bool,
+        Scalar::Char,
+        Scalar::Unit,
+        Scalar::Struct(0),
+        Scalar::Struct(1),
+        Scalar::String,
+        Scalar::DynArray(PrimScalar::Int(IntTy {
+            bits: 64,
+            signed: true,
+        })),
+        Scalar::DynStructArray(0),
+        Scalar::DynResponseArray,
+        Scalar::Str,
+        Scalar::Slice(PrimScalar::Int(IntTy {
+            bits: 64,
+            signed: true,
+        })),
+        Scalar::Enum(0),
+        Scalar::Enum(1),
+        Scalar::Tagged(0),
+        Scalar::Tagged(1),
+        Scalar::Soa(0),
+        Scalar::SoaParam(0),
+        Scalar::JsonDoc,
+        Scalar::Param(0),
+        Scalar::Reader,
+        Scalar::Writer,
+        Scalar::Buffer,
+        Scalar::Regex,
+        Scalar::Captures,
+        Scalar::CliParsed,
+        Scalar::TcpConn,
+        Scalar::TcpListener,
+        Scalar::UdpSocket,
+        Scalar::Child,
+        Scalar::File,
+        Scalar::HttpResponse,
+        Scalar::HttpServer,
+        Scalar::HttpRequestCtx,
+        Scalar::ResponseBuilder,
+        Scalar::HttpStream,
+        Scalar::RunOutput,
+        Scalar::Fn(0),
+        Scalar::Resource(0),
+        Scalar::ResourceRef(0),
+    ]
+}
+
+/// `baseline_program` plus one Move instance of every nominal shape (a `string`-bearing struct,
+/// sum type, tagged payload, and tuple), a package resource, and the struct shapes the `soa` gates
+/// discriminate: `struct#0` Copy + `SoaPlain`, `struct#1` Move, `struct#2` non-plain field,
+/// `struct#3` field-less, `struct#4` a `SoaPlain` field class with an impossible store width.
+fn delegation_program() -> hir::Program {
+    let mut program = baseline_program();
+    program.structs.push(StructDef {
+        name: "Owned".to_string(),
+        source_name: "Owned".to_string(),
+        fields: vec![FieldDef {
+            name: "text".to_string(),
+            ty: Ty::String,
+        }],
+        align: None,
+        c_repr: false,
+    });
+    program.structs.push(StructDef {
+        name: "Nested".to_string(),
+        source_name: "Nested".to_string(),
+        fields: vec![FieldDef {
+            name: "inner".to_string(),
+            ty: Ty::Struct(0),
+        }],
+        align: None,
+        c_repr: false,
+    });
+    program.structs.push(StructDef {
+        name: "Empty".to_string(),
+        source_name: "Empty".to_string(),
+        fields: Vec::new(),
+        align: None,
+        c_repr: false,
+    });
+    program.structs.push(StructDef {
+        name: "OddWidth".to_string(),
+        source_name: "OddWidth".to_string(),
+        fields: vec![FieldDef {
+            name: "value".to_string(),
+            ty: Ty::Int(IntTy {
+                bits: 7,
+                signed: true,
+            }),
+        }],
+        align: None,
+        c_repr: false,
+    });
+    program.enums.push(EnumDef {
+        name: "Owner".to_string(),
+        source_name: "Owner".to_string(),
+        variants: vec![
+            EnumVariant {
+                name: "Text".to_string(),
+                payload: vec![Scalar::String],
+                field_base: 1,
+            },
+            EnumVariant {
+                name: "None".to_string(),
+                payload: Vec::new(),
+                field_base: 1,
+            },
+        ],
+    });
+    program.tagged_types.push(TaggedType::Option(Scalar::String));
+    program.tuples.push(TupleDef {
+        elems: vec![Scalar::String, scalar_int(64)],
+    });
+    program.resources.push(ResourceDef {
+        name: "pkg.db$conn".to_string(),
+        source_name: "pkg.db$conn".to_string(),
+        declaring_module: "pkg.db".to_string(),
+        generic_arity: 0,
+        drop_hook: "pkg.db.internal.resource$drop_conn".to_string(),
+        drop_thunk: "__align_resource_drop$pkg.db$conn".to_string(),
+        representation_version: 1,
+        drop_abi_fingerprint: [0; 16],
+    });
+    program
+}
+
+/// Sweep the constructible type space through the checked-HIR gates that delegate an ownership or
+/// shape rule to the producer.
+///
+/// What this proves, exactly: each gate is still a thin wrapper over the sema predicate it
+/// delegates to (a re-introduced local rule diverges here), the scalar-level and `Ty`-level element
+/// rules still coincide (their divergence is the defect this closes), and the literal expectations
+/// below pin today's classification of the aggregate and soa shapes. Because both sides are read
+/// from the same producer, it does **not** detect a change to the producer's rule itself — that is
+/// what the pinned literal rows and the driver owner tests are for. The `Scalar` tripwire above is
+/// the part that fails on a new variant.
+#[test]
+fn delegated_ownership_and_shape_gates_agree_with_sema() {
+    let program = delegation_program();
+    let gates = crate::validate_hir::DelegatedGates::new(&program);
+    let is_move = |scalar: Scalar| {
+        align_sema::scalar_is_move(
+            scalar,
+            &program.structs,
+            &program.enums,
+            &program.tagged_types,
+        )
+    };
+    let element_read_ok = |ty: Ty| {
+        align_sema::collection_element_read_ok(
+            ty,
+            &program.structs,
+            &program.tuples,
+            &program.enums,
+            &program.tagged_types,
+        )
+    };
+
+    for scalar in delegation_scalar_samples() {
+        assert_eq!(
+            gates.scalar_copy_ok(scalar),
+            !is_move(scalar),
+            "the copy gate must be sema's Move rule for {scalar:?}"
+        );
+        // The element rule is asked at `Ty` granularity by `check_index` and at `Scalar`
+        // granularity by `check_slice_range`; a gap between those two spellings is exactly the
+        // Move-sum-type / resource element that sema accepted and this validator refused.
+        let element = align_sema::scalar_to_ty(scalar);
+        assert_eq!(
+            element_read_ok(element),
+            !is_move(scalar),
+            "the element read rule must match the scalar Move rule for {scalar:?}"
+        );
+        assert_eq!(
+            gates.collection_element_read_ok(element),
+            gates.body_ty_ok(element) && element_read_ok(element),
+            "the validator's element gate must be structural validity plus sema's rule for {scalar:?}"
+        );
+    }
+
+    // A handle is never readable out of a collection: the copy would close the same fd twice.
+    for &handle in align_sema::MOVE_HANDLE_TYPES {
+        assert!(
+            !element_read_ok(handle),
+            "{handle:?} must never be readable as a collection element"
+        );
+    }
+
+    // Aggregate elements own their contents element-wise, so the rule sees through them.
+    for (element, expected) in [
+        (Ty::Array(scalar_int(64), 2), true),
+        (Ty::Array(Scalar::String, 2), false),
+        (Ty::StructArray(0, 2), true),
+        (Ty::StructArray(1, 2), false),
+        (Ty::Tuple(0), true),
+        (Ty::Tuple(1), false),
+        (Ty::Box(scalar_int(64)), false),
+        (
+            Ty::ArrayBuilder(scalar_int(64)),
+            false,
+        ),
+        (Ty::Option(scalar_int(64)), true),
+        (Ty::Option(Scalar::String), false),
+        (Ty::Result(scalar_int(64), Scalar::Enum(0)), true),
+        (Ty::Result(scalar_int(64), Scalar::Enum(1)), false),
+        (Ty::Str, true),
+        (Ty::Soa(0), true),
+    ] {
+        assert_eq!(
+            element_read_ok(element),
+            expected,
+            "element read rule for {element:?}"
+        );
+    }
+
+    // The four soa gates are one rule (`soa_plain_ok`) plus, for the two store-bearing gates, the
+    // validator's own field-width check. `struct#4` is the only shape where they may differ.
+    for id in 0..program.structs.len() as u32 {
+        let plain = align_sema::soa_plain_ok(id, &program.structs);
+        let [placement, store, json, struct_array] = gates.soa_gates(id);
+        assert_eq!(placement, plain, "soa placement gate for struct#{id}");
+        assert_eq!(struct_array, plain, "soa struct-array gate for struct#{id}");
+        assert_eq!(store, json, "the two store-bearing soa gates for struct#{id}");
+        let widths_ok = program.structs[id as usize]
+            .fields
+            .iter()
+            .all(|field| !matches!(field.ty, Ty::Int(integer) if integer.bits == 7));
+        assert_eq!(
+            store,
+            plain && widths_ok,
+            "the store-bearing soa gate is sema's shape plus a width check for struct#{id}"
+        );
+    }
+    assert!(align_sema::soa_plain_ok(0, &program.structs));
+    assert!(!align_sema::soa_plain_ok(1, &program.structs));
+    assert!(!align_sema::soa_plain_ok(2, &program.structs));
+    assert!(!align_sema::soa_plain_ok(3, &program.structs));
+    assert!(align_sema::soa_plain_ok(4, &program.structs));
+    assert!(!align_sema::soa_plain_ok(
+        program.structs.len() as u32,
+        &program.structs
+    ));
+}
+
 #[test]
 fn hir_body_validator_prepared_binder_bridge_fails_closed() {
     let mut program = baseline_program();

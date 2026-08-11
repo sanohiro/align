@@ -723,3 +723,28 @@ pub fn main(args: array<str>) -> Result<(), Error> {
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "active score: 42\n");
 }
+
+/// The owned `array<string>` `fs.read_dir` returns cannot be borrowed as a `slice<string>`: the
+/// view would make its Move elements readable, which the MIR boundary refuses. The producer must
+/// say so with a diagnostic — this shape used to reach the boundary and report an internal error.
+#[test]
+fn read_dir_result_cannot_be_borrowed_as_a_move_element_slice() {
+    let prog = "\
+import std.fs
+fn count(names: slice<string>) -> i64 = names.len()
+pub fn main(args: array<str>) -> Result<(), Error> {
+  names := fs.read_dir(args[1])?
+  print(count(names))
+  return Ok(())
+}
+";
+    let diagnostics = check_diagnostics("m9fs-readdir-slice-borrow", prog);
+    assert!(
+        diagnostics.contains("slicing a collection of the Move type string"),
+        "borrowing an owned `array<string>` as a slice must be diagnosed:\n{diagnostics}",
+    );
+    assert!(
+        !diagnostics.contains("failed HIR validation"),
+        "it must be a diagnostic, not an internal error:\n{diagnostics}",
+    );
+}

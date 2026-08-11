@@ -330,6 +330,28 @@ fn resources_are_excluded_from_fixed_arrays_and_spawn_captures() {
 }
 
 #[test]
+fn resource_elements_cannot_be_read_out_of_a_collection() {
+    // `slice<conn>` is a declarable parameter type, so the element readers are reachable: reading
+    // one out would copy the handle and run its Drop hook twice. Sema's element deny-list had no
+    // resource arm while the MIR gate classified the handle as Move, so both of these passed
+    // checking and failed HIR validation as an internal error instead of diagnosing.
+    for (name, entry, needle) in [
+        (
+            "resource-slice-index",
+            "module main\nimport pkg.db\nfn first(xs: slice<pkg.db.conn>) -> i32 { owner := xs[0]; return 0 }\nfn main() -> i32 = 0\n",
+            "indexing an array of the Move type",
+        ),
+        (
+            "resource-slice-range",
+            "module main\nimport pkg.db\nfn view(xs: slice<pkg.db.conn>) -> i64 = xs[0..1].len()\nfn main() -> i32 = 0\n",
+            "slicing a collection of the Move type",
+        ),
+    ] {
+        assert_rejected(name, &files(entry), needle);
+    }
+}
+
+#[test]
 fn drop_hook_contract_is_checked_in_the_producer() {
     let private_internal = "\
 module pkg.db.internal.resource

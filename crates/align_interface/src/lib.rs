@@ -1175,33 +1175,74 @@ enum BuiltinCapability {
     Opaque,
 }
 
+/// Every builtin type spelling an interface can carry, with its argument arity and capability.
+/// Kept as data (not match arms) so a test can sweep the exact set against `align_sema`'s
+/// ownership bridge in both directions: the two describe one language, and a spelling that only
+/// one of them knows is how a valid interface starts failing import validation.
+const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
+    ("str", 0, BuiltinCapability::BorrowLeaf),
+    ("region", 0, BuiltinCapability::BorrowLeaf),
+    ("reader", 0, BuiltinCapability::BorrowLeaf),
+    ("writer", 0, BuiltinCapability::BorrowLeaf),
+    ("http_headers", 0, BuiltinCapability::BorrowLeaf),
+    ("json.doc", 0, BuiltinCapability::BorrowLeaf),
+    ("slice", 1, BuiltinCapability::BorrowLeaf),
+    ("soa", 1, BuiltinCapability::BorrowLeaf),
+    ("json.scanner", 1, BuiltinCapability::BorrowLeaf),
+    ("resource_ref", 1, BuiltinCapability::BorrowLeaf),
+    ("Option", 1, BuiltinCapability::Transparent),
+    ("array", 1, BuiltinCapability::Transparent),
+    ("Result", 2, BuiltinCapability::Transparent),
+    ("box", 1, BuiltinCapability::Opaque),
+    ("array_builder", 1, BuiltinCapability::Opaque),
+    ("buffer", 0, BuiltinCapability::Opaque),
+    ("file", 0, BuiltinCapability::Opaque),
+    ("rng", 0, BuiltinCapability::Opaque),
+    ("regex", 0, BuiltinCapability::Opaque),
+    ("captures", 0, BuiltinCapability::Opaque),
+    ("tcp_conn", 0, BuiltinCapability::Opaque),
+    ("tcp_listener", 0, BuiltinCapability::Opaque),
+    ("udp_socket", 0, BuiltinCapability::Opaque),
+    ("child", 0, BuiltinCapability::Opaque),
+    ("http_request_ctx", 0, BuiltinCapability::Opaque),
+    ("response_builder", 0, BuiltinCapability::Opaque),
+    ("http_stream", 0, BuiltinCapability::Opaque),
+    ("json.kind", 0, BuiltinCapability::Opaque),
+    ("Error", 0, BuiltinCapability::Opaque),
+    ("core.Error", 0, BuiltinCapability::Opaque),
+    ("argon2_params", 0, BuiltinCapability::Opaque),
+    ("crypto.argon2_params", 0, BuiltinCapability::Opaque),
+    ("regex_match", 0, BuiltinCapability::Opaque),
+    ("regex.regex_match", 0, BuiltinCapability::Opaque),
+    ("()", 0, BuiltinCapability::Opaque),
+    ("bool", 0, BuiltinCapability::Opaque),
+    ("char", 0, BuiltinCapability::Opaque),
+    ("string", 0, BuiltinCapability::Opaque),
+    ("i8", 0, BuiltinCapability::Opaque),
+    ("i16", 0, BuiltinCapability::Opaque),
+    ("i32", 0, BuiltinCapability::Opaque),
+    ("i64", 0, BuiltinCapability::Opaque),
+    ("u8", 0, BuiltinCapability::Opaque),
+    ("u16", 0, BuiltinCapability::Opaque),
+    ("u32", 0, BuiltinCapability::Opaque),
+    ("u64", 0, BuiltinCapability::Opaque),
+    ("f32", 0, BuiltinCapability::Opaque),
+    ("f64", 0, BuiltinCapability::Opaque),
+    ("raw", 0, BuiltinCapability::Opaque),
+];
+
 fn builtin_capability(path: &str) -> Option<(usize, BuiltinCapability)> {
-    let result = match path {
-        "str" | "region" | "reader" | "writer" | "http_headers" | "json.doc" => {
-            (0, BuiltinCapability::BorrowLeaf)
-        }
-        "slice" | "soa" | "json.scanner" | "resource_ref" => {
-            (1, BuiltinCapability::BorrowLeaf)
-        }
-        "Option" | "array" => (1, BuiltinCapability::Transparent),
-        "Result" => (2, BuiltinCapability::Transparent),
-        "box" | "array_builder" => (1, BuiltinCapability::Opaque),
-        "buffer" | "file" | "rng" | "regex" | "captures" | "tcp_conn"
-        | "tcp_listener" | "udp_socket" | "child" | "http_request_ctx"
-        | "response_builder" | "http_stream" | "json.kind" | "Error" | "core.Error"
-        | "argon2_params" | "crypto.argon2_params" | "regex_match"
-        | "regex.regex_match" | "()" | "bool" | "char" | "string"
-        | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
-        | "f32" | "f64" | "raw" => (0, BuiltinCapability::Opaque),
-        _ => {
-            let vector = path
-                .strip_prefix("vec")
-                .or_else(|| path.strip_prefix("mask"))
-                .is_some_and(|width| matches!(width, "2" | "4" | "8" | "16"));
-            return vector.then_some((1, BuiltinCapability::Opaque));
-        }
-    };
-    Some(result)
+    if let Some((_, arity, capability)) = BUILTIN_CAPABILITIES
+        .iter()
+        .find(|(spelling, _, _)| *spelling == path)
+    {
+        return Some((*arity, *capability));
+    }
+    let vector = path
+        .strip_prefix("vec")
+        .or_else(|| path.strip_prefix("mask"))
+        .is_some_and(|width| matches!(width, "2" | "4" | "8" | "16"));
+    vector.then_some((1, BuiltinCapability::Opaque))
 }
 
 fn bare_nominal_alias_prefers_local(path: &str) -> bool {
@@ -1324,19 +1365,19 @@ impl<'a> CapabilityAnalysis<'a> {
                         result.params[index] = true;
                         continue;
                     }
-                    match path.as_str() {
-                        "Option" | "Result" => {
-                            work.extend(args);
-                            continue;
-                        }
-                        "array" | "array_builder" | "string" | "reader" | "writer"
-                        | "buffer" | "file" | "regex" | "captures" | "tcp_conn"
-                        | "tcp_listener" | "udp_socket" | "child" | "http_request_ctx"
-                        | "response_builder" | "http_stream" => {
-                            result.intrinsic = true;
-                            continue;
-                        }
-                        _ => {}
+                    if matches!(path.as_str(), "Option" | "Result") {
+                        work.extend(args);
+                        continue;
+                    }
+                    // Whether a builtin owns droppable storage is sema's `needs_drop_flag`, reached
+                    // through its spelling bridge. A hand-written name table here was a second model
+                    // of the very bit this analysis validates, so a new droppable builtin surface
+                    // type would have rejected every valid interface that returns it.
+                    if let Some(owns_droppable) =
+                        align_sema::builtin_spelling_needs_return_cleanup(path)
+                    {
+                        result.intrinsic |= owns_droppable;
+                        continue;
                     }
                     if builtin_capability_after_local(&self.index, path).is_some() {
                         continue;
@@ -2494,4 +2535,81 @@ pub fn summary_resource_hook_facts(
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod builtin_spelling_tests {
+    use super::*;
+
+    /// The interface layer knows builtin *spellings*; `align_sema` knows what each one owns. Since
+    /// import validation compares a recorded cleanup bit against sema's answer for a spelling, the
+    /// two sets must describe one language. Sweep both directions so a spelling only one side knows
+    /// fails here instead of rejecting a valid interface as a return-cleanup mismatch.
+    #[test]
+    fn the_ownership_bridge_and_the_builtin_capability_set_cover_the_same_spellings() {
+        // Heads whose ownership needs a nominal argument or a local definition, so the bridge
+        // deliberately does not answer for them; the capability table and the definition index do.
+        let nominal_or_local = [
+            "soa",
+            "json.scanner",
+            "resource_ref",
+            "json.kind",
+            "Error",
+            "core.Error",
+            "argon2_params",
+            "crypto.argon2_params",
+            "regex_match",
+            "regex.regex_match",
+            // Walked into their arguments by the ownership analysis itself.
+            "Option",
+            "Result",
+        ];
+        for (spelling, _, _) in BUILTIN_CAPABILITIES {
+            let bridged = align_sema::builtin_spelling_needs_return_cleanup(spelling);
+            if nominal_or_local.contains(spelling) {
+                assert_eq!(
+                    bridged, None,
+                    "`{spelling}` is resolved by the analysis, not the ownership bridge"
+                );
+            } else {
+                assert!(
+                    bridged.is_some(),
+                    "`{spelling}` is an interface spelling with no ownership answer — a function \
+                     returning it would be validated against a guess"
+                );
+            }
+        }
+        for (spelling, _) in align_sema::BUILTIN_SPELLING_TYS {
+            assert!(
+                builtin_capability(spelling).is_some(),
+                "the ownership bridge answers for `{spelling}`, which this crate does not accept \
+                 as a builtin spelling"
+            );
+        }
+        // The prefix-parsed heads the table cannot list: both sides must still agree they are
+        // builtins that own nothing.
+        for spelling in ["vec4", "mask8"] {
+            assert!(builtin_capability(spelling).is_some());
+            assert_eq!(
+                align_sema::builtin_spelling_needs_return_cleanup(spelling),
+                None,
+                "a `{spelling}` head carries its element in an argument; the analysis walks it"
+            );
+        }
+        // An integer spelling is parsed, not listed, and must agree on both sides.
+        for spelling in ["i8", "u64"] {
+            assert!(builtin_capability(spelling).is_some());
+            assert_eq!(
+                align_sema::builtin_spelling_needs_return_cleanup(spelling),
+                Some(false)
+            );
+        }
+        // A non-canonical integer spelling is whatever the *resolver's* parser says it is (`i08`
+        // resolves to `i8` there), so the bridge reuses that parser rather than a second one.
+        assert_eq!(
+            align_sema::builtin_spelling_needs_return_cleanup("i08"),
+            align_sema::builtin_spelling_needs_return_cleanup("i8"),
+            "the bridge must classify an integer spelling exactly as the type resolver does"
+        );
+    }
 }
