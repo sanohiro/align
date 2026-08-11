@@ -8,6 +8,9 @@ if [[ $# -eq 0 ]]; then
 fi
 command -v cargo >/dev/null 2>&1 || { echo "cargo is required" >&2; exit 2; }
 
+# shellcheck source=scripts/dyld-env.sh
+. "$(dirname "$0")/dyld-env.sh"
+
 llvm_config="${LLVM_CONFIG:-}"
 if [[ -n "$llvm_config" ]]; then
   resolved="$(command -v "$llvm_config" 2>/dev/null || true)"
@@ -68,13 +71,7 @@ if [[ "$(uname -s)" == Darwin ]]; then
   prepend_library_path /usr/local/opt/openssl@3/lib
   prepend_library_path /usr/local/opt/libpq/lib
   export LIBRARY_PATH
-  # Some macOS hosts intermittently park freshly linked test binaries at 0% CPU
-  # in _dyld_start against the shared dyld cache (recurring HANDOFF incidents,
-  # historically dodged per-run with dedicated target dirs). A private region
-  # avoids the stall. Respect an explicit override, and leave CI untouched.
-  if [[ -z "${CI:-}" ]]; then
-    export DYLD_SHARED_REGION="${DYLD_SHARED_REGION:-private}"
-  fi
+  align_use_private_dyld_region
 fi
 
 exec cargo "$@"
