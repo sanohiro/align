@@ -3581,6 +3581,8 @@ synchronized pathではparentをreuseできる。serverがunexpected COPY/pipeli
 statusを返した場合はcurrent resultをonce clearし、`PQfinish`だけでphysical connectionをcloseし、
 parent stateをunusableにし、全local ownerをfreeして下記exact errorを返す。intervening/later
 result/COPY/cancel/transaction-state/blocking-mode/pipeline-exit callは行わない。
+first result前のnullはdistinct unavailable-initial-result protocol failureである。clearするPGresultはなく、
+status/direction/metadata/transaction-state/blocking-restoration call前にimmediate closeする。
 
 `options`はexisting common `TimeoutNs`だけを、そのshipped positivity/duplicate/absolute deadline/
 original-duration recovery/source-order ruleで受け付ける。`native`はpreceding ledgerのdescriptor-v6
@@ -3762,14 +3764,31 @@ same resource Drop thunk/public interfaceを作る。HIR exception/new intrinsic
 5. transfer/context recordをallocate/initialize;
 6. generated static validation;
 7. execution lease acquire;
-8. exact full normalized parameter-format vectorをinstallし、binder-v2 Measure、exact Parse/Bind budget validation、binder-v2 Encode、send boundaryまでpayload retain;
+8. exact full normalized parameter-format vectorをinstallし、exact Parse/Bind fixed budgetをvalidate+initializeしてからbinder-v2 Measure/binder-v2 Encode、send boundaryまでpayload retain;
 9. Timeoutありならnonblocking enable後send直前にclock reread。expiryはsend/COPY/cancel zeroでrestore-or-close;
-10. once send、deadline内flush/wait、one initial result取得、metadata前にdirection validation;
-11. `PQbinaryTuples`、`PQnfields`、every `PQfformat`を`expected_format`へvalidateし、initial result clear後resource publish。
+10. once send、deadline内flush/wait後、initial resultへ`PQgetResult`をcallする。nullはclassification前にfail-closeし、non-nullはone local PGresult ownerをestablishする;
+11. live resultをclassifyしてmetadata前にdirection validationする。expected COPY directionでは`PQbinaryTuples`、`PQnfields`、every `PQfformat`を`expected_format`へvalidateし、initial ownerをexactly once consumeしてdependent resource publishまたは下記outcome-specific drain/closeをcompleteする。
 
 earlier failure後にlater stepをrunしない。direct executionでsettledのとおりnative stateはgenerated static
 validationより先にbeginし、parameter measurementはlease後である。every pairwise multi-invalid/failpoint
 ownerはexact winnerとlater phaseのzero call/allocationをassertする。
+
+initial-handshake outcome+PGresult ownership productはexhaustiveである:
+
+| Initial `PQgetResult` outcome | Calls while live | Exact owner/connection action |
+|---|---|---|
+| null | status/direction/metadata/transaction-state/restore callなし | clearなし、synthetic unavailable-initial-result `Native`、immediate physical close+local-owner/lease cleanup |
+| expected `PGRES_COPY_IN`/`PGRES_COPY_OUT`, valid metadata | status後overall/count/every-column metadata | exactly once clear、matching Active transfer publish、lease retain |
+| expected COPY direction, format/metadata rejection | status後first failing fieldまでのmetadataだけ | exactly once clear、immediate physical close、every local owner free+lease release |
+| opposite COPY directionまたは`PGRES_COPY_BOTH` | statusだけ | exactly once clear、immediate physical close、every local owner free+lease release |
+| pipeline/unknown status | statusだけ | exactly once clear、immediate physical close、every local owner free+lease release |
+| ordinary known non-COPY status | status+exact classificationに必要なerror field | one clear前にprimaryをcopy、later ordinary resultをnullまでdrain+clearし、transaction stateをproveしてblocking restore。later COPY/pipeline/unknown resultはonce clear+immediate close |
+
+every non-null initial resultはdirection/metadata/restore/fail-closed rejectionを含めone and only one
+`PQclear`を持つ。`PQfinish`はclearの代用にならない。local transfer/context/format/payload ownerはevery
+unpublished outcomeでlast dependent call後にfreeし、valid expected-direction rowだけがtransfer owner+leaseを
+public resourceへmoveする。pairwise phase ownerはfixed Parse/Bind initializationがevery parameter Measure
+errorに勝ち、fixed-budget failureがMeasure/Encode/send/result APIをzero callにすることを証明する。
 
 active state machineはexact:
 
@@ -3862,6 +3881,7 @@ libpqからcopyするerrorはshipped field extraction+first-error ruleを維持�
 | Delivery in COPY native options | `Unsupported`, item `postgres.copy.delivery`, message `PostgreSQL COPY owns its data delivery protocol` |
 | non-PostgreSQL/unusable target | existing `DriverMismatch`/closed-target result、package COPY allocation/libpq前 |
 | initial ordinary native error | existing PostgreSQL native classification+copied fields |
+| initial PGresult前のnull | synthetic `Native`, message `PostgreSQL COPY initial result is unavailable`, clearなし、immediate physical close |
 | initial pipeline/unknown status | synthetic `Native`, message `PostgreSQL COPY protocol entered an unsupported state`, immediate physical close |
 | opposite COPY direction | `InvalidQuery`, item `postgres.copy.direction`, message `PostgreSQL COPY direction does not match the operation`+immediate physical close |
 | `PGRES_COPY_BOTH` | `Unsupported`, item `postgres.copy.direction`, message `PostgreSQL COPY BOTH is not supported`+immediate physical close |
@@ -3927,8 +3947,8 @@ Linux x86_64/ARM64/macOSで保持する。server 16.4/client >=17がrequired liv
 | Closure cell | Required discriminating owner |
 |---|---|
 | exported surface/unavailable siblings | exact public declaration golden; common/SQLite/dynamic/prepared COPYと`CopyOption`/callbackのcompile rejection |
-| start operation matrix | CopyIn/CopyOut x Conn/Tx x Text/Binary x timeout absent/present x zero/one/multiple/default/Text/Binary Params; overlap-before-full-vector-allocationとlease-before-installationを含むexact phase-order failpoint counter |
-| response metadata | direction、COPY BOTH、overall/every-column format、`0`/one/max columns、malformed count/code/pointer、initial ordinary/pipeline/unknown status |
+| start operation matrix | CopyIn/CopyOut x Conn/Tx x Text/Binary x timeout absent/present x zero/one/multiple/default/Text/Binary Params; overlap-before-full-vector-allocation、lease-before-installation、fixed Parse/Bind initialization-before-Measureを含むexact phase-order failpoint counter |
+| initial handshake/response metadata | null/non-null initial result、direction、COPY BOTH、overall/every-column format、`0`/one/max columns、malformed count/code/pointer、every ordinary/COPY/pipeline/unknown status。every non-null outcomeはexactly one clear、nullはzero clear/classification |
 | CopyIn data | empty no-call; one/multiple/`i32::MAX`/rejected-next chunk; rejected-nextはActiveでfollowing valid write/finish/abortがwork; queued/retry/hard error; post-call mutation; exact bytes/no package allocation-copy |
 | CopyOut data | zero-pending/positive/-1/-2; one/many/large row; exact zero-copy pointer/length; one-live-chunk exclusion; wrapper/libpq free count; malformed chunk |
 | finish/final results | clean active/exhausted finishはexact command result+COPY tag/count+nullをrequire; Complete finishはstored result+zero libpq; ordinary error; missing/extra result; repeated COPY/pipeline/unknown; restore/state failure; first-error preservation |
@@ -3960,6 +3980,13 @@ countをzero-call publish、every no-primary fail-closed pathはone exact synthe
 one exhaustive phase tableがpointer/deadline/flag/completion productをDrop behaviorへbindする。no-timeout hard
 I/O failureはimmediate closeし、only fixed implicit cancel budgetはexplicit no-timeout CopyOut abortの1秒である。
 これはindependent line fixでなくone state-machine redesignで、same public capability boundaryを保持する。
+
+next protocol-order reviewは2 new P1 start-handshake gap+1 P2 native-owner leakを発見したため、matrixを
+`start-handshake-outcome x protocol-budget-initialization x initial-result-ownership` axisでreopenする。
+preceding binary-format fixed Parse/Bind validationはMeasure前にrunする。one exhaustive initial-result tableが
+nullをclassification前にfail-closeし、every non-null resultへpublication/synchronized rejection/physical close前の
+exactly one clearをassignする。同じtableがlocal transfer/context/format/payload cleanupをownするため、reported
+3 lineでなくwhole start phaseをcloseし、same public capability boundaryを保持する。
 
 implementation前にこのledger+single capability boundaryをone fresh independent adversarial reviewする。
 start、both live direction、termination、cancellation、Drop、fake libpq、C signature probe、required live ownerが

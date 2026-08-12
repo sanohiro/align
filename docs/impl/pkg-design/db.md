@@ -5184,6 +5184,9 @@ COPY or pipeline subprotocol, or returned an unknown status, the package instead
 result once, calls only `PQfinish` to physically close the connection, marks the parent state
 unusable, frees every local owner, and returns the exact error below. It performs no intervening or
 later result, COPY, cancel, transaction-state, blocking-mode, or pipeline-exit call.
+Null before the first result is a distinct unavailable-initial-result protocol failure: there is no
+PGresult to clear, and the package immediately closes before any status, direction, metadata,
+transaction-state, or blocking-restoration call.
 
 `options` accepts the existing common `TimeoutNs` with its shipped positivity, duplicate, absolute
 deadline, original-duration recovery, and source-order rules. `native` accepts only
@@ -5391,19 +5394,40 @@ Start validation has one order for both directions:
 5. allocate and initialize the transfer/context records;
 6. run generated static validation;
 7. acquire the execution lease;
-8. install the exact full normalized parameter-format vector, then run binder-v2 Measure, exact
-   Parse/Bind budget validation, binder-v2 Encode, and retain all payloads through the send boundary;
+8. install the exact full normalized parameter-format vector, validate and initialize the exact
+   Parse/Bind fixed budgets, then run binder-v2 Measure and binder-v2 Encode, and retain all payloads
+   through the send boundary;
 9. with Timeout present, enable nonblocking mode and re-read the clock before send; expiry has zero
    send/COPY/cancel calls and restores or closes;
-10. send exactly once, flush/wait under the deadline, obtain one initial result, and validate
-    direction before metadata;
-11. validate `PQbinaryTuples`, `PQnfields`, and every `PQfformat` against `expected_format`; then
-    clear the initial result and publish the dependent resource.
+10. send exactly once, flush/wait under the deadline, and call `PQgetResult` for the initial result;
+    null fails closed before classification, while non-null establishes one local PGresult owner;
+11. classify the live result and validate direction before metadata; for the expected COPY direction,
+    validate `PQbinaryTuples`, `PQnfields`, and every `PQfformat` against `expected_format`; then
+    consume the initial owner exactly once and either publish the dependent resource or complete the
+    outcome-specific drain/close below.
 
 No later step runs after an earlier failure. Native state begins before generated static validation
 as settled for direct execution, while parameter measurement remains behind the lease. Every
 pairwise multi-invalid/failpoint owner asserts this exact winner and zero calls/allocations from
 later phases.
+
+The initial-handshake outcome and PGresult ownership product is exhaustive:
+
+| Initial `PQgetResult` outcome | Calls while live | Exact owner/connection action |
+|---|---|---|
+| null | no status, direction, metadata, transaction-state, or restore call | no clear; synthetic unavailable-initial-result `Native`; immediate physical close and local-owner/lease cleanup |
+| expected `PGRES_COPY_IN`/`PGRES_COPY_OUT`, valid metadata | status, then overall/count/every-column metadata | clear exactly once, publish the matching Active transfer, retain lease |
+| expected COPY direction, format or metadata rejection | status, then only metadata through the first failing field | clear exactly once, immediate physical close, free every local owner and release lease |
+| opposite COPY direction or `PGRES_COPY_BOTH` | status only | clear exactly once, immediate physical close, free every local owner and release lease |
+| pipeline or unknown status | status only | clear exactly once, immediate physical close, free every local owner and release lease |
+| ordinary known non-COPY status | status and any error fields needed by its exact classification | copy the primary before one clear, drain and clear each later ordinary result to null, then prove transaction state and restore blocking; any later COPY/pipeline/unknown result is cleared once and closes immediately |
+
+Every non-null initial result therefore has one and only one `PQclear`, including every direction,
+metadata, restore, and fail-closed rejection. `PQfinish` never substitutes for that clear. The local
+transfer/context/format/payload owners are freed after their last dependent call on every unpublished
+outcome; only the valid expected-direction row moves the transfer owner and lease into a public
+resource. Pairwise phase owners make fixed Parse/Bind initialization beat every parameter Measure
+error, and make a fixed-budget failure call no Measure, Encode, send, or result API.
 
 The active operation state machine is exact:
 
@@ -5503,6 +5527,7 @@ An error copied from libpq instead keeps the shipped field extraction and first-
 | Delivery in COPY native options | `Unsupported`, item `postgres.copy.delivery`, message `PostgreSQL COPY owns its data delivery protocol` |
 | non-PostgreSQL or unusable target | existing `DriverMismatch`/closed-target result before package COPY allocation or libpq |
 | initial ordinary native error | existing PostgreSQL native classification with copied fields |
+| null before the initial PGresult | synthetic `Native`, message `PostgreSQL COPY initial result is unavailable`, no clear, immediate physical close |
 | initial pipeline or unknown status | synthetic `Native`, message `PostgreSQL COPY protocol entered an unsupported state`, immediate physical close |
 | opposite COPY direction | `InvalidQuery`, item `postgres.copy.direction`, message `PostgreSQL COPY direction does not match the operation` plus immediate physical close |
 | `PGRES_COPY_BOTH` | `Unsupported`, item `postgres.copy.direction`, message `PostgreSQL COPY BOTH is not supported` plus immediate physical close |
@@ -5572,8 +5597,8 @@ Linux ARM64, and macOS. Server 16.4 and client >=17 remain the required live bou
 | Closure cell | Required discriminating owner |
 |---|---|
 | exported surface and unavailable siblings | exact public declaration golden; compile rejection for common/SQLite/dynamic/prepared COPY and no `CopyOption`/callback |
-| start operation matrix | CopyIn/CopyOut x Conn/Tx x Text/Binary x timeout absent/present x zero/one/multiple/default/Text/Binary Params; exact phase-order failpoint counters including overlap before full-vector allocation and lease-before-installation |
-| response metadata | direction, COPY BOTH, overall format, every per-column format, `0`/one/max columns, malformed count/code/pointer, initial ordinary/pipeline/unknown status |
+| start operation matrix | CopyIn/CopyOut x Conn/Tx x Text/Binary x timeout absent/present x zero/one/multiple/default/Text/Binary Params; exact phase-order failpoint counters including overlap before full-vector allocation, lease before installation, and fixed Parse/Bind initialization before Measure |
+| initial handshake and response metadata | null/non-null initial result; direction, COPY BOTH, overall format, every per-column format, `0`/one/max columns, malformed count/code/pointer, every ordinary/COPY/pipeline/unknown status; exactly one clear for every non-null outcome and zero clear/classification for null |
 | CopyIn data | empty no-call; one/multiple/`i32::MAX`/rejected-next chunks; rejected-next remains Active and a following valid write/finish/abort works; queued/retry/hard error; mutation after call; exact bytes and no package allocation/copy |
 | CopyOut data | zero-pending/positive/-1/-2; one/many/large rows; exact zero-copy pointer/length; one-live-chunk exclusion; wrapper/libpq free counts; malformed chunk |
 | finish/final results | clean active/exhausted finish requires exact command result+COPY tag/count+null; Complete finish returns stored result with zero libpq; ordinary error; missing/extra result; repeated COPY/pipeline/unknown; restore/state failure; first-error preservation |
@@ -5611,6 +5636,15 @@ synthetic Native record. One exhaustive phase table binds pointer/deadline/flag/
 to Drop behavior. No-timeout hard I/O failure closes immediately, while the only fixed implicit
 cancel budget is the explicit no-timeout CopyOut abort's one second. These are one state-machine
 redesign, not independent line fixes, and retain the same public capability boundary.
+
+The next protocol-order review found two new P1 start-handshake gaps and one P2 native-owner leak, so
+the matrix is reopened on the
+`start-handshake-outcome x protocol-budget-initialization x initial-result-ownership` axis. The
+preceding binary-format fixed Parse/Bind validation now runs before Measure. One exhaustive initial
+result table makes null fail closed before classification and assigns every non-null result exactly
+one clear before publication, synchronized rejection, or physical close. The same table owns local
+transfer/context/format/payload cleanup, so the redesign closes the whole start phase rather than the
+three reported lines and retains the same public capability boundary.
 
 Before implementation, complete one fresh independent adversarial review of this ledger and the
 single capability boundary. The implementation is expected to exceed roughly 1,000 changed
