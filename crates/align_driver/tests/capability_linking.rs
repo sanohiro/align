@@ -1,15 +1,23 @@
-//! M13 Slice 2 — capability-based linking. Two layers of coverage:
+//! M13 Slice 2 — capability-based linking. Three layers of coverage, in strength order:
 //!
 //!  1. **Unit (no backend):** the `link_libs` a program's MIR carries. `alignc` links only these
 //!     gated libraries (`libz`/`libzstd`/`libcrypto`/`libssl`) plus the always-linked Rust-std
 //!     support libs (`pthread`/`dl`/`m`) — so this pins exactly which programs pull which library.
 //!
-//!  2. **Integration (backend + `cc` + `llvm-readobj`):** the dynamic-dependency list (`DT_NEEDED`
-//!     on ELF, `LC_LOAD_DYLIB` on Mach-O) of the produced binary. The completion condition —
-//!     `fn main() -> i32 = 0` links NONE of z/zstd/crypto/ssl, and a `hello` that pulls the runtime
-//!     core links none of them either (the runtime's dead compress/crypto/tls code is
-//!     garbage-collected) — is asserted against the real image, while a program that DOES use a
-//!     gated feature keeps its library.
+//!  2. **Link argv (no linker, no host libraries):** the exact `cc` argument vector the driver
+//!     would run, from the pure `align_driver::link_command_args`. This is where the completion
+//!     condition lives — `fn main() -> i32 = 0` and a runtime-core `hello` pass NONE of
+//!     z/zstd/crypto/ssl, and a program that uses a gated feature passes exactly its own. It is
+//!     linker-independent and runs on every host, so an unconditionally added `-l` is caught here
+//!     regardless of what the platform installs or what a linker later prunes.
+//!
+//!  3. **Integration (backend + `cc` + `llvm-readobj`):** the dynamic-dependency list (`DT_NEEDED`
+//!     on ELF, `LC_LOAD_DYLIB` on Mach-O) of the produced binary — corroboration that the request
+//!     reaches a real image. Deliberately *not* the proof of non-over-linking: `--as-needed`
+//!     precision differs between linkers (GNU `ld` records a passed-but-unreferenced library where
+//!     `ld.lld` prunes it), so an over-linking regression can be invisible here. Absence of a
+//!     library is therefore only asserted where it is never passed at all; presence is asserted for
+//!     a library the program actually calls.
 //!
 //! Fail-closed: because the driver links only the collected libraries, any external-library builtin
 //! that is added but not classified in `align_mir::rvalue_capability` has its library dropped, so its
@@ -17,6 +25,8 @@
 
 mod common;
 use common::*;
+
+use align_driver::{link_command_args, order_link_libs, LinkPlan, Linker, ObjectFormat, Profile};
 
 /// The gated libraries the program's MIR requests, as `-l<name>` bare names. Everything the driver
 /// links unconditionally (`pthread`/`dl`/`m`) is excluded — this is only the capability-gated set.
@@ -33,6 +43,75 @@ fn gated_link_libs(name: &str, src: &str) -> Vec<String> {
         .collect();
     libs.sort();
     libs
+}
+
+/// The gated `-l<name>` flags in the exact `cc` argv the driver would run for `src`, in argv order.
+///
+/// The whole path from source to command line: sema → MIR `link_libs` → `order_link_libs` → the
+/// pure `link_command_args`. Nothing here runs a linker or needs a library installed, so it is the
+/// layer that can assert *absence* on every host and under every linker.
+fn gated_link_argv(name: &str, src: &str, format: ObjectFormat) -> Vec<String> {
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, name, src);
+    assert!(!checked.diags.has_errors(), "unexpected errors in {name}");
+    let mir = lower_to_mir(&checked.hir);
+    let ordered = order_link_libs(&mir.link_libs);
+    let argv = link_command_args(&LinkPlan {
+        objs: &[std::path::Path::new("prog.o")],
+        exe: std::path::Path::new("prog"),
+        runtime: std::path::Path::new("libalign_runtime.a"),
+        ordered_link_libs: &ordered,
+        format,
+        profile: Profile::Release,
+        profile_rt: None,
+        linker: &Linker::System,
+    });
+    argv.iter()
+        .filter_map(|arg| arg.to_str())
+        .filter(|arg| ["-lz", "-lzstd", "-lcrypto", "-lssl"].contains(arg))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The headline completion condition, at the argv layer: a program that uses no gated feature has
+/// no gated `-l` on the command line at all — on either object format, so neither the ELF nor the
+/// Mach-O branch of `link_command_args` can smuggle one in.
+#[test]
+fn pure_program_argv_carries_no_gated_library() {
+    for format in [ObjectFormat::Elf, ObjectFormat::MachO] {
+        assert_eq!(gated_link_argv("argv-empty", "fn main() -> i32 = 0\n", format), Vec::<String>::new());
+        assert_eq!(
+            gated_link_argv("argv-hello", "fn main() {\n  print(\"hi\")\n}\n", format),
+            Vec::<String>::new(),
+            "pulling the runtime core links no gated library ({format:?})"
+        );
+        assert_eq!(
+            gated_link_argv("argv-par", "fn main() {\n  print([1,2,3].par_map(fn x { x + 1 }).sum())\n}\n", format),
+            Vec::<String>::new(),
+            "threads use pthread, never a gated library ({format:?})"
+        );
+    }
+}
+
+/// A program that uses a gated feature passes exactly that feature's libraries — no more. The
+/// closure is a superset by design (the single-member runtime co-locates crypto with compress), so
+/// this pins the exact expected argv rather than merely "contains". Order is argv order, which is
+/// MIR first-seen order and is load bearing: `-l` resolves left to right.
+#[test]
+fn gated_feature_argv_is_exactly_its_capability_closure() {
+    let gzip = "import std.compress\nfn main() -> Result<(), Error> {\n  c := compress.gzip_compress(\"aaaaaaaa\", 6)?\n  print(c.len() as i64)\n  return Ok(())\n}\n";
+    assert_eq!(gated_link_argv("argv-gzip", gzip, ObjectFormat::Elf), ["-lz"]);
+
+    let zstd = "import std.compress\nfn main() -> Result<(), Error> {\n  c := compress.zstd_compress(\"aaaaaaaa\", 6)?\n  print(c.len() as i64)\n  return Ok(())\n}\n";
+    assert_eq!(gated_link_argv("argv-zstd", zstd, ObjectFormat::Elf), ["-lzstd"]);
+
+    // Crypto pulls the compress libraries with it, but NOT libssl — the exact equality is what
+    // says so; libssl belongs to the HTTPS client path alone, one line down.
+    let crypto = "import std.crypto\nfn main() -> Result<(), Error> {\n  h := crypto.sha256(\"hi\")\n  print(h.len() as i64)\n  return Ok(())\n}\n";
+    assert_eq!(gated_link_argv("argv-crypto", crypto, ObjectFormat::Elf), ["-lcrypto", "-lzstd", "-lz"]);
+
+    let https = "import std.http\nfn main() -> Result<(), Error> {\n  client := http.client()\n  r := client.get(\"https://example.com\")?\n  print(r.status())\n  return Ok(())\n}\n";
+    assert_eq!(gated_link_argv("argv-https", https, ObjectFormat::Elf), ["-lssl", "-lcrypto", "-lzstd", "-lz"]);
 }
 
 #[test]

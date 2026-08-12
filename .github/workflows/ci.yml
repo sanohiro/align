@@ -47,6 +47,11 @@ jobs:
       ALIGN_APT_PACKAGES: >-
         llvm-22-dev clang-22 libclang-rt-22-dev lld-22
         libpq-dev libsqlite3-dev libssl-dev zlib1g-dev libzstd-dev make perl
+      # Fail closed on the linker: `alignc` would otherwise silently fall back
+      # to the system linker if lld-22 ever stopped being installed, and the
+      # only symptom would be slower links nobody notices. Demanding it makes
+      # that a red build instead (build-perf item 2).
+      ALIGNC_LINKER: lld
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -176,6 +181,12 @@ jobs:
       ALIGN_APT_PACKAGES: >-
         llvm-22-dev clang-22 libclang-rt-22-dev lld-22
         libssl-dev zlib1g-dev libzstd-dev make perl
+      # Fail closed on the linker per platform: the Linux legs must actually
+      # get lld-22 (a missing package is a red build, not a silent fallback to
+      # the slow linker), and macOS states the Apple linker explicitly, which
+      # is also the only value Mach-O accepts. `matrix` is the one context a
+      # job-level `env` can read here — `runner.os` is not available.
+      ALIGNC_LINKER: ${{ startsWith(matrix.os, 'ubuntu') && 'lld' || 'system' }}
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

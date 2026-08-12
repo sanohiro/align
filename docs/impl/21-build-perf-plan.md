@@ -45,7 +45,7 @@ driver.
 
 **macOS is unchanged.** Apple's linker (`ld-prime`, Xcode 15+) is already
 fast, and running a second linker there would be a behavior difference for no
-measured gain. Mach-O never selects lld, and an explicit `ALIGN_LINKER=lld`
+measured gain. Mach-O never selects lld, and an explicit `ALIGNC_LINKER=lld`
 on Mach-O is a hard error rather than a silent no-op.
 
 **Output.** The linker choice is optimization-neutral: the same objects, the
@@ -60,30 +60,42 @@ program: `.text` and `.rodata` came out marginally *smaller* under lld while
 `.debug_str` and `.gcc_except_table` came out larger, and lld's `--as-needed`
 is more precise — the `pkg.db` binary whose db code is entirely dead records
 no `DT_NEEDED` for `libpq`/`libssl`/`libcrypto`/`libsqlite3`, where GNU `ld`
-recorded all four. A library that is actually called is always recorded (the
-`capability_linking` suite asserts exactly this on the real image, and it
-passes under both linkers). No test may assert an exact binary size or an
-exact section layout on ELF.
+recorded all four. A library that is actually called is always recorded.
 
-**Selection.** `align_driver`'s `select_linker` owns the policy in one place
-(it is internal — the linker is not part of any public API):
+Two consequences for tests. No ELF test may assert an exact binary size or an
+exact section layout, and **no ELF test may treat a dynamic-dependency list as
+proof of what the driver passed** — `--as-needed` precision decides whether an
+over-linked library is visible at all, so an over-linking regression can hide
+there. What the driver asks for is asserted directly on the pure
+`link_command_args` argv (`capability_linking`), with `DT_NEEDED` kept as the
+corroborating check that the request actually reached a real image. Comparing
+two links produced by the *same* linker on one host is unaffected by either
+rule and remains fair game.
+
+**Selection.** `align_driver`'s `select_linker` owns the policy in one place:
 
 ```text
-ALIGN_LINKER unset  ELF   ld.lld when one is found, else the system linker
-ALIGN_LINKER unset  MachO the system linker
-ALIGN_LINKER=lld    ELF   ld.lld, or a hard error when none is found
-ALIGN_LINKER=lld    MachO a hard error
-ALIGN_LINKER=system any   the system linker
-anything else       any   a hard error
+ALIGNC_LINKER unset   ELF    ld.lld when one is found, else the system linker
+ALIGNC_LINKER unset   MachO  the system linker
+ALIGNC_LINKER=lld     ELF    ld.lld, or a hard error when none is found
+ALIGNC_LINKER=lld     MachO  a hard error
+ALIGNC_LINKER=system  any    the system linker
+anything else         any    a hard error
 ```
 
 Discovery is a total, deterministic order, memoized once per process:
 `$LLVM_SYS_221_PREFIX/bin` (the compile-time prefix, so the linker matches
 the LLVM the compiler was built against), then `llvm-config --bindir`
-(versioned name first), then the first `PATH` entry holding an `ld.lld`. Each
-step requires a directory containing a program spelled exactly `ld.lld`,
-because that is the only name `-fuse-ld=lld` can address — apt's suffixed
-`/usr/bin/ld.lld-22` is deliberately not a match.
+(versioned name first). Each step requires an **executable regular file**
+named exactly `ld.lld` in that directory: that is the only name
+`-fuse-ld=lld` can address, so apt's suffixed `/usr/bin/ld.lld-22` is not a
+match, and a present-but-unrunnable file must not be selected — doing so
+would turn the fail-open default into a fail-every-link default.
+
+**`PATH` is never searched.** Both steps resolve an LLVM installation this
+compiler is version-matched to, which is what makes `-B` safe (see below) and
+keeps the answer independent of ambient environment — a conda/nix/toolbox shim
+or a relative `PATH` entry can never become the project's linker.
 
 The unset default is **fail-open**: a host without lld links exactly as it did
 before, correctly and at the old speed. That is safe only because the two
@@ -103,13 +115,29 @@ targets.
 **Visibility.** The flags are ordinary argv on the `cc` command rather than a
 mutated child environment. A failed link always names the linker that ran
 (`link failed (cc exit code …, linker: lld (/usr/lib/llvm-22/bin/ld.lld))`),
-and a failed lld link additionally names the `ALIGN_LINKER=system` escape
+and a failed lld link additionally names the `ALIGNC_LINKER=system` escape
 hatch. `alignc`'s usage text documents the variable. A successful link stays
 silent, matching every other stage.
 
 **Cache identity.** Linking is not a cached stage — the unit cache stores
 frontend results, objects, and ThinLTO bitcode, never the linked executable —
 so no cache key changes and no entry is invalidated.
+
+**CI fails closed.** Every Linux job (both `ci.yml` jobs, `nightly.yml`,
+`release.yml`) sets `ALIGNC_LINKER=lld`, and the macOS legs set `system`. A
+disappearing `lld-22` is then a red build rather than a silent return to the
+slow linker, which the fail-open default would otherwise hide — the one
+failure mode of fail-open is that nobody notices.
+
+**Instrument-PGO.** The one link with an unusual shape is `--pgo-instrument`:
+it appends the clang profile runtime and forces `__llvm_profile_runtime`
+undefined so the archive's atexit `.profraw` writer is pulled in. Dropping
+that anchor still links, and only shows up as an empty PGO corpus much later,
+so it is checked directly. On the container above, `examples/hello.align`
+built with `--pgo-instrument` wrote a 248-byte `.profraw` that
+`llvm-profdata-22 merge` turned into 664 bytes of `.profdata` — byte-identical
+counts under lld and under GNU `ld`. This matters for `release.yml`, whose PGO
+training phase links the whole corpus under lld.
 
 **Measured** on `ubuntu:24.04` (aarch64, GCC 13.3.0, GNU ld 2.42, LLD 22.1.8),
 five warm-cache rebuilds each so the link stage dominates, timing the `cc`
@@ -123,3 +151,12 @@ invocation itself:
 The link stage is roughly 5× faster, and it was 15–35% of a warm rebuild, so
 a warm rebuild lands 13–28% shorter. The saving is per link and independent
 of program size in this range — the runtime staticlib dominates both links.
+
+**Why the argv layer exists**, measured rather than argued. Adding one
+unconditional `-lssl` to the driver's argv and rerunning `capability_linking`
+on that same container under lld: all four `DT_NEEDED` tests still passed —
+lld's `--as-needed` pruned the unreferenced library, so the over-linking was
+invisible in every produced image — while both argv owners failed with the
+exact extra flag named. On macOS the same mutation did trip the `DT_NEEDED`
+tests, which is precisely the trap: the weaker layer looked sufficient on the
+platform it was written on.

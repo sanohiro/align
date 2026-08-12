@@ -35,6 +35,10 @@ jobs:
       ALIGN_APT_PACKAGES: >-
         llvm-22-dev clang-22 libclang-rt-22-dev lld-22
         libssl-dev zlib1g-dev libzstd-dev
+      # Fail closed on the linker per platform, same rule as ci.yml: the PGO
+      # training phase links the whole examples/pkg.db corpus, so a missing
+      # lld-22 would quietly make a release build slower rather than fail.
+      ALIGNC_LINKER: ${{ startsWith(matrix.os, 'ubuntu') && 'lld' || 'system' }}
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

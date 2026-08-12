@@ -35,6 +35,9 @@ jobs:
       ALIGN_APT_PACKAGES: >-
         llvm-22-dev clang-22 libclang-rt-22-dev lld-22
         libpq-dev libsqlite3-dev libssl-dev zlib1g-dev libzstd-dev make perl
+      # Fail closed on the linker: a missing lld-22 must be a red build, not a
+      # silent fallback to the slow system linker (build-perf item 2).
+      ALIGNC_LINKER: lld
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
