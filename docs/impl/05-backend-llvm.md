@@ -43,6 +43,41 @@ Fn(..)            function pointer (+ environment pointer if there is a capture)
 
 `Region` **does not appear in LLVM**. Safety is already verified in HIR (`03 §7`); codegen receives only the concrete value (an arena pointer, etc.). This is the final destination of "do not surface lifetimes".
 
+One Align type is one LLVM type. MIR's type ids are finer than LLVM's type identity, so several MIR
+spellings can name one Align type: `Ty::Tagged(id)` versus the source-shaped `Ty::Option`/
+`Ty::Result` for the same nested value; two origin-specific generic instances that share one
+`source_name`; an `Option<string>` argument bound to an `Option<str>` parameter. Codegen therefore
+keys nominal identity on what the type *lowers to* — structs and sum types by `source_name`, nested
+`Option`/`Result` by LLVM body (`build_tagged_types`) — never on the id alone. Emitting two
+structurally equal but distinct LLVM types for one Align type makes `insertvalue`, `ret`, and call
+arguments ill-formed; #670 did exactly that for nested tagged values and it went unnoticed until
+#730 made `--rt-lto`, whose merged-module verifier was the pipeline's only one, the default.
+
+### Module verification (partial)
+
+`emit_llvm_ir` verifies the module it built before printing, so every IR-shape gate in the test
+suite is also a well-formedness gate, and `link_in_rt_lto` verifies the merged module. The object,
+PGO, and ThinLTO-prelink paths do **not** verify yet, because one pre-existing MIR defect would turn
+into a hard build error:
+
+```align
+fn probe(flag: bool) -> i64 {
+  bound := "bound".clone()
+  return (if flag { " tmp ".clone() } else { bound }).trim().len()
+}
+```
+
+A borrowed owned temporary produced by value-carrying control flow lowers the `if` twice: the second
+branch stores each arm's *original* SSA value into the hidden owner's join slot, and those values
+are defined in blocks that do not dominate it (`Instruction does not dominate all uses`). MIR — not
+codegen — is ill-formed; `owned_temporaries::mixed_if_arms_drop_only_the_selected_temporary` owns
+the shape, and `alignc build` already fails on it at the default profile through the `--rt-lto`
+verifier. Fix that lowering, then move the verification into `build_module` so every emit path
+carries it. Measured cost of doing so, with a release `alignc` over a cold codegen cache: the
+78-example corpus plus `apps/db` takes 9.99s either way, and `apps/db` alone — the largest module,
+~7MB of IR — goes from a 8.368s median to 8.451s, about 1%, inside the unverified configuration's
+own run-to-run spread.
+
 ---
 
 ## 2. struct layout

@@ -1951,3 +1951,172 @@ fn llvm_drop_has_a_tag_guard_and_none_constructs_without_allocation() {
         "the None constructor must not allocate:\n{none_body}"
     );
 }
+
+/// One Align tagged type must reach exactly one LLVM type, whichever MIR spelling names it.
+///
+/// `Ty::Tagged(id)` (a tagged value used as another tagged value's payload) always lowered to the
+/// identified `%align.tagged.{id}` struct, while `Ty::Option`/`Ty::Result` (the same value as a
+/// local, parameter, or return) lowered to a fresh anonymous literal struct. Sema unifies the two
+/// spellings, so a value crossed between them and `insertvalue`/`ret` mixed `{ i8, i64 }` with
+/// `%align.tagged.0` — invalid IR that shipped in #670 and only surfaced when #730 made `--rt-lto`
+/// (the pipeline's one verifier at the time) the default. A shape whose body a table entry already
+/// predeclares is now that identified struct everywhere, which is what the literal-free IR below
+/// asserts.
+#[test]
+fn one_tagged_type_lowers_to_one_llvm_type_across_spellings() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Item { slot: Option<i64> }\n",
+        "Wrap { Value(Option<i64>), Empty }\n",
+        "fn pick(k: i32) -> Result<Option<i64>, Error> {\n",
+        "  if k == 0 { return Ok(None) }\n",
+        "  inner: Option<i64> := Some(k as i64)\n",
+        "  return Ok(inner)\n",
+        "}\n",
+        "fn relay(k: i32) -> Result<Option<i64>, Error> {\n",
+        "  value := pick(k)?\n",
+        "  return Ok(value)\n",
+        "}\n",
+        "fn fallback(k: i32) -> i64 {\n",
+        "  value := pick(k) else { return 90 }\n",
+        "  return match value { Some(n) => n, None => 7 }\n",
+        "}\n",
+        "fn source() -> Result<Option<i64>, string> = Ok(Some(5))\n",
+        "fn wrap_error(message: string) -> Error = Error.Invalid\n",
+        "fn depth(k: i32) -> Option<Option<i64>> {\n",
+        "  if k == 0 { return None }\n",
+        "  inner: Option<i64> := Some(k as i64)\n",
+        "  return Some(inner)\n",
+        "}\n",
+        "fn score(value: Option<i64>) -> i64 = match value { Some(n) => n, None => 0 }\n",
+        "fn main() -> i32 {\n",
+        "  a := match relay(3) { Ok(value) => score(value), Err(e) => 90 }\n",
+        "  b := fallback(2)\n",
+        "  c := match source().map_err(wrap_error) { Ok(value) => score(value), Err(e) => 91 }\n",
+        "  item := Item { slot: Some(4) }\n",
+        "  d := score(item.slot)\n",
+        "  wrapped := Wrap.Value(Some(6))\n",
+        "  e := match wrapped { Value(value) => score(value), Empty => 92 }\n",
+        "  f := match depth(1) { Some(value) => score(value), None => 93 }\n",
+        "  return (a + b + c + d + e + f) as i32\n",
+        "}\n",
+    );
+    let ir = emit_llvm(src);
+    assert!(
+        ir.contains("%align.tagged.0 = type { i8, i64 }"),
+        "the interned `Option<i64>` must be an identified struct:\n{ir}"
+    );
+    // `Option<i64>` reaches every spelling here — an `Ok`/`Some` payload, a local, a parameter, a
+    // return, a struct field, a sum-type payload, and the value carried through `?`, `else`,
+    // `map_err`, and `match`. Its literal spelling must therefore appear exactly once in the whole
+    // module: in the type definition asserted above, and nowhere as an operand or slot type.
+    assert_eq!(
+        ir.matches("{ i8, i64 }").count(),
+        1,
+        "an interned tagged shape must never also appear as a literal struct:\n{ir}"
+    );
+    assert_eq!(
+        build_and_run("one-tagged-type-one-llvm-type", src)
+            .status
+            .code(),
+        Some(21)
+    );
+}
+
+/// The tagged table is keyed on MIR type ids, which are finer than LLVM type identity: two
+/// origin-specific generic instances keep distinct `Ty::Struct` ids (so effect analysis stays
+/// precise) while sharing one `source_name` and therefore one LLVM struct. Sema's
+/// `source_ty_matches` unifies them, so `Option<Holder@pure>` and `Option<Holder@impure>` are one
+/// Align type whose values cross freely — they must not get one identified struct each.
+#[test]
+fn origin_specific_generic_instances_share_one_tagged_llvm_type() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Holder<T> { f: T }\n",
+        "fn pure_one(x: i64) -> i64 = x + 1\n",
+        "fn loud_one(x: i64) -> i64 {\n",
+        "  print(x)\n",
+        "  return x + 2\n",
+        "}\n",
+        "fn pick(k: i32) -> Result<Option<Holder<fn(i64) -> i64>>, Error> {\n",
+        "  if k == 0 { return Ok(Some(Holder { f: pure_one })) }\n",
+        "  if k == 1 { return Ok(Some(Holder { f: loud_one })) }\n",
+        "  return Ok(None)\n",
+        "}\n",
+        "fn apply(k: i32) -> i64 = match pick(k) {\n",
+        "  Ok(value) => match value { Some(h) => h.f(10), None => 3 },\n",
+        "  Err(e) => 90,\n",
+        "}\n",
+        "fn main() -> i32 = (apply(0) + apply(1) + apply(2)) as i32\n",
+    );
+    let ir = emit_llvm(src);
+    // Three table entries (`Ok(Some(pure))`, `Ok(Some(loud))`, and the signature's own) name one
+    // source-visible `Option<Holder<fn(i64) -> i64>>`, so the module must define one identified
+    // struct for them, not one per entry.
+    let defined: Vec<&str> = ir
+        .lines()
+        .filter(|line| line.starts_with("%align.tagged."))
+        .collect();
+    assert_eq!(
+        defined.len(),
+        1,
+        "every instance of one source-visible tagged type must share an identified struct, got \
+         {defined:?}:\n{ir}"
+    );
+    let run = build_and_run("generic-instances-one-tagged-type", src);
+    assert_eq!(run.status.code(), Some(26));
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "10\n");
+}
+
+/// Tagged identity is the LLVM body, not membership in the tagged table.
+///
+/// `Option<string>` and `Option<str>` are distinct Align types that lower to one
+/// `{ i8, { ptr, i64 } }`, and only the nested one is interned as a table entry. Keying the
+/// identified struct on the table entry instead of on the body left the owned local a literal while
+/// the borrowed payload was `%align.tagged.0`, which is how `pkg.db`'s generated static-descriptor
+/// binder came to pass a literal `{ i8, { ptr, i64 } }` to a `%align.tagged.1` parameter
+/// (`pkg_db_q4b::owned_text_and_bytes_params_bind_before_their_sources_drop`). Sema rejects that
+/// coercion in source, so the two shapes are exercised side by side instead.
+#[test]
+fn tagged_shapes_with_one_body_share_one_identified_struct() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "fn view(k: i32) -> Result<Option<str>, Error> {\n",
+        "  if k == 0 { return Ok(None) }\n",
+        "  v: Option<str> := Some(\"abc\")\n",
+        "  return Ok(v)\n",
+        "}\n",
+        "fn main() -> i32 {\n",
+        "  owned: Option<string> := Some(\"hello\".clone())\n",
+        "  a := match owned { Some(s) => s.len(), None => 0 }\n",
+        "  b := match view(1) {\n",
+        "    Ok(v) => match v { Some(s) => s.len(), None => 0 },\n",
+        "    Err(e) => 90,\n",
+        "  }\n",
+        "  return (a + b) as i32\n",
+        "}\n",
+    );
+    let ir = emit_llvm(src);
+    assert!(
+        ir.contains("%align.tagged.0 = type { i8, { ptr, i64 } }"),
+        "the nested `Option<str>` must be an identified struct:\n{ir}"
+    );
+    // `Option<string>` is never a table entry here, only `Option<str>` is. They are one LLVM body,
+    // so the owned local must reach the same identified struct: the body's literal spelling belongs
+    // in the type definition above and nowhere else.
+    assert_eq!(
+        ir.matches("{ i8, { ptr, i64 } }").count(),
+        1,
+        "one LLVM body must have one LLVM type across both tagged shapes:\n{ir}"
+    );
+    assert_eq!(
+        build_and_run("tagged-one-body-one-type", src).status.code(),
+        Some(8)
+    );
+}

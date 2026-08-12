@@ -1276,11 +1276,19 @@ layout, ABI, and behavior for their shared public surface. MIR's structural code
 includes its own complete canonical table in order; an omitted or changed entry cannot hit a stale
 object.
 
-LLVM predeclares one opaque struct per tagged entry, then assigns the existing Option or Result body
-using the already-created struct, enum, and tagged type tables. `Scalar::Tagged(id)` lowers to that
-identified struct. This preserves the current Option/Result field order, tag width, alignment, and
-by-value ABI; it does not disguise a nested tagged value as a user sum or change the user-sum
-non-union layout.
+LLVM predeclares one opaque struct per distinct tagged body, then assigns the existing Option or
+Result body using the already-created struct, enum, and tagged type tables. This preserves the
+current Option/Result field order, tag width, alignment, and by-value ABI; it does not disguise a
+nested tagged value as a user sum or change the user-sum non-union layout.
+
+That identified struct is the *only* lowering of its Align type. `Scalar::Tagged(id)` reaches it,
+and so does the source-shaped `Ty::Option`/`Ty::Result` spelling of the same type in a local,
+parameter, or return position: sema treats the two spellings as one type, so a value crosses
+between them and a second, structurally-equal-but-distinct LLVM type would make `insertvalue` and
+`ret` ill-formed. For the same reason the entry-to-struct map is many-to-one. The MIR table is
+keyed on type ids, which are finer than LLVM type identity — two origin-specific generic instances
+keep distinct ids while sharing one nominal LLVM type — so entries whose bodies lower identically
+share one identified struct, exactly as those instances already share one struct or sum type.
 
 The exact acceptance fixture is:
 
