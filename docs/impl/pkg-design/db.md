@@ -4947,18 +4947,18 @@ SQLite slot as an owner.
 
 PostgreSQL protocol v3 fixes the actual aggregate bounds. The trusted parameter count `N` is at most
 `65_535`, the unsigned range of the Parse/Bind `Int16` count fields, regardless of libpq's wider C
-`int` argument. For the exact libpq 17 call shape used here, parameter-format count is `N`, the
-result-format count is zero for Text and one for Binary, the portal name is empty, and the statement
-name is empty for direct execution or the retained generated ASCII name for prepared execution. Let
-`F` be the validated result-format tag (`0=Text`, `1=Binary`), `S` be that statement-name C-string byte
-count including its terminator, and `payload_i` be zero for NULL or the exact selected encoded length
-otherwise. The Bind length field, which includes its own four bytes but excludes the one-byte message
-tag, is exactly `11 + 2*F + S + 6*N + sum(payload_i)` and must be at most `2_147_483_647`. The Parse
+`int` argument. For the exact libpq 17 call shape used here, parameter-format count is `N`, result-
+format count is one with the validated `0=Text` or `1=Binary` code, the portal name is empty, and the
+statement name is empty for direct execution or the retained generated ASCII name for prepared
+execution. Let `S` be that statement-name C-string byte count including its terminator and
+`payload_i` be zero for NULL or the exact selected encoded length otherwise. The Bind length field,
+which includes its own four bytes but excludes the one-byte message tag, is exactly
+`13 + S + 6*N + sum(payload_i)` and must be at most `2_147_483_647`. The Parse
 length is exactly `6 + S + Q + 4*N`, where `Q` is the PostgreSQL wire-SQL C-string byte count including
 its terminator, and has the same limit. Direct execution checks both formulas; preparation checks
 Parse; prepared execution checks Bind. All arithmetic is checked in `u64` before narrowing.
 Before Measure, the exact fixed-budget result stored as signed `i64` at context offset 96 is
-`2_147_483_647 - (11 + 2*F + S + 6*N)`; a negative or non-`i64` result fails before that store.
+`2_147_483_647 - (13 + S + 6*N)`; a negative or non-`i64` result fails before that store.
 
 Descriptor/artifact formation rejects `N > 65_535` before artifact or cache publication with the
 diagnostic `PostgreSQL static query supports at most 65535 parameters`; a malformed runtime
@@ -5015,7 +5015,7 @@ plan means allocating/installing the execution-owned exact full format vector af
 validation and successful lease acquisition.
 
 The package-context row's complete fixed Bind formula is exact
-`2_147_483_647 - (11 + 2*F + S + 6*N)`, and its initializer runs only after that successful lease on
+`2_147_483_647 - (13 + S + 6*N)`, and its initializer runs only after that successful lease on
 both direct and prepared execution.
 
 For `one_native`, Metadata mode still runs for every newly acquired tuple-producing result. A

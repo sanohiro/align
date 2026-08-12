@@ -3363,16 +3363,16 @@ cleanupはSQLite zero-only slotをownerとしてinterpretしない。
 
 actual aggregate boundはPostgreSQL protocol v3が固定する。trusted parameter count `N`はlibpqのwide C
 `int` argumentに関係なくParse/Bind `Int16` count fieldのunsigned range `65_535`以下。ここで使うexact
-libpq 17 call shapeはparameter-format count=`N`、result-format countはTextでzero/Binaryでone、
-portal name=empty、statement name=directではempty/preparedではretained generated ASCII name。
-`F`をvalidated result-format tag (`0=Text`,`1=Binary`)、`S`をterminator込みstatement-name C-string
-byte count、`payload_i`をNULLならzero、それ以外はexact selected encoded lengthとする。one-byte
-message tagを除きown four byteを含むBind length fieldはexactly
-`11 + 2*F + S + 6*N + sum(payload_i)`で`2_147_483_647`以下。Parse lengthはPostgreSQL wire-SQLのterminator
+libpq 17 call shapeはparameter-format count=`N`、result-format countはoneでvalidated `0=Text`または
+`1=Binary` codeを持ち、portal name=empty、statement name=directではempty/preparedではretained
+generated ASCII name。`S`をterminator込みstatement-name C-string byte count、`payload_i`をNULLなら
+zero、それ以外はexact selected encoded lengthとする。one-byte message tagを除きown four byteを含む
+Bind length fieldはexactly `13 + S + 6*N + sum(payload_i)`で`2_147_483_647`以下。
+Parse lengthはPostgreSQL wire-SQLのterminator
 込みC-string byte countを`Q`としてexactly `6 + S + Q + 4*N`でsame limit。direct executionは両formula、
 preparationはParse、prepared executionはBindをcheckする。全arithmeticはnarrow前にchecked `u64`。
 Measure前、context offset 96にsigned `i64`でstoreするexact fixed-budget resultは
-`2_147_483_647 - (11 + 2*F + S + 6*N)`。negativeまたはnon-`i64` resultはstore前にfailする。
+`2_147_483_647 - (13 + S + 6*N)`。negativeまたはnon-`i64` resultはstore前にfailする。
 
 descriptor/artifact formationはartifact/cache publication前に`N > 65_535`をdiagnostic
 `PostgreSQL static query supports at most 65535 parameters`でrejectする。そのcountを持つmalformed
@@ -3421,7 +3421,7 @@ call-local sparse normalized planはsuccessful native-option validationの末尾
 installしない。下記closure matrixでnormalized planをinstallするとは、generated static validationと
 successful lease acquisitionの後にexecution-owned exact full format vectorをallocate/installすることを指す。
 package-context rowのcomplete fixed Bind formulaはexact
-`2_147_483_647 - (11 + 2*F + S + 6*N)`で、initializerはdirect/preparedの両executionでそのsuccessful
+`2_147_483_647 - (13 + S + 6*N)`で、initializerはdirect/preparedの両executionでそのsuccessful
 leaseの後だけrunする。
 
 `one_native`でもMetadata modeはevery newly acquired tuple-producing resultでrunする。malformed second
