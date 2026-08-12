@@ -105,10 +105,11 @@ Q4b streaming resilience         complete through D8 + D9
 Q5 schema tooling/inspection     complete through D11 + D12
 Q6 compound product closure      complete through D10
 A1 common batch/SoA rail         complete through #740 / D13
-A1 PostgreSQL lease prerequisite next / catalog + EXPLAIN overlap closure / D13
-then: A1 PostgreSQL status       package/tool fail-close + migration COPY preflight / D13
-then: A1 PostgreSQL direct       SingleRow + PortalBatch / D13
-then: A1 PostgreSQL prepared     streamed parity + stmt v3 resolver / D13
+A1 PostgreSQL lease prerequisite complete / catalog + EXPLAIN overlap closure / D13
+A1 PostgreSQL status prerequisite complete / package/tool fail-close + migration COPY / D13
+A1 PostgreSQL direct delivery    complete / SingleRow + PortalBatch / D13
+A1 PostgreSQL prepared parity    complete / streamed delivery + stmt v3 resolver / D13
+next: A1 PostgreSQL formats      binary parameters/results / D13
 ```
 
 The exact cell contracts and owner matrices remain in
