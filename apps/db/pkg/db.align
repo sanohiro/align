@@ -74,7 +74,7 @@ pub resource rows<R> = pkg.db.internal.resource.drop_rows
 pub resource batch<R> = pkg.db.internal.resource.drop_batch
 
 // All common and native execution entry points use these two sealed validators before option
-// allocation, lease acquisition, or native work. Keeping the v5 header in one owner prevents a
+// allocation, lease acquisition, or native work. Keeping the v6 header in one owner prevents a
 // descriptor version/field bump from drifting across copied validators.
 pub fn query_header_valid<P, R>(
   statement: query<P, R>,
@@ -102,13 +102,16 @@ pub fn query_header_valid<P, R>(
     decode := pkg.db.internal.descriptor.decoder(statement)
     materializer := pkg.db.internal.descriptor.meta_materializer(statement)
     parameter_resolver := pkg.db.internal.descriptor.parameter_resolver(statement)
+    parameter_count_thunk := pkg.db.internal.descriptor.parameter_count_thunk(statement)
+    parameter_count := pkg.db.internal.descriptor.parameter_count(statement)
     stream_decoder := pkg.db.internal.descriptor.stream_decoder(statement)
     batch_plan := pkg.db.internal.descriptor.batch_plan(statement)
-    base_valid := version == 5 && kind == 0 && reserved == 0 && tail_reserved == 0
+    base_valid := version == 6 && kind == 0 && reserved == 0 && tail_reserved == 0
       && !q1.is_null()
       && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
       && !validate_row.is_null() && !decode.is_null() && !materializer.is_null()
       && !parameter_resolver.is_null() && !stream_decoder.is_null()
+      && !parameter_count_thunk.is_null() && parameter_count <= 65535
       && pkg.db.internal.resource.batch_plan_valid(batch_plan)
     sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
       && postgres_sql.is_null() && postgres_len == 0
@@ -116,7 +119,8 @@ pub fn query_header_valid<P, R>(
       && !postgres_sql.is_null() && postgres_len > 0
     portable := mask == 3 && !sqlite_sql.is_null() && sqlite_len > 0
       && !postgres_sql.is_null() && postgres_len > 0
-    return base_valid && (sqlite_only || postgres_only || portable)
+    if !base_valid || (!sqlite_only && !postgres_only && !portable) { return false }
+    return pkg.db.internal.descriptor.parameter_count_value(statement) == parameter_count
   }
 }
 
@@ -146,20 +150,24 @@ pub fn command_header_valid<P>(
     decode := pkg.db.internal.descriptor.decoder(statement)
     materializer := pkg.db.internal.descriptor.meta_materializer(statement)
     parameter_resolver := pkg.db.internal.descriptor.parameter_resolver(statement)
+    parameter_count_thunk := pkg.db.internal.descriptor.parameter_count_thunk(statement)
+    parameter_count := pkg.db.internal.descriptor.parameter_count(statement)
     stream_decoder := pkg.db.internal.descriptor.stream_decoder(statement)
     batch_plan := pkg.db.internal.descriptor.batch_plan(statement)
-    base_valid := version == 5 && kind == 1 && reserved == 0 && tail_reserved == 0
+    base_valid := version == 6 && kind == 1 && reserved == 0 && tail_reserved == 0
       && !q1.is_null()
       && !id.is_null() && id_len > 0 && !binder.is_null() && !validate_static.is_null()
       && validate_row.is_null() && decode.is_null() && materializer.is_null()
       && !parameter_resolver.is_null() && stream_decoder.is_null() && batch_plan.is_null()
+      && !parameter_count_thunk.is_null() && parameter_count <= 65535
     sqlite_only := mask == 1 && !sqlite_sql.is_null() && sqlite_len > 0
       && postgres_sql.is_null() && postgres_len == 0
     postgres_only := mask == 2 && sqlite_sql.is_null() && sqlite_len == 0
       && !postgres_sql.is_null() && postgres_len > 0
     portable := mask == 3 && !sqlite_sql.is_null() && sqlite_len > 0
       && !postgres_sql.is_null() && postgres_len > 0
-    return base_valid && (sqlite_only || postgres_only || portable)
+    if !base_valid || (!sqlite_only && !postgres_only && !portable) { return false }
+    return pkg.db.internal.descriptor.parameter_count_value(statement) == parameter_count
   }
 }
 

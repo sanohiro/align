@@ -130,6 +130,15 @@ int32_t PQnfields(void *result) {
   if (postgres_key_query) return 15;
   return 4;
 }
+char *PQfname(void *result, int32_t column) {
+  (void)result; (void)column; return "";
+}
+uint32_t PQftype(void *result, int32_t column) {
+  (void)result; (void)column; return 0;
+}
+int32_t PQfformat(void *result, int32_t column) {
+  (void)result; (void)column; return 0;
+}
 int32_t PQgetisnull(void *result, int32_t row, int32_t column) {
   (void)result; (void)row;
   if (postgres_key_query && (column == 0 || column == 2 || column == 3)) return 0;

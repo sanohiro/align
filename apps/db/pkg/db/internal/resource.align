@@ -1,5 +1,6 @@
 module pkg.db.internal.resource
 
+import pkg.db.internal
 import pkg.db.internal.descriptor
 import pkg.db.internal.postgres_status
 import std.time
@@ -202,7 +203,7 @@ pub fn poison_conn_state(state: raw) {
 }
 
 // A prepared statement wrapper is dependent on the conn/tx resource generation that created it.
-//   0: u32 version (= 3)
+//   0: u32 version (= 4)
 //   4: u8  driver
 //   5: u8  closed
 //   6: u16 reserved
@@ -216,6 +217,10 @@ pub fn poison_conn_state(state: raw) {
 //  64: raw generated streaming Row decoder
 //  72: raw generated batch plan
 //  80: raw generated parameter-name resolver
+//  88: raw PostgreSQL byte-per-parameter Binary eligibility vector, null for SQLite/zero count
+//  96: raw producer-owned parameter-count thunk
+// 104: u32 trusted parameter count
+// 108: u32 reserved
 pub fn new_stmt_state(
   driver: u8,
   native: raw,
@@ -228,10 +233,13 @@ pub fn new_stmt_state(
   stream_decoder: raw,
   batch_plan: raw,
   parameter_resolver: raw,
+  binary_eligibility: raw,
+  parameter_count_thunk: raw,
+  parameter_count: u32,
 ) -> raw {
   unsafe {
-    statement := raw.alloc(88)
-    raw.store(statement, 0, 3 as u32)
+    statement := raw.alloc(112)
+    raw.store(statement, 0, 4 as u32)
     raw.store(statement, 4, driver)
     raw.store(statement, 5, 0 as u8)
     raw.store(statement, 6, 0 as u16)
@@ -245,18 +253,21 @@ pub fn new_stmt_state(
     raw.store(statement, 64, stream_decoder)
     raw.store(statement, 72, batch_plan)
     raw.store(statement, 80, parameter_resolver)
+    raw.store(statement, 88, binary_eligibility)
+    raw.store(statement, 96, parameter_count_thunk)
+    raw.store(statement, 104, parameter_count)
+    raw.store(statement, 108, 0 as u32)
     return statement
   }
 }
 
-// The one complete statement-v3 validator. Every accessor, indirect prepared bridge, execution,
-// and Drop path enters through this authority so the resolver and the existing statement fields
-// cannot drift across an ABI bump.
-pub fn stmt_header_valid(statement: raw) -> bool {
+// Establish every fixed v4 field needed to invoke the retained count thunk, but do not scan the
+// eligibility vector until the thunk has authenticated its bound.
+pub fn stmt_header_shape_valid(statement: raw) -> bool {
   unsafe {
     if statement.is_null() { return false }
     version: u32 := raw.load(statement, 0)
-    if version != 3 { return false }
+    if version != 4 { return false }
     driver: u8 := raw.load(statement, 4)
     closed: u8 := raw.load(statement, 5)
     reserved: u16 := raw.load(statement, 6)
@@ -271,14 +282,47 @@ pub fn stmt_header_valid(statement: raw) -> bool {
     stream_decoder: raw := raw.load(statement, 64)
     batch_plan: raw := raw.load(statement, 72)
     parameter_resolver: raw := raw.load(statement, 80)
+    binary_eligibility: raw := raw.load(statement, 88)
+    parameter_count_thunk: raw := raw.load(statement, 96)
+    parameter_count: u32 := raw.load(statement, 104)
+    tail_reserved: u32 := raw.load(statement, 108)
     if native.is_null() || connection_state.is_null() || binder.is_null()
       || query_id.is_null() || query_id_len <= 0 || row_validator.is_null()
       || stream_decoder.is_null() || !batch_plan_valid(batch_plan)
-      || parameter_resolver.is_null() {
+      || parameter_resolver.is_null() || parameter_count_thunk.is_null()
+      || parameter_count > 65535 || tail_reserved != 0 {
       return false
     }
-    if driver == 1 { return deallocate_sql.is_null() }
-    return !deallocate_sql.is_null()
+    if driver == 1 { return deallocate_sql.is_null() && binary_eligibility.is_null() }
+    if deallocate_sql.is_null() { return false }
+    return if parameter_count == 0 {
+      binary_eligibility.is_null()
+    } else { !binary_eligibility.is_null() }
+  }
+}
+
+// The one complete statement-v4 validator. Every accessor, indirect prepared bridge, and execution
+// path enters through this authority so the resolver, count thunk, eligibility vector, and existing
+// statement fields cannot drift across an ABI bump. Cleanup first tries this complete validation,
+// then falls back to the fixed shape so a malformed eligibility byte or count result cannot strand
+// otherwise authenticated direct owners; that fallback invokes no callback and performs no scan.
+pub fn stmt_header_valid(statement: raw) -> bool {
+  unsafe {
+    if !stmt_header_shape_valid(statement) { return false }
+    parameter_count: u32 := raw.load(statement, 104)
+    trusted_count := pkg.db.internal.descriptor.prepared_parameter_count(statement)
+    if trusted_count > 65535 || trusted_count != parameter_count { return false }
+    driver: u8 := raw.load(statement, 4)
+    if driver == 1 || parameter_count == 0 { return true }
+    binary_eligibility: raw := raw.load(statement, 88)
+    mut i: u32 := 0
+    loop {
+      if i >= parameter_count { break }
+      eligible: u8 := raw.load(binary_eligibility, i as i64)
+      if eligible > 1 { return false }
+      i = i + 1
+    }
+    return true
   }
 }
 
@@ -345,14 +389,37 @@ pub fn stmt_parameter_resolver(statement: raw) -> raw {
   }
 }
 
+pub fn stmt_parameter_count(statement: raw) -> u32 {
+  unsafe {
+    if stmt_driver(statement) == 0 { return 0 }
+    return raw.load(statement, 104)
+  }
+}
+
+pub fn stmt_binary_ordinal(statement: raw, resolver_ordinal: i32) -> i32 {
+  unsafe {
+    if !stmt_header_valid(statement) || resolver_ordinal >= 0
+      || resolver_ordinal == -2147483648 { return 0 }
+    ordinal := -resolver_ordinal
+    count: u32 := raw.load(statement, 104)
+    if ordinal <= 0 || (ordinal as u32) > count { return 0 }
+    eligibility: raw := raw.load(statement, 88)
+    if eligibility.is_null() { return 0 }
+    value: u8 := raw.load(eligibility, (ordinal as i64) - 1)
+    return if value == 1 { ordinal } else { 0 }
+  }
+}
+
 pub fn close_stmt(statement: raw) -> i32 {
   unsafe {
-    if !stmt_header_valid(statement) { return 0 }
+    complete := stmt_header_valid(statement)
+    if !complete && !stmt_header_shape_valid(statement) { return 0 }
     driver: u8 := raw.load(statement, 4)
     native: raw := raw.load(statement, 8)
     connection_state: raw := raw.load(statement, 16)
     query_id: raw := raw.load(statement, 32)
     deallocate_sql: raw := raw.load(statement, 48)
+    binary_eligibility: raw := raw.load(statement, 88)
     // Publish the closed state and null every owned/borrowed pointer before invoking native or raw
     // destructors. Re-entry can therefore neither reuse the resolver nor free an owner twice.
     raw.store(statement, 5, 1 as u8)
@@ -366,6 +433,10 @@ pub fn close_stmt(statement: raw) -> i32 {
     raw.store(statement, 64, raw.null())
     raw.store(statement, 72, raw.null())
     raw.store(statement, 80, raw.null())
+    raw.store(statement, 88, raw.null())
+    raw.store(statement, 96, raw.null())
+    raw.store(statement, 104, 0 as u32)
+    raw.store(statement, 108, 0 as u32)
     mut status: i32 := 0
     if driver == 1 {
       if !native.is_null() { status = sqlite3_finalize(native) }
@@ -394,6 +465,7 @@ pub fn close_stmt(statement: raw) -> i32 {
     }
     if !query_id.is_null() { raw.free(query_id) }
     if !deallocate_sql.is_null() { raw.free(deallocate_sql) }
+    if !binary_eligibility.is_null() { raw.free(binary_eligibility) }
     return status
   }
 }
@@ -409,8 +481,11 @@ pub fn drop_stmt(statement: raw) {
 fn free_bind_context(driver: u8, context: raw) {
   unsafe {
     if context.is_null() { return }
-    cache: raw := raw.load(context, 24)
-    if !cache.is_null() { raw.free(cache) }
+    if !pkg.db.internal.context_valid_v4(context, driver) {
+      raw.free(context)
+      return
+    }
+    pkg.db.internal.release_row_cache_v2(context)
     if driver == 1 {
       values: raw := raw.load(context, 40)
       count: u32 := raw.load(context, 48)
@@ -454,7 +529,7 @@ fn free_bind_context(driver: u8, context: raw) {
 // PostgreSQL owns either one buffered PGresult or one in-progress libpq result sequence. A
 // prepared stream remains dependent on the statement generation; a direct stream is dependent on
 // the conn/tx generation.
-//   0: u32 version (= 3), 4: driver, 5: terminal (0 active, 1 exhausted, 2 failed), 6: reserved
+//   0: u32 version (= 4), 4: driver, 5: terminal (0 active, 1 exhausted, 2 failed), 6: reserved
 //   8: sqlite3_stmt / PGresult
 //  16: prepared stmt wrapper, null for direct execution
 //  24: bind/decode context
@@ -499,7 +574,7 @@ pub fn new_rows_state(
 ) -> raw {
   unsafe {
     rows := raw.alloc(120)
-    raw.store(rows, 0, 3 as u32)
+    raw.store(rows, 0, 4 as u32)
     raw.store(rows, 4, driver)
     raw.store(rows, 5, 0 as u8)
     raw.store(rows, 6, 0 as u16)
@@ -530,7 +605,7 @@ pub fn new_rows_state(
   }
 }
 
-// The one complete rows-v3 validator. All accessors and cleanup enter through this authority so a
+// The one complete rows-v4 validator. All accessors and cleanup enter through this authority so a
 // later ABI bump cannot leave a sibling validator accepting an older or partially checked record.
 pub fn rows_header_valid(rows: raw) -> bool {
   unsafe {
@@ -562,7 +637,7 @@ pub fn rows_header_valid(rows: raw) -> bool {
     portal_max_rows: i32 := raw.load(rows, 100)
     deadline_ns: i64 := raw.load(rows, 104)
     timeout_duration_ns: i64 := raw.load(rows, 112)
-    if version != 3 || (driver != 1 && driver != 2) || terminal > 2 || reserved != 0
+    if version != 4 || (driver != 1 && driver != 2) || terminal > 2 || reserved != 0
       || owns_query_id > 1 || owns_statement > 1 || tail_reserved != 0 || restore_timeout > 1
       || timeout_reserved != 0 || timeout_reserved16 != 0 || timeout_reserved32 != 0
       || delivery > 3 || protocol_pending > 1 || delivery_reserved != 0
@@ -706,9 +781,8 @@ pub fn set_rows_native(rows: raw, result: raw) -> bool {
     if !rows_header_valid(rows) || terminal != 0 { return false }
     context: raw := raw.load(rows, 24)
     if context.is_null() { return false }
+    if !pkg.db.internal.set_native_generation_v1(context, result) { return false }
     raw.store(rows, 8, result)
-    raw.store(context, 8, result)
-    raw.store(context, 16, 0 as u32)
     return true
   }
 }
@@ -883,7 +957,10 @@ fn finish_postgres_stream(
           status := pkg.db.internal.postgres_status.code(current)
           PQclear(current)
           raw.store(rows, 8, raw.null())
-          raw.store(context, 8, raw.null())
+          if !pkg.db.internal.set_native_generation_v1(context, raw.null()) {
+            poison_conn_state(state)
+            return 1
+          }
           current = raw.null()
           if pkg.db.internal.postgres_status.must_close(status) {
             poison_conn_state(state)
@@ -913,8 +990,12 @@ fn finish_postgres_stream(
         } else {
           current = PQgetResult(connection)
           if current.is_null() { break }
+          if !pkg.db.internal.set_native_generation_v1(context, current) {
+            PQclear(current)
+            poison_conn_state(state)
+            return 1
+          }
           raw.store(rows, 8, current)
-          raw.store(context, 8, current)
         }
       }
     }

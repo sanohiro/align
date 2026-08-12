@@ -21,6 +21,8 @@ enum NativeReturn {
     Void,
     I32,
     I64,
+    F32,
+    F64,
     Ptr,
     I64Pair,
     PtrLen,
@@ -124,6 +126,13 @@ enum RuntimeAbiShape {
     A93,
     A94,
     A95,
+    A96,
+    A97,
+    A98,
+    A99,
+    A100,
+    A101,
+    A102,
 }
 
 #[derive(Clone, Copy)]
@@ -151,14 +160,30 @@ pub(super) enum UnkeyedRuntimeKey {
     ArenaReset = 2,
     Realloc = 3,
     HttpSerialize = 4,
+    F32ToBits = 5,
+    F32FromBits = 6,
+    F64ToBits = 7,
+    F64FromBits = 8,
+    F32TextLen = 9,
+    F64TextLen = 10,
+    F32TextWrite = 11,
+    F64TextWrite = 12,
 }
 
-pub(super) const UNKEYED_RUNTIME_KEYS: [UnkeyedRuntimeKey; 5] = [
+pub(super) const UNKEYED_RUNTIME_KEYS: [UnkeyedRuntimeKey; 13] = [
     UnkeyedRuntimeKey::ReportError,
     UnkeyedRuntimeKey::ArgsBuild,
     UnkeyedRuntimeKey::ArenaReset,
     UnkeyedRuntimeKey::Realloc,
     UnkeyedRuntimeKey::HttpSerialize,
+    UnkeyedRuntimeKey::F32ToBits,
+    UnkeyedRuntimeKey::F32FromBits,
+    UnkeyedRuntimeKey::F64ToBits,
+    UnkeyedRuntimeKey::F64FromBits,
+    UnkeyedRuntimeKey::F32TextLen,
+    UnkeyedRuntimeKey::F64TextLen,
+    UnkeyedRuntimeKey::F32TextWrite,
+    UnkeyedRuntimeKey::F64TextWrite,
 ];
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1707,12 +1732,12 @@ pub(super) fn validate_registry() -> Result<(), String> {
     if RuntimeKey::ALL.len() != 283 || keyed_runtime_abis().len() != 283 {
         return Err("runtime ABI registry invariant: key-count".to_string());
     }
-    if runtime_abis().count() != 288 {
+    if runtime_abis().count() != 296 {
         return Err("runtime ABI registry invariant: base-count".to_string());
     }
 
     let mut keys = HashSet::with_capacity(RuntimeKey::ALL.len());
-    let mut symbols = HashSet::with_capacity(288);
+    let mut symbols = HashSet::with_capacity(296);
     for abi in keyed_runtime_abis() {
         let key = abi
             .runtime_key()
@@ -1788,6 +1813,46 @@ pub(super) fn unkeyed_runtime_abi(key: UnkeyedRuntimeKey) -> RuntimeAbi {
             symbol: "align_rt_http_serialize",
             shape: RuntimeAbiShape::A95,
         },
+        UnkeyedRuntimeKey::F32ToBits => RuntimeAbi {
+            key: id,
+            symbol: "align_rt_f32_to_bits",
+            shape: RuntimeAbiShape::A96,
+        },
+        UnkeyedRuntimeKey::F32FromBits => RuntimeAbi {
+            key: id,
+            symbol: "align_rt_f32_from_bits",
+            shape: RuntimeAbiShape::A97,
+        },
+        UnkeyedRuntimeKey::F64ToBits => RuntimeAbi {
+            key: id,
+            symbol: "align_rt_f64_to_bits",
+            shape: RuntimeAbiShape::A98,
+        },
+        UnkeyedRuntimeKey::F64FromBits => RuntimeAbi {
+            key: id,
+            symbol: "align_rt_f64_from_bits",
+            shape: RuntimeAbiShape::A99,
+        },
+        UnkeyedRuntimeKey::F32TextLen => RuntimeAbi {
+            key: id,
+            symbol: "align_rt_f32_text_len",
+            shape: RuntimeAbiShape::A100,
+        },
+        UnkeyedRuntimeKey::F64TextLen => RuntimeAbi {
+            key: id,
+            symbol: "align_rt_f64_text_len",
+            shape: RuntimeAbiShape::A98,
+        },
+        UnkeyedRuntimeKey::F32TextWrite => RuntimeAbi {
+            key: id,
+            symbol: "align_rt_f32_text_write",
+            shape: RuntimeAbiShape::A101,
+        },
+        UnkeyedRuntimeKey::F64TextWrite => RuntimeAbi {
+            key: id,
+            symbol: "align_rt_f64_text_write",
+            shape: RuntimeAbiShape::A102,
+        },
     }
 }
 
@@ -1842,6 +1907,8 @@ fn native_return_type<'c>(ctx: &'c Context, ret: NativeReturn) -> BasicTypeEnum<
         NativeReturn::Void => unreachable!("void has no BasicTypeEnum"),
         NativeReturn::I32 => ctx.i32_type().into(),
         NativeReturn::I64 => ctx.i64_type().into(),
+        NativeReturn::F32 => ctx.f32_type().into(),
+        NativeReturn::F64 => ctx.f64_type().into(),
         NativeReturn::Ptr => ctx.ptr_type(inkwell::AddressSpace::default()).into(),
         NativeReturn::I64Pair => ctx
             .struct_type(&[ctx.i64_type().into(), ctx.i64_type().into()], false)
@@ -2936,6 +3003,62 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
             memory_argmem_read: false,
             read_ptr_params: &[],
         },
+        RuntimeAbiShape::A96 => RuntimeAbiShapeSpec {
+            ret: NativeReturn::I32,
+            params: &[NativeType::F32],
+            return_noalias: false,
+            fn_attrs: &["nofree", "nosync", "willreturn"],
+            memory_argmem_read: false,
+            read_ptr_params: &[],
+        },
+        RuntimeAbiShape::A97 => RuntimeAbiShapeSpec {
+            ret: NativeReturn::F32,
+            params: &[NativeType::I32],
+            return_noalias: false,
+            fn_attrs: &["nofree", "nosync", "willreturn"],
+            memory_argmem_read: false,
+            read_ptr_params: &[],
+        },
+        RuntimeAbiShape::A98 => RuntimeAbiShapeSpec {
+            ret: NativeReturn::I64,
+            params: &[NativeType::F64],
+            return_noalias: false,
+            fn_attrs: &["nofree", "nosync", "willreturn"],
+            memory_argmem_read: false,
+            read_ptr_params: &[],
+        },
+        RuntimeAbiShape::A99 => RuntimeAbiShapeSpec {
+            ret: NativeReturn::F64,
+            params: &[NativeType::I64],
+            return_noalias: false,
+            fn_attrs: &["nofree", "nosync", "willreturn"],
+            memory_argmem_read: false,
+            read_ptr_params: &[],
+        },
+        RuntimeAbiShape::A100 => RuntimeAbiShapeSpec {
+            ret: NativeReturn::I64,
+            params: &[NativeType::F32],
+            return_noalias: false,
+            fn_attrs: &["nofree", "nosync", "willreturn"],
+            memory_argmem_read: false,
+            read_ptr_params: &[],
+        },
+        RuntimeAbiShape::A101 => RuntimeAbiShapeSpec {
+            ret: NativeReturn::I64,
+            params: &[NativeType::F32, NativeType::Ptr, NativeType::I64],
+            return_noalias: false,
+            fn_attrs: &["nofree", "nosync", "willreturn"],
+            memory_argmem_read: false,
+            read_ptr_params: &[],
+        },
+        RuntimeAbiShape::A102 => RuntimeAbiShapeSpec {
+            ret: NativeReturn::I64,
+            params: &[NativeType::F64, NativeType::Ptr, NativeType::I64],
+            return_noalias: false,
+            fn_attrs: &["nofree", "nosync", "willreturn"],
+            memory_argmem_read: false,
+            read_ptr_params: &[],
+        },
     }
 }
 
@@ -2967,20 +3090,23 @@ mod tests {
         fn assert_ord<T: Ord>() {}
 
         assert_ord::<RuntimeAbiId>();
-        assert_eq!(UNKEYED_RUNTIME_KEYS.map(|key| key as u8), [0, 1, 2, 3, 4]);
+        assert_eq!(
+            UNKEYED_RUNTIME_KEYS.map(|key| key as u8),
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        );
         validate_registry().unwrap();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 288);
+        assert_eq!(rows.len(), 296);
         assert_eq!(
             rows.iter().map(|row| row.key).collect::<HashSet<_>>().len(),
-            288
+            296
         );
         assert_eq!(
             rows.iter()
                 .map(|row| row.symbol)
                 .collect::<HashSet<_>>()
                 .len(),
-            288
+            296
         );
         for (key, row) in RuntimeKey::ALL.into_iter().zip(keyed_runtime_abis()) {
             assert_eq!(row.key, RuntimeAbiId::Keyed(key));
@@ -3010,7 +3136,7 @@ mod tests {
     fn runtime_abi_extern_type_matrix_is_exact_for_every_row_and_ordinal() {
         let ctx = inkwell::context::Context::create();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 288);
+        assert_eq!(rows.len(), 296);
 
         for row in rows {
             let symbol = row.symbol;

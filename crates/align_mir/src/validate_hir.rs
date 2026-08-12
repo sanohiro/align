@@ -6219,19 +6219,19 @@ impl<'a> BodyValidator<'a> {
                         .map(|_| *resource),
                     _ => None,
                 };
-                    let rows_resource = match &ptr.kind {
-                        hir::ExprKind::ResourceRaw { resource, .. } => self
-                            .program
-                            .resources
-                            .get(*resource as usize)
-                            .filter(|definition| {
-                                definition.declaring_module == "pkg.db"
-                                    && definition.generic_arity == 1
-                                    && definition.name.starts_with("pkg.db$rows$")
-                            })
-                            .map(|_| *resource),
-                        _ => None,
-                    };
+                let rows_resource = match &ptr.kind {
+                    hir::ExprKind::ResourceRaw { resource, .. } => self
+                        .program
+                        .resources
+                        .get(*resource as usize)
+                        .filter(|definition| {
+                            definition.declaring_module == "pkg.db"
+                                && definition.generic_arity == 1
+                                && definition.name.starts_with("pkg.db$rows$")
+                        })
+                        .map(|_| *resource),
+                    _ => None,
+                };
                 let hir::ExprKind::Int(offset) = &offset.kind else {
                     return None;
                 };
@@ -6243,10 +6243,10 @@ impl<'a> BodyValidator<'a> {
                     || callee_flow.ty != Ty::Raw
                     || args.len() != param_tys.len()
                     || args.len() != param_modes.len()
-                        || (!matches!(offset, 40 | 48)
-                            && *return_borrow != hir::ReturnBorrowSummary::None)
-                        || (!matches!(offset, 40 | 48)
-                            && *return_region != hir::ReturnRegionSummary::None)
+                    || (!matches!(offset, 40 | 48)
+                        && *return_borrow != hir::ReturnBorrowSummary::None)
+                    || (!matches!(offset, 40 | 48)
+                        && *return_region != hir::ReturnRegionSummary::None)
                     || *return_cleanup != hir::ReturnCleanupAbi::None
                     || arg_flows
                         .iter()
@@ -6289,22 +6289,50 @@ impl<'a> BodyValidator<'a> {
                         resource,
                     )
                 });
+                let stmt_count_guard_ok = self.prepared_stmt_count_guard_matches(
+                    context,
+                    guard.as_deref(),
+                    ptr,
+                );
+                let descriptor_count_guard_ok = descriptor_kind.is_some_and(|query| {
+                    self.static_descriptor_count_guard_matches(
+                        context,
+                        guard.as_deref(),
+                        ptr,
+                        query,
+                    )
+                });
                 if descriptor_kind.is_none()
                     && prepared_resource.is_none()
                     && rows_resource.is_none()
                     && !batch_signature_ok
+                    && !stmt_count_guard_ok
                 {
                     return None;
                 }
-                if !batch_signature_ok && !prepared_guard_ok && guard.is_some() {
+                if !batch_signature_ok
+                    && !prepared_guard_ok
+                    && !stmt_count_guard_ok
+                    && !descriptor_count_guard_ok
+                    && guard.is_some()
+                {
                     return None;
                 }
-                let signature_ok = batch_signature_ok || match offset {
+                let signature_ok = batch_signature_ok
+                    || match offset {
                         40 => {
+                            let u8_ty = Ty::Int(align_sema::IntTy {
+                                bits: 8,
+                                signed: false,
+                            });
                             rows_resource.is_some()
-                                && args.len() == 1
-                                && param_tys.as_slice() == [Ty::Raw]
-                                && param_modes.as_slice() == [align_ast::ParamMode::ByValue]
+                                && args.len() == 2
+                                && param_tys.as_slice() == [Ty::Raw, u8_ty]
+                                && param_modes.as_slice()
+                                    == [
+                                        align_ast::ParamMode::ByValue,
+                                        align_ast::ParamMode::ByValue,
+                                    ]
                                 && expression.ty == i32_ty
                                 && summary_is_none(return_borrow, return_region)
                         }
@@ -6349,40 +6377,51 @@ impl<'a> BodyValidator<'a> {
                                 && *return_borrow == expected_borrow
                                 && *return_region == expected_region
                         }
-                    24 => {
+                        24 => {
                         let resource = prepared_resource?;
                         let params_ty = param_tys.get(1).copied()?;
+                        let u8_ty = Ty::Int(align_sema::IntTy { bits: 8, signed: false });
                         let definition = self.program.resources.get(resource as usize)?;
                         let expected_prefix =
                             format!("pkg.db$stmt${}$", body_ty_mangle(params_ty, self.program));
                         prepared_guard_ok
-                            && args.len() == 2
+                            && args.len() == 3
                             && matches!(params_ty, Ty::Struct(_))
                             && definition
                                 .name
                                 .strip_prefix(&expected_prefix)
                                 .is_some_and(|row| !row.is_empty())
-                            && param_tys.first() == Some(&Ty::Raw)
+                            && param_tys.as_slice() == [Ty::Raw, params_ty, u8_ty]
                             && param_modes.as_slice()
-                                == [align_ast::ParamMode::ByValue, align_ast::ParamMode::Borrow]
+                                == [
+                                    align_ast::ParamMode::ByValue,
+                                    align_ast::ParamMode::Borrow,
+                                    align_ast::ParamMode::ByValue,
+                                ]
                             && expression.ty == i32_ty
                     }
-                    64 => {
+                        64 => {
+                        let u8_ty = Ty::Int(align_sema::IntTy { bits: 8, signed: false });
                         descriptor_kind.is_some()
-                            && args.len() == 2
+                            && args.len() == 3
                             && param_tys.first() == Some(&Ty::Raw)
+                            && param_tys.get(2) == Some(&u8_ty)
                             && param_modes.as_slice()
-                                == [align_ast::ParamMode::ByValue, align_ast::ParamMode::Borrow]
+                                == [
+                                    align_ast::ParamMode::ByValue,
+                                    align_ast::ParamMode::Borrow,
+                                    align_ast::ParamMode::ByValue,
+                                ]
                             && expression.ty == i32_ty
                     }
-                    72 => {
+                        72 => {
                         descriptor_kind.is_some()
                             && args.len() == 1
                             && param_tys.as_slice() == [Ty::Raw]
                             && param_modes.as_slice() == [align_ast::ParamMode::ByValue]
                             && expression.ty == i32_ty
                     }
-                    80 => {
+                        80 => {
                         if prepared_resource.is_some() {
                             prepared_guard_ok
                                 && args.len() == 1
@@ -6390,47 +6429,79 @@ impl<'a> BodyValidator<'a> {
                                 && param_modes.as_slice() == [align_ast::ParamMode::ByValue]
                                 && expression.ty == i32_ty
                         } else {
+                            let u8_ty = Ty::Int(align_sema::IntTy { bits: 8, signed: false });
                             descriptor_kind == Some(true)
-                                && args.len() == 1
-                                && param_tys.as_slice() == [Ty::Raw]
-                                && param_modes.as_slice() == [align_ast::ParamMode::ByValue]
+                                && args.len() == 2
+                                && param_tys.as_slice() == [Ty::Raw, u8_ty]
+                                && param_modes.as_slice()
+                                    == [
+                                        align_ast::ParamMode::ByValue,
+                                        align_ast::ParamMode::ByValue,
+                                    ]
                                 && expression.ty == i32_ty
                         }
                     }
-                    88 => {
+                        88 => {
                         descriptor_kind == Some(true)
                             && args.len() == 1
                             && param_tys.as_slice() == [Ty::Raw]
                             && param_modes.as_slice() == [align_ast::ParamMode::ByValue]
                     }
-                    96 => {
-                        let u8_ty = Ty::Int(align_sema::IntTy { bits: 8, signed: false });
-                        let i64_ty = Ty::Int(align_sema::IntTy { bits: 64, signed: true });
-                        descriptor_kind == Some(true)
-                            && args.len() == 3
-                            && param_tys.as_slice() == [u8_ty, u8_ty, i64_ty]
-                            && param_modes.as_slice()
-                                == [
-                                    align_ast::ParamMode::ByValue,
-                                    align_ast::ParamMode::ByValue,
-                                    align_ast::ParamMode::ByValue,
-                                ]
-                            && matches!(
-                                expression.ty,
-                                Ty::Option(align_sema::Scalar::Struct(id))
-                                    if self.query_meta_type_ok(id)
-                            )
-                    }
-                    104 => {
+                        96 => {
+                            if stmt_count_guard_ok {
+                                let u32_ty = Ty::Int(align_sema::IntTy {
+                                    bits: 32,
+                                    signed: false,
+                                });
+                                args.is_empty()
+                                    && param_tys.is_empty()
+                                    && param_modes.is_empty()
+                                    && expression.ty == u32_ty
+                                    && summary_is_none(return_borrow, return_region)
+                            } else {
+                                let u8_ty = Ty::Int(align_sema::IntTy {
+                                    bits: 8,
+                                    signed: false,
+                                });
+                                let i64_ty = Ty::Int(align_sema::IntTy {
+                                    bits: 64,
+                                    signed: true,
+                                });
+                                descriptor_kind == Some(true)
+                                    && args.len() == 3
+                                    && param_tys.as_slice() == [u8_ty, u8_ty, i64_ty]
+                                    && param_modes.as_slice()
+                                        == [
+                                            align_ast::ParamMode::ByValue,
+                                            align_ast::ParamMode::ByValue,
+                                            align_ast::ParamMode::ByValue,
+                                        ]
+                                    && matches!(
+                                        expression.ty,
+                                        Ty::Option(align_sema::Scalar::Struct(id))
+                                            if self.query_meta_type_ok(id)
+                                    )
+                            }
+                        }
+                        104 => {
                         descriptor_kind.is_some()
                             && args.len() == 1
                             && param_tys.as_slice() == [Ty::Str]
                             && param_modes.as_slice() == [align_ast::ParamMode::ByValue]
                             && expression.ty == i32_ty
                     }
+                        136 => {
+                        let u32_ty = Ty::Int(align_sema::IntTy { bits: 32, signed: false });
+                        descriptor_count_guard_ok
+                            && args.is_empty()
+                            && param_tys.is_empty()
+                            && param_modes.is_empty()
+                            && expression.ty == u32_ty
+                            && summary_is_none(return_borrow, return_region)
+                        }
                         120 => false,
-                    _ => false,
-                };
+                        _ => false,
+                    };
                 if !signature_ok {
                     return None;
                 }
@@ -9796,8 +9867,98 @@ impl<'a> BodyValidator<'a> {
             && same_reference
     }
 
-    /// A statement retains five producer-owned callbacks after the Query value itself is gone.
-    /// They must all be loaded from one concrete Query descriptor generation; accepting five
+    fn prepared_stmt_count_guard_matches(
+        &self,
+        context: &BodyContext,
+        guard: Option<&hir::Expr>,
+        pointer: &hir::Expr,
+    ) -> bool {
+        let hir::ExprKind::Local(pointer_local) = pointer.kind else {
+            return false;
+        };
+        let Some(hir::Expr {
+            kind:
+                hir::ExprKind::Call {
+                    func,
+                    args: guard_args,
+                    type_args,
+                },
+            ty: Ty::Bool,
+            ..
+        }) = guard
+        else {
+            return false;
+        };
+        let [guard_pointer] = guard_args.as_slice() else {
+            return false;
+        };
+        self.static_descriptor_body_ok(context)
+            && func == "pkg.db.internal.resource$stmt_header_shape_valid"
+            && type_args.is_empty()
+            && pointer.ty == Ty::Raw
+            && guard_pointer.ty == Ty::Raw
+            && matches!(guard_pointer.kind, hir::ExprKind::Local(local) if local == pointer_local)
+    }
+
+    fn static_descriptor_count_guard_matches(
+        &self,
+        context: &BodyContext,
+        guard: Option<&hir::Expr>,
+        pointer: &hir::Expr,
+        query: bool,
+    ) -> bool {
+        let hir::ExprKind::Field {
+            root: pointer_root,
+            path: pointer_path,
+        } = &pointer.kind
+        else {
+            return false;
+        };
+        let Some(hir::Expr {
+            kind:
+                hir::ExprKind::Call {
+                    func,
+                    args: guard_args,
+                    type_args,
+                },
+            ty: Ty::Bool,
+            ..
+        }) = guard
+        else {
+            return false;
+        };
+        let [guard_pointer, guard_kind] = guard_args.as_slice() else {
+            return false;
+        };
+        let hir::ExprKind::Field {
+            root: guard_root,
+            path: guard_path,
+        } = &guard_pointer.kind
+        else {
+            return false;
+        };
+        let expected_kind = if query { 0 } else { 1 };
+        self.static_descriptor_body_ok(context)
+            && func == "pkg.db.internal$descriptor_count_shape_valid"
+            && type_args.is_empty()
+            && pointer.ty == Ty::Raw
+            && guard_pointer.ty == Ty::Raw
+            && pointer_root == guard_root
+            && pointer_path.as_slice() == [0]
+            && guard_path.as_slice() == [0]
+            && matches!(
+                guard_kind.kind,
+                hir::ExprKind::Int(value) if value == expected_kind
+            )
+            && guard_kind.ty
+                == Ty::Int(align_sema::IntTy {
+                    bits: 8,
+                    signed: false,
+                })
+    }
+
+    /// A statement retains six producer-owned callbacks after the Query value itself is gone.
+    /// They must all be loaded from one concrete Query descriptor generation; accepting six
     /// individually well-typed raw pointers would let malformed HIR splice a resolver or decoder
     /// from a sibling Query with the same P/R types.
     fn prepared_stmt_formation_matches(
@@ -9805,7 +9966,7 @@ impl<'a> BodyValidator<'a> {
         context: &BodyContext,
         args: &[hir::Expr],
     ) -> bool {
-        if !self.static_descriptor_body_ok(context) || args.len() != 11 {
+        if !self.static_descriptor_body_ok(context) || args.len() != 14 {
             return false;
         }
         let callback = |index: usize, expected_offset: i128| -> Option<u32> {
@@ -9829,7 +9990,7 @@ impl<'a> BodyValidator<'a> {
         let Some(root) = callback(3, 64) else {
             return false;
         };
-        [(7, 80), (8, 120), (9, 128), (10, 104)]
+        [(7, 80), (8, 120), (9, 128), (10, 104), (12, 136)]
             .into_iter()
             .all(|(index, offset)| callback(index, offset) == Some(root))
     }
