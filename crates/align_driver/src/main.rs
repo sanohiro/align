@@ -1218,15 +1218,34 @@ fn read(path: &str) -> Option<String> {
 /// import DAG), printing any diagnostics. Returns the walk on success (at least one unit), or `None`
 /// on a read/parse/check error (diagnostics already emitted). This is the shared front half of every
 /// codegen verb (`build`/`run`/`size`/`emit-obj`/`emit-llvm`/`emit-mir`) after the M15 S2b flip.
+/// Whether a package build should print the diagnostics it produced.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiagnosticEcho {
+    All,
+    ErrorsOnly,
+}
+
 /// [`walk_or_report`]'s package-build twin: the same read/report/empty-check contract, but through
 /// [`align_driver::build_package`], so a unit whose frontend result is already cached is served from
 /// disk instead of re-checked. Owns its own `SourceMap`, which is what lets the one bounded
 /// rehydration retry start from a clean one.
-fn package_or_report(path: &str, cache: &CacheContext, reuse: UnitReuse) -> Option<PackageBuild> {
+fn package_or_report(
+    path: &str,
+    cache: &CacheContext,
+    reuse: UnitReuse,
+    echo: DiagnosticEcho,
+) -> Option<PackageBuild> {
     let src = read(path)?;
     let mut sm = SourceMap::new();
     let build = align_driver::build_package(&mut sm, path, &src, cache, reuse);
-    if !build.diags.is_empty() {
+    let echo_now = match echo {
+        DiagnosticEcho::All => !build.diags.is_empty(),
+        // The retry pass re-derives the identical warnings the first attempt already printed;
+        // printing them again would break the "a diagnostic is emitted exactly once" rule. An
+        // ERROR is different: it is new information and must never be swallowed.
+        DiagnosticEcho::ErrorsOnly => build.diags.has_errors(),
+    };
+    if echo_now {
         eprint!("{}", format_diagnostics(&sm, &build.diags));
     }
     if build.diags.has_errors() {
@@ -1718,7 +1737,11 @@ fn report_pgo_use(pgo: &align_driver::PgoMode, build: &align_driver::UnitCodegen
 /// loop.
 #[allow(clippy::too_many_arguments)]
 fn build_package_to(path: &str, exe: &Path, target: BuildTarget, profile: Profile, rt_lto: bool, pgo: &align_driver::PgoMode, jobs: usize, cache_stats: bool, reuse: UnitReuse) -> Result<(), ExitCode> {
-    let mut build = package_or_report(path, &CacheContext::from_env(), reuse).ok_or(ExitCode::FAILURE)?;
+    // Only the retry pass forbids reuse here, and it re-derives what the first pass already
+    // printed. (`UnitReuse` is `#[non_exhaustive]`, so this is a first-attempt-vs-retry test rather
+    // than an exhaustive match.)
+    let echo = if reuse == UnitReuse::Allowed { DiagnosticEcho::All } else { DiagnosticEcho::ErrorsOnly };
+    let mut build = package_or_report(path, &CacheContext::from_env(), reuse, echo).ok_or(ExitCode::FAILURE)?;
     let object_stage = ArtifactStage::temp("align-per-unit-obj").map_err(|e| {
         eprintln!("alignc: cannot create object staging directory: {e}");
         ExitCode::FAILURE
@@ -1731,14 +1754,17 @@ fn build_package_to(path: &str, exe: &Path, target: BuildTarget, profile: Profil
         eprintln!("alignc: {e}");
         return Err(ExitCode::FAILURE);
     }
-    if cache_stats {
-        render_frontend_cache_stats(&build);
-    }
     let result = align_driver::codegen_package_parallel(&mut build, &obj_paths, &cache, &target, profile, rt_lto, jobs, pgo);
     let built = match result {
         Ok(built) => built,
-        Err(e) if reuse == UnitReuse::Allowed && e.starts_with("cached unit `") => {
-            eprintln!("alignc: {e}; rebuilding this package without cache reuse");
+        // The one recoverable failure, matched on its SHAPE. The entry is already unlinked, so one
+        // reuse-forbidden rebuild both succeeds and leaves the cache clean; a forbidden build never
+        // rehydrates, so this cannot recur. Nothing has been reported yet — the stats blocks below
+        // run only on the attempt that finishes — so the retry prints exactly one report.
+        Err(align_driver::PackageCodegenError::StaleCacheEntry { unit, failure }) => {
+            eprintln!(
+                "alignc: cached unit `{unit}`: {failure}; rebuilding this package without cache reuse"
+            );
             return build_package_to(path, exe, target, profile, rt_lto, pgo, jobs, cache_stats, UnitReuse::Forbidden);
         }
         Err(e) => {
@@ -1747,6 +1773,7 @@ fn build_package_to(path: &str, exe: &Path, target: BuildTarget, profile: Profil
         }
     };
     if cache_stats {
+        render_frontend_cache_stats(&build);
         render_cache_stats(&built.outcomes, cache.is_enabled());
     }
     report_pgo_use(pgo, &built);

@@ -24,6 +24,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NONCE: AtomicU64 = AtomicU64::new(0);
 
+/// Serializes every test in this file.
+///
+/// The in-process memo is process-global and every test here builds, so two tests running
+/// concurrently would interleave their `memo::stats()` contributions and make the promotion cell
+/// (P2-1) unobservable. Cargo already runs each integration test target in its own process, so this
+/// lock is confined to this file — and the suite is a few seconds either way.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn unique(tag: &str) -> PathBuf {
     let n = NONCE.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("align-unitcache-{}-{}-{tag}", std::process::id(), n))
@@ -136,6 +147,7 @@ fn two_module(tag: &str) -> Proj {
 
 #[test]
 fn a_private_body_edit_misses_only_its_own_unit() {
+    let _serial = serial();
     let proj = two_module("private-edit");
     let cold = proj.build(UnitReuse::Allowed);
     assert!(!hit(&cold, "lib") && !hit(&cold, "main"));
@@ -155,6 +167,7 @@ fn a_private_body_edit_misses_only_its_own_unit() {
 
 #[test]
 fn a_public_surface_edit_misses_the_reverse_dependent() {
+    let _serial = serial();
     let proj = two_module("surface-edit");
     proj.build(UnitReuse::Allowed);
     proj.write("lib.align", "module lib\n\npub fn twice(n: i64) -> i64 = n * 2\n\npub fn added() -> i64 = 3\n");
@@ -172,6 +185,7 @@ fn a_public_surface_edit_misses_the_reverse_dependent() {
 
 #[test]
 fn the_same_package_in_a_different_directory_hits() {
+    let _serial = serial();
     let first = two_module("relocate-a");
     let cold = first.build(UnitReuse::Allowed);
     assert!(!hit(&cold, "lib"));
@@ -196,6 +210,7 @@ fn the_same_package_in_a_different_directory_hits() {
 
 #[test]
 fn a_dependency_closure_change_misses_its_dependents() {
+    let _serial = serial();
     // `mid` re-exports nothing from `leaf`, so adding the import leaves `mid`'s summary shape the
     // same size — but `mid`'s rendered interface depends on its own closure, so `main` must miss.
     let proj = Proj::new(
@@ -220,6 +235,7 @@ fn a_dependency_closure_change_misses_its_dependents() {
 
 #[test]
 fn a_reused_build_equals_a_cold_build() {
+    let _serial = serial();
     let proj = two_module("equivalence");
 
     // Cold, with reuse FORBIDDEN: the reference result, produced exactly as before this cache
@@ -263,12 +279,14 @@ fn a_reused_build_equals_a_cold_build() {
 
 #[test]
 fn a_second_process_reuses_the_first_process_frontend() {
+    let _serial = serial();
     let proj = two_module("cross-process");
     let exe = env!("CARGO_BIN_EXE_alignc");
     let run = |label: &str| -> String {
         let out = std::process::Command::new(exe)
             .args(["build", &proj.entry(), "--cache-stats"])
             .env("ALIGNC_CACHE", &proj.cache)
+            .current_dir(&proj.dir)
             .output()
             .unwrap_or_else(|e| panic!("{label}: spawn alignc: {e}"));
         String::from_utf8_lossy(&out.stderr).into_owned()
@@ -309,6 +327,7 @@ fn warning_project(tag: &str) -> Proj {
 
 #[test]
 fn warnings_replay_verbatim_and_exactly_once() {
+    let _serial = serial();
     let proj = warning_project("warn-replay");
     let src = std::fs::read_to_string(proj.dir.join("main.align")).expect("read entry");
 
@@ -349,6 +368,7 @@ fn warnings_replay_verbatim_and_exactly_once() {
 
 #[test]
 fn a_unit_that_fails_to_check_is_never_published() {
+    let _serial = serial();
     let proj = Proj::new(
         "failing-unit",
         &[
@@ -369,6 +389,7 @@ fn a_unit_that_fails_to_check_is_never_published() {
 
 #[test]
 fn a_located_walk_never_serves_or_publishes() {
+    let _serial = serial();
     let proj = two_module("located");
     let src = std::fs::read_to_string(proj.dir.join("main.align")).expect("read entry");
     let mut sm = SourceMap::new();
@@ -382,6 +403,7 @@ fn a_located_walk_never_serves_or_publishes() {
 
 #[test]
 fn a_disabled_cache_is_a_complete_bypass() {
+    let _serial = serial();
     let proj = two_module("disabled");
     let src = std::fs::read_to_string(proj.dir.join("main.align")).expect("read entry");
     let mut sm = SourceMap::new();
@@ -393,6 +415,7 @@ fn a_disabled_cache_is_a_complete_bypass() {
 
 #[test]
 fn reuse_forbidden_neither_serves_nor_publishes() {
+    let _serial = serial();
     let proj = two_module("forbidden");
     proj.build(UnitReuse::Forbidden);
     assert!(proj.unit_entries().is_empty(), "a forbidden walk must not populate the cache");
@@ -407,6 +430,7 @@ fn reuse_forbidden_neither_serves_nor_publishes() {
 
 #[test]
 fn a_rehydrated_unit_matches_the_cold_lowering() {
+    let _serial = serial();
     let proj = two_module("rehydrate");
     let cold = proj.build(UnitReuse::Forbidden);
     let cold_mir: Vec<(String, align_interface::Hash128)> = cold
@@ -470,6 +494,7 @@ fn tamper_and_expect_rejection(tag: &str, mutate: impl FnOnce(&mut UnitEntry)) {
 
 #[test]
 fn rehydration_rejects_a_tampered_summary() {
+    let _serial = serial();
     tamper_and_expect_rejection("tamper-summary", |entry| {
         // Flip a byte inside the canonical summary. The value digest is recomputed on rewrite, so
         // this is not a corruption test — it is the "the entry disagrees with recomputation" test.
@@ -480,6 +505,7 @@ fn rehydration_rejects_a_tampered_summary() {
 
 #[test]
 fn rehydration_rejects_tampered_link_libs() {
+    let _serial = serial();
     tamper_and_expect_rejection("tamper-links", |entry| {
         entry.link_libs.push("nonexistent".to_string());
     });
@@ -487,6 +513,7 @@ fn rehydration_rejects_tampered_link_libs() {
 
 #[test]
 fn rehydration_rejects_tampered_diagnostics() {
+    let _serial = serial();
     tamper_and_expect_rejection("tamper-diags", |entry| {
         entry.diagnostics.push(unit_cache::CachedDiagnostic {
             severity: align_diag::Severity::Warning,
@@ -501,6 +528,7 @@ fn rehydration_rejects_tampered_diagnostics() {
 
 #[test]
 fn a_corrupted_entry_self_heals() {
+    let _serial = serial();
     let proj = two_module("corrupt");
     proj.build(UnitReuse::Allowed);
     let entries = proj.unit_entries();
@@ -526,6 +554,7 @@ fn a_corrupted_entry_self_heals() {
 
 #[test]
 fn an_out_of_range_diagnostic_span_is_rejected() {
+    let _serial = serial();
     let proj = warning_project("span-range");
     proj.build(UnitReuse::Allowed);
     for path in proj.unit_entries() {
@@ -552,6 +581,7 @@ fn an_out_of_range_diagnostic_span_is_rejected() {
 
 #[test]
 fn a_foreign_compiler_fingerprint_never_hits() {
+    let _serial = serial();
     let proj = two_module("foreign-compiler");
     proj.build(UnitReuse::Allowed);
     let entries = proj.unit_entries();
@@ -574,6 +604,7 @@ fn a_foreign_compiler_fingerprint_never_hits() {
 
 #[test]
 fn ffi_declared_link_libraries_survive_reuse() {
+    let _serial = serial();
     // The load-bearing case for persisting `link_libs` at all: a `link("m")` library is NOT a
     // capability, so it does not appear in `summary.capabilities` and could not be re-derived.
     let proj = Proj::new(
@@ -611,6 +642,7 @@ fn ffi_declared_link_libraries_survive_reuse() {
 
 #[test]
 fn the_reconstructed_static_input_manifest_matches_the_cold_one() {
+    let _serial = serial();
     let proj = two_module("static-inputs");
     let cold = proj.build(UnitReuse::Forbidden);
     let cold_inputs: Vec<(String, Vec<u8>)> = cold
@@ -640,6 +672,7 @@ fn the_reconstructed_static_input_manifest_matches_the_cold_one() {
 
 #[test]
 fn concurrent_producers_publish_identical_manifests() {
+    let _serial = serial();
     let proj = two_module("concurrent");
     // Four processes racing to populate one cold cache root. Every publish is a staged write plus a
     // same-directory rename, and every producer of one key writes byte-identical bytes, so
@@ -651,6 +684,7 @@ fn concurrent_producers_publish_identical_manifests() {
             std::process::Command::new(exe)
                 .args(["build", &proj.entry()])
                 .env("ALIGNC_CACHE", &proj.cache)
+            .current_dir(&proj.dir)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
@@ -679,6 +713,7 @@ fn concurrent_producers_publish_identical_manifests() {
     let warm = std::process::Command::new(exe)
         .args(["build", &proj.entry(), "--cache-stats"])
         .env("ALIGNC_CACHE", &proj.cache)
+            .current_dir(&proj.dir)
         .output()
         .expect("spawn");
     let stderr = String::from_utf8_lossy(&warm.stderr);
@@ -692,11 +727,13 @@ fn concurrent_producers_publish_identical_manifests() {
 
 #[test]
 fn a_measurement_toggle_disables_the_cache() {
+    let _serial = serial();
     let proj = two_module("toggle");
     let exe = env!("CARGO_BIN_EXE_alignc");
     let status = std::process::Command::new(exe)
         .args(["build", &proj.entry()])
         .env("ALIGNC_CACHE", &proj.cache)
+            .current_dir(&proj.dir)
         .env("ALIGN_CONST_POOL", "off")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -713,6 +750,7 @@ fn a_measurement_toggle_disables_the_cache() {
 
 #[test]
 fn the_disk_cache_and_the_memo_compose() {
+    let _serial = serial();
     let proj = two_module("memo-compose");
     // The memo is process-global and other tests share it, so this asserts only what is local: the
     // disk lookup runs on the DIGEST path, before anything renders, so it is consulted on every
@@ -742,6 +780,7 @@ fn the_disk_cache_and_the_memo_compose() {
 
 #[test]
 fn the_frontend_outcome_is_recorded_per_unit() {
+    let _serial = serial();
     let proj = two_module("outcome");
     let cold = proj.build(UnitReuse::Allowed);
     for unit in &cold.units {
@@ -762,6 +801,7 @@ fn the_frontend_outcome_is_recorded_per_unit() {
 
 #[test]
 fn summary_to_source_depends_only_on_the_summary_and_its_closure() {
+    let _serial = serial();
     // The key records `(summary_digest, closure_digest)` INSTEAD of the rendered interface source,
     // which is only sound because rendering is a pure function of exactly those two inputs. Two
     // projects in different directories with identical sources must render byte-identically.
@@ -779,6 +819,7 @@ fn summary_to_source_depends_only_on_the_summary_and_its_closure() {
 
 #[test]
 fn a_synthetic_key_round_trips_through_the_store() {
+    let _serial = serial();
     // Guards the tamper helpers: publishing a hand-built key/entry pair and reading it back must
     // recover exactly what was written, or every tamper test above would be vacuous.
     let proj = two_module("synthetic");
@@ -842,6 +883,7 @@ fn pkg_db_modules() -> Vec<(String, String)> {
 
 #[test]
 fn a_descriptor_owning_unit_is_never_cached() {
+    let _serial = serial();
     let modules = pkg_db_modules();
     let mut files: Vec<(&str, &str)> =
         modules.iter().map(|(name, src)| (name.as_str(), src.as_str())).collect();
@@ -887,4 +929,232 @@ fn a_descriptor_owning_unit_is_never_cached() {
         hit(&warm, "pkg.db.internal"),
         "while its descriptor-free dependencies still are — the exclusion is per unit, not per build"
     );
+}
+
+// ---- P3-5: closure_digest is load-bearing --------------------------------------------------
+
+#[test]
+fn a_closure_member_moving_within_the_loaded_set_misses_its_dependents() {
+    let _serial = serial();
+    // The discriminating shape for `closure_digest`. `main` imports `m1` and `m2`; `m1` imports
+    // `leaf`, so all four modules are loaded either way and `main`'s dependency LIST is byte-equal
+    // before and after. What changes is that `m2` gains an import of `leaf` without touching its own
+    // public surface — so `m2`'s interface_hash is unchanged, its position in `main`'s DFS order is
+    // unchanged, and only the rendering of `m2` (which carries its import lines) differs. Without
+    // `closure_digest` in the key, `main` would be served an entry checked against a DIFFERENT
+    // interface source.
+    let proj = Proj::new(
+        "closure-member-moves",
+        &[
+            ("leaf.align", "module leaf\n\npub fn one() -> i64 = 1\n"),
+            ("m1.align", "module m1\n\nimport leaf\n\npub fn a() -> i64 = leaf.one()\n"),
+            ("m2.align", "module m2\n\npub fn b() -> i64 = 2\n"),
+            ("main.align", "import m1\nimport m2\n\nfn main() {\n    print(m1.a() + m2.b())\n}\n"),
+        ],
+    );
+    let cold = proj.build(UnitReuse::Allowed);
+    let dep_list = |build: &PackageBuild| -> Vec<(String, Vec<String>)> {
+        build
+            .units
+            .iter()
+            .map(|u| (u.unit.clone(), u.dep_interface_hashes.iter().map(|(m, _)| m.clone()).collect()))
+            .collect()
+    };
+    let main_deps = |build: &PackageBuild| dep_list(build).into_iter().find(|(u, _)| u == "main");
+    let cold_deps = main_deps(&cold);
+    let cold_m2 = cold.units.iter().find(|u| u.unit == "m2").expect("m2").summary.interface_hash;
+
+    // `m2` gains an import; its public surface does not move.
+    proj.write("m2.align", "module m2\n\nimport leaf\n\npub fn b() -> i64 = 2\n");
+    let warm = proj.build(UnitReuse::Allowed);
+    let warm_m2 = warm.units.iter().find(|u| u.unit == "m2").expect("m2").summary.interface_hash;
+
+    assert_eq!(cold_m2, warm_m2, "the fixture must leave m2's interface hash UNCHANGED");
+    assert_eq!(
+        cold_deps,
+        main_deps(&warm),
+        "and MAIN's dependency list unchanged — the loaded set never moved, so the only thing that \
+         can discriminate main's key is m2's closure_digest"
+    );
+    assert!(!hit(&warm, "m2"), "m2's own source changed");
+    assert!(
+        !hit(&warm, "main"),
+        "main is checked against m2's RENDERED interface, which now carries a different import set"
+    );
+    assert_eq!(miss_reason(&warm, "main"), Some(align_driver::FirstDiff::DepInterfaceHashes));
+}
+
+// ---- P2-1: a verified rehydration promotes into the memo -------------------------------------
+
+#[test]
+fn a_verified_rehydration_is_promoted_into_the_memo() {
+    let _serial = serial();
+    let proj = two_module("memo-promotion");
+    proj.build(UnitReuse::Allowed); // populate disk (and, incidentally, the memo)
+
+    // Start from "disk has it, the memo does not" — the state a fresh process is always in, and the
+    // one the promotion exists for. `memo::clear` is safe here because this file is serialized.
+    align_driver::memo::clear();
+    proj.clear_objects();
+
+    let before = align_driver::memo::stats();
+    let mut first = proj.build(UnitReuse::Allowed);
+    let index = first.units.iter().position(|u| u.unit == "lib").expect("lib");
+    assert!(first.units[index].is_reused(), "the unit must come from disk, not the memo");
+    first.materialize(index).expect("rehydration must verify");
+    let after_first = align_driver::memo::stats();
+    assert_eq!(
+        after_first.unit_misses - before.unit_misses,
+        1,
+        "the first rehydration looks the memo up and finds nothing"
+    );
+    assert_eq!(after_first.unit_hits, before.unit_hits, "and certainly does not hit");
+
+    // Second rehydration of the SAME unit, in the same process: the promotion must make it a memo
+    // hit instead of a second full re-check.
+    let mut second = proj.build(UnitReuse::Allowed);
+    let index = second.units.iter().position(|u| u.unit == "lib").expect("lib");
+    assert!(second.units[index].is_reused());
+    second.materialize(index).expect("rehydration must verify");
+    let after_second = align_driver::memo::stats();
+    assert_eq!(
+        after_second.unit_hits - after_first.unit_hits,
+        1,
+        "a verified rehydration must be promoted into the memo, so the next one is served from it"
+    );
+    assert_eq!(
+        after_second.unit_misses, after_first.unit_misses,
+        "and the second rehydration must not look anything else up"
+    );
+}
+
+// ---- P2-3: the bounded retry, end to end -------------------------------------------------------
+
+#[test]
+fn a_stale_entry_makes_the_cli_retry_once_and_succeed() {
+    let _serial = serial();
+    let proj = two_module("cli-retry");
+    let exe = env!("CARGO_BIN_EXE_alignc");
+    let build = |args: &[&str]| -> std::process::Output {
+        let mut command = std::process::Command::new(exe);
+        command
+            .arg("build")
+            .arg(proj.entry())
+            .args(args)
+            .env("ALIGNC_CACHE", &proj.cache)
+            .current_dir(&proj.dir);
+        command.output().expect("spawn alignc")
+    };
+    let cold = build(&[]);
+    assert!(cold.status.success(), "cold: {}", String::from_utf8_lossy(&cold.stderr));
+
+    // Make one entry disagree with what recomputing it produces, keeping the manifest well-formed
+    // (its value digest is recomputed on rewrite) — this is the "the key was incomplete" path, not
+    // the corruption path.
+    let mut tampered = false;
+    for path in proj.unit_entries() {
+        let bytes = std::fs::read(&path).expect("read");
+        let Some((key, mut entry)) = unit_cache::decode_manifest(&bytes) else { continue };
+        if key.unit != "lib" {
+            continue;
+        }
+        entry.link_libs.push("definitely-not-a-real-library".to_string());
+        std::fs::write(&path, unit_cache::serialize_manifest(&key, &entry)).expect("rewrite");
+        tampered = true;
+    }
+    assert!(tampered, "the `lib` entry must exist to tamper with");
+    proj.clear_objects(); // force the rehydration that discovers the disagreement
+
+    let retried = build(&["--cache-stats"]);
+    let stderr = String::from_utf8_lossy(&retried.stderr).into_owned();
+    assert!(retried.status.success(), "the retry must produce a working build:\n{stderr}");
+    assert_eq!(
+        stderr.matches("rebuilding this package without cache reuse").count(),
+        1,
+        "exactly one retry, announced once:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("cached unit `lib`: cached unit disagreed with recomputation (link libraries)"),
+        "the note must name the unit and the disagreeing component:\n{stderr}"
+    );
+    // Exactly one report of each stats block: the failed attempt renders nothing.
+    assert_eq!(stderr.matches("unit(s): ").count(), 1, "one codegen summary:\n{stderr}");
+    assert_eq!(
+        stderr.matches("frontend: ").count(),
+        0,
+        "the retry forbids reuse, so it consults no frontend entry and prints no frontend block:\n{stderr}"
+    );
+    // Healing takes one more ordinary build, and that is the correct shape: the retry FORBIDS
+    // reuse, and a forbidden walk neither serves nor publishes, so the rejected entry is simply
+    // absent afterwards. The next ordinary build recomputes and republishes it...
+    let republish = build(&["--cache-stats"]);
+    let republish_err = String::from_utf8_lossy(&republish.stderr).into_owned();
+    assert!(republish.status.success());
+    assert!(
+        republish_err.contains("lib frontend miss (no prior entry)"),
+        "the rejected entry must be gone, not silently reused:\n{republish_err}"
+    );
+    // ...and the one after it hits again.
+    let healed = build(&["--cache-stats"]);
+    let healed_err = String::from_utf8_lossy(&healed.stderr);
+    assert!(healed.status.success());
+    assert!(
+        healed_err.contains("2 frontend: 2 hit, 0 miss"),
+        "the cache must be healthy again two builds later:\n{healed_err}"
+    );
+}
+
+// ---- P2-4: artifact-level equivalence ------------------------------------------------------------
+
+#[test]
+fn a_cold_build_and_an_all_hit_build_produce_the_same_executable() {
+    let _serial = serial();
+    let exe = env!("CARGO_BIN_EXE_alignc");
+    let sources: &[(&str, &str)] = &[
+        ("lib.align", "module lib\n\npub fn twice(n: i64) -> i64 = n * 2\n\nfn helper() -> i64 = 1\n"),
+        ("main.align", "import lib\n\nfn main() {\n    print(lib.twice(21))\n}\n"),
+    ];
+    // Identical sources in two directories, sharing one cache root: the first build is cold, the
+    // second is an all-hit served entirely from that root. The entry BASENAME is the same in both,
+    // which matters on Mach-O — the linker embeds the output file's name in the ad-hoc code
+    // signature, so two links differing only in destination NAME differ in bytes no matter what the
+    // cache did (doc-10 §7 scopes the byte-identity row for exactly this reason).
+    let cold = Proj::new("artifact-cold", sources);
+    let second = Proj::new("artifact-warm", sources);
+    // Borrow the second project's directory but the FIRST project's cache root. `second` stays alive
+    // for the whole test; dropping it early would remove the directory out from under the build.
+    let warm = Proj { dir: second.dir.clone(), cache: cold.cache.clone() };
+    let run_build = |proj: &Proj| -> std::process::Output {
+        std::process::Command::new(exe)
+            .args(["build", &proj.entry(), "--cache-stats"])
+            .env("ALIGNC_CACHE", &proj.cache)
+            .current_dir(&proj.dir)
+            .output()
+            .expect("spawn alignc")
+    };
+    let cold_out = run_build(&cold);
+    assert!(cold_out.status.success(), "{}", String::from_utf8_lossy(&cold_out.stderr));
+    let warm_out = run_build(&warm);
+    let warm_err = String::from_utf8_lossy(&warm_out.stderr);
+    assert!(warm_out.status.success(), "{warm_err}");
+    assert!(
+        warm_err.contains("2 frontend: 2 hit, 0 miss") && warm_err.contains("2 unit(s): 2 hit, 0 miss"),
+        "the second build must be an ALL-hit, else this compares nothing:\n{warm_err}"
+    );
+
+    let cold_exe = cold.dir.join("main");
+    let warm_exe = warm.dir.join("main");
+    let cold_bytes = std::fs::read(&cold_exe).expect("cold executable");
+    let warm_bytes = std::fs::read(&warm_exe).expect("warm executable");
+    assert_eq!(
+        cold_bytes, warm_bytes,
+        "an all-hit build must link a byte-identical executable to the cold build it reused"
+    );
+    // Belt and braces: the artifacts also behave identically.
+    let cold_run = std::process::Command::new(&cold_exe).output().expect("run cold");
+    let warm_run = std::process::Command::new(&warm_exe).output().expect("run warm");
+    assert_eq!(cold_run.stdout, warm_run.stdout);
+    assert_eq!(cold_run.status.code(), warm_run.status.code());
+    assert_eq!(String::from_utf8_lossy(&cold_run.stdout).trim(), "42");
+    drop(second);
 }

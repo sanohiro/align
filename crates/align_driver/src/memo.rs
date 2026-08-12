@@ -89,41 +89,20 @@ pub(crate) struct CachedUnit {
     /// used to disqualify the unit. Only the byte offsets are stored: the `FileId` is an index into
     /// the walk's own `SourceMap` and is reattached from the unit's file in the replaying walk. A
     /// unit whose diagnostics do not all point into its OWN source file is not retained at all
-    /// (`unit_diagnostics`), because no such reattachment would be correct.
+    /// (`crate::unit_cache::replayable_diagnostics`), because no such reattachment would be correct.
     pub(crate) diagnostics: Vec<CachedDiagnostic>,
+    /// Always `true`: [`unit_store`]'s precondition is a descriptor-free unit. Carried as data so a
+    /// consumer that must exclude descriptor-owning units (the persistent cache's publish path) can
+    /// check the fact instead of trusting a comment about who called `unit_store`.
+    pub(crate) static_descriptors_were_empty: bool,
 }
 
 /// One replayable diagnostic: everything but the `FileId`, which the replaying walk supplies.
-pub(crate) struct CachedDiagnostic {
-    pub(crate) severity: align_diag::Severity,
-    pub(crate) message: String,
-    pub(crate) lo: u32,
-    pub(crate) hi: u32,
-}
-
-/// The replayable form of `diags`, or `None` when this unit must not be retained.
 ///
-/// Every diagnostic must carry a span in the unit's OWN file (`unit_file`). A span in another file
-/// — a synthesized `<interface:…>` pseudo-file, or the `Span::new(0, 0, 0)` placeholder used by the
-/// walk's internal-error paths — cannot be reattached correctly in another walk, where that id
-/// denotes a different file, so the unit is left uncached instead.
-pub(crate) fn unit_diagnostics(
-    diags: &align_diag::Diagnostics,
-    unit_file: align_span::FileId,
-) -> Option<Vec<CachedDiagnostic>> {
-    diags
-        .iter()
-        .map(|diagnostic| {
-            let span = diagnostic.span.filter(|span| span.file == unit_file)?;
-            Some(CachedDiagnostic {
-                severity: diagnostic.severity,
-                message: diagnostic.message.clone(),
-                lo: span.lo,
-                hi: span.hi,
-            })
-        })
-        .collect()
-}
+/// Shared with the persistent cache rather than duplicated: the two stages store the same three
+/// fields under the same own-file rule, and a second copy of that rule is a second place for it to
+/// drift. See [`crate::unit_cache::replayable_diagnostics`], the single filter.
+pub(crate) use crate::unit_cache::CachedDiagnostic;
 
 /// Hit/miss and retention counters. Cumulative for the process (or since the last [`clear`]).
 ///
@@ -524,23 +503,16 @@ pub(crate) fn unit_lookup(key: Hash128) -> Option<CachedUnit> {
         summary: hit.summary.clone(),
         mir: hit.mir.clone(),
         static_inputs: hit.static_inputs.clone(),
-        diagnostics: hit
-            .diagnostics
-            .iter()
-            .map(|diagnostic| CachedDiagnostic {
-                severity: diagnostic.severity,
-                message: diagnostic.message.clone(),
-                lo: diagnostic.lo,
-                hi: diagnostic.hi,
-            })
-            .collect(),
+        diagnostics: hit.diagnostics.clone(),
+        static_descriptors_were_empty: hit.static_descriptors_were_empty,
     };
     guard.stats.unit_hits += 1;
     Some(cloned)
 }
 
 /// Retain one per-unit result. The caller must have established that the unit checked without
-/// errors, owns no static descriptors, and has replayable diagnostics ([`unit_diagnostics`]).
+/// errors, owns no static descriptors, and has replayable diagnostics
+/// ([`crate::unit_cache::replayable_diagnostics`]).
 /// `key_material_len` is the length of the canonical key material [`unit_key`] already built: it
 /// contains the unit's full source and every dependency interface it was checked against, which is
 /// what the retained summary and MIR are derived from.

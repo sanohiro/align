@@ -85,6 +85,7 @@ pub const KEYED_ENV_TOGGLES: [&str; 4] = [
 /// One keyed environment toggle's state. `Absent` and `Present("")` are distinct: an exported empty
 /// value is not the same input as an unset variable.
 #[derive(Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum EnvToggle {
     Absent,
     Present(String),
@@ -519,6 +520,7 @@ pub struct UnitHit {
 }
 
 /// The result of one unit-frontend lookup.
+#[non_exhaustive]
 pub enum UnitLookup {
     /// Served from disk: replay this entry instead of checking the unit.
     Hit(Box<UnitHit>),
@@ -546,6 +548,12 @@ pub fn lookup(root: &Path, key: &UnitKey, source_len: usize) -> UnitLookup {
         }
         Err(_) => corrupt(&path),
         Ok(Some((_, entry))) => {
+            // Steps 8 then 9, in that order: decode the summary before range-checking the spans, so
+            // a manifest that fails both reports the earlier cause. Both are past the key
+            // comparison, so both mean damage to an entry that provably is ours.
+            let Ok(summary) = align_interface::deserialize(&entry.summary_bytes) else {
+                return corrupt(&path);
+            };
             if entry
                 .diagnostics
                 .iter()
@@ -553,16 +561,19 @@ pub fn lookup(root: &Path, key: &UnitKey, source_len: usize) -> UnitLookup {
             {
                 return corrupt(&path);
             }
-            let Ok(summary) = align_interface::deserialize(&entry.summary_bytes) else {
-                return corrupt(&path);
-            };
             UnitLookup::Hit(Box::new(UnitHit { entry, summary }))
         }
     }
 }
 
-/// Unlink a damaged entry, note it, and report a rebuild. Best-effort: an unlink failure only means
-/// the next build repeats the same self-heal.
+/// Unlink a damaged entry, note it, and report a rebuild.
+///
+/// Best-effort in both directions: an unlink failure only means the next build repeats the same
+/// self-heal, and a concurrent producer that republishes between this `remove_file` and its own
+/// rename simply wins — it writes a correct manifest, which is the outcome we wanted anyway. The
+/// slot pointer is deliberately left alone: it is observability only (it names the first differing
+/// component of a later miss) and removing it would cost that diagnosis with no safety gain, since
+/// a hit always requires the full-key manifest this just removed.
 fn corrupt(path: &Path) -> UnitLookup {
     let _ = std::fs::remove_file(path);
     eprintln!("{}", cache::CORRUPT_NOTE);
@@ -668,6 +679,174 @@ mod tests {
             }],
             link_libs: vec!["sqlite3".to_string()],
         }
+    }
+
+
+    /// P2-2, semantic -> byte: the exact bytes, transcribed BY HAND from the format table in
+    /// `docs/impl/10-cache-first-optimization.md` §6.7, not captured from the encoder.
+    ///
+    /// Everything but the trailing digest is written out literally, so a changed width, tag value,
+    /// field order, or length-prefix convention fails here even if encoder and decoder change
+    /// together. The 16-byte trailer is by definition `Hash128` OF the preceding value region, so it
+    /// is checked as that rule rather than as a magic constant.
+    const GOLDEN_PREFIX_HEX: &str = concat!(
+        "01000000",                         // manifest_format_version = 1 (u32 LE)
+        "03",                               // phase_tag = 3
+        // -- key region --
+        "01000000",                         // key_format_version = 1
+        "01000000000000000200000000000000", // compiler_fingerprint = Hash128 { lo: 1, hi: 2 }
+        "05000000",                         // frontend_schema = align_interface::FORMAT_VERSION = 5
+        "04000000",                         // env_toggles: exactly 4
+        "10000000414c49474e5f434f4e53545f504f4f4c", "00",             // ALIGN_CONST_POOL   Absent
+        "12000000414c49474e5f4e4545444c455f484f495354", "01", "030000006f6666", // ..NEEDLE_HOIST Present("off")
+        "13000000414c49474e5f4255464645525f444f4e415445", "00",       // ALIGN_BUFFER_DONATE Absent
+        "13000000414c49474e5f534f52545f414441505449564500",           // ALIGN_SORT_ADAPTIVE Absent
+        "180000007838365f36342d756e6b6e6f776e2d6c696e75782d676e75",   // target_triple
+        "00",                               // object_format = 0 (ELF)
+        "06000000706b672e6462",             // unit = "pkg.db"
+        "00",                               // is_entry = false
+        "0a000000000000000b00000000000000", // source_digest = Hash128 { lo: 10, hi: 11 }
+        "02000000",                         // deps: 2
+        "0f000000706b672e64622e696e7465726e616c", "00",               // pkg.db.internal  Missing
+        "0d000000706b672e64622e73716c697465", "01",                   // pkg.db.sqlite    Present
+        "14000000000000001500000000000000",                           //   interface_hash 20/21
+        "1e000000000000001f00000000000000",                           //   closure_digest 30/31
+        // -- value region --
+        "0400000001020304",                 // summary_bytes = [1,2,3,4]
+        "01000000",                         // diagnostics: 1
+        "01",                               // severity = 1 (Warning)
+        "100000006c6f73737920636f6e76657273696f6e",                   // "lossy conversion"
+        "07000000", "0b000000",             // lo = 7, hi = 11
+        "01000000", "0700000073716c69746533",                         // link_libs = ["sqlite3"]
+    );
+
+    fn golden_key() -> UnitKey {
+        UnitKey {
+            key_format_version: 1,
+            compiler_fingerprint: Hash128 { lo: 1, hi: 2 },
+            frontend_schema: align_interface::FORMAT_VERSION,
+            env_toggles: vec![
+                EnvToggle::Absent,
+                EnvToggle::Present("off".to_string()),
+                EnvToggle::Absent,
+                EnvToggle::Absent,
+            ],
+            target_triple: "x86_64-unknown-linux-gnu".to_string(),
+            object_format: 0,
+            unit: "pkg.db".to_string(),
+            is_entry: false,
+            source_digest: Hash128 { lo: 10, hi: 11 },
+            deps: vec![
+                UnitDep { module: "pkg.db.internal".to_string(), state: DepState::Missing },
+                UnitDep {
+                    module: "pkg.db.sqlite".to_string(),
+                    state: DepState::Present {
+                        interface_hash: Hash128 { lo: 20, hi: 21 },
+                        closure_digest: Hash128 { lo: 30, hi: 31 },
+                    },
+                },
+            ],
+        }
+    }
+
+    fn golden_entry() -> UnitEntry {
+        UnitEntry {
+            summary_bytes: vec![1, 2, 3, 4],
+            diagnostics: vec![CachedDiagnostic {
+                severity: align_diag::Severity::Warning,
+                message: "lossy conversion".to_string(),
+                lo: 7,
+                hi: 11,
+            }],
+            link_libs: vec!["sqlite3".to_string()],
+        }
+    }
+
+    fn from_hex(hex: &str) -> Vec<u8> {
+        assert!(hex.len() % 2 == 0);
+        (0..hex.len() / 2)
+            .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    /// The exact byte range the value digest covers, per the format table: everything after the key
+    /// region and before the 16-byte trailer.
+    fn golden_value_start() -> usize {
+        let mut w = Writer::new();
+        w.u32(UNIT_MANIFEST_FORMAT_VERSION);
+        w.u8(UNIT_PHASE_TAG);
+        write_key(&mut w, &golden_key());
+        w.buf.len()
+    }
+
+    #[test]
+    fn golden_vector_semantic_to_byte() {
+        assert_eq!(
+            align_interface::FORMAT_VERSION,
+            5,
+            "the golden vector transcribes frontend_schema = 5; re-transcribe it if the interface \
+             codec version moves"
+        );
+        let prefix = from_hex(GOLDEN_PREFIX_HEX);
+        let encoded = serialize_manifest(&golden_key(), &golden_entry());
+        assert_eq!(
+            encoded.len(),
+            prefix.len() + 16,
+            "the manifest is the transcribed prefix plus one 16-byte value digest"
+        );
+        assert_eq!(&encoded[..prefix.len()], &prefix[..], "encoded bytes must match the format table");
+        // The trailer is the digest rule, checked independently of the encoder's own call.
+        let value = &prefix[golden_value_start()..];
+        let expected = Hash128::of(value);
+        let mut trailer = Writer::new();
+        trailer.h128(expected);
+        assert_eq!(&encoded[prefix.len()..], &trailer.buf[..], "the trailer is Hash128 OF the value region");
+    }
+
+    #[test]
+    fn golden_vector_byte_to_semantic() {
+        let mut bytes = from_hex(GOLDEN_PREFIX_HEX);
+        let value_digest = Hash128::of(&bytes[golden_value_start()..]);
+        let mut trailer = Writer::new();
+        trailer.h128(value_digest);
+        bytes.extend_from_slice(&trailer.buf);
+
+        let (key, entry) = decode_manifest(&bytes).expect("the transcribed bytes must decode");
+        // Field by field, not one struct comparison: a wrong field that happens to round-trip
+        // through the same struct would otherwise hide.
+        assert_eq!(key.key_format_version, 1);
+        assert_eq!(key.compiler_fingerprint, Hash128 { lo: 1, hi: 2 });
+        assert_eq!(key.frontend_schema, align_interface::FORMAT_VERSION);
+        assert_eq!(key.env_toggles.len(), 4);
+        assert_eq!(key.env_toggles[0], EnvToggle::Absent);
+        assert_eq!(key.env_toggles[1], EnvToggle::Present("off".to_string()));
+        assert_eq!(key.env_toggles[2], EnvToggle::Absent);
+        assert_eq!(key.env_toggles[3], EnvToggle::Absent);
+        assert_eq!(key.target_triple, "x86_64-unknown-linux-gnu");
+        assert_eq!(key.object_format, 0);
+        assert_eq!(key.unit, "pkg.db");
+        assert!(!key.is_entry);
+        assert_eq!(key.source_digest, Hash128 { lo: 10, hi: 11 });
+        assert_eq!(key.deps.len(), 2);
+        assert_eq!(key.deps[0].module, "pkg.db.internal");
+        assert_eq!(key.deps[0].state, DepState::Missing);
+        assert_eq!(key.deps[1].module, "pkg.db.sqlite");
+        assert_eq!(
+            key.deps[1].state,
+            DepState::Present {
+                interface_hash: Hash128 { lo: 20, hi: 21 },
+                closure_digest: Hash128 { lo: 30, hi: 31 },
+            }
+        );
+        assert_eq!(entry.summary_bytes, vec![1, 2, 3, 4]);
+        assert_eq!(entry.diagnostics.len(), 1);
+        assert_eq!(entry.diagnostics[0].severity, align_diag::Severity::Warning);
+        assert_eq!(entry.diagnostics[0].message, "lossy conversion");
+        assert_eq!(entry.diagnostics[0].lo, 7);
+        assert_eq!(entry.diagnostics[0].hi, 11);
+        assert_eq!(entry.link_libs, vec!["sqlite3".to_string()]);
+        // And it is the same value the round-trip test builds.
+        assert_eq!((key, entry), (golden_key(), golden_entry()));
     }
 
     #[test]

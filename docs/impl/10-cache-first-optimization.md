@@ -739,7 +739,10 @@ unchanged `build_per_unit` path.
 #### Observability
 
 `CacheStage::UnitFrontend` (label `frontend`) and two `FirstDiff` variants, `UnitSource` and
-`EnvToggle`. Both enums are now `#[non_exhaustive]`. `BuiltUnit.frontend` carries the outcome, or
+`EnvToggle`. Both enums are now `#[non_exhaustive]`. `BuiltUnit` is the public record — `unit`, `is_entry`, `summary`, `dep_interface_hashes`,
+`link_libs`, `static_inputs`, and `frontend` (seven public fields), plus `is_reused()` and `mir()`
+over a private body. `static_inputs` is a field holding the reconstructed manifest, not a method.
+`frontend` carries the stage outcome, or
 `None` when the stage was declined outright (cache disabled, reuse forbidden, located,
 descriptor-owning) — a declined stage performs no lookup and is counted in neither hits nor misses,
 matching the memo's rule. `--cache-stats` prints the frontend block before the byte-unchanged
@@ -792,13 +795,13 @@ would fail for the changed defect.
 | P1 | key — source | a private body edit misses only its own unit | `a_private_body_edit_misses_only_its_own_unit` |
 | P2 | key — path independence | the same sources in another directory hit | `the_same_package_in_a_different_directory_hits` |
 | P3 | key — interfaces | a public surface change misses reverse dependents, attributed to the dependency | `a_public_surface_edit_misses_the_reverse_dependent` |
-| P4 | key — closure names | a dependency's own closure growing misses its dependents | `a_dependency_closure_change_misses_its_dependents` |
+| P4 | key — closure names | a dependency's own closure changing misses its dependents even when the loaded set, every dependency list, and every interface hash are unchanged | `a_closure_member_moving_within_the_loaded_set_misses_its_dependents` (dropping `closure_digest` from the key makes it fail), `a_dependency_closure_change_misses_its_dependents` |
 | P4b | deps membership | `Missing` is keyed distinctly from `Present` | `a_missing_dependency_is_keyed_distinctly_from_a_present_one` |
 | P5 | key — toggles | a measurement toggle turns the whole cache off | `a_measurement_toggle_disables_the_cache` (subprocess), `absent_and_empty_toggles_are_distinct_keys` |
 | P6 | key — compiler | a foreign fingerprint is unaddressable | `a_foreign_compiler_fingerprint_never_hits` |
 | P7 | key — schema/target | each component isolates | `first_diff_priority`, `slot_digest_ignores_diffable_components_and_tracks_the_core` |
 | P8 | cross-process reuse | a second PROCESS serves both units from disk | `a_second_process_reuses_the_first_process_frontend` |
-| P9 | hit == miss | unit order, canonical summary bytes (hence both hashes), and link libraries match a reuse-forbidden build | `a_reused_build_equals_a_cold_build` |
+| P9 | hit == miss | unit order, canonical summary bytes (hence both hashes), and link libraries match a reuse-forbidden build — and the LINKED EXECUTABLE is byte-identical, with identical output | `a_reused_build_equals_a_cold_build`, `a_cold_build_and_an_all_hit_build_produce_the_same_executable` |
 | P10 | diagnostics | warnings replay verbatim, including rendered file and line | `warnings_replay_verbatim_and_exactly_once` |
 | P10b | exactly once | a hit followed by a rehydration emits them once | same |
 | P11 | span range | a span past end-of-source is `CorruptEntry`, not a panic | `an_out_of_range_diagnostic_span_is_rejected` |
@@ -807,11 +810,11 @@ would fail for the changed defect.
 | P14 | located exclusion | `build_per_unit_located` neither serves nor publishes | `a_located_walk_never_serves_or_publishes` |
 | P15 | rehydration identity | rehydrated MIR is identical to the cold lowering | `a_rehydrated_unit_matches_the_cold_lowering` |
 | P15b | rehydration verification | a tampered summary, link-lib set, or diagnostic set is rejected and unlinked | `rehydration_rejects_a_tampered_summary`, `_link_libs`, `_diagnostics` |
-| P15c | bounded retry | a rejection unlinks and the next build recomputes | asserted at the tail of each tamper test |
+| P15c | bounded retry | a rejection unlinks, the CLI announces exactly one retry naming the unit and the disagreeing component, the build succeeds, and each stats block is printed once | `a_stale_entry_makes_the_cli_retry_once_and_succeed` (the real `build_package_to` path) |
 | P16 | MIR-consuming verbs | `emit-mir`/`emit-llvm`/`emit-obj`/`explain-opt`/`check-per-unit`/`--export`/`--thin-lto` unchanged | ⊂ `per_unit*.rs`, `explain_opt.rs`, `export_roots.rs`, `thin_lto*.rs`, `emit_llvm_stage.rs` |
 | P17 | link summary | the capability union survives reuse | `ffi_declared_link_libraries_survive_reuse`; ⊂ `capability_linking.rs` |
 | P18 | static inputs | the reconstructed manifest is byte-identical to the computed one | `the_reconstructed_static_input_manifest_matches_the_cold_one` |
-| P19 | format — golden | the manifest round-trips, field by field | `manifest_round_trips`, `a_synthetic_key_round_trips_through_the_store` |
+| P19 | format — golden | a hand-transcribed hex constant, both directions: semantic→byte against the format table (the digest trailer checked as `Hash128` OF the value region, not as a magic constant) and byte→semantic field by field | `golden_vector_semantic_to_byte`, `golden_vector_byte_to_semantic`; `manifest_round_trips` and `a_synthetic_key_round_trips_through_the_store` as auxiliaries |
 | P20 | format — malformed | truncation at EVERY boundary, each bad tag/version, a trailing byte, a fixed-arity toggle violation | `decode_is_fail_closed`, `the_toggle_sequence_is_fixed_arity_and_fixed_order` |
 | P21 | concurrency | four racing producers leave one entry per unit, byte-identical to re-encoding its own contents, and a fifth process hits | `concurrent_producers_publish_identical_manifests` |
 | P22 | partial write | a killed producer leaves no visible entry | ⊂ `artifact_staging.rs` (shared staged-write + rename) |
@@ -821,7 +824,7 @@ would fail for the changed defect.
 | P26 | disabled | a disabled cache creates no root | `a_disabled_cache_is_a_complete_bypass`, `reuse_forbidden_neither_serves_nor_publishes` |
 | P27 | fingerprint fail-closed | an unidentifiable compiler disables the cache | ⊂ `cache::tests::an_unidentifiable_compiler_disables_the_cache` |
 | P28 | memo interaction | the disk stage is consulted even when the memo holds the unit | `the_disk_cache_and_the_memo_compose` |
-| P28b | memo promotion | a verified rehydration is reusable across walks | same |
+| P28b | memo promotion | a verified rehydration is stored in the memo, so a second rehydration of the same unit is served from it rather than re-checked (exact `memo::stats()` deltas; the file is serialized so the counters are exact) | `a_verified_rehydration_is_promoted_into_the_memo` (removing the `memo::unit_store` makes it fail) |
 | P29 | render purity | `summary_to_source` depends only on the summary and its closure | `summary_to_source_depends_only_on_the_summary_and_its_closure` |
 | P30 | whole-program unchanged | `check`/`lower_to_mir`/`emit_object_file` untouched | ⊂ the whole driver suite, which uses exactly those |
 | P31 | no shape change | every pre-existing caller compiles unedited | ⊂ the suite building with zero edits to the 17 `PerUnitArtifact.mir` sites in db-owned files |
@@ -850,6 +853,14 @@ The cache implementation is incomplete until this matrix is automated:
 | producer killed before publish | no cache entry; next build safely rebuilds |
 | corrupted cache bytes | digest failure, eviction, automatic rebuild |
 | cache hit vs cold build | byte-identical output and identical execution |
+| **no-op rebuild (frontend)** | every unit's frontend entry hits; no sema, no lowering, no LLVM |
+| **private body edit (frontend)** | the edited unit's frontend entry misses; every consumer's hits |
+| **public surface edit (frontend)** | reverse dependents' frontend entries miss, attributed to the dependency |
+| **a dependency's own import closure changes** | its dependents' frontend entries miss even when every interface hash is unchanged |
+| **frontend hit + object miss** | the unit is rehydrated, verified against its entry, and compiled |
+| **a cached unit disagrees with recomputation** | its entry is unlinked and the package rebuilds once with reuse forbidden |
+| **corrupted frontend entry** | the value digest fails, the entry is unlinked, the unit rebuilds |
+| **descriptor-owning unit** | never published and never served, while its descriptor-free dependencies are |
 
 The last row is scoped to **one output path**: the executable's identity is compared cold-vs-hit at
 the same target filename, because on macOS the linker embeds the output file's name in the ad-hoc
@@ -869,6 +880,12 @@ and different same-basename concurrent producers, orphan staging after a killed 
 corruption recovery, and cold-vs-hit byte identity. The interface reader also verifies its stored
 public-surface hash before exposing effect bits. Future frontend/link cache layers must rerun this
 matrix at their new stage boundary; this status does not pre-approve those deferred caches.
+
+**Unit-frontend stage status: automated at the new stage boundary.** The eight rows above are
+pinned by `crates/align_driver/tests/unit_cache.rs` plus the codec/key tests beside the code and the
+walk-structural tests in `crates/align_driver/src/lib.rs`; the full cell-to-owner mapping is the
+§6.7 closure matrix (P1–P34). The frontend and link rows in the original matrix remain safe-rerun
+requirements for the stages that still always re-run — the whole-program frontend, and the link.
 
 **ThinLTO stage status (2026-07-17): automated for the `prelink`/`thinbackend` phase boundaries.**
 `--thin-lto` adds two cacheable phases (`CacheStage::ThinLtoPrelink` + `ThinLtoBackend`) with their
@@ -1227,6 +1244,22 @@ pollutes the user cache.
 
 **Completion:** a private-body edit recompiles one unit plus relink; public soundness-summary changes
 invalidate the right reverse dependencies; no missing summary is treated optimistically.
+
+### Slice C3 — persistent per-unit frontend cache (shipped)
+
+- [x] Persist the per-unit frontend result — interface summary, replayable diagnostics, link
+  libraries — under a frontend-only key, so a new process skips sema and lowering for an unchanged
+  unit (§6.7).
+- [x] Authenticate the value region with its own digest: the key covers none of it, so a bit flip in
+  the encoded `impl_hash` could otherwise address a genuine older object for the same unit.
+- [x] Serve a hit without MIR, and rehydrate + verify the single unit whose object also misses.
+- [x] Keep `PerUnitArtifact`, `PerUnitWalk`, `codegen_units_parallel`, and `build_thin_lto`
+  unchanged; reuse lives in an additive `PackageBuild` that only `build`/`run`/`size` construct.
+
+**Completion:** an unchanged package compiles with zero sema and zero LLVM in a fresh process
+(measured: 355 ms → 247 ms against the codegen-warm baseline); a stale entry can only ever cost a
+rebuild, never a wrong artifact. Still excluded: descriptor-owning units, located walks, `--thin-lto`,
+and the whole-program path.
 
 ### CPU-cache probes
 
