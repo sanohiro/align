@@ -100,6 +100,14 @@ pub enum ObjectFormat {
 ///
 /// Cross-compilation seam (M15+): when builds take an explicit target triple, this widens to take
 /// the `BuildTarget` as an argument instead of reading the host default triple.
+/// The host's default LLVM target triple. Cheap: one static libLLVM query, with no target
+/// initialization and no `TargetMachine`. The persistent unit-frontend cache keys on it so a
+/// frontend result can never cross a host boundary, even though MIR lowering is target-independent
+/// today (`docs/impl/10-cache-first-optimization.md` §6.7 K5).
+pub fn default_triple() -> String {
+    TargetMachine::get_default_triple().as_str().to_string_lossy().into_owned()
+}
+
 pub fn target_object_format() -> Result<ObjectFormat, String> {
     let triple = TargetMachine::get_default_triple();
     let ts = triple.as_str().to_string_lossy().to_ascii_lowercase();

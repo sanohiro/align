@@ -40,8 +40,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use align_driver::{
     build_interface_summaries, build_per_unit, check, emit_llvm_ir, emit_object_cached,
-    format_diagnostics, link_objects, unknown_exports, BuildTarget, CacheContext, PerUnitWalk,
-    Profile,
+    format_diagnostics, link_objects, unknown_exports, BuildTarget, CacheContext, PackageBuild,
+    PerUnitWalk, Profile, UnitReuse,
 };
 use align_span::SourceMap;
 
@@ -1218,6 +1218,42 @@ fn read(path: &str) -> Option<String> {
 /// import DAG), printing any diagnostics. Returns the walk on success (at least one unit), or `None`
 /// on a read/parse/check error (diagnostics already emitted). This is the shared front half of every
 /// codegen verb (`build`/`run`/`size`/`emit-obj`/`emit-llvm`/`emit-mir`) after the M15 S2b flip.
+/// [`walk_or_report`]'s package-build twin: the same read/report/empty-check contract, but through
+/// [`align_driver::build_package`], so a unit whose frontend result is already cached is served from
+/// disk instead of re-checked. Owns its own `SourceMap`, which is what lets the one bounded
+/// rehydration retry start from a clean one.
+fn package_or_report(path: &str, cache: &CacheContext, reuse: UnitReuse) -> Option<PackageBuild> {
+    let src = read(path)?;
+    let mut sm = SourceMap::new();
+    let build = align_driver::build_package(&mut sm, path, &src, cache, reuse);
+    if !build.diags.is_empty() {
+        eprint!("{}", format_diagnostics(&sm, &build.diags));
+    }
+    if build.diags.has_errors() {
+        return None;
+    }
+    if build.units.is_empty() {
+        eprintln!("alignc: no units to build");
+        return None;
+    }
+    Some(build)
+}
+
+/// The deterministic capability-library union across units: first-seen in DAG (unit) order, never
+/// completion order (parallel codegen may finish out of order). Identical for a lowered unit and a
+/// reused one — a reused unit carries its `link_libs` precisely because the link never needs MIR.
+fn link_lib_union<'a>(per_unit: impl Iterator<Item = &'a [String]>) -> Vec<String> {
+    let mut union: Vec<String> = Vec::new();
+    for libs in per_unit {
+        for lib in libs {
+            if !union.contains(lib) {
+                union.push(lib.clone());
+            }
+        }
+    }
+    union
+}
+
 fn walk_or_report(path: &str) -> Option<PerUnitWalk> {
     let src = read(path)?;
     let mut sm = SourceMap::new();
@@ -1570,6 +1606,12 @@ impl Drop for ArtifactStage {
 /// atomic rename. Returns the failing `ExitCode` (diagnostics already printed) on any error.
 #[allow(clippy::too_many_arguments)]
 fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profile, rt_lto: bool, thin_lto: bool, pgo: &align_driver::PgoMode, jobs: usize, cache_stats: bool) -> Result<(), ExitCode> {
+    // The persistent unit-frontend cache is consulted only on the ordinary per-unit path. A
+    // `--thin-lto` build needs every unit's MIR for its prelink phase, so reuse there would
+    // rehydrate all of them and buy nothing; it takes the unchanged `build_per_unit` route below.
+    if !thin_lto {
+        return build_package_to(path, exe, target, profile, rt_lto, pgo, jobs, cache_stats, UnitReuse::Allowed);
+    }
     let walk = walk_or_report(path).ok_or(ExitCode::FAILURE)?;
     let object_stage = ArtifactStage::temp("align-per-unit-obj").map_err(|e| {
         eprintln!("alignc: cannot create object staging directory: {e}");
@@ -1597,7 +1639,8 @@ fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profi
         if cache_stats {
             render_thin_cache_stats(&outcomes, cache.is_enabled());
         }
-        return finish_link(&walk, &obj_paths, exe, profile, &target, &align_driver::PgoMode::Off);
+        let link_libs = link_lib_union(walk.units.iter().map(|u| u.mir.link_libs.as_slice()));
+        return finish_link(&link_libs, &obj_paths, exe, profile, &target, &align_driver::PgoMode::Off);
     }
     // Instrument-PGO (`--pgo-instrument` / `--pgo-use`, S2) now flows through the NORMAL cached +
     // parallel per-unit path below — the object cache composes it via the `PgoKey` key component
@@ -1632,6 +1675,18 @@ fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profi
     // Hard fails stay at the reliable layer (missing/bad-magic profdata; an Error-severity libLLVM
     // diagnostic), handled before/inside codegen. An all-hit build ran no LLVM, so has a `0/0` tally and no
     // warnings: any staleness was reported when each object was first built and is intrinsic to the bytes.
+    report_pgo_use(pgo, &build);
+    let link_libs = link_lib_union(walk.units.iter().map(|u| u.mir.link_libs.as_slice()));
+    finish_link(&link_libs, &obj_paths, exe, profile, &target, pgo)
+}
+
+/// The aggregated `--pgo-use` report over the units that actually ran (cache MISSES). A mismatched
+/// profile is a PERFORMANCE concern, never a correctness one (clang parity), so it is a WARNING,
+/// never an abort. Hard fails stay at the reliable layer: a missing/bad-magic profdata, and an
+/// Error-severity libLLVM diagnostic, both handled before/inside codegen. An all-hit build ran no
+/// LLVM, so it has a `0/0` tally and no warnings — any staleness was reported when each object was
+/// first built and is intrinsic to the cached bytes.
+fn report_pgo_use(pgo: &align_driver::PgoMode, build: &align_driver::UnitCodegen) {
     if matches!(pgo, align_driver::PgoMode::Use(_)) {
         if build.pgo_total > 0 && build.pgo_matched == 0 {
             eprintln!(
@@ -1652,23 +1707,57 @@ fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profi
             );
         }
     }
-    finish_link(&walk, &obj_paths, exe, profile, &target, pgo)
+}
+
+/// The ordinary (non-ThinLTO) `build`/`run`/`size` path, through the persistent unit-frontend cache.
+///
+/// `reuse` is `Allowed` on the first attempt. If a cached unit disagrees with recomputation, the
+/// entry is unlinked and this runs ONCE more with `Forbidden` and a fresh `SourceMap`: the whole
+/// package is rebuilt, not just that unit, because its dependents were checked against a summary
+/// that has just been shown untrustworthy. A `Forbidden` build never rehydrates, so the retry cannot
+/// loop.
+#[allow(clippy::too_many_arguments)]
+fn build_package_to(path: &str, exe: &Path, target: BuildTarget, profile: Profile, rt_lto: bool, pgo: &align_driver::PgoMode, jobs: usize, cache_stats: bool, reuse: UnitReuse) -> Result<(), ExitCode> {
+    let mut build = package_or_report(path, &CacheContext::from_env(), reuse).ok_or(ExitCode::FAILURE)?;
+    let object_stage = ArtifactStage::temp("align-per-unit-obj").map_err(|e| {
+        eprintln!("alignc: cannot create object staging directory: {e}");
+        ExitCode::FAILURE
+    })?;
+    let obj_paths: Vec<PathBuf> = (0..build.units.len()).map(|i| object_stage.path().join(format!("unit{i}.o"))).collect();
+    let cache = CacheContext::from_env();
+    if let align_driver::PgoMode::Use(p) = pgo
+        && let Err(e) = align_driver::validate_profdata(p)
+    {
+        eprintln!("alignc: {e}");
+        return Err(ExitCode::FAILURE);
+    }
+    if cache_stats {
+        render_frontend_cache_stats(&build);
+    }
+    let result = align_driver::codegen_package_parallel(&mut build, &obj_paths, &cache, &target, profile, rt_lto, jobs, pgo);
+    let built = match result {
+        Ok(built) => built,
+        Err(e) if reuse == UnitReuse::Allowed && e.starts_with("cached unit `") => {
+            eprintln!("alignc: {e}; rebuilding this package without cache reuse");
+            return build_package_to(path, exe, target, profile, rt_lto, pgo, jobs, cache_stats, UnitReuse::Forbidden);
+        }
+        Err(e) => {
+            eprintln!("alignc: {e}");
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    if cache_stats {
+        render_cache_stats(&built.outcomes, cache.is_enabled());
+    }
+    report_pgo_use(pgo, &built);
+    let link_libs = link_lib_union(build.units.iter().map(|u| u.link_libs.as_slice()));
+    finish_link(&link_libs, &obj_paths, exe, profile, &target, pgo)
 }
 
 /// Link the per-unit objects into `exe`: the deterministic capability-library union (first-seen in
 /// DAG order) + link + atomic-rename publish. Shared by the normal cached path and the `--thin-lto`
 /// path (the objects differ; the link step is identical).
-fn finish_link(walk: &PerUnitWalk, obj_paths: &[PathBuf], exe: &Path, profile: Profile, target: &BuildTarget, pgo: &align_driver::PgoMode) -> Result<(), ExitCode> {
-    // Deterministic capability union across units, first-seen in DAG (unit) order — never completion
-    // order (parallel codegen may finish units out of order, but this iterates `walk.units`).
-    let mut link_libs: Vec<String> = Vec::new();
-    for unit in &walk.units {
-        for lib in &unit.mir.link_libs {
-            if !link_libs.contains(lib) {
-                link_libs.push(lib.clone());
-            }
-        }
-    }
+fn finish_link(link_libs: &[String], obj_paths: &[PathBuf], exe: &Path, profile: Profile, target: &BuildTarget, pgo: &align_driver::PgoMode) -> Result<(), ExitCode> {
 
     let parent = exe.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
     let publish_stage = ArtifactStage::in_dir(parent, "align-publish").map_err(|e| {
@@ -1697,9 +1786,9 @@ fn finish_link(walk: &PerUnitWalk, obj_paths: &[PathBuf], exe: &Path, profile: P
              (set LLVM_PROFILE_FILE to redirect); then `llvm-profdata-22 merge` it and rebuild with \
              `--pgo-use <file.profdata>`"
         );
-        align_driver::link_objects_instrumented(&obj_refs, &staged_exe, &link_libs, profile, &profile_rt)
+        align_driver::link_objects_instrumented(&obj_refs, &staged_exe, link_libs, profile, &profile_rt)
     } else {
-        link_objects(&obj_refs, &staged_exe, &link_libs, profile)
+        link_objects(&obj_refs, &staged_exe, link_libs, profile)
     };
     if let Err(e) = link_result {
         eprintln!("alignc: {e}");
@@ -1749,6 +1838,32 @@ fn render_cache_stats(outcomes: &[align_driver::CacheOutcome], enabled: bool) {
 /// Render the `--cache-stats` report for a `--thin-lto` build: one `<unit> <phase> hit`/`miss (<r>)`
 /// line per phase per unit (`prelink` then `backend`), then a per-phase summary. A disabled cache
 /// prints the single disabled note (there are no per-unit lookups to report).
+/// The `--cache-stats` FRONTEND block, printed before the unchanged codegen block. One line per
+/// unit that actually consulted the stage, then its own summary. A unit whose `frontend` is `None`
+/// declined the stage (cache disabled, reuse forbidden, descriptor-owning) and is counted in
+/// neither hits nor misses — the same accounting rule the in-process memo uses. When no unit
+/// consulted it, the block is absent entirely, so a `--thin-lto` or cache-off build prints exactly
+/// what it printed before.
+fn render_frontend_cache_stats(build: &PackageBuild) {
+    let outcomes: Vec<&align_driver::CacheOutcome> =
+        build.units.iter().filter_map(|unit| unit.frontend.as_ref()).collect();
+    if outcomes.is_empty() {
+        return;
+    }
+    let (mut hits, mut misses) = (0usize, 0usize);
+    for outcome in &outcomes {
+        if outcome.hit {
+            hits += 1;
+            eprintln!("alignc: cache: {} frontend hit", outcome.unit);
+        } else {
+            misses += 1;
+            let reason = outcome.miss_reason.map(|r| r.reason()).unwrap_or("miss");
+            eprintln!("alignc: cache: {} frontend miss ({reason})", outcome.unit);
+        }
+    }
+    eprintln!("alignc: cache: {} frontend: {hits} hit, {misses} miss", outcomes.len());
+}
+
 fn render_thin_cache_stats(outcomes: &[align_driver::CacheOutcome], enabled: bool) {
     if !enabled {
         eprintln!("alignc: cache: disabled (set ALIGNC_CACHE=on or a path to enable)");

@@ -558,6 +558,277 @@ package cache, not this slice. A saturated four-core CI runner is CPU-bound on e
 the wall-clock effect there should track the CPU column rather than the (partly parallel) local wall
 column.
 
+### 6.7 SHIPPED — persistent per-unit frontend cache
+
+§6.6's memo makes a second identical compilation cheap inside ONE process; §6.2's object cache makes
+a second *codegen* cheap across processes. Neither makes a second **frontend** cheap across
+processes, and that is the last stage every new process recomputes — the codegen key's `impl_hash`
+is produced BY the frontend, so the object cache cannot be consulted until sema and lowering have
+already run.
+
+`crates/align_driver/src/unit_cache.rs` persists, per unit, exactly what a later build needs in
+order not to check that unit again:
+
+```text
+summary_bytes   align_interface::serialize(&InterfaceSummary) — carries interface_hash AND
+                impl_hash, so the codegen key can be built WITHOUT the MIR
+diagnostics     the unit's own diagnostics, FileId removed, replayed on a hit
+link_libs       the unit MIR's link_libs
+```
+
+**The MIR is deliberately absent.** Persisting it would need a canonical codec for
+`align_mir::Program` — a large surface with its own soundness matrix — and buys nothing when the
+object it produces is already content-addressed. A unit served from here is *reused*; if codegen
+later needs its MIR, that ONE unit is rehydrated and the result verified against the entry.
+
+`link_libs` is stored rather than re-derived because it is **not** a function of
+`summary.capabilities`: `align_mir::lower_program` builds it as the user-declared
+`extern "C" link("name")` libraries (validated in sema) followed by the capability-derived ones, so
+a unit that declares an FFI library and uses no gated builtin has a non-empty `link_libs` and an
+empty `capabilities`.
+
+#### The key
+
+Frontend-only, so one entry serves every profile, cpu, reloc/code model, LLVM version, `--rt-lto`
+setting, and PGO mode — `lower_to_mir_per_unit` reads none of them. This is the same reasoning that
+produced `PrelinkKey` as "the codegen key MINUS the pure backend knobs".
+
+```text
+K1  key-format version                     UNIT_KEY_FORMAT_VERSION
+K2  compiler fingerprint                   cache::compiler_build_id(); an enabled CacheContext
+                                           guarantees it is a REAL identity, never a guessed one
+K3  frontend schema                        align_interface::FORMAT_VERSION
+K4  the four ALIGN_* toggles               fixed order, Absent | Present(value)
+K5  target triple + object format          defensive; MIR lowering is target-independent today
+K6  unit module path + entry flag
+K7  digest of the unit's exact source bytes
+K8  the TRANSITIVE import closure, DFS order, EVERY member tagged
+      Missing                              checked against an ABSENT dependency — a distinct input
+      Present{interface_hash, closure_digest}
+```
+
+`interface_hash` — not a digest of the dependency's whole summary. The full encoding also carries
+`impl_hash`, so keying on it would make a private body edit in a dependency invalidate all of its
+consumers, discarding exactly the interface/implementation split M15 exists to provide. It is the
+same component `CodegenKey.dep_interface_hashes` already uses, so both stages agree on what a
+consumer depends on, and it covers everything a consumer reads: `summary_to_source` renders the
+surface, and the four external fact maps are all derived from it. `closure_digest` covers the
+dependency's own closure names, which is the rendering's only other input — so the pair is
+equivalent to keying the rendered interface source without having to render anything on a hit.
+
+The key is **structural over the complete reachable definition graph**: by the M15 S1b
+self-containment invariant a `pub` item may not name a non-`pub` type, so every type reachable from
+an interface is carried with its full definition. Deliberately excluded: the cwd, the project root,
+every absolute path, file mtimes, and the cache root itself.
+
+**No `Debug` rendering appears in any key or any stored byte.** The memo can key on a total `Debug`
+because the rendering is a constant of the process image; on disk it is not a stable format. Every
+component here is a scalar, a UTF-8 string, or a digest over an existing versioned canonical codec.
+
+#### Format
+
+One file = one manifest, at `actions/unit/<full-digest>` with a byte-identical slot pointer at
+`index/unit/<slot-digest>`, in the existing cache root under the existing `ALIGNC_CACHE` switch. No
+new environment variable, no second identity gate, no schema bump — the two subtrees are disjoint
+and every key carries K2.
+
+Decoding order is fixed, first failure wins, and the **key comparison precedes every semantic
+check** (as `cache::try_hit` already does), because a manifest that does not belong to this key is
+not evidence of damage and must not unlink anything:
+
+```text
+1  wire version                        UnknownVersion      -> clean miss
+2  phase tag (3, disjoint from ThinLTO's 1/2)              -> clean miss
+3  key region, field by field
+4  decoded key == the freshly computed key                 -> clean miss if not
+5  value region, field by field
+6  value_digest over the exact value byte range            -> CorruptEntry
+7  no trailing bytes
+8  summary_bytes decode via align_interface::deserialize   -> CorruptEntry
+9  every diagnostic: lo <= hi AND hi <= source length      -> CorruptEntry
+```
+
+**Why `value_digest` is required.** The key covers none of the summary, diagnostics, or link
+libraries. Without it, a bit flip that changed the encoded `impl_hash` to a value this same unit
+genuinely had in an EARLIER revision would build a codegen key whose action manifest still exists
+and still verifies — serving a stale object for a unit whose interface summary is the new one.
+Vanishingly unlikely, but a miscompile, and exactly the class the CAS blob digest already guards for
+objects. The threat model is the shipped one: a local, non-adversarial store, defending bit rot,
+torn writes, truncation, and accidental collision — not an attacker with write access.
+
+On the all-hit path, which never rehydrates, the guarantee is therefore: step 4 authenticates the
+key region, `value_digest` authenticates the value region, and the existing CAS blob digest
+authenticates the object. Together they prove nothing changed since publication; that the producer
+computed the summary correctly comes from it being the same compiler (K2) on the same inputs — the
+same assumption the shipped codegen cache makes.
+
+#### Integration
+
+`PerUnitArtifact`, `PerUnitWalk`, `build_per_unit`, `check_per_unit`, `codegen_units_parallel`, and
+`build_thin_lto` are unchanged, down to their field shapes. Reuse lives in an additive
+`PackageBuild` / `BuiltUnit` pair that only `build`/`run`/`size` construct, through
+`build_package(.., cache, UnitReuse)` and `codegen_package_parallel`. `UnitReuse::Forbidden`
+reproduces the pre-cache walk exactly — no lookup, no publish, no key built.
+
+Both codegen entry points delegate to one private two-phase implementation; the package one adds a
+single step between the phases, materializing only those units that are both reused and a codegen
+MISS. Serially, on the calling thread: sema is not audited for concurrent use, and on the common
+all-hit build there is nothing to materialize at all.
+
+Ordering with the memo: the disk lookup runs on the DIGEST path, before anything is rendered or
+parsed, so it is consulted on every fresh walk. A memo hit still PUBLISHES when the disk stage
+missed — the memo answers "this process already computed this unit", which says nothing about
+whether the persistent store has it (the earlier computation may have been a reuse-forbidden walk,
+or against a different root).
+
+#### Rehydration, and why it is verified
+
+```text
+1  re-run the compute path for that ONE unit against the SAME dependency summaries the walk used,
+   into a THROWAWAY diagnostic sink — its diagnostics were emitted when the unit was resolved, and
+   appending them again would make a hit observable
+2  verify, in order: no errors; codegen_impl_hash == the entry's impl_hash; the re-encoded summary
+   == the stored bytes; link_libs == the stored ones; the recomputed replayable diagnostics == the
+   replayed ones (a `None` from the filter is a MISMATCH, never "no diagnostics"); and no static
+   descriptors appeared
+3  on any failure: unlink the entry, note it, and rebuild the whole package ONCE with reuse
+   forbidden — dependents were checked against a summary just shown untrustworthy, and a forbidden
+   build never rehydrates, so the retry cannot loop
+```
+
+The rehydration path mirrors the walk's compute path rather than sharing its body, because the
+walk's version is entangled with descriptor resolution, the publication lock, and the caller's
+`SourceMap`. The risk that the two drift is carried by step 2, not by inspection: any drift fails
+the build closed instead of miscompiling.
+
+#### The `FileId` axis
+
+`load_units` tokenizes every unit against the CALLER's `SourceMap` and registers all `N` of them
+before anything else, so:
+
+```text
+F-1  a retained AST's spans are caller-space, and rehydration reuses those exact ASTs
+F-2  real units occupy exactly 0..N; every <interface:…> pseudo-file lands at >= N. The
+     rehydration map is therefore SEEDED with the same N files in file-id order — a fresh map
+     would hand the first pseudo-file id 0, which caller-side denotes unit 0, and the own-file
+     diagnostic filter would accept a pseudo-file span as the unit's own
+F-3  the filter target is ALWAYS loaded[i].fid, on the publish, replay, and verification paths
+F-4  divergence between the two maps is confined to ids >= N, which no retained artifact, no
+     published diagnostic, and no MIR references
+```
+
+F-4's last clause holds because non-located lowering consumes no `SourceMap` at all — which is
+precisely why a located walk never reuses. That exclusion is a precondition, not a conservatism.
+
+#### Exclusions
+
+| Exclusion | Why | Lifted in |
+|---|---|---|
+| a unit owning static descriptors | its result depends on files under the project root and on the metadata publication lock; a replay re-establishes neither | a later slice |
+| a `located` walk | located MIR depends on the walk's `SourceMap`, which the key does not cover, and it is the precondition above | never |
+| a unit with errors | a summary of an ill-typed unit is meaningless; dependents must see it absent | never |
+| non-replayable diagnostics | a span outside the unit's own file cannot be reattached in another walk | never |
+| a closure member that failed to render | the unit was checked without it, and a later hit would skip the error the cold path reports | never |
+| `--thin-lto` | its prelink phase needs every unit's MIR, so reuse would rehydrate all of them | a later slice |
+| an unidentifiable compiler | the whole cache is already off (`compiler_build_id_available`) | never |
+| the whole-program path (`check` / `lower_to_mir` / `emit_object_file`) | not a unit boundary | a later slice |
+
+`--export` is NOT an exclusion: export roots reach only `emit-llvm` and `emit-obj`, which run on the
+unchanged `build_per_unit` path.
+
+#### Observability
+
+`CacheStage::UnitFrontend` (label `frontend`) and two `FirstDiff` variants, `UnitSource` and
+`EnvToggle`. Both enums are now `#[non_exhaustive]`. `BuiltUnit.frontend` carries the outcome, or
+`None` when the stage was declined outright (cache disabled, reuse forbidden, located,
+descriptor-owning) — a declined stage performs no lookup and is counted in neither hits nor misses,
+matching the memo's rule. `--cache-stats` prints the frontend block before the byte-unchanged
+codegen block:
+
+```text
+alignc: cache: <unit> frontend hit
+alignc: cache: <unit> frontend miss (<reason>)
+alignc: cache: <n> frontend: <h> hit, <m> miss
+alignc: cache: <unit> hit                       <- existing codegen lines, unchanged
+alignc: cache: <n> unit(s): <h> hit, <m> miss   <- unchanged
+```
+
+#### Measured effect
+
+The baseline this competes with is the **codegen-warm** build, not a cold one: the object cache is
+already default-on and already cross-process, so a cold-vs-warm comparison would double-count a
+saving that already shipped.
+
+Measured on this machine (arm64 macOS, release compiler), `alignc build` of the `pkg.db` package
+reached from a trivial `main` — five units — median of 9 runs per state, each state re-established
+before every run:
+
+```text
+cold           444 ms  (min 419, max 452)   frontend + codegen + link
+codegen-warm   355 ms  (min 352, max 372)   frontend + link      <- the real baseline
+all-hit        247 ms  (min 246, max 249)   link only
+```
+
+**The increment is 108 ms — 30% of the codegen-warm baseline, 44% of a cold build.** The remaining
+247 ms is parse plus link, neither of which this cache touches (a package manifest that skips
+re-parsing on an all-hit build is a possible later slice; linking is not cacheable host-locally).
+The absolute numbers are far below §6.6's, which were taken with a *debug* compiler on the
+eight-module test layout; the ratio is the transferable part.
+
+A one-unit private edit misses exactly one frontend entry and rebuilds exactly one object. A profile
+switch hits every frontend entry and misses every object, so every unit is rehydrated: the build
+pays the frontend it would have paid anyway, plus one manifest read and one `codegen_impl_hash` per
+unit.
+
+#### Closure matrix
+
+Owners are in `crates/align_driver/tests/unit_cache.rs` (behavioral cells),
+`crates/align_driver/src/unit_cache.rs` (codec/key cells), and `crates/align_driver/src/lib.rs`
+(`walk_tests`, the walk-structural cells), unless stated. ⊂ = closed by an existing regression that
+would fail for the changed defect.
+
+| # | Cell | Rule | Owner |
+|---|---|---|---|
+| P1 | key — source | a private body edit misses only its own unit | `a_private_body_edit_misses_only_its_own_unit` |
+| P2 | key — path independence | the same sources in another directory hit | `the_same_package_in_a_different_directory_hits` |
+| P3 | key — interfaces | a public surface change misses reverse dependents, attributed to the dependency | `a_public_surface_edit_misses_the_reverse_dependent` |
+| P4 | key — closure names | a dependency's own closure growing misses its dependents | `a_dependency_closure_change_misses_its_dependents` |
+| P4b | deps membership | `Missing` is keyed distinctly from `Present` | `a_missing_dependency_is_keyed_distinctly_from_a_present_one` |
+| P5 | key — toggles | a measurement toggle turns the whole cache off | `a_measurement_toggle_disables_the_cache` (subprocess), `absent_and_empty_toggles_are_distinct_keys` |
+| P6 | key — compiler | a foreign fingerprint is unaddressable | `a_foreign_compiler_fingerprint_never_hits` |
+| P7 | key — schema/target | each component isolates | `first_diff_priority`, `slot_digest_ignores_diffable_components_and_tracks_the_core` |
+| P8 | cross-process reuse | a second PROCESS serves both units from disk | `a_second_process_reuses_the_first_process_frontend` |
+| P9 | hit == miss | unit order, canonical summary bytes (hence both hashes), and link libraries match a reuse-forbidden build | `a_reused_build_equals_a_cold_build` |
+| P10 | diagnostics | warnings replay verbatim, including rendered file and line | `warnings_replay_verbatim_and_exactly_once` |
+| P10b | exactly once | a hit followed by a rehydration emits them once | same |
+| P11 | span range | a span past end-of-source is `CorruptEntry`, not a panic | `an_out_of_range_diagnostic_span_is_rejected` |
+| P12 | error paths | a failing unit is never published | `a_unit_that_fails_to_check_is_never_published` |
+| P13 | descriptor exclusion | a descriptor-owning unit is never published and never served, while its descriptor-free dependencies still are | `a_descriptor_owning_unit_is_never_cached` (the shipped `pkg.db` modules read read-only at run time, plus one real `pkg.db.query` descriptor); removing the guard makes it fail |
+| P14 | located exclusion | `build_per_unit_located` neither serves nor publishes | `a_located_walk_never_serves_or_publishes` |
+| P15 | rehydration identity | rehydrated MIR is identical to the cold lowering | `a_rehydrated_unit_matches_the_cold_lowering` |
+| P15b | rehydration verification | a tampered summary, link-lib set, or diagnostic set is rejected and unlinked | `rehydration_rejects_a_tampered_summary`, `_link_libs`, `_diagnostics` |
+| P15c | bounded retry | a rejection unlinks and the next build recomputes | asserted at the tail of each tamper test |
+| P16 | MIR-consuming verbs | `emit-mir`/`emit-llvm`/`emit-obj`/`explain-opt`/`check-per-unit`/`--export`/`--thin-lto` unchanged | ⊂ `per_unit*.rs`, `explain_opt.rs`, `export_roots.rs`, `thin_lto*.rs`, `emit_llvm_stage.rs` |
+| P17 | link summary | the capability union survives reuse | `ffi_declared_link_libraries_survive_reuse`; ⊂ `capability_linking.rs` |
+| P18 | static inputs | the reconstructed manifest is byte-identical to the computed one | `the_reconstructed_static_input_manifest_matches_the_cold_one` |
+| P19 | format — golden | the manifest round-trips, field by field | `manifest_round_trips`, `a_synthetic_key_round_trips_through_the_store` |
+| P20 | format — malformed | truncation at EVERY boundary, each bad tag/version, a trailing byte, a fixed-arity toggle violation | `decode_is_fail_closed`, `the_toggle_sequence_is_fixed_arity_and_fixed_order` |
+| P21 | concurrency | four racing producers leave one entry per unit, byte-identical to re-encoding its own contents, and a fifth process hits | `concurrent_producers_publish_identical_manifests` |
+| P22 | partial write | a killed producer leaves no visible entry | ⊂ `artifact_staging.rs` (shared staged-write + rename) |
+| P23 | corruption | a value-region flip is caught and self-heals | `a_value_region_flip_is_caught_by_the_value_digest`, `a_corrupted_entry_self_heals` |
+| P24 | collision defense | a manifest for another key is a clean MISS, never damage | `a_foreign_key_is_a_clean_miss_not_damage` |
+| P25 | observability | the outcome is recorded per unit; the frontend block precedes the unchanged codegen block | `the_frontend_outcome_is_recorded_per_unit`, `a_second_process_reuses_the_first_process_frontend` |
+| P26 | disabled | a disabled cache creates no root | `a_disabled_cache_is_a_complete_bypass`, `reuse_forbidden_neither_serves_nor_publishes` |
+| P27 | fingerprint fail-closed | an unidentifiable compiler disables the cache | ⊂ `cache::tests::an_unidentifiable_compiler_disables_the_cache` |
+| P28 | memo interaction | the disk stage is consulted even when the memo holds the unit | `the_disk_cache_and_the_memo_compose` |
+| P28b | memo promotion | a verified rehydration is reusable across walks | same |
+| P29 | render purity | `summary_to_source` depends only on the summary and its closure | `summary_to_source_depends_only_on_the_summary_and_its_closure` |
+| P30 | whole-program unchanged | `check`/`lower_to_mir`/`emit_object_file` untouched | ⊂ the whole driver suite, which uses exactly those |
+| P31 | no shape change | every pre-existing caller compiles unedited | ⊂ the suite building with zero edits to the 17 `PerUnitArtifact.mir` sites in db-owned files |
+| P32 | complexity | each module's closure is computed once, never once per importer | `walk_tests::closure_of_computes_each_module_at_most_once` |
+| P33 | fid-space identity | F-1..F-4, including the negative that a fresh map would collide with unit 0 | `walk_tests::load_units_owns_the_low_file_id_space` |
+| P34 | link libs not derivable | an FFI `link("m")` with empty `capabilities` survives reuse | `ffi_declared_link_libraries_survive_reuse` |
+
 ---
 
 ## 7. Cache validation matrix

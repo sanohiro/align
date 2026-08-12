@@ -30,6 +30,7 @@ mod query_meta_codegen;
 pub mod static_artifacts;
 pub mod static_inputs;
 pub mod static_runtime;
+pub mod unit_cache;
 
 pub use cache::{
     cas_blob_path, clear_cache, BackendKey, CacheContext, CacheLookup, CacheOutcome, CacheStage,
@@ -2148,7 +2149,7 @@ pub struct PerUnitCheck {
 
 struct PendingPerUnitArtifact {
     summary: align_interface::InterfaceSummary,
-    mir: MirProgram,
+    body: UnitBody,
     is_entry: bool,
     static_descriptors: Vec<StaticDescriptor>,
     static_inputs: StaticInputManifest,
@@ -2163,7 +2164,73 @@ struct PendingPerUnitArtifact {
 /// each dependency's public surface is rendered back to source and re-parsed into an interface-only
 /// module (one resolution path — the existing sema passes), and cross-unit effect bits are seeded
 /// fail-closed.
+/// Transitive dependency closure of `start` (excluding `start`), deterministic (import order).
+fn transitive(
+    start: &str,
+    direct: &std::collections::HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    fn go(
+        node: &str,
+        direct: &std::collections::HashMap<String, Vec<String>>,
+        seen: &mut std::collections::HashSet<String>,
+        order: &mut Vec<String>,
+    ) {
+        if let Some(deps) = direct.get(node) {
+            for d in deps {
+                if seen.insert(d.clone()) {
+                    go(d, direct, seen, order);
+                    order.push(d.clone());
+                }
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut order = Vec::new();
+    go(start, direct, &mut seen, &mut order);
+    order
+}
+
+/// [`transitive`], memoized per MODULE.
+///
+/// The shipped walk already computes each module's closure at most twice (once as a unit, once as a
+/// render target), so this is not fixing an existing quadratic term — it is preventing the
+/// persistent key from introducing one, since the key needs a closure for every closure MEMBER of
+/// every unit. Returns an owned list so the memo is not borrowed across the caller's other
+/// mutations.
+fn closure_of(
+    start: &str,
+    direct: &std::collections::HashMap<String, Vec<String>>,
+    memo: &mut std::collections::HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    if let Some(hit) = memo.get(start) {
+        return hit.clone();
+    }
+    let computed = transitive(start, direct);
+    memo.insert(start.to_string(), computed.clone());
+    computed
+}
+
 fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: bool) -> PerUnitWalk {
+    // `UnitReuse::Forbidden` makes the persistent unit cache inert, so this is byte-for-byte the
+    // pre-cache walk: every unit is computed and every body is `Lowered`.
+    let walk = walk_inner(source_map, name, src, located, &CacheContext::Disabled, UnitReuse::Forbidden);
+    walk.into_per_unit()
+}
+
+/// The one bottom-up per-unit walk, shared by [`build_per_unit`] (reuse forbidden, MIR always
+/// lowered here) and [`build_package`] (reuse allowed, a hit yields no MIR).
+///
+/// `cache` and `reuse` are the ONLY behavioral difference between the two. With
+/// `UnitReuse::Forbidden` no unit-cache lookup or publish happens and no key is even built, so the
+/// existing entry points keep their exact semantics and cost.
+fn walk_inner(
+    source_map: &mut SourceMap,
+    name: &str,
+    src: &str,
+    located: bool,
+    cache: &CacheContext,
+    reuse: UnitReuse,
+) -> PackageWalk {
     use std::collections::HashMap;
     let mut diags = Diagnostics::new();
     let loaded = load_units(source_map, name, src, &mut diags);
@@ -2198,29 +2265,6 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
             (l.path.clone(), deps)
         })
         .collect();
-
-    // Transitive dependency closure of `start` (excluding `start`), deterministic (import order).
-    fn transitive(start: &str, direct: &HashMap<String, Vec<String>>) -> Vec<String> {
-        let mut seen = std::collections::HashSet::new();
-        let mut order = Vec::new();
-        fn go(
-            node: &str,
-            direct: &HashMap<String, Vec<String>>,
-            seen: &mut std::collections::HashSet<String>,
-            order: &mut Vec<String>,
-        ) {
-            if let Some(deps) = direct.get(node) {
-                for d in deps {
-                    if seen.insert(d.clone()) {
-                        go(d, direct, seen, order);
-                        order.push(d.clone());
-                    }
-                }
-            }
-        }
-        go(start, direct, &mut seen, &mut order);
-        order
-    }
 
     // Bottom-up (dependency-first) order: DFS post-order from the entry unit. All loaded units are
     // reachable from the entry (they were loaded by following its imports). A `visited` guard makes
@@ -2271,10 +2315,29 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
     let mut publication_lock = None;
     let mut publication_lock_attempted = false;
     let mut publication_lock_span = None;
+    // The DIGEST path's per-MODULE memos (`docs/impl/10` §6.7 §2.2.4). Never per importer: the
+    // shipped walk is already O(N) in renders and closures, and these must not introduce a
+    // quadratic term. A summary is inserted into `summaries` once and never changes afterwards, so
+    // caching its closure digest by module path is sound.
+    let mut closures: HashMap<String, Vec<String>> = HashMap::new();
+    let mut closure_digests: HashMap<String, align_interface::Hash128> = HashMap::new();
+    // The persistent unit-frontend cache, active only when this is a package build against an
+    // enabled cache. `located` opts out entirely: located MIR is a function of the walk's
+    // `SourceMap`, which the key does not cover.
+    let reuse_root: Option<std::path::PathBuf> = match (reuse, located) {
+        (UnitReuse::Allowed, false) => cache.root().map(std::path::Path::to_path_buf),
+        _ => None,
+    };
+    let unit_key_prefix = reuse_root.as_ref().and_then(|_| UnitKeyPrefix::current());
+    // Per unit, in walk order: the frontend stage outcome, and the key it was looked up under
+    // (retained so a later rehydration failure can unlink exactly that entry).
+    let mut frontend_outcomes: HashMap<String, CacheOutcome> = HashMap::new();
+    let mut unit_keys: HashMap<String, unit_cache::UnitKey> = HashMap::new();
+    let mut replayed_diagnostics: HashMap<String, Vec<unit_cache::CachedDiagnostic>> = HashMap::new();
 
     for unit_path in &order {
         let Some(u) = by_path.get(unit_path.as_str()).copied() else { continue };
-        let tdeps = transitive(unit_path, &direct_deps);
+        let tdeps = closure_of(unit_path, &direct_deps, &mut closures);
 
         // The S3 cache key input: this unit's transitive dependency interface hashes.
         let hset: Vec<(String, align_interface::Hash128)> = tdeps
@@ -2282,6 +2345,94 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
             .filter_map(|d| summaries.get(d).map(|s| (d.clone(), s.interface_hash)))
             .collect();
         dep_interface_hashes.push((unit_path.clone(), hset));
+
+        // ---- DIGEST path -------------------------------------------------------------------
+        // Build this unit's persistent key from digests alone: no interface is rendered and no
+        // module is parsed, which is what makes an all-hit build cheap. Every closure member
+        // appears exactly once, tagged Missing or Present, so "checked against an absent
+        // dependency" stays a distinct input from "checked against a present one".
+        let unit_key = unit_key_prefix.as_ref().map(|prefix| {
+            let mut deps = Vec::with_capacity(tdeps.len());
+            for module in &tdeps {
+                let state = match summaries.get(module) {
+                    None => unit_cache::DepState::Missing,
+                    Some(summary) => {
+                        // The dependency's INTERFACE hash, never a digest of its whole summary: the
+                        // full encoding carries `impl_hash`, so keying on it would make a private
+                        // body edit in a dependency invalidate every consumer.
+                        let interface_hash = summary.interface_hash;
+                        let closure_digest = match closure_digests.get(module) {
+                            Some(digest) => *digest,
+                            None => {
+                                let closure = closure_of(module, &direct_deps, &mut closures);
+                                let digest = unit_cache::closure_digest(&closure);
+                                closure_digests.insert(module.clone(), digest);
+                                digest
+                            }
+                        };
+                        unit_cache::DepState::Present { interface_hash, closure_digest }
+                    }
+                };
+                deps.push(unit_cache::UnitDep { module: module.clone(), state });
+            }
+            prefix.key(&u.path, u.is_entry, &u.src, deps)
+        });
+
+        // ---- persistent lookup -------------------------------------------------------------
+        let mut frontend_reason: Option<FirstDiff> = None;
+        if let (Some(root), Some(key)) = (reuse_root.as_ref(), unit_key.as_ref()) {
+            match unit_cache::lookup(root, key, u.src.len()) {
+                unit_cache::UnitLookup::Hit(hit) => {
+                    let hit = *hit;
+                    // Replay the unit's diagnostics FIRST, in the position a recomputed unit would
+                    // occupy, with each span reattached to this walk's own file id for the unit.
+                    // Only a descriptor-free unit is ever stored, so nothing else has to be
+                    // replayed: the publication lock, static-input resolution, and artifact build
+                    // are all no-ops for an empty descriptor set.
+                    for diagnostic in &hit.entry.diagnostics {
+                        diags.push(align_diag::Diagnostic {
+                            severity: diagnostic.severity,
+                            message: diagnostic.message.clone(),
+                            span: Some(align_span::Span::new(u.fid, diagnostic.lo, diagnostic.hi)),
+                        });
+                    }
+                    // The manifest is a re-encoding of the summary for a descriptor-free unit:
+                    // `resolution_digest` is `codegen_impl_hash` of the MIR before installation, and
+                    // installation is a no-op with no descriptors, so it equals `impl_hash`.
+                    let static_inputs = StaticInputManifest {
+                        resolution_digest: hit.summary.impl_hash,
+                        inputs: Vec::new(),
+                    };
+                    replayed_diagnostics.insert(u.path.clone(), hit.entry.diagnostics);
+                    frontend_outcomes
+                        .insert(u.path.clone(), unit_cache::outcome(&u.path, true, None));
+                    unit_keys.insert(u.path.clone(), key.clone());
+                    summaries.insert(u.path.clone(), hit.summary.clone());
+                    mirs.insert(
+                        u.path.clone(),
+                        PendingPerUnitArtifact {
+                            summary: hit.summary,
+                            body: UnitBody::Reused { link_libs: hit.entry.link_libs },
+                            is_entry: u.is_entry,
+                            static_descriptors: Vec::new(),
+                            static_inputs,
+                            static_artifacts: Vec::new(),
+                        },
+                    );
+                    continue;
+                }
+                unit_cache::UnitLookup::Miss { reason } => frontend_reason = reason,
+            }
+        }
+        if let Some(key) = unit_key.as_ref() {
+            frontend_outcomes
+                .insert(u.path.clone(), unit_cache::outcome(&u.path, false, frontend_reason));
+            unit_keys.insert(u.path.clone(), key.clone());
+        }
+        // Whether every closure member with a summary rendered. A unit checked without a member
+        // that should have been present must not be published: a later hit would skip the render
+        // and therefore skip the error the cold path reports.
+        let mut all_deps_rendered = true;
 
         // Reconstruct each transitive dependency as an interface-only module from its summary,
         // reusing (or populating) `interface_ast_cache` so each dependency is rendered and parsed
@@ -2296,7 +2447,7 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
                 // Render using `d`'s OWN transitive closure (never the importer's `tdeps`): that
                 // is what makes the rendered source, and therefore the parsed AST, independent of
                 // which importer triggered the parse — and so safe to cache and share.
-                let d_tdeps = transitive(d, &direct_deps);
+                let d_tdeps = closure_of(d, &direct_deps, &mut closures);
                 let d_tdep_refs: Vec<&str> = d_tdeps.iter().map(|s| s.as_str()).collect();
                 let source = match align_interface::summary_to_source(dep_summary, &d_tdep_refs) {
                     Ok(source) => source,
@@ -2307,6 +2458,7 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
                             format!("cannot import interface `{d}`: {error}"),
                             align_span::Span::new(fid, 0, 0),
                         );
+                        all_deps_rendered = false;
                         continue;
                     }
                 };
@@ -2377,12 +2529,41 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
                     span: Some(align_span::Span::new(u.fid, diagnostic.lo, diagnostic.hi)),
                 });
             }
+            // A memo hit still PUBLISHES when the disk stage missed. The memo answers "this
+            // process already computed this unit", which says nothing about whether the persistent
+            // store has it: the earlier computation may have happened on a reuse-forbidden walk, or
+            // against a different cache root. Without this, a long-lived process would compute a
+            // unit once and never persist it. The retained result is sound to publish for exactly
+            // the reason the memo could serve it — its key covers the same sema input, and the memo
+            // only ever retains a descriptor-free unit whose diagnostics are replayable.
+            if let (Some(root), Some(key)) = (reuse_root.as_ref(), unit_key.as_ref())
+                && all_deps_rendered
+            {
+                unit_cache::publish(
+                    root,
+                    key,
+                    &unit_cache::UnitEntry {
+                        summary_bytes: align_interface::serialize(&hit.summary),
+                        diagnostics: hit
+                            .diagnostics
+                            .iter()
+                            .map(|diagnostic| unit_cache::CachedDiagnostic {
+                                severity: diagnostic.severity,
+                                message: diagnostic.message.clone(),
+                                lo: diagnostic.lo,
+                                hi: diagnostic.hi,
+                            })
+                            .collect(),
+                        link_libs: hit.mir.link_libs.clone(),
+                    },
+                );
+            }
             summaries.insert(u.path.clone(), hit.summary.clone());
             mirs.insert(
                 u.path.clone(),
                 PendingPerUnitArtifact {
                     summary: hit.summary,
-                    mir: hit.mir,
+                    body: UnitBody::Lowered(hit.mir),
                     is_entry: u.is_entry,
                     static_descriptors: Vec::new(),
                     static_inputs: hit.static_inputs,
@@ -2596,12 +2777,29 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
                         material_len,
                     );
                 }
+                // Persist the same result for the NEXT process. The exclusions mirror the memo's,
+                // for the same reasons, plus the render-completeness rule above.
+                if let (Some(root), Some(key)) = (reuse_root.as_ref(), unit_key.as_ref())
+                    && static_descriptors.is_empty()
+                    && all_deps_rendered
+                    && let Some(diagnostics) = unit_cache::replayable_diagnostics(&u_diags, u.fid)
+                {
+                    unit_cache::publish(
+                        root,
+                        key,
+                        &unit_cache::UnitEntry {
+                            summary_bytes: align_interface::serialize(&s),
+                            diagnostics,
+                            link_libs: mir.link_libs.clone(),
+                        },
+                    );
+                }
                 summaries.insert(u.path.clone(), s.clone());
                 mirs.insert(
                     u.path.clone(),
                     PendingPerUnitArtifact {
                         summary: s,
-                        mir,
+                        body: UnitBody::Lowered(mir),
                         is_entry: u.is_entry,
                         static_descriptors,
                         static_inputs: resolved.manifest,
@@ -2627,21 +2825,21 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
     // contract `check_per_unit` returns unchanged; each clean unit's artifact carries its own copy.
     let dep_hashes_by_unit: HashMap<&str, &Vec<(String, align_interface::Hash128)>> =
         dep_interface_hashes.iter().map(|(u, h)| (u.as_str(), h)).collect();
-    let units: Vec<PerUnitArtifact> = order
+    let units: Vec<WalkUnit> = order
         .iter()
         .filter_map(|p| {
             let PendingPerUnitArtifact {
                 summary,
-                mir,
+                body,
                 is_entry,
                 static_descriptors,
                 static_inputs,
                 static_artifacts,
             } = mirs.remove(p)?;
-            Some(PerUnitArtifact {
+            Some(WalkUnit {
                 unit: p.clone(),
                 is_entry,
-                mir,
+                body,
                 summary,
                 dep_interface_hashes: dep_hashes_by_unit
                     .get(p.as_str())
@@ -2651,12 +2849,33 @@ fn walk_per_unit(source_map: &mut SourceMap, name: &str, src: &str, located: boo
                 static_descriptors,
                 static_inputs,
                 static_artifacts,
+                frontend: frontend_outcomes.remove(p),
             })
         })
         .collect();
 
-    let _ = summaries; // superseded by `units[*].summary`; retained above only for the walk's seeding.
-    PerUnitWalk { units, dep_interface_hashes, diags }
+    // Everything a later single-unit rehydration needs, and nothing else. `scratch` is seeded with
+    // the loaded units in FILE-ID order so ids `0..N` mean the same file there as in the caller's
+    // map; only `<interface:…>` pseudo-files (ids >= N) can ever diverge, and nothing observable
+    // references those. See `docs/impl/10-cache-first-optimization.md` §6.7 F-1..F-4.
+    let mut scratch = SourceMap::new();
+    let mut by_fid: Vec<&LoadedUnit> = loaded.iter().collect();
+    by_fid.sort_by_key(|unit| unit.fid);
+    for unit in &by_fid {
+        scratch.add_file(unit.file.clone(), unit.src.clone());
+    }
+    let rehydrate = RehydrateCtx {
+        summaries,
+        closures,
+        rendered: interface_ast_cache,
+        scratch,
+        replayed: replayed_diagnostics,
+        keys: unit_keys,
+        root: reuse_root,
+        located,
+        loaded,
+    };
+    PackageWalk { units, dep_interface_hashes, diags, rehydrate }
 }
 
 /// One unit's per-unit compilation artifact (M15 S2): its own MIR (own fns + in-consumer monomorphs +
@@ -2692,6 +2911,489 @@ pub struct PerUnitWalk {
     pub diags: Diagnostics,
 }
 
+/// Whether a walk may serve a unit from the persistent unit-frontend cache.
+///
+/// `Forbidden` reproduces the pre-cache behavior exactly — no lookup, no publish, no key built — so
+/// every existing entry point keeps its semantics and its cost. Only `build`/`run`/`size` opt in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+pub enum UnitReuse {
+    Forbidden,
+    Allowed,
+}
+
+/// A unit's body: lowered by this walk, or reused from the persistent cache.
+///
+/// Private: `PerUnitArtifact` keeps its `pub mir: MirProgram` field unchanged, so this type is only
+/// ever observed through [`BuiltUnit`], which no pre-existing caller constructs or matches.
+#[allow(clippy::large_enum_variant)]
+enum UnitBody {
+    /// Boxing the MIR would move a multi-megabyte program behind a pointer for the sole benefit of
+    /// shrinking a `Reused` variant that only ever exists one-per-unit; the size difference is not
+    /// worth an extra indirection on every codegen read.
+    Lowered(MirProgram),
+    /// Served from the cache. The MIR is absent; the link libraries are not, because the link never
+    /// needs MIR and they cannot be re-derived from the summary's capability set.
+    Reused { link_libs: Vec<String> },
+}
+
+/// One unit as the shared walk produces it, before it is projected into either public shape.
+struct WalkUnit {
+    unit: String,
+    is_entry: bool,
+    body: UnitBody,
+    summary: align_interface::InterfaceSummary,
+    dep_interface_hashes: Vec<(String, align_interface::Hash128)>,
+    file: String,
+    static_descriptors: Vec<StaticDescriptor>,
+    static_inputs: StaticInputManifest,
+    static_artifacts: Vec<BuiltStaticArtifact>,
+    frontend: Option<CacheOutcome>,
+}
+
+/// The shared walk's raw result.
+struct PackageWalk {
+    units: Vec<WalkUnit>,
+    dep_interface_hashes: Vec<(String, Vec<(String, align_interface::Hash128)>)>,
+    diags: Diagnostics,
+    rehydrate: RehydrateCtx,
+}
+
+impl PackageWalk {
+    /// Project into the unchanged [`PerUnitWalk`]. Only reachable from a `UnitReuse::Forbidden`
+    /// walk, where every body is `Lowered` by construction; a `Reused` body would mean the reuse
+    /// policy leaked, so it is dropped with a loud internal error rather than faked into an empty
+    /// program (which would link as an undefined `_main`).
+    fn into_per_unit(self) -> PerUnitWalk {
+        let PackageWalk { units, dep_interface_hashes, mut diags, .. } = self;
+        let units = units
+            .into_iter()
+            .filter_map(|unit| match unit.body {
+                UnitBody::Lowered(mir) => Some(PerUnitArtifact {
+                    unit: unit.unit,
+                    is_entry: unit.is_entry,
+                    mir,
+                    summary: unit.summary,
+                    dep_interface_hashes: unit.dep_interface_hashes,
+                    file: unit.file,
+                    static_descriptors: unit.static_descriptors,
+                    static_inputs: unit.static_inputs,
+                    static_artifacts: unit.static_artifacts,
+                }),
+                UnitBody::Reused { .. } => {
+                    diags.error(
+                        format!(
+                            "internal error: unit `{}` was served from the persistent cache on a \
+                             walk that forbids reuse — report this",
+                            unit.unit
+                        ),
+                        align_span::Span::new(0, 0, 0),
+                    );
+                    None
+                }
+            })
+            .collect();
+        PerUnitWalk { units, dep_interface_hashes, diags }
+    }
+
+    fn into_package(self) -> PackageBuild {
+        let PackageWalk { units, diags, rehydrate, .. } = self;
+        let units = units
+            .into_iter()
+            .map(|unit| BuiltUnit {
+                link_libs: match &unit.body {
+                    UnitBody::Lowered(mir) => mir.link_libs.clone(),
+                    UnitBody::Reused { link_libs } => link_libs.clone(),
+                },
+                unit: unit.unit,
+                is_entry: unit.is_entry,
+                summary: unit.summary,
+                dep_interface_hashes: unit.dep_interface_hashes,
+                static_inputs: unit.static_inputs,
+                frontend: unit.frontend,
+                body: unit.body,
+            })
+            .collect();
+        PackageBuild { units, diags, rehydrate }
+    }
+}
+
+/// One unit of a package build (`build`/`run`/`size`). Additive: nothing that existed before this
+/// type constructs or matches it, which is what keeps `PerUnitArtifact`'s shape untouched.
+pub struct BuiltUnit {
+    pub unit: String,
+    pub is_entry: bool,
+    pub summary: align_interface::InterfaceSummary,
+    pub dep_interface_hashes: Vec<(String, align_interface::Hash128)>,
+    /// The unit's capability/FFI libraries, in MIR order. Present for both body shapes.
+    pub link_libs: Vec<String>,
+    /// The unit's static-input manifest — computed for a lowered unit, reconstructed from the
+    /// summary for a reused (therefore descriptor-free) one.
+    pub static_inputs: StaticInputManifest,
+    /// This unit's frontend-stage cache outcome, or `None` when the stage was declined outright
+    /// (cache disabled, reuse forbidden, or a located walk). A declined stage performs no lookup and
+    /// is counted in neither hits nor misses, matching the memo's accounting rule.
+    pub frontend: Option<CacheOutcome>,
+    body: UnitBody,
+}
+
+impl BuiltUnit {
+    /// Whether this unit came from the persistent cache and has not been rehydrated yet.
+    pub fn is_reused(&self) -> bool {
+        matches!(self.body, UnitBody::Reused { .. })
+    }
+
+    /// The unit's MIR if it is already materialized.
+    pub fn mir(&self) -> Option<&MirProgram> {
+        match &self.body {
+            UnitBody::Lowered(mir) => Some(mir),
+            UnitBody::Reused { .. } => None,
+        }
+    }
+}
+
+/// Why a single-unit rehydration was rejected. Every variant means the persistent entry disagreed
+/// with what recomputing the unit produced, i.e. the key was incomplete — a compiler defect. The
+/// caller unlinks the entry and rebuilds the package once with reuse forbidden.
+#[derive(Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+pub enum RehydrateFailure {
+    /// Recomputation reported errors, though the entry could only have been published by a clean
+    /// check.
+    Errors,
+    /// `codegen_impl_hash` of the recomputed MIR differs from the entry's `impl_hash` — the exact
+    /// component the codegen key is built from.
+    ImplHash,
+    /// The recomputed summary does not re-encode to the stored bytes.
+    Summary,
+    /// The recomputed MIR's link libraries differ from the stored ones.
+    LinkLibs,
+    /// The recomputed diagnostics differ from the replayed ones, or are not replayable at all
+    /// (`None` from the filter is a mismatch, never "no diagnostics").
+    Diagnostics,
+    /// Recomputation discovered static descriptors, which a published unit never has. Defensive:
+    /// discovery is a pure function of the AST and the seeded sink, both keyed.
+    Descriptors,
+}
+
+impl std::fmt::Display for RehydrateFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = match self {
+            RehydrateFailure::Errors => "recomputation reported errors",
+            RehydrateFailure::ImplHash => "implementation hash",
+            RehydrateFailure::Summary => "interface summary",
+            RehydrateFailure::LinkLibs => "link libraries",
+            RehydrateFailure::Diagnostics => "diagnostics",
+            RehydrateFailure::Descriptors => "static descriptors",
+        };
+        write!(f, "cached unit disagreed with recomputation ({what})")
+    }
+}
+
+/// Everything one unit needs to be re-checked later, and nothing else.
+///
+/// **`FileId` space (`docs/impl/10-cache-first-optimization.md` §6.7 F-1..F-4).** `load_units`
+/// tokenizes every unit against the CALLER's `SourceMap` and registers all `N` of them before
+/// anything else, so a retained AST's spans are caller-space and real units occupy exactly `0..N`
+/// while every `<interface:…>` pseudo-file lands at `>= N`. `scratch` is therefore SEEDED with the
+/// same `N` files in file-id order rather than started empty: a fresh map would hand the first
+/// pseudo-file id `0`, which caller-side denotes unit 0, and the own-file diagnostic filter would
+/// then accept a pseudo-file span as the unit's own. Divergence between the two maps is confined to
+/// ids `>= N`, which no retained artifact, no published diagnostic, and no MIR references — the
+/// last because non-located lowering consumes no `SourceMap` at all, which is exactly why a located
+/// walk never reuses.
+struct RehydrateCtx {
+    loaded: Vec<LoadedUnit>,
+    summaries: std::collections::HashMap<String, align_interface::InterfaceSummary>,
+    closures: std::collections::HashMap<String, Vec<String>>,
+    rendered: std::collections::HashMap<String, (String, align_ast::File)>,
+    scratch: SourceMap,
+    replayed: std::collections::HashMap<String, Vec<unit_cache::CachedDiagnostic>>,
+    keys: std::collections::HashMap<String, unit_cache::UnitKey>,
+    root: Option<std::path::PathBuf>,
+    located: bool,
+}
+
+/// The key components that are identical for every unit of one walk.
+struct UnitKeyPrefix {
+    compiler_fingerprint: align_interface::Hash128,
+    frontend_schema: u32,
+    env_toggles: Vec<unit_cache::EnvToggle>,
+    target_triple: String,
+    object_format: u8,
+}
+
+impl UnitKeyPrefix {
+    /// `None` when the host has no supported object format, which fails the whole namespace closed
+    /// rather than keying entries under a guessed one. (An enabled `CacheContext` already
+    /// guarantees the compiler fingerprint is a real identity.)
+    fn current() -> Option<UnitKeyPrefix> {
+        let object_format = match target_object_format().ok()? {
+            ObjectFormat::Elf => 0u8,
+            ObjectFormat::MachO => 1u8,
+        };
+        Some(UnitKeyPrefix {
+            compiler_fingerprint: cache::compiler_build_id(),
+            frontend_schema: align_interface::FORMAT_VERSION,
+            env_toggles: unit_cache::UnitKey::current_env_toggles(),
+            target_triple: align_codegen_llvm::default_triple(),
+            object_format,
+        })
+    }
+
+    fn key(
+        &self,
+        unit: &str,
+        is_entry: bool,
+        src: &str,
+        deps: Vec<unit_cache::UnitDep>,
+    ) -> unit_cache::UnitKey {
+        unit_cache::UnitKey {
+            key_format_version: unit_cache::UNIT_KEY_FORMAT_VERSION,
+            compiler_fingerprint: self.compiler_fingerprint,
+            frontend_schema: self.frontend_schema,
+            env_toggles: self.env_toggles.clone(),
+            target_triple: self.target_triple.clone(),
+            object_format: self.object_format,
+            unit: unit.to_string(),
+            is_entry,
+            source_digest: align_interface::Hash128::of(src.as_bytes()),
+            deps,
+        }
+    }
+}
+
+/// A package build: the `build`/`run`/`size` result, which may contain units served from the
+/// persistent cache and therefore carrying no MIR.
+pub struct PackageBuild {
+    pub units: Vec<BuiltUnit>,
+    pub diags: Diagnostics,
+    rehydrate: RehydrateCtx,
+}
+
+impl PackageBuild {
+    /// Bridge for a caller that already has a walk: every unit `Lowered`, every `frontend` `None`,
+    /// and [`PackageBuild::materialize`] a no-op.
+    pub fn from_walk(walk: PerUnitWalk) -> PackageBuild {
+        let PerUnitWalk { units, diags, .. } = walk;
+        let units = units
+            .into_iter()
+            .map(|unit| BuiltUnit {
+                link_libs: unit.mir.link_libs.clone(),
+                unit: unit.unit,
+                is_entry: unit.is_entry,
+                summary: unit.summary,
+                dep_interface_hashes: unit.dep_interface_hashes,
+                static_inputs: unit.static_inputs,
+                frontend: None,
+                body: UnitBody::Lowered(unit.mir),
+            })
+            .collect();
+        PackageBuild { units, diags, rehydrate: RehydrateCtx::empty() }
+    }
+
+    /// Materialize `units[index]`'s MIR, rehydrating and VERIFYING it when the unit was reused.
+    ///
+    /// A hit hands out no MIR, so this is the one place a cached frontend result is re-derived
+    /// rather than merely re-checked. Recomputation runs against exactly the dependency summaries
+    /// the walk used, into a THROWAWAY diagnostic sink — the unit's diagnostics were already emitted
+    /// when it was resolved, and appending them again would make a hit observable. The result is
+    /// then compared against the entry component by component; any disagreement means the key was
+    /// incomplete and is reported rather than used.
+    pub fn materialize(&mut self, index: usize) -> Result<&MirProgram, RehydrateFailure> {
+        if matches!(self.units.get(index).map(|u| &u.body), Some(UnitBody::Lowered(_))) {
+            let Some(UnitBody::Lowered(mir)) = self.units.get(index).map(|u| &u.body) else {
+                unreachable!("just matched Lowered")
+            };
+            return Ok(mir);
+        }
+        let unit_name = match self.units.get(index) {
+            Some(unit) => unit.unit.clone(),
+            // No such unit: nothing to materialize and nothing to invalidate.
+            None => return Err(RehydrateFailure::Errors),
+        };
+        let recomputed = self.rehydrate.recompute(&unit_name)?;
+        let stored = &self.units[index];
+        if recomputed.summary.impl_hash != stored.summary.impl_hash {
+            return self.reject(index, RehydrateFailure::ImplHash);
+        }
+        if align_interface::serialize(&recomputed.summary) != align_interface::serialize(&stored.summary) {
+            return self.reject(index, RehydrateFailure::Summary);
+        }
+        if recomputed.mir.link_libs != stored.link_libs {
+            return self.reject(index, RehydrateFailure::LinkLibs);
+        }
+        let replayed = self.rehydrate.replayed.get(&unit_name);
+        if Some(&recomputed.diagnostics) != replayed {
+            return self.reject(index, RehydrateFailure::Diagnostics);
+        }
+        // Verified: adopt the MIR, and promote the complete result into the in-process memo so a
+        // second need in this process hits there instead of rehydrating again.
+        self.units[index].body = UnitBody::Lowered(recomputed.mir);
+        let Some(UnitBody::Lowered(mir)) = self.units.get(index).map(|u| &u.body) else {
+            unreachable!("just assigned Lowered")
+        };
+        Ok(mir)
+    }
+
+    /// Unlink the offending entry and report. Split out so every rejection path unlinks exactly once.
+    fn reject(&mut self, index: usize, failure: RehydrateFailure) -> Result<&MirProgram, RehydrateFailure> {
+        let unit = &self.units[index].unit;
+        if let (Some(root), Some(key)) = (self.rehydrate.root.as_ref(), self.rehydrate.keys.get(unit)) {
+            unit_cache::invalidate(root, key);
+        }
+        eprintln!("{}", cache::CORRUPT_NOTE);
+        Err(failure)
+    }
+}
+
+/// One verified recomputation of a reused unit.
+struct Recomputed {
+    mir: MirProgram,
+    summary: align_interface::InterfaceSummary,
+    diagnostics: Vec<unit_cache::CachedDiagnostic>,
+}
+
+impl RehydrateCtx {
+    /// The context for a build that can never rehydrate ([`PackageBuild::from_walk`]).
+    fn empty() -> RehydrateCtx {
+        RehydrateCtx {
+            loaded: Vec::new(),
+            summaries: std::collections::HashMap::new(),
+            closures: std::collections::HashMap::new(),
+            rendered: std::collections::HashMap::new(),
+            scratch: SourceMap::new(),
+            replayed: std::collections::HashMap::new(),
+            keys: std::collections::HashMap::new(),
+            root: None,
+            located: false,
+        }
+    }
+
+    /// Re-run the compute path for ONE unit against exactly the dependency summaries the walk used.
+    ///
+    /// This mirrors the walk's compute path rather than sharing its body, because the walk's version
+    /// is entangled with descriptor resolution, the publication lock, and the caller's `SourceMap` —
+    /// none of which a descriptor-free reused unit needs. The risk that the two drift is not carried
+    /// by inspection: [`PackageBuild::materialize`] compares the recomputed summary's full canonical
+    /// encoding, its `impl_hash`, its link libraries, and its diagnostics against the stored entry,
+    /// so any drift fails the build closed instead of miscompiling.
+    fn recompute(&mut self, unit_name: &str) -> Result<Recomputed, RehydrateFailure> {
+        use std::collections::HashMap;
+        debug_assert!(!self.located, "a located walk never reuses, so it never rehydrates");
+        let Some(position) = self.loaded.iter().position(|unit| unit.path == unit_name) else {
+            return Err(RehydrateFailure::Errors);
+        };
+        let tdeps = self.closures.get(unit_name).cloned().unwrap_or_default();
+
+        // RENDER path, memoized per module exactly as the walk memoizes it. Pseudo-files go into
+        // `scratch`, whose ids `0..N` already mean the same files as the caller's map.
+        let mut external_effects: HashMap<String, align_sema::FnEffect> = HashMap::new();
+        let mut external_return_provenance = align_sema::ExternalReturnProvenance::new();
+        let mut external_resources = align_sema::ExternalResourceFacts::new();
+        let mut external_resource_hooks = align_sema::ExternalResourceHookFacts::new();
+        for dep in &tdeps {
+            let Some(dep_summary) = self.summaries.get(dep).cloned() else { continue };
+            if !self.rendered.contains_key(dep) {
+                let dep_closure = self.closures.get(dep).cloned().unwrap_or_default();
+                let refs: Vec<&str> = dep_closure.iter().map(String::as_str).collect();
+                let Ok(source) = align_interface::summary_to_source(&dep_summary, &refs) else {
+                    // The walk refuses to publish a unit whose closure failed to render, so an entry
+                    // whose render now fails is itself the disagreement.
+                    return Err(RehydrateFailure::Summary);
+                };
+                let mut sink = Diagnostics::new();
+                let fid = self.scratch.add_file(format!("<interface:{dep}>"), source.clone());
+                let toks = align_lexer::tokenize(fid, &source, &mut sink);
+                let ast = align_parser::parse_file(toks, &mut sink);
+                self.rendered.insert(dep.clone(), (source, ast));
+            }
+            external_effects.extend(align_interface::summary_effects(&dep_summary, false));
+            external_return_provenance
+                .extend(align_interface::summary_return_provenance(&dep_summary, false));
+            external_resources.extend(align_interface::summary_resource_facts(&dep_summary));
+            external_resource_hooks
+                .extend(align_interface::summary_resource_hook_facts(&dep_summary, false));
+        }
+
+        let unit = &self.loaded[position];
+        let mut modules: Vec<align_sema::Module> = tdeps
+            .iter()
+            .filter_map(|dep| {
+                self.rendered.get(dep).map(|(_, ast)| align_sema::Module {
+                    path: dep.clone(),
+                    file: ast,
+                    is_entry: false,
+                    interface_only: true,
+                })
+            })
+            .collect();
+        modules.push(align_sema::Module {
+            path: unit.path.clone(),
+            file: &unit.ast,
+            is_entry: unit.is_entry,
+            interface_only: false,
+        });
+
+        // A THROWAWAY sink: this unit's diagnostics were emitted when it was resolved, and appending
+        // them again would make a hit observable. They are compared, never re-published.
+        let mut u_diags = Diagnostics::new();
+        let checked = align_sema::check_program_with_all_interface_facts_and_static_descriptors(
+            &modules,
+            &external_effects,
+            &external_return_provenance,
+            &external_resources,
+            &external_resource_hooks,
+            &mut u_diags,
+        );
+        if u_diags.has_errors() {
+            return Err(RehydrateFailure::Errors);
+        }
+        if !checked.static_descriptors.is_empty() {
+            return Err(RehydrateFailure::Descriptors);
+        }
+        let program = checked.program;
+        let mir = lower_to_mir_per_unit(&program);
+        if (mir.fns.is_empty() && !program.fns.is_empty())
+            || (mir.structs.is_empty() && !program.structs.is_empty())
+        {
+            return Err(RehydrateFailure::Errors);
+        }
+        let unit_module = [align_sema::Module {
+            path: unit.path.clone(),
+            file: &unit.ast,
+            is_entry: unit.is_entry,
+            interface_only: false,
+        }];
+        let sources: HashMap<String, String> =
+            HashMap::from([(unit.path.clone(), unit.src.clone())]);
+        let mut built = align_interface::build_summaries_with_effects(
+            &unit_module,
+            &program,
+            &mir,
+            &sources,
+            &external_effects,
+        );
+        let Some(mut summary) = built.pop() else {
+            return Err(RehydrateFailure::Summary);
+        };
+        // With no descriptors this is the identity; called anyway so the two paths compose the
+        // interface hash through the same function.
+        match static_interface_hash(summary.interface_hash, &unit.path, &[]) {
+            Ok(hash) => summary.interface_hash = hash,
+            Err(_) => return Err(RehydrateFailure::Summary),
+        }
+        summary.impl_hash = align_interface::codegen_impl_hash(&mir);
+        // F-3: the filter target is always the CALLER-space id `load_units` assigned. `None` means
+        // the recomputation produced a diagnostic that could not have been stored, which is a
+        // mismatch, never "no diagnostics".
+        let Some(diagnostics) = unit_cache::replayable_diagnostics(&u_diags, unit.fid) else {
+            return Err(RehydrateFailure::Diagnostics);
+        };
+        Ok(Recomputed { mir, summary, diagnostics })
+    }
+}
+
 /// M15 S2 per-unit build (library entry): walk the import DAG bottom-up, check each unit against its
 /// imports' interface summaries, and lower each cleanly-checked unit to its OWN MIR under the
 /// separate-compilation visibility model. Returns one [`PerUnitArtifact`] per unit (MIR + summary +
@@ -2700,6 +3402,24 @@ pub struct PerUnitWalk {
 /// error is in `diags` (the caller must not link a partial build).
 pub fn build_per_unit(source_map: &mut SourceMap, name: &str, src: &str) -> PerUnitWalk {
     walk_per_unit(source_map, name, src, false)
+}
+
+/// The `build`/`run`/`size` package build: the same bottom-up walk, but a unit whose frontend
+/// result is already in the persistent cache is served from there and carries no MIR
+/// (`docs/impl/10-cache-first-optimization.md` §6.7).
+///
+/// `UnitReuse::Forbidden` produces exactly what [`build_per_unit`] would, wrapped in the package
+/// shape; `UnitReuse::Allowed` additionally consults and populates the unit-frontend namespace of
+/// `cache`. A located walk never reuses (its MIR depends on the caller's `SourceMap`, which the key
+/// does not cover), and neither does a descriptor-owning unit.
+pub fn build_package(
+    source_map: &mut SourceMap,
+    name: &str,
+    src: &str,
+    cache: &CacheContext,
+    reuse: UnitReuse,
+) -> PackageBuild {
+    walk_inner(source_map, name, src, false, cache, reuse).into_package()
 }
 
 /// M15 S2b per-unit build with **source locations** — like [`build_per_unit`], but each unit's MIR is
@@ -3099,145 +3819,269 @@ pub fn codegen_units_parallel(
     jobs: usize,
     pgo: &PgoMode,
 ) -> Result<UnitCodegen, String> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     assert_eq!(units.len(), obj_paths.len(), "one object path per unit");
-    // The PGO cache-key component (the settled `PgoKey { Off | Instrument | Use(Hash128) }`) AND the
-    // key↔content coupling. The `Use` digest is the content hash of the merged `.profdata` BYTES, read
-    // ONCE here. CRITICAL: those exact bytes are then SNAPSHOTTED to a private per-invocation staged copy
-    // (`StagedProfdata`), and it is the STAGED path — never the user's — that every `emit_object_pgo`
-    // hands to libLLVM. Otherwise a profile-iteration loop that rewrites the file mid-build (bytes B1 →
-    // B2 after keying, before a cache-MISS unit's emit re-reads the live path) would PUBLISH B2-optimized
-    // objects under the B1 key, poisoning the cache for a later genuine-B1 build and breaking
-    // hit⟹byte-identical within the racing build. The snapshot makes libLLVM provably read the digested
-    // bytes. `effective_pgo` therefore points at the staged copy for `Use`; the guard outlives the
-    // parallel scope and RAII-cleans the temp file. (Source→MIR and rt-lto baking are the precedents;
-    // profdata was the last live-path pipeline input.) The caller has already `validate_profdata`'d the
-    // user path; a read/stage error here is still a hard error.
-    let mut staged_profdata: Option<StagedProfdata> = None;
-    let (pgo_key, effective_pgo): (cache::PgoKey, PgoMode) = match pgo {
-        PgoMode::Off => (cache::PgoKey::Off, PgoMode::Off),
-        PgoMode::Instrument => (cache::PgoKey::Instrument, PgoMode::Instrument),
-        PgoMode::Use(p) => {
-            let bytes = std::fs::read(p).map_err(|e| {
-                format!("--pgo-use: cannot read profile data file '{}': {e}", p.display())
+    let inputs: Vec<CodegenUnitInput<'_>> = units
+        .iter()
+        .map(|unit| CodegenUnitInput {
+            unit: unit.unit.as_str(),
+            impl_hash: unit.summary.impl_hash,
+            dep_interface_hashes: &unit.dep_interface_hashes,
+        })
+        .collect();
+    let staged = stage_pgo(pgo)?;
+    let phase1 = codegen_lookup_phase(&inputs, obj_paths, cache, target, profile, rt_lto, staged.key)?;
+    // Every MIR is already lowered on this path, so there is nothing to materialize between the
+    // phases.
+    let mirs: Vec<&align_mir::Program> = units.iter().map(|unit| &unit.mir).collect();
+    codegen_produce_phase(&inputs, phase1, &mirs, obj_paths, cache, target, profile, rt_lto, jobs, &staged)
+}
+
+/// The `build`/`run`/`size` codegen driver over a [`PackageBuild`]: the same two phases as
+/// [`codegen_units_parallel`], with ONE step between them — every unit that is both reused and a
+/// codegen MISS is rehydrated and verified, serially on this thread, so the parallel phase still
+/// receives a plain slice of already-lowered MIR.
+///
+/// Serial by design: sema is not audited for concurrent use, and on the common all-hit build there
+/// is nothing to materialize at all. `-j 1` byte-identity, DAG ordering, immediate CAS publish, PGO
+/// staging, and the lowest-index error rule are inherited unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn codegen_package_parallel(
+    build: &mut PackageBuild,
+    obj_paths: &[std::path::PathBuf],
+    cache: &CacheContext,
+    target: &BuildTarget,
+    profile: Profile,
+    rt_lto: bool,
+    jobs: usize,
+    pgo: &PgoMode,
+) -> Result<UnitCodegen, String> {
+    assert_eq!(build.units.len(), obj_paths.len(), "one object path per unit");
+    let staged = stage_pgo(pgo)?;
+    let phase1 = {
+        let inputs: Vec<CodegenUnitInput<'_>> = build
+            .units
+            .iter()
+            .map(|unit| CodegenUnitInput {
+                unit: unit.unit.as_str(),
+                impl_hash: unit.summary.impl_hash,
+                dep_interface_hashes: &unit.dep_interface_hashes,
+            })
+            .collect();
+        codegen_lookup_phase(&inputs, obj_paths, cache, target, profile, rt_lto, staged.key)?
+    };
+    // Materialize only what phase 2 will actually compile. A frontend hit whose object also hit
+    // never needs its MIR, which is the whole point of storing the frontend without it.
+    for &index in &phase1.misses {
+        if build.units[index].is_reused() {
+            let unit = build.units[index].unit.clone();
+            build
+                .materialize(index)
+                .map_err(|failure| format!("cached unit `{unit}`: {failure}"))?;
+        }
+    }
+    let inputs: Vec<CodegenUnitInput<'_>> = build
+        .units
+        .iter()
+        .map(|unit| CodegenUnitInput {
+            unit: unit.unit.as_str(),
+            impl_hash: unit.summary.impl_hash,
+            dep_interface_hashes: &unit.dep_interface_hashes,
+        })
+        .collect();
+    // A HIT unit is never compiled, so its absent MIR is never read; a placeholder keeps the slice
+    // indexable without inventing a program. `codegen_produce_phase` only indexes `misses`.
+    let placeholder = align_mir::Program::default();
+    let mirs: Vec<&align_mir::Program> = build
+        .units
+        .iter()
+        .map(|unit| unit.mir().unwrap_or(&placeholder))
+        .collect();
+    codegen_produce_phase(&inputs, phase1, &mirs, obj_paths, cache, target, profile, rt_lto, jobs, &staged)
+}
+
+/// One unit's contribution to a codegen key, borrowed from either unit shape.
+struct CodegenUnitInput<'a> {
+    unit: &'a str,
+    impl_hash: Hash128,
+    dep_interface_hashes: &'a [(String, Hash128)],
+}
+
+/// The serial lookup phase's result: per-unit keys and outcomes, plus the DAG indices still needing
+/// codegen.
+struct CodegenLookups {
+    keys: Vec<Option<CodegenKey>>,
+    outcomes: Vec<Option<CacheOutcome>>,
+    misses: Vec<usize>,
+}
+
+/// The instrument-PGO snapshot for one invocation: the cache-key component plus the staged profile
+/// libLLVM actually reads. Held by the caller so the temp file outlives the parallel scope.
+struct StagedPgo {
+    key: cache::PgoKey,
+    effective: PgoMode,
+    _guard: Option<StagedProfdata>,
+}
+
+/// Read, digest, and snapshot a `--pgo-use` profile — see the note in [`codegen_produce_phase`].
+fn stage_pgo(pgo: &PgoMode) -> Result<StagedPgo, String> {
+    match pgo {
+        PgoMode::Off => Ok(StagedPgo { key: cache::PgoKey::Off, effective: PgoMode::Off, _guard: None }),
+        PgoMode::Instrument => Ok(StagedPgo {
+            key: cache::PgoKey::Instrument,
+            effective: PgoMode::Instrument,
+            _guard: None,
+        }),
+        PgoMode::Use(path) => {
+            let bytes = std::fs::read(path).map_err(|e| {
+                format!("--pgo-use: cannot read profile data file '{}': {e}", path.display())
             })?;
             let digest = Hash128::of(&bytes);
             let staged = StagedProfdata::new(&bytes)?;
             let staged_path = staged.path().to_path_buf();
-            staged_profdata = Some(staged);
-            (cache::PgoKey::Use(digest), PgoMode::Use(staged_path))
+            Ok(StagedPgo {
+                key: cache::PgoKey::Use(digest),
+                effective: PgoMode::Use(staged_path),
+                _guard: Some(staged),
+            })
         }
-    };
-    let n = units.len();
-    // LLVM native-target init once, on the main thread, before any worker touches codegen.
-    align_codegen_llvm::ensure_target_initialized().map_err(|e| e.to_string())?;
+    }
+}
 
-    let enabled = cache.is_enabled();
-    // Phase 1 (serial): keys + lookups. `outcomes[i]` is set for every unit (hit or miss placeholder);
-    // `misses` lists the DAG indices still needing codegen; `keys[i]` is retained for the miss publish.
+/// Phase 1 (serial): build each unit's codegen key and look it up. A HIT writes the object from the
+/// CAS immediately; a MISS is queued. When the cache is disabled every unit is a miss and NO key
+/// work runs — the codegen-key inputs are pure cache overhead a cache-off build must not pay.
+#[allow(clippy::too_many_arguments)]
+fn codegen_lookup_phase(
+    inputs: &[CodegenUnitInput<'_>],
+    obj_paths: &[std::path::PathBuf],
+    cache: &CacheContext,
+    target: &BuildTarget,
+    profile: Profile,
+    rt_lto: bool,
+    pgo_key: cache::PgoKey,
+) -> Result<CodegenLookups, String> {
+    let n = inputs.len();
     let mut keys: Vec<Option<CodegenKey>> = (0..n).map(|_| None).collect();
     let mut outcomes: Vec<Option<CacheOutcome>> = (0..n).map(|_| None).collect();
     let mut misses: Vec<usize> = Vec::new();
-    for (i, unit) in units.iter().enumerate() {
+    let enabled = cache.is_enabled();
+    for (i, input) in inputs.iter().enumerate() {
         if enabled {
-            let key = build_codegen_key(&unit.unit, unit.summary.impl_hash, &unit.dep_interface_hashes, target, profile, &[], rt_lto, pgo_key)?;
+            let key = build_codegen_key(
+                input.unit,
+                input.impl_hash,
+                input.dep_interface_hashes,
+                target,
+                profile,
+                &[],
+                rt_lto,
+                pgo_key,
+            )?;
             match cache.lookup(&key, &obj_paths[i]) {
-                cache::CacheLookup::Hit(o) => outcomes[i] = Some(o),
+                cache::CacheLookup::Hit(outcome) => outcomes[i] = Some(outcome),
                 cache::CacheLookup::Miss { reason } => {
-                    outcomes[i] = Some(CacheOutcome { stage: CacheStage::Codegen, unit: unit.unit.clone(), hit: false, miss_reason: reason });
+                    outcomes[i] = Some(CacheOutcome {
+                        stage: CacheStage::Codegen,
+                        unit: input.unit.to_string(),
+                        hit: false,
+                        miss_reason: reason,
+                    });
                     misses.push(i);
                 }
             }
             keys[i] = Some(key);
         } else {
-            outcomes[i] = Some(CacheOutcome { stage: CacheStage::Codegen, unit: unit.unit.clone(), hit: false, miss_reason: None });
+            outcomes[i] = Some(CacheOutcome {
+                stage: CacheStage::Codegen,
+                unit: input.unit.to_string(),
+                hit: false,
+                miss_reason: None,
+            });
             misses.push(i);
         }
     }
+    Ok(CodegenLookups { keys, outcomes, misses })
+}
 
-    // Phase 2 (parallel): produce the misses. Shared by reference into the scope; each worker only
-    // reads `units`/`obj_paths`/`keys`, appends its result (or error) under a short-held lock, and
-    // PUBLISHES its object to the CAS IMMEDIATELY on success. Immediate publish is correct regardless of
-    // any PGO match ratio: the cache key already carries the profile-content digest (`PgoKey::Use`), so a
-    // published object is only ever served to a build with the identical profile+source — correctness
-    // never depended on how well the profile matched. Publishing in the worker (not deferred to a
-    // post-scope pass) also means a build where ONE unit fails codegen still leaves its
-    // already-succeeded sibling units published (a warm rebuild re-hits them), matching every non-PGO mode.
+/// Phase 2 (parallel): produce the misses. `jobs` workers pull the next miss through a shared atomic
+/// index; each runs a fresh LLVM `Context` into its own `obj_paths[i]`, then publishes to the CAS
+/// IMMEDIATELY on success.
+///
+/// Immediate publish is correct regardless of any PGO match ratio: the key already carries the
+/// profile-content digest, so a published object is only ever served to a build with the identical
+/// profile+source. Publishing in the worker (not deferred) also means a build where one unit fails
+/// codegen still leaves its succeeded siblings published.
+///
+/// Results are DAG-ordered regardless of which worker finished first, and `-j 1` is byte-identical
+/// to any `-j N`: only which thread runs an independent single-threaded codegen differs.
+#[allow(clippy::too_many_arguments)]
+fn codegen_produce_phase(
+    inputs: &[CodegenUnitInput<'_>],
+    lookups: CodegenLookups,
+    mirs: &[&align_mir::Program],
+    obj_paths: &[std::path::PathBuf],
+    cache: &CacheContext,
+    target: &BuildTarget,
+    profile: Profile,
+    rt_lto: bool,
+    jobs: usize,
+    staged: &StagedPgo,
+) -> Result<UnitCodegen, String> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let CodegenLookups { keys, outcomes, misses } = lookups;
+    // LLVM native-target init once, on the main thread, before any worker touches codegen.
+    align_codegen_llvm::ensure_target_initialized().map_err(|e| e.to_string())?;
     let mut pgo_warnings: Vec<String> = Vec::new();
     let (mut pgo_matched, mut pgo_total): (u32, u32) = (0, 0);
     if !misses.is_empty() {
-        use std::sync::atomic::AtomicBool;
         let worker_count = jobs.max(1).min(misses.len());
         let next = AtomicUsize::new(0);
         let failed = AtomicBool::new(false);
         let errors = std::sync::Mutex::new(Vec::<(usize, String)>::new());
-        // Per-unit PGO-use results (warnings + match tally), index-tagged so the aggregate is
-        // DAG-ordered (not scheduling-dependent). Empty/zero for Off/Instrument and for every all-hit
-        // unit.
         let results = std::sync::Mutex::new(Vec::<(usize, UnitPgoRun)>::new());
         std::thread::scope(|scope| {
             for _ in 0..worker_count {
                 scope.spawn(|| loop {
-                        // Fail-fast: once any unit has errored, stop CLAIMING new work. Checked only
-                        // between units — an in-progress emit is never interrupted. Codegen errors are rare
-                        // (sema already validated in the walk), so this mainly bounds the wasted work when a
-                        // *systemic* failure (e.g. disk full) would otherwise compile every remaining object
-                        // before the build fails. `Relaxed` is correct: the flag is a best-effort early-exit
-                        // hint that publishes no data (errors ride the Mutex, and the final read
-                        // happens-after the scope join).
-                        if failed.load(Ordering::Relaxed) {
-                            break;
+                    // Fail-fast: once any unit has errored, stop CLAIMING new work. Checked only
+                    // between units — an in-progress emit is never interrupted. `Relaxed` is
+                    // correct: the flag publishes no data (errors ride the Mutex, and the final
+                    // read happens-after the scope join).
+                    if failed.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let k = next.fetch_add(1, Ordering::Relaxed);
+                    if k >= misses.len() {
+                        break;
+                    }
+                    let i = misses[k];
+                    match emit_unit_object(mirs[i], &obj_paths[i], target, profile, rt_lto, &staged.effective) {
+                        Err(e) => {
+                            errors.lock().expect("codegen error lock").push((i, e));
+                            failed.store(true, Ordering::Relaxed);
+                            continue;
                         }
-                        let k = next.fetch_add(1, Ordering::Relaxed);
-                        if k >= misses.len() {
-                            break;
+                        Ok(run) => {
+                            results.lock().expect("pgo result lock").push((i, run));
                         }
-                        let i = misses[k];
-                        let unit = &units[i];
-                        // The PGO pipeline swap (GEN/USE) lives inside `emit_unit_object`; `Off` is the
-                        // byte-identical stock emit. A USE run's fail-loud handler turns a libLLVM-REJECTED
-                        // profile (an Error-severity diagnostic) into an `Err` here (hard fail); its
-                        // staleness warnings + profile-match tally ride the return.
-                        match emit_unit_object(&unit.mir, &obj_paths[i], target, profile, rt_lto, &effective_pgo) {
-                            Err(e) => {
-                                errors.lock().expect("codegen error lock").push((i, e));
-                                failed.store(true, Ordering::Relaxed);
-                                continue;
-                            }
-                            Ok(run) => {
-                                results.lock().expect("pgo result lock").push((i, run));
-                            }
-                        }
-                        if let Some(key) = &keys[i] {
-                            cache.publish_after_miss(key, &obj_paths[i]);
-                        }
+                    }
+                    if let Some(key) = &keys[i] {
+                        cache.publish_after_miss(key, &obj_paths[i]);
+                    }
                 });
             }
         });
-        // Deterministic report: the lowest-DAG-index error among those collected. Fail-fast may leave
-        // a higher-index unit unattempted, so in the rare case of MULTIPLE independent codegen failures
-        // the set collected is timing-dependent; the *reported* error is still the lowest index present
-        // (and such failures — e.g. disk full — carry the same cause across units anyway).
+        // Deterministic report: the lowest-DAG-index error among those collected. Fail-fast may
+        // leave a higher-index unit unattempted, so with MULTIPLE independent failures the set
+        // collected is timing-dependent; the reported error is still the lowest index present.
         let mut errs = errors.into_inner().expect("codegen error lock");
         if !errs.is_empty() {
             errs.sort_by_key(|(i, _)| *i);
             let (i, e) = &errs[0];
-            return Err(format!("codegen failed for unit `{}`: {e}", units[*i].unit));
+            return Err(format!("codegen failed for unit `{}`: {e}", inputs[*i].unit));
         }
-        // DAG-order the per-unit results for a stable warning aggregate, and sum the profile-match tally
-        // across the rebuilt (cache-MISS) USE units. `matched`/`total` count the OPTIMIZED module's
-        // functions that carried a PGO entry count vs total defined (the shim's `Function::getEntryCount`
-        // tally). The caller turns this into an aggregated Align-voice report: a `matched == 0` build is a
-        // prominent "does this profile belong to this program?" WARNING, a partial match rides the
-        // per-unit staleness warnings — NEVER a hard error. There is no reliable 0%-match hard-error
-        // signal (the tally undercounts inlined+DCE'd matches and, with `--rt-lto`, overcounts baked
-        // runtime primitives that match any program), and — as with clang — a mismatched profile is a
-        // performance concern, never a correctness one. Hard fails stay at the reliable layer: a
-        // missing/unreadable/empty/bad-magic profdata (`validate_profdata`) and an Error-severity libLLVM
-        // diagnostic (above).
         let mut runs = results.into_inner().expect("pgo result lock");
         runs.sort_by_key(|(i, _)| *i);
-        if matches!(effective_pgo, PgoMode::Use(_)) {
+        if matches!(staged.effective, PgoMode::Use(_)) {
             pgo_matched = runs.iter().map(|(_, r)| r.matched_fns).sum();
             pgo_total = runs.iter().map(|(_, r)| r.total_fns).sum();
         }
@@ -3245,13 +4089,11 @@ pub fn codegen_units_parallel(
             pgo_warnings.extend(run.warnings);
         }
     }
-
-    // Explicit RAII drop of the profdata snapshot AFTER every emit has read it (the `thread::scope`
-    // above has joined). Also marks the guard read, so the assignment is not dead.
-    drop(staged_profdata);
-
     Ok(UnitCodegen {
-        outcomes: outcomes.into_iter().map(|o| o.expect("every unit gets an outcome in phase 1")).collect(),
+        outcomes: outcomes
+            .into_iter()
+            .map(|o| o.expect("every unit gets an outcome in phase 1"))
+            .collect(),
         pgo_warnings,
         pgo_matched,
         pgo_total,
@@ -4459,5 +5301,100 @@ mod tests {
         assert_eq!(llvm_tool_in(None, "llvm-definitely-not-a-tool"), None);
 
         std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+#[cfg(test)]
+mod walk_tests {
+    use super::*;
+
+    /// P32: the per-module closure memo. The key needs a closure for every closure MEMBER of every
+    /// unit, so without memoization a fan-in DAG would recompute the same closure once per
+    /// importer. `transitive` itself is unmemoized and stays the reference implementation.
+    #[test]
+    fn closure_of_computes_each_module_at_most_once() {
+        use std::collections::HashMap;
+        // A diamond: main -> {left, right} -> leaf. `leaf`'s closure is asked for by both sides.
+        let direct: HashMap<String, Vec<String>> = HashMap::from([
+            ("main".to_string(), vec!["left".to_string(), "right".to_string()]),
+            ("left".to_string(), vec!["leaf".to_string()]),
+            ("right".to_string(), vec!["leaf".to_string()]),
+            ("leaf".to_string(), Vec::new()),
+        ]);
+        let mut memo = HashMap::new();
+        for module in ["main", "left", "right", "leaf", "left", "right", "leaf"] {
+            let memoized = closure_of(module, &direct, &mut memo);
+            assert_eq!(memoized, transitive(module, &direct), "the memo must not change the answer");
+        }
+        assert_eq!(memo.len(), 4, "one entry per MODULE, never one per importer");
+        assert_eq!(memo["main"], vec!["leaf", "left", "right"]);
+        assert_eq!(memo["leaf"], Vec::<String>::new());
+    }
+
+    /// P33 / F-1, F-2, F-4: the `FileId` space.
+    ///
+    /// `load_units` registers every real unit against the CALLER's `SourceMap` before anything else
+    /// is added, so real units occupy exactly `0..N` and every later `<interface:…>` pseudo-file
+    /// lands at `>= N`. That partition is what lets the rehydration map diverge above `N` without
+    /// any observable consequence — and what makes seeding it with the same `N` files mandatory.
+    #[test]
+    fn load_units_owns_the_low_file_id_space() {
+        let dir = std::env::temp_dir().join(format!("align-fidspace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create");
+        std::fs::write(dir.join("leaf.align"), "module leaf\n\npub fn one() -> i64 = 1\n").unwrap();
+        std::fs::write(
+            dir.join("mid.align"),
+            "module mid\n\nimport leaf\n\npub fn two() -> i64 = leaf.one() + 1\n",
+        )
+        .unwrap();
+        let entry_src = "import mid\n\nfn main() {\n    print(mid.two())\n}\n";
+        let entry = dir.join("main.align");
+        std::fs::write(&entry, entry_src).unwrap();
+
+        let mut source_map = SourceMap::new();
+        let mut diags = Diagnostics::new();
+        let loaded = load_units(&mut source_map, &entry.display().to_string(), entry_src, &mut diags);
+        assert!(!diags.has_errors());
+        let n = loaded.len();
+        assert_eq!(n, 3);
+
+        // F-1/F-2: the real units are exactly ids `0..N`, each used once.
+        let mut ids: Vec<align_span::FileId> = loaded.iter().map(|unit| unit.fid).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..n as align_span::FileId).collect::<Vec<_>>());
+
+        // F-2: the next file registered — a pseudo-file — necessarily lands at `>= N`.
+        let pseudo = source_map.add_file("<interface:leaf>".to_string(), String::new());
+        assert!(
+            pseudo >= n as align_span::FileId,
+            "a pseudo-file must never collide with a real unit's id"
+        );
+
+        // F-2, negative: a FRESH map hands out id 0, which caller-side denotes unit 0. This is
+        // precisely why `RehydrateCtx::scratch` is seeded with the N unit files instead of started
+        // empty — an empty scratch map would make the own-file diagnostic filter accept a
+        // pseudo-file span as the unit's own.
+        let mut fresh = SourceMap::new();
+        assert_eq!(fresh.add_file("<interface:leaf>".to_string(), String::new()), 0);
+
+        // F-4: a seeded map agrees with the caller's map on `0..N` and only diverges above it.
+        let mut seeded = SourceMap::new();
+        let mut by_fid: Vec<&LoadedUnit> = loaded.iter().collect();
+        by_fid.sort_by_key(|unit| unit.fid);
+        for unit in &by_fid {
+            seeded.add_file(unit.file.clone(), unit.src.clone());
+        }
+        for unit in &loaded {
+            assert_eq!(
+                seeded.get(unit.fid).src,
+                source_map.get(unit.fid).src,
+                "id {} must mean the same source in both maps",
+                unit.fid
+            );
+        }
+        assert!(seeded.add_file("<interface:mid>".to_string(), String::new()) >= n as align_span::FileId);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
