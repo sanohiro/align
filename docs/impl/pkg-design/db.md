@@ -4438,6 +4438,10 @@ MIR, and code generation; no abstract SoA reaches emitted HIR/MIR. A non-`SoaPla
 `batch_row`; `batch_soa` is rejected at the call during generic instantiation and never performs a
 runtime downgrade.
 
+The statement-v2 and rows-v2 ABI entries in this first-batch ledger describe its landing
+boundary. The cumulative current records are the statement-v3 and rows-v3 layouts fixed by the
+later PostgreSQL delivery ledger in §23.
+
 | Public record | Exact contract |
 |---|---|
 | input and defaults | `next_batch` consumes no new Query, Params, options, region, or ambient configuration. `max_rows` has no default and must be in `1..=2_147_483_647`. It advances only the supplied live `rows<R>` generation and sends no additional SQL. The first rail shipped SQLite `Step` and PostgreSQL `BufferedFull`; the later PostgreSQL delivery ledger below adds `SingleRow` and `PortalBatch` without changing this common call. |
@@ -4515,6 +4519,10 @@ gaps without hiding either repair inside the streamed state-machine PR.
 The direct boundary is intentionally above the approximate 1,000-line checkpoint: splitting its
 rows-v3 formation, result-sequence consumer, and cleanup authority would leave a dormant
 producer/consumer chain and duplicate ownership and fail-closed proof, increasing integration risk.
+Prepared parity may also cross that checkpoint because statement-v3 formation, its guarded compiler
+bridges, and the conn/tx delivery owners are one safety closure. Splitting them would either publish a
+dormant resolver ABI or leave a callable delivery path without the malformed-HIR and retained-resolver
+proof that makes it sound.
 
 The exact cumulative application-callable surface after the direct and prepared rails is below;
 the staged boundary immediately after the declaration block fixes which PR publishes each part.

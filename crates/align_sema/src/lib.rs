@@ -30951,6 +30951,9 @@ impl<'a, 't> Checker<'a, 't> {
         if method == "bind_prepared" {
             return self.check_prepared_bind_op(args, expected, span);
         }
+        if method == "prepared_parameter_ordinal" {
+            return self.check_prepared_parameter_ordinal_op(args, expected, span);
+        }
         if matches!(method, "prepare_sqlite" | "prepare_postgres") {
             return self.check_prepare_dispatch_op(method, args, expected, span);
         }
@@ -31747,6 +31750,7 @@ impl<'a, 't> Checker<'a, 't> {
             ty: Ty::Raw,
             span: reference_ast.span,
         };
+        let guard_wrapper = wrapper.clone();
         let offset = Expr {
             kind: ExprKind::Int(24),
             ty: Ty::Int(IntTy {
@@ -31770,7 +31774,7 @@ impl<'a, 't> Checker<'a, 't> {
         self.constrain(ret, expected, span);
         Expr {
             kind: ExprKind::RawCall {
-                guard: None,
+                guard: Some(Box::new(Self::stmt_header_guard(guard_wrapper, span))),
                 callee: Box::new(callee),
                 args: vec![context, params],
                 param_tys: vec![Ty::Raw, params_ty],
@@ -31780,6 +31784,125 @@ impl<'a, 't> Checker<'a, 't> {
                 return_cleanup: hir::ReturnCleanupAbi::None,
             },
             ty: ret,
+            span,
+        }
+    }
+
+    /// D13 bridge from a concrete dependent statement to its retained producer-owned parameter
+    /// resolver. The same complete statement-v3 guard protects both this callback and the binder;
+    /// malformed HIR cannot turn an arbitrary raw field into a callable resolver.
+    fn check_prepared_parameter_ordinal_op(
+        &mut self,
+        args: &[ast::Expr],
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Expr {
+        let err = || Expr {
+            kind: ExprKind::Bool(false),
+            ty: Ty::Error,
+            span,
+        };
+        let [reference_ast, name_ast] = args else {
+            self.diags.error(
+                format!(
+                    "static descriptor operation 'prepared_parameter_ordinal' expects 2 argument(s), got {}",
+                    args.len()
+                ),
+                span,
+            );
+            return err();
+        };
+        let reference = self.check_expr(reference_ast, None);
+        let reference_ty = self.resolve(reference.ty);
+        let Ty::ResourceRef(resource) = reference_ty else {
+            if reference_ty != Ty::Error {
+                self.diags.error(
+                    format!(
+                        "prepared parameter lookup requires `resource_ref<db.stmt<P,R>>`, got {}",
+                        self.ty_display(reference_ty)
+                    ),
+                    reference_ast.span,
+                );
+            }
+            return err();
+        };
+        let valid = self.resource_instances.get(&resource).is_some_and(|instance| {
+            instance.canonical == "pkg.db$stmt" && instance.args.len() == 2
+        });
+        if !valid {
+            self.diags.error(
+                "prepared parameter lookup requires a concrete statement resource".to_owned(),
+                reference_ast.span,
+            );
+            return err();
+        }
+        let name = self.check_str_init(name_ast);
+        if name.ty == Ty::Error {
+            return err();
+        }
+        if !self.source_ty_matches(name.ty, Ty::Str) {
+            self.diags.error(
+                format!(
+                    "prepared parameter name must be `str`, got {}",
+                    self.ty_display(name.ty)
+                ),
+                name_ast.span,
+            );
+            return err();
+        }
+        let wrapper = Expr {
+            kind: ExprKind::ResourceRaw {
+                reference: Box::new(reference),
+                resource,
+            },
+            ty: Ty::Raw,
+            span: reference_ast.span,
+        };
+        let guard_wrapper = wrapper.clone();
+        let callee = Expr {
+            kind: ExprKind::RawPointerLoad {
+                ptr: Box::new(wrapper),
+                offset: Box::new(Expr {
+                    kind: ExprKind::Int(80),
+                    ty: Ty::Int(IntTy {
+                        bits: 64,
+                        signed: true,
+                    }),
+                    span,
+                }),
+            },
+            ty: Ty::Raw,
+            span,
+        };
+        let ret = Ty::Int(IntTy {
+            bits: 32,
+            signed: true,
+        });
+        self.constrain(ret, expected, span);
+        Expr {
+            kind: ExprKind::RawCall {
+                guard: Some(Box::new(Self::stmt_header_guard(guard_wrapper, span))),
+                callee: Box::new(callee),
+                args: vec![name],
+                param_tys: vec![Ty::Str],
+                param_modes: vec![ast::ParamMode::ByValue],
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
+                return_cleanup: hir::ReturnCleanupAbi::None,
+            },
+            ty: ret,
+            span,
+        }
+    }
+
+    fn stmt_header_guard(wrapper: Expr, span: Span) -> Expr {
+        Expr {
+            kind: ExprKind::Call {
+                func: "pkg.db.internal.resource$stmt_header_valid".to_owned(),
+                args: vec![wrapper],
+                type_args: Vec::new(),
+            },
+            ty: Ty::Bool,
             span,
         }
     }

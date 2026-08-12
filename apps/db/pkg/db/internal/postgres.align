@@ -975,21 +975,18 @@ pub fn prepare_prevalidated<P, R>(
     free_context(context)
     release_lease(state)
     owned_id := c_string(query_id)
-    binder := pkg.db.internal.descriptor.binder(statement)
-    row_validator := pkg.db.internal.descriptor.row_validator(statement)
-    stream_decoder := pkg.db.internal.descriptor.stream_decoder(statement)
-    batch_plan := pkg.db.internal.descriptor.batch_plan(statement)
     wrapper := pkg.db.internal.resource.new_stmt_state(
       DRIVER_POSTGRES,
       name,
       state,
-      binder,
+      pkg.db.internal.descriptor.binder(statement),
       owned_id,
       query_id.len(),
       deallocate,
-      row_validator,
-      stream_decoder,
-      batch_plan,
+      pkg.db.internal.descriptor.row_validator(statement),
+      pkg.db.internal.descriptor.stream_decoder(statement),
+      pkg.db.internal.descriptor.batch_plan(statement),
+      pkg.db.internal.descriptor.parameter_resolver(statement),
     )
     prepared: pkg.db.stmt<P, R> := match target {
       Conn(reference) => resource.from_raw_borrowed(wrapper, reference)
@@ -1007,7 +1004,8 @@ pub fn rows_stmt_prevalidated<P, R>(
   unsafe {
     statement_ref := resource.borrow(statement)
     wrapper := resource.raw(statement_ref)
-    if pkg.db.internal.resource.stmt_driver(wrapper) != DRIVER_POSTGRES {
+    if !pkg.db.internal.resource.stmt_header_valid(wrapper)
+      || pkg.db.internal.resource.stmt_driver(wrapper) != DRIVER_POSTGRES {
       return Err(invalid_descriptor_error())
     }
     id_pointer := pkg.db.internal.resource.stmt_query_id_pointer(wrapper)
@@ -1016,6 +1014,40 @@ pub fn rows_stmt_prevalidated<P, R>(
       return Err(invalid_descriptor_error())
     }
     timeout := common_options_valid(options, query_id)?
+    result: Result<pkg.db.rows<R>, pkg.db.Error> := rows_stmt_native_prevalidated(
+      params, statement, timeout, 0, 0,
+    )
+    return result
+  }
+}
+
+pub fn rows_stmt_native_prevalidated<P, R>(
+  params: P,
+  borrow mut statement: pkg.db.stmt<P, R>,
+  timeout: Option<i64>,
+  delivery: u8,
+  portal_max_rows: i32,
+) -> Result<pkg.db.rows<R>, pkg.db.Error> {
+  unsafe {
+    statement_ref := resource.borrow(statement)
+    wrapper := resource.raw(statement_ref)
+    if !pkg.db.internal.resource.stmt_header_valid(wrapper)
+      || pkg.db.internal.resource.stmt_driver(wrapper) != DRIVER_POSTGRES {
+      return Err(invalid_descriptor_error())
+    }
+    id_pointer := pkg.db.internal.resource.stmt_query_id_pointer(wrapper)
+    id_length := pkg.db.internal.resource.stmt_query_id_length(wrapper)
+    query_id: str := resource.view_from_raw(statement_ref, id_pointer, id_length) else {
+      return Err(invalid_descriptor_error())
+    }
+    if delivery > 2 || (delivery == 2 && portal_max_rows <= 0)
+      || (delivery != 2 && portal_max_rows != 0) {
+      return Err(invalid_query_error(
+        query_id,
+        "postgres.rows.delivery",
+        "invalid normalized PostgreSQL row delivery mode",
+      ))
+    }
     state := pkg.db.internal.resource.stmt_connection_state(wrapper)
     connection := postgres_connection(state)
     name := pkg.db.internal.resource.stmt_native(wrapper)
@@ -1040,6 +1072,54 @@ pub fn rows_stmt_prevalidated<P, R>(
       free_context(context)
       release_lease(state)
       return Err(failure)
+    }
+    if delivery == 1 || delivery == 2 {
+      mut deadline: i64 := -1
+      mut duration: i64 := -1
+      match timeout {
+        Some(value) => {
+          duration = value
+          match absolute_deadline(value, query_id) {
+            Err(error) => {
+              free_context(context)
+              release_lease(state)
+              return Err(error)
+            }
+            Ok(resolved) => { deadline = resolved }
+          }
+        }
+        None => {}
+      }
+      raw.store(context, 8, raw.null())
+      rows_wrapper := pkg.db.internal.resource.new_rows_state(
+        DRIVER_POSTGRES,
+        raw.null(),
+        wrapper,
+        context,
+        state,
+        pkg.db.internal.resource.stmt_row_validator(wrapper),
+        pkg.db.internal.resource.stmt_stream_decoder(wrapper),
+        id_pointer,
+        id_length,
+        false,
+        false,
+        false,
+        0,
+        pkg.db.internal.resource.stmt_batch_plan(wrapper),
+        delivery,
+        true,
+        portal_max_rows,
+        deadline,
+        duration,
+      )
+      start_prepared_stream(
+        query_id, delivery, portal_max_rows, state, connection, context, rows_wrapper,
+        name, deadline,
+      )?
+      output: pkg.db.rows<R> := resource.from_raw_borrowed(
+        rows_wrapper, resource.borrow(statement),
+      )
+      return Ok(output)
     }
     executed := prepared_execute_with_timeout(
       state, connection, name, context, timeout, query_id, PGRES_TUPLES_OK,
@@ -1096,6 +1176,63 @@ pub fn rows_stmt_prevalidated<P, R>(
       rows_wrapper, resource.borrow(statement),
     )
     return Ok(output)
+  }
+}
+
+pub fn start_prepared_stream(
+  query_id: str,
+  delivery: u8,
+  portal_max_rows: i32,
+  state: raw,
+  connection: raw,
+  context: raw,
+  rows_wrapper: raw,
+  name: raw,
+  deadline: i64,
+) -> Result<(), pkg.db.Error> {
+  unsafe {
+    if PQsetnonblocking(connection, 1) != 0 {
+      failure := connection_error(connection)
+      ignored := pkg.db.internal.resource.discard_unpublished_rows(rows_wrapper)
+      return Err(failure)
+    }
+    if deadline >= 0 && time.instant() >= deadline {
+      failure := timeout_error(connection, raw.null())
+      if PQsetnonblocking(connection, 0) != 0 {
+        pkg.db.internal.resource.poison_conn_state(state)
+      }
+      ignored := pkg.db.internal.resource.discard_unpublished_rows(rows_wrapper)
+      return Err(failure)
+    }
+    count: u32 := raw.load(context, 72)
+    values: raw := raw.load(context, 40)
+    lengths: raw := raw.load(context, 56)
+    formats: raw := raw.load(context, 64)
+    sent := PQsendQueryPrepared(
+      connection, name, count as i32, values, lengths, formats, 0,
+    )
+    if sent == 0 {
+      failure := connection_error(connection)
+      if PQsetnonblocking(connection, 0) != 0 {
+        pkg.db.internal.resource.poison_conn_state(state)
+      }
+      ignored := pkg.db.internal.resource.discard_unpublished_rows(rows_wrapper)
+      return Err(failure)
+    }
+    selected := if delivery == 1 {
+      PQsetSingleRowMode(connection)
+    } else { PQsetChunkedRowsMode(connection, portal_max_rows) }
+    if selected == 0 {
+      failure := invalid_query_error(
+        query_id,
+        "postgres.rows.delivery",
+        "PostgreSQL client rejected the selected row delivery mode",
+      )
+      ignored := pkg.db.internal.resource.cancel_rows(rows_wrapper, 2, 1000000000)
+      pkg.db.internal.resource.drop_rows(rows_wrapper)
+      return Err(failure)
+    }
+    return Ok(())
   }
 }
 

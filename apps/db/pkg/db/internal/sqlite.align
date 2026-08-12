@@ -554,21 +554,18 @@ pub fn prepare_prevalidated<P, R>(
       ))
     }
     owned_id := copy_bytes(query_id)
-    binder := pkg.db.internal.descriptor.binder(statement)
-    row_validator := pkg.db.internal.descriptor.row_validator(statement)
-    stream_decoder := pkg.db.internal.descriptor.stream_decoder(statement)
-    batch_plan := pkg.db.internal.descriptor.batch_plan(statement)
     wrapper := pkg.db.internal.resource.new_stmt_state(
       DRIVER_SQLITE,
       native,
       state,
-      binder,
+      pkg.db.internal.descriptor.binder(statement),
       owned_id,
       query_id.len(),
       raw.null(),
-      row_validator,
-      stream_decoder,
-      batch_plan,
+      pkg.db.internal.descriptor.row_validator(statement),
+      pkg.db.internal.descriptor.stream_decoder(statement),
+      pkg.db.internal.descriptor.batch_plan(statement),
+      pkg.db.internal.descriptor.parameter_resolver(statement),
     )
     raw.store(state, 20, 0 as u8)
     prepared: pkg.db.stmt<P, R> := match target {

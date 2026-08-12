@@ -26,7 +26,7 @@ invented exact counts here.
 
 | Root-cause key | Events | PRs | Prevention status |
 |---|---:|---:|---|
-| `validation-phase-completeness` | 9 | 4 | Recurred past the added owner (#727: static-validation-after-native-prepare; unvalidated v3 tail-reserved field). Required next: deduplicate the copied header validators into one shared function so an ABI version bump has one owner, and extend the parameterized phase-order owner across prepared/transaction paths. |
+| `validation-phase-completeness` | 10 | 5 | Recurred past the added owner (#727: static-validation-after-native-prepare; unvalidated v3 tail-reserved field; #770: batch layout checked after native advancement). Required next: deduplicate copied header validators into one shared function so an ABI version bump has one owner, and extend the parameterized phase-order owner across prepared/transaction paths. |
 | `cross-stage-abi-exactness` | 4 | 1 | Covered by Gate 4 and exact ABI owner matrices. |
 | `native-api-version-boundary` | 4 | 1 | Covered by Gate 2 plus version/conversion goldens. |
 | `ownership-allocation-owner` | 4 | 2 | Three-plus events: scalar fixed-array admission now routes through the canonical recursive `DropPlan`, with source and handcrafted-HIR owners rejecting every non-struct element that lacks per-element cleanup. Gates 1, 2, and 4 still require every allocation, Drop path, and thunk to have one named owner. |
@@ -34,7 +34,7 @@ invented exact counts here.
 | `native-link-order-closure` | 3 | 1 | Promoted: preserve caller order around the dependency closure and test arbitrary prefix/suffix libraries. |
 | `producer-evidence-propagation` | 1 | 1 | Watch; exact producer-to-consumer evidence owner required. |
 | `public-surface-completeness` | 2 | 2 | Promoted: compare the complete exported surface to the ledger and require an internal/sealed boundary for cross-module helpers. |
-| `operation-matrix-completeness` | 4 | 3 | Three-plus events: automation required. Add one parameterized dual-driver parity owner that runs the same descriptor/status/sentinel matrix through both drivers and asserts identical error-class mapping; also check native command tags (PostgreSQL answers `COMMIT` in an aborted transaction with `PGRES_COMMAND_OK` and a `ROLLBACK` tag). |
+| `operation-matrix-completeness` | 5 | 4 | Three-plus events: automation required. Add one parameterized dual-driver parity owner that runs the same descriptor/status/sentinel matrix through both drivers and asserts identical error-class mapping; also check native command tags (PostgreSQL answers `COMMIT` in an aborted transaction with `PGRES_COMMAND_OK` and a `ROLLBACK` tag), and retain failed rows state after every cleanup failure. |
 | `error-contract-identity` | 1 | 1 | Watch; pin error class, query identity, and precedence. |
 | `source-of-truth-drift` | 5 | 3 | Three-plus events: the mandatory ledger-to-diff extraction pass in `SKILL.md` is the owner — extract every `must`/`exact`/`every`/`before`/`reject`/`required` line from the touched design sections and point each at implementation or an explicit deferral. Re-read adjacent comments and counter documentation against behavior. A lexical lint is not sound here because the drift is semantic, so the extraction pass is mandatory rather than automated. |
 | `owner-test-topology` | 3 | 3 | Three-plus events: every named closure-matrix cell must have a direct owner whose witness is **mutation-verified against the pre-fix compiler**, not merely present; retain whole/per-unit owners when refactoring fixtures. A witness that counts something the defect does not duplicate (a `.clone()` outside the duplicated subtree) passes on the broken compiler and closes nothing. |
@@ -49,6 +49,7 @@ invented exact counts here.
 | `canonical-key-encoding` | 1 | 1 | Watch; variable key fields must use one length-delimited canonical encoder rather than ad hoc separators. |
 | `shared-artifact-concurrency` | 1 | 1 | Watch; retention derived from emitted files must fail closed when emissions overlap on one path. |
 | `performance-evidence-completeness` | 1 | 1 | Watch; measure the unaffected one-shot path before enabling a process-wide performance optimization by default. |
+| `historical-workflow-source-boundary` | 1 | 1 | Watch; a workflow that checks out an older tag must not assume newly added helper scripts exist in that historical source tree. |
 
 ## Event log
 
@@ -115,6 +116,9 @@ invented exact counts here.
 | #768 | `3c892f01` | P2 | `analysis-control-path-completeness` | Collapse the hand-written borrow-mode kind list into one authority gating both the dispatch and the eager-worklist filter. |
 | #768 | `3c892f01` | P2 | `owner-test-topology` | Cover the five borrow-transparent scope kinds and give the bound cells a witness that discriminates against the pre-fix compiler. |
 | #757 | `89aed25b` | P3 | `source-of-truth-drift` | Scope the test environment-lock safety comment to the isolation it actually proves. |
+| #770 | `4667cc8f` | P2 | `operation-matrix-completeness` | Retain failed rows state when clean-terminal synchronization or blocking restoration fails. |
+| #770 | `4667cc8f` | P2 | `validation-phase-completeness` | Validate batch fixed-layout representability before advancing the native stream. |
+| #770 | `4667cc8f` | P2 | `historical-workflow-source-boundary` | Keep libpq setup/version fallback available when rebuilding a tag that predates the new helper scripts. |
 
 ## Rejected claims
 

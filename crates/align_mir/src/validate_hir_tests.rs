@@ -12881,6 +12881,18 @@ fn delegated_ownership_and_shape_gates_agree_with_sema() {
 #[test]
 fn hir_body_validator_prepared_binder_bridge_fails_closed() {
     let mut program = baseline_program();
+    program.fns.push(body_test_parameter_function(
+        "pkg.db.internal.resource$stmt_header_valid",
+        Ty::Raw,
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::Bool(true),
+                Ty::Bool,
+            ))),
+        },
+        Ty::Bool,
+    ));
     let params = Ty::Struct(0);
     let statement_id = program.resources.len() as u32;
     program.resources.push(ResourceDef {
@@ -12913,6 +12925,14 @@ fn hir_body_validator_prepared_binder_bridge_fails_closed() {
         },
         Ty::Raw,
     );
+    let guard = body_test_expr(
+        hir::ExprKind::Call {
+            func: "pkg.db.internal.resource$stmt_header_valid".to_string(),
+            args: vec![wrapper.clone()],
+            type_args: Vec::new(),
+        },
+        Ty::Bool,
+    );
     let callee = body_test_expr(
         hir::ExprKind::RawPointerLoad {
             ptr: Box::new(wrapper),
@@ -12928,7 +12948,7 @@ fn hir_body_validator_prepared_binder_bridge_fails_closed() {
     );
     let call = body_test_expr(
         hir::ExprKind::RawCall {
-            guard: None,
+            guard: Some(Box::new(guard)),
             callee: Box::new(callee),
             args: vec![
                 body_test_expr(hir::ExprKind::Local(1), Ty::Raw),
@@ -13008,6 +13028,29 @@ fn hir_body_validator_prepared_binder_bridge_fails_closed() {
     }
     assert!(!body_core_metadata_is_valid(&wrong_offset));
 
+    let mut missing_guard = program.clone();
+    {
+        let expression = raw_call(&mut missing_guard);
+        let hir::ExprKind::RawCall { guard, .. } = &mut expression.kind else {
+            unreachable!()
+        };
+        *guard = None;
+    }
+    assert!(!body_core_metadata_is_valid(&missing_guard));
+
+    let mut forged_guard = program.clone();
+    {
+        let expression = raw_call(&mut forged_guard);
+        let hir::ExprKind::RawCall { guard, .. } = &mut expression.kind else {
+            unreachable!()
+        };
+        *guard = Some(Box::new(body_test_expr(
+            hir::ExprKind::Bool(true),
+            Ty::Bool,
+        )));
+    }
+    assert!(!body_core_metadata_is_valid(&forged_guard));
+
     let mut wrong_params_mode = program.clone();
     {
         let expression = raw_call(&mut wrong_params_mode);
@@ -13032,6 +13075,327 @@ fn hir_body_validator_prepared_binder_bridge_fails_closed() {
     wrong_resource_identity.resources[statement_id as usize].name =
         "pkg.db$stmt$S5_Other$S6_Record".to_string();
     assert!(!body_core_metadata_is_valid(&wrong_resource_identity));
+}
+
+#[test]
+fn hir_body_validator_prepared_parameter_resolver_bridge_fails_closed() {
+    let mut program = baseline_program();
+    program.fns.push(body_test_parameter_function(
+        "pkg.db.internal.resource$stmt_header_valid",
+        Ty::Raw,
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::Bool(true),
+                Ty::Bool,
+            ))),
+        },
+        Ty::Bool,
+    ));
+    let statement_id = program.resources.len() as u32;
+    program.resources.push(ResourceDef {
+        name: "pkg.db$stmt$S6_Record$S6_Record".to_string(),
+        source_name: "pkg.db$stmt$S6_Record$S6_Record".to_string(),
+        declaring_module: "pkg.db".to_string(),
+        generic_arity: 2,
+        drop_hook: "pkg.db.internal.resource$drop_stmt".to_string(),
+        drop_thunk: "__align_resource_drop$pkg.db$stmt$S6_Record$S6_Record".to_string(),
+        representation_version: 1,
+        drop_abi_fingerprint: *b"align-res-drop-1",
+    });
+    let statement = Ty::Resource(statement_id);
+    let statement_ref = Ty::ResourceRef(statement_id);
+    let i32_ty = Ty::Int(IntTy {
+        bits: 32,
+        signed: true,
+    });
+    let reference = body_test_expr(
+        hir::ExprKind::ResourceBorrow {
+            owner: Box::new(body_test_expr(hir::ExprKind::Local(0), statement)),
+            resource: statement_id,
+        },
+        statement_ref,
+    );
+    let wrapper = body_test_expr(
+        hir::ExprKind::ResourceRaw {
+            reference: Box::new(reference),
+            resource: statement_id,
+        },
+        Ty::Raw,
+    );
+    let guard = body_test_expr(
+        hir::ExprKind::Call {
+            func: "pkg.db.internal.resource$stmt_header_valid".to_string(),
+            args: vec![wrapper.clone()],
+            type_args: Vec::new(),
+        },
+        Ty::Bool,
+    );
+    let callee = body_test_expr(
+        hir::ExprKind::RawPointerLoad {
+            ptr: Box::new(wrapper),
+            offset: Box::new(body_test_expr(
+                hir::ExprKind::Int(80),
+                Ty::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                }),
+            )),
+        },
+        Ty::Raw,
+    );
+    let call = body_test_expr(
+        hir::ExprKind::RawCall {
+            guard: Some(Box::new(guard)),
+            callee: Box::new(callee),
+            args: vec![body_test_expr(hir::ExprKind::Local(1), Ty::Str)],
+            param_tys: vec![Ty::Str],
+            param_modes: vec![align_ast::ParamMode::ByValue],
+            return_borrow: ReturnBorrowSummary::None,
+            return_region: ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
+        },
+        i32_ty,
+    );
+    let mut function = body_test_named_function(
+        "pkg.db.internal.postgres$prepared_parameter_resolver_owner",
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::Unsafe(hir::Block {
+                    stmts: Vec::new(),
+                    value: Some(Box::new(call)),
+                }),
+                i32_ty,
+            ))),
+        },
+        vec![
+            body_test_local(0, "statement", statement, true, true),
+            body_test_local(1, "name", Ty::Str, false, true),
+        ],
+        i32_ty,
+    );
+    function.params = vec![0, 1];
+    function.param_modes = vec![
+        align_ast::ParamMode::BorrowMut,
+        align_ast::ParamMode::ByValue,
+    ];
+    program.fns.push(function);
+    assert!(body_core_metadata_is_valid(&program));
+
+    fn raw_call(candidate: &mut hir::Program) -> &mut hir::Expr {
+        let unsafe_expression = candidate
+            .fns
+            .last_mut()
+            .and_then(|function| function.body.value.as_deref_mut())
+            .expect("prepared resolver unsafe expression");
+        let hir::ExprKind::Unsafe(block) = &mut unsafe_expression.kind else {
+            panic!("prepared resolver unsafe block")
+        };
+        block
+            .value
+            .as_deref_mut()
+            .expect("prepared resolver raw call")
+    }
+
+    let mut wrong_offset = program.clone();
+    let hir::ExprKind::RawCall { callee, .. } = &mut raw_call(&mut wrong_offset).kind else {
+        unreachable!()
+    };
+    let hir::ExprKind::RawPointerLoad { offset, .. } = &mut callee.kind else {
+        unreachable!()
+    };
+    offset.kind = hir::ExprKind::Int(24);
+    assert!(!body_core_metadata_is_valid(&wrong_offset));
+
+    let mut missing_guard = program.clone();
+    let hir::ExprKind::RawCall { guard, .. } = &mut raw_call(&mut missing_guard).kind else {
+        unreachable!()
+    };
+    *guard = None;
+    assert!(!body_core_metadata_is_valid(&missing_guard));
+
+    let mut wrong_argument = program.clone();
+    let hir::ExprKind::RawCall { param_tys, .. } = &mut raw_call(&mut wrong_argument).kind else {
+        unreachable!()
+    };
+    param_tys[0] = Ty::Raw;
+    assert!(!body_core_metadata_is_valid(&wrong_argument));
+
+    let mut wrong_resource_identity = program;
+    wrong_resource_identity.resources[statement_id as usize].declaring_module = "app".to_string();
+    assert!(!body_core_metadata_is_valid(&wrong_resource_identity));
+}
+
+#[test]
+fn hir_body_validator_prepared_statement_formation_rejects_cross_query_splices() {
+    let mut program = baseline_program();
+    let first_query = program.structs.len() as u32;
+    for name in ["pkg.db$query$First", "pkg.db$query$Second"] {
+        program.structs.push(StructDef {
+            name: name.to_string(),
+            source_name: name.to_string(),
+            fields: vec![FieldDef {
+                name: align_sema::STATIC_DESCRIPTOR_DATA_FIELD.to_string(),
+                ty: Ty::Raw,
+            }],
+            align: None,
+            c_repr: false,
+        });
+    }
+    let u8_ty = Ty::Int(IntTy {
+        bits: 8,
+        signed: false,
+    });
+    let i64_ty = Ty::Int(IntTy {
+        bits: 64,
+        signed: true,
+    });
+    let constructor_types = [
+        u8_ty,
+        Ty::Raw,
+        Ty::Raw,
+        Ty::Raw,
+        Ty::Raw,
+        i64_ty,
+        Ty::Raw,
+        Ty::Raw,
+        Ty::Raw,
+        Ty::Raw,
+        Ty::Raw,
+    ];
+    let constructor_locals = constructor_types
+        .iter()
+        .enumerate()
+        .map(|(index, ty)| hir::Local {
+            id: index as u32,
+            name: format!("arg{index}"),
+            ty: *ty,
+            is_mut: false,
+            is_param: true,
+            align: None,
+        })
+        .collect::<Vec<_>>();
+    let mut constructor = body_test_named_function(
+        "pkg.db.internal.resource$new_stmt_state",
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::Unsafe(hir::Block {
+                    stmts: Vec::new(),
+                    value: Some(Box::new(body_test_expr(
+                        hir::ExprKind::RawNull,
+                        Ty::Raw,
+                    ))),
+                }),
+                Ty::Raw,
+            ))),
+        },
+        constructor_locals,
+        Ty::Raw,
+    );
+    constructor.params = (0..constructor_types.len() as u32).collect();
+    constructor.param_modes = vec![align_ast::ParamMode::ByValue; constructor_types.len()];
+    program.fns.push(constructor);
+    assert!(
+        validate_hir::body_only_metadata_is_valid(&program),
+        "constructor declaration fixture rejected",
+    );
+
+    let pointer = |root: u32, offset: i128| {
+        body_test_expr(
+            hir::ExprKind::RawPointerLoad {
+                ptr: Box::new(body_test_expr(
+                    hir::ExprKind::Field {
+                        root,
+                        path: vec![0],
+                    },
+                    Ty::Raw,
+                )),
+                offset: Box::new(body_test_expr(hir::ExprKind::Int(offset), i64_ty)),
+            },
+            Ty::Raw,
+        )
+    };
+    let raw_null = || body_test_expr(hir::ExprKind::RawNull, Ty::Raw);
+    let call = body_test_expr(
+        hir::ExprKind::Call {
+            func: "pkg.db.internal.resource$new_stmt_state".to_string(),
+            args: vec![
+                body_test_expr(hir::ExprKind::Int(2), u8_ty),
+                raw_null(),
+                raw_null(),
+                pointer(0, 64),
+                raw_null(),
+                body_test_expr(hir::ExprKind::Int(1), i64_ty),
+                raw_null(),
+                pointer(0, 80),
+                pointer(0, 120),
+                pointer(0, 128),
+                pointer(0, 104),
+            ],
+            type_args: Vec::new(),
+        },
+        Ty::Raw,
+    );
+    let mut owner = body_test_named_function(
+        "pkg.db.internal.postgres$prepared_statement_owner",
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::Unsafe(hir::Block {
+                    stmts: Vec::new(),
+                    value: Some(Box::new(call)),
+                }),
+                Ty::Raw,
+            ))),
+        },
+        vec![
+            body_test_local(0, "first", Ty::Struct(first_query), false, true),
+            body_test_local(1, "second", Ty::Struct(first_query + 1), false, true),
+        ],
+        Ty::Raw,
+    );
+    owner.params = vec![0, 1];
+    owner.param_modes = vec![
+        align_ast::ParamMode::ByValue,
+        align_ast::ParamMode::ByValue,
+    ];
+    program.fns.push(owner);
+    assert!(
+        body_core_metadata_is_valid(&program),
+        "formation fixture rejected: global={} placement={} nominal={} body={}",
+        validate_hir::global_type_metadata_is_valid(&program),
+        validate_hir::type_placement_metadata_is_valid(&program),
+        validate_hir::nominal_link_metadata_is_valid(&program),
+        validate_hir::body_only_metadata_is_valid(&program),
+    );
+
+    let mut spliced = program;
+    let unsafe_expression = spliced
+        .fns
+        .last_mut()
+        .and_then(|function| function.body.value.as_deref_mut())
+        .expect("statement formation unsafe expression");
+    let hir::ExprKind::Unsafe(block) = &mut unsafe_expression.kind else {
+        unreachable!()
+    };
+    let hir::ExprKind::Call { args, .. } = &mut block
+        .value
+        .as_deref_mut()
+        .expect("statement formation call")
+        .kind
+    else {
+        unreachable!()
+    };
+    let hir::ExprKind::RawPointerLoad { ptr, .. } = &mut args[10].kind else {
+        unreachable!()
+    };
+    let hir::ExprKind::Field { root, .. } = &mut ptr.kind else {
+        unreachable!()
+    };
+    *root = 1;
+    assert!(!body_core_metadata_is_valid(&spliced));
 }
 
 #[test]

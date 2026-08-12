@@ -2913,6 +2913,9 @@ MoveCheck/EscapeCheck/emitted HIR/MIR/codegen前に通常のSoA field ruleを再
 emitted HIR/MIRへ到達しない。non-`SoaPlain` Rowは他のbatch operationを使えるが`batch_soa`は
 compile-time rejectされ、runtime downgradeしない。
 
+このfirst-batch ledgerのstatement-v2/rows-v2 ABI entryは、そのlanding boundaryを記述する。
+cumulative current recordは後続PostgreSQL delivery ledger §23が固定するstatement-v3/rows-v3である。
+
 | Public record | Exact contract |
 |---|---|
 | input/default | `max_rows`はdefaultなしで`1..=2_147_483_647`。supplied live `rows<R>`だけをadvanceし、追加SQLをsendしない。first railはSQLite `Step`とPostgreSQL `BufferedFull`をshipし、後続delivery ledgerがcommon callを変えず`SingleRow`/`PortalBatch`を追加する。 |
@@ -2979,6 +2982,9 @@ parameter-name authorityを追加する。各prerequisiteはindependently useful
 direct boundaryが約1,000行のcheckpointを超えるのは意図的である。rows-v3 formation、result-sequence
 consumer、cleanup authorityを分割するとdormant producer/consumer chainが残り、ownershipと
 fail-closed proofが重複してintegration riskが高くなる。
+prepared parityもstatement-v3 formation、guarded compiler bridge、conn/tx delivery ownerを1 safety
+closureとして扱うため、このcheckpointを超え得る。分割するとdormant resolver ABIをpublishするか、
+malformed-HIRとretained-resolver proofを欠くcallable delivery pathを残すことになる。
 
 direct/prepared rail完了後のexact cumulative application-callable surfaceを次に示す。各宣言を
 どのPRがpublishするかは直後のstaged boundaryが固定する。
