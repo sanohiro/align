@@ -4834,7 +4834,15 @@ fn link_objects_inner(objs: &[&std::path::Path], exe: &std::path::Path, link_lib
     let format = target_object_format()?;
     let runtime = runtime_archive()?;
     let ordered_link_libs = order_link_libs(link_libs);
+    // Which linker `cc` drives (build-perf track item 2, `docs/impl/21-build-perf-plan.md`). ELF
+    // only, and correctness-neutral: `ld.lld` produces the same fully optimized image the system
+    // linker does, just faster. Resolved before any argv is built so a requested-but-missing lld
+    // fails before the link starts.
+    let linker = select_linker(format)?;
     let mut cmd = std::process::Command::new("cc");
+    // Linker selection first in argv: these are `cc` driver options (position-independent), and
+    // putting them ahead of the inputs keeps a dumped command readable.
+    cmd.args(linker.cc_flags());
     for obj in objs {
         cmd.arg(obj);
     }
@@ -4897,7 +4905,7 @@ fn link_objects_inner(objs: &[&std::path::Path], exe: &std::path::Path, link_lib
         .status()
         .map_err(|e| format!("cannot launch cc: {e}"))?;
     if !status.success() {
-        return Err(link_failure_message(status.code(), &ordered_link_libs));
+        return Err(link_failure_message(status.code(), &ordered_link_libs, &linker));
     }
     // Mach-O strip: ld64 has no `--strip-all`, so the size profiles run the external `strip` on the
     // linked image. `strip` ships with the same Xcode CLT as the `cc`/`ld` above (the existing
@@ -4936,23 +4944,197 @@ fn support_libs(format: ObjectFormat) -> &'static [&'static str] {
     }
 }
 
+/// The environment override for linker selection (see [`select_linker`]). One variable, two values,
+/// no other knob: `system` pins the C driver's own default linker, `lld` demands `ld.lld` and fails
+/// the link when it cannot be found. Unset is the automatic policy.
+const LINKER_ENV: &str = "ALIGN_LINKER";
+
+/// The `-fuse-ld=` name and `-B` file name of LLVM's ELF linker. GCC's `collect2` and Clang both
+/// resolve `-fuse-ld=lld` by looking for a program spelled exactly `ld.lld`; a version-suffixed
+/// `ld.lld-22` on `PATH` is NOT usable through that mechanism, which is why discovery below looks
+/// for a *directory containing this exact name* rather than for any lld binary.
+const LLD_EXE: &str = "ld.lld";
+
+/// Which linker the C driver (`cc`) is told to run for a link ([`link_objects_inner`]).
+///
+/// Build-perf track item 2 (`docs/impl/21-build-perf-plan.md`): `ld.lld` is substantially faster
+/// than GNU `ld` on ELF and ships inside the LLVM 22 toolchain `alignc` already requires, so it
+/// needs no new dependency. `mold` was rejected: it is an extra third-party install and has no
+/// macOS support at all. The choice is **correctness-neutral** — the same objects, the same
+/// hygiene flags, the same fully optimized image (the track's "output is always fully optimized"
+/// principle is about optimization level, and the linker changes none of it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Linker {
+    /// The C driver's own default: GNU `ld`/`ld.gold` on ELF, `ld64`/`ld-prime` on Mach-O. The
+    /// behavior every Align build had before item 2, and still the behavior on macOS.
+    System,
+    /// LLVM's `ld.lld`, held as the *directory* that contains it (see [`Linker::cc_flags`]).
+    Lld(std::path::PathBuf),
+}
+
+impl Linker {
+    /// The `cc` driver flags that select this linker.
+    ///
+    /// `-fuse-ld=lld` alone is not enough and is actively unsafe: with GCC it makes `collect2`
+    /// search `COMPILER_PATH` and `PATH` for `ld.lld`, and when only apt's version-suffixed
+    /// `ld.lld-22` is installed the link does not fall back — it dies with
+    /// `collect2: fatal error: cannot find 'ld'`. `-B<dir>` puts the resolved LLVM `bin` directory
+    /// on `COMPILER_PATH`, so both GCC and Clang resolve the exact binary discovery found.
+    /// (`--ld-path=<abs>` would be more direct but is a Clang-only option; `cc` is GCC on the
+    /// Debian/Ubuntu hosts this targets, and it rejects the flag outright.)
+    ///
+    /// `-B<dir>` also prepends `<dir>` to the startfile and library search paths. That is harmless
+    /// and deliberate: the only directories this can name are LLVM toolchain `bin` directories,
+    /// which hold no `crt*.o` and no `lib*` — and it stays visible in the link command rather than
+    /// mutating the child's environment behind the caller's back (Nothing hidden).
+    fn cc_flags(&self) -> Vec<String> {
+        match self {
+            Linker::System => Vec::new(),
+            Linker::Lld(dir) => vec![format!("-B{}", dir.display()), "-fuse-ld=lld".to_string()],
+        }
+    }
+
+    /// How this linker is named in a diagnostic ([`link_failure_message`]).
+    fn describe(&self) -> String {
+        match self {
+            Linker::System => "system default".to_string(),
+            Linker::Lld(dir) => format!("lld ({})", dir.join(LLD_EXE).display()),
+        }
+    }
+}
+
+/// Pick the linker for an object format, honoring the [`LINKER_ENV`] override.
+///
+/// Policy, in one place:
+///
+///  - **Mach-O is never touched.** Apple's linker (`ld-prime`, Xcode 15+) is already fast, and a
+///    second linker on macOS would be a behavior difference for no measured gain. An explicit
+///    `ALIGN_LINKER=lld` there is a hard error, not a silent no-op — an explicit request must never
+///    be quietly ignored.
+///  - **ELF, unset:** use `ld.lld` when [`lld_bin_dir`] finds one, else the system linker. This
+///    fail-open default is safe precisely because the choice is correctness-neutral: a host without
+///    lld links exactly as it did before, at the old speed, with no diagnostic to act on.
+///  - **ELF, `lld`:** fail closed when no `ld.lld` is found. This is the knob CI and a measurement
+///    run use to prove lld was actually selected rather than silently skipped.
+///  - **`system`:** the escape hatch, valid on every format.
+///
+/// Determinism: for one host, one `alignc` binary, and one `PATH`, the answer is always the same —
+/// the search order below is total and the discovery result is memoized per process.
+fn select_linker(format: ObjectFormat) -> Result<Linker, String> {
+    select_linker_with(format, std::env::var_os(LINKER_ENV).as_deref().map(|v| v.to_string_lossy().into_owned()), lld_bin_dir)
+}
+
+/// [`select_linker`] with the environment request and the discovery step as parameters (unit
+/// testable without mutating process state or depending on what the host has installed).
+fn select_linker_with(
+    format: ObjectFormat,
+    request: Option<String>,
+    discover: impl FnOnce() -> Option<std::path::PathBuf>,
+) -> Result<Linker, String> {
+    match request.as_deref() {
+        Some("system") => Ok(Linker::System),
+        Some("lld") => {
+            if format != ObjectFormat::Elf {
+                return Err(format!(
+                    "{LINKER_ENV}=lld is only supported for ELF targets; this build targets Mach-O, \
+                     whose linking always uses the Apple toolchain linker"
+                ));
+            }
+            discover().map(Linker::Lld).ok_or_else(|| {
+                format!(
+                    "{LINKER_ENV}=lld was requested but no `{LLD_EXE}` was found\n\
+                     note: searched $LLVM_SYS_221_PREFIX/bin, `llvm-config --bindir`, then PATH\n\
+                     note: on Debian/Ubuntu install the lld-{} package, or unset {LINKER_ENV} to \
+                     link with the system linker",
+                    align_codegen_llvm::LLVM_TOOL_VERSION
+                )
+            })
+        }
+        Some(other) => Err(format!("{LINKER_ENV} must be `system` or `lld` (got `{other}`)")),
+        // Automatic: ELF prefers lld when present, everything else keeps the system linker.
+        None if format == ObjectFormat::Elf => Ok(discover().map_or(Linker::System, Linker::Lld)),
+        None => Ok(Linker::System),
+    }
+}
+
+/// The directory holding an `ld.lld` for this compiler's LLVM, memoized for the process.
+///
+/// Memoized because the search can spawn `llvm-config` and walk `PATH`, while a multi-object or
+/// multi-run build asks repeatedly and the answer cannot change mid-process. The *override* is
+/// deliberately NOT memoized — only this filesystem probe is — so a caller that sets
+/// [`LINKER_ENV`] between links still gets what it asked for.
+fn lld_bin_dir() -> Option<std::path::PathBuf> {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        lld_dir_from_prefix(option_env!("LLVM_SYS_221_PREFIX"))
+            .or_else(lld_dir_from_llvm_config)
+            .or_else(|| lld_dir_from_path(std::env::var_os("PATH").as_deref()))
+    })
+    .clone()
+}
+
+/// Search step 1: `<prefix>/bin/ld.lld` for the build-time LLVM prefix — the same compile-time
+/// `LLVM_SYS_221_PREFIX` seam [`llvm_tool`] uses, so the linker version always matches the LLVM the
+/// compiler was built against. A stale baked-in path (prefix moved since the build) falls through.
+fn lld_dir_from_prefix(prefix: Option<&str>) -> Option<std::path::PathBuf> {
+    let dir = std::path::Path::new(prefix?).join("bin");
+    dir.join(LLD_EXE).exists().then_some(dir)
+}
+
+/// Search step 2: `llvm-config --bindir`. Covers an installed `alignc` whose baked prefix is gone,
+/// and the apt.llvm.org layout where `ld.lld` lives in `/usr/lib/llvm-22/bin` and only the suffixed
+/// `ld.lld-22` is on `PATH`. The versioned tool name is tried first so a host with several LLVMs
+/// resolves the one this compiler matches.
+fn lld_dir_from_llvm_config() -> Option<std::path::PathBuf> {
+    let versioned = format!("llvm-config-{}", align_codegen_llvm::LLVM_TOOL_VERSION);
+    for tool in [versioned.as_str(), "llvm-config"] {
+        let Ok(out) = std::process::Command::new(tool).arg("--bindir").output() else { continue };
+        if !out.status.success() {
+            continue;
+        }
+        let bindir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if bindir.is_empty() {
+            continue;
+        }
+        let dir = std::path::PathBuf::from(bindir);
+        if dir.join(LLD_EXE).exists() {
+            return Some(dir);
+        }
+    }
+    None
+}
+
+/// Search step 3: the first `PATH` entry that contains a program spelled exactly `ld.lld`. Empty
+/// entries are skipped rather than resolved against the current directory — a build must never pick
+/// up a linker from whatever directory it happens to run in.
+fn lld_dir_from_path(path_var: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
+    std::env::split_paths(path_var?).find(|dir| !dir.as_os_str().is_empty() && dir.join(LLD_EXE).exists())
+}
+
 /// The gated capability libraries (`align_mir::Capability`): the ones a system commonly does NOT
 /// ship in the default linker search path, so a link failure involving them gets a `LIBRARY_PATH`
 /// hint appended ([`link_failure_message`]).
 const GATED_LIBS: [&str; 4] = ["z", "zstd", "crypto", "ssl"];
 
-/// The link-failure error. When the failed link involved a gated capability library, append a note
-/// about non-default library prefixes: those libraries often live outside the default search path
-/// (e.g. Homebrew keg-only OpenSSL on macOS), and the fix is the standard `LIBRARY_PATH` mechanism.
-/// The driver never injects search paths itself — what is linked, and from where, stays visible
-/// (Nothing hidden).
-fn link_failure_message(code: Option<i32>, link_libs: &[String]) -> String {
-    let mut msg = format!("link failed (cc exit code {code:?})");
+/// The link-failure error. Always names the linker that ran: the selection is automatic, so a
+/// failure that only a particular linker produces is otherwise invisible, and the reader needs to
+/// know whether to retry with `ALIGN_LINKER=system`. When the failed link involved a gated
+/// capability library, append a note about non-default library prefixes: those libraries often live
+/// outside the default search path (e.g. Homebrew keg-only OpenSSL on macOS), and the fix is the
+/// standard `LIBRARY_PATH` mechanism. The driver never injects search paths itself — what is
+/// linked, and from where, stays visible (Nothing hidden).
+fn link_failure_message(code: Option<i32>, link_libs: &[String], linker: &Linker) -> String {
+    let mut msg = format!("link failed (cc exit code {code:?}, linker: {})", linker.describe());
     if link_libs.iter().any(|l| GATED_LIBS.contains(&l.as_str())) {
         msg.push_str(
             "\nnote: libraries in a non-default prefix (e.g. Homebrew keg-only) are found via \
              LIBRARY_PATH, e.g. LIBRARY_PATH=/opt/homebrew/lib:/opt/homebrew/opt/openssl@3/lib",
         );
+    }
+    if matches!(linker, Linker::Lld(_)) {
+        msg.push_str(&format!(
+            "\nnote: this link used lld; set {LINKER_ENV}=system to link with the system linker instead"
+        ));
     }
     msg
 }
@@ -5349,13 +5531,113 @@ mod tests {
     #[test]
     fn link_failure_message_hints_library_path_only_for_gated_libs() {
         // No gated library involved → the plain error, no note.
-        let plain = link_failure_message(Some(1), &["m".to_string()]);
+        let plain = link_failure_message(Some(1), &["m".to_string()], &Linker::System);
         assert!(plain.starts_with("link failed"));
         assert!(!plain.contains("LIBRARY_PATH"), "no hint without a gated lib:\n{plain}");
         // A gated library (Homebrew keg-only class) → the LIBRARY_PATH hint is appended.
-        let hinted = link_failure_message(Some(1), &["z".to_string(), "ssl".to_string()]);
+        let hinted = link_failure_message(Some(1), &["z".to_string(), "ssl".to_string()], &Linker::System);
         assert!(hinted.contains("LIBRARY_PATH"), "gated libs get the hint:\n{hinted}");
         assert!(hinted.contains("/opt/homebrew/opt/openssl@3/lib"), "hint shows an example path:\n{hinted}");
+    }
+
+    /// The linker that ran is always named, and an lld link additionally offers the one escape
+    /// hatch — a failure the system linker would not have produced must be actionable.
+    #[test]
+    fn link_failure_message_names_the_linker() {
+        let system = link_failure_message(Some(1), &[], &Linker::System);
+        assert!(system.contains("linker: system default"), "{system}");
+        assert!(!system.contains("ALIGN_LINKER"), "no escape hatch to offer:\n{system}");
+
+        let lld = link_failure_message(Some(1), &[], &Linker::Lld("/usr/lib/llvm-22/bin".into()));
+        assert!(lld.starts_with("link failed"), "{lld}");
+        assert!(lld.contains("linker: lld (/usr/lib/llvm-22/bin/ld.lld)"), "{lld}");
+        assert!(lld.contains("ALIGN_LINKER=system"), "the escape hatch is named:\n{lld}");
+    }
+
+    /// `-B<dir>` + `-fuse-ld=lld`, in that order, and nothing at all for the system linker — a
+    /// system-linker build must be argv-identical to the pre-item-2 driver.
+    #[test]
+    fn linker_flags_are_pinned() {
+        assert_eq!(Linker::System.cc_flags(), Vec::<String>::new());
+        assert_eq!(
+            Linker::Lld("/usr/lib/llvm-22/bin".into()).cc_flags(),
+            ["-B/usr/lib/llvm-22/bin", "-fuse-ld=lld"]
+        );
+    }
+
+    /// The full override × format × availability matrix for [`select_linker_with`].
+    #[test]
+    fn linker_selection_matrix() {
+        let dir = std::path::PathBuf::from("/opt/llvm/bin");
+        let found = || Some(dir.clone());
+        let missing = || None;
+
+        // Unset + ELF: lld when present, system when not (fail-open; the output is identical).
+        assert_eq!(select_linker_with(ObjectFormat::Elf, None, found), Ok(Linker::Lld(dir.clone())));
+        assert_eq!(select_linker_with(ObjectFormat::Elf, None, missing), Ok(Linker::System));
+        // Unset + Mach-O: never lld, even when an `ld.lld` is installed. macOS is unchanged.
+        assert_eq!(select_linker_with(ObjectFormat::MachO, None, found), Ok(Linker::System));
+
+        // `system`: the system linker on every format.
+        let system = Some("system".to_string());
+        assert_eq!(select_linker_with(ObjectFormat::Elf, system.clone(), found), Ok(Linker::System));
+        assert_eq!(select_linker_with(ObjectFormat::MachO, system, found), Ok(Linker::System));
+
+        // `lld` + ELF: honored when found, a hard error when not (fail-closed, so a CI or
+        // measurement run cannot silently fall back to the system linker).
+        let lld = Some("lld".to_string());
+        assert_eq!(select_linker_with(ObjectFormat::Elf, lld.clone(), found), Ok(Linker::Lld(dir.clone())));
+        let err = select_linker_with(ObjectFormat::Elf, lld.clone(), missing).unwrap_err();
+        assert!(err.contains("no `ld.lld` was found"), "{err}");
+        assert!(err.contains("lld-22"), "the install hint names the versioned package:\n{err}");
+
+        // `lld` + Mach-O: an explicit request is refused, never silently ignored.
+        let err = select_linker_with(ObjectFormat::MachO, lld, found).unwrap_err();
+        assert!(err.contains("only supported for ELF"), "{err}");
+
+        // Anything else is a hard error on both formats: an unrecognized value must not degrade
+        // into the default policy.
+        for format in [ObjectFormat::Elf, ObjectFormat::MachO] {
+            let err = select_linker_with(format, Some("mold".to_string()), found).unwrap_err();
+            assert!(err.contains("must be `system` or `lld`"), "{err}");
+            assert!(err.contains("got `mold`"), "{err}");
+        }
+    }
+
+    /// The two pure discovery steps. Step 2 (`llvm-config --bindir`) spawns a process and depends on
+    /// what the host installed, so the chain order is documented on [`lld_bin_dir`] and only the
+    /// host-independent steps are pinned here.
+    #[test]
+    fn lld_discovery_steps() {
+        let root = std::env::temp_dir().join(format!(
+            "align-driver-lld-{}-{:p}",
+            std::process::id(),
+            &0u8 as *const _
+        ));
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).expect("create temp prefix");
+
+        // 1. A prefix without `ld.lld` does not match, even though the prefix itself exists: a host
+        //    with LLVM but no lld package must fall through, not name a nonexistent linker.
+        assert_eq!(lld_dir_from_prefix(Some(&root.to_string_lossy())), None);
+        assert_eq!(lld_dir_from_prefix(None), None);
+        std::fs::write(bin.join(LLD_EXE), b"").unwrap();
+        assert_eq!(lld_dir_from_prefix(Some(&root.to_string_lossy())), Some(bin.clone()));
+
+        // 2. PATH: the first entry that holds an `ld.lld` wins, an empty entry is never resolved
+        //    against the current directory, and a suffixed `ld.lld-22` does not count (`-fuse-ld`
+        //    cannot address it).
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let suffixed = root.join("suffixed");
+        std::fs::create_dir_all(&suffixed).unwrap();
+        std::fs::write(suffixed.join("ld.lld-22"), b"").unwrap();
+        let path = std::env::join_paths([std::path::PathBuf::new(), suffixed, empty.clone(), bin.clone()]).unwrap();
+        assert_eq!(lld_dir_from_path(Some(&path)), Some(bin));
+        assert_eq!(lld_dir_from_path(Some(&std::env::join_paths([empty]).unwrap())), None);
+        assert_eq!(lld_dir_from_path(None), None);
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

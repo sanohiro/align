@@ -33,7 +33,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       ALIGN_APT_PACKAGES: >-
-        llvm-22-dev clang-22 libclang-rt-22-dev
+        llvm-22-dev clang-22 libclang-rt-22-dev lld-22
         libssl-dev zlib1g-dev libzstd-dev
 
     steps:

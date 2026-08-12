@@ -23,9 +23,13 @@
 # Only ALIGN_APT_PACKAGES and their dependency closure are installed. This is
 # load bearing, not tidiness. The script used to run apt.llvm.org's llvm.sh,
 # whose built-in list is `clang-N lldb-N lld-N clangd-N`; nothing in this
-# repository uses lldb, lld, or clangd (the driver links with `cc` and shells
-# out to `clang-22` only for the PGO profile runtime and the IR comparison
-# test). Installing lldb-22 dragged in python3-lldb-22, which Conflicts with
+# repository uses lldb or clangd (the driver shells out to `clang-22` only for
+# the PGO profile runtime and the IR comparison test), and lld-N joined the
+# list only once it had a real consumer: `alignc` now drives `cc` with
+# `-fuse-ld=lld` on ELF when it can resolve an `ld.lld`, so without lld-22 the
+# Linux jobs would silently link at the old speed (build-perf track item 2,
+# docs/impl/21-build-perf-plan.md). Installing lldb-22, by contrast, dragged in
+# python3-lldb-22, which Conflicts with
 # the unversioned `python3-lldb-x.y` that the runner image's preinstalled
 # python3-lldb-18 provides, so apt satisfied the request by *removing* lldb-18
 # and python3-lldb-18. `dpkg --install` can never perform a removal, so the

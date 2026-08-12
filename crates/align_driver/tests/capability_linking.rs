@@ -176,15 +176,19 @@ fn crypto_binary_links_the_superset_and_not_ssl() {
         return;
     }
     let Some(readobj) = llvm_readobj() else { return };
-    // Mirrors `crypto_requests_crypto_and_the_compress_libs` at the binary level: the single-member
-    // runtime co-locates crypto with compress, so dead-code removal cannot drop the compress
-    // libraries once crypto is used — the dependencies must show libcrypto + libz + libzstd, but
-    // not libssl (which only the HTTPS client path pulls in).
+    // Mirrors `crypto_requests_crypto_and_the_compress_libs` at the binary level: the capability
+    // closure passes `-lcrypto -lz -lzstd` (the single-member runtime co-locates crypto with
+    // compress), and the *called* engine must survive to the dependency list while libssl — which
+    // only the HTTPS client path pulls in — is never passed at all and so can never appear.
+    //
+    // libz/libzstd are deliberately NOT asserted either way. Whether an unused passed library
+    // becomes a `DT_NEEDED` is an `--as-needed` precision difference between linkers, not a
+    // contract: GNU `ld` records both here, `ld.lld` records neither because dead-section removal
+    // left no live reference to them (`docs/impl/21-build-perf-plan.md` item 2). Pinning either
+    // answer would pin the linker instead of the capability mapping.
     let src = "import std.crypto\nfn main() -> Result<(), Error> {\n  h := crypto.sha256(\"hi\")\n  print(h.len() as i64)\n  return Ok(())\n}\n";
     let exe = build_exe("cap-bin-crypto", src);
     let libs = needed_libs(&readobj, &exe.exe);
     assert!(libs.iter().any(|l| is_lib(l, "crypto")), "crypto binary must link libcrypto, got {libs:?}");
-    assert!(libs.iter().any(|l| is_lib(l, "z")), "crypto binary must link libz, got {libs:?}");
-    assert!(libs.iter().any(|l| is_lib(l, "zstd")), "crypto binary must link libzstd, got {libs:?}");
     assert!(!libs.iter().any(|l| is_lib(l, "ssl")), "crypto binary must not link libssl, got {libs:?}");
 }
