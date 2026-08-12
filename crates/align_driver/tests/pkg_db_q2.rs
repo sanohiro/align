@@ -514,7 +514,6 @@ pub fn run() -> i32 {
       && byte_at(binary, 1) == 15
       && byte_at(binary, 2) == 16
       && byte_at(binary, 3) == 255
-      && byte_at(binary, 4) == 0
     pkg.db.internal.postgres.free_bytea_buffer(text)
     pkg.db.internal.postgres.free_bytea_buffer(binary)
     if text_ok && binary_ok { return 42 }
@@ -1446,7 +1445,7 @@ fn main(args: array<str>) -> Result<(), Error> {
 const LAYER1_FINGERPRINT_GOLDEN: &str = "\
 pkg-db-q2-common-postgres a9428d3064bd4bbe
 pkg-db-q2-inherited-environment e683f9105f9dc29b
-pkg-db-q2-postgres-bytea 79d1dc83bbf8957c
+pkg-db-q2-postgres-bytea 5ed11aecc1521c4c
 pkg-db-q2-postgres-connect-options 656bca47d6e7057a
 pkg-db-q2-postgres-native-scalar c09ae5eb7915a814
 pkg-db-q2-postgres-nul 8917c451b60242e7

@@ -140,9 +140,9 @@ pub fn bytea_binary_length(value: slice<u8>) -> i64 = value.len()
 pub fn encode_bytea_binary(value: slice<u8>) -> raw {
   unsafe {
     length := value.len()
-    // Keep a non-null allocation for an empty binary value while preserving the
-    // explicit zero length passed to libpq. The sentinel is outside the
-    // recorded byte range.
+    // Nonempty binary values own exactly their recorded payload bytes. Keep a
+    // one-byte sentinel only for an empty value so its pointer remains non-null
+    // while libpq still receives the explicit zero length.
     pointer := raw.alloc(if length == 0 { 1 } else { length })
     mut index := 0
     loop {
