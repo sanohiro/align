@@ -3602,8 +3602,10 @@ explicit finish/abortまたはDropによるparent fail-closeまで、sibling Que
 metadata/EXPLAIN/COPY/transaction boundary/cleanup pathはlibpq callを発行できない。compilerのordinary
 `resource.from_raw_borrowed` provenanceがrelationshipをownし、`pkg.db`-specific compiler ruleはない。
 
-successful startはexactly one 80-byte、8-aligned package transfer recordをallocateする。parameter
-format planとexecution-owned parameter payloadはstart functionがreturnする前にreleaseする。libpqは
+successful startはexactly one 176-byte、8-aligned package ownerをallocateする。package-only 96-byte
+trusted owner headerの直後にpublic-operation 80-byte transfer recordが続く。resource raw pointerは
+transfer recordを指すためordinary package/compiler-private operationからnegative-offset headerへ届かない。
+parameter format planとexecution-owned parameter payloadはstart functionがreturnする前にreleaseする。libpqは
 parameter call boundaryでconsume済みで、COPY resourceは`Params` ownerをretainしない。descriptorの
 static Query-ID bytesはimmutable descriptor storageからborrowし、copy/freeしない。success constructionは
 error valueをallocateしない。
@@ -3614,7 +3616,8 @@ pointer/lengthを`PQputCopyData`へ渡し、package allocation、sentinel append
 意味がないためzero libpq callのexact successful no-opである。
 
 positive `PQgetCopyData` resultごとにactive `copy_out`へdependentなone `copy_chunk`を作る。
-resourceはnon-null libpq allocationとone 24-byte、8-aligned package wrapperをownする。
+resourceはnon-null libpq allocationとone 64-byte、8-aligned package ownerをownする。hidden 40-byte
+trusted owner headerの後にresourceがaddressする24-byte operation recordが続く。
 `copy_chunk_bytes`はpositive returned length exactのzero-copy `slice<u8>` viewで、trailing libpq NULは
 view外である。chunk Dropは`PQfreemem`とwrapper freeをexactly once行う。dependent chunkまたはviewが
 liveな間は、compilerが別mutable `copy_out` operation、finish、abort、move、Dropをrejectする。
@@ -3639,6 +3642,25 @@ caller text、ambient encoding、embedded NULはこのFFI boundaryをcrossしな
 ##### Exact private ABIとformation boundary
 
 両transfer resourceはone canonical v1 byte recordを使い、directionはdataでlayoutをcopyしない:
+
+containing 96-byte owner headerはexact package-only shapeを持つ:
+
+```text
+size 96, alignment 8; resource raw pointer = owner base + 96
+offset  size  field
+0       8     magic = 0x414c435054524e31
+8       8     exact transfer-record self pointer
+16      80    trusted byte-for-byte shadow of the transfer record below
+```
+
+headerを書くのはpackage constructor/transition helperだけである。every operationはduplicated
+fieldをtrustする前に80-byte recordをindependently retained shadowとcompareする。one transition helperが
+shadow+operation recordをsame complete next-state imageへupdateし、independent partial writerはない。
+Drop hookはresource pointerからfixed negative offsetでheaderをderiveし、cleanupにはheaderの
+shadow state/PGconn/phase/flagだけを使う。そのためcorrupt operation-record byteをdereference/native targetにせず
+Active close、Complete/FailedSynced lease release、FailedClosed cleanupを行える。application codeはsafe/
+compiler-private public surfaceからheaderをconstruct/mutateできない。arbitrary forged raw resourceはexplicit
+`unsafe` memory-corruption boundaryでありrecoverable package inputではない。
 
 ```text
 size 80, alignment 8
@@ -3673,7 +3695,18 @@ read/libpq call前にcomplete record、direction、phase、deadline pair、flags
 agreement、Query-ID view、completion pairをvalidateする。one internal validatorがconstructor/accessor/
 operation/both Drop hookをownする。
 
-`copy_chunk`はone v1 recordを使う:
+`copy_chunk`はhidden 40-byte trusted owner header+one v1 operation recordを使う:
+
+```text
+size 40, alignment 8; resource raw pointer = owner base + 40
+offset  size  field
+0       8     magic = 0x414c435043484e31
+8       8     exact chunk-record self pointer
+16      8     trusted non-null PQgetCopyData buffer
+24      8     trusted positive byte length, at most i32::MAX
+32      1     live: 0 | 1
+33      7     zero reserved
+```
 
 ```text
 size 24, alignment 8
@@ -3684,10 +3717,12 @@ offset  size  field
 16      8     positive byte length, at most i32::MAX
 ```
 
-one validatorがconstruction、`copy_chunk_bytes`、Dropをownする。malformed wrapperはindependently
-validated non-null buffer provenanceだけをfreeし、corrupt byteからpointerをguessしない。fake-driver
-allocation ledgerはlibpq buffer owner/package wrapperをseparate trackingしnormal/malformed pathの
-no double-free/no leakを証明する。
+one validatorがconstruction、`copy_chunk_bytes`、Dropをownする。accessはoperation-record buffer/lengthとhidden
+header trusted valueのequalityをrequireする。Dropはhidden headerだけを読み、saved trusted pointerへ
+`PQfreemem`する前に`live=0`+buffer nullとし、その後64-byte allocationをexactly once freeする。corrupt
+operation pointer/lengthは`PQfreemem`/viewへ届かず、real buffer freeをsuppressせず、leakを作らない。fake allocation
+ledgerはlibpq buffer/hidden header/operation recordをseparate trackingしevery single-field corruptionとnormal
+pathのno double-free/no leakを証明する。同じtrusted-header strategyをsibling transfer Drop matrix全体に使う。
 
 このrailはpackage interface/importer keyをonce changeするが、descriptor v6、statement v4、rows v4、
 batch ABI、static artifact byte、compiler IR、runtime ABI registryは変えない。`db.command<P>` constructionと
@@ -3727,6 +3762,7 @@ CopyOut Active -- -1 + final success/null --> Complete
 CopyOut Complete -- next --> Complete + None, zero libpq calls
 CopyOut Active -- finish drains rows + final success/null --> consumed, reusable parent
 CopyOut Complete -- finish --> consumed, reusable parent
+CopyOut Complete -- abort --> consumed, reusable parent + Completed, zero libpq calls
 CopyOut Active -- abort/cancel + final failure/null --> consumed, reusable parent
 CopyOut Active -- completed-before-abort --> consumed, reusable parent + Completed
 
@@ -3757,6 +3793,11 @@ new `db.Error` variantはない。malformed descriptor resultはuntrusted identi
 query-lessのままである。complete descriptor guard後、Query-subject contract errorはstatic command IDを
 `query_id: Some(id)`に持つ。
 
+下表のevery package-synthesized `Native` rowはcomplete record
+`db.NativeError { driver: db.Driver.PostgreSQL, code: None, extended_code: None, sqlstate: None,
+message: <exact row message>, detail: None, constraint: None, table: None, column: None }`である。
+libpqからcopyするerrorはshipped field extraction+first-error ruleを維持する。
+
 | Condition | Exact public result |
 |---|---|
 | malformed descriptor/header/count proof | existing query-less `InvalidQuery`, item `db.descriptor.header`, message `invalid static database descriptor` |
@@ -3783,7 +3824,9 @@ query-lessのままである。complete descriptor guard後、Query-subject cont
 `copy_in_write`はcomplete state validationをlength validationより先に行い、malformed/non-Active recordが
 oversized/empty sliceより勝つ。valid empty sliceはdeadline/native work前に`Ok(())`。
 `copy_in_info`はActiveだけをacceptする。`copy_out_info`はActive/Complete、Completeでの
-`copy_out_next`はlibpqなしに`Ok(None)`を返す。every next/info/finish/abort/chunk accessはcomplete
+`copy_out_next`はlibpqなしに`Ok(None)`を返す。Completeでの`copy_out_abort`はresourceをconsumeし、
+stored countからzero libpq callで`Ok(CopyAbort.Completed(exec_result))`を返す。every
+next/info/finish/abort/chunk accessはcomplete
 record validationが常に勝つ。cleanup中first owned operation error、timeout、
 malformed-state error、explicit abort intentはlater server/restore/transaction-state/cleanup errorにreplaceされず、
 cleanup failureはparent reusabilityだけを変える。sole exceptionはsuccessful server completionというobservable
@@ -3815,11 +3858,17 @@ Linux x86_64/ARM64/macOSで保持する。server 16.4/client >=17がrequired liv
 | CopyIn data | empty no-call; one/multiple/`i32::MAX`/rejected-next chunk; queued/retry/hard error; post-call mutation; exact bytes/no package allocation-copy |
 | CopyOut data | zero-pending/positive/-1/-2; one/many/large row; exact zero-copy pointer/length; one-live-chunk exclusion; wrapper/libpq free count; malformed chunk |
 | finish/final results | active/exhausted finish; exact COPY tag/count; ordinary error; extra result; repeated COPY/pipeline/unknown; restore/state failure; first-error preservation |
-| abort/Drop | direction x Conn/Tx x before/after data x abort/completed race x timeout; explicit synchronized reuse/state effect; active Drop zero network+one physical close |
+| abort/Drop | direction x Conn/Tx x before/after data x abort/completed race x timeout; exhausted Complete abortはstored Completed+zero libpq; explicit synchronized reuse/state effect; active Drop zero network+one physical close |
 | timeout/cancellation | pre-send expiry; blocked put/end/get; recovery success/failure; original-duration budget; cancel/CopyFail count+finish-before-drain order |
-| malformed private ABI | every transfer/chunk byte field+deadline/completion product、wrong direction/phase/flags/reserved、no native call、safe one-owner cleanup |
-| compilation/cache | whole/per-unit interface parity、exact Drop-thunk retention、one importer invalidation、unchanged descriptor/static-artifact/runtime-ABI bytes |
+| malformed private ABI | every transfer/chunk operation-record byte field+deadline/completion product、wrong direction/phase/flags/reserved、no data/protocol call、trusted-header comparison、exact real-owner free/close/release、no attacker-selected native pointer、safe one-owner cleanup |
+| compilation/cache | whole/per-unit interface parity、exact 176-byte transfer/64-byte chunk owner+Drop-thunk retention、one importer invalidation、unchanged descriptor/static-artifact/runtime-ABI bytes |
 | live/database/measurement | required PostgreSQL 16.4 CopyIn/CopyOut Text/Binary round trip on Conn/Tx、rollback/commit/reuse、`scripts/db-verify-local.sh`、non-gating direct-libpq bytes/calls/allocations/time-to-first-byte/throughput/abort latency/peak buffered row bytes |
+
+first fresh design reviewは2 P1 closure gap+1 P2 error-record gapを発見した。`Complete` CopyOut abortは
+stored successful completionをzero-call publishする。hidden package-only owner headerがchunk+sibling transfer
+recordへindependent cleanup provenanceを与え、corrupt operation byteはnative ownerをselect/leakできない。
+every synthetic NativeErrorは全observable fieldを固定する。findingはstate-transition、malformed-ABI ownership、
+exact-error-record cellをreopenするがsingle capability boundaryは変わらない。
 
 implementation前にこのledger+single capability boundaryをone fresh independent adversarial reviewする。
 start、both live direction、termination、cancellation、Drop、fake libpq、C signature probe、required live ownerが

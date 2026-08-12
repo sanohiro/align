@@ -5207,8 +5207,11 @@ cleanup path may issue a libpq call until the transfer is explicitly finished/ab
 has fail-closed the parent. The compiler's ordinary `resource.from_raw_borrowed` provenance owns
 this relationship; no `pkg.db`-specific compiler rule is added.
 
-Each successful start allocates exactly one 80-byte, 8-aligned package transfer record. Parameter
-format-plan and execution-owned parameter payloads are released before the start function returns:
+Each successful start allocates exactly one 176-byte, 8-aligned package owner: a package-only
+96-byte trusted owner header immediately followed by the public-operation 80-byte transfer record.
+The resource raw pointer addresses the transfer record, so ordinary package/compiler-private
+operations cannot reach the negative-offset owner header. Parameter format-plan and
+execution-owned parameter payloads are released before the start function returns:
 libpq has consumed the parameter call boundary and the COPY resource retains no `Params` owner.
 The descriptor's static Query ID bytes are borrowed from immutable descriptor storage and are not
 copied or freed. Success-path construction allocates no error value.
@@ -5220,8 +5223,9 @@ output queue. An empty slice is an exact successful no-op with zero libpq calls 
 buffer boundaries have no meaning.
 
 Every positive `PQgetCopyData` result creates one `copy_chunk` dependent on the active `copy_out`.
-The resource owns the non-null libpq allocation and one 24-byte, 8-aligned package wrapper. Its
-`copy_chunk_bytes` result is a zero-copy `slice<u8>` view of exactly the positive returned length;
+The resource owns the non-null libpq allocation and one 64-byte, 8-aligned package owner: a hidden
+40-byte trusted owner header followed by the 24-byte operation record addressed by the resource.
+Its `copy_chunk_bytes` result is a zero-copy `slice<u8>` view of exactly the positive returned length;
 the trailing libpq NUL is outside the view. Dropping the chunk calls `PQfreemem` exactly once and
 frees the wrapper exactly once. The compiler rejects another mutable `copy_out` operation, finish,
 abort, move, or Drop while that dependent chunk or its view is live. No chunk collection, region
@@ -5252,6 +5256,28 @@ boundary.
 ##### Exact private ABI and formation boundary
 
 Both transfer resources use one canonical v1 byte record; direction is data, not a copied layout:
+
+The containing 96-byte owner header has this exact package-only shape:
+
+```text
+size 96, alignment 8; resource raw pointer = owner base + 96
+offset  size  field
+0       8     magic = 0x414c435054524e31
+8       8     exact transfer-record self pointer
+16      80    trusted byte-for-byte shadow of the transfer record below
+```
+
+Only package constructors and transition helpers write the header. Every operation validates the
+80-byte record against the independently retained shadow before trusting any field. One transition
+helper updates the shadow and operation record to the same complete next-state image; no field is
+maintained by an independent partial writer. The Drop hook derives the header by the fixed negative
+offset from the resource pointer and uses only the shadow's state/PGconn/phase/flags for cleanup.
+It can therefore
+close an Active transfer, release a Complete/FailedSynced lease, or finish FailedClosed cleanup
+without dereferencing or calling libpq through corrupted operation-record bytes. Application code
+cannot construct or mutate this header through any safe or compiler-private public surface; an
+arbitrary forged raw resource remains an explicit `unsafe` memory-corruption boundary, not a
+recoverable package input.
 
 ```text
 size 80, alignment 8
@@ -5288,7 +5314,18 @@ parent-state/PGconn agreement, Query-ID view, and completion pair before reading
 calling libpq. One internal validator owns all constructors, accessors, operations, and both Drop
 hooks.
 
-`copy_chunk` uses this one v1 record:
+`copy_chunk` uses a hidden 40-byte trusted owner header and one v1 operation record:
+
+```text
+size 40, alignment 8; resource raw pointer = owner base + 40
+offset  size  field
+0       8     magic = 0x414c435043484e31
+8       8     exact chunk-record self pointer
+16      8     trusted non-null PQgetCopyData buffer
+24      8     trusted positive byte length, at most i32::MAX
+32      1     live: 0 | 1
+33      7     zero reserved
+```
 
 ```text
 size 24, alignment 8
@@ -5299,10 +5336,16 @@ offset  size  field
 16      8     positive byte length, at most i32::MAX
 ```
 
-One validator owns construction, `copy_chunk_bytes`, and Drop. A malformed wrapper frees only an
-independently validated non-null buffer provenance; it never guesses a pointer from corrupt bytes.
-The fake-driver allocation ledger separately tracks the libpq buffer owner and package wrapper so
-every malformed and normal path can prove no double-free or leak.
+One validator owns construction, `copy_chunk_bytes`, and Drop. Access requires the operation-record
+buffer and length to equal the hidden header's trusted values. Drop reads only the hidden header,
+changes
+`live` to zero and its buffer to null before calling `PQfreemem` on the saved trusted pointer, then
+frees the 64-byte package allocation exactly once. A corrupted operation-record pointer or length
+therefore
+cannot reach `PQfreemem`, suppress the real buffer free, or cause a leak. The fake-driver allocation
+ledger separately tracks the libpq buffer, hidden owner header, and operation record so every
+single-field corruption and normal path proves no double-free or leak. The same trusted-header
+strategy closes the complete sibling transfer Drop matrix rather than protecting only chunks.
 
 This rail changes package interfaces and importer keys once but does not change descriptor v6,
 statement v4, rows v4, batch ABI, static artifact bytes, compiler IR, or runtime ABI registry.
@@ -5350,6 +5393,7 @@ CopyOut Active -- -1 + final success/null --> Complete
 CopyOut Complete -- next --> Complete + None, zero libpq calls
 CopyOut Active -- finish drains rows + final success/null --> consumed, reusable parent
 CopyOut Complete -- finish --> consumed, reusable parent
+CopyOut Complete -- abort --> consumed, reusable parent + Completed, zero libpq calls
 CopyOut Active -- abort/cancel + final failure/null --> consumed, reusable parent
 CopyOut Active -- completed-before-abort --> consumed, reusable parent + Completed
 
@@ -5384,6 +5428,11 @@ No new `db.Error` variant is added. The malformed descriptor result remains quer
 untrusted identity bytes enter an error. After the complete descriptor guard, every Query-subject
 contract error carries the static command ID in `query_id: Some(id)`.
 
+Every package-synthesized `Native` row below is the complete record
+`db.NativeError { driver: db.Driver.PostgreSQL, code: None, extended_code: None, sqlstate: None,
+message: <exact row message>, detail: None, constraint: None, table: None, column: None }`.
+An error copied from libpq instead keeps the shipped field extraction and first-error rules.
+
 | Condition | Exact public result |
 |---|---|
 | malformed descriptor/header/count proof | existing query-less `InvalidQuery`, item `db.descriptor.header`, message `invalid static database descriptor` |
@@ -5410,7 +5459,9 @@ contract error carries the static command ID in `query_id: Some(id)`.
 For `copy_in_write`, complete state validation precedes length validation; therefore a malformed or
 non-Active record wins over an oversized/empty slice. A valid empty slice returns `Ok(())` before
 deadline/native work. `copy_in_info` accepts only Active. `copy_out_info` accepts Active or Complete,
-and `copy_out_next` on Complete returns `Ok(None)` without a libpq call. For every
+and `copy_out_next` on Complete returns `Ok(None)` without a libpq call. `copy_out_abort` on
+Complete consumes the resource and returns `Ok(CopyAbort.Completed(exec_result))` from the stored
+count with zero libpq calls. For every
 next/info/finish/abort/chunk access, complete record validation always wins. During cleanup, the
 first owned operation error, timeout, malformed-state error, or explicit
 abort intent is never replaced by a later server, restore, transaction-state, or cleanup error;
@@ -5447,11 +5498,19 @@ Linux ARM64, and macOS. Server 16.4 and client >=17 remain the required live bou
 | CopyIn data | empty no-call; one/multiple/`i32::MAX`/rejected-next chunks; queued/retry/hard error; mutation after call; exact bytes and no package allocation/copy |
 | CopyOut data | zero-pending/positive/-1/-2; one/many/large rows; exact zero-copy pointer/length; one-live-chunk exclusion; wrapper/libpq free counts; malformed chunk |
 | finish/final results | active/exhausted finish; exact COPY tag/count; ordinary error; extra result; repeated COPY/pipeline/unknown; restore/state failure; first-error preservation |
-| abort and Drop | direction x Conn/Tx x before/after data x abort/completed race x timeout; explicit synchronized reuse/state effects; active Drop zero network and one physical close |
+| abort and Drop | direction x Conn/Tx x before/after data x abort/completed race x timeout; exhausted Complete abort returns stored Completed with zero libpq; explicit synchronized reuse/state effects; active Drop zero network and one physical close |
 | timeout/cancellation | expired before send; blocked put/end/get; recovery success/failure; original-duration budget; cancel/CopyFail call counts and finish-before-drain order |
-| malformed private ABI | every transfer/chunk byte field and deadline/completion combination, wrong direction/phase/flags/reserved bytes, no native call, safe one-owner cleanup |
-| compilation/cache | whole/per-unit interface parity, exact Drop-thunk retention, one importer invalidation, unchanged descriptor/static-artifact/runtime-ABI bytes |
+| malformed private ABI | every transfer/chunk operation-record byte field and deadline/completion combination, wrong direction/phase/flags/reserved bytes, no data/protocol call, trusted-header comparison, exact real-owner free/close/release, no attacker-selected native pointer, safe one-owner cleanup |
+| compilation/cache | whole/per-unit interface parity, exact 176-byte transfer/64-byte chunk owner and Drop-thunk retention, one importer invalidation, unchanged descriptor/static-artifact/runtime-ABI bytes |
 | live/database and measurement | required PostgreSQL 16.4 CopyIn/CopyOut Text/Binary round trips on connection and transaction, rollback/commit/reuse, `scripts/db-verify-local.sh`, and a non-gating direct-libpq comparison of bytes, calls, allocations, time-to-first-byte, throughput, abort latency, and peak buffered row bytes |
+
+The first fresh design review found two P1 closure gaps and one P2 error-record gap. `Complete`
+CopyOut now defines abort as zero-call publication of the stored successful completion. Hidden
+package-only owner headers provide independent cleanup provenance for both chunk and sibling
+transfer records, so corrupt operation bytes cannot select or leak a native owner. Every synthetic
+NativeError now fixes all observable fields. These findings reopen the state-transition,
+malformed-ABI ownership, and exact-error-record cells without changing the single capability
+boundary.
 
 Before implementation, complete one fresh independent adversarial review of this ledger and the
 single capability boundary. The implementation is expected to exceed roughly 1,000 changed
