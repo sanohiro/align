@@ -3738,9 +3738,9 @@ same resource Drop thunk/public interfaceを作る。HIR exception/new intrinsic
 3. native optionをsource orderで（ParameterFormat payload validationはduplicate detectionより先、ResultFormat/Deliveryはtag-first reject）;
 4. exact PostgreSQL driver target+complete physical parent state;
 5. transfer/context recordをallocate/initialize;
-6. generated static validation+normalized parameter-plan installation;
+6. generated static validation;
 7. execution lease acquire;
-8. binder-v2 Measure、exact Parse/Bind budget validation、binder-v2 Encode、send boundaryまでpayload retain;
+8. exact full normalized parameter-format vectorをinstallし、binder-v2 Measure、exact Parse/Bind budget validation、binder-v2 Encode、send boundaryまでpayload retain;
 9. Timeoutありならnonblocking enable後send直前にclock reread。expiryはsend/COPY/cancel zeroでrestore-or-close;
 10. once send、deadline内flush/wait、one initial result取得、metadata前にdirection validation;
 11. `PQbinaryTuples`、`PQnfields`、every `PQfformat`を`expected_format`へvalidateし、initial result clear後resource publish。
@@ -3753,6 +3753,7 @@ active state machineはexact:
 
 ```text
 CopyIn Active  -- nonempty write queued/flushed --> CopyIn Active
+CopyIn Active  -- oversized local write validation --> Active + Encode, zero libpq calls
 CopyIn Active  -- finish + final success/null --> consumed, reusable parent
 CopyIn Active  -- abort + final failure/null --> consumed, reusable parent
 CopyIn Active  -- completed-before-abort --> consumed, reusable parent + Completed
@@ -3779,13 +3780,26 @@ COPY開始後のdeadline expiryは`Timeout`を保持し、retained original-dura
 abort+synchronizationを試み、final null後だけblocking restoreし、proof failureはcloseする。obsolete
 `PQgetline`/`PQputline`/`PQputnbytes`/`PQendcopy`、pipeline exit、second SQLはcallしない。
 
-`PQputCopyEnd` successまたは`PQgetCopyData == -1`後、final sequenceはexactly one
-`PGRES_COMMAND_OK`+nullである。`PQcmdTuples`はcanonical nonempty decimal `0..=i64::MAX`、
+clean CopyIn finish、clean CopyOut exhaustion、clean exhaustionまでdrainするfinishはexactly one
+`PGRES_COMMAND_OK`+nullをrequireする。`PQcmdTuples`はcanonical nonempty decimal `0..=i64::MAX`、
 `PQcmdStatus`はexact ASCII `COPY `+same canonical decimal+one terminating NULで、successは
-`db.exec_result { rows_affected: Some(count) }`を返す。ordinary server errorは
-clear前にcopyしoriginal first-error ruleでnullまでdrainする。second non-null resultはinvalid sequence。
-ordinary statusはerrorをreplaceせずdrainし、COPY/pipeline/unknownはonce clear+immediate closeする。
-blocking restore/transaction-state validationはnull後、publication/reuse前だけである。
+`db.exec_result { rows_affected: Some(count) }`を返す。
+
+abortはdistinct final-result discriminatorを持つ。CopyInがnonnull CopyFailをqueueした後、またはCopyOut
+cancellationがdirection-correct `PQgetCopyData == -1`へ到達した後、exactly one
+`PGRES_FATAL_ERROR`+nullはsynchronized `CopyAbort.Aborted`である。requested termination outcomeなので
+native fieldをpublishせずclearする。exactly one valid `PGRES_COMMAND_OK`+nullはcompleted-before-abort raceで
+`CopyAbort.Completed(exec_result)`を返す。result前null、other ordinary status、second nonnull resultは
+malformed completionである。explicit abort外のordinary server errorはclear前にcopyしoriginal first-error
+ruleでnullまでdrainする。every final modeでordinary statusはearlier errorをreplaceせずdrainし、COPY/
+pipeline/unknownはonce clear+immediate closeする。blocking restore/transaction-state validationはnull後、
+publication/reuse前だけである。
+
+Timeout/post-native operation-error recoveryはsame direction-specific CopyFail/cancel transportを使うがpublic
+explicit abortにはならない。single failure resultはsynchronization evidenceでalready-owned `Timeout`/`Native`
+errorを保持する。completed command resultもsynchronization evidenceでearlier errorを保持し、actual DB effectは
+subsequent connection/transaction stateだけでobservableである。これらを`CopyAbort.Aborted`/`Completed`へ
+mapするのはexplicit `copy_in_abort`/`copy_out_abort` callだけである。
 
 ##### Exact errorとprecedence table
 
@@ -3832,8 +3846,12 @@ malformed-state error、explicit abort intentはlater server/restore/transaction
 cleanup failureはparent reusabilityだけを変える。sole exceptionはsuccessful server completionというobservable
 race outcomeを表す`CopyAbort.Completed`である。
 
-borrowed `copy_in_write`/`copy_out_next` failureはcaller resourceをconsumeできない。そのためreturn前に
-retained recovery budgetでdirection-correct synchronizationを行う。proved synchronizationはnon-null PGconnの
+borrowed operationには2 disjoint failure phaseがある。state/record validationがfirstである。
+`copy_in_write`はnonempty length > `i32::MAX`をexact local `Encode`としてzero libpq callでrejectし、
+trusted shadow/operation recordをboth Activeのままにするためvalid chunkでretryまたはexplicit finish/abortできる。
+other local validation failureはvalid Active transferをmutateしない。`PQputCopyData`/`PQgetCopyData`または
+そのwait/consume/flush pathがproduceしたfailureは`copy_in_write`/`copy_out_next` return前にretained
+recovery budgetでdirection-correct synchronizationを行う。proved synchronizationはnon-null PGconnの
 `Failed`、failed synchronization/malformed state/recovery中COPY-pipeline-unknown/unproved transaction stateは
 immediate physical close後null PGconnの`Failed`をstoreする。either formのlater info/data/finish/abortはsame
 COPY-state `Native` error+zero libpq call。eventual Dropは上記phase-specific bounded cleanupだけを行い、
@@ -3853,13 +3871,13 @@ Linux x86_64/ARM64/macOSで保持する。server 16.4/client >=17がrequired liv
 | Closure cell | Required discriminating owner |
 |---|---|
 | exported surface/unavailable siblings | exact public declaration golden; common/SQLite/dynamic/prepared COPYと`CopyOption`/callbackのcompile rejection |
-| start operation matrix | CopyIn/CopyOut x Conn/Tx x Text/Binary x timeout absent/present x zero/one/multiple/default/Text/Binary Params; exact phase-order failpoint counter |
+| start operation matrix | CopyIn/CopyOut x Conn/Tx x Text/Binary x timeout absent/present x zero/one/multiple/default/Text/Binary Params; overlap-before-full-vector-allocationとlease-before-installationを含むexact phase-order failpoint counter |
 | response metadata | direction、COPY BOTH、overall/every-column format、`0`/one/max columns、malformed count/code/pointer、initial ordinary/pipeline/unknown status |
-| CopyIn data | empty no-call; one/multiple/`i32::MAX`/rejected-next chunk; queued/retry/hard error; post-call mutation; exact bytes/no package allocation-copy |
+| CopyIn data | empty no-call; one/multiple/`i32::MAX`/rejected-next chunk; rejected-nextはActiveでfollowing valid write/finish/abortがwork; queued/retry/hard error; post-call mutation; exact bytes/no package allocation-copy |
 | CopyOut data | zero-pending/positive/-1/-2; one/many/large row; exact zero-copy pointer/length; one-live-chunk exclusion; wrapper/libpq free count; malformed chunk |
-| finish/final results | active/exhausted finish; exact COPY tag/count; ordinary error; extra result; repeated COPY/pipeline/unknown; restore/state failure; first-error preservation |
-| abort/Drop | direction x Conn/Tx x before/after data x abort/completed race x timeout; exhausted Complete abortはstored Completed+zero libpq; explicit synchronized reuse/state effect; active Drop zero network+one physical close |
-| timeout/cancellation | pre-send expiry; blocked put/end/get; recovery success/failure; original-duration budget; cancel/CopyFail count+finish-before-drain order |
+| finish/final results | clean active/exhausted finishはexact command result+COPY tag/count+nullをrequire; ordinary error; missing/extra result; repeated COPY/pipeline/unknown; restore/state failure; first-error preservation |
+| abort/Drop | direction x Conn/Tx x before/after data x abort failure-result/completed-command/missing-or-other/extra-result x timeout; exhausted Complete abortはstored Completed+zero libpq; explicit synchronized reuse/state effect; active Drop zero network+one physical close |
+| timeout/cancellation | pre-send expiry; blocked put/end/get; Timeout/Nativeを保持するrecovery failure-result/completed-command/malformed sequence; original-duration budget; cancel/CopyFail count+finish-before-drain order |
 | malformed private ABI | every transfer/chunk operation-record byte field+deadline/completion product、wrong direction/phase/flags/reserved、no data/protocol call、trusted-header comparison、exact real-owner free/close/release、no attacker-selected native pointer、safe one-owner cleanup |
 | compilation/cache | whole/per-unit interface parity、exact 176-byte transfer/64-byte chunk owner+Drop-thunk retention、one importer invalidation、unchanged descriptor/static-artifact/runtime-ABI bytes |
 | live/database/measurement | required PostgreSQL 16.4 CopyIn/CopyOut Text/Binary round trip on Conn/Tx、rollback/commit/reuse、`scripts/db-verify-local.sh`、non-gating direct-libpq bytes/calls/allocations/time-to-first-byte/throughput/abort latency/peak buffered row bytes |
@@ -3869,6 +3887,15 @@ stored successful completionをzero-call publishする。hidden package-only own
 recordへindependent cleanup provenanceを与え、corrupt operation byteはnative ownerをselect/leakできない。
 every synthetic NativeErrorは全observable fieldを固定する。findingはstate-transition、malformed-ABI ownership、
 exact-error-record cellをreopenするがsingle capability boundaryは変わらない。
+
+redesigned reviewはさらに2 new P1 contradiction+1 P2 ordering driftを発見したため、closure matrixを
+`termination-intent x borrowed-failure-phase x lease-bound-plan-ownership` axisでreopenする。clean
+completionはvalid command resultだけ、explicit abortはone failure resultを`Aborted`またはone valid command
+resultをcompleted raceとしてacceptし、bothは後続nullをrequireする。oversized local CopyIn validationは
+zero native workのretryable Active、COPY/native operation origin failureはborrowed ownerを返す前に
+synchronize-or-closeする。full parameter-vector installationはsuccessful lease acquire後へ移しpreceding
+binary-format ledgerを保持する。このprotocol/cleanup strategy changeでもboth directionはone
+connection-global capability boundaryのままである。
 
 implementation前にこのledger+single capability boundaryをone fresh independent adversarial reviewする。
 start、both live direction、termination、cancellation、Drop、fake libpq、C signature probe、required live ownerが
