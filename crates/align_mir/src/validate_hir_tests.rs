@@ -188,6 +188,122 @@ fn checked_source_program(source: &str) -> hir::Program {
     program
 }
 
+/// Producer-delegation matrix owner: every source shape sema accepts must survive the body
+/// validator and lower to a non-empty program.
+///
+/// The silent-empty-MIR class is exactly "the validator re-derived a producer fact with a
+/// non-equivalent rule", and each occurrence reached users as an object with an undefined `_main`
+/// and exit 0. One row per delegation cell in `docs/impl/19-hir-validation-ledger.md`'s
+/// "Producer-delegation matrix"; a new cell adds a row here rather than a new test binary.
+#[test]
+fn checked_source_shapes_survive_every_delegated_gate() {
+    for (name, source, expected_fns) in [
+        // `scan-accumulator`: sema admits any non-struct `ty_to_scalar` accumulator; the
+        // validator's own `scalar_to_prim` spelling rejected `()`.
+        (
+            "scan-unit-accumulator",
+            "fn fold(acc: (), x: i64) {\n  print(x)\n}\nfn main() -> i32 {\n  prefix := [7, 8].scan((), fold)\n  return prefix.len() as i32\n}\n",
+            2,
+        ),
+        // The same cell, reached by a sum-type accumulator: proof that admitting `()` alone would
+        // not have closed the rule.
+        (
+            "scan-enum-accumulator",
+            "E { A, B }\nfn step(acc: E, x: i64) -> E = acc\nfn main() -> i32 {\n  xs := [1, 2].scan(E.A, step)\n  return xs.len() as i32\n}\n",
+            2,
+        ),
+        // `reduce` is `scan`'s sibling terminal and never grew the extra gate; it anchors the row
+        // so a future "tighten both" edit cannot reintroduce the divergence symmetrically.
+        (
+            "reduce-unit-accumulator",
+            "fn fold(acc: (), x: i64) {\n  print(x)\n}\nfn main() -> i32 {\n  [3, 4].reduce((), fold)\n  return 0\n}\n",
+            2,
+        ),
+        // `map-err-parameter`: the mapper's declared parameter and the receiver's error scalar are
+        // independent nominal derivations of one source type, so they carry different monomorph
+        // ids. A raw id comparison rejected the whole checked program.
+        (
+            "map-err-independent-monomorph",
+            "Wrap<T> { callback: T }\nfn quiet(x: i64) -> i64 = x + 1\nfn keep_error(\n  wrap: Wrap<fn(i64) -> i64>,\n) -> Wrap<fn(i64) -> i64> = wrap\nfn fail_with<E>(error: E) -> Result<i64, E> = Err(error)\nfn main() -> i32 {\n  mapped := fail_with(Wrap { callback: quiet }).map_err(keep_error)\n  return match mapped {\n    Ok(value) => value as i32\n    Err(wrap) => wrap.callback(41) as i32\n  }\n}\n",
+            4,
+        ),
+    ] {
+        let program = checked_source_program(source);
+        assert!(
+            validate_hir::body_only_metadata_is_valid(&program),
+            "{name}: the body validator rejected checked HIR",
+        );
+        let lowered = crate::lower_program_checked(&program, false, None)
+            .unwrap_or_else(|rejected| panic!("{name}: {rejected}"));
+        assert_eq!(lowered.fns.len(), expected_fns, "{name}: lowered functions");
+    }
+}
+
+/// The vanished-checked-program rule lives at the one fallible boundary, and the four infallible
+/// entry points keep their fail-closed empty-program contract for hand-constructed HIR.
+#[test]
+fn lower_program_checked_reports_a_vanished_checked_program() {
+    let valid = checked_source_program(
+        "fn signed_minimum() -> i64 = -9223372036854775808\nfn main() -> i32 = 0\n",
+    );
+    assert!(
+        crate::lower_program_checked(&valid, false, None).is_ok(),
+        "the unmutated fixture must lower",
+    );
+
+    let mut malformed = valid;
+    let expression = body_value_expression_mut(&mut malformed, "signed_minimum");
+    let hir::ExprKind::Unary { expr, .. } = &expression.kind else {
+        panic!("signed minimum lost its unary HIR representation")
+    };
+    *expression = (**expr).clone();
+
+    let source_map = SourceMap::new();
+    for (label, per_unit, map) in [
+        ("whole-program", false, None),
+        ("per-unit", true, None),
+        ("whole-program-located", false, Some(&source_map)),
+        ("per-unit-located", true, Some(&source_map)),
+    ] {
+        let rejected = crate::lower_program_checked(&malformed, per_unit, map)
+            .expect_err("a rejected program with functions must not lower to the empty program");
+        assert_eq!(rejected.checked_fns, malformed.fns.len(), "{label}: fn count");
+        assert!(
+            rejected.to_string().contains("were not lowered"),
+            "{label}: the rejection must name the defect",
+        );
+    }
+
+    // The library contract for hand-constructed HIR is unchanged: the infallible entry points still
+    // fail closed to the canonical empty program rather than publishing partial MIR.
+    for (label, lowered) in [
+        ("whole-program", lower_program(&malformed)),
+        ("per-unit", lower_program_per_unit(&malformed)),
+        (
+            "whole-program-located",
+            lower_program_located(&malformed, &source_map),
+        ),
+        (
+            "per-unit-located",
+            lower_program_per_unit_located(&malformed, &source_map),
+        ),
+    ] {
+        assert!(
+            is_empty(&lowered),
+            "{label}: an infallible entry point published partial MIR",
+        );
+    }
+
+    // An input that really is empty is not a vanished program.
+    let mut empty = baseline_program();
+    empty.fns.clear();
+    empty.structs.clear();
+    assert!(
+        crate::lower_program_checked(&empty, false, None).is_ok(),
+        "an empty checked program lowers to the empty program",
+    );
+}
+
 #[test]
 fn hir_body_validator_accepts_signed_minimum_only_under_direct_negation() {
     let source = "fn signed_minimum() -> i64 = -9223372036854775808\nfn main() -> i32 = 0\n";

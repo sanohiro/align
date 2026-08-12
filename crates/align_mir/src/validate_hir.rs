@@ -5577,8 +5577,13 @@ impl<'a> BodyValidator<'a> {
                 let Ty::Fn(fid) = function_flow.ty else { return None };
                 let function = self.program.fn_types.get(fid as usize)?;
                 let [(mode, parameter)] = function.params.as_slice() else { return None };
+                // The mapper's declared parameter and the receiver's error scalar are two
+                // INDEPENDENT nominal derivations of one source type (a declaration header versus
+                // an inferred generic instantiation), so they may carry different monomorph ids for
+                // the same source shape. Sema admits the call through `source_scalar_matches`; a
+                // raw id comparison here rejected the checked program.
                 if *mode != align_ast::ParamMode::ByValue
-                    || *parameter != err
+                    || !self.body_scalar_matches(*parameter, err)
                     || !self.body_scalar_ok(align_sema::ty_to_scalar(function.ret)?)
                 {
                     return None;
@@ -5598,7 +5603,12 @@ impl<'a> BodyValidator<'a> {
                 }
                 let Ty::Fn(fid) = closure_flow.ty else { return None };
                 let function = self.program.fn_types.get(fid as usize)?;
-                if !function.params.is_empty() || function.ret != align_sema::scalar_to_ty(ok) {
+                // The spawned function's declared return and the task's payload are independent
+                // derivations, and a stored `Result` return may be spelled `Ty::Tagged`; ask the
+                // shared matcher rather than comparing ids and representations directly.
+                if !function.params.is_empty()
+                    || !self.body_ty_matches(function.ret, align_sema::scalar_to_ty(ok))
+                {
                     return None;
                 }
                 let sig = self.resolve_lifted_signature(closure)?;
@@ -5607,7 +5617,7 @@ impl<'a> BodyValidator<'a> {
                 } else {
                     align_sema::scalar_to_ty(ok)
                 };
-                if sig.ret != expected {
+                if !self.body_ty_matches(sig.ret, expected) {
                     return None;
                 }
                 Some((Ty::Task(ok), closure_flow.falls, closure_flow.breaks))
@@ -7925,8 +7935,10 @@ impl<'a> BodyValidator<'a> {
                     return None;
                 }
                 let init_flow = self.expr_flow(init)?;
-                let output_scalar = align_sema::ty_to_scalar(*output_elem)
-                    .filter(|scalar| align_sema::scalar_to_prim(*scalar).is_some());
+                // Delegated: the producer owns which accumulators materialize into `array<A>`.
+                // The validator's own `scalar_to_prim` spelling of that rule rejected `()` and
+                // every sum-type accumulator that `check_array_scan` accepts.
+                let output_scalar = align_sema::scan_accumulator_scalar(*output_elem);
                 if !self.body_ty_matches(init_flow.ty, *output_elem)
                     || !self.ty_copy_ok(input_elem, context)
                     || !self.ty_copy_ok(*output_elem, context)
@@ -9460,7 +9472,7 @@ impl<'a> BodyValidator<'a> {
             if !matches!(origin, hir::FnOrigin::Lifted { capture_count: 0 })
                 || !signature.params.is_empty()
                 || !signature.modes.is_empty()
-                || function.ret != align_sema::scalar_to_ty(spawn.ok)
+                || !self.body_ty_matches(function.ret, align_sema::scalar_to_ty(spawn.ok))
             {
                 return false;
             }

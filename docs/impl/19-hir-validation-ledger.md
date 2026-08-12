@@ -25,6 +25,13 @@ native declaration, Align-program/runtime/native/artifact/cache allocation,
 ownership transfer, or cache publication. Compiler-owned validation worklists
 may allocate and are released before return.
 
+That empty-program contract is for **hand-constructed** HIR only. A caller
+holding producer-checked HIR uses the fifth, fallible entrypoint
+`lower_program_checked`, which rejects at the same point with the same
+pre-construction guarantees but reports `LoweringRejected` instead of an empty
+program. See "Producer-delegation closure matrix" below for why an empty
+program must never reach a checked consumer.
+
 The complete ledger consists of this file and the callable/native appendix in
 `17-library-boundary-prerequisites.md`. An implementation capability may not replace a
 row with a broader family assumption. A new HIR discriminator must add one row,
@@ -992,3 +999,107 @@ definitions and assert that this file has exactly one owner id for every
 `GroupSource`, `GroupAgg1`, `GroupOp`, `CliFlagKind`, `EncodingKind`, `CompressKind`,
 `PathComponentKind`, `AeadCipher`, `AeadDir`, and `HashAlgo`. The test fails on
 an added, removed, duplicated, or unowned discriminator.
+
+## Producer-delegation closure matrix
+
+This matrix closes the **silent-empty-MIR** class: the body validator answering
+a question the producer already owns, with a rule that is not equivalent. Every
+occurrence rejects the whole checked program at the MIR boundary, so the unit
+lowers to the canonical empty program and links with an undefined `_main`. Four
+earlier occurrences shipped as `#742`, `#744`, `#749`, and `#737`; the two rows
+below are the fifth and sixth. Every one was "the validator re-derived a
+producer fact", never malformed HIR.
+
+### Split model
+
+A nominal id is not a stable name for a source type. `check_program` caches
+monomorph instances by *mangled name* (`struct_mono`, `enum_mono`,
+`resource_mono`), and `intern_fn_type` compares the whole `FnTy` including its
+mutable `effect` cell, so one source type can own several ids:
+
+```text
+struct[4] = Wrap$F0_vi64_i64_bn_rn  source_name Wrap$F_vi64_i64_bn_rn  callback: Fn(0)
+struct[6] = Wrap$F3_vi64_i64_bn_rn  source_name Wrap$F_vi64_i64_bn_rn  callback: Fn(3)
+```
+
+Sema treats those as one type (`source_scalar_matches`). The validator's
+equivalent is `body_ty_matches` / `body_scalar_matches`, which compare through
+`source_shape_equal`. A **raw** `==`/`!=` on two nominal ids is therefore only
+correct when the two operands cannot be independent derivations of one source
+type. The duplicate ids themselves are a separate (non-blocking) producer
+inefficiency; see "fn_types interning" below.
+
+### Axis A — validator-owned admission gates spelled `scalar_to_prim`
+
+Eight occurrences; one diverged.
+
+| Gate | Producer authority | Verdict |
+|---|---|---|
+| `ArrayScan` output element | `check_array_scan` | **Divergent.** Sema admits any non-struct `ty_to_scalar` accumulator; `scalar_to_prim` rejected `()` and every sum-type accumulator. Fixed by delegating to `align_sema::scan_accumulator_scalar`, now called by both. |
+| `rng_elem_ok` (`shuffle`/`sample`) | `check_rand_method` | Identical rule (`scalar_to_prim(es).is_none()`). No change. |
+| `ArraySortBy` element | `check_array_sort_by_key` | Identical rule. No change. |
+| `ArrayPartition` element | `check_array_partition` | Identical rule. No change. |
+| `ArrayChunks` element | `check_array_chunks` | Identical rule. No change. |
+| `array_builder_elem_ok` | `check_array_builder_new` | Wider, never narrower: sema admits `Int/Float/Bool/Char/String`; the validator additionally admits `Str`. A wider gate cannot reject a checked program, so it is outside this class. No change. |
+| `ResourceViewFromRaw` view scalar (2 sites) | none | Structural: `Scalar::Slice` is *constructed from* a `PrimScalar`, so this is a representation conversion, not an admission rule. No change. |
+
+### Axis B — nominal-identity comparisons
+
+`body_core` contains 538 comparison lines; 210 compare a `Ty` or `Scalar`.
+Classification is by **operand provenance**, because that is what decides
+whether a split is reachable:
+
+| Class | Count | Verdict |
+|---|---|---|
+| Delegated: already asks `body_ty_matches` / `body_scalar_matches` | 48 call sites | Correct by construction. |
+| Split-free: at least one operand is a primitive, a native singleton handle (`Ty::Raw`, `Ty::Reader`, `Ty::HttpClient`, …), or a scalar a sibling predicate has already narrowed to a primitive (`const_array_scalar_ok`, `valid_vector_scalar`, `numeric_body_ty`, `array_zip_scalar_ok`, `scalar_to_prim`) | 197 | Raw comparison is exact. No change. |
+| Same-derivation: a stored discriminator id compared against the child type sema derived it *from* — resource operations (`Ty::Resource(*resource)`), SoA / struct-array store bases (`Ty::Soa(*struct_id)`), JSON decode targets (`Ty::Enum(*enum_id)`), pipeline terminals (`final_elem != *elem`), pooled-array locals | 9 families | One derivation cannot split against itself. Raw comparison retained; converting them would only widen. |
+| **Cross-derivation: a callee or lifted signature compared against a call-site type.** This is the only class where two independent derivations of one source type meet. | 17 | 13 already delegated; **4 were raw and are fixed** (below). |
+
+Fixed cross-derivation cells:
+
+| Cell | Symptom |
+|---|---|
+| `ResultMapErr` mapper parameter vs receiver error scalar | **Proven.** `fail_with(Wrap { callback: quiet }).map_err(keep_error)` gave `Struct(6)` from the inferred instantiation and `Struct(4)` from the declaration header. Whole program rejected. |
+| `Spawn` closure `FnTy::ret` vs task payload | Latent: payload is primitive today, but the comparison is cross-derivation. |
+| `Spawn` lifted-signature return vs constructed `Result` expectation | Latent, and additionally sensitive to the `Ty::Result` / `Ty::Tagged` spelling that only `body_ty_matches` normalizes. |
+| Lifted-signature spawn check (`resolve_lifted_signature` consumer) | Same family as the previous row. |
+
+### Axis C — the vanished-checked-program rule
+
+The rule "a checked program with functions must not lower to the empty
+program" had three independent copies in `align_driver` and no copy at the
+lowering boundary, so the whole-program test surface — the one the two
+regressions above were observed through — got the empty program back with no
+error and failed at link with an undefined `_main`.
+
+`align_mir::lower_program_checked(program, per_unit, source_map)` is now the
+single fallible boundary and owns the rule:
+
+- returns `Err(LoweringRejected)` when validation rejects a program that has
+  functions or structs, **and** when lowering itself publishes neither;
+- returns `Ok(empty)` for a genuinely empty input;
+- the four infallible entry points keep their fail-closed empty-program
+  contract for hand-constructed HIR (`assert_rejected` is unchanged), and are
+  documented as unusable for checked input.
+
+`align_driver` exposes `try_lower_to_mir{,_per_unit,_located,_per_unit_located}`
+for callers that can render a diagnostic; the infallible `lower_to_mir*` names
+are retained for the test surface and panic on rejection, so no caller can
+obtain an empty program from a non-empty checked input.
+
+### Owners
+
+| Invariant | Owner |
+|---|---|
+| Every source shape sema accepts survives every delegated gate | `align_mir` `checked_source_shapes_survive_every_delegated_gate` (scan `()`, scan enum, reduce `()`, map_err independent monomorph) |
+| A vanished checked program is an error at the one boundary, and the infallible entry points still fail closed | `align_mir` `lower_program_checked_reports_a_vanished_checked_program` |
+| End-to-end acceptance | `align_driver` `mir_continuation`, `unit_values` |
+
+### fn_types interning (follow-up, not in this class)
+
+`intern_fn_type` deduplicates on the whole `FnTy`, including the `effect` cell
+that later inference mutates, so two structurally identical `fn(i64) -> i64`
+entries survive and multiply into duplicate struct/enum monomorphs. This costs
+duplicated monomorph records and mangled names; it is not a correctness defect
+now that the cross-derivation comparisons delegate. Track separately.

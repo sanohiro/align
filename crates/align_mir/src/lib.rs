@@ -1716,30 +1716,87 @@ fn collect_capability_libs(fns: &[Function]) -> Vec<String> {
     libs
 }
 
+/// A checked program that produced no MIR.
+///
+/// The four infallible entry points below deliberately fail closed to the canonical empty program
+/// for hand-constructed or malformed HIR. That contract is only safe when the input was never
+/// claimed to be checked: a *checked* program that vanishes is a compiler defect, and shipping its
+/// empty object silently produced a binary with an undefined `_main` and exit 0. Three separate
+/// consumers had each grown their own copy of the `mir.fns.is_empty() && !hir.fns.is_empty()`
+/// check, and every consumer that forgot one — including the whole-program test surface — got the
+/// silent empty object back. (Four copies existed; the fourth, on the unit-cache rehydration
+/// path, was found only by inventorying the call sites.) [`lower_program_checked`] owns the rule once so no caller can reach
+/// an empty program from a non-empty checked input without handling this error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoweringRejected {
+    /// Functions the producer had already checked.
+    pub checked_fns: usize,
+    /// Struct definitions the producer had already checked.
+    pub checked_structs: usize,
+}
+
+impl std::fmt::Display for LoweringRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "program passed checking but failed HIR validation at the MIR boundary; \
+             {} checked function(s) and {} checked struct(s) were not lowered — \
+             report this program shape",
+            self.checked_fns, self.checked_structs
+        )
+    }
+}
+
+/// The one fallible HIR-to-MIR boundary: lower `program`, or report that a checked program
+/// vanished.
+///
+/// `per_unit` selects the separate-compilation visibility model (see [`lower_program_per_unit`]);
+/// `source_map` populates `Block::stmt_lines` (see [`lower_program_located`]). The four historical
+/// entry points are thin fail-closed wrappers over this function, so the validation rule, the
+/// empty-program fallback, and the vanished-function rule each exist exactly once. It is `#[inline]`
+/// so those wrappers add no call frame under the deep `lower_fn`/`lower_expr` recursion
+/// (`expr_depth` stack margin).
+#[inline]
+pub fn lower_program_checked(
+    program: &hir::Program,
+    per_unit: bool,
+    source_map: Option<&SourceMap>,
+) -> Result<Program, LoweringRejected> {
+    let rejected = LoweringRejected {
+        checked_fns: program.fns.len(),
+        checked_structs: program.structs.len(),
+    };
+    if !hir_program_is_valid(program) {
+        // A genuinely empty input still lowers to the empty program; anything else vanished.
+        if program.fns.is_empty() && program.structs.is_empty() {
+            return Ok(empty_program());
+        }
+        return Err(rejected);
+    }
+    let lines = source_map.map(|sm| Rc::new(SourceLines::from_map(sm)));
+    let mir = lower_program_unchecked(program, lines, per_unit);
+    // Validation is not the only way a checked program can vanish: lowering itself must publish a
+    // function for every checked function and a record for every checked struct.
+    if (mir.fns.is_empty() && !program.fns.is_empty())
+        || (mir.structs.is_empty() && !program.structs.is_empty())
+    {
+        return Err(rejected);
+    }
+    Ok(mir)
+}
+
 /// typed HIR -> MIR.
 /// Lower a whole HIR program to MIR (a normal build: no source lines — `Block::stmt_lines` stays
 /// empty).
 pub fn lower_program(program: &hir::Program) -> Program {
-    lower_program_impl(program, None, false)
+    fail_closed(lower_program_checked(program, false, None))
 }
 
 /// Lower with source locations, so each MIR statement records the (line, col) it came from. Used by
 /// `alignc explain-opt` (and a future `-g`) to attach debug info; a normal build calls
 /// [`lower_program`]. The only difference is populated `Block::stmt_lines`.
 pub fn lower_program_located(program: &hir::Program, sm: &SourceMap) -> Program {
-    if !hir_program_is_valid(program) {
-        // Fail closed: hand-constructed or malformed HIR lowers to an empty program rather than
-        // proceeding into lowering invariants that assume checked input (`assert_rejected` pins
-        // this for every entry point). The DRIVER is responsible for making this loud: a checked
-        // program with functions that lowers to an empty program is a compiler defect and the
-        // CLI refuses to emit it (previously it silently shipped an empty binary with exit 0).
-        return empty_program();
-    }
-    lower_program_unchecked(
-        program,
-        Some(Rc::new(SourceLines::from_map(sm))),
-        false,
-    )
+    fail_closed(lower_program_checked(program, false, Some(sm)))
 }
 
 /// M15 S2 per-unit lowering: like [`lower_program`], but honors the separate-compilation visibility
@@ -1750,7 +1807,7 @@ pub fn lower_program_located(program: &hir::Program, sm: &SourceMap) -> Program 
 /// declares, so the default object stays byte-identical to today; per-unit lowering is the only path
 /// that turns these bits on.
 pub fn lower_program_per_unit(program: &hir::Program) -> Program {
-    lower_program_impl(program, None, true)
+    fail_closed(lower_program_checked(program, true, None))
 }
 
 /// M15 S2b per-unit lowering **with source locations** — the located ([`lower_program_located`])
@@ -1761,34 +1818,14 @@ pub fn lower_program_per_unit(program: &hir::Program) -> Program {
 /// now compiles each unit in isolation and needs both the debug locations (for remark attribution)
 /// and the per-unit boundary (so a cross-unit call stays an opaque call).
 pub fn lower_program_per_unit_located(program: &hir::Program, sm: &SourceMap) -> Program {
-    if !hir_program_is_valid(program) {
-        // Fail closed: hand-constructed or malformed HIR lowers to an empty program rather than
-        // proceeding into lowering invariants that assume checked input (`assert_rejected` pins
-        // this for every entry point). The DRIVER is responsible for making this loud: a checked
-        // program with functions that lowers to an empty program is a compiler defect and the
-        // CLI refuses to emit it (previously it silently shipped an empty binary with exit 0).
-        return empty_program();
-    }
-    lower_program_unchecked(
-        program,
-        Some(Rc::new(SourceLines::from_map(sm))),
-        true,
-    )
+    fail_closed(lower_program_checked(program, true, Some(sm)))
 }
 
-// Inlined into the two thin entry points above so a normal build gains no extra call frame at the
-// base of the deep `lower_fn`/`lower_expr` recursion (`expr_depth` stack margin).
+/// The hand-constructed-HIR contract: a rejected program is the canonical empty program, never
+/// partial MIR. Checked callers use [`lower_program_checked`] and handle [`LoweringRejected`].
 #[inline]
-fn lower_program_impl(program: &hir::Program, lines: Option<Rc<SourceLines>>, per_unit: bool) -> Program {
-    if !hir_program_is_valid(program) {
-        // Fail closed: hand-constructed or malformed HIR lowers to an empty program rather than
-        // proceeding into lowering invariants that assume checked input (`assert_rejected` pins
-        // this for every entry point). The DRIVER is responsible for making this loud: a checked
-        // program with functions that lowers to an empty program is a compiler defect and the
-        // CLI refuses to emit it (previously it silently shipped an empty binary with exit 0).
-        return empty_program();
-    }
-    lower_program_unchecked(program, lines, per_unit)
+fn fail_closed(lowered: Result<Program, LoweringRejected>) -> Program {
+    lowered.unwrap_or_else(|_| empty_program())
 }
 
 fn hir_program_is_valid(program: &hir::Program) -> bool {
