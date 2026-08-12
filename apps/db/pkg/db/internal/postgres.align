@@ -59,9 +59,8 @@ extern "C" link("pq") {
   fn PQisBusy(connection: raw) -> i32
   fn PQgetResult(connection: raw) -> raw
   fn PQtransactionStatus(connection: raw) -> i32
-  fn PQgetCancel(connection: raw) -> raw
-  fn PQcancel(cancel: raw, error_buffer: raw, error_buffer_size: i32) -> i32
-  fn PQfreeCancel(cancel: raw)
+  fn PQsetSingleRowMode(connection: raw) -> i32
+  fn PQsetChunkedRowsMode(connection: raw, chunk_size: i32) -> i32
   fn PQntuples(result: raw) -> i32
   fn PQnfields(result: raw) -> i32
   fn PQgetisnull(result: raw, row: i32, column: i32) -> i32
@@ -80,8 +79,12 @@ FAILURE_ROW: u8 := 3
 FAILURE_ENCODE: u8 := 4
 pub PGRES_COMMAND_OK: i32 := 1
 pub PGRES_TUPLES_OK: i32 := 2
+PGRES_EMPTY_QUERY: i32 := 0
 PGRES_COPY_OUT: i32 := 3
 PGRES_COPY_IN: i32 := 4
+PGRES_BAD_RESPONSE: i32 := 5
+PGRES_NONFATAL_ERROR: i32 := 6
+PGRES_FATAL_ERROR: i32 := 7
 PGRES_TUPLES_CHUNK: i32 := 12
 PGRES_SINGLE_TUPLE: i32 := 9
 PGRES_COPY_BOTH: i32 := 8
@@ -366,7 +369,7 @@ pub fn release_lease(state: raw) {
   }
 }
 
-fn absolute_deadline(duration_ns: i64, query_id: str) -> Result<i64, pkg.db.Error> {
+pub fn absolute_deadline(duration_ns: i64, query_id: str) -> Result<i64, pkg.db.Error> {
   now := time.instant()
   if now < 0 || duration_ns > 9223372036854775807 - now {
     return Err(descriptor_error(
@@ -386,8 +389,8 @@ fn wait_ready(connection: raw, deadline: i64) -> i32 {
     if unsafe { PQconsumeInput(connection) } == 0 { return 2 }
     if flush == 0 && unsafe { PQisBusy(connection) } == 0 { return 0 }
     now := time.instant()
-    if now >= deadline { return 1 }
-    remaining := deadline - now
+    if deadline >= 0 && now >= deadline { return 1 }
+    remaining := if deadline < 0 { WAIT_SLICE_NS } else { deadline - now }
     time.sleep(if remaining < WAIT_SLICE_NS { remaining } else { WAIT_SLICE_NS })
   }
 }
@@ -475,12 +478,8 @@ fn finish_async_result(
       return Err(failure)
     }
 
-    cancel := PQgetCancel(connection)
-    error_buffer := raw.alloc(256)
-    cancel_status := if cancel.is_null() { 0 } else { PQcancel(cancel, error_buffer, 256) }
-    if !cancel.is_null() { PQfreeCancel(cancel) }
-    raw.free(error_buffer)
-    if cancel_status == 0 {
+    recovery_budget := if duration_ns < WAIT_SLICE_NS { WAIT_SLICE_NS } else { duration_ns }
+    if !pkg.db.internal.resource.cancel_postgres(connection, recovery_budget) {
       failure := timeout_error(connection, raw.null())
       ignored := PQsetnonblocking(connection, 0)
       pkg.db.internal.resource.poison_conn_state(state)
@@ -488,7 +487,6 @@ fn finish_async_result(
     }
 
     recovery_start := time.instant()
-    recovery_budget := if duration_ns < WAIT_SLICE_NS { WAIT_SLICE_NS } else { duration_ns }
     recovery_deadline := if recovery_start > 9223372036854775807 - recovery_budget {
       9223372036854775807
     } else { recovery_start + recovery_budget }
@@ -1088,11 +1086,76 @@ pub fn rows_stmt_prevalidated<P, R>(
       false,
       0,
       pkg.db.internal.resource.stmt_batch_plan(wrapper),
+      0,
+      false,
+      0,
+      -1,
+      -1,
     )
     output: pkg.db.rows<R> := resource.from_raw_borrowed(
       rows_wrapper, resource.borrow(statement),
     )
     return Ok(output)
+  }
+}
+
+pub fn start_direct_stream(
+  query_id: str,
+  delivery: u8,
+  portal_max_rows: i32,
+  state: raw,
+  connection: raw,
+  context: raw,
+  rows_wrapper: raw,
+  sql: raw,
+  deadline: i64,
+) -> Result<(), pkg.db.Error> {
+  unsafe {
+    if PQsetnonblocking(connection, 1) != 0 {
+      failure := connection_error(connection)
+      ignored := pkg.db.internal.resource.discard_unpublished_rows(rows_wrapper)
+      return Err(failure)
+    }
+    if deadline >= 0 && time.instant() >= deadline {
+      failure := timeout_error(connection, raw.null())
+      if PQsetnonblocking(connection, 0) != 0 {
+        pkg.db.internal.resource.poison_conn_state(state)
+      }
+      ignored := pkg.db.internal.resource.discard_unpublished_rows(rows_wrapper)
+      return Err(failure)
+    }
+    count: u32 := raw.load(context, 72)
+    types: raw := raw.load(context, 48)
+    values: raw := raw.load(context, 40)
+    lengths: raw := raw.load(context, 56)
+    formats: raw := raw.load(context, 64)
+    sent := PQsendQueryParams(
+      connection, sql, count as i32, types, values, lengths, formats, 0,
+    )
+    if sent == 0 {
+      failure := connection_error(connection)
+      if PQsetnonblocking(connection, 0) != 0 {
+        pkg.db.internal.resource.poison_conn_state(state)
+      }
+      ignored := pkg.db.internal.resource.discard_unpublished_rows(rows_wrapper)
+      return Err(failure)
+    }
+    selected := if delivery == 1 {
+      PQsetSingleRowMode(connection)
+    } else { PQsetChunkedRowsMode(connection, portal_max_rows) }
+    if selected == 0 {
+      failure := invalid_query_error(
+        query_id,
+        "postgres.rows.delivery",
+        "PostgreSQL client rejected the selected row delivery mode",
+      )
+      ignored := pkg.db.internal.resource.cancel_rows(
+        rows_wrapper, 2, 1000000000,
+      )
+      pkg.db.internal.resource.drop_rows(rows_wrapper)
+      return Err(failure)
+    }
+    return Ok(())
   }
 }
 
@@ -1103,8 +1166,28 @@ pub fn rows_prevalidated<P, R>(
   query_id: str,
   timeout: Option<i64>,
 ) -> Result<pkg.db.rows<R>, pkg.db.Error> {
+  return rows_native_prevalidated(target, params, statement, query_id, timeout, 0, 0)
+}
+
+pub fn rows_native_prevalidated<P, R>(
+  target: pkg.db.exec,
+  params: P,
+  statement: pkg.db.query<P, R>,
+  query_id: str,
+  timeout: Option<i64>,
+  delivery: u8,
+  portal_max_rows: i32,
+) -> Result<pkg.db.rows<R>, pkg.db.Error> {
   unsafe {
     if !query_header_valid(statement) { return Err(invalid_descriptor_error()) }
+    if delivery > 2 || (delivery == 2 && portal_max_rows <= 0)
+      || (delivery != 2 && portal_max_rows != 0) {
+      return Err(invalid_query_error(
+        query_id,
+        "postgres.rows.delivery",
+        "invalid normalized PostgreSQL row delivery mode",
+      ))
+    }
     data := pkg.db.internal.descriptor.data(statement)
     mask: u8 := raw.load(data, 5)
     if mask & 2 == 0 { return Err(driver_mismatch_error(query_id)) }
@@ -1151,6 +1234,57 @@ pub fn rows_prevalidated<P, R>(
       free_context(context)
       release_lease(state)
       return Err(failure)
+    }
+    if delivery == 1 || delivery == 2 {
+      mut deadline: i64 := -1
+      mut duration: i64 := -1
+      match timeout {
+        Some(value) => {
+          duration = value
+          match absolute_deadline(value, query_id) {
+            Err(error) => {
+              free_context(context)
+              release_lease(state)
+              return Err(error)
+            }
+            Ok(resolved) => { deadline = resolved }
+          }
+        }
+        None => {}
+      }
+      raw.store(context, 8, raw.null())
+      owned_id := c_string(query_id)
+      rows_wrapper := pkg.db.internal.resource.new_rows_state(
+        DRIVER_POSTGRES,
+        raw.null(),
+        raw.null(),
+        context,
+        state,
+        pkg.db.internal.descriptor.row_validator(statement),
+        pkg.db.internal.descriptor.stream_decoder(statement),
+        owned_id,
+        query_id.len(),
+        true,
+        false,
+        false,
+        0,
+        pkg.db.internal.descriptor.batch_plan(statement),
+        delivery,
+        true,
+        portal_max_rows,
+        deadline,
+        duration,
+      )
+      sql := pkg.db.internal.descriptor.postgres_sql_pointer(statement)
+      start_direct_stream(
+        query_id, delivery, portal_max_rows, state, connection, context, rows_wrapper,
+        sql, deadline,
+      )?
+      output: pkg.db.rows<R> := match target {
+        Conn(reference) => resource.from_raw_borrowed(rows_wrapper, reference)
+        Tx(reference) => resource.from_raw_borrowed(rows_wrapper, reference)
+      }
+      return Ok(output)
     }
     sql := pkg.db.internal.descriptor.postgres_sql_pointer(statement)
     executed := execute_params_with_timeout(
@@ -1200,6 +1334,11 @@ pub fn rows_prevalidated<P, R>(
       false,
       0,
       pkg.db.internal.descriptor.batch_plan(statement),
+      0,
+      false,
+      0,
+      -1,
+      -1,
     )
     output: pkg.db.rows<R> := match target {
       Conn(reference) => resource.from_raw_borrowed(rows_wrapper, reference)
@@ -1209,14 +1348,193 @@ pub fn rows_prevalidated<P, R>(
   }
 }
 
+pub fn rows_header_error() -> pkg.db.Error = pkg.db.Error.InvalidQuery(pkg.db.ContractError {
+  query_id: None,
+  item: "db.rows.header".clone(),
+  message: "invalid database rows resource".clone(),
+})
+
+fn streamed_sequence_error(query_id: str) -> pkg.db.Error = invalid_query_error(
+  query_id,
+  "postgres.rows.delivery",
+  "PostgreSQL streamed result sequence is invalid",
+)
+
+fn streamed_cleanup_error(query_id: str) -> pkg.db.Error = descriptor_error(
+  query_id,
+  "db.rows.cleanup",
+  "PostgreSQL streamed rows cleanup failed and the connection was closed",
+)
+
+fn fail_closed_stream(rows: raw, state: raw, result: raw) {
+  unsafe {
+    if !result.is_null() { PQclear(result) }
+    ignored_native := pkg.db.internal.resource.set_rows_native(rows, raw.null())
+    pkg.db.internal.resource.poison_conn_state(state)
+    ignored_close := pkg.db.internal.resource.close_rows(rows, 2)
+  }
+}
+
+// Ensure that the current native result has one unread row. BufferedFull has one already-complete
+// result; explicit delivery advances and classifies the complete libpq result sequence here. This
+// is the sole result-sequence authority shared by next, next_batch, and one's cardinality probe.
+pub fn ensure_current_row(
+  rows: raw,
+  query_id: str,
+) -> Result<bool, pkg.db.Error> {
+  unsafe {
+    context := pkg.db.internal.resource.rows_context(rows)
+    state := pkg.db.internal.resource.rows_connection_state(rows)
+    connection := postgres_connection(state)
+    if context.is_null() || state.is_null() || connection.is_null() {
+      ignored := pkg.db.internal.resource.close_rows(rows, 2)
+      return Err(descriptor_error(
+        query_id,
+        "db.rows.state",
+        "PostgreSQL rows are closed or poisoned",
+      ))
+    }
+    delivery := pkg.db.internal.resource.rows_delivery(rows)
+    if delivery == 0 {
+      result := pkg.db.internal.resource.rows_native(rows)
+      if result.is_null() {
+        ignored := pkg.db.internal.resource.close_rows(rows, 2)
+        return Err(descriptor_error(
+          query_id,
+          "db.rows.state",
+          "PostgreSQL rows are closed or poisoned",
+        ))
+      }
+      count := rows_count(result)
+      if count < 0 {
+        failure := execution_error(connection, result)
+        ignored := pkg.db.internal.resource.close_rows(rows, 2)
+        return Err(failure)
+      }
+      row: u32 := raw.load(context, 16)
+      if row < (count as u32) { return Ok(true) }
+      ignored := pkg.db.internal.resource.close_rows(rows, 1)
+      return Ok(false)
+    }
+    if delivery != 1 && delivery != 2 {
+      ignored := pkg.db.internal.resource.close_rows(rows, 2)
+      return Err(rows_header_error())
+    }
+    deadline := pkg.db.internal.resource.rows_deadline(rows)
+    if deadline >= 0 && time.instant() >= deadline {
+      failure := timeout_error(connection, raw.null())
+      duration := pkg.db.internal.resource.rows_timeout_duration(rows)
+      budget := if duration < WAIT_SLICE_NS { WAIT_SLICE_NS } else { duration }
+      ignored := pkg.db.internal.resource.cancel_rows(rows, 2, budget)
+      return Err(failure)
+    }
+
+    mut saw_terminal := false
+    loop {
+      current := pkg.db.internal.resource.rows_native(rows)
+      if !current.is_null() {
+        count := rows_count(current)
+        row: u32 := raw.load(context, 16)
+        if count >= 0 && row < (count as u32) { return Ok(true) }
+        PQclear(current)
+        ignored := pkg.db.internal.resource.set_rows_native(rows, raw.null())
+      }
+
+      ready := wait_ready(connection, pkg.db.internal.resource.rows_deadline(rows))
+      if ready == 1 {
+        failure := timeout_error(connection, raw.null())
+        duration := pkg.db.internal.resource.rows_timeout_duration(rows)
+        budget := if duration < WAIT_SLICE_NS { WAIT_SLICE_NS } else { duration }
+        ignored := pkg.db.internal.resource.cancel_rows(rows, 2, budget)
+        return Err(failure)
+      }
+      if ready == 2 {
+        failure := connection_error(connection)
+        pkg.db.internal.resource.poison_conn_state(state)
+        ignored := pkg.db.internal.resource.close_rows(rows, 2)
+        return Err(failure)
+      }
+
+      result := PQgetResult(connection)
+      if result.is_null() {
+        if !saw_terminal {
+          failure := streamed_sequence_error(query_id)
+          ignored := pkg.db.internal.resource.drain_rows(rows, 2)
+          return Err(failure)
+        }
+        cleanup_status := pkg.db.internal.resource.complete_rows(rows, 1)
+        if cleanup_status != 0 { return Err(streamed_cleanup_error(query_id)) }
+        return Ok(false)
+      }
+
+      status := result_status(result)
+      if saw_terminal {
+        failure := streamed_sequence_error(query_id)
+        if result_must_close(status) {
+          fail_closed_stream(rows, state, result)
+        } else {
+          ignored_native := pkg.db.internal.resource.set_rows_native(rows, result)
+          ignored_drain := pkg.db.internal.resource.drain_rows(rows, 2)
+        }
+        return Err(failure)
+      }
+      if result_must_close(status) {
+        failure := streamed_sequence_error(query_id)
+        fail_closed_stream(rows, state, result)
+        return Err(failure)
+      }
+
+      mut terminal_result := false
+      if (delivery == 1 && status == PGRES_SINGLE_TUPLE)
+        || (delivery == 2 && status == PGRES_TUPLES_CHUNK) {
+        count := rows_count(result)
+        max_rows := pkg.db.internal.resource.rows_portal_max_rows(rows)
+        valid_count := if delivery == 1 {
+          count == 1
+        } else { count > 0 && count <= max_rows }
+        if valid_count {
+          if !pkg.db.internal.resource.set_rows_native(rows, result) {
+            fail_closed_stream(rows, state, result)
+            return Err(rows_header_error())
+          }
+          return Ok(true)
+        }
+      } else {
+        if status == PGRES_TUPLES_OK && rows_count(result) == 0 {
+          PQclear(result)
+          saw_terminal = true
+          terminal_result = true
+        }
+        if !terminal_result && (status == PGRES_BAD_RESPONSE || status == PGRES_NONFATAL_ERROR
+          || status == PGRES_FATAL_ERROR) {
+          failure := execution_error(connection, result)
+          ignored_native := pkg.db.internal.resource.set_rows_native(rows, result)
+          ignored_drain := pkg.db.internal.resource.drain_rows(rows, 2)
+          return Err(failure)
+        }
+      }
+
+      // Every remaining known status is ordinary but invalid for this result-sequence position.
+      // Retain it as current so the common drain clears it exactly once before restoring the conn.
+      if !terminal_result {
+        failure := streamed_sequence_error(query_id)
+        ignored_native := pkg.db.internal.resource.set_rows_native(rows, result)
+        ignored_drain := pkg.db.internal.resource.drain_rows(rows, 2)
+        return Err(failure)
+      }
+    }
+  }
+}
+
 pub fn next_prevalidated<R>(
   borrow mut rows: pkg.db.rows<R>,
 ) -> Result<Option<R>, pkg.db.Error> {
   unsafe {
     reference := resource.borrow(rows)
     wrapper := resource.raw(reference)
-    if pkg.db.internal.resource.rows_driver(wrapper) != DRIVER_POSTGRES {
-      return Err(invalid_descriptor_error())
+    if !pkg.db.internal.resource.rows_batch_header_valid(wrapper)
+      || pkg.db.internal.resource.rows_driver(wrapper) != DRIVER_POSTGRES {
+      return Err(rows_header_error())
     }
     terminal := pkg.db.internal.resource.rows_terminal(wrapper)
     if terminal == 1 { return Ok(None) }
@@ -1230,9 +1548,10 @@ pub fn next_prevalidated<R>(
     id_pointer := pkg.db.internal.resource.rows_query_id_pointer(wrapper)
     id_length := pkg.db.internal.resource.rows_query_id_length(wrapper)
     query_id: str := resource.view_from_raw(reference, id_pointer, id_length) else {
-      ignored := pkg.db.internal.resource.close_rows(wrapper, 2)
-      return Err(invalid_descriptor_error())
+      return Err(rows_header_error())
     }
+    available := ensure_current_row(wrapper, query_id)?
+    if !available { return Ok(None) }
     result := pkg.db.internal.resource.rows_native(wrapper)
     context := pkg.db.internal.resource.rows_context(wrapper)
     state := pkg.db.internal.resource.rows_connection_state(wrapper)
@@ -1245,21 +1564,11 @@ pub fn next_prevalidated<R>(
         "PostgreSQL rows are closed or poisoned",
       ))
     }
-    count := rows_count(result)
-    if count < 0 {
-      failure := execution_error(connection, result)
-      ignored := pkg.db.internal.resource.close_rows(wrapper, 2)
-      return Err(failure)
-    }
     row: u32 := raw.load(context, 16)
-    if row >= (count as u32) {
-      ignored := pkg.db.internal.resource.close_rows(wrapper, 1)
-      return Ok(None)
-    }
     validate_status := pkg.db.internal.descriptor.validate_current_row(reference, context)
     if validate_status != 0 {
       failure := context_error(context, connection, result, query_id)
-      ignored := pkg.db.internal.resource.close_rows(wrapper, 2)
+      ignored := pkg.db.internal.resource.drain_rows(wrapper, 2)
       return Err(failure)
     }
     decoded := pkg.db.internal.descriptor.decode_current_row(reference, context)
@@ -1275,30 +1584,18 @@ pub fn next_batch_prevalidated<R>(
   unsafe {
     reference := resource.borrow(rows)
     wrapper := resource.raw(reference)
-    if pkg.db.internal.resource.rows_driver(wrapper) != DRIVER_POSTGRES
-      || !pkg.db.internal.resource.rows_batch_header_valid(wrapper) {
-      return Err(pkg.db.Error.InvalidQuery(pkg.db.ContractError {
-        query_id: None,
-        item: "db.rows.header".clone(),
-        message: "invalid database rows resource".clone(),
-      }))
+    if !pkg.db.internal.resource.rows_batch_header_valid(wrapper)
+      || pkg.db.internal.resource.rows_driver(wrapper) != DRIVER_POSTGRES {
+      return Err(rows_header_error())
     }
     id_pointer := pkg.db.internal.resource.rows_query_id_pointer(wrapper)
     id_length := pkg.db.internal.resource.rows_query_id_length(wrapper)
     plan := pkg.db.internal.resource.rows_batch_plan(wrapper)
     query_id: str := resource.view_from_raw(reference, id_pointer, id_length) else {
-      return Err(pkg.db.Error.InvalidQuery(pkg.db.ContractError {
-        query_id: None,
-        item: "db.rows.header".clone(),
-        message: "invalid database rows resource".clone(),
-      }))
+      return Err(rows_header_error())
     }
     if plan.is_null() {
-      return Err(pkg.db.Error.InvalidQuery(pkg.db.ContractError {
-        query_id: None,
-        item: "db.rows.header".clone(),
-        message: "invalid database rows resource".clone(),
-      }))
+      return Err(rows_header_error())
     }
     if max_rows <= 0 || max_rows > 2147483647 {
       return Err(descriptor_error(
@@ -1316,29 +1613,8 @@ pub fn next_batch_prevalidated<R>(
         "database rows cannot advance after a failed execution",
       ))
     }
-    result := pkg.db.internal.resource.rows_native(wrapper)
-    context := pkg.db.internal.resource.rows_context(wrapper)
-    state := pkg.db.internal.resource.rows_connection_state(wrapper)
-    connection := postgres_connection(state)
-    if result.is_null() || context.is_null() || connection.is_null() {
-      ignored := pkg.db.internal.resource.close_rows(wrapper, 2)
-      return Err(descriptor_error(
-        query_id,
-        "db.rows.state",
-        "PostgreSQL rows are closed or poisoned",
-      ))
-    }
-    count := rows_count(result)
-    if count < 0 {
-      failure := execution_error(connection, result)
-      ignored := pkg.db.internal.resource.close_rows(wrapper, 2)
-      return Err(failure)
-    }
-    mut row: u32 := raw.load(context, 16)
-    if row >= (count as u32) {
-      ignored := pkg.db.internal.resource.close_rows(wrapper, 1)
-      return Ok(None)
-    }
+    available := ensure_current_row(wrapper, query_id)?
+    if !available { return Ok(None) }
     payload := pkg.db.internal.descriptor.create_batch(plan, max_rows)
     if payload.is_null() {
       return Err(descriptor_error(
@@ -1349,12 +1625,34 @@ pub fn next_batch_prevalidated<R>(
     }
     mut length := 0
     loop {
-      if length >= max_rows || row >= (count as u32) { break }
+      if length >= max_rows { break }
+      current_available := ensure_current_row(wrapper, query_id)
+      match current_available {
+        Err(error) => {
+          pkg.db.internal.descriptor.drop_batch_payload(plan, payload)
+          return Err(error)
+        }
+        Ok(is_available) => { if !is_available { break } }
+      }
+      result := pkg.db.internal.resource.rows_native(wrapper)
+      context := pkg.db.internal.resource.rows_context(wrapper)
+      state := pkg.db.internal.resource.rows_connection_state(wrapper)
+      connection := postgres_connection(state)
+      if result.is_null() || context.is_null() || connection.is_null() {
+        pkg.db.internal.descriptor.drop_batch_payload(plan, payload)
+        ignored := pkg.db.internal.resource.close_rows(wrapper, 2)
+        return Err(descriptor_error(
+          query_id,
+          "db.rows.state",
+          "PostgreSQL rows are closed or poisoned",
+        ))
+      }
+      row: u32 := raw.load(context, 16)
       validate_status := pkg.db.internal.descriptor.validate_current_row(reference, context)
       if validate_status != 0 {
         failure := context_error(context, connection, result, query_id)
         pkg.db.internal.descriptor.drop_batch_payload(plan, payload)
-        ignored := pkg.db.internal.resource.close_rows(wrapper, 2)
+        ignored := pkg.db.internal.resource.drain_rows(wrapper, 2)
         return Err(failure)
       }
       append_status := pkg.db.internal.descriptor.append_current_batch(
@@ -1362,19 +1660,26 @@ pub fn next_batch_prevalidated<R>(
       )
       if append_status != 0 {
         pkg.db.internal.descriptor.drop_batch_payload(plan, payload)
-        ignored := pkg.db.internal.resource.close_rows(wrapper, 2)
+        ignored := pkg.db.internal.resource.drain_rows(wrapper, 2)
         return Err(descriptor_error(
           query_id,
           "db.batch.storage",
           "database batch variable-width storage exceeds the supported address range",
         ))
       }
-      row = row + 1
-      raw.store(context, 16, row)
+      raw.store(context, 16, row + 1)
       length = length + 1
     }
-    if row >= (count as u32) {
-      ignored := pkg.db.internal.resource.close_rows(wrapper, 1)
+    if pkg.db.internal.resource.rows_delivery(wrapper) == 0 {
+      buffered_result := pkg.db.internal.resource.rows_native(wrapper)
+      buffered_context := pkg.db.internal.resource.rows_context(wrapper)
+      if !buffered_result.is_null() && !buffered_context.is_null() {
+        buffered_count := rows_count(buffered_result)
+        buffered_row: u32 := raw.load(buffered_context, 16)
+        if buffered_count >= 0 && buffered_row >= (buffered_count as u32) {
+          ignored := pkg.db.internal.resource.close_rows(wrapper, 1)
+        }
+      }
     }
     pkg.db.internal.descriptor.finish_batch(plan, payload, length)
     batch_wrapper := pkg.db.internal.resource.new_batch_state(plan, payload, length, max_rows)
@@ -1389,8 +1694,9 @@ pub fn has_next_prevalidated<R>(
   unsafe {
     reference := resource.borrow(rows)
     wrapper := resource.raw(reference)
-    if pkg.db.internal.resource.rows_driver(wrapper) != DRIVER_POSTGRES {
-      return Err(invalid_descriptor_error())
+    if !pkg.db.internal.resource.rows_batch_header_valid(wrapper)
+      || pkg.db.internal.resource.rows_driver(wrapper) != DRIVER_POSTGRES {
+      return Err(rows_header_error())
     }
     terminal := pkg.db.internal.resource.rows_terminal(wrapper)
     if terminal == 1 { return Ok(false) }
@@ -1404,39 +1710,33 @@ pub fn has_next_prevalidated<R>(
     id_pointer := pkg.db.internal.resource.rows_query_id_pointer(wrapper)
     id_length := pkg.db.internal.resource.rows_query_id_length(wrapper)
     query_id: str := resource.view_from_raw(reference, id_pointer, id_length) else {
-      ignored := pkg.db.internal.resource.close_rows(wrapper, 2)
-      return Err(invalid_descriptor_error())
+      return Err(rows_header_error())
     }
-    result := pkg.db.internal.resource.rows_native(wrapper)
-    state := pkg.db.internal.resource.rows_connection_state(wrapper)
-    connection := postgres_connection(state)
-    if result.is_null() || connection.is_null() {
-      ignored := pkg.db.internal.resource.close_rows(wrapper, 2)
-      return Err(descriptor_error(
-        query_id,
-        "db.rows.state",
-        "PostgreSQL rows are closed or poisoned",
-      ))
+    mut observed := false
+    loop {
+      available := ensure_current_row(wrapper, query_id)?
+      if !available { return Ok(observed) }
+      result := pkg.db.internal.resource.rows_native(wrapper)
+      context := pkg.db.internal.resource.rows_context(wrapper)
+      if result.is_null() || context.is_null() {
+        ignored := pkg.db.internal.resource.close_rows(wrapper, 2)
+        return Err(descriptor_error(
+          query_id,
+          "db.rows.state",
+          "PostgreSQL rows are closed or poisoned",
+        ))
+      }
+      count := rows_count(result)
+      if count < 0 {
+        state := pkg.db.internal.resource.rows_connection_state(wrapper)
+        connection := postgres_connection(state)
+        failure := execution_error(connection, result)
+        ignored := pkg.db.internal.resource.drain_rows(wrapper, 2)
+        return Err(failure)
+      }
+      raw.store(context, 16, count as u32)
+      observed = true
     }
-    count := rows_count(result)
-    if count < 0 {
-      failure := execution_error(connection, result)
-      ignored := pkg.db.internal.resource.close_rows(wrapper, 2)
-      return Err(failure)
-    }
-    context := pkg.db.internal.resource.rows_context(wrapper)
-    if context.is_null() {
-      ignored := pkg.db.internal.resource.close_rows(wrapper, 2)
-      return Err(descriptor_error(
-        query_id,
-        "db.rows.state",
-        "PostgreSQL rows are closed or poisoned",
-      ))
-    }
-    row: u32 := raw.load(context, 16)
-    if row < (count as u32) { return Ok(true) }
-    ignored := pkg.db.internal.resource.close_rows(wrapper, 1)
-    return Ok(false)
   }
 }
 

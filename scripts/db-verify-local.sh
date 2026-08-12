@@ -19,7 +19,37 @@ docker info >/dev/null 2>&1 || {
   exit 2
 }
 
-cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; }
+scripts/check-libpq-version.sh
+
+# Some developer hosts intentionally carry only libpq's stable runtime ABI
+# (`libpq.so.5`) and not the development-package linker name (`libpq.so`). The
+# version/symbol probe above proves that runtime is usable; expose only its
+# linker name for this invocation so the generated owner executables still use
+# the verified library. CI has pg_config/libpq-dev and never takes this branch.
+libpq_shim=""
+if ! command -v pg_config >/dev/null 2>&1; then
+  if command -v ldconfig >/dev/null 2>&1; then
+    libpq_runtime="$(ldconfig -p | awk '$1 == "libpq.so.5" { print $NF; exit }')"
+  else
+    libpq_runtime=""
+  fi
+  if [ -z "$libpq_runtime" ]; then
+    echo "libpq development linker name is unavailable and no libpq.so.5 runtime was found" >&2
+    exit 2
+  fi
+  libpq_shim="$(mktemp -d)"
+  ln -s "$libpq_runtime" "$libpq_shim/libpq.so"
+  export LIBRARY_PATH="$libpq_shim${LIBRARY_PATH:+:$LIBRARY_PATH}"
+  echo "using verified runtime libpq through a temporary linker shim: $libpq_runtime"
+fi
+
+cleanup() {
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  if [ -n "$libpq_shim" ]; then
+    [ ! -L "$libpq_shim/libpq.so" ] || unlink "$libpq_shim/libpq.so"
+    rmdir "$libpq_shim"
+  fi
+}
 trap cleanup EXIT
 
 docker run -d --name "$name" \
@@ -67,5 +97,6 @@ scripts/cargo.sh test --locked -p align_driver --test pkg_db_q2 -- --nocapture
 scripts/cargo.sh test --locked -p align_driver --test pkg_db_q3 -- --nocapture
 scripts/cargo.sh test --locked -p align_driver --test pkg_db_q5a -- --nocapture
 scripts/cargo.sh test --locked -p align_driver --test pkg_db_q5b2 -- --nocapture
+scripts/cargo.sh test --locked -p align_driver --test pkg_db_a1 -- --nocapture
 
-echo "local PostgreSQL verification passed (CI parity: pkg_db_q2 / q3 / q5a / q5b2)"
+echo "local PostgreSQL verification passed (CI parity: pkg_db_q2 / q3 / q5a / q5b2 / a1)"

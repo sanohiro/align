@@ -55,6 +55,11 @@ pub Format {
   Binary
 }
 
+pub Delivery {
+  SingleRow
+  PortalBatch(i64)
+}
+
 pub ConnectOption {
   ApplicationName(str)
   ConnectTimeoutNs(i64)
@@ -66,6 +71,7 @@ pub ConnectOption {
 pub ExecuteOption {
   ParameterFormat(str, Format)
   ResultFormat(Format)
+  Delivery(Delivery)
 }
 
 pub PrepareOption {
@@ -974,6 +980,13 @@ pub fn execute_native<P>(
             Text => {}
           }
         }
+        Delivery(_) => {
+          return Err(pkg.db.internal.postgres.descriptor_error(
+            query_id,
+            "postgres.execute.delivery",
+            "PostgreSQL row delivery requires a Query result",
+          ))
+        }
       }
       native_index = native_index + 1
     }
@@ -1026,6 +1039,8 @@ pub fn rows_native<P, R>(
     query_id := pkg.db.internal.descriptor.descriptor_id(statement)
     timeout := pkg.db.internal.postgres.common_options_valid(options, query_id)?
     mut saw_result := false
+    mut delivery: u8 := 0
+    mut portal_max_rows: i32 := 0
     mut native_index := 0
     loop {
       if native_index >= native.len() { break }
@@ -1091,11 +1106,38 @@ pub fn rows_native<P, R>(
             Text => {}
           }
         }
+        Delivery(mode) => {
+          mut current_delivery: u8 := 1
+          mut current_portal: i32 := 0
+          match mode {
+            SingleRow => {}
+            PortalBatch(max_rows) => {
+              if max_rows <= 0 || max_rows > 2147483647 {
+                return Err(pkg.db.internal.postgres.descriptor_error(
+                  query_id,
+                  "postgres.execute.delivery",
+                  "PostgreSQL portal batch size must be between 1 and 2147483647 rows",
+                ))
+              }
+              current_delivery = 2
+              current_portal = max_rows as i32
+            }
+          }
+          if delivery != 0 {
+            return Err(pkg.db.internal.postgres.descriptor_error(
+              query_id,
+              "postgres.execute.delivery",
+              "duplicate PostgreSQL row delivery option",
+            ))
+          }
+          delivery = current_delivery
+          portal_max_rows = current_portal
+        }
       }
       native_index = native_index + 1
     }
-    return pkg.db.internal.postgres.rows_prevalidated(
-      target, params, statement, query_id, timeout,
+    return pkg.db.internal.postgres.rows_native_prevalidated(
+      target, params, statement, query_id, timeout, delivery, portal_max_rows,
     )
   }
 }

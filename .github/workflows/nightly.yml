@@ -34,7 +34,8 @@ jobs:
     env:
       ALIGN_APT_PACKAGES: >-
         llvm-22-dev clang-22 libclang-rt-22-dev lld-22
-        libpq-dev libsqlite3-dev libssl-dev zlib1g-dev libzstd-dev make perl
+        libpq-dev postgresql-client-17
+        libsqlite3-dev libssl-dev zlib1g-dev libzstd-dev make perl
       # Fail closed on the linker: a missing lld-22 must be a red build, not a
       # silent fallback to the slow system linker (build-perf item 2).
       ALIGNC_LINKER: lld
@@ -62,6 +63,7 @@ jobs:
           # repository definition cannot drift between the two — including the
           # --no-remove that fails the night a request stops being replayable
           # by dpkg, before a cached job saves it.
+          scripts/ci-pgdg.sh
           scripts/ci-apt-llvm.sh install --uncached
           OPENSSL_PREFIX="$RUNNER_TEMP/openssl-${OPENSSL_VERSION}"
           if [ ! -x "$OPENSSL_PREFIX/bin/openssl" ]; then
@@ -86,7 +88,9 @@ jobs:
 
       - name: Build workspace
         shell: bash
-        run: scripts/cargo.sh build --workspace --locked
+        run: |
+          scripts/check-libpq-version.sh
+          scripts/cargo.sh build --workspace --locked
 
       # The db-required suites run in skip/SQLite-only mode here (no PostgreSQL
       # service); the per-PR required CI job owns that coverage. The one known
