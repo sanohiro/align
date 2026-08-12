@@ -313,7 +313,7 @@ fn exercise() -> i32 {
         native_calls_ok := unsafe {
           align_pg_connect_calls() == 1 && align_pg_execute_calls() == 12
             && align_pg_clear_calls() == 11 && align_pg_protocol_ok() == 1
-            && align_pg_last_timeout() == 2 && align_pg_finish_calls() == 0
+            && align_pg_last_timeout() == 2 && align_pg_finish_calls() == 1
         }
         if command_ok && selected_ok && zero_ok && bad_first_ok && valid_first_ok
           && row_command_ok && malformed_affected_ok && constraint_ok && serialization_ok
@@ -1460,7 +1460,7 @@ pkg-db-q2-common-postgres a9428d3064bd4bbe
 pkg-db-q2-inherited-environment e683f9105f9dc29b
 pkg-db-q2-postgres-bytea 79d1dc83bbf8957c
 pkg-db-q2-postgres-connect-options 656bca47d6e7057a
-pkg-db-q2-postgres-native-scalar 3f9b8b531022f9fb
+pkg-db-q2-postgres-native-scalar c09ae5eb7915a814
 pkg-db-q2-postgres-nul 8917c451b60242e7
 pkg-db-q2-sqlite-connect 5a2490e68e61e517
 pkg-db-q2-sqlite-invalid-connect cc4b62703c14a7e8

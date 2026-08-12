@@ -512,7 +512,7 @@ fn disabled_memo_is_a_complete_bypass() {
 
 // ---- pkg.db-backed owners: static descriptors and the sema diagnostic sink -----------------------
 
-/// The eight shipped `pkg.db` package modules, read from disk once.
+/// The nine shipped `pkg.db` package modules, read from disk once.
 ///
 /// Static descriptors exist only where the compiler recognizes a `pkg.db*` Query/command
 /// constructor, so the descriptor cells cannot be closed by a synthetic fixture — they need the real
@@ -528,6 +528,7 @@ fn db_package() -> Vec<(&'static str, String)> {
         "pkg/db/internal/descriptor.align",
         "pkg/db/internal/sqlite.align",
         "pkg/db/internal/postgres.align",
+        "pkg/db/internal/postgres_status.align",
     ]
     .into_iter()
     .map(|path| (path, fixture(&format!("apps/db/{path}")).to_string()))

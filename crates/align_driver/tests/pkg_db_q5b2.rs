@@ -251,6 +251,364 @@ import pkg.db.lease_fixture
 fn main() -> i32 = pkg.db.lease_fixture.run()
 "#;
 
+const POSTGRES_STATUS_MODULE: &str = r#"module pkg.db.status_fixture
+import pkg.db
+import pkg.db.postgres
+import pkg.db.internal.resource
+
+Params { value: i64 }
+PreparedParams { id: i64, label: str, payload: slice<u8> }
+Row { value: i64 }
+
+fn query() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
+  "SELECT CAST(:value AS BIGINT) AS value", [],
+  [pkg.db.postgres.QueryOption.ParameterType("value", "int8")],
+)
+
+fn wait_query() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
+  "SELECT CAST(:value AS BIGINT) AS value /* TIMEOUT_WAIT */", [],
+  [pkg.db.postgres.QueryOption.ParameterType("value", "int8")],
+)
+
+fn prepared_query() -> pkg.db.query<PreparedParams, Row> = pkg.db.postgres.query(
+  "SELECT CAST(:id AS BIGINT) AS value WHERE :label = :label AND :payload = :payload", [],
+  [pkg.db.postgres.QueryOption.ParameterType("id", "int8")],
+)
+
+fn prepared_wait_query() -> pkg.db.query<PreparedParams, Row> = pkg.db.postgres.query(
+  "SELECT CAST(:id AS BIGINT) AS value WHERE :label = :label AND :payload = :payload /* TIMEOUT_WAIT */", [],
+  [pkg.db.postgres.QueryOption.ParameterType("id", "int8")],
+)
+
+fn command() -> pkg.db.command<Params> = pkg.db.postgres.command(
+  "UPDATE stub SET value = :value /* COMMAND_OK */", [],
+  [pkg.db.postgres.CommandOption.ParameterType("value", "int8")],
+)
+
+extern "C" {
+  fn align_pg_reset()
+  fn align_pg_force_result_status(status: i32)
+  fn align_pg_clear_calls() -> i32
+  fn align_pg_finish_calls() -> i32
+  fn align_pg_forbidden_after_status_calls() -> i32
+  fn align_pg_make_result() -> raw
+}
+
+fn force(status: i32) { unsafe { align_pg_force_result_status(status) } }
+
+fn exact_native<T>(result: Result<T, pkg.db.Error>) -> bool = match result {
+  Err(error) => match error {
+    Native(native) => native.message == "stub execution failure"
+      && match native.sqlstate { Some(state) => state == "XX000" None => false }
+    _ => false
+  }
+  Ok(_) => false
+}
+
+fn exact_timeout<T>(result: Result<T, pkg.db.Error>) -> bool = match result {
+  Err(error) => match error {
+    Timeout(native) => native.message == "cancelled by deadline"
+    _ => false
+  }
+  Ok(_) => false
+}
+
+fn exact_command<T>(status: i32, result: Result<T, pkg.db.Error>) -> bool {
+  if status == 3 || status == 4 || status == 8 {
+    return match result {
+      Err(error) => match error {
+        InvalidQuery(contract) => contract.item == "db.command.row"
+        _ => false
+      }
+      Ok(_) => false
+    }
+  }
+  return exact_native(result)
+}
+
+fn closed(state: raw) -> bool {
+  unsafe {
+    closed_tag: u8 := raw.load(state, 5)
+    native: raw := raw.load(state, 8)
+    lease: u8 := raw.load(state, 20)
+    transaction: u8 := raw.load(state, 21)
+    return closed_tag == 1 && native.is_null() && lease == 0 && transaction == 0
+  }
+}
+
+fn counters(expected_clear: i32) -> bool {
+  unsafe {
+    return align_pg_clear_calls() == expected_clear && align_pg_finish_calls() == 1
+      && align_pg_forbidden_after_status_calls() == 0
+  }
+}
+
+fn direct_rows(status: i32) -> bool {
+  unsafe { align_pg_reset() }
+  connection := pkg.db.postgres.connect("fake", []) else { return false }
+  state := unsafe { resource.raw(resource.borrow(connection)) }
+  target := pkg.db.exec_conn(connection)
+  force(status)
+  failed := exact_native(pkg.db.rows(target, query(), Params { value: 7 }, []))
+  return failed && closed(state) && counters(1)
+}
+
+fn direct_one(status: i32) -> bool {
+  unsafe { align_pg_reset() }
+  connection := pkg.db.postgres.connect("fake", []) else { return false }
+  state := unsafe { resource.raw(resource.borrow(connection)) }
+  target := pkg.db.exec_conn(connection)
+  force(status)
+  arena out {
+    failed := exact_native(pkg.db.one(target, query(), Params { value: 7 }, out, []))
+    return failed && closed(state) && counters(1)
+  }
+}
+
+fn direct_command(status: i32) -> bool {
+  unsafe { align_pg_reset() }
+  connection := pkg.db.postgres.connect("fake", []) else { return false }
+  state := unsafe { resource.raw(resource.borrow(connection)) }
+  target := pkg.db.exec_conn(connection)
+  force(status)
+  failed := exact_command(status, pkg.db.execute(target, command(), Params { value: 7 }, []))
+  return failed && closed(state) && counters(1)
+}
+
+fn prepared_rows(status: i32, timeout: bool, wait: bool) -> bool {
+  unsafe { align_pg_reset() }
+  connection := pkg.db.postgres.connect("fake", []) else { return false }
+  state := unsafe { resource.raw(resource.borrow(connection)) }
+  target := pkg.db.exec_conn(connection)
+  mut statement := pkg.db.prepare(
+    target, if wait { prepared_wait_query() } else { prepared_query() }, [],
+  ) else { return false }
+  force(status)
+  failed := if timeout {
+    if wait {
+      exact_timeout(pkg.db.rows_stmt(
+        statement, PreparedParams {
+          id: 7, label: "first", payload: [1 as u8, 2 as u8, 3 as u8],
+        }, [pkg.db.ExecuteOption.TimeoutNs(1000000)],
+      ))
+    } else {
+      exact_native(pkg.db.rows_stmt(
+        statement, PreparedParams {
+          id: 7, label: "first", payload: [1 as u8, 2 as u8, 3 as u8],
+        }, [pkg.db.ExecuteOption.TimeoutNs(100000000)],
+      ))
+    }
+  } else {
+    exact_native(pkg.db.rows_stmt(statement, PreparedParams {
+      id: 7, label: "first", payload: [1 as u8, 2 as u8, 3 as u8],
+    }, []))
+  }
+  return failed && closed(state) && counters(2)
+}
+
+fn prepare_result(status: i32) -> bool {
+  unsafe { align_pg_reset() }
+  connection := pkg.db.postgres.connect("fake", []) else { return false }
+  state := unsafe { resource.raw(resource.borrow(connection)) }
+  force(status)
+  failed := exact_native(pkg.db.prepare(
+    pkg.db.exec_conn(connection), prepared_query(), [],
+  ))
+  return failed && closed(state) && counters(1)
+}
+
+fn timed_rows(status: i32, wait: bool) -> bool {
+  unsafe { align_pg_reset() }
+  connection := pkg.db.postgres.connect("fake", []) else { return false }
+  state := unsafe { resource.raw(resource.borrow(connection)) }
+  target := pkg.db.exec_conn(connection)
+  force(status)
+  failed := if wait {
+    exact_timeout(pkg.db.rows(
+      target, wait_query(), Params { value: 7 }, [pkg.db.ExecuteOption.TimeoutNs(1000000)],
+    ))
+  } else {
+    exact_native(pkg.db.rows(
+      target, query(), Params { value: 7 }, [pkg.db.ExecuteOption.TimeoutNs(100000000)],
+    ))
+  }
+  return failed && closed(state) && counters(1)
+}
+
+fn timed_one(status: i32) -> bool {
+  unsafe { align_pg_reset() }
+  connection := pkg.db.postgres.connect("fake", []) else { return false }
+  state := unsafe { resource.raw(resource.borrow(connection)) }
+  target := pkg.db.exec_conn(connection)
+  force(status)
+  arena out {
+    failed := exact_native(pkg.db.one(
+      target, query(), Params { value: 7 }, out,
+      [pkg.db.ExecuteOption.TimeoutNs(100000000)],
+    ))
+    return failed && closed(state) && counters(1)
+  }
+}
+
+fn timed_command(status: i32) -> bool {
+  unsafe { align_pg_reset() }
+  connection := pkg.db.postgres.connect("fake", []) else { return false }
+  state := unsafe { resource.raw(resource.borrow(connection)) }
+  target := pkg.db.exec_conn(connection)
+  force(status)
+  failed := exact_command(status, pkg.db.execute(
+    target, command(), Params { value: 7 },
+    [pkg.db.ExecuteOption.TimeoutNs(100000000)],
+  ))
+  return failed && closed(state) && counters(1)
+}
+
+fn begin_common(status: i32) -> bool {
+  unsafe { align_pg_reset() }
+  connection := pkg.db.postgres.connect("fake", []) else { return false }
+  force(status)
+  failed := exact_native(pkg.db.begin(connection, []))
+  return failed && counters(1)
+}
+
+fn begin_native(status: i32) -> bool {
+  unsafe { align_pg_reset() }
+  connection := pkg.db.postgres.connect("fake", []) else { return false }
+  force(status)
+  failed := exact_native(pkg.db.postgres.begin_native(connection, [], []))
+  return failed && counters(1)
+}
+
+fn finish_transaction(status: i32, commit: bool) -> bool {
+  unsafe { align_pg_reset() }
+  connection := pkg.db.postgres.connect("fake", []) else { return false }
+  transaction := pkg.db.begin(connection, []) else { return false }
+  force(status)
+  failed := if commit {
+    exact_native(pkg.db.commit(transaction))
+  } else { exact_native(pkg.db.rollback(transaction)) }
+  return failed && counters(2)
+}
+
+fn catalog(status: i32) -> bool {
+  unsafe { align_pg_reset() }
+  connection := pkg.db.postgres.connect("fake", []) else { return false }
+  state := unsafe { resource.raw(resource.borrow(connection)) }
+  target := pkg.db.exec_conn(connection)
+  force(status)
+  arena out {
+    failed := exact_native(pkg.db.meta_schemas(target, pkg.db.MetaDetail.Names, out, []))
+    return failed && closed(state) && counters(1)
+  }
+}
+
+fn explain(status: i32) -> bool {
+  unsafe { align_pg_reset() }
+  connection := pkg.db.postgres.connect("fake", []) else { return false }
+  state := unsafe { resource.raw(resource.borrow(connection)) }
+  target := pkg.db.exec_conn(connection)
+  force(status)
+  arena out {
+    failed := exact_native(pkg.db.explain(target, query(), Params { value: 7 }, out, []))
+    return failed && closed(state) && counters(1)
+  }
+}
+
+fn force_drop_rows<R>(rows: pkg.db.rows<R>, status: i32) { force(status) }
+fn force_drop_stmt<P, R>(statement: pkg.db.stmt<P, R>, status: i32) { force(status) }
+fn force_drop_tx(transaction: pkg.db.tx, status: i32) { force(status) }
+fn force_drop_cursor(cursor: pkg.db.catalog_cursor, status: i32) { force(status) }
+
+fn rows_drop(status: i32) -> bool {
+  unsafe { align_pg_reset() }
+  connection := pkg.db.postgres.connect("fake", []) else { return false }
+  state := unsafe { resource.raw(resource.borrow(connection)) }
+  rows := pkg.db.rows(pkg.db.exec_conn(connection), query(), Params { value: 7 }, []) else {
+    return false
+  }
+  force_drop_rows(rows, status)
+  return closed(state) && counters(1)
+}
+
+fn stmt_drop(status: i32) -> bool {
+  unsafe { align_pg_reset() }
+  connection := pkg.db.postgres.connect("fake", []) else { return false }
+  state := unsafe { resource.raw(resource.borrow(connection)) }
+  statement := pkg.db.prepare(pkg.db.exec_conn(connection), prepared_query(), []) else {
+    return false
+  }
+  force_drop_stmt(statement, status)
+  return closed(state) && counters(2)
+}
+
+fn tx_drop(status: i32) -> bool {
+  unsafe { align_pg_reset() }
+  connection := pkg.db.postgres.connect("fake", []) else { return false }
+  transaction := pkg.db.begin(connection, []) else { return false }
+  force_drop_tx(transaction, status)
+  return counters(2)
+}
+
+fn cursor_drop(status: i32) -> bool {
+  unsafe { align_pg_reset() }
+  connection := pkg.db.postgres.connect("fake", []) else { return false }
+  state := unsafe { resource.raw(resource.borrow(connection)) }
+  result := unsafe { align_pg_make_result() }
+  if result.is_null() { return false }
+  wrapper := unsafe { pkg.db.internal.resource.new_catalog_cursor(
+    2, result, state, raw.null(), raw.null(),
+  ) }
+  cursor: pkg.db.catalog_cursor := unsafe { resource.from_raw_borrowed(
+    wrapper, resource.borrow(connection),
+  ) }
+  force_drop_cursor(cursor, status)
+  return closed(state) && counters(1)
+}
+
+fn exercise(status: i32) -> i32 {
+  if !direct_rows(status) { return 1 }
+  if !direct_one(status) { return 2 }
+  if !direct_command(status) { return 3 }
+  if !prepared_rows(status, false, false) { return 4 }
+  if !prepare_result(status) { return 5 }
+  if !timed_rows(status, false) { return 6 }
+  if !timed_one(status) { return 7 }
+  if !timed_command(status) { return 8 }
+  if !prepared_rows(status, true, false) { return 9 }
+  if !timed_rows(status, true) { return 10 }
+  if !prepared_rows(status, true, true) { return 11 }
+  if !begin_common(status) { return 12 }
+  if !begin_native(status) { return 13 }
+  if !finish_transaction(status, true) { return 14 }
+  if !finish_transaction(status, false) { return 15 }
+  if !catalog(status) { return 16 }
+  if !explain(status) { return 17 }
+  if !rows_drop(status) { return 18 }
+  if !stmt_drop(status) { return 19 }
+  if !tx_drop(status) { return 20 }
+  if !cursor_drop(status) { return 21 }
+  return 0
+}
+
+pub fn run() -> i32 {
+  statuses := [3 as i32, 4 as i32, 8 as i32, 10 as i32, 11 as i32, 99 as i32]
+  mut i: i64 := 0
+  loop {
+    if i >= statuses.len() { break }
+    failure := exercise(statuses[i])
+    if failure != 0 { return failure }
+    i = i + 1
+  }
+  return 200
+}
+"#;
+
+const POSTGRES_STATUS_MAIN: &str = r#"module main
+import pkg.db.status_fixture
+
+fn main() -> i32 = pkg.db.status_fixture.run()
+"#;
+
 const LOOKUP: &str = r#"module app.lookup
 import pkg.db
 
@@ -1085,6 +1443,10 @@ fn package_files() -> Vec<(&'static str, &'static str)> {
         ("pkg/db/internal/descriptor.align", package_source("pkg/db/internal/descriptor.align")),
         ("pkg/db/internal/sqlite.align", package_source("pkg/db/internal/sqlite.align")),
         ("pkg/db/internal/postgres.align", package_source("pkg/db/internal/postgres.align")),
+        (
+            "pkg/db/internal/postgres_status.align",
+            package_source("pkg/db/internal/postgres_status.align"),
+        ),
         ("pkg/db/q5b2_setup.align", SETUP),
         ("main.align", MAIN),
     ]
@@ -1119,6 +1481,14 @@ fn postgres_lease_package_files() -> Vec<(&'static str, &'static str)> {
     files.retain(|(path, _)| *path != "main.align");
     files.push(("pkg/db/lease_fixture.align", POSTGRES_LEASE_MODULE));
     files.push(("main.align", POSTGRES_LEASE_MAIN));
+    files
+}
+
+fn postgres_status_package_files() -> Vec<(&'static str, &'static str)> {
+    let mut files = package_files();
+    files.retain(|(path, _)| *path != "main.align");
+    files.push(("pkg/db/status_fixture.align", POSTGRES_STATUS_MODULE));
+    files.push(("main.align", POSTGRES_STATUS_MAIN));
     files
 }
 
@@ -1390,6 +1760,50 @@ fn postgres_catalog_and_explain_share_the_execution_lease() {
         "stdout: {}; stderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn postgres_package_results_fail_closed_before_followup_native_work() {
+    if !backend_available() || !cc_available() {
+        return;
+    }
+    let output = build_and_run_multi_with_c(
+        "pkg-db-postgres-status-safety",
+        &postgres_status_package_files(),
+        "main.align",
+        db_harness::PG.c_source,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(200),
+        "stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+fn postgres_status_authority_is_package_sealed() {
+    let bad = r#"module app.bad_status
+import pkg.db.internal.postgres_status
+
+pub fn classify(status: i32) -> bool = pkg.db.internal.postgres_status.must_close(status)
+"#;
+    let main = "module main\nimport app.bad_status\nfn main() -> i32 = 0\n";
+    let mut files = package_files();
+    files.retain(|(path, _)| *path != "main.align");
+    files.push(("app/bad_status.align", bad));
+    files.push(("main.align", main));
+    let diagnostics = check_multi_diagnostics(
+        "pkg-db-postgres-status-authority-sealed",
+        &files,
+        "main.align",
+    );
+    assert!(
+        diagnostics.contains("cannot import internal module `pkg.db.internal.postgres_status`")
+            && diagnostics.contains("only from within `pkg.db`"),
+        "the status authority must remain package-sealed:\n{diagnostics}"
     );
 }
 

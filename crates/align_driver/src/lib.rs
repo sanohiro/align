@@ -24,6 +24,7 @@ pub mod db_prepare;
 pub mod db_prepare_native;
 pub mod db_migrate;
 pub mod db_migrate_native;
+mod db_postgres_status;
 pub mod explain;
 pub mod memo;
 mod query_meta_codegen;

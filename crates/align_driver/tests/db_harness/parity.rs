@@ -46,6 +46,7 @@ use super::runner::RUNNER_PER_UNIT_C;
 use crate::common::{
     BuildTarget, Profile, Proj, SourceMap, build_per_unit, emit_object_file, link_objects,
 };
+use align_driver::order_link_libs;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -196,13 +197,26 @@ impl ParityProgram {
             )
             .unwrap_or_else(|e| panic!("codegen for unit `{}`: {e}", unit.unit));
             for lib in &unit.mir.link_libs {
-                // The C fixture supplies libpq's symbols; linking the real library too would let
-                // the real one win and silently defeat the stub.
-                if lib != "pq" && !link_libs.contains(lib) {
+                if !link_libs.contains(lib) {
                     link_libs.push(lib.clone());
                 }
             }
             objects.push(object);
+        }
+        // The C fixture substitutes libpq itself, but the runtime and any newly split package unit
+        // still require libpq's ordered dependent closure. Normalize before removing only `pq`, as
+        // the shared C-fixture runner does; filtering first loses ssl/crypto/zstd/z on ELF.
+        let substitutes_libpq = link_libs.iter().any(|library| library == "pq");
+        link_libs = order_link_libs(&link_libs)
+            .into_iter()
+            .filter(|library| library != "pq")
+            .collect();
+        if substitutes_libpq {
+            link_libs.extend(
+                ["ssl", "crypto", "zstd", "z"]
+                    .into_iter()
+                    .map(str::to_owned),
+            );
         }
         let c_source = layout.c_fixture().expect("checked above");
         let c_path = proj.dir.join("fixture.c");

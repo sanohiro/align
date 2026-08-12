@@ -4,6 +4,7 @@ import std.process
 import pkg.db.internal
 import pkg.db.internal.resource
 import pkg.db.internal.descriptor
+import pkg.db.internal.postgres_status
 
 extern "C" link("sqlite3") {
   fn sqlite3_prepare_v2(database: raw, sql: raw, bytes: i32, statement_out: raw, tail_out: raw) -> i32
@@ -32,7 +33,6 @@ extern "C" link("pq") {
     parameter_formats: raw,
     result_format: i32,
   ) -> raw
-  fn PQresultStatus(result: raw) -> i32
   fn PQntuples(result: raw) -> i32
   fn PQnfields(result: raw) -> i32
   fn PQgetisnull(result: raw, row: i32, column: i32) -> i32
@@ -996,13 +996,18 @@ fn postgres_open_cursor(
     if !first_pointer.is_null() { raw.free(first_pointer) }
     if !second_pointer.is_null() { raw.free(second_pointer) }
     if result.is_null() {
-      inactive: u8 := 0
-      raw.store(state, 20, inactive)
-      return Err(postgres_native_error(connection, raw.null()))
+      failure := postgres_native_error(connection, raw.null())
+      pkg.db.internal.resource.poison_conn_state(state)
+      return Err(failure)
     }
-    status := PQresultStatus(result)
+    status := pkg.db.internal.postgres_status.code(result)
     if status != PGRES_TUPLES_OK {
       failure := postgres_native_error(connection, result)
+      if pkg.db.internal.postgres_status.must_close(status) {
+        PQclear(result)
+        pkg.db.internal.resource.poison_conn_state(state)
+        return Err(failure)
+      }
       wrapper := pkg.db.internal.resource.new_catalog_cursor(
         2, result, state, raw.null(), raw.null(),
       )
@@ -3563,11 +3568,18 @@ fn transaction_control(state: raw, sql: str) -> Result<(), Error> {
     if driver == 2 {
       result := PQexec(native, command)
       raw.free(command)
-      if result.is_null() { return Err(postgres_native_error(native, raw.null())) }
-      status := PQresultStatus(result)
+      if result.is_null() {
+        failure := postgres_native_error(native, raw.null())
+        pkg.db.internal.resource.poison_conn_state(state)
+        return Err(failure)
+      }
+      status := pkg.db.internal.postgres_status.code(result)
       if status != PGRES_COMMAND_OK {
         failure := postgres_native_error(native, result)
         PQclear(result)
+        if pkg.db.internal.postgres_status.must_close(status) {
+          pkg.db.internal.resource.poison_conn_state(state)
+        }
         return Err(failure)
       }
       expected_status := if sql == "COMMIT" { "COMMIT" } else {

@@ -1,0 +1,24 @@
+module pkg.db.internal.postgres_status
+
+extern "C" link("pq") {
+  fn PQresultStatus(result: raw) -> i32
+}
+
+// The complete libpq 17 ExecStatusType numeric set.  COPY and pipeline results retain
+// connection-global protocol state that pkg.db does not own yet.  A newer unknown value is equally
+// unsafe to reuse.  Keep this module independent of every package owner so execution and resource
+// cleanup can share one authority without an import cycle.
+pub fn code(result: raw) -> i32 {
+  unsafe { return PQresultStatus(result) }
+}
+
+pub fn must_close(status: i32) -> bool {
+  if status == 3 || status == 4 || status == 8 || status == 10 || status == 11 {
+    return true
+  }
+  if status == 0 || status == 1 || status == 2 || status == 5 || status == 6
+    || status == 7 || status == 9 || status == 12 {
+    return false
+  }
+  return true
+}

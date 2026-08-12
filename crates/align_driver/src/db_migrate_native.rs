@@ -1508,7 +1508,7 @@ impl PostgresConnection {
         Ok(Self { api, connection })
     }
 
-    fn execute_raw(&self, bytes: &[u8], context: &str) -> Result<(), PostgresCommandError> {
+    fn execute_raw(&mut self, bytes: &[u8], context: &str) -> Result<(), PostgresCommandError> {
         let sql = CString::new(bytes).map_err(|_| PostgresCommandError {
             message: format!("{context} contains U+0000"),
             sqlstate: None,
@@ -1516,10 +1516,12 @@ impl PostgresConnection {
         // SAFETY: connection and SQL remain live for the synchronous libpq call.
         let result = unsafe { (self.api.exec)(self.connection, sql.as_ptr()) };
         if result.is_null() {
-            return Err(PostgresCommandError {
+            let error = PostgresCommandError {
                 message: format!("libpq returned a null {context} result"),
                 sqlstate: None,
-            });
+            };
+            self.close();
+            return Err(error);
         }
         let status = unsafe { (self.api.result_status)(result) };
         let decoded = if matches!(status, 1 | 2) {
@@ -1537,25 +1539,32 @@ impl PostgresConnection {
         };
         // SAFETY: the non-null result is cleared after all referenced text is copied.
         unsafe { (self.api.clear)(result) };
+        if crate::db_postgres_status::tool_must_close(
+            crate::db_postgres_status::classify(status),
+        ) {
+            self.close();
+        }
         decoded
     }
 
-    fn execute(&self, bytes: &[u8], context: &str) -> Result<(), MigrationError> {
+    fn execute(&mut self, bytes: &[u8], context: &str) -> Result<(), MigrationError> {
         self.execute_raw(bytes, context).map_err(Into::into)
     }
 
     fn query(
-        &self,
+        &mut self,
         sql: &str,
         expected_fields: usize,
     ) -> Result<Vec<Vec<Option<String>>>, MigrationError> {
         let sql = CString::new(sql).map_err(|_| fail("PostgreSQL tool query contains U+0000"))?;
         let result = unsafe { (self.api.exec)(self.connection, sql.as_ptr()) };
         if result.is_null() {
-            return Err(fail("libpq returned a null PostgreSQL query result"));
+            let error = fail("libpq returned a null PostgreSQL query result");
+            self.close();
+            return Err(error);
         }
+        let status = unsafe { (self.api.result_status)(result) };
         let decoded = (|| {
-            let status = unsafe { (self.api.result_status)(result) };
             if status != 2 {
                 let message = pq_owned_text(unsafe { (self.api.result_error_message)(result) })
                     .unwrap_or_else(|| format!("PostgreSQL query failed with status {status}"));
@@ -1610,10 +1619,15 @@ impl PostgresConnection {
             Ok(output)
         })();
         unsafe { (self.api.clear)(result) };
+        if crate::db_postgres_status::tool_must_close(
+            crate::db_postgres_status::classify(status),
+        ) {
+            self.close();
+        }
         decoded
     }
 
-    fn advisory_lock(&self, exclusive: bool) -> Result<(), MigrationError> {
+    fn advisory_lock(&mut self, exclusive: bool) -> Result<(), MigrationError> {
         let function = if exclusive {
             "pg_advisory_lock"
         } else {
@@ -1656,7 +1670,7 @@ fn pq_owned_text(pointer: *const c_char) -> Option<String> {
 }
 
 fn postgres_begin_and_lock(
-    connection: &PostgresConnection,
+    connection: &mut PostgresConnection,
     write: bool,
 ) -> Result<(), PostgresCommandError> {
     connection.execute_raw(
@@ -1674,8 +1688,10 @@ fn postgres_begin_and_lock(
     )
 }
 
-fn postgres_rollback(connection: &PostgresConnection) {
-    let _ = connection.execute(b"ROLLBACK", "PostgreSQL migration rollback");
+fn postgres_rollback(connection: &mut PostgresConnection) {
+    if !connection.connection.is_null() {
+        let _ = connection.execute(b"ROLLBACK", "PostgreSQL migration rollback");
+    }
 }
 
 fn postgres_schema_inventory_sql() -> &'static str {
@@ -1725,7 +1741,7 @@ SELECT t.relkind,t.relpersistence,(t.relowner=current_user::pg_catalog.regrole):
 FROM target t JOIN columns c ON c.attrelid=t.table_oid JOIN constraints k ON k.conrelid=t.table_oid JOIN indexes i ON i.indrelid=t.table_oid"#
 }
 
-fn validate_postgres_schema(connection: &PostgresConnection) -> Result<(), MigrationError> {
+fn validate_postgres_schema(connection: &mut PostgresConnection) -> Result<(), MigrationError> {
     let rows = connection.query(postgres_schema_inventory_sql(), 23)?;
     let [row] = rows.as_slice() else {
         return Err(fail(
@@ -1812,7 +1828,7 @@ fn parse_postgres_u32(value: Option<&String>, what: &str) -> Result<u32, Migrati
 }
 
 fn read_postgres_history(
-    connection: &PostgresConnection,
+    connection: &mut PostgresConnection,
 ) -> Result<Vec<HistoryRow>, MigrationError> {
     connection
         .query(
@@ -1851,7 +1867,7 @@ fn read_postgres_history(
 }
 
 fn inspect_postgres_locked(
-    connection: &PostgresConnection,
+    connection: &mut PostgresConnection,
     catalog: &ScreenedCatalog,
 ) -> Result<MigrationReport, MigrationError> {
     validate_postgres_schema(connection)?;
@@ -1863,7 +1879,7 @@ fn inspect_postgres_locked(
 }
 
 fn postgres_absent_snapshot(
-    connection: &PostgresConnection,
+    connection: &mut PostgresConnection,
     catalog: &ScreenedCatalog,
 ) -> Result<MigrationReport, MigrationError> {
     connection.execute(
@@ -1902,7 +1918,7 @@ fn postgres_absent_snapshot(
 }
 
 fn postgres_inspect_phase(
-    connection: &PostgresConnection,
+    connection: &mut PostgresConnection,
     catalog: &ScreenedCatalog,
     write: bool,
     absent_allowed: bool,
@@ -1911,6 +1927,9 @@ fn postgres_inspect_phase(
         Ok(()) => {}
         Err(error) if postgres_history_is_missing(&error) => {
             postgres_rollback(connection);
+            if connection.connection.is_null() {
+                return Err(error.into());
+            }
             if absent_allowed {
                 return postgres_absent_snapshot(connection, catalog);
             }
@@ -2059,6 +2078,7 @@ fn postgres_commit(
 ) -> Result<(), MigrationError> {
     match connection.execute(b"COMMIT", context) {
         Ok(()) => Ok(()),
+        Err(error) if connection.connection.is_null() => Err(error),
         Err(error) => postgres_reconcile_commit(connection, url, catalog, expectation, error),
     }
 }
@@ -2327,7 +2347,7 @@ fn postgres_forbidden(
         "PostgreSQL Applying history commit",
     )?;
 
-    let native_result = PostgresConnection::open(url).and_then(|worker| {
+    let native_result = PostgresConnection::open(url).and_then(|mut worker| {
         worker.execute(
             &migration.bytes,
             &format!("PostgreSQL forbidden migration {:04}", migration.version),
@@ -2341,6 +2361,9 @@ fn postgres_forbidden(
     let completed = u32::from(final_state == StoredMigrationState::Applied);
     if let Err(error) = postgres_begin_and_lock(history_connection, true) {
         postgres_rollback(history_connection);
+        if history_connection.connection.is_null() {
+            return Err(error.into());
+        }
         if postgres_history_is_missing(&error) {
             postgres_restore_missing_forbidden_history(
                 history_connection,
@@ -2477,6 +2500,9 @@ fn postgres_migrate(
         }
         Err(error) if postgres_history_is_missing(&error) => {
             postgres_rollback(connection);
+            if connection.connection.is_null() {
+                return Err(error.into());
+            }
             postgres_bootstrap(connection, url, catalog)?;
             postgres_inspect_phase(connection, catalog, true, false)?
         }
@@ -2613,7 +2639,7 @@ pub fn run_postgres_migration(
     match operation {
         MigrationOperation::Migrate => postgres_migrate(&mut connection, url, catalog),
         MigrationOperation::Status | MigrationOperation::Check => {
-            postgres_inspect_phase(&connection, catalog, false, true)
+            postgres_inspect_phase(&mut connection, catalog, false, true)
         }
         MigrationOperation::Repair {
             version,
@@ -2627,6 +2653,217 @@ pub fn run_postgres_migration(
             action,
             expected_checksum,
         ),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod postgres_status_test_support {
+    use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+    const NULL_RESULT: c_int = -10_000;
+    static LOCK: Mutex<()> = Mutex::new(());
+    static STATUS: AtomicI32 = AtomicI32::new(1);
+    static UNSAFE_SEEN: AtomicBool = AtomicBool::new(false);
+    static EXEC_CALLS: AtomicI32 = AtomicI32::new(0);
+    static CLEAR_CALLS: AtomicI32 = AtomicI32::new(0);
+    static FINISH_CALLS: AtomicI32 = AtomicI32::new(0);
+    static ROW_CALLS: AtomicI32 = AtomicI32::new(0);
+    static FOLLOWUP_CALLS: AtomicI32 = AtomicI32::new(0);
+
+    fn reset(status: c_int) {
+        STATUS.store(status, Ordering::SeqCst);
+        UNSAFE_SEEN.store(false, Ordering::SeqCst);
+        EXEC_CALLS.store(0, Ordering::SeqCst);
+        CLEAR_CALLS.store(0, Ordering::SeqCst);
+        FINISH_CALLS.store(0, Ordering::SeqCst);
+        ROW_CALLS.store(0, Ordering::SeqCst);
+        FOLLOWUP_CALLS.store(0, Ordering::SeqCst);
+    }
+
+    fn token() -> *mut c_void {
+        std::ptr::NonNull::<u8>::dangling().as_ptr().cast()
+    }
+
+    fn note_followup() {
+        if UNSAFE_SEEN.load(Ordering::SeqCst) {
+            FOLLOWUP_CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    unsafe extern "C" fn connect(
+        _: *const *const c_char,
+        _: *const *const c_char,
+        _: c_int,
+    ) -> *mut c_void {
+        token()
+    }
+    unsafe extern "C" fn finish(_: *mut c_void) {
+        FINISH_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+    unsafe extern "C" fn ok(_: *const c_void) -> c_int {
+        0
+    }
+    unsafe extern "C" fn utf8(_: *const c_void) -> c_int {
+        6
+    }
+    unsafe extern "C" fn exec(_: *mut c_void, _: *const c_char) -> *mut c_void {
+        note_followup();
+        EXEC_CALLS.fetch_add(1, Ordering::SeqCst);
+        if STATUS.load(Ordering::SeqCst) == NULL_RESULT {
+            std::ptr::null_mut()
+        } else {
+            token()
+        }
+    }
+    unsafe extern "C" fn clear(_: *mut c_void) {
+        CLEAR_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+    unsafe extern "C" fn result_status(_: *const c_void) -> c_int {
+        let status = STATUS.load(Ordering::SeqCst);
+        if crate::db_postgres_status::tool_must_close(
+            crate::db_postgres_status::classify(status),
+        ) {
+            UNSAFE_SEEN.store(true, Ordering::SeqCst);
+        }
+        status
+    }
+    unsafe extern "C" fn result_message(_: *const c_void) -> *const c_char {
+        c"status diagnostic".as_ptr()
+    }
+    unsafe extern "C" fn result_field(_: *const c_void, _: c_int) -> *const c_char {
+        c"42P01".as_ptr()
+    }
+    unsafe extern "C" fn count(_: *const c_void) -> c_int {
+        note_followup();
+        ROW_CALLS.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+    unsafe extern "C" fn is_null(_: *const c_void, _: c_int, _: c_int) -> c_int {
+        note_followup();
+        ROW_CALLS.fetch_add(1, Ordering::SeqCst);
+        1
+    }
+    unsafe extern "C" fn value(_: *const c_void, _: c_int, _: c_int) -> *mut c_char {
+        note_followup();
+        ROW_CALLS.fetch_add(1, Ordering::SeqCst);
+        std::ptr::null_mut()
+    }
+    unsafe extern "C" fn length(_: *const c_void, _: c_int, _: c_int) -> c_int {
+        note_followup();
+        ROW_CALLS.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+
+    fn api() -> PostgresApi {
+        PostgresApi {
+            _library: dynamic::Library::process_for_test(),
+            connectdb_params: connect,
+            finish,
+            status: ok,
+            client_encoding: utf8,
+            exec,
+            clear,
+            result_status,
+            result_error_message: result_message,
+            result_error_field: result_field,
+            ntuples: count,
+            nfields: count,
+            getisnull: is_null,
+            getvalue: value,
+            getlength: length,
+        }
+    }
+
+    fn fake_connection() -> PostgresConnection {
+        PostgresConnection {
+            api: api(),
+            connection: token(),
+        }
+    }
+
+    fn assert_closed(connection: &PostgresConnection, expected_clear: c_int) {
+        assert!(connection.connection.is_null());
+        assert_eq!(EXEC_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(CLEAR_CALLS.load(Ordering::SeqCst), expected_clear);
+        assert_eq!(FINISH_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(ROW_CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(FOLLOWUP_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    fn catalog() -> ScreenedCatalog {
+        ScreenedCatalog {
+            entries: Vec::new(),
+            encoded: Vec::new(),
+            fingerprint: align_interface::Hash128::of(b"status-safety-test"),
+        }
+    }
+
+    pub(crate) fn assert_migration_consumers() {
+        let _guard = LOCK.lock().expect("PostgreSQL migration fake lock");
+        for status in [3, 4, 8, 9, 10, 11, 12, 99] {
+            reset(status);
+            let mut connection = fake_connection();
+            let error = connection
+                .execute_raw(b"SELECT 1", "PostgreSQL test command")
+                .expect_err("unsafe command status must fail");
+            assert!(error.message.contains("status diagnostic"));
+            postgres_rollback(&mut connection);
+            assert_closed(&connection, 1);
+
+            reset(status);
+            let mut connection = fake_connection();
+            let error = connection
+                .query("SELECT 1", 0)
+                .expect_err("unsafe query status must fail");
+            assert!(error.to_string().contains("status diagnostic"));
+            postgres_rollback(&mut connection);
+            assert_closed(&connection, 1);
+        }
+
+        for query in [false, true] {
+            reset(NULL_RESULT);
+            let mut connection = fake_connection();
+            if query {
+                connection
+                    .query("SELECT 1", 0)
+                    .expect_err("null query result must fail");
+            } else {
+                connection
+                    .execute_raw(b"SELECT 1", "PostgreSQL test command")
+                    .expect_err("null command result must fail");
+            }
+            postgres_rollback(&mut connection);
+            assert_closed(&connection, 0);
+        }
+
+        for workflow in 0..3 {
+            reset(3);
+            let mut connection = fake_connection();
+            let catalog = catalog();
+            match workflow {
+                0 => {
+                    postgres_inspect_phase(&mut connection, &catalog, false, true)
+                        .expect_err("unsafe missing-history status must not start an absent query");
+                }
+                1 => {
+                    postgres_migrate(&mut connection, "not-reopened", &catalog)
+                        .expect_err("unsafe missing-history status must not bootstrap");
+                }
+                _ => {
+                    postgres_commit(
+                        &mut connection,
+                        "not-reopened",
+                        &catalog,
+                        PostgresCommitExpectation::Applied(1),
+                        "PostgreSQL test commit",
+                    )
+                    .expect_err("unsafe commit status must not reconnect");
+                }
+            }
+            assert_closed(&connection, 1);
+        }
     }
 }
 

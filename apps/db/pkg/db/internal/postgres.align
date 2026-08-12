@@ -3,6 +3,7 @@ module pkg.db.internal.postgres
 import pkg.db
 import pkg.db.internal
 import pkg.db.internal.descriptor
+import pkg.db.internal.postgres_status
 import pkg.db.internal.resource
 import std.time
 
@@ -61,7 +62,6 @@ extern "C" link("pq") {
   fn PQgetCancel(connection: raw) -> raw
   fn PQcancel(cancel: raw, error_buffer: raw, error_buffer_size: i32) -> i32
   fn PQfreeCancel(cancel: raw)
-  fn PQresultStatus(result: raw) -> i32
   fn PQntuples(result: raw) -> i32
   fn PQnfields(result: raw) -> i32
   fn PQgetisnull(result: raw, row: i32, column: i32) -> i32
@@ -411,25 +411,49 @@ fn finish_async_result(
   context: raw,
   duration_ns: i64,
   deadline: i64,
+  query_id: str,
+  expected_status: i32,
 ) -> Result<(), pkg.db.Error> {
   unsafe {
     wait_status := wait_ready(connection, deadline)
     if wait_status == 0 {
       result := PQgetResult(connection)
+      if result.is_null() {
+        failure := connection_error(connection)
+        pkg.db.internal.resource.poison_conn_state(state)
+        return Err(failure)
+      }
+      status := result_status(result)
+      if result_must_close(status) {
+        failure := if expected_status == PGRES_COMMAND_OK && tuple_status(status) {
+          invalid_query_error(
+            query_id,
+            "db.command.row",
+            "a database command must not produce rows",
+          )
+        } else { execution_error(connection, result) }
+        clear_and_poison(state, result)
+        return Err(failure)
+      }
       extra := PQgetResult(connection)
       if !extra.is_null() {
-        if !result.is_null() { PQclear(result) }
-        mut current := extra
-        loop {
-          PQclear(current)
-          current = PQgetResult(connection)
-          if current.is_null() { break }
-        }
+        PQclear(result)
         failure := invalid_query_error(
           "database execution",
           "postgres.execution.results",
           "PostgreSQL execution returned more than one result",
         )
+        mut current := extra
+        loop {
+          current_status := result_status(current)
+          if result_must_close(current_status) {
+            clear_and_poison(state, current)
+            return Err(failure)
+          }
+          PQclear(current)
+          current = PQgetResult(connection)
+          if current.is_null() { break }
+        }
         if PQsetnonblocking(connection, 0) != 0 {
           pkg.db.internal.resource.poison_conn_state(state)
         }
@@ -441,7 +465,6 @@ fn finish_async_result(
         pkg.db.internal.resource.poison_conn_state(state)
         return Err(failure)
       }
-      if result.is_null() { return Err(connection_error(connection)) }
       raw.store(context, 8, result)
       return Ok(())
     }
@@ -473,11 +496,25 @@ fn finish_async_result(
     mut timeout_result := raw.null()
     if recovery_status == 0 {
       timeout_result = PQgetResult(connection)
+      if !timeout_result.is_null() {
+        timeout_status := result_status(timeout_result)
+        if result_must_close(timeout_status) {
+          failure := timeout_error(connection, timeout_result)
+          clear_and_poison(state, timeout_result)
+          return Err(failure)
+        }
+      }
       mut extra := PQgetResult(connection)
       loop {
         if extra.is_null() { break }
         if !timeout_result.is_null() { PQclear(timeout_result) }
         timeout_result = extra
+        timeout_status := result_status(timeout_result)
+        if result_must_close(timeout_status) {
+          failure := timeout_error(connection, timeout_result)
+          clear_and_poison(state, timeout_result)
+          return Err(failure)
+        }
         extra = PQgetResult(connection)
       }
     }
@@ -645,6 +682,7 @@ pub fn prepared_execute_with_timeout(
   context: raw,
   timeout: Option<i64>,
   query_id: str,
+  expected_status: i32,
 ) -> Result<(), pkg.db.Error> {
   match timeout {
     None => unsafe {
@@ -674,7 +712,9 @@ pub fn prepared_execute_with_timeout(
         }
         return Err(failure)
       }
-      return finish_async_result(state, connection, context, duration_ns, deadline)
+      return finish_async_result(
+        state, connection, context, duration_ns, deadline, query_id, expected_status,
+      )
     }
   }
 }
@@ -710,6 +750,7 @@ pub fn execute_params_with_timeout(
   context: raw,
   timeout: Option<i64>,
   query_id: str,
+  expected_status: i32,
 ) -> Result<(), pkg.db.Error> {
   match timeout {
     None => unsafe {
@@ -747,13 +788,25 @@ pub fn execute_params_with_timeout(
         }
         return Err(failure)
       }
-      return finish_async_result(state, connection, context, duration_ns, deadline)
+      return finish_async_result(
+        state, connection, context, duration_ns, deadline, query_id, expected_status,
+      )
     }
   }
 }
 
 pub fn result_status(result: raw) -> i32 {
-  unsafe { return PQresultStatus(result) }
+  return pkg.db.internal.postgres_status.code(result)
+}
+
+pub fn result_must_close(status: i32) -> bool =
+  pkg.db.internal.postgres_status.must_close(status)
+
+pub fn clear_and_poison(state: raw, result: raw) {
+  unsafe {
+    if !result.is_null() { PQclear(result) }
+    pkg.db.internal.resource.poison_conn_state(state)
+  }
 }
 
 pub fn result_rows(result: raw) -> i32 {
@@ -900,16 +953,20 @@ pub fn prepare_prevalidated<P, R>(
     sql := pkg.db.internal.descriptor.postgres_sql_pointer(statement)
     result := prepared_open(connection, name, sql, count as i32, types)
     if result.is_null() {
+      failure := connection_error(connection)
+      pkg.db.internal.resource.poison_conn_state(state)
       raw.free(name)
       raw.free(deallocate)
       free_context(context)
       release_lease(state)
-      return Err(connection_error(connection))
+      return Err(failure)
     }
     status := result_status(result)
     if status != PGRES_COMMAND_OK {
       failure := execution_error(connection, result)
-      prepared_clear(result)
+      if result_must_close(status) {
+        clear_and_poison(state, result)
+      } else { prepared_clear(result) }
       raw.free(name)
       raw.free(deallocate)
       free_context(context)
@@ -987,7 +1044,7 @@ pub fn rows_stmt_prevalidated<P, R>(
       return Err(failure)
     }
     executed := prepared_execute_with_timeout(
-      state, connection, name, context, timeout, query_id,
+      state, connection, name, context, timeout, query_id, PGRES_TUPLES_OK,
     )
     match executed {
       Err(error) => {
@@ -1000,6 +1057,7 @@ pub fn rows_stmt_prevalidated<P, R>(
     result: raw := raw.load(context, 8)
     if result.is_null() {
       failure := connection_error(connection)
+      pkg.db.internal.resource.poison_conn_state(state)
       free_context(context)
       release_lease(state)
       return Err(failure)
@@ -1007,7 +1065,9 @@ pub fn rows_stmt_prevalidated<P, R>(
     status := result_status(result)
     if status != PGRES_TUPLES_OK {
       failure := execution_error(connection, result)
-      prepared_clear(result)
+      if result_must_close(status) {
+        clear_and_poison(state, result)
+      } else { prepared_clear(result) }
       free_context(context)
       release_lease(state)
       return Err(failure)
@@ -1094,7 +1154,7 @@ pub fn rows_prevalidated<P, R>(
     }
     sql := pkg.db.internal.descriptor.postgres_sql_pointer(statement)
     executed := execute_params_with_timeout(
-      state, connection, sql, context, timeout, query_id,
+      state, connection, sql, context, timeout, query_id, PGRES_TUPLES_OK,
     )
     match executed {
       Err(error) => {
@@ -1107,6 +1167,7 @@ pub fn rows_prevalidated<P, R>(
     result: raw := raw.load(context, 8)
     if result.is_null() {
       failure := connection_error(connection)
+      pkg.db.internal.resource.poison_conn_state(state)
       free_context(context)
       release_lease(state)
       return Err(failure)
@@ -1114,7 +1175,10 @@ pub fn rows_prevalidated<P, R>(
     status := result_status(result)
     if status != PGRES_TUPLES_OK {
       failure := execution_error(connection, result)
-      clear_result_and_context(result, context)
+      if result_must_close(status) {
+        clear_and_poison(state, result)
+        free_context(context)
+      } else { clear_result_and_context(result, context) }
       release_lease(state)
       return Err(failure)
     }
@@ -1435,7 +1499,7 @@ pub fn execute_prevalidated<P>(
     }
     sql := pkg.db.internal.descriptor.postgres_sql_pointer(statement)
     executed := execute_params_with_timeout(
-      state, connection, sql, context, timeout, query_id,
+      state, connection, sql, context, timeout, query_id, PGRES_COMMAND_OK,
     )
     match executed {
       Err(error) => {
@@ -1448,6 +1512,7 @@ pub fn execute_prevalidated<P>(
     result: raw := raw.load(context, 8)
     if result.is_null() {
       failure := connection_error(connection)
+      pkg.db.internal.resource.poison_conn_state(state)
       free_context(context)
       release_lease(state)
       return Err(failure)
@@ -1457,7 +1522,10 @@ pub fn execute_prevalidated<P>(
       failure := if tuple_status(status) {
         invalid_query_error(query_id, "db.command.row", "a database command must not produce rows")
       } else { execution_error(connection, result) }
-      clear_result_and_context(result, context)
+      if result_must_close(status) {
+        clear_and_poison(state, result)
+        free_context(context)
+      } else { clear_result_and_context(result, context) }
       release_lease(state)
       return Err(failure)
     }
@@ -1530,13 +1598,17 @@ pub fn one_prevalidated<P, R>(
     result := execute_params(connection, sql, context)
     if result.is_null() {
       failure := connection_error(connection)
+      pkg.db.internal.resource.poison_conn_state(state)
       free_context(context)
       return Err(failure)
     }
     status := result_status(result)
     if status != PGRES_TUPLES_OK {
       failure := execution_error(connection, result)
-      clear_result_and_context(result, context)
+      if result_must_close(status) {
+        clear_and_poison(state, result)
+        free_context(context)
+      } else { clear_result_and_context(result, context) }
       return Err(failure)
     }
     rows := result_rows(result)
@@ -1692,6 +1764,7 @@ pub fn explain_prevalidated<P, R>(
     raw.free(sql_pointer)
     if result.is_null() {
       failure := connection_error(connection)
+      pkg.db.internal.resource.poison_conn_state(state)
       free_context(context)
       release_lease(state)
       return Err(failure)
@@ -1699,7 +1772,10 @@ pub fn explain_prevalidated<P, R>(
     status := result_status(result)
     if status != PGRES_TUPLES_OK {
       failure := execution_error(connection, result)
-      clear_result_and_context(result, context)
+      if result_must_close(status) {
+        clear_and_poison(state, result)
+        free_context(context)
+      } else { clear_result_and_context(result, context) }
       release_lease(state)
       return Err(failure)
     }
