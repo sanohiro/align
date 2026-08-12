@@ -1132,6 +1132,27 @@ a test overrode by hand (`owned_tagged_payloads`'s arena provenance case). For
 those inputs the empty program is the correct answer, so "a checked program did
 not vanish" is not a property the infallible surface can assert.
 
+### Axis D — machinery added by a capability must itself be verified
+
+Reopened after this capability spent two review rounds patching one cell: the
+`raw-ty-compare` ratchet was added, failed CI, was "fixed", and failed CI again
+for a second, unrelated reason. Both failures share a root cause the matrix did
+not enumerate — a gate was written without asking what it actually runs against.
+
+A capability that adds a lint, ratchet, tripwire, or gate closes these cells
+before pushing:
+
+| Cell | Rule | How this row failed |
+|---|---|---|
+| Tool identity | The counting/matching tool must be the same implementation locally and in CI, or the count is not a fact. Verify which binary runs — an interactive shell may alias it. | `grep` is aliased to ugrep here, so the pin was baselined at ugrep's 301 while CI's GNU grep counted 305. |
+| Evaluated tree | CI evaluates the **merge with `main`**, not the branch. Any count, golden, or snapshot pinned against the branch alone is pinned against a tree that never gets tested. | `main` advanced three PRs that grew the counted file; the branch counted 301, the merge 326. |
+| Direction | A ratchet must fail when the count rises and pass when it falls. Prove both, not just the passing direction. | Verified by pinning one below the true count and observing the failure message. |
+| Pin semantics | State in the ledger whether a pin is the *current* count or an *audited* one. They are different promises. | Recorded: current, not audited. |
+
+The general rule this axis adds: **verification machinery is production code for
+the gate it guards.** It gets the same locally-before-push discipline as the
+compiler change it accompanies, and CI is not its discovery loop.
+
 ### Owners
 
 | Invariant | Owner |
@@ -1140,7 +1161,7 @@ not vanish" is not a property the infallible surface can assert.
 | A vanished checked program is an error at the one boundary, and the infallible entry points still fail closed | `align_mir` `lower_program_checked_reports_a_vanished_checked_program` |
 | Delegating a gate does not switch it off | `align_mir` `delegated_gates_still_refuse_a_genuinely_different_type` (struct accumulator, unordered key, mismatched map_err mapper, and two distinct source shapes under the shape matcher) |
 | A sum-type scan accumulator compiles and runs | `align_driver` `unit_values::sum_type_scan_accumulator_compiles_and_runs` |
-| A new raw `Ty`/`Scalar` comparison in the body validator cannot land silently | `scripts/lint-ratchet.sh` row `align_mir raw-ty-compare` (pinned at 301; may only fall). Counted with `perl`, not `grep`: the first cut used `grep` and disagreed between a developer machine and CI (301 versus 305), so the gate failed on a platform its author could not reproduce. A ratchet whose count depends on the local tool flavour is not a gate. |
+| A new raw `Ty`/`Scalar` comparison in the body validator cannot land silently | `scripts/lint-ratchet.sh` row `align_mir raw-ty-compare` (pinned; may only fall). Counted with `perl`, not `grep`: this shell aliases `grep` to ugrep, so a `grep`-based count is not reproducible against CI's GNU grep. Like every ratchet row, the pin is the *current* count, not an audited one — it stops the next raw comparison from landing silently; it does not retroactively bless the ones already there. |
 | End-to-end acceptance | `align_driver` `mir_continuation`, `unit_values` |
 
 **Review-ledger bookkeeping.** These occurrences were found by an internal

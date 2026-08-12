@@ -2,5 +2,5 @@
 align_mir panics 371
 align_codegen_llvm panics 426
 align_runtime casts 293
-align_mir raw-ty-compare 301
+align_mir raw-ty-compare 326
 workspace fixture-bake 51
