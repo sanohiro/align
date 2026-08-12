@@ -473,7 +473,7 @@ A migration must prove the same defect still fails:
 1. **Backward** — `pkg_db_q4b` keeps the retired `package_files` as an oracle and
    asserts `Layout` reproduces it path by path and source by source
    (`layout_reproduces_the_pre_harness_package_files_exactly`). That pins the
-   shared eight-module package layout and its order for every suite, so a later
+   shared nine-module package layout and its order for every suite, so a later
    migration inherits the proof rather than repeating it; what each further
    suite must then show is only that its own module list and `main` are
    unchanged, which its fingerprint golden covers. Every migrated suite also
@@ -481,8 +481,8 @@ A migration must prove the same defect still fails:
 2. **Forward** — a case-fingerprint golden over label, runner, test-owned files,
    environment, and expected exit. Hashing sources alone is not enough: a
    refactor can preserve the file set while changing the runner, environment, or
-   expected code, and each of those changes what the case proves. The eight
-   package sources are excluded from the digest — they are product code with
+   expected code, and each of those changes what the case proves. The package
+   sources are excluded from the digest — they are product code with
    their own owners, and including them would break the golden on every
    `apps/db` edit.
 
@@ -546,30 +546,52 @@ Recorded so the gap is explicit rather than implied:
   status waves each added one), plus four inline `retain`+`push` sites. All are
   `Layout` chaining now, and the suite no longer restates the package module
   list — which had already drifted once when the ninth package module landed.
-- **Live-PostgreSQL identity and cleanup**: resolved by isolation rather than by
-  naming, with a residual recorded here rather than closed silently.
+- **Live-PostgreSQL identity and cleanup** splits in two, because the two live
+  suites are not in the same situation.
 
-  `pkg_db_q5a` creates fixed-name objects on the live server (`align_q5a_probe`,
-  its index, `align_q5a_history_ref`, a function and a trigger) and drops none of
-  them. Prefixing those names per run would not make concurrent runs safe,
-  because the same suite also reads and writes `align_internal.migrations_v1` —
-  the **product's own** history table, whose name is fixed by the migration
-  contract and cannot be uniquified by a test. Only a per-run database or schema
-  makes concurrency safe, and that is exactly what both consumers already
-  provide: `scripts/db-verify-local.sh` starts a disposable container per
-  invocation and tears it down in a trap, and CI's `db-postgres` job supplies an
-  ephemeral service per run.
+  **`pkg_db_q5b2` — solved by naming.** It owns every object it names and never
+  touches a product-fixed table, so a per-run suffix makes it concurrency-safe
+  outright. Its schemas are now `align_q5b2_<pid>_<n>` and
+  `pguser_q5b2_<pid>_<n>` via `db_harness::live_run_id`. The rename deliberately
+  protects the C symbols that merely share the `align_q5b2` prefix
+  (`align_q5b2_fake_sqlite` and friends), since rewriting those would unlink the
+  program; `per_run_schema_renames_only_the_schema` pins both halves.
 
-  The residual risk is therefore narrow and specific: two concurrent runs pointed
-  at one *shared, long-lived* server would collide, and a run against such a
-  server leaves objects behind. `db_harness::live_run_id` exists for a case that
-  needs a collision-free name, but it is deliberately not retrofitted onto q5a,
-  because doing so would change the SQL a required suite executes while still
-  leaving the fixed history table shared — motion without the safety.
+  **`pkg_db_q5a` — solved by isolation, with a residual.** It reads and writes
+  `align_internal.migrations_v1`, the product's own history table, whose name the
+  migration contract fixes and a test cannot uniquify, so naming cannot help it.
+  Only a per-run database or schema can, and both consumers already provide one:
+  `scripts/db-verify-local.sh` starts a disposable container per invocation and
+  tears it down in a trap, and CI's `db-postgres` job supplies an ephemeral
+  service.
+
+  The residual is sharper than "concurrent runs collide". Against a **persistent**
+  server q5a cannot even be re-run **sequentially**: its lifecycle drives the
+  history to version 3 and leaves it `Applied`, so a second run's expectation of
+  `DirtyApplying` no longer holds. That makes a shared long-lived server
+  unsupported for q5a rather than merely racy, and it is why `live_run_id` is not
+  retrofitted there — a per-run object prefix would change the SQL a required
+  suite executes while leaving both the fixed history table and this
+  re-runnability problem exactly as they are.
 - **`#[ignore]`d measurement probes** in `pkg_db_q4a`, `q4b`, and `q6` carry no
   fingerprint: they parse stdout numbers rather than asserting an exit code, so
   they are not `Case`-shaped. They never run in CI, so a golden over them would
   guard code that no gate executes. Checked by hand during review.
+- **`pkg_db_q5b2`'s live PostgreSQL owner is RED on `main`**, and has been before
+  this migration touched it. Against a real `postgres:16.4`,
+  `postgres_required_catalog_and_explain_contract_is_exact` exits 13 — the
+  `pkg.db.postgres.meta_keys_native` call at `POSTGRES_MAIN` fails — where 62 is
+  expected. Reproduced identically on unmodified `origin/main` and on the
+  migrated tree, so it is a pre-existing catalog-path defect, not migration
+  fallout. It survives because **no CI job compiles q5b2** (see the next cell):
+  the required PostgreSQL job runs `q2`/`q3`/`q5a` only. Diagnosis belongs to the
+  db session that owns the catalog path.
+- **`pkg_db_a1` and `pkg_db_q5b2` are not compiled by any CI job.** The required
+  PostgreSQL job runs `q2`/`q3`/`q5a`, and the bounded gate runs neither, so both
+  suites are owner-run only. Adding them to `db-verify-local.sh` and the CI job
+  would close that gap at a real wall-clock cost on the critical path; the
+  trade-off is recorded here rather than taken, and their owner runs are reported
+  in the PR that changes them.
 - **`pkg_db_q1` and `q3`** remain Rust-API suites outside the harness's scope;
   their `include_str!` statics feed `Proj`-based API assertions, not a `Layout`.
   `q3` uses the shared live-gating helper above, which is the only harness

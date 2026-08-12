@@ -109,6 +109,16 @@ pub const SQLITE_Q6: Stub = Stub {
 /// Every stub, for the parameterized registry owner and for name lookup.
 pub const ALL: &[&Stub] = &[&PG, &SQLITE_Q4A, &SQLITE_Q6];
 
+/// C counters a stub exports that no Align dump module prints, and deliberately so.
+///
+/// The registry sweep compares each Align module against its registry, which by construction cannot
+/// see a counter the C side exports but the Align side never reads. `align_pg_forbidden_after_status_calls`
+/// is such a counter: the PostgreSQL status wave asserts on it from Rust through its own extern
+/// block rather than through a dump, so it is invisible to the sweep. Listing it here records the
+/// blind spot instead of leaving it implicit — a counter added to the C fixture and then forgotten
+/// on the Align side looks identical to this from the sweep's point of view.
+pub const C_ONLY_COUNTERS: &[&str] = &["align_pg_forbidden_after_status_calls"];
+
 /// Whether `name` is a counter some stub actually prints.
 pub fn is_known_counter(name: &str) -> bool {
     ALL.iter().any(|stub| stub.names.contains(&name))

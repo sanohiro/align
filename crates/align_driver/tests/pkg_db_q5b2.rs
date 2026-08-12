@@ -4,6 +4,7 @@ mod common;
 use common::*;
 mod db_harness;
 use db_harness::{Layout, package_source};
+use std::sync::LazyLock;
 
 
 const SQLITE_SHAPE_STUB: &str = include_str!("fixtures/pkg_db_q5b2_sqlite_stub.c");
@@ -1438,9 +1439,45 @@ fn main() -> i32 {
 /// `Layout::new()` owns the package module list, so a package module added upstream reaches every
 /// builder below without being retyped — the hand-written copy this replaced had to be edited in
 /// lockstep with the package and had already drifted once.
+/// The per-run PostgreSQL schema suffix for this test process.
+///
+/// One value per process, not per call: `SETUP` creates the schema, the query modules read it, and
+/// `POSTGRES_MAIN` asserts on its name, so all three must agree within one program. Two concurrent
+/// runs get different process ids and therefore different schemas.
+static SCHEMA_SUFFIX: LazyLock<String> = LazyLock::new(|| format!("_{}", db_harness::live_run_id()));
+
+/// C functions that merely SHARE the `align_q5b2` prefix and must not be renamed with the schema.
+///
+/// `align_q5b2_fake_sqlite` and friends are symbols the C fixture defines; rewriting them would
+/// unlink the program. They are protected around the substitution rather than matched by a cleverer
+/// pattern, so adding another such symbol fails loudly in the linker instead of silently.
+const PREFIXED_C_SYMBOLS: &[&str] = &[
+    "align_q5b2_fake_sqlite",
+    "align_q5b2_finalize_calls",
+    "align_q5b2_fake_postgres",
+    "align_q5b2_clear_calls",
+];
+
+/// Rewrite the two fixed PostgreSQL schema names to this run's unique ones.
+///
+/// q5b2 owns every object it names, so unlike `pkg_db_q5a` it CAN be made concurrency-safe by
+/// naming alone — it never touches a product-fixed table such as `align_internal.migrations_v1`.
+fn per_run_schema(source: &str) -> String {
+    let mut text = source.to_string();
+    for (index, symbol) in PREFIXED_C_SYMBOLS.iter().enumerate() {
+        text = text.replace(symbol, &format!("\u{1}{index}"));
+    }
+    text = text.replace("align_q5b2", &format!("align_q5b2{}", *SCHEMA_SUFFIX));
+    text = text.replace("pguser_q5b2", &format!("pguser_q5b2{}", *SCHEMA_SUFFIX));
+    for (index, symbol) in PREFIXED_C_SYMBOLS.iter().enumerate() {
+        text = text.replace(&format!("\u{1}{index}"), symbol);
+    }
+    text
+}
+
 fn package_files() -> Layout {
     Layout::new()
-        .module("pkg/db/q5b2_setup.align", SETUP)
+        .module("pkg/db/q5b2_setup.align", &per_run_schema(SETUP))
         .main(MAIN)
 }
 
@@ -1476,13 +1513,13 @@ fn postgres_status_package_files() -> Layout {
 
 fn postgres_package_files() -> Layout {
     package_files()
-        .module("app/pg_inspect.align", POSTGRES_QUERIES)
-        .main(POSTGRES_MAIN)
+        .module("app/pg_inspect.align", &per_run_schema(POSTGRES_QUERIES))
+        .main(&per_run_schema(POSTGRES_MAIN))
 }
 
 fn postgres_bridge_package_files() -> Layout {
     package_files()
-        .module("app/pg_inspect.align", POSTGRES_QUERIES)
+        .module("app/pg_inspect.align", &per_run_schema(POSTGRES_QUERIES))
         .module("pkg/db/bad_normalized_explain.align", BAD_NORMALIZED_EXPLAIN)
         .main(POSTGRES_BRIDGE_MAIN)
 }
@@ -1830,4 +1867,32 @@ fn postgres_native_generic_bridge_compiles_and_rejects_wrong_driver() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// P2-1: the schema rename must hit every schema reference and NO C symbol that merely shares the
+/// prefix. Getting the second half wrong unlinks the program, so it is pinned here rather than
+/// discovered in a linker error.
+#[test]
+fn per_run_schema_renames_only_the_schema() {
+    // Every protected symbol appears in the input, so the loop below cannot pass vacuously.
+    let calls: String = PREFIXED_C_SYMBOLS
+        .iter()
+        .map(|symbol| format!("{symbol}(); "))
+        .collect();
+    let rewritten = per_run_schema(&format!(
+        "CREATE SCHEMA align_q5b2; SET search_path = align_q5b2; \
+         CREATE INDEX align_q5b2_child_b ON align_q5b2.child (b); \
+         DROP SCHEMA pguser_q5b2 CASCADE; {calls}"
+    ));
+    for symbol in PREFIXED_C_SYMBOLS {
+        assert!(
+            rewritten.contains(&format!("{symbol}(")),
+            "C symbol `{symbol}` must survive the rename verbatim: {rewritten}"
+        );
+    }
+    assert!(!rewritten.contains("CREATE SCHEMA align_q5b2;"), "{rewritten}");
+    assert!(rewritten.contains(&format!("CREATE SCHEMA align_q5b2{};", *SCHEMA_SUFFIX)));
+    assert!(rewritten.contains(&format!("pguser_q5b2{} CASCADE", *SCHEMA_SUFFIX)));
+    // The index name rides along with its schema prefix, which is what keeps it unique too.
+    assert!(rewritten.contains(&format!("align_q5b2{}_child_b", *SCHEMA_SUFFIX)));
 }

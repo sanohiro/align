@@ -162,9 +162,10 @@ pub fn live_postgres_decision(required: bool, url: Option<&str>) -> LiveDecision
 /// The live-PostgreSQL decision, read from the environment.
 ///
 /// The one place the two variable names and the meaning of "required" are spelled. Before this
-/// existed the rule had THREE spellings across the corpus — two suites tested
-/// `ALIGN_DB_POSTGRES_REQUIRED == "1"` and one tested merely that the variable was present, so
-/// `ALIGN_DB_POSTGRES_REQUIRED=0` meant "not required" in two suites and "required" in the third.
+/// existed the rule had FIVE hand-written spellings across four suites, and they disagreed:
+/// `pkg_db_q2` tested `ALIGN_DB_POSTGRES_REQUIRED == "1"` at two sites, while `pkg_db_q3`,
+/// `pkg_db_q5a`, and `pkg_db_q5b2` tested merely that the variable was PRESENT. So
+/// `ALIGN_DB_POSTGRES_REQUIRED=0` meant "not required" in one suite and "required" in three.
 pub fn live_postgres() -> LiveDecision {
     let required = std::env::var("ALIGN_DB_POSTGRES_REQUIRED").ok().as_deref() == Some("1");
     let url = std::env::var("ALIGN_DB_POSTGRES_URL").ok();
@@ -234,9 +235,9 @@ pub fn gate(needs: Needs) -> Option<Gate> {
         return None;
     }
     if needs == Needs::LivePostgres {
-        let required = std::env::var("ALIGN_DB_POSTGRES_REQUIRED").ok().as_deref() == Some("1");
-        let url = std::env::var("ALIGN_DB_POSTGRES_URL").ok();
-        return match live_postgres_decision(required, url.as_deref()) {
+        // Delegate rather than re-read: a sixth hand-written spelling here would be the same defect
+        // this helper exists to remove.
+        return match live_postgres() {
             LiveDecision::Run(_) => Some(Gate),
             LiveDecision::Skip => {
                 eprintln!("live PostgreSQL case skipped: ALIGN_DB_POSTGRES_URL is not set");
