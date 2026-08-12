@@ -1915,17 +1915,19 @@ fn hir_program_validation_reason(
         // `Bodies` is checked between JsonScan and BodyFacts, below, so it can name its function.
         (ValidationPass::BodyFacts, align_sema::checked_hir_body_facts_are_valid),
     ];
-    for (pass, gate) in gates.iter().take(6) {
+    // Destructured, not indexed: `Bodies` runs between them so it can name its function, and a
+    // magic 6 in two places is how that split silently loses a gate when one is added.
+    let [pre_body @ .., (facts_pass, facts_gate)] = gates;
+    for (pass, gate) in pre_body {
         if !gate(program) {
-            return Err((*pass, None));
+            return Err((pass, None));
         }
     }
     if let Err(function) = validate_hir::body_only_validation_reason(program) {
         return Err((ValidationPass::Bodies, Some(function)));
     }
-    let (pass, gate) = gates[6];
-    if !gate(program) {
-        return Err((pass, None));
+    if !facts_gate(program) {
+        return Err((facts_pass, None));
     }
     Ok(())
 }

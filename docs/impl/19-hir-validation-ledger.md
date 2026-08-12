@@ -1134,24 +1134,65 @@ not vanish" is not a property the infallible surface can assert.
 
 ### Axis D — machinery added by a capability must itself be verified
 
-Reopened after this capability spent two review rounds patching one cell: the
-`raw-ty-compare` ratchet was added, failed CI, was "fixed", and failed CI again
-for a second, unrelated reason. Both failures share a root cause the matrix did
-not enumerate — a gate was written without asking what it actually runs against.
+Reopened twice. The first version of this axis was itself wrong, which is the
+most useful thing in it.
 
-A capability that adds a lint, ratchet, tripwire, or gate closes these cells
-before pushing:
+**What actually happened.** This capability added a `raw-ty-compare` row to
+`scripts/lint-ratchet.sh` — a pinned count of raw `Ty`/`Scalar` comparisons in
+`validate_hir.rs` — and it failed CI twice. The first diagnosis blamed tool
+identity: this shell aliases `grep` to ugrep, the pin was baselined locally, CI
+runs GNU grep, so the tools must disagree. That was false, and asserting it
+without measuring was the real error. Measured afterwards, on the same tree, all
+three tools agree exactly:
 
-| Cell | Rule | How this row failed |
+```text
+branch 6335438a:  ugrep 301   perl 301
+merged with main: ugrep 326   perl 326   (CI's GNU grep: 305 and 326 in turn)
+```
+
+Both failures had one cause: **CI evaluates the merge with `main`, and the pin
+was taken on the branch.** `main` advanced three PRs that grew the counted file,
+so the pinned number described a tree that is never tested. The second failure
+was the same defect surviving a fix aimed at the wrong cause.
+
+**Why the mechanism was removed, not repaired.** Even pinned correctly, the row
+could not do its job:
+
+- *It is orthogonal to the class.* Six occurrences of silent-empty-MIR are on
+  record. A count over every comparison identifies none of them: it cannot say
+  which site is wrong, and the four comparison-shaped occurrences do not change
+  the total in a recognisable way. A gate that would not have caught a single
+  instance of the class it names is not a gate for that class.
+- *It collides with unrelated work by construction.* The count moves whenever
+  any PR touches the file, so every merge with `main` re-opens it. That is not
+  a property to tune; it follows from counting a whole file.
+
+**What replaced it.** A source-analysis owner in `validate_hir_tests.rs`
+(`raw_nominal_comparisons_stay_enumerated`), following this repository's existing
+precedent of recomputing a set from the repository rather than pinning a number
+— `variant_sweep_tripwire`, and `scripts/test-pr-workflow.sh` recomputing the
+gate's target list. It extracts only the comparisons whose two operands can each
+be an *independent derivation* of one source type, matches them against a named
+allowlist, and fails with the site and the instruction to ask `body_ty_matches`.
+A comparison against a fixed constructor is excluded, so unrelated work adding
+`flow.ty != Ty::Raw` does not touch it.
+
+**The cells.** A capability that adds a lint, ratchet, tripwire, or gate closes
+all of these before pushing:
+
+| Cell | Rule | How this capability failed it |
 |---|---|---|
-| Tool identity | The counting/matching tool must be the same implementation locally and in CI, or the count is not a fact. Verify which binary runs — an interactive shell may alias it. | `grep` is aliased to ugrep here, so the pin was baselined at ugrep's 301 while CI's GNU grep counted 305. |
-| Evaluated tree | CI evaluates the **merge with `main`**, not the branch. Any count, golden, or snapshot pinned against the branch alone is pinned against a tree that never gets tested. | `main` advanced three PRs that grew the counted file; the branch counted 301, the merge 326. |
-| Direction | A ratchet must fail when the count rises and pass when it falls. Prove both, not just the passing direction. | Verified by pinning one below the true count and observing the failure message. |
-| Pin semantics | State in the ledger whether a pin is the *current* count or an *audited* one. They are different promises. | Recorded: current, not audited. |
+| **Detection** | Does the mechanism fire on the class it exists for? Enumerate the recorded instances and check each against it. | Missed. A count caught 0 of 6; the replacement detector pins all 6 spellings as a test. |
+| **Friction** | Does it stay silent on changes that are not the class? An unrelated PR must not have to think about it. | Missed. A whole-file count moves with every edit; the replacement pins that split-free comparisons do not fire. |
+| **Evaluated tree** | CI evaluates the **merge with `main`**, not the branch. Any pinned number, golden, or snapshot taken on the branch is pinned to a tree that is never tested. | The single cause of both CI failures. |
+| **Direction** | Prove it fails when it should and passes when it should, on the real artifact, not only in principle. | Verified for the replacement: reintroducing `*parameter != err` into the real file reports `validate_hir.rs:5605`. |
+| **Diagnosis** | Do not assert a root cause you have not measured. Two competing explanations cost a round each. | Missed: tool identity was asserted, never measured, and was wrong. |
+| **Pin semantics** | State whether a pin is a *current* count or an *audited* set. | The allowlist is an audited set: every entry is classified in this matrix as same-derivation or split-free. |
 
-The general rule this axis adds: **verification machinery is production code for
-the gate it guards.** It gets the same locally-before-push discipline as the
-compiler change it accompanies, and CI is not its discovery loop.
+The rule this axis adds: **verification machinery is production code for the gate
+it guards.** It gets the same locally-before-push discipline as the compiler
+change it accompanies — including the question a count can never answer, *would
+this have caught the bug I just fixed?*
 
 ### Owners
 
@@ -1161,14 +1202,15 @@ compiler change it accompanies, and CI is not its discovery loop.
 | A vanished checked program is an error at the one boundary, and the infallible entry points still fail closed | `align_mir` `lower_program_checked_reports_a_vanished_checked_program` |
 | Delegating a gate does not switch it off | `align_mir` `delegated_gates_still_refuse_a_genuinely_different_type` (struct accumulator, unordered key, mismatched map_err mapper, and two distinct source shapes under the shape matcher) |
 | A sum-type scan accumulator compiles and runs | `align_driver` `unit_values::sum_type_scan_accumulator_compiles_and_runs` |
-| A new raw `Ty`/`Scalar` comparison in the body validator cannot land silently | `scripts/lint-ratchet.sh` row `align_mir raw-ty-compare` (pinned; may only fall). Counted with `perl`, not `grep`: this shell aliases `grep` to ugrep, so a `grep`-based count is not reproducible against CI's GNU grep. Like every ratchet row, the pin is the *current* count, not an audited one — it stops the next raw comparison from landing silently; it does not retroactively bless the ones already there. |
+| A new raw `Ty`/`Scalar` comparison in the body validator cannot land silently | `align_mir` `raw_nominal_comparisons_stay_enumerated` — recomputes the sites from `validate_hir.rs` and matches them against an audited allowlist, naming any new site and what to do about it |
+| The detector recognises the class and ignores everything else | `align_mir` `the_raw_comparison_detector_recognises_the_class` — all six recorded spellings fire; six split-free spellings do not |
 | End-to-end acceptance | `align_driver` `mir_continuation`, `unit_values` |
 
 **Review-ledger bookkeeping.** These occurrences were found by an internal
 investigation, not by an independent review, so `align-self-review`'s counting
 rules keep them out of `FINDINGS.md`'s root-cause table. The class is tracked
-here instead, and the ratchet row above is its automated owner — the sixth
-occurrence is what promoted it from prose to machinery.
+here instead, and the two source-analysis owners above are its automated owner —
+the sixth occurrence is what promoted it from prose to machinery.
 
 ### fn_types interning (follow-up, not in this class)
 

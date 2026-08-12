@@ -24,22 +24,6 @@ count() {
     # (common::fixture), never include_str! it: baking the source in makes every `.align`
     # edit rebuild+relink the whole test crate (measured ~6x slower edit->test on pkg.db).
     # Scanned across every crate's tests/ so a new bake is caught wherever it lands.
-    # Raw `Ty`/`Scalar` equality in the checked-HIR body validator. Six silent-empty-MIR
-    # regressions came from the validator deciding a producer question with its own rule; a raw
-    # nominal comparison is the shape that hides the next one, because two monomorph ids can name
-    # one source type (docs/impl/19-hir-validation-ledger.md, delegation matrix axis B). New
-    # comparisons must go through body_ty_matches/body_scalar_matches, so this count may only fall.
-    raw-ty-compare)
-      # Counted with perl, not grep: this repository's ratchet must agree byte-for-byte between a
-      # developer machine and CI, and grep flavours do not. The first cut of this row used grep and
-      # was baselined at 301 locally while GNU grep in CI counted 305 — the gate failed on a
-      # platform its author could not reproduce. perl's regex engine is fixed, and perl is already
-      # a required package on both (ALIGN_APT_PACKAGES).
-      n=$(perl -ne 'next if m{^\s*//}; $c++ if /\.ty\s*(?:!=|==)|(?:!=|==)\s*(?:Ty|Scalar)::/; END { print $c // 0 }' \
-        crates/align_mir/src/validate_hir.rs) || n=0
-      echo "$n"
-      return 0
-      ;;
     fixture-bake)
       n=$(grep -rE 'include_str!\("[^"]*\.align"' crates/*/tests --include='*.rs' 2>/dev/null \
         | grep -cv '^[^:]*:[[:space:]]*//') || n=0
@@ -59,7 +43,6 @@ count() {
 rows="align_mir panics
 align_codegen_llvm panics
 align_runtime casts
-align_mir raw-ty-compare
 workspace fixture-bake"
 
 if [[ "${1:-}" == "--update" ]]; then

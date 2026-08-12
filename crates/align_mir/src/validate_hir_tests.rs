@@ -248,6 +248,225 @@ fn checked_source_shapes_survive_every_delegated_gate() {
     }
 }
 
+/// One raw `Ty`/`Scalar` comparison found in the body validator's source.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct RawComparison {
+    line: usize,
+    text: String,
+}
+
+/// Whether `operand` is a fixed type literal — a constructor or a width helper whose identity is
+/// written at the comparison site. One side being fixed means the comparison cannot be two
+/// independent derivations of one source type meeting, which is the only shape that can split.
+fn raw_comparison_operand_is_literal(operand: &str) -> bool {
+    let operand = operand.trim();
+    const LITERAL_PREFIXES: [&str; 9] = [
+        "Ty::", "Scalar::", "PrimScalar::", "hir::", "Some(", "[", "&", "\"", "b\"",
+    ];
+    const LITERAL_NAMES: [&str; 8] = [
+        "i64", "i64_ty", "i32_ty", "u32_ty", "u8_ty", "u8_scalar", "exact_i32", "option_i64",
+    ];
+    LITERAL_PREFIXES
+        .iter()
+        .any(|prefix| operand.starts_with(prefix))
+        // Word-boundary prefix, not equality: an operand is cut out of a larger expression, so a
+        // fixed width binding arrives with whatever followed it attached (`i64).then(|| …`).
+        || LITERAL_NAMES.iter().any(|name| {
+            operand.strip_prefix(name).is_some_and(|rest| {
+                rest.chars().next().is_none_or(|c| !c.is_alphanumeric() && c != '_')
+            })
+        })
+        || operand.ends_with("_ty()")
+        || operand.ends_with("_ty(")
+}
+
+/// Whether `operand` names a value that holds a type. `.ty` / `.ret` / `.out_ty` are the stored
+/// spellings; the rest is this file's vocabulary for type-valued bindings, plus its `_ty` / `_elem`
+/// / `_scalar` / `_ret` suffix convention.
+fn raw_comparison_operand_is_typed(operand: &str) -> bool {
+    let operand = operand.trim().trim_start_matches(['*', '&']).trim();
+    if operand.ends_with(".ty") || operand.ends_with(".ret") || operand.ends_with(".out_ty") {
+        return true;
+    }
+    let base = operand.rsplit('.').next().unwrap_or(operand);
+    const TYPED_NAMES: [&str; 10] = [
+        "elem", "scalar", "parameter", "err", "ok", "expected", "current", "payload", "leaf", "ret",
+    ];
+    TYPED_NAMES.contains(&base)
+        || ["_ty", "_elem", "_scalar", "_ret"]
+            .iter()
+            .any(|suffix| base.ends_with(suffix))
+}
+
+/// Every raw `Ty`/`Scalar` comparison in `source` whose two operands can each be an independent
+/// derivation of one source type.
+///
+/// Deliberately narrow. A comparison against a fixed constructor (`flow.ty != Ty::Raw`,
+/// `base_ty != Ty::Soa(struct_id)`) cannot split, so it is excluded — that keeps the enumeration
+/// stable against unrelated work, which is exactly what a count over every comparison could not do.
+fn raw_nominal_comparisons(source: &str) -> Vec<RawComparison> {
+    let mut found = Vec::new();
+    for (index, raw_line) in source.lines().enumerate() {
+        let text = raw_line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if text.starts_with("//") {
+            continue;
+        }
+        let bytes = text.as_bytes();
+        for position in 0..bytes.len().saturating_sub(1) {
+            if &text[position..position + 2] != "!=" && &text[position..position + 2] != "==" {
+                continue;
+            }
+            let left = text[..position].trim().trim_start_matches(['|', '&', '!', '(', ' ']).trim();
+            let right = text[position + 2..]
+                .trim()
+                .trim_end_matches(['{', ' '])
+                .trim()
+                .trim_end_matches([')', '|', '&', ' ', ',', ';'])
+                .trim();
+            if left.is_empty() || right.is_empty() {
+                continue;
+            }
+            if raw_comparison_operand_is_literal(left) || raw_comparison_operand_is_literal(right) {
+                continue;
+            }
+            if raw_comparison_operand_is_typed(left) || raw_comparison_operand_is_typed(right) {
+                found.push(RawComparison {
+                    line: index + 1,
+                    text: text.clone(),
+                });
+                break;
+            }
+        }
+    }
+    found
+}
+
+/// Every such comparison that exists today, each one classified in
+/// `docs/impl/19-hir-validation-ledger.md`'s delegation matrix as same-derivation or split-free.
+const RAW_NOMINAL_COMPARISON_ALLOWLIST: [&str; 26] = [
+    r#"&& *elem == align_sema::scalar_to_ty(scalar)"#,
+    r#"&& expression.ty == expected"#,
+    r#"&& expression.ty == local.ty"#,
+    r#"(capture_flows[0].ty == needle.ty && needle.ty == Ty::Str).then_some(current)"#,
+    r#"(stage.out_ty == field_ty).then_some(field_ty)"#,
+    r#".is_some_and(|local| local.id == id && local.is_mut && self.body_ty_ok(local.ty))"#,
+    r#".is_some_and(|local| local.id == id && self.body_ty_ok(local.ty))"#,
+    r#"cleanup == expected"#,
+    r#"expression.ty == ty && self.local_type(context, id) == Some(ty)"#,
+    r#"flow.ty != expected"#,
+    r#"if *mapped || !slot_backed || stage.out_ty != current {"#,
+    r#"if final_elem != *elem"#,
+    r#"if final_elem != *elem || !self.scalar_copy_ok(scalar) {"#,
+    r#"if final_elem != *elem || !self.ty_copy_ok(final_elem, context) {"#,
+    r#"if flows.first().is_none_or(|flow| flow.ty != align_sema::scalar_to_ty(scalar)) {"#,
+    r#"if flows.iter().any(|flow| flow.ty != expected) {"#,
+    r#"if key_ty != source_key_ty {"#,
+    r#"if left.ty != right.ty {"#,
+    r#"if left_scalar != right_scalar"#,
+    r#"if stage.out_ty != current"#,
+    r#"if tuple.elems.as_slice() != expected {"#,
+    r#"|| *elem != align_sema::scalar_to_ty(align_sema::prim_to_scalar(primitive))"#,
+    r#"|| align_sema::scalar_to_ty(left_scalar) != *elem"#,
+    r#"|| expression.ty != expected"#,
+    r#"|| scalar != *expected"#,
+    r#"|| scalar != dst_scalar"#,
+];
+
+/// The detector must recognise the shape this class actually takes.
+///
+/// A count-based ratchet over every comparison could not: it never named a site, and it moved with
+/// unrelated work. This owner pins the demonstrated spellings — the six occurrences of the
+/// silent-empty-MIR class that were comparisons — and pins that split-free additions do not fire,
+/// so the mechanism is exercised in both directions without a manual mutation step.
+#[test]
+fn the_raw_comparison_detector_recognises_the_class() {
+    let demonstrated = [
+        // `map_err`: the shipped defect, two bare derivations of one source type.
+        "if *parameter != err {",
+        // `Spawn`: a declared return against a derived expectation.
+        "if sig.ret != expected {",
+        "if !function.params.is_empty() || function.ret != align_sema::scalar_to_ty(ok) {",
+        "|| function.ret != align_sema::scalar_to_ty(spawn.ok)",
+        // The pipeline family: a stored terminal element against a re-walked one.
+        "if final_elem != *elem",
+        // A stage output against the running element type.
+        "if stage.out_ty != current {",
+    ];
+    for spelling in demonstrated {
+        assert_eq!(
+            raw_nominal_comparisons(spelling).len(),
+            1,
+            "the detector must recognise the class spelling: {spelling}",
+        );
+    }
+
+    // Zero friction: a comparison against a fixed constructor cannot split, and unrelated work
+    // adds these constantly. None may fire.
+    let split_free = [
+        "if flow.ty != Ty::Raw {",
+        "if base_ty != Ty::Soa(struct_id) {",
+        "if index_flow.ty != i64_ty() {",
+        "if owner.ty != Ty::Resource(*resource)",
+        "(path.ty == Ty::Str).then(|| result(Ty::Reader, &[path.as_ref()]))?",
+        "if expression.ty != Ty::JsonScanner(*struct_id) {",
+        "// if parameter != err — a comment is not code",
+    ];
+    for spelling in split_free {
+        assert!(
+            raw_nominal_comparisons(spelling).is_empty(),
+            "a split-free comparison must not fire: {spelling}",
+        );
+    }
+}
+
+/// Every raw nominal comparison in the body validator is classified in the ledger.
+///
+/// This replaces a line-count ratchet that could not do the job: it counted comparisons the class
+/// never involved, so it caught none of the six occurrences and rose whenever unrelated work
+/// touched the file. This test names the site instead, and says what to do about it.
+#[test]
+fn raw_nominal_comparisons_stay_enumerated() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/validate_hir.rs");
+    let Ok(source) = std::fs::read_to_string(&path) else {
+        panic!("cannot read the body validator's source at {}", path.display())
+    };
+    let found = raw_nominal_comparisons(&source);
+
+    let allowed: std::collections::BTreeSet<&str> =
+        RAW_NOMINAL_COMPARISON_ALLOWLIST.iter().copied().collect();
+    let unlisted: Vec<&RawComparison> = found
+        .iter()
+        .filter(|site| !allowed.contains(site.text.as_str()))
+        .collect();
+    assert!(
+        unlisted.is_empty(),
+        "new raw `Ty`/`Scalar` comparison(s) in the body validator:\n{}\n\n\
+         Both operands here can be independent derivations of one source type, and sema mints \
+         several monomorph ids for one source shape, so a raw comparison rejects programs the \
+         producer accepts — the whole unit then lowers to the empty program. Ask \
+         `body_ty_matches` / `body_scalar_matches` instead. If the comparison genuinely cannot \
+         split, add it to RAW_NOMINAL_COMPARISON_ALLOWLIST with its classification in \
+         docs/impl/19-hir-validation-ledger.md.",
+        unlisted
+            .iter()
+            .map(|site| format!("  validate_hir.rs:{}: {}", site.line, site.text))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+
+    let present: std::collections::BTreeSet<&str> =
+        found.iter().map(|site| site.text.as_str()).collect();
+    let stale: Vec<&&str> = allowed
+        .iter()
+        .filter(|text| !present.contains(**text))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "RAW_NOMINAL_COMPARISON_ALLOWLIST has entries the body validator no longer contains \
+         (delegated or reworded?). Remove them so the list keeps naming real sites:\n{stale:#?}",
+    );
+}
+
 /// Negative side of the delegation matrix: delegating to the producer must not turn the gate off.
 ///
 /// Each row is the same construct as a row above with one genuinely different type substituted, so
@@ -372,8 +591,9 @@ fn lower_program_checked_reports_a_vanished_checked_program() {
     let mut empty = baseline_program();
     empty.fns.clear();
     empty.structs.clear();
-    let lowered = crate::lower_program_checked(&empty, false, None)
-        .expect("an empty checked program lowers to the empty program");
+    let Ok(lowered) = crate::lower_program_checked(&empty, false, None) else {
+        panic!("an empty checked program lowers to the empty program")
+    };
     assert!(
         lowered.fns.is_empty(),
         "an empty input must publish no functions",
