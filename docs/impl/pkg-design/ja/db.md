@@ -883,11 +883,13 @@ postgres.ExecuteOption.Delivery(SingleRow|PortalBatch(max_rows))
 `name`と`canonical_type_name`は`str` literalである。
 
 Text formatのbyteaは§5.6.1のexact hex encodingを使い、Binary formatだけがraw byteと
-explicit libpq lengthを使う。未実装のbinary mapping要求はSQL送信前に `Unsupported` とする。
+explicit libpq lengthを使う。D1--D12 implementationはBinary mapping要求をSQL送信前に
+`Unsupported`としたが、§23 D13 binary-format ledgerのexact proof/mapping tableがそのtemporary
+unavailable dispositionをsupersedeする。
 
-初期実装がtext中心でもbinaryを閉ざさない。unknown/conflicting OIDをignored hintにせず
+unknown/conflicting OIDをignored hintにせず
 errorにする。ParameterTypeはstatic artifact/public contractへ入りPostgreSQLへpinする。
-field別controlのunknown/duplicateもerror。binary mapping未実装ならSQL送信前にUnsupported。
+field別controlのunknown/duplicateもerror。
 `Delivery`はrow-producing executionだけのoptionで、operation set/default/size bound/
 streaming/error/ABIは§23のA1 PostgreSQL delivery ledgerが固定する。commandには適用しない。
 prepared rowsはexplicit `postgres.rows_stmt_native`を使い、common `db.rows_stmt`はcommon
@@ -2637,9 +2639,9 @@ lease、native wait、cleanup matrixを2つのdormant producer/consumer seamで�
 | descriptor/generic ABI | fixed 8-aligned execution descriptorを120-byte v3から128-byte v4へbumpし、offset 0〜119は不変とする。Queryのoffset 120はexact dependent `resource_ref<rows<R>>` current generationを受け取り、そのownerだけにrootedしたrecursive borrow provenanceを持つ`R`を返すnon-null producer-owned streaming decoder thunkであり、commandのoffset 120はnullである。complete v4 field checkは1つのshared query/command header validatorが所有し、common/native entry pointはapplication-unconstructibleな`pkg.db.internal.DescriptorHeaderControl`だけで到達する。malformed descriptor/header/function-signature HIRはfail-closedのままにし、whole-program/per-unit compileで生成binder/validator/materializing decoder/streaming decoderとselected native driverをreachable時だけretainする。 | `pkg_db_q4b::public_streaming_surface_is_exact`、`direct_rows_and_next_typecheck_whole_and_per_unit`、`streamed_views_cannot_cross_generation_or_escape`、Q4a shared-validator/delegation/sealed-bypass owner、sema/MIR malformed-HIR owner、exact 128-byte/offset/signature golden |
 | direct/prepared stream formation | settled orderでdescriptor、common option、native option、restriction、live target/statement、leaseをsend前にvalidateする。rows return前に全Params fieldをnative transmission完了までcopyまたはretainし、partial bind failureでは全installed/package-owned copyをexactly once dropする。`rows`/`rows_stmt`はnative success後だけdependent rows resourceを1つconstructし、resultをmaterializeしない。 | `pkg_db_q4b::owned_text_and_bytes_params_bind_before_their_sources_drop`、`sqlite_direct_stream_retains_binds_and_releases_each_native_phase_once`、両driver lifecycle ownerによるconn/tx・direct/prepared path |
 | complete bind/type matrix | non-null/`Option`のbool、全signed integer width、`f32`/`f64`、UTF-8 text、bytesにdirect ordinal binderを生成する。SQLiteはexact INTEGER/REAL/TEXT/BLOB/NULL mappingとtransient text/blob copyを使う。PostgreSQLはsettled OID/typeとText/Binary format combinationだけを受け付け、bytea Textはexact lowercase `\\x`、bytea Binaryはraw payloadを使い、C-string Text parameterのembedded NULをsend前にrejectする。 | `pkg_db_q4b::complete_sqlite_parameter_and_row_matrix_is_exact`と`complete_postgres_parameter_and_row_matrix_is_exact`、bounds/nullability/embedded zero/high byte/source mutation・Drop/copied byte/no-per-row-parameter-copy path |
-| complete row validation/decode | decoder前にexact column count、declared-order UTF-8 name bytes、NULL disposition、全first-release typeのexact driver-native representationをvalidateする。ordinalごとのgenerated typed callbackでreflection/boxing/map/artifact/source I/O/post-validation fallible conversionなしにdecodeする。multi-invalid rowは最初のdeclared ordinalをreportし、native pointer/length/UTF-8 malformed valueはsafe view形成前に失敗する。 | 両driver complete matrix owner、`pkg_db_q4b::malformed_native_view_values_fail_before_safe_view_formation`、cumulative Q2 name/type/count/null twin、generated MIR inspection、callback version/context misuse negative |
+| complete row validation/decode | decoder前にexact column count、declared-order UTF-8 name bytes、exact driver-native type metadata、NULL disposition、全first-release typeのvalue representationをvalidateする。ordinalごとのgenerated typed callbackでreflection/boxing/map/artifact/source I/O/post-validation fallible conversionなしにdecodeする。multi-invalid rowは最初のdeclared ordinalをreportし、native pointer/length/UTF-8 malformed valueはsafe view形成前に失敗する。D13 binary ledgerはこの順序を、zero-row/cardinality処理前にcountと全declared name/OID/formatを検査するresult-generation metadata phaseと、その後に各delivered rowのNULL disposition/representationを検査するvalue phaseへsupersedeする。 | 両driver complete matrix owner、`pkg_db_q4b::malformed_native_view_values_fail_before_safe_view_formation`、cumulative Q2 name/type/count/null twin、generated MIR inspection、callback version/context misuse negative、D13 metadata-before-value winner owner |
 | row generation/view safety | `next(borrow mut rows)`はnative advance前にprevious generationを終了し、1回だけadvanceしてcurrent rowをvalidateし、clean exhaustionだけで`None`を返す。scalar fieldはcopyする。`str`/`slice<u8>` fieldはfresh rows generationをownerに`resource.view_from_raw`だけで形成し、visible retention pathは`clone_in`である。次のmutable borrow後のview使用、storage、return、branch/loop generation joinを拒否する。 | `pkg_db_q4b::streamed_views_cannot_cross_generation_or_escape`、両driver complete matrix owner、malformed-native-view owner、cumulative stmt/conn parent-move case |
-| `one` cardinality compatibility | common/driver-qualified `one`はstream formationを再利用するが、settled Q2 winner orderを変えない。row 0だけをvalidate/decodeして`out`へcloneし、second rowはdriver-private non-decoding probe 1回で存在だけを確認する。malformed first rowはmultiplicityより先に失敗し、valid first rowと任意のsecond rowはsecondをvalidate/decodeせずCardinalityを返す。exhaustion/multiplicityは同じstream cleanup pathでcloseする。 | `pkg_db_q2::sqlite_native_command_and_one_execute_generated_i64_thunks`、`postgres_native_command_and_one_own_buffered_results`、両common-surface dispatch owner |
+| `one` cardinality compatibility | common/driver-qualified `one`はstream formationを再利用する。row 0だけをvalidate/decodeして`out`へcloneし、malformed first rowはmultiplicityより先に失敗する。D13はolder second-row winnerをsupersedeし、driver-private probeはsecond row有無の判定前にeach newly acquired result generationのmetadataをvalidateする。したがってmalformed second-generation count/name/OID/formatはCardinality前にDecodeを返し、valid metadata+任意のsecond rowはValue mode/row decodeなしにCardinalityを返す。exhaustion/multiplicityは同じstream cleanup pathでcloseする。 | `pkg_db_q2::sqlite_native_command_and_one_execute_generated_i64_thunks`、`postgres_native_command_and_one_own_buffered_results`、両common-surface dispatch owner、D13 second-generation malformed-metadata vs valid-metadata Cardinality twin |
 | SQLite streaming lifecycle | stream formationからexhaustion/error/Dropまでexecution leaseを保持する。successful `next`はSQLite current rowだけを公開する。exhaustion/error/Dropはowned direct statementをfinalizeするかborrowed prepared statementをreset後clearし、適用したnative busy timeoutのrestore、bind state free、lease releaseを続ける。ordinary/timeout stream overlapを両方向でrejectし、failed second attemptはfirst streamのsaved global stateをrestoreもmutateもしない。cleanup failureはdependency解放前にpoison/closeする。 | `pkg_db_q4b::sqlite_stream_lifecycle_and_overlap_are_exact`、step/finalize/reset/clear/busy state/lease/close counterとsuccess/decode error/native error/early Drop/failed second attempt path |
 | PostgreSQL buffered streaming lifecycle | settled synchronous `BufferedFull` resultをv1 baselineとしてrowsにretainし、`next`ごとにexactly one ordinal rowをdecodeし、exhaustion/error/Dropでclearする。parameter transportはsynchronous send完了後にfreeする。1つのlibpq result以外のhidden buffering、portal/single-row modeはない。 | `pkg_db_q4b::postgres_buffered_stream_lifecycle_is_exact`、delivery/PQclear/allocation counter、clean exhaustion/malformed row/early Drop、conn/tx・prepared/direct reuse |
 | common deadline disposition | 既存の全common TimeoutNs/BeginTimeoutNs scopeでpositive value、duplicate/source-order conflict、driver capability、state、native-option precedenceをauditする。SQLiteはrequested common operation deadlineをpre-send `Unsupported`にする。BusyTimeoutNsはstream lifetime中activeなlock-wait controlのままでcommon deadlineとしてreportしない。requested optionをsilent ignoreしない。 | connect/execute/one/rows/prepare/begin/metadata/EXPLAINとcommon/driver-qualified entry point両方をcrossするparameterized `pkg_db_q4b::deadline_disposition_and_precedence_are_exact` |
@@ -3174,8 +3176,326 @@ ledger-firstで閉じる。code review前にこのsectionの全normative `must`/
 `reject`/`required`をimplementation path+ownerへ対応させる。result advancement、cancellation、
 v3 validation findingはline patchでなくcomplete sibling-consumer auditを要求する。
 
+#### A1 PostgreSQL binary-format public-contract ledger
+
+これは次のindependently useful D13 railのsource of truthである。すでにpublish済みの
+`Text|Binary` parameter/result choiceをfirst-release PostgreSQL type matrixで完成させる。
+public type/function/option/error variant/driver/Query shape/dynamic dispatchは追加しない。
+binary encoderとstatic type proofを分離するとill-typed valueを送信でき、producer proofだけを
+分離するとdormantになるため、generated descriptor semantics、package binder context、prepared
+validation、libpq argument、row decodeを1 capability boundaryで変更する。strict producer-to-consumer
+chainを分割すると同じwire/ABI/malformed-input/whole-per-unit proofが重複するため、implementationが
+1,000 hand-written lineを超える場合もこの1 PR boundaryを維持する。
+
+application-callable inventoryはexactly次のまま:
+
+```text
+postgres.Format { Text, Binary }
+postgres.ExecuteOption.ParameterFormat(name: str, format: postgres.Format)
+postgres.ExecuteOption.ResultFormat(format: postgres.Format)
+```
+
+```align
+pub fn execute_native<P>(
+  target: pkg.db.exec,
+  statement: pkg.db.command<P>,
+  params: P,
+  options: slice<pkg.db.ExecuteOption>,
+  native: slice<ExecuteOption>,
+) -> Result<pkg.db.exec_result, pkg.db.Error>
+
+pub fn rows_native<P, R>(
+  target: pkg.db.exec,
+  statement: pkg.db.query<P, R>,
+  params: P,
+  options: slice<pkg.db.ExecuteOption>,
+  native: slice<ExecuteOption>,
+) -> Result<pkg.db.rows<R>, pkg.db.Error>
+
+pub fn one_native<P, R: RegionPlain>(
+  target: pkg.db.exec,
+  statement: pkg.db.query<P, R>,
+  params: P,
+  out: region,
+  options: slice<pkg.db.ExecuteOption>,
+  native: slice<ExecuteOption>,
+) -> Result<R, pkg.db.Error>
+
+pub fn rows_stmt_native<P, R>(
+  borrow mut statement: pkg.db.stmt<P, R>,
+  params: P,
+  options: slice<pkg.db.ExecuteOption>,
+  native: slice<ExecuteOption>,
+) -> Result<pkg.db.rows<R>, pkg.db.Error>
+```
+
+`ParameterFormat(name, ...)` absentはそのparameterのText、`ResultFormat(...)` absentはcomplete
+resultのTextである。1 named parameterにformat optionは最大1つ、1 executionにresult formatは
+最大1つ。result formatは全result columnに対する1 libpq-wide choiceでper-column surfaceはない。
+valid commandはresult columnを持たないが`execute_native`もselected result formatをlibpqへ渡す。
+`rows_native`/`one_native`/`rows_stmt_native`は両formatを`BufferedFull`/`SingleRow`/
+`PortalBatch`の全callable modeとcomposeする。common operationはPostgreSQL native optionを
+書けないためabsenceによるText-onlyのまま。environment/server setting/row value/prepared history/
+heuristicはformatを変えない。
+
+first-release binary mappingはexact:
+
+| Align value shape | required PostgreSQL canonical type / OID | binary parameter/result payload |
+|---|---|---|
+| `bool` / `Option<bool>` | `bool` / 16 | 1 byte、exactly `00`または`01` |
+| `i16` / `Option<i16>` | `int2` / 21 | two's-complement 2-byte big-endian |
+| `i32` / `Option<i32>` | `int4` / 23 | two's-complement 4-byte big-endian |
+| `i64` / `Option<i64>` | `int8` / 20 | two's-complement 8-byte big-endian |
+| `f32` / `Option<f32>` | `float4` / 700 | exact IEEE-754 bits、4-byte big-endian |
+| `f64` / `Option<f64>` | `float8` / 701 | exact IEEE-754 bits、8-byte big-endian |
+| `str`/`string`とnullable form | `text` / 25、`varchar` / 1043、または`name` / 19 | exact client-encoding bytes、recorded lengthにterminatorなし |
+| `slice<u8>`/`array<u8>`とnullable form | `bytea` / 17 | embedded zero/high byteを含むexact bytes |
+
+owned `string`/`array<u8>`はparameter shapeだけ。Row fieldは`Option`を含むborrowed `str`/
+`slice<u8>` viewのままで、`one_native`はexisting explicit-region cloneを維持する。
+
+connectionはclient encoding UTF-8にpinされたまま。binary text inputはexact UTF-8 bytesを
+execution-owned storageへcopyし、package storage safety用sentinelだけをrecorded length外へappend
+する。binary transportがlength-awareでもPostgreSQL text valueはU+0000を含めないため、`text`/
+`varchar`/`name`はsend前にrejectする。binary `bytea`はpayload byteを追加/削除しない。present empty
+Binary `bytea`はrecorded zero length外に1 zero sentinel byteをallocateし、そのnon-null pointerを
+libpqへ渡す。`None`だけがnull pointerを使うためemptyとSQL NULLはdistinctである。NULL parameterは
+otherwise ignored lengthでselected format codeを保持する。NULL resultはpayloadなしだが
+RowDescriptionのexpected OID/result formatを必ず検証する。Text formatはexisting exact
+lowercase `\\x` bytea encode/decodeとscalar parserを維持する。この表にないOID/domain/enum/array/
+range/numeric/date-time/JSON/extension typeをcoerceしない。
+
+semantic-to-wireとwire-to-semanticのindependent goldenは`false = 00`、`true = 01`、
+`int2(-2) = ff fe`、`int4(0x01020304) = 01 02 03 04`、
+`int8(-2) = ff ff ff ff ff ff ff fe`、`f32(1.5) = 3f c0 00 00`、
+`f64(-0.0) = 80 00 00 00 00 00 00 00`、UTF-8 `é = c3 a9`、
+`bytea([0, 255]) = 00 ff`。floatはsigned zero/infinity/NaN payloadを含むevery bitを保持しdecimal
+textを経由しない。layoutはlibpq network-byte-order requirementとPostgreSQL built-in
+`boolsend`、integer send/receive、`pq_sendfloat4`/`pq_sendfloat8`、`textsend`/`namesend`、
+`byteasend` contractに従う。
+
+compiler-private normalized-call ABIはexactである。`one_native`は
+`rows_native_prevalidated`を使い、4つ目のinternal entry pointを持たない:
+
+```align
+pub fn execute_native_prevalidated<P>(
+  target: pkg.db.exec,
+  params: P,
+  statement: pkg.db.command<P>,
+  query_id: str,
+  timeout: Option<i64>,
+  format_plan: raw,
+  format_count: u32,
+  result_format: u8,
+) -> Result<pkg.db.exec_result, pkg.db.Error>
+
+pub fn rows_native_prevalidated<P, R>(
+  target: pkg.db.exec,
+  params: P,
+  statement: pkg.db.query<P, R>,
+  query_id: str,
+  timeout: Option<i64>,
+  delivery: u8,
+  portal_max_rows: i32,
+  format_plan: raw,
+  format_count: u32,
+  result_format: u8,
+) -> Result<pkg.db.rows<R>, pkg.db.Error>
+
+pub fn rows_stmt_native_prevalidated<P, R>(
+  params: P,
+  borrow mut statement: pkg.db.stmt<P, R>,
+  timeout: Option<i64>,
+  delivery: u8,
+  portal_max_rows: i32,
+  format_plan: raw,
+  format_count: u32,
+  result_format: u8,
+) -> Result<pkg.db.rows<R>, pkg.db.Error>
+```
+
+`format_count`は8-byte/4-aligned entryのexact countで、operationのtrusted parameter count
+（directはvalidated descriptor count/thunk、preparedはvalidated stmt count thunk/copy）と
+`65_535`の両方以下。`format_plan`は`format_count == 0`のときexactly null、それ以外は
+complete synchronous call中callerがownするchecked `i64(format_count) * 8`以上のreadable byteを
+指す。entryは`i32 ordinal`、`i32 format`の順で、ordinalはone-based、`0=Text`、`1=Binary`。
+`result_format`も`0=Text`、`1=Binary`。internal calleeはlive-state access/allocation/bind/send前に
+result tag、parameter-count bound、pointer/count product、checked byte size、各entryのordinal/
+format tag/duplicate ordinalをsource orderでvalidateする。codeをexecution-owned storageへcopyし、
+caller planをretain/freeしない。malformed productは
+`InvalidQuery(ContractError { query_id: Some(query_id), item: "postgres.execute.format_plan",
+message: "invalid normalized PostgreSQL format plan" })`。compiler-private call validatorは
+corresponding public wrapperが作ったlive scratch owner由来plan pointerだけを許し、application call、
+wrong operation/type、pointer substitution、malformed HIRをcodegen前にrejectする。
+
+Binary関連のpublic contract errorはexact。以下の全recordはtrusted Query/command IDを
+`Some(query_id)`として使う:
+
+| failure | exact public error |
+|---|---|
+| selected Binary parameterがdirect static proofまたはprepared effective-OID proofを欠く | `Unsupported`、item `postgres.execute.parameter_format`、message `binary PostgreSQL parameter requires an exact supported ParameterType` |
+| malformed internal normalized plan | `InvalidQuery`、item `postgres.execute.format_plan`、message `invalid normalized PostgreSQL format plan` |
+| malformed text/byte parameter pointer/length representation | `Encode`、item `db.parameter`、message `database parameter has an invalid memory representation` |
+| PostgreSQL text-type parameterのU+0000 | `Encode`、item `db.parameter`、message `database text contains U+0000` |
+| checked parameter encodingまたはcomplete Bind-message budget overflow | `Encode`、item `db.parameter`、message `PostgreSQL parameters exceed the Bind message length limit` |
+| direct/preparation Parse-message budget overflow | `InvalidQuery`、item `postgres.execute.wire`、message `PostgreSQL Parse message exceeds the protocol length limit` |
+| result name/OID/format/NULL/pointer/length/payload mismatch | `Decode`、item `db.row`、message `PostgreSQL row does not match the static Row contract` |
+
+parameter formationはincreasing protocol ordinalをvisitする。Measure modeの1 text/byte field内では
+memory representation、該当するtext U+0000、exact encoding arithmetic、remaining Bind budgetの順。
+complete Measure pass後だけEncode modeがallocation/copyする。ordinary allocation failureはlanguage
+hard abortで、別の`pkg.db.Error`ではない。各tuple-producing native resultは2 ordered
+validation phaseを持つ。row count、zero-row/cardinality/terminal handling、result publication前にMetadata
+modeがexact column countとincreasing declared Row ordinalのname/OID/formatをcheckする。complete pass
+success後だけValue modeがdelivered rowをinspectし、increasing ordinalのNULL disposition、negative
+length、present valueのnon-null pointer、fixed width後のbool valueまたはUTF-8 payload validityをcheckする。
+したがってany metadata errorはevery value/cardinality outcomeよりwinし、phase内ではfirst declared
+ordinalがwin。このorderと上表がvalid/malformed zero-row resultを含むevery multi-invalid direct/
+prepared/buffered/streamed inputを支配する。
+
+context matrixのretained v2 rangeはexactかつdriver-specific。byte 0--39はcommon v2 fieldを保つ。
+SQLiteはoffset 40をretained text/blob pointer vector、48をその`u32` vector length、52をzero
+`u32`に使い、every byte 56--79をzeroとrequireする。offset-40 vectorとentryだけをown/freeする。
+PostgreSQLはoffset 40/48/56/64をvalue/OID/length/format vector、72をその`u32` length、76を
+zero `u32`に使い、existing ownership/cleanupを保つ。両v4 constructorは全112 byteをexplicitに
+initializeする。complete validatorはload/free前にこのdriver-specific productをcheckし、malformed
+cleanupはSQLite zero-only slotをownerとしてinterpretしない。
+
+actual aggregate boundはPostgreSQL protocol v3が固定する。trusted parameter count `N`はlibpqのwide C
+`int` argumentに関係なくParse/Bind `Int16` count fieldのunsigned range `65_535`以下。ここで使うexact
+libpq 17 call shapeはparameter-format count=`N`、result-format countはoneでvalidated `0=Text`または
+`1=Binary` codeを持ち、portal name=empty、statement name=directではempty/preparedではretained
+generated ASCII name。`S`をterminator込みstatement-name C-string byte count、`payload_i`をNULLなら
+zero、それ以外はexact selected encoded lengthとする。one-byte message tagを除きown four byteを含む
+Bind length fieldはexactly `13 + S + 6*N + sum(payload_i)`で`2_147_483_647`以下。
+Parse lengthはPostgreSQL wire-SQLのterminator
+込みC-string byte countを`Q`としてexactly `6 + S + Q + 4*N`でsame limit。direct executionは両formula、
+preparationはParse、prepared executionはBindをcheckする。全arithmeticはnarrow前にchecked `u64`。
+Measure前、context offset 96にsigned `i64`でstoreするexact fixed-budget resultは
+`2_147_483_647 - (13 + S + 6*N)`。negativeまたはnon-`i64` resultはstore前にfailする。
+
+descriptor/artifact formationはartifact/cache publication前に`N > 65_535`をdiagnostic
+`PostgreSQL static query supports at most 65535 parameters`でrejectする。そのcountを持つmalformed
+runtime descriptor/statementはoption access/allocation前にexisting query-less `InvalidQuery`、item
+`db.descriptor.header`、message `invalid static database descriptor`を返す。payload allocation前に
+generated binder-v2 Measure modeがincreasing protocol ordinalをvisitし、memory representation/text
+U+0000 ruleをvalidate、exact selected encoding lengthをcomputeしてpreinstalled remaining Bind budgetから
+debitする。Text scalar measurementはsame canonical formatterをcount-only sinkで使い、Text byteaはchecked
+`2 + 2*source_len`、Binaryはfixed tableまたはsource byte length。encoding arithmetic/debitに失敗するfirst
+ordinalがexact Bind `Encode` errorを返しlater fieldはinspectしない。complete successful Measure passだけが
+binder-v2 Encode modeをpermitする。parameterized budget ownerはno-allocation measurement stubを使い、
+multi-gigabyte fixtureなしでdirect/prepared、single/multiple/NULL value、every encoding class、both
+result format、both statement-name length、`65_535`/`65_536`のaccepted-limit/rejected-limit-plus-one pairをderiveする。
+
+binder callback familyはexact。every callbackは
+`fn(context: raw, protocol_ordinal: u32, value: T) -> i32`。non-null fieldは`Some`へliftし、nullable
+fieldは`Option`をunchangedで渡す。Measure modeはそのrowの`measure_*_v1` symbolだけ、
+Encode modeはexisting `bind_*_v2` symbolだけをcallできる。
+
+| `T` | Measure symbol | Encode symbol |
+|---|---|---|
+| `Option<bool>` | `pkg.db.internal.measure_bool_v1` | `pkg.db.internal.bind_bool_v2` |
+| `Option<i16>` | `pkg.db.internal.measure_i16_v1` | `pkg.db.internal.bind_i16_v2` |
+| `Option<i32>` | `pkg.db.internal.measure_i32_v1` | `pkg.db.internal.bind_i32_v2` |
+| `Option<i64>` | `pkg.db.internal.measure_i64_v1` | `pkg.db.internal.bind_i64_v2` |
+| `Option<f32>` | `pkg.db.internal.measure_f32_v1` | `pkg.db.internal.bind_f32_v2` |
+| `Option<f64>` | `pkg.db.internal.measure_f64_v1` | `pkg.db.internal.bind_f64_v2` |
+| `Option<str>` | `pkg.db.internal.measure_text_v1` | `pkg.db.internal.bind_text_v2` |
+| `Option<slice<u8>>` | `pkg.db.internal.measure_bytes_v1` | `pkg.db.internal.bind_bytes_v2` |
+
+eachはsettled callback status modelを使う。successはexact zero、first context-owned failureをrecordした後は
+exact one。valid callbackはother statusを返さず、MeasureはEncodeへ、EncodeはMeasureへdelegateしない。
+
+これらのcheckはsettled operation phaseをreorderせずextendする。direct executionはcomplete
+descriptor/count/identity、option、driver/live state、context、generated static contractをvalidateし、続いて
+leaseをacquire、exact full format vectorをallocate/install、Parse budgetとBind fixed budgetをvalidateした後に
+binder-v2 Measure、Encode、deadline、sendの順。prepared executionはcomplete statement/count/identityと
+option、driver/live stateをvalidate、leaseをacquire、context/full format vectorをcreate、Bind fixed budgetを
+validateした後にMeasure、Encode、deadline、sendの順。preparationはcomplete descriptor/options/live
+stateをvalidateしleaseをacquireした後にname formation、Parse budget、`PQprepare`の順。したがって
+header/count errorはevery optionよりwinし、overlapはevery direct/prepared parameter measurementよりwin、
+successful lease acquisition後はdirect Parse-budget errorがevery parameter-value errorよりwinし、Measure errorは
+increasing protocol ordinal順。budget failureはbinder-v2 Encode callback/libpqをcallしない。
+
+call-local sparse normalized planはsuccessful native-option validationの末尾でformし、execution contextには
+installしない。下記closure matrixでnormalized planをinstallするとは、generated static validationと
+successful lease acquisitionの後にexecution-owned exact full format vectorをallocate/installすることを指す。
+package-context rowのcomplete fixed Bind formulaはexact
+`2_147_483_647 - (13 + S + 6*N)`で、initializerはdirect/preparedの両executionでそのsuccessful
+leaseの後だけrunする。
+
+`one_native`でもMetadata modeはevery newly acquired tuple-producing resultでrunする。malformed second
+generationはCardinality前にexact row-contract Decode errorを返す。metadata-valid second generationは
+Value mode/decoder/second Row allocationなしにCardinalityを返す。このD13 ruleはolder D8
+any-second-row winnerをsupersedeする。
+
+implementation closure matrix:
+
+| closure cell | required implementation closure | exact owner evidence |
+|---|---|---|
+| public surface/operation matrix | 上記inventoryをexactに維持する。direct Query/commandとprepared Query executionでindependently selected Text/Binary parameter formatを、同じoperationでindependently selected Text/Binary result formatをacceptする。prepared `one_native`、common native-option escape、per-column selector、reflective codec、compatibility aliasを追加しない。 | exported-surface golden、command/direct rows/direct one/prepared rows callable matrix、parameter-format plan/result-format axisはBufferedFull/SingleRow/PortalBatchとseparate |
+| static type proof/binder/resolver ABI | 8-aligned execution descriptorを136-byte v5からexact 144-byte v6へbumpする。64/104/new 136以外のoffsetはv5 meaningを保持する。offset 64はnon-null generated binder-v2 `fn(context: raw, borrow params: P, mode: u8) -> i32`: `0=Measure`,`1=Encode`でother modeはpackage callback前にfail。両modeはsame increasing protocol ordinal/field typeをvisitし、Measureはtype-matched count/debit callbackだけ、Encodeはmatching allocation/bind callbackだけをcallする。SQLiteはexact non-measuring contextへEncodeをdirect invokeし、PostgreSQLはsame context/params/format vectorのone complete Measure success後だけEncodeを許す。offset 104はnon-null generated parameter-resolver v2: zero=unknown、positive ordinal=knownだがText-only、corresponding negative ordinal=上表のcompatible PostgreSQL `ParameterType`をexactに1つ持ちBinary可。`i32::MIN`またはabsolute ordinalが`1..=parameter_count`外はmalformed。offset 136はnon-null generated `fn() -> u32` parameter-count v1 thunkで、bodyはoffset 112のexisting distinct-parameter countとequalかつ`65_535`以下のsingle constant return exactly。complete descriptor validatorはbinder/resolver accept前に両count compare/protocol maximumをenforceする。existing sealed `parameter_known`は両signをacceptし、`parameter_ordinal`はabsolute ordinalを返す。sealed direct binary-ordinal operationはnegative formだけをabsolute ordinalへし、それ以外はzero。prepared siblingは下記retained effective-OID eligibility bitもrequireするため、異なる`ParameterOid` overrideはstale static proofをreuseできない。application call、wrong descriptor/resource、unguarded prepared load、complete header guard外のcount-thunk/binder invocation、Measure/Encode mismatch、cross-descriptor binder/resolver/count-thunk splice、malformed HIRはfail closed。Query/command formation、interface serialization、monomorphization、whole/per-unitはone producer generationのmatching binder v2/resolver v2/count thunkをretainする。 | exact v6 header/binder/resolver/count-thunk body/signature/relocation golden、`65_535`/`65_536`、offset count/thunk equality、zero/mismatch/malformed thunk product、mode/callback/ordinal parityとMeasure-before-Encode、every type/missing-`ParameterType` code、matching/differing/absent `ParameterOid` proof、sema/MIR negative、whole/per-unit runtime-selected twin |
+| option validation/precedence | §13.4 source-order phaseを維持する。direct command/Queryはcomplete descriptor/identity、common/native option、driver/live stateの順。preparedはevery name/proof lookupがguarded stateに依存するため、common/native option前にcomplete statement v4 header、batch plan、resolver、count thunk/count equality、eligibility shape、trusted identityをvalidateする。malformed/closed statementとany invalid Binary optionの組合せはquery-less `InvalidQuery`、item `db.descriptor.header`、message `invalid static database descriptor`。そのprepared guard後、direct/preparedとも各`ParameterFormat`でname U+0000、unknown、direct negative proofまたはprepared negative+eligibility proofを欠くBinary、duplicateの順にrejectし、current payload validityをduplicate registrationより先にする。missing proofは`Unsupported`、trusted Query/command ID、item `postgres.execute.parameter_format`、exact message `binary PostgreSQL parameter requires an exact supported ParameterType`。`ResultFormat`はclosed enum以外のpayloadがなくduplicate detectionはexact。Deliveryはadjacent ledger orderを維持する。operation-specific header guard後の全option errorはdriver restriction、physical connection/live-state、lease/context/bind/SQL sendより先。valid SQLite stmt+invalid BinaryはPostgreSQL driver mismatch前にoption error。 | command/direct/prepared source-order/reversed-invalid/valid-duplicate matrix、malformed/closed stmt+every invalid Binaryのheader winner、valid SQLite stmt+invalid Binaryのoption winner、unknown/NUL/missing-proof zero execution-context/plan/libpq、retained Delivery owner |
+| package context/prepared ABI | shared opaque binder/decode contextは両driverでone exact 112-byte v4。offset 0--95は上記exact v3 meaningを保持する。offset 96はsigned remaining Bind-payload budget、104はmeasurement state (`0=unmeasured`,`1=measuring`,`2=measured`)、105--111はzero。SQLiteはstate 0/budget `-1`をrequireする。new PostgreSQL contextも`(0,-1)`で開始し、sealed budget initializerだけがcomplete header/options/count/Parse validation後かつparameter payload allocation前にfixed Bind formulaのnonnegative resultとstate 1をstoreできる。Measure callbackはstate 1をrequireしexact lengthをnegativeにせずatomically debitする。complete successful binder-v2 Measure returnがstate 2へchangeし、PostgreSQL Encodeはstate 2をrequire、failure/second Measure/Encode passはpublishできない。offset 80はresult format `u8`（SQLiteは`0=Text`、PostgreSQLは`0=Text`,`1=Binary`）、81はmetadata state (`0=unvalidated`,`1=validated`)、82--87はzero、88はmetadata native pointerのまま。metadata state 0はoffset 88 nullをrequireする。sealed native-generation setterはevery row-producing SQLite Query executionとzero-row terminalを含むevery newly acquired tuple-producing PGresult前にoffset 8をinstallし81/88をresetする。successful metadata validationはstate 1とexact non-null offset-8 pointerをstoreし、value validationはそのequalityをrequireする。native state clear/replaceは両metadata fieldをresetし、pointer-address reuseはvalidationをinheritしない。one context validatorはevery driver/version/format/metadata-state/measurement-state/budget/reserved/pointer productをdereference/debit/bind/free前にrejectする。shared prepared stmt stateはexact 112-byte/8-aligned v4: offset 0--79はv3 meaning、80はresolver v2、88はpackage-owned byte-per-parameter Binary eligibility vector、96はdescriptor offset 136由来のnon-null producer-owned parameter-count v1 thunk、104はcopied exact `u32` parameter count、108--111はzero。one complete stmt-header validatorはfixed field/non-null thunkを先にestablishし、guarded thunk resultが`65_535`以下かつoffset 104とexactly equalと要求した後だけeligibility validationをboundする。SQLiteはevery countでnull eligibility pointer。PostgreSQLはzero parameterでnull、それ以外でtrusted count exactlyのreadable byteを持つnon-null vectorかつ全byte 0/1。PostgreSQL preparation時、byte `ordinal-1`はstatic validationがsupported nonzero canonical OIDをinstallし、任意の`ParameterOid` override後のeffective OIDがequalな場合だけone。arbitrary nonzero overrideはTextではvalidなままだが、異なるoverrideはそのordinalをBinary-ineligibleにする。sealed prepared binary-ordinal bridgeはcomplete guarded v4 header、trusted count内negative resolver result、eligibility byte oneをrequireする。HIR stmt formationはbinder v2/resolver/count thunk/row validator/decoder/batch planをone Query producerから要求する。stmt Dropはvector/thunk/countをnull/zero化してからvectorをonce freeする。context/stmt validator、全accessor/bridge/constructor/Drop、semantic/byte goldenを一緒に更新する。 | driver x context-v4 result-format/metadata-state/measurement-state/budget/reserved/native-pointer matrixとnew-result pointer-reuse reset/Measure replay reject、both-driver stmt v4 active/closed/malformed byte、`65_535`/`65_536`、thunk null/body/count mismatch、eligibility pointer/byte productのno out-of-bound scan/callback、cross-Query binder/thunk/resolver splice、matching/differing/absent override、constructor/accessor/Drop no-call/free counter、cumulative SQLite suite |
+| normalized format formation/ownership | complete native-option validation後、explicit parameter optionごとにcall-local normalized 8-byte entry (`i32 ordinal`,`i32 format`)を最大1つ作る。public native wrapperが上記exact synchronous internal ABI中4-aligned scratchをownしsuccess/error後freeする。published rowsはborrowしない。complete plan/count validation後、internalはText initializeしたexact one `N`-entry execution-owned format vectorをallocateし、各explicit codeをown ordinalへcopyする。これがlibpqに`N` parameter format codeをemitさせ、両binder-v2 modeが読むnon-null vectorで、zero parameterはnull。zero explicit optionはcanonical `(null, 0)` scratch plan/no scratch allocationだが`N > 0`ならfull vectorはallocateする。ResultFormatはseparate allocationなし。 | zero/one/many optionとzero/positive-`N` scratch/vector allocation/free、every malformed result-tag/count/pointer/size/ordinal/tag/duplicate productのexact `InvalidQuery`+zero context/bind/send、full-vector default/explicit code byteとlibpq format-count parity、rows publication後scratch destruction/use-after-free probe、direct/prepared parity、sema/MIR call-formation negative |
+| parameter measurement/encode/retention | directはgenerated static validation後にnormalized plan/exact full format vectorをinstallし、preparedはretained negative resolver proof/effective-OID eligibility bitの両方をrequireする。payload allocation前にapplicable Parse formulaをvalidateし、exact Bind budgetをinitializeしてbinder-v2 Measureをonce runする。Measure callbackはown ordinalのselected codeだけを読み上記どおりvalidate/debitし、allocation/bind/send/siblingへのcode broadcast/result format mutationをできない。その後binder-v2 Encodeがsame per-ordinal codeを読み上表どおりemitする。各non-null scalar/text/byteaはexactly one execution-owned payload allocation、NULLはnone。nonempty Binary byteaはexactly `len` bytes、empty Binary byteaは1 zero sentinel byteをallocateしてnon-null pointer+recorded length zeroを渡し、`None`とdistinct。BufferedFullはsync completion、SingleRow/PortalBatchは`PQgetResult` nullまたはfail-close context destructionまでretainする。every Measure/partial Encode/option-plan failureはinstalled context/vector/payload ownerをonce freeしsendしない。 | exact Parse/Bind formulaとevery encoding-class budget boundary、`65_535`/`65_536`、per-type/nullable measure-vs-wire byte/length/format/OID、every ordered two-parameter format pair+three-parameter heterogeneous、direct/prepared `Some(empty bytea)` vs `None`、U+0000、accepted-limit/rejected-next multi-parameter/statement-name twinのzero payload allocation/send、count-only scalar formatter parity、mode replay/wrong-mode、source mutation/Drop、partial allocation/free、sync/stream lifetime |
+| libpq call parity | every `PQexecParams`/`PQexecPrepared`/`PQsendQueryParams`/`PQsendQueryPrepared`へindependently formed exact parameter vector/result codeを渡す。explicit Binaryを`PQexec`/text fallback/second SQLへrouteしない。timeout/cancel/drain/status fail-close/Tx effect/delivery selectionはadjacent D8/D9/A1 ledgerのまま。 | every ordered two-parameter format pair x every result-format state x sync/async direct Query/prepared Query stub capture、separate direct-command capture、required live PostgreSQL mixed-format control、retained deadline/delivery/status/cancel matrix |
+| result metadata/decode | exact `PQfformat` FFIを追加し、descriptor offset 80/stmt offset 56/rows offset 40をsame generated row-validator v2 pointerとする。exact ABIは`fn(context: raw, mode: u8) -> i32`、`0=Metadata`,`1=Value`でother modeはpackage callback前にfailure。changed rows pointer signatureによりshared 120-byte/8-aligned rows recordをv3からv4へbumpし、other byte offsetは不変。Metadata modeは`validate_row_count_v3`をonce、続いて`validate_field_metadata_v3`をdeclared orderでcallする。SQLiteはcount/name、PostgreSQLはcount/name/OID/requested formatをvalidateし、successで上記context metadata stateをpublishする。Value modeはそのstateをrequireし、`validate_field_value_v3`をdeclared orderでNULL/representation/payloadにcallし、SQLiteはrow-dynamic native typeもvalidateする。Textはexisting parser。Binaryはwrong fixed width、boolの0/1以外、negative length、present valueのnull pointer、invalid UTF-8をsafe view/decoder前にrejectする。integer/floatはendian-explicit bit operation。every row-producing SQLite Query execution/every tuple-producing PGresult generationはrow count/zero-row terminal disposal/cardinality/`has_next`/decode/batch append前にMetadataをexactly once invokeする。Valueはdecoded/appended rowごとにonce、cardinality-only drainではnever。Binary text/bytea viewはcurrent PGresult generationをdirect viewし、Text byteaだけowned decode bufferを維持する。`one_native`は従来どおりvalidated first Rowを`out`へexactly once cloneする。descriptor producer、stmt/rows constructor、one complete rows-v4 validator、every rows consumer/Drop、sealed direct/prepared/current-metadata/current-value bridge、HIR validator、MIR、LLVM preflight、whole/per-unit retentionはv2 signatureを一緒にrecognizeし、v1/rows v3/cross-Query/invalid-mode/value-before-metadata/malformed-thunkをrejectする。 | BufferedFull/SingleRow/PortalBatch x direct/preparedのzero-row valid/wrong count/name/OID/format exact Decode-before-exhaustion/cardinality、terminalを含むevery new PGresult metadata call count、metadata-before-value multi-invalid、rows-v4/validator-v2 body/signature/relocation semantic-byte golden+sema/MIR malformed-call、per-type result-format/NULL/malformed width/bool/UTF-8/pointer、zero-copy identity、generation/one-clone、cumulative SQLite metadata/value suite |
+| cleanup/error/allocation | 上記exact error record/precedence tableを返す。missing binary proofとmalformed normalized planはnative state前。parameter representation/NUL/lengthはpre-send。malformed binary metadata/payloadはshipped delivery cleanup中もfirst exact `Decode` row-contract errorを保持しlater decoderを呼ばない。row-cache Text bytea、parameter、PGresult、context、unpublished batch/Row、statement eligibility vector/dependency、leaseをsuccess/error/timeout/cancel/early Drop/malformed stateでexactly once releaseする。Binary scalar/text/bytea result decodeはexisting row cache以外のper-field heap allocationなし。 | exact error identity/intra-field precedence x direct/prepared/all delivery、first-error/no-more-decode x Conn/Tx、fault allocation/cleanup、early Drop/reuse、sanitizer-compatible stub |
+| artifact/cache/docs identity | Text/Binary surfaceはexistingなのでapplication-facing module interface/static Query semantic fingerprint不変。`pkg.db.internal`/`pkg.db.internal.postgres`のadded/changed exported compiler-private measurement/prevalidated signatureは両internal module interface hashとevery importing module dependency-interface keyをonce changeする。descriptor v6の144-byte image、binder-v2/row-validator-v2/resolver/count-thunk body、package callback semantics、rows v4の120-byte implementation、stmt v4の112-byte implementation、shared context v4の112-byte implementationもcompiler/package implementation hashとaffected codegen/object/dependency cacheをexactly once invalidateする。checked artifact/metadata/SQL identity/driver restrictionは不変。English/Japanese designとlive handoffのnext/shipped boundaryを一致させる。 | both internal-module interface-hash/importer dependency-key before/after twin、descriptor semantic-byte parity+binder/row-validator/resolver/count-thunk relocation/body+cache twin、rows 120-byte/stmt 112-byte/context 112-byte golden、application-interface/artifact/metadata identity control、mirror consistency、implementation milestoneだけでhandoff update |
+| acceptance/measurement | merged D8/D9、A1 batch/direct+prepared delivery、libpq client >=17、required PostgreSQL jobをprerequisiteとする。parameter/result formatはindependent axis: 2 named Query parameterで`{default Text, explicit Text, explicit Binary}`のevery ordered pair（9 plan）を`{default Text, explicit Text, explicit Binary}` result formatとcross（27 product）しdirect/prepared stub両方でown、3-parameter heterogeneous controlとapplicable direct-command parameter/result-code caseも含む。separately every mapped type/nullable formをText/Binary measure/bind/decodeとBufferedFull/both explicit deliveryでcrossする。exact Parse/Bind formula、direct/prepared statement-name length、single/multiple/NULL payload、all encoding class、accepted-limit/rejected-next、parameter count `65_535`/`65_536`をno-allocation stubでcrossし、その後timeout absent/present、Conn/Tx、callableなrows/one/command、zero/one/many、valid/malformed zero-row/nonempty metadata/payload、whole/per-unitを2 format axisをcollapseせずcoverする。push前に`scripts/db-verify-local.sh`。correctness後にpayload/copied byte、allocation、time-to-first-row、full-scan throughputを含むText-vs-Binary local measurementをrecordするがsemantic gateではない。 | focused 27-product Query format-plan/result owner+command/mixed live control、protocol-budget/count boundaryとMeasure/Encode parity、metadata-only zero-row/new-generation、per-type package/compiler owner、retained `pkg_db_q4b`/`pkg_db_a1`/`pkg_db_q5b2`、required live PostgreSQL、local parity、non-gating measurement |
+
+first fresh reviewは2 P1 omissionと1 P2 error-contract gapを発見した。empty Binary byteaはexact
+non-null zero-length representationとdirect/prepared ownerを持つ。normalized-plan rowはcomplete
+compiler-private signature/bound/ownership/malformed result/call-formation guardをpinする。error tableは
+every observable fieldとmulti-invalid orderを固定する。author-side sibling auditはさらに、異なるprepared
+`ParameterOid`がdescriptor static Binary proofをreuseできる問題を発見したため、statement v4はText
+preparationをnarrowせずeffective-OID eligibilityをretainする。これらはinternal ABI/ownership cellを
+reopenするが、strict producer-to-consumer implementation boundaryは1つのまま。
+
+next fresh reviewはさらに2 P1 closure failureを発見した。eligibility lengthはself-reported stmt count
+だけだったため、descriptor v6/statement v4はone generated constant count thunkをretainし、vector
+scan前にcomplete header guard下でvalidateする。prepared option validationはearlier precedence文が
+option後へ置いたstateに依存していたため、single orderをcomplete stmt header+identity、common/native
+option、driver+physical live stateとする。exact malformed-statement/invalid-optionとvalid-wrong-driver/
+invalid-option winnerがmulti-invalid productを閉じる。これはABI/validation-order rowをreopenするが、
+one implementation boundaryは不変。
+
+redesigned reviewはさらに2 P1を発見したため、local patchでなくclosure matrixを
+`result-generation-metadata x independent-format-product` axisでreopenする。result schemaは
+generation-level obligationとなり、exact row-validator-v2 Metadata modeがzero-row/cardinality/
+terminal handling前、guarded Value modeがdelivered rowでrunする。同じreopenでparameter-plan stateと
+result-format stateをindependentにし、coupled `default/Text/Binary` shorthandでなくone parameterized
+ownerがcomplete two-parameter 27-productを閉じる。changed producer thunk/shared context ABI/every result
+consumer/format propagationはdormant proofまたはunchecked empty resultを避けるためtogetherにlandする
+必要があり、implementation boundaryは1つのまま。
+
+next redesigned reviewは2 P1/2 P2 omissionを発見したため、matrixを
+`cross-driver-context-bytes x internal-interface-cache x metadata-cardinality x encoded-length`
+axisでreopenする。SQLite context offset 56--79はcanonical zero/no ownership、internal prevalidated
+signature changeはinterface/dependency keyをexplicitにinvalidate、every result generation metadataは
+second-row Cardinality前にwin、each selected wire encodingはaccepted maximum/rejected next lengthを持つ。
+constructor/validator/consumer/cleanup/cache identity/observable error precedenceがsame ABI generationで
+一致する必要があり、分割するとunreadable context imageまたはstale callerを残すためone closure axis。
+
+protocol-boundary reviewはさらに2 P2 omissionを発見した。libpq C `int`はcomplete Bind envelopeではなく、
+Parse/Bind parameter countは16-bit protocol field。ledgerはexact Parse/Bind length formulaと`65_535`
+maximumをownする。binder v2/context v4がEncode前にone no-payload-allocation Measure passを提供し、
+impossible per-value maximumやlate libpq failureへ依存しない。wire-validation strategy changeなのでmatrixを
+`protocol-count x aggregate-message-budget x measure-before-encode` axisでreopenするが、one
+producer-to-consumer implementation boundaryは維持する。
+
+implementation referenceは[PostgreSQL protocol message formats](https://www.postgresql.org/docs/17/protocol-message-formats.html)、
+[libpq parameter/result formats](https://www.postgresql.org/docs/17/libpq-exec.html)、
+[libpq single-row mode](https://www.postgresql.org/docs/17/libpq-single-row-mode.html)、上記built-in
+send/receive functionである。implementation前にledgerとone-PR boundaryをfresh independent
+adversarial reviewし、findingはledger-firstで閉じる。code review前にsubsectionの全normative
+`must`/`exact`/`every`/`before`/`reject`/`required`を1 implementation path+discriminating ownerへ
+対応させる。resolver sign、format propagation、endian conversion、result metadata order、cleanupの
+findingはcomplete sibling type/operation/delivery auditを要求する。
+
 bounded batch generation、segmented child/validity bitmap、eligible direct SoAはfirst A1でshipped。
-PostgreSQL single-row/portal-batchは上記ledgerでspecified。PostgreSQL binary format、
+PostgreSQL single-row/portal-batchとbinary formatは上記ledgerでspecified。
 COPY/pipeline/LISTEN-NOTIFY、SQLite backup/blob/FTS、
 explicit pool、common contract実証後の追加driver。
 
