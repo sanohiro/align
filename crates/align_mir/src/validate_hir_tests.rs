@@ -13031,23 +13031,27 @@ fn hir_body_validator_prepared_binder_bridge_fails_closed() {
     let mut missing_guard = program.clone();
     {
         let expression = raw_call(&mut missing_guard);
-        let hir::ExprKind::RawCall { guard, .. } = &mut expression.kind else {
-            unreachable!()
-        };
-        *guard = None;
+        let mut changed = false;
+        if let hir::ExprKind::RawCall { guard, .. } = &mut expression.kind {
+            *guard = None;
+            changed = true;
+        }
+        assert!(changed, "prepared binder raw-call fixture changed shape");
     }
     assert!(!body_core_metadata_is_valid(&missing_guard));
 
     let mut forged_guard = program.clone();
     {
         let expression = raw_call(&mut forged_guard);
-        let hir::ExprKind::RawCall { guard, .. } = &mut expression.kind else {
-            unreachable!()
-        };
-        *guard = Some(Box::new(body_test_expr(
-            hir::ExprKind::Bool(true),
-            Ty::Bool,
-        )));
+        let mut changed = false;
+        if let hir::ExprKind::RawCall { guard, .. } = &mut expression.kind {
+            *guard = Some(Box::new(body_test_expr(
+                hir::ExprKind::Bool(true),
+                Ty::Bool,
+            )));
+            changed = true;
+        }
+        assert!(changed, "prepared binder raw-call fixture changed shape");
     }
     assert!(!body_core_metadata_is_valid(&forged_guard));
 
@@ -13183,43 +13187,50 @@ fn hir_body_validator_prepared_parameter_resolver_bridge_fails_closed() {
     program.fns.push(function);
     assert!(body_core_metadata_is_valid(&program));
 
-    fn raw_call(candidate: &mut hir::Program) -> &mut hir::Expr {
+    fn raw_call(candidate: &mut hir::Program) -> Option<&mut hir::Expr> {
         let unsafe_expression = candidate
             .fns
             .last_mut()
-            .and_then(|function| function.body.value.as_deref_mut())
-            .expect("prepared resolver unsafe expression");
+            .and_then(|function| function.body.value.as_deref_mut())?;
         let hir::ExprKind::Unsafe(block) = &mut unsafe_expression.kind else {
-            panic!("prepared resolver unsafe block")
+            return None;
         };
-        block
-            .value
-            .as_deref_mut()
-            .expect("prepared resolver raw call")
+        block.value.as_deref_mut()
     }
 
     let mut wrong_offset = program.clone();
-    let hir::ExprKind::RawCall { callee, .. } = &mut raw_call(&mut wrong_offset).kind else {
-        unreachable!()
-    };
-    let hir::ExprKind::RawPointerLoad { offset, .. } = &mut callee.kind else {
-        unreachable!()
-    };
-    offset.kind = hir::ExprKind::Int(24);
+    let mut changed = false;
+    if let Some(expression) = raw_call(&mut wrong_offset)
+        && let hir::ExprKind::RawCall { callee, .. } = &mut expression.kind
+        && let hir::ExprKind::RawPointerLoad { offset, .. } = &mut callee.kind
+    {
+        offset.kind = hir::ExprKind::Int(24);
+        changed = true;
+    }
+    assert!(changed, "prepared resolver pointer-load fixture changed shape");
     assert!(!body_core_metadata_is_valid(&wrong_offset));
 
     let mut missing_guard = program.clone();
-    let hir::ExprKind::RawCall { guard, .. } = &mut raw_call(&mut missing_guard).kind else {
-        unreachable!()
-    };
-    *guard = None;
+    let mut changed = false;
+    if let Some(expression) = raw_call(&mut missing_guard)
+        && let hir::ExprKind::RawCall { guard, .. } = &mut expression.kind
+    {
+        *guard = None;
+        changed = true;
+    }
+    assert!(changed, "prepared resolver raw-call fixture changed shape");
     assert!(!body_core_metadata_is_valid(&missing_guard));
 
     let mut wrong_argument = program.clone();
-    let hir::ExprKind::RawCall { param_tys, .. } = &mut raw_call(&mut wrong_argument).kind else {
-        unreachable!()
-    };
-    param_tys[0] = Ty::Raw;
+    let mut changed = false;
+    if let Some(expression) = raw_call(&mut wrong_argument)
+        && let hir::ExprKind::RawCall { param_tys, .. } = &mut expression.kind
+        && let Some(parameter) = param_tys.first_mut()
+    {
+        *parameter = Ty::Raw;
+        changed = true;
+    }
+    assert!(changed, "prepared resolver argument fixture changed shape");
     assert!(!body_core_metadata_is_valid(&wrong_argument));
 
     let mut wrong_resource_identity = program;
@@ -13372,29 +13383,22 @@ fn hir_body_validator_prepared_statement_formation_rejects_cross_query_splices()
     );
 
     let mut spliced = program;
-    let unsafe_expression = spliced
+    let mut changed = false;
+    if let Some(unsafe_expression) = spliced
         .fns
         .last_mut()
         .and_then(|function| function.body.value.as_deref_mut())
-        .expect("statement formation unsafe expression");
-    let hir::ExprKind::Unsafe(block) = &mut unsafe_expression.kind else {
-        unreachable!()
-    };
-    let hir::ExprKind::Call { args, .. } = &mut block
-        .value
-        .as_deref_mut()
-        .expect("statement formation call")
-        .kind
-    else {
-        unreachable!()
-    };
-    let hir::ExprKind::RawPointerLoad { ptr, .. } = &mut args[10].kind else {
-        unreachable!()
-    };
-    let hir::ExprKind::Field { root, .. } = &mut ptr.kind else {
-        unreachable!()
-    };
-    *root = 1;
+        && let hir::ExprKind::Unsafe(block) = &mut unsafe_expression.kind
+        && let Some(call) = block.value.as_deref_mut()
+        && let hir::ExprKind::Call { args, .. } = &mut call.kind
+        && let Some(argument) = args.get_mut(10)
+        && let hir::ExprKind::RawPointerLoad { ptr, .. } = &mut argument.kind
+        && let hir::ExprKind::Field { root, .. } = &mut ptr.kind
+    {
+        *root = 1;
+        changed = true;
+    }
+    assert!(changed, "statement formation fixture changed shape");
     assert!(!body_core_metadata_is_valid(&spliced));
 }
 
