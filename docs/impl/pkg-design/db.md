@@ -5314,6 +5314,31 @@ parent-state/PGconn agreement, Query-ID view, and completion pair before reading
 calling libpq. One internal validator owns all constructors, accessors, operations, and both Drop
 hooks.
 
+The valid published phase/ownership products are exhaustive:
+
+| Phase | PGconn | deadline/duration | flags | completion | Drop action |
+|---|---|---|---|---|---|
+| Active without Timeout | non-null and equal to parent | `(-1, -1)` | lease `1`, nonblocking `0` | absent, count zero | physical close, clear both flags, free |
+| Active with Timeout | non-null and equal to parent | positive absolute/positive original | lease `1`, nonblocking `1` | absent, count zero | physical close, clear both flags, free |
+| Complete | non-null and equal to parent | `(-1, -1)` | lease `1`, nonblocking `0` | present, nonnegative count | release lease, free; no libpq/close |
+| Failed synchronized | non-null and equal to parent | `(-1, -1)` | lease `1`, nonblocking `0` | absent, count zero | release lease, free; no libpq/close |
+| Failed closed | null | `(-1, -1)` | lease `0`, nonblocking `0` | absent, count zero | free only |
+
+No other phase/pointer/deadline/flag/completion product is valid. Restoration must clear
+nonblocking ownership before Complete or Failed-synchronized publication. Physical close clears
+both ownership flags and the PGconn pointer before Failed-closed publication. Complete and
+Failed-synchronized deliberately retain the lease until their still-live dependent resource is
+consumed or dropped; Failed-closed has already released it. The shadow and operation record move
+between these whole-row products through the one transition helper.
+
+The no-timeout CopyOut abort path has one non-publishable transient product: it retains the Active
+without-Timeout deadline pair, PGconn, and lease, temporarily sets nonblocking ownership to `1`, and
+uses one call-local `1_000_000_000 ns` absolute deadline. Safe public validators reject this product;
+only the abort routine and transition helper may observe it. The same one-second budget covers cancel
+creation/dispatch, COPY drain, final-result drain, blocking restoration, and transaction-state proof.
+It must end in Complete/Failed-synchronized with nonblocking cleared or Failed-closed with both flags
+and PGconn cleared; it is never stored across a public return.
+
 `copy_chunk` uses a hidden 40-byte trusted owner header and one v1 operation record:
 
 ```text
@@ -5393,7 +5418,7 @@ CopyOut Active -- positive PQgetCopyData --> Active + one dependent chunk
 CopyOut Active -- -1 + final success/null --> Complete
 CopyOut Complete -- next --> Complete + None, zero libpq calls
 CopyOut Active -- finish drains rows + final success/null --> consumed, reusable parent
-CopyOut Complete -- finish --> consumed, reusable parent
+CopyOut Complete -- finish --> consumed, reusable parent + stored exec_result, zero libpq calls
 CopyOut Complete -- abort --> consumed, reusable parent + Completed, zero libpq calls
 CopyOut Active -- abort/cancel + final failure/null --> consumed, reusable parent
 CopyOut Active -- completed-before-abort --> consumed, reusable parent + Completed
@@ -5438,6 +5463,26 @@ also synchronization evidence and preserves that earlier error while leaving the
 effect observable only through subsequent connection/transaction state. Only an explicit
 `copy_in_abort`/`copy_out_abort` call maps those two outcomes to `CopyAbort.Aborted`/`Completed`.
 
+Terminal classification and primary-error precedence are exhaustive:
+
+| Intent/current primary | Final sequence | Synchronized cleanup | Public result |
+|---|---|---|---|
+| clean finish/exhaustion, none | valid command + null | success | `Ok(exec_result)` / Complete with stored result |
+| clean finish/exhaustion, none | ordinary server error + null | success | copied native classification |
+| clean finish/exhaustion, none | missing, other ordinary, or extra result | any | synthetic COPY-completion `Native`; close if synchronization is unproved |
+| explicit abort, none | one fatal + null | success | `Ok(CopyAbort.Aborted)` |
+| explicit abort, none | one valid command + null | success | `Ok(CopyAbort.Completed(exec_result))` |
+| explicit abort, none | missing, other ordinary, or extra result | any | synthetic COPY-completion `Native`; malformed sequence overrides abort intent |
+| Timeout/post-native recovery, owned primary | one fatal or valid command + null | success | preserve owned primary |
+| Timeout/post-native recovery, owned primary | missing, other ordinary, extra, or cleanup failure | any | preserve owned primary and close when synchronization is unproved |
+| any intent | COPY/pipeline/unknown status | n/a | preserve owned primary, otherwise synthetic unsupported-protocol `Native`; immediate close |
+| clean or explicit-abort candidate, none | otherwise valid terminal but restore/state proof fails | failure | synthetic COPY-cleanup `Native`; close |
+
+An explicit abort outcome is not owned until the allowed one-result-plus-null sequence and cleanup
+proof both succeed. Thus malformed completion and cleanup errors are not allowed to disappear behind
+abort intent. Conversely, once a Timeout or post-native `Native` error is owned, later malformed
+recovery/cleanup only changes parent reusability and never replaces that primary.
+
 ##### Exact error and precedence table
 
 No new `db.Error` variant is added. The malformed descriptor result remains query-less because no
@@ -5458,6 +5503,7 @@ An error copied from libpq instead keeps the shipped field extraction and first-
 | Delivery in COPY native options | `Unsupported`, item `postgres.copy.delivery`, message `PostgreSQL COPY owns its data delivery protocol` |
 | non-PostgreSQL or unusable target | existing `DriverMismatch`/closed-target result before package COPY allocation or libpq |
 | initial ordinary native error | existing PostgreSQL native classification with copied fields |
+| initial pipeline or unknown status | synthetic `Native`, message `PostgreSQL COPY protocol entered an unsupported state`, immediate physical close |
 | opposite COPY direction | `InvalidQuery`, item `postgres.copy.direction`, message `PostgreSQL COPY direction does not match the operation` plus immediate physical close |
 | `PGRES_COPY_BOTH` | `Unsupported`, item `postgres.copy.direction`, message `PostgreSQL COPY BOTH is not supported` plus immediate physical close |
 | non-COPY success/result status | `InvalidQuery`, item `postgres.copy.direction`, message `PostgreSQL command did not enter COPY mode` |
@@ -5468,7 +5514,9 @@ An error copied from libpq instead keeps the shipped field extraction and first-
 | `PQputCopyData`/`PQputCopyEnd`/`PQgetCopyData` hard failure | copied `Native` error; direction-correct recovery or physical close preserves it |
 | deadline expiry | copied `Timeout`; recovery failure does not replace it |
 | CopyOut `PQgetCopyData == -2` | copied `Native` error before final drain; no chunk construction |
-| final status/extra-result/row-count malformed | `Native` with message `PostgreSQL COPY completion has an invalid representation`; drain or close by status class |
+| missing final result or final status/extra-result/row-count malformed | `Native` with message `PostgreSQL COPY completion has an invalid representation`; drain or close by status class |
+| clean terminal blocking restoration or transaction-state proof failure | synthetic `Native`, message `PostgreSQL COPY cleanup failed and the connection was closed`; immediate physical close |
+| explicit CopyOut cancel create/start/poll/socket/readiness failure | synthetic `Native`, message `PostgreSQL COPY cancellation failed`; immediate physical close |
 | explicit abort synchronized with final failure | `Ok(CopyAbort.Aborted)` |
 | abort races with successful completion | `Ok(CopyAbort.Completed(exec_result))` |
 
@@ -5478,12 +5526,11 @@ deadline/native work. `copy_in_info` accepts only Active. `copy_out_info` accept
 and `copy_out_next` on Complete returns `Ok(None)` without a libpq call. `copy_out_abort` on
 Complete consumes the resource and returns `Ok(CopyAbort.Completed(exec_result))` from the stored
 count with zero libpq calls. For every
-next/info/finish/abort/chunk access, complete record validation always wins. During cleanup, the
-first owned operation error, timeout, malformed-state error, or explicit
-abort intent is never replaced by a later server, restore, transaction-state, or cleanup error;
-cleanup failure changes only parent reusability. Explicit abort is the sole exception described by
-`CopyAbort.Completed`, because successful server completion is the observable race outcome rather
-than a cleanup failure.
+next/info/finish/abort/chunk access, complete record validation always wins. During cleanup, an
+already-owned operation error, timeout, or malformed-state error is never replaced by a later server, restore,
+transaction-state, or cleanup error; cleanup failure changes only parent reusability. Explicit abort
+intent is not an owned error: malformed completion or cleanup failure returns the exact `Native`
+row above, and only a valid synchronized command result becomes `CopyAbort.Completed`.
 
 A borrowed operation has two disjoint failure phases. State/record validation runs first.
 `copy_in_write` then rejects a nonempty length above `i32::MAX` as the exact local `Encode` error
@@ -5498,6 +5545,17 @@ malformed state, COPY/pipeline/unknown during recovery, or an unproved transacti
 finish/abort calls with the same COPY-state `Native` error and zero libpq calls. Its eventual Drop
 performs only the phase-specific bounded cleanup above, so an operation error cannot leave a live
 subprotocol or trigger hidden network work after returning.
+
+Recovery budget selection is exact. A transfer with `TimeoutNs` uses its remaining absolute
+deadline for ordinary work and `max(original_duration, 1_000_000 ns)` after expiry or a post-native
+error. A no-timeout `PQputCopyData` hard failure or `PQgetCopyData == -2` does not invent an
+unbounded recovery wait: it preserves the copied `Native`, physically closes immediately, and
+publishes Failed-closed. A no-timeout explicit CopyOut abort uses exactly `1_000_000_000 ns` for its
+complete cancel/drain/result/restore sequence; failure returns the cancellation `Native` above and
+closes. A timed explicit abort uses the remaining absolute deadline; expiry owns `Timeout`, switches
+recovery to `max(original_duration, 1_000_000 ns)`, and cannot publish Aborted or Completed. A
+no-timeout explicit CopyIn abort and ordinary finish/next remain caller-visible blocking operations.
+Active Drop never uses any recovery budget because it closes immediately without protocol work.
 
 ##### FFI, acceptance, and capability boundary
 
@@ -5518,9 +5576,9 @@ Linux ARM64, and macOS. Server 16.4 and client >=17 remain the required live bou
 | response metadata | direction, COPY BOTH, overall format, every per-column format, `0`/one/max columns, malformed count/code/pointer, initial ordinary/pipeline/unknown status |
 | CopyIn data | empty no-call; one/multiple/`i32::MAX`/rejected-next chunks; rejected-next remains Active and a following valid write/finish/abort works; queued/retry/hard error; mutation after call; exact bytes and no package allocation/copy |
 | CopyOut data | zero-pending/positive/-1/-2; one/many/large rows; exact zero-copy pointer/length; one-live-chunk exclusion; wrapper/libpq free counts; malformed chunk |
-| finish/final results | clean active/exhausted finish requires exact command result+COPY tag/count+null; ordinary error; missing/extra result; repeated COPY/pipeline/unknown; restore/state failure; first-error preservation |
+| finish/final results | clean active/exhausted finish requires exact command result+COPY tag/count+null; Complete finish returns stored result with zero libpq; ordinary error; missing/extra result; repeated COPY/pipeline/unknown; restore/state failure; first-error preservation |
 | abort and Drop | direction x Conn/Tx x before/after data x abort failure-result/completed-command/missing-or-other/extra-result x timeout; exhausted Complete abort returns stored Completed with zero libpq; explicit synchronized reuse/state effects; active Drop zero network and one physical close |
-| timeout/cancellation | expired before send; blocked put/end/get; recovery failure-result/completed-command/malformed sequence while preserving Timeout/Native; original-duration budget; cancel/CopyFail call counts and finish-before-drain order |
+| timeout/cancellation | expired before send; blocked put/end/get; recovery failure-result/completed-command/malformed sequence while preserving Timeout/Native; timeout recovery formula, no-timeout hard-error immediate close, no-timeout CopyOut abort 1s; cancel/CopyFail call counts and finish-before-drain order |
 | malformed private ABI | every transfer/chunk operation-record byte field and deadline/completion combination, wrong direction/phase/flags/reserved bytes, no data/protocol call, trusted-header comparison, exact real-owner free/close/release, no attacker-selected native pointer, safe one-owner cleanup |
 | compilation/cache | whole/per-unit interface parity, exact 176-byte transfer/64-byte chunk owner and Drop-thunk retention, one importer invalidation, unchanged descriptor/static-artifact/runtime-ABI bytes |
 | live/database and measurement | required PostgreSQL 16.4 CopyIn/CopyOut Text/Binary round trips on connection and transaction, rollback/commit/reuse, `scripts/db-verify-local.sh`, and a non-gating direct-libpq comparison of bytes, calls, allocations, time-to-first-byte, throughput, abort latency, and peak buffered row bytes |
@@ -5543,6 +5601,16 @@ COPY/native operation must synchronize-or-close before returning a borrowed owne
 installation moves behind successful lease acquisition, preserving the preceding binary-format
 ledger. These distinctions change the protocol/cleanup strategy but keep both directions in the
 one connection-global capability boundary.
+
+The protocol-product review found three further P1 closure gaps and two P2 product omissions, so
+the matrix is reopened on the
+`terminal-state-closure x primary-error-source x owner-flag-product x recovery-budget` axis. One
+terminal outcome table now covers clean, explicit-abort, and earlier-error recovery; Complete
+finish publishes its stored count with zero calls; every no-primary fail-closed path has one exact
+synthetic Native record. One exhaustive phase table binds pointer/deadline/flag/completion products
+to Drop behavior. No-timeout hard I/O failure closes immediately, while the only fixed implicit
+cancel budget is the explicit no-timeout CopyOut abort's one second. These are one state-machine
+redesign, not independent line fixes, and retain the same public capability boundary.
 
 Before implementation, complete one fresh independent adversarial review of this ledger and the
 single capability boundary. The implementation is expected to exceed roughly 1,000 changed
