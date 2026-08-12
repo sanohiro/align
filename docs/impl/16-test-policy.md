@@ -581,24 +581,30 @@ Recorded so the gap is explicit rather than implied:
 - ~~`pkg_db_q5b2`'s live PostgreSQL owner is RED on `main`~~ — **closed**. The
   exit-13 failure was one invalid catalog statement, not a lease or migration
   regression: `postgres_meta_keys_configured`'s SQL read the CTE column
-  `deferrable`, a PostgreSQL **reserved** keyword, unquoted. PostgreSQL accepts
-  it as `AS deferrable` and rejects every *read* of it, so the whole statement
+  `deferrable`, a PostgreSQL **reserved** keyword, unqualified and unquoted.
+  PostgreSQL accepts it as `AS deferrable` and as the qualified
+  `t.deferrable`, but rejects a bare unqualified read, so the whole statement
   was a parse error and `meta_keys_native` could never have succeeded against
   any server. The defect shipped with the catalog surface itself (#726), not
   with the lease wave (#758) that inherited the blame — the unquoted read is
   byte-identical in `apps/db/pkg/db.align` from #726 through #764. Every
-  reference is double-quoted now, and the owner reaches 62.
+  unqualified reference is double-quoted now, and the owner reaches 62.
 - ~~`pkg_db_a1` and `pkg_db_q5b2` are not compiled by any CI job~~ — **closed for
   `q5b2`**. With the red owner fixed, `q5b2` joins `q2`/`q3`/`q5a` in both
   `scripts/db-verify-local.sh` and the required PostgreSQL job — the missing
   gate is exactly what let a never-executed statement stay broken from the PR
-  that introduced it. Measured cost of the addition against a local
-  `postgres:16.4`: the full 14-test suite takes **28.6 s** of test time
-  standalone and **36.0 s** as the script's fourth step, for 149.7 s of CPU —
-  so a 4-vCPU runner should add roughly 40-50 s to that job. `pkg_db_a1` stays
-  owner-run: it drives SQLite in memory and PostgreSQL through a linked libpq
-  stub, so a live server is not its gate and the required PostgreSQL job would
-  only pay for it. Its owner run is reported in the PR that changes it.
+  that introduced it. Measured locally against a disposable `postgres:16.4`:
+  the full 14-test suite takes **28.6 s** of test time standalone and **36.0 s**
+  as the script's fourth step, for **149.7 s of CPU**. Treat 149.7 s / 4 vCPU =
+  **37.4 s as a parallelism-bound floor, not a prediction**: per-core
+  performance differs from this host, and the runner additionally compiles the
+  `pkg_db_q5b2` test binary, which a PR branch never gets from cache because
+  the Cargo caches are saved only on `main`. A first CI run can therefore land
+  **+70-130 s** on the job; the first observed figure is reported in the PR
+  that adds the step. `pkg_db_a1` stays owner-run: it drives SQLite in memory
+  and PostgreSQL through a linked libpq stub, so a live server is not its gate
+  and the required PostgreSQL job would only pay for it. Its owner run is
+  reported in the PR that changes it.
 - **`pkg_db_q1` and `q3`** remain Rust-API suites outside the harness's scope;
   their `include_str!` statics feed `Proj`-based API assertions, not a `Layout`.
   `q3` uses the shared live-gating helper above, which is the only harness
