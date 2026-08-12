@@ -78,6 +78,18 @@ static int cancel_calls;
 static int consume_calls;
 static int q6_delivered_rows;
 static int q6_fail_next_execute;
+static int forced_result_status;
+static int unsafe_status_seen;
+static int forbidden_after_status_calls;
+
+static int status_requires_close(int status) {
+  return status == 3 || status == 4 || status == 8 || status == 10 || status == 11 ||
+         status < 0 || status > 12;
+}
+
+static void note_forbidden_after_status(void) {
+  if (unsafe_status_seen) forbidden_after_status_calls++;
+}
 
 static char *copy_text(const char *text) {
   size_t n = strlen(text) + 1;
@@ -124,6 +136,9 @@ void align_pg_reset(void) {
   consume_calls = 0;
   q6_delivered_rows = 0;
   q6_fail_next_execute = 0;
+  forced_result_status = -1;
+  unsafe_status_seen = 0;
+  forbidden_after_status_calls = 0;
 }
 
 int align_pg_connect_calls(void) { return connect_calls; }
@@ -138,6 +153,8 @@ int align_pg_cancel_calls(void) { return cancel_calls; }
 int align_pg_consume_calls(void) { return consume_calls; }
 int align_pg_q6_delivered_rows(void) { return q6_delivered_rows; }
 void align_pg_q6_fail_next_execute(void) { q6_fail_next_execute = 1; }
+void align_pg_force_result_status(int status) { forced_result_status = status; }
+int align_pg_forbidden_after_status_calls(void) { return forbidden_after_status_calls; }
 int align_pg_last_timeout(void) { return last_timeout; }
 int align_pg_prepare_calls(void) { return prepare_calls; }
 int align_pg_execute_prepared_calls(void) { return execute_prepared_calls; }
@@ -273,6 +290,8 @@ static FakeResult *new_result(void) {
   return result;
 }
 
+FakeResult *align_pg_make_result(void) { return new_result(); }
+
 FakeResult *PQprepare(
     FakeConn *connection,
     const char *name,
@@ -280,6 +299,7 @@ FakeResult *PQprepare(
     int parameter_count,
     const uint32_t *parameter_types) {
   (void)connection;
+  note_forbidden_after_status();
   prepare_calls++;
   int common_types = prepare_calls == 1 && parameter_types != NULL &&
                      parameter_types[0] == 20 && parameter_types[1] == 0 &&
@@ -320,6 +340,7 @@ FakeResult *PQexecPrepared(
     const int *parameter_formats,
     int result_format) {
   (void)connection;
+  note_forbidden_after_status();
   execute_prepared_calls++;
   if (name == NULL || strcmp(name, prepared_name) != 0 || parameter_count != 3 ||
       parameter_values == NULL || parameter_lengths == NULL || parameter_formats == NULL ||
@@ -346,6 +367,7 @@ FakeResult *PQexecPrepared(
 }
 
 FakeResult *PQexec(FakeConn *connection, const char *command) {
+  note_forbidden_after_status();
   if (command == NULL) {
     protocol_ok = 0;
     if (protocol_error == 0) protocol_error = 92;
@@ -459,6 +481,7 @@ FakeResult *PQexecParams(
     const int *parameter_formats,
     int result_format) {
   (void)connection;
+  note_forbidden_after_status();
   execute_calls++;
   if (q6_fail_next_execute) {
     q6_fail_next_execute = 0;
@@ -635,6 +658,7 @@ int PQsendQueryParams(
     const int *parameter_lengths,
     const int *parameter_formats,
     int result_format) {
+  note_forbidden_after_status();
   if (has(command, "SEND_FAIL")) return 0;
   async_result = PQexecParams(
       connection,
@@ -664,6 +688,7 @@ int PQsendQueryPrepared(
     const int *parameter_lengths,
     const int *parameter_formats,
     int result_format) {
+  note_forbidden_after_status();
   async_result = PQexecPrepared(
       connection,
       name,
@@ -685,6 +710,7 @@ int PQsendQueryPrepared(
 
 int PQsetnonblocking(FakeConn *connection, int enabled) {
   (void)connection;
+  note_forbidden_after_status();
   nonblocking_calls++;
   if (enabled == 1 && fail_next_nonblocking_enable) {
     fail_next_nonblocking_enable = 0;
@@ -704,11 +730,13 @@ int PQsetnonblocking(FakeConn *connection, int enabled) {
 
 int PQflush(FakeConn *connection) {
   (void)connection;
+  note_forbidden_after_status();
   return async_flush_fail ? -1 : 0;
 }
 
 int PQconsumeInput(FakeConn *connection) {
   (void)connection;
+  note_forbidden_after_status();
   consume_calls++;
   if (async_consume_fail || (async_cancelled && async_drain_fail)) return 0;
   return 1;
@@ -716,11 +744,13 @@ int PQconsumeInput(FakeConn *connection) {
 
 int PQisBusy(FakeConn *connection) {
   (void)connection;
+  note_forbidden_after_status();
   return async_busy;
 }
 
 FakeResult *PQgetResult(FakeConn *connection) {
   (void)connection;
+  note_forbidden_after_status();
   if (async_busy) return NULL;
   FakeResult *result = async_result;
   async_result = NULL;
@@ -728,11 +758,13 @@ FakeResult *PQgetResult(FakeConn *connection) {
 }
 
 int PQtransactionStatus(FakeConn *connection) {
+  note_forbidden_after_status();
   if (async_transaction_unknown) return 4;
   return connection == NULL ? 4 : connection->transaction_status;
 }
 
 FakeCancel *PQgetCancel(FakeConn *connection) {
+  note_forbidden_after_status();
   if (async_cancel_resource_fail) return NULL;
   FakeCancel *cancel = (FakeCancel *)malloc(sizeof(FakeCancel));
   if (cancel != NULL) cancel->connection = connection;
@@ -742,6 +774,7 @@ FakeCancel *PQgetCancel(FakeConn *connection) {
 int PQcancel(FakeCancel *cancel, char *error_buffer, int error_buffer_size) {
   (void)error_buffer;
   (void)error_buffer_size;
+  note_forbidden_after_status();
   cancel_calls++;
   if (cancel == NULL || async_cancel_fail) return 0;
   async_cancelled = 1;
@@ -756,24 +789,40 @@ int PQcancel(FakeCancel *cancel, char *error_buffer, int error_buffer_size) {
 
 void PQfreeCancel(FakeCancel *cancel) { free(cancel); }
 
-int PQresultStatus(const FakeResult *result) { return result == NULL ? 7 : result->status; }
+int PQresultStatus(const FakeResult *result) {
+  note_forbidden_after_status();
+  int status = result == NULL ? 7 : (forced_result_status >= 0 ? forced_result_status : result->status);
+  if (status_requires_close(status)) unsafe_status_seen = 1;
+  return status;
+}
 char *PQcmdStatus(const FakeResult *result) {
+  note_forbidden_after_status();
   return (char *)(result == NULL ? NULL : result->command_status);
 }
-int PQntuples(const FakeResult *result) { return result == NULL ? -1 : result->rows; }
-int PQnfields(const FakeResult *result) { return result == NULL ? -1 : result->fields; }
+int PQntuples(const FakeResult *result) {
+  note_forbidden_after_status();
+  return result == NULL ? -1 : result->rows;
+}
+int PQnfields(const FakeResult *result) {
+  note_forbidden_after_status();
+  return result == NULL ? -1 : result->fields;
+}
 char *PQfname(const FakeResult *result, int column) {
+  note_forbidden_after_status();
   return (char *)(result == NULL || column < 0 || column >= result->fields ? NULL : result->names[column]);
 }
 uint32_t PQftype(const FakeResult *result, int column) {
+  note_forbidden_after_status();
   return result == NULL || column < 0 || column >= result->fields ? 0 : result->oids[column];
 }
 int PQgetisnull(const FakeResult *result, int row, int column) {
+  note_forbidden_after_status();
   return result == NULL || row < 0 || row >= result->rows || column < 0 || column >= result->fields
       ? 1
       : result->nulls[row][column];
 }
 char *PQgetvalue(const FakeResult *result, int row, int column) {
+  note_forbidden_after_status();
   if (result == NULL || row < 0 || row >= result->rows || column < 0 || column >= result->fields) return NULL;
   if (column == 0 && result->names[0] != NULL &&
       (strcmp(result->names[0], "user_id") == 0 ||
@@ -790,6 +839,7 @@ char *PQgetvalue(const FakeResult *result, int row, int column) {
   return (char *)result->values[row][column];
 }
 int PQgetlength(const FakeResult *result, int row, int column) {
+  note_forbidden_after_status();
   if (result != NULL && ((result->row_fault == 2 && column == 0) ||
                          (result->row_fault == 5 && column == 1))) {
     return -1;
@@ -797,7 +847,10 @@ int PQgetlength(const FakeResult *result, int row, int column) {
   char *value = PQgetvalue(result, row, column);
   return value == NULL ? 0 : (int)strlen(value);
 }
-char *PQcmdTuples(const FakeResult *result) { return (char *)(result == NULL ? NULL : result->affected); }
+char *PQcmdTuples(const FakeResult *result) {
+  note_forbidden_after_status();
+  return (char *)(result == NULL ? NULL : result->affected);
+}
 
 char *PQresultErrorField(const FakeResult *result, int field_code) {
   if (result == NULL) return NULL;

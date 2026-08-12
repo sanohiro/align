@@ -6,6 +6,7 @@ import pkg.db.internal
 import pkg.db.internal.resource
 import pkg.db.internal.descriptor
 import pkg.db.internal.postgres
+import pkg.db.internal.postgres_status
 
 extern "C" link("pq") {
   fn PQconninfoParse(connection_info: raw, error_out: raw) -> raw
@@ -16,7 +17,6 @@ extern "C" link("pq") {
   fn PQclientEncoding(connection: raw) -> i32
   fn PQfinish(connection: raw)
   fn PQexec(connection: raw, command: raw) -> raw
-  fn PQresultStatus(result: raw) -> i32
   fn PQcmdStatus(result: raw) -> raw
   fn PQclear(result: raw)
 }
@@ -859,12 +859,17 @@ pub fn begin_native(
     result := PQexec(native_connection, command)
     raw.free(command)
     if result.is_null() {
-      return Err(pkg.db.internal.postgres.connection_error(native_connection))
+      failure := pkg.db.internal.postgres.connection_error(native_connection)
+      pkg.db.internal.resource.poison_conn_state(state)
+      return Err(failure)
     }
-    status := PQresultStatus(result)
+    status := pkg.db.internal.postgres_status.code(result)
     if status != PGRES_COMMAND_OK {
       failure := pkg.db.internal.postgres.execution_error(native_connection, result)
       PQclear(result)
+      if pkg.db.internal.postgres_status.must_close(status) {
+        pkg.db.internal.resource.poison_conn_state(state)
+      }
       return Err(failure)
     }
     if !c_string_matches(PQcmdStatus(result), "BEGIN") {

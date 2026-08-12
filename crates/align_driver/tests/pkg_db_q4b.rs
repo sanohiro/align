@@ -19,6 +19,8 @@ static INTERNAL_SQLITE: LazyLock<&str> =
     LazyLock::new(|| fixture("apps/db/pkg/db/internal/sqlite.align"));
 static INTERNAL_POSTGRES: LazyLock<&str> =
     LazyLock::new(|| fixture("apps/db/pkg/db/internal/postgres.align"));
+static POSTGRES_STATUS: LazyLock<&str> =
+    LazyLock::new(|| fixture("apps/db/pkg/db/internal/postgres_status.align"));
 // C stubs change rarely; keeping them baked costs nothing on `.align` edits.
 const POSTGRES_STUB: &str = include_str!("fixtures/pkg_db_q2_postgres_stub.c");
 
@@ -1818,6 +1820,7 @@ fn legacy_package_files(main: &str) -> Vec<(&'static str, &str)> {
         ("pkg/db/internal/descriptor.align", *DESCRIPTOR),
         ("pkg/db/internal/sqlite.align", *INTERNAL_SQLITE),
         ("pkg/db/internal/postgres.align", *INTERNAL_POSTGRES),
+        ("pkg/db/internal/postgres_status.align", *POSTGRES_STATUS),
         ("app/q4b_query.align", QUERY),
         ("main.align", main),
     ]
@@ -1926,6 +1929,7 @@ fn postgres_parameter_type_must_match_the_params_field_shape() {
         ("pkg/db/internal/descriptor.align", *DESCRIPTOR),
         ("pkg/db/internal/sqlite.align", *INTERNAL_SQLITE),
         ("pkg/db/internal/postgres.align", *INTERNAL_POSTGRES),
+        ("pkg/db/internal/postgres_status.align", *POSTGRES_STATUS),
         ("app/q4b_query.align", mismatched_query.as_str()),
         ("main.align", main),
     ];
@@ -2247,7 +2251,7 @@ const PARITY_CASES: &[ParityCase] = &[
 /// changing the compile profile, or adding a variable to a child run therefore shows up here as a
 /// changed digest rather than passing quietly.
 ///
-/// The eight `pkg.db` package sources are deliberately NOT part of a digest: they are product code
+/// The nine `pkg.db` package sources are deliberately NOT part of a digest: they are product code
 /// with their own owners, and folding them in would break this golden on every `apps/db` edit
 /// without saying anything about the parity owner.
 ///

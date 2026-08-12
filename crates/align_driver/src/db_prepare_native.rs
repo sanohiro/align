@@ -67,6 +67,18 @@ pub(crate) mod dynamic {
             )))
         }
 
+        #[cfg(test)]
+        pub(crate) fn process_for_test() -> Self {
+            // SAFETY: a null filename asks the Unix loader for a reference-counted handle to the
+            // current process. The ordinary Drop path releases that handle exactly once.
+            let handle = unsafe { dlopen(std::ptr::null(), RTLD_NOW) };
+            assert!(!handle.is_null(), "dlopen(NULL) must succeed in unit tests");
+            Self {
+                handle,
+                name: "current process".to_string(),
+            }
+        }
+
         pub unsafe fn symbol<T: Copy>(&self, name: &'static [u8]) -> Result<T, PrepareError> {
             let name = CStr::from_bytes_with_nul(name)
                 .map_err(|_| fail("native symbol name is not terminated"))?;
@@ -149,6 +161,11 @@ pub(crate) mod dynamic {
             Err(fail(
                 "database preparation is not yet supported on this host",
             ))
+        }
+
+        #[cfg(test)]
+        pub(crate) fn process_for_test() -> Self {
+            Self
         }
 
         pub unsafe fn symbol<T: Copy>(&self, _name: &'static [u8]) -> Result<T, PrepareError> {
@@ -1077,34 +1094,81 @@ impl PostgresDescriber {
         }
     }
 
+    fn require_result_status(
+        &mut self,
+        result: *mut c_void,
+        expected: c_int,
+        null_message: &str,
+        error_what: &str,
+        failure_prefix: &str,
+    ) -> Result<(), PrepareError> {
+        if result.is_null() {
+            let error = fail(null_message);
+            self.close();
+            return Err(error);
+        }
+        let (result_status, result_error_message, clear) = {
+            let api = self
+                .api
+                .as_ref()
+                .ok_or_else(|| fail("PostgreSQL function table is absent"))?;
+            (api.result_status, api.result_error_message, api.clear)
+        };
+        let status = unsafe { result_status(result) };
+        if status == expected {
+            return Ok(());
+        }
+        let error = fail(
+            pq_text(unsafe { result_error_message(result) }, error_what)
+                .unwrap_or_else(|_| format!("{failure_prefix} with status {status}")),
+        );
+        // SAFETY: all diagnostic text was copied before this result's single release.
+        unsafe { clear(result) };
+        if crate::db_postgres_status::tool_must_close(
+            crate::db_postgres_status::classify(status),
+        ) {
+            self.close();
+        }
+        Err(error)
+    }
+
     fn query_rows(
-        &self,
+        &mut self,
         sql: &str,
         expected_fields: usize,
     ) -> Result<Vec<Vec<Option<String>>>, PrepareError> {
-        let api = self
-            .api
-            .as_ref()
-            .ok_or_else(|| fail("PostgreSQL function table is absent"))?;
+        let (exec, ntuples, nfields, getisnull, getvalue, clear) = {
+            let api = self
+                .api
+                .as_ref()
+                .ok_or_else(|| fail("PostgreSQL function table is absent"))?;
+            (
+                api.exec,
+                api.ntuples,
+                api.nfields,
+                api.getisnull,
+                api.getvalue,
+                api.clear,
+            )
+        };
         let sql = CString::new(sql).map_err(|_| fail("PostgreSQL tool query contains U+0000"))?;
         // SAFETY: the connection and SQL are live for this synchronous libpq call.
-        let result = unsafe { (api.exec)(self.connection, sql.as_ptr()) };
+        let result = unsafe { exec(self.connection, sql.as_ptr()) };
         if result.is_null() {
-            return Err(fail("libpq returned a null PostgreSQL result"));
+            let error = fail("libpq returned a null PostgreSQL result");
+            self.close();
+            return Err(error);
         }
+        self.require_result_status(
+            result,
+            2,
+            "libpq returned a null PostgreSQL result",
+            "PostgreSQL query error",
+            "PostgreSQL query failed",
+        )?;
         let decoded = (|| {
-            let status = unsafe { (api.result_status)(result) };
-            if status != 2 {
-                return Err(fail(
-                    pq_text(
-                        unsafe { (api.result_error_message)(result) },
-                        "PostgreSQL query error",
-                    )
-                    .unwrap_or_else(|_| format!("PostgreSQL query failed with status {status}")),
-                ));
-            }
-            let rows = unsafe { (api.ntuples)(result) };
-            let fields = unsafe { (api.nfields)(result) };
+            let rows = unsafe { ntuples(result) };
+            let fields = unsafe { nfields(result) };
             if rows < 0 || fields < 0 || usize::try_from(fields).ok() != Some(expected_fields) {
                 return Err(fail("PostgreSQL tool query returned an invalid shape"));
             }
@@ -1114,11 +1178,11 @@ impl PostgresDescriber {
             for row in 0..rows {
                 let mut values = Vec::with_capacity(expected_fields);
                 for field in 0..fields {
-                    if unsafe { (api.getisnull)(result, row, field) } != 0 {
+                    if unsafe { getisnull(result, row, field) } != 0 {
                         values.push(None);
                     } else {
                         values.push(Some(pq_text(
-                            unsafe { (api.getvalue)(result, row, field) },
+                            unsafe { getvalue(result, row, field) },
                             "PostgreSQL query value",
                         )?));
                     }
@@ -1128,39 +1192,36 @@ impl PostgresDescriber {
             Ok(output)
         })();
         // SAFETY: every non-null PGresult is cleared exactly once after copying its fields.
-        unsafe { (api.clear)(result) };
+        unsafe { clear(result) };
         decoded
     }
 
-    fn execute_command(&self, sql: &str, context: &str) -> Result<(), PrepareError> {
-        let api = self
-            .api
-            .as_ref()
-            .ok_or_else(|| fail("PostgreSQL function table is absent"))?;
+    fn execute_command(&mut self, sql: &str, context: &str) -> Result<(), PrepareError> {
+        let (exec, clear) = {
+            let api = self
+                .api
+                .as_ref()
+                .ok_or_else(|| fail("PostgreSQL function table is absent"))?;
+            (api.exec, api.clear)
+        };
         let sql = CString::new(sql).map_err(|_| fail(format!("{context} contains U+0000")))?;
         // SAFETY: the connection and command text are live for this synchronous call.
-        let result = unsafe { (api.exec)(self.connection, sql.as_ptr()) };
+        let result = unsafe { exec(self.connection, sql.as_ptr()) };
         if result.is_null() {
-            return Err(fail(format!("libpq returned a null {context} result")));
+            let error = fail(format!("libpq returned a null {context} result"));
+            self.close();
+            return Err(error);
         }
-        let status = unsafe { (api.result_status)(result) };
-        let error = if status == 1 {
-            None
-        } else {
-            Some(fail(
-                pq_text(
-                    unsafe { (api.result_error_message)(result) },
-                    &format!("{context} error"),
-                )
-                .unwrap_or_else(|_| format!("{context} failed with status {status}")),
-            ))
-        };
-        // SAFETY: this non-null PGresult is cleared exactly once after copying its error text.
-        unsafe { (api.clear)(result) };
-        match error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        self.require_result_status(
+            result,
+            1,
+            &format!("libpq returned a null {context} result"),
+            &format!("{context} error"),
+            &format!("{context} failed"),
+        )?;
+        // SAFETY: the expected command result contains no borrowed data and is released once.
+        unsafe { clear(result) };
+        Ok(())
     }
 
     fn type_name(&mut self, oid: u32) -> Result<String, PrepareError> {
@@ -1178,7 +1239,7 @@ impl PostgresDescriber {
         Ok(name)
     }
 
-    fn origin(&self, table_oid: u32, attribute: c_int) -> Result<PostgresOrigin, PrepareError> {
+    fn origin(&mut self, table_oid: u32, attribute: c_int) -> Result<PostgresOrigin, PrepareError> {
         if table_oid == 0 || attribute <= 0 {
             return Ok((None, None, None));
         }
@@ -1197,7 +1258,7 @@ impl PostgresDescriber {
         Ok((schema.clone(), table.clone(), column.clone()))
     }
 
-    fn deallocate(&self, name: &str) -> Result<(), PrepareError> {
+    fn deallocate(&mut self, name: &str) -> Result<(), PrepareError> {
         self.execute_command(&format!("DEALLOCATE \"{name}\""), "PostgreSQL DEALLOCATE")
     }
 }
@@ -1287,10 +1348,35 @@ impl MetadataDescriber for PostgresDescriber {
         entry: &DriverEntry,
     ) -> Result<NativeStatementDescription, PrepareError> {
         self.open()?;
-        let api = self
-            .api
-            .as_ref()
-            .ok_or_else(|| fail("PostgreSQL function table is absent"))?;
+        let (
+            prepare,
+            describe_prepared,
+            clear,
+            nparams,
+            nfields,
+            paramtype,
+            fname,
+            ftype,
+            ftable,
+            ftablecol,
+        ) = {
+            let api = self
+                .api
+                .as_ref()
+                .ok_or_else(|| fail("PostgreSQL function table is absent"))?;
+            (
+                api.prepare,
+                api.describe_prepared,
+                api.clear,
+                api.nparams,
+                api.nfields,
+                api.paramtype,
+                api.fname,
+                api.ftype,
+                api.ftable,
+                api.ftablecol,
+            )
+        };
         let descriptor_id = match artifact {
             StaticArtifact::Query(query) => &query.query_id,
             StaticArtifact::Command(command) => &command.command_id,
@@ -1312,7 +1398,7 @@ impl MetadataDescriber for PostgresDescriber {
             parameter_oids.as_ptr()
         };
         let prepared = unsafe {
-            (api.prepare)(
+            prepare(
                 self.connection,
                 name_c.as_ptr(),
                 sql.as_ptr(),
@@ -1320,81 +1406,64 @@ impl MetadataDescriber for PostgresDescriber {
                 parameter_oids_pointer,
             )
         };
-        if prepared.is_null() {
-            return Err(fail("libpq returned a null prepare result"));
-        }
-        let prepare_status = unsafe { (api.result_status)(prepared) };
-        let prepare_error = if prepare_status == 1 {
-            None
-        } else {
-            Some(fail(
-                pq_text(
-                    unsafe { (api.result_error_message)(prepared) },
-                    "PostgreSQL prepare error",
-                )
-                .unwrap_or_else(|_| {
-                    format!("PostgreSQL prepare failed with status {prepare_status}")
-                }),
-            ))
-        };
-        unsafe { (api.clear)(prepared) };
-        if let Some(error) = prepare_error {
+        self.require_result_status(
+            prepared,
+            1,
+            "libpq returned a null prepare result",
+            "PostgreSQL prepare error",
+            "PostgreSQL prepare failed",
+        )?;
+        unsafe { clear(prepared) };
+
+        let described = unsafe { describe_prepared(self.connection, name_c.as_ptr()) };
+        if let Err(error) = self.require_result_status(
+            described,
+            1,
+            "libpq returned a null describe result",
+            "PostgreSQL describe error",
+            "PostgreSQL describe failed",
+        ) {
+            if !self.connection.is_null() {
+                let _ = self.deallocate(&name);
+            }
             return Err(error);
         }
-
         let result = (|| {
-            let described = unsafe { (api.describe_prepared)(self.connection, name_c.as_ptr()) };
-            if described.is_null() {
-                return Err(fail("libpq returned a null describe result"));
+            let parameter_count = unsafe { nparams(described) };
+            let column_count = unsafe { nfields(described) };
+            if parameter_count < 0 || column_count < 0 {
+                return Err(fail("PostgreSQL describe returned a negative count"));
             }
-            let decoded = (|| {
-                let status = unsafe { (api.result_status)(described) };
-                if status != 1 {
-                    return Err(fail(
-                        pq_text(
-                            unsafe { (api.result_error_message)(described) },
-                            "PostgreSQL describe error",
-                        )
-                        .unwrap_or_else(|_| {
-                            format!("PostgreSQL describe failed with status {status}")
-                        }),
-                    ));
-                }
-                let parameter_count = unsafe { (api.nparams)(described) };
-                let column_count = unsafe { (api.nfields)(described) };
-                if parameter_count < 0 || column_count < 0 {
-                    return Err(fail("PostgreSQL describe returned a negative count"));
-                }
-                let parameter_capacity = usize::try_from(parameter_count)
-                    .map_err(|_| fail("PostgreSQL parameter count exceeds usize"))?;
-                let mut parameter_oids = Vec::with_capacity(parameter_capacity);
-                for index in 0..parameter_count {
-                    parameter_oids.push(unsafe { (api.paramtype)(described, index) });
-                }
-                let column_capacity = usize::try_from(column_count)
-                    .map_err(|_| fail("PostgreSQL column count exceeds usize"))?;
-                let mut column_data = Vec::with_capacity(column_capacity);
-                for index in 0..column_count {
-                    column_data.push((
-                        pq_text(
-                            unsafe { (api.fname)(described, index) },
-                            "PostgreSQL column name",
-                        )?,
-                        unsafe { (api.ftype)(described, index) },
-                        unsafe { (api.ftable)(described, index) },
-                        unsafe { (api.ftablecol)(described, index) },
-                    ));
-                }
-                Ok((parameter_oids, column_data))
-            })();
-            unsafe { (api.clear)(described) };
-            decoded
+            let parameter_capacity = usize::try_from(parameter_count)
+                .map_err(|_| fail("PostgreSQL parameter count exceeds usize"))?;
+            let mut parameter_oids = Vec::with_capacity(parameter_capacity);
+            for index in 0..parameter_count {
+                parameter_oids.push(unsafe { paramtype(described, index) });
+            }
+            let column_capacity = usize::try_from(column_count)
+                .map_err(|_| fail("PostgreSQL column count exceeds usize"))?;
+            let mut column_data = Vec::with_capacity(column_capacity);
+            for index in 0..column_count {
+                column_data.push((
+                    pq_text(
+                        unsafe { fname(described, index) },
+                        "PostgreSQL column name",
+                    )?,
+                    unsafe { ftype(described, index) },
+                    unsafe { ftable(described, index) },
+                    unsafe { ftablecol(described, index) },
+                ));
+            }
+            Ok((parameter_oids, column_data))
         })();
+        unsafe { clear(described) };
 
         let decoded = match result {
             Ok(value) => value,
             Err(error) => {
-                let _ = self.deallocate(&name);
+                if !self.connection.is_null() {
+                    let _ = self.deallocate(&name);
+                }
                 return Err(error);
             }
         };
@@ -1435,7 +1504,11 @@ impl MetadataDescriber for PostgresDescriber {
                 columns,
             })
         })();
-        let cleanup = self.deallocate(&name);
+        let cleanup = if self.connection.is_null() {
+            Ok(())
+        } else {
+            self.deallocate(&name)
+        };
         match (final_result, cleanup) {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(error),
@@ -1447,5 +1520,258 @@ impl MetadataDescriber for PostgresDescriber {
 impl Drop for PostgresDescriber {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod postgres_status_test_support {
+    use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+    const NULL_RESULT: c_int = -10_000;
+    static LOCK: Mutex<()> = Mutex::new(());
+    static STATUS: AtomicI32 = AtomicI32::new(1);
+    static UNSAFE_SEEN: AtomicBool = AtomicBool::new(false);
+    static NATIVE_CALLS: AtomicI32 = AtomicI32::new(0);
+    static CLEAR_CALLS: AtomicI32 = AtomicI32::new(0);
+    static FINISH_CALLS: AtomicI32 = AtomicI32::new(0);
+    static ROW_CALLS: AtomicI32 = AtomicI32::new(0);
+    static FOLLOWUP_CALLS: AtomicI32 = AtomicI32::new(0);
+
+    fn reset(status: c_int) {
+        STATUS.store(status, Ordering::SeqCst);
+        UNSAFE_SEEN.store(false, Ordering::SeqCst);
+        NATIVE_CALLS.store(0, Ordering::SeqCst);
+        CLEAR_CALLS.store(0, Ordering::SeqCst);
+        FINISH_CALLS.store(0, Ordering::SeqCst);
+        ROW_CALLS.store(0, Ordering::SeqCst);
+        FOLLOWUP_CALLS.store(0, Ordering::SeqCst);
+    }
+
+    fn token() -> *mut c_void {
+        std::ptr::NonNull::<u8>::dangling().as_ptr().cast()
+    }
+
+    fn note_followup() {
+        if UNSAFE_SEEN.load(Ordering::SeqCst) {
+            FOLLOWUP_CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn result() -> *mut c_void {
+        NATIVE_CALLS.fetch_add(1, Ordering::SeqCst);
+        if STATUS.load(Ordering::SeqCst) == NULL_RESULT {
+            std::ptr::null_mut()
+        } else {
+            token()
+        }
+    }
+
+    unsafe extern "C" fn connect(
+        _: *const *const c_char,
+        _: *const *const c_char,
+        _: c_int,
+    ) -> *mut c_void {
+        token()
+    }
+    unsafe extern "C" fn finish(_: *mut c_void) {
+        FINISH_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+    unsafe extern "C" fn ok(_: *const c_void) -> c_int {
+        0
+    }
+    unsafe extern "C" fn utf8(_: *const c_void) -> c_int {
+        6
+    }
+    unsafe extern "C" fn version(_: *const c_void) -> c_int {
+        170_000
+    }
+    unsafe extern "C" fn lib_version() -> c_int {
+        170_000
+    }
+    unsafe extern "C" fn exec(_: *mut c_void, _: *const c_char) -> *mut c_void {
+        note_followup();
+        result()
+    }
+    unsafe extern "C" fn prepare(
+        _: *mut c_void,
+        _: *const c_char,
+        _: *const c_char,
+        _: c_int,
+        _: *const u32,
+    ) -> *mut c_void {
+        note_followup();
+        result()
+    }
+    unsafe extern "C" fn describe(_: *mut c_void, _: *const c_char) -> *mut c_void {
+        note_followup();
+        result()
+    }
+    unsafe extern "C" fn clear(_: *mut c_void) {
+        CLEAR_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+    unsafe extern "C" fn result_status(_: *const c_void) -> c_int {
+        let status = STATUS.load(Ordering::SeqCst);
+        if crate::db_postgres_status::tool_must_close(
+            crate::db_postgres_status::classify(status),
+        ) {
+            UNSAFE_SEEN.store(true, Ordering::SeqCst);
+        }
+        status
+    }
+    unsafe extern "C" fn result_message(_: *const c_void) -> *const c_char {
+        c"status diagnostic".as_ptr()
+    }
+    unsafe extern "C" fn count(_: *const c_void) -> c_int {
+        note_followup();
+        ROW_CALLS.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+    unsafe extern "C" fn is_null(_: *const c_void, _: c_int, _: c_int) -> c_int {
+        note_followup();
+        ROW_CALLS.fetch_add(1, Ordering::SeqCst);
+        1
+    }
+    unsafe extern "C" fn value(_: *const c_void, _: c_int, _: c_int) -> *mut c_char {
+        note_followup();
+        ROW_CALLS.fetch_add(1, Ordering::SeqCst);
+        std::ptr::null_mut()
+    }
+    unsafe extern "C" fn name(_: *const c_void, _: c_int) -> *const c_char {
+        note_followup();
+        ROW_CALLS.fetch_add(1, Ordering::SeqCst);
+        c"field".as_ptr()
+    }
+    unsafe extern "C" fn oid(_: *const c_void, _: c_int) -> u32 {
+        note_followup();
+        ROW_CALLS.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+    unsafe extern "C" fn indexed_int(_: *const c_void, _: c_int) -> c_int {
+        note_followup();
+        ROW_CALLS.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+
+    fn api() -> PostgresApi {
+        PostgresApi {
+            _library: dynamic::Library::process_for_test(),
+            connectdb_params: connect,
+            finish,
+            status: ok,
+            client_encoding: utf8,
+            server_version: version,
+            lib_version,
+            exec,
+            prepare,
+            describe_prepared: describe,
+            clear,
+            result_status,
+            result_error_message: result_message,
+            ntuples: count,
+            nfields: count,
+            nparams: count,
+            getisnull: is_null,
+            getvalue: value,
+            fname: name,
+            ftype: oid,
+            ftable: oid,
+            ftablecol: indexed_int,
+            paramtype: oid,
+        }
+    }
+
+    fn fake_describer() -> PostgresDescriber {
+        PostgresDescriber {
+            api: Some(api()),
+            connection: token(),
+            url: String::new(),
+            schema_id: String::new(),
+            type_names: std::collections::HashMap::new(),
+        }
+    }
+
+    fn assert_closed(describer: &PostgresDescriber, expected_clear: c_int) {
+        assert!(describer.connection.is_null());
+        assert_eq!(NATIVE_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(CLEAR_CALLS.load(Ordering::SeqCst), expected_clear);
+        assert_eq!(FINISH_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(ROW_CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(FOLLOWUP_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    fn assert_prepare_result(status: c_int, prepare_consumer: bool) {
+        reset(status);
+        let mut describer = fake_describer();
+        let api = describer.api.as_ref().expect("fake PostgreSQL API");
+        let result = if prepare_consumer {
+            unsafe {
+                (api.prepare)(
+                    describer.connection,
+                    c"name".as_ptr(),
+                    c"SELECT 1".as_ptr(),
+                    0,
+                    std::ptr::null(),
+                )
+            }
+        } else {
+            unsafe { (api.describe_prepared)(describer.connection, c"name".as_ptr()) }
+        };
+        let label = if prepare_consumer { "prepare" } else { "describe" };
+        let error = describer
+            .require_result_status(
+                result,
+                1,
+                &format!("libpq returned a null {label} result"),
+                &format!("PostgreSQL {label} error"),
+                &format!("PostgreSQL {label} failed"),
+            )
+            .expect_err("unsafe preparation status must fail");
+        if status != NULL_RESULT {
+            assert!(error.to_string().contains("status diagnostic"));
+        }
+        assert_closed(&describer, if status == NULL_RESULT { 0 } else { 1 });
+    }
+
+    pub(crate) fn assert_prepare_consumers() {
+        let _guard = LOCK.lock().expect("PostgreSQL prepare fake lock");
+        for status in [3, 4, 8, 9, 10, 11, 12, 99] {
+            reset(status);
+            let mut describer = fake_describer();
+            let error = describer
+                .execute_command("SELECT 1", "PostgreSQL test command")
+                .expect_err("unsafe command status must fail");
+            assert!(error.to_string().contains("status diagnostic"));
+            assert_closed(&describer, 1);
+
+            reset(status);
+            let mut describer = fake_describer();
+            let error = describer
+                .query_rows("SELECT 1", 0)
+                .expect_err("unsafe query status must fail");
+            assert!(error.to_string().contains("status diagnostic"));
+            assert_closed(&describer, 1);
+
+            assert_prepare_result(status, true);
+            assert_prepare_result(status, false);
+        }
+
+        for query in [false, true] {
+            reset(NULL_RESULT);
+            let mut describer = fake_describer();
+            if query {
+                describer
+                    .query_rows("SELECT 1", 0)
+                    .expect_err("null query result must fail");
+            } else {
+                describer
+                    .execute_command("SELECT 1", "PostgreSQL test command")
+                    .expect_err("null command result must fail");
+            }
+            assert_closed(&describer, 0);
+        }
+        assert_prepare_result(NULL_RESULT, true);
+        assert_prepare_result(NULL_RESULT, false);
     }
 }

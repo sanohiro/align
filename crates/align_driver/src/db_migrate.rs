@@ -550,20 +550,20 @@ fn leading_words(bytes: &[u8]) -> Result<Vec<String>, MigrationError> {
     Ok(words)
 }
 
-fn rejects_transaction_control(bytes: &[u8]) -> Result<bool, MigrationError> {
-    let words = leading_words(bytes)?;
-    Ok(matches!(
+fn rejects_transaction_control(words: &[String]) -> bool {
+    matches!(
         words.first().map(String::as_str),
         Some("BEGIN" | "COMMIT" | "END" | "ROLLBACK" | "ABORT" | "SAVEPOINT" | "RELEASE")
-    ) || matches!(words.as_slice(), [first, second, ..] if matches!(first.as_str(), "START" | "PREPARE" | "SET") && second == "TRANSACTION")
-        || matches!(words.as_slice(), [first, second, third, ..] if first == "SET" && matches!(second.as_str(), "LOCAL" | "SESSION") && third == "TRANSACTION")
-        || matches!(words.as_slice(), [first, second, third, fourth, fifth, ..] if first == "SET" && second == "SESSION" && third == "CHARACTERISTICS" && fourth == "AS" && fifth == "TRANSACTION"))
+    ) || matches!(words, [first, second, ..] if matches!(first.as_str(), "START" | "PREPARE" | "SET") && second == "TRANSACTION")
+        || matches!(words, [first, second, third, ..] if first == "SET" && matches!(second.as_str(), "LOCAL" | "SESSION") && third == "TRANSACTION")
+        || matches!(words, [first, second, third, fourth, fifth, ..] if first == "SET" && second == "SESSION" && third == "CHARACTERISTICS" && fourth == "AS" && fifth == "TRANSACTION")
 }
 
 fn screen_ranges(
     entry: &MigrationEntry,
     policy: MigrationPolicy,
     ranges: Vec<std::ops::Range<usize>>,
+    reject_postgres_copy: bool,
 ) -> Result<ScreenedMigration, MigrationError> {
     if ranges.is_empty() {
         return Err(fail(format!(
@@ -572,9 +572,16 @@ fn screen_ranges(
         )));
     }
     for range in &ranges {
-        if rejects_transaction_control(&entry.bytes[range.clone()])? {
+        let words = leading_words(&entry.bytes[range.clone()])?;
+        if rejects_transaction_control(&words) {
             return Err(fail(format!(
                 "migration `{}` contains a transaction-control statement",
+                entry.filename
+            )));
+        }
+        if reject_postgres_copy && words.first().is_some_and(|word| word == "COPY") {
+            return Err(fail(format!(
+                "migration `{}` contains a PostgreSQL COPY statement",
                 entry.filename
             )));
         }
@@ -611,6 +618,7 @@ pub fn screen_postgres_catalog(
             entry,
             policy,
             postgres_statement_ranges(&entry.bytes)?,
+            true,
         )?);
     }
     Ok(ScreenedCatalog {
@@ -648,7 +656,7 @@ pub fn screen_sqlite_catalog(
             }
             ranges.push(start..entry.bytes.len());
         }
-        entries.push(screen_ranges(entry, policy, ranges)?);
+        entries.push(screen_ranges(entry, policy, ranges, false)?);
     }
     Ok(ScreenedCatalog {
         entries,
@@ -965,6 +973,44 @@ mod tests {
                 .to_string()
                 .contains("transaction-control")
         );
+    }
+
+    #[test]
+    fn postgres_copy_screening_is_source_ordered_and_lexically_exact() {
+        for (sql, expected) in [
+            (
+                "BEGIN; COPY target FROM STDIN;",
+                "transaction-control statement",
+            ),
+            (
+                "COPY target FROM STDIN; BEGIN;",
+                "PostgreSQL COPY statement",
+            ),
+            (
+                "SELECT 1; /* lead */ copy target FROM STDIN;",
+                "PostgreSQL COPY statement",
+            ),
+        ] {
+            let catalog =
+                crate::db_prepare::encode_migration_catalog(vec![entry(1, sql)]).unwrap();
+            assert!(
+                screen_postgres_catalog(&catalog)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected),
+                "{sql}"
+            );
+        }
+        for sql in [
+            "SELECT 'COPY target FROM STDIN'",
+            "SELECT $$ COPY target FROM STDIN $$",
+            "SELECT 1 /* COPY target FROM STDIN */",
+            "SELECT copy FROM target",
+        ] {
+            let catalog =
+                crate::db_prepare::encode_migration_catalog(vec![entry(1, sql)]).unwrap();
+            screen_postgres_catalog(&catalog).unwrap();
+        }
     }
 
     #[test]

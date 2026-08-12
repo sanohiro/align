@@ -16,6 +16,8 @@ static INTERNAL_SQLITE: LazyLock<&str> =
     LazyLock::new(|| fixture("apps/db/pkg/db/internal/sqlite.align"));
 static INTERNAL_POSTGRES: LazyLock<&str> =
     LazyLock::new(|| fixture("apps/db/pkg/db/internal/postgres.align"));
+static POSTGRES_STATUS: LazyLock<&str> =
+    LazyLock::new(|| fixture("apps/db/pkg/db/internal/postgres_status.align"));
 const POSTGRES_STUB: &str = include_str!("fixtures/pkg_db_q2_postgres_stub.c");
 
 const TEST_HELPER: &str = r#"module pkg.db.a1_test
@@ -250,6 +252,7 @@ fn package_files(main: &str) -> Vec<(&'static str, &str)> {
         ("pkg/db/internal/descriptor.align", *DESCRIPTOR),
         ("pkg/db/internal/sqlite.align", *INTERNAL_SQLITE),
         ("pkg/db/internal/postgres.align", *INTERNAL_POSTGRES),
+        ("pkg/db/internal/postgres_status.align", *POSTGRES_STATUS),
         ("pkg/db/a1_test.align", TEST_HELPER),
         ("app/batch_query.align", QUERY),
         ("main.align", main),

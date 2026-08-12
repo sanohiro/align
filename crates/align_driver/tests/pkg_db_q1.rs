@@ -24,6 +24,8 @@ const RESOURCE: &str = include_str!("../../../apps/db/pkg/db/internal/resource.a
 const DESCRIPTOR: &str = include_str!("../../../apps/db/pkg/db/internal/descriptor.align");
 const INTERNAL_SQLITE: &str = include_str!("../../../apps/db/pkg/db/internal/sqlite.align");
 const INTERNAL_POSTGRES: &str = include_str!("../../../apps/db/pkg/db/internal/postgres.align");
+const POSTGRES_STATUS: &str =
+    include_str!("../../../apps/db/pkg/db/internal/postgres_status.align");
 
 struct TempProject(PathBuf);
 
@@ -55,6 +57,8 @@ fn project(label: &str) -> TempProject {
         .expect("pkg.db SQLite execution internals");
     write(root.join("pkg/db/internal/postgres.align"), INTERNAL_POSTGRES)
         .expect("pkg.db PostgreSQL execution internals");
+    write(root.join("pkg/db/internal/postgres_status.align"), POSTGRES_STATUS)
+        .expect("pkg.db PostgreSQL status authority");
     TempProject(root)
 }
 

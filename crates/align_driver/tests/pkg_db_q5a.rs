@@ -184,6 +184,71 @@ fn migration_path_and_policy_screening_are_exact() {
 }
 
 #[test]
+fn postgres_migration_copy_is_rejected_before_native_work() {
+    for (index, (sql, expected)) in [
+        (
+            "COPY target FROM STDIN;",
+            "contains a PostgreSQL COPY statement",
+        ),
+        (
+            "-- align:migration transaction=forbidden\n/* lead */ copy target FROM STDIN;",
+            "contains a PostgreSQL COPY statement",
+        ),
+        (
+            "SELECT 1; COPY target FROM STDIN;",
+            "contains a PostgreSQL COPY statement",
+        ),
+        (
+            "BEGIN; COPY target FROM STDIN;",
+            "contains a transaction-control statement",
+        ),
+        (
+            "COPY target FROM STDIN; BEGIN;",
+            "contains a PostgreSQL COPY statement",
+        ),
+        (
+            "-- align:migration transaction=forbidden\nCOPY target FROM STDIN; SELECT 1;",
+            "contains a PostgreSQL COPY statement",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let raw = encode_migration_catalog(vec![MigrationEntry {
+            version: 1,
+            filename: format!("0001_copy_{index}.sql"),
+            path: PathBuf::from(format!("0001_copy_{index}.sql")),
+            bytes: sql.as_bytes().to_vec(),
+        }])
+        .expect("COPY catalog");
+        let error = screen_postgres_catalog(&raw).expect_err("COPY must fail during screening");
+        assert!(error.to_string().contains(expected), "{sql}: {error}");
+    }
+
+    for sql in [
+        "SELECT 'COPY target FROM STDIN';",
+        "SELECT $$ COPY target FROM STDIN $$;",
+        "SELECT 1 /* COPY target FROM STDIN */;",
+        "SELECT copy FROM target;",
+    ] {
+        let raw = encode_migration_catalog(vec![MigrationEntry {
+            version: 1,
+            filename: "0001_near_miss.sql".to_string(),
+            path: PathBuf::from("0001_near_miss.sql"),
+            bytes: sql.as_bytes().to_vec(),
+        }])
+        .expect("near-miss catalog");
+        screen_postgres_catalog(&raw).expect("quoted/comment/COLUMN COPY text is data");
+    }
+
+    let sqlite = project(
+        "pkg-db-q5a-sqlite-copy",
+        &[("0001_copy.sql", "COPY target FROM STDIN;")],
+    );
+    screened_sqlite(&sqlite);
+}
+
+#[test]
 fn sqlite_required_forbidden_status_check_and_repair_close_the_state_matrix() {
     let required = project(
         "pkg-db-q5a-sqlite-required",

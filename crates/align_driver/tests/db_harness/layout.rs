@@ -1,10 +1,10 @@
-//! The `pkg.db` project layout: the eight package modules plus whatever a test adds.
+//! The `pkg.db` project layout: the nine package modules plus whatever a test adds.
 
 use super::stubs::Stub;
 use crate::common::{Proj, fixture};
 use std::sync::LazyLock;
 
-/// The eight `pkg.db` package sources, read from disk ONCE.
+/// The nine `pkg.db` package sources, read from disk ONCE.
 ///
 /// A `LazyLock` rather than a per-call `fixture(...)`: `fixture` leaks its contents to `'static`,
 /// so calling it per `Layout::new()` would leak a fresh copy of the 138 KB `db.align` on every
@@ -37,6 +37,10 @@ static PACKAGE: LazyLock<Vec<(&'static str, &'static str)>> = LazyLock::new(|| {
             "pkg/db/internal/postgres.align",
             fixture("apps/db/pkg/db/internal/postgres.align"),
         ),
+        (
+            "pkg/db/internal/postgres_status.align",
+            fixture("apps/db/pkg/db/internal/postgres_status.align"),
+        ),
     ]
 });
 
@@ -44,7 +48,7 @@ static PACKAGE: LazyLock<Vec<(&'static str, &'static str)>> = LazyLock::new(|| {
 ///
 /// Surface assertions read the shipped source directly. Going through the harness reuses the copy
 /// `PACKAGE` already loaded instead of leaking another via `fixture`, and keeps every suite naming
-/// the same eight paths.
+/// the same nine paths.
 pub fn package_source(path: &str) -> &'static str {
     PACKAGE
         .iter()
@@ -66,7 +70,7 @@ pub struct Layout {
 }
 
 impl Layout {
-    /// The eight `pkg.db` package modules and nothing else.
+    /// The nine `pkg.db` package modules and nothing else.
     pub fn new() -> Layout {
         Layout {
             files: PACKAGE
@@ -158,7 +162,7 @@ impl Layout {
             .collect()
     }
 
-    /// The modules this TEST owns — everything except the eight `pkg.db` package sources.
+    /// The modules this TEST owns — everything except the nine `pkg.db` package sources.
     ///
     /// A case fingerprint uses this rather than [`Layout::files`]. The package sources are 138 KB
     /// of product code with their own owners, and folding them into a committed golden would make

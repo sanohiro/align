@@ -1,6 +1,7 @@
 module pkg.db.internal.resource
 
 import pkg.db.internal.descriptor
+import pkg.db.internal.postgres_status
 
 extern "C" link("sqlite3") {
   fn sqlite3_close_v2(database: raw) -> i32
@@ -81,7 +82,15 @@ fn rollback_state(state: raw) {
     } else {
       if driver == 2 {
         result := PQexec(native, sql)
-        if !result.is_null() { PQclear(result) }
+        if result.is_null() {
+          poison_conn_state(state)
+        } else {
+          status := pkg.db.internal.postgres_status.code(result)
+          PQclear(result)
+          if pkg.db.internal.postgres_status.must_close(status) {
+            poison_conn_state(state)
+          }
+        }
       }
     }
     raw.free(sql)
@@ -297,7 +306,15 @@ pub fn close_stmt(statement: raw) -> i32 {
         // leave the server-side statement to connection teardown instead of overlapping libpq.
         if closed == 0 && active == 0 && !connection.is_null() && !deallocate_sql.is_null() {
           result := PQexec(connection, deallocate_sql)
-          if !result.is_null() { PQclear(result) }
+          if result.is_null() {
+            poison_conn_state(connection_state)
+          } else {
+            result_status := pkg.db.internal.postgres_status.code(result)
+            PQclear(result)
+            if pkg.db.internal.postgres_status.must_close(result_status) {
+              poison_conn_state(connection_state)
+            }
+          }
         }
       }
       if !native.is_null() { raw.free(native) }
@@ -579,9 +596,17 @@ pub fn close_rows(rows: raw, terminal: u8) -> i32 {
         }
       } else {
         if driver == 2 {
-          if !native.is_null() { PQclear(native) }
+          mut close_connection := false
+          if !native.is_null() {
+            result_status := pkg.db.internal.postgres_status.code(native)
+            PQclear(native)
+            close_connection = pkg.db.internal.postgres_status.must_close(result_status)
+            if close_connection { poison_conn_state(connection_state) }
+          }
           free_bind_context(driver, context)
-          if !connection_state.is_null() { raw.store(connection_state, 20, 0 as u8) }
+          if !close_connection && !connection_state.is_null() {
+            raw.store(connection_state, 20, 0 as u8)
+          }
         }
       }
       raw.store(rows, 5, terminal)
@@ -790,18 +815,24 @@ pub fn close_catalog_cursor(cursor: raw) -> i32 {
     native: raw := raw.load(cursor, 8)
     state: raw := raw.load(cursor, 16)
     mut status: i32 := 0
+    mut close_connection := false
     if !native.is_null() {
       if driver == 1 {
         status = sqlite3_finalize(native)
       } else {
-        if driver == 2 { PQclear(native) }
+        if driver == 2 {
+          result_status := pkg.db.internal.postgres_status.code(native)
+          PQclear(native)
+          close_connection = pkg.db.internal.postgres_status.must_close(result_status)
+          if close_connection { poison_conn_state(state) }
+        }
       }
     }
     first_bind: raw := raw.load(cursor, 24)
     second_bind: raw := raw.load(cursor, 32)
     if !first_bind.is_null() { raw.free(first_bind) }
     if !second_bind.is_null() { raw.free(second_bind) }
-    if (driver == 1 || driver == 2) && !state.is_null() {
+    if (driver == 1 || driver == 2) && !close_connection && !state.is_null() {
       inactive: u8 := 0
       raw.store(state, 20, inactive)
     }
