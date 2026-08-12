@@ -191,8 +191,9 @@ round-trips for failures that reproduce locally in seconds.
 `scripts/db-verify-local.sh` is the CI-parity local gate: it starts a
 disposable Docker `postgres:16.4` with CI's exact credentials and environment,
 runs the same inverted required-mode self-test and the same
-`pkg_db_q2`/`pkg_db_q3`/`pkg_db_q5a` suites, and tears the container down. A
-diff touching `apps/db` or a `pkg_db_*` test must pass it before push. The
+`pkg_db_q2`/`pkg_db_q3`/`pkg_db_q5a`/`pkg_db_q5b2` suites, and tears the
+container down. A diff touching `apps/db` or a `pkg_db_*` test must pass it
+before push. The
 same rule generalizes: a new env-gated required CI suite ships with a matching
 local Docker script in the same PR.
 
@@ -577,21 +578,27 @@ Recorded so the gap is explicit rather than implied:
   fingerprint: they parse stdout numbers rather than asserting an exit code, so
   they are not `Case`-shaped. They never run in CI, so a golden over them would
   guard code that no gate executes. Checked by hand during review.
-- **`pkg_db_q5b2`'s live PostgreSQL owner is RED on `main`**, and has been before
-  this migration touched it. Against a real `postgres:16.4`,
-  `postgres_required_catalog_and_explain_contract_is_exact` exits 13 — the
-  `pkg.db.postgres.meta_keys_native` call at `POSTGRES_MAIN` fails — where 62 is
-  expected. Reproduced identically on unmodified `origin/main` and on the
-  migrated tree, so it is a pre-existing catalog-path defect, not migration
-  fallout. It survives because **no CI job compiles q5b2** (see the next cell):
-  the required PostgreSQL job runs `q2`/`q3`/`q5a` only. Diagnosis belongs to the
-  db session that owns the catalog path.
-- **`pkg_db_a1` and `pkg_db_q5b2` are not compiled by any CI job.** The required
-  PostgreSQL job runs `q2`/`q3`/`q5a`, and the bounded gate runs neither, so both
-  suites are owner-run only. Adding them to `db-verify-local.sh` and the CI job
-  would close that gap at a real wall-clock cost on the critical path; the
-  trade-off is recorded here rather than taken, and their owner runs are reported
-  in the PR that changes them.
+- ~~`pkg_db_q5b2`'s live PostgreSQL owner is RED on `main`~~ — **closed**. The
+  exit-13 failure was one invalid catalog statement, not a lease or migration
+  regression: `postgres_meta_keys_configured`'s SQL read the CTE column
+  `deferrable`, a PostgreSQL **reserved** keyword, unquoted. PostgreSQL accepts
+  it as `AS deferrable` and rejects every *read* of it, so the whole statement
+  was a parse error and `meta_keys_native` could never have succeeded against
+  any server. The defect shipped with the catalog surface itself (#726), not
+  with the lease wave (#758) that inherited the blame — the unquoted read is
+  byte-identical in `apps/db/pkg/db.align` from #726 through #764. Every
+  reference is double-quoted now, and the owner reaches 62.
+- ~~`pkg_db_a1` and `pkg_db_q5b2` are not compiled by any CI job~~ — **closed for
+  `q5b2`**. With the red owner fixed, `q5b2` joins `q2`/`q3`/`q5a` in both
+  `scripts/db-verify-local.sh` and the required PostgreSQL job — the missing
+  gate is exactly what let a never-executed statement stay broken from the PR
+  that introduced it. Measured cost of the addition against a local
+  `postgres:16.4`: the full 14-test suite takes **28.6 s** of test time
+  standalone and **36.0 s** as the script's fourth step, for 149.7 s of CPU —
+  so a 4-vCPU runner should add roughly 40-50 s to that job. `pkg_db_a1` stays
+  owner-run: it drives SQLite in memory and PostgreSQL through a linked libpq
+  stub, so a live server is not its gate and the required PostgreSQL job would
+  only pay for it. Its owner run is reported in the PR that changes it.
 - **`pkg_db_q1` and `q3`** remain Rust-API suites outside the harness's scope;
   their `include_str!` statics feed `Proj`-based API assertions, not a `Layout`.
   `q3` uses the shared live-gating helper above, which is the only harness
