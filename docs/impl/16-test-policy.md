@@ -595,16 +595,18 @@ Recorded so the gap is explicit rather than implied:
   gate is exactly what let a never-executed statement stay broken from the PR
   that introduced it. Measured locally against a disposable `postgres:16.4`:
   the full 14-test suite takes **28.6 s** of test time standalone and **36.0 s**
-  as the script's fourth step, for **149.7 s of CPU**. Treat 149.7 s / 4 vCPU =
-  **37.4 s as a parallelism-bound floor, not a prediction**: per-core
-  performance differs from this host, and the runner additionally compiles the
-  `pkg_db_q5b2` test binary, which a PR branch never gets from cache because
-  the Cargo caches are saved only on `main`. A first CI run can therefore land
-  **+70-130 s** on the job; the first observed figure is reported in the PR
-  that adds the step. `pkg_db_a1` stays owner-run: it drives SQLite in memory
-  and PostgreSQL through a linked libpq stub, so a live server is not its gate
-  and the required PostgreSQL job would only pay for it. Its owner run is
-  reported in the PR that changes it.
+  as the script's fourth step, for **149.7 s of CPU**. Measured in CI (#766):
+  the new step costs **32 s on a PR run and 45 s on the first `main` run**,
+  taking the required PostgreSQL job from 160 s to 216 s. The +56 s job delta
+  overstates the step because the two unchanged neighbouring suites drifted the
+  same direction on that runner (q2 57→62 s, q3 40→45 s), so **32-45 s is the
+  step's own cost**. A cold-compile penalty was predicted and did not appear: a
+  PR branch does not save the Cargo caches, but it still restores them through
+  `restore-keys`, so it inherits `main`'s and pays no first-run rebuild.
+  `pkg_db_a1` stays owner-run: it drives SQLite in memory and PostgreSQL
+  through a linked libpq stub, so a live server is not its gate and the
+  required PostgreSQL job would only pay for it. Its owner run is reported in
+  the PR that changes it.
 - **`pkg_db_q1` and `q3`** remain Rust-API suites outside the harness's scope;
   their `include_str!` statics feed `Proj`-based API assertions, not a `Layout`.
   `q3` uses the shared live-gating helper above, which is the only harness
