@@ -3469,26 +3469,26 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
 /// [`null_moved_source`] clears the source, so a destination reached after an Arena/heap join
 /// inherits the exact path's provenance instead of the escape lattice's conservative joined region.
 fn moved_drop_flag(b: &mut Builder, e: &hir::Expr) -> Option<Operand> {
-    let runtime = match &e.kind {
-        hir::ExprKind::Local(id) => {
-            let flag = b.drop_flags.get(*id as usize).copied().flatten()?;
-            let live = b.fresh_value(Ty::Bool);
-            b.push(Stmt::Let(live, Rvalue::Load(flag)));
-            Some(Operand::Value(live))
+    // A borrow-transparent scope is a wrapper around the block that delivers the value, so its
+    // ownership bit is that block's tail's. Kept on the shared enumeration so this, its sibling in
+    // `temporary_drop_flag`, and `borrow_mode_differs` cannot drift apart.
+    let runtime = if let Some(block) = borrow_transparent_scope_block(e) {
+        block.value.as_ref().and_then(|value| moved_drop_flag(b, value))
+    } else {
+        match &e.kind {
+            hir::ExprKind::Local(id) => {
+                let flag = b.drop_flags.get(*id as usize).copied().flatten()?;
+                let live = b.fresh_value(Ty::Bool);
+                b.push(Stmt::Let(live, Rvalue::Load(flag)));
+                Some(Operand::Value(live))
+            }
+            hir::ExprKind::OptionSome(inner)
+            | hir::ExprKind::ResultOk(inner)
+            | hir::ExprKind::ResultErr(inner)
+            | hir::ExprKind::Try(inner)
+            | hir::ExprKind::TaskGet(inner) => moved_drop_flag(b, inner),
+            _ => None,
         }
-        hir::ExprKind::Block(blk)
-        | hir::ExprKind::Arena(blk)
-        | hir::ExprKind::NamedArena { block: blk, .. }
-        | hir::ExprKind::Unsafe(blk)
-        | hir::ExprKind::TaskGroup(blk) => {
-            blk.value.as_ref().and_then(|v| moved_drop_flag(b, v))
-        }
-        hir::ExprKind::OptionSome(inner)
-        | hir::ExprKind::ResultOk(inner)
-        | hir::ExprKind::ResultErr(inner)
-        | hir::ExprKind::Try(inner)
-        | hir::ExprKind::TaskGet(inner) => moved_drop_flag(b, inner),
-        _ => None,
     };
     runtime.or_else(|| {
         b.drop_individual_exprs
@@ -3513,61 +3513,80 @@ fn temporary_drop_flag(b: &mut Builder, e: &hir::Expr, operand: &Operand) -> Opt
     if let Some(flag) = b.value_temp_drop_flag(operand) {
         return Some(flag);
     }
+    // A TaskGroup is a borrow-transparent scope for `borrow_mode_differs` and `moved_drop_flag`,
+    // but **not** here: it reaches this helper only when its tail can be fresh
+    // (`may_need_synthetic_owner` sees through a bound tail place), so it forwards the fresh
+    // value's ordinary ownership bit instead of recursing into the tail. Checked before the shared
+    // enumeration so that deliberate difference is explicit rather than an omission.
+    if matches!(e.kind, hir::ExprKind::TaskGroup(_)) {
+        return lowered_drop_flag(b, e, operand);
+    }
+    if let Some(block) = borrow_transparent_scope_block(e) {
+        return block.value.as_ref().and_then(|value| temporary_drop_flag(b, value, operand));
+    }
     match &e.kind {
         hir::ExprKind::Local(_)
         | hir::ExprKind::Field { .. }
         | hir::ExprKind::TupleIndex { .. }
         | hir::ExprKind::Index { .. }
         | hir::ExprKind::ElemField { .. } => Some(Operand::Const(Const::Bool(false))),
-        hir::ExprKind::Block(block)
-        | hir::ExprKind::Unsafe(block)
-        | hir::ExprKind::Arena(block)
-        | hir::ExprKind::NamedArena { block, .. } => {
-            block.value.as_ref().and_then(|value| temporary_drop_flag(b, value, operand))
-        }
-        // A TaskGroup reaches this arm only when its tail can be fresh: may_need_synthetic_owner
-        // sees through a bound tail place. Forward the fresh value's ordinary ownership bit.
-        hir::ExprKind::TaskGroup(_) => lowered_drop_flag(b, e, operand),
         _ => lowered_drop_flag(b, e, operand),
     }
 }
 
-/// Whether borrow mode lowers `e` differently from [`lower_expr`] — exactly the kinds
-/// [`lower_expr_for_borrow`] handles below instead of delegating.
+/// The block a **borrow-transparent scope** delivers its value through, if `e` is one.
+///
+/// One enumeration of that kind set, shared by every question about it: `moved_drop_flag` and
+/// `temporary_drop_flag` recurse into the tail through this, and [`borrow_mode_differs`] adds it
+/// to the value-carrying control-flow kinds. A scope is a wrapper — a question about the value it
+/// produces is a question about this block's tail.
+fn borrow_transparent_scope_block(e: &hir::Expr) -> Option<&hir::Block> {
+    match &e.kind {
+        hir::ExprKind::Block(block)
+        | hir::ExprKind::Unsafe(block)
+        | hir::ExprKind::Arena(block)
+        | hir::ExprKind::NamedArena { block, .. }
+        | hir::ExprKind::TaskGroup(block) => Some(block),
+        _ => None,
+    }
+}
+
+/// Whether borrow mode lowers `e` differently from [`lower_expr`] — **the** authority on that
+/// question, gating both [`lower_expr_for_borrow`]'s dispatch and [`eager_worklist_children`]'s
+/// filter.
 ///
 /// Value-carrying control flow and borrow-transparent scopes thread the enclosing borrow through
 /// their own join rather than transferring ownership into it, so their two lowerings are not
-/// interchangeable and **must not both run**. That makes this the eager worklist's filter as well:
-/// see [`eager_worklist_children`].
+/// interchangeable and **must not both run**. Because this predicate runs first, a kind added to
+/// `lower_expr_for_borrow` without being added here is inert (it delegates to `lower_expr`, as
+/// before) rather than double-lowered — the dangerous direction is impossible by construction, and
+/// the other direction reaches that function's `unreachable!`.
 fn borrow_mode_differs(e: &hir::Expr) -> bool {
     matches!(
         &e.kind,
-        hir::ExprKind::If { .. }
-            | hir::ExprKind::Match { .. }
-            | hir::ExprKind::ElseUnwrap { .. }
-            | hir::ExprKind::Block(_)
-            | hir::ExprKind::Unsafe(_)
-            | hir::ExprKind::Arena(_)
-            | hir::ExprKind::NamedArena { .. }
-            | hir::ExprKind::TaskGroup(_)
-    )
+        hir::ExprKind::If { .. } | hir::ExprKind::Match { .. } | hir::ExprKind::ElseUnwrap { .. }
+    ) || borrow_transparent_scope_block(e).is_some()
 }
 
 /// Lower the root of an owned value in a borrowing context. Value-carrying control flow must not
 /// null a bound-local arm merely because it stores that borrowed value through a join slot.
 ///
-/// Every kind handled here rather than delegated to [`lower_expr`] is listed by
-/// [`borrow_mode_differs`], which keeps the eager worklist from pre-lowering such a child in
-/// non-borrow mode. Both lowerings running is not a redundancy but a miscompile: the non-borrow
-/// copy nulls a bound arm's source local, and the borrow copy's join then stores the first copy's
-/// per-arm SSA values from blocks that do not dominate them
+/// [`borrow_mode_differs`] gates the dispatch below, and also keeps the eager worklist from
+/// pre-lowering such a child in non-borrow mode. Both lowerings running is not a redundancy but a
+/// miscompile: the non-borrow copy nulls a bound arm's source local and re-emits the scope's own
+/// framing (a second `arena`/`task_group` begin-end pair), and the borrow copy's join then stores
+/// the first copy's per-arm SSA values from blocks that do not dominate them
 /// (`Instruction does not dominate all uses`, `docs/impl/05-backend-llvm.md` §1).
 fn lower_expr_for_borrow(b: &mut Builder, e: &hir::Expr) -> Operand {
+    if !borrow_mode_differs(e) {
+        // Borrow mode is `lower_expr` for this kind, so a memoized eager pre-lowering is exactly
+        // the right answer to reuse.
+        return lower_expr(b, e);
+    }
     debug_assert!(
-        !borrow_mode_differs(e)
-            || !b.ctx.eager_expr_results.contains_key(&(std::ptr::from_ref(e) as usize)),
-        "the eager worklist pre-lowered a borrow edge in non-borrow mode: every kind handled \
-         specially here must be listed by `borrow_mode_differs`",
+        !b.ctx.eager_expr_results.contains_key(&(std::ptr::from_ref(e) as usize)),
+        "the eager worklist pre-lowered a borrow edge in non-borrow mode: a parent that lowers a \
+         child through this helper must filter it in `eager_worklist_children`",
     );
     if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
@@ -3620,7 +3639,9 @@ fn lower_expr_for_borrow(b: &mut Builder, e: &hir::Expr) -> Operand {
                 tail.unwrap_or(Operand::Const(Const::Unit))
             }
         }
-        _ => lower_expr(b, e),
+        // `borrow_mode_differs` admitted exactly the kinds above; anything else returned through
+        // `lower_expr` at the top of this function.
+        _ => unreachable!("borrow_mode_differs admitted a kind with no borrow-mode lowering"),
     }
 }
 

@@ -551,9 +551,9 @@ pub fn emit_llvm_ir(program: &Program, target: &BuildTarget, optimized: bool, ex
     if let Some(rt) = rt_module {
         link_in_rt_lto(&ctx, &module, rt, &runtime)?;
     }
-    // The IR lens never shows IR it knows is ill-formed. `build_module` already verified what it
-    // built; this run additionally covers the `--rt-lto` merge above.
-    verify_generated_module(&module)?;
+    // No verification of its own: the lens never shows IR it knows is ill-formed, and both of its
+    // steps above already verify — `build_module` the module it built, `link_in_rt_lto` the merged
+    // one. A third run would re-verify the identical module.
     if optimized {
         run_opt_pipeline(&module, &tm, "default<O2>")?;
     }
@@ -1549,23 +1549,34 @@ fn build_module<'c>(
     // build that silently emits ill-formed IR is exactly the blind spot #670 lived in. The
     // measured cost over the 78-example corpus plus `apps/db` is at or under 1%, inside the
     // unverified configuration's own run-to-run spread (`docs/impl/05-backend-llvm.md` §1).
+    //
+    // This verifies the Align-only module, which localizes a lowering bug to the code that
+    // produced it. `link_in_rt_lto` separately verifies the *merged* module: different scope
+    // (baked runtime bitcode this run never sees) and a different failure mode (symbol
+    // retargeting), so both are kept.
     verify_generated_module(module)?;
     Ok(RuntimeDeclarations { physical_names: runtime_physical_names })
 }
 
-/// Verify a module codegen just built, printing the offending IR before failing.
+/// Verify a module codegen just built.
 ///
-/// Ill-formed IR is a compiler bug, not a user error, and the message LLVM returns names only the
+/// Ill-formed IR is a compiler bug, not a user error, and LLVM's message names only the offending
 /// instruction — without the surrounding function it is rarely enough to find the lowering that
-/// produced it, so the module goes to stderr first.
+/// produced it. That message is always reported. The **whole module** is only dumped when
+/// `ALIGN_DUMP_IR` is set: now that this runs in every profile, `apps/db` alone would otherwise
+/// spray ~7MB of IR at a release user's terminal, burying the one line that identifies the bug.
 fn verify_generated_module(module: &Module<'_>) -> Result<(), CodegenError> {
     module.verify().map_err(|e| {
-        eprintln!(
-            "alignc: the module below failed LLVM verification. This is a compiler bug, not a \
-             problem with your program.\n{}",
-            module.print_to_string().to_string()
-        );
-        CodegenError::Lowering(format!("generated module failed verification: {e}"))
+        if std::env::var_os("ALIGN_DUMP_IR").is_some_and(|value| !value.is_empty()) {
+            eprintln!(
+                "alignc: the module below failed LLVM verification. This is a compiler bug, not a \
+                 problem with your program.\n{}",
+                module.print_to_string().to_string()
+            );
+        }
+        CodegenError::Lowering(format!(
+            "generated module failed verification (set ALIGN_DUMP_IR=1 for the full module): {e}"
+        ))
     })
 }
 

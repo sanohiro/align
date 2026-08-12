@@ -217,15 +217,20 @@ fn main() -> i32 = (probe(true) + probe(false)) as i32
 /// values into the hidden owner's join slot from blocks that do not dominate their definitions
 /// (`Instruction does not dominate all uses`).
 ///
-/// One `str_clone` per source `.clone()` is the structural witness that the borrowed subtree is
-/// lowered exactly once; the exit code proves the selected arm — and only it — is released.
+/// The witness is the **exact** number of `branch` terminators `probe` lowers: the construct's own
+/// discriminator test plus its drop guards. Counting `str_clone` would not do — in a bound cell
+/// every `.clone()` sits in a `let` *outside* the duplicated subtree, so that count is unchanged by
+/// the defect. Every expected number below was mutation-verified against the pre-fix compiler,
+/// where the same cells lower 2/4/5, 3/5/6, and 5/7/6 branches respectively. The exit code then
+/// proves the selected arm — and only it — is released.
 #[test]
 fn borrowed_control_flow_temporaries_lower_exactly_once() {
-    // (cell, `probe` body, exit code of `probe(true) + probe(false)`)
-    let cells: [(&str, &str, i32); 9] = [
+    // (cell, `probe` body, `branch` terminators, exit code of `probe(true) + probe(false)`)
+    let cells: [(&str, &str, usize, i32); 9] = [
         (
             "if-fresh",
             r#"  return (if flag { " tmp ".clone() } else { " other ".clone() }).trim().len()"#,
+            1,
             8,
         ),
         (
@@ -233,12 +238,14 @@ fn borrowed_control_flow_temporaries_lower_exactly_once() {
             r#"  a := " aaa ".clone()
   b := " bb ".clone()
   return (if flag { a } else { b }).trim().len()"#,
+            1,
             5,
         ),
         (
             "if-mixed",
             r#"  bound := " bound ".clone()
   return (if flag { " tmp ".clone() } else { bound }).trim().len()"#,
+            3,
             8,
         ),
         (
@@ -248,6 +255,7 @@ fn borrowed_control_flow_temporaries_lower_exactly_once() {
     Some(_) => " tmp ".clone()
     None => " other ".clone()
   }).trim().len()"#,
+            2,
             8,
         ),
         (
@@ -259,6 +267,7 @@ fn borrowed_control_flow_temporaries_lower_exactly_once() {
     Some(_) => a
     None => b
   }).trim().len()"#,
+            2,
             5,
         ),
         (
@@ -269,12 +278,14 @@ fn borrowed_control_flow_temporaries_lower_exactly_once() {
     Some(_) => " tmp ".clone()
     None => bound
   }).trim().len()"#,
+            4,
             8,
         ),
         (
             "else-fresh",
             r#"  opt: Option<string> := if flag { Some(" tmp ".clone()) } else { None }
   return (opt else " other ".clone()).trim().len()"#,
+            4,
             8,
         ),
         (
@@ -284,31 +295,92 @@ fn borrowed_control_flow_temporaries_lower_exactly_once() {
   opt: Option<string> := if flag { Some(a) } else { None }
   return (opt else b).trim().len()"#,
             5,
+            5,
         ),
         (
             "else-mixed",
             r#"  bound := " bound ".clone()
   opt: Option<string> := if flag { Some(" tmp ".clone()) } else { None }
   return (opt else bound).trim().len()"#,
+            4,
             8,
         ),
     ];
-    for (cell, body, exit) in cells {
+    for (cell, body, branches, exit) in cells {
         let src = format!(
             "fn probe(flag: bool) -> i64 {{\n{body}\n}}\nfn main() -> i32 = (probe(true) + probe(false)) as i32\n"
         );
         let mir = mir_text(&src);
         let probe = function(&mir, "probe");
         assert_eq!(
-            probe.matches("str_clone").count(),
-            body.matches(".clone()").count(),
-            "{cell}: the borrowed subtree must be lowered exactly once:\n{probe}"
+            probe.matches("branch ").count(),
+            branches,
+            "{cell}: the borrowed control flow must be lowered exactly once:\n{probe}"
         );
         if backend_available() {
             assert_eq!(
                 build_and_run(&format!("owned-temp-{cell}"), &src).status.code(),
                 Some(exit),
                 "{cell}: only the selected arm's temporary may be released"
+            );
+        }
+    }
+}
+
+/// The other half of the matrix: the five **borrow-transparent scopes** a borrowed owned temporary
+/// can be produced by (`{ }`, `unsafe`, `arena`, a named arena, `task_group`).
+///
+/// These never violated SSA dominance — a scope has no join — which is exactly why they needed
+/// their own cells: the pre-fix compiler mis-lowered them *silently*. Each scope was lowered twice,
+/// and while the eager memo happened to deduplicate the body's expressions, the statement stores
+/// and the scope's own framing were not memoized, so `main` emits the `n = 41` store twice and a
+/// second, empty `arena_begin`/`arena_end` (or `tg_begin`/`tg_wait`/`tg_end`) pair around nothing —
+/// a spurious runtime region and task group per evaluation. The duplicated store happens to be
+/// idempotent here, so the exit code is 44 on both compilers: only the structural counts
+/// discriminate, and both were mutation-verified at 2 against the pre-fix compiler.
+#[test]
+fn borrowed_scope_temporaries_lower_their_scope_exactly_once() {
+    // (cell, scope opener, scope-framing op, framing occurrences)
+    let cells: [(&str, &str, &str, usize); 5] = [
+        ("block", "{", "", 0),
+        ("unsafe", "unsafe {", "", 0),
+        ("arena", "arena {", "arena_begin", 1),
+        ("named-arena", "arena scope {", "arena_begin", 1),
+        ("task-group", "task_group {", "tg_begin", 1),
+    ];
+    for (cell, opener, framing, framings) in cells {
+        let src = format!(
+            r#"fn probe() -> i64 {{
+  mut n := 0
+  s := ({opener}
+    n = 41
+    " tmp ".clone()
+  }}).trim().len()
+  return s + n
+}}
+fn main() -> i32 = probe() as i32
+"#
+        );
+        let mir = mir_text(&src);
+        let probe = function(&mir, "probe");
+        assert_eq!(
+            probe.matches("<- 41_i64").count(),
+            1,
+            "{cell}: the scope's statements must be lowered exactly once:\n{probe}"
+        );
+        if !framing.is_empty() {
+            assert_eq!(
+                probe.matches(framing).count(),
+                framings,
+                "{cell}: the scope must open exactly once — a second empty {framing} pair is a \
+                 spurious runtime region:\n{probe}"
+            );
+        }
+        if backend_available() {
+            assert_eq!(
+                build_and_run(&format!("owned-temp-scope-{cell}"), &src).status.code(),
+                Some(44),
+                "{cell}: the borrowed scope temporary must still compute 3 + 41"
             );
         }
     }
