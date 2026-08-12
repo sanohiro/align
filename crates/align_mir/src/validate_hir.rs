@@ -2046,6 +2046,13 @@ struct BatchPlanCall<'a> {
 }
 
 #[derive(Clone, Copy)]
+enum NormalizedFormatPlanCall {
+    Execute,
+    Rows,
+    PreparedRows,
+}
+
+#[derive(Clone, Copy)]
 struct LoopTarget {
     ty: Ty,
     arena_depth: u32,
@@ -5703,6 +5710,11 @@ impl<'a> BodyValidator<'a> {
                     {
                         return None;
                     }
+                }
+                if normalized_format_plan_call(func).is_some()
+                    && !self.normalized_format_plan_call_ok(context, expression, func, args)
+                {
+                    return None;
                 }
                 if sig.params.len() != args.len() || sig.modes.len() != args.len() {
                     return None;
@@ -9957,6 +9969,223 @@ impl<'a> BodyValidator<'a> {
                 })
     }
 
+    /// The public PostgreSQL native-option wrappers own one call-local raw format plan. The
+    /// internal ABI receives only a pointer/count pair, so ordinary call typing cannot prove that
+    /// the readable allocation covers `count * 8` bytes. Keep that proof in HIR: only the matching
+    /// package wrapper (or its canonical null/zero convenience path) may call the prevalidated
+    /// function, and a nonempty plan must be the exact immutable local initialized from that same
+    /// count. This rejects a shorter substituted pointer before MIR or LLVM can expose a raw load.
+    fn normalized_format_plan_call_ok(
+        &self,
+        context: &BodyContext,
+        call: &hir::Expr,
+        func: &str,
+        args: &[hir::Expr],
+    ) -> bool {
+        let Some(kind) = normalized_format_plan_call(func) else {
+            return true;
+        };
+        let (plan_index, count_index, public_owner, zero_owner) = match kind {
+            NormalizedFormatPlanCall::Execute => (
+                5,
+                6,
+                "pkg.db.postgres$execute_native",
+                "pkg.db.internal.postgres$execute_prevalidated",
+            ),
+            NormalizedFormatPlanCall::Rows => (
+                7,
+                8,
+                "pkg.db.postgres$rows_native",
+                "pkg.db.internal.postgres$rows_prevalidated",
+            ),
+            NormalizedFormatPlanCall::PreparedRows => (
+                5,
+                6,
+                "pkg.db.postgres$rows_stmt_native",
+                "pkg.db.internal.postgres$rows_stmt_prevalidated",
+            ),
+        };
+        let Some(function) = self.program.fns.get(context.function) else {
+            return false;
+        };
+        let (Some(plan), Some(count)) = (args.get(plan_index), args.get(count_index)) else {
+            return false;
+        };
+        if call_name_matches_base(&function.name, zero_owner) {
+            return plan.ty == Ty::Raw
+                && canonical_raw_null(plan)
+                && count.ty == u32_ty()
+                && matches!(count.kind, hir::ExprKind::Int(0));
+        }
+        if !call_name_matches_base(&function.name, public_owner) {
+            return false;
+        }
+        let (hir::ExprKind::Local(plan_local), hir::ExprKind::Local(count_local)) =
+            (&plan.kind, &count.kind)
+        else {
+            return false;
+        };
+        if plan.ty != Ty::Raw
+            || count.ty != u32_ty()
+            || self.local_type(context, *plan_local) != Some(Ty::Raw)
+            || self.local_type(context, *count_local) != Some(u32_ty())
+            || function
+                .locals
+                .get(*plan_local as usize)
+                .is_none_or(|local| local.id != *plan_local || local.is_mut)
+        {
+            return false;
+        }
+
+        enum Scan<'b> {
+            Block(&'b hir::Block),
+            Expr(&'b hir::Expr),
+        }
+        let call_key = ptr_key(call);
+        let mut work = vec![Scan::Block(&function.body)];
+        let mut blocks = HashSet::new();
+        let mut expressions = HashSet::new();
+        while let Some(item) = work.pop() {
+            match item {
+                Scan::Block(block) => {
+                    if !blocks.insert(ptr_key(block)) {
+                        continue;
+                    }
+                    let plan_binding = block.stmts.iter().enumerate().find_map(
+                        |(index, statement)| match statement {
+                            hir::Stmt::Let { local, init } if local == plan_local => {
+                                Some((index, init))
+                            }
+                            _ => None,
+                        },
+                    );
+                    let call_binding = block.stmts.iter().enumerate().find_map(
+                        |(index, statement)| match statement {
+                            hir::Stmt::Let { init, .. } if ptr_key(init) == call_key => Some(index),
+                            _ => None,
+                        },
+                    );
+                    if let (Some((plan_statement_index, initializer)), Some(call_index)) =
+                        (plan_binding, call_binding)
+                        && plan_statement_index < call_index
+                        && self.normalized_format_plan_initializer_matches(
+                            initializer,
+                            *count_local,
+                        )
+                        && block.stmts[plan_statement_index + 1..call_index]
+                            .iter()
+                            .all(|statement| {
+                                normalized_plan_scratch_statement_ok(
+                                    statement,
+                                    *plan_local,
+                                    *count_local,
+                                )
+                            })
+                        && args.iter().enumerate().all(|(index, argument)| {
+                            index == plan_index
+                                || index == count_index
+                                || !expression_mentions_local(argument, *plan_local)
+                                    && !expression_mentions_local(argument, *count_local)
+                        })
+                    {
+                        return true;
+                    }
+                    if let Some(value) = block.value.as_deref() {
+                        work.push(Scan::Expr(value));
+                    }
+                    for statement in block.stmts.iter().rev() {
+                        for child in statement_children(statement).into_iter().rev() {
+                            work.push(Scan::Expr(child));
+                        }
+                    }
+                }
+                Scan::Expr(expression) => {
+                    if !expressions.insert(ptr_key(expression)) {
+                        continue;
+                    }
+                    match &expression.kind {
+                        hir::ExprKind::TaskGroup(block)
+                        | hir::ExprKind::Arena(block)
+                        | hir::ExprKind::NamedArena { block, .. }
+                        | hir::ExprKind::Unsafe(block)
+                        | hir::ExprKind::Block(block)
+                        | hir::ExprKind::Loop { body: block, .. } => {
+                            work.push(Scan::Block(block));
+                        }
+                        hir::ExprKind::If { then, els, .. } => {
+                            work.push(Scan::Block(els));
+                            work.push(Scan::Block(then));
+                        }
+                        hir::ExprKind::Match { arms, .. } => {
+                            for arm in arms.iter().rev() {
+                                work.push(Scan::Expr(&arm.body));
+                            }
+                        }
+                        _ => {}
+                    }
+                    for child in align_sema::direct_expr_children(expression)
+                        .into_iter()
+                        .rev()
+                    {
+                        work.push(Scan::Expr(child));
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn normalized_format_plan_initializer_matches(
+        &self,
+        initializer: &hir::Expr,
+        count: hir::LocalId,
+    ) -> bool {
+        let hir::ExprKind::If { cond, then, els } = &initializer.kind else {
+            return false;
+        };
+        let hir::ExprKind::Binary { op, lhs, rhs } = &cond.kind else {
+            return false;
+        };
+        if *op != align_ast::BinOp::Eq
+            || cond.ty != Ty::Bool
+            || lhs.ty != u32_ty()
+            || !matches!(lhs.kind, hir::ExprKind::Local(local) if local == count)
+            || rhs.ty != u32_ty()
+            || !matches!(rhs.kind, hir::ExprKind::Int(0))
+        {
+            return false;
+        }
+        let (Some(then_value), Some(else_value)) =
+            (then.value.as_deref(), els.value.as_deref())
+        else {
+            return false;
+        };
+        if !then.stmts.is_empty()
+            || !els.stmts.is_empty()
+            || then_value.ty != Ty::Raw
+            || !matches!(then_value.kind, hir::ExprKind::RawNull)
+            || else_value.ty != Ty::Raw
+        {
+            return false;
+        }
+        let hir::ExprKind::RawAlloc(size) = &else_value.kind else {
+            return false;
+        };
+        let hir::ExprKind::Binary { op, lhs, rhs } = &size.kind else {
+            return false;
+        };
+        let hir::ExprKind::Cast(cast) = &lhs.kind else {
+            return false;
+        };
+        *op == align_ast::BinOp::Mul
+            && size.ty == i64_ty()
+            && lhs.ty == i64_ty()
+            && cast.ty == u32_ty()
+            && matches!(cast.kind, hir::ExprKind::Local(local) if local == count)
+            && rhs.ty == i64_ty()
+            && matches!(rhs.kind, hir::ExprKind::Int(8))
+    }
+
     /// A statement retains six producer-owned callbacks after the Query value itself is gone.
     /// They must all be loaded from one concrete Query descriptor generation; accepting six
     /// individually well-typed raw pointers would let malformed HIR splice a resolver or decoder
@@ -10614,10 +10843,113 @@ fn statement_children(statement: &hir::Stmt) -> Vec<&hir::Expr> {
     }
 }
 
+fn call_name_matches_base(name: &str, base: &str) -> bool {
+    name.strip_prefix(base)
+        .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('$'))
+}
+
+fn normalized_format_plan_call(name: &str) -> Option<NormalizedFormatPlanCall> {
+    [
+        (
+            "pkg.db.internal.postgres$execute_native_prevalidated",
+            NormalizedFormatPlanCall::Execute,
+        ),
+        (
+            "pkg.db.internal.postgres$rows_native_prevalidated",
+            NormalizedFormatPlanCall::Rows,
+        ),
+        (
+            "pkg.db.internal.postgres$rows_stmt_native_prevalidated",
+            NormalizedFormatPlanCall::PreparedRows,
+        ),
+    ]
+    .into_iter()
+    .find_map(|(base, kind)| call_name_matches_base(name, base).then_some(kind))
+}
+
+fn expression_mentions_local(root: &hir::Expr, target: hir::LocalId) -> bool {
+    let mut work = vec![root];
+    let mut seen = HashSet::new();
+    while let Some(expression) = work.pop() {
+        if !seen.insert(ptr_key(expression)) {
+            continue;
+        }
+        if matches!(expression.kind, hir::ExprKind::Local(local) if local == target) {
+            return true;
+        }
+        work.extend(align_sema::direct_expr_children(expression));
+    }
+    false
+}
+
+fn canonical_raw_null(root: &hir::Expr) -> bool {
+    let mut current = root;
+    loop {
+        match &current.kind {
+            hir::ExprKind::RawNull => return current.ty == Ty::Raw,
+            hir::ExprKind::Unsafe(block) | hir::ExprKind::Block(block)
+                if block.stmts.is_empty() =>
+            {
+                let Some(value) = block.value.as_deref() else {
+                    return false;
+                };
+                current = value;
+            }
+            _ => return false,
+        }
+    }
+}
+
+fn normalized_plan_scratch_statement_ok(
+    statement: &hir::Stmt,
+    plan: hir::LocalId,
+    count: hir::LocalId,
+) -> bool {
+    let mut work = statement_children(statement)
+        .into_iter()
+        .map(|expression| (expression, false))
+        .collect::<Vec<_>>();
+    let mut seen = HashSet::new();
+    while let Some((expression, plan_is_store_pointer)) = work.pop() {
+        if !seen.insert((ptr_key(expression), plan_is_store_pointer)) {
+            continue;
+        }
+        if let hir::ExprKind::Local(local) = expression.kind {
+            if local == count || local == plan && !plan_is_store_pointer {
+                return false;
+            }
+            continue;
+        }
+        if let hir::ExprKind::RawStore { ptr, offset, value } = &expression.kind {
+            let pointer_is_plan = matches!(ptr.kind, hir::ExprKind::Local(local) if local == plan);
+            if expression_mentions_local(ptr, plan) && !pointer_is_plan {
+                return false;
+            }
+            work.push((ptr, pointer_is_plan));
+            work.push((offset, false));
+            work.push((value, false));
+            continue;
+        }
+        work.extend(
+            align_sema::direct_expr_children(expression)
+                .into_iter()
+                .map(|child| (child, false)),
+        );
+    }
+    true
+}
+
 fn i64_ty() -> Ty {
     Ty::Int(align_sema::IntTy {
         bits: 64,
         signed: true,
+    })
+}
+
+fn u32_ty() -> Ty {
+    Ty::Int(align_sema::IntTy {
+        bits: 32,
+        signed: false,
     })
 }
 

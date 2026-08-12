@@ -222,6 +222,12 @@ unsafe fn write_fixed_float<T: std::fmt::Display>(value: T, output: *mut u8, cap
 }
 
 /// Write the canonical allocation-free `f32` text rendering into caller-owned storage.
+///
+/// # Safety
+///
+/// When the canonical rendering is nonempty and fits in `capacity`, `output` must be valid for
+/// writes of the exact byte length returned by [`align_rt_f32_text_len`]. A negative or
+/// insufficient `capacity` returns `-1` without dereferencing `output`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_f32_text_write(
     value: f32,
@@ -232,6 +238,12 @@ pub unsafe extern "C" fn align_rt_f32_text_write(
 }
 
 /// Write the canonical allocation-free `f64` text rendering into caller-owned storage.
+///
+/// # Safety
+///
+/// When the canonical rendering is nonempty and fits in `capacity`, `output` must be valid for
+/// writes of the exact byte length returned by [`align_rt_f64_text_len`]. A negative or
+/// insufficient `capacity` returns `-1` without dereferencing `output`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_f64_text_write(
     value: f64,
@@ -19098,7 +19110,9 @@ mod tests {
             let written =
                 unsafe { align_rt_f32_text_write(value, actual.as_mut_ptr(), actual.len() as i64) };
             assert_eq!(written, expected.len() as i64);
-            assert_eq!(&actual[..written as usize], expected.as_slice());
+            let written = usize::try_from(written)
+                .unwrap_or_else(|_| panic!("successful f32 text length is nonnegative"));
+            assert_eq!(&actual[..written], expected.as_slice());
         }
 
         for bits in [
@@ -19118,7 +19132,9 @@ mod tests {
             let written =
                 unsafe { align_rt_f64_text_write(value, actual.as_mut_ptr(), actual.len() as i64) };
             assert_eq!(written, expected.len() as i64);
-            assert_eq!(&actual[..written as usize], expected.as_slice());
+            let written = usize::try_from(written)
+                .unwrap_or_else(|_| panic!("successful f64 text length is nonnegative"));
+            assert_eq!(&actual[..written], expected.as_slice());
         }
 
         assert_eq!(

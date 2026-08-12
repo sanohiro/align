@@ -13326,11 +13326,14 @@ fn hir_body_validator_prepared_parameter_count_bridge_fails_closed() {
             .fns
             .last_mut()
             .and_then(|function| function.body.value.as_deref_mut())
-            .expect("prepared count unsafe expression");
+            .unwrap_or_else(|| panic!("prepared count unsafe expression"));
         let hir::ExprKind::Unsafe(block) = &mut unsafe_expression.kind else {
             panic!("prepared count unsafe block")
         };
-        block.value.as_deref_mut().expect("prepared count call")
+        block
+            .value
+            .as_deref_mut()
+            .unwrap_or_else(|| panic!("prepared count call"))
     }
 
     let mut wrong_offset = program.clone();
@@ -13473,11 +13476,14 @@ fn hir_body_validator_static_descriptor_parameter_count_bridge_fails_closed() {
             .fns
             .last_mut()
             .and_then(|function| function.body.value.as_deref_mut())
-            .expect("descriptor count unsafe expression");
+            .unwrap_or_else(|| panic!("descriptor count unsafe expression"));
         let hir::ExprKind::Unsafe(block) = &mut unsafe_expression.kind else {
             panic!("descriptor count unsafe block")
         };
-        block.value.as_deref_mut().expect("descriptor count call")
+        block
+            .value
+            .as_deref_mut()
+            .unwrap_or_else(|| panic!("descriptor count call"))
     }
 
     let mut wrong_offset = program.clone();
@@ -13512,6 +13518,211 @@ fn hir_body_validator_static_descriptor_parameter_count_bridge_fails_closed() {
         *root = 1;
     }
     assert!(!body_core_metadata_is_valid(&mismatched_pointer));
+}
+
+#[test]
+fn hir_body_validator_postgres_normalized_plan_provenance_fails_closed() {
+    let mut program = baseline_program();
+    let u8_ty = Ty::Int(IntTy {
+        bits: 8,
+        signed: false,
+    });
+    let u32_ty = Ty::Int(IntTy {
+        bits: 32,
+        signed: false,
+    });
+    let i64_ty = Ty::Int(IntTy {
+        bits: 64,
+        signed: true,
+    });
+    let target_types = [
+        u32_ty,
+        u32_ty,
+        u32_ty,
+        u32_ty,
+        u32_ty,
+        Ty::Raw,
+        u32_ty,
+        u8_ty,
+    ];
+    let mut target = body_test_named_function(
+        "pkg.db.internal.postgres$execute_native_prevalidated",
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit))),
+        },
+        target_types
+            .iter()
+            .enumerate()
+            .map(|(index, ty)| {
+                body_test_local(index as u32, &format!("arg{index}"), *ty, false, true)
+            })
+            .collect(),
+        Ty::Unit,
+    );
+    target.params = (0..target_types.len() as u32).collect();
+    target.param_modes = vec![align_ast::ParamMode::ByValue; target_types.len()];
+    program.fns.push(target);
+
+    let local = |id, ty| body_test_expr(hir::ExprKind::Local(id), ty);
+    let plan_initializer = body_test_expr(
+        hir::ExprKind::If {
+            cond: Box::new(body_test_expr(
+                hir::ExprKind::Binary {
+                    op: align_ast::BinOp::Eq,
+                    lhs: Box::new(local(0, u32_ty)),
+                    rhs: Box::new(body_test_expr(hir::ExprKind::Int(0), u32_ty)),
+                },
+                Ty::Bool,
+            )),
+            then: hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(hir::ExprKind::RawNull, Ty::Raw))),
+            },
+            els: hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(
+                    hir::ExprKind::RawAlloc(Box::new(body_test_expr(
+                        hir::ExprKind::Binary {
+                            op: align_ast::BinOp::Mul,
+                            lhs: Box::new(body_test_expr(
+                                hir::ExprKind::Cast(Box::new(local(0, u32_ty))),
+                                i64_ty,
+                            )),
+                            rhs: Box::new(body_test_expr(hir::ExprKind::Int(8), i64_ty)),
+                        },
+                        i64_ty,
+                    ))),
+                    Ty::Raw,
+                ))),
+            },
+        },
+        Ty::Raw,
+    );
+    let call_expression = body_test_expr(
+        hir::ExprKind::Call {
+            func: "pkg.db.internal.postgres$execute_native_prevalidated".to_string(),
+            args: vec![
+                body_test_expr(hir::ExprKind::Int(0), u32_ty),
+                body_test_expr(hir::ExprKind::Int(0), u32_ty),
+                body_test_expr(hir::ExprKind::Int(0), u32_ty),
+                body_test_expr(hir::ExprKind::Int(0), u32_ty),
+                body_test_expr(hir::ExprKind::Int(0), u32_ty),
+                local(1, Ty::Raw),
+                local(0, u32_ty),
+                body_test_expr(hir::ExprKind::Int(0), u8_ty),
+            ],
+            type_args: Vec::new(),
+        },
+        Ty::Unit,
+    );
+    let unsafe_block = hir::Block {
+        stmts: vec![
+            hir::Stmt::Let {
+                local: 0,
+                init: body_test_expr(hir::ExprKind::Int(2), u32_ty),
+            },
+            hir::Stmt::Let {
+                local: 1,
+                init: plan_initializer,
+            },
+            hir::Stmt::Let {
+                local: 2,
+                init: call_expression,
+            },
+        ],
+        value: Some(Box::new(local(2, Ty::Unit))),
+    };
+    let owner = body_test_named_function(
+        "pkg.db.postgres$execute_native",
+        hir::Block {
+            stmts: Vec::new(),
+            value: Some(Box::new(body_test_expr(
+                hir::ExprKind::Unsafe(unsafe_block),
+                Ty::Unit,
+            ))),
+        },
+        vec![
+            body_test_local(0, "format_count", u32_ty, false, false),
+            body_test_local(1, "format_plan", Ty::Raw, false, false),
+            body_test_local(2, "result", Ty::Unit, false, false),
+        ],
+        Ty::Unit,
+    );
+    program.fns.push(owner);
+    assert!(body_core_metadata_is_valid(&program));
+
+    fn owner_unsafe_block(candidate: &mut hir::Program) -> &mut hir::Block {
+        let owner = candidate
+            .fns
+            .last_mut()
+            .unwrap_or_else(|| panic!("normalized-plan owner"));
+        let expression = owner
+            .body
+            .value
+            .as_deref_mut()
+            .unwrap_or_else(|| panic!("owner unsafe block"));
+        let hir::ExprKind::Unsafe(block) = &mut expression.kind else {
+            panic!("normalized-plan owner must remain unsafe")
+        };
+        block
+    }
+
+    fn normalized_call(candidate: &mut hir::Program) -> &mut hir::Expr {
+        let hir::Stmt::Let { init, .. } = &mut owner_unsafe_block(candidate).stmts[2] else {
+            panic!("normalized-plan call binding")
+        };
+        init
+    }
+
+    let mut short_allocation = program.clone();
+    let hir::Stmt::Let { init, .. } = &mut owner_unsafe_block(&mut short_allocation).stmts[1] else {
+        panic!("normalized-plan allocation binding")
+    };
+    let hir::ExprKind::If { els, .. } = &mut init.kind else {
+        panic!("normalized-plan conditional allocation")
+    };
+    let hir::ExprKind::RawAlloc(size) = &mut els
+        .value
+        .as_deref_mut()
+        .unwrap_or_else(|| panic!("normalized-plan allocation"))
+        .kind
+    else {
+        panic!("normalized-plan raw allocation")
+    };
+    let hir::ExprKind::Binary { rhs, .. } = &mut size.kind else {
+        panic!("normalized-plan allocation product")
+    };
+    rhs.kind = hir::ExprKind::Int(4);
+    assert!(!body_core_metadata_is_valid(&short_allocation));
+
+    let mut substituted_count = program.clone();
+    let hir::ExprKind::Call { args, .. } = &mut normalized_call(&mut substituted_count).kind else {
+        panic!("normalized-plan call")
+    };
+    args[6].kind = hir::ExprKind::Int(2);
+    assert!(!body_core_metadata_is_valid(&substituted_count));
+
+    let mut application_call = program.clone();
+    application_call
+        .fns
+        .last_mut()
+        .unwrap_or_else(|| panic!("normalized-plan owner"))
+        .name = "app$execute_native".to_string();
+    assert!(!body_core_metadata_is_valid(&application_call));
+
+    let mut zero_path = program;
+    zero_path
+        .fns
+        .last_mut()
+        .unwrap_or_else(|| panic!("normalized-plan owner"))
+        .name = "pkg.db.internal.postgres$execute_prevalidated".to_string();
+    let hir::ExprKind::Call { args, .. } = &mut normalized_call(&mut zero_path).kind else {
+        panic!("normalized-plan zero call")
+    };
+    args[5] = body_test_expr(hir::ExprKind::RawNull, Ty::Raw);
+    args[6] = body_test_expr(hir::ExprKind::Int(0), u32_ty);
+    assert!(body_core_metadata_is_valid(&zero_path));
 }
 
 #[test]
