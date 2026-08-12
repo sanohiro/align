@@ -5107,9 +5107,11 @@ does not parse text, CSV, or the PostgreSQL binary COPY representation.
 
 ##### Exact public record
 
-The rail adds exactly these declarations to `pkg.db.postgres`:
+The rail adds exactly the following signature ledger to `pkg.db.postgres`. This `text` block is not
+an Align source fragment: function bodies are intentionally omitted, while every name and type is
+the exact spelling used by the module declarations.
 
-```align
+```text
 pub CopyInfo {
   format: Format,
   columns: i64,
@@ -5117,7 +5119,7 @@ pub CopyInfo {
 
 pub CopyAbort {
   Aborted
-  Completed(db.exec_result)
+  Completed(pkg.db.exec_result)
 }
 
 pub resource copy_in = pkg.db.internal.resource.drop_postgres_copy_in
@@ -5125,45 +5127,45 @@ pub resource copy_out = pkg.db.internal.resource.drop_postgres_copy_out
 pub resource copy_chunk = pkg.db.internal.resource.drop_postgres_copy_chunk
 
 pub fn copy_in<P>(
-  target: db.exec,
-  statement: db.command<P>,
+  target: pkg.db.exec,
+  statement: pkg.db.command<P>,
   params: P,
   expected_format: Format,
-  options: slice<db.ExecuteOption>,
-  native: slice<postgres.ExecuteOption>,
-) -> Result<copy_in, db.Error>
+  options: slice<pkg.db.ExecuteOption>,
+  native: slice<ExecuteOption>,
+) -> Result<copy_in, pkg.db.Error>
 
-pub fn copy_in_info(borrow transfer: copy_in) -> Result<CopyInfo, db.Error>
+pub fn copy_in_info(borrow transfer: copy_in) -> Result<CopyInfo, pkg.db.Error>
 
 pub fn copy_in_write(
   borrow mut transfer: copy_in,
   bytes: slice<u8>,
-) -> Result<(), db.Error>
+) -> Result<(), pkg.db.Error>
 
-pub fn copy_in_finish(transfer: copy_in) -> Result<db.exec_result, db.Error>
+pub fn copy_in_finish(transfer: copy_in) -> Result<pkg.db.exec_result, pkg.db.Error>
 
-pub fn copy_in_abort(transfer: copy_in) -> Result<CopyAbort, db.Error>
+pub fn copy_in_abort(transfer: copy_in) -> Result<CopyAbort, pkg.db.Error>
 
 pub fn copy_out<P>(
-  target: db.exec,
-  statement: db.command<P>,
+  target: pkg.db.exec,
+  statement: pkg.db.command<P>,
   params: P,
   expected_format: Format,
-  options: slice<db.ExecuteOption>,
-  native: slice<postgres.ExecuteOption>,
-) -> Result<copy_out, db.Error>
+  options: slice<pkg.db.ExecuteOption>,
+  native: slice<ExecuteOption>,
+) -> Result<copy_out, pkg.db.Error>
 
-pub fn copy_out_info(borrow transfer: copy_out) -> Result<CopyInfo, db.Error>
+pub fn copy_out_info(borrow transfer: copy_out) -> Result<CopyInfo, pkg.db.Error>
 
 pub fn copy_out_next(
   borrow mut transfer: copy_out,
-) -> Result<Option<copy_chunk>, db.Error>
+) -> Result<Option<copy_chunk>, pkg.db.Error>
 
-pub fn copy_chunk_bytes(borrow chunk: copy_chunk) -> Result<slice<u8>, db.Error>
+pub fn copy_chunk_bytes(borrow chunk: copy_chunk) -> Result<slice<u8>, pkg.db.Error>
 
-pub fn copy_out_finish(transfer: copy_out) -> Result<db.exec_result, db.Error>
+pub fn copy_out_finish(transfer: copy_out) -> Result<pkg.db.exec_result, pkg.db.Error>
 
-pub fn copy_out_abort(transfer: copy_out) -> Result<CopyAbort, db.Error>
+pub fn copy_out_abort(transfer: copy_out) -> Result<CopyAbort, pkg.db.Error>
 ```
 
 `Format.Text` covers PostgreSQL text and CSV COPY streams because both use the protocol's overall
@@ -5411,6 +5413,17 @@ as settled for direct execution, while parameter measurement remains behind the 
 pairwise multi-invalid/failpoint owner asserts this exact winner and zero calls/allocations from
 later phases.
 
+If step 7 observes an already-owned execution lease, it returns the existing
+`pkg.db.Error.Unsupported(pkg.db.ContractError { query_id: Some(static_id), item:
+"postgres.connection.active_execution", message: "PostgreSQL connection already has an active
+execution" })`. It frees the unpublished transfer/context owners allocated by this attempt, and its
+public wrapper frees the call-local sparse option plan. It performs zero full-vector/Measure/Encode/
+deadline/libpq calls. Apart from reading the shared occupied bit needed to reject, it does not inspect
+the first operation's nonblocking mode, deadline, transfer, or result state and never clears,
+restores, releases, or otherwise mutates the first operation's lease or state.
+The complete descriptor, options, driver/parent state, and generated static validation therefore
+precede this overlap result; overlap precedes every parameter budget/value error and native effect.
+
 The initial-handshake outcome and PGresult ownership product is exhaustive:
 
 | Initial `PQgetResult` outcome | Calls while live | Exact owner/connection action |
@@ -5526,6 +5539,7 @@ An error copied from libpq instead keeps the shipped field extraction and first-
 | ResultFormat in COPY native options | `Unsupported`, item `postgres.copy.result_format`, message `PostgreSQL COPY format is declared by SQL` |
 | Delivery in COPY native options | `Unsupported`, item `postgres.copy.delivery`, message `PostgreSQL COPY owns its data delivery protocol` |
 | non-PostgreSQL or unusable target | existing `DriverMismatch`/closed-target result before package COPY allocation or libpq |
+| execution lease already owned | existing `Unsupported`; `query_id: Some(static_id)`, item `postgres.connection.active_execution`, message `PostgreSQL connection already has an active execution`; attempted local-owner cleanup only, no first-owner mutation or libpq |
 | initial ordinary native error | existing PostgreSQL native classification with copied fields |
 | null before the initial PGresult | synthetic `Native`, message `PostgreSQL COPY initial result is unavailable`, no clear, immediate physical close |
 | initial pipeline or unknown status | synthetic `Native`, message `PostgreSQL COPY protocol entered an unsupported state`, immediate physical close |
@@ -5597,7 +5611,7 @@ Linux ARM64, and macOS. Server 16.4 and client >=17 remain the required live bou
 | Closure cell | Required discriminating owner |
 |---|---|
 | exported surface and unavailable siblings | exact public declaration golden; compile rejection for common/SQLite/dynamic/prepared COPY and no `CopyOption`/callback |
-| start operation matrix | CopyIn/CopyOut x Conn/Tx x Text/Binary x timeout absent/present x zero/one/multiple/default/Text/Binary Params; exact phase-order failpoint counters including overlap before full-vector allocation, lease before installation, and fixed Parse/Bind initialization before Measure |
+| start operation matrix | CopyIn/CopyOut x Conn/Tx x Text/Binary x timeout absent/present x zero/one/multiple/default/Text/Binary Params; exact phase-order failpoint counters including failed overlap's exact error/local frees/zero first-owner mutation, overlap before full-vector allocation, lease before installation, and fixed Parse/Bind initialization before Measure |
 | initial handshake and response metadata | null/non-null initial result; direction, COPY BOTH, overall format, every per-column format, `0`/one/max columns, malformed count/code/pointer, every ordinary/COPY/pipeline/unknown status; exactly one clear for every non-null outcome and zero clear/classification for null |
 | CopyIn data | empty no-call; one/multiple/`i32::MAX`/rejected-next chunks; rejected-next remains Active and a following valid write/finish/abort works; queued/retry/hard error; mutation after call; exact bytes and no package allocation/copy |
 | CopyOut data | zero-pending/positive/-1/-2; one/many/large rows; exact zero-copy pointer/length; one-live-chunk exclusion; wrapper/libpq free counts; malformed chunk |
@@ -5645,6 +5659,12 @@ result table makes null fail closed before classification and assigns every non-
 one clear before publication, synchronized rejection, or physical close. The same table owns local
 transfer/context/format/payload cleanup, so the redesign closes the whole start phase rather than the
 three reported lines and retains the same public capability boundary.
+
+The declaration-and-overlap review found two P2 ledger omissions. The public inventory is now an
+explicit non-source signature ledger with exact module spellings, while the failed-second-operation
+row fixes the existing query-specific overlap error, attempted-owner cleanup, zero native work, and
+zero mutation of the first lease holder. The exported-surface and start-operation cells are closed
+without changing the capability or protocol strategy.
 
 Before implementation, complete one fresh independent adversarial review of this ledger and the
 single capability boundary. The implementation is expected to exceed roughly 1,000 changed

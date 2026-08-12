@@ -3507,9 +3507,11 @@ representationをparseしない。
 
 ##### Exact public record
 
-このrailは`pkg.db.postgres`へexactly次のdeclarationを追加する:
+このrailは`pkg.db.postgres`へexactly次のsignature ledgerを追加する。この`text` blockはAlign source
+fragmentではない。function bodyはintentional omitするが、every name/typeはmodule declarationで使うexact
+spellingである。
 
-```align
+```text
 pub CopyInfo {
   format: Format,
   columns: i64,
@@ -3517,7 +3519,7 @@ pub CopyInfo {
 
 pub CopyAbort {
   Aborted
-  Completed(db.exec_result)
+  Completed(pkg.db.exec_result)
 }
 
 pub resource copy_in = pkg.db.internal.resource.drop_postgres_copy_in
@@ -3525,45 +3527,45 @@ pub resource copy_out = pkg.db.internal.resource.drop_postgres_copy_out
 pub resource copy_chunk = pkg.db.internal.resource.drop_postgres_copy_chunk
 
 pub fn copy_in<P>(
-  target: db.exec,
-  statement: db.command<P>,
+  target: pkg.db.exec,
+  statement: pkg.db.command<P>,
   params: P,
   expected_format: Format,
-  options: slice<db.ExecuteOption>,
-  native: slice<postgres.ExecuteOption>,
-) -> Result<copy_in, db.Error>
+  options: slice<pkg.db.ExecuteOption>,
+  native: slice<ExecuteOption>,
+) -> Result<copy_in, pkg.db.Error>
 
-pub fn copy_in_info(borrow transfer: copy_in) -> Result<CopyInfo, db.Error>
+pub fn copy_in_info(borrow transfer: copy_in) -> Result<CopyInfo, pkg.db.Error>
 
 pub fn copy_in_write(
   borrow mut transfer: copy_in,
   bytes: slice<u8>,
-) -> Result<(), db.Error>
+) -> Result<(), pkg.db.Error>
 
-pub fn copy_in_finish(transfer: copy_in) -> Result<db.exec_result, db.Error>
+pub fn copy_in_finish(transfer: copy_in) -> Result<pkg.db.exec_result, pkg.db.Error>
 
-pub fn copy_in_abort(transfer: copy_in) -> Result<CopyAbort, db.Error>
+pub fn copy_in_abort(transfer: copy_in) -> Result<CopyAbort, pkg.db.Error>
 
 pub fn copy_out<P>(
-  target: db.exec,
-  statement: db.command<P>,
+  target: pkg.db.exec,
+  statement: pkg.db.command<P>,
   params: P,
   expected_format: Format,
-  options: slice<db.ExecuteOption>,
-  native: slice<postgres.ExecuteOption>,
-) -> Result<copy_out, db.Error>
+  options: slice<pkg.db.ExecuteOption>,
+  native: slice<ExecuteOption>,
+) -> Result<copy_out, pkg.db.Error>
 
-pub fn copy_out_info(borrow transfer: copy_out) -> Result<CopyInfo, db.Error>
+pub fn copy_out_info(borrow transfer: copy_out) -> Result<CopyInfo, pkg.db.Error>
 
 pub fn copy_out_next(
   borrow mut transfer: copy_out,
-) -> Result<Option<copy_chunk>, db.Error>
+) -> Result<Option<copy_chunk>, pkg.db.Error>
 
-pub fn copy_chunk_bytes(borrow chunk: copy_chunk) -> Result<slice<u8>, db.Error>
+pub fn copy_chunk_bytes(borrow chunk: copy_chunk) -> Result<slice<u8>, pkg.db.Error>
 
-pub fn copy_out_finish(transfer: copy_out) -> Result<db.exec_result, db.Error>
+pub fn copy_out_finish(transfer: copy_out) -> Result<pkg.db.exec_result, pkg.db.Error>
 
-pub fn copy_out_abort(transfer: copy_out) -> Result<CopyAbort, db.Error>
+pub fn copy_out_abort(transfer: copy_out) -> Result<CopyAbort, pkg.db.Error>
 ```
 
 `Format.Text`はprotocol overall text format codeを使うPostgreSQL text/CSV COPY streamを表す。
@@ -3773,6 +3775,15 @@ earlier failure後にlater stepをrunしない。direct executionでsettledの�
 validationより先にbeginし、parameter measurementはlease後である。every pairwise multi-invalid/failpoint
 ownerはexact winnerとlater phaseのzero call/allocationをassertする。
 
+step 7がalready-owned execution leaseをobserveした場合、existing
+`pkg.db.Error.Unsupported(pkg.db.ContractError { query_id: Some(static_id), item:
+"postgres.connection.active_execution", message: "PostgreSQL connection already has an active
+execution" })`を返す。このattemptがallocateしたunpublished transfer/context ownerをfreeし、public wrapperは
+call-local sparse option planをfreeする。full-vector/Measure/Encode/deadline/libpq callはzeroである。rejectに
+必要なshared occupied bit以外はfirst operationのnonblocking mode/deadline/transfer/result stateをinspectせず、
+first operationのlease/stateをclear/restore/release/mutateしない。complete descriptor/options/driver-parent state/generated static validationが
+overlapよりprecedeし、overlapはevery parameter budget/value error/native effectよりprecedeする。
+
 initial-handshake outcome+PGresult ownership productはexhaustiveである:
 
 | Initial `PQgetResult` outcome | Calls while live | Exact owner/connection action |
@@ -3880,6 +3891,7 @@ libpqからcopyするerrorはshipped field extraction+first-error ruleを維持�
 | ResultFormat in COPY native options | `Unsupported`, item `postgres.copy.result_format`, message `PostgreSQL COPY format is declared by SQL` |
 | Delivery in COPY native options | `Unsupported`, item `postgres.copy.delivery`, message `PostgreSQL COPY owns its data delivery protocol` |
 | non-PostgreSQL/unusable target | existing `DriverMismatch`/closed-target result、package COPY allocation/libpq前 |
+| execution lease already owned | existing `Unsupported`; `query_id: Some(static_id)`、item `postgres.connection.active_execution`、message `PostgreSQL connection already has an active execution`; attempted local-owner cleanupだけ、first-owner mutation/libpqなし |
 | initial ordinary native error | existing PostgreSQL native classification+copied fields |
 | initial PGresult前のnull | synthetic `Native`, message `PostgreSQL COPY initial result is unavailable`, clearなし、immediate physical close |
 | initial pipeline/unknown status | synthetic `Native`, message `PostgreSQL COPY protocol entered an unsupported state`, immediate physical close |
@@ -3947,7 +3959,7 @@ Linux x86_64/ARM64/macOSで保持する。server 16.4/client >=17がrequired liv
 | Closure cell | Required discriminating owner |
 |---|---|
 | exported surface/unavailable siblings | exact public declaration golden; common/SQLite/dynamic/prepared COPYと`CopyOption`/callbackのcompile rejection |
-| start operation matrix | CopyIn/CopyOut x Conn/Tx x Text/Binary x timeout absent/present x zero/one/multiple/default/Text/Binary Params; overlap-before-full-vector-allocation、lease-before-installation、fixed Parse/Bind initialization-before-Measureを含むexact phase-order failpoint counter |
+| start operation matrix | CopyIn/CopyOut x Conn/Tx x Text/Binary x timeout absent/present x zero/one/multiple/default/Text/Binary Params; failed overlapのexact error/local free/zero first-owner mutation、overlap-before-full-vector-allocation、lease-before-installation、fixed Parse/Bind initialization-before-Measureを含むexact phase-order failpoint counter |
 | initial handshake/response metadata | null/non-null initial result、direction、COPY BOTH、overall/every-column format、`0`/one/max columns、malformed count/code/pointer、every ordinary/COPY/pipeline/unknown status。every non-null outcomeはexactly one clear、nullはzero clear/classification |
 | CopyIn data | empty no-call; one/multiple/`i32::MAX`/rejected-next chunk; rejected-nextはActiveでfollowing valid write/finish/abortがwork; queued/retry/hard error; post-call mutation; exact bytes/no package allocation-copy |
 | CopyOut data | zero-pending/positive/-1/-2; one/many/large row; exact zero-copy pointer/length; one-live-chunk exclusion; wrapper/libpq free count; malformed chunk |
@@ -3987,6 +3999,11 @@ preceding binary-format fixed Parse/Bind validationはMeasure前にrunする。o
 nullをclassification前にfail-closeし、every non-null resultへpublication/synchronized rejection/physical close前の
 exactly one clearをassignする。同じtableがlocal transfer/context/format/payload cleanupをownするため、reported
 3 lineでなくwhole start phaseをcloseし、same public capability boundaryを保持する。
+
+declaration-and-overlap reviewは2 P2 ledger omissionを発見した。public inventoryはexact module spellingの
+explicit non-source signature ledgerとなり、failed-second-operation rowはexisting query-specific overlap error、
+attempted-owner cleanup、zero native work、first lease holderのzero mutationを固定する。exported-surface/start-
+operation cellをcapability/protocol strategy変更なしにcloseする。
 
 implementation前にこのledger+single capability boundaryをone fresh independent adversarial reviewする。
 start、both live direction、termination、cancellation、Drop、fake libpq、C signature probe、required live ownerが
