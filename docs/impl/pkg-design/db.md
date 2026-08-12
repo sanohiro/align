@@ -1715,7 +1715,8 @@ The design must not block:
 
 The initial public release requires the common Query/transaction path, native options, checked
 metadata, and basic plan access. D13's first PostgreSQL-native rail adds single-row and chunked-row
-delivery. COPY, pipeline mode, and LISTEN/NOTIFY remain later independently specified D13 rails.
+delivery. The PostgreSQL COPY rail is specified by the exact ledger in §23; pipeline mode and
+LISTEN/NOTIFY remain later independently specified D13 rails.
 
 ---
 
@@ -5094,13 +5095,389 @@ ledger-first. Before code review, extract every normative `must`/`exact`/`every`
 discriminating owner. A finding in resolver signs, format propagation, endian conversion, result
 metadata ordering, or cleanup triggers the complete sibling type/operation/delivery audit.
 
+#### A1 PostgreSQL COPY public-contract ledger
+
+This ledger is the source of truth for the next independently useful D13 rail. It exposes the
+libpq COPY data/termination protocol without adding dynamic SQL, a row codec, reflection, a hidden
+worker, a callback, a prepared-COPY path, or a common-driver abstraction. The SQL remains one
+compiler-produced `db.command<P>` descriptor and must contain the complete PostgreSQL `COPY ...
+FROM STDIN` or `COPY ... TO STDOUT` statement. PostgreSQL remains the authority for the COPY
+grammar and stream payload. Align transports caller-supplied or server-supplied bytes exactly and
+does not parse text, CSV, or the PostgreSQL binary COPY representation.
+
+##### Exact public record
+
+The rail adds exactly these declarations to `pkg.db.postgres`:
+
+```align
+pub CopyInfo {
+  format: Format,
+  columns: i64,
+}
+
+pub CopyAbort {
+  Aborted
+  Completed(db.exec_result)
+}
+
+pub resource copy_in = pkg.db.internal.resource.drop_postgres_copy_in
+pub resource copy_out = pkg.db.internal.resource.drop_postgres_copy_out
+pub resource copy_chunk = pkg.db.internal.resource.drop_postgres_copy_chunk
+
+pub fn copy_in<P>(
+  target: db.exec,
+  statement: db.command<P>,
+  params: P,
+  expected_format: Format,
+  options: slice<db.ExecuteOption>,
+  native: slice<postgres.ExecuteOption>,
+) -> Result<copy_in, db.Error>
+
+pub fn copy_in_info(borrow transfer: copy_in) -> Result<CopyInfo, db.Error>
+
+pub fn copy_in_write(
+  borrow mut transfer: copy_in,
+  bytes: slice<u8>,
+) -> Result<(), db.Error>
+
+pub fn copy_in_finish(transfer: copy_in) -> Result<db.exec_result, db.Error>
+
+pub fn copy_in_abort(transfer: copy_in) -> Result<CopyAbort, db.Error>
+
+pub fn copy_out<P>(
+  target: db.exec,
+  statement: db.command<P>,
+  params: P,
+  expected_format: Format,
+  options: slice<db.ExecuteOption>,
+  native: slice<postgres.ExecuteOption>,
+) -> Result<copy_out, db.Error>
+
+pub fn copy_out_info(borrow transfer: copy_out) -> Result<CopyInfo, db.Error>
+
+pub fn copy_out_next(
+  borrow mut transfer: copy_out,
+) -> Result<Option<copy_chunk>, db.Error>
+
+pub fn copy_chunk_bytes(borrow chunk: copy_chunk) -> Result<slice<u8>, db.Error>
+
+pub fn copy_out_finish(transfer: copy_out) -> Result<db.exec_result, db.Error>
+
+pub fn copy_out_abort(transfer: copy_out) -> Result<CopyAbort, db.Error>
+```
+
+`Format.Text` covers PostgreSQL text and CSV COPY streams because both use the protocol's overall
+text format code. `Format.Binary` covers only the PostgreSQL binary COPY representation. The
+caller must name the expected overall format at the call site; the package compares it with
+`PQbinaryTuples` and every `PQfformat` entry before returning a resource. It never infers a format
+from SQL text, silently accepts a mismatch, or translates between formats. `CopyInfo.columns` is
+the exact nonnegative `PQnfields` value after validation; it is at most `65_535`.
+
+Both start functions accept only a static `db.command<P>`. They do not accept `str`, `db.query`,
+`db.stmt`, or a common `db` COPY wrapper. `copy_in` requires the first successful result to be
+`PGRES_COPY_IN`; `copy_out` requires `PGRES_COPY_OUT`. The opposite direction,
+`PGRES_COPY_BOTH`, `PGRES_COMMAND_OK`, tuple results, partial row-mode results, pipeline results,
+and unknown status values never create a public COPY resource. An ordinary non-COPY status is
+cleared and drained to null before the package proves transaction state and blocking-mode
+restoration; that synchronized path may reuse the parent. Once the server has entered an unexpected
+COPY or pipeline subprotocol, or returned an unknown status, the package instead clears the current
+result once, calls only `PQfinish` to physically close the connection, marks the parent state
+unusable, frees every local owner, and returns the exact error below. It performs no intervening or
+later result, COPY, cancel, transaction-state, blocking-mode, or pipeline-exit call.
+
+`options` accepts the existing common `TimeoutNs` with its shipped positivity, duplicate, absolute
+deadline, original-duration recovery, and source-order rules. `native` accepts only
+`ParameterFormat(name, Text|Binary)`, using the descriptor-v6 generated ordinal and binary
+eligibility proof from the preceding ledger. `ResultFormat` is rejected because COPY format is
+specified by SQL and verified from the COPY response. `Delivery` is rejected because COPY owns a
+separate libpq subprotocol. There is no `CopyOption` sum and `[]` means default Text parameter
+binding plus no timeout; it does not choose the COPY stream format.
+
+`CopyAbort.Aborted` means the direction-specific termination reached a synchronized final failure
+and `PQgetResult` then returned null. `Completed(result)` means the server completed the COPY before
+the requested abort took effect; the exact successful `db.exec_result` is returned so effects are
+never hidden. A synchronization, native, timeout, or malformed-state failure remains `Err`.
+
+##### Ownership, lifetime, allocation, and effect record
+
+`copy_in` and `copy_out` are Move, non-Copy, non-Send dependent resources tied to the exact
+`conn`/`tx` generation in `target`. Construction acquires the existing PostgreSQL execution lease;
+no sibling Query, command, prepared statement, metadata, EXPLAIN, COPY, transaction boundary, or
+cleanup path may issue a libpq call until the transfer is explicitly finished/aborted or its Drop
+has fail-closed the parent. The compiler's ordinary `resource.from_raw_borrowed` provenance owns
+this relationship; no `pkg.db`-specific compiler rule is added.
+
+Each successful start allocates exactly one 80-byte, 8-aligned package transfer record. Parameter
+format-plan and execution-owned parameter payloads are released before the start function returns:
+libpq has consumed the parameter call boundary and the COPY resource retains no `Params` owner.
+The descriptor's static Query ID bytes are borrowed from immutable descriptor storage and are not
+copied or freed. Success-path construction allocates no error value.
+
+`copy_in_write` borrows the source slice only for the call. A nonempty slice must have length
+`1..=i32::MAX`; the package passes the exact pointer/length to `PQputCopyData` and performs no
+package allocation, sentinel append, encoding, or payload copy. libpq may copy into its documented
+output queue. An empty slice is an exact successful no-op with zero libpq calls because COPY input
+buffer boundaries have no meaning.
+
+Every positive `PQgetCopyData` result creates one `copy_chunk` dependent on the active `copy_out`.
+The resource owns the non-null libpq allocation and one 24-byte, 8-aligned package wrapper. Its
+`copy_chunk_bytes` result is a zero-copy `slice<u8>` view of exactly the positive returned length;
+the trailing libpq NUL is outside the view. Dropping the chunk calls `PQfreemem` exactly once and
+frees the wrapper exactly once. The compiler rejects another mutable `copy_out` operation, finish,
+abort, move, or Drop while that dependent chunk or its view is live. No chunk collection, region
+copy, or hidden heap materialization is provided.
+
+`copy_out_finish` may be called before exhaustion. It explicitly drains and frees every remaining
+COPY row without exposing or decoding it, completes the final-result sequence, and returns the
+row count. This potentially unbounded transport is visible in the `finish` call. By contrast,
+dropping an active `copy_in` or `copy_out` performs no network drain, cancellation, or CopyFail:
+the Drop hook immediately marks the parent unusable, closes the physical connection, releases
+package allocations/lease state, and stays silent. Reusable completion therefore requires an
+explicit `finish`/`abort` or observed clean CopyOut exhaustion. Drop of a `Complete` CopyOut
+releases its lease and record without network work or physical close; active Drop remains only the
+bounded fail-safe.
+
+On successful `finish`, a connection target is synchronized at `PQTRANS_IDLE`; a transaction
+target remains at `PQTRANS_INTRANS`. `copy_in_abort` sends one package-owned fixed CopyFail message;
+`copy_out_abort` uses the shipped libpq-17 cancel handle, then discards COPY data through the
+direction-correct receive path. A synchronized abort outside a transaction leaves the connection
+idle with the statement effects rolled back; inside a transaction it requires
+`PQTRANS_INERROR`, leaving the explicit transaction available only for its normal rollback/error
+path. A completed-before-abort race returns `CopyAbort.Completed` and preserves the actual effects.
+Any unproved state closes and poisons rather than returning a reusable owner.
+The fixed CopyFail bytes are the ASCII text `Align caller aborted PostgreSQL COPY` followed by one
+NUL supplied only to libpq; no caller text, ambient encoding, or embedded NUL crosses that FFI
+boundary.
+
+##### Exact private ABI and formation boundary
+
+Both transfer resources use one canonical v1 byte record; direction is data, not a copied layout:
+
+```text
+size 80, alignment 8
+offset  size  field
+0       4     version = 1
+4       1     direction: CopyIn = 1 | CopyOut = 2
+5       1     phase: Active = 1 | Complete = 2 | Failed = 3
+6       1     overall_format: Text = 0 | Binary = 1
+7       1     flags: bit0 lease_owned, bit1 nonblocking_owned; all other bits zero
+8       8     non-null physical connection-state pointer
+16      8     non-null PGconn pointer while parent is usable, null after physical close
+24      8     absolute deadline ns, -1 when absent
+32      8     original timeout duration ns, -1 when absent
+40      8     non-null static Query-ID pointer
+48      8     positive Query-ID byte length
+56      4     COPY column count, 0..=65_535
+60      4     zero reserved
+64      8     completion row count, zero until Complete
+72      1     completion_present: 0 | 1
+73      7     zero reserved
+```
+
+`deadline_ns` and `timeout_duration_ns` are both `-1` or both positive. `Active` has
+`completion_present = 0`; `Complete` has it set and a nonnegative row count; `Failed` has it clear.
+`Failed` with a non-null PGconn is a terminal, synchronized operation error whose parent remains
+usable after the resource releases its lease; `Failed` with a null PGconn records fail-closed
+physical ownership. No public operation except Drop accepts `Failed`. Drop of synchronized
+`Failed` releases the lease and record without a network call or physical close; Drop of
+fail-closed `Failed` releases only remaining package owners.
+`lease_owned` is set exactly while this record owns the execution lease. `nonblocking_owned` is set
+only when this operation changed the connection from blocking to nonblocking. Every safe public
+entry validates the complete record, direction, phase, deadline pair, flags, reserved bytes,
+parent-state/PGconn agreement, Query-ID view, and completion pair before reading dependent state or
+calling libpq. One internal validator owns all constructors, accessors, operations, and both Drop
+hooks.
+
+`copy_chunk` uses this one v1 record:
+
+```text
+size 24, alignment 8
+offset  size  field
+0       4     version = 1
+4       4     zero reserved
+8       8     non-null PQgetCopyData buffer
+16      8     positive byte length, at most i32::MAX
+```
+
+One validator owns construction, `copy_chunk_bytes`, and Drop. A malformed wrapper frees only an
+independently validated non-null buffer provenance; it never guesses a pointer from corrupt bytes.
+The fake-driver allocation ledger separately tracks the libpq buffer owner and package wrapper so
+every malformed and normal path can prove no double-free or leak.
+
+This rail changes package interfaces and importer keys once but does not change descriptor v6,
+statement v4, rows v4, batch ABI, static artifact bytes, compiler IR, or runtime ABI registry.
+`db.command<P>` construction and existing generated binder/static-validator/count-thunk semantics
+are reused unchanged. Whole-program and per-unit compilation must produce the same resource Drop
+thunks and public interface. No HIR exception or new intrinsic is permitted.
+
+##### Native phase order and protocol state machine
+
+Start validation has one order for both directions:
+
+1. complete descriptor-v6 command header, kind, driver restriction, static Query identity, and
+   parameter-count thunk;
+2. common options in source order;
+3. native options in source order, including ParameterFormat payload validation before duplicate
+   detection and tag-first rejection of ResultFormat/Delivery;
+4. exact PostgreSQL driver target plus complete physical parent state;
+5. allocate and initialize the transfer/context records;
+6. run generated static validation and normalized parameter-plan installation;
+7. acquire the execution lease;
+8. run binder-v2 Measure, exact Parse/Bind budget validation, binder-v2 Encode, and retain all
+   payloads through the send boundary;
+9. with Timeout present, enable nonblocking mode and re-read the clock before send; expiry has zero
+   send/COPY/cancel calls and restores or closes;
+10. send exactly once, flush/wait under the deadline, obtain one initial result, and validate
+    direction before metadata;
+11. validate `PQbinaryTuples`, `PQnfields`, and every `PQfformat` against `expected_format`; then
+    clear the initial result and publish the dependent resource.
+
+No later step runs after an earlier failure. Native state begins before generated static validation
+as settled for direct execution, while parameter measurement remains behind the lease. Every
+pairwise multi-invalid/failpoint owner asserts this exact winner and zero calls/allocations from
+later phases.
+
+The active operation state machine is exact:
+
+```text
+CopyIn Active  -- nonempty write queued/flushed --> CopyIn Active
+CopyIn Active  -- finish + final success/null --> consumed, reusable parent
+CopyIn Active  -- abort + final failure/null --> consumed, reusable parent
+CopyIn Active  -- completed-before-abort --> consumed, reusable parent + Completed
+
+CopyOut Active -- positive PQgetCopyData --> Active + one dependent chunk
+CopyOut Active -- -1 + final success/null --> Complete
+CopyOut Complete -- next --> Complete + None, zero libpq calls
+CopyOut Active -- finish drains rows + final success/null --> consumed, reusable parent
+CopyOut Complete -- finish --> consumed, reusable parent
+CopyOut Active -- abort/cancel + final failure/null --> consumed, reusable parent
+CopyOut Active -- completed-before-abort --> consumed, reusable parent + Completed
+
+Any Active -- operation error + proved synchronization --> Failed + reusable parent after Drop
+Any Active -- malformed/unrecoverable cleanup --> Failed + physically closed parent
+Any Active -- Drop --> physically closed parent
+```
+
+With no timeout, input send, output receive, finish, and abort use libpq's blocking COPY calls.
+With Timeout present, input uses `PQputCopyData`/`PQputCopyEnd` retry plus socket readiness,
+`PQconsumeInput`, and `PQflush`; output uses `PQgetCopyData(..., async = 1)` plus read readiness and
+`PQconsumeInput`. A zero input result or zero output result is progress-pending, never success or
+EOF. The existing cancel connection is the sole CopyOut cancellation owner. Deadline expiry after
+COPY starts preserves `Timeout`, attempts direction-correct abort and synchronization using the
+retained original-duration recovery budget, restores blocking only after the final null result,
+and closes on any failed proof. No path invokes obsolete `PQgetline`, `PQputline`, `PQputnbytes`,
+`PQendcopy`, a pipeline-exit call, or a second SQL command.
+
+After `PQputCopyEnd` succeeds or `PQgetCopyData` returns `-1`, the final sequence is exactly one
+`PGRES_COMMAND_OK` result followed by null. `PQcmdTuples` must be canonical nonempty decimal in
+`0..=i64::MAX`, and `PQcmdStatus` must be the exact ASCII bytes `COPY ` followed by that same
+canonical decimal and one terminating NUL; success returns
+`db.exec_result { rows_affected: Some(count) }`. An ordinary server error is copied before clear and
+drained to null under the original first-error rule. A second non-null result is invalid sequence;
+ordinary statuses are drained without replacing that error, while COPY, pipeline, and unknown
+statuses clear once and immediately close. Blocking restoration and transaction-state validation
+occur only after null and before publication/reuse.
+
+##### Exact error and precedence table
+
+No new `db.Error` variant is added. The malformed descriptor result remains query-less because no
+untrusted identity bytes enter an error. After the complete descriptor guard, every Query-subject
+contract error carries the static command ID in `query_id: Some(id)`.
+
+| Condition | Exact public result |
+|---|---|
+| malformed descriptor/header/count proof | existing query-less `InvalidQuery`, item `db.descriptor.header`, message `invalid static database descriptor` |
+| common timeout invalid/duplicate | existing `db.execute.timeout_ns` error and source-order winner |
+| ParameterFormat name contains U+0000/unknown/duplicate or lacks Binary proof | exact preceding binary-ledger errors |
+| ResultFormat in COPY native options | `Unsupported`, item `postgres.copy.result_format`, message `PostgreSQL COPY format is declared by SQL` |
+| Delivery in COPY native options | `Unsupported`, item `postgres.copy.delivery`, message `PostgreSQL COPY owns its data delivery protocol` |
+| non-PostgreSQL or unusable target | existing `DriverMismatch`/closed-target result before package COPY allocation or libpq |
+| initial ordinary native error | existing PostgreSQL native classification with copied fields |
+| opposite COPY direction | `InvalidQuery`, item `postgres.copy.direction`, message `PostgreSQL COPY direction does not match the operation` plus immediate physical close |
+| `PGRES_COPY_BOTH` | `Unsupported`, item `postgres.copy.direction`, message `PostgreSQL COPY BOTH is not supported` plus immediate physical close |
+| non-COPY success/result status | `InvalidQuery`, item `postgres.copy.direction`, message `PostgreSQL command did not enter COPY mode` |
+| overall/per-column format mismatch | `InvalidQuery`, item `postgres.copy.format`, message `PostgreSQL COPY format does not match the expected format` plus immediate physical close |
+| invalid column count/metadata pointer or code | `Native` with message `PostgreSQL COPY metadata has an invalid representation` plus immediate physical close |
+| malformed transfer/chunk record | `Native` with message `PostgreSQL COPY state has an invalid representation`, no dependent libpq call |
+| CopyIn nonempty length above `i32::MAX` | `Encode`, item `postgres.copy.data`, message `PostgreSQL COPY data exceeds the native chunk length limit`, no libpq call |
+| `PQputCopyData`/`PQputCopyEnd`/`PQgetCopyData` hard failure | copied `Native` error; direction-correct recovery or physical close preserves it |
+| deadline expiry | copied `Timeout`; recovery failure does not replace it |
+| CopyOut `PQgetCopyData == -2` | copied `Native` error before final drain; no chunk construction |
+| final status/extra-result/row-count malformed | `Native` with message `PostgreSQL COPY completion has an invalid representation`; drain or close by status class |
+| explicit abort synchronized with final failure | `Ok(CopyAbort.Aborted)` |
+| abort races with successful completion | `Ok(CopyAbort.Completed(exec_result))` |
+
+For `copy_in_write`, complete state validation precedes length validation; therefore a malformed or
+non-Active record wins over an oversized/empty slice. A valid empty slice returns `Ok(())` before
+deadline/native work. `copy_in_info` accepts only Active. `copy_out_info` accepts Active or Complete,
+and `copy_out_next` on Complete returns `Ok(None)` without a libpq call. For every
+next/info/finish/abort/chunk access, complete record validation always wins. During cleanup, the
+first owned operation error, timeout, malformed-state error, or explicit
+abort intent is never replaced by a later server, restore, transaction-state, or cleanup error;
+cleanup failure changes only parent reusability. Explicit abort is the sole exception described by
+`CopyAbort.Completed`, because successful server completion is the observable race outcome rather
+than a cleanup failure.
+
+A borrowed `copy_in_write` or `copy_out_next` failure cannot consume the caller's resource. It
+therefore performs direction-correct synchronization under the retained recovery budget before
+returning. Proved synchronization stores `Failed` with a non-null PGconn; failed synchronization,
+malformed state, COPY/pipeline/unknown during recovery, or an unproved transaction state stores
+`Failed` with a null PGconn after immediate physical close. Either form rejects later info/data/
+finish/abort calls with the same COPY-state `Native` error and zero libpq calls. Its eventual Drop
+performs only the phase-specific bounded cleanup above, so an operation error cannot leave a live
+subprotocol or trigger hidden network work after returning.
+
+##### FFI, acceptance, and capability boundary
+
+The rail declares and signature-probes exactly the current libpq-17 APIs
+`PQputCopyData(PGconn*, const char*, int) -> int`,
+`PQputCopyEnd(PGconn*, const char*) -> int`,
+`PQgetCopyData(PGconn*, char**, int) -> int`,
+`PQfreemem(void*)`, `PQbinaryTuples(const PGresult*) -> int`, plus the already-owned result,
+format, socket, nonblocking, cancel, transaction-state, and cleanup calls. Signed `int` return and
+length values, the mutable `char**` output slot, and const pointer positions are pinned by the C
+probe. The package keeps the existing whole/per-unit `pq` dependency closure on Linux x86_64,
+Linux ARM64, and macOS. Server 16.4 and client >=17 remain the required live boundary.
+
+| Closure cell | Required discriminating owner |
+|---|---|
+| exported surface and unavailable siblings | exact public declaration golden; compile rejection for common/SQLite/dynamic/prepared COPY and no `CopyOption`/callback |
+| start operation matrix | CopyIn/CopyOut x Conn/Tx x Text/Binary x timeout absent/present x zero/one/multiple/default/Text/Binary Params; exact phase-order failpoint counters |
+| response metadata | direction, COPY BOTH, overall format, every per-column format, `0`/one/max columns, malformed count/code/pointer, initial ordinary/pipeline/unknown status |
+| CopyIn data | empty no-call; one/multiple/`i32::MAX`/rejected-next chunks; queued/retry/hard error; mutation after call; exact bytes and no package allocation/copy |
+| CopyOut data | zero-pending/positive/-1/-2; one/many/large rows; exact zero-copy pointer/length; one-live-chunk exclusion; wrapper/libpq free counts; malformed chunk |
+| finish/final results | active/exhausted finish; exact COPY tag/count; ordinary error; extra result; repeated COPY/pipeline/unknown; restore/state failure; first-error preservation |
+| abort and Drop | direction x Conn/Tx x before/after data x abort/completed race x timeout; explicit synchronized reuse/state effects; active Drop zero network and one physical close |
+| timeout/cancellation | expired before send; blocked put/end/get; recovery success/failure; original-duration budget; cancel/CopyFail call counts and finish-before-drain order |
+| malformed private ABI | every transfer/chunk byte field and deadline/completion combination, wrong direction/phase/flags/reserved bytes, no native call, safe one-owner cleanup |
+| compilation/cache | whole/per-unit interface parity, exact Drop-thunk retention, one importer invalidation, unchanged descriptor/static-artifact/runtime-ABI bytes |
+| live/database and measurement | required PostgreSQL 16.4 CopyIn/CopyOut Text/Binary round trips on connection and transaction, rollback/commit/reuse, `scripts/db-verify-local.sh`, and a non-gating direct-libpq comparison of bytes, calls, allocations, time-to-first-byte, throughput, abort latency, and peak buffered row bytes |
+
+Before implementation, complete one fresh independent adversarial review of this ledger and the
+single capability boundary. The implementation is expected to exceed roughly 1,000 changed
+hand-written lines because start, both live directions, termination, cancellation, Drop, fake
+libpq, C signature probes, and required live owners form one connection-global state machine.
+Splitting a resource producer from either direction or its cleanup consumer would publish an
+unusable or unsound subprotocol and duplicate the lease/deadline proof; the one larger boundary is
+therefore lower risk. Before code review, extract every normative `must`/`exact`/`every`/`before`/
+`reject`/`required` statement in this subsection and point it to one implementation path and one
+mutation-discriminating owner. A finding in one direction, status class, timeout, parent kind, or
+Drop path triggers the complete sibling-state audit.
+
+The implementation references are the official PostgreSQL 17
+[libpq COPY functions](https://www.postgresql.org/docs/17/libpq-copy.html),
+[asynchronous command processing](https://www.postgresql.org/docs/17/libpq-async.html),
+[COPY protocol flow](https://www.postgresql.org/docs/17/protocol-flow.html), and
+[COPY SQL command](https://www.postgresql.org/docs/17/sql-copy.html).
+
 - bounded `next_batch`, batch generations, segmented child buffers, nullable validity bitmaps, and
   direct eligible `soa<Row>` decode with no intermediate AoS — shipped by the first A1 rail;
 - PostgreSQL single-row and portal-batch delivery — specified by the ledger above;
 - PostgreSQL binary parameter/result formats — specified by the ledger above;
 - a separately specified owned-Row/owned-collection materializer only if a measured consumer needs
   `string`/dynamic-array Row storage; it must not weaken the v1 `RegionPlain` path;
-- PostgreSQL COPY/pipeline/LISTEN-NOTIFY;
+- PostgreSQL COPY — specified by the ledger above;
+- PostgreSQL pipeline/LISTEN-NOTIFY;
 - SQLite backup/incremental blob/FTS helpers;
 - explicit pool package;
 - additional drivers only after the common contracts are proven.

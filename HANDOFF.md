@@ -49,8 +49,9 @@ prepared, buffered, single-row, and portal-batch execution. Descriptor v6 owns
 Measure/Encode binder passes and exact Parse/Bind budgets; context, statement, and
 rows v4 own generation-local metadata, effective-OID proof, and allocation-safe
 cleanup. The exact contract and implementation matrix are in
-`docs/impl/pkg-design/db.md` §23; an explicitly specified PostgreSQL COPY rail is
-the following `pkg.db` capability.
+`docs/impl/pkg-design/db.md` §23. That section now also owns the exact public,
+ownership, ABI, protocol, error, and acceptance ledger for the following
+PostgreSQL COPY `pkg.db` capability.
 
 Out-of-gate suite status (suites outside the bounded CI gate; a nightly
 full-suite workflow now runs them daily so this class cannot rot silently):

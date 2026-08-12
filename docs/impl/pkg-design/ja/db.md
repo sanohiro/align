@@ -905,7 +905,8 @@ SearchPathOnlyとIncludeSystemCatalogsはconflict。Buffers/Timing/Walはnative 
 ### 12.3 native feature
 
 初期release後の最初のPostgreSQL-native D13 railはsingle-row/chunked-row deliveryを追加する。
-COPY、pipeline mode、LISTEN/NOTIFYは独立してspecifyする後続D13 railである。
+PostgreSQL COPY railは§23のexact ledgerでspecifiedである。pipeline modeとLISTEN/NOTIFYは
+独立してspecifyする後続D13 railのままである。
 
 PostgreSQL array、UUID、JSONB、enum/domain、range、explicit composite mapping、COPY、
 pipeline/single-row、LISTEN/NOTIFY、LATERAL、DISTINCT ON、custom operator/extension、
@@ -3494,9 +3495,350 @@ adversarial reviewし、findingはledger-firstで閉じる。code review前にsu
 対応させる。resolver sign、format propagation、endian conversion、result metadata order、cleanupの
 findingはcomplete sibling type/operation/delivery auditを要求する。
 
+#### A1 PostgreSQL COPY public-contract ledger
+
+このledgerは次のindependently useful D13 railのsource of truthである。libpq COPYの
+data/termination protocolを公開するが、dynamic SQL、row codec、reflection、hidden worker、callback、
+prepared COPY path、common-driver abstractionは追加しない。SQLはcompiler-produced
+`db.command<P>` descriptorのcompleteな1つのPostgreSQL `COPY ... FROM STDIN`または
+`COPY ... TO STDOUT` statementである。COPY grammarとstream payloadのauthorityはPostgreSQLである。
+Alignはcaller/server supplied byteをexactにtransportし、text、CSV、PostgreSQL binary COPY
+representationをparseしない。
+
+##### Exact public record
+
+このrailは`pkg.db.postgres`へexactly次のdeclarationを追加する:
+
+```align
+pub CopyInfo {
+  format: Format,
+  columns: i64,
+}
+
+pub CopyAbort {
+  Aborted
+  Completed(db.exec_result)
+}
+
+pub resource copy_in = pkg.db.internal.resource.drop_postgres_copy_in
+pub resource copy_out = pkg.db.internal.resource.drop_postgres_copy_out
+pub resource copy_chunk = pkg.db.internal.resource.drop_postgres_copy_chunk
+
+pub fn copy_in<P>(
+  target: db.exec,
+  statement: db.command<P>,
+  params: P,
+  expected_format: Format,
+  options: slice<db.ExecuteOption>,
+  native: slice<postgres.ExecuteOption>,
+) -> Result<copy_in, db.Error>
+
+pub fn copy_in_info(borrow transfer: copy_in) -> Result<CopyInfo, db.Error>
+
+pub fn copy_in_write(
+  borrow mut transfer: copy_in,
+  bytes: slice<u8>,
+) -> Result<(), db.Error>
+
+pub fn copy_in_finish(transfer: copy_in) -> Result<db.exec_result, db.Error>
+
+pub fn copy_in_abort(transfer: copy_in) -> Result<CopyAbort, db.Error>
+
+pub fn copy_out<P>(
+  target: db.exec,
+  statement: db.command<P>,
+  params: P,
+  expected_format: Format,
+  options: slice<db.ExecuteOption>,
+  native: slice<postgres.ExecuteOption>,
+) -> Result<copy_out, db.Error>
+
+pub fn copy_out_info(borrow transfer: copy_out) -> Result<CopyInfo, db.Error>
+
+pub fn copy_out_next(
+  borrow mut transfer: copy_out,
+) -> Result<Option<copy_chunk>, db.Error>
+
+pub fn copy_chunk_bytes(borrow chunk: copy_chunk) -> Result<slice<u8>, db.Error>
+
+pub fn copy_out_finish(transfer: copy_out) -> Result<db.exec_result, db.Error>
+
+pub fn copy_out_abort(transfer: copy_out) -> Result<CopyAbort, db.Error>
+```
+
+`Format.Text`はprotocol overall text format codeを使うPostgreSQL text/CSV COPY streamを表す。
+`Format.Binary`はPostgreSQL binary COPY representationだけを表す。callerはcall siteでexpected
+overall formatを指定し、packageはresourceを返す前に`PQbinaryTuples`とevery `PQfformat` entryを
+比較する。SQL textからformatをinferせず、mismatchをsilent acceptせず、format変換もしない。
+`CopyInfo.columns`はvalidation後のexact nonnegative `PQnfields` valueで、`65_535`以下である。
+
+両start functionはstatic `db.command<P>`だけを受け付ける。`str`、`db.query`、`db.stmt`、common
+`db` COPY wrapperは受け付けない。`copy_in`は最初のsuccessful resultに`PGRES_COPY_IN`を、
+`copy_out`は`PGRES_COPY_OUT`を要求する。opposite direction、`PGRES_COPY_BOTH`、
+`PGRES_COMMAND_OK`、tuple/partial row-mode/pipeline/unknown resultはpublic resourceを作らない。
+ordinary non-COPY statusはclearしnullまでdrainした後にtransaction state/blocking restoreをproveし、
+synchronized pathではparentをreuseできる。serverがunexpected COPY/pipeline subprotocolへ入るかunknown
+statusを返した場合はcurrent resultをonce clearし、`PQfinish`だけでphysical connectionをcloseし、
+parent stateをunusableにし、全local ownerをfreeして下記exact errorを返す。intervening/later
+result/COPY/cancel/transaction-state/blocking-mode/pipeline-exit callは行わない。
+
+`options`はexisting common `TimeoutNs`だけを、そのshipped positivity/duplicate/absolute deadline/
+original-duration recovery/source-order ruleで受け付ける。`native`はpreceding ledgerのdescriptor-v6
+generated ordinal/Binary eligibility proofを使う`ParameterFormat(name, Text|Binary)`だけを受け付ける。
+COPY formatはSQLが宣言しresponseからverifyするため`ResultFormat`をrejectする。COPYはseparate
+libpq subprotocolをownするため`Delivery`をrejectする。`CopyOption` sumはない。`[]`はdefault Text
+parameter binding+timeoutなしで、COPY stream formatを選ばない。
+
+`CopyAbort.Aborted`はdirection-specific terminationがsynchronized final failureへ到達して
+`PQgetResult`がnullを返したことを表す。`Completed(result)`はabortが効く前にserverがCOPYを完了した
+ことを表し、effectを隠さないようexact successful `db.exec_result`を返す。synchronization、native、
+timeout、malformed-state failureは`Err`のままである。
+
+##### Ownership、lifetime、allocation、effect record
+
+`copy_in`/`copy_out`はMove、non-Copy、non-Sendで、`target`のexact `conn`/`tx` generationに
+dependentなresourceである。constructionはexisting PostgreSQL execution leaseをacquireする。
+explicit finish/abortまたはDropによるparent fail-closeまで、sibling Query/command/prepared statement/
+metadata/EXPLAIN/COPY/transaction boundary/cleanup pathはlibpq callを発行できない。compilerのordinary
+`resource.from_raw_borrowed` provenanceがrelationshipをownし、`pkg.db`-specific compiler ruleはない。
+
+successful startはexactly one 80-byte、8-aligned package transfer recordをallocateする。parameter
+format planとexecution-owned parameter payloadはstart functionがreturnする前にreleaseする。libpqは
+parameter call boundaryでconsume済みで、COPY resourceは`Params` ownerをretainしない。descriptorの
+static Query-ID bytesはimmutable descriptor storageからborrowし、copy/freeしない。success constructionは
+error valueをallocateしない。
+
+`copy_in_write`はcall中だけsource sliceをborrowする。nonempty lengthは`1..=i32::MAX`で、exact
+pointer/lengthを`PQputCopyData`へ渡し、package allocation、sentinel append、encoding、payload copyを
+行わない。libpqはdocumented output queueへcopyし得る。empty sliceはCOPY input buffer boundaryに
+意味がないためzero libpq callのexact successful no-opである。
+
+positive `PQgetCopyData` resultごとにactive `copy_out`へdependentなone `copy_chunk`を作る。
+resourceはnon-null libpq allocationとone 24-byte、8-aligned package wrapperをownする。
+`copy_chunk_bytes`はpositive returned length exactのzero-copy `slice<u8>` viewで、trailing libpq NULは
+view外である。chunk Dropは`PQfreemem`とwrapper freeをexactly once行う。dependent chunkまたはviewが
+liveな間は、compilerが別mutable `copy_out` operation、finish、abort、move、Dropをrejectする。
+chunk collection、region copy、hidden heap materializationはない。
+
+`copy_out_finish`はexhaustion前にもcallできる。remaining COPY rowをexpose/decodeせずexplicitにdrain/freeし、
+final-result sequenceをcompleteしてrow countを返す。potentially unbounded transportは`finish` callにvisibleである。
+一方active `copy_in`/`copy_out`のDropはnetwork drain/cancel/CopyFailを行わない。直ちにparent unusable、
+physical close、package allocation/lease releaseを行いsilentである。reuseにはexplicit finish/abortまたは
+CopyOut clean exhaustionのobserveが必要である。`Complete` CopyOutのDropはnetwork work/physical
+closeなしにlease+recordをreleaseする。active Dropだけがbounded fail-safeである。
+
+successful finish後、connection targetは`PQTRANS_IDLE`、transaction targetは`PQTRANS_INTRANS`で同期する。
+`copy_in_abort`はone package-owned fixed CopyFail messageを送る。`copy_out_abort`はshipped libpq-17 cancel
+handleを使い、direction-correct receive pathでCOPY dataをdiscardする。transaction外のsynchronized abortは
+connectionをidleにしてstatement effectをrollbackする。transaction内は`PQTRANS_INERROR`を要求し、explicit
+transactionはnormal rollback/error pathだけに使える。completed-before-abort raceは
+`CopyAbort.Completed`を返しactual effectを保持する。証明できないstateはreuseを返さずclose+poisonする。
+fixed CopyFail byteはASCII text `Align caller aborted PostgreSQL COPY`+libpq専用one NULである。
+caller text、ambient encoding、embedded NULはこのFFI boundaryをcrossしない。
+
+##### Exact private ABIとformation boundary
+
+両transfer resourceはone canonical v1 byte recordを使い、directionはdataでlayoutをcopyしない:
+
+```text
+size 80, alignment 8
+offset  size  field
+0       4     version = 1
+4       1     direction: CopyIn = 1 | CopyOut = 2
+5       1     phase: Active = 1 | Complete = 2 | Failed = 3
+6       1     overall_format: Text = 0 | Binary = 1
+7       1     flags: bit0 lease_owned, bit1 nonblocking_owned; all other bits zero
+8       8     non-null physical connection-state pointer
+16      8     non-null PGconn pointer while parent is usable, null after physical close
+24      8     absolute deadline ns, -1 when absent
+32      8     original timeout duration ns, -1 when absent
+40      8     non-null static Query-ID pointer
+48      8     positive Query-ID byte length
+56      4     COPY column count, 0..=65_535
+60      4     zero reserved
+64      8     completion row count, zero until Complete
+72      1     completion_present: 0 | 1
+73      7     zero reserved
+```
+
+`deadline_ns`/`timeout_duration_ns`はboth `-1`またはboth positiveである。`Active`は
+`completion_present = 0`、`Complete`はset+nonnegative row count、`Failed`はclearである。
+non-null PGconnの`Failed`はterminal synchronized operation errorで、lease release後parentはusableである。
+null PGconnの`Failed`はfail-closed physical ownershipを記録する。Drop以外は`Failed`をacceptしない。
+synchronized `Failed`のDropはnetwork call/physical closeなしにlease+recordをreleaseし、fail-closed
+`Failed`はremaining package ownerだけをreleaseする。
+`lease_owned`はrecordがexecution leaseをownする間exactにsetする。`nonblocking_owned`はoperationが
+blockingからnonblockingへconnectionをchangeした時だけsetする。every safe public entryはdependent state
+read/libpq call前にcomplete record、direction、phase、deadline pair、flags、reserved bytes、parent/PGconn
+agreement、Query-ID view、completion pairをvalidateする。one internal validatorがconstructor/accessor/
+operation/both Drop hookをownする。
+
+`copy_chunk`はone v1 recordを使う:
+
+```text
+size 24, alignment 8
+offset  size  field
+0       4     version = 1
+4       4     zero reserved
+8       8     non-null PQgetCopyData buffer
+16      8     positive byte length, at most i32::MAX
+```
+
+one validatorがconstruction、`copy_chunk_bytes`、Dropをownする。malformed wrapperはindependently
+validated non-null buffer provenanceだけをfreeし、corrupt byteからpointerをguessしない。fake-driver
+allocation ledgerはlibpq buffer owner/package wrapperをseparate trackingしnormal/malformed pathの
+no double-free/no leakを証明する。
+
+このrailはpackage interface/importer keyをonce changeするが、descriptor v6、statement v4、rows v4、
+batch ABI、static artifact byte、compiler IR、runtime ABI registryは変えない。`db.command<P>` constructionと
+generated binder/static-validator/count-thunk semanticsをunchanged reuseする。whole/per-unit compilationは
+same resource Drop thunk/public interfaceを作る。HIR exception/new intrinsicは禁止する。
+
+##### Native phase orderとprotocol state machine
+
+両directionのstart validation orderはone exact orderである:
+
+1. complete descriptor-v6 command header、kind、driver restriction、static Query identity、parameter-count thunk;
+2. common optionをsource orderで;
+3. native optionをsource orderで（ParameterFormat payload validationはduplicate detectionより先、ResultFormat/Deliveryはtag-first reject）;
+4. exact PostgreSQL driver target+complete physical parent state;
+5. transfer/context recordをallocate/initialize;
+6. generated static validation+normalized parameter-plan installation;
+7. execution lease acquire;
+8. binder-v2 Measure、exact Parse/Bind budget validation、binder-v2 Encode、send boundaryまでpayload retain;
+9. Timeoutありならnonblocking enable後send直前にclock reread。expiryはsend/COPY/cancel zeroでrestore-or-close;
+10. once send、deadline内flush/wait、one initial result取得、metadata前にdirection validation;
+11. `PQbinaryTuples`、`PQnfields`、every `PQfformat`を`expected_format`へvalidateし、initial result clear後resource publish。
+
+earlier failure後にlater stepをrunしない。direct executionでsettledのとおりnative stateはgenerated static
+validationより先にbeginし、parameter measurementはlease後である。every pairwise multi-invalid/failpoint
+ownerはexact winnerとlater phaseのzero call/allocationをassertする。
+
+active state machineはexact:
+
+```text
+CopyIn Active  -- nonempty write queued/flushed --> CopyIn Active
+CopyIn Active  -- finish + final success/null --> consumed, reusable parent
+CopyIn Active  -- abort + final failure/null --> consumed, reusable parent
+CopyIn Active  -- completed-before-abort --> consumed, reusable parent + Completed
+
+CopyOut Active -- positive PQgetCopyData --> Active + one dependent chunk
+CopyOut Active -- -1 + final success/null --> Complete
+CopyOut Complete -- next --> Complete + None, zero libpq calls
+CopyOut Active -- finish drains rows + final success/null --> consumed, reusable parent
+CopyOut Complete -- finish --> consumed, reusable parent
+CopyOut Active -- abort/cancel + final failure/null --> consumed, reusable parent
+CopyOut Active -- completed-before-abort --> consumed, reusable parent + Completed
+
+Any Active -- operation error + proved synchronization --> Failed + reusable parent after Drop
+Any Active -- malformed/unrecoverable cleanup --> Failed + physically closed parent
+Any Active -- Drop --> physically closed parent
+```
+
+timeoutなしではinput send/output receive/finish/abortにblocking COPY callを使う。Timeoutありではinputは
+`PQputCopyData`/`PQputCopyEnd` retry+socket readiness+`PQconsumeInput`+`PQflush`、outputは
+`PQgetCopyData(..., async = 1)`+read readiness+`PQconsumeInput`を使う。zero input/output resultは
+progress-pendingでsuccess/EOFではない。existing cancel connectionだけがCopyOut cancellation ownerである。
+COPY開始後のdeadline expiryは`Timeout`を保持し、retained original-duration recovery budgetでdirection-correct
+abort+synchronizationを試み、final null後だけblocking restoreし、proof failureはcloseする。obsolete
+`PQgetline`/`PQputline`/`PQputnbytes`/`PQendcopy`、pipeline exit、second SQLはcallしない。
+
+`PQputCopyEnd` successまたは`PQgetCopyData == -1`後、final sequenceはexactly one
+`PGRES_COMMAND_OK`+nullである。`PQcmdTuples`はcanonical nonempty decimal `0..=i64::MAX`、
+`PQcmdStatus`はexact ASCII `COPY `+same canonical decimal+one terminating NULで、successは
+`db.exec_result { rows_affected: Some(count) }`を返す。ordinary server errorは
+clear前にcopyしoriginal first-error ruleでnullまでdrainする。second non-null resultはinvalid sequence。
+ordinary statusはerrorをreplaceせずdrainし、COPY/pipeline/unknownはonce clear+immediate closeする。
+blocking restore/transaction-state validationはnull後、publication/reuse前だけである。
+
+##### Exact errorとprecedence table
+
+new `db.Error` variantはない。malformed descriptor resultはuntrusted identity byteをerrorへ入れないため
+query-lessのままである。complete descriptor guard後、Query-subject contract errorはstatic command IDを
+`query_id: Some(id)`に持つ。
+
+| Condition | Exact public result |
+|---|---|
+| malformed descriptor/header/count proof | existing query-less `InvalidQuery`, item `db.descriptor.header`, message `invalid static database descriptor` |
+| common timeout invalid/duplicate | existing `db.execute.timeout_ns` error+source-order winner |
+| ParameterFormat name U+0000/unknown/duplicate/Binary proof missing | preceding binary-ledger exact error |
+| ResultFormat in COPY native options | `Unsupported`, item `postgres.copy.result_format`, message `PostgreSQL COPY format is declared by SQL` |
+| Delivery in COPY native options | `Unsupported`, item `postgres.copy.delivery`, message `PostgreSQL COPY owns its data delivery protocol` |
+| non-PostgreSQL/unusable target | existing `DriverMismatch`/closed-target result、package COPY allocation/libpq前 |
+| initial ordinary native error | existing PostgreSQL native classification+copied fields |
+| opposite COPY direction | `InvalidQuery`, item `postgres.copy.direction`, message `PostgreSQL COPY direction does not match the operation`+immediate physical close |
+| `PGRES_COPY_BOTH` | `Unsupported`, item `postgres.copy.direction`, message `PostgreSQL COPY BOTH is not supported`+immediate physical close |
+| non-COPY success/result status | `InvalidQuery`, item `postgres.copy.direction`, message `PostgreSQL command did not enter COPY mode` |
+| overall/per-column format mismatch | `InvalidQuery`, item `postgres.copy.format`, message `PostgreSQL COPY format does not match the expected format`+immediate physical close |
+| invalid column count/metadata pointer/code | `Native`, message `PostgreSQL COPY metadata has an invalid representation`+immediate physical close |
+| malformed transfer/chunk record | `Native`, message `PostgreSQL COPY state has an invalid representation`, dependent libpq callなし |
+| CopyIn nonempty length > `i32::MAX` | `Encode`, item `postgres.copy.data`, message `PostgreSQL COPY data exceeds the native chunk length limit`, libpq callなし |
+| `PQputCopyData`/`PQputCopyEnd`/`PQgetCopyData` hard failure | copied `Native`; direction-correct recovery/physical closeは保持 |
+| deadline expiry | copied `Timeout`; recovery failureはreplaceしない |
+| CopyOut `PQgetCopyData == -2` | final drain前にcopied `Native`; chunk constructionなし |
+| malformed final status/extra result/row count | `Native`, message `PostgreSQL COPY completion has an invalid representation`; status classでdrain-or-close |
+| explicit abort synchronized with final failure | `Ok(CopyAbort.Aborted)` |
+| abort races with successful completion | `Ok(CopyAbort.Completed(exec_result))` |
+
+`copy_in_write`はcomplete state validationをlength validationより先に行い、malformed/non-Active recordが
+oversized/empty sliceより勝つ。valid empty sliceはdeadline/native work前に`Ok(())`。
+`copy_in_info`はActiveだけをacceptする。`copy_out_info`はActive/Complete、Completeでの
+`copy_out_next`はlibpqなしに`Ok(None)`を返す。every next/info/finish/abort/chunk accessはcomplete
+record validationが常に勝つ。cleanup中first owned operation error、timeout、
+malformed-state error、explicit abort intentはlater server/restore/transaction-state/cleanup errorにreplaceされず、
+cleanup failureはparent reusabilityだけを変える。sole exceptionはsuccessful server completionというobservable
+race outcomeを表す`CopyAbort.Completed`である。
+
+borrowed `copy_in_write`/`copy_out_next` failureはcaller resourceをconsumeできない。そのためreturn前に
+retained recovery budgetでdirection-correct synchronizationを行う。proved synchronizationはnon-null PGconnの
+`Failed`、failed synchronization/malformed state/recovery中COPY-pipeline-unknown/unproved transaction stateは
+immediate physical close後null PGconnの`Failed`をstoreする。either formのlater info/data/finish/abortはsame
+COPY-state `Native` error+zero libpq call。eventual Dropは上記phase-specific bounded cleanupだけを行い、
+operation error後にlive subprotocolまたはhidden post-return network workを残さない。
+
+##### FFI、acceptance、capability boundary
+
+このrailはcurrent libpq-17 API
+`PQputCopyData(PGconn*, const char*, int) -> int`、
+`PQputCopyEnd(PGconn*, const char*) -> int`、
+`PQgetCopyData(PGconn*, char**, int) -> int`、
+`PQfreemem(void*)`、`PQbinaryTuples(const PGresult*) -> int`とexisting result/format/socket/nonblocking/
+cancel/transaction-state/cleanup callをexact declare+signature-probeする。signed `int` return/length、mutable
+`char**` output slot、const pointer positionをC probeでpinする。existing whole/per-unit `pq` dependency closureを
+Linux x86_64/ARM64/macOSで保持する。server 16.4/client >=17がrequired live boundaryのままである。
+
+| Closure cell | Required discriminating owner |
+|---|---|
+| exported surface/unavailable siblings | exact public declaration golden; common/SQLite/dynamic/prepared COPYと`CopyOption`/callbackのcompile rejection |
+| start operation matrix | CopyIn/CopyOut x Conn/Tx x Text/Binary x timeout absent/present x zero/one/multiple/default/Text/Binary Params; exact phase-order failpoint counter |
+| response metadata | direction、COPY BOTH、overall/every-column format、`0`/one/max columns、malformed count/code/pointer、initial ordinary/pipeline/unknown status |
+| CopyIn data | empty no-call; one/multiple/`i32::MAX`/rejected-next chunk; queued/retry/hard error; post-call mutation; exact bytes/no package allocation-copy |
+| CopyOut data | zero-pending/positive/-1/-2; one/many/large row; exact zero-copy pointer/length; one-live-chunk exclusion; wrapper/libpq free count; malformed chunk |
+| finish/final results | active/exhausted finish; exact COPY tag/count; ordinary error; extra result; repeated COPY/pipeline/unknown; restore/state failure; first-error preservation |
+| abort/Drop | direction x Conn/Tx x before/after data x abort/completed race x timeout; explicit synchronized reuse/state effect; active Drop zero network+one physical close |
+| timeout/cancellation | pre-send expiry; blocked put/end/get; recovery success/failure; original-duration budget; cancel/CopyFail count+finish-before-drain order |
+| malformed private ABI | every transfer/chunk byte field+deadline/completion product、wrong direction/phase/flags/reserved、no native call、safe one-owner cleanup |
+| compilation/cache | whole/per-unit interface parity、exact Drop-thunk retention、one importer invalidation、unchanged descriptor/static-artifact/runtime-ABI bytes |
+| live/database/measurement | required PostgreSQL 16.4 CopyIn/CopyOut Text/Binary round trip on Conn/Tx、rollback/commit/reuse、`scripts/db-verify-local.sh`、non-gating direct-libpq bytes/calls/allocations/time-to-first-byte/throughput/abort latency/peak buffered row bytes |
+
+implementation前にこのledger+single capability boundaryをone fresh independent adversarial reviewする。
+start、both live direction、termination、cancellation、Drop、fake libpq、C signature probe、required live ownerが
+one connection-global state machineを作るため、implementationはroughly 1,000 hand-written changed linesを
+超える見込みである。resource producerをdirection/cleanup consumerからsplitするとunusable/unsound
+subprotocolをpublishしlease/deadline proofをduplicateするため、one larger boundaryの方がlow riskである。
+code review前にsubsectionの全normative `must`/`exact`/`every`/`before`/`reject`/`required`をone
+implementation path+mutation-discriminating ownerへ対応させる。one direction/status class/timeout/parent kind/
+Drop pathのfindingはcomplete sibling-state auditを要求する。
+
+implementation referenceはofficial PostgreSQL 17
+[libpq COPY functions](https://www.postgresql.org/docs/17/libpq-copy.html)、
+[asynchronous command processing](https://www.postgresql.org/docs/17/libpq-async.html)、
+[COPY protocol flow](https://www.postgresql.org/docs/17/protocol-flow.html)、
+[COPY SQL command](https://www.postgresql.org/docs/17/sql-copy.html)である。
+
 bounded batch generation、segmented child/validity bitmap、eligible direct SoAはfirst A1でshipped。
 PostgreSQL single-row/portal-batchとbinary formatは上記ledgerでspecified。
-COPY/pipeline/LISTEN-NOTIFY、SQLite backup/blob/FTS、
+PostgreSQL COPYは上記ledgerでspecified。PostgreSQL pipeline/LISTEN-NOTIFY、SQLite backup/blob/FTS、
 explicit pool、common contract実証後の追加driver。
 
 ### D14 — dynamic SQLとnative callback
