@@ -65,7 +65,7 @@ const MANIFEST_FORMAT_VERSION: u32 = 3;
 
 /// The stderr note emitted (always on, per doc-10 §6.4 fail-closed matrix) when a cache blob fails its
 /// digest check and is discarded before a rebuild.
-const CORRUPT_NOTE: &str = "alignc: cache entry corrupt; rebuilding";
+pub(crate) const CORRUPT_NOTE: &str = "alignc: cache entry corrupt; rebuilding";
 
 /// A read cap for untrusted length-prefixed sequences: pre-allocate at most this many elements up
 /// front (mirrors `align_interface::codec`'s `n.min(1024)` guard), so a garbage/huge length cannot
@@ -199,6 +199,7 @@ impl CodegenKey {
 /// elapsed time. `NoPriorEntry` = no slot pointer existed to diff against; `CorruptEntry` = a stored
 /// blob failed its digest check (a rebuild-triggering corruption, not a component diff).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum FirstDiff {
     NoPriorEntry,
     CacheFormatVersion,
@@ -211,6 +212,11 @@ pub enum FirstDiff {
     /// The unit's own `impl_hash` (MIR fingerprint) changed — a private body edit.
     MirDigest,
     DepInterfaceHashes,
+    /// (Unit-frontend stage) the unit's own source bytes changed.
+    UnitSource,
+    /// (Unit-frontend stage) a process-global `ALIGN_*` compiler toggle changed. Distinct from
+    /// `Profile`: a toggle changes what the FRONTEND lowers, not how the backend optimizes.
+    EnvToggle,
     Exports,
     Profile,
     RtLto,
@@ -242,6 +248,8 @@ impl FirstDiff {
             FirstDiff::RelocCodeModel => "reloc/code model",
             FirstDiff::MirDigest => "implementation changed",
             FirstDiff::DepInterfaceHashes => "dependency interface changed",
+            FirstDiff::UnitSource => "unit source changed",
+            FirstDiff::EnvToggle => "compiler toggle",
             FirstDiff::Exports => "export set",
             FirstDiff::Profile => "profile",
             FirstDiff::RtLto => "rt-lto mode",
@@ -310,7 +318,12 @@ fn first_diff(stored: &CodegenKey, current: &CodegenKey) -> FirstDiff {
 /// `--thin-lto` build caches two phases per unit — the summary-bearing `ThinLtoPrelink` bitcode and
 /// the final `ThinLtoBackend` object (the serial thin-link between them is never cached).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum CacheStage {
+    /// The per-unit FRONTEND entry (`unit_cache`): the interface summary, replayable diagnostics,
+    /// and link libraries a unit's sema + lowering produced. Cross-process reuse of this stage is
+    /// what lets a build skip checking a unit entirely.
+    UnitFrontend,
     Codegen,
     ThinLtoPrelink,
     ThinLtoBackend,
@@ -321,6 +334,7 @@ impl CacheStage {
     /// format `<unit> hit` is unchanged); the ThinLTO phases print their name.
     pub fn label(self) -> &'static str {
         match self {
+            CacheStage::UnitFrontend => "frontend",
             CacheStage::Codegen => "",
             CacheStage::ThinLtoPrelink => "prelink",
             CacheStage::ThinLtoBackend => "backend",
@@ -438,6 +452,16 @@ impl CacheContext {
         match std::env::var("ALIGNC_CACHE") {
             Ok(v) if !v.is_empty() && v != "off" && v != "on" => Some(PathBuf::from(v)),
             _ => default_cache_root(),
+        }
+    }
+
+    /// The resolved cache root, or `None` when the cache is off. The unit-frontend namespace
+    /// (`unit_cache`) shares this one root and this one enable switch, so there is no second
+    /// environment variable and no second identity gate to keep in step.
+    pub(crate) fn root(&self) -> Option<&Path> {
+        match self {
+            CacheContext::Disabled => None,
+            CacheContext::Enabled { root } => Some(root),
         }
     }
 
@@ -792,7 +816,7 @@ fn staging_sibling(final_path: &Path) -> PathBuf {
 /// Publish `bytes` at `final_path` by staged write + same-directory atomic rename. A concurrent
 /// producer of the same key writes byte-identical content; last-writer-wins is harmless. Creating the
 /// parent directories is idempotent.
-fn publish_file(final_path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn publish_file(final_path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = final_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("cannot create cache dir {}: {e}", parent.display()))?;
     }
@@ -826,27 +850,27 @@ fn publish_blob(root: &Path, digest: Hash128, bytes: &[u8]) -> Result<(), String
 
 // ---- manifest codec (hand-rolled, versioned, length-prefixed, fail-closed) ----------------------
 
-struct Writer {
-    buf: Vec<u8>,
+pub(crate) struct Writer {
+    pub(crate) buf: Vec<u8>,
 }
 
 impl Writer {
-    fn new() -> Writer {
+    pub(crate) fn new() -> Writer {
         Writer { buf: Vec::new() }
     }
-    fn u8(&mut self, v: u8) {
+    pub(crate) fn u8(&mut self, v: u8) {
         self.buf.push(v);
     }
-    fn bool(&mut self, v: bool) {
+    pub(crate) fn bool(&mut self, v: bool) {
         self.u8(v as u8);
     }
-    fn u32(&mut self, v: u32) {
+    pub(crate) fn u32(&mut self, v: u32) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
-    fn u64(&mut self, v: u64) {
+    pub(crate) fn u64(&mut self, v: u64) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
-    fn h128(&mut self, h: Hash128) {
+    pub(crate) fn h128(&mut self, h: Hash128) {
         self.u64(h.lo);
         self.u64(h.hi);
     }
@@ -872,18 +896,18 @@ impl Writer {
             }
         }
     }
-    fn bytes(&mut self, b: &[u8]) {
+    pub(crate) fn bytes(&mut self, b: &[u8]) {
         self.u32(u32_len(b.len()));
         self.buf.extend_from_slice(b);
     }
-    fn str(&mut self, s: &str) {
+    pub(crate) fn str(&mut self, s: &str) {
         self.bytes(s.as_bytes());
     }
 }
 
 /// Narrow a length to the `u32` prefix width, or panic loudly. Producer-side, compiler-internal data
 /// (never untrusted input) — matching `align_interface::codec::u32_len`; the reader stays Err-based.
-fn u32_len(n: usize) -> u32 {
+pub(crate) fn u32_len(n: usize) -> u32 {
     u32::try_from(n).unwrap_or_else(|_| panic!("cache manifest field exceeds u32::MAX bytes — the format uses u32 length prefixes"))
 }
 
@@ -936,15 +960,19 @@ pub enum CacheDecodeError {
     BadTag { what: &'static str, tag: u8 },
     BadUtf8,
     TrailingBytes,
+    /// The bytes decoded structurally but a decoded value is out of range for the artifact it
+    /// describes — a diagnostic span past end-of-source, or a value-region digest mismatch. Past
+    /// the key comparison this means damage, not version skew, so the entry is unlinked.
+    SemanticRange,
 }
 
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     buf: &'a [u8],
-    pos: usize,
+    pub(crate) pos: usize,
 }
 
 impl<'a> Reader<'a> {
-    fn new(buf: &'a [u8]) -> Reader<'a> {
+    pub(crate) fn new(buf: &'a [u8]) -> Reader<'a> {
         Reader { buf, pos: 0 }
     }
     fn take(&mut self, n: usize) -> Result<&'a [u8], CacheDecodeError> {
@@ -953,23 +981,23 @@ impl<'a> Reader<'a> {
         self.pos = end;
         Ok(s)
     }
-    fn u8(&mut self) -> Result<u8, CacheDecodeError> {
+    pub(crate) fn u8(&mut self) -> Result<u8, CacheDecodeError> {
         Ok(self.take(1)?[0])
     }
-    fn bool(&mut self) -> Result<bool, CacheDecodeError> {
+    pub(crate) fn bool(&mut self) -> Result<bool, CacheDecodeError> {
         match self.u8()? {
             0 => Ok(false),
             1 => Ok(true),
             tag => Err(CacheDecodeError::BadTag { what: "bool", tag }),
         }
     }
-    fn u32(&mut self) -> Result<u32, CacheDecodeError> {
+    pub(crate) fn u32(&mut self) -> Result<u32, CacheDecodeError> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
-    fn u64(&mut self) -> Result<u64, CacheDecodeError> {
+    pub(crate) fn u64(&mut self) -> Result<u64, CacheDecodeError> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
-    fn h128(&mut self) -> Result<Hash128, CacheDecodeError> {
+    pub(crate) fn h128(&mut self) -> Result<Hash128, CacheDecodeError> {
         Ok(Hash128 { lo: self.u64()?, hi: self.u64()? })
     }
     fn opt_h128(&mut self) -> Result<Option<Hash128>, CacheDecodeError> {
@@ -990,17 +1018,17 @@ impl<'a> Reader<'a> {
     }
     /// A length prefix, then that many bytes — bounds-checked (the `take` validates the count against
     /// the real buffer, so a huge length simply fails `Truncated`, never pre-allocates).
-    fn bytes(&mut self) -> Result<Vec<u8>, CacheDecodeError> {
+    pub(crate) fn bytes(&mut self) -> Result<Vec<u8>, CacheDecodeError> {
         let n = self.u32()? as usize;
         Ok(self.take(n)?.to_vec())
     }
-    fn str(&mut self) -> Result<String, CacheDecodeError> {
+    pub(crate) fn str(&mut self) -> Result<String, CacheDecodeError> {
         let bytes = self.bytes()?;
         String::from_utf8(bytes).map_err(|_| CacheDecodeError::BadUtf8)
     }
     /// A length prefix, then `f` that many times. Pre-allocates at most [`SEQ_PREALLOC_CAP`] to bound a
     /// garbage-length allocation; the real elements still have to be present to grow further.
-    fn seq<T>(&mut self, mut f: impl FnMut(&mut Reader<'a>) -> Result<T, CacheDecodeError>) -> Result<Vec<T>, CacheDecodeError> {
+    pub(crate) fn seq<T>(&mut self, mut f: impl FnMut(&mut Reader<'a>) -> Result<T, CacheDecodeError>) -> Result<Vec<T>, CacheDecodeError> {
         let n = self.u32()? as usize;
         let mut out = Vec::with_capacity(n.min(SEQ_PREALLOC_CAP));
         for _ in 0..n {
@@ -1008,7 +1036,7 @@ impl<'a> Reader<'a> {
         }
         Ok(out)
     }
-    fn finish(self) -> Result<(), CacheDecodeError> {
+    pub(crate) fn finish(self) -> Result<(), CacheDecodeError> {
         if self.pos == self.buf.len() {
             Ok(())
         } else {

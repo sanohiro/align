@@ -115,7 +115,9 @@ consult it for *how* a milestone was built, not as the newest feature-status lis
 also closed.** M11–M13, the LLVM 19→22 checkpoint, M14's LTO ceiling/runtime-bitcode slices,
 and M15 separate compilation (unit interfaces,
 per-unit codegen/link, default-on incremental object cache, parallel codegen, and the SV
-verification bundle) are complete. Cached/parallel cross-unit ThinLTO and instrumented PGO through
+verification bundle) are complete. The object cache has since been joined by a persistent per-unit
+**frontend** cache, closing the last stage every process recomputed
+(`docs/impl/10-cache-first-optimization.md` §6.7). Cached/parallel cross-unit ThinLTO and instrumented PGO through
 their verification/payoff gates are also complete. The workspace is 2272 total (2254 passed + 18
 ignored) and clippy-clean in the recorded feature states. The `http_server_no_fd_leak_across_cycles` timing flake is hardened as
 #457, qualified cross-module function values shipped as #458, wrapper-hidden local-slice returns

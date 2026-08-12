@@ -1529,6 +1529,13 @@ Operational rules:
   unobservable, and it cut the `pkg.db` owner suites' compile CPU 2.3x. A test
   that must observe a genuinely cold in-process compile calls
   `align_driver::memo::set_enabled(false)` / `memo::clear()`.
+- `alignc build`/`run`/`size` additionally reuse per-unit FRONTEND results across
+  processes (`docs/impl/10-cache-first-optimization.md` §6.7): an unchanged unit
+  skips sema and lowering entirely, keyed on its source plus its dependencies'
+  interface hashes and import closures, in the same `ALIGNC_CACHE` root. A hit
+  carries no MIR, so a unit whose object also misses is rehydrated and verified
+  against its entry. Descriptor-owning units, located walks, and `--thin-lto`
+  are excluded; `ALIGNC_CACHE=off` disables it with everything else.
 - Network, TLS, filesystem, and fd tests may need an unrestricted local
   environment rather than a sandbox.
 
