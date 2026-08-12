@@ -99,6 +99,10 @@ fn move_scope(flag: bool) -> Result<string, string> {
   v := { move_res(flag) }?
   return Ok(v)
 }
+fn move_task_group(flag: bool) -> Result<string, string> {
+  v := task_group { move_res(flag) }?
+  return Ok(v)
+}
 fn nested_res(flag: bool) -> Result<Result<string, i64>, i64> {
   if flag { return Ok(Ok("nest".clone())) }
   return Err(3)
@@ -154,12 +158,14 @@ fn code_or(r: Result<i64, i64>) -> i64 = match r { Ok(v) => v Err(e) => e }
 
 fn main() -> i32 {
   ok := text_or(dyn_call(true)) + len_or(join(true)) + text_or(move_local(true))
-    + len_or(wrapper()) + text_or(move_scope(true)) + len_or(nested_try(true))
+    + len_or(wrapper()) + text_or(move_scope(true)) + text_or(move_task_group(true))
+    + len_or(nested_try(true))
     + len_or(copy_call(true)) + len_or(copy_local(true))
     + len_or(copy_block(true)) + len_or(copy_unsafe(true)) + len_or(copy_arena(true))
     + len_or(copy_named_arena(true)) + len_or(copy_task_group(true)) + code_or(copy_abi(true))
   failed := text_or(dyn_call(false)) + len_or(join(false)) + text_or(move_local(false))
-    + text_or(move_scope(false)) + len_or(nested_try(false))
+    + text_or(move_scope(false)) + text_or(move_task_group(false))
+    + len_or(nested_try(false))
     + len_or(copy_call(false)) + len_or(copy_local(false))
     + len_or(copy_block(false)) + len_or(copy_unsafe(false)) + len_or(copy_arena(false))
     + len_or(copy_named_arena(false)) + len_or(copy_task_group(false)) + code_or(copy_abi(false))
@@ -184,6 +190,16 @@ fn function<'a>(mir: &'a str, name: &str) -> &'a str {
     let body = &mir[start..];
     let end = body.find("\n}").map_or(body.len(), |i| i + 2);
     &body[..end]
+}
+
+/// Whether `bit` names an SSA value this body *defines* as a runtime ownership bit: the cleanup
+/// result of a `DynamicBit` call (`… -> %n`) or a load of a drop-flag slot (`%n = load _m`). This
+/// is what makes the Move rows a correspondence rather than a spelling check — the forwarded bit
+/// has to be the one the operand's own ownership source produced, not any SSA value in scope.
+fn defines_runtime_bit(body: &str, bit: &str) -> bool {
+    body.lines().map(str::trim).any(|line| {
+        line.ends_with(&format!("-> {bit}")) || line.starts_with(&format!("{bit} = load _"))
+    })
 }
 
 /// The cleanup bit spelled on each of a function's return edges, in block order. A `?` puts its
@@ -228,20 +244,43 @@ fn try_err_edges_forward_a_cleanup_bit_for_every_operand_provenance() {
         );
     }
     // A runtime bit (a `DynamicBit` call, a control-flow join, a bound local's flag, a scope's or
-    // a nested `?`'s recursion into one of those) is forwarded as the SSA value it is.
-    for name in ["dyn_call", "join", "move_local", "move_scope", "nested_try"] {
+    // a nested `?`'s recursion into one of those) is forwarded as the very SSA value its own
+    // ownership source defined.
+    for name in [
+        "dyn_call",
+        "join",
+        "move_local",
+        "move_scope",
+        "move_task_group",
+        "nested_try",
+    ] {
         let body = function(&mir, name);
         let bits = cleanup_bits(body);
-        assert!(
-            !bits.is_empty() && bits.iter().all(|bit| bit.starts_with('%')),
-            "every return edge of {name} must forward the operand's own ownership bit:\n{body}"
-        );
+        assert!(!bits.is_empty(), "{name} must return through the cleanup ABI:\n{body}");
+        for bit in bits {
+            assert!(
+                defines_runtime_bit(body, bit),
+                "the {name} return edge must forward a bit its own ownership source defined, \
+                 got {bit}:\n{body}"
+            );
+        }
     }
     assert_eq!(
         cleanup_bits(function(&mir, "wrapper")).first().copied(),
         Some("true"),
         "a wrapper literal's Err edge must forward sema's static provenance"
     );
+    // The sibling return edges (`tail` / `Stmt::Return`) share `terminate_return`, so they carry a
+    // bit structurally here too: these three probes return only wrapper literals, whose bit is
+    // sema's static provenance.
+    for name in ["move_res", "mixed_res", "nested_res"] {
+        let body = function(&mir, name);
+        assert_eq!(
+            cleanup_bits(body),
+            vec!["true", "true"],
+            "every tail/return edge of {name} must carry its static provenance bit:\n{body}"
+        );
+    }
     let copy_abi = function(&mir, "copy_abi");
     assert!(
         !copy_abi.contains("return_with_cleanup"),
@@ -250,7 +289,7 @@ fn try_err_edges_forward_a_cleanup_bit_for_every_operand_provenance() {
     if backend_available() {
         assert_eq!(
             build_and_run("try-err-edge-provenance", TRY_ERR_EDGE_SOURCE).status.code(),
-            Some(108),
+            Some(114),
         );
     }
 }

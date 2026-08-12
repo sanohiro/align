@@ -265,17 +265,25 @@ drop flag to the unwrapped value only `if let Some(flag)`. For the `Err` edge th
 merely conservative but exact: sema requires the operand's error type to *equal* the function's
 (`03`; there is no `From` conversion, so `?` re-wraps the very payload it extracted, allocating
 nothing), the propagated `Err(err)` therefore owns something only if the operand did, and an
-operand whose type is not recursively Move cannot own anything. A
-`debug_assert` in `lower_try` states that invariant (`needs_drop_flag(operand)` implies a bit), and
-every test binary is a debug build, so the whole owner suite carries it.
+operand whose type is not recursively Move cannot own anything.
 
 `terminate_return` is now the **single authority** over the three return edges — the `?` `Err`
 edge, the function-body fall-through tail, and `Stmt::Return` — which previously repeated the same
-ABI match, and the same `(DynamicBit, None) => Term::Unreachable` arm, three times. Its only
-remaining `Unreachable` is a valueless return from a `DynamicBit` function: that ABI is chosen
-exactly when the return type is recursively Move, so it is never `Unit`, and a valueless edge is
-malformed HIR the driver never lowers (the backend rejects it too — "dynamic-cleanup function
-returned no value or cleanup bit"). Failing closed there is a diagnosis, not a miscompile.
+ABI match, and the same `(DynamicBit, None) => Term::Unreachable` arm, three times. It emits **no
+`Unreachable` at all**. A valueless return from a `DynamicBit` function is malformed HIR (that ABI
+is chosen exactly when the return type is recursively Move, so it is never `Unit`), and it lowers
+to the plain void return, which codegen rejects by name — "dynamic-cleanup function returned no
+value or cleanup bit". That **diagnoses** the malformed input; an `Unreachable` would have turned
+the same input into a silent runtime trap, weakening the failure mode in the one place the old
+code still had it.
+
+The helper also carries the provenance half of the rule, for every edge rather than only the one
+where it was first noticed. Each caller names the type whose ownership the bit describes — the
+returned value's own type at an ordinary return, the `?` operand's type on a propagation edge —
+and a `debug_assert` requires an owned source to supply a bit. A firing assert marks exactly the
+shape the pre-fix compiler dead-ended in `Term::Unreachable`, so it can only report a program that
+already trapped; every test binary is a debug build, so the whole owner suite carries the check
+while release lowering keeps the defined `false` bit.
 
 **Closure matrix (return-cleanup ABI × return edge × cleanup-bit provenance × Err reachability).**
 `ReturnCleanupAbi` has exactly two variants (`None`, `DynamicBit`), and `None` returns
@@ -293,6 +301,7 @@ allocation provenance, and no source at all. `if` and `match` reach the join thr
 | `?` `Err` | bound Move-`Result` local's flag | `move_local` | `…, %bit` | unchanged |
 | `?` `Err` | wrapper literal → sema static provenance | `wrapper` | `…, true` | unchanged |
 | `?` `Err` | scope tail recursion over an owned operand | `move_scope` | `…, %bit` | unchanged |
+| `?` `Err` | `task_group` tail recursion over an owned operand | `move_task_group` | `…, %bit` | unchanged |
 | `?` `Err` | `Try` recursion (a nested `??`) | `nested_try` | `…, %bit` | unchanged |
 | `?` `Err` | **none** — Copy operand, direct call | `copy_call` | `unreachable` | `…, false` |
 | `?` `Err` | **none** — Copy operand, bound local | `copy_local` | `unreachable` | `…, false` |
@@ -308,12 +317,21 @@ allocation provenance, and no source at all. `if` and `match` reach the join thr
 (`…` abbreviates `return_with_cleanup v`.) The five borrow-transparent scope kinds each get their
 own missing-bit cell rather than one representative, because they reach the bit through
 `moved_drop_flag`'s recursion and `task_group` is deliberately not that recursion in
-`temporary_drop_flag` — a difference this matrix must be able to see.
+`temporary_drop_flag` — a difference this matrix must be able to see, on the owned side
+(`move_task_group`) as well as the missing-bit side.
 
-No valid program reaches the sibling sites' missing-bit cell: a returned expression's type *is* the
-`DynamicBit` return type, so it is recursively Move and every shape that can produce it carries a
-bit (moving out of a `Move` array element or a borrowed place is rejected earlier). The row exists
-because the arm existed, and the shared helper closes it structurally rather than by argument.
+The `%bit` rows are checked as a **correspondence, not a spelling**: the forwarded SSA value must
+be one this function defines as an ownership bit — a `DynamicBit` call's cleanup result (`-> %n`)
+or a load of a drop-flag slot — so forwarding some other in-scope value fails the owner.
+
+No valid program reaches the sibling sites' missing-bit cell, which is why it has no probe: a
+returned expression's type *is* the `DynamicBit` return type, so it is recursively Move and every
+shape that can produce it carries a bit (moving out of a `Move` array element or a borrowed place
+is rejected earlier). The row exists because the arm existed; the shared helper gives it the same
+`false` bit as its `?` sibling, and the shared `debug_assert` is what reports it if a future
+provenance gap ever reaches it. The rows above it are not execution-only: `move_res`, `mixed_res`,
+and `nested_res` return through the tail and `Stmt::Return` edges in the same fixture, and the
+owner asserts their static-provenance bits structurally.
 
 The `Err`-reachability axis is per cell and needs an execution witness, not a structural one: an
 `Err` edge that is never taken produces the same exit code on both compilers, and the pre-fix

@@ -3161,19 +3161,44 @@ impl Builder {
     ///
     /// `cleanup` is that bit when the lowering knows one. `None` means it knows of no individually
     /// owned payload, which is a **`false` bit, never a dead end**: an `Unreachable` here compiles
-    /// a real, reachable edge into a runtime trap (`05 §3`). Callers that can prove the operand
-    /// carries an owner assert that separately; this helper defines the ABI, not the provenance.
-    fn terminate_return(&mut self, value: Option<Operand>, cleanup: Option<Operand>) {
+    /// a real, reachable edge into a runtime trap (`05 §3`).
+    ///
+    /// `bit_source_ty` is the type whose ownership that bit describes — the returned value's own
+    /// type at an ordinary return, and the `?` operand's type on a propagation edge, because the
+    /// propagated `Err` re-wraps the payload it extracted from that operand. It holds the
+    /// provenance half of the rule for **every** edge: an owned source must supply a bit, and a
+    /// missing bit means the source cannot own anything. A firing assert marks exactly the shape
+    /// the pre-fix compiler dead-ended in `Term::Unreachable`, so it can only report a program the
+    /// old lowering trapped at runtime anyway; every test binary is a debug build, so the whole
+    /// owner suite carries the check while release lowering keeps the defined `false` bit.
+    fn terminate_return(
+        &mut self,
+        value: Option<Operand>,
+        cleanup: Option<Operand>,
+        bit_source_ty: Ty,
+    ) {
         match (self.ctx.return_cleanup, value) {
             (hir::ReturnCleanupAbi::DynamicBit, Some(value)) => {
+                debug_assert!(
+                    cleanup.is_some()
+                        || !needs_drop_flag(
+                            bit_source_ty,
+                            &self.structs,
+                            &self.tuples,
+                            &self.enums,
+                            &self.tagged_types
+                        ),
+                    "an owned return edge must carry its ownership bit"
+                );
                 let cleanup = cleanup.unwrap_or(Operand::Const(Const::Bool(false)));
                 self.terminate(Term::ReturnWithCleanup(Box::new((value, cleanup))));
             }
             // `DynamicBit` is chosen exactly when the return type is recursively Move, so it is
-            // never `Unit` and a valueless return edge cannot come from checked HIR. Fail closed
-            // rather than emit a `Term::Return` the backend rejects ("dynamic-cleanup function
-            // returned no value or cleanup bit").
-            (hir::ReturnCleanupAbi::DynamicBit, None) => self.terminate(Term::Unreachable),
+            // never `Unit` and a valueless return edge cannot come from checked HIR. Emit the void
+            // return anyway: codegen rejects it by name ("dynamic-cleanup function returned no
+            // value or cleanup bit"), which **diagnoses** the malformed input. `Term::Unreachable`
+            // would compile it into a silent runtime trap instead — a weaker failure mode.
+            (hir::ReturnCleanupAbi::DynamicBit, None) => self.terminate(Term::Return(None)),
             (hir::ReturnCleanupAbi::None, value) => self.terminate(Term::Return(value)),
         }
     }
@@ -3307,7 +3332,8 @@ fn lower_fn(
         }
         let tail = tail.filter(|_| f.ret != Ty::Unit);
         b.emit_exit_cleanup();
-        b.terminate_return(tail, cleanup);
+        // The tail value is the function's own return value, so its type owns the bit.
+        b.terminate_return(tail, cleanup, f.ret);
     }
 
     // Synthetic owners are discovered while recursively lowering expressions, but every cleanup
@@ -4230,7 +4256,8 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 null_moved_source(b, e);
             }
             b.emit_exit_cleanup();
-            b.terminate_return(op, cleanup);
+            let returned_ty = value.as_ref().map_or(Ty::Unit, |value| value.ty);
+            b.terminate_return(op, cleanup, returned_ty);
             // The current block is now terminated; `lower_block` stops here, so no dead
             // block is created and callers can see the divergence via `is_terminated`.
         }
@@ -14274,16 +14301,9 @@ fn lower_try(b: &mut Builder, inner: &hir::Expr, ok_ty: Ty) -> Operand {
     let inner_flag = lowered_drop_flag(b, inner, &r);
     // Both edges read a missing bit the same way: no individually owned payload. The `Ok` edge
     // acts on it below (it attaches a drop flag only `if let Some(flag)`), and the `Err` edge
-    // propagates a `false` cleanup bit. That is exact, not conservative — the propagated `Err`
-    // owns something only if the operand it was extracted from did — and this tripwire holds the
-    // provenance side of it: a recursively Move operand always has a bit (a bound local's flag, a
-    // `DynamicBit` call's SSA bit, a control-flow join, or sema's static provenance). Every test
-    // binary is a debug build, so the whole owner suite carries the check.
-    debug_assert!(
-        inner_flag.is_some()
-            || !needs_drop_flag(inner.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types),
-        "an owned `?` operand must carry an ownership bit for its Err edge to propagate"
-    );
+    // propagates a `false` cleanup bit — exact, not conservative, because the propagated `Err`
+    // owns something only if the operand it was extracted from did. `terminate_return` asserts
+    // that provenance rule for this edge against `inner.ty` below.
     let inner_owners = b.borrow_owners(&r);
 
     let is_ok = b.fresh_value(Ty::Bool);
@@ -14306,7 +14326,9 @@ fn lower_try(b: &mut Builder, inner: &hir::Expr, ok_ty: Ty) -> Operand {
     null_moved_source(b, inner);
     // `?` exits the function: free open arenas and drop owned locals first.
     b.emit_exit_cleanup();
-    b.terminate_return(Some(Operand::Value(propagated)), inner_flag.clone());
+    // The propagated `Err` re-wraps the operand's own error payload, so the operand's type — not
+    // the function's return type — is what the cleanup bit describes.
+    b.terminate_return(Some(Operand::Value(propagated)), inner_flag.clone(), inner.ty);
 
     // Ok: continue with the unwrapped value. If the operand was a bound local holding an owned
     // payload (e.g. `r: Result<string,E>`), the payload is now moved into `v`, so null the source
