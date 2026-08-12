@@ -159,6 +159,52 @@ pub fn live_postgres_decision(required: bool, url: Option<&str>) -> LiveDecision
     }
 }
 
+/// The live-PostgreSQL decision, read from the environment.
+///
+/// The one place the two variable names and the meaning of "required" are spelled. Before this
+/// existed the rule had FIVE hand-written spellings across four suites, and they disagreed:
+/// `pkg_db_q2` tested `ALIGN_DB_POSTGRES_REQUIRED == "1"` at two sites, while `pkg_db_q3`,
+/// `pkg_db_q5a`, and `pkg_db_q5b2` tested merely that the variable was PRESENT. So
+/// `ALIGN_DB_POSTGRES_REQUIRED=0` meant "not required" in one suite and "required" in three.
+pub fn live_postgres() -> LiveDecision {
+    let required = std::env::var("ALIGN_DB_POSTGRES_REQUIRED").ok().as_deref() == Some("1");
+    let url = std::env::var("ALIGN_DB_POSTGRES_URL").ok();
+    live_postgres_decision(required, url.as_deref())
+}
+
+/// The live-PostgreSQL URL, or `None` when this case should skip.
+///
+/// Panics in required mode with no URL: the required CI job exists precisely so that a missing
+/// database is a failure, and a silent skip there moves first execution to CI.
+pub fn live_postgres_url(context: &str) -> Option<String> {
+    match live_postgres() {
+        LiveDecision::Run(url) => Some(url),
+        LiveDecision::Skip => {
+            eprintln!("{context} skipped: ALIGN_DB_POSTGRES_URL is not set");
+            None
+        }
+        LiveDecision::Fail => {
+            panic!("ALIGN_DB_POSTGRES_REQUIRED=1 requires ALIGN_DB_POSTGRES_URL")
+        }
+    }
+}
+
+/// A per-run identifier for objects a live case creates on a shared server.
+///
+/// Process id plus a monotonic counter, so two cases in one run and two concurrent runs on one
+/// machine cannot collide. See `16-test-policy.md` for why this is only half of the isolation
+/// story: the product's own history table has a FIXED name, so a suite that exercises migration
+/// history cannot be made concurrency-safe by naming alone and needs a per-run database.
+pub fn live_run_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}_{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// Whether the engine must clear `key`, given the keys it is setting explicitly on this child.
 ///
 /// `explicitly_set` is the caller's actual `env(...)` key list, not a restatement of it: the engine
@@ -189,9 +235,9 @@ pub fn gate(needs: Needs) -> Option<Gate> {
         return None;
     }
     if needs == Needs::LivePostgres {
-        let required = std::env::var("ALIGN_DB_POSTGRES_REQUIRED").ok().as_deref() == Some("1");
-        let url = std::env::var("ALIGN_DB_POSTGRES_URL").ok();
-        return match live_postgres_decision(required, url.as_deref()) {
+        // Delegate rather than re-read: a sixth hand-written spelling here would be the same defect
+        // this helper exists to remove.
+        return match live_postgres() {
             LiveDecision::Run(_) => Some(Gate),
             LiveDecision::Skip => {
                 eprintln!("live PostgreSQL case skipped: ALIGN_DB_POSTGRES_URL is not set");

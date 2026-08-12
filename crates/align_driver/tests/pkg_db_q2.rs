@@ -1335,13 +1335,9 @@ fn common_surface_dispatches_to_postgres_engine() {
 
 #[test]
 fn postgres_required_mode_requires_configuration() {
-    let required = std::env::var("ALIGN_DB_POSTGRES_REQUIRED").ok().as_deref() == Some("1");
-    let configured = std::env::var("ALIGN_DB_POSTGRES_URL")
-        .ok()
-        .filter(|url| !url.is_empty())
-        .is_some();
-    assert!(
-        !required || configured,
+    assert_ne!(
+        live_postgres(),
+        LiveDecision::Fail,
         "ALIGN_DB_POSTGRES_REQUIRED=1 requires ALIGN_DB_POSTGRES_URL"
     );
 }
@@ -1356,20 +1352,9 @@ fn postgres_required_portable_query_runs_against_both_drivers() {
     if !backend_available() {
         return;
     }
-    let required = std::env::var("ALIGN_DB_POSTGRES_REQUIRED").ok().as_deref() == Some("1");
-    let configured = std::env::var("ALIGN_DB_POSTGRES_URL")
-        .ok()
-        .filter(|url| !url.is_empty())
-        .is_some();
-    if !configured {
-        assert!(
-            !required,
-            "ALIGN_DB_POSTGRES_REQUIRED=1 requires ALIGN_DB_POSTGRES_URL"
-        );
-        eprintln!("postgres portable-query integration skipped: ALIGN_DB_POSTGRES_URL is not set");
+    let Some(postgres_url) = live_postgres_url("postgres portable-query integration") else {
         return;
-    }
-    let postgres_url = std::env::var("ALIGN_DB_POSTGRES_URL").expect("configured URL");
+    };
     const QUERY: &str = r#"module app.portable_query
 import pkg.db
 

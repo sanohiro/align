@@ -16,23 +16,25 @@
 //!
 //! # Module contract
 //!
-//! This module is **not** part of `tests/common/`. It is included only by the `pkg_db_*` E2E
-//! suites, so editing it rebuilds those binaries rather than all ~167 driver test binaries. It
-//! depends on `common` being declared in the including binary, and refers to it as
-//! `crate::common::…`; every including file therefore keeps
+//! This module is **not** part of `tests/common/`. It is included only by the nine `pkg_db_*`
+//! suites, so editing it rebuilds those binaries rather than all ~167 driver test binaries.
+//!
+//! It refers to the `common` harness as `crate::common::…`, so an including file must declare
+//! `mod common;` before `mod db_harness;`:
 //!
 //! ```ignore
 //! mod common;
-//! use common::*;
 //! mod db_harness;
 //! ```
 //!
-//! in that order.
+//! Whether the includer also does `use common::*;` is up to that suite — `pkg_db_q3` and
+//! `pkg_db_q5a` reach the harness for the live-PostgreSQL gate alone and name it as
+//! `db_harness::live_postgres_url`, importing neither glob.
 //!
 //! `dead_code` / `unused_imports` are allowed for the same reason `common/mod.rs` allows them: each
 //! test binary compiles this whole module but uses only the subset it needs, and the subsets
-//! genuinely differ — q5b2 uses only `package_source`, q4b uses the parity engine, q4a and q6 use
-//! the counter tables. Do not "clean up" the attribute; without it every suite would need a
+//! genuinely differ — q3 and q5a use only the live-PostgreSQL gate, q5b2 adds `Layout` and
+//! `live_run_id`, q4b uses the parity engine, and q4a, q6, and a1 use the counter tables. Do not "clean up" the attribute; without it every suite would need a
 //! hand-maintained import list that says nothing about correctness.
 //!
 //! Cargo auto-discovers only `tests/*.rs` and `tests/*/main.rs`, so this directory is a shared
@@ -52,14 +54,14 @@ pub use case::{Case, RunnerKind};
 pub use counters::{CounterExpect, Counters};
 pub use fingerprint::{CaseFingerprint, FingerprintLog};
 pub use layout::{Layout, package_source};
-pub use stubs::{PG, SQLITE_Q4A, SQLITE_Q6, Stub};
+pub use stubs::{C_ONLY_COUNTERS, PG, SQLITE_Q4A, SQLITE_Q6, Stub};
 pub use parity::{
     Driver, Expect, Limits, ParityCase, ParityProgram, run_of, run_parity,
     run_parity_with_limits,
 };
 pub use run::{
-    Gate, LiveDecision, Mismatch, Needs, Run, assert_no_mismatches, gate,
-    live_postgres_decision, should_clear_env,
+    Gate, LiveDecision, Mismatch, Needs, Run, assert_no_mismatches, gate, live_postgres,
+    live_postgres_decision, live_postgres_url, live_run_id, should_clear_env,
 };
 pub use runner::{
     RUNNER_PER_UNIT_C, RUNNER_STATIC_DESCRIPTORS, RUNNER_WHOLE_PROGRAM, expect_checks_clean,

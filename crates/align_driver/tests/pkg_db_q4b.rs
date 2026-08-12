@@ -3365,3 +3365,47 @@ fn a_case_environment_is_refused_by_the_runners_that_cannot_apply_it() {
         assert!(report.contains("pkg-db-q4b-probe-env-per-unit"), "{report}");
     }
 }
+
+/// P3-3: `live_run_id` must be unique within a process and across processes.
+///
+/// Within a process is the interesting half — two cases in one run share a pid, so only the counter
+/// separates them. Across processes is covered by the pid, checked here by construction.
+#[test]
+fn live_run_ids_do_not_collide() {
+    let first = db_harness::live_run_id();
+    let second = db_harness::live_run_id();
+    assert_ne!(first, second, "two ids in ONE process must differ");
+    let pid = std::process::id().to_string();
+    for id in [&first, &second] {
+        assert!(
+            id.starts_with(&format!("{pid}_")),
+            "an id must carry this process's pid so a concurrent run cannot collide: {id}"
+        );
+    }
+    // A different process yields a different prefix; the child prints the pid it would embed.
+    let child = std::process::Command::new("/bin/sh")
+        .args(["-c", "echo $$"])
+        .output()
+        .expect("spawn");
+    let child_pid = String::from_utf8_lossy(&child.stdout).trim().to_string();
+    assert_ne!(child_pid, pid, "the child must be a different process");
+}
+
+/// P3-8(b): the C-only counter list must name counters the fixture really exports, so it cannot
+/// quietly become a dumping ground that hides a genuinely missing Align counter.
+#[test]
+fn c_only_counters_are_exported_by_a_stub_but_printed_by_none() {
+    for name in db_harness::C_ONLY_COUNTERS {
+        assert!(
+            db_harness::PG.c_source.contains(name),
+            "`{name}` is listed as a C-only counter but no stub exports it"
+        );
+        for stub in db_harness::stubs::ALL {
+            assert!(
+                !stub.counters_align.contains(name),
+                "`{name}` IS printed by {}'s dump, so it is not C-only",
+                stub.id
+            );
+        }
+    }
+}

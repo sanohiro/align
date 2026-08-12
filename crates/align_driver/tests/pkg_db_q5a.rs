@@ -1,6 +1,7 @@
 //! pkg.db Q5a/D11 migration lifecycle owners.
 
 mod common;
+mod db_harness;
 
 use align_driver::Hash128;
 use align_driver::db_migrate::{
@@ -502,13 +503,7 @@ fn migration_catalog_history_scaling_measurement() {
 
 #[test]
 fn postgres_required_migration_lifecycle() {
-    let required = std::env::var_os("ALIGN_DB_POSTGRES_REQUIRED").is_some();
-    let Some(url) = std::env::var("ALIGN_DB_POSTGRES_URL").ok() else {
-        assert!(
-            !required,
-            "ALIGN_DB_POSTGRES_URL is required by this test environment"
-        );
-        eprintln!("skipping PostgreSQL Q5a owner: ALIGN_DB_POSTGRES_URL is not set");
+    let Some(url) = db_harness::live_postgres_url("PostgreSQL Q5a owner") else {
         return;
     };
     let project = project(
