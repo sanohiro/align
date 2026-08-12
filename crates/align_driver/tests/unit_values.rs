@@ -231,6 +231,31 @@ fn main() -> i32 {
     assert_eq!(nested_out.status.code(), Some(2));
 }
 
+/// The `scan` accumulator rule is the producer's (`align_sema::scan_accumulator_scalar`), and `()`
+/// is not a special case of it. This is the sibling non-Unit accumulator that the validator's old
+/// `scalar_to_prim` spelling also refused: it lives beside the Unit case so one file owns the
+/// `scan-accumulator` delegation cell end to end, compiled and run.
+#[test]
+fn sum_type_scan_accumulator_compiles_and_runs() {
+    if !backend_available() {
+        return;
+    }
+    let src = "\
+E { A, B }
+fn step(acc: E, x: i64) -> E {
+  print(x)
+  return acc
+}
+fn main() -> i32 {
+  xs := [1, 2].scan(E.A, step)
+  return xs.len() as i32
+}
+";
+    let out = build_and_run("scan-enum-accumulator", src);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n2\n");
+}
+
 #[test]
 fn pipeline_unit_callables_use_unit_values() {
     if !backend_available() {

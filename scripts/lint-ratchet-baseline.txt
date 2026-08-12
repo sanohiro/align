@@ -1,5 +1,6 @@
 # crate kind count — maintained by scripts/lint-ratchet.sh --update
-align_mir panics 370
+align_mir panics 371
 align_codegen_llvm panics 426
 align_runtime casts 293
+align_mir raw-ty-compare 301
 workspace fixture-bake 51

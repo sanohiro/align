@@ -1043,6 +1043,23 @@ Eight occurrences; one diverged.
 | `array_builder_elem_ok` | `check_array_builder_new` | Wider, never narrower: sema admits `Int/Float/Bool/Char/String`; the validator additionally admits `Str`. A wider gate cannot reject a checked program, so it is outside this class. No change. |
 | `ResourceViewFromRaw` view scalar (2 sites) | none | Structural: `Scalar::Slice` is *constructed from* a `PrimScalar`, so this is a representation conversion, not an admission rule. No change. |
 
+One further admission gate diverged without being spelled `scalar_to_prim`:
+
+| Gate | Producer authority | Verdict |
+|---|---|---|
+| `orderable_body_ty` (`sort_by_key` key) | `Bound::Ord` | **Divergent.** Sema's bound accepts owned `string`; the validator re-listed the arms and stopped at `str`. Both now call `align_sema::ord_body_ty`. |
+
+**Deferred, same arm — `ord-key` Move keys.** Delegating orderability does not by
+itself make a `string`-keyed `sort_by_key` lower. `pipeline_callable_ok` requires
+a pipeline callable's output to be Copy (`ty_copy_ok`), and sema imposes no Copy
+requirement on a sort key, so an owned key is still refused one gate later. That
+is a *second*, distinct divergence, and closing it needs per-key Drop in the
+fused sort path — the same shape as #739's deferred fixed-array Move elements,
+not a validator edit. Until then the reachable witness for the `ord-key` row is a
+`str` key, and the owner table records that explicitly. Do not "fix" the Copy gate
+without the MIR support: accepting a Move key the sort path cannot drop trades a
+rejected program for a leak.
+
 ### Axis B — nominal-identity comparisons
 
 `body_core` contains 538 comparison lines; 210 compare a `Ty` or `Scalar`.
@@ -1065,6 +1082,24 @@ Fixed cross-derivation cells:
 | `Spawn` lifted-signature return vs constructed `Result` expectation | Latent, and additionally sensitive to the `Ty::Result` / `Ty::Tagged` spelling that only `body_ty_matches` normalizes. |
 | Lifted-signature spawn check (`resolve_lifted_signature` consumer) | Same family as the previous row. |
 
+### Axis B (continued) — the other seven gates
+
+Axis B above measures the body gate, which owns the expression-level rules. The
+other seven gates were swept with the same criterion. They are small: **40**
+comparison lines in total, **zero** `scalar_to_prim` admission gates, and
+**seven** comparisons whose operands could carry a nominal id:
+
+| Gate | Nominal comparisons | Verdict |
+|---|---:|---|
+| `json_scan_validation_reason` | 2 | `expression.ty != Ty::JsonScanner(*struct_id)` is same-derivation (the node's stored row id and its own type come from one resolution); `input.ty != Ty::Str` is split-free. |
+| `declaration_header_metadata_is_valid` | 4 | All split-free: `Ty::Unit` (entry ABI return), `Ty::DynArray(Scalar::Str)` (argv), and two `Ty::ArenaHandle` mode checks. |
+| `nominal_link_metadata_is_valid` | 1 | Split-free (`Ty::Str`). |
+| `global_type_metadata_is_valid`, `type_placement_metadata_is_valid` | 0 | They validate the id domain itself, so they compare ids to table bounds, not types to types. |
+| `checked_hir_body_depth_is_valid` | 0 | Structural depth only. |
+| `checked_hir_body_facts_are_valid` | n/a | Compares a program against a **clone of itself** (`replay_clone::clone_program`), whose type tables are copied unchanged. Both sides carry identical ids by construction, so a nominal split cannot arise. |
+
+Audited clean; nothing deferred from this sweep.
+
 ### Axis C — the vanished-checked-program rule
 
 The rule "a checked program with functions must not lower to the empty
@@ -1083,10 +1118,19 @@ single fallible boundary and owns the rule:
   contract for hand-constructed HIR (`assert_rejected` is unchanged), and are
   documented as unusable for checked input.
 
-`align_driver` exposes `try_lower_to_mir{,_per_unit,_located,_per_unit_located}`
-for callers that can render a diagnostic; the infallible `lower_to_mir*` names
-are retained for the test surface and panic on rejection, so no caller can
-obtain an empty program from a non-empty checked input.
+`align_driver` exposes `try_lower_to_mir{,_per_unit,_located,_per_unit_located}`,
+and **every** production path uses them: the CLI walk, the interface-summary
+producer, the whole-program static-descriptor surface, the unit-cache
+rehydration path, and database metadata preparation. Each of those first proves
+the input checked without errors, which is what makes the rule meaningful.
+
+The infallible `lower_to_mir*` names stay fail-closed rather than panicking.
+They are the inspection surface, and owner tests legitimately reach them with
+HIR no producer emits — HIR from a program that failed checking (`m5`'s scanner
+inference cases assert the rejected MIR is empty) and HIR whose analysis facts
+a test overrode by hand (`owned_tagged_payloads`'s arena provenance case). For
+those inputs the empty program is the correct answer, so "a checked program did
+not vanish" is not a property the infallible surface can assert.
 
 ### Owners
 
@@ -1094,7 +1138,16 @@ obtain an empty program from a non-empty checked input.
 |---|---|
 | Every source shape sema accepts survives every delegated gate | `align_mir` `checked_source_shapes_survive_every_delegated_gate` (scan `()`, scan enum, reduce `()`, map_err independent monomorph) |
 | A vanished checked program is an error at the one boundary, and the infallible entry points still fail closed | `align_mir` `lower_program_checked_reports_a_vanished_checked_program` |
+| Delegating a gate does not switch it off | `align_mir` `delegated_gates_still_refuse_a_genuinely_different_type` (struct accumulator, unordered key, mismatched map_err mapper, and two distinct source shapes under the shape matcher) |
+| A sum-type scan accumulator compiles and runs | `align_driver` `unit_values::sum_type_scan_accumulator_compiles_and_runs` |
+| A new raw `Ty`/`Scalar` comparison in the body validator cannot land silently | `scripts/lint-ratchet.sh` row `align_mir raw-ty-compare` (pinned; may only fall) |
 | End-to-end acceptance | `align_driver` `mir_continuation`, `unit_values` |
+
+**Review-ledger bookkeeping.** These occurrences were found by an internal
+investigation, not by an independent review, so `align-self-review`'s counting
+rules keep them out of `FINDINGS.md`'s root-cause table. The class is tracked
+here instead, and the ratchet row above is its automated owner — the sixth
+occurrence is what promoted it from prose to machinery.
 
 ### fn_types interning (follow-up, not in this class)
 

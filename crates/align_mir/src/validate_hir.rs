@@ -164,7 +164,16 @@ pub(crate) fn body_core_metadata_is_valid(program: &hir::Program) -> bool {
 /// type, placement, and nominal tables. The public owner helper above keeps its standalone
 /// fail-closed contract for direct tests; MIR activation calls this body-only form so each global
 /// table is traversed once per lowering entrypoint.
+#[cfg(test)]
 pub(crate) fn body_only_metadata_is_valid(program: &hir::Program) -> bool {
+    body_only_validation_reason(program).is_ok()
+}
+
+/// The name of the first function the stored-body validator rejects.
+///
+/// The boolean wrapper above stays the production gate; this reason-valued seam lets the MIR
+/// boundary say *which* function vanished. Same shape as [`json_scan_validation_reason`].
+pub(crate) fn body_only_validation_reason(program: &hir::Program) -> Result<(), String> {
     body_core::validate(program)
 }
 
@@ -1990,13 +1999,13 @@ fn valid_prim(primitive: PrimScalar) -> bool {
 mod body_core {
     use super::*;
 
-    pub(super) fn validate(program: &hir::Program) -> bool {
+    pub(super) fn validate(program: &hir::Program) -> Result<(), String> {
         BodyValidator::new(program).validate()
     }
 
     #[cfg(test)]
     pub(super) fn validate_for_fixtures(program: &hir::Program) -> bool {
-        BodyValidator::new_for_body_fixtures(program).validate()
+        BodyValidator::new_for_body_fixtures(program).validate().is_ok()
     }
 
     pub(super) fn json_struct_descriptor_is_valid(
@@ -2517,10 +2526,13 @@ impl<'a> BodyValidator<'a> {
         }
     }
 
-    fn validate(mut self) -> bool {
+    /// `Err(name)` names the first function the body validator rejects, so the MIR boundary can
+    /// report which shape to look at instead of only that something vanished.
+    fn validate(mut self) -> Result<(), String> {
         for (function_index, function) in self.program.fns.iter().enumerate() {
+            let reject = || Err(function.name.clone());
             if !valid_span(function.span) || !self.locals_valid(function) {
-                return false;
+                return reject();
             }
             let context = BodyContext {
                 function: function_index,
@@ -2534,7 +2546,7 @@ impl<'a> BodyValidator<'a> {
                 signed_min_magnitude: false,
             };
             if !self.walk_block(&function.body, context.clone()) {
-                return false;
+                return reject();
             }
             let implicit_params = self.allow_implicit_local_params.then(|| {
                 function
@@ -2549,22 +2561,22 @@ impl<'a> BodyValidator<'a> {
                     .collect::<HashSet<_>>()
             });
             if !LocalScopeValidator::new(self.program, function, implicit_params).validate() {
-                return false;
+                return reject();
             }
             if !self.bindings_valid(function_index, function) {
-                return false;
+                return reject();
             }
             let Some(root) = self.blocks.get(&ptr_key(&function.body)) else {
-                return false;
+                return reject();
             };
             if root.falls && !self.body_ty_matches(root.ty, function.ret) {
-                return false;
+                return reject();
             }
             if !self.body_ty_ok(function.ret) {
-                return false;
+                return reject();
             }
         }
-        true
+        Ok(())
     }
 
     fn walk_block(&mut self, root: &'a hir::Block, context: BodyContext) -> bool {
@@ -10059,8 +10071,11 @@ fn numeric_body_ty(ty: Ty) -> bool {
     matches!(ty, Ty::Int(_) | Ty::Float(_))
 }
 
+/// Delegated: the producer owns which types have a total order (`Bound::Ord`). This list omitted
+/// owned `string`, which sema's bound accepts, so a checked `string`-keyed `sort_by_key` was
+/// rejected here and lowered to the empty program.
 fn orderable_body_ty(ty: Ty) -> bool {
-    matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Char | Ty::Str)
+    align_sema::ord_body_ty(ty)
 }
 
 fn fixed_array_shape(expression: &hir::Expr, ty: Ty) -> Option<(Scalar, u32)> {
@@ -10296,6 +10311,12 @@ impl<'a> DelegatedGates<'a> {
 
     pub(crate) fn scalar_copy_ok(&self, scalar: Scalar) -> bool {
         self.0.scalar_copy_ok(scalar)
+    }
+
+    /// The shape-tolerant type comparison the delegated cells use, so the negative owner can prove
+    /// it still separates two genuinely different source shapes.
+    pub(crate) fn body_ty_matches(&self, actual: Ty, expected: Ty) -> bool {
+        self.0.body_ty_matches(actual, expected)
     }
 
     pub(crate) fn collection_element_read_ok(&self, elem: Ty) -> bool {

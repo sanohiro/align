@@ -227,6 +227,15 @@ fn checked_source_shapes_survive_every_delegated_gate() {
             "Wrap<T> { callback: T }\nfn quiet(x: i64) -> i64 = x + 1\nfn keep_error(\n  wrap: Wrap<fn(i64) -> i64>,\n) -> Wrap<fn(i64) -> i64> = wrap\nfn fail_with<E>(error: E) -> Result<i64, E> = Err(error)\nfn main() -> i32 {\n  mapped := fail_with(Wrap { callback: quiet }).map_err(keep_error)\n  return match mapped {\n    Ok(value) => value as i32\n    Err(wrap) => wrap.callback(41) as i32\n  }\n}\n",
             4,
         ),
+        // `ord-key`: the orderability rule is now the producer's `Bound::Ord`. A `str` key is the
+        // reachable witness; the owned-`string` key sema also admits is still refused one gate
+        // later by the Copy requirement on a pipeline callable's output, which is a distinct
+        // deferred cell (see the ledger's `ord-key` row).
+        (
+            "sort-by-key-str-key",
+            "Row { name: str, n: i64 }\nfn key(row: Row) -> str = row.name\nfn main() -> i32 = 0\n",
+            2,
+        ),
     ] {
         let program = checked_source_program(source);
         assert!(
@@ -237,6 +246,61 @@ fn checked_source_shapes_survive_every_delegated_gate() {
             .unwrap_or_else(|rejected| panic!("{name}: {rejected}"));
         assert_eq!(lowered.fns.len(), expected_fns, "{name}: lowered functions");
     }
+}
+
+/// Negative side of the delegation matrix: delegating to the producer must not turn the gate off.
+///
+/// Each row is the same construct as a row above with one genuinely different type substituted, so
+/// a delegated gate that degenerated into "accept anything" fails here. Sema rejects every row, so
+/// the checked-HIR gate is exercised through `assert_body_rejects` on hand-substituted HIR rather
+/// than through a source fixture the producer would never emit.
+#[test]
+fn delegated_gates_still_refuse_a_genuinely_different_type() {
+    // `scan-accumulator`: a struct accumulator is the one shape the shared authority excludes.
+    let struct_accumulator = "Acc { n: i64 }\nfn step(acc: Acc, x: i64) -> Acc = acc\nfn main() -> i32 {\n  xs := [1, 2].scan(Acc { n: 0 }, step)\n  return xs.len() as i32\n}\n";
+    assert!(
+        source_is_rejected(struct_accumulator),
+        "a struct scan accumulator must still be refused",
+    );
+
+    // `ord-key`: a bool key has no total order under `Bound::Ord`.
+    let bool_key = "fn key(n: i64) -> bool = n > 1\nfn main() -> i32 {\n  sorted := [3, 1, 2].sort_by_key(key)\n  return sorted.len() as i32\n}\n";
+    assert!(
+        source_is_rejected(bool_key),
+        "an unordered sort key must still be refused",
+    );
+
+    // `map-err-parameter`: shape-tolerant matching must still reject a different source shape.
+    let wrong_error = "Wrap<T> { callback: T }\nOther { n: i64 }\nfn quiet(x: i64) -> i64 = x + 1\nfn wrong(other: Other) -> Other = other\nfn fail_with<E>(error: E) -> Result<i64, E> = Err(error)\nfn main() -> i32 {\n  mapped := fail_with(Wrap { callback: quiet }).map_err(wrong)\n  return 0\n}\n";
+    assert!(
+        source_is_rejected(wrong_error),
+        "a map_err mapper over a different source shape must still be refused",
+    );
+
+    // The shape-tolerant matcher itself: two distinct source shapes never match, however their
+    // ids were minted.
+    let program = checked_source_program(
+        "A { n: i64 }\nB { n: i64, m: i64 }\nfn main() -> i32 = 0\n",
+    );
+    let gates = crate::validate_hir::DelegatedGates::new(&program);
+    assert!(
+        !gates.body_ty_matches(Ty::Struct(0), Ty::Struct(1)),
+        "distinct source shapes must not match",
+    );
+    assert!(
+        gates.body_ty_matches(Ty::Struct(0), Ty::Struct(0)),
+        "one shape must match itself",
+    );
+}
+
+/// Whether sema refuses `source`. Used by the negative delegation rows: a program sema rejects
+/// never reaches the checked-HIR gate, which is exactly the outcome those rows assert.
+fn source_is_rejected(source: &str) -> bool {
+    let mut diagnostics = Diagnostics::new();
+    let tokens = tokenize(0, source, &mut diagnostics);
+    let file = parse_file(tokens, &mut diagnostics);
+    let _ = align_sema::check_file(&file, &mut diagnostics);
+    diagnostics.has_errors()
 }
 
 /// The vanished-checked-program rule lives at the one fallible boundary, and the four infallible
@@ -268,9 +332,18 @@ fn lower_program_checked_reports_a_vanished_checked_program() {
         let rejected = crate::lower_program_checked(&malformed, per_unit, map)
             .expect_err("a rejected program with functions must not lower to the empty program");
         assert_eq!(rejected.checked_fns, malformed.fns.len(), "{label}: fn count");
+        // Self-diagnosing: the boundary names the refusing gate and the offending function, so the
+        // next occurrence of this class needs no instrumented rebuild to locate.
+        assert_eq!(rejected.pass, crate::ValidationPass::Bodies, "{label}: gate");
+        assert_eq!(
+            rejected.function.as_deref(),
+            Some("signed_minimum"),
+            "{label}: rejected function",
+        );
+        let text = rejected.to_string();
         assert!(
-            rejected.to_string().contains("were not lowered"),
-            "{label}: the rejection must name the defect",
+            text.contains("body_only_metadata_is_valid") && text.contains("signed_minimum"),
+            "{label}: the rejection must name the gate and the function: {text}",
         );
     }
 
@@ -294,13 +367,16 @@ fn lower_program_checked_reports_a_vanished_checked_program() {
         );
     }
 
-    // An input that really is empty is not a vanished program.
+    // An input that really is empty is not a vanished program, and it lowers to the empty program
+    // rather than to something partial.
     let mut empty = baseline_program();
     empty.fns.clear();
     empty.structs.clear();
+    let lowered = crate::lower_program_checked(&empty, false, None)
+        .expect("an empty checked program lowers to the empty program");
     assert!(
-        crate::lower_program_checked(&empty, false, None).is_ok(),
-        "an empty checked program lowers to the empty program",
+        lowered.fns.is_empty(),
+        "an empty input must publish no functions",
     );
 }
 

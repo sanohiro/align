@@ -286,6 +286,17 @@ pub fn scalar_to_prim(s: Scalar) -> Option<PrimScalar> {
     }
 }
 
+/// Whether `ty` has the total order the `Ord` bound requires.
+///
+/// The single producer authority for orderability. `Bound::Ord` is defined by it, and the
+/// checked-HIR body validator asks it instead of re-listing the arms: the validator's own list
+/// omitted owned `string`, so a checked `sort_by_key` with a `string` key lowered to the
+/// fail-closed empty program (`docs/impl/19-hir-validation-ledger.md`, delegation matrix row
+/// `ord-key`).
+pub fn ord_body_ty(ty: Ty) -> bool {
+    ty.is_numeric() || matches!(ty, Ty::Char | Ty::Str | Ty::String)
+}
+
 /// The materialized element scalar of a `scan` accumulator, or `None` when the accumulator cannot
 /// be materialized into an `array<A>`.
 ///
@@ -2884,7 +2895,7 @@ impl Bound {
         match self {
             Bound::Unconstrained => true,
             Bound::Eq => ty.is_numeric() || matches!(ty, Ty::Char | Ty::Bool | Ty::Str | Ty::String),
-            Bound::Ord => ty.is_numeric() || matches!(ty, Ty::Char | Ty::Str | Ty::String),
+            Bound::Ord => ord_body_ty(ty),
             Bound::Num => ty.is_numeric(),
             // RegionPlain is structural and needs the complete nominal definition tables.  Its
             // concrete check is owned by generic-call finalization, not this scalar predicate.

@@ -1721,18 +1721,67 @@ fn collect_capability_libs(fns: &[Function]) -> Vec<String> {
 /// The four infallible entry points below deliberately fail closed to the canonical empty program
 /// for hand-constructed or malformed HIR. That contract is only safe when the input was never
 /// claimed to be checked: a *checked* program that vanishes is a compiler defect, and shipping its
-/// empty object silently produced a binary with an undefined `_main` and exit 0. Three separate
+/// empty object silently produced a binary with an undefined `_main` and exit 0. Five separate
 /// consumers had each grown their own copy of the `mir.fns.is_empty() && !hir.fns.is_empty()`
 /// check, and every consumer that forgot one — including the whole-program test surface — got the
-/// silent empty object back. (Four copies existed; the fourth, on the unit-cache rehydration
-/// path, was found only by inventorying the call sites.) [`lower_program_checked`] owns the rule once so no caller can reach
+/// silent empty object back. (Five copies existed; the fourth, on the unit-cache rehydration path,
+/// and the fifth, in database metadata preparation, were found only by inventorying the call
+/// sites.) [`lower_program_checked`] owns the rule once so no caller can reach
 /// an empty program from a non-empty checked input without handling this error.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoweringRejected {
     /// Functions the producer had already checked.
     pub checked_fns: usize,
     /// Struct definitions the producer had already checked.
     pub checked_structs: usize,
+    /// Which gate refused the program.
+    pub pass: ValidationPass,
+    /// The first function the body gate rejected, when the failing gate identifies one.
+    pub function: Option<String>,
+}
+
+/// Which validation gate refused a program at the MIR boundary.
+///
+/// Every earlier occurrence of this class was diagnosed by hand-instrumenting
+/// `hir_program_is_valid` to find the failing predicate, then again to find the failing function.
+/// Naming both in the error turns that two-rebuild investigation into reading the message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValidationPass {
+    /// `align_sema::checked_hir_body_depth_is_valid`.
+    BodyDepth,
+    /// `validate_hir::global_type_metadata_is_valid`.
+    GlobalTypes,
+    /// `validate_hir::type_placement_metadata_is_valid`.
+    TypePlacement,
+    /// `validate_hir::nominal_link_metadata_is_valid`.
+    NominalLink,
+    /// `validate_hir::declaration_header_metadata_is_valid`.
+    DeclarationHeaders,
+    /// `validate_hir::json_scan_validation_reason`.
+    JsonScan,
+    /// `validate_hir::body_only_metadata_is_valid`; carries the rejected function name.
+    Bodies,
+    /// `align_sema::checked_hir_body_facts_are_valid`.
+    BodyFacts,
+    /// Every gate passed, but lowering published no function or no struct.
+    LoweringProducedNothing,
+}
+
+impl ValidationPass {
+    /// The predicate's name, for the boundary diagnostic.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::BodyDepth => "checked_hir_body_depth_is_valid",
+            Self::GlobalTypes => "global_type_metadata_is_valid",
+            Self::TypePlacement => "type_placement_metadata_is_valid",
+            Self::NominalLink => "nominal_link_metadata_is_valid",
+            Self::DeclarationHeaders => "declaration_header_metadata_is_valid",
+            Self::JsonScan => "json_scan_validation_reason",
+            Self::Bodies => "body_only_metadata_is_valid",
+            Self::BodyFacts => "checked_hir_body_facts_are_valid",
+            Self::LoweringProducedNothing => "lowering",
+        }
+    }
 }
 
 impl std::fmt::Display for LoweringRejected {
@@ -1741,9 +1790,15 @@ impl std::fmt::Display for LoweringRejected {
             f,
             "program passed checking but failed HIR validation at the MIR boundary; \
              {} checked function(s) and {} checked struct(s) were not lowered — \
-             report this program shape",
-            self.checked_fns, self.checked_structs
-        )
+             rejected by `{}`",
+            self.checked_fns,
+            self.checked_structs,
+            self.pass.name()
+        )?;
+        if let Some(function) = &self.function {
+            write!(f, " at function `{function}`")?;
+        }
+        f.write_str(" — report this program shape")
     }
 }
 
@@ -1762,16 +1817,18 @@ pub fn lower_program_checked(
     per_unit: bool,
     source_map: Option<&SourceMap>,
 ) -> Result<Program, LoweringRejected> {
-    let rejected = LoweringRejected {
+    let rejected = |pass: ValidationPass, function: Option<String>| LoweringRejected {
         checked_fns: program.fns.len(),
         checked_structs: program.structs.len(),
+        pass,
+        function,
     };
-    if !hir_program_is_valid(program) {
+    if let Err((pass, function)) = hir_program_validation_reason(program) {
         // A genuinely empty input still lowers to the empty program; anything else vanished.
         if program.fns.is_empty() && program.structs.is_empty() {
             return Ok(empty_program());
         }
-        return Err(rejected);
+        return Err(rejected(pass, function));
     }
     let lines = source_map.map(|sm| Rc::new(SourceLines::from_map(sm)));
     let mir = lower_program_unchecked(program, lines, per_unit);
@@ -1780,7 +1837,7 @@ pub fn lower_program_checked(
     if (mir.fns.is_empty() && !program.fns.is_empty())
         || (mir.structs.is_empty() && !program.structs.is_empty())
     {
-        return Err(rejected);
+        return Err(rejected(ValidationPass::LoweringProducedNothing, None));
     }
     Ok(mir)
 }
@@ -1828,15 +1885,49 @@ fn fail_closed(lowered: Result<Program, LoweringRejected>) -> Program {
     lowered.unwrap_or_else(|_| empty_program())
 }
 
+/// Whether every gate accepts `program`. Retained for the crate's boundary tests, which assert the
+/// accept/reject verdict without needing to name the refusing gate.
+#[cfg(test)]
 fn hir_program_is_valid(program: &hir::Program) -> bool {
-    align_sema::checked_hir_body_depth_is_valid(program)
-        && validate_hir::global_type_metadata_is_valid(program)
-        && validate_hir::type_placement_metadata_is_valid(program)
-        && validate_hir::nominal_link_metadata_is_valid(program)
-        && validate_hir::declaration_header_metadata_is_valid(program)
-        && validate_hir::json_scan_validation_reason(program).is_ok()
-        && validate_hir::body_only_metadata_is_valid(program)
-        && align_sema::checked_hir_body_facts_are_valid(program)
+    hir_program_validation_reason(program).is_ok()
+}
+
+/// Run the eight gates in their fixed order, naming the first one that refuses.
+///
+/// The order is load-bearing: each gate assumes the bounds and ids the previous ones established.
+fn hir_program_validation_reason(
+    program: &hir::Program,
+) -> Result<(), (ValidationPass, Option<String>)> {
+    /// One gate: its identity and its predicate.
+    type Gate = (ValidationPass, fn(&hir::Program) -> bool);
+    let gates: [Gate; 7] = [
+        (ValidationPass::BodyDepth, align_sema::checked_hir_body_depth_is_valid),
+        (ValidationPass::GlobalTypes, validate_hir::global_type_metadata_is_valid),
+        (ValidationPass::TypePlacement, validate_hir::type_placement_metadata_is_valid),
+        (ValidationPass::NominalLink, validate_hir::nominal_link_metadata_is_valid),
+        (
+            ValidationPass::DeclarationHeaders,
+            validate_hir::declaration_header_metadata_is_valid,
+        ),
+        (ValidationPass::JsonScan, |program| {
+            validate_hir::json_scan_validation_reason(program).is_ok()
+        }),
+        // `Bodies` is checked between JsonScan and BodyFacts, below, so it can name its function.
+        (ValidationPass::BodyFacts, align_sema::checked_hir_body_facts_are_valid),
+    ];
+    for (pass, gate) in gates.iter().take(6) {
+        if !gate(program) {
+            return Err((*pass, None));
+        }
+    }
+    if let Err(function) = validate_hir::body_only_validation_reason(program) {
+        return Err((ValidationPass::Bodies, Some(function)));
+    }
+    let (pass, gate) = gates[6];
+    if !gate(program) {
+        return Err((pass, None));
+    }
+    Ok(())
 }
 
 fn empty_program() -> Program {

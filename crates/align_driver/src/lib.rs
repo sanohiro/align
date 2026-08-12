@@ -3602,31 +3602,38 @@ fn lower_memoized(
 /// The internal-error text every CLI verb reports when a checked unit produces no MIR.
 ///
 /// This is a compiler defect, not a user error, so it names the shape to report. Formatting it in
-/// one place keeps the CLI walk, the interface-summary producer, and the whole-program surface from
-/// drifting into three different messages for one condition.
+/// one place keeps the five former copies of this rule — the CLI walk, the interface-summary
+/// producer, the whole-program static-descriptor surface, the unit-cache rehydration path, and
+/// database metadata preparation — from drifting into five different messages for one condition.
 fn vanished_lowering_message(unit: &str, rejected: align_mir::LoweringRejected) -> String {
     format!("internal error: unit `{unit}` {rejected}")
 }
 
 /// Lower the sema-checked HIR down to MIR, reporting a vanished checked program.
 ///
-/// Prefer this over [`lower_to_mir`] anywhere a diagnostic can be produced: the infallible form has
-/// to panic, because returning the empty program is what silently shipped an object with an
-/// undefined `_main`.
+/// Every production path uses this form, because returning the empty program from checked input is
+/// what silently shipped an object with an undefined `_main`. The infallible [`lower_to_mir`] stays
+/// available for the inspection surface, which legitimately lowers non-producer HIR.
 pub fn try_lower_to_mir(
     hir: &align_sema::Program,
 ) -> Result<align_mir::Program, align_mir::LoweringRejected> {
     lower_memoized(hir, "whole-program", false, None)
 }
 
-/// Lower the sema-checked HIR down to MIR.
+/// Lower the sema-checked HIR down to MIR, failing closed to the empty program.
 ///
-/// Panics when a checked program lowers to nothing. That is unreachable for producer HIR and is a
-/// compiler defect when it happens; the panic is deliberate, because every silent-empty-MIR
-/// regression so far reached a user as an empty binary with exit 0 instead of an error. Callers
-/// that can render a diagnostic use [`try_lower_to_mir`].
+/// This infallible form deliberately does NOT report a vanished program. It is the inspection
+/// surface, and several owner tests reach it with HIR that no producer emits: HIR from a program
+/// that failed checking (`m5`'s scanner-inference cases assert the rejected MIR is empty) and HIR
+/// whose analysis facts a test overrode by hand (`owned_tagged_payloads`'s arena provenance case).
+/// For those inputs the empty program is the correct answer, so the rule cannot live here — it
+/// belongs where the caller has proven the input is producer-checked and error-free, which is
+/// every production path, and every one of them uses [`try_lower_to_mir`].
 pub fn lower_to_mir(hir: &align_sema::Program) -> align_mir::Program {
-    try_lower_to_mir(hir).unwrap_or_else(|rejected| panic!("internal error: {rejected}"))
+    // The reject path re-enters `align_mir::lower_program` rather than fabricating an empty
+    // program here: that keeps ONE definition of "what a rejected program lowers to", and it is
+    // the cold path, so the repeated validation costs nothing a caller notices.
+    try_lower_to_mir(hir).unwrap_or_else(|_| align_mir::lower_program(hir))
 }
 
 /// M15 S2 per-unit lowering: lower ONE unit's checked HIR to MIR under the separate-compilation
@@ -3640,9 +3647,10 @@ pub fn try_lower_to_mir_per_unit(
     lower_memoized(hir, "per-unit", true, None)
 }
 
-/// [`try_lower_to_mir_per_unit`] with the same panic-on-vanish contract as [`lower_to_mir`].
+/// [`try_lower_to_mir_per_unit`] with the same fail-closed inspection contract as [`lower_to_mir`].
 pub fn lower_to_mir_per_unit(hir: &align_sema::Program) -> align_mir::Program {
-    try_lower_to_mir_per_unit(hir).unwrap_or_else(|rejected| panic!("internal error: {rejected}"))
+    // Cold reject path; see [`lower_to_mir`] for why it re-enters the library entry point.
+    try_lower_to_mir_per_unit(hir).unwrap_or_else(|_| align_mir::lower_program_per_unit(hir))
 }
 
 /// M15 S2b per-unit lowering **with source locations** — [`lower_to_mir_per_unit`] plus populated
@@ -3655,30 +3663,17 @@ pub fn try_lower_to_mir_per_unit_located(
     lower_memoized(hir, "per-unit-located", true, Some(source_map))
 }
 
-/// [`try_lower_to_mir_per_unit_located`] with the same panic-on-vanish contract as [`lower_to_mir`].
+/// [`try_lower_to_mir_per_unit_located`] with the same fail-closed inspection contract as
+/// [`lower_to_mir`].
 pub fn lower_to_mir_per_unit_located(
     hir: &align_sema::Program,
     source_map: &SourceMap,
 ) -> align_mir::Program {
+    // Cold reject path; see [`lower_to_mir`] for why it re-enters the library entry point.
     try_lower_to_mir_per_unit_located(hir, source_map)
-        .unwrap_or_else(|rejected| panic!("internal error: {rejected}"))
+        .unwrap_or_else(|_| align_mir::lower_program_per_unit_located(hir, source_map))
 }
 
-/// Lower to MIR with source locations (each statement records the line/col it came from), for
-/// `explain-opt` / debug-info emission. Identical to [`try_lower_to_mir`] but with populated
-/// `stmt_lines`.
-pub fn try_lower_to_mir_located(
-    hir: &align_sema::Program,
-    source_map: &SourceMap,
-) -> Result<align_mir::Program, align_mir::LoweringRejected> {
-    lower_memoized(hir, "whole-program-located", false, Some(source_map))
-}
-
-/// [`try_lower_to_mir_located`] with the same panic-on-vanish contract as [`lower_to_mir`].
-pub fn lower_to_mir_located(hir: &align_sema::Program, source_map: &SourceMap) -> align_mir::Program {
-    try_lower_to_mir_located(hir, source_map)
-        .unwrap_or_else(|rejected| panic!("internal error: {rejected}"))
-}
 
 /// Whether the LLVM backend is available (codegen is wired up).
 pub fn backend_available() -> bool {
