@@ -4831,74 +4831,125 @@ pub fn link_objects_instrumented(
     link_objects_inner(objs, exe, link_libs, profile, Some(profile_rt))
 }
 
-fn link_objects_inner(objs: &[&std::path::Path], exe: &std::path::Path, link_libs: &[String], profile: Profile, profile_rt: Option<&std::path::Path>) -> Result<(), String> {
-    let format = target_object_format()?;
-    let runtime = runtime_archive()?;
-    let ordered_link_libs = order_link_libs(link_libs);
-    let mut cmd = std::process::Command::new("cc");
-    for obj in objs {
-        cmd.arg(obj);
-    }
-    cmd.arg(&runtime)
-        .arg("-o")
-        .arg(exe)
-        // Link hygiene (M13 Slice 2), spelled per object format by `hygiene_flags`. Dead-code
-        // removal (ELF `--gc-sections` / Mach-O `-dead_strip`) drops every unreferenced input
-        // section from the final image; combined with the runtime's per-function sections (Rust's
-        // default) this garbage-collects the `std.compress`/`std.crypto`/`std.http` code a program
-        // does not use, eliminating its `libz`/`libzstd`/`libcrypto`/`libssl` references so those
-        // libraries are not needed at all. Unused-dylib removal (ELF `--as-needed` / Mach-O
-        // `-dead_strip_dylibs`) then records a dependency (`DT_NEEDED` / `LC_LOAD_DYLIB`) only for
-        // libraries that actually satisfy a surviving reference. Both are correctness-neutral
-        // hygiene, kept for EVERY profile (M13 Slice 4) — even `dev`: the potential link-speed
-        // saving of dropping dead-code removal is not worth a second link-flag path, and a `dev`
-        // binary that silently links dead `libssl` etc. would be a surprising difference from
-        // `release`.
-        .args(hygiene_flags(format));
+/// Everything one link is made of — the complete input to [`link_command_args`].
+///
+/// A struct rather than a parameter list because the argv is order-sensitive in several
+/// independent ways (objects before the runtime archive, the profile runtime after both, `-l`
+/// last), and a named field at every call site is what keeps a caller from silently transposing
+/// two `&Path`s that the type system cannot tell apart.
+pub struct LinkPlan<'a> {
+    /// The Align object files, in the order they are given to `cc`.
+    pub objs: &'a [&'a std::path::Path],
+    /// The executable to produce (`-o`).
+    pub exe: &'a std::path::Path,
+    /// `libalign_runtime.a`, linked after the objects that reference it.
+    pub runtime: &'a std::path::Path,
+    /// The capability + user libraries, already normalized by [`order_link_libs`].
+    pub ordered_link_libs: &'a [String],
+    /// Which flag dialect to speak.
+    pub format: ObjectFormat,
+    /// Decides the in-link strip on ELF.
+    pub profile: Profile,
+    /// The clang profile runtime archive, for `--pgo-instrument` only.
+    pub profile_rt: Option<&'a std::path::Path>,
+    /// Which linker `cc` should run.
+    pub linker: &'a Linker,
+}
+
+/// The complete `cc` argument vector for one link, as a **pure function** of [`LinkPlan`].
+///
+/// Split out of [`link_objects_inner`] so what the driver asks the linker for is checkable without
+/// running a linker, inspecting a produced image, or having any particular library installed. The
+/// `capability_linking` owner asserts the gated `-l` set directly on this vector; the dynamic
+/// dependency list of a real binary then remains a *corroborating* check rather than the only
+/// proof, which matters because `--as-needed` precision differs between linkers and can make an
+/// over-linked library invisible in `DT_NEEDED`.
+pub fn link_command_args(plan: &LinkPlan<'_>) -> Vec<std::ffi::OsString> {
+    let &LinkPlan { objs, exe, runtime, ordered_link_libs, format, profile, profile_rt, linker } = plan;
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    // Linker selection first: `-B`/`-fuse-ld=` are `cc` driver options, position-independent with
+    // respect to the inputs, and reading them first makes the argv self-describing.
+    args.extend(linker.cc_flags().into_iter().map(std::ffi::OsString::from));
+    args.extend(objs.iter().map(|obj| obj.as_os_str().to_os_string()));
+    args.push(runtime.as_os_str().to_os_string());
+    args.push("-o".into());
+    args.push(exe.as_os_str().to_os_string());
+    // Link hygiene (M13 Slice 2), spelled per object format by `hygiene_flags`. Dead-code
+    // removal (ELF `--gc-sections` / Mach-O `-dead_strip`) drops every unreferenced input
+    // section from the final image; combined with the runtime's per-function sections (Rust's
+    // default) this garbage-collects the `std.compress`/`std.crypto`/`std.http` code a program
+    // does not use, eliminating its `libz`/`libzstd`/`libcrypto`/`libssl` references so those
+    // libraries are not needed at all. Unused-dylib removal (ELF `--as-needed` / Mach-O
+    // `-dead_strip_dylibs`) then records a dependency (`DT_NEEDED` / `LC_LOAD_DYLIB`) only for
+    // libraries that actually satisfy a surviving reference. Both are correctness-neutral
+    // hygiene, kept for EVERY profile (M13 Slice 4) — even `dev`: the potential link-speed
+    // saving of dropping dead-code removal is not worth a second link-flag path, and a `dev`
+    // binary that silently links dead `libssl` etc. would be a surprising difference from
+    // `release`.
+    args.extend(hygiene_flags(format).iter().map(std::ffi::OsString::from));
     // Per-profile strip (M13 Slice 4). The size profiles (`small`/`tiny`) drop the whole symbol
     // table; the speed profiles (`dev`/`release`/`fast`) keep symbols so a crash backtrace / `perf`
     // stays useful. The strip *decision* is owned by `Profile::strip` alone; only the *spelling*
     // is per-format: ELF strips in the link (`-Wl,--strip-all`), Mach-O has no ld64 equivalent and
-    // runs the external `strip` after a successful link (below).
+    // runs the external `strip` after a successful link (in `link_objects_inner`).
     if profile.strip() && format == ObjectFormat::Elf {
-        cmd.arg("-Wl,--strip-all");
+        args.push("-Wl,--strip-all".into());
     }
     // The always-linked support libraries, per format (`support_libs`): on ELF,
     // `libpthread`/`libdl`/`libm` are Rust-std support libraries the runtime *core* may reference
     // (threads, dlopen, math) independent of any Align feature — NOT capability-gated. On Mach-O
     // all three are libSystem re-exports, so the list is empty.
-    cmd.args(support_libs(format));
+    args.extend(support_libs(format).iter().map(std::ffi::OsString::from));
     // Instrument-PGO (`--pgo-instrument`): append the clang profile runtime archive and force the
     // `__llvm_profile_runtime` anchor undefined so its atexit `.profraw` writer is pulled from the
     // archive (see [`link_objects_instrumented`]). Placed AFTER the objects/archive that (indirectly)
     // need it — `-l`/archive resolution is left-to-right — and the forced-undefined symbol is spelled
     // per object format (ELF `--undefined=SYM`; Mach-O `-u,_SYM`, its symbols carry a leading `_`).
     if let Some(profile_rt) = profile_rt {
-        cmd.arg(profile_rt);
-        match format {
-            ObjectFormat::Elf => {
-                cmd.arg("-Wl,--undefined=__llvm_profile_runtime");
+        args.push(profile_rt.as_os_str().to_os_string());
+        args.push(
+            match format {
+                ObjectFormat::Elf => "-Wl,--undefined=__llvm_profile_runtime",
+                ObjectFormat::MachO => "-Wl,-u,___llvm_profile_runtime",
             }
-            ObjectFormat::MachO => {
-                cmd.arg("-Wl,-u,___llvm_profile_runtime");
-            }
-        }
+            .into(),
+        );
     }
     // Capability + user libraries. `libz`/`libzstd`/`libcrypto`/`libssl` are NO LONGER linked
     // unconditionally: they now arrive through `link_libs`, which MIR populates from the builtins a
     // program actually uses (`align_mir::Capability`) plus any `extern "C" link("name")` the user
     // declared (validated in sema). All go AFTER the objects/archive that reference them (`-l`
     // resolves left-to-right against preceding inputs). The supported libpq closure is normalized
-    // by `order_link_libs` immediately before this loop. Each name is a single `-l<name>` argv (no
+    // by `order_link_libs` before this call. Each name is a single `-l<name>` argv (no
     // shell/flag injection). A program using no gated feature links none of z/zstd/crypto/ssl.
-    for lib in &ordered_link_libs {
-        cmd.arg(format!("-l{lib}"));
-    }
+    args.extend(ordered_link_libs.iter().map(|lib| std::ffi::OsString::from(format!("-l{lib}"))));
+    args
+}
+
+fn link_objects_inner(objs: &[&std::path::Path], exe: &std::path::Path, link_libs: &[String], profile: Profile, profile_rt: Option<&std::path::Path>) -> Result<(), String> {
+    let format = target_object_format()?;
+    let runtime = runtime_archive()?;
+    let ordered_link_libs = order_link_libs(link_libs);
+    // Which linker `cc` drives (build-perf track item 2, `docs/impl/21-build-perf-plan.md`). ELF
+    // only, and optimization-neutral: `ld.lld` produces an equally optimized image, just faster.
+    // Resolved before any argv is built so a requested-but-missing lld fails before the link starts.
+    let linker = select_linker(format)?;
+    let mut cmd = std::process::Command::new("cc");
+    cmd.args(link_command_args(&LinkPlan {
+        objs,
+        exe,
+        runtime: &runtime,
+        ordered_link_libs: &ordered_link_libs,
+        format,
+        profile,
+        profile_rt,
+        linker: &linker,
+    }));
     let status = cmd
         .status()
         .map_err(|e| format!("cannot launch cc: {e}"))?;
     if !status.success() {
-        return Err(link_failure_message(status.code(), &ordered_link_libs));
+        return Err(link_failure_message(status.code(), &ordered_link_libs, &linker));
     }
     // Mach-O strip: ld64 has no `--strip-all`, so the size profiles run the external `strip` on the
     // linked image. `strip` ships with the same Xcode CLT as the `cc`/`ld` above (the existing
@@ -4937,23 +4988,233 @@ fn support_libs(format: ObjectFormat) -> &'static [&'static str] {
     }
 }
 
+/// The environment override for linker selection (see [`select_linker`]). One variable, two values,
+/// no other knob: `system` pins the C driver's own default linker, `lld` demands `ld.lld` and fails
+/// the link when it cannot be found. Unset is the automatic policy. Named for the `ALIGNC_*` family
+/// the other driver knobs use (`ALIGNC_CACHE`, `ALIGNC_JOBS`).
+const LINKER_ENV: &str = "ALIGNC_LINKER";
+
+/// The `-fuse-ld=` name and `-B` file name of LLVM's ELF linker. GCC's `collect2` and Clang both
+/// resolve `-fuse-ld=lld` by looking for a program spelled exactly `ld.lld`; a version-suffixed
+/// `ld.lld-22` is NOT usable through that mechanism, which is why discovery below looks for a
+/// *directory containing this exact name* rather than for any lld binary.
+const LLD_EXE: &str = "ld.lld";
+
+/// Which linker the C driver (`cc`) is told to run for a link ([`link_command_args`]).
+///
+/// Build-perf track item 2 (`docs/impl/21-build-perf-plan.md`): `ld.lld` is substantially faster
+/// than GNU `ld` on ELF and ships inside the LLVM 22 toolchain `alignc` already requires, so it
+/// needs no new dependency. `mold` was rejected: it is an extra third-party install and has no
+/// macOS support at all. The choice is **optimization-neutral** — the same objects, the same
+/// hygiene flags, the same fully optimized code (the track's "output is always fully optimized"
+/// principle is about optimization level, and the linker changes none of it). The image is not
+/// byte-identical: two linkers lay out and prune differently, and lld's `--as-needed` is the more
+/// precise of the two.
+///
+/// Public so the driver binary and the `capability_linking` owner can build a link argv for a
+/// stated linker without consulting the host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Linker {
+    /// The C driver's own default: GNU `ld`/`ld.gold` on ELF, `ld64`/`ld-prime` on Mach-O. The
+    /// behavior every Align build had before item 2, and still the behavior on macOS.
+    System,
+    /// LLVM's `ld.lld`, held as the *directory* that contains it (see [`Linker::cc_flags`]).
+    Lld(std::path::PathBuf),
+}
+
+impl Linker {
+    /// The `cc` driver flags that select this linker.
+    ///
+    /// `-fuse-ld=lld` alone is not enough and is actively unsafe: with GCC it makes `collect2`
+    /// search `COMPILER_PATH` and `PATH` for `ld.lld`, and when only apt's version-suffixed
+    /// `ld.lld-22` is installed the link does not fall back — it dies with
+    /// `collect2: fatal error: cannot find 'ld'`. `-B<dir>` puts the resolved LLVM `bin` directory
+    /// on `COMPILER_PATH`, so both GCC and Clang resolve the exact binary discovery picked.
+    /// (`--ld-path=<abs>` would be more direct but is a Clang-only option; `cc` is GCC on the
+    /// Debian/Ubuntu hosts this targets, and it rejects the flag outright.)
+    ///
+    /// `-B<dir>` also prepends `<dir>` to the startfile and library search paths. That is harmless
+    /// *because discovery cannot name any other kind of directory*: both surviving search steps
+    /// resolve an LLVM toolchain `bin` directory, which holds no `crt*.o` and no `lib*`. It stays
+    /// visible in the link command rather than mutating the child's environment behind the
+    /// caller's back (Nothing hidden).
+    fn cc_flags(&self) -> Vec<String> {
+        match self {
+            Linker::System => Vec::new(),
+            Linker::Lld(dir) => vec![format!("-B{}", dir.display()), "-fuse-ld=lld".to_string()],
+        }
+    }
+
+    /// How this linker is named in a diagnostic ([`link_failure_message`]).
+    fn describe(&self) -> String {
+        match self {
+            Linker::System => "system default".to_string(),
+            Linker::Lld(dir) => format!("lld ({})", dir.join(LLD_EXE).display()),
+        }
+    }
+}
+
+/// Pick the linker for an object format, honoring the [`LINKER_ENV`] override.
+///
+/// Policy, in one place:
+///
+///  - **Mach-O is never touched.** Apple's linker (`ld-prime`, Xcode 15+) is already fast, and a
+///    second linker on macOS would be a behavior difference for no measured gain. An explicit
+///    `ALIGNC_LINKER=lld` there is a hard error, not a silent no-op — an explicit request must
+///    never be quietly ignored.
+///  - **ELF, unset:** use `ld.lld` when [`lld_bin_dir`] finds one, else the system linker. This
+///    fail-open default is safe because both linkers produce a valid, equally optimized image: a
+///    host without lld links exactly as it did before, at the old speed, with nothing to act on.
+///  - **ELF, `lld`:** fail closed when no `ld.lld` is found. This is the knob CI sets so a missing
+///    lld is a red build rather than a silent regression to the slow linker.
+///  - **`system`:** the escape hatch, valid on every format.
+///
+/// Determinism: for one host and one `alignc` binary the answer is always the same — the search
+/// order is total, depends on no ambient `PATH`, and is memoized per process.
+fn select_linker(format: ObjectFormat) -> Result<Linker, String> {
+    select_linker_with(format, std::env::var_os(LINKER_ENV).as_deref().map(|v| v.to_string_lossy().into_owned()), lld_bin_dir)
+}
+
+/// [`select_linker`] with the environment request and the discovery step as parameters (unit
+/// testable without mutating process state or depending on what the host has installed).
+///
+/// The `format` arms are spelled out rather than defaulted, so adding an object format is a
+/// compile error here instead of a silent inheritance of the Mach-O answer.
+fn select_linker_with(
+    format: ObjectFormat,
+    request: Option<String>,
+    discover: impl FnOnce() -> Option<std::path::PathBuf>,
+) -> Result<Linker, String> {
+    match (request.as_deref(), format) {
+        (Some("system"), _) => Ok(Linker::System),
+        (Some("lld"), ObjectFormat::Elf) => discover().map(Linker::Lld).ok_or_else(|| {
+            format!(
+                "{LINKER_ENV}=lld was requested but no `{LLD_EXE}` was found\n\
+                 note: searched the compile-time $LLVM_SYS_221_PREFIX/bin, then `llvm-config --bindir`\n\
+                 note: on Debian/Ubuntu install the lld-{} package, or unset {LINKER_ENV} to \
+                 link with the system linker",
+                align_codegen_llvm::LLVM_TOOL_VERSION
+            )
+        }),
+        (Some("lld"), ObjectFormat::MachO) => Err(format!(
+            "{LINKER_ENV}=lld is only supported for ELF targets; this build targets Mach-O, \
+             whose linking always uses the Apple toolchain linker"
+        )),
+        (Some(other), _) => Err(format!("{LINKER_ENV} must be `system` or `lld` (got `{other}`)")),
+        // Automatic: ELF prefers lld when present, Mach-O always keeps the system linker.
+        (None, ObjectFormat::Elf) => Ok(discover().map_or(Linker::System, Linker::Lld)),
+        (None, ObjectFormat::MachO) => Ok(Linker::System),
+    }
+}
+
+/// The directory holding an `ld.lld` for this compiler's LLVM, memoized for the process.
+///
+/// Memoized because step 2 spawns `llvm-config`, while a multi-object or multi-run build asks
+/// repeatedly and the answer cannot change mid-process. The *override* is deliberately NOT
+/// memoized — only this filesystem probe is — so a caller that sets [`LINKER_ENV`] between links
+/// still gets what it asked for.
+///
+/// **`PATH` is never searched**, deliberately. A `PATH` fallback would make the project's linker a
+/// function of ambient environment (a conda/nix/toolbox shim, or a relative entry resolved against
+/// whatever directory the build runs in) and would let `-B` name a directory that is not an LLVM
+/// `bin` at all — exactly the assumption [`Linker::cc_flags`] relies on for that flag to be
+/// harmless. Both steps here resolve an LLVM installation this compiler is version-matched to.
+fn lld_bin_dir() -> Option<std::path::PathBuf> {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        resolve_lld_dir(lld_dir_from_prefix(option_env!("LLVM_SYS_221_PREFIX")), lld_dir_from_llvm_config)
+    })
+    .clone()
+}
+
+/// Compose the two discovery steps: the compile-time prefix wins outright, and `llvm-config` is
+/// consulted only when it misses. Split out from [`lld_bin_dir`] so the *order* is testable without
+/// depending on what the host has installed.
+fn resolve_lld_dir(
+    from_prefix: Option<std::path::PathBuf>,
+    from_llvm_config: impl FnOnce() -> Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    from_prefix.or_else(from_llvm_config)
+}
+
+/// Search step 1: `<prefix>/bin/ld.lld` for the build-time LLVM prefix — the same compile-time
+/// `LLVM_SYS_221_PREFIX` seam [`llvm_tool`] uses, so the linker version always matches the LLVM the
+/// compiler was built against. A stale baked-in path (prefix moved since the build) falls through.
+fn lld_dir_from_prefix(prefix: Option<&str>) -> Option<std::path::PathBuf> {
+    let dir = std::path::Path::new(prefix?).join("bin");
+    is_executable_file(&dir.join(LLD_EXE)).then_some(dir)
+}
+
+/// Search step 2: `llvm-config --bindir`. Covers an installed `alignc` whose baked prefix is gone,
+/// and the apt.llvm.org layout where `ld.lld` lives in `/usr/lib/llvm-22/bin` and only the suffixed
+/// `ld.lld-22` is on `PATH`. The versioned tool name is tried first so a host with several LLVMs
+/// resolves the one this compiler matches.
+fn lld_dir_from_llvm_config() -> Option<std::path::PathBuf> {
+    let versioned = format!("llvm-config-{}", align_codegen_llvm::LLVM_TOOL_VERSION);
+    for tool in [versioned.as_str(), "llvm-config"] {
+        let Ok(out) = std::process::Command::new(tool).arg("--bindir").output() else { continue };
+        if !out.status.success() {
+            continue;
+        }
+        let bindir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if bindir.is_empty() {
+            continue;
+        }
+        let dir = std::path::PathBuf::from(bindir);
+        if is_executable_file(&dir.join(LLD_EXE)) {
+            return Some(dir);
+        }
+    }
+    None
+}
+
+/// Whether `path` is a regular file the OS would actually run.
+///
+/// Mere existence is not enough: selecting a present-but-unrunnable `ld.lld` would make *every*
+/// link on that host fail, turning the fail-open default into a fail-everything default. On Unix
+/// this checks the file type plus any execute bit — the cheap `stat`-only approximation of `X_OK`;
+/// it can still admit a file this user may not execute, which then fails the link loudly with the
+/// linker named, but it rules out the realistic case of a non-executable leftover.
+fn is_executable_file(path: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else { return false };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 /// The gated capability libraries (`align_mir::Capability`): the ones a system commonly does NOT
 /// ship in the default linker search path, so a link failure involving them gets a `LIBRARY_PATH`
 /// hint appended ([`link_failure_message`]).
 const GATED_LIBS: [&str; 4] = ["z", "zstd", "crypto", "ssl"];
 
-/// The link-failure error. When the failed link involved a gated capability library, append a note
-/// about non-default library prefixes: those libraries often live outside the default search path
-/// (e.g. Homebrew keg-only OpenSSL on macOS), and the fix is the standard `LIBRARY_PATH` mechanism.
-/// The driver never injects search paths itself — what is linked, and from where, stays visible
-/// (Nothing hidden).
-fn link_failure_message(code: Option<i32>, link_libs: &[String]) -> String {
-    let mut msg = format!("link failed (cc exit code {code:?})");
+/// The link-failure error. Always names the linker that ran: the selection is automatic, so a
+/// failure that only a particular linker produces is otherwise invisible, and the reader needs to
+/// know whether to retry with `ALIGNC_LINKER=system`. When the failed link involved a gated
+/// capability library, append a note about non-default library prefixes: those libraries often live
+/// outside the default search path (e.g. Homebrew keg-only OpenSSL on macOS), and the fix is the
+/// standard `LIBRARY_PATH` mechanism. The driver never injects search paths itself — what is
+/// linked, and from where, stays visible (Nothing hidden).
+fn link_failure_message(code: Option<i32>, link_libs: &[String], linker: &Linker) -> String {
+    let mut msg = format!("link failed (cc exit code {code:?}, linker: {})", linker.describe());
     if link_libs.iter().any(|l| GATED_LIBS.contains(&l.as_str())) {
         msg.push_str(
             "\nnote: libraries in a non-default prefix (e.g. Homebrew keg-only) are found via \
              LIBRARY_PATH, e.g. LIBRARY_PATH=/opt/homebrew/lib:/opt/homebrew/opt/openssl@3/lib",
         );
+    }
+    if matches!(linker, Linker::Lld(_)) {
+        msg.push_str(&format!(
+            "\nnote: this link used lld; set {LINKER_ENV}=system to link with the system linker instead"
+        ));
     }
     msg
 }
@@ -5347,16 +5608,278 @@ mod tests {
         );
     }
 
+    /// A uniquely named temp directory that removes itself on drop, so a failing assertion (which
+    /// unwinds past any trailing cleanup line) cannot leave a tree behind. The name carries the pid
+    /// and an address so two tests, and two concurrently running test binaries, never collide.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "align-driver-{tag}-{}-{:p}",
+                std::process::id(),
+                &0u8 as *const _
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create scratch dir");
+            Scratch(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Give `path` the execute bits, so [`is_executable_file`] admits it. A no-op off Unix, where
+    /// that predicate only checks the file type.
+    fn make_executable(path: &std::path::Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path).expect("stat").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).expect("chmod");
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+        }
+    }
+
     #[test]
     fn link_failure_message_hints_library_path_only_for_gated_libs() {
         // No gated library involved → the plain error, no note.
-        let plain = link_failure_message(Some(1), &["m".to_string()]);
+        let plain = link_failure_message(Some(1), &["m".to_string()], &Linker::System);
         assert!(plain.starts_with("link failed"));
         assert!(!plain.contains("LIBRARY_PATH"), "no hint without a gated lib:\n{plain}");
         // A gated library (Homebrew keg-only class) → the LIBRARY_PATH hint is appended.
-        let hinted = link_failure_message(Some(1), &["z".to_string(), "ssl".to_string()]);
+        let hinted = link_failure_message(Some(1), &["z".to_string(), "ssl".to_string()], &Linker::System);
         assert!(hinted.contains("LIBRARY_PATH"), "gated libs get the hint:\n{hinted}");
         assert!(hinted.contains("/opt/homebrew/opt/openssl@3/lib"), "hint shows an example path:\n{hinted}");
+    }
+
+    /// The linker that ran is always named, and an lld link additionally offers the one escape
+    /// hatch — a failure the system linker would not have produced must be actionable.
+    #[test]
+    fn link_failure_message_names_the_linker() {
+        let system = link_failure_message(Some(1), &[], &Linker::System);
+        assert!(system.contains("linker: system default"), "{system}");
+        assert!(!system.contains("ALIGNC_LINKER"), "no escape hatch to offer:\n{system}");
+
+        let lld = link_failure_message(Some(1), &[], &Linker::Lld("/usr/lib/llvm-22/bin".into()));
+        assert!(lld.starts_with("link failed"), "{lld}");
+        assert!(lld.contains("linker: lld (/usr/lib/llvm-22/bin/ld.lld)"), "{lld}");
+        assert!(lld.contains("ALIGNC_LINKER=system"), "the escape hatch is named:\n{lld}");
+    }
+
+    /// `-B<dir>` + `-fuse-ld=lld`, in that order, and nothing at all for the system linker — a
+    /// system-linker build must be argv-identical to the pre-item-2 driver.
+    #[test]
+    fn linker_flags_are_pinned() {
+        assert_eq!(Linker::System.cc_flags(), Vec::<String>::new());
+        assert_eq!(
+            Linker::Lld("/usr/lib/llvm-22/bin".into()).cc_flags(),
+            ["-B/usr/lib/llvm-22/bin", "-fuse-ld=lld"]
+        );
+    }
+
+    /// The full override × format × availability matrix for [`select_linker_with`].
+    #[test]
+    fn linker_selection_matrix() {
+        let dir = std::path::PathBuf::from("/opt/llvm/bin");
+        let found = || Some(dir.clone());
+        let missing = || None;
+
+        // Unset + ELF: lld when present, system when not (fail-open; both images are equally valid
+        // and equally optimized, so there is nothing for the user to act on).
+        assert_eq!(select_linker_with(ObjectFormat::Elf, None, found), Ok(Linker::Lld(dir.clone())));
+        assert_eq!(select_linker_with(ObjectFormat::Elf, None, missing), Ok(Linker::System));
+        // Unset + Mach-O: never lld, even when an `ld.lld` is installed. macOS is unchanged.
+        assert_eq!(select_linker_with(ObjectFormat::MachO, None, found), Ok(Linker::System));
+
+        // `system`: the system linker on every format.
+        let system = Some("system".to_string());
+        assert_eq!(select_linker_with(ObjectFormat::Elf, system.clone(), found), Ok(Linker::System));
+        assert_eq!(select_linker_with(ObjectFormat::MachO, system, found), Ok(Linker::System));
+
+        // `lld` + ELF: honored when found, a hard error when not (fail-closed, so a CI or
+        // measurement run cannot silently fall back to the system linker).
+        let lld = Some("lld".to_string());
+        assert_eq!(select_linker_with(ObjectFormat::Elf, lld.clone(), found), Ok(Linker::Lld(dir.clone())));
+        let err = select_linker_with(ObjectFormat::Elf, lld.clone(), missing).unwrap_err();
+        assert!(err.contains("no `ld.lld` was found"), "{err}");
+        assert!(err.contains("lld-22"), "the install hint names the versioned package:\n{err}");
+        // The note must describe the search that actually ran: the COMPILE-TIME prefix and
+        // llvm-config, and no `PATH` (which discovery deliberately never consults).
+        assert!(err.contains("compile-time $LLVM_SYS_221_PREFIX/bin"), "{err}");
+        assert!(err.contains("llvm-config --bindir"), "{err}");
+        assert!(!err.contains("PATH"), "the note must not promise a PATH search:\n{err}");
+
+        // `lld` + Mach-O: an explicit request is refused, never silently ignored.
+        let err = select_linker_with(ObjectFormat::MachO, lld, found).unwrap_err();
+        assert!(err.contains("only supported for ELF"), "{err}");
+
+        // Anything else is a hard error on both formats: an unrecognized value must not degrade
+        // into the default policy.
+        for format in [ObjectFormat::Elf, ObjectFormat::MachO] {
+            let err = select_linker_with(format, Some("mold".to_string()), found).unwrap_err();
+            assert!(err.contains("must be `system` or `lld`"), "{err}");
+            assert!(err.contains("got `mold`"), "{err}");
+        }
+    }
+
+    /// Discovery step 1 in full: what does and does not count as a usable `ld.lld` under a prefix.
+    /// Step 2 (`llvm-config --bindir`) spawns a process and depends on what the host installed, so
+    /// only its *position* in the chain is pinned, by
+    /// [`lld_discovery_prefers_the_baked_prefix_over_llvm_config`].
+    #[test]
+    fn lld_discovery_prefix_step() {
+        let scratch = Scratch::new("lld-prefix");
+        let bin = scratch.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("create temp prefix");
+        let prefix = scratch.path().to_string_lossy().into_owned();
+
+        // A prefix without `ld.lld` does not match, even though the prefix itself exists: a host
+        // with LLVM but no lld package must fall through, not name a nonexistent linker.
+        assert_eq!(lld_dir_from_prefix(Some(&prefix)), None);
+        assert_eq!(lld_dir_from_prefix(None), None);
+
+        // A NON-EXECUTABLE `ld.lld` is still not a match. Selecting one would make every link on
+        // the host fail, turning the fail-open default into a fail-everything default.
+        std::fs::write(bin.join(LLD_EXE), b"").unwrap();
+        assert_eq!(lld_dir_from_prefix(Some(&prefix)), None, "a non-executable ld.lld must not be selected");
+
+        // A directory named `ld.lld` is not a program either.
+        let decoy = Scratch::new("lld-decoy");
+        std::fs::create_dir_all(decoy.path().join("bin").join(LLD_EXE)).unwrap();
+        assert_eq!(lld_dir_from_prefix(Some(&decoy.path().to_string_lossy())), None, "a directory is not a linker");
+
+        // Only once it is executable does the prefix answer.
+        make_executable(&bin.join(LLD_EXE));
+        assert_eq!(lld_dir_from_prefix(Some(&prefix)), Some(bin));
+
+        // A version-suffixed `ld.lld-22` never counts: `-fuse-ld=lld` can only address the exact
+        // name, so admitting the suffixed one would produce a `-B` that resolves nothing.
+        let suffixed = Scratch::new("lld-suffixed");
+        let suffixed_bin = suffixed.path().join("bin");
+        std::fs::create_dir_all(&suffixed_bin).unwrap();
+        let alt = suffixed_bin.join(format!("{LLD_EXE}-{}", align_codegen_llvm::LLVM_TOOL_VERSION));
+        std::fs::write(&alt, b"").unwrap();
+        make_executable(&alt);
+        assert_eq!(lld_dir_from_prefix(Some(&suffixed.path().to_string_lossy())), None);
+    }
+
+    /// The composition order of the two discovery steps, with no dependency on what the host has
+    /// installed: the compile-time prefix wins outright and `llvm-config` is not even consulted.
+    #[test]
+    fn lld_discovery_prefers_the_baked_prefix_over_llvm_config() {
+        use std::cell::Cell;
+
+        let prefix_dir = std::path::PathBuf::from("/baked/llvm/bin");
+        let config_dir = std::path::PathBuf::from("/queried/llvm/bin");
+
+        let consulted = Cell::new(false);
+        let config = || {
+            consulted.set(true);
+            Some(config_dir.clone())
+        };
+        assert_eq!(resolve_lld_dir(Some(prefix_dir.clone()), config), Some(prefix_dir));
+        assert!(!consulted.get(), "a prefix hit must not spawn llvm-config");
+
+        // A missed prefix falls through to `llvm-config`, and both missing yields None (the
+        // fail-open answer the unset default turns into the system linker).
+        let consulted = Cell::new(false);
+        let config = || {
+            consulted.set(true);
+            Some(config_dir.clone())
+        };
+        assert_eq!(resolve_lld_dir(None, config), Some(config_dir));
+        assert!(consulted.get(), "a missed prefix must consult llvm-config");
+        assert_eq!(resolve_lld_dir(None, || None), None);
+    }
+
+    /// The exact `cc` argv for a link, as a pure function of its inputs. This is the seam the
+    /// `capability_linking` owner asserts the gated `-l` set on, so its shape is pinned here.
+    #[test]
+    fn link_command_args_are_pinned_per_format() {
+        let obj = std::path::Path::new("/tmp/prog.o");
+        let objs = [obj];
+        let libs = ["z".to_string()];
+        let base = LinkPlan {
+            objs: &objs,
+            exe: std::path::Path::new("/tmp/prog"),
+            runtime: std::path::Path::new("/tmp/libalign_runtime.a"),
+            ordered_link_libs: &libs,
+            format: ObjectFormat::Elf,
+            profile: Profile::Release,
+            profile_rt: None,
+            linker: &Linker::System,
+        };
+
+        let elf = link_command_args(&base);
+        assert_eq!(
+            elf,
+            [
+                "/tmp/prog.o",
+                "/tmp/libalign_runtime.a",
+                "-o",
+                "/tmp/prog",
+                "-Wl,--gc-sections",
+                "-Wl,--as-needed",
+                "-lpthread",
+                "-ldl",
+                "-lm",
+                "-lz",
+            ]
+        );
+
+        // lld only prepends its two driver options; everything after is byte-identical.
+        let lld_linker = Linker::Lld("/usr/lib/llvm-22/bin".into());
+        let lld = link_command_args(&LinkPlan { linker: &lld_linker, ..base });
+        assert_eq!(&lld[..2], ["-B/usr/lib/llvm-22/bin", "-fuse-ld=lld"]);
+        assert_eq!(&lld[2..], &elf[..]);
+
+        // Mach-O: the other hygiene spelling, no support libs, and no in-link strip even for a
+        // stripping profile (an external `strip` runs after the link instead).
+        let macho = link_command_args(&LinkPlan {
+            ordered_link_libs: &[],
+            format: ObjectFormat::MachO,
+            profile: Profile::Tiny,
+            ..base
+        });
+        assert_eq!(
+            macho,
+            ["/tmp/prog.o", "/tmp/libalign_runtime.a", "-o", "/tmp/prog", "-Wl,-dead_strip", "-Wl,-dead_strip_dylibs"]
+        );
+
+        // ELF stripping profile strips in the link; instrument-PGO appends the archive plus the
+        // per-format forced-undefined anchor, after the objects that need it and before the `-l`s.
+        let rt = std::path::Path::new("/tmp/libclang_rt.profile.a");
+        let pgo = link_command_args(&LinkPlan { profile: Profile::Small, profile_rt: Some(rt), ..base });
+        assert_eq!(
+            pgo,
+            [
+                "/tmp/prog.o",
+                "/tmp/libalign_runtime.a",
+                "-o",
+                "/tmp/prog",
+                "-Wl,--gc-sections",
+                "-Wl,--as-needed",
+                "-Wl,--strip-all",
+                "-lpthread",
+                "-ldl",
+                "-lm",
+                "/tmp/libclang_rt.profile.a",
+                "-Wl,--undefined=__llvm_profile_runtime",
+                "-lz",
+            ]
+        );
     }
 
     #[test]

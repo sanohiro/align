@@ -1200,7 +1200,10 @@ fn usage() {
                        overrides ALIGNC_JOBS)\n  \
          \n\
          ALIGNC_CACHE  on | <path> | off — the codegen cache (default: on, at the XDG cache root)\n  \
-         ALIGNC_JOBS   default codegen worker-thread count (the -j flag overrides it)"
+         ALIGNC_JOBS   default codegen worker-thread count (the -j flag overrides it)\n  \
+         ALIGNC_LINKER system | lld — pin the linker (default: lld on ELF when the LLVM\n  \
+                       toolchain ships one, otherwise the system linker; macOS always uses the\n  \
+                       system linker). Only link speed changes, never the optimization applied."
     );
 }
 
