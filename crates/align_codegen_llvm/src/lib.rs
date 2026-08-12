@@ -551,8 +551,8 @@ pub fn emit_llvm_ir(program: &Program, target: &BuildTarget, optimized: bool, ex
     if let Some(rt) = rt_module {
         link_in_rt_lto(&ctx, &module, rt, &runtime)?;
     }
-    // The IR lens never shows IR it knows is ill-formed, in every profile — `build_module`'s own
-    // verification below is debug-only.
+    // The IR lens never shows IR it knows is ill-formed. `build_module` already verified what it
+    // built; this run additionally covers the `--rt-lto` merge above.
     verify_generated_module(&module)?;
     if optimized {
         run_opt_pipeline(&module, &tm, "default<O2>")?;
@@ -1544,11 +1544,11 @@ fn build_module<'c>(
     // pipeline's only one, which is exactly why the nested-tagged type mismatch #670 introduced
     // survived sixty PRs: every `build_and_run` owner test compiles with `rt_lto = false`.
     //
-    // Debug-only, and a test binary is always a debug build, so the whole owner suite is now a
-    // well-formedness gate while a release `alignc` keeps today's behavior. Promoting it to every
-    // profile is blocked on one pre-existing MIR defect it exposes, recorded with its repro and
-    // owner in `docs/impl/05-backend-llvm.md`; the measured cost of doing so is about 1%.
-    #[cfg(debug_assertions)]
+    // Every profile, not only a debug `alignc`: the one MIR defect that blocked the promotion (a
+    // borrowed temporary from value-carrying control flow, lowered twice) is fixed, and a release
+    // build that silently emits ill-formed IR is exactly the blind spot #670 lived in. The
+    // measured cost over the 78-example corpus plus `apps/db` is at or under 1%, inside the
+    // unverified configuration's own run-to-run spread (`docs/impl/05-backend-llvm.md` §1).
     verify_generated_module(module)?;
     Ok(RuntimeDeclarations { physical_names: runtime_physical_names })
 }

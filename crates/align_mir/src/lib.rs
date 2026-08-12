@@ -3532,9 +3532,43 @@ fn temporary_drop_flag(b: &mut Builder, e: &hir::Expr, operand: &Operand) -> Opt
     }
 }
 
+/// Whether borrow mode lowers `e` differently from [`lower_expr`] — exactly the kinds
+/// [`lower_expr_for_borrow`] handles below instead of delegating.
+///
+/// Value-carrying control flow and borrow-transparent scopes thread the enclosing borrow through
+/// their own join rather than transferring ownership into it, so their two lowerings are not
+/// interchangeable and **must not both run**. That makes this the eager worklist's filter as well:
+/// see [`eager_worklist_children`].
+fn borrow_mode_differs(e: &hir::Expr) -> bool {
+    matches!(
+        &e.kind,
+        hir::ExprKind::If { .. }
+            | hir::ExprKind::Match { .. }
+            | hir::ExprKind::ElseUnwrap { .. }
+            | hir::ExprKind::Block(_)
+            | hir::ExprKind::Unsafe(_)
+            | hir::ExprKind::Arena(_)
+            | hir::ExprKind::NamedArena { .. }
+            | hir::ExprKind::TaskGroup(_)
+    )
+}
+
 /// Lower the root of an owned value in a borrowing context. Value-carrying control flow must not
 /// null a bound-local arm merely because it stores that borrowed value through a join slot.
+///
+/// Every kind handled here rather than delegated to [`lower_expr`] is listed by
+/// [`borrow_mode_differs`], which keeps the eager worklist from pre-lowering such a child in
+/// non-borrow mode. Both lowerings running is not a redundancy but a miscompile: the non-borrow
+/// copy nulls a bound arm's source local, and the borrow copy's join then stores the first copy's
+/// per-arm SSA values from blocks that do not dominate them
+/// (`Instruction does not dominate all uses`, `docs/impl/05-backend-llvm.md` §1).
 fn lower_expr_for_borrow(b: &mut Builder, e: &hir::Expr) -> Operand {
+    debug_assert!(
+        !borrow_mode_differs(e)
+            || !b.ctx.eager_expr_results.contains_key(&(std::ptr::from_ref(e) as usize)),
+        "the eager worklist pre-lowered a borrow edge in non-borrow mode: every kind handled \
+         specially here must be listed by `borrow_mode_differs`",
+    );
     if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
     }
@@ -4744,6 +4778,10 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
 /// Strict eager parents perform no parent action between their source-ordered children. They can
 /// therefore share a heterogeneous worklist without disturbing the required-child ownership and
 /// termination protocol used by parent-specific or structurally optimized operations.
+///
+/// The worklist lowers those children *ahead of* the parent and the parent's own [`lower_expr`]
+/// call then returns the memoized operand, so a listed parent's borrowing child edges are filtered
+/// by [`eager_worklist_children`] before they are entered.
 fn expression_uses_eager_worklist(e: &hir::Expr) -> bool {
     match &e.kind {
         hir::ExprKind::Binary { op, .. } => !matches!(op, BinOp::And | BinOp::Or),
@@ -4772,6 +4810,23 @@ fn expression_uses_eager_worklist(e: &hir::Expr) -> bool {
         | hir::ExprKind::BuilderToString(_) => true,
         _ => false,
     }
+}
+
+/// The child edges of an eager parent that the worklist may lower ahead of it.
+///
+/// Pre-lowering is sound only for an edge the parent then consumes through [`lower_expr`], which
+/// returns the memoized operand. `StrBorrow` consumes its child through [`lower_borrowed_owned`]
+/// instead, and for the kinds [`borrow_mode_differs`] names that is a *different* lowering — so
+/// such a child is left for the parent to lower once, in borrow mode. Entering it here produced
+/// two copies of the same `if` / `match` / `else`: the non-borrow copy nulled a bound arm's source
+/// local, and the borrow copy's join stored the non-borrow copy's per-arm SSA values from blocks
+/// that do not dominate them (`docs/impl/05-backend-llvm.md` §1).
+fn eager_worklist_children(parent: &hir::Expr) -> Vec<&hir::Expr> {
+    let mut children = align_sema::direct_expr_children(parent);
+    if matches!(parent.kind, hir::ExprKind::StrBorrow(_)) {
+        children.retain(|child| !borrow_mode_differs(child));
+    }
+    children
 }
 
 /// Dispatch parent-specific roots without retaining the giant eager-expression match frame.
@@ -4969,7 +5024,7 @@ fn lower_expr(b: &mut Builder, root: &hir::Expr) -> Operand {
                     continue;
                 }
                 work.push(Work::Exit(expression));
-                let children = align_sema::direct_expr_children(expression);
+                let children = eager_worklist_children(expression);
                 work.extend(children.into_iter().rev().map(Work::Enter));
             }
             Work::Exit(expression) => {
