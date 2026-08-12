@@ -235,6 +235,97 @@ The failure edge of `?` (`04 §2.1`) is cold. In LLVM:
 
 This keeps the normal path's I-cache clean (`draft.md` §10).
 
+### Every return edge carries the cleanup bit — including the cold one
+
+Cold is not dead. The `?` failure edge is an ordinary **return edge**, so `04 §1`'s rule applies to
+it unchanged: a `ReturnCleanupAbi::DynamicBit` function returns the value together with one
+path-local cleanup bit, on every edge. `lower_try` instead lowered its `Err` edge to
+`Term::Unreachable` whenever `lowered_drop_flag` produced no bit for the `?` operand, so the whole
+propagation path dead-ended and the program took a SIGTRAP (exit 133) where it had to return `Err`:
+
+```align
+fn check(flag: bool) -> Result<(), i64> {
+  if flag { return Ok(()) }
+  return Err(9)
+}
+fn via_try(flag: bool) -> Result<string, i64> {
+  s := "try".clone()
+  check(flag)?          // Err edge: drop `s`, then trap instead of returning Err(9)
+  return Ok(s)
+}
+```
+
+The trigger is a **Copy-typed `?` operand inside a recursively-Move-returning function**, which is
+an everyday shape: `via_try` returns `Result<string, …>` (`DynamicBit`) while `check` returns
+`Result<(), i64>`, a type with no owned payload and therefore no ownership bit anywhere.
+
+**A missing bit is a `false` bit, never a dead end.** No bit means the lowering knows of no
+individually owned payload, and the `Ok` edge already acts on exactly that reading — it attaches a
+drop flag to the unwrapped value only `if let Some(flag)`. For the `Err` edge the answer is not
+merely conservative but exact: sema requires the operand's error type to *equal* the function's
+(`03`; there is no `From` conversion, so `?` re-wraps the very payload it extracted, allocating
+nothing), the propagated `Err(err)` therefore owns something only if the operand did, and an
+operand whose type is not recursively Move cannot own anything. A
+`debug_assert` in `lower_try` states that invariant (`needs_drop_flag(operand)` implies a bit), and
+every test binary is a debug build, so the whole owner suite carries it.
+
+`terminate_return` is now the **single authority** over the three return edges — the `?` `Err`
+edge, the function-body fall-through tail, and `Stmt::Return` — which previously repeated the same
+ABI match, and the same `(DynamicBit, None) => Term::Unreachable` arm, three times. Its only
+remaining `Unreachable` is a valueless return from a `DynamicBit` function: that ABI is chosen
+exactly when the return type is recursively Move, so it is never `Unit`, and a valueless edge is
+malformed HIR the driver never lowers (the backend rejects it too — "dynamic-cleanup function
+returned no value or cleanup bit"). Failing closed there is a diagnosis, not a miscompile.
+
+**Closure matrix (return-cleanup ABI × return edge × cleanup-bit provenance × Err reachability).**
+`ReturnCleanupAbi` has exactly two variants (`None`, `DynamicBit`), and `None` returns
+`Term::Return` on every edge and provenance — one row. Provenance is the complete set of sources
+`lowered_drop_flag` consults: an SSA bit attached to the value (a direct or indirect `DynamicBit`
+call, a control-flow join), a bound local's drop flag, the one recursion arm shared by the
+`Option`/`Result` wrappers, `Try`, and `TaskGet`, a borrow-transparent scope's tail, sema's static
+allocation provenance, and no source at all. `if` and `match` reach the join through the same
+`control_result_slots` flag, so the join row probes one of them.
+
+| return edge | provenance | probe | before | after |
+|---|---|---|---|---|
+| `?` `Err` | attached SSA bit (`DynamicBit` call) | `dyn_call` | `…, %bit` | unchanged |
+| `?` `Err` | attached SSA bit (`if` join) | `join` | `…, %bit` | unchanged |
+| `?` `Err` | bound Move-`Result` local's flag | `move_local` | `…, %bit` | unchanged |
+| `?` `Err` | wrapper literal → sema static provenance | `wrapper` | `…, true` | unchanged |
+| `?` `Err` | scope tail recursion over an owned operand | `move_scope` | `…, %bit` | unchanged |
+| `?` `Err` | `Try` recursion (a nested `??`) | `nested_try` | `…, %bit` | unchanged |
+| `?` `Err` | **none** — Copy operand, direct call | `copy_call` | `unreachable` | `…, false` |
+| `?` `Err` | **none** — Copy operand, bound local | `copy_local` | `unreachable` | `…, false` |
+| `?` `Err` | **none** — Copy operand in `{ }` | `copy_block` | `unreachable` | `…, false` |
+| `?` `Err` | **none** — Copy operand in `unsafe` | `copy_unsafe` | `unreachable` | `…, false` |
+| `?` `Err` | **none** — Copy operand in `arena` | `copy_arena` | `unreachable` | `…, false` |
+| `?` `Err` | **none** — Copy operand in a named arena | `copy_named_arena` | `unreachable` | `…, false` |
+| `?` `Err` | **none** — Copy operand in `task_group` | `copy_task_group` | `unreachable` | `…, false` |
+| `?` `Err` | any, under `ReturnCleanupAbi::None` | `copy_abi` | `return v` | unchanged |
+| tail / `Stmt::Return` | every provenance above | `move_res`, `mixed_res`, `nested_res` | `…, %bit` / `…, true` | unchanged |
+| tail / `Stmt::Return` | none | — | `unreachable` | `…, false` |
+
+(`…` abbreviates `return_with_cleanup v`.) The five borrow-transparent scope kinds each get their
+own missing-bit cell rather than one representative, because they reach the bit through
+`moved_drop_flag`'s recursion and `task_group` is deliberately not that recursion in
+`temporary_drop_flag` — a difference this matrix must be able to see.
+
+No valid program reaches the sibling sites' missing-bit cell: a returned expression's type *is* the
+`DynamicBit` return type, so it is recursively Move and every shape that can produce it carries a
+bit (moving out of a `Move` array element or a borrowed place is rejected earlier). The row exists
+because the arm existed, and the shared helper closes it structurally rather than by argument.
+
+The `Err`-reachability axis is per cell and needs an execution witness, not a structural one: an
+`Err` edge that is never taken produces the same exit code on both compilers, and the pre-fix
+`unreachable` is invisible until control actually reaches it. Every probe therefore runs both ways
+and contributes its `Ok` length and its `Err` code to one exit code.
+
+Owners: `move_return_cleanup::try_err_edges_forward_a_cleanup_bit_for_every_operand_provenance`
+(the provenance battery — MIR structure for every row, plus execution of both reachability states),
+and the acceptance case `owned_temporaries::moved_slots_emit_no_known_null_destructor_calls`, whose
+`via_try` fixture is the reported reproduction and which fails with no exit code (SIGTRAP) before
+this fix.
+
 ---
 
 ## 4. allocation lowering

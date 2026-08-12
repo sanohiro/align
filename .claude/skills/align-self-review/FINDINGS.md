@@ -112,8 +112,8 @@ invented exact counts here.
 | #757 | `89aed25b` | P3 | `owner-test-topology` | Add direct discriminating owners for the three previously paper-only closure cells. |
 | #757 | `89aed25b` | P3 | `source-of-truth-drift` | Align memo hit/miss counter documentation with the implemented accounting semantics. |
 | #757 | `89aed25b` | P3 | `performance-evidence-completeness` | Measure cold one-shot CLI overhead before keeping the memo enabled by default. |
-| — | `3c892f01` | P2 | `analysis-control-path-completeness` | Collapse the hand-written borrow-mode kind list into one authority gating both the dispatch and the eager-worklist filter. |
-| — | `3c892f01` | P2 | `owner-test-topology` | Cover the five borrow-transparent scope kinds and give the bound cells a witness that discriminates against the pre-fix compiler. |
+| #768 | `3c892f01` | P2 | `analysis-control-path-completeness` | Collapse the hand-written borrow-mode kind list into one authority gating both the dispatch and the eager-worklist filter. |
+| #768 | `3c892f01` | P2 | `owner-test-topology` | Cover the five borrow-transparent scope kinds and give the bound cells a witness that discriminates against the pre-fix compiler. |
 | #757 | `89aed25b` | P3 | `source-of-truth-drift` | Scope the test environment-lock safety comment to the isolation it actually proves. |
 
 ## Rejected claims

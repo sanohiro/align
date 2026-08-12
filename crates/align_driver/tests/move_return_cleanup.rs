@@ -59,6 +59,114 @@ fn main() -> i32 {
 }
 "#;
 
+/// One `?` per cleanup-bit provenance, inside a `DynamicBit` function (`05 §3`). The five
+/// `copy_*` scope probes are the same missing-bit cell reached through each borrow-transparent
+/// scope kind, which `moved_drop_flag` recurses into separately; `copy_abi` is the
+/// `ReturnCleanupAbi::None` row. Every probe is called on both its `Ok` and its `Err` selector, so
+/// the exit code covers the reachability axis as well as the structure.
+const TRY_ERR_EDGE_SOURCE: &str = r#"
+fn copy_res(flag: bool) -> Result<(), i64> {
+  if flag { return Ok(()) }
+  return Err(5)
+}
+fn move_res(flag: bool) -> Result<string, string> {
+  if flag { return Ok("ok".clone()) }
+  return Err("boom".clone())
+}
+fn mixed_res(flag: bool) -> Result<string, i64> {
+  if flag { return Ok("keep".clone()) }
+  return Err(2)
+}
+
+fn dyn_call(flag: bool) -> Result<string, string> {
+  v := move_res(flag)?
+  return Ok(v)
+}
+fn join(flag: bool) -> Result<string, i64> {
+  v := (if flag { mixed_res(true) } else { mixed_res(false) })?
+  return Ok(v)
+}
+fn move_local(flag: bool) -> Result<string, string> {
+  r := move_res(flag)
+  v := r?
+  return Ok(v)
+}
+fn wrapper() -> Result<string, i64> {
+  v: string := Ok("wrap".clone())?
+  return Ok(v)
+}
+fn move_scope(flag: bool) -> Result<string, string> {
+  v := { move_res(flag) }?
+  return Ok(v)
+}
+fn nested_res(flag: bool) -> Result<Result<string, i64>, i64> {
+  if flag { return Ok(Ok("nest".clone())) }
+  return Err(3)
+}
+fn nested_try(flag: bool) -> Result<string, i64> {
+  v := nested_res(flag)??
+  return Ok(v)
+}
+fn copy_call(flag: bool) -> Result<string, i64> {
+  s := "call".clone()
+  copy_res(flag)?
+  return Ok(s)
+}
+fn copy_local(flag: bool) -> Result<string, i64> {
+  s := "local".clone()
+  r := copy_res(flag)
+  r?
+  return Ok(s)
+}
+fn copy_block(flag: bool) -> Result<string, i64> {
+  s := "block".clone()
+  { copy_res(flag) }?
+  return Ok(s)
+}
+fn copy_unsafe(flag: bool) -> Result<string, i64> {
+  s := "unsafe".clone()
+  unsafe { copy_res(flag) }?
+  return Ok(s)
+}
+fn copy_arena(flag: bool) -> Result<string, i64> {
+  s := "arena".clone()
+  arena { copy_res(flag) }?
+  return Ok(s)
+}
+fn copy_named_arena(flag: bool) -> Result<string, i64> {
+  s := "named".clone()
+  arena a { copy_res(flag) }?
+  return Ok(s)
+}
+fn copy_task_group(flag: bool) -> Result<string, i64> {
+  s := "tg".clone()
+  task_group { copy_res(flag) }?
+  return Ok(s)
+}
+fn copy_abi(flag: bool) -> Result<i64, i64> {
+  copy_res(flag)?
+  return Ok(1)
+}
+
+fn len_or(r: Result<string, i64>) -> i64 = match r { Ok(s) => s.len() Err(e) => e }
+fn text_or(r: Result<string, string>) -> i64 = match r { Ok(s) => s.len() Err(e) => e.len() }
+fn code_or(r: Result<i64, i64>) -> i64 = match r { Ok(v) => v Err(e) => e }
+
+fn main() -> i32 {
+  ok := text_or(dyn_call(true)) + len_or(join(true)) + text_or(move_local(true))
+    + len_or(wrapper()) + text_or(move_scope(true)) + len_or(nested_try(true))
+    + len_or(copy_call(true)) + len_or(copy_local(true))
+    + len_or(copy_block(true)) + len_or(copy_unsafe(true)) + len_or(copy_arena(true))
+    + len_or(copy_named_arena(true)) + len_or(copy_task_group(true)) + code_or(copy_abi(true))
+  failed := text_or(dyn_call(false)) + len_or(join(false)) + text_or(move_local(false))
+    + text_or(move_scope(false)) + len_or(nested_try(false))
+    + len_or(copy_call(false)) + len_or(copy_local(false))
+    + len_or(copy_block(false)) + len_or(copy_unsafe(false)) + len_or(copy_arena(false))
+    + len_or(copy_named_arena(false)) + len_or(copy_task_group(false)) + code_or(copy_abi(false))
+  return (ok + failed) as i32
+}
+"#;
+
 fn mir_text(source: &str) -> String {
     let mut source_map = SourceMap::new();
     let checked = check(&mut source_map, "move-return-cleanup.align", source);
@@ -68,6 +176,83 @@ fn mir_text(source: &str) -> String {
         align_driver::format_diagnostics(&source_map, &checked.diags)
     );
     align_mir::print::program_to_string(&lower_to_mir(&checked.hir))
+}
+
+fn function<'a>(mir: &'a str, name: &str) -> &'a str {
+    let marker = format!("fn {name}(");
+    let start = mir.find(&marker).unwrap_or_else(|| panic!("missing {marker} in MIR:\n{mir}"));
+    let body = &mir[start..];
+    let end = body.find("\n}").map_or(body.len(), |i| i + 2);
+    &body[..end]
+}
+
+/// The cleanup bit spelled on each of a function's return edges, in block order. A `?` puts its
+/// `Err` edge first: the `Ok` continuation's own return edge lives in a block created after it.
+fn cleanup_bits(body: &str) -> Vec<&str> {
+    body.lines()
+        .filter_map(|line| line.trim().strip_prefix("return_with_cleanup "))
+        .filter_map(|edge| edge.rsplit_once(", "))
+        .map(|(_, bit)| bit)
+        .collect()
+}
+
+/// `05 §3`: a `?` `Err` edge is a return edge, so it forwards the return ABI's cleanup bit for
+/// every operand provenance — including the operand that has none, where the bit is `false`. The
+/// pre-fix compiler dead-ended those seven cells in `Term::Unreachable`, so the structural half is
+/// mutation-verified by the absence of `unreachable`; the execution half covers the reachability
+/// axis, which no structural witness can see (an `Err` edge that is never taken hides the trap).
+#[test]
+fn try_err_edges_forward_a_cleanup_bit_for_every_operand_provenance() {
+    let mir = mir_text(TRY_ERR_EDGE_SOURCE);
+    assert!(
+        !mir.contains("unreachable"),
+        "no return edge may dead-end into a runtime trap:\n{mir}"
+    );
+    // No ownership bit: the propagated `Err` cannot own a payload its Copy-typed operand never had.
+    for name in [
+        "copy_call",
+        "copy_local",
+        "copy_block",
+        "copy_unsafe",
+        "copy_arena",
+        "copy_named_arena",
+        "copy_task_group",
+    ] {
+        let body = function(&mir, name);
+        assert!(
+            matches!(
+                cleanup_bits(body).as_slice(),
+                [err_edge, tail] if *err_edge == "false" && tail.starts_with('%')
+            ),
+            "the `?` Err edge of {name} must propagate an unowned Err beside its owned tail:\n{body}"
+        );
+    }
+    // A runtime bit (a `DynamicBit` call, a control-flow join, a bound local's flag, a scope's or
+    // a nested `?`'s recursion into one of those) is forwarded as the SSA value it is.
+    for name in ["dyn_call", "join", "move_local", "move_scope", "nested_try"] {
+        let body = function(&mir, name);
+        let bits = cleanup_bits(body);
+        assert!(
+            !bits.is_empty() && bits.iter().all(|bit| bit.starts_with('%')),
+            "every return edge of {name} must forward the operand's own ownership bit:\n{body}"
+        );
+    }
+    assert_eq!(
+        cleanup_bits(function(&mir, "wrapper")).first().copied(),
+        Some("true"),
+        "a wrapper literal's Err edge must forward sema's static provenance"
+    );
+    let copy_abi = function(&mir, "copy_abi");
+    assert!(
+        !copy_abi.contains("return_with_cleanup"),
+        "a Copy-returning function keeps the value-only return ABI on its `?` Err edge:\n{copy_abi}"
+    );
+    if backend_available() {
+        assert_eq!(
+            build_and_run("try-err-edge-provenance", TRY_ERR_EDGE_SOURCE).status.code(),
+            Some(108),
+        );
+    }
 }
 
 #[test]
