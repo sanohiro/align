@@ -859,6 +859,19 @@ fn direct_overlap(borrow connection: pkg.db.conn) -> i32 {
     pkg.db.exec_conn(connection), app.q4b_query.deadline_success(), deadline_params(), [],
   )
   if !overlap_error(second) { return 12 }
+  arena out {
+    scalar := pkg.db.one(
+      pkg.db.exec_conn(connection), app.q4b_query.deadline_success(), deadline_params(), out, [],
+    )
+    scalar_overlap := match scalar {
+      Err(error) => match error {
+        Unsupported(contract) => contract.item == "postgres.connection.active_execution"
+        _ => false
+      }
+      Ok(_) => false
+    }
+    if !scalar_overlap { return 13 }
+  }
   return 0
 }
 
@@ -3196,7 +3209,7 @@ fn materialized_projects_are_removed_on_drop() {
 const LAYER1_FINGERPRINT_GOLDEN: &str = "\
 pkg-db-q4b-deadline-disposition f76981d6793fa0d1
 pkg-db-q4b-owned-params 5e455caea2840caa
-pkg-db-q4b-postgres-buffered-lifecycle 3a7a76c6f028bb6d
+pkg-db-q4b-postgres-buffered-lifecycle d14c08bf985b4356
 pkg-db-q4b-postgres-command-deadline 7a4bb2c4f41be14a
 pkg-db-q4b-postgres-deadline-cancel 229550b0c45c3e0f
 pkg-db-q4b-postgres-deadline-fault-phases 6527ac1deff4966e

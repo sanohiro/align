@@ -26,17 +26,17 @@ invented exact counts here.
 
 | Root-cause key | Events | PRs | Prevention status |
 |---|---:|---:|---|
-| `validation-phase-completeness` | 10 | 5 | Recurred past the added owner (#727: static-validation-after-native-prepare; unvalidated v3 tail-reserved field; #770: batch layout checked after native advancement). Required next: deduplicate copied header validators into one shared function so an ABI version bump has one owner, and extend the parameterized phase-order owner across prepared/transaction paths. |
-| `cross-stage-abi-exactness` | 4 | 1 | Covered by Gate 4 and exact ABI owner matrices. |
+| `validation-phase-completeness` | 15 | 6 | Recurred past the added owner (#727: static-validation-after-native-prepare; unvalidated v3 tail-reserved field; #770: batch layout checked after native advancement; #772: prepared-option, generation-metadata/cardinality, lease/measurement, and static/vector ordering). Required next: deduplicate copied header validators into one shared function so an ABI version bump has one owner, and extend the parameterized phase-order owner across prepared/transaction paths. |
+| `cross-stage-abi-exactness` | 7 | 2 | Covered by Gate 4 and exact ABI owner matrices; #772 additionally requires generated count evidence and canonical cross-driver context bytes. |
 | `native-api-version-boundary` | 4 | 1 | Covered by Gate 2 plus version/conversion goldens. |
-| `ownership-allocation-owner` | 4 | 2 | Three-plus events: scalar fixed-array admission now routes through the canonical recursive `DropPlan`, with source and handcrafted-HIR owners rejecting every non-struct element that lacks per-element cleanup. Gates 1, 2, and 4 still require every allocation, Drop path, and thunk to have one named owner. |
+| `ownership-allocation-owner` | 5 | 3 | Three-plus events: scalar fixed-array admission now routes through the canonical recursive `DropPlan`, with source and handcrafted-HIR owners rejecting every non-struct element that lacks per-element cleanup. Gates 1, 2, and 4 still require every allocation, Drop path, and thunk to have one named owner; #772 pins present-empty binary bytea to a non-null zero-length sentinel owner. |
 | `sql-scanner-lexical-closure` | 3 | 2 | Promoted: parameterized lexical-mode and token-free-tail owners are mandatory. |
 | `native-link-order-closure` | 3 | 1 | Promoted: preserve caller order around the dependency closure and test arbitrary prefix/suffix libraries. |
 | `producer-evidence-propagation` | 1 | 1 | Watch; exact producer-to-consumer evidence owner required. |
 | `public-surface-completeness` | 2 | 2 | Promoted: compare the complete exported surface to the ledger and require an internal/sealed boundary for cross-module helpers. |
-| `operation-matrix-completeness` | 5 | 4 | Three-plus events: automation required. Add one parameterized dual-driver parity owner that runs the same descriptor/status/sentinel matrix through both drivers and asserts identical error-class mapping; also check native command tags (PostgreSQL answers `COMMIT` in an aborted transaction with `PGRES_COMMAND_OK` and a `ROLLBACK` tag), and retain failed rows state after every cleanup failure. |
-| `error-contract-identity` | 1 | 1 | Watch; pin error class, query identity, and precedence. |
-| `source-of-truth-drift` | 6 | 4 | Three-plus events: the mandatory ledger-to-diff extraction pass in `SKILL.md` is the owner — extract every `must`/`exact`/`every`/`before`/`reject`/`required` line from the touched design sections and point each at implementation or an explicit deferral. Re-read adjacent comments and counter documentation against behavior. A lexical lint is not sound here because the drift is semantic, so the extraction pass is mandatory rather than automated. |
+| `operation-matrix-completeness` | 6 | 5 | Three-plus events: automation required. Add one parameterized dual-driver parity owner that runs the same descriptor/status/sentinel matrix through both drivers and asserts identical error-class mapping; also check native command tags (PostgreSQL answers `COMMIT` in an aborted transaction with `PGRES_COMMAND_OK` and a `ROLLBACK` tag), retain failed rows state after every cleanup failure, and keep PostgreSQL parameter/result format axes independent. |
+| `error-contract-identity` | 2 | 2 | Promoted: pin error class, query identity, and complete multi-invalid precedence. |
+| `source-of-truth-drift` | 7 | 5 | Three-plus events: the mandatory ledger-to-diff extraction pass in `SKILL.md` is the owner — extract every `must`/`exact`/`every`/`before`/`reject`/`required` line from the touched design sections and point each at implementation or an explicit deferral. Re-read adjacent comments and counter documentation against behavior, including internal interface/cache invalidation. A lexical lint is not sound here because the drift is semantic, so the extraction pass is mandatory rather than automated. |
 | `owner-test-topology` | 3 | 3 | Three-plus events: every named closure-matrix cell must have a direct owner whose witness is **mutation-verified against the pre-fix compiler**, not merely present; retain whole/per-unit owners when refactoring fixtures. A witness that counts something the defect does not duplicate (a `.clone()` outside the duplicated subtree) passes on the broken compiler and closes nothing. |
 | `test-global-state-isolation` | 1 | 1 | Watch; prefer child-scoped environment and RAII restoration. |
 | `test-entry-abi-exactness` | 1 | 1 | Watch; compile fixtures through the real entry ABI. |
@@ -45,7 +45,7 @@ invented exact counts here.
 | `analysis-control-path-completeness` | 5 | 2 | Three-plus events: automation required and shipped in #734 — call effects route through one shared atomic post-argument transition (`apply_borrow_mut_calls`/`apply_borrow_mut_call_effects`) used by the exhaustive walk, the eager worklist, and the transparent spine, with the parameterized `borrow_mut_shaper_retention` owner module covering each control path. Extended for MIR *lowering*: `borrow_mode_differs` is the single authority for "borrow mode is not `lower_expr`", gating both `lower_expr_for_borrow`'s dispatch (`_ => unreachable!`) and `eager_worklist_children`'s filter, with `borrow_transparent_scope_block` as the one scope-kind enumeration shared with `moved_drop_flag`/`temporary_drop_flag`; the `borrowed_control_flow_temporaries_lower_exactly_once` owner sweeps all 14 cells with mutation-verified structural counts. |
 | `analysis-fact-consumer-sweep` | 4 | 1 | Three-plus events: automation required. #734 closed the exact/fallback selection into one shared `borrow_mut_source_indices` used by both liveness and escape consumers. Remaining open cell: EscapeCheck still carries three unshared destination/incoming region computations (`mutable_destination_storage_region`, the `AssignField` arm, the whole-`Assign` arm); consolidation into one shared authority is the next capability, with four verified fail-open probes recorded in its plan. |
 | `memoized-input-completeness` | 1 | 1 | Watch; a memoized step must key every semantic input it reads, including caller-seeded diagnostics and process toggles. |
-| `resource-bound-completeness` | 1 | 1 | Watch; long-lived process caches require a byte-accounted retention bound and a reachable refusal owner. |
+| `resource-bound-completeness` | 5 | 2 | Three-plus events: long-lived process caches require a byte-accounted retention bound and reachable refusal owner; native protocols require parameter-count, aggregate-message, per-encoding accepted-limit/rejected-next, and fixed-field accounting owners. |
 | `canonical-key-encoding` | 1 | 1 | Watch; variable key fields must use one length-delimited canonical encoder rather than ad hoc separators. |
 | `shared-artifact-concurrency` | 1 | 1 | Watch; retention derived from emitted files must fail closed when emissions overlap on one path. |
 | `performance-evidence-completeness` | 1 | 1 | Watch; measure the unaffected one-shot path before enabling a process-wide performance optimization by default. |
@@ -120,6 +120,22 @@ invented exact counts here.
 | #770 | `4667cc8f` | P2 | `validation-phase-completeness` | Validate batch fixed-layout representability before advancing the native stream. |
 | #770 | `4667cc8f` | P2 | `historical-workflow-source-boundary` | Keep libpq setup/version fallback available when rebuilding a tag that predates the new helper scripts. |
 | #771 | `1187713` | P2 | `source-of-truth-drift` | Update the completed PostgreSQL delivery boundaries in the live handoff table. |
+| #772 | `1f89ddd` | P1 | `ownership-allocation-owner` | Give present-empty Binary bytea a non-null zero-length transport sentinel. |
+| #772 | `1f89ddd` | P1 | `cross-stage-abi-exactness` | Specify the complete normalized format-plan ABI and ownership boundary. |
+| #772 | `1f89ddd` | P2 | `error-contract-identity` | Define exact binary failure records and multi-invalid precedence. |
+| #772 | `88971d8` | P1 | `cross-stage-abi-exactness` | Retain producer-owned parameter-count evidence in prepared statement v4. |
+| #772 | `88971d8` | P1 | `validation-phase-completeness` | Put complete prepared-header validation before option lookup that depends on it. |
+| #772 | `9bd0f1e` | P1 | `validation-phase-completeness` | Validate result-generation metadata before zero-row and cardinality handling. |
+| #772 | `9bd0f1e` | P1 | `operation-matrix-completeness` | Cross PostgreSQL parameter plans independently with result format. |
+| #772 | `2922c73` | P1 | `cross-stage-abi-exactness` | Define canonical SQLite zero bytes in the shared context ABI. |
+| #772 | `2922c73` | P1 | `source-of-truth-drift` | Include compiler-private interface hashes and importer dependency keys in cache invalidation. |
+| #772 | `2922c73` | P2 | `validation-phase-completeness` | Make metadata validation precede second-row cardinality. |
+| #772 | `2922c73` | P2 | `resource-bound-completeness` | Pin each selected encoding's accepted maximum and rejected next length. |
+| #772 | `3b380d2` | P2 | `resource-bound-completeness` | Bound the complete PostgreSQL Bind message, not only individual values. |
+| #772 | `3b380d2` | P2 | `resource-bound-completeness` | Cap PostgreSQL parameter counts at the protocol Int16 limit. |
+| #772 | `7191131` | P2 | `validation-phase-completeness` | Keep direct parameter measurement behind the execution lease. |
+| #772 | `7191131` | P2 | `validation-phase-completeness` | Choose one static-validation and full-vector installation order. |
+| #772 | `8f282e9` | P2 | `resource-bound-completeness` | Account for libpq's fixed one-entry result-format field in every Bind budget. |
 
 ## Rejected claims
 

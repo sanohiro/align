@@ -915,6 +915,8 @@ pub fn execute_native<P>(
     query_id := pkg.db.internal.descriptor.descriptor_id(statement)
     timeout := pkg.db.internal.postgres.common_options_valid(options, query_id)?
     mut saw_result := false
+    mut result_format: u8 := 0
+    mut format_count: u32 := 0
     mut native_index := 0
     loop {
       if native_index >= native.len() { break }
@@ -927,14 +929,8 @@ pub fn execute_native<P>(
           }
           saw_result = true
           match format {
-            Binary => {
-              return Err(pkg.db.internal.postgres.descriptor_error(
-                query_id,
-                "postgres.execute.result_format",
-                "binary PostgreSQL results are unavailable for this scalar execution milestone",
-              ))
-            }
-            Text => {}
+            Binary => { result_format = 1 }
+            Text => { result_format = 0 }
           }
         }
         ParameterFormat(name, format) => {
@@ -945,12 +941,26 @@ pub fn execute_native<P>(
               "PostgreSQL parameter format name contains U+0000",
             ))
           }
-          if !pkg.db.internal.descriptor.parameter_known(statement, name) {
+          ordinal := pkg.db.internal.descriptor.parameter_ordinal(statement, name)
+          if ordinal == 0 {
             return Err(pkg.db.internal.postgres.descriptor_error(
               query_id,
               "postgres.execute.parameter_format",
               "unknown PostgreSQL parameter format name",
             ))
+          }
+          match format {
+            Binary => {
+              binary_ordinal := pkg.db.internal.descriptor.parameter_binary_ordinal(statement, name)
+              if binary_ordinal == 0 {
+                return Err(pkg.db.internal.postgres.descriptor_error(
+                  query_id,
+                  "postgres.execute.parameter_format",
+                  "binary PostgreSQL parameter requires an exact supported ParameterType",
+                ))
+              }
+            }
+            Text => {}
           }
           mut earlier := 0
           loop {
@@ -969,16 +979,7 @@ pub fn execute_native<P>(
             }
             earlier = earlier + 1
           }
-          match format {
-            Binary => {
-              return Err(pkg.db.internal.postgres.descriptor_error(
-                query_id,
-                "postgres.execute.parameter_format",
-                "binary PostgreSQL i64 parameters are unavailable",
-              ))
-            }
-            Text => {}
-          }
+          format_count = format_count + 1
         }
         Delivery(_) => {
           return Err(pkg.db.internal.postgres.descriptor_error(
@@ -990,9 +991,33 @@ pub fn execute_native<P>(
       }
       native_index = native_index + 1
     }
-    return pkg.db.internal.postgres.execute_prevalidated(
+    format_plan := if format_count == 0 { raw.null() } else {
+      raw.alloc((format_count as i64) * 8)
+    }
+    mut plan_index: u32 := 0
+    mut option_index := 0
+    loop {
+      if option_index >= native.len() { break }
+      match native[option_index] {
+        ParameterFormat(name, format) => {
+          ordinal := pkg.db.internal.descriptor.parameter_ordinal(statement, name)
+          raw.store(format_plan, (plan_index as i64) * 8, ordinal)
+          raw.store(format_plan, (plan_index as i64) * 8 + 4, match format {
+            Text => 0 as i32
+            Binary => 1 as i32
+          })
+          plan_index = plan_index + 1
+        }
+        _ => {}
+      }
+      option_index = option_index + 1
+    }
+    result := pkg.db.internal.postgres.execute_native_prevalidated(
       target, params, statement, query_id, timeout,
+      format_plan, format_count, result_format,
     )
+    if !format_plan.is_null() { raw.free(format_plan) }
+    return result
   }
 }
 
@@ -1039,6 +1064,8 @@ pub fn rows_native<P, R>(
     query_id := pkg.db.internal.descriptor.descriptor_id(statement)
     timeout := pkg.db.internal.postgres.common_options_valid(options, query_id)?
     mut saw_result := false
+    mut result_format: u8 := 0
+    mut format_count: u32 := 0
     mut delivery: u8 := 0
     mut portal_max_rows: i32 := 0
     mut native_index := 0
@@ -1053,14 +1080,8 @@ pub fn rows_native<P, R>(
           }
           saw_result = true
           match format {
-            Binary => {
-              return Err(pkg.db.internal.postgres.descriptor_error(
-                query_id,
-                "postgres.execute.result_format",
-                "binary PostgreSQL results are unavailable for this scalar execution milestone",
-              ))
-            }
-            Text => {}
+            Binary => { result_format = 1 }
+            Text => { result_format = 0 }
           }
         }
         ParameterFormat(name, format) => {
@@ -1071,12 +1092,26 @@ pub fn rows_native<P, R>(
               "PostgreSQL parameter format name contains U+0000",
             ))
           }
-          if !pkg.db.internal.descriptor.parameter_known(statement, name) {
+          ordinal := pkg.db.internal.descriptor.parameter_ordinal(statement, name)
+          if ordinal == 0 {
             return Err(pkg.db.internal.postgres.descriptor_error(
               query_id,
               "postgres.execute.parameter_format",
               "unknown PostgreSQL parameter format name",
             ))
+          }
+          match format {
+            Binary => {
+              binary_ordinal := pkg.db.internal.descriptor.parameter_binary_ordinal(statement, name)
+              if binary_ordinal == 0 {
+                return Err(pkg.db.internal.postgres.descriptor_error(
+                  query_id,
+                  "postgres.execute.parameter_format",
+                  "binary PostgreSQL parameter requires an exact supported ParameterType",
+                ))
+              }
+            }
+            Text => {}
           }
           mut earlier := 0
           loop {
@@ -1095,16 +1130,7 @@ pub fn rows_native<P, R>(
             }
             earlier = earlier + 1
           }
-          match format {
-            Binary => {
-              return Err(pkg.db.internal.postgres.descriptor_error(
-                query_id,
-                "postgres.execute.parameter_format",
-                "binary PostgreSQL parameters are unavailable for this execution milestone",
-              ))
-            }
-            Text => {}
-          }
+          format_count = format_count + 1
         }
         Delivery(mode) => {
           mut current_delivery: u8 := 1
@@ -1136,9 +1162,34 @@ pub fn rows_native<P, R>(
       }
       native_index = native_index + 1
     }
-    return pkg.db.internal.postgres.rows_native_prevalidated(
+    format_plan := if format_count == 0 { raw.null() } else {
+      raw.alloc((format_count as i64) * 8)
+    }
+    mut plan_index: u32 := 0
+    mut option_index := 0
+    loop {
+      if option_index >= native.len() { break }
+      match native[option_index] {
+        ParameterFormat(name, format) => {
+          ordinal := pkg.db.internal.descriptor.parameter_ordinal(statement, name)
+          raw.store(format_plan, (plan_index as i64) * 8, ordinal)
+          raw.store(format_plan, (plan_index as i64) * 8 + 4, match format {
+            Text => 0 as i32
+            Binary => 1 as i32
+          })
+          plan_index = plan_index + 1
+        }
+        _ => {}
+      }
+      option_index = option_index + 1
+    }
+    result: Result<pkg.db.rows<R>, pkg.db.Error> :=
+      pkg.db.internal.postgres.rows_native_prevalidated(
       target, params, statement, query_id, timeout, delivery, portal_max_rows,
+      format_plan, format_count, result_format,
     )
+    if !format_plan.is_null() { raw.free(format_plan) }
+    return result
   }
 }
 
@@ -1161,6 +1212,8 @@ pub fn rows_stmt_native<P, R>(
     }
     timeout := pkg.db.internal.postgres.common_options_valid(options, query_id)?
     mut saw_result := false
+    mut result_format: u8 := 0
+    mut format_count: u32 := 0
     mut delivery: u8 := 0
     mut portal_max_rows: i32 := 0
     mut native_index := 0
@@ -1175,14 +1228,8 @@ pub fn rows_stmt_native<P, R>(
           }
           saw_result = true
           match format {
-            Binary => {
-              return Err(pkg.db.internal.postgres.descriptor_error(
-                query_id,
-                "postgres.execute.result_format",
-                "binary PostgreSQL results are unavailable for this scalar execution milestone",
-              ))
-            }
-            Text => {}
+            Binary => { result_format = 1 }
+            Text => { result_format = 0 }
           }
         }
         ParameterFormat(name, format) => {
@@ -1193,12 +1240,28 @@ pub fn rows_stmt_native<P, R>(
               "PostgreSQL parameter format name contains U+0000",
             ))
           }
-          if pkg.db.internal.descriptor.prepared_parameter_ordinal(statement_ref, name) <= 0 {
+          ordinal := pkg.db.internal.descriptor.prepared_parameter_ordinal(statement_ref, name)
+          if ordinal == 0 {
             return Err(pkg.db.internal.postgres.descriptor_error(
               query_id,
               "postgres.execute.parameter_format",
               "unknown PostgreSQL parameter format name",
             ))
+          }
+          match format {
+            Binary => {
+              binary_ordinal := pkg.db.internal.descriptor.prepared_parameter_binary_ordinal(
+                statement_ref, name,
+              )
+              if binary_ordinal == 0 {
+                return Err(pkg.db.internal.postgres.descriptor_error(
+                  query_id,
+                  "postgres.execute.parameter_format",
+                  "binary PostgreSQL parameter requires an exact supported ParameterType",
+                ))
+              }
+            }
+            Text => {}
           }
           mut earlier := 0
           loop {
@@ -1217,16 +1280,7 @@ pub fn rows_stmt_native<P, R>(
             }
             earlier = earlier + 1
           }
-          match format {
-            Binary => {
-              return Err(pkg.db.internal.postgres.descriptor_error(
-                query_id,
-                "postgres.execute.parameter_format",
-                "binary PostgreSQL parameters are unavailable for this execution milestone",
-              ))
-            }
-            Text => {}
-          }
+          format_count = format_count + 1
         }
         Delivery(mode) => {
           mut current_delivery: u8 := 1
@@ -1261,10 +1315,33 @@ pub fn rows_stmt_native<P, R>(
     if pkg.db.internal.resource.stmt_driver(wrapper) != 2 {
       return Err(pkg.db.internal.postgres.driver_mismatch_error(query_id))
     }
+    format_plan := if format_count == 0 { raw.null() } else {
+      raw.alloc((format_count as i64) * 8)
+    }
+    mut plan_index: u32 := 0
+    mut option_index := 0
+    loop {
+      if option_index >= native.len() { break }
+      match native[option_index] {
+        ParameterFormat(name, format) => {
+          ordinal := pkg.db.internal.descriptor.prepared_parameter_ordinal(statement_ref, name)
+          raw.store(format_plan, (plan_index as i64) * 8, ordinal)
+          raw.store(format_plan, (plan_index as i64) * 8 + 4, match format {
+            Text => 0 as i32
+            Binary => 1 as i32
+          })
+          plan_index = plan_index + 1
+        }
+        _ => {}
+      }
+      option_index = option_index + 1
+    }
     result: Result<pkg.db.rows<R>, pkg.db.Error> :=
       pkg.db.internal.postgres.rows_stmt_native_prevalidated(
       params, statement, timeout, delivery, portal_max_rows,
+      format_plan, format_count, result_format,
     )
+    if !format_plan.is_null() { raw.free(format_plan) }
     return result
   }
 }

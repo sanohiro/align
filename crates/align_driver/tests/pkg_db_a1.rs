@@ -11,8 +11,11 @@ static POSTGRES_PUBLIC: LazyLock<&str> =
 
 const TEST_HELPER: &str = r#"module pkg.db.a1_test
 import pkg.db
+import pkg.db.internal
 import pkg.db.internal.descriptor
+import pkg.db.internal.postgres
 import pkg.db.internal.resource
+import pkg.db.internal.sqlite
 
 pub fn set_rows_terminal<R>(borrow mut rows: pkg.db.rows<R>, state: u8) {
   unsafe { raw.store(resource.raw(resource.borrow(rows)), 5, state) }
@@ -78,7 +81,7 @@ pub fn rows_shape<R>(
     deadline_ok := if deadline_present {
       deadline >= 0 && duration > 0
     } else { deadline == -1 && duration == -1 }
-    return pkg.db.internal.resource.rows_header_valid(wrapper) && version == 3
+    return pkg.db.internal.resource.rows_header_valid(wrapper) && version == 4
       && actual_driver == driver && actual_terminal == terminal
       && actual_delivery == delivery && actual_pending == (if pending { 1 } else { 0 })
       && actual_portal == portal && deadline_ok
@@ -103,7 +106,7 @@ pub fn stmt_shape<P, R>(borrow mut statement: pkg.db.stmt<P, R>, driver: u8) -> 
     plan: raw := raw.load(wrapper, 72)
     resolver: raw := raw.load(wrapper, 80)
     deallocate_ok := if driver == 1 { deallocate.is_null() } else { !deallocate.is_null() }
-    return pkg.db.internal.resource.stmt_header_valid(wrapper) && version == 3
+    return pkg.db.internal.resource.stmt_header_valid(wrapper) && version == 4
       && actual_driver == driver && closed == 0 && reserved == 0 && !native.is_null()
       && !state.is_null() && !binder.is_null() && !query_id.is_null() && query_id_len > 0
       && deallocate_ok && !validator.is_null() && !decoder.is_null()
@@ -117,6 +120,181 @@ pub fn set_stmt_version<P, R>(borrow mut statement: pkg.db.stmt<P, R>, version: 
 
 pub fn clear_stmt_resolver<P, R>(borrow mut statement: pkg.db.stmt<P, R>) {
   unsafe { raw.store(resource.raw(resource.borrow(statement)), 80, raw.null()) }
+}
+
+pub fn stmt_count_mismatch<P, R>(borrow mut statement: pkg.db.stmt<P, R>) -> bool {
+  unsafe {
+    wrapper := resource.raw(resource.borrow(statement))
+    original: u32 := raw.load(wrapper, 104)
+    raw.store(wrapper, 104, original + 1)
+    rejected := !pkg.db.internal.resource.stmt_header_valid(wrapper)
+    raw.store(wrapper, 104, original)
+    return rejected && pkg.db.internal.resource.stmt_header_valid(wrapper)
+  }
+}
+
+pub fn malformed_stmt_eligibility_cleanup<P, R>(
+  borrow mut statement: pkg.db.stmt<P, R>,
+) -> bool {
+  unsafe {
+    wrapper := resource.raw(resource.borrow(statement))
+    eligibility: raw := raw.load(wrapper, 88)
+    count: u32 := raw.load(wrapper, 104)
+    if eligibility.is_null() || count == 0 { return false }
+    raw.store(eligibility, 0, 2 as u8)
+    if pkg.db.internal.resource.stmt_header_valid(wrapper) { return false }
+    status := pkg.db.internal.resource.close_stmt(wrapper)
+    closed: u8 := raw.load(wrapper, 5)
+    native: raw := raw.load(wrapper, 8)
+    state: raw := raw.load(wrapper, 16)
+    binder: raw := raw.load(wrapper, 24)
+    query_id: raw := raw.load(wrapper, 32)
+    deallocate: raw := raw.load(wrapper, 48)
+    validator: raw := raw.load(wrapper, 56)
+    decoder: raw := raw.load(wrapper, 64)
+    plan: raw := raw.load(wrapper, 72)
+    resolver: raw := raw.load(wrapper, 80)
+    cleared_eligibility: raw := raw.load(wrapper, 88)
+    count_thunk: raw := raw.load(wrapper, 96)
+    cleared_count: u32 := raw.load(wrapper, 104)
+    return status == 0 && closed == 1 && native.is_null() && state.is_null()
+      && binder.is_null() && query_id.is_null() && deallocate.is_null()
+      && validator.is_null() && decoder.is_null() && plan.is_null()
+      && resolver.is_null() && cleared_eligibility.is_null()
+      && count_thunk.is_null() && cleared_count == 0
+  }
+}
+
+pub fn prepared_binary_ordinal<P, R>(
+  borrow mut statement: pkg.db.stmt<P, R>, name: str,
+) -> i32 {
+  unsafe {
+    return pkg.db.internal.descriptor.prepared_parameter_binary_ordinal(
+      resource.borrow(statement), name,
+    )
+  }
+}
+
+pub fn protocol_boundaries() -> bool {
+  parse_ok := pkg.db.internal.postgres.validate_parse_budget_v1(
+    1, 2147221500, 65535, "bounds",
+  )
+  parse_next := pkg.db.internal.postgres.validate_parse_budget_v1(
+    1, 2147221501, 65535, "bounds",
+  )
+  parse_count := pkg.db.internal.postgres.validate_parse_budget_v1(
+    1, 1, 65536, "bounds",
+  )
+  parse_overflow := pkg.db.internal.postgres.validate_parse_budget_v1(
+    9223372036854775807, 9223372036854775807, 0, "bounds",
+  )
+  bind_ok := pkg.db.internal.postgres.bind_budget_v1(1, 65535, "bounds")
+  bind_count := pkg.db.internal.postgres.bind_budget_v1(1, 65536, "bounds")
+  return match parse_ok { Ok(_) => true, Err(_) => false }
+    && match parse_next { Err(_) => true, Ok(_) => false }
+    && match parse_count { Err(_) => true, Ok(_) => false }
+    && match parse_overflow { Err(_) => true, Ok(_) => false }
+    && match bind_ok {
+      Ok(value) => value == 2147090423
+      Err(_) => false
+    }
+    && match bind_count { Err(_) => true, Ok(_) => false }
+}
+
+pub fn normalized_plan_products() -> bool {
+  unsafe {
+    null_ok := pkg.db.internal.postgres.validate_normalized_format_plan_v1(
+      raw.null(), 0, 0, 2, "plan",
+    )
+    wrong_null := pkg.db.internal.postgres.validate_normalized_format_plan_v1(
+      raw.null(), 1, 0, 2, "plan",
+    )
+    plan := raw.alloc(16)
+    raw.store(plan, 0, 1 as i32)
+    raw.store(plan, 4, 1 as i32)
+    raw.store(plan, 8, 2 as i32)
+    raw.store(plan, 12, 0 as i32)
+    valid := pkg.db.internal.postgres.validate_normalized_format_plan_v1(
+      plan, 2, 1, 2, "plan",
+    )
+    raw.store(plan, 8, 1 as i32)
+    duplicate := pkg.db.internal.postgres.validate_normalized_format_plan_v1(
+      plan, 2, 1, 2, "plan",
+    )
+    raw.store(plan, 8, 3 as i32)
+    out_of_range := pkg.db.internal.postgres.validate_normalized_format_plan_v1(
+      plan, 2, 1, 2, "plan",
+    )
+    raw.store(plan, 8, 2 as i32)
+    raw.store(plan, 12, 2 as i32)
+    bad_tag := pkg.db.internal.postgres.validate_normalized_format_plan_v1(
+      plan, 2, 1, 2, "plan",
+    )
+    bad_result := pkg.db.internal.postgres.validate_normalized_format_plan_v1(
+      plan, 2, 2, 2, "plan",
+    )
+    raw.free(plan)
+    return match null_ok { Ok(_) => true, Err(_) => false }
+      && match wrong_null { Err(_) => true, Ok(_) => false }
+      && match valid { Ok(_) => true, Err(_) => false }
+      && match duplicate { Err(_) => true, Ok(_) => false }
+      && match out_of_range { Err(_) => true, Ok(_) => false }
+      && match bad_tag { Err(_) => true, Ok(_) => false }
+      && match bad_result { Err(_) => true, Ok(_) => false }
+  }
+}
+
+pub fn context_v4_products() -> bool {
+  unsafe {
+    native := raw.alloc(1)
+    sqlite := pkg.db.internal.sqlite.new_context(native)
+    mut valid := pkg.db.internal.context_valid_v4(sqlite, 1)
+
+    raw.store(sqlite, 52, 1 as u32)
+    valid = valid && !pkg.db.internal.context_valid_v4(sqlite, 1)
+    raw.store(sqlite, 52, 0 as u32)
+
+    raw.store(sqlite, 48, 1 as u32)
+    valid = valid && !pkg.db.internal.context_valid_v4(sqlite, 1)
+    raw.store(sqlite, 48, 0 as u32)
+
+    raw.store(sqlite, 24, native)
+    valid = valid && !pkg.db.internal.context_valid_v4(sqlite, 1)
+    raw.store(sqlite, 24, raw.null())
+
+    raw.store(sqlite, 5, 8 as u8)
+    valid = valid && !pkg.db.internal.context_valid_v4(sqlite, 1)
+    raw.store(sqlite, 5, 5 as u8)
+    valid = valid && !pkg.db.internal.context_valid_v4(sqlite, 1)
+    raw.store(sqlite, 5, 0 as u8)
+
+    raw.store(sqlite, 81, 1 as u8)
+    raw.store(sqlite, 88, native)
+    mut reset_state: u8 := 255
+    valid = valid && pkg.db.internal.context_valid_v4(sqlite, 1)
+      && pkg.db.internal.set_native_generation_v1(sqlite, native)
+    reset_state = raw.load(sqlite, 81)
+    valid = valid && reset_state == 0
+    metadata_pointer: raw := raw.load(sqlite, 88)
+    valid = valid && metadata_pointer.is_null()
+    pkg.db.internal.sqlite.free_context(sqlite)
+    raw.free(native)
+
+    postgres := pkg.db.internal.postgres.new_context(raw.null())
+    valid = valid && pkg.db.internal.context_valid_v4(postgres, 2)
+      && pkg.db.internal.ensure_postgres_parameters_v1(postgres, 1)
+      && pkg.db.internal.context_valid_v4(postgres, 2)
+    raw.store(postgres, 72, 65536 as u32)
+    valid = valid && !pkg.db.internal.context_valid_v4(postgres, 2)
+    raw.store(postgres, 72, 1 as u32)
+    lengths: raw := raw.load(postgres, 56)
+    raw.store(postgres, 56, raw.null())
+    valid = valid && !pkg.db.internal.context_valid_v4(postgres, 2)
+    raw.store(postgres, 56, lengths)
+    valid = valid && pkg.db.internal.context_valid_v4(postgres, 2)
+    pkg.db.internal.postgres.free_context(postgres)
+    return valid
+  }
 }
 
 pub fn restore_stmt_resolver<P, R>(
@@ -388,6 +566,8 @@ pub Params { first_value: i64, last_value: i64 }
 pub DelayParams { seconds: f64 }
 pub ValueParams { value: i64 }
 pub Row { value: i64, label: str }
+pub BinaryParams { value: i32, payload: slice<u8> }
+pub BinaryRow { value: i32, payload: slice<u8> }
 
 pub fn values() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
   "SELECT value::bigint AS value, ('row-' || value::text)::text AS label FROM generate_series(:first_value, :last_value) AS value ORDER BY value",
@@ -419,6 +599,63 @@ pub fn current_effect() -> pkg.db.query<ValueParams, Row> = pkg.db.postgres.quer
   "SELECT value, 'effect'::text AS label FROM align_a1_stream_effect WHERE :value = :value", [],
   [pkg.db.postgres.QueryOption.ParameterType("value", "int8")],
 )
+
+pub fn binary_values() -> pkg.db.query<BinaryParams, BinaryRow> = pkg.db.postgres.query(
+  "SELECT :value::int4 AS value, :payload::bytea AS payload", [],
+  [
+    pkg.db.postgres.QueryOption.ParameterType("value", "int4"),
+    pkg.db.postgres.QueryOption.ParameterType("payload", "bytea"),
+  ],
+)
+"#;
+
+const BINARY_QUERY: &str = r#"module app.binary_query
+import pkg.db
+import pkg.db.postgres
+
+pub PairParams { left: i32, right: slice<u8> }
+pub PairRow { left: i32, right: slice<u8> }
+pub FaultParams { flag: bool, text: str }
+pub FaultRow { flag: bool, text: str }
+pub NoProofParams { value: i64 }
+pub NoProofRow { value: i64 }
+pub EmptyParams { payload: Option<slice<u8>> }
+
+pub fn pair() -> pkg.db.query<PairParams, PairRow> = pkg.db.postgres.query(
+  "SELECT :left::int4 AS left, :right::bytea AS right /* FORMAT_MATRIX */",
+  [],
+  [
+    pkg.db.postgres.QueryOption.ParameterType("left", "int4"),
+    pkg.db.postgres.QueryOption.ParameterType("right", "bytea"),
+  ],
+)
+
+pub fn command() -> pkg.db.command<PairParams> = pkg.db.postgres.command(
+  "UPDATE format_matrix SET left = :left WHERE right = :right /* FORMAT_COMMAND */",
+  [],
+  [
+    pkg.db.postgres.CommandOption.ParameterType("left", "int4"),
+    pkg.db.postgres.CommandOption.ParameterType("right", "bytea"),
+  ],
+)
+
+pub fn fault() -> pkg.db.query<FaultParams, FaultRow> = pkg.db.postgres.query(
+  "SELECT :flag::bool AS flag, :text::text AS text /* BINARY_FAULT */",
+  [],
+  [
+    pkg.db.postgres.QueryOption.ParameterType("flag", "bool"),
+    pkg.db.postgres.QueryOption.ParameterType("text", "text"),
+  ],
+)
+
+pub fn no_proof() -> pkg.db.query<NoProofParams, NoProofRow> = pkg.db.query(
+  "SELECT :value::bigint AS value", [],
+)
+
+pub fn empty_command() -> pkg.db.command<EmptyParams> = pkg.db.postgres.command(
+  "UPDATE binary_empty SET payload = :payload /* BINARY_EMPTY COMMAND_OK */", [],
+  [pkg.db.postgres.CommandOption.ParameterType("payload", "bytea")],
+)
 "#;
 
 const LIVE_POSTGRES_MAIN: &str = r#"module main
@@ -428,6 +665,58 @@ import app.live_stream
 
 fn params(first_value: i64, last_value: i64) -> app.live_stream.Params {
   return app.live_stream.Params { first_value: first_value, last_value: last_value }
+}
+
+fn binary_params(value: i32, payload: slice<u8>) -> app.live_stream.BinaryParams {
+  return app.live_stream.BinaryParams { value: value, payload: payload }
+}
+
+fn binary_row_ok(row: app.live_stream.BinaryRow, value: i32) -> bool {
+  return row.value == value && row.payload.len() == 3
+    && row.payload[0] == 0 && row.payload[1] == 127 && row.payload[2] == 255
+}
+
+fn live_binary_formats(borrow connection: pkg.db.conn) -> i32 {
+  payload := [0 as u8, 127 as u8, 255 as u8]
+  mut direct := pkg.db.postgres.rows_native(
+    pkg.db.exec_conn(connection), app.live_stream.binary_values(),
+    binary_params(1234, payload[..]), [],
+    [
+      pkg.db.postgres.ExecuteOption.ParameterFormat(
+        "value", pkg.db.postgres.Format.Binary,
+      ),
+      pkg.db.postgres.ExecuteOption.ParameterFormat(
+        "payload", pkg.db.postgres.Format.Text,
+      ),
+      pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Binary),
+    ],
+  ) else { return 1 }
+  direct_value := pkg.db.next(direct) else { return 2 }
+  direct_row := direct_value else { return 3 }
+  if !binary_row_ok(direct_row, 1234) { return 4 }
+  match pkg.db.next(direct) else { return 5 } { Some(_) => { return 6 } None => {} }
+
+  prepared := pkg.db.prepare(
+    pkg.db.exec_conn(connection), app.live_stream.binary_values(), [],
+  ) else { return 7 }
+  mut statement := prepared
+  mut prepared_rows := pkg.db.postgres.rows_stmt_native(
+    statement, binary_params(-4321, payload[..]), [],
+    [
+      pkg.db.postgres.ExecuteOption.ParameterFormat(
+        "value", pkg.db.postgres.Format.Text,
+      ),
+      pkg.db.postgres.ExecuteOption.ParameterFormat(
+        "payload", pkg.db.postgres.Format.Binary,
+      ),
+      pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Binary),
+    ],
+  ) else { return 8 }
+  prepared_value := pkg.db.next(prepared_rows) else { return 9 }
+  prepared_row := prepared_value else { return 10 }
+  if !binary_row_ok(prepared_row, -4321) { return 11 }
+  match pkg.db.next(prepared_rows) else { return 12 } { Some(_) => { return 13 } None => {} }
+  return 0
 }
 
 fn prepared_values(
@@ -500,6 +789,9 @@ fn transaction_effect(borrow transaction: pkg.db.tx) -> bool {
 
 fn run(url: str) -> i32 {
   connection := pkg.db.postgres.connect(url, []) else { return 1 }
+
+  binary_status := live_binary_formats(connection)
+  if binary_status != 0 { return 60 + binary_status }
 
   setup := pkg.db.execute(
     pkg.db.exec_conn(connection), app.live_stream.create_effects(),
@@ -667,12 +959,12 @@ fn sqlite_statement_v3(borrow connection: pkg.db.conn) -> bool {
   ) else { return false }
   mut statement := prepared
   if !pkg.db.a1_test.stmt_shape(statement, 1 as u8) { return false }
-  pkg.db.a1_test.set_stmt_version(statement, 2 as u32)
+  pkg.db.a1_test.set_stmt_version(statement, 3 as u32)
   old_version := pkg.db.rows_stmt(
     statement, app.batch_query.Params { base: 1 }, [],
   )
   if !invalid_query(old_version) { return false }
-  pkg.db.a1_test.set_stmt_version(statement, 3 as u32)
+  pkg.db.a1_test.set_stmt_version(statement, 4 as u32)
   pkg.db.a1_test.clear_stmt_resolver(statement)
   no_resolver := pkg.db.rows_stmt(
     statement, app.batch_query.Params { base: 1 }, [],
@@ -703,9 +995,9 @@ fn main() -> i32 {
   if !pkg.db.a1_test.rows_shape(stream, 1 as u8, 0 as u8, 3 as u8, false, 0, false) {
     return 45
   }
-  pkg.db.a1_test.set_rows_version(stream, 2 as u32)
-  malformed_version := pkg.db.next_batch(stream, 1)
   pkg.db.a1_test.set_rows_version(stream, 3 as u32)
+  malformed_version := pkg.db.next_batch(stream, 1)
+  pkg.db.a1_test.set_rows_version(stream, 4 as u32)
   match malformed_version {
     Err(error) => match error { InvalidQuery(_) => {} _ => { return 46 } }
     Ok(_) => { return 46 }
@@ -903,7 +1195,7 @@ import app.batch_query
 import pkg.db.testkit.pg
 
 
-fn execute_once(borrow connection: pkg.db.conn, present: bool) -> i32 {
+fn execute_once(borrow connection: pkg.db.conn, present: bool, mode: i32) -> i32 {
   bytes := [0 as u8, 127 as u8, 255 as u8]
   nb: Option<bool> := if present { Some(true) } else { None }
   ni16: Option<i16> := if present { Some(-1234 as i16) } else { None }
@@ -913,10 +1205,7 @@ fn execute_once(borrow connection: pkg.db.conn, present: bool) -> i32 {
   nf64: Option<f64> := if present { Some(-3.25) } else { None }
   ntext: Option<str> := if present { Some("nullable") } else { None }
   nbytes: Option<slice<u8>> := if present { Some(bytes[..]) } else { None }
-  opened := pkg.db.rows(
-    pkg.db.exec_conn(connection),
-    app.batch_query.postgres_full(),
-    app.batch_query.FullParams {
+  params := app.batch_query.FullParams {
       b: true, nb: nb,
       i16v: -12 as i16, ni16: ni16,
       i32v: 3456 as i32, ni32: ni32,
@@ -925,9 +1214,39 @@ fn execute_once(borrow connection: pkg.db.conn, present: bool) -> i32 {
       f64v: -9.75, nf64: nf64,
       textv: "hello", ntext: ntext,
       bytesv: bytes[..], nbytes: nbytes,
-    },
-    [],
-  )
+    }
+  opened := if mode == 0 {
+    pkg.db.rows(pkg.db.exec_conn(connection), app.batch_query.postgres_full(), params, [])
+  } else {
+    delivery := if mode == 1 {
+      pkg.db.postgres.ExecuteOption.Delivery(pkg.db.postgres.Delivery.SingleRow)
+    } else {
+      pkg.db.postgres.ExecuteOption.Delivery(pkg.db.postgres.Delivery.PortalBatch(2))
+    }
+    pkg.db.postgres.rows_native(
+      pkg.db.exec_conn(connection), app.batch_query.postgres_full(), params, [],
+      [
+        pkg.db.postgres.ExecuteOption.ParameterFormat("b", pkg.db.postgres.Format.Binary),
+        pkg.db.postgres.ExecuteOption.ParameterFormat("nb", pkg.db.postgres.Format.Binary),
+        pkg.db.postgres.ExecuteOption.ParameterFormat("i16v", pkg.db.postgres.Format.Binary),
+        pkg.db.postgres.ExecuteOption.ParameterFormat("ni16", pkg.db.postgres.Format.Binary),
+        pkg.db.postgres.ExecuteOption.ParameterFormat("i32v", pkg.db.postgres.Format.Binary),
+        pkg.db.postgres.ExecuteOption.ParameterFormat("ni32", pkg.db.postgres.Format.Binary),
+        pkg.db.postgres.ExecuteOption.ParameterFormat("i64v", pkg.db.postgres.Format.Binary),
+        pkg.db.postgres.ExecuteOption.ParameterFormat("ni64", pkg.db.postgres.Format.Binary),
+        pkg.db.postgres.ExecuteOption.ParameterFormat("f32v", pkg.db.postgres.Format.Binary),
+        pkg.db.postgres.ExecuteOption.ParameterFormat("nf32", pkg.db.postgres.Format.Binary),
+        pkg.db.postgres.ExecuteOption.ParameterFormat("f64v", pkg.db.postgres.Format.Binary),
+        pkg.db.postgres.ExecuteOption.ParameterFormat("nf64", pkg.db.postgres.Format.Binary),
+        pkg.db.postgres.ExecuteOption.ParameterFormat("textv", pkg.db.postgres.Format.Binary),
+        pkg.db.postgres.ExecuteOption.ParameterFormat("ntext", pkg.db.postgres.Format.Binary),
+        pkg.db.postgres.ExecuteOption.ParameterFormat("bytesv", pkg.db.postgres.Format.Binary),
+        pkg.db.postgres.ExecuteOption.ParameterFormat("nbytes", pkg.db.postgres.Format.Binary),
+        pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Binary),
+        delivery,
+      ],
+    )
+  }
   mut stream := opened else { return 1 }
   result := pkg.db.next_batch(stream, 1) else { return 2 }
   batch := result else { return 3 }
@@ -967,14 +1286,143 @@ fn execute_once(borrow connection: pkg.db.conn, present: bool) -> i32 {
 fn main() -> i32 {
   pkg.db.testkit.pg.reset()
   connection := pkg.db.postgres.connect("postgresql://stub/a1-matrix", []) else { return 30 }
-  first := execute_once(connection, true)
+  first := execute_once(connection, true, 0)
   if first != 0 { return first }
-  second := execute_once(connection, false)
+  second := execute_once(connection, false, 0)
   if second != 0 { return second }
+  third := execute_once(connection, true, 1)
+  if third != 0 { return third }
+  fourth := execute_once(connection, false, 2)
+  if fourth != 0 { return fourth }
   pkg.db.testkit.pg.dump()
   return 42
 }
 "#;
+
+const POSTGRES_BINARY_FORMAT_PRODUCTS_MAIN: &str = r#"module main
+import pkg.db
+import pkg.db.postgres
+import app.binary_query
+import pkg.db.a1_test
+import pkg.db.testkit.pg
+
+fn direct(
+  borrow connection: pkg.db.conn,
+  index: i32,
+  native: slice<pkg.db.postgres.ExecuteOption>,
+) -> bool {
+  bytes := [index as u8]
+  opened := pkg.db.postgres.rows_native(
+    pkg.db.exec_conn(connection), app.binary_query.pair(),
+    app.binary_query.PairParams { left: index, right: bytes[..] }, [], native,
+  )
+  mut stream := opened else { return false }
+  first := pkg.db.next(stream) else { return false }
+  row := first else { return false }
+  if row.left != index || row.right.len() != 1 || row.right[0] != (index as u8) { return false }
+  second := pkg.db.next(stream) else { return false }
+  return match second { None => true, Some(_) => false }
+}
+
+fn prepared(
+  borrow mut statement: pkg.db.stmt<app.binary_query.PairParams, app.binary_query.PairRow>,
+  index: i32,
+  native: slice<pkg.db.postgres.ExecuteOption>,
+) -> bool {
+  bytes := [index as u8]
+  opened := pkg.db.postgres.rows_stmt_native(
+    statement, app.binary_query.PairParams { left: index, right: bytes[..] }, [], native,
+  )
+  mut stream := opened else { return false }
+  first := pkg.db.next(stream) else { return false }
+  row := first else { return false }
+  if row.left != index || row.right.len() != 1 || row.right[0] != (index as u8) { return false }
+  second := pkg.db.next(stream) else { return false }
+  return match second { None => true, Some(_) => false }
+}
+
+fn command(borrow connection: pkg.db.conn) -> bool {
+  bytes := [26 as u8]
+  result := pkg.db.postgres.execute_native(
+    pkg.db.exec_conn(connection), app.binary_query.command(),
+    app.binary_query.PairParams { left: 26, right: bytes[..] }, [],
+    [
+      pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Binary),
+      pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Binary),
+      pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Binary),
+    ],
+  )
+  return match result { Ok(_) => true, Err(_) => false }
+}
+
+fn main() -> i32 {
+  pkg.db.testkit.pg.reset()
+  connection := pkg.db.postgres.connect("postgresql://stub/a1-binary-products", []) else { return 1 }
+  if !direct(connection, 0, []) { return 10 }
+  if !direct(connection, 1, [pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Text)]) { return 11 }
+  if !direct(connection, 2, [pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Binary)]) { return 12 }
+  if !direct(connection, 3, [pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Text)]) { return 13 }
+  if !direct(connection, 4, [pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Text)]) { return 14 }
+  if !direct(connection, 5, [pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Binary)]) { return 15 }
+  if !direct(connection, 6, [pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Binary)]) { return 16 }
+  if !direct(connection, 7, [pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Text)]) { return 17 }
+  if !direct(connection, 8, [pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Binary)]) { return 18 }
+  if !direct(connection, 9, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Text)]) { return 19 }
+  if !direct(connection, 10, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Text)]) { return 20 }
+  if !direct(connection, 11, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Binary)]) { return 21 }
+  if !direct(connection, 12, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Text)]) { return 22 }
+  if !direct(connection, 13, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Text)]) { return 23 }
+  if !direct(connection, 14, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Binary)]) { return 24 }
+  if !direct(connection, 15, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Binary)]) { return 25 }
+  if !direct(connection, 16, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Text)]) { return 26 }
+  if !direct(connection, 17, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Binary)]) { return 27 }
+  if !direct(connection, 18, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Binary)]) { return 28 }
+  if !direct(connection, 19, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Text)]) { return 29 }
+  if !direct(connection, 20, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Binary)]) { return 30 }
+  if !direct(connection, 21, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Text)]) { return 31 }
+  if !direct(connection, 22, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Text)]) { return 32 }
+  if !direct(connection, 23, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Binary)]) { return 33 }
+  if !direct(connection, 24, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Binary)]) { return 34 }
+  if !direct(connection, 25, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Text)]) { return 35 }
+  if !direct(connection, 26, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Binary)]) { return 36 }
+  prepared_result := pkg.db.postgres.prepare_native(
+    pkg.db.exec_conn(connection), app.binary_query.pair(), [], [],
+  )
+  mut statement := prepared_result else { return 40 }
+  if !pkg.db.a1_test.stmt_count_mismatch(statement) { return 41 }
+  if !prepared(statement, 0, []) { return 50 }
+  if !prepared(statement, 1, [pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Text)]) { return 51 }
+  if !prepared(statement, 2, [pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Binary)]) { return 52 }
+  if !prepared(statement, 3, [pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Text)]) { return 53 }
+  if !prepared(statement, 4, [pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Text)]) { return 54 }
+  if !prepared(statement, 5, [pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Binary)]) { return 55 }
+  if !prepared(statement, 6, [pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Binary)]) { return 56 }
+  if !prepared(statement, 7, [pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Text)]) { return 57 }
+  if !prepared(statement, 8, [pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Binary)]) { return 58 }
+  if !prepared(statement, 9, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Text)]) { return 59 }
+  if !prepared(statement, 10, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Text)]) { return 60 }
+  if !prepared(statement, 11, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Binary)]) { return 61 }
+  if !prepared(statement, 12, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Text)]) { return 62 }
+  if !prepared(statement, 13, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Text)]) { return 63 }
+  if !prepared(statement, 14, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Binary)]) { return 64 }
+  if !prepared(statement, 15, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Binary)]) { return 65 }
+  if !prepared(statement, 16, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Text)]) { return 66 }
+  if !prepared(statement, 17, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Binary)]) { return 67 }
+  if !prepared(statement, 18, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Binary)]) { return 68 }
+  if !prepared(statement, 19, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Text)]) { return 69 }
+  if !prepared(statement, 20, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Binary)]) { return 70 }
+  if !prepared(statement, 21, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Text)]) { return 71 }
+  if !prepared(statement, 22, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Text)]) { return 72 }
+  if !prepared(statement, 23, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Text), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Binary)]) { return 73 }
+  if !prepared(statement, 24, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Binary)]) { return 74 }
+  if !prepared(statement, 25, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Text)]) { return 75 }
+  if !prepared(statement, 26, [pkg.db.postgres.ExecuteOption.ParameterFormat("left", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ParameterFormat("right", pkg.db.postgres.Format.Binary), pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Binary)]) { return 76 }
+  if !command(connection) { return 80 }
+  pkg.db.testkit.pg.dump()
+  return 42
+}
+"#;
+
 
 const POSTGRES_BATCH_DECODE_FAILURE_MAIN: &str = r#"module main
 import pkg.db
@@ -1291,8 +1739,12 @@ fn invalid_query(
 
 fn consume(
   borrow mut statement: pkg.db.stmt<app.batch_query.PgViewParams, app.batch_query.PgPreparedRow>,
+  binary_id: bool,
 ) -> i32 {
   if !pkg.db.a1_test.stmt_shape(statement, 2 as u8) { return 1 }
+  id_binary := pkg.db.a1_test.prepared_binary_ordinal(statement, "id")
+  label_binary := pkg.db.a1_test.prepared_binary_ordinal(statement, "label")
+  if id_binary != (if binary_id { 1 } else { 0 }) || label_binary != 0 { return 29 }
   bytes := [1 as u8, 2 as u8, 3 as u8]
   unknown := pkg.db.postgres.rows_stmt_native(
     statement, params(7, "first", bytes[..]), [],
@@ -1307,6 +1759,19 @@ fn consume(
     Ok(_) => false
   }
   if !unknown_ok { return 2 }
+  missing_proof := pkg.db.postgres.rows_stmt_native(
+    statement, params(7, "first", bytes[..]), [],
+    [pkg.db.postgres.ExecuteOption.ParameterFormat("label", pkg.db.postgres.Format.Binary)],
+  )
+  missing_proof_ok := match missing_proof {
+    Err(error) => match error {
+      Unsupported(contract) => contract.message
+        == "binary PostgreSQL parameter requires an exact supported ParameterType"
+      _ => false
+    }
+    Ok(_) => false
+  }
+  if !missing_proof_ok { return 27 }
   duplicate := pkg.db.postgres.rows_stmt_native(
     statement, params(7, "first", bytes[..]), [],
     [
@@ -1397,32 +1862,36 @@ fn conn_phase(borrow connection: pkg.db.conn) -> i32 {
   ) else { return 30 }
   mut statement := prepared
   bytes := [1 as u8, 2 as u8, 3 as u8]
-  pkg.db.a1_test.set_stmt_version(statement, 2 as u32)
+  pkg.db.a1_test.set_stmt_version(statement, 3 as u32)
   old_version := pkg.db.postgres.rows_stmt_native(
-    statement, params(7, "first", bytes[..]), [], [],
+    statement, params(7, "first", bytes[..]), [],
+    [pkg.db.postgres.ExecuteOption.ParameterFormat("missing", pkg.db.postgres.Format.Binary)],
   )
   if !invalid_query(old_version) { return 35 }
-  pkg.db.a1_test.set_stmt_version(statement, 3 as u32)
+  pkg.db.a1_test.set_stmt_version(statement, 4 as u32)
   pkg.db.a1_test.clear_stmt_resolver(statement)
   no_resolver := pkg.db.postgres.rows_stmt_native(
-    statement, params(7, "first", bytes[..]), [], [],
+    statement, params(7, "first", bytes[..]), [],
+    [pkg.db.postgres.ExecuteOption.ParameterFormat("missing", pkg.db.postgres.Format.Binary)],
   )
   if !invalid_query(no_resolver) { return 36 }
   pkg.db.a1_test.restore_stmt_resolver(statement, app.batch_query.postgres_prepared())
-  return consume(statement)
+  status := consume(statement, true)
+  if status != 0 { return status }
+  return if pkg.db.a1_test.malformed_stmt_eligibility_cleanup(statement) { 0 } else { 37 }
 }
 
 fn tx_phase(borrow transaction: pkg.db.tx) -> i32 {
   prepared := pkg.db.postgres.prepare_native(
     pkg.db.exec_tx(transaction), app.batch_query.postgres_prepared(), [],
     [
-      pkg.db.postgres.PrepareOption.ParameterOid("id", 20 as u32),
+      pkg.db.postgres.PrepareOption.ParameterOid("id", 23 as u32),
       pkg.db.postgres.PrepareOption.ParameterOid("label", 25 as u32),
       pkg.db.postgres.PrepareOption.ParameterOid("payload", 17 as u32),
     ],
   ) else { return 31 }
   mut statement := prepared
-  return consume(statement)
+  return consume(statement, false)
 }
 
 fn main() -> i32 {
@@ -1826,6 +2295,226 @@ const CASE_ZERO_COLUMN_PLAN: Case = Case {
     expect_counters: &[],
 };
 
+const POSTGRES_BINARY_BOUNDARIES_MAIN: &str = r#"module main
+import pkg.db.a1_test
+
+fn main() -> i32 {
+  if !pkg.db.a1_test.protocol_boundaries() { return 1 }
+  if !pkg.db.a1_test.normalized_plan_products() { return 2 }
+  if !pkg.db.a1_test.context_v4_products() { return 3 }
+  return 42
+}
+"#;
+
+const POSTGRES_BINARY_MALFORMED_MAIN: &str = r#"module main
+import pkg.db
+import pkg.db.postgres
+import app.binary_query
+import pkg.db.testkit.pg
+
+extern "C" {
+  fn align_pg_set_binary_fault(fault: i32)
+}
+
+fn is_row_decode(error: pkg.db.Error) -> bool = match error {
+  Decode(contract) => contract.item == "db.row"
+    && contract.message == "PostgreSQL row does not match the static Row contract"
+  _ => false
+}
+
+fn unsupported<R>(result: Result<pkg.db.rows<R>, pkg.db.Error>, message: str) -> bool {
+  return match result {
+    Err(error) => match error {
+      Unsupported(contract) => contract.item == "postgres.execute.parameter_format"
+        && contract.message == message
+      _ => false
+    }
+    Ok(_) => false
+  }
+}
+
+fn option_precedence(borrow connection: pkg.db.conn) -> bool {
+  fault_params := app.binary_query.FaultParams { flag: true, text: "valid" }
+  unknown := pkg.db.postgres.rows_native(
+    pkg.db.exec_conn(connection), app.binary_query.fault(), fault_params, [],
+    [pkg.db.postgres.ExecuteOption.ParameterFormat("missing", pkg.db.postgres.Format.Text)],
+  )
+  if !unsupported(unknown, "unknown PostgreSQL parameter format name") { return false }
+
+  nul_name := pkg.db.postgres.rows_native(
+    pkg.db.exec_conn(connection), app.binary_query.fault(), fault_params, [],
+    [pkg.db.postgres.ExecuteOption.ParameterFormat("flag\0tail", pkg.db.postgres.Format.Text)],
+  )
+  if !unsupported(nul_name, "PostgreSQL parameter format name contains U+0000") { return false }
+
+  no_proof := app.binary_query.NoProofParams { value: 7 }
+  missing := pkg.db.postgres.rows_native(
+    pkg.db.exec_conn(connection), app.binary_query.no_proof(), no_proof, [],
+    [pkg.db.postgres.ExecuteOption.ParameterFormat("value", pkg.db.postgres.Format.Binary)],
+  )
+  if !unsupported(missing, "binary PostgreSQL parameter requires an exact supported ParameterType") {
+    return false
+  }
+
+  invalid_duplicate := pkg.db.postgres.rows_native(
+    pkg.db.exec_conn(connection), app.binary_query.no_proof(), no_proof, [],
+    [
+      pkg.db.postgres.ExecuteOption.ParameterFormat("value", pkg.db.postgres.Format.Text),
+      pkg.db.postgres.ExecuteOption.ParameterFormat("value", pkg.db.postgres.Format.Binary),
+    ],
+  )
+  if !unsupported(
+    invalid_duplicate,
+    "binary PostgreSQL parameter requires an exact supported ParameterType",
+  ) { return false }
+
+  duplicate := pkg.db.postgres.rows_native(
+    pkg.db.exec_conn(connection), app.binary_query.fault(), fault_params, [],
+    [
+      pkg.db.postgres.ExecuteOption.ParameterFormat("flag", pkg.db.postgres.Format.Binary),
+      pkg.db.postgres.ExecuteOption.ParameterFormat("flag", pkg.db.postgres.Format.Text),
+    ],
+  )
+  return unsupported(duplicate, "duplicate PostgreSQL parameter format")
+}
+
+fn empty_binary_is_not_null(borrow connection: pkg.db.conn) -> bool {
+  storage := [0 as u8]
+  present := pkg.db.postgres.execute_native(
+    pkg.db.exec_conn(connection), app.binary_query.empty_command(),
+    app.binary_query.EmptyParams { payload: Some(storage[0..0]) }, [],
+    [pkg.db.postgres.ExecuteOption.ParameterFormat("payload", pkg.db.postgres.Format.Binary)],
+  )
+  match present { Err(_) => { return false } Ok(_) => {} }
+  absent := pkg.db.postgres.execute_native(
+    pkg.db.exec_conn(connection), app.binary_query.empty_command(),
+    app.binary_query.EmptyParams { payload: None }, [],
+    [pkg.db.postgres.ExecuteOption.ParameterFormat("payload", pkg.db.postgres.Format.Binary)],
+  )
+  return match absent { Ok(_) => true, Err(_) => false }
+}
+
+fn exercise(borrow connection: pkg.db.conn, fault: i32, delivery: i32) -> bool {
+  unsafe { align_pg_set_binary_fault(fault) }
+  params := app.binary_query.FaultParams { flag: true, text: "valid" }
+  opened := if delivery == 0 {
+    pkg.db.postgres.rows_native(
+      pkg.db.exec_conn(connection), app.binary_query.fault(), params, [],
+      [
+        pkg.db.postgres.ExecuteOption.ParameterFormat(
+          "flag", pkg.db.postgres.Format.Binary,
+        ),
+        pkg.db.postgres.ExecuteOption.ParameterFormat(
+          "text", pkg.db.postgres.Format.Binary,
+        ),
+        pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Binary),
+      ],
+    )
+  } else {
+    mode := if delivery == 1 {
+      pkg.db.postgres.ExecuteOption.Delivery(pkg.db.postgres.Delivery.SingleRow)
+    } else {
+      pkg.db.postgres.ExecuteOption.Delivery(pkg.db.postgres.Delivery.PortalBatch(1))
+    }
+    pkg.db.postgres.rows_native(
+      pkg.db.exec_conn(connection), app.binary_query.fault(), params, [],
+      [
+        pkg.db.postgres.ExecuteOption.ParameterFormat(
+          "flag", pkg.db.postgres.Format.Binary,
+        ),
+        pkg.db.postgres.ExecuteOption.ParameterFormat(
+          "text", pkg.db.postgres.Format.Binary,
+        ),
+        pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Binary),
+        mode,
+      ],
+    )
+  }
+  mut rows := match opened {
+    Err(error) => { return is_row_decode(error) }
+    Ok(value) => value
+  }
+  return match pkg.db.next(rows) {
+    Err(error) => is_row_decode(error)
+    Ok(_) => false
+  }
+}
+
+fn main() -> i32 {
+  pkg.db.testkit.pg.reset()
+  connection := pkg.db.postgres.connect("postgresql://stub/a1-binary-malformed", []) else {
+    return 1
+  }
+  if !option_precedence(connection) { return 2 }
+  if !empty_binary_is_not_null(connection) { return 3 }
+  mut fault: i32 := 1
+  loop {
+    if fault > 9 { break }
+    if !exercise(connection, fault, 0) { return 10 + fault }
+    fault = fault + 1
+  }
+  if !exercise(connection, 3, 1) { return 30 }
+  if !exercise(connection, 4, 2) { return 31 }
+  pkg.db.testkit.pg.dump()
+  return 42
+}
+"#;
+
+const CASE_POSTGRES_BINARY_BOUNDARIES: Case = Case {
+    label: "pkg-db-a1-postgres-binary-boundaries",
+    runner: RunnerKind::PerUnitC,
+    needs: Needs::BackendAndCc,
+    links: &[&PG],
+    counters: &[],
+    modules: a1_modules,
+    main: POSTGRES_BINARY_BOUNDARIES_MAIN,
+    envs: &[],
+    expected_exit: 42,
+    expect_counters: &[],
+};
+
+const CASE_POSTGRES_BINARY_MALFORMED: Case = Case {
+    label: "pkg-db-a1-postgres-binary-malformed",
+    runner: RunnerKind::PerUnitC,
+    needs: Needs::BackendAndCc,
+    links: &[&PG],
+    counters: &[&PG],
+    modules: binary_modules,
+    main: POSTGRES_BINARY_MALFORMED_MAIN,
+    envs: &[],
+    expected_exit: 42,
+    expect_counters: &[
+        ("pg.protocol_ok", 1),
+        ("pg.connect_calls", 1),
+        ("pg.execute_calls", 13),
+        ("pg.clear_calls", 15),
+        ("pg.nonblocking_calls", 4),
+        ("pg.single_row_mode_calls", 1),
+        ("pg.chunked_row_mode_calls", 1),
+    ],
+};
+
+const CASE_POSTGRES_BINARY_FORMAT_PRODUCTS: Case = Case {
+    label: "pkg-db-a1-postgres-binary-format-products",
+    runner: RunnerKind::PerUnitC,
+    needs: Needs::BackendAndCc,
+    links: &[&PG],
+    counters: &[&PG],
+    modules: binary_modules,
+    main: POSTGRES_BINARY_FORMAT_PRODUCTS_MAIN,
+    envs: &[],
+    expected_exit: 42,
+    expect_counters: &[
+        ("pg.protocol_ok", 1),
+        ("pg.connect_calls", 1),
+        ("pg.execute_calls", 28),
+        ("pg.clear_calls", 56),
+        ("pg.prepare_calls", 1),
+        ("pg.execute_prepared_calls", 27),
+        ("pg.deallocate_calls", 0),
+    ],
+};
+
 const CASE_SQLITE_BATCHES: Case = Case {
     label: "pkg-db-a1-sqlite-batches",
     runner: RunnerKind::PerUnitC,
@@ -1869,8 +2558,11 @@ const CASE_POSTGRES_VALUE_MATRIX: Case = Case {
     expected_exit: 42,
     expect_counters: &[
         ("pg.protocol_ok", 1),
-        ("pg.execute_calls", 2),
-        ("pg.clear_calls", 2),
+        ("pg.execute_calls", 4),
+        ("pg.clear_calls", 6),
+        ("pg.nonblocking_calls", 4),
+        ("pg.single_row_mode_calls", 1),
+        ("pg.chunked_row_mode_calls", 1),
     ],
 };
 
@@ -2062,7 +2754,10 @@ const CASE_POSTGRES_STREAMED_UNSAFE_STATUSES: Case = Case {
 /// Every Layer-1 case in this suite, for the fingerprint golden.
 const LAYER1_CASES: &[&Case] = &[
     &CASE_ZERO_COLUMN_PLAN,
+    &CASE_POSTGRES_BINARY_BOUNDARIES,
+    &CASE_POSTGRES_BINARY_MALFORMED,
     &CASE_SQLITE_BATCHES,
+    &CASE_POSTGRES_BINARY_FORMAT_PRODUCTS,
     &CASE_POSTGRES_BUFFERED_BATCHES,
     &CASE_POSTGRES_VALUE_MATRIX,
     &CASE_POSTGRES_BATCH_DECODE_FAILURE,
@@ -2080,6 +2775,13 @@ fn a1_modules() -> Vec<(&'static str, &'static str)> {
     vec![
         ("pkg/db/a1_test.align", TEST_HELPER),
         ("app/batch_query.align", QUERY),
+    ]
+}
+
+fn binary_modules() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("pkg/db/a1_test.align", TEST_HELPER),
+        ("app/binary_query.align", BINARY_QUERY),
     ]
 }
 
@@ -2259,6 +2961,21 @@ fn postgres_buffered_batches_split_without_resend_and_own_copied_rows() {
 }
 
 #[test]
+fn postgres_binary_parameter_result_products_are_independent() {
+    CASE_POSTGRES_BINARY_FORMAT_PRODUCTS.run();
+}
+
+#[test]
+fn postgres_binary_protocol_and_plan_boundaries_are_exact() {
+    CASE_POSTGRES_BINARY_BOUNDARIES.run();
+}
+
+#[test]
+fn postgres_binary_metadata_and_payload_fail_closed() {
+    CASE_POSTGRES_BINARY_MALFORMED.run();
+}
+
+#[test]
 fn postgres_batch_all_value_kinds_and_null_bitmaps_are_exact() {
     CASE_POSTGRES_VALUE_MATRIX.run();
 }
@@ -2348,18 +3065,21 @@ fn postgres_required_streamed_delivery_uses_real_libpq17() {
 ///
 /// Regenerate ONLY with a reviewed reason, from the panic message this emits.
 const LAYER1_FINGERPRINT_GOLDEN: &str = "\
-pkg-db-a1-postgres-batch-decode-failure af292c51af09d20a
-pkg-db-a1-postgres-buffered-batches 37310112d202c8ff
-pkg-db-a1-postgres-delivery-validation b2b65d7cfade3cd5
-pkg-db-a1-postgres-prepared-streamed-modes ffc9c57acdc0aa9d
-pkg-db-a1-postgres-streamed-failures 061abe2c7f92e390
-pkg-db-a1-postgres-streamed-modes b28a2ae752039cf5
-pkg-db-a1-postgres-streamed-one ba315ee063c8d239
-pkg-db-a1-postgres-streamed-timeout-drop 9f74901ca6875ff2
-pkg-db-a1-postgres-streamed-unsafe-statuses c7fbe92c32a686bc
-pkg-db-a1-postgres-value-matrix 0f4060bf07d441dd
-pkg-db-a1-sqlite-batches 9a540f8f09e906ec
-pkg-db-a1-zero-column-plan edcbbef602120847
+pkg-db-a1-postgres-batch-decode-failure dcf1c3ba2efac3e0
+pkg-db-a1-postgres-binary-boundaries 543113c0d6e3d6b8
+pkg-db-a1-postgres-binary-format-products 25825e14312ad10c
+pkg-db-a1-postgres-binary-malformed 8f04c4a8125d8b41
+pkg-db-a1-postgres-buffered-batches 268aed4a282c52fd
+pkg-db-a1-postgres-delivery-validation 6f3598ef48a697cf
+pkg-db-a1-postgres-prepared-streamed-modes dfae330f8742042d
+pkg-db-a1-postgres-streamed-failures fa592d810a5c940a
+pkg-db-a1-postgres-streamed-modes 0e85467ce6e04357
+pkg-db-a1-postgres-streamed-one 8d6aee68ca1d395b
+pkg-db-a1-postgres-streamed-timeout-drop d87d801ab9f20be0
+pkg-db-a1-postgres-streamed-unsafe-statuses 2d0782472bf35dc2
+pkg-db-a1-postgres-value-matrix 3e7d5de4c83705ed
+pkg-db-a1-sqlite-batches d257d048f2216750
+pkg-db-a1-zero-column-plan 866983be583f9bc9
 ";
 
 #[test]

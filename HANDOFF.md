@@ -43,9 +43,14 @@ publication, and fail-closed COPY/pipeline/unknown-status handling. Prepared
 statements use exact statement v3 with a retained producer-owned parameter-name
 resolver; guarded compiler bridges and HIR formation validation prevent raw or
 cross-Query callback splices. Absence of `Delivery` remains the existing
-caller-synchronous BufferedFull path. The exact contract and implementation
-matrix are in `docs/impl/pkg-design/db.md` §23; PostgreSQL binary formats remain
-the following `pkg.db` rail.
+caller-synchronous BufferedFull path. PostgreSQL Text/Binary parameter and result
+formats now preserve the complete mapped scalar/nullable matrix across direct,
+prepared, buffered, single-row, and portal-batch execution. Descriptor v6 owns
+Measure/Encode binder passes and exact Parse/Bind budgets; context, statement, and
+rows v4 own generation-local metadata, effective-OID proof, and allocation-safe
+cleanup. The exact contract and implementation matrix are in
+`docs/impl/pkg-design/db.md` §23; an explicitly specified PostgreSQL COPY rail is
+the following `pkg.db` capability.
 
 Out-of-gate suite status (suites outside the bounded CI gate; a nightly
 full-suite workflow now runs them daily so this class cannot rot silently):
@@ -109,7 +114,8 @@ A1 PostgreSQL lease prerequisite complete / catalog + EXPLAIN overlap closure / 
 A1 PostgreSQL status prerequisite complete / package/tool fail-close + migration COPY / D13
 A1 PostgreSQL direct delivery    complete / SingleRow + PortalBatch / D13
 A1 PostgreSQL prepared parity    complete / streamed delivery + stmt v3 resolver / D13
-next: A1 PostgreSQL formats      binary parameters/results / D13
+A1 PostgreSQL formats            complete / binary parameters/results + protocol budgets / D13
+next: A1 PostgreSQL COPY         explicit data/termination protocol / D13
 ```
 
 The exact cell contracts and owner matrices remain in

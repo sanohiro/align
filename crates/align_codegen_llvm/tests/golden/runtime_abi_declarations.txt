@@ -286,6 +286,14 @@ unkeyed|ArgsBuild|declare { ptr, i64 } @align_rt_args_build(i32, ptr)
 unkeyed|ArenaReset|declare void @align_rt_arena_reset(ptr)
 unkeyed|Realloc|declare ptr @align_rt_realloc(ptr, i64)
 unkeyed|HttpSerialize|declare i32 @align_rt_http_serialize(ptr, ptr)
+unkeyed|F32ToBits|declare i32 @align_rt_f32_to_bits(float) #4
+unkeyed|F32FromBits|declare float @align_rt_f32_from_bits(i32) #4
+unkeyed|F64ToBits|declare i64 @align_rt_f64_to_bits(double) #4
+unkeyed|F64FromBits|declare double @align_rt_f64_from_bits(i64) #4
+unkeyed|F32TextLen|declare i64 @align_rt_f32_text_len(float) #4
+unkeyed|F64TextLen|declare i64 @align_rt_f64_text_len(double) #4
+unkeyed|F32TextWrite|declare i64 @align_rt_f32_text_write(float, ptr, i64) #4
+unkeyed|F64TextWrite|declare i64 @align_rt_f64_text_write(double, ptr, i64) #4
 rt-lto-guarded|align_rt_str_ends_with,align_rt_str_eq,align_rt_str_eq_ignore_case,align_rt_str_starts_with
 attributes #0 = { nofree nounwind }
 attributes #1 = { noreturn }

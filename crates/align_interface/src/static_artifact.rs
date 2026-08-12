@@ -10,8 +10,8 @@ use crate::Hash128;
 use std::collections::{HashMap, HashSet};
 
 pub const STATIC_ARTIFACT_FORMAT_VERSION: u32 = 1;
-pub const BINDER_ABI_VERSION: u32 = 1;
-pub const DECODER_ABI_VERSION: u32 = 1;
+pub const BINDER_ABI_VERSION: u32 = 2;
+pub const DECODER_ABI_VERSION: u32 = 2;
 pub const REWRITE_FORMAT_VERSION: u32 = 1;
 const MAX_TYPE_DEPTH: usize = 256;
 

@@ -2046,6 +2046,13 @@ struct BatchPlanCall<'a> {
 }
 
 #[derive(Clone, Copy)]
+enum NormalizedFormatPlanCall {
+    Execute,
+    Rows,
+    PreparedRows,
+}
+
+#[derive(Clone, Copy)]
 struct LoopTarget {
     ty: Ty,
     arena_depth: u32,
@@ -5704,6 +5711,11 @@ impl<'a> BodyValidator<'a> {
                         return None;
                     }
                 }
+                if normalized_format_plan_call(func).is_some()
+                    && !self.normalized_format_plan_call_ok(context, expression, func, args)
+                {
+                    return None;
+                }
                 if sig.params.len() != args.len() || sig.modes.len() != args.len() {
                     return None;
                 }
@@ -6219,19 +6231,19 @@ impl<'a> BodyValidator<'a> {
                         .map(|_| *resource),
                     _ => None,
                 };
-                    let rows_resource = match &ptr.kind {
-                        hir::ExprKind::ResourceRaw { resource, .. } => self
-                            .program
-                            .resources
-                            .get(*resource as usize)
-                            .filter(|definition| {
-                                definition.declaring_module == "pkg.db"
-                                    && definition.generic_arity == 1
-                                    && definition.name.starts_with("pkg.db$rows$")
-                            })
-                            .map(|_| *resource),
-                        _ => None,
-                    };
+                let rows_resource = match &ptr.kind {
+                    hir::ExprKind::ResourceRaw { resource, .. } => self
+                        .program
+                        .resources
+                        .get(*resource as usize)
+                        .filter(|definition| {
+                            definition.declaring_module == "pkg.db"
+                                && definition.generic_arity == 1
+                                && definition.name.starts_with("pkg.db$rows$")
+                        })
+                        .map(|_| *resource),
+                    _ => None,
+                };
                 let hir::ExprKind::Int(offset) = &offset.kind else {
                     return None;
                 };
@@ -6243,10 +6255,10 @@ impl<'a> BodyValidator<'a> {
                     || callee_flow.ty != Ty::Raw
                     || args.len() != param_tys.len()
                     || args.len() != param_modes.len()
-                        || (!matches!(offset, 40 | 48)
-                            && *return_borrow != hir::ReturnBorrowSummary::None)
-                        || (!matches!(offset, 40 | 48)
-                            && *return_region != hir::ReturnRegionSummary::None)
+                    || (!matches!(offset, 40 | 48)
+                        && *return_borrow != hir::ReturnBorrowSummary::None)
+                    || (!matches!(offset, 40 | 48)
+                        && *return_region != hir::ReturnRegionSummary::None)
                     || *return_cleanup != hir::ReturnCleanupAbi::None
                     || arg_flows
                         .iter()
@@ -6289,22 +6301,50 @@ impl<'a> BodyValidator<'a> {
                         resource,
                     )
                 });
+                let stmt_count_guard_ok = self.prepared_stmt_count_guard_matches(
+                    context,
+                    guard.as_deref(),
+                    ptr,
+                );
+                let descriptor_count_guard_ok = descriptor_kind.is_some_and(|query| {
+                    self.static_descriptor_count_guard_matches(
+                        context,
+                        guard.as_deref(),
+                        ptr,
+                        query,
+                    )
+                });
                 if descriptor_kind.is_none()
                     && prepared_resource.is_none()
                     && rows_resource.is_none()
                     && !batch_signature_ok
+                    && !stmt_count_guard_ok
                 {
                     return None;
                 }
-                if !batch_signature_ok && !prepared_guard_ok && guard.is_some() {
+                if !batch_signature_ok
+                    && !prepared_guard_ok
+                    && !stmt_count_guard_ok
+                    && !descriptor_count_guard_ok
+                    && guard.is_some()
+                {
                     return None;
                 }
-                let signature_ok = batch_signature_ok || match offset {
+                let signature_ok = batch_signature_ok
+                    || match offset {
                         40 => {
+                            let u8_ty = Ty::Int(align_sema::IntTy {
+                                bits: 8,
+                                signed: false,
+                            });
                             rows_resource.is_some()
-                                && args.len() == 1
-                                && param_tys.as_slice() == [Ty::Raw]
-                                && param_modes.as_slice() == [align_ast::ParamMode::ByValue]
+                                && args.len() == 2
+                                && param_tys.as_slice() == [Ty::Raw, u8_ty]
+                                && param_modes.as_slice()
+                                    == [
+                                        align_ast::ParamMode::ByValue,
+                                        align_ast::ParamMode::ByValue,
+                                    ]
                                 && expression.ty == i32_ty
                                 && summary_is_none(return_borrow, return_region)
                         }
@@ -6349,40 +6389,51 @@ impl<'a> BodyValidator<'a> {
                                 && *return_borrow == expected_borrow
                                 && *return_region == expected_region
                         }
-                    24 => {
+                        24 => {
                         let resource = prepared_resource?;
                         let params_ty = param_tys.get(1).copied()?;
+                        let u8_ty = Ty::Int(align_sema::IntTy { bits: 8, signed: false });
                         let definition = self.program.resources.get(resource as usize)?;
                         let expected_prefix =
                             format!("pkg.db$stmt${}$", body_ty_mangle(params_ty, self.program));
                         prepared_guard_ok
-                            && args.len() == 2
+                            && args.len() == 3
                             && matches!(params_ty, Ty::Struct(_))
                             && definition
                                 .name
                                 .strip_prefix(&expected_prefix)
                                 .is_some_and(|row| !row.is_empty())
-                            && param_tys.first() == Some(&Ty::Raw)
+                            && param_tys.as_slice() == [Ty::Raw, params_ty, u8_ty]
                             && param_modes.as_slice()
-                                == [align_ast::ParamMode::ByValue, align_ast::ParamMode::Borrow]
+                                == [
+                                    align_ast::ParamMode::ByValue,
+                                    align_ast::ParamMode::Borrow,
+                                    align_ast::ParamMode::ByValue,
+                                ]
                             && expression.ty == i32_ty
                     }
-                    64 => {
+                        64 => {
+                        let u8_ty = Ty::Int(align_sema::IntTy { bits: 8, signed: false });
                         descriptor_kind.is_some()
-                            && args.len() == 2
+                            && args.len() == 3
                             && param_tys.first() == Some(&Ty::Raw)
+                            && param_tys.get(2) == Some(&u8_ty)
                             && param_modes.as_slice()
-                                == [align_ast::ParamMode::ByValue, align_ast::ParamMode::Borrow]
+                                == [
+                                    align_ast::ParamMode::ByValue,
+                                    align_ast::ParamMode::Borrow,
+                                    align_ast::ParamMode::ByValue,
+                                ]
                             && expression.ty == i32_ty
                     }
-                    72 => {
+                        72 => {
                         descriptor_kind.is_some()
                             && args.len() == 1
                             && param_tys.as_slice() == [Ty::Raw]
                             && param_modes.as_slice() == [align_ast::ParamMode::ByValue]
                             && expression.ty == i32_ty
                     }
-                    80 => {
+                        80 => {
                         if prepared_resource.is_some() {
                             prepared_guard_ok
                                 && args.len() == 1
@@ -6390,47 +6441,79 @@ impl<'a> BodyValidator<'a> {
                                 && param_modes.as_slice() == [align_ast::ParamMode::ByValue]
                                 && expression.ty == i32_ty
                         } else {
+                            let u8_ty = Ty::Int(align_sema::IntTy { bits: 8, signed: false });
                             descriptor_kind == Some(true)
-                                && args.len() == 1
-                                && param_tys.as_slice() == [Ty::Raw]
-                                && param_modes.as_slice() == [align_ast::ParamMode::ByValue]
+                                && args.len() == 2
+                                && param_tys.as_slice() == [Ty::Raw, u8_ty]
+                                && param_modes.as_slice()
+                                    == [
+                                        align_ast::ParamMode::ByValue,
+                                        align_ast::ParamMode::ByValue,
+                                    ]
                                 && expression.ty == i32_ty
                         }
                     }
-                    88 => {
+                        88 => {
                         descriptor_kind == Some(true)
                             && args.len() == 1
                             && param_tys.as_slice() == [Ty::Raw]
                             && param_modes.as_slice() == [align_ast::ParamMode::ByValue]
                     }
-                    96 => {
-                        let u8_ty = Ty::Int(align_sema::IntTy { bits: 8, signed: false });
-                        let i64_ty = Ty::Int(align_sema::IntTy { bits: 64, signed: true });
-                        descriptor_kind == Some(true)
-                            && args.len() == 3
-                            && param_tys.as_slice() == [u8_ty, u8_ty, i64_ty]
-                            && param_modes.as_slice()
-                                == [
-                                    align_ast::ParamMode::ByValue,
-                                    align_ast::ParamMode::ByValue,
-                                    align_ast::ParamMode::ByValue,
-                                ]
-                            && matches!(
-                                expression.ty,
-                                Ty::Option(align_sema::Scalar::Struct(id))
-                                    if self.query_meta_type_ok(id)
-                            )
-                    }
-                    104 => {
+                        96 => {
+                            if stmt_count_guard_ok {
+                                let u32_ty = Ty::Int(align_sema::IntTy {
+                                    bits: 32,
+                                    signed: false,
+                                });
+                                args.is_empty()
+                                    && param_tys.is_empty()
+                                    && param_modes.is_empty()
+                                    && expression.ty == u32_ty
+                                    && summary_is_none(return_borrow, return_region)
+                            } else {
+                                let u8_ty = Ty::Int(align_sema::IntTy {
+                                    bits: 8,
+                                    signed: false,
+                                });
+                                let i64_ty = Ty::Int(align_sema::IntTy {
+                                    bits: 64,
+                                    signed: true,
+                                });
+                                descriptor_kind == Some(true)
+                                    && args.len() == 3
+                                    && param_tys.as_slice() == [u8_ty, u8_ty, i64_ty]
+                                    && param_modes.as_slice()
+                                        == [
+                                            align_ast::ParamMode::ByValue,
+                                            align_ast::ParamMode::ByValue,
+                                            align_ast::ParamMode::ByValue,
+                                        ]
+                                    && matches!(
+                                        expression.ty,
+                                        Ty::Option(align_sema::Scalar::Struct(id))
+                                            if self.query_meta_type_ok(id)
+                                    )
+                            }
+                        }
+                        104 => {
                         descriptor_kind.is_some()
                             && args.len() == 1
                             && param_tys.as_slice() == [Ty::Str]
                             && param_modes.as_slice() == [align_ast::ParamMode::ByValue]
                             && expression.ty == i32_ty
                     }
+                        136 => {
+                        let u32_ty = Ty::Int(align_sema::IntTy { bits: 32, signed: false });
+                        descriptor_count_guard_ok
+                            && args.is_empty()
+                            && param_tys.is_empty()
+                            && param_modes.is_empty()
+                            && expression.ty == u32_ty
+                            && summary_is_none(return_borrow, return_region)
+                        }
                         120 => false,
-                    _ => false,
-                };
+                        _ => false,
+                    };
                 if !signature_ok {
                     return None;
                 }
@@ -9796,8 +9879,315 @@ impl<'a> BodyValidator<'a> {
             && same_reference
     }
 
-    /// A statement retains five producer-owned callbacks after the Query value itself is gone.
-    /// They must all be loaded from one concrete Query descriptor generation; accepting five
+    fn prepared_stmt_count_guard_matches(
+        &self,
+        context: &BodyContext,
+        guard: Option<&hir::Expr>,
+        pointer: &hir::Expr,
+    ) -> bool {
+        let hir::ExprKind::Local(pointer_local) = pointer.kind else {
+            return false;
+        };
+        let Some(hir::Expr {
+            kind:
+                hir::ExprKind::Call {
+                    func,
+                    args: guard_args,
+                    type_args,
+                },
+            ty: Ty::Bool,
+            ..
+        }) = guard
+        else {
+            return false;
+        };
+        let [guard_pointer] = guard_args.as_slice() else {
+            return false;
+        };
+        self.static_descriptor_body_ok(context)
+            && func == "pkg.db.internal.resource$stmt_header_shape_valid"
+            && type_args.is_empty()
+            && pointer.ty == Ty::Raw
+            && guard_pointer.ty == Ty::Raw
+            && matches!(guard_pointer.kind, hir::ExprKind::Local(local) if local == pointer_local)
+    }
+
+    fn static_descriptor_count_guard_matches(
+        &self,
+        context: &BodyContext,
+        guard: Option<&hir::Expr>,
+        pointer: &hir::Expr,
+        query: bool,
+    ) -> bool {
+        let hir::ExprKind::Field {
+            root: pointer_root,
+            path: pointer_path,
+        } = &pointer.kind
+        else {
+            return false;
+        };
+        let Some(hir::Expr {
+            kind:
+                hir::ExprKind::Call {
+                    func,
+                    args: guard_args,
+                    type_args,
+                },
+            ty: Ty::Bool,
+            ..
+        }) = guard
+        else {
+            return false;
+        };
+        let [guard_pointer, guard_kind] = guard_args.as_slice() else {
+            return false;
+        };
+        let hir::ExprKind::Field {
+            root: guard_root,
+            path: guard_path,
+        } = &guard_pointer.kind
+        else {
+            return false;
+        };
+        let expected_kind = if query { 0 } else { 1 };
+        self.static_descriptor_body_ok(context)
+            && func == "pkg.db.internal$descriptor_count_shape_valid"
+            && type_args.is_empty()
+            && pointer.ty == Ty::Raw
+            && guard_pointer.ty == Ty::Raw
+            && pointer_root == guard_root
+            && pointer_path.as_slice() == [0]
+            && guard_path.as_slice() == [0]
+            && matches!(
+                guard_kind.kind,
+                hir::ExprKind::Int(value) if value == expected_kind
+            )
+            && guard_kind.ty
+                == Ty::Int(align_sema::IntTy {
+                    bits: 8,
+                    signed: false,
+                })
+    }
+
+    /// The public PostgreSQL native-option wrappers own one call-local raw format plan. The
+    /// internal ABI receives only a pointer/count pair, so ordinary call typing cannot prove that
+    /// the readable allocation covers `count * 8` bytes. Keep that proof in HIR: only the matching
+    /// package wrapper (or its canonical null/zero convenience path) may call the prevalidated
+    /// function, and a nonempty plan must be the exact immutable local initialized from that same
+    /// count. This rejects a shorter substituted pointer before MIR or LLVM can expose a raw load.
+    fn normalized_format_plan_call_ok(
+        &self,
+        context: &BodyContext,
+        call: &hir::Expr,
+        func: &str,
+        args: &[hir::Expr],
+    ) -> bool {
+        let Some(kind) = normalized_format_plan_call(func) else {
+            return true;
+        };
+        let (plan_index, count_index, public_owner, zero_owner) = match kind {
+            NormalizedFormatPlanCall::Execute => (
+                5,
+                6,
+                "pkg.db.postgres$execute_native",
+                "pkg.db.internal.postgres$execute_prevalidated",
+            ),
+            NormalizedFormatPlanCall::Rows => (
+                7,
+                8,
+                "pkg.db.postgres$rows_native",
+                "pkg.db.internal.postgres$rows_prevalidated",
+            ),
+            NormalizedFormatPlanCall::PreparedRows => (
+                5,
+                6,
+                "pkg.db.postgres$rows_stmt_native",
+                "pkg.db.internal.postgres$rows_stmt_prevalidated",
+            ),
+        };
+        let Some(function) = self.program.fns.get(context.function) else {
+            return false;
+        };
+        let (Some(plan), Some(count)) = (args.get(plan_index), args.get(count_index)) else {
+            return false;
+        };
+        if call_name_matches_base(&function.name, zero_owner) {
+            return plan.ty == Ty::Raw
+                && canonical_raw_null(plan)
+                && count.ty == u32_ty()
+                && matches!(count.kind, hir::ExprKind::Int(0));
+        }
+        if !call_name_matches_base(&function.name, public_owner) {
+            return false;
+        }
+        let (hir::ExprKind::Local(plan_local), hir::ExprKind::Local(count_local)) =
+            (&plan.kind, &count.kind)
+        else {
+            return false;
+        };
+        if plan.ty != Ty::Raw
+            || count.ty != u32_ty()
+            || self.local_type(context, *plan_local) != Some(Ty::Raw)
+            || self.local_type(context, *count_local) != Some(u32_ty())
+            || function
+                .locals
+                .get(*plan_local as usize)
+                .is_none_or(|local| local.id != *plan_local || local.is_mut)
+        {
+            return false;
+        }
+
+        enum Scan<'b> {
+            Block(&'b hir::Block),
+            Expr(&'b hir::Expr),
+        }
+        let call_key = ptr_key(call);
+        let mut work = vec![Scan::Block(&function.body)];
+        let mut blocks = HashSet::new();
+        let mut expressions = HashSet::new();
+        while let Some(item) = work.pop() {
+            match item {
+                Scan::Block(block) => {
+                    if !blocks.insert(ptr_key(block)) {
+                        continue;
+                    }
+                    let plan_binding = block.stmts.iter().enumerate().find_map(
+                        |(index, statement)| match statement {
+                            hir::Stmt::Let { local, init } if local == plan_local => {
+                                Some((index, init))
+                            }
+                            _ => None,
+                        },
+                    );
+                    let call_binding = block.stmts.iter().enumerate().find_map(
+                        |(index, statement)| match statement {
+                            hir::Stmt::Let { init, .. } if ptr_key(init) == call_key => Some(index),
+                            _ => None,
+                        },
+                    );
+                    if let (Some((plan_statement_index, initializer)), Some(call_index)) =
+                        (plan_binding, call_binding)
+                        && plan_statement_index < call_index
+                        && self.normalized_format_plan_initializer_matches(
+                            initializer,
+                            *count_local,
+                        )
+                        && block.stmts[plan_statement_index + 1..call_index]
+                            .iter()
+                            .all(|statement| {
+                                normalized_plan_scratch_statement_ok(
+                                    statement,
+                                    *plan_local,
+                                    *count_local,
+                                )
+                            })
+                        && args.iter().enumerate().all(|(index, argument)| {
+                            index == plan_index
+                                || index == count_index
+                                || !expression_mentions_local(argument, *plan_local)
+                                    && !expression_mentions_local(argument, *count_local)
+                        })
+                    {
+                        return true;
+                    }
+                    if let Some(value) = block.value.as_deref() {
+                        work.push(Scan::Expr(value));
+                    }
+                    for statement in block.stmts.iter().rev() {
+                        for child in statement_children(statement).into_iter().rev() {
+                            work.push(Scan::Expr(child));
+                        }
+                    }
+                }
+                Scan::Expr(expression) => {
+                    if !expressions.insert(ptr_key(expression)) {
+                        continue;
+                    }
+                    match &expression.kind {
+                        hir::ExprKind::TaskGroup(block)
+                        | hir::ExprKind::Arena(block)
+                        | hir::ExprKind::NamedArena { block, .. }
+                        | hir::ExprKind::Unsafe(block)
+                        | hir::ExprKind::Block(block)
+                        | hir::ExprKind::Loop { body: block, .. } => {
+                            work.push(Scan::Block(block));
+                        }
+                        hir::ExprKind::If { then, els, .. } => {
+                            work.push(Scan::Block(els));
+                            work.push(Scan::Block(then));
+                        }
+                        hir::ExprKind::Match { arms, .. } => {
+                            for arm in arms.iter().rev() {
+                                work.push(Scan::Expr(&arm.body));
+                            }
+                        }
+                        _ => {}
+                    }
+                    for child in align_sema::direct_expr_children(expression)
+                        .into_iter()
+                        .rev()
+                    {
+                        work.push(Scan::Expr(child));
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn normalized_format_plan_initializer_matches(
+        &self,
+        initializer: &hir::Expr,
+        count: hir::LocalId,
+    ) -> bool {
+        let hir::ExprKind::If { cond, then, els } = &initializer.kind else {
+            return false;
+        };
+        let hir::ExprKind::Binary { op, lhs, rhs } = &cond.kind else {
+            return false;
+        };
+        if *op != align_ast::BinOp::Eq
+            || cond.ty != Ty::Bool
+            || lhs.ty != u32_ty()
+            || !matches!(lhs.kind, hir::ExprKind::Local(local) if local == count)
+            || rhs.ty != u32_ty()
+            || !matches!(rhs.kind, hir::ExprKind::Int(0))
+        {
+            return false;
+        }
+        let (Some(then_value), Some(else_value)) =
+            (then.value.as_deref(), els.value.as_deref())
+        else {
+            return false;
+        };
+        if !then.stmts.is_empty()
+            || !els.stmts.is_empty()
+            || then_value.ty != Ty::Raw
+            || !matches!(then_value.kind, hir::ExprKind::RawNull)
+            || else_value.ty != Ty::Raw
+        {
+            return false;
+        }
+        let hir::ExprKind::RawAlloc(size) = &else_value.kind else {
+            return false;
+        };
+        let hir::ExprKind::Binary { op, lhs, rhs } = &size.kind else {
+            return false;
+        };
+        let hir::ExprKind::Cast(cast) = &lhs.kind else {
+            return false;
+        };
+        *op == align_ast::BinOp::Mul
+            && size.ty == i64_ty()
+            && lhs.ty == i64_ty()
+            && cast.ty == u32_ty()
+            && matches!(cast.kind, hir::ExprKind::Local(local) if local == count)
+            && rhs.ty == i64_ty()
+            && matches!(rhs.kind, hir::ExprKind::Int(8))
+    }
+
+    /// A statement retains six producer-owned callbacks after the Query value itself is gone.
+    /// They must all be loaded from one concrete Query descriptor generation; accepting six
     /// individually well-typed raw pointers would let malformed HIR splice a resolver or decoder
     /// from a sibling Query with the same P/R types.
     fn prepared_stmt_formation_matches(
@@ -9805,7 +10195,7 @@ impl<'a> BodyValidator<'a> {
         context: &BodyContext,
         args: &[hir::Expr],
     ) -> bool {
-        if !self.static_descriptor_body_ok(context) || args.len() != 11 {
+        if !self.static_descriptor_body_ok(context) || args.len() != 14 {
             return false;
         }
         let callback = |index: usize, expected_offset: i128| -> Option<u32> {
@@ -9829,7 +10219,7 @@ impl<'a> BodyValidator<'a> {
         let Some(root) = callback(3, 64) else {
             return false;
         };
-        [(7, 80), (8, 120), (9, 128), (10, 104)]
+        [(7, 80), (8, 120), (9, 128), (10, 104), (12, 136)]
             .into_iter()
             .all(|(index, offset)| callback(index, offset) == Some(root))
     }
@@ -10453,10 +10843,113 @@ fn statement_children(statement: &hir::Stmt) -> Vec<&hir::Expr> {
     }
 }
 
+fn call_name_matches_base(name: &str, base: &str) -> bool {
+    name.strip_prefix(base)
+        .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('$'))
+}
+
+fn normalized_format_plan_call(name: &str) -> Option<NormalizedFormatPlanCall> {
+    [
+        (
+            "pkg.db.internal.postgres$execute_native_prevalidated",
+            NormalizedFormatPlanCall::Execute,
+        ),
+        (
+            "pkg.db.internal.postgres$rows_native_prevalidated",
+            NormalizedFormatPlanCall::Rows,
+        ),
+        (
+            "pkg.db.internal.postgres$rows_stmt_native_prevalidated",
+            NormalizedFormatPlanCall::PreparedRows,
+        ),
+    ]
+    .into_iter()
+    .find_map(|(base, kind)| call_name_matches_base(name, base).then_some(kind))
+}
+
+fn expression_mentions_local(root: &hir::Expr, target: hir::LocalId) -> bool {
+    let mut work = vec![root];
+    let mut seen = HashSet::new();
+    while let Some(expression) = work.pop() {
+        if !seen.insert(ptr_key(expression)) {
+            continue;
+        }
+        if matches!(expression.kind, hir::ExprKind::Local(local) if local == target) {
+            return true;
+        }
+        work.extend(align_sema::direct_expr_children(expression));
+    }
+    false
+}
+
+fn canonical_raw_null(root: &hir::Expr) -> bool {
+    let mut current = root;
+    loop {
+        match &current.kind {
+            hir::ExprKind::RawNull => return current.ty == Ty::Raw,
+            hir::ExprKind::Unsafe(block) | hir::ExprKind::Block(block)
+                if block.stmts.is_empty() =>
+            {
+                let Some(value) = block.value.as_deref() else {
+                    return false;
+                };
+                current = value;
+            }
+            _ => return false,
+        }
+    }
+}
+
+fn normalized_plan_scratch_statement_ok(
+    statement: &hir::Stmt,
+    plan: hir::LocalId,
+    count: hir::LocalId,
+) -> bool {
+    let mut work = statement_children(statement)
+        .into_iter()
+        .map(|expression| (expression, false))
+        .collect::<Vec<_>>();
+    let mut seen = HashSet::new();
+    while let Some((expression, plan_is_store_pointer)) = work.pop() {
+        if !seen.insert((ptr_key(expression), plan_is_store_pointer)) {
+            continue;
+        }
+        if let hir::ExprKind::Local(local) = expression.kind {
+            if local == count || local == plan && !plan_is_store_pointer {
+                return false;
+            }
+            continue;
+        }
+        if let hir::ExprKind::RawStore { ptr, offset, value } = &expression.kind {
+            let pointer_is_plan = matches!(ptr.kind, hir::ExprKind::Local(local) if local == plan);
+            if expression_mentions_local(ptr, plan) && !pointer_is_plan {
+                return false;
+            }
+            work.push((ptr, pointer_is_plan));
+            work.push((offset, false));
+            work.push((value, false));
+            continue;
+        }
+        work.extend(
+            align_sema::direct_expr_children(expression)
+                .into_iter()
+                .map(|child| (child, false)),
+        );
+    }
+    true
+}
+
 fn i64_ty() -> Ty {
     Ty::Int(align_sema::IntTy {
         bits: 64,
         signed: true,
+    })
+}
+
+fn u32_ty() -> Ty {
+    Ty::Int(align_sema::IntTy {
+        bits: 32,
+        signed: false,
     })
 }
 

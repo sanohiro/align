@@ -13,12 +13,16 @@ The F-B region materialization capability has 283 `RuntimeKey` variants and a
 one-to-one native-symbol record. Relative to Am-c1, it adds
 `ArrayBuilderNewIn` and `ArrayBuilderPushBytes`; the four
 AEAD symbols that were previously selected from `AeadCipher × AeadDir` become
-ordinary typed keys; they may no longer bypass the registry. Five always-built
-runtime records have no `RuntimeKey` and instead use the five-variant
+ordinary typed keys; they may no longer bypass the registry. Thirteen always-built
+runtime records have no `RuntimeKey` and instead use the thirteen-variant
 `UnkeyedRuntimeKey`: the two main-wrapper callees
 `align_rt_report_error` and `align_rt_args_build`, plus the runtime-internal
 `align_rt_arena_reset`, `align_rt_realloc`, and
-`align_rt_http_serialize`. The base native registry therefore has 288 records.
+`align_rt_http_serialize`, and eight package-internal PostgreSQL codec helpers:
+`align_rt_f32_to_bits`, `align_rt_f32_from_bits`, `align_rt_f64_to_bits`,
+`align_rt_f64_from_bits`, `align_rt_f32_text_len`, `align_rt_f64_text_len`,
+`align_rt_f32_text_write`, and `align_rt_f64_text_write`. The base native registry
+therefore has 296 records.
 The explicit `alloc-count` runtime feature may expose four
 test/benchmark-only counter definitions. `par-map-probe` may expose four more:
 `void @align_rt_test_par_map_force_caller(i32)`,
@@ -27,10 +31,10 @@ test/benchmark-only counter definitions. `par-map-probe` may expose four more:
 `i64 @align_rt_test_par_map_workers()`. `task-group-probe` changes internal
 Rust state only and adds no unmangled native export.
 
-The compiler-visible native registry is always exactly the 288 base records.
+The compiler-visible native registry is always exactly the 296 base records.
 There is no target option, environment variable, Cargo feature, linked-runtime
 inspection, or other ambient input that changes it. The eight optional probe
-records extend only the verification-time maximum runtime-export table to 296.
+records extend only the verification-time maximum runtime-export table to 304.
 They never gain a `RuntimeKey`, callable/declaration policy, collision
 reservation, or compatible-extern reuse. Their spellings remain ordinary
 program/extern/export identities in a normal build. Probe-feature runtime
@@ -169,6 +173,14 @@ Unkeyed native records:
 | arena implementation | `void @align_rt_arena_reset(ptr)` | always linked; runtime-internal, no curated declaration attributes |
 | allocator implementation | `ptr @align_rt_realloc(ptr, i64)` | always linked; runtime-internal, no curated declaration attributes |
 | HTTP implementation | `i32 @align_rt_http_serialize(ptr, ptr)` | always linked; runtime-internal, no curated declaration attributes |
+| PostgreSQL codec | `i32 @align_rt_f32_to_bits(float) {nofree nosync willreturn}` | always linked; package-internal compatible extern |
+| PostgreSQL codec | `float @align_rt_f32_from_bits(i32) {nofree nosync willreturn}` | always linked; package-internal compatible extern |
+| PostgreSQL codec | `i64 @align_rt_f64_to_bits(double) {nofree nosync willreturn}` | always linked; package-internal compatible extern |
+| PostgreSQL codec | `double @align_rt_f64_from_bits(i64) {nofree nosync willreturn}` | always linked; package-internal compatible extern |
+| PostgreSQL codec | `i64 @align_rt_f32_text_len(float) {nofree nosync willreturn}` | always linked; package-internal compatible extern |
+| PostgreSQL codec | `i64 @align_rt_f64_text_len(double) {nofree nosync willreturn}` | always linked; package-internal compatible extern |
+| PostgreSQL codec | `i64 @align_rt_f32_text_write(float, ptr, i64) {nofree nosync willreturn}` | always linked; package-internal compatible extern |
+| PostgreSQL codec | `i64 @align_rt_f64_text_write(double, ptr, i64) {nofree nosync willreturn}` | always linked; package-internal compatible extern |
 | allocation probe | `i64 @align_rt_alloc_count()` | only with the explicit `align_runtime/alloc-count` feature; no curated declaration attributes |
 | allocation probe | `i64 @align_rt_free_count()` | only with the explicit `align_runtime/alloc-count` feature; no curated declaration attributes |
 | finder probe | `i64 @align_rt_str_finder_new_count()` | only with the explicit `align_runtime/alloc-count` feature; no curated declaration attributes |
@@ -185,17 +197,17 @@ and attribute authorities with one typed `RuntimeAbi` row per identity:
 `{ key, symbol, return type, ordered parameter types, return attrs, parameter
 attrs, function attrs, rt_lto_policy }`. Declaration and call lookup consume
 that row. `key` is `RuntimeAbiId`, either `Keyed(RuntimeKey)` or
-`Unkeyed(UnkeyedRuntimeKey)`. The five base unkeyed records use the same ABI
+`Unkeyed(UnkeyedRuntimeKey)`. The thirteen base unkeyed records use the same ABI
 shape; only `ReportError` and `ArgsBuild` have a dedicated Align main-wrapper
 declaration policy and yield typed wrapper handles when that wrapper requires
-them. The other three yield no unconditional compiler handle. An exact
-compatible source extern may declare or reuse `ReportError`, `ArenaReset`,
-`Realloc`, or `HttpSerialize` through the ordinary extern path. `ArgsBuild`
+them. The other eleven yield no unconditional compiler handle. An exact
+compatible source extern may declare or reuse every unkeyed row except `ArgsBuild`
+through the ordinary extern path. `ArgsBuild`
 returns the native `{ptr, i64}` argv view, which no source-valid extern return
 can express: `str`/slice view returns are rejected, `raw` is not a valid
 `layout(C)` field, and the closest source-valid `layout(C) { u64, i64 }` return
 lowers as `{i64, i64}` rather than `{ptr, i64}`. It is therefore wrapper-only,
-not a fifth compatible source-extern row. The legacy mixed string map remains as a handle-only alias seam
+the only base unkeyed row without a compatible source-extern form. The legacy mixed string map remains as a handle-only alias seam
 for unchanged `Rvalue::Call(String)` resolution through c1: it is populated in
 post-c1 class order from stored definitions, non-shadowed imports, externs,
 alphabetical `RuntimeKey::ALL` aliases, then existing generated aliases. The
@@ -239,23 +251,23 @@ Tests compare:
 - all 283 keys, mapped symbols, LLVM declaration types, and default attributes
   against this table through the checked-in
   `crates/align_codegen_llvm/tests/golden/runtime_abi_declarations.txt`;
-- the 288 base native symbols against default-feature `align_runtime` exports,
+- the 296 base native symbols against default-feature `align_runtime` exports,
   plus every actual Rust definition's normalized native return and ordered
   parameter types against the declaration golden, failing on either direction's
   difference through `scripts/test-runtime-abi-exports.sh`;
-- the 292 `alloc-count` and 292 `par-map-probe` native symbols against
+- the 300 `alloc-count` and 300 `par-map-probe` native symbols against
   `align_runtime` built with each feature separately, including the four exact
   probe signatures above;
-- the 296 maximum native symbols against `align_runtime` built with
+- the 304 maximum native symbols against `align_runtime` built with
   `alloc-count,par-map-probe,task-group-probe`, while proving
   `task-group-probe` adds no unmangled export;
 - rt-LTO off/on attributes for every guarded symbol, with missing,
   declaration-only, wrong-type, internal, private, available-externally, and
   non-C-calling-convention artifact negatives;
-- all 288 identities through the one `RuntimeAbiId`-keyed row iterator and all
-  288 exact registry function types through the production compatibility
+- all 296 identities through the one `RuntimeAbiId`-keyed row iterator and all
+  296 exact registry function types through the production compatibility
   predicate, one return mutation per row, and one mutation of every parameter
-  ordinal; source-valid compatible reuse for a keyed builtin and the four
+  ordinal; source-valid compatible reuse for a keyed builtin and the twelve
   source-reachable unkeyed rows; exact `ArgsBuild` `str` rejection plus the
   source-valid `layout(C) { u64, i64 }` aggregate mismatch; and
   compatible reuse representatives for each of the five checked-in attribute

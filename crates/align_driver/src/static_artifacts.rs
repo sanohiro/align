@@ -472,6 +472,11 @@ fn policy(options: &[StaticOption]) -> CheckPolicy {
         .unwrap_or(CheckPolicy::DeclaredOnly)
 }
 
+fn postgres_parameter_count_error(field_count: usize, drivers: &[Driver]) -> Option<&'static str> {
+    (drivers.contains(&Driver::PostgreSQL) && field_count > 65_535)
+        .then_some("PostgreSQL static query supports at most 65535 parameters")
+}
+
 fn driver_entries(
     descriptor: &StaticDescriptor,
     params: &CanonicalContract,
@@ -481,6 +486,9 @@ fn driver_entries(
     drivers: &[Driver],
 ) -> Result<Vec<DriverEntry>, StaticArtifactBuildError> {
     let fields = root_fields(params).map_err(|reason| fail(descriptor, reason))?;
+    if let Some(reason) = postgres_parameter_count_error(fields.len(), drivers) {
+        return Err(fail(descriptor, reason));
+    }
     let names = occurrences
         .iter()
         .map(|occurrence| occurrence.source_name.as_str())
@@ -1144,5 +1152,85 @@ mod tests {
             let error = scan_sql(sql).expect_err("malformed static SQL must fail");
             assert!(error.contains(expected), "{sql:?}: {error}");
         }
+    }
+
+    #[test]
+    fn postgres_parameter_count_boundary_is_exact_and_driver_scoped() {
+        assert_eq!(
+            postgres_parameter_count_error(65_535, &[Driver::PostgreSQL]),
+            None,
+        );
+        assert_eq!(
+            postgres_parameter_count_error(65_536, &[Driver::PostgreSQL]),
+            Some("PostgreSQL static query supports at most 65535 parameters"),
+        );
+        assert_eq!(
+            postgres_parameter_count_error(65_536, &[Driver::SQLite]),
+            None,
+        );
+
+        let root = CanonicalType::Named {
+            path: "Params".to_string(),
+            args: Vec::new(),
+        };
+        let params = CanonicalContract {
+            root,
+            definitions: vec![align_interface::CanonicalDefinition {
+                path: "Params".to_string(),
+                args: Vec::new(),
+                kind: CanonicalDefinitionBody::Struct {
+                    fields: (0..65_536)
+                        .map(|index| align_interface::CanonicalField {
+                            name: format!("p{index}"),
+                            ty: CanonicalType::Named {
+                                path: "i64".to_string(),
+                                args: Vec::new(),
+                            },
+                        })
+                        .collect(),
+                },
+            }],
+        };
+        let span = align_span::Span::new(0, 0, 0);
+        let descriptor = StaticDescriptor {
+            unit: "app".to_string(),
+            item: "too_many".to_string(),
+            descriptor_id: "app.too_many".to_string(),
+            is_public: false,
+            consumer: align_sema::StaticDescriptorConsumer::Query,
+            driver: align_sema::StaticDescriptorDriver::PostgreSQLOnly,
+            source: align_sema::StaticDescriptorSource::Inline {
+                decoded_sql: String::new(),
+                literal_span: span,
+            },
+            constructor_span: span,
+            common_options_span: span,
+            native_options_span: None,
+            params_ty: align_sema::Ty::Unit,
+            row_ty: None,
+            params_contract: align_sema::StaticContract {
+                root: align_sema::StaticContractType::Named {
+                    path: "()".to_string(),
+                    args: Vec::new(),
+                },
+                definitions: Vec::new(),
+            },
+            row_contract: None,
+            static_options: Vec::new(),
+        };
+        let error = driver_entries(
+            &descriptor,
+            &params,
+            b"",
+            &[],
+            CheckPolicy::DeclaredOnly,
+            &[Driver::PostgreSQL],
+        )
+        .expect_err("the formation boundary must reject the PostgreSQL Int16 overflow");
+        assert_eq!(error.descriptor_id, "app.too_many");
+        assert_eq!(
+            error.reason,
+            "PostgreSQL static query supports at most 65535 parameters"
+        );
     }
 }

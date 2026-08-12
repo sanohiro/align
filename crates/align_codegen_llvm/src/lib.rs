@@ -4930,6 +4930,71 @@ fn validate_batch_plan_record(
     Ok(())
 }
 
+fn validate_query_descriptor_count_thunk(
+    descriptor: &StaticData,
+    program: &Program,
+    declarations: &HashMap<ProgramCall, ProgramDeclaration>,
+) -> Result<(), CodegenError> {
+    let malformed = |detail: &str| {
+        CodegenError::Lowering(format!(
+            "static-data v6 Query descriptor is malformed: {detail}"
+        ))
+    };
+    let relocation = descriptor
+        .relocations
+        .iter()
+        .find(|relocation| relocation.offset == 136)
+        .ok_or_else(|| malformed("parameter-count thunk is absent"))?;
+    let StaticDataTarget::Function(target) = &relocation.target else {
+        return Err(malformed("parameter-count thunk is not a function"));
+    };
+    let declaration = declarations
+        .get(target)
+        .ok_or_else(|| callable_target_error(target))?;
+    let u32_ty = Ty::Int(IntTy {
+        bits: 32,
+        signed: false,
+    });
+    if !declaration.classes.contains(&ProgramDeclarationClass::Stored)
+        || declaration.classes.contains(&ProgramDeclarationClass::Extern)
+        || !static_plan_signature_matches(
+            declaration,
+            Vec::new(),
+            u32_ty,
+            hir::ReturnBorrowSummary::None,
+            hir::ReturnRegionSummary::None,
+        )
+    {
+        return Err(malformed("parameter-count thunk signature is invalid"));
+    }
+    let expected = static_u32(&descriptor.bytes, 112)
+        .ok_or_else(|| malformed("stored parameter count is absent"))?;
+    if expected > 65_535 {
+        return Err(malformed("stored parameter count exceeds the protocol maximum"));
+    }
+    let Some(function) = program.fns.iter().find(|function| &function.name == target) else {
+        return Err(malformed("parameter-count thunk body is absent"));
+    };
+    let [block] = function.blocks.as_slice() else {
+        return Err(malformed("parameter-count thunk body is not one block"));
+    };
+    if function.entry != block.id
+        || !function.slots.is_empty()
+        || !function.value_tys.is_empty()
+        || !block.stmts.is_empty()
+        || !matches!(
+            block.term,
+            Term::Return(Some(Operand::Const(Const::Int(value, ty))))
+                if value == i128::from(expected) && ty == u32_ty
+        )
+    {
+        return Err(malformed(
+            "parameter-count thunk body does not match the stored count",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_static_data_record(
     result: Option<Ty>,
     data: &StaticData,
@@ -4979,22 +5044,29 @@ fn validate_static_data_record(
             }
             cursor = end;
         }
-        let query_descriptor_v5 = static_u32(&record.bytes, 0) == Some(5)
-            && record.bytes.get(4).copied() == Some(0);
-        if query_descriptor_v5 {
-            if record.bytes.len() != 136 || record.align != 8 {
-                return Err(malformed(
-                    "v5 Query descriptor size or alignment is invalid",
-                ));
+        let query_descriptor_version = static_u32(&record.bytes, 0)
+            .filter(|version| matches!(version, 5 | 6))
+            .filter(|_| record.bytes.get(4).copied() == Some(0));
+        if let Some(version) = query_descriptor_version {
+            let expected_size = if version == 5 { 136 } else { 144 };
+            if record.bytes.len() != expected_size || record.align != 8 {
+                return Err(malformed(&format!(
+                    "v{version} Query descriptor size or alignment is invalid"
+                )));
             }
             let plan = relocations
                 .iter()
                 .find(|relocation| relocation.offset == 128)
-                .ok_or_else(|| malformed("v5 Query descriptor has no batch plan"))?;
+                .ok_or_else(|| malformed(&format!("v{version} Query descriptor has no batch plan")))?;
             let StaticDataTarget::Record(plan) = &plan.target else {
-                return Err(malformed("v5 Query descriptor batch plan is not a record"));
+                return Err(malformed(&format!(
+                    "v{version} Query descriptor batch plan is not a record"
+                )));
             };
             validate_batch_plan_record(plan, program, declarations)?;
+            if version == 6 {
+                validate_query_descriptor_count_thunk(record, program, declarations)?;
+            }
         }
     }
     Ok(())
@@ -18304,17 +18376,61 @@ mod tests {
             })
             .collect(),
         };
-        let emit_descriptor = |plan: StaticData| {
-            let mut header = vec![0; 136];
-            header[0..4].copy_from_slice(&5u32.to_le_bytes());
+        callbacks.push(Function {
+            name: program_call("parameter_count"),
+            params: Vec::new(),
+            param_modes: Vec::new(),
+            borrow_mut_cleanup_slots: Vec::new(),
+            ret: u32_ty,
+            return_borrow: hir::ReturnBorrowSummary::None,
+            return_region: hir::ReturnRegionSummary::None,
+            return_cleanup: hir::ReturnCleanupAbi::None,
+            slots: Vec::new(),
+            slot_align: Vec::new(),
+            value_tys: Vec::new(),
+            blocks: vec![Block {
+                id: 0,
+                stmts: Vec::new(),
+                stmt_lines: Vec::new(),
+                term: Term::Return(Some(Operand::Const(Const::Int(1, u32_ty)))),
+            }],
+            entry: 0,
+            exportable: false,
+        });
+        let emit_descriptor = |version: u32,
+                               stored_count: u32,
+                               thunk_count: u32,
+                               include_count: bool,
+                               plan: StaticData| {
+            let mut header = vec![0; if version == 5 { 136 } else { 144 }];
+            header[0..4].copy_from_slice(&version.to_le_bytes());
+            if version == 6 {
+                header[112..116].copy_from_slice(&stored_count.to_le_bytes());
+            }
+            let mut relocations = vec![align_mir::StaticDataRelocation {
+                offset: 128,
+                target: StaticDataTarget::Record(Box::new(plan)),
+            }];
+            if version == 6 && include_count {
+                relocations.push(align_mir::StaticDataRelocation {
+                    offset: 136,
+                    target: StaticDataTarget::Function(program_call("parameter_count")),
+                });
+            }
             let descriptor = StaticData {
                 bytes: header,
                 align: 8,
-                relocations: vec![align_mir::StaticDataRelocation {
-                    offset: 128,
-                    target: StaticDataTarget::Record(Box::new(plan)),
-                }],
+                relocations,
             };
+            let mut descriptor_functions = callbacks.clone();
+            let count_function = descriptor_functions
+                .iter_mut()
+                .find(|function| function.name == program_call("parameter_count"))
+                .unwrap_or_else(|| panic!("test parameter-count thunk"));
+            count_function.blocks[0].term = Term::Return(Some(Operand::Const(Const::Int(
+                i128::from(thunk_count),
+                u32_ty,
+            ))));
             let main = Function {
                 name: program_call("main"),
                 params: Vec::new(),
@@ -18339,7 +18455,7 @@ mod tests {
             emit_llvm_ir(
                 &Program {
                     fns: std::iter::once(main)
-                        .chain(callbacks.iter().cloned())
+                        .chain(descriptor_functions)
                         .collect(),
                     externs: Vec::new(),
                     imported_fns: vec![align_mir::ImportedFn {
@@ -18368,7 +18484,32 @@ mod tests {
                 None,
             )
         };
-        assert!(emit_descriptor(plan.clone()).is_ok());
+        assert!(emit_descriptor(5, 0, 1, false, plan.clone()).is_ok());
+        assert!(emit_descriptor(6, 1, 1, true, plan.clone()).is_ok());
+
+        let error = emit_descriptor(6, 1, 1, false, plan.clone())
+            .expect_err("v6 descriptor without count thunk must fail before LLVM");
+        assert!(
+            error.to_string().contains("parameter-count thunk is absent"),
+            "unexpected missing v6 count-thunk diagnostic: {error}"
+        );
+
+        let error = emit_descriptor(6, 2, 1, true, plan.clone())
+            .expect_err("v6 count thunk mismatch must fail before LLVM");
+        assert!(
+            error
+                .to_string()
+                .contains("parameter-count thunk body does not match the stored count"),
+            "unexpected v6 count-thunk diagnostic: {error}"
+        );
+        let error = emit_descriptor(6, 65_536, 65_536, true, plan.clone())
+            .expect_err("v6 count above the protocol maximum must fail before LLVM");
+        assert!(
+            error
+                .to_string()
+                .contains("stored parameter count exceeds the protocol maximum"),
+            "unexpected v6 count-limit diagnostic: {error}"
+        );
 
         for (length, align) in [(128, 8), (135, 8), (137, 8), (136, 16)] {
             let mut header = vec![0; length];
@@ -18385,6 +18526,21 @@ mod tests {
                 "length {length}, align {align} produced unexpected diagnostic: {error}"
             );
         }
+        for (length, align) in [(136, 8), (143, 8), (145, 8), (144, 16)] {
+            let mut header = vec![0; length];
+            header[0..4].copy_from_slice(&6u32.to_le_bytes());
+            let malformed = StaticData {
+                bytes: header,
+                align,
+                relocations: Vec::new(),
+            };
+            let error = emit(malformed, Ty::Raw)
+                .expect_err("wrong-shaped v6 Query descriptor must fail before LLVM");
+            assert!(
+                error.to_string().contains("v6 Query descriptor"),
+                "length {length}, align {align} produced unexpected diagnostic: {error}"
+            );
+        }
         for offset in [16, 24, 32, 40, 48, 56] {
             let mut malformed = plan.clone();
             let relocation = malformed
@@ -18397,7 +18553,7 @@ mod tests {
             } else {
                 "batch_drop"
             }));
-            let error = emit_descriptor(malformed)
+            let error = emit_descriptor(6, 1, 1, true, malformed)
                 .expect_err("wrong-signature batch callback must fail before LLVM");
             assert!(
                 error
@@ -18418,7 +18574,7 @@ mod tests {
                 .find(|relocation| relocation.offset == offset)
                 .unwrap_or_else(|| panic!("raw-only callback ordinal"))
                 .target = StaticDataTarget::Function(program_call(target));
-            let error = emit_descriptor(malformed)
+            let error = emit_descriptor(6, 1, 1, true, malformed)
                 .expect_err("cross-Row raw-only batch callback must fail before LLVM");
             assert!(
                 error
@@ -18441,7 +18597,7 @@ mod tests {
                 .find(|relocation| relocation.offset == offset)
                 .unwrap_or_else(|| panic!("payload callback ordinal"))
                 .target = StaticDataTarget::Function(program_call(target));
-            let error = emit_descriptor(malformed)
+            let error = emit_descriptor(6, 1, 1, true, malformed)
                 .expect_err("batch callback prefix mutation must fail before LLVM");
             assert!(
                 error
@@ -18457,7 +18613,7 @@ mod tests {
             .find(|relocation| relocation.offset == 24)
             .unwrap_or_else(|| panic!("append callback ordinal"))
             .target = StaticDataTarget::Function(program_call("wrong_ordinal_append"));
-        let error = emit_descriptor(malformed)
+        let error = emit_descriptor(6, 1, 1, true, malformed)
             .expect_err("append reader ordinal mismatch must fail before LLVM");
         assert!(
             error

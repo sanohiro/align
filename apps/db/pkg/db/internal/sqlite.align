@@ -40,7 +40,7 @@ pub SQLITE_INTEGER: i32 := 1
 pub SQLITE_TEXT: i32 := 3
 pub SQLITE_NULL: i32 := 5
 pub DRIVER_SQLITE: u8 := 1
-CONTEXT_VERSION: u32 := 2
+CONTEXT_VERSION: u32 := 4
 FAILURE_NATIVE: u8 := 1
 FAILURE_UNSUPPORTED: u8 := 2
 FAILURE_ROW: u8 := 3
@@ -231,7 +231,7 @@ pub fn tail_is_empty(pointer: raw) -> bool {
 
 pub fn new_context(native: raw) -> raw {
   unsafe {
-    context := raw.alloc(56)
+    context := raw.alloc(112)
     version: u32 := CONTEXT_VERSION
     driver: u8 := DRIVER_SQLITE
     clear8: u8 := 0
@@ -250,6 +250,23 @@ pub fn new_context(native: raw) -> raw {
     raw.store(context, 40, raw.null())
     raw.store(context, 48, clear32)
     raw.store(context, 52, clear32)
+    raw.store(context, 56, raw.null())
+    raw.store(context, 64, raw.null())
+    raw.store(context, 72, clear32)
+    raw.store(context, 76, clear32)
+    raw.store(context, 80, clear8)
+    raw.store(context, 81, clear8)
+    raw.store(context, 82, clear16)
+    raw.store(context, 84, clear32)
+    raw.store(context, 88, raw.null())
+    raw.store(context, 96, -1 as i64)
+    raw.store(context, 104, clear8)
+    mut tail: i64 := 105
+    loop {
+      if tail >= 112 { break }
+      raw.store(context, tail, clear8)
+      tail = tail + 1
+    }
     return context
   }
 }
@@ -257,6 +274,10 @@ pub fn new_context(native: raw) -> raw {
 pub fn free_context(context: raw) {
   unsafe {
     if context.is_null() { return }
+    if !pkg.db.internal.context_valid_v4(context, DRIVER_SQLITE) {
+      raw.free(context)
+      return
+    }
     pkg.db.internal.release_row_cache_v2(context)
     values: raw := raw.load(context, 40)
     count: u32 := raw.load(context, 48)
@@ -409,7 +430,7 @@ pub fn cleanup_execution(
   }
 }
 
-fn clear_execution_lease(state: raw) {
+pub fn clear_execution_lease(state: raw) {
   unsafe {
     clear: u8 := 0
     raw.store(state, 20, clear)
@@ -566,6 +587,9 @@ pub fn prepare_prevalidated<P, R>(
       pkg.db.internal.descriptor.stream_decoder(statement),
       pkg.db.internal.descriptor.batch_plan(statement),
       pkg.db.internal.descriptor.parameter_resolver(statement),
+      raw.null(),
+      pkg.db.internal.descriptor.parameter_count_thunk(statement),
+      pkg.db.internal.descriptor.parameter_count(statement),
     )
     raw.store(state, 20, 0 as u8)
     prepared: pkg.db.stmt<P, R> := match target {
@@ -604,8 +628,13 @@ pub fn rows_stmt_prevalidated<P, R>(
       ))
     }
     acquire_lease(state, query_id)?
-    context := new_context(native)
-    bind_status := pkg.db.internal.descriptor.bind_prepared(statement_ref, context, params)
+    context := new_context(raw.null())
+    if !pkg.db.internal.set_native_generation_v1(context, native) {
+      free_context(context)
+      clear_execution_lease(state)
+      return Err(invalid_descriptor_error())
+    }
+    bind_status := pkg.db.internal.descriptor.bind_prepared(statement_ref, context, params, 1)
     if bind_status != 0 {
       failure := context_error(context, database, query_id)
       reset_status := prepared_reset(native)
@@ -642,6 +671,13 @@ pub fn rows_stmt_prevalidated<P, R>(
     output: pkg.db.rows<R> := resource.from_raw_borrowed(
       rows_wrapper, resource.borrow(statement),
     )
+    metadata_status := pkg.db.internal.descriptor.validate_current_row(
+      resource.borrow(output), context, 0,
+    )
+    if metadata_status != 0 {
+      failure := context_error(context, database, query_id)
+      return Err(failure)
+    }
     return Ok(output)
   }
 }
@@ -741,8 +777,14 @@ pub fn rows_prevalidated<P, R>(
       )
       return Err(failure)
     }
-    raw.store(context, 8, native_statement)
-    bind_status := pkg.db.internal.descriptor.bind(statement, context, params)
+    if !pkg.db.internal.set_native_generation_v1(context, native_statement) {
+      failure := invalid_descriptor_error()
+      cleaned := cleanup_execution(
+        state, database, native_statement, context, restore_timeout, prior_timeout,
+      )
+      return Err(failure)
+    }
+    bind_status := pkg.db.internal.descriptor.bind(statement, context, params, 1)
     if bind_status != 0 {
       failure := context_error(context, database, query_id)
       cleaned := cleanup_execution(
@@ -775,6 +817,13 @@ pub fn rows_prevalidated<P, R>(
     output: pkg.db.rows<R> := match target {
       Conn(reference) => resource.from_raw_borrowed(rows_wrapper, reference)
       Tx(reference) => resource.from_raw_borrowed(rows_wrapper, reference)
+    }
+    metadata_status := pkg.db.internal.descriptor.validate_current_row(
+      resource.borrow(output), context, 0,
+    )
+    if metadata_status != 0 {
+      failure := context_error(context, database, query_id)
+      return Err(failure)
     }
     return Ok(output)
   }
@@ -833,7 +882,7 @@ pub fn next_prevalidated<R>(
       ignored := pkg.db.internal.resource.close_rows(wrapper, 2)
       return Err(failure)
     }
-    validate_status := pkg.db.internal.descriptor.validate_current_row(reference, context)
+    validate_status := pkg.db.internal.descriptor.validate_current_row(reference, context, 1)
     if validate_status != 0 {
       failure := context_error(context, database, query_id)
       ignored := pkg.db.internal.resource.close_rows(wrapper, 2)
@@ -938,7 +987,7 @@ pub fn next_batch_prevalidated<R>(
         ignored := pkg.db.internal.resource.close_rows(wrapper, 2)
         return Err(failure)
       }
-      validate_status := pkg.db.internal.descriptor.validate_current_row(reference, context)
+      validate_status := pkg.db.internal.descriptor.validate_current_row(reference, context, 1)
       if validate_status != 0 {
         failure := context_error(context, database, query_id)
         pkg.db.internal.descriptor.drop_batch_payload(plan, payload)
@@ -1118,8 +1167,14 @@ pub fn execute_prevalidated<P>(
       return Err(failure)
     }
 
-    raw.store(context, 8, native_statement)
-    bind_status := pkg.db.internal.descriptor.bind(statement, context, params)
+    if !pkg.db.internal.set_native_generation_v1(context, native_statement) {
+      failure := invalid_descriptor_error()
+      cleaned := cleanup_execution(
+        state, database, native_statement, context, restore_timeout, prior_timeout,
+      )
+      return Err(failure)
+    }
+    bind_status := pkg.db.internal.descriptor.bind(statement, context, params, 1)
     if bind_status != 0 {
       failure := context_error(context, database, query_id)
       cleaned := cleanup_execution(
@@ -1253,9 +1308,23 @@ pub fn one_prevalidated<P, R>(
       return Err(failure)
     }
 
-    raw.store(context, 8, native_statement)
-    bind_status := pkg.db.internal.descriptor.bind(statement, context, params)
+    if !pkg.db.internal.set_native_generation_v1(context, native_statement) {
+      failure := invalid_descriptor_error()
+      cleaned := cleanup_execution(
+        state, database, native_statement, context, restore_timeout, prior_timeout,
+      )
+      return Err(failure)
+    }
+    bind_status := pkg.db.internal.descriptor.bind(statement, context, params, 1)
     if bind_status != 0 {
+      failure := context_error(context, database, query_id)
+      cleaned := cleanup_execution(
+        state, database, native_statement, context, restore_timeout, prior_timeout,
+      )
+      return Err(failure)
+    }
+    metadata_status := pkg.db.internal.descriptor.validate_row(statement, context, 0)
+    if metadata_status != 0 {
       failure := context_error(context, database, query_id)
       cleaned := cleanup_execution(
         state, database, native_statement, context, restore_timeout, prior_timeout,
@@ -1277,7 +1346,7 @@ pub fn one_prevalidated<P, R>(
       )
       return Err(failure)
     }
-    validate_status := pkg.db.internal.descriptor.validate_row(statement, context)
+    validate_status := pkg.db.internal.descriptor.validate_row(statement, context, 1)
     if validate_status != 0 {
       failure := context_error(context, database, query_id)
       cleaned := cleanup_execution(
@@ -1427,8 +1496,12 @@ pub fn explain_prevalidated<P, R>(
       return Err(failure)
     }
     raw.free(combined)
-    raw.store(context, 8, native_statement)
-    bind_status := pkg.db.internal.descriptor.bind(statement, context, params)
+    if !pkg.db.internal.set_native_generation_v1(context, native_statement) {
+      failure := invalid_descriptor_error()
+      cleaned := cleanup_execution(state, database, native_statement, context, false, 0)
+      return Err(failure)
+    }
+    bind_status := pkg.db.internal.descriptor.bind(statement, context, params, 1)
     if bind_status != 0 {
       failure := context_error(context, database, query_id)
       cleaned := cleanup_execution(
