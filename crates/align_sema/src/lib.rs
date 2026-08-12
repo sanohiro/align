@@ -700,7 +700,9 @@ pub enum Ty {
 /// wildcard) in every pass that matches over these enums — the align-self-review Gate-1
 /// list: `region_of`, `tracks_region`, `null_moved_source`, `is_move`/`ret_is_move`,
 /// `MoveCheck`/`EscapeCheck`, drop insertion, `ty_to_scalar`/`scalar_to_ty`, MIR lowering,
-/// and codegen's `abi_type`/`scalar_bytes`/`int_type`/`int_bits`. A variant that owns
+/// and codegen's `abi_type`/`scalar_bytes`/`int_type`/`int_bits`. A variant that can carry a
+/// nested tagged id must also join codegen's `build_tagged_types`, or its payload is treated as a
+/// leaf and two spellings of one Align type get two LLVM types. A variant that owns
 /// individually-dropped dynamic-array storage must also join `ty_owns_dyn_array_storage`,
 /// or slices of it silently regain the closed frame-escape class. A variant carrying an
 /// owned or region payload additionally needs a use-after-free / double-free owner test.

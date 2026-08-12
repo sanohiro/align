@@ -57,7 +57,8 @@ use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
 use inkwell::types::{
-    BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, FunctionType, IntType, StructType,
+    AsTypeRef, BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, FunctionType, IntType,
+    StructType,
 };
 use inkwell::values::{
     ArrayValue, BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, IntValue,
@@ -550,6 +551,9 @@ pub fn emit_llvm_ir(program: &Program, target: &BuildTarget, optimized: bool, ex
     if let Some(rt) = rt_module {
         link_in_rt_lto(&ctx, &module, rt, &runtime)?;
     }
+    // The IR lens never shows IR it knows is ill-formed, in every profile — `build_module`'s own
+    // verification below is debug-only.
+    verify_generated_module(&module)?;
     if optimized {
         run_opt_pipeline(&module, &tm, "default<O2>")?;
     }
@@ -811,14 +815,13 @@ fn build_module<'c>(
         })
         .collect();
     // Concrete nested `Option` / `Result` values need their own named recursive-capable aggregate
-    // type. Create every shell before any body so a tagged payload can refer to another tagged
-    // value without relying on declaration order.
-    let tagged_types: Vec<StructType<'c>> = program
-        .tagged_types
-        .iter()
-        .enumerate()
-        .map(|(id, _)| ctx.opaque_struct_type(&format!("align.tagged.{id}")))
-        .collect();
+    // type. Entries that lower to the same LLVM body share one identified struct, and the body
+    // index makes that struct the ONE lowering of its shape — whether MIR spelled it
+    // `Ty::Tagged(id)` or `Ty::Option`/`Ty::Result`, and whether or not the spelling is itself a
+    // table entry. See [`TaggedTypes`].
+    let (tagged_shells, tagged_bodies) =
+        build_tagged_types(ctx, &program.tagged_types, &struct_types, &enum_types)?;
+    let tagged_types = TaggedTypes { shells: &tagged_shells, by_body: &tagged_bodies };
     let mut completed_enum_types = HashSet::new();
     for (e, et) in program.enums.iter().zip(&enum_types) {
         if !completed_enum_types.insert(e.source_name.as_str()) {
@@ -832,43 +835,11 @@ fn build_module<'c>(
                     scalar_to_ty(s),
                     &struct_types,
                     &enum_types,
-                    &tagged_types,
+                    tagged_types,
                 ));
             }
         }
         et.set_body(&fields, false);
-    }
-    for (tagged, llvm_ty) in program.tagged_types.iter().zip(&tagged_types) {
-        let fields = match *tagged {
-            hir::TaggedType::Option(payload) => vec![
-                ctx.i8_type().into(),
-                scalar_type(
-                    ctx,
-                    scalar_to_ty(payload),
-                    &struct_types,
-                    &enum_types,
-                    &tagged_types,
-                ),
-            ],
-            hir::TaggedType::Result(ok, err) => vec![
-                ctx.i8_type().into(),
-                scalar_type(
-                    ctx,
-                    scalar_to_ty(ok),
-                    &struct_types,
-                    &enum_types,
-                    &tagged_types,
-                ),
-                scalar_type(
-                    ctx,
-                    scalar_to_ty(err),
-                    &struct_types,
-                    &enum_types,
-                    &tagged_types,
-                ),
-            ],
-        };
-        llvm_ty.set_body(&fields, false);
     }
     // Field reordering (see `docs/impl/05-backend-llvm.md` §2): a non-`layout(C)` struct's field
     // order is language-unspecified, so codegen lays fields out in **descending alignment** (ties
@@ -899,7 +870,7 @@ fn build_module<'c>(
             perm,
             &struct_types,
             &enum_types,
-            &tagged_types,
+            tagged_types,
             &target_data,
         );
     }
@@ -920,7 +891,7 @@ fn build_module<'c>(
                         scalar_to_ty(*s),
                         &struct_types,
                         &enum_types,
-                        &tagged_types,
+                        tagged_types,
                     )
                 })
                 .collect();
@@ -991,7 +962,7 @@ fn build_module<'c>(
         for (pa, &ty) in abi.params.iter().zip(&ext.params) {
             match pa {
                 ParamAbi::Direct => param_types
-                    .push(abi_type(ctx, ty, &struct_types, &enum_types, &tagged_types).into()),
+                    .push(abi_type(ctx, ty, &struct_types, &enum_types, tagged_types).into()),
                 ParamAbi::ViewPtr => param_types.push(ctx.ptr_type(AddressSpace::default()).into()),
                 ParamAbi::StructRegs(sabi) => {
                     for &eb in &sabi.ebs {
@@ -1015,7 +986,7 @@ fn build_module<'c>(
                 if ext.ret == Ty::Unit {
                     ctx.void_type().fn_type(&param_types, false)
                 } else {
-                    abi_type(ctx, ext.ret, &struct_types, &enum_types, &tagged_types)
+                    abi_type(ctx, ext.ret, &struct_types, &enum_types, tagged_types)
                         .fn_type(&param_types, false)
                 }
             }
@@ -1054,7 +1025,7 @@ fn build_module<'c>(
             &symbol,
             &struct_types,
             &enum_types,
-            &tagged_types,
+            tagged_types,
             &tuple_types,
             program,
             exports,
@@ -1079,7 +1050,7 @@ fn build_module<'c>(
             imp,
             &struct_types,
             &enum_types,
-            &tagged_types,
+            tagged_types,
             &tuple_types,
             program,
         );
@@ -1306,7 +1277,7 @@ fn build_module<'c>(
         let env = thunk.get_nth_param(0).unwrap().into_pointer_value();
         let env_fields: Vec<BasicTypeEnum> = capture_tys
             .iter()
-            .map(|t| abi_type(ctx, *t, &struct_types, &enum_types, &tagged_types))
+            .map(|t| abi_type(ctx, *t, &struct_types, &enum_types, tagged_types))
             .collect();
         let env_struct = ctx.struct_type(&env_fields, false);
         // The explicit parameters are forwarded as-is; the captures are loaded from the env.
@@ -1318,7 +1289,7 @@ fn build_module<'c>(
                 .map_err(|e| CodegenError::Lowering(e.to_string()))?;
             let v = tb
                 .build_load(
-                    abi_type(ctx, *cty, &struct_types, &enum_types, &tagged_types),
+                    abi_type(ctx, *cty, &struct_types, &enum_types, tagged_types),
                     fld,
                     "capv",
                 )
@@ -1390,7 +1361,7 @@ fn build_module<'c>(
                     .ok_or_else(|| CodegenError::Lowering("Error enum not registered".into()))?,
             );
             let result_ty =
-                result_struct_type(ctx, ok_s, err_s, &struct_types, &enum_types, &tagged_types);
+                result_struct_type(ctx, ok_s, err_s, &struct_types, &enum_types, tagged_types);
             let agg = tb
                 .build_indirect_call(result_ty.fn_type(&[ptr.into()], false), thunk, &[env.into()], "r")
                 .map_err(lower)?
@@ -1421,7 +1392,7 @@ fn build_module<'c>(
             tb.build_store(slot, i32t.const_zero()).map_err(lower)?;
             tb.build_return(Some(&i32t.const_zero())).map_err(lower)?;
         } else {
-            let rt = scalar_type(ctx, *r, &struct_types, &enum_types, &tagged_types);
+            let rt = scalar_type(ctx, *r, &struct_types, &enum_types, tagged_types);
             let res = tb
                 .build_indirect_call(rt.fn_type(&[ptr.into()], false), thunk, &[env.into()], "r")
                 .map_err(lower)?
@@ -1513,7 +1484,7 @@ fn build_module<'c>(
             field_perm: &field_perm,
             enum_types: &enum_types,
             enums: &program.enums,
-            tagged_types: &tagged_types,
+            tagged_types,
             tagged_defs: &program.tagged_types,
             tuple_types: &tuple_types,
             tuples: &program.tuples,
@@ -1567,7 +1538,35 @@ fn build_module<'c>(
             &extern_fn_types,
         )?;
     }
+    // Every emit path — object, PGO, ThinLTO prelink, `emit-llvm`, and the remark lens — funnels
+    // through here, so this is where ill-formed IR is caught closest to the code that produced it.
+    // Until #730 made `--rt-lto` the default, the merged-module verifier behind that flag was the
+    // pipeline's only one, which is exactly why the nested-tagged type mismatch #670 introduced
+    // survived sixty PRs: every `build_and_run` owner test compiles with `rt_lto = false`.
+    //
+    // Debug-only, and a test binary is always a debug build, so the whole owner suite is now a
+    // well-formedness gate while a release `alignc` keeps today's behavior. Promoting it to every
+    // profile is blocked on one pre-existing MIR defect it exposes, recorded with its repro and
+    // owner in `docs/impl/05-backend-llvm.md`; the measured cost of doing so is about 1%.
+    #[cfg(debug_assertions)]
+    verify_generated_module(module)?;
     Ok(RuntimeDeclarations { physical_names: runtime_physical_names })
+}
+
+/// Verify a module codegen just built, printing the offending IR before failing.
+///
+/// Ill-formed IR is a compiler bug, not a user error, and the message LLVM returns names only the
+/// instruction — without the surrounding function it is rarely enough to find the lowering that
+/// produced it, so the module goes to stderr first.
+fn verify_generated_module(module: &Module<'_>) -> Result<(), CodegenError> {
+    module.verify().map_err(|e| {
+        eprintln!(
+            "alignc: the module below failed LLVM verification. This is a compiler bug, not a \
+             problem with your program.\n{}",
+            module.print_to_string().to_string()
+        );
+        CodegenError::Lowering(format!("generated module failed verification: {e}"))
+    })
 }
 
 /// Recheck package-resource operations at the cached/hand-built MIR boundary. HIR validation
@@ -5127,7 +5126,7 @@ fn scalar_type<'c>(
     ty: Ty,
     sx: &[StructType<'c>],
     ex: &[StructType<'c>],
-    tx: &[StructType<'c>],
+    tx: TaggedTypes<'c, '_>,
 ) -> BasicTypeEnum<'c> {
     match ty {
         Ty::Float(_) => float_type(ctx, ty).into(),
@@ -5135,7 +5134,7 @@ fn scalar_type<'c>(
         Ty::StructArray(id, n) => sx[id as usize].array_type(n).into(),
         // A sum type lowers to its non-union tagged struct `{ i32 tag, … }`.
         Ty::Enum(id) => ex[id as usize].into(),
-        Ty::Tagged(id) => tx[id as usize].into(),
+        Ty::Tagged(id) => tx.shell(id).into(),
         // A `{ptr,len}` payload (an owned `string` in an Option/Result, slice 8a; also str/slice/
         // array views) lowers to the slice struct.
         // A `{ptr,len}` payload (an owned `string` in an Option/Result, slice 8a; also str/slice/
@@ -5192,40 +5191,274 @@ fn vec_llvm_ty<'c>(ctx: &'c Context, elem: Ty, n: u32) -> BasicTypeEnum<'c> {
     }
 }
 
-/// `Option<T>` lowers to `{ i8 tag, T value }` (tag 1 = Some, 0 = None).
+/// `Option<T>` lowers to `{ i8 tag, T value }` (tag 1 = Some, 0 = None) — as the identified
+/// `%align.tagged.{id}` struct when a tagged table entry has that exact body, and as the
+/// structurally-uniqued literal struct otherwise (see [`TaggedTypes`]).
 fn option_struct_type<'c>(
     ctx: &'c Context,
     s: Scalar,
     sx: &[StructType<'c>],
     ex: &[StructType<'c>],
-    tx: &[StructType<'c>],
+    tx: TaggedTypes<'c, '_>,
 ) -> StructType<'c> {
-    ctx.struct_type(
+    let body = ctx.struct_type(
         &[
             ctx.i8_type().into(),
             scalar_type(ctx, scalar_to_ty(s), sx, ex, tx),
         ],
         false,
-    )
+    );
+    tx.shell_for_body(body).unwrap_or(body)
 }
 
-/// `Result<T, E>` lowers to `{ i8 tag, T ok, E err }` (tag 0 = Ok, 1 = Err).
+/// `Result<T, E>` lowers to `{ i8 tag, T ok, E err }` (tag 0 = Ok, 1 = Err) — as the identified
+/// `%align.tagged.{id}` struct when a tagged table entry has that exact body, and as the
+/// structurally-uniqued literal struct otherwise (see [`TaggedTypes`]).
 fn result_struct_type<'c>(
     ctx: &'c Context,
     ok: Scalar,
     err: Scalar,
     sx: &[StructType<'c>],
     ex: &[StructType<'c>],
-    tx: &[StructType<'c>],
+    tx: TaggedTypes<'c, '_>,
 ) -> StructType<'c> {
-    ctx.struct_type(
+    let body = ctx.struct_type(
         &[
             ctx.i8_type().into(),
             scalar_type(ctx, scalar_to_ty(ok), sx, ex, tx),
             scalar_type(ctx, scalar_to_ty(err), sx, ex, tx),
         ],
         false,
-    )
+    );
+    tx.shell_for_body(body).unwrap_or(body)
+}
+
+/// The LLVM view of MIR's nested-tagged table (`Program::tagged_types`).
+///
+/// One Align `Option`/`Result` type must reach exactly one LLVM type. That is not automatic here,
+/// because codegen meets such a type under spellings MIR keeps distinct while sema does not:
+///
+/// - `Ty::Tagged(id)` where the value is another tagged value's payload, and `Ty::Option`/
+///   `Ty::Result` where the same value is a local, parameter, or return (`expand_tagged_ty` makes
+///   them one type);
+/// - two table entries for one source-visible type, because MIR type ids are finer than LLVM type
+///   identity — two origin-specific generic instances keep distinct `Ty::Struct` ids while sharing
+///   one `source_name` and therefore one LLVM struct, and `source_ty_matches` unifies them;
+/// - an `Option<string>` argument passed to an `Option<str>` parameter, where the owned and the
+///   borrowed payload are one `{ ptr, len }` LLVM type and only one of the two shapes is in the
+///   table at all.
+///
+/// So identity here is the **LLVM body**, not the table entry: a tagged shape whose body matches a
+/// predeclared entry's lowers to that entry's identified `%align.tagged.{id}` struct, and every
+/// other shape keeps the literal struct LLVM already uniques structurally. Lowering the
+/// source-shaped spelling to a literal unconditionally is what made `insertvalue` mix
+/// `{ i8, i64 }` into `{ i8, %align.tagged.0, %Error }` — invalid IR, latent since #670 and
+/// surfaced when #730 turned `--rt-lto` (which verifies the merged module) on by default.
+#[derive(Clone, Copy)]
+struct TaggedTypes<'c, 'a> {
+    /// The identified struct per table entry, indexed by [`Ty::Tagged`]'s id. Many-to-one: entries
+    /// that lower to one body share one struct.
+    shells: &'a [StructType<'c>],
+    /// Every predeclared body → its identified struct, keyed by the uniqued literal struct's LLVM
+    /// handle. `LLVMTypeRef` is a stable, context-owned pointer and LLVM uniques literal structs
+    /// structurally, so equal bodies are one key.
+    by_body: &'a HashMap<usize, StructType<'c>>,
+}
+
+impl<'c> TaggedTypes<'c, '_> {
+    /// The identified struct for tagged entry `id`.
+    fn shell(self, id: u32) -> StructType<'c> {
+        self.shells[id as usize]
+    }
+
+    /// The identified struct predeclared for this body, or `None` when no table entry lowers to
+    /// it — in which case the caller's own literal struct is already the one lowering of the shape.
+    fn shell_for_body(self, body: StructType<'c>) -> Option<StructType<'c>> {
+        self.by_body.get(&(body.as_type_ref() as usize)).copied()
+    }
+}
+
+/// The nested tagged entry a payload scalar names, if any.
+///
+/// Exhaustive on purpose. A future [`Scalar`] variant that can carry a tagged id must fail this
+/// match rather than fall into a wildcard and key as a leaf, because a payload keyed as a leaf gets
+/// its own LLVM body and splits one Align type across two LLVM types (see [`TaggedTypes`]). This is
+/// the codegen half of `align_sema`'s `variant_sweep_tripwire`.
+fn tagged_child(payload: Scalar) -> Option<u32> {
+    match payload {
+        Scalar::Tagged(id) => Some(id),
+        Scalar::Int(_)
+        | Scalar::Float(_)
+        | Scalar::Bool
+        | Scalar::Char
+        | Scalar::Unit
+        | Scalar::Struct(_)
+        | Scalar::String
+        | Scalar::DynArray(_)
+        | Scalar::DynStructArray(_)
+        | Scalar::DynResponseArray
+        | Scalar::Str
+        | Scalar::Slice(_)
+        | Scalar::Enum(_)
+        | Scalar::Soa(_)
+        | Scalar::SoaParam(_)
+        | Scalar::JsonDoc
+        | Scalar::Param(_)
+        | Scalar::Reader
+        | Scalar::Writer
+        | Scalar::Buffer
+        | Scalar::Regex
+        | Scalar::Captures
+        | Scalar::CliParsed
+        | Scalar::TcpConn
+        | Scalar::TcpListener
+        | Scalar::UdpSocket
+        | Scalar::Child
+        | Scalar::File
+        | Scalar::HttpResponse
+        | Scalar::HttpServer
+        | Scalar::HttpRequestCtx
+        | Scalar::ResponseBuilder
+        | Scalar::HttpStream
+        | Scalar::RunOutput
+        | Scalar::Fn(_)
+        | Scalar::Resource(_)
+        | Scalar::ResourceRef(_) => None,
+    }
+}
+
+/// The payload scalars of one tagged entry, tag field excluded.
+fn tagged_payloads(tagged: hir::TaggedType) -> Vec<Scalar> {
+    match tagged {
+        hir::TaggedType::Option(payload) => vec![payload],
+        hir::TaggedType::Result(ok, err) => vec![ok, err],
+    }
+}
+
+/// Predeclare one identified struct per distinct tagged body and assign it, returning the
+/// per-entry table and the body index that [`TaggedTypes`] resolves every other spelling through.
+///
+/// Three passes, because the name of a shared struct must not depend on traversal order:
+///
+/// 1. give every entry the fully literal form of its body, children first, so equal bodies are one
+///    uniqued LLVM type and the whole equivalence is decided before anything is named;
+/// 2. walk ids in ascending order, so the **lowest** id in a body class is the one that names its
+///    `%align.tagged.{id}` struct — a golden IR assertion then depends on the table, not on which
+///    entry a depth-first walk happened to reach first;
+/// 3. assign each class representative its body over the now-final child structs, and index that
+///    body so `option_struct_type`/`result_struct_type` can resolve a query built the same way.
+///
+/// The walk is iterative because an Align program may nest thousands of tagged types deep
+/// (`deep_type_consumer_closure_matrix`), and it fails closed: a missing or self-referential entry
+/// is a `CodegenError`, never a guessed representation. `validate_tagged_program` has already
+/// rejected both by the time this runs, so this is the second line of defense.
+fn build_tagged_types<'c>(
+    ctx: &'c Context,
+    defs: &[hir::TaggedType],
+    sx: &[StructType<'c>],
+    ex: &[StructType<'c>],
+) -> Result<(Vec<StructType<'c>>, HashMap<usize, StructType<'c>>), CodegenError> {
+    let malformed = || {
+        CodegenError::Lowering(
+            "nested tagged type table is missing an entry or is recursive".to_string(),
+        )
+    };
+    // A tagged payload is resolved from the tables built here, so this bundle is never indexed.
+    let no_tagged_bodies = HashMap::new();
+    let no_tagged = TaggedTypes { shells: &[], by_body: &no_tagged_bodies };
+
+    // (1) The literal body of every entry, children first. Two entries are the same LLVM type
+    // exactly when these agree, because LLVM uniques literal structs structurally.
+    let mut literals: Vec<Option<StructType<'c>>> = vec![None; defs.len()];
+    for root in 0..defs.len() {
+        if literals[root].is_some() {
+            continue;
+        }
+        let mut active = HashSet::new();
+        let mut work = vec![(root, false)];
+        while let Some((id, children_done)) = work.pop() {
+            if literals.get(id).ok_or_else(malformed)?.is_some() {
+                active.remove(&id);
+                continue;
+            }
+            let tagged = *defs.get(id).ok_or_else(malformed)?;
+            let payloads = tagged_payloads(tagged);
+            let pending: Vec<u32> = payloads.iter().copied().filter_map(tagged_child).collect();
+            if !children_done {
+                if pending.iter().any(|child| active.contains(&(*child as usize))) {
+                    return Err(malformed());
+                }
+                if pending
+                    .iter()
+                    .any(|child| literals.get(*child as usize).is_none_or(Option::is_none))
+                {
+                    active.insert(id);
+                    work.push((id, true));
+                    for child in pending {
+                        work.push((child as usize, false));
+                    }
+                    continue;
+                }
+            }
+            active.remove(&id);
+            let mut fields: Vec<BasicTypeEnum<'c>> = Vec::with_capacity(payloads.len() + 1);
+            fields.push(ctx.i8_type().into());
+            for payload in payloads {
+                fields.push(match tagged_child(payload) {
+                    Some(child) => literals
+                        .get(child as usize)
+                        .copied()
+                        .flatten()
+                        .ok_or_else(malformed)?
+                        .into(),
+                    None => scalar_type(ctx, scalar_to_ty(payload), sx, ex, no_tagged),
+                });
+            }
+            literals[id] = Some(ctx.struct_type(&fields, false));
+        }
+    }
+    let literals = literals
+        .into_iter()
+        .map(|literal| literal.ok_or_else(malformed))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // (2) One identified struct per body class, named for the lowest id in that class.
+    let mut representative: HashMap<usize, u32> = HashMap::new();
+    let mut shells: Vec<StructType<'c>> = Vec::with_capacity(defs.len());
+    for (id, literal) in literals.iter().enumerate() {
+        let owner = *representative
+            .entry(literal.as_type_ref() as usize)
+            .or_insert(id as u32);
+        shells.push(if owner as usize == id {
+            ctx.opaque_struct_type(&format!("align.tagged.{id}"))
+        } else {
+            shells[owner as usize]
+        });
+    }
+
+    // (3) Assign each representative its body over the final child structs, and index that body.
+    let mut by_body: HashMap<usize, StructType<'c>> = HashMap::new();
+    for (id, literal) in literals.iter().enumerate() {
+        if *representative
+            .get(&(literal.as_type_ref() as usize))
+            .ok_or_else(malformed)? as usize
+            != id
+        {
+            continue;
+        }
+        let payloads = tagged_payloads(*defs.get(id).ok_or_else(malformed)?);
+        let mut fields: Vec<BasicTypeEnum<'c>> = Vec::with_capacity(payloads.len() + 1);
+        fields.push(ctx.i8_type().into());
+        for payload in payloads {
+            fields.push(match tagged_child(payload) {
+                Some(child) => shells.get(child as usize).copied().ok_or_else(malformed)?.into(),
+                None => scalar_type(ctx, scalar_to_ty(payload), sx, ex, no_tagged),
+            });
+        }
+        shells[id].set_body(&fields, false);
+        by_body.insert(ctx.struct_type(&fields, false).as_type_ref() as usize, shells[id]);
+    }
+    Ok((shells, by_body))
 }
 
 /// `slice<T>` lowers to `{ T* ptr, i64 len }`.
@@ -5260,12 +5493,12 @@ fn abi_type<'c>(
     ty: Ty,
     sx: &[StructType<'c>],
     ex: &[StructType<'c>],
-    tx: &[StructType<'c>],
+    tx: TaggedTypes<'c, '_>,
 ) -> BasicTypeEnum<'c> {
     match ty {
         Ty::Option(s) => option_struct_type(ctx, s, sx, ex, tx).into(),
         Ty::Result(o, e) => result_struct_type(ctx, o, e, sx, ex, tx).into(),
-        Ty::Tagged(id) => tx[id as usize].into(),
+        Ty::Tagged(id) => tx.shell(id).into(),
         Ty::Box(_)
         | Ty::ArenaHandle
         | Ty::Builder
@@ -5569,7 +5802,7 @@ fn set_struct_body<'c>(
     perm: &[u32],
     struct_types: &[StructType<'c>],
     enum_types: &[StructType<'c>],
-    tagged_types: &[StructType<'c>],
+    tagged_types: TaggedTypes<'c, '_>,
     target_data: &inkwell::targets::TargetData,
 ) {
     // `abi_type` maps each field (floats to their float type, `str` to the `{ ptr, len }` view, a
@@ -5839,7 +6072,7 @@ fn abi_map_ty<'c>(
     ty: Ty,
     struct_types: &[StructType<'c>],
     enum_types: &[StructType<'c>],
-    tagged_types: &[StructType<'c>],
+    tagged_types: TaggedTypes<'c, '_>,
     tuple_types: &[StructType<'c>],
 ) -> BasicTypeEnum<'c> {
     match ty {
@@ -5854,7 +6087,7 @@ fn abi_map_ty<'c>(
                 .into()
         }
         Ty::Enum(id) => enum_types[id as usize].into(),
-        Ty::Tagged(id) => tagged_types[id as usize].into(),
+        Ty::Tagged(id) => tagged_types.shell(id).into(),
         _ => abi_type(ctx, ty, struct_types, enum_types, tagged_types),
     }
 }
@@ -5907,7 +6140,7 @@ fn declare_fn<'c>(
     symbol: &str,
     struct_types: &[StructType<'c>],
     enum_types: &[StructType<'c>],
-    tagged_types: &[StructType<'c>],
+    tagged_types: TaggedTypes<'c, '_>,
     tuple_types: &[StructType<'c>],
     program: &Program,
     exports: &[String],
@@ -5985,7 +6218,7 @@ fn declare_imported_fn<'c>(
     imp: &align_mir::ImportedFn,
     struct_types: &[StructType<'c>],
     enum_types: &[StructType<'c>],
-    tagged_types: &[StructType<'c>],
+    tagged_types: TaggedTypes<'c, '_>,
     tuple_types: &[StructType<'c>],
     program: &Program,
 ) -> FunctionValue<'c> {
@@ -6447,7 +6680,7 @@ struct FnGen<'c, 'a> {
     enum_types: &'a [StructType<'c>],
     enums: &'a [EnumDef],
     /// Nested tagged LLVM types and the semantic table that defines their payloads.
-    tagged_types: &'a [StructType<'c>],
+    tagged_types: TaggedTypes<'c, 'a>,
     tagged_defs: &'a [hir::TaggedType],
     /// Anonymous tuple types, indexed by the id in [`Ty::Tuple`].
     tuple_types: &'a [StructType<'c>],
@@ -13723,7 +13956,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.tagged_types,
             )
             .into(),
-            Ty::Tagged(id) => self.tagged_types[id as usize].into(),
+            Ty::Tagged(id) => self.tagged_types.shell(id).into(),
             Ty::Box(_)
             | Ty::ArenaHandle
             | Ty::Builder
@@ -19054,6 +19287,78 @@ mod tests {
         }
     }
 
+    /// `build_tagged_types` is the second line of defense behind `validate_tagged_program`: a table
+    /// whose entry is missing must produce a `CodegenError`, never a guessed body or a panic.
+    #[test]
+    fn tagged_tables_with_a_missing_entry_are_codegen_errors() {
+        let ctx = Context::create();
+        let defs = vec![hir::TaggedType::Option(Scalar::Tagged(7))];
+        let err = build_tagged_types(&ctx, &defs, &[], &[])
+            .expect_err("a payload naming an absent entry must fail closed");
+        assert!(
+            err.to_string().contains("missing an entry or is recursive"),
+            "unexpected diagnostic for a missing tagged entry: {err}"
+        );
+        // A well-formed neighbour still lowers, so the guard rejects the table, not the shape.
+        let (shells, by_body) =
+            build_tagged_types(&ctx, &[hir::TaggedType::Option(Scalar::Bool)], &[], &[])
+                .expect("a complete table must lower");
+        assert_eq!(shells.len(), 1);
+        assert_eq!(by_body.len(), 1);
+    }
+
+    /// A self-referential entry has no finite body. It must be refused rather than send the
+    /// children-first walk around its own cycle.
+    #[test]
+    fn self_referential_tagged_entries_are_codegen_errors() {
+        let ctx = Context::create();
+        for defs in [
+            vec![hir::TaggedType::Option(Scalar::Tagged(0))],
+            vec![hir::TaggedType::Result(Scalar::Bool, Scalar::Tagged(0))],
+            // Mutual recursion reaches the same guard one level deeper.
+            vec![
+                hir::TaggedType::Option(Scalar::Tagged(1)),
+                hir::TaggedType::Option(Scalar::Tagged(0)),
+            ],
+        ] {
+            let err = build_tagged_types(&ctx, &defs, &[], &[])
+                .expect_err("a recursive tagged entry must fail closed");
+            assert!(
+                err.to_string().contains("missing an entry or is recursive"),
+                "unexpected diagnostic for a recursive tagged entry: {err}"
+            );
+        }
+    }
+
+    /// Entries that lower to one body share one identified struct, and the struct is named for the
+    /// lowest id in that class — never for whichever entry the children-first walk reached first.
+    #[test]
+    fn shared_tagged_bodies_are_named_for_their_lowest_id() {
+        let ctx = Context::create();
+        // Entry 0 is reached only through its child 2, so a traversal-ordered name would be
+        // `align.tagged.2`; entry 1 shares that body and is the lowest id in the class.
+        let defs = vec![
+            hir::TaggedType::Option(Scalar::Tagged(2)),
+            hir::TaggedType::Option(Scalar::Str),
+            hir::TaggedType::Option(Scalar::String),
+        ];
+        let (shells, by_body) =
+            build_tagged_types(&ctx, &defs, &[], &[]).expect("a complete table must lower");
+        assert_eq!(
+            shells[1], shells[2],
+            "`Option<str>` and `Option<string>` are one LLVM body and must share one struct"
+        );
+        assert_ne!(shells[0], shells[1], "a distinct body keeps its own struct");
+        assert_eq!(
+            shells[1]
+                .get_name()
+                .map(|name| name.to_string_lossy().to_string()),
+            Some("align.tagged.1".to_string()),
+            "the shared struct must be named for the lowest id in its body class"
+        );
+        assert_eq!(by_body.len(), 2, "two distinct bodies must index two structs");
+    }
+
     #[test]
     fn malformed_mir_type_graphs_fail_before_llvm_construction() {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
@@ -19296,6 +19601,10 @@ mod tests {
         });
         validate_tagged_program(&deep_tagged)
             .expect("a deep source-ABI tagged key must not consume the process stack");
+        // `build_tagged_types` claims to be stack-bounded at this depth too, and only building the
+        // module proves it: a recursive body walk would overflow here long before the verifier ran.
+        emit_llvm_ir(&deep_tagged, &BuildTarget::Baseline, false, &[], None)
+            .expect("a deep tagged table must lower without the process stack");
 
         deep.structs[DEEP_GRAPH_LEN - 1].fields[0].ty = Ty::Struct(0);
         let err = validate_tagged_program(&deep)
@@ -20654,6 +20963,8 @@ mod tests {
         // Build the LLVM struct types exactly as `codegen` does (opaque, then body via the shared
         // `set_struct_body` — the same size-padding path production uses). Enum types are built first
         // (as literal `{ i32, payloads }` structs) so a struct field of enum type resolves.
+        let no_tagged_bodies = HashMap::new();
+        let no_tagged = TaggedTypes { shells: &[], by_body: &no_tagged_bodies };
         let struct_types: Vec<StructType> = structs.iter().map(|s| ctx.opaque_struct_type(&s.name)).collect();
         let enum_types: Vec<StructType> = enums
             .iter()
@@ -20661,49 +20972,18 @@ mod tests {
                 let mut fields: Vec<BasicTypeEnum> = vec![ctx.i32_type().into()];
                 for v in &e.variants {
                     for &s in &v.payload {
-                        fields.push(scalar_type(&ctx, scalar_to_ty(s), &struct_types, &[], &[]));
+                        fields.push(scalar_type(&ctx, scalar_to_ty(s), &struct_types, &[], no_tagged));
                     }
                 }
                 ctx.struct_type(&fields, false)
             })
             .collect();
-        let tagged_types: Vec<StructType> = tagged_defs
-            .iter()
-            .enumerate()
-            .map(|(id, _)| ctx.opaque_struct_type(&format!("test.tagged.{id}")))
-            .collect();
-        for (tagged, tagged_type) in tagged_defs.iter().zip(&tagged_types) {
-            let fields = match *tagged {
-                align_sema::hir::TaggedType::Option(payload) => vec![
-                    ctx.i8_type().into(),
-                    scalar_type(
-                        &ctx,
-                        scalar_to_ty(payload),
-                        &struct_types,
-                        &enum_types,
-                        &tagged_types,
-                    ),
-                ],
-                align_sema::hir::TaggedType::Result(ok, err) => vec![
-                    ctx.i8_type().into(),
-                    scalar_type(
-                        &ctx,
-                        scalar_to_ty(ok),
-                        &struct_types,
-                        &enum_types,
-                        &tagged_types,
-                    ),
-                    scalar_type(
-                        &ctx,
-                        scalar_to_ty(err),
-                        &struct_types,
-                        &enum_types,
-                        &tagged_types,
-                    ),
-                ],
-            };
-            tagged_type.set_body(&fields, false);
-        }
+        // The nested tagged types come from the production builder itself, so this parity gate
+        // cannot drift from the shells and bodies `build_module` actually emits.
+        let (tagged_shells, tagged_bodies) =
+            build_tagged_types(&ctx, &tagged_defs, &struct_types, &enum_types)
+                .expect("tagged type tables");
+        let tagged_types = TaggedTypes { shells: &tagged_shells, by_body: &tagged_bodies };
         let mut layouts = align_sema::TypeLayoutCache::new(&structs, &enums, &tagged_defs);
         for (s, st) in structs.iter().zip(&struct_types) {
             let perm = logical_to_physical(s, &mut layouts);
@@ -20714,7 +20994,7 @@ mod tests {
                 &perm,
                 &struct_types,
                 &enum_types,
-                &tagged_types,
+                tagged_types,
                 &td,
             );
         }
@@ -20772,6 +21052,8 @@ mod tests {
                     .map(|structure| ctx.opaque_struct_type(&structure.name))
                     .collect::<Vec<_>>();
                 let mut layouts = align_sema::TypeLayoutCache::new(&structs, &[], &[]);
+                let no_tagged_bodies = HashMap::new();
+                let no_tagged = TaggedTypes { shells: &[], by_body: &no_tagged_bodies };
                 for (structure, llvm_ty) in structs.iter().zip(&struct_types) {
                     let permutation = logical_to_physical(structure, &mut layouts);
                     set_struct_body(
@@ -20781,7 +21063,7 @@ mod tests {
                         &permutation,
                         &struct_types,
                         &[],
-                        &[],
+                        no_tagged,
                         &target_data,
                     );
                 }
