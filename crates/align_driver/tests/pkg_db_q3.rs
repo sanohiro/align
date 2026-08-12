@@ -1,6 +1,7 @@
 //! pkg.db Q3/D3+D5 checked/offline metadata owners.
 
 mod common;
+mod db_harness;
 use align_driver::db_prepare::{
     build_metadata_batch, encode_migration_catalog, postgres_schema_fingerprint,
     publish_metadata_batch, read_migration_catalog, sqlite_database_schema_fingerprint,
@@ -1117,13 +1118,7 @@ pub fn query() -> pkg.db.query<Params, Row> = pkg.db.sqlite.query_file(
 
 #[test]
 fn postgres_native_prepare_describes_the_selected_query() {
-    let required = std::env::var_os("ALIGN_DB_POSTGRES_REQUIRED").is_some();
-    let Some(url) = std::env::var("ALIGN_DB_POSTGRES_URL").ok() else {
-        assert!(
-            !required,
-            "ALIGN_DB_POSTGRES_URL is required by this test environment"
-        );
-        eprintln!("skipping PostgreSQL Q3 owner: ALIGN_DB_POSTGRES_URL is not set");
+    let Some(url) = db_harness::live_postgres_url("PostgreSQL Q3 owner") else {
         return;
     };
     let project = project("pkg-db-q3-postgres-native");

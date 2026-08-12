@@ -533,27 +533,47 @@ Recorded so the gap is explicit rather than implied:
   that the case after it still runs and still reports. The hang body is a serial
   LCG keyed on a run-time string length: a plain accumulator loop was recognised
   and folded by `-O2`, and the case returned instantly.
-- **Live-PostgreSQL identity and cleanup** (unique per-run object names, drop
-  what a case created, assert no survivors). Carried over to the `pkg_db_a1`
-  migration: `q2`'s two live owners keep their existing gating and create no
-  server-side objects, so there is nothing yet for the rule to protect.
-- **`pkg_db_q2` keeps two hand-written copies of the `live_postgres_decision`
-  logic** (`postgres_required_mode_requires_configuration` and the guard inside
-  `postgres_required_portable_query_runs_against_both_drivers`). Routing them
-  through the harness helper would change what a required CI suite asserts about
-  its own gating, so it waits for the a1 wave that also brings the identity and
-  cleanup rules above.
+- ~~q2's hand-written live-gating copies~~ — **closed**. The rule had **five**
+  spellings across the corpus, and they did not agree: `q2` tested
+  `ALIGN_DB_POSTGRES_REQUIRED == "1"` while `q3`, `q5a`, and `q5b2` tested merely
+  that the variable was *present*, so `ALIGN_DB_POSTGRES_REQUIRED=0` meant "not
+  required" in one suite and "required" in three others. All five now call
+  `db_harness::live_postgres_url`, which is the single place the two variable
+  names and the meaning of "required" are spelled.
+- ~~`pkg_db_a1` unmigrated~~ — **closed**. Every E2E suite is now on the harness.
+- ~~`pkg_db_q5b2`'s derived layout builders~~ — **closed**. There were seven by
+  the time this ran, not the five recorded earlier (the PostgreSQL lease and
+  status waves each added one), plus four inline `retain`+`push` sites. All are
+  `Layout` chaining now, and the suite no longer restates the package module
+  list — which had already drifted once when the ninth package module landed.
+- **Live-PostgreSQL identity and cleanup**: resolved by isolation rather than by
+  naming, with a residual recorded here rather than closed silently.
+
+  `pkg_db_q5a` creates fixed-name objects on the live server (`align_q5a_probe`,
+  its index, `align_q5a_history_ref`, a function and a trigger) and drops none of
+  them. Prefixing those names per run would not make concurrent runs safe,
+  because the same suite also reads and writes `align_internal.migrations_v1` —
+  the **product's own** history table, whose name is fixed by the migration
+  contract and cannot be uniquified by a test. Only a per-run database or schema
+  makes concurrency safe, and that is exactly what both consumers already
+  provide: `scripts/db-verify-local.sh` starts a disposable container per
+  invocation and tears it down in a trap, and CI's `db-postgres` job supplies an
+  ephemeral service per run.
+
+  The residual risk is therefore narrow and specific: two concurrent runs pointed
+  at one *shared, long-lived* server would collide, and a run against such a
+  server leaves objects behind. `db_harness::live_run_id` exists for a case that
+  needs a collision-free name, but it is deliberately not retrofitted onto q5a,
+  because doing so would change the SQL a required suite executes while still
+  leaving the fixed history table shared — motion without the safety.
 - **`#[ignore]`d measurement probes** in `pkg_db_q4a`, `q4b`, and `q6` carry no
   fingerprint: they parse stdout numbers rather than asserting an exit code, so
-  they are not `Case`-shaped. Checked by hand during review.
-- **`pkg_db_q5b2`'s five derived layout builders** — plus three further inline
-  `retain`+`push` sites in test bodies — still use that idiom. Its inline C stub
-  was extracted in PR-2; the builder rewrite waits because `q5b2` is in the A1
-  catalog/EXPLAIN blast radius.
-- **`pkg_db_a1`** is unmigrated, after the A1 waves. `pkg_db_q1` and `q3` are
-  Rust-API suites and out of the harness's scope; their `include_str!` statics
-  feed `Proj`-based API assertions, not a `Layout`. Every other suite now reads
-  its package sources at run time.
+  they are not `Case`-shaped. They never run in CI, so a golden over them would
+  guard code that no gate executes. Checked by hand during review.
+- **`pkg_db_q1` and `q3`** remain Rust-API suites outside the harness's scope;
+  their `include_str!` statics feed `Proj`-based API assertions, not a `Layout`.
+  `q3` uses the shared live-gating helper above, which is the only harness
+  surface that applies to it.
 
 ### Build-once/run-many is not applied to q2, deliberately
 

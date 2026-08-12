@@ -2,23 +2,9 @@
 
 mod common;
 use common::*;
-use std::sync::LazyLock;
+mod db_harness;
+use db_harness::*;
 
-static DB: LazyLock<&str> = LazyLock::new(|| fixture("apps/db/pkg/db.align"));
-static SQLITE: LazyLock<&str> = LazyLock::new(|| fixture("apps/db/pkg/db/sqlite.align"));
-static POSTGRES: LazyLock<&str> = LazyLock::new(|| fixture("apps/db/pkg/db/postgres.align"));
-static INTERNAL: LazyLock<&str> = LazyLock::new(|| fixture("apps/db/pkg/db/internal.align"));
-static RESOURCE: LazyLock<&str> =
-    LazyLock::new(|| fixture("apps/db/pkg/db/internal/resource.align"));
-static DESCRIPTOR: LazyLock<&str> =
-    LazyLock::new(|| fixture("apps/db/pkg/db/internal/descriptor.align"));
-static INTERNAL_SQLITE: LazyLock<&str> =
-    LazyLock::new(|| fixture("apps/db/pkg/db/internal/sqlite.align"));
-static INTERNAL_POSTGRES: LazyLock<&str> =
-    LazyLock::new(|| fixture("apps/db/pkg/db/internal/postgres.align"));
-static POSTGRES_STATUS: LazyLock<&str> =
-    LazyLock::new(|| fixture("apps/db/pkg/db/internal/postgres_status.align"));
-const POSTGRES_STUB: &str = include_str!("fixtures/pkg_db_q2_postgres_stub.c");
 
 const TEST_HELPER: &str = r#"module pkg.db.a1_test
 import pkg.db
@@ -242,82 +228,14 @@ pub fn postgres_full() -> pkg.db.query<FullParams, FullRow> = pkg.db.postgres.qu
 )
 "#;
 
-fn package_files(main: &str) -> Vec<(&'static str, &str)> {
-    vec![
-        ("pkg/db.align", *DB),
-        ("pkg/db/sqlite.align", *SQLITE),
-        ("pkg/db/postgres.align", *POSTGRES),
-        ("pkg/db/internal.align", *INTERNAL),
-        ("pkg/db/internal/resource.align", *RESOURCE),
-        ("pkg/db/internal/descriptor.align", *DESCRIPTOR),
-        ("pkg/db/internal/sqlite.align", *INTERNAL_SQLITE),
-        ("pkg/db/internal/postgres.align", *INTERNAL_POSTGRES),
-        ("pkg/db/internal/postgres_status.align", *POSTGRES_STATUS),
-        ("pkg/db/a1_test.align", TEST_HELPER),
-        ("app/batch_query.align", QUERY),
-        ("main.align", main),
-    ]
-}
 
-#[test]
-fn common_batch_surface_typechecks_whole_and_per_unit() {
-    let main = r#"module main
-import pkg.db
-import pkg.db.sqlite
-import app.batch_query
-
-fn consume(borrow mut stream: pkg.db.rows<app.batch_query.PlainRow>) -> Result<i64, pkg.db.Error> {
-  values := pkg.db.next_batch(stream, 32)?
-  batch := values else { return Ok(0) }
-  rows := pkg.db.batch_soa(batch)?
-  first := pkg.db.batch_row(batch, 0)?
-  return Ok(rows.id.sum() + match first { Some(row) => row.id, None => 0 })
-}
-
-fn main() -> i32 = 0
-"#;
-    let checked = diff_check_multi(
-        "pkg-db-a1-common-batch-surface",
-        &package_files(main),
-        "main.align",
-    );
-    assert!(
-        !checked.whole_errors && !checked.per_unit_errors,
-        "whole diagnostics:\n{}\nper-unit diagnostics:\n{}",
-        checked.whole_diags,
-        checked.per_unit_diags,
-    );
-}
-
-#[test]
-fn nested_abstract_batch_row_application_is_rejected() {
-    let main = r#"module main
-import pkg.db
-
-Wrap<T> { value: T }
-
-fn keep<T>(value: Option<pkg.db.batch<Wrap<T>>>) -> Option<pkg.db.batch<Wrap<T>>> = value
-fn main() -> i32 = 0
-"#;
-    let checked = diff_check_multi(
-        "pkg-db-a1-nested-abstract-batch-row",
-        &package_files(main),
-        "main.align",
-    );
-    assert!(
-        checked.whole_errors && checked.per_unit_errors,
-        "nested abstract batch Row unexpectedly accepted:\nwhole diagnostics:\n{}\nper-unit diagnostics:\n{}",
-        checked.whole_diags,
-        checked.per_unit_diags,
-    );
-}
-
-#[test]
-fn zero_column_query_keeps_a_valid_non_soa_batch_plan() {
-    if !backend_available() {
-        return;
-    }
-    let main = r#"module main
+// ================================================================================================
+// Layer-1 migrated cases.
+//
+// Native call counts moved out of the Align epilogues into `expect_counters`, so a mismatch names
+// the counter instead of returning a hand-numbered sentinel.
+// ================================================================================================
+const ZERO_COLUMN_PLAN_MAIN: &str = r#"module main
 import pkg.db.a1_test
 import pkg.db
 import app.batch_query
@@ -332,95 +250,8 @@ fn main() -> i32 {
   return 42
 }
 "#;
-    let output = build_and_run_multi_with_static_descriptors(
-        "pkg-db-a1-zero-column-plan",
-        &package_files(main),
-        "main.align",
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "status: {:?}; stdout: {}; stderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-}
 
-#[test]
-fn batch_rows_and_soa_views_cannot_escape_or_survive_move() {
-    let cases = [
-        (
-            "return-row-view",
-            r#"fn bad(borrow connection: pkg.db.conn) -> str {
-  mut stream := pkg.db.rows(
-    pkg.db.exec_conn(connection), app.batch_query.plain(),
-    app.batch_query.Params { base: 1 }, [],
-  ) else { return "" }
-  values := pkg.db.next_batch(stream, 2) else { return "" }
-  batch := values else { return "" }
-  selected := pkg.db.batch_row(batch, 0) else { return "" }
-  row := selected else { return "" }
-  return row.label
-}"#,
-        ),
-        (
-            "post-move-row-view",
-            r#"fn consume(values: pkg.db.batch<app.batch_query.PlainRow>) -> i32 = 0
-
-fn bad(borrow connection: pkg.db.conn) -> i32 {
-  mut stream := pkg.db.rows(
-    pkg.db.exec_conn(connection), app.batch_query.plain(),
-    app.batch_query.Params { base: 1 }, [],
-  ) else { return 0 }
-  values := pkg.db.next_batch(stream, 2) else { return 0 }
-  batch := values else { return 0 }
-  selected := pkg.db.batch_row(batch, 0) else { return 0 }
-  row := selected else { return 0 }
-  ignored := consume(batch)
-  return row.label.len() as i32
-}"#,
-        ),
-        (
-            "return-soa-column-view",
-            r#"fn bad(borrow connection: pkg.db.conn) -> str {
-  mut stream := pkg.db.rows(
-    pkg.db.exec_conn(connection), app.batch_query.plain(),
-    app.batch_query.Params { base: 1 }, [],
-  ) else { return "" }
-  values := pkg.db.next_batch(stream, 2) else { return "" }
-  batch := values else { return "" }
-  columns := pkg.db.batch_soa(batch) else { return "" }
-  return columns.label[0]
-}"#,
-        ),
-    ];
-    for (name, body) in cases {
-        let main = format!(
-            "module main\nimport pkg.db\nimport app.batch_query\n{body}\nfn main() -> i32 = 0\n"
-        );
-        let checked = diff_check_multi(
-            &format!("pkg-db-a1-batch-view-{name}"),
-            &package_files(&main),
-            "main.align",
-        );
-        assert!(
-            checked.whole_errors && checked.per_unit_errors,
-            "{name} unexpectedly accepted (whole_errors={}, per_unit_errors={}):\nwhole diagnostics:\n{}\nper-unit diagnostics:\n{}",
-            checked.whole_errors,
-            checked.per_unit_errors,
-            checked.whole_diags,
-            checked.per_unit_diags,
-        );
-    }
-}
-
-#[test]
-fn sqlite_batches_copy_rows_grow_views_and_project_soa() {
-    if !backend_available() {
-        return;
-    }
-    let main = r#"module main
+const SQLITE_BATCHES_MAIN: &str = r#"module main
 import pkg.db
 import pkg.db.a1_test
 import pkg.db.sqlite
@@ -529,42 +360,16 @@ fn main() -> i32 {
   return 42
 }
 "#;
-    let output = build_and_run_multi_with_static_descriptors(
-        "pkg-db-a1-sqlite-batches",
-        &package_files(main),
-        "main.align",
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "status: {:?}; stdout: {}; stderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-}
 
-#[test]
-fn postgres_buffered_batches_split_without_resend_and_own_copied_rows() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
-    let main = r#"module main
+const POSTGRES_BUFFERED_BATCHES_MAIN: &str = r#"module main
 import pkg.db
 import pkg.db.postgres
 import app.batch_query
+import pkg.db.testkit.pg
 
-extern "C" {
-  fn align_pg_reset()
-  fn align_pg_execute_calls() -> i32
-  fn align_pg_clear_calls() -> i32
-  fn align_pg_q6_delivered_rows() -> i32
-  fn align_pg_protocol_ok() -> i32
-  fn align_pg_protocol_error() -> i32
-}
 
 fn main() -> i32 {
-  unsafe { align_pg_reset() }
+  pkg.db.testkit.pg.reset()
   connection := pkg.db.postgres.connect("postgresql://stub/a1", []) else { return 1 }
   rows_result := pkg.db.rows(
     pkg.db.exec_conn(connection),
@@ -604,48 +409,17 @@ fn main() -> i32 {
   retained_result := pkg.db.batch_row(first, 0) else { return 24 }
   retained := retained_result else { return 25 }
   if retained.user_name != "Alice" { return 26 }
-  return unsafe {
-    if align_pg_protocol_ok() != 1 { return 30 + align_pg_protocol_error() }
-    if align_pg_execute_calls() != 1 { return 27 }
-    if align_pg_clear_calls() != 1 { return 28 }
-    if align_pg_q6_delivered_rows() != 4 { return 29 }
-    42
-  }
+  pkg.db.testkit.pg.dump()
+  return 42
 }
 "#;
-    let output = build_and_run_multi_with_c(
-        "pkg-db-a1-postgres-buffered-batches",
-        &package_files(main),
-        "main.align",
-        POSTGRES_STUB,
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "status: {:?}; stdout: {}; stderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-}
 
-#[test]
-fn postgres_batch_all_value_kinds_and_null_bitmaps_are_exact() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
-    let main = r#"module main
+const POSTGRES_VALUE_MATRIX_MAIN: &str = r#"module main
 import pkg.db
 import pkg.db.postgres
 import app.batch_query
+import pkg.db.testkit.pg
 
-extern "C" {
-  fn align_pg_reset()
-  fn align_pg_execute_calls() -> i32
-  fn align_pg_clear_calls() -> i32
-  fn align_pg_protocol_ok() -> i32
-  fn align_pg_protocol_error() -> i32
-}
 
 fn execute_once(borrow connection: pkg.db.conn, present: bool) -> i32 {
   bytes := [0 as u8, 127 as u8, 255 as u8]
@@ -709,55 +483,26 @@ fn execute_once(borrow connection: pkg.db.conn, present: bool) -> i32 {
 }
 
 fn main() -> i32 {
-  unsafe { align_pg_reset() }
+  pkg.db.testkit.pg.reset()
   connection := pkg.db.postgres.connect("postgresql://stub/a1-matrix", []) else { return 30 }
   first := execute_once(connection, true)
   if first != 0 { return first }
   second := execute_once(connection, false)
   if second != 0 { return second }
-  return unsafe {
-    if align_pg_protocol_ok() != 1 { return 40 + align_pg_protocol_error() }
-    if align_pg_execute_calls() != 2 { return 31 }
-    if align_pg_clear_calls() != 2 { return 32 }
-    42
-  }
+  pkg.db.testkit.pg.dump()
+  return 42
 }
 "#;
-    let output = build_and_run_multi_with_c(
-        "pkg-db-a1-postgres-value-matrix",
-        &package_files(main),
-        "main.align",
-        POSTGRES_STUB,
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "status: {:?}; stdout: {}; stderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-}
 
-#[test]
-fn postgres_batch_decode_failure_drops_partial_payload_and_closes_once() {
-    if !backend_available() || !cc_available() {
-        return;
-    }
-    let main = r#"module main
+const POSTGRES_BATCH_DECODE_FAILURE_MAIN: &str = r#"module main
 import pkg.db
 import pkg.db.postgres
 import app.batch_query
+import pkg.db.testkit.pg
 
-extern "C" {
-  fn align_pg_reset()
-  fn align_pg_execute_calls() -> i32
-  fn align_pg_clear_calls() -> i32
-  fn align_pg_protocol_ok() -> i32
-}
 
 fn main() -> i32 {
-  unsafe { align_pg_reset() }
+  pkg.db.testkit.pg.reset()
   connection := pkg.db.postgres.connect("postgresql://stub/a1-error", []) else { return 1 }
   bytes := [1 as u8, 2 as u8, 3 as u8]
   rows_result := pkg.db.rows(
@@ -782,26 +527,277 @@ fn main() -> i32 {
     Ok(_) => false
   }
   if !repeated_ok { return 4 }
-  return unsafe {
-    if align_pg_protocol_ok() != 1 { return 5 }
-    if align_pg_execute_calls() != 1 { return 6 }
-    if align_pg_clear_calls() != 1 { return 7 }
-    42
-  }
+  pkg.db.testkit.pg.dump()
+  return 42
 }
 "#;
-    let output = build_and_run_multi_with_c(
-        "pkg-db-a1-postgres-batch-decode-failure",
-        &package_files(main),
+
+const CASE_ZERO_COLUMN_PLAN: Case = Case {
+    label: "pkg-db-a1-zero-column-plan",
+    runner: RunnerKind::StaticDescriptors,
+    needs: Needs::Backend,
+    links: &[],
+    counters: &[],
+    modules: a1_modules,
+    main: ZERO_COLUMN_PLAN_MAIN,
+    envs: &[],
+    expected_exit: 42,
+    expect_counters: &[],
+};
+
+const CASE_SQLITE_BATCHES: Case = Case {
+    label: "pkg-db-a1-sqlite-batches",
+    runner: RunnerKind::StaticDescriptors,
+    needs: Needs::Backend,
+    links: &[],
+    counters: &[],
+    modules: a1_modules,
+    main: SQLITE_BATCHES_MAIN,
+    envs: &[],
+    expected_exit: 42,
+    expect_counters: &[],
+};
+
+const CASE_POSTGRES_BUFFERED_BATCHES: Case = Case {
+    label: "pkg-db-a1-postgres-buffered-batches",
+    runner: RunnerKind::PerUnitC,
+    needs: Needs::BackendAndCc,
+    links: &[&PG],
+    counters: &[&PG],
+    modules: a1_modules,
+    main: POSTGRES_BUFFERED_BATCHES_MAIN,
+    envs: &[],
+    expected_exit: 42,
+    expect_counters: &[
+        ("pg.protocol_ok", 1),
+        ("pg.execute_calls", 1),
+        ("pg.clear_calls", 1),
+        ("pg.delivered_rows", 4),
+    ],
+};
+
+const CASE_POSTGRES_VALUE_MATRIX: Case = Case {
+    label: "pkg-db-a1-postgres-value-matrix",
+    runner: RunnerKind::PerUnitC,
+    needs: Needs::BackendAndCc,
+    links: &[&PG],
+    counters: &[&PG],
+    modules: a1_modules,
+    main: POSTGRES_VALUE_MATRIX_MAIN,
+    envs: &[],
+    expected_exit: 42,
+    expect_counters: &[
+        ("pg.protocol_ok", 1),
+        ("pg.execute_calls", 2),
+        ("pg.clear_calls", 2),
+    ],
+};
+
+const CASE_POSTGRES_BATCH_DECODE_FAILURE: Case = Case {
+    label: "pkg-db-a1-postgres-batch-decode-failure",
+    runner: RunnerKind::PerUnitC,
+    needs: Needs::BackendAndCc,
+    links: &[&PG],
+    counters: &[&PG],
+    modules: a1_modules,
+    main: POSTGRES_BATCH_DECODE_FAILURE_MAIN,
+    envs: &[],
+    expected_exit: 42,
+    expect_counters: &[
+        ("pg.protocol_ok", 1),
+        ("pg.execute_calls", 1),
+        ("pg.clear_calls", 1),
+    ],
+};
+
+/// Every Layer-1 case in this suite, for the fingerprint golden.
+const LAYER1_CASES: &[&Case] = &[
+    &CASE_ZERO_COLUMN_PLAN,
+    &CASE_SQLITE_BATCHES,
+    &CASE_POSTGRES_BUFFERED_BATCHES,
+    &CASE_POSTGRES_VALUE_MATRIX,
+    &CASE_POSTGRES_BATCH_DECODE_FAILURE,
+];
+
+/// The suite modules every a1 case adds on top of the `pkg.db` package.
+fn a1_modules() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("pkg/db/a1_test.align", TEST_HELPER),
+        ("app/batch_query.align", QUERY),
+    ]
+}
+
+/// The layout the non-`Case` owners use, derived from the same module list the cases use.
+fn package_files(main: &str) -> Layout {
+    let mut layout = Layout::new();
+    for (path, source) in a1_modules() {
+        layout = layout.module(path, source);
+    }
+    layout.main(main)
+}
+
+#[test]
+fn common_batch_surface_typechecks_whole_and_per_unit() {
+    let main = r#"module main
+import pkg.db
+import pkg.db.sqlite
+import app.batch_query
+
+fn consume(borrow mut stream: pkg.db.rows<app.batch_query.PlainRow>) -> Result<i64, pkg.db.Error> {
+  values := pkg.db.next_batch(stream, 32)?
+  batch := values else { return Ok(0) }
+  rows := pkg.db.batch_soa(batch)?
+  first := pkg.db.batch_row(batch, 0)?
+  return Ok(rows.id.sum() + match first { Some(row) => row.id, None => 0 })
+}
+
+fn main() -> i32 = 0
+"#;
+    let checked = diff_check_multi(
+        "pkg-db-a1-common-batch-surface",
+        &package_files(main).files(),
         "main.align",
-        POSTGRES_STUB,
     );
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "status: {:?}; stdout: {}; stderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
+    assert!(
+        !checked.whole_errors && !checked.per_unit_errors,
+        "whole diagnostics:\n{}\nper-unit diagnostics:\n{}",
+        checked.whole_diags,
+        checked.per_unit_diags,
     );
+}
+
+#[test]
+fn nested_abstract_batch_row_application_is_rejected() {
+    let main = r#"module main
+import pkg.db
+
+Wrap<T> { value: T }
+
+fn keep<T>(value: Option<pkg.db.batch<Wrap<T>>>) -> Option<pkg.db.batch<Wrap<T>>> = value
+fn main() -> i32 = 0
+"#;
+    let checked = diff_check_multi(
+        "pkg-db-a1-nested-abstract-batch-row",
+        &package_files(main).files(),
+        "main.align",
+    );
+    assert!(
+        checked.whole_errors && checked.per_unit_errors,
+        "nested abstract batch Row unexpectedly accepted:\nwhole diagnostics:\n{}\nper-unit diagnostics:\n{}",
+        checked.whole_diags,
+        checked.per_unit_diags,
+    );
+}
+
+#[test]
+fn zero_column_query_keeps_a_valid_non_soa_batch_plan() {
+    CASE_ZERO_COLUMN_PLAN.run();
+}
+
+#[test]
+fn batch_rows_and_soa_views_cannot_escape_or_survive_move() {
+    let cases = [
+        (
+            "return-row-view",
+            r#"fn bad(borrow connection: pkg.db.conn) -> str {
+  mut stream := pkg.db.rows(
+    pkg.db.exec_conn(connection), app.batch_query.plain(),
+    app.batch_query.Params { base: 1 }, [],
+  ) else { return "" }
+  values := pkg.db.next_batch(stream, 2) else { return "" }
+  batch := values else { return "" }
+  selected := pkg.db.batch_row(batch, 0) else { return "" }
+  row := selected else { return "" }
+  return row.label
+}"#,
+        ),
+        (
+            "post-move-row-view",
+            r#"fn consume(values: pkg.db.batch<app.batch_query.PlainRow>) -> i32 = 0
+
+fn bad(borrow connection: pkg.db.conn) -> i32 {
+  mut stream := pkg.db.rows(
+    pkg.db.exec_conn(connection), app.batch_query.plain(),
+    app.batch_query.Params { base: 1 }, [],
+  ) else { return 0 }
+  values := pkg.db.next_batch(stream, 2) else { return 0 }
+  batch := values else { return 0 }
+  selected := pkg.db.batch_row(batch, 0) else { return 0 }
+  row := selected else { return 0 }
+  ignored := consume(batch)
+  return row.label.len() as i32
+}"#,
+        ),
+        (
+            "return-soa-column-view",
+            r#"fn bad(borrow connection: pkg.db.conn) -> str {
+  mut stream := pkg.db.rows(
+    pkg.db.exec_conn(connection), app.batch_query.plain(),
+    app.batch_query.Params { base: 1 }, [],
+  ) else { return "" }
+  values := pkg.db.next_batch(stream, 2) else { return "" }
+  batch := values else { return "" }
+  columns := pkg.db.batch_soa(batch) else { return "" }
+  return columns.label[0]
+}"#,
+        ),
+    ];
+    for (name, body) in cases {
+        let main = format!(
+            "module main\nimport pkg.db\nimport app.batch_query\n{body}\nfn main() -> i32 = 0\n"
+        );
+        let checked = diff_check_multi(
+            &format!("pkg-db-a1-batch-view-{name}"),
+            &package_files(&main).files(),
+            "main.align",
+        );
+        assert!(
+            checked.whole_errors && checked.per_unit_errors,
+            "{name} unexpectedly accepted (whole_errors={}, per_unit_errors={}):\nwhole diagnostics:\n{}\nper-unit diagnostics:\n{}",
+            checked.whole_errors,
+            checked.per_unit_errors,
+            checked.whole_diags,
+            checked.per_unit_diags,
+        );
+    }
+}
+
+#[test]
+fn sqlite_batches_copy_rows_grow_views_and_project_soa() {
+    CASE_SQLITE_BATCHES.run();
+}
+
+#[test]
+fn postgres_buffered_batches_split_without_resend_and_own_copied_rows() {
+    CASE_POSTGRES_BUFFERED_BATCHES.run();
+}
+
+#[test]
+fn postgres_batch_all_value_kinds_and_null_bitmaps_are_exact() {
+    CASE_POSTGRES_VALUE_MATRIX.run();
+}
+
+#[test]
+fn postgres_batch_decode_failure_drops_partial_payload_and_closes_once() {
+    CASE_POSTGRES_BATCH_DECODE_FAILURE.run();
+}
+
+/// The Layer-1 migration's forward guard for this suite.
+///
+/// Regenerate ONLY with a reviewed reason, from the panic message this emits.
+const LAYER1_FINGERPRINT_GOLDEN: &str = "\
+pkg-db-a1-postgres-batch-decode-failure 7315a4a55b3e7992
+pkg-db-a1-postgres-buffered-batches 70713f7ffde32447
+pkg-db-a1-postgres-value-matrix 4f399250041e33c9
+pkg-db-a1-sqlite-batches 53dc27c12c4b9010
+pkg-db-a1-zero-column-plan 7b52bcb1abf9a791
+";
+
+#[test]
+fn layer1_case_fingerprints_match_the_golden() {
+    let mut log = FingerprintLog::new();
+    for case in LAYER1_CASES {
+        log.record(&case.fingerprint());
+    }
+    log.assert_matches(LAYER1_FINGERPRINT_GOLDEN);
 }

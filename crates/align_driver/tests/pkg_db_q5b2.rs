@@ -3,7 +3,7 @@
 mod common;
 use common::*;
 mod db_harness;
-use db_harness::package_source;
+use db_harness::{Layout, package_source};
 
 
 const SQLITE_SHAPE_STUB: &str = include_str!("fixtures/pkg_db_q5b2_sqlite_stub.c");
@@ -1433,83 +1433,58 @@ fn main() -> i32 {
 }
 "#;
 
-fn package_files() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("pkg/db.align", package_source("pkg/db.align")),
-        ("pkg/db/sqlite.align", package_source("pkg/db/sqlite.align")),
-        ("pkg/db/postgres.align", package_source("pkg/db/postgres.align")),
-        ("pkg/db/internal.align", package_source("pkg/db/internal.align")),
-        ("pkg/db/internal/resource.align", package_source("pkg/db/internal/resource.align")),
-        ("pkg/db/internal/descriptor.align", package_source("pkg/db/internal/descriptor.align")),
-        ("pkg/db/internal/sqlite.align", package_source("pkg/db/internal/sqlite.align")),
-        ("pkg/db/internal/postgres.align", package_source("pkg/db/internal/postgres.align")),
-        (
-            "pkg/db/internal/postgres_status.align",
-            package_source("pkg/db/internal/postgres_status.align"),
-        ),
-        ("pkg/db/q5b2_setup.align", SETUP),
-        ("main.align", MAIN),
-    ]
+/// The base layout: the `pkg.db` package plus this suite's setup module and its default `main`.
+///
+/// `Layout::new()` owns the package module list, so a package module added upstream reaches every
+/// builder below without being retyped — the hand-written copy this replaced had to be edited in
+/// lockstep with the package and had already drifted once.
+fn package_files() -> Layout {
+    Layout::new()
+        .module("pkg/db/q5b2_setup.align", SETUP)
+        .main(MAIN)
 }
 
-fn explain_package_files() -> Vec<(&'static str, &'static str)> {
-    let mut files = package_files();
-    files.retain(|(path, _)| *path != "main.align");
-    files.push(("app/lookup.align", LOOKUP));
-    files.push(("app/bad_lookup.align", BAD_LOOKUP));
-    files.push(("main.align", EXPLAIN_MAIN));
-    files
+fn explain_package_files() -> Layout {
+    package_files()
+        .module("app/lookup.align", LOOKUP)
+        .module("app/bad_lookup.align", BAD_LOOKUP)
+        .main(EXPLAIN_MAIN)
 }
 
-fn sqlite_native_package_files() -> Vec<(&'static str, &'static str)> {
-    let mut files = package_files();
-    files.retain(|(path, _)| *path != "main.align");
-    files.push(("main.align", SQLITE_NATIVE_MAIN));
-    files
+fn sqlite_native_package_files() -> Layout {
+    package_files()
+        .main(SQLITE_NATIVE_MAIN)
 }
 
-fn sqlite_shape_package_files() -> Vec<(&'static str, &'static str)> {
-    let mut files = package_files();
-    files.retain(|(path, _)| *path != "main.align");
-    files.push(("pkg/db/shape_fixture.align", SQLITE_SHAPE_MODULE));
-    files.push(("main.align", SQLITE_SHAPE_MAIN));
-    files
+fn sqlite_shape_package_files() -> Layout {
+    package_files()
+        .module("pkg/db/shape_fixture.align", SQLITE_SHAPE_MODULE)
+        .main(SQLITE_SHAPE_MAIN)
 }
 
-fn postgres_lease_package_files() -> Vec<(&'static str, &'static str)> {
-    let mut files = package_files();
-    files.retain(|(path, _)| *path != "main.align");
-    files.push(("pkg/db/lease_fixture.align", POSTGRES_LEASE_MODULE));
-    files.push(("main.align", POSTGRES_LEASE_MAIN));
-    files
+fn postgres_lease_package_files() -> Layout {
+    package_files()
+        .module("pkg/db/lease_fixture.align", POSTGRES_LEASE_MODULE)
+        .main(POSTGRES_LEASE_MAIN)
 }
 
-fn postgres_status_package_files() -> Vec<(&'static str, &'static str)> {
-    let mut files = package_files();
-    files.retain(|(path, _)| *path != "main.align");
-    files.push(("pkg/db/status_fixture.align", POSTGRES_STATUS_MODULE));
-    files.push(("main.align", POSTGRES_STATUS_MAIN));
-    files
+fn postgres_status_package_files() -> Layout {
+    package_files()
+        .module("pkg/db/status_fixture.align", POSTGRES_STATUS_MODULE)
+        .main(POSTGRES_STATUS_MAIN)
 }
 
-fn postgres_package_files() -> Vec<(&'static str, &'static str)> {
-    let mut files = package_files();
-    files.retain(|(path, _)| *path != "main.align");
-    files.push(("app/pg_inspect.align", POSTGRES_QUERIES));
-    files.push(("main.align", POSTGRES_MAIN));
-    files
+fn postgres_package_files() -> Layout {
+    package_files()
+        .module("app/pg_inspect.align", POSTGRES_QUERIES)
+        .main(POSTGRES_MAIN)
 }
 
-fn postgres_bridge_package_files() -> Vec<(&'static str, &'static str)> {
-    let mut files = package_files();
-    files.retain(|(path, _)| *path != "main.align");
-    files.push(("app/pg_inspect.align", POSTGRES_QUERIES));
-    files.push((
-        "pkg/db/bad_normalized_explain.align",
-        BAD_NORMALIZED_EXPLAIN,
-    ));
-    files.push(("main.align", POSTGRES_BRIDGE_MAIN));
-    files
+fn postgres_bridge_package_files() -> Layout {
+    package_files()
+        .module("app/pg_inspect.align", POSTGRES_QUERIES)
+        .module("pkg/db/bad_normalized_explain.align", BAD_NORMALIZED_EXPLAIN)
+        .main(POSTGRES_BRIDGE_MAIN)
 }
 
 #[test]
@@ -1572,11 +1547,10 @@ fn bypass(
 
 fn main() -> i32 = 0
 "#;
-    let mut files = package_files();
-    files.retain(|(path, _)| *path != "main.align");
-    files.push(("main.align", bypass));
+    let files = package_files()
+        .module("main.align", bypass);
     let diagnostics =
-        check_multi_diagnostics("pkg-db-q5b2-sealed-catalog-adapter", &files, "main.align");
+        check_multi_diagnostics("pkg-db-q5b2-sealed-catalog-adapter", &files.files(), "main.align");
     assert!(
         diagnostics.contains("type mismatch: bool vs pkg.db.internal$SqliteCatalogControls"),
         "a raw boolean must not reach the internal catalog adapter:\n{diagnostics}"
@@ -1604,15 +1578,11 @@ pub fn bad(
   }
 }
 "#;
-    let mut files = package_files();
-    files.retain(|(path, _)| *path != "main.align");
-    files.push(("pkg/db/bad_explain_type.align", wrong_type));
-    files.push((
-        "main.align",
-        "module main\nimport pkg.db.bad_explain_type\nfn main() -> i32 = 0\n",
-    ));
+    let files = package_files()
+        .module("pkg/db/bad_explain_type.align", wrong_type)
+        .main("module main\nimport pkg.db.bad_explain_type\nfn main() -> i32 = 0\n");
     let diagnostics =
-        check_multi_diagnostics("pkg-db-q5b2-explain-bridge-type", &files, "main.align");
+        check_multi_diagnostics("pkg-db-q5b2-explain-bridge-type", &files.files(), "main.align");
     assert!(
         diagnostics.contains("database EXPLAIN normalized option must be `u8`, got bool"),
         "unexpected diagnostics:\n{diagnostics}"
@@ -1637,15 +1607,11 @@ pub fn bad(
   }
 }
 "#;
-    let mut files = package_files();
-    files.retain(|(path, _)| *path != "main.align");
-    files.push(("pkg/db/bad_explain_arity.align", wrong_arity));
-    files.push((
-        "main.align",
-        "module main\nimport pkg.db.bad_explain_arity\nfn main() -> i32 = 0\n",
-    ));
+    let files = package_files()
+        .module("pkg/db/bad_explain_arity.align", wrong_arity)
+        .main("module main\nimport pkg.db.bad_explain_arity\nfn main() -> i32 = 0\n");
     let diagnostics =
-        check_multi_diagnostics("pkg-db-q5b2-explain-bridge-arity", &files, "main.align");
+        check_multi_diagnostics("pkg-db-q5b2-explain-bridge-arity", &files.files(), "main.align");
     assert!(
         diagnostics.contains(
             "static descriptor operation 'explain_postgres_native' expects 8 argument(s), got 7"
@@ -1659,7 +1625,7 @@ fn sqlite_database_schema_table_and_column_projection_is_exact() {
     if !backend_available() {
         return;
     }
-    let output = build_and_run_multi("pkg-db-q5b2-sqlite-catalog", &package_files(), "main.align");
+    let output = build_and_run_multi("pkg-db-q5b2-sqlite-catalog", &package_files().files(), "main.align");
     assert_eq!(
         output.status.code(),
         Some(45),
@@ -1675,7 +1641,7 @@ fn common_sqlite_explain_is_bound_and_inspection_only() {
     }
     let output = build_and_run_multi_with_static_descriptors(
         "pkg-db-q5b2-sqlite-explain",
-        &explain_package_files(),
+        &explain_package_files().files(),
         "main.align",
     );
     assert_eq!(
@@ -1693,7 +1659,7 @@ fn sqlite_explain_generic_bridge_links_per_unit() {
     }
     let built = build_per_unit_multi(
         "pkg-db-q5b2-sqlite-explain-unit",
-        &explain_package_files(),
+        &explain_package_files().files(),
         "main.align",
     );
     let output = built.link_and_run();
@@ -1712,7 +1678,7 @@ fn sqlite_native_option_matrix_and_validation_precedence_are_exact() {
     }
     let output = build_and_run_multi(
         "pkg-db-q5b2-sqlite-native",
-        &sqlite_native_package_files(),
+        &sqlite_native_package_files().files(),
         "main.align",
     );
     assert_eq!(
@@ -1730,7 +1696,7 @@ fn malformed_native_catalog_rows_close_once_and_sqlite_releases_the_lease() {
     }
     let output = build_and_run_multi_with_c(
         "pkg-db-q5b2-sqlite-shape",
-        &sqlite_shape_package_files(),
+        &sqlite_shape_package_files().files(),
         "main.align",
         SQLITE_SHAPE_STUB,
     );
@@ -1750,7 +1716,7 @@ fn postgres_catalog_and_explain_share_the_execution_lease() {
     }
     let output = build_and_run_multi_with_c(
         "pkg-db-q5b2-postgres-lease",
-        &postgres_lease_package_files(),
+        &postgres_lease_package_files().files(),
         "main.align",
         db_harness::PG.c_source,
     );
@@ -1770,7 +1736,7 @@ fn postgres_package_results_fail_closed_before_followup_native_work() {
     }
     let output = build_and_run_multi_with_c(
         "pkg-db-postgres-status-safety",
-        &postgres_status_package_files(),
+        &postgres_status_package_files().files(),
         "main.align",
         db_harness::PG.c_source,
     );
@@ -1791,13 +1757,12 @@ import pkg.db.internal.postgres_status
 pub fn classify(status: i32) -> bool = pkg.db.internal.postgres_status.must_close(status)
 "#;
     let main = "module main\nimport app.bad_status\nfn main() -> i32 = 0\n";
-    let mut files = package_files();
-    files.retain(|(path, _)| *path != "main.align");
-    files.push(("app/bad_status.align", bad));
-    files.push(("main.align", main));
+    let files = package_files()
+        .module("app/bad_status.align", bad)
+        .module("main.align", main);
     let diagnostics = check_multi_diagnostics(
         "pkg-db-postgres-status-authority-sealed",
-        &files,
+        &files.files(),
         "main.align",
     );
     assert!(
@@ -1814,26 +1779,17 @@ fn postgres_required_catalog_and_explain_contract_is_exact() {
     }
     let files = postgres_package_files();
     let diagnostics =
-        check_multi_diagnostics("pkg-db-q5b2-postgres-typecheck", &files, "main.align");
+        check_multi_diagnostics("pkg-db-q5b2-postgres-typecheck", &files.files(), "main.align");
     assert!(
         !diagnostics.lines().any(|line| line.contains(": error:")),
         "PostgreSQL Q5b2 fixture must type-check before live execution:\n{diagnostics}"
     );
-    let required = std::env::var_os("ALIGN_DB_POSTGRES_REQUIRED").is_some();
-    let Some(url) = std::env::var("ALIGN_DB_POSTGRES_URL")
-        .ok()
-        .filter(|url| !url.is_empty())
-    else {
-        assert!(
-            !required,
-            "ALIGN_DB_POSTGRES_URL is required by this test environment"
-        );
-        eprintln!("skipping PostgreSQL Q5b2 owner: ALIGN_DB_POSTGRES_URL is not set");
+    let Some(url) = db_harness::live_postgres_url("PostgreSQL Q5b2 owner") else {
         return;
     };
     let output = build_and_run_multi_with_static_descriptors_args_with_env(
         "pkg-db-q5b2-postgres",
-        &files,
+        &files.files(),
         "main.align",
         &[url.as_str()],
         &[],
@@ -1856,7 +1812,7 @@ fn postgres_native_generic_bridge_compiles_and_rejects_wrong_driver() {
     let files = postgres_bridge_package_files();
     let output = build_and_run_multi_with_static_descriptors(
         "pkg-db-q5b2-postgres-bridge",
-        &files,
+        &files.files(),
         "main.align",
     );
     assert_eq!(
@@ -1866,7 +1822,7 @@ fn postgres_native_generic_bridge_compiles_and_rejects_wrong_driver() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let built = build_per_unit_multi("pkg-db-q5b2-postgres-bridge-unit", &files, "main.align");
+    let built = build_per_unit_multi("pkg-db-q5b2-postgres-bridge-unit", &files.files(), "main.align");
     let output = built.link_and_run();
     assert_eq!(
         output.status.code(),

@@ -58,8 +58,8 @@ pub use parity::{
     run_parity_with_limits,
 };
 pub use run::{
-    Gate, LiveDecision, Mismatch, Needs, Run, assert_no_mismatches, gate,
-    live_postgres_decision, should_clear_env,
+    Gate, LiveDecision, Mismatch, Needs, Run, assert_no_mismatches, gate, live_postgres,
+    live_postgres_decision, live_postgres_url, live_run_id, should_clear_env,
 };
 pub use runner::{
     RUNNER_PER_UNIT_C, RUNNER_STATIC_DESCRIPTORS, RUNNER_WHOLE_PROGRAM, expect_checks_clean,
