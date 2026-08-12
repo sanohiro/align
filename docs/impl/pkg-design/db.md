@@ -1643,9 +1643,10 @@ postgres.ExecuteOption.Delivery(SingleRow|PortalBatch(max_rows))
 in its public semantic contract and artifact. `ParameterOid` applies only to preparation.
 `ParameterFormat` names a Params field; `ResultFormat` applies to the complete result in libpq v1.
 Unknown fields/types/OIDs, duplicate field controls, and conflicting formats are errors, not ignored
-hints. The first implementation may support only `Text`; requesting an unavailable binary mapping
-returns `Unsupported` before sending SQL. Text-format `bytea` uses the exact hex encoding from
-§5.6.1; Binary-format `bytea` alone passes raw bytes with an explicit libpq length.
+hints. The D1--D12 implementation supported only `Text` and returned `Unsupported` for Binary
+before send; the D13 binary-format ledger in §23 supersedes that temporary unavailable
+disposition with its exact proof and mapping table. Text-format `bytea` uses the exact hex encoding
+from §5.6.1; Binary-format `bytea` alone passes raw bytes with an explicit libpq length.
 
 `Delivery` is a row-producing execution option. Its exact operation set, default, size bound,
 streaming/error semantics, and ABI are fixed by the A1 PostgreSQL delivery ledger in §23. It does
@@ -4835,8 +4836,10 @@ The connection remains pinned to client encoding UTF-8. Binary text input theref
 exact UTF-8 bytes into execution-owned storage, appends an out-of-length sentinel only for package
 storage safety, and rejects U+0000 before send for `text`, `varchar`, and `name`; PostgreSQL text
 values cannot contain that code point even though the binary transport is length-aware. Binary
-`bytea` never adds or removes a byte. A NULL parameter is a null libpq value pointer with length
-ignored, but retains its selected format code. A NULL result has no payload but must still carry the
+`bytea` never adds or removes a payload byte. A present empty Binary `bytea` allocates one zero
+sentinel byte outside its recorded zero length and gives libpq that non-null pointer; `None` alone
+uses a null pointer, so empty and SQL NULL remain distinct. A NULL parameter otherwise has length
+ignored but retains its selected format code. A NULL result has no payload but must still carry the
 expected column OID and result format in RowDescription. Text format keeps the existing exact
 lowercase `\\x` bytea encoding/decoding and scalar parser. No other OID, domain, enum, array,
 range, numeric, date/time, JSON, or extension type is silently coerced into this table.
@@ -4849,21 +4852,105 @@ infinities, and NaN payloads; it does not pass through decimal text. These layou
 network-byte-order requirement and PostgreSQL's built-in `boolsend`, integer send/receive,
 `pq_sendfloat4`/`pq_sendfloat8`, `textsend`/`namesend`, and `byteasend` contracts.
 
+The compiler-private normalized-call ABI is exact. `one_native` uses `rows_native_prevalidated`
+and has no fourth internal entry point:
+
+```align
+pub fn execute_native_prevalidated<P>(
+  target: pkg.db.exec,
+  params: P,
+  statement: pkg.db.command<P>,
+  query_id: str,
+  timeout: Option<i64>,
+  format_plan: raw,
+  format_count: u32,
+  result_format: u8,
+) -> Result<pkg.db.exec_result, pkg.db.Error>
+
+pub fn rows_native_prevalidated<P, R>(
+  target: pkg.db.exec,
+  params: P,
+  statement: pkg.db.query<P, R>,
+  query_id: str,
+  timeout: Option<i64>,
+  delivery: u8,
+  portal_max_rows: i32,
+  format_plan: raw,
+  format_count: u32,
+  result_format: u8,
+) -> Result<pkg.db.rows<R>, pkg.db.Error>
+
+pub fn rows_stmt_native_prevalidated<P, R>(
+  params: P,
+  borrow mut statement: pkg.db.stmt<P, R>,
+  timeout: Option<i64>,
+  delivery: u8,
+  portal_max_rows: i32,
+  format_plan: raw,
+  format_count: u32,
+  result_format: u8,
+) -> Result<pkg.db.rows<R>, pkg.db.Error>
+```
+
+`format_count` is the exact number of 8-byte, 4-aligned entries and is at most both the descriptor
+parameter count and `2_147_483_647`. `format_plan` is null exactly when `format_count == 0`;
+otherwise it names at least checked `i64(format_count) * 8` readable bytes owned by the caller for
+the complete synchronous call. Each entry is `i32 ordinal` followed by `i32 format`, with one-based
+ordinal and `0=Text`, `1=Binary`. `result_format` is `0=Text`, `1=Binary`. The internal callee
+validates the result tag; parameter-count bound; pointer/count product; checked byte size; then each
+entry's ordinal, format tag, and duplicate ordinal in source order before live-state access,
+allocation, bind, or send. It copies the codes into execution-owned storage and never retains or
+frees the caller plan. A malformed product returns
+`InvalidQuery(ContractError { query_id: Some(query_id), item: "postgres.execute.format_plan",
+message: "invalid normalized PostgreSQL format plan" })`. The compiler-private call validator
+permits only a plan pointer derived from the live scratch owner formed by the corresponding public
+wrapper and rejects application calls, wrong operations/types, pointer substitution, and malformed
+HIR before code generation.
+
+Binary-related public contract errors are exact. All records below use the trusted Query or command
+ID as `Some(query_id)`:
+
+| Failure | Exact public error |
+|---|---|
+| selected Binary parameter lacks direct static proof or prepared effective-OID proof | `Unsupported`, item `postgres.execute.parameter_format`, message `binary PostgreSQL parameter requires an exact supported ParameterType` |
+| malformed internal normalized plan | `InvalidQuery`, item `postgres.execute.format_plan`, message `invalid normalized PostgreSQL format plan` |
+| malformed text/byte parameter pointer or length representation | `Encode`, item `db.parameter`, message `database parameter has an invalid memory representation` |
+| U+0000 in a PostgreSQL text-type parameter | `Encode`, item `db.parameter`, message `database text contains U+0000` |
+| parameter length outside signed libpq `int` or checked allocation arithmetic | `Encode`, item `db.parameter`, message `PostgreSQL parameter exceeds the native i32 length range` |
+| any result name/OID/format/NULL/pointer/length/payload mismatch | `Decode`, item `db.row`, message `PostgreSQL row does not match the static Row contract` |
+
+Parameter formation visits increasing protocol ordinal. Within one text/byte field it checks the
+memory representation, then text U+0000 when applicable, then the signed length bound, then
+allocation and copy. The language's ordinary allocation failure remains a hard abort, not another
+`pkg.db.Error`. Result validation visits increasing declared Row ordinal; within one field it checks
+name, OID, format, NULL disposition, negative length, non-null pointer for a present value, then
+fixed width before bool value or UTF-8 payload validity. That ordering and the table above govern
+every multi-invalid direct, prepared, buffered, and streamed input.
+
 The implementation closure matrix is:
 
 | Closure cell | Required implementation closure | Exact owner evidence |
 |---|---|---|
 | public surface and operation matrix | Preserve the exact inventory above. Accept Text and Binary parameter formats on direct Query, direct command, and prepared Query execution; accept Text and Binary result format on those same operations; add no prepared `one_native`, common native-option escape, per-column result selector, reflective codec, or compatibility alias. | exported-surface golden plus command/direct rows/direct one/prepared rows x default/Text/Binary x BufferedFull/SingleRow/PortalBatch callable matrix |
-| static type proof and resolver ABI | Keep the execution descriptor exactly 136 bytes and 8-aligned but bump it to v6. Offsets other than 104 retain v5 meaning. Offset 104 becomes the non-null generated parameter-resolver v2: zero means unknown, a positive ordinal means known but Text-only, and the corresponding negative ordinal means the parameter has one exact compatible PostgreSQL `ParameterType` from the table above and may use Binary; `i32::MIN` and an absolute ordinal outside `1..=parameter_count` are malformed. Existing sealed `parameter_known` accepts either sign and existing `parameter_ordinal` operations return the absolute ordinal. Add sealed direct and prepared binary-ordinal operations that return the absolute ordinal only for the negative form and zero otherwise. Application calls, wrong descriptor/resource types, an unguarded prepared load, cross-descriptor resolver splices, and malformed HIR fail closed. Query/command formation, interface serialization, monomorphization, whole-program, and per-unit compilation retain the matching v2 resolver. | exact v6 header/function-body/relocation goldens; every type and missing-`ParameterType` resolver code; sema/MIR application/wrong-kind/unguarded/splice/malformed rejection; whole/per-unit runtime-selected same-typed descriptor twins |
+| static type proof and resolver ABI | Keep the execution descriptor exactly 136 bytes and 8-aligned but bump it to v6. Offsets other than 104 retain v5 meaning. Offset 104 becomes the non-null generated parameter-resolver v2: zero means unknown, a positive ordinal means known but Text-only, and the corresponding negative ordinal means the parameter has one exact compatible PostgreSQL `ParameterType` from the table above and may use Binary; `i32::MIN` and an absolute ordinal outside `1..=parameter_count` are malformed. Existing sealed `parameter_known` accepts either sign and existing `parameter_ordinal` operations return the absolute ordinal. Add a sealed direct binary-ordinal operation that returns the absolute ordinal only for the negative form and zero otherwise. The prepared sibling additionally requires the retained effective-OID eligibility bit described below, so a differing `ParameterOid` override cannot reuse a stale static proof. Application calls, wrong descriptor/resource types, an unguarded prepared load, cross-descriptor resolver splices, and malformed HIR fail closed. Query/command formation, interface serialization, monomorphization, whole-program, and per-unit compilation retain the matching v2 resolver. | exact v6 header/function-body/relocation goldens; every type and missing-`ParameterType` resolver code; matching/differing/absent `ParameterOid` proof owners; sema/MIR application/wrong-kind/unguarded/splice/malformed rejection; whole/per-unit runtime-selected same-typed descriptor twins |
 | option validation and precedence | Preserve §13.4 source-order phases. At each `ParameterFormat`, reject U+0000 in `name`, then an unknown name, then a Binary request whose v2 resolver lacks the exact negative proof, then a duplicate; thus current-payload validity beats duplicate registration. Use `Unsupported`, the trusted Query/command ID, item `postgres.execute.parameter_format`, and exact message `binary PostgreSQL parameter requires an exact supported ParameterType` for the missing proof. `ResultFormat` has no payload beyond its closed enum and duplicate detection is exact. Delivery keeps its adjacent ledger order. All native-option errors precede driver restriction, live-state checks, lease/context/bind, and SQL send. | parameterized source-order and reversed-invalid/valid-duplicate owners across command/direct/prepared; unknown/NUL/missing-proof zero execution-context/format-plan/libpq counters; retained Delivery precedence owners |
-| package context and prepared ABI | PostgreSQL's opaque binder context becomes an exact 88-byte v3 record: offsets 0--79 retain v2 meaning, offset 80 is result format `u8` (`0=Text`, `1=Binary`), and 81--87 are zero. The shared generated callbacks accept exact SQLite context v2 or PostgreSQL context v3 and reject every cross-driver/version/format/reserved product before dereference. Prepared statement state remains 88-byte/8-aligned but becomes v4 because offset 80 now retains resolver v2; all other offsets remain unchanged. The one statement validator, every accessor/bridge/constructor/Drop path, SQLite sibling, and semantic/byte golden move together. | driver x context-version/size/result-format/reserved matrix; statement v4 both-driver active/closed/malformed bytes; constructor/accessor/Drop no-call counters; cumulative SQLite prepared/rows suite |
-| normalized format formation and ownership | After complete native-option validation, form at most one call-local normalized 8-byte entry (`i32 ordinal`, `i32 format`) per explicit parameter option. The public native wrapper owns that scratch storage through the synchronous internal formation call and frees it on success or error; a published rows resource never borrows it. The internal path validates count, pointer, ordinal, tag, duplicate ordinal, and parameter-count bounds before copying each code into its execution-owned vector. Zero explicit parameter options allocate no format plan. Result format needs no separate allocation. | zero/one/many option allocation/free counters; malformed internal plan no-bind/no-send owners; rows publication followed by scratch destruction/use-after-free probe; direct/prepared parity |
-| parameter encode and retention | Run generated static validation before applying the normalized plan on direct execution; prepared execution relies on the same retained resolver proof established at statement formation. Binder callbacks read the selected code for their own ordinal and encode exactly the table above. Enforce libpq's signed `int` length bound before send. Non-null scalar/text/bytea values have exactly one execution-owned payload allocation; Binary bytea uses `len` bytes without Text hex expansion, and NULL allocates none. Direct and prepared BufferedFull retain through synchronous completion; SingleRow/PortalBatch retain until `PQgetResult` returns null or fail-closed cleanup destroys the context. Every partial bind or option-plan failure frees installed values once and sends nothing. | per-type/nullable wire-byte and length/format/OID goldens; U+0000 and `i32::MAX` boundary no-send owners; mutation/source-Drop retention; partial-bind allocation/free matrix; synchronous/streamed context lifetime counters |
+| package context and prepared ABI | PostgreSQL's opaque binder context becomes an exact 88-byte v3 record: offsets 0--79 retain v2 meaning, offset 80 is result format `u8` (`0=Text`, `1=Binary`), and 81--87 are zero. The shared generated callbacks accept exact SQLite context v2 or PostgreSQL context v3 and reject every cross-driver/version/format/reserved product before dereference. Shared prepared statement state becomes an exact 104-byte, 8-aligned v4 record: offsets 0--79 retain v3 meaning; offset 80 retains resolver v2; offset 88 is a package-owned byte-per-parameter Binary eligibility vector; offset 96 is its exact `u32` count; and 100--103 are zero. SQLite requires null/zero eligibility. PostgreSQL requires null/zero for zero parameters and otherwise a non-null vector whose count is the descriptor parameter count and whose bytes are only 0/1. At PostgreSQL preparation, bit `ordinal-1` is one exactly when static validation installed a supported nonzero canonical OID and the effective OID after any `ParameterOid` override equals it. Arbitrary nonzero overrides remain valid for Text, but a differing override makes that ordinal Binary-ineligible. The sealed prepared binary-ordinal bridge requires both a negative resolver result and bit one. Statement Drop nulls the vector/count before freeing the vector once. The one statement validator, every accessor/bridge/constructor/Drop path, SQLite sibling, and semantic/byte golden move together. | driver x context-version/size/result-format/reserved matrix; statement v4 both-driver active/closed/malformed bytes and eligibility pointer/count/byte product; matching/differing/absent override; constructor/accessor/Drop no-call and free counters; cumulative SQLite prepared/rows suite |
+| normalized format formation and ownership | After complete native-option validation, form at most one call-local normalized 8-byte entry (`i32 ordinal`, `i32 format`) per explicit parameter option. The public native wrapper owns that 4-aligned scratch storage through the exact synchronous internal ABI above and frees it on success or error; a published rows resource never borrows it. The internal path performs the specified complete plan validation before copying each code into its execution-owned vector. Zero explicit parameter options use the canonical `(null, 0)` plan and allocate no scratch. Result format needs no separate allocation. | zero/one/many option allocation/free counters; every malformed result-tag/count/pointer/size/ordinal/tag/duplicate product with exact `InvalidQuery` and zero context/bind/send; rows publication followed by scratch destruction/use-after-free probe; direct/prepared parity; sema/MIR call-formation negatives |
+| parameter encode and retention | Run generated static validation before applying the normalized plan on direct execution; prepared execution requires both the retained negative resolver proof and its retained effective-OID eligibility bit. Binder callbacks read the selected code for their own ordinal and encode exactly the table above. Enforce libpq's signed `int` length bound before send. Each non-null scalar/text/bytea value has exactly one execution-owned payload allocation and NULL has none. A nonempty Binary bytea allocates exactly `len` bytes; an empty Binary bytea allocates one zero sentinel byte, passes its non-null pointer with recorded length zero, and remains distinct from `None`. Direct and prepared BufferedFull retain through synchronous completion; SingleRow/PortalBatch retain until `PQgetResult` returns null or fail-closed cleanup destroys the context. Every partial bind or option-plan failure frees installed values once and sends nothing. | per-type/nullable wire-byte and length/format/OID goldens; direct/prepared `Some(empty bytea)` versus `None` pointer/length/format owner; U+0000 and `i32::MAX` boundary no-send owners with exact errors; mutation/source-Drop retention; partial-bind allocation/free matrix; synchronous/streamed context lifetime counters |
 | libpq call parity | Pass the exact per-parameter format vector and result-format code to every `PQexecParams`, `PQexecPrepared`, `PQsendQueryParams`, and `PQsendQueryPrepared` call. Do not route an explicit Binary call through `PQexec`, text fallback, or a second SQL statement. Timeout, cancellation, normal drain, status fail-close, transaction effect, and delivery selection remain those of the adjacent D8/D9/A1 ledger. | stub argument capture for every synchronous/asynchronous direct/prepared command/rows path and required live PostgreSQL execution; retained deadline/delivery/status/cancellation matrices |
-| result metadata and decode | Add exact `PQfformat` FFI use. For each declared field, validation order is column name, exact accepted OID, exact requested format code, NULL disposition, pointer/length, then payload. The first declared ordinal wins. Text uses the existing parsers. Binary rejects wrong fixed width, bool bytes other than 0/1, negative length, null pointer for a non-null value, invalid UTF-8, or any unsupported OID/format before a safe view or decoder call. Integer and float decode use endian-explicit bit operations. Binary text/bytea views point directly into the current PGresult generation; Text bytea retains its owned decode buffer. `one_native` clones the validated first Row into `out` exactly as before. | per-type default/Text/Binary/NULL result matrices; OID-vs-format-vs-NULL multi-invalid winners; every malformed fixed length/bool/UTF-8/pointer case; zero-copy pointer identity for Binary text/bytea; view-generation and one-clone owners |
-| cleanup, errors, and allocation | A missing binary type proof is `Unsupported` before native state. Parameter NUL/length/payload formation failures are the existing owned `Encode` contract error before send. Malformed binary result metadata or payload is the existing owned `Decode` row-contract error; the first error remains primary while the result sequence drains or closes under the shipped delivery rules. No decode error permits another decoder call. Free row-cache-owned Text bytea storage, parameter storage, PGresult, context, unpublished batch/Row, statement dependency, and lease exactly once on success, error, timeout, cancellation, early Drop, and malformed state. Binary scalar/text/bytea result decode adds no per-field heap allocation beyond the existing row cache. | first-error/no-more-decode counters crossed with BufferedFull/SingleRow/PortalBatch and Conn/Tx; fault-injected allocation/cleanup matrix; early Drop and statement/connection reuse; sanitizer-compatible stub owners |
+| result metadata and decode | Add exact `PQfformat` FFI use. For each declared field, use the complete validation precedence specified above; the first declared ordinal wins. Text uses the existing parsers. Binary rejects wrong fixed width, bool bytes other than 0/1, negative length, null pointer for a present value, invalid UTF-8, or any unsupported OID/format before a safe view or decoder call. Integer and float decode use endian-explicit bit operations. Binary text/bytea views point directly into the current PGresult generation; Text bytea retains its owned decode buffer. `one_native` clones the validated first Row into `out` exactly as before. | per-type default/Text/Binary/NULL result matrices; name/OID/format/NULL/length/pointer/payload multi-invalid winners with exact error records; every malformed fixed length/bool/UTF-8/pointer case; zero-copy pointer identity for Binary text/bytea; view-generation and one-clone owners |
+| cleanup, errors, and allocation | Return exactly the error records and precedence table above. A missing binary proof and a malformed normalized plan fail before native state. Parameter representation/NUL/length failures fail before send. Malformed binary result metadata or payload preserves the first exact `Decode` row-contract error while the result sequence drains or closes under the shipped delivery rules. No decode error permits another decoder call. Free row-cache-owned Text bytea storage, parameter storage, PGresult, context, unpublished batch/Row, statement eligibility vector/dependency, and lease exactly once on success, error, timeout, cancellation, early Drop, and malformed state. Binary scalar/text/bytea result decode adds no per-field heap allocation beyond the existing row cache. | exact error identity and intra-field precedence matrix crossed with direct/prepared and BufferedFull/SingleRow/PortalBatch; first-error/no-more-decode counters crossed with Conn/Tx; fault-injected allocation/cleanup matrix; early Drop and statement/connection reuse; sanitizer-compatible stub owners |
 | artifact, cache, and documentation identity | Public module interfaces and static Query semantic fingerprints do not change because the Text/Binary surface already exists. Descriptor v6 bytes, resolver body, package callback names/semantics, statement v4 implementation, and context v3 implementation change their exact compiler/package implementation hashes and invalidate affected object/dependency cache entries once. Checked artifacts, metadata, SQL identity, and driver restriction remain unchanged. English/Japanese package designs and the live handoff agree on the next/shipped boundary. | descriptor semantic-byte parity plus implementation/cache invalidation twins; artifact/metadata identity controls; English/Japanese consistency check; handoff updated only with the implementation milestone |
 | acceptance and measurement | Require merged D8/D9 streaming/cancellation, A1 batch and direct/prepared delivery, libpq client >=17, and the required PostgreSQL server job. Cross every mapped type and nullable form through direct and prepared binding plus BufferedFull and both explicit delivery modes; cross default/Text/Binary with timeout absent/present, Conn/Tx, rows/one/command where callable, zero/one/many rows, malformed result metadata/payload, and whole/per-unit linking. Run `scripts/db-verify-local.sh` before push. Record the named local Text-versus-Binary parameter/row measurement with payload bytes, copied bytes, allocations, time-to-first-row, and full-scan throughput after correctness; it is not a semantic gate. | focused package/compiler owners, retained `pkg_db_q4b`/`pkg_db_a1`/`pkg_db_q5b2`, required live PostgreSQL suite, local database parity gate, and non-gating measurement record |
+
+The first fresh review found two P1 omissions and one P2 error-contract gap. Empty Binary bytea now
+has an exact non-null zero-length representation and direct/prepared owner. The normalized-plan row
+now pins the complete compiler-private signature, bounds, ownership, malformed result, and call-
+formation guard. The error table now fixes every observable field and multi-invalid order. The
+author-side sibling audit also found that a differing prepared `ParameterOid` could otherwise reuse
+the descriptor's static Binary proof; statement v4 therefore retains effective-OID eligibility
+without narrowing Text preparation. These changes reopen the internal ABI/ownership cells but keep
+the one strict producer-to-consumer implementation boundary.
 
 The implementation references are [libpq parameter/result formats](https://www.postgresql.org/docs/17/libpq-exec.html),
 [libpq single-row mode](https://www.postgresql.org/docs/17/libpq-single-row-mode.html), and the
