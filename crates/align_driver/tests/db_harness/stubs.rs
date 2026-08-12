@@ -63,7 +63,11 @@ pub const PG: Stub = Stub {
         "pg.protocol_error",
         "pg.nonblocking_calls",
         "pg.cancel_calls",
+        "pg.cancel_socket_wait_calls",
         "pg.consume_calls",
+        "pg.single_row_mode_calls",
+        "pg.chunked_row_mode_calls",
+        "pg.last_chunk_size",
         "pg.last_timeout",
         "pg.prepare_calls",
         "pg.execute_prepared_calls",
@@ -145,7 +149,11 @@ extern "C" {
   fn align_pg_protocol_error() -> i32
   fn align_pg_nonblocking_calls() -> i32
   fn align_pg_cancel_calls() -> i32
+  fn align_pg_cancel_socket_wait_calls() -> i32
   fn align_pg_consume_calls() -> i32
+  fn align_pg_single_row_mode_calls() -> i32
+  fn align_pg_chunked_row_mode_calls() -> i32
+  fn align_pg_last_chunk_size() -> i32
   fn align_pg_last_timeout() -> i32
   fn align_pg_prepare_calls() -> i32
   fn align_pg_execute_prepared_calls() -> i32
@@ -179,8 +187,16 @@ pub fn dump() {
     print(align_pg_nonblocking_calls())
     print("pg.cancel_calls")
     print(align_pg_cancel_calls())
+    print("pg.cancel_socket_wait_calls")
+    print(align_pg_cancel_socket_wait_calls())
     print("pg.consume_calls")
     print(align_pg_consume_calls())
+    print("pg.single_row_mode_calls")
+    print(align_pg_single_row_mode_calls())
+    print("pg.chunked_row_mode_calls")
+    print(align_pg_chunked_row_mode_calls())
+    print("pg.last_chunk_size")
+    print(align_pg_last_chunk_size())
     print("pg.last_timeout")
     print(align_pg_last_timeout())
     print("pg.prepare_calls")

@@ -31,6 +31,8 @@ extern "C" link("pq") {
 // ELF link even when the Align program reaches only the common database path.
 extern "C" link("ssl") {}
 extern "C" link("crypto") {}
+extern "C" link("zstd") {}
+extern "C" link("z") {}
 
 extern "C" {
   fn align_rt_utf8_valid(pointer: raw, length: i64) -> i32

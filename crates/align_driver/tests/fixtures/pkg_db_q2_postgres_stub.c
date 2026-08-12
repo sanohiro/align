@@ -43,7 +43,10 @@ typedef struct {
 
 typedef struct {
   FakeConn *connection;
+  int started;
 } FakeCancel;
+
+#define ASYNC_QUEUE_CAPACITY 80
 
 static int connect_calls;
 static int finish_calls;
@@ -61,6 +64,11 @@ static int fail_next_control;
 static int rollback_next_commit;
 static char prepared_name[64];
 static FakeResult *async_result;
+static FakeResult *async_queue[ASYNC_QUEUE_CAPACITY];
+static int async_queue_count;
+static int async_queue_index;
+static int async_pause_after_results;
+static FakeConn *async_connection;
 static int async_busy;
 static int async_cancelled;
 static int async_cancel_fail;
@@ -75,12 +83,39 @@ static int delay_next_nonblocking_enable;
 static int prepared_timeout_wait;
 static int nonblocking_calls;
 static int cancel_calls;
+static int cancel_socket_wait_calls;
 static int consume_calls;
+static int single_row_mode_calls;
+static int chunked_row_mode_calls;
+static int last_chunk_size;
+static int fail_next_row_mode;
+static int stream_fatal_after_rows;
+static int stream_post_terminal_status;
+static int stream_missing_terminal;
+static int stream_initial_status;
 static int q6_delivered_rows;
 static int q6_fail_next_execute;
 static int forced_result_status;
 static int unsafe_status_seen;
 static int forbidden_after_status_calls;
+
+static void clear_async_results(void) {
+  if (async_result != NULL) {
+    free(async_result);
+    async_result = NULL;
+  }
+  for (int i = async_queue_index; i < async_queue_count; i++) free(async_queue[i]);
+  async_queue_count = 0;
+  async_queue_index = 0;
+  async_pause_after_results = 0;
+  async_connection = NULL;
+}
+
+static int enqueue_async(FakeResult *result) {
+  if (result == NULL || async_queue_count >= ASYNC_QUEUE_CAPACITY) return 0;
+  async_queue[async_queue_count++] = result;
+  return 1;
+}
 
 static int status_requires_close(int status) {
   return status == 3 || status == 4 || status == 8 || status == 10 || status == 11 ||
@@ -103,6 +138,7 @@ static int has(const char *text, const char *needle) {
 }
 
 void align_pg_reset(void) {
+  clear_async_results();
   connect_calls = 0;
   finish_calls = 0;
   encoding_calls = 0;
@@ -118,7 +154,6 @@ void align_pg_reset(void) {
   fail_next_control = 0;
   rollback_next_commit = 0;
   prepared_name[0] = '\0';
-  async_result = NULL;
   async_busy = 0;
   async_cancelled = 0;
   async_cancel_fail = 0;
@@ -133,7 +168,16 @@ void align_pg_reset(void) {
   prepared_timeout_wait = 0;
   nonblocking_calls = 0;
   cancel_calls = 0;
+  cancel_socket_wait_calls = 0;
   consume_calls = 0;
+  single_row_mode_calls = 0;
+  chunked_row_mode_calls = 0;
+  last_chunk_size = 0;
+  fail_next_row_mode = 0;
+  stream_fatal_after_rows = -1;
+  stream_post_terminal_status = -1;
+  stream_missing_terminal = 0;
+  stream_initial_status = -1;
   q6_delivered_rows = 0;
   q6_fail_next_execute = 0;
   forced_result_status = -1;
@@ -150,7 +194,11 @@ int align_pg_protocol_ok(void) { return protocol_ok; }
 int align_pg_protocol_error(void) { return protocol_error; }
 int align_pg_nonblocking_calls(void) { return nonblocking_calls; }
 int align_pg_cancel_calls(void) { return cancel_calls; }
+int align_pg_cancel_socket_wait_calls(void) { return cancel_socket_wait_calls; }
 int align_pg_consume_calls(void) { return consume_calls; }
+int align_pg_single_row_mode_calls(void) { return single_row_mode_calls; }
+int align_pg_chunked_row_mode_calls(void) { return chunked_row_mode_calls; }
+int align_pg_last_chunk_size(void) { return last_chunk_size; }
 int align_pg_q6_delivered_rows(void) { return q6_delivered_rows; }
 void align_pg_q6_fail_next_execute(void) { q6_fail_next_execute = 1; }
 void align_pg_force_result_status(int status) { forced_result_status = status; }
@@ -165,6 +213,7 @@ void align_pg_rollback_next_commit(void) { rollback_next_commit = 1; }
 void align_pg_fail_next_nonblocking_enable(void) { fail_next_nonblocking_enable = 1; }
 void align_pg_fail_next_nonblocking_restore(void) { fail_next_nonblocking_restore = 1; }
 void align_pg_delay_next_nonblocking_enable(void) { delay_next_nonblocking_enable = 1; }
+void align_pg_fail_next_row_mode(void) { fail_next_row_mode = 1; }
 
 PQconninfoOption *PQconninfoParse(const char *connection_info, char **error_out) {
   if (error_out != NULL) *error_out = NULL;
@@ -258,11 +307,9 @@ int PQclientEncoding(const FakeConn *connection) {
 
 void PQfinish(FakeConn *connection) {
   finish_calls++;
-  if (async_result != NULL) {
-    clear_calls++;
-    free(async_result);
-    async_result = NULL;
-  }
+  if (async_result != NULL) clear_calls++;
+  clear_calls += async_queue_count - async_queue_index;
+  clear_async_results();
   free(connection);
 }
 
@@ -287,6 +334,34 @@ static FakeResult *new_result(void) {
   result->constraint_name = "stub_constraint";
   result->table_name = "stub_table";
   result->column_name = "stub_column";
+  return result;
+}
+
+static FakeResult *copy_result_rows(
+    const FakeResult *source, int first_row, int row_count, int status) {
+  FakeResult *copy = new_result();
+  if (copy == NULL || source == NULL) return copy;
+  *copy = *source;
+  copy->status = status;
+  copy->rows = row_count;
+  memset(copy->delivered, 0, sizeof(copy->delivered));
+  for (int row = 0; row < row_count; row++) {
+    for (int column = 0; column < source->fields; column++) {
+      copy->values[row][column] = source->values[first_row + row][column];
+      copy->nulls[row][column] = source->nulls[first_row + row][column];
+    }
+  }
+  return copy;
+}
+
+static FakeResult *stream_error_result(int status, const char *sqlstate, const char *message) {
+  FakeResult *result = new_result();
+  if (result != NULL) {
+    result->status = status;
+    result->rows = 0;
+    result->sqlstate = sqlstate;
+    result->message = message;
+  }
   return result;
 }
 
@@ -432,6 +507,14 @@ static void q6_user_result(FakeResult *result, int parameter, int last_parameter
     }
     result->nulls[2][2] = 1;
     result->nulls[2][3] = 1;
+    return;
+  }
+  if (parameter == 1 && last_parameter == 1) {
+    result->rows = 1;
+    result->values[0][0] = "1";
+    result->values[0][1] = "Alice";
+    result->values[0][2] = "10";
+    result->values[0][3] = "Admin";
     return;
   }
   if (parameter == 1) {
@@ -677,6 +760,16 @@ int PQsendQueryParams(
   async_cancel_resource_fail = has(command, "CANCEL_RESOURCE_FAIL");
   async_transaction_unknown = has(command, "TX_UNKNOWN");
   async_cancelled = 0;
+  async_connection = connection;
+  stream_fatal_after_rows = has(command, "STREAM_FATAL_AFTER_ONE") ? 1 :
+      (has(command, "STREAM_FATAL_AFTER_TWO") ? 2 : -1);
+  stream_post_terminal_status = has(command, "POST_TERMINAL_FATAL") ? 7 :
+      (has(command, "POST_TERMINAL_BAD") ? 5 : -1);
+  stream_missing_terminal = has(command, "MISSING_TERMINAL");
+  stream_initial_status = has(command, "STREAM_COPY") ? 3 :
+      (has(command, "STREAM_COMMAND") ? 1 :
+       (has(command, "STREAM_EMPTY") ? 0 : -1));
+  async_pause_after_results = has(command, "TIMEOUT_AFTER_ONE") ? 1 : 0;
   return async_result == NULL ? 0 : 1;
 }
 
@@ -705,7 +798,83 @@ int PQsendQueryPrepared(
   async_cancel_resource_fail = 0;
   async_transaction_unknown = 0;
   async_cancelled = 0;
+  async_connection = connection;
+  stream_fatal_after_rows = -1;
+  stream_post_terminal_status = -1;
+  stream_missing_terminal = 0;
+  stream_initial_status = -1;
+  async_pause_after_results = 0;
   return async_result == NULL ? 0 : 1;
+}
+
+static int select_stream_mode(int status, int chunk_size) {
+  if (fail_next_row_mode) {
+    fail_next_row_mode = 0;
+    return 0;
+  }
+  FakeResult *source = async_result;
+  if (source == NULL) return 0;
+  async_result = NULL;
+  async_queue_count = 0;
+  async_queue_index = 0;
+  if (stream_initial_status >= 0 || source->status != 2) {
+    source->status = stream_initial_status >= 0 ? stream_initial_status : source->status;
+    return enqueue_async(source);
+  }
+
+  int delivered = 0;
+  int row_limit = source->rows;
+  if (stream_fatal_after_rows >= 0 && stream_fatal_after_rows < row_limit) {
+    row_limit = stream_fatal_after_rows;
+  }
+  while (delivered < row_limit) {
+    int rows = status == 9 ? 1 : chunk_size;
+    if (rows > row_limit - delivered) rows = row_limit - delivered;
+    if (!enqueue_async(copy_result_rows(source, delivered, rows, status))) {
+      free(source);
+      clear_async_results();
+      return 0;
+    }
+    delivered += rows;
+  }
+  if (stream_fatal_after_rows >= 0 && stream_fatal_after_rows <= source->rows) {
+    if (!enqueue_async(stream_error_result(7, "40001", "streamed late failure"))) {
+      free(source);
+      clear_async_results();
+      return 0;
+    }
+  } else if (!stream_missing_terminal) {
+    if (!enqueue_async(copy_result_rows(source, 0, 0, 2))) {
+      free(source);
+      clear_async_results();
+      return 0;
+    }
+  }
+  if (stream_post_terminal_status >= 0) {
+    if (!enqueue_async(stream_error_result(
+            stream_post_terminal_status, "XX000", "post-terminal failure"))) {
+      free(source);
+      clear_async_results();
+      return 0;
+    }
+  }
+  free(source);
+  return 1;
+}
+
+int PQsetSingleRowMode(FakeConn *connection) {
+  (void)connection;
+  note_forbidden_after_status();
+  single_row_mode_calls++;
+  return select_stream_mode(9, 1);
+}
+
+int PQsetChunkedRowsMode(FakeConn *connection, int chunk_size) {
+  (void)connection;
+  note_forbidden_after_status();
+  chunked_row_mode_calls++;
+  last_chunk_size = chunk_size;
+  return chunk_size > 0 ? select_stream_mode(12, chunk_size) : 0;
 }
 
 int PQsetnonblocking(FakeConn *connection, int enabled) {
@@ -752,6 +921,17 @@ FakeResult *PQgetResult(FakeConn *connection) {
   (void)connection;
   note_forbidden_after_status();
   if (async_busy) return NULL;
+  if (async_queue_index < async_queue_count) {
+    FakeResult *queued = async_queue[async_queue_index++];
+    if (async_pause_after_results > 0 && async_queue_index == async_pause_after_results) {
+      async_busy = 1;
+    }
+    if (queued != NULL && queued->status == 7 && async_connection != NULL &&
+        async_connection->transaction_status == 2) {
+      async_connection->transaction_status = 3;
+    }
+    return queued;
+  }
   FakeResult *result = async_result;
   async_result = NULL;
   return result;
@@ -762,6 +942,71 @@ int PQtransactionStatus(FakeConn *connection) {
   if (async_transaction_unknown) return 4;
   return connection == NULL ? 4 : connection->transaction_status;
 }
+
+static int perform_cancel(FakeConn *connection) {
+  cancel_calls++;
+  if (connection == NULL || async_cancel_fail) return 0;
+  async_cancelled = 1;
+  async_busy = async_drain_fail;
+  if (connection->transaction_status == 2) connection->transaction_status = 3;
+  if (async_result != NULL) {
+    async_result->status = 7;
+    async_result->sqlstate = "57014";
+    async_result->message = "cancelled by deadline";
+  } else if (async_queue_count > 0) {
+    FakeResult *last = async_queue[async_queue_count - 1];
+    if (last != NULL) {
+      last->status = 7;
+      last->sqlstate = "57014";
+      last->message = "cancelled by deadline";
+    }
+  }
+  return 1;
+}
+
+FakeCancel *PQcancelCreate(FakeConn *connection) {
+  note_forbidden_after_status();
+  if (async_cancel_resource_fail) return NULL;
+  FakeCancel *cancel = (FakeCancel *)calloc(1, sizeof(FakeCancel));
+  if (cancel != NULL) cancel->connection = connection;
+  return cancel;
+}
+
+int PQcancelStart(FakeCancel *cancel) {
+  note_forbidden_after_status();
+  if (cancel == NULL || !perform_cancel(cancel->connection)) return 0;
+  cancel->started = 1;
+  return 1;
+}
+
+int PQcancelPoll(FakeCancel *cancel) {
+  note_forbidden_after_status();
+  return cancel != NULL && cancel->started ? 3 : 0;
+}
+
+int PQcancelSocket(const FakeCancel *cancel) {
+  note_forbidden_after_status();
+  return cancel == NULL ? -1 : 42;
+}
+
+int64_t PQgetCurrentTimeUSec(void) {
+  struct timespec now;
+  if (clock_gettime(CLOCK_REALTIME, &now) != 0) return -1;
+  return (int64_t)now.tv_sec * 1000000 + now.tv_nsec / 1000;
+}
+
+int PQsocketPoll(int socket, int for_read, int for_write, int64_t end_time_us) {
+  note_forbidden_after_status();
+  cancel_socket_wait_calls++;
+  return socket < 0 || (for_read == 0 && for_write == 0) || end_time_us < 0 ? -1 : 1;
+}
+
+char *PQcancelErrorMessage(const FakeCancel *cancel) {
+  (void)cancel;
+  return "stub cancel failure";
+}
+
+void PQcancelFinish(FakeCancel *cancel) { free(cancel); }
 
 FakeCancel *PQgetCancel(FakeConn *connection) {
   note_forbidden_after_status();
@@ -775,16 +1020,7 @@ int PQcancel(FakeCancel *cancel, char *error_buffer, int error_buffer_size) {
   (void)error_buffer;
   (void)error_buffer_size;
   note_forbidden_after_status();
-  cancel_calls++;
-  if (cancel == NULL || async_cancel_fail) return 0;
-  async_cancelled = 1;
-  async_busy = async_drain_fail;
-  if (async_result != NULL) {
-    async_result->status = 7;
-    async_result->sqlstate = "57014";
-    async_result->message = "cancelled by deadline";
-  }
-  return 1;
+  return cancel == NULL ? 0 : perform_cancel(cancel->connection);
 }
 
 void PQfreeCancel(FakeCancel *cancel) { free(cancel); }

@@ -61,8 +61,8 @@
 # link one that only a cache still has. Three workflows and four install call
 # sites (two ci.yml jobs, nightly, release) therefore resolve one package set
 # from one repository definition. The two ci.yml jobs keep separate package
-# lists, and so separate entries, because giving the lint job libpq-dev and
-# libsqlite3-dev to share one entry would change what its build detects.
+# lists, and so separate entries, because the database job additionally requests the PostgreSQL
+# client and SQLite development package used by its provisioned integration suites.
 #
 # Trust boundary. The manifest check below detects truncation and corruption,
 # not a hostile writer: installing archives with dpkg bypasses apt's repository

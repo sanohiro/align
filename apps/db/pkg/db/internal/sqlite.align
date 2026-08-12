@@ -636,6 +636,11 @@ pub fn rows_stmt_prevalidated<P, R>(
       false,
       0,
       pkg.db.internal.resource.stmt_batch_plan(wrapper),
+      3,
+      false,
+      0,
+      -1,
+      -1,
     )
     output: pkg.db.rows<R> := resource.from_raw_borrowed(
       rows_wrapper, resource.borrow(statement),
@@ -764,6 +769,11 @@ pub fn rows_prevalidated<P, R>(
       restore_timeout,
       prior_timeout,
       pkg.db.internal.descriptor.batch_plan(statement),
+      3,
+      false,
+      0,
+      -1,
+      -1,
     )
     output: pkg.db.rows<R> := match target {
       Conn(reference) => resource.from_raw_borrowed(rows_wrapper, reference)

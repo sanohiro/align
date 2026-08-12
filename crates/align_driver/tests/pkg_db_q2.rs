@@ -1299,8 +1299,11 @@ fn main() -> i32 {
             })
     };
     assert!(
-        position("pq") < position("ssl") && position("ssl") < position("crypto"),
-        "libpq TLS closure must be ordered dependent-first: {ordered_link_libs:?}"
+        position("pq") < position("ssl")
+            && position("ssl") < position("crypto")
+            && position("crypto") < position("zstd")
+            && position("zstd") < position("z"),
+        "libpq native closure must be ordered dependent-first: {ordered_link_libs:?}"
     );
     let output = built.link_and_run();
     assert_eq!(
