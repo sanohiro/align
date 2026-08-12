@@ -1140,7 +1140,7 @@ not vanish" is not a property the infallible surface can assert.
 | A vanished checked program is an error at the one boundary, and the infallible entry points still fail closed | `align_mir` `lower_program_checked_reports_a_vanished_checked_program` |
 | Delegating a gate does not switch it off | `align_mir` `delegated_gates_still_refuse_a_genuinely_different_type` (struct accumulator, unordered key, mismatched map_err mapper, and two distinct source shapes under the shape matcher) |
 | A sum-type scan accumulator compiles and runs | `align_driver` `unit_values::sum_type_scan_accumulator_compiles_and_runs` |
-| A new raw `Ty`/`Scalar` comparison in the body validator cannot land silently | `scripts/lint-ratchet.sh` row `align_mir raw-ty-compare` (pinned; may only fall) |
+| A new raw `Ty`/`Scalar` comparison in the body validator cannot land silently | `scripts/lint-ratchet.sh` row `align_mir raw-ty-compare` (pinned at 301; may only fall). Counted with `perl`, not `grep`: the first cut used `grep` and disagreed between a developer machine and CI (301 versus 305), so the gate failed on a platform its author could not reproduce. A ratchet whose count depends on the local tool flavour is not a gate. |
 | End-to-end acceptance | `align_driver` `mir_continuation`, `unit_values` |
 
 **Review-ledger bookkeeping.** These occurrences were found by an internal

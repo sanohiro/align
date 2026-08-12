@@ -30,9 +30,13 @@ count() {
     # one source type (docs/impl/19-hir-validation-ledger.md, delegation matrix axis B). New
     # comparisons must go through body_ty_matches/body_scalar_matches, so this count may only fall.
     raw-ty-compare)
-      n=$(grep -nE '(!=|==)' crates/align_mir/src/validate_hir.rs \
-        | grep -vE '^[0-9]+:[[:space:]]*//' \
-        | grep -cE '\.ty[[:space:]]*(!=|==)|(!=|==)[[:space:]]*(Ty|Scalar)::' ) || n=0
+      # Counted with perl, not grep: this repository's ratchet must agree byte-for-byte between a
+      # developer machine and CI, and grep flavours do not. The first cut of this row used grep and
+      # was baselined at 301 locally while GNU grep in CI counted 305 — the gate failed on a
+      # platform its author could not reproduce. perl's regex engine is fixed, and perl is already
+      # a required package on both (ALIGN_APT_PACKAGES).
+      n=$(perl -ne 'next if m{^\s*//}; $c++ if /\.ty\s*(?:!=|==)|(?:!=|==)\s*(?:Ty|Scalar)::/; END { print $c // 0 }' \
+        crates/align_mir/src/validate_hir.rs) || n=0
       echo "$n"
       return 0
       ;;
