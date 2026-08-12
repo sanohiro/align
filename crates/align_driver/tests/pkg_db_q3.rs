@@ -14,7 +14,8 @@ use align_driver::{
 };
 use align_interface::{DriverEntry, MetaNullability, StaticArtifact, VerificationState};
 use align_span::SourceMap;
-use common::Proj;
+use common::{Proj, fixture};
+use std::sync::LazyLock;
 
 const DB: &str = include_str!("../../../apps/db/pkg/db.align");
 const SQLITE: &str = include_str!("../../../apps/db/pkg/db/sqlite.align");
@@ -24,8 +25,8 @@ const RESOURCE: &str = include_str!("../../../apps/db/pkg/db/internal/resource.a
 const DESCRIPTOR: &str = include_str!("../../../apps/db/pkg/db/internal/descriptor.align");
 const INTERNAL_SQLITE: &str = include_str!("../../../apps/db/pkg/db/internal/sqlite.align");
 const INTERNAL_POSTGRES: &str = include_str!("../../../apps/db/pkg/db/internal/postgres.align");
-const POSTGRES_STATUS: &str =
-    include_str!("../../../apps/db/pkg/db/internal/postgres_status.align");
+static POSTGRES_STATUS: LazyLock<&str> =
+    LazyLock::new(|| fixture("apps/db/pkg/db/internal/postgres_status.align"));
 
 fn project(tag: &str) -> Proj {
     let main = "module main\nimport app.read\nimport app.write\nimport app.sqlite_table\nimport app.sqlite_command\nimport app.pg_read\nimport app.pg_command\nfn main() -> i32 = 0\n";
@@ -42,7 +43,7 @@ fn project(tag: &str) -> Proj {
         ("pkg/db/internal/descriptor.align", DESCRIPTOR),
         ("pkg/db/internal/sqlite.align", INTERNAL_SQLITE),
         ("pkg/db/internal/postgres.align", INTERNAL_POSTGRES),
-        ("pkg/db/internal/postgres_status.align", POSTGRES_STATUS),
+        ("pkg/db/internal/postgres_status.align", *POSTGRES_STATUS),
         (
             "app/read.align",
             r#"module app.read

@@ -1,5 +1,7 @@
 //! pkg.db Q1/D1 owner tests: checked public descriptors through exact static artifacts.
 
+mod common;
+
 use align_driver::{
     build_per_unit, build_static_artifacts, check, emit_llvm_ir, execute_fake_static,
     metadata_path, resolve_static_descriptors, BuildTarget, Driver, FakeCardinality, FakeExecutionError,
@@ -12,8 +14,10 @@ use align_interface::{
 };
 use align_sema::StaticDescriptorConsumer;
 use align_span::SourceMap;
+use common::fixture;
 use std::fs::{create_dir_all, write};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DB: &str = include_str!("../../../apps/db/pkg/db.align");
@@ -24,8 +28,8 @@ const RESOURCE: &str = include_str!("../../../apps/db/pkg/db/internal/resource.a
 const DESCRIPTOR: &str = include_str!("../../../apps/db/pkg/db/internal/descriptor.align");
 const INTERNAL_SQLITE: &str = include_str!("../../../apps/db/pkg/db/internal/sqlite.align");
 const INTERNAL_POSTGRES: &str = include_str!("../../../apps/db/pkg/db/internal/postgres.align");
-const POSTGRES_STATUS: &str =
-    include_str!("../../../apps/db/pkg/db/internal/postgres_status.align");
+static POSTGRES_STATUS: LazyLock<&str> =
+    LazyLock::new(|| fixture("apps/db/pkg/db/internal/postgres_status.align"));
 
 struct TempProject(PathBuf);
 
@@ -57,7 +61,7 @@ fn project(label: &str) -> TempProject {
         .expect("pkg.db SQLite execution internals");
     write(root.join("pkg/db/internal/postgres.align"), INTERNAL_POSTGRES)
         .expect("pkg.db PostgreSQL execution internals");
-    write(root.join("pkg/db/internal/postgres_status.align"), POSTGRES_STATUS)
+    write(root.join("pkg/db/internal/postgres_status.align"), *POSTGRES_STATUS)
         .expect("pkg.db PostgreSQL status authority");
     TempProject(root)
 }
