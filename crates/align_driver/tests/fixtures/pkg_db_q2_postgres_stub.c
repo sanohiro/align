@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -28,7 +29,9 @@ typedef struct {
   int fields;
   const char *names[16];
   uint32_t oids[16];
+  int formats[16];
   const char *values[64][16];
+  int lengths[64][16];
   int nulls[64][16];
   int delivered[64];
   const char *affected;
@@ -43,7 +46,10 @@ typedef struct {
 
 typedef struct {
   FakeConn *connection;
+  int started;
 } FakeCancel;
+
+#define ASYNC_QUEUE_CAPACITY 80
 
 static int connect_calls;
 static int finish_calls;
@@ -61,6 +67,11 @@ static int fail_next_control;
 static int rollback_next_commit;
 static char prepared_name[64];
 static FakeResult *async_result;
+static FakeResult *async_queue[ASYNC_QUEUE_CAPACITY];
+static int async_queue_count;
+static int async_queue_index;
+static int async_pause_after_results;
+static FakeConn *async_connection;
 static int async_busy;
 static int async_cancelled;
 static int async_cancel_fail;
@@ -75,12 +86,48 @@ static int delay_next_nonblocking_enable;
 static int prepared_timeout_wait;
 static int nonblocking_calls;
 static int cancel_calls;
+static int cancel_socket_wait_calls;
 static int consume_calls;
+static int single_row_mode_calls;
+static int chunked_row_mode_calls;
+static int last_chunk_size;
+static int fail_next_row_mode;
+static int stream_fatal_after_rows;
+static int stream_post_terminal_status;
+static int stream_missing_terminal;
+static int stream_initial_status;
 static int q6_delivered_rows;
 static int q6_fail_next_execute;
 static int forced_result_status;
 static int unsafe_status_seen;
 static int forbidden_after_status_calls;
+static int prepared_format_matrix;
+static int format_matrix_direct_calls;
+static int format_matrix_prepared_calls;
+static int binary_fault;
+static int binary_empty_calls;
+static unsigned char format_matrix_left_binary[27][4];
+static unsigned char format_matrix_right_binary[27][1];
+static char format_matrix_left_text[27][12];
+static char format_matrix_right_text[27][5];
+
+static void clear_async_results(void) {
+  if (async_result != NULL) {
+    free(async_result);
+    async_result = NULL;
+  }
+  for (int i = async_queue_index; i < async_queue_count; i++) free(async_queue[i]);
+  async_queue_count = 0;
+  async_queue_index = 0;
+  async_pause_after_results = 0;
+  async_connection = NULL;
+}
+
+static int enqueue_async(FakeResult *result) {
+  if (result == NULL || async_queue_count >= ASYNC_QUEUE_CAPACITY) return 0;
+  async_queue[async_queue_count++] = result;
+  return 1;
+}
 
 static int status_requires_close(int status) {
   return status == 3 || status == 4 || status == 8 || status == 10 || status == 11 ||
@@ -103,6 +150,7 @@ static int has(const char *text, const char *needle) {
 }
 
 void align_pg_reset(void) {
+  clear_async_results();
   connect_calls = 0;
   finish_calls = 0;
   encoding_calls = 0;
@@ -118,7 +166,6 @@ void align_pg_reset(void) {
   fail_next_control = 0;
   rollback_next_commit = 0;
   prepared_name[0] = '\0';
-  async_result = NULL;
   async_busy = 0;
   async_cancelled = 0;
   async_cancel_fail = 0;
@@ -133,12 +180,26 @@ void align_pg_reset(void) {
   prepared_timeout_wait = 0;
   nonblocking_calls = 0;
   cancel_calls = 0;
+  cancel_socket_wait_calls = 0;
   consume_calls = 0;
+  single_row_mode_calls = 0;
+  chunked_row_mode_calls = 0;
+  last_chunk_size = 0;
+  fail_next_row_mode = 0;
+  stream_fatal_after_rows = -1;
+  stream_post_terminal_status = -1;
+  stream_missing_terminal = 0;
+  stream_initial_status = -1;
   q6_delivered_rows = 0;
   q6_fail_next_execute = 0;
   forced_result_status = -1;
   unsafe_status_seen = 0;
   forbidden_after_status_calls = 0;
+  prepared_format_matrix = 0;
+  format_matrix_direct_calls = 0;
+  format_matrix_prepared_calls = 0;
+  binary_fault = 0;
+  binary_empty_calls = 0;
 }
 
 int align_pg_connect_calls(void) { return connect_calls; }
@@ -150,7 +211,11 @@ int align_pg_protocol_ok(void) { return protocol_ok; }
 int align_pg_protocol_error(void) { return protocol_error; }
 int align_pg_nonblocking_calls(void) { return nonblocking_calls; }
 int align_pg_cancel_calls(void) { return cancel_calls; }
+int align_pg_cancel_socket_wait_calls(void) { return cancel_socket_wait_calls; }
 int align_pg_consume_calls(void) { return consume_calls; }
+int align_pg_single_row_mode_calls(void) { return single_row_mode_calls; }
+int align_pg_chunked_row_mode_calls(void) { return chunked_row_mode_calls; }
+int align_pg_last_chunk_size(void) { return last_chunk_size; }
 int align_pg_q6_delivered_rows(void) { return q6_delivered_rows; }
 void align_pg_q6_fail_next_execute(void) { q6_fail_next_execute = 1; }
 void align_pg_force_result_status(int status) { forced_result_status = status; }
@@ -165,6 +230,8 @@ void align_pg_rollback_next_commit(void) { rollback_next_commit = 1; }
 void align_pg_fail_next_nonblocking_enable(void) { fail_next_nonblocking_enable = 1; }
 void align_pg_fail_next_nonblocking_restore(void) { fail_next_nonblocking_restore = 1; }
 void align_pg_delay_next_nonblocking_enable(void) { delay_next_nonblocking_enable = 1; }
+void align_pg_fail_next_row_mode(void) { fail_next_row_mode = 1; }
+void align_pg_set_binary_fault(int fault) { binary_fault = fault; }
 
 PQconninfoOption *PQconninfoParse(const char *connection_info, char **error_out) {
   if (error_out != NULL) *error_out = NULL;
@@ -258,11 +325,9 @@ int PQclientEncoding(const FakeConn *connection) {
 
 void PQfinish(FakeConn *connection) {
   finish_calls++;
-  if (async_result != NULL) {
-    clear_calls++;
-    free(async_result);
-    async_result = NULL;
-  }
+  if (async_result != NULL) clear_calls++;
+  clear_calls += async_queue_count - async_queue_index;
+  clear_async_results();
   free(connection);
 }
 
@@ -273,6 +338,9 @@ const char *PQerrorMessage(const FakeConn *connection) {
 static FakeResult *new_result(void) {
   FakeResult *result = (FakeResult *)calloc(1, sizeof(FakeResult));
   if (result == NULL) return NULL;
+  for (int row = 0; row < 64; row++) {
+    for (int column = 0; column < 16; column++) result->lengths[row][column] = -1;
+  }
   result->status = 2;
   result->command_status = "";
   result->rows = 1;
@@ -290,7 +358,105 @@ static FakeResult *new_result(void) {
   return result;
 }
 
+static FakeResult *copy_result_rows(
+    const FakeResult *source, int first_row, int row_count, int status) {
+  FakeResult *copy = new_result();
+  if (copy == NULL || source == NULL) return copy;
+  *copy = *source;
+  copy->status = status;
+  copy->rows = row_count;
+  memset(copy->delivered, 0, sizeof(copy->delivered));
+  for (int row = 0; row < row_count; row++) {
+    for (int column = 0; column < source->fields; column++) {
+      copy->values[row][column] = source->values[first_row + row][column];
+      copy->lengths[row][column] = source->lengths[first_row + row][column];
+      copy->nulls[row][column] = source->nulls[first_row + row][column];
+    }
+  }
+  return copy;
+}
+
+static FakeResult *stream_error_result(int status, const char *sqlstate, const char *message) {
+  FakeResult *result = new_result();
+  if (result != NULL) {
+    result->status = status;
+    result->rows = 0;
+    result->sqlstate = sqlstate;
+    result->message = message;
+  }
+  return result;
+}
+
 FakeResult *align_pg_make_result(void) { return new_result(); }
+
+static int format_matrix_index(
+    int expected_call,
+    int parameter_count,
+    const char *const *parameter_values,
+    const int *parameter_lengths,
+    const int *parameter_formats,
+    int result_format) {
+  if (expected_call < 0 || expected_call >= 27 || parameter_count != 2 ||
+      parameter_values == NULL || parameter_lengths == NULL || parameter_formats == NULL ||
+      parameter_values[0] == NULL || parameter_values[1] == NULL) return -1;
+  int index = -1;
+  if (parameter_formats[0] == 0) {
+    if (parameter_lengths[0] != (int)strlen(parameter_values[0])) return -1;
+    index = atoi(parameter_values[0]);
+  } else if (parameter_formats[0] == 1 && parameter_lengths[0] == 4) {
+    const unsigned char *bytes = (const unsigned char *)parameter_values[0];
+    index = (int)(((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) |
+                  ((uint32_t)bytes[2] << 8) | (uint32_t)bytes[3]);
+  } else {
+    return -1;
+  }
+  int left_mode = index / 9;
+  int right_mode = (index / 3) % 3;
+  int result_mode = index % 3;
+  if (index != expected_call || parameter_formats[0] != (left_mode == 2) ||
+      parameter_formats[1] != (right_mode == 2) || result_format != (result_mode == 2)) return -1;
+  unsigned char expected_byte = (unsigned char)index;
+  if (parameter_formats[1] == 1) {
+    if (parameter_lengths[1] != 1 ||
+        (unsigned char)parameter_values[1][0] != expected_byte) return -1;
+  } else {
+    char expected_text[5];
+    snprintf(expected_text, sizeof(expected_text), "\\x%02x", expected_byte);
+    if (parameter_lengths[1] != 4 || memcmp(parameter_values[1], expected_text, 4) != 0) return -1;
+  }
+  return index;
+}
+
+static FakeResult *format_matrix_result(int index, int result_format) {
+  FakeResult *result = new_result();
+  if (result == NULL || index < 0 || index >= 27) return result;
+  result->fields = 2;
+  result->names[0] = "left";
+  result->names[1] = "right";
+  result->oids[0] = 23;
+  result->oids[1] = 17;
+  result->formats[0] = result_format;
+  result->formats[1] = result_format;
+  if (result_format == 1) {
+    format_matrix_left_binary[index][0] = 0;
+    format_matrix_left_binary[index][1] = 0;
+    format_matrix_left_binary[index][2] = 0;
+    format_matrix_left_binary[index][3] = (unsigned char)index;
+    format_matrix_right_binary[index][0] = (unsigned char)index;
+    result->values[0][0] = (const char *)format_matrix_left_binary[index];
+    result->values[0][1] = (const char *)format_matrix_right_binary[index];
+    result->lengths[0][0] = 4;
+    result->lengths[0][1] = 1;
+  } else {
+    snprintf(format_matrix_left_text[index], sizeof(format_matrix_left_text[index]), "%d", index);
+    snprintf(format_matrix_right_text[index], sizeof(format_matrix_right_text[index]), "\\x%02x", index);
+    result->values[0][0] = format_matrix_left_text[index];
+    result->values[0][1] = format_matrix_right_text[index];
+    result->lengths[0][0] = (int)strlen(format_matrix_left_text[index]);
+    result->lengths[0][1] = 4;
+  }
+  return result;
+}
 
 FakeResult *PQprepare(
     FakeConn *connection,
@@ -301,14 +467,17 @@ FakeResult *PQprepare(
   (void)connection;
   note_forbidden_after_status();
   prepare_calls++;
+  int format_matrix = has(command, "FORMAT_MATRIX");
   int common_types = prepare_calls == 1 && parameter_types != NULL &&
                      parameter_types[0] == 20 && parameter_types[1] == 0 &&
                      parameter_types[2] == 0;
   int overridden_types = prepare_calls == 2 && parameter_types != NULL &&
-                         parameter_types[0] == 20 && parameter_types[1] == 25 &&
+                         parameter_types[0] == 23 && parameter_types[1] == 25 &&
                          parameter_types[2] == 17;
+  int format_types = format_matrix && parameter_types != NULL &&
+                     parameter_count == 2 && parameter_types[0] == 23 && parameter_types[1] == 17;
   if (name == NULL || strncmp(name, "__align_pkg_db_", 15) != 0 || command == NULL ||
-      parameter_count != 3 || (!common_types && !overridden_types)) {
+      (!format_types && (parameter_count != 3 || (!common_types && !overridden_types)))) {
     protocol_ok = 0;
     if (protocol_error == 0) protocol_error = 88;
   }
@@ -322,6 +491,7 @@ FakeResult *PQprepare(
     }
   }
   prepared_timeout_wait = has(command, "TIMEOUT_WAIT");
+  prepared_format_matrix = format_matrix;
   FakeResult *result = new_result();
   if (result != NULL) {
     result->status = 1;
@@ -342,6 +512,17 @@ FakeResult *PQexecPrepared(
   (void)connection;
   note_forbidden_after_status();
   execute_prepared_calls++;
+  if (prepared_format_matrix) {
+    int index = format_matrix_index(
+        format_matrix_prepared_calls++, parameter_count, parameter_values,
+        parameter_lengths, parameter_formats, result_format);
+    if (index < 0) {
+      protocol_ok = 0;
+      if (protocol_error == 0) protocol_error = 98;
+      index = 0;
+    }
+    return format_matrix_result(index, result_format);
+  }
   if (name == NULL || strcmp(name, prepared_name) != 0 || parameter_count != 3 ||
       parameter_values == NULL || parameter_lengths == NULL || parameter_formats == NULL ||
       result_format != 0 || parameter_values[0] == NULL || parameter_values[1] == NULL ||
@@ -434,6 +615,14 @@ static void q6_user_result(FakeResult *result, int parameter, int last_parameter
     result->nulls[2][3] = 1;
     return;
   }
+  if (parameter == 1 && last_parameter == 1) {
+    result->rows = 1;
+    result->values[0][0] = "1";
+    result->values[0][1] = "Alice";
+    result->values[0][2] = "10";
+    result->values[0][3] = "Admin";
+    return;
+  }
   if (parameter == 1) {
     result->rows = 2;
     result->values[0][0] = "1";
@@ -471,6 +660,28 @@ static void q6_transaction_result(FakeResult *result) {
   }
 }
 
+static int full_binary_value_ok(int index, const char *value, int length) {
+  static const unsigned char expected[][8] = {
+      {0x01}, {0x01},
+      {0xff, 0xf4}, {0xfb, 0x2e},
+      {0x00, 0x00, 0x0d, 0x80}, {0xff, 0xfe, 0x1d, 0xc0},
+      {0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0x64, 0xcb},
+      {0xff, 0xff, 0xff, 0xff, 0xf8, 0xa4, 0x32, 0xeb},
+      {0x3f, 0xc0, 0x00, 0x00}, {0x40, 0x20, 0x00, 0x00},
+      {0xc0, 0x23, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00},
+      {0xc0, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+  };
+  static const int widths[] = {1, 1, 2, 2, 4, 4, 8, 8, 4, 4, 8, 8};
+  if (value == NULL || index < 0 || index >= 16) return 0;
+  if (index < 12) {
+    return length == widths[index] && memcmp(value, expected[index], (size_t)length) == 0;
+  }
+  if (index == 12) return length == 5 && memcmp(value, "hello", 5) == 0;
+  if (index == 13) return length == 8 && memcmp(value, "nullable", 8) == 0;
+  static const unsigned char bytes[] = {0x00, 0x7f, 0xff};
+  return length == 3 && memcmp(value, bytes, 3) == 0;
+}
+
 FakeResult *PQexecParams(
     FakeConn *connection,
     const char *command,
@@ -487,15 +698,58 @@ FakeResult *PQexecParams(
     q6_fail_next_execute = 0;
     return NULL;
   }
-  if (command == NULL || result_format != 0) {
+  if (command == NULL || result_format < 0 || result_format > 1) {
     protocol_ok = 0;
     if (protocol_error == 0) protocol_error = 87;
   }
   int full_matrix = has(command, "FULL_MATRIX");
+  int format_matrix = has(command, "FORMAT_MATRIX");
+  int format_command = has(command, "FORMAT_COMMAND");
+  int binary_fault_query = has(command, "BINARY_FAULT");
+  int binary_empty = has(command, "BINARY_EMPTY");
   int view_fault = has(command, "VIEW_FAULT");
   int q6_user = has(command, "Q6_USER_GROUPS");
   int q6_transaction = has(command, "Q6_TRANSACTION_MASTER");
-  if (full_matrix) {
+  if (!full_matrix && !format_matrix && !format_command && !binary_fault_query &&
+      !binary_empty && result_format != 0) {
+    protocol_ok = 0;
+    if (protocol_error == 0) protocol_error = 87;
+  }
+  if (format_matrix || format_command) {
+    if (parameter_types == NULL || parameter_types[0] != 23 || parameter_types[1] != 17) {
+      protocol_ok = 0;
+      if (protocol_error == 0) protocol_error = 98;
+    }
+    int expected = format_command ? 26 : format_matrix_direct_calls++;
+    int index = format_matrix_index(
+        expected, parameter_count, parameter_values, parameter_lengths,
+        parameter_formats, result_format);
+    if (index < 0) {
+      protocol_ok = 0;
+      if (protocol_error == 0) protocol_error = 98;
+    }
+  } else if (binary_empty) {
+    int expected_present = binary_empty_calls++ == 0;
+    if (parameter_count != 1 || parameter_types == NULL || parameter_values == NULL ||
+        parameter_lengths == NULL || parameter_formats == NULL || parameter_types[0] != 17 ||
+        parameter_lengths[0] != 0 || parameter_formats[0] != 1 || result_format != 0 ||
+        (expected_present ? parameter_values[0] == NULL : parameter_values[0] != NULL)) {
+      protocol_ok = 0;
+      if (protocol_error == 0) protocol_error = 100;
+    }
+  } else if (binary_fault_query) {
+    static const unsigned char expected_flag[] = {1};
+    if (parameter_count != 2 || parameter_types == NULL || parameter_values == NULL ||
+        parameter_lengths == NULL || parameter_formats == NULL || parameter_types[0] != 16 ||
+        parameter_types[1] != 25 || parameter_formats[0] != 1 || parameter_formats[1] != 1 ||
+        parameter_values[0] == NULL || parameter_lengths[0] != 1 ||
+        memcmp(parameter_values[0], expected_flag, 1) != 0 || parameter_values[1] == NULL ||
+        parameter_lengths[1] != 5 || memcmp(parameter_values[1], "valid", 5) != 0 ||
+        result_format != 1) {
+      protocol_ok = 0;
+      if (protocol_error == 0) protocol_error = 99;
+    }
+  } else if (full_matrix) {
     static const uint32_t expected_types[16] = {
         16, 16, 21, 21, 23, 23, 20, 20, 700, 700, 701, 701, 25, 25, 17, 17,
     };
@@ -509,7 +763,7 @@ FakeResult *PQexecParams(
           protocol_ok = 0;
           if (protocol_error == 0) protocol_error = 10 + i;
         }
-        if (parameter_formats[i] != 0) {
+        if (parameter_formats[i] != 0 && parameter_formats[i] != 1) {
           protocol_ok = 0;
           if (protocol_error == 0) protocol_error = 30 + i;
         }
@@ -518,9 +772,14 @@ FakeResult *PQexecParams(
             protocol_ok = 0;
             if (protocol_error == 0) protocol_error = 50 + i;
           }
-        } else if (parameter_lengths[i] != (int)strlen(parameter_values[i])) {
-          protocol_ok = 0;
-          if (protocol_error == 0) protocol_error = 70 + i;
+        } else {
+          int value_ok = parameter_formats[i] == 0
+              ? parameter_lengths[i] == (int)strlen(parameter_values[i])
+              : full_binary_value_ok(i, parameter_values[i], parameter_lengths[i]);
+          if (!value_ok) {
+            protocol_ok = 0;
+            if (protocol_error == 0) protocol_error = 70 + i;
+          }
         }
       }
     }
@@ -567,7 +826,42 @@ FakeResult *PQexecParams(
   if (has(command, "NULL_RESULT")) return NULL;
   FakeResult *result = new_result();
   if (result == NULL) return NULL;
-  if (q6_user) {
+  if (format_matrix) {
+    int index = format_matrix_direct_calls - 1;
+    free(result);
+    return format_matrix_result(index < 0 ? 0 : index, result_format);
+  } else if (binary_fault_query) {
+    static const unsigned char valid_flag[] = {1};
+    static const unsigned char invalid_flag[] = {2};
+    static const unsigned char invalid_utf8[] = {0xff};
+    result->fields = 2;
+    result->names[0] = "flag";
+    result->names[1] = "text";
+    result->oids[0] = 16;
+    result->oids[1] = 25;
+    result->formats[0] = 1;
+    result->formats[1] = 1;
+    result->values[0][0] = (const char *)valid_flag;
+    result->values[0][1] = "valid";
+    result->lengths[0][0] = 1;
+    result->lengths[0][1] = 5;
+    if (binary_fault == 1) result->formats[0] = 0;
+    if (binary_fault == 2) result->lengths[0][0] = 2;
+    if (binary_fault == 3) result->values[0][0] = (const char *)invalid_flag;
+    if (binary_fault == 4) {
+      result->values[0][1] = (const char *)invalid_utf8;
+      result->lengths[0][1] = 1;
+    }
+    if (binary_fault == 5) result->row_fault = 4;
+    if (binary_fault == 6) result->row_fault = 5;
+    if (binary_fault == 7) {
+      result->rows = 0;
+      result->formats[1] = 0;
+    }
+    if (binary_fault == 8) result->oids[1] = 17;
+    if (binary_fault == 9) result->names[1] = "other";
+    binary_fault = 0;
+  } else if (q6_user) {
     q6_user_result(
         result,
         parameter_values == NULL ? 0 : atoi(parameter_values[0]),
@@ -586,7 +880,9 @@ FakeResult *PQexecParams(
     for (int i = 0; i < 16; i++) {
       result->names[i] = names[i];
       result->oids[i] = oids[i];
+      result->formats[i] = result_format;
       result->values[0][i] = parameter_values[i] == NULL ? "" : parameter_values[i];
+      result->lengths[0][i] = parameter_values[i] == NULL ? 0 : parameter_lengths[i];
       result->nulls[0][i] = parameter_values[i] == NULL;
     }
   } else {
@@ -606,7 +902,7 @@ FakeResult *PQexecParams(
     if (has(command, "BYTES_NULL")) result->row_fault = 4;
     if (has(command, "BYTES_LENGTH")) result->row_fault = 5;
   }
-  if (has(command, "COMMAND_OK")) {
+  if (has(command, "COMMAND_OK") || format_command) {
     result->status = 1;
     result->rows = 0;
     result->fields = 0;
@@ -677,6 +973,16 @@ int PQsendQueryParams(
   async_cancel_resource_fail = has(command, "CANCEL_RESOURCE_FAIL");
   async_transaction_unknown = has(command, "TX_UNKNOWN");
   async_cancelled = 0;
+  async_connection = connection;
+  stream_fatal_after_rows = has(command, "STREAM_FATAL_AFTER_ONE") ? 1 :
+      (has(command, "STREAM_FATAL_AFTER_TWO") ? 2 : -1);
+  stream_post_terminal_status = has(command, "POST_TERMINAL_FATAL") ? 7 :
+      (has(command, "POST_TERMINAL_BAD") ? 5 : -1);
+  stream_missing_terminal = has(command, "MISSING_TERMINAL");
+  stream_initial_status = has(command, "STREAM_COPY") ? 3 :
+      (has(command, "STREAM_COMMAND") ? 1 :
+       (has(command, "STREAM_EMPTY") ? 0 : -1));
+  async_pause_after_results = has(command, "TIMEOUT_AFTER_ONE") ? 1 : 0;
   return async_result == NULL ? 0 : 1;
 }
 
@@ -705,7 +1011,83 @@ int PQsendQueryPrepared(
   async_cancel_resource_fail = 0;
   async_transaction_unknown = 0;
   async_cancelled = 0;
+  async_connection = connection;
+  stream_fatal_after_rows = -1;
+  stream_post_terminal_status = -1;
+  stream_missing_terminal = 0;
+  stream_initial_status = -1;
+  async_pause_after_results = 0;
   return async_result == NULL ? 0 : 1;
+}
+
+static int select_stream_mode(int status, int chunk_size) {
+  if (fail_next_row_mode) {
+    fail_next_row_mode = 0;
+    return 0;
+  }
+  FakeResult *source = async_result;
+  if (source == NULL) return 0;
+  async_result = NULL;
+  async_queue_count = 0;
+  async_queue_index = 0;
+  if (stream_initial_status >= 0 || source->status != 2) {
+    source->status = stream_initial_status >= 0 ? stream_initial_status : source->status;
+    return enqueue_async(source);
+  }
+
+  int delivered = 0;
+  int row_limit = source->rows;
+  if (stream_fatal_after_rows >= 0 && stream_fatal_after_rows < row_limit) {
+    row_limit = stream_fatal_after_rows;
+  }
+  while (delivered < row_limit) {
+    int rows = status == 9 ? 1 : chunk_size;
+    if (rows > row_limit - delivered) rows = row_limit - delivered;
+    if (!enqueue_async(copy_result_rows(source, delivered, rows, status))) {
+      free(source);
+      clear_async_results();
+      return 0;
+    }
+    delivered += rows;
+  }
+  if (stream_fatal_after_rows >= 0 && stream_fatal_after_rows <= source->rows) {
+    if (!enqueue_async(stream_error_result(7, "40001", "streamed late failure"))) {
+      free(source);
+      clear_async_results();
+      return 0;
+    }
+  } else if (!stream_missing_terminal) {
+    if (!enqueue_async(copy_result_rows(source, 0, 0, 2))) {
+      free(source);
+      clear_async_results();
+      return 0;
+    }
+  }
+  if (stream_post_terminal_status >= 0) {
+    if (!enqueue_async(stream_error_result(
+            stream_post_terminal_status, "XX000", "post-terminal failure"))) {
+      free(source);
+      clear_async_results();
+      return 0;
+    }
+  }
+  free(source);
+  return 1;
+}
+
+int PQsetSingleRowMode(FakeConn *connection) {
+  (void)connection;
+  note_forbidden_after_status();
+  single_row_mode_calls++;
+  return select_stream_mode(9, 1);
+}
+
+int PQsetChunkedRowsMode(FakeConn *connection, int chunk_size) {
+  (void)connection;
+  note_forbidden_after_status();
+  chunked_row_mode_calls++;
+  last_chunk_size = chunk_size;
+  return chunk_size > 0 ? select_stream_mode(12, chunk_size) : 0;
 }
 
 int PQsetnonblocking(FakeConn *connection, int enabled) {
@@ -752,6 +1134,17 @@ FakeResult *PQgetResult(FakeConn *connection) {
   (void)connection;
   note_forbidden_after_status();
   if (async_busy) return NULL;
+  if (async_queue_index < async_queue_count) {
+    FakeResult *queued = async_queue[async_queue_index++];
+    if (async_pause_after_results > 0 && async_queue_index == async_pause_after_results) {
+      async_busy = 1;
+    }
+    if (queued != NULL && queued->status == 7 && async_connection != NULL &&
+        async_connection->transaction_status == 2) {
+      async_connection->transaction_status = 3;
+    }
+    return queued;
+  }
   FakeResult *result = async_result;
   async_result = NULL;
   return result;
@@ -762,6 +1155,71 @@ int PQtransactionStatus(FakeConn *connection) {
   if (async_transaction_unknown) return 4;
   return connection == NULL ? 4 : connection->transaction_status;
 }
+
+static int perform_cancel(FakeConn *connection) {
+  cancel_calls++;
+  if (connection == NULL || async_cancel_fail) return 0;
+  async_cancelled = 1;
+  async_busy = async_drain_fail;
+  if (connection->transaction_status == 2) connection->transaction_status = 3;
+  if (async_result != NULL) {
+    async_result->status = 7;
+    async_result->sqlstate = "57014";
+    async_result->message = "cancelled by deadline";
+  } else if (async_queue_count > 0) {
+    FakeResult *last = async_queue[async_queue_count - 1];
+    if (last != NULL) {
+      last->status = 7;
+      last->sqlstate = "57014";
+      last->message = "cancelled by deadline";
+    }
+  }
+  return 1;
+}
+
+FakeCancel *PQcancelCreate(FakeConn *connection) {
+  note_forbidden_after_status();
+  if (async_cancel_resource_fail) return NULL;
+  FakeCancel *cancel = (FakeCancel *)calloc(1, sizeof(FakeCancel));
+  if (cancel != NULL) cancel->connection = connection;
+  return cancel;
+}
+
+int PQcancelStart(FakeCancel *cancel) {
+  note_forbidden_after_status();
+  if (cancel == NULL || !perform_cancel(cancel->connection)) return 0;
+  cancel->started = 1;
+  return 1;
+}
+
+int PQcancelPoll(FakeCancel *cancel) {
+  note_forbidden_after_status();
+  return cancel != NULL && cancel->started ? 3 : 0;
+}
+
+int PQcancelSocket(const FakeCancel *cancel) {
+  note_forbidden_after_status();
+  return cancel == NULL ? -1 : 42;
+}
+
+int64_t PQgetCurrentTimeUSec(void) {
+  struct timespec now;
+  if (clock_gettime(CLOCK_REALTIME, &now) != 0) return -1;
+  return (int64_t)now.tv_sec * 1000000 + now.tv_nsec / 1000;
+}
+
+int PQsocketPoll(int socket, int for_read, int for_write, int64_t end_time_us) {
+  note_forbidden_after_status();
+  cancel_socket_wait_calls++;
+  return socket < 0 || (for_read == 0 && for_write == 0) || end_time_us < 0 ? -1 : 1;
+}
+
+char *PQcancelErrorMessage(const FakeCancel *cancel) {
+  (void)cancel;
+  return "stub cancel failure";
+}
+
+void PQcancelFinish(FakeCancel *cancel) { free(cancel); }
 
 FakeCancel *PQgetCancel(FakeConn *connection) {
   note_forbidden_after_status();
@@ -775,16 +1233,7 @@ int PQcancel(FakeCancel *cancel, char *error_buffer, int error_buffer_size) {
   (void)error_buffer;
   (void)error_buffer_size;
   note_forbidden_after_status();
-  cancel_calls++;
-  if (cancel == NULL || async_cancel_fail) return 0;
-  async_cancelled = 1;
-  async_busy = async_drain_fail;
-  if (async_result != NULL) {
-    async_result->status = 7;
-    async_result->sqlstate = "57014";
-    async_result->message = "cancelled by deadline";
-  }
-  return 1;
+  return cancel == NULL ? 0 : perform_cancel(cancel->connection);
 }
 
 void PQfreeCancel(FakeCancel *cancel) { free(cancel); }
@@ -814,6 +1263,10 @@ char *PQfname(const FakeResult *result, int column) {
 uint32_t PQftype(const FakeResult *result, int column) {
   note_forbidden_after_status();
   return result == NULL || column < 0 || column >= result->fields ? 0 : result->oids[column];
+}
+int PQfformat(const FakeResult *result, int column) {
+  note_forbidden_after_status();
+  return result == NULL || column < 0 || column >= result->fields ? -1 : result->formats[column];
 }
 int PQgetisnull(const FakeResult *result, int row, int column) {
   note_forbidden_after_status();
@@ -845,7 +1298,10 @@ int PQgetlength(const FakeResult *result, int row, int column) {
     return -1;
   }
   char *value = PQgetvalue(result, row, column);
-  return value == NULL ? 0 : (int)strlen(value);
+  if (value == NULL) return 0;
+  return result->lengths[row][column] >= 0
+      ? result->lengths[row][column]
+      : (int)strlen(value);
 }
 char *PQcmdTuples(const FakeResult *result) {
   note_forbidden_after_status();

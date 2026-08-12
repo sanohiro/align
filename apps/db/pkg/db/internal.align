@@ -21,6 +21,7 @@ extern "C" link("pq") {
   fn PQnfields(result: raw) -> i32
   fn PQfname(result: raw, column: i32) -> raw
   fn PQftype(result: raw, column: i32) -> u32
+  fn PQfformat(result: raw, column: i32) -> i32
   fn PQgetisnull(result: raw, row: i32, column: i32) -> i32
   fn PQgetvalue(result: raw, row: i32, column: i32) -> raw
   fn PQgetlength(result: raw, row: i32, column: i32) -> i32
@@ -31,12 +32,22 @@ extern "C" link("pq") {
 // ELF link even when the Align program reaches only the common database path.
 extern "C" link("ssl") {}
 extern "C" link("crypto") {}
+extern "C" link("zstd") {}
+extern "C" link("z") {}
 
 extern "C" {
   fn align_rt_utf8_valid(pointer: raw, length: i64) -> i32
+  fn align_rt_f32_to_bits(value: f32) -> u32
+  fn align_rt_f32_from_bits(bits: u32) -> f32
+  fn align_rt_f64_to_bits(value: f64) -> u64
+  fn align_rt_f64_from_bits(bits: u64) -> f64
+  fn align_rt_f32_text_len(value: f32) -> i64
+  fn align_rt_f64_text_len(value: f64) -> i64
+  fn align_rt_f32_text_write(value: f32, output: raw, capacity: i64) -> i64
+  fn align_rt_f64_text_write(value: f64, output: raw, capacity: i64) -> i64
 }
 
-CONTEXT_VERSION: u32 := 2
+CONTEXT_VERSION: u32 := 4
 DRIVER_SQLITE: u8 := 1
 DRIVER_POSTGRES: u8 := 2
 FAILURE_NONE: u8 := 0
@@ -44,6 +55,9 @@ FAILURE_NATIVE: u8 := 1
 FAILURE_UNSUPPORTED: u8 := 2
 FAILURE_ROW: u8 := 3
 FAILURE_ENCODE: u8 := 4
+FAILURE_PARAMETER_REPRESENTATION: u8 := 5
+FAILURE_PARAMETER_NUL: u8 := 6
+FAILURE_PARAMETER_BUDGET: u8 := 7
 SQLITE_OK: i32 := 0
 SQLITE_INTEGER: i32 := 1
 SQLITE_FLOAT: i32 := 2
@@ -94,8 +108,37 @@ pub fn descriptor_header_control() -> DescriptorHeaderControl {
   return DescriptorHeaderControl { seal: true }
 }
 
-// The Q2 call-scoped execution context is package-owned raw storage:
-//   0: u32 version (= 1)
+// Authenticate the fixed descriptor fields needed to invoke the producer-owned count thunk. The
+// public header validators compare its result with offset 112 immediately afterward; keeping this
+// smaller guard separate avoids calling an untrusted thunk while forming that complete verdict.
+pub fn descriptor_count_shape_valid(data: raw, expected_kind: u8) -> bool {
+  unsafe {
+    if data.is_null() || expected_kind > 1 { return false }
+    version: u32 := raw.load(data, 0)
+    kind: u8 := raw.load(data, 4)
+    reserved: u16 := raw.load(data, 6)
+    parameter_count: u32 := raw.load(data, 112)
+    tail_reserved: u32 := raw.load(data, 116)
+    parameter_count_thunk: raw := raw.load(data, 136)
+    return version == 6 && kind == expected_kind && reserved == 0
+      && parameter_count <= 65535 && tail_reserved == 0 && !parameter_count_thunk.is_null()
+  }
+}
+
+// Resolver v2 uses its sign as a private static-type proof. Ordinary name lookup never exposes
+// that proof; only the sealed Binary-specific descriptor operations consume the negative form.
+pub fn parameter_ordinal_v2(resolved: i32) -> i32 {
+  if resolved == -2147483648 { return 0 }
+  return if resolved < 0 { -resolved } else { resolved }
+}
+
+pub fn binary_parameter_ordinal_v2(resolved: i32) -> i32 {
+  if resolved >= 0 || resolved == -2147483648 { return 0 }
+  return -resolved
+}
+
+// The package-owned call-scoped execution context is one exact 112-byte v4 record:
+//   0: u32 version (= 4)
 //   4: u8  driver (1 SQLite, 2 PostgreSQL)
 //   5: u8  first-failure class (0 none, 1 native, 2 unsupported, 3 row contract)
 //   6: u16 reserved (= 0)
@@ -116,6 +159,14 @@ pub fn descriptor_header_control() -> DescriptorHeaderControl {
 //  64: raw parameter format vector
 //  72: u32 parameter vector length
 //  76: u32 reserved
+//  80: u8 result format (0 Text, 1 PostgreSQL Binary)
+//  81: u8 result-generation metadata state (0 unvalidated, 1 validated)
+//  82: u16 reserved
+//  84: u32 reserved
+//  88: raw validated result-generation identity
+//  96: i64 remaining PostgreSQL Bind payload budget (-1 before measurement)
+// 104: u8 measurement state (0 unmeasured, 1 measuring, 2 measured)
+// 105: u8[7] reserved
 // The descriptor thunks treat this pointer as opaque. Only these callbacks and the driver package
 // that created it may inspect it; neither side retains the pointer after the synchronous call.
 
@@ -124,8 +175,92 @@ fn context_base_valid(context: raw, driver: u8) -> bool {
     if context.is_null() { return false }
     version: u32 := raw.load(context, 0)
     actual_driver: u8 := raw.load(context, 4)
+    failure: u8 := raw.load(context, 5)
     reserved: u16 := raw.load(context, 6)
-    return version == CONTEXT_VERSION && actual_driver == driver && reserved == 0
+    row_reserved: u32 := raw.load(context, 20)
+    cache: raw := raw.load(context, 24)
+    cache_count: u32 := raw.load(context, 32)
+    cache_reserved: u32 := raw.load(context, 36)
+    if version != CONTEXT_VERSION || actual_driver != driver || failure > FAILURE_PARAMETER_BUDGET
+      || reserved != 0 || row_reserved != 0 || cache_reserved != 0
+      || cache_count > 2147483647 {
+      return false
+    }
+    cache_empty := cache.is_null() && cache_count == 0
+    cache_full := !cache.is_null() && cache_count > 0
+    if !cache_empty && !cache_full { return false }
+    result_format: u8 := raw.load(context, 80)
+    metadata_state: u8 := raw.load(context, 81)
+    metadata_reserved: u16 := raw.load(context, 82)
+    metadata_reserved32: u32 := raw.load(context, 84)
+    metadata_native: raw := raw.load(context, 88)
+    metadata_native_bits: u64 := raw.load(context, 88)
+    budget: i64 := raw.load(context, 96)
+    measurement_state: u8 := raw.load(context, 104)
+    mut tail: i64 := 105
+    loop {
+      if tail >= 112 { break }
+      byte: u8 := raw.load(context, tail)
+      if byte != 0 { return false }
+      tail = tail + 1
+    }
+    if metadata_state > 1 || metadata_reserved != 0 || metadata_reserved32 != 0
+      || measurement_state > 2 {
+      return false
+    }
+    native: raw := raw.load(context, 8)
+    native_bits: u64 := raw.load(context, 8)
+    if metadata_state == 0 {
+      if !metadata_native.is_null() { return false }
+    } else {
+      if native.is_null() || metadata_native_bits != native_bits { return false }
+    }
+    if driver == DRIVER_SQLITE {
+      if failure > FAILURE_ENCODE { return false }
+      values: raw := raw.load(context, 40)
+      count: u32 := raw.load(context, 48)
+      slot52: u32 := raw.load(context, 52)
+      slot56: raw := raw.load(context, 56)
+      slot64: raw := raw.load(context, 64)
+      slot72: u32 := raw.load(context, 72)
+      slot76: u32 := raw.load(context, 76)
+      vector_empty := values.is_null() && count == 0
+      vector_full := !values.is_null() && count > 0 && count <= 2147483647
+      return (vector_empty || vector_full) && slot52 == 0
+        && result_format == 0 && slot56.is_null() && slot64.is_null()
+        && slot72 == 0 && slot76 == 0 && budget == -1 && measurement_state == 0
+    }
+    if driver != DRIVER_POSTGRES || result_format > 1 { return false }
+    values: raw := raw.load(context, 40)
+    types: raw := raw.load(context, 48)
+    lengths: raw := raw.load(context, 56)
+    formats: raw := raw.load(context, 64)
+    count: u32 := raw.load(context, 72)
+    vector_reserved: u32 := raw.load(context, 76)
+    if vector_reserved != 0 || count > 65535 { return false }
+    vector_empty := values.is_null() && types.is_null() && lengths.is_null() && formats.is_null()
+    vector_full := !values.is_null() && !types.is_null() && !lengths.is_null() && !formats.is_null()
+    if (count == 0 && !vector_empty) || (count > 0 && !vector_full) { return false }
+    return (measurement_state == 0 && budget == -1)
+      || ((measurement_state == 1 || measurement_state == 2) && budget >= 0)
+  }
+}
+
+pub fn context_valid_v4(context: raw, driver: u8) -> bool = context_base_valid(context, driver)
+
+// Install one new native result generation. Metadata proof is generation-local; reset it even
+// when libpq reuses the same pointer address for a later PGresult.
+pub fn set_native_generation_v1(context: raw, native: raw) -> bool {
+  unsafe {
+    if context.is_null() { return false }
+    driver: u8 := raw.load(context, 4)
+    if driver != DRIVER_SQLITE && driver != DRIVER_POSTGRES { return false }
+    if !context_base_valid(context, driver) { return false }
+    raw.store(context, 8, native)
+    raw.store(context, 16, 0 as u32)
+    raw.store(context, 81, 0 as u8)
+    raw.store(context, 88, raw.null())
+    return true
   }
 }
 
@@ -253,6 +388,20 @@ fn copy_slice_bytes(value: slice<u8>) -> raw {
       i = i + 1
     }
     raw.store(output, value.len(), 0 as u8)
+    return output
+  }
+}
+
+fn copy_binary_bytes(value: slice<u8>) -> raw {
+  unsafe {
+    output := raw.alloc(if value.len() == 0 { 1 } else { value.len() })
+    mut i := 0
+    loop {
+      if i >= value.len() { break }
+      raw.store(output, i, value[i])
+      i = i + 1
+    }
+    if value.len() == 0 { raw.store(output, 0, 0 as u8) }
     return output
   }
 }
@@ -424,19 +573,18 @@ fn bind_null_v2(context: raw, protocol_ordinal: u32) -> i32 {
       return 0
     }
     if context_ready(context, DRIVER_POSTGRES) {
-      if !ensure_postgres_slots(context, protocol_ordinal) {
-        record_failure(context, FAILURE_NATIVE)
+      format := postgres_selected_format(context, protocol_ordinal, 2)
+      if format < 0 {
+        record_failure(context, FAILURE_PARAMETER_REPRESENTATION)
         return 1
       }
       values: raw := raw.load(context, 40)
       lengths: raw := raw.load(context, 56)
-      formats: raw := raw.load(context, 64)
       offset := (protocol_ordinal as i64) - 1
       old: raw := raw.load(values, offset * 8)
       if !old.is_null() { raw.free(old) }
       raw.store(values, offset * 8, raw.null())
       raw.store(lengths, offset * 4, 0 as i32)
-      raw.store(formats, offset * 4, 0 as i32)
       return 0
     }
     return 1
@@ -450,21 +598,58 @@ fn bind_postgres_text_v2(
   length: i32,
 ) -> i32 {
   unsafe {
-    if !ensure_postgres_slots(context, protocol_ordinal) {
-      raw.free(value)
-      record_failure(context, FAILURE_NATIVE)
+    if value.is_null() || length < 0
+      || postgres_selected_format(context, protocol_ordinal, 2) != 0 {
+      if !value.is_null() { raw.free(value) }
+      record_failure(context, FAILURE_PARAMETER_REPRESENTATION)
       return 1
     }
     values: raw := raw.load(context, 40)
     lengths: raw := raw.load(context, 56)
-    formats: raw := raw.load(context, 64)
     offset := (protocol_ordinal as i64) - 1
     old: raw := raw.load(values, offset * 8)
     if !old.is_null() { raw.free(old) }
     raw.store(values, offset * 8, value)
     raw.store(lengths, offset * 4, length)
-    raw.store(formats, offset * 4, 0 as i32)
     return 0
+  }
+}
+
+fn bind_postgres_binary_v2(
+  context: raw,
+  protocol_ordinal: u32,
+  value: raw,
+  length: i32,
+) -> i32 {
+  unsafe {
+    if value.is_null() || length < 0
+      || postgres_selected_format(context, protocol_ordinal, 2) != 1 {
+      if !value.is_null() { raw.free(value) }
+      record_failure(context, FAILURE_PARAMETER_REPRESENTATION)
+      return 1
+    }
+    values: raw := raw.load(context, 40)
+    lengths: raw := raw.load(context, 56)
+    offset := (protocol_ordinal as i64) - 1
+    old: raw := raw.load(values, offset * 8)
+    if !old.is_null() { raw.free(old) }
+    raw.store(values, offset * 8, value)
+    raw.store(lengths, offset * 4, length)
+    return 0
+  }
+}
+
+fn binary_u64(value: u64, bytes: i64) -> raw {
+  unsafe {
+    output := raw.alloc(bytes)
+    mut i: i64 := 0
+    loop {
+      if i >= bytes { break }
+      shift := ((bytes - i - 1) * 8) as u64
+      raw.store(output, i, ((value >> shift) & 255) as u8)
+      i = i + 1
+    }
+    return output
   }
 }
 
@@ -484,6 +669,13 @@ fn bind_integer_v2(context: raw, protocol_ordinal: u32, value: i64) -> i32 {
       return 0
     }
     if context_ready(context, DRIVER_POSTGRES) {
+      format := postgres_selected_format(context, protocol_ordinal, 2)
+      if format == 1 {
+        // The concrete public callback supplies the required width below. This helper is used
+        // only by Text integer callbacks.
+        record_failure(context, FAILURE_PARAMETER_REPRESENTATION)
+        return 1
+      }
       text := postgres_i64_text(value)
       return bind_postgres_text_v2(
         context, protocol_ordinal, text, postgres_c_string_length(text),
@@ -495,10 +687,29 @@ fn bind_integer_v2(context: raw, protocol_ordinal: u32, value: i64) -> i32 {
 
 fn postgres_f64_text(value: f64) -> raw {
   unsafe {
-    mut output := builder()
-    output.write_float(value)
-    text := output.to_string()
-    return copy_str_bytes(text)
+    length := align_rt_f64_text_len(value)
+    if length < 0 { return raw.null() }
+    output := raw.alloc(length + 1)
+    if align_rt_f64_text_write(value, output, length) != length {
+      raw.free(output)
+      return raw.null()
+    }
+    raw.store(output, length, 0 as u8)
+    return output
+  }
+}
+
+fn postgres_f32_text(value: f32) -> raw {
+  unsafe {
+    length := align_rt_f32_text_len(value)
+    if length < 0 { return raw.null() }
+    output := raw.alloc(length + 1)
+    if align_rt_f32_text_write(value, output, length) != length {
+      raw.free(output)
+      return raw.null()
+    }
+    raw.store(output, length, 0 as u8)
+    return output
   }
 }
 
@@ -518,6 +729,11 @@ fn bind_float_v2(context: raw, protocol_ordinal: u32, value: f64) -> i32 {
       return 0
     }
     if context_ready(context, DRIVER_POSTGRES) {
+      format := postgres_selected_format(context, protocol_ordinal, 2)
+      if format == 1 {
+        record_failure(context, FAILURE_PARAMETER_REPRESENTATION)
+        return 1
+      }
       text := postgres_f64_text(value)
       return bind_postgres_text_v2(
         context, protocol_ordinal, text, postgres_c_string_length(text),
@@ -533,6 +749,12 @@ pub fn bind_bool_v2(context: raw, protocol_ordinal: u32, value: Option<bool>) ->
     Some(actual) => {
       unsafe {
         if context_ready(context, DRIVER_POSTGRES) {
+          format := postgres_selected_format(context, protocol_ordinal, 2)
+          if format == 1 {
+            payload := raw.alloc(1)
+            raw.store(payload, 0, if actual { 1 as u8 } else { 0 as u8 })
+            return bind_postgres_binary_v2(context, protocol_ordinal, payload, 1)
+          }
           text := copy_str_bytes(if actual { "t" } else { "f" })
           return bind_postgres_text_v2(context, protocol_ordinal, text, 1)
         }
@@ -545,49 +767,119 @@ pub fn bind_bool_v2(context: raw, protocol_ordinal: u32, value: Option<bool>) ->
 pub fn bind_i16_v2(context: raw, protocol_ordinal: u32, value: Option<i16>) -> i32 {
   return match value {
     None => bind_null_v2(context, protocol_ordinal)
-    Some(actual) => bind_integer_v2(context, protocol_ordinal, actual as i64)
+    Some(actual) => unsafe {
+      if context_ready(context, DRIVER_POSTGRES)
+        && postgres_selected_format(context, protocol_ordinal, 2) == 1 {
+        return bind_postgres_binary_v2(
+          context, protocol_ordinal, binary_u64(actual as u16 as u64, 2), 2,
+        )
+      }
+      bind_integer_v2(context, protocol_ordinal, actual as i64)
+    }
   }
 }
 
 pub fn bind_i32_v2(context: raw, protocol_ordinal: u32, value: Option<i32>) -> i32 {
   return match value {
     None => bind_null_v2(context, protocol_ordinal)
-    Some(actual) => bind_integer_v2(context, protocol_ordinal, actual as i64)
+    Some(actual) => unsafe {
+      if context_ready(context, DRIVER_POSTGRES)
+        && postgres_selected_format(context, protocol_ordinal, 2) == 1 {
+        return bind_postgres_binary_v2(
+          context, protocol_ordinal, binary_u64(actual as u32 as u64, 4), 4,
+        )
+      }
+      bind_integer_v2(context, protocol_ordinal, actual as i64)
+    }
   }
 }
 
 pub fn bind_i64_v2(context: raw, protocol_ordinal: u32, value: Option<i64>) -> i32 {
   return match value {
     None => bind_null_v2(context, protocol_ordinal)
-    Some(actual) => bind_integer_v2(context, protocol_ordinal, actual)
+    Some(actual) => unsafe {
+      if context_ready(context, DRIVER_POSTGRES)
+        && postgres_selected_format(context, protocol_ordinal, 2) == 1 {
+        return bind_postgres_binary_v2(
+          context, protocol_ordinal, binary_u64(actual as u64, 8), 8,
+        )
+      }
+      bind_integer_v2(context, protocol_ordinal, actual)
+    }
   }
 }
 
 pub fn bind_f32_v2(context: raw, protocol_ordinal: u32, value: Option<f32>) -> i32 {
   return match value {
     None => bind_null_v2(context, protocol_ordinal)
-    Some(actual) => bind_float_v2(context, protocol_ordinal, actual as f64)
+    Some(actual) => unsafe {
+      if context_ready(context, DRIVER_POSTGRES)
+        && postgres_selected_format(context, protocol_ordinal, 2) == 1 {
+        bits := align_rt_f32_to_bits(actual)
+        return bind_postgres_binary_v2(
+          context, protocol_ordinal, binary_u64(bits as u64, 4), 4,
+        )
+      }
+      if context_ready(context, DRIVER_POSTGRES) {
+        text := postgres_f32_text(actual)
+        return bind_postgres_text_v2(
+          context, protocol_ordinal, text, postgres_c_string_length(text),
+        )
+      }
+      bind_float_v2(context, protocol_ordinal, actual as f64)
+    }
   }
 }
 
 pub fn bind_f64_v2(context: raw, protocol_ordinal: u32, value: Option<f64>) -> i32 {
   return match value {
     None => bind_null_v2(context, protocol_ordinal)
-    Some(actual) => bind_float_v2(context, protocol_ordinal, actual)
+    Some(actual) => unsafe {
+      if context_ready(context, DRIVER_POSTGRES)
+        && postgres_selected_format(context, protocol_ordinal, 2) == 1 {
+        bits := align_rt_f64_to_bits(actual)
+        return bind_postgres_binary_v2(
+          context, protocol_ordinal, binary_u64(bits, 8), 8,
+        )
+      }
+      bind_float_v2(context, protocol_ordinal, actual)
+    }
   }
 }
 
 pub fn bind_text_v2(context: raw, protocol_ordinal: u32, value: Option<str>) -> i32 {
   return match value {
     None => bind_null_v2(context, protocol_ordinal)
-    Some(actual) => bind_text_v1(context, protocol_ordinal, actual)
+    Some(actual) => unsafe {
+      if context_ready(context, DRIVER_POSTGRES)
+        && postgres_selected_format(context, protocol_ordinal, 2) == 1 {
+        if postgres_text_has_nul(actual) {
+          record_failure(context, FAILURE_PARAMETER_NUL)
+          return 1
+        }
+        copied := copy_str_bytes(actual)
+        return bind_postgres_binary_v2(
+          context, protocol_ordinal, copied, actual.len() as i32,
+        )
+      }
+      bind_text_v1(context, protocol_ordinal, actual)
+    }
   }
 }
 
 pub fn bind_bytes_v2(context: raw, protocol_ordinal: u32, value: Option<slice<u8>>) -> i32 {
   return match value {
     None => bind_null_v2(context, protocol_ordinal)
-    Some(actual) => bind_bytes_v1(context, protocol_ordinal, actual)
+    Some(actual) => unsafe {
+      if context_ready(context, DRIVER_POSTGRES)
+        && postgres_selected_format(context, protocol_ordinal, 2) == 1 {
+        copied := copy_binary_bytes(actual)
+        return bind_postgres_binary_v2(
+          context, protocol_ordinal, copied, actual.len() as i32,
+        )
+      }
+      bind_bytes_v1(context, protocol_ordinal, actual)
+    }
   }
 }
 
@@ -643,26 +935,249 @@ pub fn ensure_postgres_parameters_v1(context: raw, required: u32) -> bool {
   return ensure_postgres_slots(context, required)
 }
 
-fn postgres_i64_text(value: i64) -> raw {
+// Form the execution-owned full parameter-format vector. Static validation may already have sized
+// the parallel PostgreSQL vectors; this operation initializes every format to Text and installs the
+// one libpq-wide result format before either binder pass.
+pub fn install_postgres_formats_v1(
+  context: raw,
+  count: u32,
+  result_format: u8,
+) -> bool {
   unsafe {
-    mut output := builder()
-    output.write_int(value)
-    text := output.to_string()
-    bytes := text.bytes()
-    result := raw.alloc(bytes.len() + 1)
-    mut i := 0
+    if result_format > 1 || count > 65535 || !context_base_valid(context, DRIVER_POSTGRES) {
+      return false
+    }
+    if count > 0 && !ensure_postgres_slots(context, count) { return false }
+    actual: u32 := raw.load(context, 72)
+    if actual != count { return false }
+    formats: raw := raw.load(context, 64)
+    mut i: u32 := 0
     loop {
-      if i >= bytes.len() { break }
-      raw.store(result, i, bytes[i])
+      if i >= count { break }
+      raw.store(formats, (i as i64) * 4, 0 as i32)
       i = i + 1
     }
-    terminal: u8 := 0
-    raw.store(result, bytes.len(), terminal)
+    raw.store(context, 80, result_format)
+    return context_base_valid(context, DRIVER_POSTGRES)
+  }
+}
+
+pub fn set_postgres_parameter_format_v1(
+  context: raw,
+  protocol_ordinal: u32,
+  format: u8,
+) -> bool {
+  unsafe {
+    if !context_base_valid(context, DRIVER_POSTGRES) || format > 1 || protocol_ordinal == 0 {
+      return false
+    }
+    count: u32 := raw.load(context, 72)
+    if protocol_ordinal > count { return false }
+    formats: raw := raw.load(context, 64)
+    raw.store(formats, ((protocol_ordinal as i64) - 1) * 4, format as i32)
+    return true
+  }
+}
+
+pub fn begin_postgres_measure_v1(context: raw, budget: i64) -> bool {
+  unsafe {
+    if budget < 0 || !context_base_valid(context, DRIVER_POSTGRES) { return false }
+    state: u8 := raw.load(context, 104)
+    current: i64 := raw.load(context, 96)
+    if state != 0 || current != -1 { return false }
+    raw.store(context, 96, budget)
+    raw.store(context, 104, 1 as u8)
+    return context_base_valid(context, DRIVER_POSTGRES)
+  }
+}
+
+pub fn finish_postgres_measure_v1(context: raw) -> bool {
+  unsafe {
+    if !context_base_valid(context, DRIVER_POSTGRES) { return false }
+    state: u8 := raw.load(context, 104)
+    if state != 1 { return false }
+    raw.store(context, 104, 2 as u8)
+    return context_base_valid(context, DRIVER_POSTGRES)
+  }
+}
+
+fn postgres_selected_format(context: raw, protocol_ordinal: u32, state: u8) -> i32 {
+  unsafe {
+    if !context_base_valid(context, DRIVER_POSTGRES) || protocol_ordinal == 0 { return -1 }
+    actual_state: u8 := raw.load(context, 104)
+    count: u32 := raw.load(context, 72)
+    if actual_state != state || protocol_ordinal > count { return -1 }
+    formats: raw := raw.load(context, 64)
+    format: i32 := raw.load(formats, ((protocol_ordinal as i64) - 1) * 4)
+    if format != 0 && format != 1 { return -1 }
+    return format
+  }
+}
+
+fn debit_postgres_budget(context: raw, length: i64) -> i32 {
+  unsafe {
+    if length < 0 {
+      record_failure(context, FAILURE_PARAMETER_BUDGET)
+      return 1
+    }
+    budget: i64 := raw.load(context, 96)
+    if budget < length {
+      record_failure(context, FAILURE_PARAMETER_BUDGET)
+      return 1
+    }
+    raw.store(context, 96, budget - length)
+    return 0
+  }
+}
+
+fn decimal_i64_length(value: i64) -> i64 {
+  mut remaining := value
+  mut length: i64 := if value < 0 { 1 } else { 0 }
+  loop {
+    length = length + 1
+    remaining = remaining / 10
+    if remaining == 0 { break }
+  }
+  return length
+}
+
+fn measure_null_v1(context: raw, protocol_ordinal: u32) -> i32 {
+  if postgres_selected_format(context, protocol_ordinal, 1) < 0 {
+    record_failure(context, FAILURE_PARAMETER_REPRESENTATION)
+    return 1
+  }
+  return debit_postgres_budget(context, 0)
+}
+
+pub fn measure_bool_v1(context: raw, protocol_ordinal: u32, value: Option<bool>) -> i32 {
+  return match value {
+    None => measure_null_v1(context, protocol_ordinal)
+    Some(_) => {
+      format := postgres_selected_format(context, protocol_ordinal, 1)
+      if format < 0 { record_failure(context, FAILURE_PARAMETER_REPRESENTATION); return 1 }
+      debit_postgres_budget(context, 1)
+    }
+  }
+}
+
+pub fn measure_i16_v1(context: raw, protocol_ordinal: u32, value: Option<i16>) -> i32 {
+  return match value {
+    None => measure_null_v1(context, protocol_ordinal)
+    Some(actual) => {
+      format := postgres_selected_format(context, protocol_ordinal, 1)
+      if format < 0 { record_failure(context, FAILURE_PARAMETER_REPRESENTATION); return 1 }
+      debit_postgres_budget(context, if format == 1 { 2 } else {
+        decimal_i64_length(actual as i64)
+      })
+    }
+  }
+}
+
+pub fn measure_i32_v1(context: raw, protocol_ordinal: u32, value: Option<i32>) -> i32 {
+  return match value {
+    None => measure_null_v1(context, protocol_ordinal)
+    Some(actual) => {
+      format := postgres_selected_format(context, protocol_ordinal, 1)
+      if format < 0 { record_failure(context, FAILURE_PARAMETER_REPRESENTATION); return 1 }
+      debit_postgres_budget(context, if format == 1 { 4 } else {
+        decimal_i64_length(actual as i64)
+      })
+    }
+  }
+}
+
+pub fn measure_i64_v1(context: raw, protocol_ordinal: u32, value: Option<i64>) -> i32 {
+  return match value {
+    None => measure_null_v1(context, protocol_ordinal)
+    Some(actual) => {
+      format := postgres_selected_format(context, protocol_ordinal, 1)
+      if format < 0 { record_failure(context, FAILURE_PARAMETER_REPRESENTATION); return 1 }
+      debit_postgres_budget(context, if format == 1 { 8 } else {
+        decimal_i64_length(actual)
+      })
+    }
+  }
+}
+
+pub fn measure_f32_v1(context: raw, protocol_ordinal: u32, value: Option<f32>) -> i32 {
+  return match value {
+    None => measure_null_v1(context, protocol_ordinal)
+    Some(actual) => {
+      format := postgres_selected_format(context, protocol_ordinal, 1)
+      if format < 0 { record_failure(context, FAILURE_PARAMETER_REPRESENTATION); return 1 }
+      debit_postgres_budget(context, if format == 1 { 4 } else {
+        unsafe { align_rt_f32_text_len(actual) }
+      })
+    }
+  }
+}
+
+pub fn measure_f64_v1(context: raw, protocol_ordinal: u32, value: Option<f64>) -> i32 {
+  return match value {
+    None => measure_null_v1(context, protocol_ordinal)
+    Some(actual) => {
+      format := postgres_selected_format(context, protocol_ordinal, 1)
+      if format < 0 { record_failure(context, FAILURE_PARAMETER_REPRESENTATION); return 1 }
+      debit_postgres_budget(context, if format == 1 { 8 } else {
+        unsafe { align_rt_f64_text_len(actual) }
+      })
+    }
+  }
+}
+
+pub fn measure_text_v1(context: raw, protocol_ordinal: u32, value: Option<str>) -> i32 {
+  return match value {
+    None => measure_null_v1(context, protocol_ordinal)
+    Some(actual) => {
+      format := postgres_selected_format(context, protocol_ordinal, 1)
+      if format < 0 { record_failure(context, FAILURE_PARAMETER_REPRESENTATION); return 1 }
+      if postgres_text_has_nul(actual) {
+        record_failure(context, FAILURE_PARAMETER_NUL)
+        return 1
+      }
+      debit_postgres_budget(context, actual.len())
+    }
+  }
+}
+
+pub fn measure_bytes_v1(context: raw, protocol_ordinal: u32, value: Option<slice<u8>>) -> i32 {
+  return match value {
+    None => measure_null_v1(context, protocol_ordinal)
+    Some(actual) => {
+      format := postgres_selected_format(context, protocol_ordinal, 1)
+      if format < 0 { record_failure(context, FAILURE_PARAMETER_REPRESENTATION); return 1 }
+      if format == 1 { return debit_postgres_budget(context, actual.len()) }
+      if actual.len() > 4611686018427387902 {
+        record_failure(context, FAILURE_PARAMETER_BUDGET)
+        return 1
+      }
+      debit_postgres_budget(context, actual.len() * 2 + 2)
+    }
+  }
+}
+
+fn postgres_i64_text(value: i64) -> raw {
+  unsafe {
+    length := decimal_i64_length(value)
+    result := raw.alloc(length + 1)
+    raw.store(result, length, 0 as u8)
+    mut remaining := value
+    mut index := length
+    loop {
+      quotient := remaining / 10
+      remainder := remaining - quotient * 10
+      digit := if remainder < 0 { -remainder } else { remainder }
+      index = index - 1
+      raw.store(result, index, (48 + digit) as u8)
+      remaining = quotient
+      if remaining == 0 { break }
+    }
+    if value < 0 { raw.store(result, 0, 45 as u8) }
     return result
   }
 }
 
-fn postgres_c_string_length(pointer: raw) -> i32 {
+pub fn postgres_c_string_length(pointer: raw) -> i32 {
   unsafe {
     mut length: i32 := 0
     loop {
@@ -894,7 +1409,7 @@ fn row_cache_entry(context: raw, ordinal: u32) -> raw {
   }
 }
 
-pub fn release_row_cache_v2(context: raw) {
+fn reset_row_cache_v2(context: raw) {
   unsafe {
     if context.is_null() { return }
     cache: raw := raw.load(context, 24)
@@ -909,8 +1424,24 @@ pub fn release_row_cache_v2(context: raw) {
           pointer: raw := raw.load(entry, 0)
           if !pointer.is_null() { raw.free(pointer) }
         }
+        raw.store(entry, 0, 0 as i64)
+        raw.store(entry, 8, 0 as i64)
+        raw.store(entry, 16, 0 as u8)
+        raw.store(entry, 17, 0 as u8)
+        raw.store(entry, 18, 0 as u16)
+        raw.store(entry, 20, 0 as u32)
         ordinal = ordinal + 1
       }
+    }
+  }
+}
+
+pub fn release_row_cache_v2(context: raw) {
+  unsafe {
+    if context.is_null() { return }
+    reset_row_cache_v2(context)
+    cache: raw := raw.load(context, 24)
+    if !cache.is_null() {
       raw.free(cache)
     }
     raw.store(context, 24, raw.null())
@@ -934,15 +1465,21 @@ pub fn validate_row_count_v2(context: raw, expected: u32) -> i32 {
       record_failure(context, FAILURE_ROW)
       return 1
     }
-    release_row_cache_v2(context)
-    if expected == 0 {
-      raw.store(context, 24, raw.null())
+    cache: raw := raw.load(context, 24)
+    cached_count: u32 := raw.load(context, 32)
+    reusable := cached_count == expected
+      && ((expected == 0 && cache.is_null()) || (expected > 0 && !cache.is_null()))
+    if reusable {
+      reset_row_cache_v2(context)
     } else {
-      cache := raw.alloc((expected as i64) * ROW_CACHE_STRIDE)
+      release_row_cache_v2(context)
+    }
+    if expected > 0 && !reusable {
+      new_cache := raw.alloc((expected as i64) * ROW_CACHE_STRIDE)
       mut ordinal: u32 := 0
       loop {
         if ordinal >= expected { break }
-        entry := raw.offset(cache, (ordinal as i64) * ROW_CACHE_STRIDE)
+        entry := raw.offset(new_cache, (ordinal as i64) * ROW_CACHE_STRIDE)
         raw.store(entry, 0, 0 as i64)
         raw.store(entry, 8, 0 as i64)
         raw.store(entry, 16, 0 as u8)
@@ -951,7 +1488,7 @@ pub fn validate_row_count_v2(context: raw, expected: u32) -> i32 {
         raw.store(entry, 20, 0 as u32)
         ordinal = ordinal + 1
       }
-      raw.store(context, 24, cache)
+      raw.store(context, 24, new_cache)
     }
     raw.store(context, 32, expected)
     return 0
@@ -1105,6 +1642,143 @@ fn postgres_text_oid(oid: u32) -> bool {
   return oid == POSTGRES_TEXT_OID || oid == POSTGRES_VARCHAR_OID || oid == POSTGRES_NAME_OID
 }
 
+fn expected_postgres_oid(kind: u8, oid: u32) -> bool {
+  if kind == VALUE_BOOL { return oid == POSTGRES_BOOL_OID }
+  if kind == VALUE_I16 { return oid == POSTGRES_INT2_OID }
+  if kind == VALUE_I32 { return oid == POSTGRES_INT4_OID }
+  if kind == VALUE_I64 { return oid == POSTGRES_INT8_OID }
+  if kind == VALUE_F32 { return oid == POSTGRES_FLOAT4_OID }
+  if kind == VALUE_F64 { return oid == POSTGRES_FLOAT8_OID }
+  if kind == VALUE_TEXT { return postgres_text_oid(oid) }
+  if kind == VALUE_BYTES { return oid == POSTGRES_BYTEA_OID }
+  return false
+}
+
+pub fn validate_row_count_v3(context: raw, expected: u32) -> i32 {
+  unsafe {
+    if context.is_null() { return 1 }
+    driver: u8 := raw.load(context, 4)
+    if !context_base_valid(context, driver) { return 1 }
+    metadata_state: u8 := raw.load(context, 81)
+    metadata_native: raw := raw.load(context, 88)
+    if metadata_state != 0 || !metadata_native.is_null() {
+      record_failure(context, FAILURE_ROW)
+      return 1
+    }
+    status := validate_row_count_v2(context, expected)
+    if status != 0 { return status }
+    raw.store(context, 81, 0 as u8)
+    raw.store(context, 88, raw.null())
+    if expected == 0 {
+      native: raw := raw.load(context, 8)
+      raw.store(context, 81, 1 as u8)
+      raw.store(context, 88, native)
+    }
+    return 0
+  }
+}
+
+pub fn validate_field_metadata_v3(
+  context: raw,
+  ordinal: u32,
+  expected_name: str,
+  kind: u8,
+) -> i32 {
+  unsafe {
+    if context.is_null() || kind > VALUE_BYTES { return 1 }
+    driver: u8 := raw.load(context, 4)
+    if !context_ready(context, driver) { return 1 }
+    metadata_state: u8 := raw.load(context, 81)
+    count: u32 := raw.load(context, 32)
+    if metadata_state != 0 || ordinal >= count || ordinal > 2147483647 {
+      record_failure(context, FAILURE_ROW)
+      return 1
+    }
+    native: raw := raw.load(context, 8)
+    index := ordinal as i32
+    name := if driver == DRIVER_SQLITE {
+      sqlite3_column_name(native, index)
+    } else {
+      if driver != DRIVER_POSTGRES {
+        record_failure(context, FAILURE_ROW)
+        return 1
+      }
+      PQfname(native, index)
+    }
+    if !native_name_matches(name, expected_name) {
+      record_failure(context, FAILURE_ROW)
+      return 1
+    }
+    if driver == DRIVER_POSTGRES {
+      oid := PQftype(native, index)
+      format := PQfformat(native, index)
+      expected_format: u8 := raw.load(context, 80)
+      if !expected_postgres_oid(kind, oid) || format != (expected_format as i32) {
+        record_failure(context, FAILURE_ROW)
+        return 1
+      }
+    }
+    if ordinal + 1 == count {
+      raw.store(context, 81, 1 as u8)
+      raw.store(context, 88, native)
+    }
+    return 0
+  }
+}
+
+pub fn validate_field_value_v3(
+  context: raw,
+  ordinal: u32,
+  kind: u8,
+  nullable: bool,
+) -> i32 {
+  unsafe {
+    if context.is_null() { return 1 }
+    driver: u8 := raw.load(context, 4)
+    if !context_base_valid(context, driver) { return 1 }
+    metadata_state: u8 := raw.load(context, 81)
+    metadata_native_bits: u64 := raw.load(context, 88)
+    native_bits: u64 := raw.load(context, 8)
+    if metadata_state != 1 || metadata_native_bits != native_bits {
+      record_failure(context, FAILURE_ROW)
+      return 1
+    }
+    count: u32 := raw.load(context, 32)
+    cache: raw := raw.load(context, 24)
+    if ordinal >= count || cache.is_null() {
+      record_failure(context, FAILURE_ROW)
+      return 1
+    }
+    entry := raw.offset(cache, (ordinal as i64) * ROW_CACHE_STRIDE)
+    owned: u8 := raw.load(entry, 17)
+    if owned != 0 {
+      pointer: raw := raw.load(entry, 0)
+      if !pointer.is_null() { raw.free(pointer) }
+    }
+    raw.store(entry, 0, 0 as i64)
+    raw.store(entry, 8, 0 as i64)
+    raw.store(entry, 16, 0 as u8)
+    raw.store(entry, 17, 0 as u8)
+    raw.store(entry, 18, 0 as u16)
+    raw.store(entry, 20, 0 as u32)
+    return validate_field_v2(context, ordinal, "", kind, nullable)
+  }
+}
+
+fn read_binary_u64(pointer: raw, length: i32) -> u64 {
+  unsafe {
+    mut value: u64 := 0
+    mut i: i32 := 0
+    loop {
+      if i >= length { break }
+      byte: u8 := raw.load(pointer, i as i64)
+      value = (value << 8) | (byte as u64)
+      i = i + 1
+    }
+    return value
+  }
+}
+
 pub fn validate_field_v2(
   context: raw,
   ordinal: u32,
@@ -1127,7 +1801,7 @@ pub fn validate_field_v2(
     entry := raw.offset(cache, (ordinal as i64) * ROW_CACHE_STRIDE)
     if driver == DRIVER_SQLITE {
       name := sqlite3_column_name(native, index)
-      if !native_name_matches(name, expected_name) {
+      if expected_name.len() > 0 && !native_name_matches(name, expected_name) {
         record_failure(context, FAILURE_ROW)
         return 1
       }
@@ -1217,7 +1891,7 @@ pub fn validate_field_v2(
     }
     row: u32 := raw.load(context, 16)
     name := PQfname(native, index)
-    if !native_name_matches(name, expected_name) {
+    if expected_name.len() > 0 && !native_name_matches(name, expected_name) {
       record_failure(context, FAILURE_ROW)
       return 1
     }
@@ -1237,12 +1911,20 @@ pub fn validate_field_v2(
       record_failure(context, FAILURE_ROW)
       return 1
     }
+    result_format: u8 := raw.load(context, 80)
     if kind == VALUE_BOOL {
       if oid != POSTGRES_BOOL_OID {
         record_failure(context, FAILURE_ROW)
         return 1
       }
-      parsed := parse_postgres_bool(pointer, length)
+      parsed: Option<bool> := if result_format == 1 {
+        if length != 1 { None } else {
+          byte: u8 := raw.load(pointer, 0)
+          if byte == 0 { Some(false) } else {
+            if byte == 1 { Some(true) } else { None }
+          }
+        }
+      } else { parse_postgres_bool(pointer, length) }
       match parsed {
         None => { record_failure(context, FAILURE_ROW); return 1 }
         Some(value) => { raw.store(entry, 0, value); return 0 }
@@ -1256,7 +1938,17 @@ pub fn validate_field_v2(
         record_failure(context, FAILURE_ROW)
         return 1
       }
-      parsed := parse_postgres_i64(pointer, length)
+      required_width := if kind == VALUE_I16 { 2 } else { if kind == VALUE_I32 { 4 } else { 8 } }
+      parsed: Option<i64> := if result_format == 1 {
+        if length != required_width { None } else {
+          bits := read_binary_u64(pointer, length)
+          if kind == VALUE_I16 { Some((bits as u16 as i16) as i64) } else {
+            if kind == VALUE_I32 { Some((bits as u32 as i32) as i64) } else {
+              Some(bits as i64)
+            }
+          }
+        }
+      } else { parse_postgres_i64(pointer, length) }
       match parsed {
         None => { record_failure(context, FAILURE_ROW); return 1 }
         Some(integer) => {
@@ -1281,7 +1973,17 @@ pub fn validate_field_v2(
         record_failure(context, FAILURE_ROW)
         return 1
       }
-      parsed := parse_postgres_f64(pointer, length)
+      if result_format == 1 {
+        if kind == VALUE_F32 {
+          if length != 4 { record_failure(context, FAILURE_ROW); return 1 }
+          raw.store(entry, 0, align_rt_f32_from_bits(read_binary_u64(pointer, length) as u32))
+          return 0
+        }
+        if length != 8 { record_failure(context, FAILURE_ROW); return 1 }
+        raw.store(entry, 0, align_rt_f64_from_bits(read_binary_u64(pointer, length)))
+        return 0
+      }
+      parsed: Option<f64> := parse_postgres_f64(pointer, length)
       match parsed {
         None => { record_failure(context, FAILURE_ROW); return 1 }
         Some(floating) => {
@@ -1305,14 +2007,20 @@ pub fn validate_field_v2(
         record_failure(context, FAILURE_ROW)
         return 1
       }
-      decoded := decode_postgres_bytea(pointer, length)
-      if decoded.is_null() {
-        record_failure(context, FAILURE_ROW)
-        return 1
+      if result_format == 1 {
+        raw.store(entry, 0, pointer)
+        raw.store(entry, 8, length as i64)
+        raw.store(entry, 17, 0 as u8)
+      } else {
+        decoded := decode_postgres_bytea(pointer, length)
+        if decoded.is_null() {
+          record_failure(context, FAILURE_ROW)
+          return 1
+        }
+        raw.store(entry, 0, decoded)
+        raw.store(entry, 8, ((length - 2) / 2) as i64)
+        raw.store(entry, 17, 1 as u8)
       }
-      raw.store(entry, 0, decoded)
-      raw.store(entry, 8, ((length - 2) / 2) as i64)
-      raw.store(entry, 17, 1 as u8)
       return 0
     }
     record_failure(context, FAILURE_ROW)

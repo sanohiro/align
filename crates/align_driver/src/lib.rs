@@ -301,10 +301,21 @@ fn install_static_descriptor_data(
         callback("bind_text_v2")?,
         callback("bind_bytes_v2")?,
     ];
+    let measure_callbacks = [
+        callback("measure_bool_v1")?,
+        callback("measure_i16_v1")?,
+        callback("measure_i32_v1")?,
+        callback("measure_i64_v1")?,
+        callback("measure_f32_v1")?,
+        callback("measure_f64_v1")?,
+        callback("measure_text_v1")?,
+        callback("measure_bytes_v1")?,
+    ];
     let sqlite_version_callback = callback("require_sqlite_version_v1")?;
     let postgres_type_callback = callback("set_postgres_type_v2")?;
-    let row_count_callback = callback("validate_row_count_v2")?;
-    let validate_field_callback = callback("validate_field_v2")?;
+    let row_count_callback = callback("validate_row_count_v3")?;
+    let validate_field_metadata_callback = callback("validate_field_metadata_v3")?;
+    let validate_field_value_callback = callback("validate_field_value_v3")?;
     let read_callbacks = [
         callback("read_bool_v2")?,
         callback("read_i16_v2")?,
@@ -376,6 +387,25 @@ fn install_static_descriptor_data(
             i32_ty,
         );
     }
+    for (kind, callback) in [
+        GeneratedValueKind::Bool,
+        GeneratedValueKind::I16,
+        GeneratedValueKind::I32,
+        GeneratedValueKind::I64,
+        GeneratedValueKind::F32,
+        GeneratedValueKind::F64,
+        GeneratedValueKind::Text,
+        GeneratedValueKind::Bytes,
+    ]
+    .into_iter()
+    .zip(measure_callbacks.iter().cloned())
+    {
+        ensure_import(
+            callback,
+            vec![Ty::Raw, u32_ty, option_ty(value_ty(kind))?],
+            i32_ty,
+        );
+    }
     ensure_import(
         sqlite_version_callback.clone(),
         vec![Ty::Raw, u32_ty, u32_ty, u32_ty],
@@ -388,8 +418,13 @@ fn install_static_descriptor_data(
     );
     ensure_import(row_count_callback.clone(), vec![Ty::Raw, u32_ty], i32_ty);
     ensure_import(
-        validate_field_callback.clone(),
-        vec![Ty::Raw, u32_ty, Ty::Str, u8_ty, Ty::Bool],
+        validate_field_metadata_callback.clone(),
+        vec![Ty::Raw, u32_ty, Ty::Str, u8_ty],
+        i32_ty,
+    );
+    ensure_import(
+        validate_field_value_callback.clone(),
+        vec![Ty::Raw, u32_ty, u8_ty, Ty::Bool],
         i32_ty,
     );
     for (kind, callback) in [
@@ -556,12 +591,13 @@ fn install_static_descriptor_data(
             &[]
         };
 
-        let binder_name = program_call(&format!("{symbol}$static_bind_v1"))?;
+        let binder_name = program_call(&format!("{symbol}$static_bind_v2"))?;
         let static_name = program_call(&format!("{symbol}$static_validate_v1"))?;
-        let row_name = program_call(&format!("{symbol}$row_validate_v1"))?;
+        let row_name = program_call(&format!("{symbol}$row_validate_v2"))?;
         let decode_name = program_call(&format!("{symbol}$decode_v1"))?;
         let stream_decode_name = program_call(&format!("{symbol}$stream_decode_v1"))?;
         let parameter_ordinal_name = program_call(&format!("{symbol}$parameter_ordinal_v1"))?;
+        let parameter_count_name = program_call(&format!("{symbol}$parameter_count_v1"))?;
         let query_meta_name = if descriptor.consumer == StaticDescriptorConsumer::Query {
             let (name, function) =
                 query_meta_codegen::generate_query_meta_thunk(mir, &symbol, artifact)?;
@@ -572,16 +608,52 @@ fn install_static_descriptor_data(
         };
 
         let mut binder_blocks = Vec::new();
-        let mut binder_value_tys = Vec::new();
+        let mut binder_value_tys = vec![Ty::Bool, Ty::Bool];
+        let field_count = emitted_binder_fields.len() as u32;
+        let measure_start = 2;
+        let measure_success = measure_start + field_count;
+        let measure_fail_start = measure_success + 1;
+        let encode_start = measure_fail_start + field_count;
+        let encode_success = encode_start + field_count;
+        let encode_fail_start = encode_success + 1;
+        let invalid_mode = encode_fail_start + field_count;
+        binder_blocks.push(Block {
+            id: 0,
+            stmts: vec![Stmt::Let(
+                0,
+                Rvalue::Bin(
+                    BinOp::Eq,
+                    Operand::Arg(2),
+                    Operand::Const(Const::Int(0, u8_ty)),
+                ),
+            )],
+            stmt_lines: Vec::new(),
+            term: Term::Branch(Operand::Value(0), measure_start, 1),
+        });
+        binder_blocks.push(Block {
+            id: 1,
+            stmts: vec![Stmt::Let(
+                1,
+                Rvalue::Bin(
+                    BinOp::Eq,
+                    Operand::Arg(2),
+                    Operand::Const(Const::Int(1, u8_ty)),
+                ),
+            )],
+            stmt_lines: Vec::new(),
+            term: Term::Branch(Operand::Value(1), encode_start, invalid_mode),
+        });
         for (index, field) in emitted_binder_fields.iter().enumerate() {
-            let field_value = (index * 5) as u32;
+            let field_value = binder_value_tys.len() as u32;
             let normalized_value = field_value + 1;
             let option_value = field_value + 2;
             let status_value = field_value + 3;
             let success_value = field_value + 4;
-            let next = (index + 1) as u32;
-            let fail = (emitted_binder_fields.len() + index + 1) as u32;
-            let source_ty = params_field_tys[field.params_field_ordinal as usize];
+            let next = measure_start + index as u32 + 1;
+            let fail = measure_fail_start + index as u32;
+            let source_ty = *params_field_tys
+                .get(field.params_field_ordinal as usize)
+                .ok_or_else(|| "generated binder field ordinal is out of range".to_string())?;
             let base_ty = value_ty(field.shape.kind);
             let normalized_ty = if field.shape.nullable {
                 option_ty(base_ty)?
@@ -589,10 +661,13 @@ fn install_static_descriptor_data(
                 base_ty
             };
             let option_value_ty = option_ty(base_ty)?;
-            let bind_callback = bind_callbacks[value_tag(field.shape.kind) as usize].clone();
+            let measure_callback = measure_callbacks
+                .get(value_tag(field.shape.kind) as usize)
+                .ok_or_else(|| "generated binder value kind is out of range".to_string())?
+                .clone();
             binder_value_tys.extend([source_ty, normalized_ty, option_value_ty, i32_ty, Ty::Bool]);
             binder_blocks.push(Block {
-                id: index as u32,
+                id: measure_start + index as u32,
                 stmts: vec![
                     Stmt::Let(
                         field_value,
@@ -610,7 +685,7 @@ fn install_static_descriptor_data(
                     Stmt::Let(
                         status_value,
                         Rvalue::Call(
-                            DirectCall::Program(bind_callback.clone()),
+                            DirectCall::Program(measure_callback),
                             vec![
                                 Operand::Arg(0),
                                 Operand::Const(Const::Int(
@@ -634,9 +709,8 @@ fn install_static_descriptor_data(
                 term: Term::Branch(Operand::Value(success_value), next, fail),
             });
         }
-        let binder_success = emitted_binder_fields.len() as u32;
         binder_blocks.push(Block {
-            id: binder_success,
+            id: measure_success,
             stmts: Vec::new(),
             stmt_lines: Vec::new(),
             term: Term::Return(Some(Operand::Const(Const::Int(
@@ -646,25 +720,135 @@ fn install_static_descriptor_data(
         });
         for (index, _) in emitted_binder_fields.iter().enumerate() {
             binder_blocks.push(Block {
-                id: (emitted_binder_fields.len() + index + 1) as u32,
+                id: measure_fail_start + index as u32,
                 stmts: Vec::new(),
                 stmt_lines: Vec::new(),
                 term: Term::Return(Some(Operand::Const(Const::Int(1, i32_ty)))),
             });
         }
+        for (index, field) in emitted_binder_fields.iter().enumerate() {
+            let field_value = binder_value_tys.len() as u32;
+            let normalized_value = field_value + 1;
+            let option_value = field_value + 2;
+            let status_value = field_value + 3;
+            let success_value = field_value + 4;
+            let next = encode_start + index as u32 + 1;
+            let fail = encode_fail_start + index as u32;
+            let source_ty = *params_field_tys
+                .get(field.params_field_ordinal as usize)
+                .ok_or_else(|| "generated binder field ordinal is out of range".to_string())?;
+            let base_ty = value_ty(field.shape.kind);
+            let normalized_ty = if field.shape.nullable {
+                option_ty(base_ty)?
+            } else {
+                base_ty
+            };
+            let option_value_ty = option_ty(base_ty)?;
+            let bind_callback = bind_callbacks[value_tag(field.shape.kind) as usize].clone();
+            binder_value_tys.extend([source_ty, normalized_ty, option_value_ty, i32_ty, Ty::Bool]);
+            binder_blocks.push(Block {
+                id: encode_start + index as u32,
+                stmts: vec![
+                    Stmt::Let(
+                        field_value,
+                        Rvalue::Field(1, vec![field.params_field_ordinal]),
+                    ),
+                    Stmt::Let(normalized_value, Rvalue::Use(Operand::Value(field_value))),
+                    Stmt::Let(
+                        option_value,
+                        if field.shape.nullable {
+                            Rvalue::Use(Operand::Value(normalized_value))
+                        } else {
+                            Rvalue::OptionSome(Operand::Value(normalized_value))
+                        },
+                    ),
+                    Stmt::Let(
+                        status_value,
+                        Rvalue::Call(
+                            DirectCall::Program(bind_callback),
+                            vec![
+                                Operand::Arg(0),
+                                Operand::Const(Const::Int(
+                                    i128::from(field.protocol_ordinal),
+                                    u32_ty,
+                                )),
+                                Operand::Value(option_value),
+                            ],
+                        ),
+                    ),
+                    Stmt::Let(
+                        success_value,
+                        Rvalue::Bin(
+                            BinOp::Eq,
+                            Operand::Value(status_value),
+                            Operand::Const(Const::Int(0, i32_ty)),
+                        ),
+                    ),
+                ],
+                stmt_lines: Vec::new(),
+                term: Term::Branch(Operand::Value(success_value), next, fail),
+            });
+        }
+        binder_blocks.push(Block {
+            id: encode_success,
+            stmts: Vec::new(),
+            stmt_lines: Vec::new(),
+            term: Term::Return(Some(Operand::Const(Const::Int(
+                if binder_supported { 0 } else { -1 },
+                i32_ty,
+            )))),
+        });
+        for (index, _) in emitted_binder_fields.iter().enumerate() {
+            binder_blocks.push(Block {
+                id: encode_fail_start + index as u32,
+                stmts: Vec::new(),
+                stmt_lines: Vec::new(),
+                term: Term::Return(Some(Operand::Const(Const::Int(1, i32_ty)))),
+            });
+        }
+        binder_blocks.push(Block {
+            id: invalid_mode,
+            stmts: Vec::new(),
+            stmt_lines: Vec::new(),
+            term: Term::Return(Some(Operand::Const(Const::Int(-1, i32_ty)))),
+        });
         generated_functions.push(Function {
             name: binder_name.clone(),
-            params: vec![0, 1],
-            param_modes: vec![ParamMode::ByValue, ParamMode::Borrow],
-            borrow_mut_cleanup_slots: vec![None, None],
+            params: vec![0, 1, 2],
+            param_modes: vec![ParamMode::ByValue, ParamMode::Borrow, ParamMode::ByValue],
+            borrow_mut_cleanup_slots: vec![None, None, None],
             ret: i32_ty,
             return_borrow: none_borrow.clone(),
             return_region: none_region.clone(),
             return_cleanup: no_cleanup,
-            slots: vec![Ty::Raw, descriptor.params_ty],
-            slot_align: vec![None, None],
+            slots: vec![Ty::Raw, descriptor.params_ty, u8_ty],
+            slot_align: vec![None, None, None],
             value_tys: binder_value_tys,
             blocks: binder_blocks,
+            entry: 0,
+            exportable: false,
+        });
+        generated_functions.push(Function {
+            name: parameter_count_name.clone(),
+            params: Vec::new(),
+            param_modes: Vec::new(),
+            borrow_mut_cleanup_slots: Vec::new(),
+            ret: u32_ty,
+            return_borrow: none_borrow.clone(),
+            return_region: none_region.clone(),
+            return_cleanup: no_cleanup,
+            slots: Vec::new(),
+            slot_align: Vec::new(),
+            value_tys: Vec::new(),
+            blocks: vec![Block {
+                id: 0,
+                stmts: Vec::new(),
+                stmt_lines: Vec::new(),
+                term: Term::Return(Some(Operand::Const(Const::Int(
+                    first_binder.len() as i128,
+                    u32_ty,
+                )))),
+            }],
             entry: 0,
             exportable: false,
         });
@@ -722,8 +906,29 @@ fn install_static_descriptor_data(
             term: Term::Return(Some(Operand::Const(Const::Int(0, i32_ty)))),
         });
         for (index, field) in first_binder.iter().enumerate() {
-            let ordinal = i32::try_from(field.protocol_ordinal)
+            let mut ordinal = i32::try_from(field.protocol_ordinal)
                 .map_err(|_| "generated parameter ordinal exceeds i32::MAX".to_string())?;
+            let field_name = parameter_fields
+                .get(field.params_field_ordinal as usize)
+                .ok_or_else(|| "generated binder field ordinal is out of range".to_string())?
+                .name
+                .as_str();
+            let binary_eligible = descriptor.static_options.iter().any(|option| {
+                matches!(
+                    option,
+                    StaticDescriptorOption::PostgreSQLParameterType {
+                        parameter_name,
+                        canonical_type_name,
+                    } if parameter_name == field_name
+                        && postgres_parameter_type_matches(
+                            field.shape.kind,
+                            canonical_type_name,
+                        )
+                )
+            });
+            if binary_eligible {
+                ordinal = -ordinal;
+            }
             ordinal_blocks.push(Block {
                 id: miss_block + 1 + index as u32,
                 stmts: Vec::new(),
@@ -900,8 +1105,8 @@ fn install_static_descriptor_data(
             exportable: false,
         });
 
-        let mut header = vec![0u8; 136];
-        header[0..4].copy_from_slice(&5u32.to_le_bytes());
+        let mut header = vec![0u8; 144];
+        header[0..4].copy_from_slice(&6u32.to_le_bytes());
         header[4] = match descriptor.consumer {
             StaticDescriptorConsumer::Query => 0,
             StaticDescriptorConsumer::Command => 1,
@@ -961,6 +1166,10 @@ fn install_static_descriptor_data(
                 offset: 104,
                 target: StaticDataTarget::Function(parameter_ordinal_name),
             },
+            StaticDataRelocation {
+                offset: 136,
+                target: StaticDataTarget::Function(parameter_count_name),
+            },
         ];
         if let Some(sql) = sqlite_sql {
             relocations.push(StaticDataRelocation {
@@ -984,9 +1193,9 @@ fn install_static_descriptor_data(
             let GeneratedStaticRuntime::Query(runtime) = &artifact.runtime else {
                 return Err("query descriptor has command runtime data".to_string());
             };
-            let mut validation_calls = Vec::new();
+            let mut metadata_calls = Vec::new();
             if row_supported {
-                validation_calls.push((
+                metadata_calls.push((
                     row_count_callback.clone(),
                     vec![
                         Operand::Arg(0),
@@ -1004,22 +1213,60 @@ fn install_static_descriptor_data(
                     .ok_or_else(|| "generated row metadata ordinal is out of range".to_string())?
                     .source_alias
                     .clone();
-                validation_calls.push((
-                    validate_field_callback.clone(),
+                metadata_calls.push((
+                    validate_field_metadata_callback.clone(),
                     vec![
                         Operand::Arg(0),
                         Operand::Const(Const::Int(i128::from(field.row_field_ordinal), u32_ty)),
                         Operand::Value(0),
                         Operand::Const(Const::Int(value_tag(field.shape.kind), u8_ty)),
-                        Operand::Const(Const::Bool(field.shape.nullable)),
                     ],
                     Some(expected_name),
                 ));
             }
             let mut blocks = Vec::new();
-            let mut values = Vec::new();
-            for (index, (target, mut args, name)) in validation_calls.into_iter().enumerate() {
-                let base = (index * 3) as u32;
+            let mut values = vec![Ty::Bool, Ty::Bool];
+            let metadata_count = metadata_calls.len() as u32;
+            let value_count = if row_supported {
+                runtime.decoder.fields.len() as u32
+            } else {
+                0
+            };
+            let metadata_start = 2;
+            let metadata_success = metadata_start + metadata_count;
+            let metadata_fail_start = metadata_success + 1;
+            let value_start = metadata_fail_start + metadata_count;
+            let value_success = value_start + value_count;
+            let value_fail_start = value_success + 1;
+            let invalid_mode = value_fail_start + value_count;
+            blocks.push(Block {
+                id: 0,
+                stmts: vec![Stmt::Let(
+                    0,
+                    Rvalue::Bin(
+                        BinOp::Eq,
+                        Operand::Arg(1),
+                        Operand::Const(Const::Int(0, u8_ty)),
+                    ),
+                )],
+                stmt_lines: Vec::new(),
+                term: Term::Branch(Operand::Value(0), metadata_start, 1),
+            });
+            blocks.push(Block {
+                id: 1,
+                stmts: vec![Stmt::Let(
+                    1,
+                    Rvalue::Bin(
+                        BinOp::Eq,
+                        Operand::Arg(1),
+                        Operand::Const(Const::Int(1, u8_ty)),
+                    ),
+                )],
+                stmt_lines: Vec::new(),
+                term: Term::Branch(Operand::Value(1), value_start, invalid_mode),
+            });
+            for (index, (target, mut args, name)) in metadata_calls.into_iter().enumerate() {
+                let base = values.len() as u32;
                 let mut stmts = Vec::new();
                 if let Some(name) = name {
                     stmts.push(Stmt::Let(base, Rvalue::StrLit(name)));
@@ -1045,19 +1292,18 @@ fn install_static_descriptor_data(
                 ));
                 values.extend([i32_ty, Ty::Bool]);
                 blocks.push(Block {
-                    id: index as u32,
+                    id: metadata_start + index as u32,
                     stmts,
                     stmt_lines: Vec::new(),
                     term: Term::Branch(
                         Operand::Value(base + 2),
-                        (index + 1) as u32,
-                        (runtime.decoder.fields.len() + 2 + index) as u32,
+                        metadata_start + index as u32 + 1,
+                        metadata_fail_start + index as u32,
                     ),
                 });
             }
-            let success = blocks.len();
             blocks.push(Block {
-                id: success as u32,
+                id: metadata_success,
                 stmts: Vec::new(),
                 stmt_lines: Vec::new(),
                 term: Term::Return(Some(Operand::Const(Const::Int(
@@ -1065,25 +1311,96 @@ fn install_static_descriptor_data(
                     i32_ty,
                 )))),
             });
-            for index in 0..success {
+            for index in 0..metadata_count {
                 blocks.push(Block {
-                    id: (success + index + 1) as u32,
+                    id: metadata_fail_start + index,
                     stmts: Vec::new(),
                     stmt_lines: Vec::new(),
                     term: Term::Return(Some(Operand::Const(Const::Int(1, i32_ty)))),
                 });
             }
+            for (index, field) in runtime
+                .decoder
+                .fields
+                .iter()
+                .filter(|_| row_supported)
+                .enumerate()
+            {
+                let status = values.len() as u32;
+                let success = status + 1;
+                values.extend([i32_ty, Ty::Bool]);
+                blocks.push(Block {
+                    id: value_start + index as u32,
+                    stmts: vec![
+                        Stmt::Let(
+                            status,
+                            Rvalue::Call(
+                                DirectCall::Program(validate_field_value_callback.clone()),
+                                vec![
+                                    Operand::Arg(0),
+                                    Operand::Const(Const::Int(
+                                        i128::from(field.row_field_ordinal),
+                                        u32_ty,
+                                    )),
+                                    Operand::Const(Const::Int(
+                                        value_tag(field.shape.kind),
+                                        u8_ty,
+                                    )),
+                                    Operand::Const(Const::Bool(field.shape.nullable)),
+                                ],
+                            ),
+                        ),
+                        Stmt::Let(
+                            success,
+                            Rvalue::Bin(
+                                BinOp::Eq,
+                                Operand::Value(status),
+                                Operand::Const(Const::Int(0, i32_ty)),
+                            ),
+                        ),
+                    ],
+                    stmt_lines: Vec::new(),
+                    term: Term::Branch(
+                        Operand::Value(success),
+                        value_start + index as u32 + 1,
+                        value_fail_start + index as u32,
+                    ),
+                });
+            }
+            blocks.push(Block {
+                id: value_success,
+                stmts: Vec::new(),
+                stmt_lines: Vec::new(),
+                term: Term::Return(Some(Operand::Const(Const::Int(
+                    if row_supported { 0 } else { -1 },
+                    i32_ty,
+                )))),
+            });
+            for index in 0..value_count {
+                blocks.push(Block {
+                    id: value_fail_start + index,
+                    stmts: Vec::new(),
+                    stmt_lines: Vec::new(),
+                    term: Term::Return(Some(Operand::Const(Const::Int(1, i32_ty)))),
+                });
+            }
+            blocks.push(Block {
+                id: invalid_mode,
+                stmts: Vec::new(),
+                stmt_lines: Vec::new(),
+                term: Term::Return(Some(Operand::Const(Const::Int(-1, i32_ty)))),
+            });
             generated_functions.push(Function {
                 name: row_name.clone(),
-                params: vec![0],
-                param_modes: vec![ParamMode::ByValue],
-                borrow_mut_cleanup_slots: vec![None],
+                params: vec![0, 1],
+                param_modes: vec![ParamMode::ByValue, ParamMode::ByValue],
+                borrow_mut_cleanup_slots: vec![None, None],
                 ret: i32_ty,
                 return_borrow: none_borrow.clone(),
                 return_region: none_region.clone(),
                 return_cleanup: no_cleanup,
-                slots: vec![Ty::Raw],
-                slot_align: vec![None],
+                slots: vec![Ty::Raw, u8_ty],
+                slot_align: vec![None, None],
                 value_tys: values,
                 blocks,
                 entry: 0,

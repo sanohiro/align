@@ -1643,9 +1643,10 @@ postgres.ExecuteOption.Delivery(SingleRow|PortalBatch(max_rows))
 in its public semantic contract and artifact. `ParameterOid` applies only to preparation.
 `ParameterFormat` names a Params field; `ResultFormat` applies to the complete result in libpq v1.
 Unknown fields/types/OIDs, duplicate field controls, and conflicting formats are errors, not ignored
-hints. The first implementation may support only `Text`; requesting an unavailable binary mapping
-returns `Unsupported` before sending SQL. Text-format `bytea` uses the exact hex encoding from
-§5.6.1; Binary-format `bytea` alone passes raw bytes with an explicit libpq length.
+hints. The D1--D12 implementation supported only `Text` and returned `Unsupported` for Binary
+before send; the D13 binary-format ledger in §23 supersedes that temporary unavailable
+disposition with its exact proof and mapping table. Text-format `bytea` uses the exact hex encoding
+from §5.6.1; Binary-format `bytea` alone passes raw bytes with an explicit libpq length.
 
 `Delivery` is a row-producing execution option. Its exact operation set, default, size bound,
 streaming/error semantics, and ABI are fixed by the A1 PostgreSQL delivery ledger in §23. It does
@@ -4101,9 +4102,9 @@ lease, native wait, and cleanup matrix in two dormant producer/consumer seams.
 | descriptor and generic ABI | Bump the fixed 8-aligned execution descriptor from 120-byte v3 to 128-byte v4 while leaving offsets 0–119 unchanged. Query offset 120 is one non-null producer-owned streaming decoder thunk that receives the exact dependent `resource_ref<rows<R>>` current generation and returns `R` with recursive borrow provenance rooted only in that owner; command offset 120 is null. One shared query/command header validator owns the complete v4 field check; common and native entry points reach it only through an application-unconstructible `pkg.db.internal.DescriptorHeaderControl`. Keep malformed descriptor/header/function-signature HIR fail-closed and retain each generated binder/validator/materializing decoder/streaming decoder plus the selected native driver under whole-program and per-unit compilation. | `pkg_db_q4b::public_streaming_surface_is_exact`, `direct_rows_and_next_typecheck_whole_and_per_unit`, `streamed_views_cannot_cross_generation_or_escape`, and Q4a's shared-validator/delegation/sealed-bypass owner; sema/MIR malformed-HIR owners; exact 128-byte/offset/signature goldens |
 | direct and prepared stream formation | Validate descriptor, common options, native options, restriction, live target/statement, and lease in the settled order before send. Copy or retain every Params field through native transmission before returning rows; partial bind failure drops every installed/package-owned copy exactly once. `rows` and `rows_stmt` construct one dependent rows resource only after native success and never materialize the result. | `pkg_db_q4b::owned_text_and_bytes_params_bind_before_their_sources_drop`, `sqlite_direct_stream_retains_binds_and_releases_each_native_phase_once`, and both driver lifecycle owners across conn/tx and direct/prepared paths |
 | complete bind/type matrix | Generate direct ordinal binders for non-null and `Option` bool, all signed integer widths, `f32`/`f64`, UTF-8 text, and bytes. SQLite uses exact INTEGER/REAL/TEXT/BLOB/NULL mapping with transient text/blob copies. PostgreSQL accepts only the settled OID/type and Text/Binary format combinations, uses exact lowercase `\\x` bytea Text encoding, raw bytea Binary payloads, and rejects embedded NUL in C-string Text parameters before send. | `pkg_db_q4b::complete_sqlite_parameter_and_row_matrix_is_exact` and `complete_postgres_parameter_and_row_matrix_is_exact`, including bounds, nullability, embedded zero/high byte, source mutation/Drop, copied-byte, and no-per-row-parameter-copy paths |
-| complete row validation and decode | Before decoder invocation, validate exact column count, declared UTF-8 name bytes in order, NULL disposition, and the exact driver-native representation for every first-release type. Decode by ordinal through generated typed callbacks without reflection, boxing, maps, artifact/source I/O, or post-validation fallible conversion. Multi-invalid rows report the first declared ordinal; each native malformed pointer/length/UTF-8 value fails before a safe view exists. | both complete driver matrix owners, `pkg_db_q4b::malformed_native_view_values_fail_before_safe_view_formation`, cumulative Q2 name/type/count/null twins, generated MIR inspection, and callback version/context misuse negatives |
+| complete row validation and decode | Before decoder invocation, validate exact column count, declared UTF-8 name bytes in order, exact driver-native type metadata, NULL disposition, and the value representation for every first-release type. Decode by ordinal through generated typed callbacks without reflection, boxing, maps, artifact/source I/O, or post-validation fallible conversion. Multi-invalid rows report the first declared ordinal; each native malformed pointer/length/UTF-8 value fails before a safe view exists. D13's binary-format ledger supersedes this ordering with one result-generation metadata phase over count and every declared name/OID/format before zero-row/cardinality handling, followed by one value phase over each delivered row's NULL disposition and representation. | both complete driver matrix owners, `pkg_db_q4b::malformed_native_view_values_fail_before_safe_view_formation`, cumulative Q2 name/type/count/null twins, generated MIR inspection, callback version/context misuse negatives, and the D13 metadata-before-value winner owner |
 | row generation and view safety | `next(borrow mut rows)` ends the previous generation before native advancement, advances once, validates the current row, and returns `None` only at clean exhaustion. Scalar fields are copied. `str` and `slice<u8>` fields are created only with `resource.view_from_raw` against the fresh rows generation; `clone_in` is the visible retention path. No view can be stored, returned, joined across branch/loop generations, or used after the next mutable borrow. | `pkg_db_q4b::streamed_views_cannot_cross_generation_or_escape`, both complete driver matrix owners, and the malformed-native-view owner, plus cumulative statement/connection parent-move cases |
-| `one` cardinality compatibility | Common and driver-qualified `one` reuse stream formation without changing the settled Q2 winner order: validate and decode only row zero, clone it into `out`, then use one driver-private non-decoding probe for a second row. A malformed first row beats multiplicity; a valid first row plus any second row returns Cardinality without validating or decoding that second row. Exhaustion and multiplicity both close through the same stream cleanup path. | `pkg_db_q2::sqlite_native_command_and_one_execute_generated_i64_thunks`, `postgres_native_command_and_one_own_buffered_results`, and both common-surface dispatch owners |
+| `one` cardinality compatibility | Common and driver-qualified `one` reuse stream formation. Validate and decode only row zero and clone it into `out`; a malformed first row beats multiplicity. D13 supersedes the older second-row winner: the driver-private probe validates each newly acquired result generation's metadata before determining whether it contains a second row. Malformed second-generation count/name/OID/format therefore returns Decode before Cardinality; valid metadata plus any second row returns Cardinality without running Value mode or decoding that row. Exhaustion and multiplicity both close through the same stream cleanup path. | `pkg_db_q2::sqlite_native_command_and_one_execute_generated_i64_thunks`, `postgres_native_command_and_one_own_buffered_results`, both common-surface dispatch owners, and the D13 second-generation malformed-metadata versus valid-metadata Cardinality twin |
 | SQLite streaming lifecycle | Keep the execution lease from stream formation through exhaustion, error, or Drop. Each successful `next` exposes only SQLite's current row; exhaustion/error/Drop finalizes an owned direct statement or resets then clears a borrowed prepared statement, then restores an applied native busy timeout, frees bind state, and releases the lease. Ordinary/timeout streams reject overlap in both directions, and a failed second attempt neither restores nor mutates the first stream's saved global state. Cleanup failure poisons/closes before dependency release. | `pkg_db_q4b::sqlite_stream_lifecycle_and_overlap_are_exact` with step/finalize/reset/clear/busy-state/lease/close counters and success, decode error, native error, early Drop, and failed-second-attempt paths |
 | PostgreSQL buffered streaming lifecycle | Use the settled synchronous `BufferedFull` result as the v1 baseline, retain it in rows, decode exactly one ordinal row per `next`, clear it on exhaustion/error/Drop, and free all parameter transport after synchronous send completion. No hidden buffering beyond the one libpq result and no portal/single-row mode exists. | `pkg_db_q4b::postgres_buffered_stream_lifecycle_is_exact` with delivery/PQclear/allocation counters, clean exhaustion, malformed row, early Drop, conn/tx and prepared/direct reuse |
 | common deadline disposition | Audit every existing common TimeoutNs/BeginTimeoutNs scope for positive value, duplicate/source-order conflict, driver capability, state, and native-option precedence. SQLite returns pre-send `Unsupported` for a requested common operation deadline; BusyTimeoutNs remains a lock-wait control active for the stream lifetime and is never reported as a common deadline. No requested option is silently ignored. | parameterized `pkg_db_q4b::deadline_disposition_and_precedence_are_exact` over connect/execute/one/rows/prepare/begin/metadata/EXPLAIN and both common/driver-qualified entry points |
@@ -4438,6 +4439,10 @@ MIR, and code generation; no abstract SoA reaches emitted HIR/MIR. A non-`SoaPla
 `batch_row`; `batch_soa` is rejected at the call during generic instantiation and never performs a
 runtime downgrade.
 
+The statement-v2 and rows-v2 ABI entries in this first-batch ledger describe its landing
+boundary. The cumulative current records are the statement-v3 and rows-v3 layouts fixed by the
+later PostgreSQL delivery ledger in §23.
+
 | Public record | Exact contract |
 |---|---|
 | input and defaults | `next_batch` consumes no new Query, Params, options, region, or ambient configuration. `max_rows` has no default and must be in `1..=2_147_483_647`. It advances only the supplied live `rows<R>` generation and sends no additional SQL. The first rail shipped SQLite `Step` and PostgreSQL `BufferedFull`; the later PostgreSQL delivery ledger below adds `SingleRow` and `PortalBatch` without changing this common call. |
@@ -4512,6 +4517,13 @@ ABI, and the streamed protocol below. The fourth adds `rows_stmt_native` plus ex
 parameter-name authority and reuses that
 protocol without forking it. The prerequisite splits close independently useful shipped safety
 gaps without hiding either repair inside the streamed state-machine PR.
+The direct boundary is intentionally above the approximate 1,000-line checkpoint: splitting its
+rows-v3 formation, result-sequence consumer, and cleanup authority would leave a dormant
+producer/consumer chain and duplicate ownership and fail-closed proof, increasing integration risk.
+Prepared parity may also cross that checkpoint because statement-v3 formation, its guarded compiler
+bridges, and the conn/tx delivery owners are one safety closure. Splitting them would either publish a
+dormant resolver ABI or leave a callable delivery path without the malformed-HIR and retained-resolver
+proof that makes it sound.
 
 The exact cumulative application-callable surface after the direct and prepared rails is below;
 the staged boundary immediately after the declaration block fixes which PR publishes each part.
@@ -4563,7 +4575,7 @@ PostgreSQL server 16.4 as the compatibility floor. libpq's stable ABI major rema
 | parameter ownership and allocation | The generated binder still performs one execution-owned Text copy per parameter according to §5.6.1. The context retains all parameter pointer/length/format arrays and every copied payload from send through terminal `PQgetResult == null`, fail-closed connection close, mode-selection failure cleanup, timeout cleanup, or early Drop. Original text/blob source owners may be moved, mutated, or dropped after the rows constructor returns. Direct execution owns one copied Query ID: a constructor failure frees it if already allocated, while a published terminal rows wrapper retains and later frees it on rows Drop. Prepared execution always borrows the statement-owned Query ID; no prepared success or failure frees it. The delivery rail allocates no per-row container and no hidden whole-result buffer. Its steady live set is at most the binder context, current PGresult, libpq transport storage, direct Query-ID copy, and an explicit common batch; cancellation additionally owns one temporary `PGcancelConn`. `one_native` adds only the public `clone_in(out)` allocation described above: zero clones for zero/invalid-first-row, exactly one clone for a valid first row, and no later package allocation proportional to the remaining result. Success and post-clone failure/Cardinality have the same `out` allocation count and byte/alignment pattern for that first Row. |
 | validation and error precedence | Direct Query execution uses the settled §13.4 phases: validate the complete descriptor header and plan-shape agreement before reading Query identity; validate common options in source order, native options in source order, and the driver restriction; validate the exact live exec/connection state; allocate one context; invoke the generated static-option/field-shape validator; acquire the execution lease; bind values; check deadline representability; execute; and select the explicit mode. A static-validation failure frees the context without acquiring the lease or calling libpq; an overlap failure also frees that context. Prepared execution separately validates the complete statement v3 header, Query identity, batch plan, parameter resolver, common options, native options, driver/live state, and then acquires the lease before context allocation, bind, deadline, send, and selection. Its native-option validator calls only the compiler-private `pkg.db.internal.descriptor.prepared_parameter_ordinal(statement_ref, name) -> i32` bridge; the bridge accepts exactly a concrete `resource_ref<db.stmt<P,R>>` plus `str`, loads offset 80 only under a synthesized `pkg.db.internal.resource.stmt_header_valid(wrapper)` control-dependent guard, invokes the retained `fn(name: str) -> i32`, and returns zero for an unknown name. Application source, the wrong resource/type, an unguarded load/call, or malformed HIR is rejected. A nonpositive result is the existing unknown-name error before lease or allocation. At each `Delivery` source position, command rejection runs first because a command cannot use any Delivery payload. For a Query, validate the current variant payload before duplicate detection and registration, exactly as §13.4 requires; `SingleRow` has no payload and every `PortalBatch` validates its size even when its tag is a duplicate. A duplicate between valid values returns query-specific `Unsupported`, item `postgres.execute.delivery`, message `duplicate PostgreSQL row delivery option`; an invalid PortalBatch size uses the same item and message `PostgreSQL portal batch size must be between 1 and 2147483647 rows`. Thus both `[SingleRow, PortalBatch(0)]` and `[PortalBatch(0), SingleRow]` report size, while `[SingleRow, PortalBatch(1)]` reports duplicate. `execute_native` rejects its first `Delivery`, including `PortalBatch(0)`, with the same item and message `PostgreSQL row delivery requires a Query result`; Query-specific payload validation does not run for a command. All occur before lease, execution-context allocation, bind, or send. Existing earlier Text-format and common-option errors retain their exact category and precedence. |
 | post-send invariant failures | Send failure retains the existing connection error. If libpq rejects the immediately selected mode, cancel/drain using the cleanup rule below and return query-specific `InvalidQuery`, item `postgres.rows.delivery`, message `PostgreSQL client rejected the selected row delivery mode`. An invalid result sequence uses the same category/item and message `PostgreSQL streamed result sequence is invalid`. A COPY, pipeline, or unknown numeric status uses that error only if no earlier primary exists and always takes the immediate close branch above; an observing connection is never reusable. Every ordinary known-status connection is reusable only if drain, transaction-state synchronization, and blocking-mode restoration all succeed; otherwise it is poisoned/closed before return. |
-| deadline, cancellation, error drain, and Drop | One requested common `TimeoutNs` becomes one overflow-checked monotonic absolute deadline before explicit-mode send. After enabling nonblocking mode and immediately before send, read the monotonic clock again. If the deadline has expired, send and mode selection remain at zero; restore blocking mode and return the existing `Timeout`, or poison/close if restoration fails. This pre-send expiry path creates no cancel handle. Both the deadline and original positive duration otherwise remain attached until clean protocol completion. Caller think time, `one_native` pending-cardinality drain, and validation/decode/storage error drain all count. Later expiry returns the existing `Timeout` when no earlier error exists, after nonblocking native cancel and drain. A non-timeout server cancellation remains `Cancelled`. After a validation, decode, or batch-storage error with protocol results pending, destroy any unpublished package-owned value, make any cloned `one_native` Row unreachable under the monotonic-`out` rule, retain the first error as primary, and drain without decoding under the original absolute deadline. With no deadline or time remaining, continue normal drain. Clean completion commits a connection-target DML `RETURNING` and leaves a transaction target `PQTRANS_INTRANS` with effects retained. A later server fatal remains secondary to the first row/storage error but rolls back the connection-target statement at `PQTRANS_IDLE` or leaves the explicit transaction `PQTRANS_INERROR` with rollback required. If the original deadline expires during drain, issue cancellation with D9's `max(original_duration, 1_000_000 ns)` recovery budget but still return the earlier validation/decode/storage error. The cancel race may leave connection-target effects committed or rolled back at `PQTRANS_IDLE`; a transaction target is `PQTRANS_INTRANS` with effects retained if completion won, or `PQTRANS_INERROR` with rollback required if cancellation won. Early rows Drop and mode-selection failure instead issue cancellation immediately with exactly `1_000_000_000` ns of monotonic recovery; cardinality never does. The cleanup helper owns a non-null `PGcancelConn` from `PQcancelCreate` through `PQcancelStart`/`PQcancelPoll`; it reads or copies any `PQcancelErrorMessage` bytes before invoking `PQcancelFinish` exactly once on every start/poll success or failure, and no cancel-owned view escapes. It then drains and clears every ordinary main-connection PGresult to null, checks transaction synchronization, restores blocking mode or poisons/closes, frees the binder context and any unpublished direct Query-ID copy, clears the rows mutable native state when a wrapper exists, and only then releases the lease. At every result classification in normal completion, first-error drain, deadline recovery, mode-failure recovery, or early Drop, a COPY, pipeline, or unknown numeric status overrides that remaining sequence with the exact immediate-close rule above: clear only the current result, perform no further drain/pipeline-exit/cancel/probe/restore, preserve an earlier error, and close before owner cleanup and lease release. A connection target is reusable only after ordinary known-status drain reports `PQTRANS_IDLE`. An explicit transaction is reusable after ordinary known-status drain at `PQTRANS_INTRANS` when the statement completed before cancellation took effect, with its SQL effects still in that transaction; `PQTRANS_INERROR` means cancellation or a server error aborted the transaction and only caller-visible rollback/Drop or a server-rejected further operation may follow. The package performs no hidden rollback in any outcome. Timeout, mode-selection failure, or early Drop retains its primary observable result regardless of which synchronized transaction state wins; whether statement effects occurred remains observable only through subsequent database or transaction state. A published direct terminal wrapper retains its Query ID; a prepared path never frees the statement-owned ID. Failed cancel creation/dispatch, recovery expiry, I/O failure, any other transaction state, or restoration failure poisons/closes before release without overwriting an earlier owned error. With no earlier owned error, failure after an otherwise clean terminal returns the exact PostgreSQL `db.rows.cleanup` error above; timeout/native/sequence/decode/storage wins over any unpublished Row or pending Cardinality. Drop cannot report and only poisons/closes. No cleanup path issues SQL or overwrites the first owned error. |
+| deadline, cancellation, error drain, and Drop | One requested common `TimeoutNs` becomes one overflow-checked monotonic absolute deadline before explicit-mode send. After enabling nonblocking mode and immediately before send, read the monotonic clock again. If the deadline has expired, send and mode selection remain at zero; restore blocking mode and return the existing `Timeout`, or poison/close if restoration fails. This pre-send expiry path creates no cancel handle. Both the deadline and original positive duration otherwise remain attached until clean protocol completion. Caller think time, `one_native` pending-cardinality drain, and validation/decode/storage error drain all count. Later expiry returns the existing `Timeout` when no earlier error exists, after nonblocking native cancel and drain. A non-timeout server cancellation remains `Cancelled`. After a validation, decode, or batch-storage error with protocol results pending, destroy any unpublished package-owned value, make any cloned `one_native` Row unreachable under the monotonic-`out` rule, retain the first error as primary, and drain without decoding under the original absolute deadline. With no deadline or time remaining, continue normal drain. Clean completion commits a connection-target DML `RETURNING` and leaves a transaction target `PQTRANS_INTRANS` with effects retained. A later server fatal remains secondary to the first row/storage error but rolls back the connection-target statement at `PQTRANS_IDLE` or leaves the explicit transaction `PQTRANS_INERROR` with rollback required. If the original deadline expires during drain, issue cancellation with D9's `max(original_duration, 1_000_000 ns)` recovery budget but still return the earlier validation/decode/storage error. The cancel race may leave connection-target effects committed or rolled back at `PQTRANS_IDLE`; a transaction target is `PQTRANS_INTRANS` with effects retained if completion won, or `PQTRANS_INERROR` with rollback required if cancellation won. Early rows Drop and mode-selection failure instead issue cancellation immediately with exactly `1_000_000_000` ns of monotonic recovery; cardinality never does. The cleanup helper owns a non-null `PGcancelConn` from `PQcancelCreate` through `PQcancelStart`/`PQcancelPoll`. Before the first poll it reacquires `PQcancelSocket` and waits writable with `PQsocketPoll`; after each `PGRES_POLLING_READING`/`WRITING` it reacquires the possibly changed socket and waits for exactly that readiness under the remaining monotonic recovery budget before polling again. Socket lookup, readiness wait, or an undocumented polling tag fails closed. The helper reads or copies any `PQcancelErrorMessage` bytes before invoking `PQcancelFinish` exactly once on every start/poll success or failure, and no cancel-owned view escapes. It then drains and clears every ordinary main-connection PGresult to null, checks transaction synchronization, restores blocking mode or poisons/closes, frees the binder context and any unpublished direct Query-ID copy, clears the rows mutable native state when a wrapper exists, and only then releases the lease. At every result classification in normal completion, first-error drain, deadline recovery, mode-failure recovery, or early Drop, a COPY, pipeline, or unknown numeric status overrides that remaining sequence with the exact immediate-close rule above: clear only the current result, perform no further drain/pipeline-exit/cancel/probe/restore, preserve an earlier error, and close before owner cleanup and lease release. A connection target is reusable only after ordinary known-status drain reports `PQTRANS_IDLE`. An explicit transaction is reusable after ordinary known-status drain at `PQTRANS_INTRANS` when the statement completed before cancellation took effect, with its SQL effects still in that transaction; `PQTRANS_INERROR` means cancellation or a server error aborted the transaction and only caller-visible rollback/Drop or a server-rejected further operation may follow. The package performs no hidden rollback in any outcome. Timeout, mode-selection failure, or early Drop retains its primary observable result regardless of which synchronized transaction state wins; whether statement effects occurred remains observable only through subsequent database or transaction state. A published direct terminal wrapper retains its Query ID; a prepared path never frees the statement-owned ID. Failed cancel creation/dispatch, recovery expiry, I/O failure, any other transaction state, or restoration failure poisons/closes before release without overwriting an earlier owned error. With no earlier owned error, failure after an otherwise clean terminal returns the exact PostgreSQL `db.rows.cleanup` error above; timeout/native/sequence/decode/storage wins over any unpublished Row or pending Cardinality. Drop cannot report and only poisons/closes. No cleanup path issues SQL or overwrites the first owned error. |
 | overlap and global state | The prerequisite lease PR inventories every shared-connection libpq consumer before streaming lands. Typed command/prepare/rows already acquire the lease; common/native `one` delegates through rows; transaction boundaries reject an active lease; prepared Drop issues no libpq call while the lease is active; and the prerequisite makes every PostgreSQL catalog and common/native EXPLAIN acquire and release it. A streamed rows resource then owns that connection-global lease from before bind/send until synchronized exhaustion, failure cleanup, or Drop. A second command, Query, prepare, transaction boundary, catalog, EXPLAIN, or stream on that physical connection returns its settled pre-native overlap error without touching libpq; catalog and EXPLAIN use the exact query-less/query-specific `postgres.connection.active_execution` error above. Direct and prepared paths do not change process-global state. The nonblocking flag is connection-global: it is set only while the lease is held and restored before release; restoration failure poisons first. |
 | artifacts, ABI, and cache identity | Runtime delivery selection does not alter Query/command descriptor bytes, batch-plan bytes, checked metadata, static Query artifact semantics, or their semantic fingerprints; there is no per-mode descriptor or cache identity. Landing the public `Delivery` enum changes the PostgreSQL module interface hash, and landing the rows/statement ABI implementation changes the relevant producer implementation hashes. Per-unit importers therefore record new dependency-interface hashes and the affected codegen/object cache entries invalidate once at those implementation boundaries; only modules that neither import nor reach the changed interface may retain their prior cache keys. The direct PR makes the shared SQLite/PostgreSQL rows state one 120-byte, 8-aligned v3 record. Offsets 0--95 retain v2 meaning. Offset 96 is delivery `u8` (`0=PostgreSQL BufferedFull`, `1=PostgreSQL SingleRow`, `2=PostgreSQL PortalBatch`, `3=SQLite Step`); 97 is protocol-pending `u8` (`0/1`); 98--99 are zero `u16`; 100 is `i32 portal_max_rows` (zero except positive for PortalBatch); 104 is `i64 deadline_ns` (`-1` absent, otherwise nonnegative); and 112 is `i64 timeout_duration_ns` (`-1` absent, otherwise positive). Active SQLite direct/prepared rows require driver SQLite, delivery 3, pending 0, a non-null current statement mirrored at binder-context offset 8, portal size 0, and both deadline fields -1. Active PostgreSQL BufferedFull requires driver PostgreSQL, delivery 0, pending 0, a non-null current result mirrored at context offset 8, portal size 0, and both deadline fields -1 because its protocol completed before publication. Active PostgreSQL streamed rows require driver PostgreSQL, delivery 1/2, pending 1, portal size respectively zero/positive, and a null-or-live current result mirrored at context offset 8. Its deadline fields must be either the exact pair `(-1, -1)` or a nonnegative absolute deadline plus the original positive requested duration. No other driver/mode/deadline product is valid. Terminal rows for either driver set delivery/pending/portal/result/context to zero/null and both deadline fields to `-1`, while retaining the existing immutable Query identity and batch plan. The prepared-parity PR separately makes shared statement state an 88-byte, 8-aligned v3 record: offsets 0--79 retain statement v2 meaning and offset 80 is the non-null producer-owned `fn(name: str) -> i32` parameter-ordinal resolver already stored in every Query descriptor. Both SQLite and PostgreSQL preparation retain that static resolver. HIR validation accepts statement formation only when offset 80 receives `parameter_resolver` from the same concrete Query descriptor generation that supplies the retained binder, row validator, stream decoder, and batch plan; a cross-Query resolver splice or raw replacement is rejected. `stmt_header_valid` requires exact version 3, driver 1/2, live state, zero reserved bytes, every existing v2 pointer/layout invariant, a valid batch plan, and the non-null resolver before any accessor or indirect bridge call. Statement Drop marks closed and nulls native/connection/binder/identity/deallocate/row-validator/stream-decoder/batch-plan/resolver fields before free. Every SQLite/PostgreSQL constructor, accessor, `next`, `has_next`, `next_batch`, and Drop path validates its complete record before native use. Exact semantic-to-byte and byte-to-semantic goldens pin every valid direct/prepared active/terminal rows state, both-driver statement state, and malformed version/driver/tag/reserved/size/deadline/duration/pointer combinations. |
 | runtime producers and inspection | Static producer thunks remain the sole bind/row-validate/decode/batch authority. The PostgreSQL package owns option normalization and the streamed-result state machine; libpq owns protocol delivery. Runtime code performs no reflection, field-name lookup, source/artifact/cache I/O, or Query-body instantiation. Existing Query metadata continues to describe static bind/decode facts; runtime delivery inspection/bench evidence is labeled separately and does not alter artifact identity. |
@@ -4599,7 +4611,7 @@ The implementation closure matrix is:
 | failure, timeout, and cleanup | Deduplicate mode failure, deadline expiry, fatal result, validation/decode/storage error, early Drop, and clean-terminal restoration around one drain/cancel/synchronize/restore helper; cardinality and first-owned row/storage errors begin with normal no-decode drain, while only deadline expiry, early Drop, and mode failure enter cancellation. Persist the original duration needed by deadline-expiry recovery. Give each created `PGcancelConn` one owner through exactly one `PQcancelFinish`, copy no cancel error after finish, and finish it before classifying main results. Preserve the first owned error, clear ordinary main results, restore then release or poison then release, and accept only `IDLE` for a connection cancellation. If any cleanup cause instead observes COPY, pipeline, or an unknown numeric status, clear that current result, stop the helper without further drain/pipeline-exit/cancel/probe/restore, immediately poison/close, clean unpublished/wrapper/context/ID owners, and release the lease while preserving the earlier error or silent Drop. For an explicit transaction, accept `INTRANS` only as completed with effects retained, or `INERROR` as canceled/server-aborted with rollback required; perform no hidden rollback and poison any other state. A clean-terminal restore failure becomes the exact PostgreSQL `db.rows.cleanup` error; `next_batch` destroys an unpublished partial final batch before returning it. Audit existing BufferedFull timeout paths, the merged result-status safety helper, and the common A1 publication contract when this helper changes. | cancel create/start/poll/error-message/finish/drain/reset failpoint and allocation matrix; COPY/pipeline/unknown x mode/deadline/row/storage/Drop x Timeout absent/present x Conn/Tx first-error/no-call/clear-close matrix; validation/decode/storage first-error x clean-completion/later-fatal/deadline-expires x Conn/Tx effect matrix; original-duration recovery budget; clean zero/partial-final restore failure; fatal-after-data; pre-send/post-row/pending-cardinality timeout; early Drop and timeout conn/tx `IDLE`/`INTRANS`/`INERROR` race/effect owners; reuse/rollback-or-poison owners |
 | rows and statement ABI malformed input | Construct and validate the exact shared 120-byte rows v3 in one authority. SQLite direct/prepared Step plus PostgreSQL BufferedFull/SingleRow/PortalBatch each have exact active and terminal records; all consumers validate before native state and terminal stores both `-1` deadline sentinels. A live explicit stream alone may carry the exact absolute-deadline/original-duration pair. Prepared parity separately constructs statement v3 with the exact non-null resolver and updates every sibling accessor/Drop. | rows and statement semantic/byte goldens; parameterized deadline/duration and every other field mutation with no native-call counters; v2 rejection; driver x direct/prepared x active/terminal rows matrix; both-driver stmt live/closed matrix; retained SQLite rows/stmt owners |
 | artifact and cache invalidation | Keep runtime Delivery values out of static Query/command descriptor, batch-plan, checked-metadata, and semantic fingerprint bytes. When the direct public enum/rows ABI and prepared statement ABI land, allow the owning interface/implementation hashes and every affected per-unit dependency/codegen/object key to invalidate exactly once; do not create per-mode artifacts or let an importer retain a stale dependency-interface key. | descriptor/plan/metadata byte parity across runtime modes; public-interface and implementation-hash before/after controls; whole/per-unit affected-importer miss plus unrelated-module retention; no per-mode artifact/cache split |
-| FFI and native-version closure | Declare the exact libpq 17 send, row-mode, result, nonblocking cancel-connection, transaction-state, and cleanup signatures/constants. Pin signedness for native `int` chunk size and every polling/status tag with compiled C signature probes. This rail adds no COPY data/termination or pipeline-exit FFI; COPY, pipeline, and unknown-status behavior is current-result clear plus ordinary connection close. Keep ordered `pq`/`ssl`/`crypto` closure on whole/per-unit Linux and macOS links; reject a client below 17 at build/evidence setup rather than at first request and fail closed on a newer unknown status. | C signature/status/unknown-sentinel probe; forbidden COPY/pipeline-exit symbol/call inventory; client-version assertion; whole/per-unit link inventory; x86_64/ARM64/macOS build owners |
+| FFI and native-version closure | Declare the exact libpq 17 send, row-mode, result, nonblocking cancel-connection, cancel-socket/readiness, transaction-state, and cleanup signatures/constants. Pin signedness for native `int` chunk size, `pg_usec_time_t`, and every polling/status tag with compiled C signature probes. This rail adds no COPY data/termination or pipeline-exit FFI; COPY, pipeline, and unknown-status behavior is current-result clear plus ordinary connection close. Keep the ordered `pq`/`ssl`/`crypto`/`zstd`/`z` closure on whole/per-unit Linux and macOS links; reject a client below 17 at build/evidence setup rather than at first request and fail closed on a newer unknown status. | C signature/status/unknown-sentinel probe; cancel-socket readiness counter; forbidden COPY/pipeline-exit symbol/call inventory; client-version assertion; whole/per-unit link inventory; x86_64/ARM64/macOS build owners |
 | operation matrix and allocation parity | The direct PR runs conn/tx x BufferedFull/SingleRow/PortalBatch x rows/one. The prepared PR independently runs conn/tx-prepared statement x the same three modes x rows_stmt, with `next`/`next_batch` on each rows axis. Assert the mode-specific sync/send count, no hidden SQL, one lease, bounded PGresult/cancel ownership, exact parameter/Query-ID/resolver lifetime, balanced context/result/rows/batch/cancel allocation, and sibling error identity. Retain the complete SQLite Step and prepared-state matrix after each shared ABI bump. | per-PR default-and-explicit operation matrices plus retained dual-driver rows/stmt owners, required provisioned PostgreSQL suite, and direct-libpq measurement |
 
 The five-times-reopened implementation boundary is four independently mergeable vertical PRs.
@@ -4739,10 +4751,353 @@ before implementation. Close findings in the ledger first. Before each code revi
 implementation path and one owner; a finding in result advancement, cancellation, or v3 validation
 requires a complete sibling-consumer audit, not a line-local patch.
 
+#### A1 PostgreSQL binary-format public-contract ledger
+
+This ledger is the source of truth for the next independently useful D13 rail. It completes the
+already-published `Text|Binary` parameter and result choices for the first-release PostgreSQL type
+matrix. It adds no public type, function, option, error variant, driver, Query shape, or dynamic
+dispatch. The implementation is one capability boundary even though it changes generated
+descriptor semantics, the package-owned binder context, prepared-statement validation, libpq
+arguments, and row decoding: a binary encoder without the matching static type proof can send an
+ill-typed value, while a producer proof without the package consumer is dormant. The expected
+implementation may exceed 1,000 hand-written lines because splitting that strict producer-to-
+consumer chain would duplicate the same wire, ABI, malformed-input, and whole/per-unit proof.
+
+The exact application-callable inventory remains:
+
+```text
+postgres.Format { Text, Binary }
+postgres.ExecuteOption.ParameterFormat(name: str, format: postgres.Format)
+postgres.ExecuteOption.ResultFormat(format: postgres.Format)
+```
+
+```align
+pub fn execute_native<P>(
+  target: pkg.db.exec,
+  statement: pkg.db.command<P>,
+  params: P,
+  options: slice<pkg.db.ExecuteOption>,
+  native: slice<ExecuteOption>,
+) -> Result<pkg.db.exec_result, pkg.db.Error>
+
+pub fn rows_native<P, R>(
+  target: pkg.db.exec,
+  statement: pkg.db.query<P, R>,
+  params: P,
+  options: slice<pkg.db.ExecuteOption>,
+  native: slice<ExecuteOption>,
+) -> Result<pkg.db.rows<R>, pkg.db.Error>
+
+pub fn one_native<P, R: RegionPlain>(
+  target: pkg.db.exec,
+  statement: pkg.db.query<P, R>,
+  params: P,
+  out: region,
+  options: slice<pkg.db.ExecuteOption>,
+  native: slice<ExecuteOption>,
+) -> Result<R, pkg.db.Error>
+
+pub fn rows_stmt_native<P, R>(
+  borrow mut statement: pkg.db.stmt<P, R>,
+  params: P,
+  options: slice<pkg.db.ExecuteOption>,
+  native: slice<ExecuteOption>,
+) -> Result<pkg.db.rows<R>, pkg.db.Error>
+```
+
+Absence of `ParameterFormat(name, ...)` selects Text for that parameter. Absence of
+`ResultFormat(...)` selects Text for the complete result. A named parameter may have at most one
+format option and an execution may have at most one result-format option. Result format is one
+libpq-wide choice for all result columns; there is no per-column surface. `execute_native` passes
+the selected result format even though a valid command has no result columns. `rows_native`,
+`one_native`, and `rows_stmt_native` compose either format with `BufferedFull`, `SingleRow`, and
+`PortalBatch`. Common operations remain Text-only by absence because they cannot name a
+PostgreSQL-native option. No environment variable, server setting, row value, prepared-state
+history, or heuristic changes a selected format.
+
+The first-release binary mapping is exact:
+
+| Align value shape | Required PostgreSQL canonical type / OID | Binary parameter and result payload |
+|---|---|---|
+| `bool` / `Option<bool>` | `bool` / 16 | one byte, exactly `00` or `01` |
+| `i16` / `Option<i16>` | `int2` / 21 | two's-complement 2-byte big-endian |
+| `i32` / `Option<i32>` | `int4` / 23 | two's-complement 4-byte big-endian |
+| `i64` / `Option<i64>` | `int8` / 20 | two's-complement 8-byte big-endian |
+| `f32` / `Option<f32>` | `float4` / 700 | exact IEEE-754 bits, 4-byte big-endian |
+| `f64` / `Option<f64>` | `float8` / 701 | exact IEEE-754 bits, 8-byte big-endian |
+| `str`/`string` and nullable forms | `text` / 25, `varchar` / 1043, or `name` / 19 | exact client-encoding bytes, no terminator in the recorded length |
+| `slice<u8>`/`array<u8>` and nullable forms | `bytea` / 17 | exact bytes, including embedded zero and high bytes |
+
+Owned `string` and `array<u8>` forms are parameter shapes only. Row fields remain borrowed `str`
+and `slice<u8>` views (including their `Option` forms); `one_native` retains the existing explicit
+region clone.
+
+The connection remains pinned to client encoding UTF-8. Binary text input therefore copies the
+exact UTF-8 bytes into execution-owned storage, appends an out-of-length sentinel only for package
+storage safety, and rejects U+0000 before send for `text`, `varchar`, and `name`; PostgreSQL text
+values cannot contain that code point even though the binary transport is length-aware. Binary
+`bytea` never adds or removes a payload byte. A present empty Binary `bytea` allocates one zero
+sentinel byte outside its recorded zero length and gives libpq that non-null pointer; `None` alone
+uses a null pointer, so empty and SQL NULL remain distinct. A NULL parameter otherwise has length
+ignored but retains its selected format code. A NULL result has no payload but must still carry the
+expected column OID and result format in RowDescription. Text format keeps the existing exact
+lowercase `\\x` bytea encoding/decoding and scalar parser. No other OID, domain, enum, array,
+range, numeric, date/time, JSON, or extension type is silently coerced into this table.
+
+The wire goldens are independently fixed in both directions: `false = 00`, `true = 01`,
+`int2(-2) = ff fe`, `int4(0x01020304) = 01 02 03 04`, `int8(-2) = ff ff ff ff ff ff ff fe`,
+`f32(1.5) = 3f c0 00 00`, `f64(-0.0) = 80 00 00 00 00 00 00 00`, UTF-8 `é = c3 a9`, and
+`bytea([0, 255]) = 00 ff`. Float encode/decode preserves every bit, including signed zero,
+infinities, and NaN payloads; it does not pass through decimal text. These layouts follow libpq's
+network-byte-order requirement and PostgreSQL's built-in `boolsend`, integer send/receive,
+`pq_sendfloat4`/`pq_sendfloat8`, `textsend`/`namesend`, and `byteasend` contracts.
+
+The compiler-private normalized-call ABI is exact. `one_native` uses `rows_native_prevalidated`
+and has no fourth internal entry point:
+
+```align
+pub fn execute_native_prevalidated<P>(
+  target: pkg.db.exec,
+  params: P,
+  statement: pkg.db.command<P>,
+  query_id: str,
+  timeout: Option<i64>,
+  format_plan: raw,
+  format_count: u32,
+  result_format: u8,
+) -> Result<pkg.db.exec_result, pkg.db.Error>
+
+pub fn rows_native_prevalidated<P, R>(
+  target: pkg.db.exec,
+  params: P,
+  statement: pkg.db.query<P, R>,
+  query_id: str,
+  timeout: Option<i64>,
+  delivery: u8,
+  portal_max_rows: i32,
+  format_plan: raw,
+  format_count: u32,
+  result_format: u8,
+) -> Result<pkg.db.rows<R>, pkg.db.Error>
+
+pub fn rows_stmt_native_prevalidated<P, R>(
+  params: P,
+  borrow mut statement: pkg.db.stmt<P, R>,
+  timeout: Option<i64>,
+  delivery: u8,
+  portal_max_rows: i32,
+  format_plan: raw,
+  format_count: u32,
+  result_format: u8,
+) -> Result<pkg.db.rows<R>, pkg.db.Error>
+```
+
+`format_count` is the exact number of 8-byte, 4-aligned entries and is at most both the operation's
+trusted parameter count (validated descriptor count/thunk for direct execution, validated statement
+count thunk/copy for prepared execution) and `65_535`. `format_plan` is null exactly when
+`format_count == 0`;
+otherwise it names at least checked `i64(format_count) * 8` readable bytes owned by the caller for
+the complete synchronous call. Each entry is `i32 ordinal` followed by `i32 format`, with one-based
+ordinal and `0=Text`, `1=Binary`. `result_format` is `0=Text`, `1=Binary`. The internal callee
+validates the result tag; parameter-count bound; pointer/count product; checked byte size; then each
+entry's ordinal, format tag, and duplicate ordinal in source order before live-state access,
+allocation, bind, or send. It copies the codes into execution-owned storage and never retains or
+frees the caller plan. A malformed product returns
+`InvalidQuery(ContractError { query_id: Some(query_id), item: "postgres.execute.format_plan",
+message: "invalid normalized PostgreSQL format plan" })`. The compiler-private call validator
+permits only a plan pointer derived from the live scratch owner formed by the corresponding public
+wrapper and rejects application calls, wrong operations/types, pointer substitution, and malformed
+HIR before code generation.
+
+Binary-related public contract errors are exact. All records below use the trusted Query or command
+ID as `Some(query_id)`:
+
+| Failure | Exact public error |
+|---|---|
+| selected Binary parameter lacks direct static proof or prepared effective-OID proof | `Unsupported`, item `postgres.execute.parameter_format`, message `binary PostgreSQL parameter requires an exact supported ParameterType` |
+| malformed internal normalized plan | `InvalidQuery`, item `postgres.execute.format_plan`, message `invalid normalized PostgreSQL format plan` |
+| malformed text/byte parameter pointer or length representation | `Encode`, item `db.parameter`, message `database parameter has an invalid memory representation` |
+| U+0000 in a PostgreSQL text-type parameter | `Encode`, item `db.parameter`, message `database text contains U+0000` |
+| checked parameter encoding or complete Bind-message budget overflow | `Encode`, item `db.parameter`, message `PostgreSQL parameters exceed the Bind message length limit` |
+| direct/preparation Parse-message budget overflow | `InvalidQuery`, item `postgres.execute.wire`, message `PostgreSQL Parse message exceeds the protocol length limit` |
+| any result name/OID/format/NULL/pointer/length/payload mismatch | `Decode`, item `db.row`, message `PostgreSQL row does not match the static Row contract` |
+
+Parameter formation visits increasing protocol ordinal. Within Measure mode it checks the memory
+representation, then text U+0000 when applicable, then exact encoding arithmetic and the remaining
+Bind budget. Encode mode performs allocation and copy only after the complete Measure pass. The
+language's ordinary allocation failure remains a hard abort, not another
+`pkg.db.Error`. Each tuple-producing native result has two ordered validation phases. Before row
+count, zero-row/cardinality/terminal handling, or result publication, metadata mode checks exact
+column count and then increasing declared Row ordinal's name, OID, and format. Only after that
+complete pass succeeds may value mode inspect a delivered row, checking increasing ordinal's NULL
+disposition, negative length, non-null pointer for a present value, then fixed width before bool
+value or UTF-8 payload validity. Thus any metadata error wins over every value/cardinality outcome;
+within a phase the first declared ordinal wins. That ordering and the table above govern every
+multi-invalid direct, prepared, buffered, and streamed input, including valid and malformed zero-row
+results.
+
+The context matrix's retained v2 range is exact and driver-specific. Bytes 0--39 keep the common v2
+fields. SQLite uses offset 40 for its retained text/blob pointer vector, 48 for its `u32` vector
+length, 52 for zero `u32`, and requires every byte 56--79 to be zero; it owns and frees only the
+offset-40 vector and its entries. PostgreSQL uses offsets 40/48/56/64 for its value/OID/length/format
+vectors, 72 for their `u32` length, and 76 for zero `u32`, with the existing ownership and cleanup.
+Both v4 constructors initialize all 112 bytes explicitly. The complete validator checks this
+driver-specific product before any load or free, and malformed cleanup never interprets a zero-only
+SQLite slot as an owner.
+
+PostgreSQL protocol v3 fixes the actual aggregate bounds. The trusted parameter count `N` is at most
+`65_535`, the unsigned range of the Parse/Bind `Int16` count fields, regardless of libpq's wider C
+`int` argument. For the exact libpq 17 call shape used here, parameter-format count is `N`, result-
+format count is one with the validated `0=Text` or `1=Binary` code, the portal name is empty, and the
+statement name is empty for direct execution or the retained generated ASCII name for prepared
+execution. Let `S` be that statement-name C-string byte count including its terminator and
+`payload_i` be zero for NULL or the exact selected encoded length otherwise. The Bind length field,
+which includes its own four bytes but excludes the one-byte message tag, is exactly
+`13 + S + 6*N + sum(payload_i)` and must be at most `2_147_483_647`. The Parse
+length is exactly `6 + S + Q + 4*N`, where `Q` is the PostgreSQL wire-SQL C-string byte count including
+its terminator, and has the same limit. Direct execution checks both formulas; preparation checks
+Parse; prepared execution checks Bind. All arithmetic is checked in `u64` before narrowing.
+Before Measure, the exact fixed-budget result stored as signed `i64` at context offset 96 is
+`2_147_483_647 - (13 + S + 6*N)`; a negative or non-`i64` result fails before that store.
+
+Descriptor/artifact formation rejects `N > 65_535` before artifact or cache publication with the
+diagnostic `PostgreSQL static query supports at most 65535 parameters`; a malformed runtime
+descriptor or statement with that count returns the existing query-less `InvalidQuery`, item
+`db.descriptor.header`, message `invalid static database descriptor`, before option access or
+allocation. Before payload
+allocation, generated binder-v2 Measure mode visits increasing protocol ordinal, validates the
+memory representation and text U+0000 rule, computes the exact selected encoding length, and debits
+one preinstalled remaining Bind budget. Text scalar measurement uses the same canonical formatter
+against a count-only sink; Text bytea uses checked `2 + 2*source_len`; Binary uses the fixed table or
+source byte length. The first ordinal whose encoding arithmetic or debit fails returns the exact Bind
+`Encode` error and no later field is inspected. Only a complete successful Measure pass permits
+binder-v2 Encode mode. Parameterized budget owners use a no-allocation measurement stub and derive
+accepted-limit/rejected-limit-plus-one pairs for direct/prepared, single/multiple/NULL values, every
+encoding class, both result formats, both statement-name lengths, and `65_535`/`65_536`, without
+constructing a multi-gigabyte fixture.
+
+The binder callback family is exact. Every callback has signature
+`fn(context: raw, protocol_ordinal: u32, value: T) -> i32`; a non-null field is lifted to `Some`
+and a nullable field passes its `Option` unchanged. Measure mode may call only the `measure_*_v1`
+symbol in its row, while Encode mode may call only the existing `bind_*_v2` symbol:
+
+| `T` | Measure symbol | Encode symbol |
+|---|---|---|
+| `Option<bool>` | `pkg.db.internal.measure_bool_v1` | `pkg.db.internal.bind_bool_v2` |
+| `Option<i16>` | `pkg.db.internal.measure_i16_v1` | `pkg.db.internal.bind_i16_v2` |
+| `Option<i32>` | `pkg.db.internal.measure_i32_v1` | `pkg.db.internal.bind_i32_v2` |
+| `Option<i64>` | `pkg.db.internal.measure_i64_v1` | `pkg.db.internal.bind_i64_v2` |
+| `Option<f32>` | `pkg.db.internal.measure_f32_v1` | `pkg.db.internal.bind_f32_v2` |
+| `Option<f64>` | `pkg.db.internal.measure_f64_v1` | `pkg.db.internal.bind_f64_v2` |
+| `Option<str>` | `pkg.db.internal.measure_text_v1` | `pkg.db.internal.bind_text_v2` |
+| `Option<slice<u8>>` | `pkg.db.internal.measure_bytes_v1` | `pkg.db.internal.bind_bytes_v2` |
+
+Each uses the settled callback status model: exact zero on success and exact one after recording the
+first context-owned failure. No valid callback returns another status, Measure never delegates to
+Encode, and Encode never delegates to Measure.
+
+These checks extend, rather than reorder, the settled operation phases. Direct execution validates
+the complete descriptor/count/identity, options, driver/live state, context, and generated static
+contract; then acquires the lease, allocates/installs the exact full format vector, and validates the
+Parse budget and Bind fixed budget before binder-v2 Measure, Encode, deadline, and send. Prepared
+execution validates the complete statement/count/identity and options, then driver/live state,
+acquires the lease, creates the context/full format vector, and validates the Bind fixed budget before
+Measure, Encode, deadline, and send. Preparation validates its complete descriptor/options/live state
+and acquires its lease before name formation, Parse budget, and `PQprepare`. Consequently a
+header/count error beats every option, overlap beats every direct or prepared parameter measurement,
+a direct Parse-budget error beats every parameter-value error after successful lease acquisition,
+and each Measure error follows increasing protocol ordinal. No budget failure calls a binder-v2
+Encode callback or libpq.
+
+The call-local sparse normalized plan is formed at the end of successful native-option validation;
+it is not installed in the execution context. In the closure matrix below, installing the normalized
+plan means allocating/installing the execution-owned exact full format vector after generated static
+validation and successful lease acquisition.
+
+The package-context row's complete fixed Bind formula is exact
+`2_147_483_647 - (13 + S + 6*N)`, and its initializer runs only after that successful lease on
+both direct and prepared execution.
+
+For `one_native`, Metadata mode still runs for every newly acquired tuple-producing result. A
+malformed second generation therefore returns the exact row-contract Decode error before
+Cardinality. A metadata-valid second generation returns Cardinality without Value mode, decoder
+invocation, or a second Row allocation. This D13 rule supersedes the older D8 any-second-row winner.
+
+The implementation closure matrix is:
+
+| Closure cell | Required implementation closure | Exact owner evidence |
+|---|---|---|
+| public surface and operation matrix | Preserve the exact inventory above. Accept independently selected Text and Binary parameter formats on direct Query, direct command, and prepared Query execution; accept an independently selected Text or Binary result format on those same operations; add no prepared `one_native`, common native-option escape, per-column result selector, reflective codec, or compatibility alias. | exported-surface golden plus command/direct rows/direct one/prepared rows callable matrix; parameter-format plan and result-format axes remain separate from BufferedFull/SingleRow/PortalBatch |
+| static type proof, binder, and resolver ABI | Bump the 8-aligned execution descriptor from 136-byte v5 to exact 144-byte v6. Offsets other than 64, 104, and the new 136 retain v5 meaning. Offset 64 becomes the non-null generated binder-v2 `fn(context: raw, borrow params: P, mode: u8) -> i32`: `0=Measure`, `1=Encode`, and every other mode fails before a package callback. Both modes visit the same increasing protocol ordinals and field types; Measure calls only type-matched count/debit callbacks and Encode calls only the matching allocation/bind callbacks. SQLite invokes Encode directly against its exact non-measuring context; PostgreSQL requires one complete Measure success for the same context/params/format vector before Encode. Offset 104 becomes the non-null generated parameter-resolver v2: zero means unknown, a positive ordinal means known but Text-only, and the corresponding negative ordinal means the parameter has one exact compatible PostgreSQL `ParameterType` from the table above and may use Binary; `i32::MIN` and an absolute ordinal outside `1..=parameter_count` are malformed. Offset 136 is a non-null generated `fn() -> u32` parameter-count v1 thunk whose body is exactly one constant return equal to offset 112's existing distinct-parameter count and at most `65_535`. The complete descriptor validator compares those two counts and enforces the protocol maximum before accepting the binder or resolver. Existing sealed `parameter_known` accepts either resolver sign and existing `parameter_ordinal` operations return the absolute ordinal. Add a sealed direct binary-ordinal operation that returns the absolute ordinal only for the negative form and zero otherwise. The prepared sibling additionally requires the retained effective-OID eligibility bit described below, so a differing `ParameterOid` override cannot reuse a stale static proof. Application calls, wrong descriptor/resource types, unguarded prepared loads, count-thunk or binder invocation outside the complete header guard, Measure/Encode mismatch, cross-descriptor binder/resolver/count-thunk splices, and malformed HIR fail closed. Query/command formation, interface serialization, monomorphization, whole-program, and per-unit compilation retain the matching binder v2, resolver v2, and count thunk from one producer generation. | exact v6 header/binder/resolver/count-thunk body/signature/relocation goldens; `65_535`/`65_536`, offset-count/thunk equality, and every zero/mismatch/malformed thunk product; mode/callback/ordinal parity and Measure-before-Encode owners; every type and missing-`ParameterType` resolver code; matching/differing/absent `ParameterOid` proof owners; sema/MIR application/wrong-kind/unguarded/splice/malformed rejection; whole/per-unit runtime-selected same-typed descriptor twins |
+| option validation and precedence | Preserve §13.4 source-order phases. Direct command/Query execution validates the complete descriptor and identity, then common and native options before driver/live state. Prepared execution instead validates the complete statement v4 header, batch plan, resolver, count thunk/count equality, eligibility shape, and trusted identity before any common or native option because every prepared name/proof lookup depends on that guarded state. A malformed or closed statement combined with any invalid Binary option therefore returns query-less `InvalidQuery`, item `db.descriptor.header`, message `invalid static database descriptor`. After that prepared guard, both direct and prepared validation reject U+0000 in each `ParameterFormat` name, then an unknown name, then a Binary request lacking the direct negative proof or prepared negative-plus-eligibility proof, then a duplicate; current-payload validity beats duplicate registration. The missing proof uses `Unsupported`, the trusted Query/command ID, item `postgres.execute.parameter_format`, and exact message `binary PostgreSQL parameter requires an exact supported ParameterType`. `ResultFormat` has no payload beyond its closed enum and duplicate detection is exact. Delivery keeps its adjacent ledger order. After the operation-specific header guard, all option errors precede driver restriction, physical connection/live-state checks, lease/context/bind, and SQL send; a valid SQLite statement plus an invalid Binary option reports the option error before PostgreSQL driver mismatch. | parameterized source-order and reversed-invalid/valid-duplicate owners across command/direct/prepared; malformed/closed statement plus every invalid Binary option exact header winner; valid SQLite statement plus invalid Binary exact option winner; unknown/NUL/missing-proof zero execution-context/format-plan/libpq counters; retained Delivery precedence owners |
+| package context and prepared ABI | The shared opaque binder/decode context becomes one exact 112-byte v4 record for both drivers. Offsets 0--95 retain the exact v3 meanings above. Offset 96 is signed remaining Bind-payload budget; offset 104 is measurement state (`0=unmeasured`, `1=measuring`, `2=measured`); and 105--111 are zero. SQLite requires state 0 and budget `-1`. A new PostgreSQL context also starts at `(0,-1)`; only the sealed budget initializer may store state 1 and the nonnegative result of the complete fixed Bind formula after header/options/count/Parse validation and before a parameter payload allocation. Measure callbacks require state 1 and atomically debit an exact length without going negative. A complete successful binder-v2 Measure return changes state to 2; PostgreSQL Encode requires state 2, and neither failure nor a second Measure/Encode pass can publish it. Offset 80 remains result format `u8` (SQLite requires `0=Text`; PostgreSQL allows `0=Text`, `1=Binary`); offset 81 remains metadata state (`0=unvalidated`, `1=validated`); 82--87 remain zero; and offset 88 remains the metadata native pointer. Metadata state 0 requires offset 88 null. A sealed native-generation setter installs offset 8 and resets 81/88 before every row-producing SQLite Query execution and every newly acquired tuple-producing PGresult, including zero-row terminal results. Successful metadata validation stores state 1 and the exact non-null offset-8 pointer; value validation requires that equality. Clearing/replacing native state resets both metadata fields, so pointer-address reuse cannot inherit validation. The one context validator rejects every driver/version/format/metadata-state/measurement-state/budget/reserved/pointer product before dereference, debit, bind, or free. Shared prepared statement state becomes an exact 112-byte, 8-aligned v4 record: offsets 0--79 retain v3 meaning; offset 80 retains resolver v2; offset 88 is a package-owned byte-per-parameter Binary eligibility vector; offset 96 is the non-null producer-owned parameter-count v1 thunk from descriptor offset 136; offset 104 is the copied exact `u32` parameter count; and 108--111 are zero. The one complete statement-header validator first establishes the fixed fields and non-null thunk, invokes that guarded thunk, and requires a result at most `65_535` exactly equal to offset 104 before using it to bound eligibility validation. SQLite requires a null eligibility pointer for every count. PostgreSQL requires null eligibility for zero parameters and otherwise a non-null vector with exactly the trusted count's readable bytes, all 0/1. At PostgreSQL preparation, byte `ordinal-1` is one exactly when static validation installed a supported nonzero canonical OID and the effective OID after any `ParameterOid` override equals it. Arbitrary nonzero overrides remain valid for Text, but a differing override makes that ordinal Binary-ineligible. The sealed prepared binary-ordinal bridge requires a complete guarded v4 header, negative resolver result within the trusted count, and eligibility byte one. HIR statement formation requires binder v2, resolver, count thunk, row validator, decoder, and batch plan from one Query producer. Statement Drop nulls the vector/thunk/count before freeing the vector once. The context/statement validators, every accessor/bridge/constructor/Drop path, and semantic/byte goldens move together. | driver x context-v4 result-format/metadata-state/measurement-state/budget/reserved/native-pointer matrix with new-result pointer-reuse reset and Measure replay rejection; statement v4 both-driver active/closed/malformed bytes; `65_535`/`65_536`, thunk null/body/count mismatch, and eligibility pointer/byte products with no out-of-bound scan/callback; cross-Query binder/thunk/resolver splice; matching/differing/absent override; constructor/accessor/Drop no-call and free counters; cumulative SQLite prepared/rows suite |
+| normalized format formation and ownership | After complete native-option validation, form at most one call-local normalized 8-byte entry (`i32 ordinal`, `i32 format`) per explicit parameter option. The public native wrapper owns that 4-aligned scratch storage through the exact synchronous internal ABI above and frees it on success or error; a published rows resource never borrows it. After complete plan/count validation, the internal path allocates exactly one `N`-entry execution-owned format vector initialized to Text and copies each explicit code to its ordinal. This is the non-null vector that makes libpq emit `N` parameter format codes and that both binder-v2 modes read; zero parameters use a null vector. Zero explicit options use the canonical `(null, 0)` scratch plan but still allocate the full vector when `N > 0`. Result format needs no separate allocation. | zero/one/many option and zero/positive-`N` scratch/vector allocation/free counters; every malformed result-tag/count/pointer/size/ordinal/tag/duplicate product with exact `InvalidQuery` and zero context/bind/send; full-vector default/explicit code bytes and libpq format-count parity; rows publication followed by scratch destruction/use-after-free probe; direct/prepared parity; sema/MIR call-formation negatives |
+| parameter measurement, encode, and retention | Run generated static validation before installing the normalized plan and exact full format vector on direct execution; prepared execution requires both the retained negative resolver proof and its retained effective-OID eligibility bit. Before payload allocation, validate the operation's Parse formula where applicable, initialize the exact Bind budget, and run binder-v2 Measure once. Measure callbacks read only the selected code for their own ordinal, validate and debit exactly as above, and cannot allocate, bind, send, broadcast a code to a sibling, or mutate result format. Binder-v2 Encode then reads the same code per ordinal and emits exactly the table above. Each non-null scalar/text/bytea value has exactly one execution-owned payload allocation and NULL has none. A nonempty Binary bytea allocates exactly `len` bytes; an empty Binary bytea allocates one zero sentinel byte, passes its non-null pointer with recorded length zero, and remains distinct from `None`. Direct and prepared BufferedFull retain through synchronous completion; SingleRow/PortalBatch retain until `PQgetResult` returns null or fail-closed cleanup destroys the context. Every Measure, partial Encode, or option-plan failure frees installed context/vector/payload owners once and sends nothing. | exact Parse/Bind formula and every encoding-class budget boundary; `65_535`/`65_536`; per-type/nullable measure-versus-wire-byte/length/format/OID goldens; every ordered two-parameter default/explicit-Text/explicit-Binary pair plus three-parameter heterogeneous control; direct/prepared `Some(empty bytea)` versus `None`; U+0000; accepted-limit/rejected-next multi-parameter and statement-name twins with zero payload allocation/send on rejection; count-only scalar formatter parity; mode replay/wrong-mode; mutation/source-Drop retention; partial-bind allocation/free matrix; synchronous/streamed context lifetime counters |
+| libpq call parity | Pass the exact independently formed per-parameter format vector and result-format code to every `PQexecParams`, `PQexecPrepared`, `PQsendQueryParams`, and `PQsendQueryPrepared` call. Do not route an explicit Binary call through `PQexec`, text fallback, or a second SQL statement. Timeout, cancellation, normal drain, status fail-close, transaction effect, and delivery selection remain those of the adjacent D8/D9/A1 ledger. | stub capture of every ordered two-parameter format pair x every result-format state x synchronous/asynchronous direct Query and prepared Query path; separate direct-command capture; required live PostgreSQL mixed-format controls; retained deadline/delivery/status/cancellation matrices |
+| result metadata and decode | Add exact `PQfformat` FFI use and make descriptor offset 80, statement offset 56, and rows offset 40 the same generated row-validator v2 pointer with exact ABI `fn(context: raw, mode: u8) -> i32`, where `0=Metadata` and `1=Value`; every other mode returns failure before a package callback. The changed rows pointer signature bumps the shared 120-byte, 8-aligned rows record from v3 to v4 with every byte offset otherwise unchanged. Metadata mode calls `validate_row_count_v3` once, then `validate_field_metadata_v3` in declared order. SQLite validates count/name; PostgreSQL validates count/name/OID/requested format. On success it publishes the context metadata state above. Value mode requires that state, then calls `validate_field_value_v3` in declared order for NULL and representation/payload; SQLite also validates its row-dynamic native type. Text uses the existing parsers. Binary rejects wrong fixed width, bool bytes other than 0/1, negative length, null pointer for a present value, or invalid UTF-8 before a safe view or decoder call. Integer and float decode use endian-explicit bit operations. Every row-producing SQLite Query execution and every tuple-producing PGresult generation invokes Metadata exactly once before row count, zero-row terminal disposal, cardinality, `has_next`, decode, or batch append; Value runs once per decoded/appended row and never for cardinality-only drain. Binary text/bytea views point directly into the current PGresult generation; Text bytea retains its owned decode buffer. `one_native` clones the validated first Row into `out` exactly as before. The descriptor producer, statement/rows constructors, one complete rows-v4 validator, every rows consumer/Drop path, sealed direct/prepared/current-metadata/current-value bridges, HIR validator, MIR, LLVM preflight, and whole/per-unit retention all recognize the v2 signature and reject v1, rows v3, cross-Query, invalid-mode, value-before-metadata, and malformed-thunk paths. | zero-row valid/wrong count/name/OID/format exact Decode-before-exhaustion/cardinality owners for BufferedFull/SingleRow/PortalBatch and direct/prepared; every new PGresult generation metadata call count including terminal; metadata-before-value multi-invalid matrix; rows-v4 and validator-v2 body/signature/relocation semantic-byte goldens plus sema/MIR malformed-call owners; per-type result-format/NULL/malformed width/bool/UTF-8/pointer; zero-copy pointer identity; view-generation and one-clone owners; cumulative SQLite metadata/value suite |
+| cleanup, errors, and allocation | Return exactly the error records and precedence table above. A missing binary proof and a malformed normalized plan fail before native state. Parameter representation/NUL/length failures fail before send. Malformed binary result metadata or payload preserves the first exact `Decode` row-contract error while the result sequence drains or closes under the shipped delivery rules. No decode error permits another decoder call. Free row-cache-owned Text bytea storage, parameter storage, PGresult, context, unpublished batch/Row, statement eligibility vector/dependency, and lease exactly once on success, error, timeout, cancellation, early Drop, and malformed state. Binary scalar/text/bytea result decode adds no per-field heap allocation beyond the existing row cache. | exact error identity and intra-field precedence matrix crossed with direct/prepared and BufferedFull/SingleRow/PortalBatch; first-error/no-more-decode counters crossed with Conn/Tx; fault-injected allocation/cleanup matrix; early Drop and statement/connection reuse; sanitizer-compatible stub owners |
+| artifact, cache, and documentation identity | Application-facing module interfaces and static Query semantic fingerprints do not change because the Text/Binary surface already exists. The added/changed exported compiler-private measurement and prevalidated signatures in `pkg.db.internal` and `pkg.db.internal.postgres` change those internal module interface hashes and every importing module's dependency-interface key once. Descriptor v6's 144-byte image, binder-v2/row-validator-v2/resolver/count-thunk bodies, package callback names/semantics, rows v4's 120-byte implementation, statement v4's 112-byte implementation, and shared context v4's 112-byte implementation also change their exact compiler/package implementation hashes and invalidate affected codegen/object/dependency cache entries once. Checked artifacts, metadata, SQL identity, and driver restriction remain unchanged. English/Japanese package designs and the live handoff agree on the next/shipped boundary. | both internal-module interface-hash and importer dependency-key before/after twins; descriptor semantic-byte parity plus binder/row-validator/resolver/count-thunk relocation/body and implementation/cache invalidation twins; rows 120-byte/statement 112-byte/context 112-byte goldens; application-interface/artifact/metadata identity controls; English/Japanese consistency check; handoff updated only with the implementation milestone |
+| acceptance and measurement | Require merged D8/D9 streaming/cancellation, A1 batch and direct/prepared delivery, libpq client >=17, and the required PostgreSQL server job. Parameter format and result format are independent axes: for two named Query parameters, cross every ordered pair from `{default Text, explicit Text, explicit Binary}` (nine plans) with `{default Text, explicit Text, explicit Binary}` result format (27 products) on both direct and prepared stub paths; include a three-parameter heterogeneous control and the applicable direct-command parameter/result-code cases. Separately cross every mapped type/nullable form through Text and Binary measure/bind/decode, plus BufferedFull and both explicit delivery modes. Cross exact Parse/Bind formulas, direct/prepared statement-name lengths, single/multiple/NULL payloads, all encoding classes, accepted-limit/rejected-next, and parameter counts `65_535`/`65_536` through no-allocation stubs; then cross timeout absent/present, Conn/Tx, rows/one/command where callable, zero/one/many rows, valid/malformed zero-row and nonempty metadata/payload, and whole/per-unit linking without collapsing the two format axes. Run `scripts/db-verify-local.sh` before push. Record the named local Text-versus-Binary parameter/row measurement with payload bytes, copied bytes, allocations, time-to-first-row, and full-scan throughput after correctness; it is not a semantic gate. | focused 27-product Query format-plan/result owner plus command and mixed live controls; protocol-budget/count boundary and Measure/Encode parity owners; metadata-only zero-row/new-generation owners; per-type package/compiler owners; retained `pkg_db_q4b`/`pkg_db_a1`/`pkg_db_q5b2`; required live PostgreSQL suite, local database parity gate, and non-gating measurement record |
+
+The first fresh review found two P1 omissions and one P2 error-contract gap. Empty Binary bytea now
+has an exact non-null zero-length representation and direct/prepared owner. The normalized-plan row
+now pins the complete compiler-private signature, bounds, ownership, malformed result, and call-
+formation guard. The error table now fixes every observable field and multi-invalid order. The
+author-side sibling audit also found that a differing prepared `ParameterOid` could otherwise reuse
+the descriptor's static Binary proof; statement v4 therefore retains effective-OID eligibility
+without narrowing Text preparation. These changes reopen the internal ABI/ownership cells but keep
+the one strict producer-to-consumer implementation boundary.
+
+The next fresh review found two further P1 closure failures. The eligibility length had only a
+self-reported statement count, so descriptor v6 and statement v4 now retain one generated constant
+count thunk and validate it under the complete header before any vector scan. Prepared option
+validation also depended on state that the earlier precedence sentence placed after options; the
+single order is now complete statement header and identity, common/native options, driver and
+physical live state. The exact malformed-statement/invalid-option and valid-wrong-driver/invalid-
+option winners close that multi-invalid product. This reopens the ABI and validation-order rows;
+the one implementation boundary remains unchanged.
+
+The redesigned review then found two more P1s, so the closure matrix is reopened on the
+`result-generation-metadata x independent-format-product` axis rather than patched locally. Result
+schema is now a generation-level obligation with an exact row-validator-v2 Metadata mode that runs
+before zero-row/cardinality/terminal handling and a guarded Value mode for delivered rows. The same
+reopen makes parameter-plan state and result-format state independent: one parameterized owner
+closes the complete two-parameter 27-product instead of a coupled `default/Text/Binary` shorthand.
+The implementation remains one boundary because the changed producer thunk, shared context ABI,
+every result consumer, and format propagation must land together to avoid either dormant proof or
+unchecked empty results.
+
+The next redesigned review found two P1 and two P2 omissions, so the matrix is reopened on the
+`cross-driver-context-bytes x internal-interface-cache x metadata-cardinality x encoded-length`
+axis. SQLite now has canonical zero bytes and no ownership in context offsets 56--79, internal
+prevalidated signature changes explicitly invalidate interface/dependency keys, every result
+generation's metadata wins before second-row Cardinality, and each selected wire encoding has an
+accepted maximum plus rejected next length. These are one closure axis because constructors,
+validators, consumers, cleanup, cache identity, and observable error precedence must agree on the
+same ABI generation; splitting them would leave either an unreadable context image or a stale caller.
+
+The protocol-boundary review then found two P2 omissions: libpq's C `int` is not the complete Bind
+envelope, and Parse/Bind parameter counts are 16-bit protocol fields. The ledger now owns the exact
+Parse/Bind length formulas and the `65_535` maximum. Binder v2 and context v4 provide one no-payload-
+allocation Measure pass before Encode, rather than promising impossible per-value maxima or relying
+on a late libpq failure. This changes the wire-validation strategy, so the matrix is reopened on the
+`protocol-count x aggregate-message-budget x measure-before-encode` axis while retaining the same
+one producer-to-consumer implementation boundary.
+
+The implementation references are [PostgreSQL protocol message formats](https://www.postgresql.org/docs/17/protocol-message-formats.html),
+[libpq parameter/result formats](https://www.postgresql.org/docs/17/libpq-exec.html),
+[libpq single-row mode](https://www.postgresql.org/docs/17/libpq-single-row-mode.html), and the
+PostgreSQL built-in send/receive functions named above. Run one fresh independent adversarial
+review of this ledger and its one-PR capability boundary before implementation. Close findings
+ledger-first. Before code review, extract every normative `must`/`exact`/`every`/`before`/
+`reject`/`required` statement in this subsection and point it to one implementation path and one
+discriminating owner. A finding in resolver signs, format propagation, endian conversion, result
+metadata ordering, or cleanup triggers the complete sibling type/operation/delivery audit.
+
 - bounded `next_batch`, batch generations, segmented child buffers, nullable validity bitmaps, and
   direct eligible `soa<Row>` decode with no intermediate AoS — shipped by the first A1 rail;
 - PostgreSQL single-row and portal-batch delivery — specified by the ledger above;
-- PostgreSQL binary parameter/result formats;
+- PostgreSQL binary parameter/result formats — specified by the ledger above;
 - a separately specified owned-Row/owned-collection materializer only if a measured consumer needs
   `string`/dynamic-array Row storage; it must not weaken the v1 `RegionPlain` path;
 - PostgreSQL COPY/pipeline/LISTEN-NOTIFY;

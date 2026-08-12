@@ -15430,7 +15430,7 @@ pub fn make_command<P>() -> command<P> = process.abort()
 pub fn make_query<P, R>() -> query<P, R> = process.abort()
 
 pub fn bind_command<P>(statement: command<P>, context: raw, params: P) -> i32 {
-  unsafe { return pkg.db.internal.descriptor.bind(statement, context, params) }
+  unsafe { return pkg.db.internal.descriptor.bind(statement, context, params, 1 as u8) }
 }
 
 pub fn decode_query<P, R>(statement: query<P, R>, context: raw) -> R {
@@ -15504,12 +15504,23 @@ fn main() -> i32 {
                 _ => None,
             })
             .expect("command binder raw call");
-        assert_eq!(bind_call.2.len(), 2);
+        assert_eq!(bind_call.2.len(), 3);
         assert_eq!(bind_call.2[0], Ty::Raw);
         assert!(matches!(bind_call.2[1], Ty::Struct(_)));
         assert_eq!(
+            bind_call.2[2],
+            Ty::Int(align_sema::IntTy {
+                bits: 8,
+                signed: false,
+            })
+        );
+        assert_eq!(
             bind_call.4.param_modes,
-            [align_ast::ParamMode::ByValue, align_ast::ParamMode::Borrow]
+            [
+                align_ast::ParamMode::ByValue,
+                align_ast::ParamMode::Borrow,
+                align_ast::ParamMode::ByValue,
+            ]
         );
         assert!(matches!(bind_call.1[1], Operand::BorrowedPlace(_)));
         assert_eq!(
@@ -15854,7 +15865,7 @@ import pkg.db
 import pkg.db.internal.descriptor
 
 pub fn bind<P>(params: P, statement: pkg.db.command<P>, context: raw) -> i32 {
-  unsafe { return pkg.db.internal.descriptor.bind(statement, context, params) }
+  unsafe { return pkg.db.internal.descriptor.bind(statement, context, params, 1 as u8) }
 }
 "#;
         let sqlite = r#"module pkg.db.sqlite

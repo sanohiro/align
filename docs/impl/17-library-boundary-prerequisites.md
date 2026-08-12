@@ -2558,15 +2558,16 @@ Every key emits `align_rt_<key>` except `print -> align_rt_print_i64`,
 `cli_command -> align_rt_cli_command_new`, and
 `http_request -> align_rt_http_request_new`. The main wrapper additionally declares
 `align_rt_report_error` and, only for argv main, `align_rt_args_build`; neither has a MIR lookup
-key. Three further always-built runtime exports are unkeyed base rows. Four `alloc-count` probes
+key. Eleven further always-built runtime exports are unkeyed base rows: the three existing
+runtime-internal helpers and eight package-internal PostgreSQL codec helpers. Four `alloc-count` probes
 and four distinct `par-map-probe` exports are verification-only runtime-fixture records; their
 names remain ordinary program/extern/export spellings. `task-group-probe` adds no unmangled export. The
 four AEAD cross-product symbols are ordinary keys
 rather than a codegen-side string match.
 [`20-runtime-abi-ledger.md`](20-runtime-abi-ledger.md) owns all 283 keyed symbol/type/attribute
-records, the five always-built unkeyed records, and the eight verification-only probe records.
-The compiler registry is fixed at 288 base records with no feature or ambient input. The eight
-probe rows extend only the verification-time maximum runtime-export table to 296; they are never a
+records, the thirteen always-built unkeyed records, and the eight verification-only probe records.
+The compiler registry is fixed at 296 base records with no feature or ambient input. The eight
+probe rows extend only the verification-time maximum runtime-export table to 304; they are never a
 RuntimeKey, callable declaration, collision reservation, or compatible-extern reuse target.
 Probe-feature runtime builds never link user artifacts. Runtime feature selection affects only
 export-set verification and changes no source acceptance or MIR/interface/artifact/cache identity.
@@ -3342,7 +3343,7 @@ The am-c author-side construction/consumption inventory is exact for the current
 | program | validated stored functions, per-unit imports, extern declarations, HIR `Call`, `FnValue`, lifted `Closure`, every scalar/AoS pipeline stage, `reduce`/`any`/`all`, `scan`, `partition`, `sort_by_key`, and parallel terminal/stage callables | MIR print/debug, work-weight scan, tagged-type remap/embedded-type scan, LLVM definition/import/extern declaration registry, direct-call lowering, extern coercion, function-value and closure thunk discovery/lowering, parallel signature checks, whole/per-unit symbol/linkage, explicit exports, and main wrapping |
 | runtime | the 15 compiler-produced direct semantic keys split into eight specialized choices (`Print`, `PrintStr`, `PrintBool`, `PrintChar`, `PrintF32`, `PrintF64`, `Hash64`, `Hash128`) and seven generic legacy-map calls (`ProcessExit`, `ProcessAbort`, `DivFail`, `BoundsFail`, `RangeFail`, `Utf8BoundaryFail`, `LenMismatchFail`); every other dedicated MIR native node remains an exact `RuntimeKey` consumer in LLVM lowering | the fixed 283 keyed declarations and their typed dedicated consumers; the legacy alias seam populated from those declarations for unchanged seven-key generic direct calls and deferred program/generated consumers; two typed unkeyed wrapper handles; contract attributes, ThinLTO guarded rows, runtime export verification, compatible-extern reuse, and allocation/cleanup calls; `AllocSizeFail` is dedicated, while `error(code)` is not a RuntimeKey and lowers to the existing MIR identity value instead of surviving as a call |
 | generated | every distinct `FnAddr`, capturing `Closure`, `SpawnTask` result/fallibility pair, `ParMapParallel` materialize/filter count/filter scatter request, and `ParMapReduce` request | pre-body collection/validation, canonical byte sorting/deduplication, global-name reservation/probing, helper declaration/body emission, call-site pointer selection, debug names, and malformed-before-publication rejection |
-| symbol/cache | stored and imported Align definitions, extern C declarations, explicit exports, direct/wrapped main, 288 fixed native base rows, and generated requests | encoded `align_fn$<length>$<hex>` definition/import lookup, exact extern/native reuse, external-identity collision rejection, deterministic generated probing, ThinLTO internalization roots, structural MIR `impl_hash`, compiler-build cache identity, and unchanged interface/source-ABI hashes |
+| symbol/cache | stored and imported Align definitions, extern C declarations, explicit exports, direct/wrapped main, 296 fixed native base rows, and generated requests | encoded `align_fn$<length>$<hex>` definition/import lookup, exact extern/native reuse, external-identity collision rejection, deterministic generated probing, ThinLTO internalization roots, structural MIR `impl_hash`, compiler-build cache identity, and unchanged interface/source-ABI hashes |
 
 The callable applicability matrix is exhaustive; “unavailable” is an invalid hand-built MIR cell,
 not a missing positive owner:

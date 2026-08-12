@@ -649,11 +649,11 @@ fn artifact_semantics_and_checked_in_goldens() {
     assert!(runtime.bytes.starts_with(b"ALIGNQST"));
     assert_eq!(
         query_artifact.digest.to_hex(),
-        "11a2b7081c610a9c1745774360b1b6e7"
+        "447a011d927564088766bd5ecd0b2ddf"
     );
     assert_eq!(
         align_interface::Hash128::of(&runtime.bytes).to_hex(),
-        "c750d9b771de5bf8e9e0661a51ba5fb6"
+        "839dd5f59f461bee5db515a38ef73587"
     );
     assert_eq!(runtime.artifact_digest, query_artifact.digest);
     assert_eq!(runtime.static_options, query.static_options);
@@ -682,11 +682,11 @@ fn artifact_semantics_and_checked_in_goldens() {
     assert!(runtime.bytes.starts_with(b"ALIGNCST"));
     assert_eq!(
         command_artifact.digest.to_hex(),
-        "569127377c471dc7ba327efc91170a66"
+        "ea264f3f4782eb4bc400b5da098fa525"
     );
     assert_eq!(
         align_interface::Hash128::of(&runtime.bytes).to_hex(),
-        "108cb4f217617910decb55349129e800"
+        "fd8125941059deabe8ee752d8308a4c4"
     );
     assert_eq!(runtime.artifact_digest, command_artifact.digest);
     assert_eq!(runtime.static_options, command.static_options);
@@ -1011,9 +1011,9 @@ fn generated_runtime_data_is_producer_owned() {
             else {
                 panic!("descriptor constructor must start with relocation-bearing static data");
             };
-            assert_eq!(data.bytes.len(), 136);
+            assert_eq!(data.bytes.len(), 144);
             assert_eq!(data.align, 8);
-            assert_eq!(&data.bytes[0..4], &5u32.to_le_bytes());
+            assert_eq!(&data.bytes[0..4], &6u32.to_le_bytes());
             assert_eq!(
                 data.bytes[4],
                 u8::from(descriptor.consumer == StaticDescriptorConsumer::Command)
@@ -1040,7 +1040,7 @@ fn generated_runtime_data_is_producer_owned() {
                 ).then_some(relocation.offset))
                 .collect::<Vec<_>>();
             if descriptor.consumer == StaticDescriptorConsumer::Query {
-                assert_eq!(thunk_offsets, vec![64, 72, 80, 88, 96, 104, 120]);
+                assert_eq!(thunk_offsets, vec![64, 72, 80, 88, 96, 104, 120, 136]);
                 let materializer = data
                     .relocations
                     .iter()
@@ -1092,7 +1092,7 @@ fn generated_runtime_data_is_producer_owned() {
                 };
                 assert_eq!(batch_thunk_offsets, expected);
             } else {
-                assert_eq!(thunk_offsets, vec![64, 72, 104]);
+                assert_eq!(thunk_offsets, vec![64, 72, 104, 136]);
                 assert_eq!(&data.bytes[96..104], &[0; 8]);
                 assert_eq!(&data.bytes[120..128], &[0; 8]);
                 assert_eq!(&data.bytes[128..136], &[0; 8]);
@@ -1126,11 +1126,22 @@ fn generated_runtime_data_is_producer_owned() {
                 .mir
                 .fns
                 .iter()
-                .find(|function| function.name.as_str() == format!("{symbol}$static_bind_v1"))
+                .find(|function| function.name.as_str() == format!("{symbol}$static_bind_v2"))
                 .expect("generated binder");
             assert_eq!(
                 binder.param_modes,
-                vec![align_ast::ParamMode::ByValue, align_ast::ParamMode::Borrow]
+                vec![
+                    align_ast::ParamMode::ByValue,
+                    align_ast::ParamMode::Borrow,
+                    align_ast::ParamMode::ByValue,
+                ]
+            );
+            assert_eq!(
+                binder.slots[2],
+                align_sema::Ty::Int(align_sema::IntTy {
+                    bits: 8,
+                    signed: false,
+                })
             );
             let parameter_resolver = unit
                 .mir
@@ -1152,6 +1163,31 @@ fn generated_runtime_data_is_producer_owned() {
                     signed: true,
                 })
             );
+            let parameter_count_thunk = unit
+                .mir
+                .fns
+                .iter()
+                .find(|function| {
+                    function.name.as_str() == format!("{symbol}$parameter_count_v1")
+                })
+                .expect("generated parameter count thunk");
+            assert!(parameter_count_thunk.params.is_empty());
+            assert_eq!(
+                parameter_count_thunk.ret,
+                align_sema::Ty::Int(align_sema::IntTy {
+                    bits: 32,
+                    signed: false,
+                })
+            );
+            assert!(matches!(
+                parameter_count_thunk.blocks.as_slice(),
+                [align_mir::Block {
+                    term: align_mir::Term::Return(Some(align_mir::Operand::Const(
+                        align_mir::Const::Int(value, _)
+                    ))),
+                    ..
+                }] if *value == parameter_count as i128
+            ));
             let static_validator = unit
                 .mir
                 .fns

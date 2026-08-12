@@ -34,7 +34,7 @@ jobs:
     env:
       ALIGN_APT_PACKAGES: >-
         llvm-22-dev clang-22 libclang-rt-22-dev lld-22
-        libssl-dev zlib1g-dev libzstd-dev
+        libpq-dev libssl-dev zlib1g-dev libzstd-dev
       # Fail closed on the linker per platform, same rule as ci.yml: the PGO
       # training phase links the whole examples/pkg.db corpus, so a missing
       # lld-22 would quietly make a release build slower rather than fail.
@@ -78,6 +78,27 @@ jobs:
           # package set and the repository definition cannot drift. --uncached
           # also drops the resolved archives afterwards, which matters on a
           # runner already holding two PGO build directories.
+          if [ -x scripts/ci-pgdg.sh ]; then
+            scripts/ci-pgdg.sh
+          else
+            # workflow_dispatch may rebuild a tag created before ci-pgdg.sh
+            # existed. Keep the current workflow's dependency floor usable
+            # without requiring the historical source tree to contain current
+            # release machinery.
+            PGDG_KEY="$RUNNER_TEMP/pgdg.asc"
+            curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o "$PGDG_KEY"
+            FINGERPRINTS="$(gpg --show-keys --with-colons "$PGDG_KEY" 2>/dev/null \
+              | awk -F: '$1 == "fpr" { print $10 }')"
+            printf '%s\n' "$FINGERPRINTS" \
+              | grep -qxF B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8
+            CODENAME="$(. /etc/os-release && printf '%s' "$VERSION_CODENAME")"
+            ARCHITECTURE="$(dpkg --print-architecture)"
+            sudo install -d -m 0755 /etc/apt/keyrings
+            sudo install -m 0644 "$PGDG_KEY" /etc/apt/keyrings/align-pgdg.asc
+            printf 'deb [arch=%s signed-by=%s] https://apt.postgresql.org/pub/repos/apt %s-pgdg main\n' \
+              "$ARCHITECTURE" /etc/apt/keyrings/align-pgdg.asc "$CODENAME" \
+              | sudo tee /etc/apt/sources.list.d/align-pgdg.list >/dev/null
+          fi
           scripts/ci-apt-llvm.sh install --uncached
           echo "LLVM_SYS_221_PREFIX=/usr/lib/llvm-22" >> "$GITHUB_ENV"
           echo "LLVM_CONFIG=/usr/lib/llvm-22/bin/llvm-config" >> "$GITHUB_ENV"
@@ -87,12 +108,28 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          brew install llvm@22 openssl@3 zstd
+          brew install llvm@22 openssl@3 libpq zstd
           LLVM_PREFIX="$(brew --prefix llvm@22)"
+          LIBPQ_PREFIX="$(brew --prefix libpq)"
           echo "LLVM_SYS_221_PREFIX=$LLVM_PREFIX" >> "$GITHUB_ENV"
           echo "LLVM_CONFIG=$LLVM_PREFIX/bin/llvm-config" >> "$GITHUB_ENV"
           echo "$LLVM_PREFIX/bin" >> "$GITHUB_PATH"
-          echo "LIBRARY_PATH=$(brew --prefix openssl@3)/lib:$(brew --prefix zstd)/lib" >> "$GITHUB_ENV"
+          echo "$LIBPQ_PREFIX/bin" >> "$GITHUB_PATH"
+          echo "LIBRARY_PATH=$LIBPQ_PREFIX/lib:$(brew --prefix openssl@3)/lib:$(brew --prefix zstd)/lib" >> "$GITHUB_ENV"
+
+      - name: Verify libpq client baseline
+        shell: bash
+        run: |
+          if [ -x scripts/check-libpq-version.sh ]; then
+            scripts/check-libpq-version.sh
+          else
+            # Historical tags do not use the new streamed-delivery symbols,
+            # but the current release environment still guarantees libpq 17.
+            LIBPQ_VERSION="$(pg_config --version | awk '{ print $2 }')"
+            LIBPQ_MAJOR="${LIBPQ_VERSION%%.*}"
+            test "$LIBPQ_MAJOR" -ge 17
+            echo "libpq client version: $LIBPQ_VERSION (historical-tag fallback)"
+          fi
 
       # Two-phase PGO: a compiler is a branch-heavy workload, so profile-guided
       # layout stacks a measured 5-15% frontend win on top of dist's thin LTO.

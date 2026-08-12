@@ -92,6 +92,39 @@ impl FloatWrite for Vec<u8> {
     }
 }
 
+struct FixedFloatBuf {
+    bytes: [u8; 128],
+    len: usize,
+}
+
+impl std::io::Write for FixedFloatBuf {
+    fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+        let remaining = self.bytes.len().saturating_sub(self.len);
+        if input.len() > remaining {
+            return Err(std::io::Error::other(
+                "float rendering exceeded fixed buffer",
+            ));
+        }
+        self.bytes[self.len..self.len + input.len()].copy_from_slice(input);
+        self.len += input.len();
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl FloatWrite for FixedFloatBuf {
+    fn bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        std::io::Write::write_all(self, bytes).expect("fixed float rendering buffer is sufficient");
+    }
+}
+
 fn push_float<T: std::fmt::Display>(buf: &mut impl FloatWrite, x: T) {
     let start = buf.bytes().len();
     let _ = write!(buf, "{x}");
@@ -122,6 +155,102 @@ pub extern "C" fn align_rt_print_f32(x: f32) {
     line.push(b'\n');
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(&line).and_then(|()| out.flush());
+}
+
+/// Package-internal bit-preserving float conversion for native binary codecs.
+///
+/// The bit-conversion helpers keep wire encoders and decoders allocation-free and
+/// preserve signed zero, infinities, and NaN payloads exactly. The text-length
+/// helpers measure the canonical rendering without allocating. These are runtime
+/// ABI helpers rather than language-level numeric conversions.
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_f32_to_bits(value: f32) -> u32 {
+    value.to_bits()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_f32_from_bits(bits: u32) -> f32 {
+    f32::from_bits(bits)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_f64_to_bits(value: f64) -> u64 {
+    value.to_bits()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_f64_from_bits(bits: u64) -> f64 {
+    f64::from_bits(bits)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_f32_text_len(value: f32) -> i64 {
+    let mut output = FixedFloatBuf {
+        bytes: [0; 128],
+        len: 0,
+    };
+    push_float(&mut output, value);
+    output.len as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn align_rt_f64_text_len(value: f64) -> i64 {
+    let mut output = FixedFloatBuf {
+        bytes: [0; 128],
+        len: 0,
+    };
+    push_float(&mut output, value);
+    output.len as i64
+}
+
+unsafe fn write_fixed_float<T: std::fmt::Display>(value: T, output: *mut u8, capacity: i64) -> i64 {
+    let Ok(capacity) = usize::try_from(capacity) else {
+        return -1;
+    };
+    let mut rendered = FixedFloatBuf {
+        bytes: [0; 128],
+        len: 0,
+    };
+    push_float(&mut rendered, value);
+    if rendered.len > capacity || (rendered.len > 0 && output.is_null()) {
+        return -1;
+    }
+    if rendered.len > 0 {
+        unsafe { std::ptr::copy_nonoverlapping(rendered.bytes.as_ptr(), output, rendered.len) };
+    }
+    rendered.len as i64
+}
+
+/// Write the canonical allocation-free `f32` text rendering into caller-owned storage.
+///
+/// # Safety
+///
+/// When the canonical rendering is nonempty and fits in `capacity`, `output` must be valid for
+/// writes of the exact byte length returned by [`align_rt_f32_text_len`]. A negative or
+/// insufficient `capacity` returns `-1` without dereferencing `output`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_f32_text_write(
+    value: f32,
+    output: *mut u8,
+    capacity: i64,
+) -> i64 {
+    unsafe { write_fixed_float(value, output, capacity) }
+}
+
+/// Write the canonical allocation-free `f64` text rendering into caller-owned storage.
+///
+/// # Safety
+///
+/// When the canonical rendering is nonempty and fits in `capacity`, `output` must be valid for
+/// writes of the exact byte length returned by [`align_rt_f64_text_len`]. A negative or
+/// insufficient `capacity` returns `-1` without dereferencing `output`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_f64_text_write(
+    value: f64,
+    output: *mut u8,
+    capacity: i64,
+) -> i64 {
+    unsafe { write_fixed_float(value, output, capacity) }
 }
 
 /// A `str` view passed/returned across the ABI: `{ ptr, len }` (`06-runtime-std.md` §2).
@@ -18892,6 +19021,15 @@ const _: extern "C" fn(i64, i64, i64) -> i64 = align_rt_test_par_map_min_chunk_f
 #[cfg(feature = "par-map-probe")]
 const _: extern "C" fn() -> i64 = align_rt_test_par_map_workers;
 
+const _: extern "C" fn(f32) -> u32 = align_rt_f32_to_bits;
+const _: extern "C" fn(u32) -> f32 = align_rt_f32_from_bits;
+const _: extern "C" fn(f64) -> u64 = align_rt_f64_to_bits;
+const _: extern "C" fn(u64) -> f64 = align_rt_f64_from_bits;
+const _: extern "C" fn(f32) -> i64 = align_rt_f32_text_len;
+const _: extern "C" fn(f64) -> i64 = align_rt_f64_text_len;
+const _: unsafe extern "C" fn(f32, *mut u8, i64) -> i64 = align_rt_f32_text_write;
+const _: unsafe extern "C" fn(f64, *mut u8, i64) -> i64 = align_rt_f64_text_write;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -18948,9 +19086,65 @@ mod tests {
                 None
             })
             .collect();
-        assert_eq!(runtime.len(), 288);
-        assert_eq!(registry.len(), 288);
+        assert_eq!(runtime.len(), 296);
+        assert_eq!(registry.len(), 296);
         assert_eq!(runtime, registry);
+    }
+
+    #[test]
+    fn package_float_helpers_preserve_bits_and_measure_canonical_text() {
+        for bits in [
+            0_u32,
+            0x8000_0000,
+            f32::INFINITY.to_bits(),
+            f32::NEG_INFINITY.to_bits(),
+            0x7fc0_1234,
+        ] {
+            let value = align_rt_f32_from_bits(bits);
+            assert_eq!(align_rt_f32_to_bits(value), bits);
+
+            let mut expected = Vec::new();
+            push_float(&mut expected, value);
+            assert_eq!(align_rt_f32_text_len(value), expected.len() as i64);
+            let mut actual = [0_u8; 128];
+            let written =
+                unsafe { align_rt_f32_text_write(value, actual.as_mut_ptr(), actual.len() as i64) };
+            assert_eq!(written, expected.len() as i64);
+            let written = usize::try_from(written)
+                .unwrap_or_else(|_| panic!("successful f32 text length is nonnegative"));
+            assert_eq!(&actual[..written], expected.as_slice());
+        }
+
+        for bits in [
+            0_u64,
+            0x8000_0000_0000_0000,
+            f64::INFINITY.to_bits(),
+            f64::NEG_INFINITY.to_bits(),
+            0x7ff8_0000_0000_1234,
+        ] {
+            let value = align_rt_f64_from_bits(bits);
+            assert_eq!(align_rt_f64_to_bits(value), bits);
+
+            let mut expected = Vec::new();
+            push_float(&mut expected, value);
+            assert_eq!(align_rt_f64_text_len(value), expected.len() as i64);
+            let mut actual = [0_u8; 128];
+            let written =
+                unsafe { align_rt_f64_text_write(value, actual.as_mut_ptr(), actual.len() as i64) };
+            assert_eq!(written, expected.len() as i64);
+            let written = usize::try_from(written)
+                .unwrap_or_else(|_| panic!("successful f64 text length is nonnegative"));
+            assert_eq!(&actual[..written], expected.as_slice());
+        }
+
+        assert_eq!(
+            unsafe { align_rt_f32_text_write(1.0, std::ptr::null_mut(), 3) },
+            -1
+        );
+        assert_eq!(
+            unsafe { align_rt_f64_text_write(1.0, std::ptr::null_mut(), -1) },
+            -1
+        );
     }
 
     /// Matches the opaque storage envelope reserved by codegen for nonescaping builder headers.

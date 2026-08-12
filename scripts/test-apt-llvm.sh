@@ -374,9 +374,9 @@ output=""
 key_of() {
   env RUNNER_TEMP="$tmp_dir/key" "$@" /bin/bash "$under_test" key
 }
-db_list="llvm-22-dev clang-22 libclang-rt-22-dev lld-22 libpq-dev libsqlite3-dev libssl-dev zlib1g-dev libzstd-dev make perl"
-reversed_list="perl make libzstd-dev zlib1g-dev libssl-dev libsqlite3-dev libpq-dev lld-22 libclang-rt-22-dev clang-22 llvm-22-dev"
-lint_list="llvm-22-dev clang-22 libclang-rt-22-dev lld-22 libssl-dev zlib1g-dev libzstd-dev make perl"
+db_list="llvm-22-dev clang-22 libclang-rt-22-dev lld-22 libpq-dev postgresql-client-17 libsqlite3-dev libssl-dev zlib1g-dev libzstd-dev make perl"
+reversed_list="perl make libzstd-dev zlib1g-dev libssl-dev libsqlite3-dev postgresql-client-17 libpq-dev lld-22 libclang-rt-22-dev clang-22 llvm-22-dev"
+lint_list="llvm-22-dev clang-22 libclang-rt-22-dev lld-22 libpq-dev libssl-dev zlib1g-dev libzstd-dev make perl"
 db_key="$(key_of ALIGN_APT_PACKAGES="$db_list")"
 reversed_key="$(key_of ALIGN_APT_PACKAGES="$reversed_list")"
 lint_key="$(key_of ALIGN_APT_PACKAGES="$lint_list")"

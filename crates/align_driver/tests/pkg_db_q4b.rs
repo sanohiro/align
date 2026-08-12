@@ -859,6 +859,19 @@ fn direct_overlap(borrow connection: pkg.db.conn) -> i32 {
     pkg.db.exec_conn(connection), app.q4b_query.deadline_success(), deadline_params(), [],
   )
   if !overlap_error(second) { return 12 }
+  arena out {
+    scalar := pkg.db.one(
+      pkg.db.exec_conn(connection), app.q4b_query.deadline_success(), deadline_params(), out, [],
+    )
+    scalar_overlap := match scalar {
+      Err(error) => match error {
+        Unsupported(contract) => contract.item == "postgres.connection.active_execution"
+        _ => false
+      }
+      Ok(_) => false
+    }
+    if !scalar_overlap { return 13 }
+  }
   return 0
 }
 
@@ -2257,13 +2270,13 @@ const PARITY_CASES: &[ParityCase] = &[
 ///
 /// Regenerate ONLY with a reviewed reason, from the panic message this emits.
 const PARITY_FINGERPRINT_GOLDEN: &str = "\
-pkg-db-q4b-full-matrix-parity/absent_values/postgres ec61f97163fb426e
-pkg-db-q4b-full-matrix-parity/absent_values/sqlite a0c3f1256f797be4
-pkg-db-q4b-full-matrix-parity/counters/postgres 17833e8112c666ee
-pkg-db-q4b-full-matrix-parity/one_retained_bytes/postgres 00029e1d32fbb498
-pkg-db-q4b-full-matrix-parity/one_retained_bytes/sqlite ebd3c5440d20030c
-pkg-db-q4b-full-matrix-parity/present_values/postgres fafe721a49cf9464
-pkg-db-q4b-full-matrix-parity/present_values/sqlite b3cb905db2f0ef98
+pkg-db-q4b-full-matrix-parity/absent_values/postgres 017dd4378910d75e
+pkg-db-q4b-full-matrix-parity/absent_values/sqlite b93682aa197ea258
+pkg-db-q4b-full-matrix-parity/counters/postgres b2be3ad1432665a6
+pkg-db-q4b-full-matrix-parity/one_retained_bytes/postgres 67cc72cd9cd512b0
+pkg-db-q4b-full-matrix-parity/one_retained_bytes/sqlite 57b372dd884bd660
+pkg-db-q4b-full-matrix-parity/present_values/postgres 84397260bac28ee4
+pkg-db-q4b-full-matrix-parity/present_values/sqlite 65baba0036a47abc
 ";
 
 #[test]
@@ -3196,7 +3209,7 @@ fn materialized_projects_are_removed_on_drop() {
 const LAYER1_FINGERPRINT_GOLDEN: &str = "\
 pkg-db-q4b-deadline-disposition f76981d6793fa0d1
 pkg-db-q4b-owned-params 5e455caea2840caa
-pkg-db-q4b-postgres-buffered-lifecycle 3a7a76c6f028bb6d
+pkg-db-q4b-postgres-buffered-lifecycle d14c08bf985b4356
 pkg-db-q4b-postgres-command-deadline 7a4bb2c4f41be14a
 pkg-db-q4b-postgres-deadline-cancel 229550b0c45c3e0f
 pkg-db-q4b-postgres-deadline-fault-phases 6527ac1deff4966e

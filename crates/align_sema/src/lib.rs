@@ -30982,6 +30982,15 @@ impl<'a, 't> Checker<'a, 't> {
         if method == "bind_prepared" {
             return self.check_prepared_bind_op(args, expected, span);
         }
+        if matches!(
+            method,
+            "prepared_parameter_ordinal" | "prepared_parameter_binary_ordinal"
+        ) {
+            return self.check_prepared_parameter_ordinal_op(method, args, expected, span);
+        }
+        if method == "prepared_parameter_count" {
+            return self.check_prepared_parameter_count_op(args, expected, span);
+        }
         if matches!(method, "prepare_sqlite" | "prepare_postgres") {
             return self.check_prepare_dispatch_op(method, args, expected, span);
         }
@@ -31017,10 +31026,13 @@ impl<'a, 't> Checker<'a, 't> {
             | "batch_plan"
             | "meta_materializer"
             | "parameter_resolver"
+            | "parameter_count_thunk"
+            | "parameter_count_value"
             | "parameter_count" => 1,
-            "validate_static" | "validate_row" | "decode" => 2,
-            "bind" => 3,
-            "parameter_known" | "parameter_ordinal" => 2,
+            "validate_static" | "decode" => 2,
+            "validate_row" => 3,
+            "bind" => 4,
+            "parameter_known" | "parameter_ordinal" | "parameter_binary_ordinal" => 2,
             "materialize_meta" => 4,
             "execute_sqlite" | "rows_sqlite" => 4,
             "execute_postgres" | "rows_postgres" => 5,
@@ -31504,7 +31516,8 @@ impl<'a, 't> Checker<'a, 't> {
             "stream_decoder" => 120,
             "batch_plan" => 128,
             "meta_materializer" | "materialize_meta" => 96,
-            "parameter_resolver" | "parameter_ordinal" => 104,
+            "parameter_resolver" | "parameter_ordinal" | "parameter_binary_ordinal" => 104,
+            "parameter_count_thunk" | "parameter_count_value" => 136,
             _ => unreachable!(),
         };
         let pointer_offset = Expr {
@@ -31515,6 +31528,7 @@ impl<'a, 't> Checker<'a, 't> {
             }),
             span,
         };
+        let raw_call_guard_data = data.clone();
         let callee = Expr {
             kind: ExprKind::RawPointerLoad {
                 ptr: Box::new(data),
@@ -31537,6 +31551,7 @@ impl<'a, 't> Checker<'a, 't> {
                 | "batch_plan"
                 | "meta_materializer"
                 | "parameter_resolver"
+                | "parameter_count_thunk"
         ) {
             self.constrain(Ty::Raw, expected, span);
             return callee;
@@ -31589,7 +31604,7 @@ impl<'a, 't> Checker<'a, 't> {
             };
         }
 
-        if method == "parameter_ordinal" {
+        if matches!(method, "parameter_ordinal" | "parameter_binary_ordinal") {
             let name = self.check_str_init(&args[1]);
             if name.ty == Ty::Error {
                 return err;
@@ -31609,13 +31624,65 @@ impl<'a, 't> Checker<'a, 't> {
                 signed: true,
             });
             self.constrain(ret, expected, span);
-            return Expr {
+            let resolver_call = Expr {
                 kind: ExprKind::RawCall {
                     guard: None,
                     callee: Box::new(callee),
                     args: vec![name],
                     param_tys: vec![Ty::Str],
                     param_modes: vec![ast::ParamMode::ByValue],
+                    return_borrow: hir::ReturnBorrowSummary::None,
+                    return_region: hir::ReturnRegionSummary::None,
+                    return_cleanup: hir::ReturnCleanupAbi::None,
+                },
+                ty: ret,
+                span,
+            };
+            let normalizer = if method == "parameter_ordinal" {
+                "pkg.db.internal$parameter_ordinal_v2"
+            } else {
+                "pkg.db.internal$binary_parameter_ordinal_v2"
+            };
+            return Expr {
+                kind: ExprKind::Call {
+                    func: normalizer.to_owned(),
+                    args: vec![resolver_call],
+                    type_args: Vec::new(),
+                },
+                ty: ret,
+                span,
+            };
+        }
+
+        if method == "parameter_count_value" {
+            let ret = Ty::Int(IntTy {
+                bits: 32,
+                signed: false,
+            });
+            self.constrain(ret, expected, span);
+            let guard_kind = Expr {
+                kind: ExprKind::Int(if query { 0 } else { 1 }),
+                ty: Ty::Int(IntTy {
+                    bits: 8,
+                    signed: false,
+                }),
+                span,
+            };
+            return Expr {
+                kind: ExprKind::RawCall {
+                    guard: Some(Box::new(Expr {
+                        kind: ExprKind::Call {
+                            func: "pkg.db.internal$descriptor_count_shape_valid".to_owned(),
+                            args: vec![raw_call_guard_data, guard_kind],
+                            type_args: Vec::new(),
+                        },
+                        ty: Ty::Bool,
+                        span,
+                    })),
+                    callee: Box::new(callee),
+                    args: Vec::new(),
+                    param_tys: Vec::new(),
+                    param_modes: Vec::new(),
                     return_borrow: hir::ReturnBorrowSummary::None,
                     return_region: hir::ReturnRegionSummary::None,
                     return_cleanup: hir::ReturnCleanupAbi::None,
@@ -31654,6 +31721,36 @@ impl<'a, 't> Checker<'a, 't> {
             call_args.push(params);
             param_tys.push(params_ty);
             param_modes.push(ast::ParamMode::Borrow);
+            let mode_ty = Ty::Int(IntTy { bits: 8, signed: false });
+            let mode = self.check_expr(&args[3], Some(mode_ty));
+            if mode.ty == Ty::Error || !self.source_ty_matches(mode.ty, mode_ty) {
+                if mode.ty != Ty::Error {
+                    self.diags.error(
+                        format!("descriptor binder mode must be u8, got {}", self.ty_display(mode.ty)),
+                        args[3].span,
+                    );
+                }
+                return err;
+            }
+            call_args.push(mode);
+            param_tys.push(mode_ty);
+            param_modes.push(ast::ParamMode::ByValue);
+        }
+        if method == "validate_row" {
+            let mode_ty = Ty::Int(IntTy { bits: 8, signed: false });
+            let mode = self.check_expr(&args[2], Some(mode_ty));
+            if mode.ty == Ty::Error || !self.source_ty_matches(mode.ty, mode_ty) {
+                if mode.ty != Ty::Error {
+                    self.diags.error(
+                        format!("row validator mode must be u8, got {}", self.ty_display(mode.ty)),
+                        args[2].span,
+                    );
+                }
+                return err;
+            }
+            call_args.push(mode);
+            param_tys.push(mode_ty);
+            param_modes.push(ast::ParamMode::ByValue);
         }
         let ret = if method == "decode" {
             instance.args[1]
@@ -31694,10 +31791,10 @@ impl<'a, 't> Checker<'a, 't> {
             ty: Ty::Error,
             span,
         };
-        let [reference_ast, context_ast, params_ast] = args else {
+        let [reference_ast, context_ast, params_ast, mode_ast] = args else {
             self.diags.error(
                 format!(
-                    "static descriptor operation 'bind_prepared' expects 3 argument(s), got {}",
+                    "static descriptor operation 'bind_prepared' expects 4 argument(s), got {}",
                     args.len()
                 ),
                 span,
@@ -31770,6 +31867,17 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err();
         }
+        let mode_ty = Ty::Int(IntTy { bits: 8, signed: false });
+        let mode = self.check_expr(mode_ast, Some(mode_ty));
+        if mode.ty == Ty::Error || !self.source_ty_matches(mode.ty, mode_ty) {
+            if mode.ty != Ty::Error {
+                self.diags.error(
+                    format!("prepared binder mode must be u8, got {}", self.ty_display(mode.ty)),
+                    mode_ast.span,
+                );
+            }
+            return err();
+        }
         let wrapper = Expr {
             kind: ExprKind::ResourceRaw {
                 reference: Box::new(reference),
@@ -31778,6 +31886,7 @@ impl<'a, 't> Checker<'a, 't> {
             ty: Ty::Raw,
             span: reference_ast.span,
         };
+        let guard_wrapper = wrapper.clone();
         let offset = Expr {
             kind: ExprKind::Int(24),
             ty: Ty::Int(IntTy {
@@ -31801,16 +31910,240 @@ impl<'a, 't> Checker<'a, 't> {
         self.constrain(ret, expected, span);
         Expr {
             kind: ExprKind::RawCall {
-                guard: None,
+                guard: Some(Box::new(Self::stmt_header_guard(guard_wrapper, span))),
                 callee: Box::new(callee),
-                args: vec![context, params],
-                param_tys: vec![Ty::Raw, params_ty],
-                param_modes: vec![ast::ParamMode::ByValue, ast::ParamMode::Borrow],
+                args: vec![context, params, mode],
+                param_tys: vec![Ty::Raw, params_ty, mode_ty],
+                param_modes: vec![
+                    ast::ParamMode::ByValue,
+                    ast::ParamMode::Borrow,
+                    ast::ParamMode::ByValue,
+                ],
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
                 return_cleanup: hir::ReturnCleanupAbi::None,
             },
             ty: ret,
+            span,
+        }
+    }
+
+    /// D13 bridge from a concrete dependent statement to its retained producer-owned parameter
+    /// resolver. The same complete statement-v3 guard protects both this callback and the binder;
+    /// malformed HIR cannot turn an arbitrary raw field into a callable resolver.
+    fn check_prepared_parameter_ordinal_op(
+        &mut self,
+        method: &str,
+        args: &[ast::Expr],
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Expr {
+        let err = || Expr {
+            kind: ExprKind::Bool(false),
+            ty: Ty::Error,
+            span,
+        };
+        let [reference_ast, name_ast] = args else {
+            self.diags.error(
+                format!(
+                    "static descriptor operation '{method}' expects 2 argument(s), got {}",
+                    args.len()
+                ),
+                span,
+            );
+            return err();
+        };
+        let reference = self.check_expr(reference_ast, None);
+        let reference_ty = self.resolve(reference.ty);
+        let Ty::ResourceRef(resource) = reference_ty else {
+            if reference_ty != Ty::Error {
+                self.diags.error(
+                    format!(
+                        "prepared parameter lookup requires `resource_ref<db.stmt<P,R>>`, got {}",
+                        self.ty_display(reference_ty)
+                    ),
+                    reference_ast.span,
+                );
+            }
+            return err();
+        };
+        let valid = self.resource_instances.get(&resource).is_some_and(|instance| {
+            instance.canonical == "pkg.db$stmt" && instance.args.len() == 2
+        });
+        if !valid {
+            self.diags.error(
+                "prepared parameter lookup requires a concrete statement resource".to_owned(),
+                reference_ast.span,
+            );
+            return err();
+        }
+        let name = self.check_str_init(name_ast);
+        if name.ty == Ty::Error {
+            return err();
+        }
+        if !self.source_ty_matches(name.ty, Ty::Str) {
+            self.diags.error(
+                format!(
+                    "prepared parameter name must be `str`, got {}",
+                    self.ty_display(name.ty)
+                ),
+                name_ast.span,
+            );
+            return err();
+        }
+        let wrapper = Expr {
+            kind: ExprKind::ResourceRaw {
+                reference: Box::new(reference),
+                resource,
+            },
+            ty: Ty::Raw,
+            span: reference_ast.span,
+        };
+        let guard_wrapper = wrapper.clone();
+        let result_wrapper = wrapper.clone();
+        let callee = Expr {
+            kind: ExprKind::RawPointerLoad {
+                ptr: Box::new(wrapper),
+                offset: Box::new(Expr {
+                    kind: ExprKind::Int(80),
+                    ty: Ty::Int(IntTy {
+                        bits: 64,
+                        signed: true,
+                    }),
+                    span,
+                }),
+            },
+            ty: Ty::Raw,
+            span,
+        };
+        let ret = Ty::Int(IntTy {
+            bits: 32,
+            signed: true,
+        });
+        self.constrain(ret, expected, span);
+        let resolver_call = Expr {
+            kind: ExprKind::RawCall {
+                guard: Some(Box::new(Self::stmt_header_guard(guard_wrapper, span))),
+                callee: Box::new(callee),
+                args: vec![name],
+                param_tys: vec![Ty::Str],
+                param_modes: vec![ast::ParamMode::ByValue],
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
+                return_cleanup: hir::ReturnCleanupAbi::None,
+            },
+            ty: ret,
+            span,
+        };
+        let (func, call_args) = if method == "prepared_parameter_ordinal" {
+            (
+                "pkg.db.internal$parameter_ordinal_v2",
+                vec![resolver_call],
+            )
+        } else {
+            (
+                "pkg.db.internal.resource$stmt_binary_ordinal",
+                vec![result_wrapper, resolver_call],
+            )
+        };
+        Expr {
+            kind: ExprKind::Call {
+                func: func.to_owned(),
+                args: call_args,
+                type_args: Vec::new(),
+            },
+            ty: ret,
+            span,
+        }
+    }
+
+    /// D13 guarded invocation of the retained statement parameter-count thunk. The structural
+    /// guard establishes the fixed v4 fields and non-null thunk before the call; the package's
+    /// complete validator compares the result with the stored count before scanning eligibility.
+    fn check_prepared_parameter_count_op(
+        &mut self,
+        args: &[ast::Expr],
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Expr {
+        let err = || Expr {
+            kind: ExprKind::Bool(false),
+            ty: Ty::Error,
+            span,
+        };
+        let [statement_ast] = args else {
+            self.diags.error(
+                format!(
+                    "static descriptor operation 'prepared_parameter_count' expects 1 argument(s), got {}",
+                    args.len()
+                ),
+                span,
+            );
+            return err();
+        };
+        let statement = self.check_expr(statement_ast, Some(Ty::Raw));
+        if statement.ty == Ty::Error || !self.source_ty_matches(statement.ty, Ty::Raw) {
+            if statement.ty != Ty::Error {
+                self.diags.error(
+                    "prepared parameter count requires a raw statement pointer".to_owned(),
+                    statement_ast.span,
+                );
+            }
+            return err();
+        }
+        let guard_statement = statement.clone();
+        let callee = Expr {
+            kind: ExprKind::RawPointerLoad {
+                ptr: Box::new(statement),
+                offset: Box::new(Expr {
+                    kind: ExprKind::Int(96),
+                    ty: Ty::Int(IntTy {
+                        bits: 64,
+                        signed: true,
+                    }),
+                    span,
+                }),
+            },
+            ty: Ty::Raw,
+            span,
+        };
+        let ret = Ty::Int(IntTy {
+            bits: 32,
+            signed: false,
+        });
+        self.constrain(ret, expected, span);
+        Expr {
+            kind: ExprKind::RawCall {
+                guard: Some(Box::new(Expr {
+                    kind: ExprKind::Call {
+                        func: "pkg.db.internal.resource$stmt_header_shape_valid".to_owned(),
+                        args: vec![guard_statement],
+                        type_args: Vec::new(),
+                    },
+                    ty: Ty::Bool,
+                    span,
+                })),
+                callee: Box::new(callee),
+                args: Vec::new(),
+                param_tys: Vec::new(),
+                param_modes: Vec::new(),
+                return_borrow: hir::ReturnBorrowSummary::None,
+                return_region: hir::ReturnRegionSummary::None,
+                return_cleanup: hir::ReturnCleanupAbi::None,
+            },
+            ty: ret,
+            span,
+        }
+    }
+
+    fn stmt_header_guard(wrapper: Expr, span: Span) -> Expr {
+        Expr {
+            kind: ExprKind::Call {
+                func: "pkg.db.internal.resource$stmt_header_valid".to_owned(),
+                args: vec![wrapper],
+                type_args: Vec::new(),
+            },
+            ty: Ty::Bool,
             span,
         }
     }
@@ -32100,16 +32433,19 @@ impl<'a, 't> Checker<'a, 't> {
             ty: Ty::Error,
             span,
         };
-        let [reference_ast, context_ast] = args else {
+        let required = if method == "validate_current_row" { 3 } else { 2 };
+        if args.len() != required {
             self.diags.error(
                 format!(
-                    "static descriptor operation '{method}' expects 2 argument(s), got {}",
+                    "static descriptor operation '{method}' expects {required} argument(s), got {}",
                     args.len()
                 ),
                 span,
             );
             return err();
-        };
+        }
+        let reference_ast = &args[0];
+        let context_ast = &args[1];
         let reference = self.check_expr(reference_ast, None);
         let Ty::ResourceRef(rows_id) = self.resolve(reference.ty) else {
             if reference.ty != Ty::Error {
@@ -32174,14 +32510,25 @@ impl<'a, 't> Checker<'a, 't> {
         };
         let (ret, call_args, param_tys, param_modes, return_borrow, return_region) =
             if method == "validate_current_row" {
+                let mode_ty = Ty::Int(IntTy { bits: 8, signed: false });
+                let mode = self.check_expr(&args[2], Some(mode_ty));
+                if mode.ty == Ty::Error || !self.source_ty_matches(mode.ty, mode_ty) {
+                    if mode.ty != Ty::Error {
+                        self.diags.error(
+                            "current-row validator mode must be u8".to_owned(),
+                            args[2].span,
+                        );
+                    }
+                    return err();
+                }
                 (
                     Ty::Int(IntTy {
                         bits: 32,
                         signed: true,
                     }),
-                    vec![context],
-                    vec![Ty::Raw],
-                    vec![ast::ParamMode::ByValue],
+                    vec![context, mode],
+                    vec![Ty::Raw, mode_ty],
+                    vec![ast::ParamMode::ByValue, ast::ParamMode::ByValue],
                     hir::ReturnBorrowSummary::None,
                     hir::ReturnRegionSummary::None,
                 )

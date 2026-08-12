@@ -1,0 +1,134 @@
+module main
+
+import pkg.db
+import pkg.db.postgres
+import std.time
+
+extern "C" {
+  fn align_rt_alloc_count() -> i64
+  fn align_rt_free_count() -> i64
+}
+
+pub Params { first_value: i64, last_value: i64 }
+pub Row { value: i64 }
+Timed { elapsed_ns: i64, checksum: i64 }
+Probe { elapsed_ns: i64, allocations: i64, frees: i64, checksum: i64 }
+
+pub fn values() -> pkg.db.query<Params, Row> = pkg.db.postgres.query(
+  "SELECT value::bigint AS value FROM generate_series(:first_value, :last_value) AS value ORDER BY value",
+  [],
+  [
+    pkg.db.postgres.QueryOption.ParameterType("first_value", "int8"),
+    pkg.db.postgres.QueryOption.ParameterType("last_value", "int8"),
+  ],
+)
+
+fn open(
+  borrow connection: pkg.db.conn,
+  last_value: i64,
+  binary: bool,
+) -> Result<pkg.db.rows<Row>, pkg.db.Error> {
+  params := Params { first_value: 1, last_value: last_value }
+  statement: pkg.db.query<Params, Row> := values()
+  if binary {
+    result := pkg.db.postgres.rows_native(
+      pkg.db.exec_conn(connection), statement, params, [],
+      [
+        pkg.db.postgres.ExecuteOption.ParameterFormat(
+          "first_value", pkg.db.postgres.Format.Binary,
+        ),
+        pkg.db.postgres.ExecuteOption.ParameterFormat(
+          "last_value", pkg.db.postgres.Format.Binary,
+        ),
+        pkg.db.postgres.ExecuteOption.ResultFormat(pkg.db.postgres.Format.Binary),
+        pkg.db.postgres.ExecuteOption.Delivery(pkg.db.postgres.Delivery.SingleRow),
+      ],
+    )
+    return result
+  }
+  result := pkg.db.postgres.rows_native(
+    pkg.db.exec_conn(connection), statement, params, [],
+    [pkg.db.postgres.ExecuteOption.Delivery(pkg.db.postgres.Delivery.SingleRow)],
+  )
+  return result
+}
+
+fn first_work(borrow connection: pkg.db.conn, last_value: i64, binary: bool) -> Timed {
+  start := time.instant()
+  mut rows := open(connection, last_value, binary) else {
+    return Timed { elapsed_ns: -1, checksum: -1 }
+  }
+  selected := pkg.db.next(rows) else { return Timed { elapsed_ns: -2, checksum: -2 } }
+  row := selected else { return Timed { elapsed_ns: -3, checksum: -3 } }
+  return Timed { elapsed_ns: time.instant() - start, checksum: row.value }
+}
+
+fn scan_work(borrow connection: pkg.db.conn, last_value: i64, binary: bool) -> Timed {
+  start := time.instant()
+  mut rows := open(connection, last_value, binary) else {
+    return Timed { elapsed_ns: -1, checksum: -1 }
+  }
+  mut checksum: i64 := 0
+  loop {
+    selected := pkg.db.next(rows) else { return Timed { elapsed_ns: -2, checksum: -2 } }
+    row := selected else { break }
+    checksum = checksum + row.value
+  }
+  return Timed { elapsed_ns: time.instant() - start, checksum: checksum }
+}
+
+fn probe_first(borrow connection: pkg.db.conn, last_value: i64, binary: bool) -> Probe {
+  unsafe {
+    alloc0 := align_rt_alloc_count()
+    free0 := align_rt_free_count()
+    timed := first_work(connection, last_value, binary)
+    return Probe {
+      elapsed_ns: timed.elapsed_ns,
+      allocations: align_rt_alloc_count() - alloc0,
+      frees: align_rt_free_count() - free0,
+      checksum: timed.checksum,
+    }
+  }
+}
+
+fn probe_scan(borrow connection: pkg.db.conn, last_value: i64, binary: bool) -> Probe {
+  unsafe {
+    alloc0 := align_rt_alloc_count()
+    free0 := align_rt_free_count()
+    timed := scan_work(connection, last_value, binary)
+    return Probe {
+      elapsed_ns: timed.elapsed_ns,
+      allocations: align_rt_alloc_count() - alloc0,
+      frees: align_rt_free_count() - free0,
+      checksum: timed.checksum,
+    }
+  }
+}
+
+fn emit(value: Probe) {
+  print(value.elapsed_ns)
+  print(value.allocations)
+  print(value.frees)
+  print(value.checksum)
+}
+
+pub fn main(args: array<str>) -> Result<(), Error> {
+  if args.len() != 2 { return Err(error(2)) }
+  connection := pkg.db.postgres.connect(args[1], []) else { return Err(error(3)) }
+  rows: i64 := 100000
+
+  // Warm every path before taking the named record.
+  warm_text_first := first_work(connection, rows, false)
+  warm_binary_first := first_work(connection, rows, true)
+  warm_text_scan := scan_work(connection, rows, false)
+  warm_binary_scan := scan_work(connection, rows, true)
+  if warm_text_first.checksum != 1 || warm_binary_first.checksum != 1
+    || warm_text_scan.checksum != 5000050000
+    || warm_binary_scan.checksum != 5000050000 { return Err(error(4)) }
+
+  emit(probe_first(connection, rows, false))
+  emit(probe_first(connection, rows, true))
+  emit(probe_scan(connection, rows, false))
+  emit(probe_scan(connection, rows, true))
+  return Ok(())
+}

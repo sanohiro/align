@@ -47,7 +47,8 @@ jobs:
       ALIGN_DB_POSTGRES_URL: postgresql://align:align@127.0.0.1:5432/align
       ALIGN_APT_PACKAGES: >-
         llvm-22-dev clang-22 libclang-rt-22-dev lld-22
-        libpq-dev libsqlite3-dev libssl-dev zlib1g-dev libzstd-dev make perl
+        libpq-dev postgresql-client-17
+        libsqlite3-dev libssl-dev zlib1g-dev libzstd-dev make perl
       # Fail closed on the linker: `alignc` would otherwise silently fall back
       # to the system linker if lld-22 ever stopped being installed, and the
       # only symptom would be slower links nobody notices. Demanding it makes
@@ -90,6 +91,10 @@ jobs:
           path: ${{ steps.apt-llvm.outputs.path }}
           key: ${{ steps.apt-llvm.outputs.key }}
 
+      - name: Configure the PostgreSQL client repository
+        shell: bash
+        run: scripts/ci-pgdg.sh
+
       - name: Install LLVM and database libraries
         shell: bash
         run: |
@@ -122,6 +127,7 @@ jobs:
           dpkg-query --show llvm-22-dev
           pg_config --version
           psql --version
+          scripts/check-libpq-version.sh
           psql "$ALIGN_DB_POSTGRES_URL" -Atqc 'SHOW server_version'
 
       - name: Required-mode configuration self-test
@@ -157,6 +163,11 @@ jobs:
         run: |
           scripts/cargo.sh test --locked -p align_driver --test pkg_db_q5b2 -- --nocapture
 
+      - name: Required streamed delivery owners
+        shell: bash
+        run: |
+          scripts/cargo.sh test --locked -p align_driver --test pkg_db_a1 -- --nocapture
+
       - name: Save Cargo caches
         if: github.ref == 'refs/heads/main'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -186,7 +197,7 @@ jobs:
     env:
       ALIGN_APT_PACKAGES: >-
         llvm-22-dev clang-22 libclang-rt-22-dev lld-22
-        libssl-dev zlib1g-dev libzstd-dev make perl
+        libpq-dev libssl-dev zlib1g-dev libzstd-dev make perl
       # Fail closed on the linker per platform: the Linux legs must actually
       # get lld-22 (a missing package is a red build, not a silent fallback to
       # the slow linker), and macOS states the Apple linker explicitly, which
@@ -246,6 +257,7 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
+          scripts/ci-pgdg.sh
           scripts/ci-apt-llvm.sh install
           OPENSSL_PREFIX="$RUNNER_TEMP/openssl-${OPENSSL_VERSION}"
           if [ ! -x "$OPENSSL_PREFIX/bin/openssl" ]; then
@@ -281,12 +293,14 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          brew install llvm@22 openssl@3 zstd
+          brew install llvm@22 openssl@3 libpq zstd
           LLVM_PREFIX="$(brew --prefix llvm@22)"
+          LIBPQ_PREFIX="$(brew --prefix libpq)"
           echo "LLVM_SYS_221_PREFIX=$LLVM_PREFIX" >> "$GITHUB_ENV"
           echo "LLVM_CONFIG=$LLVM_PREFIX/bin/llvm-config" >> "$GITHUB_ENV"
           echo "$LLVM_PREFIX/bin" >> "$GITHUB_PATH"
-          echo "LIBRARY_PATH=$(brew --prefix openssl@3)/lib:$(brew --prefix zstd)/lib" >> "$GITHUB_ENV"
+          echo "$LIBPQ_PREFIX/bin" >> "$GITHUB_PATH"
+          echo "LIBRARY_PATH=$LIBPQ_PREFIX/lib:$(brew --prefix openssl@3)/lib:$(brew --prefix zstd)/lib" >> "$GITHUB_ENV"
 
       - name: Verify toolchain
         shell: bash
@@ -295,6 +309,7 @@ jobs:
           "$LLVM_CONFIG" --version
           openssl version
           cc --version
+          scripts/check-libpq-version.sh
           # The full apt.llvm.org snapshot, which a cache hit pins for the life
           # of the runner image. Logged so an x86_64/ARM64 snapshot difference
           # is never read as a code change.

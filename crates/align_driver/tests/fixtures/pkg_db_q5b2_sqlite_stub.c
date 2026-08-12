@@ -130,6 +130,15 @@ int32_t PQnfields(void *result) {
   if (postgres_key_query) return 15;
   return 4;
 }
+char *PQfname(void *result, int32_t column) {
+  (void)result; (void)column; return "";
+}
+uint32_t PQftype(void *result, int32_t column) {
+  (void)result; (void)column; return 0;
+}
+int32_t PQfformat(void *result, int32_t column) {
+  (void)result; (void)column; return 0;
+}
 int32_t PQgetisnull(void *result, int32_t row, int32_t column) {
   (void)result; (void)row;
   if (postgres_key_query && (column == 0 || column == 2 || column == 3)) return 0;
@@ -153,3 +162,25 @@ char *PQresultErrorField(void *result, int32_t field) {
 }
 void PQclear(void *result) { (void)result; pq_clear_calls += 1; }
 void PQfinish(void *connection) { (void)connection; }
+int32_t PQsetnonblocking(void *connection, int32_t enabled) {
+  (void)connection; (void)enabled; return 0;
+}
+int32_t PQflush(void *connection) { (void)connection; return 0; }
+int32_t PQconsumeInput(void *connection) { (void)connection; return 1; }
+int32_t PQisBusy(void *connection) { (void)connection; return 0; }
+void *PQgetResult(void *connection) { (void)connection; return 0; }
+int32_t PQtransactionStatus(void *connection) { (void)connection; return 0; }
+void *PQcancelCreate(void *connection) { (void)connection; return &fake_postgres; }
+int32_t PQcancelStart(void *cancel) { (void)cancel; return 1; }
+int32_t PQcancelPoll(void *cancel) { (void)cancel; return 3; }
+int32_t PQcancelSocket(const void *cancel) { (void)cancel; return 0; }
+char *PQcancelErrorMessage(const void *cancel) { (void)cancel; return 0; }
+void PQcancelFinish(void *cancel) { (void)cancel; }
+int32_t PQsocketPoll(
+    int32_t socket,
+    int32_t for_read,
+    int32_t for_write,
+    int64_t end_time_us) {
+  (void)socket; (void)for_read; (void)for_write; (void)end_time_us; return 1;
+}
+int64_t PQgetCurrentTimeUSec(void) { return 0; }
