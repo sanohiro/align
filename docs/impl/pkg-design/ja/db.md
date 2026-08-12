@@ -3363,15 +3363,16 @@ cleanupはSQLite zero-only slotをownerとしてinterpretしない。
 
 actual aggregate boundはPostgreSQL protocol v3が固定する。trusted parameter count `N`はlibpqのwide C
 `int` argumentに関係なくParse/Bind `Int16` count fieldのunsigned range `65_535`以下。ここで使うexact
-libpq 17 call shapeはparameter-format count=`N`、result-format count=one、portal name=empty、statement
-name=directではempty/preparedではretained generated ASCII name。`S`をterminator込みstatement-name
-C-string byte count、`payload_i`をNULLならzero、それ以外はexact selected encoded lengthとする。
-one-byte message tagを除きown four byteを含むBind length fieldはexactly
-`13 + S + 6*N + sum(payload_i)`で`2_147_483_647`以下。Parse lengthはPostgreSQL wire-SQLのterminator
+libpq 17 call shapeはparameter-format count=`N`、result-format countはTextでzero/Binaryでone、
+portal name=empty、statement name=directではempty/preparedではretained generated ASCII name。
+`F`をvalidated result-format tag (`0=Text`,`1=Binary`)、`S`をterminator込みstatement-name C-string
+byte count、`payload_i`をNULLならzero、それ以外はexact selected encoded lengthとする。one-byte
+message tagを除きown four byteを含むBind length fieldはexactly
+`11 + 2*F + S + 6*N + sum(payload_i)`で`2_147_483_647`以下。Parse lengthはPostgreSQL wire-SQLのterminator
 込みC-string byte countを`Q`としてexactly `6 + S + Q + 4*N`でsame limit。direct executionは両formula、
 preparationはParse、prepared executionはBindをcheckする。全arithmeticはnarrow前にchecked `u64`。
 Measure前、context offset 96にsigned `i64`でstoreするexact fixed-budget resultは
-`2_147_483_647 - (13 + S + 6*N)`。negativeまたはnon-`i64` resultはstore前にfailする。
+`2_147_483_647 - (11 + 2*F + S + 6*N)`。negativeまたはnon-`i64` resultはstore前にfailする。
 
 descriptor/artifact formationはartifact/cache publication前に`N > 65_535`をdiagnostic
 `PostgreSQL static query supports at most 65535 parameters`でrejectする。そのcountを持つmalformed
@@ -3384,7 +3385,7 @@ debitする。Text scalar measurementはsame canonical formatterをcount-only si
 ordinalがexact Bind `Encode` errorを返しlater fieldはinspectしない。complete successful Measure passだけが
 binder-v2 Encode modeをpermitする。parameterized budget ownerはno-allocation measurement stubを使い、
 multi-gigabyte fixtureなしでdirect/prepared、single/multiple/NULL value、every encoding class、both
-statement-name length、`65_535`/`65_536`のaccepted-limit/rejected-limit-plus-one pairをderiveする。
+result format、both statement-name length、`65_535`/`65_536`のaccepted-limit/rejected-limit-plus-one pairをderiveする。
 
 binder callback familyはexact。every callbackは
 `fn(context: raw, protocol_ordinal: u32, value: T) -> i32`。non-null fieldは`Some`へliftし、nullable
@@ -3406,14 +3407,22 @@ eachはsettled callback status modelを使う。successはexact zero、first con
 exact one。valid callbackはother statusを返さず、MeasureはEncodeへ、EncodeはMeasureへdelegateしない。
 
 これらのcheckはsettled operation phaseをreorderせずextendする。direct executionはcomplete
-descriptor/count/identity、option、driver/live state、context/full format vector、generated static contract、
-続いてParse budget、Bind fixed budget、binder-v2 Measure、lease、Encode、deadline、sendの順。prepared
-executionはcomplete statement/count/identityとoption、続いてdriver/live state、lease、context/full format
-vector、Bind fixed budget、Measure、Encode、deadline、sendの順。preparationはname formation/Parse budget/
-`PQprepare`前にcomplete descriptor/options/live stateをvalidateする。したがってheader/count errorはevery
-optionよりwinし、direct Parse-budget errorはevery parameter-value errorよりwin、Measure errorはincreasing
-protocol ordinal順、prepared overlapは従来どおりparameter measurementよりwinする。budget failureは
-binder-v2 Encode callback/libpqをcallしない。
+descriptor/count/identity、option、driver/live state、context、generated static contractをvalidateし、続いて
+leaseをacquire、exact full format vectorをallocate/install、Parse budgetとBind fixed budgetをvalidateした後に
+binder-v2 Measure、Encode、deadline、sendの順。prepared executionはcomplete statement/count/identityと
+option、driver/live stateをvalidate、leaseをacquire、context/full format vectorをcreate、Bind fixed budgetを
+validateした後にMeasure、Encode、deadline、sendの順。preparationはcomplete descriptor/options/live
+stateをvalidateしleaseをacquireした後にname formation、Parse budget、`PQprepare`の順。したがって
+header/count errorはevery optionよりwinし、overlapはevery direct/prepared parameter measurementよりwin、
+successful lease acquisition後はdirect Parse-budget errorがevery parameter-value errorよりwinし、Measure errorは
+increasing protocol ordinal順。budget failureはbinder-v2 Encode callback/libpqをcallしない。
+
+call-local sparse normalized planはsuccessful native-option validationの末尾でformし、execution contextには
+installしない。下記closure matrixでnormalized planをinstallするとは、generated static validationと
+successful lease acquisitionの後にexecution-owned exact full format vectorをallocate/installすることを指す。
+package-context rowのcomplete fixed Bind formulaはexact
+`2_147_483_647 - (11 + 2*F + S + 6*N)`で、initializerはdirect/preparedの両executionでそのsuccessful
+leaseの後だけrunする。
 
 `one_native`でもMetadata modeはevery newly acquired tuple-producing resultでrunする。malformed second
 generationはCardinality前にexact row-contract Decode errorを返す。metadata-valid second generationは

@@ -4947,17 +4947,18 @@ SQLite slot as an owner.
 
 PostgreSQL protocol v3 fixes the actual aggregate bounds. The trusted parameter count `N` is at most
 `65_535`, the unsigned range of the Parse/Bind `Int16` count fields, regardless of libpq's wider C
-`int` argument. For the exact libpq 17 call shape used here, parameter-format count is `N`, result-
-format count is one, the portal name is empty, and the statement name is empty for direct execution
-or the retained generated ASCII name for prepared execution. Let `S` be that statement-name C-string
-byte count including its terminator and `payload_i` be zero for NULL or the exact selected encoded
-length otherwise. The Bind length field, which includes its own four bytes but excludes the one-byte
-message tag, is exactly `13 + S + 6*N + sum(payload_i)` and must be at most `2_147_483_647`. The Parse
+`int` argument. For the exact libpq 17 call shape used here, parameter-format count is `N`, the
+result-format count is zero for Text and one for Binary, the portal name is empty, and the statement
+name is empty for direct execution or the retained generated ASCII name for prepared execution. Let
+`F` be the validated result-format tag (`0=Text`, `1=Binary`), `S` be that statement-name C-string byte
+count including its terminator, and `payload_i` be zero for NULL or the exact selected encoded length
+otherwise. The Bind length field, which includes its own four bytes but excludes the one-byte message
+tag, is exactly `11 + 2*F + S + 6*N + sum(payload_i)` and must be at most `2_147_483_647`. The Parse
 length is exactly `6 + S + Q + 4*N`, where `Q` is the PostgreSQL wire-SQL C-string byte count including
 its terminator, and has the same limit. Direct execution checks both formulas; preparation checks
 Parse; prepared execution checks Bind. All arithmetic is checked in `u64` before narrowing.
 Before Measure, the exact fixed-budget result stored as signed `i64` at context offset 96 is
-`2_147_483_647 - (13 + S + 6*N)`; a negative or non-`i64` result fails before that store.
+`2_147_483_647 - (11 + 2*F + S + 6*N)`; a negative or non-`i64` result fails before that store.
 
 Descriptor/artifact formation rejects `N > 65_535` before artifact or cache publication with the
 diagnostic `PostgreSQL static query supports at most 65535 parameters`; a malformed runtime
@@ -4972,8 +4973,8 @@ source byte length. The first ordinal whose encoding arithmetic or debit fails r
 `Encode` error and no later field is inspected. Only a complete successful Measure pass permits
 binder-v2 Encode mode. Parameterized budget owners use a no-allocation measurement stub and derive
 accepted-limit/rejected-limit-plus-one pairs for direct/prepared, single/multiple/NULL values, every
-encoding class, both statement-name lengths, and `65_535`/`65_536`, without constructing a multi-
-gigabyte fixture.
+encoding class, both result formats, both statement-name lengths, and `65_535`/`65_536`, without
+constructing a multi-gigabyte fixture.
 
 The binder callback family is exact. Every callback has signature
 `fn(context: raw, protocol_ordinal: u32, value: T) -> i32`; a non-null field is lifted to `Some`
@@ -4996,15 +4997,26 @@ first context-owned failure. No valid callback returns another status, Measure n
 Encode, and Encode never delegates to Measure.
 
 These checks extend, rather than reorder, the settled operation phases. Direct execution validates
-the complete descriptor/count/identity, options, driver/live state, context/full format vector, and
-generated static contract; then Parse budget, Bind fixed budget, binder-v2 Measure, lease, Encode,
-deadline, and send. Prepared execution validates the complete statement/count/identity and options,
-then driver/live state, lease, context/full format vector, Bind fixed budget, Measure, Encode,
-deadline, and send. Preparation validates its complete descriptor/options/live state before name
-formation and Parse budget and before `PQprepare`. Consequently a header/count error beats every
-option, a direct Parse-budget error beats every parameter-value error, each Measure error follows
-increasing protocol ordinal, and prepared overlap still beats parameter measurement. No budget
-failure calls a binder-v2 Encode callback or libpq.
+the complete descriptor/count/identity, options, driver/live state, context, and generated static
+contract; then acquires the lease, allocates/installs the exact full format vector, and validates the
+Parse budget and Bind fixed budget before binder-v2 Measure, Encode, deadline, and send. Prepared
+execution validates the complete statement/count/identity and options, then driver/live state,
+acquires the lease, creates the context/full format vector, and validates the Bind fixed budget before
+Measure, Encode, deadline, and send. Preparation validates its complete descriptor/options/live state
+and acquires its lease before name formation, Parse budget, and `PQprepare`. Consequently a
+header/count error beats every option, overlap beats every direct or prepared parameter measurement,
+a direct Parse-budget error beats every parameter-value error after successful lease acquisition,
+and each Measure error follows increasing protocol ordinal. No budget failure calls a binder-v2
+Encode callback or libpq.
+
+The call-local sparse normalized plan is formed at the end of successful native-option validation;
+it is not installed in the execution context. In the closure matrix below, installing the normalized
+plan means allocating/installing the execution-owned exact full format vector after generated static
+validation and successful lease acquisition.
+
+The package-context row's complete fixed Bind formula is exact
+`2_147_483_647 - (11 + 2*F + S + 6*N)`, and its initializer runs only after that successful lease on
+both direct and prepared execution.
 
 For `one_native`, Metadata mode still runs for every newly acquired tuple-producing result. A
 malformed second generation therefore returns the exact row-contract Decode error before
