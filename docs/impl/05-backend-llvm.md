@@ -53,19 +53,23 @@ structurally equal but distinct LLVM types for one Align type makes `insertvalue
 arguments ill-formed; #670 did exactly that for nested tagged values and it went unnoticed until
 #730 made `--rt-lto`, whose merged-module verifier was the pipeline's only one, the default.
 
-### Module verification (debug-only on the object paths)
+### Module verification (every profile, on every emit path)
 
-`build_module` verifies the module it just built under `cfg(debug_assertions)`. Every emit path —
-object, PGO, ThinLTO prelink, `emit-llvm`, and the remark lens — funnels through it, and a test
-binary is always a debug build, so **the whole owner suite is a well-formedness gate**: a
-`build_and_run` owner compiles with `rt_lto = false` and would otherwise never meet a verifier,
-which is precisely how #670's ill-formed nested-tagged IR survived sixty PRs. `emit_llvm_ir`
-verifies in every profile (the lens never prints IR it knows is ill-formed), and `link_in_rt_lto`
-verifies the merged module as before. A verification failure prints the module to stderr before
-returning the error, since LLVM's message names only the offending instruction.
+`build_module` verifies the module it just built. Every emit path — object, PGO, ThinLTO prelink,
+`emit-llvm`, and the remark lens — funnels through it, so **the whole owner suite is a
+well-formedness gate**: a `build_and_run` owner compiles with `rt_lto = false` and would otherwise
+never meet a verifier, which is precisely how #670's ill-formed nested-tagged IR survived sixty
+PRs. `link_in_rt_lto` separately verifies the **merged** module as before: a different scope (baked
+runtime bitcode `build_module` never sees) and a different failure mode (symbol retargeting), so the
+default object path deliberately keeps both. `emit_llvm_ir` runs neither of its own — both of its
+steps already verify the same module — and simply never prints IR it knows is ill-formed.
 
-A **release** `alignc` still does not verify on the object paths. Promoting it there is blocked on
-one pre-existing MIR defect that the debug gate already exposes:
+A verification failure always reports LLVM's message, which names only the offending instruction.
+The **whole module** goes to stderr only under `ALIGN_DUMP_IR`: now that this runs in every profile,
+`apps/db` alone would otherwise spray ~7MB of IR at a release user's terminal and bury that line.
+
+Verification was `cfg(debug_assertions)`-only when #765 introduced it, blocked on one pre-existing
+MIR defect the debug gate exposed:
 
 ```align
 fn probe(flag: bool) -> i64 {
@@ -74,18 +78,68 @@ fn probe(flag: bool) -> i64 {
 }
 ```
 
-A borrowed owned temporary produced by value-carrying control flow lowers the `if` twice: the second
-branch stores each arm's *original* SSA value into the hidden owner's join slot, and those values
-are defined in blocks that do not dominate it (`Instruction does not dominate all uses`). MIR — not
-codegen — is ill-formed; `alignc build` already fails on it at the default profile through the
-`--rt-lto` verifier, and `owned_temporaries::mixed_if_arms_drop_only_the_selected_temporary` owns
-the shape and is `#[ignore]`d against this entry. Fixing that lowering is a MIR capability of its
-own, with a closure matrix over `if` / `match` / `else`-unwrap crossed with bound and fresh arms.
-Land it, drop the `#[ignore]`, and promote the verification from `cfg(debug_assertions)` to every
-profile in the same change. Measured cost of the promotion, with a release `alignc` over a cold
-codegen cache: the 78-example corpus plus `apps/db` takes 9.99s either way, and `apps/db` alone —
-the largest module, ~7MB of IR — goes from a 8.368s median to 8.451s, about 1%, inside the
-unverified configuration's own run-to-run spread.
+A borrowed owned temporary produced by value-carrying control flow lowered its `if` **twice**, and
+the second copy stored the first copy's per-arm SSA values into the hidden owner's join slot from
+blocks that do not dominate their definitions (`Instruction does not dominate all uses`).
+
+The dominance violation was the loud half. The same double lowering hit **borrow-transparent
+scopes** (`{ }`, `unsafe`, `arena`, a named arena, `task_group`) silently, because a scope has no
+join to violate: the eager memo deduplicated the body's *expressions*, but statement stores and the
+scope's own framing are not memoized, so each such receiver emitted its statement stores twice and a
+second, empty `arena_begin`/`arena_end` (or `tg_begin`/`tg_wait`/`tg_end`) pair around nothing — a
+spurious runtime region or task group per evaluation, with a correct exit code hiding it.
+
+**Root cause and fix (MIR, not codegen).** `lower_expr`'s eager worklist lowers a parent's
+`direct_expr_children` *ahead of* the parent, and the parent's own `lower_expr` call then returns
+the memoized operand. That is sound only for an edge the parent consumes through `lower_expr`.
+`StrBorrow` — the implicit `string` → `str` view, and an eager-worklist parent — consumes its child
+through `lower_borrowed_owned` instead, so a control-flow child was lowered once in **non-borrow**
+mode (which also nulls a bound arm's source local and re-emits the scope framing) and then again in
+borrow mode by `lower_expr_for_borrow`.
+
+`borrow_mode_differs` is now the **single authority** on "borrow mode is not `lower_expr`", and it
+gates both sides: `lower_expr_for_borrow` returns `lower_expr(b, e)` before its match whenever the
+predicate is false, so the match handles exactly the admitted kinds and its catch-all is
+`unreachable!`; `eager_worklist_children` uses the same predicate to keep `StrBorrow` from entering
+such a child. Ordering the guard first also makes the dangerous drift impossible: a kind added to
+the match without being added to the predicate is inert (it delegates, as before) rather than
+double-lowered. The borrow-transparent scope kinds come from `borrow_transparent_scope_block`, one
+enumeration shared with `moved_drop_flag` and `temporary_drop_flag` — the latter still checks
+`task_group` first, deliberately, because it reaches that helper only with a fresh tail and must
+forward the ordinary ownership bit rather than recurse. A `debug_assert` in `lower_expr_for_borrow`
+aborts lowering if a future borrow edge is pre-lowered anyway; a test binary is always a debug
+build, so the whole owner suite carries that tripwire.
+
+Filtering only the divergent kinds — rather than moving `StrBorrow` to out-of-line dispatch —
+keeps a `StrBorrow` chain over non-divergent producers frame-free, which
+`validate_hir_tests::checked_hir_depth_closure_matrix` (deep `path`/`regex` string spines at
+`MAX_CHECKED_HIR_DEPTH` on a 2 MiB stack) requires; the dispatch variant overflowed it.
+
+**Closure matrix (14 cells).** `if` / `match` / `else`-unwrap crossed with fresh, bound, and mixed
+arms, owned by `owned_temporaries::borrowed_control_flow_temporaries_lower_exactly_once`; the five
+borrow-transparent scopes owned by
+`owned_temporaries::borrowed_scope_temporaries_lower_their_scope_exactly_once`; the diverging-arm
+and `?`-arm early exits owned by
+`owned_temporaries::borrowed_control_flow_temporaries_survive_diverging_and_try_arms`; and
+`owned_temporaries::mixed_if_arms_drop_only_the_selected_temporary`, which is no longer `#[ignore]`d.
+
+Each cell's witness is a structural MIR count that was **mutation-verified against the pre-fix
+compiler**: the exact number of `branch` terminators for the control-flow cells (a `str_clone` count
+would not discriminate — in a bound cell every `.clone()` sits in a `let` outside the duplicated
+subtree), and the statement-store plus scope-framing counts for the scope cells (whose exit code is
+identical on both compilers, because the duplicated store happens to be idempotent).
+
+**`loop` is not in the matrix.** `lower_expr_for_borrow` has no `Loop` arm and `lower_loop` has no
+borrow mode, so a loop-valued borrowed temporary always went through `lower_expr` and its memo:
+`loop` × fresh/bound/mixed probes return the same values and lower **byte-identical MIR** before and
+after this fix. The kind is structurally outside the class, not an untested cell.
+
+Re-measured after the promotion, interleaving the two release `alignc` binaries over a cold codegen
+cache: `apps/db` alone — the largest module, ~7MB of IR — is 8.768s unverified against 8.700s
+verified at the median of 9 pairs (8.282s against 8.301s at the minimum), and the 78-example corpus
+plus `apps/db` is 13.736s against 13.694s over 3 pairs. Both differences sit inside the host's own
+run-to-run spread, at or under the ~1% #765 recorded; verification is not a measurable cost on the
+object paths.
 
 ---
 

@@ -179,23 +179,16 @@ fn main() -> i32 = probe() as i32
     }
 }
 
-/// Owner for a **known MIR defect**, quarantined rather than deleted — the shape below lowers to
-/// ill-formed MIR today:
+/// A borrowed temporary produced by a value-carrying `if` selects one arm's ownership at runtime:
+/// the fresh arm hands its buffer to the hidden owner, the bound arm stays borrowed in place and
+/// keeps its own local Drop.
 ///
-/// - **The defect.** A borrowed owned temporary produced by value-carrying control flow lowers its
-///   `if` twice; the second branch stores each arm's *original* SSA value into the hidden owner's
-///   join slot, and those values are defined in blocks that do not dominate it. `alignc build`
-///   already fails on this at the default profile through `--rt-lto`'s verifier, and codegen's
-///   debug-build verification now fails it here too. `docs/impl/05-backend-llvm.md` §1 records the
-///   repro and the analysis.
-/// - **The fix is a separate capability.** It belongs to MIR's temporary-ownership lowering, not to
-///   codegen's type identity, and needs its own closure matrix over the value-carrying control-flow
-///   forms (`if`, `match`, `else`-unwrap) crossed with bound and fresh arms.
-/// - **On the way back.** Once that lands, drop this `#[ignore]` and promote codegen's
-///   verification from `cfg(debug_assertions)` to every profile in the same change; the measured
-///   cost of the promotion is about 1% (`docs/impl/05-backend-llvm.md`).
+/// This shape used to lower the `if` **twice** and was quarantined against
+/// `docs/impl/05-backend-llvm.md` §1 while codegen's module verification stayed debug-only. Both
+/// are closed: the eager worklist no longer pre-lowers a `str.borrow` child whose borrow-mode
+/// lowering differs, and the verifier runs in every profile.
+/// `borrowed_control_flow_temporaries_lower_exactly_once` sweeps the rest of the matrix.
 #[test]
-#[ignore = "known MIR defect: a borrowed temporary from a value-carrying `if` violates SSA dominance (docs/impl/05-backend-llvm.md §1)"]
 fn mixed_if_arms_drop_only_the_selected_temporary() {
     let src = r#"
 fn probe(flag: bool) -> i64 {
@@ -210,6 +203,228 @@ fn main() -> i32 = (probe(true) + probe(false)) as i32
     assert!(probe.contains("<- true"), "fresh arm must select a true temporary bit:\n{probe}");
     if backend_available() {
         assert_eq!(build_and_run("owned-temp-if", src).status.code(), Some(8));
+    }
+}
+
+/// Closure matrix for a borrowed owned temporary produced by value-carrying control flow
+/// (`docs/impl/05-backend-llvm.md` §1): `if` / `match` / `else`-unwrap crossed with fresh, bound,
+/// and mixed arms.
+///
+/// Every cell used to lower its control flow twice. `str.borrow` (`string` used as `str`) took the
+/// eager worklist, which lowers a parent's children *ahead of* the parent, so the control flow was
+/// lowered once in non-borrow mode — which also nulls a bound arm's source local — and then again
+/// in borrow mode by `lower_borrowed_owned`. The second copy stored the first copy's per-arm SSA
+/// values into the hidden owner's join slot from blocks that do not dominate their definitions
+/// (`Instruction does not dominate all uses`).
+///
+/// The witness is the **exact** number of `branch` terminators `probe` lowers: the construct's own
+/// discriminator test plus its drop guards. Counting `str_clone` would not do — in a bound cell
+/// every `.clone()` sits in a `let` *outside* the duplicated subtree, so that count is unchanged by
+/// the defect. Every expected number below was mutation-verified against the pre-fix compiler,
+/// where the same cells lower 2/4/5, 3/5/6, and 5/7/6 branches respectively. The exit code then
+/// proves the selected arm — and only it — is released.
+#[test]
+fn borrowed_control_flow_temporaries_lower_exactly_once() {
+    // (cell, `probe` body, `branch` terminators, exit code of `probe(true) + probe(false)`)
+    let cells: [(&str, &str, usize, i32); 9] = [
+        (
+            "if-fresh",
+            r#"  return (if flag { " tmp ".clone() } else { " other ".clone() }).trim().len()"#,
+            1,
+            8,
+        ),
+        (
+            "if-bound",
+            r#"  a := " aaa ".clone()
+  b := " bb ".clone()
+  return (if flag { a } else { b }).trim().len()"#,
+            1,
+            5,
+        ),
+        (
+            "if-mixed",
+            r#"  bound := " bound ".clone()
+  return (if flag { " tmp ".clone() } else { bound }).trim().len()"#,
+            3,
+            8,
+        ),
+        (
+            "match-fresh",
+            r#"  choice: Option<bool> := if flag { Some(true) } else { None }
+  return (match choice {
+    Some(_) => " tmp ".clone()
+    None => " other ".clone()
+  }).trim().len()"#,
+            2,
+            8,
+        ),
+        (
+            "match-bound",
+            r#"  a := " aaa ".clone()
+  b := " bb ".clone()
+  choice: Option<bool> := if flag { Some(true) } else { None }
+  return (match choice {
+    Some(_) => a
+    None => b
+  }).trim().len()"#,
+            2,
+            5,
+        ),
+        (
+            "match-mixed",
+            r#"  bound := " bound ".clone()
+  choice: Option<bool> := if flag { Some(true) } else { None }
+  return (match choice {
+    Some(_) => " tmp ".clone()
+    None => bound
+  }).trim().len()"#,
+            4,
+            8,
+        ),
+        (
+            "else-fresh",
+            r#"  opt: Option<string> := if flag { Some(" tmp ".clone()) } else { None }
+  return (opt else " other ".clone()).trim().len()"#,
+            4,
+            8,
+        ),
+        (
+            "else-bound",
+            r#"  a := " aaa ".clone()
+  b := " bb ".clone()
+  opt: Option<string> := if flag { Some(a) } else { None }
+  return (opt else b).trim().len()"#,
+            5,
+            5,
+        ),
+        (
+            "else-mixed",
+            r#"  bound := " bound ".clone()
+  opt: Option<string> := if flag { Some(" tmp ".clone()) } else { None }
+  return (opt else bound).trim().len()"#,
+            4,
+            8,
+        ),
+    ];
+    for (cell, body, branches, exit) in cells {
+        let src = format!(
+            "fn probe(flag: bool) -> i64 {{\n{body}\n}}\nfn main() -> i32 = (probe(true) + probe(false)) as i32\n"
+        );
+        let mir = mir_text(&src);
+        let probe = function(&mir, "probe");
+        assert_eq!(
+            probe.matches("branch ").count(),
+            branches,
+            "{cell}: the borrowed control flow must be lowered exactly once:\n{probe}"
+        );
+        if backend_available() {
+            assert_eq!(
+                build_and_run(&format!("owned-temp-{cell}"), &src).status.code(),
+                Some(exit),
+                "{cell}: only the selected arm's temporary may be released"
+            );
+        }
+    }
+}
+
+/// The other half of the matrix: the five **borrow-transparent scopes** a borrowed owned temporary
+/// can be produced by (`{ }`, `unsafe`, `arena`, a named arena, `task_group`).
+///
+/// These never violated SSA dominance — a scope has no join — which is exactly why they needed
+/// their own cells: the pre-fix compiler mis-lowered them *silently*. Each scope was lowered twice,
+/// and while the eager memo happened to deduplicate the body's expressions, the statement stores
+/// and the scope's own framing were not memoized, so `main` emits the `n = 41` store twice and a
+/// second, empty `arena_begin`/`arena_end` (or `tg_begin`/`tg_wait`/`tg_end`) pair around nothing —
+/// a spurious runtime region and task group per evaluation. The duplicated store happens to be
+/// idempotent here, so the exit code is 44 on both compilers: only the structural counts
+/// discriminate, and both were mutation-verified at 2 against the pre-fix compiler.
+#[test]
+fn borrowed_scope_temporaries_lower_their_scope_exactly_once() {
+    // (cell, scope opener, scope-framing op, framing occurrences)
+    let cells: [(&str, &str, &str, usize); 5] = [
+        ("block", "{", "", 0),
+        ("unsafe", "unsafe {", "", 0),
+        ("arena", "arena {", "arena_begin", 1),
+        ("named-arena", "arena scope {", "arena_begin", 1),
+        ("task-group", "task_group {", "tg_begin", 1),
+    ];
+    for (cell, opener, framing, framings) in cells {
+        let src = format!(
+            r#"fn probe() -> i64 {{
+  mut n := 0
+  s := ({opener}
+    n = 41
+    " tmp ".clone()
+  }}).trim().len()
+  return s + n
+}}
+fn main() -> i32 = probe() as i32
+"#
+        );
+        let mir = mir_text(&src);
+        let probe = function(&mir, "probe");
+        assert_eq!(
+            probe.matches("<- 41_i64").count(),
+            1,
+            "{cell}: the scope's statements must be lowered exactly once:\n{probe}"
+        );
+        if !framing.is_empty() {
+            assert_eq!(
+                probe.matches(framing).count(),
+                framings,
+                "{cell}: the scope must open exactly once — a second empty {framing} pair is a \
+                 spurious runtime region:\n{probe}"
+            );
+        }
+        if backend_available() {
+            assert_eq!(
+                build_and_run(&format!("owned-temp-scope-{cell}"), &src).status.code(),
+                Some(44),
+                "{cell}: the borrowed scope temporary must still compute 3 + 41"
+            );
+        }
+    }
+}
+
+/// The same borrowed control flow crossed with the early-exit paths: an arm that `return`s and an
+/// arm that propagates with `?`. Each leaves the join without a value on one edge, so the hidden
+/// owner must already exist when that edge runs exit cleanup and must stay disarmed there.
+#[test]
+fn borrowed_control_flow_temporaries_survive_diverging_and_try_arms() {
+    let src = r#"
+fn fail(flag: bool) -> Result<string, i64> {
+  if flag { return Ok(" ok ".clone()) }
+  return Err(7)
+}
+fn diverging_arm(flag: bool) -> i64 {
+  bound := " bound ".clone()
+  return (if flag { " tmp ".clone() } else { return 42 }).trim().len() + bound.len()
+}
+fn try_in_arm(flag: bool) -> Result<i64, i64> {
+  bound := " bound ".clone()
+  n := (if flag { fail(flag)? } else { bound }).trim().len()
+  return Ok(n)
+}
+fn main() -> i32 {
+  a := diverging_arm(true) + diverging_arm(false)
+  b := match try_in_arm(true) { Ok(v) => v Err(e) => e }
+  c := match try_in_arm(false) { Ok(v) => v Err(e) => e }
+  return (a + b + c) as i32
+}
+"#;
+    let mir = mir_text(src);
+    // One `str_clone` per source `.clone()` in each probe: two in `diverging_arm` (the bound local
+    // and the fresh arm), one in `try_in_arm` (the bound local; `fail` owns the other).
+    for (probe, clones) in [("diverging_arm", 2), ("try_in_arm", 1)] {
+        let body = function(&mir, probe);
+        assert_eq!(
+            body.matches("str_clone").count(),
+            clones,
+            "{probe}: the borrowed `if` must be lowered exactly once:\n{body}"
+        );
+    }
+    if backend_available() {
+        assert_eq!(build_and_run("owned-temp-early-exit", src).status.code(), Some(59));
     }
 }
 
