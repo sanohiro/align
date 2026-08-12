@@ -959,7 +959,11 @@ fn close_rows_with_policy(rows: raw, terminal: u8, policy: u8, budget_ns: i64) -
           }
         }
       }
-      raw.store(rows, 5, terminal)
+      // A failed cleanup can never publish an exhausted generation. The caller returns the
+      // cleanup error for this advance; retaining terminal=failed also makes every later advance
+      // report the failed-state error instead of silently returning end-of-stream.
+      published_terminal: u8 := if cleanup_status == 0 { terminal } else { 2 as u8 }
+      raw.store(rows, 5, published_terminal)
       raw.store(rows, 8, raw.null())
       raw.store(rows, 16, raw.null())
       raw.store(rows, 24, raw.null())

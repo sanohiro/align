@@ -1287,6 +1287,15 @@ fn main() -> i32 {
   if (pkg.db.batch_len(prefix_batch) else { return 23 }) != 3 { return 24 }
   unsafe { align_pg_fail_next_nonblocking_restore() }
   if !cleanup(pkg.db.next_batch(restore_rows, 3)) { return 25 }
+  repeated_restore := pkg.db.next(restore_rows)
+  repeated_restore_failed := match repeated_restore {
+    Err(error) => match error {
+      InvalidQuery(contract) => contract.item == "db.rows.state"
+      _ => false
+    }
+    Ok(_) => false
+  }
+  if !repeated_restore_failed { return 27 }
   restore_poisoned := pkg.db.rows(
     pkg.db.exec_conn(restore_closed), app.batch_query.postgres_rows(),
     app.batch_query.PgParams { first_user_id: 1, last_user_id: 1 }, [],
@@ -1974,7 +1983,7 @@ const LAYER1_FINGERPRINT_GOLDEN: &str = "\
 pkg-db-a1-postgres-batch-decode-failure bedd652eb580b5e0
 pkg-db-a1-postgres-buffered-batches ece0f00d9dd9bcfd
 pkg-db-a1-postgres-delivery-validation 1673fb23140db463
-pkg-db-a1-postgres-streamed-failures b2f839eb473b4e17
+pkg-db-a1-postgres-streamed-failures 8f5a917b70b16712
 pkg-db-a1-postgres-streamed-modes 5b8d2922055d555b
 pkg-db-a1-postgres-streamed-one 1d7544638671d32f
 pkg-db-a1-postgres-streamed-timeout-drop d469ca7e48d03ed8

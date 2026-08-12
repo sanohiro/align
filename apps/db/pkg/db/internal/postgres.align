@@ -1613,8 +1613,6 @@ pub fn next_batch_prevalidated<R>(
         "database rows cannot advance after a failed execution",
       ))
     }
-    available := ensure_current_row(wrapper, query_id)?
-    if !available { return Ok(None) }
     payload := pkg.db.internal.descriptor.create_batch(plan, max_rows)
     if payload.is_null() {
       return Err(descriptor_error(
@@ -1622,6 +1620,21 @@ pub fn next_batch_prevalidated<R>(
         "db.batch.layout",
         "database batch layout exceeds the supported address range",
       ))
+    }
+    // Layout validation is part of the call envelope and must win before the first native row is
+    // consumed. The create thunk also owns the unpublished allocation, so destroy it on every
+    // completion or execution failure before publication.
+    available_result := ensure_current_row(wrapper, query_id)
+    available := match available_result {
+      Err(error) => {
+        pkg.db.internal.descriptor.drop_batch_payload(plan, payload)
+        return Err(error)
+      }
+      Ok(value) => value
+    }
+    if !available {
+      pkg.db.internal.descriptor.drop_batch_payload(plan, payload)
+      return Ok(None)
     }
     mut length := 0
     loop {
