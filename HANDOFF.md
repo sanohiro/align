@@ -5,7 +5,7 @@ about the present state, the next decision, and operational facts. The former
 per-PR journal is preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md).
 
-_Last updated: 2026-08-11._ The C-B borrow/ownership capability is complete
+_Last updated: 2026-08-13._ The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit
 region materialization is complete through L4 and L6. Direct, captured,
 imported, and function-value returns preserve exact owner provenance;
@@ -35,69 +35,17 @@ shapers for transaction/master and User + Groups outputs, exact one-execution
 stream ownership, one-parent and adjacent segmented shaping, visible region
 allocation/copies, and whole/per-unit mutable-retention parity. #740 ships the
 first independently useful A1/D13 throughput rail: common bounded batch/SoA
-delivery with the v5 Query batch plan on both drivers. #741 tiers verification,
-#742 restores the scoped `pkg.web` dispatch rule, and #743 completes fixed and
-owned struct-array slicing. Design review reopened the second A1 matrix after
-finding that the shipped PostgreSQL catalog and EXPLAIN paths did not share the
-typed-execution lease. The next product work is therefore one independently
-mergeable libpq-consumer lease prerequisite with no public/ABI change. A second
-application-package-surface/ABI-neutral prerequisite then makes every shipped
-PostgreSQL PGresult consumer fail closed on COPY, pipeline, and unknown numeric statuses; current
-synchronous and timeout paths can already observe a result that requires an
-unsupported protocol transition and must not release that connection for reuse.
-The same prerequisite routes every Rust tool PGresult consumer through one
-private status classifier. A null result, COPY, partial row-mode result, pipeline
-status, or unknown numeric status clears the current result when present,
-closes and nulls the connection owner, and permits no rollback, deallocation,
-row access, or later libpq call. Canonical screening separately rejects every
-top-level PostgreSQL migration `COPY` before URL access, target open, lock,
-history publication, or libpq. Screening uses one statement-ordered
-classification pass, so `BEGIN; COPY` and `COPY; BEGIN` select their respective
-first prohibited statements before Forbidden-count validation.
-The independently useful PostgreSQL `SingleRow` / `PortalBatch` direct delivery
-rail follows; prepared parity is a fourth PR because it must
-retain parameter-name authority in statement v3. Cardinality drains to clean
-completion rather than canceling a possibly effectful `RETURNING` statement,
-and absent Delivery stays on the caller-synchronous BufferedFull implementation,
-including its existing nonblocking deadline subpath. Validation/decode/storage
-errors normal-drain without further decoding under the original deadline; only
-deadline expiry cancels, with Conn/Tx effect races explicit. Rows v3 retains
-both the absolute deadline and original duration needed for recovery. A fourth
-design-matrix reopen closes the deferred-COPY state: any observed COPY result is
-cleared and the physical connection is immediately poisoned/closed, with no
-generic result drain, COPY operation, cancel, transaction probe, or blocking
-restore afterward. It also restores direct execution's settled phase order:
-live state, context-backed generated static validation, lease, then bind/native
-work. The following consistency review found no
-new P1: `one_native` now states that a first-Row `clone_in(out)` remains allocated
-on Cardinality or any later error because caller arenas are monotonic; Query
-Delivery follows §13.4 payload-before-duplicate order; and Delivery is listed as
-post-release D13 rather than in the initial D1--D12 inventory. A fifth matrix
-reopen then found that the COPY closure had omitted shipped result consumers,
-that explicit direct/prepared delivery must recheck expiry after enabling
-nonblocking mode and before send, and that unknown future libpq statuses cannot
-enter ordinary drain. The final clean-up review moved `PGRES_PIPELINE_SYNC` and
-`PGRES_PIPELINE_ABORTED` to the same immediate-close branch because this rail
-does not own `PQexitPipelineMode`, and synchronized the introductory staging
-with the four-PR matrix. The next review closed the same deferred-subprotocol
-class in shipped migration tooling: user SQL could enter COPY mode through
-`PQexec` and then attempt rollback on the protocol-busy connection, so the
-status prerequisite now adds pre-native PostgreSQL migration COPY rejection and
-a complete prepare/migration SQL-origin inventory. The four implementation PR
-boundaries and exact public contract are in
-`docs/impl/pkg-design/db.md` §23; binary formats remain the following rail.
-The following review found that an inventory alone did not protect the Rust
-tools from null or unexpected deferred results before rollback/deallocation.
-The prerequisite now gives every tool result consumer the same fail-closed
-postcondition and a parameterized synthetic-status owner; this remains a P2
-closure inside the existing status PR, not another matrix reopen or PR split.
-The final base-bound review closed three further P2 consistency gaps without
-changing those boundaries: protocol state now makes every post-terminal result
-an invalid sequence before ordinary status mapping while retaining its
-drain-or-close safety action; the migration owner pins both prohibited-statement
-orders above; and runtime mode selection leaves static Query semantics unchanged
-while the public option and rows/statement implementation correctly invalidate
-affected dependency-interface and implementation cache keys once when landed.
+delivery with the v5 Query batch plan on both drivers. The PostgreSQL D13
+delivery rail is now complete through its lease and result-status prerequisites,
+direct `SingleRow` / `PortalBatch` delivery, and prepared parity. Direct and
+prepared execution share rows v3 advancement, deadline/cancel recovery, batch
+publication, and fail-closed COPY/pipeline/unknown-status handling. Prepared
+statements use exact statement v3 with a retained producer-owned parameter-name
+resolver; guarded compiler bridges and HIR formation validation prevent raw or
+cross-Query callback splices. Absence of `Delivery` remains the existing
+caller-synchronous BufferedFull path. The exact contract and implementation
+matrix are in `docs/impl/pkg-design/db.md` §23; PostgreSQL binary formats remain
+the following `pkg.db` rail.
 
 Out-of-gate suite status (suites outside the bounded CI gate; a nightly
 full-suite workflow now runs them daily so this class cannot rot silently):
@@ -157,10 +105,11 @@ Q4b streaming resilience         complete through D8 + D9
 Q5 schema tooling/inspection     complete through D11 + D12
 Q6 compound product closure      complete through D10
 A1 common batch/SoA rail         complete through #740 / D13
-A1 PostgreSQL lease prerequisite next / catalog + EXPLAIN overlap closure / D13
-then: A1 PostgreSQL status       package/tool fail-close + migration COPY preflight / D13
-then: A1 PostgreSQL direct       SingleRow + PortalBatch / D13
-then: A1 PostgreSQL prepared     streamed parity + stmt v3 resolver / D13
+A1 PostgreSQL lease prerequisite complete / catalog + EXPLAIN overlap closure / D13
+A1 PostgreSQL status prerequisite complete / package/tool fail-close + migration COPY / D13
+A1 PostgreSQL direct delivery    complete / SingleRow + PortalBatch / D13
+A1 PostgreSQL prepared parity    complete / streamed delivery + stmt v3 resolver / D13
+next: A1 PostgreSQL formats      binary parameters/results / D13
 ```
 
 The exact cell contracts and owner matrices remain in

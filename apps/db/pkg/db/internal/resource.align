@@ -202,7 +202,7 @@ pub fn poison_conn_state(state: raw) {
 }
 
 // A prepared statement wrapper is dependent on the conn/tx resource generation that created it.
-//   0: u32 version (= 1)
+//   0: u32 version (= 3)
 //   4: u8  driver
 //   5: u8  closed
 //   6: u16 reserved
@@ -215,6 +215,7 @@ pub fn poison_conn_state(state: raw) {
 //  56: raw generated Row validator
 //  64: raw generated streaming Row decoder
 //  72: raw generated batch plan
+//  80: raw generated parameter-name resolver
 pub fn new_stmt_state(
   driver: u8,
   native: raw,
@@ -226,10 +227,11 @@ pub fn new_stmt_state(
   row_validator: raw,
   stream_decoder: raw,
   batch_plan: raw,
+  parameter_resolver: raw,
 ) -> raw {
   unsafe {
-    statement := raw.alloc(80)
-    raw.store(statement, 0, 2 as u32)
+    statement := raw.alloc(88)
+    raw.store(statement, 0, 3 as u32)
     raw.store(statement, 4, driver)
     raw.store(statement, 5, 0 as u8)
     raw.store(statement, 6, 0 as u16)
@@ -242,23 +244,48 @@ pub fn new_stmt_state(
     raw.store(statement, 56, row_validator)
     raw.store(statement, 64, stream_decoder)
     raw.store(statement, 72, batch_plan)
+    raw.store(statement, 80, parameter_resolver)
     return statement
+  }
+}
+
+// The one complete statement-v3 validator. Every accessor, indirect prepared bridge, execution,
+// and Drop path enters through this authority so the resolver and the existing statement fields
+// cannot drift across an ABI bump.
+pub fn stmt_header_valid(statement: raw) -> bool {
+  unsafe {
+    if statement.is_null() { return false }
+    version: u32 := raw.load(statement, 0)
+    if version != 3 { return false }
+    driver: u8 := raw.load(statement, 4)
+    closed: u8 := raw.load(statement, 5)
+    reserved: u16 := raw.load(statement, 6)
+    if (driver != 1 && driver != 2) || closed != 0 || reserved != 0 { return false }
+    native: raw := raw.load(statement, 8)
+    connection_state: raw := raw.load(statement, 16)
+    binder: raw := raw.load(statement, 24)
+    query_id: raw := raw.load(statement, 32)
+    query_id_len: i64 := raw.load(statement, 40)
+    deallocate_sql: raw := raw.load(statement, 48)
+    row_validator: raw := raw.load(statement, 56)
+    stream_decoder: raw := raw.load(statement, 64)
+    batch_plan: raw := raw.load(statement, 72)
+    parameter_resolver: raw := raw.load(statement, 80)
+    if native.is_null() || connection_state.is_null() || binder.is_null()
+      || query_id.is_null() || query_id_len <= 0 || row_validator.is_null()
+      || stream_decoder.is_null() || !batch_plan_valid(batch_plan)
+      || parameter_resolver.is_null() {
+      return false
+    }
+    if driver == 1 { return deallocate_sql.is_null() }
+    return !deallocate_sql.is_null()
   }
 }
 
 pub fn stmt_driver(statement: raw) -> u8 {
   unsafe {
-    if statement.is_null() { return 0 }
-    version: u32 := raw.load(statement, 0)
-    driver: u8 := raw.load(statement, 4)
-    closed: u8 := raw.load(statement, 5)
-    reserved: u16 := raw.load(statement, 6)
-    batch_plan: raw := raw.load(statement, 72)
-    if version != 2 || (driver != 1 && driver != 2) || closed != 0 || reserved != 0
-      || !batch_plan_valid(batch_plan) {
-      return 0
-    }
-    return driver
+    if !stmt_header_valid(statement) { return 0 }
+    return raw.load(statement, 4)
   }
 }
 
@@ -311,12 +338,34 @@ pub fn stmt_batch_plan(statement: raw) -> raw {
   }
 }
 
+pub fn stmt_parameter_resolver(statement: raw) -> raw {
+  unsafe {
+    if stmt_driver(statement) == 0 { return raw.null() }
+    return raw.load(statement, 80)
+  }
+}
+
 pub fn close_stmt(statement: raw) -> i32 {
   unsafe {
-    driver := stmt_driver(statement)
-    if driver == 0 { return 0 }
+    if !stmt_header_valid(statement) { return 0 }
+    driver: u8 := raw.load(statement, 4)
     native: raw := raw.load(statement, 8)
     connection_state: raw := raw.load(statement, 16)
+    query_id: raw := raw.load(statement, 32)
+    deallocate_sql: raw := raw.load(statement, 48)
+    // Publish the closed state and null every owned/borrowed pointer before invoking native or raw
+    // destructors. Re-entry can therefore neither reuse the resolver nor free an owner twice.
+    raw.store(statement, 5, 1 as u8)
+    raw.store(statement, 8, raw.null())
+    raw.store(statement, 16, raw.null())
+    raw.store(statement, 24, raw.null())
+    raw.store(statement, 32, raw.null())
+    raw.store(statement, 40, 0 as i64)
+    raw.store(statement, 48, raw.null())
+    raw.store(statement, 56, raw.null())
+    raw.store(statement, 64, raw.null())
+    raw.store(statement, 72, raw.null())
+    raw.store(statement, 80, raw.null())
     mut status: i32 := 0
     if driver == 1 {
       if !native.is_null() { status = sqlite3_finalize(native) }
@@ -326,7 +375,6 @@ pub fn close_stmt(statement: raw) -> i32 {
         closed: u8 := raw.load(connection_state, 5)
         active: u8 := raw.load(connection_state, 20)
         connection: raw := raw.load(connection_state, 8)
-        deallocate_sql: raw := raw.load(statement, 48)
         // Drop cannot report a lease conflict.  If another rows resource owns the connection,
         // leave the server-side statement to connection teardown instead of overlapping libpq.
         if closed == 0 && active == 0 && !connection.is_null() && !deallocate_sql.is_null() {
@@ -344,20 +392,8 @@ pub fn close_stmt(statement: raw) -> i32 {
       }
       if !native.is_null() { raw.free(native) }
     }
-    query_id: raw := raw.load(statement, 32)
-    deallocate_sql: raw := raw.load(statement, 48)
     if !query_id.is_null() { raw.free(query_id) }
     if !deallocate_sql.is_null() { raw.free(deallocate_sql) }
-    raw.store(statement, 5, 1 as u8)
-    raw.store(statement, 8, raw.null())
-    raw.store(statement, 16, raw.null())
-    raw.store(statement, 24, raw.null())
-    raw.store(statement, 32, raw.null())
-    raw.store(statement, 40, 0 as i64)
-    raw.store(statement, 48, raw.null())
-    raw.store(statement, 56, raw.null())
-    raw.store(statement, 64, raw.null())
-    raw.store(statement, 72, raw.null())
     return status
   }
 }

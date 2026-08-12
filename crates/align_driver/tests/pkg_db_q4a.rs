@@ -1132,6 +1132,33 @@ fn main() -> i32 = 0
         "unexpected diagnostics:\n{diagnostics}"
     );
 
+    let sealed_resolver = r#"module main
+import pkg.db
+import pkg.db.internal.descriptor
+import app.q4a_query
+
+fn bad(
+  borrow mut statement: pkg.db.stmt<app.q4a_query.Params, app.q4a_query.Row>,
+) -> i32 {
+  unsafe {
+    return pkg.db.internal.descriptor.prepared_parameter_ordinal(
+      resource.borrow(statement), "id",
+    )
+  }
+}
+
+fn main() -> i32 = 0
+"#;
+    let diagnostics = check_multi_diagnostics(
+        "pkg-db-q4a-sealed-prepared-resolver",
+        &package_files(sealed_resolver).files(),
+        "main.align",
+    );
+    assert!(
+        diagnostics.contains("static descriptor operations are compiler-private to `pkg.db`"),
+        "application source reached the prepared resolver bridge:\n{diagnostics}"
+    );
+
     let header_bypass = r#"module main
 import pkg.db
 import app.q4a_query
@@ -1552,11 +1579,11 @@ fn main() -> i32 {
 ///
 /// Regenerate ONLY with a reviewed reason, from the panic message this emits.
 const LAYER1_FINGERPRINT_GOLDEN: &str = "\
-pkg-db-q4a-postgres-failed-commit 570fa64d1c84ea29
-pkg-db-q4a-postgres-failed-rollback f6db834d0c05f47f
-pkg-db-q4a-postgres-implicit-rollback 72d27284639260b5
-pkg-db-q4a-postgres-option-preflight e03c9b5a568fbf17
-pkg-db-q4a-postgres-prepared-transactions 78cdb1f4270329f4
+pkg-db-q4a-postgres-failed-commit beb3131745c55b75
+pkg-db-q4a-postgres-failed-rollback 1f331be6774d20bf
+pkg-db-q4a-postgres-implicit-rollback b27774f30e897901
+pkg-db-q4a-postgres-option-preflight 4a36a75e0e59287f
+pkg-db-q4a-postgres-prepared-transactions dd105ce9971b2028
 pkg-db-q4a-sqlite-bind-recovery 0e0e7109009f13b7
 pkg-db-q4a-sqlite-cleanup-poison 3d212209510658e9
 pkg-db-q4a-sqlite-prepared-reuse 2aa0d97ef18d963f

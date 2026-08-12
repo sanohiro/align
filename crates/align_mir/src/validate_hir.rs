@@ -5685,6 +5685,11 @@ impl<'a> BodyValidator<'a> {
                     return Some((expression.ty, flow.falls, flow.breaks));
                 }
                 let sig = self.resolve_signature(func)?;
+                if func == "pkg.db.internal.resource$new_stmt_state"
+                    && !self.prepared_stmt_formation_matches(context, args)
+                {
+                    return None;
+                }
                 if sig.is_extern && context.unsafe_depth == 0 {
                     return None;
                 }
@@ -6276,6 +6281,14 @@ impl<'a> BodyValidator<'a> {
                     return_borrow,
                     return_region,
                 });
+                let prepared_guard_ok = prepared_resource.is_some_and(|resource| {
+                    self.prepared_stmt_guard_matches(
+                        context,
+                        guard.as_deref(),
+                        ptr,
+                        resource,
+                    )
+                });
                 if descriptor_kind.is_none()
                     && prepared_resource.is_none()
                     && rows_resource.is_none()
@@ -6283,7 +6296,7 @@ impl<'a> BodyValidator<'a> {
                 {
                     return None;
                 }
-                if !batch_signature_ok && guard.is_some() {
+                if !batch_signature_ok && !prepared_guard_ok && guard.is_some() {
                     return None;
                 }
                 let signature_ok = batch_signature_ok || match offset {
@@ -6342,7 +6355,8 @@ impl<'a> BodyValidator<'a> {
                         let definition = self.program.resources.get(resource as usize)?;
                         let expected_prefix =
                             format!("pkg.db$stmt${}$", body_ty_mangle(params_ty, self.program));
-                        args.len() == 2
+                        prepared_guard_ok
+                            && args.len() == 2
                             && matches!(params_ty, Ty::Struct(_))
                             && definition
                                 .name
@@ -6369,11 +6383,19 @@ impl<'a> BodyValidator<'a> {
                             && expression.ty == i32_ty
                     }
                     80 => {
-                        descriptor_kind == Some(true)
-                            && args.len() == 1
-                            && param_tys.as_slice() == [Ty::Raw]
-                            && param_modes.as_slice() == [align_ast::ParamMode::ByValue]
-                            && expression.ty == i32_ty
+                        if prepared_resource.is_some() {
+                            prepared_guard_ok
+                                && args.len() == 1
+                                && param_tys.as_slice() == [Ty::Str]
+                                && param_modes.as_slice() == [align_ast::ParamMode::ByValue]
+                                && expression.ty == i32_ty
+                        } else {
+                            descriptor_kind == Some(true)
+                                && args.len() == 1
+                                && param_tys.as_slice() == [Ty::Raw]
+                                && param_modes.as_slice() == [align_ast::ParamMode::ByValue]
+                                && expression.ty == i32_ty
+                        }
                     }
                     88 => {
                         descriptor_kind == Some(true)
@@ -9705,6 +9727,111 @@ impl<'a> BodyValidator<'a> {
                 let name = function.name.as_str();
                 name.starts_with("pkg.db$") || name.starts_with("pkg.db.")
             })
+    }
+
+    fn prepared_stmt_guard_matches(
+        &self,
+        context: &BodyContext,
+        guard: Option<&hir::Expr>,
+        pointer: &hir::Expr,
+        resource: u32,
+    ) -> bool {
+        let hir::ExprKind::ResourceRaw {
+            reference,
+            resource: pointer_resource,
+        } = &pointer.kind
+        else {
+            return false;
+        };
+        let Some(hir::Expr {
+            kind:
+                hir::ExprKind::Call {
+                    func,
+                    args: guard_args,
+                    type_args,
+                },
+            ty: Ty::Bool,
+            ..
+        }) = guard
+        else {
+            return false;
+        };
+        let [guard_pointer] = guard_args.as_slice() else {
+            return false;
+        };
+        let hir::ExprKind::ResourceRaw {
+            reference: guard_reference,
+            resource: guard_resource,
+        } = &guard_pointer.kind
+        else {
+            return false;
+        };
+        let same_reference = matches!(
+            (&reference.kind, &guard_reference.kind),
+            (hir::ExprKind::Local(left), hir::ExprKind::Local(right)) if left == right
+        ) || matches!(
+            (&reference.kind, &guard_reference.kind),
+            (
+                hir::ExprKind::ResourceBorrow {
+                    owner: left_owner,
+                    resource: left_resource,
+                },
+                hir::ExprKind::ResourceBorrow {
+                    owner: right_owner,
+                    resource: right_resource,
+                },
+            ) if left_resource == right_resource
+                && matches!(
+                    (&left_owner.kind, &right_owner.kind),
+                    (hir::ExprKind::Local(left), hir::ExprKind::Local(right)) if left == right
+                )
+        );
+        self.static_descriptor_body_ok(context)
+            && func == "pkg.db.internal.resource$stmt_header_valid"
+            && type_args.is_empty()
+            && *pointer_resource == resource
+            && *guard_resource == resource
+            && pointer.ty == Ty::Raw
+            && guard_pointer.ty == Ty::Raw
+            && same_reference
+    }
+
+    /// A statement retains five producer-owned callbacks after the Query value itself is gone.
+    /// They must all be loaded from one concrete Query descriptor generation; accepting five
+    /// individually well-typed raw pointers would let malformed HIR splice a resolver or decoder
+    /// from a sibling Query with the same P/R types.
+    fn prepared_stmt_formation_matches(
+        &self,
+        context: &BodyContext,
+        args: &[hir::Expr],
+    ) -> bool {
+        if !self.static_descriptor_body_ok(context) || args.len() != 11 {
+            return false;
+        }
+        let callback = |index: usize, expected_offset: i128| -> Option<u32> {
+            let hir::ExprKind::RawPointerLoad { ptr, offset } = &args.get(index)?.kind else {
+                return None;
+            };
+            let hir::ExprKind::Int(actual_offset) = &offset.kind else {
+                return None;
+            };
+            if *actual_offset != expected_offset
+                || ptr.ty != Ty::Raw
+                || self.static_descriptor_data_kind(context, ptr) != Some(true)
+            {
+                return None;
+            }
+            let hir::ExprKind::Field { root, path } = &ptr.kind else {
+                return None;
+            };
+            (path.as_slice() == [0]).then_some(*root)
+        };
+        let Some(root) = callback(3, 64) else {
+            return false;
+        };
+        [(7, 80), (8, 120), (9, 128), (10, 104)]
+            .into_iter()
+            .all(|(index, offset)| callback(index, offset) == Some(root))
     }
 
     /// Validate the complete closed ABI of an A1 producer batch-plan thunk. Unlike descriptor

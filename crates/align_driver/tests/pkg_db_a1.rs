@@ -85,6 +85,51 @@ pub fn rows_shape<R>(
   }
 }
 
+pub fn stmt_shape<P, R>(borrow mut statement: pkg.db.stmt<P, R>, driver: u8) -> bool {
+  unsafe {
+    wrapper := resource.raw(resource.borrow(statement))
+    version: u32 := raw.load(wrapper, 0)
+    actual_driver: u8 := raw.load(wrapper, 4)
+    closed: u8 := raw.load(wrapper, 5)
+    reserved: u16 := raw.load(wrapper, 6)
+    native: raw := raw.load(wrapper, 8)
+    state: raw := raw.load(wrapper, 16)
+    binder: raw := raw.load(wrapper, 24)
+    query_id: raw := raw.load(wrapper, 32)
+    query_id_len: i64 := raw.load(wrapper, 40)
+    deallocate: raw := raw.load(wrapper, 48)
+    validator: raw := raw.load(wrapper, 56)
+    decoder: raw := raw.load(wrapper, 64)
+    plan: raw := raw.load(wrapper, 72)
+    resolver: raw := raw.load(wrapper, 80)
+    deallocate_ok := if driver == 1 { deallocate.is_null() } else { !deallocate.is_null() }
+    return pkg.db.internal.resource.stmt_header_valid(wrapper) && version == 3
+      && actual_driver == driver && closed == 0 && reserved == 0 && !native.is_null()
+      && !state.is_null() && !binder.is_null() && !query_id.is_null() && query_id_len > 0
+      && deallocate_ok && !validator.is_null() && !decoder.is_null()
+      && pkg.db.internal.resource.batch_plan_valid(plan) && !resolver.is_null()
+  }
+}
+
+pub fn set_stmt_version<P, R>(borrow mut statement: pkg.db.stmt<P, R>, version: u32) {
+  unsafe { raw.store(resource.raw(resource.borrow(statement)), 0, version) }
+}
+
+pub fn clear_stmt_resolver<P, R>(borrow mut statement: pkg.db.stmt<P, R>) {
+  unsafe { raw.store(resource.raw(resource.borrow(statement)), 80, raw.null()) }
+}
+
+pub fn restore_stmt_resolver<P, R>(
+  borrow mut statement: pkg.db.stmt<P, R>, query: pkg.db.query<P, R>,
+) {
+  unsafe {
+    raw.store(
+      resource.raw(resource.borrow(statement)), 80,
+      pkg.db.internal.descriptor.parameter_resolver(query),
+    )
+  }
+}
+
 pub fn set_batch_tail<R>(borrow values: pkg.db.batch<R>, tail: i64) {
   unsafe { raw.store(resource.raw(resource.borrow(values)), 40, tail) }
 }
@@ -180,6 +225,7 @@ pub Params { base: i64 }
 pub EmptyRow {}
 pub PgParams { first_user_id: i64, last_user_id: i64 }
 pub PgViewParams { id: i64, label: str, payload: slice<u8> }
+pub PgPreparedRow { id: i64 }
 
 pub PlainRow {
   id: i64,
@@ -304,6 +350,12 @@ pub fn postgres_bad_view() -> pkg.db.query<PgViewParams, PgViewRow> = pkg.db.pos
   ],
 )
 
+pub fn postgres_prepared() -> pkg.db.query<PgViewParams, PgPreparedRow> = pkg.db.postgres.query(
+  "SELECT CAST(:id AS BIGINT) AS id WHERE :label = :label AND :payload = :payload",
+  [],
+  [pkg.db.postgres.QueryOption.ParameterType("id", "int8")],
+)
+
 pub fn postgres_full() -> pkg.db.query<FullParams, FullRow> = pkg.db.postgres.query(
   "SELECT :b AS b, :nb AS nb, :i16v AS i16v, :ni16 AS ni16, :i32v AS i32v, :ni32 AS ni32, :i64v AS i64v, :ni64 AS ni64, :f32v AS f32v, :nf32 AS nf32, :f64v AS f64v, :nf64 AS nf64, :textv AS textv, :ntext AS ntext, :bytesv AS bytesv, :nbytes AS nbytes /* FULL_MATRIX */",
   [],
@@ -378,7 +430,56 @@ fn params(first_value: i64, last_value: i64) -> app.live_stream.Params {
   return app.live_stream.Params { first_value: first_value, last_value: last_value }
 }
 
+fn prepared_values(
+  borrow mut statement: pkg.db.stmt<app.live_stream.Params, app.live_stream.Row>,
+) -> i32 {
+  mut buffered := pkg.db.postgres.rows_stmt_native(statement, params(1, 1), [], []) else {
+    return 1
+  }
+  buffered_row := pkg.db.next(buffered) else { return 2 }
+  buffered_value := buffered_row else { return 3 }
+  if buffered_value.value != 1 { return 4 }
+  match pkg.db.next(buffered) else { return 5 } { Some(_) => { return 6 } None => {} }
+
+  mut singles := pkg.db.postgres.rows_stmt_native(
+    statement, params(2, 4), [],
+    [pkg.db.postgres.ExecuteOption.Delivery(pkg.db.postgres.Delivery.SingleRow)],
+  ) else { return 7 }
+  single_batch := pkg.db.next_batch(singles, 8) else { return 8 }
+  single_values := single_batch else { return 9 }
+  if (pkg.db.batch_len(single_values) else { return 10 }) != 3 { return 11 }
+
+  mut chunks := pkg.db.postgres.rows_stmt_native(
+    statement, params(5, 7), [],
+    [pkg.db.postgres.ExecuteOption.Delivery(pkg.db.postgres.Delivery.PortalBatch(2))],
+  ) else { return 12 }
+  chunk_head := pkg.db.next(chunks) else { return 13 }
+  chunk_value := chunk_head else { return 14 }
+  if chunk_value.value != 5 { return 15 }
+  chunk_tail := pkg.db.next_batch(chunks, 8) else { return 16 }
+  chunk_values := chunk_tail else { return 17 }
+  if (pkg.db.batch_len(chunk_values) else { return 18 }) != 2 { return 19 }
+  return 0
+}
+
+fn prepared_connection(borrow connection: pkg.db.conn) -> i32 {
+  prepared := pkg.db.prepare(
+    pkg.db.exec_conn(connection), app.live_stream.values(), [],
+  ) else { return 20 }
+  mut statement := prepared
+  return prepared_values(statement)
+}
+
+fn prepared_transaction(borrow transaction: pkg.db.tx) -> i32 {
+  prepared := pkg.db.postgres.prepare_native(
+    pkg.db.exec_tx(transaction), app.live_stream.values(), [], [],
+  ) else { return 21 }
+  mut statement := prepared
+  return prepared_values(statement)
+}
+
 fn transaction_effect(borrow transaction: pkg.db.tx) -> bool {
+  if prepared_transaction(transaction) != 0 { return false }
   mut tx_changed := pkg.db.postgres.rows_native(
     pkg.db.exec_tx(transaction), app.live_stream.change_effect(),
     app.live_stream.ValueParams { value: 5 }, [],
@@ -491,6 +592,12 @@ fn run(url: str) -> i32 {
   reused := pkg.db.next(buffered) else { return 34 }
   reused_value := reused else { return 35 }
   if reused_value.value != 42 { return 36 }
+  match pkg.db.next(buffered) else { return 65 } {
+    Some(_) => { return 66 }
+    None => {}
+  }
+  prepared_status := prepared_connection(connection)
+  if prepared_status != 0 { return 64 + prepared_status }
 
   tx_connection := pkg.db.postgres.connect(url, []) else { return 48 }
   tx_setup := pkg.db.execute(
@@ -545,9 +652,46 @@ import pkg.db.a1_test
 import pkg.db.sqlite
 import app.batch_query
 
+fn invalid_query(
+  result: Result<pkg.db.rows<app.batch_query.PlainRow>, pkg.db.Error>,
+) -> bool {
+  return match result {
+    Err(error) => match error { InvalidQuery(_) => true, _ => false }
+    Ok(_) => false
+  }
+}
+
+fn sqlite_statement_v3(borrow connection: pkg.db.conn) -> bool {
+  prepared := pkg.db.prepare(
+    pkg.db.exec_conn(connection), app.batch_query.plain(), [],
+  ) else { return false }
+  mut statement := prepared
+  if !pkg.db.a1_test.stmt_shape(statement, 1 as u8) { return false }
+  pkg.db.a1_test.set_stmt_version(statement, 2 as u32)
+  old_version := pkg.db.rows_stmt(
+    statement, app.batch_query.Params { base: 1 }, [],
+  )
+  if !invalid_query(old_version) { return false }
+  pkg.db.a1_test.set_stmt_version(statement, 3 as u32)
+  pkg.db.a1_test.clear_stmt_resolver(statement)
+  no_resolver := pkg.db.rows_stmt(
+    statement, app.batch_query.Params { base: 1 }, [],
+  )
+  if !invalid_query(no_resolver) { return false }
+  pkg.db.a1_test.restore_stmt_resolver(statement, app.batch_query.plain())
+  mut rows := pkg.db.rows_stmt(
+    statement, app.batch_query.Params { base: 10 }, [],
+  ) else { return false }
+  return match pkg.db.next(rows) {
+    Err(_) => false
+    Ok(value) => match value { Some(row) => row.id == 10, None => false }
+  }
+}
+
 fn main() -> i32 {
   opened := pkg.db.sqlite.connect(":memory:", [])
   connection := opened else { return 1 }
+  if !sqlite_statement_v3(connection) { return 53 }
   rows_result := pkg.db.rows(
     pkg.db.exec_conn(connection),
     app.batch_query.plain(),
@@ -1121,6 +1265,180 @@ fn main() -> i32 {
 }
 "#;
 
+const POSTGRES_PREPARED_STREAMED_MODES_MAIN: &str = r#"module main
+import pkg.db
+import pkg.db.postgres
+import app.batch_query
+import pkg.db.a1_test
+import pkg.db.testkit.pg
+
+extern "C" {
+  fn align_pg_delay_next_nonblocking_enable()
+}
+
+fn params(id: i64, label: str, payload: slice<u8>) -> app.batch_query.PgViewParams {
+  return app.batch_query.PgViewParams { id: id, label: label, payload: payload }
+}
+
+fn invalid_query(
+  result: Result<pkg.db.rows<app.batch_query.PgPreparedRow>, pkg.db.Error>,
+) -> bool {
+  return match result {
+    Err(error) => match error { InvalidQuery(_) => true, _ => false }
+    Ok(_) => false
+  }
+}
+
+fn consume(
+  borrow mut statement: pkg.db.stmt<app.batch_query.PgViewParams, app.batch_query.PgPreparedRow>,
+) -> i32 {
+  if !pkg.db.a1_test.stmt_shape(statement, 2 as u8) { return 1 }
+  bytes := [1 as u8, 2 as u8, 3 as u8]
+  unknown := pkg.db.postgres.rows_stmt_native(
+    statement, params(7, "first", bytes[..]), [],
+    [pkg.db.postgres.ExecuteOption.ParameterFormat("missing", pkg.db.postgres.Format.Text)],
+  )
+  unknown_ok := match unknown {
+    Err(error) => match error {
+      Unsupported(contract) => contract.item == "postgres.execute.parameter_format"
+        && contract.message == "unknown PostgreSQL parameter format name"
+      _ => false
+    }
+    Ok(_) => false
+  }
+  if !unknown_ok { return 2 }
+  duplicate := pkg.db.postgres.rows_stmt_native(
+    statement, params(7, "first", bytes[..]), [],
+    [
+      pkg.db.postgres.ExecuteOption.ParameterFormat(
+        "id", pkg.db.postgres.Format.Text,
+      ),
+      pkg.db.postgres.ExecuteOption.ParameterFormat(
+        "id", pkg.db.postgres.Format.Text,
+      ),
+    ],
+  )
+  duplicate_ok := match duplicate {
+    Err(error) => match error {
+      Unsupported(contract) => contract.message == "duplicate PostgreSQL parameter format"
+      _ => false
+    }
+    Ok(_) => false
+  }
+  if !duplicate_ok { return 3 }
+  invalid_after := pkg.db.postgres.rows_stmt_native(
+    statement, params(7, "first", bytes[..]), [],
+    [
+      pkg.db.postgres.ExecuteOption.Delivery(pkg.db.postgres.Delivery.SingleRow),
+      pkg.db.postgres.ExecuteOption.Delivery(pkg.db.postgres.Delivery.PortalBatch(0)),
+    ],
+  )
+  invalid_ok := match invalid_after {
+    Err(error) => match error {
+      Unsupported(contract) => contract.message
+        == "PostgreSQL portal batch size must be between 1 and 2147483647 rows"
+      _ => false
+    }
+    Ok(_) => false
+  }
+  if !invalid_ok { return 4 }
+
+  unsafe { align_pg_delay_next_nonblocking_enable() }
+  expired := pkg.db.postgres.rows_stmt_native(
+    statement, params(7, "first", bytes[..]),
+    [pkg.db.ExecuteOption.TimeoutNs(1)],
+    [pkg.db.postgres.ExecuteOption.Delivery(pkg.db.postgres.Delivery.SingleRow)],
+  )
+  expired_ok := match expired {
+    Err(error) => match error { Timeout(_) => true, _ => false }
+    Ok(_) => false
+  }
+  if !expired_ok { return 28 }
+
+  mut buffered := pkg.db.postgres.rows_stmt_native(
+    statement, params(7, "first", bytes[..]), [], [],
+  ) else { return 5 }
+  all := pkg.db.next_batch(buffered, 8) else { return 6 }
+  all_batch := all else { return 7 }
+  if (pkg.db.batch_len(all_batch) else { return 8 }) != 1
+    || !pkg.db.a1_test.rows_shape(buffered, 2 as u8, 1 as u8, 0 as u8, false, 0, false) {
+    return 9
+  }
+
+  mut singles := pkg.db.postgres.rows_stmt_native(
+    statement, params(8, "second", bytes[..]), [],
+    [pkg.db.postgres.ExecuteOption.Delivery(pkg.db.postgres.Delivery.SingleRow)],
+  ) else { return 10 }
+  first := pkg.db.next_batch(singles, 3) else { return 11 }
+  first_batch := first else { return 12 }
+  if (pkg.db.batch_len(first_batch) else { return 15 }) != 1 { return 17 }
+  match pkg.db.next_batch(singles, 3) else { return 13 } {
+    Some(_) => { return 14 }
+    None => {}
+  }
+
+  mut chunks := pkg.db.postgres.rows_stmt_native(
+    statement, params(7, "first", bytes[..]), [],
+    [pkg.db.postgres.ExecuteOption.Delivery(pkg.db.postgres.Delivery.PortalBatch(2))],
+  ) else { return 18 }
+  head := pkg.db.next(chunks) else { return 19 }
+  head_row := head else { return 20 }
+  if head_row.id != 0 { return 21 }
+  match pkg.db.next_batch(chunks, 8) else { return 22 } {
+    Some(_) => { return 23 }
+    None => {}
+  }
+  return 0
+}
+
+fn conn_phase(borrow connection: pkg.db.conn) -> i32 {
+  prepared := pkg.db.prepare(
+    pkg.db.exec_conn(connection), app.batch_query.postgres_prepared(), [],
+  ) else { return 30 }
+  mut statement := prepared
+  bytes := [1 as u8, 2 as u8, 3 as u8]
+  pkg.db.a1_test.set_stmt_version(statement, 2 as u32)
+  old_version := pkg.db.postgres.rows_stmt_native(
+    statement, params(7, "first", bytes[..]), [], [],
+  )
+  if !invalid_query(old_version) { return 35 }
+  pkg.db.a1_test.set_stmt_version(statement, 3 as u32)
+  pkg.db.a1_test.clear_stmt_resolver(statement)
+  no_resolver := pkg.db.postgres.rows_stmt_native(
+    statement, params(7, "first", bytes[..]), [], [],
+  )
+  if !invalid_query(no_resolver) { return 36 }
+  pkg.db.a1_test.restore_stmt_resolver(statement, app.batch_query.postgres_prepared())
+  return consume(statement)
+}
+
+fn tx_phase(borrow transaction: pkg.db.tx) -> i32 {
+  prepared := pkg.db.postgres.prepare_native(
+    pkg.db.exec_tx(transaction), app.batch_query.postgres_prepared(), [],
+    [
+      pkg.db.postgres.PrepareOption.ParameterOid("id", 20 as u32),
+      pkg.db.postgres.PrepareOption.ParameterOid("label", 25 as u32),
+      pkg.db.postgres.PrepareOption.ParameterOid("payload", 17 as u32),
+    ],
+  ) else { return 31 }
+  mut statement := prepared
+  return consume(statement)
+}
+
+fn main() -> i32 {
+  pkg.db.testkit.pg.reset()
+  connection := pkg.db.postgres.connect("postgresql://stub/a1-prepared", []) else { return 32 }
+  conn_status := conn_phase(connection)
+  if conn_status != 0 { return conn_status }
+  transaction := pkg.db.begin(connection, []) else { return 33 }
+  tx_status := tx_phase(transaction)
+  if tx_status != 0 { return tx_status }
+  returned := pkg.db.rollback(transaction) else { return 34 }
+  pkg.db.testkit.pg.dump()
+  return 42
+}
+"#;
+
 const POSTGRES_DELIVERY_VALIDATION_MAIN: &str = r#"module main
 import pkg.db
 import pkg.db.postgres
@@ -1600,6 +1918,33 @@ const CASE_POSTGRES_STREAMED_MODES: Case = Case {
     ],
 };
 
+const CASE_POSTGRES_PREPARED_STREAMED_MODES: Case = Case {
+    label: "pkg-db-a1-postgres-prepared-streamed-modes",
+    runner: RunnerKind::PerUnitC,
+    needs: Needs::BackendAndCc,
+    links: &[&PG],
+    counters: &[&PG],
+    modules: a1_modules,
+    main: POSTGRES_PREPARED_STREAMED_MODES_MAIN,
+    envs: &[],
+    expected_exit: 42,
+    expect_counters: &[
+        ("pg.protocol_ok", 1),
+        ("pg.connect_calls", 1),
+        ("pg.execute_calls", 0),
+        ("pg.clear_calls", 16),
+        ("pg.nonblocking_calls", 12),
+        ("pg.single_row_mode_calls", 2),
+        ("pg.chunked_row_mode_calls", 2),
+        ("pg.last_chunk_size", 2),
+        ("pg.prepare_calls", 2),
+        ("pg.execute_prepared_calls", 6),
+        ("pg.control_calls", 2),
+        ("pg.deallocate_calls", 2),
+        ("pg.delivered_rows", 0),
+    ],
+};
+
 const CASE_POSTGRES_DELIVERY_VALIDATION: Case = Case {
     label: "pkg-db-a1-postgres-delivery-validation",
     runner: RunnerKind::PerUnitC,
@@ -1724,6 +2069,7 @@ const LAYER1_CASES: &[&Case] = &[
     &CASE_POSTGRES_DELIVERY_VALIDATION,
     &CASE_POSTGRES_STREAMED_FAILURES,
     &CASE_POSTGRES_STREAMED_MODES,
+    &CASE_POSTGRES_PREPARED_STREAMED_MODES,
     &CASE_POSTGRES_STREAMED_ONE,
     &CASE_POSTGRES_STREAMED_TIMEOUT_DROP,
     &CASE_POSTGRES_STREAMED_UNSAFE_STATUSES,
@@ -1777,7 +2123,7 @@ fn main() -> i32 = 0
 }
 
 #[test]
-fn direct_delivery_surface_is_staged_without_prepared_parity() {
+fn delivery_surface_includes_prepared_parity() {
     assert!(POSTGRES_PUBLIC.contains(
         "pub Delivery {\n  SingleRow\n  PortalBatch(i64)\n}"
     ));
@@ -1786,7 +2132,24 @@ fn direct_delivery_surface_is_staged_without_prepared_parity() {
     ));
     assert!(POSTGRES_PUBLIC.contains("pub fn rows_native<P, R>("));
     assert!(POSTGRES_PUBLIC.contains("pub fn one_native<P, R: RegionPlain>("));
-    assert!(!POSTGRES_PUBLIC.contains("pub fn rows_stmt_native"));
+    assert!(POSTGRES_PUBLIC.contains("pub fn rows_stmt_native<P, R>("));
+}
+
+#[test]
+fn prepared_delivery_surface_typechecks_whole_and_per_unit() {
+    let layout = package_files(POSTGRES_PREPARED_STREAMED_MODES_MAIN)
+        .module(PG.counters_path, PG.counters_align);
+    let checked = diff_check_multi(
+        "pkg-db-a1-prepared-delivery-surface",
+        &layout.files(),
+        "main.align",
+    );
+    assert!(
+        !checked.whole_errors && !checked.per_unit_errors,
+        "whole diagnostics:\n{}\nper-unit diagnostics:\n{}",
+        checked.whole_diags,
+        checked.per_unit_diags,
+    );
 }
 
 #[test]
@@ -1911,6 +2274,11 @@ fn postgres_streamed_modes_span_results_and_preserve_buffered_default() {
 }
 
 #[test]
+fn postgres_prepared_streamed_modes_retain_resolver_and_buffered_default() {
+    CASE_POSTGRES_PREPARED_STREAMED_MODES.run();
+}
+
+#[test]
 fn postgres_delivery_validation_preserves_source_order_and_command_disposition() {
     CASE_POSTGRES_DELIVERY_VALIDATION.run();
 }
@@ -1936,7 +2304,7 @@ fn postgres_streamed_unsafe_statuses_close_without_followup_native_calls() {
 }
 
 #[test]
-fn postgres_required_direct_delivery_uses_real_libpq17() {
+fn postgres_required_streamed_delivery_uses_real_libpq17() {
     if !backend_available() {
         return;
     }
@@ -1951,7 +2319,7 @@ fn postgres_required_direct_delivery_uses_real_libpq17() {
         !diagnostics.lines().any(|line| line.contains(": error:")),
         "PostgreSQL A1 fixture must type-check before live execution:\n{diagnostics}"
     );
-    let Some(url) = db_harness::live_postgres_url("PostgreSQL A1 direct-delivery owner") else {
+    let Some(url) = db_harness::live_postgres_url("PostgreSQL A1 streamed-delivery owner") else {
         return;
     };
     let output = build_and_run_multi_with_static_descriptors_args_with_env(
@@ -1980,17 +2348,18 @@ fn postgres_required_direct_delivery_uses_real_libpq17() {
 ///
 /// Regenerate ONLY with a reviewed reason, from the panic message this emits.
 const LAYER1_FINGERPRINT_GOLDEN: &str = "\
-pkg-db-a1-postgres-batch-decode-failure bedd652eb580b5e0
-pkg-db-a1-postgres-buffered-batches ece0f00d9dd9bcfd
-pkg-db-a1-postgres-delivery-validation 1673fb23140db463
-pkg-db-a1-postgres-streamed-failures 8f5a917b70b16712
-pkg-db-a1-postgres-streamed-modes 5b8d2922055d555b
-pkg-db-a1-postgres-streamed-one 1d7544638671d32f
-pkg-db-a1-postgres-streamed-timeout-drop d469ca7e48d03ed8
-pkg-db-a1-postgres-streamed-unsafe-statuses eeb2bfc2233947fa
-pkg-db-a1-postgres-value-matrix 1851d5f5b5d1cc0b
-pkg-db-a1-sqlite-batches 32dd069e4357546a
-pkg-db-a1-zero-column-plan 87bf43dc890fb641
+pkg-db-a1-postgres-batch-decode-failure af292c51af09d20a
+pkg-db-a1-postgres-buffered-batches 37310112d202c8ff
+pkg-db-a1-postgres-delivery-validation b2b65d7cfade3cd5
+pkg-db-a1-postgres-prepared-streamed-modes ffc9c57acdc0aa9d
+pkg-db-a1-postgres-streamed-failures 061abe2c7f92e390
+pkg-db-a1-postgres-streamed-modes b28a2ae752039cf5
+pkg-db-a1-postgres-streamed-one ba315ee063c8d239
+pkg-db-a1-postgres-streamed-timeout-drop 9f74901ca6875ff2
+pkg-db-a1-postgres-streamed-unsafe-statuses c7fbe92c32a686bc
+pkg-db-a1-postgres-value-matrix 0f4060bf07d441dd
+pkg-db-a1-sqlite-batches 9a540f8f09e906ec
+pkg-db-a1-zero-column-plan edcbbef602120847
 ";
 
 #[test]
