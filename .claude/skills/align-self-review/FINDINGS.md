@@ -36,7 +36,7 @@ invented exact counts here.
 | `public-surface-completeness` | 2 | 2 | Promoted: compare the complete exported surface to the ledger and require an internal/sealed boundary for cross-module helpers. |
 | `operation-matrix-completeness` | 5 | 4 | Three-plus events: automation required. Add one parameterized dual-driver parity owner that runs the same descriptor/status/sentinel matrix through both drivers and asserts identical error-class mapping; also check native command tags (PostgreSQL answers `COMMIT` in an aborted transaction with `PGRES_COMMAND_OK` and a `ROLLBACK` tag), and retain failed rows state after every cleanup failure. |
 | `error-contract-identity` | 1 | 1 | Watch; pin error class, query identity, and precedence. |
-| `source-of-truth-drift` | 5 | 3 | Three-plus events: the mandatory ledger-to-diff extraction pass in `SKILL.md` is the owner — extract every `must`/`exact`/`every`/`before`/`reject`/`required` line from the touched design sections and point each at implementation or an explicit deferral. Re-read adjacent comments and counter documentation against behavior. A lexical lint is not sound here because the drift is semantic, so the extraction pass is mandatory rather than automated. |
+| `source-of-truth-drift` | 6 | 4 | Three-plus events: the mandatory ledger-to-diff extraction pass in `SKILL.md` is the owner — extract every `must`/`exact`/`every`/`before`/`reject`/`required` line from the touched design sections and point each at implementation or an explicit deferral. Re-read adjacent comments and counter documentation against behavior. A lexical lint is not sound here because the drift is semantic, so the extraction pass is mandatory rather than automated. |
 | `owner-test-topology` | 3 | 3 | Three-plus events: every named closure-matrix cell must have a direct owner whose witness is **mutation-verified against the pre-fix compiler**, not merely present; retain whole/per-unit owners when refactoring fixtures. A witness that counts something the defect does not duplicate (a `.clone()` outside the duplicated subtree) passes on the broken compiler and closes nothing. |
 | `test-global-state-isolation` | 1 | 1 | Watch; prefer child-scoped environment and RAII restoration. |
 | `test-entry-abi-exactness` | 1 | 1 | Watch; compile fixtures through the real entry ABI. |
@@ -119,6 +119,7 @@ invented exact counts here.
 | #770 | `4667cc8f` | P2 | `operation-matrix-completeness` | Retain failed rows state when clean-terminal synchronization or blocking restoration fails. |
 | #770 | `4667cc8f` | P2 | `validation-phase-completeness` | Validate batch fixed-layout representability before advancing the native stream. |
 | #770 | `4667cc8f` | P2 | `historical-workflow-source-boundary` | Keep libpq setup/version fallback available when rebuilding a tag that predates the new helper scripts. |
+| #771 | `1187713` | P2 | `source-of-truth-drift` | Update the completed PostgreSQL delivery boundaries in the live handoff table. |
 
 ## Rejected claims
 
