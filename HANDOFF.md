@@ -127,13 +127,10 @@ facts must live in this repository.
 
 ## Current baseline
 
-- **Release:** v0.4.0 was tagged at `88ee798` and published for the completed
-  align-llm R1/R2/R3 batch. `RELEASE_NOTES_0.4.0.md` is the release record.
-- **Post-release portability:** v0.4.0's macOS artifact failed to link because
-  `clearenv(3)` is unavailable on macOS/BSD. #636 fixed this on `main` with a
-  platform-specific portable implementation; macOS CI is green and Linux
-  behavior is unchanged. The v0.4.0 tag predates the fix, so the next versioned
-  release must be cut from current `main`.
+- **Release:** v0.5.0 is the release checkpoint for the complete committed
+  `pkg.db` roadmap through D14. `RELEASE_NOTES_0.5.0.md` is the release record.
+  It includes the post-v0.4.0 macOS `clearenv(3)` portability fix from #636;
+  macOS CI is green and Linux behavior is unchanged.
 - **Compiler roadmap:** M0-M15, the LLVM 19-to-22 checkpoint, separate
   compilation, the default-on per-unit object cache, the in-process compilation
   memo and the persistent per-unit frontend cache, parallel codegen, ThinLTO,
