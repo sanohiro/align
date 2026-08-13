@@ -1766,18 +1766,8 @@ grep -Eq '^ *cargo-nightly-.*-\$\{\{ hashFiles\('"'"'Cargo.lock'"'"'\) \}\}-$' \
 }
 
 # Release PGO profiles alignc, not the runtime archive that alignc links into
-# its training outputs. The runtime also needs multiple archive members so a
-# primitive-only program does not pull every optional native dependency.
+# its training outputs.
 release_workflow="$repo_root/.github/workflows/release.yml"
-awk '
-  $0 == "[profile.dist.package.align_runtime]" { in_runtime = 1; next }
-  /^\[/ { in_runtime = 0 }
-  in_runtime && $0 == "codegen-units = 16" { found = 1 }
-  END { exit found ? 0 : 1 }
-' "$repo_root/Cargo.toml" || {
-  echo "the dist runtime no longer preserves archive-member granularity" >&2
-  exit 1
-}
 if grep -Eq 'scripts/cargo\.sh build .* -p align_runtime -p align_driver' "$release_workflow"; then
   echo "release.yml instruments the runtime together with alignc again" >&2
   exit 1

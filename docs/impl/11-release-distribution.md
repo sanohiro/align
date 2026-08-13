@@ -26,7 +26,7 @@ These are native builds, not cross-compiles. That matters because the compiler l
 4. updates `sanohiro/homebrew-align` when `HOMEBREW_TAP_TOKEN` exists;
 5. builds and deploys a signed apt repository when `APT_GPG_PRIVATE_KEY` exists.
 
-Only a versioned release pays for that tuning: ordinary `--release` builds stay on the untuned default so routine batch builds never carry the LTO/PGO cost. The compiler uses thin LTO, one codegen unit, and compiler-only PGO. Its packaged runtime uses thin LTO with multiple codegen units so optional native capabilities remain in separate archive members, and stays outside compiler-training instrumentation. The `alignc` binary links mimalloc in every profile.
+Only a versioned release pays for that tuning: ordinary `--release` builds stay on the untuned default so routine batch builds never carry the LTO/PGO cost. The compiler uses thin LTO, one codegen unit, and compiler-only PGO. Its packaged runtime uses the same dist optimization profile but stays outside compiler-training instrumentation because `alignc` links that archive into the programs compiled during training. The `alignc` binary links mimalloc in every profile.
 
 The optional secrets make the external publishing steps fail closed: no secret means no tap or apt-repository mutation. Release assets are still produced.
 
