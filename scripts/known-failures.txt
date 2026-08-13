@@ -1,0 +1,37 @@
+# Known-failing workspace tests, the baseline scripts/run-suite-binaries.sh
+# judges the nightly run against.
+#
+#   <target><TAB><test name>[<TAB>env]
+#
+# A plain line is a STRICT expectation in both directions: that test must fail,
+# and the moment it passes the nightly turns red so the line gets deleted in
+# the same change that fixed it. That ratchet is the point — a manifest is not
+# a place for a test to retire.
+#
+# A third field of "env" marks a test whose outcome depends on something the
+# nightly runner does not provide (an environment variable, a network, a
+# service). It still runs, and it may pass or fail without changing the
+# verdict. Reserve it for genuine environment dependence, never for flakiness:
+# a flaky test is a bug, and hiding it here removes the only thing that would
+# have reported it.
+#
+# Two synthetic test names exist for binary-level outcomes:
+#   <binary-exit-N>            exited N without libtest naming a failed test
+#   <binary-did-not-report>    never reached libtest's summary (crash or cap)
+#
+# Comments and blank lines are ignored. Keep entries sorted by target.
+#
+# BOOTSTRAP (2026-08-13). This baseline is incomplete on purpose. The remaining
+# known failures on main have to be transcribed from an observed run, and the
+# machine this landed on could not produce one: freshly linked binaries park in
+# _dyld_start at 0% CPU for ~10 minutes each (macOS 26.5, syspolicyd at 116 h
+# CPU), which is the host stall CLAUDE.md already documents. Guessing the test
+# names would defeat the point of naming them.
+#
+# The first run fills this in and costs nothing extra: every failure is
+# reported as "suite: NEW failures" in exactly the two-field form below, so the
+# lines can be pasted straight in. Classify each one on the way — a test that
+# needs ALIGN_* configuration, a network, or a service gets the "env" field;
+# everything else is a real known failure and stays strict.
+
+json_scan_identity	json_scan_cross_compiler_identity	env

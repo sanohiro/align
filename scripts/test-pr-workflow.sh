@@ -1267,6 +1267,330 @@ gate_outcome_case() {
 gate_outcome_case failing '--- failing (exit 3' "$gate_pass_one" "$gate_failing"
 gate_outcome_case killed '--- suicidal (exit killed' "$gate_pass_one" "$gate_killed"
 
+# The gate has no per-binary cap and must not be able to acquire one from the
+# environment: its slowest binaries are single-threaded stress tests, and a
+# stray exported budget would start killing exactly those. The runner pins the
+# variable, so an exported value has to change nothing.
+gate_slow="$(gate_binary slow 'sleep 3; exit 0')"
+gate_slow_json="$tmp_dir/gate-slow.json"
+gate_stream "$gate_slow_json" "$gate_slow"
+gate_slow_out="$tmp_dir/gate-slow-out"
+ALIGN_GATE_JOBS=2 ALIGN_TB_TIMEOUT=1 "$gate_runner" "$gate_slow_json" slow \
+  >"$gate_slow_out" 2>&1 || {
+  echo "an exported ALIGN_TB_TIMEOUT reached the gate and killed a slow binary:" >&2
+  cat "$gate_slow_out" >&2
+  exit 1
+}
+grep -Fq -- '--- slow (exit 0' "$gate_slow_out" || {
+  echo "the gate did not report the slow binary as a clean pass:" >&2
+  cat "$gate_slow_out" >&2
+  exit 1
+}
+
+# scripts/run-suite-binaries.sh is the nightly detector: the same discovery and
+# concurrency engine, judged against scripts/known-failures.txt instead of a
+# declared binary set. Its verdict has three directions and all three are
+# exercised here against fixtures, so the nightly cannot regress into the
+# always-red fail-fast state it replaced without this file failing first.
+suite_dir="$tmp_dir/suite-runner"
+mkdir -p "$suite_dir/pkg" "$suite_dir/bin"
+suite_runner="$repo_root/scripts/run-suite-binaries.sh"
+
+# libtest's own output shape: one line per test, then the summary line the
+# runner requires as proof that the binary got to the end.
+suite_binary() {
+  local path="$suite_dir/bin/$1-0123456789abcdef"
+  printf '#!/usr/bin/env bash\n%s\n' "$2" >"$path"
+  chmod +x "$path"
+  printf '%s\n' "$path"
+}
+suite_green="$(suite_binary suite_green '
+printf "test alpha ... ok\n"
+printf "\ntest result: ok. 1 passed; 0 failed; 0 ignored\n"
+exit 0')"
+suite_red="$(suite_binary suite_red '
+printf "test alpha ... ok\n"
+printf "test beta ... FAILED\n"
+printf "\nfailures:\n    beta\n\n"
+printf "test result: FAILED. 1 passed; 1 failed; 0 ignored\n"
+exit 101')"
+suite_env="$(suite_binary suite_env '
+printf "test needs_network ... FAILED\n"
+printf "\ntest result: FAILED. 0 passed; 1 failed; 0 ignored\n"
+exit 101')"
+# Reached the summary line but still exited non-zero: a harness-level failure
+# that names no test must not be read as a clean binary.
+suite_harness="$(suite_binary suite_harness '
+printf "test result: ok. 0 passed; 0 failed; 0 ignored\n"
+exit 4')"
+# Never reaches the summary line, and never exits either — the hang the
+# per-binary cap exists for.
+suite_hang="$(suite_binary suite_hang '
+printf "test alpha ... ok\n"
+sleep 30')"
+# Named a failure, printed the summary, and THEN died (a segfault in a
+# destructor, say). Its named failure is in the manifest; the crash is not, and
+# must not be absorbed by it.
+suite_crash="$(suite_binary suite_crash '
+printf "test beta ... FAILED\n"
+printf "\ntest result: FAILED. 0 passed; 1 failed; 0 ignored\n"
+exit 139')"
+
+suite_artifact() {
+  printf '{"reason":"compiler-artifact","manifest_path":"%s/pkg/Cargo.toml",' "$suite_dir"
+  printf '"target":{"kind":["lib"],"name":"x","test":true},'
+  printf '"profile":{"opt_level":"0","test":true},"features":[],'
+  printf '"filenames":["x"],"executable":"%s","fresh":true}\n' "$1"
+}
+suite_stream() {
+  local out="$1" executable
+  shift
+  {
+    printf '{"reason":"build-script-executed","package_id":"x",'
+    printf '"linked_paths":["native=%s/bin"],"cfgs":[],"env":[]}\n' "$suite_dir"
+    for executable in "$@"; do
+      suite_artifact "$executable"
+    done
+  } >"$out"
+}
+
+suite_manifest() {
+  local path="$tmp_dir/known-failures-$1"
+  shift
+  printf '%s\n' "$@" >"$path"
+  printf '%s\n' "$path"
+}
+# The fixture manifest is written with real tabs, exactly as the shipped one is.
+suite_line() {
+  printf '%s\t%s' "$1" "$2"
+  [ $# -lt 3 ] || printf '\t%s' "$3"
+  printf '\n'
+}
+
+suite_case() {
+  local label="$1" manifest="$2" expect_status="$3"
+  shift 3
+  local stream="$tmp_dir/suite-$label.json"
+  suite_stream "$stream" "$@"
+  local out="$tmp_dir/suite-$label-out"
+  local status=0
+  ALIGN_GATE_JOBS=2 ALIGN_SUITE_BINARY_TIMEOUT=2 ALIGN_KNOWN_FAILURES="$manifest" \
+    "$suite_runner" "$stream" >"$out" 2>&1 || status=$?
+  [[ "$status" -eq "$expect_status" ]] || {
+    echo "the suite runner exited $status (expected $expect_status) for $label:" >&2
+    cat "$out" >&2
+    exit 1
+  }
+  printf '%s\n' "$out"
+}
+
+# 1. The observed failures are exactly the manifest: green.
+match_manifest="$(suite_manifest match "$(suite_line suite_red beta)")"
+suite_match_out="$(suite_case match "$match_manifest" 0 "$suite_green" "$suite_red")"
+grep -Fq 'matches' "$suite_match_out" || {
+  echo "an exact manifest match was not reported as such:" >&2
+  cat "$suite_match_out" >&2
+  exit 1
+}
+# A known-failing binary is not silently trusted: its own result line is still
+# in the report, and a passing binary is summarised rather than dumped.
+for expected_line in '--- suite_red (exit 101' '--- suite_green (exit 0' 'test result: ok.'; do
+  grep -Fq -e "$expected_line" "$suite_match_out" || {
+    echo "the suite report lacks '$expected_line':" >&2
+    cat "$suite_match_out" >&2
+    exit 1
+  }
+done
+
+# 2. A failure the manifest does not list is red, named, and its full log is
+# printed rather than summarised.
+empty_manifest="$(suite_manifest empty '# nothing is expected to fail')"
+suite_new_out="$(suite_case new "$empty_manifest" 1 "$suite_green" "$suite_red")"
+grep -Fq 'NEW failures' "$suite_new_out" || {
+  echo "an unlisted failure was not reported as new:" >&2
+  cat "$suite_new_out" >&2
+  exit 1
+}
+grep -Eq '^  suite_red[[:space:]]+beta$' "$suite_new_out" || {
+  echo "the new failure was not named target-and-test:" >&2
+  cat "$suite_new_out" >&2
+  exit 1
+}
+grep -Fq 'test alpha ... ok' "$suite_new_out" || {
+  echo "the offending binary's own output was not printed in full:" >&2
+  cat "$suite_new_out" >&2
+  exit 1
+}
+
+# 3. A manifest entry that now passes is red too — the ratchet direction.
+stale_manifest="$(suite_manifest stale \
+  "$(suite_line suite_red beta)" "$(suite_line suite_green alpha)")"
+suite_fixed_out="$(suite_case fixed "$stale_manifest" 1 "$suite_green" "$suite_red")"
+grep -Fq 'did NOT fail' "$suite_fixed_out" || {
+  echo "a repaired test was not reported against the manifest:" >&2
+  cat "$suite_fixed_out" >&2
+  exit 1
+}
+grep -Eq '^  suite_green[[:space:]]+alpha \(passed\)$' "$suite_fixed_out" || {
+  echo "the repaired test was not named:" >&2
+  cat "$suite_fixed_out" >&2
+  exit 1
+}
+# A manifest line naming a target that no longer exists is the same failure
+# with a different explanation, never a silent pass.
+gone_manifest="$(suite_manifest gone "$(suite_line suite_gone alpha)")"
+suite_gone_out="$(suite_case gone "$gone_manifest" 1 "$suite_green")"
+grep -Fq 'no such target in the workspace' "$suite_gone_out" || {
+  echo "a manifest line for a deleted target was not reported:" >&2
+  cat "$suite_gone_out" >&2
+  exit 1
+}
+
+# 4. An "env" entry runs but does not decide the verdict, in either direction.
+env_manifest="$(suite_manifest env \
+  "$(suite_line suite_env needs_network env)" "$(suite_line suite_green alpha env)")"
+suite_env_out="$(suite_case env "$env_manifest" 0 "$suite_green" "$suite_env")"
+grep -Fq '0 known, 2 environment-dependent' "$suite_env_out" || {
+  echo "the manifest counts were not reported as 0 known, 2 environment-dependent:" >&2
+  cat "$suite_env_out" >&2
+  exit 1
+}
+# Tolerating an outcome is not the same as tolerating a fiction: an env line
+# for a target that no longer exists excuses nothing and is red, symmetrically
+# with a strict line.
+env_gone_manifest="$(suite_manifest env-gone "$(suite_line suite_gone needs_network env)")"
+suite_env_gone_out="$(suite_case env-gone "$env_gone_manifest" 1 "$suite_green")"
+grep -Eq '^  suite_gone[[:space:]]+needs_network \(no such target in the workspace\)$' \
+  "$suite_env_gone_out" || {
+  echo "an env line for a deleted target was not reported:" >&2
+  cat "$suite_env_gone_out" >&2
+  exit 1
+}
+# One key cannot be strict and tolerated at once; whichever rule won would be
+# an accident of ordering, so the manifest is malformed (exit 2).
+both_manifest="$(suite_manifest both \
+  "$(suite_line suite_red beta)" "$(suite_line suite_red beta env)")"
+suite_both_out="$(suite_case both "$both_manifest" 2 "$suite_red")"
+grep -Fq 'both as a known failure and as' "$suite_both_out" || {
+  echo "a key listed as both strict and env was not rejected:" >&2
+  cat "$suite_both_out" >&2
+  exit 1
+}
+
+# 5. A binary that exits non-zero without naming a test, and one that never
+# reaches libtest's summary at all, both fail closed.
+suite_harness_out="$(suite_case harness "$empty_manifest" 1 "$suite_harness")"
+grep -Eq '^  suite_harness[[:space:]]+<binary-exit-4>$' "$suite_harness_out" || {
+  echo "a harness-level non-zero exit was not reported:" >&2
+  cat "$suite_harness_out" >&2
+  exit 1
+}
+suite_hang_out="$(suite_case hang "$empty_manifest" 1 "$suite_hang")"
+grep -Eq '^  suite_hang[[:space:]]+<binary-did-not-report>$' "$suite_hang_out" || {
+  echo "a binary killed by the per-binary cap was not reported:" >&2
+  cat "$suite_hang_out" >&2
+  exit 1
+}
+grep -Fq -- '--- suite_hang (exit timeout' "$suite_hang_out" || {
+  echo "the capped binary was not reported as a timeout:" >&2
+  cat "$suite_hang_out" >&2
+  exit 1
+}
+# The absorption hole: every test the crashing binary named is already in the
+# manifest, so only the exit code distinguishes this run from a clean baseline.
+crash_manifest="$(suite_manifest crash "$(suite_line suite_crash beta)")"
+suite_crash_out="$(suite_case crash "$crash_manifest" 1 "$suite_crash")"
+grep -Eq '^  suite_crash[[:space:]]+<binary-exit-139>$' "$suite_crash_out" || {
+  echo "a crash after libtest's summary was absorbed by the known failure:" >&2
+  cat "$suite_crash_out" >&2
+  exit 1
+}
+grep -Fq 'did NOT fail' "$suite_crash_out" && {
+  echo "the crashing binary's known failure was also reported as repaired:" >&2
+  cat "$suite_crash_out" >&2
+  exit 1
+}
+
+# 6. A malformed manifest is a configuration error (exit 2), not a verdict.
+space_manifest="$(suite_manifest spaces 'suite_red beta')"
+suite_case spaces "$space_manifest" 2 "$suite_red" >/dev/null
+kind_manifest="$(suite_manifest kind "$(suite_line suite_red beta flaky)")"
+suite_case kind "$kind_manifest" 2 "$suite_red" >/dev/null
+
+# 7. Two same-named targets would make a manifest line ambiguous, so the run
+# refuses rather than binding the line to whichever ran first.
+suite_dup_out="$(suite_case duplicate "$empty_manifest" 1 "$suite_green" "$suite_green")"
+grep -Fq 'share a name' "$suite_dup_out" || {
+  echo "duplicate target names were not rejected:" >&2
+  cat "$suite_dup_out" >&2
+  exit 1
+}
+
+# The shipped manifest has to satisfy the same parser, and stay free of the
+# duplicates and stray whitespace that would make an entry unmatchable.
+shipped_manifest="$repo_root/scripts/known-failures.txt"
+[[ -f "$shipped_manifest" ]] || {
+  echo "scripts/known-failures.txt is missing" >&2
+  exit 1
+}
+awk -F'\t' '
+  /^#/ || /^$/ { next }
+  NF < 2 || NF > 3 { printf "%s:%d: expected 2 or 3 tab-separated fields\n", FILENAME, FNR; bad = 1; next }
+  NF == 3 && $3 != "env" { printf "%s:%d: unknown third field %s\n", FILENAME, FNR, $3; bad = 1 }
+  $1 ~ /^[[:space:]]|[[:space:]]$/ || $2 ~ /^[[:space:]]|[[:space:]]$/ {
+    printf "%s:%d: padded field\n", FILENAME, FNR; bad = 1
+  }
+  { key = $1 "\t" $2; if (seen[key]++) { printf "%s:%d: duplicate entry\n", FILENAME, FNR; bad = 1 } }
+  END { exit bad ? 1 : 0 }
+' "$shipped_manifest" || exit 1
+
+# The nightly job's budget is the whole point of the rewrite: 30 minutes on the
+# suite job, the new runner instead of the fail-fast `cargo test --workspace`,
+# and the per-binary cap documented where someone tempted to raise the job
+# timeout will read it.
+nightly_workflow="$repo_root/.github/workflows/nightly.yml"
+grep -Fq 'timeout-minutes: 30' "$nightly_workflow" || {
+  echo "nightly.yml no longer carries the 30-minute suite budget" >&2
+  exit 1
+}
+grep -Fq 'scripts/run-suite-binaries.sh' "$nightly_workflow" || {
+  echo "nightly.yml no longer runs the suite runner" >&2
+  exit 1
+}
+if grep -Eq 'cargo\.sh test --workspace' "$nightly_workflow"; then
+  echo "nightly.yml runs fail-fast 'cargo test --workspace' again" >&2
+  exit 1
+fi
+grep -Fq 'ALIGN_SUITE_BINARY_TIMEOUT' "$suite_runner" || {
+  echo "scripts/run-suite-binaries.sh no longer documents the per-binary cap" >&2
+  exit 1
+}
+grep -Fq '30 minutes' "$suite_runner" || {
+  echo "scripts/run-suite-binaries.sh no longer records the 30-minute rule" >&2
+  exit 1
+}
+grep -Eq '^ALIGN_TB_TIMEOUT=0$' "$gate_runner" || {
+  echo "scripts/run-gate-binaries.sh no longer pins its per-binary cap off" >&2
+  exit 1
+}
+# A cache key fixed on Cargo.lock alone is written once and never updated, so
+# the night that first wrote it — very likely a night that did not finish
+# building — would freeze a partial target directory in forever. Every nightly
+# save key must vary per run.
+nightly_cache_keys="$(grep -cE '^ *key: cargo-nightly' "$nightly_workflow")"
+nightly_run_keys="$(grep -cE '^ *key: cargo-nightly.*github\.run_id \}\}$' "$nightly_workflow")"
+[[ "$nightly_cache_keys" -gt 0 && "$nightly_cache_keys" -eq "$nightly_run_keys" ]] || {
+  echo "a nightly Cargo cache key is not unique per run" >&2
+  echo "  key: lines: $nightly_cache_keys, ending in github.run_id: $nightly_run_keys" >&2
+  exit 1
+}
+# ... and the prefix restore-keys are what make those per-run entries usable.
+grep -Eq '^ *cargo-nightly-.*-\$\{\{ hashFiles\('"'"'Cargo.lock'"'"'\) \}\}-$' \
+  "$nightly_workflow" || {
+  echo "nightly.yml lost the Cargo.lock-prefixed restore key" >&2
+  exit 1
+}
+
 for script in \
   scripts/cargo.sh \
   scripts/check-pr-preflight.sh \
@@ -1278,7 +1602,9 @@ for script in \
   scripts/pre-pr.sh \
   scripts/review-bounded.sh \
   scripts/run-gate-binaries.sh \
+  scripts/run-suite-binaries.sh \
   scripts/test-apt-llvm.sh \
+  scripts/test-binaries-lib.sh \
   scripts/test-pr-workflow.sh \
   scripts/test-pr.sh
 do

@@ -3,10 +3,27 @@ name: Nightly full suite
 # The bounded PR gate (scripts/test-pr.sh) deliberately runs a subset; deep
 # driver suites outside it can silently rot on main (three stale-assertion and
 # one empty-MIR failure accumulated unnoticed before 2026-08-10). This job runs
-# the complete workspace test suite once a day so out-of-gate breakage surfaces
+# every workspace test binary once a day so out-of-gate breakage surfaces
 # within a day instead of during unrelated triage.
 #
-# Local equivalent: scripts/cargo.sh test --workspace
+# It used to run `cargo test --workspace`, which stops at the first failing
+# binary. With known failures on main that meant every single night died 4-10
+# minutes in and reported nothing about the other ~220 targets: a detector with
+# zero detection value. scripts/run-suite-binaries.sh builds once, runs the
+# compiled binaries concurrently, and diffs the observed failures against
+# scripts/known-failures.txt in both directions, so a NEW failure is named and
+# a FIXED one has to lose its manifest line.
+#
+# Budget: any test run that needs more than 30 minutes is worthless as a
+# detector, so the suite job carries `timeout-minutes: 30` and exceeding it is
+# itself the red signal — not something to raise. If the run approaches the
+# cap, cut test cost or raise concurrency with ALIGN_GATE_JOBS (the shared
+# knob scripts/test-binaries-lib.sh reads); do not extend the budget. The
+# runner additionally caps each individual binary at 15 minutes so one hang
+# cannot eat the report on all the others.
+#
+# Local equivalent, byte-for-byte the same judgement:
+#   scripts/run-suite-binaries.sh
 
 on:
   schedule:
@@ -30,7 +47,8 @@ jobs:
   full-suite:
     name: Full workspace tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    # Deliberately the owner's hard budget, not a safety margin. See the header.
+    timeout-minutes: 30
     env:
       ALIGN_APT_PACKAGES: >-
         llvm-22-dev clang-22 libclang-rt-22-dev lld-22
@@ -47,6 +65,32 @@ jobs:
         run: |
           rustup toolchain install "$RUST_VERSION" --profile minimal
           rustup default "$RUST_VERSION"
+
+      # The 30-minute budget is a test-execution budget, so the build must be
+      # incremental.
+      #
+      # The save key carries github.run_id, which makes it unique per run. A
+      # key fixed on Cargo.lock would be written exactly once and then be
+      # immutable: GitHub never overwrites an existing cache key. The night
+      # that key was first written is very likely a night the suite did not
+      # finish building, so a partial target directory would be frozen into it
+      # and every later night would restore that same partial state and make no
+      # further progress — a permanently red job whose build never converges.
+      # With a per-run key each night saves whatever it got and the next night
+      # resumes from the newest prefix match, so a cold bootstrap converges
+      # monotonically. The extra entries are left to GitHub's 10 GB LRU
+      # eviction, which drops the oldest of them first.
+      - name: Restore Cargo caches
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-nightly-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            cargo-nightly-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}-
+            cargo-nightly-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-
 
       - name: Restore OpenSSL cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -86,27 +130,124 @@ jobs:
           echo "$OPENSSL_PREFIX/bin" >> "$GITHUB_PATH"
           echo "/usr/lib/llvm-22/bin" >> "$GITHUB_PATH"
 
-      - name: Build workspace
+      - name: Check libpq version
         shell: bash
-        run: |
-          scripts/check-libpq-version.sh
-          scripts/cargo.sh build --workspace --locked
+        run: scripts/check-libpq-version.sh
 
       # The db-required suites run in skip/SQLite-only mode here (no PostgreSQL
       # service); the per-PR required CI job owns that coverage. The one known
       # hang (HANDOFF.md: fuzz_differential::result_question_chain_computes_the_
-      # oracle_value, pre-existing) now carries #[ignore] at its definition, so
-      # `cargo test` already excludes it by default; the former `--skip` here
-      # is redundant and was removed. Re-add `--ignored` once its triage lands
-      # and the attribute comes off.
-      - name: Run workspace test suite
+      # oracle_value, pre-existing) carries #[ignore] at its definition, so it
+      # is excluded by default. Re-add `--ignored` once its triage lands and
+      # the attribute comes off.
+      #
+      # The script performs its own `cargo test --no-run --workspace` build,
+      # which is exactly what makes the local invocation identical to this one.
+      - name: Build and run the full workspace suite
+        shell: bash
+        run: scripts/run-suite-binaries.sh
+
+      # Saved even when the suite is red: a red night must still leave a warm
+      # target directory, or every following night pays a cold build out of the
+      # same 30 minutes. `if: always()` covers a failed step but not the
+      # job-level timeout, which cancels the job outright — so a night that
+      # runs out of budget saves nothing, and only the per-run key above keeps
+      # the following night from inheriting that gap permanently.
+      - name: Save Cargo caches
+        if: always()
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-nightly-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+
+  # x86 release-profile coverage lives here rather than in the per-PR lint job;
+  # the per-PR ARM64/macOS jobs still build and smoke the release compiler.
+  # It is a separate job so its build never spends the suite's 30 minutes, and
+  # so a red suite still tells us whether the release compiler works.
+  release-smoke:
+    name: Release compiler smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      ALIGN_APT_PACKAGES: >-
+        llvm-22-dev clang-22 libclang-rt-22-dev lld-22
+        libpq-dev postgresql-client-17
+        libsqlite3-dev libssl-dev zlib1g-dev libzstd-dev make perl
+      ALIGNC_LINKER: lld
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust
         shell: bash
         run: |
-          scripts/cargo.sh test --workspace --locked -- --nocapture
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
 
-      # x86 release-profile coverage moved here from the per-PR lint job; the
-      # per-PR ARM64/macOS jobs still build and smoke the release compiler.
+      # Per-run save key with prefix restore, for the same reason as the suite
+      # job: a key fixed on Cargo.lock is written once and can never be
+      # updated, so a partial build would be frozen into it forever.
+      - name: Restore Cargo caches
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-nightly-release-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            cargo-nightly-release-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}-
+            cargo-nightly-release-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-
+
+      - name: Restore OpenSSL cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/openssl-${{ env.OPENSSL_VERSION }}
+          key: openssl-${{ env.OPENSSL_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      # Cached apt path here: the uncached apt.llvm.org canary is the suite
+      # job's, and running it twice a night proves nothing extra.
+      - name: Resolve the apt package cache entry
+        id: apt-llvm
+        shell: bash
+        run: scripts/ci-apt-llvm.sh key >> "$GITHUB_OUTPUT"
+
+      - name: Restore the apt package cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ steps.apt-llvm.outputs.path }}
+          key: ${{ steps.apt-llvm.outputs.key }}
+
+      - name: Install LLVM and native libraries
+        shell: bash
+        run: |
+          scripts/ci-pgdg.sh
+          scripts/ci-apt-llvm.sh install
+          OPENSSL_PREFIX="$RUNNER_TEMP/openssl-${OPENSSL_VERSION}"
+          if [ ! -x "$OPENSSL_PREFIX/bin/openssl" ]; then
+            curl -fsSLO \
+              "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+            echo "${OPENSSL_SHA256}  openssl-${OPENSSL_VERSION}.tar.gz" | sha256sum -c -
+            tar -xzf "openssl-${OPENSSL_VERSION}.tar.gz"
+            (
+              cd "openssl-${OPENSSL_VERSION}"
+              ./Configure --prefix="$OPENSSL_PREFIX" --libdir=lib shared no-tests
+              make -j"$(nproc)"
+              make install_sw
+            )
+          fi
+          echo "LLVM_SYS_221_PREFIX=/usr/lib/llvm-22" >> "$GITHUB_ENV"
+          echo "LLVM_CONFIG=/usr/lib/llvm-22/bin/llvm-config" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=$OPENSSL_PREFIX/lib" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$OPENSSL_PREFIX/lib" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$OPENSSL_PREFIX/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "$OPENSSL_PREFIX/bin" >> "$GITHUB_PATH"
+          echo "/usr/lib/llvm-22/bin" >> "$GITHUB_PATH"
+
       - name: Build release compiler
+        shell: bash
         run: scripts/cargo.sh build --locked --release -p align_runtime -p align_driver
 
       - name: Smoke test packaged command
@@ -115,3 +256,13 @@ jobs:
           ./target/release/alignc --version
           ./target/release/alignc build examples/hello.align
           ./hello
+
+      - name: Save Cargo caches
+        if: always()
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-nightly-release-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
