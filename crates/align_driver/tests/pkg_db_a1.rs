@@ -1612,26 +1612,6 @@ import pkg.db.postgres
 import app.batch_query
 import pkg.db.testkit.pg
 
-fn cardinality_two(result: Result<app.batch_query.PgRow, pkg.db.Error>) -> bool {
-  return match result {
-    Err(error) => match error {
-      Cardinality(value) => value.observed_at_least == 2
-      _ => false
-    }
-    Ok(_) => false
-  }
-}
-
-fn serialization(result: Result<app.batch_query.PgRow, pkg.db.Error>) -> bool {
-  return match result {
-    Err(error) => match error {
-      Serialization(_) => true
-      _ => false
-    }
-    Ok(_) => false
-  }
-}
-
 fn reuse_conn(borrow connection: pkg.db.conn) -> bool {
   mut stream := pkg.db.rows(
     pkg.db.exec_conn(connection), app.batch_query.postgres_rows(),
@@ -1661,7 +1641,13 @@ fn tx_portal_one(borrow transaction: pkg.db.tx) -> bool {
       app.batch_query.PgParams { first_user_id: 1, last_user_id: 3 }, values, [],
       [pkg.db.postgres.ExecuteOption.Delivery(pkg.db.postgres.Delivery.PortalBatch(2))],
     )
-    return cardinality_two(result)
+    return match result {
+      Err(error) => match error {
+        Cardinality(value) => value.observed_at_least == 2
+        _ => false
+      }
+      Ok(_) => false
+    }
   }
 }
 
@@ -1692,7 +1678,14 @@ fn main() -> i32 {
       app.batch_query.PgParams { first_user_id: 1, last_user_id: 3 }, values, [],
       [pkg.db.postgres.ExecuteOption.Delivery(pkg.db.postgres.Delivery.PortalBatch(2))],
     )
-    if !cardinality_two(many) { return 4 }
+    many_ok := match many {
+      Err(error) => match error {
+        Cardinality(value) => value.observed_at_least == 2
+        _ => false
+      }
+      Ok(_) => false
+    }
+    if !many_ok { return 4 }
   }
   arena values {
     late := pkg.db.postgres.one_native(
@@ -1700,7 +1693,11 @@ fn main() -> i32 {
       app.batch_query.PgParams { first_user_id: 1, last_user_id: 3 }, values, [],
       [pkg.db.postgres.ExecuteOption.Delivery(pkg.db.postgres.Delivery.SingleRow)],
     )
-    if !serialization(late) { return 5 }
+    late_ok := match late {
+      Err(error) => match error { Serialization(_) => true _ => false }
+      Ok(_) => false
+    }
+    if !late_ok { return 5 }
   }
   if !reuse_conn(connection) { return 6 }
   transaction := pkg.db.begin(connection, []) else { return 7 }
@@ -3074,7 +3071,7 @@ pkg-db-a1-postgres-delivery-validation 1e37b4a4dc266d2f
 pkg-db-a1-postgres-prepared-streamed-modes ca82f5ab6b28e07d
 pkg-db-a1-postgres-streamed-failures 6b0aeba03b414028
 pkg-db-a1-postgres-streamed-modes 5d6a50af791450c7
-pkg-db-a1-postgres-streamed-one 483d0e25b14163db
+pkg-db-a1-postgres-streamed-one 485206604faf2733
 pkg-db-a1-postgres-streamed-timeout-drop f8c274359241b762
 pkg-db-a1-postgres-streamed-unsafe-statuses d174d9b087289404
 pkg-db-a1-postgres-value-matrix 900160246701aeff

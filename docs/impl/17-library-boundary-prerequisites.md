@@ -220,7 +220,10 @@ arena-owned data with a clear bit while `Err` returns individually owned strings
 without recomputing ownership from the joined region. `IFnSig`, `FnTy`, interface hashes, and ABI
 fingerprints record that the extra bit exists, never its runtime value. Copy returns use
 `ReturnCleanupAbi::None`. `ReturnRegionSummary` remains lifetime provenance and is not a substitute
-for this dynamic ownership result.
+for this dynamic ownership result. A later by-value call does not forward that bit as a parameter
+ABI value: its callee assumes and drops free-standing storage. Escape analysis must therefore
+reject a call result that may select an explicit caller region before moving it into an ordinary
+by-value parameter, including after tagged success projection; a shared borrow remains legal.
 
 The return-borrow summary is not limited to parameters spelled `borrow`. A by-value Copy view such
 as `str`, `slice<T>`, `resource_ref<R>`, or a recursively view-bearing `db.exec` may back the

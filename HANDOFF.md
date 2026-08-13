@@ -54,6 +54,12 @@ connections retain one physical origin across conn/tx transfer and every existin
 execution path; Drop returns only after exact native-idle or rollback-and-idle
 proof, otherwise it closes and exposes a permanent capacity gap. Pool Drop keeps
 bookkeeping alive for outstanding owners without blocking or invalidating them.
+The first independently useful A2/D14 rail now ships driver-explicit dynamic SQL:
+the common `value`/`row` mapping, `dynamic_execute`, region-backed streaming
+`dynamic_rows`/`dynamic_next`, exact SQLite and PostgreSQL validation order, binary
+libpq transport, deadline/cancel recovery, package-owned session-invariant proofs,
+and failure-safe native/resource cleanup. The remaining D14 work is the proved
+callback surface and the final cross-rail audit.
 The exact contracts and implementation matrices are in
 `docs/impl/pkg-design/db.md` §23. PostgreSQL COPY remains deferred by that
 document's §25 until a concrete measured consumer selects its public operation.
@@ -131,6 +137,8 @@ A1 PostgreSQL prepared parity    complete / streamed delivery + stmt v3 resolver
 A1 PostgreSQL formats            complete / binary parameters/results + protocol budgets / D13
 A1 explicit fixed pool           complete / SQLite + PostgreSQL non-waiting ownership / D13
 deferred: A1 PostgreSQL COPY     requires a concrete measured consumer / D13
+A2 dynamic SQL rail              complete / dual-driver value + execute + rows / D14
+pending: A2 proved callbacks     callback surface + final cross-rail audit / D14
 ```
 
 The exact cell contracts and owner matrices remain in

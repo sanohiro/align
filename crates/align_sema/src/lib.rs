@@ -13030,8 +13030,24 @@ impl<'a> EscapeCheck<'a> {
                     work.push((fallback, depth));
                     work.push((opt, depth));
                 }
-                // A function result cannot borrow arena-owned storage across its own return boundary.
-                ExprKind::Call { .. } | ExprKind::CallFnValue { .. } => {}
+                // A callee cannot return storage from one of its own lexical arenas, but it may
+                // materialize a Move result into the caller's explicit `region` parameter. That
+                // path returns a clear cleanup bit and is not transferable into a by-value callee.
+                // Function-value parameters are scalar-only and region capabilities cannot be
+                // captured, so an indirect call has no corresponding region-owned return path.
+                ExprKind::Call { func, args, .. }
+                    if self.named_call_may_return_region_owned(func, args) =>
+                {
+                    return true;
+                }
+                ExprKind::RawCall { args, return_region, .. }
+                    if Self::return_region_selects_explicit_region(return_region, args) =>
+                {
+                    return true;
+                }
+                ExprKind::Call { .. }
+                | ExprKind::CallFnValue { .. }
+                | ExprKind::RawCall { .. } => {}
                 _ if !self.drop_is_individual(expression, depth) => {
                     return true;
                 }
@@ -13039,6 +13055,29 @@ impl<'a> EscapeCheck<'a> {
             }
         }
         false
+    }
+
+    /// Whether a return-region summary selects an actual explicit region capability. Return
+    /// lifetime summaries also contain ordinary borrowed-view roots, so the root set alone cannot
+    /// classify allocation provenance: only a selected `region` argument can own returned storage.
+    fn return_region_selects_explicit_region(
+        summary: &hir::ReturnRegionSummary,
+        args: &[Expr],
+    ) -> bool {
+        matches!(
+            summary,
+            hir::ReturnRegionSummary::Roots { params, .. }
+                if params.iter().any(|&index| {
+                    args.get(index as usize)
+                        .is_some_and(|argument| argument.ty == Ty::ArenaHandle)
+                })
+        )
+    }
+
+    fn named_call_may_return_region_owned(&self, func: &str, args: &[Expr]) -> bool {
+        self.named_return_region.get(func).is_some_and(|summary| {
+            Self::return_region_selects_explicit_region(summary, args)
+        })
     }
 
     /// Check the implicit Err return edge of `?` for a borrowed payload. This is independent of
@@ -13502,15 +13541,24 @@ impl<'a> EscapeCheck<'a> {
                                     !self.region_of(expression, depth).is_region_owned()
                                 }),
                         ),
-                        // A callee cannot return arena-owned storage across its function boundary,
-                        // even when `region_of(Call)` is shortened by an arena-borrowing argument.
+                        // A callee cannot return storage from its own lexical arena, but a named or
+                        // compiler-private call may return storage allocated in the caller's
+                        // explicit region. Ordinary borrowed-view roots do not change allocation
+                        // mode. Function values have scalar-only parameters and cannot capture a
+                        // region capability, so their Move results remain free-standing.
                         ExprKind::ArrayBuilderNew { region, .. } => {
                             values.push(region.is_none());
                         }
                         ExprKind::ArrayBuilderBuild(builder) => {
                             work.push(Work::Eval(builder, depth));
                         }
-                        ExprKind::Call { .. } | ExprKind::CallFnValue { .. } => values.push(true),
+                        ExprKind::Call { func, args, .. } => values.push(
+                            !self.named_call_may_return_region_owned(func, args),
+                        ),
+                        ExprKind::CallFnValue { .. } => values.push(true),
+                        ExprKind::RawCall { args, return_region, .. } => values.push(
+                            !Self::return_region_selects_explicit_region(return_region, args),
+                        ),
                         ExprKind::OptionSome(inner)
                         | ExprKind::ResultOk(inner)
                         | ExprKind::ResultErr(inner)
@@ -13710,7 +13758,12 @@ impl<'a> EscapeCheck<'a> {
                         ExprKind::ArrayBuilderBuild(builder) => {
                             work.push(Work::Eval(builder, depth));
                         }
-                        ExprKind::Call { .. } | ExprKind::CallFnValue { .. } => values.push(true),
+                        // A call with a dynamic cleanup ABI may select a free-standing path even
+                        // when another path materializes into an explicit caller region. Keep the
+                        // may half set; `drop_is_individual` above supplies the rejecting must half.
+                        ExprKind::Call { .. }
+                        | ExprKind::CallFnValue { .. }
+                        | ExprKind::RawCall { .. } => values.push(true),
                         ExprKind::OptionSome(inner)
                         | ExprKind::ResultOk(inner)
                         | ExprKind::ResultErr(inner)
@@ -21164,6 +21217,14 @@ impl<'a> MoveCheck<'a> {
         loop {
             match &expression.kind {
                 ExprKind::Local(id) if self.is_move(*id) => {
+                    if self.borrowed_param_mode(*id).is_some() {
+                        let name = &self.f.locals[*id as usize].name;
+                        self.diags.error(
+                            format!("cannot move borrowed parameter '{name}'"),
+                            expression.span,
+                        );
+                        return;
+                    }
                     if !direct {
                         let name = &self.f.locals[*id as usize].name;
                         self.diags.error(
@@ -21204,6 +21265,14 @@ impl<'a> MoveCheck<'a> {
                                 )
                         )
                     {
+                        if self.borrowed_param_mode(*root).is_some() {
+                            let name = &self.f.locals[*root as usize].name;
+                            self.diags.error(
+                                format!("cannot move a field out of borrowed parameter '{name}'"),
+                                expression.span,
+                            );
+                            return;
+                        }
                         self.reject_live_resource_dependents(*root, moved, expression.span);
                         self.invalidate_owner(*root);
                         moved.insert(MovedKey::Field(*root, field));
@@ -49132,6 +49201,37 @@ fn exit_branch(flag: bool) -> i64 {
     }
 
     #[test]
+    fn match_cannot_extract_a_move_payload_from_a_borrowed_parameter() {
+        let cases = [
+            (
+                "fn inspect(borrow value: Option<string>) -> i64 = match value {\n  Some(text) => text.len()\n  None => 0\n}\n",
+                "cannot move borrowed parameter 'value'",
+            ),
+            (
+                "fn inspect(borrow value: Result<string, string>) -> i64 = match value {\n  Ok(text) => text.len()\n  Err(text) => text.len()\n}\n",
+                "cannot move borrowed parameter 'value'",
+            ),
+            (
+                "Box { value: Option<string> }\nfn inspect(borrow wrapper: Box) -> i64 = match wrapper.value {\n  Some(text) => text.len()\n  None => 0\n}\n",
+                "cannot move a field out of borrowed parameter 'wrapper'",
+            ),
+        ];
+        for (source, expected) in cases {
+            let (_program, diagnostics) = check(&format!("{source}fn main() -> i32 = 0\n"));
+            assert!(
+                diagnostics.iter().any(|diagnostic| diagnostic
+                    .message
+                    .contains(expected)),
+                "a Move payload binding must not copy storage out of a shared-borrowed sum: {:?}",
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.as_str())
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    #[test]
     fn string_borrows_as_str_arg_without_moving() {
         // MMv2 slice 7b: passing an owned `string` to a `str` parameter *borrows* it (zero-cost,
         // same `{ptr,len}` layout). The borrow does not consume the string, so a later use is
@@ -49521,6 +49621,61 @@ fn exit_branch(flag: bool) -> i64 {
         assert!(
             !d.has_errors(),
             "a free-standing call result remains transferable when its borrow region is arena-shortened"
+        );
+    }
+
+    #[test]
+    fn explicit_region_call_results_cannot_cross_a_by_value_call() {
+        let prefix = "Row { values: array<str> }\nE { Bad }\nfn next(out: region) -> Result<Option<Row>, E> {\n  mut values: array_builder<str> := array_builder(out)\n  values.push(\"seven\".clone_in(out))\n  return Ok(Some(Row { values: values.build() }))\n}\n";
+        let by_value = format!(
+            "{prefix}fn take(row: Row) -> i64 = row.values[0].len()\nfn main() -> i32 {{\n  arena out {{\n    selected := next(out) else {{ return 1 }}\n    row := selected else {{ return 2 }}\n    return take(row) as i32\n  }}\n}}\n"
+        );
+        let (program, diagnostics) = check(&by_value);
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("cannot be moved into a function call")),
+            "a tagged success projected from an explicit-region call must retain arena ownership: next={:?}, diagnostics={:?}",
+            program.fns.iter().find(|function| function.name == "next").map(|function| &function.return_region),
+            diagnostics.iter().map(|diagnostic| diagnostic.message.as_str()).collect::<Vec<_>>(),
+        );
+
+        let matched = format!(
+            "{prefix}fn take(row: Row) -> i64 = row.values[0].len()\nfn main() -> i32 {{\n  arena out {{\n    row := match next(out) {{\n      Err(_) => {{ return 1 }}\n      Ok(selected) => match selected {{\n        None => {{ return 2 }}\n        Some(value) => value\n      }}\n    }}\n    return take(row) as i32\n  }}\n}}\n"
+        );
+        let (_program, diagnostics) = check(&matched);
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("cannot be moved into a function call")),
+            "match projection must retain the selected explicit-region ownership bit"
+        );
+
+        let propagated = format!(
+            "{prefix}fn take(row: Row) -> i64 = row.values[0].len()\nfn use(out: region) -> Result<i64, E> {{\n  selected := next(out)?\n  row := selected else {{ return Ok(0) }}\n  return Ok(take(row))\n}}\nfn main() -> i32 {{\n  arena out {{\n    value := use(out) else {{ return 1 }}\n    return value as i32\n  }}\n}}\n"
+        );
+        let (_program, diagnostics) = check(&propagated);
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("cannot be moved into a function call")),
+            "`?` projection must retain the selected explicit-region ownership bit"
+        );
+
+        let borrowed = format!(
+            "{prefix}fn inspect(borrow row: Row) -> i64 = row.values[0].len()\nfn main() -> i32 {{\n  arena out {{\n    selected := next(out) else {{ return 1 }}\n    row := selected else {{ return 2 }}\n    return inspect(row) as i32\n  }}\n}}\n"
+        );
+        let (_program, diagnostics) = check(&borrowed);
+        assert!(
+            !diagnostics.has_errors(),
+            "a shared borrow must inspect the same explicit-region result without transferring ownership"
+        );
+
+        let free_standing = "Row { values: array<str> }\nE { Bad }\nfn next() -> Result<Option<Row>, E> = Ok(Some(Row { values: [\"seven\"].to_array() }))\nfn take(row: Row) -> i64 = row.values[0].len()\nfn main() -> i32 {\n  selected := next() else { return 1 }\n  row := selected else { return 2 }\n  return take(row) as i32\n}\n";
+        let (_program, diagnostics) = check(free_standing);
+        assert!(
+            !diagnostics.has_errors(),
+            "a free-standing Move call result must retain legal by-value transfer"
         );
     }
 

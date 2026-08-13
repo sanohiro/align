@@ -26,6 +26,7 @@ extern "C" link("pq") {
   fn PQisBusy(connection: raw) -> i32
   fn PQgetResult(connection: raw) -> raw
   fn PQtransactionStatus(connection: raw) -> i32
+  fn PQclientEncoding(connection: raw) -> i32
   fn PQcancelCreate(connection: raw) -> raw
   fn PQcancelStart(cancel: raw) -> i32
   fn PQcancelPoll(cancel: raw) -> i32
@@ -39,6 +40,7 @@ extern "C" link("pq") {
 PQTRANS_IDLE: i32 := 0
 PQTRANS_INTRANS: i32 := 2
 PQTRANS_INERROR: i32 := 3
+PG_UTF8: i32 := 6
 PGRES_POLLING_FAILED: i32 := 0
 PGRES_POLLING_READING: i32 := 1
 PGRES_POLLING_WRITING: i32 := 2
@@ -1699,5 +1701,281 @@ pub fn drop_catalog_cursor(cursor: raw) {
     if cursor.is_null() { return }
     ignored := close_catalog_cursor(cursor)
     raw.free(cursor)
+  }
+}
+
+// D14's dynamic row stream owns only one native statement/result plus the existing connection
+// lease.  The compact record intentionally contains no callback, descriptor, scratch, or public
+// type metadata.
+//   0: u32 version (= 1)
+//   4: u8  driver (1 SQLite, 2 PostgreSQL)
+//   5: u8  terminal (0 live, 1 exhausted, 2 failed)
+//   6: u16 reserved (= 0)
+//   8: raw sqlite3_stmt / PGresult
+//  16: raw connection state
+//  24: i64 next row ordinal
+//  32: i64 row count (-1 for live SQLite)
+//  40: i64 column count
+pub fn new_dynamic_rows_state(
+  driver: u8,
+  native: raw,
+  state: raw,
+  next: i64,
+  row_count: i64,
+  column_count: i64,
+) -> raw {
+  unsafe {
+    wrapper := raw.alloc(48)
+    raw.store(wrapper, 0, 1 as u32)
+    raw.store(wrapper, 4, driver)
+    raw.store(wrapper, 5, 0 as u8)
+    raw.store(wrapper, 6, 0 as u16)
+    raw.store(wrapper, 8, native)
+    raw.store(wrapper, 16, state)
+    raw.store(wrapper, 24, next)
+    raw.store(wrapper, 32, row_count)
+    raw.store(wrapper, 40, column_count)
+    return wrapper
+  }
+}
+
+pub fn new_dynamic_rows_terminal(driver: u8, terminal: u8) -> raw {
+  unsafe {
+    wrapper := raw.alloc(48)
+    raw.store(wrapper, 0, 1 as u32)
+    raw.store(wrapper, 4, driver)
+    raw.store(wrapper, 5, terminal)
+    raw.store(wrapper, 6, 0 as u16)
+    raw.store(wrapper, 8, raw.null())
+    raw.store(wrapper, 16, raw.null())
+    raw.store(wrapper, 24, 0 as i64)
+    raw.store(wrapper, 32, 0 as i64)
+    raw.store(wrapper, 40, 0 as i64)
+    return wrapper
+  }
+}
+
+// Validate every scalar and pointer-null product before a caller follows either embedded pointer.
+// Non-null pointer provenance remains the privileged producer's obligation, matching conn/pool.
+pub fn dynamic_rows_header(wrapper: raw) -> u8 {
+  unsafe {
+    if wrapper.is_null() { return 255 }
+    version: u32 := raw.load(wrapper, 0)
+    driver: u8 := raw.load(wrapper, 4)
+    terminal: u8 := raw.load(wrapper, 5)
+    reserved: u16 := raw.load(wrapper, 6)
+    native: raw := raw.load(wrapper, 8)
+    state: raw := raw.load(wrapper, 16)
+    next: i64 := raw.load(wrapper, 24)
+    row_count: i64 := raw.load(wrapper, 32)
+    column_count: i64 := raw.load(wrapper, 40)
+    if version != 1 || (driver != 1 && driver != 2) || terminal > 2 || reserved != 0 {
+      return 255
+    }
+    if terminal != 0 {
+      if !native.is_null() || !state.is_null() || next != 0 || row_count != 0
+        || column_count != 0 {
+        return 255
+      }
+      return terminal
+    }
+    if native.is_null() || state.is_null() || next < 0 { return 255 }
+    if driver == 1 {
+      return if row_count == -1 && column_count > 0 { 0 as u8 } else { 255 as u8 }
+    }
+    if row_count < 0 || next > row_count || column_count < 0 { return 255 }
+    return 0
+  }
+}
+
+pub fn dynamic_rows_driver(wrapper: raw) -> u8 {
+  unsafe { return if dynamic_rows_header(wrapper) == 255 { 0 } else { raw.load(wrapper, 4) } }
+}
+
+pub fn dynamic_rows_native(wrapper: raw) -> raw {
+  unsafe {
+    if dynamic_rows_header(wrapper) != 0 { return raw.null() }
+    return raw.load(wrapper, 8)
+  }
+}
+
+pub fn dynamic_rows_connection_state(wrapper: raw) -> raw {
+  unsafe {
+    if dynamic_rows_header(wrapper) != 0 { return raw.null() }
+    return raw.load(wrapper, 16)
+  }
+}
+
+pub fn dynamic_rows_next_ordinal(wrapper: raw) -> i64 {
+  unsafe { return if dynamic_rows_header(wrapper) == 0 { raw.load(wrapper, 24) } else { -1 } }
+}
+
+pub fn dynamic_rows_row_count(wrapper: raw) -> i64 {
+  unsafe { return if dynamic_rows_header(wrapper) == 0 { raw.load(wrapper, 32) } else { -2 } }
+}
+
+pub fn dynamic_rows_column_count(wrapper: raw) -> i64 {
+  unsafe { return if dynamic_rows_header(wrapper) == 0 { raw.load(wrapper, 40) } else { -1 } }
+}
+
+pub fn advance_dynamic_rows(wrapper: raw) -> bool {
+  unsafe {
+    if dynamic_rows_header(wrapper) != 0 { return false }
+    next: i64 := raw.load(wrapper, 24)
+    driver: u8 := raw.load(wrapper, 4)
+    if next == 9223372036854775807 { return false }
+    advanced := next + 1
+    if driver == 2 {
+      row_count: i64 := raw.load(wrapper, 32)
+      if advanced > row_count { return false }
+    }
+    raw.store(wrapper, 24, advanced)
+    return true
+  }
+}
+
+fn sqlite_dynamic_synchronized(state: raw, database: raw) -> bool {
+  unsafe {
+    transaction: u8 := raw.load(state, 21)
+    autocommit := sqlite3_get_autocommit(database) != 0
+    return autocommit == (transaction == 0)
+  }
+}
+
+pub fn postgres_dynamic_synchronized(state: raw, clean_completion: bool) -> bool {
+  unsafe {
+    if !conn_live_for_driver(state, 2) { return false }
+    lease: u8 := raw.load(state, 20)
+    if lease != 1 { return false }
+    connection: raw := raw.load(state, 8)
+    if PQclientEncoding(connection) != PG_UTF8 { return false }
+    status := PQtransactionStatus(connection)
+    transaction: u8 := raw.load(state, 21)
+    if transaction == 0 { return status == PQTRANS_IDLE }
+    if clean_completion { return status == PQTRANS_INTRANS }
+    return status == PQTRANS_INTRANS || status == PQTRANS_INERROR
+  }
+}
+
+fn canonicalize_dynamic_rows(wrapper: raw, terminal: u8) {
+  unsafe {
+    raw.store(wrapper, 5, terminal)
+    raw.store(wrapper, 8, raw.null())
+    raw.store(wrapper, 16, raw.null())
+    raw.store(wrapper, 24, 0 as i64)
+    raw.store(wrapper, 32, 0 as i64)
+    raw.store(wrapper, 40, 0 as i64)
+  }
+}
+
+// Finish an unpublished command/result or the native owner held by a live dynamic stream.  A
+// successful return releases the one-active-execution lease; every failed proof closes/poisons.
+pub fn finish_dynamic_native(
+  driver: u8,
+  native: raw,
+  state: raw,
+  clean_completion: bool,
+) -> i32 {
+  unsafe {
+    if (driver != 1 && driver != 2) || !conn_live_for_driver(state, driver) {
+      return 1
+    }
+    lease: u8 := raw.load(state, 20)
+    if lease != 1 { return 1 }
+    connection: raw := raw.load(state, 8)
+    mut cleanup_ok := true
+    if driver == 1 {
+      if !native.is_null() && sqlite3_finalize(native) != 0 { cleanup_ok = false }
+      busy_ms: i32 := raw.load(state, 16)
+      if sqlite3_busy_timeout(connection, busy_ms) != 0 { cleanup_ok = false }
+      if !sqlite_dynamic_synchronized(state, connection) { cleanup_ok = false }
+    } else {
+      if !native.is_null() { PQclear(native) }
+      if !postgres_dynamic_synchronized(state, clean_completion) { cleanup_ok = false }
+    }
+    if cleanup_ok {
+      raw.store(state, 20, 0 as u8)
+      return 0
+    }
+    poison_conn_state(state)
+    return 1
+  }
+}
+
+// COPY, pipeline, and unknown libpq statuses use this stronger edge: clear once, close now, and
+// deliberately perform no encoding, transaction, cancellation, or blocking-state probe later.
+pub fn fail_close_dynamic_postgres(result: raw, state: raw) {
+  unsafe {
+    if !result.is_null() { PQclear(result) }
+    poison_conn_state(state)
+  }
+}
+
+// The caller has just classified an ordinary status and proved UTF-8 plus the exact native
+// transaction state. Result metadata/error copying cannot mutate connection-global state, so this
+// close edge clears and releases without issuing a redundant second invariant probe.
+pub fn finish_dynamic_postgres_proved(result: raw, state: raw) -> i32 {
+  unsafe {
+    if !conn_live_for_driver(state, 2) { return 1 }
+    lease: u8 := raw.load(state, 20)
+    if lease != 1 { return 1 }
+    if !result.is_null() { PQclear(result) }
+    raw.store(state, 20, 0 as u8)
+    return 0
+  }
+}
+
+// Reapply SQLite's package-owned busy timeout after one prepare/advance boundary while retaining
+// the live statement and lease. On failure, finalize and poison before canonicalizing the wrapper.
+pub fn checkpoint_dynamic_sqlite(wrapper: raw) -> i32 {
+  unsafe {
+    driver: u8 := if wrapper.is_null() { 0 } else { raw.load(wrapper, 4) }
+    if dynamic_rows_header(wrapper) != 0 || driver != 1 { return 1 }
+    statement: raw := raw.load(wrapper, 8)
+    state: raw := raw.load(wrapper, 16)
+    lease: u8 := if state.is_null() { 0 } else { raw.load(state, 20) }
+    if !conn_live_for_driver(state, 1) || lease != 1 {
+      return 1
+    }
+    database: raw := raw.load(state, 8)
+    busy_ms: i32 := raw.load(state, 16)
+    if sqlite3_busy_timeout(database, busy_ms) == 0
+      && sqlite_dynamic_synchronized(state, database) {
+      return 0
+    }
+    ignored := sqlite3_finalize(statement)
+    poison_conn_state(state)
+    canonicalize_dynamic_rows(wrapper, 2)
+    return 1
+  }
+}
+
+pub fn finish_dynamic_rows(
+  wrapper: raw,
+  terminal: u8,
+  clean_completion: bool,
+) -> i32 {
+  unsafe {
+    if terminal != 1 && terminal != 2 { return 1 }
+    header := dynamic_rows_header(wrapper)
+    if header == 1 || header == 2 { return 0 }
+    if header != 0 { return 1 }
+    driver: u8 := raw.load(wrapper, 4)
+    native: raw := raw.load(wrapper, 8)
+    state: raw := raw.load(wrapper, 16)
+    status := finish_dynamic_native(driver, native, state, clean_completion)
+    canonicalize_dynamic_rows(wrapper, if status == 0 { terminal } else { 2 as u8 })
+    return status
+  }
+}
+
+pub fn drop_dynamic_rows(wrapper: raw) {
+  unsafe {
+    if wrapper.is_null() { return }
+    header := dynamic_rows_header(wrapper)
+    if header == 0 { ignored := finish_dynamic_rows(wrapper, 2, true) }
+    // A detectably malformed image never follows either embedded pointer. Its parent's retained
+    // lease therefore stays fail-closed until conn/tx teardown.
+    raw.free(wrapper)
   }
 }

@@ -18,6 +18,26 @@ extern "C" link("sqlite3") {
 }
 
 extern "C" link("pq") {
+  fn PQexecParams(
+    connection: raw,
+    command: raw,
+    parameter_count: i32,
+    parameter_types: raw,
+    parameter_values: raw,
+    parameter_lengths: raw,
+    parameter_formats: raw,
+    result_format: i32,
+  ) -> raw
+  fn PQsendQueryParams(
+    connection: raw,
+    command: raw,
+    parameter_count: i32,
+    parameter_types: raw,
+    parameter_values: raw,
+    parameter_lengths: raw,
+    parameter_formats: raw,
+    result_format: i32,
+  ) -> i32
   fn PQnfields(result: raw) -> i32
   fn PQfname(result: raw, column: i32) -> raw
   fn PQftype(result: raw, column: i32) -> u32
@@ -2106,4 +2126,261 @@ pub fn read_view_length_v2(context: raw, ordinal: u32) -> i64 {
     length: i64 := raw.load(entry, 8)
     return length
   }
+}
+
+// D14 dynamic SQL deliberately does not reuse the compiler-generated descriptor callbacks.  It
+// does, however, use the same package-owned binary encoder record so the PostgreSQL wire bytes,
+// allocation lifetime, and protocol limits cannot drift from the static A1 path.
+pub fn new_dynamic_postgres_context(connection: raw, parameter_count: u32) -> raw {
+  unsafe {
+    if connection.is_null() || parameter_count > 65535 { return raw.null() }
+    context := raw.alloc(112)
+    raw.store(context, 0, CONTEXT_VERSION)
+    raw.store(context, 4, DRIVER_POSTGRES)
+    raw.store(context, 5, 0 as u8)
+    raw.store(context, 6, 0 as u16)
+    raw.store(context, 8, connection)
+    raw.store(context, 16, 0 as u32)
+    raw.store(context, 20, 0 as u32)
+    raw.store(context, 24, raw.null())
+    raw.store(context, 32, 0 as u32)
+    raw.store(context, 36, 0 as u32)
+    raw.store(context, 40, raw.null())
+    raw.store(context, 48, raw.null())
+    raw.store(context, 56, raw.null())
+    raw.store(context, 64, raw.null())
+    raw.store(context, 72, 0 as u32)
+    raw.store(context, 76, 0 as u32)
+    raw.store(context, 80, 0 as u8)
+    raw.store(context, 81, 0 as u8)
+    raw.store(context, 82, 0 as u16)
+    raw.store(context, 84, 0 as u32)
+    raw.store(context, 88, raw.null())
+    raw.store(context, 96, -1 as i64)
+    raw.store(context, 104, 0 as u8)
+    mut tail: i64 := 105
+    loop {
+      if tail >= 112 { break }
+      raw.store(context, tail, 0 as u8)
+      tail = tail + 1
+    }
+    if !install_postgres_formats_v1(context, parameter_count, 1) {
+      raw.free(context)
+      return raw.null()
+    }
+    return context
+  }
+}
+
+pub fn free_dynamic_postgres_context(context: raw) {
+  unsafe {
+    if context.is_null() { return }
+    if !context_base_valid(context, DRIVER_POSTGRES) {
+      raw.free(context)
+      return
+    }
+    release_row_cache_v2(context)
+    values: raw := raw.load(context, 40)
+    types: raw := raw.load(context, 48)
+    lengths: raw := raw.load(context, 56)
+    formats: raw := raw.load(context, 64)
+    count: u32 := raw.load(context, 72)
+    if !values.is_null() {
+      mut i: u32 := 0
+      loop {
+        if i >= count { break }
+        value: raw := raw.load(values, (i as i64) * 8)
+        if !value.is_null() { raw.free(value) }
+        i = i + 1
+      }
+      raw.free(values)
+    }
+    if !types.is_null() { raw.free(types) }
+    if !lengths.is_null() { raw.free(lengths) }
+    if !formats.is_null() { raw.free(formats) }
+    raw.free(context)
+  }
+}
+
+fn dynamic_postgres_context_ready(context: raw) -> bool {
+  unsafe {
+    if !context_base_valid(context, DRIVER_POSTGRES) { return false }
+    failure: u8 := raw.load(context, 5)
+    measurement: u8 := raw.load(context, 104)
+    result_format: u8 := raw.load(context, 80)
+    return failure == FAILURE_NONE && measurement == 2 && result_format == 1
+  }
+}
+
+pub fn dynamic_postgres_exec_params(connection: raw, sql: raw, context: raw) -> raw {
+  unsafe {
+    if connection.is_null() || sql.is_null() || !dynamic_postgres_context_ready(context) {
+      return raw.null()
+    }
+    count: u32 := raw.load(context, 72)
+    return PQexecParams(
+      connection,
+      sql,
+      count as i32,
+      raw.load(context, 48),
+      raw.load(context, 40),
+      raw.load(context, 56),
+      raw.load(context, 64),
+      1,
+    )
+  }
+}
+
+pub fn dynamic_postgres_send_params(connection: raw, sql: raw, context: raw) -> i32 {
+  unsafe {
+    if connection.is_null() || sql.is_null() || !dynamic_postgres_context_ready(context) {
+      return 0
+    }
+    count: u32 := raw.load(context, 72)
+    return PQsendQueryParams(
+      connection,
+      sql,
+      count as i32,
+      raw.load(context, 48),
+      raw.load(context, 40),
+      raw.load(context, 56),
+      raw.load(context, 64),
+      1,
+    )
+  }
+}
+
+fn sqlite_transient_destructor() -> raw {
+  unsafe {
+    slot := raw.alloc(8)
+    raw.store(slot, 0, -1 as i64)
+    destructor: raw := raw.load(slot, 0)
+    raw.free(slot)
+    return destructor
+  }
+}
+
+pub fn dynamic_sqlite_bind_null(statement: raw, ordinal: i32) -> i32 {
+  unsafe { return sqlite3_bind_null(statement, ordinal) }
+}
+
+pub fn dynamic_sqlite_bind_bool(statement: raw, ordinal: i32, value: bool) -> i32 {
+  unsafe { return sqlite3_bind_int64(statement, ordinal, if value { 1 } else { 0 }) }
+}
+
+pub fn dynamic_sqlite_bind_i64(statement: raw, ordinal: i32, value: i64) -> i32 {
+  unsafe { return sqlite3_bind_int64(statement, ordinal, value) }
+}
+
+pub fn dynamic_sqlite_bind_f64(statement: raw, ordinal: i32, value: f64) -> i32 {
+  unsafe { return sqlite3_bind_double(statement, ordinal, value) }
+}
+
+pub fn dynamic_sqlite_bind_text(statement: raw, ordinal: i32, value: str) -> i32 {
+  unsafe {
+    if statement.is_null() || ordinal <= 0 || value.len() > 2147483647 { return 1 }
+    copied := copy_str_bytes(value)
+    status := sqlite3_bind_text(
+      statement, ordinal, copied, value.len() as i32, sqlite_transient_destructor(),
+    )
+    raw.free(copied)
+    return status
+  }
+}
+
+pub fn dynamic_sqlite_bind_bytes(statement: raw, ordinal: i32, value: slice<u8>) -> i32 {
+  unsafe {
+    if statement.is_null() || ordinal <= 0 || value.len() > 2147483647 { return 1 }
+    copied := copy_slice_bytes(value)
+    status := sqlite3_bind_blob(
+      statement, ordinal, copied, value.len() as i32, sqlite_transient_destructor(),
+    )
+    raw.free(copied)
+    return status
+  }
+}
+
+pub fn dynamic_sqlite_tail_empty(pointer: raw) -> bool {
+  unsafe {
+    if pointer.is_null() { return false }
+    mut i: i64 := 0
+    loop {
+      byte: u8 := raw.load(pointer, i)
+      if byte == 0 { return true }
+      if byte == 9 || byte == 10 || byte == 11 || byte == 12 || byte == 13 || byte == 32 {
+        i = i + 1
+      } else {
+        if byte == 45 {
+          next: u8 := raw.load(pointer, i + 1)
+          if next != 45 { return false }
+          i = i + 2
+          loop {
+            comment: u8 := raw.load(pointer, i)
+            if comment == 0 { return true }
+            i = i + 1
+            if comment == 10 || comment == 13 { break }
+          }
+        } else {
+          if byte != 47 { return false }
+          next: u8 := raw.load(pointer, i + 1)
+          if next != 42 { return false }
+          i = i + 2
+          mut closed := false
+          loop {
+            comment: u8 := raw.load(pointer, i)
+            if comment == 0 { break }
+            if comment == 42 {
+              after: u8 := raw.load(pointer, i + 1)
+              if after == 47 {
+                i = i + 2
+                closed = true
+                break
+              }
+            }
+            i = i + 1
+          }
+          if !closed { return false }
+        }
+      }
+    }
+  }
+}
+
+pub fn dynamic_f32_is_nan(value: f32) -> bool = value != value
+
+pub fn dynamic_f64_is_nan(value: f64) -> bool = value != value
+
+pub fn dynamic_binary_bool(pointer: raw, length: i32) -> Option<bool> {
+  unsafe {
+    if pointer.is_null() || length != 1 { return None }
+    byte: u8 := raw.load(pointer, 0)
+    if byte == 0 { return Some(false) }
+    if byte == 1 { return Some(true) }
+    return None
+  }
+}
+
+pub fn dynamic_binary_i16(pointer: raw, length: i32) -> Option<i16> {
+  if pointer.is_null() || length != 2 { return None }
+  return Some(read_binary_u64(pointer, length) as u16 as i16)
+}
+
+pub fn dynamic_binary_i32(pointer: raw, length: i32) -> Option<i32> {
+  if pointer.is_null() || length != 4 { return None }
+  return Some(read_binary_u64(pointer, length) as u32 as i32)
+}
+
+pub fn dynamic_binary_i64(pointer: raw, length: i32) -> Option<i64> {
+  if pointer.is_null() || length != 8 { return None }
+  return Some(read_binary_u64(pointer, length) as i64)
+}
+
+pub fn dynamic_binary_f32(pointer: raw, length: i32) -> Option<f32> {
+  if pointer.is_null() || length != 4 { return None }
+  unsafe { return Some(align_rt_f32_from_bits(read_binary_u64(pointer, length) as u32)) }
+}
+
+pub fn dynamic_binary_f64(pointer: raw, length: i32) -> Option<f64> {
+  if pointer.is_null() || length != 8 { return None }
+  unsafe { return Some(align_rt_f64_from_bits(read_binary_u64(pointer, length))) }
 }

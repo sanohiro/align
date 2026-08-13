@@ -1,0 +1,249 @@
+module main
+
+import pkg.db
+import pkg.db.postgres
+import pkg.db.sqlite
+import std.time
+
+extern "C" {
+  fn align_rt_alloc_count() -> i64
+  fn align_rt_free_count() -> i64
+}
+
+Timed { elapsed_ns: i64, rows: i64, checksum: i64 }
+Probe { elapsed_ns: i64, allocations: i64, frees: i64, rows: i64, checksum: i64 }
+Step { state: i32, id: i64 }
+
+fn row_id(borrow row: pkg.db.row) -> i64 {
+  if row.values.len() != 3 { return -1 }
+  id := match row.values[0] { I64(value) => value, _ => -1 }
+  text_ok := match row.values[1] { Text(value) => value.len() > 4, _ => false }
+  bytes_ok := match row.values[2] {
+    Bytes(value) => value.bytes.len() == 2 && value.bytes[0] == 0 && value.bytes[1] == 255
+    _ => false
+  }
+  return if text_ok && bytes_ok { id } else { -1 }
+}
+
+fn sqlite_open(
+  borrow connection: pkg.db.conn,
+  rows: i64,
+) -> Result<pkg.db.dynamic_rows, pkg.db.Error> {
+  params := [pkg.db.value.I64(rows)]
+  return pkg.db.dynamic_rows(
+    pkg.db.exec_conn(connection), pkg.db.Driver.SQLite,
+    "SELECT value, 'row-' || value, X'00FF' FROM dynamic_bench WHERE value <= ?1 ORDER BY value",
+    params[..], [],
+  )
+}
+
+fn postgres_open(
+  borrow connection: pkg.db.conn,
+  rows: i64,
+) -> Result<pkg.db.dynamic_rows, pkg.db.Error> {
+  params := [pkg.db.value.I64(rows)]
+  return pkg.db.dynamic_rows(
+    pkg.db.exec_conn(connection), pkg.db.Driver.PostgreSQL,
+    "SELECT value::int8, ('row-' || value)::text, decode('00ff', 'hex')::bytea FROM generate_series(1, $1::int8) AS value ORDER BY value",
+    params[..], [],
+  )
+}
+
+fn next_summary(borrow mut stream: pkg.db.dynamic_rows) -> Step {
+  arena out {
+    selected := pkg.db.dynamic_next(stream, out) else {
+      return Step { state: -1, id: 0 }
+    }
+    row := selected else { return Step { state: 0, id: 0 } }
+    id := row_id(row)
+    return Step { state: if id < 0 { -1 } else { 1 }, id: id }
+  }
+}
+
+fn sqlite_first(borrow connection: pkg.db.conn, rows: i64) -> Timed {
+  start := time.instant()
+  mut delivered: i64 := -1
+  mut checksum: i64 := -1
+  {
+    mut stream := sqlite_open(connection, rows) else {
+      return Timed { elapsed_ns: -1, rows: -1, checksum: -1 }
+    }
+    step := next_summary(stream)
+    if step.state != 1 {
+      return Timed { elapsed_ns: -2, rows: step.state as i64, checksum: -2 }
+    }
+    delivered = 1
+    checksum = step.id
+  }
+  return Timed { elapsed_ns: time.instant() - start, rows: delivered, checksum: checksum }
+}
+
+fn postgres_first(borrow connection: pkg.db.conn, rows: i64) -> Timed {
+  start := time.instant()
+  mut delivered: i64 := -1
+  mut checksum: i64 := -1
+  {
+    mut stream := postgres_open(connection, rows) else {
+      return Timed { elapsed_ns: -1, rows: -1, checksum: -1 }
+    }
+    step := next_summary(stream)
+    if step.state != 1 {
+      return Timed { elapsed_ns: -2, rows: step.state as i64, checksum: -2 }
+    }
+    delivered = 1
+    checksum = step.id
+  }
+  return Timed { elapsed_ns: time.instant() - start, rows: delivered, checksum: checksum }
+}
+
+fn sqlite_scan(borrow connection: pkg.db.conn, rows: i64) -> Timed {
+  start := time.instant()
+  mut stream := sqlite_open(connection, rows) else {
+    return Timed { elapsed_ns: -1, rows: -1, checksum: -1 }
+  }
+  mut delivered: i64 := 0
+  mut checksum: i64 := 0
+  mut failed := false
+  mut done := false
+  loop {
+    step := next_summary(stream)
+    if step.state < 0 { failed = true }
+    if step.state == 0 { done = true }
+    if step.state > 0 {
+      delivered = delivered + 1
+      checksum = checksum + step.id
+    }
+    if failed || done { break }
+  }
+  return Timed {
+    elapsed_ns: if failed { -2 } else { time.instant() - start },
+    rows: delivered,
+    checksum: checksum,
+  }
+}
+
+fn postgres_scan(borrow connection: pkg.db.conn, rows: i64) -> Timed {
+  start := time.instant()
+  mut stream := postgres_open(connection, rows) else {
+    return Timed { elapsed_ns: -1, rows: -1, checksum: -1 }
+  }
+  mut delivered: i64 := 0
+  mut checksum: i64 := 0
+  mut failed := false
+  mut done := false
+  loop {
+    step := next_summary(stream)
+    if step.state < 0 { failed = true }
+    if step.state == 0 { done = true }
+    if step.state > 0 {
+      delivered = delivered + 1
+      checksum = checksum + step.id
+    }
+    if failed || done { break }
+  }
+  return Timed {
+    elapsed_ns: if failed { -2 } else { time.instant() - start },
+    rows: delivered,
+    checksum: checksum,
+  }
+}
+
+fn probe_sqlite_first(borrow connection: pkg.db.conn, rows: i64) -> Probe {
+  unsafe {
+    alloc0 := align_rt_alloc_count()
+    free0 := align_rt_free_count()
+    timed := sqlite_first(connection, rows)
+    return Probe {
+      elapsed_ns: timed.elapsed_ns,
+      allocations: align_rt_alloc_count() - alloc0,
+      frees: align_rt_free_count() - free0,
+      rows: timed.rows,
+      checksum: timed.checksum,
+    }
+  }
+}
+
+fn probe_sqlite_scan(borrow connection: pkg.db.conn, rows: i64) -> Probe {
+  unsafe {
+    alloc0 := align_rt_alloc_count()
+    free0 := align_rt_free_count()
+    timed := sqlite_scan(connection, rows)
+    return Probe {
+      elapsed_ns: timed.elapsed_ns,
+      allocations: align_rt_alloc_count() - alloc0,
+      frees: align_rt_free_count() - free0,
+      rows: timed.rows,
+      checksum: timed.checksum,
+    }
+  }
+}
+
+fn probe_postgres_first(borrow connection: pkg.db.conn, rows: i64) -> Probe {
+  unsafe {
+    alloc0 := align_rt_alloc_count()
+    free0 := align_rt_free_count()
+    timed := postgres_first(connection, rows)
+    return Probe {
+      elapsed_ns: timed.elapsed_ns,
+      allocations: align_rt_alloc_count() - alloc0,
+      frees: align_rt_free_count() - free0,
+      rows: timed.rows,
+      checksum: timed.checksum,
+    }
+  }
+}
+
+fn probe_postgres_scan(borrow connection: pkg.db.conn, rows: i64) -> Probe {
+  unsafe {
+    alloc0 := align_rt_alloc_count()
+    free0 := align_rt_free_count()
+    timed := postgres_scan(connection, rows)
+    return Probe {
+      elapsed_ns: timed.elapsed_ns,
+      allocations: align_rt_alloc_count() - alloc0,
+      frees: align_rt_free_count() - free0,
+      rows: timed.rows,
+      checksum: timed.checksum,
+    }
+  }
+}
+
+fn emit(value: Probe) {
+  print(value.elapsed_ns)
+  print(value.allocations)
+  print(value.frees)
+  print(value.rows)
+  print(value.checksum)
+}
+
+pub fn main(args: array<str>) -> Result<(), Error> {
+  if args.len() != 2 { return Err(error(2)) }
+  sqlite := pkg.db.sqlite.connect(":memory:", []) else { return Err(error(3)) }
+  postgres := pkg.db.postgres.connect(args[1], []) else { return Err(error(4)) }
+  created := pkg.db.dynamic_execute(
+    pkg.db.exec_conn(sqlite), pkg.db.Driver.SQLite,
+    "CREATE TABLE dynamic_bench(value INTEGER NOT NULL)", [], [],
+  ) else { return Err(error(5)) }
+  populated := pkg.db.dynamic_execute(
+    pkg.db.exec_conn(sqlite), pkg.db.Driver.SQLite,
+    "WITH RECURSIVE seq(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM seq WHERE value < 10000) INSERT INTO dynamic_bench SELECT value FROM seq",
+    [], [],
+  ) else { return Err(error(6)) }
+  rows: i64 := 10000
+  expected: i64 := 50005000
+
+  warm_sqlite_first := sqlite_first(sqlite, rows)
+  warm_sqlite_scan := sqlite_scan(sqlite, rows)
+  warm_postgres_first := postgres_first(postgres, rows)
+  warm_postgres_scan := postgres_scan(postgres, rows)
+  if warm_sqlite_first.checksum != 1 || warm_sqlite_scan.checksum != expected
+    || warm_postgres_first.checksum != 1 || warm_postgres_scan.checksum != expected {
+    return Err(error(7))
+  }
+
+  emit(probe_sqlite_first(sqlite, rows))
+  emit(probe_sqlite_scan(sqlite, rows))
+  emit(probe_postgres_first(postgres, rows))
+  emit(probe_postgres_scan(postgres, rows))
+  return Ok(())
+}

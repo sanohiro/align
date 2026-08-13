@@ -115,6 +115,9 @@ static unsigned char format_matrix_left_binary[27][4];
 static unsigned char format_matrix_right_binary[27][1];
 static char format_matrix_left_text[27][12];
 static char format_matrix_right_text[27][5];
+static char dynamic_echo_value[64];
+static unsigned char dynamic_echo_bytes[64];
+static int dynamic_echo_bytes_len;
 
 static void clear_async_results(void) {
   if (async_result != NULL) {
@@ -208,6 +211,8 @@ void align_pg_reset(void) {
   format_matrix_prepared_calls = 0;
   binary_fault = 0;
   binary_empty_calls = 0;
+  dynamic_echo_value[0] = '\0';
+  dynamic_echo_bytes_len = 0;
 }
 
 int align_pg_connect_calls(void) { return connect_calls; }
@@ -724,6 +729,12 @@ FakeResult *PQexecParams(
     if (protocol_error == 0) protocol_error = 87;
   }
   int full_matrix = has(command, "FULL_MATRIX");
+  int dynamic_matrix = has(command, "DYNAMIC_MATRIX");
+  int dynamic_command = has(command, "DYNAMIC_COMMAND");
+  int dynamic_zero = has(command, "DYNAMIC_ZERO_ROWS");
+  int dynamic_simple = has(command, "DYNAMIC_SIMPLE");
+  int dynamic_empty = has(command, "DYNAMIC_EMPTY_VALUES");
+  int dynamic_echo = has(command, "DYNAMIC_ECHO");
   int format_matrix = has(command, "FORMAT_MATRIX");
   int format_command = has(command, "FORMAT_COMMAND");
   int binary_fault_query = has(command, "BINARY_FAULT");
@@ -731,12 +742,79 @@ FakeResult *PQexecParams(
   int view_fault = has(command, "VIEW_FAULT");
   int q6_user = has(command, "Q6_USER_GROUPS");
   int q6_transaction = has(command, "Q6_TRANSACTION_MASTER");
-  if (!full_matrix && !format_matrix && !format_command && !binary_fault_query &&
+  if (!full_matrix && !dynamic_matrix && !dynamic_command && !dynamic_zero && !dynamic_simple &&
+      !dynamic_empty && !dynamic_echo &&
+      !format_matrix && !format_command && !binary_fault_query &&
       !binary_empty && result_format != 0) {
     protocol_ok = 0;
     if (protocol_error == 0) protocol_error = 87;
   }
-  if (format_matrix || format_command) {
+  if (dynamic_matrix || dynamic_zero) {
+    static const uint32_t expected_types[9] = {0, 16, 21, 23, 20, 700, 701, 25, 17};
+    static const int expected_lengths[9] = {0, 1, 2, 4, 8, 4, 8, 2, 2};
+    static const unsigned char expected_bool[] = {1};
+    static const unsigned char expected_i16[] = {0xff, 0xfe};
+    static const unsigned char expected_i32[] = {0x01, 0x02, 0x03, 0x04};
+    static const unsigned char expected_i64[] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe};
+    static const unsigned char expected_f32[] = {0x3f, 0xc0, 0x00, 0x00};
+    static const unsigned char expected_f64[] = {0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    static const unsigned char expected_text[] = {0xc3, 0xa9};
+    static const unsigned char expected_bytes[] = {0x00, 0xff};
+    static const unsigned char *expected_values[9] = {
+        NULL, expected_bool, expected_i16, expected_i32, expected_i64,
+        expected_f32, expected_f64, expected_text, expected_bytes,
+    };
+    if (parameter_count != 9 || parameter_types == NULL || parameter_values == NULL ||
+        parameter_lengths == NULL || parameter_formats == NULL || result_format != 1) {
+      protocol_ok = 0;
+      if (protocol_error == 0) protocol_error = 110;
+    } else {
+      for (int i = 0; i < 9; i++) {
+        int expected_format = i == 0 ? 0 : 1;
+        if (parameter_types[i] != expected_types[i] ||
+            parameter_formats[i] != expected_format ||
+            parameter_lengths[i] != expected_lengths[i] ||
+            (i == 0 ? parameter_values[i] != NULL
+                    : parameter_values[i] == NULL ||
+                      memcmp(parameter_values[i], expected_values[i], expected_lengths[i]) != 0)) {
+          protocol_ok = 0;
+          if (protocol_error == 0) protocol_error = 111 + i;
+        }
+      }
+    }
+  } else if (dynamic_echo) {
+    if (parameter_count != 2 || parameter_types == NULL || parameter_values == NULL ||
+        parameter_lengths == NULL || parameter_formats == NULL || result_format != 1 ||
+        parameter_types[0] != 25 || parameter_types[1] != 17 ||
+        parameter_formats[0] != 1 || parameter_formats[1] != 1 ||
+        parameter_values[0] == NULL || parameter_values[1] == NULL ||
+        parameter_lengths[0] < 0 || parameter_lengths[0] >= (int)sizeof(dynamic_echo_value) ||
+        parameter_lengths[1] < 0 || parameter_lengths[1] > (int)sizeof(dynamic_echo_bytes)) {
+      protocol_ok = 0;
+      if (protocol_error == 0) protocol_error = 123;
+    } else {
+      memcpy(dynamic_echo_value, parameter_values[0], (size_t)parameter_lengths[0]);
+      dynamic_echo_value[parameter_lengths[0]] = '\0';
+      memcpy(dynamic_echo_bytes, parameter_values[1], (size_t)parameter_lengths[1]);
+      dynamic_echo_bytes_len = parameter_lengths[1];
+    }
+  } else if (dynamic_empty) {
+    if (parameter_count != 3 || parameter_types == NULL || parameter_values == NULL ||
+        parameter_lengths == NULL || parameter_formats == NULL || result_format != 1 ||
+        parameter_types[0] != 25 || parameter_types[1] != 17 || parameter_types[2] != 0 ||
+        parameter_formats[0] != 1 || parameter_formats[1] != 1 || parameter_formats[2] != 0 ||
+        parameter_lengths[0] != 0 || parameter_lengths[1] != 0 || parameter_lengths[2] != 0 ||
+        parameter_values[0] == NULL || parameter_values[1] == NULL || parameter_values[2] != NULL) {
+      protocol_ok = 0;
+      if (protocol_error == 0) protocol_error = 122;
+    }
+  } else if (dynamic_command || dynamic_simple) {
+    if (parameter_count != 0 || parameter_types != NULL || parameter_values != NULL ||
+        parameter_lengths != NULL || parameter_formats != NULL || result_format != 1) {
+      protocol_ok = 0;
+      if (protocol_error == 0) protocol_error = 121;
+    }
+  } else if (format_matrix || format_command) {
     if (parameter_types == NULL || parameter_types[0] != 23 || parameter_types[1] != 17) {
       protocol_ok = 0;
       if (protocol_error == 0) protocol_error = 98;
@@ -847,7 +925,100 @@ FakeResult *PQexecParams(
   if (has(command, "NULL_RESULT")) return NULL;
   FakeResult *result = new_result();
   if (result == NULL) return NULL;
-  if (format_matrix) {
+  if (dynamic_matrix || dynamic_zero) {
+    static const unsigned char dynamic_bool[] = {1};
+    static const unsigned char dynamic_i16[] = {0xff, 0xfe};
+    static const unsigned char dynamic_i32[] = {0x01, 0x02, 0x03, 0x04};
+    static const unsigned char dynamic_i64[] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe};
+    static const unsigned char dynamic_f32[] = {0x3f, 0xc0, 0x00, 0x00};
+    static const unsigned char dynamic_f64[] = {0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    static const unsigned char dynamic_text[] = {0xc3, 0xa9};
+    static const unsigned char dynamic_bytes[] = {0x00, 0xff};
+    static const char *names[9] = {
+        "nullv", "boolv", "i16v", "i32v", "i64v", "f32v", "f64v", "textv", "bytesv",
+    };
+    static const uint32_t oids[9] = {25, 16, 21, 23, 20, 700, 701, 25, 17};
+    static const char *values[9] = {
+        "", (const char *)dynamic_bool, (const char *)dynamic_i16,
+        (const char *)dynamic_i32, (const char *)dynamic_i64,
+        (const char *)dynamic_f32, (const char *)dynamic_f64,
+        (const char *)dynamic_text, (const char *)dynamic_bytes,
+    };
+    static const int lengths[9] = {0, 1, 2, 4, 8, 4, 8, 2, 2};
+    result->fields = 9;
+    result->rows = dynamic_zero ? 0 : (has(command, "DYNAMIC_MANY_ROWS") ? 2 : 1);
+    for (int i = 0; i < 9; i++) {
+      result->names[i] = names[i];
+      result->oids[i] = oids[i];
+      result->formats[i] = 1;
+      result->values[0][i] = values[i];
+      result->lengths[0][i] = lengths[i];
+      result->nulls[0][i] = i == 0;
+      if (result->rows == 2) {
+        result->values[1][i] = values[i];
+        result->lengths[1][i] = lengths[i];
+        result->nulls[1][i] = i == 0;
+      }
+    }
+  } else if (dynamic_echo) {
+    result->fields = 2;
+    result->rows = 1;
+    result->names[0] = "textv";
+    result->names[1] = "bytesv";
+    result->oids[0] = 25;
+    result->oids[1] = 17;
+    result->formats[0] = 1;
+    result->formats[1] = 1;
+    result->values[0][0] = dynamic_echo_value;
+    result->values[0][1] = (const char *)dynamic_echo_bytes;
+    result->lengths[0][0] = (int)strlen(dynamic_echo_value);
+    result->lengths[0][1] = dynamic_echo_bytes_len;
+  } else if (dynamic_empty) {
+    static const char present_empty[] = "";
+    result->fields = 3;
+    result->rows = 1;
+    result->names[0] = "textv";
+    result->names[1] = "bytesv";
+    result->names[2] = "nullv";
+    result->oids[0] = 25;
+    result->oids[1] = 17;
+    result->oids[2] = 25;
+    result->formats[0] = 1;
+    result->formats[1] = 1;
+    result->formats[2] = 1;
+    result->values[0][0] = present_empty;
+    result->values[0][1] = present_empty;
+    result->values[0][2] = present_empty;
+    result->lengths[0][0] = 0;
+    result->lengths[0][1] = 0;
+    result->lengths[0][2] = 0;
+    result->nulls[0][2] = 1;
+  } else if (dynamic_simple) {
+    static const unsigned char dynamic_true[] = {1};
+    result->fields = 1;
+    result->rows = 1;
+    result->names[0] = "value";
+    result->oids[0] = 16;
+    result->formats[0] = 1;
+    result->values[0][0] = (const char *)dynamic_true;
+    result->lengths[0][0] = 1;
+    if (has(command, "DYNAMIC_ENCODING_BAD") && connection != NULL) connection->encoding = -1;
+    if (has(command, "DYNAMIC_TX_DRIFT") && connection != NULL) connection->transaction_status = 2;
+    if (has(command, "DYNAMIC_TX_IDLE") && connection != NULL) connection->transaction_status = 0;
+    if (has(command, "DYNAMIC_NATIVE_ERROR")) {
+      result->status = 7;
+      result->sqlstate = "XX000";
+      result->message = "dynamic native failure";
+    }
+    if (has(command, "DYNAMIC_UNSUPPORTED_OID")) result->oids[0] = 1700;
+    if (has(command, "DYNAMIC_TEXT_FORMAT")) result->formats[0] = 0;
+    if (has(command, "DYNAMIC_ZERO_COLUMNS")) result->fields = 0;
+    if (has(command, "DYNAMIC_MANY_ROWS")) {
+      result->rows = 2;
+      result->values[1][0] = (const char *)dynamic_true;
+      result->lengths[1][0] = 1;
+    }
+  } else if (format_matrix) {
     int index = format_matrix_direct_calls - 1;
     free(result);
     return format_matrix_result(index < 0 ? 0 : index, result_format);
@@ -923,7 +1094,7 @@ FakeResult *PQexecParams(
     if (has(command, "BYTES_NULL")) result->row_fault = 4;
     if (has(command, "BYTES_LENGTH")) result->row_fault = 5;
   }
-  if (has(command, "COMMAND_OK") || format_command) {
+  if (has(command, "COMMAND_OK") || format_command || dynamic_command) {
     result->status = 1;
     result->rows = 0;
     result->fields = 0;

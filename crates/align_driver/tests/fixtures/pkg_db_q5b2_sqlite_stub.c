@@ -113,6 +113,29 @@ void *PQexecParams(
   postgres_key_query = strstr(command, "WITH constraints") != 0;
   return &fake_result;
 }
+int32_t PQsendQueryParams(
+    void *connection,
+    const char *command,
+    int32_t parameter_count,
+    const uint32_t *parameter_types,
+    const char *const *parameter_values,
+    const int32_t *parameter_lengths,
+    const int32_t *parameter_formats,
+    int32_t result_format) {
+  (void)connection;
+  (void)command;
+  (void)parameter_count;
+  (void)parameter_types;
+  (void)parameter_values;
+  (void)parameter_lengths;
+  (void)parameter_formats;
+  (void)result_format;
+  return 0;
+}
+int32_t PQclientEncoding(void *connection) {
+  (void)connection;
+  return 6;
+}
 void *PQexec(void *connection, const char *command) {
   (void)connection;
   (void)command;
