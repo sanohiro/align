@@ -255,18 +255,36 @@ align_tb_slot_record() {
   fi
 }
 
-# libtest names every failed test on its own line, in both the single- and
-# multi-threaded output modes.
+# libtest names every failed test in the indented list under the final
+# "failures:" heading, printed together with the summary once every test has
+# finished. That list — not the per-test progress lines — is what gets parsed.
 #
-# A test's own captured stdout is replayed into the same stream, so a test that
-# prints a line spelled exactly like a libtest verdict would be extracted as a
-# phantom failure. That can only happen on a run that already has a real
-# failure — libtest replays captured output only for failing tests — so the
-# error is a spurious extra name inside an already-red run, never a missed
-# failure. Parsing libtest's JSON output would remove even that, but it is
-# nightly-only, so the fail-closed direction is the right trade here.
+# The progress lines ("test name ... FAILED") are written while tests are
+# still running, and the binary's stdout and stderr share one log: a stderr
+# write from a concurrent test can splice into the middle of a progress line,
+# losing the name and turning a named failure into a phantom <binary-exit-101>
+# (observed on the first nightly). The trailing failures list has no such
+# race. Each "failures:" heading resets the collected block, so the first
+# heading (the per-test detail sections) is superseded by the final name list,
+# and only a block confirmed by libtest's own "test result:" summary counts.
+#
+# A test's own captured output is replayed into the same stream, so a test
+# that prints a "failures:" heading followed by indented lines just before the
+# summary could still inject a phantom name. That can only happen on a run
+# that already has a real failure — libtest replays captured output only for
+# failing tests — so the error is a spurious extra name inside an already-red
+# run, never a missed failure. Parsing libtest's JSON output would remove even
+# that, but it is nightly-only, so the fail-closed direction is the right
+# trade here.
 align_tb_failed_tests() {
-  sed -n 's/^test \(.*\) \.\.\. FAILED$/\1/p' "$ALIGN_TB_LOGS/$1.log"
+  awk '
+    /^failures:$/ { block = ""; collecting = 1; next }
+    collecting && /^    [^ ]/ { block = block substr($0, 5) "\n"; next }
+    collecting && /^$/ { next }
+    collecting { collecting = 0 }
+    /^test result:/ { names = block; collecting = 0 }
+    END { printf "%s", names }
+  ' "$ALIGN_TB_LOGS/$1.log"
 }
 
 # Every binary's output, whichever of them failed. Returns 1 if any did.

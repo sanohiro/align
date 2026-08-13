@@ -72,6 +72,20 @@ if [ $# -ge 1 ]; then
   artifacts="$1"
 else
   artifacts="$work/artifacts.json"
+  # `cargo test --no-run` builds only what the test binaries link against
+  # directly; it does not produce the alignc runtime staticlib that driver
+  # tests hand to the linker at RUN time. The first nightly proved the hole:
+  # 33 targets failed together solely because target/debug/libalign_runtime.a
+  # did not exist. Build the workspace first, and fail closed — as a
+  # configuration error, not a verdict — if the runtime library still is not
+  # there afterwards.
+  echo "suite: building the workspace"
+  "$script_dir/cargo.sh" build --workspace --locked
+  runtime_lib="${CARGO_TARGET_DIR:-$repo_root/target}/debug/libalign_runtime.a"
+  [ -f "$runtime_lib" ] || {
+    echo "suite: workspace build did not produce $runtime_lib" >&2
+    exit 2
+  }
   echo "suite: building every workspace test binary"
   "$script_dir/cargo.sh" test --no-run --workspace --locked \
     --message-format=json-render-diagnostics >"$artifacts"
