@@ -228,9 +228,10 @@ fn checked_source_shapes_survive_every_delegated_gate() {
             4,
         ),
         // `ord-key`: the orderability rule is now the producer's `Bound::Ord`. A `str` key is the
-        // reachable witness; the owned-`string` key sema also admits is still refused one gate
-        // later by the Copy requirement on a pipeline callable's output, which is a distinct
-        // deferred cell (see the ledger's `ord-key` row).
+        // reachable witness; an owned-`string` key cannot reach this matrix at all any more —
+        // `check_array_sort_by_key` rejects it up front with the shared pipeline Move-value gate,
+        // because lowering it needs per-key Drop in the fused sort (still a deferred capability;
+        // see the ledger's "pipeline Move-value gate" section).
         (
             "sort-by-key-str-key",
             "Row { name: str, n: i64 }\nfn key(row: Row) -> str = row.name\nfn main() -> i32 = 0\n",

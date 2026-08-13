@@ -103,3 +103,21 @@ fn chunks_over_struct_array_errors() {
     let src = "Emp { pay: i32 }\nfn main() -> i32 {\n  cs := [Emp{pay: 1}].chunks(1)\n  return 0\n}\n";
     assert!(check_errs("ch-struct", src));
 }
+
+/// `scalar_to_prim` admits owned `string` (the one Move `PrimScalar`), so `chunks` accepted an
+/// `array<string>` while the MIR boundary's `scalar_copy_ok` refused it — the chunk views would
+/// alias elements the source still owns and deep-drops. That gap was an internal error after a
+/// clean `check`, not a diagnostic.
+#[test]
+fn chunks_over_a_move_element_array_is_diagnosed() {
+    let src = "fn main() -> Result<(), Error> {\n  mut b: array_builder<string> := array_builder()\n  b.push(\"a\".clone())\n  built := b.build()\n  print(built.chunks(2).len())\n  return Ok(())\n}\n";
+    let diagnostics = check_diagnostics("ch-move-elem", src);
+    assert!(
+        diagnostics.contains("'chunks' cannot view a Move element"),
+        "an owned `array<string>` source must be diagnosed:\n{diagnostics}",
+    );
+    assert!(
+        !diagnostics.contains("failed HIR validation"),
+        "it must be a diagnostic, not an internal error:\n{diagnostics}",
+    );
+}

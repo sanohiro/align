@@ -34004,6 +34004,39 @@ impl<'a, 't> Checker<'a, 't> {
         true
     }
 
+    /// The *output* sibling of [`Self::reject_move_pipeline_call_arg`]: a value the fused pipeline
+    /// buffers, collects, or views rather than passes in.
+    ///
+    /// The checked-HIR body validator requires every such position to be Copy — a pipeline
+    /// callable's result (`pipeline_callable_ok`'s `ty_copy_ok(output)`), a `to_array` collected
+    /// element (`ty_copy_ok(final_elem)`), and a `chunks` source element (`scalar_copy_ok`) — and
+    /// asks [`ty_capture_is_move`] for that rule. Sema asks the identical predicate here so an
+    /// owned `string` gets a diagnostic instead of passing `check` and then failing
+    /// `body_only_metadata_is_valid` at the MIR boundary as an internal error
+    /// (`docs/impl/19-hir-validation-ledger.md`, delegation matrix row `ord-key`). Admitting one
+    /// of these needs per-element Drop in the fused path, which is a separate capability.
+    fn reject_move_pipeline_value(
+        &mut self,
+        ty: Ty,
+        label: &str,
+        verb: &str,
+        role: &str,
+        span: Span,
+    ) -> bool {
+        let ty = self.resolve(ty);
+        if !ty_capture_is_move(ty, self.structs, self.tuples, self.enums, self.tagged_types) {
+            return false;
+        }
+        self.diags.error(
+            format!(
+                "'{label}' cannot {verb} a Move {role} ({}) yet; use a Copy or borrowed value (a `str` view instead of an owned `string`)",
+                ty_name(ty)
+            ),
+            span,
+        );
+        true
+    }
+
     /// The `idx`-th parameter type of a *named* function argument, to seed an inline-literal source's
     /// element type. A lambda has no signature to peek (its parameters are inferred), so it yields
     /// `None` (the literal then defaults like any unconstrained value).
@@ -34897,6 +34930,12 @@ impl<'a, 't> Checker<'a, 't> {
                     );
                     return err;
                 };
+                // The Move *struct* arm above has its own message; a Move scalar element (an owned
+                // `string` from `fs.read_dir`) needs the same rejection — the collected buffer has
+                // no per-element drop.
+                if self.reject_move_pipeline_value(elem, "to_array", "collect", "element", span) {
+                    return err;
+                }
                 Ty::DynArray(scalar)
             }
         };
@@ -35198,6 +35237,11 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         };
+        // `scalar_to_prim` admits owned `string` (the one Move `PrimScalar`), but the chunk views
+        // would alias elements the source still owns and drops.
+        if self.reject_move_pipeline_value(scalar_to_ty(elem_scalar), "chunks", "view", "element", span) {
+            return err;
+        }
         // A fixed stack array source must be a literal or a named local (slot-addressable, like a
         // pipeline source) so MIR can take its buffer address; a `{ptr,len}` view is fine as a value.
         if matches!(src.ty, Ty::Array(..)) && !matches!(src.kind, ExprKind::ArrayLit { .. } | ExprKind::Local(_)) {
@@ -35525,6 +35569,12 @@ impl<'a, 't> Checker<'a, 't> {
                 format!("'sort_by_key' key must be an orderable scalar (int/float/char/str), got {}", ty_name(key_ty)),
                 span,
             );
+            return err;
+        }
+        // Orderable is not enough: the fused sort buffers one key per element and has no per-key
+        // Drop, so an owned `string` key (orderable, but Move) must be rejected here rather than
+        // one gate later at the MIR boundary.
+        if self.reject_move_pipeline_value(key_ty, "sort_by_key", "buffer", "key", span) {
             return err;
         }
         Expr {
@@ -49754,6 +49804,54 @@ fn exit_branch(flag: bool) -> i64 {
         assert!(
             d.iter().any(|e| e.message.contains("'map' cannot produce a Move element")),
             "map must not leak a Move result on every pipeline iteration"
+        );
+    }
+
+    /// The output side of the same rule: a value the fused pipeline *buffers*, *collects*, or
+    /// *views* must be Copy too. The checked-HIR body validator has always required it
+    /// (`pipeline_callable_ok`'s `ty_copy_ok(output)`, `to_array`'s `ty_copy_ok(final_elem)`, and
+    /// `chunks`'s `scalar_copy_ok`); before this gate each of these three shapes passed `check`
+    /// and then failed `body_only_metadata_is_valid` at the MIR boundary as an internal error.
+    #[test]
+    fn pipeline_terminals_reject_move_values() {
+        // `Ord` admits owned `string`, but the fused sort buffers one key per element with no
+        // per-key drop — orderability alone is not enough.
+        let string_key =
+            "fn key(x: i64) -> string = \"k\".clone()\nfn main() -> i32 {\n  s := [3, 1, 2].sort_by_key(key)\n  return s[0] as i32\n}\n";
+        let (_p, d) = check(string_key);
+        assert!(
+            d.iter().any(|e| e.message.contains("'sort_by_key' cannot buffer a Move key")),
+            "an owned `string` key has no per-key drop in the fused sort"
+        );
+
+        // The reachable positive witness for the same row: a borrowed `str` key is orderable and
+        // Copy, so it keeps lowering.
+        let str_key =
+            "fn key(x: i64) -> str = \"k\"\nfn main() -> i32 {\n  s := [3, 1, 2].sort_by_key(key)\n  return s[0] as i32\n}\n";
+        let (_p, d) = check(str_key);
+        assert!(!d.has_errors(), "a borrowed `str` key stays orderable and Copy");
+
+        // An owned `array<string>` (`array_builder<string>.build()`, `fs.read_dir`) is the one
+        // reachable Move `PrimScalar` collection. `to_array`'s Move-*struct* arm had a message but
+        // its scalar arm did not, and `chunks` asked only `scalar_to_prim`, which admits `string`.
+        let owned_string_array =
+            "  mut b: array_builder<string> := array_builder()\n  b.push(\"a\".clone())\n  built := b.build()\n";
+        let to_array = format!(
+            "fn main() -> Result<(), Error> {{\n{owned_string_array}  print(built.to_array().len())\n  return Ok(())\n}}\n"
+        );
+        let (_p, d) = check(&to_array);
+        assert!(
+            d.iter().any(|e| e.message.contains("'to_array' cannot collect a Move element")),
+            "to_array must reject a Move scalar element, not only a Move struct element"
+        );
+
+        let chunks = format!(
+            "fn main() -> Result<(), Error> {{\n{owned_string_array}  print(built.chunks(2).len())\n  return Ok(())\n}}\n"
+        );
+        let (_p, d) = check(&chunks);
+        assert!(
+            d.iter().any(|e| e.message.contains("'chunks' cannot view a Move element")),
+            "chunks must not view Move elements the source still owns"
         );
     }
 

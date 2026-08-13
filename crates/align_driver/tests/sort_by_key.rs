@@ -62,3 +62,31 @@ fn sort_by_key_non_orderable_key_rejected() {
     let src = "fn main() -> Result<(), Error> {\n  arena {\n    s := [1, 2, 3].sort_by_key(fn x { x > 1 })\n    print(s[0])\n  }\n  return Ok(())\n}\n";
     assert!(check_errs("sbk-bad-key", src));
 }
+
+/// An owned `string` key is orderable (`Ord` compares it through the same `str` comparator), but
+/// the fused sort buffers one key per element and has no per-key drop. Sema stopped at
+/// orderability, so a `string` key passed `check` and then failed HIR validation at the MIR
+/// boundary as an internal error instead of being diagnosed.
+#[test]
+fn sort_by_key_move_key_rejected() {
+    for (label, src) in [
+        (
+            "named-fn",
+            "fn key(x: i64) -> string = \"k\".clone()\nfn main() -> Result<(), Error> {\n  s := [3, 1, 2].sort_by_key(key)\n  print(s[0])\n  return Ok(())\n}\n",
+        ),
+        (
+            "lambda",
+            "fn main() -> Result<(), Error> {\n  s := [3, 1, 2].sort_by_key(fn x { \"k\".clone() })\n  print(s[0])\n  return Ok(())\n}\n",
+        ),
+    ] {
+        let diagnostics = check_diagnostics(&format!("sbk-move-key-{label}"), src);
+        assert!(
+            diagnostics.contains("'sort_by_key' cannot buffer a Move key"),
+            "an owned `string` key must be diagnosed ({label}):\n{diagnostics}",
+        );
+        assert!(
+            !diagnostics.contains("failed HIR validation"),
+            "it must be a diagnostic, not an internal error ({label}):\n{diagnostics}",
+        );
+    }
+}

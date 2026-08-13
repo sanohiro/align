@@ -7,6 +7,23 @@
 mod common;
 use common::*;
 
+/// `to_array` names the Move-*struct* case ("its fields need per-element drop") but its scalar arm
+/// admitted any `ty_to_scalar`, including owned `string`. The collected buffer has no per-element
+/// drop either, so the MIR boundary refused it and a clean `check` turned into an internal error.
+#[test]
+fn to_array_of_a_move_scalar_element_is_diagnosed() {
+    let src = "fn main() -> Result<(), Error> {\n  mut b: array_builder<string> := array_builder()\n  b.push(\"a\".clone())\n  built := b.build()\n  print(built.to_array().len())\n  return Ok(())\n}\n";
+    let diagnostics = check_diagnostics("arr-move-scalar-collect", src);
+    assert!(
+        diagnostics.contains("'to_array' cannot collect a Move element"),
+        "collecting owned `string` elements must be diagnosed:\n{diagnostics}",
+    );
+    assert!(
+        !diagnostics.contains("failed HIR validation"),
+        "it must be a diagnostic, not an internal error:\n{diagnostics}",
+    );
+}
+
 #[test]
 fn to_array_result_is_returnable_and_dropped() {
     if !backend_available() {

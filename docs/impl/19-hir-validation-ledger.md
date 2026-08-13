@@ -1041,7 +1041,7 @@ Eight occurrences; one diverged.
 | `rng_elem_ok` (`shuffle`/`sample`) | `check_rand_method` | Identical rule (`scalar_to_prim(es).is_none()`). No change. |
 | `ArraySortBy` element | `check_array_sort_by_key` | Identical rule. No change. |
 | `ArrayPartition` element | `check_array_partition` | Identical rule. No change. |
-| `ArrayChunks` element | `check_array_chunks` | Identical rule. No change. |
+| `ArrayChunks` element | `check_array_chunks` | Identical `scalar_to_prim` rule, but the validator *also* asks `scalar_copy_ok`. See the Move-value gate below. |
 | `array_builder_elem_ok` | `check_array_builder_new` | Wider, never narrower: sema admits `Int/Float/Bool/Char/String`; the validator additionally admits `Str`. A wider gate cannot reject a checked program, so it is outside this class. No change. |
 | `ResourceViewFromRaw` view scalar (2 sites) | none | Structural: `Scalar::Slice` is *constructed from* a `PrimScalar`, so this is a representation conversion, not an admission rule. No change. |
 
@@ -1064,16 +1064,50 @@ complete contract:
 | Early exit | Receiver evaluation that terminates does not emit a clone; the pre-registered synthetic owner participates in existing exit cleanup. | shared `lower_borrowed_owned` early-exit owners |
 | Whole/per-unit and backend | The unchanged `StrClone` MIR/codegen shape accepts either layout-identical text receiver after checked-HIR validation. | `align_driver::m5::owned_string_clone_duplicates_locals_and_fields`; real align-llm per-unit check |
 
-**Deferred, same arm — `ord-key` Move keys.** Delegating orderability does not by
-itself make a `string`-keyed `sort_by_key` lower. `pipeline_callable_ok` requires
-a pipeline callable's output to be Copy (`ty_copy_ok`), and sema imposes no Copy
-requirement on a sort key, so an owned key is still refused one gate later. That
-is a *second*, distinct divergence, and closing it needs per-key Drop in the
-fused sort path — the same shape as #739's deferred fixed-array Move elements,
-not a validator edit. Until then the reachable witness for the `ord-key` row is a
-`str` key, and the owner table records that explicitly. Do not "fix" the Copy gate
-without the MIR support: accepting a Move key the sort path cannot drop trades a
-rejected program for a leak.
+### Axis A (continued) — the pipeline Move-value gate
+
+Delegating orderability did not by itself make a `string`-keyed `sort_by_key`
+lower. `pipeline_callable_ok` requires a pipeline callable's output to be Copy
+(`ty_copy_ok`), and sema imposed no Copy requirement on a sort key, so an owned
+key was refused one gate later. That is a *second*, distinct divergence, and the
+`ord-key` row was not its only instance: sweeping every validator `ty_copy_ok` /
+`scalar_copy_ok` site against its producer found the same asymmetry in three
+reachable places, all with the one Move `PrimScalar`, owned `string`.
+
+Sema already owned the **input** half of this rule
+(`reject_move_pipeline_call_arg`, plus `map`'s "cannot produce a Move element"),
+which is why `map` / `where` / `any` / `all` / `partition` / `par_map` /
+`reduce` / `scan` and the `sort_by_key` *element* all diagnosed correctly. The
+**output** half — a value the fused pipeline buffers, collects, or views — had
+no producer gate at all:
+
+| Cell | Validator rule | Symptom before the gate |
+|---|---|---|
+| `sort_by_key` key | `pipeline_callable_ok`'s `ty_copy_ok(output)` | `Ord` admits owned `string`; a `string` key passed `check` and hit `body_only_metadata_is_valid` as an internal error. |
+| `to_array` element | `ty_copy_ok(final_elem)` | The Move-*struct* arm had a message; the scalar arm admitted any `ty_to_scalar`, so `array_builder<string>.build().to_array()` was an internal error. |
+| `chunks` element | `scalar_copy_ok(source_scalar)` | `scalar_to_prim` admits `String`, so an `array<string>` source was an internal error; the chunk views would alias elements the source still owns. |
+
+`check_array_sort_by_key`, `check_array_to_array`, and `check_array_chunks` now
+ask one shared producer-side helper, `reject_move_pipeline_value`, which asks
+the *identical* `align_sema::ty_capture_is_move` predicate the validator's
+`ty_copy_ok` asks — so the two sides cannot drift again. The two remaining
+`scalar_copy_ok` siblings have no reachable Move witness and so need no gate:
+`rng_elem_ok` (`shuffle`/`sample`) and `map_into` both require a `slice<T>`
+destination, and a `slice<string>` cannot be formed at all (`slicing a
+collection of the Move type string` is already diagnosed at every init site).
+
+**Still deferred: actually admitting these.** Lowering a Move key/element needs
+per-element Drop in the fused sort/collect path — the same shape as #739's
+deferred fixed-array Move elements, not a validator edit. That remains a
+separate capability. Do not "fix" the Copy gate without the MIR support:
+accepting a Move value the pipeline cannot drop trades a rejected program for a
+leak. Until then the reachable witness for the `ord-key` row stays a `str` key.
+
+Owners: `align_sema::pipeline_terminals_reject_move_values` (all three cells
+plus the `str`-key positive witness),
+`align_driver::sort_by_key::sort_by_key_move_key_rejected`,
+`align_driver::array_materialize::to_array_of_a_move_scalar_element_is_diagnosed`,
+`align_driver::chunks::chunks_over_a_move_element_array_is_diagnosed`.
 
 ### Axis B — nominal-identity comparisons
 
