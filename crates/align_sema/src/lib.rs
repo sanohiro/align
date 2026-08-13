@@ -34004,23 +34004,33 @@ impl<'a, 't> Checker<'a, 't> {
         true
     }
 
-    /// The *output* sibling of [`Self::reject_move_pipeline_call_arg`]: a value the fused pipeline
-    /// buffers, collects, or views rather than passes in.
+    /// The *copy-position* sibling of [`Self::reject_move_pipeline_call_arg`]: a value an operation
+    /// buffers, collects, views, rearranges, draws, or writes rather than passes in.
     ///
-    /// The checked-HIR body validator requires every such position to be Copy — a pipeline
-    /// callable's result (`pipeline_callable_ok`'s `ty_copy_ok(output)`), a `to_array` collected
-    /// element (`ty_copy_ok(final_elem)`), and a `chunks` source element (`scalar_copy_ok`) — and
-    /// asks [`ty_capture_is_move`] for that rule. Sema asks the identical predicate here so an
-    /// owned `string` gets a diagnostic instead of passing `check` and then failing
+    /// The checked-HIR body validator refuses a Move value in each of these positions through one
+    /// of two spellings — `ty_copy_ok` (a `Ty`; `body_ty_ok` **and** not [`ty_capture_is_move`])
+    /// or `scalar_copy_ok` (a `Scalar`; not `scalar_is_move`). This helper implements only the
+    /// *Move half* that both share; the `body_ty_ok` half of `ty_copy_ok` is a separate
+    /// well-formedness question the producer already answers elsewhere. On a plain scalar the two
+    /// spellings agree, because `ty_capture_is_move` on a scalar `Ty` reduces to `ty_is_move`,
+    /// which reduces to `scalar_is_move`.
+    ///
+    /// Without this gate each position passed `check` and then failed
     /// `body_only_metadata_is_valid` at the MIR boundary as an internal error
-    /// (`docs/impl/19-hir-validation-ledger.md`, delegation matrix row `ord-key`). Admitting one
-    /// of these needs per-element Drop in the fused path, which is a separate capability.
-    fn reject_move_pipeline_value(
+    /// (`docs/impl/19-hir-validation-ledger.md`, "the reachable `slice<Move>` parameter domain").
+    /// Admitting any of them needs per-element Drop in the owning path, which stays a separate
+    /// capability — accepting a Move value the path cannot drop would trade a rejected program for
+    /// a leak or a double free.
+    ///
+    /// `hint` is appended verbatim and must name a workaround that actually exists; most of these
+    /// positions have none, and claiming one would be worse than saying the feature is deferred.
+    fn reject_move_copy_position(
         &mut self,
         ty: Ty,
         label: &str,
         verb: &str,
         role: &str,
+        hint: &str,
         span: Span,
     ) -> bool {
         let ty = self.resolve(ty);
@@ -34029,7 +34039,7 @@ impl<'a, 't> Checker<'a, 't> {
         }
         self.diags.error(
             format!(
-                "'{label}' cannot {verb} a Move {role} ({}) yet; use a Copy or borrowed value (a `str` view instead of an owned `string`)",
+                "'{label}' cannot {verb} a Move {role} ({}) yet: it needs per-element drop, which is not implemented for this path{hint}",
                 ty_name(ty)
             ),
             span,
@@ -34931,9 +34941,9 @@ impl<'a, 't> Checker<'a, 't> {
                     return err;
                 };
                 // The Move *struct* arm above has its own message; a Move scalar element (an owned
-                // `string` from `fs.read_dir`) needs the same rejection — the collected buffer has
-                // no per-element drop.
-                if self.reject_move_pipeline_value(elem, "to_array", "collect", "element", span) {
+                // `string` from `fs.read_dir` or a `slice<string>` parameter) needs the same
+                // rejection — the collected buffer has no per-element drop.
+                if self.reject_move_copy_position(elem, "to_array", "collect", "element", "", span) {
                     return err;
                 }
                 Ty::DynArray(scalar)
@@ -35032,6 +35042,13 @@ impl<'a, 't> Checker<'a, 't> {
         };
         if matches!(elem, Ty::Struct(_)) {
             self.diags.error("'map_into' over struct elements is not supported yet (project a field first)".to_string(), span);
+            return err;
+        }
+        // Both `src` and `dst` can be `slice<string>` parameters, so the element rule cannot lean
+        // on "a Move collection is unbuildable": writing into `dst` would overwrite owned headers
+        // without dropping them, and copy the source's. `scalar == dst_es` below makes checking
+        // the source element enough for both sides.
+        if self.reject_move_copy_position(elem, "map_into", "write", "element", "", span) {
             return err;
         }
         if scalar != dst_es {
@@ -35239,7 +35256,7 @@ impl<'a, 't> Checker<'a, 't> {
         };
         // `scalar_to_prim` admits owned `string` (the one Move `PrimScalar`), but the chunk views
         // would alias elements the source still owns and drops.
-        if self.reject_move_pipeline_value(scalar_to_ty(elem_scalar), "chunks", "view", "element", span) {
+        if self.reject_move_copy_position(scalar_to_ty(elem_scalar), "chunks", "view", "element", "", span) {
             return err;
         }
         // A fixed stack array source must be a literal or a named local (slot-addressable, like a
@@ -35573,8 +35590,16 @@ impl<'a, 't> Checker<'a, 't> {
         }
         // Orderable is not enough: the fused sort buffers one key per element and has no per-key
         // Drop, so an owned `string` key (orderable, but Move) must be rejected here rather than
-        // one gate later at the MIR boundary.
-        if self.reject_move_pipeline_value(key_ty, "sort_by_key", "buffer", "key", span) {
+        // one gate later at the MIR boundary. Unlike the element positions below, this one has a
+        // real workaround, because the key function's return type is the user's to choose.
+        if self.reject_move_copy_position(
+            key_ty,
+            "sort_by_key",
+            "buffer",
+            "key",
+            " — return a Copy key (int/float/char) or a borrowed `str`",
+            span,
+        ) {
             return err;
         }
         Expr {
@@ -39229,6 +39254,13 @@ impl<'a, 't> Checker<'a, 't> {
                     );
                     return err;
                 }
+                // A `slice<string>` is a declarable, passable parameter type even though no
+                // expression can build one, so `scalar_to_prim` (which admits `String`) is not
+                // enough: Fisher-Yates swaps raw `{ptr,len}` headers, which the MIR boundary's
+                // `scalar_copy_ok` refuses.
+                if self.reject_move_copy_position(scalar_to_ty(es), "shuffle", "rearrange", "element", "", xs_arg.span) {
+                    return err;
+                }
                 let Some((xid, _)) = self.place_local(xs_arg) else {
                     self.diags.error(
                         "'.shuffle()' needs a writable slice place (a `mut` local, or an `out` parameter)".to_string(),
@@ -39267,6 +39299,12 @@ impl<'a, 't> Checker<'a, 't> {
                         format!("'.sample()' element must be a primitive scalar (int/float/bool/char), got {}", scalar_name(es)),
                         xs_arg.span,
                     );
+                    return err;
+                }
+                // Same `slice<Move>` parameter domain as `shuffle`, and strictly worse: `sample`
+                // copies the drawn element values into a fresh owned `array<T>`, so a `string`
+                // element would be freed twice.
+                if self.reject_move_copy_position(scalar_to_ty(es), "sample", "draw", "element", "", xs_arg.span) {
                     return err;
                 }
                 let k = self.check_expr(k_arg, None); // sole width check below (single diagnostic).
@@ -49807,52 +49845,91 @@ fn exit_branch(flag: bool) -> i64 {
         );
     }
 
-    /// The output side of the same rule: a value the fused pipeline *buffers*, *collects*, or
-    /// *views* must be Copy too. The checked-HIR body validator has always required it
-    /// (`pipeline_callable_ok`'s `ty_copy_ok(output)`, `to_array`'s `ty_copy_ok(final_elem)`, and
-    /// `chunks`'s `scalar_copy_ok`); before this gate each of these three shapes passed `check`
-    /// and then failed `body_only_metadata_is_valid` at the MIR boundary as an internal error.
+    /// The copy-position side of the same rule: a value an operation *buffers*, *collects*,
+    /// *views*, *rearranges*, *draws*, or *writes* must be Copy too, because the checked-HIR body
+    /// validator refuses a Move value in each of those positions (`ty_copy_ok` / `scalar_copy_ok`).
+    ///
+    /// The axis is the **reachable `slice<Move>` parameter domain**: `slice<string>` is a
+    /// declarable and passable parameter type even though no expression can build such a value, so
+    /// "a Move element collection cannot be constructed" never proves a gate unreachable. Three of
+    /// these six rows (`shuffle`, `sample`, `map_into`) were live internal errors that argument had
+    /// dismissed.
+    ///
+    /// This owner pins the exact diagnostics. `align_mir`'s
+    /// `move_copy_positions_are_refused_by_the_producer_not_the_boundary` owns the stronger
+    /// property — that the *build* stops here and never reaches the MIR boundary.
     #[test]
-    fn pipeline_terminals_reject_move_values() {
-        // `Ord` admits owned `string`, but the fused sort buffers one key per element with no
-        // per-key drop — orderability alone is not enough.
-        let string_key =
-            "fn key(x: i64) -> string = \"k\".clone()\nfn main() -> i32 {\n  s := [3, 1, 2].sort_by_key(key)\n  return s[0] as i32\n}\n";
-        let (_p, d) = check(string_key);
-        assert!(
-            d.iter().any(|e| e.message.contains("'sort_by_key' cannot buffer a Move key")),
-            "an owned `string` key has no per-key drop in the fused sort"
-        );
+    fn move_copy_positions_are_rejected() {
+        // The type that makes the whole axis reachable: unbuildable as a value, legal as a type.
+        let param = "fn take(xs: slice<string>) -> i64 = xs.len()\nfn main() -> i32 = 0\n";
+        let (_p, d) = check(param);
+        assert!(!d.has_errors(), "a `slice<string>` parameter must stay declarable and passable");
 
-        // The reachable positive witness for the same row: a borrowed `str` key is orderable and
-        // Copy, so it keeps lowering.
-        let str_key =
-            "fn key(x: i64) -> str = \"k\"\nfn main() -> i32 {\n  s := [3, 1, 2].sort_by_key(key)\n  return s[0] as i32\n}\n";
-        let (_p, d) = check(str_key);
-        assert!(!d.has_errors(), "a borrowed `str` key stays orderable and Copy");
+        for (name, source, expected) in [
+            // `Ord` admits owned `string`, but the fused sort buffers one key per element with no
+            // per-key drop — orderability alone is not enough.
+            (
+                "sort_by_key key",
+                "fn key(x: i64) -> string = \"k\".clone()\nfn main() -> i32 {\n  s := [3, 1, 2].sort_by_key(key)\n  return s[0] as i32\n}\n",
+                "'sort_by_key' cannot buffer a Move key",
+            ),
+            // `to_array`'s Move-*struct* arm had a message; its scalar arm admitted any
+            // `ty_to_scalar`, owned `string` included.
+            (
+                "to_array element",
+                "fn f(xs: slice<string>) -> i64 = xs.to_array().len()\nfn main() -> i32 = 0\n",
+                "'to_array' cannot collect a Move element",
+            ),
+            // `chunks` asked only `scalar_to_prim`, which admits `String`.
+            (
+                "chunks element",
+                "fn f(xs: slice<string>) -> i64 = xs.chunks(2).len()\nfn main() -> i32 = 0\n",
+                "'chunks' cannot view a Move element",
+            ),
+            // Fisher-Yates swaps raw `{ptr,len}` headers through the slice.
+            (
+                "shuffle element",
+                "import std.rand\nfn scramble(out xs: slice<string>) {\n  mut r := rand.seed_with(1)\n  r.shuffle(xs)\n}\nfn main() -> i32 = 0\n",
+                "'shuffle' cannot rearrange a Move element",
+            ),
+            // `sample` copies the drawn values into a fresh owned `array<T>` — a double free.
+            (
+                "sample element",
+                "import std.rand\nfn pick(xs: slice<string>) -> i64 {\n  mut r := rand.seed_with(1)\n  s := r.sample(xs, 1)\n  return s.len()\n}\nfn main() -> i32 = 0\n",
+                "'sample' cannot draw a Move element",
+            ),
+            // `map_into` overwrites the destination's owned headers without dropping them.
+            (
+                "map_into element",
+                "fn fill(src: slice<string>, out dst: slice<string>) {\n  src.map_into(dst)\n}\nfn main() -> i32 = 0\n",
+                "'map_into' cannot write a Move element",
+            ),
+        ] {
+            let (_p, d) = check(source);
+            assert!(
+                d.iter().any(|e| e.message.contains(expected)),
+                "{name}: expected {expected:?}, got {:?}",
+                d.iter().map(|e| e.message.clone()).collect::<Vec<_>>()
+            );
+        }
 
-        // An owned `array<string>` (`array_builder<string>.build()`, `fs.read_dir`) is the one
-        // reachable Move `PrimScalar` collection. `to_array`'s Move-*struct* arm had a message but
-        // its scalar arm did not, and `chunks` asked only `scalar_to_prim`, which admits `string`.
-        let owned_string_array =
-            "  mut b: array_builder<string> := array_builder()\n  b.push(\"a\".clone())\n  built := b.build()\n";
-        let to_array = format!(
-            "fn main() -> Result<(), Error> {{\n{owned_string_array}  print(built.to_array().len())\n  return Ok(())\n}}\n"
-        );
-        let (_p, d) = check(&to_array);
-        assert!(
-            d.iter().any(|e| e.message.contains("'to_array' cannot collect a Move element")),
-            "to_array must reject a Move scalar element, not only a Move struct element"
-        );
-
-        let chunks = format!(
-            "fn main() -> Result<(), Error> {{\n{owned_string_array}  print(built.chunks(2).len())\n  return Ok(())\n}}\n"
-        );
-        let (_p, d) = check(&chunks);
-        assert!(
-            d.iter().any(|e| e.message.contains("'chunks' cannot view a Move element")),
-            "chunks must not view Move elements the source still owns"
-        );
+        // Over-rejecting would take the whole surface away: a borrowed `str` key is orderable and
+        // Copy, and every Copy element still passes each gate.
+        for (name, source) in [
+            ("str key", "fn key(x: i64) -> str = \"k\"\nfn main() -> i32 {\n  s := [3, 1, 2].sort_by_key(key)\n  return s[0] as i32\n}\n"),
+            ("copy to_array", "fn f(xs: slice<i64>) -> i64 = xs.to_array().len()\nfn main() -> i32 = 0\n"),
+            ("copy chunks", "fn f(xs: slice<i64>) -> i64 = xs.chunks(2).len()\nfn main() -> i32 = 0\n"),
+            ("copy shuffle", "import std.rand\nfn scramble(out xs: slice<i64>) {\n  mut r := rand.seed_with(1)\n  r.shuffle(xs)\n}\nfn main() -> i32 = 0\n"),
+            ("copy sample", "import std.rand\nfn pick(xs: slice<i64>) -> i64 {\n  mut r := rand.seed_with(1)\n  s := r.sample(xs, 1)\n  return s.len()\n}\nfn main() -> i32 = 0\n"),
+            ("copy map_into", "fn fill(src: slice<i64>, out dst: slice<i64>) {\n  src.map_into(dst)\n}\nfn main() -> i32 = 0\n"),
+        ] {
+            let (_p, d) = check(source);
+            assert!(
+                !d.has_errors(),
+                "{name}: a Copy value must still be accepted, got {:?}",
+                d.iter().map(|e| e.message.clone()).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

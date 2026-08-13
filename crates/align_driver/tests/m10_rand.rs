@@ -314,3 +314,46 @@ pub fn main() -> i32 {
 ";
     assert!(check_errs("m10-rand-parmap", src), "an rng-using (impure) closure must be rejected by par_map");
 }
+
+/// `shuffle` and `sample` gated their element on `scalar_to_prim`, which admits the one Move
+/// `PrimScalar`, owned `string`. A `slice<string>` is a declarable and passable parameter type
+/// (`struct_index::a_move_element_slice_type_is_still_declarable_and_passable`) even though no
+/// expression can build such a value, so both were reachable internal errors after a clean
+/// `check`: Fisher-Yates swaps raw `{ptr,len}` headers, and `sample` copies the drawn values into
+/// a fresh owned `array<T>` — the double free `scalar_copy_ok` exists to prevent.
+#[test]
+fn move_element_slices_are_rejected_by_shuffle_and_sample() {
+    for (label, src, expected) in [
+        (
+            "shuffle",
+            "\
+import std.rand
+fn scramble(out xs: slice<string>) {
+  mut r := rand.seed_with(1)
+  r.shuffle(xs)
+}
+pub fn main() -> i32 = 0
+",
+            "'shuffle' cannot rearrange a Move element",
+        ),
+        (
+            "sample",
+            "\
+import std.rand
+fn pick(xs: slice<string>) -> i64 {
+  mut r := rand.seed_with(1)
+  s := r.sample(xs, 1)
+  return s.len()
+}
+pub fn main() -> i32 = 0
+",
+            "'sample' cannot draw a Move element",
+        ),
+    ] {
+        let diagnostics = check_diagnostics(&format!("m10-rand-move-{label}"), src);
+        assert!(
+            diagnostics.contains(expected),
+            "a Move element must be diagnosed ({label}):\n{diagnostics}",
+        );
+    }
+}

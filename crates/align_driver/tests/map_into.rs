@@ -155,3 +155,18 @@ fn map_into_element_type_mismatch_rejected() {
     let src = "fn dbl(x: i64) -> i64 = x * 2\nfn f(src: slice<i64>, out b: slice<i32>) {\n  src.map(dbl).map_into(b)\n}\nfn main() -> i32 = 0\n";
     assert!(check_errs("mi-elem-mismatch", src));
 }
+
+/// Both `src` and `dst` can be `slice<string>` parameters — a declarable, passable type no
+/// expression can build — so `map_into`'s element rule cannot lean on "a Move collection is
+/// unbuildable". Writing into `dst` would overwrite owned `{ptr,len}` headers without dropping
+/// them and copy the source's, which the MIR boundary's `scalar_copy_ok` refuses; before this gate
+/// the shape passed `check` and died there as an internal error.
+#[test]
+fn map_into_move_element_rejected() {
+    let src = "fn fill(src: slice<string>, out dst: slice<string>) {\n  src.map_into(dst)\n}\nfn main() -> i32 = 0\n";
+    let diagnostics = check_diagnostics("mi-move-elem", src);
+    assert!(
+        diagnostics.contains("'map_into' cannot write a Move element"),
+        "a Move element must be diagnosed:\n{diagnostics}",
+    );
+}

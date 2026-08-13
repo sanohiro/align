@@ -67,6 +67,11 @@ fn sort_by_key_non_orderable_key_rejected() {
 /// the fused sort buffers one key per element and has no per-key drop. Sema stopped at
 /// orderability, so a `string` key passed `check` and then failed HIR validation at the MIR
 /// boundary as an internal error instead of being diagnosed.
+///
+/// This owns the wording for both key-function spellings; `align_mir`'s
+/// `move_copy_positions_are_refused_by_the_producer_not_the_boundary` owns the property that the
+/// build stops here (a `check`-only assertion about the boundary would be vacuously true, since
+/// `check` never runs it).
 #[test]
 fn sort_by_key_move_key_rejected() {
     for (label, src) in [
@@ -84,9 +89,11 @@ fn sort_by_key_move_key_rejected() {
             diagnostics.contains("'sort_by_key' cannot buffer a Move key"),
             "an owned `string` key must be diagnosed ({label}):\n{diagnostics}",
         );
+        // The key function's return type is the user's to choose, so this row — unlike the element
+        // rows — can name a workaround that actually exists.
         assert!(
-            !diagnostics.contains("failed HIR validation"),
-            "it must be a diagnostic, not an internal error ({label}):\n{diagnostics}",
+            diagnostics.contains("return a Copy key (int/float/char) or a borrowed `str`"),
+            "the diagnostic must point at the real workaround ({label}):\n{diagnostics}",
         );
     }
 }
