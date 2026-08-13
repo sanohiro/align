@@ -3926,6 +3926,27 @@ exact native-idle/transaction-state proofを行う。`exec.Conn`はnative idle�
 errorを返し、resource/affected-row successをpublishしない。このcheckはSQLを発行せず、dynamic callが
 callerの代わりにtransactionをbegin/commit/rollback/repairすることはない。
 
+packageがownしないsession stateはvisible dynamic statementの意図的なeffectとして残り、pool connection
+ではpool ledgerどおりphysical slotへ付随する。ただし次の2つのpackage-owned connection invariantは
+dynamic escape hatchをまたいでdriftしてはならない。
+
+- native statement workへ到達したSQLite prepare/advance/finalize sequenceの後、
+  `dynamic_execute`、`dynamic_rows` constructor、各`dynamic_next`、live Dropはpublicationまたはlease
+  release前にconnection recordのtracked busy timeoutをexactly once reapplyする。prepare/advance中に
+  effectを開始するPRAGMAも含む。restore failureはpoison/closeし、earlier owned errorをprimaryに保持、
+  earlier errorがなければoperationのexact synchronized-cleanup errorを使う。pre-lease/package-validation
+  failureはbusy handlerに触れない。
+- ordinary known-status PostgreSQL execution/recovery drainの後、result metadata/value access、success、
+  stream publication、connection reuseの前に`PQclientEncoding(connection) == PG_UTF8`をrequireする。
+  mismatchまたは`-1`はowned ordinary resultをclearしてpoison/closeし、earlier errorを保持、なければ
+  operationのexact cleanup errorを返す。repairのためのSQLや`PQsetClientEncoding`は使わない。
+  COPY/pipeline/unknown statusはstronger immediate-close ruleを保持し、classification後にencoding probeを
+  行わない。
+
+他のsuccessful session-global changeはsanitize/resetしない。この区別によりpoolのexplicit
+session-state contractを保ちながら、全typed/metadata pathが依存するUTF-8/tracked-timeout invariantを
+次operationのlease acquisition前に回復する。
+
 common parameter maximumはexact 65,535。SQL+C sentinel、SQLite value lengthはsigned native
 `int`に収まり、PostgreSQLはA1 binary ledgerのParse/Bind formulaをempty statement name `S=1`、
 count `N`、wire SQL C-string bytes `Q = sql.len() + 1`、exact payload lengthで再利用する。
@@ -3950,7 +3971,8 @@ validation/error precedence:
 6. increasing-index SQLite float NaN/PostgreSQL text NUL/pointer-length/protocol budget;
 7. setup scratch allocation。SQLiteはone prepare後にnonempty/tail/largest parameter index/kindを
    validateしてincreasing ordinalでbindし、PostgreSQLはonce sendする;
-8. native result classification、全PostgreSQL column OID/format、valid stream publicationまたは
+8. native result classification、status-appropriate package-owned session-invariant proof、全PostgreSQL
+   column OID/format、target transaction-state proof、valid stream publicationまたは
    `dynamic_execute` success前のnative cleanup。
 
 phase 3内はrepresentable SQL length→U+0000→parameter count。phase 4は各timeout payload validityが
@@ -3958,7 +3980,10 @@ duplicate registrationより先で、complete slice valid後にSQLite unavailabi
 parameterのtag/driver-specific scalar/view validityを次parameterより先にcheckし、全individual measure後に
 aggregate Parse/Bind budget。phase 7 SQLiteはnonempty→tail→parameter count→requested result kindの順で
 first bind前にcheckし、その後first native bind errorがordinal順に勝つ。PostgreSQLはstatus
-classification→result kind、complete column metadata→row count/value accessの順である。
+classification→UTF-8 client-encoding proofの順で、COPY/pipeline/unknownはproofなしでcloseし、ordinary
+statusはresult kind classification前にUTF-8をproveする。その後complete column metadata→row
+count/value access。SQLite busy-timeout reapplicationはearlier prepare/bind/step errorをprimaryに保持する
+cleanupで、otherwise-valid pathではreapplicationとtransaction-state proofがpublication/lease releaseに先行する。
 
 first failing cellが勝ち、losing cellはworkしない。parameter measureまでのpackage-detectable errorは
 SQL prepare/send/step前。SQLite prepareはnative workだがstatement bodyをexecuteせず、bind failureも
@@ -3992,6 +4017,11 @@ new query-less exact errors:
 | successful execute cleanup failure | `Unsupported`, item `db.dynamic.execute.cleanup`, message `dynamic database execution cleanup failed and the connection was closed` |
 | successful next cleanup failure | `Unsupported`, item `db.dynamic.rows.cleanup`, message `dynamic database rows cleanup failed and the connection was closed` |
 
+earlier errorがないsession-invariant/transaction-state failureでは、`dynamic_execute`は
+`db.dynamic.execute.cleanup`、`dynamic_rows` constructorと`dynamic_next`は`db.dynamic.rows.cleanup`を使う。
+Dropはsilent。earlier owned errorがあればそれをprimaryに保ち、invariant failureはcleanupをpoison/closeへ
+変えるだけである。
+
 lease overlapはshipped driver-specific `Unsupported(ContractError { query_id: None })`を保持する。
 SQLiteはitem `sqlite.connection.active_execution`、message
 `SQLite connection already has an active execution`。PostgreSQLはitem
@@ -4007,8 +4037,11 @@ driver-native error分類/fieldsも既存どおり。PostgreSQL COPY/pipeline/un
 once clearしてimmediate poison/closeし、後続result/COPY/pipeline-exit/cancel/transaction probe/
 blocking restoreを呼ばない。ordinary statusはonce clearしexisting synchronization proof後だけreuseする。
 
-`dynamic_execute`はnon-row completionだけをacceptし、SQLiteは
-`Some(sqlite3_changes64)`、PostgreSQLはexisting `PQcmdTuples` Some/None contractを返す。
+`dynamic_execute`はnon-row completionだけをacceptする。SQLiteは常に
+`rows_affected = None`を返す。dynamic surfaceにはtrusted statement-class evidenceがなく、
+`sqlite3_changes64`はDDL、transaction control、他のnon-DML statement後にもprior DML countをretainする
+ため、そのconnection-global valueをcurrent statementへ推測して帰属させない。PostgreSQLはlibpq textが
+current resultに付随するためexisting `PQcmdTuples` Some/None contractを返す。
 `dynamic_rows`はSELECTまたはDML `RETURNING`を含むrow-producing completionだけをacceptし、valid
 zero/many-row PostgreSQL tuple statusとzero/many columnをadmitする。SQLiteはdistinct tuple statusを
 持たないため`sqlite3_column_count > 0`だけをrow-producingとする。両driverはnative row/column ordinalを
@@ -4037,11 +4070,15 @@ cross/outliveしない。shared producer Drop hookはlive native ownerをsilent 
 leaseをreleaseし、reuse proof failureならpoison/closeしてwrapperをonce freeする。terminal Dropはwrapper
 だけをfreeする。public raw constructor/accessor/manual close/count/rewind/clone/Send conversionはない。
 
-`dynamic_next`はmalformed headerをembedded pointer follow/driver call前にrejectする。malformed Dropは
-silentで、outer wrapperだけをfreeしembedded load/native callを行わず、parent connectionのactive leaseを
-fail-closedに残すためlater operationはreuseできない。final conn/tx Dropがphysical ownerをclose/retireする。
-このunsafe-corruption pathはparent teardownまでunreachable native handleをretainし得るが、double-free、
-early lease release、unauthenticated driver tag dispatchはできない。
+`dynamic_next`はdetect可能なscalar/tag/reserved/null-product header corruptionをembedded pointer
+follow/driver call前にrejectする。そのdetect可能classのmalformed Dropはsilentで、outer wrapperだけを
+freeしembedded load/native callを行わず、parent connectionのactive leaseをfail-closedに残すためlater
+operationはreuseできない。final conn/tx Dropがphysical ownerをclose/retireする。shipped conn/pool
+recordと同じく、non-null native/connection-state pointerのprovenance/validityはprivileged unsafe
+producerのobligationである。safe sourceはpointerをsubstituteできず、arbitrary non-null pointer forgeryは
+48-byte recordがauthenticateすると約束する対象ではなくsafe contract外である。detect可能な
+corruption pathはparent teardownまでunreachable native handleをretainし得るが、double-free、early lease
+release、unauthenticated driver tag dispatchはできない。
 
 PostgreSQL constructorはstatement completionと全column OID/format validation後にresourceをpublishする。
 zero-row resultはclear/releaseしてcanonical exhausted stateでpublishし、nonemptyはfinal-row publication、
@@ -4081,12 +4118,21 @@ implementation closure matrix:
 | public formation/identity | exact 4 nominal type/3 fn。Copy/RegionPlain value、one region-backed Move row array、exhaustive match、return-region/resource Drop identity、whole/per-unit equality。alias/name lookup/eager materializer/prepared/native/reflection/manual closeなし。 | exact source/signature/interface byte+hash golden、direct/imported construct/match、bare-slice payload rejection、escape negative、export/forbidden inventory |
 | phase/common validation | above 8 phasesとexact query-less errors。target→driver→SQL/count/options、overlap→payload。package-detectable parameter failureはprepare/send/step/output allocation zero。 | pairwise multi-invalid/native/lease/allocation counter、NUL/length/count boundary、timeout matrix、first invalid parameter ordinal |
 | parameter/bytes/lifetime | every variantをindex順にexact mapping。Null、native placeholder、non-null empty sentinel、SQLite transient/NaN rejection、PostgreSQL binary vector/NUL/Parse-Bind budget。publication前scratch free、input provenanceなし。 | variant/Null/empty/NUL/high-byte/extrema/signed-zero/infinity/NaN x driver、bidirectional byte golden、count/placeholder/budget boundary、source mutation/Drop |
-| SQLite construction/advance | lease、one prepare/tail/largest index/pre-step kind、bind後no-step publication。nextはat most one rowをstep/map/materializeしEOF/error/Dropでfinalize/release。executeはcompletion/changes/cleanup once。 | fake call/failpoint、mixed class、empty/null pointer-length、0/1/many row/column、command/query/RETURNING、unadvanced/early Drop、live SQLite |
-| PostgreSQL construction/advance | one parameterized binary execution、publication前all-column metadata、one complete PGresult、callごとone ordinal row。existing timeout/status/sync/fail-close、final-row publish前clear/release。 | OID/format/NULL/payload matrix、all statuses+unknown、0/1/many row/column、command/query/RETURNING、Conn/Tx timeout、final-row cleanup、required live PG |
-| resource ABI/move/cleanup | exact 48-byte v1 product、embedded load前complete validation、target dependency、local/return/if/match/else/?/map_err/loop move、canonical terminal、live/terminal/malformed Dropのno-double-cleanup。 | bidirectional state golden、all field/tag/reserved/pointer/count mutation、Move/drop flag、direct/pool parent generation、whole/per-unit Drop linkage、alloc balance |
+| SQLite construction/advance | lease、one prepare/tail/largest index/pre-step kind、bind後no-step publication。nextはat most one rowをstep/map/materializeしEOF/error/Dropでfinalize/release。executeはcompletion後`rows_affected = None`。全native-statement boundaryでpublication/release前にtracked busy timeoutをreapplyする。 | fake call/failpoint、mixed class、empty/null pointer-length、0/1/many row/column、DML/DDL/transaction/PRAGMA countが全て`None`、command/query/RETURNING、prepare/step/finalize busy-timeout mutation/restore failure、unadvanced/early Drop、live SQLite |
+| PostgreSQL construction/advance | one parameterized binary execution、publication前package-owned UTF-8 client-encoding invariantとall-column metadataをvalidate、one complete PGresult、callごとone ordinal row。existing timeout/status/sync/fail-close、final-row publish前clear/release。 | OID/format/NULL/payload matrix、all statuses+unknown、0/1/many row/column、command/query/RETURNING、`SET client_encoding`/`set_config`とencoding mismatch/-1のfirst-error/no-probe-after-fail-close counter、Conn/Tx timeout、final-row cleanup、required live PG |
+| resource ABI/move/cleanup | exact 48-byte v1 product、embedded load前complete scalar/tag/reserved/null-product validation、non-null embedded-pointer provenanceをprivileged unsafe producer obligationとし、target dependency、local/return/if/match/else/?/map_err/loop move、canonical terminal、live/terminal/detectably-malformed Dropのno-double-cleanup。 | bidirectional state golden、all scalar/tag/reserved/null-product mutationのno-call、explicit unsafe-producer pointer-provenance boundary、Move/drop flag、direct/pool parent generation、whole/per-unit Drop linkage、alloc balance |
 | per-row region materialization | current rowだけone `array<value>`、nonempty view one copy、empty/Null/order、native/input viewなし、exhausted/failed allocation zero。SQLite prefetch/all-rows containerなし。 | row size 0/1/many/chunk boundary、region copy/compact counter、prior-row survival、escape/post-cleanup read、forbidden all-rows inventory |
-| failure/effects/sync | every validation/native/decode/address/cleanup failpointでcurrent rowなし、prior row/first error保持、unpublished cleanup、once clear/finalize、failed transition、release/poison once、hidden rollbackなし。全publication/reuse boundary前にexact native transaction-state proof。 | Execute/Rows/Next x Conn/Tx/direct/pool failpoint、first-error pair、raw BEGIN/COMMIT/ROLLBACK mismatch/retirement、effect/reuse、repeated failed advance、no-call-after-close |
+| failure/effects/sync | every validation/native/decode/address/session-invariant/cleanup failpointでcurrent rowなし、prior row/first error保持、unpublished cleanup、once clear/finalize、failed transition、release/poison once、hidden rollbackなし。全publication/reuse boundary前にpackage-owned busy-timeout/client-encoding checkとexact native transaction-state proof。 | Execute/Rows/Next x Conn/Tx/direct/pool failpoint、first-error pair、raw BEGIN/COMMIT/ROLLBACK mismatch/retirement、SQLite busy-timeout PRAGMA x prepare/step/finalize/Drop restore、PostgreSQL encoding drift x ordinary/fail-close/status/error path、effect/reuse、repeated failed advance、no-call-after-close |
 | product/build/measurement | typed descriptor/artifact unchanged、normal toolingからdynamic callなし、both driver whole/per-unit link、local DB gate。correctness後にzero/empty/nonempty、one/many rowのscratch/native owner/region copy/compact/peak bytes/time-to-first/full scanをsemantic thresholdなしでrecord。 | artifact golden、whole/per-unit run、A2+Q2/Q4b/A1 regressions、required CI、non-gating `bench/pkg_db_dynamic` record |
+
+`6bd6fbb`のfresh independent adversarial design reviewはP1を2件、P2を1件検出した。
+implementation前にcomplete finding setをledger-firstで閉じる:
+
+| Finding | Ledger-first closure | Required owner |
+|---|---|---|
+| transaction stateがvalidに見えるままdynamic SQLがpackage-owned session stateを変更できる | 各dynamic native-statement boundaryでSQLite tracked busy timeoutをreapplyし、PostgreSQLは`PQclientEncoding`が`PG_UTF8`でなければfail-closeする。package-ownedでないsession effectはexplicitに保持する。 | SQLite prepare/step/finalize/Drop busy-timeout mutation/failure、PostgreSQL `SET`/`set_config` encoding drift x success/error/status/timeoutのfirst-error/no-call-after-close counter |
+| wrapperがunauthenticated non-null embedded pointerまでsafeと約束していた | shipped conn/pool boundaryと揃え、scalar/tag/reserved/null productをvalidateし、non-null pointer provenanceはexplicit privileged unsafe-producer obligationとする。impossibleなarbitrary-pointer-mutation promiseは削除する。 | scalar/tag/reserved/null-product byte corruptionとsafe sourceがembedded pointerをforgeできないsource/API inventory |
+| SQLite non-DML statementがprior `sqlite3_changes64`をexposeできる | 全SQLite dynamic commandは`rows_affected = None`。current-result-owned `PQcmdTuples`を持つPostgreSQLだけcountを返す。 | prior DML後のzero/nonzero DML、DDL、transaction control、non-row PRAGMAは全SQLite `None`、retained PostgreSQL count matrix |
 
 implementationはshipped Q4b lease/stream/timeout cleanup、A1 binary-format/result-status closure、
 D12 native-consumer lease closure、D13 pool provenanceをrequireする。callback capabilityはconsumeせず、
@@ -4292,10 +4338,13 @@ execution-count付きで実証する。
 101. validationはtarget、driver、SQL、option、lease、parameter、native、resultのexact順。
      SQL U+0000とpackage-detectable parameter failureはsend前で、1 operationはnative statementを
      at most once invokeする。全publication/reuse boundaryでnative transaction stateがexplicit
-     Conn/Tx targetとmatchすることもproveし、mismatchはpoison/closeする。
+     Conn/Tx targetとmatchすることをproveし、SQLite tracked busy timeoutをreapplyし、PostgreSQL
+     UTF-8 client encodingをretainする。failureはpoison/closeする。SQLite dynamic commandは常に
+     `rows_affected = None`、PostgreSQLはcurrent resultの`PQcmdTuples`だけを使う。
 102. `dynamic_rows`はexact dependent 48-byte stream stateだけをpublishし、各`dynamic_next`がone ordered
      `array<value>`をexplicit regionへcopyする。empty/NULLを区別し、input/native viewをretainせず、
-     SQLite prefetch/all-rows allocationを行わない。
+     SQLite prefetch/all-rows allocationを行わない。scalar/tag/reserved/null-product fieldはfail closed、
+     non-null embedded-pointer provenanceはsafe sourceからforge不能なprivileged unsafe producer obligation。
 103. failureはcurrent rowをpublishせずprior rowとfirst owned errorを保ち、native cleanup/syncまたは
      poison、lease release、failed transitionをonce行い、arena rewind/hidden rollback SQLはない。
 104. dynamic SQLはstatic Query descriptor/artifact/cache identity、compiler builtin、runtime

@@ -30,7 +30,13 @@ OID set and binary payloads, rejects unknown types, and requires an explicit SQL
 untyped NULL or wider native type needs one. Both operations execute at most one native statement,
 reject SQL U+0000 before native work, preserve the existing lease/timeout/status/transaction
 cleanup rules, and publish no partial current row. SQLite rejects NaN inputs instead of silently
-accepting the engine's NaN-to-NULL conversion. This settles only the minimal common dynamic rail;
+accepting the engine's NaN-to-NULL conversion and reports no dynamic affected-row count because
+`sqlite3_changes64` is not current-statement evidence for non-DML SQL. Dynamic execution reapplies
+SQLite's package-tracked busy timeout and fail-closes PostgreSQL if its package-owned UTF-8 client
+encoding has drifted before publication or reuse; other visible session-global effects persist.
+The private stream validates scalar/tag/reserved/null products, while non-null native/state pointer
+provenance remains the privileged unsafe producer's obligation. This settles only the minimal
+common dynamic rail;
 decimal/temporal/UUID/JSON/array/range/domain mappings and all native callback surfaces remain
 separate consumer decisions.
 

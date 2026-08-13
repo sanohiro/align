@@ -5564,6 +5564,28 @@ synchronized-cleanup error when there is no earlier error; it never publishes a 
 affected-row success. This check issues no SQL and a dynamic call never begins, commits, rolls back,
 or repairs a transaction on the caller's behalf.
 
+Non-package-owned session state remains an intentional effect of the visible dynamic statement and,
+for a pooled connection, follows its physical slot as specified in the pool ledger. Two
+package-owned connection invariants are different and may never drift across this escape hatch:
+
+- After any SQLite prepare/advance/finalize sequence that reached native statement work,
+  `dynamic_execute`, the `dynamic_rows` constructor, every `dynamic_next`, and live Drop reapply the
+  connection record's tracked busy timeout exactly once before publication or lease release. This
+  also covers PRAGMAs whose effects begin during prepare or advancement. A restore failure
+  poisons/closes; an earlier owned error stays primary, otherwise the operation uses its exact
+  synchronized-cleanup error. No pre-lease/package-validation failure touches the busy handler.
+- After every ordinary known-status PostgreSQL execution or recovery drain, and before result
+  metadata/value access, success, stream publication, or connection reuse, the package requires
+  `PQclientEncoding(connection) == PG_UTF8`. A mismatch or `-1` clears the owned ordinary result,
+  poisons/closes, and preserves an earlier error or returns the operation's exact cleanup error.
+  The package never issues SQL or calls `PQsetClientEncoding` to repair it. COPY, pipeline, and
+  unknown statuses keep their stronger immediate-close rule and therefore perform no encoding
+  probe after classification.
+
+Other successful session-global changes are not sanitized or reset. This distinction preserves
+the pool's explicit session-state contract while keeping the UTF-8 and tracked-timeout assumptions
+used by every typed and metadata path true before another operation can acquire the lease.
+
 The common parameter maximum is exactly 65,535. SQL plus its out-of-domain C sentinel and every
 SQLite parameter byte length must fit signed native `int`; PostgreSQL reuses the A1 binary ledger's
 checked Parse and Bind formulas with the empty statement-name size `S=1`, parameter count `N`,
@@ -5592,8 +5614,9 @@ Validation and observable error precedence are exact:
    NUL, pointer/length products, and aggregate protocol budgets;
 7. allocate setup scratch; SQLite prepares once, validates nonempty/tail/largest parameter index
    and result kind, then binds increasing ordinals, while PostgreSQL sends once; and
-8. classify the native result, validate every PostgreSQL column's OID/format, and either publish a
-   valid `dynamic_rows` resource or complete native cleanup before publishing
+8. classify the native result, apply the status-appropriate package-owned session-invariant proof,
+   validate every PostgreSQL column's OID/format, prove the target's transaction state, and either
+   publish a valid `dynamic_rows` resource or complete native cleanup before publishing
    `dynamic_execute` success.
 
 Within phase 3, the representable SQL-length check precedes the U+0000 scan, and U+0000 precedes
@@ -5603,7 +5626,11 @@ parameter's tag and driver-specific scalar/view validity precede the next parame
 aggregate Parse/Bind budget follows all individual measurements. Within phase 7, SQLite checks
 nonempty statement, tail, parameter count, and requested result kind in that order before the
 first bind; then the first native bind error wins by ordinal. PostgreSQL status classification
-precedes result-kind classification, and complete column metadata precedes row count/value access.
+precedes its UTF-8 client-encoding proof; COPY/pipeline/unknown closes without that proof, while an
+ordinary status proves UTF-8 before result-kind classification. Complete column metadata then
+precedes row count/value access. SQLite preserves any earlier prepare/bind/step error while its
+busy-timeout reapplication runs as cleanup; on an otherwise valid path, reapplication and the
+transaction-state proof both precede publication or lease release.
 
 The first failing cell wins, later cells perform no work, and this order also governs every
 multi-invalid input. All package-detectable errors through parameter measurement occur before SQL
@@ -5642,6 +5669,11 @@ The new query-less contract errors are exact:
 | successful execution cannot complete cleanup | `Unsupported(ContractError { query_id: None, item: "db.dynamic.execute.cleanup", message: "dynamic database execution cleanup failed and the connection was closed" })` |
 | successful row advance cannot complete cleanup | `Unsupported(ContractError { query_id: None, item: "db.dynamic.rows.cleanup", message: "dynamic database rows cleanup failed and the connection was closed" })` |
 
+With no earlier error, a session-invariant or transaction-state failure from `dynamic_execute`
+uses `db.dynamic.execute.cleanup`; the `dynamic_rows` constructor and `dynamic_next` use
+`db.dynamic.rows.cleanup`. Drop is silent. With an earlier owned error, that error remains primary
+and the same invariant failure only changes cleanup to poison/close.
+
 Lease overlap retains the shipped driver-specific `Unsupported(ContractError { query_id: None })`:
 SQLite uses item `sqlite.connection.active_execution` and message
 `SQLite connection already has an active execution`; PostgreSQL uses item
@@ -5662,9 +5694,13 @@ pipeline-exit, cancel, transaction-state, or blocking-restore call. Ordinary kno
 once and return the connection only after the existing synchronization proof.
 
 `dynamic_execute` requires a non-row native completion. SQLite returns
-`exec_result.rows_affected = Some(sqlite3_changes64(database))`; PostgreSQL parses
-`PQcmdTuples` into the same existing `Some(count)`/`None` contract. A row-producing completion
-returns the exact wrong-kind error and publishes no result. `dynamic_rows` requires a row-producing
+`exec_result.rows_affected = None`: the dynamic surface has no trusted statement-class evidence,
+and `sqlite3_changes64` retains a prior DML count after DDL, transaction control, and other
+non-DML statements. It must therefore not guess whether that connection-global value belongs to
+the current statement. PostgreSQL parses `PQcmdTuples` into the existing
+`Some(count)`/`None` contract because libpq associates that text with the current result. A
+row-producing completion returns the exact wrong-kind error and publishes no result.
+`dynamic_rows` requires a row-producing
 completion, including `SELECT` or DML with `RETURNING`; a command completion returns its exact
 wrong-kind error. PostgreSQL tuple status is authoritative and may validly contain zero rows or
 zero columns. SQLite has no distinct tuple status, so a prepared statement is row-producing only
@@ -5695,12 +5731,16 @@ releases the lease only after cleanup, poisons/closes when cleanup cannot prove 
 wrapper exactly once. A terminal Drop only frees the wrapper. No public raw constructor, accessor,
 manual close, row count, column count, rewind, clone, or Send conversion exists.
 
-`dynamic_next` rejects a malformed header without following an embedded pointer or calling a
-driver. Malformed Drop is silent: it frees only the outer wrapper, performs no embedded load or
-native call, and leaves the parent connection's active lease fail-closed so no later operation can
-reuse it; final conn/tx Drop closes or retires that physical owner. This unsafe-corruption path may
-retain an unreachable native handle until parent teardown, but cannot double-free it, release the
-lease early, or dispatch through an unauthenticated driver tag.
+`dynamic_next` rejects a detectably malformed scalar/tag/reserved/null-product header without
+following an embedded pointer or calling a driver. Malformed Drop is silent: for that detectable
+class it frees only the outer wrapper, performs no embedded load or native call, and leaves the
+parent connection's active lease fail-closed so no later operation can reuse it; final conn/tx Drop
+closes or retires that physical owner. As with the shipped conn/pool records, the provenance and
+validity of a non-null native or connection-state pointer is the privileged unsafe producer's
+obligation. Safe source cannot substitute either pointer, and arbitrary non-null pointer forgery is
+outside the safe contract rather than something the 48-byte record claims to authenticate. The
+detectable corruption path may retain an unreachable native handle until parent teardown, but
+cannot double-free it, release the lease early, or dispatch through an unauthenticated driver tag.
 
 For PostgreSQL, construction has already completed the statement and validated every column's
 OID/format before publishing the resource. A zero-row result is cleared and published in canonical
@@ -5749,12 +5789,21 @@ The implementation closure matrix is:
 | public formation and identity | Export exactly four nominal types and three functions. Preserve `value` as Copy/RegionPlain, `row.values` as one region-backed Move array, exhaustive matching, exact return-region provenance, the nominal resource/Drop identity, and whole/per-unit interface equality. Export no alias, name lookup, eager materializer, prepared/native option form, reflection hook, or manual close. | exact source/signature and interface-byte/hash golden; direct/imported construction and exhaustive match; `byte_view` necessity and bare-slice-payload rejection; row/view escape negatives; exported/forbidden inventory |
 | phase order and common validation | Implement the eight phases and query-less errors above. Target precedes explicit driver, SQL length/NUL/count precedes options, overlap precedes payload validation, and every package-detectable parameter failure has zero prepare/send/step/output allocation. | pairwise multi-invalid matrix with native/lease/allocation counters; NUL and signed-length/count boundaries; timeout absent/invalid/duplicate/SQLite-unavailable; first failing parameter ordinal |
 | parameter mapping, bytes, and lifetime | Bind every variant in increasing index with the exact table, Null inference, native placeholders, non-null empty sentinel, SQLite transient copies/NaN rejection, PostgreSQL binary OID/format vectors, text-NUL rule, and checked Parse/Bind budgets. Free all setup scratch before return/publication and retain no input provenance. | every variant plus Null/empty/NUL/high-byte/extrema/signed-zero/infinity/NaN x driver; independent encode/decode byte goldens; count 0/1/65535/65536; repeated/sparse SQLite placeholders; PostgreSQL placeholder mismatch; accepted budget edge/rejected next byte; source mutation/Drop after constructor |
-| SQLite construction and advancement | Acquire the shipped lease; prepare one statement/tail, validate largest parameter index and kind, bind once, and publish without stepping. `dynamic_next` steps at most one row, maps each runtime storage class independently, materializes one row, and finalizes/releases on EOF/error/Drop. `dynamic_execute` steps to completion, reads changes, finalizes, and releases once. | fake native call/order/failpoint matrix; mixed classes across rows; empty and null pointer/length cases; zero/one/many rows/columns; command/query/RETURNING; unadvanced Drop/no-effect; early Drop; live SQLite cases |
-| PostgreSQL construction and advancement | Use one parameterized binary execution, validate every column OID/format before publication, retain one complete `PGresult`, and decode one ordinal row per call. Reuse timeout/cancel/status/transaction synchronization and fail-closed COPY/pipeline/unknown behavior; clear/release before final-row publication. | OID x format x NULL/payload width/value matrix; all known statuses plus unknown; zero/one/many rows and zero/one/many columns; command/query/RETURNING; Timeout Conn/Tx; final-row cleanup; live PostgreSQL 16.4 with client >=17 |
-| resource ABI, move, and cleanup | Form only the exact 48-byte v1 products; validate the complete header before embedded loads; construct with the target dependency; preserve it across local/return/if/match/else/`?`/`map_err`/loop joins; canonicalize terminal state; and Drop live/terminal/malformed siblings without double clear/finalize/free or premature parent release. | semantic-to-byte/byte-to-semantic state goldens; every field/tag/reserved/pointer/count mutation; Move/control-flow/drop-flag owners; conn/tx and direct/pool parent generation; whole/per-unit Drop-thunk linkage; allocation balance |
+| SQLite construction and advancement | Acquire the shipped lease; prepare one statement/tail, validate largest parameter index and kind, bind once, and publish without stepping. `dynamic_next` steps at most one row, maps each runtime storage class independently, materializes one row, and finalizes/releases on EOF/error/Drop. `dynamic_execute` steps to completion and returns `rows_affected = None`; every native-statement boundary reapplies the tracked busy timeout before publication/release. | fake native call/order/failpoint matrix; mixed classes across rows; empty and null pointer/length cases; zero/one/many rows/columns; DML/DDL/transaction/PRAGMA command counts all `None`; command/query/RETURNING; prepare/step/finalize busy-timeout mutation and restore failure; unadvanced Drop/no-effect; early Drop; live SQLite cases |
+| PostgreSQL construction and advancement | Use one parameterized binary execution, validate the package-owned UTF-8 client-encoding invariant and every column OID/format before publication, retain one complete `PGresult`, and decode one ordinal row per call. Reuse timeout/cancel/status/transaction synchronization and fail-closed COPY/pipeline/unknown behavior; clear/release before final-row publication. | OID x format x NULL/payload width/value matrix; all known statuses plus unknown; zero/one/many rows and zero/one/many columns; command/query/RETURNING; `SET client_encoding`/`set_config` and `PQclientEncoding` mismatch/-1 with first-error and no-probe-after-fail-close counters; Timeout Conn/Tx; final-row cleanup; live PostgreSQL 16.4 with client >=17 |
+| resource ABI, move, and cleanup | Form only the exact 48-byte v1 products; validate the complete scalar/tag/reserved/null-product header before embedded loads; treat non-null embedded-pointer provenance as the privileged unsafe producer's obligation; construct with the target dependency; preserve it across local/return/if/match/else/`?`/`map_err`/loop joins; canonicalize terminal state; and Drop live/terminal/detectably malformed siblings without double clear/finalize/free or premature parent release. | semantic-to-byte/byte-to-semantic state goldens; every scalar/tag/reserved/null-product mutation with no-call behavior; explicit unsafe-producer pointer-provenance boundary; Move/control-flow/drop-flag owners; conn/tx and direct/pool parent generation; whole/per-unit Drop-thunk linkage; allocation balance |
 | per-row region materialization | Build one `array<value>` for only the current row, copy each nonempty view once, preserve empty/Null and row/column order, retain no native/input view, and allocate nothing for exhausted/failed advances. Do not prefetch SQLite or allocate an all-rows container. | row-size 0/1/many and builder chunk boundaries; exact region payload/builder/compaction counters; previous-row survival; owner provenance/escape; post-native-cleanup reads; forbidden all-rows allocation inventory |
-| failure, effects, and synchronization | On every validation/native/decode/address/cleanup failpoint, publish no current row, retain earlier rows and the first error, destroy unpublished builders/scratch, clear/finalize once, transition failed, and release or poison once with no hidden rollback. Record PostgreSQL post-send wrong-kind/effects, SQLite pre-step wrong-kind/unadvanced-Drop timing, and the exact native transaction-state proof before every publication/reuse boundary. | complete failpoint ledger x Execute/Rows/Next x Conn/Tx/direct/pool; first-error pairs; raw BEGIN/COMMIT/ROLLBACK state mismatch and retirement; statement-effect/reuse/rollback-required observations; repeated failed advance; no-call-after-close assertions |
+| failure, effects, and synchronization | On every validation/native/decode/address/session-invariant/cleanup failpoint, publish no current row, retain earlier rows and the first error, destroy unpublished builders/scratch, clear/finalize once, transition failed, and release or poison once with no hidden rollback. Record PostgreSQL post-send wrong-kind/effects, SQLite pre-step wrong-kind/unadvanced-Drop timing, the package-owned busy-timeout/client-encoding checks, and the exact native transaction-state proof before every publication/reuse boundary. | complete failpoint ledger x Execute/Rows/Next x Conn/Tx/direct/pool; first-error pairs; raw BEGIN/COMMIT/ROLLBACK state mismatch and retirement; SQLite busy-timeout PRAGMA x prepare/step/finalize/Drop restore; PostgreSQL encoding drift x ordinary/fail-close/status/error path; statement-effect/reuse/rollback-required observations; repeated failed advance; no-call-after-close assertions |
 | product, build, and measurement parity | Keep typed Query behavior/artifacts byte-stable, dynamic calls out of normal build tooling, and both driver link closures available whole-program/per-unit. Run the focused A2 owner plus Q2/Q4b/A1 regressions and the local DB gate. After correctness, record zero/empty/nonempty and one/many-row scratch, native-owner, region-copy/compaction, peak-byte, and time-to-first/full-scan observations without turning them into semantic thresholds. | descriptor/artifact golden unchanged; whole/per-unit executable parity; `scripts/db-verify-local.sh`; required Linux/macOS/PostgreSQL CI; non-gating `bench/pkg_db_dynamic` record |
+
+The fresh independent adversarial design review of `6bd6fbb` found two P1 gaps and one P2 gap.
+This ledger-first revision closes the complete finding set before implementation:
+
+| Finding | Ledger-first closure | Required owner |
+|---|---|---|
+| dynamic SQL could change package-owned session state while leaving transaction state apparently valid | Reapply SQLite's tracked busy timeout at every dynamic native-statement boundary and fail-close PostgreSQL unless `PQclientEncoding` still reports `PG_UTF8`; preserve non-package-owned session effects explicitly. | SQLite prepare/step/finalize/Drop busy-timeout mutations and failures; PostgreSQL `SET`/`set_config` encoding drift across success/error/status/timeout with first-error and no-call-after-close counters |
+| the wrapper promised safety for unauthenticated non-null embedded pointers | Match the shipped conn/pool boundary: validate scalar/tag/reserved/null products, but make non-null pointer provenance an explicit privileged unsafe-producer obligation and remove the impossible arbitrary-pointer-mutation promise. | scalar/tag/reserved/null-product byte corruptions plus a source/API inventory proving safe code cannot forge embedded pointers |
+| SQLite could expose a stale prior `sqlite3_changes64` value for a non-DML statement | Return `rows_affected = None` for every SQLite dynamic command; PostgreSQL alone uses current-result-owned `PQcmdTuples`. | DML with zero/nonzero changes, DDL, transaction control, and non-row PRAGMA after a prior DML all return SQLite `None`; retained PostgreSQL count matrix |
 
 Implementation requires the shipped Q4b lease/stream/timeout cleanup, A1 binary-format and
 result-status closures, D12 native-consumer lease closure, and D13 pool provenance. It consumes no
@@ -5991,10 +6040,15 @@ The design is implemented correctly only if all are true:
 101. Dynamic validation follows the exact target, driver, SQL, option, lease, parameter, native,
      result order; SQL U+0000 and all package-detectable parameter failures precede send, and one
      operation invokes at most one native statement. Every publication/reuse boundary also proves
-     that native transaction state still matches the explicit Conn/Tx target or poisons/closes.
+     that native transaction state still matches the explicit Conn/Tx target, reapplies SQLite's
+     tracked busy timeout, and retains PostgreSQL UTF-8 client encoding, or poisons/closes. SQLite
+     dynamic commands always report `rows_affected = None`; PostgreSQL uses only the current
+     result's `PQcmdTuples` count.
 102. `dynamic_rows` publishes only the exact dependent 48-byte stream state. Each `dynamic_next`
      copies one ordered `array<value>` into its explicit region, preserves empty-versus-NULL,
-     retains no input/native view, and performs no SQLite prefetch or all-rows allocation.
+     retains no input/native view, and performs no SQLite prefetch or all-rows allocation. Its
+     scalar/tag/reserved/null-product fields fail closed; non-null embedded-pointer provenance is
+     the privileged unsafe producer's obligation and cannot be forged from safe source.
 103. A dynamic failure publishes no current row, preserves earlier rows and the first owned error,
      performs exact native cleanup/synchronization or poison, releases the lease once, marks the
      stream failed, and never rewinds the arena or issues hidden rollback SQL.
