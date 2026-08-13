@@ -142,6 +142,31 @@ done <"$manifest"
 LC_ALL=C sort -o "$expected" "$expected"
 LC_ALL=C sort -o "$env_dependent" "$env_dependent"
 
+# One key cannot be both strict and tolerated: the two rules contradict each
+# other, and whichever won would be an accident of ordering. That is a broken
+# manifest, not a verdict.
+conflicting="$(LC_ALL=C comm -12 "$expected" "$env_dependent")"
+[ -z "$conflicting" ] || {
+  echo "$manifest: entries listed both as a known failure and as 'env':" >&2
+  printf '%s\n' "$conflicting" | while IFS= read -r entry; do
+    printf '  %s\n' "$entry" >&2
+  done
+  echo "  keep one line per test: strict, or environment-dependent" >&2
+  exit 2
+}
+
+# A manifest line naming a target the workspace no longer builds is red for
+# both kinds. A strict line can never be satisfied, and an env line is worse:
+# it would sit there indefinitely excusing a test that does not exist.
+unknown="$work/unknown"
+: >"$unknown"
+cat "$expected" "$env_dependent" | while IFS= read -r entry; do
+  [ -n "$entry" ] || continue
+  printf '%s\n' "$found_names" | LC_ALL=C grep -qxF "${entry%%"$tab"*}" ||
+    printf '%s\n' "$entry" >>"$unknown"
+done
+LC_ALL=C sort -o "$unknown" "$unknown"
+
 printf 'suite: %s binaries, %s parallel, %s test thread(s) each, %ss per-binary cap\n' \
   "$(printf '%s\n' "$found_names" | wc -l | tr -d '[:space:]')" \
   "$ALIGN_TB_JOBS" "$ALIGN_TB_THREADS" "$ALIGN_TB_TIMEOUT"
@@ -155,8 +180,15 @@ suite_elapsed="$(($(date +%s) - suite_started))"
 
 # One "<target><TAB><test>" line per observed failure. A binary that never
 # printed libtest's own summary (it crashed, aborted, or hit the per-binary
-# cap) contributes a synthetic entry instead of silently looking clean, and a
-# binary that exited non-zero without naming a test contributes one too.
+# cap) contributes a synthetic entry instead of silently looking clean, and so
+# does one whose exit code cannot be explained by the tests it named.
+#
+# 101 is libtest's own "some test failed" code and 0 is success; anything else
+# after a printed summary means the process died some other way — a segfault
+# or abort in a destructor, an exit() in a leaked thread — and it is added
+# ALONGSIDE the named failures, not only when there are none. Those names may
+# all be in the manifest, and without this line a crash that happens to strike
+# a known-failing target would be absorbed into the baseline and never seen.
 actual="$work/actual"
 : >"$actual"
 for slot in $(align_tb_slots); do
@@ -166,8 +198,15 @@ for slot in $(align_tb_slots); do
   if ! grep -q '^test result:' "$ALIGN_TB_LOGS/$slot.log"; then
     names="$names${names:+
 }<binary-did-not-report>"
-  elif [ "$binary_status" != 0 ] && [ -z "$names" ]; then
-    names="$names<binary-exit-$binary_status>"
+  else
+    case "$binary_status" in
+      0 | timeout) ;;
+      101) [ -n "$names" ] || names="<binary-exit-101>" ;;
+      *)
+        names="$names${names:+
+}<binary-exit-$binary_status>"
+        ;;
+    esac
   fi
   [ -z "$names" ] || printf '%s\n' "$names" |
     while IFS= read -r name; do
@@ -182,7 +221,11 @@ LC_ALL=C sort -o "$actual" "$actual"
 tolerated="$work/tolerated"
 LC_ALL=C comm -23 "$actual" "$env_dependent" >"$tolerated"
 new_failures="$(LC_ALL=C comm -23 "$tolerated" "$expected")"
-fixed="$(LC_ALL=C comm -13 "$actual" "$expected")"
+# A strict entry whose target does not exist is also, trivially, an entry that
+# did not fail. Report it once, under the heading that explains it.
+fixed_all="$work/fixed"
+LC_ALL=C comm -13 "$actual" "$expected" >"$fixed_all"
+fixed="$(LC_ALL=C comm -23 "$fixed_all" "$unknown")"
 
 # Full output for a binary that produced an unexpected failure; one line for
 # everything else, so the whole run stays auditable without burying the signal.
@@ -215,13 +258,17 @@ if [ -n "$fixed" ]; then
   status=1
   echo "suite: manifest entries that did NOT fail — fix the manifest, not the test:" >&2
   printf '%s\n' "$fixed" | while IFS= read -r entry; do
-    if printf '%s\n' "$found_names" | LC_ALL=C grep -qxF "${entry%%"$tab"*}"; then
-      printf '  %s (passed)\n' "$entry" >&2
-    else
-      printf '  %s (no such target in the workspace)\n' "$entry" >&2
-    fi
+    printf '  %s (passed)\n' "$entry" >&2
   done
   echo "  a fixed test must lose its manifest line in the same change that fixes it" >&2
+fi
+if [ -s "$unknown" ]; then
+  status=1
+  echo "suite: manifest entries naming a target the workspace does not build:" >&2
+  while IFS= read -r entry; do
+    printf '  %s (no such target in the workspace)\n' "$entry" >&2
+  done <"$unknown"
+  echo "  this holds for an 'env' line too: it cannot excuse a test that is gone" >&2
 fi
 if [ "$status" -eq 0 ]; then
   printf 'suite: matches %s exactly\n' "$manifest"

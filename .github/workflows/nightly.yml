@@ -67,8 +67,19 @@ jobs:
           rustup default "$RUST_VERSION"
 
       # The 30-minute budget is a test-execution budget, so the build must be
-      # incremental. restore-keys keeps yesterday's target directory usable
-      # after an unrelated Cargo.lock change.
+      # incremental.
+      #
+      # The save key carries github.run_id, which makes it unique per run. A
+      # key fixed on Cargo.lock would be written exactly once and then be
+      # immutable: GitHub never overwrites an existing cache key. The night
+      # that key was first written is very likely a night the suite did not
+      # finish building, so a partial target directory would be frozen into it
+      # and every later night would restore that same partial state and make no
+      # further progress — a permanently red job whose build never converges.
+      # With a per-run key each night saves whatever it got and the next night
+      # resumes from the newest prefix match, so a cold bootstrap converges
+      # monotonically. The extra entries are left to GitHub's 10 GB LRU
+      # eviction, which drops the oldest of them first.
       - name: Restore Cargo caches
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -76,10 +87,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-nightly-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-nightly-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
           restore-keys: |
+            cargo-nightly-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}-
             cargo-nightly-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-
-            cargo-nightly-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-
 
       - name: Restore OpenSSL cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -138,7 +149,10 @@ jobs:
 
       # Saved even when the suite is red: a red night must still leave a warm
       # target directory, or every following night pays a cold build out of the
-      # same 30 minutes.
+      # same 30 minutes. `if: always()` covers a failed step but not the
+      # job-level timeout, which cancels the job outright — so a night that
+      # runs out of budget saves nothing, and only the per-run key above keeps
+      # the following night from inheriting that gap permanently.
       - name: Save Cargo caches
         if: always()
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -147,7 +161,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-nightly-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-nightly-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
 
   # x86 release-profile coverage lives here rather than in the per-PR lint job;
   # the per-PR ARM64/macOS jobs still build and smoke the release compiler.
@@ -172,6 +186,9 @@ jobs:
           rustup toolchain install "$RUST_VERSION" --profile minimal
           rustup default "$RUST_VERSION"
 
+      # Per-run save key with prefix restore, for the same reason as the suite
+      # job: a key fixed on Cargo.lock is written once and can never be
+      # updated, so a partial build would be frozen into it forever.
       - name: Restore Cargo caches
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
@@ -179,10 +196,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-nightly-release-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-nightly-release-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
           restore-keys: |
+            cargo-nightly-release-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}-
             cargo-nightly-release-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-
-            cargo-nightly-release-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-
 
       - name: Restore OpenSSL cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -248,4 +265,4 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-nightly-release-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-nightly-release-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_VERSION }}-openssl${{ env.OPENSSL_VERSION }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}

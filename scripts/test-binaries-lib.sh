@@ -149,9 +149,16 @@ align_tb_count_running() {
 # Per-binary watchdog: wait out the budget, then mark and kill. It polls rather
 # than sleeping the whole budget in one call so that cancelling it (the normal
 # case, on every binary that finishes in time) leaves at most a few seconds of
-# orphaned `sleep` behind even where `pkill` is unavailable. It kills the test
-# binary itself; anything that binary spawned is beyond reach here, exactly as
-# in align_tb_cleanup.
+# orphaned `sleep` behind even where `pkill` is unavailable.
+#
+# The kill reaches one level: the test binary and its immediate children. A
+# driver test that spawned `alignc`, which in turn spawned a linker, can leave
+# that grandchild running. On CI that is harmless — the runner is destroyed
+# with the job — but a local run that actually hits the 900 s cap can leave an
+# orphaned compiler process behind, which is worth knowing before reaching for
+# a smaller cap on a laptop. Reaching further would mean a process group per
+# binary, and killing a group risks the runner's own shell; the shallow kill is
+# the deliberate trade, matching align_tb_cleanup.
 align_tb_watchdog() {
   local child="$1" marker="$2" budget="$3" interval=5 waited=0
   [ "$budget" -ge "$interval" ] || interval="$budget"
@@ -213,7 +220,13 @@ align_tb_run() {
           kill "$watchdog" 2>/dev/null || true
           wait "$watchdog" 2>/dev/null || true
         } 2>/dev/null
-        [ ! -e "$ALIGN_TB_LOGS/$slot.timeout" ] || binary_status=timeout
+        # The watchdog decides to fire before it kills, so a binary that
+        # finished in the same instant can end up with both a marker and a
+        # clean exit. The exit code wins: a binary that reported success is
+        # never turned red by the race.
+        if [ "$binary_status" != 0 ] && [ -e "$ALIGN_TB_LOGS/$slot.timeout" ]; then
+          binary_status=timeout
+        fi
       else
         "$executable" >"$ALIGN_TB_LOGS/$slot.log" 2>&1 || binary_status=$?
       fi
@@ -244,6 +257,14 @@ align_tb_slot_record() {
 
 # libtest names every failed test on its own line, in both the single- and
 # multi-threaded output modes.
+#
+# A test's own captured stdout is replayed into the same stream, so a test that
+# prints a line spelled exactly like a libtest verdict would be extracted as a
+# phantom failure. That can only happen on a run that already has a real
+# failure — libtest replays captured output only for failing tests — so the
+# error is a spurious extra name inside an already-red run, never a missed
+# failure. Parsing libtest's JSON output would remove even that, but it is
+# nightly-only, so the fail-closed direction is the right trade here.
 align_tb_failed_tests() {
   sed -n 's/^test \(.*\) \.\.\. FAILED$/\1/p' "$ALIGN_TB_LOGS/$1.log"
 }

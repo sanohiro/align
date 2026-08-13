@@ -1267,6 +1267,26 @@ gate_outcome_case() {
 gate_outcome_case failing '--- failing (exit 3' "$gate_pass_one" "$gate_failing"
 gate_outcome_case killed '--- suicidal (exit killed' "$gate_pass_one" "$gate_killed"
 
+# The gate has no per-binary cap and must not be able to acquire one from the
+# environment: its slowest binaries are single-threaded stress tests, and a
+# stray exported budget would start killing exactly those. The runner pins the
+# variable, so an exported value has to change nothing.
+gate_slow="$(gate_binary slow 'sleep 3; exit 0')"
+gate_slow_json="$tmp_dir/gate-slow.json"
+gate_stream "$gate_slow_json" "$gate_slow"
+gate_slow_out="$tmp_dir/gate-slow-out"
+ALIGN_GATE_JOBS=2 ALIGN_TB_TIMEOUT=1 "$gate_runner" "$gate_slow_json" slow \
+  >"$gate_slow_out" 2>&1 || {
+  echo "an exported ALIGN_TB_TIMEOUT reached the gate and killed a slow binary:" >&2
+  cat "$gate_slow_out" >&2
+  exit 1
+}
+grep -Fq -- '--- slow (exit 0' "$gate_slow_out" || {
+  echo "the gate did not report the slow binary as a clean pass:" >&2
+  cat "$gate_slow_out" >&2
+  exit 1
+}
+
 # scripts/run-suite-binaries.sh is the nightly detector: the same discovery and
 # concurrency engine, judged against scripts/known-failures.txt instead of a
 # declared binary set. Its verdict has three directions and all three are
@@ -1308,6 +1328,13 @@ exit 4')"
 suite_hang="$(suite_binary suite_hang '
 printf "test alpha ... ok\n"
 sleep 30')"
+# Named a failure, printed the summary, and THEN died (a segfault in a
+# destructor, say). Its named failure is in the manifest; the crash is not, and
+# must not be absorbed by it.
+suite_crash="$(suite_binary suite_crash '
+printf "test beta ... FAILED\n"
+printf "\ntest result: FAILED. 0 passed; 1 failed; 0 ignored\n"
+exit 139')"
 
 suite_artifact() {
   printf '{"reason":"compiler-artifact","manifest_path":"%s/pkg/Cargo.toml",' "$suite_dir"
@@ -1428,6 +1455,27 @@ grep -Fq '0 known, 2 environment-dependent' "$suite_env_out" || {
   cat "$suite_env_out" >&2
   exit 1
 }
+# Tolerating an outcome is not the same as tolerating a fiction: an env line
+# for a target that no longer exists excuses nothing and is red, symmetrically
+# with a strict line.
+env_gone_manifest="$(suite_manifest env-gone "$(suite_line suite_gone needs_network env)")"
+suite_env_gone_out="$(suite_case env-gone "$env_gone_manifest" 1 "$suite_green")"
+grep -Eq '^  suite_gone[[:space:]]+needs_network \(no such target in the workspace\)$' \
+  "$suite_env_gone_out" || {
+  echo "an env line for a deleted target was not reported:" >&2
+  cat "$suite_env_gone_out" >&2
+  exit 1
+}
+# One key cannot be strict and tolerated at once; whichever rule won would be
+# an accident of ordering, so the manifest is malformed (exit 2).
+both_manifest="$(suite_manifest both \
+  "$(suite_line suite_red beta)" "$(suite_line suite_red beta env)")"
+suite_both_out="$(suite_case both "$both_manifest" 2 "$suite_red")"
+grep -Fq 'both as a known failure and as' "$suite_both_out" || {
+  echo "a key listed as both strict and env was not rejected:" >&2
+  cat "$suite_both_out" >&2
+  exit 1
+}
 
 # 5. A binary that exits non-zero without naming a test, and one that never
 # reaches libtest's summary at all, both fail closed.
@@ -1446,6 +1494,20 @@ grep -Eq '^  suite_hang[[:space:]]+<binary-did-not-report>$' "$suite_hang_out" |
 grep -Fq -- '--- suite_hang (exit timeout' "$suite_hang_out" || {
   echo "the capped binary was not reported as a timeout:" >&2
   cat "$suite_hang_out" >&2
+  exit 1
+}
+# The absorption hole: every test the crashing binary named is already in the
+# manifest, so only the exit code distinguishes this run from a clean baseline.
+crash_manifest="$(suite_manifest crash "$(suite_line suite_crash beta)")"
+suite_crash_out="$(suite_case crash "$crash_manifest" 1 "$suite_crash")"
+grep -Eq '^  suite_crash[[:space:]]+<binary-exit-139>$' "$suite_crash_out" || {
+  echo "a crash after libtest's summary was absorbed by the known failure:" >&2
+  cat "$suite_crash_out" >&2
+  exit 1
+}
+grep -Fq 'did NOT fail' "$suite_crash_out" && {
+  echo "the crashing binary's known failure was also reported as repaired:" >&2
+  cat "$suite_crash_out" >&2
   exit 1
 }
 
@@ -1505,6 +1567,27 @@ grep -Fq 'ALIGN_SUITE_BINARY_TIMEOUT' "$suite_runner" || {
 }
 grep -Fq '30 minutes' "$suite_runner" || {
   echo "scripts/run-suite-binaries.sh no longer records the 30-minute rule" >&2
+  exit 1
+}
+grep -Eq '^ALIGN_TB_TIMEOUT=0$' "$gate_runner" || {
+  echo "scripts/run-gate-binaries.sh no longer pins its per-binary cap off" >&2
+  exit 1
+}
+# A cache key fixed on Cargo.lock alone is written once and never updated, so
+# the night that first wrote it — very likely a night that did not finish
+# building — would freeze a partial target directory in forever. Every nightly
+# save key must vary per run.
+nightly_cache_keys="$(grep -cE '^ *key: cargo-nightly' "$nightly_workflow")"
+nightly_run_keys="$(grep -cE '^ *key: cargo-nightly.*github\.run_id \}\}$' "$nightly_workflow")"
+[[ "$nightly_cache_keys" -gt 0 && "$nightly_cache_keys" -eq "$nightly_run_keys" ]] || {
+  echo "a nightly Cargo cache key is not unique per run" >&2
+  echo "  key: lines: $nightly_cache_keys, ending in github.run_id: $nightly_run_keys" >&2
+  exit 1
+}
+# ... and the prefix restore-keys are what make those per-run entries usable.
+grep -Eq '^ *cargo-nightly-.*-\$\{\{ hashFiles\('"'"'Cargo.lock'"'"'\) \}\}-$' \
+  "$nightly_workflow" || {
+  echo "nightly.yml lost the Cargo.lock-prefixed restore key" >&2
   exit 1
 }
 

@@ -31,6 +31,13 @@ script_dir="$(dirname "$0")"
 . "$script_dir/test-binaries-lib.sh"
 align_use_private_dyld_region
 
+# The gate has no per-binary cap, and cannot acquire one from the environment:
+# the library reads ALIGN_TB_TIMEOUT at load, so leaving it unpinned would let
+# an exported value silently switch the gate onto the watchdog path and start
+# killing the very stress binaries that own most of its run time. The nightly
+# suite sets its own cap explicitly; the gate's is off, by declaration.
+ALIGN_TB_TIMEOUT=0
+
 ALIGN_TB_LOGS="$(mktemp -d)"
 trap 'align_tb_cleanup' EXIT
 trap 'align_tb_cleanup; exit 130' INT
