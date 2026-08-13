@@ -286,6 +286,37 @@ pub fn scalar_to_prim(s: Scalar) -> Option<PrimScalar> {
     }
 }
 
+/// Whether `ty` has the total order the `Ord` bound requires.
+///
+/// The single producer authority for orderability. `Bound::Ord` is defined by it, and the
+/// checked-HIR body validator asks it instead of re-listing the arms: the validator's own list
+/// omitted owned `string`, so a checked `sort_by_key` with a `string` key lowered to the
+/// fail-closed empty program (`docs/impl/19-hir-validation-ledger.md`, delegation matrix row
+/// `ord-key`).
+pub fn ord_body_ty(ty: Ty) -> bool {
+    ty.is_numeric() || matches!(ty, Ty::Char | Ty::Str | Ty::String)
+}
+
+/// The materialized element scalar of a `scan` accumulator, or `None` when the accumulator cannot
+/// be materialized into an `array<A>`.
+///
+/// This is the single producer authority for the `scan` output-element rule. `check_array_scan`
+/// admits an accumulator through it, and the checked-HIR body validator asks the same function
+/// instead of re-deriving the rule: the validator's own `scalar_to_prim` spelling of "materializable"
+/// rejected `()` and every sum-type accumulator that sema accepts, so a checked `scan` lowered to
+/// the fail-closed empty program (`docs/impl/19-hir-validation-ledger.md`, delegation matrix row
+/// `scan-accumulator`).
+///
+/// A struct accumulator is excluded because the fused buffer/`PtrStore` path has no struct-element
+/// support; every other `ty_to_scalar` scalar materializes. Move admission is a separate rule and
+/// stays with the caller (`reject_move_pipeline_call_arg`), which needs the diagnostic span.
+pub fn scan_accumulator_scalar(acc: Ty) -> Option<Scalar> {
+    if matches!(acc, Ty::Struct(_)) {
+        return None;
+    }
+    ty_to_scalar(acc)
+}
+
 /// Memory layout of a struct array — a property of the array *type*, so AoS-vs-SoA is decided
 /// once (at the type) and threaded into field-access lowering, not re-derived per use site
 /// (`open-questions.md` Open "SoA layout"). Only [`Layout::Aos`] exists today; `Layout::Soa`
@@ -2864,7 +2895,7 @@ impl Bound {
         match self {
             Bound::Unconstrained => true,
             Bound::Eq => ty.is_numeric() || matches!(ty, Ty::Char | Ty::Bool | Ty::Str | Ty::String),
-            Bound::Ord => ty.is_numeric() || matches!(ty, Ty::Char | Ty::Str | Ty::String),
+            Bound::Ord => ord_body_ty(ty),
             Bound::Num => ty.is_numeric(),
             // RegionPlain is structural and needs the complete nominal definition tables.  Its
             // concrete check is owned by generic-call finalization, not this scalar predicate.
@@ -35310,9 +35341,10 @@ impl<'a, 't> Checker<'a, 't> {
         if self.reject_move_pipeline_call_arg(elem, "scan", "element", span) {
             return err;
         }
-        // The accumulator (output element) must be a *primitive* scalar to materialize into
-        // `array<A>`. `ty_to_scalar` accepts `Ty::Struct` (a valid Option/Result payload), but
-        // the buffer/PtrStore path has no struct-element support, so reject structs explicitly.
+        // The accumulator (output element) must materialize into `array<A>`. `ty_to_scalar` accepts
+        // `Ty::Struct` (a valid Option/Result payload), but the buffer/PtrStore path has no
+        // struct-element support, so structs are rejected. `scan_accumulator_scalar` is the single
+        // authority for that rule; the checked-HIR body validator asks the same function.
         if matches!(acc_ty, Ty::Struct(_)) {
             self.diags.error(
                 "'scan' accumulator must be a primitive scalar (struct accumulators are not supported yet)".to_string(),
@@ -35320,7 +35352,7 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         }
-        let Some(scalar) = ty_to_scalar(acc_ty) else {
+        let Some(scalar) = scan_accumulator_scalar(acc_ty) else {
             self.diags.error(
                 format!("'scan' accumulator must be a scalar to materialize, got {}", ty_name(acc_ty)),
                 span,

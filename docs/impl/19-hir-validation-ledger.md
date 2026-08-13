@@ -25,6 +25,13 @@ native declaration, Align-program/runtime/native/artifact/cache allocation,
 ownership transfer, or cache publication. Compiler-owned validation worklists
 may allocate and are released before return.
 
+That empty-program contract is for **hand-constructed** HIR only. A caller
+holding producer-checked HIR uses the fifth, fallible entrypoint
+`lower_program_checked`, which rejects at the same point with the same
+pre-construction guarantees but reports `LoweringRejected` instead of an empty
+program. See "Producer-delegation closure matrix" below for why an empty
+program must never reach a checked consumer.
+
 The complete ledger consists of this file and the callable/native appendix in
 `17-library-boundary-prerequisites.md`. An implementation capability may not replace a
 row with a broader family assumption. A new HIR discriminator must add one row,
@@ -992,3 +999,223 @@ definitions and assert that this file has exactly one owner id for every
 `GroupSource`, `GroupAgg1`, `GroupOp`, `CliFlagKind`, `EncodingKind`, `CompressKind`,
 `PathComponentKind`, `AeadCipher`, `AeadDir`, and `HashAlgo`. The test fails on
 an added, removed, duplicated, or unowned discriminator.
+
+## Producer-delegation closure matrix
+
+This matrix closes the **silent-empty-MIR** class: the body validator answering
+a question the producer already owns, with a rule that is not equivalent. Every
+occurrence rejects the whole checked program at the MIR boundary, so the unit
+lowers to the canonical empty program and links with an undefined `_main`. Four
+earlier occurrences shipped as `#742`, `#744`, `#749`, and `#737`; the two rows
+below are the fifth and sixth. Every one was "the validator re-derived a
+producer fact", never malformed HIR.
+
+### Split model
+
+A nominal id is not a stable name for a source type. `check_program` caches
+monomorph instances by *mangled name* (`struct_mono`, `enum_mono`,
+`resource_mono`), and `intern_fn_type` compares the whole `FnTy` including its
+mutable `effect` cell, so one source type can own several ids:
+
+```text
+struct[4] = Wrap$F0_vi64_i64_bn_rn  source_name Wrap$F_vi64_i64_bn_rn  callback: Fn(0)
+struct[6] = Wrap$F3_vi64_i64_bn_rn  source_name Wrap$F_vi64_i64_bn_rn  callback: Fn(3)
+```
+
+Sema treats those as one type (`source_scalar_matches`). The validator's
+equivalent is `body_ty_matches` / `body_scalar_matches`, which compare through
+`source_shape_equal`. A **raw** `==`/`!=` on two nominal ids is therefore only
+correct when the two operands cannot be independent derivations of one source
+type. The duplicate ids themselves are a separate (non-blocking) producer
+inefficiency; see "fn_types interning" below.
+
+### Axis A — validator-owned admission gates spelled `scalar_to_prim`
+
+Eight occurrences; one diverged.
+
+| Gate | Producer authority | Verdict |
+|---|---|---|
+| `ArrayScan` output element | `check_array_scan` | **Divergent.** Sema admits any non-struct `ty_to_scalar` accumulator; `scalar_to_prim` rejected `()` and every sum-type accumulator. Fixed by delegating to `align_sema::scan_accumulator_scalar`, now called by both. |
+| `rng_elem_ok` (`shuffle`/`sample`) | `check_rand_method` | Identical rule (`scalar_to_prim(es).is_none()`). No change. |
+| `ArraySortBy` element | `check_array_sort_by_key` | Identical rule. No change. |
+| `ArrayPartition` element | `check_array_partition` | Identical rule. No change. |
+| `ArrayChunks` element | `check_array_chunks` | Identical rule. No change. |
+| `array_builder_elem_ok` | `check_array_builder_new` | Wider, never narrower: sema admits `Int/Float/Bool/Char/String`; the validator additionally admits `Str`. A wider gate cannot reject a checked program, so it is outside this class. No change. |
+| `ResourceViewFromRaw` view scalar (2 sites) | none | Structural: `Scalar::Slice` is *constructed from* a `PrimScalar`, so this is a representation conversion, not an admission rule. No change. |
+
+One further admission gate diverged without being spelled `scalar_to_prim`:
+
+| Gate | Producer authority | Verdict |
+|---|---|---|
+| `orderable_body_ty` (`sort_by_key` key) | `Bound::Ord` | **Divergent.** Sema's bound accepts owned `string`; the validator re-listed the arms and stopped at `str`. Both now call `align_sema::ord_body_ty`. |
+
+**Deferred, same arm — `ord-key` Move keys.** Delegating orderability does not by
+itself make a `string`-keyed `sort_by_key` lower. `pipeline_callable_ok` requires
+a pipeline callable's output to be Copy (`ty_copy_ok`), and sema imposes no Copy
+requirement on a sort key, so an owned key is still refused one gate later. That
+is a *second*, distinct divergence, and closing it needs per-key Drop in the
+fused sort path — the same shape as #739's deferred fixed-array Move elements,
+not a validator edit. Until then the reachable witness for the `ord-key` row is a
+`str` key, and the owner table records that explicitly. Do not "fix" the Copy gate
+without the MIR support: accepting a Move key the sort path cannot drop trades a
+rejected program for a leak.
+
+### Axis B — nominal-identity comparisons
+
+`body_core` contains 538 comparison lines; 210 compare a `Ty` or `Scalar`.
+Classification is by **operand provenance**, because that is what decides
+whether a split is reachable:
+
+| Class | Count | Verdict |
+|---|---|---|
+| Delegated: already asks `body_ty_matches` / `body_scalar_matches` | 48 call sites | Correct by construction. |
+| Split-free: at least one operand is a primitive, a native singleton handle (`Ty::Raw`, `Ty::Reader`, `Ty::HttpClient`, …), or a scalar a sibling predicate has already narrowed to a primitive (`const_array_scalar_ok`, `valid_vector_scalar`, `numeric_body_ty`, `array_zip_scalar_ok`, `scalar_to_prim`) | 197 | Raw comparison is exact. No change. |
+| Same-derivation: a stored discriminator id compared against the child type sema derived it *from* — resource operations (`Ty::Resource(*resource)`), SoA / struct-array store bases (`Ty::Soa(*struct_id)`), JSON decode targets (`Ty::Enum(*enum_id)`), pipeline terminals (`final_elem != *elem`), pooled-array locals | 9 families | One derivation cannot split against itself. Raw comparison retained; converting them would only widen. |
+| **Cross-derivation: a callee or lifted signature compared against a call-site type.** This is the only class where two independent derivations of one source type meet. | 17 | 13 already delegated; **4 were raw and are fixed** (below). |
+
+Fixed cross-derivation cells:
+
+| Cell | Symptom |
+|---|---|
+| `ResultMapErr` mapper parameter vs receiver error scalar | **Proven.** `fail_with(Wrap { callback: quiet }).map_err(keep_error)` gave `Struct(6)` from the inferred instantiation and `Struct(4)` from the declaration header. Whole program rejected. |
+| `Spawn` closure `FnTy::ret` vs task payload | Latent: payload is primitive today, but the comparison is cross-derivation. |
+| `Spawn` lifted-signature return vs constructed `Result` expectation | Latent, and additionally sensitive to the `Ty::Result` / `Ty::Tagged` spelling that only `body_ty_matches` normalizes. |
+| Lifted-signature spawn check (`resolve_lifted_signature` consumer) | Same family as the previous row. |
+
+### Axis B (continued) — the other seven gates
+
+Axis B above measures the body gate, which owns the expression-level rules. The
+other seven gates were swept with the same criterion. They are small: **40**
+comparison lines in total, **zero** `scalar_to_prim` admission gates, and
+**seven** comparisons whose operands could carry a nominal id:
+
+| Gate | Nominal comparisons | Verdict |
+|---|---:|---|
+| `json_scan_validation_reason` | 2 | `expression.ty != Ty::JsonScanner(*struct_id)` is same-derivation (the node's stored row id and its own type come from one resolution); `input.ty != Ty::Str` is split-free. |
+| `declaration_header_metadata_is_valid` | 4 | All split-free: `Ty::Unit` (entry ABI return), `Ty::DynArray(Scalar::Str)` (argv), and two `Ty::ArenaHandle` mode checks. |
+| `nominal_link_metadata_is_valid` | 1 | Split-free (`Ty::Str`). |
+| `global_type_metadata_is_valid`, `type_placement_metadata_is_valid` | 0 | They validate the id domain itself, so they compare ids to table bounds, not types to types. |
+| `checked_hir_body_depth_is_valid` | 0 | Structural depth only. |
+| `checked_hir_body_facts_are_valid` | n/a | Compares a program against a **clone of itself** (`replay_clone::clone_program`), whose type tables are copied unchanged. Both sides carry identical ids by construction, so a nominal split cannot arise. |
+
+Audited clean; nothing deferred from this sweep.
+
+### Axis C — the vanished-checked-program rule
+
+The rule "a checked program with functions must not lower to the empty
+program" had three independent copies in `align_driver` and no copy at the
+lowering boundary, so the whole-program test surface — the one the two
+regressions above were observed through — got the empty program back with no
+error and failed at link with an undefined `_main`.
+
+`align_mir::lower_program_checked(program, per_unit, source_map)` is now the
+single fallible boundary and owns the rule:
+
+- returns `Err(LoweringRejected)` when validation rejects a program that has
+  functions or structs, **and** when lowering itself publishes neither;
+- returns `Ok(empty)` for a genuinely empty input;
+- the four infallible entry points keep their fail-closed empty-program
+  contract for hand-constructed HIR (`assert_rejected` is unchanged), and are
+  documented as unusable for checked input.
+
+`align_driver` exposes `try_lower_to_mir{,_per_unit,_located,_per_unit_located}`,
+and **every** production path uses them: the CLI walk, the interface-summary
+producer, the whole-program static-descriptor surface, the unit-cache
+rehydration path, and database metadata preparation. Each of those first proves
+the input checked without errors, which is what makes the rule meaningful.
+
+The infallible `lower_to_mir*` names stay fail-closed rather than panicking.
+They are the inspection surface, and owner tests legitimately reach them with
+HIR no producer emits — HIR from a program that failed checking (`m5`'s scanner
+inference cases assert the rejected MIR is empty) and HIR whose analysis facts
+a test overrode by hand (`owned_tagged_payloads`'s arena provenance case). For
+those inputs the empty program is the correct answer, so "a checked program did
+not vanish" is not a property the infallible surface can assert.
+
+### Axis D — machinery added by a capability must itself be verified
+
+Reopened twice. The first version of this axis was itself wrong, which is the
+most useful thing in it.
+
+**What actually happened.** This capability added a `raw-ty-compare` row to
+`scripts/lint-ratchet.sh` — a pinned count of raw `Ty`/`Scalar` comparisons in
+`validate_hir.rs` — and it failed CI twice. The first diagnosis blamed tool
+identity: this shell aliases `grep` to ugrep, the pin was baselined locally, CI
+runs GNU grep, so the tools must disagree. That was false, and asserting it
+without measuring was the real error. Measured afterwards, on the same tree, all
+three tools agree exactly:
+
+```text
+branch 6335438a:  ugrep 301   perl 301
+merged with main: ugrep 326   perl 326   (CI's GNU grep: 305 and 326 in turn)
+```
+
+Both failures had one cause: **CI evaluates the merge with `main`, and the pin
+was taken on the branch.** `main` advanced three PRs that grew the counted file,
+so the pinned number described a tree that is never tested. The second failure
+was the same defect surviving a fix aimed at the wrong cause.
+
+**Why the mechanism was removed, not repaired.** Even pinned correctly, the row
+could not do its job:
+
+- *It is orthogonal to the class.* Six occurrences of silent-empty-MIR are on
+  record. A count over every comparison identifies none of them: it cannot say
+  which site is wrong, and the four comparison-shaped occurrences do not change
+  the total in a recognisable way. A gate that would not have caught a single
+  instance of the class it names is not a gate for that class.
+- *It collides with unrelated work by construction.* The count moves whenever
+  any PR touches the file, so every merge with `main` re-opens it. That is not
+  a property to tune; it follows from counting a whole file.
+
+**What replaced it.** A source-analysis owner in `validate_hir_tests.rs`
+(`raw_nominal_comparisons_stay_enumerated`), following this repository's existing
+precedent of recomputing a set from the repository rather than pinning a number
+— `variant_sweep_tripwire`, and `scripts/test-pr-workflow.sh` recomputing the
+gate's target list. It extracts only the comparisons whose two operands can each
+be an *independent derivation* of one source type, matches them against a named
+allowlist, and fails with the site and the instruction to ask `body_ty_matches`.
+A comparison against a fixed constructor is excluded, so unrelated work adding
+`flow.ty != Ty::Raw` does not touch it.
+
+**The cells.** A capability that adds a lint, ratchet, tripwire, or gate closes
+all of these before pushing:
+
+| Cell | Rule | How this capability failed it |
+|---|---|---|
+| **Detection** | Does the mechanism fire on the class it exists for? Enumerate the recorded instances and check each against it. | Missed. A count caught 0 of 6; the replacement detector pins all 6 spellings as a test. |
+| **Friction** | Does it stay silent on changes that are not the class? An unrelated PR must not have to think about it. | Missed. A whole-file count moves with every edit; the replacement pins that split-free comparisons do not fire. |
+| **Evaluated tree** | CI evaluates the **merge with `main`**, not the branch. Any pinned number, golden, or snapshot taken on the branch is pinned to a tree that is never tested. | The single cause of both CI failures. |
+| **Direction** | Prove it fails when it should and passes when it should, on the real artifact, not only in principle. | Verified for the replacement: reintroducing `*parameter != err` into the real file reports `validate_hir.rs:5605`. |
+| **Diagnosis** | Do not assert a root cause you have not measured. Two competing explanations cost a round each. | Missed: tool identity was asserted, never measured, and was wrong. |
+| **Pin semantics** | State whether a pin is a *current* count or an *audited* set. | The allowlist is an audited set: every entry is classified in this matrix as same-derivation or split-free. |
+
+The rule this axis adds: **verification machinery is production code for the gate
+it guards.** It gets the same locally-before-push discipline as the compiler
+change it accompanies — including the question a count can never answer, *would
+this have caught the bug I just fixed?*
+
+### Owners
+
+| Invariant | Owner |
+|---|---|
+| Every source shape sema accepts survives every delegated gate | `align_mir` `checked_source_shapes_survive_every_delegated_gate` (scan `()`, scan enum, reduce `()`, map_err independent monomorph) |
+| A vanished checked program is an error at the one boundary, and the infallible entry points still fail closed | `align_mir` `lower_program_checked_reports_a_vanished_checked_program` |
+| Delegating a gate does not switch it off | `align_mir` `delegated_gates_still_refuse_a_genuinely_different_type` (struct accumulator, unordered key, mismatched map_err mapper, and two distinct source shapes under the shape matcher) |
+| A sum-type scan accumulator compiles and runs | `align_driver` `unit_values::sum_type_scan_accumulator_compiles_and_runs` |
+| A new raw `Ty`/`Scalar` comparison in the body validator cannot land silently | `align_mir` `raw_nominal_comparisons_stay_enumerated` — recomputes the sites from `validate_hir.rs` and matches them against an audited allowlist, naming any new site and what to do about it |
+| The detector recognises the class and ignores everything else | `align_mir` `the_raw_comparison_detector_recognises_the_class` — all six recorded spellings fire; six split-free spellings do not |
+| End-to-end acceptance | `align_driver` `mir_continuation`, `unit_values` |
+
+**Review-ledger bookkeeping.** These occurrences were found by an internal
+investigation, not by an independent review, so `align-self-review`'s counting
+rules keep them out of `FINDINGS.md`'s root-cause table. The class is tracked
+here instead, and the two source-analysis owners above are its automated owner —
+the sixth occurrence is what promoted it from prose to machinery.
+
+### fn_types interning (follow-up, not in this class)
+
+`intern_fn_type` deduplicates on the whole `FnTy`, including the `effect` cell
+that later inference mutates, so two structurally identical `fn(i64) -> i64`
+entries survive and multiply into duplicate struct/enum monomorphs. This costs
+duplicated monomorph records and mangled names; it is not a correctness defect
+now that the cross-derivation comparisons delegate. Track separately.

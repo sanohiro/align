@@ -164,7 +164,16 @@ pub(crate) fn body_core_metadata_is_valid(program: &hir::Program) -> bool {
 /// type, placement, and nominal tables. The public owner helper above keeps its standalone
 /// fail-closed contract for direct tests; MIR activation calls this body-only form so each global
 /// table is traversed once per lowering entrypoint.
+#[cfg(test)]
 pub(crate) fn body_only_metadata_is_valid(program: &hir::Program) -> bool {
+    body_only_validation_reason(program).is_ok()
+}
+
+/// The name of the first function the stored-body validator rejects.
+///
+/// The boolean wrapper above stays the production gate; this reason-valued seam lets the MIR
+/// boundary say *which* function vanished. Same shape as [`json_scan_validation_reason`].
+pub(crate) fn body_only_validation_reason(program: &hir::Program) -> Result<(), String> {
     body_core::validate(program)
 }
 
@@ -1990,13 +1999,13 @@ fn valid_prim(primitive: PrimScalar) -> bool {
 mod body_core {
     use super::*;
 
-    pub(super) fn validate(program: &hir::Program) -> bool {
+    pub(super) fn validate(program: &hir::Program) -> Result<(), String> {
         BodyValidator::new(program).validate()
     }
 
     #[cfg(test)]
     pub(super) fn validate_for_fixtures(program: &hir::Program) -> bool {
-        BodyValidator::new_for_body_fixtures(program).validate()
+        BodyValidator::new_for_body_fixtures(program).validate().is_ok()
     }
 
     pub(super) fn json_struct_descriptor_is_valid(
@@ -2524,10 +2533,13 @@ impl<'a> BodyValidator<'a> {
         }
     }
 
-    fn validate(mut self) -> bool {
+    /// `Err(name)` names the first function the body validator rejects, so the MIR boundary can
+    /// report which shape to look at instead of only that something vanished.
+    fn validate(mut self) -> Result<(), String> {
         for (function_index, function) in self.program.fns.iter().enumerate() {
+            let reject = || Err(function.name.clone());
             if !valid_span(function.span) || !self.locals_valid(function) {
-                return false;
+                return reject();
             }
             let context = BodyContext {
                 function: function_index,
@@ -2541,7 +2553,7 @@ impl<'a> BodyValidator<'a> {
                 signed_min_magnitude: false,
             };
             if !self.walk_block(&function.body, context.clone()) {
-                return false;
+                return reject();
             }
             let implicit_params = self.allow_implicit_local_params.then(|| {
                 function
@@ -2556,22 +2568,22 @@ impl<'a> BodyValidator<'a> {
                     .collect::<HashSet<_>>()
             });
             if !LocalScopeValidator::new(self.program, function, implicit_params).validate() {
-                return false;
+                return reject();
             }
             if !self.bindings_valid(function_index, function) {
-                return false;
+                return reject();
             }
             let Some(root) = self.blocks.get(&ptr_key(&function.body)) else {
-                return false;
+                return reject();
             };
             if root.falls && !self.body_ty_matches(root.ty, function.ret) {
-                return false;
+                return reject();
             }
             if !self.body_ty_ok(function.ret) {
-                return false;
+                return reject();
             }
         }
-        true
+        Ok(())
     }
 
     fn walk_block(&mut self, root: &'a hir::Block, context: BodyContext) -> bool {
@@ -5584,8 +5596,13 @@ impl<'a> BodyValidator<'a> {
                 let Ty::Fn(fid) = function_flow.ty else { return None };
                 let function = self.program.fn_types.get(fid as usize)?;
                 let [(mode, parameter)] = function.params.as_slice() else { return None };
+                // The mapper's declared parameter and the receiver's error scalar are two
+                // INDEPENDENT nominal derivations of one source type (a declaration header versus
+                // an inferred generic instantiation), so they may carry different monomorph ids for
+                // the same source shape. Sema admits the call through `source_scalar_matches`; a
+                // raw id comparison here rejected the checked program.
                 if *mode != align_ast::ParamMode::ByValue
-                    || *parameter != err
+                    || !self.body_scalar_matches(*parameter, err)
                     || !self.body_scalar_ok(align_sema::ty_to_scalar(function.ret)?)
                 {
                     return None;
@@ -5605,7 +5622,12 @@ impl<'a> BodyValidator<'a> {
                 }
                 let Ty::Fn(fid) = closure_flow.ty else { return None };
                 let function = self.program.fn_types.get(fid as usize)?;
-                if !function.params.is_empty() || function.ret != align_sema::scalar_to_ty(ok) {
+                // The spawned function's declared return and the task's payload are independent
+                // derivations, and a stored `Result` return may be spelled `Ty::Tagged`; ask the
+                // shared matcher rather than comparing ids and representations directly.
+                if !function.params.is_empty()
+                    || !self.body_ty_matches(function.ret, align_sema::scalar_to_ty(ok))
+                {
                     return None;
                 }
                 let sig = self.resolve_lifted_signature(closure)?;
@@ -5614,7 +5636,7 @@ impl<'a> BodyValidator<'a> {
                 } else {
                     align_sema::scalar_to_ty(ok)
                 };
-                if sig.ret != expected {
+                if !self.body_ty_matches(sig.ret, expected) {
                     return None;
                 }
                 Some((Ty::Task(ok), closure_flow.falls, closure_flow.breaks))
@@ -8030,8 +8052,10 @@ impl<'a> BodyValidator<'a> {
                     return None;
                 }
                 let init_flow = self.expr_flow(init)?;
-                let output_scalar = align_sema::ty_to_scalar(*output_elem)
-                    .filter(|scalar| align_sema::scalar_to_prim(*scalar).is_some());
+                // Delegated: the producer owns which accumulators materialize into `array<A>`.
+                // The validator's own `scalar_to_prim` spelling of that rule rejected `()` and
+                // every sum-type accumulator that `check_array_scan` accepts.
+                let output_scalar = align_sema::scan_accumulator_scalar(*output_elem);
                 if !self.body_ty_matches(init_flow.ty, *output_elem)
                     || !self.ty_copy_ok(input_elem, context)
                     || !self.ty_copy_ok(*output_elem, context)
@@ -9565,7 +9589,7 @@ impl<'a> BodyValidator<'a> {
             if !matches!(origin, hir::FnOrigin::Lifted { capture_count: 0 })
                 || !signature.params.is_empty()
                 || !signature.modes.is_empty()
-                || function.ret != align_sema::scalar_to_ty(spawn.ok)
+                || !self.body_ty_matches(function.ret, align_sema::scalar_to_ty(spawn.ok))
             {
                 return false;
             }
@@ -10564,8 +10588,11 @@ fn numeric_body_ty(ty: Ty) -> bool {
     matches!(ty, Ty::Int(_) | Ty::Float(_))
 }
 
+/// Delegated: the producer owns which types have a total order (`Bound::Ord`). This list omitted
+/// owned `string`, which sema's bound accepts, so a checked `string`-keyed `sort_by_key` was
+/// rejected here and lowered to the empty program.
 fn orderable_body_ty(ty: Ty) -> bool {
-    matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Char | Ty::Str)
+    align_sema::ord_body_ty(ty)
 }
 
 fn fixed_array_shape(expression: &hir::Expr, ty: Ty) -> Option<(Scalar, u32)> {
@@ -10801,6 +10828,12 @@ impl<'a> DelegatedGates<'a> {
 
     pub(crate) fn scalar_copy_ok(&self, scalar: Scalar) -> bool {
         self.0.scalar_copy_ok(scalar)
+    }
+
+    /// The shape-tolerant type comparison the delegated cells use, so the negative owner can prove
+    /// it still separates two genuinely different source shapes.
+    pub(crate) fn body_ty_matches(&self, actual: Ty, expected: Ty) -> bool {
+        self.0.body_ty_matches(actual, expected)
     }
 
     pub(crate) fn collection_element_read_ok(&self, elem: Ty) -> bool {

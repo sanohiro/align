@@ -13,7 +13,7 @@ use crate::static_inputs::{
     metadata_path, resolve_static_descriptors_for_regeneration, ParsedCheckedMetadata,
     ParsedMetadataColumn, ParsedMetadataExtension, ParsedMetadataParameter,
 };
-use crate::{lower_to_mir, BuiltStaticArtifact, Checked};
+use crate::{try_lower_to_mir, BuiltStaticArtifact, Checked};
 use align_interface::{
     static_options_hash, CheckedColumnMeta, CheckedParameterMeta, Driver, DriverEntry, Hash128,
     MetaNullability, StaticArtifact, StaticOptionValue,
@@ -842,7 +842,8 @@ pub fn build_metadata_batch(
         ));
     }
     let project_root = project_root(entry_path)?;
-    let mir = lower_to_mir(&checked.hir);
+    let mir = try_lower_to_mir(&checked.hir)
+        .map_err(|rejected| fail(format!("internal error: {rejected}")))?;
     let resolution_digest = align_interface::codegen_impl_hash(&mir);
     let resolved = resolve_static_descriptors_for_regeneration(
         &project_root,

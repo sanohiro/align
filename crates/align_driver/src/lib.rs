@@ -2090,16 +2090,8 @@ pub fn lower_to_mir_with_static_descriptors(
     source_map: &mut SourceMap,
     project_root: &std::path::Path,
 ) -> Result<align_mir::Program, String> {
-    let mut mir = lower_to_mir(&checked.hir);
-    // Same loud-failure rule as the per-unit walk: a checked program with functions must never
-    // lower to the fail-closed empty program.
-    if mir.fns.is_empty() && !checked.hir.fns.is_empty() {
-        return Err(format!(
-            "internal error: program passed checking but failed HIR validation at the MIR \
-             boundary; {} checked function(s) were not lowered — report this program shape",
-            checked.hir.fns.len()
-        ));
-    }
+    let mut mir = try_lower_to_mir(&checked.hir)
+        .map_err(|rejected| format!("internal error: {rejected}"))?;
     if checked.static_descriptors.is_empty() {
         return Ok(mir);
     }
@@ -2409,20 +2401,18 @@ pub fn build_interface_summaries(
         return (Vec::new(), diags);
     }
     let hir = checked.program;
-    let mir = lower_to_mir(&hir);
-    // Same loud-failure rule as the CLI walk: summaries and impl hashes derived from the
-    // fail-closed empty program would publish wrong cache identity silently.
-    if mir.fns.is_empty() && !hir.fns.is_empty() {
-        diags.error(
-            format!(
-                "internal error: program passed checking but failed HIR validation at the MIR \
-                 boundary; {} checked function(s) were not lowered — report this program shape",
-                hir.fns.len()
-            ),
-            align_span::Span::new(0, 0, 0),
-        );
-        return (Vec::new(), diags);
-    }
+    // Summaries and impl hashes derived from the fail-closed empty program would publish wrong
+    // cache identity silently, so this consumer reports the shared rejection instead.
+    let mir = match try_lower_to_mir(&hir) {
+        Ok(mir) => mir,
+        Err(rejected) => {
+            diags.error(
+                vanished_lowering_message(name, rejected),
+                align_span::Span::new(0, 0, 0),
+            );
+            return (Vec::new(), diags);
+        }
+    };
     let sources: std::collections::HashMap<String, String> = loaded
         .iter()
         .map(|l| (l.path.clone(), l.src.clone()))
@@ -2957,30 +2947,25 @@ fn walk_inner(
             // linkage, and alignment. The legacy
             // whole-program summary producer still partitions function MIR for its multi-unit
             // inspection surface; only per-unit summaries feed the object cache.
-            let mut mir = if located {
-                lower_to_mir_per_unit_located(&program, source_map)
+            // MIR lowering fails closed on validator-rejected HIR; for a CHECKED unit that still
+            // has functions this is a compiler defect, and shipping it silently produced an empty
+            // object (`_main` undefined at link) with exit 0. Surface the shared rejection as a
+            // loud internal error at the one walk every CLI verb shares.
+            let lowered = if located {
+                try_lower_to_mir_per_unit_located(&program, source_map)
             } else {
-                lower_to_mir_per_unit(&program)
+                try_lower_to_mir_per_unit(&program)
             };
-            // MIR lowering fails closed on validator-rejected HIR by returning an empty program;
-            // for a CHECKED unit that still has functions this is a compiler defect, and shipping
-            // it silently produced an empty object (`_main` undefined at link) with exit 0.
-            // Surface it as a loud internal error at the one walk every CLI verb shares.
-            if (mir.fns.is_empty() && !program.fns.is_empty())
-                || (mir.structs.is_empty() && !program.structs.is_empty())
-            {
-                diags.error(
-                    format!(
-                        "internal error: unit `{}` passed checking but failed HIR validation at \
-                         the MIR boundary; {} checked function(s) were not lowered — report this \
-                         program shape",
-                        u.path,
-                        program.fns.len()
-                    ),
-                    align_span::Span::new(0, 0, 0),
-                );
-                continue;
-            }
+            let mut mir = match lowered {
+                Ok(mir) => mir,
+                Err(rejected) => {
+                    diags.error(
+                        vanished_lowering_message(&u.path, rejected),
+                        align_span::Span::new(0, 0, 0),
+                    );
+                    continue;
+                }
+            };
             let sources: HashMap<String, String> = HashMap::from([(u.path.clone(), u.src.clone())]);
             let mut built = align_interface::build_summaries_with_effects(
                 &unit_module,
@@ -3749,12 +3734,9 @@ impl RehydrateCtx {
             return Err(RehydrateFailure::Descriptors);
         }
         let program = checked.program;
-        let mir = lower_to_mir_per_unit(&program);
-        if (mir.fns.is_empty() && !program.fns.is_empty())
-            || (mir.structs.is_empty() && !program.structs.is_empty())
-        {
+        let Ok(mir) = try_lower_to_mir_per_unit(&program) else {
             return Err(RehydrateFailure::Errors);
-        }
+        };
         let unit_module = [align_sema::Module {
             path: unit.path.clone(),
             file: &unit.ast,
@@ -3906,33 +3888,69 @@ fn detect_import_cycles(
     visit(start, edges, &mut color, &mut path, diags);
 }
 
-/// Lower `hir` through `produce`, reusing the MIR this process already lowered from a
-/// byte-identical HIR (`memo.rs`; `docs/impl/10-cache-first-optimization.md` §6.6). Lowering is a
+/// Lower `hir` at the one fallible MIR boundary, reusing the MIR this process already lowered from
+/// a byte-identical HIR (`memo.rs`; `docs/impl/10-cache-first-optimization.md` §6.6). Lowering is a
 /// pure function of the HIR and the `variant` visibility model, so a hit is the same program.
 ///
-/// The LOCATED variants deliberately do not come through here: their MIR additionally depends on the
-/// `SourceMap` they resolve line/column through, which the key does not cover.
+/// A LOCATED request (`source_map` present) deliberately skips the cache: its MIR additionally
+/// depends on the `SourceMap` it resolves line/column through, which the key does not cover. It
+/// still routes through here so every driver entry point shares one vanished-program rule.
 fn lower_memoized(
     hir: &align_sema::Program,
     variant: &str,
-    produce: impl FnOnce(&align_sema::Program) -> align_mir::Program,
-) -> align_mir::Program {
-    let keyed = memo::enabled().then(|| memo::lowering_key(hir, variant));
+    per_unit: bool,
+    source_map: Option<&SourceMap>,
+) -> Result<align_mir::Program, align_mir::LoweringRejected> {
+    // Only the unlocated variants are memoizable (see the note above); a located request skips the
+    // cache entirely rather than keying MIR that also depends on the `SourceMap`.
+    let keyed = (source_map.is_none() && memo::enabled()).then(|| memo::lowering_key(hir, variant));
     if let Some((key, _)) = keyed
         && let Some(hit) = memo::lowering_lookup(key)
     {
-        return hit;
+        return Ok(hit);
     }
-    let mir = produce(hir);
+    let mir = align_mir::lower_program_checked(hir, per_unit, source_map)?;
     if let Some((key, material_len)) = keyed {
         memo::lowering_store(key, &mir, material_len);
     }
-    mir
+    Ok(mir)
 }
 
-/// Lower the sema-checked HIR down to MIR.
+/// The internal-error text every CLI verb reports when a checked unit produces no MIR.
+///
+/// This is a compiler defect, not a user error, so it names the shape to report. Formatting it in
+/// one place keeps the five former copies of this rule — the CLI walk, the interface-summary
+/// producer, the whole-program static-descriptor surface, the unit-cache rehydration path, and
+/// database metadata preparation — from drifting into five different messages for one condition.
+fn vanished_lowering_message(unit: &str, rejected: align_mir::LoweringRejected) -> String {
+    format!("internal error: unit `{unit}` {rejected}")
+}
+
+/// Lower the sema-checked HIR down to MIR, reporting a vanished checked program.
+///
+/// Every production path uses this form, because returning the empty program from checked input is
+/// what silently shipped an object with an undefined `_main`. The infallible [`lower_to_mir`] stays
+/// available for the inspection surface, which legitimately lowers non-producer HIR.
+pub fn try_lower_to_mir(
+    hir: &align_sema::Program,
+) -> Result<align_mir::Program, align_mir::LoweringRejected> {
+    lower_memoized(hir, "whole-program", false, None)
+}
+
+/// Lower the sema-checked HIR down to MIR, failing closed to the empty program.
+///
+/// This infallible form deliberately does NOT report a vanished program. It is the inspection
+/// surface, and several owner tests reach it with HIR that no producer emits: HIR from a program
+/// that failed checking (`m5`'s scanner-inference cases assert the rejected MIR is empty) and HIR
+/// whose analysis facts a test overrode by hand (`owned_tagged_payloads`'s arena provenance case).
+/// For those inputs the empty program is the correct answer, so the rule cannot live here — it
+/// belongs where the caller has proven the input is producer-checked and error-free, which is
+/// every production path, and every one of them uses [`try_lower_to_mir`].
 pub fn lower_to_mir(hir: &align_sema::Program) -> align_mir::Program {
-    lower_memoized(hir, "whole-program", align_mir::lower_program)
+    // The reject path re-enters `align_mir::lower_program` rather than fabricating an empty
+    // program here: that keeps ONE definition of "what a rejected program lowers to", and it is
+    // the cold path, so the repeated validation costs nothing a caller notices.
+    try_lower_to_mir(hir).unwrap_or_else(|_| align_mir::lower_program(hir))
 }
 
 /// M15 S2 per-unit lowering: lower ONE unit's checked HIR to MIR under the separate-compilation
@@ -3940,23 +3958,39 @@ pub fn lower_to_mir(hir: &align_sema::Program) -> align_mir::Program {
 /// declarations from interface-only dependencies become external declares
 /// (`align_mir::lower_program_per_unit`). The whole-program [`lower_to_mir`] keeps every function
 /// `internal` and drops declares, so the default object stays byte-identical.
+pub fn try_lower_to_mir_per_unit(
+    hir: &align_sema::Program,
+) -> Result<align_mir::Program, align_mir::LoweringRejected> {
+    lower_memoized(hir, "per-unit", true, None)
+}
+
+/// [`try_lower_to_mir_per_unit`] with the same fail-closed inspection contract as [`lower_to_mir`].
 pub fn lower_to_mir_per_unit(hir: &align_sema::Program) -> align_mir::Program {
-    lower_memoized(hir, "per-unit", align_mir::lower_program_per_unit)
+    // Cold reject path; see [`lower_to_mir`] for why it re-enters the library entry point.
+    try_lower_to_mir_per_unit(hir).unwrap_or_else(|_| align_mir::lower_program_per_unit(hir))
 }
 
 /// M15 S2b per-unit lowering **with source locations** — [`lower_to_mir_per_unit`] plus populated
 /// `Block::stmt_lines` (`align_mir::lower_program_per_unit_located`). Used by `explain-opt`, which
 /// compiles each unit in isolation and needs the debug locations for LLVM's per-unit remarks.
-pub fn lower_to_mir_per_unit_located(hir: &align_sema::Program, source_map: &SourceMap) -> align_mir::Program {
-    align_mir::lower_program_per_unit_located(hir, source_map)
+pub fn try_lower_to_mir_per_unit_located(
+    hir: &align_sema::Program,
+    source_map: &SourceMap,
+) -> Result<align_mir::Program, align_mir::LoweringRejected> {
+    lower_memoized(hir, "per-unit-located", true, Some(source_map))
 }
 
-/// Lower to MIR with source locations (each statement records the line/col it came from), for
-/// `explain-opt` / debug-info emission. Identical to [`lower_to_mir`] but with populated
-/// `stmt_lines`.
-pub fn lower_to_mir_located(hir: &align_sema::Program, source_map: &SourceMap) -> align_mir::Program {
-    align_mir::lower_program_located(hir, source_map)
+/// [`try_lower_to_mir_per_unit_located`] with the same fail-closed inspection contract as
+/// [`lower_to_mir`].
+pub fn lower_to_mir_per_unit_located(
+    hir: &align_sema::Program,
+    source_map: &SourceMap,
+) -> align_mir::Program {
+    // Cold reject path; see [`lower_to_mir`] for why it re-enters the library entry point.
+    try_lower_to_mir_per_unit_located(hir, source_map)
+        .unwrap_or_else(|_| align_mir::lower_program_per_unit_located(hir, source_map))
 }
+
 
 /// Whether the LLVM backend is available (codegen is wired up).
 pub fn backend_available() -> bool {
