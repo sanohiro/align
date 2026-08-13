@@ -28,6 +28,13 @@ wave-by-wave record moved to the 2026-08-13 archive.
 The exact contracts and implementation matrices are in
 `docs/impl/pkg-design/db.md` §23. PostgreSQL COPY remains deferred by that
 document's §25 until a concrete measured consumer selects its public operation.
+After D14 and the existing versioned-release checkpoint, VC1 is the planned
+non-release-gating vector-compatibility checkpoint. It adds no public API:
+existing driver-pinned SQL, Text/Bytes casts, checked metadata, metadata, and
+EXPLAIN are proved against PostgreSQL/pgvector; SQLite vec1 and the wider RDB
+portability boundary are recorded without adding an extension loader or common
+vector/search abstraction. Any later direct native-vector mapping remains a
+separate consumer-driven, driver-qualified design.
 
 The align-llm compatibility break found by the v0.4.0-successor release
 compiler is closed on `main` by #786: Sema admitted both `str.clone()` and

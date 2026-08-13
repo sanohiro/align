@@ -2237,6 +2237,7 @@ acceptance closureのownerであり、labelごとに別PRを要求しない。da
 前提をpackage名special caseで代替してはならない。
 
 以下のD1〜D14 contractは変更しない。deliveryはusefulなconsumer outcomeでまとめる。
+VC1はexisting surfaceを検証するpost-D14 compatibility checkpointであり、新しいpublic capability trainではない。
 
 | Wave | Acceptance owner | Mergeable outcome | Default publication boundary |
 |---|---|---|---|
@@ -2250,6 +2251,7 @@ acceptance closureのownerであり、labelごとに別PRを要求しない。da
 | Q6 compound product | D10 | many-to-one/one-to-many Outputを1 executionでend-to-end実行 | Q4b後の1 capability PR |
 | A1 throughput/native train | D13 | batch/SoAとdriver-native throughput surface | independently usefulなcommon/driver railを並行merge可能 |
 | A2 dynamic/callback train | D14 | dynamic rowとproved native callback | dynamic SQL/driver callback railを並行merge可能 |
+| VC1 vector compatibility | post-D14 | existing driver-pinned SQLとscalar/bytes mappingをextension-backed vector searchで実証 | D14後のno-surface integration/documentation checkpoint 1つ。release gateにはしない |
 
 Q1〜Q4b/Q6は内部D labelで分割しない。両側がend-to-end実行し、独立に有用で、同じmatrix、
 review、broad gateを繰り返さない時だけ分割する。Q5はmigrationがexternal stateを変更し、
@@ -2262,6 +2264,10 @@ explicit poolの4つとする。A2はdynamic SQL/value/row railの後、独立�
 PostgreSQL callback railを進める。rail内は複数commitを使えるが、useful surfaceがstableに
 なった時にreviewとselected broad gateを1回だけ行う。未指定の追加driverはcompletionに
 必須ではなく、common contract実証後にconsumer-backed railとして追加する。
+
+VC1はcomplete committed roadmapとversioned-release checkpointの後、D14に続いて実行する。
+どちらのgateも広げない。existing SQL-native surfaceがvector workloadをどこまで表現できるかを
+実証・文書化し、後続native type mappingの境界をexactに残す。
 
 active implementationでは8時間でcompiling focused-owner-backed source checkpoint、24時間で
 whole capability PR-ready、またはindependently usefulなA1/A2 railを残す。達しない場合は
@@ -4478,6 +4484,48 @@ valid findingをledger-firstでcloseする。code review前にmatrix-to-diff pas
 argument/result ownership、comparator strategy、native ABI、registration lifetime、failure/reentrancyを変えるfindingは
 public/safety strategy変更なのでfresh design reviewを要求する。
 
+### VC1 — vector-search compatibility checkpoint（public APIなし）
+
+VC1はD14後に実行し、public package surface、compiler/runtime ABI、Query descriptor、
+checked-artifact format、release gateを変更しない。`db.vector`、`db.embedding`、
+`db.nearest`、common distance/index enum、SQL rewriter、embedding generation、extension loader、
+driver capability booleanは追加しない。native SQL、migration、driver restriction、checked prepare、
+metadata、EXPLAINのみをdatabase-facing mechanismとする。
+
+bounded outcomeは次の4つである。
+
+1. **PostgreSQL/pgvector existing-surface proof。** explicitにpinnedしたpgvector release付き一時DBで、
+   embeddingをordinary `str` parameterとし、SQLが`CAST(:embedding AS text)::vector(N)`を可視に行い、
+   Rowが既存scalar/text/byteだけのdriver-pinned static Queryを実行する。filtered top-kとdistance、
+   direct/prepared、checked metadata regeneration/offline use、`meta_query`、EXPLAINをcoverする。
+   fixture setupが`CREATE EXTENSION vector`をownerし、`pkg.db`はinstall/upgradeしない。existing canonical
+   extension name/versionはschema/server identityに入り、absent/changed extensionはprepareまたはstale
+   metadata checkでfailし、fallbackしない。
+2. **SQLite/vec1 disposition。** pinnedしたsqlite.org vec1 releaseのisolated probeを記録する。vectorは
+   virtual-table/BLOB contract、JSON conversion/query syntaxはnative SQL、extensionは`pkg.db`外から供給する。
+   SQLite extension loadingはdisabledでvec1はbuilt-in typeでないため、VC1はshipped SQLite vector supportを
+   claimせずloadも追加しない。後続bundled/static extensionはdependency、provenance、platform、
+   initialization、migration planを持つ別proposalとする。
+3. **Portability record。** primary vendor sourceからPostgreSQL/pgvector、SQLite vec1、MySQL Community/HeatWave、
+   MariaDB、SQL Server、Oracleのstorage type、exact/approx query、distance semantics、index family、tuning scope、
+   extension/service/version availabilityを1つの簡潔なEnglish/Japanese guideに更新する。commonなのは
+   application-owned Params/Row shapeまでで、executable Queryはdriver-pinned SQLのままとする。
+4. **No-surface regression proof。** exported inventory、public interface bytes/hash、static Query artifact bytes/digest、
+   dynamic `db.value` set、native runtime ABI registry、no-extension SQLite/PostgreSQL ownerをapplicableな範囲で
+   byte-identical/behaviorally unchangedに保つ。existing-API integration coverageとdocumentation以外を追加しない。
+   latency/recall/allocation/zero-copy promiseはないためbenchmarkはcorrectness gateではない。
+
+PostgreSQL proofはapplication-visibleなvector-to-text constructionとserver-side parseを意図的に支払う。これは
+compatibility pathでありoptimal transportのpromiseではない。native vector resultはvisible castでadmitted
+text/byteにしない限り返さず、typical search Rowはid、common payload、scalar distanceを返す。
+
+後続direct native-vector mappingはconcrete consumerによる別designであり、VC1 completionではない。
+driver-qualifiedのままquery/index/tuning syntaxをSQLまたはscoped native optionに残し、implementation前に
+public-contract ledgerを作る。pgvectorはqualified catalog identityからtypeを解決してinstallation-local OIDを
+hard-codeせず、extension identity/version、dimension/typmod、finite element、Text/Binary encoding、endianness、
+ownership/allocation、malformed precedence、Row-view lifetimeをexactに決める。他engineは名称が似ているだけで
+このmappingを継承しない。
+
 ### 初期release gate
 
 D labelはacceptance ownershipを表す。publicationは上記delivery waveに従う。
@@ -4700,7 +4748,8 @@ execution-count付きで実証する。
 load-bearing shapeは確定済み。残るもの:
 
 1. decimal precision/scale表現。
-2. UUID、temporal、JSON/JSONB、PostgreSQL array/range/domain、SQLite custom type mapping。
+2. UUID、temporal、JSON/JSONB、PostgreSQL array/range/domain、SQLite custom type mapping、
+   pgvectorや将来のbundled SQLite extensionなどのdriver-qualified native vector mapping。
 3. measured consumerを持つCOPY/pipeline/backup/blob operation。PostgreSQL COPY consumer/workload
    measurementはcurrent recordに存在しないため、そのpublic surface/implementationはdeferredである。
 4. SQLite collation semantic identity/persisted-index migration。future surfaceはcomparator-version changeを
@@ -4711,8 +4760,13 @@ minimal common dynamic `db.value`/`db.row` setとSQLite scalar-function callback
 ledgerでsettledした。上記wider logical/native type mapping、SQLite collation、separate PostgreSQL callback
 surfaceはsettleしない。
 
+post-D14 VC1はexisting Text/Bytes + visible cast compatibility pathのproofとcross-engine boundaryの記録だけを行う。
+native vector value/search/index/embedding/extension-loading/capability-discovery APIはsettleもauthorizeもしない。
+後続native mappingはVC1のdriver-qualified ledger requirementとconcrete consumerに従う。
+
 engine/versionごとのnullability/origin support matrixは§16.3.1で確定しD0/D3/D5が所有する。
-残りはコミット済みD14ロードマップ完了後のconsumer-gated future railである。Query identity、one-execution、ownership、artifact、
+残りはコミット済みD14ロードマップ完了後のconsumer-gated future railであり、vector mappingはさらに上記VC1に従う。
+Query identity、one-execution、ownership、artifact、
 runtime validation、option rejectionを弱める理由にはならない。
 
 ## 26. 実装agentへの指示
