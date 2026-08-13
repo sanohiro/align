@@ -722,6 +722,7 @@ enum ProgramDeclarationClass {
 struct ProgramDeclaration {
     signature: ProgramSignature,
     classes: Vec<ProgramDeclarationClass>,
+    sqlite_callback_effect: Option<align_sema::FnEffect>,
 }
 
 struct CallablePreflight {
@@ -1237,7 +1238,14 @@ fn emit_sqlite_scalar_callback_trampoline<'c>(
     builder.position_at_end(args_init);
     let scratch_ty = value_llvm_ty.array_type(127);
     let scratch = builder.build_alloca(scratch_ty, "values").map_err(lower)?;
+    let pointer_scratch_ty = ptr_ty.array_type(127);
+    let pointer_scratch = builder
+        .build_alloca(pointer_scratch_ty, "value.pointers")
+        .map_err(lower)?;
     let ordinal_slot = builder.build_alloca(i32_ty, "ordinal").map_err(lower)?;
+    let alias_ordinal_slot = builder
+        .build_alloca(i32_ty, "alias.ordinal")
+        .map_err(lower)?;
     builder.build_store(ordinal_slot, i32_ty.const_zero()).map_err(lower)?;
     builder.build_unconditional_branch(args_head).map_err(lower)?;
 
@@ -1254,7 +1262,114 @@ fn emit_sqlite_scalar_callback_trampoline<'c>(
     let native_value = builder.build_load(ptr_ty, argv_slot, "native.value").map_err(lower)?.into_pointer_value();
     let native_null = builder.build_is_null(native_value, "native.null").map_err(lower)?;
     let classify = ctx.append_basic_block(callback, "arg.classify");
-    builder.build_conditional_branch(native_null, input_invalid, classify).map_err(lower)?;
+    let alias_init = ctx.append_basic_block(callback, "arg.alias.init");
+    let alias_head = ctx.append_basic_block(callback, "arg.alias.head");
+    let alias_compare = ctx.append_basic_block(callback, "arg.alias.compare");
+    let alias_reuse = ctx.append_basic_block(callback, "arg.alias.reuse");
+    let alias_next = ctx.append_basic_block(callback, "arg.alias.next");
+    builder.build_conditional_branch(native_null, input_invalid, alias_init).map_err(lower)?;
+
+    builder.position_at_end(alias_init);
+    builder.build_store(alias_ordinal_slot, i32_ty.const_zero()).map_err(lower)?;
+    builder.build_unconditional_branch(alias_head).map_err(lower)?;
+
+    builder.position_at_end(alias_head);
+    let alias_ordinal = builder
+        .build_load(i32_ty, alias_ordinal_slot, "alias.ordinal.current")
+        .map_err(lower)?
+        .into_int_value();
+    let aliases_done = builder
+        .build_int_compare(IntPredicate::EQ, alias_ordinal, ordinal, "alias.done")
+        .map_err(lower)?;
+    builder
+        .build_conditional_branch(aliases_done, classify, alias_compare)
+        .map_err(lower)?;
+
+    builder.position_at_end(alias_compare);
+    let alias_ordinal64 = builder
+        .build_int_s_extend(alias_ordinal, i64_ty, "alias.ordinal64")
+        .map_err(lower)?;
+    let prior_pointer_slot = unsafe {
+        builder
+            .build_in_bounds_gep(
+                pointer_scratch_ty,
+                pointer_scratch,
+                &[i64_ty.const_zero(), alias_ordinal64],
+                "alias.pointer.slot",
+            )
+            .map_err(lower)?
+    };
+    let prior_pointer = builder
+        .build_load(ptr_ty, prior_pointer_slot, "alias.pointer")
+        .map_err(lower)?
+        .into_pointer_value();
+    let prior_pointer_int = builder
+        .build_ptr_to_int(prior_pointer, i64_ty, "alias.pointer.int")
+        .map_err(lower)?;
+    let native_value_int = builder
+        .build_ptr_to_int(native_value, i64_ty, "native.value.int")
+        .map_err(lower)?;
+    let aliases = builder
+        .build_int_compare(
+            IntPredicate::EQ,
+            prior_pointer_int,
+            native_value_int,
+            "alias.matches",
+        )
+        .map_err(lower)?;
+    builder
+        .build_conditional_branch(aliases, alias_reuse, alias_next)
+        .map_err(lower)?;
+
+    builder.position_at_end(alias_next);
+    let next_alias = builder
+        .build_int_add(alias_ordinal, i32_ty.const_int(1, false), "alias.next")
+        .map_err(lower)?;
+    builder.build_store(alias_ordinal_slot, next_alias).map_err(lower)?;
+    builder.build_unconditional_branch(alias_head).map_err(lower)?;
+
+    builder.position_at_end(alias_reuse);
+    let prior_value_slot = unsafe {
+        builder
+            .build_in_bounds_gep(
+                scratch_ty,
+                scratch,
+                &[i64_ty.const_zero(), alias_ordinal64],
+                "alias.value.slot",
+            )
+            .map_err(lower)?
+    };
+    let prior_value = builder
+        .build_load(value_llvm_ty, prior_value_slot, "alias.value")
+        .map_err(lower)?;
+    let current_value_slot = unsafe {
+        builder
+            .build_in_bounds_gep(
+                scratch_ty,
+                scratch,
+                &[i64_ty.const_zero(), ordinal64],
+                "alias.destination",
+            )
+            .map_err(lower)?
+    };
+    let current_pointer_slot = unsafe {
+        builder
+            .build_in_bounds_gep(
+                pointer_scratch_ty,
+                pointer_scratch,
+                &[i64_ty.const_zero(), ordinal64],
+                "alias.pointer.destination",
+            )
+            .map_err(lower)?
+    };
+    builder.build_store(current_value_slot, prior_value).map_err(lower)?;
+    builder.build_store(current_pointer_slot, native_value).map_err(lower)?;
+    let next_ordinal = builder
+        .build_int_add(ordinal, i32_ty.const_int(1, false), "alias.ordinal.next")
+        .map_err(lower)?;
+    builder.build_store(ordinal_slot, next_ordinal).map_err(lower)?;
+    builder.build_unconditional_branch(args_head).map_err(lower)?;
+
     builder.position_at_end(classify);
     let storage_class = builder
         .build_call(value_type, &[native_value.into()], "storage.class")
@@ -1292,6 +1407,17 @@ fn emit_sqlite_scalar_callback_trampoline<'c>(
                     .map_err(lower)?
             };
             builder.build_store(destination, $value).map_err(lower)?;
+            let pointer_destination = unsafe {
+                builder
+                    .build_in_bounds_gep(
+                        pointer_scratch_ty,
+                        pointer_scratch,
+                        &[i64_ty.const_zero(), current64],
+                        "value.pointer.slot",
+                    )
+                    .map_err(lower)?
+            };
+            builder.build_store(pointer_destination, native_value).map_err(lower)?;
             let next = builder.build_int_add(current, i32_ty.const_int(1, false), "ordinal.next").map_err(lower)?;
             builder.build_store(ordinal_slot, next).map_err(lower)?;
             builder.build_unconditional_branch(args_head).map_err(lower)?;
@@ -1371,12 +1497,6 @@ fn emit_sqlite_scalar_callback_trampoline<'c>(
     let text_present = ctx.append_basic_block(callback, "arg.text.present");
     builder.build_conditional_branch(text_pointer_null, text_null, text_present).map_err(lower)?;
     builder.position_at_end(text_null);
-    let text_empty = builder
-        .build_int_compare(IntPredicate::EQ, text_len32, i32_ty.const_zero(), "text.empty")
-        .map_err(lower)?;
-    let text_null_error = ctx.append_basic_block(callback, "arg.text.null.error");
-    builder.build_conditional_branch(text_empty, text_present, text_null_error).map_err(lower)?;
-    builder.position_at_end(text_null_error);
     let error_code = builder
         .build_call(db_errcode, &[database.into()], "text.errcode")
         .map_err(lower)?
@@ -4382,6 +4502,7 @@ fn register_program_declaration(
             ProgramDeclaration {
                 signature,
                 classes: vec![class],
+                sqlite_callback_effect: None,
             },
         );
         return Ok(());
@@ -5033,6 +5154,17 @@ fn callable_declarations(
             },
         )?;
     }
+    for (target, effect) in &program.sqlite_callback_effects {
+        let declaration = declarations
+            .get_mut(target)
+            .ok_or_else(|| callable_target_error(target))?;
+        if declaration.classes.contains(&ProgramDeclarationClass::Extern)
+            || !matches!(effect, align_sema::FnEffect::Pure | align_sema::FnEffect::Impure)
+            || declaration.sqlite_callback_effect.replace(*effect).is_some()
+        {
+            return Err(callable_target_error(target));
+        }
+    }
     for declaration in declarations.values() {
         canonical_signature(&declaration.signature, program)?;
     }
@@ -5163,6 +5295,7 @@ fn callable_preflight(
                         if !descriptor_type_ok
                             || descriptor.family_version != 1
                             || declaration.classes.contains(&ProgramDeclarationClass::Extern)
+                            || declaration.sqlite_callback_effect != Some(descriptor.effect)
                             || descriptor.params != declaration.signature.params
                             || descriptor.param_modes != declaration.signature.modes
                             || descriptor.ret != declaration.signature.ret
@@ -19182,6 +19315,7 @@ mod tests {
         }];
         fns.extend(extra_fns);
         let program = Program {
+            sqlite_callback_effects: HashMap::new(),
             fns,
             externs: vec![],
             imported_fns: vec![],
@@ -19686,6 +19820,7 @@ mod tests {
             };
             emit_llvm_ir(
                 &Program {
+                    sqlite_callback_effects: HashMap::new(),
                     fns: std::iter::once(main)
                         .chain(descriptor_functions)
                         .collect(),
@@ -19992,6 +20127,7 @@ mod tests {
             };
             emit_llvm_ir(
                 &Program {
+                    sqlite_callback_effects: HashMap::new(),
                     fns: vec![function],
                     externs: Vec::new(),
                     imported_fns: Vec::new(),
@@ -20407,6 +20543,7 @@ mod tests {
     fn malformed_nested_tagged_id_is_a_codegen_error_not_a_panic() {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let program = Program {
+            sqlite_callback_effects: HashMap::new(),
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -20450,6 +20587,7 @@ mod tests {
     fn malformed_embedded_nested_tagged_id_is_a_codegen_error_not_a_panic() {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let program = Program {
+            sqlite_callback_effects: HashMap::new(),
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -20507,6 +20645,7 @@ mod tests {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let zero = Operand::Const(Const::Int(0, i32_ty));
         let program = Program {
+            sqlite_callback_effects: HashMap::new(),
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -20557,6 +20696,7 @@ mod tests {
     fn malformed_nested_tagged_nominal_ids_are_codegen_errors_not_panics() {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let program = |payload| Program {
+            sqlite_callback_effects: HashMap::new(),
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -20611,6 +20751,7 @@ mod tests {
     fn malformed_cross_table_tagged_cycles_are_codegen_errors_not_panics() {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let program = |structs, enums, tagged_types| Program {
+            sqlite_callback_effects: HashMap::new(),
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -20762,6 +20903,7 @@ mod tests {
     fn malformed_mir_type_graphs_fail_before_llvm_construction() {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let base = || Program {
+            sqlite_callback_effects: HashMap::new(),
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -21019,6 +21161,7 @@ mod tests {
     fn direct_tagged_slot_uses_its_recursive_drop_plan() {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let program = Program {
+            sqlite_callback_effects: HashMap::new(),
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -21062,6 +21205,7 @@ mod tests {
     fn tuple_drop_uses_recursive_element_destructor() {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let program = Program {
+            sqlite_callback_effects: HashMap::new(),
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -21103,6 +21247,7 @@ mod tests {
         );
 
         let program = Program {
+            sqlite_callback_effects: HashMap::new(),
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -21162,6 +21307,7 @@ mod tests {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let i64_scalar = Scalar::Int(IntTy { bits: 64, signed: true });
         let program = |tagged_types: Vec<hir::TaggedType>, value_tys: Vec<Ty>| Program {
+            sqlite_callback_effects: HashMap::new(),
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -21938,6 +22084,7 @@ mod tests {
         count_arg: bool,
     ) -> String {
         let program = Program {
+            sqlite_callback_effects: HashMap::new(),
             fns: vec![Function {
                 name: program_call(if count_arg { "allocation_probe" } else { "main" }),
                 params: if count_arg { vec![0] } else { vec![] },
@@ -21996,6 +22143,7 @@ mod tests {
     fn arena_allocation_case_ir() -> String {
         let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
         let program = Program {
+            sqlite_callback_effects: HashMap::new(),
             fns: vec![Function {
                 name: program_call("arena_allocation_probe"),
                 params: vec![0],
@@ -22043,6 +22191,7 @@ mod tests {
         let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
         let dynamic = matches!(len, Operand::Arg(0));
         let program = Program {
+            sqlite_callback_effects: HashMap::new(),
             fns: vec![Function {
                 name: program_call(if dynamic { "soa_allocation_probe" } else { "main" }),
                 params: if dynamic { vec![0] } else { vec![] },

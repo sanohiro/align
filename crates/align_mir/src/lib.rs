@@ -107,6 +107,10 @@ pub struct ImportedFn {
 #[derive(Clone, Debug, Default)]
 pub struct Program {
     pub fns: Vec<Function>,
+    /// Target-owned effect facts for functions named by SQLite callback descriptors. This table is
+    /// recomputed from checked HIR bodies independently of each descriptor's copied effect bit.
+    pub sqlite_callback_effects:
+        std::collections::HashMap<ProgramCall, align_sema::FnEffect>,
     /// Foreign (`extern "C"`) declarations, passed through from HIR unchanged; codegen emits an
     /// external LLVM declaration for each, keyed by the C symbol so a `Rvalue::Call` resolves.
     pub externs: Vec<ProgramExtern>,
@@ -2077,8 +2081,13 @@ fn lower_program_unchecked(
             link_libs.push(l);
         }
     }
+    let sqlite_callback_effects = align_sema::sqlite_callback_target_effects(program)
+        .into_iter()
+        .map(|(target, effect)| (ProgramCall::from_validated(&target), effect))
+        .collect();
     let mut mir = Program {
         fns,
+        sqlite_callback_effects,
         externs: program
             .externs
             .iter()
@@ -16860,6 +16869,7 @@ fn main() -> i32 = 0
             signed: true,
         });
         let mut program = Program {
+            sqlite_callback_effects: std::collections::HashMap::new(),
             fns: vec![Function {
                 name: ProgramCall::from_validated("main"),
                 params: vec![],

@@ -95,6 +95,17 @@ fn main() -> i32 {
 }
 "#;
 
+const CONSTRUCTED_ARGS_MAIN: &str = r#"module main
+import pkg.db
+import pkg.db.sqlite
+
+fn main() -> i32 {
+  values := [pkg.db.value.Null]
+  args := pkg.db.sqlite.function_args { values: values }
+  return args.values.len() as i32
+}
+"#;
+
 const INTERNAL_DESCRIPTOR_ACCESS_MAIN: &str = r#"module main
 import pkg.db
 import pkg.db.sqlite
@@ -156,6 +167,11 @@ import pkg.db.sqlite
 import pkg.db.testkit.callback
 
 fn inspect(args: pkg.db.sqlite.function_args) -> Result<pkg.db.value, str> {
+  if args.values.len() == 2 {
+    first := match args.values[0] { Text(value) => value.len(), _ => -1 }
+    second := match args.values[1] { Text(value) => value.len(), _ => -1 }
+    return Ok(pkg.db.value.I64(first + second))
+  }
   if args.values.len() != 1 { return Err("unexpected arity") }
   return match args.values[0] {
     Text(value) => Ok(pkg.db.value.I64(value.len()))
@@ -168,7 +184,7 @@ fn main() -> i32 {
   callback := pkg.db.sqlite.function(inspect)
   mut scenario := 0
   loop {
-    if scenario >= 14 { break }
+    if scenario >= 16 { break }
     result := pkg.db.testkit.callback.invoke(callback, scenario)
     if result != 42 { return result }
     scenario = scenario + 1
@@ -670,6 +686,10 @@ fn sqlite_callback_public_producer_accepts_only_one_exact_static_target() {
         &Layout::new().main(CONSTRUCTED_DESCRIPTOR_MAIN),
     );
     expect_checks_rejected(
+        "pkg-db-callback-constructed-args",
+        &Layout::new().main(CONSTRUCTED_ARGS_MAIN),
+    );
+    expect_checks_rejected(
         "pkg-db-callback-private-access",
         &Layout::new().main(INTERNAL_DESCRIPTOR_ACCESS_MAIN),
     );
@@ -705,6 +725,36 @@ fn sqlite_callback_descriptor_and_trampoline_have_the_exact_generated_llvm_shape
         false,
     )
     .expect("emit callback LLVM");
+    let mut stale_effect = built.unit("main").mir.clone();
+    let callback_target = stale_effect
+        .fns
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.stmts)
+        .find_map(|statement| match statement {
+            align_mir::Stmt::Let(
+                _,
+                align_mir::Rvalue::SqliteCallbackDescriptor(descriptor),
+            ) => Some(descriptor.target.clone()),
+            _ => None,
+        })
+        .expect("fixture contains a SQLite callback descriptor");
+    *stale_effect
+        .sqlite_callback_effects
+        .get_mut(&callback_target)
+        .expect("fixture retains the target-owned callback effect") = align_sema::FnEffect::Impure;
+    let stale_error = common::emit_llvm_ir(
+        &stale_effect,
+        common::BuildTarget::Baseline,
+        false,
+        &[],
+        false,
+    )
+    .expect_err("a descriptor effect that disagrees with its target must fail closed");
+    assert!(
+        stale_error.to_string().contains("callable target invalid"),
+        "unexpected stale callback effect error: {stale_error}",
+    );
     for (pipeline, llvm) in [("whole", &whole_llvm), ("per-unit", &per_unit_llvm)] {
         assert!(
             llvm.contains(

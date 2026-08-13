@@ -8040,6 +8040,34 @@ fn finalize_sqlite_callback_descriptor_effects(
     }
 }
 
+/// Recompute the target-owned effect facts needed by SQLite callback MIR validation. The returned
+/// map is independent of the effect cell carried by each descriptor expression, so a malformed
+/// post-HIR descriptor cannot make an Impure target appear Pure by changing one copied bit.
+pub fn sqlite_callback_target_effects(
+    program: &hir::Program,
+) -> std::collections::HashMap<String, FnEffect> {
+    let external_effects = program
+        .imported_fns
+        .iter()
+        .map(|function| (function.name.clone(), function.effect))
+        .collect::<std::collections::HashMap<_, _>>();
+    let effects = fn_effects(program, &external_effects);
+    let mut targets = std::collections::HashMap::new();
+    for function in &program.fns {
+        for event in hir_depth::body_events(&function.body) {
+            if let hir_depth::BodyEvent::ExprEnter(Expr {
+                kind: ExprKind::SqliteCallbackDescriptor { target, .. },
+                ..
+            }) = event
+                && let Some(effect) = effects.get(target).copied()
+            {
+                targets.insert(target.clone(), effect);
+            }
+        }
+    }
+    targets
+}
+
 /// Recompute all body-derived facts at the HIR/MIR boundary without trusting producer metadata.
 ///
 /// The caller must run the structural, type, placement, nominal, and declaration validators first;
@@ -28180,6 +28208,16 @@ impl<'a, 't> Checker<'a, 't> {
     fn check_struct_lit(&mut self, name: &ast::Path, fields: &[ast::FieldInit], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let Some(canonical) = self.canonical_type(name, name.span) else { return err };
+        if canonical == SQLITE_FUNCTION_ARGS_TYPE {
+            self.diags.error(
+                "SQLite callback arguments can only be formed by a callback invocation".to_string(),
+                span,
+            );
+            for field in fields {
+                let _ = self.check_expr(&field.value, None);
+            }
+            return err;
+        }
         // A generic struct literal (`Pair { a: 1, b: 2 }`): infer the type arguments from the field
         // values, then monomorphize. (Type arguments are not written at the literal — same as calls.)
         if let Some(tmpl) = self.struct_templates.get(&canonical).cloned() {

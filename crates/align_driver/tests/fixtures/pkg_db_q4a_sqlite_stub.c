@@ -599,7 +599,9 @@ int sqlite3_value_type(void *value) {
     case 3: return 99;
     case 4:
     case 5:
-    case 6: return 3;
+    case 6:
+    case 14:
+    case 15: return 3;
     case 7:
     case 8: return 4;
     case 9: return 2;
@@ -627,7 +629,9 @@ int sqlite3_value_bytes(void *value) {
     case 7: return 0;
     case 5: return 1;
     case 6:
+    case 14:
     case 8: return 2;
+    case 15: return 0;
     default: callback_protocol_ok = 0; return -1;
   }
 }
@@ -636,7 +640,9 @@ const unsigned char *sqlite3_value_text(void *value) {
   if (value == NULL || callback_step != 2) callback_protocol_ok = 0;
   callback_step = 3;
   if (callback_scenario == 4 || callback_scenario == 5) return NULL;
-  if (callback_scenario == 6) return callback_text;
+  if (callback_scenario == 6 || callback_scenario == 14 || callback_scenario == 15) {
+    return callback_text;
+  }
   callback_protocol_ok = 0;
   return NULL;
 }
@@ -651,7 +657,8 @@ const void *sqlite3_value_blob(void *value) {
 }
 
 static int callback_fixture_errcode(void *database) {
-  if (database == NULL || callback_step != 3 || callback_scenario != 5) {
+  if (database == NULL || callback_step != 3
+      || (callback_scenario != 4 && callback_scenario != 5)) {
     callback_protocol_ok = 0;
   }
   callback_step = 4;
@@ -698,7 +705,7 @@ int test_sqlite_callback_invoke(void *raw_callback, int scenario) {
   Callback callback = (Callback)raw_callback;
   void *context = &callback_scenario;
   void *value = &callback_scenario;
-  void *argv[1] = {value};
+  void *argv[2] = {value, NULL};
   void *many_argv[127];
   int argc = 1;
   void **arguments = argv;
@@ -748,19 +755,28 @@ int test_sqlite_callback_invoke(void *raw_callback, int scenario) {
     argc = 0;
     arguments = NULL;
   }
+  if (scenario == 14) {
+    argv[1] = value;
+    argc = 2;
+  }
   callback(context, argc, arguments);
   callback_fixture_active = 0;
   if (!callback_protocol_ok || callback_db_calls != 1 || callback_result_calls != 1) return 10 + scenario;
   if (scenario == 5) {
     return callback_step == 4 && callback_result_kind == 7 ? 42 : 20;
   }
-  if (scenario == 4 || scenario == 7) {
+  if (scenario == 7 || scenario == 15) {
     return callback_step == 3 && callback_result_kind == 2 && callback_result_i64 == 0 ? 42 : 21;
+  }
+  if (scenario == 14) {
+    return callback_step == 3 && callback_value_type_calls == 1
+      && callback_result_kind == 2 && callback_result_i64 == 4 ? 42 : 29;
   }
   if (scenario == 6 || scenario == 8) {
     return callback_step == 3 && callback_result_kind == 2 && callback_result_i64 == 2 ? 42 : 22;
   }
-  if (scenario == 0 || scenario == 1 || scenario == 2 || scenario == 3 || scenario == 9) {
+  if (scenario == 0 || scenario == 1 || scenario == 2 || scenario == 3
+      || scenario == 4 || scenario == 9) {
     const char *expected = "pkg.db SQLite function callback received an invalid native value";
     return callback_result_kind == 6
       && callback_error_len == (int)strlen(expected)
@@ -768,7 +784,7 @@ int test_sqlite_callback_invoke(void *raw_callback, int scenario) {
   }
   if (scenario == 12 || scenario == 13) {
     const char *expected = "unexpected arity";
-    int expected_types = scenario == 12 ? 127 : 0;
+    int expected_types = scenario == 12 ? 1 : 0;
     return callback_result_kind == 6
       && callback_value_type_calls == expected_types
       && callback_error_len == (int)strlen(expected)
