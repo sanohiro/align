@@ -326,7 +326,9 @@ Required meaning:
 
 - `db.conn` is an opaque Move resource owning one physical SQLite or PostgreSQL connection.
 - `db.tx` is an opaque Move resource that owns the connection moved into a transaction. Dropping an
-  active transaction performs fail-safe rollback and then closes the connection, never commit.
+  active transaction performs fail-safe rollback and never commits. A direct-driver connection then
+  closes; D13 permits a pool-origin connection to return only after the pool ledger's exact
+  rollback-and-native-idle proof, otherwise it closes and retires that slot.
 - `db.exec` is a short-lived borrowed execution view produced from either a connection or a
   transaction. This lets a Query be reused inside and outside a transaction without a public trait.
 - `db.query<P, R>` is a Copy static descriptor containing SQL identity, parameter contract, row
@@ -1944,8 +1946,10 @@ conn := db.rollback(tx)?
 
 `begin` consumes `conn`; the caller cannot use the connection while the transaction is active.
 `commit` and `rollback` consume `tx` and return the connection on success. A failed explicit end or
-Drop performs best-effort rollback and closes the owned connection; it never returns a connection in
-an unknown transaction state and MUST NOT commit.
+Drop performs fail-safe rollback and MUST NOT commit. A direct-driver connection closes. D13's
+pool-origin exception returns the connection only after the exact native rollback-and-idle proof in
+the pool ledger; a missing/failed proof closes it and retires the slot. Neither path returns a
+connection in an unknown transaction state.
 
 ### 14.2 Native transaction options
 
@@ -4030,7 +4034,8 @@ this path first lands or changes.
 - `db.begin` consumes `db.conn`;
 - `db.exec_conn` and `db.exec_tx` return the same borrowed type;
 - `db.commit`/`db.rollback` consume `db.tx` and return `db.conn`;
-- Drop rollback closes the connection;
+- Drop rollback closes a direct-driver connection; D13's pool-origin exception returns only after
+  its exact rollback-and-idle proof and otherwise closes/retires;
 - the exact common/SQLite/PostgreSQL transaction option sums from §11–§14;
 - SQLite begin modes;
 - PostgreSQL isolation/read-only/deferrable combinations and pre-BEGIN conflict rejection;
@@ -4054,7 +4059,7 @@ model.
 | PostgreSQL prepared lifecycle | Validate each `ParameterOid(name, oid)` against the concrete Params contract before `PQprepare`, reject unknown/duplicate/zero OIDs, allocate one connection-local collision-free statement name, use `PQexecPrepared`, clear every result/context once, and best-effort `DEALLOCATE` on stmt Drop. No process/global cache exists. | PostgreSQL required prepare/reuse and option owner plus native stub lifecycle counters |
 | transaction formation and options | Validate common options first and driver options in source order before `BEGIN`. `begin` consumes conn only after successful native begin, uses exact SQLite mode SQL and exact PostgreSQL isolation/access/deferrable clause, and rejects invalid PostgreSQL combinations before send. | common/native option precedence, SQLite three-mode owner, required PostgreSQL combination/no-send owner |
 | transaction execution and joins | A live tx carries the same validated connection prefix as conn. Every existing common/native execution and inspection path accepts `exec.Tx` without a second trait/ABI; use-after-end, conn/tx aliases, and commit/rollback while a stmt/rows child is live are compile-time errors. | common command/Query inside both driver transactions, metadata/EXPLAIN tx owner, compile-fail alias/child matrix |
-| commit, rollback, and Drop | `commit`/`rollback` consume tx and return conn only after certain native success. An end error leaves the tx owner live for fail-safe rollback+close. Implicit Drop never commits: it best-effort rolls back, closes once, nulls transferred state, and frees the wrapper in native order. | success/error/early-return/branch/`?` end matrix and close/rollback/commit counters |
+| commit, rollback, and Drop | `commit`/`rollback` consume tx and return conn only after certain native success. An end error leaves the tx owner live for fail-safe rollback. Implicit Drop never commits: it rolls back, nulls transferred state, and frees the wrapper in native order. Direct-driver state closes once. D13 pool-origin state returns only after the exact driver rollback-and-idle proof and otherwise closes/retires. | success/error/early-return/branch/`?` end matrix and close/rollback/commit/pool-return counters |
 | generic and ABI closure | Bump the fixed 8-aligned execution descriptor from 104-byte v2 to 120-byte v3 while leaving offsets 0–103 unchanged. Offset 104 is one non-null producer-owned `fn(name: str) -> i32` parameter-ordinal resolver for Query and command, offset 112 is the exact `u32` distinct-parameter count, and offset 116 is reserved zero. The generic stmt binder bridge is package-private, requires a concrete `stmt<P,R>` reference and matching P, lowers to the retained producer thunk with exact borrow modes, and is rejected from application source or malformed HIR. Whole-program and per-unit linkage retain the producer thunk and both native libraries only when reachable. | sema/MIR fail-closed bridge owner, exact descriptor-size/offset/signature owner, whole/per-unit runtime parity |
 | explicit later cells | Q4a does not publish `next`, borrowed current-row views, common deadline enforcement, cancellation, portals, or a statement cache. D8 owns typed row delivery/generation and the full bind/decode type matrix; D9 owns deadline/cancel completion. Q4a nevertheless closes rows resource cleanup and prepared text/blob copy lifetime needed by those consumers. | absence/interface golden plus the Q4b/D8+D9 matrix |
 
@@ -5196,14 +5201,23 @@ until the last checked-out conn/tx drops. The acquired owner therefore supports 
 common/native Query, command, metadata, EXPLAIN, prepared statement, row stream, batch, and
 transaction operation without a pool-specific execution path.
 
-Dropping an idle, live acquired `db.conn` returns that exact physical state to the originating pool
-in LIFO order, with no reset SQL, rollback, health probe, reconnect, or allocation. `commit` and
-`rollback` return the same attached state as `db.conn`; dropping `db.tx` first performs the settled
-fail-safe rollback and then returns it only after an exact idle proof: SQLite requires
+Dropping a live acquired `db.conn` into an open originating pool first requires the package wrapper
+to have no execution lease or transaction owner and then proves native transaction idleness:
+SQLite requires `sqlite3_get_autocommit(connection) != 0`, and PostgreSQL requires
+`PQtransactionStatus(connection) == PQTRANS_IDLE`. A missing or failed proof poisons/closes the
+connection and retires the slot. Success returns that exact physical state in LIFO order, with no
+reset SQL, rollback, health probe, reconnect, or allocation. This is a transaction-safety boundary,
+not session sanitization: successful session-global changes such as supported PRAGMAs, PostgreSQL
+`SET`, temporary objects, and advisory state remain properties of that physical connection and may
+be observed by its next acquirer. Callers that need fresh session state must open a new pool or use
+explicit inverse native operations before Drop; the pool neither infers nor compensates them.
+
+`commit` and `rollback` return the same attached state as `db.conn`; dropping `db.tx` first performs
+the settled fail-safe rollback and then returns it only after a stronger exact rollback-and-idle
+proof: SQLite requires
 `sqlite3_exec("ROLLBACK") == SQLITE_OK` and `sqlite3_get_autocommit(connection) != 0`; PostgreSQL
 requires a non-null `PGRES_COMMAND_OK` result, exact `ROLLBACK` command status, and `PQTRANS_IDLE`
-after clear. Any missing or failed proof
-poisons/closes and retires the slot. Existing dependent
+after clear. Any missing or failed proof poisons/closes and retires the slot. Existing dependent
 stmt/rows resources prevent their conn/tx parent from dropping, so no active result or prepared
 handle can enter the idle array. Any path that poisons/closes the native connection retains the
 checked-out accounting until conn/tx Drop, then frees that state instead of returning it. Capacity is
@@ -5240,7 +5254,11 @@ at 5, zero `u16` at 6, signed `capacity`/`idle`/`checked_out` at 8/16/24, non-nu
 at 32, and zero `u64` at 40. The array has exactly `capacity` pointer cells; only `[0,idle)` owns
 non-null connection states. Constructor publication, acquire, return, retirement, Pool Drop, and
 last-checkout Drop are the only transitions. No state pointer, slot array, or counter enters a public
-ABI, persisted artifact, cache key, or FFI signature.
+ABI, persisted artifact, cache key, or FFI signature. `pkg.db.internal.resource` owns the shared
+conn-origin/pool-record validators and transitions so `drop_conn`/`drop_tx` never import upward into
+the public pool module. `pkg.db.pool.internal.resource.drop_pool` is the required descendant hook and
+delegates its raw owner downward to that common authority; `pkg.db.pool` constructs/observes through
+the same sealed helpers. This keeps the module graph acyclic and gives the layout one owner.
 
 The implementation is one capability PR: splitting the pool producer from conn/tx return would
 leave either a dormant pool or a connection Drop path that closes instead of returning its owner.
@@ -5256,17 +5274,25 @@ Implementation closure matrix:
 | public surface and errors | Export only the constant, resource, Info, two constructors, `try_acquire`, and `info`; add exactly payload-free `db.Error.PoolExhausted`; update interface/cache identity once. | source/interface golden; whole/per-unit imported call and exhaustive Error match; absence of acquire/close/release/adopt aliases |
 | capacity and constructor validation | Capacity wins every multi-invalid product and rejects 0, negative, 1025, and `i64` extrema before allocation/native work. Valid 1/1024 delegates exact driver validation and opens ordinals in order. | allocation/connect counters; capacity x NUL/invalid-option winner matrix; both-driver boundary owners |
 | partial formation cleanup | Failure/null at each physical ordinal closes prior unpublished connections once in reverse order, frees every raw owner, returns the exact failing driver error, and publishes no pool. | parameterized ordinal failpoints and allocation/native close ledger for SQLite/PostgreSQL |
-| acquisition, observation, and ordering | Complete state validation precedes slot reads. Initial and returned states pop LIFO; success changes idle/checked-out by exactly one with no allocation/clock/native call. Empty valid state returns exact `PoolExhausted` without mutation. | byte/counter snapshots, session-identity LIFO probe, exhaustion replay, `info` before/during/after checkout |
+| acquisition, observation, and ordering | Complete state validation precedes slot reads. Initial and returned states pop LIFO; success changes idle/checked-out by exactly one with no allocation/clock/native call. Empty valid state returns exact `PoolExhausted` without mutation. Session-global state intentionally follows the physical LIFO slot. | byte/counter snapshots, session-identity and session-state LIFO probes, exhaustion replay, `info` before/during/after checkout |
 | conn/tx ownership transfer | A checked-out conn carries its origin through begin, commit, rollback, failed commit/rollback cleanup, moves, returns, replacement, branches, loops, `?`, and Drop. Tx Drop returns only after the exact SQLite/PostgreSQL rollback-and-idle proof above; no dependency is laundered through raw provenance. | existing Q4a transaction matrix extended with pool counters, rollback status/tag/transaction-state failpoints, and whole/per-unit paths |
 | dependent execution resources | stmt, rows, batch views, catalog cursors, and EXPLAIN retain existing parent generations and leases; conn/tx cannot return while a child is live, and child Drop completes before pool return. | compile-time parent-overlap negatives plus Q4a/Q4b/Q5b2/A1 pooled execution owners on both drivers |
-| poison, close, and retirement | Every existing poison/close cause makes later state reuse fail; conn/tx Drop frees rather than idles it, decrements checked-out once, and leaves a visible capacity gap without reconnect/reset. Ordinary database errors that retain synchronization still return the connection. | driver status/timeout/restore/rollback failure matrix; info/exhaustion after retirement; zero reconnect/reset calls |
+| poison, close, and retirement | Every existing poison/close cause and every failed conn-return native-idle or tx rollback-and-idle proof makes later state reuse fail; conn/tx Drop frees rather than idles it, decrements checked-out once, and leaves a visible capacity gap without reconnect/reset. Ordinary database errors that retain synchronization and native idleness still return the connection. | driver status/timeout/restore/conn-idle/rollback failure matrix, including raw transaction-control command leakage attempts; info/exhaustion after retirement; zero reconnect/reset calls |
 | Pool Drop with outstanding owners | Closing publishes before idle teardown, closes each idle owner once, keeps bookkeeping while checkouts exist, permits those conn/tx operations, then closes each on Drop and frees bookkeeping exactly at the last outstanding owner. | zero/one/many idle x zero/one/many checked-out allocation/close/order matrix, including tx and dependent stmt/rows |
-| private ABI and malformed state | All v2 conn and v1 pool offsets, tags, reserved bytes, counts, native-pointer products, and slot prefix agree across constructor/accessor/Drop. Malformed authenticated fields fail before slot/native access and never dispatch through an unknown driver; raw origin/slot pointer validity remains the privileged unsafe producer's obligation. | exact byte goldens; one-field-at-a-time scalar/tag/null corruption no-call owners; v1 conn and unknown pool lifecycle rejection; constructor-origin transition assertions |
+| private ABI and malformed state | All v2 conn and v1 pool offsets, tags, reserved bytes, counts, native-pointer products, and slot prefix agree across the one common internal authority, constructor/accessor, thin descendant Drop hook, and conn/tx Drop. Malformed authenticated fields fail before slot/native access and never dispatch through an unknown driver; raw origin/slot pointer validity remains the privileged unsafe producer's obligation. | exact byte goldens; one-field-at-a-time scalar/tag/null corruption no-call owners; v1 conn and unknown pool lifecycle rejection; constructor-origin transition and no-upward-import assertions |
 | driver and build parity | Direct and pooled connections share the same execution code and result/error identity; pool code retains both driver producer Drop thunks under whole-program/per-unit builds and uses no ambient configuration. | complete fake-driver matrix, live SQLite and PostgreSQL acquire/use/tx/reuse/Drop cases, `scripts/db-verify-local.sh` |
 
-Run one fresh independent adversarial review of this ledger and the one-PR boundary before
-implementation. Resolve findings ledger-first. Before code review, perform one author-side
-matrix-to-diff pass and point every applicable cell to its implementation and discriminating owner.
+The fresh independent adversarial design review of `3da5488c` found one P1 and two P2 gaps. This
+ledger-first revision closes the complete finding set:
+
+| Finding | Ledger-first closure | Required owner |
+|---|---|---|
+| a wrapper-idle conn could hide native `BEGIN`/`START TRANSACTION` and leak a transaction across acquisitions | Require the exact driver-native idle proof on every conn return, retire on failure, and state separately that non-transaction session state remains attached. | raw transaction-control command x SQLite/PostgreSQL native-idle/retirement/no-next-acquirer matrix |
+| pooled tx Drop contradicted the settled close-only rule | Qualify every earlier transaction rule: direct state closes, while pool-origin state may return only after the stronger exact rollback-and-idle proof. | explicit-end failure and implicit Drop x direct/pool x rollback proof success/failure |
+| the exact pool contract had no Settled record | Record the fixed-capacity non-waiting pool separately from the still-open general Send/thread-safe mutable-state question. | source-of-truth consistency check |
+
+Before code review, perform one author-side matrix-to-diff pass and point every applicable cell to
+its implementation and discriminating owner.
 
 - bounded `next_batch`, batch generations, segmented child buffers, nullable validity bitmaps, and
   direct eligible `soa<Row>` decode with no intermediate AoS — shipped by the first A1 rail;
@@ -5500,8 +5526,9 @@ The design is implemented correctly only if all are true:
     driver input set, and partial formation closes every unpublished owner before returning the
     exact driver error.
 96. A checked-out conn preserves one pool origin through conn/tx conversion and every dependent
-    execution resource. Live Drop returns it LIFO, poison retires it, and neither path resets or
-    reconnects.
+    execution resource. Live Drop returns it LIFO only after exact native-idle proof, poison or a
+    failed proof retires it, and neither path resets or reconnects; other session-global state
+    intentionally remains attached to the physical slot.
 97. Pool Drop closes idle connections first but does not invalidate checked-out conn/tx owners; the
     last later owner Drop closes its connection and frees retained bookkeeping exactly once.
 98. `db.Error.PoolExhausted` is payload-free and allocation-free; `pkg.db.pool.Info` exposes exact
