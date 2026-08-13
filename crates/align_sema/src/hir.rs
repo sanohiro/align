@@ -428,6 +428,13 @@ pub enum ExprKind {
     Str(String),
     Bool(bool),
     Local(LocalId),
+    /// A compiler-produced `pkg.db.sqlite.scalar_function` descriptor for one exact noncapturing
+    /// Align callback target. The target is retained as a declaration identity, never lowered
+    /// through the ordinary function-value/closure representation.
+    SqliteCallbackDescriptor {
+        target: String,
+        effect: std::cell::Cell<crate::FnEffect>,
+    },
     Unary {
         op: UnOp,
         expr: Box<Expr>,

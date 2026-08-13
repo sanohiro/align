@@ -347,6 +347,25 @@ pub fn emit_llvm_optimized(src: &str, exports: &[&str]) -> String {
         .expect("emit optimized llvm ir")
 }
 
+/// Whole-program LLVM IR for one multi-file fixture. This is the non-linking twin of
+/// [`build_exe_multi`], used when an owner must inspect generated ABI shape without requiring every
+/// native dependency to be installed on the host.
+pub fn emit_llvm_multi(name: &str, files: &[(&str, &str)], entry: &str) -> String {
+    let proj = TempProject::new(name, files);
+    let entry_path = proj.entry(entry);
+    let entry_src = std::fs::read_to_string(&entry_path).expect("read entry");
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, &entry_path.display().to_string(), &entry_src);
+    assert!(
+        !checked.diags.has_errors(),
+        "unexpected errors:\n{}",
+        align_driver::format_diagnostics(&sm, &checked.diags)
+    );
+    let mir = lower_to_mir(&checked.hir);
+    align_driver::emit_llvm_ir(&mir, BuildTarget::Baseline, false, &[], false)
+        .expect("emit multi-file LLVM IR")
+}
+
 /// Whether checking `src` produces any error (for negative tests).
 pub fn check_errs(name: &str, src: &str) -> bool {
     let mut sm = SourceMap::new();

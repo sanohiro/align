@@ -250,6 +250,10 @@ fn rvalue_str(rv: &Rvalue) -> String {
                 }
             }
         }
+        Rvalue::SqliteCallbackDescriptor(descriptor) => format!(
+            "sqlite_callback(target={}, effect={:?}, family={})",
+            descriptor.target, descriptor.effect, descriptor.family_version
+        ),
         Rvalue::CallWithCleanup(call) => {
             let crate::DirectCallWithCleanup { target, args, cleanup } = call.as_ref();
             let a: Vec<String> = args.iter().map(operand_str).collect();

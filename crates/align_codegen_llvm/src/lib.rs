@@ -729,6 +729,924 @@ struct CallablePreflight {
     generated_names: HashMap<GeneratedId, String>,
 }
 
+fn sqlite_callback_bytes_global<'c>(
+    ctx: &'c Context,
+    module: &Module<'c>,
+    name: &str,
+    bytes: &[u8],
+) -> PointerValue<'c> {
+    let value = ctx.const_string(bytes, false);
+    let global = module.add_global(value.get_type(), None, name);
+    global.set_initializer(&value);
+    global.set_constant(true);
+    mark_private_unnamed_addr(global);
+    global.as_pointer_value()
+}
+
+const SQLITE_CALLBACK_REGISTER_HELPER: &str = "align_pkg_db_sqlite_register_v1";
+
+#[derive(Clone, Copy)]
+struct SqliteCallbackContractTypes {
+    args: u32,
+    value: u32,
+    byte_view: u32,
+}
+
+/// Validate the complete source/LLVM type closure used by the generated reverse-C bridge before
+/// any layout-specific extraction. Keeping this as one authority makes malformed MIR a diagnostic
+/// instead of letting a plausible-but-wrong tagged layout reach `into_*_value` or field indexing.
+fn sqlite_callback_contract_types(
+    program: &Program,
+    signature: &ProgramSignature,
+) -> Result<SqliteCallbackContractTypes, CodegenError> {
+    let [Ty::Struct(args)] = signature.params.as_slice() else {
+        return Err(CodegenError::Lowering(
+            "SQLite scalar callback has an incompatible parameter ABI".into(),
+        ));
+    };
+    if signature.modes != [align_ast::ParamMode::ByValue] {
+        return Err(CodegenError::Lowering(
+            "SQLite scalar callback has an incompatible parameter mode".into(),
+        ));
+    }
+    let value = program
+        .enums
+        .iter()
+        .position(|definition| definition.source_name == "pkg.db$value")
+        .and_then(|id| u32::try_from(id).ok())
+        .ok_or_else(|| {
+            CodegenError::Lowering("pkg.db.value is absent from a SQLite callback unit".into())
+        })?;
+    if signature.ret != Ty::Result(Scalar::Enum(value), Scalar::Str) {
+        return Err(CodegenError::Lowering(
+            "SQLite scalar callback has an incompatible return ABI".into(),
+        ));
+    }
+    let args_definition = program
+        .structs
+        .get(*args as usize)
+        .filter(|definition| {
+            definition.source_name == "pkg.db.sqlite$function_args"
+                && matches!(
+                    definition.fields.as_slice(),
+                    [hir::FieldDef { name, ty: Ty::Slice(Scalar::Enum(id)) }]
+                        if name == "values" && *id == value
+                )
+                && definition.align.is_none()
+                && !definition.c_repr
+        })
+        .ok_or_else(|| {
+            CodegenError::Lowering(
+                "pkg.db.sqlite.function_args has an incompatible callback layout".into(),
+            )
+        })?;
+    let _ = args_definition;
+
+    let value_definition = program.enums.get(value as usize).ok_or_else(|| {
+        CodegenError::Lowering("pkg.db.value has an incompatible callback layout".into())
+    })?;
+    let expected = [
+        ("Null", Vec::new(), 1),
+        ("Bool", vec![Scalar::Bool], 1),
+        ("I16", vec![Scalar::Int(align_sema::IntTy { bits: 16, signed: true })], 2),
+        ("I32", vec![Scalar::Int(align_sema::IntTy { bits: 32, signed: true })], 3),
+        ("I64", vec![Scalar::Int(align_sema::IntTy { bits: 64, signed: true })], 4),
+        ("F32", vec![Scalar::Float(align_sema::FloatTy { bits: 32 })], 5),
+        ("F64", vec![Scalar::Float(align_sema::FloatTy { bits: 64 })], 6),
+        ("Text", vec![Scalar::Str], 7),
+    ];
+    let prefix_valid = value_definition.variants.len() == 9
+        && value_definition
+            .variants
+            .iter()
+            .take(expected.len())
+            .zip(expected.iter())
+            .all(|(variant, (name, payload, field_base))| {
+                variant.name == *name
+                    && variant.payload == *payload
+                    && variant.field_base == *field_base
+            });
+    let bytes_variant = value_definition.variants.get(8);
+    let byte_view = match bytes_variant {
+        Some(hir::EnumVariant {
+            name,
+            payload,
+            field_base: 8,
+        }) if name == "Bytes" => match payload.as_slice() {
+            [Scalar::Struct(id)] => Some(*id),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(byte_view) = byte_view.filter(|_| prefix_valid) else {
+        return Err(CodegenError::Lowering(
+            "pkg.db.value has an incompatible callback layout".into(),
+        ));
+    };
+    let byte_view_definition = program
+        .structs
+        .get(byte_view as usize)
+        .filter(|definition| {
+            definition.source_name == "pkg.db$byte_view"
+                && matches!(
+                    definition.fields.as_slice(),
+                    [hir::FieldDef {
+                        name,
+                        ty: Ty::Slice(Scalar::Int(align_sema::IntTy {
+                            bits: 8,
+                            signed: false,
+                        })),
+                    }] if name == "bytes"
+                )
+                && definition.align.is_none()
+                && !definition.c_repr
+        })
+        .ok_or_else(|| {
+            CodegenError::Lowering("pkg.db.byte_view has an incompatible callback layout".into())
+        })?;
+    let _ = byte_view_definition;
+
+    Ok(SqliteCallbackContractTypes {
+        args: *args,
+        value,
+        byte_view,
+    })
+}
+
+/// Define the package-private registration shim declared by `pkg.db.sqlite`. Its source-visible
+/// `str` argument arrives through the existing FFI view ABI as the data pointer; the explicit
+/// length follows as a separate argument so the shim can form the promised fixed stack C string.
+fn emit_sqlite_callback_register_helper<'c>(
+    ctx: &'c Context,
+    module: &Module<'c>,
+    helper: FunctionValue<'c>,
+) -> Result<(), CodegenError> {
+    let lower = |error: inkwell::builder::BuilderError| CodegenError::Lowering(error.to_string());
+    if helper.count_basic_blocks() != 0 {
+        return Err(CodegenError::Lowering("SQLite callback registration helper was defined more than once".into()));
+    }
+    let ptr_ty = ctx.ptr_type(AddressSpace::default());
+    let i8_ty = ctx.i8_type();
+    let i32_ty = ctx.i32_type();
+    let i64_ty = ctx.i64_type();
+    let expected_helper_ty = i32_ty.fn_type(
+        &[
+            ptr_ty.into(),
+            ptr_ty.into(),
+            i64_ty.into(),
+            i32_ty.into(),
+            i32_ty.into(),
+            ptr_ty.into(),
+        ],
+        false,
+    );
+    if helper.get_type() != expected_helper_ty {
+        return Err(CodegenError::Lowering(
+            "SQLite callback registration helper has an incompatible ABI".into(),
+        ));
+    }
+    let create_ty = i32_ty.fn_type(
+        &[
+            ptr_ty.into(),
+            ptr_ty.into(),
+            i32_ty.into(),
+            i32_ty.into(),
+            ptr_ty.into(),
+            ptr_ty.into(),
+            ptr_ty.into(),
+            ptr_ty.into(),
+            ptr_ty.into(),
+        ],
+        false,
+    );
+    let create = module
+        .get_function("sqlite3_create_function_v2")
+        .unwrap_or_else(|| module.add_function("sqlite3_create_function_v2", create_ty, None));
+    if create.get_type() != create_ty {
+        return Err(CodegenError::Lowering(
+            "SQLite callback registration native declaration has an incompatible ABI".into(),
+        ));
+    }
+    let builder = ctx.create_builder();
+    let entry = ctx.append_basic_block(helper, "entry");
+    let valid = ctx.append_basic_block(helper, "valid");
+    let invalid = ctx.append_basic_block(helper, "invalid");
+    builder.position_at_end(entry);
+    let params = (0..6)
+        .map(|index| helper.get_nth_param(index))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            CodegenError::Lowering("SQLite callback registration helper lost a parameter".into())
+        })?;
+    let [database, name, name_len, arity, flags, trampoline] = params.as_slice() else {
+        return Err(CodegenError::Lowering(
+            "SQLite callback registration helper has an incompatible parameter count".into(),
+        ));
+    };
+    let database = (*database).into_pointer_value();
+    let name = (*name).into_pointer_value();
+    let name_len = (*name_len).into_int_value();
+    let arity = (*arity).into_int_value();
+    let flags = (*flags).into_int_value();
+    let trampoline = (*trampoline).into_pointer_value();
+    let database_ok = builder.build_is_not_null(database, "database.ok").map_err(lower)?;
+    let name_ok = builder.build_is_not_null(name, "name.ok").map_err(lower)?;
+    let len_positive = builder
+        .build_int_compare(IntPredicate::SGT, name_len, i64_ty.const_zero(), "name.len.positive")
+        .map_err(lower)?;
+    let len_bounded = builder
+        .build_int_compare(IntPredicate::SLE, name_len, i64_ty.const_int(255, false), "name.len.bounded")
+        .map_err(lower)?;
+    let mut input_ok = builder.build_and(database_ok, name_ok, "input.pointer.ok").map_err(lower)?;
+    input_ok = builder.build_and(input_ok, len_positive, "input.len.positive").map_err(lower)?;
+    input_ok = builder.build_and(input_ok, len_bounded, "input.ok").map_err(lower)?;
+    builder.build_conditional_branch(input_ok, valid, invalid).map_err(lower)?;
+
+    builder.position_at_end(invalid);
+    builder.build_return(Some(&i32_ty.const_int(21, false))).map_err(lower)?;
+
+    builder.position_at_end(valid);
+    let scratch_ty = i8_ty.array_type(256);
+    let scratch = builder.build_alloca(scratch_ty, "name.scratch").map_err(lower)?;
+    let scratch_data = unsafe {
+        builder
+            .build_in_bounds_gep(scratch_ty, scratch, &[i64_ty.const_zero(), i64_ty.const_zero()], "name.data")
+            .map_err(lower)?
+    };
+    builder.build_memcpy(scratch_data, 1, name, 1, name_len).map_err(lower)?;
+    let terminator = unsafe {
+        builder
+            .build_in_bounds_gep(i8_ty, scratch_data, &[name_len], "name.terminator")
+            .map_err(lower)?
+    };
+    builder.build_store(terminator, i8_ty.const_zero()).map_err(lower)?;
+    let null = ptr_ty.const_null();
+    let status = builder
+        .build_call(
+            create,
+            &[
+                database.into(),
+                scratch_data.into(),
+                arity.into(),
+                flags.into(),
+                null.into(),
+                trampoline.into(),
+                null.into(),
+                null.into(),
+                null.into(),
+            ],
+            "status",
+        )
+        .map_err(lower)?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| {
+            CodegenError::Lowering("sqlite3_create_function_v2 returned no status".into())
+        })?;
+    builder.build_return(Some(&status)).map_err(lower)?;
+    mark_private_helper(helper);
+    Ok(())
+}
+
+/// Emit the complete reverse-C bridge for one statically selected SQLite scalar callback.
+///
+/// The package owns registration and descriptor authentication. This generated boundary owns the
+/// SQLite value ABI because ordinary Align source cannot manufacture invocation-scoped native
+/// views or a C entrypoint. All semantic target/effect/provenance facts were fixed in HIR/MIR; this
+/// routine only lowers that closed contract to control flow and native calls.
+#[allow(clippy::too_many_arguments)]
+fn emit_sqlite_scalar_callback_trampoline<'c>(
+    ctx: &'c Context,
+    module: &Module<'c>,
+    callback: FunctionValue<'c>,
+    id: &GeneratedId,
+    program: &Program,
+    callable_preflight: &CallablePreflight,
+    program_funcs: &HashMap<ProgramCall, FunctionValue<'c>>,
+    runtime_funcs: &HashMap<RuntimeKey, FunctionValue<'c>>,
+    struct_types: &[StructType<'c>],
+    enum_types: &[StructType<'c>],
+) -> Result<(), CodegenError> {
+    let lower = |error: inkwell::builder::BuilderError| CodegenError::Lowering(error.to_string());
+    let GeneratedId::SqliteScalarCallback { target, .. } = id else {
+        return Err(CodegenError::Lowering("non-SQLite generated id reached SQLite trampoline emission".into()));
+    };
+    let declaration = callable_preflight
+        .declarations
+        .get(target)
+        .ok_or_else(|| callable_target_error(target))?;
+    let target_fn = program_funcs
+        .get(target)
+        .copied()
+        .ok_or_else(|| callable_target_error(target))?;
+    let contract = sqlite_callback_contract_types(program, &declaration.signature)?;
+    let args_id = contract.args;
+    let value_id = contract.value;
+    let byte_view_id = contract.byte_view;
+    let value_definition = program.enums.get(value_id as usize).ok_or_else(|| {
+        CodegenError::Lowering("pkg.db.value has an incompatible callback layout".into())
+    })?;
+
+    let ptr_ty = ctx.ptr_type(AddressSpace::default());
+    let i8_ty = ctx.i8_type();
+    let i32_ty = ctx.i32_type();
+    let i64_ty = ctx.i64_type();
+    let f32_ty = ctx.f32_type();
+    let f64_ty = ctx.f64_type();
+    let native = |name: &str, ty: FunctionType<'c>| {
+        let function = module.get_function(name).unwrap_or_else(|| module.add_function(name, ty, None));
+        if function.get_type() != ty {
+            return Err(CodegenError::Lowering(format!(
+                "SQLite callback native declaration '{name}' has an incompatible ABI"
+            )));
+        }
+        Ok(function)
+    };
+    let ptr_from_ptr = ptr_ty.fn_type(&[ptr_ty.into()], false);
+    let i32_from_ptr = i32_ty.fn_type(&[ptr_ty.into()], false);
+    let context_db = native("sqlite3_context_db_handle", ptr_from_ptr)?;
+    let value_type = native("sqlite3_value_type", i32_from_ptr)?;
+    let value_int64 = native("sqlite3_value_int64", i64_ty.fn_type(&[ptr_ty.into()], false))?;
+    let value_double = native("sqlite3_value_double", f64_ty.fn_type(&[ptr_ty.into()], false))?;
+    let value_bytes = native("sqlite3_value_bytes", i32_from_ptr)?;
+    let value_text = native("sqlite3_value_text", ptr_from_ptr)?;
+    let value_blob = native("sqlite3_value_blob", ptr_from_ptr)?;
+    let db_errcode = native("sqlite3_errcode", i32_from_ptr)?;
+    let result_null = native("sqlite3_result_null", ctx.void_type().fn_type(&[ptr_ty.into()], false))?;
+    let result_int64 = native(
+        "sqlite3_result_int64",
+        ctx.void_type().fn_type(&[ptr_ty.into(), i64_ty.into()], false),
+    )?;
+    let result_double = native(
+        "sqlite3_result_double",
+        ctx.void_type().fn_type(&[ptr_ty.into(), f64_ty.into()], false),
+    )?;
+    let result_view_ty = ctx
+        .void_type()
+        .fn_type(&[ptr_ty.into(), ptr_ty.into(), i32_ty.into(), ptr_ty.into()], false);
+    let result_text = native("sqlite3_result_text", result_view_ty)?;
+    let result_blob = native("sqlite3_result_blob", result_view_ty)?;
+    let result_error = native(
+        "sqlite3_result_error",
+        ctx.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into(), i32_ty.into()], false),
+    )?;
+    let result_error_nomem = native(
+        "sqlite3_result_error_nomem",
+        ctx.void_type().fn_type(&[ptr_ty.into()], false),
+    )?;
+    let abort = runtime_funcs
+        .get(&RuntimeKey::ProcessAbort)
+        .copied()
+        .ok_or_else(|| CodegenError::Lowering("process abort runtime is absent".into()))?;
+    let utf8_valid = runtime_funcs
+        .get(&RuntimeKey::Utf8Valid)
+        .copied()
+        .ok_or_else(|| CodegenError::Lowering("UTF-8 validation runtime is absent".into()))?;
+
+    let value_llvm_ty = enum_types.get(value_id as usize).copied().ok_or_else(|| {
+        CodegenError::Lowering("pkg.db.value LLVM layout is absent".into())
+    })?;
+    let args_llvm_ty = struct_types.get(args_id as usize).copied().ok_or_else(|| {
+        CodegenError::Lowering("pkg.db.sqlite.function_args LLVM layout is absent".into())
+    })?;
+    let byte_view_llvm_ty = struct_types.get(byte_view_id as usize).copied().ok_or_else(|| {
+        CodegenError::Lowering("pkg.db.byte_view LLVM layout is absent".into())
+    })?;
+    let view_ty = slice_struct_type(ctx);
+    let transient = i64_ty.const_all_ones().const_to_pointer(ptr_ty);
+    let sentinel = sqlite_callback_bytes_global(ctx, module, "sqlite_callback_empty", &[0]);
+    let invalid_native_bytes = b"pkg.db SQLite function callback received an invalid native value";
+    let invalid_value_bytes = b"pkg.db SQLite function callback returned an invalid value";
+    let invalid_error_bytes = b"pkg.db SQLite function callback returned an invalid error message";
+    let invalid_native = sqlite_callback_bytes_global(ctx, module, "sqlite_callback_invalid_native", invalid_native_bytes);
+    let invalid_value = sqlite_callback_bytes_global(ctx, module, "sqlite_callback_invalid_value", invalid_value_bytes);
+    let invalid_error = sqlite_callback_bytes_global(ctx, module, "sqlite_callback_invalid_error", invalid_error_bytes);
+    let memchr_ty = ptr_ty.fn_type(&[ptr_ty.into(), i32_ty.into(), i64_ty.into()], false);
+    let memchr = module.get_function("memchr").unwrap_or_else(|| module.add_function("memchr", memchr_ty, None));
+    if memchr.get_type() != memchr_ty {
+        return Err(CodegenError::Lowering("SQLite callback memchr declaration has an incompatible ABI".into()));
+    }
+
+    let builder = ctx.create_builder();
+    let entry = ctx.append_basic_block(callback, "entry");
+    let hard_abort = ctx.append_basic_block(callback, "hard.abort");
+    let validate_call = ctx.append_basic_block(callback, "validate.call");
+    let input_invalid = ctx.append_basic_block(callback, "input.invalid");
+    let input_nomem = ctx.append_basic_block(callback, "input.nomem");
+    let args_init = ctx.append_basic_block(callback, "args.init");
+    let args_head = ctx.append_basic_block(callback, "args.head");
+    let args_dispatch = ctx.append_basic_block(callback, "args.dispatch");
+    let invoke = ctx.append_basic_block(callback, "invoke");
+    let result_dispatch = ctx.append_basic_block(callback, "result.dispatch");
+    let output_invalid = ctx.append_basic_block(callback, "output.invalid");
+    let error_invalid = ctx.append_basic_block(callback, "error.invalid");
+
+    builder.position_at_end(entry);
+    let context = callback
+        .get_nth_param(0)
+        .ok_or_else(|| CodegenError::Lowering("SQLite callback context is absent".into()))?
+        .into_pointer_value();
+    let argc = callback
+        .get_nth_param(1)
+        .ok_or_else(|| CodegenError::Lowering("SQLite callback argc is absent".into()))?
+        .into_int_value();
+    let argv = callback
+        .get_nth_param(2)
+        .ok_or_else(|| CodegenError::Lowering("SQLite callback argv is absent".into()))?
+        .into_pointer_value();
+    let context_null = builder.build_is_null(context, "context.null").map_err(lower)?;
+    builder.build_conditional_branch(context_null, hard_abort, validate_call).map_err(lower)?;
+
+    builder.position_at_end(hard_abort);
+    builder.build_call(abort, &[], "").map_err(lower)?;
+    builder.build_unreachable().map_err(lower)?;
+
+    builder.position_at_end(validate_call);
+    let database = builder
+        .build_call(context_db, &[context.into()], "database")
+        .map_err(lower)?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| CodegenError::Lowering("sqlite3_context_db_handle returned void".into()))?
+        .into_pointer_value();
+    let database_null = builder.build_is_null(database, "database.null").map_err(lower)?;
+    let argc_negative = builder
+        .build_int_compare(IntPredicate::SLT, argc, i32_ty.const_zero(), "argc.negative")
+        .map_err(lower)?;
+    let argc_large = builder
+        .build_int_compare(IntPredicate::SGT, argc, i32_ty.const_int(127, false), "argc.large")
+        .map_err(lower)?;
+    let argc_invalid = builder.build_or(argc_negative, argc_large, "argc.invalid").map_err(lower)?;
+    let argc_nonzero = builder
+        .build_int_compare(IntPredicate::NE, argc, i32_ty.const_zero(), "argc.nonzero")
+        .map_err(lower)?;
+    let argv_null = builder.build_is_null(argv, "argv.null").map_err(lower)?;
+    let argv_invalid = builder.build_and(argc_nonzero, argv_null, "argv.invalid").map_err(lower)?;
+    let recoverable_invalid = builder.build_or(argc_invalid, argv_invalid, "call.invalid").map_err(lower)?;
+    let abort_or_args = ctx.append_basic_block(callback, "abort.or.args");
+    builder.build_conditional_branch(database_null, hard_abort, abort_or_args).map_err(lower)?;
+    builder.position_at_end(abort_or_args);
+    builder.build_conditional_branch(recoverable_invalid, input_invalid, args_init).map_err(lower)?;
+
+    builder.position_at_end(input_invalid);
+    builder
+        .build_call(
+            result_error,
+            &[
+                context.into(),
+                invalid_native.into(),
+                i32_ty.const_int(invalid_native_bytes.len() as u64, false).into(),
+            ],
+            "",
+        )
+        .map_err(lower)?;
+    builder.build_return(None).map_err(lower)?;
+
+    builder.position_at_end(input_nomem);
+    builder.build_call(result_error_nomem, &[context.into()], "").map_err(lower)?;
+    builder.build_return(None).map_err(lower)?;
+
+    builder.position_at_end(output_invalid);
+    builder
+        .build_call(
+            result_error,
+            &[
+                context.into(),
+                invalid_value.into(),
+                i32_ty.const_int(invalid_value_bytes.len() as u64, false).into(),
+            ],
+            "",
+        )
+        .map_err(lower)?;
+    builder.build_return(None).map_err(lower)?;
+
+    builder.position_at_end(error_invalid);
+    builder
+        .build_call(
+            result_error,
+            &[
+                context.into(),
+                invalid_error.into(),
+                i32_ty.const_int(invalid_error_bytes.len() as u64, false).into(),
+            ],
+            "",
+        )
+        .map_err(lower)?;
+    builder.build_return(None).map_err(lower)?;
+
+    builder.position_at_end(args_init);
+    let scratch_ty = value_llvm_ty.array_type(127);
+    let scratch = builder.build_alloca(scratch_ty, "values").map_err(lower)?;
+    let ordinal_slot = builder.build_alloca(i32_ty, "ordinal").map_err(lower)?;
+    builder.build_store(ordinal_slot, i32_ty.const_zero()).map_err(lower)?;
+    builder.build_unconditional_branch(args_head).map_err(lower)?;
+
+    builder.position_at_end(args_head);
+    let ordinal = builder.build_load(i32_ty, ordinal_slot, "ordinal").map_err(lower)?.into_int_value();
+    let args_done = builder
+        .build_int_compare(IntPredicate::EQ, ordinal, argc, "args.done")
+        .map_err(lower)?;
+    builder.build_conditional_branch(args_done, invoke, args_dispatch).map_err(lower)?;
+
+    builder.position_at_end(args_dispatch);
+    let ordinal64 = builder.build_int_s_extend(ordinal, i64_ty, "ordinal64").map_err(lower)?;
+    let argv_slot = unsafe { builder.build_in_bounds_gep(ptr_ty, argv, &[ordinal64], "argv.slot").map_err(lower)? };
+    let native_value = builder.build_load(ptr_ty, argv_slot, "native.value").map_err(lower)?.into_pointer_value();
+    let native_null = builder.build_is_null(native_value, "native.null").map_err(lower)?;
+    let classify = ctx.append_basic_block(callback, "arg.classify");
+    builder.build_conditional_branch(native_null, input_invalid, classify).map_err(lower)?;
+    builder.position_at_end(classify);
+    let storage_class = builder
+        .build_call(value_type, &[native_value.into()], "storage.class")
+        .map_err(lower)?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| CodegenError::Lowering("sqlite3_value_type returned void".into()))?
+        .into_int_value();
+    let integer_case = ctx.append_basic_block(callback, "arg.integer");
+    let float_case = ctx.append_basic_block(callback, "arg.float");
+    let text_case = ctx.append_basic_block(callback, "arg.text");
+    let blob_case = ctx.append_basic_block(callback, "arg.blob");
+    let null_case = ctx.append_basic_block(callback, "arg.null");
+    builder
+        .build_switch(
+            storage_class,
+            input_invalid,
+            &[
+                (i32_ty.const_int(1, false), integer_case),
+                (i32_ty.const_int(2, false), float_case),
+                (i32_ty.const_int(3, false), text_case),
+                (i32_ty.const_int(4, false), blob_case),
+                (i32_ty.const_int(5, false), null_case),
+            ],
+        )
+        .map_err(lower)?;
+
+    macro_rules! finish_input_value {
+        ($value:expr) => {{
+            let current = builder.build_load(i32_ty, ordinal_slot, "ordinal.store").map_err(lower)?.into_int_value();
+            let current64 = builder.build_int_s_extend(current, i64_ty, "ordinal.store64").map_err(lower)?;
+            let destination = unsafe {
+                builder
+                    .build_in_bounds_gep(scratch_ty, scratch, &[i64_ty.const_zero(), current64], "value.slot")
+                    .map_err(lower)?
+            };
+            builder.build_store(destination, $value).map_err(lower)?;
+            let next = builder.build_int_add(current, i32_ty.const_int(1, false), "ordinal.next").map_err(lower)?;
+            builder.build_store(ordinal_slot, next).map_err(lower)?;
+            builder.build_unconditional_branch(args_head).map_err(lower)?;
+        }};
+    }
+    macro_rules! enum_value {
+        ($variant:expr, $payload:expr) => {{
+            let variant = value_definition.variants.get($variant).ok_or_else(|| {
+                CodegenError::Lowering("pkg.db.value callback variant is absent".into())
+            })?;
+            let tagged = builder
+                .build_insert_value(value_llvm_ty.const_zero(), i32_ty.const_int($variant as u64, false), 0, "value.tag")
+                .map_err(lower)?
+                .into_struct_value();
+            builder
+                .build_insert_value(tagged, $payload, variant.field_base, "value.payload")
+                .map_err(lower)?
+                .into_struct_value()
+        }};
+    }
+
+    builder.position_at_end(null_case);
+    let null_value = builder
+        .build_insert_value(value_llvm_ty.const_zero(), i32_ty.const_zero(), 0, "value.null")
+        .map_err(lower)?
+        .into_struct_value();
+    finish_input_value!(null_value);
+
+    builder.position_at_end(integer_case);
+    let integer = builder
+        .build_call(value_int64, &[native_value.into()], "integer")
+        .map_err(lower)?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| CodegenError::Lowering("sqlite3_value_int64 returned no value".into()))?;
+    let integer_value = enum_value!(4, integer);
+    finish_input_value!(integer_value);
+
+    builder.position_at_end(float_case);
+    let float = builder
+        .build_call(value_double, &[native_value.into()], "float")
+        .map_err(lower)?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| CodegenError::Lowering("sqlite3_value_double returned no value".into()))?
+        .into_float_value();
+    let float_nan = builder.build_float_compare(FloatPredicate::UNO, float, float, "float.nan").map_err(lower)?;
+    let float_valid = ctx.append_basic_block(callback, "arg.float.valid");
+    builder.build_conditional_branch(float_nan, input_invalid, float_valid).map_err(lower)?;
+    builder.position_at_end(float_valid);
+    let float_value = enum_value!(6, float);
+    finish_input_value!(float_value);
+
+    builder.position_at_end(text_case);
+    let text_len32 = builder
+        .build_call(value_bytes, &[native_value.into()], "text.len")
+        .map_err(lower)?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| CodegenError::Lowering("sqlite3_value_bytes returned no value".into()))?
+        .into_int_value();
+    let text_len_negative = builder
+        .build_int_compare(IntPredicate::SLT, text_len32, i32_ty.const_zero(), "text.len.negative")
+        .map_err(lower)?;
+    let text_pointer_case = ctx.append_basic_block(callback, "arg.text.pointer");
+    builder.build_conditional_branch(text_len_negative, input_invalid, text_pointer_case).map_err(lower)?;
+    builder.position_at_end(text_pointer_case);
+    let text_pointer = builder
+        .build_call(value_text, &[native_value.into()], "text.pointer")
+        .map_err(lower)?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| CodegenError::Lowering("sqlite3_value_text returned no value".into()))?
+        .into_pointer_value();
+    let text_pointer_null = builder.build_is_null(text_pointer, "text.pointer.null").map_err(lower)?;
+    let text_null = ctx.append_basic_block(callback, "arg.text.null");
+    let text_present = ctx.append_basic_block(callback, "arg.text.present");
+    builder.build_conditional_branch(text_pointer_null, text_null, text_present).map_err(lower)?;
+    builder.position_at_end(text_null);
+    let text_empty = builder
+        .build_int_compare(IntPredicate::EQ, text_len32, i32_ty.const_zero(), "text.empty")
+        .map_err(lower)?;
+    let text_null_error = ctx.append_basic_block(callback, "arg.text.null.error");
+    builder.build_conditional_branch(text_empty, text_present, text_null_error).map_err(lower)?;
+    builder.position_at_end(text_null_error);
+    let error_code = builder
+        .build_call(db_errcode, &[database.into()], "text.errcode")
+        .map_err(lower)?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| CodegenError::Lowering("sqlite3_errcode returned no value".into()))?
+        .into_int_value();
+    let is_nomem = builder
+        .build_int_compare(IntPredicate::EQ, error_code, i32_ty.const_int(7, false), "text.nomem")
+        .map_err(lower)?;
+    builder.build_conditional_branch(is_nomem, input_nomem, input_invalid).map_err(lower)?;
+    builder.position_at_end(text_present);
+    let text_len = builder.build_int_s_extend(text_len32, i64_ty, "text.len64").map_err(lower)?;
+    let text_empty = builder
+        .build_int_compare(IntPredicate::EQ, text_len32, i32_ty.const_zero(), "text.empty.present")
+        .map_err(lower)?;
+    let text_normalized = builder
+        .build_select(text_empty, sentinel, text_pointer, "text.normalized")
+        .map_err(lower)?
+        .into_pointer_value();
+    let text_utf8 = builder
+        .build_call(utf8_valid, &[text_normalized.into(), text_len.into()], "text.utf8")
+        .map_err(lower)?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| CodegenError::Lowering("UTF-8 validator returned no value".into()))?
+        .into_int_value();
+    let text_utf8_ok = builder
+        .build_int_compare(IntPredicate::NE, text_utf8, i32_ty.const_zero(), "text.utf8.ok")
+        .map_err(lower)?;
+    let text_nul = builder
+        .build_call(memchr, &[text_normalized.into(), i32_ty.const_zero().into(), text_len.into()], "text.nul")
+        .map_err(lower)?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| CodegenError::Lowering("memchr returned no value".into()))?
+        .into_pointer_value();
+    let text_no_nul = builder.build_is_null(text_nul, "text.no.nul").map_err(lower)?;
+    let text_valid = builder.build_and(text_utf8_ok, text_no_nul, "text.valid").map_err(lower)?;
+    let text_store = ctx.append_basic_block(callback, "arg.text.store");
+    builder.build_conditional_branch(text_valid, text_store, input_invalid).map_err(lower)?;
+    builder.position_at_end(text_store);
+    let text_view = view_ty.const_zero();
+    let text_view = builder.build_insert_value(text_view, text_normalized, 0, "text.view.ptr").map_err(lower)?.into_struct_value();
+    let text_view = builder.build_insert_value(text_view, text_len, 1, "text.view.len").map_err(lower)?.into_struct_value();
+    let text_value = enum_value!(7, text_view);
+    finish_input_value!(text_value);
+
+    builder.position_at_end(blob_case);
+    let blob_len32 = builder
+        .build_call(value_bytes, &[native_value.into()], "blob.len")
+        .map_err(lower)?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| CodegenError::Lowering("sqlite3_value_bytes returned no value".into()))?
+        .into_int_value();
+    let blob_len_negative = builder
+        .build_int_compare(IntPredicate::SLT, blob_len32, i32_ty.const_zero(), "blob.len.negative")
+        .map_err(lower)?;
+    let blob_pointer_case = ctx.append_basic_block(callback, "arg.blob.pointer");
+    builder.build_conditional_branch(blob_len_negative, input_invalid, blob_pointer_case).map_err(lower)?;
+    builder.position_at_end(blob_pointer_case);
+    let blob_pointer = builder
+        .build_call(value_blob, &[native_value.into()], "blob.pointer")
+        .map_err(lower)?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| CodegenError::Lowering("sqlite3_value_blob returned no value".into()))?
+        .into_pointer_value();
+    let blob_empty = builder
+        .build_int_compare(IntPredicate::EQ, blob_len32, i32_ty.const_zero(), "blob.empty")
+        .map_err(lower)?;
+    let blob_pointer_null = builder.build_is_null(blob_pointer, "blob.pointer.null").map_err(lower)?;
+    let blob_invalid = builder.build_and(blob_pointer_null, builder.build_not(blob_empty, "blob.nonempty").map_err(lower)?, "blob.invalid").map_err(lower)?;
+    let blob_store = ctx.append_basic_block(callback, "arg.blob.store");
+    builder.build_conditional_branch(blob_invalid, input_invalid, blob_store).map_err(lower)?;
+    builder.position_at_end(blob_store);
+    let blob_len = builder.build_int_s_extend(blob_len32, i64_ty, "blob.len64").map_err(lower)?;
+    let blob_normalized = builder
+        .build_select(blob_empty, sentinel, blob_pointer, "blob.normalized")
+        .map_err(lower)?
+        .into_pointer_value();
+    let blob_view = view_ty.const_zero();
+    let blob_view = builder.build_insert_value(blob_view, blob_normalized, 0, "blob.view.ptr").map_err(lower)?.into_struct_value();
+    let blob_view = builder.build_insert_value(blob_view, blob_len, 1, "blob.view.len").map_err(lower)?.into_struct_value();
+    let byte_view = builder.build_insert_value(byte_view_llvm_ty.const_zero(), blob_view, 0, "byte.view").map_err(lower)?.into_struct_value();
+    let blob_value = enum_value!(8, byte_view);
+    finish_input_value!(blob_value);
+
+    builder.position_at_end(invoke);
+    let scratch_base = unsafe {
+        builder
+            .build_in_bounds_gep(scratch_ty, scratch, &[i64_ty.const_zero(), i64_ty.const_zero()], "values.base")
+            .map_err(lower)?
+    };
+    let argc64 = builder.build_int_s_extend(argc, i64_ty, "argc64").map_err(lower)?;
+    let values_view = view_ty.const_zero();
+    let values_view = builder.build_insert_value(values_view, scratch_base, 0, "values.ptr").map_err(lower)?.into_struct_value();
+    let values_view = builder.build_insert_value(values_view, argc64, 1, "values.len").map_err(lower)?.into_struct_value();
+    let function_args = builder.build_insert_value(args_llvm_ty.const_zero(), values_view, 0, "function.args").map_err(lower)?.into_struct_value();
+    let callback_result = builder
+        .build_call(target_fn, &[function_args.into()], "callback.result")
+        .map_err(lower)?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| callable_target_error(target))?
+        .into_struct_value();
+    builder.build_unconditional_branch(result_dispatch).map_err(lower)?;
+
+    builder.position_at_end(result_dispatch);
+    let result_tag = builder.build_extract_value(callback_result, 0, "result.tag").map_err(lower)?.into_int_value();
+    let ok_case = ctx.append_basic_block(callback, "result.ok");
+    let err_case = ctx.append_basic_block(callback, "result.err");
+    builder
+        .build_switch(
+            result_tag,
+            output_invalid,
+            &[(i8_ty.const_zero(), ok_case), (i8_ty.const_int(1, false), err_case)],
+        )
+        .map_err(lower)?;
+
+    builder.position_at_end(err_case);
+    let error_view = builder.build_extract_value(callback_result, 2, "error.message").map_err(lower)?.into_struct_value();
+    let error_pointer = builder.build_extract_value(error_view, 0, "error.pointer").map_err(lower)?.into_pointer_value();
+    let error_len = builder.build_extract_value(error_view, 1, "error.len").map_err(lower)?.into_int_value();
+    let error_positive = builder.build_int_compare(IntPredicate::SGT, error_len, i64_ty.const_zero(), "error.positive").map_err(lower)?;
+    let error_fits = builder.build_int_compare(IntPredicate::SLE, error_len, i64_ty.const_int(i32::MAX as u64, false), "error.fits").map_err(lower)?;
+    let error_pointer_ok = builder.build_is_not_null(error_pointer, "error.pointer.ok").map_err(lower)?;
+    let error_prevalid = builder.build_and(error_positive, error_fits, "error.valid.range").map_err(lower)?;
+    let error_prevalid = builder.build_and(error_prevalid, error_pointer_ok, "error.valid.pointer").map_err(lower)?;
+    let error_scan = ctx.append_basic_block(callback, "error.scan");
+    builder.build_conditional_branch(error_prevalid, error_scan, error_invalid).map_err(lower)?;
+    builder.position_at_end(error_scan);
+    let error_nul = builder
+        .build_call(memchr, &[error_pointer.into(), i32_ty.const_zero().into(), error_len.into()], "error.nul")
+        .map_err(lower)?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| CodegenError::Lowering("memchr returned no value".into()))?
+        .into_pointer_value();
+    let error_no_nul = builder.build_is_null(error_nul, "error.no.nul").map_err(lower)?;
+    let error_emit = ctx.append_basic_block(callback, "error.emit");
+    builder.build_conditional_branch(error_no_nul, error_emit, error_invalid).map_err(lower)?;
+    builder.position_at_end(error_emit);
+    let error_len32 = builder.build_int_truncate(error_len, i32_ty, "error.len32").map_err(lower)?;
+    builder.build_call(result_error, &[context.into(), error_pointer.into(), error_len32.into()], "").map_err(lower)?;
+    builder.build_return(None).map_err(lower)?;
+
+    builder.position_at_end(ok_case);
+    let output_value = builder.build_extract_value(callback_result, 1, "output.value").map_err(lower)?.into_struct_value();
+    let output_tag = builder.build_extract_value(output_value, 0, "output.tag").map_err(lower)?.into_int_value();
+    let output_cases: Vec<_> = (0..9)
+        .map(|_| ctx.append_basic_block(callback, "output.case"))
+        .collect();
+    let switch_cases: Vec<_> = output_cases
+        .iter()
+        .enumerate()
+        .map(|(tag, block)| (i32_ty.const_int(tag as u64, false), *block))
+        .collect();
+    builder.build_switch(output_tag, output_invalid, &switch_cases).map_err(lower)?;
+
+    let null_output = output_cases.first().copied().ok_or_else(|| {
+        CodegenError::Lowering("pkg.db.value Null output block is absent".into())
+    })?;
+    builder.position_at_end(null_output);
+    builder.build_call(result_null, &[context.into()], "").map_err(lower)?;
+    builder.build_return(None).map_err(lower)?;
+
+    for (variant_index, signed) in [(1usize, false), (2, true), (3, true), (4, true)] {
+        let output_case = output_cases.get(variant_index).copied().ok_or_else(|| {
+            CodegenError::Lowering("pkg.db.value integer output block is absent".into())
+        })?;
+        let variant = value_definition.variants.get(variant_index).ok_or_else(|| {
+            CodegenError::Lowering("pkg.db.value integer callback variant is absent".into())
+        })?;
+        builder.position_at_end(output_case);
+        let integer = builder
+            .build_extract_value(output_value, variant.field_base, "output.integer")
+            .map_err(lower)?
+            .into_int_value();
+        let widened = if integer.get_type() == i64_ty {
+            integer
+        } else if signed {
+            builder.build_int_s_extend(integer, i64_ty, "output.integer64").map_err(lower)?
+        } else {
+            builder.build_int_z_extend(integer, i64_ty, "output.integer64").map_err(lower)?
+        };
+        builder.build_call(result_int64, &[context.into(), widened.into()], "").map_err(lower)?;
+        builder.build_return(None).map_err(lower)?;
+    }
+
+    for variant_index in [5usize, 6] {
+        let output_case = output_cases.get(variant_index).copied().ok_or_else(|| {
+            CodegenError::Lowering("pkg.db.value float output block is absent".into())
+        })?;
+        let variant = value_definition.variants.get(variant_index).ok_or_else(|| {
+            CodegenError::Lowering("pkg.db.value float callback variant is absent".into())
+        })?;
+        builder.position_at_end(output_case);
+        let float = builder
+            .build_extract_value(output_value, variant.field_base, "output.float")
+            .map_err(lower)?
+            .into_float_value();
+        let nan = builder.build_float_compare(FloatPredicate::UNO, float, float, "output.nan").map_err(lower)?;
+        let float_emit = ctx.append_basic_block(callback, "output.float.emit");
+        builder.build_conditional_branch(nan, output_invalid, float_emit).map_err(lower)?;
+        builder.position_at_end(float_emit);
+        let widened = if float.get_type() == f32_ty {
+            builder.build_float_ext(float, f64_ty, "output.float64").map_err(lower)?
+        } else {
+            float
+        };
+        builder.build_call(result_double, &[context.into(), widened.into()], "").map_err(lower)?;
+        builder.build_return(None).map_err(lower)?;
+    }
+
+    for (variant_index, native_result) in [(7usize, result_text), (8usize, result_blob)] {
+        let output_case = output_cases.get(variant_index).copied().ok_or_else(|| {
+            CodegenError::Lowering("pkg.db.value view output block is absent".into())
+        })?;
+        let variant = value_definition.variants.get(variant_index).ok_or_else(|| {
+            CodegenError::Lowering("pkg.db.value view callback variant is absent".into())
+        })?;
+        builder.position_at_end(output_case);
+        let payload = builder.build_extract_value(output_value, variant.field_base, "output.view.payload").map_err(lower)?;
+        let view = if variant_index == 7 {
+            payload.into_struct_value()
+        } else {
+            let byte_view = payload.into_struct_value();
+            builder.build_extract_value(byte_view, 0, "output.bytes").map_err(lower)?.into_struct_value()
+        };
+        let pointer = builder.build_extract_value(view, 0, "output.view.pointer").map_err(lower)?.into_pointer_value();
+        let len = builder.build_extract_value(view, 1, "output.view.len").map_err(lower)?.into_int_value();
+        let nonnegative = builder.build_int_compare(IntPredicate::SGE, len, i64_ty.const_zero(), "output.view.nonnegative").map_err(lower)?;
+        let fits = builder.build_int_compare(IntPredicate::SLE, len, i64_ty.const_int(i32::MAX as u64, false), "output.view.fits").map_err(lower)?;
+        let empty = builder.build_int_compare(IntPredicate::EQ, len, i64_ty.const_zero(), "output.view.empty").map_err(lower)?;
+        let pointer_ok = builder.build_is_not_null(pointer, "output.view.pointer.ok").map_err(lower)?;
+        let product_ok = builder.build_or(empty, pointer_ok, "output.view.product").map_err(lower)?;
+        let prevalid = builder.build_and(nonnegative, fits, "output.view.range").map_err(lower)?;
+        let prevalid = builder.build_and(prevalid, product_ok, "output.view.valid").map_err(lower)?;
+        let emit = ctx.append_basic_block(callback, "output.view.emit");
+        if variant_index == 7 {
+            let scan = ctx.append_basic_block(callback, "output.text.scan");
+            builder.build_conditional_branch(prevalid, scan, output_invalid).map_err(lower)?;
+            builder.position_at_end(scan);
+            let normalized = builder.build_select(empty, sentinel, pointer, "output.text.normalized").map_err(lower)?.into_pointer_value();
+            let nul = builder
+                .build_call(memchr, &[normalized.into(), i32_ty.const_zero().into(), len.into()], "output.text.nul")
+                .map_err(lower)?
+                .try_as_basic_value()
+                .basic()
+                .ok_or_else(|| CodegenError::Lowering("memchr returned no value".into()))?
+                .into_pointer_value();
+            let no_nul = builder.build_is_null(nul, "output.text.no.nul").map_err(lower)?;
+            builder.build_conditional_branch(no_nul, emit, output_invalid).map_err(lower)?;
+        } else {
+            builder.build_conditional_branch(prevalid, emit, output_invalid).map_err(lower)?;
+        }
+        builder.position_at_end(emit);
+        let normalized = builder.build_select(empty, sentinel, pointer, "output.view.normalized").map_err(lower)?.into_pointer_value();
+        let len32 = builder.build_int_truncate(len, i32_ty, "output.view.len32").map_err(lower)?;
+        builder
+            .build_call(native_result, &[context.into(), normalized.into(), len32.into(), transient.into()], "")
+            .map_err(lower)?;
+        builder.build_return(None).map_err(lower)?;
+    }
+
+    Ok(())
+}
+
 fn build_module<'c>(
     ctx: &'c Context,
     module: &Module<'c>,
@@ -1092,6 +2010,15 @@ fn build_module<'c>(
             .unwrap_or_else(|| module.add_function(ext.name.as_str(), fn_ty, None));
         program_funcs.insert(ext.name.clone(), fv);
     }
+    if let Some(helper) = module.get_function(SQLITE_CALLBACK_REGISTER_HELPER) {
+        let declared_by_package = program
+            .externs
+            .iter()
+            .any(|external| external.name.as_str() == SQLITE_CALLBACK_REGISTER_HELPER);
+        if declared_by_package {
+            emit_sqlite_callback_register_helper(ctx, module, helper)?;
+        }
+    }
     // The fixed native ABI table is the sole declaration/type/attribute authority. Program,
     // imported, and extern declarations intentionally remain earlier in the module. Keyed native
     // rows are then emitted in alphabetical RuntimeKey::ALL order into the typed runtime registry.
@@ -1403,6 +2330,64 @@ fn build_module<'c>(
             tb.build_return(Some(&i32t.const_zero())).map_err(lower)?;
         }
         generated_funcs.insert(id.clone(), tramp);
+    }
+
+    // Pass 1e: one exact C-ABI entrypoint per SQLite scalar callback descriptor. The full native
+    // value bridge is emitted here (rather than as an ordinary Align closure) so SQLite retains no
+    // source environment and the callback has a stable `void(context, argc, argv)` ABI.
+    let mut sqlite_callbacks = std::collections::BTreeMap::<Box<[u8]>, GeneratedId>::new();
+    for function in &program.fns {
+        for block in &function.blocks {
+            for statement in &block.stmts {
+                let Stmt::Let(_, Rvalue::SqliteCallbackDescriptor(descriptor)) = statement else {
+                    continue;
+                };
+                let declaration = callable_preflight
+                    .declarations
+                    .get(&descriptor.target)
+                    .ok_or_else(|| callable_target_error(&descriptor.target))?;
+                let effect = match descriptor.effect {
+                    align_sema::FnEffect::Pure => 0,
+                    align_sema::FnEffect::Impure => 1,
+                    align_sema::FnEffect::Unknown => {
+                        return Err(callable_target_error(&descriptor.target));
+                    }
+                };
+                let id = GeneratedId::SqliteScalarCallback {
+                    target: descriptor.target.clone(),
+                    signature: canonical_signature(&declaration.signature, program)?,
+                    effect,
+                    descriptor_version: 1,
+                    kind: 0,
+                    family_version: descriptor.family_version,
+                };
+                sqlite_callbacks.insert(canonical_metadata(id.to_canonical_bytes())?, id);
+            }
+        }
+    }
+    for id in sqlite_callbacks.values() {
+        let emitted_name = callable_preflight.generated_names.get(id).ok_or_else(|| {
+            CodegenError::Lowering("SQLite callback identity was not collected".into())
+        })?;
+        let callback_ty = ctx
+            .void_type()
+            .fn_type(&[ptr.into(), ctx.i32_type().into(), ptr.into()], false);
+        let callback = module.add_function(emitted_name, callback_ty, None);
+        mark_nounwind(ctx, callback);
+        mark_private_helper(callback);
+        emit_sqlite_scalar_callback_trampoline(
+            ctx,
+            module,
+            callback,
+            id,
+            program,
+            &callable_preflight,
+            &program_funcs,
+            &runtime_funcs,
+            &struct_types,
+            &enum_types,
+        )?;
+        generated_funcs.insert(id.clone(), callback);
     }
 
     // Producer units define one externally linkable hidden support thunk per concrete resource;
@@ -3926,6 +4911,14 @@ fn generated_stem(id: &GeneratedId) -> Result<String, CodegenError> {
             let result_hex = lowercase_hex(result.as_bytes());
             format!("align_gen$tramp${fallible_byte}${result_hex}")
         }
+        GeneratedId::SqliteScalarCallback { target, .. } => {
+            let bytes = canonical_metadata(id.to_canonical_bytes())?;
+            format!(
+                "align_gen$sqlite_scalar${}${}",
+                callable_hex(target),
+                lowercase_hex(&bytes)
+            )
+        }
         GeneratedId::Parallel(parallel) => {
             let bytes = canonical_metadata(id.to_canonical_bytes())?;
             let mode = parallel.mode as u8;
@@ -4149,6 +5142,44 @@ fn callable_preflight(
                         {
                             return Err(callable_target_error(target));
                         }
+                    }
+                    Rvalue::SqliteCallbackDescriptor(descriptor) => {
+                        let Some(declaration) = declarations.get(&descriptor.target) else {
+                            return Err(callable_target_error(&descriptor.target));
+                        };
+                        sqlite_callback_contract_types(program, &declaration.signature)?;
+                        let result = function.value_tys.get(*value as usize).copied();
+                        let descriptor_type_ok = matches!(result, Some(Ty::Struct(id))
+                            if program.structs.get(id as usize).is_some_and(
+                                align_sema::sqlite_callback_descriptor_struct_is_valid
+                            ));
+                        let effect = match descriptor.effect {
+                            align_sema::FnEffect::Pure => 0,
+                            align_sema::FnEffect::Impure => 1,
+                            align_sema::FnEffect::Unknown => {
+                                return Err(callable_target_error(&descriptor.target));
+                            }
+                        };
+                        if !descriptor_type_ok
+                            || descriptor.family_version != 1
+                            || declaration.classes.contains(&ProgramDeclarationClass::Extern)
+                            || descriptor.params != declaration.signature.params
+                            || descriptor.param_modes != declaration.signature.modes
+                            || descriptor.ret != declaration.signature.ret
+                            || descriptor.return_borrow != declaration.signature.borrow
+                            || descriptor.return_region != declaration.signature.region
+                            || descriptor.return_cleanup != declaration.signature.cleanup
+                        {
+                            return Err(callable_target_error(&descriptor.target));
+                        }
+                        generated.push(GeneratedId::SqliteScalarCallback {
+                            target: descriptor.target.clone(),
+                            signature: canonical_signature(&declaration.signature, program)?,
+                            effect,
+                            descriptor_version: 1,
+                            kind: 0,
+                            family_version: descriptor.family_version,
+                        });
                     }
                     Rvalue::FnAddr { target, signature } => {
                         let Some(declaration) = declarations.get(target) else {
@@ -13690,6 +14721,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 }
                 return Ok(cs.try_as_basic_value().basic());
             }
+            Rvalue::SqliteCallbackDescriptor(descriptor) => {
+                return Ok(Some(self.sqlite_callback_descriptor_value(descriptor)?.into()));
+            }
             Rvalue::CallWithCleanup(call) => {
                 let align_mir::DirectCallWithCleanup { target, args, cleanup } = call.as_ref();
                 let declaration = self
@@ -15047,6 +16081,101 @@ impl<'c, 'a> FnGen<'c, 'a> {
         g.set_constant(true);
         mark_private_unnamed_addr(g);
         (g.as_pointer_value(), len)
+    }
+
+    fn sqlite_callback_descriptor_value(
+        &self,
+        descriptor: &align_mir::SqliteCallbackDescriptor,
+    ) -> Result<inkwell::values::StructValue<'c>, CodegenError> {
+        use inkwell::types::BasicType;
+
+        if self.target_data.get_pointer_byte_size(None) != 8 || descriptor.family_version != 1 {
+            return Err(self.err("SQLite callback descriptors require the v1 64-bit ABI"));
+        }
+        let declaration = self
+            .callable_preflight
+            .declarations
+            .get(&descriptor.target)
+            .ok_or_else(|| callable_target_error(&descriptor.target))?;
+        let effect = match descriptor.effect {
+            align_sema::FnEffect::Pure => 0,
+            align_sema::FnEffect::Impure => 1,
+            align_sema::FnEffect::Unknown => {
+                return Err(callable_target_error(&descriptor.target));
+            }
+        };
+        let id = GeneratedId::SqliteScalarCallback {
+            target: descriptor.target.clone(),
+            signature: canonical_signature(&declaration.signature, self.program)?,
+            effect,
+            descriptor_version: 1,
+            kind: 0,
+            family_version: descriptor.family_version,
+        };
+        let trampoline = self
+            .generated_funcs
+            .get(&id)
+            .copied()
+            .ok_or_else(|| self.err("SQLite callback trampoline was not generated"))?;
+        let identity = self
+            .callable_preflight
+            .generated_names
+            .get(&id)
+            .ok_or_else(|| self.err("SQLite callback identity was not generated"))?;
+        let identity_len = u64::try_from(identity.len())
+            .map_err(|_| self.err("SQLite callback identity length is unrepresentable"))?;
+        let identity_bytes = self.ctx.const_string(identity.as_bytes(), true);
+        let identity_global = self.module.add_global(
+            identity_bytes.get_type(),
+            None,
+            "sqlite_callback_identity",
+        );
+        identity_global.set_initializer(&identity_bytes);
+        identity_global.set_constant(true);
+        mark_private_unnamed_addr(identity_global);
+
+        let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
+        let record_ty = self.ctx.struct_type(
+            &[
+                self.ctx.i32_type().as_basic_type_enum(),
+                self.ctx.i8_type().as_basic_type_enum(),
+                self.ctx.i8_type().as_basic_type_enum(),
+                self.ctx.i16_type().as_basic_type_enum(),
+                ptr_ty.as_basic_type_enum(),
+                ptr_ty.as_basic_type_enum(),
+                self.ctx.i64_type().as_basic_type_enum(),
+            ],
+            false,
+        );
+        let record = record_ty.const_named_struct(&[
+            self.ctx.i32_type().const_int(1, false).into(),
+            self.ctx.i8_type().const_zero().into(),
+            self.ctx.i8_type().const_int(effect.into(), false).into(),
+            self.ctx.i16_type().const_zero().into(),
+            trampoline.as_global_value().as_pointer_value().into(),
+            identity_global.as_pointer_value().into(),
+            self.ctx
+                .i64_type()
+                .const_int(identity_len, false)
+                .into(),
+        ]);
+        let record_global = self.module.add_global(record_ty, None, "sqlite_callback_descriptor");
+        record_global.set_initializer(&record);
+        record_global.set_constant(true);
+        record_global.set_alignment(8);
+        mark_private_unnamed_addr(record_global);
+
+        let descriptor_id = self
+            .structs
+            .iter()
+            .position(align_sema::sqlite_callback_descriptor_struct_is_valid)
+            .ok_or_else(|| self.err("SQLite callback descriptor nominal type is absent"))?;
+        let descriptor_ty = self
+            .struct_types
+            .get(descriptor_id)
+            .copied()
+            .ok_or_else(|| self.err("SQLite callback descriptor LLVM type is absent"))?;
+        Ok(descriptor_ty.const_named_struct(&[record_global.as_pointer_value().into()]))
     }
 
     /// Lower a validated MIR static-data record to one private LLVM constant. Pointer relocations
@@ -16911,6 +18040,109 @@ mod tests {
             d.iter().map(|diagnostic| &diagnostic.message).collect::<Vec<_>>(),
         );
         lower_program(&hir)
+    }
+
+    fn sqlite_callback_contract_fixture() -> (Program, ProgramSignature) {
+        let mut program = Program::default();
+        program.structs = vec![
+            hir::StructDef {
+                name: "pkg.db.sqlite$function_args".into(),
+                source_name: "pkg.db.sqlite$function_args".into(),
+                fields: vec![hir::FieldDef {
+                    name: "values".into(),
+                    ty: Ty::Slice(Scalar::Enum(0)),
+                }],
+                align: None,
+                c_repr: false,
+            },
+            hir::StructDef {
+                name: "pkg.db$byte_view".into(),
+                source_name: "pkg.db$byte_view".into(),
+                fields: vec![hir::FieldDef {
+                    name: "bytes".into(),
+                    ty: Ty::Slice(Scalar::Int(IntTy {
+                        bits: 8,
+                        signed: false,
+                    })),
+                }],
+                align: None,
+                c_repr: false,
+            },
+        ];
+        let payloads = [
+            ("Null", vec![]),
+            ("Bool", vec![Scalar::Bool]),
+            ("I16", vec![Scalar::Int(IntTy { bits: 16, signed: true })]),
+            ("I32", vec![Scalar::Int(IntTy { bits: 32, signed: true })]),
+            ("I64", vec![Scalar::Int(IntTy { bits: 64, signed: true })]),
+            ("F32", vec![Scalar::Float(align_sema::FloatTy { bits: 32 })]),
+            ("F64", vec![Scalar::Float(align_sema::FloatTy { bits: 64 })]),
+            ("Text", vec![Scalar::Str]),
+            ("Bytes", vec![Scalar::Struct(1)]),
+        ];
+        let mut field_base = 1;
+        program.enums.push(hir::EnumDef {
+            name: "pkg.db$value".into(),
+            source_name: "pkg.db$value".into(),
+            variants: payloads
+                .into_iter()
+                .map(|(name, payload)| {
+                    let variant = hir::EnumVariant {
+                        name: name.into(),
+                        field_base,
+                        payload,
+                    };
+                    field_base += u32::try_from(variant.payload.len())
+                        .expect("callback fixture payload count fits u32");
+                    variant
+                })
+                .collect(),
+        });
+        let signature = ProgramSignature {
+            params: vec![Ty::Struct(0)],
+            modes: vec![align_ast::ParamMode::ByValue],
+            ret: Ty::Result(Scalar::Enum(0), Scalar::Str),
+            borrow: hir::ReturnBorrowSummary::None,
+            region: hir::ReturnRegionSummary::None,
+            cleanup: hir::ReturnCleanupAbi::None,
+        };
+        (program, signature)
+    }
+
+    #[test]
+    fn sqlite_callback_contract_type_matrix_fails_closed_before_llvm_extraction() {
+        let (program, signature) = sqlite_callback_contract_fixture();
+        let valid = sqlite_callback_contract_types(&program, &signature)
+            .expect("the exact callback contract fixture must validate");
+        assert_eq!((valid.args, valid.value, valid.byte_view), (0, 0, 1));
+
+        let mut wrong_return = signature.clone();
+        wrong_return.ret = Ty::Unit;
+        assert!(sqlite_callback_contract_types(&program, &wrong_return).is_err());
+
+        let mut wrong_mode = signature.clone();
+        wrong_mode.modes[0] = align_ast::ParamMode::Borrow;
+        assert!(sqlite_callback_contract_types(&program, &wrong_mode).is_err());
+
+        let mut wrong_args = program.clone();
+        wrong_args.structs[0].fields[0].ty = Ty::Slice(Scalar::Bool);
+        assert!(sqlite_callback_contract_types(&wrong_args, &signature).is_err());
+
+        for index in 0..program.enums[0].variants.len() {
+            let mut wrong_value = program.clone();
+            wrong_value.enums[0].variants[index].field_base += 1;
+            assert!(
+                sqlite_callback_contract_types(&wrong_value, &signature).is_err(),
+                "variant {index} field offset must be authenticated"
+            );
+        }
+
+        let mut wrong_bytes = program;
+        wrong_bytes.structs[1].fields[0].ty = Ty::Slice(Scalar::Int(IntTy {
+            bits: 8,
+            signed: true,
+        }));
+        assert!(sqlite_callback_contract_types(&wrong_bytes, &signature).is_err());
     }
 
     fn ir(src: &str) -> String {

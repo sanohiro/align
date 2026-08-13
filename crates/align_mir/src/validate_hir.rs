@@ -660,6 +660,8 @@ impl<'a> NominalLinkValidator<'a> {
                 || definition.name.starts_with("pkg.db$command$")
             {
                 align_sema::static_descriptor_struct_is_valid(definition)
+            } else if definition.name == "pkg.db.sqlite$scalar_function" {
+                align_sema::sqlite_callback_descriptor_struct_is_valid(definition)
             } else {
                 members_valid(definition.fields.iter().map(|field| field.name.as_str()))
             };
@@ -831,6 +833,12 @@ impl<'a> PlacementValidator<'a> {
                 || definition.name.starts_with("pkg.db$command$")
             {
                 if !align_sema::static_descriptor_struct_is_valid(definition) {
+                    return false;
+                }
+                continue;
+            }
+            if definition.name == "pkg.db.sqlite$scalar_function" {
+                if !align_sema::sqlite_callback_descriptor_struct_is_valid(definition) {
                     return false;
                 }
                 continue;
@@ -3494,6 +3502,9 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::BuilderNew { .. }
             | hir::ExprKind::BuilderWrite { .. }
             | hir::ExprKind::BuilderToString(_) => true,
+            hir::ExprKind::SqliteCallbackDescriptor { target, effect } => {
+                self.sqlite_callback_descriptor_ok(expression.ty, target, effect.get())
+            }
             hir::ExprKind::RawPointerLoad { .. } => true,
             hir::ExprKind::StaticDescriptorView { offset, .. } => {
                 self.static_descriptor_body_ok(context) && matches!(offset, 16 | 32 | 48)
@@ -3880,6 +3891,76 @@ impl<'a> BodyValidator<'a> {
             }
         };
         envelope && valid_span(expression.span)
+    }
+
+    fn sqlite_callback_descriptor_ok(
+        &self,
+        descriptor_ty: Ty,
+        target: &str,
+        effect: align_sema::FnEffect,
+    ) -> bool {
+        if target.is_empty()
+            || target.as_bytes().contains(&0)
+            || !matches!(effect, align_sema::FnEffect::Pure | align_sema::FnEffect::Impure)
+        {
+            return false;
+        }
+        let Ty::Struct(descriptor_id) = descriptor_ty else {
+            return false;
+        };
+        if !self
+            .program
+            .structs
+            .get(descriptor_id as usize)
+            .is_some_and(align_sema::sqlite_callback_descriptor_struct_is_valid)
+        {
+            return false;
+        }
+        let Some(args_id) = self
+            .program
+            .structs
+            .iter()
+            .position(|definition| definition.name == "pkg.db.sqlite$function_args")
+            .and_then(|id| u32::try_from(id).ok())
+        else {
+            return false;
+        };
+        let Some(value_id) = self
+            .program
+            .enums
+            .iter()
+            .position(|definition| definition.name == "pkg.db$value")
+            .and_then(|id| u32::try_from(id).ok())
+        else {
+            return false;
+        };
+        let expected_ret = Ty::Result(Scalar::Enum(value_id), Scalar::Str);
+        if let Some(function) = self.program.fns.iter().find(|function| function.name == target) {
+            return matches!(
+                function.origin,
+                hir::FnOrigin::Source { .. }
+                    | hir::FnOrigin::Monomorph
+                    | hir::FnOrigin::Lifted { capture_count: 0 }
+            ) && function.params.len() == 1
+                && function.param_modes == [align_ast::ParamMode::ByValue]
+                && function
+                    .params
+                    .first()
+                    .and_then(|local| function.locals.get(*local as usize))
+                    .is_some_and(|local| local.ty == Ty::Struct(args_id))
+                && function.ret == expected_ret;
+        }
+        self.program
+            .imported_fns
+            .iter()
+            .find(|function| function.name == target)
+            .is_some_and(|function| {
+                function.params == [Ty::Struct(args_id)]
+                    && function.param_modes == [align_ast::ParamMode::ByValue]
+                    && function.ret == expected_ret
+                    && function.effect == effect
+                    && function.return_provenance_known
+            })
     }
 
     fn native_expression_envelope_ok(&self, expression: &hir::Expr) -> bool {
@@ -5479,6 +5560,10 @@ impl<'a> BodyValidator<'a> {
                     return None;
                 }
                 Some((Ty::Fn(fid), true, Vec::new()))
+            }
+            hir::ExprKind::SqliteCallbackDescriptor { target, effect } => {
+                self.sqlite_callback_descriptor_ok(expression.ty, target, effect.get())
+                    .then_some((expression.ty, true, Vec::new()))
             }
             hir::ExprKind::Closure { lifted, captures } => {
                 let sig = self.resolve_signature(lifted)?;

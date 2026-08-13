@@ -9,6 +9,14 @@ import pkg.db.internal.sqlite
 
 extern "C" {
   fn memcpy(destination: raw, source: str, count: i64) -> raw
+  fn align_pkg_db_sqlite_register_v1(
+    database: raw,
+    name: str,
+    name_length: i64,
+    arity: i32,
+    flags: i32,
+    trampoline: raw,
+  ) -> i32
 }
 
 extern "C" link("sqlite3") {
@@ -20,6 +28,33 @@ extern "C" link("sqlite3") {
   fn sqlite3_errcode(database: raw) -> i32
   fn sqlite3_extended_errcode(database: raw) -> i32
   fn sqlite3_errmsg(database: raw) -> raw
+  fn sqlite3_libversion_number() -> i32
+  fn sqlite3_get_autocommit(database: raw) -> i32
+  fn sqlite3_create_function_v2(
+    database: raw,
+    name: raw,
+    arity: i32,
+    flags: i32,
+    application: raw,
+    scalar: raw,
+    step: raw,
+    finalizer: raw,
+    destroy: raw,
+  ) -> i32
+  fn sqlite3_context_db_handle(context: raw) -> raw
+  fn sqlite3_value_type(value: raw) -> i32
+  fn sqlite3_value_int64(value: raw) -> i64
+  fn sqlite3_value_double(value: raw) -> f64
+  fn sqlite3_value_bytes(value: raw) -> i32
+  fn sqlite3_value_text(value: raw) -> raw
+  fn sqlite3_value_blob(value: raw) -> raw
+  fn sqlite3_result_null(context: raw)
+  fn sqlite3_result_int64(context: raw, value: i64)
+  fn sqlite3_result_double(context: raw, value: f64)
+  fn sqlite3_result_text(context: raw, value: raw, bytes: i32, destroy: raw)
+  fn sqlite3_result_blob(context: raw, value: raw, bytes: i32, destroy: raw)
+  fn sqlite3_result_error(context: raw, message: raw, bytes: i32)
+  fn sqlite3_result_error_nomem(context: raw)
 }
 
 SQLITE_OK: i32 := 0
@@ -33,6 +68,10 @@ SQLITE_OPEN_SHAREDCACHE: i32 := 131072
 SQLITE_OPEN_PRIVATECACHE: i32 := 262144
 SQLITE_BUSY_DEFAULT_MS: i32 := 0
 SQLITE_TIMEOUT_MAX_MS: i64 := 2147483647
+SQLITE_UTF8: i32 := 1
+SQLITE_DETERMINISTIC: i32 := 2048
+SQLITE_DIRECTONLY: i32 := 524288
+SQLITE_CALLBACK_MIN_VERSION: i32 := 3030000
 
 pub QueryOption {
   RequireVersionAtLeast(u32, u32, u32)
@@ -78,6 +117,16 @@ pub MetaOption {
 pub ExplainOption {
   QueryPlan
   Bytecode
+}
+
+pub function_args {
+  values: slice<pkg.db.value>,
+}
+
+pub scalar_function {}
+
+pub FunctionOption {
+  Deterministic
 }
 
 fn contract_error(item: str, message: str) -> pkg.db.Error = pkg.db.Error.Unsupported(
@@ -224,6 +273,232 @@ pub fn command<P>(
   options: slice<pkg.db.CommandOption>,
   native: slice<CommandOption>,
 ) -> pkg.db.command<P> = process.abort()
+
+pub fn function(
+  callback: fn(function_args) -> Result<pkg.db.value, str>,
+) -> scalar_function = process.abort()
+
+fn callback_driver_error() -> pkg.db.Error = pkg.db.Error.DriverMismatch(
+  pkg.db.ContractError {
+    query_id: None,
+    item: "sqlite.callback.driver".clone(),
+    message: "SQLite callbacks require a SQLite connection".clone(),
+  },
+)
+
+fn callback_connection_error() -> pkg.db.Error = contract_error(
+  "sqlite.callback.connection",
+  "SQLite callbacks require an idle direct connection",
+)
+
+fn callback_name_valid(name: str) -> Result<(), pkg.db.Error> {
+  if name.len() < 1 || name.len() > 255 {
+    return Err(contract_error(
+      "sqlite.callback.name",
+      "SQLite callback name must contain 1 to 255 UTF-8 bytes",
+    ))
+  }
+  if contains_nul(name) {
+    return Err(pkg.db.Error.Encode(pkg.db.ContractError {
+      query_id: None,
+      item: "sqlite.callback.name".clone(),
+      message: "SQLite callback name contains U+0000".clone(),
+    }))
+  }
+  return Ok(())
+}
+
+fn callback_connection_valid(
+  borrow mut connection: pkg.db.conn,
+) -> Result<(), pkg.db.Error> {
+  unsafe {
+    candidate := resource.raw(resource.borrow(connection))
+    if !pkg.db.internal.resource.conn_state_valid(candidate) {
+      return Err(callback_connection_error())
+    }
+    if pkg.db.internal.resource.conn_driver_tag(candidate) != 1 {
+      return Err(callback_driver_error())
+    }
+    origin: raw := raw.load(candidate, 32)
+    lease: u8 := raw.load(candidate, 20)
+    if !pkg.db.internal.resource.conn_live_for_driver(candidate, 1)
+      || !origin.is_null()
+      || lease != 0
+      || pkg.db.internal.resource.transaction_active(candidate) {
+      return Err(callback_connection_error())
+    }
+    database: raw := raw.load(candidate, 8)
+    if database.is_null() || sqlite3_get_autocommit(database) != 1 {
+      return Err(callback_connection_error())
+    }
+    if sqlite3_libversion_number() < SQLITE_CALLBACK_MIN_VERSION {
+      return Err(contract_error(
+        "sqlite.callback.version",
+        "SQLite callbacks require SQLite 3.30.0 or newer",
+      ))
+    }
+    return Ok(())
+  }
+}
+
+fn callback_descriptor_valid(
+  callback: scalar_function,
+) -> Result<(), pkg.db.Error> {
+  unsafe {
+    candidate := pkg.db.internal.descriptor.sqlite_callback_data(callback)
+    if candidate.is_null() { return Err(contract_error(
+      "sqlite.callback.descriptor",
+      "SQLite callback descriptor is invalid",
+    )) }
+    version: u32 := raw.load(candidate, 0)
+    kind: u8 := raw.load(candidate, 4)
+    effect: u8 := raw.load(candidate, 5)
+    reserved: u16 := raw.load(candidate, 6)
+    trampoline: raw := raw.load(candidate, 8)
+    identity: raw := raw.load(candidate, 16)
+    identity_length: i64 := raw.load(candidate, 24)
+    if version != 1 || kind != 0 || effect > 1 || reserved != 0
+      || trampoline.is_null() || identity.is_null()
+      || identity_length <= 0 || identity_length > 4294967295 {
+      return Err(contract_error(
+        "sqlite.callback.descriptor",
+        "SQLite callback descriptor is invalid",
+      ))
+    }
+    mut i := 0
+    loop {
+      if i >= identity_length { break }
+      byte: u8 := raw.load(identity, i)
+      if byte == 0 {
+        return Err(contract_error(
+          "sqlite.callback.descriptor",
+          "SQLite callback descriptor is invalid",
+        ))
+      }
+      i = i + 1
+    }
+    terminator: u8 := raw.load(identity, identity_length)
+    if terminator != 0 {
+      return Err(contract_error(
+        "sqlite.callback.descriptor",
+        "SQLite callback descriptor is invalid",
+      ))
+    }
+    return Ok(())
+  }
+}
+
+fn callback_post_call_valid(state: raw, database: raw) -> bool {
+  unsafe {
+    if !pkg.db.internal.resource.conn_live_for_driver(state, 1) { return false }
+    origin: raw := raw.load(state, 32)
+    lease: u8 := raw.load(state, 20)
+    return origin.is_null() && lease == 0
+      && !pkg.db.internal.resource.transaction_active(state)
+      && sqlite3_get_autocommit(database) == 1
+  }
+}
+
+pub fn register_function(
+  borrow mut connection: pkg.db.conn,
+  name: str,
+  arity: i32,
+  callback: scalar_function,
+  options: slice<FunctionOption>,
+) -> Result<(), pkg.db.Error> {
+  callback_connection_valid(connection)?
+  callback_name_valid(name)?
+  if arity < 0 || arity > 127 {
+    return Err(contract_error(
+      "sqlite.function.arity",
+      "SQLite scalar function arity must be between 0 and 127",
+    ))
+  }
+  mut deterministic := false
+  mut i := 0
+  loop {
+    if i >= options.len() { break }
+    match options[i] {
+      Deterministic => {
+        if deterministic {
+          return Err(contract_error(
+            "sqlite.function.option",
+            "SQLite scalar function options are invalid",
+          ))
+        }
+        deterministic = true
+      }
+    }
+    i = i + 1
+  }
+  callback_descriptor_valid(callback)?
+  unsafe {
+    cb_state := resource.raw(resource.borrow(connection))
+    cb_data := pkg.db.internal.descriptor.sqlite_callback_data(callback)
+    effect: u8 := raw.load(cb_data, 5)
+    if deterministic && effect != 0 {
+      return Err(contract_error(
+        "sqlite.function.deterministic",
+        "SQLite deterministic functions require a Pure callback",
+      ))
+    }
+    cb_database: raw := raw.load(cb_state, 8)
+    cb_trampoline: raw := raw.load(cb_data, 8)
+    cb_flags := SQLITE_UTF8 | SQLITE_DIRECTONLY
+      | if deterministic { SQLITE_DETERMINISTIC } else { 0 }
+    cb_status := align_pkg_db_sqlite_register_v1(
+      cb_database, name, name.len(), arity, cb_flags, cb_trampoline,
+    )
+    if cb_status != SQLITE_OK {
+      first := sqlite_error(cb_database)
+      pkg.db.internal.resource.poison_conn_state(cb_state)
+      return Err(first)
+    }
+    if !callback_post_call_valid(cb_state, cb_database) {
+      pkg.db.internal.resource.poison_conn_state(cb_state)
+      return Err(contract_error(
+        "sqlite.callback.cleanup",
+        "SQLite callback registration left the connection unusable",
+      ))
+    }
+    return Ok(())
+  }
+}
+
+pub fn remove_function(
+  borrow mut connection: pkg.db.conn,
+  name: str,
+  arity: i32,
+) -> Result<(), pkg.db.Error> {
+  callback_connection_valid(connection)?
+  callback_name_valid(name)?
+  if arity < 0 || arity > 127 {
+    return Err(contract_error(
+      "sqlite.function.arity",
+      "SQLite scalar function arity must be between 0 and 127",
+    ))
+  }
+  unsafe {
+    cb_state := resource.raw(resource.borrow(connection))
+    cb_database: raw := raw.load(cb_state, 8)
+    cb_status := align_pkg_db_sqlite_register_v1(
+      cb_database, name, name.len(), arity, SQLITE_UTF8 | SQLITE_DIRECTONLY, raw.null(),
+    )
+    if cb_status != SQLITE_OK {
+      first := sqlite_error(cb_database)
+      pkg.db.internal.resource.poison_conn_state(cb_state)
+      return Err(first)
+    }
+    if !callback_post_call_valid(cb_state, cb_database) {
+      pkg.db.internal.resource.poison_conn_state(cb_state)
+      return Err(contract_error(
+        "sqlite.callback.cleanup",
+        "SQLite callback registration left the connection unusable",
+      ))
+    }
+    return Ok(())
+  }
+}
 
 pub fn connect(path: str, options: slice<ConnectOption>) -> Result<pkg.db.conn, pkg.db.Error> {
   if contains_nul(path) {

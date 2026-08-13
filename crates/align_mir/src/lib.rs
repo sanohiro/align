@@ -426,6 +426,22 @@ pub struct FnSignatureFacts {
     pub return_cleanup: hir::ReturnCleanupAbi,
 }
 
+/// Complete declaration facts carried by a compiler-produced SQLite scalar callback descriptor.
+/// No ordinary function-value environment is formed; codegen uses this record to correlate the
+/// immutable descriptor and its generated C-ABI trampoline with one exact Align target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqliteCallbackDescriptor {
+    pub target: ProgramCall,
+    pub params: Vec<Ty>,
+    pub param_modes: Vec<align_ast::ParamMode>,
+    pub ret: Ty,
+    pub effect: align_sema::FnEffect,
+    pub return_borrow: hir::ReturnBorrowSummary,
+    pub return_region: hir::ReturnRegionSummary,
+    pub return_cleanup: hir::ReturnCleanupAbi,
+    pub family_version: u32,
+}
+
 /// One pointer relocation in an immutable compiler-owned data record.
 ///
 /// The record carries its complete non-relocated byte image so MIR remains backend-agnostic and
@@ -489,6 +505,9 @@ pub enum Rvalue {
     /// numeric operand/result type; lowers to the matching LLVM intrinsic (signedness/float from `ty`).
     MathOp { fn_: align_sema::MathFn, ty: Ty, operands: Vec<Operand> },
     Call(DirectCall, Vec<Operand>),
+    /// One immutable `pkg.db.sqlite.scalar_function` descriptor plus its generated reverse-C
+    /// trampoline. This is a compile-time producer value, not a normal function pointer.
+    SqliteCallbackDescriptor(Box<SqliteCallbackDescriptor>),
     /// An Align-ABI call whose recursively Move result is returned together with its runtime
     /// cleanup bit. Codegen defines both `result` and `cleanup` from the one physical call.
     CallWithCleanup(Box<DirectCallWithCleanup>),
@@ -1982,6 +2001,49 @@ fn lower_program_unchecked(
             )
             .collect::<std::collections::HashMap<_, _>>(),
     );
+    let sqlite_callback_targets = Rc::new(
+        program
+            .fns
+            .iter()
+            .map(|function| {
+                let params = function
+                    .params
+                    .iter()
+                    .map(|local| function.locals[*local as usize].ty)
+                    .collect();
+                (
+                    function.name.clone(),
+                    SqliteCallbackDescriptor {
+                        target: ProgramCall::from_validated(&function.name),
+                        params,
+                        param_modes: function.param_modes.clone(),
+                        ret: function.ret,
+                        effect: align_sema::FnEffect::Unknown,
+                        return_borrow: function.return_borrow.clone(),
+                        return_region: function.return_region.clone(),
+                        return_cleanup: function.return_cleanup,
+                        family_version: 1,
+                    },
+                )
+            })
+            .chain(program.imported_fns.iter().map(|function| {
+                (
+                    function.name.clone(),
+                    SqliteCallbackDescriptor {
+                        target: ProgramCall::from_validated(&function.name),
+                        params: function.params.clone(),
+                        param_modes: function.param_modes.clone(),
+                        ret: function.ret,
+                        effect: function.effect,
+                        return_borrow: function.return_borrow.clone(),
+                        return_region: function.return_region.clone(),
+                        return_cleanup: function.return_cleanup,
+                        family_version: 1,
+                    },
+                )
+            }))
+            .collect::<std::collections::HashMap<_, _>>(),
+    );
     let mut fns: Vec<Function> = program
         .fns
         .iter()
@@ -1995,6 +2057,7 @@ fn lower_program_unchecked(
                 &fn_types,
                 &named_return_cleanup,
                 &named_param_modes,
+                &sqlite_callback_targets,
                 lines.as_ref(),
             );
             // Separate-compilation visibility (per-unit lowering only); whole-program lowering keeps
@@ -3034,6 +3097,8 @@ struct BuilderCtx {
     named_return_cleanup: Rc<std::collections::HashMap<String, hir::ReturnCleanupAbi>>,
     /// Checked physical parameter modes for direct named calls.
     named_param_modes: Rc<std::collections::HashMap<String, Vec<align_ast::ParamMode>>>,
+    /// Exact stored/imported declarations eligible for compiler-generated SQLite callback data.
+    sqlite_callback_targets: Rc<std::collections::HashMap<String, SqliteCallbackDescriptor>>,
     /// Physical return ABI of the function currently being lowered.
     return_cleanup: hir::ReturnCleanupAbi,
     /// Results produced by the active eager-expression worklist, keyed by stable HIR address.
@@ -3358,6 +3423,7 @@ fn lower_fn(
     fn_types: &Rc<[hir::FnTy]>,
     named_return_cleanup: &Rc<std::collections::HashMap<String, hir::ReturnCleanupAbi>>,
     named_param_modes: &Rc<std::collections::HashMap<String, Vec<align_ast::ParamMode>>>,
+    sqlite_callback_targets: &Rc<std::collections::HashMap<String, SqliteCallbackDescriptor>>,
     lines: Option<&Rc<SourceLines>>,
 ) -> Function {
     let mut slots: Vec<Ty> = f.locals.iter().map(|l| l.ty).collect();
@@ -3414,6 +3480,7 @@ fn lower_fn(
             fn_types: Rc::clone(fn_types),
             named_return_cleanup: Rc::clone(named_return_cleanup),
             named_param_modes: Rc::clone(named_param_modes),
+            sqlite_callback_targets: Rc::clone(sqlite_callback_targets),
             return_cleanup: f.return_cleanup,
             eager_expr_results: std::collections::HashMap::new(),
             eager_expr_active: false,
@@ -5278,6 +5345,20 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             hir::ExprKind::Str(s) => {
                 let v = b.fresh_value(e.ty);
                 b.push(Stmt::Let(v, Rvalue::StrLit(s.clone())));
+                Operand::Value(v)
+            }
+            hir::ExprKind::SqliteCallbackDescriptor { target, effect } => {
+                let Some(mut descriptor) = b.ctx.sqlite_callback_targets.get(target).cloned()
+                else {
+                    b.terminate(Term::Unreachable);
+                    break 'lower_expr terminated_operand();
+                };
+                descriptor.effect = effect.get();
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::SqliteCallbackDescriptor(Box::new(descriptor)),
+                ));
                 Operand::Value(v)
             }
             hir::ExprKind::ConstArray {
@@ -15957,6 +16038,7 @@ fn main() -> i32 {
                 fn_types: Rc::from(Vec::<hir::FnTy>::new()),
                 named_return_cleanup: Rc::new(std::collections::HashMap::new()),
                 named_param_modes: Rc::new(std::collections::HashMap::new()),
+                sqlite_callback_targets: Rc::new(std::collections::HashMap::new()),
                 return_cleanup: hir::ReturnCleanupAbi::None,
                 eager_expr_results: std::collections::HashMap::new(),
                 eager_expr_active: false,

@@ -3069,6 +3069,25 @@ pub struct StaticDescriptor {
 /// to the same physical ABI, while the producer initializes the pointer from generated static data.
 pub const STATIC_DESCRIPTOR_DATA_FIELD: &str = "$static";
 
+/// Compiler-private storage carried by the fieldless public SQLite callback descriptor.
+/// The source spelling is outside Align's identifier grammar, so only the producer can form it.
+pub const SQLITE_CALLBACK_DESCRIPTOR_DATA_FIELD: &str = "$sqlite_callback";
+
+const SQLITE_SCALAR_FUNCTION_TYPE: &str = "pkg.db.sqlite$scalar_function";
+const SQLITE_FUNCTION_ARGS_TYPE: &str = "pkg.db.sqlite$function_args";
+const DB_VALUE_TYPE: &str = "pkg.db$value";
+
+pub fn sqlite_callback_descriptor_struct_is_valid(definition: &hir::StructDef) -> bool {
+    definition.name == SQLITE_SCALAR_FUNCTION_TYPE
+        && matches!(
+            definition.fields.as_slice(),
+            [hir::FieldDef { name, ty: Ty::Raw }]
+                if name == SQLITE_CALLBACK_DESCRIPTOR_DATA_FIELD
+        )
+        && definition.align.is_none()
+        && !definition.c_repr
+}
+
 fn static_descriptor_generic_arity(name: &str) -> Option<usize> {
     match name {
         "pkg.db$query" => Some(2),
@@ -5944,6 +5963,20 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         // `align(N)` over-alignment (M6): honored at the one `type_align` codegen seam (the slot
         // alloca / struct-array element). `None` = the type's natural alignment.
         let name = mangle_fn(module, *_is_entry, &s.name.name);
+        let callback_descriptor = name == SQLITE_SCALAR_FUNCTION_TYPE;
+        if callback_descriptor && (!fields.is_empty() || s.align.is_some() || s.c_repr) {
+            diags.error(
+                "compiler-known SQLite callback descriptor must be a fieldless, naturally aligned Align struct"
+                    .to_string(),
+                s.span,
+            );
+        }
+        if callback_descriptor && fields.is_empty() && s.align.is_none() && !s.c_repr {
+            fields.push(FieldDef {
+                name: SQLITE_CALLBACK_DESCRIPTOR_DATA_FIELD.to_string(),
+                ty: Ty::Raw,
+            });
+        }
         structs[i] = StructDef {
             source_name: name.clone(),
             name,
@@ -7973,6 +8006,38 @@ fn run_body_analysis_passes(
     } else {
         check_parallelism(program, external_effects, diags);
     }
+    finalize_sqlite_callback_descriptor_effects(program, external_effects, diags);
+}
+
+/// Bind each SQLite callback descriptor to the settled effect of its exact declaration. The
+/// descriptor is a compile-time value, so taking it adds no call edge; registration later uses the
+/// stored bit to gate `Deterministic` without rediscovering source or reflection metadata.
+fn finalize_sqlite_callback_descriptor_effects(
+    program: &hir::Program,
+    external_effects: &std::collections::HashMap<String, FnEffect>,
+    diags: &mut Diagnostics,
+) {
+    let mut effects = fn_effects(program, external_effects);
+    effects.extend(external_effects.iter().map(|(name, effect)| (name.clone(), *effect)));
+    for function in &program.fns {
+        for event in hir_depth::body_events(&function.body) {
+            if let hir_depth::BodyEvent::ExprEnter(Expr {
+                kind: ExprKind::SqliteCallbackDescriptor { target, effect },
+                span,
+                ..
+            }) = event
+            {
+                let inferred = effects.get(target).copied().unwrap_or(FnEffect::Unknown);
+                effect.set(inferred);
+                if inferred == FnEffect::Unknown {
+                    diags.error(
+                        "SQLite callback effect could not be proved Pure or Impure".to_string(),
+                        *span,
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Recompute all body-derived facts at the HIR/MIR boundary without trusting producer metadata.
@@ -8045,6 +8110,13 @@ fn reset_body_analysis_facts(program: &mut Program) {
         // Assignment cleanup flags use interior mutability, so the shared event references can
         // reset them without raw pointers or unsafe aliasing.
         for event in hir_depth::body_events(&function.body) {
+            if let hir_depth::BodyEvent::ExprEnter(Expr {
+                kind: ExprKind::SqliteCallbackDescriptor { effect, .. },
+                ..
+            }) = event
+            {
+                effect.set(FnEffect::Unknown);
+            }
             if let hir_depth::BodyEvent::StmtEnter(hir::Stmt::Assign {
                 drop_old, drop_new, ..
             }) = event
@@ -8105,6 +8177,8 @@ fn body_analysis_facts_equal(expected: &hir::Program, actual: &Program) -> bool 
             || expected.drop_individual_locals != actual.drop_individual_locals
             || expected.drop_individual_exprs != actual.drop_individual_exprs
             || assignment_facts(expected) != assignment_facts(actual)
+            || sqlite_callback_descriptor_facts(expected)
+                != sqlite_callback_descriptor_facts(actual)
         {
             return false;
         }
@@ -8114,6 +8188,25 @@ fn body_analysis_facts_equal(expected: &hir::Program, actual: &Program) -> bool 
         .iter()
         .zip(&actual.fn_types)
         .all(|(expected, actual)| expected.effect.get() == actual.effect.get())
+}
+
+fn sqlite_callback_descriptor_facts(
+    function: &hir::Fn,
+) -> Vec<(&str, FnEffect)> {
+    hir_depth::body_events(&function.body)
+        .into_iter()
+        .filter_map(|event| match event {
+            hir_depth::BodyEvent::ExprEnter(Expr {
+                kind: ExprKind::SqliteCallbackDescriptor { target, effect },
+                ..
+            }) => Some((target.as_str(), effect.get())),
+            hir_depth::BodyEvent::StmtEnter(_)
+            | hir_depth::BodyEvent::StmtExit(_)
+            | hir_depth::BodyEvent::ExprEnter(_)
+            | hir_depth::BodyEvent::ExprExit { .. }
+            | hir_depth::BodyEvent::MatchArmEnter { .. } => None,
+        })
+        .collect()
 }
 
 fn assignment_facts(function: &hir::Fn) -> Vec<(hir::LocalId, bool, bool)> {
@@ -12300,7 +12393,8 @@ impl EffectScan<'_> {
             | ExprKind::Field { .. } | ExprKind::SoaColumn { .. } | ExprKind::ArrayGroupAgg { .. }
             | ExprKind::ArrayGroupAggMulti { .. }
             | ExprKind::ArrayDictEncode { .. } | ExprKind::IndexField { .. }
-            | ExprKind::RawNull => {}
+            | ExprKind::RawNull
+            | ExprKind::SqliteCallbackDescriptor { .. } => {}
         }
         true
     }
@@ -15291,7 +15385,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::CryptoArgon2 { .. }
             | ExprKind::ArrayGroupAgg { .. }
             | ExprKind::ArrayGroupAggMulti { .. }
-            | ExprKind::RawNull => values.push(Region::Static),
+            | ExprKind::RawNull
+            | ExprKind::SqliteCallbackDescriptor { .. } => values.push(Region::Static),
                 },
                 Work::Shorter(count, initial) => {
                     let start = values
@@ -15673,7 +15768,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::CryptoHkdf { .. }
             | ExprKind::CryptoAead { .. }
             | ExprKind::CryptoArgon2 { .. }
-            | ExprKind::RawNull => {}
+            | ExprKind::RawNull
+            | ExprKind::SqliteCallbackDescriptor { .. } => {}
             }
         }
         false
@@ -17482,7 +17578,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ArrayGroupAggMulti { .. }
             | ExprKind::ArrayDictEncode { .. }
             | ExprKind::IndexField { .. }
-            | ExprKind::RawNull => {}
+            | ExprKind::RawNull
+            | ExprKind::SqliteCallbackDescriptor { .. } => {}
         }
     }
 }
@@ -20355,7 +20452,8 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::RegexFindAll { .. } | ExprKind::RegexSplit { .. } | ExprKind::RegexReplace { .. }
             | ExprKind::RegexCaptures { .. } | ExprKind::RegexGroupCount { .. }
             | ExprKind::RegexGroupIndex { .. } | ExprKind::CapturesGroup { .. }
-            | ExprKind::RawNull => {
+            | ExprKind::RawNull
+            | ExprKind::SqliteCallbackDescriptor { .. } => {
                 debug_assert!(
                     !ty_may_borrow(e.ty, self.structs, self.tuples, self.enums, self.tagged_types),
                     "borrow_sources_inner: {:?} is classified as never borrowing, but its result type \
@@ -25036,7 +25134,8 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ConstArray { .. }
             | ExprKind::Bool(_)
             | ExprKind::OptionNone
-            | ExprKind::RawNull => {}
+            | ExprKind::RawNull
+            | ExprKind::SqliteCallbackDescriptor { .. } => {}
         }
         true
     }
@@ -29048,6 +29147,9 @@ impl<'a, 't> Checker<'a, 't> {
     /// signature lookup, generic-call dispatch, the `out` no-alias check, argument checking, and the
     /// `Call` node. Reused by a bare call (`check_call`) and a cross-module `mod.fn(...)` call.
     fn check_named_call(&mut self, name: String, display: String, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+        if name == "pkg.db.sqlite$function" {
+            return self.check_sqlite_callback_descriptor(args, expected, span);
+        }
         let Some(sig) = self.sigs.get(&name) else {
             self.diags.error(format!("undefined function: '{name}'"), span);
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
@@ -29187,6 +29289,144 @@ impl<'a, 't> Checker<'a, 't> {
             }
         }
         Expr { kind: ExprKind::Call { func: name, args: checked, type_args: Vec::new() }, ty: ret, span }
+    }
+
+    /// Compile `pkg.db.sqlite.function(target)` without forming an ordinary function value.
+    fn check_sqlite_callback_descriptor(
+        &mut self,
+        args: &[ast::Expr],
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Expr {
+        let err = || Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let [argument] = args else {
+            self.diags.error(
+                format!("'pkg.db.sqlite.function' expects 1 argument(s), got {}", args.len()),
+                span,
+            );
+            return err();
+        };
+        let Some(&args_id) = self.struct_ids.get(SQLITE_FUNCTION_ARGS_TYPE) else {
+            self.diags.error("SQLite callback argument type is unavailable".to_string(), span);
+            return err();
+        };
+        let Some(&value_id) = self.enum_ids.get(DB_VALUE_TYPE) else {
+            self.diags.error("database callback value type is unavailable".to_string(), span);
+            return err();
+        };
+        let Some(&descriptor_id) = self.struct_ids.get(SQLITE_SCALAR_FUNCTION_TYPE) else {
+            self.diags.error("SQLite callback descriptor type is unavailable".to_string(), span);
+            return err();
+        };
+        let callback_param = Ty::Struct(args_id);
+        let callback_ret = Ty::Result(Scalar::Enum(value_id), Scalar::Str);
+
+        let (target, lifted_valid) = match &argument.kind {
+            ast::ExprKind::Path(path) => {
+                let segments = &path.segments;
+                let Some(last) = segments.last() else {
+                    self.diags.error("SQLite callback target is empty".to_string(), argument.span);
+                    return err();
+                };
+                if segments.len() == 1 {
+                    (self.resolve_local_fn(&last.name), false)
+                } else {
+                    let module = segments[..segments.len() - 1]
+                        .iter()
+                        .map(|segment| segment.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    match self.resolve_qualified_fn(&module, &last.name, argument.span) {
+                        Ok(target) => (target, false),
+                        Err(()) => return err(),
+                    }
+                }
+            }
+            ast::ExprKind::FieldAccess { recv, field }
+                if !leftmost_segment(recv).is_some_and(|leftmost| self.name_in_scope(leftmost)) =>
+            {
+                let Some(module) = flatten_module_path(recv) else {
+                    self.diags.error(
+                        "SQLite callbacks require one exact named function or noncapturing function literal"
+                            .to_string(),
+                        argument.span,
+                    );
+                    return err();
+                };
+                match self.resolve_qualified_fn(&module, &field.name, argument.span) {
+                    Ok(Some(target)) => (Some(target), false),
+                    Ok(None) => {
+                        self.diags.error(
+                            format!("module '{module}' is not imported here (add `import {module}`)"),
+                            argument.span,
+                        );
+                        return err();
+                    }
+                    Err(()) => return err(),
+                }
+            }
+            ast::ExprKind::Lambda { params, body } => {
+                let Some((target, ret, captures)) = self.lift_lambda(
+                    params,
+                    body,
+                    &[callback_param],
+                    Some(callback_ret),
+                    argument.span,
+                ) else {
+                    return err();
+                };
+                if !captures.is_empty() {
+                    self.diags.error(
+                        "SQLite callbacks cannot capture values; pass a named or noncapturing function"
+                            .to_string(),
+                        argument.span,
+                    );
+                    return err();
+                }
+                if self.finalize(ret) != callback_ret {
+                    return err();
+                }
+                (Some(target), true)
+            }
+            _ => {
+                self.diags.error(
+                    "SQLite callbacks require one exact named function or noncapturing function literal"
+                        .to_string(),
+                    argument.span,
+                );
+                return err();
+            }
+        };
+        let Some(target) = target else {
+            self.diags.error("SQLite callback target does not resolve to a function".to_string(), argument.span);
+            return err();
+        };
+        let valid = lifted_valid
+            || self.sigs.get(&target).is_some_and(|signature| {
+                !signature.is_extern
+                    && signature.type_params.is_empty()
+                    && signature.params == [callback_param]
+                    && signature.param_modes == [ast::ParamMode::ByValue]
+                    && signature.ret == callback_ret
+            });
+        if !valid {
+            self.diags.error(
+                "SQLite scalar callbacks must have exact signature `fn(pkg.db.sqlite.function_args) -> Result<pkg.db.value, str>`"
+                    .to_string(),
+                argument.span,
+            );
+            return err();
+        }
+        let ty = Ty::Struct(descriptor_id);
+        self.constrain(ty, expected, span);
+        Expr {
+            kind: ExprKind::SqliteCallbackDescriptor {
+                target,
+                effect: std::cell::Cell::new(FnEffect::Unknown),
+            },
+            ty,
+            span,
+        }
     }
 
     /// Check a call to a **generic** function `fn f<T, …>(…)`. Type arguments are inferred — never
@@ -30988,6 +31228,50 @@ impl<'a, 't> Checker<'a, 't> {
                 span,
             );
             return err;
+        }
+        if method == "sqlite_callback_data" {
+            let [callback_ast] = args else {
+                self.diags.error(
+                    format!(
+                        "static descriptor operation 'sqlite_callback_data' expects 1 argument(s), got {}",
+                        args.len()
+                    ),
+                    span,
+                );
+                return err;
+            };
+            let callback = self.check_expr(callback_ast, None);
+            let Ty::Struct(struct_id) = callback.ty else {
+                self.diags.error(
+                    "SQLite callback data requires a scalar_function descriptor".to_owned(),
+                    callback_ast.span,
+                );
+                return err;
+            };
+            if !self
+                .structs
+                .get(struct_id as usize)
+                .is_some_and(sqlite_callback_descriptor_struct_is_valid)
+            {
+                self.diags.error(
+                    "SQLite callback data requires a scalar_function descriptor".to_owned(),
+                    callback_ast.span,
+                );
+                return err;
+            }
+            let ExprKind::Local(root) = callback.kind else {
+                self.diags.error(
+                    "SQLite callback data requires a bound scalar_function value".to_owned(),
+                    callback_ast.span,
+                );
+                return err;
+            };
+            self.constrain(Ty::Raw, expected, span);
+            return Expr {
+                kind: ExprKind::Field { root, path: vec![0] },
+                ty: Ty::Raw,
+                span,
+            };
         }
         if method == "drop_batch_payload" {
             let [plan_ast, payload_ast] = args else {
@@ -42589,7 +42873,8 @@ impl<'a, 't> Checker<'a, 't> {
             | ExprKind::ArrayGroupAggMulti { .. }
             | ExprKind::ArrayDictEncode { .. }
             | ExprKind::IndexField { .. }
-            | ExprKind::RawNull => {}
+            | ExprKind::RawNull
+            | ExprKind::SqliteCallbackDescriptor { .. } => {}
         }
         if let Some(t) = recomputed {
             e.ty = t;

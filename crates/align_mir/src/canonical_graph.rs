@@ -293,6 +293,11 @@ impl<'a> GraphValidator<'a> {
                         if name == align_sema::STATIC_DESCRIPTOR_DATA_FIELD)
                     && align.is_none()
                     && !*c_repr;
+                let sqlite_callback_descriptor = name == "pkg.db.sqlite$scalar_function"
+                    && matches!(fields, [hir::FieldDef { name, ty: Ty::Raw }]
+                        if name == align_sema::SQLITE_CALLBACK_DESCRIPTOR_DATA_FIELD)
+                    && align.is_none()
+                    && !*c_repr;
                 let source_ordinal = self.field_ordinal();
                 self.validate_source_name(source_name, source_ordinal);
                 if let Some(align) = *align {
@@ -309,7 +314,7 @@ impl<'a> GraphValidator<'a> {
                 let mut names = HashSet::new();
                 for field in fields {
                     let name_ordinal = self.field_ordinal();
-                    if !static_descriptor {
+                    if !static_descriptor && !sqlite_callback_descriptor {
                         self.validate_identifier(&field.name, name_ordinal);
                     }
                     if !names.insert(field.name.as_str()) {

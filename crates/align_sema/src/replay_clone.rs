@@ -321,6 +321,7 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         | ExprKind::Bool(_)
         | ExprKind::Local(_)
         | ExprKind::FnValue(_)
+        | ExprKind::SqliteCallbackDescriptor { .. }
         | ExprKind::Wait
         | ExprKind::Field { .. }
         | ExprKind::SoaColumn { .. }
@@ -1757,6 +1758,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::Bool(_)
         | ExprKind::Local(_)
         | ExprKind::FnValue(_)
+        | ExprKind::SqliteCallbackDescriptor { .. }
         | ExprKind::Wait
         | ExprKind::Field { .. }
         | ExprKind::SoaColumn { .. }

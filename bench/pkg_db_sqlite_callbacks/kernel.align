@@ -1,0 +1,122 @@
+module main
+
+import pkg.db
+import pkg.db.sqlite
+import std.time
+
+Timed { elapsed_ns: i64, operations: i64, checksum: i64 }
+
+fn zero(args: pkg.db.sqlite.function_args) -> Result<pkg.db.value, str> =
+  Ok(pkg.db.value.I64(1))
+
+fn one(args: pkg.db.sqlite.function_args) -> Result<pkg.db.value, str> {
+  if args.values.len() != 1 { return Err("unexpected callback arity") }
+  return Ok(args.values[0])
+}
+
+fn many(args: pkg.db.sqlite.function_args) -> Result<pkg.db.value, str> {
+  if args.values.len() != 127 { return Err("unexpected callback arity") }
+  mut total: i64 := 0
+  mut index: i64 := 0
+  loop {
+    if index == args.values.len() { break }
+    value := match args.values[index] { I64(value) => value, _ => 0 }
+    total = total + value
+    index = index + 1
+  }
+  return Ok(pkg.db.value.I64(total))
+}
+
+fn registration_work(
+  borrow mut connection: pkg.db.conn,
+  iterations: i64,
+) -> Timed {
+  callback := pkg.db.sqlite.function(zero)
+  start := time.instant()
+  mut index: i64 := 0
+  loop {
+    if index == iterations { break }
+    pkg.db.sqlite.register_function(connection, "align_register", 0, callback, []) else {
+      return Timed { elapsed_ns: -1, operations: index, checksum: -1 }
+    }
+    index = index + 1
+  }
+  elapsed := time.instant() - start
+  pkg.db.sqlite.remove_function(connection, "align_register", 0) else {
+    return Timed { elapsed_ns: -2, operations: index, checksum: -2 }
+  }
+  return Timed { elapsed_ns: elapsed, operations: index, checksum: index }
+}
+
+fn query_i64(borrow connection: pkg.db.conn, sql: str) -> i64 {
+  mut rows := pkg.db.dynamic_rows(
+    pkg.db.exec_conn(connection), pkg.db.Driver.SQLite, sql, [], [],
+  ) else { return -1 }
+  arena out {
+    selected := pkg.db.dynamic_next(rows, out) else { return -2 }
+    row := selected else { return -3 }
+    if row.values.len() != 1 { return -4 }
+    return match row.values[0] { I64(value) => value, _ => -5 }
+  }
+}
+
+fn scalar_work(
+  borrow connection: pkg.db.conn,
+  sql: str,
+  operations: i64,
+) -> Timed {
+  start := time.instant()
+  checksum := query_i64(connection, sql)
+  return Timed {
+    elapsed_ns: time.instant() - start,
+    operations: operations,
+    checksum: checksum,
+  }
+}
+
+fn emit(value: Timed) {
+  print(value.elapsed_ns)
+  print(value.operations)
+  print(value.checksum)
+}
+
+pub fn main(args: array<str>) -> Result<(), Error> {
+  if args.len() != 1 { return Err(error(2)) }
+  mut connection := pkg.db.sqlite.connect(":memory:", []) else { return Err(error(3)) }
+  pkg.db.dynamic_execute(
+    pkg.db.exec_conn(connection), pkg.db.Driver.SQLite,
+    "CREATE TABLE callback_bench(value INTEGER NOT NULL)", [], [],
+  ) else { return Err(error(4)) }
+  pkg.db.dynamic_execute(
+    pkg.db.exec_conn(connection), pkg.db.Driver.SQLite,
+    "WITH RECURSIVE seq(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM seq WHERE value < 10000) INSERT INTO callback_bench SELECT value FROM seq",
+    [], [],
+  ) else { return Err(error(5)) }
+
+  pkg.db.sqlite.register_function(
+    connection, "align_zero", 0, pkg.db.sqlite.function(zero),
+    [pkg.db.sqlite.FunctionOption.Deterministic],
+  ) else { return Err(error(6)) }
+  pkg.db.sqlite.register_function(
+    connection, "align_one", 1, pkg.db.sqlite.function(one),
+    [pkg.db.sqlite.FunctionOption.Deterministic],
+  ) else { return Err(error(7)) }
+  pkg.db.sqlite.register_function(
+    connection, "align_many", 127, pkg.db.sqlite.function(many),
+    [pkg.db.sqlite.FunctionOption.Deterministic],
+  ) else { return Err(error(8)) }
+
+  zero_sql := "SELECT sum(align_zero()) FROM callback_bench"
+  one_sql := "SELECT sum(align_one(value)) FROM callback_bench"
+  many_sql := "SELECT sum(align_many(value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value, value)) FROM callback_bench"
+
+  if query_i64(connection, zero_sql) != 10000 { return Err(error(9)) }
+  if query_i64(connection, one_sql) != 50005000 { return Err(error(10)) }
+  if query_i64(connection, many_sql) != 6350635000 { return Err(error(11)) }
+
+  emit(registration_work(connection, 10000))
+  emit(scalar_work(connection, zero_sql, 10000))
+  emit(scalar_work(connection, one_sql, 10000))
+  emit(scalar_work(connection, many_sql, 1270000))
+  return Ok(())
+}

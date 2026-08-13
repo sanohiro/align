@@ -1885,7 +1885,15 @@ pub fn finish_dynamic_native(
     connection: raw := raw.load(state, 8)
     mut cleanup_ok := true
     if driver == 1 {
-      if !native.is_null() && sqlite3_finalize(native) != 0 { cleanup_ok = false }
+      // After a failed `sqlite3_step`, `sqlite3_finalize` repeats that statement error even when
+      // finalization itself completed and the connection remains reusable. The caller already
+      // copied the first native error and passes `clean_completion = false` for exactly that path;
+      // only a successful/otherwise-clean statement makes a nonzero finalize status a new cleanup
+      // failure. Busy-timeout and transaction-state restoration are still proved below.
+      if !native.is_null() {
+        finalize_status := sqlite3_finalize(native)
+        if clean_completion && finalize_status != 0 { cleanup_ok = false }
+      }
       busy_ms: i32 := raw.load(state, 16)
       if sqlite3_busy_timeout(connection, busy_ms) != 0 { cleanup_ok = false }
       if !sqlite_dynamic_synchronized(state, connection) { cleanup_ok = false }

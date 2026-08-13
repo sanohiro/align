@@ -87,6 +87,14 @@ pub enum GeneratedId {
         fallible: bool,
         result: CanonicalTy,
     },
+    SqliteScalarCallback {
+        target: ProgramCall,
+        signature: CanonicalFnAbi,
+        effect: u8,
+        descriptor_version: u32,
+        kind: u8,
+        family_version: u32,
+    },
     Parallel(ParallelGeneratedId),
 }
 
@@ -120,6 +128,22 @@ impl GeneratedId {
                 out.push(3);
                 encode_parallel(&mut out, parallel)?;
             }
+            Self::SqliteScalarCallback {
+                target,
+                signature,
+                effect,
+                descriptor_version,
+                kind,
+                family_version,
+            } => {
+                out.push(4);
+                encode_call(&mut out, target)?;
+                out.extend(signature.as_bytes());
+                out.push(*effect);
+                out.extend(descriptor_version.to_le_bytes());
+                out.push(*kind);
+                out.extend(family_version.to_le_bytes());
+            }
         }
         Ok(out.into_boxed_slice())
     }
@@ -144,6 +168,14 @@ impl GeneratedId {
                 result: cursor.ty()?,
             },
             3 => Self::Parallel(cursor.parallel()?),
+            4 => Self::SqliteScalarCallback {
+                target: cursor.call()?,
+                signature: cursor.abi()?,
+                effect: cursor.byte()?,
+                descriptor_version: cursor.u32()?,
+                kind: cursor.byte()?,
+                family_version: cursor.u32()?,
+            },
             _ => return Err(CanonicalCodecError::UnknownTag),
         };
         validate_generated(&value)?;
@@ -252,6 +284,25 @@ fn validate_generated(value: &GeneratedId) -> Result<(), CanonicalCodecError> {
         GeneratedId::FnValue { target, .. } => validate_call(target),
         GeneratedId::Closure { lifted, .. } => validate_call(lifted),
         GeneratedId::Task { .. } => Ok(()),
+        GeneratedId::SqliteScalarCallback {
+            target,
+            effect,
+            descriptor_version,
+            kind,
+            family_version,
+            ..
+        } => {
+            validate_call(target)?;
+            if *effect <= 1
+                && *descriptor_version == 1
+                && *kind == 0
+                && *family_version == 1
+            {
+                Ok(())
+            } else {
+                Err(CanonicalCodecError::InvalidGraph)
+            }
+        }
         GeneratedId::Parallel(value) => validate_parallel(value),
     }
 }
@@ -579,6 +630,17 @@ mod tests {
                 },
                 "0102010300000000000140",
             ),
+            (
+                GeneratedId::SqliteScalarCallback {
+                    target: call("cb"),
+                    signature: empty_abi.clone(),
+                    effect: 0,
+                    descriptor_version: 1,
+                    kind: 0,
+                    family_version: 1,
+                },
+                "0104020000006362010000000003000000003800000000010000000001000000",
+            ),
         ];
         for (value, expected) in goldens {
             let expected = hex(expected);
@@ -711,6 +773,40 @@ mod tests {
             invalid_parallel.to_canonical_bytes(),
             Err(CanonicalCodecError::InvalidGraph)
         );
+
+        let valid_callback = GeneratedId::SqliteScalarCallback {
+            target: call("cb"),
+            signature: abi("0100000000030000000038000000"),
+            effect: 0,
+            descriptor_version: 1,
+            kind: 0,
+            family_version: 1,
+        };
+        for field in 0..4 {
+            let mut invalid_callback = valid_callback.clone();
+            let GeneratedId::SqliteScalarCallback {
+                effect,
+                descriptor_version,
+                kind,
+                family_version,
+                ..
+            } = &mut invalid_callback
+            else {
+                unreachable!()
+            };
+            match field {
+                0 => *effect = 2,
+                1 => *descriptor_version = 2,
+                2 => *kind = 1,
+                3 => *family_version = 2,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                invalid_callback.to_canonical_bytes(),
+                Err(CanonicalCodecError::InvalidGraph),
+                "SQLite callback identity field {field} must be authenticated",
+            );
+        }
     }
 
     #[test]

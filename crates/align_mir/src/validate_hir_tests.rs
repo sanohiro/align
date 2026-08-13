@@ -2262,7 +2262,19 @@ fn body_contract_function_root_completion() {
 
 #[test]
 fn checked_hir_body_fact_replay_rejects_stale_producer_facts() {
-    let base = declaration_header_program();
+    let mut base = declaration_header_program();
+    let callback_fact = hir::Expr {
+        kind: hir::ExprKind::SqliteCallbackDescriptor {
+            target: "worker".to_string(),
+            effect: Cell::new(FnEffect::Pure),
+        },
+        ty: Ty::Unit,
+        span: align_span::Span::new(0, 0, 0),
+    };
+    base.fns[0]
+        .body
+        .stmts
+        .push(hir::Stmt::Expr(callback_fact));
     // The baseline function-type entry is annotation-only in this fixture; its producer value is
     // the conservative Unknown state, not a synthesized Pure result.
     base.fn_types[0].effect.set(FnEffect::Unknown);
@@ -2324,6 +2336,25 @@ fn checked_hir_body_fact_replay_rejects_stale_producer_facts() {
     assert_replay_rejects_without_mutating(
         bad_effect,
         "stale annotation-only effect must fail closed",
+    );
+
+    let stale_callback_effect = base.clone();
+    let callback_effect = stale_callback_effect.fns[0]
+        .body
+        .stmts
+        .iter()
+        .find_map(|statement| match statement {
+            hir::Stmt::Expr(hir::Expr {
+                kind: hir::ExprKind::SqliteCallbackDescriptor { effect, .. },
+                ..
+            }) => Some(effect),
+            _ => None,
+        })
+        .expect("fixture contains a SQLite callback descriptor effect");
+    callback_effect.set(FnEffect::Impure);
+    assert_replay_rejects_without_mutating(
+        stale_callback_effect,
+        "a stale SQLite callback descriptor effect must fail closed",
     );
 }
 
