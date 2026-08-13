@@ -13,6 +13,30 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### `pkg.db` dynamic values are a closed indexed region surface (SETTLED 2026-08-13)
+
+**Decision:** D14's common dynamic-SQL escape hatch uses one closed Copy sum:
+`Null`, `Bool`, exact-width signed integers and floats, `Text(str)`, and
+`Bytes(db.byte_view { bytes: slice<u8> })`. `db.row` owns one ordered `array<db.value>`.
+`dynamic_execute` and `dynamic_rows` require a visible runtime SQL string, explicit value slice,
+exact `db.Driver`, and common execution-option slice. `dynamic_rows` returns a dependent one-pass
+resource; `dynamic_next(stream, out)` copies exactly one row and its text/bytes into the explicit
+region. There is no field-name reflection, arbitrary native-type coercion, hidden
+descriptor/artifact, prepared form, eager all-rows materializer, native option escape, or inferred
+driver.
+
+SQLite maps each result cell by its runtime storage class. PostgreSQL uses the exact first-release
+OID set and binary payloads, rejects unknown types, and requires an explicit SQL cast when an
+untyped NULL or wider native type needs one. Both operations execute at most one native statement,
+reject SQL U+0000 before native work, preserve the existing lease/timeout/status/transaction
+cleanup rules, and publish no partial current row. SQLite rejects NaN inputs instead of silently
+accepting the engine's NaN-to-NULL conversion. This settles only the minimal common dynamic rail;
+decimal/temporal/UUID/JSON/array/range/domain mappings and all native callback surfaces remain
+separate consumer decisions.
+
+Record: `docs/impl/pkg-design/db.md` §§19 and 23 and synchronized
+`docs/impl/pkg-design/ja/db.md`
+
 ### `pkg.db.pool` is explicit, fixed-capacity, and non-waiting (SETTLED 2026-08-13)
 
 **Decision:** D13 adds one `pkg.db.pool` module with an eagerly opened `1..=1024` fixed-capacity

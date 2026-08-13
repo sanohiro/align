@@ -318,6 +318,8 @@ db.rows<R>
 db.batch<R>
 db.exec_result
 db.Driver
+db.dynamic_rows
+db.byte_view
 db.row
 db.value
 ```
@@ -343,7 +345,14 @@ Required meaning:
 - `db.exec_result` is the allocation-free Copy affected-row record from §6.1.
 - `db.Driver { SQLite, PostgreSQL }` is the exact public driver identity used in errors, metadata,
   delivery observations, and D14's explicit dynamic-SQL restriction; it has no `Any` variant.
-- `db.row` and `db.value` are explicit dynamic escape hatches.
+- `db.dynamic_rows` is D14's Move, one-pass dynamic row stream, dependent on the execution target
+  for its resource lifetime; EOF, failure, or Drop completes its native cleanup and releases the
+  execution lease.
+- `db.byte_view` is the one-field Copy wrapper that makes arbitrary bytes a legal tagged-sum
+  payload without treating them as UTF-8. `db.value` is the closed Copy sum used by explicit
+  dynamic-SQL parameters and region-owned results.
+- `db.row` is one Move indexed row owning an `array<db.value>` in the caller's explicit region. It
+  carries no static Query identity, field-name reflection, or native-buffer borrow.
 
 The common root declares the resource types and names `pub`, raw-only Drop hooks in
 `pkg.db.internal.resource`. Each hook is an ordinary function with an `unsafe {}` body; the resource
@@ -3311,29 +3320,85 @@ The native package may expose:
 Static typed Queries are the default. Runtime SQL is explicit and weaker.
 
 ```align
-rows := db.dynamic_rows(
-  exec,
-  db.Driver.SQLite,
-  sql_text,
-  params,
-  out,
-  [],
-)?
+pub fn first_dynamic(
+  target: db.exec,
+  sql_text: str,
+  name: str,
+  out: region,
+) -> Result<Option<db.value>, db.Error> {
+  values := [db.value.I64(42), db.value.Text(name)]
+  mut rows := db.dynamic_rows(target, db.Driver.SQLite, sql_text, values[..], [])?
+  row := db.dynamic_next(rows, out)? else { return Ok(None) }
+  return Ok(Some(row.values[0]))
+}
 ```
 
-Dynamic results use:
+The exact common surface is:
 
-```text
-db.row
-db.value
+```align
+pub byte_view {
+  bytes: slice<u8>,
+}
+
+pub value {
+  Null
+  Bool(bool)
+  I16(i16)
+  I32(i32)
+  I64(i64)
+  F32(f32)
+  F64(f64)
+  Text(str)
+  Bytes(byte_view)
+}
+
+pub row {
+  values: array<value>,
+}
+
+pub resource dynamic_rows = pkg.db.internal.resource.drop_dynamic_rows
+
+pub fn dynamic_execute(
+  target: exec,
+  driver: Driver,
+  sql: str,
+  params: slice<value>,
+  options: slice<ExecuteOption>,
+) -> Result<exec_result, Error>
+
+pub fn dynamic_rows(
+  target: exec,
+  driver: Driver,
+  sql: str,
+  params: slice<value>,
+  options: slice<ExecuteOption>,
+) -> Result<dynamic_rows, Error>
+
+pub fn dynamic_next(
+  borrow mut stream: dynamic_rows,
+  out: region,
+) -> Result<Option<row>, Error>
 ```
 
 The second argument is an exact `db.Driver` value, not `AnySupportedDriver` and not an inferred
-property of `exec`. `db.dynamic_execute` and `db.dynamic_rows` compare it with the execution handle
-and return `DriverMismatch` before sending SQL. Their parameter values are an explicit slice, and
-their final argument is `slice<db.ExecuteOption>`. A driver-native variant is itself qualified as
-`sqlite.dynamic_*_native`/`postgres.dynamic_*_native`; that module path is its exact restriction,
-and it receives one common option slice plus one native option slice.
+property of `exec`. Both constructors compare it with the execution handle and return
+`DriverMismatch` before sending or stepping SQL. The SQL bytes, parameter slice, common execution
+options, and each `dynamic_next` destination region are visible at the call. There is no placeholder
+rewrite, checked artifact, descriptor, prepared form, statement cache, name lookup, or reflective
+struct decoder.
+
+`dynamic_execute` accepts a single non-row statement and returns its ordinary affected-row record.
+`dynamic_rows` starts one row-producing execution and returns its dependent one-pass stream.
+`dynamic_next` preserves server row and column order and copies exactly one row into `out`; the
+returned Move `db.row` contains its indexed `array<db.value>`. Text and bytes in that array point
+into `out`, never into SQLite or libpq storage. The complete type, mapping, validation, allocation,
+failure, and cleanup contract is the A2 ledger in §23.
+
+This first dynamic rail publishes no `dynamic_one`, `dynamic_prepare`, eager all-rows materializer,
+column-name table, identifier-composition API, or driver-native option form. If a later measured
+consumer needs native options, its functions use the qualified
+`sqlite.dynamic_*_native`/`postgres.dynamic_*_native` names and a separate native option slice; it
+does not widen these common signatures or infer a driver.
 
 They do not silently decode into an arbitrary typed struct using reflection.
 
@@ -5309,7 +5374,8 @@ No roadmap item may add hidden relationship loading or a Query-builder DSL.
 
 ### D14 — dynamic SQL and native callbacks
 
-- settle and implement the minimal owned `db.value` sum and indexed `db.row`;
+- settle and implement the minimal explicit `db.value` sum, indexed `db.row`, and dependent
+  dynamic row stream;
 - require a visible dynamic SQL string, explicit value slice, exact `db.Driver` restriction, and
   execute-option slice; reject driver mismatch before SQL send;
 - reject U+0000 in dynamic SQL before SQL send;
@@ -5318,6 +5384,388 @@ No roadmap item may add hidden relationship loading or a Query-builder DSL.
 - add SQLite function/collation and PostgreSQL notice/COPY callback surfaces only after the
   callback-capture, abort, reentrancy, and thread rules are proved;
 - pin statement count, value allocation, callback lifetime, and cleanup behavior.
+
+#### A2 dynamic SQL/value/row public-contract ledger
+
+This ledger is the source of truth for the first independently useful D14 rail. It settles the
+minimal common dynamic value set and implements it over both shipped drivers in one capability.
+It is deliberately weaker than a static Query: it has no compile-time SQL scan, placeholder
+rewrite, Params/Row fingerprint, checked metadata, producer thunk, prepared form, or field-name
+contract. Splitting the public value/row producer from either driver would publish a dormant or
+single-driver common abstraction and duplicate the same value, allocation, cleanup, and
+whole/per-unit proof. The implementation may therefore exceed 1,000 hand-written lines when its
+two-driver owner matrix is included; the single boundary has less duplicated proof and lower
+integration risk.
+
+The exact public inventory is the §19 surface and no more:
+
+```align
+pub byte_view {
+  bytes: slice<u8>,
+}
+
+pub value {
+  Null
+  Bool(bool)
+  I16(i16)
+  I32(i32)
+  I64(i64)
+  F32(f32)
+  F64(f64)
+  Text(str)
+  Bytes(byte_view)
+}
+
+pub row {
+  values: array<value>,
+}
+
+pub resource dynamic_rows = pkg.db.internal.resource.drop_dynamic_rows
+
+pub fn dynamic_execute(
+  target: exec,
+  driver: Driver,
+  sql: str,
+  params: slice<value>,
+  options: slice<ExecuteOption>,
+) -> Result<exec_result, Error>
+
+pub fn dynamic_rows(
+  target: exec,
+  driver: Driver,
+  sql: str,
+  params: slice<value>,
+  options: slice<ExecuteOption>,
+) -> Result<dynamic_rows, Error>
+
+pub fn dynamic_next(
+  borrow mut stream: dynamic_rows,
+  out: region,
+) -> Result<Option<row>, Error>
+```
+
+`byte_view` is the required one-field wrapper because current tagged payloads admit a plain struct
+but not a bare `slice<u8>`; it changes no bytes semantics. `value` is a Copy, RegionPlain tagged
+value. An input `Text` or `Bytes(byte_view { bytes })` borrows its source only through
+`dynamic_execute`/`dynamic_rows` setup. `row` is Move because it owns one arena-backed
+`array<value>`; its dynamic cleanup bit is false when produced into `out`. A returned Text/Bytes
+payload and `row.values` all carry that region and never borrow a native result, connection,
+parameter, or package scratch owner. Callers use `row.values.len()`, an integer index, and an
+exhaustive `match` on `value`; there is no column-name lookup, mutable field write, native type-id
+field, reflection hook, or unchecked accessor. `Null` is untyped as an input. In PostgreSQL SQL
+that cannot infer it, the caller writes a visible cast such as `$1::int8`; the package never guesses
+a NULL type.
+
+Every argument in the inventory is required. `options = []` means no deadline; the only common
+variant is the settled positive, unique `ExecuteOption.TimeoutNs`. PostgreSQL enforces it while the
+constructor executes, SQLite rejects it before lease acquisition, and `dynamic_next` has no hidden
+deadline or ambient option. No environment variable, connection setting, catalog, or prior call
+changes the value mapping, driver selection, statement count, or validation order.
+
+These are nominal producer types named `pkg.db.byte_view`, `pkg.db.value`, `pkg.db.row`, and
+`pkg.db.dynamic_rows`. Their canonical package interface records the complete reachable
+definitions, signatures, return-region summary, resource identity/version, and Drop thunk. A
+consumer cache key depends on that producer interface and implementation identity. Dynamic calls
+create no separate structural Params/Row fingerprint, checked artifact, persisted descriptor, or
+runtime type table.
+
+The ordinary `pkg.db` root owns public formation and dispatch; `pkg.db.internal.sqlite`,
+`pkg.db.internal.postgres`, and `pkg.db.internal.resource` own native execution, the private state,
+and cleanup. The compiler and runtime gain no DB-specific path: they supply only the already-shipped
+nominal resource, return-provenance, exhaustive-sum, `clone_in`, and region-builder mechanisms. This
+ledger makes no throughput promise. Because it does promise one native statement, one retained
+native result/statement, per-row output, exact view copies, and the stated scratch lifetimes, the
+implementation records those counters and peak package/native bytes in one local
+`bench/pkg_db_dynamic` measurement after correctness. The measurement is not a semantic merge gate.
+
+The common mapping is exact:
+
+| `db.value` | SQLite parameter / result | PostgreSQL parameter / result |
+|---|---|---|
+| `Null` | `sqlite3_bind_null`; every `SQLITE_NULL` cell | null pointer with inferred OID 0; SQL NULL after the complete result-column OID/format check |
+| `Bool(v)` | bind integer `0`/`1`; SQLite has no distinct Boolean result storage class | exact `bool` OID 16, one binary byte `00`/`01` |
+| `I16(v)` | checked lossless widen and bind as `sqlite3_int64`; an INTEGER result is `I64` | exact `int2` OID 21, two-byte big-endian |
+| `I32(v)` | checked lossless widen and bind as `sqlite3_int64`; an INTEGER result is `I64` | exact `int4` OID 23, four-byte big-endian |
+| `I64(v)` | bind/read exact `sqlite3_int64` | exact `int8` OID 20, eight-byte big-endian |
+| `F32(v)` | reject NaN; otherwise losslessly widen and bind as double; a REAL result is `F64` | exact `float4` OID 700, four exact IEEE-754 bits in big-endian order |
+| `F64(v)` | reject NaN; otherwise bind/read the SQLite double | exact `float8` OID 701, eight exact IEEE-754 bits in big-endian order |
+| `Text(v)` | explicit byte length with transient-copy binding; `SQLITE_TEXT` is length-copied and UTF-8 checked | parameter type `text` OID 25; results admit exact OID 25, `varchar` 1043, or `name` 19; binary payload is exact UTF-8 bytes |
+| `Bytes(byte_view { bytes })` | explicit byte length with transient-copy binding; `SQLITE_BLOB` is length-copied | exact `bytea` OID 17 and exact binary bytes |
+
+SQLite result variants follow each cell's runtime storage class, not a declaration, the first row,
+or the parameter variant. Therefore an SQLite `Bool`, `I16`, or `I32` parameter can return as
+`I64`, and `F32` can return as `F64`; those widening conversions are lossless. A column may produce
+different variants in different rows. SQLite converts a bound NaN to SQL NULL, so accepting one
+would silently collapse `F32`/`F64` into `Null`; both NaN variants instead fail parameter validation
+before prepare. Finite values, signed zero, and infinities remain admitted. A synthetic
+`SQLITE_FLOAT` NaN result is an invalid native representation; a real SQLite engine exposes such a
+value as `SQLITE_NULL`.
+
+PostgreSQL uses one parameterized binary execution. Without a timeout this is one synchronous
+`PQexecParams`; with a timeout it is the shipped one-send nonblocking wait/cancel/drain path with
+the same OID/value/length/format vectors. Every non-null parameter supplies the exact OID and
+binary payload above; `Null` alone supplies OID 0, a null value pointer, and text format because it
+has no payload or independently knowable binary type. The result requests binary format once for
+all columns. Before inspecting a row or allocating an output payload, the package validates every
+column in increasing ordinal against the admitted OID set and binary format 1. It then decodes the
+exact fixed width or checked UTF-8/byte length. No numeric, decimal, temporal, UUID, JSON/JSONB,
+array, range, domain, enum, composite, extension, or unknown PostgreSQL OID is coerced to `Text` or
+`Bytes`; the SQL author uses an explicit cast to an admitted type or a later driver-qualified
+surface.
+
+The independent semantic-to-byte and byte-to-semantic goldens reuse A1's exact vectors:
+`false = 00`, `true = 01`, `int2(-2) = ff fe`,
+`int4(0x01020304) = 01 02 03 04`, `int8(-2) = ff ff ff ff ff ff ff fe`,
+`f32(1.5) = 3f c0 00 00`, `f64(-0.0) = 80 00 00 00 00 00 00 00`,
+UTF-8 `é = c3 a9`, and `bytea([0, 255]) = 00 ff`. PostgreSQL float transport preserves every bit,
+including signed zero, infinities, and NaN payloads. A present empty Text/Bytes parameter uses a
+non-null stable sentinel with recorded length zero on both drivers; only `Null` uses a null value
+pointer. For results, SQLite BLOB permits a null pointer only with zero byte length, while present
+PostgreSQL values require the libpq-provided non-null pointer even at length zero. Text checks the
+native error state, pointer/length product, and UTF-8 before cloning. More exactly, a present
+SQLite TEXT requires a non-null pointer even at length zero; a present zero-length BLOB may use a
+null pointer only while `sqlite3_errcode` remains `SQLITE_OK`. Any other null/length/error-state
+product is the owned native error when available, otherwise the invalid-representation error.
+Empty values remain distinct from `Null`.
+
+SQL is one visible runtime `str` in the selected driver's native dialect. SQLite placeholders keep
+their native `?`, `?NNN`, `:name`, `@name`, or `$name` meaning and the explicit value slice binds
+native ordinals `1..=params.len()`. SQLite's native parameter count is the largest assigned index,
+not textual occurrence count: repeated names share an index and a sparse `?NNN` sequence still
+requires values through its largest index. PostgreSQL placeholders are native `$1..$N`; the server
+validates their use. The package does not accept the static Query `:name` rewrite contract here,
+inspect identifiers, interpolate values, read an artifact, consult a catalog, issue a describing
+query, or prepare/cache a hidden statement.
+
+Both constructors accept exactly one nonempty native statement. SQLite proves this from one
+`sqlite3_prepare_v2` result and a comment/whitespace-only tail before the first `sqlite3_step`;
+PostgreSQL relies on the extended-query one-command rule of `PQexecParams`. A SQLite empty or
+multi-statement input returns the exact statement error below without stepping. PostgreSQL empty
+input maps the known empty-result status to that same error; other server-reported syntax or
+multi-command rejection retains the ordinary PostgreSQL native error and its SQLSTATE. In every
+case the package invokes one statement execution at most. Timeout recovery may invoke native
+cancel/drain, but no path issues SQL for validation, cleanup, rollback, or retry. Implementation
+authority is the official SQLite contracts for
+[`sqlite3_prepare_v2`](https://sqlite.org/c3ref/prepare.html),
+[`sqlite3_bind_parameter_count`](https://sqlite.org/c3ref/bind_parameter_count.html),
+[`sqlite3_bind_*`](https://sqlite.org/c3ref/bind_blob.html),
+[`sqlite3_step`](https://sqlite.org/c3ref/step.html), and
+[`sqlite3_column_*`](https://sqlite.org/c3ref/column_blob.html), plus PostgreSQL 17's
+[`PQexecParams`](https://www.postgresql.org/docs/17/libpq-exec.html) and
+[`PGresult` accessors](https://www.postgresql.org/docs/17/libpq-exec.html#LIBPQ-EXEC-SELECT-INFO).
+
+The dynamic escape hatch deliberately permits native transaction-control SQL; an explicit
+`db.exec.Tx` may consequently desynchronize the wrapper's transaction model if the caller bypasses
+the ordinary transaction API. Before any success, reusable error, or stream publication/terminal
+release, the driver runs the same exact native-idle/transaction-state proof already required for
+pool return and timeout recovery. The observed state must match the target kind: native idle for
+`exec.Conn`, active/in-transaction for `exec.Tx`. A mismatch poisons/closes and returns the ordinary
+synchronized-cleanup error when there is no earlier error; it never publishes a resource or
+affected-row success. This check issues no SQL and a dynamic call never begins, commits, rolls back,
+or repairs a transaction on the caller's behalf.
+
+The common parameter maximum is exactly 65,535. SQL plus its out-of-domain C sentinel and every
+SQLite parameter byte length must fit signed native `int`; PostgreSQL reuses the A1 binary ledger's
+checked Parse and Bind formulas with the empty statement-name size `S=1`, parameter count `N`,
+wire SQL C-string byte count `Q = sql.len() + 1`, and exact payload lengths. All count,
+multiplication, addition, and pointer/length products are checked before narrowing. SQLite compares
+`sqlite3_bind_parameter_count` with `params.len()` after preparation and before the first bind;
+PostgreSQL sends exactly `params.len()` OIDs, values, lengths, and formats and lets the server
+validate placeholder use. Parameters are visited once in increasing slice index. SQLite uses
+`SQLITE_TRANSIENT` semantics for Text/Bytes. The package owns one SQL C-string copy and bounded
+parameter-vector/encoded-payload scratch during setup. Each present Text/Bytes value and each
+PostgreSQL scalar is copied or encoded once into that scratch; an empty view uses the one-byte
+sentinel outside its recorded length. All setup scratch is freed before `dynamic_rows` publishes
+its resource or `dynamic_execute` returns. PostgreSQL `Text` containing U+0000 and SQLite F32/F64
+NaN are rejected in increasing parameter index before prepare/send. SQLite Text uses its explicit
+length and may contain U+0000. Bytes permit every byte on both drivers. Native allocation failure
+remains the language's hard allocation error; it is not mapped to `pkg.db.Error`.
+
+Validation and observable error precedence are exact:
+
+1. validate the complete execution target and transaction/live-state relation;
+2. compare the explicit `Driver` with that target;
+3. validate SQL length, then reject U+0000, then validate the common parameter-count bound;
+4. validate `ExecuteOption` in source order and reject a requested SQLite common timeout;
+5. acquire the existing one-active-execution lease, so overlap wins over parameter payload errors;
+6. validate/measure parameters in increasing index, including SQLite float NaN, PostgreSQL text
+   NUL, pointer/length products, and aggregate protocol budgets;
+7. allocate setup scratch; SQLite prepares once, validates nonempty/tail/largest parameter index
+   and result kind, then binds increasing ordinals, while PostgreSQL sends once; and
+8. classify the native result, validate every PostgreSQL column's OID/format, and either publish a
+   valid `dynamic_rows` resource or complete native cleanup before publishing
+   `dynamic_execute` success.
+
+Within phase 3, the representable SQL-length check precedes the U+0000 scan, and U+0000 precedes
+parameter count. Within phase 4, each timeout payload is checked before duplicate registration;
+after the complete slice is otherwise valid, SQLite unavailability wins. Within phase 6, each
+parameter's tag and driver-specific scalar/view validity precede the next parameter, and the final
+aggregate Parse/Bind budget follows all individual measurements. Within phase 7, SQLite checks
+nonempty statement, tail, parameter count, and requested result kind in that order before the
+first bind; then the first native bind error wins by ordinal. PostgreSQL status classification
+precedes result-kind classification, and complete column metadata precedes row count/value access.
+
+The first failing cell wins, later cells perform no work, and this order also governs every
+multi-invalid input. All package-detectable errors through parameter measurement occur before SQL
+prepare/send/step. SQLite preparation is native work but does not execute the statement body;
+every bind failure still precedes the first step. Native SQL validity, PostgreSQL placeholder use,
+and PostgreSQL command-versus-row kind are known only after server execution; a PostgreSQL
+wrong-kind error may therefore follow visible statement effects. SQLite checks command-versus-row
+kind from `sqlite3_column_count` before its first step. `dynamic_rows` executes and buffers its
+PostgreSQL statement before returning; SQLite only prepares and binds during construction, and the
+first `dynamic_next` performs its first step. Dropping an unadvanced SQLite stream therefore
+executes no statement body, while dropping a PostgreSQL stream cannot retract effects already
+completed by the server. Neither driver performs a hidden rollback: connection-target and
+explicit-transaction effects follow the settled Q4a/Q4b semantics and remain observable after a
+synchronized error.
+
+The new query-less contract errors are exact:
+
+| Failure | Exact `pkg.db.Error` |
+|---|---|
+| invalid/closed execution target | `Unsupported(ContractError { query_id: None, item: "db.dynamic.exec", message: "dynamic SQL requires an idle live connection or active transaction" })` |
+| explicit driver does not match | `DriverMismatch(ContractError { query_id: None, item: "db.dynamic.driver", message: "dynamic SQL driver does not match the execution handle" })` |
+| SQL contains U+0000 | `Encode(ContractError { query_id: None, item: "db.dynamic.sql", message: "dynamic SQL contains U+0000" })` |
+| SQL/native length is unrepresentable | `Unsupported(ContractError { query_id: None, item: "db.dynamic.sql", message: "dynamic SQL exceeds the supported native length range" })` |
+| more than 65,535 values | `Unsupported(ContractError { query_id: None, item: "db.dynamic.parameters", message: "dynamic SQL supports at most 65535 parameters" })` |
+| empty or independently recognized multi-statement input | `InvalidQuery(ContractError { query_id: None, item: "db.dynamic.statement", message: "dynamic SQL must contain exactly one statement" })` |
+| SQLite/native parameter count differs | `InvalidQuery(ContractError { query_id: None, item: "db.dynamic.parameters", message: "dynamic SQL parameter count does not match the statement" })` |
+| PostgreSQL Text parameter contains U+0000 | `Encode(ContractError { query_id: None, item: "db.dynamic.parameter", message: "PostgreSQL dynamic text parameter contains U+0000" })` |
+| SQLite F32/F64 parameter is NaN | `Encode(ContractError { query_id: None, item: "db.dynamic.parameter", message: "SQLite dynamic floating parameter must not be NaN" })` |
+| parameter representation or aggregate wire budget is invalid | `Encode(ContractError { query_id: None, item: "db.dynamic.parameter", message: "dynamic SQL parameters exceed the supported native representation" })` |
+| `dynamic_execute` receives rows | `InvalidQuery(ContractError { query_id: None, item: "db.dynamic.execute", message: "dynamic execute must not produce rows" })` |
+| `dynamic_rows` receives no row result | `InvalidQuery(ContractError { query_id: None, item: "db.dynamic.rows", message: "dynamic rows requires a row-producing statement" })` |
+| malformed or already-failed dynamic stream | `InvalidQuery(ContractError { query_id: None, item: "db.dynamic.rows.state", message: "invalid or failed dynamic database rows resource" })` |
+| unsupported PostgreSQL OID/format or SQLite storage class | `Decode(ContractError { query_id: None, item: "db.dynamic.value", message: "database dynamic value has an unsupported native type" })` |
+| invalid width, pointer/length, bool tag, scalar bytes, or UTF-8 | `Decode(ContractError { query_id: None, item: "db.dynamic.value", message: "database dynamic value has an invalid native representation" })` |
+| checked row/column/product address overflow | `Unsupported(ContractError { query_id: None, item: "db.dynamic.result", message: "dynamic SQL result exceeds the supported address range" })` |
+| successful execution cannot complete cleanup | `Unsupported(ContractError { query_id: None, item: "db.dynamic.execute.cleanup", message: "dynamic database execution cleanup failed and the connection was closed" })` |
+| successful row advance cannot complete cleanup | `Unsupported(ContractError { query_id: None, item: "db.dynamic.rows.cleanup", message: "dynamic database rows cleanup failed and the connection was closed" })` |
+
+Lease overlap retains the shipped driver-specific `Unsupported(ContractError { query_id: None })`:
+SQLite uses item `sqlite.connection.active_execution` and message
+`SQLite connection already has an active execution`; PostgreSQL uses item
+`postgres.connection.active_execution` and message
+`PostgreSQL connection already has an active execution`. It performs no parameter allocation,
+prepare/send/step, timeout mutation, or read/restore of the first owner's state.
+
+An invalid or duplicate common timeout uses
+`Unsupported(ContractError { query_id: None, item: "db.execute.timeout_ns" })` with the exact
+message `database execution timeout must be positive` or
+`duplicate database execution timeout`, respectively. SQLite's unavailable timeout retains the
+exact message `SQLite does not support common execution deadlines`. Driver-native connection, constraint,
+serialization, deadlock, timeout, cancellation, and other failures retain the existing `Error`
+classification and `NativeError` fields, also without a Query identity. The PostgreSQL
+result-status safety authority remains exhaustive: COPY, pipeline, or unknown status clears the
+current result once, immediately poisons/closes, and permits no later result, COPY,
+pipeline-exit, cancel, transaction-state, or blocking-restore call. Ordinary known results clear
+once and return the connection only after the existing synchronization proof.
+
+`dynamic_execute` requires a non-row native completion. SQLite returns
+`exec_result.rows_affected = Some(sqlite3_changes64(database))`; PostgreSQL parses
+`PQcmdTuples` into the same existing `Some(count)`/`None` contract. A row-producing completion
+returns the exact wrong-kind error and publishes no result. `dynamic_rows` requires a row-producing
+completion, including `SELECT` or DML with `RETURNING`; a command completion returns its exact
+wrong-kind error. PostgreSQL tuple status is authoritative and may validly contain zero rows or
+zero columns. SQLite has no distinct tuple status, so a prepared statement is row-producing only
+when `sqlite3_column_count > 0`. Both preserve every native row and column ordinal.
+
+The published resource owns one private 48-byte, 8-aligned v1 wrapper and no parameter scratch:
+
+```text
+offset 0   u32 version = 1
+offset 4   u8  driver = 1 SQLite | 2 PostgreSQL
+offset 5   u8  terminal = 0 live | 1 exhausted | 2 failed
+offset 6   u16 reserved = 0
+offset 8   raw native statement/PGresult
+offset 16  raw connection state
+offset 24  i64 next row ordinal
+offset 32  i64 row count (-1 while SQLite is live; >= 0 for PostgreSQL)
+offset 40  i64 column count
+```
+
+A live SQLite product has non-null native/state, `next >= 0`, `row_count = -1`, and
+`column_count > 0`. A live PostgreSQL product has non-null native/state,
+`0 <= next <= row_count`, `row_count >= 0`, and `column_count >= 0`. Every terminal product has
+null native/state and zero next/row/column counts. All other combinations are malformed. The root
+constructs the resource with `resource.from_raw_borrowed` from the exact conn/tx arm of `target`, so
+the wrapper cannot outlive or cross a move of that target even after its native state becomes
+terminal. The shared producer-owned Drop hook silently finalizes/clears a live native owner,
+releases the lease only after cleanup, poisons/closes when cleanup cannot prove reuse, and frees the
+wrapper exactly once. A terminal Drop only frees the wrapper. No public raw constructor, accessor,
+manual close, row count, column count, rewind, clone, or Send conversion exists.
+
+`dynamic_next` rejects a malformed header without following an embedded pointer or calling a
+driver. Malformed Drop is silent: it frees only the outer wrapper, performs no embedded load or
+native call, and leaves the parent connection's active lease fail-closed so no later operation can
+reuse it; final conn/tx Drop closes or retires that physical owner. This unsafe-corruption path may
+retain an unreachable native handle until parent teardown, but cannot double-free it, release the
+lease early, or dispatch through an unauthenticated driver tag.
+
+For PostgreSQL, construction has already completed the statement and validated every column's
+OID/format before publishing the resource. A zero-row result is cleared and published in canonical
+exhausted state. Otherwise the complete `PGresult` and lease remain until final-row publication,
+failure, or Drop. SQLite publishes the prepared/bound statement before its first step and retains
+the lease over the stream.
+
+`dynamic_next` validates the complete wrapper before its first embedded load. Exhausted returns
+`Ok(None)` without native or region work; failed or malformed returns the exact state error. A live
+call selects exactly one row, then validates cells in increasing column ordinal. Each non-null
+PostgreSQL cell checks metadata first, followed by null disposition, signed length, pointer,
+fixed width, scalar bits/bool tag, or UTF-8. SQLite reads the runtime storage class first and applies
+the corresponding pointer/length/scalar checks. All address arithmetic is checked before native
+view formation or region allocation.
+
+One `array_builder<value>(out)` materializes exactly that row and performs one ordinary L6 final
+compaction. Each nonempty Text/Bytes cell performs exactly one `clone_in(out)` payload copy; an
+empty view performs no payload allocation and remains distinct from `Null`. The completed
+`array<value>` becomes the returned Move `row`. There is no all-rows value plane, per-result row
+array, package heap output, native view retention, or prefetch of the next SQLite row. PostgreSQL
+clears/releases before publishing its final row. SQLite learns EOF only on the next advance; that
+advance or early Drop finalizes/releases without retracting prior rows.
+
+Current-row publication is failure-atomic. A decode, address, step/result, or cleanup error returns
+no `row` for that advance, destroys the unpublished builder, marks the wrapper failed after exact
+native cleanup, and preserves every earlier row in its caller region. An arena is monotonic, so any
+payloads or builder chunks allocated before the failing cell remain unreachable until the arena
+ends; the package never rewinds it. A physical allocation failure is the language hard error. The
+first owned validation/native/decode error remains primary over later cleanup failure; a cleanup
+failure with no earlier error uses the exact cleanup error above. Success or failure finalizes or
+clears native state once, frees setup owners, restores or poisons once, and releases the lease once.
+Drop is silent and performs no hidden rollback. Connection-target and explicit-transaction effects
+remain exactly those already completed by the engine.
+
+This rail changes only the ordinary package interface and implementation keys once. It creates no
+static Query/artifact/cache identity, no compiler builtin, no MIR/LLVM operation, no runtime
+reflection table, and no normal-build database/network access. Whole-program and per-unit callers
+must receive byte-identical signatures, tagged-value layout, region provenance, exhaustive-match
+behavior, and driver linkage. The implementation runs `scripts/db-verify-local.sh` before push and
+keeps the required PostgreSQL job non-skippable.
+
+The implementation closure matrix is:
+
+| Closure cell | Required implementation closure | Exact owner evidence |
+|---|---|---|
+| public formation and identity | Export exactly four nominal types and three functions. Preserve `value` as Copy/RegionPlain, `row.values` as one region-backed Move array, exhaustive matching, exact return-region provenance, the nominal resource/Drop identity, and whole/per-unit interface equality. Export no alias, name lookup, eager materializer, prepared/native option form, reflection hook, or manual close. | exact source/signature and interface-byte/hash golden; direct/imported construction and exhaustive match; `byte_view` necessity and bare-slice-payload rejection; row/view escape negatives; exported/forbidden inventory |
+| phase order and common validation | Implement the eight phases and query-less errors above. Target precedes explicit driver, SQL length/NUL/count precedes options, overlap precedes payload validation, and every package-detectable parameter failure has zero prepare/send/step/output allocation. | pairwise multi-invalid matrix with native/lease/allocation counters; NUL and signed-length/count boundaries; timeout absent/invalid/duplicate/SQLite-unavailable; first failing parameter ordinal |
+| parameter mapping, bytes, and lifetime | Bind every variant in increasing index with the exact table, Null inference, native placeholders, non-null empty sentinel, SQLite transient copies/NaN rejection, PostgreSQL binary OID/format vectors, text-NUL rule, and checked Parse/Bind budgets. Free all setup scratch before return/publication and retain no input provenance. | every variant plus Null/empty/NUL/high-byte/extrema/signed-zero/infinity/NaN x driver; independent encode/decode byte goldens; count 0/1/65535/65536; repeated/sparse SQLite placeholders; PostgreSQL placeholder mismatch; accepted budget edge/rejected next byte; source mutation/Drop after constructor |
+| SQLite construction and advancement | Acquire the shipped lease; prepare one statement/tail, validate largest parameter index and kind, bind once, and publish without stepping. `dynamic_next` steps at most one row, maps each runtime storage class independently, materializes one row, and finalizes/releases on EOF/error/Drop. `dynamic_execute` steps to completion, reads changes, finalizes, and releases once. | fake native call/order/failpoint matrix; mixed classes across rows; empty and null pointer/length cases; zero/one/many rows/columns; command/query/RETURNING; unadvanced Drop/no-effect; early Drop; live SQLite cases |
+| PostgreSQL construction and advancement | Use one parameterized binary execution, validate every column OID/format before publication, retain one complete `PGresult`, and decode one ordinal row per call. Reuse timeout/cancel/status/transaction synchronization and fail-closed COPY/pipeline/unknown behavior; clear/release before final-row publication. | OID x format x NULL/payload width/value matrix; all known statuses plus unknown; zero/one/many rows and zero/one/many columns; command/query/RETURNING; Timeout Conn/Tx; final-row cleanup; live PostgreSQL 16.4 with client >=17 |
+| resource ABI, move, and cleanup | Form only the exact 48-byte v1 products; validate the complete header before embedded loads; construct with the target dependency; preserve it across local/return/if/match/else/`?`/`map_err`/loop joins; canonicalize terminal state; and Drop live/terminal/malformed siblings without double clear/finalize/free or premature parent release. | semantic-to-byte/byte-to-semantic state goldens; every field/tag/reserved/pointer/count mutation; Move/control-flow/drop-flag owners; conn/tx and direct/pool parent generation; whole/per-unit Drop-thunk linkage; allocation balance |
+| per-row region materialization | Build one `array<value>` for only the current row, copy each nonempty view once, preserve empty/Null and row/column order, retain no native/input view, and allocate nothing for exhausted/failed advances. Do not prefetch SQLite or allocate an all-rows container. | row-size 0/1/many and builder chunk boundaries; exact region payload/builder/compaction counters; previous-row survival; owner provenance/escape; post-native-cleanup reads; forbidden all-rows allocation inventory |
+| failure, effects, and synchronization | On every validation/native/decode/address/cleanup failpoint, publish no current row, retain earlier rows and the first error, destroy unpublished builders/scratch, clear/finalize once, transition failed, and release or poison once with no hidden rollback. Record PostgreSQL post-send wrong-kind/effects, SQLite pre-step wrong-kind/unadvanced-Drop timing, and the exact native transaction-state proof before every publication/reuse boundary. | complete failpoint ledger x Execute/Rows/Next x Conn/Tx/direct/pool; first-error pairs; raw BEGIN/COMMIT/ROLLBACK state mismatch and retirement; statement-effect/reuse/rollback-required observations; repeated failed advance; no-call-after-close assertions |
+| product, build, and measurement parity | Keep typed Query behavior/artifacts byte-stable, dynamic calls out of normal build tooling, and both driver link closures available whole-program/per-unit. Run the focused A2 owner plus Q2/Q4b/A1 regressions and the local DB gate. After correctness, record zero/empty/nonempty and one/many-row scratch, native-owner, region-copy/compaction, peak-byte, and time-to-first/full-scan observations without turning them into semantic thresholds. | descriptor/artifact golden unchanged; whole/per-unit executable parity; `scripts/db-verify-local.sh`; required Linux/macOS/PostgreSQL CI; non-gating `bench/pkg_db_dynamic` record |
+
+Implementation requires the shipped Q4b lease/stream/timeout cleanup, A1 binary-format and
+result-status closures, D12 native-consumer lease closure, and D13 pool provenance. It consumes no
+callback capability and does not authorize the later SQLite/PostgreSQL callback rails.
+
+Before implementation, run one fresh independent adversarial review of this ledger and its one-PR
+boundary, then close findings ledger-first. Before code review, perform the author-side
+matrix-to-diff pass: every applicable cell above points to implementation and one discriminating
+owner, or the ledger explicitly defers it. A finding that changes the value set, output ownership,
+validation order, native mapping, or failure atomicity changes the public/safety strategy and
+requires a fresh design review before implementation continues.
 
 This capability follows the typed Query product. It is not permission to route typed Query
 execution through a reflective dynamic engine.
@@ -5533,6 +5981,26 @@ The design is implemented correctly only if all are true:
     last later owner Drop closes its connection and frees retained bookkeeping exactly once.
 98. `db.Error.PoolExhausted` is payload-free and allocation-free; `pkg.db.pool.Info` exposes exact
     capacity, idle, and checked-out counts so retired capacity is visible.
+99. The common dynamic surface is exactly `db.byte_view`, the closed Copy `db.value` sum, the Move
+    `db.row` with indexed `array<value>`, the dependent one-pass `db.dynamic_rows` resource,
+    `dynamic_execute`, `dynamic_rows`, and `dynamic_next`; it has no inferred driver,
+    name/reflection access, eager all-rows materializer, prepared form, or native option escape.
+100. Every dynamic parameter/result follows the A2 SQLite-storage-class or PostgreSQL exact
+     binary-OID table. Unknown native types reject rather than coercing to Text/Bytes, and an
+     untyped PostgreSQL NULL requires visible SQL type context.
+101. Dynamic validation follows the exact target, driver, SQL, option, lease, parameter, native,
+     result order; SQL U+0000 and all package-detectable parameter failures precede send, and one
+     operation invokes at most one native statement. Every publication/reuse boundary also proves
+     that native transaction state still matches the explicit Conn/Tx target or poisons/closes.
+102. `dynamic_rows` publishes only the exact dependent 48-byte stream state. Each `dynamic_next`
+     copies one ordered `array<value>` into its explicit region, preserves empty-versus-NULL,
+     retains no input/native view, and performs no SQLite prefetch or all-rows allocation.
+103. A dynamic failure publishes no current row, preserves earlier rows and the first owned error,
+     performs exact native cleanup/synchronization or poison, releases the lease once, marks the
+     stream failed, and never rewinds the arena or issues hidden rollback SQL.
+104. Dynamic SQL creates no static Query descriptor/artifact/cache identity, compiler builtin,
+     runtime reflection table, or normal-build database/network work; whole-program and per-unit
+     package interfaces remain identical.
 
 ---
 
@@ -5544,11 +6012,13 @@ consumer-driven type/native-surface decisions are:
 
 1. Decimal precision/scale representation.
 2. UUID, temporal, JSON/JSONB, PostgreSQL array/range/domain, and SQLite custom-type mappings.
-3. The minimal safe dynamic `db.row`/`db.value` set.
-4. Native callback safety for SQLite functions/collations.
-5. Which COPY/pipeline/backup/blob operations have a measured consumer. No PostgreSQL COPY consumer
+3. Native callback safety for SQLite functions/collations.
+4. Which COPY/pipeline/backup/blob operations have a measured consumer. No PostgreSQL COPY consumer
    or workload measurement is currently recorded, so its public surface and implementation remain
    deferred.
+
+The minimal common dynamic `db.value`/`db.row` set is settled by §19 and the A2 ledger in §23. It
+does not settle the wider logical/native type mappings above or any callback surface.
 
 The engine/version nullability/origin support matrix is settled by §16.3.1 and owned by
 D0/D3/D5 rather than this list. The remaining items have roadmap homes in D12–D14. They do not
