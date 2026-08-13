@@ -274,6 +274,10 @@ User {
 
 There is no class / inheritance.
 
+One field type is rejected at the **declaration**, independently of JSON or any other use: a bare
+`array<string>` field ("an `array<string>` field is not supported yet — its per-element deep free is
+a later slice"). Use `array<str>` for borrowed strings, or `array<Struct>` with a `string` field.
+
 ### Sum Type
 
 A type whose body is **variants** (not `field: Type`) is a sum type — the keyword-less companion of
@@ -353,6 +357,9 @@ Rules:
 
 - `break` binds to the innermost enclosing `loop`, and must appear lexically inside one in the
   same function. A lambda body is its own function — `break` cannot cross it.
+- A `break` lexically inside an `arena {}` or `task_group {}` **nested in the loop** is rejected
+  today (unwinding the scoped region on the break edge is a separate slice). Restructure so the
+  region ends before the `break`.
 - There is no `continue` and no labeled break. Skip-to-next-iteration is an `if` around the rest
   of the body; a nested loop needing a two-level exit is a function waiting to be extracted.
 - `?` and `return` inside a loop behave as everywhere else: they exit the **function**, not the
@@ -523,8 +530,12 @@ exactly the scalar hierarchy it declares.
 Ordering (`<` `<=` `>` `>=`) follows the same shape: defined for numbers, `char`, and — the same
 one visible-length case — `str`/`string`, whose order is **byte-lexicographic** (for valid UTF-8
 this equals Unicode scalar order). It is deterministic and locale-free; dictionary/locale
-collation is a library concern (`pkg`), never the operator. A `sort_by_key` key is anything
-`Ord`: a number, a `char`, or a string. Aggregates have no order, exactly as they have no `==`.
+collation is a library concern (`pkg`), never the operator. A `sort_by_key` key is a **Copy** `Ord`
+value: a number, a `char`, or a borrowed `str`. An owned `string` key is **not** supported today —
+it satisfies `Ord`, so the checker accepts it, but the program is then rejected at the MIR boundary
+as an internal error rather than with a user diagnostic (the fused sort path has no per-key Drop;
+the deferral is recorded in `docs/impl/19-hir-validation-ledger.md`). Project the key to a `str`.
+Aggregates have no order, exactly as they have no `==`.
 
 The operator and builtin-bound paths compare owned `string` values through a non-consuming,
 zero-cost `str` borrow. Mixed `string`/`str` operands use the same path; comparison neither moves
@@ -577,11 +588,10 @@ variable; needing the error *is* the signal to `match`. So each intent has exact
 Error { NotFound, Invalid, Denied, Timeout, Code(i32) }
 ```
 
-Construct it with `Error.NotFound` / `Error.Code(c)`. `error(c)` is syntax sugar for
-`core.Error.Code(c)` and therefore always constructs the builtin even in a module that declares a
-local `Error`.
-discriminate it with `match`, and at `main` it becomes the process exit code (`Code(c)` → `c`, a
-category → a small distinct code). `Timeout` is the category for a run/transport deadline (a
+Construct it with `Error.NotFound` / `Error.Code(c)`, discriminate it with `match`, and at `main` it
+becomes the process exit code (`Code(c)` → `c`, a category → a small distinct code). `error(c)` is
+syntax sugar for `core.Error.Code(c)` and therefore always constructs the builtin even in a module
+that declares a local `Error`. `Timeout` is the category for a run/transport deadline (a
 `std.process` `run` that overran its `timeout_ns`, or — once shipped — a `std.http`/`std.net` I/O
 timeout); it is produced only by an explicit timeout site, never inferred from an errno. The standard fallible operations (`fs.read_file`, `json.decode`,
 …) return `Result<T, Error>`.
@@ -797,9 +807,26 @@ it is not recomputed from the joined region.
 | `match x { ... }` | The shortest region among the continuing arm values. | A payload binding inherits `x`'s bit; each selected arm then forwards its result bit and clears any moved source. |
 | `opt else fallback` | The shorter of the `Some`/`Ok` payload and fallback regions. | `Some`/`Ok` moves the payload and clears the container; the fallback moves normally. Their bits join with the value. |
 | `result?` | The `Ok` payload's region. | `Ok` moves the payload and its bit, clearing the input; `Err` drops live individually owned locals, closes regions, and returns early. |
+| `loop { ... break v }` | `Static` — every accepted `break` value obeys the return-escape rule, so the loop value never borrows a per-iteration (or enclosing-arena) local. | Each `break` moves its value and forwards its cleanup bit; per-iteration owned locals are dropped at the back edge and at every `break`, with the moved-out break value nulled first. |
 
-The table is exhaustive for value-carrying control syntax. Adding another form requires choosing
-both columns and adding the corresponding regression cells.
+The table is exhaustive for value-carrying control syntax except `task_group`, whose trailing-value
+transfer is specified in the ownership-bit paragraph below and in §11. Adding another form requires
+choosing both columns and adding the corresponding regression cells.
+
+**One restriction applies to the `if` row today.** A value-carrying `if`/`else` **expression** cannot
+move an already-bound owned local out of an arm:
+
+```align
+a := "hello".clone()
+c := if n > 2 { a } else { "hi".clone() }   // compile error
+```
+
+The rejection belongs to the `if`-expression arm, not to the consumer: the binding above, an
+argument position (`f(if n > 2 { a } else { … })`), and `return if n > 2 { a } else { … }` are all
+rejected identically, with `cannot move owned value '<name>' out through a conditional expression
+yet`. Every sibling form moves a bound owned local normally — a `match` arm, an `else`-unwrap
+fallback, a block tail, and a statement-form `if` + `return` — and an `if` expression whose arms
+build fresh temporaries is fine. Use one of those, or bind the arms' shared value before the `if`.
 
 A by-value function argument is an ownership transfer for a Move type. Only a free-standing owned
 value may cross that boundary: the callee owns and drops it. An arena-owned value remains tied to
@@ -866,8 +893,12 @@ I/O, and database work remain Impure regardless of parameter mode.
 One aggregate value uses one path-local cleanup bit. Its owned members must therefore use one
 allocation mode: all free-standing or all arena-owned. Mixing the two in one tuple, struct, sum
 value, or owned array is a compile error; keep them separate or construct every owned member in the
-same mode. Replacing an owned field or element must preserve the aggregate's mode. Borrowed fields
-do not affect this rule. A one-owner aggregate may forward a heap/arena path-dependent runtime bit,
+same mode. Replacing an owned field or element must preserve the aggregate's mode. Field replacement
+is additionally limited today: the assigned leaf must be a `string` or an `Option<string>` (the two
+leaves with typed drop-old lowering). Replacing any other owned leaf — a nested Move struct, an
+owned array — is a compile error naming the unsupported type; replace the whole aggregate instead.
+Borrowed fields do not affect this rule.
+A one-owner aggregate may forward a heap/arena path-dependent runtime bit,
 but its owned fields or elements cannot be mutated until the mode is definite. Direct Move-struct
 and fixed-array bindings retain every completed field owner until initialization succeeds.
 
@@ -1211,6 +1242,40 @@ element-wise `a.min(b)` / `a.max(b)` of two vectors, and `abs`, also work on int
 with no argument is the reduction instead). Each maps to one SIMD instruction; `pow` (a libcall) stays
 scalar-only. `fma(a, b, c)` is the fused multiply-add `a*b + c` with a single rounding (a free builtin,
 float scalar or vector) — the kernel of dot products, FIR filters, and Horner-method polynomials.
+
+### Broadcast and lane access
+
+A scalar operand of a vector op **broadcasts** across the lanes, on either side (the operand order is
+preserved for the non-commutative ops, so `20 - a` is `[20 - a[0], …]`). Broadcast is implicit in the
+operand types — a lossless splat, not a hidden allocation. The scalar's type must unify with the
+element: `vec4<i32> + 2.0` is rejected.
+
+A `slice<T>` is the bridge between array memory and a vector register. `s.load(i) -> vecN<T>` reads
+`N` consecutive elements from runtime index `i` (the width and element come from the target
+annotation, exactly as for a vector literal); `s.store(i, v)` writes a vector's lanes into a
+**writable** (`mut` / `out`) slice at `i..i+N`. Both are bounds-checked (`0 <= i && i + N <= len`,
+the ordinary range-fail path), and a fixed array is loaded/stored by passing it where a slice is
+expected (the array→slice borrow — nothing hidden). Both emit the `<N x T>` access at the *element*
+alignment; the `align(N)` binding form below is what promotes a provably aligned offset to an
+aligned load.
+
+`v[i]` **reads** lane `i` and `v[i] = x` **writes** it, in both cases at a compile-time-constant
+index in `0..N` (a dynamic lane is rejected). The write requires a `mut` vector local; a vector is a
+register value, so it lowers to an `insertelement` that re-stores the whole vector.
+
+```align
+fn kernel(data: slice<i64>, out dst: slice<i64>) -> i64 {
+  v: vec4<i64> := data.load(0)   // slice → vector
+  w := v + 5                     // scalar broadcast on the right
+  u := 5 + v                     // ... and on the left
+  m: mask4<i64> := v > 2         // a written mask annotation
+  hi := select(m, w, u)
+  dst.store(0, hi)               // vector → writable slice
+  mut z: vec4<i64> := [1, 2, 3, 4]
+  z[0] = 9                       // lane assignment
+  return z[0] + hi[1]
+}
+```
 
 ### Array Expressions
 
@@ -1686,7 +1751,6 @@ scan once
 zero-copy
 arena
 typed decode
-field table
 builder encode
 ```
 
@@ -1732,22 +1796,12 @@ From a struct definition, the following can be generated.
 ```text
 decode
 encode
-validate
-field table
 ```
 
-### Field Table
-
-Field information is held at compile time.
-
-```text
-name
-len
-hash
-first byte
-offset
-escape info
-```
+That is the whole generated surface: there is no `validate<T>` (decoding and discarding *is*
+validation — one way) and no public `field_table<T>`. The compiler does hold per-field information
+(name, length, hash, first byte, offset, escape info) at compile time to drive the scanner, but it
+is an internal artifact with no source-level name. See §18.1 `core.json`.
 
 ### SIMD Scan
 
@@ -1810,15 +1864,24 @@ Dangerous operations are only in an `unsafe` block. The `raw.*` surface manages 
 ```align
 unsafe {
   none := raw.null()        // explicit null pointer for a native ABI argument or sentinel
+  empty := none.is_null()   // the only null test — `bool`, valid on any `raw`
   p := raw.alloc(16)        // 16 bytes → a `raw` pointer
   raw.store(p, 0, 42)       // write a flat value at a byte offset (type from the value)
   x: i64 := raw.load(p, 0)  // read it back (type from the annotation — no turbofish, like decode)
+  q := raw.offset(p, 8)     // advance by 8 bytes → a new `raw` pointer
   raw.free(p)               // manual free; a `raw` is Copy and never auto-dropped
 }
 ```
 
-`raw.null()` is the only null-pointer constructor and is explicit at the unsafe boundary; there is
-no general null value in ordinary Align types. The stored/loaded type is inferred (from the value
+`raw.offset(p, n)` is byte-granular pointer arithmetic: it returns `p` advanced by `n` bytes as a
+new `raw`, for stepping through a buffer or handing an interior pointer to C. It is distinct from
+the inline byte offset of `load`/`store` — that one addresses a value, this one produces the pointer
+itself. The result's validity is the enclosing `unsafe` block's obligation, exactly like the
+pointer it derives from.
+
+`raw.null()` is the only null-pointer constructor and is explicit at the unsafe boundary; a raw
+pointer is tested with `p.is_null()`. There is no general null value in ordinary Align types.
+The stored/loaded type is inferred (from the value
 for `store`, from the expected type for `load`) —
 Align has **no turbofish**, so an explicit `raw.op<T>(...)` is not the surface. (An unchecked pointer
 cast / reinterpret is a later `raw.*` op.) The admitted flat values are primitive scalars, `raw`
@@ -2187,6 +2250,10 @@ core.hash
 core.math
 ```
 
+Every name above is an importable module except `core.array_builder`: `array_builder<T>()` is a
+language-intrinsic global (like `builder()`), listed here as a core area rather than as an `import`
+target.
+
 ### core.array / core.slice
 
 ```text
@@ -2200,6 +2267,7 @@ scan
 partition
 sort
 group_by
+zip
 ```
 
 ### core.vec / core.mask
@@ -2226,6 +2294,8 @@ rfind
 find_any
 split
 trim
+trim_start
+trim_end
 contains
 starts_with
 ends_with
@@ -2499,7 +2569,7 @@ std.http
 ### Error mapping (all of std)
 
 Recoverably fallible `std` functions return `Result<T, Error>` (the builtin `Error` sum type,
-§5/`open-questions.md` "Error type design"). An absence-only query may return `Option<T>`, and an
+§4 "Result"/`open-questions.md` "Error type design"). An absence-only query may return `Option<T>`, and an
 operation specified as total returns its value directly. Programmer errors abort rather than
 returning `Error`. A failing syscall in a `Result`-returning operation maps its `errno` through
 **one fixed table**, the same everywhere — not a per-module ad hoc mapping ("one way"):
@@ -2646,15 +2716,53 @@ path.normalize(p: str) -> string
 ### std.process
 
 ```text
-spawn
-exec
-exit
-process.cpu_count() -> i64   // parallelism available to THIS process (affinity/quota aware, >= 1)
+process.spawn(cmd: str, args: array<str>) -> Result<child, Error>  // fork+exec; the child owns its pid
+ch.wait() -> Result<i64, Error>          // reap; returns the exit code
+ch.kill(sig: i64) -> Result<(), Error>
+process.exec(cmd: str, args: array<str>) -> Result<(), Error>      // replace this image (returns only on error)
+process.exit(code: i64)                  // run cleanup (flush buffered output), then exit
+process.abort()                          // immediate `_exit(1)`, NO cleanup
+process.cpu_count() -> i64               // parallelism available to THIS process (affinity/quota aware, >= 1)
 ```
+
+`child` is a **Move** handle owning a pid. Explicit `wait()` returns the exit code; Drop without a
+`wait()` still reaps the child with a blocking `waitpid` (discarding the code) so it can never become
+a zombie. `exit` and `abort` are the deliberate pair: `exit` runs ordinary cleanup so a buffered
+`print` is flushed, `abort` is the no-cleanup escape.
 
 `cpu_count` is the number a `task_group` worker count is sized against — the runtime schedules a
 group's tasks on a pool sized from exactly this source, so a set of never-returning tasks larger
 than it would leave the extra ones unstarted.
+
+**Captured output.** `spawn` inherits the terminal, so reading a child's output goes through the
+`command` builder instead:
+
+```text
+c := process.command(cmd: str, args: array<str>) -> command   // Move handle
+c.cwd(dir: str)                    // set the child's working directory  -> ()
+c.env(name: str, value: str)       // add/override one variable          -> ()
+c.env_clear()                      // start the child environment empty  -> ()
+c.timeout_ns(ns: i64)              // kill + Err(Timeout) past ns; 0 = no timeout  -> ()
+out := c.run() -> Result<run_output, Error>   // fork + capture; borrows c, so it is re-runnable
+
+out.code()   -> i64
+out.stdout() -> str    // captured stdout, a zero-copy view region-tied to `out`
+out.stderr() -> str    // ditto
+```
+
+The config methods are in-place setters on a bound local and yield `()`. A negative `timeout_ns`
+is a programmer error and aborts at the call. `run` is where `Error.Timeout` (§4 "Result") is
+produced: past the deadline the child is killed and the partial output discarded, so a timeout is
+never reported as a half-answer. `run_output` is a Move handle, not a by-value struct, because it
+owns both captured buffers; its `str` accessors validate UTF-8 and yield `Error.Invalid` on invalid
+bytes (a raw `bytes` tier is deferred).
+
+```align
+c := process.command("git", ["git", "status", "--porcelain"])
+c.cwd(repo_dir)
+c.timeout_ns(30_000_000_000)          // 30 s
+out := c.run()?
+```
 
 ### std.env
 
@@ -2890,17 +2998,22 @@ that are deliberately **not** in `core`/`std`. The building blocks that make the
 in core/std (`bytes`, `buffer`, `builder`, `arena`, `json`, `reader`/`writer`, the `http` primitive,
 `crypto`, `encoding`), so a `pkg` library is ordinary Align that needs no privileged surface.
 
+The first-party packages developed in this repository are exactly two subtrees:
+
 ```text
-pkg.web            // the zero-copy REST framework (first-party, shipped with the system)
-pkg.router
-pkg.db.postgres
-pkg.db.mysql
-pkg.db.sqlite
-pkg.orm
-pkg.rpc
-pkg.aws
-pkg.openai
+pkg.web            // the zero-copy REST framework (routing included; no separate pkg.router)
+pkg.db             // the common driver surface: db.value, db.row, db.Driver, db.Error
+pkg.db.sqlite      // driver submodule
+pkg.db.postgres    // driver submodule
+pkg.db.pool        // explicit fixed-capacity connection pool
 ```
+
+`pkg/db` is **one vendorable subtree with four public module boundaries**, not four independently
+versioned packages; the root owns the semantic contracts and the closed internal resource dispatch,
+and the driver submodules own connection construction and native options. Further drivers
+(`pkg.db.mysql`, `pkg.db.odbc`, `pkg.db.duckdb`) and any ecosystem package (an RPC layer, a cloud
+SDK, a model client) are ordinary third-party `pkg` subtrees on the same two path rules — the
+language reserves no names for them.
 
 A package is a **distribution-layer** concept, defined entirely by §17 "Packages": it is the module
 subtree under `pkg/<name>/` (root `pkg/<name>.align` + optional submodules), discovered from imports
@@ -2953,7 +3066,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
     io.stdout.write(out)?
   }
 
-  return ok
+  return Ok(())
 }
 ```
 
