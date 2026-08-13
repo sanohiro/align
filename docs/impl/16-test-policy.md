@@ -189,10 +189,13 @@ discovery loop: recent `pkg.db` waves paid repeated push→wait→read-log
 round-trips for failures that reproduce locally in seconds.
 
 `scripts/db-verify-local.sh` is the CI-parity local gate: it starts a
-disposable Docker `postgres:16.4` with CI's exact credentials and environment,
-runs the same inverted required-mode self-test and all thirteen `pkg.db` owner
+disposable Docker `postgres:16.4` with no optional extension and an isolated
+`pgvector/pgvector:0.8.6-pg16-bookworm` service with CI's exact credentials and environment,
+runs the same inverted required-mode self-tests and all fourteen `pkg.db` owner
 suites (`q1`, `q2`, `q3`, `q4a`, `q4b`, `q5a`, `q5b1`, `q5b2`, `q6`, `a1`,
-`pool`, `a2`, and `callbacks`), and tears the container down. A diff touching
+`pool`, `a2`, `callbacks`, and `vc1`), and tears both containers down. The VC1 setup explicitly
+creates `vector`, verifies extension version `0.8.6`, and retains the ordinary service as the
+no-extension control. A diff touching
 `apps/db` or a `pkg_db_*` test must pass it before push. The
 same rule generalizes: a new env-gated required CI suite ships with a matching
 local Docker script in the same PR.

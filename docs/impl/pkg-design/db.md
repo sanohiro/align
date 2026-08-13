@@ -6235,6 +6235,10 @@ failure/reentrancy behavior changes the public or safety strategy and requires a
 
 ### VC1 — vector-search compatibility checkpoint (no public API)
 
+**Status:** Complete. The required owner pins pgvector 0.8.6 beside the ordinary no-extension
+PostgreSQL 16.4 service; the English/Japanese guide records the verified vec1 0.7 probe and all
+listed vendor boundaries. The package/compiler/runtime surface remains unchanged.
+
 VC1 runs after D14 and changes no public package surface, compiler/runtime ABI, Query descriptor,
 checked-artifact format, or release gate. It adds no `db.vector`, `db.embedding`, `db.nearest`,
 common distance/index enum, SQL rewriter, embedding-generation call, extension loader, or

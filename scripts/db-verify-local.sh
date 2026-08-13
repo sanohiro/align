@@ -10,8 +10,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 port="${ALIGN_DB_LOCAL_PORT:-55432}"
+vector_port="${ALIGN_DB_PGVECTOR_LOCAL_PORT:-55433}"
 image="postgres:16.4"
+vector_image="pgvector/pgvector:0.8.6-pg16-bookworm"
 name="align-db-verify-$$"
+vector_name="align-db-vector-verify-$$"
 
 command -v docker >/dev/null 2>&1 || { echo "docker is required" >&2; exit 2; }
 docker info >/dev/null 2>&1 || {
@@ -45,6 +48,7 @@ fi
 
 cleanup() {
   docker rm -f "$name" >/dev/null 2>&1 || true
+  docker rm -f "$vector_name" >/dev/null 2>&1 || true
   if [ -n "$libpq_shim" ]; then
     [ ! -L "$libpq_shim/libpq.so" ] || unlink "$libpq_shim/libpq.so"
     rmdir "$libpq_shim"
@@ -55,31 +59,52 @@ trap cleanup EXIT
 docker run -d --name "$name" \
   -e POSTGRES_DB=align -e POSTGRES_USER=align -e POSTGRES_PASSWORD=align \
   -p "127.0.0.1:${port}:5432" "$image" >/dev/null
+docker run -d --name "$vector_name" \
+  -e POSTGRES_DB=align_vector -e POSTGRES_USER=align -e POSTGRES_PASSWORD=align \
+  -p "127.0.0.1:${vector_port}:5432" "$vector_image" >/dev/null
 
 # postgres's init entrypoint starts a temporary server (unix socket only,
 # listen_addresses='') and then restarts. Probe over TCP: the temp server has
 # no TCP listener, so three consecutive TCP successes prove the final server.
-ready=0
-attempt=0
-while [ "$attempt" -lt 90 ]; do
-  if docker exec "$name" pg_isready -h 127.0.0.1 -U align -d align >/dev/null 2>&1; then
-    ready=$((ready + 1))
-    [ "$ready" -ge 3 ] && break
-  else
-    ready=0
+wait_for_postgres() {
+  container="$1"
+  database="$2"
+  ready=0
+  attempt=0
+  while [ "$attempt" -lt 90 ]; do
+    if docker exec "$container" pg_isready -h 127.0.0.1 -U align -d "$database" >/dev/null 2>&1; then
+      ready=$((ready + 1))
+      [ "$ready" -ge 3 ] && break
+    else
+      ready=0
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+  done
+  if [ "$ready" -lt 3 ]; then
+    echo "$container did not become ready within 90s" >&2
+    exit 1
   fi
-  attempt=$((attempt + 1))
-  sleep 1
-done
-if [ "$ready" -lt 3 ]; then
-  echo "postgres did not become ready within 90s" >&2
-  exit 1
-fi
+}
+
+wait_for_postgres "$name" align
+wait_for_postgres "$vector_name" align_vector
 
 export ALIGN_DB_POSTGRES_REQUIRED=1
 export ALIGN_DB_POSTGRES_URL="postgresql://align:align@127.0.0.1:${port}/align"
+export ALIGN_DB_PGVECTOR_REQUIRED=1
+export ALIGN_DB_PGVECTOR_URL="postgresql://align:align@127.0.0.1:${vector_port}/align_vector"
 
 docker exec "$name" psql -h 127.0.0.1 -U align -d align -Atqc 'SHOW server_version'
+docker exec "$vector_name" psql -h 127.0.0.1 -U align -d align_vector \
+  -v ON_ERROR_STOP=1 -c 'CREATE EXTENSION vector'
+vector_version="$(docker exec "$vector_name" psql -h 127.0.0.1 -U align -d align_vector \
+  -Atqc "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'vector'")"
+if [ "$vector_version" != "0.8.6" ]; then
+  echo "expected pgvector 0.8.6, got $vector_version" >&2
+  exit 1
+fi
+echo "pgvector $vector_version"
 
 # Step 1 (inverted, as in CI): required mode with a missing URL must FAIL.
 set +e
@@ -92,7 +117,17 @@ if [ "$status" -eq 0 ]; then
   exit 1
 fi
 
-# Steps 2-14: the same thirteen required integration suites CI runs.
+set +e
+env -u ALIGN_DB_PGVECTOR_URL scripts/cargo.sh test --locked \
+  -p align_driver --test pkg_db_vc1 pgvector_required_mode_requires_configuration -- --exact
+status=$?
+set -e
+if [ "$status" -eq 0 ]; then
+  echo "required pgvector mode accepted a missing URL" >&2
+  exit 1
+fi
+
+# Steps 3-16: the same fourteen required integration suites CI runs.
 scripts/cargo.sh test --locked -p align_driver --test pkg_db_q1 -- --nocapture
 scripts/cargo.sh test --locked -p align_driver --test pkg_db_q2 -- --nocapture
 scripts/cargo.sh test --locked -p align_driver --test pkg_db_q3 -- --nocapture
@@ -106,5 +141,6 @@ scripts/cargo.sh test --locked -p align_driver --test pkg_db_a1 -- --nocapture
 scripts/cargo.sh test --locked -p align_driver --test pkg_db_pool -- --nocapture
 scripts/cargo.sh test --locked -p align_driver --test pkg_db_a2 -- --nocapture
 scripts/cargo.sh test --locked -p align_driver --test pkg_db_callbacks -- --nocapture
+scripts/cargo.sh test --locked -p align_driver --test pkg_db_vc1 -- --nocapture
 
-echo "local PostgreSQL verification passed (CI parity: all thirteen pkg.db owner suites)"
+echo "local PostgreSQL verification passed (CI parity: all fourteen pkg.db owner suites)"
