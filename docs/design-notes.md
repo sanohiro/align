@@ -793,6 +793,18 @@ An extern may therefore be called directly or used by an immediate non-escaping 
 inside `unsafe`, but it cannot become a first-class function value until the language has an
 explicit unsafe-callable type. This keeps foreign execution lexically visible.
 
+**Generated native callbacks are producer-selected, not a second FFI surface.** Some native
+libraries call application behavior synchronously, but exposing raw callback pointers or a general
+export annotation would let ABI, lifetime, effect, and unwind obligations drift into application
+convention. A trusted compile-time package producer may instead select one exact noncapturing
+target and cause the compiler to emit a nominal descriptor and package-specific C trampoline. The
+package contract owns the complete ABI and malformed-input policy; source can neither construct nor
+reinterpret the descriptor. This reuses ordinary effect/provenance/cleanup facts while keeping
+closure allocation, unsafe permission, native pointers, and callback-frame views out of the public
+language. Persisted native semantics remain a separate package concern: for example, SQLite
+collations still need versioned ordering identity and migration/`REINDEX`, even if their callback
+body is statically proved Pure.
+
 Raw memory stores flat values, including `raw` pointers themselves. This is the honest representation
 for a package-owned native handle slot: the address remains an address, its load/store stays visibly
 `unsafe`, and no database or other FFI wrapper needs an integer cast or a compiler/runtime-owned

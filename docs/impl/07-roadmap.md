@@ -3685,15 +3685,15 @@ D13 batch/SoA/high-value native paths
 D14 dynamic SQL + proved callback surfaces
 ```
 
-D14 is three independently useful rails with separate proof ownership: the shipped dual-driver
-dynamic value/row surface, SQLite static-target scalar-function/collation callbacks, and later
-PostgreSQL notice/COPY callbacks. The SQLite callback rail uses one compiler-produced nominal
-descriptor and generated C-ABI trampoline family for both consumers. Scalar functions are
-invocation-scoped and DIRECTONLY; collations use a proved-Pure key producer followed by
-package-owned byte comparison instead of publishing SQLite's unchecked comparator. The exact
-capture/effect/abort/reentrancy/thread/lifetime and cleanup contract is the A2 callback ledger in
-`pkg-design/db.md` §23. Its compiler producer and two native consumers land together because the
-producer alone is dormant and a split would duplicate one ABI/safety proof.
+D14 has independently useful rails with separate proof ownership: the shipped dual-driver dynamic
+value/row surface, SQLite static-target scalar functions, a deferred SQLite collation rail, and
+later PostgreSQL notice/COPY callbacks. The scalar-function rail uses one compiler-produced nominal
+descriptor and generated C-ABI trampoline. Functions are invocation-scoped and DIRECTONLY. The
+exact capture/effect/abort/reentrancy/thread/lifetime and cleanup contract is the A2 callback ledger
+in `pkg-design/db.md` §23. Its compiler producer and native consumer land together because the
+producer alone is dormant. SQLite collations require a separate versioned semantic-identity and
+persisted-index migration/`REINDEX` contract before implementation; key purity alone cannot make an
+existing on-disk index agree with a changed callback body.
 
 L1a establishes the canonical cycle-safe recursive `DropPlan` classifier and admits
 `Option<string>` as the first conditional owned struct-field leaf. Enclosing and nested structs are

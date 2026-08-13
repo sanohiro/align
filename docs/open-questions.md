@@ -13,7 +13,7 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
-### `pkg.db.sqlite` callbacks use static targets and key-based collations (SETTLED 2026-08-13)
+### `pkg.db.sqlite` scalar callbacks use static targets (SETTLED 2026-08-13)
 
 **Decision:** D14's first native-callback rail accepts one exact noncapturing named or lifted Align
 target and compiles it into a nominal static descriptor plus a generated C-ABI trampoline. It does
@@ -21,18 +21,16 @@ not retain a closure environment or expose a native pointer. Scalar functions re
 invocation-scoped `slice<db.value>` and return `Result<db.value, str>`; they are always SQLite
 DIRECTONLY, and the optional deterministic flag requires the complete inferred Pure fact.
 
-Collations do not expose SQLite's unchecked comparator contract. One proved-Pure callback maps each
-possibly non-UTF-8 byte input to an owned `array<u8>` key; the package invokes it left then right,
-compares the keys byte-lexicographically, and drops both. This makes the native ordering laws a
-package property. Registration is fixed-arity, connection-local, and restricted to an idle direct
-SQLite connection; it persists until replacement, explicit removal, or close. Program-lifetime
-trampolines require no application data/destructor, so SQLite's differing failed-registration
-destructor rules cannot create a cleanup fork. Callback views stay on the statement thread, safe
+Registration is fixed-arity, connection-local, and restricted to an idle direct SQLite connection;
+it persists until replacement, explicit removal, or close. Program-lifetime
+trampolines require no application data/destructor, so failed registration cannot create an
+application cleanup fork. Callback views stay on the statement thread, safe
 source has no route to the invoking connection, ordinary scalar `Err` becomes an SQLite function
 error, and a language hard error terminates the process without unwinding through C.
 
-This settles SQLite scalar-function/collation capture, effect, abort, reentrancy, thread, lifetime,
-and cleanup rules. PostgreSQL notice/COPY callbacks remain a separate D14 consumer decision.
+This settles SQLite scalar-function capture, effect, abort, reentrancy, thread, lifetime, and
+cleanup rules. SQLite collations and PostgreSQL notice/COPY callbacks remain separate D14 consumer
+decisions.
 
 Record: `docs/impl/pkg-design/db.md` §23 and synchronized
 `docs/impl/pkg-design/ja/db.md`
@@ -2884,6 +2882,16 @@ shipped behavior normative without fixing the internal sorting algorithm. Full c
 
 ## Open (to be decided)
 
+### SQLite collation identity and persisted-index migration — pending (D14)
+
+SQLite can persist comparator results in indexes and schema objects, but its collation registration
+API has no `DIRECTONLY` boundary. A connection-local callback whose body changes between program
+versions can therefore disagree with an existing on-disk index even when the callback is Pure and
+obeys ordering laws. Before `pkg.db.sqlite` exposes a collation callback, define a versioned
+semantic identity, affected-schema discovery, replacement and reopen behavior, failure atomicity,
+and an explicit migration/`REINDEX` policy that completes before application queries can use the
+old ordering. The scalar-function rail does not pre-commit that surface.
+
 Each item is tagged with a target milestone for resolution (`impl/07-roadmap.md`).
 
 ### Scalar-family `==` / `Ord` admission for 128-bit id types — pending (post-`pkg.db`, `std.id`)
@@ -3496,12 +3504,13 @@ fast; "spec-debt" = no decision needed, just transcribe implemented truth into `
 - **C→Align (reverse FFI)** — general embedding (a C program hosting Align as a library) remains a
   **non-goal** (owner decision 2026-07-09): Align is an application language; exporting a stable C
   surface drags in runtime-init questions for no aligned use case. **UPDATE 2026-08-13:** D14 SQLite
-  functions/collations triggered the callback case. The settled narrow mechanism is one exact
+  scalar functions triggered the callback case. The settled narrow mechanism is one exact
   noncapturing named/lifted target, a compiler-produced nominal descriptor, and a kind-specific
   generated C-ABI trampoline selected only by the trusted package producer. It is not a plain raw
   function-pointer conversion, exported-C source declaration, retained closure environment, or
   general reverse-FFI surface. The exact record is the Settled item above and the `pkg.db` A2
-  callback ledger.
+  callback ledger. SQLite collations remain open because their persisted semantic identity is a
+  separate database contract, not a property the trampoline alone can prove.
 - **No-shadowing vs. function names** — a local/parameter may currently share a name with a
   top-level function (functions and values are separate namespaces today; fn-values are not yet
   first-class), which the no-shadowing settlement's wording (Settled → "No shadowing") does not

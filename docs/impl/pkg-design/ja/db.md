@@ -833,7 +833,8 @@ v1で公開せずdisabledのまま。SQLite optionをPostgreSQLへ渡すこと�
 ### 11.3 native feature
 
 `RETURNING`、STRICT、WITHOUT ROWID、JSON1、FTS、attached database、backup、incremental
-blob、安全なcallback modelができた後のcustom function/collationを妨げない。初期release
+blob、proved callback rail後のcustom scalar function、persisted-order identity/migration model後の
+collationを妨げない。初期release
 はconnection、typed Query、transaction、migration、必要metadataに絞り、残りはD13/D14へ
 明示的に置く。
 
@@ -3765,8 +3766,9 @@ explicit poolは上記ledgerに従うfourth consumer-visible A1 railでshipped�
 
 minimal explicit `db.value`、indexed `db.row`、dependent dynamic row stream、visible dynamic SQL/value slice/exact
 `db.Driver` restriction/execute option、pre-send mismatch/U+0000 rejection、
-typed Queryと別artifact path、reflectionなし。SQLite function/collationやPostgreSQL
-notice/COPY callbackはcapture、abort、reentrancy、thread、lifetimeを証明してから追加する。
+typed Queryと別artifact path、reflectionなし。SQLite scalar functionはcapture/abort/reentrancy/thread/lifetime
+proof後に追加し、collationはさらにpersisted-order identity/migration proof後だけ追加する。PostgreSQL
+notice/COPY callbackは別rail。
 
 #### A2 dynamic SQL/value/row public-contract ledger
 
@@ -4148,15 +4150,14 @@ ledger-firstでcloseする。code review前にmatrix-to-diff passを行う。val
 order、native mapping、failure atomicityが変わるfindingはpublic/safety strategy変更なのでimplementationを
 止めてfresh design reviewを要求する。
 
-#### A2 SQLite proved-callback public-contract ledger
+#### A2 SQLite scalar-function callback public-contract ledger
 
 このledgerは最初のnative-callback railのsource of truthである。source closureのretain、native pointerの
-公開、owning connectionへのcallback reentry、unchecked C comparatorなしでconnection-local SQLite
-scalar function/collationを追加する。PostgreSQL notice/COPY callbackは別rail。public callback producer、
-generated C-ABI trampoline、registration/replacement/removal、両callback consumerは1 capabilityとする。
-compiler producerだけではdormantで、native consumerを別々にすると同じcapture/effect/ABI proofを重複
-するため、implementationは1,000 hand-written lineを超えてよい。このstrict producer-to-consumer chainを
-1 PRにする方がproof duplication/integration riskが小さい。
+公開、owning connectionへのcallback reentryなしでconnection-local SQLite scalar functionを追加する。
+SQLite collationとPostgreSQL notice/COPY callbackは別rail。compiler producerだけではdormantなので、public
+producer、generated C-ABI trampoline、registration/replacement/removal、scalar consumerを1 capabilityとする。
+implementationは1,000 hand-written lineを超えてよい。このstrict producer-to-consumer chainを1 PRにする方が
+proof duplication/integration riskが小さい。
 
 exact public inventoryは`pkg.db.sqlite`だけに置く:
 
@@ -4165,12 +4166,7 @@ pub function_args {
   values: slice<pkg.db.value>,
 }
 
-pub collation_input {
-  bytes: slice<u8>,
-}
-
 pub scalar_function {}
-pub collation {}
 
 pub FunctionOption {
   Deterministic
@@ -4179,10 +4175,6 @@ pub FunctionOption {
 pub fn function(
   callback: fn(function_args) -> Result<pkg.db.value, str>,
 ) -> scalar_function = process.abort()
-
-pub fn collation_key(
-  callback: fn(collation_input) -> array<u8>,
-) -> collation = process.abort()
 
 pub fn register_function(
   borrow mut connection: pkg.db.conn,
@@ -4198,16 +4190,6 @@ pub fn remove_function(
   arity: i32,
 ) -> Result<(), pkg.db.Error>
 
-pub fn register_collation(
-  borrow mut connection: pkg.db.conn,
-  name: str,
-  callback: collation,
-) -> Result<(), pkg.db.Error>
-
-pub fn remove_collation(
-  borrow mut connection: pkg.db.conn,
-  name: str,
-) -> Result<(), pkg.db.Error>
 ```
 
 alias、variadic function、aggregate/window function、arbitrary comparator、collation-needed/
@@ -4217,13 +4199,12 @@ callback constructor、manual callback pointer、captured callbackはない。�
 `SQLITE_DIRECTONLY`で登録し、view/trigger/CHECK/default/generated column/expression/partial index等の
 schema programからは実行不能。schema useは別のinnocuous/deterministic proof後だけ後続contractで追加できる。
 
-`scalar_function`/`collation`はcompiler-produced nominal Copy descriptorで、fieldless source declarationを
-ordinary valueとしてconstructできない。`function`/`collation_key`はsource spellingに関わらずcompile-time
-producerであり、sole argumentは1つのexact namedまたはnon-capturing lifted Align functionにresolveする。
+`scalar_function`はcompiler-produced nominal Copy descriptorで、fieldless source declarationをordinary
+valueとしてconstructできない。`function`はsource spellingに関わらずcompile-time producerであり、sole
+argumentは1つのexact namedまたはnon-capturing lifted Align functionにresolveする。
 capturing closure、dynamically selected function value、extern、unresolved/open callable set、wrong signature、
 unproved effectはHIR publication前にrejectする。scalar callbackはPure/Impureのどちらでもよいが、
-`Deterministic`はcomplete inferred `Pure` factをdescriptorが持つ場合だけ許可する。collation key callbackは
-formation時に`Pure`必須。Pureはtotalを意味しない。allocation/bounds/invalid division/explicit
+`Deterministic`はcomplete inferred `Pure` factをdescriptorが持つ場合だけ許可する。Pureはtotalを意味しない。allocation/bounds/invalid division/explicit
 `process.abort`等のlanguage hard errorはSQLite外と同様processをterminateし、panic/unwind/ordinary errorを
 C boundary越しに渡さない。
 
@@ -4232,7 +4213,7 @@ compilerはsemantic callbackごとにexact 32-byte, 8-aligned v1 static descript
 ```text
 offset  width  meaning
 0       u32    version = 1
-4       u8     kind: 0 = scalar function, 1 = collation key
+4       u8     kind = 0 (scalar function)
 5       u8     effect: 0 = Pure, 1 = Impure
 6       u16    zero
 8       raw    non-null generated C-ABI trampoline
@@ -4242,23 +4223,18 @@ offset  width  meaning
 
 他version/kind/effect/reserved、null pointer、nonpositive/unrepresentable identity length、embedded identity
 NUL、wrong signature/relocationはinvalid。kind 0のsource signatureはexact
-`fn(function_args) -> Result<pkg.db.value, str>`、kind 1はexact
-`fn(collation_input) -> array<u8>`かつPure。generated identityはcanonical module/declarationまたはlifted
+`fn(function_args) -> Result<pkg.db.value, str>`。generated identityはcanonical module/declarationまたはlifted
 identity、complete callback signature/mode、inferred effect、return provenance/cleanup ABI、descriptor
 version/kind、generated-family versionを含むnominal identity。complete descriptor validator/LLVM preflightが
 pointer load/register前にstored/imported targetとのcorrelationとexact trampoline bodyをinspectする。
 descriptor/trampoline/identity splice、application construction、wrong kind、malformed HIR/MIR、unguarded
 accessorはfail closed。
 
-`function_args`/`collation_input`はgenerated trampoline内だけで形成するCopy view。fieldはordinary read
-可能だがprovenanceはcallback invocationで、return、longer-lived aggregate、escaping fn capture、task移動、
-callback後useを拒否する。`function_args.values`はarityと同数のordered slice。
-`collation_input.bytes`はxCompareが渡したpossibly non-UTF-8 byte/lengthそのもので、`str`と推測しない。
+`function_args`はgenerated trampoline内だけで形成するCopy view。fieldはordinary read可能だがprovenanceは
+callback invocationで、return、longer-lived aggregate、escaping fn capture、task移動、callback後useを拒否する。
+`function_args.values`はarityと同数のordered slice。
 scalar callbackがargument/static storageをborrowするText/Bytesを返してもtrampolineがinvocation end前に
-transient-copyする。collation callbackはowned `array<u8>` keyを1つ返す。left key、right keyの順にproduceし、
-unsigned byte lexicographic、最後にlengthでcompareし、両方exactly once Dropする。equal keyはvalidな
-equivalence class。1つのproved-Pure functionがinputをkeyへ写しpackageだけがcompareするため、symmetry、
-equality transitivity、antisymmetry、order transitivityをunchecked application comparatorに依存しない。
+transient-copyする。
 
 scalar input/output mappingはexact:
 
@@ -4283,18 +4259,21 @@ SQLiteへvalueを見せる前にfixed callback error。Text/Bytesはexplicit non
 SQLite input storageからbool/narrow-integer tagは復元しない。
 
 generated scalar trampolineのexact C ABIは
-`fn(context: raw, argc: i32, argv: raw) -> ()`。non-null context、`0 <= argc <= 127`、registered
-arity、argv null/count product、全argumentをordinal順にcallback前validateする。fixed-capacity 127-value
-stack scratchと先頭`argc`のborrowed sliceを形成し、package heap allocationなし、callback at most once。
-`Ok`はresult call exactly one、`Err`/pre-callback failureはerror result exactly oneかつvalue result zero。
-connection取得、statement prepare/step/reset/finalize、registration、context/argv source公開はない。
+`fn(context: raw, argc: i32, argv: raw) -> ()`。`0 <= argc <= 127`、argv null/count product、全argumentを
+ordinal順にcallback前validateする。fixed-arityの`argc == arity` invariantはSQLite contractが所有し、descriptorに
+arityを重複しない。null contextはSQLite result routineを呼ばず`process.abort`する。non-nullならvalue extraction
+前に`sqlite3_context_db_handle(context)`をexactly once呼び、nullならhard abortする。
 
-generated collation trampolineのexact C ABIは
-`fn(application: raw, left_len: i32, left: raw, right_len: i32, right: raw) -> i32`。application dataは
-null、length nonnegative、nonempty input pointer non-null。UTF-8変換せず2 viewを形成し、same proved-Pure key
-callbackをleft-to-right exactly twice、owned key compare、両Drop後exactly -1/0/1。invalid native
-pointer/length productはcollation ABIでreport不能なnative-contract violationなのでsource callback前に
-`process.abort`し、Align unwindをCへ渡さない。
+ordinalごとに`sqlite3_value_type`を1回呼ぶ。Textは`sqlite3_value_text`をbytesより先に呼び、null pointerなら
+他SQLite APIより先にsaved database handleの`sqlite3_errcode`を直ちに読む。`SQLITE_NOMEM`は
+`sqlite3_result_error_nomem`、他はfixed malformed-input error。Bytesは`sqlite3_value_blob`を呼び、nullなら
+同様にerrcodeを直ちに読み、NOMEMをmapし、それ以外は後続byte countがzeroの場合だけvalid。全byte countは
+nonnegative、same `sqlite3_value`にはsource callback return前に別conversion accessorを呼ばない。
+
+fixed-capacity 127-value stack scratchと先頭`argc`のborrowed sliceを形成し、package heap allocationなし、callback
+at most once。non-null contextでは`Ok`にresult call exactly one、`Err`/recoverable pre-callback failureにerror
+result exactly one。source connection wrapper取得、statement prepare/step/reset/finalize、registration、context/argv
+source公開はない。
 
 registrationはconnection-global native stateなのでlive/idle/direct SQLite `conn`の`borrow mut`だけを受ける。
 PostgreSQL、pool-origin physical connection、detectably closed/malformed、active lease/transaction、live
@@ -4305,24 +4284,27 @@ rejectする。success後はreplacement/explicit removal/connection close
 までphysical connectionにattachし、later typed/dynamic statementからvisible。他connectionへcopyせず、
 pool-originを禁止するのでpool return後へsilent persistenceしない。
 
-nameはexplicit UTF-8 `str`でterminator除外1..=255 bytes、U+0000なし。function arityはfixed `0..=127`、
-`-1` variadicなし。function identityはSQLite case-insensitive name + exact arity + UTF-8 encoding、collation
-identityはcase-insensitive UTF-8 name。existing identity/builtin overrideはSQLite replacement semantics、removeは
+nameはexplicit UTF-8 `str`でterminator除外1..=255 bytes、U+0000なし。全package validation成功後だけone
+fixed-capacity 256-byte call-local stack scratchを形成し、possibly sliced/nonterminated input bytesを先頭へcopy、
+NULをappendしてsingle native callまでretainする。heap allocation/destructorはなく、SQLiteがretainするのは
+name valueでcaller bufferではない。function arityはfixed `0..=127`、`-1` variadicなし。function identityはSQLite
+case-insensitive name + exact arity + UTF-8 encoding。existing identity/builtin overrideはSQLite replacement semantics、removeは
 exact identityへnull callbacksを渡す。schema probe/SQL prepare/retry/別arity discoveryはない。全registrationで
-null `pApp`/`pArg`とnull `xDestroy`。descriptor/trampolineはimmutable program-lifetimeなのでfailure/replace/
-remove/closeにapplication allocation/destructor edgeなし。function/collationで異なるSQLite registration-failure
-destructor ruleに依存しない。
+null `pApp`とnull `xDestroy`。descriptor/trampolineはimmutable program-lifetimeなのでfailure/replace/remove/closeに
+application allocation/destructor edgeなし。
 
 validation orderはexactでfirst failure後停止:
 
 1. complete connection scalar/tag/reserved/pointer product authenticate;
 2. SQLite/direct origin/wrapper idle/native autocommit、次にlinked SQLite 3.30.0以上;
 3. name length、次にU+0000;
-4. functionだけarity、次にoption sliceをsource order;
-5. complete descriptor authenticateとoperation kind;
-6. `Deterministic`またはcollation keyのPure;
-7. guarded trampoline loadとexactly one native registration/removal call;
-8. success前native autocommit/wrapper idle再proof、contradictionはpoison/close。
+4. arity、次にoption sliceをsource order;
+5. complete descriptor authenticateとscalar-function kind;
+6. `Deterministic`のPure;
+7. call-local native-name stack scratchをform/terminateし、guarded trampoline loadとexactly one native call;
+8. name free前にnative errorをcopyし、native failureならambiguous previous stateをreuseせずphysical connectionを
+   poison/closeしてfirst `NativeError`をreturn;
+9. success前native autocommit/wrapper idle再proof、contradictionはpoison/close。
 
 duplicate `Deterministic`がfirst option error。removalにdescriptor/effect phaseなし。package-detectable errorは
 native mutation前。exact Query-less errors:
@@ -4339,7 +4321,7 @@ native mutation前。exact Query-less errors:
 | wrong/malformed descriptor | `Unsupported(ContractError { query_id: None, item: "sqlite.callback.descriptor", message: "SQLite callback descriptor is invalid" })` |
 | deterministic function is not Pure | `Unsupported(ContractError { query_id: None, item: "sqlite.function.deterministic", message: "SQLite deterministic functions require a Pure callback" })` |
 | native failure | current primary/extended code/copied messageのordinary SQLite `Connection(NativeError)` |
-| post-call idle proof failure | earlier native error、なければ`Connection(ContractError { query_id: None, item: "sqlite.callback.cleanup", message: "SQLite callback registration left the connection unusable" })` |
+| post-call idle proof failure | earlier native error、なければ`Unsupported(ContractError { query_id: None, item: "sqlite.callback.cleanup", message: "SQLite callback registration left the connection unusable" })` |
 
 SQLiteはstatement実行threadでcallbackをsynchronousにinvokeする。resource/resource_refはnon-Send、leaseはone
 statementだけ、descriptorにenvironmentなし。safe callback sourceはinvocation viewだけを受けcaptureせず、Alignに
@@ -4351,7 +4333,6 @@ implementation authorityはSQLite published contractの
 [`sqlite3_create_function_v2`](https://sqlite.org/c3ref/create_function.html)、
 [`sqlite3_value_*`](https://sqlite.org/c3ref/value_blob.html)、
 [`sqlite3_result_*`](https://sqlite.org/c3ref/result_blob.html)、
-[`sqlite3_create_collation_v2`](https://sqlite.org/c3ref/create_collation.html)、
 [threading modes](https://sqlite.org/threadsafe.html)。owner testはconfigured libraryを使い、これらがpublishする
 以上のpointer/destructor/callback-count/thread guaranteeを推測しない。
 
@@ -4368,12 +4349,25 @@ implementation closure matrix:
 |---|---|---|
 | public formation/inventory | exact inventory、one direct noncapturing exact-signature targetだけlower、complete effect/provenance/cleanup。capture/extern/dynamic/open/wrong signature/effect/fieldless construction/omitted surfaceをreject。 | source/interface inventory、direct/imported/lambda positive、全negative、whole/per-unit parity |
 | descriptor/generated identity | exact 32-byte v1、nominal identity、signature/effect/provenance/cleanup/relocation/C-ABI familyをpointer前validate。 | bidirectional golden、all field mutation、cross-kind/target/identity/trampoline splice、malformed HIR/MIR/LLVM、whole/per-unit/ThinLTO |
-| scalar trampoline | context/argc/argv/all valuesをone callback前validate、ordered view/return provenance、all value/result/error exactly once transient-copy、package heapなし。 | argc -1/0/127/128、argv product、all class/variant、pointer/length/UTF-8/NUL/NaN、Ok/Err/hard-error IR、call/result/allocation counter |
-| collation trampoline | null app/valid byte view、one Pure key target left→right、owned key byte compare、both Drop、-1/0/1。 | empty/NUL/non-UTF-8/high-byte/prefix/equal、allocation/Drop、antisymmetry/equality/transitivity、impure/capture reject、invalid native hard-error IR |
-| registration/removal | exact connection/version/name/arity/option/descriptor order、UTF-8/DIRECTONLY、deterministic proof、one native call、replacement/removal、post-idle proof。 | pairwise multi-invalid no-call、SQLite 3.29.99/3.30.0/newer、name 0/1/255/256/NUL、arity -1/0/127/128、option、builtin/user replace/remove、autocommit、fake call order |
-| lifetime/cleanup/reentrancy | program-lifetime dataだけretain、null app/destructor、connection-local replace/remove/close、pool-origin/owning-connection access禁止、first error/poison once。 | both API failure/replace/remove/close destructor-zero、direct/pool/tx/lease/dependent matrix、typed/dynamic invocation、distinct nested connection、no same-connection route、no-call-after-close |
+| scalar trampoline | null contextはhard abort、他はDB handleをsaveしてfixed accessor/OOM orderでargc/argv/all valuesをone callback前validate、ordered view/return provenance、all result/error exactly once transient-copy、package heapなし。 | null context/DB handle subprocess、argc -1/0/127/128、argv product、all class/variant、text/blob injected OOM/API trace、pointer/length/UTF-8/NUL/NaN、Ok/Err/hard-error IR、counter |
+| registration/removal | exact connection/version/name/arity/option/descriptor order、validation後だけterminated stack name形成、UTF-8/DIRECTONLY、deterministic proof、one native call、error copy。 | pairwise multi-invalid no-call、SQLite 3.29.99/3.30.0/newer、name 0/1/255/256/NUL/sliced/nonterminated、exact stack bytes/fake call order、arity -1/0/127/128、option、builtin/user replace/remove、autocommit |
+| lifetime/cleanup/reentrancy | program-lifetime dataだけretain、null app/destructor、connection-local replace/remove/close、pool-origin/owning-connection access禁止、native mutation failure/reuse-proof failureはcopied first errorを保ちpoison/close。 | registration/replace/remove failure/close destructor-zero、direct/pool/tx/lease/dependent matrix、typed/dynamic invocation、distinct nested connection、no same-connection route、no-call-after-close |
 | thread/effect | statement threadでview consume、frame data retainなし、non-Send、C entry nounwind、ordinary scalar Errとhard abortを区別。 | thread id、escape/capture/task negatives、Pure/Impure x option、LLVM ABI/nounwind、error continuation/hard-abort subprocess |
-| build/cache/measurement | callbackなし既存behavior、stable whole/per-unit identity、reachable時だけSQLite link、local DB gate。registration、scalar arity 0/1/127、collation empty/small/large key call/Drop/timeをthresholdなしでmeasure。 | cumulative owners、interface/object/cache twins、`scripts/db-verify-local.sh`、required CI、non-gating `bench/pkg_db_sqlite_callbacks` |
+| build/cache/measurement | callbackなし既存behavior、stable whole/per-unit identity、reachable時だけSQLite link、local DB gate。registration/scalar arity 0/1/127をthresholdなしでmeasure。 | cumulative owners、interface/object/cache twins、`scripts/db-verify-local.sh`、required CI、non-gating `bench/pkg_db_sqlite_callbacks` |
+
+`7eb445b`のindependent adversarial reviewはpersisted-collation-identity axisをreopenした。このrevisionはfresh
+review前にcomplete finding setをcloseする:
+
+| Finding | Ledger-first closure | Required owner |
+|---|---|---|
+| connection-local comparatorの意味がpersisted indexを通じprocessより長生きし、SQLite collationには`DIRECTONLY` analogueがない | collationをこのrailから除外。後続contractはAPI前にversioned semantic identity、schema discovery、migration/`REINDEX`、replacement/failure/reopen behaviorを定義する。 | future persisted-index/reopen/version-change matrix、このrail interfaceにcollation symbol zero |
+| cleanupが`Connection(ContractError)`という非inhabitantを使った | package-detected contradictionは`Unsupported(ContractError)`、copied SQLite failureだけ`Connection(NativeError)`。 | error constructor type check/post-call contradiction |
+| `str`はNUL-terminated native nameを保証しない | validated fixed 256-byte stack scratchを形成し、copied bytes後にNUL append、callまでretain。 | sliced/nonterminated name、exact stack bytes/call order |
+| SQLite conversion OOM/accessor invalidation orderが曖昧 | context DB handleをsave、type/text-or-blob/bytes orderを固定し、suspicious null直後にerrcode、same valueのlater conversionを禁止。 | all conversion injected OOM、API trace/no-read-after-null |
+| descriptorにregistered arityがなくtrampoline check不能 | SQLite fixed-arity contractに依存し、trampolineはargc range/argv productだけvalidate。 | 0/127 valid、out-of-range/native-product mutation |
+| null contextへSQLite error resultを安全に書けない | common result/error path前のnative-contract hard abort。 | null-context subprocess、SQLite result call zero |
+| failed replace/remove後のregistration stateが未規定 | native error copy後にpoison/closeしambiguous stateをreuseしない。 | failure x absent/user/builtin prior state、copied error/no-call-after-close |
+| trusted generated reverse-callback mechanismがpackage docsだけ | `draft.md`/`language-spec.md`/`design-notes.md`にnarrow producer-selected mechanism/non-goalを追加。 | cross-document contract、producer/interface inventory |
 
 implementation前にこのledger/shared producer-consumer boundaryのfresh independent adversarial reviewを1回行い、
 valid findingをledger-firstでcloseする。code review前にmatrix-to-diff passを行う。capture/effect eligibility、
@@ -4586,14 +4580,12 @@ execution-count付きで実証する。
      poison、lease release、failed transitionをonce行い、arena rewind/hidden rollback SQLはない。
 104. dynamic SQLはstatic Query descriptor/artifact/cache identity、compiler builtin、runtime
      reflection table、normal-build DB/network workを作らず、whole/per-unit interfaceは同一。
-105. SQLite callbackはone exact noncapturing targetからnominal static descriptor/generated C-ABI
+105. SQLite scalar callbackはone exact noncapturing targetからnominal static descriptor/generated C-ABI
      trampolineだけで形成する。source closure env/native pointer/connection handle/callback-frame viewを
      registration/invocation後に残さない。
 106. scalar functionはone ordered `slice<db.value>`を受け`Result<db.value,str>`を返し、常に
      DIRECTONLY。proved-Pure targetだけdeterministicをclaimできる。
-107. collationはproved-Pure `collation_input -> array<u8>` key callbackを使い、packageだけがkeyを
-     compare/Dropするためsafe sourceはorder-law-violating C comparatorをpublishできない。
-108. callback registrationはfixed-arity/UTF-8/connection-local/direct-SQLite-only。replace/remove/close
+107. scalar callback registrationはfixed-arity/UTF-8/connection-local/direct-SQLite-only。replace/remove/close
      までvisibleにpersistし、pool slotをfollowせず、application destructor/registration heap envなし。
 
 ## 25. 実装前にconsumerで確定するtype/native detail
@@ -4604,9 +4596,12 @@ load-bearing shapeは確定済み。残るもの:
 2. UUID、temporal、JSON/JSONB、PostgreSQL array/range/domain、SQLite custom type mapping。
 3. measured consumerを持つCOPY/pipeline/backup/blob operation。PostgreSQL COPY consumer/workload
    measurementはcurrent recordに存在しないため、そのpublic surface/implementationはdeferredである。
+4. SQLite collation semantic identity/persisted-index migration。future surfaceはcomparator-version changeを
+   explicitにし、affected schema objectをdiscoverし、replacement/reopen behaviorとatomic migration/`REINDEX`
+   policyを定義してからapplication queryにold orderingを使わせる。
 
-minimal common dynamic `db.value`/`db.row` setとSQLite scalar-function/collation callback surfaceは
-§19と§23 A2 ledgerでsettledした。上記wider logical/native type mappingとseparate PostgreSQL callback
+minimal common dynamic `db.value`/`db.row` setとSQLite scalar-function callback surfaceは§19と§23 A2
+ledgerでsettledした。上記wider logical/native type mapping、SQLite collation、separate PostgreSQL callback
 surfaceはsettleしない。
 
 engine/versionごとのnullability/origin support matrixは§16.3.1で確定しD0/D3/D5が所有する。

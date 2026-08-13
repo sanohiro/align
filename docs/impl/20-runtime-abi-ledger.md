@@ -295,7 +295,7 @@ definition with a body before attributes are removed and linkage becomes
 internal; a missing body or changed linkage/convention is a compiler error,
 never a silent static-runtime fallback after partial mutation.
 
-## D14 generated SQLite callback ABI
+## D14 generated SQLite scalar-callback ABI
 
 D14's callback entrypoints are program-generated helpers, not runtime-native declarations. They do
 not add a `RuntimeKey`, `UnkeyedRuntimeKey`, runtime export, compatible-extern reuse row, or registry
@@ -309,14 +309,12 @@ The exact external callback ABIs are:
 
 | Kind | Exact LLVM function type | Required attributes and body boundary |
 |---|---|---|
-| ScalarFunction v1 | `void @GEN(ptr, i32, ptr)` | C calling convention, `nounwind`; validate context/argc/argv and all 0..127 SQLite values, build fixed stack scratch, call the exact Align target once, consume its dynamic cleanup result, call one result/error family, return void |
-| CollationKey v1 | `i32 @GEN(ptr, i32, ptr, i32, ptr)` | C calling convention, `nounwind`; require null application data and valid input products, call the exact Pure Align target left then right, unsigned-byte compare and Drop both owned keys, return only -1/0/1 |
+| ScalarFunction v1 | `void @GEN(ptr, i32, ptr)` | C calling convention, `nounwind`; hard-abort null context/database handle, validate argc/argv and all 0..127 SQLite values in the fixed type/accessor/errcode order, build fixed stack scratch, call the exact Align target once, consume its dynamic cleanup result, call one result/error family, return void |
 
-Neither function is `readnone`, `readonly`, `willreturn`, or `nofree`: SQLite value/result routines
-may allocate or mutate native state, scalar application code may be Impure, collation key formation
-may allocate, and either Align target may hard-terminate. `nounwind` states only that no language or
-Rust unwind crosses C. Invalid collation pointer/length products call the existing process-abort
-path. Descriptor validation and generated-body preflight occur before either address is installed in
+The function is not `readnone`, `readonly`, `willreturn`, or `nofree`: SQLite value/result routines
+may allocate or mutate native state, scalar application code may be Impure, and the Align target
+may hard-terminate. `nounwind` states only that no language or Rust unwind crosses C. Descriptor
+validation and generated-body preflight occur before its address is installed in
 SQLite. Whole-program, per-unit, and ThinLTO emission must agree on the descriptor bytes, target
 symbol, physical generated name, C type, and attributes; a malformed checked program emits neither
 descriptor nor callback definition.

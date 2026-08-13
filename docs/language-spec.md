@@ -601,6 +601,14 @@ struct. Returns admit `()`, integer and float scalars, `raw`, and an eligible no
 AOT-via-LLVM with no GC), which is the keystone of the library strategy: `std`/`pkg` own the memory
 wrappers and borrow C engines via FFI.
 
+A trusted compile-time library producer may accept one exact named or non-capturing lifted Align
+function and form a nominal static descriptor plus a producer-owned C-ABI trampoline. The producer
+contract fixes the source signature, effects/provenance, native ABI, lifetime, cleanup, validation,
+and malformed-input behavior. This forms neither a closure environment nor an ordinary function
+value. Application source cannot construct the descriptor, obtain a callback pointer, choose an
+arbitrary native signature, or use this narrow mechanism as general reverse FFI; callback views are
+invocation-scoped and cannot escape the trampoline. (`draft.md` §8.)
+
 `raw.store(p, offset, value)` and `raw.load(p, offset)` move one inferred flat value at a byte
 offset. Store takes its type from `value`; load takes it from the expected result type. Admitted
 values are primitive scalars, `raw` pointers, and eligible non-empty `layout(C)` structs. Pointer
