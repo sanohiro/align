@@ -854,7 +854,7 @@ fn a_synthetic_key_round_trips_through_the_store() {
 
 // ---- P13: the static-descriptor exclusion (the db-session firewall) ----------------------------
 
-/// The eight shipped `pkg.db` modules, read from the repository at RUN time.
+/// The shipped `pkg.db` modules, read from the repository at RUN time.
 ///
 /// Read-only, and by path rather than `include_str!`, so this test never becomes a compile-time
 /// dependency of `apps/db`. It needs a REAL descriptor because a static descriptor can only be
@@ -866,6 +866,7 @@ fn pkg_db_modules() -> Vec<(String, String)> {
         "db/sqlite.align",
         "db/postgres.align",
         "db/internal.align",
+        "db/internal/postgres_status.align",
         "db/internal/resource.align",
         "db/internal/descriptor.align",
         "db/internal/sqlite.align",

@@ -1144,7 +1144,9 @@ effect and provenance facts, native ABI, lifetime, cleanup, validation order, an
 behavior. It forms no closure environment or ordinary function value, and application source cannot
 construct the descriptor, obtain its pointer, select a native signature, or use the mechanism as
 general reverse FFI. A callback invocation may expose only the package's declared invocation-scoped
-views; those views cannot escape the generated trampoline.
+views; those views cannot escape the generated trampoline or cross a `spawn`/`par_map` worker
+boundary. The compiler carries this non-Send provenance through direct and indirect helpers and
+fails closed when an imported or indirect transfer fact is unavailable.
 
 ### Sequential Effects and Evaluation Order
 

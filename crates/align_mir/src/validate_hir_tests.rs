@@ -111,6 +111,7 @@ fn declaration_header_program() -> hir::Program {
         },
         return_cleanup: hir::ReturnCleanupAbi::None,
         effect: FnEffect::Pure,
+        parallel_transfer_params: Vec::new(),
     });
     let span = align_span::Span::new(0, 0, 0);
     program.fns.push(hir::Fn {
@@ -131,6 +132,7 @@ fn declaration_header_program() -> hir::Program {
             captures: Vec::new(),
         },
         return_cleanup: hir::ReturnCleanupAbi::None,
+        parallel_transfer: hir::ReturnBorrowSummary::None,
         locals: vec![
             hir::Local {
                 id: 0,
@@ -773,7 +775,12 @@ fn checked_interface_program(
     if let Some(provenance) = provenance {
         external_provenance.insert(
             "dep$identity".to_string(),
-            (provenance.0, provenance.1, hir::ReturnCleanupAbi::None),
+            (
+                provenance.0,
+                provenance.1,
+                hir::ReturnCleanupAbi::None,
+                Vec::new(),
+            ),
         );
     }
     let program = if external_provenance.is_empty() {
@@ -893,6 +900,7 @@ fn main_header_program(params: Vec<Ty>, param_modes: Vec<align_ast::ParamMode>, 
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        parallel_transfer: hir::ReturnBorrowSummary::None,
         locals: local_params,
         body: hir::Block {
             stmts: Vec::new(),
@@ -1002,6 +1010,12 @@ fn malformed_hir_declaration_header_metadata_fails_closed() {
             params: vec![0],
             captures: Vec::new(),
         };
+    });
+    assert_one_header_mutation("import-transfer-order", &base, |program| {
+        program.imported_fns[0].parallel_transfer_params = vec![0, 0];
+    });
+    assert_one_header_mutation("import-transfer-range", &base, |program| {
+        program.imported_fns[0].parallel_transfer_params = vec![1];
     });
     assert_one_header_mutation("import-duplicate-name", &base, |program| {
         program.imported_fns.push(program.imported_fns[0].clone());
@@ -2382,7 +2396,19 @@ fn body_contract_function_root_completion() {
 
 #[test]
 fn checked_hir_body_fact_replay_rejects_stale_producer_facts() {
-    let base = declaration_header_program();
+    let mut base = declaration_header_program();
+    let callback_fact = hir::Expr {
+        kind: hir::ExprKind::SqliteCallbackDescriptor {
+            target: "worker".to_string(),
+            effect: Cell::new(FnEffect::Pure),
+        },
+        ty: Ty::Unit,
+        span: align_span::Span::new(0, 0, 0),
+    };
+    base.fns[0]
+        .body
+        .stmts
+        .push(hir::Stmt::Expr(callback_fact));
     // The baseline function-type entry is annotation-only in this fixture; its producer value is
     // the conservative Unknown state, not a synthesized Pure result.
     base.fn_types[0].effect.set(FnEffect::Unknown);
@@ -2444,6 +2470,37 @@ fn checked_hir_body_fact_replay_rejects_stale_producer_facts() {
     assert_replay_rejects_without_mutating(
         bad_effect,
         "stale annotation-only effect must fail closed",
+    );
+
+    let stale_callback_effect = base.clone();
+    let callback_effect = stale_callback_effect.fns[0]
+        .body
+        .stmts
+        .iter()
+        .find_map(|statement| match statement {
+            hir::Stmt::Expr(hir::Expr {
+                kind: hir::ExprKind::SqliteCallbackDescriptor { effect, .. },
+                ..
+            }) => Some(effect),
+            _ => None,
+        });
+    let Some(callback_effect) = callback_effect else {
+        panic!("fixture contains a SQLite callback descriptor effect")
+    };
+    callback_effect.set(FnEffect::Impure);
+    assert_replay_rejects_without_mutating(
+        stale_callback_effect,
+        "a stale SQLite callback descriptor effect must fail closed",
+    );
+
+    let mut transferring_callback = base;
+    transferring_callback.fns[0].parallel_transfer = ReturnBorrowSummary::Roots {
+        params: vec![0],
+        captures: Vec::new(),
+    };
+    assert_body_entrypoints_empty(
+        "a SQLite callback target that transfers its invocation view",
+        &transferring_callback,
     );
 }
 
@@ -2650,6 +2707,7 @@ fn deep_hir_header_type_dag_is_stack_bounded() {
         },
         return_cleanup: hir::ReturnCleanupAbi::None,
         effect: FnEffect::Unknown,
+        parallel_transfer_params: Vec::new(),
     });
     assert!(validate_hir::declaration_header_metadata_is_valid(&program));
     assert!(!is_empty(&lower_program_per_unit(&program)));
@@ -2665,6 +2723,7 @@ fn deep_hir_header_type_dag_is_stack_bounded() {
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
         effect: FnEffect::Impure,
+        parallel_transfer_params: Vec::new(),
     });
     assert_header_rejected("deep-header-later-sibling", &malformed);
 }
@@ -2883,6 +2942,7 @@ fn imported_fn(name: &str, params: Vec<Ty>, ret: Ty) -> ImportedFn {
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
         effect: FnEffect::Pure,
+        parallel_transfer_params: Vec::new(),
     }
 }
 
@@ -2950,6 +3010,7 @@ fn with_return(ty: Ty) -> hir::Program {
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
         effect: FnEffect::Pure,
+        parallel_transfer_params: Vec::new(),
     });
     program
 }
@@ -3554,6 +3615,7 @@ fn with_unary_body_depth(depth: usize) -> hir::Program {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        parallel_transfer: hir::ReturnBorrowSummary::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -3639,6 +3701,7 @@ fn with_mixed_eager_body_depth(depth: usize) -> hir::Program {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        parallel_transfer: hir::ReturnBorrowSummary::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -3666,6 +3729,7 @@ fn with_str_trim_body_depth(depth: usize) -> hir::Program {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        parallel_transfer: hir::ReturnBorrowSummary::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -3766,6 +3830,7 @@ fn with_path_string_body_depth(depth: usize) -> hir::Program {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        parallel_transfer: hir::ReturnBorrowSummary::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -3808,6 +3873,7 @@ fn with_reader_buffered_body_depth(depth: usize) -> hir::Program {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        parallel_transfer: hir::ReturnBorrowSummary::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -3888,6 +3954,7 @@ fn with_bytes_str_cycle_body_depth(depth: usize) -> hir::Program {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        parallel_transfer: hir::ReturnBorrowSummary::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -3983,6 +4050,7 @@ fn with_regex_string_body_depth(depth: usize) -> hir::Program {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        parallel_transfer: hir::ReturnBorrowSummary::None,
         locals: vec![hir::Local {
             id: 0,
             name: "regex".to_string(),
@@ -4053,6 +4121,7 @@ fn with_template_body_depth(depth: usize) -> hir::Program {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        parallel_transfer: hir::ReturnBorrowSummary::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -4093,6 +4162,7 @@ fn with_file_body_depth(depth: usize) -> hir::Program {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        parallel_transfer: hir::ReturnBorrowSummary::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -4139,6 +4209,7 @@ fn with_array_builder_body_depth(depth: usize) -> hir::Program {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        parallel_transfer: hir::ReturnBorrowSummary::None,
         locals: vec![hir::Local {
             id: 0,
             name: "builder".to_string(),
@@ -4193,6 +4264,7 @@ fn with_process_command_body_depth(depth: usize) -> hir::Program {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        parallel_transfer: hir::ReturnBorrowSummary::None,
         locals: vec![hir::Local {
             id: 0,
             name: "argv".to_string(),
@@ -4246,6 +4318,7 @@ fn with_http_body_depth(depth: usize) -> hir::Program {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        parallel_transfer: hir::ReturnBorrowSummary::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: vec![hir::Stmt::Expr(expr)],
@@ -4312,6 +4385,7 @@ fn with_block_stmt_body_depth(depth: usize) -> hir::Program {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        parallel_transfer: hir::ReturnBorrowSummary::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -4383,6 +4457,7 @@ fn with_match_arm_body_depth(depth: usize) -> hir::Program {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        parallel_transfer: hir::ReturnBorrowSummary::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -4469,6 +4544,7 @@ fn with_if_branch_body_depth(depth: usize) -> hir::Program {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        parallel_transfer: hir::ReturnBorrowSummary::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -4561,6 +4637,7 @@ fn with_binary_match_body_depth(depth: usize) -> hir::Program {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        parallel_transfer: hir::ReturnBorrowSummary::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -4627,6 +4704,7 @@ fn with_conditional_operand_body_depth(depth: usize) -> hir::Program {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        parallel_transfer: hir::ReturnBorrowSummary::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -4695,6 +4773,7 @@ fn with_scoped_control_body_depth(depth: usize) -> hir::Program {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        parallel_transfer: hir::ReturnBorrowSummary::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -4757,6 +4836,7 @@ fn with_loop_body_depth(depth: usize) -> hir::Program {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        parallel_transfer: hir::ReturnBorrowSummary::None,
         locals: Vec::new(),
         body: hir::Block {
             stmts: Vec::new(),
@@ -4828,6 +4908,7 @@ fn with_stage_body_depth(depth: usize) -> hir::Program {
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
+        parallel_transfer: hir::ReturnBorrowSummary::None,
         locals: vec![hir::Local {
             id: 0,
             name: "xs".to_string(),
@@ -5388,6 +5469,7 @@ fn region_only_array_builder_headers_are_placement_valid() {
             return_region: ReturnRegionSummary::None,
             return_cleanup: hir::ReturnCleanupAbi::None,
             effect: FnEffect::Pure,
+            parallel_transfer_params: Vec::new(),
         });
         assert!(
             validate_hir::type_placement_metadata_is_valid(&program),
@@ -5424,6 +5506,7 @@ fn region_only_array_builder_headers_are_placement_valid() {
             return_region: ReturnRegionSummary::None,
             return_cleanup: hir::ReturnCleanupAbi::None,
             effect: FnEffect::Pure,
+            parallel_transfer_params: Vec::new(),
         });
         assert_placement_rejected(label, &program);
     }
@@ -5441,6 +5524,7 @@ fn region_only_array_builder_headers_are_placement_valid() {
         return_region: ReturnRegionSummary::None,
         return_cleanup: hir::ReturnCleanupAbi::None,
         effect: FnEffect::Pure,
+        parallel_transfer_params: Vec::new(),
     });
     assert_rejected("unknown_fixed_struct_array", &unknown_struct);
 }
@@ -6002,6 +6086,7 @@ fn body_test_named_function(
         return_borrow: ReturnBorrowSummary::None,
         return_region: ReturnRegionSummary::None,
         return_cleanup: body_test_return_cleanup(ret),
+        parallel_transfer: hir::ReturnBorrowSummary::None,
         locals,
         body,
         span: align_span::Span::new(0, 0, 0),

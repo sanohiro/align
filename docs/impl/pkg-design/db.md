@@ -5921,6 +5921,58 @@ elements. A scalar callback
 may return Text/Bytes borrowed from its arguments or static storage because the trampoline consumes
 and transient-copies that result before the invocation ends.
 
+Invocation provenance is also compiler-known non-Send provenance, independently of its ordinary
+borrow lifetime. The checked-HIR producer computes one least-fixed-point parallel-transfer summary
+for every direct or imported function: the exact parameter roots whose contained views can reach a
+`spawn` capture, a `par_map` source, or a `par_map` stage/terminal capture. The exhaustive borrow
+provenance classifier carries roots through locals, projections, aggregates, control-flow joins,
+direct calls, concrete function-value calls, and returned helper views. Direct-call and known
+function-value summaries translate selected callee roots back to caller arguments. An unresolved,
+open, absent, or incompatible indirect target conservatively selects every borrow-capable call
+argument and capture; the surrounding helper therefore publishes those caller parameter roots
+rather than erasing them.
+
+Interface format v6 appends one `parallel_transfer_params` field to each public function record,
+immediately after its one-byte effect and before `resource_hook_body`: one little-endian `u32`
+count followed by that many little-endian `u32` zero-based parameter indices. The indices are
+strictly increasing, unique, less than the preceding function parameter count, and each selected
+parameter is borrow-capable. Decode validates the format version first, then the containing record
+and preceding fields, then count/truncation, and each index in encoded order for range and strict
+ordering. After the complete dependent type-definition graph is decoded, it validates borrow
+capability for every selected root before stored-hash acceptance or publication; an unauthenticable
+type graph fails closed at that same gate. Old/unknown versions, a missing field, malformed roots,
+and an imported declaration whose source signature disagrees all fail closed. The format version and complete function record
+already enter canonical `encode_interface_surface`, so any root change changes `interface_hash`,
+invalidates dependent object/cache keys, and is checked against the stored hash on decode. Byte and
+hash goldens cover zero roots, `[0]`, `[0, 2]`, every malformed index/order product, and the
+sequential-to-parallel body change with an otherwise identical public signature. Function-value
+types acquire no source-visible or ABI field; their checked concrete target sets supply internal
+summaries, with the unresolved fallback above.
+
+Per-unit HIR carries the decoded fact as
+`ImportedFn.parallel_transfer_params: Vec<u32>` beside its normalized effect. Import construction
+copies only the already-decoded canonical set. Header validation rechecks strict ordering, range,
+borrow capability, and exact equality with the matching imported signature record before any body
+fact replay. Replay clears every stored source-function parallel-transfer set, seeds imported sets
+only from those validated declarations, recomputes direct/concrete-function-value propagation and
+the unresolved fallback to a least fixed point, and compares every stored descriptor fact with the
+recomputed target set. The validation-only imported field is stripped after that gate; MIR's
+existing six-field imported ABI record and runtime calling convention do not change. Whole-program
+HIR has no imported declarations and computes the same stored-function fact from bodies.
+
+A scalar callback descriptor is rejected before HIR publication when invocation root 0 reaches any
+parallel-transfer sink, whether directly, through a same-unit/imported helper, through a returned
+helper view, or through a concrete/unresolved function value. The callback may still use sequential
+pipelines and may return an argument-backed Text/Bytes result for the trampoline's synchronous
+transient copy. Descriptor semantic identity includes the target's parallel-transfer fact alongside
+its other provenance facts. The compiler emits exactly one diagnostic at the descriptor expression,
+`SQLite callback invocation views cannot be transferred to parallel workers`, regardless of how
+many transfer sinks selected root 0. Descriptor finalization checks this transfer fact before the
+target effect, so when the same descriptor also has an unknown target effect this diagnostic is
+emitted first, followed by the existing
+`SQLite callback effect could not be proved Pure or Impure`; descriptor expressions retain source
+order.
+
 The scalar input/output mapping is exact:
 
 | SQLite storage/result class | callback `pkg.db.value` |
@@ -5928,7 +5980,7 @@ The scalar input/output mapping is exact:
 | `SQLITE_NULL` | `Null` |
 | `SQLITE_INTEGER` | `I64(sqlite3_value_int64(...))` |
 | `SQLITE_FLOAT` | finite, infinity, or signed-zero `F64`; a native NaN is invalid |
-| `SQLITE_TEXT` | `Text` view after exact nonnegative length, final-pointer, UTF-8, and no-U+0000 validation; zero length uses the stable non-null sentinel |
+| `SQLITE_TEXT` | `Text` view after exact nonnegative length, non-null final-pointer, UTF-8, and no-U+0000 validation; zero length with a non-null pointer uses the stable non-null sentinel, while a null pointer follows the OOM/malformed rule below |
 | `SQLITE_BLOB` | `Bytes(byte_view { bytes })`; every zero-length input uses the stable non-null sentinel, including when SQLite returns null |
 
 Callback results accept every `pkg.db.value` variant. `Bool`, `I16`, and `I32` widen through
@@ -5956,15 +6008,19 @@ contract violation and calls `process.abort` without calling any SQLite result r
 non-null context, the trampoline obtains `sqlite3_context_db_handle(context)` exactly once before
 value extraction and hard-aborts if it is null.
 
-It calls `sqlite3_value_type` once per ordinal. For Text it calls `sqlite3_value_bytes` first and
+It visits every ordinal in order and calls `sqlite3_value_type` once for the first occurrence of
+each distinct non-null `sqlite3_value*`. If a later ordinal aliases a previously converted pointer,
+it copies that complete `pkg.db.value` into the later scratch slot without another SQLite accessor.
+For Text it calls `sqlite3_value_bytes` first and
 then `sqlite3_value_text` as the final accessor; for Bytes it calls `sqlite3_value_bytes` first and
 then `sqlite3_value_blob` as the final accessor. Every byte count must be nonnegative. A null final
 Text pointer is followed immediately by `sqlite3_errcode` on the saved database handle before any
 other SQLite API, mapping `SQLITE_NOMEM` to `sqlite3_result_error_nomem` and any other code to the
-fixed malformed-input error. Initial BLOB-to-BLOB access performs no encoding conversion: a null
-final Bytes pointer is the malformed-input error when length is nonzero and is replaced by the
-stable non-null empty sentinel when length is zero. Every zero-length Text/Bytes view is normalized
-to that sentinel regardless of the native pointer. No further value accessor is
+fixed malformed-input error, including when the earlier byte count was zero. Initial BLOB-to-BLOB
+access performs no encoding conversion: a null final Bytes pointer is the malformed-input error
+when length is nonzero and is replaced by the stable non-null empty sentinel when length is zero.
+Every zero-length Text with a non-null final pointer and every zero-length Bytes value is normalized
+to that sentinel. No further value accessor is
 called on that same `sqlite3_value` before the source callback returns. This final-pointer order
 pins SQLite conversion side effects and OOM precedence without retaining an accessor result that a
 later `sqlite3_value_bytes` call may invalidate.
@@ -6000,6 +6056,63 @@ The package passes null `pApp` and null `xDestroy` for every registration. Descr
 trampoline storage is immutable program-lifetime data, so replacement, removal, close, and either
 native registration failure have no application allocation or destructor edge.
 
+The private registration boundary is exact
+`align_pkg_db_sqlite_register_v2(database: raw, name: str, name_length: i64, arity: i32, flags: i32,
+trampoline: raw) -> raw`. It returns null on success and allocates nothing. On the sole native call's
+nonzero status it snapshots the current SQLite failure while the fixed name scratch is still live,
+then returns one non-null allocation with malloc alignment and this exact layout:
+
+```text
+offset          width  meaning
+0               i32    sqlite3_errcode(database) & 0xff
+4               i32    sqlite3_extended_errcode(database)
+8               i64    message byte length, nonnegative and excluding terminator
+16              len    exact sqlite3_errmsg(database) bytes
+16 + len        u8     zero terminator
+```
+
+The helper reads `sqlite3_errcode`, masks it with `0xff` to the primary result code, then reads the
+extended code and message in that order immediately after native failure,
+computes the message length before allocation, checks `len <= i64::MAX - 17`, allocates exactly
+`17 + len` bytes through `align_rt_alloc`, fills the complete header/message/terminator, and only
+then returns and ends the name scratch. A null native message becomes length zero. The runtime
+allocator's ordinary OOM behavior is a process-hard abort; no recoverable callback-registration
+error or usable connection survives that outcome. Invalid private-helper inputs hard-abort before a
+native call and cannot manufacture a snapshot; checked HIR and LLVM preflight admit only the guarded
+package call above.
+
+The helper's accepted input product and check order are exact. It first requires non-null
+`database`; then non-null `name`, `1 <= name_length <= 255`, and a readable source `str` range of
+exactly `name_length` bytes; it scans those bytes in increasing order and rejects the first U+0000;
+then it requires `0 <= arity <= 127`; finally it accepts exactly one of these products:
+
+```text
+trampoline  flags
+non-null    SQLITE_UTF8 | SQLITE_DIRECTONLY
+non-null    SQLITE_UTF8 | SQLITE_DIRECTONLY | SQLITE_DETERMINISTIC
+null        SQLITE_UTF8 | SQLITE_DIRECTONLY
+```
+
+Every unknown/missing flag, deterministic removal, and other nullness product hard-aborts before
+forming the scratch or calling SQLite. The non-null/readable name-range property is the ordinary
+source-`str` ABI precondition and cannot be authenticated from an arbitrary forged pointer; checked
+HIR requires the exact guarded `str` operand and LLVM preflight rejects every different call
+signature/producer. After those gates, the helper copies exactly the validated range, appends NUL,
+and makes one native call. Malformed-helper owners cover each scalar/null/flag/NUL product and prove
+zero SQLite calls; the exact valid registration/removal products prove one call each.
+
+On non-null return, package code first poisons/closes the physical connection, then reads the two
+codes and copies the explicit message bytes into an owned Align `string`, and finally frees the one
+snapshot allocation exactly once before constructing `Connection(NativeError)`. The snapshot has no
+partial published state: an abort during native-message or package-string allocation terminates the
+process, while every returning error owns its message and has already freed the snapshot. Removal
+uses the same boundary and ownership. Message length is the prefix before SQLite's first C NUL;
+package code reads exactly that many bytes, maps invalid UTF-8 to the existing fixed
+`invalid UTF-8 in SQLite error`, and never rescans native state. Header integers use the supported
+target's little-endian representation. Semantic-to-byte and byte-to-semantic goldens cover null
+success and a failure with primary 1, extended 257, and message `x` as
+`01 00 00 00 01 01 00 00 01 00 00 00 00 00 00 00 78 00`.
+
 Validation order is exact and stops at the first failure:
 
 1. authenticate the complete connection scalar/tag/reserved/pointer product;
@@ -6008,11 +6121,12 @@ Validation order is exact and stops at the first failure:
 4. validate arity, then the option slice in source order;
 5. authenticate the complete descriptor and require scalar-function kind;
 6. require Pure for `Deterministic`;
-7. form and terminate the call-local native-name stack scratch, load the guarded trampoline, and make exactly
-   one native registration/removal call;
-8. copy any native error before freeing the name; on any native failure poison/close the physical
-   connection and return that first `NativeError` because SQLite does not promise the prior
-   registration state remains usable;
+7. invoke the guarded v2 helper, which validates its private inputs, forms and terminates its local
+   native-name stack scratch, makes exactly one native registration/removal call, snapshots any
+   failure completely while that scratch remains live, and ends the scratch before returning;
+8. on a non-null snapshot, poison/close the physical connection, consume and free that owned
+   snapshot exactly once, and return its first `NativeError` because SQLite does not promise the
+   prior registration state remains usable;
 9. re-prove native autocommit and wrapper idle state before success; poison/close on contradiction.
 
 Duplicate `Deterministic` is the first option error. Removal has no descriptor/effect phase. All
@@ -6065,9 +6179,9 @@ The implementation closure matrix is:
 | public formation and inventory | Export exactly the types, variants, and functions above; lower only one direct noncapturing target of the exact kind signature; require complete effect/provenance/cleanup facts; reject captures, externs, dynamic/open target sets, ordinary fieldless construction, and every omitted surface. | source/interface inventory; direct/imported/noncapturing-lambda positives; capture/extern/dynamic/wrong-signature/effect negatives; whole/per-unit interface parity |
 | descriptor and generated identity | Form and validate the exact 32-byte v1 record, canonical nominal identity, signature, effect, return provenance/cleanup, relocation, and generated C-ABI family before pointer use. | semantic-to-byte and byte-to-semantic goldens; every field mutation; cross-kind/target/identity/trampoline splice; malformed HIR/MIR/LLVM preflight; whole/per-unit/ThinLTO link twins |
 | scalar trampoline | Hard-abort a null context; otherwise save its database handle, validate argc/argv and every value in bytes-then-final-pointer order before one callback, normalize every empty Text/Bytes view to the stable non-null sentinel, preserve ordered invocation views and returned provenance, and map every value/result/error exactly once with transient copies and no package heap. | null-context/db-handle subprocess owners; argc -1/0/127/128 and argv null products; every storage class/value variant; injected text/blob OOM and exact accessor/errcode traces; empty null/non-null pointer normalization; malformed pointer/length/UTF-8/NUL/NaN; exact invalid-result message; Ok/Err/hard-error IR; call/result/allocation counters |
-| registration and removal | Enforce exact connection/version/name/arity/option/descriptor order, form one call-local terminated stack name only after validation, pass UTF-8/DIRECTONLY flags, prove deterministic eligibility, make one native call, and copy native errors before returning. | pairwise multi-invalid no-call matrix; SQLite 3.29.99/3.30.0/newer; name 0/1/255/256/NUL and sliced/nonterminated input; exact stack bytes and fake-native call order; arity -1/0/127/128; options; built-in/user replacement/removal; autocommit before/after |
+| registration and removal | Enforce exact connection/version/name/arity/option/descriptor order, form one call-local terminated stack name only after validation, pass UTF-8/DIRECTONLY flags, prove deterministic eligibility, and make one native call. On failure, the registration shim captures primary/extended codes and one owned message copy before its name scratch ends, then returns that snapshot to package code; success allocates no snapshot. | pairwise multi-invalid no-call matrix; SQLite 3.29.99/3.30.0/newer; name 0/1/255/256/NUL and sliced/nonterminated input; exact stack bytes, error-snapshot-before-return ordering, copied-message lifetime, and fake-native call order; arity -1/0/127/128; options; built-in/user replacement/removal; autocommit before/after |
 | lifetime, cleanup, and reentrancy | Retain only program-lifetime trampoline data; pass null application/destructor pointers; keep callbacks connection-local through replace/remove/close; forbid pool-origin registration and access to the invoking connection; preserve a copied first native error and poison/close on every native mutation failure or failed reuse proof. | registration/replace/remove failure and close destructor-zero counters; direct/pool/tx/lease/dependent-resource matrix; typed/dynamic invocation; distinct-connection nested callback; no same-connection source route; poison/no-call-after-close |
-| thread and effect behavior | Invoke and consume views on the statement thread, retain no callback frame data, preserve non-Send connection ownership, mark generated C entrypoints nounwind, and distinguish ordinary scalar Err from process-hard abort. | thread-id assertions; view/callback return/capture/task escape negatives; Pure/Impure x option; LLVM nounwind/ABI inspection; ordinary error continuation and hard-abort subprocess twins |
+| thread and effect behavior | Seed callback parameter 0 as invocation-scoped non-Send provenance; infer exact direct/imported parallel-transfer parameter roots through every borrow-provenance form, helper return, and concrete function-value target, with every compatible argument/capture selected for unresolved indirect targets; reject that root at `spawn` and every `par_map` source/capture before descriptor publication. Invoke and consume accepted views on the statement thread, retain no callback frame data, preserve non-Send connection ownership, mark generated C entrypoints nounwind, and distinguish ordinary scalar Err from process-hard abort. | direct source/capture, local/projection/aggregate/control-flow, helper-argument/helper-return, concrete/unresolved function-value, same-unit/imported, malformed/missing-summary, and source-order task/par_map negatives; exact v6 codec byte/hash products; safe sequential helper and static/owned parallel twins; thread-id assertions; Pure/Impure x option; LLVM nounwind/ABI inspection; ordinary error continuation and hard-abort subprocess twins |
 | build, cache, and measurement | Preserve existing typed/dynamic behavior without callbacks, emit stable whole/per-unit identities, link SQLite only when reachable, and run the local DB parity gate. Measure registration and scalar calls at arity 0/1/127 without semantic thresholds. | cumulative Q2/Q4b/A1/A2 owners; interface/object/cache before/after twins; `scripts/db-verify-local.sh`; required CI; non-gating `bench/pkg_db_sqlite_callbacks` record |
 
 The independent adversarial review of `7eb445b` reopened the persisted-collation-identity axis. This
@@ -6094,6 +6208,16 @@ removes this pointer-lifetime proof. This matrix revision closes every verified 
 | `sqlite3_value_bytes` could invalidate a pointer retained from an earlier accessor | Valid: obtain and validate the byte count first, call text/blob as the final accessor, inspect errcode immediately after null Text, normalize null empty BLOB without conversion, and call no later accessor on that value. | exact per-value API traces, injected Text-conversion OOM, and pointer-use-after-final-accessor owner |
 | DIRECTONLY requires SQLite 3.31.0 | Rejected after primary-source verification: SQLite's official 3.30.0 release record explicitly introduces `SQLITE_DIRECTONLY`; retain the 3.30.0 floor and link that record. | configured 3.29.99/3.30.0/newer version boundary owner |
 | invalid callback results had no exact observable error bytes | Valid: use exact `pkg.db SQLite function callback returned an invalid value` bytes and explicit length. | each invalid result class observes exactly that message and no value result |
+
+The final implementation review of `910a361` found a second omitted safety axis, so the closure
+matrix is reopened on invocation-thread transfer rather than patched at the two reported sites. The
+producer/consumer boundary remains one capability: publishing a non-Send callback root without the
+same-unit/imported helper summaries that consume it would be a dormant, unsafe intermediate state.
+
+| Review report | Root-cause closure | Required owner |
+|---|---|---|
+| callback invocation views can reach worker threads through direct or helper `spawn`/`par_map` use | Add the compiler-only parallel-transfer summary above, reuse the exhaustive borrow-root classifier, translate direct and concrete function-value roots to caller arguments to a least fixed point, conservatively select compatible arguments/captures for unresolved indirect targets, serialize exact imported roots with the v6 codec, fail closed on absent/malformed facts, and reject callback root 0 before descriptor publication. Audit the complete direct/captured/returned/function-value and same-unit/imported class rather than only the reported direct capture. | direct source/capture plus local/projection/aggregate/control-flow variants; same-unit helper argument and returned-view twins; concrete/unresolved higher-order helper; imported exact/missing/malformed fact twins; v6 byte/hash goldens; safe sequential helper and unrelated static/owned parallel controls; checked-HIR replay parity |
+| the name stack frame ended before package code captured SQLite's failure | Change the private registration shim to return an owned failure snapshot captured while its fixed name scratch is live. Snapshot primary/extended codes and exact message bytes after the sole native call; allocate only on failure, free exactly once after package construction, and retain the existing poison/close rule. | injected failure proves code/message access and copy precede shim return/name-scratch end; message survives clobbering; success allocation count stays zero; failure snapshot/free and poison counts are exact |
 
 Before implementation, run one fresh independent adversarial review of this ledger and the shared
 producer/consumer boundary, then close every valid finding ledger-first. Before code review, perform
@@ -6339,12 +6463,16 @@ The design is implemented correctly only if all are true:
      package interfaces remain identical.
 105. SQLite scalar callbacks are formed only from one exact noncapturing target through nominal static
      descriptors and generated C-ABI trampolines. No source closure environment, native pointer,
-     connection handle, or callback-frame view survives registration or invocation.
+     connection handle, or callback-frame view survives registration or invocation; invocation-root
+     provenance crosses no direct, imported, concrete-indirect, or unresolved `spawn`/`par_map` boundary.
 106. Scalar functions receive one ordered `slice<db.value>`, return `Result<db.value, str>`, are
      always DIRECTONLY, and may claim deterministic behavior only with a proved-Pure target.
 107. Scalar callback registration is fixed-arity, UTF-8, connection-local, direct-SQLite-only state. It
      persists visibly until replace/remove/close, never follows a pool slot, and uses no application
      destructor or registration-owned heap environment.
+108. Interface-v6 parallel-transfer roots are canonical, authenticated checked-HIR facts that change
+     dependent hashes; registration failure uses one exact v2 owned snapshot captured before the name
+     scratch ends, poisoned before consumption, and freed exactly once.
 
 ---
 

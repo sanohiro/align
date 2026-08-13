@@ -321,6 +321,7 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         | ExprKind::Bool(_)
         | ExprKind::Local(_)
         | ExprKind::FnValue(_)
+        | ExprKind::SqliteCallbackDescriptor { .. }
         | ExprKind::Wait
         | ExprKind::Field { .. }
         | ExprKind::SoaColumn { .. }
@@ -1465,6 +1466,7 @@ fn clone_function(function: &hir::Fn) -> Option<hir::Fn> {
         return_borrow: function.return_borrow.clone(),
         return_region: function.return_region.clone(),
         return_cleanup: function.return_cleanup,
+        parallel_transfer: function.parallel_transfer.clone(),
         locals: function.locals.clone(),
         body,
         span: function.span,
@@ -1555,6 +1557,7 @@ fn drop_functions(fns: Vec<hir::Fn>) {
                     return_borrow,
                     return_region,
                     return_cleanup,
+                    parallel_transfer,
                     locals,
                     body,
                     span,
@@ -1571,6 +1574,7 @@ fn drop_functions(fns: Vec<hir::Fn>) {
                     return_borrow,
                     return_region,
                     return_cleanup,
+                    parallel_transfer,
                     locals,
                     span,
                     drop_locals,
@@ -1757,6 +1761,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::Bool(_)
         | ExprKind::Local(_)
         | ExprKind::FnValue(_)
+        | ExprKind::SqliteCallbackDescriptor { .. }
         | ExprKind::Wait
         | ExprKind::Field { .. }
         | ExprKind::SoaColumn { .. }
@@ -2444,6 +2449,7 @@ mod tests {
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
                 return_cleanup: hir::ReturnCleanupAbi::None,
+                parallel_transfer: hir::ReturnBorrowSummary::None,
                 locals: Vec::new(),
                 body,
                 span: Span::new(0, 0, 0),

@@ -4236,6 +4236,41 @@ callback invocationで、return、longer-lived aggregate、escaping fn capture�
 scalar callbackがargument/static storageをborrowするText/Bytesを返してもtrampolineがinvocation end前に
 transient-copyする。
 
+invocation provenanceはordinary borrow lifetimeとは別のcompiler-known non-Send provenanceでもある。
+checked-HIR producerは全direct/imported functionについて、contained viewが`spawn` capture、`par_map`
+source、stage/terminal captureへ到達し得るexact parameter rootのleast-fixed-point
+`parallel_transfer_params` summaryを計算する。exhaustive borrow classifierはlocal/projection/aggregate/control
+join/direct call/concrete function-value call/helper returnを通してrootを運び、callee rootをcaller argumentへ
+translateする。unresolved/open/absent/incompatible indirect targetは全borrow-capable call argument/captureを
+conservativeにselectする。
+
+interface format v6は各public fn recordのone-byte effect直後、`resource_hook_body`前に
+little-endian `u32` countとstrictly-increasing unique zero-based `u32` parameter index列を追加する。indexは
+preceding parameter count未満かつborrow-capableでなければならない。decodeはversion、preceding record、
+count/truncation、encoded orderでrange/orderを検証する。complete dependent type-definition graph decode後、
+stored hash acceptance/publication前に全selected rootのborrow capabilityを検証し、type graphをauthenticate
+できなければsame gateでfail closedする。
+old/missing/malformed/signature-incompatible factsはfail closed。versionとcomplete recordはcanonical surface hash
+inputなのでroot変更は`interface_hash`とdependent object/cache keyを必ず変える。zero/`[0]`/`[0, 2]`、全
+malformed product、same signatureのsequential→parallel body changeをbyte/hash goldenにする。fn-value typeの
+source/ABI fieldは増やさずconcrete target setを内部利用し、unresolved時は上記fallbackを使う。
+
+per-unit HIRはdecoded factをnormalized effect隣の
+`ImportedFn.parallel_transfer_params: Vec<u32>`として運ぶ。import constructionはdecoded canonical setだけを
+copyし、header validationがbody replay前にstrict order/range/borrow capability/matching imported signatureとの
+exact equalityを再検証する。replayはstored source functionのtransfer setをclearし、validated importだけをseed、
+direct/concrete fn-value propagationとunresolved fallbackをleast fixed pointへ再計算し、descriptor factをtarget
+setとcompareする。このvalidation-only fieldはgate後stripされ、MIR existing six-field import ABI/runtime ABIは
+不変。whole-program HIRはimport declarationなしでbodyからsame factを計算する。
+
+callback root 0がdirect/same-unit/imported/helper-return/concrete-or-unresolved fn-valueのいずれからでもparallel
+sinkへ達すればdescriptorをHIR publication前にrejectする。sequential pipelineとargument-backed Text/Bytesの
+synchronous return copyは許可する。descriptor semantic identityにもtarget parallel-transfer factを含める。
+選択したsink数にかかわらずdescriptor expression spanへexactly one
+`SQLite callback invocation views cannot be transferred to parallel workers`をemitする。descriptor finalizationは
+transfer factをtarget effectより先にcheckするため、same descriptorのeffectもUnknownならこのdiagnostic、次に既存
+`SQLite callback effect could not be proved Pure or Impure`の順でemitし、descriptor間はsource orderを保つ。
+
 scalar input/output mappingはexact:
 
 | SQLite storage/result class | callback `pkg.db.value` |
@@ -4243,7 +4278,7 @@ scalar input/output mappingはexact:
 | `SQLITE_NULL` | `Null` |
 | `SQLITE_INTEGER` | `I64(sqlite3_value_int64(...))` |
 | `SQLITE_FLOAT` | finite/infinity/signed-zero `F64`; native NaNはinvalid |
-| `SQLITE_TEXT` | exact nonnegative length/final pointer/UTF-8/no-U+0000 validation後の`Text` view; zero lengthはstable non-null sentinel |
+| `SQLITE_TEXT` | exact nonnegative length/non-null final pointer/UTF-8/no-U+0000 validation後の`Text` view; non-null pointerのzero lengthはstable non-null sentinel、null pointerは下記OOM/malformed rule |
 | `SQLITE_BLOB` | `Bytes(byte_view { bytes })`; SQLite pointerがnullでも全zero-length inputをstable non-null sentinelへnormalize |
 
 callback resultは全`pkg.db.value` variantを許可する。`Bool`/`I16`/`I32`は
@@ -4265,13 +4300,15 @@ ordinal順にcallback前validateする。fixed-arityの`argc == arity` invariant
 arityを重複しない。null contextはSQLite result routineを呼ばず`process.abort`する。non-nullならvalue extraction
 前に`sqlite3_context_db_handle(context)`をexactly once呼び、nullならhard abortする。
 
-ordinalごとに`sqlite3_value_type`を1回呼ぶ。Textは`sqlite3_value_bytes`を先に呼び、最後のaccessorとして
+全ordinalを順にvisitし、distinct non-null `sqlite3_value*`のfirst occurrenceごとに
+`sqlite3_value_type`を1回呼ぶ。later ordinalがalready-converted pointerをaliasする場合は別SQLite accessorを
+呼ばずcomplete `pkg.db.value`をlater scratch slotへcopyする。Textは`sqlite3_value_bytes`を先に呼び、最後のaccessorとして
 `sqlite3_value_text`を呼ぶ。Bytesもbytesを先に、`sqlite3_value_blob`を最後に呼ぶ。全byte countは
 nonnegative。final Text pointerがnullなら他SQLite APIより先にsaved DB handleの`sqlite3_errcode`を直ちに読み、
-`SQLITE_NOMEM`は`sqlite3_result_error_nomem`、他codeはfixed malformed-input error。initial BLOB-to-BLOB
+`SQLITE_NOMEM`は`sqlite3_result_error_nomem`、zero byte countの場合も含め他codeはfixed malformed-input error。initial BLOB-to-BLOB
 accessはencoding conversionなしなのでnull Bytesはnonzero lengthならmalformed、zeroならstable non-null empty
-sentinelへreplaceする。native pointerに関わらず全
-zero-length Text/Bytes viewをsentinelへnormalizeする。same valueにはcallback return前に別accessorを呼ばず、
+sentinelへreplaceする。non-null final pointerのzero-length Textと全zero-length Bytesをsentinelへnormalizeする。
+same valueにはcallback return前に別accessorを呼ばず、
 later bytes callがretained pointerをinvalidateしないfinal-pointer orderを固定する。
 
 fixed-capacity 127-value stack scratchと先頭`argc`のborrowed sliceを形成し、package heap allocationなし、callback
@@ -4297,6 +4334,49 @@ exact identityへnull callbacksを渡す。schema probe/SQL prepare/retry/別ari
 null `pApp`とnull `xDestroy`。descriptor/trampolineはimmutable program-lifetimeなのでfailure/replace/remove/closeに
 application allocation/destructor edgeなし。
 
+private registration boundaryはexact
+`align_pkg_db_sqlite_register_v2(database: raw, name: str, name_length: i64, arity: i32, flags: i32,
+trampoline: raw) -> raw`。successはnullかつallocation zero。sole native callがnonzeroならfixed name scratchが
+liveな間にcurrent SQLite failureをsnapshotし、malloc-aligned one allocationを返す:
+
+```text
+offset          width  meaning
+0               i32    sqlite3_errcode(database) & 0xff
+4               i32    sqlite3_extended_errcode(database)
+8               i64    message byte length, nonnegative, terminator excluded
+16              len    exact sqlite3_errmsg(database) bytes
+16 + len        u8     zero terminator
+```
+
+failure直後に`sqlite3_errcode`を読み`0xff`でprimary codeへmaskし、次にextended→messageの順で読み、
+allocation前にlengthを得て`len <= i64::MAX - 17`を確認、
+`align_rt_alloc`でexact `17 + len` bytesをallocateしcomplete recordをfillしてからreturn/name scratch end。
+null native messageはlen zero。OOMはprocess-hard abortでrecoverable error/usable connectionなし。invalid private
+inputはnative call前hard abortし、guarded package callだけHIR/LLVM preflightが許可する。non-null return後は
+packageがまずconnectionをpoison/closeし、codesとexplicit message bytesをowned `string`へcopy、snapshotを
+exactly once free後に`Connection(NativeError)`をconstructする。abortしたpartial constructionはprocessを
+terminateし、returning errorはowned messageかつsnapshot-free。removeもsame boundary。primary 1/extended
+257/message `x`のgoldenは次のとおり。message lenはSQLite first C NUL前のprefixで、packageはexact lenを読み、
+invalid UTF-8をexisting fixed `invalid UTF-8 in SQLite error`へmapしnative stateを再scanしない。header integerは
+supported targetのlittle-endian representation:
+`01 00 00 00 01 01 00 00 01 00 00 00 00 00 00 00 78 00`、successはnull。
+
+helper accepted product/check orderはexact。まずnon-null `database`、次にnon-null `name`、
+`1 <= name_length <= 255`、exact len readable source-`str` rangeを要求し、increasing byte orderでfirst U+0000を
+reject。次に`0 <= arity <= 127`。最後に次の3 productだけacceptする:
+
+```text
+trampoline  flags
+non-null    SQLITE_UTF8 | SQLITE_DIRECTONLY
+non-null    SQLITE_UTF8 | SQLITE_DIRECTONLY | SQLITE_DETERMINISTIC
+null        SQLITE_UTF8 | SQLITE_DIRECTONLY
+```
+
+unknown/missing flag、deterministic removal、他null productはscratch/SQLite call前hard abort。non-null/readable
+rangeはsource-`str` ABI preconditionでarbitrary forged pointerからruntime認証不能なので、checked HIRがexact
+guarded `str` operand、LLVM preflightがcall signature/producerを認証する。その後exact range copy/NUL append/one
+native call。malformed-helper ownerは全scalar/null/flag/NUL productでSQLite call zero、3 valid productでone call。
+
 validation orderはexactでfirst failure後停止:
 
 1. complete connection scalar/tag/reserved/pointer product authenticate;
@@ -4305,9 +4385,10 @@ validation orderはexactでfirst failure後停止:
 4. arity、次にoption sliceをsource order;
 5. complete descriptor authenticateとscalar-function kind;
 6. `Deterministic`のPure;
-7. call-local native-name stack scratchをform/terminateし、guarded trampoline loadとexactly one native call;
-8. name free前にnative errorをcopyし、native failureならambiguous previous stateをreuseせずphysical connectionを
-   poison/closeしてfirst `NativeError`をreturn;
+7. guarded v2 helperをinvokeし、helperがprivate inputをvalidate、local native-name stack scratchをform/terminate、
+   exactly one native call、scratch live中にfailureをcomplete snapshotし、return前にscratchを終了;
+8. non-null snapshotならphysical connectionをpoison/closeし、そのowned snapshotをexactly once consume/freeして、
+   ambiguous previous stateをreuseせずfirst `NativeError`をreturn;
 9. success前native autocommit/wrapper idle再proof、contradictionはpoison/close。
 
 duplicate `Deterministic`がfirst option error。removalにdescriptor/effect phaseなし。package-detectable errorは
@@ -4354,9 +4435,9 @@ implementation closure matrix:
 | public formation/inventory | exact inventory、one direct noncapturing exact-signature targetだけlower、complete effect/provenance/cleanup。capture/extern/dynamic/open/wrong signature/effect/fieldless construction/omitted surfaceをreject。 | source/interface inventory、direct/imported/lambda positive、全negative、whole/per-unit parity |
 | descriptor/generated identity | exact 32-byte v1、nominal identity、signature/effect/provenance/cleanup/relocation/C-ABI familyをpointer前validate。 | bidirectional golden、all field mutation、cross-kind/target/identity/trampoline splice、malformed HIR/MIR/LLVM、whole/per-unit/ThinLTO |
 | scalar trampoline | null contextはhard abort、他はDB handleをsaveしてbytes→final pointer orderでargc/argv/all valuesをone callback前validate、全empty Text/Bytesをstable non-null sentinelへnormalize、ordered view/return provenance、all result/error exactly once transient-copy、package heapなし。 | null context/DB handle subprocess、argc -1/0/127/128、argv product、all class/variant、text/blob injected OOM/exact API trace、empty null/non-null normalization、pointer/length/UTF-8/NUL/NaN、exact invalid-result message、Ok/Err/hard-error IR、counter |
-| registration/removal | exact connection/version/name/arity/option/descriptor order、validation後だけterminated stack name形成、UTF-8/DIRECTONLY、deterministic proof、one native call、error copy。 | pairwise multi-invalid no-call、SQLite 3.29.99/3.30.0/newer、name 0/1/255/256/NUL/sliced/nonterminated、exact stack bytes/fake call order、arity -1/0/127/128、option、builtin/user replace/remove、autocommit |
+| registration/removal | exact connection/version/name/arity/option/descriptor order、validation後だけterminated stack name形成、UTF-8/DIRECTONLY、deterministic proof、one native call。failureはname scratch live中にexact v2 owned snapshot、success allocation zero。 | pairwise multi-invalid no-call、SQLite 3.29.99/3.30.0/newer、name 0/1/255/256/NUL/sliced/nonterminated、exact stack/snapshot bytes・copy-before-return・free/fake call order、arity -1/0/127/128、option、builtin/user replace/remove、autocommit |
 | lifetime/cleanup/reentrancy | program-lifetime dataだけretain、null app/destructor、connection-local replace/remove/close、pool-origin/owning-connection access禁止、native mutation failure/reuse-proof failureはcopied first errorを保ちpoison/close。 | registration/replace/remove failure/close destructor-zero、direct/pool/tx/lease/dependent matrix、typed/dynamic invocation、distinct nested connection、no same-connection route、no-call-after-close |
-| thread/effect | statement threadでview consume、frame data retainなし、non-Send、C entry nounwind、ordinary scalar Errとhard abortを区別。 | thread id、escape/capture/task negatives、Pure/Impure x option、LLVM ABI/nounwind、error continuation/hard-abort subprocess |
+| thread/effect | callback root 0をnon-Send seedし、全borrow form/helper return/direct/imported/concrete fn-valueをfixed-point、unresolved indirectは全compatible arg/captureをselectし、`spawn`/全`par_map` source/capture前にreject。statement thread consume、frame retainなし、C entry nounwind、ordinary Err/hard abortを区別。 | direct/local/projection/aggregate/control/helper/concrete・unresolved fn-value/same-unit/imported/malformed summary negatives、v6 codec byte/hash、safe sequential/static-owned parallel twins、thread id、Pure/Impure、LLVM ABI/nounwind、error/hard-abort |
 | build/cache/measurement | callbackなし既存behavior、stable whole/per-unit identity、reachable時だけSQLite link、local DB gate。registration/scalar arity 0/1/127をthresholdなしでmeasure。 | cumulative owners、interface/object/cache twins、`scripts/db-verify-local.sh`、required CI、non-gating `bench/pkg_db_sqlite_callbacks` |
 
 `7eb445b`のindependent adversarial reviewはpersisted-collation-identity axisをreopenした。このrevisionはfresh
@@ -4383,6 +4464,14 @@ revisionはverified reportを全てcloseする:
 | earlier accessor pointerを`sqlite3_value_bytes`がinvalidateし得た | Valid: byte countを先にvalidate、text/blobをfinal accessor、null Text直後errcode、null empty BLOBをconversionなしnormalize、same value later accessorなし。 | exact per-value trace、injected Text conversion OOM、pointer-use-after-final-accessor owner |
 | DIRECTONLYはSQLite 3.31.0必須 | Rejected: official 3.30.0 release recordが`SQLITE_DIRECTONLY`導入を明記するため3.30.0 floor/linkを維持。 | configured 3.29.99/3.30.0/newer boundary owner |
 | invalid callback resultのobservable error bytesが未指定 | Valid: exact `pkg.db SQLite function callback returned an invalid value`とexplicit length。 | each invalid result classでsame message/value result zero |
+
+`910a361`のfinal implementation reviewでinvocation-thread transfer axisが未閉鎖と判明したためmatrixをreopenする。
+non-Send producerだけをhelper summary consumerからsplitするとunsafe dormant stateになるのでone capabilityを維持する。
+
+| Review report | Root-cause closure | Required owner |
+|---|---|---|
+| callback viewがdirect/helper `spawn`/`par_map`からworkerへ到達可能 | exhaustive borrow rootを再利用したsummary、direct/concrete fn-value translation、unresolved compatible fallback、exact v6 imported codec、missing/malformed fail-closed、descriptor前root 0 rejectでdirect/captured/returned/higher-order/same-unit/imported classを一括close。 | direct/local/projection/aggregate/control、helper arg/return、concrete/unresolved HOF、imported exact/missing/malformed、v6 byte/hash、safe sequential/static-owned twins、replay parity |
+| name stack frameがSQLite error captureより先に終了 | exact v2 private ABIでname live中にcodes/messageをone owned snapshotへcopy。failure-only allocation、package poison後consume、exact once free。 | injected order/clobber survival、success alloc zero、failure snapshot/free/poison exact |
 
 implementation前にこのledger/shared producer-consumer boundaryのfresh independent adversarial reviewを1回行い、
 valid findingをledger-firstでcloseする。code review前にmatrix-to-diff passを行う。capture/effect eligibility、
@@ -4597,11 +4686,14 @@ execution-count付きで実証する。
      reflection table、normal-build DB/network workを作らず、whole/per-unit interfaceは同一。
 105. SQLite scalar callbackはone exact noncapturing targetからnominal static descriptor/generated C-ABI
      trampolineだけで形成する。source closure env/native pointer/connection handle/callback-frame viewを
-     registration/invocation後に残さない。
+     registration/invocation後に残さず、invocation rootはdirect/imported/concrete-indirect/unresolvedの
+     どの`spawn`/`par_map` boundaryもcrossしない。
 106. scalar functionはone ordered `slice<db.value>`を受け`Result<db.value,str>`を返し、常に
      DIRECTONLY。proved-Pure targetだけdeterministicをclaimできる。
 107. scalar callback registrationはfixed-arity/UTF-8/connection-local/direct-SQLite-only。replace/remove/close
      までvisibleにpersistし、pool slotをfollowせず、application destructor/registration heap envなし。
+108. interface-v6 parallel-transfer rootはcanonical/authenticated checked-HIR factでdependent hashを変え、
+     registration failureはname scratch end前にexact v2 owned snapshotへcapture、consume前poison、exactly once free。
 
 ## 25. 実装前にconsumerで確定するtype/native detail
 

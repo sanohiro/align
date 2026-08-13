@@ -2331,6 +2331,63 @@ fn malformed_return_roots_fail_closed_during_decode() {
 }
 
 #[test]
+fn parallel_transfer_roots_are_canonical_and_change_the_interface_hash() {
+    let sequential =
+        one("pub fn run(values: slice<i64>) -> i64 = values.sum()\nfn main() -> i32 = 0\n")
+            .remove(0);
+    let parallel = one(
+        "fn keep(value: i64) -> i64 = value\npub fn run(values: slice<i64>) -> i64 = values.par_map(keep).sum()\nfn main() -> i32 = 0\n",
+    )
+    .remove(0);
+    assert!(sequential.fns[0].parallel_transfer_params.is_empty());
+    assert_eq!(parallel.fns[0].parallel_transfer_params, [0]);
+    assert_ne!(sequential.interface_hash, parallel.interface_hash);
+    assert_eq!(deserialize(&serialize(&parallel)), Ok(parallel.clone()));
+
+    let mut duplicate = parallel.clone();
+    duplicate.fns[0].parallel_transfer_params = vec![0, 0];
+    assert_eq!(
+        validate_for_import(&duplicate),
+        Err(ImportCompatibilityError::ParallelTransferRootsNonCanonical),
+    );
+    rehash(&mut duplicate);
+    assert_eq!(
+        deserialize(&serialize(&duplicate)),
+        Err(DecodeError::InvalidSummary(
+            "parallel-transfer roots must be strictly increasing"
+        )),
+    );
+
+    let mut out_of_range = parallel;
+    out_of_range.fns[0].parallel_transfer_params = vec![1];
+    rehash(&mut out_of_range);
+    assert_eq!(
+        deserialize(&serialize(&out_of_range)),
+        Err(DecodeError::InvalidSummary(
+            "parallel-transfer root is outside the signature"
+        )),
+    );
+
+    let mut nonborrowing =
+        one("pub fn run(value: i64) -> i64 = value\nfn main() -> i32 = 0\n").remove(0);
+    nonborrowing.fns[0].parallel_transfer_params = vec![0];
+    rehash(&mut nonborrowing);
+    assert_eq!(
+        deserialize(&serialize(&nonborrowing)),
+        Err(DecodeError::InvalidSummary(
+            "parallel-transfer root is not borrow-capable"
+        )),
+    );
+
+    let mut borrowed =
+        one("pub fn run(borrow value: i64) -> i64 = value\nfn main() -> i32 = 0\n")
+            .remove(0);
+    borrowed.fns[0].parallel_transfer_params = vec![0];
+    rehash(&mut borrowed);
+    assert_eq!(deserialize(&serialize(&borrowed)), Ok(borrowed));
+}
+
+#[test]
 fn parameter_mode_codec_has_a_byte_golden_and_rejects_unknown_tags() {
     let summary =
         one("pub fn inspect(out value: slice<i64>) -> i64 = value.len()\nfn main() -> i32 = 0\n").remove(0);
@@ -2338,7 +2395,7 @@ fn parameter_mode_codec_has_a_byte_golden_and_rejects_unknown_tags() {
     let hex = surface.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
     assert_eq!(
         hex,
-        "05000000040000006d61696e0100000007000000696e73706563740000000001000000010005000000736c6963650100000000030000006936340000000000030000006936340000000000000000000000000000000000000000000000000000"
+        "06000000040000006d61696e0100000007000000696e73706563740000000001000000010005000000736c696365010000000003000000693634000000000003000000693634000000000000000000000000000000000000000000000000000000000000"
     );
 
     let mut artifact = serialize(&summary);
@@ -2355,22 +2412,22 @@ fn parameter_mode_codec_has_a_byte_golden_and_rejects_unknown_tags() {
     );
 
     // This one-function surface ends with the function's borrow tag, region tag, cleanup ABI,
-    // effect, resource-hook-body bit, generic body option, then the empty top-level
-    // struct/enum/resource/const sequences.
+    // effect, empty parallel-transfer sequence, resource-hook-body bit, generic body option, then
+    // the empty top-level struct/enum/resource/const sequences.
     let mut bad_borrow = serialize(&summary);
-    bad_borrow[surface.len() - 22] = 0xff;
+    bad_borrow[surface.len() - 26] = 0xff;
     assert_eq!(
         deserialize(&bad_borrow),
         Err(DecodeError::BadTag { what: "return-borrow summary", tag: 0xff })
     );
     let mut bad_region = serialize(&summary);
-    bad_region[surface.len() - 21] = 0xff;
+    bad_region[surface.len() - 25] = 0xff;
     assert_eq!(
         deserialize(&bad_region),
         Err(DecodeError::BadTag { what: "return-region summary", tag: 0xff })
     );
     let mut bad_cleanup = serialize(&summary);
-    bad_cleanup[surface.len() - 20] = 0xff;
+    bad_cleanup[surface.len() - 24] = 0xff;
     assert_eq!(
         deserialize(&bad_cleanup),
         Err(DecodeError::BadTag {

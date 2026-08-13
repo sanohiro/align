@@ -92,7 +92,7 @@ if [ "$status" -eq 0 ]; then
   exit 1
 fi
 
-# Steps 2-8: the same seven required integration suites CI runs.
+# Steps 2-9: the same eight required integration suites CI runs.
 scripts/cargo.sh test --locked -p align_driver --test pkg_db_q2 -- --nocapture
 scripts/cargo.sh test --locked -p align_driver --test pkg_db_q3 -- --nocapture
 scripts/cargo.sh test --locked -p align_driver --test pkg_db_q5a -- --nocapture
@@ -100,5 +100,6 @@ scripts/cargo.sh test --locked -p align_driver --test pkg_db_q5b2 -- --nocapture
 scripts/cargo.sh test --locked -p align_driver --test pkg_db_a1 -- --nocapture
 scripts/cargo.sh test --locked -p align_driver --test pkg_db_pool -- --nocapture
 scripts/cargo.sh test --locked -p align_driver --test pkg_db_a2 -- --nocapture
+scripts/cargo.sh test --locked -p align_driver --test pkg_db_callbacks -- --nocapture
 
-echo "local PostgreSQL verification passed (CI parity: pkg_db_q2 / q3 / q5a / q5b2 / a1 / pool / a2)"
+echo "local PostgreSQL verification passed (CI parity: pkg_db_q2 / q3 / q5a / q5b2 / a1 / pool / a2 / callbacks)"

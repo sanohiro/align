@@ -3069,6 +3069,25 @@ pub struct StaticDescriptor {
 /// to the same physical ABI, while the producer initializes the pointer from generated static data.
 pub const STATIC_DESCRIPTOR_DATA_FIELD: &str = "$static";
 
+/// Compiler-private storage carried by the fieldless public SQLite callback descriptor.
+/// The source spelling is outside Align's identifier grammar, so only the producer can form it.
+pub const SQLITE_CALLBACK_DESCRIPTOR_DATA_FIELD: &str = "$sqlite_callback";
+
+const SQLITE_SCALAR_FUNCTION_TYPE: &str = "pkg.db.sqlite$scalar_function";
+const SQLITE_FUNCTION_ARGS_TYPE: &str = "pkg.db.sqlite$function_args";
+const DB_VALUE_TYPE: &str = "pkg.db$value";
+
+pub fn sqlite_callback_descriptor_struct_is_valid(definition: &hir::StructDef) -> bool {
+    definition.name == SQLITE_SCALAR_FUNCTION_TYPE
+        && matches!(
+            definition.fields.as_slice(),
+            [hir::FieldDef { name, ty: Ty::Raw }]
+                if name == SQLITE_CALLBACK_DESCRIPTOR_DATA_FIELD
+        )
+        && definition.align.is_none()
+        && !definition.c_repr
+}
+
 fn static_descriptor_generic_arity(name: &str) -> Option<usize> {
     match name {
         "pkg.db$query" => Some(2),
@@ -5289,17 +5308,18 @@ pub fn check_program_with_static_descriptors(
     )
 }
 
-/// The imported return-provenance facts of non-generic public functions, keyed by canonical
-/// (mangled) name. The interface codec validates every root before constructing this map.
-pub type ExternalReturnProvenance =
-    std::collections::HashMap<
-        String,
-        (
-            hir::ReturnBorrowSummary,
-            hir::ReturnRegionSummary,
-            hir::ReturnCleanupAbi,
-        ),
-    >;
+/// The imported return-provenance, cleanup, and parallel-transfer facts of non-generic public
+/// functions, keyed by canonical (mangled) name. The interface codec validates every root before
+/// constructing this map.
+pub type ExternalReturnProvenance = std::collections::HashMap<
+    String,
+    (
+        hir::ReturnBorrowSummary,
+        hir::ReturnRegionSummary,
+        hir::ReturnCleanupAbi,
+        Vec<u32>,
+    ),
+>;
 
 /// Resource metadata that cannot be represented by synthesized interface source. The producer
 /// owns the linkable Drop thunk identity; consumers must reuse it verbatim rather than deriving a
@@ -5319,7 +5339,7 @@ pub type ExternalResourceFacts = std::collections::HashMap<String, ExternalResou
 pub type ExternalResourceHookFacts = std::collections::HashMap<String, bool>;
 
 /// M15 S1b compatibility entry point. L2b callers that reconstruct interface-only dependencies use
-/// [`check_program_with_interface_facts`] so imported return provenance is preserved as well.
+/// [`check_program_with_interface_facts`] so imported provenance and transfer facts are preserved.
 pub fn check_program_with_effects(
     modules: &[Module],
     external_effects: &std::collections::HashMap<String, FnEffect>,
@@ -5331,9 +5351,10 @@ pub fn check_program_with_effects(
 /// Per-unit checking with semantic facts that synthesized interface source cannot express.
 ///
 /// `external_effects` carries each imported non-generic public function's 3-valued effect bit.
-/// `external_return_provenance` carries its exact return-borrow and return-region roots. Both maps
-/// use canonical names. Generic imported functions are absent because their bodies are instantiated
-/// in the consumer and their facts are inferred from those bodies.
+/// `external_return_provenance` carries its exact return-borrow, return-region, cleanup, and
+/// parallel-transfer roots. Both maps use canonical names. Generic imported functions are absent
+/// because their bodies are instantiated in the consumer and their facts are inferred from those
+/// bodies.
 pub fn check_program_with_interface_facts(
     modules: &[Module],
     external_effects: &std::collections::HashMap<String, FnEffect>,
@@ -5944,6 +5965,20 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         // `align(N)` over-alignment (M6): honored at the one `type_align` codegen seam (the slot
         // alloca / struct-array element). `None` = the type's natural alignment.
         let name = mangle_fn(module, *_is_entry, &s.name.name);
+        let callback_descriptor = name == SQLITE_SCALAR_FUNCTION_TYPE;
+        if callback_descriptor && (!fields.is_empty() || s.align.is_some() || s.c_repr) {
+            diags.error(
+                "compiler-known SQLite callback descriptor must be a fieldless, naturally aligned Align struct"
+                    .to_string(),
+                s.span,
+            );
+        }
+        if callback_descriptor && fields.is_empty() && s.align.is_none() && !s.c_repr {
+            fields.push(FieldDef {
+                name: SQLITE_CALLBACK_DESCRIPTOR_DATA_FIELD.to_string(),
+                ty: Ty::Raw,
+            });
+        }
         structs[i] = StructDef {
             source_name: name.clone(),
             name,
@@ -6524,7 +6559,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
     // Synthesized interface source cannot spell compiler-owned provenance facts. Restore those
     // facts after signature collection. The driver supplies the complete transitive fact map, so
     // entries outside the modules visible to this check are intentionally ignored.
-    for (name, (return_borrow, return_region, return_cleanup)) in external_return_provenance {
+    for (name, (return_borrow, return_region, return_cleanup, _)) in external_return_provenance {
         if let Some(sig) = sigs.get_mut(name) {
             sig.return_borrow = return_borrow.clone();
             sig.return_region = return_region.clone();
@@ -6904,6 +6939,29 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                         .get(&mangled)
                         .copied()
                         .unwrap_or(FnEffect::Impure);
+                    let parallel_transfer_params = external_return_provenance
+                        .get(&mangled)
+                        .map(|(_, _, _, roots)| roots.clone())
+                        .unwrap_or_else(|| {
+                            sig.params
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(index, ty)| {
+                                    (ty_may_borrow(
+                                        *ty,
+                                        &structs,
+                                        &tuples,
+                                        &enums,
+                                        &tagged_types,
+                                    ) || matches!(
+                                        sig.param_modes.get(index),
+                                        Some(ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
+                                    ))
+                                        .then(|| u32::try_from(index).ok())
+                                        .flatten()
+                                })
+                                .collect()
+                        });
                     imported_fns.push(hir::ImportedFn {
                         name: mangled,
                         params: sig.params.clone(),
@@ -6914,6 +6972,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                         return_region: sig.return_region.clone(),
                         return_cleanup: sig.return_cleanup,
                         effect,
+                        parallel_transfer_params,
                     });
                 }
             }
@@ -7837,7 +7896,33 @@ fn run_body_analysis_passes(
                 .map(|function| (function.name.clone(), function.param_modes.clone())),
         )
         .collect();
+    let named_parallel_transfer = program
+        .fns
+        .iter()
+        .map(|function| (function.name.clone(), function.parallel_transfer.clone()))
+        .chain(program.imported_fns.iter().map(|function| {
+            let summary = if function.parallel_transfer_params.is_empty() {
+                hir::ReturnBorrowSummary::None
+            } else {
+                hir::ReturnBorrowSummary::Roots {
+                    params: function.parallel_transfer_params.clone(),
+                    captures: Vec::new(),
+                }
+            };
+            (function.name.clone(), summary)
+        }))
+        .collect::<std::collections::HashMap<_, _>>();
     let callable = infer_fn_value_return_provenance(program, &named_return_borrow);
+    let callable_parallel_targets = callable
+        .target_ids
+        .iter()
+        .filter_map(|(name, target)| {
+            named_parallel_transfer
+                .get(name)
+                .cloned()
+                .map(|summary| (*target, summary))
+        })
+        .collect::<CallableTransferSet>();
     // Pass 3 (partial): move / use-after-move checking + arena escape checking
     // (`03-types.md` §6–§7), then derive the per-function drop set (MMv2 slice 4).
     // Destructure so the flow analyses can read `tuples` (a tuple may be region-tracked when it
@@ -7861,6 +7946,7 @@ fn run_body_analysis_passes(
             f,
             diags,
             named_return_borrow: &named_return_borrow,
+            named_parallel_transfer: &named_parallel_transfer,
             named_param_modes: &named_param_modes,
             named_borrow_mut_retention: borrow_mut_retention,
             summary_dependencies: None,
@@ -7871,6 +7957,7 @@ fn run_body_analysis_passes(
             fn_types,
             callable_targets: &callable.targets_by_type,
             callable_target_ids: &callable.target_ids,
+            callable_parallel_targets: &callable_parallel_targets,
             loop_breaks: Vec::new(),
             borrows: BorrowState::default(),
             next_pipeline_snapshot: 0,
@@ -7884,6 +7971,7 @@ fn run_body_analysis_passes(
             loop_iter_drops: Vec::new(),
             arena_depth: 0,
             return_roots: BorrowRoots::new(),
+            parallel_transfer_roots: BorrowRoots::new(),
             borrow_mut_retention: vec![BorrowRoots::new(); f.params.len()],
             non_fallthrough: std::collections::HashSet::new(),
             borrow_fact_cache: std::cell::RefCell::new(None),
@@ -7973,6 +8061,93 @@ fn run_body_analysis_passes(
     } else {
         check_parallelism(program, external_effects, diags);
     }
+    finalize_sqlite_callback_descriptor_effects(program, external_effects, diags);
+}
+
+/// Bind each SQLite callback descriptor to the settled effect of its exact declaration. The
+/// descriptor is a compile-time value, so taking it adds no call edge; registration later uses the
+/// stored bit to gate `Deterministic` without rediscovering source or reflection metadata.
+fn finalize_sqlite_callback_descriptor_effects(
+    program: &hir::Program,
+    external_effects: &std::collections::HashMap<String, FnEffect>,
+    diags: &mut Diagnostics,
+) {
+    let mut effects = fn_effects(program, external_effects);
+    effects.extend(external_effects.iter().map(|(name, effect)| (name.clone(), *effect)));
+    let transfers = program
+        .fns
+        .iter()
+        .map(|function| (function.name.clone(), function.parallel_transfer.clone()))
+        .chain(program.imported_fns.iter().map(|function| {
+            let summary = if function.parallel_transfer_params.is_empty() {
+                hir::ReturnBorrowSummary::None
+            } else {
+                hir::ReturnBorrowSummary::Roots {
+                    params: function.parallel_transfer_params.clone(),
+                    captures: Vec::new(),
+                }
+            };
+            (function.name.clone(), summary)
+        }))
+        .collect::<std::collections::HashMap<_, _>>();
+    for function in &program.fns {
+        for event in hir_depth::body_events(&function.body) {
+            if let hir_depth::BodyEvent::ExprEnter(Expr {
+                kind: ExprKind::SqliteCallbackDescriptor { target, effect },
+                span,
+                ..
+            }) = event
+            {
+                if matches!(
+                    transfers.get(target),
+                    Some(hir::ReturnBorrowSummary::Roots { params, .. })
+                        if params.binary_search(&0).is_ok()
+                ) {
+                    diags.error(
+                        "SQLite callback invocation views cannot be transferred to parallel workers"
+                            .to_string(),
+                        *span,
+                    );
+                }
+                let inferred = effects.get(target).copied().unwrap_or(FnEffect::Unknown);
+                effect.set(inferred);
+                if inferred == FnEffect::Unknown {
+                    diags.error(
+                        "SQLite callback effect could not be proved Pure or Impure".to_string(),
+                        *span,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Recompute the target-owned effect facts needed by SQLite callback MIR validation. The returned
+/// map is independent of the effect cell carried by each descriptor expression, so a malformed
+/// post-HIR descriptor cannot make an Impure target appear Pure by changing one copied bit.
+pub fn sqlite_callback_target_effects(
+    program: &hir::Program,
+) -> std::collections::HashMap<String, FnEffect> {
+    let external_effects = program
+        .imported_fns
+        .iter()
+        .map(|function| (function.name.clone(), function.effect))
+        .collect::<std::collections::HashMap<_, _>>();
+    let effects = fn_effects(program, &external_effects);
+    let mut targets = std::collections::HashMap::new();
+    for function in &program.fns {
+        for event in hir_depth::body_events(&function.body) {
+            if let hir_depth::BodyEvent::ExprEnter(Expr {
+                kind: ExprKind::SqliteCallbackDescriptor { target, .. },
+                ..
+            }) = event
+                && let Some(effect) = effects.get(target).copied()
+            {
+                targets.insert(target.clone(), effect);
+            }
+        }
+    }
+    targets
 }
 
 /// Recompute all body-derived facts at the HIR/MIR boundary without trusting producer metadata.
@@ -8037,6 +8212,7 @@ fn reset_body_analysis_facts(program: &mut Program) {
     for function in &mut program.fns {
         function.return_borrow = hir::ReturnBorrowSummary::None;
         function.return_region = hir::ReturnRegionSummary::None;
+        function.parallel_transfer = hir::ReturnBorrowSummary::None;
         function.drop_locals.clear();
         function.drop_individual_locals.clear();
         function.drop_individual_exprs.clear();
@@ -8045,6 +8221,13 @@ fn reset_body_analysis_facts(program: &mut Program) {
         // Assignment cleanup flags use interior mutability, so the shared event references can
         // reset them without raw pointers or unsafe aliasing.
         for event in hir_depth::body_events(&function.body) {
+            if let hir_depth::BodyEvent::ExprEnter(Expr {
+                kind: ExprKind::SqliteCallbackDescriptor { effect, .. },
+                ..
+            }) = event
+            {
+                effect.set(FnEffect::Unknown);
+            }
             if let hir_depth::BodyEvent::StmtEnter(hir::Stmt::Assign {
                 drop_old, drop_new, ..
             }) = event
@@ -8101,10 +8284,13 @@ fn body_analysis_facts_equal(expected: &hir::Program, actual: &Program) -> bool 
             || expected.return_borrow != actual.return_borrow
             || expected.return_region != actual.return_region
             || expected.return_cleanup != actual.return_cleanup
+            || expected.parallel_transfer != actual.parallel_transfer
             || expected.drop_locals != actual.drop_locals
             || expected.drop_individual_locals != actual.drop_individual_locals
             || expected.drop_individual_exprs != actual.drop_individual_exprs
             || assignment_facts(expected) != assignment_facts(actual)
+            || sqlite_callback_descriptor_facts(expected)
+                != sqlite_callback_descriptor_facts(actual)
         {
             return false;
         }
@@ -8114,6 +8300,25 @@ fn body_analysis_facts_equal(expected: &hir::Program, actual: &Program) -> bool 
         .iter()
         .zip(&actual.fn_types)
         .all(|(expected, actual)| expected.effect.get() == actual.effect.get())
+}
+
+fn sqlite_callback_descriptor_facts(
+    function: &hir::Fn,
+) -> Vec<(&str, FnEffect)> {
+    hir_depth::body_events(&function.body)
+        .into_iter()
+        .filter_map(|event| match event {
+            hir_depth::BodyEvent::ExprEnter(Expr {
+                kind: ExprKind::SqliteCallbackDescriptor { target, effect },
+                ..
+            }) => Some((target.as_str(), effect.get())),
+            hir_depth::BodyEvent::StmtEnter(_)
+            | hir_depth::BodyEvent::StmtExit(_)
+            | hir_depth::BodyEvent::ExprEnter(_)
+            | hir_depth::BodyEvent::ExprExit { .. }
+            | hir_depth::BodyEvent::MatchArmEnter { .. } => None,
+        })
+        .collect()
 }
 
 fn assignment_facts(function: &hir::Fn) -> Vec<(hir::LocalId, bool, bool)> {
@@ -8216,6 +8421,7 @@ fn struct_path_type(root: Ty, path: &[u32], structs: &[StructDef]) -> Option<Ty>
 }
 
 type CallableTargetSet = std::collections::BTreeMap<u32, hir::ReturnBorrowSummary>;
+type CallableTransferSet = std::collections::BTreeMap<u32, hir::ReturnBorrowSummary>;
 
 #[derive(Clone, PartialEq, Eq)]
 struct CallableProvenance {
@@ -8578,10 +8784,27 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
                 .map(|function| (function.name.clone(), function.return_borrow.clone())),
         )
         .collect();
+    let mut named_parallel: std::collections::HashMap<String, hir::ReturnBorrowSummary> = program
+        .fns
+        .iter()
+        .map(|function| (function.name.clone(), hir::ReturnBorrowSummary::None))
+        .chain(program.imported_fns.iter().map(|function| {
+            let summary = if function.parallel_transfer_params.is_empty() {
+                hir::ReturnBorrowSummary::None
+            } else {
+                hir::ReturnBorrowSummary::Roots {
+                    params: function.parallel_transfer_params.clone(),
+                    captures: Vec::new(),
+                }
+            };
+            (function.name.clone(), summary)
+        }))
+        .collect();
 
-    // Process each function once, then only revisit direct callers of a summary that grew. Call
-    // dependencies are collected by MoveCheck's exhaustive expression walk on the first visit, so
-    // declaration order cannot turn a long forwarding chain into repeated whole-program scans.
+    // Process each function once, then revisit direct callers of a summary that grew. Concrete
+    // indirect callers are revisited when either their target set or a target's parallel-transfer
+    // summary changes. Call dependencies are collected by MoveCheck's exhaustive expression walk
+    // on the first visit, so declaration order cannot lose a later summary refinement.
     let function_count = program.fns.len();
     let mut reverse_callers:
         std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
@@ -8612,9 +8835,20 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
         .collect::<BorrowMutRetentionMap>();
     let mut callable = infer_fn_value_return_provenance(program, &named);
     loop {
+        let mut indirect_parallel_changed = false;
         while let Some(index) = worklist.pop_front() {
             queued[index] = false;
             let function = &program.fns[index];
+            let parallel_targets = callable
+                .target_ids
+                .iter()
+                .filter_map(|(name, target)| {
+                    named_parallel
+                        .get(name)
+                        .cloned()
+                        .map(|summary| (*target, summary))
+                })
+                .collect::<CallableTransferSet>();
 
         let mut dependencies = std::collections::HashSet::new();
         let collect_dependencies =
@@ -8624,6 +8858,7 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
             f: function,
             diags: &mut sink,
             named_return_borrow: &named,
+                named_parallel_transfer: &named_parallel,
             named_param_modes: &named_param_modes,
             named_borrow_mut_retention: &named_borrow_mut_retention,
             summary_dependencies: collect_dependencies,
@@ -8634,6 +8869,7 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
             fn_types: &program.fn_types,
             callable_targets: &callable.targets_by_type,
             callable_target_ids: &callable.target_ids,
+                callable_parallel_targets: &parallel_targets,
             loop_breaks: Vec::new(),
             borrows: BorrowState::default(),
             next_pipeline_snapshot: 0,
@@ -8647,6 +8883,7 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
             loop_iter_drops: Vec::new(),
             arena_depth: 0,
             return_roots: BorrowRoots::new(),
+                parallel_transfer_roots: BorrowRoots::new(),
             borrow_mut_retention: vec![BorrowRoots::new(); function.params.len()],
             non_fallthrough: std::collections::HashSet::new(),
             borrow_fact_cache: std::cell::RefCell::new(None),
@@ -8669,13 +8906,17 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
             };
             let explicit_params = (function.params.len() as u32).saturating_sub(capture_count);
             let summary = summary_from_roots(&result.return_roots, explicit_params);
+            let parallel_summary = summary_from_roots(&result.parallel_transfer_roots, explicit_params);
             let return_changed = named.get(&function.name) != Some(&summary);
+            let parallel_changed = named_parallel.get(&function.name) != Some(&parallel_summary);
             let retention_changed = named_borrow_mut_retention.get(&function.name)
                 != Some(&result.borrow_mut_retention);
-            if !return_changed && !retention_changed {
+            if !return_changed && !retention_changed && !parallel_changed {
                 continue;
             }
             named.insert(function.name.clone(), summary);
+            indirect_parallel_changed |= parallel_changed;
+            named_parallel.insert(function.name.clone(), parallel_summary);
             named_borrow_mut_retention
                 .insert(function.name.clone(), result.borrow_mut_retention);
             if let Some(callers) = reverse_callers.get(&function.name) {
@@ -8689,7 +8930,7 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
         }
 
         let next_callable = infer_fn_value_return_provenance(program, &named);
-        if next_callable == callable {
+        if next_callable == callable && !indirect_parallel_changed {
             break;
         }
         callable = next_callable;
@@ -8717,6 +8958,10 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
             .unwrap_or(hir::ReturnBorrowSummary::None);
         function.return_region = borrow_to_region_summary(&summary);
         function.return_borrow = summary;
+        function.parallel_transfer = named_parallel
+            .get(&function.name)
+            .cloned()
+            .unwrap_or(hir::ReturnBorrowSummary::None);
     }
     named_borrow_mut_retention
 }
@@ -12300,7 +12545,8 @@ impl EffectScan<'_> {
             | ExprKind::Field { .. } | ExprKind::SoaColumn { .. } | ExprKind::ArrayGroupAgg { .. }
             | ExprKind::ArrayGroupAggMulti { .. }
             | ExprKind::ArrayDictEncode { .. } | ExprKind::IndexField { .. }
-            | ExprKind::RawNull => {}
+            | ExprKind::RawNull
+            | ExprKind::SqliteCallbackDescriptor { .. } => {}
         }
         true
     }
@@ -15291,7 +15537,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::CryptoArgon2 { .. }
             | ExprKind::ArrayGroupAgg { .. }
             | ExprKind::ArrayGroupAggMulti { .. }
-            | ExprKind::RawNull => values.push(Region::Static),
+            | ExprKind::RawNull
+            | ExprKind::SqliteCallbackDescriptor { .. } => values.push(Region::Static),
                 },
                 Work::Shorter(count, initial) => {
                     let start = values
@@ -15673,7 +15920,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::CryptoHkdf { .. }
             | ExprKind::CryptoAead { .. }
             | ExprKind::CryptoArgon2 { .. }
-            | ExprKind::RawNull => {}
+            | ExprKind::RawNull
+            | ExprKind::SqliteCallbackDescriptor { .. } => {}
             }
         }
         false
@@ -17482,7 +17730,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ArrayGroupAggMulti { .. }
             | ExprKind::ArrayDictEncode { .. }
             | ExprKind::IndexField { .. }
-            | ExprKind::RawNull => {}
+            | ExprKind::RawNull
+            | ExprKind::SqliteCallbackDescriptor { .. } => {}
         }
     }
 }
@@ -17767,6 +18016,8 @@ struct MoveCheck<'a> {
     /// Settled same-program/imported return summaries for mapping call results back to their exact
     /// caller-side inputs. The map is recomputed to a fixpoint before the diagnostic pass.
     named_return_borrow: &'a std::collections::HashMap<String, hir::ReturnBorrowSummary>,
+    /// Same-program/imported roots whose contained views the callee may transfer to a worker.
+    named_parallel_transfer: &'a std::collections::HashMap<String, hir::ReturnBorrowSummary>,
     /// Checked parameter modes for direct callees. Borrowed arguments are read from caller
     /// storage and therefore neither transfer ownership nor contribute their value facts as if
     /// they were by-value copies.
@@ -17793,6 +18044,8 @@ struct MoveCheck<'a> {
     callable_targets: &'a [CallableTargetSet],
     /// Stable per-program target ordinals used in closure-environment projection facts.
     callable_target_ids: &'a std::collections::HashMap<String, u32>,
+    /// Parallel-transfer summaries keyed by the same stable target ordinals.
+    callable_parallel_targets: &'a CallableTransferSet,
     /// Stack of enclosing `loop`s (innermost last). Each entry collects the moved-set snapshot at
     /// every `break` bound to that loop; their union is the move state after the loop (code past a
     /// loop runs only after a `break`, so a local moved on *any* break path is possibly-moved).
@@ -17844,6 +18097,8 @@ struct MoveCheck<'a> {
     arena_depth: u32,
     /// Symbolic parameter roots observed on explicit, implicit, and `?` return edges.
     return_roots: BorrowRoots,
+    /// Symbolic parameter roots observed at worker-transfer sinks, including transitive callees.
+    parallel_transfer_roots: BorrowRoots,
     /// Union of the exact parameter roots stored in every mutable destination at each returning
     /// function edge. Entries are indexed by this function's parameter positions.
     borrow_mut_retention: BorrowMutRetentionSummary,
@@ -17978,6 +18233,7 @@ fn borrow_mut_source_indices(
 struct MoveCheckResult {
     return_roots: BorrowRoots,
     borrow_mut_retention: BorrowMutRetentionSummary,
+    parallel_transfer_roots: BorrowRoots,
 }
 
 impl BorrowRoot {
@@ -18459,6 +18715,7 @@ impl<'a> MoveCheck<'a> {
         MoveCheckResult {
             return_roots: self.return_roots,
             borrow_mut_retention: self.borrow_mut_retention,
+            parallel_transfer_roots: self.parallel_transfer_roots,
         }
     }
 
@@ -19597,6 +19854,131 @@ impl<'a> MoveCheck<'a> {
         fact
     }
 
+    fn parallel_argument_fact(&self, argument: &Expr, mode: Option<ast::ParamMode>) -> BorrowFact {
+        if matches!(
+            mode,
+            Some(ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
+        ) {
+            BorrowFact::from_direct(self.storage_roots(argument))
+        } else {
+            self.borrow_fact(argument)
+        }
+    }
+
+    fn add_direct_parallel_transfer(&mut self, target: &str, arguments: &[Expr]) {
+        let summary = self.named_parallel_transfer.get(target);
+        let modes = self.named_param_modes.get(target);
+        let Some(hir::ReturnBorrowSummary::Roots { params, .. }) = summary else {
+            if summary.is_none() {
+                for argument in arguments {
+                    if ty_may_borrow(
+                        argument.ty,
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    ) {
+                        self.parallel_transfer_roots
+                            .extend(self.borrow_sources(argument));
+                    }
+                }
+            }
+            return;
+        };
+        for index in params.iter().copied() {
+            if let Some(argument) = arguments.get(index as usize) {
+                let mode = modes.and_then(|modes| modes.get(index as usize)).copied();
+                self.parallel_transfer_roots
+                    .extend(self.parallel_argument_fact(argument, mode).flatten());
+            }
+        }
+    }
+
+    fn indirect_parallel_transfer_fact_from_facts(
+        &self,
+        callee: &Expr,
+        arguments: &[(Ty, BorrowFact)],
+    ) -> BorrowFact {
+        let unresolved = || {
+            let mut fact = self.borrow_fact(callee);
+            for (ty, argument) in arguments {
+                if ty_may_borrow(
+                    *ty,
+                    self.structs,
+                    self.tuples,
+                    self.enums,
+                    self.tagged_types,
+                ) {
+                    fact = fact.join(argument);
+                }
+            }
+            fact
+        };
+        let ty = match &callee.kind {
+            ExprKind::Local(local) => self
+                .f
+                .locals
+                .get(*local as usize)
+                .map(|local| local.ty)
+                .unwrap_or(callee.ty),
+            _ => callee.ty,
+        };
+        let Ty::Fn(id) = ty else {
+            return unresolved();
+        };
+        let Some(targets) = self.callable_targets.get(id as usize) else {
+            return unresolved();
+        };
+        if targets.is_empty() {
+            return unresolved();
+        }
+        let environment = self.borrow_fact(callee);
+        let mut fact = BorrowFact::default();
+        for target in targets.keys().copied() {
+            let Some(summary) = self.callable_parallel_targets.get(&target) else {
+                fact = fact.join(&unresolved());
+                continue;
+            };
+            let hir::ReturnBorrowSummary::Roots { params, captures } = summary else {
+                continue;
+            };
+            for index in params.iter().copied() {
+                if let Some((_, argument)) = arguments.get(index as usize) {
+                    fact = fact.join(argument);
+                }
+            }
+            let selected_environment =
+                environment.project_exact(BorrowProjection::ClosureTarget(target));
+            for capture in captures.iter().copied() {
+                fact = fact.join(
+                    &selected_environment.project_exact(BorrowProjection::ClosureCapture(capture)),
+                );
+            }
+        }
+        fact
+    }
+
+    fn add_indirect_parallel_transfer(&mut self, callee: &Expr, arguments: &[Expr]) {
+        let signature = match callee.ty {
+            Ty::Fn(id) => self.fn_types.get(id as usize),
+            _ => None,
+        };
+        let facts = arguments
+            .iter()
+            .enumerate()
+            .map(|(index, argument)| {
+                let mode = signature
+                    .and_then(|signature| signature.params.get(index))
+                    .map(|(mode, _)| *mode);
+                (argument.ty, self.parallel_argument_fact(argument, mode))
+            })
+            .collect::<Vec<_>>();
+        let roots = self
+            .indirect_parallel_transfer_fact_from_facts(callee, &facts)
+            .flatten();
+        self.parallel_transfer_roots.extend(roots);
+    }
+
     fn borrow_fact_inner(&self, e: &Expr) -> BorrowFact {
         match &e.kind {
             ExprKind::Local(id) => self.local_borrow_fact(*id),
@@ -20355,7 +20737,8 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::RegexFindAll { .. } | ExprKind::RegexSplit { .. } | ExprKind::RegexReplace { .. }
             | ExprKind::RegexCaptures { .. } | ExprKind::RegexGroupCount { .. }
             | ExprKind::RegexGroupIndex { .. } | ExprKind::CapturesGroup { .. }
-            | ExprKind::RawNull => {
+            | ExprKind::RawNull
+            | ExprKind::SqliteCallbackDescriptor { .. } => {
                 debug_assert!(
                     !ty_may_borrow(e.ty, self.structs, self.tuples, self.enums, self.tagged_types),
                     "borrow_sources_inner: {:?} is classified as never borrowing, but its result type \
@@ -21570,6 +21953,7 @@ impl<'a> MoveCheck<'a> {
         match &expression.kind {
             ExprKind::Call { func, args, .. } => {
                 self.apply_direct_borrow_mut_call_effects(func, args, moved);
+                self.add_direct_parallel_transfer(func, args);
             }
             ExprKind::CallFnValue { callee, args } => {
                 let modes = match callee.ty {
@@ -21585,6 +21969,26 @@ impl<'a> MoveCheck<'a> {
                 if let Some(modes) = modes {
                     self.apply_borrow_mut_call_effects(args, &modes, None, moved);
                 }
+                self.add_indirect_parallel_transfer(callee, args);
+            }
+            ExprKind::Spawn { closure, .. } => {
+                self.parallel_transfer_roots
+                    .extend(self.borrow_sources(closure));
+            }
+            ExprKind::ResultMapErr { result, f } => {
+                let result_fact = self.normalize_borrow_fact(result.ty, self.borrow_fact(result));
+                let error_ty = match expand_tagged_ty(result.ty, self.tagged_types) {
+                    Ty::Result(_, error) => scalar_to_ty(error),
+                    _ => result.ty,
+                };
+                let arguments = [(
+                    error_ty,
+                    result_fact.project_exact(BorrowProjection::ResultErr),
+                )];
+                let roots = self
+                    .indirect_parallel_transfer_fact_from_facts(f, &arguments)
+                    .flatten();
+                self.parallel_transfer_roots.extend(roots);
             }
             ExprKind::ReaderReadLine { buffer, .. } => {
                 self.invalidate_storage(buffer);
@@ -21617,9 +22021,10 @@ impl<'a> MoveCheck<'a> {
                 snapshots_source: bool,
                 snapshot: Option<Option<usize>>,
             },
-            DirectBorrowMutCall {
+            DirectCall {
                 function: &'e str,
                 args: &'e [Expr],
+                borrow_mut: bool,
             },
             IfAfterCondition {
                 then: &'e Block,
@@ -22560,13 +22965,10 @@ impl<'a> MoveCheck<'a> {
                         }
                         let consumes = func != "print"
                             && !matches!(mode, ast::ParamMode::Borrow | ast::ParamMode::BorrowMut);
-                        let post = if mode == ast::ParamMode::BorrowMut {
-                            Post::DirectBorrowMutCall {
-                                function: func,
-                                args,
-                            }
-                        } else {
-                            Post::None
+                        let post = Post::DirectCall {
+                            function: func,
+                            args,
+                            borrow_mut: mode == ast::ParamMode::BorrowMut,
                         };
                         (&args[0], false, consumes, consumes, post)
                     }
@@ -22926,7 +23328,7 @@ impl<'a> MoveCheck<'a> {
                     self.loop_value_facts.remove(&wrapper.span);
                     None
                 }
-                Post::Pipeline { snapshot, .. } => {
+                Post::Pipeline { source, snapshot, .. } => {
                     if let Some(snapshot) = snapshot {
                         self.finish_pipeline_source_snapshot(
                             snapshot,
@@ -22934,11 +23336,23 @@ impl<'a> MoveCheck<'a> {
                             falls_through,
                         );
                     }
+                    if falls_through && let ExprKind::ArrayParMap { stages, .. } = &wrapper.kind {
+                        self.parallel_transfer_roots.extend(self.pipeline_source_roots(source));
+                        for capture in stage_capture_exprs(stages) {
+                            self.parallel_transfer_roots.extend(self.borrow_sources(capture));
+                        }
+                        for capture in node_captures(&wrapper.kind) {
+                            self.parallel_transfer_roots.extend(self.borrow_sources(capture));
+                        }
+                    }
                     None
                 }
-                Post::DirectBorrowMutCall { function, args } => {
+                Post::DirectCall { function, args, borrow_mut } => {
                     if falls_through {
-                        self.apply_direct_borrow_mut_call_effects(function, args, moved);
+                        if borrow_mut {
+                            self.apply_direct_borrow_mut_call_effects(function, args, moved);
+                        }
+                        self.add_direct_parallel_transfer(function, args);
                     }
                     None
                 }
@@ -24002,6 +24416,9 @@ impl<'a> MoveCheck<'a> {
                         );
                     move_expr!(self, a, moved, consuming, consuming);
                 }
+                if !self.collecting_move_children {
+                    self.add_direct_parallel_transfer(func, args);
+                }
             }
             // A fn value is Copy (a pointer); an indirect call's callee + args are reads.
             ExprKind::FnValue(_) => {}
@@ -24037,6 +24454,9 @@ impl<'a> MoveCheck<'a> {
                         Some(ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
                     );
                     move_expr!(self, a, moved, consuming, consuming);
+                }
+                if !self.collecting_move_children {
+                    self.add_indirect_parallel_transfer(callee, args);
                 }
             }
             ExprKind::StructLit { fields, .. } => {
@@ -24190,6 +24610,19 @@ impl<'a> MoveCheck<'a> {
                 }
                 for capture in node_captures(&e.kind) {
                     move_expr!(self, capture, moved, false, false);
+                }
+                if !self.collecting_move_children && matches!(e.kind, ExprKind::ArrayParMap { .. })
+                {
+                    self.parallel_transfer_roots
+                        .extend(self.pipeline_source_roots(source));
+                    for capture in stage_capture_exprs(stages) {
+                        self.parallel_transfer_roots
+                            .extend(self.borrow_sources(capture));
+                    }
+                    for capture in node_captures(&e.kind) {
+                        self.parallel_transfer_roots
+                            .extend(self.borrow_sources(capture));
+                    }
                 }
             }
             // `recv[index]` / `recv[index].field` borrow the receiver (read an element) and read
@@ -24448,7 +24881,13 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, ptr, moved, false, false);
                 move_expr!(self, len, moved, false, false);
             }
-            ExprKind::Spawn { closure, .. } => move_expr!(self, closure, moved, false, false),
+            ExprKind::Spawn { closure, .. } => {
+                move_expr!(self, closure, moved, false, false);
+                if !self.collecting_move_children {
+                    self.parallel_transfer_roots
+                        .extend(self.borrow_sources(closure));
+                }
+            }
             // A sum-type construction moves each payload into the variant, exactly like a struct
             // literal — an owned `array<Struct>` payload (J2) is consumed here (and its source slot
             // nulled in MIR `null_moved_source`), a scalar / `str` / plain-struct payload is Copy so
@@ -24569,6 +25008,22 @@ impl<'a> MoveCheck<'a> {
                 // `map_err` unwraps/consumes the result (its Ok payload may be an owned Move type).
                 move_expr!(self, result, moved, true, true);
                 move_expr!(self, f, moved, false, false);
+                if !self.collecting_move_children {
+                    let result_fact =
+                        self.normalize_borrow_fact(result.ty, self.borrow_fact(result));
+                    let error_ty = match expand_tagged_ty(result.ty, self.tagged_types) {
+                        Ty::Result(_, error) => scalar_to_ty(error),
+                        _ => result.ty,
+                    };
+                    let arguments = [(
+                        error_ty,
+                        result_fact.project_exact(BorrowProjection::ResultErr),
+                    )];
+                    let roots = self
+                        .indirect_parallel_transfer_fact_from_facts(f, &arguments)
+                        .flatten();
+                    self.parallel_transfer_roots.extend(roots);
+                }
             }
             // `t.get()` moves the result out of the task when `R` is an owned/move type, so it
             // consumes the task (a second `get()` would double-free the buffer).
@@ -25036,7 +25491,8 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ConstArray { .. }
             | ExprKind::Bool(_)
             | ExprKind::OptionNone
-            | ExprKind::RawNull => {}
+            | ExprKind::RawNull
+            | ExprKind::SqliteCallbackDescriptor { .. } => {}
         }
         true
     }
@@ -26039,6 +26495,7 @@ impl<'a, 't> Checker<'a, 't> {
             return_borrow: sig.return_borrow.clone(),
             return_region: sig.return_region.clone(),
             return_cleanup: hir::ReturnCleanupAbi::None,
+            parallel_transfer: hir::ReturnBorrowSummary::None,
             locals,
             body,
             span: f.span,
@@ -28081,6 +28538,16 @@ impl<'a, 't> Checker<'a, 't> {
     fn check_struct_lit(&mut self, name: &ast::Path, fields: &[ast::FieldInit], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let Some(canonical) = self.canonical_type(name, name.span) else { return err };
+        if canonical == SQLITE_FUNCTION_ARGS_TYPE {
+            self.diags.error(
+                "SQLite callback arguments can only be formed by a callback invocation".to_string(),
+                span,
+            );
+            for field in fields {
+                let _ = self.check_expr(&field.value, None);
+            }
+            return err;
+        }
         // A generic struct literal (`Pair { a: 1, b: 2 }`): infer the type arguments from the field
         // values, then monomorphize. (Type arguments are not written at the literal — same as calls.)
         if let Some(tmpl) = self.struct_templates.get(&canonical).cloned() {
@@ -29048,6 +29515,9 @@ impl<'a, 't> Checker<'a, 't> {
     /// signature lookup, generic-call dispatch, the `out` no-alias check, argument checking, and the
     /// `Call` node. Reused by a bare call (`check_call`) and a cross-module `mod.fn(...)` call.
     fn check_named_call(&mut self, name: String, display: String, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+        if name == "pkg.db.sqlite$function" {
+            return self.check_sqlite_callback_descriptor(args, expected, span);
+        }
         let Some(sig) = self.sigs.get(&name) else {
             self.diags.error(format!("undefined function: '{name}'"), span);
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
@@ -29187,6 +29657,144 @@ impl<'a, 't> Checker<'a, 't> {
             }
         }
         Expr { kind: ExprKind::Call { func: name, args: checked, type_args: Vec::new() }, ty: ret, span }
+    }
+
+    /// Compile `pkg.db.sqlite.function(target)` without forming an ordinary function value.
+    fn check_sqlite_callback_descriptor(
+        &mut self,
+        args: &[ast::Expr],
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Expr {
+        let err = || Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let [argument] = args else {
+            self.diags.error(
+                format!("'pkg.db.sqlite.function' expects 1 argument(s), got {}", args.len()),
+                span,
+            );
+            return err();
+        };
+        let Some(&args_id) = self.struct_ids.get(SQLITE_FUNCTION_ARGS_TYPE) else {
+            self.diags.error("SQLite callback argument type is unavailable".to_string(), span);
+            return err();
+        };
+        let Some(&value_id) = self.enum_ids.get(DB_VALUE_TYPE) else {
+            self.diags.error("database callback value type is unavailable".to_string(), span);
+            return err();
+        };
+        let Some(&descriptor_id) = self.struct_ids.get(SQLITE_SCALAR_FUNCTION_TYPE) else {
+            self.diags.error("SQLite callback descriptor type is unavailable".to_string(), span);
+            return err();
+        };
+        let callback_param = Ty::Struct(args_id);
+        let callback_ret = Ty::Result(Scalar::Enum(value_id), Scalar::Str);
+
+        let (target, lifted_valid) = match &argument.kind {
+            ast::ExprKind::Path(path) => {
+                let segments = &path.segments;
+                let Some(last) = segments.last() else {
+                    self.diags.error("SQLite callback target is empty".to_string(), argument.span);
+                    return err();
+                };
+                if segments.len() == 1 {
+                    (self.resolve_local_fn(&last.name), false)
+                } else {
+                    let module = segments[..segments.len() - 1]
+                        .iter()
+                        .map(|segment| segment.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    match self.resolve_qualified_fn(&module, &last.name, argument.span) {
+                        Ok(target) => (target, false),
+                        Err(()) => return err(),
+                    }
+                }
+            }
+            ast::ExprKind::FieldAccess { recv, field }
+                if !leftmost_segment(recv).is_some_and(|leftmost| self.name_in_scope(leftmost)) =>
+            {
+                let Some(module) = flatten_module_path(recv) else {
+                    self.diags.error(
+                        "SQLite callbacks require one exact named function or noncapturing function literal"
+                            .to_string(),
+                        argument.span,
+                    );
+                    return err();
+                };
+                match self.resolve_qualified_fn(&module, &field.name, argument.span) {
+                    Ok(Some(target)) => (Some(target), false),
+                    Ok(None) => {
+                        self.diags.error(
+                            format!("module '{module}' is not imported here (add `import {module}`)"),
+                            argument.span,
+                        );
+                        return err();
+                    }
+                    Err(()) => return err(),
+                }
+            }
+            ast::ExprKind::Lambda { params, body } => {
+                let Some((target, ret, captures)) = self.lift_lambda(
+                    params,
+                    body,
+                    &[callback_param],
+                    Some(callback_ret),
+                    argument.span,
+                ) else {
+                    return err();
+                };
+                if !captures.is_empty() {
+                    self.diags.error(
+                        "SQLite callbacks cannot capture values; pass a named or noncapturing function"
+                            .to_string(),
+                        argument.span,
+                    );
+                    return err();
+                }
+                if self.finalize(ret) != callback_ret {
+                    return err();
+                }
+                (Some(target), true)
+            }
+            _ => {
+                self.diags.error(
+                    "SQLite callbacks require one exact named function or noncapturing function literal"
+                        .to_string(),
+                    argument.span,
+                );
+                return err();
+            }
+        };
+        let Some(target) = target else {
+            self.diags.error("SQLite callback target does not resolve to a function".to_string(), argument.span);
+            return err();
+        };
+        let valid = lifted_valid
+            || self.sigs.get(&target).is_some_and(|signature| {
+                !signature.is_extern
+                    && signature.type_params.is_empty()
+                    && signature.params == [callback_param]
+                    && signature.param_modes == [ast::ParamMode::ByValue]
+                    && signature.ret == callback_ret
+            });
+        if !valid {
+            self.diags.error(
+                "SQLite scalar callbacks must have exact signature `fn(pkg.db.sqlite.function_args) -> Result<pkg.db.value, str>`"
+                    .to_string(),
+                argument.span,
+            );
+            return err();
+        }
+        let ty = Ty::Struct(descriptor_id);
+        self.constrain(ty, expected, span);
+        Expr {
+            kind: ExprKind::SqliteCallbackDescriptor {
+                target,
+                effect: std::cell::Cell::new(FnEffect::Unknown),
+            },
+            ty,
+            span,
+        }
     }
 
     /// Check a call to a **generic** function `fn f<T, …>(…)`. Type arguments are inferred — never
@@ -30988,6 +31596,50 @@ impl<'a, 't> Checker<'a, 't> {
                 span,
             );
             return err;
+        }
+        if method == "sqlite_callback_data" {
+            let [callback_ast] = args else {
+                self.diags.error(
+                    format!(
+                        "static descriptor operation 'sqlite_callback_data' expects 1 argument(s), got {}",
+                        args.len()
+                    ),
+                    span,
+                );
+                return err;
+            };
+            let callback = self.check_expr(callback_ast, None);
+            let Ty::Struct(struct_id) = callback.ty else {
+                self.diags.error(
+                    "SQLite callback data requires a scalar_function descriptor".to_owned(),
+                    callback_ast.span,
+                );
+                return err;
+            };
+            if !self
+                .structs
+                .get(struct_id as usize)
+                .is_some_and(sqlite_callback_descriptor_struct_is_valid)
+            {
+                self.diags.error(
+                    "SQLite callback data requires a scalar_function descriptor".to_owned(),
+                    callback_ast.span,
+                );
+                return err;
+            }
+            let ExprKind::Local(root) = callback.kind else {
+                self.diags.error(
+                    "SQLite callback data requires a bound scalar_function value".to_owned(),
+                    callback_ast.span,
+                );
+                return err;
+            };
+            self.constrain(Ty::Raw, expected, span);
+            return Expr {
+                kind: ExprKind::Field { root, path: vec![0] },
+                ty: Ty::Raw,
+                span,
+            };
         }
         if method == "drop_batch_payload" {
             let [plan_ast, payload_ast] = args else {
@@ -33887,6 +34539,7 @@ impl<'a, 't> Checker<'a, 't> {
             return_borrow: hir::ReturnBorrowSummary::None,
             return_region: hir::ReturnRegionSummary::None,
             return_cleanup: hir::ReturnCleanupAbi::None,
+            parallel_transfer: hir::ReturnBorrowSummary::None,
             locals,
             body: body_fin,
             span,
@@ -42677,7 +43330,8 @@ impl<'a, 't> Checker<'a, 't> {
             | ExprKind::ArrayGroupAggMulti { .. }
             | ExprKind::ArrayDictEncode { .. }
             | ExprKind::IndexField { .. }
-            | ExprKind::RawNull => {}
+            | ExprKind::RawNull
+            | ExprKind::SqliteCallbackDescriptor { .. } => {}
         }
         if let Some(t) = recomputed {
             e.ty = t;
@@ -47232,11 +47886,13 @@ fn main() -> i32 = 0
         let named_borrow_mut_retention = std::collections::HashMap::new();
         let callable_targets = vec![CallableTargetSet::new(); program.fn_types.len()];
         let callable_target_ids = std::collections::HashMap::new();
+        let parallel_targets = CallableTransferSet::new();
         let mut sink = Diagnostics::new();
         let mut checker = MoveCheck {
             f: function,
             diags: &mut sink,
             named_return_borrow: &named,
+            named_parallel_transfer: &named,
             named_param_modes: &named_modes,
             named_borrow_mut_retention: &named_borrow_mut_retention,
             summary_dependencies: None,
@@ -47247,6 +47903,7 @@ fn main() -> i32 = 0
             fn_types: &program.fn_types,
             callable_targets: &callable_targets,
             callable_target_ids: &callable_target_ids,
+            callable_parallel_targets: &parallel_targets,
             loop_breaks: Vec::new(),
             borrows: BorrowState::default(),
             next_pipeline_snapshot: 0,
@@ -47260,6 +47917,7 @@ fn main() -> i32 = 0
             loop_iter_drops: Vec::new(),
             arena_depth: 0,
             return_roots: BorrowRoots::new(),
+            parallel_transfer_roots: BorrowRoots::new(),
             borrow_mut_retention: vec![BorrowRoots::new(); function.params.len()],
             non_fallthrough: std::collections::HashSet::new(),
             borrow_fact_cache: std::cell::RefCell::new(None),
@@ -47556,11 +48214,13 @@ fn main() -> i32 = 0
         let named_borrow_mut_retention = std::collections::HashMap::new();
         let callable_targets = vec![CallableTargetSet::new(); program.fn_types.len()];
         let callable_target_ids = std::collections::HashMap::new();
+        let parallel_targets = CallableTransferSet::new();
         let mut sink = Diagnostics::new();
         let mut checker = MoveCheck {
             f: function,
             diags: &mut sink,
             named_return_borrow: &named,
+            named_parallel_transfer: &named,
             named_param_modes: &named_modes,
             named_borrow_mut_retention: &named_borrow_mut_retention,
             summary_dependencies: None,
@@ -47571,6 +48231,7 @@ fn main() -> i32 = 0
             fn_types: &program.fn_types,
             callable_targets: &callable_targets,
             callable_target_ids: &callable_target_ids,
+            callable_parallel_targets: &parallel_targets,
             loop_breaks: Vec::new(),
             borrows: BorrowState::default(),
             next_pipeline_snapshot: 0,
@@ -47584,6 +48245,7 @@ fn main() -> i32 = 0
             loop_iter_drops: Vec::new(),
             arena_depth: 0,
             return_roots: BorrowRoots::new(),
+            parallel_transfer_roots: BorrowRoots::new(),
             borrow_mut_retention: vec![BorrowRoots::new(); function.params.len()],
             non_fallthrough: std::collections::HashSet::new(),
             borrow_fact_cache: std::cell::RefCell::new(None),
@@ -47815,9 +48477,9 @@ fn main() -> i32 {
     }
 
     #[test]
-    fn imported_effect_facts_are_normalized_and_stripped() {
+    fn imported_effect_and_absent_transfer_facts_are_normalized() {
         let mut diagnostics = Diagnostics::new();
-        let lib_source = "module lib\npub fn read(value: i64) -> i64 = value\n";
+        let lib_source = "module lib\npub fn read(borrow value: i64) -> i64 = value\n";
         let main_source = "module main\nimport lib\nfn main() -> i32 = 0\n";
         let lib_tokens = tokenize(1, lib_source, &mut diagnostics);
         let lib = parse_file(lib_tokens, &mut diagnostics);
@@ -47871,6 +48533,11 @@ fn main() -> i32 {
                 .find(|function| function.name == "lib$read")
                 .expect("imported declaration");
             assert_eq!(imported.effect, expected, "provided effect: {provided:?}");
+            assert_eq!(
+                imported.parallel_transfer_params,
+                [0],
+                "an absent transfer fact must conservatively select borrowed scalar storage",
+            );
         }
     }
 
