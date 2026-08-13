@@ -25,8 +25,8 @@ jobs:
   db-postgres:
     name: PostgreSQL integration (required)
     runs-on: ubuntu-24.04
-    # Keep the server version explicit: this is the non-skippable cross-rail gate for every
-    # pkg.db owner suite through D14.
+    # Keep both server images explicit. The ordinary service remains the no-extension
+    # compatibility floor; VC1's isolated service proves the existing SQL-native pgvector path.
     services:
       postgres:
         image: postgres:16.4
@@ -41,10 +41,25 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
+      pgvector:
+        image: pgvector/pgvector:0.8.6-pg16-bookworm
+        env:
+          POSTGRES_DB: align_vector
+          POSTGRES_USER: align
+          POSTGRES_PASSWORD: align
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U align -d align_vector"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     env:
       RUST_VERSION: 1.96.0
       ALIGN_DB_POSTGRES_REQUIRED: "1"
       ALIGN_DB_POSTGRES_URL: postgresql://align:align@127.0.0.1:5432/align
+      ALIGN_DB_PGVECTOR_REQUIRED: "1"
+      ALIGN_DB_PGVECTOR_URL: postgresql://align:align@127.0.0.1:5433/align_vector
       ALIGN_APT_PACKAGES: >-
         llvm-22-dev clang-22 libclang-rt-22-dev lld-22
         libpq-dev postgresql-client-17
@@ -129,6 +144,11 @@ jobs:
           psql --version
           scripts/check-libpq-version.sh
           psql "$ALIGN_DB_POSTGRES_URL" -Atqc 'SHOW server_version'
+          psql "$ALIGN_DB_PGVECTOR_URL" -v ON_ERROR_STOP=1 -c 'CREATE EXTENSION vector'
+          vector_version="$(psql "$ALIGN_DB_PGVECTOR_URL" -Atqc \
+            "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'vector'")"
+          test "$vector_version" = "0.8.6"
+          echo "pgvector $vector_version"
 
       - name: Required-mode configuration self-test
         shell: bash
@@ -140,6 +160,17 @@ jobs:
           set -e
           if [ "$status" -eq 0 ]; then
             echo "required PostgreSQL mode accepted a missing URL" >&2
+            exit 1
+          fi
+
+          set +e
+          env -u ALIGN_DB_PGVECTOR_URL scripts/cargo.sh test --locked \
+            -p align_driver --test pkg_db_vc1 \
+            pgvector_required_mode_requires_configuration -- --exact
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "required pgvector mode accepted a missing URL" >&2
             exit 1
           fi
 
@@ -207,6 +238,11 @@ jobs:
         shell: bash
         run: |
           scripts/cargo.sh test --locked -p align_driver --test pkg_db_callbacks -- --nocapture
+
+      - name: Required vector compatibility owner
+        shell: bash
+        run: |
+          scripts/cargo.sh test --locked -p align_driver --test pkg_db_vc1 -- --nocapture
 
       - name: Save Cargo caches
         if: github.ref == 'refs/heads/main'

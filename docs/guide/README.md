@@ -43,3 +43,4 @@ Prefer learning by doing? **[The Little Aligner](../little-aligner/README.md)** 
 
 - [23 — Packages: vendored source, pkg.web, pkg.jwt, and pkg.db](23-packages.md)
 - [24 — Databases: pkg.db in practice](24-database.md)
+- [25 — Vector search through pkg.db](25-vector-search.md)

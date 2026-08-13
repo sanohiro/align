@@ -4486,6 +4486,10 @@ public/safety strategy変更なのでfresh design reviewを要求する。
 
 ### VC1 — vector-search compatibility checkpoint（public APIなし）
 
+**Status:** 完了。required ownerは通常のno-extension PostgreSQL 16.4 serviceと並べてpgvector
+0.8.6をpinし、英日guideは検証済みvec1 0.7 probeと列挙した全vendor boundaryを記録する。
+package/compiler/runtime surfaceは変更されない。
+
 VC1はD14後に実行し、public package surface、compiler/runtime ABI、Query descriptor、
 checked-artifact format、release gateを変更しない。`db.vector`、`db.embedding`、
 `db.nearest`、common distance/index enum、SQL rewriter、embedding generation、extension loader、
