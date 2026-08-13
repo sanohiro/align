@@ -5964,7 +5964,13 @@ parallel-transfer sink, whether directly, through a same-unit/imported helper, t
 helper view, or through a concrete/unresolved function value. The callback may still use sequential
 pipelines and may return an argument-backed Text/Bytes result for the trampoline's synchronous
 transient copy. Descriptor semantic identity includes the target's parallel-transfer fact alongside
-its other provenance facts.
+its other provenance facts. The compiler emits exactly one diagnostic at the descriptor expression,
+`SQLite callback invocation views cannot be transferred to parallel workers`, regardless of how
+many transfer sinks selected root 0. Descriptor finalization checks this transfer fact before the
+target effect, so when the same descriptor also has an unknown target effect this diagnostic is
+emitted first, followed by the existing
+`SQLite callback effect could not be proved Pure or Impure`; descriptor expressions retain source
+order.
 
 The scalar input/output mapping is exact:
 
@@ -6053,14 +6059,15 @@ then returns one non-null allocation with malloc alignment and this exact layout
 
 ```text
 offset          width  meaning
-0               i32    sqlite3_errcode(database)
+0               i32    sqlite3_errcode(database) & 0xff
 4               i32    sqlite3_extended_errcode(database)
 8               i64    message byte length, nonnegative and excluding terminator
 16              len    exact sqlite3_errmsg(database) bytes
 16 + len        u8     zero terminator
 ```
 
-The helper reads primary, extended, and message in that order immediately after native failure,
+The helper reads `sqlite3_errcode`, masks it with `0xff` to the primary result code, then reads the
+extended code and message in that order immediately after native failure,
 computes the message length before allocation, checks `len <= i64::MAX - 17`, allocates exactly
 `17 + len` bytes through `align_rt_alloc`, fills the complete header/message/terminator, and only
 then returns and ends the name scratch. A null native message becomes length zero. The runtime
@@ -6109,11 +6116,12 @@ Validation order is exact and stops at the first failure:
 4. validate arity, then the option slice in source order;
 5. authenticate the complete descriptor and require scalar-function kind;
 6. require Pure for `Deterministic`;
-7. form and terminate the call-local native-name stack scratch, load the guarded trampoline, and make exactly
-   one native registration/removal call;
-8. copy any native error before freeing the name; on any native failure poison/close the physical
-   connection and return that first `NativeError` because SQLite does not promise the prior
-   registration state remains usable;
+7. invoke the guarded v2 helper, which validates its private inputs, forms and terminates its local
+   native-name stack scratch, makes exactly one native registration/removal call, snapshots any
+   failure completely while that scratch remains live, and ends the scratch before returning;
+8. on a non-null snapshot, poison/close the physical connection, consume and free that owned
+   snapshot exactly once, and return its first `NativeError` because SQLite does not promise the
+   prior registration state remains usable;
 9. re-prove native autocommit and wrapper idle state before success; poison/close on contradiction.
 
 Duplicate `Deterministic` is the first option error. Removal has no descriptor/effect phase. All

@@ -4264,6 +4264,10 @@ setとcompareする。このvalidation-only fieldはgate後stripされ、MIR exi
 callback root 0がdirect/same-unit/imported/helper-return/concrete-or-unresolved fn-valueのいずれからでもparallel
 sinkへ達すればdescriptorをHIR publication前にrejectする。sequential pipelineとargument-backed Text/Bytesの
 synchronous return copyは許可する。descriptor semantic identityにもtarget parallel-transfer factを含める。
+選択したsink数にかかわらずdescriptor expression spanへexactly one
+`SQLite callback invocation views cannot be transferred to parallel workers`をemitする。descriptor finalizationは
+transfer factをtarget effectより先にcheckするため、same descriptorのeffectもUnknownならこのdiagnostic、次に既存
+`SQLite callback effect could not be proved Pure or Impure`の順でemitし、descriptor間はsource orderを保つ。
 
 scalar input/output mappingはexact:
 
@@ -4333,14 +4337,15 @@ liveな間にcurrent SQLite failureをsnapshotし、malloc-aligned one allocatio
 
 ```text
 offset          width  meaning
-0               i32    sqlite3_errcode(database)
+0               i32    sqlite3_errcode(database) & 0xff
 4               i32    sqlite3_extended_errcode(database)
 8               i64    message byte length, nonnegative, terminator excluded
 16              len    exact sqlite3_errmsg(database) bytes
 16 + len        u8     zero terminator
 ```
 
-failure直後にprimary→extended→messageの順で読み、allocation前にlengthを得て`len <= i64::MAX - 17`を確認、
+failure直後に`sqlite3_errcode`を読み`0xff`でprimary codeへmaskし、次にextended→messageの順で読み、
+allocation前にlengthを得て`len <= i64::MAX - 17`を確認、
 `align_rt_alloc`でexact `17 + len` bytesをallocateしcomplete recordをfillしてからreturn/name scratch end。
 null native messageはlen zero。OOMはprocess-hard abortでrecoverable error/usable connectionなし。invalid private
 inputはnative call前hard abortし、guarded package callだけHIR/LLVM preflightが許可する。non-null return後は
@@ -4376,9 +4381,10 @@ validation orderはexactでfirst failure後停止:
 4. arity、次にoption sliceをsource order;
 5. complete descriptor authenticateとscalar-function kind;
 6. `Deterministic`のPure;
-7. call-local native-name stack scratchをform/terminateし、guarded trampoline loadとexactly one native call;
-8. name free前にnative errorをcopyし、native failureならambiguous previous stateをreuseせずphysical connectionを
-   poison/closeしてfirst `NativeError`をreturn;
+7. guarded v2 helperをinvokeし、helperがprivate inputをvalidate、local native-name stack scratchをform/terminate、
+   exactly one native call、scratch live中にfailureをcomplete snapshotし、return前にscratchを終了;
+8. non-null snapshotならphysical connectionをpoison/closeし、そのowned snapshotをexactly once consume/freeして、
+   ambiguous previous stateをreuseせずfirst `NativeError`をreturn;
 9. success前native autocommit/wrapper idle再proof、contradictionはpoison/close。
 
 duplicate `Deterministic`がfirst option error。removalにdescriptor/effect phaseなし。package-detectable errorは
