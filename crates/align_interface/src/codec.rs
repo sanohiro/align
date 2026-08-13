@@ -277,8 +277,8 @@ pub enum DecodeError {
     /// The decoded public surface does not match the fingerprint stored in the artifact.
     /// This catches a stale or modified effect bit/signature/layout before a consumer can trust it.
     InterfaceHashMismatch,
-    /// A return-provenance summary was not canonical or referenced a root unavailable in an
-    /// exported interface.
+    /// A provenance summary was not canonical or referenced a root unavailable in an exported
+    /// interface.
     InvalidSummary(&'static str),
 }
 
@@ -294,7 +294,7 @@ impl std::fmt::Display for DecodeError {
             DecodeError::TrailingBytes => write!(f, "interface artifact has trailing bytes"),
             DecodeError::InterfaceHashMismatch => write!(f, "interface artifact surface does not match its stored hash"),
             DecodeError::InvalidSummary(reason) => {
-                write!(f, "invalid interface return-provenance summary: {reason}")
+                write!(f, "invalid interface provenance summary: {reason}")
             }
         }
     }
@@ -608,6 +608,11 @@ pub fn deserialize(bytes: &[u8]) -> Result<InterfaceSummary, DecodeError> {
         interface_hash,
         impl_hash,
     };
+    if !crate::decoded_parallel_transfer_roots_are_borrow_capable(&summary) {
+        return Err(DecodeError::InvalidSummary(
+            "parallel-transfer root is not borrow-capable",
+        ));
+    }
     if Hash128::of(&bytes[..surface_len]) != summary.interface_hash {
         return Err(DecodeError::InterfaceHashMismatch);
     }

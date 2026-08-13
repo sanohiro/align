@@ -4247,7 +4247,9 @@ conservativeにselectする。
 interface format v6は各public fn recordのone-byte effect直後、`resource_hook_body`前に
 little-endian `u32` countとstrictly-increasing unique zero-based `u32` parameter index列を追加する。indexは
 preceding parameter count未満かつborrow-capableでなければならない。decodeはversion、preceding record、
-count/truncation、encoded orderでrange/order/borrow-capabilityの順にfirst failureでartifact全体をrejectする。
+count/truncation、encoded orderでrange/orderを検証する。complete dependent type-definition graph decode後、
+stored hash acceptance/publication前に全selected rootのborrow capabilityを検証し、type graphをauthenticate
+できなければsame gateでfail closedする。
 old/missing/malformed/signature-incompatible factsはfail closed。versionとcomplete recordはcanonical surface hash
 inputなのでroot変更は`interface_hash`とdependent object/cache keyを必ず変える。zero/`[0]`/`[0, 2]`、全
 malformed product、same signatureのsequential→parallel body changeをbyte/hash goldenにする。fn-value typeの
@@ -4276,7 +4278,7 @@ scalar input/output mappingはexact:
 | `SQLITE_NULL` | `Null` |
 | `SQLITE_INTEGER` | `I64(sqlite3_value_int64(...))` |
 | `SQLITE_FLOAT` | finite/infinity/signed-zero `F64`; native NaNはinvalid |
-| `SQLITE_TEXT` | exact nonnegative length/final pointer/UTF-8/no-U+0000 validation後の`Text` view; zero lengthはstable non-null sentinel |
+| `SQLITE_TEXT` | exact nonnegative length/non-null final pointer/UTF-8/no-U+0000 validation後の`Text` view; non-null pointerのzero lengthはstable non-null sentinel、null pointerは下記OOM/malformed rule |
 | `SQLITE_BLOB` | `Bytes(byte_view { bytes })`; SQLite pointerがnullでも全zero-length inputをstable non-null sentinelへnormalize |
 
 callback resultは全`pkg.db.value` variantを許可する。`Bool`/`I16`/`I32`は
@@ -4298,13 +4300,15 @@ ordinal順にcallback前validateする。fixed-arityの`argc == arity` invariant
 arityを重複しない。null contextはSQLite result routineを呼ばず`process.abort`する。non-nullならvalue extraction
 前に`sqlite3_context_db_handle(context)`をexactly once呼び、nullならhard abortする。
 
-ordinalごとに`sqlite3_value_type`を1回呼ぶ。Textは`sqlite3_value_bytes`を先に呼び、最後のaccessorとして
+全ordinalを順にvisitし、distinct non-null `sqlite3_value*`のfirst occurrenceごとに
+`sqlite3_value_type`を1回呼ぶ。later ordinalがalready-converted pointerをaliasする場合は別SQLite accessorを
+呼ばずcomplete `pkg.db.value`をlater scratch slotへcopyする。Textは`sqlite3_value_bytes`を先に呼び、最後のaccessorとして
 `sqlite3_value_text`を呼ぶ。Bytesもbytesを先に、`sqlite3_value_blob`を最後に呼ぶ。全byte countは
 nonnegative。final Text pointerがnullなら他SQLite APIより先にsaved DB handleの`sqlite3_errcode`を直ちに読み、
-`SQLITE_NOMEM`は`sqlite3_result_error_nomem`、他codeはfixed malformed-input error。initial BLOB-to-BLOB
+`SQLITE_NOMEM`は`sqlite3_result_error_nomem`、zero byte countの場合も含め他codeはfixed malformed-input error。initial BLOB-to-BLOB
 accessはencoding conversionなしなのでnull Bytesはnonzero lengthならmalformed、zeroならstable non-null empty
-sentinelへreplaceする。native pointerに関わらず全
-zero-length Text/Bytes viewをsentinelへnormalizeする。same valueにはcallback return前に別accessorを呼ばず、
+sentinelへreplaceする。non-null final pointerのzero-length Textと全zero-length Bytesをsentinelへnormalizeする。
+same valueにはcallback return前に別accessorを呼ばず、
 later bytes callがretained pointerをinvalidateしないfinal-pointer orderを固定する。
 
 fixed-capacity 127-value stack scratchと先頭`argc`のborrowed sliceを形成し、package heap allocationなし、callback

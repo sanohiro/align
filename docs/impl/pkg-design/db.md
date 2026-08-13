@@ -5937,10 +5937,11 @@ immediately after its one-byte effect and before `resource_hook_body`: one littl
 count followed by that many little-endian `u32` zero-based parameter indices. The indices are
 strictly increasing, unique, less than the preceding function parameter count, and each selected
 parameter is borrow-capable. Decode validates the format version first, then the containing record
-and preceding fields, then count/truncation, and finally each index in encoded order for range,
-strict ordering, and borrow capability; the first violation rejects the complete artifact before
-publication. Old/unknown versions, a missing field, malformed roots, and an imported declaration
-whose source signature disagrees all fail closed. The format version and complete function record
+and preceding fields, then count/truncation, and each index in encoded order for range and strict
+ordering. After the complete dependent type-definition graph is decoded, it validates borrow
+capability for every selected root before stored-hash acceptance or publication; an unauthenticable
+type graph fails closed at that same gate. Old/unknown versions, a missing field, malformed roots,
+and an imported declaration whose source signature disagrees all fail closed. The format version and complete function record
 already enter canonical `encode_interface_surface`, so any root change changes `interface_hash`,
 invalidates dependent object/cache keys, and is checked against the stored hash on decode. Byte and
 hash goldens cover zero roots, `[0]`, `[0, 2]`, every malformed index/order product, and the
@@ -5979,7 +5980,7 @@ The scalar input/output mapping is exact:
 | `SQLITE_NULL` | `Null` |
 | `SQLITE_INTEGER` | `I64(sqlite3_value_int64(...))` |
 | `SQLITE_FLOAT` | finite, infinity, or signed-zero `F64`; a native NaN is invalid |
-| `SQLITE_TEXT` | `Text` view after exact nonnegative length, final-pointer, UTF-8, and no-U+0000 validation; zero length uses the stable non-null sentinel |
+| `SQLITE_TEXT` | `Text` view after exact nonnegative length, non-null final-pointer, UTF-8, and no-U+0000 validation; zero length with a non-null pointer uses the stable non-null sentinel, while a null pointer follows the OOM/malformed rule below |
 | `SQLITE_BLOB` | `Bytes(byte_view { bytes })`; every zero-length input uses the stable non-null sentinel, including when SQLite returns null |
 
 Callback results accept every `pkg.db.value` variant. `Bool`, `I16`, and `I32` widen through
@@ -6007,15 +6008,19 @@ contract violation and calls `process.abort` without calling any SQLite result r
 non-null context, the trampoline obtains `sqlite3_context_db_handle(context)` exactly once before
 value extraction and hard-aborts if it is null.
 
-It calls `sqlite3_value_type` once per ordinal. For Text it calls `sqlite3_value_bytes` first and
+It visits every ordinal in order and calls `sqlite3_value_type` once for the first occurrence of
+each distinct non-null `sqlite3_value*`. If a later ordinal aliases a previously converted pointer,
+it copies that complete `pkg.db.value` into the later scratch slot without another SQLite accessor.
+For Text it calls `sqlite3_value_bytes` first and
 then `sqlite3_value_text` as the final accessor; for Bytes it calls `sqlite3_value_bytes` first and
 then `sqlite3_value_blob` as the final accessor. Every byte count must be nonnegative. A null final
 Text pointer is followed immediately by `sqlite3_errcode` on the saved database handle before any
 other SQLite API, mapping `SQLITE_NOMEM` to `sqlite3_result_error_nomem` and any other code to the
-fixed malformed-input error. Initial BLOB-to-BLOB access performs no encoding conversion: a null
-final Bytes pointer is the malformed-input error when length is nonzero and is replaced by the
-stable non-null empty sentinel when length is zero. Every zero-length Text/Bytes view is normalized
-to that sentinel regardless of the native pointer. No further value accessor is
+fixed malformed-input error, including when the earlier byte count was zero. Initial BLOB-to-BLOB
+access performs no encoding conversion: a null final Bytes pointer is the malformed-input error
+when length is nonzero and is replaced by the stable non-null empty sentinel when length is zero.
+Every zero-length Text with a non-null final pointer and every zero-length Bytes value is normalized
+to that sentinel. No further value accessor is
 called on that same `sqlite3_value` before the source callback returns. This final-pointer order
 pins SQLite conversion side effects and OOM precedence without retaining an accessor result that a
 later `sqlite3_value_bytes` call may invalidate.

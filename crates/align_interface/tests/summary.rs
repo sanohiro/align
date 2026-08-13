@@ -2367,6 +2367,24 @@ fn parallel_transfer_roots_are_canonical_and_change_the_interface_hash() {
             "parallel-transfer root is outside the signature"
         )),
     );
+
+    let mut nonborrowing =
+        one("pub fn run(value: i64) -> i64 = value\nfn main() -> i32 = 0\n").remove(0);
+    nonborrowing.fns[0].parallel_transfer_params = vec![0];
+    rehash(&mut nonborrowing);
+    assert_eq!(
+        deserialize(&serialize(&nonborrowing)),
+        Err(DecodeError::InvalidSummary(
+            "parallel-transfer root is not borrow-capable"
+        )),
+    );
+
+    let mut borrowed =
+        one("pub fn run(borrow value: i64) -> i64 = value\nfn main() -> i32 = 0\n")
+            .remove(0);
+    borrowed.fns[0].parallel_transfer_params = vec![0];
+    rehash(&mut borrowed);
+    assert_eq!(deserialize(&serialize(&borrowed)), Ok(borrowed));
 }
 
 #[test]

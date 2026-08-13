@@ -1783,6 +1783,31 @@ impl<'a> CapabilityAnalysis<'a> {
     }
 }
 
+/// Authenticate decoded parallel-transfer roots against the complete interface type graph.
+/// Structural codec checks run while each function record is read; nominal borrow capability can
+/// only be decided after the later struct/enum/resource definitions are available.
+pub(crate) fn decoded_parallel_transfer_roots_are_borrow_capable(
+    summary: &InterfaceSummary,
+) -> bool {
+    if summary.fns.iter().all(|function| function.parallel_transfer_params.is_empty()) {
+        return true;
+    }
+    let Ok(index) = LocalDefinitionIndex::new(summary) else {
+        return false;
+    };
+    let Ok(analysis) = CapabilityAnalysis::new(index) else {
+        return false;
+    };
+    summary.fns.iter().all(|function| {
+        function.parallel_transfer_params.iter().all(|&root| {
+            function.params.get(root as usize).is_some_and(|parameter| {
+                analysis.may_borrow(&parameter.ty, &function.type_params)
+                    || matches!(parameter.mode, ParamMode::Borrow | ParamMode::BorrowMut)
+            })
+        })
+    })
+}
+
 fn validate_type_params(
     type_params: &[ITypeParam],
     index: &LocalDefinitionIndex<'_>,
