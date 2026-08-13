@@ -708,6 +708,20 @@ fn str_clone_of_decoded_field_is_owned() {
 }
 
 #[test]
+fn owned_string_clone_duplicates_locals_and_fields() {
+    if !backend_available() {
+        return;
+    }
+    // `string.clone()` uses the same HIR node as `str.clone()`, but its receiver remains owned.
+    // Exercise both a direct local and an owned struct field: the checked-HIR validator used to
+    // admit only `str`, so both producer-valid shapes vanished at the MIR boundary.
+    let src = "Holder { text: string }\nfn main() -> i32 {\n  original := \"hello\".clone()\n  direct := original.clone()\n  holder := Holder { text: original }\n  field := holder.text.clone()\n  print(direct)\n  print(field)\n  print(holder.text)\n  return (direct.len() + field.len() + holder.text.len()) as i32\n}\n";
+    let out = build_and_run("owned-string-clone", src);
+    assert_eq!(out.status.code(), Some(15));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello\nhello\nhello\n");
+}
+
+#[test]
 fn owned_string_moved_into_callee_is_freed_once() {
     if !backend_available() {
         return;

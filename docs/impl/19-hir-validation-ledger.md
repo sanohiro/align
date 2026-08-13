@@ -1004,12 +1004,13 @@ an added, removed, duplicated, or unowned discriminator.
 ## Producer-delegation closure matrix
 
 This matrix closes the **silent-empty-MIR** class: the body validator answering
-a question the producer already owns, with a rule that is not equivalent. Every
-occurrence rejects the whole checked program at the MIR boundary, so the unit
-lowers to the canonical empty program and links with an undefined `_main`. Four
-earlier occurrences shipped as `#742`, `#744`, `#749`, and `#737`; the two rows
-below are the fifth and sixth. Every one was "the validator re-derived a
-producer fact", never malformed HIR.
+a question the producer already owns, with a rule that is not equivalent. Before
+`#774`, each occurrence rejected the whole checked program into the canonical
+empty program and an undefined `_main`; the fallible production boundary now
+reports the refusing validator and function instead. Seven earlier occurrences
+shipped through `#742`, `#744`, `#749`, `#737`, and `#774`; the owned-`string`
+clone row below is the eighth. Every one was "the validator re-derived a producer
+fact", never malformed HIR.
 
 ### Split model
 
@@ -1044,11 +1045,12 @@ Eight occurrences; one diverged.
 | `array_builder_elem_ok` | `check_array_builder_new` | Wider, never narrower: sema admits `Int/Float/Bool/Char/String`; the validator additionally admits `Str`. A wider gate cannot reject a checked program, so it is outside this class. No change. |
 | `ResourceViewFromRaw` view scalar (2 sites) | none | Structural: `Scalar::Slice` is *constructed from* a `PrimScalar`, so this is a representation conversion, not an admission rule. No change. |
 
-One further admission gate diverged without being spelled `scalar_to_prim`:
+Two further admission gates diverged without being spelled `scalar_to_prim`:
 
 | Gate | Producer authority | Verdict |
 |---|---|---|
 | `orderable_body_ty` (`sort_by_key` key) | `Bound::Ord` | **Divergent.** Sema's bound accepts owned `string`; the validator re-listed the arms and stopped at `str`. Both now call `align_sema::ord_body_ty`. |
+| `StrClone` receiver | `check_box_clone` | **Divergent.** Sema lowers both borrowed `str` and owned `string` receivers to `StrClone`; the validator admitted only `str`. Both now call `align_sema::str_clone_body_ty`. |
 
 **Deferred, same arm — `ord-key` Move keys.** Delegating orderability does not by
 itself make a `string`-keyed `sort_by_key` lower. `pipeline_callable_ok` requires
@@ -1203,6 +1205,7 @@ this have caught the bug I just fixed?*
 | A vanished checked program is an error at the one boundary, and the infallible entry points still fail closed | `align_mir` `lower_program_checked_reports_a_vanished_checked_program` |
 | Delegating a gate does not switch it off | `align_mir` `delegated_gates_still_refuse_a_genuinely_different_type` (struct accumulator, unordered key, mismatched map_err mapper, and two distinct source shapes under the shape matcher) |
 | A sum-type scan accumulator compiles and runs | `align_driver` `unit_values::sum_type_scan_accumulator_compiles_and_runs` |
+| Borrowed and owned text clones both survive checked HIR and execute | `align_driver` `m5::str_clone_escapes_arena_as_owned_string`, `m5::owned_string_clone_duplicates_locals_and_fields` |
 | A new raw `Ty`/`Scalar` comparison in the body validator cannot land silently | `align_mir` `raw_nominal_comparisons_stay_enumerated` — recomputes the sites from `validate_hir.rs` and matches them against an audited allowlist, naming any new site and what to do about it |
 | The detector recognises the class and ignores everything else | `align_mir` `the_raw_comparison_detector_recognises_the_class` — all six recorded spellings fire; six split-free spellings do not |
 | End-to-end acceptance | `align_driver` `mir_continuation`, `unit_values` |
