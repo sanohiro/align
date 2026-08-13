@@ -1498,6 +1498,21 @@ grep -Fq -- '--- suite_hang (exit timeout' "$suite_hang_out" || {
   cat "$suite_hang_out" >&2
   exit 1
 }
+# A target that only produced a synthetic marker reported no trustworthy
+# outcome, so its manifest entries must not be advised out of the file: the
+# hung binary never got to run its known-failing test.
+hang_known_manifest="$(suite_manifest hang-known "$(suite_line suite_hang alpha)")"
+suite_hang_known_out="$(suite_case hang-known "$hang_known_manifest" 1 "$suite_hang")"
+grep -Eq '^  suite_hang[[:space:]]+<binary-did-not-report>$' "$suite_hang_known_out" || {
+  echo "a hung binary with a manifest entry was not reported as did-not-report:" >&2
+  cat "$suite_hang_known_out" >&2
+  exit 1
+}
+grep -Fq 'did NOT fail' "$suite_hang_known_out" && {
+  echo "a hung target's manifest entry was advised out of the file:" >&2
+  cat "$suite_hang_known_out" >&2
+  exit 1
+}
 # The absorption hole: every test the crashing binary named is already in the
 # manifest, so only the exit code distinguishes this run from a clean baseline.
 crash_manifest="$(suite_manifest crash "$(suite_line suite_crash beta)")"
@@ -1517,8 +1532,10 @@ grep -Fq 'did NOT fail' "$suite_crash_out" && {
 # middle of "test beta ... FAILED" used to lose the name and report a phantom
 # <binary-exit-101> instead (observed on the first nightly). The name list is
 # printed after every test finished, so this run matches its manifest line
-# exactly — and the detail sections under the FIRST "failures:" heading
-# contribute no phantom names either.
+# exactly. The detail section exercises the parser's block reset (each
+# "failures:" heading discards what came before); that detail content never
+# LOOKS like a name list is a property of libtest's output shape, which this
+# fixture uses but does not prove.
 suite_dirty="$(suite_binary suite_dirty '
 printf "test alpha ... ok\ntest beta ..."
 printf "stderr splice from a concurrent test\n"
@@ -1532,6 +1549,37 @@ suite_dirty_out="$(suite_case dirty "$dirty_manifest" 0 "$suite_dirty")"
 grep -Fq 'matches' "$suite_dirty_out" || {
   echo "a spliced progress line changed the verdict despite an intact failures list:" >&2
   cat "$suite_dirty_out" >&2
+  exit 1
+}
+grep -Fq 'failure-list-unparsed' "$suite_dirty_out" && {
+  echo "a failures list matching its counted total still drew the unparsed marker:" >&2
+  cat "$suite_dirty_out" >&2
+  exit 1
+}
+# A splice INTO the name list itself loses a counted name. The summary's own
+# "N failed" total catches that: the collected names are reported, the deficit
+# draws the synthetic <failure-list-unparsed> no manifest line can match, and
+# the run is red — a mangled list can never absorb a failure. The lost name
+# (beta, listed in the manifest) must NOT be advised out of the file: this
+# target reported no trustworthy outcome.
+suite_splice="$(suite_binary suite_splice '
+printf "test alpha ... FAILED\ntest beta ... FAILED\n"
+printf "\nfailures:\n    alpha\n"
+printf "stderr splice inside the name list\n"
+printf "    beta\n\n"
+printf "test result: FAILED. 0 passed; 2 failed; 0 ignored\n"
+exit 101')"
+splice_manifest="$(suite_manifest splice \
+  "$(suite_line suite_splice alpha)" "$(suite_line suite_splice beta)")"
+suite_splice_out="$(suite_case splice "$splice_manifest" 1 "$suite_splice")"
+grep -Eq '^  suite_splice[[:space:]]+<failure-list-unparsed>$' "$suite_splice_out" || {
+  echo "a spliced failures list was not reported as unparsed:" >&2
+  cat "$suite_splice_out" >&2
+  exit 1
+}
+grep -Fq 'did NOT fail' "$suite_splice_out" && {
+  echo "a name lost to the splice was advised out of the manifest:" >&2
+  cat "$suite_splice_out" >&2
   exit 1
 }
 
@@ -1564,12 +1612,18 @@ cp "$repo_root/scripts/run-suite-binaries.sh" \
 suite_build_artifacts="$tmp_dir/suite-build-artifacts.json"
 suite_stream "$suite_build_artifacts" "$suite_green"
 suite_build_cargo_log="$tmp_dir/suite-build-cargo-log"
+# The stub serves `metadata` too: the runner asks cargo where the artifacts
+# landed rather than trusting CARGO_TARGET_DIR (which would miss
+# CARGO_BUILD_TARGET_DIR and any .cargo/config override), and this fixture
+# deliberately exports no target-dir variable at all so the metadata answer is
+# the only source.
 cat >"$suite_build_root/scripts/cargo.sh" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >>"$FAKE_CARGO_LOG"
 case "$1" in
   build) exit 0 ;;
+  metadata) printf '{"target_directory":"%s"}\n' "$FAKE_TARGET_DIR" ;;
   test) cat "$FAKE_SUITE_ARTIFACTS" ;;
   *)
     echo "unexpected cargo.sh invocation: $*" >&2
@@ -1585,7 +1639,7 @@ suite_build_case() {
   : >"$suite_build_cargo_log"
   FAKE_CARGO_LOG="$suite_build_cargo_log" \
     FAKE_SUITE_ARTIFACTS="$suite_build_artifacts" \
-    CARGO_TARGET_DIR="$suite_build_root/target" \
+    FAKE_TARGET_DIR="$suite_build_root/target" \
     ALIGN_GATE_JOBS=2 ALIGN_SUITE_BINARY_TIMEOUT=2 \
     ALIGN_KNOWN_FAILURES="$empty_manifest" \
     "$suite_build_root/scripts/run-suite-binaries.sh" >"$out" 2>&1 || status=$?
@@ -1614,8 +1668,8 @@ if grep -q '^test --no-run' "$suite_build_cargo_log"; then
   cat "$suite_build_cargo_log" >&2
   exit 1
 fi
-# With the staticlib in place the branch proceeds — workspace build first,
-# test-binary build second — through to the normal verdict.
+# With the staticlib in place the branch proceeds — workspace build, then the
+# metadata lookup, then the test-binary build — through to the normal verdict.
 mkdir -p "$suite_build_root/target/debug"
 : >"$suite_build_root/target/debug/libalign_runtime.a"
 suite_build_ok_out="$(suite_build_case ok 0)"
@@ -1630,9 +1684,17 @@ grep -Fq 'matches' "$suite_build_ok_out" || {
   exit 1
 }
 case "$(sed -n '2p' "$suite_build_cargo_log")" in
+  "metadata --format-version 1"*) ;;
+  *)
+    echo "the target-directory lookup did not follow the workspace build:" >&2
+    cat "$suite_build_cargo_log" >&2
+    exit 1
+    ;;
+esac
+case "$(sed -n '3p' "$suite_build_cargo_log")" in
   "test --no-run --workspace --locked"*) ;;
   *)
-    echo "the test-binary build did not follow the workspace build:" >&2
+    echo "the test-binary build did not follow the target-directory lookup:" >&2
     cat "$suite_build_cargo_log" >&2
     exit 1
     ;;

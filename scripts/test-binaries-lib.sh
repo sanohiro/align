@@ -263,27 +263,45 @@ align_tb_slot_record() {
 # still running, and the binary's stdout and stderr share one log: a stderr
 # write from a concurrent test can splice into the middle of a progress line,
 # losing the name and turning a named failure into a phantom <binary-exit-101>
-# (observed on the first nightly). The trailing failures list has no such
-# race. Each "failures:" heading resets the collected block, so the first
-# heading (the per-test detail sections) is superseded by the final name list,
-# and only a block confirmed by libtest's own "test result:" summary counts.
+# (observed on the first nightly). The trailing list is written after every
+# test has finished, so a splice there takes a straggler thread — much rarer,
+# but not impossible, and a lost name must not let a failure hide. libtest's
+# own summary line carries the failed count, so a list that does not account
+# for every counted failure contributes the synthetic <failure-list-unparsed>,
+# which no manifest line can match: a mangled list can only turn the run red,
+# never absorb a failure. A count-preserving splice (one that garbles a name
+# without changing the line count) still yields a name no manifest lists —
+# red again, from the other direction.
 #
-# A test's own captured output is replayed into the same stream, so a test
-# that prints a "failures:" heading followed by indented lines just before the
-# summary could still inject a phantom name. That can only happen on a run
-# that already has a real failure — libtest replays captured output only for
-# failing tests — so the error is a spurious extra name inside an already-red
-# run, never a missed failure. Parsing libtest's JSON output would remove even
-# that, but it is nightly-only, so the fail-closed direction is the right
-# trade here.
+# Each "failures:" heading resets the collected block, so the first heading
+# (the per-test detail sections) is superseded by the final name list, and
+# only a block confirmed by a "test result:" summary counts. Detail-section
+# content staying out of the names rests on the shape libtest prints (the
+# sections open with an unindented "---- name ----" banner, which stops
+# collection); a test's own replayed output could still fabricate an indented
+# line under a fabricated heading just before the summary. That replay exists
+# only when something already failed, so the error is a spurious extra name
+# inside an already-red run, never a missed failure. Parsing libtest's JSON
+# output would remove even that, but it is nightly-only, so the fail-closed
+# direction is the right trade here.
 align_tb_failed_tests() {
-  awk '
-    /^failures:$/ { block = ""; collecting = 1; next }
-    collecting && /^    [^ ]/ { block = block substr($0, 5) "\n"; next }
+  LC_ALL=C awk '
+    /^failures:$/ { block = ""; count = 0; collecting = 1; next }
+    collecting && /^    [^ ]/ { block = block substr($0, 5) "\n"; count++; next }
     collecting && /^$/ { next }
     collecting { collecting = 0 }
-    /^test result:/ { names = block; collecting = 0 }
-    END { printf "%s", names }
+    /^test result:/ {
+      names = block
+      named = count
+      failed = 0
+      if (match($0, /[0-9]+ failed/)) failed = substr($0, RSTART, RLENGTH) + 0
+      confirmed = 1
+      collecting = 0
+    }
+    END {
+      printf "%s", names
+      if (confirmed && failed != named) print "<failure-list-unparsed>"
+    }
   ' "$ALIGN_TB_LOGS/$1.log"
 }
 

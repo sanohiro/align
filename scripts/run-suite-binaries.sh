@@ -5,8 +5,9 @@
 #
 #   usage: scripts/run-suite-binaries.sh [ARTIFACT_JSON]
 #
-# With no argument the script performs the `cargo test --no-run` build itself.
-# ARTIFACT_JSON, the stdout of such a build, is accepted so
+# With no argument the script builds the workspace (for the runtime staticlib
+# the driver tests link against) and then performs the `cargo test --no-run`
+# build itself. ARTIFACT_JSON, the stdout of such a test build, is accepted so
 # scripts/test-pr-workflow.sh can exercise every branch against fixtures
 # without compiling anything.
 #
@@ -68,52 +69,12 @@ trap 'suite_cleanup' EXIT
 trap 'suite_cleanup; exit 130' INT
 trap 'suite_cleanup; exit 143' TERM
 
-if [ $# -ge 1 ]; then
-  artifacts="$1"
-else
-  artifacts="$work/artifacts.json"
-  # `cargo test --no-run` builds only what the test binaries link against
-  # directly; it does not produce the alignc runtime staticlib that driver
-  # tests hand to the linker at RUN time. The first nightly proved the hole:
-  # 33 targets failed together solely because target/debug/libalign_runtime.a
-  # did not exist. Build the workspace first, and fail closed — as a
-  # configuration error, not a verdict — if the runtime library still is not
-  # there afterwards.
-  echo "suite: building the workspace"
-  "$script_dir/cargo.sh" build --workspace --locked
-  runtime_lib="${CARGO_TARGET_DIR:-$repo_root/target}/debug/libalign_runtime.a"
-  [ -f "$runtime_lib" ] || {
-    echo "suite: workspace build did not produce $runtime_lib" >&2
-    exit 2
-  }
-  echo "suite: building every workspace test binary"
-  "$script_dir/cargo.sh" test --no-run --workspace --locked \
-    --message-format=json-render-diagnostics >"$artifacts"
-fi
-
-align_tb_discover "$artifacts" || {
-  echo "the suite build produced no test binaries (cargo artifact format changed?)" >&2
-  exit 1
-}
-
-# The manifest keys failures by target name, so two packages holding a
-# same-named target would make a manifest line ambiguous. Cargo's own -<hash>
-# disambiguation is not stable across runs, so reject the collision instead of
-# silently binding the line to whichever one ran first.
-found_names="$(align_tb_names | LC_ALL=C sort)"
-duplicates="$(printf '%s\n' "$found_names" | LC_ALL=C uniq -d)"
-[ -z "$duplicates" ] || {
-  echo "two workspace test targets share a name, so the manifest cannot key on it:" >&2
-  printf '  %s\n' $duplicates >&2
-  echo "  rename one of them, or teach the manifest a package-qualified key" >&2
-  exit 1
-}
-
-align_tb_export_dylib_path "$artifacts"
-align_tb_configure_jobs
-
 tab="$align_tb_tab"
 
+# Parse the manifest before spending anything on a build: every malformed-
+# manifest outcome is a configuration error (exit 2) either way, and it should
+# cost seconds, not a workspace build.
+#
 # Manifest lines are "<target><TAB><test>" with an optional third field. The
 # only third field is "env": a test whose outcome depends on an environment
 # variable, a network, or a service that the nightly runner does not provide.
@@ -169,6 +130,66 @@ conflicting="$(LC_ALL=C comm -12 "$expected" "$env_dependent")"
   exit 2
 }
 
+if [ $# -ge 1 ]; then
+  artifacts="$1"
+else
+  artifacts="$work/artifacts.json"
+  # `cargo test --no-run` builds only what the test binaries link against
+  # directly; it does not produce the alignc runtime staticlib that driver
+  # tests hand to the linker at RUN time. The first nightly proved the hole:
+  # 33 targets failed together solely because target/debug/libalign_runtime.a
+  # did not exist. Build the workspace first, and fail closed — as a
+  # configuration error, not a verdict — if the runtime library still is not
+  # there afterwards.
+  #
+  # Two invocations resolve features twice under resolver 2. Deliberately left
+  # that way for now: whether merging them into one `--all-targets`-style
+  # build is worth it gets decided from the first fixed nightly's wall-clock,
+  # not guessed here.
+  echo "suite: building the workspace"
+  "$script_dir/cargo.sh" build --workspace --locked
+  # Where the artifacts landed comes from cargo itself: CARGO_TARGET_DIR alone
+  # would miss CARGO_BUILD_TARGET_DIR and any .cargo/config override.
+  target_dir="$("$script_dir/cargo.sh" metadata --format-version 1 --no-deps \
+    --manifest-path "$repo_root/Cargo.toml" |
+    sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+  [ -n "$target_dir" ] || {
+    echo "suite: cargo metadata did not report a target directory" >&2
+    exit 2
+  }
+  # Existence only, deliberately: freshness is the compile driver's own
+  # digest check downstream.
+  runtime_lib="$target_dir/debug/libalign_runtime.a"
+  [ -f "$runtime_lib" ] || {
+    echo "suite: workspace build did not produce $runtime_lib" >&2
+    exit 2
+  }
+  echo "suite: building every workspace test binary"
+  "$script_dir/cargo.sh" test --no-run --workspace --locked \
+    --message-format=json-render-diagnostics >"$artifacts"
+fi
+
+align_tb_discover "$artifacts" || {
+  echo "the suite build produced no test binaries (cargo artifact format changed?)" >&2
+  exit 1
+}
+
+# The manifest keys failures by target name, so two packages holding a
+# same-named target would make a manifest line ambiguous. Cargo's own -<hash>
+# disambiguation is not stable across runs, so reject the collision instead of
+# silently binding the line to whichever one ran first.
+found_names="$(align_tb_names | LC_ALL=C sort)"
+duplicates="$(printf '%s\n' "$found_names" | LC_ALL=C uniq -d)"
+[ -z "$duplicates" ] || {
+  echo "two workspace test targets share a name, so the manifest cannot key on it:" >&2
+  printf '  %s\n' $duplicates >&2
+  echo "  rename one of them, or teach the manifest a package-qualified key" >&2
+  exit 1
+}
+
+align_tb_export_dylib_path "$artifacts"
+align_tb_configure_jobs
+
 # A manifest line naming a target the workspace no longer builds is red for
 # both kinds. A strict line can never be satisfied, and an env line is worse:
 # it would sit there indefinitely excusing a test that does not exist.
@@ -204,7 +225,9 @@ suite_elapsed="$(($(date +%s) - suite_started))"
 # all be in the manifest, and without this line a crash that happens to strike
 # a known-failing target would be absorbed into the baseline and never seen.
 actual="$work/actual"
+synthetic="$work/synthetic-targets"
 : >"$actual"
+: >"$synthetic"
 for slot in $(align_tb_slots); do
   record="$(align_tb_slot_record "$slot")"
   binary_status="${record%% *}"
@@ -226,6 +249,11 @@ for slot in $(align_tb_slots); do
     while IFS= read -r name; do
       [ -n "$name" ] || continue
       printf '%s%s%s\n' "$slot" "$tab" "$name" >>"$actual"
+      # Any synthetic marker means this target's real outcome is unknown: it
+      # crashed, hung, or its failure list could not be parsed.
+      case "$name" in
+        '<'*) printf '%s\n' "$slot" >>"$synthetic" ;;
+      esac
     done
 done
 LC_ALL=C sort -o "$actual" "$actual"
@@ -237,9 +265,19 @@ LC_ALL=C comm -23 "$actual" "$env_dependent" >"$tolerated"
 new_failures="$(LC_ALL=C comm -23 "$tolerated" "$expected")"
 # A strict entry whose target does not exist is also, trivially, an entry that
 # did not fail. Report it once, under the heading that explains it.
+#
+# A target that contributed a synthetic marker never reported a trustworthy
+# outcome, so its manifest entries are not declared repaired: "delete the
+# line" for a test that crashed, hung, or lost its failure list would be the
+# ratchet pointing the wrong way. Those entries stay, and the synthetic
+# marker itself already turned the run red.
 fixed_all="$work/fixed"
 LC_ALL=C comm -13 "$actual" "$expected" >"$fixed_all"
-fixed="$(LC_ALL=C comm -23 "$fixed_all" "$unknown")"
+fixed="$(LC_ALL=C comm -23 "$fixed_all" "$unknown" |
+  while IFS= read -r entry; do
+    LC_ALL=C grep -qxF "${entry%%"$tab"*}" "$synthetic" ||
+      printf '%s\n' "$entry"
+  done)"
 
 # Full output for a binary that produced an unexpected failure; one line for
 # everything else, so the whole run stays auditable without burying the signal.

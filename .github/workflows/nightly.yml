@@ -141,8 +141,10 @@ jobs:
       # is excluded by default. Re-add `--ignored` once its triage lands and
       # the attribute comes off.
       #
-      # The script performs its own `cargo test --no-run --workspace` build,
-      # which is exactly what makes the local invocation identical to this one.
+      # The script performs its own two-stage build — `cargo build` for the
+      # runtime staticlib the driver tests link against, then the
+      # `cargo test --no-run` build of the test binaries — which is exactly
+      # what makes the local invocation identical to this one.
       - name: Build and run the full workspace suite
         shell: bash
         run: scripts/run-suite-binaries.sh
