@@ -73,8 +73,9 @@ independently useful rail is the exact PostgreSQL `SingleRow` / `PortalBatch` di
 contract recorded by the adjacent A1 ledger. Prepared parity follows in its own
 rail with the statement-v3 parameter resolver needed for exact native-option
 validation. `Delivery` is therefore a post-release D13 addition, not part of the
-initial D1--D12 option inventory. PostgreSQL binary formats, COPY, pipeline mode, and LISTEN/NOTIFY
-remain later independent rails rather than enlarging any of those PRs. Until the
+initial D1--D12 option inventory. PostgreSQL binary formats are shipped. COPY remains deferred by
+`pkg-design/db.md` §25 until a concrete measured consumer selects its operation; pipeline mode and
+LISTEN/NOTIFY remain later independent rails rather than enlarging any of those PRs. Until the
 COPY or pipeline rail exists, any COPY, pipeline, or unknown numeric status observed by any
 PostgreSQL result consumer clears its current result and immediately poisons/closes the
 connection; it is never sent through a generic result drain or pipeline-exit attempt. Explicit

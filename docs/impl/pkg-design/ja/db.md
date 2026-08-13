@@ -905,7 +905,8 @@ SearchPathOnlyとIncludeSystemCatalogsはconflict。Buffers/Timing/Walはnative 
 ### 12.3 native feature
 
 初期release後の最初のPostgreSQL-native D13 railはsingle-row/chunked-row deliveryを追加する。
-COPY、pipeline mode、LISTEN/NOTIFYは独立してspecifyする後続D13 railである。
+COPYは§25がconcrete measured consumerを記録するまでdeferredである。pipeline modeとLISTEN/NOTIFYは
+独立してspecifyする後続D13 railである。
 
 PostgreSQL array、UUID、JSONB、enum/domain、range、explicit composite mapping、COPY、
 pipeline/single-row、LISTEN/NOTIFY、LATERAL、DISTINCT ON、custom operator/extension、
@@ -3688,7 +3689,8 @@ load-bearing shapeは確定済み。残るもの:
 2. UUID、temporal、JSON/JSONB、PostgreSQL array/range/domain、SQLite custom type mapping。
 3. minimal safe dynamic `db.row`/`db.value` variant。
 4. SQLite function/collation callback safety。
-5. measured consumerを持つCOPY/pipeline/backup/blob operation。
+5. measured consumerを持つCOPY/pipeline/backup/blob operation。PostgreSQL COPY consumer/workload
+   measurementはcurrent recordに存在しないため、そのpublic surface/implementationはdeferredである。
 
 engine/versionごとのnullability/origin support matrixは§16.3.1で確定しD0/D3/D5が所有する。
 残りはD12〜D14に担当を持つ。Query identity、one-execution、ownership、artifact、

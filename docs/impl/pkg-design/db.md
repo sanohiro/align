@@ -1715,7 +1715,8 @@ The design must not block:
 
 The initial public release requires the common Query/transaction path, native options, checked
 metadata, and basic plan access. D13's first PostgreSQL-native rail adds single-row and chunked-row
-delivery. COPY, pipeline mode, and LISTEN/NOTIFY remain later independently specified D13 rails.
+delivery. COPY remains deferred until §25 records a concrete measured consumer; pipeline mode and
+LISTEN/NOTIFY remain later independently specified D13 rails.
 
 ---
 
@@ -5332,7 +5333,9 @@ consumer-driven type/native-surface decisions are:
 2. UUID, temporal, JSON/JSONB, PostgreSQL array/range/domain, and SQLite custom-type mappings.
 3. The minimal safe dynamic `db.row`/`db.value` set.
 4. Native callback safety for SQLite functions/collations.
-5. Which COPY/pipeline/backup/blob operations have a measured consumer.
+5. Which COPY/pipeline/backup/blob operations have a measured consumer. No PostgreSQL COPY consumer
+   or workload measurement is currently recorded, so its public surface and implementation remain
+   deferred.
 
 The engine/version nullability/origin support matrix is settled by §16.3.1 and owned by
 D0/D3/D5 rather than this list. The remaining items have roadmap homes in D12–D14. They do not
