@@ -1642,7 +1642,7 @@ acceptance label creates a PR boundary by itself.
 | D11 | exact-input exact-policy SQL migrations with versioned identity codec; initial-release gate | CLI selector, byte/digest golden, checksum/order/atomic/dirty/repair/status | migration fingerprint/startup/large history |
 | D12 | exact signature notation and parseable validated calls/typed-ref/detail/discriminator/record, region-owned category metadata and EXPLAIN options, QueryMeta materializer ABI/code and descriptor-header version; initial-release gate | signature-table parity; syntax; cross-unit runtime plan/materializer source; multi-invalid precedence; duplicate-key identity; detail/state/entry Unknown/group order; field/ordinal/digest/lifetime/allocation/flatness/category isolation; Query-ID context; ANALYZE visible | catalog query count/record bytes/latency and metadata thunk |
 | D13 | batch/SoA/native paths/pool | generation, native lifecycle, exact semantics | driver-specific throughput rails |
-| D14 | driver-restricted dynamic rows and proved callbacks | pre-send mismatch, allocation/lifetime/reentrancy/cleanup | dynamic decode/callback overhead |
+| D14 | driver-restricted dynamic rows; SQLite static-target scalar functions and Pure key-based collations; separately proved PostgreSQL callbacks | pre-send mismatch; callback capture/effect/ABI, invocation-view lifetime, registration/replacement/removal, thread/reentrancy/abort/cleanup | dynamic decode plus scalar/collation callback overhead |
 
 The delivery dependencies are:
 

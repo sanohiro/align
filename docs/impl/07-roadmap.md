@@ -3685,6 +3685,16 @@ D13 batch/SoA/high-value native paths
 D14 dynamic SQL + proved callback surfaces
 ```
 
+D14 is three independently useful rails with separate proof ownership: the shipped dual-driver
+dynamic value/row surface, SQLite static-target scalar-function/collation callbacks, and later
+PostgreSQL notice/COPY callbacks. The SQLite callback rail uses one compiler-produced nominal
+descriptor and generated C-ABI trampoline family for both consumers. Scalar functions are
+invocation-scoped and DIRECTONLY; collations use a proved-Pure key producer followed by
+package-owned byte comparison instead of publishing SQLite's unchecked comparator. The exact
+capture/effect/abort/reentrancy/thread/lifetime and cleanup contract is the A2 callback ledger in
+`pkg-design/db.md` §23. Its compiler producer and two native consumers land together because the
+producer alone is dormant and a split would duplicate one ABI/safety proof.
+
 L1a establishes the canonical cycle-safe recursive `DropPlan` classifier and admits
 `Option<string>` as the first conditional owned struct-field leaf. Enclosing and nested structs are
 Move, Drop tests the `Option` tag before freeing the live string, supported partial moves zero the
