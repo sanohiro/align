@@ -3557,7 +3557,8 @@ an `.align` program end to end and tests execution count, decoded values, owners
 errors.
 
 The D1–D14 contracts below are unchanged. Delivery groups them by useful
-consumer outcome:
+consumer outcome. VC1 is a post-D14 compatibility checkpoint over the existing
+surface, not another public capability train:
 
 | Wave | Acceptance owners | Mergeable outcome | Default publication boundary |
 |---|---|---|---|
@@ -3571,6 +3572,7 @@ consumer outcome:
 | Q6 compound product | D10 | many-to-one and one-to-many Output run once end to end | one capability PR after Q4b |
 | A1 throughput/native train | D13 | batch/SoA and driver-native throughput surfaces | independently usable common/driver rails may merge in parallel |
 | A2 dynamic/callback train | D14 | dynamic rows plus proved native callbacks | dynamic SQL and driver callback rails may merge in parallel |
+| VC1 vector compatibility | post-D14 | existing driver-pinned SQL and scalar/bytes mappings are proved against extension-backed vector search | one no-surface integration/documentation checkpoint after D14; not release-gating |
 
 Q1–Q4b and Q6 do not split at their internal D labels. A split is justified only
 when both sides already execute end to end, are independently useful, and do
@@ -3587,6 +3589,12 @@ PostgreSQL callback rails. A rail may use multiple commits but receives one
 review and one selected broad gate when its useful surface is stable. No
 unspecified additional driver is required for completion; any added driver is
 its own consumer-backed rail after the common contracts are proven.
+
+VC1 follows D14 after the complete committed roadmap and versioned-release checkpoint. It does not
+extend either gate. Its purpose is to prove and document what the existing SQL-native surface can
+already express for vector workloads, and to leave an exact boundary for any later native type
+mapping rather than turning the end of D14 into an accidental claim that vector search is portable
+or unsupported.
 
 During active implementation, eight hours must leave a compiling,
 focused-owner-backed source checkpoint and twenty-four hours must leave a whole
@@ -6225,6 +6233,56 @@ one author-side matrix-to-diff pass. A finding that changes callback capture/eff
 argument/result ownership, the comparator strategy, native ABI, registration lifetime, or
 failure/reentrancy behavior changes the public or safety strategy and requires a fresh design review.
 
+### VC1 — vector-search compatibility checkpoint (no public API)
+
+VC1 runs after D14 and changes no public package surface, compiler/runtime ABI, Query descriptor,
+checked-artifact format, or release gate. It adds no `db.vector`, `db.embedding`, `db.nearest`,
+common distance/index enum, SQL rewriter, embedding-generation call, extension loader, or
+driver-capability boolean. Native SQL, migrations, driver restrictions, checked preparation,
+metadata, and EXPLAIN remain the only database-facing mechanisms.
+
+The checkpoint has four bounded outcomes:
+
+1. **PostgreSQL/pgvector existing-surface proof.** In a disposable PostgreSQL database with one
+   explicitly pinned pgvector release, run a driver-pinned static Query whose embedding parameter
+   is ordinary `str`, whose SQL visibly casts `CAST(:embedding AS text)::vector(N)`, and whose Row
+   contains only already-supported scalar/text/byte fields. Cover a filtered top-k query plus its
+   returned distance, direct and prepared execution, checked-metadata regeneration/offline use,
+   `meta_query`, and EXPLAIN. The fixture setup owns `CREATE EXTENSION vector`; `pkg.db` does not
+   install or upgrade it. The existing canonical extension name/version input must participate in
+   schema/server identity, and an absent or changed extension must fail preparation or stale
+   metadata checking rather than select a fallback.
+2. **SQLite/vec1 disposition.** Record an isolated probe against one pinned sqlite.org vec1 release:
+   its vector is a virtual-table/BLOB contract, its JSON conversion and query syntax are native SQL,
+   and its extension must be supplied outside `pkg.db`. Because SQLite extension loading remains
+   disabled and vec1 is not a built-in SQLite type, VC1 claims no shipped SQLite vector support and
+   adds no loader. A later bundled/static-extension proposal needs its own dependency, provenance,
+   platform, initialization, and migration plan.
+3. **Portability record.** Refresh one concise English/Japanese guide from primary vendor sources
+   for PostgreSQL/pgvector, SQLite vec1, MySQL Community versus HeatWave, MariaDB, SQL Server, and
+   Oracle. It records storage type, exact/approximate query form, distance semantics, index family,
+   tuning scope, and extension/service/version availability. Commonality ends at application-owned
+   Params/Row shapes; each executable Query remains driver-pinned SQL.
+4. **No-surface regression proof.** The exported package inventory, public interface bytes/hash,
+   static Query artifact bytes/digest, dynamic `db.value` set, native runtime ABI registry, and
+   ordinary no-extension SQLite/PostgreSQL owners remain byte-for-byte or behaviorally unchanged as
+   applicable. VC1 adds only existing-API integration coverage and documentation. It makes no
+   latency, recall, allocation, or zero-copy promise, so no benchmark is a correctness gate.
+
+The PostgreSQL proof deliberately pays application-visible vector-to-text construction and
+server-side parsing. It is a compatibility path, not a claim of optimal transport. Queries do not
+return a native vector value unless they visibly cast it to an admitted text or byte type; typical
+search Rows return identifiers, common payload columns, and a scalar distance.
+
+Any later direct native-vector mapping is a separate consumer-driven design, not VC1 completion. It
+must remain driver-qualified, keep query/index/tuning syntax in SQL or scoped native options, and
+receive its own public-contract ledger before implementation. For pgvector that ledger must resolve
+the extension type by qualified catalog identity rather than hard-code an installation-local OID;
+bind checked extension identity and version; specify dimension/typmod and finite-element validation;
+and fix Text/Binary encoding, endianness, ownership, allocation, malformed-input precedence, and
+Row-view lifetime. SQLite vec1, MySQL, MariaDB, SQL Server, and Oracle do not inherit that mapping by
+similarity of terminology.
+
 ### Initial release gate
 
 The D labels define acceptance ownership. Publication follows the delivery
@@ -6483,7 +6541,8 @@ The load-bearing implementation shape is settled here and in
 consumer-driven type/native-surface decisions are:
 
 1. Decimal precision/scale representation.
-2. UUID, temporal, JSON/JSONB, PostgreSQL array/range/domain, and SQLite custom-type mappings.
+2. UUID, temporal, JSON/JSONB, PostgreSQL array/range/domain, SQLite custom-type mappings, and
+   driver-qualified native vector mappings such as pgvector or a future bundled SQLite extension.
 3. Which COPY/pipeline/backup/blob operations have a measured consumer. No PostgreSQL COPY consumer
    or workload measurement is currently recorded, so its public surface and implementation remain
    deferred.
@@ -6496,10 +6555,15 @@ The minimal common dynamic `db.value`/`db.row` set and the SQLite scalar-functio
 are settled by §19 and the A2 ledgers in §23. They do not settle the wider logical/native type
 mappings above, SQLite collations, or the separate PostgreSQL callback surface.
 
+Post-D14 VC1 proves only the existing Text/Bytes-and-visible-cast compatibility path and records the
+cross-engine boundary. It does not settle or authorize a native vector value, search, index,
+embedding, extension-loading, or capability-discovery API. Any later native mapping follows VC1's
+driver-qualified ledger requirements and a concrete consumer.
+
 The engine/version nullability/origin support matrix is settled by §16.3.1 and owned by
 D0/D3/D5 rather than this list. The remaining items are consumer-gated future rails after the
-complete committed D14 roadmap. They do not
-permit weakening Query identity,
+complete committed D14 roadmap; vector mapping additionally follows VC1 as stated above. They do
+not permit weakening Query identity,
 one-execution semantics, ownership, static artifacts, runtime validation, or option rejection.
 “The driver library made the choice for us” is not a design rationale.
 

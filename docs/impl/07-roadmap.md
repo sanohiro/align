@@ -96,6 +96,12 @@ The complete committed roadmap is implemented through D14. Future logical
 types, PostgreSQL COPY/callbacks, and SQLite collations remain consumer-gated
 surfaces, not unfinished work in this roadmap.
 
+After D14, one **VC1 vector-compatibility checkpoint** proves PostgreSQL/pgvector and records
+SQLite vec1 plus the wider RDB portability boundary using only the existing driver-pinned SQL,
+Text/Bytes, checked-metadata, metadata, and EXPLAIN surfaces. It adds no public API, native type,
+extension loader, SQL abstraction, or release requirement. The exact no-surface scope and the
+requirements for any later consumer-driven native mapping are in `pkg-design/db.md` §23 VC1.
+
 Every wave must produce a compiling, focused-owner-backed checkpoint within
 eight active hours and a PR-ready capability within twenty-four active hours,
 unless it is waiting only on one still-progressing required command or external
