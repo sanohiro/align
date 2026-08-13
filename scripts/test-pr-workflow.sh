@@ -1316,7 +1316,8 @@ printf "test result: FAILED. 1 passed; 1 failed; 0 ignored\n"
 exit 101')"
 suite_env="$(suite_binary suite_env '
 printf "test needs_network ... FAILED\n"
-printf "\ntest result: FAILED. 0 passed; 1 failed; 0 ignored\n"
+printf "\nfailures:\n    needs_network\n\n"
+printf "test result: FAILED. 0 passed; 1 failed; 0 ignored\n"
 exit 101')"
 # Reached the summary line but still exited non-zero: a harness-level failure
 # that names no test must not be read as a clean binary.
@@ -1333,7 +1334,8 @@ sleep 30')"
 # must not be absorbed by it.
 suite_crash="$(suite_binary suite_crash '
 printf "test beta ... FAILED\n"
-printf "\ntest result: FAILED. 0 passed; 1 failed; 0 ignored\n"
+printf "\nfailures:\n    beta\n\n"
+printf "test result: FAILED. 0 passed; 1 failed; 0 ignored\n"
 exit 139')"
 
 suite_artifact() {
@@ -1496,6 +1498,21 @@ grep -Fq -- '--- suite_hang (exit timeout' "$suite_hang_out" || {
   cat "$suite_hang_out" >&2
   exit 1
 }
+# A target that only produced a synthetic marker reported no trustworthy
+# outcome, so its manifest entries must not be advised out of the file: the
+# hung binary never got to run its known-failing test.
+hang_known_manifest="$(suite_manifest hang-known "$(suite_line suite_hang alpha)")"
+suite_hang_known_out="$(suite_case hang-known "$hang_known_manifest" 1 "$suite_hang")"
+grep -Eq '^  suite_hang[[:space:]]+<binary-did-not-report>$' "$suite_hang_known_out" || {
+  echo "a hung binary with a manifest entry was not reported as did-not-report:" >&2
+  cat "$suite_hang_known_out" >&2
+  exit 1
+}
+grep -Fq 'did NOT fail' "$suite_hang_known_out" && {
+  echo "a hung target's manifest entry was advised out of the file:" >&2
+  cat "$suite_hang_known_out" >&2
+  exit 1
+}
 # The absorption hole: every test the crashing binary named is already in the
 # manifest, so only the exit code distinguishes this run from a clean baseline.
 crash_manifest="$(suite_manifest crash "$(suite_line suite_crash beta)")"
@@ -1508,6 +1525,61 @@ grep -Eq '^  suite_crash[[:space:]]+<binary-exit-139>$' "$suite_crash_out" || {
 grep -Fq 'did NOT fail' "$suite_crash_out" && {
   echo "the crashing binary's known failure was also reported as repaired:" >&2
   cat "$suite_crash_out" >&2
+  exit 1
+}
+# Failure names come from the trailing "failures:" list, not the racy progress
+# lines: stdout and stderr share one log, and a stderr write splicing into the
+# middle of "test beta ... FAILED" used to lose the name and report a phantom
+# <binary-exit-101> instead (observed on the first nightly). The name list is
+# printed after every test finished, so this run matches its manifest line
+# exactly. The detail section exercises the parser's block reset (each
+# "failures:" heading discards what came before); that detail content never
+# LOOKS like a name list is a property of libtest's output shape, which this
+# fixture uses but does not prove.
+suite_dirty="$(suite_binary suite_dirty '
+printf "test alpha ... ok\ntest beta ..."
+printf "stderr splice from a concurrent test\n"
+printf " FAILED\n"
+printf "\nfailures:\n\n---- beta stdout ----\n    indented panic detail\n\n"
+printf "failures:\n    beta\n\n"
+printf "test result: FAILED. 1 passed; 1 failed; 0 ignored\n"
+exit 101')"
+dirty_manifest="$(suite_manifest dirty "$(suite_line suite_dirty beta)")"
+suite_dirty_out="$(suite_case dirty "$dirty_manifest" 0 "$suite_dirty")"
+grep -Fq 'matches' "$suite_dirty_out" || {
+  echo "a spliced progress line changed the verdict despite an intact failures list:" >&2
+  cat "$suite_dirty_out" >&2
+  exit 1
+}
+grep -Fq 'failure-list-unparsed' "$suite_dirty_out" && {
+  echo "a failures list matching its counted total still drew the unparsed marker:" >&2
+  cat "$suite_dirty_out" >&2
+  exit 1
+}
+# A splice INTO the name list itself loses a counted name. The summary's own
+# "N failed" total catches that: the collected names are reported, the deficit
+# draws the synthetic <failure-list-unparsed> no manifest line can match, and
+# the run is red — a mangled list can never absorb a failure. The lost name
+# (beta, listed in the manifest) must NOT be advised out of the file: this
+# target reported no trustworthy outcome.
+suite_splice="$(suite_binary suite_splice '
+printf "test alpha ... FAILED\ntest beta ... FAILED\n"
+printf "\nfailures:\n    alpha\n"
+printf "stderr splice inside the name list\n"
+printf "    beta\n\n"
+printf "test result: FAILED. 0 passed; 2 failed; 0 ignored\n"
+exit 101')"
+splice_manifest="$(suite_manifest splice \
+  "$(suite_line suite_splice alpha)" "$(suite_line suite_splice beta)")"
+suite_splice_out="$(suite_case splice "$splice_manifest" 1 "$suite_splice")"
+grep -Eq '^  suite_splice[[:space:]]+<failure-list-unparsed>$' "$suite_splice_out" || {
+  echo "a spliced failures list was not reported as unparsed:" >&2
+  cat "$suite_splice_out" >&2
+  exit 1
+}
+grep -Fq 'did NOT fail' "$suite_splice_out" && {
+  echo "a name lost to the splice was advised out of the manifest:" >&2
+  cat "$suite_splice_out" >&2
   exit 1
 }
 
@@ -1525,6 +1597,108 @@ grep -Fq 'share a name' "$suite_dup_out" || {
   cat "$suite_dup_out" >&2
   exit 1
 }
+
+# 8. The self-build branch (no artifact argument) must build the workspace
+# before the test-binary build — `cargo test --no-run` alone does not produce
+# libalign_runtime.a, the hole that invalidated the first nightly baseline —
+# and must fail closed as a configuration error (exit 2) when the build still
+# yields no runtime staticlib. Exercised against a copied script tree with a
+# stubbed cargo.sh, so nothing compiles here either.
+suite_build_root="$tmp_dir/suite-build"
+mkdir -p "$suite_build_root/scripts"
+cp "$repo_root/scripts/run-suite-binaries.sh" \
+  "$repo_root/scripts/test-binaries-lib.sh" \
+  "$repo_root/scripts/dyld-env.sh" "$suite_build_root/scripts/"
+suite_build_artifacts="$tmp_dir/suite-build-artifacts.json"
+suite_stream "$suite_build_artifacts" "$suite_green"
+suite_build_cargo_log="$tmp_dir/suite-build-cargo-log"
+# The stub serves `metadata` too: the runner asks cargo where the artifacts
+# landed rather than trusting CARGO_TARGET_DIR (which would miss
+# CARGO_BUILD_TARGET_DIR and any .cargo/config override), and this fixture
+# deliberately exports no target-dir variable at all so the metadata answer is
+# the only source.
+cat >"$suite_build_root/scripts/cargo.sh" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$FAKE_CARGO_LOG"
+case "$1" in
+  build) exit 0 ;;
+  metadata) printf '{"target_directory":"%s"}\n' "$FAKE_TARGET_DIR" ;;
+  test) cat "$FAKE_SUITE_ARTIFACTS" ;;
+  *)
+    echo "unexpected cargo.sh invocation: $*" >&2
+    exit 9
+    ;;
+esac
+STUB
+chmod +x "$suite_build_root/scripts/cargo.sh"
+suite_build_case() {
+  local label="$1" expect_status="$2"
+  local out="$tmp_dir/suite-build-$label-out"
+  local status=0
+  : >"$suite_build_cargo_log"
+  FAKE_CARGO_LOG="$suite_build_cargo_log" \
+    FAKE_SUITE_ARTIFACTS="$suite_build_artifacts" \
+    FAKE_TARGET_DIR="$suite_build_root/target" \
+    ALIGN_GATE_JOBS=2 ALIGN_SUITE_BINARY_TIMEOUT=2 \
+    ALIGN_KNOWN_FAILURES="$empty_manifest" \
+    "$suite_build_root/scripts/run-suite-binaries.sh" >"$out" 2>&1 || status=$?
+  [[ "$status" -eq "$expect_status" ]] || {
+    echo "the self-build branch exited $status (expected $expect_status) for $label:" >&2
+    cat "$out" >&2
+    exit 1
+  }
+  printf '%s\n' "$out"
+}
+# The workspace build ran but left no runtime staticlib: a configuration
+# error, named, and the test-binary build is never attempted.
+suite_build_missing_out="$(suite_build_case missing 2)"
+grep -Fq 'did not produce' "$suite_build_missing_out" || {
+  echo "a missing libalign_runtime.a was not reported:" >&2
+  cat "$suite_build_missing_out" >&2
+  exit 1
+}
+grep -q '^build --workspace --locked$' "$suite_build_cargo_log" || {
+  echo "the self-build branch never ran the workspace build:" >&2
+  cat "$suite_build_cargo_log" >&2
+  exit 1
+}
+if grep -q '^test --no-run' "$suite_build_cargo_log"; then
+  echo "the test-binary build ran despite the missing runtime staticlib:" >&2
+  cat "$suite_build_cargo_log" >&2
+  exit 1
+fi
+# With the staticlib in place the branch proceeds — workspace build, then the
+# metadata lookup, then the test-binary build — through to the normal verdict.
+mkdir -p "$suite_build_root/target/debug"
+: >"$suite_build_root/target/debug/libalign_runtime.a"
+suite_build_ok_out="$(suite_build_case ok 0)"
+grep -Fq 'matches' "$suite_build_ok_out" || {
+  echo "the self-build branch did not reach the normal verdict:" >&2
+  cat "$suite_build_ok_out" >&2
+  exit 1
+}
+[[ "$(sed -n '1p' "$suite_build_cargo_log")" == "build --workspace --locked" ]] || {
+  echo "the workspace build did not run first:" >&2
+  cat "$suite_build_cargo_log" >&2
+  exit 1
+}
+case "$(sed -n '2p' "$suite_build_cargo_log")" in
+  "metadata --format-version 1"*) ;;
+  *)
+    echo "the target-directory lookup did not follow the workspace build:" >&2
+    cat "$suite_build_cargo_log" >&2
+    exit 1
+    ;;
+esac
+case "$(sed -n '3p' "$suite_build_cargo_log")" in
+  "test --no-run --workspace --locked"*) ;;
+  *)
+    echo "the test-binary build did not follow the target-directory lookup:" >&2
+    cat "$suite_build_cargo_log" >&2
+    exit 1
+    ;;
+esac
 
 # The shipped manifest has to satisfy the same parser, and stay free of the
 # duplicates and stray whitespace that would make an entry unmatchable.
