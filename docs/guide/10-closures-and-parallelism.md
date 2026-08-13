@@ -53,8 +53,9 @@ fn show(x: i64) -> i64 {
 }
 
 ys := [1, 2].par_map(fn x { show(x) })
-// error: 'par_map' requires a Pure function, but the lambda has a side
-//        effect (it reads/writes I/O)
+// error: 'par_map' requires a Pure function, but 'main$lambda0' has an
+//        observable side effect (I/O or a caller-view write); use `reduce`
+//        for an accumulation
 ```
 
 A data race needs shared mutable state or unordered side effects; a Pure function by-value-capturing its inputs has neither. So Align doesn't detect races — it makes them **unrepresentable** in the parallel constructs, at compile time, with no `Send`/`Sync` vocabulary to learn.

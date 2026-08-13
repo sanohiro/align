@@ -1,8 +1,8 @@
-# Packages: vendored source, pkg.web, and pkg.jwt
+# Packages: vendored source, pkg.web, pkg.jwt, and pkg.db
 
 > 🌐 **English** · [Japanese](./ja/23-packages.md)
 
-`core` is the language's data layer, `std` is the OS boundary, and `pkg` is the source-package layer for frameworks and domain libraries. The package foundation and the first-party `pkg.web` and `pkg.jwt` packages are available today. What is deliberately still missing is a registry or fetch tool.
+`core` is the language's data layer, `std` is the OS boundary, and `pkg` is the source-package layer for frameworks and domain libraries. The package foundation and the first-party `pkg.web` and `pkg.jwt` packages are available today. A third first-party package, `pkg.db`, exists in the same tree and is still being implemented; the last section of this chapter says exactly where it stands. What is deliberately still missing is a registry or fetch tool.
 
 ## A package is a source tree
 
@@ -11,8 +11,13 @@ A package root is `pkg/<name>.align`, with optional submodules below `pkg/<name>
 ```text
 main.align
 pkg/
+  db.align
   jwt.align
   web.align
+  db/
+    sqlite.align
+    postgres.align
+    pool.align
   web/
     types.align
     cookie.align
@@ -22,7 +27,7 @@ pkg/
 
 `import pkg.web` resolves to `pkg/web.align`; `import pkg.web.cookie` resolves to `pkg/web/cookie.align`. Calls and types remain fully qualified, such as `pkg.web.get(...)` and `pkg.web.types.Ctx`.
 
-Vendoring means copying that source subtree into the consuming project. In this repository, [apps/web/pkg](../../apps/web/pkg) and [apps/jwt/pkg](../../apps/jwt/pkg) are package-author workspaces; copy or merge their `pkg/` directories into your application's root. They are not embedded in the `alignc` archive, Debian package, or Homebrew formula.
+Vendoring means copying that source subtree into the consuming project. In this repository, [apps/web/pkg](../../apps/web/pkg), [apps/jwt/pkg](../../apps/jwt/pkg), and [apps/db/pkg](../../apps/db/pkg) are package-author workspaces; copy or merge their `pkg/` directories into your application's root. They are not embedded in the `alignc` archive, Debian package, or Homebrew formula.
 
 There is no package manifest, lockfile, registry, version solver, or download command. Imports plus the filesystem are the dependency graph, and one `pkg/<name>` exists per source tree. Updating or auditing a dependency means updating or auditing the vendored source.
 
@@ -65,7 +70,7 @@ Public companion modules provide focused, composable pieces:
 - `pkg.web.cors` makes CORS policy decisions without silently permitting an invalid wildcard-plus-credentials policy.
 - `pkg.web.multipart` walks `multipart/form-data` bodies as zero-copy `Part` views. The application supplies `pkg.web.body(c)` and owns the iteration offset.
 
-There is no application-state parameter in the handler shape yet, and no database package. Those are current limitations, not hidden framework facilities.
+There is no application-state parameter in the handler shape yet. That is a current limitation, not a hidden framework facility. Database access is a separate package, `pkg.db`, below.
 
 ## `pkg.jwt`
 
@@ -84,3 +89,13 @@ pub fn main() -> Result<(), Error> {
 ```
 
 Verification pins the algorithm to HS256 instead of trusting the token's `alg` field, and compares signatures in constant time. `time_claims_valid` checks optional `exp` and `nbf` NumericDate claims separately from signature verification. HS384/512, RSA, ECDSA, and public-provider OIDC verification are not exposed until the corresponding audited crypto primitives exist.
+
+## `pkg.db` — real, and still landing
+
+`pkg.db` is the first-party database package, vendored the same way as the other two: [apps/db/pkg](../../apps/db/pkg) holds `pkg/db.align` plus the `pkg.db.sqlite`, `pkg.db.postgres`, and `pkg.db.pool` modules beneath it. It is neither absent nor finished, so this chapter states where it actually is rather than promising a stable surface.
+
+Complete: the first public release scope. Typed static queries and commands are checked against real schema metadata at compile time, execute on both SQLite and PostgreSQL, and regenerate that metadata offline. Prepared statements, transactions, typed row streams with deadlines and cancellation, compound one-to-many and many-to-one outputs, migration lifecycle tooling, and read-only catalog inspection with `EXPLAIN` are all in.
+
+Landing now: the post-release throughput and dynamic rails. Bounded batch and SoA delivery, PostgreSQL-native single-row and portal-batch delivery, and the explicit fixed-capacity, non-waiting `pkg.db.pool` have shipped; driver-explicit dynamic SQL has shipped. Remaining are the proved native callback surface and the final cross-rail audit. Until those close, treat the public surface as still moving.
+
+The compiler side is already in the binary you have: `alignc db prepare`, `db migrate`, `db status`, `db check`, and `db repair` (chapter [16](16-toolchain.md)) drive the checked metadata and the migration catalog. `docs/impl/pkg-design/db.md` is the contract of record.

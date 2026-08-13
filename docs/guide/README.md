@@ -41,4 +41,4 @@ Prefer learning by doing? **[The Little Aligner](../little-aligner/README.md)** 
 
 ## Part V — Packages
 
-- [23 — Packages: vendored source, pkg.web, and pkg.jwt](23-packages.md)
+- [23 — Packages: vendored source, pkg.web, pkg.jwt, and pkg.db](23-packages.md)

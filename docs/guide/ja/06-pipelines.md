@@ -79,6 +79,8 @@ fn main() -> i32 {
 
 `sort()` は昇順にソートし、`sort_by_key(f)` は計算したキーでソートします。`partition(p)` は 1 パスで 2 つの所有配列に分割します。条件を満たす要素、続いてそれ以外です。
 
+現時点でどちらのソートもスカラ専用で、これが構造体の `array<Item>` を扱うときの落とし穴になります。構造体要素に対する `sort` / `sort_by_key` はそのまま拒否され（`'sort' over struct elements is not supported yet (project a field first)`）、`sort_by_key` のキーも順序付け可能なスカラ（整数、浮動小数点数、`char`、`str`）でなければなりません。並べ替えたいフィールドを先に射影してください。
+
 > **Cost:** どちらのsortもstableで、最悪計算量は O(n log n)、所有する結果をmaterializeします。追加の作業領域は最悪 O(n) です。`sort_by_key` はkey関数を入力順に各要素ちょうど1回評価します。これらの保証を保つ限り、内部のmerge方式は変更されることがあります。
 
 ## チャンク分割（一定サイズの切り出し）

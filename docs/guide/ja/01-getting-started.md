@@ -73,11 +73,16 @@ alignc emit-llvm      file.align          最適化前後の LLVM IR をダン�
 alignc emit-obj       file.align [out.o]  object file のみ、link なし
 alignc explain-opt    file.align          optimizer の判断を source line 上で説明
 alignc size           file.align          build して executable の size を報告
-alignc cache clear                        解決した codegen cache を消去
+alignc cache clear                        解決した build cache を消去
+alignc db prepare     file.align          検査済み SQLite/PostgreSQL メタデータを再生成
+alignc db migrate     --entry file.align  明示的なマイグレーションカタログを適用
+alignc db status      --entry file.align  マイグレーションの状態を報告
+alignc db check       --entry file.align  期待どおりの状態であることを要求
+alignc db repair      --entry file.align  dirty な 1 件をチェックサム束縛で修復
 alignc --version                          compiler version を表示
 ```
 
-日常的な開発サイクルでは、編集中は `check` を、テスト実行時は `run` を使用します。また、`emit-llvm` の存在を早めに知っておくことは有益です。Align は、素直なコードが効率的な機械語にコンパイルされるように設計されています。`emit-llvm` は、その設計通りにコンパイルされているかをご自身の目で確かめるためのコマンドです。
+`db` グループが関係するのは、`pkg.db` パッケージを使うプロジェクトだけです（第 [23](23-packages.md) 章）。日常的な開発サイクルでは、編集中は `check` を、テスト実行時は `run` を使用します。また、`emit-llvm` の存在を早めに知っておくことは有益です。Align は、素直なコードが効率的な機械語にコンパイルされるように設計されています。`emit-llvm` は、その設計通りにコンパイルされているかをご自身の目で確かめるためのコマンドです。
 
 ## コンパイルエラーを読む
 

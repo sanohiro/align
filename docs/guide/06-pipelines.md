@@ -82,6 +82,8 @@ fn main() -> i32 {
 
 `sort()` sorts ascending; `sort_by_key(f)` sorts by a computed key. `partition(p)` splits one pass into two owned arrays: satisfying, then rest.
 
+Both sorts are scalar-only for now, which is the pitfall on an `array<Item>` of structs: `sort` and `sort_by_key` over struct elements are rejected outright (`'sort' over struct elements is not supported yet (project a field first)`), and a `sort_by_key` key must be an orderable scalar — an int, a float, a `char`, or a `str`. Project the field you want to order by first.
+
 > **Cost:** Both sorts are stable, have O(n log n) worst-case time, and materialize an owned result. Additional working storage is O(n) in the worst case. `sort_by_key` evaluates its key function exactly once per element, in input order. The current merge strategy may change without changing these guarantees.
 
 ## Chunking
