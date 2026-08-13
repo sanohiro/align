@@ -801,7 +801,9 @@ target and cause the compiler to emit a nominal descriptor and package-specific 
 package contract owns the complete ABI and malformed-input policy; source can neither construct nor
 reinterpret the descriptor. This reuses ordinary effect/provenance/cleanup facts while keeping
 closure allocation, unsafe permission, native pointers, and callback-frame views out of the public
-language. Persisted native semantics remain a separate package concern: for example, SQLite
+language. Invocation-scoped callback views are non-Send: direct, imported, and concrete indirect
+helper facts preserve that provenance to every `spawn`/`par_map` sink, while an unresolved target
+fails closed. Persisted native semantics remain a separate package concern: for example, SQLite
 collations still need versioned ordering identity and migration/`REINDEX`, even if their callback
 body is statically proved Pure.
 

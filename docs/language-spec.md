@@ -688,8 +688,9 @@ contract fixes the source signature, effects/provenance, native ABI, lifetime, c
 and malformed-input behavior. This forms neither a closure environment nor an ordinary function
 value. Application source cannot construct the descriptor, obtain a callback pointer, choose an
 arbitrary native signature, or use this narrow mechanism as general reverse FFI; callback views are
-invocation-scoped and cannot escape the trampoline. (`draft.md` §15 for the extern/`unsafe` rules,
-§8 for the producer trampoline.)
+invocation-scoped and cannot escape the trampoline or cross a `spawn`/`par_map` worker boundary.
+Direct, imported, and indirect helper calls preserve that non-Send fact or fail closed when it is
+unavailable. (`draft.md` §15 for the extern/`unsafe` rules, §8 for the producer trampoline.)
 
 A function containing `unsafe` is inferred Impure, so it can **never** be a `par_map` callee — the
 danger stays visible and traceable.
