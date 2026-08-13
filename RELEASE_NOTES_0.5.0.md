@@ -48,7 +48,7 @@ Typed streams can materialize one-pass nested products without reflection. Bound
 
 When SQL cannot be static, the common dynamic rail accepts a closed `pkg.db.value` sum and provides `dynamic_execute`, `dynamic_rows`, and `dynamic_next`. Each returned row is copied into the caller's explicit region. PostgreSQL validates binary OIDs and formats; SQLite maps runtime storage classes without weakening ownership or cleanup guarantees.
 
-SQLite scalar functions can be registered with exact noncapturing Align function targets. Argument and result values use the same closed dynamic value model, native callback state is allocation-accounted, and panics, malformed native values, invalid callback values, and callback errors cross the C boundary as deterministic SQLite errors rather than unwinding through it.
+SQLite scalar functions can be registered with exact noncapturing Align function targets. Argument and result values use the same closed dynamic value model, native callback state is allocation-accounted, and malformed native values, invalid callback values, and callback-returned errors cross the C boundary as deterministic SQLite errors. A language hard error still terminates the process; the callback boundary does not catch or downgrade it.
 
 ## Language and compiler foundations
 
