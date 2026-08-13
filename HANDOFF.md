@@ -64,6 +64,18 @@ The exact contracts and implementation matrices are in
 `docs/impl/pkg-design/db.md` §23. PostgreSQL COPY remains deferred by that
 document's §25 until a concrete measured consumer selects its public operation.
 
+Active align-llm compatibility checkpoint: branch `agent/align-llm-hir-validator-compat` is based
+on `origin/main` `1be17b0ec7e4f05ec19a3b5f5c5145732fe1e406`. That release compiler correctly
+made a previously silent HIR-to-MIR rejection loud, exposing that Sema admits both `str.clone()`
+and `string.clone()` while the body validator accepted only the borrowed receiver. The candidate
+routes both stages through `align_sema::str_clone_body_ty`. Review of `efd6edaa` found that newly
+admitted fresh and control-flow receivers also had to use MIR's borrow-owned lowering path; the
+consolidated repair adds that ownership closure plus discriminating local, field, temporary, and
+control-flow owners and synchronizes the exact ledger. The repaired focused owner, exact release
+workspace build, and real align-llm 15-unit per-unit check all pass. The consolidated review repair
+is committed after the reviewed candidate. Next: run exact-head preflight, merge, then pin
+align-llm to the merged commit and continue the consumer capability. The working tree is clean.
+
 Out-of-gate suite status (suites outside the bounded CI gate; a nightly
 full-suite workflow runs them daily so this class cannot rot silently). The
 nightly no longer runs `cargo test --workspace`, which stopped at the first

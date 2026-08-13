@@ -708,6 +708,54 @@ fn str_clone_of_decoded_field_is_owned() {
 }
 
 #[test]
+fn owned_string_clone_duplicates_locals_and_fields() {
+    // `string.clone()` uses the same HIR node as `str.clone()`, but its receiver remains owned.
+    // A fresh receiver needs a hidden owner that is dropped after the copy; otherwise each
+    // `make().clone()` leaks its first allocation. Pin that ownership independently of LLVM.
+    let temporary = "fn make() -> string = \"temp\".clone()\nfn main() -> i32 {\n  mut total := 0\n  loop {\n    cloned := make().clone()\n    total = total + cloned.len() as i32\n    if total >= 4 { break }\n  }\n  return total\n}\n";
+    let mut source_map = SourceMap::new();
+    let checked = check(&mut source_map, "owned-string-clone-temporary.align", temporary);
+    assert!(
+        !checked.diags.has_errors(),
+        "unexpected errors:\n{}",
+        align_driver::format_diagnostics(&source_map, &checked.diags)
+    );
+    let mir = lower_to_mir(&checked.hir);
+    let main = mir
+        .fns
+        .iter()
+        .find(|f| f.name.as_str() == "main")
+        .expect("main MIR");
+    let dropped_owners = main
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .filter_map(|stmt| match stmt {
+            align_mir::Stmt::Drop(slot) => Some(*slot),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        dropped_owners.len() >= 2,
+        "the fresh receiver and cloned result need distinct owners:\n{}",
+        align_mir::print::function_to_string(main)
+    );
+
+    if !backend_available() {
+        return;
+    }
+    // Exercise bound locals and fields plus both arms of value-carrying control flow. Cloning is a
+    // borrow, so every selected source remains printable and is freed only by its original owner.
+    let src = "Holder { text: string }\nfn make(label: str) -> string = label.clone()\nfn main() -> i32 {\n  original := \"hello\".clone()\n  direct := original.clone()\n  holder := Holder { text: original }\n  field := holder.text.clone()\n  temporary := make(\"temp\").clone()\n  left := \"left\".clone()\n  right := \"right\".clone()\n  from_left := (if true { left } else { right }).clone()\n  from_right := (if false { left } else { right }).clone()\n  print(direct)\n  print(field)\n  print(holder.text)\n  print(temporary)\n  print(from_left)\n  print(from_right)\n  print(left)\n  print(right)\n  return (direct.len() + field.len() + holder.text.len() + temporary.len() + from_left.len() + from_right.len() + left.len() + right.len()) as i32\n}\n";
+    let out = build_and_run("owned-string-clone", src);
+    assert_eq!(out.status.code(), Some(37));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hello\nhello\nhello\ntemp\nleft\nright\nleft\nright\n"
+    );
+}
+
+#[test]
 fn owned_string_moved_into_callee_is_freed_once() {
     if !backend_available() {
         return;

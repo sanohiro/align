@@ -6705,7 +6705,8 @@ impl<'a> BodyValidator<'a> {
             }
             hir::ExprKind::StrClone(value) => {
                 let flow = self.expr_flow(value)?;
-                (flow.ty == Ty::Str).then_some((Ty::String, flow.falls, flow.breaks))
+                align_sema::str_clone_body_ty(flow.ty)
+                    .then_some((Ty::String, flow.falls, flow.breaks))
             }
             hir::ExprKind::CloneIn { value, region } => {
                 let value = self.expr_flow(value)?;

@@ -297,6 +297,15 @@ pub fn ord_body_ty(ty: Ty) -> bool {
     ty.is_numeric() || matches!(ty, Ty::Char | Ty::Str | Ty::String)
 }
 
+/// Whether `ty` is a text receiver that the source checker lowers to [`ExprKind::StrClone`].
+///
+/// This is the single producer authority for the clone input rule. Both borrowed `str` and owned
+/// `string` clone into a new owned `string`; the checked-HIR body validator delegates here instead
+/// of narrowing the accepted receiver back to `str`.
+pub fn str_clone_body_ty(ty: Ty) -> bool {
+    matches!(ty, Ty::Str | Ty::String)
+}
+
 /// The materialized element scalar of a `scan` accumulator, or `None` when the accumulator cannot
 /// be materialized into an `array<A>`.
 ///
@@ -35668,7 +35677,9 @@ impl<'a, 't> Checker<'a, 't> {
             // Unlike `box.clone`, it needs no arena: the result owns its buffer and is `Drop`-freed,
             // so it can outlive any region — this is how a zero-copy view escapes. (Arena-bump
             // cloning, the in-arena optimization, is a later sub-slice.)
-            Ty::Str | Ty::String => Expr { kind: ExprKind::StrClone(Box::new(recv)), ty: Ty::String, span },
+            ty if str_clone_body_ty(ty) => {
+                Expr { kind: ExprKind::StrClone(Box::new(recv)), ty: Ty::String, span }
+            }
             Ty::Error => Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span },
             other => {
                 self.diags

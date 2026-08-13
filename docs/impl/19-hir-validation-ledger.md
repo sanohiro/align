@@ -618,7 +618,7 @@ The result formula in every row is followed by the universal
 | `HeapNew` | `env[]`; `child[value]`; `post[inside arena; payload first satisfies the box type-argument predicate, then additionally rejects Slice; result Box(payload scalar); value is copied into the owned box allocation]`. |
 | `BoxGet` | `env[]`; `child[box]`; `post[box.ty == Box(S), S is Copy; result scalar_to_ty(S); box borrowed]`. |
 | `BoxClone` | `env[]`; `child[box]`; `post[box.ty == Box(S), S is Copy; result same Box(S); inside arena; source borrowed and destination newly arena-owned]`. |
-| `StrClone` | `env[]`; `child[str]`; `post[str.ty == Str; result String; source borrowed; result individually owned unless current arena captures it]`. |
+| `StrClone` | `env[]`; `child[text]`; `post[text.ty is Str or String; result String; source borrowed without transfer; a fresh owned receiver is kept live only through the copy; result individually owned unless current arena captures it]`. |
 | `StrPredicate` | `env[kind]`; `child[haystack,needle]`; `post[both Str; Contains/StartsWith/EndsWith/EqIgnoreCase result Bool; Find/Rfind result Option<i64>; both borrowed]`. |
 | `StrTrim` | `env[kind]`; `child[recv]`; `post[recv Str; result Str; view inherits recv roots/region]`. |
 | `StrBorrow` | `env[]`; `child[string]`; `post[string.ty == String; result Str; owned source is borrowed and remains live]`. |
@@ -1004,12 +1004,13 @@ an added, removed, duplicated, or unowned discriminator.
 ## Producer-delegation closure matrix
 
 This matrix closes the **silent-empty-MIR** class: the body validator answering
-a question the producer already owns, with a rule that is not equivalent. Every
-occurrence rejects the whole checked program at the MIR boundary, so the unit
-lowers to the canonical empty program and links with an undefined `_main`. Four
-earlier occurrences shipped as `#742`, `#744`, `#749`, and `#737`; the two rows
-below are the fifth and sixth. Every one was "the validator re-derived a
-producer fact", never malformed HIR.
+a question the producer already owns, with a rule that is not equivalent. Before
+`#774`, each occurrence rejected the whole checked program into the canonical
+empty program and an undefined `_main`; the fallible production boundary now
+reports the refusing validator and function instead. Seven earlier occurrences
+shipped through `#742`, `#744`, `#749`, `#737`, and `#774`; the owned-`string`
+clone row below is the eighth. Every one was "the validator re-derived a producer
+fact", never malformed HIR.
 
 ### Split model
 
@@ -1044,11 +1045,24 @@ Eight occurrences; one diverged.
 | `array_builder_elem_ok` | `check_array_builder_new` | Wider, never narrower: sema admits `Int/Float/Bool/Char/String`; the validator additionally admits `Str`. A wider gate cannot reject a checked program, so it is outside this class. No change. |
 | `ResourceViewFromRaw` view scalar (2 sites) | none | Structural: `Scalar::Slice` is *constructed from* a `PrimScalar`, so this is a representation conversion, not an admission rule. No change. |
 
-One further admission gate diverged without being spelled `scalar_to_prim`:
+Two further admission gates diverged without being spelled `scalar_to_prim`:
 
 | Gate | Producer authority | Verdict |
 |---|---|---|
 | `orderable_body_ty` (`sort_by_key` key) | `Bound::Ord` | **Divergent.** Sema's bound accepts owned `string`; the validator re-listed the arms and stopped at `str`. Both now call `align_sema::ord_body_ty`. |
+| `StrClone` receiver | `check_box_clone` | **Divergent.** Sema lowers both borrowed `str` and owned `string` receivers to `StrClone`; the validator admitted only `str`. Both now call `align_sema::str_clone_body_ty`. |
+
+The owned-receiver repair also closes the lowering boundary exposed by admitting the producer's
+complete contract:
+
+| Cell | Required behavior | Owner |
+|---|---|---|
+| Construction and malformed HIR | Sema and the body validator share the exact `Str`/`String` receiver gate; every other receiver remains rejected before MIR. | `align_driver::m5::owned_string_clone_duplicates_locals_and_fields`; existing malformed-HIR validator owners |
+| Bound local and field | Clone borrows the place, leaves its ownership bit and storage unchanged, and creates one independently owned result. | `align_driver::m5::owned_string_clone_duplicates_locals_and_fields` |
+| Fresh receiver and cleanup | A fresh `string` moves into a hidden owner, stays live through `Rvalue::StrClone`, and is dropped immediately after the copy, including on each loop iteration. | `align_driver::m5::owned_string_clone_duplicates_locals_and_fields` (MIR owner plus executable result) |
+| Value-carrying control flow | `if`/`match`/`else` and transparent scopes lower once in borrow mode; the selected bound arm is not moved or nulled, while a fresh selected arm retains its path-local cleanup bit. | `align_driver::m5::owned_string_clone_duplicates_locals_and_fields`; shared `lower_expr_for_borrow` owners |
+| Early exit | Receiver evaluation that terminates does not emit a clone; the pre-registered synthetic owner participates in existing exit cleanup. | shared `lower_borrowed_owned` early-exit owners |
+| Whole/per-unit and backend | The unchanged `StrClone` MIR/codegen shape accepts either layout-identical text receiver after checked-HIR validation. | `align_driver::m5::owned_string_clone_duplicates_locals_and_fields`; real align-llm per-unit check |
 
 **Deferred, same arm — `ord-key` Move keys.** Delegating orderability does not by
 itself make a `string`-keyed `sort_by_key` lower. `pipeline_callable_ok` requires
@@ -1203,6 +1217,7 @@ this have caught the bug I just fixed?*
 | A vanished checked program is an error at the one boundary, and the infallible entry points still fail closed | `align_mir` `lower_program_checked_reports_a_vanished_checked_program` |
 | Delegating a gate does not switch it off | `align_mir` `delegated_gates_still_refuse_a_genuinely_different_type` (struct accumulator, unordered key, mismatched map_err mapper, and two distinct source shapes under the shape matcher) |
 | A sum-type scan accumulator compiles and runs | `align_driver` `unit_values::sum_type_scan_accumulator_compiles_and_runs` |
+| Borrowed and owned text clones both survive checked HIR and execute | `align_driver` `m5::str_clone_escapes_arena_as_owned_string`, `m5::owned_string_clone_duplicates_locals_and_fields` |
 | A new raw `Ty`/`Scalar` comparison in the body validator cannot land silently | `align_mir` `raw_nominal_comparisons_stay_enumerated` — recomputes the sites from `validate_hir.rs` and matches them against an audited allowlist, naming any new site and what to do about it |
 | The detector recognises the class and ignores everything else | `align_mir` `the_raw_comparison_detector_recognises_the_class` — all six recorded spellings fire; six split-free spellings do not |
 | End-to-end acceptance | `align_driver` `mir_continuation`, `unit_values` |
