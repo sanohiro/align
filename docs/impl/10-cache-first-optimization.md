@@ -558,13 +558,14 @@ package cache, not this slice. A saturated four-core CI runner is CPU-bound on e
 the wall-clock effect there should track the CPU column rather than the (partly parallel) local wall
 column.
 
-### 6.7 SHIPPED — persistent per-unit frontend cache
+### 6.7 SHIPPED 2026-08-12 (#761) — persistent per-unit frontend cache
 
 §6.6's memo makes a second identical compilation cheap inside ONE process; §6.2's object cache makes
 a second *codegen* cheap across processes. Neither makes a second **frontend** cheap across
 processes, and that is the last stage every new process recomputes — the codegen key's `impl_hash`
 is produced BY the frontend, so the object cache cannot be consulted until sema and lowering have
-already run.
+already run. This closes item 1 of the dedicated build-performance track,
+`docs/impl/21-build-perf-plan.md`.
 
 `crates/align_driver/src/unit_cache.rs` persists, per unit, exactly what a later build needs in
 order not to check that unit again:

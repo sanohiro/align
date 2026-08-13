@@ -21,6 +21,10 @@ invented exact counts here.
   promote an explicit question into `SKILL.md`. Third: add a lint, structural
   assertion, or parameterized owner where feasible; otherwise make the closure
   matrix cell mandatory and record why automation is not sound.
+- A class found by internal investigation is tracked in its owning ledger rather
+  than counted here. The silent-empty-MIR / producer-delegation class
+  (`docs/impl/19-hir-validation-ledger.md`) is the current example, at eight
+  occurrences with its own source-analysis owners.
 
 ## Root-cause counts
 
@@ -35,20 +39,21 @@ invented exact counts here.
 | `producer-evidence-propagation` | 1 | 1 | Watch; exact producer-to-consumer evidence owner required. |
 | `public-surface-completeness` | 2 | 2 | Promoted: compare the complete exported surface to the ledger and require an internal/sealed boundary for cross-module helpers. |
 | `operation-matrix-completeness` | 7 | 6 | Three-plus events: automation required. Add one parameterized dual-driver parity owner that runs the same descriptor/status/sentinel matrix through both drivers and asserts identical error-class mapping; also check native command tags (PostgreSQL answers `COMMIT` in an aborted transaction with `PGRES_COMMAND_OK` and a `ROLLBACK` tag), retain failed rows state after every cleanup failure, and keep PostgreSQL parameter/result format axes independent. |
-| `error-contract-identity` | 2 | 2 | Promoted: pin error class, query identity, and complete multi-invalid precedence. |
-| `source-of-truth-drift` | 10 | 7 | Three-plus events: the mandatory ledger-to-diff extraction pass in `SKILL.md` is the owner — extract every `must`/`exact`/`every`/`before`/`reject`/`required` line from the touched design sections and point each at implementation or an explicit deferral. Re-read adjacent comments and counter documentation against behavior, including internal interface/cache invalidation and runtime ABI inventory totals. A lexical lint is not sound here because the drift is semantic, so the extraction pass is mandatory rather than automated. |
-| `owner-test-topology` | 3 | 3 | Three-plus events: every named closure-matrix cell must have a direct owner whose witness is **mutation-verified against the pre-fix compiler**, not merely present; retain whole/per-unit owners when refactoring fixtures. A witness that counts something the defect does not duplicate (a `.clone()` outside the duplicated subtree) passes on the broken compiler and closes nothing. |
+| `error-contract-identity` | 3 | 3 | Three-plus events: a lexical lint cannot see whether an error *value* carries its own identity, so the automated owner is per-error-type and the closure-matrix cell is mandatory. Every fallible boundary that can refuse needs a discriminating owner asserting the refusing pass/stage and the offending identity in the produced error (#774's `lower_program_checked_reports_a_vanished_checked_program` names the validation pass and function; `ContractError` pins error class, query identity, and complete multi-invalid precedence). |
+| `source-of-truth-drift` | 12 | 9 | Three-plus events: the mandatory ledger-to-diff extraction pass in `SKILL.md` is the owner — extract every `must`/`exact`/`every`/`before`/`reject`/`required` line from the touched design sections and point each at implementation or an explicit deferral. Re-read adjacent comments and counter documentation against behavior, including internal interface/cache invalidation and runtime ABI inventory totals. A lexical lint is not sound here because the drift is semantic, so the extraction pass is mandatory rather than automated. |
+| `owner-test-topology` | 4 | 4 | Three-plus events: every named closure-matrix cell must have a direct owner whose witness is **mutation-verified against the pre-fix compiler**, not merely present; retain whole/per-unit owners when refactoring fixtures. A witness that counts something the defect does not duplicate (a `.clone()` outside the duplicated subtree) passes on the broken compiler and closes nothing. #774 adds the negative direction: a delegated gate also needs an owner proving it still refuses a genuinely different type. |
 | `test-global-state-isolation` | 1 | 1 | Watch; prefer child-scoped environment and RAII restoration. |
 | `test-entry-abi-exactness` | 1 | 1 | Watch; compile fixtures through the real entry ABI. |
 | `mutation-noop-idempotency` | 1 | 1 | Watch; prove unchanged input performs no write. |
 | `native-evidence-applicability` | 1 | 1 | Watch; project optional native evidence only for engines/access methods whose semantics are proved. |
-| `analysis-control-path-completeness` | 5 | 2 | Three-plus events: automation required and shipped in #734 — call effects route through one shared atomic post-argument transition (`apply_borrow_mut_calls`/`apply_borrow_mut_call_effects`) used by the exhaustive walk, the eager worklist, and the transparent spine, with the parameterized `borrow_mut_shaper_retention` owner module covering each control path. Extended for MIR *lowering*: `borrow_mode_differs` is the single authority for "borrow mode is not `lower_expr`", gating both `lower_expr_for_borrow`'s dispatch (`_ => unreachable!`) and `eager_worklist_children`'s filter, with `borrow_transparent_scope_block` as the one scope-kind enumeration shared with `moved_drop_flag`/`temporary_drop_flag`; the `borrowed_control_flow_temporaries_lower_exactly_once` owner sweeps all 14 cells with mutation-verified structural counts. |
-| `analysis-fact-consumer-sweep` | 4 | 1 | Three-plus events: automation required. #734 closed the exact/fallback selection into one shared `borrow_mut_source_indices` used by both liveness and escape consumers. Remaining open cell: EscapeCheck still carries three unshared destination/incoming region computations (`mutable_destination_storage_region`, the `AssignField` arm, the whole-`Assign` arm); consolidation into one shared authority is the next capability, with four verified fail-open probes recorded in its plan. |
+| `analysis-control-path-completeness` | 6 | 3 | Three-plus events: automation required and shipped in #734 — call effects route through one shared atomic post-argument transition (`apply_borrow_mut_calls`/`apply_borrow_mut_call_effects`) used by the exhaustive walk, the eager worklist, and the transparent spine, with the parameterized `borrow_mut_shaper_retention` owner module covering each control path. Extended for MIR *lowering*: `borrow_mode_differs` is the single authority for "borrow mode is not `lower_expr`", gating both `lower_expr_for_borrow`'s dispatch (`_ => unreachable!`) and `eager_worklist_children`'s filter, with `borrow_transparent_scope_block` as the one scope-kind enumeration shared with `moved_drop_flag`/`temporary_drop_flag`; the `borrowed_control_flow_temporaries_lower_exactly_once` owner sweeps all 14 cells with mutation-verified structural counts. #786 recurred *past* that automation from a new direction — the authority was correct, but admitting a new receiver type silently added cells the sweep never enumerated — so any change that widens what a borrow-mode gate accepts must re-run the 14-cell sweep over the newly admitted shapes. |
+| `analysis-fact-consumer-sweep` | 5 | 2 | Three-plus events: automation required. #734 closed the exact/fallback selection into one shared `borrow_mut_source_indices` used by both liveness and escape consumers. Remaining open cell: EscapeCheck still carries three unshared destination/incoming region computations (`mutable_destination_storage_region`, the `AssignField` arm, the whole-`Assign` arm); consolidation into one shared authority is the next capability, with four verified fail-open probes recorded in its plan. #774 extends the rule to delegated gates: fix the reported gate by sweeping every sibling that re-derives the same producer fact. |
 | `memoized-input-completeness` | 1 | 1 | Watch; a memoized step must key every semantic input it reads, including caller-seeded diagnostics and process toggles. |
 | `resource-bound-completeness` | 5 | 2 | Three-plus events: long-lived process caches require a byte-accounted retention bound and reachable refusal owner; native protocols require parameter-count, aggregate-message, per-encoding accepted-limit/rejected-next, and fixed-field accounting owners. |
 | `canonical-key-encoding` | 1 | 1 | Watch; variable key fields must use one length-delimited canonical encoder rather than ad hoc separators. |
 | `shared-artifact-concurrency` | 1 | 1 | Watch; retention derived from emitted files must fail closed when emissions overlap on one path. |
 | `performance-evidence-completeness` | 1 | 1 | Watch; measure the unaffected one-shot path before enabling a process-wide performance optimization by default. |
+| `infallible-entrypoint-contract` | 1 | 1 | Watch; an inspection entry point documented as infallible must stay fail-closed on input no producer emits (unchecked or hand-overridden HIR). Only the explicitly fallible boundary may reject, and every production path must use that boundary. |
 | `historical-workflow-source-boundary` | 1 | 1 | Watch; a workflow that checks out an older tag must not assume newly added helper scripts exist in that historical source tree. |
 
 ## Event log
@@ -142,6 +147,18 @@ invented exact counts here.
 | #776 | `3da5488c` | P1 | `operation-matrix-completeness` | Prove driver-native transaction idleness before returning every wrapper-idle pooled connection. |
 | #776 | `3da5488c` | P2 | `source-of-truth-drift` | Reconcile pooled transaction Drop with the earlier direct-connection close-only rule. |
 | #776 | `3da5488c` | P2 | `source-of-truth-drift` | Record the exact fixed-capacity non-waiting pool contract in Settled. |
+| #774 | `a23f5a98` | P1 | `infallible-entrypoint-contract` | Keep the infallible `lower_to_mir*` inspection surface fail-closed; only the fallible boundary may reject. |
+| #774 | `a23f5a98` | P2 | `source-of-truth-drift` | `orderable_body_ty` was narrower than sema's `Bound::Ord`; both now call `align_sema::ord_body_ty`. |
+| #774 | `a23f5a98` | P2 | `analysis-fact-consumer-sweep` | Sweep the other seven delegated gates rather than fixing only the reported one. |
+| #774 | `a23f5a98` | P2 | `error-contract-identity` | `LoweringRejected` must name the refusing validation pass and function. |
+| #774 | `a23f5a98` | P2 | `owner-test-topology` | Add negative owners proving a delegated gate still refuses a genuinely different type. |
+| #786 | `efd6edaa` | P1 | `analysis-control-path-completeness` | Newly admitted unbound and value-carrying `String` clone receivers must use borrow-owned lowering and the eager-child filter, not ordinary lowering. |
+| #786 | `efd6edaa` | P2 | `source-of-truth-drift` | Synchronize the exact `StrClone` expression row with the new producer-delegation row. |
+
+The rows above are the reviews whose logs are reachable from this checkout's
+`.git/`. Capabilities produced in agent worktrees (#777 and later, other than
+#786) keep their logs with those worktrees; their finding sets are unrecorded
+here and belong to their owning sessions to reconcile.
 
 ## Rejected claims
 

@@ -36,12 +36,20 @@ Read the narrowest relevant source before changing a design or implementation:
   Settled items are locked; read them before proposing language changes.
 - `docs/impl/00-overview.md` through `07-roadmap.md` — compiler strategy,
   pipeline, and milestone truth.
-- `docs/impl/09-explain-opt.md` through
-  `15-pkg-web-plan.md` — focused implementation plans and audits. Read the
-  relevant audit before modifying its optimization or safety path.
+- `docs/impl/09-explain-opt.md` through `21-build-perf-plan.md` — focused
+  implementation plans, ledgers, and audits (two numbers carry two documents
+  each, so read by filename). Read the relevant one before modifying its
+  optimization, safety, ABI, or validation path.
+  `17-library-boundary-prerequisites.md` owns the native-library boundary,
+  `19-hir-validation-ledger.md` the checked-HIR record contract,
+  `20-runtime-abi-ledger.md` the runtime ABI inventory, and
+  `21-build-perf-plan.md` the build-performance track, which deliberately
+  consumes no milestone.
 - `docs/impl/std-design/`, `core-design/`, and `pkg-design/` — shipped and
   planned library surfaces. English files are authoritative; `ja/` mirrors
   must not drift.
+- `docs/archive/` — dated historical handoffs. Never a source of current
+  status.
 
 For `pkg.web`, `docs/impl/15-pkg-web-plan.md` is the plan of record and
 `docs/impl/pkg-design/web.md` is the design source of truth.
@@ -265,6 +273,10 @@ dir forces a near-full rebuild in both directions on every alternation. It respe
 `LLVM_CONFIG`, `LLVM_SYS_221_PREFIX`, and `LIBRARY_PATH` overrides. Repository
 shell scripts require Bash and must remain compatible with the macOS-provided
 Bash 3.2 and current Debian/Ubuntu Bash; do not invoke them through `sh`.
+Every Linux CI job sets `ALIGNC_LINKER=lld` and the macOS legs set `system`, so
+a missing `ld.lld` is a red build rather than a silent fallback to the slow
+system linker; locally an unset value fails open to `ld.lld` when the matched
+LLVM install has one (`docs/impl/21-build-perf-plan.md` item 2).
 
 Run the narrow regression target that owns the changed behavior. There is no
 mandatory full-workspace test command: deep driver, fuzz, resource, stress,
@@ -272,6 +284,26 @@ and integration targets run only when they own the changed boundary.
 Benchmarks are separate local measurements run only for the changed
 performance path or an explicit performance/resource claim. See
 `docs/impl/16-test-policy.md` for selection and growth rules.
+
+**Thirty minutes is the hard test budget.** A run that needs longer is
+worthless as a detector, so the nightly suite job carries `timeout-minutes: 30`
+and the runner caps each individual binary at 15 minutes. Exceeding the budget
+*is* the red signal, not a number to raise: cut test cost or raise concurrency
+with `ALIGN_GATE_JOBS`, the shared knob `scripts/test-binaries-lib.sh` reads for
+both the bounded gate and the full suite. Do not add a suite whose cost only
+fits by extending the budget.
+
+**The nightly full suite is the out-of-gate detector, not a second gate.**
+`scripts/test-pr.sh` is bounded by design, so every suite outside it can rot on
+`main` unnoticed — four such failures accumulated before 2026-08-10.
+`.github/workflows/nightly.yml` builds once and runs every compiled test binary
+through `scripts/run-suite-binaries.sh`, diffing the observed failures against
+`scripts/known-failures.txt` in **both** directions: a new failure is named, and
+a manifest line whose test starts passing stays red until the change that fixed
+it deletes the line. `scripts/run-suite-binaries.sh` reproduces that judgement
+locally. A red nightly is triaged against the manifest; it does not block an
+unrelated PR, and it never substitutes for running a change's owner target
+locally before pushing.
 
 **CI is the final guard, never the discovery loop.** In any implementation
 flow — human or agent-driven — do not push a change to find out whether
