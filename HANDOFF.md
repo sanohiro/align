@@ -7,7 +7,7 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-13._ The C-B borrow/ownership capability is complete
+_Last updated: 2026-08-14._ The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit
 region materialization is complete through L4 and L6. Direct, captured,
 imported, and function-value returns preserve exact owner provenance;
@@ -19,9 +19,12 @@ Drop; named regions support explicit recursive cloning plus chunked `RegionPlain
 array construction without a hidden heap vector; and the library-boundary
 prerequisites are complete through L7. The `pkg.db` roadmap is complete through
 Q1–Q6, D13's common batch/SoA rail, its PostgreSQL lease/status/delivery/format
-and pool rails, and D14's dual-driver dynamic SQL; the wave-by-wave record moved
-to the 2026-08-13 archive. The remaining D14 work is the proved callback surface
-and the final cross-rail audit.
+and pool rails, and D14's dual-driver dynamic SQL and proved SQLite scalar
+callbacks. The final cross-rail audit is complete: arena-owned owner patterns,
+the Q5b1 connection-v2 reset, partial SQLite fixture interposition, and
+PostgreSQL streamed-versus-buffered fixture isolation were closed, and all
+thirteen `pkg.db` owner suites now run in the local and required CI gate. The
+wave-by-wave record moved to the 2026-08-13 archive.
 The exact contracts and implementation matrices are in
 `docs/impl/pkg-design/db.md` §23. PostgreSQL COPY remains deferred by that
 document's §25 until a concrete measured consumer selects its public operation.
@@ -96,7 +99,7 @@ A1 PostgreSQL formats            complete / binary parameters/results + protocol
 A1 explicit fixed pool           complete / SQLite + PostgreSQL non-waiting ownership / D13
 deferred: A1 PostgreSQL COPY     requires a concrete measured consumer / D13
 A2 dynamic SQL rail              complete / dual-driver value + execute + rows / D14
-pending: A2 proved callbacks     callback surface + final cross-rail audit / D14
+A2 proved callbacks              complete / SQLite scalar functions + final cross-rail audit / D14
 ```
 
 The exact cell contracts and owner matrices remain in

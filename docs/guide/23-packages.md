@@ -2,7 +2,7 @@
 
 > 🌐 **English** · [Japanese](./ja/23-packages.md)
 
-`core` is the language's data layer, `std` is the OS boundary, and `pkg` is the source-package layer for frameworks and domain libraries. The package foundation and the first-party `pkg.web` and `pkg.jwt` packages are available today. A third first-party package, `pkg.db`, exists in the same tree and is still being implemented; the last section of this chapter says exactly where it stands. What is deliberately still missing is a registry or fetch tool.
+`core` is the language's data layer, `std` is the OS boundary, and `pkg` is the source-package layer for frameworks and domain libraries. The package foundation and the first-party `pkg.web`, `pkg.jwt`, and `pkg.db` packages are available today. What is deliberately still missing is a registry or fetch tool.
 
 ## A package is a source tree
 
@@ -90,13 +90,13 @@ pub fn main() -> Result<(), Error> {
 
 Verification pins the algorithm to HS256 instead of trusting the token's `alg` field, and compares signatures in constant time. `time_claims_valid` checks optional `exp` and `nbf` NumericDate claims separately from signature verification. HS384/512, RSA, ECDSA, and public-provider OIDC verification are not exposed until the corresponding audited crypto primitives exist.
 
-## `pkg.db` — real, and still landing
+## `pkg.db` — complete committed roadmap
 
-`pkg.db` is the first-party database package, vendored the same way as the other two: [apps/db/pkg](../../apps/db/pkg) holds `pkg/db.align` plus the `pkg.db.sqlite`, `pkg.db.postgres`, and `pkg.db.pool` modules beneath it. It is neither absent nor finished, so this chapter states where it actually is rather than promising a stable surface.
+`pkg.db` is the first-party database package, vendored the same way as the other two: [apps/db/pkg](../../apps/db/pkg) holds `pkg/db.align` plus the `pkg.db.sqlite`, `pkg.db.postgres`, and `pkg.db.pool` modules beneath it.
 
 Complete: the first public release scope. Typed static queries and commands are checked against real schema metadata at compile time, execute on both SQLite and PostgreSQL, and regenerate that metadata offline. Prepared statements, transactions, typed row streams with deadlines and cancellation, compound one-to-many and many-to-one outputs, migration lifecycle tooling, and read-only catalog inspection with `EXPLAIN` are all in.
 
-Landing now: the post-release throughput and dynamic rails. Bounded batch and SoA delivery, PostgreSQL-native single-row and portal-batch delivery, and the explicit fixed-capacity, non-waiting `pkg.db.pool` have shipped; driver-explicit dynamic SQL has shipped. Remaining are the proved native callback surface and the final cross-rail audit. Until those close, treat the public surface as still moving.
+The complete committed roadmap has also shipped: bounded batch and SoA delivery, PostgreSQL-native single-row and portal-batch delivery, the explicit fixed-capacity non-waiting `pkg.db.pool`, driver-explicit dynamic SQL, and proved SQLite scalar functions. The final cross-rail audit runs every owner suite in the required local and CI gate. Broader logical types, PostgreSQL COPY and callbacks, and SQLite collations remain explicitly consumer-gated future surfaces rather than incomplete D1–D14 work.
 
 The compiler side is already in the binary you have: `alignc db prepare`, `db migrate`, `db status`, `db check`, and `db repair` (chapter [16](16-toolchain.md)) drive the checked metadata and the migration catalog. `docs/impl/pkg-design/db.md` is the contract of record.
 

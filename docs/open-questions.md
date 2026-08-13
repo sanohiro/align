@@ -2904,7 +2904,7 @@ shipped behavior normative without fixing the internal sorting algorithm. Full c
 
 ## Open (to be decided)
 
-### SQLite collation identity and persisted-index migration — pending (D14)
+### SQLite collation identity and persisted-index migration — pending (post-D14, consumer-gated)
 
 SQLite can persist comparator results in indexes and schema objects, but its collation registration
 API has no `DIRECTONLY` boundary. A connection-local callback whose body changes between program

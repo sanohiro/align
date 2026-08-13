@@ -39,46 +39,6 @@ fn counts(prepare: i32, steps: i32, delivered: i32, finalized: i32) -> bool = un
     && align_sqlite_q6_finalize_calls() == finalized
 }
 
-fn error_code(error: pkg.db.Error) -> i32 {
-  return match error {
-    Connection(_) => 101
-    Timeout(_) => 102
-    Cancelled(_) => 103
-    NotFound => 104
-    Cardinality(_) => 105
-    Constraint(_) => 106
-    Serialization(_) => 107
-    Deadlock(_) => 108
-    SchemaMismatch(_) => 109
-    DriverMismatch(_) => 110
-    Decode(_) => 111
-    Encode(_) => 112
-    InvalidQuery(_) => 113
-    Unsupported(_) => 114
-    Native(_) => 115
-  }
-}
-
-fn is_contract_error(error: pkg.db.Error, item: str) -> bool {
-  return match error {
-    Connection(_) => false
-    Timeout(_) => false
-    Cancelled(_) => false
-    NotFound => false
-    Cardinality(_) => false
-    Constraint(_) => false
-    Serialization(_) => false
-    Deadlock(_) => false
-    SchemaMismatch(_) => false
-    DriverMismatch(_) => false
-    Decode(contract) => contract.item == item
-    Encode(_) => false
-    InvalidQuery(_) => false
-    Unsupported(_) => false
-    Native(_) => false
-  }
-}
-
 fn one_parent(borrow connection: pkg.db.conn) -> i32 {
   unsafe { align_sqlite_q6_reset() }
   arena out {
@@ -86,7 +46,26 @@ fn one_parent(borrow connection: pkg.db.conn) -> i32 {
       pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 0, last_user_id: 0 }, out,
     )
     empty := match attempted {
-      Err(error) => { return error_code(error) }
+      Err(error) => {
+        return match error {
+          Connection(_) => 101
+          Timeout(_) => 102
+          Cancelled(_) => 103
+          NotFound => 104
+          PoolExhausted => 116
+          Cardinality(_) => 105
+          Constraint(_) => 106
+          Serialization(_) => 107
+          Deadlock(_) => 108
+          SchemaMismatch(_) => 109
+          DriverMismatch(_) => 110
+          Decode(_) => 111
+          Encode(_) => 112
+          InvalidQuery(_) => 113
+          Unsupported(_) => 114
+          Native(_) => 115
+        }
+      }
       Ok(value) => value
     }
     if match empty { Some(_) => true, None => false } { return 2 }
@@ -123,8 +102,14 @@ fn one_parent(borrow connection: pkg.db.conn) -> i32 {
     partial_id := app.user_groups.run(
       pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 3, last_user_id: 3 }, out,
     )
-    error := match partial_id { Ok(_) => { return 15 } Err(cause) => cause }
-    if !is_contract_error(error, "app.user_groups.group") { return 23 }
+    rejected := match partial_id {
+      Ok(_) => { return 15 }
+      Err(error) => match error {
+        Decode(contract) => contract.item == "app.user_groups.group"
+        _ => false
+      }
+    }
+    if !rejected { return 23 }
     if !counts(1, 1, 1, 1) { return 16 }
   }
 
@@ -133,8 +118,14 @@ fn one_parent(borrow connection: pkg.db.conn) -> i32 {
     partial_name := app.user_groups.run(
       pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 4, last_user_id: 4 }, out,
     )
-    error := match partial_name { Ok(_) => { return 17 } Err(cause) => cause }
-    if !is_contract_error(error, "app.user_groups.group") { return 24 }
+    rejected := match partial_name {
+      Ok(_) => { return 17 }
+      Err(error) => match error {
+        Decode(contract) => contract.item == "app.user_groups.group"
+        _ => false
+      }
+    }
+    if !rejected { return 24 }
     if !counts(1, 1, 1, 1) { return 18 }
   }
 
@@ -143,8 +134,14 @@ fn one_parent(borrow connection: pkg.db.conn) -> i32 {
     inconsistent := app.user_groups.run(
       pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 5, last_user_id: 5 }, out,
     )
-    error := match inconsistent { Ok(_) => { return 19 } Err(cause) => cause }
-    if !is_contract_error(error, "app.user_groups.user_name") { return 25 }
+    rejected := match inconsistent {
+      Ok(_) => { return 19 }
+      Err(error) => match error {
+        Decode(contract) => contract.item == "app.user_groups.user_name"
+        _ => false
+      }
+    }
+    if !rejected { return 25 }
     if !counts(1, 2, 2, 1) { return 20 }
   }
 
@@ -153,8 +150,14 @@ fn one_parent(borrow connection: pkg.db.conn) -> i32 {
     inconsistent_id := app.user_groups.run(
       pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 6, last_user_id: 6 }, out,
     )
-    error := match inconsistent_id { Ok(_) => { return 21 } Err(cause) => cause }
-    if !is_contract_error(error, "app.user_groups.user_id") { return 26 }
+    rejected := match inconsistent_id {
+      Ok(_) => { return 21 }
+      Err(error) => match error {
+        Decode(contract) => contract.item == "app.user_groups.user_id"
+        _ => false
+      }
+    }
+    if !rejected { return 26 }
     if !counts(1, 2, 2, 1) { return 22 }
   }
   return 0
@@ -193,8 +196,14 @@ fn segmented(borrow connection: pkg.db.conn) -> i32 {
     partial_id := app.user_groups.run_segmented(
       pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 3, last_user_id: 3 }, out,
     )
-    error := match partial_id { Ok(_) => { return 59 } Err(cause) => cause }
-    if !is_contract_error(error, "app.user_groups.group") { return 60 }
+    rejected := match partial_id {
+      Ok(_) => { return 59 }
+      Err(error) => match error {
+        Decode(contract) => contract.item == "app.user_groups.group"
+        _ => false
+      }
+    }
+    if !rejected { return 60 }
     if !counts(1, 1, 1, 1) { return 61 }
   }
 
@@ -203,8 +212,14 @@ fn segmented(borrow connection: pkg.db.conn) -> i32 {
     partial_name := app.user_groups.run_segmented(
       pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 4, last_user_id: 4 }, out,
     )
-    error := match partial_name { Ok(_) => { return 62 } Err(cause) => cause }
-    if !is_contract_error(error, "app.user_groups.group") { return 63 }
+    rejected := match partial_name {
+      Ok(_) => { return 62 }
+      Err(error) => match error {
+        Decode(contract) => contract.item == "app.user_groups.group"
+        _ => false
+      }
+    }
+    if !rejected { return 63 }
     if !counts(1, 1, 1, 1) { return 64 }
   }
 
@@ -213,8 +228,14 @@ fn segmented(borrow connection: pkg.db.conn) -> i32 {
     disagreement := app.user_groups.run_segmented(
       pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 5, last_user_id: 5 }, out,
     )
-    error := match disagreement { Ok(_) => { return 65 } Err(cause) => cause }
-    if !is_contract_error(error, "app.user_groups.user_name") { return 66 }
+    rejected := match disagreement {
+      Ok(_) => { return 65 }
+      Err(error) => match error {
+        Decode(contract) => contract.item == "app.user_groups.user_name"
+        _ => false
+      }
+    }
+    if !rejected { return 66 }
     if !counts(1, 2, 2, 1) { return 67 }
   }
 
@@ -223,8 +244,14 @@ fn segmented(borrow connection: pkg.db.conn) -> i32 {
     non_adjacent := app.user_groups.run_segmented(
       pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 7, last_user_id: 7 }, out,
     )
-    error := match non_adjacent { Ok(_) => { return 68 } Err(cause) => cause }
-    if !is_contract_error(error, "app.user_groups.order") { return 69 }
+    rejected := match non_adjacent {
+      Ok(_) => { return 68 }
+      Err(error) => match error {
+        Decode(contract) => contract.item == "app.user_groups.order"
+        _ => false
+      }
+    }
+    if !rejected { return 69 }
     if !counts(1, 3, 3, 1) { return 70 }
   }
 
@@ -233,8 +260,14 @@ fn segmented(borrow connection: pkg.db.conn) -> i32 {
     partial_precedence := app.user_groups.run_segmented(
       pkg.db.exec_conn(connection), app.user_groups.Params { first_user_id: 9, last_user_id: 9 }, out,
     )
-    error := match partial_precedence { Ok(_) => { return 71 } Err(cause) => cause }
-    if !is_contract_error(error, "app.user_groups.group") { return 72 }
+    rejected := match partial_precedence {
+      Ok(_) => { return 71 }
+      Err(error) => match error {
+        Decode(contract) => contract.item == "app.user_groups.group"
+        _ => false
+      }
+    }
+    if !rejected { return 72 }
     if !counts(1, 1, 1, 1) { return 73 }
   }
   return 0
@@ -301,6 +334,9 @@ import app.user_groups
 import app.transaction_master
 import pkg.db.testkit.pg
 
+extern "C" {
+  fn align_pg_q6_compound_owner()
+}
 
 fn one_parent(borrow connection: pkg.db.conn) -> i32 {
   arena out {
@@ -339,6 +375,7 @@ fn project(target: pkg.db.exec, out: region) -> i32 {
 
 fn main() -> i32 {
   pkg.db.testkit.pg.reset()
+  unsafe { align_pg_q6_compound_owner() }
   connection := pkg.db.postgres.connect("postgresql://stub/q6", []) else { return 12 }
   grouped := one_parent(connection)
   if grouped != 0 { return grouped }
@@ -1481,11 +1518,11 @@ fn main() -> i32 {
 ///
 /// Regenerate ONLY with a reviewed reason, from the panic message this emits.
 const LAYER1_FINGERPRINT_GOLDEN: &str = "\
-pkg-db-q6-postgres-compound 6b7ee85cc14d50cd
-pkg-db-q6-postgres-send-failure 86ad7ae32e02ef54
+pkg-db-q6-postgres-compound 4d4f6c9aa0e614d6
+pkg-db-q6-postgres-send-failure 3933e83c6ebfe254
 pkg-db-q6-sqlite-pre-send-failure 52c3818f4776e225
 pkg-db-q6-sqlite-transaction-master 18e964c9f82314d3
-pkg-db-q6-sqlite-user-groups 5f1b6015b066bffa
+pkg-db-q6-sqlite-user-groups 7035260367de47cd
 ";
 
 #[test]

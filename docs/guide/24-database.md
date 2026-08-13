@@ -250,6 +250,30 @@ The driver is an argument, not an inference: it is compared with the execution h
 
 Identifiers still cannot be bound. Branching between two named static queries is the supported answer; string-concatenating an identifier into SQL is not.
 
+## Registering a SQLite scalar function
+
+SQLite scalar functions use a compiler-proved, noncapturing callback rather than a raw function pointer or retained closure environment:
+
+```align
+fn twice(args: pkg.db.sqlite.function_args) -> Result<pkg.db.value, str> {
+  if args.values.len() != 1 { return Err("twice expects one argument") }
+  return match args.values[0] {
+    I64(value) => Ok(pkg.db.value.I64(value * 2))
+    _ => Err("twice expects an i64")
+  }
+}
+
+fn install(borrow mut connection: pkg.db.conn) -> Result<(), pkg.db.Error> {
+  callback := pkg.db.sqlite.function(twice)
+  return pkg.db.sqlite.register_function(
+    connection, "align_twice", 1, callback,
+    [pkg.db.sqlite.FunctionOption.Deterministic],
+  )
+}
+```
+
+Registration is fixed-arity, connection-local, SQLite 3.30 or newer, and always `DIRECTONLY`. `Deterministic` is accepted only when the compiler proves the callback Pure. Registration requires an idle direct SQLite connection; a pooled connection is rejected because callback state must never follow a reusable pool slot. `remove_function` removes the same name/arity pair. Callback failure becomes the SQLite function error, while a language hard error still terminates the process.
+
 ## What is not there yet
 
 - No `maybe_one` and no `all` — use `one` or the stream.
@@ -257,6 +281,6 @@ Identifiers still cannot be bound. Branching between two named static queries is
 - Prepared statements belong to one connection and never migrate between pooled ones. There is no statement cache, global or otherwise.
 - The pool never waits, reconnects, health-checks, or resets a session.
 - Dynamic SQL has no prepared or eager-materializing form.
-- Native callbacks — custom functions, busy handlers, extension loading — wait for the proved callback rail. Until it and the final cross-rail audit land, treat the public surface as still moving.
+- Beyond the shipped SQLite scalar functions, there are no SQLite collations, busy handlers, extension loaders, or PostgreSQL callback surfaces. Each remains consumer-gated because it needs a distinct safety or persistence contract.
 
 The contract of record is `docs/impl/pkg-design/db.md`. [apps/db](../../apps/db) is the package-author workspace, and its `app/user_groups.align` is a worked one-to-many shaping example: one query, one ordered pass, one `array_builder` per child collection.

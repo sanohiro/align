@@ -250,6 +250,30 @@ fn counted(borrow connection: pkg.db.conn, out: region) -> Result<i64, pkg.db.Er
 
 識別子は依然としてバインドできません。名前付きの静的クエリ2つを分岐で使い分けるのが正攻法で、識別子を SQL に文字列連結するのはサポート対象外です。
 
+## SQLite scalar function を登録する
+
+SQLite scalar function は raw function pointer や保持される closure environment ではなく、コンパイラが証明した noncapturing callback を使います。
+
+```align
+fn twice(args: pkg.db.sqlite.function_args) -> Result<pkg.db.value, str> {
+  if args.values.len() != 1 { return Err("twice expects one argument") }
+  return match args.values[0] {
+    I64(value) => Ok(pkg.db.value.I64(value * 2))
+    _ => Err("twice expects an i64")
+  }
+}
+
+fn install(borrow mut connection: pkg.db.conn) -> Result<(), pkg.db.Error> {
+  callback := pkg.db.sqlite.function(twice)
+  return pkg.db.sqlite.register_function(
+    connection, "align_twice", 1, callback,
+    [pkg.db.sqlite.FunctionOption.Deterministic],
+  )
+}
+```
+
+登録は固定 arity、接続ローカル、SQLite 3.30 以降で、常に `DIRECTONLY` です。`Deterministic` は callback が Pure だとコンパイラが証明した場合だけ受理されます。idle な direct SQLite connection が必要で、callback state が再利用される pool slot を追わないよう pooled connection は拒否されます。`remove_function` は同じ name/arity pair を削除します。callback の失敗は SQLite function error になり、言語の hard error は従来どおり process を終了します。
+
 ## まだ無いもの
 
 - `maybe_one` も `all` もありません。`one` かストリームを使います。
@@ -257,6 +281,6 @@ fn counted(borrow connection: pkg.db.conn, out: region) -> Result<i64, pkg.db.Er
 - プリペアドステートメントは1つの接続に属し、プール内の別接続へ移ることはありません。ステートメントキャッシュはグローバルにもローカルにも存在しません。
 - プールは待機も再接続もヘルスチェックもセッションのリセットも行いません。
 - 動的 SQL に prepare 形式や一括実体化の形式はありません。
-- ネイティブコールバック（カスタム関数、busy handler、拡張ロード）は証明付きのコールバックレール待ちです。それと最後のレール横断監査が閉じるまで、公開 API はまだ動きうるものとして扱ってください。
+- 出荷済みの SQLite scalar function 以外に、SQLite collation、busy handler、extension loader、PostgreSQL callback surface はありません。それぞれ固有の安全性または永続化契約が必要なため、consumer-gated のままです。
 
 契約の正本は `docs/impl/pkg-design/db.md` です。[apps/db](../../../apps/db) はパッケージ作者用ワークスペースで、その `app/user_groups.align` は一対多シェイピングの実例です。クエリ1本、順序付きの1パス、子コレクション1つにつき `array_builder` 1つ、という形になっています。

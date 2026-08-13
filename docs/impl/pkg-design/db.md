@@ -6497,7 +6497,8 @@ are settled by §19 and the A2 ledgers in §23. They do not settle the wider log
 mappings above, SQLite collations, or the separate PostgreSQL callback surface.
 
 The engine/version nullability/origin support matrix is settled by §16.3.1 and owned by
-D0/D3/D5 rather than this list. The remaining items have roadmap homes in D12–D14. They do not
+D0/D3/D5 rather than this list. The remaining items are consumer-gated future rails after the
+complete committed D14 roadmap. They do not
 permit weakening Query identity,
 one-execution semantics, ownership, static artifacts, runtime validation, or option rejection.
 “The driver library made the choice for us” is not a design rationale.
