@@ -48,7 +48,13 @@ formats now preserve the complete mapped scalar/nullable matrix across direct,
 prepared, buffered, single-row, and portal-batch execution. Descriptor v6 owns
 Measure/Encode binder passes and exact Parse/Bind budgets; context, statement, and
 rows v4 own generation-local metadata, effective-OID proof, and allocation-safe
-cleanup. The exact contract and implementation matrix are in
+cleanup. The fourth consumer-visible D13 rail now ships `pkg.db.pool` as an
+explicit fixed-capacity, non-waiting pool for SQLite and PostgreSQL. Checked-out
+connections retain one physical origin across conn/tx transfer and every existing
+execution path; Drop returns only after exact native-idle or rollback-and-idle
+proof, otherwise it closes and exposes a permanent capacity gap. Pool Drop keeps
+bookkeeping alive for outstanding owners without blocking or invalidating them.
+The exact contracts and implementation matrices are in
 `docs/impl/pkg-design/db.md` §23. PostgreSQL COPY remains deferred by that
 document's §25 until a concrete measured consumer selects its public operation.
 
@@ -115,6 +121,7 @@ A1 PostgreSQL status prerequisite complete / package/tool fail-close + migration
 A1 PostgreSQL direct delivery    complete / SingleRow + PortalBatch / D13
 A1 PostgreSQL prepared parity    complete / streamed delivery + stmt v3 resolver / D13
 A1 PostgreSQL formats            complete / binary parameters/results + protocol budgets / D13
+A1 explicit fixed pool           complete / SQLite + PostgreSQL non-waiting ownership / D13
 deferred: A1 PostgreSQL COPY     requires a concrete measured consumer / D13
 ```
 

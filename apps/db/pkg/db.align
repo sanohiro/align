@@ -63,8 +63,9 @@ pub command<P> {}
 // dispatch; public code never receives its native pointer.
 pub resource conn = pkg.db.internal.resource.drop_conn
 
-// A transaction owns the same physical connection state until commit/rollback returns it or Drop
-// performs fail-safe rollback and close.
+// A transaction owns the same physical connection state until commit/rollback returns it. Drop
+// performs fail-safe rollback, then closes a direct state or returns a pool-origin state only after
+// the driver-native rollback-and-idle proof.
 pub resource tx = pkg.db.internal.resource.drop_tx
 
 // Q4a prepared execution resources. A stmt depends on the conn/tx generation that prepared it;
@@ -436,6 +437,7 @@ pub Error {
   Timeout(NativeError)
   Cancelled(NativeError)
   NotFound
+  PoolExhausted
   Cardinality(CardinalityError)
   Constraint(NativeError)
   Serialization(NativeError)
@@ -576,17 +578,7 @@ fn execution_state(target: exec) -> raw {
         if pkg.db.internal.resource.transaction_active(candidate) { candidate } else { raw.null() }
       }
     }
-    if state.is_null() { return raw.null() }
-    version: u32 := raw.load(state, 0)
-    driver: u8 := raw.load(state, 4)
-    closed: u8 := raw.load(state, 5)
-    reserved: u16 := raw.load(state, 6)
-    native: raw := raw.load(state, 8)
-    if version != 1 || (driver != 1 && driver != 2) || closed != 0 || reserved != 0
-      || native.is_null() {
-      return raw.null()
-    }
-    return state
+    return if pkg.db.internal.resource.conn_live(state) { state } else { raw.null() }
   }
 }
 
@@ -1251,8 +1243,7 @@ pub fn driver_tag(target: exec) -> u8 {
       Conn(reference) => resource.raw(reference)
       Tx(reference) => resource.raw(reference)
     }
-    if state.is_null() { return 0 }
-    return raw.load(state, 4)
+    return pkg.db.internal.resource.conn_driver_tag(state)
   }
 }
 
@@ -3057,16 +3048,10 @@ pub fn meta_query<P, R>(
         if pkg.db.internal.resource.transaction_active(candidate) { candidate } else { raw.null() }
       }
     }
-    mut live_exec := false
-    if !connection_state.is_null() {
-      state_version: u32 := raw.load(connection_state, 0)
-      state_driver: u8 := raw.load(connection_state, 4)
-      state_closed: u8 := raw.load(connection_state, 5)
-      state_reserved: u16 := raw.load(connection_state, 6)
-      state_native: raw := raw.load(connection_state, 8)
-      live_exec = state_version == 1 && state_driver == connection_driver && state_closed == 0
-        && state_reserved == 0 && !state_native.is_null()
-    }
+    live_exec := pkg.db.internal.resource.conn_live_for_driver(
+      connection_state,
+      connection_driver,
+    )
     if !live_exec {
       return Err(Error.Unsupported(ContractError {
         query_id: Some(query_id.clone()),
@@ -3176,16 +3161,7 @@ pub fn explain<P, R>(
         if pkg.db.internal.resource.transaction_active(candidate) { candidate } else { raw.null() }
       }
     }
-    mut live_exec := false
-    if !state.is_null() {
-      state_version: u32 := raw.load(state, 0)
-      state_driver: u8 := raw.load(state, 4)
-      state_closed: u8 := raw.load(state, 5)
-      state_reserved: u16 := raw.load(state, 6)
-      state_native: raw := raw.load(state, 8)
-      live_exec = state_version == 1 && state_driver == driver && state_closed == 0
-        && state_reserved == 0 && !state_native.is_null()
-    }
+    live_exec := pkg.db.internal.resource.conn_live_for_driver(state, driver)
     if !live_exec {
       return Err(Error.Unsupported(ContractError {
         query_id: Some(query_id.clone()),
@@ -3554,16 +3530,10 @@ fn tx_options_valid(options: slice<TxOption>) -> Result<(), Error> {
 
 fn transaction_state_valid(state: raw, active: bool) -> bool {
   unsafe {
-    if state.is_null() { return false }
-    version: u32 := raw.load(state, 0)
-    driver: u8 := raw.load(state, 4)
-    closed: u8 := raw.load(state, 5)
-    reserved: u16 := raw.load(state, 6)
-    native: raw := raw.load(state, 8)
+    if !pkg.db.internal.resource.conn_live(state) { return false }
     lease: u8 := raw.load(state, 20)
     transaction: u8 := raw.load(state, 21)
-    return version == 1 && (driver == 1 || driver == 2) && closed == 0 && reserved == 0
-      && !native.is_null() && lease == 0 && ((transaction != 0) == active)
+    return lease == 0 && ((transaction != 0) == active)
   }
 }
 

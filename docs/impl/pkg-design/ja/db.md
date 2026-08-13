@@ -3690,7 +3690,7 @@ discriminating ownerへ対応させる。
 bounded batch generation、segmented child/validity bitmap、eligible direct SoAはfirst A1でshipped。
 PostgreSQL single-row/portal-batchとbinary formatは上記ledgerでspecified。
 COPY/pipeline/LISTEN-NOTIFY、SQLite backup/blob/FTS、
-explicit poolは上記ledgerでspecified、common contract実証後の追加driver。
+explicit poolは上記ledgerに従うfourth consumer-visible A1 railでshipped、common contract実証後の追加driver。
 
 ### D14 — dynamic SQLとnative callback
 

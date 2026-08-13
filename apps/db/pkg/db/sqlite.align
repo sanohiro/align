@@ -553,14 +553,15 @@ pub fn begin_native(
         "SQLite transaction requires an idle live connection",
       ))
     }
-    version: u32 := raw.load(state, 0)
-    driver: u8 := raw.load(state, 4)
-    closed: u8 := raw.load(state, 5)
-    reserved: u16 := raw.load(state, 6)
+    if !pkg.db.internal.resource.conn_live_for_driver(state, 1) {
+      return Err(contract_error(
+        "sqlite.transaction.connection",
+        "SQLite transaction requires an idle live SQLite connection",
+      ))
+    }
     database: raw := raw.load(state, 8)
     lease: u8 := raw.load(state, 20)
-    if version != 1 || driver != 1 || closed != 0 || reserved != 0
-      || database.is_null() || lease != 0 {
+    if lease != 0 {
       return Err(contract_error(
         "sqlite.transaction.connection",
         "SQLite transaction requires an idle live SQLite connection",
@@ -811,11 +812,7 @@ fn metadata_live(target: pkg.db.exec) -> Result<(), pkg.db.Error> {
         "database metadata requires a live SQLite connection",
       ))
     }
-    version: u32 := raw.load(state, 0)
-    driver: u8 := raw.load(state, 4)
-    closed: u8 := raw.load(state, 5)
-    reserved: u16 := raw.load(state, 6)
-    native: raw := raw.load(state, 8)
+    driver := pkg.db.internal.resource.conn_driver_tag(state)
     if driver != 1 {
       return Err(pkg.db.Error.DriverMismatch(pkg.db.ContractError {
         query_id: None,
@@ -823,7 +820,7 @@ fn metadata_live(target: pkg.db.exec) -> Result<(), pkg.db.Error> {
         message: "SQLite metadata requires a SQLite connection".clone(),
       }))
     }
-    if version != 1 || closed != 0 || reserved != 0 || native.is_null() {
+    if !pkg.db.internal.resource.conn_live_for_driver(state, 1) {
       return Err(contract_error(
         "db.meta.exec",
         "database metadata requires a live SQLite connection",

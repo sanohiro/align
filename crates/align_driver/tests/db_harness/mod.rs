@@ -3,7 +3,7 @@
 //!
 //! # Why this module exists
 //!
-//! Every `pkg.db` E2E suite used to hand-write the same four things: the eight-module package
+//! Every `pkg.db` E2E suite used to hand-write the same four things: the package
 //! layout, a tool-availability guard, an exit-code assertion, and a trailing block of native
 //! stub-counter checks encoded as hand-numbered sentinel exit codes. Those four blocks accounted for
 //! ~1,300 duplicated lines across the corpus, the exit assertion had drifted into four
@@ -16,7 +16,7 @@
 //!
 //! # Module contract
 //!
-//! This module is **not** part of `tests/common/`. It is included only by the nine `pkg_db_*`
+//! This module is **not** part of `tests/common/`. It is included only by the `pkg_db_*`
 //! suites, so editing it rebuilds those binaries rather than all ~167 driver test binaries.
 //!
 //! It refers to the `common` harness as `crate::common::…`, so an including file must declare

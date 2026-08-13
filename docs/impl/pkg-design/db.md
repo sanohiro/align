@@ -5302,7 +5302,7 @@ its implementation and discriminating owner.
   `string`/dynamic-array Row storage; it must not weaken the v1 `RegionPlain` path;
 - PostgreSQL COPY/pipeline/LISTEN-NOTIFY;
 - SQLite backup/incremental blob/FTS helpers;
-- explicit pool package — specified by the ledger above;
+- explicit pool package — shipped by the fourth consumer-visible A1 rail under the ledger above;
 - additional drivers only after the common contracts are proven.
 
 No roadmap item may add hidden relationship loading or a Query-builder DSL.

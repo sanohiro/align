@@ -2,6 +2,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+typedef struct {
+  int autocommit;
+  int ordinal;
+} PoolDatabase;
+
 static int prepare_calls;
 static int bind_i64_calls;
 static int bind_text_calls;
@@ -23,6 +28,12 @@ static int64_t bound_i64;
 static int step_phase;
 static int view_mode;
 static int row_fault;
+static int pool_connect_calls;
+static int pool_close_calls;
+static int pool_fail_connect_at;
+static int pool_rollback_fault;
+static int pool_control_fault;
+static int pool_close_ordinals[4];
 
 void align_sqlite_q4a_reset(void) {
   prepare_calls = 0;
@@ -46,6 +57,24 @@ void align_sqlite_q4a_reset(void) {
   step_phase = 0;
   view_mode = 0;
   row_fault = 0;
+  pool_connect_calls = 0;
+  pool_close_calls = 0;
+  pool_fail_connect_at = 0;
+  pool_rollback_fault = 0;
+  pool_control_fault = 0;
+  memset(pool_close_ordinals, 0, sizeof(pool_close_ordinals));
+}
+
+void align_sqlite_pool_fail_connect_at(int ordinal) { pool_fail_connect_at = ordinal; }
+int align_sqlite_pool_connect_calls(void) { return pool_connect_calls; }
+int align_sqlite_pool_close_calls(void) { return pool_close_calls; }
+int align_sqlite_pool_close_ordinal(int index) {
+  return index < 0 || index >= 4 ? -1 : pool_close_ordinals[index];
+}
+void align_sqlite_pool_rollback_fault(int fault) { pool_rollback_fault = fault; }
+void align_sqlite_pool_control_fault(int fault) { pool_control_fault = fault; }
+int align_sqlite_pool_connection_ordinal(void *database) {
+  return database == NULL ? -1 : ((PoolDatabase *)database)->ordinal;
 }
 
 int align_sqlite_q4a_prepare_calls(void) { return prepare_calls; }
@@ -62,6 +91,78 @@ void align_sqlite_q4a_fail_next_text(void) { fail_next_text = 1; }
 void align_sqlite_q4a_fail_next_reset(void) { fail_next_reset = 1; }
 void align_sqlite_q4a_fail_next_busy_timeout(void) { fail_next_busy_timeout = 1; }
 void align_sqlite_q4a_set_row_fault(int fault) { row_fault = fault; }
+
+int sqlite3_open_v2(const char *filename, void **database_out, int flags, const char *vfs) {
+  (void)flags;
+  (void)vfs;
+  pool_connect_calls++;
+  if (filename == NULL || database_out == NULL) return 1;
+  *database_out = NULL;
+  if (pool_fail_connect_at > 0 && pool_connect_calls == pool_fail_connect_at) return 1;
+  PoolDatabase *database = (PoolDatabase *)calloc(1, sizeof(PoolDatabase));
+  if (database == NULL) return 7;
+  database->autocommit = 1;
+  database->ordinal = pool_connect_calls;
+  *database_out = database;
+  return 0;
+}
+
+int sqlite3_close_v2(void *database) {
+  if (pool_close_calls < 4 && database != NULL) {
+    pool_close_ordinals[pool_close_calls] = ((PoolDatabase *)database)->ordinal;
+  }
+  pool_close_calls++;
+  free(database);
+  return 0;
+}
+
+int sqlite3_extended_result_codes(void *database, int enabled) {
+  return database != NULL && enabled == 1 ? 0 : 1;
+}
+
+int sqlite3_errcode(void *database) { return database == NULL ? 1 : 0; }
+int sqlite3_extended_errcode(void *database) { return database == NULL ? 1 : 0; }
+const char *sqlite3_errmsg(void *database) {
+  (void)database;
+  return "SQLite pool stub failure";
+}
+
+int sqlite3_get_autocommit(void *database) {
+  return database == NULL ? 0 : ((PoolDatabase *)database)->autocommit;
+}
+
+int sqlite3_exec(
+    void *database,
+    const char *sql,
+    void *callback,
+    void *argument,
+    char **error_out) {
+  (void)callback;
+  (void)argument;
+  (void)error_out;
+  if (database == NULL || sql == NULL) return 1;
+  PoolDatabase *pool = (PoolDatabase *)database;
+  if (strncmp(sql, "BEGIN", 5) == 0) pool->autocommit = 0;
+  if (strcmp(sql, "ROLLBACK") == 0) {
+    if (pool_control_fault == 2) {
+      pool_control_fault = 0;
+      return 1;
+    }
+    int fault = pool_rollback_fault;
+    pool_rollback_fault = 0;
+    if (fault == 1) return 1;
+    if (fault == 2) return 0;
+    pool->autocommit = 1;
+  }
+  if (strcmp(sql, "COMMIT") == 0) {
+    if (pool_control_fault == 1) {
+      pool_control_fault = 0;
+      return 1;
+    }
+    pool->autocommit = 1;
+  }
+  return 0;
+}
 
 int sqlite3_busy_timeout(void *database, int milliseconds) {
   busy_timeout_calls++;

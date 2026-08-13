@@ -1,0 +1,7 @@
+module pkg.db.pool.internal.resource
+
+import pkg.db.internal.resource
+
+pub fn drop_pool(state: raw) {
+  unsafe { pkg.db.internal.resource.drop_pool_state(state) }
+}

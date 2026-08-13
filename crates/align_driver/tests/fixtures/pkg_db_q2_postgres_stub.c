@@ -19,6 +19,7 @@ typedef struct {
   int status;
   int encoding;
   int transaction_status;
+  int ordinal;
   const char *message;
 } FakeConn;
 
@@ -52,7 +53,9 @@ typedef struct {
 #define ASYNC_QUEUE_CAPACITY 80
 
 static int connect_calls;
+static int fail_connect_at;
 static int finish_calls;
+static int finish_ordinals[4];
 static int encoding_calls;
 static int execute_calls;
 static int clear_calls;
@@ -65,6 +68,7 @@ static int control_calls;
 static int deallocate_calls;
 static int fail_next_control;
 static int rollback_next_commit;
+static int pool_rollback_fault;
 static char prepared_name[64];
 static FakeResult *async_result;
 static FakeResult *async_queue[ASYNC_QUEUE_CAPACITY];
@@ -152,7 +156,9 @@ static int has(const char *text, const char *needle) {
 void align_pg_reset(void) {
   clear_async_results();
   connect_calls = 0;
+  fail_connect_at = 0;
   finish_calls = 0;
+  memset(finish_ordinals, 0, sizeof(finish_ordinals));
   encoding_calls = 0;
   execute_calls = 0;
   clear_calls = 0;
@@ -165,6 +171,7 @@ void align_pg_reset(void) {
   deallocate_calls = 0;
   fail_next_control = 0;
   rollback_next_commit = 0;
+  pool_rollback_fault = 0;
   prepared_name[0] = '\0';
   async_busy = 0;
   async_cancelled = 0;
@@ -203,7 +210,11 @@ void align_pg_reset(void) {
 }
 
 int align_pg_connect_calls(void) { return connect_calls; }
+void align_pg_fail_connect_at(int ordinal) { fail_connect_at = ordinal; }
 int align_pg_finish_calls(void) { return finish_calls; }
+int align_pg_finish_ordinal(int index) {
+  return index < 0 || index >= 4 ? -1 : finish_ordinals[index];
+}
 int align_pg_encoding_calls(void) { return encoding_calls; }
 int align_pg_execute_calls(void) { return execute_calls; }
 int align_pg_clear_calls(void) { return clear_calls; }
@@ -227,6 +238,7 @@ int align_pg_control_calls(void) { return control_calls; }
 int align_pg_deallocate_calls(void) { return deallocate_calls; }
 void align_pg_fail_next_control(void) { fail_next_control = 1; }
 void align_pg_rollback_next_commit(void) { rollback_next_commit = 1; }
+void align_pg_pool_rollback_fault(int fault) { pool_rollback_fault = fault; }
 void align_pg_fail_next_nonblocking_enable(void) { fail_next_nonblocking_enable = 1; }
 void align_pg_fail_next_nonblocking_restore(void) { fail_next_nonblocking_restore = 1; }
 void align_pg_delay_next_nonblocking_enable(void) { delay_next_nonblocking_enable = 1; }
@@ -307,11 +319,13 @@ FakeConn *PQconnectdbParams(const char *const *keywords, const char *const *valu
     if (protocol_error == 0) protocol_error = 85;
   }
   if (has(dbname, "null-connection")) return NULL;
+  if (fail_connect_at > 0 && connect_calls == fail_connect_at) return NULL;
   FakeConn *connection = (FakeConn *)calloc(1, sizeof(FakeConn));
   if (connection == NULL) return NULL;
   connection->status = has(dbname, "bad-connection") ? 1 : 0;
   connection->encoding = has(dbname, "bad-encoding") ? -1 : 6;
   connection->transaction_status = 0;
+  connection->ordinal = connect_calls;
   connection->message = "stub connection failure";
   return connection;
 }
@@ -324,6 +338,7 @@ int PQclientEncoding(const FakeConn *connection) {
 }
 
 void PQfinish(FakeConn *connection) {
+  if (finish_calls < 4 && connection != NULL) finish_ordinals[finish_calls] = connection->ordinal;
   finish_calls++;
   if (async_result != NULL) clear_calls++;
   clear_calls += async_queue_count - async_queue_index;
@@ -472,7 +487,7 @@ FakeResult *PQprepare(
                      parameter_types[0] == 20 && parameter_types[1] == 0 &&
                      parameter_types[2] == 0;
   int overridden_types = prepare_calls == 2 && parameter_types != NULL &&
-                         parameter_types[0] == 23 && parameter_types[1] == 25 &&
+                         parameter_types[0] == 20 && parameter_types[1] == 25 &&
                          parameter_types[2] == 17;
   int format_types = format_matrix && parameter_types != NULL &&
                      parameter_count == 2 && parameter_types[0] == 23 && parameter_types[1] == 17;
@@ -571,7 +586,10 @@ FakeResult *PQexec(FakeConn *connection, const char *command) {
   }
   FakeResult *result = new_result();
   if (result != NULL) {
-    result->status = fail_next_control ? 7 : 1;
+    result->status = fail_next_control ||
+            (command != NULL && strcmp(command, "ROLLBACK") == 0 && pool_rollback_fault == 1)
+        ? 7
+        : 1;
     if (command != NULL && strncmp(command, "BEGIN ", 6) == 0) {
       result->command_status = "BEGIN";
       if (connection != NULL) connection->transaction_status = 2;
@@ -579,8 +597,8 @@ FakeResult *PQexec(FakeConn *connection, const char *command) {
       result->command_status = rollback_next_commit ? "ROLLBACK" : "COMMIT";
       if (connection != NULL) connection->transaction_status = 0;
     } else if (command != NULL && strcmp(command, "ROLLBACK") == 0) {
-      result->command_status = "ROLLBACK";
-      if (connection != NULL) connection->transaction_status = 0;
+      result->command_status = pool_rollback_fault == 2 ? "COMMIT" : "ROLLBACK";
+      if (connection != NULL) connection->transaction_status = pool_rollback_fault == 3 ? 2 : 0;
     } else if (command != NULL && strncmp(command, "DEALLOCATE ", 11) == 0) {
       result->command_status = "DEALLOCATE";
     }
@@ -589,6 +607,7 @@ FakeResult *PQexec(FakeConn *connection, const char *command) {
   }
   fail_next_control = 0;
   rollback_next_commit = 0;
+  pool_rollback_fault = 0;
   return result;
 }
 

@@ -34,9 +34,9 @@ invented exact counts here.
 | `native-link-order-closure` | 3 | 1 | Promoted: preserve caller order around the dependency closure and test arbitrary prefix/suffix libraries. |
 | `producer-evidence-propagation` | 1 | 1 | Watch; exact producer-to-consumer evidence owner required. |
 | `public-surface-completeness` | 2 | 2 | Promoted: compare the complete exported surface to the ledger and require an internal/sealed boundary for cross-module helpers. |
-| `operation-matrix-completeness` | 6 | 5 | Three-plus events: automation required. Add one parameterized dual-driver parity owner that runs the same descriptor/status/sentinel matrix through both drivers and asserts identical error-class mapping; also check native command tags (PostgreSQL answers `COMMIT` in an aborted transaction with `PGRES_COMMAND_OK` and a `ROLLBACK` tag), retain failed rows state after every cleanup failure, and keep PostgreSQL parameter/result format axes independent. |
+| `operation-matrix-completeness` | 7 | 6 | Three-plus events: automation required. Add one parameterized dual-driver parity owner that runs the same descriptor/status/sentinel matrix through both drivers and asserts identical error-class mapping; also check native command tags (PostgreSQL answers `COMMIT` in an aborted transaction with `PGRES_COMMAND_OK` and a `ROLLBACK` tag), retain failed rows state after every cleanup failure, and keep PostgreSQL parameter/result format axes independent. |
 | `error-contract-identity` | 2 | 2 | Promoted: pin error class, query identity, and complete multi-invalid precedence. |
-| `source-of-truth-drift` | 8 | 6 | Three-plus events: the mandatory ledger-to-diff extraction pass in `SKILL.md` is the owner — extract every `must`/`exact`/`every`/`before`/`reject`/`required` line from the touched design sections and point each at implementation or an explicit deferral. Re-read adjacent comments and counter documentation against behavior, including internal interface/cache invalidation and runtime ABI inventory totals. A lexical lint is not sound here because the drift is semantic, so the extraction pass is mandatory rather than automated. |
+| `source-of-truth-drift` | 10 | 7 | Three-plus events: the mandatory ledger-to-diff extraction pass in `SKILL.md` is the owner — extract every `must`/`exact`/`every`/`before`/`reject`/`required` line from the touched design sections and point each at implementation or an explicit deferral. Re-read adjacent comments and counter documentation against behavior, including internal interface/cache invalidation and runtime ABI inventory totals. A lexical lint is not sound here because the drift is semantic, so the extraction pass is mandatory rather than automated. |
 | `owner-test-topology` | 3 | 3 | Three-plus events: every named closure-matrix cell must have a direct owner whose witness is **mutation-verified against the pre-fix compiler**, not merely present; retain whole/per-unit owners when refactoring fixtures. A witness that counts something the defect does not duplicate (a `.clone()` outside the duplicated subtree) passes on the broken compiler and closes nothing. |
 | `test-global-state-isolation` | 1 | 1 | Watch; prefer child-scoped environment and RAII restoration. |
 | `test-entry-abi-exactness` | 1 | 1 | Watch; compile fixtures through the real entry ABI. |
@@ -139,6 +139,9 @@ invented exact counts here.
 | #773 | `857b9489` | P1 | `validation-phase-completeness` | Validate descriptor-v6 count-thunk shape, value agreement, and the protocol parameter limit before LLVM construction. |
 | #773 | `857b9489` | P1 | `ownership-allocation-owner` | Reject normalized PostgreSQL format plans whose HIR allocation and use provenance is not the exact compiler-owned shape. |
 | #773 | `857b9489` | P2 | `source-of-truth-drift` | Update the runtime ABI ledgers from the stale 5/288 inventory to the shipped 13/296 base entries. |
+| #776 | `3da5488c` | P1 | `operation-matrix-completeness` | Prove driver-native transaction idleness before returning every wrapper-idle pooled connection. |
+| #776 | `3da5488c` | P2 | `source-of-truth-drift` | Reconcile pooled transaction Drop with the earlier direct-connection close-only rule. |
+| #776 | `3da5488c` | P2 | `source-of-truth-drift` | Record the exact fixed-capacity non-waiting pool contract in Settled. |
 
 ## Rejected claims
 

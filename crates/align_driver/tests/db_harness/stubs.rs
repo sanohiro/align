@@ -121,7 +121,11 @@ pub const ALL: &[&Stub] = &[&PG, &SQLITE_Q4A, &SQLITE_Q6];
 /// block rather than through a dump, so it is invisible to the sweep. Listing it here records the
 /// blind spot instead of leaving it implicit — a counter added to the C fixture and then forgotten
 /// on the Align side looks identical to this from the sweep's point of view.
-pub const C_ONLY_COUNTERS: &[&str] = &["align_pg_forbidden_after_status_calls"];
+pub const C_ONLY_COUNTERS: &[&str] = &[
+    "align_pg_forbidden_after_status_calls",
+    "align_sqlite_pool_connect_calls",
+    "align_sqlite_pool_close_calls",
+];
 
 /// Whether `name` is a counter some stub actually prints.
 pub fn is_known_counter(name: &str) -> bool {
@@ -141,6 +145,7 @@ const PG_COUNTERS_ALIGN: &str = r##"module pkg.db.testkit.pg
 extern "C" {
   fn align_pg_reset()
   fn align_pg_connect_calls() -> i32
+  fn align_pg_fail_connect_at(ordinal: i32)
   fn align_pg_finish_calls() -> i32
   fn align_pg_encoding_calls() -> i32
   fn align_pg_execute_calls() -> i32
@@ -164,6 +169,10 @@ extern "C" {
 
 pub fn reset() {
   unsafe { align_pg_reset() }
+}
+
+pub fn fail_connect_at(ordinal: i32) {
+  unsafe { align_pg_fail_connect_at(ordinal) }
 }
 
 pub fn dump() {

@@ -21,6 +21,9 @@ static INTERNAL_POSTGRES: LazyLock<&str> =
     LazyLock::new(|| fixture("apps/db/pkg/db/internal/postgres.align"));
 static POSTGRES_STATUS: LazyLock<&str> =
     LazyLock::new(|| fixture("apps/db/pkg/db/internal/postgres_status.align"));
+static POOL: LazyLock<&str> = LazyLock::new(|| fixture("apps/db/pkg/db/pool.align"));
+static POOL_RESOURCE: LazyLock<&str> =
+    LazyLock::new(|| fixture("apps/db/pkg/db/pool/internal/resource.align"));
 // C stubs change rarely; keeping them baked costs nothing on `.align` edits.
 const POSTGRES_STUB: &str = include_str!("fixtures/pkg_db_q2_postgres_stub.c");
 
@@ -1834,6 +1837,8 @@ fn legacy_package_files(main: &str) -> Vec<(&'static str, &str)> {
         ("pkg/db/internal/sqlite.align", *INTERNAL_SQLITE),
         ("pkg/db/internal/postgres.align", *INTERNAL_POSTGRES),
         ("pkg/db/internal/postgres_status.align", *POSTGRES_STATUS),
+        ("pkg/db/pool.align", *POOL),
+        ("pkg/db/pool/internal/resource.align", *POOL_RESOURCE),
         ("app/q4b_query.align", QUERY),
         ("main.align", main),
     ]
@@ -2264,19 +2269,19 @@ const PARITY_CASES: &[ParityCase] = &[
 /// changing the compile profile, or adding a variable to a child run therefore shows up here as a
 /// changed digest rather than passing quietly.
 ///
-/// The nine `pkg.db` package sources are deliberately NOT part of a digest: they are product code
+/// The `pkg.db` package sources are deliberately NOT part of a digest: they are product code
 /// with their own owners, and folding them in would break this golden on every `apps/db` edit
 /// without saying anything about the parity owner.
 ///
 /// Regenerate ONLY with a reviewed reason, from the panic message this emits.
 const PARITY_FINGERPRINT_GOLDEN: &str = "\
-pkg-db-q4b-full-matrix-parity/absent_values/postgres 017dd4378910d75e
-pkg-db-q4b-full-matrix-parity/absent_values/sqlite b93682aa197ea258
-pkg-db-q4b-full-matrix-parity/counters/postgres b2be3ad1432665a6
-pkg-db-q4b-full-matrix-parity/one_retained_bytes/postgres 67cc72cd9cd512b0
-pkg-db-q4b-full-matrix-parity/one_retained_bytes/sqlite 57b372dd884bd660
-pkg-db-q4b-full-matrix-parity/present_values/postgres 84397260bac28ee4
-pkg-db-q4b-full-matrix-parity/present_values/sqlite 65baba0036a47abc
+pkg-db-q4b-full-matrix-parity/absent_values/postgres 4cad22592ca0f28e
+pkg-db-q4b-full-matrix-parity/absent_values/sqlite 45b77196aed3010e
+pkg-db-q4b-full-matrix-parity/counters/postgres 09b9e5206ca760f8
+pkg-db-q4b-full-matrix-parity/one_retained_bytes/postgres 97f12ca2ac41eeee
+pkg-db-q4b-full-matrix-parity/one_retained_bytes/sqlite 03fb5d6b73eec75c
+pkg-db-q4b-full-matrix-parity/present_values/postgres a6249a2ad1dff904
+pkg-db-q4b-full-matrix-parity/present_values/sqlite cc9ee209135e1136
 ";
 
 #[test]
@@ -3410,7 +3415,9 @@ fn live_run_ids_do_not_collide() {
 fn c_only_counters_are_exported_by_a_stub_but_printed_by_none() {
     for name in db_harness::C_ONLY_COUNTERS {
         assert!(
-            db_harness::PG.c_source.contains(name),
+            db_harness::stubs::ALL
+                .iter()
+                .any(|stub| stub.c_source.contains(name)),
             "`{name}` is listed as a C-only counter but no stub exports it"
         );
         for stub in db_harness::stubs::ALL {

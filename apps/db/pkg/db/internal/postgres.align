@@ -667,15 +667,12 @@ pub fn state_for(target: pkg.db.exec) -> raw {
 pub fn postgres_connection(state: raw) -> raw {
   unsafe {
     if state.is_null() { return raw.null() }
-    version: u32 := raw.load(state, 0)
-    driver: u8 := raw.load(state, 4)
-    closed: u8 := raw.load(state, 5)
-    reserved: u16 := raw.load(state, 6)
-    connection: raw := raw.load(state, 8)
+    driver := pkg.db.internal.resource.conn_driver_tag(state)
     if driver != DRIVER_POSTGRES { return raw.null() }
-    if version != 1 || reserved != 0 || closed != 0 || connection.is_null() {
+    if !pkg.db.internal.resource.conn_live_for_driver(state, DRIVER_POSTGRES) {
       return raw.null()
     }
+    connection: raw := raw.load(state, 8)
     return connection
   }
 }
