@@ -53,7 +53,15 @@ cleanup. The exact contract and implementation matrix are in
 document's §25 until a concrete measured consumer selects its public operation.
 
 Out-of-gate suite status (suites outside the bounded CI gate; a nightly
-full-suite workflow now runs them daily so this class cannot rot silently):
+full-suite workflow runs them daily so this class cannot rot silently). The
+nightly no longer runs `cargo test --workspace`, which stopped at the first
+failing binary and therefore reported nothing about the other ~220 targets:
+`scripts/run-suite-binaries.sh` builds once, runs every compiled binary
+concurrently, and diffs the observed failures against
+`scripts/known-failures.txt` in both directions — a new failure is named, and a
+manifest entry that starts passing is red until its line is deleted. The job
+budget is 30 minutes and exceeding it is the signal, not something to raise;
+run the same judgement locally with `scripts/run-suite-binaries.sh`:
 
 - The 2026-08-09 `per_unit_surface` CLI/library parity failure was fixed on
   `main` by #731 (gate-on-use in `install_static_descriptor_data`); a unit
