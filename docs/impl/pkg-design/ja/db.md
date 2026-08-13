@@ -160,11 +160,11 @@ v1に含めないもの:
 - runtime reflectionによるRow mapping;
 - 汎用Query-builder DSLや自動dialect rewrite;
 - stored procedure abstraction、distributed transaction;
-- transparent retry、transparent pooling;
+- transparent retry、transparent pooling（D13は§23の明示的 `pkg.db.pool` を提供する）;
 - 「最適」なrelational fetch strategyの自動選択。
 
-poolは将来、明示的な `pkg.db.pool` として追加できる。Query意味論を変えず、
-connection acquisition/wait costを隠さない。
+D13 poolは§23で確定する明示的 `pkg.db.pool` moduleである。Query意味論を変えず、
+acquisition、exhaustion、physical-connection costを隠さない。
 
 ## 4. Package layout
 
@@ -176,15 +176,21 @@ pkg.db.sqlite
 pkg.db.postgres
 ```
 
-これは独立versionの3 packageではない。Alignのpackage規則に従う、1つのvendorable
-`pkg/db` subtree内の3つのpublic module境界である。root/common moduleはpublic driver
-moduleをimportせず、driver moduleがcommon/internalへ下向きに呼ぶ。この向きでmodule
-graphをacyclicに保つ。
+D13はsame package subtreeへ4つ目のpublic moduleを追加する:
+
+```text
+pkg.db.pool
+```
+
+initial listは独立versionの3 packageではない。Alignのpackage規則に従う、1つのvendorable
+`pkg/db` subtree内の3つのpublic module境界であり、D13はsame subtreeへ4つ目を追加する。
+`pkg.db.pool` はpublic driver constructorをimportするがroot/internalへupward edgeを作らない。
+root/common moduleはpublic driver moduleをimportせず、driver moduleがcommon/internalへ下向きに
+呼ぶ。この向きでmodule graphをacyclicに保つ。
 
 将来候補:
 
 ```text
-pkg.db.pool
 pkg.db.odbc
 pkg.db.mysql
 pkg.db.duckdb
@@ -240,7 +246,9 @@ db.value
 
 - `db.conn`: SQLite/PostgreSQL connectionを1つ所有するopaque Move resource。
 - `db.tx`: transactionへmoveされたconnectionを所有するopaque Move resource。
-  activeなままDropするとfail-safe rollback後にcloseし、commitはしない。
+  activeなままDropするとfail-safe rollbackしcommitしない。direct-driver connectionはcloseする。
+  D13はpool-origin connectionをpool ledgerのexact rollback-and-native-idle proof後だけreturnし、
+  それ以外はcloseしてslotをretireする。
 - `db.exec`: conn/txのどちらからも生成する短命なborrowed execution view。
 - `db.query<P,R>`: SQL identity、Params/Row contract、driver restriction、hash、
   static optionを持つCopy static descriptor。
@@ -1086,8 +1094,10 @@ conn := db.rollback(tx)?
 ```
 
 `begin` はconnをconsumeし、active tx中にcallerがconnを使えない。commit/rollbackはtxを
-consumeし、成功時にconnを返す。明示end失敗またはDropはbest-effort rollback後に
-owned connectionをcloseする。状態不明connを返さず、Dropでcommitしない。
+consumeし、成功時にconnを返す。明示end失敗またはDropはfail-safe rollbackしcommitしない。
+direct-driver connectionはcloseする。D13 pool-origin exceptionはpool ledgerのexact native
+rollback-and-idle proof後だけreturnし、proof missing/failureはcloseしてslotをretireする。
+どちらも状態不明connを返さない。
 
 ### 14.2 native transaction option
 
@@ -1148,6 +1158,7 @@ db.Error {
   Timeout(NativeError),
   Cancelled(NativeError),
   NotFound,
+  PoolExhausted,
   Cardinality(CardinalityError),
   Constraint(NativeError),
   Serialization(NativeError),
@@ -1167,6 +1178,9 @@ viewをerrorへ残さない。`ContractError.query_id` はQuery/command contract
 connection/transaction/metadataなどQueryなしのoperation/input validationと、identity trust前に
 malformed descriptor headerがfailする場合は `None` とし、
 どちらも `item` がexact operation/inputを示す。success hot pathはerror stringをallocateしない。
+`PoolExhausted` はvalidなnon-waiting pool acquisitionにidle connectionがない場合の
+allocation-free、Query-less categoryである。`pkg.db.pool.info` により、全slotがcheckout中か、
+poisoned connectionの後にcapacityがretireしたかを区別できる。
 
 この形はL1a/L1bのrecursive tagged Move payloadを必須とする。compiler-known例外や
 opaque integerだけへ縮退しない。low-level builtin `Error` への変換が必要なら
@@ -2072,6 +2086,11 @@ timeout/cancel後はrequired resultをdrainしてprotocol/transaction stateの�
 connectionだけを再利用可能とする。それ以外はpoison/closeし、state不明のconnectionをpoolや
 callerへ返さない。transparent retryはない。
 
+D13 `pkg.db.pool` は明示的なfixed-capacity moduleである。acquisitionはnon-waiting
+`try_acquire` のみで、exhaustionを即時に返しacquisition timeoutを持たず、constructorがexact
+sizeを公開する。acquired `db.conn` はtransaction conversionからDropまでphysical connectionと
+pool affinityを保持し、operationが黙って別connectionへ移さない。
+
 ## 21. Performance contract
 
 ### 21.1 必須invariant
@@ -2569,7 +2588,8 @@ prepared/common/reprepare costをlocalに別々に測る。
 ### D7 — transaction/common exec view
 
 `db.begin` がconnをconsumeし、`exec_conn`/`exec_tx` が同じ `db.exec` を返す。
-commit/rollback consume、Drop rollback+close、success/error/panic相当exitのexact cleanup、
+commit/rollback consume、direct connectionのDrop rollback+close、D13 pool-originのproved
+rollback+return-or-retire、success/error/panic相当exitのexact cleanup、
 public traitなし。§11〜§14のexact common/両driver transaction option sum、SQLite begin
 mode、PostgreSQL isolation/access/deferrableのBEGIN前conflict rejectionもここで実装する。
 
@@ -2590,7 +2610,7 @@ connection move-in/move-out、child-before-parent、driver dispatch、Drop proof
 | PostgreSQL prepared lifecycle | concrete Params contractに対して各`ParameterOid(name, oid)`を`PQprepare`前にvalidateし、unknown/duplicate/zero OIDをrejectする。connection-local collision-free statement nameを1つallocateし、`PQexecPrepared`を使い、全result/contextを1回clearし、stmt Dropでbest-effort `DEALLOCATE`する。process/global cacheはない。 | PostgreSQL required prepare/reuse/option ownerとnative stub lifecycle counter |
 | transaction formationとoption | common option、次にdriver optionをsource orderで`BEGIN`前にvalidateする。`begin`はnative begin成功後だけconnをconsumeし、exact SQLite mode SQLとexact PostgreSQL isolation/access/deferrable clauseを使う。invalid PostgreSQL combinationはsend前にrejectする。 | common/native option precedence、SQLite 3 mode owner、required PostgreSQL combination/no-send owner |
 | transaction executionとjoin | live txはconnと同じvalidated connection prefixを持つ。既存common/native execution/inspection pathはsecond trait/ABIなしで`exec.Tx`を受ける。use-after-end、conn/tx alias、live stmt/rows child中のcommit/rollbackはcompile-time errorにする。 | 両driver transaction内common command/Query、metadata/EXPLAIN tx owner、compile-fail alias/child matrix |
-| commit、rollback、Drop | `commit`/`rollback`はtxをconsumeし、certain native success後だけconnを返す。end errorはfail-safe rollback+closeのためtx ownerをliveに保つ。implicit Dropはcommitせず、best-effort rollback、exactly once close、transferred state null、wrapper freeをnative orderで行う。 | success/error/early-return/branch/`?` end matrixとclose/rollback/commit counter |
+| commit、rollback、Drop | `commit`/`rollback`はtxをconsumeし、certain native success後だけconnを返す。end errorはfail-safe rollbackのためtx ownerをliveに保つ。implicit Dropはcommitせずrollbackし、transferred state null、wrapper freeをnative orderで行う。direct-driver stateはonce close。D13 pool-origin stateはexact driver rollback-and-idle proof後だけreturnし、それ以外はclose/retire。 | success/error/early-return/branch/`?` end matrixとclose/rollback/commit/pool-return counter |
 | generic/ABI closure | fixed 8-aligned execution descriptorを104-byte v2から120-byte v3へbumpし、offset 0〜103は不変とする。offset 104はQuery/commandでnon-nullのproducer-owned `fn(name: str) -> i32` parameter-ordinal resolver、offset 112はexact `u32` distinct-parameter count、offset 116はreserved zeroである。generic stmt binder bridgeはpackage-privateで、concrete `stmt<P,R>` referenceとmatching Pを要求し、exact borrow modeでretained producer thunkへlowerする。application sourceまたはmalformed HIRからの使用をrejectする。whole/per-unit linkageはreachableな時だけproducer thunkとnative libraryを保持する。 | sema/MIR fail-closed bridge owner、exact descriptor size/offset/signature owner、whole/per-unit runtime parity |
 | explicit later cells | Q4aは`next`、borrowed current-row view、common deadline enforcement、cancellation、portal、statement cacheをpublishしない。D8がtyped row delivery/generationとfull bind/decode type matrix、D9がdeadline/cancel completionを所有する。Q4aはそのconsumerに必要なrows cleanupとprepared text/blob copy lifetimeをcloseする。 | absence/interface goldenとQ4b/D8+D9 matrix |
 
@@ -3495,10 +3515,182 @@ adversarial reviewし、findingはledger-firstで閉じる。code review前にsu
 対応させる。resolver sign、format propagation、endian conversion、result metadata order、cleanupの
 findingはcomplete sibling type/operation/delivery auditを要求する。
 
+#### A1 explicit-pool public-contract ledger
+
+これは4つ目のconsumer-visible D13 railのsource of truthである。すでにshippedしたSQLite/
+PostgreSQL constructor上に、明示的なfixed-capacity poolを1つ追加する。driver registry、background
+worker、connection reset SQL、health check、retry、wait queue、dynamic resource collection、
+compiler special caseは追加しない。one `Pool` resourceが下記explicit-size private pointer arrayを
+opaque native representationとしてownするが、language-level Move resource collectionではない。
+exact public surface:
+
+```align
+module pkg.db.pool
+
+import pkg.db
+import pkg.db.sqlite
+import pkg.db.postgres
+import pkg.db.pool.internal.resource
+
+pub MAX_CAPACITY: i64 := 1024
+
+pub resource Pool = pkg.db.pool.internal.resource.drop_pool
+
+pub Info {
+  driver: pkg.db.Driver,
+  capacity: i64,
+  idle: i64,
+  checked_out: i64,
+}
+
+pub fn open_sqlite(
+  path: str,
+  capacity: i64,
+  options: slice<pkg.db.sqlite.ConnectOption>,
+) -> Result<Pool, pkg.db.Error>
+
+pub fn open_postgres(
+  url: str,
+  capacity: i64,
+  options: slice<pkg.db.postgres.ConnectOption>,
+) -> Result<Pool, pkg.db.Error>
+
+pub fn try_acquire(borrow owner: Pool) -> Result<pkg.db.conn, pkg.db.Error>
+
+pub fn info(borrow owner: Pool) -> Result<Info, pkg.db.Error>
+```
+
+`db.Error` は§15のpayload-free `PoolExhausted` variantを追加する。`acquire` alias、manual
+release/close、pool option sum、acquisition timeoutはない。`try_acquire` はwait、clock read、
+connection open、database/native I/Oを行わない。valid poolで `idle == 0` ならexact
+`db.Error.PoolExhausted` を即時に返す。malformed private pool imageはslot load/counter mutation前に
+exact `Unsupported(ContractError { query_id: None, item: "db.pool.state",
+message: "database pool state is invalid" })` を返す。`info` も同じcomplete state validationを行い、
+1つのCopy snapshotを返す。fieldsは `0 <= idle`、`0 <= checked_out`、
+`idle + checked_out <= capacity` を満たし、差分はunusable checked-out connectionのDrop後に
+retireしたslot数である。
+
+capacity validationが最初で、exact `1..=MAX_CAPACITY` だけをacceptする。それ以外はbookkeeping
+allocation、input/option inspection、native work前に
+`Unsupported(ContractError { query_id: None, item: "db.pool.capacity",
+message: "database pool capacity must be between 1 and 1024" })` を返す。このboundはone constructor
+callを1,024 external connection attempt、pointer storageをexact 8,192 byteへcapするresource-safety
+boundであり、default/throughput recommendationではない。valid capacityならconstructorは
+text/option sliceをcall中だけborrowし、fixed pool record 1つとchecked pointer array 1つをallocateし、
+対応するshipped `sqlite.connect` / `postgres.connect` をphysical ordinal昇順に呼ぶ。したがって
+UTF-8/U+0000、option default、duplicate/conflict、duration、client encoding、native connection
+errorとsource orderはexactに各constructor contractのままである。poolはpath、URL、secret、option
+valueを保持しない。ordinal `n` のfailureは、先に成功した `n-1` connectionをordinal逆順に
+close/freeしpool bookkeepingを全てfreeしてから、そのexact driver errorを返し `Pool` をpublish
+しない。constructorは全 `capacity` connection成功後だけpoolをpublishするため、後続acquisitionに
+hidden network/filesystem/SQL/PRAGMA/authentication workはない。同じSQLite pathを繰り返しても
+database identityをrewrite/inferしない。SQLite `:memory:`、empty、URI、cache、mutex semanticsは
+callerの明示connect inputが持つexact meaningのままである。formation cleanupはownership-atomicだが
+external-effect rollbackではない。earlier successful `sqlite.connect` がcreateしたSQLite fileやapplyした
+PRAGMAはlater ordinal failureでもdelete/compensateしない。`ConnectTimeoutNs` その他のconnect optionは
+各physical connectionへindependently applyし、aggregate pool-open deadlineはない。
+
+open poolはidle physical connectionをownする。`try_acquire` はmost-recently-returned idle
+connection、初期状態ではhighest open ordinalをordinary standalone `db.conn` 1つへtransferして
+`checked_out` をincrementし、checked-out stateはidle arrayから外れる。connectionはprivate origin
+pointerを1つ保持するが `Pool` へのcompiler borrow dependencyは持たない。settled
+`db.begin`/`commit`/`rollback` APIは同じraw stateをnominal `db.conn`/`db.tx`間でtransferするため、
+parent-dependent `db.conn`をfabricateして `resource.into_raw` を使うとparent provenanceが消える。
+このためruntime ownershipがlast checked-out conn/tx Dropまでpool bookkeepingを生存させる。
+acquired ownerはpool-specific execution pathなしに、既存の全common/native Query、command、
+metadata、EXPLAIN、prepared statement、row stream、batch、transaction operationを使える。
+
+live acquired `db.conn` をopen originating poolへDropする時は、package wrapperにexecution lease/
+transaction ownerがないことを先にrequireし、その後native transaction idleをproveする。SQLiteは
+`sqlite3_get_autocommit(connection) != 0`、PostgreSQLは
+`PQtransactionStatus(connection) == PQTRANS_IDLE` をrequireする。proof missing/failureは
+poison/closeしてslotをretireする。successはreset SQL、rollback、health probe、reconnect、allocation
+なしにexact physical stateをLIFO returnする。これはtransaction-safety boundaryでありsession
+sanitizationではない。successful session-global change（supported PRAGMA、PostgreSQL `SET`、temporary
+object、advisory stateなど）はphysical connectionのpropertyとして残りnext acquirerからobservableである。
+fresh session stateが必要なcallerはnew poolをopenするかDrop前にexplicit inverse native operationを
+使い、poolはそれらをinfer/compensateしない。
+
+`commit`/`rollback` は同じattached stateを `db.conn` として返す。`db.tx` Dropはsettled fail-safe
+rollbackを先に行い、stronger exact rollback-and-idle proofを満たす場合だけ返す。SQLiteは
+`sqlite3_exec("ROLLBACK") == SQLITE_OK` と
+`sqlite3_get_autocommit(connection) != 0`、PostgreSQLはnon-null `PGRES_COMMAND_OK` result、exact `ROLLBACK` command status、clear後
+`PQTRANS_IDLE`を全てrequireする。proofがmissing/failならpoison/closeしてslotをretireする。
+既存dependent stmt/rows resourceがconn/tx parentのDropを防ぐため、active
+result/prepared handleがidle arrayへ入ることはない。native connectionをpoison/closeするpathは
+conn/tx Dropまでchecked-out accountingを保持し、その後stateをreturnせずfreeする。capacityはfixedで
+そのslotはretireする。poolはcredentialを保持せずtransparent reconnectしない。後続 `info` は低下した
+`idle + checked_out` を公開し、残るidle setがemptyなら `try_acquire` は `PoolExhausted`。
+replenishmentはpoolを明示的にDropしてopenし直す。
+
+`Pool` はsettled resource ruleによりMove、non-Copy、non-Sendである。borrowed operationがmutate
+できるのはprivate native bookkeepingだけで、task capture/concurrent accessは許さない。したがって
+v1のblocking acquireには意味がない。non-Send callerが待つ間にconnectionを返せるconcurrent ownerが
+存在しない。future Send/thread-safe resource formにはsynchronization、wait fairness、timeout、
+cancellation、Drop coordinationを持つnew pool contractが必要で、このcontractを黙って変更しない。
+
+Pool Dropはclosing stateを先にpublishし、全idle connectionをreverse LIFOでclose/freeする。
+checked-outがなければpointer array/pool recordを即freeする。残る場合、record/arrayはprivateのまま
+checked-out connection originからだけ到達可能であり、そのconn/txはPool Drop後もusableである。
+各later Dropはphysical stateをreturnせずclose/freeし、outstanding countをexactly once decrementし、
+最後がarray/pool recordをfreeする。Pool Dropはblock、borrower wait、SQL発行、checked-out native
+connection invalidationをしない。public manual close/detach/adopt/cross-pool returnはない。
+
+private connection recordはexact 40-byte、8-aligned v2となる。offset `0..31` はsettled
+driver/closed/native/busy-timeout/execution/transaction/statement-ordinal meaningを保持し、offset 32は
+origin-pool pointerで、direct driver connectionはnull、attached pool slotはnon-null。全
+connection-state validatorはnative access前にv1/unknown version/driver、invalid reserved、malformed
+live/closed native-pointer productをrejectする。originはprivileged package producer/Drop pathだけが
+install/consumeする。opaque resource内の全native pointerと同様、arbitrary pointer corruptionはprobe
+すべきpublic inputでなくsafe source contract外である。private pool recordはexact 48-byte、8-aligned v1:
+0に`u32 version=1`、4に`u8 driver`、5に`u8 lifecycle` (`0=open`,`1=closing`)、6にzero `u16`、
+8/16/24にsigned `capacity`/`idle`/`checked_out`、32にnon-null slot-array pointer、40にzero `u64`。
+arrayはexact `capacity` pointer cellで、`[0,idle)` だけがnon-null connection stateをownする。
+constructor publication、acquire、return、retirement、Pool Drop、last-checkout Dropだけがtransitionである。
+state pointer/slot array/counterはpublic ABI、persisted artifact、cache key、FFI signatureへ入らない。
+`pkg.db.internal.resource` がshared conn-origin/pool-record validator/transitionをownし、
+`drop_conn`/`drop_tx` はpublic pool moduleをupward importしない。
+`pkg.db.pool.internal.resource.drop_pool` はrequired descendant hookとしてraw ownerをそのcommon
+authorityへdownward delegateし、`pkg.db.pool` constructor/observerもsame sealed helperを使う。
+これによりmodule graphをacyclicに保ちlayout ownerを1つにする。
+
+implementationは1 capability PRとする。pool producerとconn/tx returnを分割するとdormant poolか、
+returnせずcloseするconnection Drop pathを残す。package sourceとowner testを変更し、compiler ownership
+semantics/IR shapeは変えない。throughput/latency数値を約束しないためbenchmarkはcorrectness gateで
+なく、allocation/native-call counterがexplicit-cost ruleを証明する。push前に
+`scripts/db-verify-local.sh` を実行しrequired live PostgreSQL jobをnon-skippableのままにする。
+
+Implementation closure matrix:
+
+| Closure cell | Required implementation closure | Exact owner evidence |
+|---|---|---|
+| public surface/error | constant/resource/Info/2 constructor/`try_acquire`/`info`だけexportし、payload-free `db.Error.PoolExhausted`だけ追加。interface/cache identityをonce更新。 | source/interface golden、whole/per-unit imported call、exhaustive Error match、acquire/close/release/adopt alias不存在 |
+| capacity/constructor validation | capacityは全multi-invalid productに勝ち、0/negative/1025/`i64` extremaをallocation/native前にreject。valid 1/1024はexact driver validationへdelegateしordinal順にopen。 | allocation/connect counter、capacity x NUL/invalid-option winner、both-driver boundary owner |
+| partial formation cleanup | 各physical ordinalのfailure/nullはprior unpublished connectionを逆順exactly once closeし、全raw ownerをfree、exact driver errorを返しpoolをpublishしない。 | SQLite/PostgreSQL parameterized ordinal failpoint、allocation/native-close ledger |
+| acquisition/observation/order | complete state validationがslot read前。initial/returned stateをLIFO popし、successはallocation/clock/native callなしにidle/checked-outをexact 1変更。empty valid stateはmutationなしのexact `PoolExhausted`。session-global stateはphysical LIFO slotに意図的に追従する。 | byte/counter snapshot、session-identity/session-state LIFO probe、exhaustion replay、checkout前中後info |
+| conn/tx ownership transfer | checked-out connはbegin/commit/rollback、failed commit/rollback cleanup、move、return、replacement、branch、loop、`?`、Dropでoriginを保持。Tx Dropは上記exact SQLite/PostgreSQL rollback-and-idle proof後だけreturn。raw provenanceでdependencyをlaunderしない。 | existing Q4a transaction matrix + pool counter、rollback status/tag/transaction-state failpoint、whole/per-unit |
+| dependent execution resource | stmt/rows/batch view/catalog cursor/EXPLAINは既存parent generation/leaseを保持。child live中conn/txはreturn不能で、child Dropがpool return前に完了。 | compile-time parent-overlap negative + both-driver Q4a/Q4b/Q5b2/A1 pooled execution owner |
+| poison/close/retirement | every existing poison/close causeとconn-return native-idle/tx rollback-and-idle proof failureはreuseをfailさせ、conn/tx Dropはidleにせずfree、checked-outをonce decrementしreconnect/resetなしのvisible capacity gapを残す。同期/native idleを保持するordinary DB errorはreturn可能。 | raw transaction-control command leakage attemptを含むdriver status/timeout/restore/conn-idle/rollback failure matrix、retirement後info/exhaustion、zero reconnect/reset call |
+| outstanding owner付きPool Drop | closingをidle teardown前にpublishしidleをonce close。checkout中bookkeepingを保持しconn/tx operationを許し、各Dropでclose、最後だけbookkeeping free。 | zero/one/many idle x zero/one/many checked-out allocation/close/order、tx/dependent stmt/rows含む |
+| private ABI/malformed state | 全v2 conn/v1 pool offset/tag/reserved/count/native-pointer product/slot prefixがone common internal authority、constructor/accessor、thin descendant Drop hook、conn/tx Dropで一致。malformed authenticated fieldはslot/native access前にfailしunknown driver dispatchなし。raw origin/slot pointer validityはprivileged unsafe producerのobligation。 | exact byte golden、one-field scalar/tag/null corruption no-call、v1 conn/unknown pool lifecycle rejection、constructor-origin transition/no-upward-import assertion |
+| driver/build parity | direct/pooled connectionはsame execution code/result/error identity。pool codeはwhole/per-unitでboth driver producer Drop thunkをretainしambient configなし。 | complete fake-driver matrix、live SQLite/PostgreSQL acquire/use/tx/reuse/Drop、`scripts/db-verify-local.sh` |
+
+`3da5488c` のfresh independent adversarial design reviewはP1 1件/P2 2件を発見した。この
+ledger-first revisionがcomplete finding setを閉じる:
+
+| Finding | Ledger-first closure | Required owner |
+|---|---|---|
+| wrapper-idle connがnative `BEGIN`/`START TRANSACTION`を隠しtransactionを次acquisitionへleakできた | every conn returnでexact driver-native idle proofをrequireしfailureはretire。non-transaction session stateのretentionを別に明記。 | raw transaction-control command x SQLite/PostgreSQL native-idle/retirement/no-next-acquirer matrix |
+| pooled tx Dropがsettled close-only ruleと矛盾 | earlier transaction ruleを全てqualifyし、directはclose、pool-originはstronger exact rollback-and-idle proof後だけreturn。 | explicit-end failure/implicit Drop x direct/pool x rollback proof success/failure |
+| exact pool contractにSettled recordがなかった | fixed-capacity non-waiting poolと、openのgeneral Send/thread-safe mutable-state questionを分離してrecord。 | source-of-truth consistency check |
+
+code review前にauthor-side matrix-to-diff passを1回行い、全applicable cellをimplementation pathと
+discriminating ownerへ対応させる。
+
 bounded batch generation、segmented child/validity bitmap、eligible direct SoAはfirst A1でshipped。
 PostgreSQL single-row/portal-batchとbinary formatは上記ledgerでspecified。
 COPY/pipeline/LISTEN-NOTIFY、SQLite backup/blob/FTS、
-explicit pool、common contract実証後の追加driver。
+explicit poolは上記ledgerでspecified、common contract実証後の追加driver。
 
 ### D14 — dynamic SQLとnative callback
 
@@ -3680,6 +3872,18 @@ execution-count付きで実証する。
 93. metadata schema/table inputのU+0000は両driverでnative/catalog request前にexact
     Query-less `db.Error.Encode` としてrejectし、multi-invalid inputはdeclaration-order
     precedenceに従う。
+94. `pkg.db.pool` はexactに `MAX_CAPACITY`、`Pool`、`Info`、`open_sqlite`、
+    `open_postgres`、`try_acquire`、`info` だけをexportする。acquisitionはimmediateでwait、
+    timeout、hidden open、aliasがない。
+95. pool capacityはexact `1..=1024`。全physical connectionをone explicit driver input setから
+    eagerly openし、partial formationはexact driver errorを返す前に全unpublished ownerをcloseする。
+96. checked-out connはconn/tx conversionと全dependent execution resourceでone pool originを保持する。
+    live Dropはexact native-idle proof後だけLIFO returnし、poison/proof failureはretireする。どのpathも
+    reset/reconnectせず、他のsession-global stateはphysical slotに意図的に残る。
+97. Pool Dropはidle connectionを先にcloseするがchecked-out conn/tx ownerをinvalidateしない。
+    last later owner Dropがconnectionをcloseしretained bookkeepingをexactly once freeする。
+98. `db.Error.PoolExhausted` はpayload-free/allocation-free。`pkg.db.pool.Info` がexact capacity、
+    idle、checked-out countを公開するためretired capacityもvisibleである。
 
 ## 25. 実装前にconsumerで確定するtype/native detail
 

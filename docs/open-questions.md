@@ -13,6 +13,25 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### `pkg.db.pool` is explicit, fixed-capacity, and non-waiting (SETTLED 2026-08-13)
+
+**Decision:** D13 adds one `pkg.db.pool` module with an eagerly opened `1..=1024` fixed-capacity
+SQLite/PostgreSQL pool, payload-free `db.Error.PoolExhausted`, immediate `try_acquire`, and exact
+capacity/idle/checked-out inspection. It has no background work, wait, acquisition timeout,
+transparent reset/retry/reconnect, or hidden connection open. A checked-out ordinary `db.conn`
+keeps a private runtime origin through conn/tx transfer. It returns LIFO only after the exact native
+transaction-idle proof; poison or a failed proof retires the slot. Pool Drop closes idle owners but
+keeps bookkeeping alive for outstanding conn/tx values, which close and release it exactly once.
+Session-global state other than transaction idleness deliberately follows the physical slot.
+
+This settles the package contract without introducing a compiler ownership exception or a general
+shareable state primitive. `Pool` remains an ordinary non-Send resource. Whether Align later needs a
+Send/thread-safe resource form for concurrent wait/fairness/cancellation and general server-lifetime
+mutable state remains Open below.
+
+Record: `docs/impl/pkg-design/db.md` §23 and synchronized
+`docs/impl/pkg-design/ja/db.md`
+
 ### Runtime-bitcode LTO defaults on under optimizing profiles (SETTLED 2026-08-09)
 
 `--rt-lto` (M14 Slice 2) was designed opt-in. The default now resolves per profile: **ON for
@@ -2853,10 +2872,13 @@ Recommendations recorded here for confirmation; on approval each moves to Settle
   discipline (interpret `X-Forwarded-*` only from a configured trusted proxy; default distrust),
   without which the proxy assumption is a client-IP spoofing hole. Revisit at HTTP/2 (ALPN) or real
   standalone-deploy demand — a revisit, not a permanent no.
-- **Long-lived mutable state** (e.g. a server-lifetime Pool) — currently expressible only in
+- **Long-lived mutable state** — the D13 `pkg.db.pool.Pool` is an explicit non-Send resource whose
+  borrowed operations mutate only package-owned native bookkeeping; it does not make application
+  state shareable across tasks. General server-lifetime mutable state is still expressible only in
   `main`'s outermost scope threaded by `borrow mut`. Whether that is ergonomic enough for
-  server-shaped programs, or wants a dedicated form, is open. Guide chapters 20 and 22 sketch this
-  and now carry a note to that effect; their full rewrite follows this resolution.
+  server-shaped programs, or wants a dedicated Send/thread-safe form, is open. Guide chapters 20
+  and 22 sketch this and now carry a note to that effect; their full rewrite follows this
+  resolution.
 
 ### Unit-returning `fn main()` yields a nondeterministic exit code — FIXED as #450, 2026-07-14
 
