@@ -21,17 +21,59 @@
 #
 # Comments and blank lines are ignored. Keep entries sorted by target.
 #
-# BOOTSTRAP (2026-08-13). This baseline is incomplete on purpose. The remaining
-# known failures on main have to be transcribed from an observed run, and the
-# machine this landed on could not produce one: freshly linked binaries park in
-# _dyld_start at 0% CPU for ~10 minutes each (macOS 26.5, syspolicyd at 116 h
-# CPU), which is the host stall CLAUDE.md already documents. Guessing the test
-# names would defeat the point of naming them.
-#
-# The first run fills this in and costs nothing extra: every failure is
-# reported as "suite: NEW failures" in exactly the two-field form below, so the
-# lines can be pasted straight in. Classify each one on the way — a test that
-# needs ALIGN_* configuration, a network, or a service gets the "env" field;
-# everything else is a real known failure and stays strict.
+# baseline recorded from run 31662845202 (2026-08-13); burn-down list — delete
+# lines as fixes land
 
+artifact_staging	<binary-exit-101>
+buffer_donate	donation_on_and_off_execute_identically
+build_profiles	size_report_honors_profile_eq_form
+build_profiles	size_report_release_has_expected_shape
+build_profiles	size_report_tiny_is_stripped
+cache_codegen	gate10_cross_process_impl_hash_stability
+cache_codegen	gate13b_sort_adaptive_toggle_never_poisons_cache
+cache_codegen	gate13c_buffer_donate_toggle_never_poisons_cache
+cache_parallel	cache_clear_resets_the_cache
+cache_parallel	cache_stats_reports_hits_and_misses
+cache_parallel	concurrent_different_same_basename_builds_keep_distinct_actions
+cache_parallel	concurrent_identical_builds_share_complete_actions
+cache_parallel	default_on_second_build_all_hit_and_byte_identical
+cache_parallel	jobs_flag_and_env_are_honored
+cache_parallel	parallel_build_is_byte_identical_to_serial
+cache_parallel	parallel_dag_build_is_deterministic
+const_pool	value_only_edit_of_pooled_table_misses_the_cache
 json_scan_identity	json_scan_cross_compiler_identity	env
+m5	json_scalar_array_str_element_rejected
+m5	json_scan_generic_return_context_inference_matrix
+owned_structs	move_struct_in_unsupported_containers_rejected
+per_unit_surface	cli_build_capability_union_needs_libz_only
+per_unit_surface	cli_build_run_size_match_library_reference
+per_unit_surface	cli_rt_lto_multi_file_inlines_in_non_entry_unit
+per_unit_surface	size_multi_file_reports_the_final_executable
+pgo	flag_off_builds_are_byte_identical
+pgo	full_round_trip_gen_merge_use
+pgo	instrument_binary_has_profile_sections_plain_does_not
+pgo	instrument_build_writes_profraw_and_prints_destination
+pgo	run_parity_off_instrument_use
+pgo_cache	instrument_exe_is_byte_identical_cold_vs_hit_and_cache_stats_report_normal
+pgo_sv	gate_sv1a_instrument_build_twice_byte_identical
+pkg_db_q5b1	meta_query_rejects_non_live_execution_targets_before_materialization
+pkg_db_q6	layer1_case_fingerprints_match_the_golden
+pkg_db_q6	postgres_compound_shaping_dispatches_once_on_connection_and_transaction
+pkg_db_q6	sqlite_user_groups_one_parent_and_segmented_matrices_are_exact
+reassign_drop	arena_to_heap_reassign_sets_a_path_local_drop_flag
+reassign_drop	owned_call_result_stays_individual_with_an_arena_borrow_argument
+return_provenance	product_projection_summaries_select_exact_parameter_roots
+runway_a2_binary_codec	append_own_bytes_survives_reallocation
+struct_handle_fields	option_of_handle_field_stays_rejected
+thin_lto	gate_n1_exe_byte_identical
+thin_lto_cache	gate7_cross_process_second_build_all_hit
+thin_lto_sv	gate_sv1_subprocess_build_twice_byte_identical
+unit_cache	a_cold_build_and_an_all_hit_build_produce_the_same_executable
+unit_cache	a_descriptor_owning_unit_is_never_cached
+unit_cache	a_measurement_toggle_disables_the_cache
+unit_cache	a_stale_entry_makes_the_cli_retry_once_and_succeed
+vectorize_shapes	canonical_indexed_loop_skeleton_raw
+
+# byte-identity family (thin_lto/pgo/cache_parallel/unit_cache/pkg_db
+# fingerprints) fails as a cluster on the Linux runner — suspected single root
+# cause under triage; see backlog
