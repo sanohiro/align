@@ -2,7 +2,7 @@
 
 > 🌐 [English](../23-packages.md) · **日本語**
 
-`core` は言語のデータレイヤー、`std` は OS 境界、`pkg` はフレームワークやドメインライブラリを置くソースパッケージのレイヤーです。パッケージ基盤と first-party の `pkg.web`、`pkg.jwt` は現在すでに利用できます。3 つ目の first-party パッケージ `pkg.db` も同じツリーに実在しますが、まだ実装途上です。現状は本章の最後の節で正確に述べます。意図的にまだ存在しないのは、レジストリや取得ツールです。
+`core` は言語のデータレイヤー、`std` は OS 境界、`pkg` はフレームワークやドメインライブラリを置くソースパッケージのレイヤーです。パッケージ基盤と first-party の `pkg.web`、`pkg.jwt`、`pkg.db` は現在すでに利用できます。意図的にまだ存在しないのは、レジストリや取得ツールです。
 
 ## パッケージはソースツリー
 
@@ -90,13 +90,13 @@ pub fn main() -> Result<(), Error> {
 
 検証時はトークン自身の `alg` フィールドを信頼せず、アルゴリズムを HS256 に固定し、署名を定数時間で比較します。`time_claims_valid` は、署名検証とは分離して、任意の `exp` と `nbf` NumericDate claim を検査します。HS384/512、RSA、ECDSA、公開プロバイダの OIDC 検証は、それぞれに必要な監査済み暗号プリミティブが揃うまで公開しません。
 
-## `pkg.db` ― 実在し、なお着地中
+## `pkg.db` ― コミット済みロードマップ完了
 
-`pkg.db` は first-party のデータベースパッケージで、vendoring の形は他の 2 つと同じです。[apps/db/pkg](../../../apps/db/pkg) に `pkg/db.align` があり、その下に `pkg.db.sqlite`、`pkg.db.postgres`、`pkg.db.pool` の各モジュールが並びます。「まだ無い」わけでも「もう完成した」わけでもないため、本節では安定した API を約束する代わりに、現在地をそのまま述べます。
+`pkg.db` は first-party のデータベースパッケージで、vendoring の形は他の 2 つと同じです。[apps/db/pkg](../../../apps/db/pkg) に `pkg/db.align` があり、その下に `pkg.db.sqlite`、`pkg.db.postgres`、`pkg.db.pool` の各モジュールが並びます。
 
 完了しているのは、公開初回リリースの範囲です。型付きの静的クエリとコマンドは、実際のスキーマメタデータに対してコンパイル時に検査され、SQLite と PostgreSQL の両方で実行でき、そのメタデータをオフラインで再生成できます。プリペアドステートメント、トランザクション、デッドラインとキャンセルを備えた型付き行ストリーム、一対多／多対一の複合出力、マイグレーションのライフサイクル管理、`EXPLAIN` を含む読み取り専用のカタログ検査も、すべて入っています。
 
-着地中なのは、リリース後のスループット系と動的 SQL 系のレールです。上限付きのバッチ／SoA デリバリ、PostgreSQL ネイティブの single-row / portal-batch デリバリ、明示的な固定容量・待機なしの `pkg.db.pool` はすでに出荷済みで、ドライバ明示の動的 SQL も出荷済みです。残るのは、証明付きのネイティブコールバック面と、最後のレール横断監査です。これらが閉じるまでは、公開 API はまだ動きうるものとして扱ってください。
+コミット済みの全ロードマップも出荷済みです。上限付きのバッチ／SoA デリバリ、PostgreSQL ネイティブの single-row / portal-batch デリバリ、明示的な固定容量・待機なしの `pkg.db.pool`、ドライバ明示の動的 SQL、証明付き SQLite scalar function が入っています。最後のレール横断監査により、全 owner suite がローカルと CI の必須ゲートで走ります。より広い論理型、PostgreSQL COPY と callback、SQLite collation は D1〜D14 の未完了ではなく、consumer が具体化してから決める将来の面です。
 
 コンパイラ側はすでに手元のバイナリに入っています。`alignc db prepare`、`db migrate`、`db status`、`db check`、`db repair`（第 [16](16-toolchain.md) 章）が、検査済みメタデータとマイグレーションカタログを操作します。契約の正本は `docs/impl/pkg-design/db.md` です。
 

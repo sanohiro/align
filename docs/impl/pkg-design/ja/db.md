@@ -4712,7 +4712,7 @@ ledgerでsettledした。上記wider logical/native type mapping、SQLite collat
 surfaceはsettleしない。
 
 engine/versionごとのnullability/origin support matrixは§16.3.1で確定しD0/D3/D5が所有する。
-残りはD12〜D14に担当を持つ。Query identity、one-execution、ownership、artifact、
+残りはコミット済みD14ロードマップ完了後のconsumer-gated future railである。Query identity、one-execution、ownership、artifact、
 runtime validation、option rejectionを弱める理由にはならない。
 
 ## 26. 実装agentへの指示

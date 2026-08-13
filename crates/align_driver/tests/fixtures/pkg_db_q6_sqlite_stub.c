@@ -3,6 +3,10 @@
 #include <string.h>
 
 typedef struct {
+  int autocommit;
+} Q6Database;
+
+typedef struct {
   int kind;
   int row;
   int rows;
@@ -14,16 +18,20 @@ static int q6_prepare_calls;
 static int q6_step_calls;
 static int q6_delivered_rows;
 static int q6_finalize_calls;
+static int q6_control_calls;
 static int q6_protocol_ok;
 static int q6_fail_next_bind;
+static int q6_last_error;
 
 void align_sqlite_q6_reset(void) {
   q6_prepare_calls = 0;
   q6_step_calls = 0;
   q6_delivered_rows = 0;
   q6_finalize_calls = 0;
+  q6_control_calls = 0;
   q6_protocol_ok = 1;
   q6_fail_next_bind = 0;
+  q6_last_error = 0;
 }
 
 void align_sqlite_q6_fail_next_bind(void) { q6_fail_next_bind = 1; }
@@ -32,7 +40,75 @@ int align_sqlite_q6_prepare_calls(void) { return q6_prepare_calls; }
 int align_sqlite_q6_step_calls(void) { return q6_step_calls; }
 int align_sqlite_q6_delivered_rows(void) { return q6_delivered_rows; }
 int align_sqlite_q6_finalize_calls(void) { return q6_finalize_calls; }
+int align_sqlite_q6_control_calls(void) { return q6_control_calls; }
 int align_sqlite_q6_protocol_ok(void) { return q6_protocol_ok; }
+
+int sqlite3_open_v2(const char *filename, void **database_out, int flags, const char *vfs) {
+  (void)flags;
+  (void)vfs;
+  if (filename == NULL || database_out == NULL) return 1;
+  Q6Database *database = (Q6Database *)calloc(1, sizeof(Q6Database));
+  if (database == NULL) return 7;
+  database->autocommit = 1;
+  *database_out = database;
+  q6_last_error = 0;
+  return 0;
+}
+
+int sqlite3_close_v2(void *database) {
+  free(database);
+  return 0;
+}
+
+int sqlite3_extended_result_codes(void *database, int enabled) {
+  return database != NULL && enabled == 1 ? 0 : 1;
+}
+
+int sqlite3_errcode(void *database) { return database == NULL ? 1 : q6_last_error; }
+int sqlite3_extended_errcode(void *database) { return sqlite3_errcode(database); }
+const char *sqlite3_errmsg(void *database) {
+  (void)database;
+  return q6_last_error == 0 ? "not an error" : "SQLite q6 stub failure";
+}
+int sqlite3_libversion_number(void) { return 3046000; }
+
+int sqlite3_get_autocommit(void *database) {
+  return database == NULL ? 0 : ((Q6Database *)database)->autocommit;
+}
+
+int sqlite3_exec(
+    void *database,
+    const char *sql,
+    void *callback,
+    void *argument,
+    char **error_out) {
+  (void)callback;
+  (void)argument;
+  (void)error_out;
+  if (database == NULL || sql == NULL) {
+    q6_protocol_ok = 0;
+    q6_last_error = 1;
+    return 1;
+  }
+  Q6Database *state = (Q6Database *)database;
+  if (strcmp(sql, "BEGIN DEFERRED") == 0 && state->autocommit == 1) {
+    state->autocommit = 0;
+  } else if ((strcmp(sql, "ROLLBACK") == 0 || strcmp(sql, "COMMIT") == 0)
+      && state->autocommit == 0) {
+    state->autocommit = 1;
+  } else {
+    q6_protocol_ok = 0;
+    q6_last_error = 1;
+    return 1;
+  }
+  q6_control_calls++;
+  q6_last_error = 0;
+  return 0;
+}
+
+int sqlite3_busy_timeout(void *database, int milliseconds) {
+  return database != NULL && milliseconds >= 0 ? 0 : 1;
+}
 
 static int q6_rows(int kind, int64_t parameter, int64_t last_parameter) {
   if (kind == 2) return parameter == 0 ? 0 : 2;
@@ -92,8 +168,10 @@ int sqlite3_bind_int64(void *raw_statement, int index, int64_t value) {
   }
   if (q6_fail_next_bind) {
     q6_fail_next_bind = 0;
+    q6_last_error = 7;
     return 7;
   }
+  q6_last_error = 0;
   if (index == 1) statement->parameter = value;
   else statement->last_parameter = value;
   statement->rows = q6_rows(

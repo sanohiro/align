@@ -204,17 +204,6 @@ import pkg.db.sqlite
 import pkg.db.q5b1_test
 import app.lookup
 
-fn rejected(result: Result<array<pkg.db.QueryMeta>, pkg.db.Error>) -> bool = match result {
-  Ok(_) => false
-  Err(error) => match error {
-    Unsupported(contract) => contract.item == "db.meta.exec" && match contract.query_id {
-      Some(query_id) => query_id == "app.lookup.query"
-      None => false
-    }
-    _ => false
-  }
-}
-
 fn main() -> i32 {
   opened := pkg.db.sqlite.connect(":memory:", [])
   connection := opened else { return 1 }
@@ -224,22 +213,62 @@ fn main() -> i32 {
     pkg.db.q5b1_test.set_closed(target, 1)
     closed := pkg.db.meta_query(target, query, pkg.db.MetaDetail.Names, out, [])
     pkg.db.q5b1_test.set_closed(target, 0)
-    if !rejected(closed) { return 2 }
+    closed_rejected := match closed {
+      Err(error) => match error {
+        Unsupported(contract) => contract.item == "db.meta.exec" && match contract.query_id {
+          Some(query_id) => query_id == "app.lookup.query"
+          None => false
+        }
+        _ => false
+      }
+      Ok(_) => false
+    }
+    if !closed_rejected { return 2 }
 
     pkg.db.q5b1_test.set_version(target, 0)
     wrong_version := pkg.db.meta_query(target, query, pkg.db.MetaDetail.Names, out, [])
-    pkg.db.q5b1_test.set_version(target, 1)
-    if !rejected(wrong_version) { return 3 }
+    pkg.db.q5b1_test.set_version(target, 2)
+    wrong_version_rejected := match wrong_version {
+      Err(error) => match error {
+        Unsupported(contract) => contract.item == "db.meta.exec" && match contract.query_id {
+          Some(query_id) => query_id == "app.lookup.query"
+          None => false
+        }
+        _ => false
+      }
+      Ok(_) => false
+    }
+    if !wrong_version_rejected { return 3 }
 
     pkg.db.q5b1_test.set_reserved(target, 1)
     reserved := pkg.db.meta_query(target, query, pkg.db.MetaDetail.Names, out, [])
     pkg.db.q5b1_test.set_reserved(target, 0)
-    if !rejected(reserved) { return 4 }
+    reserved_rejected := match reserved {
+      Err(error) => match error {
+        Unsupported(contract) => contract.item == "db.meta.exec" && match contract.query_id {
+          Some(query_id) => query_id == "app.lookup.query"
+          None => false
+        }
+        _ => false
+      }
+      Ok(_) => false
+    }
+    if !reserved_rejected { return 4 }
 
     native := pkg.db.q5b1_test.take_native(target)
     missing_native := pkg.db.meta_query(target, query, pkg.db.MetaDetail.Names, out, [])
     pkg.db.q5b1_test.restore_native(target, native)
-    if !rejected(missing_native) { return 5 }
+    missing_native_rejected := match missing_native {
+      Err(error) => match error {
+        Unsupported(contract) => contract.item == "db.meta.exec" && match contract.query_id {
+          Some(query_id) => query_id == "app.lookup.query"
+          None => false
+        }
+        _ => false
+      }
+      Ok(_) => false
+    }
+    if !missing_native_rejected { return 5 }
 
     valid := pkg.db.meta_query(target, query, pkg.db.MetaDetail.Names, out, [])
     rows := valid else { return 6 }
@@ -566,7 +595,7 @@ fn checked_query_metadata_projection_uses_only_selected_driver_evidence() {
 ///
 /// Regenerate ONLY with a reviewed reason, from the panic message this emits.
 const LAYER1_FINGERPRINT_GOLDEN: &str = "\
-pkg-db-q5b1-query-meta-live-exec 67a385220c30f690
+pkg-db-q5b1-query-meta-live-exec 48dc881c537a7687
 pkg-db-q5b1-query-meta-whole ea8352ac404210f8
 ";
 

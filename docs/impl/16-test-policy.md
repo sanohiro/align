@@ -190,10 +190,10 @@ round-trips for failures that reproduce locally in seconds.
 
 `scripts/db-verify-local.sh` is the CI-parity local gate: it starts a
 disposable Docker `postgres:16.4` with CI's exact credentials and environment,
-runs the same inverted required-mode self-test and the same
-`pkg_db_q2`/`pkg_db_q3`/`pkg_db_q5a`/`pkg_db_q5b2` suites, and tears the
-container down. A diff touching `apps/db` or a `pkg_db_*` test must pass it
-before push. The
+runs the same inverted required-mode self-test and all thirteen `pkg.db` owner
+suites (`q1`, `q2`, `q3`, `q4a`, `q4b`, `q5a`, `q5b1`, `q5b2`, `q6`, `a1`,
+`pool`, `a2`, and `callbacks`), and tears the container down. A diff touching
+`apps/db` or a `pkg_db_*` test must pass it before push. The
 same rule generalizes: a new env-gated required CI suite ships with a matching
 local Docker script in the same PR.
 
@@ -420,8 +420,9 @@ red nightly is triaged against the manifest and does not block an unrelated PR.
 
 ## pkg.db owner-test harness
 
-The `pkg.db` end-to-end suites (`pkg_db_a1`, `q2`, `q4a`, `q4b`, `q5b1`, `q5b2`,
-`q6`) share one harness at `crates/align_driver/tests/db_harness/`. The
+The `pkg.db` end-to-end suites (`pkg_db_a1`, `a2`, `callbacks`, `pool`, `q2`,
+`q4a`, `q4b`, `q5b1`, `q5b2`, `q6`) share one harness at
+`crates/align_driver/tests/db_harness/`. The
 Rust-API suites (`q1`, `q3`, `q5a`) drive `align_driver` directly and are out of
 its scope.
 
@@ -629,11 +630,13 @@ Recorded so the gap is explicit rather than implied:
   with the lease wave (#758) that inherited the blame — the unquoted read is
   byte-identical in `apps/db/pkg/db.align` from #726 through #764. Every
   unqualified reference is double-quoted now, and the owner reaches 62.
-- ~~`pkg_db_a1` and `pkg_db_q5b2` are not compiled by any CI job~~ — **closed for
-  `q5b2`**. With the red owner fixed, `q5b2` joins `q2`/`q3`/`q5a` in both
-  `scripts/db-verify-local.sh` and the required PostgreSQL job — the missing
-  gate is exactly what let a never-executed statement stay broken from the PR
-  that introduced it. Measured locally against a disposable `postgres:16.4`:
+- ~~The complete `pkg.db` owner set is not compiled by any required CI job~~ —
+  **closed**. The final D14 cross-rail audit found real stale assumptions in
+  `q4b`, `q5b1`, and `q6` precisely because only eight of thirteen owners ran in
+  the required local/CI gate. All thirteen now run in both
+  `scripts/db-verify-local.sh` and the required PostgreSQL job. The earlier
+  `q5b2` addition established the measured cost baseline against a disposable
+  `postgres:16.4`:
   the full 14-test suite takes **28.6 s** of test time standalone and **36.0 s**
   as the script's fourth step, for **149.7 s of CPU**. Measured in CI (#766):
   the new step costs **32 s on a PR run and 45 s on the first `main` run**,
@@ -643,11 +646,10 @@ Recorded so the gap is explicit rather than implied:
   step's own cost**. A cold-compile penalty was predicted and did not appear: a
   PR branch does not save the Cargo caches, but it still restores them through
   `restore-keys`, so it inherits `main`'s and pays no first-run rebuild.
-  `pkg_db_a1` stays owner-run: it drives SQLite in memory and PostgreSQL
-  through a linked libpq stub, so a live server is not its gate and the
-  required PostgreSQL job would only pay for it. Its owner run is reported in
-  the PR that changes it.
-- **`pkg_db_q1` and `q3`** remain Rust-API suites outside the harness's scope;
+  The final closure deliberately also runs stub- and SQLite-owned suites in
+  that job: it is the one required cross-rail product gate, while individual
+  cases retain their exact native/live gating.
+- **`pkg_db_q1`, `q3`, and `q5a`** remain Rust-API suites outside the harness's scope;
   their `include_str!` statics feed `Proj`-based API assertions, not a `Layout`.
   `q3` uses the shared live-gating helper above, which is the only harness
   surface that applies to it.

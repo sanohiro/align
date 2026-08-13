@@ -1355,9 +1355,15 @@ fn inspect(
       [pkg.db.MetaOption.TimeoutNs(1)],
       [pkg.db.sqlite.MetaOption.IncludeInternalObjects],
     )
-    if !contract(
-      sqlite_meta, "db.meta.timeout_ns", "SQLite does not support common metadata deadlines",
-    ) { return 7 }
+    sqlite_meta_contract := match sqlite_meta {
+      Err(error) => match error {
+        Unsupported(value) => value.item == "db.meta.timeout_ns"
+          && value.message == "SQLite does not support common metadata deadlines"
+        _ => false
+      }
+      Ok(_) => false
+    }
+    if !sqlite_meta_contract { return 7 }
     postgres_meta := pkg.db.postgres.meta_database_native(
       postgres_target, pkg.db.MetaDetail.Names, out,
       [pkg.db.MetaOption.TimeoutNs(1)],
@@ -1366,31 +1372,43 @@ fn inspect(
         pkg.db.postgres.MetaOption.IncludeSystemCatalogs,
       ],
     )
-    if !contract(
-      postgres_meta,
-      "db.meta.timeout_ns",
-      "PostgreSQL metadata deadlines are not supported in v1",
-    ) { return 8 }
+    postgres_meta_contract := match postgres_meta {
+      Err(error) => match error {
+        Unsupported(value) => value.item == "db.meta.timeout_ns"
+          && value.message == "PostgreSQL metadata deadlines are not supported in v1"
+        _ => false
+      }
+      Ok(_) => false
+    }
+    if !postgres_meta_contract { return 8 }
     sqlite_explain := pkg.db.sqlite.explain_native(
       sqlite_target, app.q4b_query.selected(), sqlite_params(bytes[..]), out,
       [pkg.db.ExplainOption.TimeoutNs(1)],
       [pkg.db.sqlite.ExplainOption.QueryPlan, pkg.db.sqlite.ExplainOption.Bytecode],
     )
-    if !contract(
-      sqlite_explain,
-      "db.explain.timeout_ns",
-      "SQLite does not support common EXPLAIN deadlines",
-    ) { return 9 }
+    sqlite_explain_contract := match sqlite_explain {
+      Err(error) => match error {
+        Unsupported(value) => value.item == "db.explain.timeout_ns"
+          && value.message == "SQLite does not support common EXPLAIN deadlines"
+        _ => false
+      }
+      Ok(_) => false
+    }
+    if !sqlite_explain_contract { return 9 }
     postgres_explain := pkg.db.postgres.explain_native(
       postgres_target, app.q4b_query.deadline_success(), params(), out,
       [pkg.db.ExplainOption.TimeoutNs(1)],
       [pkg.db.postgres.ExplainOption.Buffers(true)],
     )
-    if !contract(
-      postgres_explain,
-      "db.explain.timeout_ns",
-      "PostgreSQL EXPLAIN deadlines are not supported in v1",
-    ) { return 10 }
+    postgres_explain_contract := match postgres_explain {
+      Err(error) => match error {
+        Unsupported(value) => value.item == "db.explain.timeout_ns"
+          && value.message == "PostgreSQL EXPLAIN deadlines are not supported in v1"
+        _ => false
+      }
+      Ok(_) => false
+    }
+    if !postgres_explain_contract { return 10 }
   }
   return 0
 }
@@ -3212,7 +3230,7 @@ fn materialized_projects_are_removed_on_drop() {
 ///
 /// Regenerate ONLY with a reviewed reason, from the panic message this emits.
 const LAYER1_FINGERPRINT_GOLDEN: &str = "\
-pkg-db-q4b-deadline-disposition f76981d6793fa0d1
+pkg-db-q4b-deadline-disposition 2aaa1256e5529c05
 pkg-db-q4b-owned-params 5e455caea2840caa
 pkg-db-q4b-postgres-buffered-lifecycle d14c08bf985b4356
 pkg-db-q4b-postgres-command-deadline 7a4bb2c4f41be14a

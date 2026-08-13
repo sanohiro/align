@@ -92,6 +92,10 @@ For planning language, **initial `pkg.db` release** means L1a–L7 plus D1–D12
 **complete committed `pkg.db` roadmap** means those plus D13 and D14. D0 is
 disposable native evidence and may run in parallel at any time.
 
+The complete committed roadmap is implemented through D14. Future logical
+types, PostgreSQL COPY/callbacks, and SQLite collations remain consumer-gated
+surfaces, not unfinished work in this roadmap.
+
 Every wave must produce a compiling, focused-owner-backed checkpoint within
 eight active hours and a PR-ready capability within twenty-four active hours,
 unless it is waiting only on one still-progressing required command or external

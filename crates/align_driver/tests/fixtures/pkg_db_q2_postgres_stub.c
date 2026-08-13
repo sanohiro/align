@@ -72,6 +72,7 @@ static int rollback_next_commit;
 static int pool_rollback_fault;
 static char prepared_name[64];
 static FakeResult *async_result;
+static int q6_compound_owner;
 static FakeResult *async_queue[ASYNC_QUEUE_CAPACITY];
 static int async_queue_count;
 static int async_queue_index;
@@ -178,6 +179,7 @@ void align_pg_reset(void) {
   pool_rollback_fault = 0;
   prepared_name[0] = '\0';
   async_busy = 0;
+  q6_compound_owner = 0;
   async_cancelled = 0;
   async_cancel_fail = 0;
   async_drain_fail = 0;
@@ -235,6 +237,7 @@ int align_pg_chunked_row_mode_calls(void) { return chunked_row_mode_calls; }
 int align_pg_last_chunk_size(void) { return last_chunk_size; }
 int align_pg_q6_delivered_rows(void) { return q6_delivered_rows; }
 void align_pg_q6_fail_next_execute(void) { q6_fail_next_execute = 1; }
+void align_pg_q6_compound_owner(void) { q6_compound_owner = 1; }
 void align_pg_force_result_status(int status) { forced_result_status = status; }
 int align_pg_forbidden_after_status_calls(void) { return forbidden_after_status_calls; }
 int align_pg_last_timeout(void) { return last_timeout; }
@@ -641,7 +644,7 @@ static void q6_user_result(FakeResult *result, int parameter, int last_parameter
     result->nulls[2][3] = 1;
     return;
   }
-  if (parameter == 1 && last_parameter == 1) {
+  if (!q6_compound_owner && parameter == 1 && last_parameter == 1) {
     result->rows = 1;
     result->values[0][0] = "1";
     result->values[0][1] = "Alice";
