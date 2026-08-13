@@ -68,12 +68,13 @@ Active align-llm compatibility checkpoint: branch `agent/align-llm-hir-validator
 on `origin/main` `1be17b0ec7e4f05ec19a3b5f5c5145732fe1e406`. That release compiler correctly
 made a previously silent HIR-to-MIR rejection loud, exposing that Sema admits both `str.clone()`
 and `string.clone()` while the body validator accepted only the borrowed receiver. The candidate
-routes both stages through `align_sema::str_clone_body_ty` and adds a discriminating end-to-end
-owner for owned locals and fields. The focused owner, the exact release workspace build, and the
-real align-llm 15-unit per-unit check pass. Next: commit the candidate, run one fresh full-diff
-review and exact-head preflight, merge it, then pin align-llm to the merged commit and continue the
-consumer capability. The four implementation/ledger files plus this handoff are the intentional
-uncommitted set.
+routes both stages through `align_sema::str_clone_body_ty`. Review of `efd6edaa` found that newly
+admitted fresh and control-flow receivers also had to use MIR's borrow-owned lowering path; the
+consolidated repair adds that ownership closure plus discriminating local, field, temporary, and
+control-flow owners and synchronizes the exact ledger. The repaired focused owner, exact release
+workspace build, and real align-llm 15-unit per-unit check all pass. The consolidated review repair
+is committed after the reviewed candidate. Next: run exact-head preflight, merge, then pin
+align-llm to the merged commit and continue the consumer capability. The working tree is clean.
 
 Out-of-gate suite status (suites outside the bounded CI gate; a nightly
 full-suite workflow runs them daily so this class cannot rot silently). The

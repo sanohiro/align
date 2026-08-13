@@ -4999,15 +4999,15 @@ fn expression_uses_eager_worklist(e: &hir::Expr) -> bool {
 /// The child edges of an eager parent that the worklist may lower ahead of it.
 ///
 /// Pre-lowering is sound only for an edge the parent then consumes through [`lower_expr`], which
-/// returns the memoized operand. `StrBorrow` consumes its child through [`lower_borrowed_owned`]
-/// instead, and for the kinds [`borrow_mode_differs`] names that is a *different* lowering — so
-/// such a child is left for the parent to lower once, in borrow mode. Entering it here produced
-/// two copies of the same `if` / `match` / `else`: the non-borrow copy nulled a bound arm's source
-/// local, and the borrow copy's join stored the non-borrow copy's per-arm SSA values from blocks
-/// that do not dominate them (`docs/impl/05-backend-llvm.md` §1).
+/// returns the memoized operand. `StrBorrow` and `StrClone` consume their child through
+/// [`lower_borrowed_owned`] instead, and for the kinds [`borrow_mode_differs`] names that is a
+/// *different* lowering — so such a child is left for the parent to lower once, in borrow mode.
+/// Entering it here produced two copies of the same `if` / `match` / `else`: the non-borrow copy
+/// nulled a bound arm's source local, and the borrow copy's join stored the non-borrow copy's
+/// per-arm SSA values from blocks that do not dominate them (`docs/impl/05-backend-llvm.md` §1).
 fn eager_worklist_children(parent: &hir::Expr) -> Vec<&hir::Expr> {
     let mut children = align_sema::direct_expr_children(parent);
-    if matches!(parent.kind, hir::ExprKind::StrBorrow(_)) {
+    if matches!(parent.kind, hir::ExprKind::StrBorrow(_) | hir::ExprKind::StrClone(_)) {
         children.retain(|child| !borrow_mode_differs(child));
     }
     children
@@ -6707,12 +6707,17 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 Operand::Value(v)
             }
             hir::ExprKind::StrClone(inner) => {
-                // Deep-copy the `str` bytes into a fresh heap buffer, yielding an owned `string`
-                // `{ptr,len}`. The slot it lands in is `Drop`-freed at scope exit (sema marks the
-                // String local for drop), so no arena is needed.
-                lower_required_binding!(b, src = lower_expr(b, inner), Operand::Const(Const::Unit));
+                // Deep-copy borrowed bytes into a fresh owned `string`. An owned receiver is still
+                // borrowed: a fresh value gets a hidden owner for the duration of the copy, while
+                // value-carrying control flow must not move/null whichever bound arm was selected.
+                lower_required_binding!(
+                    b,
+                    src = lower_borrowed_owned(b, inner),
+                    Operand::Const(Const::Unit)
+                );
                 let v = b.fresh_value(e.ty);
-                b.push(Stmt::Let(v, Rvalue::StrClone(src)));
+                b.push(Stmt::Let(v, Rvalue::StrClone(src.clone())));
+                drop_borrow_owners(b, &src);
                 Operand::Value(v)
             }
             hir::ExprKind::CloneIn { value, region } => {

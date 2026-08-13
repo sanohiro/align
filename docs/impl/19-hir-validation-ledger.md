@@ -618,7 +618,7 @@ The result formula in every row is followed by the universal
 | `HeapNew` | `env[]`; `child[value]`; `post[inside arena; payload first satisfies the box type-argument predicate, then additionally rejects Slice; result Box(payload scalar); value is copied into the owned box allocation]`. |
 | `BoxGet` | `env[]`; `child[box]`; `post[box.ty == Box(S), S is Copy; result scalar_to_ty(S); box borrowed]`. |
 | `BoxClone` | `env[]`; `child[box]`; `post[box.ty == Box(S), S is Copy; result same Box(S); inside arena; source borrowed and destination newly arena-owned]`. |
-| `StrClone` | `env[]`; `child[str]`; `post[str.ty == Str; result String; source borrowed; result individually owned unless current arena captures it]`. |
+| `StrClone` | `env[]`; `child[text]`; `post[text.ty is Str or String; result String; source borrowed without transfer; a fresh owned receiver is kept live only through the copy; result individually owned unless current arena captures it]`. |
 | `StrPredicate` | `env[kind]`; `child[haystack,needle]`; `post[both Str; Contains/StartsWith/EndsWith/EqIgnoreCase result Bool; Find/Rfind result Option<i64>; both borrowed]`. |
 | `StrTrim` | `env[kind]`; `child[recv]`; `post[recv Str; result Str; view inherits recv roots/region]`. |
 | `StrBorrow` | `env[]`; `child[string]`; `post[string.ty == String; result Str; owned source is borrowed and remains live]`. |
@@ -1051,6 +1051,18 @@ Two further admission gates diverged without being spelled `scalar_to_prim`:
 |---|---|---|
 | `orderable_body_ty` (`sort_by_key` key) | `Bound::Ord` | **Divergent.** Sema's bound accepts owned `string`; the validator re-listed the arms and stopped at `str`. Both now call `align_sema::ord_body_ty`. |
 | `StrClone` receiver | `check_box_clone` | **Divergent.** Sema lowers both borrowed `str` and owned `string` receivers to `StrClone`; the validator admitted only `str`. Both now call `align_sema::str_clone_body_ty`. |
+
+The owned-receiver repair also closes the lowering boundary exposed by admitting the producer's
+complete contract:
+
+| Cell | Required behavior | Owner |
+|---|---|---|
+| Construction and malformed HIR | Sema and the body validator share the exact `Str`/`String` receiver gate; every other receiver remains rejected before MIR. | `align_driver::m5::owned_string_clone_duplicates_locals_and_fields`; existing malformed-HIR validator owners |
+| Bound local and field | Clone borrows the place, leaves its ownership bit and storage unchanged, and creates one independently owned result. | `align_driver::m5::owned_string_clone_duplicates_locals_and_fields` |
+| Fresh receiver and cleanup | A fresh `string` moves into a hidden owner, stays live through `Rvalue::StrClone`, and is dropped immediately after the copy, including on each loop iteration. | `align_driver::m5::owned_string_clone_duplicates_locals_and_fields` (MIR owner plus executable result) |
+| Value-carrying control flow | `if`/`match`/`else` and transparent scopes lower once in borrow mode; the selected bound arm is not moved or nulled, while a fresh selected arm retains its path-local cleanup bit. | `align_driver::m5::owned_string_clone_duplicates_locals_and_fields`; shared `lower_expr_for_borrow` owners |
+| Early exit | Receiver evaluation that terminates does not emit a clone; the pre-registered synthetic owner participates in existing exit cleanup. | shared `lower_borrowed_owned` early-exit owners |
+| Whole/per-unit and backend | The unchanged `StrClone` MIR/codegen shape accepts either layout-identical text receiver after checked-HIR validation. | `align_driver::m5::owned_string_clone_duplicates_locals_and_fields`; real align-llm per-unit check |
 
 **Deferred, same arm — `ord-key` Move keys.** Delegating orderability does not by
 itself make a `string`-keyed `sort_by_key` lower. `pipeline_callable_ok` requires
