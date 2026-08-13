@@ -15,14 +15,42 @@ alignc fmt   file.align --write # normalize formatting in place
 
 The edit loop is `check` and `run`. Multi-file builds compile one module per `.align` file, check imports against explicit interfaces, and link the reachable DAG. `check-per-unit` exposes that interface-based checker; `emit-interface` prints each unit's public surface and interface/implementation hashes.
 
-Codegen uses a default-on content-addressed object cache and parallel workers. It is silent unless asked:
+Two content-addressed caches sit behind every build, both default-on and both silent unless asked. Codegen also runs parallel workers:
 
 ```text
 alignc build app.align --cache-stats -j 4
 alignc cache clear
 ```
 
-`-j` overrides `ALIGNC_JOBS`. `ALIGNC_CACHE=off` disables caching; `ALIGNC_CACHE=<path>` relocates it. Cache identity includes source/interface content, compiler and LLVM identity, target, profile, exports, runtime bitcode, and PGO mode. A hit therefore means reusable bytes, not merely a newer timestamp.
+`--cache-stats` reports the two layers in pipeline order — the frontend first, then codegen:
+
+```text
+alignc: cache: main frontend hit
+alignc: cache: 1 frontend: 1 hit, 0 miss
+alignc: cache: main hit
+alignc: cache: 1 unit(s): 1 hit, 0 miss
+```
+
+The **frontend cache** stores each unit's checked interface summary, its diagnostics, and its link libraries, so a later process does not re-check that unit. Its identity is frontend-only: the unit's exact source bytes, the transitive interface closure it was checked against, the compiler and interface-format identity, and the target triple. Profile, `--target-cpu`, runtime LTO, and PGO mode are deliberately absent, because none of them changes what the frontend produces — one entry serves every build configuration.
+
+The **codegen cache** stores object bytes, so its identity does include those backend knobs: profile, target CPU, exports, runtime bitcode, LLVM identity, and PGO mode. Rebuilding the same source under a different `--profile` or `--target-cpu` therefore hits the frontend and misses codegen, and `--cache-stats` names the reason:
+
+```text
+alignc: cache: main frontend hit
+alignc: cache: main miss (profile)
+```
+
+A hit in either layer means reusable bytes, not merely a newer timestamp. `-j` overrides `ALIGNC_JOBS`. `ALIGNC_CACHE=off` disables both layers and `ALIGNC_CACHE=<path>` relocates them; the two live in disjoint subtrees of one cache root, and `alignc cache clear` empties that root.
+
+Projects that use `pkg.db` (chapter [23](23-packages.md)) get five more subcommands; they matter nowhere else:
+
+```text
+alignc db prepare file.align            regenerate the checked SQLite/PostgreSQL metadata
+alignc db migrate --entry file.align    apply an explicit migration catalog
+alignc db status  --entry file.align    report the migration state
+alignc db check   --entry file.align    require the exact expected migration state
+alignc db repair  --entry file.align    checksum-bound repair of one dirty migration
+```
 
 ## Seeing what the compiler saw
 
@@ -58,6 +86,20 @@ alignc build app.align --profile fast --pgo-use app.profdata
 ```
 
 The compiler prints the actual raw-profile destination. Instrument and use modes are mutually exclusive, cached independently, and currently cannot be combined with `--thin-lto`; `--rt-lto` does compose. A missing, unreadable, corrupt, or version-invalid profile is a hard error. A stale or wrong-but-readable profile produces a prominent warning and still builds because profile mismatch affects performance, not program semantics.
+
+## The linker
+
+`alignc` links through the system C driver. On ELF targets it additionally asks that driver to run LLVM's `ld.lld`, which ships inside the LLVM toolchain `alignc` already requires, so nothing new needs installing. `ALIGNC_LINKER` pins the choice:
+
+```text
+ALIGNC_LINKER=lld       ELF: use ld.lld, or fail loudly if none is found
+                        Mach-O: a hard error, not a silent no-op
+ALIGNC_LINKER=system    always use the system linker
+unset (default)         ELF: ld.lld when the toolchain ships one, else the system linker
+                        Mach-O: always the system linker
+```
+
+Any other value is a hard error. Only link speed changes: the objects, the hygiene flags, the per-profile strip, and the optimization applied are identical either way, so this is not a `--profile` in disguise. macOS is unaffected — Apple's linker is already fast, and Mach-O never selects lld. A failed link names the linker that ran, and a failed lld link also names `ALIGNC_LINKER=system` as the escape hatch.
 
 ## The formatter
 

@@ -85,7 +85,15 @@ fn main() -> i32 {
 }
 ```
 
-You will rarely write this — and the compiler will tell you when you didn't need it. The example above actually earns a lint: *"unnecessary heap allocation: this box never escapes — use the value directly."* `heap.new` exists for the case where a value must outlive the stack frame that computed it but live inside a chosen arena; it is deliberately not the everyday tool. In Align, "allocate every object on the heap" is not a style — the language steers you to values and arenas, and it says so when you stray.
+You will rarely write this — and the compiler will tell you when you didn't need it. The example above actually earns a lint:
+
+```text
+warning: unnecessary heap allocation: this box is only ever read back with
+         `.get()` and never escapes — use the value directly (a stack value
+         suffices)
+```
+
+`heap.new` exists for the case where a value must outlive the stack frame that computed it but live inside a chosen arena; it is deliberately not the everyday tool. In Align, "allocate every object on the heap" is not a style — the language steers you to values and arenas, and it says so when you stray.
 
 ## Views: `str` and `slice<T>`
 

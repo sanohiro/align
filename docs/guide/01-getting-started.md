@@ -73,11 +73,16 @@ alignc emit-llvm      file.align          dump raw or optimized LLVM IR
 alignc emit-obj       file.align [out.o]  object file only, no link
 alignc explain-opt    file.align          explain optimizer decisions at source lines
 alignc size           file.align          build and report the executable's size
-alignc cache clear                        clear the resolved codegen cache
+alignc cache clear                        clear the resolved build cache
+alignc db prepare     file.align          regenerate checked SQLite/PostgreSQL metadata
+alignc db migrate     --entry file.align  apply an explicit migration catalog
+alignc db status      --entry file.align  report the migration state
+alignc db check       --entry file.align  require the exact expected migration state
+alignc db repair      --entry file.align  checksum-bound repair of one dirty migration
 alignc --version                          print the compiler version
 ```
 
-The everyday loop is `check` while editing, `run` to try it. `emit-llvm` is worth knowing early: Align's design promises that ordinary code lowers to tight machine code, and `emit-llvm` is how you check that promise yourself.
+The `db` group only concerns projects that use the `pkg.db` package (chapter [23](23-packages.md)). The everyday loop is `check` while editing, `run` to try it. `emit-llvm` is worth knowing early: Align's design promises that ordinary code lowers to tight machine code, and `emit-llvm` is how you check that promise yourself.
 
 ## Reading a compile error
 

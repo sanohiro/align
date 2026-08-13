@@ -93,7 +93,7 @@ fn main() -> Result<(), Error> {
 }
 ```
 
-`.agg(...)` interns each key once and folds all the accumulators in a single pass — the shape a hand-written analytics loop takes, generated from a declaration. It accepts `str`-key AoS and SoA sources. Numeric-key SoA supports the individual grouped reducers; its multi-aggregate `.agg(...)` form remains deferred.
+`.agg(...)` interns each key once and folds all the accumulators in a single pass — the shape a hand-written analytics loop takes, generated from a declaration. The fused form is narrower than the individual reducers: it currently requires an AoS `array<Struct>` with a `str` key. A soa source is rejected whatever its key type (`fused group_by(.key).agg(...) first cut needs an AoS array<Struct> with a str key, got soa<…>`), and an AoS `group_by` key must itself be `str`. SoA sources keep the individual grouped reducers shown above — `.sum(.f)`, `.min(.f)`, `.max(.f)`, `.count()` — over numeric and `str` keys alike; only their multi-aggregate `.agg(...)` form is deferred.
 
 ## `dict_encode` — pay for the key once
 

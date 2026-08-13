@@ -41,4 +41,4 @@ Align を書くための実践的な入門です。仕様書(それは draft.md 
 
 ## 第 V 部 —— パッケージ
 
-- [23 — パッケージ: vendoring、pkg.web、pkg.jwt](23-packages.md)
+- [23 — パッケージ: vendoring、pkg.web、pkg.jwt、pkg.db](23-packages.md)

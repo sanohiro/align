@@ -53,8 +53,9 @@ fn show(x: i64) -> i64 {
 }
 
 ys := [1, 2].par_map(fn x { show(x) })
-// error: 'par_map' requires a Pure function, but the lambda has a side
-//        effect (it reads/writes I/O)
+// error: 'par_map' requires a Pure function, but 'main$lambda0' has an
+//        observable side effect (I/O or a caller-view write); use `reduce`
+//        for an accumulation
 ```
 
 データ競合（Data Race）が発生するには、「共有された変更可能な状態」か「順序が保証されない副作用」のいずれかが必要です。入力を値でキャプチャする Pure な関数には、そのどちらも存在しません。そのため Align は、データ競合を「検出する」のではなく、並列処理の構文において競合自体を**「表現不可能」**なものにしています。この保証はコンパイル時に行われ、Rust のような `Send` や `Sync` といった複雑な概念を覚える必要もありません。

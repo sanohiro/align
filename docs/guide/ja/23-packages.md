@@ -1,8 +1,8 @@
-# パッケージ: vendoring、pkg.web、pkg.jwt
+# パッケージ: vendoring、pkg.web、pkg.jwt、pkg.db
 
 > 🌐 [English](../23-packages.md) · **日本語**
 
-`core` は言語のデータレイヤー、`std` は OS 境界、`pkg` はフレームワークやドメインライブラリを置くソースパッケージのレイヤーです。パッケージ基盤と first-party の `pkg.web`、`pkg.jwt` は現在すでに利用できます。意図的にまだ存在しないのは、レジストリや取得ツールです。
+`core` は言語のデータレイヤー、`std` は OS 境界、`pkg` はフレームワークやドメインライブラリを置くソースパッケージのレイヤーです。パッケージ基盤と first-party の `pkg.web`、`pkg.jwt` は現在すでに利用できます。3 つ目の first-party パッケージ `pkg.db` も同じツリーに実在しますが、まだ実装途上です。現状は本章の最後の節で正確に述べます。意図的にまだ存在しないのは、レジストリや取得ツールです。
 
 ## パッケージはソースツリー
 
@@ -11,8 +11,13 @@
 ```text
 main.align
 pkg/
+  db.align
   jwt.align
   web.align
+  db/
+    sqlite.align
+    postgres.align
+    pool.align
   web/
     types.align
     cookie.align
@@ -22,7 +27,7 @@ pkg/
 
 `import pkg.web` は `pkg/web.align`、`import pkg.web.cookie` は `pkg/web/cookie.align` に解決されます。呼び出しや型名は `pkg.web.get(...)`、`pkg.web.types.Ctx` のように常に完全修飾します。
 
-Vendoring とは、このソースサブツリーを利用側プロジェクトへコピーすることです。このリポジトリの [apps/web/pkg](../../../apps/web/pkg) と [apps/jwt/pkg](../../../apps/jwt/pkg) はパッケージ作者用ワークスペースなので、その `pkg/` ディレクトリをアプリケーションのルートへコピーまたはマージします。これらは `alignc` のアーカイブ、Debian パッケージ、Homebrew formula には埋め込まれていません。
+Vendoring とは、このソースサブツリーを利用側プロジェクトへコピーすることです。このリポジトリの [apps/web/pkg](../../../apps/web/pkg)、[apps/jwt/pkg](../../../apps/jwt/pkg)、[apps/db/pkg](../../../apps/db/pkg) はパッケージ作者用ワークスペースなので、その `pkg/` ディレクトリをアプリケーションのルートへコピーまたはマージします。これらは `alignc` のアーカイブ、Debian パッケージ、Homebrew formula には埋め込まれていません。
 
 パッケージ用のマニフェスト、lockfile、レジストリ、バージョンソルバ、ダウンロードコマンドはありません。依存グラフは `import` とファイルシステムから決まり、1つのソースツリーに存在できる `pkg/<name>` は1つです。依存関係の更新や監査は、vendoring したソース自体の更新や監査として行います。
 
@@ -65,7 +70,7 @@ pub fn main() -> Result<(), Error> {
 - `pkg.web.cors` は CORS ポリシーを判定し、不正な wildcard と credentials の組み合わせを暗黙に許可しません。
 - `pkg.web.multipart` は `multipart/form-data` の body を zero-copy な `Part` ビューとして走査します。アプリケーションが `pkg.web.body(c)` と反復オフセットを渡します。
 
-ハンドラへアプリケーション状態を渡す引数やデータベースパッケージはまだありません。これらは現在の制限であり、フレームワークが裏側に隠している機能ではありません。
+ハンドラへアプリケーション状態を渡す引数はまだありません。これは現在の制限であり、フレームワークが裏側に隠している機能ではありません。データベースアクセスは別パッケージ `pkg.db` が担当します（後述）。
 
 ## `pkg.jwt`
 
@@ -84,3 +89,13 @@ pub fn main() -> Result<(), Error> {
 ```
 
 検証時はトークン自身の `alg` フィールドを信頼せず、アルゴリズムを HS256 に固定し、署名を定数時間で比較します。`time_claims_valid` は、署名検証とは分離して、任意の `exp` と `nbf` NumericDate claim を検査します。HS384/512、RSA、ECDSA、公開プロバイダの OIDC 検証は、それぞれに必要な監査済み暗号プリミティブが揃うまで公開しません。
+
+## `pkg.db` ― 実在し、なお着地中
+
+`pkg.db` は first-party のデータベースパッケージで、vendoring の形は他の 2 つと同じです。[apps/db/pkg](../../../apps/db/pkg) に `pkg/db.align` があり、その下に `pkg.db.sqlite`、`pkg.db.postgres`、`pkg.db.pool` の各モジュールが並びます。「まだ無い」わけでも「もう完成した」わけでもないため、本節では安定した API を約束する代わりに、現在地をそのまま述べます。
+
+完了しているのは、公開初回リリースの範囲です。型付きの静的クエリとコマンドは、実際のスキーマメタデータに対してコンパイル時に検査され、SQLite と PostgreSQL の両方で実行でき、そのメタデータをオフラインで再生成できます。プリペアドステートメント、トランザクション、デッドラインとキャンセルを備えた型付き行ストリーム、一対多／多対一の複合出力、マイグレーションのライフサイクル管理、`EXPLAIN` を含む読み取り専用のカタログ検査も、すべて入っています。
+
+着地中なのは、リリース後のスループット系と動的 SQL 系のレールです。上限付きのバッチ／SoA デリバリ、PostgreSQL ネイティブの single-row / portal-batch デリバリ、明示的な固定容量・待機なしの `pkg.db.pool` はすでに出荷済みで、ドライバ明示の動的 SQL も出荷済みです。残るのは、証明付きのネイティブコールバック面と、最後のレール横断監査です。これらが閉じるまでは、公開 API はまだ動きうるものとして扱ってください。
+
+コンパイラ側はすでに手元のバイナリに入っています。`alignc db prepare`、`db migrate`、`db status`、`db check`、`db repair`（第 [16](16-toolchain.md) 章）が、検査済みメタデータとマイグレーションカタログを操作します。契約の正本は `docs/impl/pkg-design/db.md` です。
