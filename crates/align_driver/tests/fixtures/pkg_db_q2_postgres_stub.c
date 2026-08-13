@@ -20,6 +20,7 @@ typedef struct {
   int encoding;
   int transaction_status;
   int ordinal;
+  uint32_t expected_second_prepare_id_oid;
   const char *message;
 } FakeConn;
 
@@ -326,6 +327,7 @@ FakeConn *PQconnectdbParams(const char *const *keywords, const char *const *valu
   connection->encoding = has(dbname, "bad-encoding") ? -1 : 6;
   connection->transaction_status = 0;
   connection->ordinal = connect_calls;
+  connection->expected_second_prepare_id_oid = has(dbname, "/q4a") ? 20 : 23;
   connection->message = "stub connection failure";
   return connection;
 }
@@ -486,9 +488,9 @@ FakeResult *PQprepare(
   int common_types = prepare_calls == 1 && parameter_types != NULL &&
                      parameter_types[0] == 20 && parameter_types[1] == 0 &&
                      parameter_types[2] == 0;
-  int overridden_types = prepare_calls == 2 && parameter_types != NULL &&
-                         parameter_types[0] == 20 && parameter_types[1] == 25 &&
-                         parameter_types[2] == 17;
+  int overridden_types = prepare_calls == 2 && connection != NULL && parameter_types != NULL &&
+                         parameter_types[0] == connection->expected_second_prepare_id_oid &&
+                         parameter_types[1] == 25 && parameter_types[2] == 17;
   int format_types = format_matrix && parameter_types != NULL &&
                      parameter_count == 2 && parameter_types[0] == 23 && parameter_types[1] == 17;
   if (name == NULL || strncmp(name, "__align_pkg_db_", 15) != 0 || command == NULL ||
