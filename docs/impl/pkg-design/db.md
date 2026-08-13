@@ -1715,8 +1715,9 @@ The design must not block:
 
 The initial public release requires the common Query/transaction path, native options, checked
 metadata, and basic plan access. D13's first PostgreSQL-native rail adds single-row and chunked-row
-delivery. The PostgreSQL COPY rail is specified by the exact ledger in §23; pipeline mode and
-LISTEN/NOTIFY remain later independently specified D13 rails.
+delivery. Section 23 records a reviewed candidate PostgreSQL COPY ledger, but §25 defers selection
+and implementation until a measured consumer exists; pipeline mode and LISTEN/NOTIFY likewise
+remain later independently specified D13 rails.
 
 ---
 
@@ -5097,13 +5098,21 @@ metadata ordering, or cleanup triggers the complete sibling type/operation/deliv
 
 #### A1 PostgreSQL COPY public-contract ledger
 
-This ledger is the source of truth for the next independently useful D13 rail. It exposes the
-libpq COPY data/termination protocol without adding dynamic SQL, a row codec, reflection, a hidden
-worker, a callback, a prepared-COPY path, or a common-driver abstraction. The SQL remains one
-compiler-produced `db.command<P>` descriptor and must contain the complete PostgreSQL `COPY ...
-FROM STDIN` or `COPY ... TO STDOUT` statement. PostgreSQL remains the authority for the COPY
-grammar and stream payload. Align transports caller-supplied or server-supplied bytes exactly and
-does not parse text, CSV, or the PostgreSQL binary COPY representation.
+This ledger records the reviewed candidate boundary for a future independently useful D13 rail. It
+does not select or settle that public surface: implementation remains deferred by §25 until one
+concrete consumer and its workload measurement establish which COPY operation is needed. When that
+evidence exists, update the consumer record first and obtain one fresh adversarial review of the
+ledger against it; the consumer may narrow or change this candidate before implementation.
+
+The candidate exposes the libpq COPY data/termination protocol without adding dynamic SQL, a row
+codec, reflection, a hidden worker, a callback, a prepared-COPY path, or a common-driver
+abstraction. The SQL remains one compiler-produced `db.command<P>` descriptor and must contain the
+complete PostgreSQL `COPY ... FROM STDIN` or `COPY ... TO STDOUT` statement. Before target-state
+access, allocation, lease acquisition, parameter work, or send, the package classifies the exact
+immutable PostgreSQL wire-SQL bytes from that descriptor and proves that they select the requested
+direction and stream endpoint. PostgreSQL remains the authority for the rest of the COPY grammar
+and stream payload. Align transports caller-supplied or server-supplied bytes exactly and does not
+parse text, CSV, or the PostgreSQL binary COPY representation.
 
 ##### Exact public record
 
@@ -5176,7 +5185,21 @@ from SQL text, silently accepts a mismatch, or translates between formats. `Copy
 the exact nonnegative `PQnfields` value after validation; it is at most `65_535`.
 
 Both start functions accept only a static `db.command<P>`. They do not accept `str`, `db.query`,
-`db.stmt`, or a common `db` COPY wrapper. `copy_in` requires the first successful result to be
+`db.stmt`, or a common `db` COPY wrapper. Descriptor formation already proves that the PostgreSQL
+wire SQL is valid UTF-8 without U+0000 and contains exactly one nonempty statement. The COPY
+classifier is allocation-free and scans that exact length, never a sentinel-terminated prefix. It
+skips ASCII whitespace, line comments, nested block comments, single-quoted and escape-string
+literals, double-quoted identifiers, and dollar-quoted bodies; tracks parentheses with checked
+depth; and compares unquoted ASCII keywords case-insensitively. The first token must be `COPY`. The
+first `FROM` or `TO` token at parenthesis depth zero after it is the direction delimiter, and the
+next token after trivia must be exactly `STDIN` for `FROM` or `STDOUT` for `TO`. A quoted pathname,
+`PROGRAM`, identifier, missing endpoint, opposite endpoint, or no top-level delimiter is rejected.
+Consequently table-form COPY and parenthesized-query COPY are accepted without interpreting their
+remaining grammar, while non-COPY DML/DDL and server-file/program COPY are rejected before native
+work. `copy_in` requires the classified `FROM STDIN` direction and `copy_out` requires classified
+`TO STDOUT`.
+
+After that pre-send proof, `copy_in` requires the first successful result to be
 `PGRES_COPY_IN`; `copy_out` requires `PGRES_COPY_OUT`. The opposite direction,
 `PGRES_COPY_BOTH`, `PGRES_COMMAND_OK`, tuple results, partial row-mode results, pipeline results,
 and unknown status values never create a public COPY resource. An ordinary non-COPY status is
@@ -5377,11 +5400,14 @@ ledger separately tracks the libpq buffer, hidden owner header, and operation re
 single-field corruption and normal path proves no double-free or leak. The same trusted-header
 strategy closes the complete sibling transfer Drop matrix rather than protecting only chunks.
 
-This rail changes package interfaces and importer keys once but does not change descriptor v6,
+If selected after its consumer gate, this rail changes package interfaces and importer keys once
+but does not change descriptor v6,
 statement v4, rows v4, batch ABI, static artifact bytes, compiler IR, or runtime ABI registry.
 `db.command<P>` construction and existing generated binder/static-validator/count-thunk semantics
-are reused unchanged. Whole-program and per-unit compilation must produce the same resource Drop
-thunks and public interface. No HIR exception or new intrinsic is permitted.
+are reused unchanged. The allocation-free package classifier reads only the already-guarded
+descriptor's exact PostgreSQL `str` view; it adds no descriptor tag, cache input, or artifact field.
+Whole-program and per-unit compilation must produce the same resource Drop thunks and public
+interface. No HIR exception or new intrinsic is permitted.
 
 ##### Native phase order and protocol state machine
 
@@ -5392,18 +5418,20 @@ Start validation has one order for both directions:
 2. common options in source order;
 3. native options in source order, including ParameterFormat payload validation before duplicate
    detection and tag-first rejection of ResultFormat/Delivery;
-4. exact PostgreSQL driver target plus complete physical parent state;
-5. allocate and initialize the transfer/context records;
-6. run generated static validation;
-7. acquire the execution lease;
-8. install the exact full normalized parameter-format vector, validate and initialize the exact
+4. allocation-free classification of the guarded descriptor's exact PostgreSQL wire SQL, requiring
+   the requested `COPY ... FROM STDIN` or `COPY ... TO STDOUT` shape;
+5. exact PostgreSQL driver target plus complete physical parent state;
+6. allocate and initialize the transfer/context records;
+7. run generated static validation;
+8. acquire the execution lease;
+9. install the exact full normalized parameter-format vector, validate and initialize the exact
    Parse/Bind fixed budgets, then run binder-v2 Measure and binder-v2 Encode, and retain all payloads
    through the send boundary;
-9. with Timeout present, enable nonblocking mode and re-read the clock before send; expiry has zero
+10. with Timeout present, enable nonblocking mode and re-read the clock before send; expiry has zero
    send/COPY/cancel calls and restores or closes;
-10. send exactly once, flush/wait under the deadline, and call `PQgetResult` for the initial result;
+11. send exactly once, flush/wait under the deadline, and call `PQgetResult` for the initial result;
     null fails closed before classification, while non-null establishes one local PGresult owner;
-11. classify the live result and validate direction before metadata; for the expected COPY direction,
+12. classify the live result and validate direction before metadata; for the expected COPY direction,
     validate `PQbinaryTuples`, `PQnfields`, and every `PQfformat` against `expected_format`; then
     consume the initial owner exactly once and either publish the dependent resource or complete the
     outcome-specific drain/close below.
@@ -5413,7 +5441,7 @@ as settled for direct execution, while parameter measurement remains behind the 
 pairwise multi-invalid/failpoint owner asserts this exact winner and zero calls/allocations from
 later phases.
 
-If step 7 observes an already-owned execution lease, it returns the existing
+If step 8 observes an already-owned execution lease, it returns the existing
 `pkg.db.Error.Unsupported(pkg.db.ContractError { query_id: Some(static_id), item:
 "postgres.connection.active_execution", message: "PostgreSQL connection already has an active
 execution" })`. It frees the unpublished transfer/context owners allocated by this attempt, and its
@@ -5421,7 +5449,8 @@ public wrapper frees the call-local sparse option plan. It performs zero full-ve
 deadline/libpq calls. Apart from reading the shared occupied bit needed to reject, it does not inspect
 the first operation's nonblocking mode, deadline, transfer, or result state and never clears,
 restores, releases, or otherwise mutates the first operation's lease or state.
-The complete descriptor, options, driver/parent state, and generated static validation therefore
+The complete descriptor, options, static COPY shape, driver/parent state, and generated static
+validation therefore
 precede this overlap result; overlap precedes every parameter budget/value error and native effect.
 
 The initial-handshake outcome and PGresult ownership product is exhaustive:
@@ -5538,6 +5567,8 @@ An error copied from libpq instead keeps the shipped field extraction and first-
 | ParameterFormat name contains U+0000/unknown/duplicate or lacks Binary proof | exact preceding binary-ledger errors |
 | ResultFormat in COPY native options | `Unsupported`, item `postgres.copy.result_format`, message `PostgreSQL COPY format is declared by SQL` |
 | Delivery in COPY native options | `Unsupported`, item `postgres.copy.delivery`, message `PostgreSQL COPY owns its data delivery protocol` |
+| static SQL is not a supported COPY stream | `InvalidQuery`, item `postgres.copy.statement`, message `PostgreSQL command is not a supported COPY stream`; zero target-state, allocation, lease, parameter, deadline, or libpq work |
+| static SQL COPY stream has the opposite direction | `InvalidQuery`, item `postgres.copy.direction`, message `PostgreSQL COPY direction does not match the operation`; zero target-state, allocation, lease, parameter, deadline, or libpq work |
 | non-PostgreSQL or unusable target | existing `DriverMismatch`/closed-target result before package COPY allocation or libpq |
 | execution lease already owned | existing `Unsupported`; `query_id: Some(static_id)`, item `postgres.connection.active_execution`, message `PostgreSQL connection already has an active execution`; attempted local-owner cleanup only, no first-owner mutation or libpq |
 | initial ordinary native error | existing PostgreSQL native classification with copied fields |
@@ -5611,7 +5642,8 @@ Linux ARM64, and macOS. Server 16.4 and client >=17 remain the required live bou
 | Closure cell | Required discriminating owner |
 |---|---|
 | exported surface and unavailable siblings | exact public declaration golden; compile rejection for common/SQLite/dynamic/prepared COPY and no `CopyOption`/callback |
-| start operation matrix | CopyIn/CopyOut x Conn/Tx x Text/Binary x timeout absent/present x zero/one/multiple/default/Text/Binary Params; exact phase-order failpoint counters including failed overlap's exact error/local frees/zero first-owner mutation, overlap before full-vector allocation, lease before installation, and fixed Parse/Bind initialization before Measure |
+| static COPY statement classification | exact immutable wire-SQL length; lowercase/comment-leading table COPY; parenthesized-query COPY with inner `FROM`; Text/CSV/Binary options left to PostgreSQL; non-COPY DML/DDL; opposite direction; pathname/`PROGRAM`/identifier/missing endpoint; quoted/comment/dollar-body keyword near-misses; nested/unbalanced depth and multi-invalid option/shape products; every rejection has the exact error and zero target-state, allocation, lease, binder, deadline, or libpq work |
+| start operation matrix | CopyIn/CopyOut x Conn/Tx x Text/Binary x timeout absent/present x zero/one/multiple/default/Text/Binary Params; exact phase-order failpoint counters including static COPY classification before target/native work, failed overlap's exact error/local frees/zero first-owner mutation, overlap before full-vector allocation, lease before installation, and fixed Parse/Bind initialization before Measure |
 | initial handshake and response metadata | null/non-null initial result; direction, COPY BOTH, overall format, every per-column format, `0`/one/max columns, malformed count/code/pointer, every ordinary/COPY/pipeline/unknown status; exactly one clear for every non-null outcome and zero clear/classification for null |
 | CopyIn data | empty no-call; one/multiple/`i32::MAX`/rejected-next chunks; rejected-next remains Active and a following valid write/finish/abort works; queued/retry/hard error; mutation after call; exact bytes and no package allocation/copy |
 | CopyOut data | zero-pending/positive/-1/-2; one/many/large rows; exact zero-copy pointer/length; one-live-chunk exclusion; wrapper/libpq free counts; malformed chunk |
@@ -5666,7 +5698,17 @@ row fixes the existing query-specific overlap error, attempted-owner cleanup, ze
 zero mutation of the first lease holder. The exported-surface and start-operation cells are closed
 without changing the capability or protocol strategy.
 
-Before implementation, complete one fresh independent adversarial review of this ledger and the
+The next review found one P1 side-effect hole and one P2 scheduling contradiction, so the matrix is
+reopened on the `static-statement-shape x direction x pre-native-effect x consumer-evidence` axis.
+One allocation-free classifier now proves an exact descriptor-backed `FROM STDIN`/`TO STDOUT`
+shape before target or native work, and its negative matrix closes ordinary DML plus file/program
+COPY rather than relying on the server result after possible effects. No measured consumer is
+recorded in the repository or request register, so this candidate is explicitly deferred instead
+of being named the next settled rail. Consumer evidence must update §25 and trigger one fresh
+ledger review before implementation.
+
+After the consumer gate is closed and before implementation, complete one fresh independent
+adversarial review of this ledger and the
 single capability boundary. The implementation is expected to exceed roughly 1,000 changed
 hand-written lines because start, both live directions, termination, cancellation, Drop, fake
 libpq, C signature probes, and required live owners form one connection-global state machine.
@@ -5689,7 +5731,7 @@ The implementation references are the official PostgreSQL 17
 - PostgreSQL binary parameter/result formats — specified by the ledger above;
 - a separately specified owned-Row/owned-collection materializer only if a measured consumer needs
   `string`/dynamic-array Row storage; it must not weaken the v1 `RegionPlain` path;
-- PostgreSQL COPY — specified by the ledger above;
+- PostgreSQL COPY — candidate ledger above; deferred until §25 records a measured consumer;
 - PostgreSQL pipeline/LISTEN-NOTIFY;
 - SQLite backup/incremental blob/FTS helpers;
 - explicit pool package;
@@ -5922,7 +5964,9 @@ consumer-driven type/native-surface decisions are:
 2. UUID, temporal, JSON/JSONB, PostgreSQL array/range/domain, and SQLite custom-type mappings.
 3. The minimal safe dynamic `db.row`/`db.value` set.
 4. Native callback safety for SQLite functions/collations.
-5. Which COPY/pipeline/backup/blob operations have a measured consumer.
+5. Which COPY/pipeline/backup/blob operations have a measured consumer. No PostgreSQL COPY consumer
+   or workload measurement is currently recorded, so the candidate §23 COPY surface is deferred and
+   is not the next implementation rail.
 
 The engine/version nullability/origin support matrix is settled by §16.3.1 and owned by
 D0/D3/D5 rather than this list. The remaining items have roadmap homes in D12–D14. They do not

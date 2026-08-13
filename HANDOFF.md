@@ -49,9 +49,10 @@ prepared, buffered, single-row, and portal-batch execution. Descriptor v6 owns
 Measure/Encode binder passes and exact Parse/Bind budgets; context, statement, and
 rows v4 own generation-local metadata, effective-OID proof, and allocation-safe
 cleanup. The exact contract and implementation matrix are in
-`docs/impl/pkg-design/db.md` §23. That section now also owns the exact public,
-ownership, ABI, protocol, error, and acceptance ledger for the following
-PostgreSQL COPY `pkg.db` capability.
+`docs/impl/pkg-design/db.md` §23. That section now also records a reviewed candidate public,
+ownership, ABI, protocol, error, and acceptance ledger for a future PostgreSQL COPY `pkg.db`
+capability. No measured COPY consumer is recorded yet, so §25 keeps its public surface and
+implementation deferred.
 
 Out-of-gate suite status (suites outside the bounded CI gate; a nightly
 full-suite workflow now runs them daily so this class cannot rot silently):
@@ -116,7 +117,7 @@ A1 PostgreSQL status prerequisite complete / package/tool fail-close + migration
 A1 PostgreSQL direct delivery    complete / SingleRow + PortalBatch / D13
 A1 PostgreSQL prepared parity    complete / streamed delivery + stmt v3 resolver / D13
 A1 PostgreSQL formats            complete / binary parameters/results + protocol budgets / D13
-next: A1 PostgreSQL COPY         explicit data/termination protocol / D13
+deferred: A1 PostgreSQL COPY     candidate protocol; requires a measured consumer / D13
 ```
 
 The exact cell contracts and owner matrices remain in

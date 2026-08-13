@@ -905,8 +905,9 @@ SearchPathOnlyとIncludeSystemCatalogsはconflict。Buffers/Timing/Walはnative 
 ### 12.3 native feature
 
 初期release後の最初のPostgreSQL-native D13 railはsingle-row/chunked-row deliveryを追加する。
-PostgreSQL COPY railは§23のexact ledgerでspecifiedである。pipeline modeとLISTEN/NOTIFYは
-独立してspecifyする後続D13 railのままである。
+§23はreviewed candidate PostgreSQL COPY ledgerを記録するが、§25はmeasured consumerが存在するまで
+selection/implementationをdeferする。pipeline modeとLISTEN/NOTIFYも独立してspecifyする後続D13
+railのままである。
 
 PostgreSQL array、UUID、JSONB、enum/domain、range、explicit composite mapping、COPY、
 pipeline/single-row、LISTEN/NOTIFY、LATERAL、DISTINCT ON、custom operator/extension、
@@ -3497,13 +3498,20 @@ findingはcomplete sibling type/operation/delivery auditを要求する。
 
 #### A1 PostgreSQL COPY public-contract ledger
 
-このledgerは次のindependently useful D13 railのsource of truthである。libpq COPYの
-data/termination protocolを公開するが、dynamic SQL、row codec、reflection、hidden worker、callback、
-prepared COPY path、common-driver abstractionは追加しない。SQLはcompiler-produced
-`db.command<P>` descriptorのcompleteな1つのPostgreSQL `COPY ... FROM STDIN`または
-`COPY ... TO STDOUT` statementである。COPY grammarとstream payloadのauthorityはPostgreSQLである。
-Alignはcaller/server supplied byteをexactにtransportし、text、CSV、PostgreSQL binary COPY
-representationをparseしない。
+このledgerはfuture independently useful D13 railのreviewed candidate boundaryを記録する。public
+surfaceをselect/settleするものではなく、one concrete consumer+workload measurementが必要なCOPY
+operationを確定するまで§25によりimplementationをdeferする。evidence成立時はconsumer recordを先に
+updateし、ledgerをconsumerに対してone fresh adversarial reviewする。consumerはimplementation前にこの
+candidateをnarrow/changeしてよい。
+
+candidateはlibpq COPYのdata/termination protocolを公開するが、dynamic SQL、row codec、reflection、
+hidden worker、callback、prepared COPY path、common-driver abstractionは追加しない。SQLはcompiler-
+produced `db.command<P>` descriptorのcompleteな1つのPostgreSQL `COPY ... FROM STDIN`または
+`COPY ... TO STDOUT` statementである。target-state access、allocation、lease acquisition、parameter
+work、sendより前にpackageはdescriptorのexact immutable PostgreSQL wire-SQL byteをclassifyし、requested
+direction+stream endpointをproveする。COPY grammarのremaining部分とstream payloadのauthorityは
+PostgreSQLである。Alignはcaller/server supplied byteをexactにtransportし、text、CSV、PostgreSQL
+binary COPY representationをparseしない。
 
 ##### Exact public record
 
@@ -3575,7 +3583,19 @@ overall formatを指定し、packageはresourceを返す前に`PQbinaryTuples`�
 `CopyInfo.columns`はvalidation後のexact nonnegative `PQnfields` valueで、`65_535`以下である。
 
 両start functionはstatic `db.command<P>`だけを受け付ける。`str`、`db.query`、`db.stmt`、common
-`db` COPY wrapperは受け付けない。`copy_in`は最初のsuccessful resultに`PGRES_COPY_IN`を、
+`db` COPY wrapperは受け付けない。descriptor formationはPostgreSQL wire SQLがU+0000なしvalid UTF-8の
+exactly one nonempty statementであることをalready proveする。COPY classifierはallocation-freeでexact
+lengthをscanし、sentinel-terminated prefixを使わない。ASCII whitespace、line comment、nested block
+comment、single-quoted/escape-string literal、double-quoted identifier、dollar-quoted bodyをskipし、checked
+parenthesis depthをtrackしてunquoted ASCII keywordをcase-insensitive比較する。first tokenは`COPY`でなければ
+ならない。その後parenthesis depth zeroのfirst `FROM`/`TO` tokenをdirection delimiterとし、trivia後の
+next tokenが`FROM`ではexact `STDIN`、`TO`ではexact `STDOUT`でなければならない。quoted pathname、
+`PROGRAM`、identifier、missing/opposite endpoint、top-level delimiterなしはrejectする。これによりremaining
+grammarをinterpretせずtable-form COPYとinner `FROM`を持つparenthesized-query COPYをacceptし、non-COPY
+DML/DDLとserver-file/program COPYをnative work前にrejectする。`copy_in`はclassified `FROM STDIN`、
+`copy_out`はclassified `TO STDOUT`をrequireする。
+
+pre-send proof後、`copy_in`は最初のsuccessful resultに`PGRES_COPY_IN`を、
 `copy_out`は`PGRES_COPY_OUT`を要求する。opposite direction、`PGRES_COPY_BOTH`、
 `PGRES_COMMAND_OK`、tuple/partial row-mode/pipeline/unknown resultはpublic resourceを作らない。
 ordinary non-COPY statusはclearしnullまでdrainした後にtransaction state/blocking restoreをproveし、
@@ -3750,10 +3770,12 @@ operation pointer/lengthは`PQfreemem`/viewへ届かず、real buffer freeをsup
 ledgerはlibpq buffer/hidden header/operation recordをseparate trackingしevery single-field corruptionとnormal
 pathのno double-free/no leakを証明する。同じtrusted-header strategyをsibling transfer Drop matrix全体に使う。
 
-このrailはpackage interface/importer keyをonce changeするが、descriptor v6、statement v4、rows v4、
-batch ABI、static artifact byte、compiler IR、runtime ABI registryは変えない。`db.command<P>` constructionと
-generated binder/static-validator/count-thunk semanticsをunchanged reuseする。whole/per-unit compilationは
-same resource Drop thunk/public interfaceを作る。HIR exception/new intrinsicは禁止する。
+consumer gate後にselectされた場合、このrailはpackage interface/importer keyをonce changeするが、
+descriptor v6、statement v4、rows v4、batch ABI、static artifact byte、compiler IR、runtime ABI registryは
+変えない。`db.command<P>` constructionとgenerated binder/static-validator/count-thunk semanticsをunchanged
+reuseする。allocation-free package classifierはalready-guarded descriptorのexact PostgreSQL `str` viewだけを
+読み、descriptor tag/cache input/artifact fieldを追加しない。whole/per-unit compilationはsame resource Drop
+thunk/public interfaceを作る。HIR exception/new intrinsicは禁止する。
 
 ##### Native phase orderとprotocol state machine
 
@@ -3762,26 +3784,28 @@ same resource Drop thunk/public interfaceを作る。HIR exception/new intrinsic
 1. complete descriptor-v6 command header、kind、driver restriction、static Query identity、parameter-count thunk;
 2. common optionをsource orderで;
 3. native optionをsource orderで（ParameterFormat payload validationはduplicate detectionより先、ResultFormat/Deliveryはtag-first reject）;
-4. exact PostgreSQL driver target+complete physical parent state;
-5. transfer/context recordをallocate/initialize;
-6. generated static validation;
-7. execution lease acquire;
-8. exact full normalized parameter-format vectorをinstallし、exact Parse/Bind fixed budgetをvalidate+initializeしてからbinder-v2 Measure/binder-v2 Encode、send boundaryまでpayload retain;
-9. Timeoutありならnonblocking enable後send直前にclock reread。expiryはsend/COPY/cancel zeroでrestore-or-close;
-10. once send、deadline内flush/wait後、initial resultへ`PQgetResult`をcallする。nullはclassification前にfail-closeし、non-nullはone local PGresult ownerをestablishする;
-11. live resultをclassifyしてmetadata前にdirection validationする。expected COPY directionでは`PQbinaryTuples`、`PQnfields`、every `PQfformat`を`expected_format`へvalidateし、initial ownerをexactly once consumeしてdependent resource publishまたは下記outcome-specific drain/closeをcompleteする。
+4. guarded descriptorのexact PostgreSQL wire SQLをallocation-free classifyし、requested `COPY ... FROM STDIN`/`COPY ... TO STDOUT` shapeをrequire;
+5. exact PostgreSQL driver target+complete physical parent state;
+6. transfer/context recordをallocate/initialize;
+7. generated static validation;
+8. execution lease acquire;
+9. exact full normalized parameter-format vectorをinstallし、exact Parse/Bind fixed budgetをvalidate+initializeしてからbinder-v2 Measure/binder-v2 Encode、send boundaryまでpayload retain;
+10. Timeoutありならnonblocking enable後send直前にclock reread。expiryはsend/COPY/cancel zeroでrestore-or-close;
+11. once send、deadline内flush/wait後、initial resultへ`PQgetResult`をcallする。nullはclassification前にfail-closeし、non-nullはone local PGresult ownerをestablishする;
+12. live resultをclassifyしてmetadata前にdirection validationする。expected COPY directionでは`PQbinaryTuples`、`PQnfields`、every `PQfformat`を`expected_format`へvalidateし、initial ownerをexactly once consumeしてdependent resource publishまたは下記outcome-specific drain/closeをcompleteする。
 
 earlier failure後にlater stepをrunしない。direct executionでsettledのとおりnative stateはgenerated static
 validationより先にbeginし、parameter measurementはlease後である。every pairwise multi-invalid/failpoint
 ownerはexact winnerとlater phaseのzero call/allocationをassertする。
 
-step 7がalready-owned execution leaseをobserveした場合、existing
+step 8がalready-owned execution leaseをobserveした場合、existing
 `pkg.db.Error.Unsupported(pkg.db.ContractError { query_id: Some(static_id), item:
 "postgres.connection.active_execution", message: "PostgreSQL connection already has an active
 execution" })`を返す。このattemptがallocateしたunpublished transfer/context ownerをfreeし、public wrapperは
 call-local sparse option planをfreeする。full-vector/Measure/Encode/deadline/libpq callはzeroである。rejectに
 必要なshared occupied bit以外はfirst operationのnonblocking mode/deadline/transfer/result stateをinspectせず、
-first operationのlease/stateをclear/restore/release/mutateしない。complete descriptor/options/driver-parent state/generated static validationが
+first operationのlease/stateをclear/restore/release/mutateしない。complete descriptor/options/static COPY
+shape/driver-parent state/generated static validationが
 overlapよりprecedeし、overlapはevery parameter budget/value error/native effectよりprecedeする。
 
 initial-handshake outcome+PGresult ownership productはexhaustiveである:
@@ -3890,6 +3914,8 @@ libpqからcopyするerrorはshipped field extraction+first-error ruleを維持�
 | ParameterFormat name U+0000/unknown/duplicate/Binary proof missing | preceding binary-ledger exact error |
 | ResultFormat in COPY native options | `Unsupported`, item `postgres.copy.result_format`, message `PostgreSQL COPY format is declared by SQL` |
 | Delivery in COPY native options | `Unsupported`, item `postgres.copy.delivery`, message `PostgreSQL COPY owns its data delivery protocol` |
+| static SQLがsupported COPY streamでない | `InvalidQuery`, item `postgres.copy.statement`, message `PostgreSQL command is not a supported COPY stream`; target-state/allocation/lease/parameter/deadline/libpq work zero |
+| static SQL COPY streamがopposite direction | `InvalidQuery`, item `postgres.copy.direction`, message `PostgreSQL COPY direction does not match the operation`; target-state/allocation/lease/parameter/deadline/libpq work zero |
 | non-PostgreSQL/unusable target | existing `DriverMismatch`/closed-target result、package COPY allocation/libpq前 |
 | execution lease already owned | existing `Unsupported`; `query_id: Some(static_id)`、item `postgres.connection.active_execution`、message `PostgreSQL connection already has an active execution`; attempted local-owner cleanupだけ、first-owner mutation/libpqなし |
 | initial ordinary native error | existing PostgreSQL native classification+copied fields |
@@ -3959,7 +3985,8 @@ Linux x86_64/ARM64/macOSで保持する。server 16.4/client >=17がrequired liv
 | Closure cell | Required discriminating owner |
 |---|---|
 | exported surface/unavailable siblings | exact public declaration golden; common/SQLite/dynamic/prepared COPYと`CopyOption`/callbackのcompile rejection |
-| start operation matrix | CopyIn/CopyOut x Conn/Tx x Text/Binary x timeout absent/present x zero/one/multiple/default/Text/Binary Params; failed overlapのexact error/local free/zero first-owner mutation、overlap-before-full-vector-allocation、lease-before-installation、fixed Parse/Bind initialization-before-Measureを含むexact phase-order failpoint counter |
+| static COPY statement classification | exact immutable wire-SQL length; lowercase/comment-leading table COPY; inner `FROM`を持つparenthesized-query COPY; Text/CSV/Binary optionはPostgreSQL authority; non-COPY DML/DDL; opposite direction; pathname/`PROGRAM`/identifier/missing endpoint; quoted/comment/dollar-body keyword near-miss; nested/unbalanced depth+multi-invalid option/shape product; every rejectionはexact error+target-state/allocation/lease/binder/deadline/libpq work zero |
+| start operation matrix | CopyIn/CopyOut x Conn/Tx x Text/Binary x timeout absent/present x zero/one/multiple/default/Text/Binary Params; target/native work前のstatic COPY classification、failed overlapのexact error/local free/zero first-owner mutation、overlap-before-full-vector-allocation、lease-before-installation、fixed Parse/Bind initialization-before-Measureを含むexact phase-order failpoint counter |
 | initial handshake/response metadata | null/non-null initial result、direction、COPY BOTH、overall/every-column format、`0`/one/max columns、malformed count/code/pointer、every ordinary/COPY/pipeline/unknown status。every non-null outcomeはexactly one clear、nullはzero clear/classification |
 | CopyIn data | empty no-call; one/multiple/`i32::MAX`/rejected-next chunk; rejected-nextはActiveでfollowing valid write/finish/abortがwork; queued/retry/hard error; post-call mutation; exact bytes/no package allocation-copy |
 | CopyOut data | zero-pending/positive/-1/-2; one/many/large row; exact zero-copy pointer/length; one-live-chunk exclusion; wrapper/libpq free count; malformed chunk |
@@ -4005,7 +4032,16 @@ explicit non-source signature ledgerとなり、failed-second-operation rowはex
 attempted-owner cleanup、zero native work、first lease holderのzero mutationを固定する。exported-surface/start-
 operation cellをcapability/protocol strategy変更なしにcloseする。
 
-implementation前にこのledger+single capability boundaryをone fresh independent adversarial reviewする。
+next reviewは1 P1 side-effect hole+1 P2 scheduling contradictionを発見したため、matrixを
+`static-statement-shape x direction x pre-native-effect x consumer-evidence` axisでreopenする。one
+allocation-free classifierがtarget/native work前にexact descriptor-backed `FROM STDIN`/`TO STDOUT` shapeを
+proveし、server resultへpossible effect後に依存せずordinary DML+file/program COPYまでnegative matrixを
+closeする。repository/request registerにmeasured consumerは記録されていないため、このcandidateをnext
+settled railとせずexplicit deferする。consumer evidenceはimplementation前に§25 update+one fresh ledger reviewを
+triggerしなければならない。
+
+consumer gate closure後かつimplementation前にこのledger+single capability boundaryをone fresh independent
+adversarial reviewする。
 start、both live direction、termination、cancellation、Drop、fake libpq、C signature probe、required live ownerが
 one connection-global state machineを作るため、implementationはroughly 1,000 hand-written changed linesを
 超える見込みである。resource producerをdirection/cleanup consumerからsplitするとunusable/unsound
@@ -4022,7 +4058,8 @@ implementation referenceはofficial PostgreSQL 17
 
 bounded batch generation、segmented child/validity bitmap、eligible direct SoAはfirst A1でshipped。
 PostgreSQL single-row/portal-batchとbinary formatは上記ledgerでspecified。
-PostgreSQL COPYは上記ledgerでspecified。PostgreSQL pipeline/LISTEN-NOTIFY、SQLite backup/blob/FTS、
+PostgreSQL COPYは上記candidate ledgerを持つが§25のmeasured consumer記録までdeferred。PostgreSQL
+pipeline/LISTEN-NOTIFY、SQLite backup/blob/FTS、
 explicit pool、common contract実証後の追加driver。
 
 ### D14 — dynamic SQLとnative callback
@@ -4214,7 +4251,9 @@ load-bearing shapeは確定済み。残るもの:
 2. UUID、temporal、JSON/JSONB、PostgreSQL array/range/domain、SQLite custom type mapping。
 3. minimal safe dynamic `db.row`/`db.value` variant。
 4. SQLite function/collation callback safety。
-5. measured consumerを持つCOPY/pipeline/backup/blob operation。
+5. measured consumerを持つCOPY/pipeline/backup/blob operation。PostgreSQL COPY consumer/workload
+   measurementはcurrent recordに存在しないため、candidate §23 COPY surfaceはdeferredでnext
+   implementation railではない。
 
 engine/versionごとのnullability/origin support matrixは§16.3.1で確定しD0/D3/D5が所有する。
 残りはD12〜D14に担当を持つ。Query identity、one-execution、ownership、artifact、
