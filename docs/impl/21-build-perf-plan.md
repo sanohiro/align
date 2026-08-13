@@ -16,9 +16,9 @@ Order is priority.
 
 | # | Item | Status |
 |---|------|--------|
-| 1 | Persistent unit cache v1 | In flight — in-process memoization shipped as #757; ledger lands in `docs/impl/10-cache-first-optimization.md` §6.7 with the v1 PR |
-| 2 | lld linking on ELF | Shipped — see below |
-| 3 | Pipelined compilation | Start a dependent unit's frontend as soon as the dependency's interface summary exists; same work, shorter wall clock |
+| 1 | Persistent unit cache v1 | Shipped — in-process memo #757 (`docs/impl/10-cache-first-optimization.md` §6.6) and the persistent per-unit frontend cache #761 (§6.7, Slice C3) |
+| 2 | lld linking on ELF | Shipped as #763 — see below |
+| 3 | Pipelined compilation | Next in priority order. Start a dependent unit's frontend as soon as the dependency's interface summary exists; same work, shorter wall clock |
 | 4 | Prebuilt optimized cache distribution | Ship warmed std/pkg cache entries with releases, once the v1 persistent format is settled |
 | 5 | Daemon / watch mode | Keep the in-process memo alive across builds; the main lever for AI-agent edit-compile loops |
 | 6 | Function-level incremental compilation | Heaviest; requires its own design ledger before any implementation |

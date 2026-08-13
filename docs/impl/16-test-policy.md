@@ -366,17 +366,57 @@ full-workspace command as a substitute for identifying the owner target.
 
 ## Workspace health audit
 
-`scripts/test-full.sh` is retired. `cargo test --workspace` mixes deterministic
-units, 167 separately linked driver targets, generated-program fuzzing, real
-resources, stress loops, and measurement probes. Its long elapsed time and one
-aggregate verdict do not identify which product boundary was verified, and a
-single environmental failure invalidates the entire run.
+`scripts/test-full.sh` is retired, and `cargo test --workspace` is not the
+health audit either. It mixes deterministic units, 184 separately linked driver
+targets, generated-program fuzzing, real resources, stress loops, and
+measurement probes: its long elapsed time and one aggregate verdict do not
+identify which product boundary was verified, and a single environmental failure
+invalidates the entire run. Worse for a detector, cargo runs test binaries one
+at a time and stops the whole run at the first failing binary, so with known
+failures on `main` it reports nothing about the remaining targets.
 
 The individual tests remain available and meaningful through their crate,
-target, and filter. Run named affected targets for code changes. A human may
-still request `scripts/cargo.sh test --workspace --locked` as a background health audit,
-but its result is informational: it does not block a PR, release, or milestone,
-and it must not cause already-green owner targets to be rerun.
+target, and filter. Run named affected targets for code changes. The
+whole-workspace question is answered by `scripts/run-suite-binaries.sh` below,
+and its result is informational for a human: it does not block a PR, release, or
+milestone, and it must not cause already-green owner targets to be rerun.
+
+## Nightly full-suite detector
+
+The bounded gate cannot see out-of-gate rot: three stale-assertion failures and
+one silent-empty-MIR failure accumulated unnoticed on `main` before 2026-08-10.
+`.github/workflows/nightly.yml` runs daily, builds the workspace once, runs
+every compiled test binary concurrently through
+`scripts/run-suite-binaries.sh`, and diffs the observed failures against
+`scripts/known-failures.txt`.
+
+The manifest is a strict two-direction ratchet:
+
+```text
+a failure that is not in the manifest   red, named
+a manifest failure that now passes      red ("delete the line")
+exactly the manifest                    green
+```
+
+The second direction is the point — a fixed test may not sit in the manifest
+quietly re-earning its exemption, so the line goes away in the same change that
+fixes the test. A third field of `env` marks genuine environment dependence: the
+test still runs and may pass or fail without changing the verdict. It is never
+a cover for flakiness, because a flaky test is a bug and hiding it there removes
+the only thing that would have reported it. Two synthetic test names carry
+binary-level outcomes: `<binary-exit-N>` (exited without libtest naming a failed
+test) and `<binary-did-not-report>` (crash, or the per-binary cap).
+
+The budget is 30 minutes, hard. The job carries `timeout-minutes: 30`, the
+runner caps each individual binary at 15 minutes
+(`ALIGN_SUITE_BINARY_TIMEOUT`) so one hang cannot cost the report on everything
+else, and `ALIGN_GATE_JOBS` raises concurrency. A run that needs more than the
+budget is worthless as a detector: exceeding it is itself the red signal, not a
+number to raise, and no suite may be added whose cost only fits by extending it.
+
+Running `scripts/run-suite-binaries.sh` with no arguments reproduces the
+nightly's judgement locally. The nightly is a detector, not a second PR gate: a
+red nightly is triaged against the manifest and does not block an unrelated PR.
 
 ## pkg.db owner-test harness
 
@@ -387,7 +427,7 @@ its scope.
 
 `db_harness` is a shared module, not a test binary: Cargo auto-discovers only
 `tests/*.rs` and `tests/*/main.rs`. It deliberately does not live in
-`tests/common/`, which every one of the ~167 driver binaries compiles; only the
+`tests/common/`, which every one of the ~184 driver binaries compiles; only the
 E2E suites include it. It depends on `common` being declared first in the
 including file and refers to it as `crate::common::…`.
 
