@@ -20,3 +20,9 @@ license = "MIT OR Apache-2.0"
 inherits = "release"
 lto = "thin"
 codegen-units = 1
+
+# Keep optional runtime capabilities in separate archive members. With one
+# codegen unit, linking even a trivial Align program pulls every native
+# capability dependency from libalign_runtime.a.
+[profile.dist.package.align_runtime]
+codegen-units = 16

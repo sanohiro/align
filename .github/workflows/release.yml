@@ -138,9 +138,13 @@ jobs:
       - name: Build instrumented compiler (PGO phase 1)
         shell: bash
         run: |
+          # The runtime is linked into programs emitted during training. Keep
+          # it uninstrumented: only alignc owns this compiler profile.
+          CARGO_TARGET_DIR=target/pgogen \
+            scripts/cargo.sh build --locked --profile dist -p align_runtime
           RUSTFLAGS="-Cprofile-generate=$RUNNER_TEMP/pgo-data" \
           CARGO_TARGET_DIR=target/pgogen \
-            scripts/cargo.sh build --locked --profile dist -p align_runtime -p align_driver
+            scripts/cargo.sh build --locked --profile dist -p align_driver
 
       - name: Collect compilation profile (PGO phase 2)
         shell: bash
@@ -173,8 +177,9 @@ jobs:
       - name: Build compiler (PGO phase 3)
         shell: bash
         run: |
+          scripts/cargo.sh build --locked --profile dist -p align_runtime
           RUSTFLAGS="-Cprofile-use=$RUNNER_TEMP/merged.profdata" \
-            scripts/cargo.sh build --locked --profile dist -p align_runtime -p align_driver
+            scripts/cargo.sh build --locked --profile dist -p align_driver
 
       - name: Smoke test compiler
         shell: bash
