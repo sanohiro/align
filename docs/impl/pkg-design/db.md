@@ -5948,6 +5948,17 @@ sequential-to-parallel body change with an otherwise identical public signature.
 types acquire no source-visible or ABI field; their checked concrete target sets supply internal
 summaries, with the unresolved fallback above.
 
+Per-unit HIR carries the decoded fact as
+`ImportedFn.parallel_transfer_params: Vec<u32>` beside its normalized effect. Import construction
+copies only the already-decoded canonical set. Header validation rechecks strict ordering, range,
+borrow capability, and exact equality with the matching imported signature record before any body
+fact replay. Replay clears every stored source-function parallel-transfer set, seeds imported sets
+only from those validated declarations, recomputes direct/concrete-function-value propagation and
+the unresolved fallback to a least fixed point, and compares every stored descriptor fact with the
+recomputed target set. The validation-only imported field is stripped after that gate; MIR's
+existing six-field imported ABI record and runtime calling convention do not change. Whole-program
+HIR has no imported declarations and computes the same stored-function fact from bodies.
+
 A scalar callback descriptor is rejected before HIR publication when invocation root 0 reaches any
 parallel-transfer sink, whether directly, through a same-unit/imported helper, through a returned
 helper view, or through a concrete/unresolved function value. The callback may still use sequential
@@ -6057,6 +6068,26 @@ allocator's ordinary OOM behavior is a process-hard abort; no recoverable callba
 error or usable connection survives that outcome. Invalid private-helper inputs hard-abort before a
 native call and cannot manufacture a snapshot; checked HIR and LLVM preflight admit only the guarded
 package call above.
+
+The helper's accepted input product and check order are exact. It first requires non-null
+`database`; then non-null `name`, `1 <= name_length <= 255`, and a readable source `str` range of
+exactly `name_length` bytes; it scans those bytes in increasing order and rejects the first U+0000;
+then it requires `0 <= arity <= 127`; finally it accepts exactly one of these products:
+
+```text
+trampoline  flags
+non-null    SQLITE_UTF8 | SQLITE_DIRECTONLY
+non-null    SQLITE_UTF8 | SQLITE_DIRECTONLY | SQLITE_DETERMINISTIC
+null        SQLITE_UTF8 | SQLITE_DIRECTONLY
+```
+
+Every unknown/missing flag, deterministic removal, and other nullness product hard-aborts before
+forming the scratch or calling SQLite. The non-null/readable name-range property is the ordinary
+source-`str` ABI precondition and cannot be authenticated from an arbitrary forged pointer; checked
+HIR requires the exact guarded `str` operand and LLVM preflight rejects every different call
+signature/producer. After those gates, the helper copies exactly the validated range, appends NUL,
+and makes one native call. Malformed-helper owners cover each scalar/null/flag/NUL product and prove
+zero SQLite calls; the exact valid registration/removal products prove one call each.
 
 On non-null return, package code first poisons/closes the physical connection, then reads the two
 codes and copies the explicit message bytes into an owned Align `string`, and finally frees the one
@@ -6419,12 +6450,16 @@ The design is implemented correctly only if all are true:
      package interfaces remain identical.
 105. SQLite scalar callbacks are formed only from one exact noncapturing target through nominal static
      descriptors and generated C-ABI trampolines. No source closure environment, native pointer,
-     connection handle, or callback-frame view survives registration or invocation.
+     connection handle, or callback-frame view survives registration or invocation; invocation-root
+     provenance crosses no direct, imported, concrete-indirect, or unresolved `spawn`/`par_map` boundary.
 106. Scalar functions receive one ordered `slice<db.value>`, return `Result<db.value, str>`, are
      always DIRECTONLY, and may claim deterministic behavior only with a proved-Pure target.
 107. Scalar callback registration is fixed-arity, UTF-8, connection-local, direct-SQLite-only state. It
      persists visibly until replace/remove/close, never follows a pool slot, and uses no application
      destructor or registration-owned heap environment.
+108. Interface-v6 parallel-transfer roots are canonical, authenticated checked-HIR facts that change
+     dependent hashes; registration failure uses one exact v2 owned snapshot captured before the name
+     scratch ends, poisoned before consumption, and freed exactly once.
 
 ---
 

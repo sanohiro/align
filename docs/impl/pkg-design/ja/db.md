@@ -4253,6 +4253,14 @@ inputなのでroot変更は`interface_hash`とdependent object/cache keyを必�
 malformed product、same signatureのsequential→parallel body changeをbyte/hash goldenにする。fn-value typeの
 source/ABI fieldは増やさずconcrete target setを内部利用し、unresolved時は上記fallbackを使う。
 
+per-unit HIRはdecoded factをnormalized effect隣の
+`ImportedFn.parallel_transfer_params: Vec<u32>`として運ぶ。import constructionはdecoded canonical setだけを
+copyし、header validationがbody replay前にstrict order/range/borrow capability/matching imported signatureとの
+exact equalityを再検証する。replayはstored source functionのtransfer setをclearし、validated importだけをseed、
+direct/concrete fn-value propagationとunresolved fallbackをleast fixed pointへ再計算し、descriptor factをtarget
+setとcompareする。このvalidation-only fieldはgate後stripされ、MIR existing six-field import ABI/runtime ABIは
+不変。whole-program HIRはimport declarationなしでbodyからsame factを計算する。
+
 callback root 0がdirect/same-unit/imported/helper-return/concrete-or-unresolved fn-valueのいずれからでもparallel
 sinkへ達すればdescriptorをHIR publication前にrejectする。sequential pipelineとargument-backed Text/Bytesの
 synchronous return copyは許可する。descriptor semantic identityにもtarget parallel-transfer factを含める。
@@ -4343,6 +4351,22 @@ terminateし、returning errorはowned messageかつsnapshot-free。removeもsam
 invalid UTF-8をexisting fixed `invalid UTF-8 in SQLite error`へmapしnative stateを再scanしない。header integerは
 supported targetのlittle-endian representation:
 `01 00 00 00 01 01 00 00 01 00 00 00 00 00 00 00 78 00`、successはnull。
+
+helper accepted product/check orderはexact。まずnon-null `database`、次にnon-null `name`、
+`1 <= name_length <= 255`、exact len readable source-`str` rangeを要求し、increasing byte orderでfirst U+0000を
+reject。次に`0 <= arity <= 127`。最後に次の3 productだけacceptする:
+
+```text
+trampoline  flags
+non-null    SQLITE_UTF8 | SQLITE_DIRECTONLY
+non-null    SQLITE_UTF8 | SQLITE_DIRECTONLY | SQLITE_DETERMINISTIC
+null        SQLITE_UTF8 | SQLITE_DIRECTONLY
+```
+
+unknown/missing flag、deterministic removal、他null productはscratch/SQLite call前hard abort。non-null/readable
+rangeはsource-`str` ABI preconditionでarbitrary forged pointerからruntime認証不能なので、checked HIRがexact
+guarded `str` operand、LLVM preflightがcall signature/producerを認証する。その後exact range copy/NUL append/one
+native call。malformed-helper ownerは全scalar/null/flag/NUL productでSQLite call zero、3 valid productでone call。
 
 validation orderはexactでfirst failure後停止:
 
@@ -4652,11 +4676,14 @@ execution-count付きで実証する。
      reflection table、normal-build DB/network workを作らず、whole/per-unit interfaceは同一。
 105. SQLite scalar callbackはone exact noncapturing targetからnominal static descriptor/generated C-ABI
      trampolineだけで形成する。source closure env/native pointer/connection handle/callback-frame viewを
-     registration/invocation後に残さない。
+     registration/invocation後に残さず、invocation rootはdirect/imported/concrete-indirect/unresolvedの
+     どの`spawn`/`par_map` boundaryもcrossしない。
 106. scalar functionはone ordered `slice<db.value>`を受け`Result<db.value,str>`を返し、常に
      DIRECTONLY。proved-Pure targetだけdeterministicをclaimできる。
 107. scalar callback registrationはfixed-arity/UTF-8/connection-local/direct-SQLite-only。replace/remove/close
      までvisibleにpersistし、pool slotをfollowせず、application destructor/registration heap envなし。
+108. interface-v6 parallel-transfer rootはcanonical/authenticated checked-HIR factでdependent hashを変え、
+     registration failureはname scratch end前にexact v2 owned snapshotへcapture、consume前poison、exactly once free。
 
 ## 25. 実装前にconsumerで確定するtype/native detail
 

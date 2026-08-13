@@ -269,15 +269,19 @@ rejects a body above `MAX_CHECKED_HIR_DEPTH`, clones the already structurally
 validated HIR, and performs all replay/reset work on that compiler-owned clone.
 The caller's HIR, its type-table length, local `Ty::Fn` ordinals, and all
 compiler/runtime/cache state remain unchanged. Reset clears function return
-summaries, both Drop-local vectors, the exact Drop-expression map, every
+summaries, function parallel-transfer summaries, both Drop-local vectors, the exact Drop-expression map, every
 assignment cleanup `Cell<bool>`, and every concrete `FnTy.effect` cell; imported
-return provenance and effect seeds come only from the already validated
-imported declaration fields. A diagnostic, fact mismatch, or panic from a
+return provenance, effect, and parallel-transfer seeds come only from the already validated
+imported declaration fields. Direct and concrete function-value transfer summaries translate to
+caller roots; an unresolved indirect target selects every compatible argument/capture. A diagnostic, fact mismatch, or panic from a
 legacy analysis receiving a direct malformed-HIR call returns `false`.
 `ImportedFn.return_provenance_known` preserves whether the producer received
 an external provenance record: `false` retains the compatibility API's
 all-compatible-input fallback, while an explicit `None` is trusted only when
-the record was present. This predicate is not the structural HIR validator;
+the record was present. `ImportedFn.parallel_transfer_params` is the decoded interface-v6
+strictly increasing unique in-range borrow-capable root set; header validation authenticates it
+before replay, and a compatibility omission conservatively selects every borrow-capable parameter.
+Both imported validation-only facts are stripped before MIR. This predicate is not the structural HIR validator;
 direct callers must supply the checked type, id, header, and body envelope,
 and direct malformed metadata that does not trigger a replay diagnostic or
 legacy panic is outside this predicate's contract.
