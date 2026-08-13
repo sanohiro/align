@@ -158,11 +158,11 @@ orders
     .sum()
 ```
 
-Over `soa<Order>`, the pipeline reads the three named columns and no others.
+Read the shape of it: `map(fn o { … })` is handed a whole **row**, so this pipeline wants AoS — `orders` is an `array<Order>`. Turn it sideways and the compiler stops you, and says why: a whole-struct `map` over `soa<Order>` would gather every column to rebuild the row that SoA just took apart. Sideways you speak in columns instead — bind `s.price` and `s.quantity`, pair them with `zip` (chapter 13), and reduce. Only `where(.field)` survives whole-row on a soa, because filtering by one column is still columnar work (A8).
 
 ---
 
-**Q21.** Why not write `orders.price.sum() * orders.quantity.sum()`?
+**Q21.** Sideways now, over a `soa<Order>` named `s`. Why not write `s.price.sum() * s.quantity.sum()`?
 
 **A21.** Because multiplication belongs row by row before the sum. The first order's price pairs with the first order's quantity. Columnar layout changes storage, never relationships.
 
@@ -173,7 +173,7 @@ Over `soa<Order>`, the pipeline reads the three named columns and no others.
 **A22.** Slice the columns or the SoA window before reducing. A projected column is an ordinary slice:
 
 ```align
-orders.price[100..200].sum()
+s.price[100..200].sum()
 ```
 
 The half-open range contains one hundred prices.
@@ -182,7 +182,7 @@ The half-open range contains one hundred prices.
 
 **Q23.** You need one customer's entire record after finding its index. Is gathering one row a failure of SoA?
 
-**A23.** No. `orders[i]` gathers it. A layout is chosen for the dominant work, not sworn as a religion. Occasional row gathers are the price paid for cheap repeated column scans.
+**A23.** No. `s[i]` gathers it. A layout is chosen for the dominant work, not sworn as a religion. Occasional row gathers are the price paid for cheap repeated column scans.
 
 ---
 

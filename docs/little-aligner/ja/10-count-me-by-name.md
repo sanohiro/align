@@ -62,6 +62,8 @@ g := xs.group_by(.name).agg(sum(.a), max(.b), count())
 
 `agg` はキーごとに3つすべてを1回のパスで畳み込みます: `g.0` は名前、`g.1` は sum、続いて max、count。メモリを1回走査する間に、すべてのアキュムレータが同時に相乗りして計算されます。
 
+ソースの形に注意してください。融合された multi-aggregate が読むのは、**row 形式** の `array<Struct>` で、キーは **string** です — ここでの `xs` は所有された `array<Row>`、`json.decode` が返すあの形です(Q12)。soa や整数キーは、今日の `agg` が受け取る形ではありません。soa にも乗るのは、単一 aggregate の `group_by(.k).sum(.v)` のほうです(Q2)。
+
 ---
 
 **Q8.** なぜ1回のパスがそれほど大事なのですか？
@@ -86,7 +88,7 @@ s := e.group_by(.name).sum(.score)  // these ride the ids —
 c := e.group_by(.name).count()      //   no re-hashing
 ```
 
-辞書エンコーディング — 列指向データベースの最も古典的な定石（テクニック）を、明示的な呼び出し1つで実現できます。
+辞書エンコーディング — 列指向データベースの最も古典的な定石（テクニック）を、明示的な呼び出し1つで実現できます。ソースの形は `agg` と同じです: `xs` は所有された `array<Row>`、`.name` はその string キーです。
 
 ---
 
@@ -132,24 +134,25 @@ print(g.1.max())        // the largest of the per-name maxima
 **Q16.** customer ごとの order です。
 
 ```text
-7  10
-9   4
-7   3
-9   8
-7   2
+ada  10
+bo    4
+ada   3
+bo    8
+ada   2
 ```
 
 customer ごとの sum は？
 
-**A16.** customer `7 → 15`、customer `9 → 12`。syntax に触る前に頭の中で group します。
+**A16.** customer `ada → 15`、customer `bo → 12`。syntax に触る前に頭の中で group します。
 
 ---
 
 **Q17.** field `.customer` と `.amount` で書いてください。
 
-**A17.**
+**A17.** まず row がどこにあるかを言います — A7 の形、string キーを持つ所有された `array<Order>` です:
 
 ```align
+orders: array<Order> := json.decode(data)?
 g := orders.group_by(.customer).sum(.amount)
 ```
 
@@ -169,7 +172,7 @@ g := orders.group_by(.customer).agg(
 )
 ```
 
-一つの key table に、group ごと3つの accumulator。
+一つの key table に、group ごと3つの accumulator。そして Q16 の customer が数字ではなく *名前* である理由もこれです: `agg` が求めるのは row 形式の order に対する string キーです。番号にしてしまうと、3回問うか、一度に一つずつ問うほかありません。
 
 ---
 

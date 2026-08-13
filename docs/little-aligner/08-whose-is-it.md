@@ -48,7 +48,7 @@ How many owned strings exist now?
 
 **Q6.** Which types are Move?
 
-**A6.** The owners: `string`, `array<T>`, `buffer`, `box`, file handles. Everything plain — numbers, `bool`, views, small structs of them — is Copy. Own a resource: Move. Just data: Copy. And a struct that *contains* a `string` becomes Move too — ownership soaks upward.
+**A6.** The owners: `string`, `array<T>`, `buffer`, file handles. Everything plain — numbers, `bool`, views, small structs of them — is Copy. Own a resource: Move. Just data: Copy. And a struct that *contains* a `string` becomes Move too — ownership soaks upward.
 
 ---
 

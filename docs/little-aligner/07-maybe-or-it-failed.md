@@ -71,7 +71,7 @@ fs.write_file("log.txt", "hi")
 
 **Q10.** What is in the built-in `Error`?
 
-**A10.** The categories the OS speaks — `NotFound`, `Invalid`, `Denied` — and `Code(n)` for the rest. `match` on it like any sum type (chapter 6 taught you how; `Error` is just a sum type with a badge).
+**A10.** The categories the OS speaks — `NotFound`, `Invalid`, `Denied`, `Timeout` — and `Code(n)` for the rest, where `n` is an `i32`. Five arms, so `match` on it like any sum type and name all five (chapter 6 taught you how; `Error` is just a sum type with a badge). Let one escape `main` and it becomes the exit status: `1`, `2`, `3`, `4` in that order, and `Code(c)` exits `c`.
 
 ---
 

@@ -25,7 +25,7 @@ r.map_err(f)        -> Result<T,F> // Result-only; f: fn(E) -> F; Ok passes thro
 match v { Some(x) => …, None => … }        // exhaustive, payload binds positionally
 match r { Ok(v) => …, Err(e) => … }
 
-Error { NotFound, Invalid, Denied, Code(i64) }   // builtin; explicit name core.Error
+Error { NotFound, Invalid, Denied, Timeout, Code(i32) }   // builtin; explicit name core.Error
 error(c)                            // sugar: always constructs core.Error.Code(c)
 ```
 
@@ -60,7 +60,7 @@ Pure machinery. `?` is control flow, not an effect; a function is impure only th
 - `?` performs **no implicit error-type conversion** — `Result<T, MyErr>` does not flow through a
   `Result<T, Error>` context; convert visibly with `.map_err(to_error)`.
 - `main() -> Result<(), Error>`: an escaping `Err` maps to the process exit code — categorical
-  variants exit `tag + 1` (`NotFound`→1, `Invalid`→2, `Denied`→3), `Code(c)` exits `c` (#308
+  variants exit `tag + 1` (`NotFound`→1, `Invalid`→2, `Denied`→3, `Timeout`→4), `Code(c)` exits `c` (#308
   restricted `main`'s error type to the builtin `Error`; a user `E` in `main` is rejected).
 
 ## Regions

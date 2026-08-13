@@ -62,6 +62,8 @@ g := xs.group_by(.name).agg(sum(.a), max(.b), count())
 
 `agg` folds all three per key in a single pass: `g.0` the names, `g.1` the sums, then the maxes, the counts. One trip through memory, every accumulator riding along.
 
+Mind the source. The fused multi-aggregate reads a **row-shaped** `array<Struct>` with a **string** key — `xs` here is an owned `array<Row>`, the kind `json.decode` hands back (Q12). A soa, or an integer key, is not the shape `agg` takes today; single-aggregate `group_by(.k).sum(.v)` is the one that also rides a soa (Q2).
+
 ---
 
 **Q8.** Why does one pass matter so much?
@@ -86,7 +88,7 @@ s := e.group_by(.name).sum(.score)  // these ride the ids —
 c := e.group_by(.name).count()      //   no re-hashing
 ```
 
-Dictionary encoding — the columnar database's oldest trick, as one visible call.
+Dictionary encoding — the columnar database's oldest trick, as one visible call. Same source shape as `agg`: `xs` is an owned `array<Row>` and `.name` is its string key.
 
 ---
 
@@ -132,24 +134,25 @@ print(g.1.max())        // the largest of the per-name maxima
 **Q16.** Orders by customer:
 
 ```text
-7  10
-9   4
-7   3
-9   8
-7   2
+ada  10
+bo    4
+ada   3
+bo    8
+ada   2
 ```
 
 What per-customer sums must come back?
 
-**A16.** Customer `7 → 15`; customer `9 → 12`. Do the grouping in your head before touching syntax.
+**A16.** Customer `ada → 15`; customer `bo → 12`. Do the grouping in your head before touching syntax.
 
 ---
 
 **Q17.** Say it over fields `.customer` and `.amount`.
 
-**A17.**
+**A17.** First say where the rows live — A7's shape, an owned `array<Order>` with a string key:
 
 ```align
+orders: array<Order> := json.decode(data)?
 g := orders.group_by(.customer).sum(.amount)
 ```
 
@@ -169,7 +172,7 @@ g := orders.group_by(.customer).agg(
 )
 ```
 
-One key table, three accumulators per group.
+One key table, three accumulators per group — and the reason Q16's customers are *names* rather than numbers: `agg` wants a string key over row-shaped orders. Number them instead and you must ask three times, or one question at a time.
 
 ---
 

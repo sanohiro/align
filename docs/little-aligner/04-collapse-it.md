@@ -22,7 +22,7 @@
 
 **Q4.** What is `[2, 4, 6].all(fn x { x % 2 == 0 })`?
 
-**A4.** `true`. And `[2, 4, 7]`? — `false`. The `7` ruins it, and `all` can say so the moment it meets it.
+**A4.** `true`. And `[2, 4, 7]`? — `false`. The `7` ruins it — but `all` keeps walking. Align's `any` and `all` do **not** short-circuit: they are branchless full scans, a steady pass the machine can vectorize rather than an early exit it must guess at (chapter 13). The answer is the same; the shape of the work is not.
 
 ---
 
@@ -58,7 +58,7 @@
 
 **Q9.** What is `[1, 2, 3, 4].scan(0, fn acc, x { acc + x })`?
 
-**A9.** The *running* sums: `1, 3, 6, 10`. `scan` is `reduce` that shows its work — and so it is a **stage**, not an ending: something must still consume it.
+**A9.** The *running* sums: `1, 3, 6, 10`. `scan` is `reduce` that shows its work — and it is an **ending**, not a stage: like `sort`, it materializes, handing you a real array with the allocation in plain sight. Unlike a dangling `xs.map(f)`, it needs no consumer; but a reducer may still ask it a question.
 
 ---
 
@@ -147,8 +147,10 @@ pair := [2, 4, 6].reduce((0, 0), fn acc, x {
 **A20.** `[3, -2, 2, 4]` from:
 
 ```align
-[3, -5, 4, 2].scan(0, fn acc, x { acc + x }).to_array()
+totals := [3, -5, 4, 2].scan(0, fn acc, x { acc + x })
 ```
+
+No `to_array` in sight: `scan` already built the array (A9). Asking for one again would allocate the same answer twice.
 
 ---
 
@@ -160,7 +162,7 @@ pair := [2, 4, 6].reduce((0, 0), fn acc, x {
 [3, -5, 4, 2].scan(0, fn acc, x { acc + x }).max()
 ```
 
-`4`. A stage may expose intermediate answers so a later reducer can ask about their history.
+`4`. Materializing the intermediate answers is what lets a later reducer ask about their history.
 
 ---
 

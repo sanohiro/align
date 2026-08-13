@@ -103,10 +103,16 @@ One visible allocation, two cheap reductions. (One day you'll want *many* aggreg
 **Q11.** A chain that writes into memory *you* own — what is `map_into`?
 
 ```align
-src.map(dbl).map_into(dst)
+fn dbl(x: i64) -> i64 = x * 2
+
+fn double_into(src: slice<i64>, out dst: slice<i64>) {
+    src.map(dbl).map_into(dst)
+}
 ```
 
 **A11.** The zero-allocation ending: results go into the slice `dst`, which must be the same length, and which the compiler proves doesn't overlap `src`. For the hot path that recycles buffers.
+
+The `out` says where the storage comes from: `dst` is the *caller's* slice, and this function writes through it. That is the only way to name a destination you did not allocate — so a `map_into` always lives inside a function with an `out` parameter.
 
 ---
 
@@ -185,10 +191,12 @@ The right answer depends on reuse. “No hidden allocation” does not mean “n
 **A19.**
 
 ```align
-src.map(fn x { x * 2 }).map_into(dst)
+fn scale_into(src: slice<i64>, out dst: slice<i64>) {
+    src.map(fn x { x * 2 }).map_into(dst)
+}
 ```
 
-`to_array` asks for new storage; `map_into` names existing storage. Same transformation, different ownership story.
+`to_array` asks for new storage; `map_into` names existing storage — the caller's, arriving as `out dst` (A11). Same transformation, different ownership story.
 
 ---
 

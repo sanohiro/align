@@ -27,13 +27,15 @@ out-mode parameter. Parsing uses token lookahead, not whitespace.
 
 That is the entire box surface — no `.set()`, no deref operator.
 
-Required L4 signature, **not implemented yet**:
+Named-region form (required L4, **shipped**):
 
 ```text
 arena out { … }             // binds the same arena as `out: region`
+fn f(out: region)           // the same arena, substituted through ordinary calls
+v.clone_in(out)             // copy a view into the named arena
 ```
 
-The named arena form is a settled prerequisite. It does not widen `box<T>`:
+The named arena form does not widen `box<T>`:
 `out` is a scope-limited allocation-destination capability for ordinary library functions, and
 anonymous/named arenas share the same begin/end and bulk cleanup. Full contract:
 [`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md) §4.
@@ -75,9 +77,10 @@ The reference implementation of the region model: `region_of(box) = Arena(depth)
   against `mut` locals and arena values, which already cover the patterns.
 - Escaping boxes (a box that outlives its arena / a global heap tier) — deliberately absent;
   the ownership model's answer to "longer-lived" is Move types, not box lifetimes.
-- **Named `region` implementation (required L4):** parse/bind `arena out {}`, substitute the exact
-  arena through ordinary calls, enforce no escape/storage/task/FFI, and add `clone_in(out)`. The
-  design is settled; only the implementation is outstanding.
+
+(Named `region` is no longer in this list: `arena out {}`, `out: region` parameters, exact-arena
+substitution through ordinary calls, escape/storage/task/FFI rejection, and `clone_in(out)` are
+all shipped — F-B region materialization is complete through L4 and L6.)
 
 ## Pitfalls
 
