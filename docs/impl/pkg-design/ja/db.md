@@ -3833,7 +3833,10 @@ bitはfalseである。returned Text/Bytesと`row.values`はoutput regionを保�
 connection、parameter、scratchをborrowしない。callerは`row.values.len()`、integer index、
 `value`のexhaustive `match`だけを使う。column-name lookup、arbitrary struct write、native type ID、
 reflection、unchecked accessorはない。input `Null`はuntypedであり、PostgreSQLがcontextから推論
-できない場合はcallerが `$1::int8` のようなcastをvisibleに書く。
+できない場合はcallerが `$1::int8` のようなcastをvisibleに書く。returned
+`Result<Option<row>, Error>`を`else`/`match`/`?`でunwrapしてもselected cleanup bitを保持する。
+arena-owned `row`は`borrow row: row`でinspectできるが、ordinary by-value callはfree-standing
+storageを前提にDropするcalleeへ入る前にrejectする。
 
 inventoryの全argumentはrequired。`options = []`はdeadlineなしで、common variantはsettled positive/
 unique `ExecuteOption.TimeoutNs`だけである。PostgreSQLはconstructor execution中にenforceし、SQLiteは
@@ -3895,7 +3898,8 @@ length zeroのnon-null stable sentinelを使い、null pointerは`Null`だけで
 BLOBだけzero lengthのnull pointerをadmitし、present PostgreSQL valueはzero lengthでもlibpqの
 non-null pointerをrequireする。Textはnative error state、pointer/length product、UTF-8をclone前に
 checkする。exactにはpresent SQLite TEXTはzero lengthでもnon-null pointerをrequireし、present
-zero-length BLOBのnull pointerは`sqlite3_errcode == SQLITE_OK`のときだけadmitする。他の
+zero-length BLOBのnull pointerは`sqlite3_errcode`が`SQLITE_OK`または現在の正常な
+`SQLITE_ROW`のときだけadmitする。他の
 null/length/error-state productはavailableならowned native error、それ以外はinvalid-representation
 error。emptyは`Null`と区別する。
 
@@ -4121,6 +4125,7 @@ implementation closure matrix:
 | SQLite construction/advance | lease、one prepare/tail/largest index/pre-step kind、bind後no-step publication。nextはat most one rowをstep/map/materializeしEOF/error/Dropでfinalize/release。executeはcompletion後`rows_affected = None`。全native-statement boundaryでpublication/release前にtracked busy timeoutをreapplyする。 | fake call/failpoint、mixed class、empty/null pointer-length、0/1/many row/column、DML/DDL/transaction/PRAGMA countが全て`None`、command/query/RETURNING、prepare/step/finalize busy-timeout mutation/restore failure、unadvanced/early Drop、live SQLite |
 | PostgreSQL construction/advance | one parameterized binary execution、publication前package-owned UTF-8 client-encoding invariantとall-column metadataをvalidate、one complete PGresult、callごとone ordinal row。existing timeout/status/sync/fail-close、final-row publish前clear/release。 | OID/format/NULL/payload matrix、all statuses+unknown、0/1/many row/column、command/query/RETURNING、`SET client_encoding`/`set_config`とencoding mismatch/-1のfirst-error/no-probe-after-fail-close counter、Conn/Tx timeout、final-row cleanup、required live PG |
 | resource ABI/move/cleanup | exact 48-byte v1 product、embedded load前complete scalar/tag/reserved/null-product validation、non-null embedded-pointer provenanceをprivileged unsafe producer obligationとし、target dependency、local/return/if/match/else/?/map_err/loop move、canonical terminal、live/terminal/detectably-malformed Dropのno-double-cleanup。 | bidirectional state golden、all scalar/tag/reserved/null-product mutationのno-call、explicit unsafe-producer pointer-provenance boundary、Move/drop flag、direct/pool parent generation、whole/per-unit Drop linkage、alloc balance |
+| returned-row ownership/call transfer | direct/imported/compiler-private callから`Result`/`Option` success projectionまでpath-selected cleanup bitを保持する。`out`にproduceされたrowは`else`/`match`/`?`後もarena-ownedで、shared-borrow helperはinspectできるがordinary by-value callはcallee entry前にrejectする。first-class function signatureは`region` capabilityをcarry/captureできず、free-standing Move call-result transferは従来どおりlegal。 | mutation-discriminating generic direct/compiler-private/imported call-result owner、A2 `dynamic_next` `else`/borrow-helper acceptanceとby-value rejection、whole/per-unit parity、runtime no-double-free control |
 | per-row region materialization | current rowだけone `array<value>`、nonempty view one copy、empty/Null/order、native/input viewなし、exhausted/failed allocation zero。SQLite prefetch/all-rows containerなし。 | row size 0/1/many/chunk boundary、region copy/compact counter、prior-row survival、escape/post-cleanup read、forbidden all-rows inventory |
 | failure/effects/sync | every validation/native/decode/address/session-invariant/cleanup failpointでcurrent rowなし、prior row/first error保持、unpublished cleanup、once clear/finalize、failed transition、release/poison once、hidden rollbackなし。全publication/reuse boundary前にpackage-owned busy-timeout/client-encoding checkとexact native transaction-state proof。 | Execute/Rows/Next x Conn/Tx/direct/pool failpoint、first-error pair、raw BEGIN/COMMIT/ROLLBACK mismatch/retirement、SQLite busy-timeout PRAGMA x prepare/step/finalize/Drop restore、PostgreSQL encoding drift x ordinary/fail-close/status/error path、effect/reuse、repeated failed advance、no-call-after-close |
 | product/build/measurement | typed descriptor/artifact unchanged、normal toolingからdynamic callなし、both driver whole/per-unit link、local DB gate。correctness後にzero/empty/nonempty、one/many rowのscratch/native owner/region copy/compact/peak bytes/time-to-first/full scanをsemantic thresholdなしでrecord。 | artifact golden、whole/per-unit run、A2+Q2/Q4b/A1 regressions、required CI、non-gating `bench/pkg_db_dynamic` record |

@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 typedef struct {
   int autocommit;
@@ -20,6 +21,7 @@ static int protocol_ok;
 static int fail_next_text;
 static int fail_next_reset;
 static int fail_next_busy_timeout;
+static int fail_next_finalize;
 static int failed_bind_pending;
 static const char *bound_text;
 static int bound_text_bytes;
@@ -28,6 +30,7 @@ static int64_t bound_i64;
 static int step_phase;
 static int view_mode;
 static int row_fault;
+static int dynamic_mode;
 static int pool_connect_calls;
 static int pool_close_calls;
 static int pool_fail_connect_at;
@@ -49,6 +52,7 @@ void align_sqlite_q4a_reset(void) {
   fail_next_text = 0;
   fail_next_reset = 0;
   fail_next_busy_timeout = 0;
+  fail_next_finalize = 0;
   failed_bind_pending = 0;
   bound_text = NULL;
   bound_text_bytes = 0;
@@ -57,6 +61,7 @@ void align_sqlite_q4a_reset(void) {
   step_phase = 0;
   view_mode = 0;
   row_fault = 0;
+  dynamic_mode = 0;
   pool_connect_calls = 0;
   pool_close_calls = 0;
   pool_fail_connect_at = 0;
@@ -90,6 +95,7 @@ int align_sqlite_q4a_protocol_ok(void) { return protocol_ok; }
 void align_sqlite_q4a_fail_next_text(void) { fail_next_text = 1; }
 void align_sqlite_q4a_fail_next_reset(void) { fail_next_reset = 1; }
 void align_sqlite_q4a_fail_next_busy_timeout(void) { fail_next_busy_timeout = 1; }
+void align_sqlite_q4a_fail_next_finalize(void) { fail_next_finalize = 1; }
 void align_sqlite_q4a_set_row_fault(int fault) { row_fault = fault; }
 
 int sqlite3_open_v2(const char *filename, void **database_out, int flags, const char *vfs) {
@@ -120,8 +126,10 @@ int sqlite3_extended_result_codes(void *database, int enabled) {
   return database != NULL && enabled == 1 ? 0 : 1;
 }
 
-int sqlite3_errcode(void *database) { return database == NULL ? 1 : 0; }
-int sqlite3_extended_errcode(void *database) { return database == NULL ? 1 : 0; }
+int sqlite3_errcode(void *database) {
+  return database == NULL ? 1 : (dynamic_mode == 1 && step_phase == 1 ? 100 : 0);
+}
+int sqlite3_extended_errcode(void *database) { return sqlite3_errcode(database); }
 const char *sqlite3_errmsg(void *database) {
   (void)database;
   return "SQLite pool stub failure";
@@ -202,20 +210,41 @@ int sqlite3_prepare_v2(
     void **statement_out,
     const char **tail_out) {
   prepare_calls++;
-  if (database == NULL || sql == NULL || bytes != -1 || statement_out == NULL ||
+  int dynamic = sql != NULL && strstr(sql, "DYNAMIC_SQLITE") != NULL;
+  if (database == NULL || sql == NULL ||
+      (dynamic ? bytes != (int)strlen(sql) + 1 : bytes != -1) || statement_out == NULL ||
       tail_out == NULL) {
     protocol_ok = 0;
     return 1;
   }
   step_phase = 0;
-  view_mode = strstr(sql, "label AS label") != NULL;
+  dynamic_mode = dynamic
+      ? (strstr(sql, "DYNAMIC_SQLITE_COMMAND") != NULL ? 2
+         : (strstr(sql, "DYNAMIC_SQLITE_MIXED") != NULL ? 3
+            : (strstr(sql, "DYNAMIC_SQLITE_ZERO_ROWS") != NULL ? 4 : 1)))
+      : 0;
+  view_mode = !dynamic && strstr(sql, "label AS label") != NULL;
+  if (strstr(sql, "DYNAMIC_SQLITE_EMPTY") != NULL) {
+    dynamic_mode = 0;
+    *statement_out = NULL;
+    *tail_out = sql + strlen(sql);
+    return 0;
+  }
   *statement_out = calloc(1, 8);
-  *tail_out = sql + strlen(sql);
+  *tail_out = strstr(sql, "DYNAMIC_SQLITE_MULTI") != NULL
+      ? strstr(sql, "DYNAMIC_SQLITE_MULTI") + strlen("DYNAMIC_SQLITE_MULTI")
+      : sql + strlen(sql);
   return *statement_out == NULL ? 7 : 0;
 }
 
 int sqlite3_bind_int64(void *statement, int index, int64_t value) {
   bind_i64_calls++;
+  if (dynamic_mode == 1) {
+    int valid = (index == 2 && value == 1) || (index == 3 && value == -2) ||
+                (index == 4 && value == 16909060) || (index == 5 && value == -2);
+    if (statement == NULL || !valid) protocol_ok = 0;
+    return 0;
+  }
   int expected_index = view_mode ? 3 : 1;
   if (statement == NULL || index != expected_index || (value != 7 && value != 8)) protocol_ok = 0;
   bound_i64 = value;
@@ -227,6 +256,16 @@ int sqlite3_step(void *statement) {
     protocol_ok = 0;
     return 1;
   }
+  if (dynamic_mode == 2) return 101;
+  if (dynamic_mode == 3) {
+    if (step_phase < 2) {
+      step_phase++;
+      return 100;
+    }
+    return 101;
+  }
+  if (dynamic_mode == 4) return 101;
+  if (dynamic_mode == 1 && row_fault == 20) return 1;
   if (step_phase == 0) {
     step_phase = 1;
     return 100;
@@ -235,7 +274,18 @@ int sqlite3_step(void *statement) {
 }
 
 int sqlite3_column_count(void *statement) {
-  return statement == NULL ? -1 : (view_mode ? 2 : 1);
+  if (statement == NULL) return -1;
+  if (dynamic_mode == 1) return 9;
+  if (dynamic_mode == 3 || dynamic_mode == 4) return 1;
+  if (dynamic_mode == 2) return 0;
+  return view_mode ? 2 : 1;
+}
+
+int sqlite3_bind_parameter_count(void *statement) {
+  if (statement == NULL) return -1;
+  return dynamic_mode == 1 ? 9
+      : ((dynamic_mode == 2 || dynamic_mode == 3 || dynamic_mode == 4)
+          ? 0 : (view_mode ? 3 : 2));
 }
 
 const char *sqlite3_column_name(void *statement, int column) {
@@ -247,19 +297,51 @@ const char *sqlite3_column_name(void *statement, int column) {
 
 int sqlite3_column_type(void *statement, int column) {
   if (statement == NULL) return 5;
+  if (dynamic_mode == 3) return column != 0 ? 5 : (step_phase == 1 ? 1 : 3);
+  if (dynamic_mode == 4) return 5;
+  if (dynamic_mode == 1) {
+    if (row_fault == 10 && column == 0) return 99;
+    static const int types[9] = {5, 1, 1, 1, 1, 2, 2, 3, 4};
+    return column < 0 || column >= 9 ? 5 : types[column];
+  }
   if (!view_mode) return column == 0 ? 1 : 5;
   if (column == 0) return 3;
   return column == 1 ? 4 : 5;
 }
 
 int64_t sqlite3_column_int64(void *statement, int column) {
+  if (dynamic_mode == 3) {
+    if (statement == NULL || column != 0 || step_phase != 1) protocol_ok = 0;
+    return 7;
+  }
+  if (dynamic_mode == 1) {
+    static const int64_t values[9] = {0, 1, -2, 16909060, -2, 0, 0, 0, 0};
+    if (statement == NULL || column < 1 || column > 4) protocol_ok = 0;
+    return column < 0 || column >= 9 ? 0 : values[column];
+  }
   if (statement == NULL || column != 0) protocol_ok = 0;
   return bound_i64;
+}
+
+double sqlite3_column_double(void *statement, int column) {
+  if (statement == NULL || dynamic_mode != 1 || (column != 5 && column != 6)) protocol_ok = 0;
+  if (row_fault == 16 && column == 5) return NAN;
+  return column == 5 ? 1.5 : 2.5;
 }
 
 const unsigned char *sqlite3_column_text(void *statement, int column) {
   static const unsigned char valid[] = "view";
   static const unsigned char invalid_utf8[] = {0xff, 0};
+  static const unsigned char dynamic_text[] = {'a', 0, 'b', 0};
+  static const unsigned char mixed_text[] = "two";
+  if (dynamic_mode == 3) {
+    return statement != NULL && column == 0 && step_phase == 2 ? mixed_text : NULL;
+  }
+  if (dynamic_mode == 1) {
+    if (column == 7 && row_fault == 11) return NULL;
+    if (column == 7 && row_fault == 13) return invalid_utf8;
+    return statement != NULL && column == 7 ? dynamic_text : NULL;
+  }
   if (statement == NULL || !view_mode || column != 0) return NULL;
   if (row_fault == 1) return NULL;
   return row_fault == 3 ? invalid_utf8 : valid;
@@ -267,11 +349,32 @@ const unsigned char *sqlite3_column_text(void *statement, int column) {
 
 const void *sqlite3_column_blob(void *statement, int column) {
   static const unsigned char valid[] = {1, 2, 3};
+  static const unsigned char dynamic_blob[] = {0, 255};
+  if (dynamic_mode == 1) {
+    if (column == 8 && (row_fault == 14 || row_fault == 17)) return NULL;
+    return statement != NULL && column == 8 ? dynamic_blob : NULL;
+  }
   if (statement == NULL || !view_mode || column != 1 || row_fault == 4) return NULL;
   return valid;
 }
 
 int sqlite3_column_bytes(void *statement, int column) {
+  if (dynamic_mode == 1) {
+    if (statement == NULL) return -1;
+    if (column == 7) {
+      if (row_fault == 12) return -1;
+      if (row_fault == 11 || row_fault == 13) return 1;
+      return 3;
+    }
+    if (column == 8) {
+      if (row_fault == 15) return -1;
+      if (row_fault == 14) return 1;
+      if (row_fault == 17) return 0;
+      return 2;
+    }
+    return 0;
+  }
+  if (dynamic_mode == 3) return statement != NULL && column == 0 && step_phase == 2 ? 3 : 0;
   if (statement == NULL || !view_mode) return -1;
   if (column == 0) {
     if (row_fault == 2) return -1;
@@ -293,6 +396,18 @@ int sqlite3_bind_text(
     int bytes,
     void (*destructor)(void *)) {
   bind_text_calls++;
+  if (dynamic_mode == 1) {
+    const unsigned char expected[] = {'a', 0, 'b'};
+    if (statement == NULL || index != 8 || value == NULL || bytes != 3 ||
+        destructor != (void (*)(void *))-1 || memcmp(value, expected, sizeof(expected)) != 0) {
+      protocol_ok = 0;
+    }
+    if (fail_next_text) {
+      fail_next_text = 0;
+      return 1;
+    }
+    return 0;
+  }
   int expected_index = view_mode ? 1 : 2;
   if (statement == NULL || index != expected_index || value == NULL || destructor != NULL ||
       !((bytes == 5 && memcmp(value, "first", 5) == 0) ||
@@ -317,6 +432,15 @@ int sqlite3_bind_blob(
     void (*destructor)(void *)) {
   static const unsigned char expected[] = {1, 2, 3};
   bind_blob_calls++;
+  if (dynamic_mode == 1) {
+    static const unsigned char dynamic_expected[] = {0, 255};
+    if (statement == NULL || index != 9 || value == NULL || bytes != 2 ||
+        destructor != (void (*)(void *))-1 ||
+        memcmp(value, dynamic_expected, sizeof(dynamic_expected)) != 0) {
+      protocol_ok = 0;
+    }
+    return 0;
+  }
   int expected_index = view_mode ? 2 : 3;
   if (statement == NULL || index != expected_index || value == NULL || bytes != 3 || destructor != NULL ||
       memcmp(value, expected, sizeof(expected)) != 0) {
@@ -361,6 +485,24 @@ int sqlite3_finalize(void *statement) {
     protocol_ok = 0;
   } else {
     free(statement);
+  }
+  dynamic_mode = 0;
+  if (fail_next_finalize) {
+    fail_next_finalize = 0;
+    return 1;
+  }
+  return 0;
+}
+
+int sqlite3_bind_null(void *statement, int index) {
+  if (statement == NULL || dynamic_mode != 1 || index != 1) protocol_ok = 0;
+  return 0;
+}
+
+int sqlite3_bind_double(void *statement, int index, double value) {
+  if (statement == NULL || dynamic_mode != 1 ||
+      !((index == 6 && value == 1.5) || (index == 7 && value == 2.5))) {
+    protocol_ok = 0;
   }
   return 0;
 }

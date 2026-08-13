@@ -173,6 +173,11 @@ jobs:
         run: |
           scripts/cargo.sh test --locked -p align_driver --test pkg_db_pool -- --nocapture
 
+      - name: Required dynamic SQL owners
+        shell: bash
+        run: |
+          scripts/cargo.sh test --locked -p align_driver --test pkg_db_a2 -- --nocapture
+
       - name: Save Cargo caches
         if: github.ref == 'refs/heads/main'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0

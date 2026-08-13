@@ -1,6 +1,7 @@
 module pkg.db
 
 import std.process
+import std.time
 import pkg.db.internal
 import pkg.db.internal.resource
 import pkg.db.internal.descriptor
@@ -8,12 +9,15 @@ import pkg.db.internal.postgres_status
 
 extern "C" link("sqlite3") {
   fn sqlite3_prepare_v2(database: raw, sql: raw, bytes: i32, statement_out: raw, tail_out: raw) -> i32
+  fn sqlite3_bind_parameter_count(statement: raw) -> i32
   fn sqlite3_bind_text(statement: raw, index: i32, value: raw, bytes: i32, destructor: raw) -> i32
   fn sqlite3_step(statement: raw) -> i32
   fn sqlite3_column_count(statement: raw) -> i32
   fn sqlite3_column_type(statement: raw, index: i32) -> i32
   fn sqlite3_column_int64(statement: raw, index: i32) -> i64
+  fn sqlite3_column_double(statement: raw, index: i32) -> f64
   fn sqlite3_column_text(statement: raw, index: i32) -> raw
+  fn sqlite3_column_blob(statement: raw, index: i32) -> raw
   fn sqlite3_column_bytes(statement: raw, index: i32) -> i32
   fn sqlite3_db_readonly(database: raw, schema: raw) -> i32
   fn sqlite3_errcode(database: raw) -> i32
@@ -35,24 +39,49 @@ extern "C" link("pq") {
   ) -> raw
   fn PQntuples(result: raw) -> i32
   fn PQnfields(result: raw) -> i32
+  fn PQftype(result: raw, column: i32) -> u32
+  fn PQfformat(result: raw, column: i32) -> i32
   fn PQgetisnull(result: raw, row: i32, column: i32) -> i32
   fn PQgetvalue(result: raw, row: i32, column: i32) -> raw
   fn PQgetlength(result: raw, row: i32, column: i32) -> i32
+  fn PQcmdTuples(result: raw) -> raw
   fn PQerrorMessage(connection: raw) -> raw
   fn PQresultErrorField(result: raw, field: i32) -> raw
   fn PQexec(connection: raw, command: raw) -> raw
   fn PQcmdStatus(result: raw) -> raw
+  fn PQsetnonblocking(connection: raw, enabled: i32) -> i32
+  fn PQflush(connection: raw) -> i32
+  fn PQconsumeInput(connection: raw) -> i32
+  fn PQisBusy(connection: raw) -> i32
+  fn PQgetResult(connection: raw) -> raw
   fn PQclear(result: raw)
 }
 
 SQLITE_OK: i32 := 0
 SQLITE_INTEGER: i32 := 1
+SQLITE_FLOAT: i32 := 2
 SQLITE_TEXT: i32 := 3
+SQLITE_BLOB: i32 := 4
 SQLITE_NULL: i32 := 5
 SQLITE_ROW: i32 := 100
 SQLITE_DONE: i32 := 101
 PGRES_TUPLES_OK: i32 := 2
 PGRES_COMMAND_OK: i32 := 1
+PGRES_EMPTY_QUERY: i32 := 0
+PGRES_BAD_RESPONSE: i32 := 5
+PGRES_NONFATAL_ERROR: i32 := 6
+PGRES_FATAL_ERROR: i32 := 7
+POSTGRES_BOOL_OID: u32 := 16
+POSTGRES_BYTEA_OID: u32 := 17
+POSTGRES_NAME_OID: u32 := 19
+POSTGRES_INT8_OID: u32 := 20
+POSTGRES_INT2_OID: u32 := 21
+POSTGRES_INT4_OID: u32 := 23
+POSTGRES_TEXT_OID: u32 := 25
+POSTGRES_FLOAT4_OID: u32 := 700
+POSTGRES_FLOAT8_OID: u32 := 701
+POSTGRES_VARCHAR_OID: u32 := 1043
+POSTGRES_WAIT_SLICE_NS: i64 := 1000000
 
 // Static statement descriptors are compiler-produced Copy values. These source declarations own
 // their public type surface; a constructor body is unreachable after descriptor lowering.
@@ -73,6 +102,28 @@ pub resource tx = pkg.db.internal.resource.drop_tx
 pub resource stmt<P, R> = pkg.db.internal.resource.drop_stmt
 pub resource rows<R> = pkg.db.internal.resource.drop_rows
 pub resource batch<R> = pkg.db.internal.resource.drop_batch
+
+pub byte_view {
+  bytes: slice<u8>,
+}
+
+pub value {
+  Null
+  Bool(bool)
+  I16(i16)
+  I32(i32)
+  I64(i64)
+  F32(f32)
+  F64(f64)
+  Text(str)
+  Bytes(byte_view)
+}
+
+pub row {
+  values: array<value>,
+}
+
+pub resource dynamic_rows = pkg.db.internal.resource.drop_dynamic_rows
 
 // All common and native execution entry points use these two sealed validators before option
 // allocation, lease acquisition, or native work. Keeping the v6 header in one owner prevents a
@@ -899,6 +950,305 @@ fn postgres_native_error(connection: raw, result: raw) -> Error {
   }
 }
 
+fn dynamic_sqlite_native_error(database: raw) -> Error {
+  unsafe {
+    primary := sqlite3_errcode(database)
+    extended := sqlite3_extended_errcode(database)
+    mut code_builder := builder()
+    code_builder.write_int(primary)
+    return Error.Connection(NativeError {
+      driver: Driver.SQLite,
+      code: Some(code_builder.to_string()),
+      extended_code: Some(extended as i64),
+      sqlstate: None,
+      message: copy_c_string(sqlite3_errmsg(database)),
+      detail: None,
+      constraint: None,
+      table: None,
+      column: None,
+    })
+  }
+}
+
+fn dynamic_postgres_detail(connection: raw, result: raw) -> NativeError {
+  unsafe {
+    mut sqlstate: Option<string> := None
+    mut message := copy_c_string(PQerrorMessage(connection))
+    mut detail: Option<string> := None
+    mut constraint: Option<string> := None
+    mut table: Option<string> := None
+    mut column: Option<string> := None
+    if !result.is_null() {
+      sqlstate = optional_c_string(PQresultErrorField(result, 67))
+      native_message := PQresultErrorField(result, 77)
+      if !native_message.is_null() { message = copy_c_string(native_message) }
+      detail = optional_c_string(PQresultErrorField(result, 68))
+      constraint = optional_c_string(PQresultErrorField(result, 110))
+      table = optional_c_string(PQresultErrorField(result, 116))
+      column = optional_c_string(PQresultErrorField(result, 99))
+    }
+    return NativeError {
+      driver: Driver.PostgreSQL,
+      code: None,
+      extended_code: None,
+      sqlstate: sqlstate,
+      message: message,
+      detail: detail,
+      constraint: constraint,
+      table: table,
+      column: column,
+    }
+  }
+}
+
+fn dynamic_postgres_sqlstate_category(pointer: raw) -> i32 {
+  unsafe {
+    if pointer.is_null() { return 0 }
+    a: u8 := raw.load(pointer, 0)
+    b: u8 := raw.load(pointer, 1)
+    c: u8 := raw.load(pointer, 2)
+    d: u8 := raw.load(pointer, 3)
+    e: u8 := raw.load(pointer, 4)
+    terminal: u8 := raw.load(pointer, 5)
+    if terminal != 0 { return 0 }
+    if a == 50 && b == 51 { return 1 }
+    if a == 52 && b == 48 && c == 48 && d == 48 && e == 49 { return 2 }
+    if a == 52 && b == 48 && c == 80 && d == 48 && e == 49 { return 3 }
+    if a == 53 && b == 55 && c == 48 && d == 49 && e == 52 { return 4 }
+    return 0
+  }
+}
+
+fn dynamic_postgres_execution_error(connection: raw, result: raw) -> Error {
+  unsafe {
+    category := if result.is_null() { 0 } else {
+      dynamic_postgres_sqlstate_category(PQresultErrorField(result, 67))
+    }
+    detail := dynamic_postgres_detail(connection, result)
+    if category == 1 { return Error.Constraint(detail) }
+    if category == 2 { return Error.Serialization(detail) }
+    if category == 3 { return Error.Deadlock(detail) }
+    if category == 4 { return Error.Cancelled(detail) }
+    return Error.Native(detail)
+  }
+}
+
+fn dynamic_postgres_connection_error(connection: raw) -> Error =
+  unsafe { Error.Connection(dynamic_postgres_detail(connection, raw.null())) }
+
+fn dynamic_postgres_timeout_error(connection: raw, result: raw) -> Error =
+  Error.Timeout(dynamic_postgres_detail(connection, result))
+
+fn dynamic_postgres_wait_ready(connection: raw, deadline: i64) -> i32 {
+  loop {
+    flushed := unsafe { PQflush(connection) }
+    if flushed < 0 { return 2 }
+    if unsafe { PQconsumeInput(connection) } == 0 { return 2 }
+    if flushed == 0 && unsafe { PQisBusy(connection) } == 0 { return 0 }
+    now := time.instant()
+    if deadline >= 0 && now >= deadline { return 1 }
+    remaining := if deadline < 0 { POSTGRES_WAIT_SLICE_NS } else { deadline - now }
+    time.sleep(if remaining < POSTGRES_WAIT_SLICE_NS {
+      remaining
+    } else { POSTGRES_WAIT_SLICE_NS })
+  }
+}
+
+fn dynamic_postgres_deadline(duration_ns: i64) -> Result<i64, Error> {
+  now := time.instant()
+  if now < 0 || duration_ns > 9223372036854775807 - now {
+    return Err(dynamic_unsupported(
+      "db.execute.timeout_ns",
+      "database execution timeout exceeds the monotonic deadline range",
+    ))
+  }
+  return Ok(now + duration_ns)
+}
+
+fn dynamic_postgres_timeout_recovery(
+  state: raw,
+  connection: raw,
+  duration_ns: i64,
+  result_out: raw,
+) -> Result<(), Error> {
+  unsafe {
+    recovery_budget := if duration_ns < POSTGRES_WAIT_SLICE_NS {
+      POSTGRES_WAIT_SLICE_NS
+    } else { duration_ns }
+    if !pkg.db.internal.resource.cancel_postgres(connection, recovery_budget) {
+      failure := dynamic_postgres_timeout_error(connection, raw.null())
+      ignored := PQsetnonblocking(connection, 0)
+      pkg.db.internal.resource.poison_conn_state(state)
+      return Err(failure)
+    }
+    now := time.instant()
+    recovery_deadline := if now < 0 || now > 9223372036854775807 - recovery_budget {
+      9223372036854775807
+    } else { now + recovery_budget }
+    if dynamic_postgres_wait_ready(connection, recovery_deadline) != 0 {
+      failure := dynamic_postgres_timeout_error(connection, raw.null())
+      ignored := PQsetnonblocking(connection, 0)
+      pkg.db.internal.resource.poison_conn_state(state)
+      return Err(failure)
+    }
+    mut retained := PQgetResult(connection)
+    loop {
+      if retained.is_null() { break }
+      status := pkg.db.internal.postgres_status.code(retained)
+      if pkg.db.internal.postgres_status.must_close(status) {
+        failure := dynamic_postgres_timeout_error(connection, retained)
+        pkg.db.internal.resource.fail_close_dynamic_postgres(retained, state)
+        return Err(failure)
+      }
+      next := PQgetResult(connection)
+      if next.is_null() { break }
+      PQclear(retained)
+      retained = next
+    }
+    if PQsetnonblocking(connection, 0) != 0 {
+      failure := dynamic_postgres_timeout_error(connection, retained)
+      if !retained.is_null() { PQclear(retained) }
+      pkg.db.internal.resource.poison_conn_state(state)
+      return Err(failure)
+    }
+    raw.store(result_out, 0, retained)
+    return Ok(())
+  }
+}
+
+// Return one ordinary classified PGresult with blocking mode restored. COPY/pipeline/unknown
+// results are returned immediately while still nonblocking so their caller can apply the stronger
+// clear-and-close edge without another connection-global native call.
+fn dynamic_postgres_execute_result(
+  state: raw,
+  connection: raw,
+  sql_pointer: raw,
+  context: raw,
+  timeout: Option<i64>,
+  result_out: raw,
+) -> Result<(), Error> {
+  return match timeout {
+    None => unsafe {
+      result := pkg.db.internal.dynamic_postgres_exec_params(connection, sql_pointer, context)
+      if result.is_null() {
+        failure := dynamic_postgres_connection_error(connection)
+        pkg.db.internal.resource.poison_conn_state(state)
+        return Err(failure)
+      }
+      raw.store(result_out, 0, result)
+      Ok(())
+    }
+    Some(duration_ns) => unsafe {
+      deadline_result := dynamic_postgres_deadline(duration_ns)
+      deadline := match deadline_result {
+        Err(failure) => {
+          ignored := pkg.db.internal.resource.finish_dynamic_native(
+            2, raw.null(), state, false,
+          )
+          return Err(failure)
+        }
+        Ok(value) => value
+      }
+      if PQsetnonblocking(connection, 1) != 0 {
+        failure := dynamic_postgres_connection_error(connection)
+        ignored := pkg.db.internal.resource.finish_dynamic_native(2, raw.null(), state, false)
+        return Err(failure)
+      }
+      if time.instant() >= deadline {
+        failure := dynamic_postgres_timeout_error(connection, raw.null())
+        if PQsetnonblocking(connection, 0) != 0 {
+          pkg.db.internal.resource.poison_conn_state(state)
+        } else {
+          ignored := pkg.db.internal.resource.finish_dynamic_native(2, raw.null(), state, false)
+        }
+        return Err(failure)
+      }
+      if pkg.db.internal.dynamic_postgres_send_params(connection, sql_pointer, context) == 0 {
+        failure := dynamic_postgres_connection_error(connection)
+        if PQsetnonblocking(connection, 0) != 0 {
+          pkg.db.internal.resource.poison_conn_state(state)
+        } else {
+          ignored := pkg.db.internal.resource.finish_dynamic_native(2, raw.null(), state, false)
+        }
+        return Err(failure)
+      }
+      ready := dynamic_postgres_wait_ready(connection, deadline)
+      if ready == 2 {
+        failure := dynamic_postgres_connection_error(connection)
+        ignored := PQsetnonblocking(connection, 0)
+        pkg.db.internal.resource.poison_conn_state(state)
+        return Err(failure)
+      }
+      if ready == 1 {
+        recovered := dynamic_postgres_timeout_recovery(
+          state, connection, duration_ns, result_out,
+        )
+        return match recovered {
+          Err(failure) => Err(failure)
+          Ok(_) => {
+            result: raw := raw.load(result_out, 0)
+            failure := dynamic_postgres_timeout_error(connection, result)
+            cleanup := pkg.db.internal.resource.finish_dynamic_native(
+              2, result, state, false,
+            )
+            if cleanup != 0 { return Err(failure) }
+            Err(failure)
+          }
+        }
+      }
+      result := PQgetResult(connection)
+      if result.is_null() {
+        failure := dynamic_postgres_connection_error(connection)
+        ignored := PQsetnonblocking(connection, 0)
+        pkg.db.internal.resource.poison_conn_state(state)
+        return Err(failure)
+      }
+      status := pkg.db.internal.postgres_status.code(result)
+      if pkg.db.internal.postgres_status.must_close(status) {
+        raw.store(result_out, 0, result)
+        raw.store(result_out, 8, status)
+        raw.store(result_out, 12, 1 as u8)
+        return Ok(())
+      }
+      extra := PQgetResult(connection)
+      if !extra.is_null() {
+        failure := dynamic_invalid(
+          "db.dynamic.statement",
+          "dynamic SQL must contain exactly one statement",
+        )
+        PQclear(result)
+        mut current := extra
+        loop {
+          current_status := pkg.db.internal.postgres_status.code(current)
+          if pkg.db.internal.postgres_status.must_close(current_status) {
+            pkg.db.internal.resource.fail_close_dynamic_postgres(current, state)
+            return Err(failure)
+          }
+          PQclear(current)
+          current = PQgetResult(connection)
+          if current.is_null() { break }
+        }
+        if PQsetnonblocking(connection, 0) != 0 {
+          pkg.db.internal.resource.poison_conn_state(state)
+        } else {
+          ignored := pkg.db.internal.resource.finish_dynamic_native(2, raw.null(), state, true)
+        }
+        return Err(failure)
+      }
+      if PQsetnonblocking(connection, 0) != 0 {
+        failure := dynamic_postgres_connection_error(connection)
+        PQclear(result)
+        pkg.db.internal.resource.poison_conn_state(state)
+        return Err(failure)
+      }
+      raw.store(result_out, 0, result)
+      raw.store(result_out, 8, status)
+      raw.store(result_out, 12, 1 as u8)
+      Ok(())
+    }
+  }
+}
+
 fn postgres_cursor_shape(item: str) -> Error = Error.Decode(ContractError {
   query_id: None,
   item: item.clone(),
@@ -1279,6 +1629,354 @@ pub fn execute_options_valid(
     i = i + 1
   }
   return Ok(timeout)
+}
+
+fn dynamic_unsupported(item: str, message: str) -> Error = Error.Unsupported(ContractError {
+  query_id: None,
+  item: item.clone(),
+  message: message.clone(),
+})
+
+fn dynamic_invalid(item: str, message: str) -> Error = Error.InvalidQuery(ContractError {
+  query_id: None,
+  item: item.clone(),
+  message: message.clone(),
+})
+
+fn dynamic_encode(item: str, message: str) -> Error = Error.Encode(ContractError {
+  query_id: None,
+  item: item.clone(),
+  message: message.clone(),
+})
+
+fn dynamic_decode(item: str, message: str) -> Error = Error.Decode(ContractError {
+  query_id: None,
+  item: item.clone(),
+  message: message.clone(),
+})
+
+fn dynamic_driver_mismatch() -> Error = Error.DriverMismatch(ContractError {
+  query_id: None,
+  item: "db.dynamic.driver".clone(),
+  message: "dynamic SQL driver does not match the execution handle".clone(),
+})
+
+fn dynamic_state_error() -> Error = dynamic_invalid(
+  "db.dynamic.rows.state",
+  "invalid or failed dynamic database rows resource",
+)
+
+fn dynamic_parameter_error() -> Error = dynamic_encode(
+  "db.dynamic.parameter",
+  "dynamic SQL parameters exceed the supported native representation",
+)
+
+fn dynamic_cleanup_error(rows_operation: bool) -> Error = dynamic_unsupported(
+  if rows_operation { "db.dynamic.rows.cleanup" } else { "db.dynamic.execute.cleanup" },
+  if rows_operation {
+    "dynamic database rows cleanup failed and the connection was closed"
+  } else {
+    "dynamic database execution cleanup failed and the connection was closed"
+  },
+)
+
+fn dynamic_driver_value(driver: Driver) -> u8 = match driver {
+  SQLite => 1
+  PostgreSQL => 2
+}
+
+fn dynamic_options_valid(
+  options: slice<ExecuteOption>,
+  driver: u8,
+) -> Result<Option<i64>, Error> {
+  mut timeout: Option<i64> := None
+  mut i := 0
+  loop {
+    if i >= options.len() { break }
+    match options[i] {
+      TimeoutNs(ns) => {
+        if ns <= 0 {
+          return Err(dynamic_unsupported(
+            "db.execute.timeout_ns",
+            "database execution timeout must be positive",
+          ))
+        }
+        match timeout {
+          Some(_) => {
+            return Err(dynamic_unsupported(
+              "db.execute.timeout_ns",
+              "duplicate database execution timeout",
+            ))
+          }
+          None => { timeout = Some(ns) }
+        }
+      }
+    }
+    i = i + 1
+  }
+  if driver == 1 {
+    match timeout {
+      Some(_) => {
+        return Err(dynamic_unsupported(
+          "db.execute.timeout_ns",
+          "SQLite does not support common execution deadlines",
+        ))
+      }
+      None => {}
+    }
+  }
+  return Ok(timeout)
+}
+
+fn dynamic_payload_length(parameter: value, driver: u8) -> Result<i64, Error> {
+  return match parameter {
+    Null => Ok(0)
+    Bool(_) => Ok(if driver == 2 { 1 } else { 0 })
+    I16(_) => Ok(if driver == 2 { 2 } else { 0 })
+    I32(_) => Ok(if driver == 2 { 4 } else { 0 })
+    I64(_) => Ok(if driver == 2 { 8 } else { 0 })
+    F32(actual) => {
+      if driver == 1 && pkg.db.internal.dynamic_f32_is_nan(actual) {
+        return Err(dynamic_encode(
+          "db.dynamic.parameter",
+          "SQLite dynamic floating parameter must not be NaN",
+        ))
+      }
+      Ok(if driver == 2 { 4 } else { 0 })
+    }
+    F64(actual) => {
+      if driver == 1 && pkg.db.internal.dynamic_f64_is_nan(actual) {
+        return Err(dynamic_encode(
+          "db.dynamic.parameter",
+          "SQLite dynamic floating parameter must not be NaN",
+        ))
+      }
+      Ok(if driver == 2 { 8 } else { 0 })
+    }
+    Text(actual) => {
+      if actual.len() > 2147483647 { return Err(dynamic_parameter_error()) }
+      if driver == 2 && contains_nul(actual) {
+        return Err(dynamic_encode(
+          "db.dynamic.parameter",
+          "PostgreSQL dynamic text parameter contains U+0000",
+        ))
+      }
+      Ok(if driver == 2 { actual.len() } else { 0 })
+    }
+    Bytes(view) => {
+      if view.bytes.len() > 2147483647 { return Err(dynamic_parameter_error()) }
+      Ok(if driver == 2 { view.bytes.len() } else { 0 })
+    }
+  }
+}
+
+fn release_dynamic_lease(state: raw) {
+  unsafe {
+    if pkg.db.internal.resource.conn_live(state) { raw.store(state, 20, 0 as u8) }
+  }
+}
+
+fn dynamic_request(
+  target: exec,
+  requested_driver: Driver,
+  sql: str,
+  params: slice<value>,
+  options: slice<ExecuteOption>,
+) -> Result<Option<i64>, Error> {
+  unsafe {
+    // Phases 1--4 are deliberately complete before the one-active-execution lease is touched.
+    state := execution_state(target)
+    if state.is_null() {
+      return Err(dynamic_unsupported(
+        "db.dynamic.exec",
+        "dynamic SQL requires an idle live connection or active transaction",
+      ))
+    }
+    actual_driver: u8 := raw.load(state, 4)
+    driver := dynamic_driver_value(requested_driver)
+    if driver != actual_driver { return Err(dynamic_driver_mismatch()) }
+    if sql.len() > 2147483646 {
+      return Err(dynamic_unsupported(
+        "db.dynamic.sql",
+        "dynamic SQL exceeds the supported native length range",
+      ))
+    }
+    if contains_nul(sql) {
+      return Err(dynamic_encode("db.dynamic.sql", "dynamic SQL contains U+0000"))
+    }
+    if params.len() > 65535 {
+      return Err(dynamic_unsupported(
+        "db.dynamic.parameters",
+        "dynamic SQL supports at most 65535 parameters",
+      ))
+    }
+    timeout := dynamic_options_valid(options, driver)?
+
+    active: u8 := raw.load(state, 20)
+    if active != 0 {
+      return Err(dynamic_unsupported(
+        if driver == 1 {
+          "sqlite.connection.active_execution"
+        } else { "postgres.connection.active_execution" },
+        if driver == 1 {
+          "SQLite connection already has an active execution"
+        } else { "PostgreSQL connection already has an active execution" },
+      ))
+    }
+    raw.store(state, 20, 1 as u8)
+
+    mut payload: i64 := 0
+    mut i := 0
+    loop {
+      if i >= params.len() { break }
+      measured := dynamic_payload_length(params[i], driver)
+      match measured {
+        Err(failure) => {
+          release_dynamic_lease(state)
+          return Err(failure)
+        }
+        Ok(length) => { payload = payload + length }
+      }
+      i = i + 1
+    }
+
+    mut bind_budget: i64 := -1
+    if driver == 2 {
+      count := params.len()
+      query_bytes := sql.len() + 1
+      parse_length := 7 + query_bytes + 4 * count
+      fixed_bind := 14 + 6 * count
+      bind_budget = 2147483647 - fixed_bind
+      if parse_length > 2147483647 || fixed_bind > 2147483647 || payload > bind_budget {
+        release_dynamic_lease(state)
+        return Err(dynamic_parameter_error())
+      }
+    }
+    return Ok(timeout)
+  }
+}
+
+fn dynamic_postgres_set_type(context: raw, ordinal: u32, parameter: value) -> i32 {
+  return match parameter {
+    Null => {
+      if pkg.db.internal.set_postgres_parameter_format_v1(context, ordinal, 0) { 0 } else { 1 }
+    }
+    Bool(_) => pkg.db.internal.set_postgres_type_v2(context, ordinal, "bool")
+    I16(_) => pkg.db.internal.set_postgres_type_v2(context, ordinal, "int2")
+    I32(_) => pkg.db.internal.set_postgres_type_v2(context, ordinal, "int4")
+    I64(_) => pkg.db.internal.set_postgres_type_v2(context, ordinal, "int8")
+    F32(_) => pkg.db.internal.set_postgres_type_v2(context, ordinal, "float4")
+    F64(_) => pkg.db.internal.set_postgres_type_v2(context, ordinal, "float8")
+    Text(_) => pkg.db.internal.set_postgres_type_v2(context, ordinal, "text")
+    Bytes(_) => pkg.db.internal.set_postgres_type_v2(context, ordinal, "bytea")
+  }
+}
+
+fn dynamic_postgres_measure(context: raw, ordinal: u32, parameter: value) -> i32 {
+  return match parameter {
+    Null => pkg.db.internal.measure_bool_v1(context, ordinal, None)
+    Bool(actual) => pkg.db.internal.measure_bool_v1(context, ordinal, Some(actual))
+    I16(actual) => pkg.db.internal.measure_i16_v1(context, ordinal, Some(actual))
+    I32(actual) => pkg.db.internal.measure_i32_v1(context, ordinal, Some(actual))
+    I64(actual) => pkg.db.internal.measure_i64_v1(context, ordinal, Some(actual))
+    F32(actual) => pkg.db.internal.measure_f32_v1(context, ordinal, Some(actual))
+    F64(actual) => pkg.db.internal.measure_f64_v1(context, ordinal, Some(actual))
+    Text(actual) => pkg.db.internal.measure_text_v1(context, ordinal, Some(actual))
+    Bytes(view) => pkg.db.internal.measure_bytes_v1(context, ordinal, Some(view.bytes))
+  }
+}
+
+fn dynamic_postgres_bind(context: raw, ordinal: u32, parameter: value) -> i32 {
+  return match parameter {
+    Null => pkg.db.internal.bind_bool_v2(context, ordinal, None)
+    Bool(actual) => pkg.db.internal.bind_bool_v2(context, ordinal, Some(actual))
+    I16(actual) => pkg.db.internal.bind_i16_v2(context, ordinal, Some(actual))
+    I32(actual) => pkg.db.internal.bind_i32_v2(context, ordinal, Some(actual))
+    I64(actual) => pkg.db.internal.bind_i64_v2(context, ordinal, Some(actual))
+    F32(actual) => pkg.db.internal.bind_f32_v2(context, ordinal, Some(actual))
+    F64(actual) => pkg.db.internal.bind_f64_v2(context, ordinal, Some(actual))
+    Text(actual) => pkg.db.internal.bind_text_v2(context, ordinal, Some(actual))
+    Bytes(view) => pkg.db.internal.bind_bytes_v2(context, ordinal, Some(view.bytes))
+  }
+}
+
+fn dynamic_postgres_context(
+  connection: raw,
+  params: slice<value>,
+  bind_budget: i64,
+) -> raw {
+  unsafe {
+    context := pkg.db.internal.new_dynamic_postgres_context(connection, params.len() as u32)
+    if context.is_null() { return raw.null() }
+    mut i := 0
+    loop {
+      if i >= params.len() { break }
+      ordinal := (i + 1) as u32
+      if dynamic_postgres_set_type(context, ordinal, params[i]) != 0 {
+        pkg.db.internal.free_dynamic_postgres_context(context)
+        return raw.null()
+      }
+      match params[i] {
+        Null => {}
+        _ => {
+          if !pkg.db.internal.set_postgres_parameter_format_v1(context, ordinal, 1) {
+            pkg.db.internal.free_dynamic_postgres_context(context)
+            return raw.null()
+          }
+        }
+      }
+      i = i + 1
+    }
+    if !pkg.db.internal.begin_postgres_measure_v1(context, bind_budget) {
+      pkg.db.internal.free_dynamic_postgres_context(context)
+      return raw.null()
+    }
+    i = 0
+    loop {
+      if i >= params.len() { break }
+      if dynamic_postgres_measure(context, (i + 1) as u32, params[i]) != 0 {
+        pkg.db.internal.free_dynamic_postgres_context(context)
+        return raw.null()
+      }
+      i = i + 1
+    }
+    if !pkg.db.internal.finish_postgres_measure_v1(context) {
+      pkg.db.internal.free_dynamic_postgres_context(context)
+      return raw.null()
+    }
+    i = 0
+    loop {
+      if i >= params.len() { break }
+      if dynamic_postgres_bind(context, (i + 1) as u32, params[i]) != 0 {
+        pkg.db.internal.free_dynamic_postgres_context(context)
+        return raw.null()
+      }
+      i = i + 1
+    }
+    return context
+  }
+}
+
+fn dynamic_sqlite_bind(statement: raw, params: slice<value>) -> Result<(), i32> {
+  mut i := 0
+  loop {
+    if i >= params.len() { break }
+    ordinal := (i + 1) as i32
+    status := match params[i] {
+      Null => pkg.db.internal.dynamic_sqlite_bind_null(statement, ordinal)
+      Bool(actual) => pkg.db.internal.dynamic_sqlite_bind_bool(statement, ordinal, actual)
+      I16(actual) => pkg.db.internal.dynamic_sqlite_bind_i64(statement, ordinal, actual as i64)
+      I32(actual) => pkg.db.internal.dynamic_sqlite_bind_i64(statement, ordinal, actual as i64)
+      I64(actual) => pkg.db.internal.dynamic_sqlite_bind_i64(statement, ordinal, actual)
+      F32(actual) => pkg.db.internal.dynamic_sqlite_bind_f64(statement, ordinal, actual as f64)
+      F64(actual) => pkg.db.internal.dynamic_sqlite_bind_f64(statement, ordinal, actual)
+      Text(actual) => pkg.db.internal.dynamic_sqlite_bind_text(statement, ordinal, actual)
+      Bytes(view) => pkg.db.internal.dynamic_sqlite_bind_bytes(statement, ordinal, view.bytes)
+    }
+    if status != SQLITE_OK { return Err(status) }
+    i = i + 1
+  }
+  return Ok(())
 }
 
 fn sqlite_meta_database(
@@ -3196,6 +3894,735 @@ pub fn unsupported<T>(query_id: str) -> Result<T, Error> {
     item: "db.execute.driver".clone(),
     message: "no native database driver is available in this compilation unit".clone(),
   }))
+}
+
+fn dynamic_rows_resource(target: exec, wrapper: raw) -> dynamic_rows {
+  unsafe {
+    return match target {
+      Conn(reference) => resource.from_raw_borrowed(wrapper, reference)
+      Tx(reference) => resource.from_raw_borrowed(wrapper, reference)
+    }
+  }
+}
+
+fn dynamic_sqlite_statement(
+  state: raw,
+  sql: str,
+  params: slice<value>,
+  want_rows: bool,
+  result_out: raw,
+) -> Result<(), Error> {
+  unsafe {
+    database: raw := raw.load(state, 8)
+    sql_pointer := c_string(sql)
+    statement_out := raw.alloc(8)
+    tail_out := raw.alloc(8)
+    raw.store(statement_out, 0, raw.null())
+    raw.store(tail_out, 0, raw.null())
+    prepare_status := sqlite3_prepare_v2(
+      database,
+      sql_pointer,
+      (sql.len() + 1) as i32,
+      statement_out,
+      tail_out,
+    )
+    statement: raw := raw.load(statement_out, 0)
+    tail: raw := raw.load(tail_out, 0)
+    raw.free(statement_out)
+    raw.free(tail_out)
+    if prepare_status != SQLITE_OK {
+      failure := dynamic_sqlite_native_error(database)
+      ignored := pkg.db.internal.resource.finish_dynamic_native(
+        1, statement, state, false,
+      )
+      raw.free(sql_pointer)
+      return Err(failure)
+    }
+    if statement.is_null() {
+      failure := dynamic_invalid(
+        "db.dynamic.statement",
+        "dynamic SQL must contain exactly one statement",
+      )
+      ignored := pkg.db.internal.resource.finish_dynamic_native(
+        1, raw.null(), state, true,
+      )
+      raw.free(sql_pointer)
+      return Err(failure)
+    }
+    if !pkg.db.internal.dynamic_sqlite_tail_empty(tail) {
+      failure := dynamic_invalid(
+        "db.dynamic.statement",
+        "dynamic SQL must contain exactly one statement",
+      )
+      ignored := pkg.db.internal.resource.finish_dynamic_native(1, statement, state, true)
+      raw.free(sql_pointer)
+      return Err(failure)
+    }
+    raw.free(sql_pointer)
+    if sqlite3_bind_parameter_count(statement) != params.len() as i32 {
+      failure := dynamic_invalid(
+        "db.dynamic.parameters",
+        "dynamic SQL parameter count does not match the statement",
+      )
+      ignored := pkg.db.internal.resource.finish_dynamic_native(1, statement, state, true)
+      return Err(failure)
+    }
+    columns := sqlite3_column_count(statement)
+    if columns < 0 {
+      failure := dynamic_sqlite_native_error(database)
+      ignored := pkg.db.internal.resource.finish_dynamic_native(1, statement, state, false)
+      return Err(failure)
+    }
+    if want_rows && columns == 0 {
+      failure := dynamic_invalid(
+        "db.dynamic.rows",
+        "dynamic rows requires a row-producing statement",
+      )
+      ignored := pkg.db.internal.resource.finish_dynamic_native(1, statement, state, true)
+      return Err(failure)
+    }
+    if !want_rows && columns != 0 {
+      failure := dynamic_invalid(
+        "db.dynamic.execute",
+        "dynamic execute must not produce rows",
+      )
+      ignored := pkg.db.internal.resource.finish_dynamic_native(1, statement, state, true)
+      return Err(failure)
+    }
+    bound := dynamic_sqlite_bind(statement, params)
+    match bound {
+      Err(_) => {
+        failure := dynamic_sqlite_native_error(database)
+        ignored := pkg.db.internal.resource.finish_dynamic_native(1, statement, state, false)
+        return Err(failure)
+      }
+      Ok(_) => {
+        raw.store(result_out, 0, statement)
+        return Ok(())
+      }
+    }
+  }
+}
+
+fn dynamic_postgres_result(
+  state: raw,
+  timeout: Option<i64>,
+  bind_budget: i64,
+  sql: str,
+  params: slice<value>,
+  result_out: raw,
+) -> Result<(), Error> {
+  unsafe {
+    connection: raw := raw.load(state, 8)
+    context := dynamic_postgres_context(connection, params, bind_budget)
+    if context.is_null() {
+      release_dynamic_lease(state)
+      return Err(dynamic_parameter_error())
+    }
+    sql_pointer := c_string(sql)
+    executed := dynamic_postgres_execute_result(
+      state, connection, sql_pointer, context, timeout, result_out,
+    )
+    raw.free(sql_pointer)
+    pkg.db.internal.free_dynamic_postgres_context(context)
+    return executed
+  }
+}
+
+fn dynamic_postgres_status_error(connection: raw, result: raw, status: i32) -> Error {
+  if status == PGRES_EMPTY_QUERY {
+    return dynamic_invalid(
+      "db.dynamic.statement",
+      "dynamic SQL must contain exactly one statement",
+    )
+  }
+  return dynamic_postgres_execution_error(connection, result)
+}
+
+fn dynamic_postgres_status_clean(status: i32) -> bool =
+  status == PGRES_EMPTY_QUERY || status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK
+
+fn dynamic_postgres_check_status(
+  state: raw,
+  result: raw,
+  rows_operation: bool,
+  known_status: Option<i32>,
+) -> Result<i32, Error> {
+  unsafe {
+    connection: raw := raw.load(state, 8)
+    status := match known_status {
+      Some(value) => value
+      None => pkg.db.internal.postgres_status.code(result)
+    }
+    if pkg.db.internal.postgres_status.must_close(status) {
+      failure := dynamic_postgres_execution_error(connection, result)
+      pkg.db.internal.resource.fail_close_dynamic_postgres(result, state)
+      return Err(failure)
+    }
+    mut prior: Option<Error> := None
+    if status != PGRES_EMPTY_QUERY && status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK {
+      prior = Some(dynamic_postgres_status_error(connection, result, status))
+    }
+    if !pkg.db.internal.resource.postgres_dynamic_synchronized(
+      state, dynamic_postgres_status_clean(status),
+    ) {
+      pkg.db.internal.resource.fail_close_dynamic_postgres(result, state)
+      return match prior {
+        Some(failure) => Err(failure)
+        None => Err(dynamic_cleanup_error(rows_operation))
+      }
+    }
+    return match prior {
+      Some(failure) => {
+        ignored := pkg.db.internal.resource.finish_dynamic_postgres_proved(result, state)
+        Err(failure)
+      }
+      None => Ok(status)
+    }
+  }
+}
+
+fn dynamic_postgres_metadata(result: raw, shape_out: raw) -> Result<(), Error> {
+  unsafe {
+    columns := PQnfields(result)
+    if columns < 0 {
+      return Err(dynamic_decode(
+        "db.dynamic.value",
+        "database dynamic value has an invalid native representation",
+      ))
+    }
+    mut column: i32 := 0
+    loop {
+      if column >= columns { break }
+      oid := PQftype(result, column)
+      format := PQfformat(result, column)
+      supported := oid == POSTGRES_BOOL_OID || oid == POSTGRES_BYTEA_OID
+        || oid == POSTGRES_NAME_OID || oid == POSTGRES_INT8_OID
+        || oid == POSTGRES_INT2_OID || oid == POSTGRES_INT4_OID
+        || oid == POSTGRES_TEXT_OID || oid == POSTGRES_FLOAT4_OID
+        || oid == POSTGRES_FLOAT8_OID || oid == POSTGRES_VARCHAR_OID
+      if !supported || format != 1 {
+        return Err(dynamic_decode(
+          "db.dynamic.value",
+          "database dynamic value has an unsupported native type",
+        ))
+      }
+      column = column + 1
+    }
+    rows := PQntuples(result)
+    if rows < 0 {
+      return Err(dynamic_decode(
+        "db.dynamic.value",
+        "database dynamic value has an invalid native representation",
+      ))
+    }
+    if columns != 0 && (rows as i64) > 9223372036854775807 / (columns as i64) {
+      return Err(dynamic_unsupported(
+        "db.dynamic.result",
+        "dynamic SQL result exceeds the supported address range",
+      ))
+    }
+    raw.store(shape_out, 0, rows as i64)
+    raw.store(shape_out, 8, columns as i64)
+    return Ok(())
+  }
+}
+
+fn dynamic_postgres_affected(pointer: raw) -> Result<Option<i64>, Error> {
+  unsafe {
+    if pointer.is_null() {
+      return Err(dynamic_decode(
+        "db.dynamic.value",
+        "database dynamic value has an invalid native representation",
+      ))
+    }
+    first: u8 := raw.load(pointer, 0)
+    if first == 0 { return Ok(None) }
+    mut value: i64 := 0
+    mut i: i64 := 0
+    loop {
+      byte: u8 := raw.load(pointer, i)
+      if byte == 0 { break }
+      if byte < 48 || byte > 57 {
+        return Err(dynamic_decode(
+          "db.dynamic.value",
+          "database dynamic value has an invalid native representation",
+        ))
+      }
+      digit := (byte - 48) as i64
+      if value > (9223372036854775807 - digit) / 10 {
+        return Err(dynamic_unsupported(
+          "db.dynamic.result",
+          "dynamic SQL result exceeds the supported address range",
+        ))
+      }
+      value = value * 10 + digit
+      i = i + 1
+    }
+    return Ok(Some(value))
+  }
+}
+
+pub fn dynamic_execute(
+  target: exec,
+  driver: Driver,
+  sql: str,
+  params: slice<value>,
+  options: slice<ExecuteOption>,
+) -> Result<exec_result, Error> {
+  timeout := dynamic_request(target, driver, sql, params, options)?
+  unsafe {
+    state := execution_state(target)
+    selected_driver := dynamic_driver_value(driver)
+    if selected_driver == 1 {
+      statement_out := raw.alloc(8)
+      raw.store(statement_out, 0, raw.null())
+      started := dynamic_sqlite_statement(state, sql, params, false, statement_out)
+      match started {
+        Err(failure) => {
+          raw.free(statement_out)
+          return Err(failure)
+        }
+        Ok(_) => {}
+      }
+      statement: raw := raw.load(statement_out, 0)
+      raw.free(statement_out)
+      database: raw := raw.load(state, 8)
+      status := sqlite3_step(statement)
+      if status != SQLITE_DONE {
+        failure := if status == SQLITE_ROW {
+          dynamic_invalid(
+            "db.dynamic.execute",
+            "dynamic execute must not produce rows",
+          )
+        } else { dynamic_sqlite_native_error(database) }
+        ignored := pkg.db.internal.resource.finish_dynamic_native(
+          1, statement, state, status == SQLITE_ROW,
+        )
+        return Err(failure)
+      }
+      cleanup := pkg.db.internal.resource.finish_dynamic_native(1, statement, state, true)
+      if cleanup != 0 { return Err(dynamic_cleanup_error(false)) }
+      return Ok(exec_result { rows_affected: None })
+    }
+
+    bind_budget := 2147483647 - (14 + 6 * params.len())
+    result_out := raw.alloc(16)
+    raw.store(result_out, 0, raw.null())
+    raw.store(result_out, 8, 0 as i32)
+    raw.store(result_out, 12, 0 as u8)
+    executed := dynamic_postgres_result(
+      state, timeout, bind_budget, sql, params, result_out,
+    )
+    match executed {
+      Err(failure) => {
+        raw.free(result_out)
+        return Err(failure)
+      }
+      Ok(_) => {}
+    }
+    result: raw := raw.load(result_out, 0)
+    status_known: u8 := raw.load(result_out, 12)
+    observed_status: i32 := raw.load(result_out, 8)
+    known_status: Option<i32> := if status_known == 1 {
+      Some(observed_status)
+    } else { None }
+    raw.free(result_out)
+    status_result := dynamic_postgres_check_status(state, result, false, known_status)
+    status := match status_result {
+      Err(failure) => { return Err(failure) }
+      Ok(value) => value
+    }
+    if status == PGRES_EMPTY_QUERY {
+      failure := dynamic_invalid(
+        "db.dynamic.statement",
+        "dynamic SQL must contain exactly one statement",
+      )
+      ignored := pkg.db.internal.resource.finish_dynamic_postgres_proved(result, state)
+      return Err(failure)
+    }
+    if status != PGRES_COMMAND_OK {
+      failure := dynamic_invalid(
+        "db.dynamic.execute",
+        "dynamic execute must not produce rows",
+      )
+      ignored := pkg.db.internal.resource.finish_dynamic_postgres_proved(result, state)
+      return Err(failure)
+    }
+    affected_result := dynamic_postgres_affected(PQcmdTuples(result))
+    affected := match affected_result {
+      Err(failure) => {
+        ignored := pkg.db.internal.resource.finish_dynamic_postgres_proved(result, state)
+        return Err(failure)
+      }
+      Ok(value) => value
+    }
+    cleanup := pkg.db.internal.resource.finish_dynamic_postgres_proved(result, state)
+    if cleanup != 0 { return Err(dynamic_cleanup_error(false)) }
+    return Ok(exec_result { rows_affected: affected })
+  }
+}
+
+pub fn dynamic_rows(
+  target: exec,
+  driver: Driver,
+  sql: str,
+  params: slice<value>,
+  options: slice<ExecuteOption>,
+) -> Result<dynamic_rows, Error> {
+  timeout := dynamic_request(target, driver, sql, params, options)?
+  unsafe {
+    state := execution_state(target)
+    selected_driver := dynamic_driver_value(driver)
+    if selected_driver == 1 {
+      statement_out := raw.alloc(8)
+      raw.store(statement_out, 0, raw.null())
+      started := dynamic_sqlite_statement(state, sql, params, true, statement_out)
+      match started {
+        Err(failure) => {
+          raw.free(statement_out)
+          return Err(failure)
+        }
+        Ok(_) => {}
+      }
+      statement: raw := raw.load(statement_out, 0)
+      raw.free(statement_out)
+      columns := sqlite3_column_count(statement)
+      wrapper := pkg.db.internal.resource.new_dynamic_rows_state(
+        1, statement, state, 0, -1, columns as i64,
+      )
+      if pkg.db.internal.resource.checkpoint_dynamic_sqlite(wrapper) != 0 {
+        raw.free(wrapper)
+        return Err(dynamic_cleanup_error(true))
+      }
+      return Ok(dynamic_rows_resource(target, wrapper))
+    }
+
+    bind_budget := 2147483647 - (14 + 6 * params.len())
+    result_out := raw.alloc(16)
+    raw.store(result_out, 0, raw.null())
+    raw.store(result_out, 8, 0 as i32)
+    raw.store(result_out, 12, 0 as u8)
+    executed := dynamic_postgres_result(
+      state, timeout, bind_budget, sql, params, result_out,
+    )
+    match executed {
+      Err(failure) => {
+        raw.free(result_out)
+        return Err(failure)
+      }
+      Ok(_) => {}
+    }
+    result: raw := raw.load(result_out, 0)
+    status_known: u8 := raw.load(result_out, 12)
+    observed_status: i32 := raw.load(result_out, 8)
+    known_status: Option<i32> := if status_known == 1 {
+      Some(observed_status)
+    } else { None }
+    raw.free(result_out)
+    status_result := dynamic_postgres_check_status(state, result, true, known_status)
+    status := match status_result {
+      Err(failure) => { return Err(failure) }
+      Ok(value) => value
+    }
+    if status == PGRES_EMPTY_QUERY {
+      failure := dynamic_invalid(
+        "db.dynamic.statement",
+        "dynamic SQL must contain exactly one statement",
+      )
+      ignored := pkg.db.internal.resource.finish_dynamic_postgres_proved(result, state)
+      return Err(failure)
+    }
+    if status != PGRES_TUPLES_OK {
+      failure := dynamic_invalid(
+        "db.dynamic.rows",
+        "dynamic rows requires a row-producing statement",
+      )
+      ignored := pkg.db.internal.resource.finish_dynamic_postgres_proved(result, state)
+      return Err(failure)
+    }
+    shape_out := raw.alloc(16)
+    raw.store(shape_out, 0, 0 as i64)
+    raw.store(shape_out, 8, 0 as i64)
+    shape_result := dynamic_postgres_metadata(result, shape_out)
+    match shape_result {
+      Err(failure) => {
+        raw.free(shape_out)
+        ignored := pkg.db.internal.resource.finish_dynamic_postgres_proved(result, state)
+        return Err(failure)
+      }
+      Ok(_) => {}
+    }
+    row_count: i64 := raw.load(shape_out, 0)
+    column_count: i64 := raw.load(shape_out, 8)
+    raw.free(shape_out)
+    if row_count == 0 {
+      cleanup := pkg.db.internal.resource.finish_dynamic_postgres_proved(result, state)
+      if cleanup != 0 { return Err(dynamic_cleanup_error(true)) }
+      wrapper := pkg.db.internal.resource.new_dynamic_rows_terminal(2, 1)
+      return Ok(dynamic_rows_resource(target, wrapper))
+    }
+    wrapper := pkg.db.internal.resource.new_dynamic_rows_state(
+      2, result, state, 0, row_count, column_count,
+    )
+    return Ok(dynamic_rows_resource(target, wrapper))
+  }
+}
+
+fn dynamic_invalid_representation() -> Error = dynamic_decode(
+  "db.dynamic.value",
+  "database dynamic value has an invalid native representation",
+)
+
+fn dynamic_unsupported_type() -> Error = dynamic_decode(
+  "db.dynamic.value",
+  "database dynamic value has an unsupported native type",
+)
+
+fn dynamic_result_range() -> Error = dynamic_unsupported(
+  "db.dynamic.result",
+  "dynamic SQL result exceeds the supported address range",
+)
+
+fn dynamic_sqlite_cell(
+  reference: resource_ref<dynamic_rows>,
+  statement: raw,
+  database: raw,
+  column: i32,
+  out: region,
+  borrow mut values: array_builder<value>,
+) -> Result<(), Error> {
+  unsafe {
+    kind := sqlite3_column_type(statement, column)
+    if kind == SQLITE_NULL {
+      values.push(value.Null)
+      return Ok(())
+    }
+    if kind == SQLITE_INTEGER {
+      values.push(value.I64(sqlite3_column_int64(statement, column)))
+      return Ok(())
+    }
+    if kind == SQLITE_FLOAT {
+      actual := sqlite3_column_double(statement, column)
+      if pkg.db.internal.dynamic_f64_is_nan(actual) {
+        return Err(dynamic_invalid_representation())
+      }
+      values.push(value.F64(actual))
+      return Ok(())
+    }
+    if kind == SQLITE_TEXT {
+      pointer := sqlite3_column_text(statement, column)
+      length := sqlite3_column_bytes(statement, column)
+      error_state := sqlite3_errcode(database)
+      if error_state != SQLITE_OK && error_state != SQLITE_ROW {
+        return Err(dynamic_sqlite_native_error(database))
+      }
+      if pointer.is_null() || length < 0 { return Err(dynamic_invalid_representation()) }
+      view: str := resource.view_from_raw(reference, pointer, length as i64) else {
+        return Err(dynamic_invalid_representation())
+      }
+      values.push(value.Text(view.clone_in(out)))
+      return Ok(())
+    }
+    if kind == SQLITE_BLOB {
+      pointer := sqlite3_column_blob(statement, column)
+      length := sqlite3_column_bytes(statement, column)
+      error_state := sqlite3_errcode(database)
+      if error_state != SQLITE_OK && error_state != SQLITE_ROW {
+        return Err(dynamic_sqlite_native_error(database))
+      }
+      if length < 0 || (pointer.is_null() && length != 0) {
+        return Err(dynamic_invalid_representation())
+      }
+      view: slice<u8> := resource.view_from_raw(reference, pointer, length as i64) else {
+        return Err(dynamic_invalid_representation())
+      }
+      values.push(value.Bytes(byte_view { bytes: view.clone_in(out) }))
+      return Ok(())
+    }
+    return Err(dynamic_unsupported_type())
+  }
+}
+
+fn dynamic_postgres_cell(
+  reference: resource_ref<dynamic_rows>,
+  result: raw,
+  row_ordinal: i32,
+  column: i32,
+  out: region,
+  borrow mut values: array_builder<value>,
+) -> Result<(), Error> {
+  unsafe {
+    if PQgetisnull(result, row_ordinal, column) != 0 {
+      values.push(value.Null)
+      return Ok(())
+    }
+    pointer := PQgetvalue(result, row_ordinal, column)
+    length := PQgetlength(result, row_ordinal, column)
+    if pointer.is_null() || length < 0 { return Err(dynamic_invalid_representation()) }
+    oid := PQftype(result, column)
+    if oid == POSTGRES_BOOL_OID {
+      actual := pkg.db.internal.dynamic_binary_bool(pointer, length) else {
+        return Err(dynamic_invalid_representation())
+      }
+      values.push(value.Bool(actual))
+      return Ok(())
+    }
+    if oid == POSTGRES_INT2_OID {
+      actual := pkg.db.internal.dynamic_binary_i16(pointer, length) else {
+        return Err(dynamic_invalid_representation())
+      }
+      values.push(value.I16(actual))
+      return Ok(())
+    }
+    if oid == POSTGRES_INT4_OID {
+      actual := pkg.db.internal.dynamic_binary_i32(pointer, length) else {
+        return Err(dynamic_invalid_representation())
+      }
+      values.push(value.I32(actual))
+      return Ok(())
+    }
+    if oid == POSTGRES_INT8_OID {
+      actual := pkg.db.internal.dynamic_binary_i64(pointer, length) else {
+        return Err(dynamic_invalid_representation())
+      }
+      values.push(value.I64(actual))
+      return Ok(())
+    }
+    if oid == POSTGRES_FLOAT4_OID {
+      actual := pkg.db.internal.dynamic_binary_f32(pointer, length) else {
+        return Err(dynamic_invalid_representation())
+      }
+      values.push(value.F32(actual))
+      return Ok(())
+    }
+    if oid == POSTGRES_FLOAT8_OID {
+      actual := pkg.db.internal.dynamic_binary_f64(pointer, length) else {
+        return Err(dynamic_invalid_representation())
+      }
+      values.push(value.F64(actual))
+      return Ok(())
+    }
+    if oid == POSTGRES_TEXT_OID || oid == POSTGRES_VARCHAR_OID || oid == POSTGRES_NAME_OID {
+      view: str := resource.view_from_raw(reference, pointer, length as i64) else {
+        return Err(dynamic_invalid_representation())
+      }
+      values.push(value.Text(view.clone_in(out)))
+      return Ok(())
+    }
+    if oid == POSTGRES_BYTEA_OID {
+      view: slice<u8> := resource.view_from_raw(reference, pointer, length as i64) else {
+        return Err(dynamic_invalid_representation())
+      }
+      values.push(value.Bytes(byte_view { bytes: view.clone_in(out) }))
+      return Ok(())
+    }
+    return Err(dynamic_unsupported_type())
+  }
+}
+
+pub fn dynamic_next(
+  borrow mut stream: dynamic_rows,
+  out: region,
+) -> Result<Option<row>, Error> {
+  unsafe {
+    reference := resource.borrow(stream)
+    wrapper := resource.raw(reference)
+    header := pkg.db.internal.resource.dynamic_rows_header(wrapper)
+    if header == 1 { return Ok(None) }
+    if header != 0 { return Err(dynamic_state_error()) }
+    driver := pkg.db.internal.resource.dynamic_rows_driver(wrapper)
+    native := pkg.db.internal.resource.dynamic_rows_native(wrapper)
+    state := pkg.db.internal.resource.dynamic_rows_connection_state(wrapper)
+    if native.is_null() || state.is_null() { return Err(dynamic_state_error()) }
+
+    if driver == 1 {
+      database: raw := raw.load(state, 8)
+      status := sqlite3_step(native)
+      if status == SQLITE_DONE {
+        cleanup := pkg.db.internal.resource.finish_dynamic_rows(wrapper, 1, true)
+        if cleanup != 0 { return Err(dynamic_cleanup_error(true)) }
+        return Ok(None)
+      }
+      if status != SQLITE_ROW {
+        failure := dynamic_sqlite_native_error(database)
+        ignored := pkg.db.internal.resource.finish_dynamic_rows(wrapper, 2, false)
+        return Err(failure)
+      }
+      columns := pkg.db.internal.resource.dynamic_rows_column_count(wrapper)
+      if columns <= 0 || columns > 2147483647 {
+        failure := dynamic_result_range()
+        ignored := pkg.db.internal.resource.finish_dynamic_rows(wrapper, 2, true)
+        return Err(failure)
+      }
+      mut values: array_builder<value> := array_builder(out)
+      mut column: i64 := 0
+      loop {
+        if column >= columns { break }
+        decoded := dynamic_sqlite_cell(
+          reference, native, database, column as i32, out, values,
+        )
+        match decoded {
+          Err(failure) => {
+            ignored := pkg.db.internal.resource.finish_dynamic_rows(wrapper, 2, true)
+            return Err(failure)
+          }
+          Ok(_) => {}
+        }
+        column = column + 1
+      }
+      // Reapply the package-owned busy timeout once for this advance. Decode/range failures use
+      // `finish_dynamic_rows` instead, so an error path cannot restore twice before release.
+      if pkg.db.internal.resource.checkpoint_dynamic_sqlite(wrapper) != 0 {
+        return Err(dynamic_cleanup_error(true))
+      }
+      if !pkg.db.internal.resource.advance_dynamic_rows(wrapper) {
+        failure := dynamic_result_range()
+        ignored := pkg.db.internal.resource.finish_dynamic_rows(wrapper, 2, true)
+        return Err(failure)
+      }
+      return Ok(Some(row { values: values.build() }))
+    }
+
+    if driver != 2 { return Err(dynamic_state_error()) }
+    row_ordinal := pkg.db.internal.resource.dynamic_rows_next_ordinal(wrapper)
+    row_count := pkg.db.internal.resource.dynamic_rows_row_count(wrapper)
+    columns := pkg.db.internal.resource.dynamic_rows_column_count(wrapper)
+    if row_ordinal < 0 || row_ordinal >= row_count || row_ordinal > 2147483647
+      || columns < 0 || columns > 2147483647 {
+      failure := dynamic_result_range()
+      ignored := pkg.db.internal.resource.finish_dynamic_rows(wrapper, 2, true)
+      return Err(failure)
+    }
+    mut values: array_builder<value> := array_builder(out)
+    mut column: i64 := 0
+    loop {
+      if column >= columns { break }
+      decoded := dynamic_postgres_cell(
+        reference, native, row_ordinal as i32, column as i32, out, values,
+      )
+      match decoded {
+        Err(failure) => {
+          ignored := pkg.db.internal.resource.finish_dynamic_rows(wrapper, 2, true)
+          return Err(failure)
+        }
+        Ok(_) => {}
+      }
+      column = column + 1
+    }
+    final_row := row_ordinal + 1 == row_count
+    if final_row {
+      cleanup := pkg.db.internal.resource.finish_dynamic_rows(wrapper, 1, true)
+      if cleanup != 0 { return Err(dynamic_cleanup_error(true)) }
+    } else {
+      if !pkg.db.internal.resource.advance_dynamic_rows(wrapper) {
+        failure := dynamic_result_range()
+        ignored := pkg.db.internal.resource.finish_dynamic_rows(wrapper, 2, true)
+        return Err(failure)
+      }
+    }
+    return Ok(Some(row { values: values.build() }))
+  }
 }
 
 pub fn execute<P>(

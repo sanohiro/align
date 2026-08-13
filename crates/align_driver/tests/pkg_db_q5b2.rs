@@ -129,24 +129,6 @@ extern "C" {
   fn align_pg_execute_calls() -> i32
 }
 
-fn catalog_overlap<T>(result: Result<T, pkg.db.Error>) -> bool = match result {
-  Err(error) => match error {
-    Unsupported(contract) => contract.item == "postgres.connection.active_execution"
-      && match contract.query_id { None => true Some(_) => false }
-    _ => false
-  }
-  Ok(_) => false
-}
-
-fn explain_overlap<T>(result: Result<T, pkg.db.Error>) -> bool = match result {
-  Err(error) => match error {
-    Unsupported(contract) => contract.item == "postgres.connection.active_execution"
-      && match contract.query_id { Some(_) => true None => false }
-    _ => false
-  }
-  Ok(_) => false
-}
-
 fn lease_active(state: raw) -> bool {
   unsafe {
     active: u8 := raw.load(state, 20)
@@ -162,56 +144,188 @@ fn exercise(target: pkg.db.exec, state: raw) -> i32 {
     schema: Option<pkg.db.SchemaRef> := None
     query := query()
     arena out {
-      if !catalog_overlap(pkg.db.meta_database(target, pkg.db.MetaDetail.Names, out, [])) {
-        return 1
+      common_database := pkg.db.meta_database(target, pkg.db.MetaDetail.Names, out, [])
+      mut overlap_ok := match common_database {
+        Err(error) => match error {
+          Unsupported(contract) => contract.item == "postgres.connection.active_execution"
+            && match contract.query_id { None => true Some(_) => false }
+          _ => false
+        }
+        Ok(_) => false
       }
-      if !catalog_overlap(pkg.db.meta_schemas(target, pkg.db.MetaDetail.Names, out, [])) {
-        return 2
+      if !overlap_ok { return 1 }
+      common_schemas := pkg.db.meta_schemas(target, pkg.db.MetaDetail.Names, out, [])
+      overlap_ok = match common_schemas {
+        Err(error) => match error {
+          Unsupported(contract) => contract.item == "postgres.connection.active_execution"
+            && match contract.query_id { None => true Some(_) => false }
+          _ => false
+        }
+        Ok(_) => false
       }
-      if !catalog_overlap(pkg.db.meta_tables(
+      if !overlap_ok { return 2 }
+      common_tables := pkg.db.meta_tables(
         target, schema, pkg.db.MetaDetail.Names, out, [],
-      )) { return 3 }
-      if !catalog_overlap(pkg.db.meta_table(target, table, pkg.db.MetaDetail.Names, out, [])) {
-        return 4
+      )
+      overlap_ok = match common_tables {
+        Err(error) => match error {
+          Unsupported(contract) => contract.item == "postgres.connection.active_execution"
+            && match contract.query_id { None => true Some(_) => false }
+          _ => false
+        }
+        Ok(_) => false
       }
-      if !catalog_overlap(pkg.db.meta_columns(target, table, pkg.db.MetaDetail.Names, out, [])) {
-        return 5
+      if !overlap_ok { return 3 }
+      common_table := pkg.db.meta_table(target, table, pkg.db.MetaDetail.Names, out, [])
+      overlap_ok = match common_table {
+        Err(error) => match error {
+          Unsupported(contract) => contract.item == "postgres.connection.active_execution"
+            && match contract.query_id { None => true Some(_) => false }
+          _ => false
+        }
+        Ok(_) => false
       }
-      if !catalog_overlap(pkg.db.meta_keys(target, table, pkg.db.MetaDetail.Names, out, [])) {
-        return 6
+      if !overlap_ok { return 4 }
+      common_columns := pkg.db.meta_columns(target, table, pkg.db.MetaDetail.Names, out, [])
+      overlap_ok = match common_columns {
+        Err(error) => match error {
+          Unsupported(contract) => contract.item == "postgres.connection.active_execution"
+            && match contract.query_id { None => true Some(_) => false }
+          _ => false
+        }
+        Ok(_) => false
       }
-      if !catalog_overlap(pkg.db.meta_indexes(target, table, pkg.db.MetaDetail.Names, out, [])) {
-        return 7
+      if !overlap_ok { return 5 }
+      common_keys := pkg.db.meta_keys(target, table, pkg.db.MetaDetail.Names, out, [])
+      overlap_ok = match common_keys {
+        Err(error) => match error {
+          Unsupported(contract) => contract.item == "postgres.connection.active_execution"
+            && match contract.query_id { None => true Some(_) => false }
+          _ => false
+        }
+        Ok(_) => false
       }
+      if !overlap_ok { return 6 }
+      common_indexes := pkg.db.meta_indexes(target, table, pkg.db.MetaDetail.Names, out, [])
+      overlap_ok = match common_indexes {
+        Err(error) => match error {
+          Unsupported(contract) => contract.item == "postgres.connection.active_execution"
+            && match contract.query_id { None => true Some(_) => false }
+          _ => false
+        }
+        Ok(_) => false
+      }
+      if !overlap_ok { return 7 }
 
-      if !catalog_overlap(pkg.db.postgres.meta_database_native(
+      native_database := pkg.db.postgres.meta_database_native(
         target, pkg.db.MetaDetail.Names, out, [], [],
-      )) { return 8 }
-      if !catalog_overlap(pkg.db.postgres.meta_schemas_native(
+      )
+      overlap_ok = match native_database {
+        Err(error) => match error {
+          Unsupported(contract) => contract.item == "postgres.connection.active_execution"
+            && match contract.query_id { None => true Some(_) => false }
+          _ => false
+        }
+        Ok(_) => false
+      }
+      if !overlap_ok { return 8 }
+      native_schemas := pkg.db.postgres.meta_schemas_native(
         target, pkg.db.MetaDetail.Names, out, [], [],
-      )) { return 9 }
-      if !catalog_overlap(pkg.db.postgres.meta_tables_native(
+      )
+      overlap_ok = match native_schemas {
+        Err(error) => match error {
+          Unsupported(contract) => contract.item == "postgres.connection.active_execution"
+            && match contract.query_id { None => true Some(_) => false }
+          _ => false
+        }
+        Ok(_) => false
+      }
+      if !overlap_ok { return 9 }
+      native_tables := pkg.db.postgres.meta_tables_native(
         target, schema, pkg.db.MetaDetail.Names, out, [], [],
-      )) { return 10 }
-      if !catalog_overlap(pkg.db.postgres.meta_table_native(
+      )
+      overlap_ok = match native_tables {
+        Err(error) => match error {
+          Unsupported(contract) => contract.item == "postgres.connection.active_execution"
+            && match contract.query_id { None => true Some(_) => false }
+          _ => false
+        }
+        Ok(_) => false
+      }
+      if !overlap_ok { return 10 }
+      native_table := pkg.db.postgres.meta_table_native(
         target, table, pkg.db.MetaDetail.Names, out, [], [],
-      )) { return 11 }
-      if !catalog_overlap(pkg.db.postgres.meta_columns_native(
+      )
+      overlap_ok = match native_table {
+        Err(error) => match error {
+          Unsupported(contract) => contract.item == "postgres.connection.active_execution"
+            && match contract.query_id { None => true Some(_) => false }
+          _ => false
+        }
+        Ok(_) => false
+      }
+      if !overlap_ok { return 11 }
+      native_columns := pkg.db.postgres.meta_columns_native(
         target, table, pkg.db.MetaDetail.Names, out, [], [],
-      )) { return 12 }
-      if !catalog_overlap(pkg.db.postgres.meta_keys_native(
+      )
+      overlap_ok = match native_columns {
+        Err(error) => match error {
+          Unsupported(contract) => contract.item == "postgres.connection.active_execution"
+            && match contract.query_id { None => true Some(_) => false }
+          _ => false
+        }
+        Ok(_) => false
+      }
+      if !overlap_ok { return 12 }
+      native_keys := pkg.db.postgres.meta_keys_native(
         target, table, pkg.db.MetaDetail.Names, out, [], [],
-      )) { return 13 }
-      if !catalog_overlap(pkg.db.postgres.meta_indexes_native(
+      )
+      overlap_ok = match native_keys {
+        Err(error) => match error {
+          Unsupported(contract) => contract.item == "postgres.connection.active_execution"
+            && match contract.query_id { None => true Some(_) => false }
+          _ => false
+        }
+        Ok(_) => false
+      }
+      if !overlap_ok { return 13 }
+      native_indexes := pkg.db.postgres.meta_indexes_native(
         target, table, pkg.db.MetaDetail.Names, out, [], [],
-      )) { return 14 }
+      )
+      overlap_ok = match native_indexes {
+        Err(error) => match error {
+          Unsupported(contract) => contract.item == "postgres.connection.active_execution"
+            && match contract.query_id { None => true Some(_) => false }
+          _ => false
+        }
+        Ok(_) => false
+      }
+      if !overlap_ok { return 14 }
 
-      if !explain_overlap(pkg.db.explain(
+      common_plan := pkg.db.explain(
         target, query, Params { id: 1 }, out, [],
-      )) { return 15 }
-      if !explain_overlap(pkg.db.postgres.explain_native(
+      )
+      overlap_ok = match common_plan {
+        Err(error) => match error {
+          Unsupported(contract) => contract.item == "postgres.connection.active_execution"
+            && match contract.query_id { Some(_) => true None => false }
+          _ => false
+        }
+        Ok(_) => false
+      }
+      if !overlap_ok { return 15 }
+      native_plan := pkg.db.postgres.explain_native(
         target, query, Params { id: 2 }, out, [], [],
-      )) { return 16 }
+      )
+      overlap_ok = match native_plan {
+        Err(error) => match error {
+          Unsupported(contract) => contract.item == "postgres.connection.active_execution"
+            && match contract.query_id { Some(_) => true None => false }
+          _ => false
+        }
+        Ok(_) => false
+      }
+      if !overlap_ok { return 16 }
       if !lease_active(state) { return 17 }
       if align_pg_execute_calls() != 0 { return 18 }
       raw.store(state, 20, 0 as u8)
@@ -498,7 +612,15 @@ fn catalog(status: i32) -> bool {
   target := pkg.db.exec_conn(connection)
   force(status)
   arena out {
-    failed := exact_native(pkg.db.meta_schemas(target, pkg.db.MetaDetail.Names, out, []))
+    result := pkg.db.meta_schemas(target, pkg.db.MetaDetail.Names, out, [])
+    failed := match result {
+      Err(error) => match error {
+        Native(native) => native.message == "stub execution failure"
+          && match native.sqlstate { Some(sqlstate) => sqlstate == "XX000" None => false }
+        _ => false
+      }
+      Ok(_) => false
+    }
     return failed && closed(state) && counters(1)
   }
 }
@@ -510,7 +632,15 @@ fn explain(status: i32) -> bool {
   target := pkg.db.exec_conn(connection)
   force(status)
   arena out {
-    failed := exact_native(pkg.db.explain(target, query(), Params { value: 7 }, out, []))
+    result := pkg.db.explain(target, query(), Params { value: 7 }, out, [])
+    failed := match result {
+      Err(error) => match error {
+        Native(native) => native.message == "stub execution failure"
+          && match native.sqlstate { Some(sqlstate) => sqlstate == "XX000" None => false }
+        _ => false
+      }
+      Ok(_) => false
+    }
     return failed && closed(state) && counters(1)
   }
 }
@@ -776,22 +906,6 @@ fn absent(value: Option<str>) -> bool = match value {
   None => true
 }
 
-fn is_not_found(result: Result<pkg.db.TableMeta, pkg.db.Error>) -> bool = match result {
-  Err(error) => match error { NotFound => true _ => false }
-  Ok(_) => false
-}
-
-fn encode_item<T>(result: Result<T, pkg.db.Error>, expected: str) -> bool = match result {
-  Err(error) => match error {
-    Encode(contract) => contract.item == expected && match contract.query_id {
-      None => true
-      Some(_) => false
-    }
-    _ => false
-  }
-  Ok(_) => false
-}
-
 fn main() -> i32 {
   opened := pkg.db.sqlite.connect(":memory:", [])
   connection := opened else { return 1 }
@@ -830,7 +944,11 @@ fn main() -> i32 {
       out,
       [],
     )
-    if !is_not_found(missing) { return 20 }
+    missing_ok := match missing {
+      Err(error) => match error { NotFound => true _ => false }
+      Ok(_) => false
+    }
+    if !missing_ok { return 20 }
 
     names_result := pkg.db.meta_columns(target, reference, pkg.db.MetaDetail.Names, out, [])
     names := names_result else { return 21 }
@@ -869,7 +987,15 @@ fn main() -> i32 {
       out,
       [],
     )
-    if !encode_item(bad_schema, "metadata.schema") { return 43 }
+    bad_schema_ok := match bad_schema {
+      Err(error) => match error {
+        Encode(contract) => contract.item == "metadata.schema"
+          && match contract.query_id { None => true Some(_) => false }
+        _ => false
+      }
+      Ok(_) => false
+    }
+    if !bad_schema_ok { return 43 }
     bad_table := pkg.db.meta_table(
       target,
       pkg.db.TableRef { schema: "bad\0schema", name: "bad\0name" },
@@ -877,7 +1003,15 @@ fn main() -> i32 {
       out,
       [],
     )
-    if !encode_item(bad_table, "metadata.table.schema") { return 44 }
+    bad_table_ok := match bad_table {
+      Err(error) => match error {
+        Encode(contract) => contract.item == "metadata.table.schema"
+          && match contract.query_id { None => true Some(_) => false }
+        _ => false
+      }
+      Ok(_) => false
+    }
+    if !bad_table_ok { return 44 }
 
     return 45
   }
@@ -903,17 +1037,6 @@ fn text_plan(value: pkg.db.PlanFormat) -> bool = match value {
 fn native_plan(value: pkg.db.PlanFormat) -> bool = match value {
   Native => true
   _ => false
-}
-
-fn contract_item<T>(result: Result<T, pkg.db.Error>, expected: str) -> bool = match result {
-  Err(error) => match error {
-    Unsupported(contract) => contract.item == expected && match contract.query_id {
-      Some(_) => true
-      None => false
-    }
-    _ => false
-  }
-  Ok(_) => false
 }
 
 fn main() -> i32 {
@@ -951,7 +1074,15 @@ fn main() -> i32 {
       [],
       [pkg.db.sqlite.ExplainOption.QueryPlan, pkg.db.sqlite.ExplainOption.Bytecode],
     )
-    if !contract_item(duplicate_mode, "sqlite.explain.mode") { return 10 }
+    duplicate_mode_ok := match duplicate_mode {
+      Err(error) => match error {
+        Unsupported(contract) => contract.item == "sqlite.explain.mode"
+          && match contract.query_id { Some(_) => true None => false }
+        _ => false
+      }
+      Ok(_) => false
+    }
+    if !duplicate_mode_ok { return 10 }
     unavailable_timeout := pkg.db.explain(
       target,
       query,
@@ -959,7 +1090,15 @@ fn main() -> i32 {
       out,
       [pkg.db.ExplainOption.TimeoutNs(1)],
     )
-    if !contract_item(unavailable_timeout, "db.explain.timeout_ns") { return 11 }
+    unavailable_timeout_ok := match unavailable_timeout {
+      Err(error) => match error {
+        Unsupported(contract) => contract.item == "db.explain.timeout_ns"
+          && match contract.query_id { Some(_) => true None => false }
+        _ => false
+      }
+      Ok(_) => false
+    }
+    if !unavailable_timeout_ok { return 11 }
 
     broken := pkg.db.explain(
       target,
@@ -986,28 +1125,6 @@ const SQLITE_NATIVE_MAIN: &str = r#"module main
 import pkg.db
 import pkg.db.sqlite
 import pkg.db.q5b2_setup
-
-fn contract_item<T>(result: Result<T, pkg.db.Error>, expected: str) -> bool = match result {
-  Err(error) => match error {
-    Unsupported(contract) => contract.item == expected && match contract.query_id {
-      None => true
-      Some(_) => false
-    }
-    _ => false
-  }
-  Ok(_) => false
-}
-
-fn encode_item<T>(result: Result<T, pkg.db.Error>, expected: str) -> bool = match result {
-  Err(error) => match error {
-    Encode(contract) => contract.item == expected && match contract.query_id {
-      None => true
-      Some(_) => false
-    }
-    _ => false
-  }
-  Ok(_) => false
-}
 
 fn main() -> i32 {
   opened := pkg.db.sqlite.connect(":memory:", [])
@@ -1073,7 +1190,15 @@ fn main() -> i32 {
         pkg.db.sqlite.MetaOption.IncludeInternalObjects,
       ],
     )
-    if !contract_item(common_first, "db.meta.timeout_ns") { return 16 }
+    common_first_ok := match common_first {
+      Err(error) => match error {
+        Unsupported(contract) => contract.item == "db.meta.timeout_ns"
+          && match contract.query_id { None => true Some(_) => false }
+        _ => false
+      }
+      Ok(_) => false
+    }
+    if !common_first_ok { return 16 }
 
     native_second := pkg.db.sqlite.meta_table_native(
       target,
@@ -1086,7 +1211,15 @@ fn main() -> i32 {
         pkg.db.sqlite.MetaOption.IncludeHiddenColumns,
       ],
     )
-    if !contract_item(native_second, "sqlite.meta.include_hidden_columns") { return 17 }
+    native_second_ok := match native_second {
+      Err(error) => match error {
+        Unsupported(contract) => contract.item == "sqlite.meta.include_hidden_columns"
+          && match contract.query_id { None => true Some(_) => false }
+        _ => false
+      }
+      Ok(_) => false
+    }
+    if !native_second_ok { return 17 }
 
     identifier_third := pkg.db.sqlite.meta_table_native(
       target,
@@ -1096,7 +1229,15 @@ fn main() -> i32 {
       [],
       [],
     )
-    if !encode_item(identifier_third, "metadata.table.schema") { return 18 }
+    identifier_third_ok := match identifier_third {
+      Err(error) => match error {
+        Encode(contract) => contract.item == "metadata.table.schema"
+          && match contract.query_id { None => true Some(_) => false }
+        _ => false
+      }
+      Ok(_) => false
+    }
+    if !identifier_third_ok { return 18 }
     duplicate_common := pkg.db.sqlite.meta_schemas_native(
       target,
       pkg.db.MetaDetail.Names,
@@ -1104,7 +1245,15 @@ fn main() -> i32 {
       [pkg.db.MetaOption.IncludeSystem, pkg.db.MetaOption.IncludeSystem],
       [],
     )
-    if !contract_item(duplicate_common, "db.meta.include_system") { return 19 }
+    duplicate_common_ok := match duplicate_common {
+      Err(error) => match error {
+        Unsupported(contract) => contract.item == "db.meta.include_system"
+          && match contract.query_id { None => true Some(_) => false }
+        _ => false
+      }
+      Ok(_) => false
+    }
+    if !duplicate_common_ok { return 19 }
     return 52
   }
 }
@@ -1120,11 +1269,6 @@ import app.pg_inspect
 fn json_plan(value: pkg.db.PlanFormat) -> bool = match value {
   Json => true
   _ => false
-}
-
-fn mismatch<T>(result: Result<T, pkg.db.Error>) -> bool = match result {
-  Err(error) => match error { DriverMismatch(_) => true _ => false }
-  Ok(_) => false
 }
 
 fn descending(value: Option<pkg.db.MetaSortOrder>) -> bool = match value {
@@ -1145,14 +1289,6 @@ fn no_sort(value: Option<pkg.db.MetaSortOrder>) -> bool = match value {
 fn no_null_order(value: Option<pkg.db.MetaNullOrder>) -> bool = match value {
   None => true
   Some(_) => false
-}
-
-fn contract_item<T>(result: Result<T, pkg.db.Error>, expected: str) -> bool = match result {
-  Err(error) => match error {
-    Unsupported(contract) => contract.item == expected
-    _ => false
-  }
-  Ok(_) => false
 }
 
 fn run(url: str) -> i32 {
@@ -1273,7 +1409,11 @@ fn run(url: str) -> i32 {
       target, pkg.db.MetaDetail.Names, out, [], [],
     )
     pkg.db.q5b2_setup.set_closed(target, false)
-    if !mismatch(wrong_driver) { return 41 }
+    wrong_driver_ok := match wrong_driver {
+      Err(error) => match error { DriverMismatch(_) => true _ => false }
+      Ok(_) => false
+    }
+    if !wrong_driver_ok { return 41 }
 
     conflict := pkg.db.postgres.meta_table_native(
       target,
@@ -1286,7 +1426,14 @@ fn run(url: str) -> i32 {
         pkg.db.postgres.MetaOption.IncludeSystemCatalogs,
       ],
     )
-    if !contract_item(conflict, "postgres.meta.options") { return 17 }
+    conflict_ok := match conflict {
+      Err(error) => match error {
+        Unsupported(contract) => contract.item == "postgres.meta.options"
+        _ => false
+      }
+      Ok(_) => false
+    }
+    if !conflict_ok { return 17 }
 
     query := app.pg_inspect.mutate()
     common_plan := pkg.db.explain(
@@ -1316,7 +1463,14 @@ fn run(url: str) -> i32 {
       [],
       [pkg.db.postgres.ExplainOption.Buffers(true)],
     )
-    if !contract_item(invalid_plan, "postgres.explain.analyze") { return 22 }
+    invalid_plan_ok := match invalid_plan {
+      Err(error) => match error {
+        Unsupported(contract) => contract.item == "postgres.explain.analyze"
+        _ => false
+      }
+      Ok(_) => false
+    }
+    if !invalid_plan_ok { return 22 }
     still_before := pkg.db.one(
       target, app.pg_inspect.counter(), app.pg_inspect.Params { probe: 1 }, out, [],
     ) else { return 23 }
@@ -1359,19 +1513,6 @@ import pkg.db.q5b2_setup
 import pkg.db.bad_normalized_explain
 import app.pg_inspect
 
-fn mismatch<T>(result: Result<T, pkg.db.Error>) -> bool = match result {
-  Err(error) => match error { DriverMismatch(_) => true _ => false }
-  Ok(_) => false
-}
-
-fn contract_item<T>(result: Result<T, pkg.db.Error>, expected: str) -> bool = match result {
-  Err(error) => match error {
-    Unsupported(contract) => contract.item == expected
-    _ => false
-  }
-  Ok(_) => false
-}
-
 fn main() -> i32 {
   opened := pkg.db.sqlite.connect(":memory:", [])
   connection := opened else { return 1 }
@@ -1382,7 +1523,11 @@ fn main() -> i32 {
       target, pkg.db.MetaDetail.Names, out, [], [],
     )
     pkg.db.q5b2_setup.set_closed(target, false)
-    if !mismatch(poisoned_wrong_driver) { return 7 }
+    poisoned_wrong_driver_ok := match poisoned_wrong_driver {
+      Err(error) => match error { DriverMismatch(_) => true _ => false }
+      Ok(_) => false
+    }
+    if !poisoned_wrong_driver_ok { return 7 }
     settings := pkg.db.postgres.explain_native(
       target,
       app.pg_inspect.mutate(),
@@ -1391,7 +1536,11 @@ fn main() -> i32 {
       [],
       [pkg.db.postgres.ExplainOption.Settings(true)],
     )
-    if !mismatch(settings) { return 2 }
+    settings_ok := match settings {
+      Err(error) => match error { DriverMismatch(_) => true _ => false }
+      Ok(_) => false
+    }
+    if !settings_ok { return 2 }
     timing := pkg.db.postgres.explain_native(
       target,
       app.pg_inspect.mutate(),
@@ -1400,7 +1549,14 @@ fn main() -> i32 {
       [],
       [pkg.db.postgres.ExplainOption.Timing(false)],
     )
-    if !contract_item(timing, "postgres.explain.analyze") { return 3 }
+    timing_ok := match timing {
+      Err(error) => match error {
+        Unsupported(contract) => contract.item == "postgres.explain.analyze"
+        _ => false
+      }
+      Ok(_) => false
+    }
+    if !timing_ok { return 3 }
     duplicate_format := pkg.db.postgres.explain_native(
       target,
       app.pg_inspect.mutate(),
@@ -1412,7 +1568,14 @@ fn main() -> i32 {
         pkg.db.postgres.ExplainOption.Format(pkg.db.postgres.PlanFormat.Json),
       ],
     )
-    if !contract_item(duplicate_format, "postgres.explain.format") { return 4 }
+    duplicate_format_ok := match duplicate_format {
+      Err(error) => match error {
+        Unsupported(contract) => contract.item == "postgres.explain.format"
+        _ => false
+      }
+      Ok(_) => false
+    }
+    if !duplicate_format_ok { return 4 }
     duplicate_settings := pkg.db.postgres.explain_native(
       target,
       app.pg_inspect.mutate(),
@@ -1424,11 +1587,25 @@ fn main() -> i32 {
         pkg.db.postgres.ExplainOption.Settings(false),
       ],
     )
-    if !contract_item(duplicate_settings, "postgres.explain.options") { return 5 }
+    duplicate_settings_ok := match duplicate_settings {
+      Err(error) => match error {
+        Unsupported(contract) => contract.item == "postgres.explain.options"
+        _ => false
+      }
+      Ok(_) => false
+    }
+    if !duplicate_settings_ok { return 5 }
     malformed_normalized := pkg.db.bad_normalized_explain.run(
       target, out,
     )
-    if !contract_item(malformed_normalized, "postgres.explain.analyze") { return 6 }
+    malformed_normalized_ok := match malformed_normalized {
+      Err(error) => match error {
+        Unsupported(contract) => contract.item == "postgres.explain.analyze"
+        _ => false
+      }
+      Ok(_) => false
+    }
+    if !malformed_normalized_ok { return 6 }
     return 53
   }
 }
