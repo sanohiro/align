@@ -117,6 +117,22 @@ the exact import rule, unchanged builtin fallback in a module without a local de
 Record: `draft.md` Error handling and Modules, `docs/language-spec.md`,
 `docs/design-notes.md`, `docs/impl/pkg-design/db.md`
 
+### A value-carrying `if` expression cannot move a bound owned local (DEFERRED, recorded 2026-08-13)
+
+**Current behavior, not a decision.** A value-carrying `if`/`else` **expression** rejects an arm
+that moves an already-bound owned local: `c := if n > 2 { a } else { "hi".clone() }` fails with
+`cannot move owned value 'a' out through a conditional expression yet`. The restriction belongs to
+the `if`-expression arm, not to the consumer — the binding, argument, and `return` positions are all
+rejected identically. Every sibling form already does this correctly: a `match` arm, an
+`else`-unwrap fallback, a block tail, a statement-form `if` + `return`, and an `if` expression whose
+arms build fresh temporaries.
+
+Closing the gap is a sema/MIR change mirroring the working `match` join, plus a diagnostic reword
+(today's "bind the `if`/`else` result to a local first" is wrong advice — the user already has).
+Until then the restriction is spec text, so the §6.3 table no longer over-promises.
+
+Record: `draft.md` §6.3, `docs/language-spec.md` Memory
+
 ### Empty array literals require an expected element type (SETTLED 2026-08-07)
 
 **Decision:** `[]` is legal only where the surrounding expression supplies one exact element type,
@@ -530,7 +546,7 @@ Record: `crates/align_hir`, `crates/align_sema` (`EscapeCheck`, `Stmt::Assign::d
   context — one way, nothing hidden. (A scalar broadcast `vecN<T>(x)` is a later, additive form.)
 - **Lane read = `v[i]` with a constant index** (extractelement). A SIMD lane is a fixed position, so
   the index must be a compile-time constant in `0..N` (a dynamic lane would risk an out-of-range
-  poison value); lane *assignment* `v[i] = x` is deferred.
+  poison value); lane *assignment* `v[i] = x` was deferred here and **shipped in Slice 8 below**.
 Elementwise `+`/`-`/`*`/`/` lower to one lane-wise hardware instruction each. The `vec4<f32>`
 N-in-name spelling needs no lexer/parser/AST change. (`crates/align_*`, `tests/vec_simd.rs`,
 `examples/vec_simd.align`.)
@@ -539,7 +555,8 @@ N-in-name spelling needs no lexer/parser/AST change. (`crates/align_*`, `tests/v
 `>=`) is elementwise and yields a **`mask`** — `Ty::Mask(N)` → LLVM `<N x i1>`, one bool lane per
 vector lane. Settled here: the mask is **width-only / element-agnostic** (a width-`N` mask blends any
 two `vecN<T>`) and **produced/consumed inline** — no written `mask<T>` annotation yet (the surface
-spelling `mask<T>` carries no width, so the annotation is deferred until a use needs it).
+spelling `mask<T>` carries no width, so the annotation was deferred until a use needed it — **Slice
+10 below shipped the written `maskN<T>` form**).
 `select(mask, a, b)` (a `core.vec` builtin) is the consumer: lane `i` is `a[i]` where the mask is set,
 else `b[i]` (so `select(a > b, a, b)` is elementwise max). Comparisons reuse `ExprKind::Binary`
 (codegen `gen_bin` routes a vec operand + comparison op to `gen_vec_cmp` → vector `icmp`/`fcmp`);
@@ -551,8 +568,9 @@ vectors. (`examples/vec_mask.align`.)
 broadcasts across the lanes (`a + 5`, `scores > 80` — the draft §9 spelling). Settled here: broadcast
 is **implicit in `vec OP scalar`** (a cheap, lossless splat implied by the operand types — not a
 hidden allocation or a lossy coercion, so it stays within "nothing hidden"), and the **vector must be
-on the left** (scalar-on-the-left and a vector-literal right operand are deferred — they need
-bidirectional inference the one-pass checker doesn't do cleanly yet). The scalar's type unifies with
+on the left** (scalar-on-the-left and a vector-literal right operand were deferred here — they need
+bidirectional inference the one-pass checker doesn't do cleanly yet; **Slice 9 below lifted the
+scalar-on-the-left cut**). The scalar's type unifies with
 the element (`vec4<i32> + 2.0` is rejected — int vector, float scalar). `vec.sum_where(mask)` is the
 **masked horizontal sum** (the first vec→scalar reduction): `select(mask, vec, 0)` then add all lanes
 → the element scalar, so `scores.sum_where(scores > 80)` runs (draft §9). Codegen splats via an
@@ -587,9 +605,10 @@ stage or a `.field` projection), and type-checks every other receiver to detect 
 lanes, as the element scalar (the unmasked sibling of `sum_where`). Same dispatch shape as `min`/`max`
 (a vector receiver → the SIMD reduction; an array pipeline `xs.map(f).sum()` → the fused array path).
 `hir::VecSum` → `Rvalue::VecSum`, reusing the shared `horizontal_sum`; int + float. **The vector
-reduction surface (`sum`/`sum_where`/`dot`/`min`/`max`) is now complete.** Still deferred:
-scalar-on-the-left broadcast, array load/store, the generic `vec<N,T>` spelling, lane assignment, a
-written `mask<T>` annotation, and a SIMD-unit **tree reduction** (the reductions extract-and-fold
+reduction surface (`sum`/`sum_where`/`dot`/`min`/`max`) is now complete.** Deferred **as of this
+slice** — scalar-on-the-left broadcast, array load/store, lane assignment, and a written
+`mask<T>` annotation — all shipped in Slices 7–10 below. Still deferred after those: the generic
+`vec<N,T>` spelling, and a SIMD-unit **tree reduction** (the reductions extract-and-fold
 today — semantics-exact and -O2-reshaped, but a shuffle tree would keep it on the vector units).
 (`examples/vec_sum.align`.)
 
@@ -982,7 +1001,7 @@ with 10 branches. `tests/branchless_where.rs`, `tests/optimizer.rs`, `bench/`. (
 stream-compaction — `to_array`/`partition`/`scan` under a `where` — stays branchy: it must not
 *append* a masked-out element, which is not an identity op; that is a separate slice.)
 
-### soa construction — IMPLEMENTATION PLAN (the largest remaining soa gap; RESUME HERE for perf)
+### soa construction — IMPLEMENTATION PLAN (SHIPPED: `.to_soa()` + direct JSON→SoA decode)
 
 **Goal.** Make `soa<T>` usable in real Align programs. Today it is a **borrowed parameter only** — the
 benchmark feeds column data from an external Rust harness; pure Align can't *make* a soa. The
@@ -2122,10 +2141,11 @@ literal defaults to `i64`, an unconstrained float literal to `f64`** (previously
 §5 directly — user-visible, since it affects overflow/precision); and **`&&`/`||` evaluate
 left-to-right with short-circuit semantics** (`a && b` never evaluates `b` if `a` is false), now
 given its own evaluation-order note in `draft.md` rather than being implied by "logical operators."
-This is a **spec-documentation** settlement, not a claim that the short-circuit *implementation* is
-verified end-to-end — track that separately (External soundness audit item **3-1** above records
-`&&`/`||` lowering to a strict, non-short-circuiting `Rvalue::Bin` in MIR as of that audit; confirm
-it is actually fixed before relying on the spec text here as also describing current codegen).
+This began as a **spec-documentation** settlement (External soundness audit item **3-1** above
+recorded `&&`/`||` lowering to a strict, non-short-circuiting `Rvalue::Bin` in MIR as of that
+audit). **Confirmed fixed by execution:** `if i < xs.len() && xs[i] > 0` with an out-of-range `i`
+does not abort, and the `||` mirror behaves the same, so the spec text also describes current
+codegen. TODO closed.
 Record: `draft.md` §5 (doc update landed).
 
 ### Panic / unwinding (CFG shape)
@@ -2742,8 +2762,9 @@ protocol client cannot be written in Align source without it.
 - **Docs updated 2026-07-09** (design-first, implementation deferred — no timing pressure, per
   ideal-form-or-defer): `draft.md` §4/§7, `language-spec.md`, `design-notes.md`, `history.md`,
   guide ch00/02/06/13/17, little-aligner ch11 (rewritten — it taught recursion-as-iteration and
-  overclaimed TCO), + `ja/` mirrors. Implementation is a future slice (lexer `loop`/`break` +
-  HIR/MIR back-edge + break-type unification + escape/drop wiring); not scheduled inside M11.
+  overclaimed TCO), + `ja/` mirrors. Implementation was a future slice at that point (lexer
+  `loop`/`break` + HIR/MIR back-edge + break-type unification + escape/drop wiring), not scheduled
+  inside M11 — **superseded by "Implemented 2026-07-10" below**.
   Implementer notes from the design review: loop-carried `mut` Move state needs drop-on-reassign
   each iteration (the existing `drop_old` machinery), and a per-iteration owned local carried out
   by `break` needs path-sensitive move-vs-drop (move on the break edge, drop on the back edge) —
@@ -2785,8 +2806,9 @@ implementation deltas are noted.
    shared with template interpolation; `print` is Impure. Matches the guide and shipped behavior.
 2. **Literals & escapes** (§12 "Literals and Escapes"): string literals single-line; `char` = one
    Unicode scalar (surrogates rejected); escape set `\n \t \r \0 \\ \" \' \u{...}`; unknown
-   escape = compile error. Shipped today: `\n \t \" \\`; the lexer still owes `\r \0 \u{}` + the
-   explicit single-line / unknown-escape errors.
+   escape = compile error. **Complete as of the current lexer** (`crates/align_lexer/src/lib.rs`
+   `lex_unicode_escape` + the `literal_escape_set_matches_the_spec` test): the full set including
+   `\r \0 \u{}` and the explicit single-line / unknown-escape errors is implemented.
 3. **Equality = scalars + strings only** (§5 "Equality and Ordering"): no structural `==` on
    struct/tuple/array/sum — explicit field comparison / `match` / pipeline instead (nothing
    hidden; the `match`-is-for-variants boundary). **Implementation bug found while settling

@@ -25,7 +25,9 @@ Data-oriented programming
 * One way to do the same thing
 * No hidden allocation
 * No hidden error
+* No hidden side effect
 * No hidden parallelism
+* No hidden `unsafe`
 * Data-oriented by default
 * Cache-friendly by default
 * SIMD-friendly by default
@@ -61,8 +63,11 @@ slice<T>
 
 vecN<T>
 maskN<T>
-bitset
+bitset        // designed, not built yet (its layout is the SIMD vec/mask model)
 ```
+
+`()` is unit and `(e)` is grouping, so a **tuple has arity ≥ 2**. Its ownership derives from its
+elements (Move if any element is Move), exactly like a struct.
 
 ### Integer literals
 
@@ -73,7 +78,16 @@ precision). A *value* literal that provably does not fit its context type (`x: u
 argument / field / array element / return value) is a **compile error**, not a silent wrap — cast
 explicitly (`0xFFFFFFFF as i32`) if the wrapped bit pattern is wanted; `-128` is checked at its
 effective value so it is a valid `i8`. Runtime arithmetic overflow still wraps, and an over-wide
-`match` *pattern* literal still truncates to the scrutinee's type by the defined wrap rule. (`draft.md` §5.)
+`match` *pattern* literal still truncates to the scrutinee's type by the defined wrap rule.
+(`draft.md` §4 "Integer Literals".)
+
+### Statement termination and line continuation
+
+A newline terminates a statement; braces delimit blocks and indentation is insignificant. `;` is an
+**optional separator** used only to put several statements on one line, so any block can be inlined.
+A line that **begins** with `.` (the pipeline form) or a binary operator continues the previous line,
+which is how a multi-line chain is written without any continuation marker.
+(`draft.md` §4 "Statement Terminator".)
 
 ### Numeric conversion
 
@@ -91,7 +105,8 @@ explicit `checked_*` / `saturating_*` / `wrapping_*` ops cover the rest. Divisio
 silent — a runtime `/`/`%` by zero aborts, a constant one is a compile error — but `INT_MIN / -1`
 wraps to `INT_MIN` (`INT_MIN % -1` yields `0`), consistent with the two's-complement overflow rule;
 only zero divisors abort. Unary `-` is signed, so negating an unsigned type (`x: u32 := -5`) is a
-compile error, not a silent wrap — cast explicitly if the wrapped pattern is wanted. (`draft.md` §3.)
+compile error, not a silent wrap — cast explicitly if the wrapped pattern is wanted.
+(`draft.md` §4 "Numeric Conversion".)
 
 ### Bitwise & shift
 
@@ -102,7 +117,7 @@ bind like `*`, `| ^` like `+`, so all of them bind tighter than comparison (`a &
 on a signed value, logical on an unsigned one. The `bitset` type is built on these. The logical
 `&&` / `||` **short-circuit** (the right operand runs only when the left doesn't decide the result),
 so a guard like `i < xs.len() && xs[i] > 0` never indexes out of range; the bitwise `& | ` always
-evaluate both operands. (`draft.md` §5.)
+evaluate both operands. (`draft.md` §4 "Bitwise and Shift Operators".)
 
 ### Constants
 
@@ -118,7 +133,8 @@ GREETING := "hello"
 
 A constant's type is fixed at the definition (it does not infer from a use site — it is stable
 across modules), so an unannotated integer defaults to `i64` / a float to `f64`; annotate otherwise.
-`pub` exports it; an importer names it qualified (`mod.NAME`), like a `pub` function/type. (`draft.md` §3/§4.)
+`pub` exports it; an importer names it qualified (`mod.NAME`), like a `pub` function/type.
+(`draft.md` §4 "Constants".)
 
 An initializer may be an **array literal** — an aggregate constant, typed **`slice<T>` not `array<T>`**
 (ownership is a property of the type, so a top-level constant owns nothing; like a `str` literal, it
@@ -135,6 +151,14 @@ folded like a scalar constant. A constant index folds to the element (`PRIMES[1]
 dynamic index / `.len()` / slice / pipeline reads the table with no allocation. An `array<T>`
 annotation is rejected. Deferred in an element: function calls, `as` casts, nested arrays, references
 to other aggregate constants, and struct constants / elements.
+
+A constant table is **read-only**. It views the per-unit read-only data section, so writing through
+it — `TABLE[i] = v`, or passing it to an `out slice<T>` parameter — is a compile error *even through
+a `mut` binding or a sub-slice* (a `mut` binding rebinds the view, it does not make the storage
+writable). The same rule covers a string literal's byte view (`"…".bytes()`); copy into an owned
+array to modify. A `pub` constant's value is part of the exported interface (the initializer ships
+and re-folds in importers), so a `pub` constant's initializer may reference only `pub` constants.
+Division by zero, a cyclic definition, and a type mismatch in a constant are compile errors.
 
 Function completion matches the declared return. Unit functions may use bare `return` or reachable
 fallthrough. A non-Unit function must produce its value on every reachable path through a typed
@@ -166,7 +190,10 @@ area := match s {
 `loop { ... }` is the one sequential-control construct, and an expression: `break expr` ends the
 loop with that value (bare `break` = `()`); all breaks in one loop unify like `match` arms; a
 `loop` with no `break` diverges. There is no `for`, no `while`, no `continue`, no labeled break.
-`?`/`return` exit the function; `break` is the only loop exit and cannot cross a lambda boundary.
+`?`/`return` exit the function; `break` is the only loop exit and cannot cross a lambda boundary. A
+`break` value obeys the return-escape rule, so it may not borrow a per-iteration local (`.clone()`
+to carry one out); a `break` lexically inside an `arena {}` / `task_group {}` **nested in the loop**
+is rejected today — restructure so the region ends before the `break`.
 The pipeline owns the data path; `loop` owns the control path (EOF pumps, retry, convergence) —
 walking an array by index inside a `loop` is a lint. Recursion stays legal for recursive problems
 (parsers, trees) but is not iteration: no tail-call optimization is guaranteed. See `draft.md` §4
@@ -179,11 +206,15 @@ round-trip; `bool` = `true`/`false`; strings verbatim); printing an aggregate is
 String literals are single-line; escapes are `\n \t \r \0 \\ \" \' \u{...}` and an unknown escape
 is a compile error; a `char` literal holds one Unicode scalar. `==` is scalars + strings only —
 no structural equality (explicit fields / `match` / pipeline instead). No shadowing: a name binds
-once per scope chain. Floats are IEEE 754 and never abort (`x/0.0` → `±inf`, NaN ≠ NaN); only
+once per scope chain — with one exception, two **disjoint sibling blocks** may each bind the same
+name, because neither is in the other's chain. Floats are IEEE 754 and never abort (`x/0.0` → `±inf`, NaN ≠ NaN); only
 integer division aborts. `str`/`string` are `Ord` (byte-lexicographic; locale collation is a
-library concern), so strings sort and compare. `else` works on `Result` as well as `Option` —
-the intent triangle is `?` propagates / `else` falls back / `match` inspects. Details:
-`draft.md` §4 / §5 / §12.
+library concern), so strings sort and compare. A `sort_by_key` key is a **Copy** `Ord` value — a
+number, a `char`, or a borrowed `str`; an owned `string` key type-checks but is then rejected at the
+MIR boundary as an internal error (no per-key Drop in the fused sort path — see
+`docs/impl/19-hir-validation-ledger.md`), so project the key to a `str`. `else` works on `Result` as
+well as `Option` — the intent triangle is `?` propagates / `else` falls back / `match` inspects.
+Details: `draft.md` §4 (display, equality, ordering, floats) and §12 (literals and escapes).
 
 Comparison operators and `Eq`/`Ord` bounds accept both `str` and owned `string`. An owned operand
 is compared through a non-consuming, zero-cost `str` borrow, including in mixed `string`/`str`
@@ -225,8 +256,11 @@ emitted HIR/MIR. No abstract SoA or runtime type test survives monomorphization.
 fn id<T>(x: T) -> T = x                  // unconstrained: pass/return only
 fn max<T: Ord>(a: T, b: T) -> T = if a > b { a } else { b }
 fn unwrap_or<T>(o: Option<T>, d: T) -> T = o else d
-n := id(5)        // T = i32, monomorphized to id$i32
+n := id(5)        // T inferred from the argument; one specialized instance per type argument
 ```
+
+A **no-payload generic variant has nothing to infer its type argument from** — `Opt.None` needs a
+payload-bearing sibling to fix the type at construction.
 
 A function-local `[]` has no element type of its own. It is accepted only when an enclosing
 `slice<T>` context supplies the exact `T` (for example, a typed parameter or binding), and then
@@ -244,11 +278,18 @@ unsafe
 
 Escape lifetime and cleanup provenance are separate inferred facts. A value-carrying block keeps
 its trailing value's region; `if` and `match` take the shortest continuing-arm region;
-`else`-unwrap takes the shorter of the payload and fallback; `?` keeps the `Ok` payload region.
+`else`-unwrap takes the shorter of the payload and fallback; `?` keeps the `Ok` payload region; a
+`loop`'s value must satisfy the return-escape rule on every accepted `break`.
 For an owned value, the same selected edge forwards a path-local bit that distinguishes individual
 heap ownership from arena ownership. Moves clear the source; scope exit drops only a live
 individually owned value. A `mut` binding may therefore change allocation region when every assigned
 value outlives its scope, without leaking heap storage or individually freeing arena storage.
+
+One restriction applies to `if` today: a value-carrying `if`/`else` **expression** cannot move an
+already-bound owned local out of an arm (`c := if n > 2 { a } else { … }` is rejected, and so are
+the argument and `return` positions). `match`, `else`-unwrap, a block tail, and a statement-form
+`if` + `return` all move a bound owned local normally, and an `if` expression whose arms produce
+fresh temporaries is fine.
 
 A Move argument passed by value transfers ownership to the callee, which becomes responsible for
 its drop. Only free-standing owned values may cross a call boundary. Arena-owned values must stay
@@ -265,7 +306,11 @@ that inner source before an outer return or call takes ownership.
 
 An aggregate has one path-local cleanup bit, so its owned members must all be free-standing or all
 be arena-owned. Mixing allocation modes in one tuple, struct, sum value, or owned array is rejected.
-Replacing an owned field or element must preserve the existing mode. Borrowed members do not
+Replacing an owned field or element must preserve the existing mode, and the replaced leaf must be a
+`string` or `Option<string>` today — replacing any other owned leaf (a nested Move struct, an owned
+array) is a compile error naming the type; replace the whole aggregate instead. A bare
+`array<string>` **field** is likewise rejected at the declaration, in any struct, not only in a JSON
+schema; use `array<str>` or `array<Struct>`. Borrowed members do not
 participate in this allocation-mode check. A path-dependent one-owner aggregate forwards its
 runtime mode, but mutation requires a definite mode. After generic substitution, a struct field may
 be Copy or recursively Move when its finite, non-recursive Drop plan is known; this does not make an
@@ -325,7 +370,7 @@ Result<T,E>
 Error { NotFound, Invalid, Denied, Timeout, Code(i32) }   // canonical builtin error sum type
 ```
 
-No exceptions. `E` is any sum type (a domain may use its own error enum). `Error` is the builtin
+No exceptions. `E` is any sum type **or scalar** (a domain may use its own error enum). `Error` is the builtin
 error type — construct `Error.NotFound` / `Error.Code(c)`, use `error(c)` as syntax sugar for the
 explicit builtin `core.Error.Code(c)`, `match` it, and at
 `main` it maps to the process exit code. Fallible builtins (`fs.read_file`, `json.decode`, …)
@@ -364,7 +409,18 @@ group_by
 sort
 sort_by_key
 chunks
+zip
 ```
+
+`zip(a, b, ...)` is the same-index multi-source pipeline source over two or more arrays/slices of
+Copy primitive scalars (`zip(a, b).map(fn v { v.0 * v.1 }).sum()`). Every runtime length is checked
+equal before the loop and fixed unequal lengths are a compile error; the per-index tuple is an SSA
+value, never an allocated tuple array. For `map_into`, `dst` must be disjoint from every source,
+while the sources may alias each other.
+
+`group_by(.key).sum(.value)` yields **two parallel arrays** — the distinct keys and their per-key
+aggregate — not a hash map. First cut: an `i64` or `str` key over a `soa`, or a `str` key over an
+`array<Struct>`, with an `i64` value and `sum`/`min`/`max`/`count`.
 
 ### Reduction
 
@@ -410,7 +466,19 @@ buffer that must not alias any other argument — both a safety constraint and t
 SIMD is two layers: the pipeline (`map`/`where`/`reduce`) is the width-agnostic main road — it never
 names a width, so bulk vectorization (including future scalable ISAs, SVE/RVV) is chosen in the
 backend and stays a hardware detail. `vecN<T>` / `maskN<T>` (below) are the fixed-size escape hatch
-for hand-written register kernels. (`draft.md` §9.)
+for hand-written register kernels.
+
+The register layer's surface: a vector is built from an array literal under a `vecN<T>` annotation;
+elementwise `+ - * / %` and the unary float math map one-to-one to lane-wise instructions; a
+comparison yields a `maskN<T>`, which is a **nameable** type (annotation, parameter, return) with the
+same element and width as the compared vectors; `select(m, a, b)` blends. A **scalar broadcasts on
+either side** of a vector op (`v + 5`, `5 + v`), preserving operand order for the non-commutative
+ops, and its type must unify with the element. A `slice<T>` bridges memory and registers:
+`s.load(i) -> vecN<T>` reads `N` consecutive elements from runtime index `i` (width/element from the
+target annotation) and `s.store(i, v)` writes them back into a **writable** (`mut`/`out`) slice; both
+are bounds-checked and emitted at the *element* alignment, so only an `align(N)` binding promotes a
+provably aligned offset to an aligned load. `v[i]` reads lane `i` and `v[i] = x` writes it, both at a
+compile-time-constant index in `0..N`, the write requiring a `mut` vector local. (`draft.md` §9.)
 
 `array<T>` is row-major (array-of-structs); `soa<T>` is the explicit column-major (struct-of-arrays)
 layout, so a field-wise pipeline streams only the columns it touches (the cache lever that beats an
@@ -438,7 +506,7 @@ An owning package resource may expose a borrowed `soa<T>` view over its exact-le
 that resource generation is then the lifetime root. `pkg.db.batch_soa<T: SoaPlain>` uses this form.
 It does not create an owned `soa<T>` value or admit Move-fielded columns.
 
-The settled completeness design (draft §14): a JSON `oneOf` maps to a sum
+The settled completeness design (`draft.md` §18.1 "Union (Sum-Type) Mapping"): a JSON `oneOf` maps to a sum
 type discriminated by pairwise-distinct **shape classes** (compile-checked; O(1) dispatch, encode
 writes the live payload bare); schema-unknown JSON is read through the zero-copy arena-backed
 `json.doc` view (no serde-style value tree, no map type) — `d := json.doc(s)?` in an `arena {}`, then
@@ -484,6 +552,16 @@ UTF-8** (a type invariant): a range slice `s[a..b]` uses byte offsets and aborts
 splits a scalar, so arbitrary-byte work goes through `s.bytes()` (→ `bytes`, no UTF-8 obligation).
 `str + str` is a **hard error** — `+` never concatenates (a hidden allocation, and a second way to
 build a string); the one way is a `builder`. (`draft.md` §7/§12.)
+
+**Binary decode / encode.** Packed binary is read from a `bytes` view and written into a growable
+`buffer`, bounds-checked and **endian-explicit**: every multi-byte read/write names its byte order
+with a `_le` / `_be` suffix (`h.u32_le(0)`, `out.put_u64_be(n)`), and only `u8` / `i8` carry no
+suffix. The scalar set is `u8`, `i8`, `u16`/`i16`, `u32`/`i32`, `u64`/`i64`, `f32`, `f64`; a read is
+`bytes.<scalar>(off)`, its dual `buffer.put_<scalar>(v)`, and `buffer.append(data)` copies a raw
+`bytes`/`str` blob in. The value handed to `put_*` must match the writer's scalar type **exactly**
+(no silent coercion), and an out-of-range read (`off < 0`, or `off + width > len`) **aborts**, the
+same fail-closed policy as `slice[i]` — check `.len()` first. A read returns a Copy scalar carrying
+no region; the `bytes`/`buffer` stay borrowed. (`draft.md` §12.)
 
 ### JSON
 
@@ -549,6 +627,9 @@ Its private runtime region stores spawned environments and result slots only. It
 allocation arena: ordinary owned values keep individual ownership, and arena-only operations still
 require an explicit `arena {}`.
 
+`spawn` takes a lambda, not a bare call, and returns a `Task<R>`. `wait()?` is the single error
+boundary: it joins every task and propagates the **lowest-spawn-index** `Err`.
+
 `Task.get()` is valid only after a successful `wait()` on every reachable path for its task
 generation. In a fallible group, the Wait Result may be handled directly or through a bare local,
 copy/reassignment, block tail, `map_err`, or value-producing `if`/`match`/`else`/`loop`; only an
@@ -607,7 +688,11 @@ contract fixes the source signature, effects/provenance, native ABI, lifetime, c
 and malformed-input behavior. This forms neither a closure environment nor an ordinary function
 value. Application source cannot construct the descriptor, obtain a callback pointer, choose an
 arbitrary native signature, or use this narrow mechanism as general reverse FFI; callback views are
-invocation-scoped and cannot escape the trampoline. (`draft.md` §8.)
+invocation-scoped and cannot escape the trampoline. (`draft.md` §15 for the extern/`unsafe` rules,
+§8 for the producer trampoline.)
+
+A function containing `unsafe` is inferred Impure, so it can **never** be a `par_map` callee — the
+danger stays visible and traceable.
 
 `raw.store(p, offset, value)` and `raw.load(p, offset)` move one inferred flat value at a byte
 offset. Store takes its type from `value`; load takes it from the expected result type. Admitted
@@ -623,9 +708,14 @@ by-name-invisible cache-density win. A `layout(C)` attribute (`layout(C) Point {
 `align(N)`) is the escape hatch — it pins a struct to a stable, C-compatible flat layout (declaration
 order, natural alignment, no reordering). Among structs, only such a struct may be written to / read
 from `raw` memory (`raw.store`/`raw.load` of a whole struct) — the pointer-based FFI pattern. Its fields must be
-FFI-mappable scalars. On x86-64 SysV, a `layout(C)` struct in the ABI's register classes and no
-larger than 16 bytes may also cross by value; MEMORY-class/larger structs and other platform ABIs
-remain pointer-only.
+FFI-mappable scalars. On **x86-64 Linux (SysV AMD64) only**, a `layout(C)` struct in the ABI's
+register classes and no larger than 16 bytes may also cross by value; a struct that the ABI would
+classify MEMORY — or that is larger — is **rejected** rather than silently passed in memory, and
+every other platform ABI stays pointer-only. The same boundary is enforced under **register
+pressure**: SysV puts a struct in registers only if all its eightbytes fit the class registers left
+after the preceding arguments, so a signature where a by-value struct argument would fall to memory
+(a two-eightbyte struct after five integer arguments, say) is rejected too — reorder it earlier or
+pass it by pointer.
 
 An `align(N)` attribute (`align(N) S { … }`, a power of two, composes with `layout(C)`) over-aligns a
 struct's storage — the max of `N` and the natural alignment, so it never under-aligns — for SIMD /
@@ -735,6 +825,18 @@ first import segment is a trust tier (`core`/`std`/`pkg`/project); calls stay fu
 (`pkg.web.get(...)`) with no aliases. Vendoring is copying the subtree; one version per tree by
 construction. (`draft.md` §17 "Packages" / §18.3.)
 
+### Formatter and lints
+
+The official formatter is **mandatory**. It normalizes only meaningless variation — spacing, `;`
+placement, trailing commas, alignment — and deliberately does not force the one-line versus
+multi-line choice.
+
+The standard lint set is eleven checks: allocation in loop, huge struct copy, unnecessary clone,
+unnecessary heap, unhandled `Result`, branch in hot loop, string re-scan, implicit copy, lossy
+conversion (narrowing / float→int / wide-int→float / `char`-narrowing `as`), wasteful default type
+(a large literal array left at the `i64`/`f64` default), and index-walk in loop (walking an array by
+index inside a `loop` instead of writing a pipeline). (`draft.md` §16.)
+
 ## Core library
 
 ```text
@@ -743,22 +845,36 @@ core.result
 
 core.array
 core.slice
-core.array_builder
+core.chunks
 
 core.vec
 core.mask
 core.bitset
 
+core.map
+core.reduce
+core.scan
+core.partition
+core.sort
+
+core.str
+core.string
+core.bytes
+core.buffer
 core.builder
+core.array_builder
+
+core.arena
 
 core.json
 core.template
 
 core.hash
 core.math
-
-core.arena
 ```
+
+Every name above is an importable module except `core.array_builder`: `array_builder<T>()` is a
+language-intrinsic global (like `builder()`), listed as a core area rather than an `import` target.
 
 `array_builder<T>()` retains its individually owned heap/zero-copy-freeze form.
 `array_builder<T>(out: region)` is the caller-region form for recursively plain values. It uses
@@ -790,27 +906,58 @@ std.crypto
 std.http
 ```
 
-`std.io`: concrete builtin **Move** `reader`/`writer` types (own an fd, `Drop` closes it) — one
-type, many constructors (`fs.open`, `io.stdin`, `io.stdout.buffered()`), not a trait. `io.stdout`/
+`std.io`: concrete builtin **Move** types `reader` / `writer` / `file` (each owns an fd, `Drop`
+closes it) — one type, many constructors (`fs.open`, `io.stdin`, `io.stdout.buffered()`), not a
+trait; `stream` is named but its surface is not yet specified. `io.stdout`/
 `io.stderr` are `writer`; `io.stdout.buffered()` unifies buffering into `writer` rather than a
 separate type. `r.read(b: mut buffer) -> Result<i64, Error>` fills `b` up to its capacity (0 =
 EOF); `w.write(str|bytes|builder)` / `w.flush()`; `io.copy(r, w) -> Result<i64, Error>` is always
 `O(buffer)` memory (a portable fixed-buffer loop is the v1/reference; a `sendfile`/`splice`/mmap
-fast path may follow without an API change). `std.fs`: `read_file`/`write_file`/`open`/`create`/
-`exists`/`remove`/`read_dir`, plus `read_file_view` (a `str` mmap view — requires an enclosing
+fast path may follow without an API change). `bytes.as_str() -> Result<str, Error>` is the one
+bytes→text boundary: it validates UTF-8 and returns a zero-copy `str` view region-bound to the
+receiver.
+
+`file` is the **random-access** handle: every access carries an explicit offset, so there is no
+cursor and no `seek` (hidden mutable state), and no read-only constructor. `f.pread(b: mut buffer,
+off)` reads one window, `f.pwrite(data: bytes, off)` writes all of `data` (extending past EOF), and
+`f.len()` is a live `fstat`. A **negative** offset is a programmer bug and aborts.
+
+**Line reads** are explicit because they need lookahead: `r.buffered()` upgrades a reader (the read
+dual of the buffered writer), and `read_line` is a **buffered-reader-only** method. It fills `b`
+with the line body, exactly one `\r?\n` already stripped, and returns the bytes consumed including
+the terminator (0 = EOF). Unlike `read`, it **grows** `b` as needed, up to a 64 MiB line cap
+(`Error.Invalid` beyond it). The per-iteration line view (`buf.bytes()` / its `as_str()`) must not
+be hoisted across iterations — the next `read_line` overwrites `buf` — so `.clone()` a line you keep.
+
+**A v1 restriction:** an owned handle (`reader`/`writer`/`file`/`buffer`, and a buffered
+`io.stdout.buffered()`) must be bound to a local before a method call — `w := fs.create(p)?` then
+`w.write(d)?`, never `fs.create(p)?.write(d)?` — because an unbound owned temporary never runs its
+`Drop`. The unbuffered borrowed standard streams own no fd and may be used inline. All native
+buffer-fill operations (`read`, `read_line`, `pread`, `recv_from`, `crypto.random`) additionally
+require the buffer argument to be a bare local declared with `mut`; temporaries and immutable locals
+are rejected before the operation is formed.
+
+`std.fs`: `read_file`/`write_file`/`open`/`create`/
+`exists`/`remove`/`read_dir`, plus `create_rw` / `open_rw` (the `file` constructors — `O_RDWR` fresh
+or must-exist), `read_file_view` (a `str` mmap view — requires an enclosing
 arena, escapes via `.clone()`) and `read_bytes_view` (its binary sibling — the same arena mmap
-without UTF-8 validation, returning a `bytes` view so a GGUF/binary asset maps zero-copy). `std.path`: `join`/`normalize` (owned), `base`/`dir`/`ext` (zero-copy
-substring views). `std.env`: `get`/`set` only — `args` comes solely from `main(args: array<str>)`,
-there is no `env.args`. `std.time`: one `i64`-nanosecond timeline, no `Duration` type — `now()`
+without UTF-8 validation, returning a `bytes` view so a GGUF/binary asset maps zero-copy).
+`read_dir` returns owned strings and **excludes** any entry whose name is not valid UTF-8, so a
+listing can silently be short. `std.path`: `join`/`normalize` (owned), `base`/`dir`/`ext` (zero-copy
+substring views). `std.process`: `spawn`/`wait`/`kill`/`exec`, `exit` (runs cleanup) vs `abort`
+(immediate `_exit(1)`), `cpu_count()`, and the `command` builder — `process.command(cmd, args)` plus
+`cwd`/`env`/`env_clear`/`timeout_ns` setters and `run() -> Result<run_output, Error>` for captured
+`code()`/`stdout()`/`stderr()`. `std.env`: `get`/`set` only — `args` comes solely from
+`main(args: array<str>)`, there is no `env.args`. `std.time`: one `i64`-nanosecond timeline, no
+`Duration` type — `now()`
 (wall), `instant()` (monotonic), `sleep(ns)`. Recoverably fallible `std` functions return
 `Result<T, Error>`; absence-only queries may return `Option<T>`, total operations return their value
 directly, and programmer errors abort. A failing syscall in a `Result`-returning operation maps
 through one fixed errno table (`ENOENT`→`NotFound`, `EACCES`/`EPERM`→`Denied`, `EINVAL`→`Invalid`,
-else `Code(errno)`). (`draft.md` §18.2, M9.)
-
-All native buffer-fill operations require the argument to be a bare local declared with `mut`;
-temporaries and immutable locals are rejected before the operation is formed. The same rule applies
-to `read_line`, positional `pread`, UDP `recv_from`, and `crypto.random`.
+else `Code(errno)`). `Error.Timeout` is **not** in that table — an `ETIMEDOUT` from an unrelated
+syscall still maps to `Code(errno)`; `Timeout` is produced only where a deadline is enforced
+explicitly (a `command`'s `timeout_ns`, an `std.http`/`std.net` I/O timeout).
+(`draft.md` §18.2, M9.)
 
 `std.encoding`: `base64`/`base64url`/`hex`/`percent` (RFC 3986 URI components — everything outside
 the unreserved set becomes `%XX`) / `form` (`application/x-www-form-urlencoded` — the same rule but
@@ -821,7 +968,9 @@ text and a quoted attribute; reversing HTML needs a parser's full entity table, 
 UTF-8 invariant on `bytes`; invalid input is `Error.Invalid`) plus `utf8_valid`. `std.rand`
 (non-cryptographic): `rand.seed()`/`seed_with(s)` produce a **Copy** `rng` value (state-only, no
 fd — unlike `reader`/`writer`); `r.next()`/`r.range(lo, hi)`/`r.shuffle(out xs)`/`r.sample(xs, k)`
-take a `mut` receiver, OS-seeded via `getrandom`/`urandom`; `lo >= hi` (`range`) and `k < 0` or
+take a `mut` receiver. Only `rand.seed()` is OS-seeded (via `getrandom`/`urandom`; a failure aborts
+rather than surfacing a `Result`) — `seed_with(s)` is **deterministic**, for tests and
+reproducibility. `lo >= hi` (`range`) and `k < 0` or
 `k > xs.len()` (`sample`) are programmer errors and abort at runtime, like out-of-bounds indexing.
 `std.crypto`: EVP-backed operations use OpenSSL libcrypto, linked only when a used capability
 requires it. Most work with OpenSSL 3.0; `argon2id` requires the `ARGON2ID` provider added in OpenSSL 3.2
@@ -846,12 +995,17 @@ look-around/backreferences. No regex literal or implicit cache is part of the la
 
 ## Packages
 
+The first-party packages developed in this repository are exactly two vendorable subtrees:
+
 ```text
-pkg.db.*
-pkg.web.*
-pkg.rpc.*
-pkg.cloud.*
-pkg.ai.*
+pkg.web            // the zero-copy REST framework (routing included; no separate pkg.router)
+pkg.db             // common driver surface: db.value, db.row, db.Driver, db.Error
+pkg.db.sqlite      // driver submodule
+pkg.db.postgres    // driver submodule
+pkg.db.pool        // explicit fixed-capacity connection pool
 ```
 
-Not part of the language core.
+`pkg/db` is one subtree with four public module boundaries, not four independently versioned
+packages. Further drivers (`pkg.db.mysql`, `pkg.db.odbc`, `pkg.db.duckdb`) and every ecosystem
+package are ordinary third-party `pkg` subtrees under the same two path rules; the language reserves
+no names for them. Not part of the language core. (`draft.md` §18.3.)
