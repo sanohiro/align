@@ -2990,7 +2990,7 @@ mod tests {
 
     fn mir_program(program: &hir::Program) -> Program {
         Program {
-            sqlite_callback_effects: std::collections::HashMap::new(),
+            sqlite_callback_effects: std::collections::BTreeMap::new(),
             fns: Vec::new(),
             externs: Vec::new(),
             imported_fns: Vec::new(),
@@ -3891,7 +3891,7 @@ mod tests {
         let mut tuples = hir.tuples.clone();
         tuples[0].elems = vec![Scalar::Fn(2)];
         let mut program = Program {
-            sqlite_callback_effects: std::collections::HashMap::new(),
+            sqlite_callback_effects: std::collections::BTreeMap::new(),
             fns: Vec::new(),
             externs: Vec::new(),
             imported_fns: Vec::new(),

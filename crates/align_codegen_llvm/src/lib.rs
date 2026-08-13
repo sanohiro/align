@@ -19584,7 +19584,7 @@ mod tests {
         }];
         fns.extend(extra_fns);
         let program = Program {
-            sqlite_callback_effects: HashMap::new(),
+            sqlite_callback_effects: Default::default(),
             fns,
             externs: vec![],
             imported_fns: vec![],
@@ -20089,7 +20089,7 @@ mod tests {
             };
             emit_llvm_ir(
                 &Program {
-                    sqlite_callback_effects: HashMap::new(),
+                    sqlite_callback_effects: Default::default(),
                     fns: std::iter::once(main)
                         .chain(descriptor_functions)
                         .collect(),
@@ -20396,7 +20396,7 @@ mod tests {
             };
             emit_llvm_ir(
                 &Program {
-                    sqlite_callback_effects: HashMap::new(),
+                    sqlite_callback_effects: Default::default(),
                     fns: vec![function],
                     externs: Vec::new(),
                     imported_fns: Vec::new(),
@@ -20812,7 +20812,7 @@ mod tests {
     fn malformed_nested_tagged_id_is_a_codegen_error_not_a_panic() {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let program = Program {
-            sqlite_callback_effects: HashMap::new(),
+            sqlite_callback_effects: Default::default(),
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -20856,7 +20856,7 @@ mod tests {
     fn malformed_embedded_nested_tagged_id_is_a_codegen_error_not_a_panic() {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let program = Program {
-            sqlite_callback_effects: HashMap::new(),
+            sqlite_callback_effects: Default::default(),
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -20914,7 +20914,7 @@ mod tests {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let zero = Operand::Const(Const::Int(0, i32_ty));
         let program = Program {
-            sqlite_callback_effects: HashMap::new(),
+            sqlite_callback_effects: Default::default(),
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -20965,7 +20965,7 @@ mod tests {
     fn malformed_nested_tagged_nominal_ids_are_codegen_errors_not_panics() {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let program = |payload| Program {
-            sqlite_callback_effects: HashMap::new(),
+            sqlite_callback_effects: Default::default(),
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -21020,7 +21020,7 @@ mod tests {
     fn malformed_cross_table_tagged_cycles_are_codegen_errors_not_panics() {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let program = |structs, enums, tagged_types| Program {
-            sqlite_callback_effects: HashMap::new(),
+            sqlite_callback_effects: Default::default(),
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -21172,7 +21172,7 @@ mod tests {
     fn malformed_mir_type_graphs_fail_before_llvm_construction() {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let base = || Program {
-            sqlite_callback_effects: HashMap::new(),
+            sqlite_callback_effects: Default::default(),
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -21430,7 +21430,7 @@ mod tests {
     fn direct_tagged_slot_uses_its_recursive_drop_plan() {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let program = Program {
-            sqlite_callback_effects: HashMap::new(),
+            sqlite_callback_effects: Default::default(),
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -21474,7 +21474,7 @@ mod tests {
     fn tuple_drop_uses_recursive_element_destructor() {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let program = Program {
-            sqlite_callback_effects: HashMap::new(),
+            sqlite_callback_effects: Default::default(),
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -21516,7 +21516,7 @@ mod tests {
         );
 
         let program = Program {
-            sqlite_callback_effects: HashMap::new(),
+            sqlite_callback_effects: Default::default(),
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -21576,7 +21576,7 @@ mod tests {
         let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
         let i64_scalar = Scalar::Int(IntTy { bits: 64, signed: true });
         let program = |tagged_types: Vec<hir::TaggedType>, value_tys: Vec<Ty>| Program {
-            sqlite_callback_effects: HashMap::new(),
+            sqlite_callback_effects: Default::default(),
             fns: vec![Function {
                 name: program_call("main"),
                 params: vec![],
@@ -22353,7 +22353,7 @@ mod tests {
         count_arg: bool,
     ) -> String {
         let program = Program {
-            sqlite_callback_effects: HashMap::new(),
+            sqlite_callback_effects: Default::default(),
             fns: vec![Function {
                 name: program_call(if count_arg { "allocation_probe" } else { "main" }),
                 params: if count_arg { vec![0] } else { vec![] },
@@ -22412,7 +22412,7 @@ mod tests {
     fn arena_allocation_case_ir() -> String {
         let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
         let program = Program {
-            sqlite_callback_effects: HashMap::new(),
+            sqlite_callback_effects: Default::default(),
             fns: vec![Function {
                 name: program_call("arena_allocation_probe"),
                 params: vec![0],
@@ -22460,7 +22460,7 @@ mod tests {
         let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
         let dynamic = matches!(len, Operand::Arg(0));
         let program = Program {
-            sqlite_callback_effects: HashMap::new(),
+            sqlite_callback_effects: Default::default(),
             fns: vec![Function {
                 name: program_call(if dynamic { "soa_allocation_probe" } else { "main" }),
                 params: if dynamic { vec![0] } else { vec![] },

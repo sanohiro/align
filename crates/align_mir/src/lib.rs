@@ -110,7 +110,7 @@ pub struct Program {
     /// Target-owned effect facts for functions named by SQLite callback descriptors. This table is
     /// recomputed from checked HIR bodies independently of each descriptor's copied effect bit.
     pub sqlite_callback_effects:
-        std::collections::HashMap<ProgramCall, align_sema::FnEffect>,
+        std::collections::BTreeMap<ProgramCall, align_sema::FnEffect>,
     /// Foreign (`extern "C"`) declarations, passed through from HIR unchanged; codegen emits an
     /// external LLVM declaration for each, keyed by the C symbol so a `Rvalue::Call` resolves.
     pub externs: Vec<ProgramExtern>,
@@ -15435,6 +15435,28 @@ mod tests {
     use align_parser::parse_file;
     use align_sema::check_file;
 
+    #[test]
+    fn sqlite_callback_effects_render_in_target_order() {
+        let mut program = Program::default();
+        program.sqlite_callback_effects.insert(
+            ProgramCall::from_validated("z_callback"),
+            align_sema::FnEffect::Pure,
+        );
+        program.sqlite_callback_effects.insert(
+            ProgramCall::from_validated("a_callback"),
+            align_sema::FnEffect::Impure,
+        );
+
+        let rendered = print::codegen_input_to_string(&program);
+        let Some(a) = rendered.find("a_callback") else {
+            panic!("first callback target missing: {rendered}");
+        };
+        let Some(z) = rendered.find("z_callback") else {
+            panic!("second callback target missing: {rendered}");
+        };
+        assert!(a < z, "callback effect metadata must render canonically: {rendered}");
+    }
+
     fn direct_program_name(call: &DirectCall) -> Option<&str> {
         match call {
             DirectCall::Program(target) => Some(target.as_str()),
@@ -16869,7 +16891,7 @@ fn main() -> i32 = 0
             signed: true,
         });
         let mut program = Program {
-            sqlite_callback_effects: std::collections::HashMap::new(),
+            sqlite_callback_effects: std::collections::BTreeMap::new(),
             fns: vec![Function {
                 name: ProgramCall::from_validated("main"),
                 params: vec![],
