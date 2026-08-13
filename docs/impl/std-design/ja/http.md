@@ -881,8 +881,9 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
     ループは純粋に `Content-Length` でフレーミングする(リクエストメソッドやステータスで特別扱いしない)
     ため、決して来ないボディバイトを待ち続ける → 上と同じ無期限ブロックになる。v1 の表面は `HEAD` を
     手軽には出していない(`get`/`post`/`request` のみ)が、メソッド `HEAD` で組んだ `request` はこれに
-    当たる。メソッド/ステータスを見たフレーミング(HEAD/1xx/204/304 はボディ無し)は、de-chunking を足す
-    のと同じスライスで入れる。スライス 3 では修正せず、ここに記録する。
+    当たる。**下記 align-llm Request 4 で設計済み、実装待ち。** 同じ capability が method/status-aware
+    framing、informational response の advancement、client-side chunk de-framing を、二つ目の transport
+    surface を増やさずに追加する。
 - **~~`https://` の拒否が粗い(DC-1, low)。~~ スライス 5 で解消。** `https://` はもはや `Error.Invalid`
   に写らず、検証済み TLS 経路にルーティングされる。検証失敗は明確な `Error.Denied`、TLS トランスポート不良は
   `Error.Code`、プロトコル違反は `Error.Invalid`。(メッセージレスな `Error` enum はより広い別課題として残る
@@ -989,6 +990,122 @@ accept 後無応答 → `AL_TIMEOUT`(read 経路、`SO_RCVTIMEO` + 平文写像�
 ラウンドトリップはドライバハーネスから駆動できない — `#[cfg(test)]` の信頼フックがそこには無い、スライス 5 の
 記録どおり);TLS トランスポートが唯一異なる `tls_read`/`tls_write_all` の `has_deadline` 写像は上に記述した。
 既存の http/TLS/pool/get_many/stream テストはすべて不変で通る(有効 0 のバイト一致不変条件)。
+
+## Client response framing (align-llm Request 4 — DESIGNED 2026-08-14)
+
+`align-llm` の C1 provider adapter はすでに SSE event を parse するが、provider response は一般に
+HTTP/1.1 `Transfer-Encoding: chunked` を使う。出荷済み whole-body client は provider が body を見る
+前にこの framing を拒否する。Request 4 は既存の `cl.request` boundary を完成させる。chunked response
+を de-frame し、同じ owned `response` と zero-copy `resp.body()` view を返す。public type、method、
+option、ABI entry point、streaming-input handle、provider 固有 abstraction は追加しない。
+
+これは framing capability であり、設定可能な receive-bound capability ではない。既存の固定
+`HTTP_MAX_BODY` ceiling が decoded-body ceiling のままで、超過は `Error.Invalid` のままである。
+align-llm Request 5 が public client/request cap と limit-specific error を別途所有する。Request 5 が
+この capability より後に land する場合、両者を組み合わせた cap/framing adoption gate は Request 5 が
+所有する。
+
+### Public-contract ledger
+
+| Surface / state | Exact contract |
+|---|---|
+| Existing calls | `cl.get(url)`、`cl.post(url, body)`、`cl.request(req)`、すべての `cl.get_many` worker がこの framing engine を使う。`http.parse(bytes)` は request method を持たないため ordinary method semantics で同じ complete-response decoder を使う。signature は変えない。 |
+| Ownership and views | success は既存の Move `response` を返す。exact final response head と、それに続く contiguous decoded body を含む一つの retained byte buffer を所有する。header span は exact final-head byte を引き続き index し、`status()`、`header()`、`body()` の lifetime/allocation rule は不変。interim head、chunk line、delimiter、trailer は保持しない。 |
+| Request-method selection | exact uppercase `HEAD` だけが HEAD response semantics を選ぶ。exact uppercase `CONNECT` は、この whole-body API が tunnel を返せないため、DNS、connect、write、pool access、その他の network side effect より前に `Error.Invalid` で拒否する。lowercase/mixed-case の `head` と `connect` は ordinary extension method。`http.parse(bytes)` は ordinary non-HEAD semantics を使う。 |
+| Informational responses | `101` 以外のすべての `100..=199` response は interim head。validation し、`Content-Length` と `Transfer-Encoding` をどちらも持ってはならず、payload を消費せず、discard して次の co-read byte から parse を続ける。各 terminating empty line を含む interim/final head wire span 全体で一つの cumulative `HTTP_MAX_HEADER_BLOCK = 262,144` byte allowance を共有する。各 head は独立に `HTTP_MAX_HEADERS = 128` を守る。`101` は `Error.Invalid` で、response/upgraded handle を公開しない。 |
+| Bodyless final responses | exact `HEAD` への final response と final `204`/`304` は zero-length body を作り、payload、chunk terminator、trailer を読まない。status `204` 以外の exact `HEAD` とすべての `304` は、任意 decimal magnitude の syntactically valid `Content-Length` または一つの supported `Transfer-Encoding: chunked` value を metadata として持てる。exact final header は discoverable のまま。`204` は method にかかわらず両 field を許さない。malformed/conflicting length、unsupported transfer coding、`Content-Length` と `Transfer-Encoding` の同時存在は suppression より前に拒否する。 |
+| Transfer-Encoding | すべての field value を wire order で結合し、optional SP/HTAB 付き comma で分割する。supported sequence は、parameter を持たない case-insensitive `chunked` coding が exactly one の場合だけ。empty element、repeated `chunked`、別 coding、malformed token syntax は `Error.Invalid`。supported transfer coding と任意の `Content-Length` の同時存在も `Error.Invalid`。 |
+| Content-Length / close-delimited | 既存の decimal、equal-duplicate、fixed-cap、truncation、close-delimited behavior を保つ。payload-bearing response では `Content-Length` を close-delimited より先に選び、supported chunked field をその両方より先に選ぶ。read-to-close response は引き続き reuse 不可。 |
+| Chunk-size line | `HTTP_MAX_CHUNK_LINE = 8,192` wire bytes は terminating CRLF を含む。line は一つ以上の ASCII hexadecimal digit、zero or more RFC 9112 chunk extension、exact CRLF。extension name は RFC `token`、optional value は `token` または valid quoted-pair escaping を持つ quoted-string。bare LF、invalid grammar、guard 内での CRLF 欠落、guard を越える byte は `Error.Invalid`。excess byte に依存する syntax/magnitude state より guard excess が優先し、syntactically valid magnitude が固定 decoded-body ceiling を越えれば target conversion なしで `Error.Invalid`。 |
+| Chunk payload | nonzero size は target conversion、reserve、次の payload read より前に cumulative decoded length と `HTTP_MAX_BODY` に照らして検査する。exactly size bytes の payload と exact CRLF が必要。zero は trailer を選ぶ。size line、payload、payload CRLF、zero chunk、trailer の truncation は `Error.Invalid` で、partial response は成功しない。zero は terminal なので empty data chunk は存在しない。 |
+| Trailers | `HTTP_MAX_TRAILER_BLOCK = HTTP_MAX_HEADER_BLOCK = 262,144` wire bytes は zero-chunk line 後の最初の byte から terminating empty CRLF までを数える。trailer line は exact CRLF、直後に `:` を持つ RFC-token field name、HTAB/SP/visible ASCII/obs-text だけの value を要求する。`Content-Length` と `Transfer-Encoding` trailer field は invalid。trailer count は final head の `HTTP_MAX_HEADERS` 未使用分を消費する。trailer は incrementally validate するが retain、merge、expose しない。guard exactly で終わる valid terminator は受理し、guard 越しに認識されるものは over-guard probe 無しで invalid。 |
+| Errors and precedence | request validation が network work より先。各 available head では line/header syntax、`Content-Length` normalization/conflict、transfer-coding syntax/conflict が method/status body selection より先。chunk/trailer guard は excess byte を必要とする grammar state より先、complete in-guard grammar は decoded-size check より先、decoded-size excess は payload/trailer read より先。malformed/truncated framing は `Error.Invalid`、armed I/O deadline は `Error.Timeout`、他の transport/TLS failure は既存 taxonomy のまま。全 failure で output slot は null のまま。 |
+| Connection fate | bodyless、Content-Length、terminal-chunk-plus-valid-trailers response は self-delimited。final head が keep-alive eligible で residual byte が無い場合だけ pool する。chunk metadata/trailer を完全に消費してから pool する。read-to-close、`Connection: close`、`101`、malformed/truncated framing、fixed-cap excess、任意 residual byte は pool せず close する。reused idle connection の zero-response-byte failure は既存の一度の fresh retry を保ち、response byte が一つでもあれば retry しない。 |
+| Plaintext / TLS | 一つの parser/state machine が既存 `Conn` abstraction を両 transport で消費する。同じ read limit、error、cleanup、pooling rule、timeout behavior を適用する。TLS は plaintext-only staging や別 framing path を増やさない。 |
+| Allocation / performance | header/chunk discovery は `HTTP_CLIENT_READ_CHUNK = 32,768` bytes の reusable read scratch を使う。retained response buffer は final head と decoded payload からだけ grow し、peer-declared size だけでは grow しない。known-size payload segment は spare capacity へ直接 read してよい。parser state は constant-size で、interim count、chunk count、chunk magnitude、trailer byte では grow しない。chunk table、trailer table、second body、per-chunk allocation を禁止する。 |
+| Consumer acceptance | provider fixture が二つの SSE chunk と terminal zero chunk を返し、OpenAI-compatible/llama.cpp adapter は concatenated payload だけを受け取る。direct fixture が status/header/body preservation、全 malformed/truncated case、bodyless/informational framing、plaintext/TLS parity、sequential reuse、close-delimited non-reuse を証明する。 |
+
+上記 `Content-Length` の arbitrary-magnitude allowance は `HEAD` と `304` の metadata 専用である。
+leading zero を除いて digit sequence を比較し decimal magnitude を normalize する。`usize` へ変換せず、
+`HTTP_MAX_BODY` と比較せず、それから reserve せず、body を読まない。duplicate value は normalized
+magnitude で等しい(`003` は `3` と等しい)。payload-bearing length は Request 5 が wider
+arbitrary-magnitude/limit-specific comparison を提供するまで、既存の target-representable/global-cap
+requirement を保つ。
+
+### Streaming decoder and retained layout
+
+parser は discovery 中の byte と返す handle が所有する byte を分離する。
+
+```text
+fixed read scratch -> interim head (validate, discard)
+                   -> final head (copy exact bytes once, keep header spans)
+                   -> chunk line / CRLF / trailers (validate, discard)
+                   -> decoded chunk payload (append or read directly into response buffer)
+
+response.buf = exact final head || decoded payload
+response.body_start = final head length
+response.body_len = cumulative decoded payload length
+```
+
+`HttpHead` は header scan で chunked を拒否する代わりに explicit framing classification を持つ。
+transport loop が request-method/status selection、interim advancement、byte guard、reuse を所有する。
+complete-buffer `http.parse` path は ordinary method semantics で同じ state machine を呼ぶ。従来通り、
+最初の complete self-delimited response 後の byte は body に加わらない。新しい retained layout は
+unreachable tail capacity として持たず discard する。final-head byte を rewrite せず、trailer byte を
+`HttpHeaderSpans` に入れないため、既存 header lookup は byte-exact のまま。
+
+固定 scratch read は head、size line、trailer line を完成させる boundary より後の byte を co-read してよい。
+その byte は一つの 32 KiB scratch allowance 内に留まり次 state へ渡る。failure を認識した後は retained
+body storage へ copy せず、後続 transport read を行わない。zero-chunk 後の全 read は残り trailer
+allowance に clamp する。zero-chunk と co-read 済みの byte は次の read より前に charge する。
+chunk line/trailer block の one-byte over-guard probe は無い。
+
+### Framing and reuse matrix
+
+| Method / final status | Valid metadata | Selected body | Reusable after exact completion |
+|---|---|---|---|
+| exact `HEAD`、`204` 以外の final status | framing field 無し、任意 valid CL、supported chunked TE | zero bytes、body framing を消費しない | final head が keep-alive で residual byte が無いとき yes |
+| any method、`204` | CL/TE とも無し | zero bytes | 同上 |
+| ordinary method、`304` | framing field 無し、任意 valid CL、supported chunked TE | zero bytes、body framing を消費しない | 同上 |
+| ordinary method、other final status + supported chunked TE | TE only | valid trailer まで decoded chunk | terminal chunk/trailer 完了かつ residual byte 無しで yes |
+| ordinary method、other final status + CL | CL only | exactly CL bytes | 既存 rule |
+| ordinary method、other final status + neither | none | EOF まで read | never |
+| any、interim non-`101` | CL/TE とも無し | zero、次 head へ advance | completion ではない |
+| any、`101` または invalid/conflicting framing | any | none、fail | never |
+
+### Implementation closure matrix
+
+この matrix が implementation PR の authoritative record である。implementation はこの reviewed strategy
+を reopen せずに従う。public row、allocation strategy、error/reuse precedence を変えるなら matrix を先に
+reopen し、fresh design review を要求する。
+
+| Closure axis | Required implementation evidence | Owner |
+|---|---|---|
+| Header formation and validation | `HttpHead` が exact version/status/header span と normalized CL/TE fact を記録する。parameterized table が CL duplicate/leading zero、TE token list、CL+TE、per-head header count、bodyless forbidden/permitted metadata を覆う。 | `align_runtime` HTTP parser unit |
+| Request validation | exact `CONNECT` が pool lookup/connect/write より先に fail し、case variant は fixture に到達する。exact `HEAD` だけが suppression を選ぶ。 | runtime side-effect counter fixture + driver E2E |
+| Interim construction/discard | same-read/split-read の `100`、`102`、`103`、`199` が co-read final byte を保つ。framing field、`101`、cumulative head byte excess、malformed/truncated interim head は final handle 無しで fail する。同時に live な header-span table は最大一つ。 | runtime parameterized state-machine owner |
+| Chunk move-in / compaction | same-read、every-boundary split、many-tiny-chunk、extension、uppercase/lowercase hex、embedded NUL payload、exact fixed-cap case が一つの retained final head + byte-exact decoded body を作る。 | runtime decoder matrix + allocation instrumentation |
+| Chunk malformed / early exits | empty/invalid/overlong size line、over-global magnitude、truncated payload、missing payload CRLF、missing zero chunk、全 state の EOF/error/timeout は response と later read 無し。 | runtime fault-injection matrix |
+| Trailer validation / discard | empty trailer、exact guard、guard+1、continuous unterminated input、invalid name/value、forbidden framing field、shared header-count boundary、final header と同名、every-boundary split が trailer byte/offset を保持せず header lookup を変えない。 | runtime trailer matrix + structural instrumentation |
+| Bodyless / final selection | `HEAD`、`204`、`304` が absent/CL/chunked metadata の Cartesian row(global cap 超の値を含む)を覆い、terminator/trailer read を行わない。lowercase method は payload-bearing control。 | runtime framing matrix + plaintext driver fixture |
+| Response move-out / Drop | success は exactly one response を box し、全 failure は null のまま scratch/accumulator を free する。`get_many` が chunked/ordinary response を混在させても既存 response-array success/error Drop path が exact。 | live-response/allocation counter + `get_many` owner |
+| Pool and replacement | chunked/bodyless/CL の first response は complete self-delimitation 後だけ一つの plaintext/TLS connection を second response に reuse する。close、residual、malformed、cap、`101`、read-to-close は close。stale zero-byte retry は一度の fresh attempt のまま。 | runtime pool matrix、plaintext + verified-TLS |
+| Whole / per-call consumers | `get`、`post`、`request`、`get_many`、`http.parse` が method knowledge に応じた framing behavior を共有する。package/compiler/ABI surface は変えない。 | runtime unit + `crates/align_driver/tests/http_chunked_client.rs` |
+| Plaintext / TLS parity | identical byte partition/failure が `Conn::Plain`/`Conn::Tls` を通る。timeout mapping/teardown だけが `Conn` より下で transport-specific。 | plaintext vector と対にした verified-TLS runtime fixture |
+| Resource and allocation parity | peak Align-owned response byte は retained final head + decoded body + one 32 KiB scratch。chunk/trailer structural state は constant-size。validation 前に untrusted CL/chunk magnitude から reserve しない。 | runtime capacity/high-water instrumentation |
+
+benchmark は correctness gate ではない。この capability は新しい throughput claim をせず accepted framing を
+変える。既存 R1/R4 requirement は保つため、owner は allocation/copy count を記録し、per-chunk allocation
+または second body buffer を加える regression を拒否する。
+
+### Delivery and adoption
+
+implementation は一つの runtime/owner-test capability PR。compiler/package/ABI layer は変更しない。
+implementation PR は historical item-7 client-asymmetry test を outright update し、本 section を implemented
+にする。merge 後、align-llm は次の許可された consumer-prerequisite wave で Align を rebuild/pin し、provider
+stream fixture を Content-Length から chunked へ切り替え、valid SSE、malformed/truncated rejection、final
+status/header/body preservation を証明する。sibling request register が adoption evidence の lifecycle owner
+であり続ける。
 
 ## Pitfalls
 

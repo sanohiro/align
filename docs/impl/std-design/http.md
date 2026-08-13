@@ -901,8 +901,9 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
     purely by `Content-Length` (it does not special-case the request method or status), so it would
     wait for body bytes that never arrive → the same indefinite block as above. v1's surface does not
     expose `HEAD` conveniently (only `get`/`post`/`request`), but a caller-built `request` with method
-    `HEAD` hits this. Method/status-aware framing (no-body for HEAD/1xx/204/304) lands with the same
-    slice that adds de-chunking; recorded here, not fixed in Slice 3.
+    `HEAD` hits this. **DESIGNED for align-llm Request 4 below; implementation pending.** The same
+    capability adds method/status-aware framing, informational-response advancement, and client-side
+    chunk de-framing without adding a second transport surface.
 - **~~`https://` rejection is coarse (DC-1, low).~~ RESOLVED by Slice 5.** `https://` no longer maps
   to `Error.Invalid` at all — it routes to the verified TLS path. A verification failure is now the
   distinct `Error.Denied`; a bad TLS transport is `Error.Code`; a protocol violation is
@@ -1016,6 +1017,123 @@ positive TLS round-trip is not drivable from the driver harness — the `#[cfg(t
 absent there, as recorded in Slice 5); the `has_deadline` mapping in `tls_read`/`tls_write_all` is the
 one place the TLS transport differs, documented above. Every pre-existing http/TLS/pool/get_many/stream
 test passes unchanged (the effective-0 byte-identical invariant).
+
+## Client response framing (align-llm Request 4 — DESIGNED 2026-08-14)
+
+`align-llm`'s C1 provider adapters already parse SSE events, but provider responses commonly use
+HTTP/1.1 `Transfer-Encoding: chunked`. The shipped whole-body client rejects that framing before the
+provider can see the body. Request 4 completes the existing `cl.request` boundary: it de-frames a
+chunked response into the same owned `response` and zero-copy `resp.body()` view. It adds no public
+type, method, option, ABI entry point, streaming-input handle, or provider-specific abstraction.
+
+This is a framing capability, not a configurable receive-bound capability. The existing fixed
+`HTTP_MAX_BODY` ceiling remains the decoded-body ceiling and an excess remains `Error.Invalid`.
+align-llm Request 5 separately owns the public client/request cap and its limit-specific error. If
+Request 5 lands after this capability, Request 5 owns their combined cap/framing adoption gate.
+
+### Public-contract ledger
+
+| Surface / state | Exact contract |
+|---|---|
+| Existing calls | `cl.get(url)`, `cl.post(url, body)`, `cl.request(req)`, and every `cl.get_many` worker use this framing engine. `http.parse(bytes)` uses the same complete-response decoder with ordinary method semantics because it has no request method. No signature changes. |
+| Ownership and views | Success returns the existing Move `response`. It owns one retained byte buffer containing the exact final response head followed by the contiguous decoded body. Header spans still index the exact final-head bytes; `status()`, `header()`, and `body()` keep their existing lifetime and allocation rules. Interim heads, chunk lines, delimiters, and trailers are not retained. |
+| Request-method selection | Only exact uppercase `HEAD` selects HEAD response semantics. Exact uppercase `CONNECT` is rejected as `Error.Invalid` before DNS, connect, write, pool access, or any other network side effect because this whole-body API cannot return a tunnel. Lowercase or mixed-case `head` and `connect` are ordinary extension methods. `http.parse(bytes)` uses ordinary non-HEAD semantics. |
+| Informational responses | Every `100..=199` response except `101` is an interim head. It is validated, must contain neither `Content-Length` nor `Transfer-Encoding`, consumes no payload, is discarded, and parsing continues at the next co-read byte. Interim and final head wire spans, including each terminating empty line, share one cumulative `HTTP_MAX_HEADER_BLOCK = 262,144` byte allowance. Each head independently obeys `HTTP_MAX_HEADERS = 128`. `101` is `Error.Invalid`; no response or upgraded handle is exposed. |
+| Bodyless final responses | A final response to exact `HEAD`, and final `204` and `304`, produces a zero-length body and performs no payload, chunk-terminator, or trailer read. Exact `HEAD` except at status `204`, and every `304`, may carry a syntactically valid `Content-Length` of any decimal magnitude or one supported `Transfer-Encoding: chunked` value as metadata; the exact final header remains discoverable. `204` permits neither field regardless of method. All heads still reject malformed/conflicting lengths, unsupported transfer codings, and simultaneous `Content-Length` plus `Transfer-Encoding` before suppression. |
+| Transfer-Encoding | Combine all field values in wire order and split them on commas with optional SP/HTAB. The only supported sequence is exactly one case-insensitive `chunked` coding with no parameter. Empty elements, repeated `chunked`, another coding, or malformed token syntax are `Error.Invalid`. A supported transfer coding and any `Content-Length` together are `Error.Invalid`. |
+| Content-Length / close-delimited | Existing decimal, equal-duplicate, fixed-cap, truncation, and close-delimited behavior remains. For payload-bearing responses, `Content-Length` is selected before close-delimited; a supported chunked field is selected before either. Read-to-close responses remain non-reusable. |
+| Chunk-size line | `HTTP_MAX_CHUNK_LINE = 8,192` wire bytes includes the terminating CRLF. A line is one or more ASCII hexadecimal digits followed by zero or more RFC 9112 chunk extensions and exact CRLF. Extension names are RFC `token`; an optional value is a `token` or quoted-string with valid quoted-pair escaping. Bare LF, invalid grammar, missing CRLF within the guard, or a byte beyond the guard is `Error.Invalid`. Guard excess wins before syntax or magnitude state that depends on the excess byte; a syntactically valid magnitude above the fixed decoded-body ceiling is then `Error.Invalid` without target conversion. |
+| Chunk payload | A nonzero size is checked against cumulative decoded length and `HTTP_MAX_BODY` before target conversion, reserve, or another payload read. Exactly that many payload bytes followed by exact CRLF are required. Zero selects trailers. Truncation at the size line, payload, payload CRLF, zero chunk, or trailers is `Error.Invalid`; no partial response succeeds. Empty data chunks are impossible because zero is terminal. |
+| Trailers | `HTTP_MAX_TRAILER_BLOCK = HTTP_MAX_HEADER_BLOCK = 262,144` wire bytes counts from the first byte after the zero-chunk line through the terminating empty CRLF. Trailer lines require exact CRLF, an RFC-token field name immediately followed by `:`, and a value containing only HTAB, SP, visible ASCII, or obs-text. `Content-Length` and `Transfer-Encoding` trailer fields are invalid. Trailer count consumes the unused portion of the final head's `HTTP_MAX_HEADERS` budget. Trailers are validated incrementally but never retained, merged, or exposed. A valid terminator ending exactly at the guard is accepted; recognizing one beyond the guard is invalid without an over-guard probe. |
+| Errors and precedence | Request validation precedes network work. For each available head: line/header syntax, `Content-Length` normalization/conflicts, and transfer-coding syntax/conflicts precede method/status body selection. Chunk/trailer guards precede grammar state requiring an excess byte; complete in-guard grammar precedes decoded-size checks; decoded-size excess precedes payload/trailer reads. Malformed/truncated framing is `Error.Invalid`; an armed I/O deadline remains `Error.Timeout`; other transport/TLS failures keep their existing taxonomy. Every failure leaves the output slot null. |
+| Connection fate | A bodyless, Content-Length, or terminal-chunk-plus-valid-trailers response is self-delimited. It is pooled only when the final head is keep-alive eligible and no residual byte remains. Chunk metadata and trailers must be fully consumed before pooling. Read-to-close, `Connection: close`, `101`, malformed/truncated framing, fixed-cap excess, and any residual byte close rather than pool. A zero-response-byte failure on a reused idle connection retains the existing one fresh retry; any response byte makes the failure non-retryable. |
+| Plaintext / TLS | One parser and state machine consumes the existing `Conn` abstraction for both transports. The same read limits, errors, cleanup, pooling rules, and timeout behavior apply. TLS adds no plaintext-only staging or alternate framing path. |
+| Allocation / performance | Header and chunk discovery use `HTTP_CLIENT_READ_CHUNK = 32,768` bytes of reusable read scratch. The retained response buffer grows only from the final head and decoded payload, never from a peer-declared size alone. Known-size payload segments may read directly into its spare capacity. Parser state is constant-size; it does not grow with interim count, chunk count, chunk magnitude, or trailer bytes. No chunk table, trailer table, second body, or per-chunk allocation is permitted. |
+| Consumer acceptance | A provider fixture returns two SSE chunks and a terminal zero chunk; both OpenAI-compatible and llama.cpp adapters receive only their concatenated payload. Direct fixtures prove status/header/body preservation, every malformed/truncated case, bodyless and informational framing, plaintext/TLS parity, sequential reuse, and close-delimited non-reuse. |
+
+The `Content-Length` arbitrary-magnitude allowance above is metadata-only for `HEAD` and `304`.
+Normalize its decimal magnitude by removing leading zeroes and comparing digit sequences; do not
+convert it to `usize`, compare it with `HTTP_MAX_BODY`, reserve from it, or read a body. Equal
+duplicate values are equal by normalized magnitude (`003` equals `3`). Payload-bearing lengths keep
+the existing target-representable and global-cap requirements until Request 5 supplies its wider
+arbitrary-magnitude, limit-specific comparison.
+
+### Streaming decoder and retained layout
+
+The parser separates the bytes it is discovering from the bytes the returned handle owns:
+
+```text
+fixed read scratch -> interim head (validate, discard)
+                   -> final head (copy exact bytes once, keep header spans)
+                   -> chunk line / CRLF / trailers (validate, discard)
+                   -> decoded chunk payload (append or read directly into response buffer)
+
+response.buf = exact final head || decoded payload
+response.body_start = final head length
+response.body_len = cumulative decoded payload length
+```
+
+`HttpHead` gains an explicit framing classification instead of rejecting chunked during header
+scan. The transport loop owns request-method/status selection, interim advancement, byte guards,
+and reuse. The complete-buffer `http.parse` path calls the same state machine with ordinary method
+semantics. As before, bytes after the first complete self-delimited response do not join its body;
+the new retained layout discards them instead of keeping unreachable tail capacity. Existing header
+lookup remains byte-exact because final-head bytes are not rewritten and trailer bytes never enter
+`HttpHeaderSpans`.
+
+A fixed scratch read may co-read bytes beyond the boundary that completes a head, size line, or
+trailer line. Those bytes stay within the one 32 KiB scratch allowance and are fed to the next state;
+after a failure becomes recognizable, no byte is copied into retained body storage and no later
+transport read occurs. Every post-zero-chunk read is clamped to the remaining trailer allowance.
+Bytes already co-read with the zero-chunk are charged before another read. There is no one-byte
+over-guard probe for a chunk line or trailer block.
+
+### Framing and reuse matrix
+
+| Method / final status | Valid metadata | Selected body | Reusable after exact completion |
+|---|---|---|---|
+| exact `HEAD`, final status other than `204` | no framing field, arbitrary valid CL, or supported chunked TE | zero bytes; consume no body framing | yes when final head is keep-alive and no residual byte exists |
+| any method, `204` | neither CL nor TE | zero bytes | same |
+| ordinary method, `304` | no framing field, arbitrary valid CL, or supported chunked TE | zero bytes; consume no body framing | same |
+| ordinary method, other final status + supported chunked TE | TE only | decoded chunks through valid trailers | yes after terminal chunk/trailers and no residual byte |
+| ordinary method, other final status + CL | CL only | exactly CL bytes | existing rule |
+| ordinary method, other final status + neither | none | read to EOF | never |
+| any, interim non-`101` | neither CL nor TE | zero; advance to next head | not a completion |
+| any, `101` or any invalid/conflicting framing | any | none; fail | never |
+
+### Implementation closure matrix
+
+This matrix is authoritative for the implementation PR. The implementation follows this reviewed
+strategy without reopening it; a change to the public rows, allocation strategy, or error/reuse
+precedence reopens the matrix and requires a fresh design review.
+
+| Closure axis | Required implementation evidence | Owner |
+|---|---|---|
+| Header formation and validation | `HttpHead` records exact version/status/header spans plus normalized CL/TE facts; a parameterized table covers CL duplicates/leading zeroes, TE token lists, CL+TE, per-head header count, and bodyless forbidden/permitted metadata. | `align_runtime` HTTP parser units |
+| Request validation | Exact `CONNECT` fails before pool lookup/connect/write; case variants reach a fixture. Exact `HEAD` alone selects suppression. | runtime side-effect counter fixture + driver E2E |
+| Interim construction/discard | Same-read and split-read `100`, `102`, `103`, and `199` preserve co-read final bytes; framing fields, `101`, cumulative head byte excess, malformed/truncated interim heads fail with no final handle. At most one header-span table is live. | runtime parameterized state-machine owner |
+| Chunk move-in / compaction | Same-read, split-at-every-boundary, many-tiny-chunk, extensions, uppercase/lowercase hex, embedded NUL payload, and exact fixed-cap cases produce one retained final head plus byte-exact decoded body. | runtime decoder matrix + allocation instrumentation |
+| Chunk malformed / early exits | Empty/invalid/overlong size line, over-global magnitude, truncated payload, missing payload CRLF, missing zero chunk, and EOF/error/timeout at every state produce no response and no later read. | runtime fault-injection matrix |
+| Trailer validation / discard | Empty trailers, exact guard, guard+1, continuous unterminated input, invalid name/value, forbidden framing fields, shared header-count boundary, duplicate name with final header, and split-at-every-boundary retain no trailer bytes/offsets and never alter header lookup. | runtime trailer matrix + structural instrumentation |
+| Bodyless / final selection | `HEAD`, `204`, and `304` cover absent/CL/chunked metadata Cartesian rows, including values above the global cap; no terminator/trailer read occurs. Lowercase method controls are payload-bearing. | runtime framing matrix + plaintext driver fixture |
+| Response move-out / Drop | Success boxes exactly one response; every failure leaves null and frees scratch/accumulator. Existing response array success/error Drop paths remain exact when `get_many` mixes chunked and ordinary responses. | live-response/allocation counters + `get_many` owner |
+| Pool and replacement | Chunked, bodyless, and CL first responses reuse one plaintext/TLS connection for a second response only after full self-delimitation. Close, residual, malformed, cap, `101`, and read-to-close cases close; stale zero-byte retry remains one fresh attempt. | runtime pool matrix, plaintext and verified-TLS |
+| Whole / per-call consumers | `get`, `post`, `request`, `get_many`, and `http.parse` share framing behavior appropriate to their method knowledge; no package/compiler/ABI surface changes. | runtime units + `crates/align_driver/tests/http_chunked_client.rs` |
+| Plaintext / TLS parity | Identical byte partitions and failures traverse `Conn::Plain` and `Conn::Tls`; timeout mapping and teardown remain transport-specific only below `Conn`. | verified-TLS runtime fixtures paired with plaintext vectors |
+| Resource and allocation parity | Peak Align-owned response bytes are retained final head + decoded body + one 32 KiB scratch; chunk/trailer structural state is constant-size. No reserve uses untrusted CL/chunk magnitude before validation. | runtime capacity/high-water instrumentation |
+
+No benchmark is a correctness gate: this capability changes accepted framing without making a new
+throughput claim. The existing R1/R4 requirements still apply, so the owner records allocation and
+copy counts and rejects a regression that adds per-chunk allocation or a second body buffer.
+
+### Delivery and adoption
+
+The implementation is one runtime/owner-test capability PR. No compiler, package, or ABI layer must
+change. The implementation PR updates the historical item-7 client-asymmetry tests outright and
+marks this section implemented. After merge, align-llm rebuilds and pins Align in its next permitted
+consumer-prerequisite wave, switches its provider stream fixtures from Content-Length to chunked,
+and proves valid SSE, malformed/truncated rejection, and final status/header/body preservation. The
+sibling request register remains the lifecycle owner for that adoption evidence.
 
 ## Pitfalls
 

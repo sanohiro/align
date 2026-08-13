@@ -37,6 +37,13 @@ and EXPLAIN are proved against PostgreSQL/pgvector; SQLite vec1 and the wider RD
 boundary are recorded without adding an extension loader or common vector/search abstraction. Any
 later direct native-vector mapping remains a separate consumer-driven, driver-qualified design.
 
+The next consumer-backed capability is align-llm Request 4: client-side HTTP/1.1 chunked response
+de-framing for the C1 provider-stream acceptance gate. Its public contract, framing/reuse matrix,
+allocation rule, and implementation closure matrix are accepted in
+`docs/impl/std-design/http.md` "Client response framing". It changes no public API or ABI. The next
+PR implements that reviewed runtime-only boundary across plaintext/TLS, `http.parse`, pooling, and
+the existing client calls; a public or allocation-strategy change reopens the matrix first.
+
 The align-llm compatibility break found by the v0.4.0-successor release
 compiler is closed on `main` by #786: Sema admitted both `str.clone()` and
 `string.clone()` while the MIR body validator accepted only the borrowed
@@ -150,8 +157,9 @@ facts must live in this repository.
   `docs/impl/pkg-design/web.md`; `docs/impl/15-pkg-web-plan.md` is the completed
   execution record. The framework is general-purpose REST infrastructure, not
   an LLM-gateway-specific subset.
-- **align-llm requests:** Requests 4–5 and 7–14 remain proposed in
-  `../align-llm/docs/align-requests.md`. Request 6 is `ALIGN_MERGED` (design
+- **align-llm requests:** Request 4 is accepted and designed for the next implementation PR.
+  Requests 5 and 7–14 remain proposed in `../align-llm/docs/align-requests.md`. Request 6 is
+  `ALIGN_MERGED` (design
   #703, implementation #704); its real-client adoption and pin are
   align-llm-side. Request 9 remains the later C7 blocker.
 
