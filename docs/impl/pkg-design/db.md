@@ -1584,7 +1584,8 @@ The design must not block:
 - attached databases;
 - backup API;
 - incremental blob I/O;
-- custom functions/collations when a safe callback model exists.
+- custom scalar functions when the proved callback rail lands, and collations only after their
+  persisted-order identity and migration model exists.
 
 Only connection, typed Query, transaction, migration, and metadata essentials are required in the
 first release. Others are roadmap items.
@@ -5381,8 +5382,9 @@ No roadmap item may add hidden relationship loading or a Query-builder DSL.
 - reject U+0000 in dynamic SQL before SQL send;
 - keep dynamic execution separate from typed Query descriptors and checked artifacts;
 - decode dynamic rows by indexed access only, with no struct reflection or name-based field writes;
-- add SQLite function/collation and PostgreSQL notice/COPY callback surfaces only after the
-  callback-capture, abort, reentrancy, and thread rules are proved;
+- add SQLite scalar functions after the callback-capture, abort, reentrancy, and thread rules are
+  proved; add collations only after persisted-order identity/migration is also proved; keep
+  PostgreSQL notice/COPY callbacks separate;
 - pin statement count, value allocation, callback lifetime, and cleanup behavior.
 
 #### A2 dynamic SQL/value/row public-contract ledger
@@ -5824,6 +5826,281 @@ requires a fresh design review before implementation continues.
 This capability follows the typed Query product. It is not permission to route typed Query
 execution through a reflective dynamic engine.
 
+#### A2 SQLite scalar-function callback public-contract ledger
+
+This ledger is the source of truth for the first native-callback rail. It adds connection-local
+SQLite scalar functions without retaining a source closure, exposing a native pointer, or permitting
+callback reentry into the owning connection. SQLite collations and PostgreSQL notice/COPY callbacks
+remain separate rails. Landing the compiler producer without scalar registration is dormant, so the
+public producer, generated C-ABI trampoline, registration, replacement, removal, and callback
+consumer form one capability. The implementation may therefore exceed 1,000 changed hand-written
+lines; this one-PR boundary has less duplicated proof and lower integration risk than splitting the
+strict producer-to-consumer chain.
+
+The exact public inventory is confined to `pkg.db.sqlite`:
+
+```align
+pub function_args {
+  values: slice<pkg.db.value>,
+}
+
+pub scalar_function {}
+
+pub FunctionOption {
+  Deterministic
+}
+
+pub fn function(
+  callback: fn(function_args) -> Result<pkg.db.value, str>,
+) -> scalar_function = process.abort()
+
+pub fn register_function(
+  borrow mut connection: pkg.db.conn,
+  name: str,
+  arity: i32,
+  callback: scalar_function,
+  options: slice<FunctionOption>,
+) -> Result<(), pkg.db.Error>
+
+pub fn remove_function(
+  borrow mut connection: pkg.db.conn,
+  name: str,
+  arity: i32,
+) -> Result<(), pkg.db.Error>
+
+```
+
+There are no aliases, variadic function form, aggregate/window function, arbitrary comparator,
+collation-needed hook, auxiliary-data hook, subtype/innocuous/schema-use option, transaction target,
+pool-wide installer, raw callback constructor, manual callback pointer, or captured callback in this
+rail. Every argument above is required. `options = []` installs a non-deterministic function;
+`[Deterministic]` is the only other valid slice. Every function is registered as UTF-8 and
+`SQLITE_DIRECTONLY`. No callback can run from a view, trigger, CHECK/default constraint, generated
+column, expression/partial index, or other schema program. A later contract may add schema use only
+with a separately proved innocuous/deterministic policy.
+
+`scalar_function` is a nominal compiler-produced Copy descriptor. Its fieldless source declaration
+is not constructible as an ordinary value. `function` is a compile-time producer despite its source
+spelling: its sole argument must resolve to one exact
+named or non-capturing lifted Align function. A capturing closure, dynamically selected function
+value, extern declaration, unresolved/open callable set, wrong signature, or callback with an
+unproved effect is rejected before HIR publication. A scalar callback may be Pure or Impure;
+`Deterministic` is accepted only when its descriptor records the complete inferred `Pure` fact.
+Purity does not mean total: an allocation failure, bounds failure, invalid integer division,
+explicit `process.abort`, or another language hard error terminates the process exactly as it does
+outside SQLite. No panic/unwind or ordinary error crosses the C boundary.
+
+The compiler emits one exact 32-byte, 8-aligned v1 static descriptor per semantic callback:
+
+```text
+offset  width  meaning
+0       u32    version = 1
+4       u8     kind = 0 (scalar function)
+5       u8     effect: 0 = Pure, 1 = Impure
+6       u16    zero
+8       raw    non-null generated C-ABI trampoline
+16      raw    non-null NUL-terminated canonical callback identity bytes
+24      i64    identity byte length, positive and excluding the terminator
+```
+
+No other version, kind, effect, reserved value, null pointer, nonpositive/unrepresentable identity
+length, embedded identity NUL, signature, or relocation product is valid. Kind 0 has exact source
+signature `fn(function_args) -> Result<pkg.db.value, str>`. The generated identity is nominal: canonical module
+and declaration/lifted identity, complete callback signature including parameter modes, inferred
+effect, return provenance and cleanup ABI, descriptor version/kind, and generated-family version.
+The complete descriptor validator and LLVM preflight correlate those fields with one stored or
+imported target and inspect the exact trampoline body before any pointer is loaded or registered.
+A descriptor/trampoline/identity splice, application-constructed value, wrong-kind use, malformed
+checked HIR/MIR, or unguarded accessor fails closed.
+
+`function_args` is a Copy view formed only inside a generated trampoline. Its field is an ordinary
+readable value, but its source provenance is the callback invocation: it cannot be returned, stored
+into a longer-lived aggregate, captured by an escaping function value, moved to a task, or used
+after the callback returns. `function_args.values` is one ordered slice with exactly `arity`
+elements. A scalar callback
+may return Text/Bytes borrowed from its arguments or static storage because the trampoline consumes
+and transient-copies that result before the invocation ends.
+
+The scalar input/output mapping is exact:
+
+| SQLite storage/result class | callback `pkg.db.value` |
+|---|---|
+| `SQLITE_NULL` | `Null` |
+| `SQLITE_INTEGER` | `I64(sqlite3_value_int64(...))` |
+| `SQLITE_FLOAT` | finite, infinity, or signed-zero `F64`; a native NaN is invalid |
+| `SQLITE_TEXT` | `Text` view after exact nonnegative length, final-pointer, UTF-8, and no-U+0000 validation; zero length uses the stable non-null sentinel |
+| `SQLITE_BLOB` | `Bytes(byte_view { bytes })`; every zero-length input uses the stable non-null sentinel, including when SQLite returns null |
+
+Callback results accept every `pkg.db.value` variant. `Bool`, `I16`, and `I32` widen through
+`sqlite3_result_int64`; `F32` widens through `sqlite3_result_double`; `I64`, `F64`, `Null`, Text, and
+Bytes use the corresponding exact result routine. NaN, a Text result containing U+0000, an
+unrepresentable length, a nonempty null view, or an invalid tagged value becomes the fixed callback
+error `pkg.db SQLite function callback returned an invalid value` through `sqlite3_result_error`
+with that exact explicit byte length before SQLite observes a value. Text/Bytes use explicit nonnegative lengths and
+`SQLITE_TRANSIENT`; SQLite owns its copy before the callback returns. Empty Text/Bytes use a stable
+non-null sentinel and remain distinct from `Null`. `Err(message)` uses `sqlite3_result_error` with
+the explicit UTF-8 byte length; an empty, U+0000-bearing, or unrepresentable message is replaced by
+the fixed `pkg.db SQLite function callback returned an invalid error message`. Native input
+conversion OOM uses `sqlite3_result_error_nomem`; other malformed native input uses
+`pkg.db SQLite function callback received an invalid native value`. The independent semantic/byte
+goldens are `I64(-2)`, exact IEEE-754 bits for `F64(-0.0)` and both infinities, UTF-8
+`é = c3 a9`, `Bytes([0, 255]) = 00 ff`, empty Text/Bytes, and Null. No bool/narrow-integer type tag
+can be recovered from SQLite input storage.
+
+Each generated scalar trampoline has exact C ABI
+`fn(context: raw, argc: i32, argv: raw) -> ()`. It validates non-null context, `0 <= argc <= 127`,
+the argv null/count product, and every argument in increasing ordinal before invoking application
+code. SQLite's fixed-arity registration contract owns the `argc == arity` invariant; no arity is
+duplicated in the descriptor or recoverable from null application data. A null context is a native
+contract violation and calls `process.abort` without calling any SQLite result routine. With a
+non-null context, the trampoline obtains `sqlite3_context_db_handle(context)` exactly once before
+value extraction and hard-aborts if it is null.
+
+It calls `sqlite3_value_type` once per ordinal. For Text it calls `sqlite3_value_bytes` first and
+then `sqlite3_value_text` as the final accessor; for Bytes it calls `sqlite3_value_bytes` first and
+then `sqlite3_value_blob` as the final accessor. Every byte count must be nonnegative. A null final
+Text pointer is followed immediately by `sqlite3_errcode` on the saved database handle before any
+other SQLite API, mapping `SQLITE_NOMEM` to `sqlite3_result_error_nomem` and any other code to the
+fixed malformed-input error. Initial BLOB-to-BLOB access performs no encoding conversion: a null
+final Bytes pointer is the malformed-input error when length is nonzero and is replaced by the
+stable non-null empty sentinel when length is zero. Every zero-length Text/Bytes view is normalized
+to that sentinel regardless of the native pointer. No further value accessor is
+called on that same `sqlite3_value` before the source callback returns. This final-pointer order
+pins SQLite conversion side effects and OOM precedence without retaining an accessor result that a
+later `sqlite3_value_bytes` call may invalidate.
+
+The trampoline forms one fixed-capacity 127-value stack scratch and one borrowed slice of its first
+`argc` entries; it performs no package heap allocation and invokes the callback at most once. For
+every non-null context it emits exactly one result call on `Ok`, or exactly one error result on
+`Err` or a recoverable pre-callback failure. It never obtains the source connection wrapper,
+prepares/steps/resets/finalizes a statement, calls registration, or exposes context/argv to source.
+
+Registration is connection-global native state and therefore accepts only `borrow mut` of one live,
+idle, direct SQLite `conn`. It rejects PostgreSQL, a pool-origin physical connection, a detectably
+closed/malformed connection, an active execution lease, an active transaction, or any live
+dependent statement/rows/batch/cursor before a native call. The ordinary ownership rules already
+make the last four overlaps statically unavailable; the complete runtime state/native-autocommit
+proof remains fail-closed. The linked SQLite runtime must report at least 3.30.0, the
+[first release with `SQLITE_DIRECTONLY`](https://sqlite.org/releaselog/3_30_0.html); an older runtime rejects before registration rather than silently losing
+the schema-execution boundary. A successful registration is attached to that physical connection until
+replacement, explicit removal, or connection close. It is visible to every later typed or dynamic
+statement on that connection. It is not copied to another connection and cannot silently survive a
+pool return because pool-origin registration is forbidden.
+
+Names are explicit UTF-8 `str`, 1 through 255 bytes excluding a terminator, and contain no U+0000.
+After all package-detectable validation succeeds, the package forms one fixed-capacity 256-byte
+call-local stack scratch, copies the possibly sliced/nonterminated input into its first `name.len`
+bytes, appends one NUL, and retains that prefix through the single native call. The scratch has no
+heap allocation or destructor; SQLite retains the name value, not the caller buffer.
+Function arity is fixed `0..=127`; `-1` variadic registration is not exposed. Function identity is
+SQLite's case-insensitive name plus exact arity and UTF-8 encoding. Registration deliberately follows SQLite replacement semantics for an
+existing identity, including a built-in override; removal passes null callbacks for that exact
+identity. Neither operation probes the schema, prepares SQL, retries, or discovers another arity.
+The package passes null `pApp` and null `xDestroy` for every registration. Descriptor and
+trampoline storage is immutable program-lifetime data, so replacement, removal, close, and either
+native registration failure have no application allocation or destructor edge.
+
+Validation order is exact and stops at the first failure:
+
+1. authenticate the complete connection scalar/tag/reserved/pointer product;
+2. require SQLite, direct origin, wrapper idle state, native autocommit, then linked SQLite at least 3.30.0;
+3. validate name length then U+0000;
+4. validate arity, then the option slice in source order;
+5. authenticate the complete descriptor and require scalar-function kind;
+6. require Pure for `Deterministic`;
+7. form and terminate the call-local native-name stack scratch, load the guarded trampoline, and make exactly
+   one native registration/removal call;
+8. copy any native error before freeing the name; on any native failure poison/close the physical
+   connection and return that first `NativeError` because SQLite does not promise the prior
+   registration state remains usable;
+9. re-prove native autocommit and wrapper idle state before success; poison/close on contradiction.
+
+Duplicate `Deterministic` is the first option error. Removal has no descriptor/effect phase. All
+package-detectable errors happen before native mutation. The exact Query-less errors are:
+
+| condition | error |
+|---|---|
+| non-SQLite target | `DriverMismatch(ContractError { query_id: None, item: "sqlite.callback.driver", message: "SQLite callbacks require a SQLite connection" })` |
+| pool-origin or non-idle target | `Unsupported(ContractError { query_id: None, item: "sqlite.callback.connection", message: "SQLite callbacks require an idle direct connection" })` |
+| linked SQLite is older than 3.30.0 | `Unsupported(ContractError { query_id: None, item: "sqlite.callback.version", message: "SQLite callbacks require SQLite 3.30.0 or newer" })` |
+| empty/too-long name | `Unsupported(ContractError { query_id: None, item: "sqlite.callback.name", message: "SQLite callback name must contain 1 to 255 UTF-8 bytes" })` |
+| name contains U+0000 | `Encode(ContractError { query_id: None, item: "sqlite.callback.name", message: "SQLite callback name contains U+0000" })` |
+| arity outside `0..=127` | `Unsupported(ContractError { query_id: None, item: "sqlite.function.arity", message: "SQLite scalar function arity must be between 0 and 127" })` |
+| duplicate/unknown option | `Unsupported(ContractError { query_id: None, item: "sqlite.function.option", message: "SQLite scalar function options are invalid" })` |
+| wrong/malformed descriptor | `Unsupported(ContractError { query_id: None, item: "sqlite.callback.descriptor", message: "SQLite callback descriptor is invalid" })` |
+| deterministic function is not Pure | `Unsupported(ContractError { query_id: None, item: "sqlite.function.deterministic", message: "SQLite deterministic functions require a Pure callback" })` |
+| native registration/removal failure | ordinary SQLite `Connection(NativeError)` with the current primary/extended code and copied message |
+| post-call idle proof fails | first native error if present; otherwise `Unsupported(ContractError { query_id: None, item: "sqlite.callback.cleanup", message: "SQLite callback registration left the connection unusable" })` |
+
+SQLite invokes a registered callback synchronously on the thread executing the statement. Align
+resources and resource references remain non-Send, the execution lease admits one statement on the
+connection, and a descriptor contains no environment. Safe callback source therefore has no route
+to the owning connection: the callback receives only invocation views, captures nothing, and Align
+has no mutable global state. It may open/use a distinct connection, but it cannot close, reset,
+finalize, register on, or recursively execute the connection currently inside SQLite. Thread-local
+native views are formed, consumed, and invalidated on that same callback thread. The package does
+not alter SQLite process-global configuration or threading mode.
+
+Implementation authority is SQLite's published contract for
+[`sqlite3_create_function_v2`](https://sqlite.org/c3ref/create_function.html),
+[`sqlite3_value_*`](https://sqlite.org/c3ref/value_blob.html),
+[`sqlite3_result_*`](https://sqlite.org/c3ref/result_blob.html),
+[threading modes](https://sqlite.org/threadsafe.html). The owner tests use the configured library;
+they do not infer a stronger pointer, destructor, callback-count, or thread guarantee than those
+interfaces publish.
+
+Registration changes the ordinary `pkg.db.sqlite` interface and its importers' dependency-interface
+keys once. Each descriptor's semantic identity and generated trampoline enter the unit's
+implementation/object/cache key; changing the callback body changes its implementation key, while
+changing its signature/effect/provenance changes both descriptor identity and dependent interface
+facts. There is no checked SQL artifact, catalog artifact, persisted descriptor file, runtime
+reflection table, network access, or normal-build database access. Whole-program and per-unit
+compilation emit byte-identical v1 descriptor data and one definition of each canonical generated
+trampoline, with imported callback targets linked by their encoded Align symbol.
+
+The implementation closure matrix is:
+
+| Closure cell | Required implementation closure | Exact owner evidence |
+|---|---|---|
+| public formation and inventory | Export exactly the types, variants, and functions above; lower only one direct noncapturing target of the exact kind signature; require complete effect/provenance/cleanup facts; reject captures, externs, dynamic/open target sets, ordinary fieldless construction, and every omitted surface. | source/interface inventory; direct/imported/noncapturing-lambda positives; capture/extern/dynamic/wrong-signature/effect negatives; whole/per-unit interface parity |
+| descriptor and generated identity | Form and validate the exact 32-byte v1 record, canonical nominal identity, signature, effect, return provenance/cleanup, relocation, and generated C-ABI family before pointer use. | semantic-to-byte and byte-to-semantic goldens; every field mutation; cross-kind/target/identity/trampoline splice; malformed HIR/MIR/LLVM preflight; whole/per-unit/ThinLTO link twins |
+| scalar trampoline | Hard-abort a null context; otherwise save its database handle, validate argc/argv and every value in bytes-then-final-pointer order before one callback, normalize every empty Text/Bytes view to the stable non-null sentinel, preserve ordered invocation views and returned provenance, and map every value/result/error exactly once with transient copies and no package heap. | null-context/db-handle subprocess owners; argc -1/0/127/128 and argv null products; every storage class/value variant; injected text/blob OOM and exact accessor/errcode traces; empty null/non-null pointer normalization; malformed pointer/length/UTF-8/NUL/NaN; exact invalid-result message; Ok/Err/hard-error IR; call/result/allocation counters |
+| registration and removal | Enforce exact connection/version/name/arity/option/descriptor order, form one call-local terminated stack name only after validation, pass UTF-8/DIRECTONLY flags, prove deterministic eligibility, make one native call, and copy native errors before returning. | pairwise multi-invalid no-call matrix; SQLite 3.29.99/3.30.0/newer; name 0/1/255/256/NUL and sliced/nonterminated input; exact stack bytes and fake-native call order; arity -1/0/127/128; options; built-in/user replacement/removal; autocommit before/after |
+| lifetime, cleanup, and reentrancy | Retain only program-lifetime trampoline data; pass null application/destructor pointers; keep callbacks connection-local through replace/remove/close; forbid pool-origin registration and access to the invoking connection; preserve a copied first native error and poison/close on every native mutation failure or failed reuse proof. | registration/replace/remove failure and close destructor-zero counters; direct/pool/tx/lease/dependent-resource matrix; typed/dynamic invocation; distinct-connection nested callback; no same-connection source route; poison/no-call-after-close |
+| thread and effect behavior | Invoke and consume views on the statement thread, retain no callback frame data, preserve non-Send connection ownership, mark generated C entrypoints nounwind, and distinguish ordinary scalar Err from process-hard abort. | thread-id assertions; view/callback return/capture/task escape negatives; Pure/Impure x option; LLVM nounwind/ABI inspection; ordinary error continuation and hard-abort subprocess twins |
+| build, cache, and measurement | Preserve existing typed/dynamic behavior without callbacks, emit stable whole/per-unit identities, link SQLite only when reachable, and run the local DB parity gate. Measure registration and scalar calls at arity 0/1/127 without semantic thresholds. | cumulative Q2/Q4b/A1/A2 owners; interface/object/cache before/after twins; `scripts/db-verify-local.sh`; required CI; non-gating `bench/pkg_db_sqlite_callbacks` record |
+
+The independent adversarial review of `7eb445b` reopened the persisted-collation-identity axis. This
+revision closes its complete finding set before a fresh review:
+
+| Finding | Ledger-first closure | Required owner |
+|---|---|---|
+| a connection-local comparator can outlive the process semantically through persisted indexes, while SQLite exposes no collation analogue of `DIRECTONLY` | Remove collations from this rail. A later contract must version comparator semantic identity and define schema discovery, migration/`REINDEX`, replacement, failure, and reopening behavior before exposing registration. | future persisted-index/reopen/version-change matrix; no collation symbol in this rail's interface inventory |
+| cleanup used `Connection(ContractError)`, which is not an inhabitant of `pkg.db.Error` | Use `Unsupported(ContractError)` for a package-detected post-call contradiction; preserve `Connection(NativeError)` only for copied SQLite failures. | error-constructor type check and post-call contradiction owner |
+| `str` does not imply a NUL-terminated native name | Form one validated fixed 256-byte stack scratch, append NUL after the copied bytes, and retain the prefix through the call. | sliced/nonterminated names plus exact stack bytes and call ordering |
+| SQLite value conversion OOM and accessor invalidation order was ambiguous | Save the context database handle, pin type/text-or-blob/bytes ordering, inspect `sqlite3_errcode` immediately after suspicious null, and forbid another conversion on that value before the callback. | injected OOM at every conversion plus API trace and no-read-after-null owners |
+| the descriptor contains no registered arity for the trampoline to check | Rely on SQLite's fixed-arity native contract and validate only `argc` range and argv product inside the trampoline. | 0/127 valid and out-of-range/native-product mutation owners |
+| a null context cannot safely receive an SQLite error result | Treat null context as a hard native-contract abort before the common result/error path. | null-context subprocess owner with zero SQLite result calls |
+| failed replacement/removal does not promise which registration remains | Copy the native error, then poison/close on every failed native mutation so no ambiguous state can be reused. | replacement/removal failure x prior absent/user/builtin state, copied-error and no-call-after-close counters |
+| the trusted generated reverse-callback mechanism was only recorded in package documents | Add the narrow producer-selected mechanism and its non-goals to `draft.md`, `language-spec.md`, and `design-notes.md`. | cross-document contract check plus producer/interface inventory |
+
+The fresh full review of `cb808cc` exposed the missed native-view-normalization axis. The scalar
+boundary remains one producer/consumer capability because no independently useful dormant split
+removes this pointer-lifetime proof. This matrix revision closes every verified report:
+
+| Review report | Disposition | Required owner |
+|---|---|---|
+| empty native BLOB could form a null `slice<u8>` | Valid: normalize every zero-length Text/Bytes input to the program-lifetime non-null sentinel before forming the view. | null and non-null empty native pointers produce one valid empty view; no native pointer survives |
+| `sqlite3_value_bytes` could invalidate a pointer retained from an earlier accessor | Valid: obtain and validate the byte count first, call text/blob as the final accessor, inspect errcode immediately after null Text, normalize null empty BLOB without conversion, and call no later accessor on that value. | exact per-value API traces, injected Text-conversion OOM, and pointer-use-after-final-accessor owner |
+| DIRECTONLY requires SQLite 3.31.0 | Rejected after primary-source verification: SQLite's official 3.30.0 release record explicitly introduces `SQLITE_DIRECTONLY`; retain the 3.30.0 floor and link that record. | configured 3.29.99/3.30.0/newer version boundary owner |
+| invalid callback results had no exact observable error bytes | Valid: use exact `pkg.db SQLite function callback returned an invalid value` bytes and explicit length. | each invalid result class observes exactly that message and no value result |
+
+Before implementation, run one fresh independent adversarial review of this ledger and the shared
+producer/consumer boundary, then close every valid finding ledger-first. Before code review, perform
+one author-side matrix-to-diff pass. A finding that changes callback capture/effect eligibility,
+argument/result ownership, the comparator strategy, native ABI, registration lifetime, or
+failure/reentrancy behavior changes the public or safety strategy and requires a fresh design review.
+
 ### Initial release gate
 
 The D labels define acceptance ownership. Publication follows the delivery
@@ -6060,6 +6337,14 @@ The design is implemented correctly only if all are true:
 104. Dynamic SQL creates no static Query descriptor/artifact/cache identity, compiler builtin,
      runtime reflection table, or normal-build database/network work; whole-program and per-unit
      package interfaces remain identical.
+105. SQLite scalar callbacks are formed only from one exact noncapturing target through nominal static
+     descriptors and generated C-ABI trampolines. No source closure environment, native pointer,
+     connection handle, or callback-frame view survives registration or invocation.
+106. Scalar functions receive one ordered `slice<db.value>`, return `Result<db.value, str>`, are
+     always DIRECTONLY, and may claim deterministic behavior only with a proved-Pure target.
+107. Scalar callback registration is fixed-arity, UTF-8, connection-local, direct-SQLite-only state. It
+     persists visibly until replace/remove/close, never follows a pool slot, and uses no application
+     destructor or registration-owned heap environment.
 
 ---
 
@@ -6071,13 +6356,17 @@ consumer-driven type/native-surface decisions are:
 
 1. Decimal precision/scale representation.
 2. UUID, temporal, JSON/JSONB, PostgreSQL array/range/domain, and SQLite custom-type mappings.
-3. Native callback safety for SQLite functions/collations.
-4. Which COPY/pipeline/backup/blob operations have a measured consumer. No PostgreSQL COPY consumer
+3. Which COPY/pipeline/backup/blob operations have a measured consumer. No PostgreSQL COPY consumer
    or workload measurement is currently recorded, so its public surface and implementation remain
    deferred.
+4. SQLite collation semantic identity and persisted-index migration. A future surface must make
+   comparator-version changes explicit, discover affected schema objects, define replacement and
+   reopen behavior, and require an atomic migration/`REINDEX` policy before application queries can
+   observe an index built under another ordering.
 
-The minimal common dynamic `db.value`/`db.row` set is settled by §19 and the A2 ledger in §23. It
-does not settle the wider logical/native type mappings above or any callback surface.
+The minimal common dynamic `db.value`/`db.row` set and the SQLite scalar-function callback surface
+are settled by §19 and the A2 ledgers in §23. They do not settle the wider logical/native type
+mappings above, SQLite collations, or the separate PostgreSQL callback surface.
 
 The engine/version nullability/origin support matrix is settled by §16.3.1 and owned by
 D0/D3/D5 rather than this list. The remaining items have roadmap homes in D12–D14. They do not

@@ -1106,6 +1106,15 @@ beyond the frame, or handed to `spawn` (§11) — needs a region-owned environme
 enclosing `arena {}` / `task_group {}` scope (never a hidden `malloc`); escape analysis chooses the
 representation.
 
+A trusted compile-time library producer may instead require one exact named or non-capturing lifted
+function and compile it into a nominal static descriptor plus a producer-owned C-ABI trampoline.
+This is available only to producer identities whose package contract fixes the source signature,
+effect and provenance facts, native ABI, lifetime, cleanup, validation order, and malformed-input
+behavior. It forms no closure environment or ordinary function value, and application source cannot
+construct the descriptor, obtain its pointer, select a native signature, or use the mechanism as
+general reverse FFI. A callback invocation may expose only the package's declared invocation-scoped
+views; those views cannot escape the generated trampoline.
+
 ### Sequential Effects and Evaluation Order
 
 Ordinary sequential `map` / `where` / `reduce` / `scan` / `partition` / `any` / `all` callables may

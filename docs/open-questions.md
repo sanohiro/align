@@ -13,6 +13,28 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### `pkg.db.sqlite` scalar callbacks use static targets (SETTLED 2026-08-13)
+
+**Decision:** D14's first native-callback rail accepts one exact noncapturing named or lifted Align
+target and compiles it into a nominal static descriptor plus a generated C-ABI trampoline. It does
+not retain a closure environment or expose a native pointer. Scalar functions receive an ordered
+invocation-scoped `slice<db.value>` and return `Result<db.value, str>`; they are always SQLite
+DIRECTONLY, and the optional deterministic flag requires the complete inferred Pure fact.
+
+Registration is fixed-arity, connection-local, and restricted to an idle direct SQLite connection;
+it persists until replacement, explicit removal, or close. Program-lifetime
+trampolines require no application data/destructor, so failed registration cannot create an
+application cleanup fork. Callback views stay on the statement thread, safe
+source has no route to the invoking connection, ordinary scalar `Err` becomes an SQLite function
+error, and a language hard error terminates the process without unwinding through C.
+
+This settles SQLite scalar-function capture, effect, abort, reentrancy, thread, lifetime, and
+cleanup rules. SQLite collations and PostgreSQL notice/COPY callbacks remain separate D14 consumer
+decisions.
+
+Record: `docs/impl/pkg-design/db.md` §23 and synchronized
+`docs/impl/pkg-design/ja/db.md`
+
 ### `pkg.db` dynamic values are a closed indexed region surface (SETTLED 2026-08-13)
 
 **Decision:** D14's common dynamic-SQL escape hatch uses one closed Copy sum:
@@ -36,9 +58,8 @@ SQLite's package-tracked busy timeout and fail-closes PostgreSQL if its package-
 encoding has drifted before publication or reuse; other visible session-global effects persist.
 The private stream validates scalar/tag/reserved/null products, while non-null native/state pointer
 provenance remains the privileged unsafe producer's obligation. This settles only the minimal
-common dynamic rail;
-decimal/temporal/UUID/JSON/array/range/domain mappings and all native callback surfaces remain
-separate consumer decisions.
+common dynamic rail; decimal/temporal/UUID/JSON/array/range/domain mappings and native callback
+surfaces have their own ledgers or remain separate consumer decisions.
 
 Record: `docs/impl/pkg-design/db.md` §§19 and 23 and synchronized
 `docs/impl/pkg-design/ja/db.md`
@@ -2861,6 +2882,16 @@ shipped behavior normative without fixing the internal sorting algorithm. Full c
 
 ## Open (to be decided)
 
+### SQLite collation identity and persisted-index migration — pending (D14)
+
+SQLite can persist comparator results in indexes and schema objects, but its collation registration
+API has no `DIRECTONLY` boundary. A connection-local callback whose body changes between program
+versions can therefore disagree with an existing on-disk index even when the callback is Pure and
+obeys ordering laws. Before `pkg.db.sqlite` exposes a collation callback, define a versioned
+semantic identity, affected-schema discovery, replacement and reopen behavior, failure atomicity,
+and an explicit migration/`REINDEX` policy that completes before application queries can use the
+old ordering. The scalar-function rail does not pre-commit that surface.
+
 Each item is tagged with a target milestone for resolution (`impl/07-roadmap.md`).
 
 ### Scalar-family `==` / `Ord` admission for 128-bit id types — pending (post-`pkg.db`, `std.id`)
@@ -3470,14 +3501,16 @@ fast; "spec-debt" = no decision needed, just transcribe implemented truth into `
 - **Reserved words + identifier grammar** — no keyword list exists; may a local be named `loop`?
   Are non-ASCII identifiers legal? Spec-debt from the lexer, plus one decision — lean: ASCII-only
   identifiers for v1 (AI/tooling-friendly, matches the English-only source policy).
-- **C→Align (reverse FFI)** — general embedding (a C program hosting Align as a library) =
-  **non-goal** (owner decision 2026-07-09): Align is an application language; exporting a stable
-  C surface drags in closure-ABI + runtime-init questions for no aligned use case. The one real
-  use is **callbacks** — passing an Align function to a C API during an Align-initiated FFI call
-  (signal handlers; callback-style C libraries). Deferred with a trigger: a concrete std/pkg
-  consumer that cannot use a stepped/non-callback C API. Ideal shape when triggered: a
-  **top-level non-capturing `fn` only** (a plain function pointer — extern-compatible params, no
-  closure environment, no new mechanism).
+- **C→Align (reverse FFI)** — general embedding (a C program hosting Align as a library) remains a
+  **non-goal** (owner decision 2026-07-09): Align is an application language; exporting a stable C
+  surface drags in runtime-init questions for no aligned use case. **UPDATE 2026-08-13:** D14 SQLite
+  scalar functions triggered the callback case. The settled narrow mechanism is one exact
+  noncapturing named/lifted target, a compiler-produced nominal descriptor, and a kind-specific
+  generated C-ABI trampoline selected only by the trusted package producer. It is not a plain raw
+  function-pointer conversion, exported-C source declaration, retained closure environment, or
+  general reverse-FFI surface. The exact record is the Settled item above and the `pkg.db` A2
+  callback ledger. SQLite collations remain open because their persisted semantic identity is a
+  separate database contract, not a property the trampoline alone can prove.
 - **No-shadowing vs. function names** — a local/parameter may currently share a name with a
   top-level function (functions and values are separate namespaces today; fn-values are not yet
   first-class), which the no-shadowing settlement's wording (Settled → "No shadowing") does not
