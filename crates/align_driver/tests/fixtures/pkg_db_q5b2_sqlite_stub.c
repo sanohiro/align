@@ -90,6 +90,8 @@ int32_t sqlite3_close_v2(void *database) {
   return 0;
 }
 
+int32_t sqlite3_get_autocommit(void *database) { return database == NULL ? 0 : 1; }
+
 void *PQexecParams(
     void *connection,
     const char *command,

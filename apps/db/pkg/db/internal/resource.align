@@ -7,6 +7,7 @@ import std.time
 
 extern "C" link("sqlite3") {
   fn sqlite3_close_v2(database: raw) -> i32
+  fn sqlite3_get_autocommit(database: raw) -> i32
   fn sqlite3_finalize(statement: raw) -> i32
   fn sqlite3_reset(statement: raw) -> i32
   fn sqlite3_clear_bindings(statement: raw) -> i32
@@ -18,6 +19,7 @@ extern "C" link("pq") {
   fn PQfinish(connection: raw)
   fn PQclear(result: raw)
   fn PQexec(connection: raw, command: raw) -> raw
+  fn PQcmdStatus(result: raw) -> raw
   fn PQsetnonblocking(connection: raw, enabled: i32) -> i32
   fn PQflush(connection: raw) -> i32
   fn PQconsumeInput(connection: raw) -> i32
@@ -43,6 +45,11 @@ PGRES_POLLING_WRITING: i32 := 2
 PGRES_POLLING_OK: i32 := 3
 POSTGRES_WAIT_SLICE_NS: i64 := 1000000
 POSTGRES_DROP_RECOVERY_NS: i64 := 1000000000
+CONN_VERSION: u32 := 2
+POOL_VERSION: u32 := 1
+POOL_OPEN: u8 := 0
+POOL_CLOSING: u8 := 1
+POOL_MAX_CAPACITY: i64 := 1024
 
 // The state is private to pkg.db descendants. Its fixed Q2 prefix is:
 //   0: u32 version (= 2)
@@ -55,12 +62,13 @@ POSTGRES_DROP_RECOVERY_NS: i64 := 1000000000
 //  21: u8  active transaction owner
 //  22: u16 reserved
 //  24: i64 next connection-local prepared-statement ordinal
+//  32: raw origin pool, null for a direct-driver connection
 // The native pointer stays an actual pointer. The package never integer-casts it and the runtime
 // owns neither this layout nor either database handle.
 pub fn new_conn_state(driver: u8, native: raw, sqlite_busy_ms: i32) -> raw {
   unsafe {
-    state := raw.alloc(32)
-    version: u32 := 1
+    state := raw.alloc(40)
+    version: u32 := CONN_VERSION
     clear: u8 := 0
     reserved: u16 := 0
     raw.store(state, 0, version)
@@ -74,9 +82,54 @@ pub fn new_conn_state(driver: u8, native: raw, sqlite_busy_ms: i32) -> raw {
     raw.store(state, 22, reserved)
     next_statement: i64 := 0
     raw.store(state, 24, next_statement)
+    raw.store(state, 32, raw.null())
     return state
   }
 }
+
+// Authenticate the complete scalar connection image in one authority. Native and origin pointers
+// remain privileged producer values, but every public/internal consumer reaches those pointers only
+// after the version, driver, reserved, state-product, and ordinal fields agree.
+pub fn conn_state_valid(state: raw) -> bool {
+  unsafe {
+    if state.is_null() { return false }
+    version: u32 := raw.load(state, 0)
+    driver: u8 := raw.load(state, 4)
+    closed: u8 := raw.load(state, 5)
+    reserved: u16 := raw.load(state, 6)
+    native: raw := raw.load(state, 8)
+    busy_ms: i32 := raw.load(state, 16)
+    lease: u8 := raw.load(state, 20)
+    transaction: u8 := raw.load(state, 21)
+    tail_reserved: u16 := raw.load(state, 22)
+    next_statement: i64 := raw.load(state, 24)
+    if version != CONN_VERSION || (driver != 1 && driver != 2) || reserved != 0
+      || busy_ms < 0 || (driver == 2 && busy_ms != 0) || lease > 1 || transaction > 1
+      || tail_reserved != 0 || next_statement < 0 {
+      return false
+    }
+    if closed == 0 { return !native.is_null() }
+    return closed == 1 && native.is_null() && lease == 0 && transaction == 0
+  }
+}
+
+pub fn conn_driver_tag(state: raw) -> u8 {
+  unsafe {
+    if !conn_state_valid(state) { return 0 }
+    return raw.load(state, 4)
+  }
+}
+
+pub fn conn_live(state: raw) -> bool {
+  unsafe {
+    if !conn_state_valid(state) { return false }
+    closed: u8 := raw.load(state, 5)
+    return closed == 0
+  }
+}
+
+pub fn conn_live_for_driver(state: raw, driver: u8) -> bool =
+  conn_live(state) && conn_driver_tag(state) == driver
 
 fn c_string(value: str) -> raw {
   unsafe {
@@ -93,18 +146,37 @@ fn c_string(value: str) -> raw {
   }
 }
 
-fn rollback_state(state: raw) {
+fn c_string_equals(pointer: raw, expected: str) -> bool {
   unsafe {
-    if state.is_null() { return }
-    version: u32 := raw.load(state, 0)
+    if pointer.is_null() { return false }
+    bytes := expected.bytes()
+    mut i := 0
+    loop {
+      if i >= bytes.len() { break }
+      actual: u8 := raw.load(pointer, i)
+      if actual != bytes[i] { return false }
+      i = i + 1
+    }
+    terminal: u8 := raw.load(pointer, bytes.len())
+    return terminal == 0
+  }
+}
+
+// Roll back one active transaction and return whether the native effect is proved exactly. The
+// wrapper transaction flag is always cleared before the caller decides between pool return and
+// close/retirement.
+fn rollback_state(state: raw) -> bool {
+  unsafe {
+    if !conn_live(state) { return false }
     driver: u8 := raw.load(state, 4)
-    closed: u8 := raw.load(state, 5)
     active: u8 := raw.load(state, 21)
     native: raw := raw.load(state, 8)
-    if version != 1 || closed != 0 || active == 0 || native.is_null() { return }
+    if active == 0 { return false }
     sql := c_string("ROLLBACK")
+    mut proved := false
     if driver == 1 {
-      ignored := sqlite3_exec(native, sql, raw.null(), raw.null(), raw.null())
+      status := sqlite3_exec(native, sql, raw.null(), raw.null(), raw.null())
+      proved = status == 0 && sqlite3_get_autocommit(native) != 0
     } else {
       if driver == 2 {
         result := PQexec(native, sql)
@@ -112,8 +184,10 @@ fn rollback_state(state: raw) {
           poison_conn_state(state)
         } else {
           status := pkg.db.internal.postgres_status.code(result)
+          command_ok := status == 1 && c_string_equals(PQcmdStatus(result), "ROLLBACK")
           PQclear(result)
-          if pkg.db.internal.postgres_status.must_close(status) {
+          proved = command_ok && PQtransactionStatus(native) == PQTRANS_IDLE
+          if !proved {
             poison_conn_state(state)
           }
         }
@@ -121,6 +195,8 @@ fn rollback_state(state: raw) {
     }
     raw.free(sql)
     raw.store(state, 21, 0 as u8)
+    if !proved && conn_live(state) { poison_conn_state(state) }
+    return proved
   }
 }
 
@@ -128,15 +204,18 @@ fn drop_state(state: raw) {
   unsafe {
     if state.is_null() { return }
     version: u32 := raw.load(state, 0)
-    driver: u8 := raw.load(state, 4)
-    native: raw := raw.load(state, 8)
     // A malformed private state is still freed, but never dispatched through an untrusted tag.
     // Both native destructors are null-guarded here so partial construction has one cleanup edge.
-    if version == 1 && !native.is_null() {
-      if driver == 1 {
-        ignored := sqlite3_close_v2(native)
-      } else {
-        if driver == 2 { PQfinish(native) }
+    if version == CONN_VERSION {
+      driver: u8 := raw.load(state, 4)
+      closed: u8 := raw.load(state, 5)
+      native: raw := raw.load(state, 8)
+      if closed == 0 && !native.is_null() {
+        if driver == 1 {
+          ignored := sqlite3_close_v2(native)
+        } else {
+          if driver == 2 { PQfinish(native) }
+        }
       }
     }
     raw.free(state)
@@ -144,37 +223,39 @@ fn drop_state(state: raw) {
 }
 
 pub fn drop_conn(state: raw) {
-  unsafe { drop_state(state) }
+  unsafe { release_conn_state(state) }
 }
 
 pub fn drop_tx(state: raw) {
   unsafe {
-    rollback_state(state)
-    drop_state(state)
+    origin: raw := if conn_state_valid(state) { raw.load(state, 32) } else { raw.null() }
+    proved := rollback_state(state)
+    if !origin.is_null() && proved {
+      release_conn_state(state)
+    } else {
+      if !origin.is_null() { retire_conn_state(state, origin) } else { drop_state(state) }
+    }
   }
 }
 
 pub fn transaction_active(state: raw) -> bool {
   unsafe {
-    if state.is_null() { return false }
-    version: u32 := raw.load(state, 0)
-    closed: u8 := raw.load(state, 5)
+    if !conn_live(state) { return false }
     active: u8 := raw.load(state, 21)
-    native: raw := raw.load(state, 8)
-    return version == 1 && closed == 0 && active != 0 && !native.is_null()
+    return active != 0
   }
 }
 
 pub fn set_transaction_active(state: raw, active: bool) {
   unsafe {
-    if state.is_null() { return }
+    if !conn_live(state) { return }
     raw.store(state, 21, if active { 1 as u8 } else { 0 as u8 })
   }
 }
 
 pub fn next_statement_ordinal(state: raw) -> i64 {
   unsafe {
-    if state.is_null() { return -1 }
+    if !conn_live(state) { return -1 }
     current: i64 := raw.load(state, 24)
     if current < 0 || current == 9223372036854775807 { return -1 }
     raw.store(state, 24, current + 1)
@@ -185,11 +266,11 @@ pub fn next_statement_ordinal(state: raw) -> i64 {
 pub fn poison_conn_state(state: raw) {
   unsafe {
     if state.is_null() { return }
-    version: u32 := raw.load(state, 0)
+    if !conn_state_valid(state) { return }
     driver: u8 := raw.load(state, 4)
     closed: u8 := raw.load(state, 5)
     native: raw := raw.load(state, 8)
-    if version != 1 || closed != 0 || native.is_null() { return }
+    if closed != 0 || native.is_null() { return }
     raw.store(state, 5, 1 as u8)
     raw.store(state, 8, raw.null())
     raw.store(state, 20, 0 as u8)
@@ -199,6 +280,252 @@ pub fn poison_conn_state(state: raw) {
     } else {
       if driver == 2 { PQfinish(native) }
     }
+  }
+}
+
+// The private fixed-capacity pool image is:
+//   0: u32 version (= 1)
+//   4: u8  driver (1 = SQLite, 2 = PostgreSQL)
+//   5: u8  lifecycle (0 = open, 1 = closing)
+//   6: u16 reserved (= 0)
+//   8: i64 capacity
+//  16: i64 idle
+//  24: i64 checked out
+//  32: raw pointer to exactly capacity pointer cells
+//  40: u64 reserved (= 0)
+fn pool_scalar_valid(pool: raw) -> bool {
+  unsafe {
+    if pool.is_null() { return false }
+    version: u32 := raw.load(pool, 0)
+    driver: u8 := raw.load(pool, 4)
+    lifecycle: u8 := raw.load(pool, 5)
+    reserved: u16 := raw.load(pool, 6)
+    capacity: i64 := raw.load(pool, 8)
+    idle: i64 := raw.load(pool, 16)
+    checked_out: i64 := raw.load(pool, 24)
+    slots: raw := raw.load(pool, 32)
+    tail_reserved: u64 := raw.load(pool, 40)
+    return version == POOL_VERSION && (driver == 1 || driver == 2)
+      && (lifecycle == POOL_OPEN || lifecycle == POOL_CLOSING) && reserved == 0
+      && capacity >= 1 && capacity <= POOL_MAX_CAPACITY && idle >= 0 && checked_out >= 0
+      && idle <= capacity && checked_out <= capacity - idle && !slots.is_null()
+      && tail_reserved == 0
+  }
+}
+
+pub fn pool_state_valid(pool: raw) -> bool {
+  unsafe {
+    if !pool_scalar_valid(pool) { return false }
+    driver: u8 := raw.load(pool, 4)
+    capacity: i64 := raw.load(pool, 8)
+    idle: i64 := raw.load(pool, 16)
+    slots: raw := raw.load(pool, 32)
+    mut i: i64 := 0
+    loop {
+      if i >= capacity { break }
+      state: raw := raw.load(slots, i * 8)
+      if i < idle {
+        if !conn_live_for_driver(state, driver) { return false }
+        lease: u8 := raw.load(state, 20)
+        transaction: u8 := raw.load(state, 21)
+        origin: raw := raw.load(state, 32)
+        if lease != 0 || transaction != 0 || origin.is_null() { return false }
+      } else {
+        if !state.is_null() { return false }
+      }
+      i = i + 1
+    }
+    return true
+  }
+}
+
+pub fn pool_open_valid(pool: raw) -> bool {
+  unsafe {
+    if !pool_state_valid(pool) { return false }
+    lifecycle: u8 := raw.load(pool, 5)
+    return lifecycle == POOL_OPEN
+  }
+}
+
+pub fn new_pool_state(driver: u8, capacity: i64) -> raw {
+  unsafe {
+    if (driver != 1 && driver != 2) || capacity < 1 || capacity > POOL_MAX_CAPACITY {
+      return raw.null()
+    }
+    slots := raw.alloc(capacity * 8)
+    mut i: i64 := 0
+    loop {
+      if i >= capacity { break }
+      raw.store(slots, i * 8, raw.null())
+      i = i + 1
+    }
+    pool := raw.alloc(48)
+    raw.store(pool, 0, POOL_VERSION)
+    raw.store(pool, 4, driver)
+    raw.store(pool, 5, POOL_OPEN)
+    raw.store(pool, 6, 0 as u16)
+    raw.store(pool, 8, capacity)
+    raw.store(pool, 16, 0 as i64)
+    raw.store(pool, 24, 0 as i64)
+    raw.store(pool, 32, slots)
+    raw.store(pool, 40, 0 as u64)
+    return pool
+  }
+}
+
+// Attach one newly opened, unpublished direct connection. Constructors call this in increasing
+// physical ordinal, so the ordinary LIFO pop yields the highest successful ordinal first and Pool
+// Drop closes a partial construction in reverse order.
+pub fn pool_attach_initial(pool: raw, state: raw) -> bool {
+  unsafe {
+    if !pool_open_valid(pool) || !conn_live(state) { return false }
+    driver: u8 := raw.load(pool, 4)
+    if conn_driver_tag(state) != driver { return false }
+    origin: raw := raw.load(state, 32)
+    if !origin.is_null() { return false }
+    idle: i64 := raw.load(pool, 16)
+    capacity: i64 := raw.load(pool, 8)
+    if idle >= capacity { return false }
+    slots: raw := raw.load(pool, 32)
+    raw.store(state, 32, pool)
+    raw.store(slots, idle * 8, state)
+    raw.store(pool, 16, idle + 1)
+    return true
+  }
+}
+
+pub fn pool_try_acquire(pool: raw) -> raw {
+  unsafe {
+    if !pool_open_valid(pool) { return raw.null() }
+    idle: i64 := raw.load(pool, 16)
+    if idle == 0 { return raw.null() }
+    checked_out: i64 := raw.load(pool, 24)
+    slots: raw := raw.load(pool, 32)
+    index := idle - 1
+    state: raw := raw.load(slots, index * 8)
+    raw.store(slots, index * 8, raw.null())
+    raw.store(pool, 16, index)
+    raw.store(pool, 24, checked_out + 1)
+    return state
+  }
+}
+
+pub fn pool_driver(pool: raw) -> u8 {
+  unsafe { return if pool_open_valid(pool) { raw.load(pool, 4) } else { 0 as u8 } }
+}
+
+pub fn pool_capacity(pool: raw) -> i64 {
+  unsafe { return if pool_open_valid(pool) { raw.load(pool, 8) } else { -1 } }
+}
+
+pub fn pool_idle(pool: raw) -> i64 {
+  unsafe { return if pool_open_valid(pool) { raw.load(pool, 16) } else { -1 } }
+}
+
+pub fn pool_checked_out(pool: raw) -> i64 {
+  unsafe { return if pool_open_valid(pool) { raw.load(pool, 24) } else { -1 } }
+}
+
+fn conn_native_idle(state: raw) -> bool {
+  unsafe {
+    if !conn_live(state) { return false }
+    lease: u8 := raw.load(state, 20)
+    transaction: u8 := raw.load(state, 21)
+    if lease != 0 || transaction != 0 { return false }
+    driver: u8 := raw.load(state, 4)
+    native: raw := raw.load(state, 8)
+    if driver == 1 { return sqlite3_get_autocommit(native) != 0 }
+    return driver == 2 && PQtransactionStatus(native) == PQTRANS_IDLE
+  }
+}
+
+fn free_pool_bookkeeping(pool: raw) {
+  unsafe {
+    slots: raw := raw.load(pool, 32)
+    raw.store(pool, 32, raw.null())
+    if !slots.is_null() { raw.free(slots) }
+    raw.free(pool)
+  }
+}
+
+fn retire_conn_state(state: raw, pool: raw) {
+  unsafe {
+    mut free_pool := false
+    if pool_scalar_valid(pool) {
+      checked_out: i64 := raw.load(pool, 24)
+      lifecycle: u8 := raw.load(pool, 5)
+      if checked_out > 0 {
+        raw.store(pool, 24, checked_out - 1)
+        free_pool = lifecycle == POOL_CLOSING && checked_out == 1
+      }
+    }
+    if conn_state_valid(state) { raw.store(state, 32, raw.null()) }
+    drop_state(state)
+    if free_pool { free_pool_bookkeeping(pool) }
+  }
+}
+
+fn release_conn_state(state: raw) {
+  unsafe {
+    if !conn_state_valid(state) {
+      drop_state(state)
+      return
+    }
+    pool: raw := raw.load(state, 32)
+    if pool.is_null() {
+      drop_state(state)
+      return
+    }
+    if !pool_state_valid(pool) {
+      drop_state(state)
+      return
+    }
+    lifecycle: u8 := raw.load(pool, 5)
+    if lifecycle == POOL_CLOSING {
+      retire_conn_state(state, pool)
+      return
+    }
+    checked_out: i64 := raw.load(pool, 24)
+    idle: i64 := raw.load(pool, 16)
+    capacity: i64 := raw.load(pool, 8)
+    if checked_out <= 0 || idle >= capacity || !conn_native_idle(state) {
+      if conn_live(state) { poison_conn_state(state) }
+      retire_conn_state(state, pool)
+      return
+    }
+    slots: raw := raw.load(pool, 32)
+    slot: raw := raw.load(slots, idle * 8)
+    if !slot.is_null() {
+      poison_conn_state(state)
+      retire_conn_state(state, pool)
+      return
+    }
+    raw.store(slots, idle * 8, state)
+    raw.store(pool, 16, idle + 1)
+    raw.store(pool, 24, checked_out - 1)
+  }
+}
+
+pub fn drop_pool_state(pool: raw) {
+  unsafe {
+    if !pool_open_valid(pool) {
+      if !pool.is_null() { raw.free(pool) }
+      return
+    }
+    raw.store(pool, 5, POOL_CLOSING)
+    mut idle: i64 := raw.load(pool, 16)
+    slots: raw := raw.load(pool, 32)
+    loop {
+      if idle == 0 { break }
+      idle = idle - 1
+      state: raw := raw.load(slots, idle * 8)
+      raw.store(slots, idle * 8, raw.null())
+      raw.store(pool, 16, idle)
+      if conn_state_valid(state) { raw.store(state, 32, raw.null()) }
+      drop_state(state)
+    }
+    checked_out: i64 := raw.load(pool, 24)
+    if checked_out == 0 { free_pool_bookkeeping(pool) }
   }
 }
 

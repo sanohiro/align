@@ -151,7 +151,7 @@ impl ParityCase {
 
 /// A program compiled ONCE and spawned per (driver, case).
 ///
-/// One compile of the eight-module `pkg.db` package (138 KB of `db.align` alone) dominates
+/// One compile of the `pkg.db` package (138 KB of `db.align` alone) dominates
 /// everything else, so the matrix pays it once. One process per case also gives free stub-counter
 /// isolation: no reset ordering to reason about.
 pub struct ParityProgram {

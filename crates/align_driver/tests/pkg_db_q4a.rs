@@ -1579,11 +1579,11 @@ fn main() -> i32 {
 ///
 /// Regenerate ONLY with a reviewed reason, from the panic message this emits.
 const LAYER1_FINGERPRINT_GOLDEN: &str = "\
-pkg-db-q4a-postgres-failed-commit beb3131745c55b75
-pkg-db-q4a-postgres-failed-rollback 1f331be6774d20bf
-pkg-db-q4a-postgres-implicit-rollback b27774f30e897901
-pkg-db-q4a-postgres-option-preflight 4a36a75e0e59287f
-pkg-db-q4a-postgres-prepared-transactions dd105ce9971b2028
+pkg-db-q4a-postgres-failed-commit 8007c373a301f35f
+pkg-db-q4a-postgres-failed-rollback fbc35a1e647e2f7f
+pkg-db-q4a-postgres-implicit-rollback ff3ca8bd4b732ea5
+pkg-db-q4a-postgres-option-preflight f683df5b6b32fe91
+pkg-db-q4a-postgres-prepared-transactions 228482a9d70eaf5e
 pkg-db-q4a-sqlite-bind-recovery 0e0e7109009f13b7
 pkg-db-q4a-sqlite-cleanup-poison 3d212209510658e9
 pkg-db-q4a-sqlite-prepared-reuse 2aa0d97ef18d963f

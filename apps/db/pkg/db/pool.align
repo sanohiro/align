@@ -1,0 +1,117 @@
+module pkg.db.pool
+
+import pkg.db
+import pkg.db.sqlite
+import pkg.db.postgres
+import pkg.db.internal.resource
+import pkg.db.pool.internal.resource
+
+pub MAX_CAPACITY: i64 := 1024
+
+pub resource Pool = pkg.db.pool.internal.resource.drop_pool
+
+pub Info {
+  driver: pkg.db.Driver,
+  capacity: i64,
+  idle: i64,
+  checked_out: i64,
+}
+
+fn capacity_error() -> pkg.db.Error = pkg.db.Error.Unsupported(pkg.db.ContractError {
+  query_id: None,
+  item: "db.pool.capacity".clone(),
+  message: "database pool capacity must be between 1 and 1024".clone(),
+})
+
+fn state_error() -> pkg.db.Error = pkg.db.Error.Unsupported(pkg.db.ContractError {
+  query_id: None,
+  item: "db.pool.state".clone(),
+  message: "database pool state is invalid".clone(),
+})
+
+fn capacity_valid(capacity: i64) -> bool = capacity >= 1 && capacity <= MAX_CAPACITY
+
+fn attach_initial(borrow owner: Pool, connection: pkg.db.conn) -> Result<(), pkg.db.Error> {
+  unsafe {
+    pool_state := resource.raw(resource.borrow(owner))
+    connection_state := resource.into_raw(connection)
+    if pkg.db.internal.resource.pool_attach_initial(pool_state, connection_state) {
+      return Ok(())
+    }
+    restored: pkg.db.conn := resource.from_raw(connection_state)
+    return Err(state_error())
+  }
+}
+
+pub fn open_sqlite(
+  path: str,
+  capacity: i64,
+  options: slice<pkg.db.sqlite.ConnectOption>,
+) -> Result<Pool, pkg.db.Error> {
+  if !capacity_valid(capacity) { return Err(capacity_error()) }
+  unsafe {
+    state := pkg.db.internal.resource.new_pool_state(1, capacity)
+    if state.is_null() { return Err(state_error()) }
+    owner: Pool := resource.from_raw(state)
+    mut i: i64 := 0
+    loop {
+      if i >= capacity { break }
+      connection := pkg.db.sqlite.connect(path, options)?
+      attach_initial(owner, connection)?
+      i = i + 1
+    }
+    return Ok(owner)
+  }
+}
+
+pub fn open_postgres(
+  url: str,
+  capacity: i64,
+  options: slice<pkg.db.postgres.ConnectOption>,
+) -> Result<Pool, pkg.db.Error> {
+  if !capacity_valid(capacity) { return Err(capacity_error()) }
+  unsafe {
+    state := pkg.db.internal.resource.new_pool_state(2, capacity)
+    if state.is_null() { return Err(state_error()) }
+    owner: Pool := resource.from_raw(state)
+    mut i: i64 := 0
+    loop {
+      if i >= capacity { break }
+      connection := pkg.db.postgres.connect(url, options)?
+      attach_initial(owner, connection)?
+      i = i + 1
+    }
+    return Ok(owner)
+  }
+}
+
+pub fn try_acquire(borrow owner: Pool) -> Result<pkg.db.conn, pkg.db.Error> {
+  unsafe {
+    pool_state := resource.raw(resource.borrow(owner))
+    if !pkg.db.internal.resource.pool_open_valid(pool_state) { return Err(state_error()) }
+    if pkg.db.internal.resource.pool_idle(pool_state) == 0 {
+      return Err(pkg.db.Error.PoolExhausted)
+    }
+    connection_state := pkg.db.internal.resource.pool_try_acquire(pool_state)
+    if connection_state.is_null() { return Err(state_error()) }
+    connection: pkg.db.conn := resource.from_raw(connection_state)
+    return Ok(connection)
+  }
+}
+
+pub fn info(borrow owner: Pool) -> Result<Info, pkg.db.Error> {
+  unsafe {
+    pool_state := resource.raw(resource.borrow(owner))
+    if !pkg.db.internal.resource.pool_open_valid(pool_state) { return Err(state_error()) }
+    driver_tag := pkg.db.internal.resource.pool_driver(pool_state)
+    driver := if driver_tag == 1 { pkg.db.Driver.SQLite } else {
+      if driver_tag == 2 { pkg.db.Driver.PostgreSQL } else { return Err(state_error()) }
+    }
+    return Ok(Info {
+      driver: driver,
+      capacity: pkg.db.internal.resource.pool_capacity(pool_state),
+      idle: pkg.db.internal.resource.pool_idle(pool_state),
+      checked_out: pkg.db.internal.resource.pool_checked_out(pool_state),
+    })
+  }
+}

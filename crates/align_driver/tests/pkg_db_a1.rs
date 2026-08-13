@@ -3065,19 +3065,19 @@ fn postgres_required_streamed_delivery_uses_real_libpq17() {
 ///
 /// Regenerate ONLY with a reviewed reason, from the panic message this emits.
 const LAYER1_FINGERPRINT_GOLDEN: &str = "\
-pkg-db-a1-postgres-batch-decode-failure dcf1c3ba2efac3e0
+pkg-db-a1-postgres-batch-decode-failure e934fa4b827d7344
 pkg-db-a1-postgres-binary-boundaries 543113c0d6e3d6b8
-pkg-db-a1-postgres-binary-format-products 25825e14312ad10c
-pkg-db-a1-postgres-binary-malformed 8f04c4a8125d8b41
-pkg-db-a1-postgres-buffered-batches 268aed4a282c52fd
-pkg-db-a1-postgres-delivery-validation 6f3598ef48a697cf
-pkg-db-a1-postgres-prepared-streamed-modes dfae330f8742042d
-pkg-db-a1-postgres-streamed-failures fa592d810a5c940a
-pkg-db-a1-postgres-streamed-modes 0e85467ce6e04357
-pkg-db-a1-postgres-streamed-one 8d6aee68ca1d395b
-pkg-db-a1-postgres-streamed-timeout-drop d87d801ab9f20be0
-pkg-db-a1-postgres-streamed-unsafe-statuses 2d0782472bf35dc2
-pkg-db-a1-postgres-value-matrix 3e7d5de4c83705ed
+pkg-db-a1-postgres-binary-format-products fe62e2b915ad9168
+pkg-db-a1-postgres-binary-malformed f5147f6f40568d5f
+pkg-db-a1-postgres-buffered-batches 2e40921dad4c84b1
+pkg-db-a1-postgres-delivery-validation 1e37b4a4dc266d2f
+pkg-db-a1-postgres-prepared-streamed-modes ca82f5ab6b28e07d
+pkg-db-a1-postgres-streamed-failures 6b0aeba03b414028
+pkg-db-a1-postgres-streamed-modes 5d6a50af791450c7
+pkg-db-a1-postgres-streamed-one 483d0e25b14163db
+pkg-db-a1-postgres-streamed-timeout-drop f8c274359241b762
+pkg-db-a1-postgres-streamed-unsafe-statuses d174d9b087289404
+pkg-db-a1-postgres-value-matrix 900160246701aeff
 pkg-db-a1-sqlite-batches d257d048f2216750
 pkg-db-a1-zero-column-plan 866983be583f9bc9
 ";
