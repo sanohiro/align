@@ -99,3 +99,5 @@ pub fn main() -> Result<(), Error> {
 着地中なのは、リリース後のスループット系と動的 SQL 系のレールです。上限付きのバッチ／SoA デリバリ、PostgreSQL ネイティブの single-row / portal-batch デリバリ、明示的な固定容量・待機なしの `pkg.db.pool` はすでに出荷済みで、ドライバ明示の動的 SQL も出荷済みです。残るのは、証明付きのネイティブコールバック面と、最後のレール横断監査です。これらが閉じるまでは、公開 API はまだ動きうるものとして扱ってください。
 
 コンパイラ側はすでに手元のバイナリに入っています。`alignc db prepare`、`db migrate`、`db status`、`db check`、`db repair`（第 [16](16-toolchain.md) 章）が、検査済みメタデータとマイグレーションカタログを操作します。契約の正本は `docs/impl/pkg-design/db.md` です。
+
+出荷済みの範囲を実務でどう使うかは、課題ごとに整理した第 [24](24-database.md) 章が扱います。

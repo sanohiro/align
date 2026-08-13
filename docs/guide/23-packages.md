@@ -99,3 +99,5 @@ Complete: the first public release scope. Typed static queries and commands are 
 Landing now: the post-release throughput and dynamic rails. Bounded batch and SoA delivery, PostgreSQL-native single-row and portal-batch delivery, and the explicit fixed-capacity, non-waiting `pkg.db.pool` have shipped; driver-explicit dynamic SQL has shipped. Remaining are the proved native callback surface and the final cross-rail audit. Until those close, treat the public surface as still moving.
 
 The compiler side is already in the binary you have: `alignc db prepare`, `db migrate`, `db status`, `db check`, and `db repair` (chapter [16](16-toolchain.md)) drive the checked metadata and the migration catalog. `docs/impl/pkg-design/db.md` is the contract of record.
+
+Chapter [24](24-database.md) is the working guide to that shipped surface, task by task.
