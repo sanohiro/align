@@ -5928,14 +5928,15 @@ The scalar input/output mapping is exact:
 | `SQLITE_NULL` | `Null` |
 | `SQLITE_INTEGER` | `I64(sqlite3_value_int64(...))` |
 | `SQLITE_FLOAT` | finite, infinity, or signed-zero `F64`; a native NaN is invalid |
-| `SQLITE_TEXT` | `Text` view after exact nonnegative length, pointer, UTF-8, and no-U+0000 validation |
-| `SQLITE_BLOB` | `Bytes(byte_view { bytes })`; null pointer is allowed only at length zero |
+| `SQLITE_TEXT` | `Text` view after exact nonnegative length, final-pointer, UTF-8, and no-U+0000 validation; zero length uses the stable non-null sentinel |
+| `SQLITE_BLOB` | `Bytes(byte_view { bytes })`; every zero-length input uses the stable non-null sentinel, including when SQLite returns null |
 
 Callback results accept every `pkg.db.value` variant. `Bool`, `I16`, and `I32` widen through
 `sqlite3_result_int64`; `F32` widens through `sqlite3_result_double`; `I64`, `F64`, `Null`, Text, and
 Bytes use the corresponding exact result routine. NaN, a Text result containing U+0000, an
 unrepresentable length, a nonempty null view, or an invalid tagged value becomes the fixed callback
-error before SQLite observes a value. Text/Bytes use explicit nonnegative lengths and
+error `pkg.db SQLite function callback returned an invalid value` through `sqlite3_result_error`
+with that exact explicit byte length before SQLite observes a value. Text/Bytes use explicit nonnegative lengths and
 `SQLITE_TRANSIENT`; SQLite owns its copy before the callback returns. Empty Text/Bytes use a stable
 non-null sentinel and remain distinct from `Null`. `Err(message)` uses `sqlite3_result_error` with
 the explicit UTF-8 byte length; an empty, U+0000-bearing, or unrepresentable message is replaced by
@@ -5955,15 +5956,18 @@ contract violation and calls `process.abort` without calling any SQLite result r
 non-null context, the trampoline obtains `sqlite3_context_db_handle(context)` exactly once before
 value extraction and hard-aborts if it is null.
 
-It calls `sqlite3_value_type` once per ordinal. For Text it calls `sqlite3_value_text` before
-`sqlite3_value_bytes`; a null text pointer is followed immediately by `sqlite3_errcode` on the
-saved database handle before any other SQLite API, mapping `SQLITE_NOMEM` to
-`sqlite3_result_error_nomem` and every other case to the fixed malformed-input error. For Bytes it
-calls `sqlite3_value_blob`; a null pointer is followed immediately by `sqlite3_errcode`, maps
-`SQLITE_NOMEM` likewise, and otherwise is valid only when the following byte count is zero. Every
-byte count must be nonnegative, and no further conversion accessor is called on the same
-`sqlite3_value` before the source callback returns. This pins SQLite conversion side effects and
-OOM precedence without reading a null pointer or allowing a later API call to overwrite the error.
+It calls `sqlite3_value_type` once per ordinal. For Text it calls `sqlite3_value_bytes` first and
+then `sqlite3_value_text` as the final accessor; for Bytes it calls `sqlite3_value_bytes` first and
+then `sqlite3_value_blob` as the final accessor. Every byte count must be nonnegative. A null final
+Text pointer is followed immediately by `sqlite3_errcode` on the saved database handle before any
+other SQLite API, mapping `SQLITE_NOMEM` to `sqlite3_result_error_nomem` and any other code to the
+fixed malformed-input error. Initial BLOB-to-BLOB access performs no encoding conversion: a null
+final Bytes pointer is the malformed-input error when length is nonzero and is replaced by the
+stable non-null empty sentinel when length is zero. Every zero-length Text/Bytes view is normalized
+to that sentinel regardless of the native pointer. No further value accessor is
+called on that same `sqlite3_value` before the source callback returns. This final-pointer order
+pins SQLite conversion side effects and OOM precedence without retaining an accessor result that a
+later `sqlite3_value_bytes` call may invalidate.
 
 The trampoline forms one fixed-capacity 127-value stack scratch and one borrowed slice of its first
 `argc` entries; it performs no package heap allocation and invokes the callback at most once. For
@@ -5976,8 +5980,8 @@ idle, direct SQLite `conn`. It rejects PostgreSQL, a pool-origin physical connec
 closed/malformed connection, an active execution lease, an active transaction, or any live
 dependent statement/rows/batch/cursor before a native call. The ordinary ownership rules already
 make the last four overlaps statically unavailable; the complete runtime state/native-autocommit
-proof remains fail-closed. The linked SQLite runtime must report at least 3.30.0, the first release
-with `SQLITE_DIRECTONLY`; an older runtime rejects before registration rather than silently losing
+proof remains fail-closed. The linked SQLite runtime must report at least 3.30.0, the
+[first release with `SQLITE_DIRECTONLY`](https://sqlite.org/releaselog/3_30_0.html); an older runtime rejects before registration rather than silently losing
 the schema-execution boundary. A successful registration is attached to that physical connection until
 replacement, explicit removal, or connection close. It is visible to every later typed or dynamic
 statement on that connection. It is not copied to another connection and cannot silently survive a
@@ -6060,7 +6064,7 @@ The implementation closure matrix is:
 |---|---|---|
 | public formation and inventory | Export exactly the types, variants, and functions above; lower only one direct noncapturing target of the exact kind signature; require complete effect/provenance/cleanup facts; reject captures, externs, dynamic/open target sets, ordinary fieldless construction, and every omitted surface. | source/interface inventory; direct/imported/noncapturing-lambda positives; capture/extern/dynamic/wrong-signature/effect negatives; whole/per-unit interface parity |
 | descriptor and generated identity | Form and validate the exact 32-byte v1 record, canonical nominal identity, signature, effect, return provenance/cleanup, relocation, and generated C-ABI family before pointer use. | semantic-to-byte and byte-to-semantic goldens; every field mutation; cross-kind/target/identity/trampoline splice; malformed HIR/MIR/LLVM preflight; whole/per-unit/ThinLTO link twins |
-| scalar trampoline | Hard-abort a null context; otherwise save its database handle, validate argc/argv and every value in the fixed accessor/OOM order before one callback, preserve ordered invocation views and returned provenance, and map every value/result/error exactly once with transient copies and no package heap. | null-context/db-handle subprocess owners; argc -1/0/127/128 and argv null products; every storage class/value variant; injected text/blob OOM and exact API traces; malformed pointer/length/UTF-8/NUL/NaN; Ok/Err/hard-error IR; call/result/allocation counters |
+| scalar trampoline | Hard-abort a null context; otherwise save its database handle, validate argc/argv and every value in bytes-then-final-pointer order before one callback, normalize every empty Text/Bytes view to the stable non-null sentinel, preserve ordered invocation views and returned provenance, and map every value/result/error exactly once with transient copies and no package heap. | null-context/db-handle subprocess owners; argc -1/0/127/128 and argv null products; every storage class/value variant; injected text/blob OOM and exact accessor/errcode traces; empty null/non-null pointer normalization; malformed pointer/length/UTF-8/NUL/NaN; exact invalid-result message; Ok/Err/hard-error IR; call/result/allocation counters |
 | registration and removal | Enforce exact connection/version/name/arity/option/descriptor order, form one call-local terminated stack name only after validation, pass UTF-8/DIRECTONLY flags, prove deterministic eligibility, make one native call, and copy native errors before returning. | pairwise multi-invalid no-call matrix; SQLite 3.29.99/3.30.0/newer; name 0/1/255/256/NUL and sliced/nonterminated input; exact stack bytes and fake-native call order; arity -1/0/127/128; options; built-in/user replacement/removal; autocommit before/after |
 | lifetime, cleanup, and reentrancy | Retain only program-lifetime trampoline data; pass null application/destructor pointers; keep callbacks connection-local through replace/remove/close; forbid pool-origin registration and access to the invoking connection; preserve a copied first native error and poison/close on every native mutation failure or failed reuse proof. | registration/replace/remove failure and close destructor-zero counters; direct/pool/tx/lease/dependent-resource matrix; typed/dynamic invocation; distinct-connection nested callback; no same-connection source route; poison/no-call-after-close |
 | thread and effect behavior | Invoke and consume views on the statement thread, retain no callback frame data, preserve non-Send connection ownership, mark generated C entrypoints nounwind, and distinguish ordinary scalar Err from process-hard abort. | thread-id assertions; view/callback return/capture/task escape negatives; Pure/Impure x option; LLVM nounwind/ABI inspection; ordinary error continuation and hard-abort subprocess twins |
@@ -6079,6 +6083,17 @@ revision closes its complete finding set before a fresh review:
 | a null context cannot safely receive an SQLite error result | Treat null context as a hard native-contract abort before the common result/error path. | null-context subprocess owner with zero SQLite result calls |
 | failed replacement/removal does not promise which registration remains | Copy the native error, then poison/close on every failed native mutation so no ambiguous state can be reused. | replacement/removal failure x prior absent/user/builtin state, copied-error and no-call-after-close counters |
 | the trusted generated reverse-callback mechanism was only recorded in package documents | Add the narrow producer-selected mechanism and its non-goals to `draft.md`, `language-spec.md`, and `design-notes.md`. | cross-document contract check plus producer/interface inventory |
+
+The fresh full review of `cb808cc` exposed the missed native-view-normalization axis. The scalar
+boundary remains one producer/consumer capability because no independently useful dormant split
+removes this pointer-lifetime proof. This matrix revision closes every verified report:
+
+| Review report | Disposition | Required owner |
+|---|---|---|
+| empty native BLOB could form a null `slice<u8>` | Valid: normalize every zero-length Text/Bytes input to the program-lifetime non-null sentinel before forming the view. | null and non-null empty native pointers produce one valid empty view; no native pointer survives |
+| `sqlite3_value_bytes` could invalidate a pointer retained from an earlier accessor | Valid: obtain and validate the byte count first, call text/blob as the final accessor, inspect errcode immediately after null Text, normalize null empty BLOB without conversion, and call no later accessor on that value. | exact per-value API traces, injected Text-conversion OOM, and pointer-use-after-final-accessor owner |
+| DIRECTONLY requires SQLite 3.31.0 | Rejected after primary-source verification: SQLite's official 3.30.0 release record explicitly introduces `SQLITE_DIRECTONLY`; retain the 3.30.0 floor and link that record. | configured 3.29.99/3.30.0/newer version boundary owner |
+| invalid callback results had no exact observable error bytes | Valid: use exact `pkg.db SQLite function callback returned an invalid value` bytes and explicit length. | each invalid result class observes exactly that message and no value result |
 
 Before implementation, run one fresh independent adversarial review of this ledger and the shared
 producer/consumer boundary, then close every valid finding ledger-first. Before code review, perform

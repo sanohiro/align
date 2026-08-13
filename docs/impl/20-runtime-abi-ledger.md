@@ -309,7 +309,7 @@ The exact external callback ABIs are:
 
 | Kind | Exact LLVM function type | Required attributes and body boundary |
 |---|---|---|
-| ScalarFunction v1 | `void @GEN(ptr, i32, ptr)` | C calling convention, `nounwind`; hard-abort null context/database handle, validate argc/argv and all 0..127 SQLite values in the fixed type/accessor/errcode order, build fixed stack scratch, call the exact Align target once, consume its dynamic cleanup result, call one result/error family, return void |
+| ScalarFunction v1 | `void @GEN(ptr, i32, ptr)` | C calling convention, `nounwind`; hard-abort null context/database handle, validate argc/argv and all 0..127 SQLite values in type/byte-count/final-pointer order with immediate errcode after null Text, normalize empty views to a stable non-null sentinel, build fixed stack scratch, call the exact Align target once, consume its dynamic cleanup result, call one result/error family, return void |
 
 The function is not `readnone`, `readonly`, `willreturn`, or `nofree`: SQLite value/result routines
 may allocate or mutate native state, scalar application code may be Impure, and the Align target

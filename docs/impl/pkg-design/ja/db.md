@@ -4243,13 +4243,14 @@ scalar input/output mappingはexact:
 | `SQLITE_NULL` | `Null` |
 | `SQLITE_INTEGER` | `I64(sqlite3_value_int64(...))` |
 | `SQLITE_FLOAT` | finite/infinity/signed-zero `F64`; native NaNはinvalid |
-| `SQLITE_TEXT` | exact nonnegative length/pointer/UTF-8/no-U+0000 validation後の`Text` view |
-| `SQLITE_BLOB` | `Bytes(byte_view { bytes })`; null pointerはlength zeroだけ |
+| `SQLITE_TEXT` | exact nonnegative length/final pointer/UTF-8/no-U+0000 validation後の`Text` view; zero lengthはstable non-null sentinel |
+| `SQLITE_BLOB` | `Bytes(byte_view { bytes })`; SQLite pointerがnullでも全zero-length inputをstable non-null sentinelへnormalize |
 
 callback resultは全`pkg.db.value` variantを許可する。`Bool`/`I16`/`I32`は
 `sqlite3_result_int64`、`F32`は`sqlite3_result_double`へwidenし、`I64`/`F64`/`Null`/Text/Bytesはexact
 result routineを使う。NaN、U+0000-bearing Text、unrepresentable length、nonempty null view、invalid tagは
-SQLiteへvalueを見せる前にfixed callback error。Text/Bytesはexplicit nonnegative lengthと
+SQLiteへvalueを見せる前にexact `pkg.db SQLite function callback returned an invalid value`をexplicit byte
+lengthの`sqlite3_result_error`で返す。Text/Bytesはexplicit nonnegative lengthと
 `SQLITE_TRANSIENT`でSQLiteがreturn前にcopyする。empty Text/Bytesはstable non-null sentinelでNullとdistinct。
 `Err(message)`はexplicit UTF-8 byte lengthで`sqlite3_result_error`。empty/U+0000/unrepresentable messageは
 `pkg.db SQLite function callback returned an invalid error message`へ置換する。native input conversion OOMは
@@ -4264,11 +4265,14 @@ ordinal順にcallback前validateする。fixed-arityの`argc == arity` invariant
 arityを重複しない。null contextはSQLite result routineを呼ばず`process.abort`する。non-nullならvalue extraction
 前に`sqlite3_context_db_handle(context)`をexactly once呼び、nullならhard abortする。
 
-ordinalごとに`sqlite3_value_type`を1回呼ぶ。Textは`sqlite3_value_text`をbytesより先に呼び、null pointerなら
-他SQLite APIより先にsaved database handleの`sqlite3_errcode`を直ちに読む。`SQLITE_NOMEM`は
-`sqlite3_result_error_nomem`、他はfixed malformed-input error。Bytesは`sqlite3_value_blob`を呼び、nullなら
-同様にerrcodeを直ちに読み、NOMEMをmapし、それ以外は後続byte countがzeroの場合だけvalid。全byte countは
-nonnegative、same `sqlite3_value`にはsource callback return前に別conversion accessorを呼ばない。
+ordinalごとに`sqlite3_value_type`を1回呼ぶ。Textは`sqlite3_value_bytes`を先に呼び、最後のaccessorとして
+`sqlite3_value_text`を呼ぶ。Bytesもbytesを先に、`sqlite3_value_blob`を最後に呼ぶ。全byte countは
+nonnegative。final Text pointerがnullなら他SQLite APIより先にsaved DB handleの`sqlite3_errcode`を直ちに読み、
+`SQLITE_NOMEM`は`sqlite3_result_error_nomem`、他codeはfixed malformed-input error。initial BLOB-to-BLOB
+accessはencoding conversionなしなのでnull Bytesはnonzero lengthならmalformed、zeroならstable non-null empty
+sentinelへreplaceする。native pointerに関わらず全
+zero-length Text/Bytes viewをsentinelへnormalizeする。same valueにはcallback return前に別accessorを呼ばず、
+later bytes callがretained pointerをinvalidateしないfinal-pointer orderを固定する。
 
 fixed-capacity 127-value stack scratchと先頭`argc`のborrowed sliceを形成し、package heap allocationなし、callback
 at most once。non-null contextでは`Ok`にresult call exactly one、`Err`/recoverable pre-callback failureにerror
@@ -4278,8 +4282,8 @@ source公開はない。
 registrationはconnection-global native stateなのでlive/idle/direct SQLite `conn`の`borrow mut`だけを受ける。
 PostgreSQL、pool-origin physical connection、detectably closed/malformed、active lease/transaction、live
 dependent stmt/rows/batch/cursorはnative call前にreject。ordinary ownershipが後4 overlapをstaticに除外しても、
-complete runtime/native-autocommit proofはfail closed。linked SQLite runtimeは`SQLITE_DIRECTONLY`を最初に持つ
-3.30.0以上をreportしなければならず、older runtimeはschema-execution boundaryをsilentに失わずregistration前に
+complete runtime/native-autocommit proofはfail closed。linked SQLite runtimeは
+[`SQLITE_DIRECTONLY`を最初に持つ3.30.0](https://sqlite.org/releaselog/3_30_0.html)以上をreportしなければならず、older runtimeはschema-execution boundaryをsilentに失わずregistration前に
 rejectする。success後はreplacement/explicit removal/connection close
 までphysical connectionにattachし、later typed/dynamic statementからvisible。他connectionへcopyせず、
 pool-originを禁止するのでpool return後へsilent persistenceしない。
@@ -4349,7 +4353,7 @@ implementation closure matrix:
 |---|---|---|
 | public formation/inventory | exact inventory、one direct noncapturing exact-signature targetだけlower、complete effect/provenance/cleanup。capture/extern/dynamic/open/wrong signature/effect/fieldless construction/omitted surfaceをreject。 | source/interface inventory、direct/imported/lambda positive、全negative、whole/per-unit parity |
 | descriptor/generated identity | exact 32-byte v1、nominal identity、signature/effect/provenance/cleanup/relocation/C-ABI familyをpointer前validate。 | bidirectional golden、all field mutation、cross-kind/target/identity/trampoline splice、malformed HIR/MIR/LLVM、whole/per-unit/ThinLTO |
-| scalar trampoline | null contextはhard abort、他はDB handleをsaveしてfixed accessor/OOM orderでargc/argv/all valuesをone callback前validate、ordered view/return provenance、all result/error exactly once transient-copy、package heapなし。 | null context/DB handle subprocess、argc -1/0/127/128、argv product、all class/variant、text/blob injected OOM/API trace、pointer/length/UTF-8/NUL/NaN、Ok/Err/hard-error IR、counter |
+| scalar trampoline | null contextはhard abort、他はDB handleをsaveしてbytes→final pointer orderでargc/argv/all valuesをone callback前validate、全empty Text/Bytesをstable non-null sentinelへnormalize、ordered view/return provenance、all result/error exactly once transient-copy、package heapなし。 | null context/DB handle subprocess、argc -1/0/127/128、argv product、all class/variant、text/blob injected OOM/exact API trace、empty null/non-null normalization、pointer/length/UTF-8/NUL/NaN、exact invalid-result message、Ok/Err/hard-error IR、counter |
 | registration/removal | exact connection/version/name/arity/option/descriptor order、validation後だけterminated stack name形成、UTF-8/DIRECTONLY、deterministic proof、one native call、error copy。 | pairwise multi-invalid no-call、SQLite 3.29.99/3.30.0/newer、name 0/1/255/256/NUL/sliced/nonterminated、exact stack bytes/fake call order、arity -1/0/127/128、option、builtin/user replace/remove、autocommit |
 | lifetime/cleanup/reentrancy | program-lifetime dataだけretain、null app/destructor、connection-local replace/remove/close、pool-origin/owning-connection access禁止、native mutation failure/reuse-proof failureはcopied first errorを保ちpoison/close。 | registration/replace/remove failure/close destructor-zero、direct/pool/tx/lease/dependent matrix、typed/dynamic invocation、distinct nested connection、no same-connection route、no-call-after-close |
 | thread/effect | statement threadでview consume、frame data retainなし、non-Send、C entry nounwind、ordinary scalar Errとhard abortを区別。 | thread id、escape/capture/task negatives、Pure/Impure x option、LLVM ABI/nounwind、error continuation/hard-abort subprocess |
@@ -4368,6 +4372,17 @@ review前にcomplete finding setをcloseする:
 | null contextへSQLite error resultを安全に書けない | common result/error path前のnative-contract hard abort。 | null-context subprocess、SQLite result call zero |
 | failed replace/remove後のregistration stateが未規定 | native error copy後にpoison/closeしambiguous stateをreuseしない。 | failure x absent/user/builtin prior state、copied error/no-call-after-close |
 | trusted generated reverse-callback mechanismがpackage docsだけ | `draft.md`/`language-spec.md`/`design-notes.md`にnarrow producer-selected mechanism/non-goalを追加。 | cross-document contract、producer/interface inventory |
+
+`cb808cc`のfresh full reviewはmissed native-view-normalization axisを示した。independently usefulなdormant
+splitではpointer-lifetime proofを除けないのでscalar boundaryはone producer/consumer capabilityのまま。このmatrix
+revisionはverified reportを全てcloseする:
+
+| Review report | Disposition | Required owner |
+|---|---|---|
+| empty native BLOBからnull `slice<u8>`を形成し得た | Valid: 全zero-length Text/Bytesをview formation前にprogram-lifetime non-null sentinelへnormalize。 | null/non-null empty native pointerがone valid empty view、native pointer survives zero |
+| earlier accessor pointerを`sqlite3_value_bytes`がinvalidateし得た | Valid: byte countを先にvalidate、text/blobをfinal accessor、null Text直後errcode、null empty BLOBをconversionなしnormalize、same value later accessorなし。 | exact per-value trace、injected Text conversion OOM、pointer-use-after-final-accessor owner |
+| DIRECTONLYはSQLite 3.31.0必須 | Rejected: official 3.30.0 release recordが`SQLITE_DIRECTONLY`導入を明記するため3.30.0 floor/linkを維持。 | configured 3.29.99/3.30.0/newer boundary owner |
+| invalid callback resultのobservable error bytesが未指定 | Valid: exact `pkg.db SQLite function callback returned an invalid value`とexplicit length。 | each invalid result classでsame message/value result zero |
 
 implementation前にこのledger/shared producer-consumer boundaryのfresh independent adversarial reviewを1回行い、
 valid findingをledger-firstでcloseする。code review前にmatrix-to-diff passを行う。capture/effect eligibility、
