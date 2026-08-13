@@ -1765,6 +1765,20 @@ grep -Eq '^ *cargo-nightly-.*-\$\{\{ hashFiles\('"'"'Cargo.lock'"'"'\) \}\}-$' \
   exit 1
 }
 
+# Release PGO profiles alignc, not the runtime archive that alignc links into
+# its training outputs.
+release_workflow="$repo_root/.github/workflows/release.yml"
+if grep -Eq 'scripts/cargo\.sh build .* -p align_runtime -p align_driver' "$release_workflow"; then
+  echo "release.yml instruments the runtime together with alignc again" >&2
+  exit 1
+fi
+release_runtime_builds="$(grep -Fc 'scripts/cargo.sh build --locked --profile dist -p align_runtime' "$release_workflow")"
+release_driver_builds="$(grep -Fc 'scripts/cargo.sh build --locked --profile dist -p align_driver' "$release_workflow")"
+[[ "$release_runtime_builds" -eq 2 && "$release_driver_builds" -eq 2 ]] || {
+  echo "release.yml no longer builds the runtime and compiler separately in both PGO phases" >&2
+  exit 1
+}
+
 for script in \
   scripts/cargo.sh \
   scripts/check-pr-preflight.sh \

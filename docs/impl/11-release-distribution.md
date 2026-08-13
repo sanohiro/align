@@ -20,13 +20,13 @@ These are native builds, not cross-compiles. That matters because the compiler l
 
 `.github/workflows/release.yml` runs for `v*` tags (or an explicitly selected tag), rejects a tag whose version differs from `[workspace.package].version`, and then:
 
-1. builds and smoke-tests the three native compilers with `--profile dist` (thin LTO, one codegen unit) under two-phase PGO over the examples and `pkg.db` corpus;
+1. builds and smoke-tests the three native compilers with `--profile dist` under two-phase PGO over the examples and `pkg.db` corpus;
 2. creates tarballs, two Debian packages, checksums, and a generated Homebrew formula;
 3. attaches the files to the release;
 4. updates `sanohiro/homebrew-align` when `HOMEBREW_TAP_TOKEN` exists;
 5. builds and deploys a signed apt repository when `APT_GPG_PRIVATE_KEY` exists.
 
-Only a versioned release pays for that tuning: ordinary `--release` builds stay on the untuned default so routine batch builds never carry the LTO/PGO cost. The `alignc` binary links mimalloc in every profile.
+Only a versioned release pays for that tuning: ordinary `--release` builds stay on the untuned default so routine batch builds never carry the LTO/PGO cost. The compiler uses thin LTO, one codegen unit, and compiler-only PGO. Its packaged runtime uses the same dist optimization profile but stays outside compiler-training instrumentation because `alignc` links that archive into the programs compiled during training. The `alignc` binary links mimalloc in every profile.
 
 The optional secrets make the external publishing steps fail closed: no secret means no tap or apt-repository mutation. Release assets are still produced.
 
