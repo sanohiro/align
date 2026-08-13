@@ -91,6 +91,7 @@ pub enum GeneratedId {
         target: ProgramCall,
         signature: CanonicalFnAbi,
         effect: u8,
+        parallel_transfer_params: Vec<u32>,
         descriptor_version: u32,
         kind: u8,
         family_version: u32,
@@ -132,6 +133,7 @@ impl GeneratedId {
                 target,
                 signature,
                 effect,
+                parallel_transfer_params,
                 descriptor_version,
                 kind,
                 family_version,
@@ -140,6 +142,10 @@ impl GeneratedId {
                 encode_call(&mut out, target)?;
                 out.extend(signature.as_bytes());
                 out.push(*effect);
+                out.extend(checked_count(parallel_transfer_params.len())?.to_le_bytes());
+                for param in parallel_transfer_params {
+                    out.extend(param.to_le_bytes());
+                }
                 out.extend(descriptor_version.to_le_bytes());
                 out.push(*kind);
                 out.extend(family_version.to_le_bytes());
@@ -172,6 +178,7 @@ impl GeneratedId {
                 target: cursor.call()?,
                 signature: cursor.abi()?,
                 effect: cursor.byte()?,
+                parallel_transfer_params: cursor.u32s()?,
                 descriptor_version: cursor.u32()?,
                 kind: cursor.byte()?,
                 family_version: cursor.u32()?,
@@ -287,6 +294,7 @@ fn validate_generated(value: &GeneratedId) -> Result<(), CanonicalCodecError> {
         GeneratedId::SqliteScalarCallback {
             target,
             effect,
+            parallel_transfer_params,
             descriptor_version,
             kind,
             family_version,
@@ -294,6 +302,7 @@ fn validate_generated(value: &GeneratedId) -> Result<(), CanonicalCodecError> {
         } => {
             validate_call(target)?;
             if *effect <= 1
+                && parallel_transfer_params.is_empty()
                 && *descriptor_version == 1
                 && *kind == 0
                 && *family_version == 1
@@ -409,6 +418,15 @@ impl<'a> IdentityCursor<'a> {
             return Err(CanonicalCodecError::Truncated);
         }
         Ok(count)
+    }
+
+    fn u32s(&mut self) -> Result<Vec<u32>, CanonicalCodecError> {
+        let count = self.count(4)?;
+        let mut values = Vec::with_capacity(count);
+        for _ in 0..count {
+            values.push(self.u32()?);
+        }
+        Ok(values)
     }
 
     fn call(&mut self) -> Result<ProgramCall, CanonicalCodecError> {
@@ -635,11 +653,12 @@ mod tests {
                     target: call("cb"),
                     signature: empty_abi.clone(),
                     effect: 0,
+                    parallel_transfer_params: vec![],
                     descriptor_version: 1,
                     kind: 0,
                     family_version: 1,
                 },
-                "0104020000006362010000000003000000003800000000010000000001000000",
+                "010402000000636201000000000300000000380000000000000000010000000001000000",
             ),
         ];
         for (value, expected) in goldens {
@@ -778,28 +797,31 @@ mod tests {
             target: call("cb"),
             signature: abi("0100000000030000000038000000"),
             effect: 0,
+            parallel_transfer_params: vec![],
             descriptor_version: 1,
             kind: 0,
             family_version: 1,
         };
-        for field in 0..4 {
+        for field in 0..5 {
             let mut invalid_callback = valid_callback.clone();
             let GeneratedId::SqliteScalarCallback {
                 effect,
+                parallel_transfer_params,
                 descriptor_version,
                 kind,
                 family_version,
                 ..
             } = &mut invalid_callback
             else {
-                unreachable!()
+                panic!("callback fixture changed variant")
             };
             match field {
                 0 => *effect = 2,
-                1 => *descriptor_version = 2,
-                2 => *kind = 1,
-                3 => *family_version = 2,
-                _ => unreachable!(),
+                1 => parallel_transfer_params.push(0),
+                2 => *descriptor_version = 2,
+                3 => *kind = 1,
+                4 => *family_version = 2,
+                _ => panic!("callback identity mutation index is outside the fixed range"),
             }
             assert_eq!(
                 invalid_callback.to_canonical_bytes(),

@@ -20,6 +20,91 @@ fn main() -> i32 {
 }
 "#;
 
+const PARALLEL_CALLBACK_MAIN: &str = r#"module main
+import pkg.db
+import pkg.db.sqlite
+
+fn score(value: pkg.db.value) -> i64 = match value { Null => 0, _ => 1 }
+
+fn direct(args: pkg.db.sqlite.function_args) -> Result<pkg.db.value, str> {
+  values := args.values
+  count := values.par_map(score).sum()
+  return Ok(pkg.db.value.I64(count))
+}
+
+fn helper(values: slice<pkg.db.value>) -> i64 = values.par_map(score).sum()
+
+fn through_helper(args: pkg.db.sqlite.function_args) -> Result<pkg.db.value, str> =
+  Ok(pkg.db.value.I64(helper(args.values)))
+
+fn through_concrete_function_value(text: str) -> i64 {
+  f := helper_text
+  return f(text)
+}
+
+fn helper_text(text: str) -> i64 = task_group {
+  task := spawn(fn { text.len() })
+  wait()
+  task.get()
+}
+
+fn through_function_value(args: pkg.db.sqlite.function_args) -> Result<pkg.db.value, str> {
+  if args.values.len() == 0 { return Ok(pkg.db.value.Null) }
+  return match args.values[0] {
+    Text(text) => Ok(pkg.db.value.I64(through_concrete_function_value(text)))
+    _ => Ok(pkg.db.value.Null)
+  }
+}
+
+fn main() -> i32 {
+  first := pkg.db.sqlite.function(direct)
+  second := pkg.db.sqlite.function(through_helper)
+  third := pkg.db.sqlite.function(through_function_value)
+  return 42
+}
+"#;
+
+const SAFE_PARALLEL_CALLBACK_MAIN: &str = r#"module main
+import pkg.db
+import pkg.db.sqlite
+
+fn twice(value: i64) -> i64 = value * 2
+
+fn safe(args: pkg.db.sqlite.function_args) -> Result<pkg.db.value, str> {
+  count := [1, 2, 3].par_map(twice).sum()
+  if args.values.len() == 0 { return Ok(pkg.db.value.I64(count)) }
+  return Ok(args.values[0])
+}
+
+fn main() -> i32 {
+  callback := pkg.db.sqlite.function(safe)
+  return 42
+}
+"#;
+
+const IMPORTED_PARALLEL_CALLBACK_MODULE: &str = r#"module callback_parallel_dep
+import pkg.db
+import pkg.db.sqlite
+
+fn score(value: pkg.db.value) -> i64 = match value { Null => 0, _ => 1 }
+
+pub fn callback(args: pkg.db.sqlite.function_args) -> Result<pkg.db.value, str> {
+  values := args.values
+  count := values.par_map(score).sum()
+  return Ok(pkg.db.value.I64(count))
+}
+"#;
+
+const IMPORTED_PARALLEL_CALLBACK_MAIN: &str = r#"module main
+import callback_parallel_dep
+import pkg.db.sqlite
+
+fn main() -> i32 {
+  callback := pkg.db.sqlite.function(callback_parallel_dep.callback)
+  return 42
+}
+"#;
+
 const WRONG_SIGNATURE_MAIN: &str = r#"module main
 import pkg.db
 import pkg.db.sqlite
@@ -227,6 +312,18 @@ fn is_connection_error(result: Result<(), pkg.db.Error>) -> bool = match result 
   Ok(_) => false
 }
 
+fn is_snapshot_error(result: Result<(), pkg.db.Error>) -> bool = match result {
+  Err(error) => match error {
+    Connection(native) => {
+      primary := match native.code { Some(code) => code == "1", None => false }
+      extended := match native.extended_code { Some(code) => code == 257, None => false }
+      primary && extended && native.message == "x"
+    }
+    _ => false
+  }
+  Ok(_) => false
+}
+
 fn is_callback_connection_error(result: Result<(), pkg.db.Error>) -> bool = match result {
   Err(error) => match error {
     Unsupported(contract) => contract.item == "sqlite.callback.connection"
@@ -255,7 +352,7 @@ fn main() -> i32 {
   failed := pkg.db.sqlite.register_function(
     native_failure, "align_fail", 0, pkg.db.sqlite.function(value), [],
   )
-  if !is_connection_error(failed) || pkg.db.testkit.callback_registration.calls() != 1 { return 4 }
+  if !is_snapshot_error(failed) || pkg.db.testkit.callback_registration.calls() != 1 { return 4 }
   after_failure := pkg.db.sqlite.register_function(
     native_failure, "align_again", 0, pkg.db.sqlite.function(value), [],
   )
@@ -285,7 +382,7 @@ fn main() -> i32 {
   pkg.db.testkit.callback_registration.reset(1, 3030000)
   mut removal_failure := pkg.db.sqlite.connect(":memory:", []) else { return 10 }
   removed := pkg.db.sqlite.remove_function(removal_failure, "align_remove", 0)
-  if !is_connection_error(removed)
+  if !is_snapshot_error(removed)
     || pkg.db.testkit.callback_registration.calls() != 1 { return 11 }
   after_removal := pkg.db.sqlite.remove_function(removal_failure, "align_remove", 0)
   if !is_callback_connection_error(after_removal)
@@ -696,6 +793,49 @@ fn sqlite_callback_public_producer_accepts_only_one_exact_static_target() {
 }
 
 #[test]
+fn sqlite_callback_invocation_views_never_reach_parallel_workers() {
+    const DIAGNOSTIC: &str =
+        "SQLite callback invocation views cannot be transferred to parallel workers";
+    let direct = Layout::new().main(PARALLEL_CALLBACK_MAIN);
+    let direct_checked = common::diff_check_multi(
+        "pkg-db-callback-parallel-transfer",
+        &direct.files(),
+        "main.align",
+    );
+    assert!(direct_checked.whole_errors && direct_checked.per_unit_errors);
+    for diagnostics in [&direct_checked.whole_diags, &direct_checked.per_unit_diags] {
+        assert_eq!(
+            diagnostics.matches(DIAGNOSTIC).count(),
+            3,
+            "direct/helper/function-value descriptors must each receive the exact diagnostic:\n{diagnostics}",
+        );
+    }
+
+    let imported = Layout::new()
+        .module(
+            "callback_parallel_dep.align",
+            IMPORTED_PARALLEL_CALLBACK_MODULE,
+        )
+        .main(IMPORTED_PARALLEL_CALLBACK_MAIN);
+    let imported_checked = common::diff_check_multi(
+        "pkg-db-callback-imported-parallel-transfer",
+        &imported.files(),
+        "main.align",
+    );
+    assert!(imported_checked.whole_errors && imported_checked.per_unit_errors);
+    for diagnostics in [
+        &imported_checked.whole_diags,
+        &imported_checked.per_unit_diags,
+    ] {
+        assert_eq!(diagnostics.matches(DIAGNOSTIC).count(), 1, "{diagnostics}");
+    }
+    expect_checks_clean(
+        "pkg-db-callback-static-parallel",
+        &Layout::new().main(SAFE_PARALLEL_CALLBACK_MAIN),
+    );
+}
+
+#[test]
 fn sqlite_callback_descriptor_and_trampoline_link_in_per_unit_build() {
     CALLBACK_FORMATION.run();
 }
@@ -725,6 +865,25 @@ fn sqlite_callback_descriptor_and_trampoline_have_the_exact_generated_llvm_shape
         false,
     )
     .expect("emit callback LLVM");
+    let sqlite_unit = built
+        .walk
+        .units
+        .iter()
+        .find(|unit| {
+            unit.mir
+                .externs
+                .iter()
+                .any(|external| external.name.as_str() == "align_pkg_db_sqlite_register_v2")
+        })
+        .expect("per-unit build contains the SQLite package unit");
+    let per_unit_sqlite_llvm = common::emit_llvm_ir(
+        &sqlite_unit.mir,
+        common::BuildTarget::Baseline,
+        false,
+        &[],
+        false,
+    )
+    .expect("emit SQLite package LLVM");
     let mut stale_effect = built.unit("main").mir.clone();
     let callback_target = stale_effect
         .fns
@@ -791,6 +950,32 @@ fn sqlite_callback_descriptor_and_trampoline_have_the_exact_generated_llvm_shape
             llvm.matches("call ptr @sqlite3_context_db_handle").count(),
             1,
             "{pipeline}: callback must save its database handle exactly once",
+        );
+    }
+    for (pipeline, llvm) in [
+        ("whole", &whole_llvm),
+        ("per-unit SQLite", &per_unit_sqlite_llvm),
+    ] {
+        assert!(
+            llvm.contains("define private ptr @align_pkg_db_sqlite_register_v2"),
+            "{pipeline}: missing the exact v2 registration helper definition:\n{llvm}",
+        );
+        for call in [
+            "call i32 @sqlite3_create_function_v2",
+            "call i32 @sqlite3_errcode",
+            "call i32 @sqlite3_extended_errcode",
+            "call ptr @sqlite3_errmsg",
+            "call ptr @align_rt_alloc",
+            "call void @llvm.trap",
+        ] {
+            assert!(
+                llvm.contains(call),
+                "{pipeline}: registration helper is missing `{call}`:\n{llvm}",
+            );
+        }
+        assert!(
+            llvm.lines().any(|line| line.contains("and i32") && line.trim_end().ends_with(", 255")),
+            "{pipeline}: primary SQLite result code must be masked to eight bits:\n{llvm}",
         );
     }
     for artifact in ["@sqlite_callback_descriptor =", "@sqlite_callback_identity ="] {

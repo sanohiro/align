@@ -140,11 +140,13 @@ int sqlite3_extended_result_codes(void *database, int enabled) {
 
 int sqlite3_errcode(void *database) {
   if (callback_fixture_active) return callback_fixture_errcode(database);
+  if (callback_registration_mode == 1) return 257;
   return database == NULL ? 1 : (dynamic_mode == 1 && step_phase == 1 ? 100 : 0);
 }
 int sqlite3_extended_errcode(void *database) { return sqlite3_errcode(database); }
 const char *sqlite3_errmsg(void *database) {
   (void)database;
+  if (callback_registration_mode == 1) return "x";
   return "SQLite pool stub failure";
 }
 

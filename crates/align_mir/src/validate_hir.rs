@@ -239,6 +239,12 @@ impl<'a> DeclarationValidator<'a> {
                     &function.return_region,
                 )
                 || !self.return_cleanup_valid(function.ret, function.return_cleanup)
+                || !transfer_params_valid(
+                    self.program,
+                    &function.parallel_transfer_params,
+                    &function.params,
+                    &function.param_modes,
+                )
             {
                 return false;
             }
@@ -423,6 +429,16 @@ impl<'a> DeclarationValidator<'a> {
                 &function.param_modes,
             )
             && self.return_cleanup_valid(function.ret, function.return_cleanup)
+            && transfer_summary_valid(
+                self.program,
+                &function.parallel_transfer,
+                &parameter_types,
+                &function.param_modes,
+                match function.origin {
+                    hir::FnOrigin::Lifted { capture_count } => capture_count,
+                    hir::FnOrigin::Source { .. } | hir::FnOrigin::Monomorph => 0,
+                },
+            )
     }
 
     fn return_cleanup_valid(&self, ret: Ty, cleanup: hir::ReturnCleanupAbi) -> bool {
@@ -594,6 +610,78 @@ fn summary_valid(
         }
         _ => false,
     }
+}
+
+fn transfer_params_valid(
+    program: &hir::Program,
+    roots: &[u32],
+    params: &[Ty],
+    modes: &[align_ast::ParamMode],
+) -> bool {
+    roots.windows(2).all(|pair| pair[0] < pair[1])
+        && roots.iter().all(|&id| {
+            params.get(id as usize).is_some_and(|&ty| {
+                modes.get(id as usize).is_some_and(|mode| {
+                    matches!(
+                        mode,
+                        align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut
+                    ) || align_sema::ty_may_borrow(
+                        ty,
+                        &program.structs,
+                        &program.tuples,
+                        &program.enums,
+                        &program.tagged_types,
+                    )
+                })
+            })
+        })
+}
+
+fn transfer_summary_valid(
+    program: &hir::Program,
+    summary: &hir::ReturnBorrowSummary,
+    params: &[Ty],
+    modes: &[align_ast::ParamMode],
+    capture_count: u32,
+) -> bool {
+    let hir::ReturnBorrowSummary::Roots {
+        params: roots,
+        captures,
+    } = summary
+    else {
+        return true;
+    };
+    if roots.is_empty() && captures.is_empty() {
+        return false;
+    }
+    let Ok(capture_count) = usize::try_from(capture_count) else {
+        return false;
+    };
+    let Some(explicit_count) = params.len().checked_sub(capture_count) else {
+        return false;
+    };
+    transfer_params_valid(
+        program,
+        roots,
+        &params[..explicit_count],
+        &modes[..explicit_count],
+    ) && captures.windows(2).all(|pair| pair[0] < pair[1])
+        && captures.iter().all(|&capture| {
+            let Some(index) = usize::try_from(capture)
+                .ok()
+                .and_then(|capture| explicit_count.checked_add(capture))
+            else {
+                return false;
+            };
+            index < params.len()
+                && align_sema::ty_may_borrow(
+                    params[index],
+                    &program.structs,
+                    &program.tuples,
+                    &program.enums,
+                    &program.tagged_types,
+                )
+        })
 }
 
 fn builtin_error_shape(definition: &hir::EnumDef) -> bool {
@@ -3947,19 +4035,26 @@ impl<'a> BodyValidator<'a> {
                     .params
                     .first()
                     .and_then(|local| function.locals.get(*local as usize))
-                    .is_some_and(|local| local.ty == Ty::Struct(args_id))
-                && function.ret == expected_ret;
+                    .is_some_and(|local| self.body_ty_matches(local.ty, Ty::Struct(args_id)))
+                && self.body_ty_matches(function.ret, expected_ret)
+                    && !matches!(
+                        &function.parallel_transfer,
+                        hir::ReturnBorrowSummary::Roots { params, .. }
+                            if params.binary_search(&0).is_ok()
+                    );
         }
         self.program
             .imported_fns
             .iter()
             .find(|function| function.name == target)
             .is_some_and(|function| {
-                function.params == [Ty::Struct(args_id)]
+                function.params.len() == 1
+                    && self.body_ty_matches(function.params[0], Ty::Struct(args_id))
                     && function.param_modes == [align_ast::ParamMode::ByValue]
-                    && function.ret == expected_ret
+                    && self.body_ty_matches(function.ret, expected_ret)
                     && function.effect == effect
                     && function.return_provenance_known
+                    && function.parallel_transfer_params.binary_search(&0).is_err()
             })
     }
 

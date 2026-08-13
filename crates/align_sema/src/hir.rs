@@ -161,8 +161,11 @@ pub struct ImportedFn {
     pub return_region: ReturnRegionSummary,
     pub return_cleanup: ReturnCleanupAbi,
     /// The normalized cross-unit effect fact. This is checked-HIR transport only; MIR strips it
-    /// after declaration validation because the six-field imported ABI record is unchanged.
+    /// after declaration validation because imported callable ABI records are unchanged.
     pub effect: crate::FnEffect,
+    /// Canonical parameter roots whose contained views may be transferred to a worker by the
+    /// imported body. This validation-only interface fact is stripped before MIR construction.
+    pub parallel_transfer_params: Vec<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -318,6 +321,9 @@ pub struct Fn {
     pub return_borrow: ReturnBorrowSummary,
     pub return_region: ReturnRegionSummary,
     pub return_cleanup: ReturnCleanupAbi,
+    /// Parameter/capture roots whose contained views may reach `spawn` or `par_map` workers.
+    /// Source functions have no capture roots; lifted functions retain capture-relative roots.
+    pub parallel_transfer: ReturnBorrowSummary,
     /// All locals (params + `let` bindings), indexed by [`LocalId`]. Each is a slot.
     pub locals: Vec<Local>,
     pub body: Block,

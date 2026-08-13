@@ -18,7 +18,7 @@ use crate::{
 /// The interface-artifact format version. Bump on ANY encoding change; a bump invalidates every
 /// cached summary (an old version fails closed on read) and changes `interface_hash` (the version is
 /// part of the hashed surface).
-pub const FORMAT_VERSION: u32 = 5;
+pub const FORMAT_VERSION: u32 = 6;
 
 /// Narrow a length to the format's `u32` length-prefix width, or panic loudly. This is
 /// producer-side, compiler-internal data (interface surfaces built from the compiler's own source
@@ -177,6 +177,7 @@ fn write_fn(w: &mut Writer, f: &IFnSig) {
     write_return_region(w, &f.return_region);
     write_return_cleanup(w, f.return_cleanup);
     write_effect(w, f.effect);
+    w.seq(&f.parallel_transfer_params, |w, root| w.u32(*root));
     w.bool(f.resource_hook_body);
     w.opt_str(&f.generic_body);
 }
@@ -424,6 +425,20 @@ fn validate_roots(
     Ok(())
 }
 
+fn validate_transfer_roots(params: &[u32], param_count: usize) -> Result<(), DecodeError> {
+    if params.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(DecodeError::InvalidSummary(
+            "parallel-transfer roots must be strictly increasing",
+        ));
+    }
+    if params.iter().any(|root| *root as usize >= param_count) {
+        return Err(DecodeError::InvalidSummary(
+            "parallel-transfer root is outside the signature",
+        ));
+    }
+    Ok(())
+}
+
 fn read_roots(
     r: &mut Reader<'_>,
     param_count: usize,
@@ -494,6 +509,8 @@ fn read_fn(r: &mut Reader<'_>) -> Result<IFnSig, DecodeError> {
     let return_region = read_return_region(r, params.len())?;
     let return_cleanup = read_return_cleanup(r)?;
     let effect = read_effect(r)?;
+    let parallel_transfer_params = r.seq(|r| r.u32())?;
+    validate_transfer_roots(&parallel_transfer_params, params.len())?;
     let resource_hook_body = r.bool()?;
     let generic_body = r.opt_str()?;
     Ok(IFnSig {
@@ -505,6 +522,7 @@ fn read_fn(r: &mut Reader<'_>) -> Result<IFnSig, DecodeError> {
         return_region,
         return_cleanup,
         effect,
+        parallel_transfer_params,
         resource_hook_body,
         generic_body,
     })

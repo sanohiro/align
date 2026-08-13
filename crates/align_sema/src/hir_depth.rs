@@ -1423,6 +1423,7 @@ mod tests {
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
                 return_cleanup: hir::ReturnCleanupAbi::None,
+                parallel_transfer: hir::ReturnBorrowSummary::None,
                 locals: Vec::new(),
                 body: Block {
                     stmts: Vec::new(),
@@ -1483,6 +1484,7 @@ mod tests {
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
                 return_cleanup: hir::ReturnCleanupAbi::DynamicBit,
+                parallel_transfer: hir::ReturnBorrowSummary::None,
                 locals: vec![hir::Local {
                     id: 0,
                     name: "value".to_string(),
@@ -1553,6 +1555,7 @@ mod tests {
                 return_borrow: hir::ReturnBorrowSummary::None,
                 return_region: hir::ReturnRegionSummary::None,
                 return_cleanup: hir::ReturnCleanupAbi::DynamicBit,
+                parallel_transfer: hir::ReturnBorrowSummary::None,
                 locals: vec![hir::Local {
                     id: 0,
                     name: "value".to_string(),
@@ -1629,6 +1632,7 @@ mod tests {
                 } else {
                     hir::ReturnCleanupAbi::None
                 },
+                parallel_transfer: hir::ReturnBorrowSummary::None,
                 locals: vec![hir::Local {
                     id: 0,
                     name: "value".to_string(),
@@ -2058,6 +2062,7 @@ mod tests {
                 } else {
                     hir::ReturnCleanupAbi::None
                 },
+                parallel_transfer: hir::ReturnBorrowSummary::None,
                 locals: vec![hir::Local {
                     id: 0,
                     name: "value".to_string(),
@@ -2232,10 +2237,12 @@ mod tests {
                     let callable_targets =
                         vec![crate::CallableTargetSet::new(); move_program.fn_types.len()];
                     let callable_target_ids = std::collections::HashMap::new();
+                    let callable_parallel_targets = crate::CallableTransferSet::new();
                     crate::MoveCheck {
                         f: &move_program.fns[0],
                         diags: &mut diagnostics,
                         named_return_borrow: &named_return_borrow,
+                        named_parallel_transfer: &named_return_borrow,
                         named_param_modes: &named_param_modes,
                         named_borrow_mut_retention: &named_borrow_mut_retention,
                         summary_dependencies: None,
@@ -2246,6 +2253,7 @@ mod tests {
                         fn_types: &move_program.fn_types,
                         callable_targets: &callable_targets,
                         callable_target_ids: &callable_target_ids,
+                        callable_parallel_targets: &callable_parallel_targets,
                         loop_breaks: Vec::new(),
                         borrows: crate::BorrowState::default(),
                         next_pipeline_snapshot: 0,
@@ -2259,6 +2267,7 @@ mod tests {
                         loop_iter_drops: Vec::new(),
                         arena_depth: 0,
                         return_roots: crate::BorrowRoots::new(),
+                        parallel_transfer_roots: crate::BorrowRoots::new(),
                         borrow_mut_retention: vec![
                             crate::BorrowRoots::new();
                             move_program.fns[0].params.len()

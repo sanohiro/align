@@ -9,14 +9,14 @@ import pkg.db.internal.sqlite
 
 extern "C" {
   fn memcpy(destination: raw, source: str, count: i64) -> raw
-  fn align_pkg_db_sqlite_register_v1(
+  fn align_pkg_db_sqlite_register_v2(
     database: raw,
     name: str,
     name_length: i64,
     arity: i32,
     flags: i32,
     trampoline: raw,
-  ) -> i32
+  ) -> raw
 }
 
 extern "C" link("sqlite3") {
@@ -181,6 +181,39 @@ fn sqlite_error(database: raw) -> pkg.db.Error {
     code_builder.write_int(primary)
     code := code_builder.to_string()
     message := copy_c_string(sqlite3_errmsg(database))
+    return pkg.db.Error.Connection(pkg.db.NativeError {
+      driver: pkg.db.Driver.SQLite,
+      code: Some(code),
+      extended_code: Some(extended as i64),
+      sqlstate: None,
+      message: message,
+      detail: None,
+      constraint: None,
+      table: None,
+      column: None,
+    })
+  }
+}
+
+fn sqlite_callback_snapshot_error(snapshot: raw) -> pkg.db.Error {
+  unsafe {
+    primary: i32 := raw.load(snapshot, 0)
+    extended: i32 := raw.load(snapshot, 4)
+    message_length: i64 := raw.load(snapshot, 8)
+    mut output := buffer(message_length)
+    mut i := 0
+    loop {
+      if i >= message_length { break }
+      byte: u8 := raw.load(snapshot, 16 + i)
+      output.put_u8(byte)
+      i = i + 1
+    }
+    text := output.bytes().as_str() else "invalid UTF-8 in SQLite error"
+    message := text.clone()
+    raw.free(snapshot)
+    mut code_builder := builder()
+    code_builder.write_int(primary)
+    code := code_builder.to_string()
     return pkg.db.Error.Connection(pkg.db.NativeError {
       driver: pkg.db.Driver.SQLite,
       code: Some(code),
@@ -446,12 +479,12 @@ pub fn register_function(
     cb_trampoline: raw := raw.load(cb_data, 8)
     cb_flags := SQLITE_UTF8 | SQLITE_DIRECTONLY
       | if deterministic { SQLITE_DETERMINISTIC } else { 0 }
-    cb_status := align_pkg_db_sqlite_register_v1(
+    cb_snapshot := align_pkg_db_sqlite_register_v2(
       cb_database, name, name.len(), arity, cb_flags, cb_trampoline,
     )
-    if cb_status != SQLITE_OK {
-      first := sqlite_error(cb_database)
+    if !cb_snapshot.is_null() {
       pkg.db.internal.resource.poison_conn_state(cb_state)
+      first := sqlite_callback_snapshot_error(cb_snapshot)
       return Err(first)
     }
     if !callback_post_call_valid(cb_state, cb_database) {
@@ -481,12 +514,12 @@ pub fn remove_function(
   unsafe {
     cb_state := resource.raw(resource.borrow(connection))
     cb_database: raw := raw.load(cb_state, 8)
-    cb_status := align_pkg_db_sqlite_register_v1(
+    cb_snapshot := align_pkg_db_sqlite_register_v2(
       cb_database, name, name.len(), arity, SQLITE_UTF8 | SQLITE_DIRECTONLY, raw.null(),
     )
-    if cb_status != SQLITE_OK {
-      first := sqlite_error(cb_database)
+    if !cb_snapshot.is_null() {
       pkg.db.internal.resource.poison_conn_state(cb_state)
+      first := sqlite_callback_snapshot_error(cb_snapshot)
       return Err(first)
     }
     if !callback_post_call_valid(cb_state, cb_database) {

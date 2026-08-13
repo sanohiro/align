@@ -744,7 +744,7 @@ fn sqlite_callback_bytes_global<'c>(
     global.as_pointer_value()
 }
 
-const SQLITE_CALLBACK_REGISTER_HELPER: &str = "align_pkg_db_sqlite_register_v1";
+const SQLITE_CALLBACK_REGISTER_HELPER: &str = "align_pkg_db_sqlite_register_v2";
 
 #[derive(Clone, Copy)]
 struct SqliteCallbackContractTypes {
@@ -890,7 +890,7 @@ fn emit_sqlite_callback_register_helper<'c>(
     let i8_ty = ctx.i8_type();
     let i32_ty = ctx.i32_type();
     let i64_ty = ctx.i64_type();
-    let expected_helper_ty = i32_ty.fn_type(
+    let expected_helper_ty = ptr_ty.fn_type(
         &[
             ptr_ty.into(),
             ptr_ty.into(),
@@ -928,10 +928,56 @@ fn emit_sqlite_callback_register_helper<'c>(
             "SQLite callback registration native declaration has an incompatible ABI".into(),
         ));
     }
+    let i32_from_ptr = i32_ty.fn_type(&[ptr_ty.into()], false);
+    let errcode = module
+        .get_function("sqlite3_errcode")
+        .unwrap_or_else(|| module.add_function("sqlite3_errcode", i32_from_ptr, None));
+    let extended_errcode = module
+        .get_function("sqlite3_extended_errcode")
+        .unwrap_or_else(|| module.add_function("sqlite3_extended_errcode", i32_from_ptr, None));
+    let errmsg_ty = ptr_ty.fn_type(&[ptr_ty.into()], false);
+    let errmsg = module
+        .get_function("sqlite3_errmsg")
+        .unwrap_or_else(|| module.add_function("sqlite3_errmsg", errmsg_ty, None));
+    let strlen_ty = i64_ty.fn_type(&[ptr_ty.into()], false);
+    let strlen = module
+        .get_function("strlen")
+        .unwrap_or_else(|| module.add_function("strlen", strlen_ty, None));
+    let alloc_ty = ptr_ty.fn_type(&[i64_ty.into()], false);
+    let alloc = module
+        .get_function("align_rt_alloc")
+        .unwrap_or_else(|| module.add_function("align_rt_alloc", alloc_ty, None));
+    let trap_ty = ctx.void_type().fn_type(&[], false);
+    let trap = module
+        .get_function("llvm.trap")
+        .unwrap_or_else(|| module.add_function("llvm.trap", trap_ty, None));
+    for (name, function, expected) in [
+        ("sqlite3_errcode", errcode, i32_from_ptr),
+        ("sqlite3_extended_errcode", extended_errcode, i32_from_ptr),
+        ("sqlite3_errmsg", errmsg, errmsg_ty),
+        ("strlen", strlen, strlen_ty),
+        ("align_rt_alloc", alloc, alloc_ty),
+        ("llvm.trap", trap, trap_ty),
+    ] {
+        if function.get_type() != expected {
+            return Err(CodegenError::Lowering(format!(
+                "SQLite callback registration dependency '{name}' has an incompatible ABI"
+            )));
+        }
+    }
     let builder = ctx.create_builder();
     let entry = ctx.append_basic_block(helper, "entry");
+    let scan_head = ctx.append_basic_block(helper, "name.scan.head");
+    let scan_body = ctx.append_basic_block(helper, "name.scan.body");
+    let scalar_valid = ctx.append_basic_block(helper, "scalar.valid");
     let valid = ctx.append_basic_block(helper, "valid");
     let invalid = ctx.append_basic_block(helper, "invalid");
+    let native_success = ctx.append_basic_block(helper, "native.success");
+    let native_failure = ctx.append_basic_block(helper, "native.failure");
+    let message_length = ctx.append_basic_block(helper, "message.length");
+    let snapshot = ctx.append_basic_block(helper, "snapshot");
+    let snapshot_copy = ctx.append_basic_block(helper, "snapshot.copy");
+    let snapshot_done = ctx.append_basic_block(helper, "snapshot.done");
     builder.position_at_end(entry);
     let params = (0..6)
         .map(|index| helper.get_nth_param(index))
@@ -961,10 +1007,69 @@ fn emit_sqlite_callback_register_helper<'c>(
     let mut input_ok = builder.build_and(database_ok, name_ok, "input.pointer.ok").map_err(lower)?;
     input_ok = builder.build_and(input_ok, len_positive, "input.len.positive").map_err(lower)?;
     input_ok = builder.build_and(input_ok, len_bounded, "input.ok").map_err(lower)?;
-    builder.build_conditional_branch(input_ok, valid, invalid).map_err(lower)?;
+    builder.build_conditional_branch(input_ok, scan_head, invalid).map_err(lower)?;
 
     builder.position_at_end(invalid);
-    builder.build_return(Some(&i32_ty.const_int(21, false))).map_err(lower)?;
+    builder.build_call(trap, &[], "").map_err(lower)?;
+    builder.build_unreachable().map_err(lower)?;
+
+    builder.position_at_end(scan_head);
+    let scan_index = builder.build_phi(i64_ty, "name.index").map_err(lower)?;
+    scan_index.add_incoming(&[(&i64_ty.const_zero(), entry)]);
+    let scan_index_value = scan_index.as_basic_value().into_int_value();
+    let scan_complete = builder
+        .build_int_compare(IntPredicate::EQ, scan_index_value, name_len, "name.scan.complete")
+        .map_err(lower)?;
+    builder.build_conditional_branch(scan_complete, scalar_valid, scan_body).map_err(lower)?;
+
+    builder.position_at_end(scan_body);
+    let name_byte_ptr = unsafe {
+        builder
+            .build_in_bounds_gep(i8_ty, name, &[scan_index_value], "name.byte.ptr")
+            .map_err(lower)?
+    };
+    let name_byte = builder
+        .build_load(i8_ty, name_byte_ptr, "name.byte")
+        .map_err(lower)?
+        .into_int_value();
+    let name_has_nul = builder
+        .build_int_compare(IntPredicate::EQ, name_byte, i8_ty.const_zero(), "name.has.nul")
+        .map_err(lower)?;
+    let scan_next = builder
+        .build_int_add(scan_index_value, i64_ty.const_int(1, false), "name.index.next")
+        .map_err(lower)?;
+    scan_index.add_incoming(&[(&scan_next, scan_body)]);
+    builder.build_conditional_branch(name_has_nul, invalid, scan_head).map_err(lower)?;
+
+    builder.position_at_end(scalar_valid);
+    let arity_nonnegative = builder
+        .build_int_compare(IntPredicate::SGE, arity, i32_ty.const_zero(), "arity.nonnegative")
+        .map_err(lower)?;
+    let arity_bounded = builder
+        .build_int_compare(IntPredicate::SLE, arity, i32_ty.const_int(127, false), "arity.bounded")
+        .map_err(lower)?;
+    let arity_ok = builder.build_and(arity_nonnegative, arity_bounded, "arity.ok").map_err(lower)?;
+    let trampoline_present = builder.build_is_not_null(trampoline, "trampoline.present").map_err(lower)?;
+    let direct_flags = i32_ty.const_int((1 | 524_288) as u64, false);
+    let deterministic_flags = i32_ty.const_int((1 | 524_288 | 2_048) as u64, false);
+    let flags_direct = builder
+        .build_int_compare(IntPredicate::EQ, flags, direct_flags, "flags.direct")
+        .map_err(lower)?;
+    let flags_deterministic = builder
+        .build_int_compare(IntPredicate::EQ, flags, deterministic_flags, "flags.deterministic")
+        .map_err(lower)?;
+    let registration_flags = builder.build_or(flags_direct, flags_deterministic, "flags.registration").map_err(lower)?;
+    let removal = builder
+        .build_and(
+            builder.build_not(trampoline_present, "trampoline.absent").map_err(lower)?,
+            flags_direct,
+            "removal.ok",
+        )
+        .map_err(lower)?;
+    let registration = builder.build_and(trampoline_present, registration_flags, "registration.ok").map_err(lower)?;
+    let product_ok = builder.build_or(registration, removal, "product.ok").map_err(lower)?;
+    let scalar_ok = builder.build_and(arity_ok, product_ok, "scalar.ok").map_err(lower)?;
+    builder.build_conditional_branch(scalar_ok, valid, invalid).map_err(lower)?;
 
     builder.position_at_end(valid);
     let scratch_ty = i8_ty.array_type(256);
@@ -1004,7 +1109,159 @@ fn emit_sqlite_callback_register_helper<'c>(
         .ok_or_else(|| {
             CodegenError::Lowering("sqlite3_create_function_v2 returned no status".into())
         })?;
-    builder.build_return(Some(&status)).map_err(lower)?;
+    let status = status.into_int_value();
+    let status_ok = builder
+        .build_int_compare(IntPredicate::EQ, status, i32_ty.const_zero(), "status.ok")
+        .map_err(lower)?;
+    builder
+        .build_conditional_branch(status_ok, native_success, native_failure)
+        .map_err(lower)?;
+
+    builder.position_at_end(native_success);
+    builder
+        .build_return(Some(&ptr_ty.const_null()))
+        .map_err(lower)?;
+
+    builder.position_at_end(native_failure);
+    let primary_raw = builder
+        .build_call(errcode, &[database.into()], "primary.raw")
+        .map_err(lower)?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| CodegenError::Lowering("sqlite3_errcode returned void".into()))?
+        .into_int_value();
+    let primary = builder
+        .build_and(primary_raw, i32_ty.const_int(0xff, false), "primary")
+        .map_err(lower)?;
+    let extended = builder
+        .build_call(extended_errcode, &[database.into()], "extended")
+        .map_err(lower)?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| CodegenError::Lowering("sqlite3_extended_errcode returned void".into()))?
+        .into_int_value();
+    let message = builder
+        .build_call(errmsg, &[database.into()], "message")
+        .map_err(lower)?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| CodegenError::Lowering("sqlite3_errmsg returned void".into()))?
+        .into_pointer_value();
+    let message_null = builder
+        .build_is_null(message, "message.null")
+        .map_err(lower)?;
+    builder
+        .build_conditional_branch(message_null, snapshot, message_length)
+        .map_err(lower)?;
+
+    builder.position_at_end(message_length);
+    let measured_length = builder
+        .build_call(strlen, &[message.into()], "message.length")
+        .map_err(lower)?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| CodegenError::Lowering("strlen returned void".into()))?
+        .into_int_value();
+    builder
+        .build_unconditional_branch(snapshot)
+        .map_err(lower)?;
+
+    builder.position_at_end(snapshot);
+    let length = builder
+        .build_phi(i64_ty, "snapshot.length")
+        .map_err(lower)?;
+    length.add_incoming(&[
+        (&i64_ty.const_zero(), native_failure),
+        (&measured_length, message_length),
+    ]);
+    let length = length.as_basic_value().into_int_value();
+    let length_ok = builder
+        .build_int_compare(
+            IntPredicate::ULE,
+            length,
+            i64_ty.const_int((i64::MAX - 17) as u64, false),
+            "snapshot.length.ok",
+        )
+        .map_err(lower)?;
+    let snapshot_alloc = ctx.append_basic_block(helper, "snapshot.alloc");
+    builder
+        .build_conditional_branch(length_ok, snapshot_alloc, invalid)
+        .map_err(lower)?;
+
+    builder.position_at_end(snapshot_alloc);
+    let allocation_size = builder
+        .build_int_add(length, i64_ty.const_int(17, false), "snapshot.size")
+        .map_err(lower)?;
+    let allocation = builder
+        .build_call(alloc, &[allocation_size.into()], "snapshot.allocation")
+        .map_err(lower)?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| CodegenError::Lowering("align_rt_alloc returned void".into()))?
+        .into_pointer_value();
+    builder.build_store(allocation, primary).map_err(lower)?;
+    let extended_ptr = unsafe {
+        builder
+            .build_in_bounds_gep(
+                i8_ty,
+                allocation,
+                &[i64_ty.const_int(4, false)],
+                "snapshot.extended.ptr",
+            )
+            .map_err(lower)?
+    };
+    builder.build_store(extended_ptr, extended).map_err(lower)?;
+    let length_ptr = unsafe {
+        builder
+            .build_in_bounds_gep(
+                i8_ty,
+                allocation,
+                &[i64_ty.const_int(8, false)],
+                "snapshot.length.ptr",
+            )
+            .map_err(lower)?
+    };
+    builder.build_store(length_ptr, length).map_err(lower)?;
+    let bytes_ptr = unsafe {
+        builder
+            .build_in_bounds_gep(
+                i8_ty,
+                allocation,
+                &[i64_ty.const_int(16, false)],
+                "snapshot.bytes",
+            )
+            .map_err(lower)?
+    };
+    let has_message = builder
+        .build_int_compare(
+            IntPredicate::NE,
+            length,
+            i64_ty.const_zero(),
+            "snapshot.has.message",
+        )
+        .map_err(lower)?;
+    builder
+        .build_conditional_branch(has_message, snapshot_copy, snapshot_done)
+        .map_err(lower)?;
+
+    builder.position_at_end(snapshot_copy);
+    builder
+        .build_memcpy(bytes_ptr, 1, message, 1, length)
+        .map_err(lower)?;
+    builder
+        .build_unconditional_branch(snapshot_done)
+        .map_err(lower)?;
+
+    builder.position_at_end(snapshot_done);
+    let terminator = unsafe {
+        builder
+            .build_in_bounds_gep(i8_ty, bytes_ptr, &[length], "snapshot.terminator")
+            .map_err(lower)?
+    };
+    builder
+        .build_store(terminator, i8_ty.const_zero())
+        .map_err(lower)?;
+    builder.build_return(Some(&allocation)).map_err(lower)?;
     mark_private_helper(helper);
     Ok(())
 }
@@ -2130,15 +2387,6 @@ fn build_module<'c>(
             .unwrap_or_else(|| module.add_function(ext.name.as_str(), fn_ty, None));
         program_funcs.insert(ext.name.clone(), fv);
     }
-    if let Some(helper) = module.get_function(SQLITE_CALLBACK_REGISTER_HELPER) {
-        let declared_by_package = program
-            .externs
-            .iter()
-            .any(|external| external.name.as_str() == SQLITE_CALLBACK_REGISTER_HELPER);
-        if declared_by_package {
-            emit_sqlite_callback_register_helper(ctx, module, helper)?;
-        }
-    }
     // The fixed native ABI table is the sole declaration/type/attribute authority. Program,
     // imported, and extern declarations intentionally remain earlier in the module. Keyed native
     // rows are then emitted in alphabetical RuntimeKey::ALL order into the typed runtime registry.
@@ -2177,6 +2425,19 @@ fn build_module<'c>(
             key,
             function.get_name().to_string_lossy().into_owned(),
         );
+    }
+    // Define the package-private SQLite registration helper only after the runtime registry has
+    // declared its fixed physical symbols. The failure snapshot calls `align_rt_alloc`; defining
+    // the helper earlier would make LLVM reserve that spelling before the registry authority and
+    // silently rename the real runtime declaration to `.1`.
+    if let Some(helper) = module.get_function(SQLITE_CALLBACK_REGISTER_HELPER) {
+        let declared_by_package = program
+            .externs
+            .iter()
+            .any(|external| external.name.as_str() == SQLITE_CALLBACK_REGISTER_HELPER);
+        if declared_by_package {
+            emit_sqlite_callback_register_helper(ctx, module, helper)?;
+        }
     }
 
     // Pass 1b: emit a thunk for each function used as a value (`FnValue`/`FnAddr`). A closure
@@ -2477,6 +2738,7 @@ fn build_module<'c>(
                     target: descriptor.target.clone(),
                     signature: canonical_signature(&declaration.signature, program)?,
                     effect,
+                    parallel_transfer_params: Vec::new(),
                     descriptor_version: 1,
                     kind: 0,
                     family_version: descriptor.family_version,
@@ -5309,6 +5571,7 @@ fn callable_preflight(
                             target: descriptor.target.clone(),
                             signature: canonical_signature(&declaration.signature, program)?,
                             effect,
+                            parallel_transfer_params: Vec::new(),
                             descriptor_version: 1,
                             kind: 0,
                             family_version: descriptor.family_version,
@@ -16241,6 +16504,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             target: descriptor.target.clone(),
             signature: canonical_signature(&declaration.signature, self.program)?,
             effect,
+            parallel_transfer_params: Vec::new(),
             descriptor_version: 1,
             kind: 0,
             family_version: descriptor.family_version,
@@ -18225,8 +18489,11 @@ mod tests {
                         field_base,
                         payload,
                     };
-                    field_base += u32::try_from(variant.payload.len())
-                        .expect("callback fixture payload count fits u32");
+                    let payload_len = match u32::try_from(variant.payload.len()) {
+                        Ok(payload_len) => payload_len,
+                        Err(_) => panic!("callback fixture payload count fits u32"),
+                    };
+                    field_base += payload_len;
                     variant
                 })
                 .collect(),
@@ -18245,8 +18512,10 @@ mod tests {
     #[test]
     fn sqlite_callback_contract_type_matrix_fails_closed_before_llvm_extraction() {
         let (program, signature) = sqlite_callback_contract_fixture();
-        let valid = sqlite_callback_contract_types(&program, &signature)
-            .expect("the exact callback contract fixture must validate");
+        let valid = match sqlite_callback_contract_types(&program, &signature) {
+            Ok(valid) => valid,
+            Err(error) => panic!("the exact callback contract fixture must validate: {error}"),
+        };
         assert_eq!((valid.args, valid.value, valid.byte_view), (0, 0, 1));
 
         let mut wrong_return = signature.clone();

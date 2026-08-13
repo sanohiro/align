@@ -120,9 +120,9 @@ pub enum DepState {
         /// uses, so both cache stages agree on what a consumer depends on.
         ///
         /// It covers everything the consumer actually reads: `summary_to_source` renders the
-        /// surface, and the four external fact maps (effects, return provenance, resource facts,
-        /// resource hooks) are all derived from it. Capabilities are excluded from the surface by
-        /// design and never reach a consumer's check — they are its own MIR's concern.
+        /// surface, and the four external fact maps (effects, return/parallel provenance, resource
+        /// facts, resource hooks) are all derived from it. Capabilities are excluded from the
+        /// surface by design and never reach a consumer's check — they are its own MIR's concern.
         interface_hash: Hash128,
         /// A digest over the dependency's OWN transitive closure module names, in its own walk
         /// order. Together with `interface_hash` this covers the rendered interface source exactly:
@@ -695,7 +695,7 @@ mod tests {
         // -- key region --
         "01000000",                         // key_format_version = 1
         "01000000000000000200000000000000", // compiler_fingerprint = Hash128 { lo: 1, hi: 2 }
-        "05000000",                         // frontend_schema = align_interface::FORMAT_VERSION = 5
+        "06000000",                         // frontend_schema = align_interface::FORMAT_VERSION = 6
         "04000000",                         // env_toggles: exactly 4
         "10000000414c49474e5f434f4e53545f504f4f4c", "00",             // ALIGN_CONST_POOL   Absent
         "12000000414c49474e5f4e4545444c455f484f495354", "01", "030000006f6666", // ..NEEDLE_HOIST Present("off")

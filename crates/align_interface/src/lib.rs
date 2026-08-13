@@ -141,6 +141,8 @@ pub struct IFnSig {
     pub return_cleanup: align_sema::hir::ReturnCleanupAbi,
     /// The 3-valued effect bit (part of the interface — flipping Pure→Impure is an interface change).
     pub effect: Effect,
+    /// Canonical parameter roots whose contained views may be transferred to parallel workers.
+    pub parallel_transfer_params: Vec<u32>,
     /// Whether the producer source has the exact top-level `unsafe {}` body shape required of a
     /// resource Drop hook. This is semantic validation metadata, not an importable hook path.
     pub resource_hook_body: bool,
@@ -436,6 +438,23 @@ pub fn build_summaries_with_effects(
             )
         }))
         .collect();
+    let parallel_transfer: HashMap<&str, Vec<u32>> = program
+        .fns
+        .iter()
+        .map(|function| {
+            let params = match &function.parallel_transfer {
+                ReturnBorrowSummary::None => Vec::new(),
+                ReturnBorrowSummary::Roots { params, .. } => params.clone(),
+            };
+            (function.name.as_str(), params)
+        })
+        .chain(program.imported_fns.iter().map(|function| {
+            (
+                function.name.as_str(),
+                function.parallel_transfer_params.clone(),
+            )
+        }))
+        .collect();
     let caps_by_unit = partition_capabilities(modules, mir);
     let impl_hash_by_unit = partition_impl_hashes(modules, mir);
 
@@ -467,22 +486,37 @@ pub fn build_summaries_with_effects(
                             effects.get(&canonical).copied().unwrap_or(Effect::Impure)
                         };
                         let canonical = mangle(&m.path, m.is_entry, &fd.name.name);
-                        let (return_borrow, return_region, return_cleanup) = if is_generic {
+                        let (
+                            return_borrow,
+                            return_region,
+                            return_cleanup,
+                            parallel_transfer_params,
+                        ) = if is_generic {
                             (
                                 ReturnBorrowSummary::None,
                                 ReturnRegionSummary::None,
                                 align_sema::hir::ReturnCleanupAbi::None,
+                                Vec::new(),
                             )
                         } else {
                             return_provenance
                                 .get(canonical.as_str())
                                 .map(|(borrow, region, cleanup)| {
-                                    ((*borrow).clone(), (*region).clone(), *cleanup)
+                                    (
+                                        (*borrow).clone(),
+                                        (*region).clone(),
+                                        *cleanup,
+                                        parallel_transfer
+                                            .get(canonical.as_str())
+                                            .cloned()
+                                            .unwrap_or_default(),
+                                    )
                                 })
                                 .unwrap_or((
                                     ReturnBorrowSummary::None,
                                     ReturnRegionSummary::None,
                                     align_sema::hir::ReturnCleanupAbi::None,
+                                    Vec::new(),
                                 ))
                         };
                         let mut params = fd
@@ -518,6 +552,7 @@ pub fn build_summaries_with_effects(
                             return_region,
                             return_cleanup,
                             effect,
+                            parallel_transfer_params,
                             resource_hook_body: align_sema::resource_hook_has_unsafe_body(&fd.body),
                             generic_body: is_generic.then(|| safe_slice(src, fd.span)),
                         });
@@ -939,6 +974,7 @@ pub enum ImportCompatibilityError {
     ReturnSummaryDisagreement,
     ReturnSummaryOnUnsupportedSignature,
     ReturnSummaryGenerativeCapabilityGraph,
+    ParallelTransferRootsNonCanonical,
     ReturnCleanupMismatch,
 }
 
@@ -1044,6 +1080,9 @@ impl std::fmt::Display for ImportCompatibilityError {
                     f,
                     "return provenance capability validation found a generative recursive type graph"
                 )
+            }
+            ImportCompatibilityError::ParallelTransferRootsNonCanonical => {
+                write!(f, "interface parallel-transfer roots are not strictly increasing")
             }
             ImportCompatibilityError::ReturnCleanupMismatch => {
                 write!(f, "interface return-cleanup metadata disagrees with its return type")
@@ -2286,6 +2325,30 @@ pub fn validate_for_import(
             &analysis,
             &function.type_params,
         )?;
+        if function
+            .parallel_transfer_params
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(ImportCompatibilityError::ParallelTransferRootsNonCanonical);
+        }
+        if function.generic_body.is_some() && !function.parallel_transfer_params.is_empty() {
+            return Err(ImportCompatibilityError::ReturnSummaryOnUnsupportedSignature);
+        }
+        for &index in &function.parallel_transfer_params {
+            let Some(parameter) = function.params.get(index as usize) else {
+                return Err(ImportCompatibilityError::ReturnSummaryRootCannotBorrow(
+                    index,
+                ));
+            };
+            if !analysis.may_borrow(&parameter.ty, &function.type_params)
+                && !matches!(parameter.mode, ParamMode::Borrow | ParamMode::BorrowMut)
+            {
+                return Err(ImportCompatibilityError::ReturnSummaryRootCannotBorrow(
+                    index,
+                ));
+            }
+        }
     }
     for structure in &summary.structs {
         if structure.type_params.is_empty() {
@@ -2489,6 +2552,7 @@ pub fn summary_return_provenance(
                 function.return_borrow.clone(),
                 function.return_region.clone(),
                 function.return_cleanup,
+                function.parallel_transfer_params.clone(),
             ),
         );
     }
