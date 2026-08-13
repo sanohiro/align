@@ -106,6 +106,7 @@ pub const SQLITE_Q6: Stub = Stub {
         "sqlite6.step_calls",
         "sqlite6.delivered_rows",
         "sqlite6.finalize_calls",
+        "sqlite6.control_calls",
         "sqlite6.protocol_ok",
     ],
 };
@@ -279,6 +280,7 @@ extern "C" {
   fn align_sqlite_q6_step_calls() -> i32
   fn align_sqlite_q6_delivered_rows() -> i32
   fn align_sqlite_q6_finalize_calls() -> i32
+  fn align_sqlite_q6_control_calls() -> i32
   fn align_sqlite_q6_protocol_ok() -> i32
 }
 
@@ -297,6 +299,8 @@ pub fn dump() {
     print(align_sqlite_q6_delivered_rows())
     print("sqlite6.finalize_calls")
     print(align_sqlite_q6_finalize_calls())
+    print("sqlite6.control_calls")
+    print(align_sqlite_q6_control_calls())
     print("sqlite6.protocol_ok")
     print(align_sqlite_q6_protocol_ok())
     print("#db-counters-end")

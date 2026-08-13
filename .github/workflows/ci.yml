@@ -25,8 +25,8 @@ jobs:
   db-postgres:
     name: PostgreSQL integration (required)
     runs-on: ubuntu-24.04
-    # Keep the server version explicit: this job is the non-skippable D4/Q2, D5/Q3, D11/Q5a, and
-    # D12/Q5b2 gate.
+    # Keep the server version explicit: this is the non-skippable cross-rail gate for every
+    # pkg.db owner suite through D14.
     services:
       postgres:
         image: postgres:16.4

@@ -479,6 +479,7 @@ const CASE_SQLITE_TRANSACTION_MASTER: Case = Case {
         ("sqlite6.step_calls", 6),
         ("sqlite6.delivered_rows", 4),
         ("sqlite6.finalize_calls", 2),
+        ("sqlite6.control_calls", 2),
     ],
 };
 
@@ -1520,8 +1521,8 @@ fn main() -> i32 {
 const LAYER1_FINGERPRINT_GOLDEN: &str = "\
 pkg-db-q6-postgres-compound 4d4f6c9aa0e614d6
 pkg-db-q6-postgres-send-failure 3933e83c6ebfe254
-pkg-db-q6-sqlite-pre-send-failure 52c3818f4776e225
-pkg-db-q6-sqlite-transaction-master 18e964c9f82314d3
+pkg-db-q6-sqlite-pre-send-failure c52bf5901df71de3
+pkg-db-q6-sqlite-transaction-master bcd46efc655db2d0
 pkg-db-q6-sqlite-user-groups 7035260367de47cd
 ";
 

@@ -18,6 +18,7 @@ static int q6_prepare_calls;
 static int q6_step_calls;
 static int q6_delivered_rows;
 static int q6_finalize_calls;
+static int q6_control_calls;
 static int q6_protocol_ok;
 static int q6_fail_next_bind;
 static int q6_last_error;
@@ -27,6 +28,7 @@ void align_sqlite_q6_reset(void) {
   q6_step_calls = 0;
   q6_delivered_rows = 0;
   q6_finalize_calls = 0;
+  q6_control_calls = 0;
   q6_protocol_ok = 1;
   q6_fail_next_bind = 0;
   q6_last_error = 0;
@@ -38,6 +40,7 @@ int align_sqlite_q6_prepare_calls(void) { return q6_prepare_calls; }
 int align_sqlite_q6_step_calls(void) { return q6_step_calls; }
 int align_sqlite_q6_delivered_rows(void) { return q6_delivered_rows; }
 int align_sqlite_q6_finalize_calls(void) { return q6_finalize_calls; }
+int align_sqlite_q6_control_calls(void) { return q6_control_calls; }
 int align_sqlite_q6_protocol_ok(void) { return q6_protocol_ok; }
 
 int sqlite3_open_v2(const char *filename, void **database_out, int flags, const char *vfs) {
@@ -82,10 +85,23 @@ int sqlite3_exec(
   (void)callback;
   (void)argument;
   (void)error_out;
-  if (database == NULL || sql == NULL) return 1;
+  if (database == NULL || sql == NULL) {
+    q6_protocol_ok = 0;
+    q6_last_error = 1;
+    return 1;
+  }
   Q6Database *state = (Q6Database *)database;
-  if (strncmp(sql, "BEGIN", 5) == 0) state->autocommit = 0;
-  else if (strcmp(sql, "ROLLBACK") == 0 || strcmp(sql, "COMMIT") == 0) state->autocommit = 1;
+  if (strcmp(sql, "BEGIN DEFERRED") == 0 && state->autocommit == 1) {
+    state->autocommit = 0;
+  } else if ((strcmp(sql, "ROLLBACK") == 0 || strcmp(sql, "COMMIT") == 0)
+      && state->autocommit == 0) {
+    state->autocommit = 1;
+  } else {
+    q6_protocol_ok = 0;
+    q6_last_error = 1;
+    return 1;
+  }
+  q6_control_calls++;
   q6_last_error = 0;
   return 0;
 }
