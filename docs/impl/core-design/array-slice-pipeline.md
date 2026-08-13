@@ -50,11 +50,16 @@ builder.push(value)
 builder.build() -> array<T>
 ```
 
-Required L6 signature, **not implemented yet**:
+Region form (required L6, **shipped**):
 
 ```text
 array_builder<T>(out: region)      // region/plain-struct form
 ```
+
+The region builder accepts recursive `RegionPlain` elements only. An element type whose fields own
+independent heap storage is rejected with a specific diagnostic — `array_builder<S> cannot use
+region storage: field 'f' owns independent heap storage` — not by absence of the form. Design:
+[`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md) §7.
 
 Function arguments to stages: named `fn`, lambda `fn x { … }` / `fn acc, x { … }`, or the
 `.field` projection forms. `reduce`/`scan` are **init-first** — the old trailing-init order was
@@ -104,12 +109,6 @@ For `zip(...).map_into(dst)`, the proof covers **every** source. Runtime source 
 input-vs-output scope; sources are allowed to alias one another and are never declared disjoint.
 
 ## Spec'd but not implemented
-
-- **Region-backed plain-struct builder (required L6):** `array_builder<T>(out)` grows in chunks in
-  the explicit region, accepts recursive `RegionPlain` elements, and performs one documented final
-  compacting pass. A short-lived view must use `clone_in(out)` before insertion. It has no hidden
-  heap allocation and does not change the shipped heap builder's zero-copy freeze. Design:
-  [`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md) §7.
 
 - Slicing/indexing **Move-element** collections ("slicing a collection of the Move type … not
   supported yet"). Fixed arrays of Move structs and owned struct-array fields already have

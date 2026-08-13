@@ -47,11 +47,16 @@ builder.push(value)
 builder.build() -> array<T>
 ```
 
-必須L6 signature（**未実装**）:
+region 形式（必須L6、**実装済み**）:
 
 ```text
 array_builder<T>(out: region)      // region/plain-struct 形式
 ```
+
+region builder が受け入れるのは再帰的な `RegionPlain` 要素のみである。フィールドが独立した heap storage
+を所有する要素型は、形式の欠如ではなく専用の診断で拒否される — `array_builder<S> cannot use region
+storage: field 'f' owns independent heap storage`。設計は
+[`../../17-library-boundary-prerequisites.md`](../../17-library-boundary-prerequisites.md) §7 にある。
 
 ステージへの関数引数は、名前付きの `fn`、ラムダ式 `fn x { … }` / `fn acc, x { … }`、または `.field` 射影の形式をとる。`reduce` や `scan` は **init-first（初期値が先）** である。末尾に初期値を置く古い形式は完全に廃止された（後方互換性を持たせないルールに従い、別名は一切残していない）。
 
@@ -84,13 +89,6 @@ array_builder<T>(out: region)      // region/plain-struct 形式
 `zip(...).map_into(dst)` では、すべての source と `dst` が重複しないことが証明される。ランタイムの source 読み込みは 1 つの input-vs-output スコープを共有し、source 同士のエイリアスは許可されており、互いに disjoint であるとは宣言されない。
 
 ## 仕様先行(未実装)
-
-- **region-backed plain-struct builder（必須 L6）**: `array_builder<T>(out)` は明示された
-  region 内でchunk単位に成長し、再帰的な `RegionPlain` 要素を受け入れ、最後に文書化された
-  1回のcompact passを行う。短命なviewは挿入前に `clone_in(out)` しなければならない。
-  hidden heap allocationはなく、実装済みheap builderのzero-copy freezeも変更しない。
-  設計は [`../../17-library-boundary-prerequisites.md`](../../17-library-boundary-prerequisites.md)
-  §7にある。
 
 - **Move 要素** のコレクションの slicing/indexing（「slicing a collection of the Move type … not supported yet」）。固定長の Move struct 配列と所有 struct-array フィールドには再帰的な要素 drop が実装済みである。残る問題はコレクションの破棄ではなく、読み出しを借用とするか所有権移動とするかという規則である。
 - **非プリミティブな leaf**（str / owned / nested-Move）を持つ dynamic `array<Struct>` における要素フィールドの書き込み — `StoreElemFieldPtr` はプリミティブ leaf 専用である（#316）。

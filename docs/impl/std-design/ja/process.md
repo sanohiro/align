@@ -285,9 +285,10 @@ c := process.command("git", ["git", "status", "--porcelain"])
 c.cwd(repo_dir)
 c.timeout_ns(30_000_000_000)          // 30 s
 out := c.run()?                        // Err(Timeout) if it overruns
-match out.code() {
-  0 => parse_clean(out.stdout()),
-  _ => report(out.stderr()),
+if out.code() == 0 {
+  parse_clean(out.stdout())
+} else {
+  report(out.stderr())
 }
 ```
 

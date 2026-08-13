@@ -71,11 +71,11 @@ fs.write_file("log.txt", "hi")
 
 **Q10.** 組み込みの `Error` には何が入っていますか？
 
-**A10.** OSが返すエラーのカテゴリ — `NotFound`、`Invalid`、`Denied` — と、残りのための `Code(n)` です。ほかの sum type と同じように `match` します(6章で学んだとおり。`Error` はタグの付いたただの sum type です)。
+**A10.** OSが返すエラーのカテゴリ — `NotFound`、`Invalid`、`Denied`、`Timeout` — と、残りのための `Code(n)` で、`n` は `i32` です。全部で5つなので、ほかの sum type と同じように `match` して5つすべてを名指します(6章で学んだとおり。`Error` はタグの付いたただの sum type です)。`main` から抜け出せば、それがそのまま exit status になります: この順に `1`、`2`、`3`、`4`、そして `Code(c)` は `c` で終了します。
 
 ---
 
-**Q11.** では、自分のエラー型 — そして継ぎ目をまたぐ `？` は?
+**Q11.** では、自分のエラー型 — そして継ぎ目をまたぐ `?` は?
 
 **A11.** 型を宣言し（`ParseErr { Empty, BadChar }`）、境界で **明示的に** 変換します:
 

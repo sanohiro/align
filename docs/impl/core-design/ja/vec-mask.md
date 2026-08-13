@@ -14,7 +14,7 @@
 ```text
 v: vecN<T> := [a, b, ...]        // N ∈ {2,4,8,16}; T numeric; literal under annotation
 v + w, v - w, v * w, v / w, v % w    // lane-wise, one instruction each
-v + s / s + v                        // scalar literal broadcasts (either side)
+v + s / s + v                        // scalar broadcasts (either side; literal or typed binding)
 v == w, v > w, v < w, ...        -> maskN<T>
 v[i]                             -> T            // lane read, constant index
 v[i] = x                                          // lane write (mut binding)
@@ -23,7 +23,7 @@ a.min(b) / a.max(b)              -> vecN<T>      // element-wise
 v.sqrt()/abs()/floor()/ceil()/round()/trunc()    // per-lane float math
 dot(a, b)                        -> T
 fma(a, b, c)                     -> vecN<T>      // one rounding
-select(m, a, b)                  -> vecN<T>      // lane blend
+select(m, a, b)                  -> vecN<T>      // lane blend; a and b are BOTH vectors (no broadcast)
 v.sum_where(m)                   -> T            // masked reduction
 
 s.load(i)                        -> vecN<T>      // N consecutive slice elems; bounds-checked
@@ -52,7 +52,7 @@ align(N) Struct { ... }                           // over-align struct; stride p
 ## 仕様先行(未実装)
 
 - **`bitset`**（§18.1 カタログ） — 実装もテストもない。設計は未定であり、packed-bool な soa カラム（M6 以降のバックログ）との関係性を考慮して一緒に決定すべきである。
-- スカラー **変数** のブロードキャスト（broadcast）は、仕様の本文が示唆しているより適用範囲が狭い。リテラルのブロードキャスト（`v * 2`、`10 + v` など）は検証済みだが、スカラーの *変数束縛* をレーン演算へブロードキャストすることは拒否される（「type mismatch: f64 vs vec4<f64>」）。splat 機能が実装されるまでは、明示的な splat ベクタまたはリテラルを用いて記述すること（ガイドの ch12 は検証済みのサブセットの範囲内で書かれている）。
+- **`select`** のオペランドへのスカラーのブロードキャスト（broadcast）。算術のブロードキャストは完成している — リテラル（`v * 2`、`10 + v`）も、型の付いたスカラー束縛（`s: f64 := 2.0; v * s` / `s * v`）も正しく lowering される。`select` はこれに参加しない。blend する2つのオペランドはどちらも `vecN<T>` でなければならず（`select(m, w, 0)` は「'select' vectors must have the same type, got vec4<i32> and int(undetermined)」となる）、splat 機能が実装されるまで定数側は明示的なベクタとして記述すること。
 - 関数境界を越える aligned-load の伝播（関数をまたいでもアライメントが証明可能なスライスの引き渡し） — 保留中。現在はローカルで証明可能なアライメントのみが load 操作を最適化（格上げ）する（#320）。
 
 ## Pitfalls
@@ -64,4 +64,4 @@ align(N) Struct { ... }                           // over-align struct; stride p
 
 ## Test anchors
 
-`examples/vec_simd.align`、`vec_mask.align`、`vec_mask_annot.align`、`vec_broadcast.align`、`vec_sum_where.align`、`vec_minmax.align`、`vec_math.align`、`vec_fma.align`、`vec_dot.align`、`vec_load_store.align`、`vec_lane_set.align`、`aligned_load.align`、`align_attr.align`。#318 周辺の vec lane-`%` / div-guard テスト。differential fuzzer の lane-arith 拡張（#326）。M6 完了時のピン: 本物の `<N x T>` IR + すべての reducer に対する分岐のない（branchless な）`where` の実現（#303, #327）。�みだが、スカラーの *束縛* を lane 演算へ broadcast するのは拒否されるのを確認している
+`examples/vec_simd.align`、`vec_mask.align`、`vec_mask_annot.align`、`vec_broadcast.align`、`vec_sum_where.align`、`vec_minmax.align`、`vec_math.align`、`vec_fma.align`、`vec_dot.align`、`vec_load_store.align`、`vec_lane_set.align`、`aligned_load.align`、`align_attr.align`。#318 周辺の vec lane-`%` / div-guard テスト。differential fuzzer の lane-arith 拡張（#326）。M6 完了時のピン: 本物の `<N x T>` IR + すべての reducer に対する分岐のない（branchless な）`where` の実現（#303, #327）。

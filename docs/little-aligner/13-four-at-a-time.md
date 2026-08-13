@@ -85,11 +85,13 @@ Where the mask is true, it picks the lane from `v2`; where false, from `ones` �
 **A12.** Through a slice:
 
 ```align
-v: vec4<i32> := xs.load(i)
-dst.store(i, v * 2)
+fn double4(xs: slice<i32>, out dst: slice<i32>, i: i64) {
+    v: vec4<i32> := xs.load(i)
+    dst.store(i, v * 2)
+}
 ```
 
-`load` reads four consecutive elements; `store` writes four. Both are bounds-checked. The register is a value, but memory remains explicit at the boundary.
+`load` reads four consecutive elements; `store` writes four. Both are bounds-checked. The register is a value, but memory remains explicit at the boundary — and `store` must have somewhere to write, so the destination arrives as the caller's `out dst` (chapter 5), exactly as `map_into`'s did.
 
 ---
 
@@ -126,9 +128,16 @@ w := v * 3 + 1
 
 ---
 
-**Q17.** `m := w > 8`. Which lanes are true, and what is `select(m, w, 0)`?
+**Q17.** `m := w > 8`. Which lanes are true, and how do we zero the rest?
 
-**A17.** The last two lanes are true. The selected vector is `[0, 0, 10, 13]`; scalar `0` broadcasts for the false side.
+**A17.** The last two lanes are true, and the false side needs a real vector:
+
+```align
+zero: vec4<i32> := [0, 0, 0, 0]
+select(m, w, zero)
+```
+
+`[0, 0, 10, 13]`. Note the asymmetry against Q16: *arithmetic* broadcasts a scalar (`w * 3 + 1`), but `select` blends **two vectors** — `select(m, w, 0)` is a type error. A blend chooses between two things of the same shape; say the shape.
 
 ---
 

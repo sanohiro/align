@@ -85,11 +85,13 @@ ans := v1 / safe_v2
 **A12.** slice を使います。
 
 ```align
-v: vec4<i32> := xs.load(i)
-dst.store(i, v * 2)
+fn double4(xs: slice<i32>, out dst: slice<i32>, i: i64) {
+    v: vec4<i32> := xs.load(i)
+    dst.store(i, v * 2)
+}
 ```
 
-`load` が連続4要素を読み、`store` が4要素を書きます。どちらも bounds-checked。register は値ですが、memory との境界は明示的です。
+`load` が連続4要素を読み、`store` が4要素を書きます。どちらも bounds-checked。register は値ですが、memory との境界は明示的です — そして `store` には書き込む先が要るので、宛先は呼び出し側の `out dst` として渡されます(5章)。`map_into` のときとまったく同じです。
 
 ---
 
@@ -126,9 +128,16 @@ w := v * 3 + 1
 
 ---
 
-**Q17.** `m := w > 8`。true なのはどの lane で、`select(m, w, 0)` は？
+**Q17.** `m := w > 8`。true なのはどの lane で、残りを 0 にするには？
 
-**A17.** 後ろ2 lane が true。結果は `[0, 0, 10, 13]` です。false 側では scalar `0` が broadcast されます。
+**A17.** 後ろ2 lane が true。そして false 側には本物の vector が要ります:
+
+```align
+zero: vec4<i32> := [0, 0, 0, 0]
+select(m, w, zero)
+```
+
+`[0, 0, 10, 13]`。Q16 との非対称に注意してください: *算術* は scalar を broadcast します(`w * 3 + 1`)が、`select` は **2つの vector** を blend します — `select(m, w, 0)` は型エラーです。blend は同じ形の2つから選ぶもの。その形を言ってやりましょう。
 
 ---
 

@@ -103,10 +103,16 @@ print(active.max())
 **Q11.** *あなた* が所有するメモリに書き込む chain — `map_into` とは何ですか？
 
 ```align
-src.map(dbl).map_into(dst)
+fn dbl(x: i64) -> i64 = x * 2
+
+fn double_into(src: slice<i64>, out dst: slice<i64>) {
+    src.map(dbl).map_into(dst)
+}
 ```
 
 **A11.** メモリ確保を行わない終端処理です。結果は slice `dst` に入ります。`dst` は同じ長さでなければならず、`src` と重ならないことをコンパイラが証明します。バッファを再利用するホットパス向けです。
+
+`out` は storage の出どころを言うためのものです。`dst` は *呼び出し側* の slice で、この関数はそこへ書き込みます。自分で確保していない宛先を名指す方法はこれだけなので、`map_into` は常に `out` parameter を持つ関数の中に住みます。
 
 ---
 
@@ -185,10 +191,12 @@ n := warm.count()
 **A19.**
 
 ```align
-src.map(fn x { x * 2 }).map_into(dst)
+fn scale_into(src: slice<i64>, out dst: slice<i64>) {
+    src.map(fn x { x * 2 }).map_into(dst)
+}
 ```
 
-`to_array` は新しい storage を求め、`map_into` は既存の storage を名指します。同じ変換で、ownership の物語が違います。
+`to_array` は新しい storage を求め、`map_into` は既存の storage — `out dst` として届く呼び出し側のもの(A11) — を名指します。同じ変換で、ownership の物語が違います。
 
 ---
 

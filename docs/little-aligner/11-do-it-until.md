@@ -71,7 +71,7 @@ The answer-so-far lives in a `mut` local declared *before* the loop; `break tota
 
 **Q8.** You are counting `i` from `0` to `len` inside a `loop`, doing the same thing to `xs[i]` each round. What have you done?
 
-**A8.** Written a `for` loop in a funny hat. Take it off — that one was `xs.map(...)` all along. The pipeline owns the *data*; `loop` owns the *control*. The compiler will say so too (it is a lint).
+**A8.** Written a `for` loop in a funny hat. Take it off — that one was `xs.map(...)` all along. The pipeline owns the *data*; `loop` owns the *control*. The specification calls for a lint that says so too — `alignc` does not raise it yet, so for now the habit is yours to keep.
 
 ---
 

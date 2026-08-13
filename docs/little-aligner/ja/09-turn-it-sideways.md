@@ -158,11 +158,11 @@ orders
     .sum()
 ```
 
-`soa<Order>` なら、名指した3 column だけを読みます。
+形をよく見てください。`map(fn o { … })` には **row** がまるごと渡されます。つまりこの pipeline が求めているのは AoS で、`orders` は `array<Order>` です。sideways にするとコンパイラが止めて、理由も告げます — `soa<Order>` に対する whole-struct な `map` は、SoA がせっかく分解した row を組み直すために全 column を gather することになるからです。sideways では column で語ります — `s.price` と `s.quantity` を束縛し、`zip`(13章)で対にして reduce します。soa で whole-row のまま許されるのは `where(.field)` だけで、1 column での絞り込みはやはり columnar な仕事だからです(A8)。
 
 ---
 
-**Q21.** なぜ `orders.price.sum() * orders.quantity.sum()` ではない？
+**Q21.** ここからは sideways、`s` という `soa<Order>` の上で考えます。なぜ `s.price.sum() * s.quantity.sum()` ではない？
 
 **A21.** multiply は sum より前に、row ごとに行うからです。最初の price は最初の quantity と対応します。columnar layout は storage を変えますが、関係は変えません。
 
@@ -173,7 +173,7 @@ orders
 **A22.** reduce の前に column を slice します。
 
 ```align
-orders.price[100..200].sum()
+s.price[100..200].sum()
 ```
 
 半開区間には100個の price が入ります。
@@ -182,7 +182,7 @@ orders.price[100..200].sum()
 
 **Q23.** index を見つけたあと、customer 一人の record 全体が必要です。row gather は SoA の失敗？
 
-**A23.** いいえ。`orders[i]` で gather します。layout は支配的な仕事のために選ぶもので、宗教ではありません。時々の row gather は、繰り返す column scan を安くするために払う価格です。
+**A23.** いいえ。`s[i]` で gather します。layout は支配的な仕事のために選ぶもので、宗教ではありません。時々の row gather は、繰り返す column scan を安くするために払う価格です。
 
 ---
 

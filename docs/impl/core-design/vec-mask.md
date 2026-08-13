@@ -19,7 +19,7 @@ the **pipeline is the width-agnostic main path** (auto-vectorized, scalable-ISA-
 ```text
 v: vecN<T> := [a, b, ...]        // N ∈ {2,4,8,16}; T numeric; literal under annotation
 v + w, v - w, v * w, v / w, v % w    // lane-wise, one instruction each
-v + s / s + v                        // scalar literal broadcasts (either side)
+v + s / s + v                        // scalar broadcasts (either side; literal or typed binding)
 v == w, v > w, v < w, ...        -> maskN<T>
 v[i]                             -> T            // lane read, constant index
 v[i] = x                                          // lane write (mut binding)
@@ -28,7 +28,7 @@ a.min(b) / a.max(b)              -> vecN<T>      // element-wise
 v.sqrt()/abs()/floor()/ceil()/round()/trunc()    // per-lane float math
 dot(a, b)                        -> T
 fma(a, b, c)                     -> vecN<T>      // one rounding
-select(m, a, b)                  -> vecN<T>      // lane blend
+select(m, a, b)                  -> vecN<T>      // lane blend; a and b are BOTH vectors (no broadcast)
 v.sum_where(m)                   -> T            // masked reduction
 
 s.load(i)                        -> vecN<T>      // N consecutive slice elems; bounds-checked
@@ -66,10 +66,11 @@ None — Copy values. `load` borrows the slice momentarily; `store` requires a w
 
 - **`bitset`** (§18.1 catalog) — no implementation, no tests. Design open: relationship to
   packed-bool soa columns (post-M6 backlog) should be settled together.
-- Scalar-**variable** broadcast is narrower than spec prose suggests: literal broadcast (`v * 2`,
-  `10 + v`) is verified; broadcasting a scalar *binding* into a lane op was observed rejected
-  ("type mismatch: f64 vs vec4<f64>") — spell it as an explicit splat vector or a literal until
-  a splat form ships. (Guide ch12 was written within the verified subset.)
+- Scalar broadcast into a **`select`** operand. Arithmetic broadcast is complete — a literal
+  (`v * 2`, `10 + v`) and a typed scalar binding (`s: f64 := 2.0; v * s` / `s * v`) both lower
+  correctly. `select` does not participate: both blended operands must be `vecN<T>`
+  (`select(m, w, 0)` → "'select' vectors must have the same type, got vec4<i32> and
+  int(undetermined)"), so spell the constant side as an explicit vector until a splat form ships.
 - Aligned-load propagation across function boundaries (cross-function provably-aligned slices) —
   deferred; only locally provable alignment upgrades the load today (#320).
 

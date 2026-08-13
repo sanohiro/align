@@ -22,7 +22,7 @@ r.map_err(f)        -> Result<T,F> // Result-only; f: fn(E) -> F; Ok passes thro
 match v { Some(x) => …, None => … }        // exhaustive, payload binds positionally
 match r { Ok(v) => …, Err(e) => … }
 
-Error { NotFound, Invalid, Denied, Code(i64) }   // builtin; explicit nameはcore.Error
+Error { NotFound, Invalid, Denied, Timeout, Code(i32) }   // builtin; explicit nameはcore.Error
 error(c)                            // sugar: 常にcore.Error.Code(c)を構築する
 ```
 
@@ -47,7 +47,7 @@ Pure な機構である。`?` は制御フローであってエフェクトで�
 
 - **未処理の `Result` はハードなコンパイルエラー** となる（lint スイートの correctness スライス、#138）。処理されずに捨てられた `Result` の文は、`?` で伝播するか、`match` するか、変数に束縛しなければならない。
 - `?` は **暗黙のエラー型変換を一切行わない** — `Result<T, MyErr>` は `Result<T, Error>` を要求する文脈を素通りできない。`.map_err(to_error)` を使って明示的に変換すること。
-- `main() -> Result<(), Error>`: 外へエスケープした `Err` はプロセスの終了コード（exit code）へマッピングされる。カテゴリカルな variant は `tag + 1`（`NotFound`→1、`Invalid`→2、`Denied`→3）、`Code(c)` は `c` を exit code とする（#308 の対応により、`main` のエラー型を組み込みの `Error` に限定した。`main` にユーザー定義の `E` を指定することは拒否される）。
+- `main() -> Result<(), Error>`: 外へエスケープした `Err` はプロセスの終了コード（exit code）へマッピングされる。カテゴリカルな variant は `tag + 1`（`NotFound`→1、`Invalid`→2、`Denied`→3、`Timeout`→4）、`Code(c)` は `c` を exit code とする（#308 の対応により、`main` のエラー型を組み込みの `Error` に限定した。`main` にユーザー定義の `E` を指定することは拒否される）。
 
 ## Regions
 
