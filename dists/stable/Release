@@ -1,0 +1,13 @@
+Origin: Align
+Label: Align
+Suite: stable
+Codename: stable
+Date: Thu, 13 Aug 2026 17:22:04 +0000
+Architectures: amd64 arm64
+Components: main
+Description: Align compiler apt repository
+SHA256:
+ c412bb40675531da6ce8f8bea56f2be884b08236a7e313837a14b2c5bd11af10 552 main/binary-amd64/Packages
+ eea1d3a95f9d2acfa02574cc6e40a13de75d2141b75533bd4ad308f706e43641 404 main/binary-amd64/Packages.gz
+ 6a3424c43cde324ab9c8a1ecaca807d3524e03e6ccf5bcb7ffa45e15aee48d21 551 main/binary-arm64/Packages
+ b606af3dceadb23753c336c03fb93483127bb015f7ce616f459e984d2f50fe1b 403 main/binary-arm64/Packages.gz
