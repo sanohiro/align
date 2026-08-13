@@ -1012,6 +1012,13 @@ shipped through `#742`, `#744`, `#749`, `#737`, and `#774`; the owned-`string`
 clone row below is the eighth. Every one was "the validator re-derived a producer
 fact", never malformed HIR.
 
+One reachability argument is banned outright when judging these gates: "a Move
+element collection cannot be constructed." A `slice<Move>` **type** is declarable
+and passable even though no expression builds such a **value**, and the body
+validator validates every function body. See "Axis A (continued) — the reachable
+`slice<Move>` parameter domain" for the six gates that argument had wrongly
+cleared.
+
 ### Split model
 
 A nominal id is not a stable name for a source type. `check_program` caches
@@ -1038,10 +1045,10 @@ Eight occurrences; one diverged.
 | Gate | Producer authority | Verdict |
 |---|---|---|
 | `ArrayScan` output element | `check_array_scan` | **Divergent.** Sema admits any non-struct `ty_to_scalar` accumulator; `scalar_to_prim` rejected `()` and every sum-type accumulator. Fixed by delegating to `align_sema::scan_accumulator_scalar`, now called by both. |
-| `rng_elem_ok` (`shuffle`/`sample`) | `check_rand_method` | Identical rule (`scalar_to_prim(es).is_none()`). No change. |
+| `rng_elem_ok` (`shuffle`/`sample`) | `check_rand_method` | **Divergent.** The `scalar_to_prim` half is identical, but `rng_elem_ok` *also* asks `scalar_copy_ok` and sema did not. See the Move-value gate below. |
 | `ArraySortBy` element | `check_array_sort_by_key` | Identical rule. No change. |
 | `ArrayPartition` element | `check_array_partition` | Identical rule. No change. |
-| `ArrayChunks` element | `check_array_chunks` | Identical rule. No change. |
+| `ArrayChunks` element | `check_array_chunks` | Identical `scalar_to_prim` rule, but the validator *also* asks `scalar_copy_ok`. See the Move-value gate below. |
 | `array_builder_elem_ok` | `check_array_builder_new` | Wider, never narrower: sema admits `Int/Float/Bool/Char/String`; the validator additionally admits `Str`. A wider gate cannot reject a checked program, so it is outside this class. No change. |
 | `ResourceViewFromRaw` view scalar (2 sites) | none | Structural: `Scalar::Slice` is *constructed from* a `PrimScalar`, so this is a representation conversion, not an admission rule. No change. |
 
@@ -1064,16 +1071,95 @@ complete contract:
 | Early exit | Receiver evaluation that terminates does not emit a clone; the pre-registered synthetic owner participates in existing exit cleanup. | shared `lower_borrowed_owned` early-exit owners |
 | Whole/per-unit and backend | The unchanged `StrClone` MIR/codegen shape accepts either layout-identical text receiver after checked-HIR validation. | `align_driver::m5::owned_string_clone_duplicates_locals_and_fields`; real align-llm per-unit check |
 
-**Deferred, same arm — `ord-key` Move keys.** Delegating orderability does not by
-itself make a `string`-keyed `sort_by_key` lower. `pipeline_callable_ok` requires
-a pipeline callable's output to be Copy (`ty_copy_ok`), and sema imposes no Copy
-requirement on a sort key, so an owned key is still refused one gate later. That
-is a *second*, distinct divergence, and closing it needs per-key Drop in the
-fused sort path — the same shape as #739's deferred fixed-array Move elements,
-not a validator edit. Until then the reachable witness for the `ord-key` row is a
-`str` key, and the owner table records that explicitly. Do not "fix" the Copy gate
-without the MIR support: accepting a Move key the sort path cannot drop trades a
-rejected program for a leak.
+### Axis A (continued) — the reachable `slice<Move>` parameter domain
+
+**The axis.** A Move element *collection* cannot be built by any expression: an
+owned `array<string>` cannot be indexed, sliced, or borrowed as a view, and
+`string` cannot be a fixed-array element. But a `slice<Move>` **type** is fully
+declarable and passable — `fn take(xs: slice<string>) -> i64 = xs.len()` checks,
+and so does forwarding it to another such parameter. `align_driver::struct_index::
+a_move_element_slice_type_is_still_declarable_and_passable` pins that on purpose:
+over-rejecting the type would remove the whole `slice<E>` surface.
+
+The body validator validates **every** function body, not the reachable ones, so
+a never-called function taking a `slice<string>` is enough to reach any gate that
+function's body touches. This asymmetry — the type is formable, a value is not —
+invalidates the argument "a Move element collection cannot be constructed, so
+this gate is unreachable" in every place it might be used. That argument had been
+applied to `rng_elem_ok` and `map_into`; both were live internal errors.
+
+**The rule.** The validator refuses a Move value in a *copy position* — one it
+buffers, collects, views, rearranges, draws, or writes — through one of two
+spellings:
+
+- `ty_copy_ok(ty)`: `body_ty_ok(ty)` **and** not `ty_capture_is_move(ty)`;
+- `scalar_copy_ok(scalar)`: not `scalar_is_move(scalar)`.
+
+These are different functions. They agree on a plain scalar, because
+`ty_capture_is_move` on a scalar `Ty` reduces to `ty_is_move`, which reduces to
+`scalar_is_move`; they differ on tuples and fixed arrays, which cannot occupy any
+of these positions. Sema's `reject_move_copy_position` implements the **Move
+half** that both share — the `body_ty_ok` half of `ty_copy_ok` is a separate
+well-formedness question the producer already answers elsewhere.
+
+Sema already owned the **input** half of the ownership rule
+(`reject_move_pipeline_call_arg`, plus `map`'s "cannot produce a Move element"),
+which is why `map` / `where` / `any` / `all` / `partition` / `par_map` /
+`reduce` / `scan` and the `sort_by_key` *element* all diagnosed correctly. The
+copy positions had no producer gate at all:
+
+| Cell | Validator spelling | Symptom before the gate |
+|---|---|---|
+| `sort_by_key` key | `pipeline_callable_ok`'s `ty_copy_ok(output)` | `Ord` admits owned `string`; a `string` key passed `check` and hit `body_only_metadata_is_valid`. |
+| `to_array` element | `ty_copy_ok(final_elem)` | The Move-*struct* arm had a message; the scalar arm admitted any `ty_to_scalar`. |
+| `chunks` element | `scalar_copy_ok(source_scalar)` | `scalar_to_prim` admits `String`; the chunk views would alias elements the source still owns. |
+| `shuffle` element | `rng_elem_ok`'s `scalar_copy_ok` | Fisher-Yates swaps raw `{ptr,len}` headers through the slice. |
+| `sample` element | `rng_elem_ok`'s `scalar_copy_ok` | Worse: the drawn values are copied into a fresh owned `array<T>`, so each `string` is freed twice. |
+| `map_into` element | `ArrayMapInto`'s `scalar_copy_ok` | Writing into `dst` overwrites owned headers without dropping them and copies the source's. |
+
+All six now call one shared helper, `Checker::reject_move_copy_position`, which
+asks `align_sema::ty_capture_is_move` — the same predicate `ty_copy_ok` asks — so
+producer and validator cannot drift again. Only `sort_by_key` names a workaround,
+because the key function's return type is the user's to choose; the element rows
+deliberately say the capability is deferred rather than invent one.
+
+**Re-check of every other copy gate under this axis.** Each row was retested with
+a `slice<string>` parameter, not merely reasoned about:
+
+| Gate | Verdict | Evidence |
+|---|---|---|
+| `array_literal_element_ok` | Unreachable | The gate itself excludes Move (`!scalar.is_move()`), and sema rejects a Move fixed-array element (`string cannot be an element of a fixed array yet`). |
+| `array_builder_elem_ok` | Wider, never narrower | Explicitly admits `Scalar::String`. A wider validator gate cannot reject a checked program. |
+| `ArrayBuilderAppend` | Unreachable | The validator refuses `Scalar::String` outright, and sema refuses the method: `'.append()' is not available` for a `string` builder. |
+| `ArrayZip` element / tuple source | Symmetric | Sema stops first with `'zip' v1 supports only Copy …`, for `count`, `map_into`, and `to_array` terminals alike. |
+| `BoxNew` / `BoxGet` / `BoxClone` | Unreachable | Sema: `a box payload must be a primitive` — `heap.new("a".clone())` never forms a `box<string>`. |
+| Struct-array element field path (`ty_copy_ok(leaf)`) | Symmetric | Sema rejects both spellings: `reading a Move-type field` and `'arr[i].xs' needs a …`. An owned `string` field is demoted to `str` on both sides. |
+| `array_to_array_result` struct arm | Symmetric | `to_array`'s own Move-struct arm rejects it first. |
+| Lifted / fn-value capture (`ty_copy_ok(flow.ty)`) | Symmetric | Sema asks the identical `ty_capture_is_move` when lifting a lambda; a `slice<string>` capture is Copy on both sides and still builds. |
+| `sort` / `sum` / `min` / `max` element | Symmetric | Rejected earlier as non-numeric. |
+| Index / slice-range of a Move collection | Symmetric | `indexing an array of the Move type string` / `slicing a collection of the Move type string`. |
+
+**Still deferred: actually admitting these.** Lowering a Move key or element
+needs per-element Drop in the owning path — the same shape as #739's deferred
+fixed-array Move elements, not a validator edit. That remains a separate
+capability. Do not "fix" a Copy gate without the MIR support: accepting a Move
+value the path cannot drop trades a rejected program for a leak or a double free.
+Until then the reachable witness for the `ord-key` row stays a `str` key.
+
+Owners:
+`align_mir::validate_hir_tests::move_copy_positions_are_refused_by_the_producer_not_the_boundary`
+is the load-bearing one — it runs the frontend **and then the MIR boundary** and
+asserts the rejection is the producer's diagnostic and never
+`report this program shape`, so deleting any one gate reproduces that cell's
+internal error. (A `check`-only assertion that the diagnostics do not mention
+`failed HIR validation` is vacuously true, because `check` never runs the
+boundary; do not add one.) The surface-local wording owners are
+`align_sema::move_copy_positions_are_rejected`,
+`align_driver::sort_by_key::sort_by_key_move_key_rejected`,
+`align_driver::array_materialize::to_array_of_a_move_scalar_element_is_diagnosed`,
+`align_driver::chunks::chunks_over_a_move_element_array_is_diagnosed`,
+`align_driver::m10_rand::move_element_slices_are_rejected_by_shuffle_and_sample`,
+and `align_driver::map_into::map_into_move_element_rejected`.
 
 ### Axis B — nominal-identity comparisons
 

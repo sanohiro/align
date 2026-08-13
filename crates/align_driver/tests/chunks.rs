@@ -103,3 +103,32 @@ fn chunks_over_struct_array_errors() {
     let src = "Emp { pay: i32 }\nfn main() -> i32 {\n  cs := [Emp{pay: 1}].chunks(1)\n  return 0\n}\n";
     assert!(check_errs("ch-struct", src));
 }
+
+/// `scalar_to_prim` admits owned `string` (the one Move `PrimScalar`), so `chunks` accepted an
+/// `array<string>` while the MIR boundary's `scalar_copy_ok` refused it — the chunk views would
+/// alias elements the source still owns and deep-drops. That gap was an internal error after a
+/// clean `check`, not a diagnostic.
+///
+/// Both reachable sources are covered: a built `array<string>`, and a `slice<string>` parameter —
+/// a type that is declarable and passable even though no expression can build such a value.
+/// `align_mir`'s `move_copy_positions_are_refused_by_the_producer_not_the_boundary` owns the
+/// build-stops-here property.
+#[test]
+fn chunks_over_a_move_element_array_is_diagnosed() {
+    for (label, src) in [
+        (
+            "built-array",
+            "fn main() -> Result<(), Error> {\n  mut b: array_builder<string> := array_builder()\n  b.push(\"a\".clone())\n  built := b.build()\n  print(built.chunks(2).len())\n  return Ok(())\n}\n",
+        ),
+        (
+            "slice-param",
+            "fn f(xs: slice<string>) -> i64 = xs.chunks(2).len()\nfn main() -> i32 = 0\n",
+        ),
+    ] {
+        let diagnostics = check_diagnostics(&format!("ch-move-elem-{label}"), src);
+        assert!(
+            diagnostics.contains("'chunks' cannot view a Move element"),
+            "a Move-element source must be diagnosed ({label}):\n{diagnostics}",
+        );
+    }
+}

@@ -188,6 +188,124 @@ fn checked_source_program(source: &str) -> hir::Program {
     program
 }
 
+/// What the driver actually does with `source`: run the frontend, and only if it checks cleanly,
+/// take it to the MIR boundary.
+///
+/// `Ok(n)` is a program that lowered to `n` functions. `Err` is the *user-visible* rejection, which
+/// is a diagnostic when sema stopped it and the `LoweringRejected` internal-error text when the
+/// boundary did. Asserting on that single value is what makes a "sema diagnoses it" owner real: a
+/// `check`-only assertion that the rendered diagnostics do not mention `failed HIR validation` is
+/// vacuously true, because `check` never runs the boundary at all.
+fn frontend_then_boundary(source: &str) -> Result<usize, String> {
+    let mut diagnostics = Diagnostics::new();
+    let tokens = tokenize(0, source, &mut diagnostics);
+    let file = parse_file(tokens, &mut diagnostics);
+    let program = align_sema::check_file(&file, &mut diagnostics);
+    if diagnostics.has_errors() {
+        return Err(diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
+    match crate::lower_program_checked(&program, false, None) {
+        Ok(mir) => Ok(mir.fns.len()),
+        Err(rejected) => Err(rejected.to_string()),
+    }
+}
+
+/// Every position the checked-HIR body validator requires to be Copy must be refused by the
+/// producer first, so the user gets a diagnostic instead of an internal error.
+///
+/// The axis these rows share is the **reachable `slice<Move>` parameter domain**: `slice<string>`
+/// is a declarable and passable parameter type (`align_driver::struct_index::
+/// a_move_element_slice_type_is_still_declarable_and_passable`) even though no expression can
+/// build such a value. "A Move element collection cannot be constructed, so the gate is
+/// unreachable" is therefore never a valid argument, and three of these six rows were live ICEs
+/// that reasoning had dismissed.
+///
+/// Each row asserts the *whole* build decision, not just `check`: the error must be the producer's
+/// diagnostic and must never be the boundary's `report this program shape`. Deleting any one
+/// `reject_move_copy_position` call turns its row's `Err` into the internal-error text, which both
+/// assertions catch.
+#[test]
+fn move_copy_positions_are_refused_by_the_producer_not_the_boundary() {
+    // A `slice<string>` parameter: unbuildable as a value, perfectly legal as a type.
+    let slice_param = "fn take(xs: slice<string>) -> i64 = xs.len()\n";
+    for (name, source, expected) in [
+        // `sort_by_key` key — `Bound::Ord` admits owned `string`; the fused sort buffers one key
+        // per element with no per-key drop.
+        (
+            "sort-by-key-move-key",
+            "fn key(x: i64) -> string = \"k\".clone()\nfn main() -> i32 {\n  s := [3, 1, 2].sort_by_key(key)\n  return s[0] as i32\n}\n",
+            "'sort_by_key' cannot buffer a Move key",
+        ),
+        // `to_array` collected element — the Move-*struct* arm had a message, the scalar arm did not.
+        (
+            "to-array-move-element",
+            "fn f(xs: slice<string>) -> i64 = xs.to_array().len()\nfn main() -> i32 = 0\n",
+            "'to_array' cannot collect a Move element",
+        ),
+        // `chunks` source element — `scalar_to_prim` admits `String`; the chunk views would alias
+        // elements the source still owns.
+        (
+            "chunks-move-element",
+            "fn f(xs: slice<string>) -> i64 = xs.chunks(2).len()\nfn main() -> i32 = 0\n",
+            "'chunks' cannot view a Move element",
+        ),
+        // `shuffle` — Fisher-Yates swaps raw `{ptr,len}` headers through the slice.
+        (
+            "shuffle-move-element",
+            "import std.rand\nfn scramble(out xs: slice<string>) {\n  mut r := rand.seed_with(1)\n  r.shuffle(xs)\n}\nfn main() -> i32 = 0\n",
+            "'shuffle' cannot rearrange a Move element",
+        ),
+        // `sample` — strictly worse than `shuffle`: it copies the drawn values into a fresh owned
+        // `array<T>`, so each drawn `string` would be freed twice.
+        (
+            "sample-move-element",
+            "import std.rand\nfn pick(xs: slice<string>) -> i64 {\n  mut r := rand.seed_with(1)\n  s := r.sample(xs, 1)\n  return s.len()\n}\nfn main() -> i32 = 0\n",
+            "'sample' cannot draw a Move element",
+        ),
+        // `map_into` — writing into `dst` overwrites owned headers without dropping them.
+        (
+            "map-into-move-element",
+            "fn fill(src: slice<string>, out dst: slice<string>) {\n  src.map_into(dst)\n}\nfn main() -> i32 = 0\n",
+            "'map_into' cannot write a Move element",
+        ),
+    ] {
+        let outcome = frontend_then_boundary(source);
+        let Err(message) = &outcome else {
+            panic!("{name}: a Move value in a Copy position must be refused, got {outcome:?}");
+        };
+        assert!(
+            message.contains(expected),
+            "{name}: expected the producer diagnostic {expected:?}, got:\n{message}",
+        );
+        assert!(
+            !message.contains("report this program shape"),
+            "{name}: the producer must refuse it, not the MIR boundary:\n{message}",
+        );
+    }
+
+    // The positive witnesses for the same rows: a Copy element and a borrowed `str` key still
+    // reach MIR. Over-rejecting here would take the whole surface away.
+    for (name, source, expected_fns) in [
+        ("str-key-still-lowers", "fn key(x: i64) -> str = \"k\"\nfn main() -> i32 {\n  s := [3, 1, 2].sort_by_key(key)\n  return s[0] as i32\n}\n", 2),
+        ("copy-element-to-array", "fn f(xs: slice<i64>) -> i64 = xs.to_array().len()\nfn main() -> i32 = 0\n", 2),
+        ("copy-element-chunks", "fn f(xs: slice<i64>) -> i64 = xs.chunks(2).len()\nfn main() -> i32 = 0\n", 2),
+        ("copy-element-shuffle", "import std.rand\nfn scramble(out xs: slice<i64>) {\n  mut r := rand.seed_with(1)\n  r.shuffle(xs)\n}\nfn main() -> i32 = 0\n", 2),
+        ("copy-element-sample", "import std.rand\nfn pick(xs: slice<i64>) -> i64 {\n  mut r := rand.seed_with(1)\n  s := r.sample(xs, 1)\n  return s.len()\n}\nfn main() -> i32 = 0\n", 2),
+        ("copy-element-map-into", "fn fill(src: slice<i64>, out dst: slice<i64>) {\n  src.map_into(dst)\n}\nfn main() -> i32 = 0\n", 2),
+        // The declarable-but-unbuildable parameter type itself must keep checking and lowering.
+        ("move-slice-param-still-lowers", slice_param, 1),
+    ] {
+        match frontend_then_boundary(source) {
+            Ok(fns) => assert_eq!(fns, expected_fns, "{name}: lowered functions"),
+            Err(message) => panic!("{name}: must still lower:\n{message}"),
+        }
+    }
+}
+
 /// Producer-delegation matrix owner: every source shape sema accepts must survive the body
 /// validator and lower to a non-empty program.
 ///
@@ -228,9 +346,11 @@ fn checked_source_shapes_survive_every_delegated_gate() {
             4,
         ),
         // `ord-key`: the orderability rule is now the producer's `Bound::Ord`. A `str` key is the
-        // reachable witness; the owned-`string` key sema also admits is still refused one gate
-        // later by the Copy requirement on a pipeline callable's output, which is a distinct
-        // deferred cell (see the ledger's `ord-key` row).
+        // reachable witness; an owned-`string` key cannot reach this matrix at all any more —
+        // `check_array_sort_by_key` rejects it up front with the shared Move-copy-position gate,
+        // because lowering it needs per-key Drop in the fused sort (still a deferred capability;
+        // see the ledger's "reachable `slice<Move>` parameter domain" section, and
+        // `move_copy_positions_are_refused_by_the_producer_not_the_boundary` above).
         (
             "sort-by-key-str-key",
             "Row { name: str, n: i64 }\nfn key(row: Row) -> str = row.name\nfn main() -> i32 = 0\n",
