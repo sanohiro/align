@@ -2853,10 +2853,13 @@ Recommendations recorded here for confirmation; on approval each moves to Settle
   discipline (interpret `X-Forwarded-*` only from a configured trusted proxy; default distrust),
   without which the proxy assumption is a client-IP spoofing hole. Revisit at HTTP/2 (ALPN) or real
   standalone-deploy demand — a revisit, not a permanent no.
-- **Long-lived mutable state** (e.g. a server-lifetime Pool) — currently expressible only in
+- **Long-lived mutable state** — the D13 `pkg.db.pool.Pool` is an explicit non-Send resource whose
+  borrowed operations mutate only package-owned native bookkeeping; it does not make application
+  state shareable across tasks. General server-lifetime mutable state is still expressible only in
   `main`'s outermost scope threaded by `borrow mut`. Whether that is ergonomic enough for
-  server-shaped programs, or wants a dedicated form, is open. Guide chapters 20 and 22 sketch this
-  and now carry a note to that effect; their full rewrite follows this resolution.
+  server-shaped programs, or wants a dedicated Send/thread-safe form, is open. Guide chapters 20
+  and 22 sketch this and now carry a note to that effect; their full rewrite follows this
+  resolution.
 
 ### Unit-returning `fn main()` yields a nondeterministic exit code — FIXED as #450, 2026-07-14
 

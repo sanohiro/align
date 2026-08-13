@@ -222,11 +222,11 @@ Version 1 does not include:
 - stored-procedure abstraction;
 - distributed transactions;
 - transparent retries;
-- transparent pooling;
+- transparent pooling (D13 instead provides the explicit `pkg.db.pool` contract in §23);
 - automatic selection of a “best” relational fetch strategy.
 
-A pool may later be a separate explicit `pkg.db.pool` package. Its presence must not change Query
-semantics or hide acquisition/wait costs.
+The D13 pool is the separate explicit `pkg.db.pool` module specified in §23. Its presence does not
+change Query semantics or hide acquisition, exhaustion, or physical-connection costs.
 
 ---
 
@@ -240,17 +240,23 @@ pkg.db.sqlite
 pkg.db.postgres
 ```
 
-Under Align's settled package rule, these are **three public module boundaries in one vendorable
-`pkg/db` package subtree**, not three independently versioned packages. `pkg.db` is the root common
-module; `pkg.db.sqlite` and `pkg.db.postgres` are driver submodules. This preserves the requested
-qualified API names while respecting one package version per build and the acyclic import graph.
-The root/internal layer never imports a public driver module; driver modules call downward into the
-common/internal layer.
+D13 adds one fourth public module in the same package subtree:
+
+```text
+pkg.db.pool
+```
+
+Under Align's settled package rule, the initial list is **three public module boundaries in one
+vendorable `pkg/db` package subtree**, not three independently versioned packages; D13 adds the
+fourth boundary to that same subtree. `pkg.db` is the root common module; `pkg.db.sqlite` and
+`pkg.db.postgres` are driver submodules, and `pkg.db.pool` imports those public constructors without
+creating a root/internal upward edge. This preserves the requested qualified API names while
+respecting one package version per build and the acyclic import graph. The root/internal layer never
+imports a public driver module; driver modules call downward into the common/internal layer.
 
 Possible future public submodules or separately named package roots:
 
 ```text
-pkg.db.pool
 pkg.db.odbc
 pkg.db.mysql
 pkg.db.duckdb
@@ -1973,7 +1979,7 @@ drivers.
 ## 15. Errors
 
 Database operations return a structured database error rather than aborting for recoverable
-failures. The v1 payloads are:
+failures. The package payloads through D13 are:
 
 ```align
 db.NativeError {
@@ -2005,6 +2011,7 @@ db.Error {
   Timeout(db.NativeError),
   Cancelled(db.NativeError),
   NotFound,
+  PoolExhausted,
   Cardinality(db.CardinalityError),
   Constraint(db.NativeError),
   Serialization(db.NativeError),
@@ -2033,6 +2040,9 @@ acceptable substitutes.
 The semantics are:
 
 - stable categories for ordinary control flow;
+- `PoolExhausted` is the allocation-free, Query-less result of a valid non-waiting pool acquisition
+  when no idle connection exists; callers may inspect `pkg.db.pool.info` to distinguish all slots
+  being checked out from capacity retired after a poisoned connection;
 - `ContractError.query_id` is `Some(id)` whenever validation has a Query/command subject, including
   `meta_query` and Query EXPLAIN. It is `None` only when no Query/command subject exists, such as
   connection input, transaction-option, or category-metadata validation, and when a malformed
@@ -3359,7 +3369,10 @@ String concatenation of untrusted values into SQL is not a package-supported bin
 - A connection with an active unread result follows the driver’s documented rule; the package must not
   silently buffer an unbounded remainder to make reuse appear possible.
 
-Pooling is separate future work and must expose wait, timeout, size, and connection affinity.
+The D13 `pkg.db.pool` module is explicit and fixed-capacity. Its only acquisition operation is
+non-waiting `try_acquire`: exhaustion is immediate, there is no acquisition timeout, and the
+constructor exposes the exact size. An acquired `db.conn` retains its physical connection and pool
+affinity through transaction conversion until Drop; no operation silently migrates it.
 
 ---
 
@@ -5095,6 +5108,166 @@ ledger-first. Before code review, extract every normative `must`/`exact`/`every`
 discriminating owner. A finding in resolver signs, format propagation, endian conversion, result
 metadata ordering, or cleanup triggers the complete sibling type/operation/delivery audit.
 
+#### A1 explicit-pool public-contract ledger
+
+This ledger is the source of truth for the fourth consumer-visible D13 rail. It adds one explicit,
+fixed-capacity pool over the already-shipped SQLite and PostgreSQL constructors. It does not add a
+driver registry, background worker, connection reset SQL, health check, retry, wait queue, dynamic
+resource collection, or compiler special case. The one `Pool` resource owns the explicitly sized
+private pointer array below; that is its opaque native representation, not a language-level
+collection of Move resources. The exact public surface is:
+
+```align
+module pkg.db.pool
+
+import pkg.db
+import pkg.db.sqlite
+import pkg.db.postgres
+import pkg.db.pool.internal.resource
+
+pub MAX_CAPACITY: i64 := 1024
+
+pub resource Pool = pkg.db.pool.internal.resource.drop_pool
+
+pub Info {
+  driver: pkg.db.Driver,
+  capacity: i64,
+  idle: i64,
+  checked_out: i64,
+}
+
+pub fn open_sqlite(
+  path: str,
+  capacity: i64,
+  options: slice<pkg.db.sqlite.ConnectOption>,
+) -> Result<Pool, pkg.db.Error>
+
+pub fn open_postgres(
+  url: str,
+  capacity: i64,
+  options: slice<pkg.db.postgres.ConnectOption>,
+) -> Result<Pool, pkg.db.Error>
+
+pub fn try_acquire(borrow owner: Pool) -> Result<pkg.db.conn, pkg.db.Error>
+
+pub fn info(borrow owner: Pool) -> Result<Info, pkg.db.Error>
+```
+
+`db.Error` adds the payload-free `PoolExhausted` variant shown in §15. There is no `acquire` alias,
+manual release/close operation, pool option sum, or acquisition timeout. `try_acquire` never waits,
+reads a clock, opens a connection, or performs database/native I/O. A valid pool with `idle == 0`
+returns exact `db.Error.PoolExhausted` immediately. A malformed private pool image returns exact
+`Unsupported(ContractError { query_id: None, item: "db.pool.state",
+message: "database pool state is invalid" })` before a slot load or counter mutation. `info`
+performs the same complete state validation and returns one Copy snapshot. Its fields satisfy
+`0 <= idle`, `0 <= checked_out`, and `idle + checked_out <= capacity`; the difference is the number
+of slots retired after unusable checked-out connections were dropped.
+
+Capacity validation is first and accepts exactly `1..=MAX_CAPACITY`. Any other value returns
+`Unsupported(ContractError { query_id: None, item: "db.pool.capacity",
+message: "database pool capacity must be between 1 and 1024" })` before bookkeeping allocation,
+input/option inspection, or native work. The bound caps the one constructor call at 1,024 external
+connection attempts and its pointer storage at exactly 8,192 bytes; it is a resource-safety bound,
+not a default or throughput recommendation. For a valid capacity, each constructor borrows its text and
+option slice only for the call, allocates one fixed pool record and one checked pointer array, then
+invokes the corresponding shipped `sqlite.connect` or `postgres.connect` in increasing physical
+ordinal. Thus all UTF-8/U+0000, option-default, duplicate/conflict, duration, client-encoding, and
+native connection errors and their source order remain exactly those constructors' contracts. The
+pool never stores the path, URL, secret, or option values. A failure at ordinal `n` returns that
+exact driver error after closing/freeing the `n-1` successful unpublished connections in reverse
+ordinal and freeing all pool bookkeeping; it publishes no `Pool`. All `capacity` connections open
+successfully before the constructor publishes the pool, so later acquisition has no hidden network,
+filesystem, SQL, PRAGMA, or authentication work. Repeating the same SQLite path does not rewrite or
+infer database identity: SQLite `:memory:`, empty, URI, cache, and mutex semantics remain the exact
+meaning of the caller's explicit connect inputs. Formation cleanup is ownership-atomic, not an
+external-effect rollback: a SQLite file created or PRAGMA applied by an earlier successful
+`sqlite.connect` is not deleted or compensated if a later ordinal fails. `ConnectTimeoutNs` and
+every other connect option apply independently to each physical connection; there is no aggregate
+pool-open deadline.
+
+An open pool owns its idle physical connections. `try_acquire` transfers the most recently returned
+idle connection, or initially the highest open ordinal, into one ordinary standalone `db.conn` and
+increments `checked_out`; the checked-out state is absent from the idle array. The connection keeps
+one private origin pointer but no compiler borrow dependency on `Pool`. This is required because the
+settled `db.begin`/`commit`/`rollback` API transfers the same raw state between the nominal `db.conn`
+and `db.tx` resources; fabricating a parent-dependent `db.conn` and then using `resource.into_raw`
+would erase its parent provenance. The runtime ownership instead keeps the pool bookkeeping alive
+until the last checked-out conn/tx drops. The acquired owner therefore supports every existing
+common/native Query, command, metadata, EXPLAIN, prepared statement, row stream, batch, and
+transaction operation without a pool-specific execution path.
+
+Dropping an idle, live acquired `db.conn` returns that exact physical state to the originating pool
+in LIFO order, with no reset SQL, rollback, health probe, reconnect, or allocation. `commit` and
+`rollback` return the same attached state as `db.conn`; dropping `db.tx` first performs the settled
+fail-safe rollback and then returns it only after an exact idle proof: SQLite requires
+`sqlite3_exec("ROLLBACK") == SQLITE_OK` and `sqlite3_get_autocommit(connection) != 0`; PostgreSQL
+requires a non-null `PGRES_COMMAND_OK` result, exact `ROLLBACK` command status, and `PQTRANS_IDLE`
+after clear. Any missing or failed proof
+poisons/closes and retires the slot. Existing dependent
+stmt/rows resources prevent their conn/tx parent from dropping, so no active result or prepared
+handle can enter the idle array. Any path that poisons/closes the native connection retains the
+checked-out accounting until conn/tx Drop, then frees that state instead of returning it. Capacity is
+fixed and such a slot is retired: the pool never retains credentials or reconnects transparently.
+Subsequent `info` exposes the lower `idle + checked_out`, and `try_acquire` reports
+`PoolExhausted` when the remaining idle set is empty. Replenishment requires explicitly dropping and
+reopening a pool.
+
+`Pool` is Move, non-Copy, and non-Send under the settled resource rules. Borrowed operations may
+mutate only its private native bookkeeping; they do not permit task capture or concurrent access.
+This makes blocking acquisition meaningless in v1: no concurrent owner can return a connection
+while the non-Send caller waits. A future Send/thread-safe resource form would require a new pool
+contract with synchronization, wait fairness, timeout, cancellation, and Drop coordination rather
+than silently changing this one.
+
+Pool Drop first publishes the closing state, then closes/frees every idle connection in reverse LIFO
+order. If none is checked out it frees the pointer array and pool record immediately. Otherwise the
+record and array remain private and unreachable except through the checked-out connection origins;
+those conn/tx values remain usable after Pool Drop. Each later Drop closes/frees its physical state
+instead of returning it, decrements the outstanding count exactly once, and the last one frees the
+array and pool record. Pool Drop never blocks, waits for a borrower, issues SQL, or invalidates a
+checked-out native connection. There is no public manual close, detach, adopt, or cross-pool return.
+
+The private connection record becomes exact 40-byte, 8-aligned v2. Offsets `0..31` retain the
+settled driver/closed/native/busy-timeout/execution/transaction/statement-ordinal meanings; offset
+32 is the origin-pool pointer, null for direct driver connections and non-null for an attached pool
+slot. Every connection-state validator rejects v1, unknown versions/drivers, invalid reserved bytes,
+and malformed live/closed native-pointer products before native access. The origin is installed and
+consumed only by the privileged package producer/Drop paths; like every native pointer inside an
+opaque resource, arbitrary pointer corruption is outside the safe source contract rather than a
+public input to probe. The private pool record is exact
+48-byte, 8-aligned v1: `u32 version=1` at 0, `u8 driver` at 4, `u8 lifecycle` (`0=open`, `1=closing`)
+at 5, zero `u16` at 6, signed `capacity`/`idle`/`checked_out` at 8/16/24, non-null slot-array pointer
+at 32, and zero `u64` at 40. The array has exactly `capacity` pointer cells; only `[0,idle)` owns
+non-null connection states. Constructor publication, acquire, return, retirement, Pool Drop, and
+last-checkout Drop are the only transitions. No state pointer, slot array, or counter enters a public
+ABI, persisted artifact, cache key, or FFI signature.
+
+The implementation is one capability PR: splitting the pool producer from conn/tx return would
+leave either a dormant pool or a connection Drop path that closes instead of returning its owner.
+It changes package sources plus their owner tests, not compiler ownership semantics or an IR shape.
+No benchmark is a correctness gate because this contract promises no throughput or latency number;
+allocation/native-call counters prove the explicit-cost rules. Run `scripts/db-verify-local.sh`
+before push and keep the required live PostgreSQL job non-skippable.
+
+Implementation closure matrix:
+
+| Closure cell | Required implementation closure | Exact owner evidence |
+|---|---|---|
+| public surface and errors | Export only the constant, resource, Info, two constructors, `try_acquire`, and `info`; add exactly payload-free `db.Error.PoolExhausted`; update interface/cache identity once. | source/interface golden; whole/per-unit imported call and exhaustive Error match; absence of acquire/close/release/adopt aliases |
+| capacity and constructor validation | Capacity wins every multi-invalid product and rejects 0, negative, 1025, and `i64` extrema before allocation/native work. Valid 1/1024 delegates exact driver validation and opens ordinals in order. | allocation/connect counters; capacity x NUL/invalid-option winner matrix; both-driver boundary owners |
+| partial formation cleanup | Failure/null at each physical ordinal closes prior unpublished connections once in reverse order, frees every raw owner, returns the exact failing driver error, and publishes no pool. | parameterized ordinal failpoints and allocation/native close ledger for SQLite/PostgreSQL |
+| acquisition, observation, and ordering | Complete state validation precedes slot reads. Initial and returned states pop LIFO; success changes idle/checked-out by exactly one with no allocation/clock/native call. Empty valid state returns exact `PoolExhausted` without mutation. | byte/counter snapshots, session-identity LIFO probe, exhaustion replay, `info` before/during/after checkout |
+| conn/tx ownership transfer | A checked-out conn carries its origin through begin, commit, rollback, failed commit/rollback cleanup, moves, returns, replacement, branches, loops, `?`, and Drop. Tx Drop returns only after the exact SQLite/PostgreSQL rollback-and-idle proof above; no dependency is laundered through raw provenance. | existing Q4a transaction matrix extended with pool counters, rollback status/tag/transaction-state failpoints, and whole/per-unit paths |
+| dependent execution resources | stmt, rows, batch views, catalog cursors, and EXPLAIN retain existing parent generations and leases; conn/tx cannot return while a child is live, and child Drop completes before pool return. | compile-time parent-overlap negatives plus Q4a/Q4b/Q5b2/A1 pooled execution owners on both drivers |
+| poison, close, and retirement | Every existing poison/close cause makes later state reuse fail; conn/tx Drop frees rather than idles it, decrements checked-out once, and leaves a visible capacity gap without reconnect/reset. Ordinary database errors that retain synchronization still return the connection. | driver status/timeout/restore/rollback failure matrix; info/exhaustion after retirement; zero reconnect/reset calls |
+| Pool Drop with outstanding owners | Closing publishes before idle teardown, closes each idle owner once, keeps bookkeeping while checkouts exist, permits those conn/tx operations, then closes each on Drop and frees bookkeeping exactly at the last outstanding owner. | zero/one/many idle x zero/one/many checked-out allocation/close/order matrix, including tx and dependent stmt/rows |
+| private ABI and malformed state | All v2 conn and v1 pool offsets, tags, reserved bytes, counts, native-pointer products, and slot prefix agree across constructor/accessor/Drop. Malformed authenticated fields fail before slot/native access and never dispatch through an unknown driver; raw origin/slot pointer validity remains the privileged unsafe producer's obligation. | exact byte goldens; one-field-at-a-time scalar/tag/null corruption no-call owners; v1 conn and unknown pool lifecycle rejection; constructor-origin transition assertions |
+| driver and build parity | Direct and pooled connections share the same execution code and result/error identity; pool code retains both driver producer Drop thunks under whole-program/per-unit builds and uses no ambient configuration. | complete fake-driver matrix, live SQLite and PostgreSQL acquire/use/tx/reuse/Drop cases, `scripts/db-verify-local.sh` |
+
+Run one fresh independent adversarial review of this ledger and the one-PR boundary before
+implementation. Resolve findings ledger-first. Before code review, perform one author-side
+matrix-to-diff pass and point every applicable cell to its implementation and discriminating owner.
+
 - bounded `next_batch`, batch generations, segmented child buffers, nullable validity bitmaps, and
   direct eligible `soa<Row>` decode with no intermediate AoS — shipped by the first A1 rail;
 - PostgreSQL single-row and portal-batch delivery — specified by the ledger above;
@@ -5103,7 +5276,7 @@ metadata ordering, or cleanup triggers the complete sibling type/operation/deliv
   `string`/dynamic-array Row storage; it must not weaken the v1 `RegionPlain` path;
 - PostgreSQL COPY/pipeline/LISTEN-NOTIFY;
 - SQLite backup/incremental blob/FTS helpers;
-- explicit pool package;
+- explicit pool package — specified by the ledger above;
 - additional drivers only after the common contracts are proven.
 
 No roadmap item may add hidden relationship loading or a Query-builder DSL.
@@ -5320,6 +5493,19 @@ The design is implemented correctly only if all are true:
 93. Metadata schema/table inputs reject U+0000 as the exact Query-less `db.Error.Encode` before any
     native/catalog request on both drivers, with declaration-order precedence for multi-invalid
     inputs.
+94. `pkg.db.pool` exports exactly `MAX_CAPACITY`, `Pool`, `Info`, `open_sqlite`, `open_postgres`,
+    `try_acquire`, and `info`; acquisition is immediate and has no wait, timeout, hidden open, or
+    alias.
+95. Pool capacity is exactly `1..=1024`; all physical connections open eagerly from one explicit
+    driver input set, and partial formation closes every unpublished owner before returning the
+    exact driver error.
+96. A checked-out conn preserves one pool origin through conn/tx conversion and every dependent
+    execution resource. Live Drop returns it LIFO, poison retires it, and neither path resets or
+    reconnects.
+97. Pool Drop closes idle connections first but does not invalidate checked-out conn/tx owners; the
+    last later owner Drop closes its connection and frees retained bookkeeping exactly once.
+98. `db.Error.PoolExhausted` is payload-free and allocation-free; `pkg.db.pool.Info` exposes exact
+    capacity, idle, and checked-out counts so retired capacity is visible.
 
 ---
 
