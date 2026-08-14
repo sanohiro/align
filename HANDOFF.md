@@ -55,27 +55,29 @@ align-llm Request 6 adoption is closed by align-llm PR #84. Request 8's Align-ow
 declared-record `array_builder` contract was accepted in #799 and shipped in #801 at
 `029e27465d79e24cd36d374aae41dca0ec7e6979`. The sibling request register records the merged
 surface and the required batch release build is green. Request 10's recursive heap-tree-record
-extension is implemented from the accepted
+extension is shipped from the accepted
 `docs/impl/17-library-boundary-prerequisites.md` §7.6 ledger: nested Options, string/Copy/record
 arrays, the exact C6 field graph, existing tagged-wrapper closure, whole/per-unit identity, and
 stack/boxed recursive cleanup share the existing builder/runtime ABI. Reopen §7.6 only for a public
 or ownership-strategy change after design review.
 
-align-llm Request 12 is the active prerequisite. Branch
-`agent/bounded-canonical-json` implements the accepted public design in
-`docs/impl/17-library-boundary-prerequisites.md` §7.7: `json.encode_bounded(value, max_bytes: i64)`
-shares `json.encode` bytes and schema, returns an owned `Result<string, Error>`, and rejects a
-negative or exceeded inclusive emitted-byte limit as `Error.Invalid`. The runtime bounded builder,
-Sema/checked-HIR discriminator, MIR Result control flow, LLVM shared formatter path, typed ABI rows,
-and focused runtime/driver owners are implemented. Complete the focused ARM-native qualification,
-comprehensive review, repair, publication preflight, PR, and merge. The comprehensive review of
-`e439f643841bc8ad2f816993ddc8d4a415cbcf52` found one valid checked-HIR boundary gap: the bounded
-discriminator reused generic template validation and therefore admitted raw `str` holes or arbitrary
-text in malformed HIR. The consolidated repair adds an iterative canonical-plan grammar and exact
-part-type validation; its ARM-native validator owners, seven-test driver owner, workspace build, and
-library Clippy target pass with one job. Run the findings-fixed publication preflight next. Do not
-build a second formatter, estimator pass, dynamic JSON value, or unbounded-encode-then-discard
-compatibility path.
+align-llm Requests 11 and 12 have accepted designs. Request 12 is the active publication capability
+on `agent/bounded-canonical-json` and PR #807. It implements
+`docs/impl/17-library-boundary-prerequisites.md` §7.7 through the complete
+Sema→checked-HIR→MIR→LLVM→runtime owner matrix while sharing the existing canonical formatter. The
+comprehensive review of `e439f643841bc8ad2f816993ddc8d4a415cbcf52` found one checked-HIR boundary
+gap; consolidated repair `4816232614a8c64a9920751265c0cbbaaebab398` adds the iterative canonical-plan
+grammar and mutation regressions. The findings-fixed native ARM64 publication preflight passed with
+one build/test/gate job. Refresh that evidence after integrating #806, update PR #807, and merge it.
+Do not add a second formatter, estimator pass, dynamic JSON value, or unbounded-encode-then-discard
+path.
+
+Request 11 is the next implementation capability after #807. Its bounded process-capture contract
+is in `docs/impl/std-design/process.md`: `max_capture_bytes` is a per-stream command-local bound,
+`run_bytes` is the explicit arbitrary-byte terminal, and timeout/cap precedence, exact allocation,
+allocation-free post-fork bounded drain, deadline-aware post-EOF wait, terminal pipe-error cleanup,
+process-group signalling/direct-child reap, interface identity, and owner cells are fixed in one
+ledger. Implement that ledger without reopening the public surface.
 
 Out-of-gate suites (everything outside `scripts/test-pr.sh`) are guarded by the
 nightly full-suite workflow, which builds once, runs every compiled test binary
@@ -184,15 +186,16 @@ facts must live in this repository.
 - **align-llm requests:** Request 4 is merged through Align design #798 and implementation #800;
   Request 6 is closed after Align design #703, implementation #704, and align-llm adoption #84;
   Request 8 is merged through Align design #799 and implementation #801; Request 10's §7.6
-  implementation is complete. Requests 5, 7, 9, and 11–14 otherwise remain proposed in
+  implementation is merged; Request 11's bounded-capture design is accepted. Requests 5, 7, 9, and
+  12–14 otherwise remain proposed in
   `../align-llm/docs/align-requests.md`; Request 9 remains the later C7 blocker after Request 7.
 
 Consumer-gated deferrals that remain intentional:
 
 - Fully escaping function values wait for a consumer and a settled heap-owned
   environment/drop model.
-- `std.process` binary capture (`run_bytes`) waits for a binary-output consumer;
-  see `docs/impl/std-design/process.md`.
+- `std.process` bounded/binary capture now has align-llm Request 11 as its consumer and an accepted
+  contract; implementation remains the active capability in `docs/impl/std-design/process.md`.
 - Top-level `array<str> := json.decode(...)` waits for a result representation
   that carries the input region. Struct fields of `array<str>` already ship;
   see `docs/impl/core-design/json.md`.

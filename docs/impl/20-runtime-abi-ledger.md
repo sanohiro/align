@@ -44,6 +44,12 @@ feature selection changes neither accepted callable input nor MIR, interface,
 artifact, or cache identity. Registry membership is never inferred from symbol
 spelling.
 
+Request 11 reserves six additional regular `RuntimeKey` rows for bounded process capture. They are
+normative planned rows, not part of the current 285/298/306 counts until the implementation commit
+adds their runtime definitions and registry entries atomically. At activation the exact counts become
+291 keyed records, 304 base records, and 312 records in the maximum optional-probe export table. No
+unkeyed or probe category changes.
+
 The key-to-symbol mapping is `key -> "align_rt_" + snake_case(key)` except:
 
 ```text
@@ -164,6 +170,25 @@ from those bodies. `align_rt_str_cmp` is not guarded and always keeps A01.
 | A88 | `{ ptr, i64 } @SYM(ptr, ptr, i64, i64, i64)` | `align_rt_rng_sample` |
 | A89 | `{ ptr, i64 } @SYM(ptr, ptr, i64, i64, i64, i64, ptr, ptr)` | `align_rt_par_map_filter` |
 | A90 | `{ ptr, i64 } @SYM(ptr, ptr, i64, ptr, i64, i32)` | `align_rt_regex_replace` |
+
+Request 11 planned keyed delta (implementation pending):
+
+| Runtime key | Exact symbol | Existing ABI row and exact declaration |
+|---|---|---|
+| `CommandMaxCapture` | `align_rt_command_max_capture` | A66: `void @SYM(ptr, i64)`; no curated attributes |
+| `CommandRunBytes` | `align_rt_command_run_bytes` | A19: `i32 @SYM(ptr, ptr)`; no curated attributes |
+| `RunBytesCode` | `align_rt_run_bytes_code` | A29: `i64 @SYM(ptr)`; no curated attributes |
+| `RunBytesStdout` | `align_rt_run_bytes_stdout` | A83: `{ ptr, i64 } @SYM(ptr)`; no curated attributes |
+| `RunBytesStderr` | `align_rt_run_bytes_stderr` | A83: `{ ptr, i64 } @SYM(ptr)`; no curated attributes |
+| `RunBytesFree` | `align_rt_run_bytes_free` | A62: `void @SYM(ptr)`; no curated attributes |
+
+All six use the regular `align_rt_` plus snake-case key mapping and occupy collision-reserved native
+identities as soon as the capability activates. `runtime_abi_registry_is_complete_and_unique` owns
+the 291/304 counts, key/symbol bijection, and reverse lookup; the exact extern-type matrix owns every
+parameter/return/attribute cell; the checked-in declaration golden owns spelling and row order; and
+the base/feature runtime-export parity owners require all six definitions in every normal runtime
+while rejecting any missing, duplicate, near-spelled, or wrong-signature record. The capability must
+not add a direct declaration outside this registry.
 
 Unkeyed native records:
 
