@@ -332,17 +332,21 @@ env_clear: bool, timeout_ns: i64 }` を `align_rt_command_new(cmd, args)` で構
    `execvp`/`chdir`/`setenv` は既知の既存ハザードであり、`posix_spawn` が記録済みの理想的な修正):cwd が設定
    されていれば `chdir(cwd)`(失敗 → `_exit(127)`);`env_clear` なら `clearenv()`、続いて各上書きを `setenv`;
    2 つのパイプ write 端を fd 1 と 2 に `dup2`;すべてのパイプ fd を close;`execvp`;失敗時 `_exit(127)`。
-3. **親**:write 端を close する。両 read fd を non-blocking にする。**両 read fd を一緒に `poll`** し、データが
-   届くたびに `out.out` / `out.err` へドレインする。両方を同時にドレインするのは必須である。さもないと、親が
-   stdout を読む間に子が stderr パイプを満たすと**デッドロック**する(古典的な 2 パイプキャプチャバグ)。両方が
-   EOF に達するまでループする。
-4. **タイムアウト**:`timeout_ns > 0` なら、残りのデッドラインで `poll` する(ns→ms、≥1 にクランプ)。期限切れ時:
-   子の process group を `SIGKILL` し、EOF の再 drain 無しに両 read end を閉じ、直接の子を `waitpid` した後
-   **`AL_TIMEOUT`** を返す(部分出力は捨てる — 「タイムアウトを報告せよ、半端な答えを返すな」)。read を閉じる
-   ことで group を escape した descendant が capture を永遠に開いたままにできない。`timeout_ns == 0` =
-   タイムアウト無し(ブロック)。負の `timeout_ns` は `c.timeout_ns()` の構築時に拒否する(`kill` のシグナル範囲と
-   同じく abort)。
-5. 子を `waitpid`(ここで reap — ゾンビ無し);`out.code = decode_wait_status(status)`。
+3. **親**:write 端を close する。有界呼び出しでは両 read fd は `fork` 前に non-blocking 化済みで、既存の
+   無制限 path は現在の setup を保つ。**両 read fd を一緒に `poll`** し、データが届くたびに `out.out` /
+   `out.err` へドレインする。両方を同時にドレインするのは必須である。さもないと、親が stdout を読む間に子が
+   stderr パイプを満たすと**デッドロック**する(古典的な 2 パイプキャプチャバグ)。両 stream が EOF に達し、
+   かつ直接の子を reap するまで同じ lifecycle を続ける。
+4. **タイムアウト**:`timeout_ns > 0` なら、pipe drain から EOF 後の direct-child wait まで1つの deadline を
+   維持する。pipe が開いている間は残り deadline で `poll` する(ns→ms、≥1 にクランプ)。両 pipe EOF 後は、
+   直接の子が終了するまで `waitpid(WNOHANG)` と allocation-free な zero-fd `poll` を最大
+   `min(remaining, 1 ms)` 使う。期限切れ時は **`AL_TIMEOUT`** を保存し、owned child process group があれば
+   そこへ、**常に direct pid へも** `SIGKILL`、EOF の再 drain 無しに両 read end を閉じ、直接の子への
+   `waitpid` を `EINTR` retry した後、保存した status を返す(部分出力は捨てる — 「タイムアウトを報告せよ、
+   半端な答えを返すな」)。read を閉じることで group を escape した descendant が capture を永遠に開いたままに
+   できない。`timeout_ns == 0` = タイムアウト無し(ブロック)。負の `timeout_ns` は `c.timeout_ns()` の構築時に
+   拒否する(`kill` のシグナル範囲と同じく abort)。
+5. 両 stream が EOF に達し直接の子を reap した後、`out.code = decode_wait_status(status)` を設定する。
 6. **UTF-8**:`out.out` / `out.err` を UTF-8 として検証する。不正 → free して `AL_INVALID` を返す
    (`fs.read_file` の先例 — `string` 型のアクセサは非 UTF-8 バイトを晒せない)。下記参照。
 7. `*out = Box::into_raw(Box::new(RunOutput{...}))`;`0` を返す。
@@ -396,19 +400,21 @@ fork/pipe/dup2/waitpid の失敗 → errno→`Error` テーブル(M9)。タイ�
 5. `c.timeout_ns(ns)` + `Error.Timeout` のコア変更 — 「ハングしたテストがループを凍らせる」の修正
    (kill + `Err(Timeout)`)。**実装済み。** `c.timeout_ns(ns: i64)` はバインド済みローカルへのインプレース
    セッタ(`()`)。`ns == 0` = タイムアウト無し(スライス 4 の既定)、負の `ns` はビルド時に abort。`c.run()`
-   はデッドラインを 2 パイプのドレインに通す(残り時間 ns→ms、`>= 1` にクランプして `poll`)。期限切れ時は子の
+   は1つの deadline を 2 パイプのドレインと EOF 後の direct-child wait に通す(残り時間 ns→ms、`>= 1` に
+   クランプして `poll`、EOF 後は `waitpid(WNOHANG)` + zero-fd `poll`)。期限切れ時は子の
    **プロセスグループ**全体を `SIGKILL` し(子は自分のグループに `setpgid` するので、`sh -c "sleep 10"` の孫
    プロセスにも signal が届く。さもないとキャプチャパイプを開いたままドレインをハングさせる)、EOF の再 drain 無しに
-   両 read end を閉じ、直接の子だけを `waitpid` し、`Err(Error.Timeout)` を返す(部分出力は破棄)。`poll` の `EINTR` は残りデッドラインを
-   再計算する。`timeout_ns == 0` は無限の `-1` `poll`(スライス 4 の挙動そのまま)を保つ。
+   **常に直接 pid へも** `SIGKILL`、両 read end を閉じ、直接の子だけを `EINTR` retry 付きで `waitpid` し、
+   `Err(Error.Timeout)` を返す(部分出力は破棄)。`EINTR` は残り deadline を再計算する。`timeout_ns == 0` は
+   blocking 動作を保つ。
 6. `c.env(name,value)` + `c.env_clear()` — **実装済み。** どちらもその場で書き換える束縛ローカルのセッタ
    (`()`)。`c.env(name, value)` は `(name, value)` の上書きを記録し、`c.env_clear()` は子環境を空から
    始めるよう印を付ける。ランタイムの `Command` に `env: Vec<(CString, CString)>` と `env_clear: bool` を
    追加。フォークした子では、`chdir` の後・`dup2` の前に `if env_clear { clearenv() }` を実行し、続いて
    記録された各ペアを `setenv(name, value, 1)`(overwrite=1 — 同名の後発 `env` が勝ち、`env_clear` 後の
-   `env` は残る)。name/value は**親側**で C 文字列にマーシャルする(子は割り当てをしない。`spawn`/スライス 4 の
-   非同期シグナル安全性の規律)。name/value の内部 NUL・非 UTF-8 は abort し、`=` を含む name も abort する
-   (`setenv` が拒否するため)。
+   `env` は残る)。name/value は**親側**で C 文字列にマーシャルするため、子は pair ごとの marshalling
+   allocation を追加しない。`clearenv`/`setenv`/`execvp` は P11 の子側 allocation/async-signal-safety caveat を
+   保つ。name/value の内部 NUL・非 UTF-8 は abort し、`=` を含む name も abort する(`setenv` が拒否するため)。
 7. *(下記で設計済み、実装待ち)* bytes 層 `c.run_bytes()` とコマンドローカルな
    `max_capture_bytes` 上限 — align-llm Request 11。
 
@@ -455,7 +461,7 @@ fork/pipe/dup2/waitpid の失敗 → errno→`Error` テーブル(M9)。タイ�
 | Surface | 厳密な契約 |
 |---|---|
 | `c.max_capture_bytes(limit: i64) -> ()` | 束縛されたローカル `command` をその場で変更する setter。`limit >= 0`。負値はプログラマエラーとして、子プロセス生成や割り当てより前に abort する。最後の呼び出しが前の上限を上書きする。明示的な `0` は stdout と stderr の両方について空だけを許す。未呼び出しのコマンドだけが既存の無制限動作を保つ。同じ上限を各ストリームへ独立に適用し、その後のすべての `run()` / `run_bytes()` で使う。 |
-| `c.run() -> Result<run_output, Error>` | 既存の、借用され再実行可能な text キャプチャ。有界時は各ストリームを `limit` バイトまで許す。ちょうど上限は成功し、どちらかで最初に上限を超えるバイトを観測したら子のプロセスグループを kill し、直接の子を reap し、両方の部分出力を捨て、`Error.Invalid` を返す。上限内で完了した出力は従来どおり UTF-8 検証し、不正なら `Error.Invalid`。非ゼロ終了は従来どおり `Ok(run_output)`。 |
+| `c.run() -> Result<run_output, Error>` | 既存の、借用され再実行可能な text キャプチャ。有界時は各ストリームを `limit` バイトまで許す。ちょうど上限は成功し、どちらかで最初に上限を超えるバイトを観測したら owned child process group があればそこへ signal し、直接の子を kill/reap し、両方の部分出力を捨て、`Error.Invalid` を返す。上限内で完了した出力は従来どおり UTF-8 検証し、不正なら `Error.Invalid`。非ゼロ終了は従来どおり `Ok(run_output)`。 |
 | `c.run_bytes() -> Result<run_bytes, Error>` | 新しい、借用され再実行可能なバイナリキャプチャ。コマンド設定、両パイプ drain、上限、timeout、kill、reap は `run()` と同じ経路を使い、UTF-8 検証はしない。`run_bytes` は終了コードと2つの byte buffer を所有する単一の不透明 Move ハンドル。 |
 | `out.code() -> i64` | `run_output` と `run_bytes` の両方が既存の終了コード復号を公開する: `WEXITSTATUS`、`128 + signal`、または子側 `chdir`/`execvp` 失敗時の `127`。純粋な Copy 読み出し。 |
 | `out.stdout()`, `out.stderr()` | `run_output` は zero-copy `str` view、`run_bytes` は zero-copy `slice<u8>` view を返す。空出力は空 view。各 view は出力ハンドルの region に束縛され、Drop を越えて escape できない。埋め込み NUL は byte 層では通常データであり、text 層でもストリーム全体が正しい UTF-8 なら受理する。 |
@@ -471,7 +477,7 @@ measurement command に `262_144` を設定し、無制限実行後の長さ検�
   無い。未設定だけが無制限で、`0` は実在する0バイト上限である。
 - 負の `limit` は割り当てやプロセス生成より前の setter で abort する。有界実行は最初に出力 slot を検証し、
   非負上限を platform allocation size へ変換し、2つの capture store と mode 固有の空 output-handle shell を
-  生成する。表現不能な layout は `Error.Invalid`。物理 allocation failure は Align の locked fatal-OOM 方針に
+  生成する。表現不能な layout は `Error.Invalid`。物理 capture/output allocation failure は Align の locked fatal-OOM 方針に
   従い、unwind や recoverable `Error` 無しで即時 abort する。どちらでも子はまだ開始しておらず、fatal OOM 前の
   preallocation は process teardown が回収する。
 - pipe/fork/nonblocking-setup failure は固定 errno 対応を保つ。pipe 作成と両 read-fd の `fcntl` は fork 前に
@@ -510,14 +516,15 @@ buffer をちょうど1回 Drop する。その view は text view が `region_o
 mode 固有の空 output-handle shell を割り当てる。`L == 0` ならどちらの byte layout も割り当てない。1つの
 capture allocation / reserved capacity は `L` より大きくなく、2つの live capture layout の合計は厳密に
 `2L` である。既存の固定64 KiB stack read scratch、command の argv/cwd/environment storage、2本の pipe
-descriptor、固定 stack `[PollFd; 2]`、小さい output handle はこの capture-store 上限の外である。有界実行は
-fork 後に**heap allocation を一切しない**。poll descriptor array はその場で埋め、post-EOF wait は zero-fd
-`poll` を使い、read は固定 scratch に入り、chunk 全体が選択ストリームの残容量へ収まる場合だけコピーする。
-成功時は既存 shell を埋め、追加 allocation 無しで2 layout を移す。すべての recoverable failure で3つの
-preallocated object を解放する。fatal OOM は process-wide allocation rule に従い pipe 作成/fork より前に終了する。
-両 read end は fork 前に nonblocking 化し、`F_GETFL`/`F_SETFL` failure は recoverable setup error であって、
-best-effort post-fork assumption ではない。無制限呼び出しは既存 growable `Vec` 動作を保ち、memory-bound claim を
-持たない。
+descriptor、固定 stack `[PollFd; 2]`、小さい output handle はこの capture-store 上限の外である。**親側の有界
+capture/reap state machine** は fork 後に heap allocation をしない。poll descriptor array はその場で埋め、
+post-EOF wait は zero-fd `poll` を使い、read は固定 scratch に入り、chunk 全体が選択ストリームの残容量へ収まる
+場合だけコピーする。成功時は既存 shell を埋め、追加 allocation 無しで2 layout を移す。すべての recoverable
+failure で3つの preallocated object を解放する。これら capture/output allocation の fatal OOM は process-wide
+allocation rule に従い pipe 作成/fork より前に終了する。fork された子は既存 P11 launch path のままであり、
+`clearenv`/`setenv`/`execvp` は allocation し得る。この capture 契約はその caveat を強めも隠しもしない。両 read
+end は fork 前に nonblocking 化し、`F_GETFL`/`F_SETFL` failure は recoverable setup error であって、best-effort
+post-fork assumption ではない。無制限呼び出しは既存 growable `Vec` 動作を保ち、memory-bound claim を持たない。
 
 正の timeout または明示的 capture bound を持つ command は、子を process-group leader にする。timeout、
 overflow、hard post-fork capture/wait error は owned group があればそこへ、常に直接 pid へ `SIGKILL` を送り、
@@ -571,7 +578,8 @@ entry を無効化する。
 | Post-fork lifecycle | `{pipes open/EOF} × {child live/exited} × {untimed/timed/bounded}` を parameterize。成功には両 EOF と direct child reap が必要。timed EOF/live child は WNOHANG + allocation-free zero-fd poll で exit/deadline まで進む。Owner: `command_capture_lifecycle_state_matrix`。 |
 | Binary tier | `run_bytes` は invalid UTF-8 と embedded NUL を byte-for-byte で保ち、region-bound byte view、nonzero exit、exact-cap 動作を共有。Owner: `command_run_bytes_preserves_arbitrary_output`。 |
 | Move と Drop | formation、construction、`Result` move-in/out、`?`、`else`、`match`、`map_err`、replacement、return、source nulling、early exit は各 output を1回 Drop。aggregate/capture/temporary と escaped view を拒否。Owner: `m11_process_command` ownership matrix と checked-HIR variant tripwire。 |
-| Allocation、descriptor setup、malformed limit | exact layout/shell を pipe/fork 前に割り当て、zero は byte store 無し、unrepresentable layout は `Invalid`、物理 allocation failure は子が存在する前に no-unwind abort、両 read fd は fork 前に nonblocking または setup failure、固定 poll/scratch/wait storage により bounded post-fork allocation 無し、capture capacity は `L` 以下。Owner: 第1/第2/shell allocation の subprocess fatal-OOM failpoint、`fcntl` failpoint、`command_capture_allocation_bound`。child marker で fork 未到達を証明。 |
+| Allocation、descriptor setup、malformed limit | exact layout/shell を pipe/fork 前に割り当て、zero は byte store 無し、unrepresentable layout は `Invalid`、物理 capture/output allocation failure は子が存在する前に no-unwind abort、両 read fd は fork 前に nonblocking または setup failure、固定 poll/scratch/wait storage により親側 bounded capture/reap state machine の post-fork heap allocation は0、capture capacity は `L` 以下。Owner: 第1/第2/shell allocation の subprocess fatal-OOM failpoint、`fcntl` failpoint、`command_capture_allocation_bound`。child marker で fork 未到達を証明。 |
+| Child launch boundary | bounded terminal は既存の post-fork child `chdir`/environment/`execvp` path を再利用し、新しい child-side operation を追加しない。`clearenv`/`setenv`/`execvp` は allocation し得て P11 を保ち、親側 capture bound/fatal-OOM-before-fork claim は適用しない。Owner: `m11_process_command` 内の既存 cwd/env/env_clear/exit-127 regression。 |
 | Reuse と concurrency | 1 command が保持/上書き bound で text/byte run を反復し、2つの独立 command は shared state 無しで並行実行。Owner: `command_capture_reuse_and_independent_concurrency`。 |
 | Generic/interface/per-unit/cache parity | `Result<run_bytes, Error>` を返す関数は whole-program/per-unit で同じ type/ABI。interface round-trip と exact edit/revert cache identity が一致。Owner: process interface/per-unit/cache tests。 |
 | Existing behavior | setter 無し `run()` は無制限で byte-for-byte compatible。cwd/env/env_clear/timeout、large dual-pipe、nonzero exit、text view owner は green のまま。Owner: 完全な `m11_process_command` target。 |
@@ -583,10 +591,12 @@ consumer limit について、有界 text/byte throughput と最大 live capture
 ### Closure matrix reopened: post-fork lifecycle
 
 2回目の review で、最初の matrix は bounded pipe capture までで direct-child termination を含まないと判明した。
-reopen した軸は `{pipe state} × {direct-child state} × {deadline state} × {terminal trigger}`。shared engine は
-pre-fork setup から EOF、direct-child wait、terminal cleanup まで1つの indivisible capability とする。新しい
-producer/type work をこの runtime consumer から分けると既存 timeout hang と truncated-success path が reachable の
-ままなので、design/implementation は1つの mergeable capability を保つ。
+その後の projection review で、overview が古い unconditional post-EOF wait を記述し、既存 child launcher まで親側の
+no-allocation promise に含めていたと判明した。reopen した軸は `{parent capture/child launch} × {pipe state} ×
+{direct-child state} × {deadline state} × {terminal trigger}`。shared parent engine は pre-fork setup から EOF、
+direct-child wait、terminal cleanup まで1つの indivisible capability とし、既存 P11 child launcher は明示的な隣接
+boundary とする。新しい producer/type work をこの runtime consumer から分けると既存 timeout hang と
+truncated-success path が reachable のままなので、design/implementation は1つの mergeable capability を保つ。
 
 ## Design review finding の closure
 
@@ -597,9 +607,12 @@ producer/type work をこの runtime consumer から分けると既存 timeout h
 | P2 compiler type encoding が実装依存 | canonical codec version 3 に exact `Ty`/`Scalar` tag 60/36 と双方向/malformed vector を追加し、interface format 6 は既存 named-type record を exact byte vector 付きで使う。 |
 | P2 external request register が proposed のまま | sibling register に accepted per-stream/text/bytes/ownership/error contract と final reviewed design commit を記録し、指示どおりその repository では uncommitted のままにする。 |
 | P1 deadline が pipe EOF で終わっていた | reopen した lifecycle は direct-child reap まで deadline を維持する。EOF/live は `waitpid(WNOHANG)` + allocation-free zero-fd `poll` と専用 owner を使う。 |
-| P1 bounded poll が fork 後に allocation | allocation row は exact store/shell を pipe 前に用意し、fixed stack poll/scratch state、pre-fork nonblocking setup、bounded post-fork heap allocation 0を要求する。 |
+| P1 bounded poll が fork 後に allocation | allocation row は exact store/shell を pipe 前に用意し、fixed stack poll/scratch state、pre-fork nonblocking setup、親側 bounded post-fork heap allocation 0を要求する。 |
 | P2 hard poll/read error が partial success | precedence/hard-I/O row が最初の deterministic errno を map し、同じ kill/close/direct-reap cleanup、元 status 保持、output 非公開を要求する。 |
 | P2 normative group reaping が過大 | specification は process group を signal し、reap するのは直接の子だけと明記する。escaped descendant は契約外。 |
+| P1 overview が pipe EOF で deadline を終えていた | runtime sequence と shipped-slice summary は lifecycle row を厳密に投影し、timed EOF/live-child state は exit/expiry まで `waitpid(WNOHANG)` + zero-fd `poll` を使う。 |
+| P1 no-allocation promise が既存 child launcher を含んだ | allocation promise/owner row は親側 bounded capture/reap state machine だけを対象とし、別の child-launch row が `clearenv`/`setenv`/`execvp` の P11 を維持する。 |
+| P2 timeout overview に direct-pid fallback が無い | すべての timeout 記述は status を保存し、owned group があればそこへ、常に direct pid へ signal、両 read を close、`EINTR` retry 付きで直接の子だけを reap する。 |
 
 ## Acceptance gate
 

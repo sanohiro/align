@@ -2735,8 +2735,8 @@ run-Drops-then-exit vs. an immediate hard-exit API — both landed: the first as
 The command-local spelling is `c.max_capture_bytes(limit: i64)`. The non-negative limit applies
 independently to stdout and stderr; explicit zero accepts only empty streams, while no setter call is
 the existing unbounded behavior. Exact-limit output succeeds. The first observed byte beyond either
-stream's limit kills the child process group, closes the pipes, reaps the direct child, discards both
-partial streams, and returns `Error.Invalid`. Deadline checks precede poll/read processing, so an
+stream's limit signals the owned child process group when present, kills the direct child, closes the
+pipes, reaps the direct child, discards both partial streams, and returns `Error.Invalid`. Deadline checks precede poll/read processing, so an
 already-observable timeout remains `Error.Timeout` and wins over overflow at that checkpoint. The
 deadline stays active through direct-child wait after pipe EOF. Hard poll/read/wait failures use the
 fixed `Error.Code(errno)` mapping, signal an owned group when present, run the same
