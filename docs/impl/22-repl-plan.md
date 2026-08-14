@@ -354,6 +354,13 @@ attempt 2: N = (this entry's candidate name set, §3.6) ∩ (the union of existi
                   roll back.
 ```
 
+This sequence owns region 4, whose binding names are available only from HIR.
+Regions 2 and 3 have exact entry-AST names before checking, so they perform the
+same same-region intersection and in-place replacement before their single
+candidate check. This is required for `extern "C"`: Align currently accepts a
+repeated extern declaration without a duplicate diagnostic, so waiting for an
+error would silently accumulate two REPL-owned entries for one symbol.
+
 `N` is computed from the **HIR delta intersected with existing `Entry.names`**
 (§3.6), never parsed out of diagnostic text. Diagnostic strings are pinned by an
 owner test only to prove the *class* test still recognises them, not to extract
@@ -368,14 +375,13 @@ region and is only asking "is a rebinding what happened here?", where a duplicat
 plus downstream `undefined name` noise is the normal shape. An owner test pins
 both thresholds so a later simplification to one predicate fails.
 
-Six message classes must be recognised for the class test to be complete: the
-four quoted above plus `duplicate resource declaration` and the extern-symbol
-duplicate. **Coverage basis:** these are the only diagnostics the compiler emits
-for "this name is already taken by something in the same namespace", one per
-thing the REPL can create (local, function, type, constant, resource, extern
-symbol) — the list is derived from the set of creatable entities in §3.2's four
-regions, not from a grep. An owner test enumerates one entry of each creatable
-kind, rebinds it, and asserts attempt 2 is entered.
+Five compiler message classes are recognised: local shadowing, duplicate
+function, duplicate type declaration, duplicate constant, and duplicate import.
+The type class covers structs, sums, and resources. There is no sixth extern
+class: the compiler intentionally accepts repeated compatible extern declarations,
+so the AST-owned region-3 pre-resolution above owns extern replacement. An owner
+test pins all five strings and separately proves that an extern entry replaces in
+place.
 
 ### 3.6 Candidate name set: HIR delta ∩ entry-top-level
 
@@ -469,7 +475,8 @@ minus the CLI's PGO and `--cache-stats` branches. Consequences:
 - The `PackageCodegenError::StaleCacheEntry` retry (one rebuild with
   `UnitReuse::Forbidden`) is inherited rather than reimplemented.
 - `ALIGNC_CACHE` / `ALIGNC_JOBS` / `ALIGNC_LINKER` behave exactly as for
-  `alignc`; the REPL re-interprets none of them.
+  `alignc`; a positive `ALIGNC_JOBS` overrides the REPL default and a malformed
+  value fails startup.
 - A v1 session is always a **one-unit package** (N6), so the capability-library
   union degenerates to that unit's `link_libs`; V2c promotes the union helper.
 
@@ -557,7 +564,10 @@ the one case where the policy gives no ergonomic benefit; `:help` says so.
 **External side effects are never elided.** A session containing `fs.write(...)`
 writes the file again every entry. Stated in `:help` and in the `:save` header.
 
-`:out` reprints the last run's full captured output at any time.
+`:out` reprints the last run's full captured output when it fit the retention
+bound. Immediately after an over-cap run, the bytes have already been printed
+but are deliberately not retained; `:out` reports that bounded-retention case
+instead of claiming that nothing has run.
 
 ## 7. Profile: no deviation from `alignc`
 
@@ -585,7 +595,7 @@ are errors that do not touch the program. **Eleven commands** (`:save!` and
 | 6 | `:save <path>` / `:save! <path>` | Write the generated program plus a 3-line header (generated-by; the fixed `main` signature; the side-effect note), then print the `alignc build <path>` line. Path resolved against the process cwd; no `~` or variable expansion (there is no shell); the parent must exist; `:save` refuses an existing file, `:save!` overwrites. | `SaveError::{Exists, ParentMissing, Io}` |
 | 7 | `:undo` | Remove the most recent entry, restore the entry it replaced, or remove a whole split paste. Rebuild, re-run, reset the §6 baseline. | Empty session -> message. |
 | 8 | `:time [N]` / `:time! [N]` | Run the already-built binary N times with output discarded; report min/median/max plus the startup spawn floor. Does not recompile. N clamped to `1..=1000`, and the clamp is reported when it fires; if last-run-time × N exceeds 10 s, print the projection and require `:time!`. | `TimeRefusal::{NoBinary, Projected}` |
-| 9 | `:out` | Reprint the last successful run's full captured output. | Nothing run yet -> message. |
+| 9 | `:out` | Reprint the last successful run's full captured output when retained. | Nothing run yet, or the last run exceeded the retention bound -> distinct message. |
 | 10 | `:clear` | Drop every entry; reset to the empty program and the empty output baseline. The ordinal counter keeps its current value (ordinals are never reused). | — |
 | 11 | `:drop <ordinal>` | Remove one entry by ordinal. Rebuild and re-run; roll back if the result does not compile. | Unknown or removed ordinal -> message. |
 
@@ -635,9 +645,11 @@ crates/align_repl/
   tests/fixtures/      transcripts + .align goldens, READ AT RUNTIME (§10)
 ```
 
-Dependencies: `align_driver`, `align_sema`, `align_lexer`, `align_parser`,
-`align_ast`, `align_span`, `align_diag` — **all path deps already in the
-workspace. Zero new external crates.**
+Dependencies: `align_driver`, `align_runtime` (so a focused `cargo test -p
+align_repl` materializes the static archive its generated programs link),
+`align_sema`, `align_lexer`, `align_parser`, `align_ast`, `align_span`,
+`align_diag` — **all path deps already in the workspace. Zero new external
+crates.**
 
 The workspace's complete external set is `inkwell` + `llvm-sys`
 (`align_codegen_llvm`), `mimalloc` (`align_driver`), `memchr` + `regex` +
@@ -707,13 +719,13 @@ abandon.
 
 | id | Surface | Exact signature | Inputs / defaults | Ownership / alloc | Errors | Owner test |
 |---|---|---|---|---|---|---|
-| R1 | `Session::new` | `fn new(cfg: Config) -> Result<Session, StartupError>` | `Config { profile: Profile::Release, rt_lto: true, target: BuildTarget::Baseline, jobs: available_parallelism(), memo_budget_bytes: 256<<20, time_default_n: 10, output_cap_bytes: 8<<20 }` | Owns the `ArtifactStage`, the entry `Vec`, and the retained `Checked`. | `StartupError::{BackendUnavailable, RuntimeArchiveStale(String), Stage(io::Error), FloorBuild(String)}` — `RuntimeArchiveStale` is a real failure (`libalign_runtime.a is stale: … run cargo build`) a library consumer hits exactly as `alignc` does; reported once at startup with the driver's own message. | `session.rs::startup_creates_and_removes_stage` |
+| R1 | `Session::new` | `fn new(cfg: Config) -> Result<Session, StartupError>` | `Config { profile: Profile::Release, rt_lto: true, target: BuildTarget::Baseline, jobs: 1 on aarch64 and available_parallelism() otherwise (a positive ALIGNC_JOBS overrides either), memo_budget_bytes: 256<<20, time_default_n: 10, output_cap_bytes: 8<<20 }` | Owns the `ArtifactStage`, the entry `Vec`, and the retained HIR. | `StartupError::{BackendUnavailable, InvalidJobs(String), RuntimeArchiveStale(String), Stage(io::Error), FloorBuild(String)}` — `RuntimeArchiveStale` is a real failure (`libalign_runtime.a is stale: … run cargo build`) a library consumer hits exactly as `alignc` does; reported once at startup with the driver's own message. | `session.rs::startup_creates_and_removes_stage` |
 | R2 | `Session::feed` | `fn feed(&mut self, line: &str) -> Feed` | one raw input line | borrows | — | `session.rs::continuation_*` |
 | R3 | `Feed` | `enum Feed { NeedMore, Ready(Outcome) }` | — | owned | — | — |
 | R4 | `Session::submit` | `fn submit(&mut self, entry: &str) -> Outcome` | a complete entry | transactional (§3.7.2) | see `Outcome` | the whole `session.rs` matrix |
 | R5 | `Outcome` | `enum Outcome { NoOp, Applied { ordinals: Vec<u32>, replaced: Vec<u32>, echo: Echo, out: RunOutput }, CompileFailed { rendered: String, replacing: Vec<u32> }, RegionConflict { name: String, ordinal: u32 }, RanAndFailed { status: ExitStatus, out: RunOutput }, Command(CmdResult) }` | — | owned | — | — |
-| R6 | `Echo` | `enum Echo { None, Printed, TypeOnly { rendered: String }, ResultBound { rendered: String } }` | `ResultBound` is §3.4 case 3 and drives the `note:` line | owned | — | `session.rs::echo_matrix` |
-| R7 | `RunOutput` | `struct RunOutput { stdout_shown: String, stderr_shown: String, diverged: bool, truncated: bool }` | `*_shown` is the suffix or the full text per §6 | owned | — | `session.rs::output_matrix` |
+| R6 | `Echo` | `enum Echo { None, Printed, TypeOnly { rendered: String }, ResultBound { rendered: String } }`; `fn render(&self) -> Option<String>` | `ResultBound` is §3.4 case 3 and drives the `note:` line | owned | — | `session.rs::echo_matrix` |
+| R7 | `RunOutput` | `struct RunOutput { stdout_shown: String, stderr_shown: String, diverged: bool, truncated: bool }` | `*_shown` is the suffix or the full text per §6 | owned | — | `build.rs::output_matrix` plus session replacement/removal owners |
 | R8 | `Session::render` | `fn render(&self) -> String` | — | owned; the exact bytes compiled and `:save`d | — | `session.rs::render_is_what_alignc_builds` |
 | R9 | `Session::entries` | `fn entries(&self) -> &[Entry]` | — | borrow | — | — |
 | R10 | `Entry` | `struct Entry { ordinal: u32, region: Region, kind: EntryKind, text: String, emitted: String, names: Vec<String>, paste_group: Option<u32> }`; `enum Region { Import, Const, Decl, Main }`; `enum EntryKind { Import, Decl, Const, Statement, Printed, ResultBound }` | `text` is what the user typed; `emitted` is what §3.4 splices — identical except for a `print(…)` / `_ := (…)` wrapper | owned | — | `entry.rs` classification matrix |
@@ -722,12 +734,14 @@ abandon.
 | R13 | `Timing` | `struct Timing { n: u32, clamped_from: Option<u32>, min_ms: f64, median_ms: f64, max_ms: f64, floor_ms: f64 }` | — | Copy | — | — |
 | R14 | `Session::save` | `fn save(&self, path: &Path, force: bool) -> Result<(), SaveError>` | §8 row 6 path rules | — | `SaveError::{Exists, ParentMissing, Io}` | `session.rs::save_path_rules`, `e2e.rs::saved_file_builds_with_alignc` |
 | R15 | `Session::undo` / `drop_entry` | `fn undo(&mut self) -> Outcome`; `fn drop_entry(&mut self, ordinal: u32) -> Outcome` | `undo` reverses a replacement or a whole paste group | transactional | — | `session.rs::undo_restores_a_replaced_entry`, `::drop_by_ordinal` |
+| R16 | command-facing `Session` helpers | `fn continuing(&self) -> bool`; `fn add_const(&mut self, text: &str) -> Outcome`; `fn listing(&self) -> String`; `fn clear(&mut self) -> Outcome`; `fn last_output(&self) -> Option<String>`; `fn last_output_was_truncated(&self) -> bool` | Direct backing for the eleven binary commands; no second state machine | borrows or returns owned reports | compiler diagnostics through `Outcome`; bounded-output status is distinct from never-run | command and session matrices |
+| R17 | `cmd` module | `enum Command`; `enum CmdResult { Message(String) }`; `fn parse(&str) -> Option<Command>`; `const HELP: &str` | Binary parser and help text for §8; public because the binary is a separate crate in the package | owned command arguments | malformed and unknown forms become `Command::Unknown` | `cmd.rs::command_table_covers_the_v1_surface_and_errors` |
 
 ### `align-repl` binary surface
 
 | id | Contract |
 |---|---|
-| B1 | `align-repl`, no positional arguments, `--help` / `--version` only. **No environment variable of its own.** `ALIGNC_CACHE` / `ALIGNC_JOBS` / `ALIGNC_LINKER` are read by `align_driver` exactly as for `alignc` and are not re-interpreted. |
+| B1 | `align-repl`, no positional arguments, `--help` / `--version` only. **No environment variable of its own.** It honors the same `ALIGNC_CACHE` / `ALIGNC_JOBS` / `ALIGNC_LINKER` contracts as `alignc`; `ALIGNC_JOBS` overrides the architecture default before the shared driver build calls receive the resolved count. |
 | B2 | `align> ` primary prompt, `...   ` continuation, both on **stdout**; diagnostics on **stderr**; program output forwarded to the matching stream. Non-tty stdin suppresses the prompt. |
 | B3 | Exit 0 on `:quit`/EOF; 1 on a `StartupError`. Never propagates the program's exit code (N8). Ctrl-C: §8.10. |
 | B4 | Exactly one `ArtifactStage`, removed on normal exit and on panic, **not** on signal death. Writes to the user's cwd only via `:save`. |
@@ -758,17 +772,17 @@ semantics. `docs/guide/` gains a REPL page in v2 with its `ja/` mirror.
 
 | Axis | Cells | Closed by |
 |---|---|---|
-| **Synthetic-code consumption** — every path on which the REPL emits text the user did not type | `print(E)` where E is: a Copy local; a **Move local** (`box`) — next entry must still use it; a `.field` of a Move struct; an owned `string` (borrowed, not consumed); a call returning a temporary. `_ := (E)` where E is: a fallible **call** (nothing named, no consumption); a **Result-typed place expression** — next entry naming it **must** fail with `use of moved value`, and the echo **must** have printed the `note:` line. Verbatim `E` where E is: a bare Move local — next entry must still use it; a nested-scope binding. Plus the negative: **no other emission path exists** — asserted structurally by a test that walks every `Entry.emitted` in a scripted session and requires it to equal `text`, `print({text})`, or `_ := ({text})`. | `session.rs::synthetic_consumption_matrix`, `::emitted_forms_are_exhaustive` |
+| **Synthetic-code consumption** — every path on which the REPL emits text the user did not type | `print(E)` where E is: a Copy local; a **Move local** (owned `string`) — next entry must still use it; a `.field` of a Move struct; a call returning a temporary. (`box` cannot be a cross-entry local because N11's arena scope cannot span entries.) `_ := (E)` where E is: a fallible **call** (nothing named, no consumption); a **Result-typed place expression** — next entry naming it **must** fail with `use of moved value`, and the echo **must** have printed the `note:` line. Verbatim `E` where E is: a bare Move aggregate — next entry must still use it; a nested-scope binding. Plus the negative: **no other emission path exists** — asserted structurally by a test that walks every `Entry.emitted` in a scripted session and requires it to equal `text`, `print({text})`, or `_ := ({text})`. | `session.rs::synthetic_consumption_matrix`, `::emitted_forms_are_exhaustive` |
 | Classification (§3.3) | **step 0:** blank line, whitespace-only, comment-only, comment-then-blank — each a NO-OP that does **not** rebuild or re-run. keyword-first: `import` / `fn` / `extern` / `resource`. step 2 statement-only: `print(1)`, `x := 1`, `mut x := 1`, `x = 2`, `xs[0] = 1`, `p.f = 1`, `return`, `break`, `if`/`match`/`loop`/`arena`. step 3 decl-only: `P { a: slice<u8> }`, `P { a: array<i64>[3] }`. step 4 routing: `P { a: i64 }` with `P` undeclared -> DECL; `P { a: x }` with `x` a live local -> MAIN; both-non-dup-error -> MAIN + MAIN's diagnostics. **step 4 duplicate-tolerance — the traced cells:** (a) `x := 2` rebinding an existing local -> **MAIN**, then §3.5.1 replaces in place and the value changes on re-run; (b) `T { a: i64 }` redeclaring an existing struct -> **DECL**, then §3.5.1 replaces the type in place; (b′) the same with a sum, `S { A, B }`; (c) `Point{x: a, y: b}` with `Point` declared and `a`/`b` undefined -> **DECL**, §3.5.1 attempt 2 fails with `unknown type: 'a'` and the entry **rolls back with the replaced-ordinal note**; (c′) the same text after `a` and `b` exist as locals -> **MAIN, clean**. **overlap determinism:** MAIN-clean ∧ DECL-dup-only (`P { a: x }` with `x` both a type and a local) -> MAIN by first-wins; MAIN-dup-only ∧ DECL-clean asserted **unreachable**; both-clean asserted **impossible**. **threshold pinning:** step 4 rejects on one non-dup error while §3.5.1 attempt 1 accepts on one dup error — both thresholds asserted so collapsing them to one predicate fails. unparseable text. | `entry.rs` parameterized table, `session.rs::step4_duplicate_routing`, `::step4_overlap_determinism`, `::duplicate_thresholds_differ` |
 | Echo (§3.4) | P-clean printable (int, float, bool, char, `str`, owned `string`); P-fails/S-clean aggregate (struct, sum, tuple, array, slice, `Option`, `box`); S-clean statement-position non-expression (no echo); S-fails-with-`unhandled Result` -> D accepted, with the `note:` line; S-fails otherwise -> S's diagnostics, rollback; `Ty::Error` after a failed check | `session.rs::echo_matrix` |
 | Mixed paste (§3.7.1) | import + fn; two fns; import already present (dedup, ordinal preserved); second item fails (whole paste rolls back); `:undo` after a paste | `session.rs::paste_matrix` |
 | Name delta (§3.6) | `x := 1`; `mut x := 1`; `(a, b) := t`; `(a, _) := t` contributes exactly `a` (the `_` element is `None` in `LetTuple::locals` and creates no `Local`); two `_ := (…)` entries in one session coexist and contribute no names; `fn f`; struct; sum; resource; extern symbol; `:const`; multi-item paste; `$lambda` lifted fn excluded; `arena { p := … }` entry's `p` excluded by the entry-top-level filter, and a later `p := 9` must NOT displace it; `link_libs` never treated as a namespace | `session.rs::name_delta_matrix`, asserting the delta directly |
-| Replacement (§3.5) | binding replaces binding; `mut` binding replaces binding; tuple binding replaces two; fn replaces fn; type replaces type; extern replaces extern; `:const` replaces `:const`; no collision -> append; `fn f` does NOT displace local `f`; type `P` does NOT displace local `P`; region-2 constant vs region-4 local -> `RegionConflict`, nothing removed; replacement whose RHS references a later ordinal (fails + rolls back); replacement of an entry a later entry reads (re-runs with the new value); §3.5.1 attempt-2 trigger with **one** duplicate error among several; attempt 2 with empty `N`; all six duplicate message classes recognised, one per creatable entity | `session.rs::replacement_matrix`, `::duplicate_message_classes_are_complete` |
+| Replacement (§3.5) | binding replaces binding; `mut` binding replaces binding; tuple binding replaces two; fn replaces fn; type replaces type; extern replaces extern through the AST-owned region-3 path; `:const` replaces `:const`; no collision -> append; `fn f` does NOT displace local `f`; type `P` does NOT displace local `P`; region-2 constant vs region-4 local -> `RegionConflict`, nothing removed; replacement whose RHS references a later ordinal (fails + rolls back); replacement of an entry a later entry reads (re-runs with the new value); §3.5.1 attempt-2 trigger with **one** duplicate error among several; attempt 2 with empty `N`; all five emitted duplicate message classes recognised | `session.rs::replacement_matrix`, `::duplicate_message_classes_are_complete` |
 | Ordinals (§3.7) | monotonic; gap after replacement / `:undo` / `:drop`; `:list` shows gaps and regions; `:clear` does not reset the counter | `session.rs::ordinal_matrix` |
 | Rollback (§3.7.2) | failure at §3.3 step 4, §3.4 cases 1/2/3/4, §3.5.1 attempts 1 and 2; lowering, codegen, and link failure; each leaves entries, ordinals, `render()`, retained HIR, and the output baseline byte-identical | `session.rs::rollback_is_total` |
 | Execution failure | exit 0; non-zero exit; abort (bounds check); abort (invalid integer division); killed by signal | `session.rs::runtime_failure_keeps_the_entry` |
-| Output (§6) | first run; pure-suffix growth; divergence via replaced binding; divergence via nondeterminism; empty; stderr-only; both streams; over-cap truncation + notice; after `:undo` / `:drop` / `:clear` | `session.rs::output_matrix` |
-| Build path (§4.1) | the rendered source builds through `build_package` + `codegen_package_parallel` + `link_objects`, and **the emitted object is byte-identical** to `alignc build`'s object for the `:save`d file; `ALIGNC_CACHE=off` works; a poisoned entry takes the `StaleCacheEntry` retry; an accepted entry's build frontend is an in-process memo **hit** (asserted via `MemoStats`) | `e2e.rs::repl_object_matches_alignc_build`, `::cache_off`, `::stale_entry_retry`, `session.rs::accepted_build_hits_the_memo` |
+| Output (§6) | first run; pure-suffix growth; divergence via replaced binding; divergence via nondeterminism; empty; stderr-only; both streams; over-cap truncation + notice; after `:undo` / `:drop` / `:clear` | `build.rs::output_matrix`, session replacement/removal owners |
+| Build path (§4.1) | the rendered source builds through `build_package` + `codegen_package_parallel` + `link_objects`, and **the emitted object is byte-identical** to `alignc build`'s object for the `:save`d file; `ALIGNC_CACHE=off` works; a poisoned entry takes the `StaleCacheEntry` retry; an accepted entry's build frontend is an in-process memo **hit** (asserted via `MemoStats`) | `build.rs::repl_object_matches_the_alignc_build_path`, `e2e.rs::cache_off_still_builds_and_runs`, `::saved_file_builds_with_the_real_alignc_binary`, `session.rs::accepted_build_reuses_the_candidate_frontend` |
 | main signature | zero fallible ops; `?` present; `?` introduced then undone; `Ok(())` tail always present | `session.rs::main_signature_is_constant` |
 | Commands | each of the eleven plus each error branch plus unknown `:foo`; `:time` clamp and projection refusal; `:save` path rules; `:help` mentions N11 | `cmd.rs` table test |
 | Stage lifetime | normal exit; `:quit`; EOF; panic mid-build; two concurrent sessions get distinct dirs; L2's "removes only its own" | `session.rs::stage_matrix`, `align_driver` L2 unit test |

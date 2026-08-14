@@ -6354,3 +6354,84 @@ mod walk_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+/// A process-private staging directory, shared by every artifact producer in this workspace.
+///
+/// Lives in the library rather than in `alignc`'s binary crate because a library consumer needs it
+/// too: `align-repl` stages one session's source, object, and executable exactly the way `alignc`
+/// stages a build (`docs/impl/22-repl-plan.md` §11 L2). A second copy of this directory-race
+/// protocol is a second place for it to drift.
+static ARTIFACT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A process-private staging directory. `create_dir` is the atomic claim: a stale or racing path is
+/// skipped, and Drop removes only the directory this invocation successfully created.
+pub struct ArtifactStage {
+    dir: std::path::PathBuf,
+}
+
+impl ArtifactStage {
+    pub fn in_dir(parent: &std::path::Path, label: &str) -> std::io::Result<Self> {
+        let parent = std::fs::canonicalize(parent)?;
+        for _ in 0..1024 {
+            let nonce = ARTIFACT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let dir = parent.join(format!(".{label}-{}-{stamp}-{nonce}", std::process::id()));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => return Ok(Self { dir }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not create a unique artifact staging directory",
+        ))
+    }
+
+    pub fn temp(label: &str) -> std::io::Result<Self> {
+        Self::in_dir(&std::env::temp_dir(), label)
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.dir
+    }
+}
+
+impl Drop for ArtifactStage {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[cfg(test)]
+mod artifact_stage_tests {
+    use super::ArtifactStage;
+
+    #[test]
+    fn concurrent_stages_are_distinct_and_remove_only_their_own_directory() {
+        let left = std::thread::spawn(|| ArtifactStage::temp("align-stage-owner-test"));
+        let right = std::thread::spawn(|| ArtifactStage::temp("align-stage-owner-test"));
+        let left = left
+            .join()
+            .unwrap_or_else(|_| panic!("left stage thread panicked"))
+            .unwrap_or_else(|error| panic!("create left stage: {error}"));
+        let right = right
+            .join()
+            .unwrap_or_else(|_| panic!("right stage thread panicked"))
+            .unwrap_or_else(|error| panic!("create right stage: {error}"));
+        let left_path = left.path().to_path_buf();
+        let right_path = right.path().to_path_buf();
+        assert_ne!(left_path, right_path);
+        assert!(left_path.is_dir());
+        assert!(right_path.is_dir());
+
+        drop(left);
+        assert!(!left_path.exists());
+        assert!(right_path.is_dir());
+        drop(right);
+        assert!(!right_path.exists());
+    }
+}

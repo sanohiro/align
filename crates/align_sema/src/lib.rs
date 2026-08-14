@@ -26327,156 +26327,10 @@ impl<'a, 't> Checker<'a, 't> {
     /// in type-mismatch diagnostics so a user sees `Error`, not `enum#0`. An explicit token worklist
     /// renders composite payloads (a `Result<i32, Error>` shows `Error`, not `enum#0`) without using
     /// the process stack.
+    /// Render `ty` with this checker's tables. The implementation is the free
+    /// [`ty_display`], shared with external consumers so there is one renderer.
     fn ty_display(&self, ty: Ty) -> String {
-        enum Work {
-            Type(Ty),
-            Text(String),
-            ExitTagged(u32),
-        }
-
-        let mut work = vec![Work::Type(ty)];
-        let mut output = String::new();
-        let mut active_tagged = HashSet::new();
-        while let Some(item) = work.pop() {
-            match item {
-                Work::Text(text) => output.push_str(&text),
-                Work::ExitTagged(id) => {
-                    active_tagged.remove(&id);
-                }
-                Work::Type(ty) => match ty {
-                    Ty::Struct(id) => output.push_str(
-                        &self
-                            .structs
-                            .get(id as usize)
-                            .map(|definition| definition.source_name.clone())
-                            .unwrap_or_else(|| ty_name(ty)),
-                    ),
-                    Ty::Enum(id) => output.push_str(
-                        &self
-                            .enums
-                            .get(id as usize)
-                            .map(|definition| definition.source_name.clone())
-                            .unwrap_or_else(|| ty_name(ty)),
-                    ),
-                    Ty::Tagged(id) => {
-                        if active_tagged.insert(id) {
-                            work.push(Work::ExitTagged(id));
-                            work.push(Work::Type(expand_tagged_ty(
-                                Ty::Tagged(id),
-                                self.tagged_types,
-                            )));
-                        } else {
-                            output.push_str(&ty_name(ty));
-                        }
-                    }
-                    Ty::Option(payload) => {
-                        work.push(Work::Text(">".to_string()));
-                        work.push(Work::Type(scalar_to_ty(payload)));
-                        work.push(Work::Text("Option<".to_string()));
-                    }
-                    Ty::Result(ok, err) => {
-                        work.push(Work::Text(">".to_string()));
-                        work.push(Work::Type(scalar_to_ty(err)));
-                        work.push(Work::Text(", ".to_string()));
-                        work.push(Work::Type(scalar_to_ty(ok)));
-                        work.push(Work::Text("Result<".to_string()));
-                    }
-                    Ty::Box(payload) => {
-                        work.push(Work::Text(">".to_string()));
-                        work.push(Work::Type(scalar_to_ty(payload)));
-                        work.push(Work::Text("box<".to_string()));
-                    }
-                    Ty::Task(payload) => {
-                        work.push(Work::Text(">".to_string()));
-                        work.push(Work::Type(scalar_to_ty(payload)));
-                        work.push(Work::Text("Task<".to_string()));
-                    }
-                    Ty::Array(payload, len) => {
-                        work.push(Work::Text(format!(">[{len}]")));
-                        work.push(Work::Type(scalar_to_ty(payload)));
-                        work.push(Work::Text("array<".to_string()));
-                    }
-                    Ty::Slice(payload) => {
-                        work.push(Work::Text(">".to_string()));
-                        work.push(Work::Type(scalar_to_ty(payload)));
-                        work.push(Work::Text("slice<".to_string()));
-                    }
-                    Ty::DynArray(payload) => {
-                        work.push(Work::Text(">".to_string()));
-                        work.push(Work::Type(scalar_to_ty(payload)));
-                        work.push(Work::Text("array<".to_string()));
-                    }
-                    Ty::ArrayBuilder(element) => {
-                        work.push(Work::Text(">".to_string()));
-                        work.push(Work::Type(scalar_to_ty(element)));
-                        work.push(Work::Text("array_builder<".to_string()));
-                    }
-                    ty if let Some(element) = ty.array_builder_element() => {
-                        work.push(Work::Text(">".to_string()));
-                        work.push(Work::Type(element.ty()));
-                        work.push(Work::Text("array_builder<".to_string()));
-                    }
-                    ty if let Some(element) = ty.dyn_aggregate_array_element() => {
-                        work.push(Work::Text(">".to_string()));
-                        work.push(Work::Type(element.ty()));
-                        work.push(Work::Text("array<".to_string()));
-                    }
-                    Ty::StructArray(id, len) => {
-                        work.push(Work::Text(format!(">[{len}]")));
-                        work.push(Work::Type(Ty::Struct(id)));
-                        work.push(Work::Text("array<".to_string()));
-                    }
-                    Ty::DynStructArray(id, _) => {
-                        work.push(Work::Text(">".to_string()));
-                        work.push(Work::Type(Ty::Struct(id)));
-                        work.push(Work::Text("array<".to_string()));
-                    }
-                    Ty::Soa(id) => {
-                        work.push(Work::Text(">".to_string()));
-                        work.push(Work::Type(Ty::Struct(id)));
-                        work.push(Work::Text("soa<".to_string()));
-                    }
-                    Ty::SoaParam(index) => {
-                        work.push(Work::Text(">".to_string()));
-                        work.push(Work::Type(Ty::Param(index)));
-                        work.push(Work::Text("soa<".to_string()));
-                    }
-                    Ty::JsonScanner(id) => {
-                        work.push(Work::Text(">".to_string()));
-                        work.push(Work::Type(Ty::Struct(id)));
-                        work.push(Work::Text("json.scanner<".to_string()));
-                    }
-                    Ty::DictEncoded(id, _) => {
-                        work.push(Work::Text(">".to_string()));
-                        work.push(Work::Type(Ty::Struct(id)));
-                        work.push(Work::Text("dict_encoded<".to_string()));
-                    }
-                    Ty::Tuple(id) => {
-                        let Some(definition) = self.tuples.get(id as usize) else {
-                            output.push_str(&ty_name(ty));
-                            continue;
-                        };
-                        output.push('(');
-                        work.push(Work::Text(")".to_string()));
-                        for (index, &element) in definition.elems.iter().enumerate().rev() {
-                            work.push(Work::Type(scalar_to_ty(element)));
-                            if index > 0 {
-                                work.push(Work::Text(", ".to_string()));
-                            }
-                        }
-                    }
-                    Ty::Param(index) => output.push_str(
-                        self.type_params
-                            .get(index as usize)
-                            .map(String::as_str)
-                            .unwrap_or("<unknown type parameter>"),
-                    ),
-                    // No id (primitives), or no source name to resolve (fn#) — the free form is fine.
-                    _ => output.push_str(&ty_name(ty)),
-                },
-            }
-        }
-        output
+        ty_display(ty, self.structs, self.enums, self.tagged_types, self.tuples, &self.type_params)
     }
 
     /// Constrain `ty` to an expected type if one is given.
@@ -44438,6 +44292,174 @@ pub enum PrintKind {
     Str,
 }
 
+/// Render `ty` using the owning tables' source names — `Point` rather than `struct#3`.
+///
+/// The one type renderer. `Checker::ty_display` delegates here so a diagnostic and an external
+/// consumer (`align-repl`'s `:type` and value echo, `docs/impl/22-repl-plan.md` §11 L1) can never
+/// drift into two spellings of the same type.
+///
+/// `type_params` names the enclosing generic function's `<...>` list, for [`Ty::Param`]. A caller
+/// with no generic context in scope passes `&[]`, and a `Param` then renders as
+/// `<unknown type parameter>` rather than as a wrong name — which is correct for any consumer
+/// reading types out of a *checked* function, since monomorphization substitutes every `Param`
+/// before HIR is published.
+pub fn ty_display(
+    ty: Ty,
+    structs: &[hir::StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+    tuples: &[hir::TupleDef],
+    type_params: &[String],
+) -> String {
+    enum Work {
+        Type(Ty),
+        Text(String),
+        ExitTagged(u32),
+    }
+
+    let mut work = vec![Work::Type(ty)];
+    let mut output = String::new();
+    let mut active_tagged = HashSet::new();
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Text(text) => output.push_str(&text),
+            Work::ExitTagged(id) => {
+                active_tagged.remove(&id);
+            }
+            Work::Type(ty) => match ty {
+                Ty::Struct(id) => output.push_str(
+                    &structs
+                        .get(id as usize)
+                        .map(|definition| definition.source_name.clone())
+                        .unwrap_or_else(|| ty_name(ty)),
+                ),
+                Ty::Enum(id) => output.push_str(
+                    &enums
+                        .get(id as usize)
+                        .map(|definition| definition.source_name.clone())
+                        .unwrap_or_else(|| ty_name(ty)),
+                ),
+                Ty::Tagged(id) => {
+                    if active_tagged.insert(id) {
+                        work.push(Work::ExitTagged(id));
+                        work.push(Work::Type(expand_tagged_ty(
+                            Ty::Tagged(id),
+                            tagged_types,
+                        )));
+                    } else {
+                        output.push_str(&ty_name(ty));
+                    }
+                }
+                Ty::Option(payload) => {
+                    work.push(Work::Text(">".to_string()));
+                    work.push(Work::Type(scalar_to_ty(payload)));
+                    work.push(Work::Text("Option<".to_string()));
+                }
+                Ty::Result(ok, err) => {
+                    work.push(Work::Text(">".to_string()));
+                    work.push(Work::Type(scalar_to_ty(err)));
+                    work.push(Work::Text(", ".to_string()));
+                    work.push(Work::Type(scalar_to_ty(ok)));
+                    work.push(Work::Text("Result<".to_string()));
+                }
+                Ty::Box(payload) => {
+                    work.push(Work::Text(">".to_string()));
+                    work.push(Work::Type(scalar_to_ty(payload)));
+                    work.push(Work::Text("box<".to_string()));
+                }
+                Ty::Task(payload) => {
+                    work.push(Work::Text(">".to_string()));
+                    work.push(Work::Type(scalar_to_ty(payload)));
+                    work.push(Work::Text("Task<".to_string()));
+                }
+                Ty::Array(payload, len) => {
+                    work.push(Work::Text(format!(">[{len}]")));
+                    work.push(Work::Type(scalar_to_ty(payload)));
+                    work.push(Work::Text("array<".to_string()));
+                }
+                Ty::Slice(payload) => {
+                    work.push(Work::Text(">".to_string()));
+                    work.push(Work::Type(scalar_to_ty(payload)));
+                    work.push(Work::Text("slice<".to_string()));
+                }
+                Ty::DynArray(payload) => {
+                    work.push(Work::Text(">".to_string()));
+                    work.push(Work::Type(scalar_to_ty(payload)));
+                    work.push(Work::Text("array<".to_string()));
+                }
+                Ty::ArrayBuilder(element) => {
+                    work.push(Work::Text(">".to_string()));
+                    work.push(Work::Type(scalar_to_ty(element)));
+                    work.push(Work::Text("array_builder<".to_string()));
+                }
+                ty if let Some(element) = ty.array_builder_element() => {
+                    work.push(Work::Text(">".to_string()));
+                    work.push(Work::Type(element.ty()));
+                    work.push(Work::Text("array_builder<".to_string()));
+                }
+                ty if let Some(element) = ty.dyn_aggregate_array_element() => {
+                    work.push(Work::Text(">".to_string()));
+                    work.push(Work::Type(element.ty()));
+                    work.push(Work::Text("array<".to_string()));
+                }
+                Ty::StructArray(id, len) => {
+                    work.push(Work::Text(format!(">[{len}]")));
+                    work.push(Work::Type(Ty::Struct(id)));
+                    work.push(Work::Text("array<".to_string()));
+                }
+                Ty::DynStructArray(id, _) => {
+                    work.push(Work::Text(">".to_string()));
+                    work.push(Work::Type(Ty::Struct(id)));
+                    work.push(Work::Text("array<".to_string()));
+                }
+                Ty::Soa(id) => {
+                    work.push(Work::Text(">".to_string()));
+                    work.push(Work::Type(Ty::Struct(id)));
+                    work.push(Work::Text("soa<".to_string()));
+                }
+                Ty::SoaParam(index) => {
+                    work.push(Work::Text(">".to_string()));
+                    work.push(Work::Type(Ty::Param(index)));
+                    work.push(Work::Text("soa<".to_string()));
+                }
+                Ty::JsonScanner(id) => {
+                    work.push(Work::Text(">".to_string()));
+                    work.push(Work::Type(Ty::Struct(id)));
+                    work.push(Work::Text("json.scanner<".to_string()));
+                }
+                Ty::DictEncoded(id, _) => {
+                    work.push(Work::Text(">".to_string()));
+                    work.push(Work::Type(Ty::Struct(id)));
+                    work.push(Work::Text("dict_encoded<".to_string()));
+                }
+                Ty::Tuple(id) => {
+                    let Some(definition) = tuples.get(id as usize) else {
+                        output.push_str(&ty_name(ty));
+                        continue;
+                    };
+                    output.push('(');
+                    work.push(Work::Text(")".to_string()));
+                    for (index, &element) in definition.elems.iter().enumerate().rev() {
+                        work.push(Work::Type(scalar_to_ty(element)));
+                        if index > 0 {
+                            work.push(Work::Text(", ".to_string()));
+                        }
+                    }
+                }
+                Ty::Param(index) => output.push_str(
+                    type_params
+                        .get(index as usize)
+                        .map(String::as_str)
+                        .unwrap_or("<unknown type parameter>"),
+                ),
+                // No id (primitives), or no source name to resolve (fn#) — the free form is fine.
+                _ => output.push_str(&ty_name(ty)),
+            },
+        }
+    }
+    output
+}
+
 /// The [`PrintKind`] of `ty`, or `None` when it is not printable (`print` / a `template` hole then
 /// reports a sema error; nothing unprintable reaches MIR).
 pub fn print_kind(ty: Ty) -> Option<PrintKind> {
@@ -53243,5 +53265,48 @@ fn exit_branch(flag: bool) -> i64 {
             .expect("spawn deep JSON descriptor owner")
             .join()
             .expect("deep JSON descriptor owner");
+    }
+
+    #[test]
+    fn public_ty_display_covers_repl_shapes() {
+        let i64_ty = Ty::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        let i64_scalar = ty_to_scalar(i64_ty).unwrap_or_else(|| panic!("i64 is scalar"));
+        let u8_scalar = ty_to_scalar(Ty::Int(IntTy {
+            bits: 8,
+            signed: false,
+        }))
+        .unwrap_or_else(|| panic!("u8 is scalar"));
+        let structs = vec![hir::StructDef {
+            name: "unit$Point".to_string(),
+            source_name: "Point".to_string(),
+            fields: vec![],
+            align: None,
+            c_repr: false,
+        }];
+        let enums = vec![hir::EnumDef {
+            name: "unit$Error".to_string(),
+            source_name: "Error".to_string(),
+            variants: vec![],
+        }];
+        let tagged_types = vec![
+            hir::TaggedType::Result(i64_scalar, Scalar::Enum(0)),
+            hir::TaggedType::Option(Scalar::Tagged(1)),
+        ];
+        let tuples = vec![hir::TupleDef {
+            elems: vec![i64_scalar, Scalar::Bool],
+        }];
+        let render = |ty| ty_display(ty, &structs, &enums, &tagged_types, &tuples, &[]);
+
+        assert_eq!(render(Ty::Struct(0)), "Point");
+        assert_eq!(render(Ty::Enum(0)), "Error");
+        assert_eq!(render(Ty::Option(Scalar::Tagged(0))), "Option<Result<i64, Error>>");
+        assert_eq!(render(Ty::Array(i64_scalar, 3)), "array<i64>[3]");
+        assert_eq!(render(Ty::Slice(u8_scalar)), "slice<u8>");
+        assert_eq!(render(Ty::Tuple(0)), "(i64, bool)");
+        assert_eq!(render(Ty::Param(0)), "<unknown type parameter>");
+        assert_eq!(render(Ty::Tagged(1)), "Option<<nested tagged type>>");
     }
 }
