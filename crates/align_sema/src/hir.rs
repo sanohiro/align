@@ -1279,6 +1279,8 @@ pub enum ExprKind {
     /// `command` is a bound [`crate::Ty::Command`] local; `ns` is a borrowed `i64`. `ns == 0` means no
     /// timeout (the Slice-4 default); a negative `ns` aborts at runtime (like a bad `cwd` path). Impure.
     CommandTimeout { command: Box<Expr>, ns: Box<Expr> },
+    /// `c.max_capture_bytes(limit)` — persist a per-stream capture bound. Impure.
+    CommandMaxCapture { command: Box<Expr>, limit: Box<Expr> },
     /// `c.env(name, value)` (`std.process` Slice 6) — add or override one environment variable the child
     /// sees, in place (the child `setenv`s each recorded pair before `execvp`, overwrite=1), mutating the
     /// handle (not consumed — like [`CommandCwd`]). The `ty` is [`crate::Ty::Unit`]. `command` is a bound
@@ -1296,6 +1298,8 @@ pub enum ExprKind {
     /// [`ChildWait`]). A `pipe`/`fork` failure or non-UTF-8 captured output is `Err`; a `chdir`/`execvp`
     /// failure in the child surfaces as exit code 127 in `out.code()` (not an `Err`). Impure.
     CommandRun { command: Box<Expr> },
+    /// `c.run_bytes()` — binary captured output, sharing the command capture engine. Impure.
+    CommandRunBytes { command: Box<Expr> },
     /// `out.code()` (`std.process` Slice 4) — the run's exit code (`i64`: `WEXITSTATUS` / `128+signal` /
     /// `127`). `out` is a bound [`crate::Ty::RunOutput`] local. Pure (reads the owned handle). The
     /// exit-code dual of [`HttpRespStatus`].
@@ -1307,6 +1311,12 @@ pub enum ExprKind {
     RunOutputStdout { out: Box<Expr> },
     /// The stderr sibling of [`RunOutputStdout`] (a `str` view into `out`'s captured stderr buffer).
     RunOutputStderr { out: Box<Expr> },
+    /// `run_bytes.code()` — Copy exit code read.
+    RunBytesCode { out: Box<Expr> },
+    /// `run_bytes.stdout()` — region-bound `slice<u8>` view.
+    RunBytesStdout { out: Box<Expr> },
+    /// `run_bytes.stderr()` — region-bound `slice<u8>` view.
+    RunBytesStderr { out: Box<Expr> },
     /// `encoding.base64_encode`/`base64url_encode`/`hex_encode(data)` — encode a byte view (`str` /
     /// owned `string` (auto-borrowed) / `slice<u8>`) into a freshly heap-allocated owned `string`
     /// (the `ty` is [`crate::Ty::String`]). `kind` selects the alphabet. Pure (a byte transform, no

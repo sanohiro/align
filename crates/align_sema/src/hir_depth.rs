@@ -529,6 +529,10 @@ fn walk_body_records<'a>(
                     command: lhs,
                     ns: rhs,
                 }
+                | ExprKind::CommandMaxCapture {
+                    command: lhs,
+                    limit: rhs,
+                }
                 | ExprKind::Compress {
                     data: lhs,
                     level: rhs,
@@ -749,9 +753,13 @@ fn walk_body_records<'a>(
                 | ExprKind::ChildWait { child: recv }
                 | ExprKind::CommandEnvClear { command: recv }
                 | ExprKind::CommandRun { command: recv }
+                | ExprKind::CommandRunBytes { command: recv }
                 | ExprKind::RunOutputCode { out: recv }
                 | ExprKind::RunOutputStdout { out: recv }
                 | ExprKind::RunOutputStderr { out: recv }
+                | ExprKind::RunBytesCode { out: recv }
+                | ExprKind::RunBytesStdout { out: recv }
+                | ExprKind::RunBytesStderr { out: recv }
                 | ExprKind::EncodingEncode { data: recv, .. }
                 | ExprKind::EncodingDecode { input: recv, .. }
                 | ExprKind::Utf8Valid { data: recv }

@@ -208,6 +208,8 @@ pub enum Scalar {
     /// region-tracked (a `run_output` borrows nothing; its `.stdout()`/`.stderr()` VIEWS are what
     /// region-bind to it). (There is no `Scalar::Command`: a `command` builder never rides an aggregate.)
     RunOutput,
+    /// Binary captured process output. Owned Move handle; its byte views borrow this owner.
+    RunBytes,
     /// A first-class **function value** payload (`Ty::Fn`, indexed into `Program.fn_types`). A
     /// sum-type variant may carry one — the `Handler { Respond(fn(Ctx) -> …), Stream(fn(Ctx, …) -> …) }`
     /// or-kind that lets pkg.web's stream and unary routes share one table. A fn value is a **Copy**
@@ -232,7 +234,7 @@ impl Scalar {
     /// the I/O handles `reader`/`writer`, a decoded `buffer`, a `cli parsed`, a `tcp_conn`, a
     /// `tcp_listener`, a `udp_socket`, or a package-defined resource.
     pub fn is_move(self) -> bool {
-        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::ResponseBuilder | Scalar::RunOutput | Scalar::Resource(_))
+        matches!(self, Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_) | Scalar::DynResponseArray | Scalar::Reader | Scalar::Writer | Scalar::Buffer | Scalar::Regex | Scalar::Captures | Scalar::CliParsed | Scalar::TcpConn | Scalar::TcpListener | Scalar::UdpSocket | Scalar::Child | Scalar::File | Scalar::HttpResponse | Scalar::HttpServer | Scalar::HttpRequestCtx | Scalar::HttpStream | Scalar::ResponseBuilder | Scalar::RunOutput | Scalar::RunBytes | Scalar::Resource(_))
     }
 }
 
@@ -624,6 +626,8 @@ pub enum Ty {
     /// #297). Rides `Result`'s Ok slot as [`Scalar::RunOutput`]. Impure to produce, pure to read. Opaque
     /// pointer.
     RunOutput,
+    /// Binary captured process output returned by `command.run_bytes()`.
+    RunBytes,
     /// An `http request` (`std.http`) — the request builder from `http.request(method, url)`. An
     /// owned **Move** handle (like `reader`/`writer`/`buffer`/`cli command`) owning its method / url /
     /// header list / body buffer, `Drop`-freed. `r.header(name, value)` / `r.body(data)` mutate it in
@@ -805,6 +809,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Ty::Child
         | Ty::Command
         | Ty::RunOutput
+        | Ty::RunBytes
         | Ty::HttpRequest
         | Ty::HttpResponse
         | Ty::HttpClient
@@ -860,6 +865,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Scalar::ResponseBuilder
         | Scalar::HttpStream
         | Scalar::RunOutput
+        | Scalar::RunBytes
         | Scalar::Fn { .. }
         | Scalar::Resource { .. }
         | Scalar::ResourceRef { .. } => {}
@@ -929,6 +935,7 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         // A `run_output` owned handle as the `Result` Ok payload of `c.run()` (std.process Slice 4).
         // (A `command` builder is never a payload — like `http request`, it has no `Scalar`, `None` here.)
         Ty::RunOutput => Some(Scalar::RunOutput),
+        Ty::RunBytes => Some(Scalar::RunBytes),
         // A `soa<Struct>` borrowed view can be a `Result`/`Option` payload (the `json.decode →
         // soa` result). Region-tracked, never dropped — like `Str`.
         Ty::Soa(id) => Some(Scalar::Soa(id)),
@@ -957,7 +964,7 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
 /// "any type": widening is exactly what a consumer needed, so no untested aggregate-return ABI is
 /// admitted by accident.
 pub fn fn_value_ret_ok(ty: Ty) -> bool {
-    fn_sig_scalar(ty).is_some() || matches!(ty, Ty::Result(..))
+    ty != Ty::RunBytes && (fn_sig_scalar(ty).is_some() || matches!(ty, Ty::Result(..)))
 }
 
 pub fn fn_sig_scalar(ty: Ty) -> Option<Scalar> {
@@ -1006,6 +1013,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::ResponseBuilder => Ty::ResponseBuilder,
         Scalar::HttpStream => Ty::HttpStream,
         Scalar::RunOutput => Ty::RunOutput,
+        Scalar::RunBytes => Ty::RunBytes,
         Scalar::Fn(fid) => Ty::Fn(fid),
     }
 }
@@ -1791,6 +1799,7 @@ pub fn drop_plan(
                         | Ty::HttpStream
                         | Ty::Command
                         | Ty::RunOutput
+                        | Ty::RunBytes
                         | Ty::DictEncoded(..)
                         | Ty::Resource(_)
                 ) =>
@@ -2779,6 +2788,7 @@ pub const BUILTIN_SPELLING_TYS: &[(&str, Ty)] = &[
     ("tcp_listener", Ty::TcpListener),
     ("udp_socket", Ty::UdpSocket),
     ("child", Ty::Child),
+    ("run_bytes", Ty::RunBytes),
     ("http_request_ctx", Ty::HttpRequestCtx),
     ("response_builder", Ty::ResponseBuilder),
     ("http_stream", Ty::HttpStream),
@@ -6667,6 +6677,13 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                 if matches!(r, Ty::Fn(_)) {
                     diags.error(
                         "returning a function value is not supported yet (a closure's environment is frame-local)".to_string(),
+                        t.span(),
+                    );
+                }
+                if r == Ty::RunBytes {
+                    diags.error(
+                        "run_bytes cannot be returned directly; return Result<run_bytes, Error> and keep run_bytes in its direct Ok slot"
+                            .to_string(),
                         t.span(),
                     );
                 }
@@ -12013,6 +12030,11 @@ impl EffectScan<'_> {
                 walk!(ns);
                 self.impure_direct = true;
             }
+            ExprKind::CommandMaxCapture { command, limit } => {
+                walk!(command);
+                walk!(limit);
+                self.impure_direct = true;
+            }
             // `c.read_timeout_ns(ns)` / `c.write_timeout_ns(ns)` do a `setsockopt` syscall — Impure,
             // like `c.timeout_ns(ns)` on a command (the conn is borrowed, the ns is Copy).
             ExprKind::TcpReadTimeout { conn, ns } | ExprKind::TcpWriteTimeout { conn, ns } => {
@@ -12030,11 +12052,14 @@ impl EffectScan<'_> {
                 walk!(command);
                 self.impure_direct = true;
             }
-            ExprKind::CommandRun { command } => {
+            ExprKind::CommandRun { command } | ExprKind::CommandRunBytes { command } => {
                 walk!(command);
                 self.impure_direct = true;
             }
             ExprKind::RunOutputCode { out } | ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
+                walk!(out);
+            }
+            ExprKind::RunBytesCode { out } | ExprKind::RunBytesStdout { out } | ExprKind::RunBytesStderr { out } => {
                 walk!(out);
             }
             // `std.encoding` transforms are pure byte computations (no I/O) — recurse into the view.
@@ -13923,6 +13948,7 @@ impl<'a> EscapeCheck<'a> {
             // not, so it is freely returnable. The view exprs get their region in `region_of`.
             | Ty::Command
             | Ty::RunOutput
+            | Ty::RunBytes
             | Ty::Error
             | Ty::Unit => {}
             }
@@ -15254,6 +15280,13 @@ impl<'a> EscapeCheck<'a> {
                     vec![(out, depth, None)],
                 );
             }
+            ExprKind::RunBytesStdout { out } | ExprKind::RunBytesStderr { out } => {
+                push_fold(
+                    &mut work,
+                    self.borrowed_storage_cap(out),
+                    vec![(out, depth, None)],
+                );
+            }
             // `ctx.method()`/`path()`/`body()`/`headers()` are the read-duals: `str` / `slice<u8>` /
             // header-table **views** into the `http_request_ctx` handle's owned buffer (freed at frame
             // exit), so — like the `resp.*` views above — they are `Frame`-regioned and bound to `ctx`
@@ -15659,6 +15692,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ProcessCommand { .. }
             | ExprKind::CommandCwd { .. }
             | ExprKind::CommandTimeout { .. }
+            | ExprKind::CommandMaxCapture { .. }
             // `c.read_timeout_ns` / `c.write_timeout_ns` produce `()` (a socket-option side effect) —
             // nothing borrows, so `Static` (like `c.cwd`/`c.timeout_ns`).
             | ExprKind::TcpReadTimeout { .. }
@@ -15666,7 +15700,9 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::CommandEnv { .. }
             | ExprKind::CommandEnvClear { .. }
             | ExprKind::CommandRun { .. }
+            | ExprKind::CommandRunBytes { .. }
             | ExprKind::RunOutputCode { .. }
+            | ExprKind::RunBytesCode { .. }
             | ExprKind::EncodingEncode { .. }
             | ExprKind::EncodingDecode { .. }
             | ExprKind::Utf8Valid { .. }
@@ -15781,6 +15817,15 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::BufferBytes { .. }
             | ExprKind::HttpRespBody { .. }
             | ExprKind::HttpCtxBody { .. } => return true,
+            // A byte view minted from a local or by-value `run_bytes` owner dies with this frame.
+            // A `borrow`/`borrow mut` parameter still belongs to the caller, however, so its view
+            // may be returned with that caller-side provenance (the same distinction made by
+            // `borrowed_storage_cap` in `region_of`).
+            ExprKind::RunBytesStdout { out } | ExprKind::RunBytesStderr { out } => {
+                if !self.borrowed_param_place(out) {
+                    return true;
+                }
+            }
             ExprKind::Local(p) if self.state.local_backed_slice.contains(p) => return true,
             ExprKind::Local(_) => {}
             ExprKind::Call { func, args, .. } => {
@@ -16036,15 +16081,18 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ProcessCommand { .. }
             | ExprKind::CommandCwd { .. }
             | ExprKind::CommandTimeout { .. }
+            | ExprKind::CommandMaxCapture { .. }
             // `c.read_timeout_ns`/`c.write_timeout_ns` produce `()`, never a slice — not local-backed.
             | ExprKind::TcpReadTimeout { .. }
             | ExprKind::TcpWriteTimeout { .. }
             | ExprKind::CommandEnv { .. }
             | ExprKind::CommandEnvClear { .. }
             | ExprKind::CommandRun { .. }
+            | ExprKind::CommandRunBytes { .. }
             | ExprKind::RunOutputCode { .. }
             | ExprKind::RunOutputStdout { .. }
             | ExprKind::RunOutputStderr { .. }
+            | ExprKind::RunBytesCode { .. }
             | ExprKind::EncodingEncode { .. }
             | ExprKind::EncodingDecode { .. }
             | ExprKind::Utf8Valid { .. }
@@ -17640,6 +17688,10 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(command, depth);
                 self.walk(ns, depth);
             }
+            ExprKind::CommandMaxCapture { command, limit } => {
+                self.walk(command, depth);
+                self.walk(limit, depth);
+            }
             // `c.read_timeout_ns` / `c.write_timeout_ns` borrow the conn in place (no escape) and take a
             // Copy `i64` — just recurse to check an escape *inside* the operands (like `CommandTimeout`).
             ExprKind::TcpReadTimeout { conn, ns } | ExprKind::TcpWriteTimeout { conn, ns } => {
@@ -17652,8 +17704,11 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(value, depth);
             }
             ExprKind::CommandEnvClear { command } => self.walk(command, depth),
-            ExprKind::CommandRun { command } => self.walk(command, depth),
+            ExprKind::CommandRun { command } | ExprKind::CommandRunBytes { command } => self.walk(command, depth),
             ExprKind::RunOutputCode { out } | ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
+                self.walk(out, depth)
+            }
+            ExprKind::RunBytesCode { out } | ExprKind::RunBytesStdout { out } | ExprKind::RunBytesStderr { out } => {
                 self.walk(out, depth)
             }
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.walk(data, depth),
@@ -20642,6 +20697,8 @@ impl<'a> MoveCheck<'a> {
             // buffers, so they carry `out`'s storage provenance (region-bound in `region_of`).
             | ExprKind::RunOutputStdout { out: buffer }
             | ExprKind::RunOutputStderr { out: buffer } => self.storage_roots(buffer),
+            ExprKind::RunBytesStdout { out: buffer }
+            | ExprKind::RunBytesStderr { out: buffer } => self.storage_roots(buffer),
             // Buffering transfers an owned reader, but preserves an existing borrowed-reader tie
             // (notably `c.reader().buffered()` still borrows `c`).
             ExprKind::ReaderBuffered { reader } => self.borrow_sources(reader),
@@ -20912,10 +20969,12 @@ impl<'a> MoveCheck<'a> {
             // `out.code` (`i64`) borrow nothing; `out.stdout()`/`out.stderr()` (which DO borrow `out`)
             // are in the `storage_roots` group above.
             | ExprKind::ProcessCommand { .. } | ExprKind::CommandCwd { .. } | ExprKind::CommandTimeout { .. }
+            | ExprKind::CommandMaxCapture { .. }
             // `c.read_timeout_ns` / `c.write_timeout_ns` yield `()` (a socket-option side effect) — no borrow.
             | ExprKind::TcpReadTimeout { .. } | ExprKind::TcpWriteTimeout { .. }
             | ExprKind::CommandEnv { .. } | ExprKind::CommandEnvClear { .. } | ExprKind::CommandRun { .. }
-            | ExprKind::RunOutputCode { .. } | ExprKind::EncodingEncode { .. }
+            | ExprKind::CommandRunBytes { .. }
+            | ExprKind::RunOutputCode { .. } | ExprKind::RunBytesCode { .. } | ExprKind::EncodingEncode { .. }
             | ExprKind::EncodingDecode { .. } | ExprKind::Utf8Valid { .. } | ExprKind::Compress { .. }
             | ExprKind::Decompress { .. } | ExprKind::RandSeed | ExprKind::RandSeedWith { .. }
             | ExprKind::RandNext { .. } | ExprKind::RandRange { .. } | ExprKind::RandShuffle { .. }
@@ -25420,6 +25479,10 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, command, moved, false, false);
                 move_expr!(self, ns, moved, false, false);
             }
+            ExprKind::CommandMaxCapture { command, limit } => {
+                move_expr!(self, command, moved, false, false);
+                move_expr!(self, limit, moved, false, false);
+            }
             // `c.read_timeout_ns` / `c.write_timeout_ns` BORROW the conn (in-place socket-option set,
             // never consumed — like `c.timeout_ns` / `c.reader()`); every operand is a read (no move).
             ExprKind::TcpReadTimeout { conn, ns } | ExprKind::TcpWriteTimeout { conn, ns } => {
@@ -25432,8 +25495,13 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, value, moved, false, false);
             }
             ExprKind::CommandEnvClear { command } => move_expr!(self, command, moved, false, false),
-            ExprKind::CommandRun { command } => move_expr!(self, command, moved, false, false),
+            ExprKind::CommandRun { command } | ExprKind::CommandRunBytes { command } => {
+                move_expr!(self, command, moved, false, false)
+            }
             ExprKind::RunOutputCode { out } | ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
+                move_expr!(self, out, moved, false, false)
+            }
+            ExprKind::RunBytesCode { out } | ExprKind::RunBytesStdout { out } | ExprKind::RunBytesStderr { out } => {
                 move_expr!(self, out, moved, false, false)
             }
             // `std.encoding` borrows its byte-view / `str` arg (never consumed) — like `hash64`.
@@ -26541,6 +26609,13 @@ impl<'a, 't> Checker<'a, 't> {
             ret = self.subst_type(ret, &mono_args, f.span);
             for t in &mut param_tys {
                 *t = self.subst_type(*t, &mono_args, f.span);
+            }
+            if ret == Ty::RunBytes {
+                self.diags.error(
+                    "generic substitution cannot produce a bare run_bytes return; return Result<run_bytes, Error> and keep run_bytes in its direct Ok slot"
+                        .to_string(),
+                    f.ret.as_ref().map(ast::Type::span).unwrap_or(f.span),
+                );
             }
         }
         if mangled == "main" {
@@ -31623,13 +31698,16 @@ impl<'a, 't> Checker<'a, 't> {
             // `std.process` (Slice 4) `command` methods on a `command`: `c.cwd(dir)` sets the working
             // directory in place (`()`); `c.run()` forks + captures → `Result<run_output, Error>`.
             // Type-guarded, same as the `http request` builder methods.
-            "cwd" | "timeout_ns" | "env" | "env_clear" | "run" if recv_ty == Ty::Command => {
+            "cwd" | "timeout_ns" | "max_capture_bytes" | "env" | "env_clear" | "run" | "run_bytes" if recv_ty == Ty::Command => {
                 self.check_command_method(recv_expr, method, args, span)
             }
             // `std.process` (Slice 4) `run_output` getters on a `run_output`: `out.code()` (`i64`) /
             // `out.stdout()` / `out.stderr()` (`str` views into `out`). Type-guarded.
             "code" | "stdout" | "stderr" if recv_ty == Ty::RunOutput => {
                 self.check_run_output_method(recv_expr, method, args, span)
+            }
+            "code" | "stdout" | "stderr" if recv_ty == Ty::RunBytes => {
+                self.check_run_bytes_method(recv_expr, method, args, span)
             }
             // `std.http` request methods on an `http request`: `r.header(name, value)` /
             // `r.body(data)` mutate the builder in place; `r.timeout(ns)` sets a per-request I/O
@@ -34277,6 +34355,7 @@ impl<'a, 't> Checker<'a, 't> {
                 | Ty::HttpStream
                 | Ty::Command
                 | Ty::RunOutput
+                | Ty::RunBytes
         ) {
             self.diags.error(
                 format!("`{}` cannot be an array element — an owned I/O handle/buffer is bound to one local, not collected (bind it to a local)", ty_name(elem_ty)),
@@ -39614,6 +39693,33 @@ impl<'a, 't> Checker<'a, 't> {
                 }
                 Expr { kind: ExprKind::CommandTimeout { command: Box::new(recv_expr), ns: Box::new(ns) }, ty: Ty::Unit, span }
             }
+            "max_capture_bytes" => {
+                if args.len() != 1 {
+                    self.diags.error(format!("'.max_capture_bytes()' takes 1 argument (the per-stream byte limit, i64), got {}", args.len()), span);
+                    return err;
+                }
+                let limit = self.check_expr(&args[0], None);
+                if limit.ty == Ty::Error {
+                    return err;
+                }
+                let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+                match self.resolve(limit.ty) {
+                    Ty::Int(IntTy { bits: 64, signed: true }) => {}
+                    Ty::IntVar(_) => self.constrain(limit.ty, Some(i64_ty), args[0].span),
+                    other => {
+                        self.diags.error(
+                            format!("'.max_capture_bytes()' expects a byte limit (i64), got {}", ty_name(other)),
+                            args[0].span,
+                        );
+                        return err;
+                    }
+                }
+                Expr {
+                    kind: ExprKind::CommandMaxCapture { command: Box::new(recv_expr), limit: Box::new(limit) },
+                    ty: Ty::Unit,
+                    span,
+                }
+            }
             "env" => {
                 if args.len() != 2 {
                     self.diags.error(format!("'.env()' takes 2 arguments (the variable name and value), got {}", args.len()), span);
@@ -39647,8 +39753,19 @@ impl<'a, 't> Checker<'a, 't> {
                     span,
                 }
             }
+            "run_bytes" => {
+                if !args.is_empty() {
+                    self.diags.error(format!("'.run_bytes()' takes no arguments, got {}", args.len()), span);
+                    return err;
+                }
+                Expr {
+                    kind: ExprKind::CommandRunBytes { command: Box::new(recv_expr) },
+                    ty: Ty::Result(Scalar::RunBytes, Scalar::Enum(self.error_enum_id)),
+                    span,
+                }
+            }
             _ => {
-                self.diags.error(format!("'.{method}()' is not a method on a command (try cwd / timeout_ns / env / env_clear / run)"), span);
+                self.diags.error(format!("'.{method}()' is not a method on a command (try cwd / timeout_ns / max_capture_bytes / env / env_clear / run / run_bytes)"), span);
                 err
             }
         }
@@ -39687,6 +39804,44 @@ impl<'a, 't> Checker<'a, 't> {
             "stderr" => Expr { kind: ExprKind::RunOutputStderr { out: Box::new(recv_expr) }, ty: Ty::Str, span },
             _ => {
                 self.diags.error(format!("'.{method}()' is not a method on a run output (try code / stdout / stderr)"), span);
+                err
+            }
+        }
+    }
+
+    fn check_run_bytes_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if !matches!(recv_expr.kind, ExprKind::Local(_)) {
+            if recv_expr.ty != Ty::Error {
+                self.diags.error(
+                    "bind the byte run output to a local first, then read it (`out := c.run_bytes()?` then `out.stdout()`) — a temporary owned run_bytes handle is not dropped yet".to_string(),
+                    span,
+                );
+            }
+            return err;
+        }
+        if !args.is_empty() {
+            self.diags.error(format!("'.{method}()' takes no arguments, got {}", args.len()), span);
+            return err;
+        }
+        match method {
+            "code" => Expr {
+                kind: ExprKind::RunBytesCode { out: Box::new(recv_expr) },
+                ty: Ty::Int(IntTy { bits: 64, signed: true }),
+                span,
+            },
+            "stdout" => Expr {
+                kind: ExprKind::RunBytesStdout { out: Box::new(recv_expr) },
+                ty: Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })),
+                span,
+            },
+            "stderr" => Expr {
+                kind: ExprKind::RunBytesStderr { out: Box::new(recv_expr) },
+                ty: Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })),
+                span,
+            },
+            _ => {
+                self.diags.error(format!("'.{method}()' is not a method on run_bytes (try code / stdout / stderr)"), span);
                 err
             }
         }
@@ -43359,6 +43514,10 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(command);
                 self.finalize_expr(ns);
             }
+            ExprKind::CommandMaxCapture { command, limit } => {
+                self.finalize_expr(command);
+                self.finalize_expr(limit);
+            }
             ExprKind::TcpReadTimeout { conn, ns } | ExprKind::TcpWriteTimeout { conn, ns } => {
                 self.finalize_expr(conn);
                 self.finalize_expr(ns);
@@ -43369,8 +43528,11 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(value);
             }
             ExprKind::CommandEnvClear { command } => self.finalize_expr(command),
-            ExprKind::CommandRun { command } => self.finalize_expr(command),
+            ExprKind::CommandRun { command } | ExprKind::CommandRunBytes { command } => self.finalize_expr(command),
             ExprKind::RunOutputCode { out } | ExprKind::RunOutputStdout { out } | ExprKind::RunOutputStderr { out } => {
+                self.finalize_expr(out)
+            }
+            ExprKind::RunBytesCode { out } | ExprKind::RunBytesStdout { out } | ExprKind::RunBytesStderr { out } => {
                 self.finalize_expr(out)
             }
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.finalize_expr(data),
@@ -44423,6 +44585,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::Child => "child".to_string(),
         Ty::Command => "command".to_string(),
         Ty::RunOutput => "run output".to_string(),
+        Ty::RunBytes => "run_bytes".to_string(),
         Ty::HttpRequest => "http request".to_string(),
         Ty::HttpResponse => "http response".to_string(),
         Ty::HttpClient => "http client".to_string(),
@@ -44843,6 +45006,7 @@ fn resolved_type_source_spelling(
             Ty::Child => "child".to_string(),
             Ty::Command => "command".to_string(),
             Ty::RunOutput => "run_output".to_string(),
+            Ty::RunBytes => "run_bytes".to_string(),
             Ty::HttpRequest => "http request".to_string(),
             Ty::HttpResponse => "http response".to_string(),
             Ty::HttpClient => "http client".to_string(),
@@ -45802,6 +45966,34 @@ fn ty_mangle_impl(
         .collect()
 }
 
+fn type_contains_run_bytes(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
+    let mut work = match ty {
+        Ty::RunBytes => return true,
+        Ty::Option(payload) => vec![payload],
+        Ty::Result(ok, err) => vec![ok, err],
+        Ty::Tagged(id) => vec![Scalar::Tagged(id)],
+        _ => return false,
+    };
+    let mut seen = HashSet::new();
+    while let Some(scalar) = work.pop() {
+        match scalar {
+            Scalar::RunBytes => return true,
+            Scalar::Tagged(id) if seen.insert(id) => {
+                let Some(tagged) = tagged_types.get(id as usize) else { continue };
+                match *tagged {
+                    hir::TaggedType::Option(payload) => work.push(payload),
+                    hir::TaggedType::Result(ok, err) => {
+                        work.push(err);
+                        work.push(ok);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// A composite type argument must resolve to a concrete scalar in M2.
 fn scalar_arg(
     ty: Ty,
@@ -45815,6 +46007,16 @@ fn scalar_arg(
     // `box`/`slice`/`array` over a `T` are not supported yet, so reject `Param` there.
     if matches!(ty, Ty::Param(_)) && !allow_param {
         diags.error(format!("{what} cannot be a generic type parameter yet, got {}", ty_name(ty)), span);
+        return None;
+    }
+    // `run_bytes` has one public carrier: the Ok slot of `Result<run_bytes, E>`. The Result
+    // resolver installs that exact leaf explicitly; every generic payload path (Option, enum,
+    // nested tagged payload, collection, or box) must reject it rather than broadening ownership.
+    if ty == Ty::RunBytes {
+        diags.error(
+            format!("{what} cannot be `run_bytes` — use it only as the direct Ok payload of `Result<run_bytes, E>`"),
+            span,
+        );
         return None;
     }
     if allow_param {
@@ -45848,7 +46050,7 @@ fn scalar_arg(
     // header list + body buffer). A `http_server` / `http_request_ctx` may ride a `Result` Ok payload (`http.serve`
     // / `srv.accept`) — the `allow_param` positions — but never an array/slice/box element (a copied
     // handle would double-`close` its fd), exactly like `tcp_listener` / `http response`.
-    if matches!(ty, Ty::Buffer | Ty::CliCommand | Ty::HttpRequest | Ty::Command) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::ResponseBuilder | Ty::RunOutput) && !allow_param) {
+    if matches!(ty, Ty::Buffer | Ty::CliCommand | Ty::HttpRequest | Ty::Command) || (matches!(ty, Ty::Reader | Ty::Writer | Ty::Regex | Ty::Captures | Ty::CliParsed | Ty::TcpConn | Ty::TcpListener | Ty::UdpSocket | Ty::Child | Ty::File | Ty::HttpResponse | Ty::HttpClient | Ty::HttpServer | Ty::HttpRequestCtx | Ty::HttpStream | Ty::ResponseBuilder | Ty::RunOutput | Ty::RunBytes) && !allow_param) {
         diags.error(
             format!("{what} cannot be `{}` — an owned I/O handle/buffer is bound to one local, not collected into an array/slice/box (bind it to a local)", ty_name(ty)),
             span,
@@ -45927,6 +46129,7 @@ fn collection_scalar_type(ty: Ty) -> Option<Scalar> {
             | Ty::HttpStream
             | Ty::ResponseBuilder
             | Ty::RunOutput
+            | Ty::RunBytes
             | Ty::HttpHeaders
     ) {
         return None;
@@ -46544,6 +46747,13 @@ fn resolve_type(
             }
             Ty::Child
         }
+        "run_bytes" => {
+            if !args.is_empty() {
+                diags.error("run_bytes takes no type arguments".to_string(), span);
+                return Ty::Error;
+            }
+            Ty::RunBytes
+        }
         // `http_request_ctx` (`std.http`) — one accepted+parsed request, an owned Move handle
         // (`srv.accept()`). A surface type name (F1②) so the pkg.web request `Ctx` can **own** it as
         // a struct field (`Ctx { req: http_request_ctx, … }`) — the struct becomes Move and its drop
@@ -46640,6 +46850,14 @@ fn resolve_type(
             if !abstract_pkg_db_batch_application(inner, cx)
                 && reject_abstract_nominal_container(inner, "Option", cx, span, diags)
             {
+                return Ty::Error;
+            }
+            if type_contains_run_bytes(inner, cx.tagged_types) {
+                diags.error(
+                    "Option cannot contain `run_bytes`; use `Result<run_bytes, E>` and bind its Ok value to a local"
+                        .to_string(),
+                    span,
+                );
                 return Ty::Error;
             }
             match scalar_arg(inner, "Option payload", true, cx.tagged_types, span, diags) {
@@ -46811,17 +47029,30 @@ fn resolve_type(
                 );
                 return Ty::Error;
             }
-            match (
-                scalar_arg(ok, "Result ok payload", true, cx.tagged_types, span, diags),
-                scalar_arg(
-                    err,
-                    "Result err payload",
-                    true,
-                    cx.tagged_types,
+            if (type_contains_run_bytes(ok, cx.tagged_types) && ok != Ty::RunBytes)
+                || type_contains_run_bytes(err, cx.tagged_types)
+            {
+                diags.error(
+                    "run_bytes is permitted only as the direct Ok payload of Result<run_bytes, E>"
+                        .to_string(),
                     span,
-                    diags,
-                ),
-            ) {
+                );
+                return Ty::Error;
+            }
+            let ok = if ok == Ty::RunBytes {
+                Some(Scalar::RunBytes)
+            } else {
+                scalar_arg(ok, "Result ok payload", true, cx.tagged_types, span, diags)
+            };
+            let err = scalar_arg(
+                err,
+                "Result err payload",
+                true,
+                cx.tagged_types,
+                span,
+                diags,
+            );
+            match (ok, err) {
                 (Some(o), Some(e)) => Ty::Result(o, e),
                 _ => Ty::Error,
             }
@@ -47026,10 +47257,12 @@ pub const MOVE_HANDLE_TYPES: &[Ty] = &[
     Ty::HttpRequestCtx,
     Ty::ResponseBuilder,
     Ty::HttpStream,
-    // `command` / `run_output` (std.process Slice 4) — bare opaque-pointer Move handles freed
-    // by `command_free` / `run_output_free`. Kept in lockstep with codegen's `handle_free_key`.
+    // `command` / `run_output` / `run_bytes` — bare opaque-pointer Move handles freed by their
+    // matching runtime free entry. Kept in lockstep with codegen's `handle_free_key`; RunBytes keeps
+    // its narrower Result/local placement rule in the type-formation gates above.
     Ty::Command,
     Ty::RunOutput,
+    Ty::RunBytes,
 ];
 
 /// The tailored rejection for a [`Ty::HttpHeaders`] in a payload / element position. The view has
@@ -47054,6 +47287,10 @@ fn is_field_ok(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
     let mut visited_tagged = HashSet::new();
     while let Some(ty) = work.pop() {
         match ty {
+        // Request 11 keeps `run_bytes` in its constructor Result and bound-local flow only. Unlike
+        // framework handles intentionally admitted as fields, embedding it would broaden the
+        // reviewed ownership surface without a field move-out/replacement owner.
+        Ty::RunBytes => return false,
         Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Struct(_) | Ty::Resource(_) | Ty::ResourceRef(_) | Ty::Param(_) | Ty::Error => {}
         // A sum-type (`enum`) field — the JSON `oneOf`/union shape (`Message { content: Content }`,
         // J1b). The recursive DropPlan distinguishes Copy enums from Move enums with owned payloads;
@@ -47720,6 +47957,15 @@ mod tests {
     use super::*;
     use align_lexer::tokenize;
     use align_parser::parse_file;
+
+    #[test]
+    fn run_bytes_is_not_a_function_value_return() {
+        assert!(!fn_value_ret_ok(Ty::RunBytes));
+        assert!(fn_value_ret_ok(Ty::Result(
+            Scalar::RunBytes,
+            Scalar::Enum(0),
+        )));
+    }
 
     fn check(src: &str) -> (Program, Diagnostics) {
         let mut d = Diagnostics::new();

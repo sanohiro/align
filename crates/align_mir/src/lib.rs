@@ -1383,6 +1383,8 @@ pub enum Rvalue {
     /// `c.timeout_ns(ns)` — set the command handle `command`'s run timeout (`ns` an `i64` nanosecond
     /// count), in place. No value. `ns == 0` = no timeout; a negative `ns` aborts at runtime. Impure.
     CommandTimeout { command: Operand, ns: Operand },
+    /// Persist a per-stream capture bound on a command handle.
+    CommandMaxCapture { command: Operand, limit: Operand },
     /// `c.env(name, value)` — add or override one environment variable the child sees (`name`/`value`
     /// `{ptr,len}` str views), in place. No value. A `name`/`value` with an interior NUL, or a `name`
     /// containing `=`, aborts at runtime. Impure.
@@ -1394,11 +1396,17 @@ pub enum Rvalue {
     /// an `i32` status (0 = ok; else `AL_INVALID` for non-UTF-8 output / a mapped errno). The caller
     /// branches `Ok(run_output)` / `Err`. `command` is borrowed (re-runnable). Impure.
     CommandRun { command: Operand, out: Slot },
+    /// Binary captured run returning an owned `run_bytes` handle through `out`.
+    CommandRunBytes { command: Operand, out: Slot },
     /// `out.code()` — the run's exit code (`i64`) of the run-output handle `out`. Pure.
     RunOutputCode { out: Operand },
     /// `out.stdout()` / `out.stderr()` — the captured stdout / stderr as a `str` **view** `{ptr,len}`
     /// into `out`'s owned buffer (region-bound to `out`). `err` selects the stderr buffer. Pure.
     RunOutputView { out: Operand, err: bool },
+    /// Exit-code accessor for a `run_bytes` handle.
+    RunBytesCode { out: Operand },
+    /// Byte-slice stdout/stderr view for a `run_bytes` handle.
+    RunBytesView { out: Operand, err: bool },
     /// `http.parse(data)` — parse the response byte view `data` (`{ptr,len}`) into an owned `http
     /// response` handle written to `out`, returning an `i32` status (0 = ok, `AL_INVALID` ->
     /// `Error.Invalid`). The caller branches `Ok(response)` / `Err`. Pure.
@@ -5073,12 +5081,17 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
         | hir::ExprKind::ProcessCommand { .. }
         | hir::ExprKind::CommandCwd { .. }
         | hir::ExprKind::CommandTimeout { .. }
+        | hir::ExprKind::CommandMaxCapture { .. }
         | hir::ExprKind::CommandEnv { .. }
         | hir::ExprKind::CommandEnvClear { .. }
         | hir::ExprKind::CommandRun { .. }
+        | hir::ExprKind::CommandRunBytes { .. }
         | hir::ExprKind::RunOutputCode { .. }
         | hir::ExprKind::RunOutputStdout { .. }
         | hir::ExprKind::RunOutputStderr { .. }
+        | hir::ExprKind::RunBytesCode { .. }
+        | hir::ExprKind::RunBytesStdout { .. }
+        | hir::ExprKind::RunBytesStderr { .. }
         | hir::ExprKind::PathJoin { .. }
         | hir::ExprKind::PathComponent { .. }
         | hir::ExprKind::PathNormalize { .. }
@@ -5224,12 +5237,17 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::ProcessCommand { .. }
         | hir::ExprKind::CommandCwd { .. }
         | hir::ExprKind::CommandTimeout { .. }
+        | hir::ExprKind::CommandMaxCapture { .. }
         | hir::ExprKind::CommandEnv { .. }
         | hir::ExprKind::CommandEnvClear { .. }
         | hir::ExprKind::CommandRun { .. }
+        | hir::ExprKind::CommandRunBytes { .. }
         | hir::ExprKind::RunOutputCode { .. }
         | hir::ExprKind::RunOutputStdout { .. }
         | hir::ExprKind::RunOutputStderr { .. } => lower_command(b, e),
+        hir::ExprKind::RunBytesCode { .. }
+        | hir::ExprKind::RunBytesStdout { .. }
+        | hir::ExprKind::RunBytesStderr { .. } => lower_command(b, e),
         hir::ExprKind::PathJoin { .. }
         | hir::ExprKind::PathComponent { .. }
         | hir::ExprKind::PathNormalize { .. } => lower_path_expr(b, e),
@@ -5815,12 +5833,17 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             hir::ExprKind::ProcessCommand { .. }
             | hir::ExprKind::CommandCwd { .. }
             | hir::ExprKind::CommandTimeout { .. }
+            | hir::ExprKind::CommandMaxCapture { .. }
             | hir::ExprKind::CommandEnv { .. }
             | hir::ExprKind::CommandEnvClear { .. }
             | hir::ExprKind::CommandRun { .. }
+            | hir::ExprKind::CommandRunBytes { .. }
             | hir::ExprKind::RunOutputCode { .. }
             | hir::ExprKind::RunOutputStdout { .. }
             | hir::ExprKind::RunOutputStderr { .. } => lower_command(b, e),
+            hir::ExprKind::RunBytesCode { .. }
+            | hir::ExprKind::RunBytesStdout { .. }
+            | hir::ExprKind::RunBytesStderr { .. } => lower_command(b, e),
             // `fs.read_file_view(path)` yields `Result<str, Error>`, threading the enclosing arena so the
             // runtime registers the mmap for `munmap` at arena end.
             hir::ExprKind::FsReadFileView { path } => lower_fs_read_file_view(b, path, e.ty),
@@ -11794,6 +11817,7 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         | Scalar::ResponseBuilder
         | Scalar::HttpStream
         | Scalar::RunOutput
+        | Scalar::RunBytes
         | Scalar::Fn(_) => KeyOrder::PartialFloat,
         Scalar::Resource(_) | Scalar::ResourceRef(_) => KeyOrder::PartialFloat,
     }
@@ -13838,6 +13862,13 @@ fn lower_command(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(v, Rvalue::CommandTimeout { command: cm, ns: n }));
             Operand::Const(Const::Unit)
         }
+        hir::ExprKind::CommandMaxCapture { command, limit } => {
+            let cm = lower_required!(b, lower_expr(b, command), Operand::Const(Const::Unit));
+            let n = lower_required!(b, lower_expr(b, limit), Operand::Const(Const::Unit));
+            let v = b.fresh_value(Ty::Unit);
+            b.push(Stmt::Let(v, Rvalue::CommandMaxCapture { command: cm, limit: n }));
+            Operand::Const(Const::Unit)
+        }
         // `c.env(name, value)` → add/override one child environment variable in place; no value.
         hir::ExprKind::CommandEnv { command, name, value } => {
             let cm = lower_required!(b, lower_expr(b, command), Operand::Const(Const::Unit));
@@ -13861,6 +13892,11 @@ fn lower_command(b: &mut Builder, e: &hir::Expr) -> Operand {
             let cm = lower_required!(b, lower_expr(b, command), Operand::Const(Const::Unit));
             lower_http_response_result(b, Rvalue::CommandRun { command: cm, out }, out, Ty::RunOutput, e.ty)
         }
+        hir::ExprKind::CommandRunBytes { command } => {
+            let out = b.new_slot(Ty::RunBytes);
+            let cm = lower_required!(b, lower_expr(b, command), Operand::Const(Const::Unit));
+            lower_http_response_result(b, Rvalue::CommandRunBytes { command: cm, out }, out, Ty::RunBytes, e.ty)
+        }
         // `out.code()` → the runtime returns the i64 exit code directly.
         hir::ExprKind::RunOutputCode { out } => {
             let o = lower_required!(b, lower_expr(b, out), Operand::Const(Const::Unit));
@@ -13875,6 +13911,19 @@ fn lower_command(b: &mut Builder, e: &hir::Expr) -> Operand {
             let o = lower_required!(b, lower_expr(b, out), Operand::Const(Const::Unit));
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::RunOutputView { out: o, err: is_err }));
+            Operand::Value(v)
+        }
+        hir::ExprKind::RunBytesCode { out } => {
+            let o = lower_required!(b, lower_expr(b, out), Operand::Const(Const::Unit));
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::RunBytesCode { out: o }));
+            Operand::Value(v)
+        }
+        hir::ExprKind::RunBytesStdout { out } | hir::ExprKind::RunBytesStderr { out } => {
+            let is_err = matches!(&e.kind, hir::ExprKind::RunBytesStderr { .. });
+            let o = lower_required!(b, lower_expr(b, out), Operand::Const(Const::Unit));
+            let v = b.fresh_value(e.ty);
+            b.push(Stmt::Let(v, Rvalue::RunBytesView { out: o, err: is_err }));
             Operand::Value(v)
         }
         other => unreachable!("lower_command called with non-command expr: {other:?}"),
@@ -15508,6 +15557,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Child => "child".to_string(),
         Ty::Command => "command".to_string(),
         Ty::RunOutput => "run output".to_string(),
+        Ty::RunBytes => "run_bytes".to_string(),
         Ty::HttpRequest => "http request".to_string(),
         Ty::HttpResponse => "http response".to_string(),
         Ty::HttpClient => "http client".to_string(),

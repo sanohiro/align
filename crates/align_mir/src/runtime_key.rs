@@ -11,7 +11,7 @@ macro_rules! runtime_keys {
         }
 
         impl RuntimeKey {
-            pub const ALL: [Self; 285] = [$(Self::$variant,)*];
+            pub const ALL: [Self; 291] = [$(Self::$variant,)*];
 
             pub const fn logical_name(self) -> &'static str {
                 match self {
@@ -91,8 +91,10 @@ runtime_keys! {
     CommandEnv => "command_env",
     CommandEnvClear => "command_env_clear",
     CommandFree => "command_free",
+    CommandMaxCapture => "command_max_capture",
     CommandNew => "command_new",
     CommandRun => "command_run",
+    CommandRunBytes => "command_run_bytes",
     CommandTimeout => "command_timeout",
     CompressGzipCompress => "compress_gzip_compress",
     CompressGzipDecompress => "compress_gzip_decompress",
@@ -266,6 +268,10 @@ runtime_keys! {
     RngSeedOs => "rng_seed_os",
     RngSeedWith => "rng_seed_with",
     RngShuffle => "rng_shuffle",
+    RunBytesCode => "run_bytes_code",
+    RunBytesFree => "run_bytes_free",
+    RunBytesStderr => "run_bytes_stderr",
+    RunBytesStdout => "run_bytes_stdout",
     RunOutputCode => "run_output_code",
     RunOutputFree => "run_output_free",
     RunOutputStderr => "run_output_stderr",
@@ -310,7 +316,7 @@ runtime_keys! {
     Utf8Valid => "utf8_valid",
 }
 
-const _: [(); 285] = [(); RuntimeKey::ALL.len()];
+const _: [(); 291] = [(); RuntimeKey::ALL.len()];
 
 #[cfg(test)]
 mod tests {
@@ -319,7 +325,7 @@ mod tests {
 
     #[test]
     fn runtime_keys_are_complete_unique_and_alphabetical() {
-        assert_eq!(RuntimeKey::ALL.len(), 285);
+        assert_eq!(RuntimeKey::ALL.len(), 291);
         let names: Vec<_> = RuntimeKey::ALL
             .iter()
             .map(|key| key.logical_name())

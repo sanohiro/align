@@ -1033,6 +1033,10 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             command: boxed!(command),
             ns: boxed!(ns),
         },
+        ExprKind::CommandMaxCapture { command, limit } => ExprKind::CommandMaxCapture {
+            command: boxed!(command),
+            limit: boxed!(limit),
+        },
         ExprKind::CommandEnv {
             command,
             name,
@@ -1048,9 +1052,15 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         ExprKind::CommandRun { command } => ExprKind::CommandRun {
             command: boxed!(command),
         },
+        ExprKind::CommandRunBytes { command } => ExprKind::CommandRunBytes {
+            command: boxed!(command),
+        },
         ExprKind::RunOutputCode { out } => ExprKind::RunOutputCode { out: boxed!(out) },
         ExprKind::RunOutputStdout { out } => ExprKind::RunOutputStdout { out: boxed!(out) },
         ExprKind::RunOutputStderr { out } => ExprKind::RunOutputStderr { out: boxed!(out) },
+        ExprKind::RunBytesCode { out } => ExprKind::RunBytesCode { out: boxed!(out) },
+        ExprKind::RunBytesStdout { out } => ExprKind::RunBytesStdout { out: boxed!(out) },
+        ExprKind::RunBytesStderr { out } => ExprKind::RunBytesStderr { out: boxed!(out) },
         ExprKind::EncodingEncode { kind, data } => ExprKind::EncodingEncode {
             kind: *kind,
             data: boxed!(data),
@@ -1929,6 +1939,10 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             command: lhs,
             ns: rhs,
         }
+        | ExprKind::CommandMaxCapture {
+            command: lhs,
+            limit: rhs,
+        }
         | ExprKind::Compress {
             data: lhs,
             level: rhs,
@@ -2172,9 +2186,13 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::ChildWait { child: recv }
         | ExprKind::CommandEnvClear { command: recv }
         | ExprKind::CommandRun { command: recv }
+        | ExprKind::CommandRunBytes { command: recv }
         | ExprKind::RunOutputCode { out: recv }
         | ExprKind::RunOutputStdout { out: recv }
         | ExprKind::RunOutputStderr { out: recv }
+        | ExprKind::RunBytesCode { out: recv }
+        | ExprKind::RunBytesStdout { out: recv }
+        | ExprKind::RunBytesStderr { out: recv }
         | ExprKind::EncodingEncode { data: recv, .. }
         | ExprKind::EncodingDecode { input: recv, .. }
         | ExprKind::Utf8Valid { data: recv }

@@ -642,6 +642,11 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
             symbol: "align_rt_command_free",
             shape: RuntimeAbiShape::A62,
         },
+        RuntimeKey::CommandMaxCapture => RuntimeAbi {
+            key,
+            symbol: "align_rt_command_max_capture",
+            shape: RuntimeAbiShape::A66,
+        },
         RuntimeKey::CommandNew => RuntimeAbi {
             key,
             symbol: "align_rt_command_new",
@@ -650,6 +655,11 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
         RuntimeKey::CommandRun => RuntimeAbi {
             key,
             symbol: "align_rt_command_run",
+            shape: RuntimeAbiShape::A19,
+        },
+        RuntimeKey::CommandRunBytes => RuntimeAbi {
+            key,
+            symbol: "align_rt_command_run_bytes",
             shape: RuntimeAbiShape::A19,
         },
         RuntimeKey::CommandTimeout => RuntimeAbi {
@@ -1517,6 +1527,26 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
             symbol: "align_rt_rng_shuffle",
             shape: RuntimeAbiShape::A75,
         },
+        RuntimeKey::RunBytesCode => RuntimeAbi {
+            key,
+            symbol: "align_rt_run_bytes_code",
+            shape: RuntimeAbiShape::A29,
+        },
+        RuntimeKey::RunBytesFree => RuntimeAbi {
+            key,
+            symbol: "align_rt_run_bytes_free",
+            shape: RuntimeAbiShape::A62,
+        },
+        RuntimeKey::RunBytesStderr => RuntimeAbi {
+            key,
+            symbol: "align_rt_run_bytes_stderr",
+            shape: RuntimeAbiShape::A83,
+        },
+        RuntimeKey::RunBytesStdout => RuntimeAbi {
+            key,
+            symbol: "align_rt_run_bytes_stdout",
+            shape: RuntimeAbiShape::A83,
+        },
         RuntimeKey::RunOutputCode => RuntimeAbi {
             key,
             symbol: "align_rt_run_output_code",
@@ -1739,15 +1769,15 @@ pub(super) fn runtime_abis() -> impl Iterator<Item = RuntimeAbi> {
 }
 
 pub(super) fn validate_registry() -> Result<(), String> {
-    if RuntimeKey::ALL.len() != 285 || keyed_runtime_abis().len() != 285 {
+    if RuntimeKey::ALL.len() != 291 || keyed_runtime_abis().len() != 291 {
         return Err("runtime ABI registry invariant: key-count".to_string());
     }
-    if runtime_abis().count() != 298 {
+    if runtime_abis().count() != 304 {
         return Err("runtime ABI registry invariant: base-count".to_string());
     }
 
     let mut keys = HashSet::with_capacity(RuntimeKey::ALL.len());
-    let mut symbols = HashSet::with_capacity(298);
+    let mut symbols = HashSet::with_capacity(304);
     for abi in keyed_runtime_abis() {
         let key = abi
             .runtime_key()
@@ -3106,17 +3136,17 @@ mod tests {
         );
         validate_registry().unwrap();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 298);
+        assert_eq!(rows.len(), 304);
         assert_eq!(
             rows.iter().map(|row| row.key).collect::<HashSet<_>>().len(),
-            298
+            304
         );
         assert_eq!(
             rows.iter()
                 .map(|row| row.symbol)
                 .collect::<HashSet<_>>()
                 .len(),
-            298
+            304
         );
         for (key, row) in RuntimeKey::ALL.into_iter().zip(keyed_runtime_abis()) {
             assert_eq!(row.key, RuntimeAbiId::Keyed(key));
@@ -3146,7 +3176,7 @@ mod tests {
     fn runtime_abi_extern_type_matrix_is_exact_for_every_row_and_ordinal() {
         let ctx = inkwell::context::Context::create();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 298);
+        assert_eq!(rows.len(), 304);
 
         for row in rows {
             let symbol = row.symbol;

@@ -10272,6 +10272,252 @@ fn hir_body_validator_pipeline_template_json_group_control_flow() {
 }
 
 #[test]
+fn request11_process_rows_match_the_producer() {
+    let mut program = baseline_program();
+    let error = push_builtin_error(&mut program);
+    let result = native_result(Ty::RunBytes, error);
+    let bytes = Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false }));
+    let mut add = |name: &str, expression: hir::Expr, locals: Vec<hir::Local>, ret: Ty| {
+        let mut function = body_native_case(name, expression, ret);
+        function.locals = locals;
+        program.fns.push(function);
+    };
+    add(
+        "request11_max_capture",
+        body_test_expr(
+            hir::ExprKind::CommandMaxCapture {
+                command: Box::new(native_local(0, Ty::Command)),
+                limit: Box::new(native_i64()),
+            },
+            Ty::Unit,
+        ),
+        vec![body_test_local(0, "command", Ty::Command, false, false)],
+        Ty::Unit,
+    );
+    add(
+        "request11_run_bytes",
+        body_test_expr(
+            hir::ExprKind::CommandRunBytes {
+                command: Box::new(native_local(0, Ty::Command)),
+            },
+            result,
+        ),
+        vec![body_test_local(0, "command", Ty::Command, false, false)],
+        result,
+    );
+    add(
+        "request11_code",
+        body_test_expr(
+            hir::ExprKind::RunBytesCode {
+                out: Box::new(native_local(0, Ty::RunBytes)),
+            },
+            int(64),
+        ),
+        vec![body_test_local(0, "out", Ty::RunBytes, false, false)],
+        int(64),
+    );
+    add(
+        "request11_stdout",
+        body_test_expr(
+            hir::ExprKind::RunBytesStdout {
+                out: Box::new(native_local(0, Ty::RunBytes)),
+            },
+            bytes,
+        ),
+        vec![body_test_local(0, "out", Ty::RunBytes, false, false)],
+        bytes,
+    );
+    add(
+        "request11_stderr",
+        body_test_expr(
+            hir::ExprKind::RunBytesStderr {
+                out: Box::new(native_local(0, Ty::RunBytes)),
+            },
+            bytes,
+        ),
+        vec![body_test_local(0, "out", Ty::RunBytes, false, false)],
+        bytes,
+    );
+    assert!(body_core_metadata_is_valid(&program));
+
+    let mut field_placement = program.clone();
+    field_placement.structs[0].fields[0].ty = Ty::RunBytes;
+    assert_rejected("request11-run-bytes-field", &field_placement);
+    assert_rejected(
+        "request11-run-bytes-option",
+        &with_return(Ty::Option(Scalar::RunBytes)),
+    );
+    assert_rejected(
+        "request11-run-bytes-error",
+        &with_return(Ty::Result(Scalar::Unit, Scalar::RunBytes)),
+    );
+    assert_rejected(
+        "request11-run-bytes-bare-return",
+        &with_return(Ty::RunBytes),
+    );
+    let mut nested_placement = with_return(Ty::Unit);
+    let inner = nested_placement.tagged_types.len() as u32;
+    nested_placement
+        .tagged_types
+        .push(hir::TaggedType::Result(Scalar::RunBytes, Scalar::Enum(0)));
+    nested_placement.imported_fns[0].ret =
+        Ty::Result(Scalar::Tagged(inner), Scalar::Enum(0));
+    assert_rejected("request11-run-bytes-nested-result", &nested_placement);
+
+    fn expression_mut<'a>(program: &'a mut hir::Program, name: &str) -> &'a mut hir::Expr {
+        if name == "request11_run_bytes" {
+            body_value_expression_mut(program, name)
+        } else {
+            body_statement_expression_mut(program, name)
+        }
+    }
+    for name in [
+        "request11_max_capture",
+        "request11_run_bytes",
+        "request11_code",
+        "request11_stdout",
+        "request11_stderr",
+    ] {
+        let mut malformed = program.clone();
+        expression_mut(&mut malformed, name).ty = Ty::Bool;
+        assert!(!body_core_metadata_is_valid(&malformed), "{name}: wrong stored result type");
+
+        let mut malformed = program.clone();
+        let expression = expression_mut(&mut malformed, name);
+        match &mut expression.kind {
+            hir::ExprKind::CommandMaxCapture { command, .. }
+            | hir::ExprKind::CommandRunBytes { command } => command.ty = Ty::RunBytes,
+            hir::ExprKind::RunBytesCode { out }
+            | hir::ExprKind::RunBytesStdout { out }
+            | hir::ExprKind::RunBytesStderr { out } => out.ty = Ty::RunOutput,
+            _ => panic!("{name}: wrong Request 11 fixture"),
+        }
+        assert!(!body_core_metadata_is_valid(&malformed), "{name}: wrong receiver type");
+    }
+
+    let mut malformed_limit = program.clone();
+    let hir::ExprKind::CommandMaxCapture { limit, .. } =
+        &mut expression_mut(&mut malformed_limit, "request11_max_capture").kind
+    else {
+        panic!("max-capture fixture lost its discriminator")
+    };
+    limit.ty = Ty::Bool;
+    assert!(!body_core_metadata_is_valid(&malformed_limit));
+
+    // An equal-typed, individually valid producer is still not a stable bound-local receiver. The
+    // enum shape itself fixes child count and order at compile time; this twin closes the remaining
+    // post-child locality discriminator without relying on malformed child HIR.
+    let mut temporary = program.clone();
+    let Some(function) = temporary
+        .fns
+        .iter_mut()
+        .find(|function| function.name == "request11_run_bytes")
+    else {
+        panic!("request11 run fixture is missing")
+    };
+    function.locals.push(body_test_local(
+        1,
+        "args",
+        Ty::DynArray(Scalar::Str),
+        false,
+        false,
+    ));
+    let Some(expression) = function.body.value.as_deref_mut() else {
+        panic!("request11 run value is missing")
+    };
+    let hir::ExprKind::CommandRunBytes { command } = &mut expression.kind else {
+        panic!("run-bytes fixture lost its discriminator")
+    };
+    *command = Box::new(body_test_expr(
+        hir::ExprKind::ProcessCommand {
+            cmd: Box::new(native_str()),
+            args: Box::new(native_local(1, Ty::DynArray(Scalar::Str))),
+        },
+        Ty::Command,
+    ));
+    assert!(!body_core_metadata_is_valid(&temporary));
+
+    let mut temporary = program.clone();
+    let Some(function) = temporary
+        .fns
+        .iter_mut()
+        .find(|function| function.name == "request11_max_capture")
+    else {
+        panic!("request11 max-capture fixture is missing")
+    };
+    function.locals.push(body_test_local(
+        1,
+        "args",
+        Ty::DynArray(Scalar::Str),
+        false,
+        false,
+    ));
+    let Some(expression) = function.body.stmts.first_mut() else {
+        panic!("request11 max-capture statement is missing")
+    };
+    let hir::Stmt::Expr(expression) = expression else {
+        panic!("max-capture fixture lost its expression statement")
+    };
+    let hir::ExprKind::CommandMaxCapture { command, .. } = &mut expression.kind else {
+        panic!("max-capture fixture lost its discriminator")
+    };
+    *command = Box::new(body_test_expr(
+        hir::ExprKind::ProcessCommand {
+            cmd: Box::new(native_str()),
+            args: Box::new(native_local(1, Ty::DynArray(Scalar::Str))),
+        },
+        Ty::Command,
+    ));
+    assert!(!body_core_metadata_is_valid(&temporary));
+
+    for name in ["request11_code", "request11_stdout", "request11_stderr"] {
+        let mut temporary = program.clone();
+        let expression = expression_mut(&mut temporary, name);
+        let out = match &mut expression.kind {
+            hir::ExprKind::RunBytesCode { out }
+            | hir::ExprKind::RunBytesStdout { out }
+            | hir::ExprKind::RunBytesStderr { out } => out,
+            _ => panic!("{name}: fixture lost its discriminator"),
+        };
+        *out = Box::new(body_test_expr(
+            hir::ExprKind::Block(hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(native_local(0, Ty::RunBytes))),
+            }),
+            Ty::RunBytes,
+        ));
+        assert!(!body_core_metadata_is_valid(&temporary), "{name}: temporary receiver");
+    }
+}
+
+#[test]
+fn request11_expr_kind_inventory_tripwire() {
+    let source = include_str!("../../align_sema/src/hir.rs");
+    let marker = "pub enum ExprKind {";
+    let Some(definition) = source.find(marker) else {
+        panic!("ExprKind definition is missing")
+    };
+    let start = definition + marker.len();
+    let mut variants = 0usize;
+    for line in source[start..].lines() {
+        if line == "}" {
+            break;
+        }
+        if let Some(top_level) = line.strip_prefix("    ")
+            && !top_level.starts_with(' ')
+            && top_level.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+            && (top_level.ends_with(',') || top_level.ends_with('{'))
+        {
+            variants += 1;
+        }
+    }
+    assert_eq!(
+        variants, 258,
+        "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
+    );
+}
+
+#[test]
 fn hir_body_validator_native() {
     let mut program = baseline_program();
     let heap_record = program.structs.len() as u32;
@@ -11244,6 +11490,18 @@ fn hir_body_validator_native() {
         Ty::Unit
     );
     add!(
+        "native_command_max_capture",
+        body_test_expr(
+            hir::ExprKind::CommandMaxCapture {
+                command: Box::new(native_local(0, Ty::Command)),
+                limit: Box::new(native_i64()),
+            },
+            Ty::Unit,
+        ),
+        vec![body_test_local(0, "command", Ty::Command, false, false)],
+        Ty::Unit
+    );
+    add!(
         "native_command_env",
         body_test_expr(
             hir::ExprKind::CommandEnv {
@@ -11279,6 +11537,17 @@ fn hir_body_validator_native() {
         native_result(Ty::RunOutput, error)
     );
     add!(
+        "native_command_run_bytes",
+        body_test_expr(
+            hir::ExprKind::CommandRunBytes {
+                command: Box::new(native_local(0, Ty::Command)),
+            },
+            native_result(Ty::RunBytes, error),
+        ),
+        vec![body_test_local(0, "command", Ty::Command, false, false)],
+        native_result(Ty::RunBytes, error)
+    );
+    add!(
         "native_run_output_code",
         body_test_expr(
             hir::ExprKind::RunOutputCode {
@@ -11310,6 +11579,39 @@ fn hir_body_validator_native() {
         ),
         vec![body_test_local(0, "out", Ty::RunOutput, false, false)],
         Ty::Str
+    );
+    add!(
+        "native_run_bytes_code",
+        body_test_expr(
+            hir::ExprKind::RunBytesCode {
+                out: Box::new(native_local(0, Ty::RunBytes)),
+            },
+            i64_ty,
+        ),
+        vec![body_test_local(0, "out", Ty::RunBytes, false, false)],
+        i64_ty
+    );
+    add!(
+        "native_run_bytes_stdout",
+        body_test_expr(
+            hir::ExprKind::RunBytesStdout {
+                out: Box::new(native_local(0, Ty::RunBytes)),
+            },
+            Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })),
+        ),
+        vec![body_test_local(0, "out", Ty::RunBytes, false, false)],
+        Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false }))
+    );
+    add!(
+        "native_run_bytes_stderr",
+        body_test_expr(
+            hir::ExprKind::RunBytesStderr {
+                out: Box::new(native_local(0, Ty::RunBytes)),
+            },
+            Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })),
+        ),
+        vec![body_test_local(0, "out", Ty::RunBytes, false, false)],
+        Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false }))
     );
     add!(
         "native_encoding_encode",
@@ -13616,6 +13918,7 @@ const fn delegation_scalar_sweep_tripwire(scalar: &Scalar) {
         | Scalar::ResponseBuilder
         | Scalar::HttpStream
         | Scalar::RunOutput
+        | Scalar::RunBytes
         | Scalar::Fn { .. }
         | Scalar::Resource { .. }
         | Scalar::ResourceRef { .. } => {}
@@ -15401,6 +15704,7 @@ fn valid_hir_global_type_preflight_is_mir_identity() {
         Ty::Child,
         Ty::Command,
         Ty::RunOutput,
+        Ty::RunBytes,
         Ty::HttpRequest,
         Ty::HttpResponse,
         Ty::HttpClient,
@@ -15455,11 +15759,16 @@ fn valid_hir_global_type_preflight_is_mir_identity() {
         Scalar::ResponseBuilder,
         Scalar::HttpStream,
         Scalar::RunOutput,
+        Scalar::RunBytes,
         Scalar::Fn(0),
     ];
     for scalar in valid_scalars {
         assert_graph_accepted("scalar-discriminator", &with_return(Ty::Option(scalar)));
     }
+    assert_rejected(
+        "run-bytes-option-placement",
+        &with_return(Ty::Option(Scalar::RunBytes)),
+    );
 
     for primitive in [
         PrimScalar::Int(IntTy {

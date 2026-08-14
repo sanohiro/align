@@ -1543,6 +1543,7 @@ fn decode_scalar(cursor: &mut DecodeCursor<'_>) -> Result<Scalar, CanonicalCodec
         33 => Ok(Scalar::Fn(node(cursor)?)),
         34 => Ok(Scalar::Resource(node(cursor)?)),
         35 => Ok(Scalar::ResourceRef(node(cursor)?)),
+        36 => Ok(Scalar::RunBytes),
         _ => Err(CanonicalCodecError::UnknownTag),
     }
 }
@@ -1683,6 +1684,7 @@ fn decode_ty(cursor: &mut DecodeCursor<'_>) -> Result<Ty, CanonicalCodecError> {
         57 => Ok(Ty::Resource(node(cursor)?)),
         58 => Ok(Ty::ResourceRef(node(cursor)?)),
         59 => Ok(Ty::dyn_aggregate_array(decode_aggregate_array_elem(cursor)?)),
+        60 => Ok(Ty::RunBytes),
         _ => Err(CanonicalCodecError::UnknownTag),
     }
 }
@@ -2477,6 +2479,7 @@ fn scalar(
             Scalar::Fn(id) => node!(33, Fn, id),
             Scalar::Resource(id) => node!(34, Resource, id),
             Scalar::ResourceRef(id) => node!(35, Resource, id),
+            Scalar::RunBytes => leaf!(36),
             Scalar::Param(_) | Scalar::SoaParam(_) => {
                 Err(CanonicalGraphError::InvalidGraph)
             }
@@ -2697,6 +2700,7 @@ fn ty(
                     ordinal,
                 )
             }
+            Ty::RunBytes => leaf!(60),
             Ty::Param(_) | Ty::SoaParam(_) | Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Error => {
                 Err(CanonicalGraphError::InvalidGraph)
             }
@@ -3418,6 +3422,7 @@ mod tests {
             (Ty::Unit, vec![3, 0, 0, 0, 0, 56]),
             (Ty::Bool, vec![3, 0, 0, 0, 0, 2]),
             (Ty::Int(i(64)), vec![3, 0, 0, 0, 0, 0, 1, 64]),
+            (Ty::RunBytes, vec![3, 0, 0, 0, 0, 60]),
         ] {
             let encoded = CanonicalTy::from_program(root, &program).unwrap();
             assert_eq!(encoded.as_bytes(), expected);
@@ -3498,6 +3503,7 @@ mod tests {
             Ty::Child,
             Ty::Command,
             Ty::RunOutput,
+            Ty::RunBytes,
             Ty::HttpRequest,
             Ty::HttpResponse,
             Ty::HttpClient,
@@ -3556,6 +3562,7 @@ mod tests {
             Scalar::ResponseBuilder,
             Scalar::HttpStream,
             Scalar::RunOutput,
+            Scalar::RunBytes,
             Scalar::Fn(0),
         ];
         crate::source_shape::tests::assert_scalar_matrix(&scalars);
@@ -3616,6 +3623,9 @@ mod tests {
         error(&[], CanonicalCodecError::Truncated);
         error(&[2], CanonicalCodecError::UnsupportedVersion);
         error(&[3, 0, 0, 0, 0, 0xff], CanonicalCodecError::UnknownTag);
+        error(&[3, 0, 0, 0, 0, 61], CanonicalCodecError::UnknownTag);
+        error(&[3, 0, 0, 0, 0, 4, 37], CanonicalCodecError::UnknownTag);
+        error(&[3, 0, 0, 0, 0], CanonicalCodecError::Truncated);
         error(&[3, 0, 0, 0, 0, 26, 2], CanonicalCodecError::UnknownTag);
         error(&[3, 0, 0, 0, 0, 26, 1, 4], CanonicalCodecError::UnknownTag);
         error(
@@ -3955,6 +3965,7 @@ mod tests {
             Scalar::RunOutput => [32], Scalar::Fn(1) => [33, 1, 0x50, 0, 0],
             Scalar::Resource(1) => [34, 1, 0x60, 0, 0],
             Scalar::ResourceRef(1) => [35, 1, 0x60, 0, 0],
+            Scalar::RunBytes => [36],
         );
     }
 
@@ -3999,6 +4010,7 @@ mod tests {
                 => [59, 2, 2, 2, 0, 0, 0],
             Ty::dyn_aggregate_array(AggregateArrayElem::Mask(Scalar::Float(f(32)), 4))
                 => [59, 1, 1, 32, 4, 0, 0, 0],
+            Ty::RunBytes => [60],
             Ty::dyn_aggregate_array(AggregateArrayElem::FixedStructArray(1, 2))
                 => [59, 3, 1, 0x10, 0, 0, 2, 0, 0, 0],
         );

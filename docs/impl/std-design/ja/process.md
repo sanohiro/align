@@ -9,7 +9,7 @@
 > 2026-07-24 に設計済み**（align-llm Request 1）です。`process.command` ビルダ + `run_output` ハンドルに
 > よる、出力キャプチャ + cwd / env / timeout — 本ファイル末尾の「Extension」を参照してください。**スライス
 > 4〜6 は実装済み**（`process.command`/`c.cwd`/`c.run` のキャプチャ、`c.timeout_ns` とコアの `Error.Timeout`
-> バリアント、`c.env`/`c.env_clear`）。align-llm Request 11 の有界 text/bytes 拡張は**設計済み**で、実装待ちです。
+> バリアント、`c.env`/`c.env_clear`）。align-llm Request 11 の有界 text/bytes 拡張も**実装済み**です。
 
 ## Overview
 
@@ -318,39 +318,37 @@ if out.code() == 0 {
 
 ## Runtime design (`align_rt_command_*` + `align_rt_command_run`)
 
-この subsection は**現在 shipped 済みのスライス 4–6**を記録する。下の Request 11 ledger は親側 capture/reap
-lifecycle の accepted replacement だが、Rust implementation が land するまでは pending であり、future behavior を
-ここでスライス 5 に帰属させない。
+この subsection は**現在 shipped 済みのスライス 4–7**を記録する。下の Request 11 ledger が親側の完全な
+bounded capture/reap lifecycle を所有する。
 
 ビルダハンドル `Command { argv: Vec<CString>, cwd: Option<CString>, env: Vec<(CString,CString)>,
-env_clear: bool, timeout_ns: i64 }` を `align_rt_command_new(cmd, args)` で構築する(argv は
+env_clear: bool, timeout_ns: i64, max_capture_bytes: Option<i64> }` を
+`align_rt_command_new(cmd, args)` で構築する(argv は
 `marshal_cmd_argv` を再利用。内部 NUL / 空 argv / 非 UTF-8 の拒否も同じ)。`cwd` / `env` / `env_clear` /
 `timeout_ns` は薄いセッタである(env のペアは `*const AlignStr, len` のスライス ABI で marshal、`env` 呼び出し
 1 回につき 1 ペア)。`run_output` ハンドルは `RunOutput { code: i64, out: Vec<u8>, err: Vec<u8> }`。
 
 `align_rt_command_run(c, out: *mut *mut RunOutput) -> i32`:
 
-1. パイプを 2 本(`stdout`, `stderr`)作り、両端を `O_CLOEXEC` にする(P3 — 子へリークせず、read 端が exec 後の
-   イメージに届かない)。
+1. optional bound を検証し、2つの exact capture layout と output shell を割り当てる。2本の `O_CLOEXEC`
+   pipe を作り、両 read end を fork 前に nonblocking にする。
 2. `fork`。**子**(async-signal-safety の注意点は `spawn` と同一 — スレッド化された親から fork した後の
    `execvp`/`chdir`/`setenv` は既知の既存ハザードであり、`posix_spawn` が記録済みの理想的な修正):cwd が設定
    されていれば `chdir(cwd)`(失敗 → `_exit(127)`);`env_clear` なら `clearenv()`、続いて各上書きを `setenv`;
    2 つのパイプ write 端を fd 1 と 2 に `dup2`;すべてのパイプ fd を close;`execvp`;失敗時 `_exit(127)`。
-3. **親**:write 端を close し、両 read fd を non-blocking にし、**両 read fd を一緒に `poll`** して、データが
-   届くたびに `out.out` / `out.err` へドレインする。両方を同時にドレインするのは必須である。さもないと、親が
+3. **親**:write 端を close し、**両 read fd を一緒に `poll`** して、stdout、stderr の順に選択した store へ
+   ドレインする。両方を同時にドレインするのは必須である。さもないと、親が
    stdout を読む間に子が stderr パイプを満たすと**デッドロック**する(古典的な 2 パイプキャプチャバグ)。両方が
    EOF に達するまでループする。
-4. **現在のスライス 5 timeout**:`timeout_ns > 0` なら、pipe が開いている間だけ残り deadline で `poll` する
-   (ns→ms、≥1 にクランプ)。期限切れ時、shipped runtime は想定した child process group だけへ `SIGKILL`、両
-   read end を閉じ、direct-child `waitpid` で block し、部分出力を捨てて **`AL_TIMEOUT`** を返す。現在の
-   `setpgid` result は unchecked、direct-pid fallback は無く、pipe EOF 後は deadline が進まない。Request 11 は
-   下記 target state machine でこれら既知の lifecycle gap を閉じる。`timeout_ns == 0` は timeout 無し、負値は
-   `c.timeout_ns()` の構築時に abort する。
-5. EOF 後、direct-child `waitpid` で block し(ここで reap — ゾンビ無し)、
-   `out.code = decode_wait_status(status)` を設定する。
+4. monotonic deadline は pipe drain から direct-child reap までを覆う。timed EOF/live-child は
+   `waitpid(WNOHANG)` + zero-fd `poll`、untimed EOF は blocking `waitpid` を使える。timeout、overflow、hard
+   capture/wait error は最初の status を保持し、owned group があればそこへ、direct child が waitable な間は
+   direct pid へ signal し、両 read を close して直接の子を reap する。既に子を consume した wait は、再利用され得る
+   pid へ signal しない。
+5. 成功には両 EOF と direct-child reap が必要で、その後 `out.code = decode_wait_status(status)` を設定する。
 6. **UTF-8**:`out.out` / `out.err` を UTF-8 として検証する。不正 → free して `AL_INVALID` を返す
    (`fs.read_file` の先例 — `string` 型のアクセサは非 UTF-8 バイトを晒せない)。下記参照。
-7. `*out = Box::into_raw(Box::new(RunOutput{...}))`;`0` を返す。
+7. 2つの store を preallocated `RunOutput` または `RunBytes` shell へ移し、公開して `0` を返す。
 
 `.stdout()`/`.stderr()` は `AlignStr { ptr: out.out.as_ptr(), len }` を返す — 借用ビューであり、
 `align_rt_http_resp_body` とまったく同じ。
@@ -401,10 +399,9 @@ fork/pipe/dup2/waitpid の失敗 → errno→`Error` テーブル(M9)。タイ�
 5. `c.timeout_ns(ns)` + `Error.Timeout` のコア変更 — 「ハングしたテストがループを凍らせる」の修正
    (kill + `Err(Timeout)`)。**実装済み。** `c.timeout_ns(ns: i64)` はバインド済みローカルへのインプレース
    セッタ(`()`)。`ns == 0` = タイムアウト無し(スライス 4 の既定)、負の `ns` はビルド時に abort。`c.run()`
-   は deadline を 2 パイプのドレインだけに通す(残り時間 ns→ms、`>= 1` にクランプして `poll`)。期限切れ時、
-   shipped runtime は子の想定**プロセスグループ**を target にし、両 read を閉じ、直接の子を blocking reap し、
-   部分出力を捨てて `Err(Error.Timeout)` を返す。unchecked group setup、direct-pid fallback の欠如、unconditional
-   post-EOF wait は現在の limitation であり、下の Request 11 pending lifecycle が3つとも閉じる。
+   は deadline を 2 パイプ drain から direct-child reap まで通す。期限切れ時、runtime は owned
+   **プロセスグループ**があればそこへ、direct child が waitable な間は direct pid へ signal し、両 read を閉じ、直接の子を reap し、
+   部分出力を捨てて `Err(Error.Timeout)` を返す。deadline は pipe EOF 後も有効である。
    `timeout_ns == 0` は blocking 動作を保つ。
 6. `c.env(name,value)` + `c.env_clear()` — **実装済み。** どちらもその場で書き換える束縛ローカルのセッタ
    (`()`)。`c.env(name, value)` は `(name, value)` の上書きを記録し、`c.env_clear()` は子環境を空から
@@ -414,18 +411,17 @@ fork/pipe/dup2/waitpid の失敗 → errno→`Error` テーブル(M9)。タイ�
    `env` は残る)。name/value は**親側**で C 文字列にマーシャルするため、子は pair ごとの marshalling
    allocation を追加しない。`clearenv`/`setenv`/`execvp` は P11 の子側 allocation/async-signal-safety caveat を
    保つ。name/value の内部 NUL・非 UTF-8 は abort し、`=` を含む name も abort する(`setenv` が拒否するため)。
-7. *(下記で設計済み、実装待ち)* bytes 層 `c.run_bytes()` とコマンドローカルな
-   `max_capture_bytes` 上限 — align-llm Request 11。
+7. **実装済み:** bytes 層 `c.run_bytes()` とコマンドローカルな `max_capture_bytes` 上限 —
+   align-llm Request 11。
 
 ## Pitfalls
 
 - **P7(2 パイプデッドロック)** — 第 1 の正しさポイント。**両方**の read fd を `poll` し両方をドレインせよ。
   さもないと、子が一方のパイプを満たす間に親が他方を読むとデッドロックする。テスト:*両方*のストリームに
   >64 KiB を書き、非ゼロで終了する子 → 両方が完全にキャプチャされ、コードも正しい。
-- **P8(タイムアウトは実際に kill + reap すべし;Request 11 target)** — deadline は pipe drain と **pipe EOF 後の wait** の両方を
+- **P8(タイムアウトは実際に kill + reap すべし)** — deadline は pipe drain と **pipe EOF 後の wait** の両方を
   覆う。期限切れ時は process group と direct pid を `SIGKILL`、両 capture read を閉じ、直接の子を `waitpid` する。
-  fd 1/2 を閉じて走り続ける子でも zombie/leak/hang を起こさない。shipped スライス 5 は post-EOF/direct-pid
-  部分をまだ満たさない。Acceptance test:100 ms timeout の `sleep 10` と
+  fd 1/2 を閉じて走り続ける子でも zombie/leak/hang を起こさない。Acceptance test:100 ms timeout の `sleep 10` と
   `exec 1>&- 2>&-; sleep 10` は bounded tolerance 内に `Err(Timeout)`、direct-child zombie 無し。
 - **P9(ビューのリージョン、http P3 と同様)** — `.stdout()`/`.stderr()` は `out` へのビュー;`region_of =
   region_of(out)`。`out` の Drop を越える escape は拒否。
@@ -451,7 +447,7 @@ fork/pipe/dup2/waitpid の失敗 → errno→`Error` テーブル(M9)。タイ�
 
 # 拡張 — 有界 text/byte キャプチャ（align-llm Request 11）
 
-> **ステータス: 設計 ACCEPTED（2026-08-14）、実装待ち。** この拡張は上限を選択した呼び出しについて P12 を
+> **ステータス: 実装済み（2026-08-14）。** この拡張は上限を選択した呼び出しについて P12 を
 > 閉じ、先送りしていたバイナリ出力層を出荷する。出典: `../align-llm/docs/align-requests.md` Request 11。
 
 ## 公開契約 ledger
@@ -497,9 +493,11 @@ measurement command に `262_144` を設定し、無制限実行後の長さ検�
   partial success を許可しない。
 - 両ストリーム EOF 後、text `run()` は stdout、stderr の順に検証する。どちらも同じ `Error.Invalid` なので、
   部分出力や失敗ストリームの識別は公開しない。
-- post-fork timeout/overflow/hard-pipe/hard-wait failure は winning status を保存し、この run が作った owned process
-  group があればそこへ、常に direct pid へ `SIGKILL`、両 read fd を close、direct-child `waitpid` を `EINTR` retry (`ECHILD` は already-reaped)、
-  capture/output state を free し、元の status を result slot null のまま返す。この caller が reap するのは直接の子
+- post-fork timeout/overflow/hard-pipe/hard-wait failure は winning status を保存し、direct child が waitable な間は
+  この run が作った owned process group と direct pid へ `SIGKILL`、両 read fd を close、direct-child `waitpid` を
+  `EINTR` retry (`ECHILD` は already-reaped)、capture/output state を free し、元の status を result slot null のまま返す。
+  successful wait または `ECHILD` は後続 cleanup より先に pid を consumed とし、再利用され得る pid へ signal しない。
+  `ECHILD` は synthesized exit status ではなく hard `Error.Code` のままである。この caller が reap するのは直接の子
   だけで、group 内 descendant は signal され、`setsid` descendant は契約外である。fatal OOM に cleanup/unwind
   path は無く、有界 run では pipe 作成/fork より前に起きる。recoverable error は部分 bytes、exit code、
   truncation marker を返さない。
@@ -527,8 +525,9 @@ end は fork 前に nonblocking 化し、`F_GETFL`/`F_SETFL` failure は recover
 post-fork assumption ではない。無制限呼び出しは既存 growable `Vec` 動作を保ち、memory-bound claim を持たない。
 
 正の timeout または明示的 capture bound を持つ command は、子を process-group leader にする。timeout、
-overflow、hard post-fork capture/wait error は owned group があればそこへ、常に直接 pid へ `SIGKILL` を送り、
-EOF の再 drain 無しに両 read end を閉じ、`EINTR` retry 付きで直接の子を待つ。意図的に `setsid` で escape した
+overflow、hard post-fork capture/wait error は owned group があればそこへ、direct child が waitable な間は直接 pid へ
+`SIGKILL` を送り、EOF の再 drain 無しに両 read end を閉じ、`EINTR` retry 付きで直接の子を待つ。既に子を consume
+した wait result は、その pid への後続 signal を抑止する。意図的に `setsid` で escape した
 descendant は process-group 契約外だが、read end を閉じるので呼び出し元を block し続けられない。この caller は
 descendant を reap すると主張しない。別 command は mutable state を共有せず、並行実行は独立する。safe Align
 では実行中の同一 command を再設定できず、同期 run が完了してから再利用する。
@@ -612,16 +611,16 @@ truncated-success path が reachable のままなので、design/implementation 
 | P1 bounded poll が fork 後に allocation | allocation row は exact store/shell を pipe 前に用意し、fixed stack poll/scratch state、pre-fork nonblocking setup、親側 bounded post-fork heap allocation 0を要求する。 |
 | P2 hard poll/read error が partial success | precedence/hard-I/O row が最初の deterministic errno を map し、同じ kill/close/direct-reap cleanup、元 status 保持、output 非公開を要求する。 |
 | P2 normative group reaping が過大 | specification は process group を signal し、reap するのは直接の子だけと明記する。escaped descendant は契約外。 |
-| P1 target overview が pipe EOF で deadline を終えていた | Request 11 target lifecycle は direct-child reap まで deadline を維持し、timed EOF/live-child state は exit/expiry まで `waitpid(WNOHANG)` + zero-fd `poll` を使う。current-runtime subsection はスライス 5 の pending gap を別に記録する。 |
+| P1 target overview が pipe EOF で deadline を終えていた | Request 11 lifecycle は direct-child reap まで deadline を維持し、timed EOF/live-child state は exit/expiry まで `waitpid(WNOHANG)` + zero-fd `poll` を使う。 |
 | P1 no-allocation promise が既存 child launcher を含んだ | allocation promise/owner row は親側 bounded capture/reap state machine だけを対象とし、別の child-launch row が `clearenv`/`setenv`/`execvp` の P11 を維持する。 |
-| P2 target timeout overview に direct-pid fallback が無い | すべての Request 11 target 記述は status を保存し、owned group があればそこへ、常に direct pid へ signal、両 read を close、`EINTR` retry 付きで直接の子だけを reap する。shipped subsection はその pending behavior を主張しない。 |
-| P1 pending lifecycle を shipped スライス 5 に帰属 | current-runtime/slice-breakdown subsection は実際の pipe-only deadline、group-only kill、blocking post-EOF wait を記録し、accepted replacement は pending Request 11 ledger だけに置く。 |
-| P2 pending direct-pid fallback を shipped スライス 5 に帰属 | shipped subsection は unchecked group setup/group-only kill を記録し、target ledger と owner test は always-direct-pid fallback を implementation PR に予約する。 |
+| P2 target timeout overview に direct-pid fallback が無い | すべての Request 11 記述は status を保存し、owned group があればそこへ、direct child が waitable な間は direct pid へ signal、両 read を close、`EINTR` retry 付きで直接の子だけを reap する。successful wait または `ECHILD` は、再利用され得る pid への後続 signal を抑止する。 |
+| P1 pending lifecycle を shipped スライス 5 に帰属 | 設計時の status 分離は、完全な Request 11 state machine が atomic に有効化されるまで旧 Slice-5 behavior と区別した。 |
+| P2 pending direct-pid fallback を shipped スライス 5 に帰属 | 設計時 ledger は waitable child への direct-pid fallback を implementation に予約し、shipped runtime と owner が現在それを検証する。 |
 | P2 `code()` を region-bound view と記述 | condensed specification は `code()` を Copy `i64` とし、region-bound zero-copy view を `stdout()`/`stderr()` だけに限定した。 |
 
 ## Acceptance gate
 
-実装を shipped とする前に:
+implementation acceptance と consumer adoption には次が必要である:
 
 1. 各 matrix row が implementation と regression owner を指し、新 type が exhaustive variant tripwire に含まれる。
 2. 英日 process design、`draft.md`、condensed language spec、design notes、Settled decisions、checked-HIR ledger、
