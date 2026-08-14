@@ -6246,15 +6246,17 @@ fn heap_record_array_builder_rows_match_the_producer() {
             2 => malformed.structs[0].align = Some(16),
             3 => malformed.structs[0].c_repr = true,
             4 => malformed.structs[0].fields[0].ty = Ty::Struct(99),
-            _ => unreachable!(),
+            _ => malformed.structs.clear(),
         }
         assert!(!body_core_metadata_is_valid(&malformed), "malformed {label} record accepted");
     }
 
     let mut wrong_result = copy.clone();
     wrong_result.fns[2].ret = Ty::DynStructArray(0, Layout::Soa);
-    wrong_result.fns[2].body.value.as_deref_mut().expect("build row").ty =
-        Ty::DynStructArray(0, Layout::Soa);
+    let Some(build) = wrong_result.fns[2].body.value.as_deref_mut() else {
+        panic!("build row changed shape")
+    };
+    build.ty = Ty::DynStructArray(0, Layout::Soa);
     assert!(!body_core_metadata_is_valid(&wrong_result), "non-AoS build result accepted");
 }
 
