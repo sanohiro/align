@@ -17856,7 +17856,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             self.builder.position_at_end(finish);
             let out_ptr = self.slots[&out];
-            return Ok(self
+            let status = self
                 .builder
                 .build_call(
                     self.runtime(RuntimeKey::BuilderFinishBoundedStack),
@@ -17866,7 +17866,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 .map_err(|e| self.err(e))?
                 .try_as_basic_value()
                 .basic()
-                .expect("bounded builder finish returns i32 status"));
+                .ok_or_else(|| self.err("bounded builder finish returned no status value"))?;
+            return Ok(status);
         }
         let finish = if arena.is_some() {
             RuntimeKey::BuilderFinishStack

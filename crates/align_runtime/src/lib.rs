@@ -2670,7 +2670,7 @@ pub unsafe extern "C" fn align_rt_builder_init_stack(out: *mut u8, arena: *mut A
     if out.is_null() {
         return core::ptr::null_mut();
     }
-    debug_assert_eq!(out as usize % core::mem::align_of::<Builder>(), 0, "stack Builder storage is misaligned");
+    debug_assert_eq!(out.addr() % core::mem::align_of::<Builder>(), 0, "stack Builder storage is misaligned");
     let b = out.cast::<Builder>();
     unsafe { b.write(builder_value(arena, capacity)) };
     b
@@ -23474,12 +23474,14 @@ mod tests {
 
     #[test]
     fn bounded_stack_builder_enforces_inclusive_small_caps_without_overallocation() {
-        for max_bytes in 0..=8 {
+        for max_bytes in 0_u8..=8 {
             let mut storage = StackHeader([0; 64]);
-            let b = unsafe { align_rt_builder_init_bounded_stack(storage.0.as_mut_ptr(), max_bytes) };
+            let b = unsafe {
+                align_rt_builder_init_bounded_stack(storage.0.as_mut_ptr(), i64::from(max_bytes))
+            };
             unsafe { align_rt_builder_write(b, b"{}".as_ptr(), 2) };
             let observed_cap = unsafe { (*b).buf.cap };
-            assert!(observed_cap <= max_bytes as usize, "cap {max_bytes} allocated {observed_cap}");
+            assert!(observed_cap <= usize::from(max_bytes), "cap {max_bytes} allocated {observed_cap}");
 
             let mut out = AlignStr { ptr: core::ptr::null(), len: -1 };
             let status = unsafe { align_rt_builder_finish_bounded_stack(b, &mut out) };
@@ -23571,7 +23573,7 @@ mod tests {
             (
                 "char",
                 "日".as_bytes().to_vec(),
-                Box::new(|b| unsafe { align_rt_builder_write_char(b, '日' as u32) }),
+                Box::new(|b| unsafe { align_rt_builder_write_char(b, u32::from('日')) }),
             ),
             (
                 "float",

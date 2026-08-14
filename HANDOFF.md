@@ -68,8 +68,14 @@ shares `json.encode` bytes and schema, returns an owned `Result<string, Error>`,
 negative or exceeded inclusive emitted-byte limit as `Error.Invalid`. The runtime bounded builder,
 Sema/checked-HIR discriminator, MIR Result control flow, LLVM shared formatter path, typed ABI rows,
 and focused runtime/driver owners are implemented. Complete the focused ARM-native qualification,
-comprehensive review, repair, publication preflight, PR, and merge. Do not build a second formatter,
-estimator pass, dynamic JSON value, or unbounded-encode-then-discard compatibility path.
+comprehensive review, repair, publication preflight, PR, and merge. The comprehensive review of
+`e439f643841bc8ad2f816993ddc8d4a415cbcf52` found one valid checked-HIR boundary gap: the bounded
+discriminator reused generic template validation and therefore admitted raw `str` holes or arbitrary
+text in malformed HIR. The consolidated repair adds an iterative canonical-plan grammar and exact
+part-type validation; its ARM-native validator owners, seven-test driver owner, workspace build, and
+library Clippy target pass with one job. Run the findings-fixed publication preflight next. Do not
+build a second formatter, estimator pass, dynamic JSON value, or unbounded-encode-then-discard
+compatibility path.
 
 Out-of-gate suites (everything outside `scripts/test-pr.sh`) are guarded by the
 nightly full-suite workflow, which builds once, runs every compiled test binary

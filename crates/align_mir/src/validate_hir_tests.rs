@@ -9707,7 +9707,15 @@ fn hir_body_validator_pipeline_template_json_group() {
         Vec::new(),
         body_test_expr(
             hir::ExprKind::JsonEncodeBounded {
-                parts: vec![hir::TemplatePart::Text("{}".to_string())],
+                parts: vec![
+                    hir::TemplatePart::Text("{".to_string()),
+                    hir::TemplatePart::Text("\"text\":".to_string()),
+                    hir::TemplatePart::JsonStr(body_test_expr(
+                        hir::ExprKind::Str("value".to_string()),
+                        Ty::Str,
+                    )),
+                    hir::TemplatePart::Text("}".to_string()),
+                ],
                 max_bytes: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
             },
             result_string,
@@ -10111,6 +10119,25 @@ fn hir_body_validator_pipeline_template_json_group() {
         panic!("bounded encoder fixture lost its discriminator")
     };
     parts.clear();
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "b2b2_json_encode_bounded");
+    let hir::ExprKind::JsonEncodeBounded { parts, .. } = &mut expression.kind else {
+        panic!("bounded encoder fixture lost its discriminator")
+    };
+    let hir::TemplatePart::JsonStr(value) = parts.remove(2) else {
+        panic!("bounded encoder fixture lost its JSON string part")
+    };
+    parts.insert(2, hir::TemplatePart::Hole(value));
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "b2b2_json_encode_bounded");
+    let hir::ExprKind::JsonEncodeBounded { parts, .. } = &mut expression.kind else {
+        panic!("bounded encoder fixture lost its discriminator")
+    };
+    parts[1] = hir::TemplatePart::Text("raw".to_string());
     assert!(!body_core_metadata_is_valid(&reject));
 
     let mut reject = program.clone();

@@ -4703,7 +4703,7 @@ fn lower_template_parts(b: &mut Builder, parts: &[hir::TemplatePart]) -> Option<
             hir::TemplatePart::Text(text) => pieces.push(TemplatePiece::Static(text.clone())),
             hir::TemplatePart::PopComma => pieces.push(TemplatePiece::PopComma),
             _ => {
-                let child = template_part_expr(part).expect("an operand part has one expression");
+                let child = template_part_expr(part)?;
                 let operand = lower_expr(b, child);
                 if !lowering_continues(b) {
                     return None;

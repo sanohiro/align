@@ -3718,7 +3718,7 @@ impl<'a> BodyValidator<'a> {
                 !parts.is_empty() && self.template_parts_envelope_ok(parts)
             }
             hir::ExprKind::JsonEncodeBounded { parts, .. } => {
-                !parts.is_empty() && self.template_parts_envelope_ok(parts)
+                !parts.is_empty() && self.json_encode_parts_envelope_ok(parts)
             }
             hir::ExprKind::JsonDecode { struct_id, .. }
             | hir::ExprKind::JsonDecodeStructArray { struct_id, .. }
@@ -4699,6 +4699,291 @@ impl<'a> BodyValidator<'a> {
                     && self.json_union_descriptor_ok(*enum_id, true)
             }
         })
+    }
+
+    fn json_encode_parts_envelope_ok(&self, parts: &[hir::TemplatePart]) -> bool {
+        Self::json_encode_parts_syntax_ok(parts) && self.template_parts_envelope_ok(parts)
+    }
+
+    /// Validate the compiler-owned canonical JSON plan independently of expression facts.
+    ///
+    /// Ordinary templates deliberately admit arbitrary text and printable `str` holes. A bounded
+    /// encode has a dedicated HIR discriminator, so accepting that generic grammar here would let
+    /// malformed checked HIR select raw text/string formatting while claiming canonical JSON.
+    /// Keep this parser iterative: a generated plan is flat even when its record schema is deeply
+    /// nested, and validation must not turn that nesting back into native call-stack recursion.
+    fn json_encode_parts_syntax_ok(parts: &[hir::TemplatePart]) -> bool {
+        #[derive(Clone, Copy)]
+        enum Frame {
+            Array {
+                state: ArrayState,
+                elements: usize,
+            },
+            Object {
+                has_option: bool,
+                state: ObjectState,
+                fields: usize,
+                saw_option: bool,
+            },
+        }
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum ArrayState {
+            ElementOrClose,
+            CommaOrClose,
+        }
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum ObjectState {
+            FieldOrClose,
+            Value,
+            TrailingComma,
+            Close,
+        }
+
+        fn static_text(part: &hir::TemplatePart) -> Option<&str> {
+            match part {
+                hir::TemplatePart::Text(text) => Some(text.as_str()),
+                _ => None,
+            }
+        }
+
+        fn field_prefix(text: &str, leading_comma: bool) -> bool {
+            let Some(text) = (if leading_comma {
+                text.strip_prefix(',')
+            } else if text.starts_with(',') {
+                None
+            } else {
+                Some(text)
+            }) else {
+                return false;
+            };
+            text.strip_prefix('"')
+                .and_then(|text| text.strip_suffix("\":"))
+                .is_some_and(valid_declaration_name)
+        }
+
+        fn value_part(part: &hir::TemplatePart) -> bool {
+            matches!(
+                part,
+                hir::TemplatePart::Hole(_)
+                    | hir::TemplatePart::JsonStr(_)
+                    | hir::TemplatePart::StructArrayField { .. }
+                    | hir::TemplatePart::ScalarArrayField { .. }
+                    | hir::TemplatePart::UnionValue { .. }
+            )
+        }
+
+        if parts.len() == 1 {
+            return matches!(&parts[0], hir::TemplatePart::UnionValue { .. });
+        }
+
+        // Record whether each object has an Option field at its own level. The producer switches
+        // the complete object to comma-repair spelling when any such field exists.
+        let mut object_options = vec![None; parts.len()];
+        let mut objects = Vec::new();
+        for (index, part) in parts.iter().enumerate() {
+            match part {
+                hir::TemplatePart::Text(text) if text == "{" => {
+                    objects.push((index, false));
+                }
+                hir::TemplatePart::OptionField { .. }
+                | hir::TemplatePart::OptionStructField { .. } => {
+                    let Some((_, has_option)) = objects.last_mut() else {
+                        return false;
+                    };
+                    *has_option = true;
+                }
+                hir::TemplatePart::Text(text) if text == "}" => {
+                    let Some((open, has_option)) = objects.pop() else {
+                        return false;
+                    };
+                    object_options[open] = Some(has_option);
+                }
+                _ => {}
+            }
+        }
+        if !objects.is_empty() {
+            return false;
+        }
+
+        let mut frames = Vec::new();
+        match static_text(&parts[0]) {
+            Some("[") => frames.push(Frame::Array {
+                state: ArrayState::ElementOrClose,
+                elements: 0,
+            }),
+            Some("{") => {
+                let Some(has_option) = object_options[0] else {
+                    return false;
+                };
+                frames.push(Frame::Object {
+                    has_option,
+                    state: ObjectState::FieldOrClose,
+                    fields: 0,
+                    saw_option: false,
+                });
+            }
+            _ => return false,
+        }
+
+        let mut index = 1;
+        while let Some(frame) = frames.pop() {
+            let Some(part) = parts.get(index) else {
+                return false;
+            };
+            match frame {
+                Frame::Array {
+                    state: ArrayState::ElementOrClose,
+                    elements,
+                } => match static_text(part) {
+                    Some("]") if elements == 0 => {
+                        index += 1;
+                    }
+                    Some("{") => {
+                        let Some(has_option) = object_options[index] else {
+                            return false;
+                        };
+                        frames.push(Frame::Array {
+                            state: ArrayState::CommaOrClose,
+                            elements: elements + 1,
+                        });
+                        frames.push(Frame::Object {
+                            has_option,
+                            state: ObjectState::FieldOrClose,
+                            fields: 0,
+                            saw_option: false,
+                        });
+                        index += 1;
+                    }
+                    _ => return false,
+                },
+                Frame::Array {
+                    state: ArrayState::CommaOrClose,
+                    elements,
+                } => match static_text(part) {
+                    Some(",") => {
+                        frames.push(Frame::Array {
+                            state: ArrayState::ElementOrClose,
+                            elements,
+                        });
+                        index += 1;
+                    }
+                    Some("]") => {
+                        index += 1;
+                    }
+                    _ => return false,
+                },
+                Frame::Object {
+                    has_option,
+                    state: ObjectState::FieldOrClose,
+                    fields,
+                    saw_option,
+                } => {
+                    if matches!(static_text(part), Some("}")) {
+                        if has_option {
+                            return false;
+                        }
+                        index += 1;
+                    } else if has_option
+                        && matches!(part, hir::TemplatePart::OptionField { .. } | hir::TemplatePart::OptionStructField { .. })
+                    {
+                        frames.push(Frame::Object {
+                            has_option,
+                            state: ObjectState::FieldOrClose,
+                            fields: fields + 1,
+                            saw_option: true,
+                        });
+                        index += 1;
+                    } else if has_option && matches!(part, hir::TemplatePart::PopComma) {
+                        if !saw_option {
+                            return false;
+                        }
+                        frames.push(Frame::Object {
+                            has_option,
+                            state: ObjectState::Close,
+                            fields,
+                            saw_option,
+                        });
+                        index += 1;
+                    } else if static_text(part)
+                        .is_some_and(|text| field_prefix(text, !has_option && fields > 0))
+                    {
+                        frames.push(Frame::Object {
+                            has_option,
+                            state: ObjectState::Value,
+                            fields: fields + 1,
+                            saw_option,
+                        });
+                        index += 1;
+                    } else {
+                        return false;
+                    }
+                }
+                Frame::Object {
+                    has_option,
+                    state: ObjectState::Value,
+                    fields,
+                    saw_option,
+                } => {
+                    let next = if has_option {
+                        ObjectState::TrailingComma
+                    } else {
+                        ObjectState::FieldOrClose
+                    };
+                    frames.push(Frame::Object {
+                        has_option,
+                        state: next,
+                        fields,
+                        saw_option,
+                    });
+                    if matches!(static_text(part), Some("{")) {
+                        let Some(child_has_option) = object_options[index] else {
+                            return false;
+                        };
+                        frames.push(Frame::Object {
+                            has_option: child_has_option,
+                            state: ObjectState::FieldOrClose,
+                            fields: 0,
+                            saw_option: false,
+                        });
+                    } else if !value_part(part) {
+                        return false;
+                    }
+                    index += 1;
+                }
+                Frame::Object {
+                    has_option,
+                    state: ObjectState::TrailingComma,
+                    fields,
+                    saw_option,
+                } => {
+                    if !matches!(static_text(part), Some(",")) {
+                        return false;
+                    }
+                    frames.push(Frame::Object {
+                        has_option,
+                        state: ObjectState::FieldOrClose,
+                        fields,
+                        saw_option,
+                    });
+                    index += 1;
+                }
+                Frame::Object {
+                    has_option,
+                    state: ObjectState::Close,
+                    fields,
+                    saw_option,
+                } => {
+                    if !matches!(static_text(part), Some("}")) {
+                        return false;
+                    }
+                    let _ = (has_option, fields, saw_option);
+                    index += 1;
+                }
+            }
+        }
+        index == parts.len()
     }
 
     fn json_scalar_target_ok(&self, ty: Ty) -> bool {
@@ -8762,7 +9047,7 @@ impl<'a> BodyValidator<'a> {
             }
             hir::ExprKind::JsonEncodeBounded { parts, max_bytes } => {
                 let (template_ty, template_falls, template_breaks) =
-                    self.derive_template_expression(parts, context)?;
+                    self.derive_json_encode_expression(parts, context)?;
                 let limit = self.expr_flow(max_bytes)?;
                 if template_ty != Ty::Str || limit.ty != i64_ty() {
                     return None;
@@ -9066,6 +9351,97 @@ impl<'a> BodyValidator<'a> {
         }
         if !object_has_option.is_empty() {
             return None;
+        }
+        let (falls, breaks) = strict_flow(&flows);
+        Some((Ty::Str, falls, breaks))
+    }
+
+    fn derive_json_encode_expression(
+        &self,
+        parts: &[hir::TemplatePart],
+        _: &BodyContext,
+    ) -> Option<(Ty, bool, Vec<Ty>)> {
+        if !Self::json_encode_parts_syntax_ok(parts) {
+            return None;
+        }
+        let mut flows = Vec::new();
+        for part in parts {
+            let flow = match part {
+                hir::TemplatePart::Text(_) | hir::TemplatePart::PopComma => continue,
+                hir::TemplatePart::Hole(expression) => {
+                    let flow = self.expr_flow(expression)?;
+                    if !matches!(
+                        flow.ty,
+                        Ty::Int(integer) if valid_int(integer.bits)
+                    ) && !matches!(
+                        flow.ty,
+                        Ty::Float(float) if valid_float(float.bits)
+                    ) && flow.ty != Ty::Bool
+                    {
+                        return None;
+                    }
+                    flow
+                }
+                hir::TemplatePart::JsonStr(expression) => {
+                    let flow = self.expr_flow(expression)?;
+                    if flow.ty != Ty::Str {
+                        return None;
+                    }
+                    flow
+                }
+                hir::TemplatePart::OptionField { access, name } => {
+                    let flow = self.expr_flow(access)?;
+                    if !valid_declaration_name(name)
+                        || !matches!(
+                            flow.ty,
+                            Ty::Option(payload) if self.json_array_element_ok(payload)
+                        )
+                    {
+                        return None;
+                    }
+                    flow
+                }
+                hir::TemplatePart::OptionStructField {
+                    access,
+                    name,
+                    struct_id,
+                } => {
+                    let flow = self.expr_flow(access)?;
+                    if !valid_declaration_name(name)
+                        || flow.ty != Ty::Option(Scalar::Struct(*struct_id))
+                        || !self.json_struct_descriptor_ok(*struct_id, true)
+                    {
+                        return None;
+                    }
+                    flow
+                }
+                hir::TemplatePart::StructArrayField { access, struct_id } => {
+                    let flow = self.expr_flow(access)?;
+                    if flow.ty != Ty::DynStructArray(*struct_id, align_sema::Layout::Aos)
+                        || !self.json_struct_descriptor_ok(*struct_id, true)
+                    {
+                        return None;
+                    }
+                    flow
+                }
+                hir::TemplatePart::ScalarArrayField { access, elem } => {
+                    let flow = self.expr_flow(access)?;
+                    if flow.ty != Ty::DynArray(*elem) || !self.json_array_element_ok(*elem) {
+                        return None;
+                    }
+                    flow
+                }
+                hir::TemplatePart::UnionValue { access, enum_id } => {
+                    let flow = self.expr_flow(access)?;
+                    if flow.ty != Ty::Enum(*enum_id)
+                        || !self.json_union_descriptor_ok(*enum_id, true)
+                    {
+                        return None;
+                    }
+                    flow
+                }
+            };
+            flows.push(flow);
         }
         let (falls, breaks) = strict_flow(&flows);
         Some((Ty::Str, falls, breaks))
