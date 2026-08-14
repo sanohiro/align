@@ -7,34 +7,16 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-15._ Active work is align-llm Request 5's
-consumer-complete bounded HTTP response-body capability on
-`agent/request5-bounded-http`, based on `7a06b2fd`. Both Pure bound-local setters,
-checked HIR/MIR/LLVM A66 lowering, the HTTP-private `Error.Code(-1)` mapping,
-fixed explicit head/body allocation, CL/chunked/close-delimited enforcement,
-bodyless composition, cleanup, and `get_many` propagation are implemented.
-Focused runtime, checked-HIR, ABI/export, cache-identity, and native ARM64 driver
-owners pass with `CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 ALIGN_GATE_JOBS=1` and
-isolated target `/tmp/align-request5-target`. The complete `align_sema` (223),
-`align_mir` (159), and `align_codegen_llvm` (89 passed, 5 ignored) suites pass,
-as does their applicable lib/bin clippy owner. The runtime aggregate has nine
-macOS-host failures (one non-UTF-8 filesystem fixture, two HTTP pool fixtures,
-and six TLS fixtures); the unchanged `7a06b2fd` runtime binary has those same
-nine failures plus its now-repaired stale export inventory. Candidate
-`c7030580` received one comprehensive host review with one valid P2: an 8 KiB
-retained chunk-line buffer exceeded the promised 557,056-byte ceiling. The
-consolidated repair replaces it with scalar incremental grammar state, pins the
-decoder below 1 KiB, and preserves the existing extension grammar across every
-split boundary. Final comprehensive review of repair head `e6cbfa5d` found one
-valid P2: the chunked path allocated the selected-cap body before its first
-complete chunk-size line passed the cap. The narrow disposition defers that
-allocation until the first nonzero valid in-cap chunk and pins rejection-before-
-allocation. The focused explicit-bound runtime matrix and exact 557,056-byte
-ceiling test pass after the final repair, as do all five native ARM64 driver
-owners, runtime lib Clippy, and the lint ratchet. The repair delta is limited to
-the allocation point, its regression assertions, checked limit conversion, and
-this handoff. Next: run the exact-head pre-publication gate, then publish and
-merge the PR.
+_Last updated: 2026-08-15._ Align PR #812 merged align-llm Request 5's bounded HTTP
+response-body capability at `5aa5b23a`. Its exact-head native ARM64 preflight and every required
+GitHub check passed before merge. Active work is the separate align-llm Request 7
+benchmark-evidence prerequisite design on `agent/json-escape-benchmark-evidence-design`. The
+proposed contract is `docs/impl/core-design/json-escape-benchmark-evidence.md`: a merged-baseline
+controller, native named x86_64 host, digest-pinned offline OCI toolchain, read-only revision
+isolation, fixed balanced sampling, exact integer ratios, and host-signed canonical evidence. Next:
+finish the author consistency pass, run one independent design review, fix its complete valid
+finding set, publish and merge the design, then implement the benchmark-input and evidence-controller
+prerequisites before creating a Request 7 implementation branch.
 
 The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit
