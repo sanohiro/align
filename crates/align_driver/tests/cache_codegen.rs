@@ -790,13 +790,19 @@ fn record_builder_nominal_identity_and_definition_edit_revert() {
     }
     let records_v1 = concat!(
         "module records\n",
-        "pub Item { name: string, value: i64 }\n",
-        "pub fn make(value: i64) -> Item = Item{name: \"item\".clone(), value: value}\n",
+        "pub Item { name: string, tags: array<string>, value: i64 }\n",
+        "fn tags() -> array<string> { mut b: array_builder<string> := array_builder()\n",
+        "  b.push(\"tag\".clone())\n",
+        "  return b.build() }\n",
+        "pub fn make(value: i64) -> Item = Item{name: \"item\".clone(), tags: tags(), value: value}\n",
     );
     let records_v2 = concat!(
         "module records\n",
-        "pub Item { name: string, value: i64, active: bool }\n",
-        "pub fn make(value: i64) -> Item = Item{name: \"item\".clone(), value: value, active: true}\n",
+        "pub Item { name: string, tags: array<string>, value: i64, active: bool }\n",
+        "fn tags() -> array<string> { mut b: array_builder<string> := array_builder()\n",
+        "  b.push(\"tag\".clone())\n",
+        "  return b.build() }\n",
+        "pub fn make(value: i64) -> Item = Item{name: \"item\".clone(), tags: tags(), value: value, active: true}\n",
     );
     let main = concat!(
         "module main\n",

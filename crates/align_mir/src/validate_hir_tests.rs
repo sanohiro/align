@@ -193,16 +193,29 @@ fn checked_source_program(source: &str) -> hir::Program {
 #[test]
 fn heap_record_array_builder_rows_match_the_producer() {
     let source = concat!(
-        "Item { name: string, value: i64 }\n",
+        "Child { label: string }\n",
+        "Item { name: string, maybe: Option<Child>, nested: Option<Option<Child>>, names: array<string>, children: array<Child> }\n",
         "fn main() -> i32 {\n",
+        "  mut children: array_builder<Child> := array_builder()\n",
+        "  children.push(Child{label: \"child\".clone()})\n",
+        "  child_values := children.build()\n",
+        "  mut names: array_builder<string> := array_builder()\n",
+        "  names.push(\"first\".clone())\n",
+        "  names.push(\"second\".clone())\n",
+        "  name_values := names.build()\n",
         "  mut items: array_builder<Item> := array_builder()\n",
-        "  items.push(Item{name: \"owned\".clone(), value: 7})\n",
+        "  items.push(Item{name: \"owned\".clone(), maybe: Some(Child{label: \"optional\".clone()}), nested: Some(Some(Child{label: \"nested\".clone()})), names: name_values, children: child_values})\n",
         "  values := items.build()\n",
-        "  return values.len() as i32\n",
+        "  return 0\n",
         "}\n",
     );
     let program = checked_source_program(source);
     assert!(body_core_metadata_is_valid(&program));
+    let item_id = program
+        .structs
+        .iter()
+        .position(|definition| definition.source_name == "Item")
+        .expect("Item definition") as u32;
     let gates = crate::validate_hir::DelegatedGates::new(&program);
     assert!(gates.array_builder_append_elem_ok(ArrayBuilderElem::Scalar(
         Scalar::Int(IntTy {
@@ -214,7 +227,7 @@ fn heap_record_array_builder_rows_match_the_producer() {
         !gates.array_builder_append_elem_ok(ArrayBuilderElem::Scalar(Scalar::Struct(0))),
         "widening heap construction to Copy records must not widen append"
     );
-    assert!(gates.heap_array_builder_record_ok(0));
+    assert!(gates.heap_array_builder_record_ok(item_id));
     assert!(!gates.heap_array_builder_record_ok(99));
 
     for excluded in [
@@ -228,10 +241,7 @@ fn heap_record_array_builder_rows_match_the_producer() {
         Ty::Raw,
         Ty::Fn(0),
         Ty::Builder,
-        Ty::DynArray(Scalar::Int(IntTy {
-            bits: 64,
-            signed: true,
-        })),
+        Ty::Param(0),
         Ty::Array(
             Scalar::Int(IntTy {
                 bits: 64,
@@ -239,7 +249,6 @@ fn heap_record_array_builder_rows_match_the_producer() {
             }),
             2,
         ),
-        Ty::Option(Scalar::String),
         Ty::Result(
             Scalar::String,
             Scalar::Int(IntTy {
@@ -250,33 +259,56 @@ fn heap_record_array_builder_rows_match_the_producer() {
         Ty::Enum(0),
         Ty::Tuple(0),
         Ty::Box(Scalar::String),
-        Ty::DynStructArray(0, Layout::Aos),
+        Ty::DynStructArray(0, Layout::Soa),
     ] {
         let mut rejected = program.clone();
-        rejected.structs[0].fields[0].ty = excluded;
+        rejected.structs[item_id as usize].fields[0].ty = excluded;
         assert!(
             !crate::validate_hir::DelegatedGates::new(&rejected)
-                .heap_array_builder_record_ok(0),
+                .heap_array_builder_record_ok(item_id),
             "checked-HIR heap-record formation admitted excluded field {excluded:?}"
         );
     }
 
     for malformed in ["empty", "layout-c", "aligned", "cycle"] {
         let mut rejected = program.clone();
-        let record = &mut rejected.structs[0];
+        let record = &mut rejected.structs[item_id as usize];
         match malformed {
             "empty" => record.fields.clear(),
             "layout-c" => record.c_repr = true,
             "aligned" => record.align = Some(16),
-            "cycle" => record.fields[0].ty = Ty::Struct(0),
+            "cycle" => record.fields[0].ty = Ty::Struct(item_id),
             _ => {}
         }
         assert!(
             !crate::validate_hir::DelegatedGates::new(&rejected)
-                .heap_array_builder_record_ok(0),
+                .heap_array_builder_record_ok(item_id),
             "checked-HIR heap-record formation admitted malformed {malformed} definition"
         );
     }
+
+    let mut rejected = program.clone();
+    rejected.structs[item_id as usize].fields[2].ty = Ty::Tagged(99);
+    assert!(
+        !crate::validate_hir::DelegatedGates::new(&rejected)
+            .heap_array_builder_record_ok(item_id),
+        "checked-HIR heap-record formation admitted an unknown tagged id"
+    );
+
+    let mut rejected = program.clone();
+    let nested_tagged = match rejected.structs[item_id as usize].fields[2].ty {
+        Ty::Option(Scalar::Tagged(id)) => id,
+        other => panic!("nested Option fixture lost its tagged payload: {other:?}"),
+    };
+    rejected.tagged_types[nested_tagged as usize] = hir::TaggedType::Result(
+        Scalar::Struct(0),
+        Scalar::String,
+    );
+    assert!(
+        !crate::validate_hir::DelegatedGates::new(&rejected)
+            .heap_array_builder_record_ok(item_id),
+        "checked-HIR heap-record formation admitted a nested Result"
+    );
 
     fn main_function(program: &mut hir::Program) -> Option<&mut hir::Fn> {
         program
@@ -287,7 +319,7 @@ fn heap_record_array_builder_rows_match_the_producer() {
 
     let mut reject = program.clone();
     if let Some(function) = main_function(&mut reject)
-        && let Some(hir::Stmt::Let { init, .. }) = function.body.stmts.get_mut(0)
+        && let Some(hir::Stmt::Let { init, .. }) = function.body.stmts.get_mut(7)
         && let hir::ExprKind::ArrayBuilderNew { elem, .. } = &mut init.kind
     {
         *elem = ArrayBuilderElem::Scalar(Scalar::String);
@@ -296,7 +328,7 @@ fn heap_record_array_builder_rows_match_the_producer() {
 
     let mut reject = program.clone();
     if let Some(function) = main_function(&mut reject)
-        && let Some(hir::Stmt::Expr(push)) = function.body.stmts.get_mut(1)
+        && let Some(hir::Stmt::Expr(push)) = function.body.stmts.get_mut(8)
         && let hir::ExprKind::ArrayBuilderPush { moves_value, .. } = &mut push.kind
     {
         *moves_value = false;
@@ -305,7 +337,7 @@ fn heap_record_array_builder_rows_match_the_producer() {
 
     let mut reject = program.clone();
     if let Some(function) = main_function(&mut reject)
-        && let Some(hir::Stmt::Let { init, .. }) = function.body.stmts.get_mut(2)
+        && let Some(hir::Stmt::Let { init, .. }) = function.body.stmts.get_mut(9)
         && matches!(init.kind, hir::ExprKind::ArrayBuilderBuild(_))
     {
         init.ty = Ty::DynArray(Scalar::String);
@@ -5431,10 +5463,6 @@ fn malformed_hir_type_placement_fails_closed() {
     field_box.structs[0].fields[0].ty = Ty::Box(scalar_int(64));
     assert_placement_rejected("box in struct field", &field_box);
 
-    let mut field_owned_array = baseline_program();
-    field_owned_array.structs[0].fields[0].ty = Ty::DynArray(Scalar::String);
-    assert_placement_rejected("deep-free array in struct field", &field_owned_array);
-
     assert_placement_rejected(
         "nested owned array element",
         &with_return(Ty::DynArray(Scalar::DynArray(PrimScalar::Int(IntTy {
@@ -6048,6 +6076,10 @@ fn valid_hir_type_placement_preflight_is_mir_identity() {
         FieldDef {
             name: "owned".to_string(),
             ty: Ty::File,
+        },
+        FieldDef {
+            name: "direct_owned_array".to_string(),
+            ty: Ty::DynArray(Scalar::String),
         },
         FieldDef {
             name: "nested_owned_array".to_string(),

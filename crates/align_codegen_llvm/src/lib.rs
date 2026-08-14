@@ -23442,10 +23442,17 @@ mod tests {
     #[test]
     fn unfinished_heap_record_builders_reuse_array_drop_for_stack_and_boxed_headers() {
         let stack = ir(
-            "Item { name: string, value: i64 }\n\
+            "Leaf { name: string }\n\
+             Item { maybe: Option<Leaf>, names: array<string>, leaves: array<Leaf>, value: i64 }\n\
+             fn names() -> array<string> { mut b: array_builder<string> := array_builder()\n\
+               b.push(\"name\".clone())\n\
+               return b.build() }\n\
+             fn leaves() -> array<Leaf> { mut b: array_builder<Leaf> := array_builder()\n\
+               b.push(Leaf{name: \"leaf\".clone()})\n\
+               return b.build() }\n\
              fn main() -> i32 {\n\
                mut items: array_builder<Item> := array_builder()\n\
-               items.push(Item{name: \"stack\".clone(), value: 1})\n\
+               items.push(Item{maybe: Some(Leaf{name: \"optional\".clone()}), names: names(), leaves: leaves(), value: 1})\n\
                return 0\n\
              }\n",
         );
@@ -23459,11 +23466,18 @@ mod tests {
         );
 
         let boxed = ir(
-            "Item { name: string, value: i64 }\n\
+            "Leaf { name: string }\n\
+             Item { maybe: Option<Leaf>, names: array<string>, leaves: array<Leaf>, value: i64 }\n\
+             fn names() -> array<string> { mut b: array_builder<string> := array_builder()\n\
+               b.push(\"name\".clone())\n\
+               return b.build() }\n\
+             fn leaves() -> array<Leaf> { mut b: array_builder<Leaf> := array_builder()\n\
+               b.push(Leaf{name: \"leaf\".clone()})\n\
+               return b.build() }\n\
              fn pass(items: array_builder<Item>) -> array_builder<Item> = items\n\
              fn main() -> i32 {\n\
                mut items: array_builder<Item> := array_builder()\n\
-               items.push(Item{name: \"boxed\".clone(), value: 1})\n\
+               items.push(Item{maybe: Some(Leaf{name: \"optional\".clone()}), names: names(), leaves: leaves(), value: 1})\n\
                abandoned := pass(items)\n\
                return 0\n\
              }\n",

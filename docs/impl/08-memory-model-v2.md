@@ -823,7 +823,7 @@ closed the same way. Reading a field directly off a
 `slice<Struct>` element (`xs[i].field`) remains unsupported — a whole-element read (`row := xs[i]`)
 is the shape both this capability and `pkg.web` use.
 
-## 17. Recursive owned heap-record builders (accepted 2026-08-14)
+## 17. Recursive owned heap-record builders (implemented 2026-08-14)
 
 The align-llm Request 10 extension is specified by
 `17-library-boundary-prerequisites.md` §7.6. It does not add a memory model. It composes the shipped

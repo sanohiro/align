@@ -213,18 +213,21 @@ fn record_builder_partial_element_and_enclosing_record_cleanup() {
         return;
     }
     let src = concat!(
-        "Item { first: string, second: string }\n",
+        "Item { first: string, tags: array<string>, optional: Option<string>, second: string }\n",
         "Envelope { items: array<Item>, tail: string }\n",
+        "fn tags() -> array<string> { mut b: array_builder<string> := array_builder()\n",
+        "  b.push(\"tag\".clone())\n",
+        "  return b.build() }\n",
         "fn fail_string() -> Result<string, Error> = Err(Error.Code(1))\n",
         "fn partial() -> Result<i32, Error> {\n",
         "  mut b: array_builder<Item> := array_builder()\n",
-        "  b.push(Item{first: \"kept\".clone(), second: \"prefix\".clone()})\n",
-        "  b.push(Item{first: \"partial\".clone(), second: fail_string()?})\n",
+        "  b.push(Item{first: \"kept\".clone(), tags: tags(), optional: Some(\"optional\".clone()), second: \"prefix\".clone()})\n",
+        "  b.push(Item{first: \"partial\".clone(), tags: tags(), optional: None, second: fail_string()?})\n",
         "  return Ok(b.build().len() as i32)\n",
         "}\n",
         "fn enclosing() -> Result<Envelope, Error> {\n",
         "  mut b: array_builder<Item> := array_builder()\n",
-        "  b.push(Item{first: \"built\".clone(), second: \"owner\".clone()})\n",
+        "  b.push(Item{first: \"built\".clone(), tags: tags(), optional: Some(\"nested\".clone()), second: \"owner\".clone()})\n",
         "  return Ok(Envelope{items: b.build(), tail: fail_string()?})\n",
         "}\n",
         "fn main() -> i32 {\n",
@@ -248,18 +251,21 @@ fn record_builder_move_source_matrix() {
         return;
     }
     let src = concat!(
-        "Item { name: string, value: i64 }\n",
+        "Item { name: string, tags: array<string>, maybe: Option<string>, value: i64 }\n",
         "Choice { Left, Right }\n",
         "LoadErr { Bad }\n",
-        "fn make(value: i64) -> Item = Item{name: \"call\".clone(), value: value}\n",
+        "fn tags() -> array<string> { mut b: array_builder<string> := array_builder()\n",
+        "  b.push(\"tag\".clone())\n",
+        "  return b.build() }\n",
+        "fn make(value: i64) -> Item = Item{name: \"call\".clone(), tags: tags(), maybe: Some(\"optional\".clone()), value: value}\n",
         "fn maybe(value: i64) -> Result<Item, Error> = Ok(make(value))\n",
         "fn load(value: i64) -> Result<Item, LoadErr> = Ok(make(value))\n",
         "fn to_error(e: LoadErr) -> Error = match e { Bad => Error.Code(1) }\n",
         "fn collect(flag: bool) -> Result<array<Item>, Error> {\n",
         "  mut b: array_builder<Item> := array_builder()\n",
-        "  local := Item{name: \"local\".clone(), value: 1}\n",
+        "  local := Item{name: \"local\".clone(), tags: tags(), maybe: None, value: 1}\n",
         "  b.push(local)\n",
-        "  b.push(Item{name: \"fresh\".clone(), value: 2})\n",
+        "  b.push(Item{name: \"fresh\".clone(), tags: tags(), maybe: Some(\"fresh-optional\".clone()), value: 2})\n",
         "  b.push(make(3))\n",
         "  b.push(if flag { make(4) } else { make(40) })\n",
         "  choice := Choice.Left\n",
@@ -295,6 +301,23 @@ fn record_builder_source_use_after_push_and_borrowed_source_rejected() {
         "}\n",
     );
     assert!(check_diagnostics("ab-record-source-moved", moved).contains("moved"));
+
+    let recursive_moved = concat!(
+        "Item { names: array<string>, maybe: Option<string> }\n",
+        "fn names() -> array<string> { mut b: array_builder<string> := array_builder()\n",
+        "  b.push(\"name\".clone())\n",
+        "  return b.build() }\n",
+        "fn main() -> i32 {\n",
+        "  mut b: array_builder<Item> := array_builder()\n",
+        "  item := Item{names: names(), maybe: Some(\"owned\".clone())}\n",
+        "  b.push(item)\n",
+        "  b.push(item)\n",
+        "  return 0\n",
+        "}\n",
+    );
+    assert!(
+        check_diagnostics("ab-recursive-source-moved", recursive_moved).contains("moved")
+    );
 
     let borrowed = concat!(
         "Item { name: string }\n",
@@ -343,19 +366,80 @@ fn record_builder_source_use_after_push_and_borrowed_source_rejected() {
 }
 
 #[test]
+fn recursive_record_arena_owned_paths_reject_before_heap_push() {
+    let direct = concat!(
+        "Item { values: array<i64> }\n",
+        "fn main() -> i32 {\n",
+        "  mut heap: array_builder<Item> := array_builder()\n",
+        "  arena out {\n",
+        "    mut values: array_builder<i64> := array_builder(out)\n",
+        "    values.push(1)\n",
+        "    heap.push(Item{values: values.build()})\n",
+        "  }\n",
+        "  return 0\n",
+        "}\n",
+    );
+    assert!(
+        check_diagnostics("ab-recursive-arena-direct", direct)
+            .contains("cannot push a record with arena-owned")
+    );
+
+    let optional = concat!(
+        "Item { values: Option<array<i64>> }\n",
+        "fn main() -> i32 {\n",
+        "  mut heap: array_builder<Item> := array_builder()\n",
+        "  arena out {\n",
+        "    mut values: array_builder<i64> := array_builder(out)\n",
+        "    values.push(1)\n",
+        "    heap.push(Item{values: Some(values.build())})\n",
+        "  }\n",
+        "  return 0\n",
+        "}\n",
+    );
+    assert!(
+        check_diagnostics("ab-recursive-arena-option", optional)
+            .contains("cannot push a record with arena-owned")
+    );
+
+    let array_element = concat!(
+        "Leaf { values: array<i64> }\n",
+        "Item { leaves: array<Leaf> }\n",
+        "fn main() -> i32 {\n",
+        "  mut heap: array_builder<Item> := array_builder()\n",
+        "  arena out {\n",
+        "    mut values: array_builder<i64> := array_builder(out)\n",
+        "    values.push(1)\n",
+        "    mut leaves: array_builder<Leaf> := array_builder(out)\n",
+        "    leaves.push(Leaf{values: values.build()})\n",
+        "    heap.push(Item{leaves: leaves.build()})\n",
+        "  }\n",
+        "  return 0\n",
+        "}\n",
+    );
+    assert!(
+        check_diagnostics("ab-recursive-arena-array-element", array_element)
+            .contains("cannot push a record with arena-owned")
+    );
+}
+
+#[test]
 fn record_builder_by_value_parameter_return_and_borrow_mut() {
     if !backend_available() {
         return;
     }
     let src = concat!(
-        "Item { name: string, value: i64 }\n",
+        "Item { name: string, tags: array<string>, maybe: Option<string>, value: i64 }\n",
+        "fn tags() -> array<string> { mut b: array_builder<string> := array_builder()\n",
+        "  b.push(\"tag\".clone())\n",
+        "  return b.build() }\n",
+        "fn item(name: str, value: i64) -> Item = Item{name: name.clone(), tags: tags(), maybe: Some(\"optional\".clone()), value: value}\n",
         "fn relay(items: array_builder<Item>) -> array_builder<Item> = items\n",
         "fn add(borrow mut items: array_builder<Item>, item: Item) { items.push(item) }\n",
         "fn main() -> i32 {\n",
         "  mut first: array_builder<Item> := array_builder()\n",
-        "  first.push(Item{name: \"one\".clone(), value: 1})\n",
+        "  first.push(item(\"one\", 1))\n",
         "  mut second := relay(first)\n",
-        "  add(second, Item{name: \"two\".clone(), value: 2})\n",
+        "  add(second, item(\"two\", 2))\n",
         "  values := second.build()\n",
         "  return (values.len() + values[0].value + values[1].value) as i32\n",
         "}\n",
@@ -391,11 +475,300 @@ fn nested_move_record_reallocation_and_reassignment_drop_once() {
 }
 
 #[test]
+fn recursive_heap_tree_record_reallocation_build_and_drop() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Leaf { name: string, tags: array<string> }\n",
+        "Branch { maybe: Option<Leaf>, names: array<string>, nums: array<i64>, leaves: array<Leaf> }\n",
+        "fn strings(prefix: str) -> array<string> {\n",
+        "  mut b: array_builder<string> := array_builder()\n",
+        "  b.push(prefix.clone())\n",
+        "  b.push(\"tail\".clone())\n",
+        "  return b.build()\n",
+        "}\n",
+        "fn leaf(name: str) -> Leaf = Leaf{name: name.clone(), tags: strings(\"tag\")}\n",
+        "fn leaves() -> array<Leaf> {\n",
+        "  mut b: array_builder<Leaf> := array_builder()\n",
+        "  b.push(leaf(\"first\"))\n",
+        "  b.push(leaf(\"second\"))\n",
+        "  return b.build()\n",
+        "}\n",
+        "fn main() -> i32 {\n",
+        "  mut b: array_builder<Branch> := array_builder()\n",
+        "  mut i := 0\n",
+        "  loop {\n",
+        "    b.push(Branch{maybe: Some(leaf(\"optional\")), names: strings(\"name\"), nums: [1, 2, 3].to_array(), leaves: leaves()})\n",
+        "    i = i + 1\n",
+        "    if i >= 80 { break }\n",
+        "  }\n",
+        "  values := b.build()\n",
+        "  if values.len() != 80 { return 1 }\n",
+        "  return 0\n",
+        "}\n",
+    );
+    let out = build_and_run("ab-recursive-heap-tree", src);
+    assert_eq!(code(&out), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+const REQUEST10_C6_SOURCE: &str = r#"
+ArtifactExpectation { path: string, kind: string, expected_sha256: string }
+ArtifactDigest { path: string, mode: string, byte_count: i64, sha256: string }
+RegressionLimits { maximum_unrelated_diff_count: i64, maximum_patch_size_bytes: i64, maximum_public_api_change_count: i64, maximum_repair_loops: i64, maximum_benchmark_regression_ppm: Option<i64> }
+EnvironmentProbe { schema_version: i64, artifact_kind: string, producer: string, os: string, os_release: string, architecture: string, cpu: string, logical_cpu_count: Option<i64>, gpu: string, runtime_identity: string, content_sha256: string }
+EvaluationInputIdentity { schema_version: i64, artifact_kind: string, task_id: string, task_input_snapshot_sha256: string, parent_variant_sha256: string, candidate_variant_sha256: string, task_prompt_sha256: string, context_sources_sha256: string, generation_policy_sha256: string, generation_request_sha256: string, adapter_request_sha256: string, environment_policy_sha256: string, environment_sha256: string, sample_index: i64, paired_seed: i64, content_sha256: string }
+GenerationRequestIdentity { schema_version: i64, artifact_kind: string, rendered_prompt_sha256: string, system_text_sha256: string, user_text_sha256: string, generation_policy_sha256: string, provider_control_sha256: string, environment_policy_sha256: string, max_tokens: i64, temperature_micros: i64, paired_seed: i64, provider_request_sha256: string, seed_attestation_sha256: string, content_sha256: string }
+SeedCapabilityAttestation { schema_version: i64, artifact_kind: string, provider_kind: string, provider_model: string, requested_seed: i64, result: string, applied_seed: Option<i64>, provider_request_sha256: string, content_sha256: string }
+TaskMeasurement { schema_version: i64, artifact_kind: string, status: string, failure_kind: string, build_status: string, test_status: string, repair_loop_count: i64, unrelated_diff_count: i64, patch_size_bytes: i64, public_api_change_count: i64, policy_violation_count: i64, cleanup_passed: bool, containment_passed: bool, benchmark_regression_ppm: Option<i64>, generation_to_passing_patch_ns: Option<i64>, rendered_prompt_sha256: string, generation_request: GenerationRequestIdentity, environment_probe: EnvironmentProbe, seed_attestation: SeedCapabilityAttestation, diagnostic_summary: string, diagnostic_stdout: string, diagnostic_stderr: string, content_sha256: string }
+SnapshotRequest { schema_version: i64, artifact_kind: string, task_id: string, project_root: string, repo_path: string, repo_revision: string, require_clean_repo: bool, static_expectations: array<ArtifactExpectation>, additional_files: array<string>, workspace_path: string, allowed_workspace_entries: array<string>, content_sha256: string }
+PromptEvaluationTask { schema_version: i64, artifact_kind: string, task_id: string, repo_id: string, repo_revision: string, repo_path: string, require_clean_repo: bool, cmd: string, argv: array<string>, snapshot_cmd: string, snapshot_argv: array<string>, measurement_adapter_runtime: string, snapshot_helper_runtime: string, cwd: string, timeout_ns: i64, task_prompt_path: string, context_sources_path: string, generation_policy_path: string, provider_control_path: string, environment_policy_path: string, artifacts: array<ArtifactExpectation>, regression_limits: RegressionLimits, content_sha256: string }
+PromptTaskRow { schema_version: i64, artifact_kind: string, evaluation_id: string, task_id: string, sample_index: i64, variant: string, variant_id: string, variant_sha256: string, prompt_preparation_ns: i64, time_to_passing_patch_ns: Option<i64>, evaluation_input: EvaluationInputIdentity, measurement: TaskMeasurement, content_sha256: string }
+TaskAggregate { task_id: string, parent_pass_count: i64, candidate_pass_count: i64, parent_repair_loop_count: i64, candidate_repair_loop_count: i64, paired_pass_count: i64, parent_paired_median_time_ns: Option<i64>, candidate_paired_median_time_ns: Option<i64>, time_improvement_ppm: Option<i64>, time_regression_ppm: Option<i64> }
+CorpusAggregate { task_count: i64, sample_count: i64, parent_pass_count: i64, candidate_pass_count: i64, parent_repair_loop_count: i64, candidate_repair_loop_count: i64, paired_pass_count: i64, parent_paired_median_time_ns: Option<i64>, candidate_paired_median_time_ns: Option<i64>, completion_gain_count: i64, time_improvement_ppm: Option<i64>, time_regression_ppm: Option<i64>, repair_loop_regression_count: i64 }
+RegressionReason { task_id: string, sample_index: i64, code: string, parent_value: string, candidate_value: string, limit: string }
+RunSnapshotAttestation { schema_version: i64, artifact_kind: string, task_id: string, sample_index: i64, variant: string, status: string, error_code: string, error: string, snapshot_request_sha256: string, before_snapshot_result_sha256: string, after_snapshot_result_sha256: Option<string>, before_input_snapshot_sha256: Option<string>, after_input_snapshot_sha256: Option<string>, content_sha256: string }
+SnapshotResult { schema_version: i64, artifact_kind: string, task_id: string, status: string, error_code: string, error: string, environment_probe: Option<EnvironmentProbe>, artifact_digests: array<ArtifactDigest>, content_sha256: string }
+TaskInputSnapshot { schema_version: i64, artifact_kind: string, task_id: string, task_manifest_sha256: string, artifact_digests: array<ArtifactDigest>, environment_sha256: string, content_sha256: string }
+Request10ConsumerRoot { tasks: array<PromptEvaluationTask>, snapshot_requests: array<SnapshotRequest>, snapshot_results: array<SnapshotResult>, input_snapshots: array<TaskInputSnapshot>, snapshot_attestations: array<RunSnapshotAttestation>, rows: array<PromptTaskRow>, task_aggregates: array<TaskAggregate>, corpus_aggregate: Option<CorpusAggregate>, serious_regression_reasons: array<RegressionReason> }
+
+fn text(filled: bool) -> string {
+  if filled { return "x".clone() }
+  return "".clone()
+}
+fn strings(filled: bool) -> array<string> {
+  mut b: array_builder<string> := array_builder()
+  if filled { b.push(text(true)) }
+  return b.build()
+}
+fn expectation(filled: bool) -> ArtifactExpectation = ArtifactExpectation{path: text(filled), kind: text(filled), expected_sha256: text(filled)}
+fn expectations(include: bool, filled: bool) -> array<ArtifactExpectation> {
+  mut b: array_builder<ArtifactExpectation> := array_builder()
+  if include { b.push(expectation(filled)) }
+  return b.build()
+}
+fn digest(filled: bool) -> ArtifactDigest = ArtifactDigest{path: text(filled), mode: text(filled), byte_count: 1, sha256: text(filled)}
+fn digests(include: bool, filled: bool) -> array<ArtifactDigest> {
+  mut b: array_builder<ArtifactDigest> := array_builder()
+  if include { b.push(digest(filled)) }
+  return b.build()
+}
+fn limits(filled: bool) -> RegressionLimits = RegressionLimits{maximum_unrelated_diff_count: 1, maximum_patch_size_bytes: 1, maximum_public_api_change_count: 1, maximum_repair_loops: 1, maximum_benchmark_regression_ppm: if filled { Some(1) } else { None }}
+fn environment(filled: bool) -> EnvironmentProbe = EnvironmentProbe{schema_version: 1, artifact_kind: text(filled), producer: text(filled), os: text(filled), os_release: text(filled), architecture: text(filled), cpu: text(filled), logical_cpu_count: if filled { Some(1) } else { None }, gpu: text(filled), runtime_identity: text(filled), content_sha256: text(filled)}
+fn evaluation_input(filled: bool) -> EvaluationInputIdentity = EvaluationInputIdentity{schema_version: 1, artifact_kind: text(filled), task_id: text(filled), task_input_snapshot_sha256: text(filled), parent_variant_sha256: text(filled), candidate_variant_sha256: text(filled), task_prompt_sha256: text(filled), context_sources_sha256: text(filled), generation_policy_sha256: text(filled), generation_request_sha256: text(filled), adapter_request_sha256: text(filled), environment_policy_sha256: text(filled), environment_sha256: text(filled), sample_index: 1, paired_seed: 1, content_sha256: text(filled)}
+fn generation_request(filled: bool) -> GenerationRequestIdentity = GenerationRequestIdentity{schema_version: 1, artifact_kind: text(filled), rendered_prompt_sha256: text(filled), system_text_sha256: text(filled), user_text_sha256: text(filled), generation_policy_sha256: text(filled), provider_control_sha256: text(filled), environment_policy_sha256: text(filled), max_tokens: 1, temperature_micros: 1, paired_seed: 1, provider_request_sha256: text(filled), seed_attestation_sha256: text(filled), content_sha256: text(filled)}
+fn seed(filled: bool) -> SeedCapabilityAttestation = SeedCapabilityAttestation{schema_version: 1, artifact_kind: text(filled), provider_kind: text(filled), provider_model: text(filled), requested_seed: 1, result: text(filled), applied_seed: if filled { Some(1) } else { None }, provider_request_sha256: text(filled), content_sha256: text(filled)}
+fn measurement(filled: bool) -> TaskMeasurement = TaskMeasurement{schema_version: 1, artifact_kind: text(filled), status: text(filled), failure_kind: text(filled), build_status: text(filled), test_status: text(filled), repair_loop_count: 1, unrelated_diff_count: 1, patch_size_bytes: 1, public_api_change_count: 1, policy_violation_count: 1, cleanup_passed: true, containment_passed: true, benchmark_regression_ppm: if filled { Some(1) } else { None }, generation_to_passing_patch_ns: if filled { Some(1) } else { None }, rendered_prompt_sha256: text(filled), generation_request: generation_request(filled), environment_probe: environment(filled), seed_attestation: seed(filled), diagnostic_summary: text(filled), diagnostic_stdout: text(filled), diagnostic_stderr: text(filled), content_sha256: text(filled)}
+fn snapshot_request(filled: bool) -> SnapshotRequest = SnapshotRequest{schema_version: 1, artifact_kind: text(filled), task_id: text(filled), project_root: text(filled), repo_path: text(filled), repo_revision: text(filled), require_clean_repo: true, static_expectations: expectations(filled, filled), additional_files: strings(filled), workspace_path: text(filled), allowed_workspace_entries: strings(filled), content_sha256: text(filled)}
+fn prompt_task(filled: bool) -> PromptEvaluationTask = PromptEvaluationTask{schema_version: 1, artifact_kind: text(filled), task_id: text(filled), repo_id: text(filled), repo_revision: text(filled), repo_path: text(filled), require_clean_repo: true, cmd: text(filled), argv: strings(filled), snapshot_cmd: text(filled), snapshot_argv: strings(filled), measurement_adapter_runtime: text(filled), snapshot_helper_runtime: text(filled), cwd: text(filled), timeout_ns: 1, task_prompt_path: text(filled), context_sources_path: text(filled), generation_policy_path: text(filled), provider_control_path: text(filled), environment_policy_path: text(filled), artifacts: expectations(filled, filled), regression_limits: limits(filled), content_sha256: text(filled)}
+fn row(filled: bool) -> PromptTaskRow = PromptTaskRow{schema_version: 1, artifact_kind: text(filled), evaluation_id: text(filled), task_id: text(filled), sample_index: 1, variant: text(filled), variant_id: text(filled), variant_sha256: text(filled), prompt_preparation_ns: 1, time_to_passing_patch_ns: if filled { Some(1) } else { None }, evaluation_input: evaluation_input(filled), measurement: measurement(filled), content_sha256: text(filled)}
+fn task_aggregate(filled: bool) -> TaskAggregate = TaskAggregate{task_id: text(filled), parent_pass_count: 1, candidate_pass_count: 1, parent_repair_loop_count: 1, candidate_repair_loop_count: 1, paired_pass_count: 1, parent_paired_median_time_ns: if filled { Some(1) } else { None }, candidate_paired_median_time_ns: if filled { Some(1) } else { None }, time_improvement_ppm: if filled { Some(1) } else { None }, time_regression_ppm: if filled { Some(1) } else { None }}
+fn corpus(filled: bool) -> CorpusAggregate = CorpusAggregate{task_count: 1, sample_count: 1, parent_pass_count: 1, candidate_pass_count: 1, parent_repair_loop_count: 1, candidate_repair_loop_count: 1, paired_pass_count: 1, parent_paired_median_time_ns: if filled { Some(1) } else { None }, candidate_paired_median_time_ns: if filled { Some(1) } else { None }, completion_gain_count: 1, time_improvement_ppm: if filled { Some(1) } else { None }, time_regression_ppm: if filled { Some(1) } else { None }, repair_loop_regression_count: 1}
+fn reason(filled: bool) -> RegressionReason = RegressionReason{task_id: text(filled), sample_index: 1, code: text(filled), parent_value: text(filled), candidate_value: text(filled), limit: text(filled)}
+fn attestation(filled: bool) -> RunSnapshotAttestation = RunSnapshotAttestation{schema_version: 1, artifact_kind: text(filled), task_id: text(filled), sample_index: 1, variant: text(filled), status: text(filled), error_code: text(filled), error: text(filled), snapshot_request_sha256: text(filled), before_snapshot_result_sha256: text(filled), after_snapshot_result_sha256: if filled { Some(text(true)) } else { None }, before_input_snapshot_sha256: if filled { Some(text(true)) } else { None }, after_input_snapshot_sha256: if filled { Some(text(true)) } else { None }, content_sha256: text(filled)}
+fn snapshot_result(filled: bool) -> SnapshotResult = SnapshotResult{schema_version: 1, artifact_kind: text(filled), task_id: text(filled), status: text(filled), error_code: text(filled), error: text(filled), environment_probe: if filled { Some(environment(true)) } else { None }, artifact_digests: digests(filled, filled), content_sha256: text(filled)}
+fn input_snapshot(filled: bool) -> TaskInputSnapshot = TaskInputSnapshot{schema_version: 1, artifact_kind: text(filled), task_id: text(filled), task_manifest_sha256: text(filled), artifact_digests: digests(filled, filled), environment_sha256: text(filled), content_sha256: text(filled)}
+
+fn tasks(include: bool, filled: bool) -> array<PromptEvaluationTask> { mut b: array_builder<PromptEvaluationTask> := array_builder()
+  if include { b.push(prompt_task(filled)) }
+  return b.build() }
+fn snapshot_requests(include: bool, filled: bool) -> array<SnapshotRequest> { mut b: array_builder<SnapshotRequest> := array_builder()
+  if include { b.push(snapshot_request(filled)) }
+  return b.build() }
+fn snapshot_results(include: bool, filled: bool) -> array<SnapshotResult> { mut b: array_builder<SnapshotResult> := array_builder()
+  if include { b.push(snapshot_result(filled)) }
+  return b.build() }
+fn input_snapshots(include: bool, filled: bool) -> array<TaskInputSnapshot> { mut b: array_builder<TaskInputSnapshot> := array_builder()
+  if include { b.push(input_snapshot(filled)) }
+  return b.build() }
+fn attestations(include: bool, filled: bool) -> array<RunSnapshotAttestation> { mut b: array_builder<RunSnapshotAttestation> := array_builder()
+  if include { b.push(attestation(filled)) }
+  return b.build() }
+fn rows(include: bool, filled: bool) -> array<PromptTaskRow> { mut b: array_builder<PromptTaskRow> := array_builder()
+  if include { b.push(row(filled)) }
+  return b.build() }
+fn task_aggregates(include: bool, filled: bool) -> array<TaskAggregate> { mut b: array_builder<TaskAggregate> := array_builder()
+  if include { b.push(task_aggregate(filled)) }
+  return b.build() }
+fn reasons(include: bool, filled: bool) -> array<RegressionReason> { mut b: array_builder<RegressionReason> := array_builder()
+  if include { b.push(reason(filled)) }
+  return b.build() }
+fn root(include: bool, filled: bool) -> Request10ConsumerRoot = Request10ConsumerRoot{tasks: tasks(include, filled), snapshot_requests: snapshot_requests(include, filled), snapshot_results: snapshot_results(include, filled), input_snapshots: input_snapshots(include, filled), snapshot_attestations: attestations(include, filled), rows: rows(include, filled), task_aggregates: task_aggregates(include, filled), corpus_aggregate: if include { Some(corpus(filled)) } else { None }, serious_regression_reasons: reasons(include, filled)}
+fn main() -> i32 {
+  mut b: array_builder<Request10ConsumerRoot> := array_builder()
+  b.push(root(true, true))
+  b.push(root(true, false))
+  b.push(root(false, false))
+  values := b.build()
+  if values.len() == 3 { return 0 }
+  return 1
+}
+"#;
+
+#[test]
+fn request10_exact_c6_consumer_graph() {
+    let expected: &[(&str, &[(&str, &str)])] = &[
+        ("ArtifactExpectation", &[("path", "string"), ("kind", "string"), ("expected_sha256", "string")]),
+        ("ArtifactDigest", &[("path", "string"), ("mode", "string"), ("byte_count", "i64"), ("sha256", "string")]),
+        ("RegressionLimits", &[("maximum_unrelated_diff_count", "i64"), ("maximum_patch_size_bytes", "i64"), ("maximum_public_api_change_count", "i64"), ("maximum_repair_loops", "i64"), ("maximum_benchmark_regression_ppm", "Option<i64>")]),
+        ("EnvironmentProbe", &[("schema_version", "i64"), ("artifact_kind", "string"), ("producer", "string"), ("os", "string"), ("os_release", "string"), ("architecture", "string"), ("cpu", "string"), ("logical_cpu_count", "Option<i64>"), ("gpu", "string"), ("runtime_identity", "string"), ("content_sha256", "string")]),
+        ("EvaluationInputIdentity", &[("schema_version", "i64"), ("artifact_kind", "string"), ("task_id", "string"), ("task_input_snapshot_sha256", "string"), ("parent_variant_sha256", "string"), ("candidate_variant_sha256", "string"), ("task_prompt_sha256", "string"), ("context_sources_sha256", "string"), ("generation_policy_sha256", "string"), ("generation_request_sha256", "string"), ("adapter_request_sha256", "string"), ("environment_policy_sha256", "string"), ("environment_sha256", "string"), ("sample_index", "i64"), ("paired_seed", "i64"), ("content_sha256", "string")]),
+        ("GenerationRequestIdentity", &[("schema_version", "i64"), ("artifact_kind", "string"), ("rendered_prompt_sha256", "string"), ("system_text_sha256", "string"), ("user_text_sha256", "string"), ("generation_policy_sha256", "string"), ("provider_control_sha256", "string"), ("environment_policy_sha256", "string"), ("max_tokens", "i64"), ("temperature_micros", "i64"), ("paired_seed", "i64"), ("provider_request_sha256", "string"), ("seed_attestation_sha256", "string"), ("content_sha256", "string")]),
+        ("SeedCapabilityAttestation", &[("schema_version", "i64"), ("artifact_kind", "string"), ("provider_kind", "string"), ("provider_model", "string"), ("requested_seed", "i64"), ("result", "string"), ("applied_seed", "Option<i64>"), ("provider_request_sha256", "string"), ("content_sha256", "string")]),
+        ("TaskMeasurement", &[("schema_version", "i64"), ("artifact_kind", "string"), ("status", "string"), ("failure_kind", "string"), ("build_status", "string"), ("test_status", "string"), ("repair_loop_count", "i64"), ("unrelated_diff_count", "i64"), ("patch_size_bytes", "i64"), ("public_api_change_count", "i64"), ("policy_violation_count", "i64"), ("cleanup_passed", "bool"), ("containment_passed", "bool"), ("benchmark_regression_ppm", "Option<i64>"), ("generation_to_passing_patch_ns", "Option<i64>"), ("rendered_prompt_sha256", "string"), ("generation_request", "GenerationRequestIdentity"), ("environment_probe", "EnvironmentProbe"), ("seed_attestation", "SeedCapabilityAttestation"), ("diagnostic_summary", "string"), ("diagnostic_stdout", "string"), ("diagnostic_stderr", "string"), ("content_sha256", "string")]),
+        ("SnapshotRequest", &[("schema_version", "i64"), ("artifact_kind", "string"), ("task_id", "string"), ("project_root", "string"), ("repo_path", "string"), ("repo_revision", "string"), ("require_clean_repo", "bool"), ("static_expectations", "array<ArtifactExpectation>"), ("additional_files", "array<string>"), ("workspace_path", "string"), ("allowed_workspace_entries", "array<string>"), ("content_sha256", "string")]),
+        ("PromptEvaluationTask", &[("schema_version", "i64"), ("artifact_kind", "string"), ("task_id", "string"), ("repo_id", "string"), ("repo_revision", "string"), ("repo_path", "string"), ("require_clean_repo", "bool"), ("cmd", "string"), ("argv", "array<string>"), ("snapshot_cmd", "string"), ("snapshot_argv", "array<string>"), ("measurement_adapter_runtime", "string"), ("snapshot_helper_runtime", "string"), ("cwd", "string"), ("timeout_ns", "i64"), ("task_prompt_path", "string"), ("context_sources_path", "string"), ("generation_policy_path", "string"), ("provider_control_path", "string"), ("environment_policy_path", "string"), ("artifacts", "array<ArtifactExpectation>"), ("regression_limits", "RegressionLimits"), ("content_sha256", "string")]),
+        ("PromptTaskRow", &[("schema_version", "i64"), ("artifact_kind", "string"), ("evaluation_id", "string"), ("task_id", "string"), ("sample_index", "i64"), ("variant", "string"), ("variant_id", "string"), ("variant_sha256", "string"), ("prompt_preparation_ns", "i64"), ("time_to_passing_patch_ns", "Option<i64>"), ("evaluation_input", "EvaluationInputIdentity"), ("measurement", "TaskMeasurement"), ("content_sha256", "string")]),
+        ("TaskAggregate", &[("task_id", "string"), ("parent_pass_count", "i64"), ("candidate_pass_count", "i64"), ("parent_repair_loop_count", "i64"), ("candidate_repair_loop_count", "i64"), ("paired_pass_count", "i64"), ("parent_paired_median_time_ns", "Option<i64>"), ("candidate_paired_median_time_ns", "Option<i64>"), ("time_improvement_ppm", "Option<i64>"), ("time_regression_ppm", "Option<i64>")]),
+        ("CorpusAggregate", &[("task_count", "i64"), ("sample_count", "i64"), ("parent_pass_count", "i64"), ("candidate_pass_count", "i64"), ("parent_repair_loop_count", "i64"), ("candidate_repair_loop_count", "i64"), ("paired_pass_count", "i64"), ("parent_paired_median_time_ns", "Option<i64>"), ("candidate_paired_median_time_ns", "Option<i64>"), ("completion_gain_count", "i64"), ("time_improvement_ppm", "Option<i64>"), ("time_regression_ppm", "Option<i64>"), ("repair_loop_regression_count", "i64")]),
+        ("RegressionReason", &[("task_id", "string"), ("sample_index", "i64"), ("code", "string"), ("parent_value", "string"), ("candidate_value", "string"), ("limit", "string")]),
+        ("RunSnapshotAttestation", &[("schema_version", "i64"), ("artifact_kind", "string"), ("task_id", "string"), ("sample_index", "i64"), ("variant", "string"), ("status", "string"), ("error_code", "string"), ("error", "string"), ("snapshot_request_sha256", "string"), ("before_snapshot_result_sha256", "string"), ("after_snapshot_result_sha256", "Option<string>"), ("before_input_snapshot_sha256", "Option<string>"), ("after_input_snapshot_sha256", "Option<string>"), ("content_sha256", "string")]),
+        ("SnapshotResult", &[("schema_version", "i64"), ("artifact_kind", "string"), ("task_id", "string"), ("status", "string"), ("error_code", "string"), ("error", "string"), ("environment_probe", "Option<EnvironmentProbe>"), ("artifact_digests", "array<ArtifactDigest>"), ("content_sha256", "string")]),
+        ("TaskInputSnapshot", &[("schema_version", "i64"), ("artifact_kind", "string"), ("task_id", "string"), ("task_manifest_sha256", "string"), ("artifact_digests", "array<ArtifactDigest>"), ("environment_sha256", "string"), ("content_sha256", "string")]),
+        ("Request10ConsumerRoot", &[("tasks", "array<PromptEvaluationTask>"), ("snapshot_requests", "array<SnapshotRequest>"), ("snapshot_results", "array<SnapshotResult>"), ("input_snapshots", "array<TaskInputSnapshot>"), ("snapshot_attestations", "array<RunSnapshotAttestation>"), ("rows", "array<PromptTaskRow>"), ("task_aggregates", "array<TaskAggregate>"), ("corpus_aggregate", "Option<CorpusAggregate>"), ("serious_regression_reasons", "array<RegressionReason>")]),
+    ];
+
+    fn scalar_name(program: &align_sema::Program, scalar: align_sema::Scalar) -> String {
+        use align_sema::Scalar;
+        match scalar {
+            Scalar::Int(ty) if ty.bits == 64 && ty.signed => "i64".to_string(),
+            Scalar::Bool => "bool".to_string(),
+            Scalar::String => "string".to_string(),
+            Scalar::Struct(id) => program.structs[id as usize].source_name.clone(),
+            other => panic!("unexpected Request 10 scalar {other:?}"),
+        }
+    }
+    fn type_name(program: &align_sema::Program, ty: align_sema::Ty) -> String {
+        use align_sema::{Layout, Ty};
+        match ty {
+            Ty::Int(ty) if ty.bits == 64 && ty.signed => "i64".to_string(),
+            Ty::Bool => "bool".to_string(),
+            Ty::String => "string".to_string(),
+            Ty::Struct(id) => program.structs[id as usize].source_name.clone(),
+            Ty::Option(payload) => format!("Option<{}>", scalar_name(program, payload)),
+            Ty::DynArray(payload) => format!("array<{}>", scalar_name(program, payload)),
+            Ty::DynStructArray(id, Layout::Aos) => {
+                format!("array<{}>", program.structs[id as usize].source_name)
+            }
+            other => panic!("unexpected Request 10 field type {other:?}"),
+        }
+    }
+
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "request10-c6-fields", REQUEST10_C6_SOURCE);
+    assert!(
+        !checked.diags.has_errors(),
+        "unexpected errors:\n{}",
+        align_driver::format_diagnostics(&sm, &checked.diags)
+    );
+    for (record_name, expected_fields) in expected {
+        let record = checked
+            .hir
+            .structs
+            .iter()
+            .find(|record| record.source_name == *record_name)
+            .unwrap_or_else(|| panic!("missing exact C6 record {record_name}"));
+        let actual = record
+            .fields
+            .iter()
+            .map(|field| (field.name.as_str(), type_name(&checked.hir, field.ty)))
+            .collect::<Vec<_>>();
+        let expected = expected_fields
+            .iter()
+            .map(|(name, ty)| (*name, (*ty).to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "field vector drifted for {record_name}");
+    }
+    if backend_available() {
+        let out = build_and_run("request10-c6-runtime", REQUEST10_C6_SOURCE);
+        assert_eq!(code(&out), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    }
+}
+
+#[test]
+fn recursive_record_tagged_wrapper_transfer_and_drop_matrix() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Payload { names: array<string>, label: string }\n",
+        "Envelope { payload: Payload, tail: string }\n",
+        "Choice { Empty, Data(Payload), Alternate(Payload) }\n",
+        "fn names(value: str) -> array<string> { mut b: array_builder<string> := array_builder()\n",
+        "  b.push(value.clone())\n",
+        "  b.push(\"tail\".clone())\n",
+        "  return b.build() }\n",
+        "fn payload(value: str) -> Payload = Payload{names: names(value), label: value.clone()}\n",
+        "fn maybe(present: bool) -> Option<Payload> { if present { return Some(payload(\"some\")) }\n",
+        "  return None }\n",
+        "fn result(ok: bool) -> Result<Payload, Payload> { if ok { return Ok(payload(\"ok\")) }\n",
+        "  return Err(payload(\"err\")) }\n",
+        "fn relay() -> Result<Payload, Payload> { value := result(true)?\n",
+        "  return Ok(value) }\n",
+        "fn map_payload(value: Payload) -> Payload = value\n",
+        "fn mapped() -> Result<Payload, Payload> { value := result(true).map_err(map_payload)?\n",
+        "  return Ok(value) }\n",
+        "fn fail_string() -> Result<string, Payload> = Err(payload(\"partial-error\"))\n",
+        "fn partial() -> Result<Envelope, Payload> = Ok(Envelope{payload: payload(\"partial-owner\"), tail: fail_string()?})\n",
+        "fn exercise() -> i32 {\n",
+        "  mut selected: Option<Payload> := Some(payload(\"old\"))\n",
+        "  selected = None\n",
+        "  selected = Some(payload(\"new\"))\n",
+        "  value := selected else { return 1 }\n",
+        "  none_score := match maybe(false) { Some(_) => 10, None => 0 }\n",
+        "  some_score := match maybe(true) { Some(_) => 0, None => 20 }\n",
+        "  ok_score := match relay() { Ok(_) => 0, Err(_) => 30 }\n",
+        "  err_score := match result(false) { Ok(_) => 40, Err(_) => 0 }\n",
+        "  mapped_score := match mapped() { Ok(_) => 0, Err(_) => 50 }\n",
+        "  data_score := match Choice.Data(value) { Empty => 60, Data(_) => 0, Alternate(_) => 70 }\n",
+        "  alternate_score := match Choice.Alternate(payload(\"alternate\")) { Empty => 80, Data(_) => 90, Alternate(_) => 0 }\n",
+        "  partial_score := match partial() { Ok(_) => 100, Err(_) => 0 }\n",
+        "  return none_score + some_score + ok_score + err_score + mapped_score + data_score + alternate_score + partial_score\n",
+        "}\n",
+        "fn main() -> i32 { mut i := 0\n",
+        "  loop { if exercise() != 0 { return 1 }\n",
+        "    i = i + 1\n",
+        "    if i >= 1000 { break } }\n",
+        "  return 0 }\n",
+    );
+    let out = build_and_run("ab-recursive-tagged", src);
+    assert_eq!(code(&out), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn recursive_record_generic_substitution_is_concrete_before_admission() {
+    if !backend_available() {
+        return;
+    }
+    let positive = concat!(
+        "Leaf { value: string }\n",
+        "Tree<T> { maybe: Option<T>, leaves: array<T> }\n",
+        "fn leaves() -> array<Leaf> { mut b: array_builder<Leaf> := array_builder()\n",
+        "  b.push(Leaf{value: \"leaf\".clone()})\n",
+        "  return b.build() }\n",
+        "fn main() -> i32 { mut b: array_builder<Tree<Leaf>> := array_builder()\n",
+        "  b.push(Tree{maybe: Some(Leaf{value: \"optional\".clone()}), leaves: leaves()})\n",
+        "  values := b.build()\n",
+        "  if values.len() == 1 { return 0 }\n",
+        "  return 1 }\n",
+    );
+    let out = build_and_run("ab-recursive-generic", positive);
+    assert_eq!(code(&out), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+
+    let excluded = concat!(
+        "Bad<T> { values: array<Option<T>> }\n",
+        "fn main() -> i32 { mut b: array_builder<Bad<i64>> := array_builder()\n",
+        "  return 0 }\n",
+    );
+    assert!(check_errs("ab-recursive-generic-composite-array", excluded));
+}
+
+#[test]
 fn record_builder_closed_shape_and_append_rejections() {
     let cases = [
         ("view", "Bad { value: str }"),
-        ("array", "Bad { value: array<i64> }"),
-        ("option", "Bad { value: Option<i64> }"),
+        ("slice", "Bad { value: slice<i64> }"),
+        ("result", "Bad { value: Result<i64, i64> }"),
         ("empty", "Bad {}"),
         ("c-layout", "layout(C) Bad { value: i64 }"),
         ("aligned", "align(16) Bad { value: i64 }"),
@@ -455,24 +828,27 @@ fn record_builder_nominal_twins_remain_distinct() {
 #[test]
 fn record_builder_invalid_storage_capture_and_borrowed_consumption_rejected() {
     let aggregate = concat!(
-        "Item { name: string }\n",
+        "Item { names: array<string>, maybe: Option<string> }\n",
         "Holder { items: array_builder<Item> }\n",
         "fn main() -> i32 = 0\n",
     );
     assert!(check_errs("ab-record-aggregate-storage", aggregate));
 
     let borrowed_build = concat!(
-        "Item { name: string }\n",
+        "Item { names: array<string>, maybe: Option<string> }\n",
         "fn consume(borrow mut items: array_builder<Item>) { values := items.build() }\n",
         "fn main() -> i32 = 0\n",
     );
     assert!(check_errs("ab-record-borrowed-build", borrowed_build));
 
     let capture = concat!(
-        "Item { name: string }\n",
+        "Item { names: array<string>, maybe: Option<string> }\n",
+        "fn names() -> array<string> { mut b: array_builder<string> := array_builder()\n",
+        "  b.push(\"name\".clone())\n",
+        "  return b.build() }\n",
         "fn main() -> Result<(), Error> {\n",
         "  mut items: array_builder<Item> := array_builder()\n",
-        "  task_group { task := spawn(fn { items.push(Item{name: \"x\".clone()}); 1 })\n",
+        "  task_group { task := spawn(fn { items.push(Item{names: names(), maybe: Some(\"x\".clone())}); 1 })\n",
         "    wait()\n",
         "    print(task.get())\n",
         "  }\n",
