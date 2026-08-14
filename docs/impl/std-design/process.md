@@ -324,6 +324,10 @@ larger deferred feature first (and would then be a second way to do the same thi
 
 ## Runtime design (`align_rt_command_*` + `align_rt_command_run`)
 
+This subsection records the **currently shipped Slices 4–6**. The Request 11 ledger below is the
+accepted replacement for the parent capture/reap lifecycle, but remains pending until its Rust
+implementation lands; future behavior is not attributed to Slice 5 here.
+
 Builder handle `Command { argv: Vec<CString>, cwd: Option<CString>, env: Vec<(CString,CString)>,
 env_clear: bool, timeout_ns: i64 }` built by `align_rt_command_new(cmd, args)` (reuse
 `marshal_cmd_argv` for the argv, same interior-NUL / empty-argv / non-UTF-8 rejection). `cwd` / `env`
@@ -340,23 +344,18 @@ Vec<u8> }`.
    fix): `chdir(cwd)` if set (fail → `_exit(127)`); if `env_clear` then `clearenv()`, then `setenv`
    each override; `dup2` the two pipe write-ends onto fds 1 and 2; close all pipe fds; `execvp`; on
    failure `_exit(127)`.
-3. **Parent**: close the write ends. For a bounded call, both read fds were made non-blocking before
-   `fork`; the existing unbounded path retains its current setup. **`poll` BOTH read fds together** and
-   drain into `out.out` / `out.err` as data arrives — draining both concurrently is mandatory, or a
-   child that fills the stderr pipe while the parent reads stdout **deadlocks** (the classic two-pipe
-   capture bug). Continue the same lifecycle until both streams reached EOF **and** the direct child
-   was reaped.
-4. **Timeout**: if `timeout_ns > 0`, keep one deadline active through pipe drain and the post-EOF
-   direct-child wait. While a pipe is open, `poll` with the remaining deadline (ns→ms, clamp ≥1).
-   After both pipes reach EOF, use `waitpid(WNOHANG)` plus allocation-free zero-fd `poll` for at most
-   `min(remaining, 1 ms)` until the direct child exits. On expiry, snapshot **`AL_TIMEOUT`**, send
-   `SIGKILL` to the owned child process group when present **and always to the direct pid**, close both
-   read ends without another EOF drain, retry direct-child `waitpid` on `EINTR`, then return the
-   snapshot status (partial output is discarded — "report timeout, don't return a half-answer").
-   Closing the reads keeps a descendant that escaped the group from holding capture open forever.
-   `timeout_ns == 0` = no timeout (block). Negative `timeout_ns` is rejected at `c.timeout_ns()` build
-   time (abort, like `kill`'s sig range).
-5. Once both streams reached EOF and the direct child was reaped, set
+3. **Parent**: close the write ends, set both read fds non-blocking, **`poll` BOTH read fds together**,
+   and drain into `out.out` / `out.err` as data arrives. Draining both concurrently is mandatory, or
+   a child that fills the stderr pipe while the parent reads stdout **deadlocks** (the classic
+   two-pipe capture bug). Loop until both hit EOF.
+4. **Current Slice-5 timeout**: if `timeout_ns > 0`, `poll` with the remaining deadline (ns→ms, clamp
+   ≥1) while a pipe remains open. On expiry the shipped runtime sends `SIGKILL` only to the expected
+   child process group, closes both read ends, blocks in direct-child `waitpid`, and returns
+   **`AL_TIMEOUT`** with partial output discarded. The current `setpgid` results are unchecked, there
+   is no direct-pid fallback, and the deadline no longer advances after pipe EOF. Request 11 closes
+   those known lifecycle gaps with the target state machine below. `timeout_ns == 0` = no timeout;
+   negative `timeout_ns` aborts at `c.timeout_ns()` build time.
+5. After EOF, block in direct-child `waitpid` (reaped here — no zombie), then set
    `out.code = decode_wait_status(status)`.
 6. **UTF-8**: validate `out.out` / `out.err` as UTF-8. Invalid → free and return `AL_INVALID` (the
    `fs.read_file` precedent — a `string`-typed accessor cannot expose non-UTF-8 bytes). See below.
@@ -414,13 +413,11 @@ code 127 in `out.code()` (same convention as `spawn`), **not** an `Err` — the 
 5. `c.timeout_ns(ns)` + the `Error.Timeout` core change — the "a hung test freezes the loop" fix
    (kill + `Err(Timeout)`). **SHIPPED.** `c.timeout_ns(ns: i64)` is an in-place bound-local setter
    (`()`); `ns == 0` = no timeout (the Slice-4 default), a negative `ns` aborts at build. `c.run()`
-   threads one deadline through the two-pipe drain and the post-EOF direct-child wait (`poll` with the
-   remaining ns→ms, clamped `>= 1`, then `waitpid(WNOHANG)` plus zero-fd `poll` after EOF); past the
-   deadline it `SIGKILL`s the child's whole **process group** (the child `setpgid`s into its
-   own group, so a `sh -c "sleep 10"` grandchild is signalled too — otherwise it holds the capture
-   pipes open and wedges the drain) **and always the direct pid**, closes both read ends without
-   another EOF drain, `waitpid`s only the direct child with `EINTR` retry, and returns
-   `Err(Error.Timeout)` (partial output discarded). `EINTR` recomputes the remaining deadline;
+   threads the deadline through the two-pipe drain (`poll` with the remaining ns→ms, clamped `>= 1`).
+   Past the deadline the shipped runtime targets the child's expected **process group**, closes both
+   reads, blocks while reaping the direct child, and returns `Err(Error.Timeout)` with partial output
+   discarded. Its unchecked group setup, missing direct-pid fallback, and unconditional post-EOF
+   wait are current limitations; Request 11's pending lifecycle below closes all three.
    `timeout_ns == 0` keeps the blocking behavior.
 6. `c.env(name,value)` + `c.env_clear()` — **SHIPPED.** Both are in-place bound-local setters (`()`).
    `c.env(name, value)` records a `(name, value)` override; `c.env_clear()` marks the child to start
@@ -439,10 +436,11 @@ code 127 in `out.code()` (same convention as `spawn`), **not** an `Err` — the 
 - **P7 (two-pipe deadlock)** — the #1 correctness point. `poll` **both** read fds and drain both, or
   a child filling one pipe while the parent reads the other deadlocks. Test: a child that writes
   >64 KiB to *both* streams and exits nonzero → both fully captured, code correct.
-- **P8 (timeout must actually kill + reap)** — the deadline covers pipe drain **and the wait after
+- **P8 (timeout must actually kill + reap; Request 11 target)** — the deadline covers pipe drain **and the wait after
   pipe EOF**. On expiry `SIGKILL` the process group and direct pid, close both capture reads, and
   `waitpid` the direct child; do not leak a zombie or wedge on a child that closes fd 1/2 and keeps
-  running. Test: both `sleep 10` and `exec 1>&- 2>&-; sleep 10` with a 100 ms timeout produce
+  running. The shipped Slice 5 does not yet meet the post-EOF or direct-pid parts. Acceptance test:
+  both `sleep 10` and `exec 1>&- 2>&-; sleep 10` with a 100 ms timeout produce
   `Err(Timeout)` within the bounded tolerance, with no direct-child zombie.
 - **P9 (view region, like http P3)** — `.stdout()`/`.stderr()` are views into `out`; `region_of =
   region_of(out)`. Escape past `out` Drop rejected.
@@ -630,8 +628,10 @@ correctness gate.
 ### Closure matrix reopened: post-fork lifecycle
 
 The second review found that the first matrix bounded pipe capture but stopped before direct-child
-termination. A later projection review found that the overview still described the old unconditional
-post-EOF wait and treated the existing child launcher as part of the parent's no-allocation promise.
+termination. A later projection review found that the target-facing overview still described the old
+unconditional post-EOF wait and treated the existing child launcher as part of the parent's
+no-allocation promise. A status audit then separated that corrected target from the still-shipped
+Slice-5 behavior instead of describing the pending replacement as already implemented.
 The reopened axis is `{parent capture/child launch} × {pipe state} × {direct-child state} × {deadline
 state} × {terminal trigger}`. The shared parent engine is now one indivisible capability from
 pre-fork setup through EOF, direct-child wait, and terminal cleanup; the existing P11 child launcher
@@ -651,9 +651,12 @@ implementation remain one mergeable capability.
 | P1 bounded poll allocated after fork | The allocation row requires exact stores/shell before pipes, fixed stack poll/scratch state, pre-fork nonblocking setup, and no parent-side bounded post-fork heap allocation. |
 | P2 hard poll/read errors became partial success | The precedence and hard-I/O rows map the first deterministic errno, run the same kill/close/direct-reap cleanup, preserve the original status, and expose no output. |
 | P2 normative group reaping was overstated | Specifications now say the process group is signalled while only the direct child is reaped; escaped descendants remain outside the contract. |
-| P1 overview still ended the deadline at pipe EOF | The runtime sequence and shipped-slice summary now project the lifecycle row exactly: timed EOF/live-child state uses `waitpid(WNOHANG)` plus zero-fd `poll` until exit or expiry. |
+| P1 target overview still ended the deadline at pipe EOF | The Request 11 target lifecycle keeps the deadline active through direct-child reap: timed EOF/live-child state uses `waitpid(WNOHANG)` plus zero-fd `poll` until exit or expiry. The current-runtime subsection separately records Slice 5's pending gap. |
 | P1 no-allocation promise included the existing child launcher | The allocation promise and owner row now cover only the parent bounded capture/reap state machine; a separate child-launch row retains P11 for `clearenv`/`setenv`/`execvp`. |
-| P2 timeout overview omitted the direct-pid fallback | Every timeout description now snapshots the status, signals an owned group when present and always the direct pid, closes both reads, and reaps only the direct child with `EINTR` retry. |
+| P2 target timeout overview omitted the direct-pid fallback | Every Request 11 target description snapshots the status, signals an owned group when present and always the direct pid, closes both reads, and reaps only the direct child with `EINTR` retry. The shipped subsection does not claim that pending behavior. |
+| P1 pending lifecycle was attributed to shipped Slice 5 | The current-runtime and slice-breakdown subsections now state the actual pipe-only deadline, group-only kill, and blocking post-EOF wait; the accepted replacement remains solely in the pending Request 11 ledger. |
+| P2 pending direct-pid fallback was attributed to shipped Slice 5 | The shipped subsection records unchecked group setup and group-only kill; the target ledger and its owner test reserve the always-direct-pid fallback for the implementation PR. |
+| P2 `code()` was described as a region-bound view | The condensed specification now identifies `code()` as a Copy `i64` and limits region-bound zero-copy views to `stdout()`/`stderr()`. |
 
 ## Acceptance gate
 

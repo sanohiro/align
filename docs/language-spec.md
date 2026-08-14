@@ -977,9 +977,9 @@ substring views). `std.process`: `spawn`/`wait`/`kill`/`exec`, `exit` (runs clea
 (immediate `_exit(1)`), `cpu_count()`, and the `command` builder — `process.command(cmd, args)` plus
 `cwd`/`env`/`env_clear`/`timeout_ns` setters, the optional per-stream
 `max_capture_bytes(limit)` bound, `run() -> Result<run_output, Error>` for UTF-8 text capture, and
-`run_bytes() -> Result<run_bytes, Error>` for arbitrary bytes. Both output handles expose
-`code()`/`stdout()`/`stderr()` as region-bound zero-copy views. An unset capture bound preserves the
-existing unbounded behavior; explicit `0` permits only empty streams, exact-limit output succeeds,
+`run_bytes() -> Result<run_bytes, Error>` for arbitrary bytes. Both output handles expose `code()` as
+a Copy `i64`; `stdout()`/`stderr()` are region-bound zero-copy views. An unset capture bound
+preserves the existing unbounded behavior; explicit `0` permits only empty streams, exact-limit output succeeds,
 and overflow signals the owned process group when present, kills and reaps the direct child, discards
 partial output, and returns `Error.Invalid`. The timeout deadline remains active through direct-child wait after pipe EOF; hard
 pipe/wait failures signal an owned group when present, kill/reap the direct child, and return
