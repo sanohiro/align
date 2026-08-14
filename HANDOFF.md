@@ -15,10 +15,13 @@ proposed contract is `docs/impl/core-design/json-escape-benchmark-evidence.md`: 
 controller/verifier, continuously monitored native x86_64 host, digest-pinned offline OCI toolchain,
 read-only revision isolation, robust inner statistics plus fixed balanced sampling, a complete
 canonical report schema, and host-signed evidence. One independent review of `5ed19c85` found six
-valid issues; the current repair closes its complete finding set and adds the synchronized Japanese
-mirror and indexes. Next: run the required final comprehensive review of the repaired full diff,
-publish and merge the design, then implement the benchmark-input and evidence-controller
-prerequisites before creating a Request 7 implementation branch.
+valid issues; `65753fe7` closed that set and added the synchronized Japanese mirror and indexes. The
+required full-diff review of that repair found seven further valid contract gaps, so the design was
+re-scoped: exact median quantization, a prepare/direct-exec boundary, two-sided path changes, unique
+child-monitor partitions, signed actual-merge verification, and pre-publication unlock semantics now
+close them together. Next: review the redesigned stable candidate, publish and merge the design,
+then implement the benchmark-input and evidence-controller prerequisites before creating a Request
+7 implementation branch.
 
 The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit

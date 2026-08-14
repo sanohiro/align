@@ -35,10 +35,11 @@ controller は provider API/credential を使わない。通常の GitHub public
 |---|---|
 | Public producer | `/opt/align-evidence/v1/bin/align-json-escape-evidence run --repository REPO --baseline BASE --candidate CANDIDATE --review-log REVIEW_LOG --output-dir NEW_DIR`。root-owned launcher/module は merged evidence implementation から install され benchmark account から immutable、hash は host profile に埋め込む。verified `BASE` object から controller/profile/key blob を直接読み、installed copy と byte/mode equality を確認してから他の処理を行う。path は absolute、OID は lowercase 40-hex、`NEW_DIR` は不存在。override/追加引数なし。 |
 | Public verifier | `/opt/align-evidence/v1/bin/align-json-escape-evidence verify --report REPORT --signature SIGNATURE --expected-baseline BASE --expected-candidate CANDIDATE --pr-body PR_BODY`。bytes/signature と report/review/preflight binding を明示OID/PR bodyへ照合する。local は diagnostic のみ。acceptance は trusted-base CI が GitHub event 由来の `BASE`/`CANDIDATE`/`PR_BODY` を渡す。同じ installed verifier は build/checkout/benchmark/network/repository mutation を行わない。 |
+| Public merge verifier | `/opt/align-evidence/v1/bin/align-json-escape-evidence verify-merge --repository REPO --report REPORT --signature SIGNATURE --merge MERGE --output-dir NEW_DIR`。provider responseのexact object fetch後、reportを再verifyし、isolated raw-object pathで`MERGE`を読み、local target ref、two parents、treeをsigned expectationへ照合してexact `merge-verification.json`/`.sig`を出力。`NEW_DIR`は不存在、overrideなし。 |
 | Ambient state | semantic default なし。empty environment に fixed `PATH`, `LC_ALL=C`, `TZ=UTC`, empty `HOME`, `CARGO_NET_OFFLINE=true` と controller-created descriptor/config だけを置く。ambient Git/Cargo/Rust/Docker/locale/proxy/credential/target/tuning は渡さない。 |
-| Result | success は `NEW_DIR` に `report.json`/`report.json.sig` のみを atomic create、両方と directory を fsync、exclusive lock を release、absolute path を出力し zero exit。threshold failure も同じ durability/lock-release 後に signed `regression` report を作り exit 1。他の construction/identity/isolation/execution/parsing/timeout/cleanup/signing/publication failure は staging を削除し `NEW_DIR` を残さず accepted path を出さない。 |
+| Result | successはlock保持中にprivate stagingの`report.json`/`report.json.sig`とdirectoryをfsync、unlock、stagingを`NEW_DIR`へatomic rename、parent fsync、absolute path出力、zero exit。threshold failureも同sequenceでsigned `regression`をpublishしexit 1。unlock/rename/parent-fsyncを含む他failureはstaging/unpublished directoryを削除、`NEW_DIR`不存在、accepted pathなし。 |
 | Controller owner | checked-in Python 3 controller、root-owned installed launcher、`scripts/` と `tests/benchmark_evidence/` の fixture tests。installed/source relation、installer manifest、interpreter、Git、Docker client/daemon、`ssh-keygen`、kernel、OCI image、host profile、executable SHA-256 をすべて記録する。candidate file は evidence root にならない。 |
-| Persisted format | canonical UTF-8 JSON `align.json_escape_benchmark_evidence/v1` を byte-for-byte、host Ed25519 key と `ssh-keygen -Y sign` namespace `align-json-escape-benchmark-evidence-v1` で署名。unknown/missing/duplicate/reordered/non-ASCII key、non-integer/float、invalid UTF-8/escape、trailing/noncanonical bytes は reject。 |
+| Persisted format | canonical UTF-8 JSON `align.json_escape_benchmark_evidence/v1` と `align.json_escape_benchmark_merge_verification/v1`。それぞれhost Ed25519 keyとfixed namespaceでbyte-for-byte署名。unknown/missing/duplicate/reordered/non-ASCII key、non-integer/float、invalid UTF-8/escape、trailing/noncanonical bytesはreject。 |
 | Ownership/allocation | controller が temp dir、pipe、child、container、capture、report staging、cleanup を所有。benchmark child は stdin `/dev/null`、private stdout/stderr のみ。capture ceiling は profile 固定。report/signature/repository administration/controller/Docker socket/signing key/other revision writable dir は child に渡さない。 |
 | Concurrency | repository inspection 前に profile の host-global exclusive lock を取得し、signing/cleanup まで保持。baseline/candidate は overlap しない。fixed pair order だけが schedule。 |
 | Prerequisites | benchmark-input slice、Request 7 の両 language prerequisite、本 design、evidence implementation、pinned image、host profile/public key、adversarial owner が merge 後にのみ `BASE` を選ぶ。`BASE` は当時の target tip かつ最初の Request 7 commit の exact parent。 |
@@ -130,9 +131,13 @@ revision source はread-only、empty target/bench-work/tmpはrevision-private wr
 read-only。`CARGO_TARGET_DIR`/`TMPDIR`/`ALIGN_BENCH_WORK_DIR`を固定。enabling implementationは両scriptを
 absent/nonempty/unsafe work dirでrejectさせ、`kernel.o`等すべてをそこへ限定する。
 
-argv arrayでshell interpolationなし。root/detached Cargoはすべて`--locked --offline`、
-`CARGO_NET_OFFLINE=true`はdefense in depth。cache/source/config manifestをbefore/after比較しwriteをreject。
-targetはrevisionごとにempty startし、そのwarm-up/sample間だけ保持する。
+baseline選択前に両protected scriptをclosed two-phase interfaceにする。`run.sh prepare native`が
+root/detached Cargo buildと`alignc emit-obj`を行い、compiler/runtime/benchmark executable/kernel object/
+effective configのcanonical SHA-256/mode manifestをrevision-private work dirに作る。`run.sh native`は
+manifestをverifyしprepared executableをdirect exec、Cargo/compiler work・missing/extra/changed/wrong-mode
+artifact・prepare-only selectorをreject。argv arrayでshell interpolationなし。prepare Cargoはすべて
+`--locked --offline`。cache/source/config manifestをbefore/after比較しwriteをreject。benchmark-input
+sliceがcurrent 4 invocationをlock後、evidence implementationがbaseline前にprepare/direct-execへ置換する。
 
 child前にCLOEXEC pipeを作りfd enumerate、stdin/stdout/stderrだけを渡す。dup後番号確認、inherited range close、
 entrypointも`/proc/self/fd`確認。collision/inheritance/missing CLOEXEC/mapping changeはreject。bounded outputは
@@ -143,20 +148,24 @@ failure/interrupt時はcontainer/process group kill/reap/remove、fd close、mou
 
 ## Workload/measurement
 
-両revision build後、baseline選択前のevidence implementationが既存timed operation/round countを維持したまま
-inner minimumをarithmetic medianに変更する。40/30のeven countはsorted nanosecondの中央2値の平均をchecked
-integerで求め、既存3-decimal ms tokenへ1回だけ変換。low outlierを選ばずfloat medianなし。synthetic duration
-ownerがextreme low outlier、middle pair、renderingを固定。timed invocationの追加/削除/reorderなし。`BASE`前に
-identical protected inputとなる。
+controllerはdecodeのbaseline/candidate、次にsoaのbaseline/candidateに`run.sh prepare native`を実行し、
+4 artifact manifestをwarm-up前にverify。prepare childはnon-overlap、measurementと別にmonitor/reportする。
 
-controllerは次だけを実行する。
+baseline選択前のevidence implementationが既存timed operation/round countを維持しinner minimumを
+arithmetic medianに変更。40/30はchecked integer nanosecondをsortしexact `middle_sum_ns`を保持。
+output microsecondsはchecked `(middle_sum_ns + 1000) / 2000`（nearest microsecond、exact halfはup）。
+`us / 1000`とzero-padded `us % 1000`でexisting ms tokenへし、float/二次roundingなし。synthetic ownerが
+odd/even sum、half-unit tie、overflow、equal middle、low outlier、tokenを固定。timed invocation変更なし。
+
+prepare後、warm-up/sample childは次だけを実行。
 
 ```text
 bench/json_decode/run.sh native
 bench/json_soa/run.sh native
 ```
 
-native target/profile CPU一致を要求し、downgrade/cross/emulation/effective config changeをreject。
+prepared native target/profile CPU一致を要求し、downgrade/cross/emulation/effective config change、
+measurement中build、artifact manifest changeをreject。
 benchmarkごとrevision各1 discarded warm-up、その後10 pair。odd B-C、even C-B、overlapなし。failed attemptを
 置換せず、再試行はnew target/outputからrun全体をやり直す。
 
@@ -169,7 +178,7 @@ json_soa:    records, json KB, soa ms, aos ms, proj ms, rust ms, soa/rust, aos/r
 ```
 
 全column grammarを検証しmillion rowの`A-full`,`A-proj`,`soa ms`,`aos ms`,`proj ms`のみ保持。duplicate/
-missing/extra/wrong order/whitespace/sign/exponent/nonfinite/ratio/profile outputはreject。tokenはinner medianの
+missing/extra/wrong order/whitespace/sign/exponent/nonfinite/ratio/profile outputはreject。tokenはquantized inner medianの
 positive ASCII 3-decimalで、roundingなしにinteger microsecondsへ変換。10値をsortしmedianをmiddle sum/2で保持。
 
 ```text
@@ -188,9 +197,9 @@ Report = {"body":Body,"body_sha256":hex64}\n
 ```
 
 string外whitespaceなし。member orderは下記宣言順。arrayもorder/cardinality固定。`u32/u64`はunsigned decimal
-（0以外leading zeroなし、overflow reject）、`bool`はlowercase、`hex40/64/128`はfixed lowercase hex、
-`token=[0-9]+\.[0-9]{3}`、`time=YYYY-MM-DDTHH:MM:SS.NNNNNNNNNZ`、その他はclosed enumまたは
-`name=[A-Za-z0-9._/:+=@-]{1,255}`。`hex40/64`はそれぞれ40/64桁の lowercase hex。arbitrary bytes/Git pathはlowercase even hex。quote/backslash/control/
+（0以外leading zeroなし、overflow reject）、`bool`はlowercase、`hex40/64`はそれぞれ40/64桁の
+lowercase hex。`token=[0-9]+\.[0-9]{3}`、`time=YYYY-MM-DDTHH:MM:SS.NNNNNNNNNZ`、その他はclosed
+enumまたは`name=[A-Za-z0-9._/:+=@-]{1,255}`。arbitrary bytes/Git pathはlowercase even hex。quote/backslash/control/
 non-ASCII/invalid UTF-8/overlong/unknown/missing/duplicate/reordered/wrong cardinality/float/negative/null/trailingをreject。
 
 以下が全member名/order/type/presence。`[]`だけunbounded、他cardinality exact。
@@ -212,10 +221,13 @@ ToolIdentity = {"version":name,"source_commit":hex40,"source_manifest_blob":hex4
 ExecutableIdentity = {"version":name,"executable_sha256":hex64}
 Revision = {"commit_oid":hex40,"commit_sha256":hex64,"tree_oid":hex40,
   "tree_manifest_sha256":hex64,"parents":[hex40],"commits":[CommitIdentity],
-  "changed_paths":[PathIdentity]}
+  "changed_paths":[PathChange]}
 CommitIdentity = {"oid":hex40,"raw_sha256":hex64,"tree_oid":hex40,"parents":[hex40]}
 PathIdentity = {"path_hex":bytes,"mode":GitMode,"kind":PathKind,"oid":hex40,
   "size":u64,"sha256":hex64}
+PathChange = {"path_hex":bytes,"status":ChangeStatus,"old":PathSide,"new":PathSide}
+PathSide = {"presence":Presence,"mode":GitModeOrEmpty,"kind":PathKindOrEmpty,
+  "oid":OidOrEmpty,"size":u64,"sha256":DigestOrEmpty}
 TargetBinding = {"local_ref":"refs/heads/main","run_oid":hex40,
   "expected_merge_base":hex40,"expected_merge_head":hex40,"expected_merge_tree":hex40}
 ReviewBinding = {"log_sha256":hex64,"review_head":hex40,"review_base":hex40,
@@ -231,14 +243,20 @@ ExecutionIdentity = {"host_id":name,"kernel":name,"cpu":name,"microcode":name,
   "environment_sha256":hex64,"mount_manifest_sha256":hex64,
   "limit_manifest_sha256":hex64,"descriptor_manifest_sha256":hex64}
 HostObservation = {"ordinal":u32,"phase":HostPhase,"monotonic_ns":u64,
+  "child_id":ChildOrEmpty,
   "load_milli":u64,"cpu_pressure_total_us":u64,"memory_pressure_total_us":u64,
   "free_memory_bytes":u64,"swap_read_bytes":u64,"swap_write_bytes":u64,
   "throttle_events":u64,"thermal_events":u64,"foreign_schedule_events":u64,
   "foreign_container_events":u64,"monitor_lost_events":u64,
   "frequency_khz":u64,"temperature_millic":u64,"container_manifest_sha256":hex64}
-BenchmarkEvidence = {"name":Benchmark,"argv":Argv,"warmups":[Run;2],"pairs":[Pair;10]}
+BenchmarkEvidence = {"name":Benchmark,"prepare_argv":PrepareArgv,"argv":Argv,
+  "preparations":[Preparation;2],"warmups":[Run;2],"pairs":[Pair;10]}
+Preparation = {"child_id":hex64,"revision":RevisionArm,"sequence":u32,
+  "stdout_sha256":hex64,"stderr_sha256":hex64,"stderr_tail_hex":bytes,
+  "exit_code":u32,"elapsed_ns":u64,"monitor_first":u32,"monitor_last":u32,
+  "artifact_manifest_sha256":hex64}
 Pair = {"ordinal":u32,"first":Run,"second":Run}
-Run = {"revision":RevisionArm,"sequence":u32,"stdout_sha256":hex64,
+Run = {"child_id":hex64,"revision":RevisionArm,"sequence":u32,"stdout_sha256":hex64,
   "stderr_sha256":hex64,"stderr_tail_hex":bytes,"exit_code":u32,
   "elapsed_ns":u64,"monitor_first":u32,"monitor_last":u32,"samples":[Sample]}
 Sample = {"field":Field,"token":token,"microseconds":u64}
@@ -255,24 +273,42 @@ Cleanup = {"children_remaining":u32,"containers_remaining":u32,
   "cache_manifests_unchanged":bool}
 PathKind = "blob" | "symlink"
 GitMode = "100644" | "100755" | "120000"
+ChangeStatus = "added" | "deleted" | "modified"
+Presence = "absent" | "present"
+GitModeOrEmpty = "" | GitMode
+PathKindOrEmpty = "" | PathKind
+OidOrEmpty = "" | hex40
+DigestOrEmpty = "" | hex64
 ReviewState = "clean" | "findings-fixed"
 Verdict = "pass" | "regression"
 FieldOrEmpty = "" | Field
 RevisionArm = "baseline" | "candidate"
 Benchmark = "json_decode" | "json_soa"
+PrepareArgv = "bench/json_decode/run.sh prepare native" |
+  "bench/json_soa/run.sh prepare native"
 Argv = "bench/json_decode/run.sh native" | "bench/json_soa/run.sh native"
 Field = "A-full" | "A-proj" | "soa ms" | "aos ms" | "proj ms"
 HostPhase = "pre-build" | "child-start" | "child-sample" | "child-end" |
   "between-children" | "post-run"
+ChildOrEmpty = "" | hex64
 ```
 
-baseline commit/path listはempty、candidate commitはbaseline後のnonempty first-parent順、path/protected entryは
-path-hex順。protected manifestはequal。HostObservationはdenseでRunはchild-startからchild-endまでのnonempty
-inclusive範囲。benchmark順はdecode/soa、warmup B/C、pair 1..10 balanced order、sample fieldは2/3の上記順、
-field resultは5順。original sampleはpair順、sortedはnondecreasing exact permutation。ratio numerator/denominator
-はcandidate/baseline middle sum。cleanup countはzero、bool trueで署名前もhost lock保持。durable output後にlockを
-releaseし、その成功後だけpathをprintする。`first_failed_field`はpassでempty、regressionで最初のfalse field。
-conditional/omitted memberなし。
+baseline commit/path listはempty、candidate commitはbaseline後のnonempty first-parent順。`changed_paths`は
+baseline/candidate treeのexact path-hex-ordered union diff。addedはabsent/present、deletedはpresent/absent、
+modifiedはpresent/presentでmode/kind/OID/size/SHAの少なくとも1つが異なる。absent sideはempty
+mode/kind/OID/digestとsize zero、present sideはemptyなし。protected entryはpath-hex順でmanifest equal。
+
+HostObservationはdense。全`Preparation`/`Run`はglobally unique `child_id`とnonempty inclusive rangeを持ち、
+first/lastは同IDのchild-start/end、interior child-sampleも同ID。rangeはglobal sequence順にstrictly
+increasing/disjointで、nonempty-child observation全体のexact partition。reuse/orphanなし。non-child phaseはempty ID。
+benchmark順はdecode/soa、各preparation B/C、warmup B/C、pair 1..10 balanced order。artifact manifestは
+同benchmark/revisionの全runで再verify。sample fieldは2/3順、field resultは5順。original sampleはpair順、
+sortedはnondecreasing exact permutation。ratio numerator/denominatorはcandidate/baseline middle sum。
+
+cleanup countはzero、bool true。host lock保持中にsignしprivate staging files/directoryをdurableにする。
+unlock後atomic rename・parent fsyncしてからpathをprint。unlock failureはstagingを削除、rename/parent-fsync
+failureもvisible but unaccepted directoryを削除する。`first_failed_field`はpassでempty、regressionで最初の
+false field。conditional/omitted memberなし。
 
 `clean` reviewは`review_head=candidate`、`repair_commits=[]`。`findings-fixed`はreviewed ancestorを
 `review_head`とし、その後candidateまでのnonempty exact first-parent順を`repair_commits`に記録する。
@@ -290,16 +326,39 @@ complete minimal-pass/first-regression semantic fixture、exact one-line bytes�
 independent reference encoderを使う。全member/enum/width/cardinality/order/presence/duplicate/string/LF/domain/digest/
 signature/derived field mutationを所有する。
 
+post-merge verificationはexactに次のrecord + one LF。
+
+```text
+MergeVerification = {
+  "schema":"align.json_escape_benchmark_merge_verification/v1",
+  "profile_id":name,"profile_sha256":hex64,"verifier":ToolIdentity,
+  "report_sha256":hex64,"report_signature_sha256":hex64,
+  "target_ref":"refs/heads/main","target_oid":hex40,
+  "merge_oid":hex40,"merge_sha256":hex64,"parents":[hex40;2],
+  "tree_oid":hex40,"verified_at":time
+}\n
+```
+
+Reportと同じscalar/string/order/whitespace/UTF-8/rejection grammar。detached signatureはfinal LF込みを
+namespace `align-json-escape-benchmark-merge-verification-v1`で署名。report/signature hashはcomplete bytes。
+`target_oid=merge_oid=MERGE`、parentsはbaseline/candidate、treeはreportのexpected tree。全relationship後に
+raw merge-object SHA-256を記録。golden/mutation/wrong parent/tree/ref/stale/swap ownerを持つ。
+同host lockをinspection前に取得し、private stage→file/dir fsync→unlock→atomic rename→parent fsync→
+path publicationの同sequenceを使う。failureは`NEW_DIR`不存在。
+
 accepted PRはcomplete report/signatureをimmutable artifactまたはbase64-safe attachmentで保持しverifier結果を
-記録。1 byte変更でinvalid。private keyはcontainer cleanup後non-inheritable fdでのみopen。sign failureはoutputなし。
+記録。merge後、trusted hostがmerge-verification record/signatureをimmutable artifactに保存しPRからlink。
+それまでlifecycle/dependent workを進めない。1 byte変更でinvalid。private keyはcontainer cleanup後
+non-inheritable fdでのみopen。sign failureはoutputなし。
 
 ## Review/base drift/integration
 
 coherent candidateのcomprehensive review（exact CLEANまたはone findings-fixed chain）後にmeasurement。以後の
 commit/amend/rebase/merge/protected changeはreport無効。publication時preflight/PR attestationをcandidate/base/
 reviewへ照合。merge直前target OIDは`BASE`必須。違えばnew tipへrebaseしnew baseline/review/evidence/preflight。
-mergeはexpected headをbindし、returned commitのfirst parent BASE、second CANDIDATE、tree candidate-identicalを
-raw-object verify。race結果はunshippedでdependent work前にrevert、lifecycleを進めない。
+mergeはexpected headをbind。provider responseのexact OIDをtrusted hostがfetchし`verify-merge`を実行。local targetが
+同OID、first parent BASE、second CANDIDATE、tree candidate-identicalのときだけsigned artifactをaccept。
+race/unavailable objectはunshippedでdependent work前にrevert、lifecycleを進めない。
 
 current hosting transactionはexpected base OIDをatomicに受けないため、implementationはdisposable remoteで
 fail-closed merge/revert ownerを証明するか、endpoint/principal/repo/expected base+head/request/response/secretを
@@ -319,22 +378,22 @@ bindするprovider CASをreviewed amendmentで導入する。base ruleを弱め�
 
 | Cell | Owner / exact regression |
 |---|---|
-| Trusted bootstrap/CLI | installed producer/verifier/monitorをmanifest/baseline blobへ照合。candidate/PATH/PYTHONPATH/CWD substitution、replacement、引数/path/OID/output/ambient異常をmutation前にreject。CIがexpected OID/PRを供給。`benchmark_evidence_bootstrap_cli_matrix`. |
+| Trusted bootstrap/CLI | installed producer/verifier/merge-verifier/monitorをmanifest/baseline blobへ照合。candidate/PATH/PYTHONPATH/CWD substitution、replacement、引数/path/OID/output/ambient異常をmutation前にreject。CIがexpected OID/PRを供給。`benchmark_evidence_bootstrap_cli_matrix`. |
 | Raw identity/construction | clone/worktree、packed/loose、reviewed symlink、hostile Git state、missing/raw swap/path collision/mutation race。`benchmark_evidence_raw_object_matrix`. |
-| Revision binding | exact parent chain、wrong target/ancestry/merge/ref/stale review/drift。全path/modeをscope dispositionへ出す。`benchmark_evidence_revision_binding_matrix`. |
+| Revision binding | exact parent chain/two-sided add-delete-modify diff、wrong target/ancestry/merge/ref/stale review/drift、missing deletion、wrong old/new mode/type、incomplete tree union。`benchmark_evidence_revision_binding_matrix`. |
 | Protected input | required/optional config/manifest/lock/script/kernel/harness/generator/output/timingのpresence/path/type/mode/bytes mutationをcandidate前reject。`benchmark_evidence_protected_input_matrix`. |
 | Toolchain/cache/offline | image/tool/cache/config、swap、lock/cache/network/write。`benchmark_evidence_toolchain_matrix`. |
-| Native host/isolation | native x86_64 success、ARM/emulation/mismatch/quota/exposure reject。child内latched foreign/throttle/thermal/frequency/pressure/swap/containerとmonitor lossをreject。`benchmark_evidence_host_isolation_matrix`. |
+| Native host/isolation | native x86_64 success、ARM/emulation/mismatch/quota/exposure reject。child内latched event/monitor loss、duplicate/reused/overlap range、wrong child ID、orphan observationをreject。`benchmark_evidence_host_isolation_matrix`. |
 | Descriptor/environment | 全fd collision/CLOEXEC/mapping/env/truncation/capture。`benchmark_evidence_process_boundary_matrix`. |
-| Schedule | exact warmup/pair、overlap/reorder/retry/skip/crash/timeout/signal/nonzero。`benchmark_evidence_schedule_matrix`. |
-| Inner/outer statistic | synthetic middle/outlier/overflow/rendering、10 exact token、1.05 boundary。`benchmark_evidence_statistic_matrix`. |
+| Schedule | 4 exact prepare + sealed artifactの後にwarmup/pair。measurement中build/Cargo/compiler、artifact mutation、overlap/reorder/retry/skip/crash/timeout/signal/nonzero。`benchmark_evidence_schedule_matrix`. |
+| Inner/outer statistic | synthetic odd/even ns sum、half-us tie、middle/outlier/overflow、round-half-up quantization/rendering、10 exact token、1.05 boundary。`benchmark_evidence_statistic_matrix`. |
 | Parser/arithmetic | exact line/row/fieldと全malformed。`benchmark_evidence_parser_ratio_matrix`. |
-| Report/signature | bidirectional goldenと全field/order/type/width/duplicate/escape/trailing/derived/key/namespace/stale。`benchmark_evidence_report_v1_matrix`. |
-| Failure/cleanup | 全phase error/timeout/signal/disk/fsync/remove/sign。残存なし。`benchmark_evidence_cleanup_matrix`. |
+| Report/signature | report/merge-verification bidirectional goldenと全field/order/type/width/duplicate/escape/trailing/derived/key/namespace/stale。`benchmark_evidence_report_v1_matrix`. |
+| Failure/cleanup | 全phase error/timeout/signal/disk/file+dir+parent fsync/unlock/rename/remove/sign。accepted path/staging/lock残存なし。`benchmark_evidence_cleanup_matrix`. |
 | Concurrent | second runはGit/image前fail、完全cleanup後lock release。`benchmark_evidence_exclusive_run`. |
 | TOCTOU | executable/image/source rename/replacement/swap。`benchmark_evidence_bound_object_swap_matrix`. |
 | Forged/stale | unsigned/edit/replay/truncate/concat/wrong namespace、PR mismatch。`benchmark_evidence_stale_forged_matrix`. |
-| Base/integration race | target move、precheck race、wrong parent/tree、revert failure、exact merge。`benchmark_evidence_merge_race_matrix`. |
+| Base/integration race | target move、precheck race、unavailable/wrong response OID、local-target mismatch、wrong parent/tree、signed artifact mutation、revert failure、exact merge。`benchmark_evidence_merge_race_matrix`. |
 
 testsはfixture executor/fake daemon/disposable repo+remote/test keyを使いperformance workload/wall-clock ratioを
 ordinary testにしない。native host qualification/final measurementはmanual named evidence。
@@ -350,12 +409,24 @@ ordinary testにしない。native host qualification/final measurementはmanual
 | inner minimum bias | operation/round維持のchecked-integer inner medianとoutlier owner。 |
 | mirror/index欠落 | 本mirrorと両indexを同じrepairに含め、Englishをauthoritativeとする。 |
 
+## Final-review redesign closure
+
+| Finding | Closure |
+|---|---|
+| inner medianはtokenにexact representableでない | exact middle ns sumからchecked round-half-upで1回だけinteger usへ変換後、3-decimal render。 |
+| measured invocationが毎回rebuild | baseline前にfixed prepare/direct-exec interface。4 monitored prepareでartifact seal後、measurementはbuild/driftをreject。 |
+| deletion/old-side pathが表現不能 | `PathChange`がexplicit presence/status/old/newを持つexact two-tree union diff。 |
+| monitor rangeをreuse可能 | preparation/runごとunique child ID、全child observationのstrict disjoint ordered partition。 |
+| verifierがactual mergeを観測不能 | installed `verify-merge`がfetched response OIDを読み、report/target/raw merge/parents/treeにbindしたsecond signed artifactを出す。 |
+| unlock failureがaccepted-looking outputを残す | lock中はprivate staging、unlock後だけatomic publish、unlock/publication failureはunpublished stateを削除。 |
+| Japaneseにundefined `hex128` | 両languageはused `hex40/64`のみでschemaも同一。 |
+
 ## Author consistency pass
 
 - ledger/threat/workload/report/delivery/matrixはone baseline/candidate/profile/controller/verifier/image/host/
   protected set/schedule/parser/threshold/failure ruleで一致。
-- exchanged formatはcanonical report v1 + detached signatureのみ。field owner/malformed/identityがありfloat/
-  ambient defaultなし。
+- exchanged formatはcanonical report v1とpost-merge verification v1、各detached signatureのみ。field owner/
+  malformed/identityがありfloat/ambient defaultなし。
 - provider credentialはN/A。secretはcandidate container外のhost signing keyのみ。
 - language/API/ABI/ownership changeはN/A。developer evidence toolingのみ。
 - correctnessはRequest 7 compiler/runtime owner、controllerはrequired performance comparisonのみをaccept。

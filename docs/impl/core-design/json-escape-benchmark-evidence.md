@@ -39,10 +39,11 @@ must not broaden it independently.
 |---|---|
 | Public producer | `/opt/align-evidence/v1/bin/align-json-escape-evidence run --repository REPO --baseline BASE --candidate CANDIDATE --review-log REVIEW_LOG --output-dir NEW_DIR`. The root-owned launcher and modules were installed from the merged evidence implementation, are immutable to the benchmark account, and have hashes embedded in the host profile. It reads the controller/profile/key blobs directly from verified `BASE` objects and requires byte/mode equality with its installed copies before other work. All paths are absolute. OIDs are lowercase 40-hex. `NEW_DIR` must not exist. No other arguments or overrides exist. |
 | Public verifier | `/opt/align-evidence/v1/bin/align-json-escape-evidence verify --report REPORT --signature SIGNATURE --expected-baseline BASE --expected-candidate CANDIDATE --pr-body PR_BODY`. It verifies bytes/signature and requires the report/review/preflight bindings to equal the explicit OIDs and PR body. Local use is diagnostic; acceptance runs this same installed verifier in trusted-base CI, with `BASE`, `CANDIDATE`, and `PR_BODY` supplied from the GitHub event rather than candidate arguments. It performs no build, checkout, benchmark, network, or repository mutation. |
+| Public merge verifier | `/opt/align-evidence/v1/bin/align-json-escape-evidence verify-merge --repository REPO --report REPORT --signature SIGNATURE --merge MERGE --output-dir NEW_DIR`. After the provider returns and the exact object is fetched, it verifies the report again, reads `MERGE` through the isolated raw-object path, requires the local target ref to resolve to it, checks its two parents and tree against the signed expectations, and emits exactly `merge-verification.json` and `merge-verification.json.sig`. `NEW_DIR` must not exist; no override exists. |
 | Ambient state | There are no semantic defaults. The launcher enters an empty environment containing only fixed `PATH`, `LC_ALL=C`, `TZ=UTC`, empty `HOME`, `CARGO_NET_OFFLINE=true`, and controller-created descriptor/configuration values. Ambient Git, Cargo, Rust, Docker, locale, proxy, credential, target, and tuning variables are omitted. |
-| Result | Success atomically creates exactly `report.json` and `report.json.sig` in `NEW_DIR`, fsyncs both and the directory, releases the exclusive lock, prints their absolute paths, and exits zero. A threshold failure creates a valid signed `regression` report and exits 1 after the same durability and lock-release sequence. Every other failure removes private staging, leaves `NEW_DIR` absent, emits no accepted path, and exits nonzero. |
+| Result | Success writes and fsyncs `report.json` and `report.json.sig` in private staging while holding the exclusive lock, releases the lock, atomically renames staging to `NEW_DIR`, fsyncs its parent, prints the two absolute paths, and exits zero. A threshold failure publishes a valid signed `regression` report by the same sequence and exits 1. Every other failure, including unlock, rename, or parent-fsync failure, removes private staging and any unpublished directory, leaves `NEW_DIR` absent, emits no accepted path, and exits nonzero. |
 | Controller owner | A checked-in Python 3 controller, root-owned installed launcher, and fixture tests under `scripts/` and `tests/benchmark_evidence/`. The exact installed/source relationship, installer manifest, interpreter, Git, Docker client/daemon, `ssh-keygen`, kernel, OCI image, host profile, and executable SHA-256 identities are recorded. Candidate files are never executable evidence roots. |
-| Persisted format | Canonical UTF-8 JSON schema `align.json_escape_benchmark_evidence/v1`, signed byte-for-byte with the host Ed25519 key using `ssh-keygen -Y sign` namespace `align-json-escape-benchmark-evidence-v1`. Unknown, missing, duplicate, reordered, non-ASCII key, non-integer number, float, invalid UTF-8/escape, trailing byte, or noncanonical serialization rejects. |
+| Persisted format | Canonical UTF-8 JSON schemas `align.json_escape_benchmark_evidence/v1` and `align.json_escape_benchmark_merge_verification/v1`, each signed byte-for-byte with the host Ed25519 key under its fixed namespace. Unknown, missing, duplicate, reordered, non-ASCII key, non-integer number, float, invalid UTF-8/escape, trailing byte, or noncanonical serialization rejects. |
 | Ownership/allocation | The controller owns all temporary directories, pipes, children, containers, captures, report staging, and cleanup. Benchmark children receive only stdin `/dev/null`, private stdout, and private stderr. Captures have fixed profile ceilings. No child receives the report, signature, repository administration, controller, Docker socket, signing key, or another revision's writable directory. |
 | Concurrency | One controller obtains the profile's host-global exclusive lock before repository inspection and holds it through signing and cleanup. Baseline and candidate never overlap. The fixed pair order is the only schedule. |
 | Prerequisites | The benchmark-input slice, both Request 7 language prerequisites, this design, its evidence implementation, pinned image, host profile/public key, and controller adversarial owners merge before `BASE` is selected. `BASE` is the then-current target tip and exact parent of the first Request 7 implementation commit. |
@@ -170,11 +171,21 @@ fixed `ALIGN_BENCH_WORK_DIR` select those directories. The enabling implementati
 benchmark scripts reject an absent, nonempty, or unsafe work directory and confines `kernel.o` and
 all generated files there.
 
-Commands are argv arrays without shell interpolation. All root and detached Cargo operations are
-visibly `--locked --offline`; `CARGO_NET_OFFLINE=true` is defense in depth. Registry/cache/source
-manifests are compared before/after; a lockfile, index, cache, source, or configuration write
-rejects. Each build starts with an empty target; a revision keeps its private target for warm-up and
-samples.
+Commands are argv arrays without shell interpolation. Before baseline selection, the evidence
+implementation gives each protected script a closed two-phase interface. `run.sh prepare native`
+performs every root and detached Cargo build plus `alignc emit-obj`, then writes a canonical
+SHA-256/mode manifest for the compiler, runtime, detached benchmark executable, kernel object, and
+effective configuration into the revision-private work directory. `run.sh native` accepts no Cargo
+or compiler work: it verifies that manifest and directly execs the prepared benchmark executable.
+It rejects missing, extra, changed, or wrong-mode artifacts and any prepare-only selector.
+
+All prepare-phase Cargo operations are visibly `--locked --offline`; `CARGO_NET_OFFLINE=true` is
+defense in depth. Registry/cache/source manifests are compared before/after; a lockfile, index,
+cache, source, or configuration write rejects. Each revision starts with an empty target and work
+directory, is prepared exactly once per benchmark, and retains only its verified private artifacts
+for warm-up and samples. The benchmark-input slice first locks the current four invocations; the
+evidence implementation then replaces their measurement-time `cargo run` shape with this protected
+prepare/direct-exec interface before `BASE` can exist.
 
 Before each child, the controller creates close-on-exec pipes, enumerates descriptors, and passes
 exactly stdin/stdout/stderr. It validates descriptor numbers after duplication, closes the inherited
@@ -189,25 +200,33 @@ valid report. Signal handlers preserve the cause but never publish partial evide
 
 ## Workload and measurement
 
-Builds finish for both revisions before warm-up. Before baseline selection, the evidence
-implementation changes both protected harnesses to retain their existing timed operations and round
-counts but report the arithmetic median of every inner timing for each field, not the minimum. For
-the even counts (40 and 30), each value is the arithmetic mean of the two middle sorted nanosecond
-durations, converted once to the existing three-decimal millisecond token. The harness uses checked
-integer nanoseconds for selection/averaging and never selects a low outlier or computes a
-floating-point median. Deterministic owners feed synthetic duration sequences, including one extreme
-low outlier, and pin the selected middle pair and rendering. This does not add, remove, or reorder a
-timed kernel invocation. It is identical protected input before `BASE` exists.
+The controller runs `bench/json_decode/run.sh prepare native` for baseline and candidate, then does
+the same for `json_soa`, and verifies all four artifact manifests before any warm-up. No prepare
+child overlaps another, and every build/prepare child is monitored and reported separately from
+measurement children.
 
-The controller then runs only:
+Before baseline selection, the evidence implementation also changes both protected harnesses to
+retain their existing timed operations and round counts but report the arithmetic median of every
+inner timing for each field, not the minimum. For the even counts (40 and 30), it sorts checked
+integer nanoseconds and retains the exact middle sum `middle_ns[0] + middle_ns[1]`. The output
+microseconds are exactly `(middle_sum_ns + 1000) / 2000` using checked unsigned integer arithmetic:
+nearest microsecond, with an exact half-microsecond rounded upward. The script formats that integer
+as the existing three-decimal millisecond token using `us / 1000` and a zero-padded `us % 1000`,
+without floating point or a second rounding. Deterministic owners feed odd/even nanosecond sums, half-unit ties, overflow
+edges, equal middle values, and one extreme low outlier, and pin the middle pair, quantized
+microseconds, and token. This does not add, remove, or reorder a timed kernel invocation. It is
+identical protected input before `BASE` exists.
+
+After preparation, each warm-up and sample child runs only:
 
 ```text
 bench/json_decode/run.sh native
 bench/json_soa/run.sh native
 ```
 
-The emitted native target must match the profile CPU. Feature downgrade, cross compilation,
-emulation, or changed effective Cargo/rustc configuration rejects.
+The prepared native target must match the profile CPU. Feature downgrade, cross compilation,
+emulation, changed effective Cargo/rustc configuration, an attempted build, or an artifact-manifest
+change rejects.
 
 For each benchmark, one discarded warm-up per revision precedes ten measured pairs. Odd pairs run
 baseline then candidate; even pairs candidate then baseline. Processes never overlap. A failure is
@@ -231,7 +250,7 @@ json_soa:    soa ms, aos ms, proj ms
 
 Duplicate/missing lines, wrong row/order/field count, non-ASCII whitespace, sign, exponent,
 nonfinite token, invalid ratio suffix, or profiling output rejects. Each retained token is the
-harness's inner median, is positive ASCII decimal with exactly three fractional digits, and converts without
+harness's quantized inner median, is positive ASCII decimal with exactly three fractional digits, and converts without
 floating point or rounding to integer microseconds. Original token and integer are reported. For
 each field/revision, sort ten integers and define median `(sample[4] + sample[5]) / 2`. Store the
 middle sum and denominator `2`, never a rounded value. Compare exactly:
@@ -284,11 +303,14 @@ ToolIdentity = {"version":name,"source_commit":hex40,"source_manifest_blob":hex4
 ExecutableIdentity = {"version":name,"executable_sha256":hex64}
 Revision = {"commit_oid":hex40,"commit_sha256":hex64,"tree_oid":hex40,
   "tree_manifest_sha256":hex64,"parents":[hex40],"commits":[CommitIdentity],
-  "changed_paths":[PathIdentity]}
+  "changed_paths":[PathChange]}
 CommitIdentity = {"oid":hex40,"raw_sha256":hex64,"tree_oid":hex40,
   "parents":[hex40]}
 PathIdentity = {"path_hex":bytes,"mode":GitMode,"kind":PathKind,"oid":hex40,
   "size":u64,"sha256":hex64}
+PathChange = {"path_hex":bytes,"status":ChangeStatus,"old":PathSide,"new":PathSide}
+PathSide = {"presence":Presence,"mode":GitModeOrEmpty,"kind":PathKindOrEmpty,
+  "oid":OidOrEmpty,"size":u64,"sha256":DigestOrEmpty}
 TargetBinding = {"local_ref":"refs/heads/main","run_oid":hex40,
   "expected_merge_base":hex40,"expected_merge_head":hex40,
   "expected_merge_tree":hex40}
@@ -306,16 +328,21 @@ ExecutionIdentity = {"host_id":name,"kernel":name,"cpu":name,"microcode":name,
   "environment_sha256":hex64,"mount_manifest_sha256":hex64,
   "limit_manifest_sha256":hex64,"descriptor_manifest_sha256":hex64}
 HostObservation = {"ordinal":u32,"phase":HostPhase,"monotonic_ns":u64,
+  "child_id":ChildOrEmpty,
   "load_milli":u64,"cpu_pressure_total_us":u64,"memory_pressure_total_us":u64,
   "free_memory_bytes":u64,"swap_read_bytes":u64,"swap_write_bytes":u64,
   "throttle_events":u64,"thermal_events":u64,"foreign_schedule_events":u64,
   "foreign_container_events":u64,"monitor_lost_events":u64,
   "frequency_khz":u64,"temperature_millic":u64,"container_manifest_sha256":hex64}
 
-BenchmarkEvidence = {"name":Benchmark,"argv":Argv,"warmups":[Run;2],
-  "pairs":[Pair;10]}
+BenchmarkEvidence = {"name":Benchmark,"prepare_argv":PrepareArgv,"argv":Argv,
+  "preparations":[Preparation;2],"warmups":[Run;2],"pairs":[Pair;10]}
+Preparation = {"child_id":hex64,"revision":RevisionArm,"sequence":u32,
+  "stdout_sha256":hex64,"stderr_sha256":hex64,"stderr_tail_hex":bytes,
+  "exit_code":u32,"elapsed_ns":u64,"monitor_first":u32,"monitor_last":u32,
+  "artifact_manifest_sha256":hex64}
 Pair = {"ordinal":u32,"first":Run,"second":Run}
-Run = {"revision":RevisionArm,"sequence":u32,"stdout_sha256":hex64,
+Run = {"child_id":hex64,"revision":RevisionArm,"sequence":u32,"stdout_sha256":hex64,
   "stderr_sha256":hex64,"stderr_tail_hex":bytes,"exit_code":u32,
   "elapsed_ns":u64,"monitor_first":u32,"monitor_last":u32,"samples":[Sample]}
 Sample = {"field":Field,"token":token,"microseconds":u64}
@@ -337,31 +364,52 @@ Closed enums are exact:
 ```text
 PathKind = "blob" | "symlink"
 GitMode = "100644" | "100755" | "120000"
+ChangeStatus = "added" | "deleted" | "modified"
+Presence = "absent" | "present"
+GitModeOrEmpty = "" | GitMode
+PathKindOrEmpty = "" | PathKind
+OidOrEmpty = "" | hex40
+DigestOrEmpty = "" | hex64
 ReviewState = "clean" | "findings-fixed"
 Verdict = "pass" | "regression"
 FieldOrEmpty = "" | Field
 RevisionArm = "baseline" | "candidate"
 Benchmark = "json_decode" | "json_soa"
+PrepareArgv = "bench/json_decode/run.sh prepare native" |
+  "bench/json_soa/run.sh prepare native"
 Argv = "bench/json_decode/run.sh native" | "bench/json_soa/run.sh native"
 Field = "A-full" | "A-proj" | "soa ms" | "aos ms" | "proj ms"
 HostPhase = "pre-build" | "child-start" | "child-sample" | "child-end" |
   "between-children" | "post-run"
+ChildOrEmpty = "" | hex64
 ```
 
 `Revision.parents` has exactly the raw commit parents; baseline `commits` and `changed_paths` are
 empty, candidate `commits` is the nonempty first-parent sequence after baseline, and candidate
-`changed_paths` is path-hex order. Protected entries are path-hex order and contain the common
-identity once; their two manifest hashes must be equal. Host observations have dense ordinals and
-each `Run` names an inclusive nonempty range that starts with `child-start`, ends with `child-end`,
-and contains all its 100 ms samples. Benchmarks are `json_decode`, then `json_soa`. Warmups are
-baseline, then candidate. Pair ordinals are 1 through 10 with B/C arms in the specified balanced
-order. `Run.samples` has fields in benchmark order (two then three). Field results use the five field
-order above. Original samples follow pair ordinal; sorted samples are nondecreasing and exact
-permutations. `ratio_numerator` is candidate middle sum and `ratio_denominator` baseline middle sum.
+`changed_paths` is the exact path-hex-ordered union diff of the baseline and candidate trees. An
+`added` side is absent/present, a `deleted` side present/absent, and a `modified` side present/present
+with at least one mode, kind, OID, size, or SHA-256 difference. An absent `PathSide` has empty
+mode/kind/OID/digest and size zero; a present side has no empty value. Protected entries are
+path-hex order and contain the common identity once; their two manifest hashes must be equal.
+
+Host observations have dense ordinals. Every `Preparation` and `Run` has a globally unique
+`child_id` and names an inclusive nonempty range whose first/last observations are respectively
+`child-start`/`child-end` with that same ID; every interior `child-sample` carries that ID. In global
+sequence order, those ranges are strictly increasing, disjoint, and are an exact partition of every
+nonempty-child observation: no range or child observation is reused or orphaned. Non-child phases
+carry the empty ID. Benchmarks are `json_decode`, then `json_soa`; each has preparations baseline
+then candidate, followed by warm-ups baseline then candidate. Pair ordinals are 1 through 10 with
+B/C arms in the specified balanced order. `Preparation.artifact_manifest_sha256` matches the
+manifest reverified by every later run of that benchmark/revision. `Run.samples` has fields in
+benchmark order (two then three). Field results use the five field order above. Original samples
+follow pair ordinal; sorted samples are nondecreasing and exact permutations. `ratio_numerator` is
+candidate middle sum and `ratio_denominator` baseline middle sum.
 All cleanup counts are zero and booleans true before either verdict can be signed. The host lock is
-still held while signing; after both output files and their directory are durable, the producer
-releases it and only then prints accepted paths. Lock-release failure suppresses those paths but
-cannot retroactively alter the signed report.
+still held while signing and while both private-staging files and that directory become durable.
+The producer then releases the lock, atomically renames staging to `NEW_DIR`, fsyncs the parent, and
+only then prints accepted paths. Lock-release failure removes private staging, so signed bytes are
+not published as an accepted directory. Rename or parent-fsync failure likewise removes any visible
+but not yet accepted directory before returning failure.
 `first_failed_field` is empty exactly for `pass`; for `regression` it is the first false field in
 field order. There are no conditional or omitted members.
 
@@ -392,11 +440,38 @@ production decode-to-semantics and re-encode must match byte-for-byte. The mutat
 every member, enum, scalar width/boundary, array cardinality/order, key order/presence/duplicate,
 string grammar, LF, body preimage/domain/digest, signature namespace/key, and derived field.
 
+Post-merge verification produces exactly this second canonical record followed by one LF:
+
+```text
+MergeVerification = {
+  "schema":"align.json_escape_benchmark_merge_verification/v1",
+  "profile_id":name,"profile_sha256":hex64,"verifier":ToolIdentity,
+  "report_sha256":hex64,"report_signature_sha256":hex64,
+  "target_ref":"refs/heads/main","target_oid":hex40,
+  "merge_oid":hex40,"merge_sha256":hex64,"parents":[hex40;2],
+  "tree_oid":hex40,"verified_at":time
+}\n
+```
+
+It uses the same scalar, string, member-order, whitespace, UTF-8, and rejection grammar as `Report`.
+The detached signature covers the complete bytes including LF under namespace
+`align-json-escape-benchmark-merge-verification-v1`. `report_sha256` hashes the complete report
+including LF; `report_signature_sha256` hashes its detached signature bytes. `target_oid` and
+`merge_oid` both equal the supplied `MERGE`; `parents` are exactly baseline then candidate; and
+`tree_oid` equals the report's expected candidate tree. The verifier records the raw merge-object
+SHA-256 only after all relationships pass. Complete golden, mutation, wrong-parent/tree/ref, stale
+report/signature, and raw-object swap owners cover this format. It obtains the same exclusive host
+lock before inspection and uses the same private-stage, file/directory fsync, unlock, atomic rename,
+parent-fsync, then path-publication sequence; any failure leaves `NEW_DIR` absent.
+
 An accepted PR carries the complete report/signature as unmodified files in an immutable artifact
-or base64-safe fenced attachment, plus verifier command/result. Copying is allowed; changing one byte
-invalidates the signature. A report for another baseline, candidate, profile, host, toolchain,
-review, sample set, or target is stale. The private key opens only after measurement containers are
-gone, through a non-inheritable descriptor. Signing failure leaves no output directory.
+or base64-safe fenced attachment, plus verifier command/result. After merge, the trusted host stores
+the complete merge-verification record/signature in an immutable artifact and links it from the PR
+before Request 7 or any dependent lifecycle advances. Copying is allowed; changing one byte
+invalidates the relevant signature. A record for another baseline, candidate, merge, profile, host,
+toolchain, review, sample set, or target is stale. The private key opens only after measurement
+containers are gone, through a non-inheritable descriptor. Signing failure leaves no output
+directory.
 
 ## Review, base drift, and integration
 
@@ -407,9 +482,11 @@ invalidates the report. Only raw commit OIDs/objects are identities.
 At publication, preflight and PR attestation must match the report candidate, merge base, review
 head, and state. Immediately before merge, target OID must still equal `BASE`; otherwise rebase from
 the new tip, select that parent as a new baseline, and repeat review/evidence/preflight. Merge binds
-the expected PR head. Its returned commit must have first parent `BASE`, second parent `CANDIDATE`,
-and candidate-identical tree. The merge verifier checks raw objects under the same Git isolation. A
-race makes the result unshipped and it is reverted before dependent work; no lifecycle advances.
+the expected PR head. After the provider returns, the trusted host fetches that exact response OID,
+runs `verify-merge`, and accepts the signed merge-verification artifact only when the local target
+resolves to it, its first parent is `BASE`, its second parent is `CANDIDATE`, and its tree is
+candidate-identical. A race or unavailable object makes the result unshipped and it is reverted
+before dependent work; no lifecycle advances.
 
 This postcondition is cleanup for a hosting transaction that cannot currently atomically accept an
 expected base OID. Before Request 7 starts, implementation must prove fail-closed merge/revert on a
@@ -435,22 +512,22 @@ It may not weaken the base rule.
 
 | Cell | Owner and exact regression |
 |---|---|
-| Trusted bootstrap and CLI | Root-owned installed producer/verifier/monitor bytes must match their manifest and verified baseline blobs. Candidate/PATH/PYTHONPATH/current-directory substitution, installed-file replacement, missing/extra/repeated options, relative paths, malformed/same OIDs, existing output, untrusted repository, and ambient selectors reject before mutation. Trusted CI supplies expected baseline/candidate/PR body. `benchmark_evidence_bootstrap_cli_matrix`. |
+| Trusted bootstrap and CLI | Root-owned installed producer/verifier/merge-verifier/monitor bytes must match their manifest and verified baseline blobs. Candidate/PATH/PYTHONPATH/current-directory substitution, installed-file replacement, missing/extra/repeated options, relative paths, malformed/same OIDs, existing output, untrusted repository, and ambient selectors reject before mutation. Trusted CI supplies expected baseline/candidate/PR body. `benchmark_evidence_bootstrap_cli_matrix`. |
 | Raw identity/construction | Cover clone/worktree, packed/loose objects, reviewed symlinks, hostile config/includes/hooks/filters/fsmonitor/commit-graph/replacements/grafts/alternates/promisor/shallow/missing objects, raw swap, path/type/mode collisions, and mutation race. `benchmark_evidence_raw_object_matrix`. |
-| Revision binding | Exact parent chain succeeds; wrong local target, unrelated ancestry, merge/side parent, ref movement, stale review, and branch-after-drift reject. The report exposes every changed path/mode for review scope disposition. `benchmark_evidence_revision_binding_matrix`. |
+| Revision binding | Exact parent chain and two-sided added/deleted/modified path inventory succeed; wrong local target, unrelated ancestry, merge/side parent, ref movement, stale review, branch-after-drift, missing deletion, wrong old/new mode/type, and incomplete tree-union diff reject. `benchmark_evidence_revision_binding_matrix`. |
 | Protected inputs | Mutate presence/path/type/mode/bytes of every required/optional config, manifest, lock, script, kernel, harness, generator, output, and timing owner; reject before candidate execution. `benchmark_evidence_protected_input_matrix`. |
 | Toolchain/cache/offline | Image/tool/cache/config identity succeeds; tag/image/tool swap, missing/stale lock, incomplete cache, registry update, network, and source/cache/lock/target cross-write reject. `benchmark_evidence_toolchain_matrix`. |
-| Native host/isolation | Cover x86_64 success; ARM/emulation, CPU/microcode/kernel/daemon/runtime/cgroup/image mismatch, quota/writable source/network/device/capability/credential/socket/cross-revision exposure reject. A latched foreign scheduler/container, throttle/thermal/frequency, pressure/load, swap/memory event during any child, monitor loss/overflow/delay/death, and boundary-only clean snapshots all reject. `benchmark_evidence_host_isolation_matrix`. |
+| Native host/isolation | Cover x86_64 success; ARM/emulation, CPU/microcode/kernel/daemon/runtime/cgroup/image mismatch, quota/writable source/network/device/capability/credential/socket/cross-revision exposure reject. A latched foreign scheduler/container, throttle/thermal/frequency, pressure/load, swap/memory event during any child, monitor loss/overflow/delay/death, duplicate/reused/overlapping range, wrong child ID, or orphan child observation rejects. `benchmark_evidence_host_isolation_matrix`. |
 | Descriptor/environment | Collide every inherited fd; cover missing CLOEXEC, unexpected fd, stdio swap, proxy/Cargo/Rust/Git/locale/home injection, truncation, and capture overflow. `benchmark_evidence_process_boundary_matrix`. |
-| Schedule | Exact warm-ups and odd B-C/even C-B pairs succeed; overlap, reorder, retry, skip, duplicate, crash, timeout, signal, and nonzero reject. `benchmark_evidence_schedule_matrix`. |
-| Inner/outer statistics | Synthetic odd/even durations, equal middle values, overflow edges, and one arbitrarily low outlier pin checked-integer inner medians and three-decimal rendering. Ten printed samples retain exact tokens; exact 1.05 passes and the next microsecond unit fails. `benchmark_evidence_statistic_matrix`. |
+| Schedule | Four exact prepare children complete and their artifacts are sealed before exact warm-ups and odd B-C/even C-B pairs. Build/Cargo/compiler use during measurement, artifact mutation, overlap, reorder, retry, skip, duplicate, crash, timeout, signal, and nonzero reject. `benchmark_evidence_schedule_matrix`. |
+| Inner/outer statistics | Synthetic odd/even nanosecond sums, half-microsecond ties, equal middle values, overflow edges, and one arbitrarily low outlier pin the middle sum, round-half-up integer-microsecond quantization, and three-decimal rendering. Ten printed samples retain exact tokens; exact 1.05 passes and the next microsecond unit fails. `benchmark_evidence_statistic_matrix`. |
 | Parser/arithmetic | Exact titles, headers, three rows, all columns, and five retained fields succeed; wrong/duplicate/missing/extra line, row, header, or field and whitespace/sign/exponent/nonfinite/precision/ratio/zero/overflow reject. `benchmark_evidence_parser_ratio_matrix`. |
-| Report/signature | Bidirectional golden plus every field/order/type/width/duplicate/escape/trailing/derived mutation; wrong key/namespace/signature/profile/stale candidate reject. `benchmark_evidence_report_v1_matrix`. |
-| Failure/cleanup | Cross each phase with error, timeout, signal, disk-full, fsync, removal, and signing failure. No accepted path remains; children, containers, mounts, fds, locks, and private dirs are gone. `benchmark_evidence_cleanup_matrix`. |
+| Report/signature | Bidirectional report and merge-verification goldens plus every field/order/type/width/duplicate/escape/trailing/derived mutation; wrong key/namespace/signature/profile/stale candidate/report/merge reject. `benchmark_evidence_report_v1_matrix`. |
+| Failure/cleanup | Cross each phase with error, timeout, signal, disk-full, file/directory/parent fsync, unlock, rename, removal, and signing failure. No accepted path remains; children, containers, mounts, fds, locks, staging, and private dirs are gone. `benchmark_evidence_cleanup_matrix`. |
 | Concurrent runs | Second run fails before Git/image/container work; lock releases only after cleanup, including signal/sign failure. `benchmark_evidence_exclusive_run`. |
 | TOCTOU swap | Opened executable/image/source identities are used or revalidated at privilege boundary; rename, replacement, daemon-image, and source swaps cannot substitute inspected bytes. `benchmark_evidence_bound_object_swap_matrix`. |
 | Forged/stale evidence | Unsigned, edited, replayed profile/target/review/candidate, truncated, concatenated, and valid-signature/wrong-namespace reports reject. PR/preflight mismatch blocks. `benchmark_evidence_stale_forged_matrix`. |
-| Base/integration race | Disposable remote covers target movement before/after run, precheck-to-merge race, wrong merge parents/tree, failed revert, and exact merge. Failures never advance lifecycle. `benchmark_evidence_merge_race_matrix`. |
+| Base/integration race | Disposable remote covers target movement before/after run, precheck-to-merge race, unavailable/wrong response OID, local-target mismatch, wrong merge parents/tree, signed merge-verification mutation, failed revert, and exact merge. Failures never advance lifecycle. `benchmark_evidence_merge_race_matrix`. |
 
 Implementation maps every row to source and deterministic tests before review. Tests use fixture
 executors, a fake daemon, disposable repositories/remotes, and test keys; they do not run the
@@ -468,12 +545,25 @@ measurement remain named manual evidence.
 | P1 inner minima selected unrelated low outliers | Both harnesses keep their operations/round counts but select checked-integer inner medians before the baseline exists; synthetic outlier owners pin the statistic. The controller retains balanced outer pairs and exact rational threshold arithmetic. |
 | P2 core-design mirror/index absent | The synchronized Japanese mirror and both core-design indexes are part of this repair. English remains authoritative. |
 
+## Final-review redesign closure
+
+| Finding | Ledger-first closure |
+|---|---|
+| P1 inner median was not exactly representable by the output token | The harness retains the exact middle nanosecond sum and applies one checked round-half-up conversion to integer microseconds before exact three-decimal rendering. |
+| P1 current scripts rebuilt inside every measured invocation | Protected scripts gain a fixed prepare/direct-exec interface before baseline selection. Four monitored preparation children seal artifacts before any warm-up; measurement rejects build activity or artifact drift. |
+| P1 deleted and old-side paths were unrepresentable | `PathChange` is the exact two-tree union diff with explicit presence, status, and old/new identities. |
+| P1 monitor ranges could be reused | Every preparation/run has a unique child ID, and its range participates in one strict disjoint ordered partition of all child observations. |
+| P1 verifier could not observe the actual merge | The installed `verify-merge` mode consumes the fetched provider-response OID and emits a second host-signed canonical artifact bound to the report, target, raw merge object, parents, and tree. |
+| P2 unlock failure left accepted-looking durable output | Report bytes remain private while the lock is held; unlock precedes atomic publication, and any unlock/publication failure removes unpublished state. |
+| P2 Japanese mirror retained undefined `hex128` | Both languages now define only the used `hex40` and `hex64` grammars and carry the same schemas. |
+
 ## Author consistency pass
 
 - Ledger, threat model, workload, report, delivery, and matrix use one baseline/candidate, profile,
   controller/verifier, image/host, protected set, schedule/parser, exact threshold, and failure rule.
-- Canonical report v1 plus detached signature is the sole exchanged format. Every field has an owner,
-  malformed rule, and identity; there is no float or ambient default.
+- Canonical report v1 and post-merge verification v1, each with its detached signature, are the sole
+  exchanged formats. Every field has an owner, malformed rule, and identity; there is no float or
+  ambient default.
 - Provider credentials are N/A. The sole secret is the host signing key outside all candidate
   containers and opened only after cleanup through a non-inheritable descriptor.
 - Language/API/ABI/ownership changes are N/A: this adds developer evidence tooling only.
