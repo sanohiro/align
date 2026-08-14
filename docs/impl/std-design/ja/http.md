@@ -24,14 +24,14 @@ v1 案として、Fable が確定させた形式:
 
 ```text
 // Client
-cl := http.client()                         // owns a connection pool (Move)
-cl.max_response_body_bytes(limit: i64)      // 0 restores the fixed default; positive limits bound receive allocation
+cl := http.client()                         // コネクションプールを所有する (Move)
+cl.max_response_body_bytes(limit: i64)      // 0 は固定既定値へ戻し、正値は受信 allocation を制限する
 cl.get(url: str) -> Result<response, Error>
 cl.post(url: str, body: bytes) -> Result<response, Error>
 cl.request(req: request) -> Result<response, Error>
 // Request/response building
-r := http.request(method: str, url: str)    // builder (Move — owns header list + body buf)
-r.max_response_body_bytes(limit: i64)       // 0 inherits the client; positive limits only narrow it
+r := http.request(method: str, url: str)    // builder (Move — header list と body buf を所有する)
+r.max_response_body_bytes(limit: i64)       // 0 は client を継承し、正値は上限を狭めるだけ
 r.header(name: str, value: str)
 r.body(data: bytes)
 resp.status() -> i64
@@ -1115,23 +1115,23 @@ stream fixture を Content-Length から chunked へ切り替え、valid SSE、m
 status/header/body preservation を証明する。sibling request register が adoption evidence の lifecycle owner
 であり続ける。
 
-## Bounded client response bodies (align-llm Request 5 — DESIGNED 2026-08-14)
+## Client response body の上限制御 (align-llm Request 5 — DESIGNED 2026-08-14)
 
 provider call には whole-body client が allocation した後の length check ではなく、受信中に効く
 operation-sized limit が必要である。Request 5 は Request 4 framing engine に client default と request
 override を一つずつ加える。streaming-input handle、第二 decoder、provider policy、ambient config、package
 API は加えない。
 
-### Public-contract ledger
+### 公開契約台帳
 
-| Surface / state | Exact contract |
+| Surface / state | 厳密な契約 |
 |---|---|
-| Public methods | `cl.max_response_body_bytes(limit: i64) -> ()` は bound `http.client`、`r.max_response_body_bytes(limit: i64) -> ()` は bound `http.request` を mutate する。どちらも Move receiver を consume しない Impure setter。request を consume するのは `cl.request(r)` だけ。 |
+| Public methods | `cl.max_response_body_bytes(limit: i64) -> ()` は bound `http.client`、`r.max_response_body_bytes(limit: i64) -> ()` は bound `http.request` を mutate する。既存の timeout/header/body 設定メソッドと同じく、どちらも I/O を行わない Pure setter で、Move receiver を consume せず borrow する。request を consume するのは `cl.request(r)` だけ。 |
 | Input and defaults | `limit == 0` は stored value を clear する。clear client は fixed `HTTP_MAX_BODY = 1,073,741,824`、clear request は client を inherit する。positive は `1..=HTTP_MAX_BODY` かつ target-`usize` representable。negative/larger/unrepresentable/null handle は previous value と network work より前に abort。ambient input は無い。 |
 | Selection | `get`/`post` は client value、`request` は `min(positive client or HTTP_MAX_BODY, positive request or HTTP_MAX_BODY)`。どちらかが positive なら positive `HTTP_MAX_BODY` 自体も *explicit*、zero/unset は non-explicit。`get_many` は worker start 前に client value を一度 snapshot。source borrow が concurrent setter を除外し、native atomic storage が race-free snapshot を保つ。 |
 | Success and ownership | exact-limit payload は既存 Move `response` を返し、`status()`/`header()`/`body()` は region-bound zero-copy view のまま。explicitly bounded response は fixed header/body allocation を別々に Drop まで所有するが opaque handle ABI/source ownership は不変。setter は input view を保持しない。 |
-| Limit result | explicit bound の最初に recognizable な payload excess は stable `Error.Code(-1)`。`-1` は `std.http` receive-body limit 専用で、HTTP status `100..=599` と common errno mapping が公開する non-negative raw OS code の外。`Error.Invalid`、`Error.Timeout`、transport `Error.Code(errno)`、successful HTTP 413 と別。partial response/body は無い。 |
-| Native status mapping | runtime は HTTP-private `AL_HTTP_BODY_LIMIT = i32::MAX` を使う。HTTP Result lowerer だけが common category/errno mapping 前にこれを `Error.Code(-1)` へ写す。generic errno decoder には入らず、`Error` variant/layout を増やさない。 |
+| Limit result | explicit bound を超える payload を最初に認識した時点で stable `Error.Code(-1)` を返す。explicit bound が無い場合の target/global excess は従来どおり `Error.Invalid` である。`-1` は `std.http` receive-body limit 専用で、HTTP status `100..=599` と common errno mapping が公開する non-negative raw OS code の外にある。`Error.Timeout`、transport `Error.Code(errno)`、successful HTTP 413 とも異なり、partial response/body は返さない。 |
+| Native status mapping | runtime は HTTP-private `AL_HTTP_BODY_LIMIT = -1` を使う。client-response Result lowerer だけが positive な common category/errno mapping 前にこれを `Error.Code(-1)` へ写す。この sentinel は saturating `AL_CODE + errno` と衝突せず、generic errno decoder には入らず、`Error` variant/layout を増やさない。 |
 | Content-Length | 各 field を arbitrary-precision normalized decimal magnitude として parse。syntax、equal duplicate normalization、conflicting duplicate、CL/TE conflict が cap より先。payload-bearing final response の valid magnitude が explicit cap 超なら `usize`/`HTTP_MAX_BODY` 超でも `Error.Code(-1)`。explicit でなければ target/global excess は `Error.Invalid`。peer value から reserve せず、excess 後に payload read しない。 |
 | Method/status composition | Request 4 の exact-uppercase `HEAD`/`CONNECT`、interim、`204`、`304` rule を維持。bodyless final は metadata を validate するが cap compare、body allocate、payload/chunk/trailer read をしない。cap は returned final payload だけ。 |
 | Chunked payload | line/framing/trailer guard と grammar は不変。guard と complete-line syntax が cap より先。valid chunk magnitude で cumulative decoded bytes が explicit cap を超えるなら target conversion/payload allocation/next read 前に `Error.Code(-1)`。non-explicit global excess は `Error.Invalid`。terminal chunk 前の limit 後は trailer を読まない。 |
@@ -1147,9 +1147,9 @@ API は加えない。
 | ABI and identity | A66 に `void @align_rt_http_max_response_body_bytes(ptr, i64)` と `void @align_rt_http_client_max_response_body_bytes(ptr, i64)` を追加。他の signature/type tag/interface record/handle ABI は不変。method spelling/MIR discriminant は interface-format-6/cache identity に入り、exact edit/revert で元 hash に戻る。 |
 | Prerequisite and adoption | Request 4 `f04672bce6f8689c9b219d0a20e770571e2d638b` が framing を供給。Align implementation 後、sibling が merge を pin、`provider_http` に 262,144 を設定し combined framing/cap/cleanup matrix と HTTP status 区別を証明する。 |
 
-### Framing and limit matrix
+### Framing と limit のマトリクス
 
-| Final selection | Explicit bound | Excess result / connection |
+| 最終 body 選択 | Explicit bound | 超過結果 / connection |
 |---|---:|---|
 | exact `HEAD`、`204`、`304` bodyless | either | compare 無し。empty body + normal bodyless reuse verdict |
 | Content-Length / chunked / close-delimited payload | no | fixed global excess は `Error.Invalid`; close |
@@ -1159,12 +1159,12 @@ API は加えない。
 | malformed/conflicting/truncated framing | either | `Error.Invalid`; close |
 | recognizable excess 前の deadline/transport failure | either | existing `Error.Timeout` / `Error.Code(errno)`; close |
 
-### Implementation closure matrix
+### 実装 closure matrix
 
 public setter だけでは dormant、decoder-only cap は unnameable なので一つの cross-layer capability とする。
 Request 4 state machine/owner を再利用し expected hand-written change は概ね 1,000 lines 未満。
 
-| Closure axis | Required evidence | Owner |
+| Closure axis | 必須 evidence | Owner |
 |---|---|---|
 | Formation and setters | receiver 両方、exact `i64`、arity、bound-local、zero clear/inherit、positive endpoint、invalid abort-before-store、whole/per-unit spelling、interface/cache edit-revert。 | Sema/checked-HIR/MIR owner + abort fixture |
 | Selection and concurrency | get/post inheritance、request min-selection、explicit `HTTP_MAX_BODY` vs zero、one `get_many` snapshot。 | runtime table + driver dispatch/batch |

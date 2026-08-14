@@ -1056,6 +1056,24 @@ an added, removed, duplicated, or unowned discriminator.
 Request 11 changed the asserted `ExprKind` total from 253 to 258 in the same integrated tree that
 already contains `JsonEncodeBounded`, and activated its five rows.
 
+### Request 5 bounded-HTTP planned delta
+
+Request 5 activates both setters with the bounded decoder; neither discriminator may ship as a
+dormant producer. The implementation adds exactly these two rows and changes the asserted current
+`ExprKind` total from 258 to 260 in that integrated tree:
+
+| Planned `ExprKind` | Exact producer and checked-HIR envelope |
+|---|---|
+| `HttpRequestMaxResponseBodyBytes` | `env[]; child[req,limit]`; `LocalHandle(HttpRequest,req),i64; result Unit; req native state mutated without source mut; Pure`. |
+| `HttpClientMaxResponseBodyBytes` | `env[]; child[client,limit]`; `LocalHandle(HttpClient,client),i64; result Unit; client native state mutated without source mut; Pure`. |
+
+Each row requires exact child order, handle kind, bound-local receiver, `i64` limit, Unit result,
+and Pure effect. Complete-envelope mutation owners reject a temporary or wrong handle, wrong limit
+or result type, reordered/missing children, and malformed nested children before MIR allocation or
+runtime declaration. Negative and above-global values are producer-valid HIR and remain runtime
+programmer-error aborts before storage or network work. Whole-program and imported/per-unit lowering
+must emit the same row and interface/cache spelling.
+
 ## Producer-delegation closure matrix
 
 This matrix closes the **silent-empty-MIR** class: the body validator answering

@@ -198,8 +198,9 @@ Request 5 bounded-HTTP design delta (not shipped until its implementation PR):
 
 Both use ordinary keyed-native identity and become mandatory base exports when the capability
 activates. The implementation updates registry counts, bijection, declaration golden, and base
-runtime-export parity in the same change. The HTTP-private result sentinel is not an ABI symbol: MIR
-maps it to reserved `Error.Code(-1)` before the common status decoder.
+runtime-export parity in the same change. The HTTP-private negative result sentinel is not an ABI
+symbol: client-response MIR maps it to reserved `Error.Code(-1)` before the common positive status
+decoder, so it cannot collide with a saturating encoded errno.
 
 Unkeyed native records:
 
