@@ -11,11 +11,13 @@ _Last updated: 2026-08-15._ Align PR #812 merged align-llm Request 5's bounded H
 response-body capability at `5aa5b23a`. Its exact-head native ARM64 preflight and every required
 GitHub check passed before merge. Active work is the separate align-llm Request 7
 benchmark-evidence prerequisite design on `agent/json-escape-benchmark-evidence-design`. The
-proposed contract is `docs/impl/core-design/json-escape-benchmark-evidence.md`: a merged-baseline
-controller, native named x86_64 host, digest-pinned offline OCI toolchain, read-only revision
-isolation, fixed balanced sampling, exact integer ratios, and host-signed canonical evidence. Next:
-finish the author consistency pass, run one independent design review, fix its complete valid
-finding set, publish and merge the design, then implement the benchmark-input and evidence-controller
+proposed contract is `docs/impl/core-design/json-escape-benchmark-evidence.md`: a trusted installed
+controller/verifier, continuously monitored native x86_64 host, digest-pinned offline OCI toolchain,
+read-only revision isolation, robust inner statistics plus fixed balanced sampling, a complete
+canonical report schema, and host-signed evidence. One independent review of `5ed19c85` found six
+valid issues; the current repair closes its complete finding set and adds the synchronized Japanese
+mirror and indexes. Next: run the required final comprehensive review of the repaired full diff,
+publish and merge the design, then implement the benchmark-input and evidence-controller
 prerequisites before creating a Request 7 implementation branch.
 
 The C-B borrow/ownership capability is complete
@@ -192,7 +194,8 @@ facts must live in this repository.
   Request 6 is closed after Align design #703, implementation #704, and align-llm adoption #84;
   Request 8 is merged through Align design #799 and implementation #801; Request 10's §7.6
   implementation is merged; Requests 11 and 12 are implemented, and Request 5's bounded-HTTP
-  implementation is active on `agent/request5-bounded-http`. Requests 7, 9, and 13–14 remain proposed in
+  implementation is merged at `5aa5b23a`. Request 7's benchmark-evidence design is active; Requests
+  9 and 13–14 remain proposed in
   `../align-llm/docs/align-requests.md`; Request 9 remains the later C7 blocker after Request 7.
 
 Consumer-gated deferrals that remain intentional:

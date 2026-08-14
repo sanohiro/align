@@ -32,6 +32,8 @@ PR (same rule as std-design).
 - [vec-mask.md](vec-mask.md) — `vecN<T>` / `maskN<T>`, lane ops, `load`/`store`, `select`/`dot`/`fma`/`sum_where`, `align(N)`
 - [arena-heap.md](arena-heap.md) — `arena {}` and `heap.new` / `box`: regions, escape, drop
 - [hash.md](hash.md) — `core.hash` (`hash64`/`hash128`): status and design
+- [json-escape-benchmark-evidence.md](json-escape-benchmark-evidence.md) — trusted native-host
+  controller, isolation, report schema, and acceptance boundary for the JSON escape benchmark
 
 Template per file: **Overview → Signatures (verified unless explicitly pending) → Type & ownership → Effects → Errors &
 aborts → Regions → Spec'd but not implemented → Pitfalls → Test anchors.**

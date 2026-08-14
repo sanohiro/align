@@ -23,6 +23,8 @@ core の領域を実装・変更する際は、同じ PR 内でここの該当�
 - [vec-mask.md](vec-mask.md) — `vecN<T>` / `maskN<T>`、レーン操作、`load`/`store`、`select`/`dot`/`fma`/`sum_where`、`align(N)`
 - [arena-heap.md](arena-heap.md) — `arena {}` と `heap.new` / `box`: region、escape、drop
 - [hash.md](hash.md) — `core.hash`(`hash64`/`hash128`): 状態と設計
+- [json-escape-benchmark-evidence.md](json-escape-benchmark-evidence.md) — JSON escape benchmark の
+  trusted native-host controller、isolation、report schema、acceptance boundary
 
 各ファイルのテンプレート: **Overview → Signatures (明示的に pending のものを除き verified) → Type & ownership → Effects → Errors &
 aborts → Regions → 仕様先行(未実装) → Pitfalls → Test anchors。**

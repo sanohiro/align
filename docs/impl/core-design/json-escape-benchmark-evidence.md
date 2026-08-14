@@ -1,5 +1,7 @@
 # JSON escape benchmark evidence
 
+> 🌐 **English** · [Japanese](./ja/json-escape-benchmark-evidence.md)
+
 Status: proposed design for align-llm Request 7. This document defines the evidence boundary only.
 It does not accept the JSON language change, select its immutable baseline, or make a performance
 claim. The evidence implementation and benchmark-input prerequisite must merge before the Request
@@ -12,7 +14,8 @@ not choose the baseline, controller, workload, toolchain, host, sample order, pa
 attestation that judges it. A benchmark script can execute candidate compiler/runtime code; it
 cannot publish an accepted result by itself.
 
-The trusted boundary is a reviewed controller already present in the immutable baseline; one
+The trusted boundary is a root-owned launcher installed from a reviewed controller before baseline
+selection, with the same controller bytes already present in the immutable baseline; one
 digest-pinned Linux x86_64 OCI image containing the complete build toolchain and offline dependency
 cache; one named, otherwise-idle native x86_64 evidence host; kernel-enforced read-only source,
 controller, toolchain, and dependency mounts; distinct writable revision workspaces; and a host-held
@@ -34,11 +37,11 @@ must not broaden it independently.
 
 | Field | Exact contract |
 |---|---|
-| Public producer | `scripts/json-escape-benchmark-evidence run --repository REPO --baseline BASE --candidate CANDIDATE --review-log REVIEW_LOG --output-dir NEW_DIR` executed from a clean raw checkout of `BASE`. The launcher verifies its own script, modules, profile, and key bytes/modes against `BASE` before other work. All paths are absolute. OIDs are lowercase 40-hex. `NEW_DIR` must not exist. No other positional arguments, environment selectors, image/host overrides, sample counts, modes, or thresholds exist. |
-| Public verifier | `scripts/json-escape-benchmark-evidence verify --report REPORT --signature SIGNATURE` checks an existing pair against the merged profile/public key. It performs no build, checkout, benchmark, network, or repository mutation. |
+| Public producer | `/opt/align-evidence/v1/bin/align-json-escape-evidence run --repository REPO --baseline BASE --candidate CANDIDATE --review-log REVIEW_LOG --output-dir NEW_DIR`. The root-owned launcher and modules were installed from the merged evidence implementation, are immutable to the benchmark account, and have hashes embedded in the host profile. It reads the controller/profile/key blobs directly from verified `BASE` objects and requires byte/mode equality with its installed copies before other work. All paths are absolute. OIDs are lowercase 40-hex. `NEW_DIR` must not exist. No other arguments or overrides exist. |
+| Public verifier | `/opt/align-evidence/v1/bin/align-json-escape-evidence verify --report REPORT --signature SIGNATURE --expected-baseline BASE --expected-candidate CANDIDATE --pr-body PR_BODY`. It verifies bytes/signature and requires the report/review/preflight bindings to equal the explicit OIDs and PR body. Local use is diagnostic; acceptance runs this same installed verifier in trusted-base CI, with `BASE`, `CANDIDATE`, and `PR_BODY` supplied from the GitHub event rather than candidate arguments. It performs no build, checkout, benchmark, network, or repository mutation. |
 | Ambient state | There are no semantic defaults. The launcher enters an empty environment containing only fixed `PATH`, `LC_ALL=C`, `TZ=UTC`, empty `HOME`, `CARGO_NET_OFFLINE=true`, and controller-created descriptor/configuration values. Ambient Git, Cargo, Rust, Docker, locale, proxy, credential, target, and tuning variables are omitted. |
-| Result | Success atomically creates exactly `report.json` and `report.json.sig` in `NEW_DIR`, fsyncs both and the directory, prints their absolute paths, and exits zero. A threshold failure creates a valid signed `regression` report and exits 1. Every other failure removes private staging, leaves `NEW_DIR` absent, emits no accepted path, and exits nonzero. |
-| Controller owner | A checked-in Python 3 controller and fixture tests under `scripts/` and `tests/benchmark_evidence/`. The exact source, interpreter, Git, Docker client/daemon, `ssh-keygen`, kernel, OCI image, host profile, and allowed executable SHA-256 identities are recorded. |
+| Result | Success atomically creates exactly `report.json` and `report.json.sig` in `NEW_DIR`, fsyncs both and the directory, releases the exclusive lock, prints their absolute paths, and exits zero. A threshold failure creates a valid signed `regression` report and exits 1 after the same durability and lock-release sequence. Every other failure removes private staging, leaves `NEW_DIR` absent, emits no accepted path, and exits nonzero. |
+| Controller owner | A checked-in Python 3 controller, root-owned installed launcher, and fixture tests under `scripts/` and `tests/benchmark_evidence/`. The exact installed/source relationship, installer manifest, interpreter, Git, Docker client/daemon, `ssh-keygen`, kernel, OCI image, host profile, and executable SHA-256 identities are recorded. Candidate files are never executable evidence roots. |
 | Persisted format | Canonical UTF-8 JSON schema `align.json_escape_benchmark_evidence/v1`, signed byte-for-byte with the host Ed25519 key using `ssh-keygen -Y sign` namespace `align-json-escape-benchmark-evidence-v1`. Unknown, missing, duplicate, reordered, non-ASCII key, non-integer number, float, invalid UTF-8/escape, trailing byte, or noncanonical serialization rejects. |
 | Ownership/allocation | The controller owns all temporary directories, pipes, children, containers, captures, report staging, and cleanup. Benchmark children receive only stdin `/dev/null`, private stdout, and private stderr. Captures have fixed profile ceilings. No child receives the report, signature, repository administration, controller, Docker socket, signing key, or another revision's writable directory. |
 | Concurrency | One controller obtains the profile's host-global exclusive lock before repository inspection and holds it through signing and cleanup. Baseline and candidate never overlap. The fixed pair order is the only schedule. |
@@ -53,6 +56,15 @@ requires the trusted-base PR attestation to carry the identical candidate, merge
 reviewer, and clean/findings-fixed state. An edited log cannot create that required status.
 
 ## Merged profile and fixed identities
+
+The implementation installs the launcher under a root-owned `/opt/align-evidence/v1` tree with no
+benchmark-account write permission. Its installation manifest fixes every relative path, mode,
+owner, size, and SHA-256 and embeds the evidence implementation commit plus profile blob OID. The
+launcher opens itself and every module before parsing caller input, checks the installed manifest,
+then uses pinned Git to read the same paths from `BASE` and requires exact equality. The verifier is
+the same installed program; it never imports a module from `REPO`, `BASE`, `CANDIDATE`, current
+directory, `PYTHONPATH`, user site, or a caller-selected path. Installation/replacement is an
+administrator-only qualification step before baseline selection.
 
 The implementation adds canonical profile
 `bench/json_escape/evidence/linux-x86_64-v1.json` containing exactly:
@@ -79,11 +91,23 @@ self-inspection with network disabled must reproduce all tool versions and hashe
 QEMU/binfmt, a cross-architecture image, mutable tag resolution, or changed tool rejects. This lane
 never emulates x86_64 or ARM.
 
-The named host is operationally reserved. The controller samples load, CPU pressure, throttling,
-steal time, governor, temperature/throttle flags, free memory, swap activity, and running containers
-before build, between every child, and after the last child. The profile fixes admissible values.
-Any violation rejects the run instead of deleting a slow sample. Observations enter the report. The
-controller does not claim to detect a malicious host administrator.
+The named host is operationally reserved. Its benchmark CPUs are an exclusive cpuset from which the
+host service manager excludes ordinary work. A root-owned, profile-pinned monitor opens scheduler,
+cgroup, thermal-throttle, frequency, pressure, memory, swap, and container event sources before the
+first build. For every child it brackets the exact child cgroup, continuously consumes events, and
+latches any non-child task scheduled on the benchmark CPUs, CPU migration outside the set,
+throttle/thermal/frequency-limit event, pressure/load-limit crossing, swap I/O, memory-limit event,
+or foreign-container transition until after child reap. Monotonic counter deltas close events that
+occur entirely between periodic samples. Fixed 100 ms snapshots additionally record load, pressure,
+frequency, temperature, free memory, and container inventory during the child. An event-source
+overflow, lost event, monitor delay above the profile ceiling, monitor death, counter reset, or
+unattributed event rejects.
+
+The controller also samples before build, between children, and after the last child. All latched
+events and snapshots enter the report and any violation rejects the complete run instead of deleting
+a slow sample. The monitor runs outside candidate containers, exposes no writable/control fd to
+them, and is included in installed executable identities. It does not claim to detect a malicious
+host administrator.
 
 ## Revision and source construction
 
@@ -165,7 +189,17 @@ valid report. Signal handlers preserve the cause but never publish partial evide
 
 ## Workload and measurement
 
-Builds finish for both revisions before warm-up. The controller then runs only:
+Builds finish for both revisions before warm-up. Before baseline selection, the evidence
+implementation changes both protected harnesses to retain their existing timed operations and round
+counts but report the arithmetic median of every inner timing for each field, not the minimum. For
+the even counts (40 and 30), each value is the arithmetic mean of the two middle sorted nanosecond
+durations, converted once to the existing three-decimal millisecond token. The harness uses checked
+integer nanoseconds for selection/averaging and never selects a low outlier or computes a
+floating-point median. Deterministic owners feed synthetic duration sequences, including one extreme
+low outlier, and pin the selected middle pair and rendering. This does not add, remove, or reorder a
+timed kernel invocation. It is identical protected input before `BASE` exists.
+
+The controller then runs only:
 
 ```text
 bench/json_decode/run.sh native
@@ -196,8 +230,8 @@ json_soa:    soa ms, aos ms, proj ms
 ```
 
 Duplicate/missing lines, wrong row/order/field count, non-ASCII whitespace, sign, exponent,
-nonfinite token, invalid ratio suffix, or profiling output rejects. Each retained token is positive
-ASCII decimal with exactly three fractional digits and converts without
+nonfinite token, invalid ratio suffix, or profiling output rejects. Each retained token is the
+harness's inner median, is positive ASCII decimal with exactly three fractional digits, and converts without
 floating point or rounding to integer microseconds. Original token and integer are reported. For
 each field/revision, sort ten integers and define median `(sample[4] + sample[5]) / 2`. Store the
 middle sum and denominator `2`, never a rounded value. Compare exactly:
@@ -212,31 +246,151 @@ owners.
 
 ## Canonical report and signature
 
-`report.json` uses fixed key order and ASCII keys. Strings are UTF-8; digests/OIDs are fixed-width
-lowercase hex; measurements/counts are integers. Arrays preserve normative order. There are no JSON
-floats, nulls, optional unknown fields, or timestamp identities.
+The complete file is exactly this outer record followed by one LF:
 
-The top-level record contains, in order:
+```text
+Report = {"body":Body,"body_sha256":hex64}\n
+```
 
-1. schema/profile/controller/verifier versions and source/executable identities;
-2. a 256-bit host-CSPRNG run ID, UTC start/end, and host lock identity;
-3. baseline/candidate raw identities, parent chain, target-tip observation, changed-path inventory,
-   and protected-input manifests;
-4. review-log digest and parsed head/base/verdict/findings-fixed bindings;
-5. host/kernel/CPU/memory/daemon/image/toolchain/cache/config/environment/mount/fd/limit observations;
-6. ordered pre/between/post resource observations;
-7. per benchmark: argv, warm-up capture identities, then ten ordered pairs with revision,
-   stdout/stderr hashes, exit/duration, parsed token(s), and integer values;
-8. per field/revision: original/sorted samples, middle sum and denominator; then exact ratio and
-   threshold result;
-9. cleanup inventory, verdict `pass` or `regression`, and first failed threshold; and
-10. SHA-256 over the canonical unsigned semantic record.
+There is no whitespace outside strings. Object members appear in the order declared below. Arrays
+use the declared order and cardinality. `u32` and `u64` are unsigned ASCII decimal with no leading
+zero except `0`; encoders use checked conversion and decoders reject overflow. `bool` is `true` or
+`false`. `hex40` and `hex64` are lowercase hexadecimal of exactly 40 and 64 digits.
+`token` is `[0-9]+\.[0-9]{3}`. `time` is exactly
+`YYYY-MM-DDTHH:MM:SS.NNNNNNNNNZ`. Every other string belongs to a closed enum below or matches
+`name = [A-Za-z0-9._/:+=@-]{1,255}`. Arbitrary bytes and Git paths are lowercase even-length hex strings,
+so the format never needs a JSON escape. A quote, backslash, control byte, non-ASCII scalar, invalid
+UTF-8, overlong string, unknown member, missing member, duplicate member, reordered member, wrong
+array length/order, float, negative number, `null`, or trailing byte rejects.
 
-The producer encodes, reparses with duplicate rejection, re-encodes, and requires byte identity
-before signing. The verifier repeats schema/canonical validation, relationships, sample
-reconstruction, medians, exact comparisons, identities, key fingerprint, and signature; it does not
-trust stored derived values. Goldens cover both directions and one mutation of every scalar,
-ordering, presence, duplicate, width, signature, and derived field.
+The following type declarations fix every member name, order, type, and presence. `[]` is permitted
+only where an unbounded sequence is shown. All other cardinalities are exact.
+
+```text
+Body = {
+  "schema":"align.json_escape_benchmark_evidence/v1",
+  "profile_id":name, "profile_sha256":hex64,
+  "producer":ToolIdentity, "verifier":ToolIdentity, "monitor":ToolIdentity,
+  "run_id":hex64, "started_at":time, "ended_at":time,
+  "baseline":Revision, "candidate":Revision, "target":TargetBinding,
+  "review":ReviewBinding, "protected_inputs":ProtectedInputs,
+  "execution":ExecutionIdentity, "host_observations":[HostObservation],
+  "benchmarks":[BenchmarkEvidence;2], "fields":[FieldResult;5],
+  "cleanup":Cleanup, "verdict":Verdict, "first_failed_field":FieldOrEmpty
+}
+
+ToolIdentity = {"version":name,"source_commit":hex40,"source_manifest_blob":hex40,
+  "source_manifest_sha256":hex64,"executable_sha256":hex64}
+ExecutableIdentity = {"version":name,"executable_sha256":hex64}
+Revision = {"commit_oid":hex40,"commit_sha256":hex64,"tree_oid":hex40,
+  "tree_manifest_sha256":hex64,"parents":[hex40],"commits":[CommitIdentity],
+  "changed_paths":[PathIdentity]}
+CommitIdentity = {"oid":hex40,"raw_sha256":hex64,"tree_oid":hex40,
+  "parents":[hex40]}
+PathIdentity = {"path_hex":bytes,"mode":GitMode,"kind":PathKind,"oid":hex40,
+  "size":u64,"sha256":hex64}
+TargetBinding = {"local_ref":"refs/heads/main","run_oid":hex40,
+  "expected_merge_base":hex40,"expected_merge_head":hex40,
+  "expected_merge_tree":hex40}
+ReviewBinding = {"log_sha256":hex64,"review_head":hex40,"review_base":hex40,
+  "state":ReviewState,"reviewer":name,"repair_commits":[hex40]}
+ProtectedInputs = {"baseline_manifest_sha256":hex64,
+  "candidate_manifest_sha256":hex64,"entries":[PathIdentity]}
+
+ExecutionIdentity = {"host_id":name,"kernel":name,"cpu":name,"microcode":name,
+  "cpu_set":name,"numa_set":name,"memory_bytes":u64,"docker_client":ExecutableIdentity,
+  "docker_daemon":name,"oci_runtime":name,"image_digest":name,
+  "image_id":hex64,"image_config":hex64,"cargo":ExecutableIdentity,"rustc":ExecutableIdentity,
+  "llvm":ExecutableIdentity,"cc":ExecutableIdentity,"linker":ExecutableIdentity,
+  "cargo_cache_manifest_sha256":hex64,"cargo_config_sha256":hex64,
+  "environment_sha256":hex64,"mount_manifest_sha256":hex64,
+  "limit_manifest_sha256":hex64,"descriptor_manifest_sha256":hex64}
+HostObservation = {"ordinal":u32,"phase":HostPhase,"monotonic_ns":u64,
+  "load_milli":u64,"cpu_pressure_total_us":u64,"memory_pressure_total_us":u64,
+  "free_memory_bytes":u64,"swap_read_bytes":u64,"swap_write_bytes":u64,
+  "throttle_events":u64,"thermal_events":u64,"foreign_schedule_events":u64,
+  "foreign_container_events":u64,"monitor_lost_events":u64,
+  "frequency_khz":u64,"temperature_millic":u64,"container_manifest_sha256":hex64}
+
+BenchmarkEvidence = {"name":Benchmark,"argv":Argv,"warmups":[Run;2],
+  "pairs":[Pair;10]}
+Pair = {"ordinal":u32,"first":Run,"second":Run}
+Run = {"revision":RevisionArm,"sequence":u32,"stdout_sha256":hex64,
+  "stderr_sha256":hex64,"stderr_tail_hex":bytes,"exit_code":u32,
+  "elapsed_ns":u64,"monitor_first":u32,"monitor_last":u32,"samples":[Sample]}
+Sample = {"field":Field,"token":token,"microseconds":u64}
+FieldResult = {"field":Field,"baseline_tokens":[token;10],
+  "candidate_tokens":[token;10],"baseline_samples_us":[u64;10],
+  "candidate_samples_us":[u64;10],"baseline_sorted_us":[u64;10],
+  "candidate_sorted_us":[u64;10],"baseline_middle_sum":u64,
+  "candidate_middle_sum":u64,"median_denominator":2,"ratio_numerator":u64,
+  "ratio_denominator":u64,"threshold_numerator":105,
+  "threshold_denominator":100,"passed":bool}
+Cleanup = {"children_remaining":u32,"containers_remaining":u32,
+  "mounts_remaining":u32,"fds_remaining":u32,"private_dirs_remaining":u32,
+  "host_lock_held_for_signing":bool,"source_manifests_unchanged":bool,
+  "cache_manifests_unchanged":bool}
+```
+
+Closed enums are exact:
+
+```text
+PathKind = "blob" | "symlink"
+GitMode = "100644" | "100755" | "120000"
+ReviewState = "clean" | "findings-fixed"
+Verdict = "pass" | "regression"
+FieldOrEmpty = "" | Field
+RevisionArm = "baseline" | "candidate"
+Benchmark = "json_decode" | "json_soa"
+Argv = "bench/json_decode/run.sh native" | "bench/json_soa/run.sh native"
+Field = "A-full" | "A-proj" | "soa ms" | "aos ms" | "proj ms"
+HostPhase = "pre-build" | "child-start" | "child-sample" | "child-end" |
+  "between-children" | "post-run"
+```
+
+`Revision.parents` has exactly the raw commit parents; baseline `commits` and `changed_paths` are
+empty, candidate `commits` is the nonempty first-parent sequence after baseline, and candidate
+`changed_paths` is path-hex order. Protected entries are path-hex order and contain the common
+identity once; their two manifest hashes must be equal. Host observations have dense ordinals and
+each `Run` names an inclusive nonempty range that starts with `child-start`, ends with `child-end`,
+and contains all its 100 ms samples. Benchmarks are `json_decode`, then `json_soa`. Warmups are
+baseline, then candidate. Pair ordinals are 1 through 10 with B/C arms in the specified balanced
+order. `Run.samples` has fields in benchmark order (two then three). Field results use the five field
+order above. Original samples follow pair ordinal; sorted samples are nondecreasing and exact
+permutations. `ratio_numerator` is candidate middle sum and `ratio_denominator` baseline middle sum.
+All cleanup counts are zero and booleans true before either verdict can be signed. The host lock is
+still held while signing; after both output files and their directory are durable, the producer
+releases it and only then prints accepted paths. Lock-release failure suppresses those paths but
+cannot retroactively alter the signed report.
+`first_failed_field` is empty exactly for `pass`; for `regression` it is the first false field in
+field order. There are no conditional or omitted members.
+
+For a `clean` review, `review_head` equals the candidate and `repair_commits` is empty. For a
+`findings-fixed` review, `review_head` is the reviewed ancestor and `repair_commits` is the exact
+nonempty first-parent sequence after it, ending at the candidate; every listed commit is also in
+candidate `commits`, in the same order. `review_base` equals the reported baseline in either state.
+Each `ToolIdentity.source_manifest_blob` names the canonical installation-manifest blob in
+`source_commit`; `source_manifest_sha256` hashes those blob bytes, and the manifest in turn fixes
+every installed file used by that tool.
+
+`body_sha256` is not recursive. Its exact preimage is the 45 ASCII bytes
+`align-json-escape-benchmark-evidence-body-v1\0` followed by the canonical JSON encoding of `Body`
+alone, with no LF. The digest is lowercase hex in the outer record. The signature covers the
+complete canonical outer record including its final LF in namespace
+`align-json-escape-benchmark-evidence-v1`.
+
+The producer encodes `Body`, computes that domain-separated digest, encodes `Report`, reparses with
+duplicate rejection, re-encodes, and requires byte identity before signing. The verifier repeats
+schema/canonical validation, the body digest, every relationship, sample reconstruction, medians,
+exact comparisons, explicit expected baseline/candidate/PR bindings, identities, key fingerprint,
+and signature; it trusts no stored derived value.
+
+The implementation checks in complete minimal-pass and first-field-regression semantic fixtures,
+their exact one-line report bytes, detached test signatures, and SHA-256 files. A structurally
+independent reference encoder produces each golden without calling production encode/decode code;
+production decode-to-semantics and re-encode must match byte-for-byte. The mutation matrix changes
+every member, enum, scalar width/boundary, array cardinality/order, key order/presence/duplicate,
+string grammar, LF, body preimage/domain/digest, signature namespace/key, and derived field.
 
 An accepted PR carries the complete report/signature as unmodified files in an immutable artifact
 or base64-safe fenced attachment, plus verifier command/result. Copying is allowed; changing one byte
@@ -268,9 +422,9 @@ It may not weaken the base rule.
 1. Merge the benchmark-input slice: check in detached locks, remove ignores, make all four Cargo
    invocations locked/offline, confine generated outputs, and add deterministic missing/stale/cache,
    no-network, no-write, and cleanup owners.
-2. Merge evidence implementation: controller, verifier, profile, pinned image recipe/digest, public
-   key, host guide, adversarial fixtures, format goldens, and merge-race owner. It makes no Request 7
-   performance claim.
+2. Merge evidence implementation: installed controller/verifier/monitor, profile, pinned image
+   recipe/digest, public key, inner-median harness update, host guide, adversarial fixtures, format
+   goldens, and merge-race owner. It makes no Request 7 performance claim.
 3. Provision the host private key, independently verify image/cache/toolchain/profile, and run host
    self-qualification.
 4. Only then select current target tip as `BASE` and create the Request 7 branch directly on it.
@@ -281,15 +435,16 @@ It may not weaken the base rule.
 
 | Cell | Owner and exact regression |
 |---|---|
-| CLI construction | Reject missing/extra/repeated options, relative paths, malformed/same OIDs, existing output, untrusted controller checkout/repository, and ambient selectors before mutation. `benchmark_evidence_cli_matrix`. |
+| Trusted bootstrap and CLI | Root-owned installed producer/verifier/monitor bytes must match their manifest and verified baseline blobs. Candidate/PATH/PYTHONPATH/current-directory substitution, installed-file replacement, missing/extra/repeated options, relative paths, malformed/same OIDs, existing output, untrusted repository, and ambient selectors reject before mutation. Trusted CI supplies expected baseline/candidate/PR body. `benchmark_evidence_bootstrap_cli_matrix`. |
 | Raw identity/construction | Cover clone/worktree, packed/loose objects, reviewed symlinks, hostile config/includes/hooks/filters/fsmonitor/commit-graph/replacements/grafts/alternates/promisor/shallow/missing objects, raw swap, path/type/mode collisions, and mutation race. `benchmark_evidence_raw_object_matrix`. |
 | Revision binding | Exact parent chain succeeds; wrong local target, unrelated ancestry, merge/side parent, ref movement, stale review, and branch-after-drift reject. The report exposes every changed path/mode for review scope disposition. `benchmark_evidence_revision_binding_matrix`. |
 | Protected inputs | Mutate presence/path/type/mode/bytes of every required/optional config, manifest, lock, script, kernel, harness, generator, output, and timing owner; reject before candidate execution. `benchmark_evidence_protected_input_matrix`. |
 | Toolchain/cache/offline | Image/tool/cache/config identity succeeds; tag/image/tool swap, missing/stale lock, incomplete cache, registry update, network, and source/cache/lock/target cross-write reject. `benchmark_evidence_toolchain_matrix`. |
-| Native host/isolation | Cover x86_64 success; ARM/emulation, CPU/microcode/kernel/daemon/runtime/cgroup/image mismatch, quota/load/throttle/swap, writable source, network/device/capability/credential/socket/cross-revision exposure reject. `benchmark_evidence_host_isolation_matrix`. |
+| Native host/isolation | Cover x86_64 success; ARM/emulation, CPU/microcode/kernel/daemon/runtime/cgroup/image mismatch, quota/writable source/network/device/capability/credential/socket/cross-revision exposure reject. A latched foreign scheduler/container, throttle/thermal/frequency, pressure/load, swap/memory event during any child, monitor loss/overflow/delay/death, and boundary-only clean snapshots all reject. `benchmark_evidence_host_isolation_matrix`. |
 | Descriptor/environment | Collide every inherited fd; cover missing CLOEXEC, unexpected fd, stdio swap, proxy/Cargo/Rust/Git/locale/home injection, truncation, and capture overflow. `benchmark_evidence_process_boundary_matrix`. |
 | Schedule | Exact warm-ups and odd B-C/even C-B pairs succeed; overlap, reorder, retry, skip, duplicate, crash, timeout, signal, and nonzero reject. `benchmark_evidence_schedule_matrix`. |
-| Parser/arithmetic | Exact titles, headers, three rows, all columns, and five retained fields succeed; wrong/duplicate/missing/extra line, row, header, or field and whitespace/sign/exponent/nonfinite/precision/ratio/zero/overflow reject. Exact 1.05 passes; next unit fails. `benchmark_evidence_parser_ratio_matrix`. |
+| Inner/outer statistics | Synthetic odd/even durations, equal middle values, overflow edges, and one arbitrarily low outlier pin checked-integer inner medians and three-decimal rendering. Ten printed samples retain exact tokens; exact 1.05 passes and the next microsecond unit fails. `benchmark_evidence_statistic_matrix`. |
+| Parser/arithmetic | Exact titles, headers, three rows, all columns, and five retained fields succeed; wrong/duplicate/missing/extra line, row, header, or field and whitespace/sign/exponent/nonfinite/precision/ratio/zero/overflow reject. `benchmark_evidence_parser_ratio_matrix`. |
 | Report/signature | Bidirectional golden plus every field/order/type/width/duplicate/escape/trailing/derived mutation; wrong key/namespace/signature/profile/stale candidate reject. `benchmark_evidence_report_v1_matrix`. |
 | Failure/cleanup | Cross each phase with error, timeout, signal, disk-full, fsync, removal, and signing failure. No accepted path remains; children, containers, mounts, fds, locks, and private dirs are gone. `benchmark_evidence_cleanup_matrix`. |
 | Concurrent runs | Second run fails before Git/image/container work; lock releases only after cleanup, including signal/sign failure. `benchmark_evidence_exclusive_run`. |
@@ -301,6 +456,17 @@ Implementation maps every row to source and deterministic tests before review. T
 executors, a fake daemon, disposable repositories/remotes, and test keys; they do not run the
 performance workload or assert wall-clock ratios. Native host qualification and final Request 7
 measurement remain named manual evidence.
+
+## Design-review finding closure
+
+| Finding | Ledger-first closure |
+|---|---|
+| P1 candidate-selected producer/verifier could attest or replay itself | Both entry points are one root-owned installed program pinned by the host profile and independently matched to verified baseline blobs. Acceptance supplies expected OIDs and PR body from trusted-base CI, never candidate arguments alone. |
+| P1 report v1 lacked complete nested bytes | The exact outer record, every ordered nested member/type/cardinality, scalar/string grammar, enum, presence rule, relationship, independent encoder, full pass/regression goldens, and mutation matrix are now normative. |
+| P1 report digest had a recursive/ambiguous preimage | `body_sha256` is outside `Body` and hashes one exact 45-byte domain plus canonical `Body` without LF. Goldens and mutations own domain, boundary, and digest. |
+| P1 host violations could occur wholly inside one child | A root-owned event monitor brackets every child, continuously consumes and latches scheduler/cgroup/thermal/frequency/pressure/memory/swap/container events, and pairs them with 100 ms snapshots. Loss, overflow, delay, or death rejects. |
+| P1 inner minima selected unrelated low outliers | Both harnesses keep their operations/round counts but select checked-integer inner medians before the baseline exists; synthetic outlier owners pin the statistic. The controller retains balanced outer pairs and exact rational threshold arithmetic. |
+| P2 core-design mirror/index absent | The synchronized Japanese mirror and both core-design indexes are part of this repair. English remains authoritative. |
 
 ## Author consistency pass
 
