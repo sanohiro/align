@@ -1403,6 +1403,7 @@ fn scalar_name(s: Scalar) -> String {
 enum JsonDir {
     Decode,
     Encode,
+    EncodeBounded,
 }
 
 #[derive(Clone, Copy)]
@@ -1417,6 +1418,7 @@ impl JsonDir {
         match self {
             JsonDir::Decode => "json.decode",
             JsonDir::Encode => "json.encode",
+            JsonDir::EncodeBounded => "json.encode_bounded",
         }
     }
 
@@ -1424,8 +1426,12 @@ impl JsonDir {
     fn verb(self) -> &'static str {
         match self {
             JsonDir::Decode => "decode",
-            JsonDir::Encode => "encode",
+            JsonDir::Encode | JsonDir::EncodeBounded => "encode",
         }
+    }
+
+    fn is_encode(self) -> bool {
+        matches!(self, JsonDir::Encode | JsonDir::EncodeBounded)
     }
 }
 
@@ -7784,6 +7790,11 @@ fn compact_abstract_nominal_instances(
                     remap_template_part(part, remap, valid);
                 }
             }
+            ExprKind::JsonEncodeBounded { parts, .. } => {
+                for part in parts {
+                    remap_template_part(part, remap, valid);
+                }
+            }
             _ => {}
         }
         match &mut expr.kind {
@@ -12651,6 +12662,18 @@ impl EffectScan<'_> {
                     }
                 }
             }
+            ExprKind::JsonEncodeBounded {
+                parts, max_bytes, ..
+            } => {
+                for p in parts {
+                    match p {
+                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => walk!(h),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => walk!(access),
+                        TemplatePart::Text(_) | TemplatePart::PopComma => {}
+                    }
+                }
+                walk!(max_bytes);
+            }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. }
             | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. }
             // `json.scan(input)` is Pure (build a streaming scanner — no I/O); walk the input (J5).
@@ -15702,6 +15725,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::CryptoArgon2 { .. }
             | ExprKind::ArrayGroupAgg { .. }
             | ExprKind::ArrayGroupAggMulti { .. }
+            | ExprKind::JsonEncodeBounded { .. }
             | ExprKind::RawNull
             | ExprKind::SqliteCallbackDescriptor { .. } => values.push(Region::Static),
                 },
@@ -15923,6 +15947,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ArrayChunks { .. }
             | ExprKind::Len(..)
             | ExprKind::Template(..)
+            | ExprKind::JsonEncodeBounded { .. }
             | ExprKind::JsonDecode { .. }
             | ExprKind::JsonDecodeArray { .. }
             | ExprKind::JsonDecodeScalar { .. }
@@ -17508,6 +17533,18 @@ impl<'a> EscapeCheck<'a> {
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
+            }
+            ExprKind::JsonEncodeBounded {
+                parts, max_bytes, ..
+            } => {
+                for p in parts {
+                    match p {
+                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.walk(h, depth),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.walk(access, depth),
+                        TemplatePart::Text(_) | TemplatePart::PopComma => {}
+                    }
+                }
+                self.walk(max_bytes, depth);
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.walk(input, depth),
             // `json.doc(...)` and the doc accessors: walk their operands (J4).
@@ -20643,6 +20680,9 @@ impl<'a> MoveCheck<'a> {
             // their rendered bytes into its own storage, so `t := template "{h}"` survives a later
             // `h = …` — exactly the property that keeps it a real copy rather than a view of `h`.
             ExprKind::Template(_) => self.template_owner_root(e).into_iter().collect(),
+            // The bounded encoder copies source bytes into a free-standing owned `string`; neither
+            // its Ok payload nor its Error payload borrows the input.
+            ExprKind::JsonEncodeBounded { .. } => BorrowRoots::new(),
             ExprKind::JsonDecode { input, .. }
             | ExprKind::JsonDecodeArray { input, .. }
             | ExprKind::JsonDecodeStructArray { input, .. } => self.storage_roots(input),
@@ -25256,6 +25296,18 @@ impl<'a> MoveCheck<'a> {
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
+            }
+            ExprKind::JsonEncodeBounded {
+                parts, max_bytes, ..
+            } => {
+                for p in parts {
+                    match p {
+                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => move_expr!(self, h, moved, false, false),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => move_expr!(self, access, moved, false, false),
+                        TemplatePart::Text(_) | TemplatePart::PopComma => {}
+                    }
+                }
+                move_expr!(self, max_bytes, moved, false, false);
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => move_expr!(self, input, moved, false, false),
             // `json.scan(input)` reads the input as a borrowed `str` view (never consumed) — J5.
@@ -30820,6 +30872,10 @@ impl<'a, 't> Checker<'a, 't> {
             if module == "json" && method == "encode" {
                 self.require_import("core.json", "json.encode", span);
                 return self.check_json_encode(args, span);
+            }
+            if module == "json" && method == "encode_bounded" {
+                self.require_import("core.json", "json.encode_bounded", span);
+                return self.check_json_encode_bounded(args, span);
             }
             if module == "json" && method == "decode" {
                 self.require_import("core.json", "json.decode", span);
@@ -37589,17 +37645,31 @@ impl<'a, 't> Checker<'a, 't> {
                 .error(format!("'json.encode' expects 1 argument, got {}", args.len()), span);
             return err;
         }
-        let Some((base, ty)) = self.place_local(&args[0]) else {
-            self.diags
-                .error("'json.encode' expects a struct or struct-array value (a local binding)".to_string(), args[0].span);
+        let Some((parts, _, _)) = self.json_encode_parts(&args[0], JsonDir::Encode) else {
             return err;
+        };
+        Expr { kind: ExprKind::Template(parts), ty: Ty::Str, span }
+    }
+
+    /// Construct the one checked encode plan shared by `json.encode` and
+    /// `json.encode_bounded`. Keeping schema admission and ordered parts here makes byte parity a
+    /// construction property rather than a duplicated formatter promise.
+    fn json_encode_parts(
+        &mut self,
+        value: &ast::Expr,
+        dir: JsonDir,
+    ) -> Option<(Vec<TemplatePart>, LocalId, Ty)> {
+        let Some((base, ty)) = self.place_local(value) else {
+            self.diags
+                .error(format!("'{}' expects a struct or struct-array value (a local binding)", dir.name()), value.span);
+            return None;
         };
         let mut parts = vec![];
         let mut ok = true;
         match ty {
             // A single struct → a JSON object.
             Ty::Struct(sid) => {
-                self.json_object_parts(base, sid, None, &[], &[], &mut parts, args[0].span, &mut ok);
+                self.json_object_parts(base, sid, None, &[], &[], &mut parts, value.span, &mut ok, dir);
             }
             // A fixed struct-array → a JSON array of objects (unrolled; length is static).
             Ty::StructArray(sid, n) => {
@@ -37608,7 +37678,7 @@ impl<'a, 't> Checker<'a, 't> {
                     if i > 0 {
                         parts.push(TemplatePart::Text(",".to_string()));
                     }
-                    self.json_object_parts(base, sid, Some(i), &[], &[], &mut parts, args[0].span, &mut ok);
+                    self.json_object_parts(base, sid, Some(i), &[], &[], &mut parts, value.span, &mut ok, dir);
                 }
                 parts.push(TemplatePart::Text("]".to_string()));
             }
@@ -37616,24 +37686,59 @@ impl<'a, 't> Checker<'a, 't> {
             // key), so `decode(encode(x))` round-trips (JSON completeness J1b). One conditional runtime
             // piece switches on the tag.
             Ty::Enum(eid) => {
-                if !self.check_union_decodable(eid, args[0].span, JsonDir::Encode) {
-                    return err;
+                if !self.check_union_decodable(eid, value.span, dir) {
+                    return None;
                 }
-                let access = Expr { kind: ExprKind::Local(base), ty, span: args[0].span };
+                let access = Expr { kind: ExprKind::Local(base), ty, span: value.span };
                 parts.push(TemplatePart::UnionValue { access, enum_id: eid });
             }
             _ => {
                 self.diags
-                    .error(format!("'json.encode' expects a struct or struct-array, got {}", ty_name(ty)), args[0].span);
-                return err;
+                    .error(format!("'{}' expects a struct or struct-array, got {}", dir.name(), ty_name(ty)), value.span);
+                return None;
             }
         }
         // An unsupported field left a `"name":` with no value part: return the error
         // sentinel rather than a malformed template (matches the other checks' convention).
         if !ok {
+            return None;
+        }
+        Some((parts, base, ty))
+    }
+
+    fn check_json_encode_bounded(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        if args.len() != 2 {
+            self.diags
+                .error(format!("'json.encode_bounded' expects 2 arguments, got {}", args.len()), span);
             return err;
         }
-        Expr { kind: ExprKind::Template(parts), ty: Ty::Str, span }
+        let Some((parts, base, _)) = self.json_encode_parts(&args[0], JsonDir::EncodeBounded) else {
+            return err;
+        };
+        // Check without a hint, then bind an untyped integer literal through the one exact-i64
+        // gate. This keeps negative literals and named `i64` values equivalent while rejecting a
+        // concrete narrower integer without speculative-unification residue.
+        let max_bytes = self.check_expr(&args[1], None);
+        if max_bytes.ty == Ty::Error {
+            return err;
+        }
+        if !self.require_i64_arg(
+            max_bytes.ty,
+            args[1].span,
+            "'json.encode_bounded' max_bytes",
+        ) {
+            return err;
+        }
+        Expr {
+            kind: ExprKind::JsonEncodeBounded {
+                base,
+                parts,
+                max_bytes: Box::new(max_bytes),
+            },
+            ty: Ty::Result(Scalar::String, Scalar::Enum(self.error_enum_id)),
+            span,
+        }
     }
 
     /// `json.decode(input)` — parse a `str` into a struct at runtime, yielding
@@ -38106,7 +38211,7 @@ impl<'a, 't> Checker<'a, 't> {
                         | Ty::DynStructArray(id, _) => {
                             Some(JsonShapeRoot::Struct(id))
                         }
-                        Ty::Option(Scalar::Enum(id)) if dir == JsonDir::Encode => {
+                        Ty::Option(Scalar::Enum(id)) if dir.is_encode() => {
                             Some(JsonShapeRoot::Enum(id))
                         }
                         Ty::Enum(id) => Some(JsonShapeRoot::Enum(id)),
@@ -38238,6 +38343,7 @@ impl<'a, 't> Checker<'a, 't> {
         parts: &mut Vec<TemplatePart>,
         span: Span,
         ok: &mut bool,
+        dir: JsonDir,
     ) {
         enum Work {
             Enter {
@@ -38274,7 +38380,7 @@ impl<'a, 't> Checker<'a, 't> {
                     let pop_projection = projection.is_some();
                     if !active.insert(id) {
                         self.diags.error(
-                            "'json.encode' cannot encode a self-referential struct".to_string(),
+                            format!("'{}' cannot encode a self-referential struct", dir.name()),
                             span,
                         );
                         *ok = false;
@@ -38333,7 +38439,7 @@ impl<'a, 't> Checker<'a, 't> {
 
                     if let Ty::Option(payload) = field.ty {
                         if let Scalar::Struct(id) = payload {
-                            if !self.json_struct_fields_ok(id, span, JsonDir::Encode) {
+                            if !self.json_struct_fields_ok(id, span, dir) {
                                 *ok = false;
                             } else {
                                 parts.push(TemplatePart::OptionStructField {
@@ -38347,7 +38453,8 @@ impl<'a, 't> Checker<'a, 't> {
                         if !json_encodable_scalar(payload) {
                             self.diags.error(
                                 format!(
-                                    "'json.encode' field '{}' has unsupported type {} — an `Option` field's payload must be an int, float, bool, str, or a nested struct",
+                                    "'{}' field '{}' has unsupported type {} — an `Option` field's payload must be an int, float, bool, str, or a nested struct",
+                                    dir.name(),
                                     field.name,
                                     ty_name(field.ty)
                                 ),
@@ -38385,7 +38492,7 @@ impl<'a, 't> Checker<'a, 't> {
                     let mut skip_trailing_comma = false;
                     match field.ty {
                         Ty::DynStructArray(id, _) => {
-                            if !self.json_struct_fields_ok(id, span, JsonDir::Encode) {
+                            if !self.json_struct_fields_ok(id, span, dir) {
                                 *ok = false;
                             } else {
                                 parts.push(TemplatePart::StructArrayField {
@@ -38398,7 +38505,8 @@ impl<'a, 't> Checker<'a, 't> {
                             if !json_encodable_scalar(payload) {
                                 self.diags.error(
                                     format!(
-                                        "'json.encode' field '{}' has unsupported type {} — an `array` field's element must be an int, float, bool, str, or a struct",
+                                        "'{}' field '{}' has unsupported type {} — an `array` field's element must be an int, float, bool, str, or a struct",
+                                        dir.name(),
                                         field.name,
                                         ty_name(field.ty)
                                     ),
@@ -38413,7 +38521,7 @@ impl<'a, 't> Checker<'a, 't> {
                             }
                         }
                         Ty::Enum(id) => {
-                            if !self.check_union_decodable(id, span, JsonDir::Encode) {
+                            if !self.check_union_decodable(id, span, dir) {
                                 *ok = false;
                             } else {
                                 parts.push(TemplatePart::UnionValue {
@@ -38429,7 +38537,8 @@ impl<'a, 't> Checker<'a, 't> {
                         _ => {
                             self.diags.error(
                                 format!(
-                                    "'json.encode' field '{}' has unsupported type {} (int/float/bool/str/nested-struct/Option/array<struct> only for now)",
+                                    "'{}' field '{}' has unsupported type {} (int/float/bool/str/nested-struct/Option/array<struct> only for now)",
+                                    dir.name(),
                                     field.name,
                                     ty_name(field.ty)
                                 ),
@@ -43153,6 +43262,18 @@ impl<'a, 't> Checker<'a, 't> {
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
+            }
+            ExprKind::JsonEncodeBounded {
+                parts, max_bytes, ..
+            } => {
+                for p in parts {
+                    match p {
+                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.finalize_expr(h),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.finalize_expr(access),
+                        TemplatePart::Text(_) | TemplatePart::PopComma => {}
+                    }
+                }
+                self.finalize_expr(max_bytes);
             }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.finalize_expr(input),
             ExprKind::JsonDoc { input } => self.finalize_expr(input),

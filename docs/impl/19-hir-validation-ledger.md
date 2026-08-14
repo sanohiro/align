@@ -720,6 +720,7 @@ means:
 | `SliceRange` | `env[start presence,end presence]`; `child[recv,start if present,end if present]`; `post[start/end i64; recv Str→Str or fixed/dynamic primitive array/Slice(s)→Slice(s); result view inherits recv owner/region; range action last]`. |
 | `ElemField` | `env[path,struct_id]`: nonempty valid path in struct_id. `child[recv,index]`; `post[index i64; recv fixed/dynamic StructArray(struct_id) or Soa(struct_id) where producer admits this path; result exact leaf; result view/Copy fact inherits recv; bounds/path action last]`. |
 | `Template` | `env[parts.len]`; `child[parts in order]`; `post[nonempty; every part is checked against its exact access type; an exact `Text("{")`/`Text("}")` stack tracks nested optional-field objects, and each `PopComma` requires an optional field since the previous pop in the current object; result Str; hidden builder ownership is registered before holes and cleaned/transferred exactly]`. Part records have no span; only the enclosing expression span participates. |
+| `JsonEncodeBounded` | `env[base, parts.len]`; `child[parts in order, max_bytes]`; `post[base is one visible admitted source local; reconstructing its complete reachable schema exactly matches every static token, field ordinal, access root/path, name, descriptor identity, and fixed-array element in parts; nonempty; max_bytes exactly i64; result exactly Result<String,builtin Error>; every part access is borrowed; source accesses precede the limit; success owns the String payload and failure owns no partial builder output]`. |
 | `JsonDecode` | `env[struct_id]`: Decode-direction JSON descriptor. `child[input]`; `post[input Str; result ERR(Struct(struct_id)); input borrowed by any Str fields; successful struct ownership exact]`. |
 | `JsonDecodeArray` | `env[elem]`: JSON scalar-array element is Int/Float/Bool. `child[input]`; `post[input Str; result ERR(DynArray(payload(elem))); new owned array, no input view]`. |
 | `JsonDecodeScalar` | `env[scalar]`: scalar is Int/Float/Bool. `child[input]`; `post[input Str; result ERR(scalar); copied result]`. |
@@ -1032,7 +1033,7 @@ this authoritative boundary instead of relying on the older scalar/string valida
 The five reserved expression rows above are normative for the bounded-capture implementation but do
 not describe the current Rust enum until that capability lands. The capability activates all five
 together with `Ty::RunBytes` / `Scalar::RunBytes`; there is no mergeable producer-only intermediate.
-The current 239-variant inventory becomes 244, and `variant_sweep_tripwire` must fail at compile time
+The current 240-variant inventory becomes 245, and `variant_sweep_tripwire` must fail at compile time
 if any of those five variants is absent from validation or ownership analysis.
 
 | Cell | Exact closure | Owner evidence |
@@ -1047,14 +1048,14 @@ if any of those five variants is absent from validation or ownership analysis.
 
 The implementation must derive an exhaustiveness constant from the Rust enum
 definitions and assert that this file has exactly one owner id for every
-`Stmt`, all 239 `ExprKind` variants, `ArithMode`, `MathFn`, every
+`Stmt`, all 240 `ExprKind` variants, `ArithMode`, `MathFn`, every
 `BuilderWriteKind`, `StrPredKind`, `StrTrimKind`, `TemplatePart`, `StageKind`,
 `GroupSource`, `GroupAgg1`, `GroupOp`, `CliFlagKind`, `EncodingKind`, `CompressKind`,
 `PathComponentKind`, `AeadCipher`, `AeadDir`, and `HashAlgo`. The test fails on
 an added, removed, duplicated, or unowned discriminator.
 
-Request 11 changes the asserted `ExprKind` total from 239 to 244 in the same commit that activates
-its five reserved rows. Until then the current 239 count remains exact; documentation alone must not
+Request 11 changes the asserted `ExprKind` total from 240 to 245 in the same commit that activates
+its five reserved rows. Until then the current 240 count remains exact; documentation alone must not
 pretend the Rust inventory has already grown.
 
 ## Producer-delegation closure matrix

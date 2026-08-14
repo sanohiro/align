@@ -519,8 +519,8 @@ builtin `json.kind` sum type, leaf accessors `as_str` / `as_i64` / `as_f64` / `a
 level once, then index/`len`/recurse — reuses the slice machinery, no new array type); `json.scan`
 streams typed rows as a pipeline source. The
 core.json surface is exactly `decode`/`encode`/`encode_bounded`/`doc`/`scan` — `validate<T>`,
-`token`, and `field_table<T>` are deleted. `encode_bounded` is an accepted design pending
-implementation. See `draft.md` §9, §14, §18.1.
+`token`, and `field_table<T>` are deleted. `encode_bounded` is shipped with the same typed encode
+plan and an inclusive emitted-byte ceiling. See `draft.md` §9, §14, §18.1.
 
 `xs[i]` reads a bounds-checked element. A half-open range `xs[start..end]` slices instead: a
 borrowed sub-view of a `str` (→ `str`) or an array / slice (→ `slice<T>`) — same storage, no

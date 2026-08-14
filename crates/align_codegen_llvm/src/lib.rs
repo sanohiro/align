@@ -5206,6 +5206,50 @@ fn preflight_operand_ty(function: &Function, operand: &Operand) -> Option<Ty> {
     }
 }
 
+fn bounded_json_piece_is_type_safe(
+    program: &Program,
+    function: &Function,
+    piece: &align_mir::TemplatePiece,
+) -> bool {
+    let operand_ty = |operand| preflight_operand_ty(function, operand);
+    match piece {
+        align_mir::TemplatePiece::Static(_) | align_mir::TemplatePiece::PopComma => true,
+        align_mir::TemplatePiece::IntHole(operand) => {
+            matches!(operand_ty(operand), Some(Ty::Int(_)))
+        }
+        align_mir::TemplatePiece::StrHole(operand)
+        | align_mir::TemplatePiece::JsonStrHole(operand) => operand_ty(operand) == Some(Ty::Str),
+        align_mir::TemplatePiece::BoolHole(operand) => operand_ty(operand) == Some(Ty::Bool),
+        align_mir::TemplatePiece::CharHole(operand) => operand_ty(operand) == Some(Ty::Char),
+        align_mir::TemplatePiece::FloatHole(operand) => {
+            matches!(operand_ty(operand), Some(Ty::Float(_)))
+        }
+        align_mir::TemplatePiece::OptionField { opt, .. } => matches!(
+            operand_ty(opt),
+            Some(Ty::Option(payload))
+                if matches!(
+                    align_sema::scalar_to_ty(payload),
+                    Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Str
+                )
+        ),
+        align_mir::TemplatePiece::OptionStructField { opt, struct_id, .. } => {
+            program.structs.get(*struct_id as usize).is_some()
+                && operand_ty(opt) == Some(Ty::Option(Scalar::Struct(*struct_id)))
+        }
+        align_mir::TemplatePiece::StructArrayField { array, struct_id } => {
+            program.structs.get(*struct_id as usize).is_some()
+                && operand_ty(array) == Some(Ty::DynStructArray(*struct_id, align_sema::Layout::Aos))
+        }
+        align_mir::TemplatePiece::ScalarArrayField { array, elem } => {
+            operand_ty(array) == Some(Ty::DynArray(*elem))
+        }
+        align_mir::TemplatePiece::UnionValue { value, enum_id } => {
+            program.enums.get(*enum_id as usize).is_some()
+                && operand_ty(value) == Some(Ty::Enum(*enum_id))
+        }
+    }
+}
+
 fn operands_match_modes(
     args: &[Operand],
     modes: &[align_ast::ParamMode],
@@ -5446,6 +5490,31 @@ fn callable_preflight(
                     continue;
                 };
                 match rvalue {
+                    Rvalue::JsonEncodeBounded {
+                        pieces,
+                        max_bytes,
+                        out,
+                    } => {
+                        let i64_ty = Ty::Int(align_sema::IntTy {
+                            bits: 64,
+                            signed: true,
+                        });
+                        let status_ty = Ty::Int(align_sema::IntTy {
+                            bits: 32,
+                            signed: true,
+                        });
+                        if preflight_operand_ty(function, max_bytes) != Some(i64_ty)
+                            || function.slots.get(*out as usize) != Some(&Ty::String)
+                            || function.value_tys.get(*value as usize) != Some(&status_ty)
+                            || pieces
+                                .iter()
+                                .any(|piece| !bounded_json_piece_is_type_safe(program, function, piece))
+                        {
+                            return Err(CodegenError::Lowering(
+                                "bounded json.encode MIR metadata invalid".to_owned(),
+                            ));
+                        }
+                    }
                     Rvalue::Call(DirectCall::Runtime(key), args) => {
                         let argument_types = args
                             .iter()
@@ -8275,7 +8344,7 @@ fn stack_header_plan(f: &Function) -> StackHeaderPlan {
                     Rvalue::Load(slot) if is_builder_header_ty(f.slots[*slot as usize]) => {
                         load_defs.insert(*v, *slot);
                     }
-                    Rvalue::Template(..) => {
+                    Rvalue::Template(..) | Rvalue::JsonEncodeBounded { .. } => {
                         // The header exists only inside `gen_template`: no MIR operand can name it,
                         // and both arena/non-arena paths consume it before publishing the string.
                         template_values.insert(*v);
@@ -13645,7 +13714,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .basic()
                     .expect("builder_into_string returns a {ptr,len}")
             }
-            Rvalue::Template(pieces, arena) => self.gen_template(result_id, pieces, arena.as_ref())?,
+            Rvalue::Template(pieces, arena) => {
+                self.gen_template(result_id, pieces, arena.as_ref(), None)?
+            }
+            Rvalue::JsonEncodeBounded {
+                pieces,
+                max_bytes,
+                out,
+            } => self.gen_template(
+                result_id,
+                pieces,
+                None,
+                Some((max_bytes, *out)),
+            )?,
             Rvalue::JsonDecode { struct_id, input, out } => self.gen_json_decode(*struct_id, input, *out)?,
             Rvalue::JsonDecodeArray { elem, input, out } => self.gen_json_decode_array(*elem, input, *out)?,
             Rvalue::JsonDecodeScalar { scalar, input, out } => self.gen_json_decode_scalar(*scalar, input, *out)?,
@@ -17500,6 +17581,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         result_id: ValueId,
         pieces: &[align_mir::TemplatePiece],
         arena: Option<&Operand>,
+        bounded: Option<(&Operand, Slot)>,
     ) -> Result<BasicValueEnum<'c>, CodegenError> {
         // Pass the enclosing arena handle, or null for an individually owned finish retained by a
         // synthetic MIR string owner.
@@ -17511,11 +17593,25 @@ impl<'c, 'a> FnGen<'c, 'a> {
         // separate future opt; the user-facing `builder(capacity)` is the capacity surface.
         let zero = self.ctx.i64_type().const_zero();
         let header = self.stack_template_headers[&result_id];
+        let limit = bounded
+            .map(|(max_bytes, _)| self.operand(max_bytes))
+            .transpose()?;
+        let (init, init_args) = if let Some(limit) = limit {
+            (
+                RuntimeKey::BuilderInitBoundedStack,
+                vec![header.into(), limit.into()],
+            )
+        } else {
+            (
+                RuntimeKey::BuilderInitStack,
+                vec![header.into(), arena_ptr.into(), zero.into()],
+            )
+        };
         let bptr = self
             .builder
             .build_call(
-                self.runtime(RuntimeKey::BuilderInitStack),
-                &[header.into(), arena_ptr.into(), zero.into()],
+                self.runtime(init),
+                &init_args,
                 "b.stack",
             )
             .map_err(|e| self.err(e))?
@@ -17523,6 +17619,32 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .basic()
             .expect("builder_init_stack returns a pointer");
         let i64t = self.ctx.i64_type();
+        let bounded_finish = if let (Some(limit), Some((_, out))) = (limit, bounded) {
+            let limit = limit.into_int_value();
+            let func = self
+                .builder
+                .get_insert_block()
+                .and_then(|block| block.get_parent())
+                .ok_or_else(|| self.err("no enclosing function for bounded json.encode"))?;
+            let write = self.ctx.append_basic_block(func, "json.bounded.write");
+            let finish = self.ctx.append_basic_block(func, "json.bounded.finish");
+            let nonnegative = self
+                .builder
+                .build_int_compare(
+                    IntPredicate::SGE,
+                    limit,
+                    i64t.const_zero(),
+                    "json.limit.nonnegative",
+                )
+                .map_err(|e| self.err(e))?;
+            self.builder
+                .build_conditional_branch(nonnegative, write, finish)
+                .map_err(|e| self.err(e))?;
+            self.builder.position_at_end(write);
+            Some((finish, out))
+        } else {
+            None
+        };
         for piece in pieces {
             match piece {
                 align_mir::TemplatePiece::Static(s) => {
@@ -17790,6 +17912,31 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .map_err(|e| self.err(e))?;
                 }
             }
+        }
+        if let Some((finish, out)) = bounded_finish {
+            let current = self
+                .builder
+                .get_insert_block()
+                .ok_or_else(|| self.err("bounded json.encode lost its write block"))?;
+            if current.get_terminator().is_none() {
+                self.builder
+                    .build_unconditional_branch(finish)
+                    .map_err(|e| self.err(e))?;
+            }
+            self.builder.position_at_end(finish);
+            let out_ptr = self.slots[&out];
+            let status = self
+                .builder
+                .build_call(
+                    self.runtime(RuntimeKey::BuilderFinishBoundedStack),
+                    &[bptr.into(), out_ptr.into()],
+                    "json.bounded.status",
+                )
+                .map_err(|e| self.err(e))?
+                .try_as_basic_value()
+                .basic()
+                .ok_or_else(|| self.err("bounded builder finish returned no status value"))?;
+            return Ok(status);
         }
         let finish = if arena.is_some() {
             RuntimeKey::BuilderFinishStack
@@ -22396,6 +22543,31 @@ mod tests {
         )
         .expect_err("a payload-less union variant has no descriptor arm");
         assert!(err.to_string().contains("carries no payload"), "got: {err}");
+    }
+
+    #[test]
+    fn a_malformed_bounded_json_limit_is_an_error_not_a_panic() {
+        let status = Ty::Int(IntTy {
+            bits: 32,
+            signed: true,
+        });
+        let err = codegen_program(
+            vec![Stmt::Let(
+                0,
+                Rvalue::JsonEncodeBounded {
+                    pieces: vec![align_mir::TemplatePiece::Static("{}".to_string())],
+                    max_bytes: Operand::Const(Const::Bool(true)),
+                    out: 0,
+                },
+            )],
+            vec![status],
+            vec![Ty::String],
+            vec![],
+            vec![],
+            vec![],
+        )
+        .expect_err("a non-i64 bounded JSON limit must fail before LLVM construction");
+        assert_lowering(err, "bounded json.encode MIR metadata invalid");
     }
 
     fn allocation_case_ir(

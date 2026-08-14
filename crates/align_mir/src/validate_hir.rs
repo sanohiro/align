@@ -2548,6 +2548,7 @@ impl<'a> LocalScopeValidator<'a> {
             | hir::ExprKind::Field { root: local, .. }
             | hir::ExprKind::SoaColumn { base: local, .. }
             | hir::ExprKind::IndexField { base: local, .. }
+            | hir::ExprKind::JsonEncodeBounded { base: local, .. }
             | hir::ExprKind::ArrayGroupAgg { base: local, .. }
             | hir::ExprKind::ArrayGroupAggMulti { base: local, .. }
             | hir::ExprKind::ArrayDictEncode { base: local, .. } => Some(*local),
@@ -3717,6 +3718,9 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::Template(parts) => {
                 !parts.is_empty() && self.template_parts_envelope_ok(parts)
             }
+            hir::ExprKind::JsonEncodeBounded { parts, .. } => {
+                !parts.is_empty() && self.json_encode_parts_envelope_ok(parts)
+            }
             hir::ExprKind::JsonDecode { struct_id, .. }
             | hir::ExprKind::JsonDecodeStructArray { struct_id, .. }
             | hir::ExprKind::JsonScan { struct_id, .. } => {
@@ -4698,6 +4702,291 @@ impl<'a> BodyValidator<'a> {
         })
     }
 
+    fn json_encode_parts_envelope_ok(&self, parts: &[hir::TemplatePart]) -> bool {
+        Self::json_encode_parts_syntax_ok(parts) && self.template_parts_envelope_ok(parts)
+    }
+
+    /// Validate the compiler-owned canonical JSON plan independently of expression facts.
+    ///
+    /// Ordinary templates deliberately admit arbitrary text and printable `str` holes. A bounded
+    /// encode has a dedicated HIR discriminator, so accepting that generic grammar here would let
+    /// malformed checked HIR select raw text/string formatting while claiming canonical JSON.
+    /// Keep this parser iterative: a generated plan is flat even when its record schema is deeply
+    /// nested, and validation must not turn that nesting back into native call-stack recursion.
+    fn json_encode_parts_syntax_ok(parts: &[hir::TemplatePart]) -> bool {
+        #[derive(Clone, Copy)]
+        enum Frame {
+            Array {
+                state: ArrayState,
+                elements: usize,
+            },
+            Object {
+                has_option: bool,
+                state: ObjectState,
+                fields: usize,
+                saw_option: bool,
+            },
+        }
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum ArrayState {
+            ElementOrClose,
+            CommaOrClose,
+        }
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum ObjectState {
+            FieldOrClose,
+            Value,
+            TrailingComma,
+            Close,
+        }
+
+        fn static_text(part: &hir::TemplatePart) -> Option<&str> {
+            match part {
+                hir::TemplatePart::Text(text) => Some(text.as_str()),
+                _ => None,
+            }
+        }
+
+        fn field_prefix(text: &str, leading_comma: bool) -> bool {
+            let Some(text) = (if leading_comma {
+                text.strip_prefix(',')
+            } else if text.starts_with(',') {
+                None
+            } else {
+                Some(text)
+            }) else {
+                return false;
+            };
+            text.strip_prefix('"')
+                .and_then(|text| text.strip_suffix("\":"))
+                .is_some_and(valid_declaration_name)
+        }
+
+        fn value_part(part: &hir::TemplatePart) -> bool {
+            matches!(
+                part,
+                hir::TemplatePart::Hole(_)
+                    | hir::TemplatePart::JsonStr(_)
+                    | hir::TemplatePart::StructArrayField { .. }
+                    | hir::TemplatePart::ScalarArrayField { .. }
+                    | hir::TemplatePart::UnionValue { .. }
+            )
+        }
+
+        if parts.len() == 1 {
+            return matches!(&parts[0], hir::TemplatePart::UnionValue { .. });
+        }
+
+        // Record whether each object has an Option field at its own level. The producer switches
+        // the complete object to comma-repair spelling when any such field exists.
+        let mut object_options = vec![None; parts.len()];
+        let mut objects = Vec::new();
+        for (index, part) in parts.iter().enumerate() {
+            match part {
+                hir::TemplatePart::Text(text) if text == "{" => {
+                    objects.push((index, false));
+                }
+                hir::TemplatePart::OptionField { .. }
+                | hir::TemplatePart::OptionStructField { .. } => {
+                    let Some((_, has_option)) = objects.last_mut() else {
+                        return false;
+                    };
+                    *has_option = true;
+                }
+                hir::TemplatePart::Text(text) if text == "}" => {
+                    let Some((open, has_option)) = objects.pop() else {
+                        return false;
+                    };
+                    object_options[open] = Some(has_option);
+                }
+                _ => {}
+            }
+        }
+        if !objects.is_empty() {
+            return false;
+        }
+
+        let mut frames = Vec::new();
+        match static_text(&parts[0]) {
+            Some("[") => frames.push(Frame::Array {
+                state: ArrayState::ElementOrClose,
+                elements: 0,
+            }),
+            Some("{") => {
+                let Some(has_option) = object_options[0] else {
+                    return false;
+                };
+                frames.push(Frame::Object {
+                    has_option,
+                    state: ObjectState::FieldOrClose,
+                    fields: 0,
+                    saw_option: false,
+                });
+            }
+            _ => return false,
+        }
+
+        let mut index = 1;
+        while let Some(frame) = frames.pop() {
+            let Some(part) = parts.get(index) else {
+                return false;
+            };
+            match frame {
+                Frame::Array {
+                    state: ArrayState::ElementOrClose,
+                    elements,
+                } => match static_text(part) {
+                    Some("]") if elements == 0 => {
+                        index += 1;
+                    }
+                    Some("{") => {
+                        let Some(has_option) = object_options[index] else {
+                            return false;
+                        };
+                        frames.push(Frame::Array {
+                            state: ArrayState::CommaOrClose,
+                            elements: elements + 1,
+                        });
+                        frames.push(Frame::Object {
+                            has_option,
+                            state: ObjectState::FieldOrClose,
+                            fields: 0,
+                            saw_option: false,
+                        });
+                        index += 1;
+                    }
+                    _ => return false,
+                },
+                Frame::Array {
+                    state: ArrayState::CommaOrClose,
+                    elements,
+                } => match static_text(part) {
+                    Some(",") => {
+                        frames.push(Frame::Array {
+                            state: ArrayState::ElementOrClose,
+                            elements,
+                        });
+                        index += 1;
+                    }
+                    Some("]") => {
+                        index += 1;
+                    }
+                    _ => return false,
+                },
+                Frame::Object {
+                    has_option,
+                    state: ObjectState::FieldOrClose,
+                    fields,
+                    saw_option,
+                } => {
+                    if matches!(static_text(part), Some("}")) {
+                        if has_option {
+                            return false;
+                        }
+                        index += 1;
+                    } else if has_option
+                        && matches!(part, hir::TemplatePart::OptionField { .. } | hir::TemplatePart::OptionStructField { .. })
+                    {
+                        frames.push(Frame::Object {
+                            has_option,
+                            state: ObjectState::FieldOrClose,
+                            fields: fields + 1,
+                            saw_option: true,
+                        });
+                        index += 1;
+                    } else if has_option && matches!(part, hir::TemplatePart::PopComma) {
+                        if !saw_option {
+                            return false;
+                        }
+                        frames.push(Frame::Object {
+                            has_option,
+                            state: ObjectState::Close,
+                            fields,
+                            saw_option,
+                        });
+                        index += 1;
+                    } else if static_text(part)
+                        .is_some_and(|text| field_prefix(text, !has_option && fields > 0))
+                    {
+                        frames.push(Frame::Object {
+                            has_option,
+                            state: ObjectState::Value,
+                            fields: fields + 1,
+                            saw_option,
+                        });
+                        index += 1;
+                    } else {
+                        return false;
+                    }
+                }
+                Frame::Object {
+                    has_option,
+                    state: ObjectState::Value,
+                    fields,
+                    saw_option,
+                } => {
+                    let next = if has_option {
+                        ObjectState::TrailingComma
+                    } else {
+                        ObjectState::FieldOrClose
+                    };
+                    frames.push(Frame::Object {
+                        has_option,
+                        state: next,
+                        fields,
+                        saw_option,
+                    });
+                    if matches!(static_text(part), Some("{")) {
+                        let Some(child_has_option) = object_options[index] else {
+                            return false;
+                        };
+                        frames.push(Frame::Object {
+                            has_option: child_has_option,
+                            state: ObjectState::FieldOrClose,
+                            fields: 0,
+                            saw_option: false,
+                        });
+                    } else if !value_part(part) {
+                        return false;
+                    }
+                    index += 1;
+                }
+                Frame::Object {
+                    has_option,
+                    state: ObjectState::TrailingComma,
+                    fields,
+                    saw_option,
+                } => {
+                    if !matches!(static_text(part), Some(",")) {
+                        return false;
+                    }
+                    frames.push(Frame::Object {
+                        has_option,
+                        state: ObjectState::FieldOrClose,
+                        fields,
+                        saw_option,
+                    });
+                    index += 1;
+                }
+                Frame::Object {
+                    has_option,
+                    state: ObjectState::Close,
+                    fields,
+                    saw_option,
+                } => {
+                    if !matches!(static_text(part), Some("}")) {
+                        return false;
+                    }
+                    let _ = (has_option, fields, saw_option);
+                    index += 1;
+                }
+            }
+        }
+        index == parts.len()
+    }
+
     fn json_scalar_target_ok(&self, ty: Ty) -> bool {
         match ty {
             Ty::Int(integer) => valid_int(integer.bits),
@@ -5434,6 +5723,29 @@ impl<'a> BodyValidator<'a> {
                 push_expr!(recv, context.clone());
             }
             hir::ExprKind::Template(parts) => {
+                for part in parts.iter().rev() {
+                    match part {
+                        hir::TemplatePart::Hole(expr)
+                        | hir::TemplatePart::JsonStr(expr) => {
+                            push_expr!(expr, context.clone());
+                        }
+                        hir::TemplatePart::OptionField { access, .. }
+                        | hir::TemplatePart::OptionStructField { access, .. }
+                        | hir::TemplatePart::StructArrayField { access, .. }
+                        | hir::TemplatePart::ScalarArrayField { access, .. }
+                        | hir::TemplatePart::UnionValue { access, .. } => {
+                            push_expr!(access, context.clone());
+                        }
+                        hir::TemplatePart::Text(_) | hir::TemplatePart::PopComma => {}
+                    }
+                }
+            }
+            hir::ExprKind::JsonEncodeBounded {
+                parts, max_bytes, ..
+            } => {
+                // The source accesses encoded by `parts` are evaluated before the explicit limit.
+                // Push in reverse because this worklist is LIFO.
+                push_expr!(max_bytes, context.clone());
                 for part in parts.iter().rev() {
                     match part {
                         hir::TemplatePart::Hole(expr)
@@ -8736,6 +9048,30 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::Template(parts) => {
                 self.derive_template_expression(parts, context)
             }
+            hir::ExprKind::JsonEncodeBounded {
+                base,
+                parts,
+                max_bytes,
+            } => {
+                let (template_ty, template_falls, template_breaks) =
+                    self.derive_json_encode_expression(*base, parts, context)?;
+                let limit = self.expr_flow(max_bytes)?;
+                if template_ty != Ty::Str || limit.ty != i64_ty() {
+                    return None;
+                }
+                let template = BodyFlow {
+                    ty: template_ty,
+                    falls: template_falls,
+                    breaks: template_breaks,
+                };
+                let error = self.error_id()?;
+                let (falls, breaks) = strict_flow(&[template, limit]);
+                Some((
+                    Ty::Result(Scalar::String, Scalar::Enum(error)),
+                    falls,
+                    breaks,
+                ))
+            }
             hir::ExprKind::JsonDecode { struct_id, input } => {
                 self.derive_json_decode_struct(*struct_id, input, context, false)
             }
@@ -9022,6 +9358,395 @@ impl<'a> BodyValidator<'a> {
         }
         if !object_has_option.is_empty() {
             return None;
+        }
+        let (falls, breaks) = strict_flow(&flows);
+        Some((Ty::Str, falls, breaks))
+    }
+
+    /// Reconstruct the producer's canonical plan from the recorded source local and compare every
+    /// static token, field ordinal, access path, name, and descriptor identity. Type-compatible
+    /// substitutions are not sufficient: they could pair one JSON key with another field's value.
+    fn json_encode_parts_match_source(
+        &self,
+        base: hir::LocalId,
+        parts: &[hir::TemplatePart],
+        context: &BodyContext,
+    ) -> bool {
+        #[derive(Clone)]
+        enum Expected {
+            Text(String),
+            Hole { elem: Option<u32>, path: Vec<u32>, ty: Ty },
+            JsonStr { elem: Option<u32>, path: Vec<u32> },
+            OptionField { elem: Option<u32>, path: Vec<u32>, name: String, ty: Ty },
+            OptionStructField {
+                elem: Option<u32>,
+                path: Vec<u32>,
+                name: String,
+                struct_id: u32,
+            },
+            PopComma,
+            StructArrayField { elem: Option<u32>, path: Vec<u32>, ty: Ty, struct_id: u32 },
+            ScalarArrayField { elem: Option<u32>, path: Vec<u32>, scalar: Scalar },
+            UnionField { elem: Option<u32>, path: Vec<u32>, enum_id: u32 },
+            RootUnion(u32),
+        }
+
+        enum Work {
+            Emit(Expected),
+            Object { id: u32, elem: Option<u32>, path: Vec<u32> },
+            Fields { id: u32, elem: Option<u32>, path: Vec<u32>, next: usize, has_option: bool },
+            Array { id: u32, len: u32, next: u32 },
+        }
+
+        fn access_matches(
+            validator: &BodyValidator<'_>,
+            expression: &hir::Expr,
+            base: hir::LocalId,
+            elem: Option<u32>,
+            path: &[u32],
+            ty: Ty,
+        ) -> bool {
+            validator.body_ty_matches(expression.ty, ty)
+                && match (&expression.kind, elem) {
+                    (hir::ExprKind::Field { root, path: actual }, None) => {
+                        *root == base && actual == path
+                    }
+                    (
+                        hir::ExprKind::IndexField {
+                            base: actual_base,
+                            index,
+                            path: actual,
+                        },
+                        Some(expected_index),
+                    ) => *actual_base == base && *index == expected_index && actual == path,
+                    _ => false,
+                }
+        }
+
+        fn expected_matches(
+            validator: &BodyValidator<'_>,
+            expected: Expected,
+            actual: &hir::TemplatePart,
+            base: hir::LocalId,
+        ) -> bool {
+            match (expected, actual) {
+                (Expected::Text(expected), hir::TemplatePart::Text(actual)) => expected == *actual,
+                (Expected::Hole { elem, path, ty }, hir::TemplatePart::Hole(expression)) => {
+                    access_matches(validator, expression, base, elem, &path, ty)
+                }
+                (Expected::JsonStr { elem, path }, hir::TemplatePart::JsonStr(expression)) => {
+                    access_matches(validator, expression, base, elem, &path, Ty::Str)
+                }
+                (
+                    Expected::OptionField { elem, path, name, ty },
+                    hir::TemplatePart::OptionField { access, name: actual_name },
+                ) => {
+                    name == *actual_name
+                        && access_matches(validator, access, base, elem, &path, ty)
+                }
+                (
+                    Expected::OptionStructField { elem, path, name, struct_id },
+                    hir::TemplatePart::OptionStructField {
+                        access,
+                        name: actual_name,
+                        struct_id: actual_id,
+                    },
+                ) => {
+                    name == *actual_name
+                        && struct_id == *actual_id
+                        && access_matches(
+                            validator,
+                            access,
+                            base,
+                            elem,
+                            &path,
+                            Ty::Option(Scalar::Struct(struct_id)),
+                        )
+                }
+                (Expected::PopComma, hir::TemplatePart::PopComma) => true,
+                (
+                    Expected::StructArrayField { elem, path, ty, struct_id },
+                    hir::TemplatePart::StructArrayField { access, struct_id: actual_id },
+                ) => {
+                    struct_id == *actual_id
+                        && access_matches(validator, access, base, elem, &path, ty)
+                }
+                (
+                    Expected::ScalarArrayField { elem, path, scalar },
+                    hir::TemplatePart::ScalarArrayField { access, elem: actual },
+                ) => {
+                    validator.body_scalar_matches(scalar, *actual)
+                        && access_matches(
+                            validator,
+                            access,
+                            base,
+                            elem,
+                            &path,
+                            Ty::DynArray(scalar),
+                        )
+                }
+                (
+                    Expected::UnionField { elem, path, enum_id },
+                    hir::TemplatePart::UnionValue { access, enum_id: actual },
+                ) => {
+                    enum_id == *actual
+                        && access_matches(
+                            validator,
+                            access,
+                            base,
+                            elem,
+                            &path,
+                            Ty::Enum(enum_id),
+                        )
+                }
+                (
+                    Expected::RootUnion(enum_id),
+                    hir::TemplatePart::UnionValue { access, enum_id: actual },
+                ) => {
+                    enum_id == *actual
+                        && access.ty == Ty::Enum(enum_id)
+                        && matches!(access.kind, hir::ExprKind::Local(local) if local == base)
+                }
+                _ => false,
+            }
+        }
+
+        let Some(root) = self.local_type(context, base) else {
+            return false;
+        };
+        let mut work = match root {
+            Ty::Struct(id) => vec![Work::Object { id, elem: None, path: Vec::new() }],
+            Ty::StructArray(id, len) => vec![Work::Array { id, len, next: 0 }],
+            Ty::Enum(id) => vec![Work::Emit(Expected::RootUnion(id))],
+            _ => return false,
+        };
+        let mut part = 0usize;
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Emit(expected) => {
+                    let Some(actual) = parts.get(part) else {
+                        return false;
+                    };
+                    if !expected_matches(self, expected, actual, base) {
+                        return false;
+                    }
+                    part += 1;
+                }
+                Work::Array {
+                    id: _,
+                    len: 0,
+                    next: 0,
+                } => {
+                    work.push(Work::Emit(Expected::Text("]".to_owned())));
+                    work.push(Work::Emit(Expected::Text("[".to_owned())));
+                }
+                Work::Array { id, len, next: 0 } => {
+                    work.push(Work::Array { id, len, next: 1 });
+                    work.push(Work::Object { id, elem: Some(0), path: Vec::new() });
+                    work.push(Work::Emit(Expected::Text("[".to_owned())));
+                }
+                Work::Array { id, len, next } if next < len => {
+                    work.push(Work::Array { id, len, next: next + 1 });
+                    work.push(Work::Object { id, elem: Some(next), path: Vec::new() });
+                    work.push(Work::Emit(Expected::Text(",".to_owned())));
+                }
+                Work::Array { .. } => work.push(Work::Emit(Expected::Text("]".to_owned()))),
+                Work::Object { id, elem, path } => {
+                    let Some(definition) = self.program.structs.get(id as usize) else {
+                        return false;
+                    };
+                    let has_option = definition
+                        .fields
+                        .iter()
+                        .any(|field| matches!(field.ty, Ty::Option(_)));
+                    work.push(Work::Fields { id, elem, path, next: 0, has_option });
+                    work.push(Work::Emit(Expected::Text("{".to_owned())));
+                }
+                Work::Fields { id, elem, path, next, has_option } => {
+                    let Some(definition) = self.program.structs.get(id as usize) else {
+                        return false;
+                    };
+                    if next == definition.fields.len() {
+                        work.push(Work::Emit(Expected::Text("}".to_owned())));
+                        if has_option {
+                            work.push(Work::Emit(Expected::PopComma));
+                        }
+                        continue;
+                    }
+                    let field = definition.fields[next].clone();
+                    let mut field_path = path.clone();
+                    let Ok(field_index) = u32::try_from(next) else {
+                        return false;
+                    };
+                    field_path.push(field_index);
+                    work.push(Work::Fields {
+                        id,
+                        elem,
+                        path: path.clone(),
+                        next: next + 1,
+                        has_option,
+                    });
+                    if let Ty::Option(payload) = field.ty {
+                        let expected = match payload {
+                            Scalar::Struct(struct_id) => Expected::OptionStructField {
+                                elem,
+                                path: field_path,
+                                name: field.name,
+                                struct_id,
+                            },
+                            _ if self.json_array_element_ok(payload) => Expected::OptionField {
+                                elem,
+                                path: field_path,
+                                name: field.name,
+                                ty: field.ty,
+                            },
+                            _ => return false,
+                        };
+                        work.push(Work::Emit(expected));
+                        continue;
+                    }
+                    if has_option {
+                        work.push(Work::Emit(Expected::Text(",".to_owned())));
+                    }
+                    match field.ty {
+                        Ty::Struct(child) => work.push(Work::Object {
+                            id: child,
+                            elem,
+                            path: field_path.clone(),
+                        }),
+                        Ty::DynStructArray(struct_id, _) => {
+                            work.push(Work::Emit(Expected::StructArrayField {
+                                elem,
+                                path: field_path.clone(),
+                                ty: field.ty,
+                                struct_id,
+                            }));
+                        }
+                        Ty::DynArray(scalar) if self.json_array_element_ok(scalar) => {
+                            work.push(Work::Emit(Expected::ScalarArrayField {
+                                elem,
+                                path: field_path.clone(),
+                                scalar,
+                            }));
+                        }
+                        Ty::Enum(enum_id) => work.push(Work::Emit(Expected::UnionField {
+                            elem,
+                            path: field_path.clone(),
+                            enum_id,
+                        })),
+                        Ty::Str => work.push(Work::Emit(Expected::JsonStr {
+                            elem,
+                            path: field_path.clone(),
+                        })),
+                        ty if matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool) => {
+                            work.push(Work::Emit(Expected::Hole {
+                                elem,
+                                path: field_path.clone(),
+                                ty,
+                            }));
+                        }
+                        _ => return false,
+                    }
+                    let separator = if has_option || next == 0 { "" } else { "," };
+                    work.push(Work::Emit(Expected::Text(format!(
+                        "{separator}\"{}\":",
+                        field.name
+                    ))));
+                }
+            }
+        }
+        part == parts.len()
+    }
+
+    fn derive_json_encode_expression(
+        &self,
+        base: hir::LocalId,
+        parts: &[hir::TemplatePart],
+        context: &BodyContext,
+    ) -> Option<(Ty, bool, Vec<Ty>)> {
+        if !Self::json_encode_parts_syntax_ok(parts)
+            || !self.json_encode_parts_match_source(base, parts, context)
+        {
+            return None;
+        }
+        let mut flows = Vec::new();
+        for part in parts {
+            let flow = match part {
+                hir::TemplatePart::Text(_) | hir::TemplatePart::PopComma => continue,
+                hir::TemplatePart::Hole(expression) => {
+                    let flow = self.expr_flow(expression)?;
+                    if !matches!(
+                        flow.ty,
+                        Ty::Int(integer) if valid_int(integer.bits)
+                    ) && !matches!(
+                        flow.ty,
+                        Ty::Float(float) if valid_float(float.bits)
+                    ) && flow.ty != Ty::Bool
+                    {
+                        return None;
+                    }
+                    flow
+                }
+                hir::TemplatePart::JsonStr(expression) => {
+                    let flow = self.expr_flow(expression)?;
+                    if flow.ty != Ty::Str {
+                        return None;
+                    }
+                    flow
+                }
+                hir::TemplatePart::OptionField { access, name } => {
+                    let flow = self.expr_flow(access)?;
+                    if !valid_declaration_name(name)
+                        || !matches!(
+                            flow.ty,
+                            Ty::Option(payload) if self.json_array_element_ok(payload)
+                        )
+                    {
+                        return None;
+                    }
+                    flow
+                }
+                hir::TemplatePart::OptionStructField {
+                    access,
+                    name,
+                    struct_id,
+                } => {
+                    let flow = self.expr_flow(access)?;
+                    if !valid_declaration_name(name)
+                        || flow.ty != Ty::Option(Scalar::Struct(*struct_id))
+                        || !self.json_struct_descriptor_ok(*struct_id, true)
+                    {
+                        return None;
+                    }
+                    flow
+                }
+                hir::TemplatePart::StructArrayField { access, struct_id } => {
+                    let flow = self.expr_flow(access)?;
+                    if flow.ty != Ty::DynStructArray(*struct_id, align_sema::Layout::Aos)
+                        || !self.json_struct_descriptor_ok(*struct_id, true)
+                    {
+                        return None;
+                    }
+                    flow
+                }
+                hir::TemplatePart::ScalarArrayField { access, elem } => {
+                    let flow = self.expr_flow(access)?;
+                    if flow.ty != Ty::DynArray(*elem) || !self.json_array_element_ok(*elem) {
+                        return None;
+                    }
+                    flow
+                }
+                hir::TemplatePart::UnionValue { access, enum_id } => {
+                    let flow = self.expr_flow(access)?;
+                    if flow.ty != Ty::Enum(*enum_id)
+                        || !self.json_union_descriptor_ok(*enum_id, true)
+                    {
+                        return None;
+                    }
+                    flow
+                }
+            };
+            flows.push(flow);
         }
         let (falls, breaks) = strict_flow(&flows);
         Some((Ty::Str, falls, breaks))

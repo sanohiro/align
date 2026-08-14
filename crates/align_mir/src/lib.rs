@@ -923,6 +923,13 @@ pub enum Rvalue {
     /// `template "..."` — build a `str` from pieces. The optional operand is the enclosing arena
     /// handle; absent means individually owned storage held by a synthetic `string` owner.
     Template(Vec<TemplatePiece>, Option<Operand>),
+    /// `json.encode_bounded` — emit the shared canonical template pieces into a bounded stack
+    /// builder, consume it into the owned `string` `out` slot, and yield an i32 status.
+    JsonEncodeBounded {
+        pieces: Vec<TemplatePiece>,
+        max_bytes: Operand,
+        out: Slot,
+    },
     /// `json.decode` into struct `struct_id`: parse the `str` `input` and fill the `out`
     /// struct slot. Yields an `i32` status (0 = ok). codegen builds the field table (names,
     /// type tags, byte offsets) and calls the runtime parser.
@@ -4689,6 +4696,86 @@ fn template_part_expr(part: &hir::TemplatePart) -> Option<&hir::Expr> {
     }
 }
 
+fn lower_template_parts(b: &mut Builder, parts: &[hir::TemplatePart]) -> Option<Vec<TemplatePiece>> {
+    let mut pieces = Vec::with_capacity(parts.len());
+    for part in parts {
+        match part {
+            hir::TemplatePart::Text(text) => pieces.push(TemplatePiece::Static(text.clone())),
+            hir::TemplatePart::PopComma => pieces.push(TemplatePiece::PopComma),
+            _ => {
+                let child = template_part_expr(part)?;
+                let operand = lower_expr(b, child);
+                if !lowering_continues(b) {
+                    return None;
+                }
+                pieces.push(template_piece(part, operand));
+            }
+        }
+    }
+    Some(pieces)
+}
+
+#[inline(never)]
+fn lower_json_encode_bounded(
+    b: &mut Builder,
+    parts: &[hir::TemplatePart],
+    max_bytes: &hir::Expr,
+    result_ty: Ty,
+) -> Operand {
+    let Some(pieces) = lower_template_parts(b, parts) else {
+        return terminated_operand();
+    };
+    let limit = lower_expr(b, max_bytes);
+    if !lowering_continues(b) {
+        return terminated_operand();
+    }
+    let out = b.new_slot(Ty::String);
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(
+        code,
+        Rvalue::JsonEncodeBounded {
+            pieces,
+            max_bytes: limit,
+            out,
+        },
+    ));
+
+    let isok = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
+    let ok_bb = b.new_block();
+    let err_bb = b.new_block();
+    let join = b.new_block();
+    let rslot = b.new_slot(result_ty);
+    b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
+
+    b.cur = ok_bb;
+    let string = b.fresh_value(Ty::String);
+    b.push(Stmt::Let(string, Rvalue::Load(out)));
+    let ok = b.fresh_value(result_ty);
+    b.push(Stmt::Let(ok, Rvalue::ResultOk(Operand::Value(string))));
+    b.push(Stmt::Store(rslot, Operand::Value(ok)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = err_bb;
+    let error = make_error_from_status(b, code, result_ty);
+    let err = b.fresh_value(result_ty);
+    b.push(Stmt::Let(err, Rvalue::ResultErr(error)));
+    b.push(Stmt::Store(rslot, Operand::Value(err)));
+    b.terminate(Term::Goto(join));
+
+    b.cur = join;
+    let result = b.fresh_value(result_ty);
+    b.push(Stmt::Let(result, Rvalue::Load(rslot)));
+    Operand::Value(result)
+}
+
 /// Lower nested templates with explicit frames while preserving part evaluation and owner order.
 #[inline(never)]
 fn lower_template_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
@@ -4970,6 +5057,7 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
         | hir::ExprKind::NamedArena { .. }
         | hir::ExprKind::TaskGroup(_)
         | hir::ExprKind::Template(_)
+        | hir::ExprKind::JsonEncodeBounded { .. }
         | hir::ExprKind::FileCreateRw { .. }
         | hir::ExprKind::FileOpenRw { .. }
         | hir::ExprKind::FilePread { .. }
@@ -5116,6 +5204,11 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::NamedArena { local, block } => lower_named_arena_block(b, *local, block),
         hir::ExprKind::TaskGroup(block) => lower_task_group_block(b, block),
         hir::ExprKind::Template(_) => lower_template_spine(b, e),
+        hir::ExprKind::JsonEncodeBounded {
+            parts, max_bytes, ..
+        } => {
+            lower_json_encode_bounded(b, parts, max_bytes, e.ty)
+        }
         hir::ExprKind::FileCreateRw { .. }
         | hir::ExprKind::FileOpenRw { .. }
         | hir::ExprKind::FilePread { .. }
@@ -5377,6 +5470,11 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 len: _,
             } => finish_const_array(b, elems, *elem, e.ty),
             hir::ExprKind::Template(_) => lower_template_spine(b, e),
+            hir::ExprKind::JsonEncodeBounded {
+                parts, max_bytes, ..
+            } => {
+                lower_json_encode_bounded(b, parts, max_bytes, e.ty)
+            }
             hir::ExprKind::JsonDecode { struct_id, input } => {
                 lower_json_decode(b, *struct_id, input, e.ty)
             }

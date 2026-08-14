@@ -2484,11 +2484,23 @@ struct BuilderBuf {
     ptr: *mut u8,
     len: usize,
     cap: usize,
+    /// Inclusive emitted-byte ceiling for bounded JSON encoding. `None` preserves the ordinary
+    /// builder's unbounded growth policy.
+    limit: Option<usize>,
+    /// Sticky failure: once a write would cross `limit`, later writes remain allocation-free and
+    /// the bounded finish rejects the whole partial value.
+    limit_exceeded: bool,
 }
 
 impl BuilderBuf {
     fn new(capacity: i64) -> BuilderBuf {
-        let mut out = BuilderBuf { ptr: core::ptr::null_mut(), len: 0, cap: 0 };
+        let mut out = BuilderBuf {
+            ptr: core::ptr::null_mut(),
+            len: 0,
+            cap: 0,
+            limit: None,
+            limit_exceeded: false,
+        };
         // Preserve the old best-effort capacity hint: an impossible/failed eager reservation is
         // ignored, while an actual later write still follows the runtime's fail-fast OOM policy.
         if let Ok(cap) = safe_len(capacity)
@@ -2501,6 +2513,25 @@ impl BuilderBuf {
             }
         }
         out
+    }
+
+    fn new_bounded(max_bytes: i64) -> BuilderBuf {
+        match safe_len(max_bytes) {
+            Ok(limit) => BuilderBuf {
+                ptr: core::ptr::null_mut(),
+                len: 0,
+                cap: 0,
+                limit: Some(limit),
+                limit_exceeded: false,
+            },
+            Err(()) => BuilderBuf {
+                ptr: core::ptr::null_mut(),
+                len: 0,
+                cap: 0,
+                limit: Some(0),
+                limit_exceeded: true,
+            },
+        }
     }
 
     fn len(&self) -> usize {
@@ -2519,28 +2550,43 @@ impl BuilderBuf {
         }
     }
 
-    fn reserve(&mut self, additional: usize) {
+    fn failed_limit(&self) -> bool {
+        self.limit_exceeded
+    }
+
+    fn reserve(&mut self, additional: usize) -> bool {
+        if self.limit_exceeded {
+            return false;
+        }
         let Some(required) = self.len.checked_add(additional) else {
             panic_abort("builder allocation too large");
         };
+        if self.limit.is_some_and(|limit| required > limit) {
+            self.limit_exceeded = true;
+            return false;
+        }
         if required <= self.cap {
-            return;
+            return true;
         }
         let max = isize::MAX as usize;
         if required > max {
             panic_abort("builder allocation too large");
         }
         let doubled = self.cap.saturating_mul(2).min(max);
-        let new_cap = required.max(doubled).max(8);
+        let desired = required.max(doubled).max(8);
+        let new_cap = self.limit.map_or(desired, |limit| desired.min(limit));
         self.ptr = unsafe { align_rt_realloc(self.ptr, new_cap as i64) };
         self.cap = new_cap;
+        true
     }
 
     fn extend_from_slice(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
-        self.reserve(bytes.len());
+        if !self.reserve(bytes.len()) {
+            return;
+        }
         unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(self.len), bytes.len()) };
         self.len += bytes.len();
     }
@@ -2600,6 +2646,10 @@ fn builder_value(arena: *mut Arena, capacity: i64) -> Builder {
     Builder { buf: BuilderBuf::new(capacity), arena }
 }
 
+fn bounded_builder_value(max_bytes: i64) -> Builder {
+    Builder { buf: BuilderBuf::new_bounded(max_bytes), arena: core::ptr::null_mut() }
+}
+
 /// Open a builder. If `arena` is non-null, the finished string is allocated in that arena (freed in
 /// bulk at the block's end); otherwise the caller must use [`align_rt_builder_into_string`] and
 /// retain/drop the returned owner. `capacity` (bytes) pre-sizes the backing buffer so appends don't
@@ -2620,9 +2670,27 @@ pub unsafe extern "C" fn align_rt_builder_init_stack(out: *mut u8, arena: *mut A
     if out.is_null() {
         return core::ptr::null_mut();
     }
-    debug_assert_eq!(out as usize % core::mem::align_of::<Builder>(), 0, "stack Builder storage is misaligned");
+    debug_assert_eq!(out.addr() % core::mem::align_of::<Builder>(), 0, "stack Builder storage is misaligned");
     let b = out.cast::<Builder>();
     unsafe { b.write(builder_value(arena, capacity)) };
+    b
+}
+
+/// Initialize a compiler-provided nonescaping builder for bounded JSON encoding. The payload never
+/// grows beyond `max_bytes`; a negative or exceeded limit becomes a sticky `AL_INVALID` result at
+/// [`align_rt_builder_finish_bounded_stack`].
+///
+/// # Safety
+/// `out` has the same storage, alignment, and lifetime requirements as
+/// [`align_rt_builder_init_stack`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_builder_init_bounded_stack(out: *mut u8, max_bytes: i64) -> *mut Builder {
+    if out.is_null() {
+        return core::ptr::null_mut();
+    }
+    debug_assert_eq!(out as usize % core::mem::align_of::<Builder>(), 0, "stack Builder storage is misaligned");
+    let b = out.cast::<Builder>();
+    unsafe { b.write(bounded_builder_value(max_bytes)) };
     b
 }
 
@@ -2651,6 +2719,9 @@ pub unsafe extern "C" fn align_rt_builder_pop_comma(b: *mut Builder) {
         return;
     }
     let b = unsafe { &mut *b };
+    if b.buf.failed_limit() {
+        return;
+    }
     if b.buf.len > 0 && unsafe { *b.buf.ptr.add(b.buf.len - 1) } == b',' {
         b.buf.len -= 1;
     }
@@ -2695,8 +2766,14 @@ unsafe fn read_le_uint(ptr: *const u8, w: usize) -> u64 {
 /// `base`/`descs` must describe the struct actually encoded; each nested `sub` must be valid.
 unsafe fn json_encode_object(b: &mut Builder, base: *const u8, descs: &[JsonField]) {
     b.buf.push(b'{');
+    if b.buf.failed_limit() {
+        return;
+    }
     let mut wrote = false;
     for d in descs {
+        if b.buf.failed_limit() {
+            break;
+        }
         let kind = (d.tag >> 8) & 0xff;
         // An optional field with a `None` tag (0) is omitted.
         if d.opt_tag >= 0 {
@@ -2719,6 +2796,9 @@ unsafe fn json_encode_object(b: &mut Builder, base: *const u8, descs: &[JsonFiel
         let fp = unsafe { base.add(d.offset as usize) };
         unsafe { json_encode_value(b, fp, d, kind) };
     }
+    if b.buf.failed_limit() {
+        return;
+    }
     b.buf.push(b'}');
 }
 
@@ -2731,6 +2811,9 @@ unsafe fn json_encode_object(b: &mut Builder, base: *const u8, descs: &[JsonFiel
 /// # Safety
 /// `fp` must point at a value of the kind `d` describes; kind 4/5 require a valid `d.sub`.
 unsafe fn json_encode_value(b: &mut Builder, fp: *const u8, d: &JsonField, kind: i32) {
+    if b.buf.failed_limit() {
+        return;
+    }
     match kind {
         1 => b.buf.extend_from_slice(if unsafe { *fp } != 0 { &b"true"[..] } else { &b"false"[..] }),
         2 => {
@@ -2816,6 +2899,9 @@ unsafe fn json_encode_value(b: &mut Builder, fp: *const u8, d: &JsonField, kind:
 /// `union_desc` must be a valid [`JsonUnion`]; `base` must point at a live enum value of
 /// `union_desc.store_size` bytes; `b` must be a valid builder.
 unsafe fn encode_union_at(b: &mut Builder, base: *const u8, u: &JsonUnion) {
+    if b.buf.failed_limit() {
+        return;
+    }
     // Read the enum tag (i32 at offset 0).
     let mut tag_bytes = [0u8; 4];
     unsafe { core::ptr::copy_nonoverlapping(base, tag_bytes.as_mut_ptr(), 4) };
@@ -2873,6 +2959,9 @@ pub unsafe extern "C" fn align_rt_json_encode_union(b: *mut Builder, base: *cons
 /// # Safety
 /// `slot` must address a valid `{ptr,count}` (16 bytes); the buffer `count` `elem_width`-byte scalars.
 unsafe fn json_encode_scalar_array_at(b: &mut Builder, slot: *const u8, elem_kind: i32, elem_width: usize, elem_signed: bool) {
+    if b.buf.failed_limit() {
+        return;
+    }
     let mut pb = [0u8; 8];
     let mut lb = [0u8; 8];
     unsafe {
@@ -2890,14 +2979,23 @@ unsafe fn json_encode_scalar_array_at(b: &mut Builder, slot: *const u8, elem_kin
         opt_tag: -1,
     };
     b.buf.push(b'[');
+    if b.buf.failed_limit() {
+        return;
+    }
     if !ptr.is_null() {
         for i in 0..len as usize {
+            if b.buf.failed_limit() {
+                break;
+            }
             if i > 0 {
                 b.buf.push(b',');
             }
             let eptr = unsafe { ptr.add(i * elem_width) };
             unsafe { json_encode_value(b, eptr, &ed, elem_kind) };
         }
+    }
+    if b.buf.failed_limit() {
+        return;
     }
     b.buf.push(b']');
 }
@@ -2926,6 +3024,9 @@ pub unsafe extern "C" fn align_rt_json_encode_scalar_array(b: *mut Builder, ptr:
 }
 
 unsafe fn json_encode_struct_array_at(b: &mut Builder, slot: *const u8, sub: *const JsonSubTable) {
+    if b.buf.failed_limit() {
+        return;
+    }
     if sub.is_null() {
         b.buf.extend_from_slice(b"null");
         return;
@@ -2942,12 +3043,21 @@ unsafe fn json_encode_struct_array_at(b: &mut Builder, slot: *const u8, sub: *co
     let esz = sub.store_size.max(0) as usize;
     let descs = unsafe { safe_slice(sub.descs, sub.n_fields) };
     b.buf.push(b'[');
+    if b.buf.failed_limit() {
+        return;
+    }
     for i in 0..len as usize {
+        if b.buf.failed_limit() {
+            break;
+        }
         if i > 0 {
             b.buf.push(b',');
         }
         let eptr = unsafe { ptr.add(i * esz) };
         unsafe { json_encode_object(b, eptr, descs) };
+    }
+    if b.buf.failed_limit() {
+        return;
     }
     b.buf.push(b']');
 }
@@ -2976,12 +3086,21 @@ pub unsafe extern "C" fn align_rt_json_encode_struct_array(
     let len = len.max(0);
     let esz = esz.max(0) as usize;
     b.buf.push(b'[');
+    if b.buf.failed_limit() {
+        return;
+    }
     for i in 0..len as usize {
+        if b.buf.failed_limit() {
+            break;
+        }
         if i > 0 {
             b.buf.push(b',');
         }
         let eptr = unsafe { ptr.add(i * esz) };
         unsafe { json_encode_object(b, eptr, descs) };
+    }
+    if b.buf.failed_limit() {
+        return;
     }
     b.buf.push(b']');
 }
@@ -3064,6 +3183,9 @@ fn builder_push_i64(buf: &mut BuilderBuf, v: i64) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_builder_write_int(b: *mut Builder, v: i64) {
     let b = unsafe { &mut *b };
+    if b.buf.failed_limit() {
+        return;
+    }
     builder_push_i64(&mut b.buf, v);
 }
 
@@ -3076,6 +3198,9 @@ pub unsafe extern "C" fn align_rt_builder_write_int(b: *mut Builder, v: i64) {
 pub unsafe extern "C" fn align_rt_builder_write_str_int_str(b: *mut Builder, p1: *const u8, l1: i64, v: i64, p2: *const u8, l2: i64) {
     if b.is_null() { return; }
     let b = unsafe { &mut *b };
+    if b.buf.failed_limit() {
+        return;
+    }
     b.buf.extend_from_slice(unsafe { safe_slice(p1, l1) });
     builder_push_i64(&mut b.buf, v);
     b.buf.extend_from_slice(unsafe { safe_slice(p2, l2) });
@@ -3088,6 +3213,9 @@ pub unsafe extern "C" fn align_rt_builder_write_str_int_str(b: *mut Builder, p1:
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_builder_write_bool(b: *mut Builder, v: i32) {
     let b = unsafe { &mut *b };
+    if b.buf.failed_limit() {
+        return;
+    }
     b.buf.extend_from_slice(if v != 0 { &b"true"[..] } else { &b"false"[..] });
 }
 
@@ -3098,6 +3226,9 @@ pub unsafe extern "C" fn align_rt_builder_write_bool(b: *mut Builder, v: i32) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_builder_write_char(b: *mut Builder, c: u32) {
     let b = unsafe { &mut *b };
+    if b.buf.failed_limit() {
+        return;
+    }
     let ch = char::from_u32(c).unwrap_or('\u{FFFD}');
     let mut tmp = [0u8; 4];
     b.buf.extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
@@ -3110,6 +3241,9 @@ pub unsafe extern "C" fn align_rt_builder_write_char(b: *mut Builder, c: u32) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_builder_write_f64(b: *mut Builder, x: f64) {
     let b = unsafe { &mut *b };
+    if b.buf.failed_limit() {
+        return;
+    }
     push_float(&mut b.buf, x);
 }
 
@@ -3120,6 +3254,9 @@ pub unsafe extern "C" fn align_rt_builder_write_f64(b: *mut Builder, x: f64) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_builder_write_f32(b: *mut Builder, x: f32) {
     let b = unsafe { &mut *b };
+    if b.buf.failed_limit() {
+        return;
+    }
     push_float(&mut b.buf, x);
 }
 
@@ -3132,6 +3269,9 @@ pub unsafe extern "C" fn align_rt_builder_write_f32(b: *mut Builder, x: f32) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_builder_write_json_str(b: *mut Builder, ptr: *const u8, len: i64) {
     let b = unsafe { &mut *b };
+    if b.buf.failed_limit() {
+        return;
+    }
     b.buf.push(b'"');
     if len > 0 {
         let bytes = unsafe { safe_slice(ptr, len) };
@@ -3152,6 +3292,9 @@ fn json_needs_escape(c: u8) -> bool {
 fn write_json_str_scalar(buf: &mut BuilderBuf, bytes: &[u8]) {
     let mut start = 0;
     for (i, &c) in bytes.iter().enumerate() {
+        if buf.failed_limit() {
+            return;
+        }
         if json_needs_escape(c) {
             if start < i {
                 // Skip an empty copy when escapes are adjacent (e.g. `\r\n`).
@@ -3188,6 +3331,9 @@ const JSON_ESCAPE_SIMD_MIN: usize = 16;
 /// crossover. Scalar below the crossover and on other targets.
 #[inline]
 fn write_json_str_body(buf: &mut BuilderBuf, bytes: &[u8]) {
+    if buf.failed_limit() {
+        return;
+    }
     #[cfg(target_arch = "x86_64")]
     {
         if bytes.len() >= JSON_ESCAPE_SIMD_MIN {
@@ -3261,8 +3407,14 @@ unsafe fn write_json_str_avx2(buf: &mut BuilderBuf, bytes: &[u8]) {
     let mut start = 0usize;
     let mut i = 0usize;
     while i + 32 <= n {
+        if buf.failed_limit() {
+            return;
+        }
         let mut mask = unsafe { json_escape_mask_avx2(ptr.add(i)) };
         while mask != 0 {
+            if buf.failed_limit() {
+                return;
+            }
             let p = i + mask.trailing_zeros() as usize;
             if start < p {
                 buf.extend_from_slice(&bytes[start..p]);
@@ -3285,8 +3437,14 @@ unsafe fn write_json_str_sse2(buf: &mut BuilderBuf, bytes: &[u8]) {
     let mut start = 0usize;
     let mut i = 0usize;
     while i + 16 <= n {
+        if buf.failed_limit() {
+            return;
+        }
         let mut mask = unsafe { json_escape_mask_sse2(ptr.add(i)) };
         while mask != 0 {
+            if buf.failed_limit() {
+                return;
+            }
             let p = i + mask.trailing_zeros() as usize;
             if start < p {
                 buf.extend_from_slice(&bytes[start..p]);
@@ -3310,6 +3468,9 @@ unsafe fn write_json_str_sse2(buf: &mut BuilderBuf, bytes: &[u8]) {
 fn write_json_str_tail(buf: &mut BuilderBuf, bytes: &[u8], mut start: usize, i: usize) {
     let mut j = i;
     while j < bytes.len() {
+        if buf.failed_limit() {
+            return;
+        }
         let c = bytes[j];
         if json_needs_escape(c) {
             if start < j {
@@ -3354,8 +3515,14 @@ unsafe fn write_json_str_neon(buf: &mut BuilderBuf, bytes: &[u8]) {
     let mut start = 0usize;
     let mut i = 0usize;
     while i + 16 <= n {
+        if buf.failed_limit() {
+            return;
+        }
         let mut map = unsafe { json_escape_map_neon(ptr.add(i)) };
         while map != 0 {
+            if buf.failed_limit() {
+                return;
+            }
             // Each escaping lane is a 0xF nibble; trailing_zeros/4 is its index in the block.
             let lane = map.trailing_zeros() as usize >> 2;
             let p = i + lane;
@@ -7536,6 +7703,34 @@ pub unsafe extern "C" fn align_rt_builder_into_string_stack(b: *mut Builder) -> 
         return AlignStr { ptr: core::ptr::null(), len: 0 };
     }
     unsafe { builder_into_string_value(b.read()) }
+}
+
+/// Consume a bounded stack-header builder. On success, transfer its allocator-compatible payload
+/// into `out` and return `0`. On a negative or exceeded byte ceiling, drop the partial payload,
+/// leave `out` as canonical null/0, and return `AL_INVALID`.
+///
+/// # Safety
+/// `b` must point to a live value from [`align_rt_builder_init_bounded_stack`] and `out` must point
+/// to writable [`AlignStr`] storage. This call consumes `b` on every path.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_builder_finish_bounded_stack(b: *mut Builder, out: *mut AlignStr) -> i32 {
+    if out.is_null() {
+        if !b.is_null() {
+            unsafe { b.drop_in_place() };
+        }
+        return AL_INVALID;
+    }
+    unsafe { out.write(AlignStr { ptr: core::ptr::null(), len: 0 }) };
+    if b.is_null() {
+        return AL_INVALID;
+    }
+    let b = unsafe { b.read() };
+    if b.buf.limit_exceeded {
+        drop(b);
+        return AL_INVALID;
+    }
+    unsafe { out.write(builder_into_string_value(b)) };
+    0
 }
 
 /// Convert a builder header by value into an owned Align string by transferring its C-allocator
@@ -19947,8 +20142,8 @@ mod tests {
                 None
             })
             .collect();
-        assert_eq!(runtime.len(), 296);
-        assert_eq!(registry.len(), 296);
+        assert_eq!(runtime.len(), 298);
+        assert_eq!(registry.len(), 298);
         assert_eq!(runtime, registry);
     }
 
@@ -23275,6 +23470,189 @@ mod tests {
         let b = unsafe { align_rt_builder_init_stack(storage.0.as_mut_ptr(), core::ptr::null_mut(), 0) };
         unsafe { align_rt_builder_write(b, b"drop me".as_ptr(), 7) };
         unsafe { align_rt_builder_free_stack(b) };
+    }
+
+    #[test]
+    fn bounded_stack_builder_enforces_inclusive_small_caps_without_overallocation() {
+        for max_bytes in 0_u8..=8 {
+            let mut storage = StackHeader([0; 64]);
+            let b = unsafe {
+                align_rt_builder_init_bounded_stack(storage.0.as_mut_ptr(), i64::from(max_bytes))
+            };
+            unsafe { align_rt_builder_write(b, b"{}".as_ptr(), 2) };
+            let observed_cap = unsafe { (*b).buf.cap };
+            assert!(observed_cap <= usize::from(max_bytes), "cap {max_bytes} allocated {observed_cap}");
+
+            let mut out = AlignStr { ptr: core::ptr::null(), len: -1 };
+            let status = unsafe { align_rt_builder_finish_bounded_stack(b, &mut out) };
+            if max_bytes < 2 {
+                assert_eq!(status, AL_INVALID, "cap {max_bytes} rejects two emitted bytes");
+                assert!(out.ptr.is_null());
+                assert_eq!(out.len, 0);
+                assert_eq!(observed_cap, 0, "the first over-limit write allocates nothing");
+            } else {
+                assert_eq!(status, 0, "cap {max_bytes} accepts the exact two-byte value");
+                assert_eq!(unsafe { safe_slice(out.ptr, out.len) }, b"{}");
+                unsafe { align_rt_free(out.ptr as *mut u8) };
+            }
+        }
+
+        let mut storage = StackHeader([0; 64]);
+        let b = unsafe { align_rt_builder_init_bounded_stack(storage.0.as_mut_ptr(), -1) };
+        unsafe { align_rt_builder_write(b, b"{}".as_ptr(), 2) };
+        assert_eq!(unsafe { (*b).buf.cap }, 0);
+        let mut out = AlignStr { ptr: core::ptr::null(), len: -1 };
+        assert_eq!(unsafe { align_rt_builder_finish_bounded_stack(b, &mut out) }, AL_INVALID);
+        assert!(out.ptr.is_null());
+        assert_eq!(out.len, 0);
+    }
+
+    #[test]
+    fn bounded_stack_builder_null_abi_inputs_fail_defensively() {
+        assert!(unsafe {
+            align_rt_builder_init_bounded_stack(core::ptr::null_mut(), 8).is_null()
+        });
+
+        let mut out = AlignStr {
+            ptr: 1usize as *const u8,
+            len: -1,
+        };
+        assert_eq!(
+            unsafe {
+                align_rt_builder_finish_bounded_stack(core::ptr::null_mut(), &mut out)
+            },
+            AL_INVALID
+        );
+        assert!(out.ptr.is_null());
+        assert_eq!(out.len, 0);
+
+        let mut storage = StackHeader([0; 64]);
+        let b = unsafe { align_rt_builder_init_bounded_stack(storage.0.as_mut_ptr(), 8) };
+        unsafe { align_rt_builder_write(b, b"{}".as_ptr(), 2) };
+        assert_eq!(
+            unsafe { align_rt_builder_finish_bounded_stack(b, core::ptr::null_mut()) },
+            AL_INVALID
+        );
+    }
+
+    #[test]
+    fn bounded_stack_builder_routes_every_scalar_writer_through_one_limit() {
+        fn encode(max_bytes: i64, write: impl FnOnce(*mut Builder)) -> (i32, Vec<u8>, usize) {
+            let mut storage = StackHeader([0; 64]);
+            let b = unsafe {
+                align_rt_builder_init_bounded_stack(storage.0.as_mut_ptr(), max_bytes)
+            };
+            write(b);
+            let peak = unsafe { (*b).buf.cap };
+            let mut out = AlignStr {
+                ptr: core::ptr::null(),
+                len: -1,
+            };
+            let status = unsafe { align_rt_builder_finish_bounded_stack(b, &mut out) };
+            let bytes = unsafe { safe_slice(out.ptr, out.len) }.to_vec();
+            unsafe { align_rt_free(out.ptr as *mut u8) };
+            (status, bytes, peak)
+        }
+
+        let writers: Vec<(&str, Vec<u8>, Box<dyn Fn(*mut Builder)>)> = vec![
+            (
+                "raw",
+                b"raw".to_vec(),
+                Box::new(|b| unsafe { align_rt_builder_write(b, b"raw".as_ptr(), 3) }),
+            ),
+            (
+                "int",
+                b"-42".to_vec(),
+                Box::new(|b| unsafe { align_rt_builder_write_int(b, -42) }),
+            ),
+            (
+                "bool",
+                b"true".to_vec(),
+                Box::new(|b| unsafe { align_rt_builder_write_bool(b, 1) }),
+            ),
+            (
+                "char",
+                "日".as_bytes().to_vec(),
+                Box::new(|b| unsafe { align_rt_builder_write_char(b, u32::from('日')) }),
+            ),
+            (
+                "float",
+                b"1.5".to_vec(),
+                Box::new(|b| unsafe { align_rt_builder_write_f64(b, 1.5) }),
+            ),
+            (
+                "json-str",
+                b"\"a\\n\"".to_vec(),
+                Box::new(|b| unsafe {
+                    align_rt_builder_write_json_str(b, b"a\n".as_ptr(), 2)
+                }),
+            ),
+            (
+                "batched",
+                b"x7y".to_vec(),
+                Box::new(|b| unsafe {
+                    align_rt_builder_write_str_int_str(
+                        b,
+                        b"x".as_ptr(),
+                        1,
+                        7,
+                        b"y".as_ptr(),
+                        1,
+                    )
+                }),
+            ),
+        ];
+
+        for (name, expected, writer) in writers {
+            let (status, bytes, peak) = encode(expected.len() as i64, &writer);
+            assert_eq!(status, 0, "{name} exact fit");
+            assert_eq!(bytes, expected, "{name} byte parity");
+            assert!(peak <= bytes.len(), "{name} peak {peak} exceeds exact cap");
+
+            let (status, bytes, peak) = encode(expected.len() as i64 + 1, &writer);
+            assert_eq!(status, 0, "{name} one byte spare");
+            assert_eq!(bytes, expected, "{name} spare-cap byte parity");
+            assert!(peak <= expected.len() + 1, "{name} exceeded its spare cap");
+
+            let (status, bytes, peak) = encode((expected.len() - 1) as i64, writer);
+            assert_eq!(status, AL_INVALID, "{name} one byte short");
+            assert!(bytes.is_empty(), "{name} may not publish a partial result");
+            assert!(peak <= expected.len() - 1, "{name} exceeded its short cap");
+        }
+    }
+
+    #[test]
+    fn bounded_stack_builders_keep_limit_state_per_instance() {
+        let workers = (0..8)
+            .map(|index| {
+                std::thread::spawn(move || {
+                    let max = if index % 2 == 0 { 2 } else { 1 };
+                    let mut storage = StackHeader([0; 64]);
+                    let b = unsafe {
+                        align_rt_builder_init_bounded_stack(storage.0.as_mut_ptr(), max)
+                    };
+                    unsafe { align_rt_builder_write(b, b"{}".as_ptr(), 2) };
+                    let mut out = AlignStr {
+                        ptr: core::ptr::null(),
+                        len: 0,
+                    };
+                    let status = unsafe {
+                        align_rt_builder_finish_bounded_stack(b, &mut out)
+                    };
+                    let bytes = unsafe { safe_slice(out.ptr, out.len) }.to_vec();
+                    unsafe { align_rt_free(out.ptr as *mut u8) };
+                    (status, bytes)
+                })
+            })
+            .collect::<Vec<_>>();
+        for (index, worker) in workers.into_iter().enumerate() {
+            let (status, bytes) = worker.join().expect("bounded builder worker");
+            if index % 2 == 0 {
+                assert_eq!((status, bytes), (0, b"{}".to_vec()));
+            } else {
+                assert_eq!((status, bytes), (AL_INVALID, Vec::new()));
+            }
+        }
     }
 
     #[test]

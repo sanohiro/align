@@ -963,6 +963,16 @@ fn walk_body_records<'a>(
                             .map(|part| (BodyRecord::TemplatePart(part), child_depth)),
                     );
                 }
+                ExprKind::JsonEncodeBounded {
+                    parts, max_bytes, ..
+                } => {
+                    work.extend(
+                        parts
+                            .iter()
+                            .map(|part| (BodyRecord::TemplatePart(part), child_depth)),
+                    );
+                    work.push((BodyRecord::Expr(max_bytes), child_depth));
+                }
                 ExprKind::FilePread {
                     file,
                     buffer,

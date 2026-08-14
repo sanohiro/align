@@ -61,18 +61,26 @@ arrays, the exact C6 field graph, existing tagged-wrapper closure, whole/per-uni
 stack/boxed recursive cleanup share the existing builder/runtime ABI. Reopen §7.6 only for a public
 or ownership-strategy change after design review.
 
-align-llm Requests 11 and 12 have accepted designs. Request 11 is the active implementation
-capability. Its bounded process-capture contract is in
-`docs/impl/std-design/process.md`: `max_capture_bytes` is a per-stream command-local bound,
+align-llm Requests 11 and 12 have accepted designs. Request 12 is the active publication capability
+on `agent/bounded-canonical-json` and PR #807. It implements
+`docs/impl/17-library-boundary-prerequisites.md` §7.7 through the complete
+Sema→checked-HIR→MIR→LLVM→runtime owner matrix while sharing the existing canonical formatter. After
+integrating #806, the comprehensive review of
+`33de89431e4e7066f06e9df23522d5bef0c3cefb` found two valid boundary gaps: checked HIR did not bind
+JSON keys/access paths/order back to the source schema, and malformed MIR could pass a non-`i64`
+limit to LLVM's integer cast. The consolidated repair records the source local, reconstructs and
+compares the complete canonical plan iteratively, and preflights the bounded MIR result/out/piece
+envelope before LLVM construction. Its native ARM64 focused validator, driver, malformed-MIR, and
+library Clippy owners pass with one job. Commit the repair, run findings-fixed publication preflight,
+update PR #807, and merge it. Do not add a second formatter, estimator pass, dynamic JSON value, or
+unbounded-encode-then-discard path.
+
+Request 11 is the next implementation capability after #807. Its bounded process-capture contract
+is in `docs/impl/std-design/process.md`: `max_capture_bytes` is a per-stream command-local bound,
 `run_bytes` is the explicit arbitrary-byte terminal, and timeout/cap precedence, exact allocation,
 allocation-free post-fork bounded drain, deadline-aware post-EOF wait, terminal pipe-error cleanup,
 process-group signalling/direct-child reap, interface identity, and owner cells are fixed in one
-ledger. Implementation must follow that ledger without reopening the public surface. Request 12's
-design merged in #805 and is queued next: `docs/impl/17-library-boundary-prerequisites.md` §7.7 fixes
-`json.encode_bounded(value, max_bytes: i64)` as the owned, fallible, inclusive-byte-bounded sibling
-of `json.encode`. Its implementation must reuse the existing formatter and complete the recorded
-Sema→checked-HIR→MIR→LLVM→runtime owner matrix; do not add an estimator pass, dynamic JSON value, or
-unbounded-encode-then-discard path.
+ledger. Implement that ledger without reopening the public surface.
 
 Out-of-gate suites (everything outside `scripts/test-pr.sh`) are guarded by the
 nightly full-suite workflow, which builds once, runs every compiled test binary
