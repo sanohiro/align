@@ -470,8 +470,9 @@ measurement command に `262_144` を設定し、無制限実行後の長さ検�
   無い。未設定だけが無制限で、`0` は実在する0バイト上限である。
 - 負の `limit` は割り当てやプロセス生成より前の setter で abort する。有界実行は最初に出力 slot を検証し、
   非負上限を platform allocation size へ変換し、2つの capture store と mode 固有の空 output-handle shell を
-  生成する。表現不能な layout は `Error.Invalid`、いずれかの allocation failure は `Error.Code(ENOMEM)`。
-  どちらでも子はまだ開始していない。
+  生成する。表現不能な layout は `Error.Invalid`。物理 allocation failure は Align の locked fatal-OOM 方針に
+  従い、unwind や recoverable `Error` 無しで即時 abort する。どちらでも子はまだ開始しておらず、fatal OOM 前の
+  preallocation は process teardown が回収する。
 - pipe/fork failure は固定 errno 対応を保つ。子側 `chdir`/`execvp` failure は code `127` の `Ok` のまま。
   非ゼロ終了は capture failure より優先されない。
 - drain は各 `poll` の前と各正の read を処理する前に monotonic deadline を検査する。期限切れなら
@@ -480,9 +481,9 @@ measurement command に `262_144` を設定し、無制限実行後の長さ検�
   後の exit status や UTF-8 検証より優先する。
 - 両ストリーム EOF 後、text `run()` は stdout、stderr の順に検証する。どちらも同じ `Error.Invalid` なので、
   部分出力や失敗ストリームの識別は公開しない。
-- すべての error path は result slot を null のまま保ち、両 pipe fd と capture allocation を解放し、子が
-  存在すれば process group を kill し、直接の子をちょうど1回 reap する。部分 bytes、exit code、truncation
-  marker は返さない。
+- すべての recoverable error path は result slot を null のまま保ち、両 pipe fd と capture allocation を解放し、
+  子が存在すれば process group を kill し、直接の子をちょうど1回 reap する。fatal OOM に cleanup/unwind path は
+  無く、pipe 作成/fork より前に起きる。recoverable error は部分 bytes、exit code、truncation marker を返さない。
 
 ### 所有権、lifetime、allocation、並行性
 
@@ -498,8 +499,9 @@ capture allocation / reserved capacity は `L` より大きくなく、2つの l
 `2L` である。既存の固定64 KiB stack read scratch、command の argv/cwd/environment storage、2本の pipe
 descriptor、小さい output handle はこの capture-store 上限の外である。read は固定 scratch に入り、chunk 全体が
 選択ストリームの残容量へ収まる場合だけコピーする。成功時は既存 shell を埋め、追加 allocation 無しで2 layout を
-移す。すべての失敗で3つの preallocated object を解放する。無制限呼び出しは既存の growable `Vec` 動作を保ち、
-memory-bound claim を持たない。
+移す。すべての recoverable failure で3つの preallocated object を解放する。fatal OOM は process-wide allocation
+rule に従い pipe 作成/fork より前に終了する。無制限呼び出しは既存の growable `Vec` 動作を保ち、memory-bound
+claim を持たない。
 
 正の timeout または明示的 capture bound を持つ command は、子を process-group leader にする。timeout または
 overflow は group と、race/fallback として直接 pid の両方へ `SIGKILL` を送り、EOF の再 drain 無しに両 read
@@ -522,11 +524,23 @@ align_rt_run_bytes_free(out: ptr) -> void
 
 `align_rt_command_run` は ABI を保ち、`Command` に保存した新 bound を読む。両 run entry は1つの runtime capture
 engine へ委譲し、mode 固有の処理は完了 buffer の UTF-8 検証と output-handle construction だけである。
-`run_bytes` は HIR、MIR、LLVM lowering、checked-HIR validation、interface serialization、cache identity に
-新しい閉じた builtin type/scalar tag を持つ。runtime reflection、callback、persisted artifact、wire tag、ambient
-cache input は無い。同じ source の whole-program/per-unit compile は同じ run mode と output type を選ばなければ
-ならない。`run` と `run_bytes` の変更、source 上の bound call の追加・変更は通常の source-derived frontend/object
-cache entry を無効化する。
+
+`run_bytes` は compiler-owned type format ごとに次の厳密な append-only encoding を持つ。
+
+- canonical type codec version 3 は変更しない。`Ty::RunBytes` は既存最大 `59` の後の leaf tag `60`、
+  `Scalar::RunBytes` は既存最大 `35` の後の leaf tag `36`。root の semantic-to-byte / byte-to-semantic golden は
+  `RunBytes <-> [3, 0, 0, 0, 0, 60]`、scalar field golden は `RunBytes <-> [36]`。tag の挿入や renumber はしない。
+  unknown tag `61`/`37` と truncated root `[3, 0, 0, 0, 0]` は cache publication 前に拒否する。
+- interface summary format 6 は全 source type を既存 `IType::Named` で表すため、新 discriminator や version bump は
+  無い。`run_bytes` は既存 type tag `0`、UTF-8 path `run_bytes`、type argument 0個を使う。field-local golden は双方向で
+  `[0, 9, 0, 0, 0, 114, 117, 110, 95, 98, 121, 116, 101, 115, 0, 0, 0, 0]`。unknown type tag `3`、
+  truncated name/argument count、invalid UTF-8、trailing bytes は semantic import 前に拒否する。
+
+HIR、MIR、LLVM lowering、checked-HIR validation は同じ新しい closed builtin type を使う。runtime reflection、
+callback、別の user wire format、ambient cache input は無く、canonical type bytes と versioned interface summary が
+persisted compiler record である。同じ source の whole-program/per-unit compile は同じ run mode と output type を
+選ぶ。`run` と `run_bytes` の変更、source 上の bound call の追加・変更は通常の source-derived frontend/object cache
+entry を無効化する。
 
 ## 実装 closure matrix
 
@@ -538,7 +552,7 @@ cache entry を無効化する。
 | Timeout/cap/exit/UTF-8 precedence | timeout-before-overflow、overflow-before-timeout、nonzero-overflow、in-bound invalid UTF-8 で上記 checkpoint order を検証。Owner: `command_capture_error_precedence`。 |
 | Binary tier | `run_bytes` は invalid UTF-8 と embedded NUL を byte-for-byte で保ち、region-bound byte view、nonzero exit、exact-cap 動作を共有。Owner: `command_run_bytes_preserves_arbitrary_output`。 |
 | Move と Drop | formation、construction、`Result` move-in/out、`?`、`else`、`match`、`map_err`、replacement、return、source nulling、early exit は各 output を1回 Drop。aggregate/capture/temporary と escaped view を拒否。Owner: `m11_process_command` ownership matrix と checked-HIR variant tripwire。 |
-| Allocation と malformed limit | exact layout を fork 前に割り当て、第1/第2 allocation failure は先行 state を free し子を開始しない。zero は allocation 無し、unrepresentable layout は `Invalid`、capture capacity は `L` を越えない。Owner: runtime allocation failpoint/unit owner と `command_capture_allocation_bound`。 |
+| Allocation と malformed limit | exact layout を fork 前に割り当て、zero は byte store を割り当てず、unrepresentable layout は `Invalid`、物理 allocation failure は子が存在する前に unwind 無しで abort、capture capacity は `L` を越えない。Owner: 第1/第2/shell allocation の subprocess fatal-OOM failpoint と `command_capture_allocation_bound`。child-side marker で fork 未到達を証明する。 |
 | Reuse と concurrency | 1 command が保持/上書き bound で text/byte run を反復し、2つの独立 command は shared state 無しで並行実行。Owner: `command_capture_reuse_and_independent_concurrency`。 |
 | Generic/interface/per-unit/cache parity | `Result<run_bytes, Error>` を返す関数は whole-program/per-unit で同じ type/ABI。interface round-trip と exact edit/revert cache identity が一致。Owner: process interface/per-unit/cache tests。 |
 | Existing behavior | setter 無し `run()` は無制限で byte-for-byte compatible。cwd/env/env_clear/timeout、large dual-pipe、nonzero exit、text view owner は green のまま。Owner: 完全な `m11_process_command` target。 |
@@ -547,13 +561,22 @@ cache entry を無効化する。
 consumer limit について、有界 text/byte throughput と最大 live capture-layout bytes を既存無制限 path と比較して
 記録する。resource contract の evidence であり correctness gate ではない。
 
+## Design review finding の closure
+
+| Finding | Ledger-first closure |
+|---|---|
+| P1 recoverable OOM が locked allocation model と矛盾 | error/allocation row は no-unwind fatal OOM を維持する。表現不能 layout だけが `Error.Invalid` で、subprocess failpoint が abort-before-fork を証明する。 |
+| P1 HIR/native owner ledger に新 surface が無い | `docs/impl/19-hir-validation-ledger.md` が5つの厳密な expression row と malformed fixture を予約し、`docs/impl/20-runtime-abi-ledger.md` が6つの keyed symbol、declaration、attribute、count、registry owner を予約する。 |
+| P2 compiler type encoding が実装依存 | canonical codec version 3 に exact `Ty`/`Scalar` tag 60/36 と双方向/malformed vector を追加し、interface format 6 は既存 named-type record を exact byte vector 付きで使う。 |
+| P2 external request register が proposed のまま | sibling register に accepted per-stream/text/bytes/ownership/error contract と final reviewed design commit を記録し、指示どおりその repository では uncommitted のままにする。 |
+
 ## Acceptance gate
 
 実装を shipped とする前に:
 
 1. 各 matrix row が implementation と regression owner を指し、新 type が exhaustive variant tripwire に含まれる。
-2. 英日 process design、`draft.md`、condensed language spec、design notes、Settled decisions、runtime ABI ledger、
-   align-llm request register が一致する。
+2. 英日 process design、`draft.md`、condensed language spec、design notes、Settled decisions、checked-HIR ledger、
+   runtime ABI ledger、align-llm request register が一致する。
 3. focused process owner、bounded PR gate、library/binary Clippy、whole/per-unit/cache owner、allocation failpoint、
    local resource measurement が final candidate で通る。
 4. align-llm は、named merged implementation commit を pin し、focused helper/adapter target が 65,536/262,144

@@ -487,8 +487,9 @@ measurement command; it does not perform an unbounded run followed by a length c
 - Negative `limit` aborts at the setter before allocation or process creation. A bounded run first
   validates its output slot, converts the non-negative limit to the platform allocation size, and
   creates both capture stores plus the mode-specific empty output-handle shell. An unrepresentable
-  layout returns `Error.Invalid`; any allocation failure returns `Error.Code(ENOMEM)`. No child has
-  started in either case.
+  layout returns `Error.Invalid`. Physical allocation failure follows Align's locked fatal-OOM
+  policy: it aborts immediately without unwinding or a recoverable `Error` value. No child has
+  started in either case; process teardown reclaims any earlier preallocation after fatal OOM.
 - Pipe/fork failures retain the fixed errno mapping. Child-side `chdir`/`execvp` failure remains
   `Ok` with code `127`. A nonzero child exit never outranks a capture failure.
 - The drain checks the monotonic deadline before every `poll` and before processing every positive
@@ -497,9 +498,10 @@ measurement command; it does not perform an unbounded run followed by a length c
   only when overflow is observed first. Either error outranks later exit status or UTF-8 validation.
 - After both streams reach EOF, text `run()` validates stdout first and stderr second; either invalid
   stream returns the same `Error.Invalid`, so no partial output or stream identity is exposed.
-- All error paths leave the result slot null, release both pipe fds and capture allocations, kill the
-  process group when a child exists, and reap the direct child exactly once. No partial bytes, exit
-  code, or truncation marker are returned.
+- All recoverable error paths leave the result slot null, release both pipe fds and capture
+  allocations, kill the process group when a child exists, and reap the direct child exactly once.
+  Fatal OOM has no cleanup or unwind path and occurs before pipe creation/fork. No recoverable error
+  returns partial bytes, an exit code, or a truncation marker.
 
 ### Ownership, lifetime, allocation, and concurrency
 
@@ -516,7 +518,8 @@ capture layouts total exactly `2L`. The existing fixed 64 KiB stack read scratch
 argv/cwd/environment storage, two pipe descriptors, and the small output handle are outside that
 declared capture-store bound. Reads land in the fixed scratch first and copy only when the complete
 chunk fits the selected stream's remaining capacity. Success fills the existing shell and transfers
-the two layouts without another allocation; every error frees all three preallocated objects.
+the two layouts without another allocation; every recoverable error frees all three preallocated
+objects. Fatal OOM terminates before pipe creation/fork under the process-wide allocation rule.
 Unbounded callers retain the existing growable `Vec` behavior and make no memory-bound claim.
 
 A command with either a positive timeout or an explicit capture bound creates the child as a process
@@ -542,12 +545,28 @@ align_rt_run_bytes_free(out: ptr) -> void
 
 `align_rt_command_run` keeps its ABI and consumes the new bound stored in `Command`. Both run entries
 delegate to one runtime capture engine; the only mode-specific step is completed-buffer UTF-8
-validation and output-handle construction. `run_bytes` has a new closed builtin type/scalar tag in
-HIR, MIR, LLVM lowering, checked-HIR validation, interface serialization, and cache identity. There
-is no runtime reflection, callback, persisted artifact, wire tag, or ambient cache input. Whole-
-program and per-unit compilation of the same source must select the same run mode and output type;
-changing between `run` and `run_bytes`, or adding/changing the bound call in source, invalidates the
-ordinary source-derived frontend/object cache entry.
+validation and output-handle construction.
+
+`run_bytes` has one exact append-only encoding in each compiler-owned type format:
+
+- canonical type codec version 3 remains unchanged; `Ty::RunBytes` is the new leaf tag `60` and
+  `Scalar::RunBytes` is the new leaf tag `36`, after the existing `59` and `35` maxima. The root
+  semantic-to-byte and byte-to-semantic golden is `RunBytes <-> [3, 0, 0, 0, 0, 60]`; the scalar
+  field golden is `RunBytes <-> [36]`. Tags are never inserted or renumbered. Unknown tags `61` and
+  `37`, and a truncated root `[3, 0, 0, 0, 0]`, reject before cache publication.
+- interface summary format 6 already represents every source type as `IType::Named`; it does not
+  gain a type discriminator or version bump. `run_bytes` uses existing type tag `0`, UTF-8 path
+  `run_bytes`, and zero type arguments. Its field-local golden is
+  `[0, 9, 0, 0, 0, 114, 117, 110, 95, 98, 121, 116, 101, 115, 0, 0, 0, 0]` in both directions.
+  Unknown type tag `3`, a truncated name/argument count, invalid UTF-8, or trailing bytes rejects
+  before semantic import.
+
+HIR, MIR, LLVM lowering, and checked-HIR validation use the same new closed builtin type. There is
+no runtime reflection, callback, separate user wire format, or ambient cache input; the canonical
+type bytes and versioned interface summary are the persisted compiler records. Whole-program and
+per-unit compilation of the same source must select the same run mode and output type. Changing
+between `run` and `run_bytes`, or adding/changing the bound call in source, invalidates the ordinary
+source-derived frontend/object cache entry.
 
 ## Implementation closure matrix
 
@@ -559,7 +578,7 @@ ordinary source-derived frontend/object cache entry.
 | Timeout/cap/exit/UTF-8 precedence | Checkpoint order above is exercised for timeout-before-overflow, overflow-before-timeout, nonzero-overflow, and in-bound invalid UTF-8. Owner: `command_capture_error_precedence`. |
 | Binary tier | `run_bytes` preserves invalid UTF-8 and embedded NUL byte-for-byte, exposes region-bound byte views, supports nonzero exit, and shares exact-cap behavior. Owner: `command_run_bytes_preserves_arbitrary_output`. |
 | Move and Drop | Formation, construction, `Result` move-in/out, `?`, `else`, `match`, `map_err`, replacement, return, source nulling, and early exit drop each output once; aggregate/capture/temporary and escaped views reject. Owners: `m11_process_command` ownership matrix plus the checked-HIR variant tripwire. |
-| Allocation and malformed limits | Exact layouts are allocated before fork; first/second allocation failure frees prior state and starts no child; zero allocates none; unrepresentable layout is `Invalid`; capture capacity never exceeds `L`. Owner: runtime allocation failpoint/unit owners and `command_capture_allocation_bound`. |
+| Allocation and malformed limits | Exact layouts are allocated before fork; zero allocates no byte stores; unrepresentable layout is `Invalid`; physical allocation failure aborts without unwind before a child exists; capture capacity never exceeds `L`. Owner: subprocess fatal-OOM failpoints for first/second/shell allocation plus `command_capture_allocation_bound`; a child-side marker proves fork was never reached. |
 | Reuse and concurrency | One command repeats text and byte runs with the persisted/overwritten bound; two independent commands run concurrently without shared state. Owner: `command_capture_reuse_and_independent_concurrency`. |
 | Generic/interface/per-unit/cache parity | A function returning `Result<run_bytes, Error>` has identical whole-program and per-unit type/ABI; interface round-trip and exact edit/revert cache identity agree. Owners: process interface/per-unit/cache tests. |
 | Existing behavior | No-setter `run()` remains unbounded and byte-for-byte compatible; cwd/env/env_clear/timeout, large dual-pipe, nonzero exit, and text view owners remain green. Owner: complete `m11_process_command` target. |
@@ -569,6 +588,15 @@ bounded text/byte throughput and the maximum live capture-layout bytes for the 6
 consumer limits versus the existing unbounded path. It is evidence for the resource contract, not a
 correctness gate.
 
+## Design-review finding closure
+
+| Finding | Ledger-first closure |
+|---|---|
+| P1 recoverable OOM contradicted the locked allocation model | The error/allocation rows now retain fatal OOM with no unwind; only unrepresentable layouts return `Error.Invalid`, and subprocess failpoints prove abort-before-fork. |
+| P1 HIR and native owner ledgers omitted the new surface | `docs/impl/19-hir-validation-ledger.md` reserves the five exact expression rows and malformed fixtures; `docs/impl/20-runtime-abi-ledger.md` reserves all six keyed symbols, declarations, attributes, counts, and registry owners. |
+| P2 compiler type encodings were implementation-defined | The canonical codec keeps version 3 and appends exact `Ty`/`Scalar` tags 60/36 with bidirectional and malformed vectors; interface format 6 uses its existing named-type record with an exact byte vector. |
+| P2 the external request register remained proposed | The sibling register records the accepted per-stream/text/bytes/ownership/error contract and the final reviewed design commit; the edit remains uncommitted in that repository as required. |
+
 ## Acceptance gate
 
 Before the implementation is marked shipped:
@@ -576,7 +604,8 @@ Before the implementation is marked shipped:
 1. every matrix row points to implementation and a regression owner, with the new type included in
    the exhaustive variant tripwire;
 2. the English and Japanese process designs, `draft.md`, the condensed language specification,
-   design notes, Settled decisions, runtime ABI ledger, and align-llm request register agree;
+   design notes, Settled decisions, checked-HIR ledger, runtime ABI ledger, and align-llm request
+   register agree;
 3. the focused process owner, bounded PR gate, library/binary Clippy, whole/per-unit/cache owners,
    allocation failpoint, and local resource measurement pass on the final candidate; and
 4. align-llm may advance the request only after it pins the named merged implementation commit and

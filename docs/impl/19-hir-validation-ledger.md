@@ -796,6 +796,8 @@ predicate, not type equality alone:
   `Rng`, `Regex`, `Captures`, `CliCommand`, `CliParsed`, `TcpConn`,
   `TcpListener`, `UdpSocket`, `Child`, `Command`, `RunOutput`, `HttpRequest`,
   `HttpClient`, `HttpServer`, `HttpStream`, `ResponseBuilder`, and `File`.
+  Request 11 activates `RunBytes` under this same predicate when its reserved
+  rows below land; a temporary output handle is never admitted by type equality alone.
 - `ReaderPlace(e)` is `LocalHandle(Reader,e)` or the exact zero-argument
   `ReaderStdin` producer. `ReaderRead` and the reader operand of `IoCopy` use
   it. `ReaderReadLine` is narrower: it is a local recorded by the producer's
@@ -914,6 +916,11 @@ merely because its `Ty` matches.
 | `RunOutputCode` | `env[]; child[out]`; `RunOutput; result i64; borrowed; Pure`. |
 | `RunOutputStdout` | `env[]; child[out]`; `RunOutput; result Str; view inherits out provenance; Pure`. |
 | `RunOutputStderr` | `env[]; child[out]`; `RunOutput; result Str; view inherits out provenance; Pure`. |
+| `CommandMaxCapture` *(Request 11 reserved)* | `env[]; child[command,limit]`; `LocalHandle(Command,command),i64; result Unit; command native state mutated without source mut; Impure`. A negative runtime value is producer-valid HIR and aborts in the runtime before allocation/fork; malformed stored child/result types reject before lowering. |
+| `CommandRunBytes` *(Request 11 reserved)* | `env[]; child[command]`; `LocalHandle(Command,command); result ERR(RunBytes); command borrowed, result newly owned; Impure`. |
+| `RunBytesCode` *(Request 11 reserved)* | `env[]; child[out]`; `LocalHandle(RunBytes,out); result i64; borrowed; Pure`. |
+| `RunBytesStdout` *(Request 11 reserved)* | `env[]; child[out]`; `LocalHandle(RunBytes,out); result bytes; view inherits out provenance; Pure`. |
+| `RunBytesStderr` *(Request 11 reserved)* | `env[]; child[out]`; `LocalHandle(RunBytes,out); result bytes; view inherits out provenance; Pure`. |
 | `EncodingEncode` | `env[kind]`; `child[data]`; `byte-view; result String; fresh owned output; Pure`. |
 | `EncodingDecode` | `env[kind]`; `child[input]`; `Str; result ERR(Buffer); fresh owned output on success; Pure`. |
 | `Utf8Valid` | `env[]; child[data]`; `bytes; result Bool; borrowed; Pure`. |
@@ -1020,6 +1027,22 @@ this authoritative boundary instead of relying on the older scalar/string valida
 | Indirect tagged reachability | Lifting direct `array<string>` record-field formation makes that record reachable through existing Option, Result, and user-sum payload positions. Their tagged ids, payload types, move bits, and active-tag Drop remain exact; malformed/inactive payload state is not reinterpreted by the builder boundary. | parameterized Option/Result/user-sum wrapper owner through source validation and all checked-HIR entrypoints |
 | Delegation drift | Sema formation and checked-HIR validation call the same `heap_array_builder_record` classifier and canonical recursive ownership predicate. A newly admitted/excluded field kind or Drop rule therefore changes both domains in one owner. | helper-domain sweep plus whole/per-unit producer HIR passed through `lower_program_checked` |
 
+### Request 11 process-capture activation delta
+
+The five reserved expression rows above are normative for the bounded-capture implementation but do
+not describe the current Rust enum until that capability lands. The capability activates all five
+together with `Ty::RunBytes` / `Scalar::RunBytes`; there is no mergeable producer-only intermediate.
+The current 239-variant inventory becomes 244, and `variant_sweep_tripwire` must fail at compile time
+if any of those five variants is absent from validation or ownership analysis.
+
+| Cell | Exact closure | Owner evidence |
+|---|---|---|
+| Valid producer envelope | Sema emits each reserved row with exactly the child/result/effect relation written above; `CommandMaxCapture` and `CommandRunBytes` require a bound local `Command`, and all three accessors require a bound local `RunBytes`. | one accepted source fixture per discriminator in `request11_process_rows_match_the_producer`, passed through every checked lowering entrypoint |
+| One-field malformed mutations | For each row, mutate every child type, the stored result type, child count/order, receiver locality, and receiver handle kind independently. Validation rejects before MIR allocation, runtime declaration, ownership transfer, or cache publication. | parameterized complete-envelope mutations in `request11_process_rows_match_the_producer` |
+| Diagnostic precedence | A malformed child expression is visited before the receiver/result post relation; an equal-typed temporary receiver rejects only after its child validates. Negative `limit` is not a HIR-malformation discriminator and remains the runtime programmer-error abort. | accepted-local/temporary twins plus an invalid later-child twin in the same owner |
+| Closed Move classification | `RunBytes` is owned and dropped exactly like `RunOutput`: it is permitted only in its `Result` Ok carrier/local flow, nulls on move, is excluded from aggregates, arrays, task captures, and Copy/region-plain domains, and its byte views inherit only its owner region. | `run_bytes_type_classification_tripwire` sweeps Copy/Move/Drop/region/aggregate/capture/return and every control-flow cleanup owner |
+| Canonical/interface parity | Whole-program and imported/per-unit checked HIR resolve source `run_bytes` to the same closed type. Canonical type codec v3 tags are exactly `Ty=60` and `Scalar=36`; interface format 6 retains named-type tag 0/path `run_bytes`/zero args. | bidirectional golden and unknown/truncated-tag owners named in the process design, plus exact edit/revert unit-cache identity |
+
 ## Inventory closure
 
 The implementation must derive an exhaustiveness constant from the Rust enum
@@ -1029,6 +1052,10 @@ definitions and assert that this file has exactly one owner id for every
 `GroupSource`, `GroupAgg1`, `GroupOp`, `CliFlagKind`, `EncodingKind`, `CompressKind`,
 `PathComponentKind`, `AeadCipher`, `AeadDir`, and `HashAlgo`. The test fails on
 an added, removed, duplicated, or unowned discriminator.
+
+Request 11 changes the asserted `ExprKind` total from 239 to 244 in the same commit that activates
+its five reserved rows. Until then the current 239 count remains exact; documentation alone must not
+pretend the Rust inventory has already grown.
 
 ## Producer-delegation closure matrix
 
