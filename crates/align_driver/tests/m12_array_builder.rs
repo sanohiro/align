@@ -2,9 +2,10 @@
 //! (`builder`->`string`, `buffer`->bytes, this->`array<T>`). `array_builder()` opens an empty
 //! builder; `b.push(v)` / `b.append(xs: slice<T>)` grow it in place (a `mut`-bound local); `b.build()`
 //! **consumes** it into an owned `array<T>` (a zero-copy ptr+len retype over `align_rt_realloc`
-//! storage). Element set v1 = Copy scalars + `string` (push MOVES a string in; the builder's own Drop
-//! deep-frees pushed-not-frozen strings). Move-handle exclusions (no aggregate riding, capture into
-//! par_map/spawn rejected). (`docs/impl/07-roadmap.md` M12 Slice A6; `draft.md` §18.2.)
+//! storage). The heap form accepts Copy scalars, `string`, and the closed declared-record subset;
+//! push moves a string or Move record in, and the builder's own Drop recursively frees every
+//! pushed-not-frozen owner. Move-handle exclusions (no aggregate riding, capture into par_map/spawn
+//! rejected). (`docs/impl/07-roadmap.md` M12 Slice A6; `draft.md` §18.2.)
 
 mod common;
 use common::*;
@@ -97,6 +98,388 @@ fn many_pushes_grow_correctly() {
     let out = build_and_run("ab-grow", src);
     assert_eq!(code(&out), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "499500\n");
+}
+
+// --- declared-record elements -------------------------------------------------------------------
+
+#[test]
+fn copy_record_push_build_zero_one_many_and_realloc() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Point { x: i64, y: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  mut empty: array_builder<Point> := array_builder()\n",
+        "  zs := empty.build()\n",
+        "  mut b: array_builder<Point> := array_builder()\n",
+        "  mut i := 0\n",
+        "  loop {\n",
+        "    b.push(Point{x: i, y: i + 1})\n",
+        "    i = i + 1\n",
+        "    if i >= 80 { break }\n",
+        "  }\n",
+        "  xs := b.build()\n",
+        "  return (zs.len() + xs.len() + xs[0].x + xs[79].y) as i32\n",
+        "}\n",
+    );
+    let out = build_and_run("ab-record-copy", src);
+    assert_eq!(code(&out), Some(160), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn move_record_push_nulls_source_and_build_deep_drops() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Name { text: string, score: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  mut b: array_builder<Name> := array_builder()\n",
+        "  first := Name{text: \"alpha\".clone(), score: 7}\n",
+        "  b.push(first)\n",
+        "  b.push(Name{text: \"be\\0ta\".clone(), score: 9})\n",
+        "  xs := b.build()\n",
+        "  return (xs.len() + xs[0].score + xs[1].score) as i32\n",
+        "}\n",
+    );
+    let out = build_and_run("ab-record-move", src);
+    assert_eq!(code(&out), Some(18), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn unfinished_move_record_builder_drops_initialized_prefix() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Name { text: string }\n",
+        "fn main() -> i32 {\n",
+        "  mut i := 0\n",
+        "  loop {\n",
+        "    mut b: array_builder<Name> := array_builder()\n",
+        "    b.push(Name{text: \"owned\".clone()})\n",
+        "    i = i + 1\n",
+        "    if i >= 2000 { break }\n",
+        "  }\n",
+        "  return 0\n",
+        "}\n",
+    );
+    let out = build_and_run("ab-record-unfinished", src);
+    assert_eq!(code(&out), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn record_builder_abandonment_all_exit_kinds() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "import core.json\n",
+        "Item { name: string, value: i64 }\n",
+        "Parsed { value: i64 }\n",
+        "Choice { Left, Right }\n",
+        "LoadErr { Bad }\n",
+        "fn item(value: i64) -> Item = Item{name: \"owned\".clone(), value: value}\n",
+        "fn fail() -> Result<i32, Error> = Err(Error.Code(1))\n",
+        "fn custom_fail() -> Result<i32, LoadErr> = Err(LoadErr.Bad)\n",
+        "fn to_error(e: LoadErr) -> Error = match e { Bad => Error.Code(2) }\n",
+        "fn relay(items: array_builder<Item>) -> array_builder<Item> = items\n",
+        "fn normal() -> i32 { mut b: array_builder<Item> := array_builder()\n b.push(item(1))\n return 0 }\n",
+        "fn early() -> i32 { mut b: array_builder<Item> := array_builder()\n b.push(item(2))\n return 0 }\n",
+        "fn tried() -> Result<i32, Error> { mut b: array_builder<Item> := array_builder()\n b.push(item(3))\n n := fail()?\n return Ok(n) }\n",
+        "fn mapped() -> Result<i32, Error> { mut b: array_builder<Item> := array_builder()\n b.push(item(4))\n n := custom_fail().map_err(to_error)?\n return Ok(n) }\n",
+        "fn unwrapped() -> i32 { mut b: array_builder<Item> := array_builder()\n b.push(item(5))\n n := fail() else { return 0 }\n return n }\n",
+        "fn branched(flag: bool) -> i32 { if flag { mut b: array_builder<Item> := array_builder()\n b.push(item(6)) } else { mut b: array_builder<Item> := array_builder()\n b.push(item(7)) }\n return 0 }\n",
+        "fn matched() -> i32 { choice := Choice.Left\n match choice { Left => { mut b: array_builder<Item> := array_builder()\n b.push(item(8)) }, Right => { mut b: array_builder<Item> := array_builder()\n b.push(item(9)) } }\n return 0 }\n",
+        "fn looped() -> i32 { mut n := 0\n loop { mut b: array_builder<Item> := array_builder()\n b.push(item(n))\n n = n + 1\n if n >= 8 { break } }\n return 0 }\n",
+        "fn boxed() -> i32 { mut b: array_builder<Item> := array_builder()\n b.push(item(10))\n abandoned := relay(b)\n return 0 }\n",
+        "fn malformed() -> Result<i32, Error> { mut b: array_builder<Item> := array_builder()\n b.push(item(11))\n parsed: Parsed := json.decode(\"{\")?\n return Ok(parsed.value as i32) }\n",
+        "fn main() -> i32 {\n",
+        "  mut total := normal() + early() + unwrapped() + branched(true) + branched(false) + matched() + looped() + boxed()\n",
+        "  total = total + match tried() { Ok(value) => value, Err(_) => 0 }\n",
+        "  total = total + match mapped() { Ok(value) => value, Err(_) => 0 }\n",
+        "  total = total + match malformed() { Ok(value) => value, Err(_) => 0 }\n",
+        "  return total\n",
+        "}\n",
+    );
+    let out = build_and_run("ab-record-exits", src);
+    assert_eq!(code(&out), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn record_builder_partial_element_and_enclosing_record_cleanup() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Item { first: string, second: string }\n",
+        "Envelope { items: array<Item>, tail: string }\n",
+        "fn fail_string() -> Result<string, Error> = Err(Error.Code(1))\n",
+        "fn partial() -> Result<i32, Error> {\n",
+        "  mut b: array_builder<Item> := array_builder()\n",
+        "  b.push(Item{first: \"kept\".clone(), second: \"prefix\".clone()})\n",
+        "  b.push(Item{first: \"partial\".clone(), second: fail_string()?})\n",
+        "  return Ok(b.build().len() as i32)\n",
+        "}\n",
+        "fn enclosing() -> Result<Envelope, Error> {\n",
+        "  mut b: array_builder<Item> := array_builder()\n",
+        "  b.push(Item{first: \"built\".clone(), second: \"owner\".clone()})\n",
+        "  return Ok(Envelope{items: b.build(), tail: fail_string()?})\n",
+        "}\n",
+        "fn main() -> i32 {\n",
+        "  mut n := 0\n",
+        "  loop {\n",
+        "    a := match partial() { Ok(value) => value, Err(_) => 0 }\n",
+        "    b := match enclosing() { Ok(_) => 1, Err(_) => 0 }\n",
+        "    n = n + 1 + a + b\n",
+        "    if n >= 1000 { break }\n",
+        "  }\n",
+        "  return 0\n",
+        "}\n",
+    );
+    let out = build_and_run("ab-record-partial-cleanup", src);
+    assert_eq!(code(&out), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn record_builder_move_source_matrix() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Item { name: string, value: i64 }\n",
+        "Choice { Left, Right }\n",
+        "LoadErr { Bad }\n",
+        "fn make(value: i64) -> Item = Item{name: \"call\".clone(), value: value}\n",
+        "fn maybe(value: i64) -> Result<Item, Error> = Ok(make(value))\n",
+        "fn load(value: i64) -> Result<Item, LoadErr> = Ok(make(value))\n",
+        "fn to_error(e: LoadErr) -> Error = match e { Bad => Error.Code(1) }\n",
+        "fn collect(flag: bool) -> Result<array<Item>, Error> {\n",
+        "  mut b: array_builder<Item> := array_builder()\n",
+        "  local := Item{name: \"local\".clone(), value: 1}\n",
+        "  b.push(local)\n",
+        "  b.push(Item{name: \"fresh\".clone(), value: 2})\n",
+        "  b.push(make(3))\n",
+        "  b.push(if flag { make(4) } else { make(40) })\n",
+        "  choice := Choice.Left\n",
+        "  b.push(match choice { Left => make(5), Right => make(50) })\n",
+        "  b.push(maybe(6)?)\n",
+        "  b.push(load(7).map_err(to_error)?)\n",
+        "  b.push(maybe(8) else { return Err(Error.Code(2)) })\n",
+        "  b.push({ make(9) })\n",
+        "  b.push(if flag { make(10) } else { return Err(Error.Code(3)) })\n",
+        "  return Ok(b.build())\n",
+        "}\n",
+        "fn main() -> Result<(), Error> {\n",
+        "  xs := collect(true)?\n",
+        "  print(xs[0].value + xs[1].value + xs[2].value + xs[3].value + xs[4].value + xs[5].value + xs[6].value + xs[7].value + xs[8].value + xs[9].value)\n",
+        "  return Ok(())\n",
+        "}\n",
+    );
+    let out = build_and_run("ab-record-source-matrix", src);
+    assert_eq!(code(&out), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "55\n");
+}
+
+#[test]
+fn record_builder_source_use_after_push_and_borrowed_source_rejected() {
+    let moved = concat!(
+        "Item { name: string }\n",
+        "fn main() -> i32 {\n",
+        "  mut b: array_builder<Item> := array_builder()\n",
+        "  item := Item{name: \"owned\".clone()}\n",
+        "  b.push(item)\n",
+        "  b.push(item)\n",
+        "  return 0\n",
+        "}\n",
+    );
+    assert!(check_diagnostics("ab-record-source-moved", moved).contains("moved"));
+
+    let borrowed = concat!(
+        "Item { name: string }\n",
+        "fn retain(borrow item: Item) {\n",
+        "  mut b: array_builder<Item> := array_builder()\n",
+        "  b.push(item)\n",
+        "}\n",
+        "fn main() -> i32 = 0\n",
+    );
+    assert!(check_diagnostics("ab-record-source-borrowed", borrowed).contains("borrow"));
+
+    let projection = concat!(
+        "Item { name: string }\n",
+        "Outer { item: Item }\n",
+        "fn main() -> i32 {\n",
+        "  mut b: array_builder<Item> := array_builder()\n",
+        "  outer := Outer{item: Item{name: \"owned\".clone()}}\n",
+        "  b.push(outer.item)\n",
+        "  return 0\n",
+        "}\n",
+    );
+    assert!(check_errs("ab-record-source-projection", projection));
+
+    let divergent = concat!(
+        "Item { name: string }\n",
+        "Other { name: string }\n",
+        "fn main() -> i32 {\n",
+        "  mut b: array_builder<Item> := array_builder()\n",
+        "  b.push(if true { Item{name: \"item\".clone()} } else { Other{name: \"other\".clone()} })\n",
+        "  return 0\n",
+        "}\n",
+    );
+    assert!(check_errs("ab-record-source-divergent", divergent));
+
+    let consumed_arm = concat!(
+        "Item { name: string }\n",
+        "fn main() -> i32 {\n",
+        "  mut b: array_builder<Item> := array_builder()\n",
+        "  item := Item{name: \"owned\".clone()}\n",
+        "  b.push(item)\n",
+        "  b.push(if true { item } else { Item{name: \"fresh\".clone()} })\n",
+        "  return 0\n",
+        "}\n",
+    );
+    assert!(check_errs("ab-record-source-consumed-arm", consumed_arm));
+}
+
+#[test]
+fn record_builder_by_value_parameter_return_and_borrow_mut() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Item { name: string, value: i64 }\n",
+        "fn relay(items: array_builder<Item>) -> array_builder<Item> = items\n",
+        "fn add(borrow mut items: array_builder<Item>, item: Item) { items.push(item) }\n",
+        "fn main() -> i32 {\n",
+        "  mut first: array_builder<Item> := array_builder()\n",
+        "  first.push(Item{name: \"one\".clone(), value: 1})\n",
+        "  mut second := relay(first)\n",
+        "  add(second, Item{name: \"two\".clone(), value: 2})\n",
+        "  values := second.build()\n",
+        "  return (values.len() + values[0].value + values[1].value) as i32\n",
+        "}\n",
+    );
+    let out = build_and_run("ab-record-boundary", src);
+    assert_eq!(code(&out), Some(5), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn nested_move_record_reallocation_and_reassignment_drop_once() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Inner { name: string }\n",
+        "Outer { inner: Inner, value: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  mut b: array_builder<Outer> := array_builder()\n",
+        "  b.push(Outer{inner: Inner{name: \"old\".clone()}, value: 99})\n",
+        "  b = array_builder()\n",
+        "  mut i := 0\n",
+        "  loop {\n",
+        "    b.push(Outer{inner: Inner{name: \"live\".clone()}, value: i})\n",
+        "    i = i + 1\n",
+        "    if i >= 80 { break }\n",
+        "  }\n",
+        "  values := b.build()\n",
+        "  return (values.len() + values[79].value) as i32\n",
+        "}\n",
+    );
+    let out = build_and_run("ab-record-nested-reassign", src);
+    assert_eq!(code(&out), Some(159), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn record_builder_closed_shape_and_append_rejections() {
+    let cases = [
+        ("view", "Bad { value: str }"),
+        ("array", "Bad { value: array<i64> }"),
+        ("option", "Bad { value: Option<i64> }"),
+        ("empty", "Bad {}"),
+        ("c-layout", "layout(C) Bad { value: i64 }"),
+        ("aligned", "align(16) Bad { value: i64 }"),
+    ];
+    for (name, definition) in cases {
+        let src = format!(
+            "{definition}\nfn main() -> i32 {{\n  mut b: array_builder<Bad> := array_builder()\n  return 0\n}}\n"
+        );
+        assert!(check_errs(&format!("ab-record-reject-{name}"), &src), "{name} was accepted");
+    }
+
+    let append = concat!(
+        "Point { x: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  values := [Point{x: 1}]\n",
+        "  mut b: array_builder<Point> := array_builder()\n",
+        "  b.append(values[..])\n",
+        "  return 0\n",
+        "}\n",
+    );
+    assert!(check_errs("ab-record-append", append));
+}
+
+#[test]
+fn record_builder_nominal_twins_remain_distinct() {
+    if !backend_available() {
+        return;
+    }
+    let positive = concat!(
+        "Left { value: i64 }\n",
+        "Right { value: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  mut left: array_builder<Left> := array_builder()\n",
+        "  mut right: array_builder<Right> := array_builder()\n",
+        "  left.push(Left{value: 1})\n",
+        "  right.push(Right{value: 2})\n",
+        "  xs := left.build()\n",
+        "  ys := right.build()\n",
+        "  return (xs[0].value + ys[0].value) as i32\n",
+        "}\n",
+    );
+    let out = build_and_run("ab-record-nominal-twins", positive);
+    assert_eq!(code(&out), Some(3), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+
+    let wrong = concat!(
+        "Left { value: i64 }\n",
+        "Right { value: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  mut left: array_builder<Left> := array_builder()\n",
+        "  left.push(Right{value: 1})\n",
+        "  return 0\n",
+        "}\n",
+    );
+    assert!(check_errs("ab-record-nominal-twin-mismatch", wrong));
+}
+
+#[test]
+fn record_builder_invalid_storage_capture_and_borrowed_consumption_rejected() {
+    let aggregate = concat!(
+        "Item { name: string }\n",
+        "Holder { items: array_builder<Item> }\n",
+        "fn main() -> i32 = 0\n",
+    );
+    assert!(check_errs("ab-record-aggregate-storage", aggregate));
+
+    let borrowed_build = concat!(
+        "Item { name: string }\n",
+        "fn consume(borrow mut items: array_builder<Item>) { values := items.build() }\n",
+        "fn main() -> i32 = 0\n",
+    );
+    assert!(check_errs("ab-record-borrowed-build", borrowed_build));
+
+    let capture = concat!(
+        "Item { name: string }\n",
+        "fn main() -> Result<(), Error> {\n",
+        "  mut items: array_builder<Item> := array_builder()\n",
+        "  task_group { task := spawn(fn { items.push(Item{name: \"x\".clone()}); 1 })\n",
+        "    wait()\n",
+        "    print(task.get())\n",
+        "  }\n",
+        "  return Ok(())\n",
+        "}\n",
+    );
+    assert!(check_errs("ab-record-capture", capture));
 }
 
 // --- the two mandatory guardrails ---------------------------------------------------------------
@@ -207,7 +590,7 @@ fn append_on_string_builder_rejected() {
 }
 
 /// An `array_builder<str>` (a view element) is rejected at the type argument — fail-closed to the
-/// settled v1 element set (Copy scalars + owned `string`).
+/// closed heap element set (Copy scalars, owned `string`, and view-free declared records).
 #[test]
 fn str_view_element_rejected_at_type() {
     let src = "fn main() -> i32 {\n  mut b: array_builder<str> := array_builder()\n  return 0\n}\n";

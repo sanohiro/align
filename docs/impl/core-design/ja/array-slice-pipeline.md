@@ -47,13 +47,13 @@ builder.push(value)
 builder.build() -> array<T>
 ```
 
-次の heap 拡張として、natural alignment を持つ空でない view-free declared record を受け入れる設計が
-確定している。field は再帰的に Copy scalar、free-standing な `string`、または同じ record class
+実装済みの heap-record 拡張は、natural alignment を持つ空でない view-free declared record を
+受け入れる。field は再帰的に Copy scalar、free-standing な `string`、または同じ record class
 だけで構成する。owned string を持つ record の `push` は値を move して source を null にする。
 未完了 builder の Drop は初期化済み prefix を再帰的に解放し、`build` は同じ buffer を通常の
 deep-drop される AoS array へ移譲する。`append` は引き続き Copy scalar 専用である。完全な契約と
 実装 matrix は [`../../17-library-boundary-prerequisites.md`](../../17-library-boundary-prerequisites.md)
-§7.5 にある。この拡張は設計済みだが、まだ実装されていない。
+§7.5 にある。完全な capability は 2026-08-14 に実装された。
 
 region 形式（必須L6、**実装済み**）:
 

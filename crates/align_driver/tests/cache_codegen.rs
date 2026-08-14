@@ -783,6 +783,48 @@ fn gate5_edit_then_revert_hits_old_entry() {
     assert!(e3.all_hit(), "an exact revert must re-hit the original CAS entry");
 }
 
+#[test]
+fn record_builder_nominal_identity_and_definition_edit_revert() {
+    if !backend() {
+        return;
+    }
+    let records_v1 = concat!(
+        "module records\n",
+        "pub Item { name: string, value: i64 }\n",
+        "pub fn make(value: i64) -> Item = Item{name: \"item\".clone(), value: value}\n",
+    );
+    let records_v2 = concat!(
+        "module records\n",
+        "pub Item { name: string, value: i64, active: bool }\n",
+        "pub fn make(value: i64) -> Item = Item{name: \"item\".clone(), value: value, active: true}\n",
+    );
+    let main = concat!(
+        "module main\n",
+        "import records\n",
+        "fn main() -> i32 {\n",
+        "  mut items: array_builder<records.Item> := array_builder()\n",
+        "  items.push(records.make(7))\n",
+        "  return items.build().len() as i32\n",
+        "}\n",
+    );
+    let project = Project::new(
+        "record-builder-definition",
+        &[("records.align", records_v1), ("main.align", main)],
+        "main.align",
+    );
+    let cache = project.cache();
+    let _ = emit_all(&project, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+
+    project.write("records.align", records_v2);
+    let edited = emit_all(&project, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(!edited.outcome("records").hit, "the reachable record definition edit must miss its producer");
+    assert!(!edited.outcome("main").hit, "the imported builder specialization must miss with its dependency identity");
+
+    project.write("records.align", records_v1);
+    let reverted = emit_all(&project, &cache, Profile::Release, BuildTarget::Baseline, &no_exports(), false);
+    assert!(reverted.all_hit(), "an exact reachable-definition revert must restore the original identities");
+}
+
 // ---- Gate 6: corrupted blob → corruption event + rebuild + correct binary ------------------------
 
 #[test]

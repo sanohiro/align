@@ -2004,10 +2004,11 @@ green. **Next: M13** (codegen quality & link hygiene, the pre-LLVM-upgrade wave)
   `lower_expr` + `gen_rvalue` (the #296 frame lesson — expr-depth 5/5 holds). 19 driver tests
   (`m12_array_builder.rs`) incl. both mandatory guardrails (builder-outside-loop survives
   per-iteration drops; capture into `spawn`/`par_map` rejected); `cargo test --workspace` = 1781
-  green. `draft.md` §18.1 core.array_builder. **Deferred at this milestone:** record elements and
-  `append` of `string` elements. The later align-llm Request 8 design accepts a closed view-free
-  Copy/owned-string record graph under `17-library-boundary-prerequisites.md` §7.5; its complete
-  push/cleanup/build capability remains pending. The third member of the
+  green. `draft.md` §18.1 core.array_builder. The align-llm Request 8 extension shipped on
+  2026-08-14: the heap form also accepts the closed view-free Copy/owned-string record graph from
+  `17-library-boundary-prerequisites.md` §7.5, with complete move-in, recursive unfinished cleanup,
+  nominal interface/cache identity, and ordinary AoS-array Drop after build. `append` remains
+  Copy-scalar-only. The third member of the
   grow-then-freeze family (`builder`→`string`,
   `buffer`→bytes, now typed): a builder holds **no views**, so amortized realloc can never
   invalidate one — memory-safe by construction, which is exactly why growable `array<T>`
@@ -2017,10 +2018,11 @@ green. **Next: M13** (codegen quality & link hygiene, the pre-LLVM-upgrade wave)
   eager-materialize). **Freeze is zero-copy**: storage is `align_rt_alloc`-family memory grown
   via a NEW `align_rt_realloc` (amortized doubling), so `.build()` is a pure ptr+len retype
   (a Rust-`Vec`-backed store was rejected — its buffer cannot cross the allocator boundary to
-  the C-free that frees `array<T>`). Element set v1 = **Copy scalars + `string`**
+  the C-free that frees `array<T>`). The initial 2026-07-11 element set was **Copy scalars +
+  `string`**
   (`array<string>` deep-drop is shipped end-to-end via read_dir; the builder's own Drop
-  deep-frees pushed-not-frozen strings via the same helper); Copy structs deferred
-  (struct-array store path unverified), Move handles excluded (the settled exclusion).
+  deep-frees pushed-not-frozen strings via the same helper). The Request 8 extension recorded above
+  adds only its closed Copy/owned-string record graph; other Move handles remain excluded.
   Standard Move-handle exclusions (no Result/Option/array riding, print/== rejected).
   Mandatory tests: a builder declared outside a `loop` body survives per-iteration drops
   (#402 `body_locals` range); capture into `par_map`/`spawn` rejected (`ty_capture_is_move`).

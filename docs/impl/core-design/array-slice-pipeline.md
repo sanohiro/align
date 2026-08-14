@@ -50,13 +50,13 @@ builder.push(value)
 builder.build() -> array<T>
 ```
 
-The accepted next heap extension admits a nonempty, naturally aligned, view-free declared record
+The shipped heap-record extension admits a nonempty, naturally aligned, view-free declared record
 whose fields recursively contain only Copy scalars, free-standing `string`, or the same record
 class. `push` moves a record with owned strings and nulls its source; unfinished Drop recursively
 cleans the initialized prefix, while `build` transfers the same buffer to the ordinary deeply
 dropped AoS array. `append` remains Copy-scalar-only. The complete contract and implementation
 matrix are [`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md)
-§7.5; this extension is designed but not yet shipped.
+§7.5; the complete capability shipped on 2026-08-14.
 
 Region form (required L6, **shipped**):
 

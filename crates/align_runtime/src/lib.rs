@@ -13235,11 +13235,12 @@ unsafe fn array_builder_free_value(b: ArrayBuilder) {
     unsafe { owned_raw_free(b.data) };
 }
 
-/// Drop an unfrozen scalar-element `array_builder` — free its storage, then the header. Null-safe (a
+/// Drop an unfrozen flat-element `array_builder` — free its storage, then the header. Move-record
+/// builders are first transferred to ordinary recursive array Drop by codegen. Null-safe (a
 /// moved-out / never-grown builder drops harmlessly).
 ///
 /// # Safety
-/// `b` must be null or a valid scalar-element [`ArrayBuilder`], not yet frozen.
+/// `b` must be null or a valid flat-element [`ArrayBuilder`], not yet frozen.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_array_builder_free(b: *mut ArrayBuilder) {
     if b.is_null() {
@@ -13252,10 +13253,10 @@ pub unsafe extern "C" fn align_rt_array_builder_free(b: *mut ArrayBuilder) {
     unsafe { array_builder_free_value(b) };
 }
 
-/// Drop an unfrozen scalar-element stack header in place, freeing only its payload.
+/// Drop an unfrozen flat-element stack header in place, freeing only its payload.
 ///
 /// # Safety
-/// `b` must be null or point to a live scalar-element `ArrayBuilder` initialized by
+/// `b` must be null or point to a live flat-element `ArrayBuilder` initialized by
 /// [`align_rt_array_builder_init_stack`] and not yet frozen or dropped.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_array_builder_free_stack(b: *mut ArrayBuilder) {
@@ -33170,6 +33171,109 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             (after - before).abs() <= 50,
             "stack array_builder<string>'s Drop must free every pushed entry (no leak): {before} -> {after}"
         );
+    }
+
+    #[test]
+    fn array_builder_record_sized_push_realloc_and_instances_are_independent() {
+        #[repr(C)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        struct Record {
+            first: u64,
+            second: u64,
+            third: u64,
+        }
+
+        let left = align_rt_array_builder_new(core::mem::size_of::<Record>() as i64);
+        let right = align_rt_array_builder_new(core::mem::size_of::<Record>() as i64);
+        for value in 0..80_u64 {
+            let a = Record {
+                first: value,
+                second: value + 1,
+                third: value + 2,
+            };
+            let b = Record {
+                first: 1000 + value,
+                second: 2000 + value,
+                third: 3000 + value,
+            };
+            unsafe {
+                align_rt_array_builder_push_bytes(left, (&a as *const Record).cast());
+                align_rt_array_builder_push_bytes(right, (&b as *const Record).cast());
+            }
+        }
+        let left = unsafe { align_rt_array_builder_build(left) };
+        let right = unsafe { align_rt_array_builder_build(right) };
+        let left_values = unsafe { core::slice::from_raw_parts(left.ptr.cast::<Record>(), 80) };
+        let right_values = unsafe { core::slice::from_raw_parts(right.ptr.cast::<Record>(), 80) };
+        assert_eq!(
+            left_values[79],
+            Record {
+                first: 79,
+                second: 80,
+                third: 81,
+            }
+        );
+        assert_eq!(
+            right_values[0],
+            Record {
+                first: 1000,
+                second: 2000,
+                third: 3000,
+            }
+        );
+        unsafe {
+            align_rt_free(left.ptr.cast_mut());
+            align_rt_free(right.ptr.cast_mut());
+        }
+    }
+
+    #[test]
+    fn array_builder_record_capacity_arithmetic_failures_are_terminal() {
+        const CHILD: &str = "ALIGN_RECORD_BUILDER_OVERFLOW_CHILD";
+        const NAME: &str =
+            "tests::array_builder_record_capacity_arithmetic_failures_are_terminal";
+        if let Some(mode) = std::env::var_os(CHILD) {
+            let mut builder = Box::new(array_builder_value(24));
+            match mode.to_string_lossy().as_ref() {
+                "count" => builder.len = usize::MAX,
+                "bytes" => builder.elem_size = usize::MAX,
+                _ => std::process::exit(79),
+            }
+            let record = [0_u8; 24];
+            unsafe {
+                align_rt_array_builder_push_bytes(
+                    builder.as_mut(),
+                    record.as_ptr(),
+                )
+            };
+            std::process::exit(78);
+        }
+
+        for mode in ["count", "bytes"] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env(CHILD, mode)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(
+                        !status.success() && status.code() != Some(78),
+                        "{mode} overflow must abort inside reserve, got {status}"
+                    );
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("{mode} overflow child did not terminate");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
     }
 
     /// Companion check for the builder's *other* fate: `build()` into a frozen `array<string>`, then
