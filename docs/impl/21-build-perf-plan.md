@@ -20,7 +20,7 @@ Order is priority.
 | 2 | lld linking on ELF | Shipped as #763 — see below |
 | 3 | Pipelined compilation | Next in priority order. Start a dependent unit's frontend as soon as the dependency's interface summary exists; same work, shorter wall clock |
 | 4 | Prebuilt optimized cache distribution | Ship warmed std/pkg cache entries with releases, once the v1 persistent format is settled |
-| 5 | Daemon / watch mode | Keep the in-process memo alive across builds; the main lever for AI-agent edit-compile loops |
+| 5 | Daemon / watch mode | Keep the in-process memo alive across builds; the main lever for AI-agent edit-compile loops. `align-repl` (`docs/impl/22-repl-plan.md`) is the first consumer of this lever: it is already a long-lived process, so it realizes memo residency with no daemon machinery |
 | 6 | Function-level incremental compilation | Heaviest; requires its own design ledger before any implementation |
 
 ## Background
