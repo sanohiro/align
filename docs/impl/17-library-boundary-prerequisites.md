@@ -7,6 +7,10 @@ This is not a database-private escape hatch. It closes the general gap between o
 packages and native stateful libraries. `std.http`, `std.net`, `std.process`, and future
 FFI-backed packages must be able to use the same ownership and borrow machinery.
 
+Section 7.5 is a later, independently consumer-complete extension for align-llm Request 8. It
+reuses the shipped builder, region, generic, interface, and Drop machinery but is not a `pkg.db`
+prerequisite and is not yet implemented.
+
 The implementation order in this document is mandatory. A database driver must not add another
 closed `Ty`/HIR/MIR family that recognizes `pkg.db` names, and it must not expose `raw` handles or
 manual close functions through its safe public API.
@@ -1113,6 +1117,74 @@ symbolic `soa<Param(R)>` expression and bound so a separate consumer can reconst
 instantiation reruns the ordinary SoA admission rule and substitutes `Ty::Soa(struct_id)` before
 MoveCheck, EscapeCheck, and emitted HIR/MIR. No abstract SoA, generic thunk, dictionary, reflection,
 or DB-named compiler operation reaches runtime code.
+
+### 7.5 Individually owned heap-record builder
+
+Status: designed for align-llm Request 8; implementation not shipped.
+
+The heap constructor keeps the existing syntax and allocation visibility:
+
+```text
+array_builder<T>()       // T is inferred from the annotated binding
+b.push(value: T)         // consumes value when T is Move
+b.append(xs: slice<T>)   // remains Copy-scalar-only
+b.build() -> array<T>    // consumes the builder; zero-copy freeze
+```
+
+This capability admits declared records to the existing individually owned heap form. It does not
+add a constructor, type argument syntax, allocator input, ambient option, conversion, or second
+collection abstraction. The explicit-region form in §§7.1–7.4 remains the only builder that accepts
+borrowed views.
+
+#### Public-contract ledger
+
+| Field | Contract |
+|---|---|
+| Surface and owner | `core.array_builder`, owned by Sema formation/call checking, Move/Escape analysis, MIR cleanup, LLVM lowering, and the runtime allocation primitives. `array_builder()` infers `T` from `array_builder<T>` exactly as today. |
+| Heap record predicate | `HeapRecord(S)` holds only for a nonempty, acyclic declared struct whose fields, recursively in source declaration order, are integer/float/`bool`/`char`, owned `string`, or another `HeapRecord`. The root and every nested struct use natural Align layout with alignment at most 8 and have neither `align(N)` nor `layout(C)`. Copy-scalar-only records are Copy; a reachable `string` makes the record Move. |
+| Closed exclusions | Direct or nested `str`, `slice`, `resource_ref`, resource, `raw`, function, builder, dynamic/fixed array, `Option`, `Result`, sum/enum, tuple, box, independently owned non-string collection, empty struct, explicit layout/alignment, unknown definition, and inline cycle reject before builder construction. No exclusion is inferred from an opaque existing Drop plan. |
+| Push and move | `push` mutably borrows the builder. A Copy record is copied once. A Move record transfers the complete value, and the source is nulled at the same move boundary before any later source Drop. There is no implicit clone, JSON path, per-element arena, or shallow-copy fallback. |
+| Allocation mode | Every reachable `string` in a pushed Move record must be free-standing. Sema/MIR proves the complete value has individual ownership before the growth side effect; arena-owned, mixed, or path-dependent ownership rejects at the first source-order owner path. Copy fields contribute no allocation mode. Relocation preserves owner bytes without dropping the old byte positions. |
+| Builder ownership | The record form follows the existing builder owner model: one Move handle, mutable local receiver, existing by-value function transfer and `borrow mut` rules, no aggregate/`Option`/`Result` storage, and no task/closure capture. A by-value call moves the builder; a `borrow mut` helper cannot consume or retain it. `build` consumes it. Scalar and `string` behavior is unchanged. |
+| Append | `append` stays available only for existing Copy scalar elements. It never bulk-copies a record, `string`, view, or other Move value. |
+| Growth and build | Heap growth remains amortized `align_rt_realloc` storage. Record relocation is bytewise because accepted records contain only scalars and external string owners, never self-relative views. `build` transfers the initialized buffer without a second element allocation and returns the ordinary AoS `array<S>`. |
+| Drop and cleanup | The compile-time element type owns one canonical recursive `DropPlan`. Dropping an unfinished builder drains exactly its initialized prefix through the same array-element Drop plan, then frees storage/header. A successful build transfers that obligation to ordinary `array<S>` Drop. No runtime reflection, callback table, or self-describing element wire is added. |
+| Failures | Type, placement, source-move, exact-type, and allocation-mode failures are compile diagnostics before constructor/push side effects. Capacity arithmetic and allocator failure retain the existing terminal-abort policy and never return partial success. Partial source-record construction is cleaned by the existing aggregate owner before `push` begins. |
+| Validation order | Parser/import/arity and expected-type inference; recursive `HeapRecord` formation; builder placement/receiver; source move state and exact element type; recursive individual-allocation proof; build result escape/cleanup. Whole-program, interface-backed, and cache-replay paths use the same first failure. |
+| Interfaces and identity | The canonical identity is the existing nominal producer item plus its serialized reachable struct-definition graph, layout, ownership facts, and compiler interface schema. `Ty::ArrayBuilder(Scalar::Struct(id))` and `Ty::DynStructArray(id, Aos)` remap that identity through the existing interface tables; generic use is admitted only after concrete monomorphization. Existing interface and codegen-cache hashes change when a reachable definition changes and return to the old identity after an exact revert. |
+| Persisted/wire format | N/A. A builder is not persisted or exchanged. There is deliberately no `RecordBuilderDescV1`: a second structural byte identity would conflict with Align's nominal type identity and duplicate the versioned interface graph. Persisted consumer artifacts remain consumer-owned. |
+| Encoding and text | Field names in compiler metadata are UTF-8 source identifiers under existing declaration rules. Owned `string` contents retain their existing arbitrary UTF-8-byte/embedded-NUL semantics; the builder performs no encoding or validation. |
+| Effects and overlap | Constructor, push, and build are Pure in-memory operations under existing allocation semantics. One mutable builder operation is representable at a time; two distinct builders and independent processes share no mutable builder state. |
+| Metric | N/A. This is a correctness/ownership capability and makes no performance threshold claim. Zero-copy heap freeze is preserved and checked structurally; a later optimization claim requires its own workload and baseline. |
+
+The independently owned heap and explicit-region predicates intentionally overlap on scalar-only
+records but differ in ownership: `array_builder()` may retain free-standing `string` owners and no
+views, while `array_builder(out)` may retain region-valid views and no independently owned field.
+The constructor argument makes that choice visible. Neither predicate is widened to approximate the
+other.
+
+#### Implementation closure matrix
+
+| Closure cell | Required implementation closure | Owner evidence |
+|---|---|---|
+| Formation and deterministic exclusion | Add one cycle-safe, source-order `HeapRecord` classifier and select it only for `array_builder()` after expected-type inference. Reject every closed exclusion, empty/explicit-layout/over-aligned records, and malformed imported definitions before HIR publication. | `m12_array_builder::record_builder_type_formation_and_inference`, `record_builder_field_predicate_rejects_closed_shapes`, `record_builder_view_and_layout_rejected_before_construction`; whole/per-unit diagnostic parity owner |
+| Concrete generic substitution | A generic struct application may become a heap record only after complete concrete substitution; no abstract `Param`, new bound, or unresolved nominal enters emitted HIR. | `generics::record_builder_generic_instantiation`; checked-HIR abstract-template rejection twins |
+| Copy construction, push, growth, and build | Preserve the exact struct layout in zero/one/many/reallocating pushes and return the ordinary AoS dynamic struct array with exact values. | `m12_array_builder::copy_record_push_build_zero_one_many_and_realloc`; MIR/LLVM element-layout assertions |
+| Move-in and source nulling | Transfer a nested owned-string record once, null every moved source owner through the canonical aggregate move path, and reject later source use. | `m12_array_builder::move_record_push_nulls_source`; MIR source-nulling owner |
+| Individual allocation proof | Accept only fully free-standing reachable string owners. Reject arena, mixed, and path-dependent owner modes before the runtime push call. | `owned_structs::record_builder_rejects_arena_or_mixed_nested_owners`; no-call LLVM/side-effect assertion |
+| Relocation | Reallocation copies initialized record bytes without transient Drop and preserves every nested owner for later exactly-once cleanup. | `m12_array_builder::record_builder_realloc_preserves_nested_owners`; allocation/live-owner instrumentation |
+| Unfinished cleanup | Normal exit, return, `?`, `map_err`, branch/match/else joins, loop back-edge/break, reassignment, and malformed-input exit drain every initialized element and storage once. | `m12_array_builder::record_builder_abandonment_all_exit_kinds`, `record_builder_reassignment_drops_old_storage`, `region_flow::record_builder_join_cleanup_matrix` |
+| Partial value and enclosing aggregate | A failure while constructing the next record remains source-aggregate cleanup and never increments builder length; failure after placing a built array in an enclosing record drops that array and its initialized elements once. | `m12_array_builder::record_builder_partial_element_failure_drops_fields`; `owned_structs::record_builder_enclosing_record_failure` |
+| Build transfer | Heap build consumes header state, transfers the same element buffer, and leaves the result's recursive array Drop as sole owner. Unused, returned, and consumed results have no duplicate builder cleanup. | `m12_array_builder::record_builder_build_transfer_and_array_drop`; pointer/allocation instrumentation |
+| Function and borrow boundary | Preserve existing scalar/string builder transfer behavior and apply the same typed by-value/`borrow mut` rules to records. Reject aggregate storage, capture, task transfer, and consuming a borrowed builder. | `m12_array_builder::record_builder_function_and_borrow_boundaries`; existing boxed-header/capture owners |
+| Interface, nominal remap, and cache | Serialize/remap the existing builder element type and complete reachable struct definition; whole/per-unit and cold/cache-replay paths agree, malformed producer definitions reject, edit/revert changes/restores cache identity. | `per_unit::record_builder_imported_interface_graph`; `cache_codegen::record_builder_definition_edit_and_revert_identity`; interface corruption owner |
+| Runtime terminal boundaries | Checked capacity math and allocation failure abort without a successful partial array; separate builders/processes remain independent. | `m12_array_builder::record_builder_capacity_overflow_terminal_child`, allocator-failure child, two-instance and `cache_parallel` owners |
+| Compatibility | Existing scalar/string heap builders, region aggregate builders, JSON struct arrays, deep array Drop, and bounded PR tests remain green. | existing `m12_array_builder`, region-builder, `m5` JSON-array, DropPlan, `scripts/test-pr.sh`, and applicable Clippy owners |
+
+This is one implementation capability. Formation without recursive cleanup would admit an unsafe
+type; runtime storage without the Sema allocation-mode proof could retain an arena child; build
+without ordinary array Drop would transfer a leak. Intermediate commits may be compiling owner-test
+checkpoints, but the public merge includes the complete formation/push/cleanup/build consumer.
 
 ## 8. Recursive tagged Move payloads
 

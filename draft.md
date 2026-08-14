@@ -2352,13 +2352,22 @@ a live element/slice borrow would dangle across a `push`. The builder confines
 growth to a phase with no outstanding borrows, then freezes to the immutable,
 borrowable `array<T>`.
 
-The individually owned heap form accepts **Copy scalars** (int/float/bool/char) **+ `string`**. A
-`string`
-element is **moved** into the builder by `push` (its source is nulled; the builder's
-`Drop` deep-frees any pushed-but-not-frozen strings), so `append` — which bulk-copies
-a borrowed `slice<T>` — is offered only for Copy-scalar elements. Owned collections,
-`str` views, structs, and other Move handles as the element type are rejected for this
-heap form.
+The individually owned heap form accepts **Copy scalars** (int/float/bool/char), **`string`**, and a
+closed recursively view-free declared-record class. An admitted record is nonempty, naturally
+aligned to at most 8 bytes, has no explicit layout/alignment, and contains only Copy scalars,
+`string`, or another admitted record. Dynamic/fixed arrays, options/results, sums, tuples, boxes,
+resources/refs, raw/function/builder values, empty or cyclic records, explicit layout/alignment,
+and every direct or nested view are rejected before construction. A concrete generic record is
+tested only after monomorphization; there is no new generic bound or runtime dictionary.
+
+A `string` or Move record element is **moved** into the builder by `push`: its complete source is
+nulled, and every reachable string owner must be free-standing before the growth side effect.
+Arena-owned, mixed, or path-dependent nested owners reject. Reallocation relocates initialized
+record bytes without dropping the old byte positions. An unfinished builder recursively drops its
+initialized prefix; `build` transfers the same buffer to the ordinary deeply dropped `array<T>`.
+`append` — which bulk-copies a borrowed `slice<T>` — remains Copy-scalar-only. The builder retains
+no runtime reflection or self-describing record wire: its nominal element type, interface graph,
+and compiler `DropPlan` are the single type/cleanup identity.
 
 The region form is the required generalization for ordinary libraries. `out: region` comes from
 `arena out {}`. It accepts recursively plain scalars, options, fixed arrays, structs, and

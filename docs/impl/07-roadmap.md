@@ -2004,8 +2004,10 @@ green. **Next: M13** (codegen quality & link hygiene, the pre-LLVM-upgrade wave)
   `lower_expr` + `gen_rvalue` (the #296 frame lesson — expr-depth 5/5 holds). 19 driver tests
   (`m12_array_builder.rs`) incl. both mandatory guardrails (builder-outside-loop survives
   per-iteration drops; capture into `spawn`/`par_map` rejected); `cargo test --workspace` = 1781
-  green. `draft.md` §18.1 core.array_builder. **Deferred:** Copy-struct elements
-  (struct-array store path unverified); `append` of `string` elements. The third member of the
+  green. `draft.md` §18.1 core.array_builder. **Deferred at this milestone:** record elements and
+  `append` of `string` elements. The later align-llm Request 8 design accepts a closed view-free
+  Copy/owned-string record graph under `17-library-boundary-prerequisites.md` §7.5; its complete
+  push/cleanup/build capability remains pending. The third member of the
   grow-then-freeze family (`builder`→`string`,
   `buffer`→bytes, now typed): a builder holds **no views**, so amortized realloc can never
   invalidate one — memory-safe by construction, which is exactly why growable `array<T>`

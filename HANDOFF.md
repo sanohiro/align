@@ -53,6 +53,12 @@ required MIR's borrow-owned lowering path. Both stages now route through
 `docs/impl/19-hir-validation-ledger.md` "Producer-delegation closure matrix".
 Pinning align-llm to the merged commit is align-llm-side work.
 
+align-llm Request 6 adoption is now closed by align-llm PR #84. The next independent client
+prerequisite is Request 8's heap declared-record `array_builder`; branch
+`agent/heap-record-array-builder-design` is authoring its Align-owned public contract and closure
+matrix against `004b7f02086570b200b238d752a1f7ba67da7d04`. No implementation is accepted until that
+design is reviewed and merged.
+
 Out-of-gate suites (everything outside `scripts/test-pr.sh`) are guarded by the
 nightly full-suite workflow, which builds once, runs every compiled test binary
 concurrently through `scripts/run-suite-binaries.sh`, and diffs the observed
@@ -158,10 +164,9 @@ facts must live in this repository.
   execution record. The framework is general-purpose REST infrastructure, not
   an LLM-gateway-specific subset.
 - **align-llm requests:** Request 4 is accepted and designed for the next implementation PR.
-  Requests 5 and 7–14 remain proposed in `../align-llm/docs/align-requests.md`. Request 6 is
-  `ALIGN_MERGED` (design
-  #703, implementation #704); its real-client adoption and pin are
-  align-llm-side. Request 9 remains the later C7 blocker.
+  Requests 5 and 7–14 remain proposed in `../align-llm/docs/align-requests.md`; Request 8's
+  Align-owned design is active but not yet accepted. Request 6 is closed after Align design #703,
+  implementation #704, and align-llm adoption #84. Request 9 remains the later C7 blocker.
 
 Consumer-gated deferrals that remain intentional:
 

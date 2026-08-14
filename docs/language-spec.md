@@ -878,6 +878,13 @@ Every name above is an importable module except `core.array_builder`: `array_bui
 language-intrinsic global (like `builder()`), listed as a core area rather than an `import` target.
 
 `array_builder<T>()` retains its individually owned heap/zero-copy-freeze form.
+Besides Copy scalars and `string`, it accepts nonempty naturally aligned declared records composed
+recursively only of Copy scalars, owned `string`, and the same record class. Such records contain no
+views or other owned collections. A Move record is pushed only when every reachable string owner is
+free-standing; push moves and nulls the source, unfinished-builder Drop recursively cleans the
+initialized prefix, and build transfers the same buffer to the ordinary deeply dropped
+`array<T>`. `append` remains Copy-scalar-only. The nominal type plus its versioned interface graph
+and compiler Drop plan is the sole record identity; no runtime record descriptor is exposed.
 `array_builder<T>(out: region)` is the caller-region form for recursively plain values. It uses
 arena chunks with no hidden heap allocation and performs one documented compacting pass at
 `build()`. Shorter-lived views must first use `clone_in(out)`. Both forms remain one mutable-local

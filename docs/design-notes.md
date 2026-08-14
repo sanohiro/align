@@ -460,6 +460,19 @@ is exactly what makes cross-unit edits invalidate dependents through the interfa
 `array<T>` annotation is therefore rejected, not accepted-and-coerced — the type would be a lie about
 ownership.
 
+**A heap record builder reuses nominal type identity and compile-time Drop, not a runtime record
+descriptor.** Once a consumer needed runtime-sized record arrays, three possible designs existed:
+serialize records through JSON, add a self-describing structural record-builder wire, or extend the
+existing typed builder. JSON would turn an in-memory ownership operation into an encoding round
+trip. A second structural wire would disagree with Align's nominal record identity and duplicate
+interface versioning, layout, cache invalidation, and Drop facts. The typed extension is the one-way
+answer: the compiler already knows the exact record definition and recursively generated Drop plan,
+so the runtime header still needs only storage state. The safe heap predicate is deliberately
+narrow—Copy scalars, free-standing `string`, and nested records of the same class. Views belong to
+the explicit-region builder; other owned collections wait for their own recursive cleanup proof.
+That split keeps allocation visible and lets realloc move raw record bytes without inventing hidden
+arenas, reflection, or callbacks.
+
 ---
 
 ## The lambda philosophy
