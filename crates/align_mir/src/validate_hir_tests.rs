@@ -215,7 +215,9 @@ fn heap_record_array_builder_rows_match_the_producer() {
         .structs
         .iter()
         .position(|definition| definition.source_name == "Item")
-        .expect("Item definition") as u32;
+        .map(|index| index as u32);
+    assert!(item_id.is_some(), "checked source must contain Item");
+    let item_id = item_id.unwrap_or(u32::MAX);
     let gates = crate::validate_hir::DelegatedGates::new(&program);
     assert!(gates.array_builder_append_elem_ok(ArrayBuilderElem::Scalar(
         Scalar::Int(IntTy {
@@ -296,9 +298,13 @@ fn heap_record_array_builder_rows_match_the_producer() {
     );
 
     let mut rejected = program.clone();
-    let nested_tagged = match rejected.structs[item_id as usize].fields[2].ty {
-        Ty::Option(Scalar::Tagged(id)) => id,
-        other => panic!("nested Option fixture lost its tagged payload: {other:?}"),
+    let nested_ty = rejected.structs[item_id as usize].fields[2].ty;
+    assert!(
+        matches!(nested_ty, Ty::Option(Scalar::Tagged(_))),
+        "nested Option fixture lost its tagged payload: {nested_ty:?}"
+    );
+    let Ty::Option(Scalar::Tagged(nested_tagged)) = nested_ty else {
+        return;
     };
     rejected.tagged_types[nested_tagged as usize] = hir::TaggedType::Result(
         Scalar::Struct(0),
