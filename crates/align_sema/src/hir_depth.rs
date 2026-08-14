@@ -587,6 +587,10 @@ fn walk_body_records<'a>(
                     data: rhs,
                 }
                 | ExprKind::HttpRequestTimeout { req: lhs, ns: rhs }
+                | ExprKind::HttpRequestMaxResponseBodyBytes {
+                    req: lhs,
+                    limit: rhs,
+                }
                 | ExprKind::HttpRespHeader {
                     resp: lhs,
                     name: rhs,
@@ -594,6 +598,10 @@ fn walk_body_records<'a>(
                 | ExprKind::HttpClientTimeout {
                     client: lhs,
                     ns: rhs,
+                }
+                | ExprKind::HttpClientMaxResponseBodyBytes {
+                    client: lhs,
+                    limit: rhs,
                 }
                 | ExprKind::HttpClientGet {
                     client: lhs,

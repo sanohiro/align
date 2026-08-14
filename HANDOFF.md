@@ -7,21 +7,22 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-15._ Active work is the consumer-complete `align-repl`
-v1 capability from `docs/impl/22-repl-plan.md` on
-`agent/align-repl-v1-codex`, based on `5f0bd2ea`. The native AOT session,
-replacement/undo model, command surface, bounded output retention, driver stage
-promotion, shared type renderer, and ARM default of one codegen job are
-implemented. Candidate `e81c1817` received one comprehensive Codex review with
-five valid findings. Repairs now run all compiler transactions on a named 32 MiB
-worker, preserve syntax diagnostics for malformed entries, derive main binders
-from AST binding positions, keep child output as raw bytes, and discard rather
-than capture `:time` output. Focused `align_repl` tests pass (9 unit, 5 e2e, 25
-session), as do its clippy owner and the lint ratchet, with
-`CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 ALIGN_GATE_JOBS=1` and isolated target
-`/tmp/align-repl-v1.VUH9z1`. Next: commit the consolidated review repair, run the
-exact-head pre-publication gate with `--findings-fixed`, then publish and merge
-the PR.
+_Last updated: 2026-08-15._ Active work is align-llm Request 5's
+consumer-complete bounded HTTP response-body capability on
+`agent/request5-bounded-http`, based on `7a06b2fd`. Both Pure bound-local setters,
+checked HIR/MIR/LLVM A66 lowering, the HTTP-private `Error.Code(-1)` mapping,
+fixed explicit head/body allocation, CL/chunked/close-delimited enforcement,
+bodyless composition, cleanup, and `get_many` propagation are implemented.
+Focused runtime, checked-HIR, ABI/export, cache-identity, and native ARM64 driver
+owners pass with `CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 ALIGN_GATE_JOBS=1` and
+isolated target `/tmp/align-request5-target`. The complete `align_sema` (223),
+`align_mir` (159), and `align_codegen_llvm` (89 passed, 5 ignored) suites pass,
+as does their applicable lib/bin clippy owner. The runtime aggregate has nine
+macOS-host failures (one non-UTF-8 filesystem fixture, two HTTP pool fixtures,
+and six TLS fixtures); the unchanged `7a06b2fd` runtime binary has those same
+nine failures plus its now-repaired stale export inventory. Next: commit the
+coherent candidate, perform one comprehensive review and consolidated repair,
+then run the exact-head pre-publication gate and publish/merge the PR.
 
 The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit
@@ -196,8 +197,8 @@ facts must live in this repository.
 - **align-llm requests:** Request 4 is merged through Align design #798 and implementation #800;
   Request 6 is closed after Align design #703, implementation #704, and align-llm adoption #84;
   Request 8 is merged through Align design #799 and implementation #801; Request 10's §7.6
-  implementation is merged; Request 11's bounded-capture implementation is complete and Request 12's
-  design is accepted. Requests 5, 7, 9, and 13–14 otherwise remain proposed in
+  implementation is merged; Requests 11 and 12 are implemented, and Request 5's bounded-HTTP
+  implementation is active on `agent/request5-bounded-http`. Requests 7, 9, and 13–14 remain proposed in
   `../align-llm/docs/align-requests.md`; Request 9 remains the later C7 blocker after Request 7.
 
 Consumer-gated deferrals that remain intentional:

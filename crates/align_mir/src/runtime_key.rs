@@ -11,7 +11,7 @@ macro_rules! runtime_keys {
         }
 
         impl RuntimeKey {
-            pub const ALL: [Self; 291] = [$(Self::$variant,)*];
+            pub const ALL: [Self; 293] = [$(Self::$variant,)*];
 
             pub const fn logical_name(self) -> &'static str {
                 match self {
@@ -153,6 +153,7 @@ runtime_keys! {
     HttpBody => "http_body",
     HttpClientFree => "http_client_free",
     HttpClientGet => "http_client_get",
+    HttpClientMaxResponseBodyBytes => "http_client_max_response_body_bytes",
     HttpClientNew => "http_client_new",
     HttpClientPost => "http_client_post",
     HttpClientRequest => "http_client_request",
@@ -164,6 +165,7 @@ runtime_keys! {
     HttpCtxPath => "http_ctx_path",
     HttpGetMany => "http_get_many",
     HttpHeader => "http_header",
+    HttpMaxResponseBodyBytes => "http_max_response_body_bytes",
     HttpParse => "http_parse",
     HttpRbBody => "http_rb_body",
     HttpRbHeader => "http_rb_header",
@@ -316,7 +318,7 @@ runtime_keys! {
     Utf8Valid => "utf8_valid",
 }
 
-const _: [(); 291] = [(); RuntimeKey::ALL.len()];
+const _: [(); 293] = [(); RuntimeKey::ALL.len()];
 
 #[cfg(test)]
 mod tests {
@@ -325,7 +327,7 @@ mod tests {
 
     #[test]
     fn runtime_keys_are_complete_unique_and_alphabetical() {
-        assert_eq!(RuntimeKey::ALL.len(), 291);
+        assert_eq!(RuntimeKey::ALL.len(), 293);
         let names: Vec<_> = RuntimeKey::ALL
             .iter()
             .map(|key| key.logical_name())

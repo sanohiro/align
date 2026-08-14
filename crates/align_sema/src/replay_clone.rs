@@ -1189,6 +1189,12 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             req: boxed!(req),
             ns: boxed!(ns),
         },
+        ExprKind::HttpRequestMaxResponseBodyBytes { req, limit } => {
+            ExprKind::HttpRequestMaxResponseBodyBytes {
+                req: boxed!(req),
+                limit: boxed!(limit),
+            }
+        }
         ExprKind::HttpParse { data } => ExprKind::HttpParse { data: boxed!(data) },
         ExprKind::HttpRespStatus { resp } => ExprKind::HttpRespStatus { resp: boxed!(resp) },
         ExprKind::HttpRespHeader { resp, name } => ExprKind::HttpRespHeader {
@@ -1200,6 +1206,12 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             client: boxed!(client),
             ns: boxed!(ns),
         },
+        ExprKind::HttpClientMaxResponseBodyBytes { client, limit } => {
+            ExprKind::HttpClientMaxResponseBodyBytes {
+                client: boxed!(client),
+                limit: boxed!(limit),
+            }
+        }
         ExprKind::HttpClientGet { client, url } => ExprKind::HttpClientGet {
             client: boxed!(client),
             url: boxed!(url),
@@ -1997,6 +2009,10 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             data: rhs,
         }
         | ExprKind::HttpRequestTimeout { req: lhs, ns: rhs }
+        | ExprKind::HttpRequestMaxResponseBodyBytes {
+            req: lhs,
+            limit: rhs,
+        }
         | ExprKind::HttpRespHeader {
             resp: lhs,
             name: rhs,
@@ -2004,6 +2020,10 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::HttpClientTimeout {
             client: lhs,
             ns: rhs,
+        }
+        | ExprKind::HttpClientMaxResponseBodyBytes {
+            client: lhs,
+            limit: rhs,
         }
         | ExprKind::HttpClientGet {
             client: lhs,

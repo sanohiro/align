@@ -10512,7 +10512,7 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        variants, 258,
+        variants, 260,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -12036,6 +12036,18 @@ fn hir_body_validator_native() {
         Ty::Unit
     );
     add!(
+        "native_http_request_max_response_body_bytes",
+        body_test_expr(
+            hir::ExprKind::HttpRequestMaxResponseBodyBytes {
+                req: Box::new(native_local(0, Ty::HttpRequest)),
+                limit: Box::new(native_i64()),
+            },
+            Ty::Unit,
+        ),
+        vec![body_test_local(0, "request", Ty::HttpRequest, false, false)],
+        Ty::Unit
+    );
+    add!(
         "native_http_parse",
         body_test_expr(
             hir::ExprKind::HttpParse {
@@ -12092,6 +12104,18 @@ fn hir_body_validator_native() {
             hir::ExprKind::HttpClientTimeout {
                 client: Box::new(native_local(0, Ty::HttpClient)),
                 ns: Box::new(native_i64()),
+            },
+            Ty::Unit,
+        ),
+        vec![body_test_local(0, "client", Ty::HttpClient, false, false)],
+        Ty::Unit
+    );
+    add!(
+        "native_http_client_max_response_body_bytes",
+        body_test_expr(
+            hir::ExprKind::HttpClientMaxResponseBodyBytes {
+                client: Box::new(native_local(0, Ty::HttpClient)),
+                limit: Box::new(native_i64()),
             },
             Ty::Unit,
         ),
@@ -12476,10 +12500,26 @@ fn hir_body_validator_native() {
     assert!(body_core_metadata_is_valid(&program), "native body metadata");
 
     let mut reject = program.clone();
-    let expression = body_statement_expression_mut(
-        &mut reject,
-        "native_heap_record_array_builder_new",
-    );
+    let expression =
+        body_statement_expression_mut(&mut reject, "native_http_request_max_response_body_bytes");
+    let hir::ExprKind::HttpRequestMaxResponseBodyBytes { limit, .. } = &mut expression.kind else {
+        panic!("request body-limit fixture lost its discriminator")
+    };
+    limit.ty = Ty::Bool;
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression =
+        body_statement_expression_mut(&mut reject, "native_http_client_max_response_body_bytes");
+    let hir::ExprKind::HttpClientMaxResponseBodyBytes { client, .. } = &mut expression.kind else {
+        panic!("client body-limit fixture lost its discriminator")
+    };
+    *client = Box::new(body_test_expr(hir::ExprKind::HttpClient, Ty::HttpClient));
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression =
+        body_statement_expression_mut(&mut reject, "native_heap_record_array_builder_new");
     if let hir::ExprKind::ArrayBuilderNew { elem, .. } = &mut expression.kind {
         *elem = ArrayBuilderElem::Scalar(Scalar::Struct(0));
         expression.ty = Ty::ArrayBuilder(Scalar::Struct(0));

@@ -1115,7 +1115,7 @@ stream fixture を Content-Length から chunked へ切り替え、valid SSE、m
 status/header/body preservation を証明する。sibling request register が adoption evidence の lifecycle owner
 であり続ける。
 
-## Client response body の上限制御 (align-llm Request 5 — DESIGNED 2026-08-14)
+## Client response body の上限制御 (align-llm Request 5 — DESIGNED 2026-08-14、IMPLEMENTED 2026-08-15)
 
 provider call には whole-body client が allocation した後の length check ではなく、受信中に効く
 operation-sized limit が必要である。Request 5 は Request 4 framing engine に client default と request

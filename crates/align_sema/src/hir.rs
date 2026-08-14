@@ -1450,7 +1450,16 @@ pub enum ExprKind {
     /// `ns` overrides the client default; a negative `ns` **aborts** at runtime (the `command.timeout_ns`
     /// precedent). `req` is a bound local; `ns` is a Copy `i64`. Pure — this stores a field on the
     /// handle (the deadline is applied at perform time, no I/O here). The build-dual of [`HttpBody`].
-    HttpRequestTimeout { req: Box<Expr>, ns: Box<Expr> },
+    HttpRequestTimeout {
+        req: Box<Expr>,
+        ns: Box<Expr>,
+    },
+    /// `r.max_response_body_bytes(limit)` — set/clear the request-local response receive cap. The
+    /// request is borrowed and mutated in place; `limit` is an `i64`; result Unit; Pure.
+    HttpRequestMaxResponseBodyBytes {
+        req: Box<Expr>,
+        limit: Box<Expr>,
+    },
     /// `http.parse(data)` — parse a complete HTTP/1.1 response buffer `data` (a byte view) into an
     /// owned [`crate::Ty::HttpResponse`], yielding `Result<response, Error>` (the `ty`). A malformed
     /// status line / non-numeric status / header without `:` / chunked encoding / bad or oversized
@@ -1478,7 +1487,16 @@ pub enum ExprKind {
     /// (the default — current blocking behavior); a negative `ns` **aborts** at runtime. `client` is a
     /// bound local (borrowed, not consumed); `ns` is a Copy `i64`. Pure — stores a field, applied per
     /// request at perform time. A request's own `timeout > 0` overrides this default.
-    HttpClientTimeout { client: Box<Expr>, ns: Box<Expr> },
+    HttpClientTimeout {
+        client: Box<Expr>,
+        ns: Box<Expr>,
+    },
+    /// `cl.max_response_body_bytes(limit)` — set/clear the client-default response receive cap. The
+    /// client is borrowed and mutated in place; `limit` is an `i64`; result Unit; Pure.
+    HttpClientMaxResponseBodyBytes {
+        client: Box<Expr>,
+        limit: Box<Expr>,
+    },
     /// `cl.get(url)` — perform a `GET url` over a fresh connection, yielding `Result<response, Error>`
     /// (the `ty`). `cl` is a bound [`crate::Ty::HttpClient`] local (borrowed, not consumed); `url` is a
     /// borrowed `str`. **Impure** (network I/O). A 4xx/5xx status is `Ok(response)` (http.md P2); a

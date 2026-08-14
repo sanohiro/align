@@ -1146,7 +1146,7 @@ consumer-prerequisite wave, switches its provider stream fixtures from Content-L
 and proves valid SSE, malformed/truncated rejection, and final status/header/body preservation. The
 sibling request register remains the lifecycle owner for that adoption evidence.
 
-## Bounded client response bodies (align-llm Request 5 — DESIGNED 2026-08-14)
+## Bounded client response bodies (align-llm Request 5 — DESIGNED 2026-08-14, IMPLEMENTED 2026-08-15)
 
 Provider calls need an operation-sized receive limit, not a check after the whole-body client has
 already allocated the response. Request 5 adds one client default and one request override to the
