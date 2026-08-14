@@ -91,8 +91,9 @@ Move-enum field), then frees the AoS — called from both the struct-field drop 
 arm deep-frees each element (gated by `sub_owns_buffers`), and `decode_struct_array_value` frees the
 elements already materialized in `buf[0..count]` on a mid-array parse failure. **With J3b the OpenAI
 chat gateway closes end-to-end** (`Chat` round-trips byte-identically). **Still rejected:**
-`array<string>` (a bare-`string`-element array field — its per-element string free is a separate slice,
-caught at 0b-2). **Constraint:** a Move struct (owns an array/Move-enum) can't be a `Result`/`Option`
+JSON decode/encode of `array<string>` (a bare-`string`-element array field has no JSON descriptor
+arm). Request 10 makes that field valid for ordinary owned record construction by reusing the
+standalone deep Drop; it does not add the JSON producer. **Constraint:** a Move struct (owns an array/Move-enum) can't be a `Result`/`Option`
 Ok payload across a function boundary — decode + use in-scope; `json.encode` of a bare
 `array<Move-struct>` and pipelines over such a field stay restricted (decode→encode passthrough works).
 

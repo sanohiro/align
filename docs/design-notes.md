@@ -983,6 +983,9 @@ The heap `array_builder` accepts Options and dynamic arrays inside its view-free
 does not introduce arrays whose elements are Options or other arrays. The named evaluator consumer
 needs optional fields, arrays of owned strings, and arrays of records that themselves contain those
 fields. All use existing compact type representations and the canonical recursive Drop plan.
+Making direct `array<string>` a valid record field also makes that record available to the existing
+Option, Result, and user-sum payload grammar. This is not a new tagged surface, but it is a newly
+reachable Drop composition and therefore belongs in the same implementation proof.
 
 An `array<Option<T>>` or `array<array<T>>` would instead need a new composite-element array type,
 element move-out/indexing rules, interface and ABI representation, and generic/pipeline coverage.

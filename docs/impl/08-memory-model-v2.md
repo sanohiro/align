@@ -842,5 +842,7 @@ The admitted dynamic-array element is a Copy scalar, owned `string`, or an admit
 Composite array elements such as Option and dynamic array remain deferred because they require a
 new type/ABI representation and element move-out contract. Direct `array<string>` record fields
 reuse the already shipped standalone deep string-array Drop; this does not widen JSON or sum
-payload modes. Allocation accounting is structural: push allocates no child, build allocates
+payload syntax/ABI. Such a record remains usable in the existing Option, Result, and user-sum
+payload positions, whose active-tag cleanup must now dispatch its string-array field. Allocation
+accounting is structural: push allocates no child, build allocates
 nothing, and only the outer builder growth can add storage to already constructed children.

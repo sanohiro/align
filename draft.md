@@ -276,7 +276,9 @@ There is no class / inheritance.
 
 An owned `array<string>` is a valid ordinary struct field. Its Drop walks the initialized strings
 before freeing the array buffer. This does not make it a supported JSON field: JSON decoding and
-encoding retain their own closed schema grammar. Use `array<str>` when the strings are borrowed.
+encoding retain their own closed schema grammar. A finite Move struct containing that field may be
+used in the existing `Option`, `Result`, and user-sum payload positions; Drop still follows only the
+active tag. Use `array<str>` when the strings are borrowed.
 
 ### Sum Type
 

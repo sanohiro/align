@@ -56,8 +56,8 @@ declared-record `array_builder` contract was accepted in #799 and shipped in #80
 `029e27465d79e24cd36d374aae41dca0ec7e6979`. The sibling request register records the merged
 surface and the required batch release build is green. Request 10 is the next consumer-owned
 extension: `docs/impl/17-library-boundary-prerequisites.md` §7.6 owns its Options/dynamic-array
-ledger and implementation closure matrix. Its implementation remains unshipped; reopen §7.6 only
-for a public or ownership-strategy change after design review.
+ledger, exact C6 field graph, tagged-wrapper closure, and implementation matrix. Its implementation
+remains unshipped; reopen §7.6 only for a public or ownership-strategy change after design review.
 
 Out-of-gate suites (everything outside `scripts/test-pr.sh`) are guarded by the
 nightly full-suite workflow, which builds once, runs every compiled test binary

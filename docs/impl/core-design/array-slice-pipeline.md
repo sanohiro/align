@@ -63,7 +63,8 @@ dynamic arrays whose element is a Copy scalar, `string`, or another accepted rec
 views, requires every reachable string/array buffer to be free-standing before push, deep-drops
 active Options, string arrays, and arrays of Move records, and adds no runtime ABI. Arrays of
 Options or arrays remain outside this capability. The exact ledger and implementation matrix are
-§7.6; implementation is pending.
+§7.6; they also close existing Option/Result/user-sum payloads over a record with a direct string
+array field. Implementation is pending.
 
 Region form (required L6, **shipped**):
 

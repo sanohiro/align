@@ -60,7 +60,8 @@ Request 10 の受理済み拡張は、この class を、受け入れ済み fiel
 view は保持せず、push 前に到達可能な全 string/array buffer が free-standing であることを要求し、
 active Option、string array、Move record array を deep-drop する。runtime ABI は増やさない。
 Option や array を要素とする array は対象外である。正確な ledger と implementation matrix は
-§7.6 にあり、実装は未完了である。
+§7.6 にあり、直接 string-array field を持つ record に対する既存の Option/Result/user-sum payload
+も閉じる。実装は未完了である。
 
 region 形式（必須L6、**実装済み**）:
 
