@@ -14559,12 +14559,36 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
+            Rvalue::HttpRequestMaxResponseBodyBytes { req, limit } => {
+                let r = self.operand(req)?.into_pointer_value();
+                let n = self.operand(limit)?;
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::HttpMaxResponseBodyBytes),
+                        &[r.into(), n.into()],
+                        "",
+                    )
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
             // `cl.timeout(ns)` — set the client handle's default I/O timeout in place; no value.
             Rvalue::HttpClientTimeout { client, ns } => {
                 let c = self.operand(client)?.into_pointer_value();
                 let n = self.operand(ns)?;
                 self.builder
                     .build_call(self.runtime(RuntimeKey::HttpClientTimeout), &[c.into(), n.into()], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
+            Rvalue::HttpClientMaxResponseBodyBytes { client, limit } => {
+                let c = self.operand(client)?.into_pointer_value();
+                let n = self.operand(limit)?;
+                self.builder
+                    .build_call(
+                        self.runtime(RuntimeKey::HttpClientMaxResponseBodyBytes),
+                        &[c.into(), n.into()],
+                        "",
+                    )
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
