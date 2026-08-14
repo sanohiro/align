@@ -634,4 +634,34 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn run_bytes_named_type_has_the_exact_format_6_field_encoding() {
+        let ty = IType::Named { path: "run_bytes".to_string(), args: Vec::new() };
+        let mut writer = Writer { buf: Vec::new() };
+        write_type(&mut writer, &ty);
+        let expected = [
+            0, 9, 0, 0, 0, b'r', b'u', b'n', b'_', b'b', b'y', b't', b'e', b's',
+            0, 0, 0, 0,
+        ];
+        assert_eq!(writer.buf, expected);
+
+        let mut reader = Reader::new(&expected);
+        assert_eq!(read_type(&mut reader), Ok(ty));
+        assert_eq!(reader.finish(), Ok(()));
+
+        let mut unknown = Reader::new(&[3]);
+        assert_eq!(
+            read_type(&mut unknown),
+            Err(DecodeError::BadTag { what: "type", tag: 3 })
+        );
+        for malformed in [
+            &expected[..4],
+            &[0, 1, 0, 0, 0, 0xff, 0, 0, 0, 0][..],
+            &[expected.as_slice(), &[0]].concat()[..],
+        ] {
+            let mut reader = Reader::new(malformed);
+            assert!(read_type(&mut reader).and_then(|_| reader.finish()).is_err());
+        }
+    }
 }

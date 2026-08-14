@@ -3891,6 +3891,7 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                 | Scalar::ResponseBuilder
                 | Scalar::HttpStream
                 | Scalar::RunOutput
+                | Scalar::RunBytes
                 // MIR carries no function-type table; the embedded signature facts are validated
                 // at every function-value producer/consumer, and the physical closure ABI is
                 // independent of this sema-local identity.
@@ -4018,6 +4019,7 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                         | Ty::Child
                         | Ty::Command
                         | Ty::RunOutput
+                        | Ty::RunBytes
                         | Ty::HttpRequest
                         | Ty::HttpResponse
                         | Ty::HttpClient
@@ -6900,6 +6902,7 @@ fn tagged_child(payload: Scalar) -> Option<u32> {
         | Scalar::ResponseBuilder
         | Scalar::HttpStream
         | Scalar::RunOutput
+        | Scalar::RunBytes
         | Scalar::Fn(_)
         | Scalar::Resource(_)
         | Scalar::ResourceRef(_) => None,
@@ -7460,7 +7463,9 @@ fn scalar_bytes(s: Scalar) -> u64 {
         Scalar::TcpListener => unreachable!("a tcp_listener handle is not a box/array payload"),
         Scalar::UdpSocket => unreachable!("a udp_socket handle is not a box/array payload"),
         Scalar::Child => unreachable!("a child handle is not a box/array payload"),
-        Scalar::RunOutput => unreachable!("a run_output handle is not a box/array payload"),
+        Scalar::RunOutput | Scalar::RunBytes => {
+            unreachable!("a captured-run handle is not a box/array payload")
+        }
         Scalar::Fn(_) => 16,
         Scalar::Resource(_) | Scalar::ResourceRef(_) => 8,
     }
@@ -7550,6 +7555,7 @@ fn handle_free_key(ty: Ty) -> Option<RuntimeKey> {
         Ty::Child => RuntimeKey::ChildFree,
         Ty::Command => RuntimeKey::CommandFree,
         Ty::RunOutput => RuntimeKey::RunOutputFree,
+        Ty::RunBytes => RuntimeKey::RunBytesFree,
         Ty::HttpRequest => RuntimeKey::HttpRequestFree,
         Ty::HttpResponse => RuntimeKey::HttpRespFree,
         Ty::HttpClient => RuntimeKey::HttpClientFree,
@@ -14591,6 +14597,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
+            Rvalue::CommandMaxCapture { command, limit } => {
+                let c = self.operand(command)?.into_pointer_value();
+                let n = self.operand(limit)?;
+                self.builder
+                    .build_call(self.runtime(RuntimeKey::CommandMaxCapture), &[c.into(), n.into()], "")
+                    .map_err(|e| self.err(e))?;
+                return Ok(None);
+            }
             // `c.env(name, value)` — add/override one child environment variable in place; no value.
             Rvalue::CommandEnv { command, name, value } => {
                 let c = self.operand(command)?.into_pointer_value();
@@ -14623,6 +14637,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("command_run returns i32 status")
             }
+            Rvalue::CommandRunBytes { command, out } => {
+                let c = self.operand(command)?.into_pointer_value();
+                let out_ptr = self.slots[out];
+                self.builder
+                    .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
+                    .map_err(|e| self.err(e))?;
+                self.builder
+                    .build_call(self.runtime(RuntimeKey::CommandRunBytes), &[c.into(), out_ptr.into()], "cmdrunbytes")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("command_run_bytes returned no i32 status"))?
+            }
             // `out.code()` — the runtime returns the i64 exit code directly.
             Rvalue::RunOutputCode { out } => {
                 let p = self.operand(out)?.into_pointer_value();
@@ -14639,6 +14666,25 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.runtime(key), &[p.into()], "roview")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("run_output_stdout/stderr returns a {ptr,len}")
+            }
+            Rvalue::RunBytesCode { out } => {
+                let p = self.operand(out)?.into_pointer_value();
+                self.builder
+                    .build_call(self.runtime(RuntimeKey::RunBytesCode), &[p.into()], "rbcode")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("run_bytes_code returned no i64 value"))?
+            }
+            Rvalue::RunBytesView { out, err } => {
+                let p = self.operand(out)?.into_pointer_value();
+                let key = if *err { RuntimeKey::RunBytesStderr } else { RuntimeKey::RunBytesStdout };
+                self.builder
+                    .build_call(self.runtime(key), &[p.into()], "rbview")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("run_bytes stdout/stderr returned no {ptr,len} view"))?
             }
             // std.regex — compiled handle plus borrowed text. Compile/find write through explicit
             // out slots and return i32 status/present flags; MIR performs Result/Option branching.

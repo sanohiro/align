@@ -917,11 +917,11 @@ merely because its `Ty` matches.
 | `RunOutputCode` | `env[]; child[out]`; `RunOutput; result i64; borrowed; Pure`. |
 | `RunOutputStdout` | `env[]; child[out]`; `RunOutput; result Str; view inherits out provenance; Pure`. |
 | `RunOutputStderr` | `env[]; child[out]`; `RunOutput; result Str; view inherits out provenance; Pure`. |
-| `CommandMaxCapture` *(Request 11 reserved)* | `env[]; child[command,limit]`; `LocalHandle(Command,command),i64; result Unit; command native state mutated without source mut; Impure`. A negative runtime value is producer-valid HIR and aborts in the runtime before allocation/fork; malformed stored child/result types reject before lowering. |
-| `CommandRunBytes` *(Request 11 reserved)* | `env[]; child[command]`; `LocalHandle(Command,command); result ERR(RunBytes); command borrowed, result newly owned; Impure`. |
-| `RunBytesCode` *(Request 11 reserved)* | `env[]; child[out]`; `LocalHandle(RunBytes,out); result i64; borrowed; Pure`. |
-| `RunBytesStdout` *(Request 11 reserved)* | `env[]; child[out]`; `LocalHandle(RunBytes,out); result bytes; view inherits out provenance; Pure`. |
-| `RunBytesStderr` *(Request 11 reserved)* | `env[]; child[out]`; `LocalHandle(RunBytes,out); result bytes; view inherits out provenance; Pure`. |
+| `CommandMaxCapture` *(Request 11)* | `env[]; child[command,limit]`; `LocalHandle(Command,command),i64; result Unit; command native state mutated without source mut; Impure`. A negative runtime value is producer-valid HIR and aborts in the runtime before allocation/fork; malformed stored child/result types reject before lowering. |
+| `CommandRunBytes` *(Request 11)* | `env[]; child[command]`; `LocalHandle(Command,command); result ERR(RunBytes); command borrowed, result newly owned; Impure`. |
+| `RunBytesCode` *(Request 11)* | `env[]; child[out]`; `LocalHandle(RunBytes,out); result i64; borrowed; Pure`. |
+| `RunBytesStdout` *(Request 11)* | `env[]; child[out]`; `LocalHandle(RunBytes,out); result bytes; view inherits out provenance; Pure`. |
+| `RunBytesStderr` *(Request 11)* | `env[]; child[out]`; `LocalHandle(RunBytes,out); result bytes; view inherits out provenance; Pure`. |
 | `EncodingEncode` | `env[kind]`; `child[data]`; `byte-view; result String; fresh owned output; Pure`. |
 | `EncodingDecode` | `env[kind]`; `child[input]`; `Str; result ERR(Buffer); fresh owned output on success; Pure`. |
 | `Utf8Valid` | `env[]; child[data]`; `bytes; result Bool; borrowed; Pure`. |
@@ -1030,10 +1030,9 @@ this authoritative boundary instead of relying on the older scalar/string valida
 
 ### Request 11 process-capture activation delta
 
-The five reserved expression rows above are normative for the bounded-capture implementation but do
-not describe the current Rust enum until that capability lands. The capability activates all five
-together with `Ty::RunBytes` / `Scalar::RunBytes`; there is no mergeable producer-only intermediate.
-The current 240-variant inventory becomes 245, and `variant_sweep_tripwire` must fail at compile time
+The five Request 11 expression rows above activated together with `Ty::RunBytes` /
+`Scalar::RunBytes`; there is no producer-only intermediate. The `ExprKind` inventory is 257, and
+`variant_sweep_tripwire` must fail at compile time
 if any of those five variants is absent from validation or ownership analysis.
 
 | Cell | Exact closure | Owner evidence |
@@ -1048,15 +1047,14 @@ if any of those five variants is absent from validation or ownership analysis.
 
 The implementation must derive an exhaustiveness constant from the Rust enum
 definitions and assert that this file has exactly one owner id for every
-`Stmt`, all 240 `ExprKind` variants, `ArithMode`, `MathFn`, every
+`Stmt`, all 257 `ExprKind` variants, `ArithMode`, `MathFn`, every
 `BuilderWriteKind`, `StrPredKind`, `StrTrimKind`, `TemplatePart`, `StageKind`,
 `GroupSource`, `GroupAgg1`, `GroupOp`, `CliFlagKind`, `EncodingKind`, `CompressKind`,
 `PathComponentKind`, `AeadCipher`, `AeadDir`, and `HashAlgo`. The test fails on
 an added, removed, duplicated, or unowned discriminator.
 
-Request 11 changes the asserted `ExprKind` total from 240 to 245 in the same commit that activates
-its five reserved rows. Until then the current 240 count remains exact; documentation alone must not
-pretend the Rust inventory has already grown.
+Request 11 changed the asserted `ExprKind` total from 252 to 257 in the same commit that activated
+its five rows.
 
 ## Producer-delegation closure matrix
 

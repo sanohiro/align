@@ -383,7 +383,8 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             | Scalar::HttpRequestCtx
             | Scalar::ResponseBuilder
             | Scalar::HttpStream
-            | Scalar::RunOutput => left == right,
+            | Scalar::RunOutput
+            | Scalar::RunBytes => left == right,
         }
     }
 
@@ -518,6 +519,7 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             | Ty::Child
             | Ty::Command
             | Ty::RunOutput
+            | Ty::RunBytes
             | Ty::HttpRequest
             | Ty::HttpResponse
             | Ty::HttpClient

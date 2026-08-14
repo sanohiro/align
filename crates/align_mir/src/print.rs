@@ -722,12 +722,18 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::Command { cmd, args } => format!("command({}, {})", operand_str(cmd), operand_str(args)),
         Rvalue::CommandCwd { command, dir } => format!("command_cwd({}, {})", operand_str(command), operand_str(dir)),
         Rvalue::CommandTimeout { command, ns } => format!("command_timeout({}, {})", operand_str(command), operand_str(ns)),
+        Rvalue::CommandMaxCapture { command, limit } => format!("command_max_capture({}, {})", operand_str(command), operand_str(limit)),
         Rvalue::CommandEnv { command, name, value } => format!("command_env({}, {}, {})", operand_str(command), operand_str(name), operand_str(value)),
         Rvalue::CommandEnvClear { command } => format!("command_env_clear({})", operand_str(command)),
         Rvalue::CommandRun { command, out } => format!("command_run({}, -> _{out})", operand_str(command)),
+        Rvalue::CommandRunBytes { command, out } => format!("command_run_bytes({}, -> _{out})", operand_str(command)),
         Rvalue::RunOutputCode { out } => format!("run_output_code({})", operand_str(out)),
         Rvalue::RunOutputView { out, err } => {
             format!("run_output_{}({})", if *err { "stderr" } else { "stdout" }, operand_str(out))
+        }
+        Rvalue::RunBytesCode { out } => format!("run_bytes_code({})", operand_str(out)),
+        Rvalue::RunBytesView { out, err } => {
+            format!("run_bytes_{}({})", if *err { "stderr" } else { "stdout" }, operand_str(out))
         }
         Rvalue::FsReadFileView { path, arena, out } => {
             format!("fs_read_file_view({}, {}, -> _{out})", operand_str(path), operand_str(arena))

@@ -949,6 +949,9 @@ impl<'a> PlacementValidator<'a> {
             let abstract_node = self.is_abstract(Node::Enum(id as u32));
             for variant in &definition.variants {
                 for &payload in &variant.payload {
+                    if self.scalar_contains_run_bytes(payload) {
+                        return false;
+                    }
                     let valid = if abstract_node {
                         self.scalar_ok(payload, ScalarPlacement::Payload { allow_param: true })
                     } else {
@@ -985,9 +988,14 @@ impl<'a> PlacementValidator<'a> {
                 allow_param: self.is_abstract(Node::Tagged(id as u32)),
             };
             let valid = match *entry {
-                hir::TaggedType::Option(payload) => self.scalar_ok(payload, mode),
+                hir::TaggedType::Option(payload) => {
+                    !self.scalar_contains_run_bytes(payload) && self.scalar_ok(payload, mode)
+                }
                 hir::TaggedType::Result(ok, err) => {
-                    self.scalar_ok(ok, mode) && self.scalar_ok(err, mode)
+                    (ok == Scalar::RunBytes || !self.scalar_contains_run_bytes(ok))
+                        && !self.scalar_contains_run_bytes(err)
+                        && self.scalar_ok(ok, mode)
+                        && self.scalar_ok(err, mode)
                 }
             };
             if !valid {
@@ -1057,6 +1065,7 @@ impl<'a> PlacementValidator<'a> {
 
     fn field_type_ok(&self, ty: Ty, allow_param: bool) -> bool {
         match ty {
+            Ty::RunBytes => false,
             Ty::Param(_) => allow_param,
             Ty::Int(integer) => valid_int(integer.bits),
             Ty::Float(float) => valid_float(float.bits),
@@ -1213,6 +1222,30 @@ impl<'a> PlacementValidator<'a> {
         true
     }
 
+    fn scalar_contains_run_bytes(&self, initial: Scalar) -> bool {
+        let mut work = vec![initial];
+        let mut seen = HashSet::new();
+        while let Some(scalar) = work.pop() {
+            match scalar {
+                Scalar::RunBytes => return true,
+                Scalar::Tagged(id) if seen.insert(id) => {
+                    let Some(tagged) = self.program.tagged_types.get(id as usize) else {
+                        continue;
+                    };
+                    match *tagged {
+                        hir::TaggedType::Option(payload) => work.push(payload),
+                        hir::TaggedType::Result(ok, err) => {
+                            work.push(err);
+                            work.push(ok);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
     fn scalar_leaf_ok(&self, scalar: Scalar, mode: ScalarPlacement) -> bool {
         match scalar {
             Scalar::Int(integer) => valid_int(integer.bits),
@@ -1263,6 +1296,7 @@ impl<'a> PlacementValidator<'a> {
             | Scalar::HttpStream
             | Scalar::ResponseBuilder
             | Scalar::RunOutput => !matches!(mode, ScalarPlacement::Collection),
+            Scalar::RunBytes => !matches!(mode, ScalarPlacement::Collection),
             Scalar::File => !matches!(mode, ScalarPlacement::Collection),
             Scalar::Bool
             | Scalar::Char
@@ -1312,7 +1346,8 @@ impl<'a> PlacementValidator<'a> {
                     )
             }
             Scalar::Tagged(id) => {
-                self.tagged_payload_ok(id, ScalarPlacement::Payload { allow_param: false })
+                !self.scalar_contains_run_bytes(Scalar::Tagged(id))
+                    && self.tagged_payload_ok(id, ScalarPlacement::Payload { allow_param: false })
             }
             _ => false,
         }
@@ -1325,13 +1360,32 @@ impl<'a> PlacementValidator<'a> {
             Ty::Float(float) => valid_float(float.bits),
             Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Unit | Ty::Raw | Ty::ArenaHandle => true,
             Ty::Option(payload) => {
-                self.scalar_ok(payload, ScalarPlacement::Payload { allow_param })
+                !self.scalar_contains_run_bytes(payload)
+                    && self.scalar_ok(payload, ScalarPlacement::Payload { allow_param })
             }
             Ty::Result(ok, err) => {
-                self.scalar_ok(ok, ScalarPlacement::Payload { allow_param })
+                (ok == Scalar::RunBytes || !self.scalar_contains_run_bytes(ok))
+                    && !self.scalar_contains_run_bytes(err)
+                    && self.scalar_ok(ok, ScalarPlacement::Payload { allow_param })
                     && self.scalar_ok(err, ScalarPlacement::Payload { allow_param })
             }
-            Ty::Tagged(id) => self.tagged_payload_ok(id, ScalarPlacement::Payload { allow_param }),
+            Ty::Tagged(id) => {
+                let Some(tagged) = self.program.tagged_types.get(id as usize) else {
+                    return false;
+                };
+                match *tagged {
+                    hir::TaggedType::Option(payload) => {
+                        !self.scalar_contains_run_bytes(payload)
+                            && self.scalar_ok(payload, ScalarPlacement::Payload { allow_param })
+                    }
+                    hir::TaggedType::Result(ok, err) => {
+                        (ok == Scalar::RunBytes || !self.scalar_contains_run_bytes(ok))
+                            && !self.scalar_contains_run_bytes(err)
+                            && self.scalar_ok(ok, ScalarPlacement::Payload { allow_param })
+                            && self.scalar_ok(err, ScalarPlacement::Payload { allow_param })
+                    }
+                }
+            }
             // `scalar_arg` always resolves a box payload with `allow_param=false`, even while
             // validating an abstract generic template. A `box<Param>` HIR node is therefore
             // graph-valid but never producer-valid.
@@ -1394,6 +1448,7 @@ impl<'a> PlacementValidator<'a> {
             | Ty::HttpServer
             | Ty::Command
             | Ty::RunOutput => false,
+            Ty::RunBytes => true,
             Ty::CliCommand => false,
             _ if align_sema::is_move_handle(ty) => true,
             Ty::Rng | Ty::HttpHeaders | Ty::JsonDoc => true,
@@ -1865,6 +1920,7 @@ impl<'a> Validator<'a> {
             | Ty::Child
             | Ty::Command
             | Ty::RunOutput
+            | Ty::RunBytes
             | Ty::HttpRequest
             | Ty::HttpResponse
             | Ty::HttpClient
@@ -1925,6 +1981,7 @@ impl<'a> Validator<'a> {
             | Scalar::ResponseBuilder
             | Scalar::HttpStream
             | Scalar::RunOutput => true,
+            Scalar::RunBytes => true,
         }
     }
 
@@ -2880,6 +2937,7 @@ impl<'a> BodyValidator<'a> {
             | Ty::Child
             | Ty::Command
             | Ty::RunOutput
+            | Ty::RunBytes
             | Ty::HttpRequest
             | Ty::HttpResponse
             | Ty::HttpClient
@@ -3188,6 +3246,7 @@ impl<'a> BodyValidator<'a> {
             | Scalar::ResponseBuilder
             | Scalar::HttpStream
             | Scalar::RunOutput => true,
+            Scalar::RunBytes => true,
             Scalar::Param(_) | Scalar::SoaParam(_) => false,
         }
     }
@@ -3843,12 +3902,17 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::ProcessCommand { .. }
             | hir::ExprKind::CommandCwd { .. }
             | hir::ExprKind::CommandTimeout { .. }
+            | hir::ExprKind::CommandMaxCapture { .. }
             | hir::ExprKind::CommandEnv { .. }
             | hir::ExprKind::CommandEnvClear { .. }
             | hir::ExprKind::CommandRun { .. }
+            | hir::ExprKind::CommandRunBytes { .. }
             | hir::ExprKind::RunOutputCode { .. }
             | hir::ExprKind::RunOutputStdout { .. }
             | hir::ExprKind::RunOutputStderr { .. }
+            | hir::ExprKind::RunBytesCode { .. }
+            | hir::ExprKind::RunBytesStdout { .. }
+            | hir::ExprKind::RunBytesStderr { .. }
             | hir::ExprKind::EncodingEncode { .. }
             | hir::ExprKind::EncodingDecode { .. }
             | hir::ExprKind::Utf8Valid { .. }
@@ -4150,12 +4214,17 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::ProcessCommand { .. }
             | hir::ExprKind::CommandCwd { .. }
             | hir::ExprKind::CommandTimeout { .. }
+            | hir::ExprKind::CommandMaxCapture { .. }
             | hir::ExprKind::CommandEnv { .. }
             | hir::ExprKind::CommandEnvClear { .. }
             | hir::ExprKind::CommandRun { .. }
+            | hir::ExprKind::CommandRunBytes { .. }
             | hir::ExprKind::RunOutputCode { .. }
             | hir::ExprKind::RunOutputStdout { .. }
             | hir::ExprKind::RunOutputStderr { .. }
+            | hir::ExprKind::RunBytesCode { .. }
+            | hir::ExprKind::RunBytesStdout { .. }
+            | hir::ExprKind::RunBytesStderr { .. }
             | hir::ExprKind::Utf8Valid { .. }
             | hir::ExprKind::RandSeed
             | hir::ExprKind::RandSeedWith { .. }
@@ -7798,6 +7867,14 @@ impl<'a> BodyValidator<'a> {
                 (local(command, Ty::Command) && command.ty == Ty::Command && ns.ty == i64)
                     .then(|| strict(Ty::Unit, &[command, ns]))?
             }
+            hir::ExprKind::CommandMaxCapture { command, limit } => {
+                let flows = self.native_children(&[command, limit])?;
+                if !local(command, Ty::Command) || command.ty != Ty::Command || limit.ty != i64 {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&flows);
+                Some((Ty::Unit, falls, breaks))
+            }
             hir::ExprKind::CommandEnv {
                 command,
                 name,
@@ -7817,6 +7894,14 @@ impl<'a> BodyValidator<'a> {
                 (local(command, Ty::Command) && command.ty == Ty::Command)
                     .then(|| result(Ty::RunOutput, &[command]))?
             }
+            hir::ExprKind::CommandRunBytes { command } => {
+                let flows = self.native_children(&[command])?;
+                if !local(command, Ty::Command) || command.ty != Ty::Command {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&flows);
+                Some((self.native_result_ty(Ty::RunBytes)?, falls, breaks))
+            }
             hir::ExprKind::RunOutputCode { out } => {
                 (local(out, Ty::RunOutput) && out.ty == Ty::RunOutput)
                     .then(|| strict(i64, &[out]))?
@@ -7824,6 +7909,22 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::RunOutputStdout { out } | hir::ExprKind::RunOutputStderr { out } => {
                 (local(out, Ty::RunOutput) && out.ty == Ty::RunOutput)
                     .then(|| strict(Ty::Str, &[out]))?
+            }
+            hir::ExprKind::RunBytesCode { out } => {
+                let flows = self.native_children(&[out])?;
+                if !local(out, Ty::RunBytes) || out.ty != Ty::RunBytes {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&flows);
+                Some((i64, falls, breaks))
+            }
+            hir::ExprKind::RunBytesStdout { out } | hir::ExprKind::RunBytesStderr { out } => {
+                let flows = self.native_children(&[out])?;
+                if !local(out, Ty::RunBytes) || out.ty != Ty::RunBytes {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&flows);
+                Some((Ty::Slice(u8_scalar), falls, breaks))
             }
             hir::ExprKind::EncodingEncode { data, .. } => {
                 (byte_view(data.ty)).then(|| strict(Ty::String, &[data]))?
@@ -8248,6 +8349,7 @@ impl<'a> BodyValidator<'a> {
             | Ty::Child
             | Ty::Command
             | Ty::RunOutput
+            | Ty::RunBytes
             | Ty::HttpRequest
             | Ty::HttpResponse
             | Ty::HttpClient

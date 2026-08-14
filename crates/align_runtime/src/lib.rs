@@ -792,7 +792,7 @@ unsafe fn connect_with_deadline(fd: i32, addr: *const u8, addrlen: u32, timeout_
     // `as u64` cast is exact.
     let deadline = std::time::Instant::now().checked_add(std::time::Duration::from_nanos(timeout_ns as u64));
     // Arm non-blocking so `connect` returns immediately (`EINPROGRESS`) and the `poll` owns the wait.
-    unsafe { set_nonblocking(fd) };
+    let _ = unsafe { set_nonblocking(fd) };
     let rc = unsafe { connect(fd, addr, addrlen) };
     if rc == 0 {
         // Rare: an immediate connect (e.g. a loopback peer already listening). Restore blocking.
@@ -11508,6 +11508,9 @@ pub struct Command {
     /// `align_rt_command_run`: past the deadline it `SIGKILL`s the child and returns [`AL_TIMEOUT`].
     /// Never negative (the setter aborts a negative `ns`).
     timeout_ns: i64,
+    /// Per-stream capture limit in bytes. `None` preserves the original unbounded behavior;
+    /// `Some(0)` is distinct and accepts only empty stdout/stderr.
+    max_capture_bytes: Option<i64>,
     /// Environment-variable overrides applied to the child before `execvp` (Slice 6), each a
     /// `(name, value)` NUL-terminated C-string pair recorded by [`align_rt_command_env`]. The child
     /// `setenv(name, value, 1)`s each pair in order (a later pair for the same name wins — overwrite=1),
@@ -11524,6 +11527,14 @@ pub struct Command {
 /// [`align_rt_run_output_stdout`] / [`align_rt_run_output_stderr`] can never expose non-UTF-8 bytes.
 /// Freed by [`align_rt_run_output_free`].
 pub struct RunOutput {
+    code: i64,
+    out: Vec<u8>,
+    err: Vec<u8>,
+}
+
+/// A `run_bytes` handle: the binary-output sibling of [`RunOutput`]. The buffers are not UTF-8
+/// validated and its accessors expose byte slices rather than strings.
+pub struct RunBytes {
     code: i64,
     out: Vec<u8>,
     err: Vec<u8>,
@@ -11562,22 +11573,196 @@ unsafe fn make_pipe_cloexec() -> Result<[i32; 2], i32> {
     Ok(fds)
 }
 
-/// Set `O_NONBLOCK` on `fd` (best-effort). [`drain_two_pipes`] reads each ready fd in a loop until it
+/// Set `O_NONBLOCK` on `fd`. The capture engine reads each ready fd in a loop until it
 /// would block (`EAGAIN`), which **requires** `O_NONBLOCK`: without it, that inner `read` blocks after
 /// the last available byte instead of returning to `poll`, and while blocked on one fd a full pipe on
 /// the *other* fd stalls the child — the exact two-pipe deadlock (P7) the concurrent drain exists to
-/// prevent. A failed `fcntl` is therefore a genuine (not merely cosmetic) risk; it is left best-effort
-/// only because `F_SETFL` on a freshly-created pipe fd does not fail in practice (no `EBADF`/`EINVAL`
-/// is reachable here). If that assumption is ever wrong on some platform, this must become a hard
-/// error that fails the run rather than risk the deadlock.
+/// prevent. A failed `F_GETFL` or `F_SETFL` is therefore a hard pre-fork capture setup error. Socket
+/// callers that retain their historical best-effort mode explicitly ignore the returned error.
 ///
 /// # Safety
 /// `fd` must be a valid open descriptor.
-unsafe fn set_nonblocking(fd: i32) {
+unsafe fn set_nonblocking(fd: i32) -> Result<(), i32> {
     let flags = unsafe { fcntl(fd, F_GETFL, 0) };
-    if flags >= 0 {
-        unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) };
+    if flags < 0 {
+        return Err(io_error_to_status(&std::io::Error::last_os_error()));
     }
+    if unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) } < 0 {
+        return Err(io_error_to_status(&std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureFailpoint {
+    None,
+    AllocFirst,
+    AllocSecond,
+    AllocShell,
+    FcntlGetStdout,
+    FcntlSetStdout,
+    FcntlGetStderr,
+    FcntlSetStderr,
+    Poll,
+    PollAfterDeadline,
+    PollNval,
+    ReadStdout,
+    ReadStderr,
+    ReadBoth,
+    Wait,
+    WaitEchild,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static CAPTURE_FAILPOINT: core::cell::Cell<CaptureFailpoint> = const { core::cell::Cell::new(CaptureFailpoint::None) };
+    static CAPTURE_FORK_COUNT: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static CAPTURE_LAST_PID: core::cell::Cell<i32> = const { core::cell::Cell::new(-1) };
+    static CAPTURE_LAST_FDS: core::cell::Cell<(i32, i32)> = const { core::cell::Cell::new((-1, -1)) };
+    static CAPTURE_CLOSE_MASK: core::cell::Cell<u8> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn capture_failpoint_take(expected: CaptureFailpoint) -> bool {
+    CAPTURE_FAILPOINT.with(|slot| {
+        if slot.get() == expected {
+            slot.set(CaptureFailpoint::None);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(test)]
+fn set_capture_failpoint(failpoint: CaptureFailpoint) {
+    CAPTURE_FAILPOINT.with(|slot| slot.set(failpoint));
+    CAPTURE_FORK_COUNT.with(|count| count.set(0));
+    CAPTURE_LAST_PID.with(|pid| pid.set(-1));
+    CAPTURE_LAST_FDS.with(|fds| fds.set((-1, -1)));
+    CAPTURE_CLOSE_MASK.with(|mask| mask.set(0));
+}
+
+#[cfg(test)]
+fn capture_allocation_checkpoint(expected: CaptureFailpoint) {
+    if capture_failpoint_take(expected) {
+        panic_abort("test-only process capture allocation failure");
+    }
+}
+
+unsafe fn set_capture_nonblocking(fd: i32, stdout: bool) -> Result<(), i32> {
+    #[cfg(not(test))]
+    let _ = stdout;
+    #[cfg(test)]
+    {
+        let get = if stdout {
+            CaptureFailpoint::FcntlGetStdout
+        } else {
+            CaptureFailpoint::FcntlGetStderr
+        };
+        if capture_failpoint_take(get) {
+            return Err(io_error_to_status(&std::io::Error::from_raw_os_error(5)));
+        }
+    }
+    let flags = unsafe { fcntl(fd, F_GETFL, 0) };
+    if flags < 0 {
+        return Err(io_error_to_status(&std::io::Error::last_os_error()));
+    }
+    #[cfg(test)]
+    {
+        let set = if stdout {
+            CaptureFailpoint::FcntlSetStdout
+        } else {
+            CaptureFailpoint::FcntlSetStderr
+        };
+        if capture_failpoint_take(set) {
+            return Err(io_error_to_status(&std::io::Error::from_raw_os_error(5)));
+        }
+    }
+    if unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) } < 0 {
+        return Err(io_error_to_status(&std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+unsafe fn capture_poll(
+    fds: *mut PollFd,
+    count: usize,
+    timeout: i32,
+) -> Result<i32, std::io::Error> {
+    #[cfg(test)]
+    {
+        if capture_failpoint_take(CaptureFailpoint::PollAfterDeadline) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            return Err(std::io::Error::from_raw_os_error(5));
+        }
+        if capture_failpoint_take(CaptureFailpoint::Poll) {
+            return Err(std::io::Error::from_raw_os_error(5));
+        }
+        if count != 0 && capture_failpoint_take(CaptureFailpoint::PollNval) {
+            unsafe { (*fds).revents = POLLNVAL };
+            return Ok(1);
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    let count = core::ffi::c_ulong::try_from(count)
+        .map_err(|_| std::io::Error::from_raw_os_error(22))?;
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let count = core::ffi::c_uint::try_from(count)
+        .map_err(|_| std::io::Error::from_raw_os_error(22))?;
+    let rc = unsafe { poll(fds, count, timeout) };
+    if rc < 0 { Err(std::io::Error::last_os_error()) } else { Ok(rc) }
+}
+
+unsafe fn capture_read(fd: i32, index: usize, bytes: &mut [u8]) -> Result<isize, std::io::Error> {
+    #[cfg(not(test))]
+    let _ = index;
+    #[cfg(test)]
+    {
+        let selected = match index {
+            0 => CaptureFailpoint::ReadStdout,
+            _ => CaptureFailpoint::ReadStderr,
+        };
+        if capture_failpoint_take(selected) {
+            return Err(std::io::Error::from_raw_os_error(5));
+        }
+        if CAPTURE_FAILPOINT.with(|slot| slot.get() == CaptureFailpoint::ReadBoth) {
+            if index == 0 {
+                CAPTURE_FAILPOINT.with(|slot| slot.set(CaptureFailpoint::None));
+                return Err(std::io::Error::from_raw_os_error(5));
+            }
+            return Err(std::io::Error::from_raw_os_error(1));
+        }
+    }
+    let rc = unsafe { read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+    if rc < 0 { Err(std::io::Error::last_os_error()) } else { Ok(rc) }
+}
+
+unsafe fn capture_waitpid(pid: i32, raw: &mut i32, options: i32) -> Result<i32, std::io::Error> {
+    #[cfg(test)]
+    if capture_failpoint_take(CaptureFailpoint::Wait) {
+        return Err(std::io::Error::from_raw_os_error(5));
+    }
+    #[cfg(test)]
+    if capture_failpoint_take(CaptureFailpoint::WaitEchild) {
+        // Model a competing reaper faithfully: terminate and consume the direct child before
+        // reporting ECHILD, so the terminal path can prove that it neither leaks nor signals a
+        // potentially recycled pid.
+        unsafe { kill(pid, 9) };
+        loop {
+            let rc = unsafe { waitpid(pid, raw, 0) };
+            if rc == pid {
+                break;
+            }
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                break;
+            }
+        }
+        return Err(std::io::Error::from_raw_os_error(10));
+    }
+    let rc = unsafe { waitpid(pid, raw, options) };
+    if rc < 0 { Err(std::io::Error::last_os_error()) } else { Ok(rc) }
 }
 
 /// Clear `O_NONBLOCK` on `fd` (restore blocking mode). The connect-timeout substrate sets the socket
@@ -11608,138 +11793,366 @@ fn poll_timeout_ms(remaining: std::time::Duration) -> Option<i32> {
     Some(ms.clamp(1, i32::MAX as u128) as i32)
 }
 
-/// Drain BOTH capture pipes concurrently until each reaches EOF (P7 — the two-pipe deadlock is the
-/// #1 correctness point). `poll`s whichever read fds are still open, then reads all currently
-/// available bytes from each ready fd into its buffer. Both fds are non-blocking, so a `read` that
-/// would block returns `EAGAIN`/`EWOULDBLOCK` and we return to `poll`. `EINTR` is retried on both
-/// `poll` and `read` (the deadline is recomputed on retry). A `read` of `0` (EOF) or a hard error
-/// closes that side; the loop ends when both sides are closed. Never panics; allocates only into the
-/// caller's buffers.
-///
-/// When `deadline` is `Some`, each `poll` waits only until that instant; on expiry the drain STOPS
-/// and returns `true` (timed out) with whatever was captured so far — the caller then `SIGKILL`s the
-/// child and drains again (with `deadline = None`) to EOF (P8). `None` = drain to EOF with no bound
-/// (the Slice-4 behavior — an infinite `-1` `poll`). Returns `true` iff it stopped on the deadline.
-///
-/// # Safety
-/// `fd_out` / `fd_err` must be valid, open, non-blocking read descriptors.
-unsafe fn drain_two_pipes(
-    fd_out: i32,
-    fd_err: i32,
-    out: &mut Vec<u8>,
-    err: &mut Vec<u8>,
-    deadline: Option<std::time::Instant>,
-) -> bool {
-    let mut out_open = true;
-    let mut err_open = true;
-    let mut chunk = [0u8; 65536];
-    // A single `read` loop for one ready fd: drain until `EAGAIN`/EOF/error. Returns `false` when the
-    // fd hit EOF or a hard error (the side is now closed).
-    // (Inlined below rather than a closure to keep the borrow of the target `Vec` local per call.)
-    while out_open || err_open {
-        let mut fds: Vec<PollFd> = Vec::with_capacity(2);
-        if out_open {
-            fds.push(PollFd { fd: fd_out, events: POLLIN, revents: 0 });
+/// Capture storage selected before pipe creation. The bounded form owns one exact uninitialized
+/// allocation and never grows; the unbounded form preserves the shipped `Vec` behavior.
+enum CommandCaptureBuffer {
+    Unbounded(Vec<u8>),
+    Bounded { bytes: Box<[core::mem::MaybeUninit<u8>]>, len: usize },
+}
+
+impl CommandCaptureBuffer {
+    fn new(limit: Option<usize>) -> Self {
+        match limit {
+            Some(0) => Self::Bounded { bytes: Box::new([]), len: 0 },
+            Some(n) => Self::Bounded { bytes: Box::<[u8]>::new_uninit_slice(n), len: 0 },
+            None => Self::Unbounded(Vec::new()),
         }
-        if err_open {
-            fds.push(PollFd { fd: fd_err, events: POLLIN, revents: 0 });
+    }
+
+    /// Append one complete read chunk. `false` means the chunk would cross the per-stream bound;
+    /// no prefix is retained, so the overflow result is deterministic and never truncates.
+    fn append(&mut self, chunk: &[u8]) -> bool {
+        match self {
+            Self::Unbounded(bytes) => {
+                bytes.extend_from_slice(chunk);
+                true
+            }
+            Self::Bounded { bytes, len } => {
+                let Some(end) = len.checked_add(chunk.len()) else { return false };
+                if end > bytes.len() {
+                    return false;
+                }
+                // SAFETY: `end <= bytes.len()` and the source is a disjoint stack scratch slice.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(chunk.as_ptr(), bytes.as_mut_ptr().add(*len).cast::<u8>(), chunk.len());
+                }
+                *len = end;
+                true
+            }
         }
-        if fds.is_empty() {
-            break;
+    }
+
+    fn into_vec(self) -> Vec<u8> {
+        match self {
+            Self::Unbounded(bytes) => bytes,
+            Self::Bounded { mut bytes, len } => {
+                if bytes.is_empty() {
+                    return Vec::new();
+                }
+                let cap = bytes.len();
+                let ptr = bytes.as_mut_ptr().cast::<u8>();
+                core::mem::forget(bytes);
+                // SAFETY: the boxed slice and Vec use the global allocator and the first `len`
+                // bytes were initialized by `append`; `cap` is the exact original allocation.
+                unsafe { Vec::from_raw_parts(ptr, len, cap) }
+            }
         }
-        // Compute this iteration's `poll` timeout from the deadline (recomputed each loop / EINTR
-        // retry). A passed deadline → stop now, reporting the timeout.
-        let timeout_ms = match deadline {
+    }
+}
+
+fn command_capture_limit(cmd: &Command) -> Result<Option<usize>, i32> {
+    let Some(limit) = cmd.max_capture_bytes else { return Ok(None) };
+    let Ok(limit) = usize::try_from(limit) else { return Err(AL_INVALID) };
+    if std::alloc::Layout::array::<u8>(limit).is_err() {
+        return Err(AL_INVALID);
+    }
+    Ok(Some(limit))
+}
+
+/// Close an fd when still open and mark the slot closed.
+unsafe fn close_capture_fd(fd: &mut i32) {
+    if *fd >= 0 {
+        #[cfg(test)]
+        CAPTURE_LAST_FDS.with(|last| {
+            let (out, err) = last.get();
+            CAPTURE_CLOSE_MASK.with(|mask| {
+                let bit = if *fd == out { 1 } else if *fd == err { 2 } else { 0 };
+                mask.set(mask.get() | bit);
+            });
+        });
+        unsafe { close(*fd) };
+        *fd = -1;
+    }
+}
+
+/// Reap the direct child, retrying EINTR. ECHILD means another checkpoint already reaped it.
+unsafe fn reap_capture_child(pid: i32, already_reaped: bool) {
+    if already_reaped {
+        return;
+    }
+    let mut raw = 0i32;
+    loop {
+        let rc = unsafe { waitpid(pid, &mut raw, 0) };
+        if rc == pid {
+            return;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.raw_os_error() == Some(10) {
+            return; // ECHILD: already reaped.
+        }
+        return;
+    }
+}
+
+/// Terminal capture cleanup. The winning status is chosen by the caller and is never overwritten by
+/// teardown errors. An owned group is signalled when present; the direct pid is always signalled and
+/// is the only process this caller reaps.
+unsafe fn fail_command_capture(
+    pid: i32,
+    use_pgroup: bool,
+    child_reaped: bool,
+    out_fd: &mut i32,
+    err_fd: &mut i32,
+) {
+    // Once waitpid has consumed the direct child (or ECHILD reports that somebody else did), its pid
+    // is no longer ours to signal and may already have been recycled. Both descriptors are already
+    // EOF in that state, so there is no descendant writer left for this capture to terminate.
+    if !child_reaped {
+        if use_pgroup {
+            unsafe { kill(-pid, 9) };
+        }
+        unsafe { kill(pid, 9) };
+    }
+    unsafe {
+        close_capture_fd(out_fd);
+        close_capture_fd(err_fd);
+        reap_capture_child(pid, child_reaped);
+    }
+}
+
+/// Shared parent capture/reap engine for `run` and `run_bytes`. All bounded storage is supplied by
+/// the caller and both read descriptors are nonblocking before fork, so the bounded parent path does
+/// no heap allocation after fork.
+unsafe fn run_command_capture(
+    cmd: &Command,
+    out_buf: &mut CommandCaptureBuffer,
+    err_buf: &mut CommandCaptureBuffer,
+) -> Result<i64, i32> {
+    let mut argv_ptrs: Vec<*const u8> = cmd.argv.iter().map(|a| a.as_ptr().cast()).collect();
+    argv_ptrs.push(core::ptr::null());
+    let cmd_ptr: *const u8 = cmd.cmd.as_ptr().cast();
+    let cwd_ptr: *const u8 = cmd.cwd.as_ref().map_or(core::ptr::null(), |d| d.as_ptr().cast());
+    let use_pgroup = cmd.timeout_ns > 0 || cmd.max_capture_bytes.is_some();
+
+    let out_pipe = unsafe { make_pipe_cloexec() }?;
+    let err_pipe = match unsafe { make_pipe_cloexec() } {
+        Ok(pipe) => pipe,
+        Err(status) => {
+            unsafe { close(out_pipe[0]); close(out_pipe[1]); }
+            return Err(status);
+        }
+    };
+    if let Err(status) = unsafe { set_capture_nonblocking(out_pipe[0], true) } {
+        unsafe { close(out_pipe[0]); close(out_pipe[1]); close(err_pipe[0]); close(err_pipe[1]); }
+        return Err(status);
+    }
+    if let Err(status) = unsafe { set_capture_nonblocking(err_pipe[0], false) } {
+        unsafe { close(out_pipe[0]); close(out_pipe[1]); close(err_pipe[0]); close(err_pipe[1]); }
+        return Err(status);
+    }
+
+    let pid = unsafe { fork() };
+    if pid < 0 {
+        let status = io_error_to_status(&std::io::Error::last_os_error());
+        unsafe { close(out_pipe[0]); close(out_pipe[1]); close(err_pipe[0]); close(err_pipe[1]); }
+        return Err(status);
+    }
+    if pid == 0 {
+        unsafe {
+            if use_pgroup { setpgid(0, 0); }
+            if !cwd_ptr.is_null() && chdir(cwd_ptr) != 0 { _exit(127); }
+            if cmd.env_clear { clearenv_portable(); }
+            for (name, value) in &cmd.env {
+                setenv(name.as_ptr().cast(), value.as_ptr().cast(), 1);
+            }
+            dup2(out_pipe[1], 1);
+            dup2(err_pipe[1], 2);
+            close(out_pipe[0]); close(out_pipe[1]); close(err_pipe[0]); close(err_pipe[1]);
+            execvp(cmd_ptr, argv_ptrs.as_ptr());
+            _exit(127);
+        }
+    }
+
+    #[cfg(test)]
+    {
+        CAPTURE_FORK_COUNT.with(|count| count.set(count.get() + 1));
+        CAPTURE_LAST_PID.with(|last| last.set(pid));
+        CAPTURE_LAST_FDS.with(|last| last.set((out_pipe[0], err_pipe[0])));
+    }
+
+    if use_pgroup {
+        unsafe { setpgid(pid, pid) };
+    }
+    unsafe { close(out_pipe[1]); close(err_pipe[1]); }
+    let mut out_fd = out_pipe[0];
+    let mut err_fd = err_pipe[0];
+    let deadline = if cmd.timeout_ns > 0 {
+        std::time::Instant::now().checked_add(std::time::Duration::from_nanos(cmd.timeout_ns as u64))
+    } else {
+        None
+    };
+    let mut child_reaped = false;
+    let mut raw_status = 0i32;
+    let mut scratch = [0u8; 65536];
+
+    loop {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+            return Err(AL_TIMEOUT);
+        }
+
+        // Do not reap while either pipe is still open. Keeping the direct child waitable prevents
+        // its pid from being recycled while a descendant still owns a pipe and a later timeout or
+        // hard I/O error must signal the direct pid. Once both streams reach EOF, untimed capture
+        // blocks and timed capture checkpoints with WNOHANG until the shared deadline.
+        if !child_reaped && out_fd < 0 && err_fd < 0 {
+            let wait_options = if deadline.is_none() { 0 } else { 1 }; // WNOHANG for timed EOF/live
+            let wait_result = unsafe { capture_waitpid(pid, &mut raw_status, wait_options) };
+            // Record consumption before a post-syscall deadline check. Otherwise a wait that reaps
+            // at the deadline boundary could send SIGKILL to a newly recycled pid during cleanup.
+            let wait_reaped = matches!(&wait_result, Ok(wait_rc) if *wait_rc == pid)
+                || matches!(&wait_result, Err(error) if error.raw_os_error() == Some(10));
+            if wait_reaped {
+                child_reaped = true;
+            }
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                return Err(AL_TIMEOUT);
+            }
+            match wait_result {
+                Ok(wait_rc) if wait_rc == pid => {}
+                Ok(_) => {}
+                Err(error) => {
+                    if error.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    // ECHILD records an already-consumed child but is still a hard wait failure: no
+                    // exit status is available, so it must never manufacture a partial code-0 success.
+                    let winning = io_error_to_status(&error);
+                    unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                    return Err(winning);
+                }
+            }
+        }
+
+        if out_fd < 0 && err_fd < 0 {
+            if child_reaped {
+                return Ok(decode_wait_status(raw_status));
+            }
+            // Timed EOF/live-child: allocation-free short sleep, then another deadline/WNOHANG
+            // checkpoint. Untimed EOF/live-child was handled by blocking waitpid above.
+            let Some(deadline) = deadline else {
+                // The untimed EOF/live state uses blocking waitpid above, so reaching this branch is
+                // an internal state mismatch. Fail closed through the ordinary terminal cleanup.
+                unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                return Err(AL_INVALID);
+            };
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let timeout = poll_timeout_ms(remaining).unwrap_or(1).min(1);
+            if let Err(error) = unsafe { capture_poll(core::ptr::null_mut(), 0, timeout) } {
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    let winning = io_error_to_status(&error);
+                    unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                    return Err(winning);
+                }
+            }
+            continue;
+        }
+
+        let mut fds = [
+            PollFd { fd: out_fd, events: POLLIN, revents: 0 },
+            PollFd { fd: err_fd, events: POLLIN, revents: 0 },
+        ];
+        let timeout = match deadline {
             Some(d) => match poll_timeout_ms(d.saturating_duration_since(std::time::Instant::now())) {
                 Some(ms) => ms,
-                None => return true, // deadline already reached
+                None => {
+                    unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                    return Err(AL_TIMEOUT);
+                }
             },
-            None => -1, // infinite (Slice-4 behavior)
+            None => -1,
         };
-        let rc = unsafe { poll(fds.as_mut_ptr(), fds.len() as _, timeout_ms) };
+        let poll_result = unsafe { capture_poll(fds.as_mut_ptr(), 2, timeout) };
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+            return Err(AL_TIMEOUT);
+        }
+        let rc = match poll_result {
+            Ok(rc) => rc,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                let winning = io_error_to_status(&error);
+                unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                return Err(winning);
+            }
+        };
         if rc == 0 {
-            // `poll` timed out. With a deadline set, that means we hit it (the clamp-to-1ms wait is
-            // always >= the true remaining, so a `0` return implies the instant has passed) — confirm
-            // and report the timeout. Without a deadline `poll(-1)` never returns 0, so this is
-            // unreachable there; treat a spurious 0 as "keep polling".
-            match deadline {
-                Some(d) if std::time::Instant::now() >= d => return true,
-                _ => continue,
-            }
+            continue; // deadline is checked at the top before any descriptor result is interpreted.
         }
-        if rc < 0 {
-            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue; // EINTR: re-poll (deadline recomputed at the top of the loop)
+
+        // Fixed stdout-then-stderr traversal owns deterministic simultaneous-error precedence.
+        for index in 0..2 {
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                return Err(AL_TIMEOUT);
             }
-            // An unexpected poll error (should not happen with valid pipe fds): stop draining rather
-            // than spin. The subsequent `waitpid` still reaps the child; captured-so-far bytes stand.
-            break;
-        }
-        // Any readiness (POLLIN) or hangup/error (POLLHUP/POLLERR/POLLNVAL) means "read now": a pipe
-        // reports POLLHUP once the write end is closed, and there may still be buffered bytes to read
-        // before EOF, so we drain on any revent and rely on `read == 0` to detect true EOF.
-        for pf in &fds {
-            if pf.revents == 0 {
+            let pf = fds[index];
+            if pf.fd < 0 || pf.revents == 0 {
                 continue;
             }
-            let is_out = pf.fd == fd_out;
+            if pf.revents & POLLNVAL != 0 {
+                let winning = io_error_to_status(&std::io::Error::from_raw_os_error(9)); // EBADF
+                unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                return Err(winning);
+            }
             loop {
-                let r = unsafe { read(pf.fd, chunk.as_mut_ptr() as *mut core::ffi::c_void, chunk.len()) };
-                if r > 0 {
-                    let n = r as usize;
-                    let slice = &chunk[..n];
-                    if is_out {
-                        out.extend_from_slice(slice);
-                    } else {
-                        err.extend_from_slice(slice);
-                    }
-                    continue; // keep reading until this fd would block or hits EOF
-                } else if r == 0 {
-                    // EOF: the child closed (or exited and the kernel closed) this write end.
-                    if is_out {
-                        out_open = false;
-                    } else {
-                        err_open = false;
-                    }
-                    break;
-                } else {
-                    let e = std::io::Error::last_os_error();
-                    match e.kind() {
-                        std::io::ErrorKind::Interrupted => continue, // EINTR: retry the read
-                        std::io::ErrorKind::WouldBlock => break,     // EAGAIN: nothing more right now
-                        _ => {
-                            // A hard read error: treat this side as closed (do not spin forever).
-                            if is_out {
-                                out_open = false;
-                            } else {
-                                err_open = false;
-                            }
-                            break;
+                if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                    unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                    return Err(AL_TIMEOUT);
+                }
+                let read_result = unsafe { capture_read(pf.fd, index, &mut scratch) };
+                if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                    unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                    return Err(AL_TIMEOUT);
+                }
+                match read_result {
+                    Ok(n) if n > 0 => {
+                        let Ok(read_len) = usize::try_from(n) else {
+                            unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                            return Err(AL_INVALID);
+                        };
+                        let bytes = &scratch[..read_len];
+                        let accepted = if index == 0 { out_buf.append(bytes) } else { err_buf.append(bytes) };
+                        if !accepted {
+                            unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                            return Err(AL_INVALID);
                         }
+                    }
+                    Ok(0) => {
+                        if index == 0 { unsafe { close_capture_fd(&mut out_fd) } } else { unsafe { close_capture_fd(&mut err_fd) } }
+                        break;
+                    }
+                    Err(error) => match error.kind() {
+                        std::io::ErrorKind::Interrupted => continue,
+                        std::io::ErrorKind::WouldBlock => break,
+                        _ => {
+                            let winning = io_error_to_status(&error);
+                            unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                            return Err(winning);
+                        }
+                    },
+                    Ok(_) => {
+                        unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                        return Err(AL_INVALID);
                     }
                 }
             }
         }
     }
-    false // both sides reached EOF (or a hard error / unexpected poll error) — not a timeout
-}
-
-/// Blocking `waitpid` reap of `pid`, retrying `EINTR`, so the child cannot become a zombie. Returns
-/// the raw wait status (feed to [`decode_wait_status`]). Shared by the normal and timeout paths of
-/// [`align_rt_command_run`].
-///
-/// # Safety
-/// `pid` must be a child of this process that has not yet been reaped.
-unsafe fn reap_child_blocking(pid: i32) -> i32 {
-    let mut status: i32 = 0;
-    loop {
-        let r = unsafe { waitpid(pid, &mut status, 0) };
-        if r < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-            continue;
-        }
-        break;
-    }
-    status
 }
 
 /// `process.command(cmd, args)` — build a `Command` Move handle. `cmd` is the `str` lookup path
@@ -11768,7 +12181,15 @@ pub unsafe extern "C" fn align_rt_command_new(
         // A bad argv cannot be reported (the surface has no `Result`) — abort, like a header injection.
         Err(_) => panic_abort("process.command: invalid command/argv (empty, interior NUL, or non-UTF-8)"),
     };
-    Box::into_raw(Box::new(Command { cmd: cmd_c, argv: argv_owned, cwd: None, timeout_ns: 0, env: Vec::new(), env_clear: false }))
+    Box::into_raw(Box::new(Command {
+        cmd: cmd_c,
+        argv: argv_owned,
+        cwd: None,
+        timeout_ns: 0,
+        max_capture_bytes: None,
+        env: Vec::new(),
+        env_clear: false,
+    }))
 }
 
 /// `c.cwd(dir)` — set the command's working directory (the child `chdir`s into it before `execvp`).
@@ -11808,6 +12229,23 @@ pub unsafe extern "C" fn align_rt_command_timeout(c: *mut Command, ns: i64) {
         panic_abort("command.timeout_ns: negative timeout");
     }
     unsafe { &mut *c }.timeout_ns = ns;
+}
+
+/// `c.max_capture_bytes(limit)` — persist a per-stream capture bound for later text and byte runs.
+/// A negative value is a programmer error and aborts before any allocation or child creation.
+/// `0` is an explicit empty-only bound; the latest call replaces the previous value.
+///
+/// # Safety
+/// `c` must be null or a valid `Command` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_command_max_capture(c: *mut Command, limit: i64) {
+    if c.is_null() {
+        panic_abort("command.max_capture_bytes: null command handle");
+    }
+    if limit < 0 {
+        panic_abort("command.max_capture_bytes: negative capture limit");
+    }
+    unsafe { &mut *c }.max_capture_bytes = Some(limit);
 }
 
 /// `c.env(name, value)` — record one environment-variable override the child will `setenv` (overwrite=1)
@@ -11915,18 +12353,20 @@ unsafe fn clearenv_portable() -> i32 {
     0
 }
 
-/// `out := c.run()` — fork a child running the command with BOTH stdout and stderr captured, drain
-/// both pipes to EOF, reap the child, and write an owned `RunOutput` handle to `*out`. Returns `0` on
-/// success, `AL_INVALID` for a null argument or non-UTF-8 captured output, `AL_TIMEOUT` when the run
-/// overruns the command's `timeout_ns` (the child is `SIGKILL`ed and reaped, partial output
-/// discarded), or a mapped errno for a `pipe`/`fork` failure. `c` is BORROWED (re-runnable — not
-/// consumed). Leaves `*out = null` on any non-success. The child inherits nothing but the two pipe
-/// write-ends (dup2'd onto 1/2); all
-/// Align-owned fds are CLOEXEC (P3). A `chdir`/`execvp` failure in the child surfaces as exit code
-/// 127 in `out.code()` (the shell convention — the fork itself succeeded), NOT an `Err`.
-///
-/// # Safety
-/// `c` must be null or a valid `Command` pointer; `out` a writable `*mut RunOutput` slot.
+/// Shared front end for the text and byte terminals. Bounded capture stores and the output shell are
+/// allocated before the engine creates pipes or forks; a recoverable failure leaves the caller's
+/// result slot null and drops every preallocated object.
+fn prepare_command_capture(cmd: &Command) -> Result<(CommandCaptureBuffer, CommandCaptureBuffer), i32> {
+    let limit = command_capture_limit(cmd)?;
+    #[cfg(test)]
+    capture_allocation_checkpoint(CaptureFailpoint::AllocFirst);
+    let stdout = CommandCaptureBuffer::new(limit);
+    #[cfg(test)]
+    capture_allocation_checkpoint(CaptureFailpoint::AllocSecond);
+    let stderr = CommandCaptureBuffer::new(limit);
+    Ok((stdout, stderr))
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_command_run(c: *mut Command, out: *mut *mut RunOutput) -> i32 {
     if out.is_null() {
@@ -11937,164 +12377,56 @@ pub unsafe extern "C" fn align_rt_command_run(c: *mut Command, out: *mut *mut Ru
         return AL_INVALID;
     }
     let cmd = unsafe { &*c };
-
-    // Marshal the argv pointer vector in the PARENT (the child does no allocation between fork and
-    // exec — the async-signal-safety discipline shared with `spawn`). `argv_ptrs` borrows `cmd.argv`.
-    let mut argv_ptrs: Vec<*const u8> = cmd.argv.iter().map(|a| a.as_ptr().cast()).collect();
-    argv_ptrs.push(core::ptr::null());
-    let cmd_ptr: *const u8 = cmd.cmd.as_ptr().cast();
-    let cwd_ptr: *const u8 = cmd.cwd.as_ref().map_or(core::ptr::null(), |d| d.as_ptr().cast());
-    // With a timeout, run the child in its OWN process group so the deadline kill reaps the whole
-    // tree it spawns (e.g. `sh -c "sleep 10"`'s `sleep` grandchild), not just the direct child —
-    // otherwise a surviving grandchild holds the capture pipes open and wedges the drain-to-EOF.
-    // Without a timeout, the group is unnecessary; keep the Slice-4 behavior byte-identical.
-    let use_pgroup = cmd.timeout_ns > 0;
-
-    // Two CLOEXEC pipes: `[read, write]` for stdout and stderr.
-    let out_pipe = match unsafe { make_pipe_cloexec() } {
-        Ok(p) => p,
-        Err(s) => return s,
+    let (mut stdout, mut stderr) = match prepare_command_capture(cmd) {
+        Ok(buffers) => buffers,
+        Err(status) => return status,
     };
-    let err_pipe = match unsafe { make_pipe_cloexec() } {
-        Ok(p) => p,
-        Err(s) => {
-            unsafe {
-                close(out_pipe[0]);
-                close(out_pipe[1]);
-            }
-            return s;
-        }
+    #[cfg(test)]
+    capture_allocation_checkpoint(CaptureFailpoint::AllocShell);
+    let mut shell = Box::new(RunOutput { code: 0, out: Vec::new(), err: Vec::new() });
+    let code = match unsafe { run_command_capture(cmd, &mut stdout, &mut stderr) } {
+        Ok(code) => code,
+        Err(status) => return status,
     };
-
-    // SAFETY: `fork` takes no arguments. We marshalled everything (argv pointers, CStrings) in the
-    // parent above, so the child branch allocates nothing. Same `execvp`-not-async-signal-safe caveat
-    // as `align_rt_process_spawn` (a threaded parent holding the allocator lock at `fork` can deadlock
-    // the child in `execvp`'s PATH search) — `posix_spawn` is the recorded deferred fix.
-    let pid = unsafe { fork() };
-    if pid < 0 {
-        let status = io_error_to_status(&std::io::Error::last_os_error());
-        unsafe {
-            close(out_pipe[0]);
-            close(out_pipe[1]);
-            close(err_pipe[0]);
-            close(err_pipe[1]);
-        }
-        return status;
-    }
-    if pid == 0 {
-        // Child. Only async-signal-safe-ish libc calls here (the `execvp` caveat above); no `malloc`.
-        unsafe {
-            // New process group (leader = this pid) so a timeout kill(-pgid) reaps the whole tree.
-            // Done in BOTH child and parent (the classic race-free double `setpgid`): whichever runs
-            // first wins, the other is a harmless no-op / EACCES-after-exec. Errors are ignored (a
-            // failure only loses the group-kill, never memory safety).
-            if use_pgroup {
-                setpgid(0, 0);
-            }
-            if !cwd_ptr.is_null() && chdir(cwd_ptr) != 0 {
-                _exit(127); // a bad cwd → 127, the "command could not run" convention (P not an Err)
-            }
-            // Apply the environment overrides (Slice 6) BEFORE exec (env changes are process-wide in the
-            // child, so they must precede `execvp`). Order: `env_clear` wipes first, then each `env` pair
-            // `setenv`s with overwrite=1 (so a pair after an `env_clear` survives; a later pair for the
-            // same name wins). `clearenv`/`setenv` are NOT async-signal-safe, but the child already runs
-            // the non-async-signal-safe `execvp` (PATH malloc) — the same documented `spawn`/Slice-4
-            // hazard — so this is acceptable. The `setenv` pairs read CStrings built in the parent
-            // (`align_rt_command_env`); the only child-side allocation is the macOS `clearenv_portable`
-            // shim (glibc `clearenv` allocates nothing), within that same execvp caveat.
-            if cmd.env_clear {
-                clearenv_portable();
-            }
-            for (n, v) in &cmd.env {
-                setenv(n.as_ptr().cast(), v.as_ptr().cast(), 1);
-            }
-            // Redirect stdout/stderr to the pipe write-ends, then close every pipe fd (the read ends
-            // and the now-duplicated write ends). The dup2'd fds 1/2 are NOT CLOEXEC, so they survive
-            // `execvp` and the exec'd program writes straight into our pipes.
-            //
-            // Assumption (shared with `align_rt_process_spawn`): fds 0/1/2 are open in the parent, so
-            // `pipe2` returned fds >= 3 and no pipe write-end can itself be fd 1 or 2. If a caller had
-            // pre-closed a std fd, a pipe write-end could land on fd 2 and the `close(out_pipe[1])`
-            // below would then close the *stderr* redirect (the classic dup2-shuffle hazard) — corrupt
-            // capture, never memory-unsafety. A normally-launched Align program always has 0/1/2 open,
-            // so this is unreachable from the surface; the robust fix (a dup-to-temp shuffle) is
-            // deferred as unwarranted complexity for an unreachable case.
-            dup2(out_pipe[1], 1);
-            dup2(err_pipe[1], 2);
-            close(out_pipe[0]);
-            close(out_pipe[1]);
-            close(err_pipe[0]);
-            close(err_pipe[1]);
-            execvp(cmd_ptr, argv_ptrs.as_ptr());
-            _exit(127); // execvp returned → not found / not executable (surfaces as code 127)
-        }
-    }
-
-    // Parent. Race-free half of the `setpgid` pair (see the child): ensure the child is in its own
-    // process group before we might signal it. Ignore the result (EACCES if the child already exec'd,
-    // ESRCH if it already exited — both fine; the child's own `setpgid` covers those cases).
-    if use_pgroup {
-        unsafe { setpgid(pid, pid) };
-    }
-    // Close the write ends (so our reads see EOF once the child's last writer closes), set both read
-    // ends non-blocking, and drain both concurrently to EOF (P7).
-    unsafe {
-        close(out_pipe[1]);
-        close(err_pipe[1]);
-        set_nonblocking(out_pipe[0]);
-        set_nonblocking(err_pipe[0]);
-    }
-    // A positive `timeout_ns` bounds the drain: past the deadline the child is `SIGKILL`ed and the run
-    // reports `Error.Timeout` (P8). `0` (or the default) means no timeout — drain to EOF (Slice-4).
-    // `checked_add`, not `+`: `Instant + Duration` PANICS if the result is unrepresentable, and
-    // `timeout_ns` is an arbitrary user `i64` (`c.timeout_ns(...)`) — a near-`i64::MAX` value (~292
-    // years) would overflow the platform `Instant`. An overflow falls back to `None` (no bound); a
-    // timeout that far out is indistinguishable from "no timeout" anyway. Never panics.
-    let deadline = if cmd.timeout_ns > 0 {
-        std::time::Instant::now().checked_add(std::time::Duration::from_nanos(cmd.timeout_ns as u64))
-    } else {
-        None
-    };
-    let mut out_buf: Vec<u8> = Vec::new();
-    let mut err_buf: Vec<u8> = Vec::new();
-    let timed_out = unsafe { drain_two_pipes(out_pipe[0], err_pipe[0], &mut out_buf, &mut err_buf, deadline) };
-    if timed_out {
-        // The child overran the deadline (P8). `SIGKILL` the whole process GROUP (signal 9 to `-pid`
-        // — the child leads its own group here, so this reaps grandchildren like a `sleep` under
-        // `sh -c`). Then **do NOT re-drain**: the partial capture is DISCARDED anyway ("report the
-        // timeout, don't return a half-answer"; `*out` stays null), so draining buys nothing — and a
-        // `deadline = None` (infinite) re-drain would REINTRODUCE the very unbounded block this
-        // feature exists to prevent. `kill(-pid)` cannot reach a descendant that escaped the group
-        // (a `setsid`/daemonizing grandchild), and such a descendant inherits the pipe write-end
-        // (fds 1/2 are not CLOEXEC), so an EOF-drain could wait on it forever. Instead: close our read
-        // ends now (a surviving writer just gets EPIPE on its next write — harmless to us) and reap
-        // the leader. The SIGKILL'd direct child dies promptly, so `reap_child_blocking` does not
-        // block; any escaped grandchild is reparented to init, which reaps it. Wall-clock is thus
-        // bounded unconditionally.
-        unsafe { kill(-pid, 9) };
-        unsafe {
-            close(out_pipe[0]);
-            close(err_pipe[0]);
-        }
-        unsafe { reap_child_blocking(pid) };
-        return AL_TIMEOUT;
-    }
-    unsafe {
-        close(out_pipe[0]);
-        close(err_pipe[0]);
-    }
-
-    // Reap the child (no zombie). `EINTR` is retried.
-    let status = unsafe { reap_child_blocking(pid) };
-    let code = decode_wait_status(status);
-
-    // The `str` accessors cannot expose non-UTF-8 bytes (the `fs.read_file` string-vs-bytes rule):
-    // reject invalid captured output with `AL_INVALID` and free everything (leaving `*out = null`).
-    if std::str::from_utf8(&out_buf).is_err() || std::str::from_utf8(&err_buf).is_err() {
+    let stdout = stdout.into_vec();
+    let stderr = stderr.into_vec();
+    if std::str::from_utf8(&stdout).is_err() || std::str::from_utf8(&stderr).is_err() {
         return AL_INVALID;
     }
+    shell.code = code;
+    shell.out = stdout;
+    shell.err = stderr;
+    unsafe { *out = Box::into_raw(shell) };
+    0
+}
 
-    unsafe { *out = Box::into_raw(Box::new(RunOutput { code, out: out_buf, err: err_buf })) };
+/// Binary captured-run terminal. It shares all setup, cap, timeout, kill, and direct-reap behavior
+/// with [`align_rt_command_run`] and deliberately performs no UTF-8 validation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_command_run_bytes(c: *mut Command, out: *mut *mut RunBytes) -> i32 {
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *out = core::ptr::null_mut() };
+    if c.is_null() {
+        return AL_INVALID;
+    }
+    let cmd = unsafe { &*c };
+    let (mut stdout, mut stderr) = match prepare_command_capture(cmd) {
+        Ok(buffers) => buffers,
+        Err(status) => return status,
+    };
+    #[cfg(test)]
+    capture_allocation_checkpoint(CaptureFailpoint::AllocShell);
+    let mut shell = Box::new(RunBytes { code: 0, out: Vec::new(), err: Vec::new() });
+    let code = match unsafe { run_command_capture(cmd, &mut stdout, &mut stderr) } {
+        Ok(code) => code,
+        Err(status) => return status,
+    };
+    shell.code = code;
+    shell.out = stdout.into_vec();
+    shell.err = stderr.into_vec();
+    unsafe { *out = Box::into_raw(shell) };
     0
 }
 
@@ -12147,6 +12479,37 @@ pub unsafe extern "C" fn align_rt_run_output_stderr(o: *const RunOutput) -> Alig
     AlignStr { ptr: r.err.as_ptr(), len: r.err.len() as i64 }
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_run_bytes_code(o: *const RunBytes) -> i64 {
+    if o.is_null() { 0 } else { unsafe { &*o }.code }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_run_bytes_stdout(o: *const RunBytes) -> AlignStr {
+    if o.is_null() {
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    }
+    let bytes = &unsafe { &*o }.out;
+    if bytes.is_empty() {
+        AlignStr { ptr: core::ptr::null(), len: 0 }
+    } else {
+        AlignStr { ptr: bytes.as_ptr(), len: i64::try_from(bytes.len()).unwrap_or(i64::MAX) }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_run_bytes_stderr(o: *const RunBytes) -> AlignStr {
+    if o.is_null() {
+        return AlignStr { ptr: core::ptr::null(), len: 0 };
+    }
+    let bytes = &unsafe { &*o }.err;
+    if bytes.is_empty() {
+        AlignStr { ptr: core::ptr::null(), len: 0 }
+    } else {
+        AlignStr { ptr: bytes.as_ptr(), len: i64::try_from(bytes.len()).unwrap_or(i64::MAX) }
+    }
+}
+
 /// Free a `Command` handle (its owned CStrings). Null-safe (a moved-out / never-initialised owned slot
 /// drops harmlessly).
 ///
@@ -12165,6 +12528,14 @@ pub unsafe extern "C" fn align_rt_command_free(c: *mut Command) {
 /// `o` must be null or a pointer from [`align_rt_command_run`], not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_run_output_free(o: *mut RunOutput) {
+    if !o.is_null() {
+        drop(unsafe { Box::from_raw(o) });
+    }
+}
+
+/// Free a `RunBytes` handle. Null-safe for moved-out/never-initialized slots.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_run_bytes_free(o: *mut RunBytes) {
     if !o.is_null() {
         drop(unsafe { Box::from_raw(o) });
     }
@@ -26747,7 +27118,8 @@ mod tests {
 
     /// P8 — a child that overruns `timeout_ns` is `SIGKILL`ed and the run reports `AL_TIMEOUT`,
     /// promptly (well under the child's own 10 s sleep, proving it was killed, not waited out) and
-    /// with no leaked handle. The internal `reap_child_blocking` means it cannot leave a zombie.
+    /// with no leaked handle. The shared capture cleanup directly reaps the child, so it cannot leave
+    /// a zombie.
     #[test]
     fn command_timeout_kills_a_hung_child() {
         if !std::path::Path::new("/bin/sh").exists() {
@@ -26911,6 +27283,269 @@ mod tests {
         let mut out: *mut RunOutput = std::ptr::null_mut();
         assert_eq!(unsafe { align_rt_command_run(std::ptr::null_mut(), &mut out) }, AL_INVALID);
         assert!(out.is_null());
+    }
+
+    #[test]
+    fn command_capture_allocation_bound_and_exact_limit() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let (cp, cl) = view_of("/bin/sh");
+        let argv = argv_of(&["/bin/sh", "-c", "printf HELLO"]);
+        let c = unsafe { align_rt_command_new(cp, cl, argv.as_ptr(), argv.len() as i64) };
+        unsafe { align_rt_command_max_capture(c, 5) };
+        let mut out: *mut RunOutput = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_command_run(c, &mut out) }, 0);
+        assert_eq!(unsafe { &*out }.out, b"HELLO");
+        assert_eq!(unsafe { &*out }.out.capacity(), 5, "stdout owns exactly the selected layout");
+        assert_eq!(unsafe { &*out }.err.capacity(), 5, "stderr owns its independent exact layout");
+        unsafe { align_rt_run_output_free(out) };
+
+        unsafe { align_rt_command_max_capture(c, 4) };
+        let mut overflow: *mut RunOutput = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_command_run(c, &mut overflow) }, AL_INVALID);
+        assert!(overflow.is_null(), "overflow publishes no partial handle");
+        unsafe { align_rt_command_free(c) };
+    }
+
+    #[test]
+    fn command_capture_zero_is_empty_only() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let (cp, cl) = view_of("/bin/sh");
+        let empty_argv = argv_of(&["/bin/sh", "-c", ":"]);
+        let empty = unsafe { align_rt_command_new(cp, cl, empty_argv.as_ptr(), empty_argv.len() as i64) };
+        unsafe { align_rt_command_max_capture(empty, 0) };
+        let mut out: *mut RunOutput = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_command_run(empty, &mut out) }, 0);
+        assert!(unsafe { &*out }.out.is_empty() && unsafe { &*out }.err.is_empty());
+        assert_eq!(unsafe { &*out }.out.capacity(), 0);
+        assert_eq!(unsafe { &*out }.err.capacity(), 0);
+        unsafe { align_rt_run_output_free(out) };
+        unsafe { align_rt_command_free(empty) };
+
+        let byte_argv = argv_of(&["/bin/sh", "-c", "printf x 1>&2"]);
+        let byte = unsafe { align_rt_command_new(cp, cl, byte_argv.as_ptr(), byte_argv.len() as i64) };
+        unsafe { align_rt_command_max_capture(byte, 0) };
+        let mut rejected: *mut RunOutput = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_command_run(byte, &mut rejected) }, AL_INVALID);
+        assert!(rejected.is_null());
+        unsafe { align_rt_command_free(byte) };
+    }
+
+    #[test]
+    fn command_run_bytes_preserves_non_utf8_and_nul() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let (cp, cl) = view_of("/bin/sh");
+        let argv = argv_of(&["/bin/sh", "-c", "printf '\\377\\000A'; printf '\\000E' 1>&2"]);
+        let c = unsafe { align_rt_command_new(cp, cl, argv.as_ptr(), argv.len() as i64) };
+        unsafe { align_rt_command_max_capture(c, 3) };
+        let mut out: *mut RunBytes = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_command_run_bytes(c, &mut out) }, 0);
+        assert_eq!(unsafe { align_rt_run_bytes_code(out) }, 0);
+        let stdout = unsafe { align_rt_run_bytes_stdout(out) };
+        let stderr = unsafe { align_rt_run_bytes_stderr(out) };
+        assert_eq!(unsafe { safe_slice(stdout.ptr, stdout.len) }, &[0xff, 0, b'A']);
+        assert_eq!(unsafe { safe_slice(stderr.ptr, stderr.len) }, &[0, b'E']);
+        unsafe { align_rt_run_bytes_free(out) };
+        unsafe { align_rt_command_free(c) };
+    }
+
+    fn capture_test_command(script: &str, bound: bool, timeout_ns: i64) -> *mut Command {
+        let (cp, cl) = view_of("/bin/sh");
+        let argv = argv_of(&["/bin/sh", "-c", script]);
+        let command = unsafe { align_rt_command_new(cp, cl, argv.as_ptr(), argv.len() as i64) };
+        if bound {
+            unsafe { align_rt_command_max_capture(command, 64) };
+        }
+        if timeout_ns != 0 {
+            unsafe { align_rt_command_timeout(command, timeout_ns) };
+        }
+        command
+    }
+
+    fn assert_capture_child_reaped_and_fds_closed() {
+        let pid = CAPTURE_LAST_PID.with(|last| last.get());
+        assert!(pid > 0, "a post-fork failpoint must record the direct child");
+        let mut raw = 0;
+        assert_eq!(unsafe { waitpid(pid, &mut raw, 1) }, -1, "the direct child must already be reaped");
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(10));
+        assert_eq!(CAPTURE_CLOSE_MASK.with(|mask| mask.get()), 3, "both capture read fds must be closed");
+    }
+
+    #[test]
+    fn command_capture_descriptor_setup_failures_precede_fork() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let expected = io_error_to_status(&std::io::Error::from_raw_os_error(5));
+        for failpoint in [
+            CaptureFailpoint::FcntlGetStdout,
+            CaptureFailpoint::FcntlSetStdout,
+            CaptureFailpoint::FcntlGetStderr,
+            CaptureFailpoint::FcntlSetStderr,
+        ] {
+            set_capture_failpoint(failpoint);
+            let command = capture_test_command(":", true, 0);
+            let mut out: *mut RunOutput = std::ptr::null_mut();
+            assert_eq!(unsafe { align_rt_command_run(command, &mut out) }, expected, "{failpoint:?}");
+            assert!(out.is_null(), "setup failure publishes no result");
+            assert_eq!(CAPTURE_FORK_COUNT.with(|count| count.get()), 0, "setup failure must precede fork");
+            unsafe { align_rt_command_free(command) };
+        }
+    }
+
+    #[test]
+    fn command_capture_hard_io_errors_are_terminal() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let eio = io_error_to_status(&std::io::Error::from_raw_os_error(5));
+        let ebadf = io_error_to_status(&std::io::Error::from_raw_os_error(9));
+        let cases = [
+            (CaptureFailpoint::Poll, "sleep 10", eio),
+            (CaptureFailpoint::PollNval, "sleep 10", ebadf),
+            (CaptureFailpoint::ReadStdout, "printf x; sleep 10", eio),
+            (CaptureFailpoint::ReadStderr, "printf x 1>&2; sleep 10", eio),
+            (CaptureFailpoint::ReadBoth, "printf x; printf y 1>&2; sleep 10", eio),
+            (CaptureFailpoint::Wait, "exec 1>&- 2>&-; sleep 10", eio),
+            (CaptureFailpoint::WaitEchild, "exec 1>&- 2>&-; sleep 10", io_error_to_status(&std::io::Error::from_raw_os_error(10))),
+        ];
+        for (failpoint, script, expected) in cases {
+            set_capture_failpoint(failpoint);
+            let command = capture_test_command(script, true, 0);
+            let mut out: *mut RunOutput = std::ptr::null_mut();
+            assert_eq!(unsafe { align_rt_command_run(command, &mut out) }, expected, "{failpoint:?}");
+            assert!(out.is_null(), "hard failure publishes no partial result");
+            assert_eq!(CAPTURE_FORK_COUNT.with(|count| count.get()), 1);
+            assert_capture_child_reaped_and_fds_closed();
+            unsafe { align_rt_command_free(command) };
+        }
+    }
+
+    #[test]
+    fn command_capture_observable_timeout_precedes_poll_error() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        set_capture_failpoint(CaptureFailpoint::PollAfterDeadline);
+        let command = capture_test_command("sleep 10", true, 1_000_000);
+        let mut out: *mut RunOutput = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_command_run(command, &mut out) }, AL_TIMEOUT);
+        assert!(out.is_null());
+        assert_capture_child_reaped_and_fds_closed();
+        unsafe { align_rt_command_free(command) };
+    }
+
+    #[test]
+    fn command_capture_lifecycle_state_matrix() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        for (script, bound, timeout_ns, expected_code) in [
+            ("printf open; sleep 0.02", false, 0, 0),
+            ("printf bounded; sleep 0.02", true, 0, 0),
+            ("exec 1>&- 2>&-; sleep 0.02", false, 1_000_000_000, 0),
+            ("printf exited", true, 1_000_000_000, 0),
+        ] {
+            let command = capture_test_command(script, bound, timeout_ns);
+            let mut out: *mut RunOutput = std::ptr::null_mut();
+            assert_eq!(unsafe { align_rt_command_run(command, &mut out) }, 0, "{script}");
+            assert_eq!(unsafe { align_rt_run_output_code(out) }, expected_code, "{script}");
+            unsafe { align_rt_run_output_free(out) };
+            unsafe { align_rt_command_free(command) };
+        }
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn command_capture_malformed_layout_starts_no_child() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        set_capture_failpoint(CaptureFailpoint::None);
+        let command = capture_test_command(":", false, 0);
+        unsafe { &mut *command }.max_capture_bytes = Some(i64::MAX);
+        let mut out: *mut RunOutput = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_command_run(command, &mut out) }, AL_INVALID);
+        assert!(out.is_null());
+        assert_eq!(CAPTURE_FORK_COUNT.with(|count| count.get()), 0);
+        unsafe { align_rt_command_free(command) };
+    }
+
+    #[test]
+    fn command_capture_allocation_failures_abort_before_fork() {
+        const CHILD: &str = "ALIGN_CAPTURE_ALLOC_FAIL_CHILD";
+        const MARKER: &str = "ALIGN_CAPTURE_ALLOC_FAIL_MARKER";
+        const NAME: &str = "tests::command_capture_allocation_failures_abort_before_fork";
+        if let Some(mode) = std::env::var_os(CHILD) {
+            let marker = std::env::var(MARKER).unwrap();
+            let script = format!("printf child > '{}'", marker);
+            let command = capture_test_command(&script, true, 0);
+            let failpoint = match mode.to_string_lossy().as_ref() {
+                "first" => CaptureFailpoint::AllocFirst,
+                "second" => CaptureFailpoint::AllocSecond,
+                "shell" => CaptureFailpoint::AllocShell,
+                _ => std::process::exit(79),
+            };
+            set_capture_failpoint(failpoint);
+            let mut out: *mut RunOutput = std::ptr::null_mut();
+            let _ = unsafe { align_rt_command_run(command, &mut out) };
+            std::process::exit(78);
+        }
+
+        for mode in ["first", "second", "shell"] {
+            let marker = tmp_path(&format!("capture-alloc-{mode}"));
+            let _ = std::fs::remove_file(&marker);
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env(CHILD, mode)
+                .env(MARKER, &marker)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(!status.success() && status.code() != Some(78), "{mode} allocation failure must abort");
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("{mode} allocation-failure subprocess did not terminate");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(!marker.exists(), "{mode} allocation failure must occur before fork");
+        }
+    }
+
+    #[test]
+    fn command_capture_reuse_and_independent_concurrency() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let threads = ["printf alpha", "printf beta"].map(|script| {
+            std::thread::spawn(move || {
+                let command = capture_test_command(script, true, 0);
+                for _ in 0..2 {
+                    let mut out: *mut RunBytes = std::ptr::null_mut();
+                    assert_eq!(unsafe { align_rt_command_run_bytes(command, &mut out) }, 0);
+                    let bytes = unsafe { align_rt_run_bytes_stdout(out) };
+                    assert_eq!(unsafe { safe_slice(bytes.ptr, bytes.len) }, &script.as_bytes()[7..]);
+                    unsafe { align_rt_run_bytes_free(out) };
+                }
+                unsafe { align_rt_command_free(command) };
+            })
+        });
+        for thread in threads {
+            thread.join().unwrap();
+        }
     }
 
     #[test]

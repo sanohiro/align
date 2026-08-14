@@ -61,26 +61,17 @@ arrays, the exact C6 field graph, existing tagged-wrapper closure, whole/per-uni
 stack/boxed recursive cleanup share the existing builder/runtime ABI. Reopen §7.6 only for a public
 or ownership-strategy change after design review.
 
-align-llm Requests 11 and 12 have accepted designs. Request 12 is the active publication capability
-on `agent/bounded-canonical-json` and PR #807. It implements
-`docs/impl/17-library-boundary-prerequisites.md` §7.7 through the complete
-Sema→checked-HIR→MIR→LLVM→runtime owner matrix while sharing the existing canonical formatter. After
-integrating #806, the comprehensive review of
-`33de89431e4e7066f06e9df23522d5bef0c3cefb` found two valid boundary gaps: checked HIR did not bind
-JSON keys/access paths/order back to the source schema, and malformed MIR could pass a non-`i64`
-limit to LLVM's integer cast. The consolidated repair records the source local, reconstructs and
-compares the complete canonical plan iteratively, and preflights the bounded MIR result/out/piece
-envelope before LLVM construction. Its native ARM64 focused validator, driver, malformed-MIR, and
-library Clippy owners pass with one job. Commit the repair, run findings-fixed publication preflight,
-update PR #807, and merge it. Do not add a second formatter, estimator pass, dynamic JSON value, or
-unbounded-encode-then-discard path.
-
-Request 11 is the next implementation capability after #807. Its bounded process-capture contract
-is in `docs/impl/std-design/process.md`: `max_capture_bytes` is a per-stream command-local bound,
-`run_bytes` is the explicit arbitrary-byte terminal, and timeout/cap precedence, exact allocation,
-allocation-free post-fork bounded drain, deadline-aware post-EOF wait, terminal pipe-error cleanup,
-process-group signalling/direct-child reap, interface identity, and owner cells are fixed in one
-ledger. Implement that ledger without reopening the public surface.
+align-llm Requests 11 and 12 are implemented. Request 12 shipped in #807: the bounded canonical JSON
+path shares the existing formatter, binds the complete encode plan back to the source schema, and
+validates the fallible MIR envelope before LLVM construction. Request 11 adds
+`max_capture_bytes` as the per-stream command-local bound;
+`run_bytes` is the arbitrary-byte terminal, and the shared runtime owns exact bounded allocation,
+allocation-free post-fork drain, deadline-aware post-EOF wait, deterministic error precedence,
+process-group signalling, and direct-child reap. Whole/per-unit interface identity, cache
+edit/revert, checked-HIR inventory, fatal allocation and syscall failpoints, and the 64/256 KiB
+resource measurement are owned by the process suite and `bench/process_capture`. Do not add a
+second JSON formatter, estimator pass, dynamic JSON value, unbounded-encode-then-discard path, or
+post-capture length check.
 
 Out-of-gate suites (everything outside `scripts/test-pr.sh`) are guarded by the
 nightly full-suite workflow, which builds once, runs every compiled test binary
@@ -189,16 +180,16 @@ facts must live in this repository.
 - **align-llm requests:** Request 4 is merged through Align design #798 and implementation #800;
   Request 6 is closed after Align design #703, implementation #704, and align-llm adoption #84;
   Request 8 is merged through Align design #799 and implementation #801; Request 10's §7.6
-  implementation is merged; Request 11's bounded-capture design is accepted. Requests 5, 7, 9, and
-  12–14 otherwise remain proposed in
+  implementation is merged; Request 11's bounded-capture implementation is complete and Request 12's
+  design is accepted. Requests 5, 7, 9, and 13–14 otherwise remain proposed in
   `../align-llm/docs/align-requests.md`; Request 9 remains the later C7 blocker after Request 7.
 
 Consumer-gated deferrals that remain intentional:
 
 - Fully escaping function values wait for a consumer and a settled heap-owned
   environment/drop model.
-- `std.process` bounded/binary capture now has align-llm Request 11 as its consumer and an accepted
-  contract; implementation remains the active capability in `docs/impl/std-design/process.md`.
+- `std.process` bounded/binary capture is complete for align-llm Request 11; client adoption still
+  requires pinning the merged implementation and running the request's focused real-client gate.
 - Top-level `array<str> := json.decode(...)` waits for a result representation
   that carries the input region. Struct fields of `array<str>` already ship;
   see `docs/impl/core-design/json.md`.

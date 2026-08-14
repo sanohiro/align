@@ -1243,6 +1243,7 @@ const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("tcp_listener", 0, BuiltinCapability::Opaque),
     ("udp_socket", 0, BuiltinCapability::Opaque),
     ("child", 0, BuiltinCapability::Opaque),
+    ("run_bytes", 0, BuiltinCapability::Opaque),
     ("http_request_ctx", 0, BuiltinCapability::Opaque),
     ("response_builder", 0, BuiltinCapability::Opaque),
     ("http_stream", 0, BuiltinCapability::Opaque),
