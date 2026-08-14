@@ -7,16 +7,21 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-14._ Active work is the consumer-complete `align-repl`
+_Last updated: 2026-08-15._ Active work is the consumer-complete `align-repl`
 v1 capability from `docs/impl/22-repl-plan.md` on
 `agent/align-repl-v1-codex`, based on `5f0bd2ea`. The native AOT session,
 replacement/undo model, command surface, bounded output retention, driver stage
 promotion, shared type renderer, and ARM default of one codegen job are
-implemented. Focused `align_repl`, `align_sema`, and `align_driver` owner tests
-pass with `CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 ALIGN_GATE_JOBS=1` and the
-isolated target `/tmp/align-repl-v1.VUH9z1`. Next: finish the plan-to-diff audit,
-commit the stable candidate, perform one comprehensive review and repairs, run
-the exact-head pre-publication gate, then publish and merge the PR.
+implemented. Candidate `e81c1817` received one comprehensive Codex review with
+five valid findings. Repairs now run all compiler transactions on a named 32 MiB
+worker, preserve syntax diagnostics for malformed entries, derive main binders
+from AST binding positions, keep child output as raw bytes, and discard rather
+than capture `:time` output. Focused `align_repl` tests pass (9 unit, 5 e2e, 25
+session), as do its clippy owner and the lint ratchet, with
+`CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 ALIGN_GATE_JOBS=1` and isolated target
+`/tmp/align-repl-v1.VUH9z1`. Next: commit the consolidated review repair, run the
+exact-head pre-publication gate with `--findings-fixed`, then publish and merge
+the PR.
 
 The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit

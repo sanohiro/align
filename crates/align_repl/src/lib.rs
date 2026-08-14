@@ -309,8 +309,8 @@ impl Session {
         })?;
         let mut samples = Vec::new();
         for _ in 0..5 {
-            match build::run_exe(&s.exe) {
-                Ok((_, _, _, ms)) => samples.push(ms),
+            match build::run_exe_discard(&s.exe) {
+                Ok((_, ms)) => samples.push(ms),
                 Err(e) => return Err(StartupError::FloorBuild(e)),
             }
         }
@@ -536,7 +536,7 @@ impl Session {
             let emitted = Entry::emit_for(kind, text);
             // Parse-only prefilter: `print(x := 1)` is not an expression, so candidate P is never
             // formed for a statement entry and costs nothing.
-            if !entry::parses_as_statement(&emitted) {
+            if kind == EntryKind::Printed && !entry::parses_as_statement(&emitted) {
                 continue;
             }
             if kind == EntryKind::ResultBound && !echo::only_unhandled_result(&stmt_rendered) {
@@ -689,7 +689,10 @@ impl Session {
         }
 
         let source = self.render_entries(&proposed);
-        let checked = build::check_candidate(&self.session_path(), &source);
+        let checked = match build::check_candidate(&self.session_path(), &source) {
+            Ok(checked) => checked,
+            Err(rendered) => return DeclTry::Rejected { rendered, all_dup: false, replacing: replaced },
+        };
         if checked.had_errors {
             return DeclTry::Rejected {
                 all_dup: all_errors_are_duplicates(&checked.rendered),
@@ -750,8 +753,14 @@ impl Session {
             paste_group: None,
         });
         let source = candidate(&appended, self);
-        let first = build::check_candidate(&self.session_path(), &source);
-        let first_hir = build::check_hir(&self.session_path(), &source);
+        let first = match build::check_candidate(&self.session_path(), &source) {
+            Ok(checked) => checked,
+            Err(rendered) => return Resolved::Err { rendered, replacing: Vec::new() },
+        };
+        let first_hir = match build::check_hir(&self.session_path(), &source) {
+            Ok(checked) => checked,
+            Err(rendered) => return Resolved::Err { rendered, replacing: Vec::new() },
+        };
         let names = self.main_name_delta(&first_hir.hir, &top_level_names);
         if let Some(entry) = appended.last_mut() {
             entry.names = names.clone();
@@ -820,14 +829,20 @@ impl Session {
             paste_group: None,
         };
         let source = candidate(&replaced_entries, self);
-        let second = build::check_candidate(&self.session_path(), &source);
+        let second = match build::check_candidate(&self.session_path(), &source) {
+            Ok(checked) => checked,
+            Err(rendered) => return Resolved::Err { rendered, replacing: hit },
+        };
         if second.had_errors {
             return Resolved::Err {
                 rendered: second.rendered,
                 replacing: hit,
             };
         }
-        let second_hir = build::check_hir(&self.session_path(), &source);
+        let second_hir = match build::check_hir(&self.session_path(), &source) {
+            Ok(checked) => checked,
+            Err(rendered) => return Resolved::Err { rendered, replacing: hit },
+        };
         if second_hir.had_errors {
             return Resolved::Err {
                 rendered: second_hir.rendered,
@@ -922,7 +937,7 @@ impl Session {
         if !accepted.diagnostics.is_empty() {
             match &mut outcome {
                 Outcome::Applied { out, .. } | Outcome::RanAndFailed { out, .. } => {
-                    out.stderr_shown.insert_str(0, &accepted.diagnostics);
+                    out.stderr_shown.splice(0..0, accepted.diagnostics.bytes());
                 }
                 _ => {}
             }
@@ -1023,7 +1038,10 @@ impl Session {
             None => proposed.push(new),
         }
         let source = self.render_entries(&proposed);
-        let checked = build::check_candidate(&self.session_path(), &source);
+        let checked = match build::check_candidate(&self.session_path(), &source) {
+            Ok(checked) => checked,
+            Err(rendered) => return Outcome::CompileFailed { rendered, replacing: hit },
+        };
         if checked.had_errors {
             return Outcome::CompileFailed {
                 rendered: checked.rendered,
@@ -1131,7 +1149,7 @@ impl Session {
         });
         let source = self.render_entries(&proposed);
         let index = proposed.iter().filter(|e| e.region == Region::Main).count() - 1;
-        let checked = build::check_hir(&self.session_path(), &source);
+        let checked = build::check_hir(&self.session_path(), &source)?;
         if !checked.had_errors {
             return echo::entry_type(&checked.hir, index)
                 .ok_or_else(|| String::from("align-repl: that entry has no value to type\n"));
@@ -1225,8 +1243,8 @@ impl Session {
         }
         let mut samples = Vec::with_capacity(usize::try_from(clamped).unwrap_or(1000));
         for _ in 0..clamped {
-            match build::run_exe(&self.exe) {
-                Ok((_, _, _, ms)) => samples.push(ms),
+            match build::run_exe_discard(&self.exe) {
+                Ok((_, ms)) => samples.push(ms),
                 Err(_) => return Err(TimeRefusal::NoBinary),
             }
         }
@@ -1242,8 +1260,8 @@ impl Session {
     }
 
     /// `:out` — the last run's full captured output.
-    pub fn last_output(&self) -> Option<String> {
-        self.baseline.last_full().map(|(o, e)| format!("{o}{e}"))
+    pub fn last_output(&self) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.baseline.last_full().cloned()
     }
 
     /// Whether the last run was printed but could not be retained within the configured bound.

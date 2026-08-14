@@ -102,7 +102,7 @@ fn run_command(session: &mut Session, command: cmd::Command) {
         cmd::Command::Drop(n) => report(&session.drop_entry(n)),
         cmd::Command::Clear => report(&session.clear()),
         cmd::Command::Out => match session.last_output() {
-            Some(text) => print!("{text}"),
+            Some((stdout, stderr)) => write_program_output(&stdout, &stderr),
             None if session.last_output_was_truncated() => {
                 eprintln!("align-repl: the last output exceeded the retention cap and cannot be reprinted")
             }
@@ -194,6 +194,14 @@ fn show_output(out: &align_repl::RunOutput) {
              nondeterminism, or an external side effect) — full output follows"
         );
     }
-    print!("{}", out.stdout_shown);
-    eprint!("{}", out.stderr_shown);
+    write_program_output(&out.stdout_shown, &out.stderr_shown);
+}
+
+fn write_program_output(stdout: &[u8], stderr: &[u8]) {
+    if let Err(error) = std::io::stdout().write_all(stdout) {
+        eprintln!("align-repl: cannot forward program stdout: {error}");
+    }
+    if let Err(error) = std::io::stderr().write_all(stderr) {
+        eprintln!("align-repl: cannot forward program stderr: {error}");
+    }
 }

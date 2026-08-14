@@ -496,9 +496,11 @@ whole design rests on. Revisit when V2c needs multi-unit staging anyway.
 
 ### 4.2 One long-lived process
 
-`align-repl` links `align_driver` as a library and drives it on a 32 MB worker
-thread (sema, lowering, and codegen recurse per expression-nesting level;
-`crates/align_driver/tests/common/mod.rs` does the same).
+`align-repl` links `align_driver` as a library and drives each compiler
+transaction on a named 32 MB worker thread (sema, lowering, and codegen recurse
+per expression-nesting level; `crates/align_driver/tests/common/mod.rs` does the
+same). Thread-spawn failure is a compiler-operation failure, and a compiler panic
+is resumed on the caller so normal panic cleanup still owns the session stage.
 
 The **in-process memo** (`docs/impl/10-cache-first-optimization.md` §6.6) is
 process-lifetime and content-keyed, and the REPL is the long-lived embedder it
@@ -725,7 +727,7 @@ abandon.
 | R4 | `Session::submit` | `fn submit(&mut self, entry: &str) -> Outcome` | a complete entry | transactional (§3.7.2) | see `Outcome` | the whole `session.rs` matrix |
 | R5 | `Outcome` | `enum Outcome { NoOp, Applied { ordinals: Vec<u32>, replaced: Vec<u32>, echo: Echo, out: RunOutput }, CompileFailed { rendered: String, replacing: Vec<u32> }, RegionConflict { name: String, ordinal: u32 }, RanAndFailed { status: ExitStatus, out: RunOutput }, Command(CmdResult) }` | — | owned | — | — |
 | R6 | `Echo` | `enum Echo { None, Printed, TypeOnly { rendered: String }, ResultBound { rendered: String } }`; `fn render(&self) -> Option<String>` | `ResultBound` is §3.4 case 3 and drives the `note:` line | owned | — | `session.rs::echo_matrix` |
-| R7 | `RunOutput` | `struct RunOutput { stdout_shown: String, stderr_shown: String, diverged: bool, truncated: bool }` | `*_shown` is the suffix or the full text per §6 | owned | — | `build.rs::output_matrix` plus session replacement/removal owners |
+| R7 | `RunOutput` | `struct RunOutput { stdout_shown: Vec<u8>, stderr_shown: Vec<u8>, diverged: bool, truncated: bool }` | `*_shown` is the suffix or the full raw bytes per §6; no UTF-8 conversion | owned | — | `build.rs::output_matrix` plus `session.rs::child_output_remains_byte_exact_for_invalid_utf8` and replacement/removal owners |
 | R8 | `Session::render` | `fn render(&self) -> String` | — | owned; the exact bytes compiled and `:save`d | — | `session.rs::render_is_what_alignc_builds` |
 | R9 | `Session::entries` | `fn entries(&self) -> &[Entry]` | — | borrow | — | — |
 | R10 | `Entry` | `struct Entry { ordinal: u32, region: Region, kind: EntryKind, text: String, emitted: String, names: Vec<String>, paste_group: Option<u32> }`; `enum Region { Import, Const, Decl, Main }`; `enum EntryKind { Import, Decl, Const, Statement, Printed, ResultBound }` | `text` is what the user typed; `emitted` is what §3.4 splices — identical except for a `print(…)` / `_ := (…)` wrapper | owned | — | `entry.rs` classification matrix |
@@ -734,7 +736,7 @@ abandon.
 | R13 | `Timing` | `struct Timing { n: u32, clamped_from: Option<u32>, min_ms: f64, median_ms: f64, max_ms: f64, floor_ms: f64 }` | — | Copy | — | — |
 | R14 | `Session::save` | `fn save(&self, path: &Path, force: bool) -> Result<(), SaveError>` | §8 row 6 path rules | — | `SaveError::{Exists, ParentMissing, Io}` | `session.rs::save_path_rules`, `e2e.rs::saved_file_builds_with_alignc` |
 | R15 | `Session::undo` / `drop_entry` | `fn undo(&mut self) -> Outcome`; `fn drop_entry(&mut self, ordinal: u32) -> Outcome` | `undo` reverses a replacement or a whole paste group | transactional | — | `session.rs::undo_restores_a_replaced_entry`, `::drop_by_ordinal` |
-| R16 | command-facing `Session` helpers | `fn continuing(&self) -> bool`; `fn add_const(&mut self, text: &str) -> Outcome`; `fn listing(&self) -> String`; `fn clear(&mut self) -> Outcome`; `fn last_output(&self) -> Option<String>`; `fn last_output_was_truncated(&self) -> bool` | Direct backing for the eleven binary commands; no second state machine | borrows or returns owned reports | compiler diagnostics through `Outcome`; bounded-output status is distinct from never-run | command and session matrices |
+| R16 | command-facing `Session` helpers | `fn continuing(&self) -> bool`; `fn add_const(&mut self, text: &str) -> Outcome`; `fn listing(&self) -> String`; `fn clear(&mut self) -> Outcome`; `fn last_output(&self) -> Option<(Vec<u8>, Vec<u8>)>`; `fn last_output_was_truncated(&self) -> bool` | Direct backing for the eleven binary commands; `last_output` preserves the two raw streams separately; no second state machine | borrows or returns owned reports | compiler diagnostics through `Outcome`; bounded-output status is distinct from never-run | command and session matrices |
 | R17 | `cmd` module | `enum Command`; `enum CmdResult { Message(String) }`; `fn parse(&str) -> Option<Command>`; `const HELP: &str` | Binary parser and help text for §8; public because the binary is a separate crate in the package | owned command arguments | malformed and unknown forms become `Command::Unknown` | `cmd.rs::command_table_covers_the_v1_surface_and_errors` |
 
 ### `align-repl` binary surface

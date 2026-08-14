@@ -196,60 +196,42 @@ pub(crate) fn import_path(path: &align_ast::Path) -> String {
 /// `arena { p := … }` entry would appear to own `p`, and a later `p := 9` — which the compiler
 /// accepts, because `p` is block-scoped — would wrongly displace the arena entry.
 ///
-/// Computed by tokenizing the entry and taking each `Ident` (optionally after `mut`, or inside a
-/// leading parenthesised tuple) that is immediately followed by `:=` at bracket depth zero.
-/// A lone `_` is skipped: it creates no local and is never a member of any name set (§3.4).
+/// Computed from the parser's binding nodes in a probe `main`, so annotation and initializer
+/// identifiers cannot be mistaken for binders. Malformed text contributes no trusted names; its
+/// real candidate check reports the syntax diagnostics.
 pub(crate) fn top_level_binding_names(text: &str) -> Vec<String> {
+    let src = format!("fn main() -> Result<(), Error> {{\n{text}\nreturn Ok(())\n}}\n");
     let mut sm = SourceMap::new();
-    let file = sm.add_file("<repl-probe>", text.to_string());
+    let file = sm.add_file("<repl-probe>", src.clone());
     let mut diags = Diagnostics::new();
-    let toks = align_lexer::tokenize(file, text, &mut diags);
-
+    let toks = align_lexer::tokenize(file, &src, &mut diags);
+    let parsed = align_parser::parse_file(toks, &mut diags);
+    if diags.has_errors() {
+        return Vec::new();
+    }
     let mut names = Vec::new();
-    let mut depth: i32 = 0;
-    // Identifiers seen at depth 0, or inside a tuple pattern that started at depth 0, since the
-    // last statement boundary. A `:=` at depth 0 commits them.
-    let mut pending: Vec<String> = Vec::new();
-    let mut tuple_depth: Option<i32> = None;
-
-    for t in &toks {
-        match &t.kind {
-            TokKind::LParen | TokKind::LBracket | TokKind::LBrace => {
-                if depth == 0 && matches!(t.kind, TokKind::LParen) && pending.is_empty() {
-                    tuple_depth = Some(depth);
-                }
-                depth += 1;
+    let Some(main) = parsed.items.iter().find_map(|item| match item {
+        align_ast::Item::Fn(function) if function.name.name == "main" => Some(function),
+        _ => None,
+    }) else {
+        return names;
+    };
+    let align_ast::FnBody::Block(body) = &main.body else {
+        return names;
+    };
+    for statement in &body.stmts {
+        match statement {
+            align_ast::Stmt::Let { name, .. } if name.name != "_" => names.push(name.name.clone()),
+            align_ast::Stmt::LetTuple { names: tuple, .. } => {
+                names.extend(
+                    tuple
+                        .iter()
+                        .flatten()
+                        .filter(|name| name.name != "_")
+                        .map(|name| name.name.clone()),
+                );
             }
-            TokKind::RParen | TokKind::RBracket | TokKind::RBrace => {
-                depth -= 1;
-                if tuple_depth == Some(depth) && !matches!(t.kind, TokKind::RParen) {
-                    tuple_depth = None;
-                }
-            }
-            // `mut x := 1` — the marker precedes the name and must not reset the prefix.
-            TokKind::Mut => {}
-            TokKind::Ident(name) => {
-                let in_tuple = tuple_depth == Some(0) && depth == 1;
-                // A lone `_` creates no local (`LetTuple::locals` holds `None` for it, and a
-                // standalone `_ := (E)` binds nothing), so it is never a member of a name set.
-                if (depth == 0 || in_tuple) && name != "_" {
-                    pending.push(name.clone());
-                }
-            }
-            TokKind::ColonEq if depth == 0 => {
-                names.append(&mut pending);
-                tuple_depth = None;
-            }
-            TokKind::End | TokKind::Eof if depth == 0 => {
-                pending.clear();
-                tuple_depth = None;
-            }
-            _ => {
-                if depth == 0 && !matches!(t.kind, TokKind::Comma | TokKind::Colon) {
-                    // Anything else at statement level means this is not a plain binding prefix.
-                    pending.clear();
-                }
-            }
+            _ => {}
         }
     }
     names
@@ -292,13 +274,14 @@ mod tests {
         let cases = [
             ("x := 1", vec!["x"]),
             ("mut x := 1", vec!["x"]),
-            ("typed: i64 := 1", vec!["typed", "i64"]),
+            ("typed: i64 := 1", vec!["typed"]),
             ("(a, b) := (1, 2)", vec!["a", "b"]),
             ("(a, _) := (1, 2)", vec!["a"]),
             ("_ := (1)", vec![]),
             ("arena { nested := 1; print(nested) }", vec![]),
             ("x = 2", vec![]),
             ("p.field = 2", vec![]),
+            ("broken: i64 :=", vec![]),
         ];
         for (text, expected) in cases {
             assert_eq!(top_level_binding_names(text), expected, "{text}");

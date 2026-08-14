@@ -42,7 +42,7 @@ fn printable_values_run_the_native_program() {
     assert_eq!(ordinals, [1]);
     assert!(replaced.is_empty());
     assert_eq!(echo, Echo::Printed);
-    assert_eq!(out.stdout_shown, "3\n");
+    assert_eq!(out.stdout_shown, b"3\n");
     assert_eq!(repl.entries()[0].kind, EntryKind::Printed);
     assert_eq!(repl.entries()[0].emitted, "print(1 + 2)");
 }
@@ -56,12 +56,12 @@ fn replacement_is_in_place_and_undo_restores_it() {
     let (_, replaced, _, out) = applied(repl.submit("x := 2"));
     assert_eq!(replaced, [1]);
     assert!(out.diverged);
-    assert_eq!(out.stdout_shown, "2\n");
+    assert_eq!(out.stdout_shown, b"2\n");
     assert_eq!(repl.entries()[0].ordinal, 1);
     assert_eq!(repl.entries()[0].text, "x := 2");
 
     let (_, _, _, out) = applied(repl.undo());
-    assert_eq!(out.stdout_shown, "1\n");
+    assert_eq!(out.stdout_shown, b"1\n");
     assert_eq!(repl.entries()[0].ordinal, 1);
     assert_eq!(repl.entries()[0].text, "x := 1");
 }
@@ -89,7 +89,7 @@ fn mixed_paste_is_split_and_undone_atomically() {
     let paste = "import core.math\nfn twice(x: i64) -> i64 = x * 2";
     let (ordinals, _, _, out) = applied(repl.submit(paste));
     assert_eq!(ordinals, [1, 2]);
-    assert!(out.stderr_shown.contains("unused import"));
+    assert!(String::from_utf8_lossy(&out.stderr_shown).contains("unused import"));
     assert_eq!(repl.entries().len(), 2);
     assert_eq!(repl.entries()[0].region, Region::Import);
     assert_eq!(repl.entries()[1].region, Region::Decl);
@@ -109,6 +109,31 @@ fn const_and_main_names_cannot_cross_regions() {
     ));
     assert_eq!(repl.entries().len(), 1);
     assert_eq!(repl.entries()[0].region, Region::Const);
+}
+
+#[test]
+fn annotated_binding_ignores_type_names_for_region_conflicts() {
+    let mut repl = session();
+    applied(repl.add_const("i64 := 7"));
+    let (ordinals, replaced, _, _) = applied(repl.submit("x: i64 := 1"));
+    assert_eq!(ordinals, [2]);
+    assert!(replaced.is_empty());
+    assert_eq!(repl.entries()[1].names, ["x"]);
+}
+
+#[test]
+fn malformed_main_entry_reports_the_compiler_syntax_error() {
+    let mut repl = session();
+    let before = repl.render();
+    match repl.submit("1 +") {
+        Outcome::CompileFailed { rendered, replacing } => {
+            assert!(!rendered.is_empty());
+            assert!(rendered.contains("error:"), "{rendered}");
+            assert!(replacing.is_empty());
+        }
+        other => panic!("expected syntax failure, got {other:?}"),
+    }
+    assert_eq!(repl.render(), before);
 }
 
 #[test]
@@ -198,20 +223,20 @@ fn synthetic_consumption_matrix_preserves_borrowed_move_values() {
     applied(repl.submit("s := \"owned\".clone()"));
     let (_, _, echo, out) = applied(repl.submit("s"));
     assert_eq!(echo, Echo::Printed);
-    assert_eq!(out.stdout_shown, "owned\n");
+    assert_eq!(out.stdout_shown, b"owned\n");
     let (_, _, _, out) = applied(repl.submit("s.len()"));
-    assert_eq!(out.stdout_shown, "5\n");
+    assert_eq!(out.stdout_shown, b"5\n");
 
     applied(repl.submit("value := Owned { text: \"field\".clone() }"));
     let (_, _, echo, out) = applied(repl.submit("value.text"));
     assert_eq!(echo, Echo::Printed);
-    assert_eq!(out.stdout_shown, "field\n");
+    assert_eq!(out.stdout_shown, b"field\n");
     let (_, _, _, out) = applied(repl.submit("value.text.len()"));
-    assert_eq!(out.stdout_shown, "5\n");
+    assert_eq!(out.stdout_shown, b"5\n");
 
     let (_, _, echo, out) = applied(repl.submit("\"temporary\".clone()"));
     assert_eq!(echo, Echo::Printed);
-    assert_eq!(out.stdout_shown, "temporary\n");
+    assert_eq!(out.stdout_shown, b"temporary\n");
 
     let (_, _, echo, _) = applied(repl.submit("value"));
     assert_eq!(
@@ -221,7 +246,22 @@ fn synthetic_consumption_matrix_preserves_borrowed_move_values() {
         }
     );
     let (_, _, _, out) = applied(repl.submit("value.text.len()"));
-    assert_eq!(out.stdout_shown, "5\n");
+    assert_eq!(out.stdout_shown, b"5\n");
+}
+
+#[test]
+fn child_output_remains_byte_exact_for_invalid_utf8() {
+    let mut repl = session();
+    applied(repl.submit("import std.io"));
+    applied(repl.submit("mut bytes := buffer(1)"));
+    applied(repl.submit("bytes.put_u8(255)"));
+    let (_, _, _, out) = applied(repl.submit("io.stdout.write(bytes.bytes())?"));
+    assert_eq!(out.stdout_shown, [255]);
+    assert!(out.stderr_shown.is_empty());
+
+    let (_, _, _, suffix) = applied(repl.submit("io.stdout.write(\"x\")?"));
+    assert_eq!(suffix.stdout_shown, b"x");
+    assert_eq!(repl.last_output(), Some((vec![255, b'x'], Vec::new())));
 }
 
 #[test]
@@ -392,7 +432,11 @@ fn drop_rolls_back_on_dependency_and_clear_keeps_ordinal_gaps() {
 fn accepted_build_reuses_the_candidate_frontend() {
     let mut repl = session();
     let before = align_driver::memo::stats().unit_hits;
-    applied(repl.submit("memo_probe := 17"));
+    // Keep this source fresh across separate test-process invocations. A prior invocation's
+    // persistent unit-cache entry bypasses the in-process store entirely and would make this owner
+    // observe no new memo hit even though candidate and build still share the correct path.
+    let entry = format!("memo_probe := {}", std::process::id());
+    applied(repl.submit(&entry));
     let after = align_driver::memo::stats().unit_hits;
     assert!(after > before, "accepted build must hit the candidate's unit frontend");
 }
