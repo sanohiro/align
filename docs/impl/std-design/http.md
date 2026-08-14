@@ -169,8 +169,8 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
    codec** (`align_rt_http_serialize`, one contiguous buffer per R4, unit-tested) — Slice 2's client
    renders + one-writes it, not a language builtin yet. All Slice-1 ops **Pure** (no sockets). Auto
    `Host` + `Content-Length` (iff body non-empty); a caller-supplied `Host`/`Content-Length` is
-   rejected (CL-duplication smuggling guard). `chunked` Transfer-Encoding → `Error.Invalid`
-   (Content-Length framing only in v1; R1-honouring de-chunking deferred). Caps: ≤ 128 headers,
+   rejected (CL-duplication smuggling guard). The original slice rejected `chunked`; Request 4 now
+   de-chunks supported HTTP/1.1 responses through the same R1-honouring decoder. Caps: ≤ 128 headers,
    ≤ 1 GiB body. R1 zero-copy: the response owns one byte buffer + an offset table; scanning rides
    the `memchr` crate (R2).
 2. client + get/post over one net `tcp_conn` (plaintext). **DONE** (branch
@@ -185,8 +185,9 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
    Content-Length, method/header/smuggling validation) → stream the response through the socket in
    32 KiB reads (never per-line — R4) to Content-Length, then parse via the Slice-1
    `http_parse_core` (R1 zero-copy). A 4xx/5xx is `Ok(response)` (P2); `https://` / a malformed URL
-   is `Error.Invalid` at request time (P1 — never a silent plaintext downgrade). Framing is
-   Content-Length (or read-to-close); chunked stays `Error.Invalid` (Slice-1 policy). The parser
+   is `Error.Invalid` at request time (P1 — never a silent plaintext downgrade). Framing supports
+   Content-Length, HTTP/1.1 chunked, and read-to-close; Request 4 replaced the original CL-only path.
+   The parser
    was refactored to an `Incomplete`/`Invalid` split so the streaming read distinguishes "need more
    bytes" from "malformed" over one shared decoder. NO pool yet (every request connects fresh and
    closes — Slice 3 adds keepalive reuse); `get_many` / server / HTTPS remain.
@@ -423,7 +424,7 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
    payload, the accept precedent), HIR `HttpRespondStream`/`HttpStreamSend`/`HttpStreamFinish`, all
    routed through `lower_http`. Tested by runtime units (frame encoder, version, shared-head parity,
    poison, empty-send no-op) + `crates/align_driver/tests/m12_http_stream.rs` (1.1 chunked / 1.0 raw /
-   truncation / poison / the align-client-rejects-chunked asymmetry / the double-consume + bodied-abort
+   truncation / poison / Align-client chunked dogfood / the double-consume + bodied-abort
    gates). (Two-critic review, Fable synthesis.) The gateway token-streaming layer: the
    caller writes SSE `data: …\n\n` lines as body content; std.http ships the **transfer framing
    only** (the framework boundary holds).
@@ -462,8 +463,8 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
    - Streaming restates the slow-loris caveat: a stream holds the single blocking accept
      thread for the whole generation by design — the trusted-network posture is load-bearing,
      not just an attack caveat.
-   - Client parse stays CL-only (chunked → `Error.Invalid` on align's own client — the
-     recorded asymmetry; the gateway's clients are external).
+   - Request 4 later removed the original client asymmetry: Align's own whole-body client now
+     de-chunks the streaming server response and exposes the decoded payload.
 
 8. **`respond_stream` rework for pkg.web stream routes — DESIGNED + SHIPPED 2026-07-21.**
    pkg.web's streaming design (`docs/impl/pkg-design/web.md` → "Streaming") is the consumer; it
@@ -1018,12 +1019,12 @@ absent there, as recorded in Slice 5); the `has_deadline` mapping in `tls_read`/
 one place the TLS transport differs, documented above. Every pre-existing http/TLS/pool/get_many/stream
 test passes unchanged (the effective-0 byte-identical invariant).
 
-## Client response framing (align-llm Request 4 — DESIGNED 2026-08-14)
+## Client response framing (align-llm Request 4 — DESIGNED + IMPLEMENTED 2026-08-14)
 
 `align-llm`'s C1 provider adapters already parse SSE events, but provider responses commonly use
-HTTP/1.1 `Transfer-Encoding: chunked`. The shipped whole-body client rejects that framing before the
-provider can see the body. Request 4 completes the existing `cl.request` boundary: it de-frames a
-chunked response into the same owned `response` and zero-copy `resp.body()` view. It adds no public
+HTTP/1.1 `Transfer-Encoding: chunked`. Before Request 4, the whole-body client rejected that framing
+before the provider could see the body. Request 4 completes the existing `cl.request` boundary: it
+de-frames a chunked response into the same owned `response` and zero-copy `resp.body()` view. It adds no public
 type, method, option, ABI entry point, streaming-input handle, or provider-specific abstraction.
 
 This is a framing capability, not a configurable receive-bound capability. The existing fixed
@@ -1132,9 +1133,13 @@ copy counts and rejects a regression that adds per-chunk allocation or a second 
 
 ### Delivery and adoption
 
-The implementation is one runtime/owner-test capability PR. No compiler, package, or ABI layer must
-change. The implementation PR updates the historical item-7 client-asymmetry tests outright and
-marks this section implemented. After merge, align-llm rebuilds and pins Align in its next permitted
+The implementation is one runtime/owner-test capability PR. No compiler, package, or ABI layer
+changes. Its hand-written diff exceeds roughly 1,000 lines because the strict head parser,
+incremental chunk/trailer decoder, exact-capacity accumulator, plaintext/TLS reuse verdict, and their
+single owner matrix form one producer-to-consumer failure domain: splitting them would leave a
+dormant parser or duplicate framing, cleanup, and allocation proof across temporary boundaries. The
+implementation updates the historical item-7 client-asymmetry tests outright. After merge,
+align-llm rebuilds and pins Align in its next permitted
 consumer-prerequisite wave, switches its provider stream fixtures from Content-Length to chunked,
 and proves valid SSE, malformed/truncated rejection, and final status/header/body preservation. The
 sibling request register remains the lifecycle owner for that adoption evidence.

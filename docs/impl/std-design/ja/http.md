@@ -172,9 +172,9 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
    のままで、スライス 2 のクライアントがそれをレンダリングして 1 回の write で送る — まだ言語のビルトインでは
    ない。スライス 1 の演算はすべて **Pure**(ソケットなし)。`Host` と `Content-Length`(ボディが非空のとき)は
    自動付与し、呼び出し側が `Host`/`Content-Length` を指定した場合は拒否する(CL 重複によるスマグリング対策)。
-   `chunked` の Transfer-Encoding は `Error.Invalid`(v1 は Content-Length フレーミングのみ。R1 を守る
-   デチャンクは先送り)。上限: ヘッダー 128 個以下、ボディ 1 GiB 以下。R1 ゼロコピー: response は 1 本の
-   バイトバッファ + オフセット表を所有し、スキャンは `memchr` クレート(R2)に載せる。
+   元の slice は `chunked` を拒否していたが、Request 4 により、同じ R1 準拠 decoder で supported
+   HTTP/1.1 response を de-chunk する。上限: ヘッダー 128 個以下、ボディ 1 GiB 以下。R1 ゼロコピー:
+   response は 1 本のバイトバッファ + オフセット表を所有し、スキャンは `memchr` クレート(R2)に載せる。
 2. client + 1 つの net の `tcp_conn` 上での get/post(平文)。**完了**(ブランチ
    `m11-http-slice2-client`)。提供する API(`import std.http` の下、すべて **非純粋** — ネットワーク):
    `http.client()`(Move の `http client` ハンドル。v1 では ZST — プール状態はまだ持たないが、FFI
@@ -187,9 +187,9 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
    Content-Length を自動付与し、メソッド/ヘッダー/スマグリングを検証)→ レスポンスをソケットから 32 KiB
    ずつ(1 行ずつではなく — R4)Content-Length まで読み、スライス 1 の `http_parse_core`(R1 ゼロコピー)で
    パースする。4xx/5xx は `Ok(response)`(P2)。`https://` や不正な URL はリクエスト時点で `Error.Invalid`
-   (P1 — 黙って平文にダウングレードしない)。フレーミングは Content-Length(または read-to-close)。
-   chunked は `Error.Invalid` のまま(スライス 1 の方針)。パーサはストリーミング読み取りが「もっとバイトが
-   必要」と「不正」を 1 つの共通デコーダで区別できるよう、`Incomplete`/`Invalid` の 2 分岐にリファクタした。
+   (P1 — 黙って平文にダウングレードしない)。フレーミングは Content-Length、HTTP/1.1 chunked、
+   read-to-close をサポートし、Request 4 が元の CL-only path を置き換えた。パーサはストリーミング読み取りが
+   「もっとバイトが必要」と「不正」を 1 つの共通デコーダで区別できるよう、`Incomplete`/`Invalid` の 2 分岐にリファクタした。
    プールはまだなし(各リクエストは新規接続して閉じる — keepalive の再利用はスライス 3)。`get_many` /
    server / HTTPS は残る。
 3. コネクションプールの再利用(基盤（レール） — keepalive、デフォルトで再利用)。**完了**(ブランチ
@@ -420,7 +420,7 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
    ハンドル。accept の前例）、HIR の `HttpRespondStream`/`HttpStreamSend`/`HttpStreamFinish`、いずれも
    `lower_http` を通す。テストはランタイムの unit（フレームエンコーダ、バージョン、共有 head の一致、
    poison、空 send の no-op）+ `crates/align_driver/tests/m12_http_stream.rs`（1.1 chunked / 1.0 raw /
-   切断 / poison / align 自身の client が chunked を拒否する非対称性 / 二重消費 + bodied abort の
+   切断 / poison / Align client の chunked dogfood / 二重消費 + bodied abort の
    ゲート）。（2 レンズのレビュー、Fable が統合。）gateway のトークンストリーミング層は: 呼び出し側が
    SSE の `data: …\n\n` 行をボディ内容として書き、std.http は**転送フレーミングのみ**を提供する
    （フレームワーク境界を保つ）。
@@ -458,8 +458,8 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
    - ストリーミングは slow-loris の caveat を再確認させる: stream は設計上、生成の全期間にわたって
      単一のブロッキング accept スレッドを保持する — 信頼済みネットワークの前提は攻撃時の caveat と
      いうだけでなく、設計上の荷重を負っている。
-   - client 側のパースは CL のみのまま（chunked → align 自身の client では `Error.Invalid` — 記録済みの
-     非対称性。gateway の client は外部のものである）。
+   - Request 4 が後に元の client 非対称性を除去した。Align 自身の whole-body client は streaming
+     server response を de-chunk し、decoded payload を公開する。
 8. **`respond_stream` の作り直し（pkg.web stream ルート向け）— 2026-07-21 設計、同日出荷。**
    pkg.web のストリーミング設計（`docs/impl/pkg-design/web.md` → 「ストリーミング」）が消費者である。
    stream ハンドラの実行中も framework がリクエストコンテキストを所有し続けること、および head 確定前の
@@ -991,11 +991,11 @@ accept 後無応答 → `AL_TIMEOUT`(read 経路、`SO_RCVTIMEO` + 平文写像�
 記録どおり);TLS トランスポートが唯一異なる `tls_read`/`tls_write_all` の `has_deadline` 写像は上に記述した。
 既存の http/TLS/pool/get_many/stream テストはすべて不変で通る(有効 0 のバイト一致不変条件)。
 
-## Client response framing (align-llm Request 4 — DESIGNED 2026-08-14)
+## Client response framing (align-llm Request 4 — DESIGNED + IMPLEMENTED 2026-08-14)
 
 `align-llm` の C1 provider adapter はすでに SSE event を parse するが、provider response は一般に
-HTTP/1.1 `Transfer-Encoding: chunked` を使う。出荷済み whole-body client は provider が body を見る
-前にこの framing を拒否する。Request 4 は既存の `cl.request` boundary を完成させる。chunked response
+HTTP/1.1 `Transfer-Encoding: chunked` を使う。Request 4 より前の whole-body client は provider が body を
+見る前にこの framing を拒否していた。Request 4 は既存の `cl.request` boundary を完成させる。chunked response
 を de-frame し、同じ owned `response` と zero-copy `resp.body()` view を返す。public type、method、
 option、ABI entry point、streaming-input handle、provider 固有 abstraction は追加しない。
 
@@ -1104,8 +1104,11 @@ benchmark は correctness gate ではない。この capability は新しい thr
 ### Delivery and adoption
 
 implementation は一つの runtime/owner-test capability PR。compiler/package/ABI layer は変更しない。
-implementation PR は historical item-7 client-asymmetry test を outright update し、本 section を implemented
-にする。merge 後、align-llm は次の許可された consumer-prerequisite wave で Align を rebuild/pin し、provider
+hand-written diff が約 1,000 行を超えるのは、strict head parser、incremental chunk/trailer decoder、
+exact-capacity accumulator、plaintext/TLS reuse verdict と単一 owner matrix が一つの producer-to-consumer
+failure domain をなすためである。分割すれば dormant parser を残すか、framing/cleanup/allocation proof を
+一時的 boundary 間で重複させる。実装は historical item-7 client-asymmetry test を outright update する。
+merge 後、align-llm は次の許可された consumer-prerequisite wave で Align を rebuild/pin し、provider
 stream fixture を Content-Length から chunked へ切り替え、valid SSE、malformed/truncated rejection、final
 status/header/body preservation を証明する。sibling request register が adoption evidence の lifecycle owner
 であり続ける。

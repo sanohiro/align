@@ -14881,8 +14881,8 @@ pub unsafe extern "C" fn align_rt_cli_parsed_free(parsed: *mut CliParsed) {
 //     reads the parsed code; `resp.header(name)` is a case-insensitive lookup returning a `str`
 //     **view** into the buffer; `resp.body()` is a `slice<u8>` **view** into the buffer.
 // Scanning rides the `memchr` crate (http.md R2 — AVX2/NEON/scalar, never byte-at-a-time). All ops
-// are pure in-language (no syscalls in this slice). v1 framing: Content-Length only — a `chunked`
-// Transfer-Encoding is rejected with `AL_INVALID` (de-chunking that honours R1 is deferred).
+// are pure in-language (no syscalls in this slice). Request 4 extended the shared response decoder
+// from Content-Length/read-to-close to strict HTTP/1.1 chunked framing while preserving R1.
 // ---------------------------------------------------------------------------------------------
 
 /// The response header-count cap: a response with more than this many headers is rejected
@@ -15297,17 +15297,17 @@ fn http_trim_ows(src: &[u8], start: usize, len: usize) -> (usize, usize) {
     (s, e - s)
 }
 
-/// Parse one CRLF- (or bare-LF-) terminated line starting at `pos` in `src`, returning
-/// `(line_start, line_len, next_pos)` where the line content excludes the terminator and any
-/// trailing `\r`. Returns `None` if there is no `\n` at or after `pos` (an unterminated line →
-/// malformed). Scans with `memchr` (http.md R2).
-fn http_next_line(src: &[u8], pos: usize) -> Option<(usize, usize, usize)> {
-    let nl = memchr::memchr(b'\n', &src[pos..])? + pos;
-    let mut end = nl;
-    if end > pos && src[end - 1] == b'\r' {
-        end -= 1;
+/// Parse one exact-CRLF-terminated line starting at `pos`, returning its content span and the next
+/// position. A bare LF is immediately invalid; no LF is a valid incomplete prefix. Response-head
+/// framing is strict before CL/TE selection so a peer and an intermediary cannot disagree.
+fn http_next_line(src: &[u8], pos: usize) -> Result<Option<(usize, usize, usize)>, HttpParseErr> {
+    let Some(nl) = memchr::memchr(b'\n', &src[pos..]).map(|i| i + pos) else {
+        return Ok(None);
+    };
+    if nl == pos || src[nl - 1] != b'\r' {
+        return Err(HttpParseErr::Invalid);
     }
-    Some((pos, end - pos, nl + 1))
+    Ok(Some((pos, nl - pos - 1, nl + 1)))
 }
 
 /// The outcome of a *partial* HTTP/1.1 response parse. The distinction is what lets the Slice-2
@@ -15320,10 +15320,17 @@ enum HttpParseErr {
     /// A valid-so-far prefix: the status line / header block isn't terminated yet, or a
     /// `Content-Length` body isn't fully present. The client reads more; the FFI treats it as invalid.
     Incomplete,
-    /// Definitively malformed: bad status line, non-numeric status, header without `:` / empty name,
-    /// over the header cap, a `chunked` Transfer-Encoding (v1 is Content-Length only), or a bad /
-    /// oversized `Content-Length`.
+    /// Definitively malformed response syntax or framing.
     Invalid,
+}
+
+/// A normalized decimal magnitude kept as a byte span into the exact response head. Leading zeroes
+/// are removed while retaining one zero for the all-zero case. Delaying target conversion is what
+/// lets HEAD/304 accept arbitrary valid metadata magnitudes without allocation or overflow.
+#[derive(Clone, Copy)]
+struct HttpDecimalSpan {
+    start: usize,
+    len: usize,
 }
 
 /// The parsed status line + header block of a response plus the body-framing decision. The `headers`
@@ -15335,52 +15342,97 @@ struct HttpHead {
     headers: HttpHeaderSpans,
     /// Offset in `src` just past the blank line terminating the header block (the body start).
     body_start: usize,
-    /// The declared `Content-Length`, or `None` for read-to-close framing (no CL, not chunked).
-    content_length: Option<usize>,
-    /// `true` iff the status line is exactly `HTTP/1.1` — the persistence default (keep-alive unless
-    /// `Connection: close`). Any other version (`1.0`, or an unknown version) is `false`, so the
-    /// keepalive default is close (conservative — the pool only reuses a conn it is sure about;
-    /// http.md R3). Used only by the client's reuse decision ([`http_head_keep_alive`]).
+    /// Normalized `Content-Length` metadata. Conversion happens only after method/status body
+    /// selection, so bodyless responses never convert or reserve from it.
+    content_length: Option<HttpDecimalSpan>,
+    /// Whether the one admitted Transfer-Encoding coding is exactly `chunked`.
+    chunked: bool,
+    /// `true` for exact HTTP/1.1, `false` for exact HTTP/1.0. No other version is admitted.
     http_1_1: bool,
 }
 
-/// Scan the status line + header block of `src` (up to and including the blank line), WITHOUT copying
-/// the body — the framing primitive shared by the streaming client and the owning parse. A `chunked`
-/// Transfer-Encoding is `Invalid` (v1 is Content-Length framing only; R1-honouring de-chunking is
-/// deferred). Scanning rides `memchr` (http.md R2).
+fn http_response_value_byte(b: u8) -> bool {
+    b == b'\t' || b == b' ' || (0x21..=0x7e).contains(&b) || b >= 0x80
+}
+
+fn http_normalize_decimal(src: &[u8], start: usize, len: usize) -> HttpDecimalSpan {
+    let mut skip = 0;
+    while skip + 1 < len && src[start + skip] == b'0' {
+        skip += 1;
+    }
+    HttpDecimalSpan { start: start + skip, len: len - skip }
+}
+
+fn http_decimal_spans_equal(src: &[u8], a: HttpDecimalSpan, b: HttpDecimalSpan) -> bool {
+    a.len == b.len && src[a.start..a.start + a.len] == src[b.start..b.start + b.len]
+}
+
+/// Validate one Transfer-Encoding field and add its coding count. The complete wire-order sequence
+/// must be exactly one case-insensitive `chunked` token with no parameters.
+fn http_parse_transfer_encoding(value: &[u8], coding_count: &mut usize) -> Result<(), HttpParseErr> {
+    let mut pos = 0;
+    loop {
+        while pos < value.len() && matches!(value[pos], b' ' | b'\t') {
+            pos += 1;
+        }
+        let start = pos;
+        while pos < value.len() && http_is_token(&value[pos..pos + 1]) {
+            pos += 1;
+        }
+        if pos == start || !value[start..pos].eq_ignore_ascii_case(b"chunked") {
+            return Err(HttpParseErr::Invalid);
+        }
+        while pos < value.len() && matches!(value[pos], b' ' | b'\t') {
+            pos += 1;
+        }
+        if pos < value.len() && value[pos] == b';' {
+            return Err(HttpParseErr::Invalid);
+        }
+        *coding_count = coding_count.checked_add(1).ok_or(HttpParseErr::Invalid)?;
+        if pos == value.len() {
+            return Ok(());
+        }
+        if value[pos] != b',' {
+            return Err(HttpParseErr::Invalid);
+        }
+        pos += 1;
+        if pos == value.len() {
+            return Err(HttpParseErr::Invalid);
+        }
+    }
+}
+
+/// Scan and strictly validate one complete or partial response head without copying it. Exact wire
+/// syntax is established before framing facts are returned.
 fn http_parse_head(src: &[u8]) -> Result<HttpHead, HttpParseErr> {
-    // --- status line: `HTTP/<v> <code> <reason>` ---
-    let Some((sl_start, sl_len, mut pos)) = http_next_line(src, 0) else {
+    let Some((sl_start, sl_len, mut pos)) = http_next_line(src, 0)? else {
         return Err(HttpParseErr::Incomplete); // no line terminator yet — read more
     };
     let status_line = &src[sl_start..sl_start + sl_len];
-    if !status_line.starts_with(b"HTTP/") {
+    if status_line.len() < 13
+        || (status_line[..8] != *b"HTTP/1.0" && status_line[..8] != *b"HTTP/1.1")
+        || status_line[8] != b' '
+        || !status_line[9..12].iter().all(u8::is_ascii_digit)
+        || status_line[12] != b' '
+        || !status_line[13..].iter().copied().all(http_response_value_byte)
+    {
         return Err(HttpParseErr::Invalid);
     }
-    // The status code is the second space-separated token; it must be all ASCII digits.
-    let Some(sp) = memchr::memchr(b' ', status_line) else {
-        return Err(HttpParseErr::Invalid);
-    };
-    // The version token is between `HTTP/` and that first space. Only exact `HTTP/1.1` defaults to
-    // keepalive; every other version (1.0 or unknown) defaults to close for the reuse decision.
-    let http_1_1 = &status_line[..sp] == b"HTTP/1.1";
-    let after = &status_line[sp + 1..];
-    let code_end = memchr::memchr(b' ', after).unwrap_or(after.len());
-    let code_bytes = &after[..code_end];
-    if code_bytes.is_empty() || !code_bytes.iter().all(|b| b.is_ascii_digit()) {
+    let status = ((status_line[9] - b'0') as i64) * 100
+        + ((status_line[10] - b'0') as i64) * 10
+        + (status_line[11] - b'0') as i64;
+    if status < 100 {
         return Err(HttpParseErr::Invalid);
     }
-    let Ok(status) = std::str::from_utf8(code_bytes).unwrap_or("").parse::<i64>() else {
-        return Err(HttpParseErr::Invalid);
-    };
+    let http_1_1 = status_line[..8] == *b"HTTP/1.1";
 
     // --- headers: lines up to the first empty line ---
     let mut headers = HttpHeaderSpans::new();
-    let mut content_length: Option<usize> = None;
-    let mut is_chunked = false;
+    let mut content_length: Option<HttpDecimalSpan> = None;
+    let mut transfer_codings = 0usize;
     let body_start;
     loop {
-        let Some((ls, ll, next)) = http_next_line(src, pos) else {
+        let Some((ls, ll, next)) = http_next_line(src, pos)? else {
             return Err(HttpParseErr::Incomplete); // no empty line yet — the header block is truncated
         };
         if ll == 0 {
@@ -15394,96 +15446,672 @@ fn http_parse_head(src: &[u8]) -> Result<HttpHead, HttpParseErr> {
         let Some(colon) = memchr::memchr(b':', line) else {
             return Err(HttpParseErr::Invalid); // a header line must have a `:`
         };
-        let (name_start, name_len) = http_trim_ows(src, ls, colon);
-        let (value_start, value_len) = http_trim_ows(src, ls + colon + 1, ll - colon - 1);
-        if name_len == 0 {
-            return Err(HttpParseErr::Invalid); // empty header name
+        // Field names are exact RFC tokens immediately followed by `:`. No OWS or obs-fold is
+        // admitted before framing classification.
+        if colon == 0 || !http_is_token(&line[..colon]) {
+            return Err(HttpParseErr::Invalid);
         }
+        let name_start = ls;
+        let name_len = colon;
+        let raw_value = &line[colon + 1..];
+        if !raw_value.iter().copied().all(http_response_value_byte) {
+            return Err(HttpParseErr::Invalid);
+        }
+        let (value_start, value_len) = http_trim_ows(src, ls + colon + 1, ll - colon - 1);
         let name = &src[name_start..name_start + name_len];
         let value = &src[value_start..value_start + value_len];
         if name.eq_ignore_ascii_case(b"content-length") {
-            // RFC 9112 §6.2: Content-Length is a bare sequence of ASCII digits. `parse::<usize>`
-            // alone would accept a leading `+` (`+3` → 3), a framing differential vs. stricter peers
-            // (smuggling), so require digits-only first; an empty value is likewise rejected.
             if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
                 return Err(HttpParseErr::Invalid);
             }
-            // Digits-only above ⇒ valid UTF-8; parse still guards against a usize overflow (→ Invalid,
-            // never a panic) for an absurdly long digit run.
-            let Ok(n) = std::str::from_utf8(value).unwrap_or("x").parse::<usize>() else {
-                return Err(HttpParseErr::Invalid);
-            };
-            // RFC 7230 §3.3.3: a second Content-Length whose value *conflicts* with the first is a
-            // response-smuggling vector (two proxies could frame the body differently) → reject. An
-            // identical repeat is harmless and accepted.
-            if content_length.is_some_and(|prev| prev != n) {
+            let normalized = http_normalize_decimal(src, value_start, value_len);
+            if content_length.is_some_and(|prev| !http_decimal_spans_equal(src, prev, normalized)) {
                 return Err(HttpParseErr::Invalid);
             }
-            content_length = Some(n);
-        } else if name.eq_ignore_ascii_case(b"transfer-encoding")
-            && value.to_ascii_lowercase().windows(7).any(|w| w == b"chunked")
-        {
-            is_chunked = true;
+            content_length = Some(normalized);
+        } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            http_parse_transfer_encoding(value, &mut transfer_codings)?;
         }
         headers.push(HttpHeaderSpan { name_start, name_len, value_start, value_len });
         pos = next;
     }
-    if is_chunked {
-        return Err(HttpParseErr::Invalid); // `chunked` de-chunking is deferred (v1 = Content-Length only)
-    }
-    Ok(HttpHead { status, headers, body_start, content_length, http_1_1 })
-}
-
-/// Parse a COMPLETE HTTP/1.1 response buffer into an owned [`HttpResponse`] (http.md R1 — one owned
-/// copy of the bytes + an offset table; no per-header allocation, no body copy beyond the single
-/// buffer). `Incomplete` if the header block is unterminated or a `Content-Length` body runs past
-/// `src` (a truncated read); `Invalid` on any malformed head or over-cap body. Shared by the codec
-/// FFI and the Slice-2 client — the ONE authoritative response decoder.
-fn http_response_from_head(buf: Vec<u8>, head: HttpHead) -> Result<HttpResponse, HttpParseErr> {
-    // --- body framing (v1: Content-Length only; chunked already rejected in the head scan) ---
-    let body_len = match head.content_length {
-        Some(n) => {
-            if n > HTTP_MAX_BODY {
-                return Err(HttpParseErr::Invalid); // over cap
-            }
-            // `checked_add` (Gate-2 discipline): a wrap would otherwise turn an out-of-buffer body
-            // into an in-bounds one. A body running past `src` is a truncated read → `Incomplete`.
-            match head.body_start.checked_add(n) {
-                Some(end) if end <= buf.len() => n,
-                Some(_) => return Err(HttpParseErr::Incomplete),
-                None => return Err(HttpParseErr::Invalid),
-            }
-        }
-        // No Content-Length and not chunked: the body is everything remaining (read-to-close), which
-        // for a complete buffer is the tail after the header terminator.
-        None => buf.len() - head.body_start,
-    };
-    if body_len > HTTP_MAX_BODY {
+    if transfer_codings > 1 || (transfer_codings == 1 && (!http_1_1 || content_length.is_some())) {
         return Err(HttpParseErr::Invalid);
     }
-    Ok(HttpResponse {
-        buf,
-        status: head.status,
-        headers: head.headers,
-        body_start: head.body_start,
-        body_len,
-    })
+    Ok(HttpHead { status, headers, body_start, content_length, chunked: transfer_codings == 1, http_1_1 })
+}
+
+const HTTP_MAX_CHUNK_LINE: usize = 8 * 1024;
+const HTTP_MAX_CHUNK_FRAMING: usize = 256 * 1024;
+const HTTP_MAX_TRAILER_BLOCK: usize = HTTP_MAX_HEADER_BLOCK;
+const HTTP_MAX_RESPONSE_LOGICAL: usize = HTTP_MAX_HEADER_BLOCK + HTTP_MAX_BODY;
+
+/// Exact-capacity response storage. `Vec::reserve*` may expose allocator-dependent excess capacity,
+/// so the decoder grows one boxed allocation to an explicit geometric target and converts the final
+/// allocation into the response Vec without reallocating.
+struct HttpResponseAccumulator {
+    storage: Box<[core::mem::MaybeUninit<u8>]>,
+    len: usize,
+    #[cfg(test)]
+    growths: usize,
+}
+
+fn http_response_growth_target(current: usize, needed: usize) -> Option<usize> {
+    if needed > HTTP_MAX_RESPONSE_LOGICAL {
+        return None;
+    }
+    let first = HTTP_CLIENT_READ_CHUNK.min(HTTP_MAX_RESPONSE_LOGICAL);
+    let geometric = current.checked_mul(2).unwrap_or(HTTP_MAX_RESPONSE_LOGICAL);
+    let target = needed.max(first).max(geometric).min(HTTP_MAX_RESPONSE_LOGICAL);
+    (target >= needed).then_some(target)
+}
+
+impl HttpResponseAccumulator {
+    fn new() -> Self {
+        Self {
+            storage: Box::<[u8]>::new_uninit_slice(0),
+            len: 0,
+            #[cfg(test)]
+            growths: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn capacity(&self) -> usize {
+        self.storage.len()
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: `0..len` is initialised only by `push`/`extend_from_slice`, and `len <= capacity`.
+        unsafe { core::slice::from_raw_parts(self.storage.as_ptr().cast::<u8>(), self.len) }
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    fn ensure_capacity(&mut self, needed: usize) -> Result<(), HttpParseErr> {
+        if needed <= self.capacity() {
+            return Ok(());
+        }
+        let target = http_response_growth_target(self.capacity(), needed).ok_or(HttpParseErr::Invalid)?;
+        debug_assert!(self.capacity() < target && target <= HTTP_MAX_RESPONSE_LOGICAL);
+        let mut next = Box::<[u8]>::new_uninit_slice(target);
+        // SAFETY: both allocations are valid for `len` bytes, do not overlap, and the old prefix is
+        // initialised. The old box stays live through the copy and is freed on assignment.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                self.storage.as_ptr().cast::<u8>(),
+                next.as_mut_ptr().cast::<u8>(),
+                self.len,
+            );
+        }
+        self.storage = next;
+        #[cfg(test)]
+        {
+            self.growths += 1;
+        }
+        Ok(())
+    }
+
+    fn push(&mut self, byte: u8) -> Result<(), HttpParseErr> {
+        let needed = self.len.checked_add(1).ok_or(HttpParseErr::Invalid)?;
+        self.ensure_capacity(needed)?;
+        self.storage[self.len].write(byte);
+        self.len = needed;
+        Ok(())
+    }
+
+    fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<(), HttpParseErr> {
+        let needed = self.len.checked_add(bytes.len()).ok_or(HttpParseErr::Invalid)?;
+        self.ensure_capacity(needed)?;
+        // SAFETY: the target spare range is valid, non-overlapping, and becomes initialised.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.storage.as_mut_ptr().cast::<u8>().add(self.len),
+                bytes.len(),
+            );
+        }
+        self.len = needed;
+        Ok(())
+    }
+
+    fn ends_with(&self, suffix: &[u8]) -> bool {
+        self.as_slice().ends_with(suffix)
+    }
+
+    fn into_vec(self) -> Vec<u8> {
+        let cap = self.storage.len();
+        if cap == 0 {
+            return Vec::new();
+        }
+        let len = self.len;
+        let raw = Box::into_raw(self.storage);
+        let ptr = raw.cast::<core::mem::MaybeUninit<u8>>().cast::<u8>();
+        // SAFETY: the box was allocated for exactly `cap` u8-layout elements, `0..len` is
+        // initialised, and ownership of that allocation was transferred by `Box::into_raw`.
+        unsafe { Vec::from_raw_parts(ptr, len, cap) }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HttpDecodeState {
+    Head,
+    Fixed { remaining: usize },
+    CloseDelimited,
+    ChunkSize,
+    ChunkData { remaining: usize },
+    ChunkDataCrLf { seen: u8 },
+    Trailers,
+    Complete,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HttpTrailerState {
+    Start,
+    Name,
+    Value,
+    LineLf,
+    FinalLf,
+}
+
+struct HttpResponseDecoder {
+    acc: HttpResponseAccumulator,
+    state: HttpDecodeState,
+    final_head: Option<HttpHead>,
+    method_is_head: bool,
+    keep_alive: bool,
+    cumulative_head_bytes: usize,
+    chunk_line: [u8; HTTP_MAX_CHUNK_LINE],
+    chunk_line_len: usize,
+    chunk_framing_bytes: usize,
+    trailer_state: HttpTrailerState,
+    trailer_bytes: usize,
+    trailer_count: usize,
+    trailer_name_len: usize,
+    trailer_is_content_length: bool,
+    trailer_is_transfer_encoding: bool,
+}
+
+impl HttpResponseDecoder {
+    fn new(method_is_head: bool) -> Self {
+        Self {
+            acc: HttpResponseAccumulator::new(),
+            state: HttpDecodeState::Head,
+            final_head: None,
+            method_is_head,
+            keep_alive: false,
+            cumulative_head_bytes: 0,
+            chunk_line: [0; HTTP_MAX_CHUNK_LINE],
+            chunk_line_len: 0,
+            chunk_framing_bytes: 0,
+            trailer_state: HttpTrailerState::Start,
+            trailer_bytes: 0,
+            trailer_count: 0,
+            trailer_name_len: 0,
+            trailer_is_content_length: true,
+            trailer_is_transfer_encoding: true,
+        }
+    }
+
+    fn complete(&self) -> bool {
+        self.state == HttpDecodeState::Complete
+    }
+
+    fn next_read_limit(&self) -> usize {
+        let remaining = match self.state {
+            HttpDecodeState::Head => HTTP_MAX_HEADER_BLOCK.saturating_sub(self.cumulative_head_bytes),
+            HttpDecodeState::ChunkSize => HTTP_MAX_CHUNK_LINE
+                .saturating_sub(self.chunk_line_len)
+                .min(HTTP_MAX_CHUNK_FRAMING.saturating_sub(self.chunk_framing_bytes)),
+            HttpDecodeState::ChunkData { remaining } => remaining.saturating_add(
+                HTTP_MAX_CHUNK_FRAMING.saturating_sub(self.chunk_framing_bytes),
+            ),
+            HttpDecodeState::ChunkDataCrLf { .. } => {
+                HTTP_MAX_CHUNK_FRAMING.saturating_sub(self.chunk_framing_bytes)
+            }
+            HttpDecodeState::Trailers => HTTP_MAX_TRAILER_BLOCK.saturating_sub(self.trailer_bytes),
+            // Keep the eventual final fixed-length read one byte wider than the framed remainder
+            // so an immediately available overshoot is observed and makes the conn non-reusable.
+            // A full-sized read at an exact 32 KiB multiple would otherwise consume the framing
+            // boundary exactly, so leave one byte for that final probe-sized read.
+            HttpDecodeState::Fixed { remaining } if remaining > HTTP_CLIENT_READ_CHUNK => {
+                HTTP_CLIENT_READ_CHUNK
+            }
+            HttpDecodeState::Fixed { remaining } if remaining == HTTP_CLIENT_READ_CHUNK => {
+                HTTP_CLIENT_READ_CHUNK - 1
+            }
+            HttpDecodeState::Fixed { remaining } => remaining.saturating_add(1),
+            HttpDecodeState::CloseDelimited => HTTP_CLIENT_READ_CHUNK,
+            HttpDecodeState::Complete => 0,
+        };
+        remaining.min(HTTP_CLIENT_READ_CHUNK)
+    }
+
+    fn decimal_body_len(&self, span: HttpDecimalSpan) -> Result<usize, HttpParseErr> {
+        let mut n = 0usize;
+        for &digit in &self.acc.as_slice()[span.start..span.start + span.len] {
+            let d = (digit - b'0') as usize;
+            if n > (HTTP_MAX_BODY - d) / 10 {
+                return Err(HttpParseErr::Invalid);
+            }
+            n = n * 10 + d;
+        }
+        Ok(n)
+    }
+
+    fn select_head(&mut self, head: HttpHead) -> Result<(), HttpParseErr> {
+        if head.status == 101 {
+            return Err(HttpParseErr::Invalid);
+        }
+        if (100..=199).contains(&head.status) {
+            if head.content_length.is_some() || head.chunked {
+                return Err(HttpParseErr::Invalid);
+            }
+            self.acc.clear();
+            self.state = HttpDecodeState::Head;
+            if self.cumulative_head_bytes == HTTP_MAX_HEADER_BLOCK {
+                return Err(HttpParseErr::Invalid);
+            }
+            return Ok(());
+        }
+        if head.status == 204 && (head.content_length.is_some() || head.chunked) {
+            return Err(HttpParseErr::Invalid);
+        }
+
+        self.keep_alive = http_head_keep_alive(&head, self.acc.as_slice());
+        let bodyless = self.method_is_head || head.status == 204 || head.status == 304;
+        if bodyless {
+            self.final_head = Some(head);
+            self.state = HttpDecodeState::Complete;
+            return Ok(());
+        }
+        if head.chunked {
+            self.final_head = Some(head);
+            self.state = HttpDecodeState::ChunkSize;
+            return Ok(());
+        }
+        if let Some(span) = head.content_length {
+            let remaining = self.decimal_body_len(span)?;
+            self.final_head = Some(head);
+            self.state = if remaining == 0 {
+                HttpDecodeState::Complete
+            } else {
+                HttpDecodeState::Fixed { remaining }
+            };
+            return Ok(());
+        }
+        self.final_head = Some(head);
+        self.state = HttpDecodeState::CloseDelimited;
+        Ok(())
+    }
+
+    fn parse_chunk_line(&mut self) -> Result<(), HttpParseErr> {
+        // The shortest valid line is one hex digit plus CRLF. An empty CRLF line is malformed
+        // peer input, not an internal invariant, so reject it before slicing instead of asserting.
+        if self.chunk_line_len < 3 {
+            return Err(HttpParseErr::Invalid);
+        }
+        let line = &self.chunk_line[..self.chunk_line_len - 2];
+        let mut pos = 0;
+        let digit_start = pos;
+        let mut size = 0usize;
+        let mut magnitude_ok = true;
+        while pos < line.len() && line[pos].is_ascii_hexdigit() {
+            let d = match line[pos] {
+                b'0'..=b'9' => (line[pos] - b'0') as usize,
+                b'a'..=b'f' => (line[pos] - b'a' + 10) as usize,
+                b'A'..=b'F' => (line[pos] - b'A' + 10) as usize,
+                _ => return Err(HttpParseErr::Invalid),
+            };
+            if magnitude_ok {
+                if size > (HTTP_MAX_BODY - d) / 16 {
+                    magnitude_ok = false;
+                } else {
+                    size = size * 16 + d;
+                }
+            }
+            pos += 1;
+        }
+        if pos == digit_start {
+            return Err(HttpParseErr::Invalid);
+        }
+        while pos < line.len() {
+            while pos < line.len() && matches!(line[pos], b' ' | b'\t') {
+                pos += 1;
+            }
+            if pos == line.len() {
+                return Err(HttpParseErr::Invalid);
+            }
+            if line[pos] != b';' {
+                return Err(HttpParseErr::Invalid);
+            }
+            pos += 1;
+            while pos < line.len() && matches!(line[pos], b' ' | b'\t') {
+                pos += 1;
+            }
+            let name_start = pos;
+            while pos < line.len() && http_is_token(&line[pos..pos + 1]) {
+                pos += 1;
+            }
+            if pos == name_start {
+                return Err(HttpParseErr::Invalid);
+            }
+            while pos < line.len() && matches!(line[pos], b' ' | b'\t') {
+                pos += 1;
+            }
+            if pos < line.len() && line[pos] == b'=' {
+                pos += 1;
+                while pos < line.len() && matches!(line[pos], b' ' | b'\t') {
+                    pos += 1;
+                }
+                if pos == line.len() {
+                    return Err(HttpParseErr::Invalid);
+                }
+                if line[pos] == b'"' {
+                    pos += 1;
+                    let mut closed = false;
+                    while pos < line.len() {
+                        match line[pos] {
+                            b'"' => {
+                                pos += 1;
+                                closed = true;
+                                break;
+                            }
+                            b'\\' => {
+                                pos += 1;
+                                if pos == line.len()
+                                    || !(line[pos] == b'\t'
+                                        || line[pos] == b' '
+                                        || (0x21..=0x7e).contains(&line[pos])
+                                        || line[pos] >= 0x80)
+                                {
+                                    return Err(HttpParseErr::Invalid);
+                                }
+                                pos += 1;
+                            }
+                            b if b == b'\t'
+                                || b == b' '
+                                || b == b'!'
+                                || (0x23..=0x5b).contains(&b)
+                                || (0x5d..=0x7e).contains(&b)
+                                || b >= 0x80 => pos += 1,
+                            _ => return Err(HttpParseErr::Invalid),
+                        }
+                    }
+                    if !closed {
+                        return Err(HttpParseErr::Invalid);
+                    }
+                } else {
+                    let value_start = pos;
+                    while pos < line.len() && http_is_token(&line[pos..pos + 1]) {
+                        pos += 1;
+                    }
+                    if pos == value_start {
+                        return Err(HttpParseErr::Invalid);
+                    }
+                }
+                while pos < line.len() && matches!(line[pos], b' ' | b'\t') {
+                    pos += 1;
+                }
+            }
+        }
+        if !magnitude_ok {
+            return Err(HttpParseErr::Invalid);
+        }
+        let body_len = self.acc.len().saturating_sub(
+            self.final_head.as_ref().ok_or(HttpParseErr::Invalid)?.body_start,
+        );
+        if body_len.checked_add(size).is_none_or(|n| n > HTTP_MAX_BODY) {
+            return Err(HttpParseErr::Invalid);
+        }
+        self.chunk_line_len = 0;
+        self.state = if size == 0 {
+            self.trailer_state = HttpTrailerState::Start;
+            HttpDecodeState::Trailers
+        } else {
+            HttpDecodeState::ChunkData { remaining: size }
+        };
+        Ok(())
+    }
+
+    fn charge_chunk_framing(&mut self, b: u8) -> Result<(), HttpParseErr> {
+        self.chunk_framing_bytes = self.chunk_framing_bytes.checked_add(1).ok_or(HttpParseErr::Invalid)?;
+        if self.chunk_framing_bytes > HTTP_MAX_CHUNK_FRAMING {
+            return Err(HttpParseErr::Invalid);
+        }
+        if self.chunk_line_len == HTTP_MAX_CHUNK_LINE {
+            return Err(HttpParseErr::Invalid);
+        }
+        self.chunk_line[self.chunk_line_len] = b;
+        self.chunk_line_len += 1;
+        Ok(())
+    }
+
+    fn reset_trailer_name(&mut self, first: u8) {
+        self.trailer_name_len = 1;
+        self.trailer_is_content_length = first.eq_ignore_ascii_case(&b'c');
+        self.trailer_is_transfer_encoding = first.eq_ignore_ascii_case(&b't');
+    }
+
+    fn extend_trailer_name(&mut self, b: u8) {
+        const CL: &[u8] = b"content-length";
+        const TE: &[u8] = b"transfer-encoding";
+        let i = self.trailer_name_len;
+        self.trailer_is_content_length &= i < CL.len() && b.eq_ignore_ascii_case(&CL[i]);
+        self.trailer_is_transfer_encoding &= i < TE.len() && b.eq_ignore_ascii_case(&TE[i]);
+        self.trailer_name_len += 1;
+    }
+
+    fn feed_trailer_byte(&mut self, b: u8) -> Result<(), HttpParseErr> {
+        self.trailer_bytes = self.trailer_bytes.checked_add(1).ok_or(HttpParseErr::Invalid)?;
+        if self.trailer_bytes > HTTP_MAX_TRAILER_BLOCK {
+            return Err(HttpParseErr::Invalid);
+        }
+        match self.trailer_state {
+            HttpTrailerState::Start => {
+                if b == b'\r' {
+                    self.trailer_state = HttpTrailerState::FinalLf;
+                } else if http_is_token(core::slice::from_ref(&b)) {
+                    let final_headers = self.final_head.as_ref().ok_or(HttpParseErr::Invalid)?.headers.len();
+                    if final_headers.checked_add(self.trailer_count).is_none_or(|n| n >= HTTP_MAX_HEADERS) {
+                        return Err(HttpParseErr::Invalid);
+                    }
+                    self.reset_trailer_name(b);
+                    self.trailer_state = HttpTrailerState::Name;
+                } else {
+                    return Err(HttpParseErr::Invalid);
+                }
+            }
+            HttpTrailerState::Name => {
+                if http_is_token(core::slice::from_ref(&b)) {
+                    self.extend_trailer_name(b);
+                } else if b == b':' {
+                    if (self.trailer_is_content_length && self.trailer_name_len == b"content-length".len())
+                        || (self.trailer_is_transfer_encoding
+                            && self.trailer_name_len == b"transfer-encoding".len())
+                    {
+                        return Err(HttpParseErr::Invalid);
+                    }
+                    self.trailer_count += 1;
+                    self.trailer_state = HttpTrailerState::Value;
+                } else {
+                    return Err(HttpParseErr::Invalid);
+                }
+            }
+            HttpTrailerState::Value => {
+                if b == b'\r' {
+                    self.trailer_state = HttpTrailerState::LineLf;
+                } else if !http_response_value_byte(b) {
+                    return Err(HttpParseErr::Invalid);
+                }
+            }
+            HttpTrailerState::LineLf => {
+                if b != b'\n' {
+                    return Err(HttpParseErr::Invalid);
+                }
+                self.trailer_state = HttpTrailerState::Start;
+            }
+            HttpTrailerState::FinalLf => {
+                if b != b'\n' {
+                    return Err(HttpParseErr::Invalid);
+                }
+                self.state = HttpDecodeState::Complete;
+            }
+        }
+        if self.trailer_bytes == HTTP_MAX_TRAILER_BLOCK && !self.complete() {
+            return Err(HttpParseErr::Invalid);
+        }
+        Ok(())
+    }
+
+    /// Feed available wire bytes. Returns `(consumed, complete)`; unconsumed bytes are residual and
+    /// never enter the returned response.
+    fn feed(&mut self, input: &[u8]) -> Result<(usize, bool), HttpParseErr> {
+        let mut pos = 0usize;
+        while pos < input.len() && !self.complete() {
+            match self.state {
+                HttpDecodeState::Head => {
+                    self.cumulative_head_bytes = self
+                        .cumulative_head_bytes
+                        .checked_add(1)
+                        .ok_or(HttpParseErr::Invalid)?;
+                    if self.cumulative_head_bytes > HTTP_MAX_HEADER_BLOCK {
+                        return Err(HttpParseErr::Invalid);
+                    }
+                    self.acc.push(input[pos])?;
+                    pos += 1;
+                    if self.acc.ends_with(b"\r\n\r\n") {
+                        let head = http_parse_head(self.acc.as_slice())?;
+                        self.select_head(head)?;
+                    } else if self.cumulative_head_bytes == HTTP_MAX_HEADER_BLOCK {
+                        return Err(HttpParseErr::Invalid);
+                    }
+                }
+                HttpDecodeState::Fixed { remaining } => {
+                    let take = remaining.min(input.len() - pos);
+                    self.acc.extend_from_slice(&input[pos..pos + take])?;
+                    pos += take;
+                    let left = remaining - take;
+                    self.state = if left == 0 {
+                        HttpDecodeState::Complete
+                    } else {
+                        HttpDecodeState::Fixed { remaining: left }
+                    };
+                }
+                HttpDecodeState::CloseDelimited => {
+                    self.acc.extend_from_slice(&input[pos..])?;
+                    pos = input.len();
+                }
+                HttpDecodeState::ChunkSize => {
+                    let b = input[pos];
+                    pos += 1;
+                    self.charge_chunk_framing(b)?;
+                    if b == b'\n' {
+                        if self.chunk_line_len < 2 || self.chunk_line[self.chunk_line_len - 2] != b'\r' {
+                            return Err(HttpParseErr::Invalid);
+                        }
+                        self.parse_chunk_line()?;
+                    }
+                    if self.chunk_framing_bytes == HTTP_MAX_CHUNK_FRAMING
+                        && !matches!(self.state, HttpDecodeState::Trailers)
+                    {
+                        return Err(HttpParseErr::Invalid);
+                    }
+                }
+                HttpDecodeState::ChunkData { remaining } => {
+                    let take = remaining.min(input.len() - pos);
+                    self.acc.extend_from_slice(&input[pos..pos + take])?;
+                    pos += take;
+                    let left = remaining - take;
+                    self.state = if left == 0 {
+                        HttpDecodeState::ChunkDataCrLf { seen: 0 }
+                    } else {
+                        HttpDecodeState::ChunkData { remaining: left }
+                    };
+                }
+                HttpDecodeState::ChunkDataCrLf { seen } => {
+                    let b = input[pos];
+                    pos += 1;
+                    self.chunk_framing_bytes = self
+                        .chunk_framing_bytes
+                        .checked_add(1)
+                        .ok_or(HttpParseErr::Invalid)?;
+                    if self.chunk_framing_bytes > HTTP_MAX_CHUNK_FRAMING
+                        || (seen == 0 && b != b'\r')
+                        || (seen == 1 && b != b'\n')
+                    {
+                        return Err(HttpParseErr::Invalid);
+                    }
+                    self.state = if seen == 1 {
+                        self.chunk_line_len = 0;
+                        HttpDecodeState::ChunkSize
+                    } else {
+                        HttpDecodeState::ChunkDataCrLf { seen: 1 }
+                    };
+                    if self.chunk_framing_bytes == HTTP_MAX_CHUNK_FRAMING {
+                        return Err(HttpParseErr::Invalid);
+                    }
+                }
+                HttpDecodeState::Trailers => {
+                    let b = input[pos];
+                    pos += 1;
+                    self.feed_trailer_byte(b)?;
+                }
+                HttpDecodeState::Complete => break,
+            }
+        }
+        Ok((pos, self.complete()))
+    }
+
+    fn finish_eof(&mut self) -> Result<(), HttpParseErr> {
+        match self.state {
+            HttpDecodeState::CloseDelimited => {
+                self.state = HttpDecodeState::Complete;
+                Ok(())
+            }
+            HttpDecodeState::Complete => Ok(()),
+            _ => Err(HttpParseErr::Incomplete),
+        }
+    }
+
+    fn into_response(self) -> Result<HttpResponse, HttpParseErr> {
+        if !self.complete() {
+            return Err(HttpParseErr::Incomplete);
+        }
+        let head = self.final_head.ok_or(HttpParseErr::Invalid)?;
+        let body_len = self.acc.len().checked_sub(head.body_start).ok_or(HttpParseErr::Invalid)?;
+        if body_len > HTTP_MAX_BODY {
+            return Err(HttpParseErr::Invalid);
+        }
+        Ok(HttpResponse {
+            buf: self.acc.into_vec(),
+            status: head.status,
+            headers: head.headers,
+            body_start: head.body_start,
+            body_len,
+        })
+    }
 }
 
 fn http_parse_core(src: &[u8]) -> Result<HttpResponse, HttpParseErr> {
-    let head = http_parse_head(src)?;
-    // The complete-buffer FFI borrows its input, so its response must own one copy. The socket
-    // client already owns its receive buffer and calls `http_response_from_head` directly instead.
-    http_response_from_head(src.to_vec(), head)
+    let mut decoder = HttpResponseDecoder::new(false);
+    decoder.feed(src)?;
+    decoder.finish_eof()?;
+    decoder.into_response()
 }
 
 /// `http.parse(bytes)` — parse a complete HTTP/1.1 response buffer into an owned [`HttpResponse`]
 /// (http.md R1 — one owned copy of the bytes + an offset table; no per-header allocation, no body
 /// copy beyond the single buffer). Writes the handle to `*out` and returns `0`, or `AL_INVALID`
 /// (→ `Error.Invalid`) leaving `*out` null on: a malformed / missing status line, a non-numeric
-/// status, a header line without `:`, more than [`HTTP_MAX_HEADERS`] headers, a `chunked`
-/// Transfer-Encoding (unsupported in v1), a `Content-Length` that is non-numeric / exceeds
-/// [`HTTP_MAX_BODY`] / runs past the buffer, or a truncated header block.
+/// status, a header line without `:`, more than [`HTTP_MAX_HEADERS`] headers, malformed response
+/// framing, a decoded body above [`HTTP_MAX_BODY`], or a truncated response. Supported HTTP/1.1
+/// chunked framing is decoded into the same contiguous owned body as fixed/close-delimited input.
 ///
 /// # Safety
 /// `data_ptr`/`data_len` must describe a valid byte range (or be `{null,<=0}`); `out` must point to
@@ -15698,6 +16326,8 @@ unsafe extern "C" {
     fn SSL_write(ssl: *mut c_void, buf: *const c_void, num: c_int) -> c_int;
     fn SSL_get_error(ssl: *const c_void, ret: c_int) -> c_int;
     fn SSL_get_verify_result(ssl: *const c_void) -> c_long;
+    fn SSL_pending(ssl: *const c_void) -> c_int;
+    fn SSL_has_pending(ssl: *const c_void) -> c_int;
     fn SSL_shutdown(ssl: *mut c_void) -> c_int;
     // Test-only trust injection (see `build_tls_client_ctx`): loads an extra CA so a self-signed
     // local test server is trusted. `#[cfg(test)]`, so this symbol is not even referenced by the
@@ -15850,6 +16480,16 @@ impl Conn {
         match *self {
             Conn::Plain { fd } => unsafe { plain_read(fd, dst, len) },
             Conn::Tls { ssl, .. } => unsafe { tls_read(ssl, dst, len, has_deadline) },
+        }
+    }
+
+    /// Whether OpenSSL has already buffered application bytes or record/plaintext work outside
+    /// Align's read scratch. Such a TLS conn cannot be pooled: its next response would otherwise
+    /// begin from hidden residual state even when the scratch itself ended exactly at framing.
+    fn has_pending(&self) -> bool {
+        match *self {
+            Conn::Plain { .. } => false,
+            Conn::Tls { ssl, .. } => unsafe { SSL_pending(ssl) > 0 || SSL_has_pending(ssl) != 0 },
         }
     }
 
@@ -16567,9 +17207,8 @@ fn http_split_authority(authority: &str, default_port: i64) -> Option<(&str, i64
 /// response byte was seen (a reused idle conn that fails with zero bytes is an idle-close race → retry
 /// once on a fresh conn; a fresh conn's failure, or a mid-response failure, is returned as-is).
 enum HttpExchange {
-    /// A complete parsed response. `reusable` = keep-alive AND Content-Length-framed AND no bytes
-    /// beyond the framed message (a keepalive server sends exactly one response per request; a
-    /// read-to-close response, a `Connection: close`, or leftover bytes make the conn non-reusable).
+    /// A complete parsed response. `reusable` means self-delimited, keep-alive eligible, and free of
+    /// both Align-scratch and OpenSSL-pending residual bytes.
     Complete { response: HttpResponse, reusable: bool },
     /// The exchange failed. `received_any` distinguishes a pre-response failure (retryable on a reused
     /// conn) from a mid-response one.
@@ -16578,47 +17217,11 @@ enum HttpExchange {
 
 const HTTP_CLIENT_READ_CHUNK: usize = 32 * 1024;
 
-/// Read one framed body step directly into `buf`'s uninitialised spare capacity. Capacity grows at
-/// most geometrically toward `framed_total`: an untrusted huge Content-Length cannot force its full
-/// allocation before the peer has sent a comparable amount of data. `read_limit` may be smaller
-/// than that spare capacity so the caller can preserve room for an overshoot-detecting final read.
-///
-/// # Safety
-/// `conn` must be live; `framed_total > buf.len()`, and `read_limit` must fit in that remainder.
-unsafe fn http_conn_read_into(
-    conn: &mut Conn,
-    buf: &mut Vec<u8>,
-    framed_total: usize,
-    read_limit: usize,
-    has_deadline: bool,
-) -> ConnRead {
-    let len = buf.len();
-    debug_assert!(framed_total > len);
-    debug_assert!((1..=framed_total - len).contains(&read_limit));
-    let desired = buf
-        .capacity()
-        .saturating_mul(2)
-        .max(len + HTTP_CLIENT_READ_CHUNK)
-        .min(framed_total);
-    buf.reserve_exact(desired - len);
-    let writable = (buf.capacity() - len).min(read_limit);
-    debug_assert!(writable > 0);
-    let result = unsafe { conn.read_raw(buf.as_mut_ptr().add(len), writable, has_deadline) };
-    match result {
-        ConnRead::Data(n) if n <= writable => {
-            // The transport initialised exactly these `n` bytes, and `n <= writable <= spare`.
-            unsafe { buf.set_len(len + n) };
-            ConnRead::Data(n)
-        }
-        ConnRead::Data(_) => ConnRead::Err(AL_INVALID),
-        other => other,
-    }
-}
-
 /// Send `request` (the serialized bytes, one write — http.md R4) over `conn` (plaintext or TLS —
 /// the [`Conn`] abstraction keeps this loop single-sourced), then stream the response into one
-/// growing buffer, stopping at the Content-Length-framed end (or at EOF for a read-to-close
-/// response). Reads go in 32 KiB chunks — never a per-line read (http.md R4). Does NOT close `conn`
+/// bounded decoder, stopping at a bodyless, Content-Length, or terminal-chunk/trailer boundary (or
+/// at EOF for read-to-close). Reads use one 32 KiB scratch and are clamped at framing guards. Does
+/// NOT close `conn`
 /// (the caller decides pool-return vs close). Returns an [`HttpExchange`] carrying the parsed
 /// response + reuse verdict, or a failure + whether any byte was received.
 ///
@@ -16628,7 +17231,12 @@ unsafe fn http_conn_read_into(
 ///
 /// # Safety
 /// `conn` must be live (a valid connected fd / handshaken `SSL*`).
-unsafe fn http_socket_exchange(conn: &mut Conn, request: &[u8], has_deadline: bool) -> HttpExchange {
+unsafe fn http_socket_exchange(
+    conn: &mut Conn,
+    request: &[u8],
+    method_is_head: bool,
+    has_deadline: bool,
+) -> HttpExchange {
     // One write of the whole request (start-line + headers + body already in one buffer). SIGPIPE is
     // suppressed by `MSG_NOSIGNAL`/`SO_NOSIGPIPE` on plaintext, and by the caller's `pthread_sigmask`
     // block on TLS.
@@ -16638,102 +17246,45 @@ unsafe fn http_socket_exchange(conn: &mut Conn, request: &[u8], has_deadline: bo
         // nothing was received.
         return HttpExchange::Failed { status: ws, received_any: false };
     }
-    let mut buf: Vec<u8> = Vec::new();
-    // Framing, decided ONCE the header block is available: `target` is the total framed length under
-    // Content-Length, or `None` for read-to-close. Keep the parsed head so its span allocation moves
-    // into the returned response instead of scanning and allocating for the same head twice.
-    let mut parsed_head: Option<HttpHead> = None;
-    let mut target: Option<(usize, bool)> = None;
+    let mut decoder = HttpResponseDecoder::new(method_is_head);
     let mut chunk = [0u8; HTTP_CLIENT_READ_CHUNK];
+    let mut received_any = false;
     loop {
-        // Decide the framing once, then just read to the target length (no per-chunk head re-scan —
-        // http.md R1/R4). `keep_alive` is computed here while the head spans still index `buf`.
-        if parsed_head.is_none() {
-            match http_parse_head(&buf) {
-                Ok(head) => {
-                    // The terminator itself must land inside the advertised head cap. Checking the
-                    // cap only on `Incomplete` prefixes lets an oversized head through when its
-                    // final read also carries the blank line.
-                    if head.body_start > HTTP_MAX_HEADER_BLOCK {
-                        return HttpExchange::Failed { status: AL_INVALID, received_any: true };
-                    }
-                    let keep_alive = http_head_keep_alive(&head, &buf);
-                    if let Some(cl) = head.content_length {
-                        match head.body_start.checked_add(cl) {
-                            Some(t) if t <= HTTP_MAX_BODY.saturating_add(HTTP_MAX_HEADER_BLOCK) => {
-                                target = Some((t, keep_alive));
-                            }
-                            _ => return HttpExchange::Failed { status: AL_INVALID, received_any: !buf.is_empty() },
-                        }
-                    }
-                    // No Content-Length → read-to-close framing: `target` stays empty and the conn
-                    // is never reusable (its end is the connection close).
-                    parsed_head = Some(head);
-                }
-                Err(HttpParseErr::Incomplete) => {
-                    if buf.len() > HTTP_MAX_HEADER_BLOCK {
-                        return HttpExchange::Failed { status: AL_INVALID, received_any: !buf.is_empty() };
-                    }
-                }
-                Err(HttpParseErr::Invalid) => return HttpExchange::Failed { status: AL_INVALID, received_any: !buf.is_empty() },
-            }
+        let limit = decoder.next_read_limit();
+        if limit == 0 {
+            return HttpExchange::Failed { status: AL_INVALID, received_any };
         }
-        if let Some((t, keep_alive)) = target
-            && buf.len() >= t
-        {
-            // Reusable only if keep-alive AND no bytes beyond the framed message. A keepalive server
-            // sends exactly one response per request; leftover bytes mean a dirty conn (reusing it
-            // would misframe the NEXT response — a data-corruption class bug), so drop the conn.
-            let reusable = keep_alive && buf.len() == t;
-            buf.truncate(t);
-            let head = parsed_head.take().expect("a framed target always has a parsed head");
-            return match http_response_from_head(buf, head) {
+        let n = match unsafe { conn.read(&mut chunk[..limit], has_deadline) } {
+            ConnRead::Data(n) => {
+                received_any = true;
+                n
+            }
+            ConnRead::Err(status) => {
+                return HttpExchange::Failed { status, received_any };
+            }
+            ConnRead::Eof => {
+                if !received_any {
+                    return HttpExchange::Failed { status: AL_INVALID, received_any: false };
+                }
+                if decoder.finish_eof().is_err() {
+                    return HttpExchange::Failed { status: AL_INVALID, received_any: true };
+                }
+                return match decoder.into_response() {
+                    Ok(response) => HttpExchange::Complete { response, reusable: false },
+                    Err(_) => HttpExchange::Failed { status: AL_INVALID, received_any: true },
+                };
+            }
+        };
+        let (consumed, complete) = match decoder.feed(&chunk[..n]) {
+            Ok(v) => v,
+            Err(_) => return HttpExchange::Failed { status: AL_INVALID, received_any: true },
+        };
+        if complete {
+            let reusable = decoder.keep_alive && consumed == n && !conn.has_pending();
+            return match decoder.into_response() {
                 Ok(response) => HttpExchange::Complete { response, reusable },
                 Err(_) => HttpExchange::Failed { status: AL_INVALID, received_any: true },
             };
-        }
-        // For a large framed body, stream its middle directly into the response buffer. Always leave
-        // the last <32 KiB for the ordinary *unclamped* chunk read: that read can observe bytes past
-        // Content-Length and mark the conn dirty. Small responses keep the original one-read path,
-        // and an untrusted huge length grows the destination only geometrically as bytes arrive.
-        let direct = target.and_then(|(t, _)| {
-            let remaining = t - buf.len();
-            (remaining >= HTTP_CLIENT_READ_CHUNK)
-                .then(|| (t, remaining - (HTTP_CLIENT_READ_CHUNK - 1)))
-        });
-        let (read_result, appended_directly) = match direct {
-            Some((t, limit)) => (unsafe { http_conn_read_into(conn, &mut buf, t, limit, has_deadline) }, true),
-            None => (unsafe { conn.read(&mut chunk, has_deadline) }, false),
-        };
-        let n = match read_result {
-            ConnRead::Data(n) => n,
-            ConnRead::Err(status) => return HttpExchange::Failed { status, received_any: !buf.is_empty() },
-            ConnRead::Eof => {
-                // EOF. Nothing received at all → a closed conn before any response (a reused idle conn
-                // the server dropped) → retryable failure. A read-to-close body ends here (never
-                // reusable). A Content-Length body not yet complete is a truncated read → malformed.
-                if buf.is_empty() {
-                    return HttpExchange::Failed { status: AL_INVALID, received_any: false };
-                }
-                if target.is_none()
-                    && let Some(head) = parsed_head.take()
-                {
-                    return match http_response_from_head(buf, head) {
-                        Ok(response) => HttpExchange::Complete { response, reusable: false },
-                        Err(_) => HttpExchange::Failed { status: AL_INVALID, received_any: true },
-                    };
-                }
-                return HttpExchange::Failed { status: AL_INVALID, received_any: true };
-            }
-        };
-        if !appended_directly {
-            buf.extend_from_slice(&chunk[..n]);
-        }
-        // Defensive memory bound for read-to-close (no declared Content-Length).
-        if parsed_head.as_ref().is_some_and(|head| head.content_length.is_none())
-            && buf.len() > HTTP_MAX_BODY.saturating_add(HTTP_MAX_HEADER_BLOCK)
-        {
-            return HttpExchange::Failed { status: AL_INVALID, received_any: true };
         }
     }
 }
@@ -16778,7 +17329,7 @@ unsafe fn http_connect_fd(host: &str, port: i64, timeout_ns: i64) -> Result<i32,
 ///
 /// **Connection reuse (http.md R3):** the exchange runs over a pooled keepalive conn to the same
 /// `(scheme, host, port)` when one is idle, else a fresh conn (a TLS handshake for `https://`); a
-/// reusable finished conn (keep-alive, Content-Length-framed, no leftover) is returned to `client`'s
+/// reusable finished conn (keep-alive and self-delimited, with no scratch/TLS residual) is returned to `client`'s
 /// pool — for a TLS conn its live `SSL*` is pooled too (reuse = no re-handshake). A reused idle conn
 /// the server has since dropped fails before any response byte — that ONE case is retried once on a
 /// fresh conn (the failure is the idle-close race, not a server-side effect). A fresh conn's failure
@@ -16797,6 +17348,11 @@ unsafe fn http_client_perform(
     req: HttpRequestView<'_>,
     out: *mut *mut HttpResponse,
 ) -> i32 {
+    // A successful CONNECT switches to a tunnel this whole-response surface cannot represent.
+    // Reject before URL parsing, scratch borrowing, pool access, DNS, connect, write, or TLS work.
+    if req.method == "CONNECT" {
+        return AL_INVALID;
+    }
     // 1. Split the URL into scheme + authority (`https://` now routes to TLS — Slice 5; any other
     //    scheme / empty authority / malformed → Error.Invalid).
     let Some((scheme, authority, _path)) = http_split_url(req.url) else {
@@ -16874,7 +17430,14 @@ unsafe fn http_client_perform(
             unsafe { http_arm_conn_timeout(conn.fd(), effective_timeout) };
         }
         // Exchange over this conn.
-        match unsafe { http_socket_exchange(&mut conn, request_bytes.as_slice(), has_deadline) } {
+        match unsafe {
+            http_socket_exchange(
+                &mut conn,
+                request_bytes.as_slice(),
+                req.method == "HEAD",
+                has_deadline,
+            )
+        } {
             HttpExchange::Complete { response, reusable } => {
                 // The exchange has already parsed the head and moved both its spans and the socket
                 // receive buffer into `response`. Decide the conn's fate only after that successful
@@ -28138,6 +28701,342 @@ mod tests {
         unsafe { align_rt_http_resp_free(out2) };
     }
 
+    fn http_decode_for_test(
+        raw: &[u8],
+        method_is_head: bool,
+        partitions: &[usize],
+    ) -> Result<(HttpResponse, usize, usize), HttpParseErr> {
+        let mut decoder = HttpResponseDecoder::new(method_is_head);
+        let mut offset = 0usize;
+        let mut consumed = 0usize;
+        for &width in partitions {
+            let end = (offset + width).min(raw.len());
+            let (used, _) = decoder.feed(&raw[offset..end])?;
+            consumed += used;
+            offset = end;
+        }
+        if offset < raw.len() {
+            let (used, _) = decoder.feed(&raw[offset..])?;
+            consumed += used;
+        }
+        decoder.finish_eof()?;
+        let growths = decoder.acc.growths;
+        Ok((decoder.into_response()?, consumed, growths))
+    }
+
+    fn http_response_body(response: &HttpResponse) -> &[u8] {
+        &response.buf[response.body_start..response.body_start + response.body_len]
+    }
+
+    fn http_response_has_header(response: &HttpResponse, wanted: &[u8]) -> bool {
+        response.headers.as_slice().iter().any(|header| {
+            response.buf[header.name_start..header.name_start + header.name_len]
+                .eq_ignore_ascii_case(wanted)
+        })
+    }
+
+    /// Response-head validation is complete before framing selection. These cases pin the exact
+    /// status/header grammar as well as normalized equal Content-Length fields.
+    #[test]
+    fn http_response_head_strict_validation_matrix() {
+        for valid in [
+            b"HTTP/1.0 200 \r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 999 reason\t\xff\r\nContent-Length: 0003\r\nContent-Length: 3\r\n\r\nabc",
+        ] {
+            assert!(http_decode_for_test(valid, false, &[]).is_ok(), "valid: {valid:?}");
+        }
+
+        let invalid: &[&[u8]] = &[
+            b"HTTP/1.1 200 OK\n\n",
+            b"HTTP/2.0 200 OK\r\n\r\n",
+            b"HTTP/1.1 20 OK\r\n\r\n",
+            b"HTTP/1.1 2000 OK\r\n\r\n",
+            b"HTTP/1.1 000 OK\r\n\r\n",
+            b"HTTP/1.1  200 OK\r\n\r\n",
+            b"HTTP/1.1 200OK\r\n\r\n",
+            b"HTTP/1.1 200 OK\x01\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nBad Name: x\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nX-Bad : x\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\n folded\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nX-Bad: a\x00b\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\nabc",
+        ];
+        for raw in invalid {
+            assert!(http_decode_for_test(raw, false, &[]).is_err(), "invalid: {raw:?}");
+        }
+    }
+
+    /// All Transfer-Encoding fields form one wire-order sequence: exactly one case-insensitive
+    /// `chunked` token, with OWS but without a parameter or any second coding.
+    #[test]
+    fn http_transfer_encoding_matrix() {
+        for value in ["chunked", " ChUnKeD\t"] {
+            let raw = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding:{value}\r\n\r\n0\r\n\r\n");
+            let (response, _, _) = http_decode_for_test(raw.as_bytes(), false, &[]).unwrap();
+            assert!(http_response_body(&response).is_empty());
+        }
+        for raw in [
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked;foo=bar\r\n\r\n0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, chunked\r\n\r\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: \r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked,\r\n\r\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            b"HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        ] {
+            assert!(http_decode_for_test(raw, false, &[]).is_err(), "invalid TE: {raw:?}");
+        }
+    }
+
+    /// Chunk metadata and trailers are validated but discarded. Only the exact final head and the
+    /// compacted payload remain, including embedded NUL bytes.
+    #[test]
+    fn http_chunked_decodes_compacts_and_splits_at_every_boundary() {
+        let raw = b"HTTP/1.1 200 OK\r\nX-Head: visible\r\nTransfer-Encoding: chunked\r\n\r\n5;kind=sse\r\ndata:\r\n4;quoted=\"a\\\"b\"\r\na\0b\n\r\n0\r\nX-Head: hidden\r\nX-Trailer: hidden\r\n\r\n";
+        let expected = b"data:a\0b\n";
+        let (whole, consumed, _) = http_decode_for_test(raw, false, &[]).unwrap();
+        assert_eq!(consumed, raw.len());
+        assert_eq!(whole.status, 200);
+        assert_eq!(http_response_body(&whole), expected);
+        assert!(http_response_has_header(&whole, b"x-head"));
+        assert!(!http_response_has_header(&whole, b"x-trailer"));
+        assert!(!whole.buf.windows(b"kind=sse".len()).any(|w| w == b"kind=sse"));
+
+        for split in 0..=raw.len() {
+            let (response, used, _) = http_decode_for_test(raw, false, &[split]).unwrap();
+            assert_eq!(used, raw.len(), "split {split}");
+            assert_eq!(http_response_body(&response), expected, "split {split}");
+        }
+        let one_byte_partitions = vec![1; raw.len()];
+        let (response, _, _) = http_decode_for_test(raw, false, &one_byte_partitions).unwrap();
+        assert_eq!(http_response_body(&response), expected);
+    }
+
+    #[test]
+    fn http_chunked_malformed_and_truncated_matrix() {
+        let invalid: &[&[u8]] = &[
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\ng\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\nA\r\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1;=x\r\nA\r\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1;a=\"unterminated\r\nA\r\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n100000000\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nab",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\naX\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX: y\r\n",
+        ];
+        for raw in invalid {
+            assert!(http_decode_for_test(raw, false, &[]).is_err(), "invalid chunk: {raw:?}");
+        }
+    }
+
+    /// Every non-101 informational response is discarded, including when the final head shares the
+    /// same read. Framing fields on an interim response and 101 are always invalid.
+    #[test]
+    fn http_informational_response_matrix() {
+        for status in [100, 102, 103, 199] {
+            let raw = format!(
+                "HTTP/1.1 {status} interim\r\nX-I: gone\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+            );
+            for split in [0, 1, raw.len() / 2, raw.len() - 1] {
+                let (response, _, _) = http_decode_for_test(raw.as_bytes(), false, &[split]).unwrap();
+                assert_eq!(http_response_body(&response), b"ok");
+                assert!(!http_response_has_header(&response, b"x-i"));
+            }
+        }
+        for raw in [
+            b"HTTP/1.1 101 Switching Protocols\r\n\r\n".as_slice(),
+            b"HTTP/1.1 100 Continue\r\nContent-Length: 0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 103 Early Hints\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            b"HTTP/1.1 100 Continue\r\n",
+        ] {
+            assert!(http_decode_for_test(raw, false, &[]).is_err());
+        }
+    }
+
+    /// Method/status suppression happens only after the complete head is validated. HEAD and 304
+    /// accept arbitrary decimal metadata without converting it; 204 rejects all framing metadata.
+    #[test]
+    fn http_bodyless_response_matrix() {
+        let huge = "9".repeat(4096);
+        for (status, method_is_head) in [(200, true), (304, false)] {
+            for framing in [
+                String::new(),
+                format!("Content-Length: {huge}\r\n"),
+                "Transfer-Encoding: chunked\r\n".to_owned(),
+            ] {
+                let raw = format!("HTTP/1.1 {status} bodyless\r\n{framing}\r\nUNREAD");
+                let head_end = raw.find("\r\n\r\n").unwrap() + 4;
+                let (response, consumed, _) = http_decode_for_test(raw.as_bytes(), method_is_head, &[]).unwrap();
+                assert!(http_response_body(&response).is_empty());
+                assert_eq!(consumed, head_end);
+            }
+        }
+        assert!(http_decode_for_test(b"HTTP/1.1 204 No Content\r\n\r\nUNREAD", false, &[]).is_ok());
+        for framing in ["Content-Length: 0\r\n", "Transfer-Encoding: chunked\r\n"] {
+            let raw = format!("HTTP/1.1 204 No Content\r\n{framing}\r\n");
+            assert!(http_decode_for_test(raw.as_bytes(), false, &[]).is_err());
+            assert!(http_decode_for_test(raw.as_bytes(), true, &[]).is_err());
+        }
+        // A case variant is an ordinary extension method, not HEAD suppression.
+        let (response, _, _) = http_decode_for_test(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc",
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(http_response_body(&response), b"abc");
+    }
+
+    #[test]
+    fn http_chunk_and_trailer_guards_are_exact() {
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+        let mut exact_line = head.to_vec();
+        exact_line.extend_from_slice(b"1;a=");
+        exact_line.extend(std::iter::repeat_n(b'x', HTTP_MAX_CHUNK_LINE - 6));
+        exact_line.extend_from_slice(b"\r\na\r\n0\r\n\r\n");
+        assert!(http_decode_for_test(&exact_line, false, &[]).is_ok());
+        let mut long_line = head.to_vec();
+        long_line.extend_from_slice(b"1;a=");
+        long_line.extend(std::iter::repeat_n(b'x', HTTP_MAX_CHUNK_LINE - 5));
+        long_line.extend_from_slice(b"\r\na\r\n0\r\n\r\n");
+        assert!(http_decode_for_test(&long_line, false, &[]).is_err());
+
+        let mut exact_trailer = head.to_vec();
+        exact_trailer.extend_from_slice(b"0\r\nX:");
+        exact_trailer.extend(std::iter::repeat_n(b'x', HTTP_MAX_TRAILER_BLOCK - 6));
+        exact_trailer.extend_from_slice(b"\r\n\r\n");
+        assert!(http_decode_for_test(&exact_trailer, false, &[]).is_ok());
+        let mut long_trailer = head.to_vec();
+        long_trailer.extend_from_slice(b"0\r\nX:");
+        long_trailer.extend(std::iter::repeat_n(b'x', HTTP_MAX_TRAILER_BLOCK - 5));
+        long_trailer.extend_from_slice(b"\r\n\r\n");
+        assert!(http_decode_for_test(&long_trailer, false, &[]).is_err());
+
+        let mut exact_framing = head.to_vec();
+        for _ in 0..52_426 {
+            exact_framing.extend_from_slice(b"1\r\nx\r\n");
+        }
+        exact_framing.extend_from_slice(b"1;a=abc\r\nx\r\n0\r\n\r\n");
+        assert!(http_decode_for_test(&exact_framing, false, &[]).is_ok());
+        let mut long_framing = head.to_vec();
+        for _ in 0..52_426 {
+            long_framing.extend_from_slice(b"1\r\nx\r\n");
+        }
+        long_framing.extend_from_slice(b"1;a=abcd\r\nx\r\n0\r\n\r\n");
+        assert!(http_decode_for_test(&long_framing, false, &[]).is_err());
+
+        let mut exact_body = HttpResponseDecoder::new(false);
+        exact_body
+            .feed(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n40000000\r\n")
+            .unwrap();
+        assert!(matches!(exact_body.state, HttpDecodeState::ChunkData { remaining } if remaining == HTTP_MAX_BODY));
+        let mut oversized_body = HttpResponseDecoder::new(false);
+        assert!(
+            oversized_body
+                .feed(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n40000001\r\n")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn http_head_guard_is_exact_across_informational_heads() {
+        let prefix = b"HTTP/1.1 204 No Content\r\nX:";
+        let suffix = b"\r\n\r\n";
+        let mut exact = prefix.to_vec();
+        exact.extend(std::iter::repeat_n(b'x', HTTP_MAX_HEADER_BLOCK - prefix.len() - suffix.len()));
+        exact.extend_from_slice(suffix);
+        assert_eq!(exact.len(), HTTP_MAX_HEADER_BLOCK);
+        assert!(http_decode_for_test(&exact, false, &[]).is_ok());
+        let insert_at = exact.len() - suffix.len();
+        let mut long = exact.clone();
+        long.insert(insert_at, b'x');
+        assert!(http_decode_for_test(&long, false, &[]).is_err());
+
+        let interim = b"HTTP/1.1 100 Continue\r\n\r\n";
+        let final_prefix = b"HTTP/1.1 204 No Content\r\nX:";
+        let mut cumulative = interim.to_vec();
+        cumulative.extend_from_slice(final_prefix);
+        cumulative.extend(std::iter::repeat_n(
+            b'x',
+            HTTP_MAX_HEADER_BLOCK - interim.len() - final_prefix.len() - suffix.len(),
+        ));
+        cumulative.extend_from_slice(suffix);
+        assert_eq!(cumulative.len(), HTTP_MAX_HEADER_BLOCK);
+        assert!(http_decode_for_test(&cumulative, false, &[]).is_ok());
+        let insert_at = cumulative.len() - suffix.len();
+        cumulative.insert(insert_at, b'x');
+        assert!(http_decode_for_test(&cumulative, false, &[]).is_err());
+    }
+
+    #[test]
+    fn http_trailers_validate_discard_and_share_header_budget() {
+        for raw in [
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nBad Name: x\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX : x\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX: a\x00b\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nTransfer-Encoding: chunked\r\n\r\n",
+        ] {
+            assert!(http_decode_for_test(raw, false, &[]).is_err(), "invalid trailer: {raw:?}");
+        }
+
+        let mut budget = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n".to_vec();
+        for i in 0..(HTTP_MAX_HEADERS - 1) {
+            budget.extend_from_slice(format!("X-{i}: v\r\n").as_bytes());
+        }
+        budget.extend_from_slice(b"\r\n0\r\nOne-More: no\r\n\r\n");
+        assert!(http_decode_for_test(&budget, false, &[]).is_err());
+
+        let mut exact_budget = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n".to_vec();
+        for i in 0..(HTTP_MAX_HEADERS - 2) {
+            exact_budget.extend_from_slice(format!("X-{i}: v\r\n").as_bytes());
+        }
+        exact_budget.extend_from_slice(b"\r\n0\r\nOne-More: accepted\r\n\r\n");
+        assert!(http_decode_for_test(&exact_budget, false, &[]).is_ok());
+    }
+
+    /// Geometric capacity is a function of retained head/payload bytes, not chunk count. The final
+    /// Vec preserves the exact boxed allocation capacity.
+    #[test]
+    fn http_response_accumulator_capacity_is_bounded_and_not_per_chunk() {
+        assert_eq!(http_response_growth_target(0, 1), Some(HTTP_CLIENT_READ_CHUNK));
+        assert_eq!(http_response_growth_target(HTTP_MAX_RESPONSE_LOGICAL / 2, HTTP_MAX_RESPONSE_LOGICAL), Some(HTTP_MAX_RESPONSE_LOGICAL));
+        assert_eq!(http_response_growth_target(0, HTTP_MAX_RESPONSE_LOGICAL + 1), None);
+        for (old, needed) in [(0, 1), (32_768, 32_769), (1 << 29, (1 << 29) + 1)] {
+            let new = http_response_growth_target(old, needed).unwrap();
+            assert!(new <= HTTP_MAX_RESPONSE_LOGICAL);
+            if old != 0 {
+                assert!(old < new);
+                assert!(old + new + HTTP_CLIENT_READ_CHUNK < 2 * HTTP_MAX_RESPONSE_LOGICAL + HTTP_CLIENT_READ_CHUNK);
+            }
+        }
+
+        let body_len = 4096usize;
+        let mut one = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{body_len:x}\r\n"
+        )
+        .into_bytes();
+        one.extend(std::iter::repeat_n(b'x', body_len));
+        one.extend_from_slice(b"\r\n0\r\n\r\n");
+        let (one_response, _, one_growths) = http_decode_for_test(&one, false, &[]).unwrap();
+
+        let mut many = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for _ in 0..body_len {
+            many.extend_from_slice(b"1\r\nx\r\n");
+        }
+        many.extend_from_slice(b"0\r\n\r\n");
+        let (many_response, _, many_growths) = http_decode_for_test(&many, false, &[]).unwrap();
+        assert_eq!(http_response_body(&one_response), http_response_body(&many_response));
+        assert_eq!(one_growths, many_growths);
+        assert_eq!(one_response.buf.capacity(), many_response.buf.capacity());
+        assert!(many_response.buf.capacity() <= HTTP_MAX_RESPONSE_LOGICAL);
+    }
+
     /// Every malformed / unsupported / oversized response fails with `AL_INVALID`, `*out` null.
     #[test]
     fn http_parse_errors_map_to_invalid() {
@@ -28147,7 +29046,6 @@ mod tests {
             b"garbage line\r\n\r\n",                                     // not a status line
             b"HTTP/1.1 twohundred OK\r\n\r\n",                           // non-numeric status
             b"HTTP/1.1 200 OK\r\nBadHeaderNoColon\r\n\r\n",              // header without `:`
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", // chunked (deferred)
             b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort",      // CL past the buffer
             b"HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\n",           // non-numeric CL
             b"HTTP/1.1 200 OK\r\nContent-Type: x",                       // header block truncated
@@ -28280,6 +29178,110 @@ mod tests {
         let req = String::from_utf8_lossy(&server.join().unwrap()).into_owned();
         assert!(req.starts_with("GET /path HTTP/1.1\r\n"), "request line: {req:?}");
         assert!(req.contains(&format!("Host: 127.0.0.1:{port}\r\n")), "auto Host header missing: {req:?}");
+    }
+
+    /// All public whole-body client calls share the chunk decoder. Chunk metadata/trailers never
+    /// reach the returned body, and a mixed get_many batch owns/frees each compacted response.
+    #[test]
+    fn http_client_chunked_all_call_paths() {
+        let response = b"HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\nX-Kind: sse\r\n\r\nB\r\ndata: one\n\n\r\nB\r\ndata: two\n\n\r\n0\r\nX-Trailer: hidden\r\n\r\n".to_vec();
+        let (port, server) = http_serve_pool(response, 5, true);
+        let url = format!("http://127.0.0.1:{port}/events");
+        let client = align_rt_http_client_new();
+
+        let check = |out: *mut HttpResponse| {
+            assert!(!out.is_null());
+            let body = unsafe { align_rt_http_resp_body(out) };
+            assert_eq!(unsafe { safe_slice(body.ptr, body.len) }, b"data: one\n\ndata: two\n\n");
+            let trailer = b"x-trailer";
+            let mut value = AlignStr { ptr: std::ptr::null(), len: 0 };
+            assert_eq!(
+                unsafe { align_rt_http_resp_header(out, trailer.as_ptr(), trailer.len() as i64, &mut value) },
+                0,
+                "trailers are never exposed as final headers"
+            );
+            unsafe { align_rt_http_resp_free(out) };
+        };
+
+        let mut out = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_client_get(client, url.as_ptr(), url.len() as i64, &mut out) }, 0);
+        check(out);
+
+        let mut out = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { align_rt_http_client_post(client, url.as_ptr(), url.len() as i64, b"x".as_ptr(), 1, &mut out) },
+            0
+        );
+        check(out);
+
+        let (method_ptr, method_len) = http_s("PUT");
+        let req = unsafe { align_rt_http_request_new(method_ptr, method_len, url.as_ptr(), url.len() as i64) };
+        let mut out = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_client_request(client, req, &mut out) }, 0);
+        check(out);
+
+        let urls = [
+            AlignStr { ptr: url.as_ptr(), len: url.len() as i64 },
+            AlignStr { ptr: url.as_ptr(), len: url.len() as i64 },
+        ];
+        let mut batch = AlignStr { ptr: std::ptr::null(), len: 0 };
+        assert_eq!(unsafe { align_rt_http_get_many(client, urls.as_ptr(), 2, 2, &mut batch) }, 0);
+        let handles = unsafe { std::slice::from_raw_parts(batch.ptr as *const *mut HttpResponse, 2) };
+        for &response in handles {
+            let body = unsafe { align_rt_http_resp_body(response) };
+            assert_eq!(unsafe { safe_slice(body.ptr, body.len) }, b"data: one\n\ndata: two\n\n");
+        }
+        unsafe { align_rt_free_response_array(batch.ptr as *mut u8, batch.len) };
+        unsafe { align_rt_http_client_free(client) };
+        assert_eq!(server.join().unwrap(), 5);
+    }
+
+    /// Exact uppercase method selection is part of request validation, not a case-insensitive HTTP
+    /// convenience. CONNECT returns before even taking a matching pooled connection; HEAD suppresses
+    /// payload framing, while lowercase controls remain ordinary extension methods.
+    #[test]
+    fn http_client_exact_head_and_connect_method_selection() {
+        let client = align_rt_http_client_new();
+        let pooled_fd = dead_fd();
+        unsafe { &*client }.put_idle(HttpScheme::Http, "example.com", 80, pooled_fd, std::ptr::null_mut());
+        let url = "http://example.com/";
+        let (method_ptr, method_len) = http_s("CONNECT");
+        let req = unsafe { align_rt_http_request_new(method_ptr, method_len, url.as_ptr(), url.len() as i64) };
+        let mut out = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_client_request(client, req, &mut out) }, AL_INVALID);
+        assert!(out.is_null());
+        assert_eq!(
+            unsafe { &*client }.take_idle(HttpScheme::Http, "example.com", 80),
+            Some((pooled_fd, std::ptr::null_mut())),
+            "CONNECT validation precedes pool access"
+        );
+        unsafe { close(pooled_fd) };
+
+        let (port, server) = http_serve_once(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-Meta: yes\r\n\r\nUNREAD".to_vec(),
+        );
+        let url = format!("http://127.0.0.1:{port}/head");
+        let (method_ptr, method_len) = http_s("HEAD");
+        let req = unsafe { align_rt_http_request_new(method_ptr, method_len, url.as_ptr(), url.len() as i64) };
+        let mut out = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_client_request(client, req, &mut out) }, 0);
+        let body = unsafe { align_rt_http_resp_body(out) };
+        assert_eq!(body.len, 0);
+        unsafe { align_rt_http_resp_free(out) };
+        let request = server.join().unwrap();
+        assert!(request.starts_with(b"HEAD /head HTTP/1.1\r\n"));
+
+        let (port, server) = http_serve_once(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc".to_vec());
+        let url = format!("http://127.0.0.1:{port}/lower");
+        let (method_ptr, method_len) = http_s("head");
+        let req = unsafe { align_rt_http_request_new(method_ptr, method_len, url.as_ptr(), url.len() as i64) };
+        let mut out = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_client_request(client, req, &mut out) }, 0);
+        let body = unsafe { align_rt_http_resp_body(out) };
+        assert_eq!(unsafe { safe_slice(body.ptr, body.len) }, b"abc");
+        unsafe { align_rt_http_resp_free(out) };
+        assert!(server.join().unwrap().starts_with(b"head /lower HTTP/1.1\r\n"));
+        unsafe { align_rt_http_client_free(client) };
     }
 
     /// A framed body well past two client read chunks takes the direct-to-response middle path and
@@ -28632,6 +29634,32 @@ mod tests {
         (port, handle)
     }
 
+    fn http_serve_response_sequence(responses: Vec<Vec<u8>>) -> (u16, std::thread::JoinHandle<usize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind response sequence");
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept response sequence");
+            socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut buffered = Vec::new();
+            let mut scratch = [0u8; 512];
+            for response in responses {
+                loop {
+                    if let Some(end) = buffered.windows(4).position(|window| window == b"\r\n\r\n") {
+                        buffered.drain(..end + 4);
+                        break;
+                    }
+                    let n = socket.read(&mut scratch).expect("read request sequence");
+                    assert!(n > 0, "client closed before the response sequence completed");
+                    buffered.extend_from_slice(&scratch[..n]);
+                }
+                socket.write_all(&response).expect("write response sequence");
+            }
+            1
+        });
+        (port, handle)
+    }
+
     /// http.md R3: consecutive `get`s to the same host:port over ONE client reuse a single pooled
     /// keepalive connection — the server accepts exactly ONE connection for three requests.
     #[test]
@@ -28651,6 +29679,59 @@ mod tests {
         }
         unsafe { align_rt_http_client_free(client) }; // closes the pooled conn → server's read hits EOF
         assert_eq!(server.join().unwrap(), 1, "3 gets reused ONE connection (R3)");
+    }
+
+    #[test]
+    fn http_client_chunked_pool_reuses_after_terminal_trailers() {
+        let resp = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\nX-Done: yes\r\n\r\n".to_vec();
+        let (port, server) = http_serve_pool(resp, 1, false);
+        let url = format!("http://127.0.0.1:{port}/");
+        let client = align_rt_http_client_new();
+        for _ in 0..2 {
+            let mut out = std::ptr::null_mut();
+            assert_eq!(unsafe { align_rt_http_client_get(client, url.as_ptr(), url.len() as i64, &mut out) }, 0);
+            let body = unsafe { align_rt_http_resp_body(out) };
+            assert_eq!(unsafe { safe_slice(body.ptr, body.len) }, b"hi");
+            unsafe { align_rt_http_resp_free(out) };
+        }
+        unsafe { align_rt_http_client_free(client) };
+        assert_eq!(server.join().unwrap(), 1, "terminal trailers permit reuse of one plaintext connection");
+    }
+
+    #[test]
+    fn http_client_bodyless_matrix_reuses_without_reading_payload_framing() {
+        let huge = "9".repeat(4096);
+        let responses = vec![
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {huge}\r\n\r\n").into_bytes(),
+            b"HTTP/1.1 204 No Content\r\n\r\n".to_vec(),
+            b"HTTP/1.1 304 Not Modified\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec(),
+        ];
+        let (port, server) = http_serve_response_sequence(responses);
+        let url = format!("http://127.0.0.1:{port}/");
+        let client = align_rt_http_client_new();
+
+        let (method_ptr, method_len) = http_s("HEAD");
+        let request = unsafe { align_rt_http_request_new(method_ptr, method_len, url.as_ptr(), url.len() as i64) };
+        let mut out = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_client_request(client, request, &mut out) }, 0);
+        assert_eq!(unsafe { align_rt_http_resp_body(out) }.len, 0);
+        unsafe { align_rt_http_resp_free(out) };
+
+        for expected_status in [204, 304, 200] {
+            let mut out = std::ptr::null_mut();
+            assert_eq!(unsafe { align_rt_http_client_get(client, url.as_ptr(), url.len() as i64, &mut out) }, 0);
+            assert_eq!(unsafe { align_rt_http_resp_status(out) }, expected_status);
+            if expected_status == 200 {
+                let body = unsafe { align_rt_http_resp_body(out) };
+                assert_eq!(unsafe { safe_slice(body.ptr, body.len) }, b"ok");
+            } else {
+                assert_eq!(unsafe { align_rt_http_resp_body(out) }.len, 0);
+            }
+            unsafe { align_rt_http_resp_free(out) };
+        }
+        unsafe { align_rt_http_client_free(client) };
+        assert_eq!(server.join().unwrap(), 1, "HEAD, 204, and 304 all preserve one keepalive connection");
     }
 
     /// A response with `Connection: close` must NOT be pooled — the next `get` opens a fresh conn, so
@@ -28863,6 +29944,69 @@ mod tests {
         unsafe { align_rt_http_resp_free(out) };
         unsafe { align_rt_http_client_free(client) }; // closes the remaining (2nd) seeded corpse — no leak
         assert_eq!(server.join().unwrap(), 1, "exactly one real connection was made (the fresh retry)");
+    }
+
+    /// Interim bytes prove the request reached a responding peer even though that head is discarded
+    /// from the retained accumulator. A subsequent EOF must therefore never take the zero-byte stale
+    /// pooled-connection retry path.
+    #[test]
+    fn http_client_interim_then_eof_is_not_retried() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind interim retry fixture");
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut first = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("accept first request: {error}"),
+                }
+            };
+            first.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut request = [0u8; 1024];
+            assert!(first.read(&mut request).unwrap() > 0);
+            first.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").unwrap();
+            assert!(first.read(&mut request).unwrap() > 0, "second request reuses the pooled conn");
+            first.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").unwrap();
+            drop(first);
+
+            let retry_deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            loop {
+                match listener.accept() {
+                    Ok((mut retry, _)) => {
+                        let _ = retry.read(&mut request);
+                        let _ = retry.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                        return 2;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < retry_deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return 1,
+                    Err(error) => panic!("accept retry probe: {error}"),
+                }
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/");
+        let client = align_rt_http_client_new();
+        let mut out = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_client_get(client, url.as_ptr(), url.len() as i64, &mut out) }, 0);
+        unsafe { align_rt_http_resp_free(out) };
+        let mut out = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { align_rt_http_client_get(client, url.as_ptr(), url.len() as i64, &mut out) },
+            AL_INVALID
+        );
+        assert!(out.is_null());
+        unsafe { align_rt_http_client_free(client) };
+        assert_eq!(server.join().unwrap(), 1, "an interim response byte makes failure non-retryable");
     }
 
     /// An emptied idle bucket stays available for the request's eventual put, then explicit cleanup
@@ -29186,6 +30330,52 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         (port, handle)
     }
 
+    /// Serve one complete response followed by residual bytes in the same TLS application-data
+    /// record, then accept one fresh connection. The first SSL_read returns both into Align scratch.
+    fn tls_serve_pending_records(
+        first: &'static [u8],
+        pending: &'static [u8],
+        fresh: &'static [u8],
+    ) -> (u16, std::thread::JoinHandle<usize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind TLS pending server");
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            use std::os::fd::IntoRawFd;
+            let ctx = tls_server_ctx(TLS_GOOD_CERT, TLS_GOOD_KEY);
+            let mut accepted = 0usize;
+            for response in [first, fresh] {
+                let (sock, _) = listener.accept().expect("accept TLS pending client");
+                accepted += 1;
+                let fd = sock.into_raw_fd();
+                unsafe {
+                    let ssl = SSL_new(ctx);
+                    assert!(!ssl.is_null());
+                    assert_eq!(SSL_set_fd(ssl, fd), 1);
+                    assert_eq!(SSL_accept(ssl), 1);
+                    let mut request = [0u8; 4096];
+                    assert!(SSL_read(ssl, request.as_mut_ptr().cast(), request.len() as c_int) > 0);
+                    if accepted == 1 {
+                        let mut co_read = response.to_vec();
+                        co_read.extend_from_slice(pending);
+                        assert_eq!(
+                            SSL_write(ssl, co_read.as_ptr().cast(), co_read.len() as c_int),
+                            co_read.len() as c_int
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                    } else {
+                        assert_eq!(
+                            SSL_write(ssl, response.as_ptr().cast(), response.len() as c_int),
+                            response.len() as c_int
+                        );
+                    }
+                    close_tls(ssl, fd);
+                }
+            }
+            accepted
+        });
+        (port, handle)
+    }
+
     /// A plaintext server that sends non-TLS garbage then closes — the client's handshake fails with a
     /// protocol error (no cert seen, so verify result stays OK) → `Error.Invalid`.
     fn tls_garbage_serve() -> (u16, std::thread::JoinHandle<()>) {
@@ -29357,6 +30547,119 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         }
         unsafe { align_rt_http_client_free(client) };
         assert_eq!(server.join().unwrap(), 1, "two https gets reused ONE TLS conn (live SSL* pooled)");
+    }
+
+    /// Chunked framing uses the same verified TLS decoder and may reuse the live SSL connection only
+    /// after the terminal chunk and trailers have been consumed.
+    #[test]
+    fn https_chunked_pool_reuses_after_terminal_trailers() {
+        let _net_guard = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        tls_test_setup();
+        let resp = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\nX-Done: yes\r\n\r\n".to_vec();
+        let (port, server) = tls_serve(TLS_GOOD_CERT, TLS_GOOD_KEY, resp, 1, false);
+        let url = format!("https://127.0.0.1:{port}/");
+        let client = align_rt_http_client_new();
+        for _ in 0..2 {
+            let mut out = std::ptr::null_mut();
+            assert_eq!(unsafe { align_rt_http_client_get(client, url.as_ptr(), url.len() as i64, &mut out) }, 0);
+            let body = unsafe { align_rt_http_resp_body(out) };
+            assert_eq!(unsafe { safe_slice(body.ptr, body.len) }, b"hi");
+            unsafe { align_rt_http_resp_free(out) };
+        }
+        unsafe { align_rt_http_client_free(client) };
+        assert_eq!(server.join().unwrap(), 1, "terminal trailers permit reuse of one TLS connection");
+    }
+
+    #[test]
+    fn https_chunked_malformed_matches_plaintext_invalid() {
+        let _net_guard = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        tls_test_setup();
+        let malformed = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhiX\n0\r\n\r\n".to_vec();
+        let (port, server) = tls_serve(TLS_GOOD_CERT, TLS_GOOD_KEY, malformed, 1, true);
+        let url = format!("https://127.0.0.1:{port}/");
+        let client = align_rt_http_client_new();
+        let mut out = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { align_rt_http_client_get(client, url.as_ptr(), url.len() as i64, &mut out) },
+            AL_INVALID
+        );
+        assert!(out.is_null());
+        unsafe { align_rt_http_client_free(client) };
+        assert_eq!(server.join().unwrap(), 1);
+    }
+
+    /// A complete first response followed by residual plaintext in the same TLS record leaves bytes
+    /// in Align's read scratch. That dirty conn must not enter the pool.
+    #[test]
+    fn https_co_read_plaintext_prevents_pooling() {
+        let _net_guard = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        tls_test_setup();
+        const FIRST: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n";
+        const PENDING: &[u8] = b"HTTP/1.1 599 Residual\r\nContent-Length: 0\r\n\r\n";
+        const FRESH: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        let (port, server) = tls_serve_pending_records(FIRST, PENDING, FRESH);
+        let url = format!("https://127.0.0.1:{port}/");
+        let client = align_rt_http_client_new();
+
+        let mut out = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_client_get(client, url.as_ptr(), url.len() as i64, &mut out) }, 0);
+        let body = unsafe { align_rt_http_resp_body(out) };
+        assert_eq!(unsafe { safe_slice(body.ptr, body.len) }, b"hi");
+        unsafe { align_rt_http_resp_free(out) };
+        let pooled: usize = unsafe { &*client }
+            .idle
+            .lock()
+            .unwrap()
+            .values()
+            .flat_map(|endpoints| endpoints.values())
+            .map(Vec::len)
+            .sum();
+        assert_eq!(pooled, 0, "TLS plaintext co-read into Align scratch makes the connection dirty");
+
+        let mut out = std::ptr::null_mut();
+        assert_eq!(unsafe { align_rt_http_client_get(client, url.as_ptr(), url.len() as i64, &mut out) }, 0);
+        let body = unsafe { align_rt_http_resp_body(out) };
+        assert_eq!(unsafe { safe_slice(body.ptr, body.len) }, b"ok");
+        unsafe { align_rt_http_resp_free(out) };
+        unsafe { align_rt_http_client_free(client) };
+        assert_eq!(server.join().unwrap(), 2);
+    }
+
+    /// `SSL_read` may return only part of one already-decrypted application record. The remaining
+    /// plaintext is invisible to Align scratch but reported by OpenSSL and must make `Conn` dirty.
+    #[test]
+    fn https_conn_detects_openssl_pending_plaintext() {
+        let _net_guard = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        tls_test_setup();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind TLS pending probe");
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            use std::os::fd::IntoRawFd;
+            let ctx = tls_server_ctx(TLS_GOOD_CERT, TLS_GOOD_KEY);
+            let (sock, _) = listener.accept().expect("accept TLS pending probe");
+            let fd = sock.into_raw_fd();
+            unsafe {
+                let ssl = SSL_new(ctx);
+                assert!(!ssl.is_null());
+                assert_eq!(SSL_set_fd(ssl, fd), 1);
+                assert_eq!(SSL_accept(ssl), 1);
+                let payload = b"pending-plaintext";
+                assert_eq!(SSL_write(ssl, payload.as_ptr().cast(), payload.len() as c_int), payload.len() as c_int);
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                close_tls(ssl, fd);
+            }
+        });
+        let mut conn = unsafe { http_tls_connect("127.0.0.1", port as i64, 0) }.expect("verified TLS probe");
+        let ssl = match &mut conn {
+            Conn::Tls { ssl, .. } => *ssl,
+            Conn::Plain { .. } => panic!("https probe must produce TLS Conn"),
+        };
+        let mut first = 0u8;
+        assert_eq!(unsafe { SSL_read(ssl, (&mut first as *mut u8).cast(), 1) }, 1);
+        assert_eq!(first, b'p');
+        assert!(conn.has_pending(), "the unread suffix of the decrypted record is pending in OpenSSL");
+        unsafe { conn.close() };
+        server.join().unwrap();
     }
 
     /// Pool scheme-keying: an `http` conn and an `https` conn to the SAME host:port never cross —
