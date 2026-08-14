@@ -1800,12 +1800,15 @@ From a struct definition, the following can be generated.
 ```text
 decode
 encode
+encode_bounded
 ```
 
-That is the whole generated surface: there is no `validate<T>` (decoding and discarding *is*
-validation — one way) and no public `field_table<T>`. The compiler does hold per-field information
-(name, length, hash, first byte, offset, escape info) at compile time to drive the scanner, but it
-is an internal artifact with no source-level name. See §18.1 `core.json`.
+That is the whole generated typed-schema surface: there is no `validate<T>` (decoding and
+discarding *is* validation — one way) and no public `field_table<T>`. `encode_bounded` is the
+accepted, not-yet-implemented fallible destination for the same generated encode plan. The compiler
+does hold per-field information (name, length, hash, first byte, offset, escape info) at compile
+time to drive the scanner, but it is an internal artifact with no source-level name. See §18.1
+`core.json`.
 
 ### SIMD Scan
 

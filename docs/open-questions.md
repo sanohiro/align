@@ -4630,7 +4630,8 @@ prerequisite is accepted and merged.
 `json.validate<T>` **deleted** (decode-and-discard IS validation with zero-copy costs; one way);
 `json.token` **deleted** (doc + scan cover the realistic cases; no consumer — build it only if one
 appears, as a Future note); `json.field_table<T>` **deleted** (a compiler-internal artifact, not
-API). §18.1's core.json surface becomes exactly: `decode`, `encode`, `doc`, `scan`. This also
+API). §18.1's core.json surface is now exactly: `decode`, `encode`, `encode_bounded`, `doc`, `scan`;
+the bounded operation is the accepted Request 12 addition pending implementation. This also
 closes the no-turbofish settled item's "schema-selector residual" — `scan` is the one survivor
 and it types from the binding annotation.
 

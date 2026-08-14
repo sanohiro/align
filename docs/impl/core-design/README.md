@@ -27,11 +27,11 @@ PR (same rule as std-design).
 - [option-result.md](option-result.md) — `Option<T>` / `Result<T, E>` / builtin `Error`: constructors, `?`, `else`, `map_err`, `main` exit mapping
 - [array-slice-pipeline.md](array-slice-pipeline.md) — `array<T>` / `slice<T>` / ranges / `out`, and the whole pipeline vocabulary + termination and fusion rules
 - [string.md](string.md) — `str` / `string` / `bytes` / `buffer` / `builder` / `template`: methods, concat policy, UTF-8 stance
-- [json.md](json.md) — `json.encode` / `json.decode` (struct / array / soa targets), error policy, zero-copy views
+- [json.md](json.md) — `json.encode` / pending `json.encode_bounded` / `json.decode` (struct / array / soa targets), error policy, zero-copy views
 - [soa-groupby.md](soa-groupby.md) — `soa<T>`, column ops, `group_by` aggregates, `.agg(...)`, `dict_encode`
 - [vec-mask.md](vec-mask.md) — `vecN<T>` / `maskN<T>`, lane ops, `load`/`store`, `select`/`dot`/`fma`/`sum_where`, `align(N)`
 - [arena-heap.md](arena-heap.md) — `arena {}` and `heap.new` / `box`: regions, escape, drop
 - [hash.md](hash.md) — `core.hash` (`hash64`/`hash128`): status and design
 
-Template per file: **Overview → Signatures (verified) → Type & ownership → Effects → Errors &
+Template per file: **Overview → Signatures (verified unless explicitly pending) → Type & ownership → Effects → Errors &
 aborts → Regions → Spec'd but not implemented → Pitfalls → Test anchors.**
