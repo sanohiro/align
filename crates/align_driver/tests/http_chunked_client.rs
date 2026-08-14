@@ -44,6 +44,24 @@ fn client_get_decodes_provider_sse_chunks_end_to_end() {
     if !backend_available() {
         return;
     }
+    let prog = "\
+import std.http
+import std.io
+import std.cli
+pub fn main(args: array<str>) -> Result<(), Error> {
+  c := cli.command(\"chunked\")
+  c.flag_str(\"url\", \"\")
+  p := c.parse(args)?
+  cl := http.client()
+  resp := cl.get(p.get_str(\"url\"))?
+  print(resp.status())
+  io.stdout.write(resp.body())?
+  return Ok(())
+}
+";
+    // Compile before the fixture begins blocking in `accept`, so a compiler regression cannot
+    // strand the server thread and turn the test failure into a process-wide hang.
+    let client = build_exe("http-chunked-provider", prog);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
     let port = listener.local_addr().unwrap().port();
     let server = std::thread::spawn(move || {
@@ -65,23 +83,11 @@ fn client_get_decodes_provider_sse_chunks_end_to_end() {
             .expect("write chunked response");
         request
     });
-    let prog = "\
-import std.http
-import std.io
-import std.cli
-pub fn main(args: array<str>) -> Result<(), Error> {
-  c := cli.command(\"chunked\")
-  c.flag_str(\"url\", \"\")
-  p := c.parse(args)?
-  cl := http.client()
-  resp := cl.get(p.get_str(\"url\"))?
-  print(resp.status())
-  io.stdout.write(resp.body())?
-  return Ok(())
-}
-";
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
-    let out = build_and_run_args("http-chunked-provider", prog, &["--url", &url]);
+    let out = std::process::Command::new(&client.exe)
+        .args(["--url", &url])
+        .output()
+        .expect("run chunked client");
     let request = server.join().unwrap();
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "200\ndata: one\n\ndata: two\n\n");

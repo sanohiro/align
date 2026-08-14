@@ -15355,6 +15355,64 @@ fn http_response_value_byte(b: u8) -> bool {
     b == b'\t' || b == b' ' || (0x21..=0x7e).contains(&b) || b >= 0x80
 }
 
+fn http_validate_status_line(status_line: &[u8]) -> Result<(), HttpParseErr> {
+    if status_line.len() < 13
+        || (status_line[..8] != *b"HTTP/1.0" && status_line[..8] != *b"HTTP/1.1")
+        || status_line[8] != b' '
+        || !status_line[9..12].iter().all(u8::is_ascii_digit)
+        || status_line[9] == b'0'
+        || status_line[12] != b' '
+        || !status_line[13..].iter().copied().all(http_response_value_byte)
+    {
+        return Err(HttpParseErr::Invalid);
+    }
+    Ok(())
+}
+
+fn http_validate_status_prefix(prefix: &[u8]) -> Result<(), HttpParseErr> {
+    const VERSION: &[u8] = b"HTTP/1.";
+    let version_prefix = prefix.len().min(VERSION.len());
+    if prefix[..version_prefix] != VERSION[..version_prefix]
+        || (prefix.len() > 7 && !matches!(prefix[7], b'0' | b'1'))
+        || (prefix.len() > 8 && prefix[8] != b' ')
+        || (prefix.len() > 9 && !prefix[9].is_ascii_digit())
+        || (prefix.len() > 10 && !prefix[10].is_ascii_digit())
+        || (prefix.len() > 11 && !prefix[11].is_ascii_digit())
+        || (prefix.len() > 12 && prefix[12] != b' ')
+        || (prefix.len() > 13 && !prefix[13..].iter().copied().all(http_response_value_byte))
+    {
+        return Err(HttpParseErr::Invalid);
+    }
+    Ok(())
+}
+
+fn http_validate_header_line(line: &[u8]) -> Result<usize, HttpParseErr> {
+    let Some(colon) = memchr::memchr(b':', line) else {
+        return Err(HttpParseErr::Invalid);
+    };
+    if colon == 0
+        || !http_is_token(&line[..colon])
+        || !line[colon + 1..].iter().copied().all(http_response_value_byte)
+    {
+        return Err(HttpParseErr::Invalid);
+    }
+    Ok(colon)
+}
+
+fn http_validate_header_prefix(prefix: &[u8]) -> Result<(), HttpParseErr> {
+    if let Some(colon) = memchr::memchr(b':', prefix) {
+        if colon == 0
+            || !http_is_token(&prefix[..colon])
+            || !prefix[colon + 1..].iter().copied().all(http_response_value_byte)
+        {
+            return Err(HttpParseErr::Invalid);
+        }
+    } else if !prefix.is_empty() && !http_is_token(prefix) {
+        return Err(HttpParseErr::Invalid);
+    }
+    Ok(())
+}
+
 fn http_normalize_decimal(src: &[u8], start: usize, len: usize) -> HttpDecimalSpan {
     let mut skip = 0;
     while skip + 1 < len && src[start + skip] == b'0' {
@@ -15409,21 +15467,10 @@ fn http_parse_head(src: &[u8]) -> Result<HttpHead, HttpParseErr> {
         return Err(HttpParseErr::Incomplete); // no line terminator yet — read more
     };
     let status_line = &src[sl_start..sl_start + sl_len];
-    if status_line.len() < 13
-        || (status_line[..8] != *b"HTTP/1.0" && status_line[..8] != *b"HTTP/1.1")
-        || status_line[8] != b' '
-        || !status_line[9..12].iter().all(u8::is_ascii_digit)
-        || status_line[12] != b' '
-        || !status_line[13..].iter().copied().all(http_response_value_byte)
-    {
-        return Err(HttpParseErr::Invalid);
-    }
+    http_validate_status_line(status_line)?;
     let status = ((status_line[9] - b'0') as i64) * 100
         + ((status_line[10] - b'0') as i64) * 10
         + (status_line[11] - b'0') as i64;
-    if status < 100 {
-        return Err(HttpParseErr::Invalid);
-    }
     let http_1_1 = status_line[..8] == *b"HTTP/1.1";
 
     // --- headers: lines up to the first empty line ---
@@ -15443,20 +15490,11 @@ fn http_parse_head(src: &[u8]) -> Result<HttpHead, HttpParseErr> {
             return Err(HttpParseErr::Invalid); // header flood
         }
         let line = &src[ls..ls + ll];
-        let Some(colon) = memchr::memchr(b':', line) else {
-            return Err(HttpParseErr::Invalid); // a header line must have a `:`
-        };
         // Field names are exact RFC tokens immediately followed by `:`. No OWS or obs-fold is
         // admitted before framing classification.
-        if colon == 0 || !http_is_token(&line[..colon]) {
-            return Err(HttpParseErr::Invalid);
-        }
+        let colon = http_validate_header_line(line)?;
         let name_start = ls;
         let name_len = colon;
-        let raw_value = &line[colon + 1..];
-        if !raw_value.iter().copied().all(http_response_value_byte) {
-            return Err(HttpParseErr::Invalid);
-        }
         let (value_start, value_len) = http_trim_ows(src, ls + colon + 1, ll - colon - 1);
         let name = &src[name_start..name_start + name_len];
         let value = &src[value_start..value_start + value_len];
@@ -15557,14 +15595,6 @@ impl HttpResponseAccumulator {
         Ok(())
     }
 
-    fn push(&mut self, byte: u8) -> Result<(), HttpParseErr> {
-        let needed = self.len.checked_add(1).ok_or(HttpParseErr::Invalid)?;
-        self.ensure_capacity(needed)?;
-        self.storage[self.len].write(byte);
-        self.len = needed;
-        Ok(())
-    }
-
     fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<(), HttpParseErr> {
         let needed = self.len.checked_add(bytes.len()).ok_or(HttpParseErr::Invalid)?;
         self.ensure_capacity(needed)?;
@@ -15578,10 +15608,6 @@ impl HttpResponseAccumulator {
         }
         self.len = needed;
         Ok(())
-    }
-
-    fn ends_with(&self, suffix: &[u8]) -> bool {
-        self.as_slice().ends_with(suffix)
     }
 
     fn into_vec(self) -> Vec<u8> {
@@ -15626,6 +15652,12 @@ struct HttpResponseDecoder {
     method_is_head: bool,
     keep_alive: bool,
     cumulative_head_bytes: usize,
+    head_line_start: usize,
+    head_header_count: usize,
+    head_status: Option<i64>,
+    head_http_1_1: bool,
+    head_content_length: Option<HttpDecimalSpan>,
+    head_transfer_codings: usize,
     chunk_line: [u8; HTTP_MAX_CHUNK_LINE],
     chunk_line_len: usize,
     chunk_framing_bytes: usize,
@@ -15646,6 +15678,12 @@ impl HttpResponseDecoder {
             method_is_head,
             keep_alive: false,
             cumulative_head_bytes: 0,
+            head_line_start: 0,
+            head_header_count: 0,
+            head_status: None,
+            head_http_1_1: false,
+            head_content_length: None,
+            head_transfer_codings: 0,
             chunk_line: [0; HTTP_MAX_CHUNK_LINE],
             chunk_line_len: 0,
             chunk_framing_bytes: 0,
@@ -15686,7 +15724,15 @@ impl HttpResponseDecoder {
                 HTTP_CLIENT_READ_CHUNK - 1
             }
             HttpDecodeState::Fixed { remaining } => remaining.saturating_add(1),
-            HttpDecodeState::CloseDelimited => HTTP_CLIENT_READ_CHUNK,
+            HttpDecodeState::CloseDelimited => {
+                let body_start = self
+                    .final_head
+                    .as_ref()
+                    .map_or(self.acc.len(), |head| head.body_start);
+                HTTP_MAX_BODY
+                    .saturating_sub(self.acc.len().saturating_sub(body_start))
+                    .saturating_add(1)
+            }
             HttpDecodeState::Complete => 0,
         };
         remaining.min(HTTP_CLIENT_READ_CHUNK)
@@ -15695,7 +15741,7 @@ impl HttpResponseDecoder {
     fn decimal_body_len(&self, span: HttpDecimalSpan) -> Result<usize, HttpParseErr> {
         let mut n = 0usize;
         for &digit in &self.acc.as_slice()[span.start..span.start + span.len] {
-            let d = (digit - b'0') as usize;
+            let d = usize::from(digit - b'0');
             if n > (HTTP_MAX_BODY - d) / 10 {
                 return Err(HttpParseErr::Invalid);
             }
@@ -15714,6 +15760,12 @@ impl HttpResponseDecoder {
             }
             self.acc.clear();
             self.state = HttpDecodeState::Head;
+            self.head_line_start = 0;
+            self.head_header_count = 0;
+            self.head_status = None;
+            self.head_http_1_1 = false;
+            self.head_content_length = None;
+            self.head_transfer_codings = 0;
             if self.cumulative_head_bytes == HTTP_MAX_HEADER_BLOCK {
                 return Err(HttpParseErr::Invalid);
             }
@@ -15763,9 +15815,9 @@ impl HttpResponseDecoder {
         let mut magnitude_ok = true;
         while pos < line.len() && line[pos].is_ascii_hexdigit() {
             let d = match line[pos] {
-                b'0'..=b'9' => (line[pos] - b'0') as usize,
-                b'a'..=b'f' => (line[pos] - b'a' + 10) as usize,
-                b'A'..=b'F' => (line[pos] - b'A' + 10) as usize,
+                b'0'..=b'9' => usize::from(line[pos] - b'0'),
+                b'a'..=b'f' => usize::from(line[pos] - b'a' + 10),
+                b'A'..=b'F' => usize::from(line[pos] - b'A' + 10),
                 _ => return Err(HttpParseErr::Invalid),
             };
             if magnitude_ok {
@@ -15863,9 +15915,11 @@ impl HttpResponseDecoder {
         if !magnitude_ok {
             return Err(HttpParseErr::Invalid);
         }
-        let body_len = self.acc.len().saturating_sub(
-            self.final_head.as_ref().ok_or(HttpParseErr::Invalid)?.body_start,
-        );
+        let body_len = self
+            .acc
+            .len()
+            .checked_sub(self.final_head.as_ref().ok_or(HttpParseErr::Invalid)?.body_start)
+            .ok_or(HttpParseErr::Invalid)?;
         if body_len.checked_add(size).is_none_or(|n| n > HTTP_MAX_BODY) {
             return Err(HttpParseErr::Invalid);
         }
@@ -15879,16 +15933,232 @@ impl HttpResponseDecoder {
         Ok(())
     }
 
-    fn charge_chunk_framing(&mut self, b: u8) -> Result<(), HttpParseErr> {
-        self.chunk_framing_bytes = self.chunk_framing_bytes.checked_add(1).ok_or(HttpParseErr::Invalid)?;
-        if self.chunk_framing_bytes > HTTP_MAX_CHUNK_FRAMING {
+    fn append_chunk_framing(&mut self, bytes: &[u8]) -> Result<(), HttpParseErr> {
+        self.chunk_framing_bytes = self
+            .chunk_framing_bytes
+            .checked_add(bytes.len())
+            .ok_or(HttpParseErr::Invalid)?;
+        if self.chunk_framing_bytes > HTTP_MAX_CHUNK_FRAMING
+            || self.chunk_line_len.checked_add(bytes.len()).is_none_or(|n| n > HTTP_MAX_CHUNK_LINE)
+        {
             return Err(HttpParseErr::Invalid);
         }
-        if self.chunk_line_len == HTTP_MAX_CHUNK_LINE {
+        let end = self.chunk_line_len + bytes.len();
+        self.chunk_line[self.chunk_line_len..end].copy_from_slice(bytes);
+        self.chunk_line_len = end;
+        Ok(())
+    }
+
+    /// Reject a chunk-size line as soon as its current prefix cannot become valid. The complete
+    /// parser remains authoritative for extension grammar; this prefix gate prevents a peer from
+    /// making the transport block after an impossible first token or a bare CR is already present.
+    fn validate_chunk_line_prefix(&self) -> Result<(), HttpParseErr> {
+        let mut line = &self.chunk_line[..self.chunk_line_len];
+        if line.is_empty() {
+            return Ok(());
+        }
+        let complete = line.last() == Some(&b'\r');
+        if complete {
+            line = &line[..line.len() - 1];
+        }
+        if memchr::memchr(b'\r', line).is_some() || memchr::memchr(b'\n', line).is_some() {
             return Err(HttpParseErr::Invalid);
         }
-        self.chunk_line[self.chunk_line_len] = b;
-        self.chunk_line_len += 1;
+        let mut pos = 0usize;
+        let mut size = 0usize;
+        while pos < line.len() && line[pos].is_ascii_hexdigit() {
+            let d = match line[pos] {
+                b'0'..=b'9' => usize::from(line[pos] - b'0'),
+                b'a'..=b'f' => usize::from(line[pos] - b'a' + 10),
+                b'A'..=b'F' => usize::from(line[pos] - b'A' + 10),
+                _ => return Err(HttpParseErr::Invalid),
+            };
+            if size > (HTTP_MAX_BODY - d) / 16 {
+                return Err(HttpParseErr::Invalid);
+            }
+            size = size * 16 + d;
+            pos += 1;
+        }
+        if pos == 0 {
+            return Err(HttpParseErr::Invalid);
+        }
+        if pos == line.len() {
+            return Ok(());
+        }
+        loop {
+            while pos < line.len() && matches!(line[pos], b' ' | b'\t') {
+                pos += 1;
+            }
+            if pos == line.len() {
+                // OWS after the size may still be followed by an extension delimiter, but it may
+                // not terminate the line under the decoder's settled extension grammar.
+                return if complete { Err(HttpParseErr::Invalid) } else { Ok(()) };
+            }
+            if line[pos] != b';' {
+                return Err(HttpParseErr::Invalid);
+            }
+            pos += 1;
+            while pos < line.len() && matches!(line[pos], b' ' | b'\t') {
+                pos += 1;
+            }
+            let name_start = pos;
+            while pos < line.len() && http_is_token(&line[pos..pos + 1]) {
+                pos += 1;
+            }
+            if pos == name_start {
+                return if pos == line.len() && !complete {
+                    Ok(())
+                } else {
+                    Err(HttpParseErr::Invalid)
+                };
+            }
+            while pos < line.len() && matches!(line[pos], b' ' | b'\t') {
+                pos += 1;
+            }
+            if pos == line.len() {
+                return Ok(());
+            }
+            if line[pos] == b'=' {
+                pos += 1;
+                while pos < line.len() && matches!(line[pos], b' ' | b'\t') {
+                    pos += 1;
+                }
+                if pos == line.len() {
+                    return if complete { Err(HttpParseErr::Invalid) } else { Ok(()) };
+                }
+                if line[pos] == b'"' {
+                    pos += 1;
+                    let mut closed = false;
+                    while pos < line.len() {
+                        match line[pos] {
+                            b'"' => {
+                                pos += 1;
+                                closed = true;
+                                break;
+                            }
+                            b'\\' => {
+                                pos += 1;
+                                if pos == line.len() {
+                                    return if complete { Err(HttpParseErr::Invalid) } else { Ok(()) };
+                                }
+                                if !(line[pos] == b'\t'
+                                    || line[pos] == b' '
+                                    || (0x21..=0x7e).contains(&line[pos])
+                                    || line[pos] >= 0x80)
+                                {
+                                    return Err(HttpParseErr::Invalid);
+                                }
+                                pos += 1;
+                            }
+                            b if b == b'\t'
+                                || b == b' '
+                                || b == b'!'
+                                || (0x23..=0x5b).contains(&b)
+                                || (0x5d..=0x7e).contains(&b)
+                                || b >= 0x80 => pos += 1,
+                            _ => return Err(HttpParseErr::Invalid),
+                        }
+                    }
+                    if !closed {
+                        return if complete { Err(HttpParseErr::Invalid) } else { Ok(()) };
+                    }
+                } else {
+                    let value_start = pos;
+                    while pos < line.len() && http_is_token(&line[pos..pos + 1]) {
+                        pos += 1;
+                    }
+                    if pos == value_start {
+                        return Err(HttpParseErr::Invalid);
+                    }
+                }
+                while pos < line.len() && matches!(line[pos], b' ' | b'\t') {
+                    pos += 1;
+                }
+                if pos == line.len() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    fn append_head(&mut self, bytes: &[u8]) -> Result<(), HttpParseErr> {
+        self.cumulative_head_bytes = self
+            .cumulative_head_bytes
+            .checked_add(bytes.len())
+            .ok_or(HttpParseErr::Invalid)?;
+        if self.cumulative_head_bytes > HTTP_MAX_HEADER_BLOCK {
+            return Err(HttpParseErr::Invalid);
+        }
+        self.acc.extend_from_slice(bytes)
+    }
+
+    fn validate_incremental_header(&mut self, line_start: usize, line_end: usize) -> Result<(), HttpParseErr> {
+        let line = &self.acc.as_slice()[line_start..line_end];
+        let colon = http_validate_header_line(line)?;
+        let name = &line[..colon];
+        let (value_start, value_len) = http_trim_ows(
+            self.acc.as_slice(),
+            line_start + colon + 1,
+            line.len() - colon - 1,
+        );
+        let value = &self.acc.as_slice()[value_start..value_start + value_len];
+        if name.eq_ignore_ascii_case(b"content-length") {
+            if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+                return Err(HttpParseErr::Invalid);
+            }
+            let normalized = http_normalize_decimal(self.acc.as_slice(), value_start, value_len);
+            if self
+                .head_content_length
+                .is_some_and(|prev| !http_decimal_spans_equal(self.acc.as_slice(), prev, normalized))
+            {
+                return Err(HttpParseErr::Invalid);
+            }
+            self.head_content_length = Some(normalized);
+        } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            http_parse_transfer_encoding(value, &mut self.head_transfer_codings)?;
+        }
+        let status = self.head_status.ok_or(HttpParseErr::Invalid)?;
+        let has_framing = self.head_content_length.is_some() || self.head_transfer_codings != 0;
+        if self.head_transfer_codings > 1
+            || (self.head_transfer_codings == 1
+                && (!self.head_http_1_1 || self.head_content_length.is_some()))
+            || ((100..=199).contains(&status) && has_framing)
+            || (status == 204 && has_framing)
+        {
+            return Err(HttpParseErr::Invalid);
+        }
+        Ok(())
+    }
+
+    /// Validate the newly completed status/header line before the transport can issue another
+    /// read. Line discovery uses memchr and input ranges are appended in bulk; scalar work is
+    /// limited to the grammar of the one discovered line.
+    fn finish_head_line(&mut self) -> Result<(), HttpParseErr> {
+        let end = self.acc.len();
+        if end < self.head_line_start + 2 || self.acc.as_slice()[end - 2] != b'\r' {
+            return Err(HttpParseErr::Invalid);
+        }
+        let line = &self.acc.as_slice()[self.head_line_start..end - 2];
+        if self.head_line_start == 0 {
+            http_validate_status_line(line)?;
+            self.head_status = Some(
+                ((line[9] - b'0') as i64) * 100
+                    + ((line[10] - b'0') as i64) * 10
+                    + (line[11] - b'0') as i64,
+            );
+            self.head_http_1_1 = line[..8] == *b"HTTP/1.1";
+        } else if line.is_empty() {
+            let head = http_parse_head(self.acc.as_slice())?;
+            self.select_head(head)?;
+            return Ok(());
+        } else {
+            if self.head_header_count == HTTP_MAX_HEADERS {
+                return Err(HttpParseErr::Invalid);
+            }
+            self.validate_incremental_header(self.head_line_start, end - 2)?;
+            self.head_header_count += 1;
+        }
+        self.head_line_start = end;
         Ok(())
     }
 
@@ -15976,20 +16246,35 @@ impl HttpResponseDecoder {
         while pos < input.len() && !self.complete() {
             match self.state {
                 HttpDecodeState::Head => {
-                    self.cumulative_head_bytes = self
-                        .cumulative_head_bytes
-                        .checked_add(1)
-                        .ok_or(HttpParseErr::Invalid)?;
-                    if self.cumulative_head_bytes > HTTP_MAX_HEADER_BLOCK {
-                        return Err(HttpParseErr::Invalid);
-                    }
-                    self.acc.push(input[pos])?;
-                    pos += 1;
-                    if self.acc.ends_with(b"\r\n\r\n") {
-                        let head = http_parse_head(self.acc.as_slice())?;
-                        self.select_head(head)?;
-                    } else if self.cumulative_head_bytes == HTTP_MAX_HEADER_BLOCK {
-                        return Err(HttpParseErr::Invalid);
+                    let rest = &input[pos..];
+                    if let Some(nl) = memchr::memchr(b'\n', rest) {
+                        let take = nl + 1;
+                        self.append_head(&rest[..take])?;
+                        pos += take;
+                        self.finish_head_line()?;
+                    } else {
+                        self.append_head(rest)?;
+                        pos = input.len();
+                        let partial = &self.acc.as_slice()[self.head_line_start..];
+                        if let Some(cr) = memchr::memchr(b'\r', partial)
+                            && cr + 1 != partial.len()
+                        {
+                            return Err(HttpParseErr::Invalid);
+                        }
+                        let complete_line = partial.last() == Some(&b'\r');
+                        let partial = partial.strip_suffix(b"\r").unwrap_or(partial);
+                        if self.head_line_start == 0 && complete_line {
+                            http_validate_status_line(partial)?;
+                        } else if self.head_line_start == 0 {
+                            http_validate_status_prefix(partial)?;
+                        } else if complete_line && !partial.is_empty() {
+                            http_validate_header_line(partial)?;
+                        } else {
+                            http_validate_header_prefix(partial)?;
+                        }
+                        if self.cumulative_head_bytes == HTTP_MAX_HEADER_BLOCK {
+                            return Err(HttpParseErr::Invalid);
+                        }
                     }
                 }
                 HttpDecodeState::Fixed { remaining } => {
@@ -16004,18 +16289,30 @@ impl HttpResponseDecoder {
                     };
                 }
                 HttpDecodeState::CloseDelimited => {
+                    let head = self.final_head.as_ref().ok_or(HttpParseErr::Invalid)?;
+                    let body_len = self
+                        .acc
+                        .len()
+                        .checked_sub(head.body_start)
+                        .ok_or(HttpParseErr::Invalid)?;
+                    if body_len.checked_add(input.len() - pos).is_none_or(|n| n > HTTP_MAX_BODY) {
+                        return Err(HttpParseErr::Invalid);
+                    }
                     self.acc.extend_from_slice(&input[pos..])?;
                     pos = input.len();
                 }
                 HttpDecodeState::ChunkSize => {
-                    let b = input[pos];
-                    pos += 1;
-                    self.charge_chunk_framing(b)?;
-                    if b == b'\n' {
+                    let rest = &input[pos..];
+                    let take = memchr::memchr(b'\n', rest).map_or(rest.len(), |nl| nl + 1);
+                    self.append_chunk_framing(&rest[..take])?;
+                    pos += take;
+                    if self.chunk_line[self.chunk_line_len - 1] == b'\n' {
                         if self.chunk_line_len < 2 || self.chunk_line[self.chunk_line_len - 2] != b'\r' {
                             return Err(HttpParseErr::Invalid);
                         }
                         self.parse_chunk_line()?;
+                    } else {
+                        self.validate_chunk_line_prefix()?;
                     }
                     if self.chunk_framing_bytes == HTTP_MAX_CHUNK_FRAMING
                         && !matches!(self.state, HttpDecodeState::Trailers)
@@ -28830,6 +29127,40 @@ mod tests {
         ];
         for raw in invalid {
             assert!(http_decode_for_test(raw, false, &[]).is_err(), "invalid chunk: {raw:?}");
+        }
+    }
+
+    /// A framing error that is already determined by the bytes in hand is returned by that feed;
+    /// the socket loop must never issue a later blocking read merely to find another delimiter.
+    #[test]
+    fn http_decoder_rejects_recognizable_prefix_errors_immediately() {
+        for bad_head in [
+            b"HTTP/2".as_slice(),
+            b"HTTP/1.1 000 Nope\r".as_slice(),
+            b"HTTP/1.1 200 OK\r\nBad Header".as_slice(),
+            b"HTTP/1.1 200 OK\r\nBadHeader\r".as_slice(),
+            b"HTTP/1.1 200 OK\r\nBadHeader\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: nope\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n".as_slice(),
+            b"HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n".as_slice(),
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n".as_slice(),
+        ] {
+            let mut decoder = HttpResponseDecoder::new(false);
+            assert_eq!(decoder.feed(bad_head), Err(HttpParseErr::Invalid), "head: {bad_head:?}");
+        }
+
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        for bad_prefix in [
+            b"g".as_slice(),
+            b"1?",
+            b"1;=",
+            b"1;a=\x00",
+            b"1;\r",
+            b"40000001",
+        ] {
+            let mut decoder = HttpResponseDecoder::new(false);
+            decoder.feed(head).unwrap();
+            assert_eq!(decoder.feed(bad_prefix), Err(HttpParseErr::Invalid), "chunk: {bad_prefix:?}");
         }
     }
 
