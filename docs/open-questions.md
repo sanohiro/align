@@ -3642,8 +3642,8 @@ fast-systems-programming needs that any Align user hits, not engine-specific.
    complete source; unfinished Drop and the built array use the canonical recursive compile-time
    Drop plan. `append` stays Copy-scalar-only. The existing nominal interface graph is the sole
    type/cache identity; a self-describing `RecordBuilderDescV1` was rejected as a second identity.
-   Other Move handles remain excluded. **Recursive owned-record extension SETTLED 2026-08-14
-   (align-llm Request 10; implementation pending):** admit nested Options and dynamic arrays only
+   Other Move handles remain excluded. **Recursive owned-record extension SETTLED and IMPLEMENTED
+   2026-08-14 (align-llm Request 10):** admit nested Options and dynamic arrays only
    where the record remains view-free. An array element is a Copy scalar, `string`, or another
    admitted record; `array<Option<T>>` and `array<array<T>>` remain separate composite-element-array
    work. Every nested buffer must be free-standing before push. Direct `array<string>` record fields

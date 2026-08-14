@@ -1099,17 +1099,28 @@ pub fn region_plain_type_ok(
 }
 
 /// Return the deterministic first reason a declared struct is not an element of the individually
-/// owned heap-record `array_builder` subset. The walk is source-order, cycle-safe, and shared by
+/// owned heap-tree-record `array_builder` subset. The walk is source-order, cycle-safe, and shared by
 /// source checking plus the checked-HIR boundary so a malformed or imported definition cannot
 /// bypass the constructor gate.
-pub fn heap_record_error(id: u32, structs: &[StructDef]) -> Option<String> {
-    enum Work {
-        Enter { id: u32, path: String },
-        Field { ty: Ty, path: String },
-        Exit(u32),
+pub fn heap_tree_record_error(
+    id: u32,
+    structs: &[StructDef],
+    tagged_types: &[hir::TaggedType],
+) -> Option<String> {
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    enum Node {
+        Struct(u32),
+        Tagged(u32),
     }
 
-    let mut work = vec![Work::Enter {
+    enum Work {
+        EnterStruct { id: u32, path: String },
+        EnterTagged { id: u32, path: String },
+        Field { ty: Ty, path: String },
+        Exit(Node),
+    }
+
+    let mut work = vec![Work::EnterStruct {
         id,
         path: String::new(),
     }];
@@ -1117,12 +1128,13 @@ pub fn heap_record_error(id: u32, structs: &[StructDef]) -> Option<String> {
     let mut complete = HashSet::new();
     while let Some(item) = work.pop() {
         match item {
-            Work::Exit(id) => {
-                active.remove(&id);
-                complete.insert(id);
+            Work::Exit(node) => {
+                active.remove(&node);
+                complete.insert(node);
             }
-            Work::Enter { id, path } => {
-                if complete.contains(&id) {
+            Work::EnterStruct { id, path } => {
+                let node = Node::Struct(id);
+                if complete.contains(&node) {
                     continue;
                 }
                 let at = |reason: &str| {
@@ -1132,7 +1144,7 @@ pub fn heap_record_error(id: u32, structs: &[StructDef]) -> Option<String> {
                         format!("field '{path}' {reason}")
                     }
                 };
-                if !active.insert(id) {
+                if !active.insert(node) {
                     return Some(at("forms an inline ownership cycle"));
                 }
                 let Some(definition) = structs.get(id as usize) else {
@@ -1147,7 +1159,7 @@ pub fn heap_record_error(id: u32, structs: &[StructDef]) -> Option<String> {
                 if definition.align.is_some() {
                     return Some(at("uses explicit `align(N)`"));
                 }
-                work.push(Work::Exit(id));
+                work.push(Work::Exit(node));
                 for field in definition.fields.iter().rev() {
                     let field_path = if path.is_empty() {
                         field.name.clone()
@@ -1160,9 +1172,51 @@ pub fn heap_record_error(id: u32, structs: &[StructDef]) -> Option<String> {
                     });
                 }
             }
+            Work::EnterTagged { id, path } => {
+                let node = Node::Tagged(id);
+                if complete.contains(&node) {
+                    continue;
+                }
+                let at = |reason: &str| {
+                    if path.is_empty() {
+                        reason.to_string()
+                    } else {
+                        format!("field '{path}' {reason}")
+                    }
+                };
+                if !active.insert(node) {
+                    return Some(at("forms an inline ownership cycle"));
+                }
+                let Some(tagged) = tagged_types.get(id as usize) else {
+                    return Some(at("has an unknown tagged definition"));
+                };
+                let hir::TaggedType::Option(payload) = *tagged else {
+                    return Some(at("has excluded tagged type `Result`"));
+                };
+                work.push(Work::Exit(node));
+                work.push(Work::Field {
+                    ty: scalar_to_ty(payload),
+                    path,
+                });
+            }
             Work::Field { ty, path } => match ty {
                 Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::String => {}
-                Ty::Struct(id) => work.push(Work::Enter { id, path }),
+                Ty::Struct(id) => work.push(Work::EnterStruct { id, path }),
+                Ty::Option(payload) => work.push(Work::Field {
+                    ty: scalar_to_ty(payload),
+                    path,
+                }),
+                Ty::Tagged(id) => work.push(Work::EnterTagged { id, path }),
+                Ty::DynArray(
+                    Scalar::Int(_)
+                    | Scalar::Float(_)
+                    | Scalar::Bool
+                    | Scalar::Char
+                    | Scalar::String,
+                ) => {}
+                Ty::DynStructArray(id, Layout::Aos) => {
+                    work.push(Work::EnterStruct { id, path });
+                }
                 other => {
                     return Some(format!(
                         "field '{path}' has excluded type {}",
@@ -1175,10 +1229,14 @@ pub fn heap_record_error(id: u32, structs: &[StructDef]) -> Option<String> {
     None
 }
 
-/// Whether `id` is the closed, view-free declared-record element accepted by
+/// Whether `id` is the closed, view-free recursive declared-record element accepted by
 /// `array_builder<Struct>()`.
-pub fn heap_record_type_ok(id: u32, structs: &[StructDef]) -> bool {
-    heap_record_error(id, structs).is_none()
+pub fn heap_tree_record_type_ok(
+    id: u32,
+    structs: &[StructDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    heap_tree_record_error(id, structs, tagged_types).is_none()
 }
 
 /// Expand the reversible type view of a nested tagged payload. Other types pass through unchanged.
@@ -6083,16 +6141,9 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
             let fty = structs[i].fields[fi].ty;
             // An `array<T>` field (REST-gateway runway Slice C) owns ONE heap buffer freed by the
             // struct's `Drop` (`drop_struct_fields`). Plain scalar, `str`-view, and Move-struct
-            // elements are supported; the recursive array Drop path handles owned struct fields.
-            // Bare `array<string>` still needs a per-element deep free in this declaration path,
-            // so reject it here. `array<Move-struct>` is checked after pass 0c, where
+            // elements are supported; the recursive array Drop path handles owned struct and
+            // string elements. `array<Move-struct>` is checked after pass 0c, where
             // `struct_is_move` is enum-accurate.
-            if let Ty::DynArray(Scalar::String) = fty {
-                diags.error(
-                    "an `array<string>` field is not supported yet (its per-element deep free is a later slice) — use `array<str>` for borrowed strings".to_string(),
-                    f.span,
-                );
-            }
             // The nested-struct checks apply to a direct `Struct` field AND an `Option<Struct>` field:
             // both embed the struct **inline**, so both need the acyclic + no-`align(N)` guarantees.
             let mut nested_types = Vec::new();
@@ -6289,9 +6340,8 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
     // (freeing a `string`/owned-array/Move-enum field, transitively), then frees the AoS buffer; the
     // runtime decode error path (`drop_decoded_owned` kind-5 / `decode_struct_array_value`) mirrors that
     // per-element deep free. So there is no `array<Move-struct>` rejection here — an owned-element array
-    // is as legal as an owned scalar-element one. (`array<string>` — a bare-`string` element — is still
-    // rejected in pass 0b-2 above: it is a `DynArray(String)`, not a struct-element array, and its
-    // per-element string free is a separate slice.)
+    // is as legal as an owned scalar-element one. A direct `array<string>` field uses the same
+    // standalone deep string-array Drop through the ordinary recursive struct plan.
 
     // Every function across all modules, tagged with its module path + whether that is the entry
     // module (so its name is unmangled). Used by passes 1 / 2 and the module-resolution table.
@@ -13103,20 +13153,23 @@ impl<'a> EscapeCheck<'a> {
                 // A by-value Move parameter has crossed the call boundary and is free-standing.
                 // A borrowed builder keeps the constructor modes admitted by its element type:
                 // `string` is heap-only, primitive scalars may use either constructor, and the
-                // remaining source element forms are region-only. This keeps a nested helper from
-                // treating a possibly region-backed incoming builder as definitely individual.
+                // remaining source element forms are region-only. A Move HeapTreeRecord is
+                // necessarily heap-only: every Move leaf in that grammar (`string` or a dynamic
+                // array) is rejected by RegionPlain. Copy records may use either constructor.
+                // This keeps a nested helper from treating a possibly region-backed incoming
+                // builder as definitely individual.
                 let (individual, may_individual) = match (borrowed_builder, local.ty) {
                     (true, Ty::ArrayBuilder(Scalar::String)) => {
                         (true, true)
                     }
                     (true, Ty::ArrayBuilder(Scalar::Struct(id)))
-                        if heap_record_type_ok(id, self.structs)
+                        if heap_tree_record_type_ok(id, self.structs, self.tagged_types)
                             && struct_is_move(id, self.structs, self.enums, self.tagged_types) =>
                     {
                         (true, true)
                     }
                     (true, Ty::ArrayBuilder(Scalar::Struct(id)))
-                        if heap_record_type_ok(id, self.structs) =>
+                        if heap_tree_record_type_ok(id, self.structs, self.tagged_types) =>
                     {
                         (false, true)
                     }
@@ -13263,7 +13316,7 @@ impl<'a> EscapeCheck<'a> {
                 let move_heap_record = matches!(
                     builder.ty.array_builder_element(),
                     Some(ArrayBuilderElem::Scalar(Scalar::Struct(id)))
-                        if heap_record_type_ok(id, self.structs)
+                        if heap_tree_record_type_ok(id, self.structs, self.tagged_types)
                             && struct_is_move(id, self.structs, self.enums, self.tagged_types)
                 );
                 if move_heap_record
@@ -36757,10 +36810,14 @@ impl<'a, 't> Checker<'a, 't> {
                 Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::String)
         ) && !matches!(elem,
             ArrayBuilderElem::Scalar(Scalar::Struct(id))
-                if heap_record_type_ok(id, self.structs)
+                if heap_tree_record_type_ok(id, self.structs, self.tagged_types)
         ) {
             let detail = match elem {
-                ArrayBuilderElem::Scalar(Scalar::Struct(id)) => heap_record_error(id, self.structs)
+                ArrayBuilderElem::Scalar(Scalar::Struct(id)) => heap_tree_record_error(
+                    id,
+                    self.structs,
+                    self.tagged_types,
+                )
                     .map(|reason| format!(": {reason}"))
                     .unwrap_or_default(),
                 _ => String::new(),
@@ -46864,14 +46921,14 @@ fn http_headers_placement_error(what: &str) -> String {
     )
 }
 
-/// Whether a resolved type has a field representation. Detailed restrictions for inline layout,
-/// direct `array<string>`, and recursive ownership are applied after all definitions exist.
+/// Whether a resolved type has a field representation. Detailed restrictions for inline layout
+/// and recursive ownership are applied after all definitions exist.
 fn is_field_ok(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
     // A struct field is a primitive scalar, `str` (a borrow), an owned value, an inline struct or
     // enum, a view/handle, an **`Option<T>`/`Result<T, E>`** whose payload is itself a valid field
     // shape, or an owned array. An owned (`string`, Move-struct, handle, option payload, or array)
     // field makes the enclosing struct a Move type with a recursive `Drop`; the complete inline
-    // graph and the direct `array<string>` exception are checked by later passes.
+    // graph is checked by later passes.
     let mut work = vec![ty];
     let mut visited_tagged = HashSet::new();
     while let Some(ty) = work.pop() {
@@ -46935,9 +46992,9 @@ fn is_field_ok(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
         }
         Ty::Tagged(_) => return false,
         // An owned `array<T>` field (REST-gateway runway Slice C): the `messages: array<Message>` /
-        // `choices: array<Choice>` shape. The complete struct table and the direct
-        // `array<string>` exception are enforced at declaration (pass 0b-2); here we admit the
-        // array shape, including the recursively droppable `array<Move-struct>` form.
+        // `choices: array<Choice>` shape. The complete struct table is enforced at declaration;
+        // here we admit the array shape, including the recursively droppable `array<string>` and
+        // `array<Move-struct>` forms.
         ty if ty.is_dyn_aggregate_array() => {}
         Ty::DynArray(_) | Ty::DynStructArray(..) => {}
         _ => return false,
@@ -51934,26 +51991,141 @@ fn exit_branch(flag: bool) -> i64 {
             bits: 64,
             signed: true,
         });
+        let tagged = vec![
+            hir::TaggedType::Option(Scalar::Struct(0)),
+            hir::TaggedType::Option(Scalar::Tagged(0)),
+            hir::TaggedType::Result(Scalar::Struct(0), Scalar::String),
+        ];
         let valid = vec![
-            structure("Inner", vec![("name", Ty::String)]),
+            structure(
+                "Inner",
+                vec![
+                    ("name", Ty::String),
+                    ("scores", Ty::DynArray(Scalar::Float(FloatTy { bits: 64 }))),
+                ],
+            ),
             structure(
                 "Outer",
-                vec![("count", i64_ty), ("inner", Ty::Struct(0))],
+                vec![
+                    ("count", i64_ty),
+                    ("inner", Ty::Struct(0)),
+                    ("maybe_name", Ty::Option(Scalar::String)),
+                    ("maybe_inner", Ty::Tagged(1)),
+                    ("names", Ty::DynArray(Scalar::String)),
+                    ("inners", Ty::DynStructArray(0, Layout::Aos)),
+                ],
             ),
         ];
-        assert!(heap_record_type_ok(0, &valid));
-        assert!(heap_record_type_ok(1, &valid));
+        assert!(heap_tree_record_type_ok(0, &valid, &tagged));
+        assert!(heap_tree_record_type_ok(1, &valid, &tagged));
+
+        let copy_dual_mode = vec![structure("CopyDualMode", vec![("value", i64_ty)])];
+        assert!(heap_tree_record_type_ok(0, &copy_dual_mode, &[]));
+        assert!(region_plain_type_ok(
+            Ty::Struct(0),
+            &copy_dual_mode,
+            &[],
+            &[],
+        ));
+        let move_heap_only = vec![structure(
+            "MoveHeapOnly",
+            vec![("values", Ty::DynArray(Scalar::Int(IntTy {
+                bits: 64,
+                signed: true,
+            })))],
+        )];
+        assert!(heap_tree_record_type_ok(0, &move_heap_only, &[]));
+        assert!(
+            !region_plain_type_ok(Ty::Struct(0), &move_heap_only, &[], &[]),
+            "a Move HeapTreeRecord must never be dual-mode because RegionPlain rejects every owning leaf"
+        );
+
+        for (name, excluded, expected) in [
+            ("view", Ty::Str, "field 'bad' has excluded type str"),
+            (
+                "view array",
+                Ty::DynArray(Scalar::Str),
+                "field 'bad' has excluded type array<str>",
+            ),
+            (
+                "fixed array",
+                Ty::Array(Scalar::String, 2),
+                "field 'bad' has excluded type array<string>[2]",
+            ),
+            (
+                "SoA record array",
+                Ty::DynStructArray(0, Layout::Soa),
+                "field 'bad' has excluded type array<struct#0>",
+            ),
+            (
+                "composite array",
+                Ty::DynArray(Scalar::DynArray(PrimScalar::String)),
+                "field 'bad' has excluded type array<array<string>>",
+            ),
+        ] {
+            let rejected = vec![structure("Bad", vec![("bad", excluded)])];
+            assert_eq!(
+                heap_tree_record_error(0, &rejected, &tagged).as_deref(),
+                Some(expected),
+                "{name} was not rejected deterministically"
+            );
+        }
+
+        let unknown = vec![structure(
+            "Unknown",
+            vec![
+                ("tagged", Ty::Tagged(99)),
+                ("record_array", Ty::DynStructArray(99, Layout::Aos)),
+            ],
+        )];
+        assert_eq!(
+            heap_tree_record_error(0, &unknown, &tagged).as_deref(),
+            Some("field 'tagged' has an unknown tagged definition")
+        );
+        let unknown_array = vec![structure(
+            "UnknownArray",
+            vec![("record_array", Ty::DynStructArray(99, Layout::Aos))],
+        )];
+        assert_eq!(
+            heap_tree_record_error(0, &unknown_array, &tagged).as_deref(),
+            Some("field 'record_array' has an unknown struct definition")
+        );
+
+        let result_tagged = vec![structure("BadResult", vec![("value", Ty::Tagged(2))])];
+        assert_eq!(
+            heap_tree_record_error(0, &result_tagged, &tagged).as_deref(),
+            Some("field 'value' has excluded tagged type `Result`")
+        );
 
         let empty = vec![structure("Empty", Vec::new())];
-        assert_eq!(heap_record_error(0, &empty).as_deref(), Some("is an empty struct"));
         assert_eq!(
-            heap_record_error(99, &empty).as_deref(),
+            heap_tree_record_error(0, &empty, &[]).as_deref(),
+            Some("is an empty struct")
+        );
+        assert_eq!(
+            heap_tree_record_error(99, &empty, &[]).as_deref(),
             Some("has an unknown struct definition")
         );
 
         let cycle = vec![structure("Cycle", vec![("next", Ty::Struct(0))])];
         assert_eq!(
-            heap_record_error(0, &cycle).as_deref(),
+            heap_tree_record_error(0, &cycle, &[]).as_deref(),
+            Some("field 'next' forms an inline ownership cycle")
+        );
+
+        let array_cycle = vec![structure(
+            "ArrayCycle",
+            vec![("children", Ty::DynStructArray(0, Layout::Aos))],
+        )];
+        assert_eq!(
+            heap_tree_record_error(0, &array_cycle, &[]).as_deref(),
+            Some("field 'children' forms an inline ownership cycle")
+        );
+
+        let tagged_cycle = vec![hir::TaggedType::Option(Scalar::Tagged(0))];
+        let option_cycle = vec![structure("OptionCycle", vec![("next", Ty::Tagged(0))])];
+        assert_eq!(
+            heap_tree_record_error(0, &option_cycle, &tagged_cycle).as_deref(),
             Some("field 'next' forms an inline ownership cycle")
         );
 
@@ -51968,7 +52140,7 @@ fn exit_branch(flag: bool) -> i64 {
             ],
         )];
         assert_eq!(
-            heap_record_error(0, &source_order).as_deref(),
+            heap_tree_record_error(0, &source_order, &[]).as_deref(),
             Some("field 'first' has excluded type str")
         );
 
@@ -51980,25 +52152,48 @@ fn exit_branch(flag: bool) -> i64 {
             ),
         ];
         assert_eq!(
-            heap_record_error(1, &nested_source_order).as_deref(),
+            heap_tree_record_error(1, &nested_source_order, &[]).as_deref(),
             Some("field 'first.inner' has excluded type str")
         );
 
         let mut explicit = vec![structure("Explicit", vec![("value", i64_ty)])];
         explicit[0].c_repr = true;
-        assert_eq!(heap_record_error(0, &explicit).as_deref(), Some("uses `layout(C)`"));
+        assert_eq!(
+            heap_tree_record_error(0, &explicit, &[]).as_deref(),
+            Some("uses `layout(C)`")
+        );
         explicit[0].c_repr = false;
         explicit[0].align = Some(16);
         assert_eq!(
-            heap_record_error(0, &explicit).as_deref(),
+            heap_tree_record_error(0, &explicit, &[]).as_deref(),
             Some("uses explicit `align(N)`")
+        );
+
+        const DEPTH: usize = 1024;
+        let deep = (0..DEPTH)
+            .map(|id| {
+                let ty = if id + 1 == DEPTH {
+                    Ty::String
+                } else {
+                    match id % 3 {
+                        0 => Ty::Struct((id + 1) as u32),
+                        1 => Ty::Option(Scalar::Struct((id + 1) as u32)),
+                        _ => Ty::DynStructArray((id + 1) as u32, Layout::Aos),
+                    }
+                };
+                structure(&format!("Deep{id}"), vec![("next", ty)])
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            heap_tree_record_type_ok(0, &deep, &[]),
+            "a deep finite heap-tree record graph must be classified iteratively"
         );
     }
 
     #[test]
     fn heap_record_builder_owned_leaves_are_proved_individual_before_push() {
         let (program, diagnostics) = check(
-            "Item { name: string, value: i64 }\nfn make() -> Item = Item{name: \"call\".clone(), value: 2}\nfn main() -> i32 {\n  mut items: array_builder<Item> := array_builder()\n  local := Item{name: \"local\".clone(), value: 1}\n  items.push(local)\n  items.push(make())\n  return 0\n}\n",
+            "Leaf { name: string }\nItem { name: string, maybe: Option<Leaf>, names: array<string>, leaves: array<Leaf>, value: i64 }\nfn names() -> array<string> { mut b: array_builder<string> := array_builder()\n  b.push(\"name\".clone())\n  return b.build() }\nfn leaves() -> array<Leaf> { mut b: array_builder<Leaf> := array_builder()\n  b.push(Leaf{name: \"leaf\".clone()})\n  return b.build() }\nfn make(value: i64) -> Item = Item{name: \"call\".clone(), maybe: Some(Leaf{name: \"optional\".clone()}), names: names(), leaves: leaves(), value: value}\nfn main() -> i32 {\n  mut items: array_builder<Item> := array_builder()\n  local := make(1)\n  items.push(local)\n  items.push(make(2))\n  return 0\n}\n",
         );
         assert!(!diagnostics.has_errors());
         let main = program

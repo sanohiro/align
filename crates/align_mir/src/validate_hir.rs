@@ -935,7 +935,6 @@ impl<'a> PlacementValidator<'a> {
             for field in &definition.fields {
                 if !self.field_type_ok(field.ty, abstract_node)
                     || (definition.c_repr && !matches!(field.ty, Ty::Int(_) | Ty::Float(_)))
-                    || matches!(field.ty, Ty::DynArray(Scalar::String))
                     || !self.inline_structs_unaligned(field.ty)
                 {
                     return false;
@@ -4214,7 +4213,11 @@ impl<'a> BodyValidator<'a> {
         (align_sema::scalar_to_prim(elem).is_some()
             && (elem == Scalar::String || self.scalar_copy_ok(elem)))
             || matches!(elem, Scalar::Struct(id)
-                if align_sema::heap_record_type_ok(id, &self.program.structs))
+                if align_sema::heap_tree_record_type_ok(
+                    id,
+                    &self.program.structs,
+                    &self.program.tagged_types,
+                ))
     }
 
     fn array_builder_moves_value(&self, elem: ArrayBuilderElem) -> bool {

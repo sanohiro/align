@@ -404,14 +404,21 @@ fn imported_impure_fn_value_effect_survives_indirect_call() {
 fn record_builder_imported_interface_graph() {
     let records = concat!(
         "module records\n",
-        "pub Item { name: string, value: i64 }\n",
-        "pub fn make(value: i64) -> Item = Item{name: \"item\".clone(), value: value}\n",
+        "pub Child { name: string }\n",
+        "pub Tree<T> { name: string, tags: array<string>, child: Option<T>, children: array<T>, value: i64 }\n",
+        "fn tags() -> array<string> { mut b: array_builder<string> := array_builder()\n",
+        "  b.push(\"tag\".clone())\n",
+        "  return b.build() }\n",
+        "fn children() -> array<Child> { mut b: array_builder<Child> := array_builder()\n",
+        "  b.push(Child{name: \"array-child\".clone()})\n",
+        "  return b.build() }\n",
+        "pub fn make(value: i64) -> Tree<Child> = Tree{name: \"item\".clone(), tags: tags(), child: Some(Child{name: \"optional-child\".clone()}), children: children(), value: value}\n",
     );
     let main = concat!(
         "module main\n",
         "import records\n",
         "fn main() -> i32 {\n",
-        "  mut items: array_builder<records.Item> := array_builder()\n",
+        "  mut items: array_builder<records.Tree<records.Child>> := array_builder()\n",
         "  items.push(records.make(42))\n",
         "  values := items.build()\n",
         "  return (values.len() + values[0].value) as i32\n",

@@ -8,8 +8,7 @@ packages and native stateful libraries. `std.http`, `std.net`, `std.process`, an
 FFI-backed packages must be able to use the same ownership and borrow machinery.
 
 Sections 7.5 and 7.6 are later, independently consumer-complete extensions for align-llm Requests
-8 and 10. Section 7.5 is implemented. Section 7.6 is the accepted design for the recursive
-Option/dynamic-array record graph and remains unimplemented. Neither is a `pkg.db` prerequisite.
+8 and 10. Both are implemented. Neither is a `pkg.db` prerequisite.
 
 The implementation order in this document is mandatory. A database driver must not add another
 closed `Ty`/HIR/MIR family that recognizes `pkg.db` names, and it must not expose `raw` handles or
@@ -1200,7 +1199,7 @@ risk and less duplicated evidence.
 
 ### 7.6 Recursive owned heap-record builder
 
-Status: accepted design for align-llm Request 10; implementation pending.
+Status: implemented 2026-08-14 for align-llm Request 10.
 
 This extension keeps the Request 8 syntax, owner model, nominal identity, and runtime allocation
 ABI. It widens only the admitted record graph needed by the named C6 evaluator records. There is no

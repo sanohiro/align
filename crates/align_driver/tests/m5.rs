@@ -3334,9 +3334,9 @@ fn json_standalone_array_of_move_struct_local_drops_clean() {
 
 #[test]
 fn json_array_of_move_struct_with_string_field_rejected_via_element() {
-    // The element restriction is unchanged where it must be: an `array<Struct>` whose element owns a
-    // bare `array<string>` field is rejected — the `array<string>` field itself is deferred (its
-    // per-element string free is a separate slice), caught at the element struct's declaration.
+    // Request 10 makes the bare `array<string>` field a valid ordinary Move field, but does not
+    // widen JSON's recursive element grammar. JSON must still reject an `array<Struct>` whose
+    // element owns that field before descriptor/codegen publication.
     assert!(check_errs(
         "json-arr-move-arrstring",
         "import core.json\n\
