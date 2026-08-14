@@ -10351,6 +10351,10 @@ fn request11_process_rows_match_the_producer() {
         "request11-run-bytes-error",
         &with_return(Ty::Result(Scalar::Unit, Scalar::RunBytes)),
     );
+    assert_rejected(
+        "request11-run-bytes-bare-return",
+        &with_return(Ty::RunBytes),
+    );
     let mut nested_placement = with_return(Ty::Unit);
     let inner = nested_placement.tagged_types.len() as u32;
     nested_placement
@@ -10508,7 +10512,7 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        variants, 257,
+        variants, 258,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }

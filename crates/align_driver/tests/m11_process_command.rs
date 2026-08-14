@@ -549,6 +549,10 @@ fn run_bytes_type_classification_tripwire() {
             "run-bytes-nested-result",
             "import std.process\nfn bad() -> Result<Result<run_bytes, Error>, Error> = Err(Error.Invalid)\npub fn main() -> i32 { 0 }\n",
         ),
+        (
+            "run-bytes-bare-return",
+            "import std.process\nfn bad(out: run_bytes) -> run_bytes = out\npub fn main() -> i32 { 0 }\n",
+        ),
     ] {
         assert!(check_errs(name, declaration), "{name} must stay outside the closed run_bytes carrier set");
     }
@@ -569,6 +573,20 @@ pub fn main() -> Result<(), Error> {\n\
   Ok(())\n\
 }\n";
     assert!(check_errs("run-bytes-capture", capture));
+    let generic_return = "import std.process\n\
+fn identity<T>(value: T) -> T = value\n\
+pub fn main() -> Result<(), Error> {\n\
+  c := process.command(\"/bin/echo\", [\"/bin/echo\", \"x\"])\n\
+  out := c.run_bytes()?\n\
+  returned := identity(out)\n\
+  print(returned.code())\n\
+  Ok(())\n\
+}\n";
+    let diagnostics = check_diagnostics("run-bytes-generic-bare-return", generic_return);
+    assert!(
+        diagnostics.contains("generic substitution cannot produce a bare run_bytes return"),
+        "generic substitution must fail at the closed return-carrier gate:\n{diagnostics}"
+    );
     let return_move = "import std.process\n\
 fn capture() -> Result<run_bytes, Error> {\n\
   c := process.command(\"/bin/echo\", [\"/bin/echo\", \"x\"])\n\

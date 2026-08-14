@@ -1031,7 +1031,7 @@ this authoritative boundary instead of relying on the older scalar/string valida
 ### Request 11 process-capture activation delta
 
 The five Request 11 expression rows above activated together with `Ty::RunBytes` /
-`Scalar::RunBytes`; there is no producer-only intermediate. The `ExprKind` inventory is 257, and
+`Scalar::RunBytes`; there is no producer-only intermediate. The `ExprKind` inventory is 258, and
 `variant_sweep_tripwire` must fail at compile time
 if any of those five variants is absent from validation or ownership analysis.
 
@@ -1047,14 +1047,14 @@ if any of those five variants is absent from validation or ownership analysis.
 
 The implementation must derive an exhaustiveness constant from the Rust enum
 definitions and assert that this file has exactly one owner id for every
-`Stmt`, all 257 `ExprKind` variants, `ArithMode`, `MathFn`, every
+`Stmt`, all 258 `ExprKind` variants, `ArithMode`, `MathFn`, every
 `BuilderWriteKind`, `StrPredKind`, `StrTrimKind`, `TemplatePart`, `StageKind`,
 `GroupSource`, `GroupAgg1`, `GroupOp`, `CliFlagKind`, `EncodingKind`, `CompressKind`,
 `PathComponentKind`, `AeadCipher`, `AeadDir`, and `HashAlgo`. The test fails on
 an added, removed, duplicated, or unowned discriminator.
 
-Request 11 changed the asserted `ExprKind` total from 252 to 257 in the same commit that activated
-its five rows.
+Request 11 changed the asserted `ExprKind` total from 253 to 258 in the same integrated tree that
+already contains `JsonEncodeBounded`, and activated its five rows.
 
 ## Producer-delegation closure matrix
 

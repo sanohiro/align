@@ -964,7 +964,7 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
 /// "any type": widening is exactly what a consumer needed, so no untested aggregate-return ABI is
 /// admitted by accident.
 pub fn fn_value_ret_ok(ty: Ty) -> bool {
-    fn_sig_scalar(ty).is_some() || matches!(ty, Ty::Result(..))
+    ty != Ty::RunBytes && (fn_sig_scalar(ty).is_some() || matches!(ty, Ty::Result(..)))
 }
 
 pub fn fn_sig_scalar(ty: Ty) -> Option<Scalar> {
@@ -6677,6 +6677,13 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                 if matches!(r, Ty::Fn(_)) {
                     diags.error(
                         "returning a function value is not supported yet (a closure's environment is frame-local)".to_string(),
+                        t.span(),
+                    );
+                }
+                if r == Ty::RunBytes {
+                    diags.error(
+                        "run_bytes cannot be returned directly; return Result<run_bytes, Error> and keep run_bytes in its direct Ok slot"
+                            .to_string(),
                         t.span(),
                     );
                 }
@@ -26602,6 +26609,13 @@ impl<'a, 't> Checker<'a, 't> {
             ret = self.subst_type(ret, &mono_args, f.span);
             for t in &mut param_tys {
                 *t = self.subst_type(*t, &mono_args, f.span);
+            }
+            if ret == Ty::RunBytes {
+                self.diags.error(
+                    "generic substitution cannot produce a bare run_bytes return; return Result<run_bytes, Error> and keep run_bytes in its direct Ok slot"
+                        .to_string(),
+                    f.ret.as_ref().map(ast::Type::span).unwrap_or(f.span),
+                );
             }
         }
         if mangled == "main" {
@@ -47943,6 +47957,15 @@ mod tests {
     use super::*;
     use align_lexer::tokenize;
     use align_parser::parse_file;
+
+    #[test]
+    fn run_bytes_is_not_a_function_value_return() {
+        assert!(!fn_value_ret_ok(Ty::RunBytes));
+        assert!(fn_value_ret_ok(Ty::Result(
+            Scalar::RunBytes,
+            Scalar::Enum(0),
+        )));
+    }
 
     fn check(src: &str) -> (Program, Diagnostics) {
         let mut d = Diagnostics::new();

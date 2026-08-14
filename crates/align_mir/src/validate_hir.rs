@@ -1521,7 +1521,8 @@ impl<'a> PlacementValidator<'a> {
     fn source_function_type_ok(&self, ty: Ty, parameter: bool, return_position: bool) -> bool {
         self.resolve_type_ok(ty, false)
             && !(parameter && matches!(ty, Ty::Box(_)))
-            && !(return_position && matches!(ty, Ty::Box(_) | Ty::Fn(_) | Ty::ArenaHandle))
+            && !(return_position
+                && matches!(ty, Ty::Box(_) | Ty::Fn(_) | Ty::ArenaHandle | Ty::RunBytes))
     }
 
     fn stored_function_parameter_ok(&self, function: &hir::Fn, index: usize, ty: Ty) -> bool {
