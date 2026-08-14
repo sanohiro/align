@@ -16501,7 +16501,6 @@ impl HttpResponseDecoder {
         }
         if head.chunked {
             self.final_head = Some(head);
-            self.prepare_body();
             self.state = HttpDecodeState::ChunkSize;
             return Ok(());
         }
@@ -16547,6 +16546,12 @@ impl HttpResponseDecoder {
             } else {
                 HttpParseErr::Invalid
             });
+        }
+        // Chunked framing does not reveal a payload magnitude in the response head. Defer the
+        // exact-cap body allocation until the first nonzero size line is complete, syntactically
+        // valid, and within the cumulative cap. An immediately rejected line must allocate no body.
+        if size != 0 {
+            self.prepare_body();
         }
         self.reset_chunk_line();
         self.state = if size == 0 {
@@ -18371,19 +18376,27 @@ unsafe fn http_client_perform(
         return AL_INVALID;
     }
     let body_bound_is_explicit = client_body_limit > 0 || req.max_response_body_bytes > 0;
-    let selected_body_limit = body_bound_is_explicit.then(|| {
+    let selected_body_limit = if body_bound_is_explicit {
         let client_bound = if client_body_limit > 0 {
-            client_body_limit as usize
+            let Ok(limit) = usize::try_from(client_body_limit) else {
+                return AL_INVALID;
+            };
+            limit
         } else {
             HTTP_MAX_BODY
         };
         let request_bound = if req.max_response_body_bytes > 0 {
-            req.max_response_body_bytes as usize
+            let Ok(limit) = usize::try_from(req.max_response_body_bytes) else {
+                return AL_INVALID;
+            };
+            limit
         } else {
             HTTP_MAX_BODY
         };
-        client_bound.min(request_bound)
-    });
+        Some(client_bound.min(request_bound))
+    } else {
+        None
+    };
     // 4. Render the request into ONE buffer (validates method / headers / smuggling — http.md R4).
     // A real client lends bounded scratch storage; a null client keeps the no-pool behavior.
     let mut request_bytes = client_ref
@@ -30540,6 +30553,24 @@ mod tests {
             ),
             Err(HttpParseErr::BodyLimit)
         ));
+        let mut rejected_chunk = HttpResponseDecoder::new_with_limit(false, Some(5));
+        rejected_chunk
+            .feed(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .unwrap();
+        assert!(
+            rejected_chunk.bounded_body.is_none(),
+            "a chunked head alone does not justify the exact-cap body allocation"
+        );
+        assert_eq!(rejected_chunk.feed(b"6\r\n"), Err(HttpParseErr::BodyLimit));
+        assert!(
+            rejected_chunk.bounded_body.is_none(),
+            "an over-cap first chunk is rejected before body allocation"
+        );
+        let mut admitted_chunk = HttpResponseDecoder::new_with_limit(false, Some(5));
+        admitted_chunk
+            .feed(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n")
+            .unwrap();
+        assert_eq!(admitted_chunk.bounded_body.as_ref().unwrap().capacity(), 5);
         assert!(
             matches!(
                 http_decode_bounded_for_test(

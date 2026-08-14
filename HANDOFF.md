@@ -25,10 +25,16 @@ nine failures plus its now-repaired stale export inventory. Candidate
 retained chunk-line buffer exceeded the promised 557,056-byte ceiling. The
 consolidated repair replaces it with scalar incremental grammar state, pins the
 decoder below 1 KiB, and preserves the existing extension grammar across every
-split boundary. Affected runtime, driver, aggregate-failure-set, and clippy
-owners pass. Next: commit the repair, perform the required final comprehensive
-review because the parser approach changed, then run the exact-head
-pre-publication gate and publish/merge the PR.
+split boundary. Final comprehensive review of repair head `e6cbfa5d` found one
+valid P2: the chunked path allocated the selected-cap body before its first
+complete chunk-size line passed the cap. The narrow disposition defers that
+allocation until the first nonzero valid in-cap chunk and pins rejection-before-
+allocation. The focused explicit-bound runtime matrix and exact 557,056-byte
+ceiling test pass after the final repair, as do all five native ARM64 driver
+owners, runtime lib Clippy, and the lint ratchet. The repair delta is limited to
+the allocation point, its regression assertions, checked limit conversion, and
+this handoff. Next: run the exact-head pre-publication gate, then publish and
+merge the PR.
 
 The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit
