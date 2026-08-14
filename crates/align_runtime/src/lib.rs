@@ -7794,6 +7794,8 @@ const AL_TIMEOUT: i32 = 4;
 /// Base offset for `Error.Code(errno)`: an encoded status is `AL_CODE + errno`, kept above the
 /// four category sentinels so a small errno (e.g. `ESRCH` = 3) can never look like a category.
 const AL_CODE: i32 = 5;
+/// Private HTTP-client sentinel mapped by MIR to `Error.Code(-1)`.
+const AL_HTTP_BODY_LIMIT: i32 = -1;
 
 /// The one fixed errno→`Error` table (`draft.md` §18.2). Uses `std::io::ErrorKind` so the mapping
 /// is portable (the kernel errno numbers differ per platform): `NotFound`←ENOENT, `PermissionDenied`
@@ -15499,6 +15501,8 @@ pub struct HttpRequest {
     /// the client default" (http.md "I/O timeouts"). A positive value overrides the client default; the
     /// effective per-op deadline (connect + send + receive) is resolved in [`http_client_perform`].
     timeout_ns: i64,
+    /// The per-request response-body receive cap, or `0` to inherit the client default.
+    max_response_body_bytes: i64,
 }
 
 /// The request fields the serializer and client exchange only borrow. Builder-backed requests use
@@ -15514,6 +15518,8 @@ struct HttpRequestView<'a> {
     /// [`http_client_perform`] can resolve the effective per-op deadline (http.md "I/O timeouts"); the
     /// convenience `get`/`post` views (no request handle) always set `0` (inherit).
     timeout_ns: i64,
+    /// The per-request response-body receive cap (`0` = inherit the client default).
+    max_response_body_bytes: i64,
 }
 
 impl HttpRequest {
@@ -15524,6 +15530,7 @@ impl HttpRequest {
             headers: &self.headers,
             body: &self.body,
             timeout_ns: self.timeout_ns,
+            max_response_body_bytes: self.max_response_body_bytes,
         }
     }
 }
@@ -15583,12 +15590,14 @@ impl HttpHeaderSpans {
     }
 }
 
-/// A parsed HTTP/1.1 response — ONE owned raw byte buffer plus an offset table (http.md R1). The
-/// status line / headers / body are all views into `buf`; `resp.header()` / `resp.body()` hand back
-/// zero-copy `AlignStr` views (region-bound to the handle in sema). Freed by
+/// A parsed HTTP/1.1 response. Unconfigured parsing keeps the Request-4 single raw buffer; an
+/// explicitly bounded client exchange owns a fixed header buffer plus a separate exact-capacity
+/// body buffer. Header spans index `buf`, while `resp.header()` / `resp.body()` return zero-copy
+/// `AlignStr` views into their response-owned storage (region-bound to the handle in sema). Freed by
 /// [`align_rt_http_resp_free`].
 pub struct HttpResponse {
     buf: Vec<u8>,
+    body: Option<Vec<u8>>,
     status: i64,
     headers: HttpHeaderSpans,
     body_start: usize,
@@ -15633,7 +15642,14 @@ pub unsafe extern "C" fn align_rt_http_request_new(
 ) -> *mut HttpRequest {
     let method = String::from_utf8_lossy(unsafe { bytes_view(method_ptr, method_len) }).into_owned();
     let url = String::from_utf8_lossy(unsafe { bytes_view(url_ptr, url_len) }).into_owned();
-    Box::into_raw(Box::new(HttpRequest { method, url, headers: Vec::new(), body: Vec::new(), timeout_ns: 0 }))
+    Box::into_raw(Box::new(HttpRequest {
+        method,
+        url,
+        headers: Vec::new(),
+        body: Vec::new(),
+        timeout_ns: 0,
+        max_response_body_bytes: 0,
+    }))
 }
 
 /// `r.header(name, value)` — append a header. **Aborts** (http.md P6) if either the name or the
@@ -15702,6 +15718,22 @@ pub unsafe extern "C" fn align_rt_http_timeout(req: *mut HttpRequest, ns: i64) {
         panic_abort("http.timeout: negative timeout");
     }
     unsafe { &mut *req }.timeout_ns = ns;
+}
+
+/// `r.max_response_body_bytes(limit)` — set the request's receive cap. `0` inherits the client;
+/// `1..=HTTP_MAX_BODY` narrows it. Invalid values abort before the stored value changes.
+///
+/// # Safety
+/// `req` must be null or a pointer from [`align_rt_http_request_new`], not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_max_response_body_bytes(req: *mut HttpRequest, limit: i64) {
+    if req.is_null() {
+        panic_abort("http.max_response_body_bytes: null request handle");
+    }
+    if !(0..=HTTP_MAX_BODY as i64).contains(&limit) || usize::try_from(limit).is_err() {
+        panic_abort("http.max_response_body_bytes: limit must be 0..=HTTP_MAX_BODY");
+    }
+    unsafe { &mut *req }.max_response_body_bytes = limit;
 }
 
 /// An RFC 7230 `token`: one or more `tchar` (ALPHA / DIGIT / a fixed set of symbols — no control
@@ -15915,6 +15947,8 @@ enum HttpParseErr {
     Incomplete,
     /// Definitively malformed response syntax or framing.
     Invalid,
+    /// A syntactically valid payload magnitude or observed byte exceeds an explicit receive cap.
+    Limit,
 }
 
 /// A normalized decimal magnitude kept as a byte span into the exact response head. Leading zeroes
@@ -16147,6 +16181,15 @@ impl HttpResponseAccumulator {
         }
     }
 
+    fn with_capacity_exact(capacity: usize) -> Self {
+        Self {
+            storage: Box::<[u8]>::new_uninit_slice(capacity),
+            len: 0,
+            #[cfg(test)]
+            growths: 0,
+        }
+    }
+
     fn len(&self) -> usize {
         self.len
     }
@@ -16240,6 +16283,8 @@ enum HttpTrailerState {
 
 struct HttpResponseDecoder {
     acc: HttpResponseAccumulator,
+    body: Option<HttpResponseAccumulator>,
+    explicit_body_limit: Option<usize>,
     state: HttpDecodeState,
     final_head: Option<HttpHead>,
     method_is_head: bool,
@@ -16264,8 +16309,16 @@ struct HttpResponseDecoder {
 
 impl HttpResponseDecoder {
     fn new(method_is_head: bool) -> Self {
+        Self::with_body_limit(method_is_head, None)
+    }
+
+    fn with_body_limit(method_is_head: bool, explicit_body_limit: Option<usize>) -> Self {
         Self {
-            acc: HttpResponseAccumulator::new(),
+            acc: explicit_body_limit.map_or_else(HttpResponseAccumulator::new, |_| {
+                HttpResponseAccumulator::with_capacity_exact(HTTP_MAX_HEADER_BLOCK)
+            }),
+            body: None,
+            explicit_body_limit,
             state: HttpDecodeState::Head,
             final_head: None,
             method_is_head,
@@ -16293,6 +16346,43 @@ impl HttpResponseDecoder {
         self.state == HttpDecodeState::Complete
     }
 
+    fn selected_body_limit(&self) -> usize {
+        self.explicit_body_limit.unwrap_or(HTTP_MAX_BODY)
+    }
+
+    fn body_len(&self) -> Result<usize, HttpParseErr> {
+        if let Some(body) = &self.body {
+            return Ok(body.len());
+        }
+        let start = self.final_head.as_ref().ok_or(HttpParseErr::Invalid)?.body_start;
+        self.acc.len().checked_sub(start).ok_or(HttpParseErr::Invalid)
+    }
+
+    fn prepare_body(&mut self) {
+        if self.explicit_body_limit.is_some() && self.body.is_none() {
+            self.body = Some(HttpResponseAccumulator::with_capacity_exact(self.selected_body_limit()));
+        }
+    }
+
+    fn append_body(&mut self, bytes: &[u8]) -> Result<(), HttpParseErr> {
+        if self
+            .body_len()?
+            .checked_add(bytes.len())
+            .is_none_or(|n| n > self.selected_body_limit())
+        {
+            return Err(if self.explicit_body_limit.is_some() {
+                HttpParseErr::Limit
+            } else {
+                HttpParseErr::Invalid
+            });
+        }
+        if let Some(body) = &mut self.body {
+            body.extend_from_slice(bytes)
+        } else {
+            self.acc.extend_from_slice(bytes)
+        }
+    }
+
     fn next_read_limit(&self) -> usize {
         let remaining = match self.state {
             HttpDecodeState::Head => HTTP_MAX_HEADER_BLOCK.saturating_sub(self.cumulative_head_bytes),
@@ -16318,12 +16408,8 @@ impl HttpResponseDecoder {
             }
             HttpDecodeState::Fixed { remaining } => remaining.saturating_add(1),
             HttpDecodeState::CloseDelimited => {
-                let body_start = self
-                    .final_head
-                    .as_ref()
-                    .map_or(self.acc.len(), |head| head.body_start);
-                HTTP_MAX_BODY
-                    .saturating_sub(self.acc.len().saturating_sub(body_start))
+                self.selected_body_limit()
+                    .saturating_sub(self.body_len().unwrap_or(self.selected_body_limit()))
                     .saturating_add(1)
             }
             HttpDecodeState::Complete => 0,
@@ -16333,10 +16419,15 @@ impl HttpResponseDecoder {
 
     fn decimal_body_len(&self, span: HttpDecimalSpan) -> Result<usize, HttpParseErr> {
         let mut n = 0usize;
+        let limit = self.selected_body_limit();
         for &digit in &self.acc.as_slice()[span.start..span.start + span.len] {
             let d = usize::from(digit - b'0');
-            if n > (HTTP_MAX_BODY - d) / 10 {
-                return Err(HttpParseErr::Invalid);
+            if limit.checked_sub(d).is_none_or(|remaining| n > remaining / 10) {
+                return Err(if self.explicit_body_limit.is_some() {
+                    HttpParseErr::Limit
+                } else {
+                    HttpParseErr::Invalid
+                });
             }
             n = n * 10 + d;
         }
@@ -16377,12 +16468,14 @@ impl HttpResponseDecoder {
         }
         if head.chunked {
             self.final_head = Some(head);
+            self.prepare_body();
             self.state = HttpDecodeState::ChunkSize;
             return Ok(());
         }
         if let Some(span) = head.content_length {
             let remaining = self.decimal_body_len(span)?;
             self.final_head = Some(head);
+            self.prepare_body();
             self.state = if remaining == 0 {
                 HttpDecodeState::Complete
             } else {
@@ -16391,6 +16484,7 @@ impl HttpResponseDecoder {
             return Ok(());
         }
         self.final_head = Some(head);
+        self.prepare_body();
         self.state = HttpDecodeState::CloseDelimited;
         Ok(())
     }
@@ -16404,6 +16498,15 @@ impl HttpResponseDecoder {
         let line = &self.chunk_line[..self.chunk_line_len - 2];
         let mut pos = 0;
         let digit_start = pos;
+        let body_len = self.body_len()?;
+        let remaining_limit = self
+            .selected_body_limit()
+            .checked_sub(body_len)
+            .ok_or(if self.explicit_body_limit.is_some() {
+                HttpParseErr::Limit
+            } else {
+                HttpParseErr::Invalid
+            })?;
         let mut size = 0usize;
         let mut magnitude_ok = true;
         while pos < line.len() && line[pos].is_ascii_hexdigit() {
@@ -16414,7 +16517,7 @@ impl HttpResponseDecoder {
                 _ => return Err(HttpParseErr::Invalid),
             };
             if magnitude_ok {
-                if size > (HTTP_MAX_BODY - d) / 16 {
+                if remaining_limit.checked_sub(d).is_none_or(|remaining| size > remaining / 16) {
                     magnitude_ok = false;
                 } else {
                     size = size * 16 + d;
@@ -16506,15 +16609,11 @@ impl HttpResponseDecoder {
             }
         }
         if !magnitude_ok {
-            return Err(HttpParseErr::Invalid);
-        }
-        let body_len = self
-            .acc
-            .len()
-            .checked_sub(self.final_head.as_ref().ok_or(HttpParseErr::Invalid)?.body_start)
-            .ok_or(HttpParseErr::Invalid)?;
-        if body_len.checked_add(size).is_none_or(|n| n > HTTP_MAX_BODY) {
-            return Err(HttpParseErr::Invalid);
+            return Err(if self.explicit_body_limit.is_some() {
+                HttpParseErr::Limit
+            } else {
+                HttpParseErr::Invalid
+            });
         }
         self.chunk_line_len = 0;
         self.state = if size == 0 {
@@ -16559,6 +16658,8 @@ impl HttpResponseDecoder {
         }
         let mut pos = 0usize;
         let mut size = 0usize;
+        let mut magnitude_ok = true;
+        let limit = self.selected_body_limit();
         while pos < line.len() && line[pos].is_ascii_hexdigit() {
             let d = match line[pos] {
                 b'0'..=b'9' => usize::from(line[pos] - b'0'),
@@ -16566,10 +16667,16 @@ impl HttpResponseDecoder {
                 b'A'..=b'F' => usize::from(line[pos] - b'A' + 10),
                 _ => return Err(HttpParseErr::Invalid),
             };
-            if size > (HTTP_MAX_BODY - d) / 16 {
-                return Err(HttpParseErr::Invalid);
+            if magnitude_ok {
+                if limit.checked_sub(d).is_none_or(|remaining| size > remaining / 16) {
+                    if self.explicit_body_limit.is_none() {
+                        return Err(HttpParseErr::Invalid);
+                    }
+                    magnitude_ok = false;
+                } else {
+                    size = size * 16 + d;
+                }
             }
-            size = size * 16 + d;
             pos += 1;
         }
         if pos == 0 {
@@ -16872,7 +16979,7 @@ impl HttpResponseDecoder {
                 }
                 HttpDecodeState::Fixed { remaining } => {
                     let take = remaining.min(input.len() - pos);
-                    self.acc.extend_from_slice(&input[pos..pos + take])?;
+                    self.append_body(&input[pos..pos + take])?;
                     pos += take;
                     let left = remaining - take;
                     self.state = if left == 0 {
@@ -16882,16 +16989,7 @@ impl HttpResponseDecoder {
                     };
                 }
                 HttpDecodeState::CloseDelimited => {
-                    let head = self.final_head.as_ref().ok_or(HttpParseErr::Invalid)?;
-                    let body_len = self
-                        .acc
-                        .len()
-                        .checked_sub(head.body_start)
-                        .ok_or(HttpParseErr::Invalid)?;
-                    if body_len.checked_add(input.len() - pos).is_none_or(|n| n > HTTP_MAX_BODY) {
-                        return Err(HttpParseErr::Invalid);
-                    }
-                    self.acc.extend_from_slice(&input[pos..])?;
+                    self.append_body(&input[pos..])?;
                     pos = input.len();
                 }
                 HttpDecodeState::ChunkSize => {
@@ -16915,7 +17013,7 @@ impl HttpResponseDecoder {
                 }
                 HttpDecodeState::ChunkData { remaining } => {
                     let take = remaining.min(input.len() - pos);
-                    self.acc.extend_from_slice(&input[pos..pos + take])?;
+                    self.append_body(&input[pos..pos + take])?;
                     pos += take;
                     let left = remaining - take;
                     self.state = if left == 0 {
@@ -16973,13 +17071,14 @@ impl HttpResponseDecoder {
         if !self.complete() {
             return Err(HttpParseErr::Incomplete);
         }
+        let body_len = self.body_len()?;
         let head = self.final_head.ok_or(HttpParseErr::Invalid)?;
-        let body_len = self.acc.len().checked_sub(head.body_start).ok_or(HttpParseErr::Invalid)?;
         if body_len > HTTP_MAX_BODY {
             return Err(HttpParseErr::Invalid);
         }
         Ok(HttpResponse {
             buf: self.acc.into_vec(),
+            body: self.body.map(HttpResponseAccumulator::into_vec),
             status: head.status,
             headers: head.headers,
             body_start: head.body_start,
@@ -17068,7 +17167,8 @@ pub unsafe extern "C" fn align_rt_http_resp_header(
     0
 }
 
-/// `resp.body()` — a `slice<u8>` **view** over the response body (zero copy; region-bound in sema).
+/// `resp.body()` — a `slice<u8>` **view** over response-owned body storage (zero copy;
+/// region-bound in sema).
 /// Returns `{null,0}` on a null handle or an empty body.
 ///
 /// # Safety
@@ -17083,7 +17183,11 @@ pub unsafe extern "C" fn align_rt_http_resp_body(resp: *const HttpResponse) -> A
     if r.body_len == 0 {
         return AlignStr { ptr: core::ptr::null(), len: 0 };
     }
-    let ptr = unsafe { r.buf.as_ptr().add(r.body_start) };
+    let ptr = if let Some(body) = &r.body {
+        body.as_ptr()
+    } else {
+        unsafe { r.buf.as_ptr().add(r.body_start) }
+    };
     AlignStr { ptr, len: r.body_len as i64 }
 }
 
@@ -17754,6 +17858,8 @@ pub struct HttpClient {
     /// client across worker threads that read this field concurrently; it is only written by the
     /// (single-threaded, bound-local) setter before requests run.
     timeout_ns: std::sync::atomic::AtomicI64,
+    /// The client-default response-body receive cap, or `0` for [`HTTP_MAX_BODY`].
+    max_response_body_bytes: std::sync::atomic::AtomicI64,
 }
 
 // SAFETY: `IdleConn` holds a raw `*mut c_void` (an OpenSSL `SSL*`), which makes it non-`Send`, so the
@@ -17920,6 +18026,7 @@ pub extern "C" fn align_rt_http_client_new() -> *mut HttpClient {
         idle: std::sync::Mutex::new(std::collections::HashMap::new()),
         request_buffers: std::sync::Mutex::new(Vec::new()),
         timeout_ns: std::sync::atomic::AtomicI64::new(0),
+        max_response_body_bytes: std::sync::atomic::AtomicI64::new(0),
     }))
 }
 
@@ -17940,6 +18047,25 @@ pub unsafe extern "C" fn align_rt_http_client_timeout(c: *mut HttpClient, ns: i6
         panic_abort("http.client.timeout: negative timeout");
     }
     unsafe { &*c }.timeout_ns.store(ns, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `cl.max_response_body_bytes(limit)` — set the client's receive cap. `0` restores the fixed
+/// global default; `1..=HTTP_MAX_BODY` bounds every later exchange. Invalid values abort before the
+/// stored value changes.
+///
+/// # Safety
+/// `c` must be null or a pointer from [`align_rt_http_client_new`], not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_client_max_response_body_bytes(c: *mut HttpClient, limit: i64) {
+    if c.is_null() {
+        panic_abort("http.client.max_response_body_bytes: null client handle");
+    }
+    if !(0..=HTTP_MAX_BODY as i64).contains(&limit) || usize::try_from(limit).is_err() {
+        panic_abort("http.client.max_response_body_bytes: limit must be 0..=HTTP_MAX_BODY");
+    }
+    unsafe { &*c }
+        .max_response_body_bytes
+        .store(limit, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Free a `client`, closing every pooled idle conn (http.md P5 — no fd leak across pool churn).
@@ -18107,6 +18233,13 @@ enum HttpExchange {
 
 const HTTP_CLIENT_READ_CHUNK: usize = 32 * 1024;
 
+fn http_parse_error_status(error: HttpParseErr) -> i32 {
+    match error {
+        HttpParseErr::Limit => AL_HTTP_BODY_LIMIT,
+        HttpParseErr::Incomplete | HttpParseErr::Invalid => AL_INVALID,
+    }
+}
+
 /// Send `request` (the serialized bytes, one write — http.md R4) over `conn` (plaintext or TLS —
 /// the [`Conn`] abstraction keeps this loop single-sourced), then stream the response into one
 /// bounded decoder, stopping at a bodyless, Content-Length, or terminal-chunk/trailer boundary (or
@@ -18126,6 +18259,7 @@ unsafe fn http_socket_exchange(
     request: &[u8],
     method_is_head: bool,
     has_deadline: bool,
+    body_limit: Option<usize>,
 ) -> HttpExchange {
     // One write of the whole request (start-line + headers + body already in one buffer). SIGPIPE is
     // suppressed by `MSG_NOSIGNAL`/`SO_NOSIGPIPE` on plaintext, and by the caller's `pthread_sigmask`
@@ -18136,7 +18270,7 @@ unsafe fn http_socket_exchange(
         // nothing was received.
         return HttpExchange::Failed { status: ws, received_any: false };
     }
-    let mut decoder = HttpResponseDecoder::new(method_is_head);
+    let mut decoder = HttpResponseDecoder::with_body_limit(method_is_head, body_limit);
     let mut chunk = [0u8; HTTP_CLIENT_READ_CHUNK];
     let mut received_any = false;
     loop {
@@ -18156,24 +18290,38 @@ unsafe fn http_socket_exchange(
                 if !received_any {
                     return HttpExchange::Failed { status: AL_INVALID, received_any: false };
                 }
-                if decoder.finish_eof().is_err() {
-                    return HttpExchange::Failed { status: AL_INVALID, received_any: true };
+                if let Err(error) = decoder.finish_eof() {
+                    return HttpExchange::Failed {
+                        status: http_parse_error_status(error),
+                        received_any: true,
+                    };
                 }
                 return match decoder.into_response() {
                     Ok(response) => HttpExchange::Complete { response, reusable: false },
-                    Err(_) => HttpExchange::Failed { status: AL_INVALID, received_any: true },
+                    Err(error) => HttpExchange::Failed {
+                        status: http_parse_error_status(error),
+                        received_any: true,
+                    },
                 };
             }
         };
         let (consumed, complete) = match decoder.feed(&chunk[..n]) {
             Ok(v) => v,
-            Err(_) => return HttpExchange::Failed { status: AL_INVALID, received_any: true },
+            Err(error) => {
+                return HttpExchange::Failed {
+                    status: http_parse_error_status(error),
+                    received_any: true,
+                };
+            }
         };
         if complete {
             let reusable = decoder.keep_alive && consumed == n && !conn.has_pending();
             return match decoder.into_response() {
                 Ok(response) => HttpExchange::Complete { response, reusable },
-                Err(_) => HttpExchange::Failed { status: AL_INVALID, received_any: true },
+                Err(error) => HttpExchange::Failed {
+                    status: http_parse_error_status(error),
+                    received_any: true,
+                },
             };
         }
     }
@@ -18236,6 +18384,7 @@ unsafe fn http_connect_fd(host: &str, port: i64, timeout_ns: i64) -> Result<i32,
 unsafe fn http_client_perform(
     client: *mut HttpClient,
     req: HttpRequestView<'_>,
+    client_body_limit_snapshot: Option<i64>,
     out: *mut *mut HttpResponse,
 ) -> i32 {
     // A successful CONNECT switches to a tunnel this whole-response surface cannot represent.
@@ -18267,6 +18416,18 @@ unsafe fn http_client_perform(
         .unwrap_or(0);
     let effective_timeout = if req.timeout_ns > 0 { req.timeout_ns } else { client_timeout };
     let has_deadline = effective_timeout > 0;
+    let client_body_limit = client_body_limit_snapshot.unwrap_or_else(|| {
+        client_ref
+            .map(|c| c.max_response_body_bytes.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0)
+    });
+    let selected_body_limit = [client_body_limit, req.max_response_body_bytes]
+        .into_iter()
+        .filter(|limit| *limit > 0)
+        .min()
+        .unwrap_or(HTTP_MAX_BODY as i64) as usize;
+    let explicit_body_limit = (client_body_limit > 0 || req.max_response_body_bytes > 0)
+        .then_some(selected_body_limit);
     // 4. Render the request into ONE buffer (validates method / headers / smuggling — http.md R4).
     // A real client lends bounded scratch storage; a null client keeps the no-pool behavior.
     let mut request_bytes = client_ref
@@ -18326,12 +18487,13 @@ unsafe fn http_client_perform(
                 request_bytes.as_slice(),
                 req.method == "HEAD",
                 has_deadline,
+                explicit_body_limit,
             )
         } {
             HttpExchange::Complete { response, reusable } => {
-                // The exchange has already parsed the head and moved both its spans and the socket
-                // receive buffer into `response`. Decide the conn's fate only after that successful
-                // parse: a protocol failure returns `Failed` above and is never pooled.
+                // The exchange has already parsed the head and moved its header/body allocations
+                // into `response`. Decide the conn's fate only after that successful parse: a
+                // protocol failure returns `Failed` above and is never pooled.
                 let (fd, ssl) = conn.into_parts();
                 if reusable && let Some(c) = client_ref {
                     c.put_idle(scheme, host, port, fd, ssl);
@@ -18365,7 +18527,14 @@ unsafe fn http_client_perform(
 }
 
 fn http_get_request(url: String) -> HttpRequest {
-    HttpRequest { method: "GET".to_string(), url, headers: Vec::new(), body: Vec::new(), timeout_ns: 0 }
+    HttpRequest {
+        method: "GET".to_string(),
+        url,
+        headers: Vec::new(),
+        body: Vec::new(),
+        timeout_ns: 0,
+        max_response_body_bytes: 0,
+    }
 }
 
 /// `cl.get(url)` — perform a `GET url` (plaintext or verified TLS for `https://`) over a pooled or
@@ -18390,8 +18559,15 @@ pub unsafe extern "C" fn align_rt_http_client_get(
     let Some(url) = (unsafe { abi_str_view(url_ptr, url_len) }) else {
         return AL_INVALID;
     };
-    let req = HttpRequestView { method: "GET", url, headers: &[], body: &[], timeout_ns: 0 };
-    unsafe { http_client_perform(client, req, out) }
+    let req = HttpRequestView {
+        method: "GET",
+        url,
+        headers: &[],
+        body: &[],
+        timeout_ns: 0,
+        max_response_body_bytes: 0,
+    };
+    unsafe { http_client_perform(client, req, None, out) }
 }
 
 /// `cl.get_many(urls, max_concurrency)` (http.md item 6 / R5) — perform a batch of `GET`s over
@@ -18475,6 +18651,9 @@ pub unsafe extern "C" fn align_rt_http_get_many(
         }
     }
     let shared = SharedClient(client);
+    let client_body_limit_snapshot = unsafe { client.as_ref() }
+        .map(|c| c.max_response_body_bytes.load(Ordering::Relaxed))
+        .unwrap_or(0);
 
     std::thread::scope(|scope| {
         for _ in 0..workers {
@@ -18485,7 +18664,14 @@ pub unsafe extern "C" fn align_rt_http_get_many(
                         break;
                     }
                     let mut resp: *mut HttpResponse = core::ptr::null_mut();
-                    let code = unsafe { http_client_perform(shared.ptr(), requests[i].as_view(), &mut resp) };
+                    let code = unsafe {
+                        http_client_perform(
+                            shared.ptr(),
+                            requests[i].as_view(),
+                            Some(client_body_limit_snapshot),
+                            &mut resp,
+                        )
+                    };
                     if code == 0 {
                         results[i].store(resp, Ordering::Relaxed);
                     } else {
@@ -18581,8 +18767,15 @@ pub unsafe extern "C" fn align_rt_http_client_post(
         return AL_INVALID;
     };
     let body = unsafe { bytes_view(body_ptr, body_len) };
-    let req = HttpRequestView { method: "POST", url, headers: &[], body, timeout_ns: 0 };
-    unsafe { http_client_perform(client, req, out) }
+    let req = HttpRequestView {
+        method: "POST",
+        url,
+        headers: &[],
+        body,
+        timeout_ns: 0,
+        max_response_body_bytes: 0,
+    };
+    unsafe { http_client_perform(client, req, None, out) }
 }
 
 /// `cl.request(req)` — perform the fully-built request `req` (its method / url / caller headers /
@@ -18610,7 +18803,7 @@ pub unsafe extern "C" fn align_rt_http_client_request(
     let Some(owned) = owned else {
         return AL_INVALID; // a null request handle
     };
-    unsafe { http_client_perform(client, owned.as_view(), out) }
+    unsafe { http_client_perform(client, owned.as_view(), None, out) }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -19270,7 +19463,7 @@ unsafe fn http_read_request(fd: i32) -> Result<HttpRequestCtx, i32> {
                         return Err(AL_INVALID); // header block never terminated within the cap
                     }
                 }
-                Err(HttpParseErr::Invalid) => return Err(AL_INVALID),
+                Err(HttpParseErr::Invalid | HttpParseErr::Limit) => return Err(AL_INVALID),
             }
         }
         // If the head is parsed, compute the framed end ONCE — both the completeness test below and
@@ -29792,9 +29985,9 @@ mod tests {
         let headers = vec![("Accept".to_string(), "application/json".to_string())];
         let body = b"{\"k\":1}";
         let cases = [
-            HttpRequestView { method: "GET", url: "http://localhost:8080", headers: &[], body: &[], timeout_ns: 0 },
-            HttpRequestView { method: "", url: "https://example.com/path?q=1", headers: &[], body: &[], timeout_ns: 0 },
-            HttpRequestView { method: "POST", url: "http://example.com/submit", headers: &headers, body, timeout_ns: 0 },
+            HttpRequestView { method: "GET", url: "http://localhost:8080", headers: &[], body: &[], timeout_ns: 0, max_response_body_bytes: 0 },
+            HttpRequestView { method: "", url: "https://example.com/path?q=1", headers: &[], body: &[], timeout_ns: 0, max_response_body_bytes: 0 },
+            HttpRequestView { method: "POST", url: "http://example.com/submit", headers: &headers, body, timeout_ns: 0, max_response_body_bytes: 0 },
         ];
         for req in cases {
             let out = http_serialize_core(req).expect("representative request serializes");
@@ -29821,6 +30014,7 @@ mod tests {
             headers: &[],
             body: &[],
             timeout_ns: 0,
+            max_response_body_bytes: 0,
         };
 
         let (first_ptr, first_capacity) = {
@@ -29855,6 +30049,7 @@ mod tests {
                 headers: &[],
                 body: &large_body,
                 timeout_ns: 0,
+                max_response_body_bytes: 0,
             };
             http_serialize_into(post, lease.bytes_mut()).expect("large request still serializes");
             assert!(lease.bytes.capacity() > HTTP_CLIENT_REQUEST_BUFFER_RETAIN_MAX);
@@ -30061,8 +30256,87 @@ mod tests {
         Ok((decoder.into_response()?, consumed, growths))
     }
 
+    fn http_decode_bounded_for_test(
+        raw: &[u8],
+        method_is_head: bool,
+        limit: usize,
+    ) -> Result<HttpResponse, HttpParseErr> {
+        let mut decoder = HttpResponseDecoder::with_body_limit(method_is_head, Some(limit));
+        decoder.feed(raw)?;
+        decoder.finish_eof()?;
+        decoder.into_response()
+    }
+
     fn http_response_body(response: &HttpResponse) -> &[u8] {
-        &response.buf[response.body_start..response.body_start + response.body_len]
+        response.body.as_deref().unwrap_or_else(|| {
+            &response.buf[response.body_start..response.body_start + response.body_len]
+        })
+    }
+
+    #[test]
+    fn http_bounded_response_decoder_framing_and_allocation_matrix() {
+        let exact = http_decode_bounded_for_test(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata",
+            false,
+            4,
+        )
+        .unwrap();
+        assert_eq!(http_response_body(&exact), b"data");
+        assert_eq!(exact.buf.capacity(), HTTP_MAX_HEADER_BLOCK);
+        assert_eq!(exact.body.as_ref().unwrap().capacity(), 4);
+        assert!(matches!(
+            http_decode_bounded_for_test(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
+                false,
+                4,
+            ),
+            Err(HttpParseErr::Limit)
+        ));
+
+        let chunked = http_decode_bounded_for_test(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n2\r\ncd\r\n0\r\n\r\n",
+            false,
+            4,
+        )
+        .unwrap();
+        assert_eq!(http_response_body(&chunked), b"abcd");
+        assert!(matches!(
+            http_decode_bounded_for_test(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n",
+                false,
+                4,
+            ),
+            Err(HttpParseErr::Limit)
+        ));
+        assert!(matches!(
+            http_decode_bounded_for_test(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;=bad\r\n",
+                false,
+                4,
+            ),
+            Err(HttpParseErr::Invalid)
+        ));
+
+        let close = http_decode_bounded_for_test(b"HTTP/1.0 200 OK\r\n\r\ndata", false, 4).unwrap();
+        assert_eq!(http_response_body(&close), b"data");
+        assert!(matches!(
+            http_decode_bounded_for_test(b"HTTP/1.0 200 OK\r\n\r\ndata!", false, 4),
+            Err(HttpParseErr::Limit)
+        ));
+
+        let huge = "9".repeat(4096);
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {huge}\r\n\r\nUNREAD");
+        let bodyless = http_decode_bounded_for_test(head.as_bytes(), true, 4).unwrap();
+        assert!(bodyless.body.is_none());
+        assert!(http_response_body(&bodyless).is_empty());
+        assert!(matches!(
+            http_decode_bounded_for_test(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 999999999999999999999999\r\n\r\n",
+                false,
+                4,
+            ),
+            Err(HttpParseErr::Limit)
+        ));
     }
 
     fn http_response_has_header(response: &HttpResponse, wanted: &[u8]) -> bool {
@@ -30653,6 +30927,146 @@ mod tests {
         unsafe { align_rt_http_resp_free(out) };
         assert!(server.join().unwrap().starts_with(b"head /lower HTTP/1.1\r\n"));
         unsafe { align_rt_http_client_free(client) };
+    }
+
+    #[test]
+    fn http_client_response_limit_exact_excess_and_request_narrowing() {
+        let client = align_rt_http_client_new();
+        unsafe { align_rt_http_client_max_response_body_bytes(client, 4) };
+        assert_eq!(
+            unsafe { &*client }
+                .max_response_body_bytes
+                .load(core::sync::atomic::Ordering::Relaxed),
+            4,
+        );
+        unsafe { align_rt_http_client_max_response_body_bytes(client, 0) };
+        assert_eq!(
+            unsafe { &*client }
+                .max_response_body_bytes
+                .load(core::sync::atomic::Ordering::Relaxed),
+            0,
+        );
+        unsafe { align_rt_http_client_max_response_body_bytes(client, 4) };
+
+        let (exact_port, exact_server) = http_serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata".to_vec(),
+        );
+        let exact_url = format!("http://127.0.0.1:{exact_port}/exact");
+        let mut exact: *mut HttpResponse = core::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                align_rt_http_client_get(
+                    client,
+                    exact_url.as_ptr(),
+                    exact_url.len() as i64,
+                    &mut exact,
+                )
+            },
+            0,
+        );
+        assert_eq!(unsafe { safe_slice(align_rt_http_resp_body(exact).ptr, 4) }, b"data");
+        assert_eq!(unsafe { &*exact }.body.as_ref().unwrap().capacity(), 4);
+        unsafe { align_rt_http_resp_free(exact) };
+        exact_server.join().unwrap();
+
+        let (excess_port, excess_server) = http_serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\ndata!".to_vec(),
+        );
+        let excess_url = format!("http://127.0.0.1:{excess_port}/excess");
+        let mut excess: *mut HttpResponse = core::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                align_rt_http_client_get(
+                    client,
+                    excess_url.as_ptr(),
+                    excess_url.len() as i64,
+                    &mut excess,
+                )
+            },
+            AL_HTTP_BODY_LIMIT,
+        );
+        assert!(excess.is_null());
+        excess_server.join().unwrap();
+
+        let (narrow_port, narrow_server) = http_serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata".to_vec(),
+        );
+        let narrow_url = format!("http://127.0.0.1:{narrow_port}/narrow");
+        let request = unsafe {
+            align_rt_http_request_new(
+                b"GET".as_ptr(),
+                3,
+                narrow_url.as_ptr(),
+                narrow_url.len() as i64,
+            )
+        };
+        unsafe { align_rt_http_max_response_body_bytes(request, 3) };
+        assert_eq!(unsafe { &*request }.max_response_body_bytes, 3);
+        let mut narrow: *mut HttpResponse = core::ptr::null_mut();
+        assert_eq!(
+            unsafe { align_rt_http_client_request(client, request, &mut narrow) },
+            AL_HTTP_BODY_LIMIT,
+        );
+        assert!(narrow.is_null());
+        narrow_server.join().unwrap();
+
+        unsafe { align_rt_http_client_free(client) };
+    }
+
+    #[test]
+    fn http_response_limit_invalid_setters_abort() {
+        const CHILD: &str = "ALIGN_HTTP_RESPONSE_LIMIT_ABORT_CHILD";
+        const NAME: &str = "tests::http_response_limit_invalid_setters_abort";
+        if let Some(mode) = std::env::var_os(CHILD) {
+            match mode.to_string_lossy().as_ref() {
+                "request-negative" => {
+                    let request = unsafe {
+                        align_rt_http_request_new(b"GET".as_ptr(), 3, b"http://a/".as_ptr(), 9)
+                    };
+                    unsafe { align_rt_http_max_response_body_bytes(request, -1) };
+                }
+                "request-large" => {
+                    let request = unsafe {
+                        align_rt_http_request_new(b"GET".as_ptr(), 3, b"http://a/".as_ptr(), 9)
+                    };
+                    unsafe {
+                        align_rt_http_max_response_body_bytes(request, HTTP_MAX_BODY as i64 + 1)
+                    };
+                }
+                "request-null" => unsafe {
+                    align_rt_http_max_response_body_bytes(core::ptr::null_mut(), 1)
+                },
+                "client-negative" => {
+                    let client = align_rt_http_client_new();
+                    unsafe { align_rt_http_client_max_response_body_bytes(client, -1) };
+                }
+                "client-null" => unsafe {
+                    align_rt_http_client_max_response_body_bytes(core::ptr::null_mut(), 1)
+                },
+                _ => std::process::exit(79),
+            }
+            std::process::exit(78);
+        }
+
+        for mode in [
+            "request-negative",
+            "request-large",
+            "request-null",
+            "client-negative",
+            "client-null",
+        ] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env(CHILD, mode)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(
+                !status.success() && status.code() != Some(78),
+                "{mode} must abort before the setter returns: {status}"
+            );
+        }
     }
 
     /// A framed body well past two client read chunks takes the direct-to-response middle path and
@@ -32359,6 +32773,29 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         unsafe { align_rt_http_client_free(client) };
     }
 
+    #[test]
+    fn http_get_many_uses_the_snapshotted_client_body_limit() {
+        let (port, server) = http_serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\ndata!"
+                .to_vec(),
+        );
+        let url = format!("http://127.0.0.1:{port}/bounded-batch");
+        let urls = [as_view(&url)];
+        let client = align_rt_http_client_new();
+        unsafe { align_rt_http_client_max_response_body_bytes(client, 4) };
+        let mut out = AlignStr {
+            ptr: core::ptr::null(),
+            len: 0,
+        };
+        assert_eq!(
+            unsafe { align_rt_http_get_many(client, urls.as_ptr(), 1, 1, &mut out) },
+            AL_HTTP_BODY_LIMIT,
+        );
+        assert!(out.ptr.is_null() && out.len == 0);
+        unsafe { align_rt_http_client_free(client) };
+        server.join().unwrap();
+    }
+
     /// All-or-Err: one URL to a closed port fails the WHOLE batch with a transport error, every
     /// successful response is freed (verified via [`LIVE_HTTP_RESPONSES`], not just `rc`/`out` — the
     /// F1 gate finding: deleting the `first_err` branch's free loop makes no assertion here fail,
@@ -33096,7 +33533,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
                         let name = |r: &Result<HttpRequestHead, HttpParseErr>| match r {
                             Ok(_) => "Ok",
                             Err(HttpParseErr::Incomplete) => "Incomplete",
-                            Err(HttpParseErr::Invalid) => "Invalid",
+                            Err(HttpParseErr::Invalid | HttpParseErr::Limit) => "Invalid",
                         };
                         panic!("{what}: one-shot {} vs incremental {}", name(a), name(b))
                     }

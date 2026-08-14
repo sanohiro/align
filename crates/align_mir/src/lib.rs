@@ -1368,10 +1368,14 @@ pub enum Rvalue {
     /// nanosecond count), in place. No value. `ns == 0` = inherit the client default; a negative `ns`
     /// aborts at runtime. Pure (a field store; the deadline is applied at perform time).
     HttpRequestTimeout { req: Operand, ns: Operand },
+    /// `r.max_response_body_bytes(limit)` — store a request-local response receive cap. Pure.
+    HttpRequestMaxResponseBodyBytes { req: Operand, limit: Operand },
     /// `cl.timeout(ns)` — set the client handle `client`'s default I/O timeout (`ns` an `i64`
     /// nanosecond count), in place. No value. `ns == 0` = no timeout; a negative `ns` aborts at
     /// runtime. Pure (a field store; applied per request at perform time).
     HttpClientTimeout { client: Operand, ns: Operand },
+    /// `cl.max_response_body_bytes(limit)` — store a client-default response receive cap. Pure.
+    HttpClientMaxResponseBodyBytes { client: Operand, limit: Operand },
     /// `process.command(cmd, args)` (`std.process` Slice 4) — allocate a `command` builder handle
     /// (opaque pointer), returned by value (the bound local `Drop`-frees it via `command_free`).
     /// `cmd`/`args` are `{ptr,len}` str views (the argv is marshalled to C strings by the runtime; a
@@ -5110,6 +5114,8 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
         | hir::ExprKind::HttpBody { .. }
         | hir::ExprKind::HttpRequestTimeout { .. }
         | hir::ExprKind::HttpClientTimeout { .. }
+        | hir::ExprKind::HttpRequestMaxResponseBodyBytes { .. }
+        | hir::ExprKind::HttpClientMaxResponseBodyBytes { .. }
         | hir::ExprKind::HttpParse { .. }
         | hir::ExprKind::HttpRespStatus { .. }
         | hir::ExprKind::HttpRespHeader { .. }
@@ -5266,6 +5272,8 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         | hir::ExprKind::HttpBody { .. }
         | hir::ExprKind::HttpRequestTimeout { .. }
         | hir::ExprKind::HttpClientTimeout { .. }
+        | hir::ExprKind::HttpRequestMaxResponseBodyBytes { .. }
+        | hir::ExprKind::HttpClientMaxResponseBodyBytes { .. }
         | hir::ExprKind::HttpParse { .. }
         | hir::ExprKind::HttpRespStatus { .. }
         | hir::ExprKind::HttpRespHeader { .. }
@@ -6283,6 +6291,8 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             | hir::ExprKind::HttpBody { .. }
             | hir::ExprKind::HttpRequestTimeout { .. }
             | hir::ExprKind::HttpClientTimeout { .. }
+            | hir::ExprKind::HttpRequestMaxResponseBodyBytes { .. }
+            | hir::ExprKind::HttpClientMaxResponseBodyBytes { .. }
             | hir::ExprKind::HttpParse { .. }
             | hir::ExprKind::HttpRespStatus { .. }
             | hir::ExprKind::HttpRespHeader { .. }
@@ -12940,6 +12950,37 @@ fn make_error_from_status(b: &mut Builder, status: ValueId, result_ty: Ty) -> Op
     Operand::Value(ev)
 }
 
+/// Decode a client-response status, reserving the runtime-private `-1` sentinel for the public
+/// `Error.Code(-1)` value before the ordinary positive errno/category table is selected.
+fn make_http_client_error_from_status(b: &mut Builder, status: ValueId, result_ty: Ty) -> Operand {
+    let error_id = match result_ty {
+        Ty::Result(_, align_sema::Scalar::Enum(eid)) => eid,
+        _ => 0,
+    };
+    let limit_code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(
+        limit_code,
+        Rvalue::Use(Operand::Const(Const::Int(-1, status_ty()))),
+    ));
+    let limit_error = make_error_code(b, limit_code, result_ty);
+    let common_error = make_error_from_status(b, status, result_ty);
+    let is_limit = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        is_limit,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(status),
+            Operand::Const(Const::Int(-1, status_ty())),
+        ),
+    ));
+    let selected = b.fresh_value(Ty::Enum(error_id));
+    b.push(Stmt::Let(
+        selected,
+        Rvalue::Select { cond: Operand::Value(is_limit), a: limit_error, b: common_error },
+    ));
+    Operand::Value(selected)
+}
+
 fn lower_fs_read_file(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(Ty::String);
     let p = lower_required!(b, lower_expr(b, path), Operand::Const(Const::Unit));
@@ -13890,12 +13931,12 @@ fn lower_command(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::CommandRun { command } => {
             let out = b.new_slot(Ty::RunOutput);
             let cm = lower_required!(b, lower_expr(b, command), Operand::Const(Const::Unit));
-            lower_http_response_result(b, Rvalue::CommandRun { command: cm, out }, out, Ty::RunOutput, e.ty)
+            lower_http_response_result(b, Rvalue::CommandRun { command: cm, out }, out, Ty::RunOutput, e.ty, false)
         }
         hir::ExprKind::CommandRunBytes { command } => {
             let out = b.new_slot(Ty::RunBytes);
             let cm = lower_required!(b, lower_expr(b, command), Operand::Const(Const::Unit));
-            lower_http_response_result(b, Rvalue::CommandRunBytes { command: cm, out }, out, Ty::RunBytes, e.ty)
+            lower_http_response_result(b, Rvalue::CommandRunBytes { command: cm, out }, out, Ty::RunBytes, e.ty, false)
         }
         // `out.code()` → the runtime returns the i64 exit code directly.
         hir::ExprKind::RunOutputCode { out } => {
@@ -13971,12 +14012,26 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
             b.push(Stmt::Let(v, Rvalue::HttpRequestTimeout { req: rq, ns: n }));
             Operand::Const(Const::Unit)
         }
+        hir::ExprKind::HttpRequestMaxResponseBodyBytes { req, limit } => {
+            let rq = lower_required!(b, lower_expr(b, req), Operand::Const(Const::Unit));
+            let n = lower_required!(b, lower_expr(b, limit), Operand::Const(Const::Unit));
+            let v = b.fresh_value(Ty::Unit);
+            b.push(Stmt::Let(v, Rvalue::HttpRequestMaxResponseBodyBytes { req: rq, limit: n }));
+            Operand::Const(Const::Unit)
+        }
         // `cl.timeout(ns)` → set the client handle's default I/O timeout in place; no value.
         hir::ExprKind::HttpClientTimeout { client, ns } => {
             let cl = lower_required!(b, lower_expr(b, client), Operand::Const(Const::Unit));
             let n = lower_required!(b, lower_expr(b, ns), Operand::Const(Const::Unit));
             let v = b.fresh_value(Ty::Unit);
             b.push(Stmt::Let(v, Rvalue::HttpClientTimeout { client: cl, ns: n }));
+            Operand::Const(Const::Unit)
+        }
+        hir::ExprKind::HttpClientMaxResponseBodyBytes { client, limit } => {
+            let cl = lower_required!(b, lower_expr(b, client), Operand::Const(Const::Unit));
+            let n = lower_required!(b, lower_expr(b, limit), Operand::Const(Const::Unit));
+            let v = b.fresh_value(Ty::Unit);
+            b.push(Stmt::Let(v, Rvalue::HttpClientMaxResponseBodyBytes { client: cl, limit: n }));
             Operand::Const(Const::Unit)
         }
         // `http.parse(data)` → `Result<response, Error>` (out-slot + i32 status; see below).
@@ -14011,7 +14066,7 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
             let out = b.new_slot(Ty::HttpResponse);
             let c = lower_required!(b, lower_expr(b, client), Operand::Const(Const::Unit));
             let u = lower_required!(b, lower_expr(b, url), Operand::Const(Const::Unit));
-            lower_http_response_result(b, Rvalue::HttpClientGet { client: c, url: u, out }, out, Ty::HttpResponse, e.ty)
+            lower_http_response_result(b, Rvalue::HttpClientGet { client: c, url: u, out }, out, Ty::HttpResponse, e.ty, true)
         }
         // `cl.post(url, body)` → `Result<response, Error>`. `url`/`body` are byte views.
         hir::ExprKind::HttpClientPost { client, url, body } => {
@@ -14019,7 +14074,7 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
             let c = lower_required!(b, lower_expr(b, client), Operand::Const(Const::Unit));
             let u = lower_required!(b, lower_expr(b, url), Operand::Const(Const::Unit));
             let bd = lower_required!(b, lower_expr(b, body), Operand::Const(Const::Unit));
-            lower_http_response_result(b, Rvalue::HttpClientPost { client: c, url: u, body: bd, out }, out, Ty::HttpResponse, e.ty)
+            lower_http_response_result(b, Rvalue::HttpClientPost { client: c, url: u, body: bd, out }, out, Ty::HttpResponse, e.ty, true)
         }
         // `cl.request(req)` → `Result<response, Error>`. `req` is a Move `http request` **consumed** by
         // the call (the runtime frees it): null its source slot so the exit `Drop` doesn't double-free.
@@ -14028,7 +14083,7 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
             let c = lower_required!(b, lower_expr(b, client), Operand::Const(Const::Unit));
             let rq = lower_required!(b, lower_expr(b, req), Operand::Const(Const::Unit));
             null_moved_source(b, req);
-            lower_http_response_result(b, Rvalue::HttpClientRequest { client: c, req: rq, out }, out, Ty::HttpResponse, e.ty)
+            lower_http_response_result(b, Rvalue::HttpClientRequest { client: c, req: rq, out }, out, Ty::HttpResponse, e.ty, true)
         }
         // `cl.get_many(urls, max_concurrency)` → `Result<array<response>, Error>`. The runtime writes an
         // owned `array<response>` into an out slot + returns an i32 status; branch Ok(array)/Err — the
@@ -14042,14 +14097,14 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
             let out = b.new_slot(Ty::HttpServer);
             let h = lower_required!(b, lower_expr(b, host), Operand::Const(Const::Unit));
             let p = lower_required!(b, lower_expr(b, port), Operand::Const(Const::Unit));
-            lower_http_response_result(b, Rvalue::HttpServe { host: h, port: p, out, shared: *shared }, out, Ty::HttpServer, e.ty)
+            lower_http_response_result(b, Rvalue::HttpServe { host: h, port: p, out, shared: *shared }, out, Ty::HttpServer, e.ty, false)
         }
         // `srv.accept()` → `Result<http_request_ctx, Error>` (`ok_ty = HttpRequestCtx`). `server` is
         // borrowed (a server accepts many).
         hir::ExprKind::HttpAccept { server } => {
             let out = b.new_slot(Ty::HttpRequestCtx);
             let s = lower_required!(b, lower_expr(b, server), Operand::Const(Const::Unit));
-            lower_http_response_result(b, Rvalue::HttpAccept { server: s, out }, out, Ty::HttpRequestCtx, e.ty)
+            lower_http_response_result(b, Rvalue::HttpAccept { server: s, out }, out, Ty::HttpRequestCtx, e.ty, false)
         }
         // `ctx.method()` / `ctx.path()` → a `str` view `{ptr,len}` into the ctx buffer (region-bound to
         // `ctx`; not owned — no `Drop`).
@@ -14129,7 +14184,7 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
             let cx = lower_required!(b, lower_expr(b, ctx), Operand::Const(Const::Unit));
             let r = lower_required!(b, lower_expr(b, rb), Operand::Const(Const::Unit));
             null_moved_source(b, rb);
-            lower_http_response_result(b, Rvalue::HttpRespondStream { ctx: cx, rb: r, out }, out, Ty::HttpStream, e.ty)
+            lower_http_response_result(b, Rvalue::HttpRespondStream { ctx: cx, rb: r, out }, out, Ty::HttpStream, e.ty, false)
         }
         // `s.send(chunk)` / `s.send_event(data)` → `Result<(), Error>`. `s` is **borrowed** (mutated
         // in place — not consumed); the payload is a byte view.
@@ -14168,7 +14223,7 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
 fn lower_http_parse(b: &mut Builder, data: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(Ty::HttpResponse);
     let d = lower_required!(b, lower_expr(b, data), Operand::Const(Const::Unit));
-    lower_http_response_result(b, Rvalue::HttpParse { data: d, out }, out, Ty::HttpResponse, result_ty)
+    lower_http_response_result(b, Rvalue::HttpParse { data: d, out }, out, Ty::HttpResponse, result_ty, false)
 }
 
 /// `cl.get_many(urls, max_concurrency)` → `Result<array<response>, Error>`. The runtime writes an owned
@@ -14219,7 +14274,7 @@ fn lower_http_get_many(
     // nothing to free here; map the lowest-index status.
     b.cur = err_bb;
     let errv = b.fresh_value(result_ty);
-    let ec = make_error_from_status(b, code, result_ty);
+    let ec = make_http_client_error_from_status(b, code, result_ty);
     b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
     b.push(Stmt::Store(rslot, Operand::Value(errv)));
     b.terminate(Term::Goto(join));
@@ -14271,7 +14326,7 @@ fn lower_regex_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::RegexCompile { pattern } => {
             let out = b.new_slot(Ty::Regex);
             let p = lower_required!(b, lower_expr(b, pattern), Operand::Const(Const::Unit));
-            lower_http_response_result(b, Rvalue::RegexCompile { pattern: p, out }, out, Ty::Regex, e.ty)
+            lower_http_response_result(b, Rvalue::RegexCompile { pattern: p, out }, out, Ty::Regex, e.ty, false)
         }
         hir::ExprKind::RegexIsMatch { regex, text } => {
             let re = lower_required!(b, lower_expr(b, regex), Operand::Const(Const::Unit));
@@ -14434,7 +14489,14 @@ fn lower_regex_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
 /// `Err(<mapped status>)`. Out-of-line (`#[inline(never)]`) so its block/slot locals stay off the
 /// recursive `lower_expr` frame (the `expr_depth` #296 lesson).
 #[inline(never)]
-fn lower_http_response_result(b: &mut Builder, code_rv: Rvalue, out: Slot, ok_ty: Ty, result_ty: Ty) -> Operand {
+fn lower_http_response_result(
+    b: &mut Builder,
+    code_rv: Rvalue,
+    out: Slot,
+    ok_ty: Ty,
+    result_ty: Ty,
+    client_response_status: bool,
+) -> Operand {
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, code_rv));
 
@@ -14458,7 +14520,11 @@ fn lower_http_response_result(b: &mut Builder, code_rv: Rvalue, out: Slot, ok_ty
     // Err: the out slot was zeroed (null handle) → nothing to free; map the status (`Error.Invalid`).
     b.cur = err_bb;
     let errv = b.fresh_value(result_ty);
-    let ec = make_error_from_status(b, code, result_ty);
+    let ec = if client_response_status {
+        make_http_client_error_from_status(b, code, result_ty)
+    } else {
+        make_error_from_status(b, code, result_ty)
+    };
     b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
     b.push(Stmt::Store(rslot, Operand::Value(errv)));
     b.terminate(Term::Goto(join));

@@ -1451,6 +1451,10 @@ pub enum ExprKind {
     /// precedent). `req` is a bound local; `ns` is a Copy `i64`. Pure — this stores a field on the
     /// handle (the deadline is applied at perform time, no I/O here). The build-dual of [`HttpBody`].
     HttpRequestTimeout { req: Box<Expr>, ns: Box<Expr> },
+    /// `r.max_response_body_bytes(limit)` — set the request's response-body receive cap. `0`
+    /// inherits the client; a positive value narrows it; invalid values abort before storage or I/O.
+    /// The bound request is borrowed and mutated in place. Pure.
+    HttpRequestMaxResponseBodyBytes { req: Box<Expr>, limit: Box<Expr> },
     /// `http.parse(data)` — parse a complete HTTP/1.1 response buffer `data` (a byte view) into an
     /// owned [`crate::Ty::HttpResponse`], yielding `Result<response, Error>` (the `ty`). A malformed
     /// status line / non-numeric status / header without `:` / chunked encoding / bad or oversized
@@ -1479,6 +1483,10 @@ pub enum ExprKind {
     /// bound local (borrowed, not consumed); `ns` is a Copy `i64`. Pure — stores a field, applied per
     /// request at perform time. A request's own `timeout > 0` overrides this default.
     HttpClientTimeout { client: Box<Expr>, ns: Box<Expr> },
+    /// `cl.max_response_body_bytes(limit)` — set the client's response-body receive cap. `0`
+    /// restores the fixed global default; a positive value bounds every client exchange. The bound
+    /// client is borrowed and mutated in place. Pure.
+    HttpClientMaxResponseBodyBytes { client: Box<Expr>, limit: Box<Expr> },
     /// `cl.get(url)` — perform a `GET url` over a fresh connection, yielding `Result<response, Error>`
     /// (the `ty`). `cl` is a bound [`crate::Ty::HttpClient`] local (borrowed, not consumed); `url` is a
     /// borrowed `str`. **Impure** (network I/O). A 4xx/5xx status is `Ok(response)` (http.md P2); a

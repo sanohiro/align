@@ -3946,12 +3946,14 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::HttpHeader { .. }
             | hir::ExprKind::HttpBody { .. }
             | hir::ExprKind::HttpRequestTimeout { .. }
+            | hir::ExprKind::HttpRequestMaxResponseBodyBytes { .. }
             | hir::ExprKind::HttpParse { .. }
             | hir::ExprKind::HttpRespStatus { .. }
             | hir::ExprKind::HttpRespHeader { .. }
             | hir::ExprKind::HttpRespBody { .. }
             | hir::ExprKind::HttpClient
             | hir::ExprKind::HttpClientTimeout { .. }
+            | hir::ExprKind::HttpClientMaxResponseBodyBytes { .. }
             | hir::ExprKind::HttpClientGet { .. }
             | hir::ExprKind::HttpClientPost { .. }
             | hir::ExprKind::HttpClientRequest { .. }
@@ -4249,12 +4251,14 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::HttpHeader { .. }
             | hir::ExprKind::HttpBody { .. }
             | hir::ExprKind::HttpRequestTimeout { .. }
+            | hir::ExprKind::HttpRequestMaxResponseBodyBytes { .. }
             | hir::ExprKind::HttpParse { .. }
             | hir::ExprKind::HttpRespStatus { .. }
             | hir::ExprKind::HttpRespHeader { .. }
             | hir::ExprKind::HttpRespBody { .. }
             | hir::ExprKind::HttpClient
             | hir::ExprKind::HttpClientTimeout { .. }
+            | hir::ExprKind::HttpClientMaxResponseBodyBytes { .. }
             | hir::ExprKind::HttpClientGet { .. }
             | hir::ExprKind::HttpClientPost { .. }
             | hir::ExprKind::HttpClientRequest { .. }
@@ -8111,6 +8115,10 @@ impl<'a> BodyValidator<'a> {
                 (local(req, Ty::HttpRequest) && req.ty == Ty::HttpRequest && ns.ty == i64)
                     .then(|| strict(Ty::Unit, &[req, ns]))?
             }
+            hir::ExprKind::HttpRequestMaxResponseBodyBytes { req, limit } => {
+                (local(req, Ty::HttpRequest) && req.ty == Ty::HttpRequest && limit.ty == i64)
+                    .then(|| strict(Ty::Unit, &[req, limit]))?
+            }
             hir::ExprKind::HttpParse { data } => {
                 (byte_view(data.ty)).then(|| result(Ty::HttpResponse, &[data]))?
             }
@@ -8130,6 +8138,10 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::HttpClientTimeout { client, ns } => {
                 (local(client, Ty::HttpClient) && client.ty == Ty::HttpClient && ns.ty == i64)
                     .then(|| strict(Ty::Unit, &[client, ns]))?
+            }
+            hir::ExprKind::HttpClientMaxResponseBodyBytes { client, limit } => {
+                (local(client, Ty::HttpClient) && client.ty == Ty::HttpClient && limit.ty == i64)
+                    .then(|| strict(Ty::Unit, &[client, limit]))?
             }
             hir::ExprKind::HttpClientGet { client, url } => {
                 (local(client, Ty::HttpClient) && client.ty == Ty::HttpClient && url.ty == Ty::Str)

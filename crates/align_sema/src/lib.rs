@@ -12179,6 +12179,14 @@ impl EffectScan<'_> {
                 walk!(client);
                 walk!(ns);
             }
+            ExprKind::HttpRequestMaxResponseBodyBytes { req, limit } => {
+                walk!(req);
+                walk!(limit);
+            }
+            ExprKind::HttpClientMaxResponseBodyBytes { client, limit } => {
+                walk!(client);
+                walk!(limit);
+            }
             ExprKind::HttpParse { data } => walk!(data),
             ExprKind::HttpRespStatus { resp } | ExprKind::HttpRespBody { resp } => walk!(resp),
             ExprKind::HttpRespHeader { resp, name } => {
@@ -15735,6 +15743,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpBody { .. }
             | ExprKind::HttpRequestTimeout { .. }
             | ExprKind::HttpClientTimeout { .. }
+            | ExprKind::HttpRequestMaxResponseBodyBytes { .. }
+            | ExprKind::HttpClientMaxResponseBodyBytes { .. }
             | ExprKind::HttpParse { .. }
             | ExprKind::HttpRespStatus { .. }
             | ExprKind::HttpClient
@@ -16126,6 +16136,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpBody { .. }
             | ExprKind::HttpRequestTimeout { .. }
             | ExprKind::HttpClientTimeout { .. }
+            | ExprKind::HttpRequestMaxResponseBodyBytes { .. }
+            | ExprKind::HttpClientMaxResponseBodyBytes { .. }
             | ExprKind::HttpParse { .. }
             | ExprKind::HttpRespStatus { .. }
             | ExprKind::HttpRespHeader { .. }
@@ -17813,6 +17825,14 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::HttpClientTimeout { client, ns } => {
                 self.walk(client, depth);
                 self.walk(ns, depth);
+            }
+            ExprKind::HttpRequestMaxResponseBodyBytes { req, limit } => {
+                self.walk(req, depth);
+                self.walk(limit, depth);
+            }
+            ExprKind::HttpClientMaxResponseBodyBytes { client, limit } => {
+                self.walk(client, depth);
+                self.walk(limit, depth);
             }
             ExprKind::HttpParse { data } => self.walk(data, depth),
             ExprKind::HttpRespStatus { resp } | ExprKind::HttpRespBody { resp } => self.walk(resp, depth),
@@ -20982,6 +21002,8 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::CliGetBool { .. } | ExprKind::CliGetI64 { .. } | ExprKind::CliUsage { .. }
             | ExprKind::HttpRequest { .. } | ExprKind::HttpHeader { .. } | ExprKind::HttpBody { .. }
             | ExprKind::HttpRequestTimeout { .. } | ExprKind::HttpClientTimeout { .. }
+            | ExprKind::HttpRequestMaxResponseBodyBytes { .. }
+            | ExprKind::HttpClientMaxResponseBodyBytes { .. }
             | ExprKind::HttpParse { .. } | ExprKind::HttpRespStatus { .. } | ExprKind::HttpClient
             | ExprKind::HttpClientGet { .. } | ExprKind::HttpClientPost { .. } | ExprKind::HttpClientRequest { .. }
             | ExprKind::HttpGetMany { .. } | ExprKind::HttpServe { .. } | ExprKind::HttpAccept { .. }
@@ -25608,6 +25630,14 @@ impl<'a> MoveCheck<'a> {
             ExprKind::HttpClientTimeout { client, ns } => {
                 move_expr!(self, client, moved, false, false);
                 move_expr!(self, ns, moved, false, false);
+            }
+            ExprKind::HttpRequestMaxResponseBodyBytes { req, limit } => {
+                move_expr!(self, req, moved, false, false);
+                move_expr!(self, limit, moved, false, false);
+            }
+            ExprKind::HttpClientMaxResponseBodyBytes { client, limit } => {
+                move_expr!(self, client, moved, false, false);
+                move_expr!(self, limit, moved, false, false);
             }
             ExprKind::HttpParse { data } => move_expr!(self, data, moved, false, false),
             ExprKind::HttpRespStatus { resp } | ExprKind::HttpRespBody { resp } => move_expr!(self, resp, moved, false, false),
@@ -31712,7 +31742,7 @@ impl<'a, 't> Checker<'a, 't> {
             // `std.http` request methods on an `http request`: `r.header(name, value)` /
             // `r.body(data)` mutate the builder in place; `r.timeout(ns)` sets a per-request I/O
             // deadline. Type-guarded, same as the cli methods above.
-            "header" | "body" | "timeout" if recv_ty == Ty::HttpRequest => {
+            "header" | "body" | "timeout" | "max_response_body_bytes" if recv_ty == Ty::HttpRequest => {
                 self.check_http_request_method(recv_expr, method, args, span)
             }
             // `std.http` response getters on an `http response`: `resp.status()` / `resp.header(name)`
@@ -31723,7 +31753,9 @@ impl<'a, 't> Checker<'a, 't> {
             // `std.http` (Slice 2) client requests on an `http client`: `cl.get(url)` /
             // `cl.post(url, body)` / `cl.request(req)` each yield `Result<response, Error>`. Impure
             // (network). Type-guarded, same as the response getters above.
-            "get" | "post" | "request" | "get_many" | "timeout" if recv_ty == Ty::HttpClient => {
+            "get" | "post" | "request" | "get_many" | "timeout" | "max_response_body_bytes"
+                if recv_ty == Ty::HttpClient =>
+            {
                 self.check_http_client_method(recv_expr, method, args, span)
             }
             // (`srv.accept()` on an `http_server` is dispatched by the early `method == "accept"`
@@ -40819,6 +40851,35 @@ impl<'a, 't> Checker<'a, 't> {
         Some(ns)
     }
 
+    /// Type-check the single exact `i64` argument of the HTTP response-body limit setters. Value
+    /// range validation is runtime-owned so dynamic invalid values abort before storage or I/O.
+    fn check_http_response_limit_arg(&mut self, args: &[ast::Expr], span: Span) -> Option<Expr> {
+        if args.len() != 1 {
+            self.diags.error(
+                format!("'.max_response_body_bytes()' takes 1 argument (the byte limit, i64), got {}", args.len()),
+                span,
+            );
+            return None;
+        }
+        let limit = self.check_expr(&args[0], None);
+        if limit.ty == Ty::Error {
+            return None;
+        }
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        match self.resolve(limit.ty) {
+            Ty::Int(IntTy { bits: 64, signed: true }) => {}
+            Ty::IntVar(_) => self.constrain(limit.ty, Some(i64_ty), args[0].span),
+            other => {
+                self.diags.error(
+                    format!("'.max_response_body_bytes()' expects a byte limit (i64), got {}", ty_name(other)),
+                    args[0].span,
+                );
+                return None;
+            }
+        }
+        Some(limit)
+    }
+
     /// `r.header(name, value)` / `r.body(data)` / `r.timeout(ns)` on an `http request`
     /// ([`Ty::HttpRequest`]), the receiver already evaluated. The receiver must be a **bound local**
     /// (the v1 Move-temporary gate, `check_cli_command_method` precedent); all mutate the builder in
@@ -40863,8 +40924,19 @@ impl<'a, 't> Checker<'a, 't> {
                 let Some(ns) = self.check_http_timeout_arg(args, span) else { return err };
                 Expr { kind: ExprKind::HttpRequestTimeout { req: Box::new(recv_expr), ns: Box::new(ns) }, ty: Ty::Unit, span }
             }
+            "max_response_body_bytes" => {
+                let Some(limit) = self.check_http_response_limit_arg(args, span) else { return err };
+                Expr {
+                    kind: ExprKind::HttpRequestMaxResponseBodyBytes {
+                        req: Box::new(recv_expr),
+                        limit: Box::new(limit),
+                    },
+                    ty: Ty::Unit,
+                    span,
+                }
+            }
             _ => {
-                self.diags.error(format!("'.{method}()' is not a method on an http request (try header / body / timeout)"), span);
+                self.diags.error(format!("'.{method}()' is not a method on an http request (try header / body / timeout / max_response_body_bytes)"), span);
                 err
             }
         }
@@ -41067,8 +41139,19 @@ impl<'a, 't> Checker<'a, 't> {
                 let Some(ns) = self.check_http_timeout_arg(args, span) else { return err };
                 Expr { kind: ExprKind::HttpClientTimeout { client: Box::new(recv_expr), ns: Box::new(ns) }, ty: Ty::Unit, span }
             }
+            "max_response_body_bytes" => {
+                let Some(limit) = self.check_http_response_limit_arg(args, span) else { return err };
+                Expr {
+                    kind: ExprKind::HttpClientMaxResponseBodyBytes {
+                        client: Box::new(recv_expr),
+                        limit: Box::new(limit),
+                    },
+                    ty: Ty::Unit,
+                    span,
+                }
+            }
             _ => {
-                self.diags.error(format!("'.{method}()' is not a method on an http client (try get / post / request / get_many / timeout)"), span);
+                self.diags.error(format!("'.{method}()' is not a method on an http client (try get / post / request / get_many / timeout / max_response_body_bytes)"), span);
                 err
             }
         }
@@ -43624,6 +43707,14 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::HttpClientTimeout { client, ns } => {
                 self.finalize_expr(client);
                 self.finalize_expr(ns);
+            }
+            ExprKind::HttpRequestMaxResponseBodyBytes { req, limit } => {
+                self.finalize_expr(req);
+                self.finalize_expr(limit);
+            }
+            ExprKind::HttpClientMaxResponseBodyBytes { client, limit } => {
+                self.finalize_expr(client);
+                self.finalize_expr(limit);
             }
             ExprKind::HttpParse { data } => self.finalize_expr(data),
             ExprKind::HttpRespStatus { resp } | ExprKind::HttpRespBody { resp } => self.finalize_expr(resp),

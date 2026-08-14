@@ -861,6 +861,12 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::HttpBody { req, data } => format!("http_body({}, {})", operand_str(req), operand_str(data)),
         Rvalue::HttpRequestTimeout { req, ns } => format!("http_request_timeout({}, {})", operand_str(req), operand_str(ns)),
         Rvalue::HttpClientTimeout { client, ns } => format!("http_client_timeout({}, {})", operand_str(client), operand_str(ns)),
+        Rvalue::HttpRequestMaxResponseBodyBytes { req, limit } => {
+            format!("http_request_max_response_body_bytes({}, {})", operand_str(req), operand_str(limit))
+        }
+        Rvalue::HttpClientMaxResponseBodyBytes { client, limit } => {
+            format!("http_client_max_response_body_bytes({}, {})", operand_str(client), operand_str(limit))
+        }
         Rvalue::HttpParse { data, out } => format!("http_parse({}, -> _{out})", operand_str(data)),
         Rvalue::HttpRespStatus { resp } => format!("http_resp_status({})", operand_str(resp)),
         Rvalue::HttpRespHeader { resp, name, out } => format!("http_resp_header({}, {}, -> _{out})", operand_str(resp), operand_str(name)),
