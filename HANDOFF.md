@@ -58,8 +58,11 @@ align-llm Request 6 adoption is closed by align-llm PR #84. Request 8's Align-ow
 accepted after #799 and align-llm records it as ACCEPTED after PR #87. The active implementation
 checkpoint has passed the focused record builder driver owners, checked-HIR New/Push/Build rows,
 LLVM stack/boxed cleanup owner, concrete-generic owner, imported-interface parity owner, and
-nominal edit/revert cache owner. Exact publication preflight and comprehensive implementation
-review remain before merge; align-llm must not consume the surface until the merged commit is named.
+nominal edit/revert cache owner. The comprehensive review of `af66f870` found one valid P2: borrowed
+Move-record builders were not classified as heap-only when relayed to a shared-borrow helper. The
+candidate now classifies Move HeapRecords as heap-only and Copy HeapRecords as heap-or-region, with
+both outcomes pinned by the region-builder owner. Exact publication preflight remains before merge;
+align-llm must not consume the surface until the merged commit is named.
 
 Latest durable Request 8 verification on `agent/heap-record-array-builder`:
 
@@ -70,6 +73,7 @@ scripts/cargo.sh test -p align_sema heap_array_builder_record_classifier_is_clos
 scripts/cargo.sh test -p align_mir heap_record_array_builder_rows_match_the_producer -- --nocapture  PASS
 scripts/cargo.sh test -p align_codegen_llvm move_record_array_builder_uses_typed_stack_and_boxed_cleanup -- --nocapture  PASS
 scripts/cargo.sh test -p align_driver --test m12_array_builder -- --nocapture  PASS (31/31)
+scripts/cargo.sh test -p align_driver --test fb_region region_builder_crosses_calls_only_as_borrow_mut -- --exact --nocapture  PASS
 scripts/cargo.sh test -p align_driver --test m12_array_builder record_builder_move_source_matrix -- --exact --nocapture  PASS
 scripts/cargo.sh test -p align_driver --test m12_array_builder record_builder_abandonment_all_exit_kinds -- --exact --nocapture  PASS
 scripts/cargo.sh test -p align_driver --test m12_array_builder record_builder_partial_element_failure_drops_fields -- --exact --nocapture  PASS
@@ -78,9 +82,9 @@ scripts/cargo.sh test -p align_driver --test per_unit record_builder_imported_in
 scripts/cargo.sh test -p align_driver --test cache_codegen record_builder_nominal_identity_and_definition_edit_revert -- --exact --nocapture  PASS
 ```
 
-Next actions are one comprehensive implementation review, consolidated finding repair when needed,
-exact publication preflight, and merge. Then update align-llm's pin and run the Request 8 client
-acceptance capability against the merged compiler.
+Next actions are the consolidated review-finding repair commit, exact publication preflight, and
+merge. Then update align-llm's pin and run the Request 8 client acceptance capability against the
+merged compiler.
 
 Out-of-gate suites (everything outside `scripts/test-pr.sh`) are guarded by the
 nightly full-suite workflow, which builds once, runs every compiled test binary

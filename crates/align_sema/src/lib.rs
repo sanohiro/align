@@ -13062,12 +13062,31 @@ impl<'a> EscapeCheck<'a> {
             {
                 // A by-value Move parameter has crossed the call boundary and is free-standing.
                 // A borrowed builder keeps the constructor modes admitted by its element type:
-                // `string` is heap-only, primitive scalars may use either constructor, and the
-                // remaining source element forms are region-only. This keeps a nested helper from
-                // treating a possibly region-backed incoming builder as definitely individual.
+                // `string` and Move HeapRecords are heap-only; primitive scalars and Copy
+                // HeapRecords may use either constructor; the remaining source element forms are
+                // region-only. This keeps a nested helper from treating a possibly region-backed
+                // incoming builder as definitely individual.
                 let (individual, may_individual) = match (borrowed_builder, local.ty) {
                     (true, Ty::ArrayBuilder(Scalar::String)) => {
                         (true, true)
+                    }
+                    (true, Ty::ArrayBuilder(Scalar::Struct(id)))
+                        if heap_array_builder_record(
+                            id,
+                            self.structs,
+                            self.enums,
+                            self.tagged_types,
+                        ) =>
+                    {
+                        (
+                            struct_is_move(
+                                id,
+                                self.structs,
+                                self.enums,
+                                self.tagged_types,
+                            ),
+                            true,
+                        )
                     }
                     (
                         true,

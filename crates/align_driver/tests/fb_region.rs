@@ -362,6 +362,23 @@ fn region_builder_crosses_calls_only_as_borrow_mut() {
         heap_only,
         "a heap-only incoming builder should remain borrowable",
     );
+
+    let move_record = "Owned { text: string }\nfn inspect(borrow values: array_builder<Owned>) {}\nfn relay(borrow mut values: array_builder<Owned>) { inspect(values) }\nfn main() -> i32 = 0\n";
+    assert_no_errors(
+        "fb-incoming-move-record-builder-shared-call",
+        move_record,
+        "a Move HeapRecord builder is heap-only and should remain borrowable",
+    );
+
+    let copy_record = "Point { value: i64 }\nfn inspect(borrow values: array_builder<Point>) {}\nfn relay(borrow mut values: array_builder<Point>) { inspect(values) }\nfn main() -> i32 = 0\n";
+    let diags = check_diagnostics(
+        "fb-incoming-copy-record-builder-shared-call",
+        copy_record,
+    );
+    assert!(
+        diags.contains("may be passed only as `borrow mut`"),
+        "a possibly region-backed Copy HeapRecord builder must fail closed, got:\n{diags}"
+    );
 }
 
 #[test]
