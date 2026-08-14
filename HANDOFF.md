@@ -20,9 +20,15 @@ isolated target `/tmp/align-request5-target`. The complete `align_sema` (223),
 as does their applicable lib/bin clippy owner. The runtime aggregate has nine
 macOS-host failures (one non-UTF-8 filesystem fixture, two HTTP pool fixtures,
 and six TLS fixtures); the unchanged `7a06b2fd` runtime binary has those same
-nine failures plus its now-repaired stale export inventory. Next: commit the
-coherent candidate, perform one comprehensive review and consolidated repair,
-then run the exact-head pre-publication gate and publish/merge the PR.
+nine failures plus its now-repaired stale export inventory. Candidate
+`c7030580` received one comprehensive host review with one valid P2: an 8 KiB
+retained chunk-line buffer exceeded the promised 557,056-byte ceiling. The
+consolidated repair replaces it with scalar incremental grammar state, pins the
+decoder below 1 KiB, and preserves the existing extension grammar across every
+split boundary. Affected runtime, driver, aggregate-failure-set, and clippy
+owners pass. Next: commit the repair, perform the required final comprehensive
+review because the parser approach changed, then run the exact-head
+pre-publication gate and publish/merge the PR.
 
 The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit

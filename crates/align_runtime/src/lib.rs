@@ -16283,6 +16283,22 @@ enum HttpDecodeState {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+enum HttpChunkLineState {
+    Size,
+    AfterSizeOws,
+    ExtensionStart,
+    ExtensionName,
+    AfterExtensionNameOws,
+    BeforeValue,
+    TokenValue,
+    AfterValueOws,
+    QuotedValue,
+    QuotedEscape,
+    AfterQuotedValueOws,
+    Cr,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum HttpTrailerState {
     Start,
     Name,
@@ -16306,8 +16322,11 @@ struct HttpResponseDecoder {
     head_http_1_1: bool,
     head_content_length: Option<HttpDecimalSpan>,
     head_transfer_codings: usize,
-    chunk_line: [u8; HTTP_MAX_CHUNK_LINE],
+    chunk_line_state: HttpChunkLineState,
     chunk_line_len: usize,
+    chunk_line_has_digit: bool,
+    chunk_size: usize,
+    chunk_magnitude_ok: bool,
     chunk_framing_bytes: usize,
     trailer_state: HttpTrailerState,
     trailer_bytes: usize,
@@ -16340,8 +16359,11 @@ impl HttpResponseDecoder {
             head_http_1_1: false,
             head_content_length: None,
             head_transfer_codings: 0,
-            chunk_line: [0; HTTP_MAX_CHUNK_LINE],
+            chunk_line_state: HttpChunkLineState::Size,
             chunk_line_len: 0,
+            chunk_line_has_digit: false,
+            chunk_size: 0,
+            chunk_magnitude_ok: true,
             chunk_framing_bytes: 0,
             trailer_state: HttpTrailerState::Start,
             trailer_bytes: 0,
@@ -16500,123 +16522,23 @@ impl HttpResponseDecoder {
         Ok(())
     }
 
-    fn parse_chunk_line(&mut self) -> Result<(), HttpParseErr> {
-        // The shortest valid line is one hex digit plus CRLF. An empty CRLF line is malformed
-        // peer input, not an internal invariant, so reject it before slicing instead of asserting.
-        if self.chunk_line_len < 3 {
-            return Err(HttpParseErr::Invalid);
-        }
-        let line = &self.chunk_line[..self.chunk_line_len - 2];
-        let mut pos = 0;
-        let digit_start = pos;
-        let mut size = 0usize;
-        let mut magnitude_ok = true;
-        while pos < line.len() && line[pos].is_ascii_hexdigit() {
-            let d = match line[pos] {
-                b'0'..=b'9' => usize::from(line[pos] - b'0'),
-                b'a'..=b'f' => usize::from(line[pos] - b'a' + 10),
-                b'A'..=b'F' => usize::from(line[pos] - b'A' + 10),
-                _ => return Err(HttpParseErr::Invalid),
-            };
-            if magnitude_ok {
-                if size > (HTTP_MAX_BODY - d) / 16 {
-                    magnitude_ok = false;
-                } else {
-                    size = size * 16 + d;
-                }
-            }
-            pos += 1;
-        }
-        if pos == digit_start {
-            return Err(HttpParseErr::Invalid);
-        }
-        while pos < line.len() {
-            while pos < line.len() && matches!(line[pos], b' ' | b'\t') {
-                pos += 1;
-            }
-            if pos == line.len() {
-                return Err(HttpParseErr::Invalid);
-            }
-            if line[pos] != b';' {
-                return Err(HttpParseErr::Invalid);
-            }
-            pos += 1;
-            while pos < line.len() && matches!(line[pos], b' ' | b'\t') {
-                pos += 1;
-            }
-            let name_start = pos;
-            while pos < line.len() && http_is_token(&line[pos..pos + 1]) {
-                pos += 1;
-            }
-            if pos == name_start {
-                return Err(HttpParseErr::Invalid);
-            }
-            while pos < line.len() && matches!(line[pos], b' ' | b'\t') {
-                pos += 1;
-            }
-            if pos < line.len() && line[pos] == b'=' {
-                pos += 1;
-                while pos < line.len() && matches!(line[pos], b' ' | b'\t') {
-                    pos += 1;
-                }
-                if pos == line.len() {
-                    return Err(HttpParseErr::Invalid);
-                }
-                if line[pos] == b'"' {
-                    pos += 1;
-                    let mut closed = false;
-                    while pos < line.len() {
-                        match line[pos] {
-                            b'"' => {
-                                pos += 1;
-                                closed = true;
-                                break;
-                            }
-                            b'\\' => {
-                                pos += 1;
-                                if pos == line.len()
-                                    || !(line[pos] == b'\t'
-                                        || line[pos] == b' '
-                                        || (0x21..=0x7e).contains(&line[pos])
-                                        || line[pos] >= 0x80)
-                                {
-                                    return Err(HttpParseErr::Invalid);
-                                }
-                                pos += 1;
-                            }
-                            b if b == b'\t'
-                                || b == b' '
-                                || b == b'!'
-                                || (0x23..=0x5b).contains(&b)
-                                || (0x5d..=0x7e).contains(&b)
-                                || b >= 0x80 => pos += 1,
-                            _ => return Err(HttpParseErr::Invalid),
-                        }
-                    }
-                    if !closed {
-                        return Err(HttpParseErr::Invalid);
-                    }
-                } else {
-                    let value_start = pos;
-                    while pos < line.len() && http_is_token(&line[pos..pos + 1]) {
-                        pos += 1;
-                    }
-                    if pos == value_start {
-                        return Err(HttpParseErr::Invalid);
-                    }
-                }
-                while pos < line.len() && matches!(line[pos], b' ' | b'\t') {
-                    pos += 1;
-                }
-            }
-        }
-        if !magnitude_ok {
+    fn reset_chunk_line(&mut self) {
+        self.chunk_line_state = HttpChunkLineState::Size;
+        self.chunk_line_len = 0;
+        self.chunk_line_has_digit = false;
+        self.chunk_size = 0;
+        self.chunk_magnitude_ok = true;
+    }
+
+    fn finish_chunk_line(&mut self) -> Result<(), HttpParseErr> {
+        if !self.chunk_magnitude_ok {
             return Err(if self.explicit_body_limit.is_some() {
                 HttpParseErr::BodyLimit
             } else {
                 HttpParseErr::Invalid
             });
         }
+        let size = self.chunk_size;
         let body_len = self.body_len()?;
         let cap = self.explicit_body_limit.unwrap_or(HTTP_MAX_BODY);
         if body_len.checked_add(size).is_none_or(|n| n > cap) {
@@ -16626,7 +16548,7 @@ impl HttpResponseDecoder {
                 HttpParseErr::Invalid
             });
         }
-        self.chunk_line_len = 0;
+        self.reset_chunk_line();
         self.state = if size == 0 {
             self.trailer_state = HttpTrailerState::Start;
             HttpDecodeState::Trailers
@@ -16636,7 +16558,22 @@ impl HttpResponseDecoder {
         Ok(())
     }
 
-    fn append_chunk_framing(&mut self, bytes: &[u8]) -> Result<(), HttpParseErr> {
+    fn chunk_line_can_end(&self) -> bool {
+        match self.chunk_line_state {
+            HttpChunkLineState::Size => self.chunk_line_has_digit,
+            HttpChunkLineState::ExtensionName
+            | HttpChunkLineState::AfterExtensionNameOws
+            | HttpChunkLineState::TokenValue
+            | HttpChunkLineState::AfterValueOws
+            | HttpChunkLineState::AfterQuotedValueOws => true,
+            _ => false,
+        }
+    }
+
+    /// Validate a chunk-size line incrementally without retaining its raw bytes. This keeps the
+    /// sole 32 KiB socket scratch as the only framing staging allowance while preserving the exact
+    /// extension grammar and deferring magnitude/cap precedence until a valid CRLF-terminated line.
+    fn feed_chunk_line(&mut self, bytes: &[u8]) -> Result<(), HttpParseErr> {
         self.chunk_framing_bytes = self
             .chunk_framing_bytes
             .checked_add(bytes.len())
@@ -16646,145 +16583,140 @@ impl HttpResponseDecoder {
         {
             return Err(HttpParseErr::Invalid);
         }
-        let end = self.chunk_line_len + bytes.len();
-        self.chunk_line[self.chunk_line_len..end].copy_from_slice(bytes);
-        self.chunk_line_len = end;
-        Ok(())
-    }
 
-    /// Reject a chunk-size line as soon as its current prefix cannot become valid. The complete
-    /// parser remains authoritative for extension grammar; this prefix gate prevents a peer from
-    /// making the transport block after an impossible first token or a bare CR is already present.
-    fn validate_chunk_line_prefix(&self) -> Result<(), HttpParseErr> {
-        let mut line = &self.chunk_line[..self.chunk_line_len];
-        if line.is_empty() {
-            return Ok(());
-        }
-        let complete = line.last() == Some(&b'\r');
-        if complete {
-            line = &line[..line.len() - 1];
-        }
-        if memchr::memchr(b'\r', line).is_some() || memchr::memchr(b'\n', line).is_some() {
-            return Err(HttpParseErr::Invalid);
-        }
-        let mut pos = 0usize;
-        let mut size = 0usize;
-        let enforce_magnitude = self.explicit_body_limit.is_none();
-        while pos < line.len() && line[pos].is_ascii_hexdigit() {
-            let d = match line[pos] {
-                b'0'..=b'9' => usize::from(line[pos] - b'0'),
-                b'a'..=b'f' => usize::from(line[pos] - b'a' + 10),
-                b'A'..=b'F' => usize::from(line[pos] - b'A' + 10),
-                _ => return Err(HttpParseErr::Invalid),
-            };
-            if enforce_magnitude && size > (HTTP_MAX_BODY - d) / 16 {
+        for &byte in bytes {
+            self.chunk_line_len += 1;
+            if self.chunk_line_state == HttpChunkLineState::Cr {
+                if byte != b'\n' {
+                    return Err(HttpParseErr::Invalid);
+                }
+                self.finish_chunk_line()?;
+                continue;
+            }
+            if byte == b'\n' {
                 return Err(HttpParseErr::Invalid);
             }
-            if enforce_magnitude {
-                size = size * 16 + d;
-            }
-            pos += 1;
-        }
-        if pos == 0 {
-            return Err(HttpParseErr::Invalid);
-        }
-        if pos == line.len() {
-            return Ok(());
-        }
-        loop {
-            while pos < line.len() && matches!(line[pos], b' ' | b'\t') {
-                pos += 1;
-            }
-            if pos == line.len() {
-                // OWS after the size may still be followed by an extension delimiter, but it may
-                // not terminate the line under the decoder's settled extension grammar.
-                return if complete { Err(HttpParseErr::Invalid) } else { Ok(()) };
-            }
-            if line[pos] != b';' {
-                return Err(HttpParseErr::Invalid);
-            }
-            pos += 1;
-            while pos < line.len() && matches!(line[pos], b' ' | b'\t') {
-                pos += 1;
-            }
-            let name_start = pos;
-            while pos < line.len() && http_is_token(&line[pos..pos + 1]) {
-                pos += 1;
-            }
-            if pos == name_start {
-                return if pos == line.len() && !complete {
-                    Ok(())
-                } else {
-                    Err(HttpParseErr::Invalid)
-                };
-            }
-            while pos < line.len() && matches!(line[pos], b' ' | b'\t') {
-                pos += 1;
-            }
-            if pos == line.len() {
-                return Ok(());
-            }
-            if line[pos] == b'=' {
-                pos += 1;
-                while pos < line.len() && matches!(line[pos], b' ' | b'\t') {
-                    pos += 1;
+            if byte == b'\r' {
+                if !self.chunk_line_can_end() {
+                    return Err(HttpParseErr::Invalid);
                 }
-                if pos == line.len() {
-                    return if complete { Err(HttpParseErr::Invalid) } else { Ok(()) };
-                }
-                if line[pos] == b'"' {
-                    pos += 1;
-                    let mut closed = false;
-                    while pos < line.len() {
-                        match line[pos] {
-                            b'"' => {
-                                pos += 1;
-                                closed = true;
-                                break;
-                            }
-                            b'\\' => {
-                                pos += 1;
-                                if pos == line.len() {
-                                    return if complete { Err(HttpParseErr::Invalid) } else { Ok(()) };
-                                }
-                                if !(line[pos] == b'\t'
-                                    || line[pos] == b' '
-                                    || (0x21..=0x7e).contains(&line[pos])
-                                    || line[pos] >= 0x80)
-                                {
-                                    return Err(HttpParseErr::Invalid);
-                                }
-                                pos += 1;
-                            }
-                            b if b == b'\t'
-                                || b == b' '
-                                || b == b'!'
-                                || (0x23..=0x5b).contains(&b)
-                                || (0x5d..=0x7e).contains(&b)
-                                || b >= 0x80 => pos += 1,
+                self.chunk_line_state = HttpChunkLineState::Cr;
+                continue;
+            }
+
+            let token = http_is_token(core::slice::from_ref(&byte));
+            self.chunk_line_state = match self.chunk_line_state {
+                HttpChunkLineState::Size if byte.is_ascii_hexdigit() => {
+                    self.chunk_line_has_digit = true;
+                    if self.chunk_magnitude_ok {
+                        let digit = match byte {
+                            b'0'..=b'9' => usize::from(byte - b'0'),
+                            b'a'..=b'f' => usize::from(byte - b'a' + 10),
+                            b'A'..=b'F' => usize::from(byte - b'A' + 10),
                             _ => return Err(HttpParseErr::Invalid),
+                        };
+                        if self.chunk_size > (HTTP_MAX_BODY - digit) / 16 {
+                            if self.explicit_body_limit.is_none() {
+                                return Err(HttpParseErr::Invalid);
+                            }
+                            self.chunk_magnitude_ok = false;
+                        } else {
+                            self.chunk_size = self.chunk_size * 16 + digit;
                         }
                     }
-                    if !closed {
-                        return if complete { Err(HttpParseErr::Invalid) } else { Ok(()) };
-                    }
-                } else {
-                    let value_start = pos;
-                    while pos < line.len() && http_is_token(&line[pos..pos + 1]) {
-                        pos += 1;
-                    }
-                    if pos == value_start {
-                        return Err(HttpParseErr::Invalid);
-                    }
+                    HttpChunkLineState::Size
                 }
-                while pos < line.len() && matches!(line[pos], b' ' | b'\t') {
-                    pos += 1;
+                HttpChunkLineState::Size
+                    if self.chunk_line_has_digit && matches!(byte, b' ' | b'\t') =>
+                {
+                    HttpChunkLineState::AfterSizeOws
                 }
-                if pos == line.len() {
-                    return Ok(());
+                HttpChunkLineState::Size if self.chunk_line_has_digit && byte == b';' => {
+                    HttpChunkLineState::ExtensionStart
                 }
-            }
+                HttpChunkLineState::AfterSizeOws if matches!(byte, b' ' | b'\t') => {
+                    HttpChunkLineState::AfterSizeOws
+                }
+                HttpChunkLineState::AfterSizeOws if byte == b';' => {
+                    HttpChunkLineState::ExtensionStart
+                }
+                HttpChunkLineState::ExtensionStart if matches!(byte, b' ' | b'\t') => {
+                    HttpChunkLineState::ExtensionStart
+                }
+                HttpChunkLineState::ExtensionStart if token => HttpChunkLineState::ExtensionName,
+                HttpChunkLineState::ExtensionName if token => HttpChunkLineState::ExtensionName,
+                HttpChunkLineState::ExtensionName if matches!(byte, b' ' | b'\t') => {
+                    HttpChunkLineState::AfterExtensionNameOws
+                }
+                HttpChunkLineState::ExtensionName if byte == b'=' => {
+                    HttpChunkLineState::BeforeValue
+                }
+                HttpChunkLineState::ExtensionName if byte == b';' => {
+                    HttpChunkLineState::ExtensionStart
+                }
+                HttpChunkLineState::AfterExtensionNameOws if matches!(byte, b' ' | b'\t') => {
+                    HttpChunkLineState::AfterExtensionNameOws
+                }
+                HttpChunkLineState::AfterExtensionNameOws if byte == b'=' => {
+                    HttpChunkLineState::BeforeValue
+                }
+                HttpChunkLineState::AfterExtensionNameOws if byte == b';' => {
+                    HttpChunkLineState::ExtensionStart
+                }
+                HttpChunkLineState::BeforeValue if matches!(byte, b' ' | b'\t') => {
+                    HttpChunkLineState::BeforeValue
+                }
+                HttpChunkLineState::BeforeValue if byte == b'"' => {
+                    HttpChunkLineState::QuotedValue
+                }
+                HttpChunkLineState::BeforeValue if token => HttpChunkLineState::TokenValue,
+                HttpChunkLineState::TokenValue if token => HttpChunkLineState::TokenValue,
+                HttpChunkLineState::TokenValue if matches!(byte, b' ' | b'\t') => {
+                    HttpChunkLineState::AfterValueOws
+                }
+                HttpChunkLineState::TokenValue if byte == b';' => {
+                    HttpChunkLineState::ExtensionStart
+                }
+                HttpChunkLineState::AfterValueOws if matches!(byte, b' ' | b'\t') => {
+                    HttpChunkLineState::AfterValueOws
+                }
+                HttpChunkLineState::AfterValueOws if byte == b';' => {
+                    HttpChunkLineState::ExtensionStart
+                }
+                HttpChunkLineState::QuotedValue if byte == b'"' => {
+                    HttpChunkLineState::AfterQuotedValueOws
+                }
+                HttpChunkLineState::QuotedValue if byte == b'\\' => {
+                    HttpChunkLineState::QuotedEscape
+                }
+                HttpChunkLineState::QuotedValue
+                    if byte == b'\t'
+                        || byte == b' '
+                        || byte == b'!'
+                        || (0x23..=0x5b).contains(&byte)
+                        || (0x5d..=0x7e).contains(&byte)
+                        || byte >= 0x80 =>
+                {
+                    HttpChunkLineState::QuotedValue
+                }
+                HttpChunkLineState::QuotedEscape
+                    if byte == b'\t'
+                        || byte == b' '
+                        || (0x21..=0x7e).contains(&byte)
+                        || byte >= 0x80 =>
+                {
+                    HttpChunkLineState::QuotedValue
+                }
+                HttpChunkLineState::AfterQuotedValueOws if matches!(byte, b' ' | b'\t') => {
+                    HttpChunkLineState::AfterQuotedValueOws
+                }
+                HttpChunkLineState::AfterQuotedValueOws if byte == b';' => {
+                    HttpChunkLineState::ExtensionStart
+                }
+                _ => return Err(HttpParseErr::Invalid),
+            };
         }
+        Ok(())
     }
 
     fn append_head(&mut self, bytes: &[u8]) -> Result<(), HttpParseErr> {
@@ -17013,16 +16945,8 @@ impl HttpResponseDecoder {
                 HttpDecodeState::ChunkSize => {
                     let rest = &input[pos..];
                     let take = memchr::memchr(b'\n', rest).map_or(rest.len(), |nl| nl + 1);
-                    self.append_chunk_framing(&rest[..take])?;
+                    self.feed_chunk_line(&rest[..take])?;
                     pos += take;
-                    if self.chunk_line[self.chunk_line_len - 1] == b'\n' {
-                        if self.chunk_line_len < 2 || self.chunk_line[self.chunk_line_len - 2] != b'\r' {
-                            return Err(HttpParseErr::Invalid);
-                        }
-                        self.parse_chunk_line()?;
-                    } else {
-                        self.validate_chunk_line_prefix()?;
-                    }
                     if self.chunk_framing_bytes == HTTP_MAX_CHUNK_FRAMING
                         && !matches!(self.state, HttpDecodeState::Trailers)
                     {
@@ -17054,7 +16978,7 @@ impl HttpResponseDecoder {
                         return Err(HttpParseErr::Invalid);
                     }
                     self.state = if seen == 1 {
-                        self.chunk_line_len = 0;
+                        self.reset_chunk_line();
                         HttpDecodeState::ChunkSize
                     } else {
                         HttpDecodeState::ChunkDataCrLf { seen: 1 }
@@ -30431,6 +30355,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn http_chunk_line_scalar_state_preserves_the_settled_extension_grammar() {
+        for line in [
+            "1;flag",
+            "1;flag ",
+            "1 ; flag = token ; quoted = \"a\\\"b\" ",
+            "1;empty=\"\"",
+        ] {
+            let raw = format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{line}\r\nx\r\n0\r\n\r\n"
+            );
+            for split in 0..=raw.len() {
+                let (response, consumed, _) =
+                    http_decode_for_test(raw.as_bytes(), false, &[split]).unwrap();
+                assert_eq!(consumed, raw.len(), "valid line {line:?}, split {split}");
+                assert_eq!(http_response_body(&response), b"x");
+            }
+        }
+
+        for line in [
+            "1 ",
+            "1;",
+            "1;flag=",
+            "1;flag=\"unterminated",
+            "1;flag=\"x\"junk",
+            "1;flag=token?",
+            "1;flag==token",
+        ] {
+            let raw = format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{line}\r\nx\r\n0\r\n\r\n"
+            );
+            assert!(
+                http_decode_for_test(raw.as_bytes(), false, &[]).is_err(),
+                "invalid line {line:?}"
+            );
+        }
+    }
+
     /// A framing error that is already determined by the bytes in hand is returned by that feed;
     /// the socket loop must never issue a later blocking read merely to find another delimiter.
     #[test]
@@ -30623,6 +30585,10 @@ mod tests {
     fn http_explicit_262144_limit_has_the_exact_allocation_ceiling_for_every_framing() {
         const LIMIT: usize = 262_144;
         const CEILING: usize = 557_056;
+        assert!(
+            core::mem::size_of::<HttpResponseDecoder>() < 1024,
+            "chunk grammar must remain scalar state, not a retained raw-line staging buffer"
+        );
         let payload = vec![b'x'; LIMIT];
 
         let mut fixed = format!(
