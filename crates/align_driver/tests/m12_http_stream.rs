@@ -10,9 +10,9 @@
 //! before the first send — discards the stored head and answers with a complete NORMAL response
 //! (consuming BOTH). Drop is **close-only** (no terminal write — abrupt close is chunked's own
 //! truncation signal). The wire framing / lazy-head / reject / poison / version threading are
-//! runtime-unit-tested in `align_runtime`; here we drive a real Align streaming server end-to-end (a
-//! Rust client that DECODES the chunked framing) and check the Gate-1 rejections + the recorded
-//! 1.1/1.0 + truncation + poison + spent-ctx + reject paths.
+//! runtime-unit-tested in `align_runtime`; here we drive a real Align streaming server end-to-end
+//! with both Rust and Align clients and check the Gate-1 rejections + the recorded 1.1/1.0 +
+//! truncation + poison + spent-ctx + reject paths.
 
 mod common;
 use common::*;
@@ -337,11 +337,10 @@ pub fn main(args: array<str>) -> Result<(), Error> {{
     assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n", "poisoned finish returns Err");
 }
 
-/// Dogfood asymmetry (recorded): align's OWN client rejects a chunked response as `Error.Invalid`
-/// (client parse stays Content-Length-only). The align streaming server responds chunked; the align
-/// `cl.get` client sees `Err`.
+/// Dogfood symmetry: Align's own whole-body client consumes its streaming server's chunked response
+/// and exposes only the decoded payload.
 #[test]
-fn align_client_rejects_chunked_stream_as_invalid() {
+fn align_client_decodes_chunked_stream() {
     if !backend_available() {
         return;
     }
@@ -364,16 +363,16 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 ";
     let client_prog = "\
 import std.http
+import std.io
 import std.cli
 pub fn main(args: array<str>) -> Result<(), Error> {
   c := cli.command(\"get\")
   c.flag_str(\"url\", \"\")
   p := c.parse(args)?
   cl := http.client()
-  match cl.get(p.get_str(\"url\")) {
-    Ok(_) => print(0)
-    Err(_) => print(1)
-  }
+  resp := cl.get(p.get_str(\"url\"))?
+  io.stdout.write(resp.body())?
+  io.stdout.write(\"\\n\")?
   return Ok(())
 }
 ";
@@ -396,7 +395,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
     let out = build_and_run_args("m12-stream-dogfood-cli", client_prog, &["--url", &url]);
     let _ = child.wait();
     assert_eq!(out.status.code(), Some(0), "client stderr: {}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n", "align client rejects a chunked response as Invalid");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello\n", "Align client exposes the decoded stream payload");
 }
 
 /// A bodied `response_builder` passed to `respond_stream` is a programmer contract bug → **abort**

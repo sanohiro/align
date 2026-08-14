@@ -238,8 +238,8 @@ pub fn main() -> Result<(), Error> {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "404\n0\n");
 }
 
-/// A malformed response (bad status line / non-numeric status / header without `:` / chunked /
-/// oversized framing) is `Error.Invalid` — a recoverable `Err`, never an abort.
+/// A malformed response (bad status line / non-numeric status / header without `:` / oversized
+/// framing) is `Error.Invalid` — a recoverable `Err`, never an abort.
 #[test]
 fn parse_malformed_is_err_not_abort() {
     if !backend_available() {
