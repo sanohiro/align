@@ -963,7 +963,9 @@ fn walk_body_records<'a>(
                             .map(|part| (BodyRecord::TemplatePart(part), child_depth)),
                     );
                 }
-                ExprKind::JsonEncodeBounded { parts, max_bytes } => {
+                ExprKind::JsonEncodeBounded {
+                    parts, max_bytes, ..
+                } => {
                     work.extend(
                         parts
                             .iter()

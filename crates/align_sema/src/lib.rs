@@ -12662,7 +12662,9 @@ impl EffectScan<'_> {
                     }
                 }
             }
-            ExprKind::JsonEncodeBounded { parts, max_bytes } => {
+            ExprKind::JsonEncodeBounded {
+                parts, max_bytes, ..
+            } => {
                 for p in parts {
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => walk!(h),
@@ -17532,7 +17534,9 @@ impl<'a> EscapeCheck<'a> {
                     }
                 }
             }
-            ExprKind::JsonEncodeBounded { parts, max_bytes } => {
+            ExprKind::JsonEncodeBounded {
+                parts, max_bytes, ..
+            } => {
                 for p in parts {
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.walk(h, depth),
@@ -25293,7 +25297,9 @@ impl<'a> MoveCheck<'a> {
                     }
                 }
             }
-            ExprKind::JsonEncodeBounded { parts, max_bytes } => {
+            ExprKind::JsonEncodeBounded {
+                parts, max_bytes, ..
+            } => {
                 for p in parts {
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => move_expr!(self, h, moved, false, false),
@@ -37639,7 +37645,7 @@ impl<'a, 't> Checker<'a, 't> {
                 .error(format!("'json.encode' expects 1 argument, got {}", args.len()), span);
             return err;
         }
-        let Some(parts) = self.json_encode_parts(&args[0], JsonDir::Encode) else {
+        let Some((parts, _, _)) = self.json_encode_parts(&args[0], JsonDir::Encode) else {
             return err;
         };
         Expr { kind: ExprKind::Template(parts), ty: Ty::Str, span }
@@ -37648,7 +37654,11 @@ impl<'a, 't> Checker<'a, 't> {
     /// Construct the one checked encode plan shared by `json.encode` and
     /// `json.encode_bounded`. Keeping schema admission and ordered parts here makes byte parity a
     /// construction property rather than a duplicated formatter promise.
-    fn json_encode_parts(&mut self, value: &ast::Expr, dir: JsonDir) -> Option<Vec<TemplatePart>> {
+    fn json_encode_parts(
+        &mut self,
+        value: &ast::Expr,
+        dir: JsonDir,
+    ) -> Option<(Vec<TemplatePart>, LocalId, Ty)> {
         let Some((base, ty)) = self.place_local(value) else {
             self.diags
                 .error(format!("'{}' expects a struct or struct-array value (a local binding)", dir.name()), value.span);
@@ -37693,7 +37703,7 @@ impl<'a, 't> Checker<'a, 't> {
         if !ok {
             return None;
         }
-        Some(parts)
+        Some((parts, base, ty))
     }
 
     fn check_json_encode_bounded(&mut self, args: &[ast::Expr], span: Span) -> Expr {
@@ -37703,7 +37713,7 @@ impl<'a, 't> Checker<'a, 't> {
                 .error(format!("'json.encode_bounded' expects 2 arguments, got {}", args.len()), span);
             return err;
         }
-        let Some(parts) = self.json_encode_parts(&args[0], JsonDir::EncodeBounded) else {
+        let Some((parts, base, _)) = self.json_encode_parts(&args[0], JsonDir::EncodeBounded) else {
             return err;
         };
         // Check without a hint, then bind an untyped integer literal through the one exact-i64
@@ -37722,6 +37732,7 @@ impl<'a, 't> Checker<'a, 't> {
         }
         Expr {
             kind: ExprKind::JsonEncodeBounded {
+                base,
                 parts,
                 max_bytes: Box::new(max_bytes),
             },
@@ -43252,7 +43263,9 @@ impl<'a, 't> Checker<'a, 't> {
                     }
                 }
             }
-            ExprKind::JsonEncodeBounded { parts, max_bytes } => {
+            ExprKind::JsonEncodeBounded {
+                parts, max_bytes, ..
+            } => {
                 for p in parts {
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.finalize_expr(h),

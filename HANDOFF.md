@@ -64,13 +64,16 @@ or ownership-strategy change after design review.
 align-llm Requests 11 and 12 have accepted designs. Request 12 is the active publication capability
 on `agent/bounded-canonical-json` and PR #807. It implements
 `docs/impl/17-library-boundary-prerequisites.md` §7.7 through the complete
-Sema→checked-HIR→MIR→LLVM→runtime owner matrix while sharing the existing canonical formatter. The
-comprehensive review of `e439f643841bc8ad2f816993ddc8d4a415cbcf52` found one checked-HIR boundary
-gap; consolidated repair `4816232614a8c64a9920751265c0cbbaaebab398` adds the iterative canonical-plan
-grammar and mutation regressions. The findings-fixed native ARM64 publication preflight passed with
-one build/test/gate job. Refresh that evidence after integrating #806, update PR #807, and merge it.
-Do not add a second formatter, estimator pass, dynamic JSON value, or unbounded-encode-then-discard
-path.
+Sema→checked-HIR→MIR→LLVM→runtime owner matrix while sharing the existing canonical formatter. After
+integrating #806, the comprehensive review of
+`33de89431e4e7066f06e9df23522d5bef0c3cefb` found two valid boundary gaps: checked HIR did not bind
+JSON keys/access paths/order back to the source schema, and malformed MIR could pass a non-`i64`
+limit to LLVM's integer cast. The consolidated repair records the source local, reconstructs and
+compares the complete canonical plan iteratively, and preflights the bounded MIR result/out/piece
+envelope before LLVM construction. Its native ARM64 focused validator, driver, malformed-MIR, and
+library Clippy owners pass with one job. Commit the repair, run findings-fixed publication preflight,
+update PR #807, and merge it. Do not add a second formatter, estimator pass, dynamic JSON value, or
+unbounded-encode-then-discard path.
 
 Request 11 is the next implementation capability after #807. Its bounded process-capture contract
 is in `docs/impl/std-design/process.md`: `max_capture_bytes` is a per-stream command-local bound,

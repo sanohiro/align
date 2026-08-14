@@ -5204,7 +5204,9 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::NamedArena { local, block } => lower_named_arena_block(b, *local, block),
         hir::ExprKind::TaskGroup(block) => lower_task_group_block(b, block),
         hir::ExprKind::Template(_) => lower_template_spine(b, e),
-        hir::ExprKind::JsonEncodeBounded { parts, max_bytes } => {
+        hir::ExprKind::JsonEncodeBounded {
+            parts, max_bytes, ..
+        } => {
             lower_json_encode_bounded(b, parts, max_bytes, e.ty)
         }
         hir::ExprKind::FileCreateRw { .. }
@@ -5468,7 +5470,9 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 len: _,
             } => finish_const_array(b, elems, *elem, e.ty),
             hir::ExprKind::Template(_) => lower_template_spine(b, e),
-            hir::ExprKind::JsonEncodeBounded { parts, max_bytes } => {
+            hir::ExprKind::JsonEncodeBounded {
+                parts, max_bytes, ..
+            } => {
                 lower_json_encode_bounded(b, parts, max_bytes, e.ty)
             }
             hir::ExprKind::JsonDecode { struct_id, input } => {

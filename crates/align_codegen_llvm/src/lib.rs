@@ -5206,6 +5206,50 @@ fn preflight_operand_ty(function: &Function, operand: &Operand) -> Option<Ty> {
     }
 }
 
+fn bounded_json_piece_is_type_safe(
+    program: &Program,
+    function: &Function,
+    piece: &align_mir::TemplatePiece,
+) -> bool {
+    let operand_ty = |operand| preflight_operand_ty(function, operand);
+    match piece {
+        align_mir::TemplatePiece::Static(_) | align_mir::TemplatePiece::PopComma => true,
+        align_mir::TemplatePiece::IntHole(operand) => {
+            matches!(operand_ty(operand), Some(Ty::Int(_)))
+        }
+        align_mir::TemplatePiece::StrHole(operand)
+        | align_mir::TemplatePiece::JsonStrHole(operand) => operand_ty(operand) == Some(Ty::Str),
+        align_mir::TemplatePiece::BoolHole(operand) => operand_ty(operand) == Some(Ty::Bool),
+        align_mir::TemplatePiece::CharHole(operand) => operand_ty(operand) == Some(Ty::Char),
+        align_mir::TemplatePiece::FloatHole(operand) => {
+            matches!(operand_ty(operand), Some(Ty::Float(_)))
+        }
+        align_mir::TemplatePiece::OptionField { opt, .. } => matches!(
+            operand_ty(opt),
+            Some(Ty::Option(payload))
+                if matches!(
+                    align_sema::scalar_to_ty(payload),
+                    Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Str
+                )
+        ),
+        align_mir::TemplatePiece::OptionStructField { opt, struct_id, .. } => {
+            program.structs.get(*struct_id as usize).is_some()
+                && operand_ty(opt) == Some(Ty::Option(Scalar::Struct(*struct_id)))
+        }
+        align_mir::TemplatePiece::StructArrayField { array, struct_id } => {
+            program.structs.get(*struct_id as usize).is_some()
+                && operand_ty(array) == Some(Ty::DynStructArray(*struct_id, align_sema::Layout::Aos))
+        }
+        align_mir::TemplatePiece::ScalarArrayField { array, elem } => {
+            operand_ty(array) == Some(Ty::DynArray(*elem))
+        }
+        align_mir::TemplatePiece::UnionValue { value, enum_id } => {
+            program.enums.get(*enum_id as usize).is_some()
+                && operand_ty(value) == Some(Ty::Enum(*enum_id))
+        }
+    }
+}
+
 fn operands_match_modes(
     args: &[Operand],
     modes: &[align_ast::ParamMode],
@@ -5446,6 +5490,31 @@ fn callable_preflight(
                     continue;
                 };
                 match rvalue {
+                    Rvalue::JsonEncodeBounded {
+                        pieces,
+                        max_bytes,
+                        out,
+                    } => {
+                        let i64_ty = Ty::Int(align_sema::IntTy {
+                            bits: 64,
+                            signed: true,
+                        });
+                        let status_ty = Ty::Int(align_sema::IntTy {
+                            bits: 32,
+                            signed: true,
+                        });
+                        if preflight_operand_ty(function, max_bytes) != Some(i64_ty)
+                            || function.slots.get(*out as usize) != Some(&Ty::String)
+                            || function.value_tys.get(*value as usize) != Some(&status_ty)
+                            || pieces
+                                .iter()
+                                .any(|piece| !bounded_json_piece_is_type_safe(program, function, piece))
+                        {
+                            return Err(CodegenError::Lowering(
+                                "bounded json.encode MIR metadata invalid".to_owned(),
+                            ));
+                        }
+                    }
                     Rvalue::Call(DirectCall::Runtime(key), args) => {
                         let argument_types = args
                             .iter()
@@ -22474,6 +22543,31 @@ mod tests {
         )
         .expect_err("a payload-less union variant has no descriptor arm");
         assert!(err.to_string().contains("carries no payload"), "got: {err}");
+    }
+
+    #[test]
+    fn a_malformed_bounded_json_limit_is_an_error_not_a_panic() {
+        let status = Ty::Int(IntTy {
+            bits: 32,
+            signed: true,
+        });
+        let err = codegen_program(
+            vec![Stmt::Let(
+                0,
+                Rvalue::JsonEncodeBounded {
+                    pieces: vec![align_mir::TemplatePiece::Static("{}".to_string())],
+                    max_bytes: Operand::Const(Const::Bool(true)),
+                    out: 0,
+                },
+            )],
+            vec![status],
+            vec![Ty::String],
+            vec![],
+            vec![],
+            vec![],
+        )
+        .expect_err("a non-i64 bounded JSON limit must fail before LLVM construction");
+        assert_lowering(err, "bounded json.encode MIR metadata invalid");
     }
 
     fn allocation_case_ir(

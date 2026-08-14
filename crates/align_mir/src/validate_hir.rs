@@ -2548,6 +2548,7 @@ impl<'a> LocalScopeValidator<'a> {
             | hir::ExprKind::Field { root: local, .. }
             | hir::ExprKind::SoaColumn { base: local, .. }
             | hir::ExprKind::IndexField { base: local, .. }
+            | hir::ExprKind::JsonEncodeBounded { base: local, .. }
             | hir::ExprKind::ArrayGroupAgg { base: local, .. }
             | hir::ExprKind::ArrayGroupAggMulti { base: local, .. }
             | hir::ExprKind::ArrayDictEncode { base: local, .. } => Some(*local),
@@ -5739,7 +5740,9 @@ impl<'a> BodyValidator<'a> {
                     }
                 }
             }
-            hir::ExprKind::JsonEncodeBounded { parts, max_bytes } => {
+            hir::ExprKind::JsonEncodeBounded {
+                parts, max_bytes, ..
+            } => {
                 // The source accesses encoded by `parts` are evaluated before the explicit limit.
                 // Push in reverse because this worklist is LIFO.
                 push_expr!(max_bytes, context.clone());
@@ -9045,9 +9048,13 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::Template(parts) => {
                 self.derive_template_expression(parts, context)
             }
-            hir::ExprKind::JsonEncodeBounded { parts, max_bytes } => {
+            hir::ExprKind::JsonEncodeBounded {
+                base,
+                parts,
+                max_bytes,
+            } => {
                 let (template_ty, template_falls, template_breaks) =
-                    self.derive_json_encode_expression(parts, context)?;
+                    self.derive_json_encode_expression(*base, parts, context)?;
                 let limit = self.expr_flow(max_bytes)?;
                 if template_ty != Ty::Str || limit.ty != i64_ty() {
                     return None;
@@ -9356,12 +9363,310 @@ impl<'a> BodyValidator<'a> {
         Some((Ty::Str, falls, breaks))
     }
 
+    /// Reconstruct the producer's canonical plan from the recorded source local and compare every
+    /// static token, field ordinal, access path, name, and descriptor identity. Type-compatible
+    /// substitutions are not sufficient: they could pair one JSON key with another field's value.
+    fn json_encode_parts_match_source(
+        &self,
+        base: hir::LocalId,
+        parts: &[hir::TemplatePart],
+        context: &BodyContext,
+    ) -> bool {
+        #[derive(Clone)]
+        enum Expected {
+            Text(String),
+            Hole { elem: Option<u32>, path: Vec<u32>, ty: Ty },
+            JsonStr { elem: Option<u32>, path: Vec<u32> },
+            OptionField { elem: Option<u32>, path: Vec<u32>, name: String, ty: Ty },
+            OptionStructField {
+                elem: Option<u32>,
+                path: Vec<u32>,
+                name: String,
+                struct_id: u32,
+            },
+            PopComma,
+            StructArrayField { elem: Option<u32>, path: Vec<u32>, ty: Ty, struct_id: u32 },
+            ScalarArrayField { elem: Option<u32>, path: Vec<u32>, scalar: Scalar },
+            UnionField { elem: Option<u32>, path: Vec<u32>, enum_id: u32 },
+            RootUnion(u32),
+        }
+
+        enum Work {
+            Emit(Expected),
+            Object { id: u32, elem: Option<u32>, path: Vec<u32> },
+            Fields { id: u32, elem: Option<u32>, path: Vec<u32>, next: usize, has_option: bool },
+            Array { id: u32, len: u32, next: u32 },
+        }
+
+        fn access_matches(
+            validator: &BodyValidator<'_>,
+            expression: &hir::Expr,
+            base: hir::LocalId,
+            elem: Option<u32>,
+            path: &[u32],
+            ty: Ty,
+        ) -> bool {
+            validator.body_ty_matches(expression.ty, ty)
+                && match (&expression.kind, elem) {
+                    (hir::ExprKind::Field { root, path: actual }, None) => {
+                        *root == base && actual == path
+                    }
+                    (
+                        hir::ExprKind::IndexField {
+                            base: actual_base,
+                            index,
+                            path: actual,
+                        },
+                        Some(expected_index),
+                    ) => *actual_base == base && *index == expected_index && actual == path,
+                    _ => false,
+                }
+        }
+
+        fn expected_matches(
+            validator: &BodyValidator<'_>,
+            expected: Expected,
+            actual: &hir::TemplatePart,
+            base: hir::LocalId,
+        ) -> bool {
+            match (expected, actual) {
+                (Expected::Text(expected), hir::TemplatePart::Text(actual)) => expected == *actual,
+                (Expected::Hole { elem, path, ty }, hir::TemplatePart::Hole(expression)) => {
+                    access_matches(validator, expression, base, elem, &path, ty)
+                }
+                (Expected::JsonStr { elem, path }, hir::TemplatePart::JsonStr(expression)) => {
+                    access_matches(validator, expression, base, elem, &path, Ty::Str)
+                }
+                (
+                    Expected::OptionField { elem, path, name, ty },
+                    hir::TemplatePart::OptionField { access, name: actual_name },
+                ) => {
+                    name == *actual_name
+                        && access_matches(validator, access, base, elem, &path, ty)
+                }
+                (
+                    Expected::OptionStructField { elem, path, name, struct_id },
+                    hir::TemplatePart::OptionStructField {
+                        access,
+                        name: actual_name,
+                        struct_id: actual_id,
+                    },
+                ) => {
+                    name == *actual_name
+                        && struct_id == *actual_id
+                        && access_matches(
+                            validator,
+                            access,
+                            base,
+                            elem,
+                            &path,
+                            Ty::Option(Scalar::Struct(struct_id)),
+                        )
+                }
+                (Expected::PopComma, hir::TemplatePart::PopComma) => true,
+                (
+                    Expected::StructArrayField { elem, path, ty, struct_id },
+                    hir::TemplatePart::StructArrayField { access, struct_id: actual_id },
+                ) => {
+                    struct_id == *actual_id
+                        && access_matches(validator, access, base, elem, &path, ty)
+                }
+                (
+                    Expected::ScalarArrayField { elem, path, scalar },
+                    hir::TemplatePart::ScalarArrayField { access, elem: actual },
+                ) => {
+                    validator.body_scalar_matches(scalar, *actual)
+                        && access_matches(
+                            validator,
+                            access,
+                            base,
+                            elem,
+                            &path,
+                            Ty::DynArray(scalar),
+                        )
+                }
+                (
+                    Expected::UnionField { elem, path, enum_id },
+                    hir::TemplatePart::UnionValue { access, enum_id: actual },
+                ) => {
+                    enum_id == *actual
+                        && access_matches(
+                            validator,
+                            access,
+                            base,
+                            elem,
+                            &path,
+                            Ty::Enum(enum_id),
+                        )
+                }
+                (
+                    Expected::RootUnion(enum_id),
+                    hir::TemplatePart::UnionValue { access, enum_id: actual },
+                ) => {
+                    enum_id == *actual
+                        && access.ty == Ty::Enum(enum_id)
+                        && matches!(access.kind, hir::ExprKind::Local(local) if local == base)
+                }
+                _ => false,
+            }
+        }
+
+        let Some(root) = self.local_type(context, base) else {
+            return false;
+        };
+        let mut work = match root {
+            Ty::Struct(id) => vec![Work::Object { id, elem: None, path: Vec::new() }],
+            Ty::StructArray(id, len) => vec![Work::Array { id, len, next: 0 }],
+            Ty::Enum(id) => vec![Work::Emit(Expected::RootUnion(id))],
+            _ => return false,
+        };
+        let mut part = 0usize;
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Emit(expected) => {
+                    let Some(actual) = parts.get(part) else {
+                        return false;
+                    };
+                    if !expected_matches(self, expected, actual, base) {
+                        return false;
+                    }
+                    part += 1;
+                }
+                Work::Array {
+                    id: _,
+                    len: 0,
+                    next: 0,
+                } => {
+                    work.push(Work::Emit(Expected::Text("]".to_owned())));
+                    work.push(Work::Emit(Expected::Text("[".to_owned())));
+                }
+                Work::Array { id, len, next: 0 } => {
+                    work.push(Work::Array { id, len, next: 1 });
+                    work.push(Work::Object { id, elem: Some(0), path: Vec::new() });
+                    work.push(Work::Emit(Expected::Text("[".to_owned())));
+                }
+                Work::Array { id, len, next } if next < len => {
+                    work.push(Work::Array { id, len, next: next + 1 });
+                    work.push(Work::Object { id, elem: Some(next), path: Vec::new() });
+                    work.push(Work::Emit(Expected::Text(",".to_owned())));
+                }
+                Work::Array { .. } => work.push(Work::Emit(Expected::Text("]".to_owned()))),
+                Work::Object { id, elem, path } => {
+                    let Some(definition) = self.program.structs.get(id as usize) else {
+                        return false;
+                    };
+                    let has_option = definition
+                        .fields
+                        .iter()
+                        .any(|field| matches!(field.ty, Ty::Option(_)));
+                    work.push(Work::Fields { id, elem, path, next: 0, has_option });
+                    work.push(Work::Emit(Expected::Text("{".to_owned())));
+                }
+                Work::Fields { id, elem, path, next, has_option } => {
+                    let Some(definition) = self.program.structs.get(id as usize) else {
+                        return false;
+                    };
+                    if next == definition.fields.len() {
+                        work.push(Work::Emit(Expected::Text("}".to_owned())));
+                        if has_option {
+                            work.push(Work::Emit(Expected::PopComma));
+                        }
+                        continue;
+                    }
+                    let field = definition.fields[next].clone();
+                    let mut field_path = path.clone();
+                    let Ok(field_index) = u32::try_from(next) else {
+                        return false;
+                    };
+                    field_path.push(field_index);
+                    work.push(Work::Fields {
+                        id,
+                        elem,
+                        path: path.clone(),
+                        next: next + 1,
+                        has_option,
+                    });
+                    if let Ty::Option(payload) = field.ty {
+                        let expected = match payload {
+                            Scalar::Struct(struct_id) => Expected::OptionStructField {
+                                elem,
+                                path: field_path,
+                                name: field.name,
+                                struct_id,
+                            },
+                            _ if self.json_array_element_ok(payload) => Expected::OptionField {
+                                elem,
+                                path: field_path,
+                                name: field.name,
+                                ty: field.ty,
+                            },
+                            _ => return false,
+                        };
+                        work.push(Work::Emit(expected));
+                        continue;
+                    }
+                    if has_option {
+                        work.push(Work::Emit(Expected::Text(",".to_owned())));
+                    }
+                    match field.ty {
+                        Ty::Struct(child) => work.push(Work::Object {
+                            id: child,
+                            elem,
+                            path: field_path.clone(),
+                        }),
+                        Ty::DynStructArray(struct_id, _) => {
+                            work.push(Work::Emit(Expected::StructArrayField {
+                                elem,
+                                path: field_path.clone(),
+                                ty: field.ty,
+                                struct_id,
+                            }));
+                        }
+                        Ty::DynArray(scalar) if self.json_array_element_ok(scalar) => {
+                            work.push(Work::Emit(Expected::ScalarArrayField {
+                                elem,
+                                path: field_path.clone(),
+                                scalar,
+                            }));
+                        }
+                        Ty::Enum(enum_id) => work.push(Work::Emit(Expected::UnionField {
+                            elem,
+                            path: field_path.clone(),
+                            enum_id,
+                        })),
+                        Ty::Str => work.push(Work::Emit(Expected::JsonStr {
+                            elem,
+                            path: field_path.clone(),
+                        })),
+                        ty if matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool) => {
+                            work.push(Work::Emit(Expected::Hole {
+                                elem,
+                                path: field_path.clone(),
+                                ty,
+                            }));
+                        }
+                        _ => return false,
+                    }
+                    let separator = if has_option || next == 0 { "" } else { "," };
+                    work.push(Work::Emit(Expected::Text(format!(
+                        "{separator}\"{}\":",
+                        field.name
+                    ))));
+                }
+            }
+        }
+        part == parts.len()
+    }
+
     fn derive_json_encode_expression(
         &self,
+        base: hir::LocalId,
         parts: &[hir::TemplatePart],
-        _: &BodyContext,
+        context: &BodyContext,
     ) -> Option<(Ty, bool, Vec<Ty>)> {
-        if !Self::json_encode_parts_syntax_ok(parts) {
+        if !Self::json_encode_parts_syntax_ok(parts)
+            || !self.json_encode_parts_match_source(base, parts, context)
+        {
             return None;
         }
         let mut flows = Vec::new();

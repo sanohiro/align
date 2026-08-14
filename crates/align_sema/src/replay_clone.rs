@@ -785,7 +785,12 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             struct_id: *struct_id,
         },
         ExprKind::Template(parts) => ExprKind::Template(clones.parts(parts.len())?),
-        ExprKind::JsonEncodeBounded { parts, max_bytes } => ExprKind::JsonEncodeBounded {
+        ExprKind::JsonEncodeBounded {
+            base,
+            parts,
+            max_bytes,
+        } => ExprKind::JsonEncodeBounded {
+            base: *base,
             parts: clones.parts(parts.len())?,
             max_bytes: boxed!(max_bytes),
         },
@@ -2298,7 +2303,9 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             one!(dst);
         }
         ExprKind::Template(parts) => parts!(parts),
-        ExprKind::JsonEncodeBounded { parts, max_bytes } => {
+        ExprKind::JsonEncodeBounded {
+            parts, max_bytes, ..
+        } => {
             parts!(parts);
             one!(max_bytes);
         }

@@ -862,6 +862,8 @@ pub enum ExprKind {
     /// `json.encode`, emitted into an individually owned builder with an inclusive byte ceiling.
     /// The expression type is `Result<string, Error>`.
     JsonEncodeBounded {
+        /// The checked local whose complete schema owns the canonical plan below.
+        base: LocalId,
         parts: Vec<TemplatePart>,
         max_bytes: Box<Expr>,
     },
