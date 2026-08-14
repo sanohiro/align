@@ -12052,12 +12052,12 @@ unsafe fn run_command_capture(
             };
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let timeout = poll_timeout_ms(remaining).unwrap_or(1).min(1);
-            if let Err(error) = unsafe { capture_poll(core::ptr::null_mut(), 0, timeout) } {
-                if error.kind() != std::io::ErrorKind::Interrupted {
-                    let winning = io_error_to_status(&error);
-                    unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
-                    return Err(winning);
-                }
+            if let Err(error) = unsafe { capture_poll(core::ptr::null_mut(), 0, timeout) }
+                && error.kind() != std::io::ErrorKind::Interrupted
+            {
+                let winning = io_error_to_status(&error);
+                unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
+                return Err(winning);
             }
             continue;
         }
@@ -12095,12 +12095,11 @@ unsafe fn run_command_capture(
         }
 
         // Fixed stdout-then-stderr traversal owns deterministic simultaneous-error precedence.
-        for index in 0..2 {
+        for (index, pf) in fds.iter().copied().enumerate() {
             if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
                 unsafe { fail_command_capture(pid, use_pgroup, child_reaped, &mut out_fd, &mut err_fd) };
                 return Err(AL_TIMEOUT);
             }
-            let pf = fds[index];
             if pf.fd < 0 || pf.revents == 0 {
                 continue;
             }
@@ -12367,6 +12366,11 @@ fn prepare_command_capture(cmd: &Command) -> Result<(CommandCaptureBuffer, Comma
     Ok((stdout, stderr))
 }
 
+/// Run one command and return its UTF-8-validated captured streams in a `RunOutput` owner.
+///
+/// # Safety
+/// `c` must be null or point to a live `Command`. `out` must be null or point to writable,
+/// properly aligned storage for one `RunOutput` pointer, and a non-null `out` must not alias `c`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_command_run(c: *mut Command, out: *mut *mut RunOutput) -> i32 {
     if out.is_null() {
@@ -12402,6 +12406,10 @@ pub unsafe extern "C" fn align_rt_command_run(c: *mut Command, out: *mut *mut Ru
 
 /// Binary captured-run terminal. It shares all setup, cap, timeout, kill, and direct-reap behavior
 /// with [`align_rt_command_run`] and deliberately performs no UTF-8 validation.
+///
+/// # Safety
+/// `c` must be null or point to a live `Command`. `out` must be null or point to writable,
+/// properly aligned storage for one `RunBytes` pointer, and a non-null `out` must not alias `c`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_command_run_bytes(c: *mut Command, out: *mut *mut RunBytes) -> i32 {
     if out.is_null() {
@@ -12479,11 +12487,20 @@ pub unsafe extern "C" fn align_rt_run_output_stderr(o: *const RunOutput) -> Alig
     AlignStr { ptr: r.err.as_ptr(), len: r.err.len() as i64 }
 }
 
+/// Return the captured process exit code, or zero for a null handle.
+///
+/// # Safety
+/// `o` must be null or point to a live `RunBytes` owner.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_run_bytes_code(o: *const RunBytes) -> i64 {
     if o.is_null() { 0 } else { unsafe { &*o }.code }
 }
 
+/// Return a byte view over the captured stdout buffer.
+///
+/// # Safety
+/// `o` must be null or point to a live `RunBytes` owner. The returned view borrows `o` and must not
+/// outlive or overlap mutation of that owner.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_run_bytes_stdout(o: *const RunBytes) -> AlignStr {
     if o.is_null() {
@@ -12497,6 +12514,11 @@ pub unsafe extern "C" fn align_rt_run_bytes_stdout(o: *const RunBytes) -> AlignS
     }
 }
 
+/// Return a byte view over the captured stderr buffer.
+///
+/// # Safety
+/// `o` must be null or point to a live `RunBytes` owner. The returned view borrows `o` and must not
+/// outlive or overlap mutation of that owner.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_run_bytes_stderr(o: *const RunBytes) -> AlignStr {
     if o.is_null() {
@@ -12534,6 +12556,10 @@ pub unsafe extern "C" fn align_rt_run_output_free(o: *mut RunOutput) {
 }
 
 /// Free a `RunBytes` handle. Null-safe for moved-out/never-initialized slots.
+///
+/// # Safety
+/// `o` must be null or a pointer returned through [`align_rt_command_run_bytes`] that has not
+/// already been freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_run_bytes_free(o: *mut RunBytes) {
     if !o.is_null() {

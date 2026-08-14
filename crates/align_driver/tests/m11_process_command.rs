@@ -424,6 +424,23 @@ fn leak() -> Result<slice<u8>, Error> {\n\
 }\n\
 pub fn main() -> i32 { 0 }\n";
     assert!(check_errs("run-bytes-view-escape", leak));
+
+    let borrowed = "import std.process\n\
+fn stdout(borrow out: run_bytes) -> slice<u8> = out.stdout()\n\
+fn stderr(borrow mut out: run_bytes) -> slice<u8> = out.stderr()\n\
+pub fn main() -> i32 { 0 }\n";
+    assert!(
+        !check_errs("run-bytes-borrowed-view-return", borrowed),
+        "views of caller-owned borrowed run_bytes parameters must remain returnable"
+    );
+
+    let by_value = "import std.process\n\
+fn stdout(out: run_bytes) -> slice<u8> = out.stdout()\n\
+pub fn main() -> i32 { 0 }\n";
+    assert!(
+        check_errs("run-bytes-by-value-view-return", by_value),
+        "a by-value run_bytes parameter is dropped by the callee, so its view must not escape"
+    );
 }
 
 #[test]

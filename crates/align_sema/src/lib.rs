@@ -15810,7 +15810,15 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::BufferBytes { .. }
             | ExprKind::HttpRespBody { .. }
             | ExprKind::HttpCtxBody { .. } => return true,
-            ExprKind::RunBytesStdout { .. } | ExprKind::RunBytesStderr { .. } => return true,
+            // A byte view minted from a local or by-value `run_bytes` owner dies with this frame.
+            // A `borrow`/`borrow mut` parameter still belongs to the caller, however, so its view
+            // may be returned with that caller-side provenance (the same distinction made by
+            // `borrowed_storage_cap` in `region_of`).
+            ExprKind::RunBytesStdout { out } | ExprKind::RunBytesStderr { out } => {
+                if !self.borrowed_param_place(out) {
+                    return true;
+                }
+            }
             ExprKind::Local(p) if self.state.local_backed_slice.contains(p) => return true,
             ExprKind::Local(_) => {}
             ExprKind::Call { func, args, .. } => {
