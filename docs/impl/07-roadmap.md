@@ -2018,10 +2018,11 @@ green. **Next: M13** (codegen quality & link hygiene, the pre-LLVM-upgrade wave)
   eager-materialize). **Freeze is zero-copy**: storage is `align_rt_alloc`-family memory grown
   via a NEW `align_rt_realloc` (amortized doubling), so `.build()` is a pure ptr+len retype
   (a Rust-`Vec`-backed store was rejected — its buffer cannot cross the allocator boundary to
-  the C-free that frees `array<T>`). Element set v1 = **Copy scalars + `string`**
+  the C-free that frees `array<T>`). The initial 2026-07-11 element set was **Copy scalars +
+  `string`**
   (`array<string>` deep-drop is shipped end-to-end via read_dir; the builder's own Drop
-  deep-frees pushed-not-frozen strings via the same helper); Copy structs deferred
-  (struct-array store path unverified), Move handles excluded (the settled exclusion).
+  deep-frees pushed-not-frozen strings via the same helper). The Request 8 extension recorded above
+  adds only its closed Copy/owned-string record graph; other Move handles remain excluded.
   Standard Move-handle exclusions (no Result/Option/array riding, print/== rejected).
   Mandatory tests: a builder declared outside a `loop` body survives per-iteration drops
   (#402 `body_locals` range); capture into `par_map`/`spawn` rejected (`ty_capture_is_move`).

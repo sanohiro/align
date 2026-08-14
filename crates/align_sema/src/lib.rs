@@ -1105,6 +1105,7 @@ pub fn region_plain_type_ok(
 pub fn heap_record_error(id: u32, structs: &[StructDef]) -> Option<String> {
     enum Work {
         Enter { id: u32, path: String },
+        Field { ty: Ty, path: String },
         Exit(u32),
     }
 
@@ -1148,26 +1149,27 @@ pub fn heap_record_error(id: u32, structs: &[StructDef]) -> Option<String> {
                 }
                 work.push(Work::Exit(id));
                 for field in definition.fields.iter().rev() {
-                    let child_path = if path.is_empty() {
+                    let field_path = if path.is_empty() {
                         field.name.clone()
                     } else {
                         format!("{path}.{}", field.name)
                     };
-                    match field.ty {
-                        Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::String => {}
-                        Ty::Struct(child) => work.push(Work::Enter {
-                            id: child,
-                            path: child_path,
-                        }),
-                        other => {
-                            return Some(format!(
-                                "field '{child_path}' has excluded type {}",
-                                ty_name(other)
-                            ));
-                        }
-                    }
+                    work.push(Work::Field {
+                        ty: field.ty,
+                        path: field_path,
+                    });
                 }
             }
+            Work::Field { ty, path } => match ty {
+                Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::String => {}
+                Ty::Struct(id) => work.push(Work::Enter { id, path }),
+                other => {
+                    return Some(format!(
+                        "field '{path}' has excluded type {}",
+                        ty_name(other)
+                    ));
+                }
+            },
         }
     }
     None
@@ -51957,11 +51959,29 @@ fn exit_branch(flag: bool) -> i64 {
 
         let source_order = vec![structure(
             "Bad",
-            vec![("first", Ty::Str), ("later", Ty::Struct(99))],
+            vec![
+                ("first", Ty::Str),
+                ("later", Ty::Slice(Scalar::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                }))),
+            ],
         )];
         assert_eq!(
             heap_record_error(0, &source_order).as_deref(),
             Some("field 'first' has excluded type str")
+        );
+
+        let nested_source_order = vec![
+            structure("Child", vec![("inner", Ty::Str)]),
+            structure(
+                "Parent",
+                vec![("first", Ty::Struct(0)), ("later", Ty::Raw)],
+            ),
+        ];
+        assert_eq!(
+            heap_record_error(1, &nested_source_order).as_deref(),
+            Some("field 'first.inner' has excluded type str")
         );
 
         let mut explicit = vec![structure("Explicit", vec![("value", i64_ty)])];
