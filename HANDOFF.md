@@ -61,6 +61,14 @@ arrays, the exact C6 field graph, existing tagged-wrapper closure, whole/per-uni
 stack/boxed recursive cleanup share the existing builder/runtime ABI. Reopen §7.6 only for a public
 or ownership-strategy change after design review.
 
+align-llm Request 12 is the active prerequisite. Branch
+`agent/bounded-canonical-json-design` records the accepted public design in
+`docs/impl/17-library-boundary-prerequisites.md` §7.7: `json.encode_bounded(value, max_bytes: i64)`
+shares `json.encode` bytes and schema, returns an owned `Result<string, Error>`, and rejects a
+negative or exceeded inclusive emitted-byte limit as `Error.Invalid`. Review and merge this design,
+then implement its complete Sema→checked-HIR→MIR→LLVM→runtime owner matrix. Do not build a second
+formatter, estimator pass, dynamic JSON value, or unbounded-encode-then-discard compatibility path.
+
 Out-of-gate suites (everything outside `scripts/test-pr.sh`) are guarded by the
 nightly full-suite workflow, which builds once, runs every compiled test binary
 concurrently through `scripts/run-suite-binaries.sh`, and diffs the observed

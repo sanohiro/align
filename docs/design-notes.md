@@ -420,6 +420,14 @@ runtime inspection remains possible across separate compilation without reflecti
 source/metadata files. Checked metadata and migration/schema identities have versioned exact codecs
 and independent goldens; “canonical” is never an agreement between two copies of the same encoder.
 
+**A bounded encoder is a destination policy, not a second format.** A consumer that must reject an
+oversized persisted artifact cannot safely call an unbounded encoder and discard the result. The
+bounded operation therefore shares the exact typed encode plan and every scalar/escape/descriptor
+writer with the ordinary operation, while its destination enforces an inclusive byte ceiling
+before growth. Success bytes match by construction, the owned result makes allocation visible, and
+limit failure is an ordinary `Result`; no estimator pass, dynamic JSON tree, alternate canonical
+rules, or partial prefix becomes a second way.
+
 **Database configuration is closed, scoped data.** Connection, static statement, prepare, execute,
 transaction, metadata, and EXPLAIN options have distinct finite sums and separate common/native
 slices. Their first-release variants, defaults, and conflicts are part of the API contract, not

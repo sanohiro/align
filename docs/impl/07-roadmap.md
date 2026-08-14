@@ -2013,7 +2013,12 @@ green. **Next: M13** (codegen quality & link hygiene, the pre-LLVM-upgrade wave)
   same view-free record graph only when every array element is a Copy scalar, owned `string`, or an
   admitted record. Its gate pins the exact C6 field graph and closes the newly reachable existing
   Option/Result/user-sum payload paths for a record with a direct string-array field. It adds no
-  runtime ABI; the complete capability shipped on 2026-08-14. The third member of the
+  runtime ABI; the complete capability shipped on 2026-08-14. The align-llm Request 12 follow-on is
+  the accepted `core.json` bounded canonical encoder in
+  `17-library-boundary-prerequisites.md` §7.7: it reuses the existing typed encode plan, returns an
+  owned `Result<string, Error>`, and enforces an inclusive emitted-byte ceiling before allocation
+  growth. Its implementation is pending and adds no dynamic JSON or second format. The third
+  member of the
   grow-then-freeze family (`builder`→`string`,
   `buffer`→bytes, now typed): a builder holds **no views**, so amortized realloc can never
   invalidate one — memory-safe by construction, which is exactly why growable `array<T>`

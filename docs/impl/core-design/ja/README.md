@@ -18,11 +18,11 @@ core の領域を実装・変更する際は、同じ PR 内でここの該当�
 - [option-result.md](option-result.md) — `Option<T>` / `Result<T, E>` / builtin `Error`: コンストラクタ、`?`、`else`、`map_err`、`main` の exit マッピング
 - [array-slice-pipeline.md](array-slice-pipeline.md) — `array<T>` / `slice<T>` / range / `out`、そしてパイプライン語彙の全体 + 終端と fusion のルール
 - [string.md](string.md) — `str` / `string` / `bytes` / `buffer` / `builder` / `template`: メソッド、連結の方針、UTF-8 の立場
-- [json.md](json.md) — `json.encode` / `json.decode`(struct / array / soa ターゲット)、エラー方針、ゼロコピービュー
+- [json.md](json.md) — `json.encode` / pending `json.encode_bounded` / `json.decode`(struct / array / soa ターゲット)、エラー方針、ゼロコピービュー
 - [soa-groupby.md](soa-groupby.md) — `soa<T>`、列操作、`group_by` の集約、`.agg(...)`、`dict_encode`
 - [vec-mask.md](vec-mask.md) — `vecN<T>` / `maskN<T>`、レーン操作、`load`/`store`、`select`/`dot`/`fma`/`sum_where`、`align(N)`
 - [arena-heap.md](arena-heap.md) — `arena {}` と `heap.new` / `box`: region、escape、drop
 - [hash.md](hash.md) — `core.hash`(`hash64`/`hash128`): 状態と設計
 
-各ファイルのテンプレート: **Overview → Signatures (verified) → Type & ownership → Effects → Errors &
+各ファイルのテンプレート: **Overview → Signatures (明示的に pending のものを除き verified) → Type & ownership → Effects → Errors &
 aborts → Regions → 仕様先行(未実装) → Pitfalls → Test anchors。**
