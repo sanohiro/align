@@ -980,7 +980,10 @@ substring views). `std.process`: `spawn`/`wait`/`kill`/`exec`, `exit` (runs clea
 `run_bytes() -> Result<run_bytes, Error>` for arbitrary bytes. Both output handles expose
 `code()`/`stdout()`/`stderr()` as region-bound zero-copy views. An unset capture bound preserves the
 existing unbounded behavior; explicit `0` permits only empty streams, exact-limit output succeeds,
-and overflow kills/reaps the child group, discards partial output, and returns `Error.Invalid`.
+and overflow kills the process group, reaps the direct child, discards partial output, and returns
+`Error.Invalid`. The timeout deadline remains active through direct-child wait after pipe EOF; hard
+pipe/wait failures signal an owned group when present, kill/reap the direct child, and return
+`Error.Code` without partial output.
 `std.env`: `get`/`set` only — `args` comes solely from
 `main(args: array<str>)`, there is no `env.args`. `std.time`: one `i64`-nanosecond timeline, no
 `Duration` type — `now()`

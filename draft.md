@@ -2792,11 +2792,13 @@ raw.stderr() -> slice<u8>
 The config methods are in-place setters on a bound local and yield `()`. A negative `timeout_ns`
 or capture limit is a programmer error and aborts at the call. An unset capture limit preserves the
 existing unbounded behavior; a selected non-negative limit applies independently to stdout and
-stderr, exact-limit output succeeds, and the first byte beyond either limit kills/reaps the child
-group, discards both partial streams, and returns `Error.Invalid`. A selected `0` therefore accepts
+stderr, exact-limit output succeeds, and the first byte beyond either limit kills the process group,
+reaps the direct child, discards both partial streams, and returns `Error.Invalid`. A selected `0` therefore accepts
 only two empty streams. `run` is where `Error.Timeout` (§4 "Result") is produced: the drain checks
-the deadline before each poll/read checkpoint, so an already-observable timeout wins over cap
-overflow; either error is returned without a half-answer. `run_output` and `run_bytes` are Move
+the deadline before each poll/read checkpoint and through direct-child wait after pipe EOF, so an
+already-observable timeout wins over cap overflow; either error is returned without a half-answer.
+Hard pipe/wait failures signal the owned group when present, kill and reap the direct child, and
+return their fixed `Error.Code` without partial output. `run_output` and `run_bytes` are Move
 handles, not by-value structs, because each owns both captured buffers. The text handle validates
 UTF-8 and returns `Error.Invalid` for invalid bytes; the byte handle preserves arbitrary bytes and
 embedded NUL. All four output views are region-bound to their handle.

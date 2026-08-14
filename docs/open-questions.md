@@ -2737,10 +2737,14 @@ independently to stdout and stderr; explicit zero accepts only empty streams, wh
 the existing unbounded behavior. Exact-limit output succeeds. The first observed byte beyond either
 stream's limit kills the child process group, closes the pipes, reaps the direct child, discards both
 partial streams, and returns `Error.Invalid`. Deadline checks precede poll/read processing, so an
-already-observable timeout remains `Error.Timeout` and wins over overflow at that checkpoint.
+already-observable timeout remains `Error.Timeout` and wins over overflow at that checkpoint. The
+deadline stays active through direct-child wait after pipe EOF. Hard poll/read/wait failures use the
+fixed `Error.Code(errno)` mapping, signal an owned group when present, run the same
+direct-kill/close/direct-reap cleanup, and expose no partial output. Only the direct child is reaped
+by this caller; descendants are merely signalled when they remain in the group.
 
 The previously deferred binary tier is the separate `c.run_bytes() -> Result<run_bytes, Error>` terminal. It
-shares all command configuration, capture, cap, timeout, kill, reap, and allocation behavior with
+shares all command configuration, capture, cap, timeout, kill, direct-child reap, and allocation behavior with
 text `run()`, but exposes region-bound `slice<u8>` stdout/stderr views without UTF-8 validation.
 Text `run()` keeps its existing `str` views and `Error.Invalid` UTF-8 rejection. Both outputs are
 single-owner Move handles and never expose truncation or partial success. The authoritative ledger

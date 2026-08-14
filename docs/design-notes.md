@@ -1015,16 +1015,17 @@ empty-only; hidden defaults and magic sentinel values stay out of source.
 
 Text and bytes remain separate operations for the same reason `read_file` and byte views are
 separate. `run()` promises valid `str` views and rejects malformed UTF-8. `run_bytes()` promises the
-same process, timeout, cap, kill, reap, and ownership behavior but exposes arbitrary bytes through
-`slice<u8>`. A flag that changes an accessor's type, silent lossy conversion, or truncation would
-create hidden mode or partial success. Two named terminals over one capture engine keep the type and
-allocation contract visible.
+same process, timeout, cap, kill, direct-child reap, and ownership behavior but exposes arbitrary
+bytes through `slice<u8>`. A flag that changes an accessor's type, silent lossy conversion, or
+truncation would create hidden mode or partial success. Two named terminals over one capture engine
+keep the type and allocation contract visible.
 
 Overflow uses the existing `Error.Invalid` category because the requested operation cannot produce
 a complete value under its declared bound; it adds no process-specific error model. Timeout remains
-distinct and is checked before each poll/read checkpoint. Both paths kill the process group, close
-the capture fds, reap the direct child once, and discard partial bytes, so failure has one cleanup
-shape and never masquerades as a nonzero successful run.
+distinct and is checked before each poll/read checkpoint and while waiting for the direct child after
+pipe EOF. Overflow, timeout, and hard pipe/wait errors signal the owned process group when present,
+kill/reap only the direct child, close the capture fds, and discard partial bytes, so failure has one
+cleanup shape and never masquerades as a nonzero successful run.
 
 ---
 

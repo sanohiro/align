@@ -409,9 +409,9 @@ code 127 in `out.code()` (same convention as `spawn`), **not** an `Err` — the 
    (`()`); `ns == 0` = no timeout (the Slice-4 default), a negative `ns` aborts at build. `c.run()`
    threads the deadline into the two-pipe drain (`poll` with the remaining ns→ms, clamped `>= 1`);
    past the deadline it `SIGKILL`s the child's whole **process group** (the child `setpgid`s into its
-   own group, so a `sh -c "sleep 10"` grandchild is reaped too — otherwise it holds the capture pipes
-   open and wedges the drain), closes both read ends without another EOF drain, `waitpid`s the direct
-   child, and returns `Err(Error.Timeout)` (partial output discarded). `EINTR` on `poll` recomputes
+   own group, so a `sh -c "sleep 10"` grandchild is signalled too — otherwise it holds the capture
+   pipes open and wedges the drain), closes both read ends without another EOF drain, `waitpid`s only
+   the direct child, and returns `Err(Error.Timeout)` (partial output discarded). `EINTR` on `poll` recomputes
    the remaining deadline; `timeout_ns == 0` keeps the infinite `-1` `poll` (Slice-4 behavior exactly).
 6. `c.env(name,value)` + `c.env_clear()` — **SHIPPED.** Both are in-place bound-local setters (`()`).
    `c.env(name, value)` records a `(name, value)` override; `c.env_clear()` marks the child to start
@@ -429,9 +429,11 @@ code 127 in `out.code()` (same convention as `spawn`), **not** an `Err` — the 
 - **P7 (two-pipe deadlock)** — the #1 correctness point. `poll` **both** read fds and drain both, or
   a child filling one pipe while the parent reads the other deadlocks. Test: a child that writes
   >64 KiB to *both* streams and exits nonzero → both fully captured, code correct.
-- **P8 (timeout must actually kill + reap)** — on expiry `SIGKILL`, close both capture reads, and
-  `waitpid`; do not leak a zombie or wedge on a full/escaped pipe. Test: `sleep 10` with a 100 ms timeout →
-  `Err(Timeout)` within ~100 ms, no zombie.
+- **P8 (timeout must actually kill + reap)** — the deadline covers pipe drain **and the wait after
+  pipe EOF**. On expiry `SIGKILL` the process group and direct pid, close both capture reads, and
+  `waitpid` the direct child; do not leak a zombie or wedge on a child that closes fd 1/2 and keeps
+  running. Test: both `sleep 10` and `exec 1>&- 2>&-; sleep 10` with a 100 ms timeout produce
+  `Err(Timeout)` within the bounded tolerance, with no direct-child zombie.
 - **P9 (view region, like http P3)** — `.stdout()`/`.stderr()` are views into `out`; `region_of =
   region_of(out)`. Escape past `out` Drop rejected.
 - **P10 (new-Ty sweep)** — `Ty::Command`/`Ty::RunOutput` must hit every pass in New machinery; a
@@ -490,18 +492,35 @@ measurement command; it does not perform an unbounded run followed by a length c
   layout returns `Error.Invalid`. Physical allocation failure follows Align's locked fatal-OOM
   policy: it aborts immediately without unwinding or a recoverable `Error` value. No child has
   started in either case; process teardown reclaims any earlier preallocation after fatal OOM.
-- Pipe/fork failures retain the fixed errno mapping. Child-side `chdir`/`execvp` failure remains
-  `Ok` with code `127`. A nonzero child exit never outranks a capture failure.
-- The drain checks the monotonic deadline before every `poll` and before processing every positive
-  read. If expired, `Error.Timeout` wins. Otherwise a read that would cross either cap produces
-  `Error.Invalid`. Thus timeout wins whenever it is already observable at a checkpoint; a cap wins
-  only when overflow is observed first. Either error outranks later exit status or UTF-8 validation.
+- Pipe/fork/nonblocking-setup failures retain the fixed errno mapping. Pipe creation and both read-fd
+  `fcntl` operations complete before fork; a hard setup error closes every opened fd, frees bounded
+  preallocation, and starts no child. Child-side `chdir`/`execvp` failure remains `Ok` with code
+  `127`. A nonzero child exit never outranks a capture failure.
+- The shared post-fork engine owns one state machine from the first pipe poll until **both** streams
+  reached EOF and the direct child was reaped. It checks the monotonic deadline before every `poll`,
+  before interpreting each descriptor/read result in stdout-then-stderr order, and before every
+  `waitpid(WNOHANG)` checkpoint after pipe EOF. If expired, `Error.Timeout` wins. Otherwise a positive
+  read that would cross either cap produces `Error.Invalid`; `POLLNVAL`, a non-`EINTR` poll failure,
+  or a non-`EINTR`/non-`EAGAIN` read failure returns the fixed `Error.Code(errno)` mapping. `POLLNVAL`
+  maps deterministically to `EBADF`. Thus an already-observable timeout wins, otherwise the first
+  stdout-before-stderr hard pipe error or overflow wins. Any capture error outranks later exit status
+  or UTF-8 validation.
+- Once both pipes reach EOF, an untimed run may use blocking `waitpid`; a timed run repeatedly checks
+  the deadline, calls `waitpid(WNOHANG)`, and sleeps without allocation using zero-fd `poll` for at
+  most `min(remaining, 1 ms)`. It therefore returns promptly when a child closes stdout/stderr and
+  continues running, instead of entering an unbounded wait. `EINTR` retries from the deadline
+  checkpoint. A hard `waitpid` error uses its fixed errno mapping; `ECHILD` means the direct child is
+  already reaped and never authorizes a partial successful result.
 - After both streams reach EOF, text `run()` validates stdout first and stderr second; either invalid
   stream returns the same `Error.Invalid`, so no partial output or stream identity is exposed.
-- All recoverable error paths leave the result slot null, release both pipe fds and capture
-  allocations, kill the process group when a child exists, and reap the direct child exactly once.
-  Fatal OOM has no cleanup or unwind path and occurs before pipe creation/fork. No recoverable error
-  returns partial bytes, an exit code, or a truncation marker.
+- Every post-fork timeout/overflow/hard-pipe/hard-wait failure snapshots its winning status, sends
+  `SIGKILL` to the owned process group when this run created one and always to the direct pid, closes
+  both read fds, retries direct-child `waitpid` on `EINTR` (`ECHILD` is already-reaped), frees
+  capture/output state, and returns the
+  original status with the result slot null. Only the direct child is reaped by this caller; in-group
+  descendants are signalled, and `setsid` descendants remain outside the contract. Fatal OOM has no
+  cleanup or unwind path and, for a bounded run, occurs before pipe creation/fork. No recoverable
+  error returns partial bytes, an exit code, or a truncation marker.
 
 ### Ownership, lifetime, allocation, and concurrency
 
@@ -515,20 +534,25 @@ For a bounded run, the runtime allocates one exact `L`-byte capture layout per s
 mode-specific output-handle shell **before** pipe creation and fork; `L == 0` allocates neither byte
 layout. No capture allocation or reserved capture capacity is larger than `L`, and the two live
 capture layouts total exactly `2L`. The existing fixed 64 KiB stack read scratch, the command's
-argv/cwd/environment storage, two pipe descriptors, and the small output handle are outside that
-declared capture-store bound. Reads land in the fixed scratch first and copy only when the complete
-chunk fits the selected stream's remaining capacity. Success fills the existing shell and transfers
-the two layouts without another allocation; every recoverable error frees all three preallocated
-objects. Fatal OOM terminates before pipe creation/fork under the process-wide allocation rule.
+argv/cwd/environment storage, two pipe descriptors, a fixed stack `[PollFd; 2]`, and the small output
+handle are outside that declared capture-store bound. Bounded execution performs **no heap allocation
+after fork**: the poll descriptor array is filled in place, the post-EOF wait uses zero-fd `poll`, and
+reads land in the fixed scratch then copy only when the complete chunk fits the selected stream's
+remaining capacity. Success fills the existing shell and transfers the two layouts without another
+allocation; every recoverable error frees all three preallocated objects. Fatal OOM therefore
+terminates before pipe creation/fork under the process-wide allocation rule. Both read ends are made
+nonblocking before fork; a failed `F_GETFL`/`F_SETFL` is a recoverable setup error, never a best-effort
+post-fork assumption.
 Unbounded callers retain the existing growable `Vec` behavior and make no memory-bound claim.
 
 A command with either a positive timeout or an explicit capture bound creates the child as a process
-group leader. Timeout or overflow sends `SIGKILL` to the group and also to the direct pid as a
-race/fallback, closes both read ends without another EOF drain, then waits for the direct child with
-`EINTR` retry. Descendants that deliberately escape with `setsid` are outside the process-group
-contract; closing the read ends ensures they cannot keep the caller blocked. Distinct commands share
-no mutable state, so concurrent runs are independent. The same `command` cannot be mutably configured
-during a run in safe Align, and one synchronous run completes before that command is reused.
+group leader. Timeout, overflow, or a hard post-fork capture/wait error sends `SIGKILL` to that owned
+group when present and always to the direct pid, closes both read ends without another EOF drain, then
+waits for the direct child with `EINTR` retry. Descendants that deliberately escape with `setsid` are
+outside the process-group contract; closing the read ends ensures they cannot keep the caller
+blocked. The caller never claims to reap descendants. Distinct commands share no mutable state, so
+concurrent runs are independent. The same `command` cannot be mutably configured during a run in safe
+Align, and one synchronous run completes before that command is reused.
 
 ### Runtime and cache identity
 
@@ -574,11 +598,13 @@ source-derived frontend/object cache entry.
 |---|---|
 | Setter formation and validation | Sema/HIR/MIR/codegen/runtime route `max_capture_bytes(i64)` only on a bound `command`; wrong arity/type and temporary receivers diagnose; negative aborts before side effects; `0`, overwrite, and unset states are distinct. Owner: `m11_process_command::command_capture_bound_formation_and_state`. |
 | Exact-limit text success | Shared drain admits empty, `L`, stdout-only, stderr-only, and simultaneous `L`/`L`; `run_output` retains existing code/text views. Owner: `command_capture_exact_limit_and_reuse`. |
-| One-byte overflow | Either stream at `L + 1`, including simultaneous pipe pressure, returns `Error.Invalid`, exposes no output, kills the group, closes fds, and reaps once. Owner: `command_capture_overflow_kills_group_and_discards_partial`. |
-| Timeout/cap/exit/UTF-8 precedence | Checkpoint order above is exercised for timeout-before-overflow, overflow-before-timeout, nonzero-overflow, and in-bound invalid UTF-8. Owner: `command_capture_error_precedence`. |
+| One-byte overflow | Either stream at `L + 1`, including simultaneous pipe pressure, returns `Error.Invalid`, exposes no output, kills the group/direct pid, closes fds, and reaps the direct child once. Owner: `command_capture_overflow_kills_group_and_discards_partial`. |
+| Timeout/cap/exit/UTF-8 precedence | Checkpoint order above is exercised for timeout-before-overflow, overflow-before-timeout, nonzero-overflow, in-bound invalid UTF-8, and a child that closes both streams then remains alive beyond the deadline. Owner: `command_capture_error_precedence` plus `command_timeout_covers_post_eof_wait`. |
+| Hard pipe/wait errors | Inject non-`EINTR` poll, `POLLNVAL`, stdout/stderr hard read, and post-EOF `waitpid` errors. Timeout wins when already observable; otherwise stdout precedes stderr, the original fixed errno survives cleanup, no partial result escapes, an owned group (if present) and direct pid are killed, fds close, and the direct child is reaped or already `ECHILD`. Owner: `command_capture_hard_io_errors_are_terminal`. |
+| Post-fork lifecycle | Parameterize `{pipes open/EOF} × {child live/exited} × {untimed/timed/bounded}`. Success requires both EOF and a reaped direct child; a timed EOF/live child uses WNOHANG plus allocation-free zero-fd poll until exit/deadline. Owner: `command_capture_lifecycle_state_matrix`. |
 | Binary tier | `run_bytes` preserves invalid UTF-8 and embedded NUL byte-for-byte, exposes region-bound byte views, supports nonzero exit, and shares exact-cap behavior. Owner: `command_run_bytes_preserves_arbitrary_output`. |
 | Move and Drop | Formation, construction, `Result` move-in/out, `?`, `else`, `match`, `map_err`, replacement, return, source nulling, and early exit drop each output once; aggregate/capture/temporary and escaped views reject. Owners: `m11_process_command` ownership matrix plus the checked-HIR variant tripwire. |
-| Allocation and malformed limits | Exact layouts are allocated before fork; zero allocates no byte stores; unrepresentable layout is `Invalid`; physical allocation failure aborts without unwind before a child exists; capture capacity never exceeds `L`. Owner: subprocess fatal-OOM failpoints for first/second/shell allocation plus `command_capture_allocation_bound`; a child-side marker proves fork was never reached. |
+| Allocation, descriptor setup, and malformed limits | Exact layouts/shell are allocated before pipes/fork; zero allocates no byte stores; unrepresentable layout is `Invalid`; physical allocation failure aborts without unwind before a child exists; both read fds become nonblocking before fork or setup fails cleanly; fixed poll/scratch/wait storage performs no bounded post-fork allocation; capture capacity never exceeds `L`. Owners: subprocess fatal-OOM failpoints for first/second/shell allocation, `fcntl` failpoints, and `command_capture_allocation_bound`; child-side markers prove fork was never reached. |
 | Reuse and concurrency | One command repeats text and byte runs with the persisted/overwritten bound; two independent commands run concurrently without shared state. Owner: `command_capture_reuse_and_independent_concurrency`. |
 | Generic/interface/per-unit/cache parity | A function returning `Result<run_bytes, Error>` has identical whole-program and per-unit type/ABI; interface round-trip and exact edit/revert cache identity agree. Owners: process interface/per-unit/cache tests. |
 | Existing behavior | No-setter `run()` remains unbounded and byte-for-byte compatible; cwd/env/env_clear/timeout, large dual-pipe, nonzero exit, and text view owners remain green. Owner: complete `m11_process_command` target. |
@@ -588,6 +614,15 @@ bounded text/byte throughput and the maximum live capture-layout bytes for the 6
 consumer limits versus the existing unbounded path. It is evidence for the resource contract, not a
 correctness gate.
 
+### Closure matrix reopened: post-fork lifecycle
+
+The second review found that the first matrix bounded pipe capture but stopped before direct-child
+termination. The reopened axis is `{pipe state} × {direct-child state} × {deadline state} ×
+{terminal trigger}`. The shared engine is now one indivisible capability from pre-fork setup through
+EOF, direct-child wait, and terminal cleanup. Splitting the new producer/type work from this runtime
+consumer would leave the existing timeout hang and truncated-success path reachable, so the design
+and implementation remain one mergeable capability.
+
 ## Design-review finding closure
 
 | Finding | Ledger-first closure |
@@ -596,6 +631,10 @@ correctness gate.
 | P1 HIR and native owner ledgers omitted the new surface | `docs/impl/19-hir-validation-ledger.md` reserves the five exact expression rows and malformed fixtures; `docs/impl/20-runtime-abi-ledger.md` reserves all six keyed symbols, declarations, attributes, counts, and registry owners. |
 | P2 compiler type encodings were implementation-defined | The canonical codec keeps version 3 and appends exact `Ty`/`Scalar` tags 60/36 with bidirectional and malformed vectors; interface format 6 uses its existing named-type record with an exact byte vector. |
 | P2 the external request register remained proposed | The sibling register records the accepted per-stream/text/bytes/ownership/error contract and the final reviewed design commit; the edit remains uncommitted in that repository as required. |
+| P1 deadline ended at pipe EOF | The reopened lifecycle keeps the deadline active until direct-child reap; EOF/live uses `waitpid(WNOHANG)` plus allocation-free zero-fd `poll`, with its own owner. |
+| P1 bounded poll allocated after fork | The allocation row requires exact stores/shell before pipes, fixed stack poll/scratch state, pre-fork nonblocking setup, and no bounded post-fork heap allocation. |
+| P2 hard poll/read errors became partial success | The precedence and hard-I/O rows map the first deterministic errno, run the same kill/close/direct-reap cleanup, preserve the original status, and expose no output. |
+| P2 normative group reaping was overstated | Specifications now say the process group is signalled while only the direct child is reaped; escaped descendants remain outside the contract. |
 
 ## Acceptance gate
 

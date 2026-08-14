@@ -65,9 +65,10 @@ align-llm Requests 11 and 12 have accepted designs. Request 11 is the active imp
 capability. Its bounded process-capture contract is in
 `docs/impl/std-design/process.md`: `max_capture_bytes` is a per-stream command-local bound,
 `run_bytes` is the explicit arbitrary-byte terminal, and timeout/cap precedence, exact allocation,
-process-group cleanup, interface identity, and owner cells are fixed in one ledger. Implementation
-must follow that ledger without reopening the public surface. Request 12's design merged in #805 and
-is queued next: `docs/impl/17-library-boundary-prerequisites.md` §7.7 fixes
+allocation-free post-fork bounded drain, deadline-aware post-EOF wait, terminal pipe-error cleanup,
+process-group signalling/direct-child reap, interface identity, and owner cells are fixed in one
+ledger. Implementation must follow that ledger without reopening the public surface. Request 12's
+design merged in #805 and is queued next: `docs/impl/17-library-boundary-prerequisites.md` §7.7 fixes
 `json.encode_bounded(value, max_bytes: i64)` as the owned, fallible, inclusive-byte-bounded sibling
 of `json.encode`. Its implementation must reuse the existing formatter and complete the recorded
 Sema→checked-HIR→MIR→LLVM→runtime owner matrix; do not add an estimator pass, dynamic JSON value, or
