@@ -421,6 +421,13 @@ Running `scripts/run-suite-binaries.sh` with no arguments reproduces the
 nightly's judgement locally. The nightly is a detector, not a second PR gate: a
 red nightly is triaged against the manifest and does not block an unrelated PR.
 
+`align_repl`'s two leaf owner binaries (`tests/session.rs`, `tests/e2e.rs`) are
+nightly-only by design and are deliberately absent from the bounded gate's
+package list: each entry they exercise is a real compile-and-link, so the suite
+costs seconds rather than milliseconds, and `align-repl` is a tool over the
+compiler rather than a stage inside it (`docs/impl/22-repl-plan.md` §10). They
+carry no `scripts/known-failures.txt` entry and must be green.
+
 ## pkg.db owner-test harness
 
 The `pkg.db` end-to-end suites (`pkg_db_a1`, `a2`, `callbacks`, `pool`, `q2`,
