@@ -34,21 +34,36 @@ controller は provider API/credential を使わない。通常の GitHub public
 | Field | Exact contract |
 |---|---|
 | Public producer | `/opt/align-evidence/v1/bin/align-json-escape-evidence run --repository REPO --baseline BASE --candidate CANDIDATE --review-log REVIEW_LOG --output-dir NEW_DIR`。root-owned launcher/module は merged evidence implementation から install され benchmark account から immutable、hash は host profile に埋め込む。verified `BASE` object から controller/profile/key blob を直接読み、installed copy と byte/mode equality を確認してから他の処理を行う。path は absolute、OID は lowercase 40-hex、`NEW_DIR` は不存在。override/追加引数なし。 |
-| Public verifier | `/opt/align-evidence/v1/bin/align-json-escape-evidence verify --report REPORT --signature SIGNATURE --expected-baseline BASE --expected-candidate CANDIDATE --pr-body PR_BODY`。bytes/signature と report/review/preflight binding を明示OID/PR bodyへ照合する。local は diagnostic のみ。acceptance は trusted-base CI が GitHub event 由来の `BASE`/`CANDIDATE`/`PR_BODY` を渡す。同じ installed verifier は build/checkout/benchmark/network/repository mutation を行わない。 |
-| Public merge verifier | `/opt/align-evidence/v1/bin/align-json-escape-evidence verify-merge --repository REPO --report REPORT --signature SIGNATURE --merge MERGE --output-dir NEW_DIR`。provider responseのexact object fetch後、reportを再verifyし、isolated raw-object pathで`MERGE`を読み、local target ref、two parents、treeをsigned expectationへ照合してexact `merge-verification.json`/`.sig`を出力。`NEW_DIR`は不存在、overrideなし。 |
+| Public verifier | `/opt/align-evidence/v1/bin/align-json-escape-evidence verify --report REPORT --signature SIGNATURE --expected-baseline BASE --expected-candidate CANDIDATE --pr-body PR_BODY --review-attestation REVIEW_ATTESTATION`。bytes/signature/report/review/preflightをexplicit OID、PR body、trusted review attestationへ照合。localはdiagnostic、acceptanceはtrusted-base CIがGitHub event/APIからcheckout外で入力を作る。build/checkout/network/mutationなし。 |
+| Public merge verifier | `/opt/align-evidence/v1/bin/align-json-escape-evidence verify-merge --repository REPO --report REPORT --signature SIGNATURE --merge MERGE --output-dir NEW_DIR`。provider response exact object fetch後、reportを再verify、raw-object pathで`MERGE`を読み、local target first-parent chain、parents/treeを照合しexact `merge-verification.json`/`merge-verification.json.sig`を出力。`NEW_DIR`不存在、overrideなし。 |
+| Trusted review adapter | trusted-base CIだけがevent repo/PRのGitHub review APIをjob tokenでquery。PR author、write roleなし、dismissed/stale/duplicate/wrong commit、exact report `log_sha256`なしをreject。canonical `REVIEW_ATTESTATION`をcheckout外で作りverifierへ渡す。token/raw responseはcontroller/candidate/report/container/PR argumentへ渡さない。 |
 | Ambient state | semantic default なし。empty environment に fixed `PATH`, `LC_ALL=C`, `TZ=UTC`, empty `HOME`, `CARGO_NET_OFFLINE=true` と controller-created descriptor/config だけを置く。ambient Git/Cargo/Rust/Docker/locale/proxy/credential/target/tuning は渡さない。 |
-| Result | successはlock保持中にprivate stagingの`report.json`/`report.json.sig`とdirectoryをfsync、unlock、stagingを`NEW_DIR`へatomic rename、parent fsync、absolute path出力、zero exit。threshold failureも同sequenceでsigned `regression`をpublishしexit 1。unlock/rename/parent-fsyncを含む他failureはstaging/unpublished directoryを削除、`NEW_DIR`不存在、accepted pathなし。 |
+| Result | successはlock中にprivate report/signature/directoryをfsync、profile-global publication reservationをcreate/fsync、unlock、`NEW_DIR`へatomic rename、parent fsync、reservation remove/fsync、path出力。reservation中のsecond invocationはrepository/image/container前reject。threshold failureも同sequence。failureはstaging/output/reservationを削除しpathなし。crash/cleanup failureはreservationをfail-closedで残しadmin recovery。 |
 | Controller owner | checked-in Python 3 controller、root-owned installed launcher、`scripts/` と `tests/benchmark_evidence/` の fixture tests。installed/source relation、installer manifest、interpreter、Git、Docker client/daemon、`ssh-keygen`、kernel、OCI image、host profile、executable SHA-256 をすべて記録する。candidate file は evidence root にならない。 |
 | Persisted format | canonical UTF-8 JSON `align.json_escape_benchmark_evidence/v1` と `align.json_escape_benchmark_merge_verification/v1`。それぞれhost Ed25519 keyとfixed namespaceでbyte-for-byte署名。unknown/missing/duplicate/reordered/non-ASCII key、non-integer/float、invalid UTF-8/escape、trailing/noncanonical bytesはreject。 |
 | Ownership/allocation | controller が temp dir、pipe、child、container、capture、report staging、cleanup を所有。benchmark child は stdin `/dev/null`、private stdout/stderr のみ。capture ceiling は profile 固定。report/signature/repository administration/controller/Docker socket/signing key/other revision writable dir は child に渡さない。 |
-| Concurrency | repository inspection 前に profile の host-global exclusive lock を取得し、signing/cleanup まで保持。baseline/candidate は overlap しない。fixed pair order だけが schedule。 |
+| Concurrency | repository inspection前からsigning/cleanupまでhost-global lock。unlock前にprofile-global publication reservationをinstallし、publication完了までlater invocationはrepository/image/container work前にreject。baseline/candidate overlapなし。 |
 | Prerequisites | benchmark-input slice、Request 7 の両 language prerequisite、本 design、evidence implementation、pinned image、host profile/public key、adversarial owner が merge 後にのみ `BASE` を選ぶ。`BASE` は当時の target tip かつ最初の Request 7 commit の exact parent。 |
-| Acceptance | valid signature、`pass` verdict、exact PR/preflight/review binding、merge 時の unchanged target base、identical protected input、5 field 各10 sample、全 exact ratio `<=1.05` が必要。correctness test は別の deterministic owner。 |
+| Acceptance | valid signature、`pass`、exact PR/preflight/trusted-review binding、unchanged target base at merge、final fetched targetからmergeがreachableであるsigned merge artifact、identical protected input、5 field各10 sample、全ratio `<=1.05`。 |
 
 `REVIEW_LOG` は candidate repository 外の標準 pre-open review log。`CLEAN` なら candidate へ直接、
 `FINDINGS` なら reviewed ancestor と `CANDIDATE` までの complete findings-fixed chain に bind する。
-controller は log SHA-256/binding を記録するが prose の authenticity は主張しない。trusted-base PR
-attestation も同じ candidate、merge base、review head/reviewer/state を持つ必要がある。
+controllerはlog SHA-256/bindingを記録するがcaller proseをauthenticとしない。
+
+PR open後、independent reviewerがbodyにexact one line
+`ALIGN_REVIEW_LOG_SHA256=<report log_sha256>`を持つnative GitHub reviewをsubmit。trusted-base CIはAPIから
+次のcanonical single-line JSON + LFを作る。
+
+```text
+ReviewAttestation = {"repository":name,"pull_request":u64,"review_id":u64,
+  "reviewer":name,"review_commit":hex40,"review_state":ReviewState,
+  "review_log_sha256":hex64,"submitted_at":time}\n
+```
+
+`clean`はGitHub `APPROVED` on candidate、`fixed`はGitHub `COMMENTED` + `FINDINGS` on `review_head`で、
+PRはcomplete disposition/repair chainを持つ。adapterはrepository/event PR/head/base、reviewer role/ID、commit/
+state/body digest/reportを照合。missing/stale/author-owned/duplicate/edited/substitutionはreject。fixture API responseが
+candidate-controlled content前に全failureを所有。
 
 ## Merged profile と fixed identity
 
@@ -115,10 +130,14 @@ rust-toolchain.toml            when present in either revision
 bench/.cargo/**                when present in either revision
 bench/json_decode/**
 bench/json_soa/**
+bench/json_escape/evidence/**
+scripts/benchmark_evidence/**
+tests/benchmark_evidence/**
 ```
 
 presence/path/mode/type/blob/manifest equalityをcandidate実行前に要求し、script/kernel/harness/manifest/lock/
-generator/output/timing/configすべてを含む。
+generator/output/timing/config、profile/public key、installed source/manifest、adversarial ownerすべてを含む。
+変更はseparate reviewed profile implementation/requalificationが必要でRequest 7 candidateと併存不可。
 
 ## Container/process boundary
 
@@ -279,7 +298,7 @@ GitModeOrEmpty = "" | GitMode
 PathKindOrEmpty = "" | PathKind
 OidOrEmpty = "" | hex40
 DigestOrEmpty = "" | hex64
-ReviewState = "clean" | "findings-fixed"
+ReviewState = "clean" | "fixed"
 Verdict = "pass" | "regression"
 FieldOrEmpty = "" | Field
 RevisionArm = "baseline" | "candidate"
@@ -305,20 +324,38 @@ benchmark順はdecode/soa、各preparation B/C、warmup B/C、pair 1..10 balance
 同benchmark/revisionの全runで再verify。sample fieldは2/3順、field resultは5順。original sampleはpair順、
 sortedはnondecreasing exact permutation。ratio numerator/denominatorはcandidate/baseline middle sum。
 
-cleanup countはzero、bool true。host lock保持中にsignしprivate staging files/directoryをdurableにする。
-unlock後atomic rename・parent fsyncしてからpathをprint。unlock failureはstagingを削除、rename/parent-fsync
-failureもvisible but unaccepted directoryを削除する。`first_failed_field`はpassでempty、regressionで最初の
+cleanup countはzero、bool true。host lock保持中にsign/private staging fsync後、profile-fixed root-owned
+publication reservationをno-follow exclusive create・fsync。unlock後atomic rename・output parent fsync・reservation
+remove・reservation directory fsync後だけpathをprint。reservation存在中のlater invocationはrepository前reject。
+failureはstateを削除し、surviving reservationはoutputをunacceptedとしadmin recoveryまでfuture runをblock。
+reservation removalはalready-signed measurement cleanup外のpublication postconditionで、成功までaccepted pathなし。
+`first_failed_field`はpassでempty、regressionで最初の
 false field。conditional/omitted memberなし。
 
-`clean` reviewは`review_head=candidate`、`repair_commits=[]`。`findings-fixed`はreviewed ancestorを
+`clean` reviewは`review_head=candidate`、`repair_commits=[]`。`fixed`はreviewed ancestorを
 `review_head`とし、その後candidateまでのnonempty exact first-parent順を`repair_commits`に記録する。
 各commitはcandidate `commits`に同順で含まれる。どちらも`review_base=baseline`。
+literalはrepository preflight stamp/PR markerとexact一致。log `CLEAN`は`clean`のみ、`FINDINGS`+
+nonempty accepted repair chainは`fixed`のみにmap。
 `ToolIdentity.source_manifest_blob`は`source_commit`内のcanonical installation manifest blob、
 `source_manifest_sha256`はそのbytesのhashで、manifestがtoolの全installed fileを固定する。
 
 `body_sha256`のpreimageはexact 45 ASCII bytes
 `align-json-escape-benchmark-evidence-body-v1\0` + LFなしcanonical `Body`。recursiveではない。signatureは
 final LF込みcomplete outer recordをnamespace `align-json-escape-benchmark-evidence-v1`で署名。
+
+各`.sig`はpinned OpenSSH `SSHSIG` v1 ASCII armorでraw Ed25519ではない。exact header
+`-----BEGIN SSH SIGNATURE-----\n`、binary SSHSIGのRFC 4648 standard base64（70 ASCII/line、最終は
+1..70、required `=` padding保持）、各line LF、exact footer `-----END SSH SIGNATURE-----\n`。CR/space/
+blank/noncanonical padding/wrap/trailingをreject。SSH stringはu32 big-endian length。binaryはmagic `SSHSIG`、
+version 1、profile Ed25519 public-key blob、exact namespace、empty reserved、`sha512`、そして
+`ssh-ed25519` + 64-byte signature。
+
+signing preimageはexact magic `SSHSIG`、SSH string namespace、empty reserved、SSH string `sha512`、complete
+canonical message bytesの64-byte SHA-512を持つSSH string。report/merge namespaceはそれぞれ
+`align-json-escape-benchmark-evidence-v1` / `align-json-escape-benchmark-merge-verification-v1`。
+armor/binary field/lengthをdecode・canonical re-encode equality後のみpinned `ssh-keygen -Y sign/verify`。
+signature SHA-256はfinal LF込みcomplete armorをhash。
 
 producerはBody encode→domain hash→Report encode→duplicate-reject parse/re-encode equality後にsign。verifierは
 schema/canonical/body digest/relationship/sample/median/comparison/expected OID/PR/identity/key/signatureを再計算。
@@ -341,10 +378,12 @@ MergeVerification = {
 
 Reportと同じscalar/string/order/whitespace/UTF-8/rejection grammar。detached signatureはfinal LF込みを
 namespace `align-json-escape-benchmark-merge-verification-v1`で署名。report/signature hashはcomplete bytes。
-`target_oid=merge_oid=MERGE`、parentsはbaseline/candidate、treeはreportのexpected tree。全relationship後に
+`merge_oid=MERGE`、`target_oid`はfetched target tipでmergeをfirst-parent chainに含み、parentsはbaseline/
+candidate、treeはreportのexpected tree。全relationship後に
 raw merge-object SHA-256を記録。golden/mutation/wrong parent/tree/ref/stale/swap ownerを持つ。
-同host lockをinspection前に取得し、private stage→file/dir fsync→unlock→atomic rename→parent fsync→
-path publicationの同sequenceを使う。failureは`NEW_DIR`不存在。
+同host lockをinspection前に取得し、private stage→file/dir fsync→durable publication reservation→unlock→
+atomic rename→parent fsync→reservation remove/directory fsync→path publicationの同sequenceを使う。
+surviving reservationがあればoutputはunacceptedでlater workをblock。
 
 accepted PRはcomplete report/signatureをimmutable artifactまたはbase64-safe attachmentで保持しverifier結果を
 記録。merge後、trusted hostがmerge-verification record/signatureをimmutable artifactに保存しPRからlink。
@@ -354,11 +393,12 @@ non-inheritable fdでのみopen。sign failureはoutputなし。
 ## Review/base drift/integration
 
 coherent candidateのcomprehensive review（exact CLEANまたはone findings-fixed chain）後にmeasurement。以後の
-commit/amend/rebase/merge/protected changeはreport無効。publication時preflight/PR attestationをcandidate/base/
+commit/amend/rebase/merge/protected changeはreport無効。publication時preflight/trusted review/PR markerをcandidate/base/
 reviewへ照合。merge直前target OIDは`BASE`必須。違えばnew tipへrebaseしnew baseline/review/evidence/preflight。
-mergeはexpected headをbind。provider responseのexact OIDをtrusted hostがfetchし`verify-merge`を実行。local targetが
-同OID、first parent BASE、second CANDIDATE、tree candidate-identicalのときだけsigned artifactをaccept。
-race/unavailable objectはunshippedでdependent work前にrevert、lifecycleを進めない。
+mergeはexpected headをbind。provider response exact OIDをfetchし`verify-merge`。mergeがfetched targetのfirst-parent
+chain上、parents BASE/CANDIDATE、tree candidate-identicalのときだけsigned artifact。artifact store/link後、
+trusted lifecycle adapterがtargetを再fetchしreachabilityを再verify後のみadvance。normal descendantはvalid、
+MERGEを除くforce-push/replacement/movementはartifact/lifecycleをinvalidate。unavailable/fetch failureはunshipped。
 
 current hosting transactionはexpected base OIDをatomicに受けないため、implementationはdisposable remoteで
 fail-closed merge/revert ownerを証明するか、endpoint/principal/repo/expected base+head/request/response/secretを
@@ -378,22 +418,22 @@ bindするprovider CASをreviewed amendmentで導入する。base ruleを弱め�
 
 | Cell | Owner / exact regression |
 |---|---|
-| Trusted bootstrap/CLI | installed producer/verifier/merge-verifier/monitorをmanifest/baseline blobへ照合。candidate/PATH/PYTHONPATH/CWD substitution、replacement、引数/path/OID/output/ambient異常をmutation前にreject。CIがexpected OID/PRを供給。`benchmark_evidence_bootstrap_cli_matrix`. |
+| Trusted bootstrap/CLI | installed producer/verifier/merge-verifier/monitorをmanifest/baseline blobへ照合。candidate/PATH/PYTHONPATH/CWD substitution、replacement、引数/path/OID/output/ambient異常をmutation前にreject。trusted CIがexpected OID/PRとfixture-owned GitHub API responseから作ったcanonical review attestationを供給し、wrong repository/PR/reviewer role/review ID/commit/state/body digest、author review、dismiss/stale/duplicate、API/file substitutionをcandidate content読取前にreject。`benchmark_evidence_bootstrap_cli_matrix`. |
 | Raw identity/construction | clone/worktree、packed/loose、reviewed symlink、hostile Git state、missing/raw swap/path collision/mutation race。`benchmark_evidence_raw_object_matrix`. |
 | Revision binding | exact parent chain/two-sided add-delete-modify diff、wrong target/ancestry/merge/ref/stale review/drift、missing deletion、wrong old/new mode/type、incomplete tree union。`benchmark_evidence_revision_binding_matrix`. |
-| Protected input | required/optional config/manifest/lock/script/kernel/harness/generator/output/timingのpresence/path/type/mode/bytes mutationをcandidate前reject。`benchmark_evidence_protected_input_matrix`. |
+| Protected input | required/optional config/manifest/lock/script/kernel/harness/generator/output/timing、evidence profile/public key、installed-source manifest、controller/verifier/monitor source、evidence owner testのpresence/path/type/mode/bytes mutationをcandidate前reject。`benchmark_evidence_protected_input_matrix`. |
 | Toolchain/cache/offline | image/tool/cache/config、swap、lock/cache/network/write。`benchmark_evidence_toolchain_matrix`. |
 | Native host/isolation | native x86_64 success、ARM/emulation/mismatch/quota/exposure reject。child内latched event/monitor loss、duplicate/reused/overlap range、wrong child ID、orphan observationをreject。`benchmark_evidence_host_isolation_matrix`. |
 | Descriptor/environment | 全fd collision/CLOEXEC/mapping/env/truncation/capture。`benchmark_evidence_process_boundary_matrix`. |
 | Schedule | 4 exact prepare + sealed artifactの後にwarmup/pair。measurement中build/Cargo/compiler、artifact mutation、overlap/reorder/retry/skip/crash/timeout/signal/nonzero。`benchmark_evidence_schedule_matrix`. |
 | Inner/outer statistic | synthetic odd/even ns sum、half-us tie、middle/outlier/overflow、round-half-up quantization/rendering、10 exact token、1.05 boundary。`benchmark_evidence_statistic_matrix`. |
 | Parser/arithmetic | exact line/row/fieldと全malformed。`benchmark_evidence_parser_ratio_matrix`. |
-| Report/signature | report/merge-verification bidirectional goldenと全field/order/type/width/duplicate/escape/trailing/derived/key/namespace/stale。`benchmark_evidence_report_v1_matrix`. |
-| Failure/cleanup | 全phase error/timeout/signal/disk/file+dir+parent fsync/unlock/rename/remove/sign。accepted path/staging/lock残存なし。`benchmark_evidence_cleanup_matrix`. |
-| Concurrent | second runはGit/image前fail、完全cleanup後lock release。`benchmark_evidence_exclusive_run`. |
+| Report/signature | report/merge-verification bidirectional goldenと全field/order/type/width/duplicate/escape/trailing/derived mutation、exact SSHSIG binary/preimage、armor header/footer/LF/base64/wrap/padding、wrong key/namespace/profile/stale。`benchmark_evidence_report_v1_matrix`. |
+| Failure/cleanup | 全phase error/timeout/signal/disk/file+dir+parent+reservation fsync/unlock/rename/reservation remove/ordinary remove/sign。accepted pathなし。全resourceが消えるか、surviving fail-closed reservationがacceptとlater workを阻止。`benchmark_evidence_cleanup_matrix`. |
+| Concurrent | lockまたはpublication reservation中のsecond runはGit/image/container前fail。lockはmeasurement cleanupとdurable reservation後にreleaseし、accepted publishはreservationをremove+fsync。crash/restart/admin recoveryもfail-closed。`benchmark_evidence_exclusive_run`. |
 | TOCTOU | executable/image/source rename/replacement/swap。`benchmark_evidence_bound_object_swap_matrix`. |
-| Forged/stale | unsigned/edit/replay/truncate/concat/wrong namespace、PR mismatch。`benchmark_evidence_stale_forged_matrix`. |
-| Base/integration race | target move、precheck race、unavailable/wrong response OID、local-target mismatch、wrong parent/tree、signed artifact mutation、revert failure、exact merge。`benchmark_evidence_merge_race_matrix`. |
+| Forged/stale | unsigned/edit/replay/truncate/concat/wrong namespace、PR/preflight/trusted-review mismatch。`CLEAN`は`clean`のみ、accepted `FINDINGS` + nonempty repair chainは`fixed`のみにmap。`benchmark_evidence_stale_forged_matrix`. |
+| Base/integration race | target move、precheck race、unavailable/wrong response OID、local-target mismatch、wrong parent/tree、signed artifact mutation、normal later first-parent descendant、final trusted refetch前のforce-push/removal、revert failure、exact merge。final target first-parent chainにmergeが残らなければlifecycleを進めない。`benchmark_evidence_merge_race_matrix`. |
 
 testsはfixture executor/fake daemon/disposable repo+remote/test keyを使いperformance workload/wall-clock ratioを
 ordinary testにしない。native host qualification/final measurementはmanual named evidence。
@@ -420,6 +460,17 @@ ordinary testにしない。native host qualification/final measurementはmanual
 | verifierがactual mergeを観測不能 | installed `verify-merge`がfetched response OIDを読み、report/target/raw merge/parents/treeにbindしたsecond signed artifactを出す。 |
 | unlock failureがaccepted-looking outputを残す | lock中はprivate staging、unlock後だけatomic publish、unlock/publication failureはunpublished stateを削除。 |
 | Japaneseにundefined `hex128` | 両languageはused `hex40/64`のみでschemaも同一。 |
+
+## Stable-candidate review closure
+
+| Finding | Closure |
+|---|---|
+| caller-owned review logがtrusted reviewを偽造可能 | token-isolated trusted-base adapterがGitHub review APIをqueryし、repository/PR/reviewer role/review ID/commit/state/exact log digestにbindしたcanonical attestationを供給。fixture API substitutionで全rejectをowner。 |
+| evidence profile/controller sourceがprotected input外 | profile/public key、installed-source manifest、controller/verifier/monitor source、adversarial ownerをprotected setへ追加。変更はbaseline選択前のseparate reviewed profile requalificationが必要。 |
+| merge verify後にtargetが移動可能 | signed artifactはexact mergeをfirst-parent chainに含むfetched target tipを記録し、durable store後にtrusted lifecycle adapterがrefetchしてreachabilityを再確認。 |
+| unlock-before-publicationでsecond runが開始可能 | lock中にdurable profile-global reservationを作りatomic publication完了まで保持。later invocationはrepository/image/container前rejectし、crash/cleanup failureもfail-closed。 |
+| report review-state literalがrepository metadataと不一致 | canonical literalを`clean`/`fixed`に統一し、`CLEAN`とaccepted `FINDINGS` + nonempty repair chainからのone-way mappingを明記。 |
+| detached signature bytesが曖昧 | exact OpenSSH SSHSIG v1 binary record、SHA-512 signing preimage、70-column canonical ASCII armor、final LF、byte-identical decode/re-encodeを固定。 |
 
 ## Author consistency pass
 

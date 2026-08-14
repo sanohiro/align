@@ -19,9 +19,13 @@ valid issues; `65753fe7` closed that set and added the synchronized Japanese mir
 required full-diff review of that repair found seven further valid contract gaps, so the design was
 re-scoped: exact median quantization, a prepare/direct-exec boundary, two-sided path changes, unique
 child-monitor partitions, signed actual-merge verification, and pre-publication unlock semantics now
-close them together. Next: review the redesigned stable candidate, publish and merge the design,
-then implement the benchmark-input and evidence-controller prerequisites before creating a Request
-7 implementation branch.
+close them together. The bounded review of redesigned head `0bb57285` found six precise binding and
+publication gaps. The current repair adds trusted GitHub review attestation, protects the complete
+evidence profile/source set, rechecks final target reachability, serializes publication with a
+durable reservation, uses the repository's exact `clean`/`fixed` states, and fixes SSHSIG bytes.
+Next: inspect this repair delta, run docs publication preflight, publish and merge the design, then
+implement the benchmark-input and evidence-controller prerequisites before creating a Request 7
+implementation branch.
 
 The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit

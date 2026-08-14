@@ -38,23 +38,40 @@ must not broaden it independently.
 | Field | Exact contract |
 |---|---|
 | Public producer | `/opt/align-evidence/v1/bin/align-json-escape-evidence run --repository REPO --baseline BASE --candidate CANDIDATE --review-log REVIEW_LOG --output-dir NEW_DIR`. The root-owned launcher and modules were installed from the merged evidence implementation, are immutable to the benchmark account, and have hashes embedded in the host profile. It reads the controller/profile/key blobs directly from verified `BASE` objects and requires byte/mode equality with its installed copies before other work. All paths are absolute. OIDs are lowercase 40-hex. `NEW_DIR` must not exist. No other arguments or overrides exist. |
-| Public verifier | `/opt/align-evidence/v1/bin/align-json-escape-evidence verify --report REPORT --signature SIGNATURE --expected-baseline BASE --expected-candidate CANDIDATE --pr-body PR_BODY`. It verifies bytes/signature and requires the report/review/preflight bindings to equal the explicit OIDs and PR body. Local use is diagnostic; acceptance runs this same installed verifier in trusted-base CI, with `BASE`, `CANDIDATE`, and `PR_BODY` supplied from the GitHub event rather than candidate arguments. It performs no build, checkout, benchmark, network, or repository mutation. |
-| Public merge verifier | `/opt/align-evidence/v1/bin/align-json-escape-evidence verify-merge --repository REPO --report REPORT --signature SIGNATURE --merge MERGE --output-dir NEW_DIR`. After the provider returns and the exact object is fetched, it verifies the report again, reads `MERGE` through the isolated raw-object path, requires the local target ref to resolve to it, checks its two parents and tree against the signed expectations, and emits exactly `merge-verification.json` and `merge-verification.json.sig`. `NEW_DIR` must not exist; no override exists. |
+| Public verifier | `/opt/align-evidence/v1/bin/align-json-escape-evidence verify --report REPORT --signature SIGNATURE --expected-baseline BASE --expected-candidate CANDIDATE --pr-body PR_BODY --review-attestation REVIEW_ATTESTATION`. It verifies bytes/signature and requires the report/review/preflight bindings to equal the explicit OIDs, PR body, and trusted review attestation below. Local use is diagnostic; acceptance runs this same installed verifier in trusted-base CI, with every expected input created from the GitHub event/API outside the checkout. It performs no build, checkout, benchmark, network, or repository mutation. |
+| Public merge verifier | `/opt/align-evidence/v1/bin/align-json-escape-evidence verify-merge --repository REPO --report REPORT --signature SIGNATURE --merge MERGE --output-dir NEW_DIR`. After the provider returns and the exact object is fetched, it verifies the report again, reads `MERGE` through the isolated raw-object path, requires the local target ref to contain it on its first-parent chain, checks its two parents and tree against the signed expectations, and emits exactly `merge-verification.json` and `merge-verification.json.sig`. `NEW_DIR` must not exist; no override exists. |
+| Trusted review adapter | Trusted-base CI alone queries the GitHub review API with its job token for the event repository/PR. It rejects the PR author, missing repository write role, dismissed/stale/duplicate reviews, wrong commit, and a body without the exact report `log_sha256`. It writes the canonical `REVIEW_ATTESTATION` outside the checkout and supplies it to the verifier. The controller, candidate, report, benchmark containers, and PR arguments never receive the token or raw API response. |
 | Ambient state | There are no semantic defaults. The launcher enters an empty environment containing only fixed `PATH`, `LC_ALL=C`, `TZ=UTC`, empty `HOME`, `CARGO_NET_OFFLINE=true`, and controller-created descriptor/configuration values. Ambient Git, Cargo, Rust, Docker, locale, proxy, credential, target, and tuning variables are omitted. |
-| Result | Success writes and fsyncs `report.json` and `report.json.sig` in private staging while holding the exclusive lock, releases the lock, atomically renames staging to `NEW_DIR`, fsyncs its parent, prints the two absolute paths, and exits zero. A threshold failure publishes a valid signed `regression` report by the same sequence and exits 1. Every other failure, including unlock, rename, or parent-fsync failure, removes private staging and any unpublished directory, leaves `NEW_DIR` absent, emits no accepted path, and exits nonzero. |
+| Result | Success writes and fsyncs `report.json` and `report.json.sig` in private staging while holding the exclusive lock, creates and fsyncs the profile-global publication reservation, releases the lock, atomically renames staging to `NEW_DIR`, fsyncs its parent, removes/fsyncs the reservation, prints the two absolute paths, and exits zero. The reservation makes every second invocation reject before repository/image/container work. A threshold failure publishes a valid signed `regression` report by the same sequence and exits 1. Every other failure removes private staging, output, and reservation where possible, emits no accepted path, and exits nonzero; a crash or failed cleanup leaves the reservation fail-closed for administrator recovery. |
 | Controller owner | A checked-in Python 3 controller, root-owned installed launcher, and fixture tests under `scripts/` and `tests/benchmark_evidence/`. The exact installed/source relationship, installer manifest, interpreter, Git, Docker client/daemon, `ssh-keygen`, kernel, OCI image, host profile, and executable SHA-256 identities are recorded. Candidate files are never executable evidence roots. |
 | Persisted format | Canonical UTF-8 JSON schemas `align.json_escape_benchmark_evidence/v1` and `align.json_escape_benchmark_merge_verification/v1`, each signed byte-for-byte with the host Ed25519 key under its fixed namespace. Unknown, missing, duplicate, reordered, non-ASCII key, non-integer number, float, invalid UTF-8/escape, trailing byte, or noncanonical serialization rejects. |
 | Ownership/allocation | The controller owns all temporary directories, pipes, children, containers, captures, report staging, and cleanup. Benchmark children receive only stdin `/dev/null`, private stdout, and private stderr. Captures have fixed profile ceilings. No child receives the report, signature, repository administration, controller, Docker socket, signing key, or another revision's writable directory. |
-| Concurrency | One controller obtains the profile's host-global exclusive lock before repository inspection and holds it through signing and cleanup. Baseline and candidate never overlap. The fixed pair order is the only schedule. |
+| Concurrency | One controller obtains the profile's host-global exclusive lock before repository inspection and holds it through signing and cleanup. Before unlocking it installs the profile-global publication reservation, which keeps every later invocation out of repository/image/container work until publication completes. Baseline and candidate never overlap. The fixed pair order is the only schedule. |
 | Prerequisites | The benchmark-input slice, both Request 7 language prerequisites, this design, its evidence implementation, pinned image, host profile/public key, and controller adversarial owners merge before `BASE` is selected. `BASE` is the then-current target tip and exact parent of the first Request 7 implementation commit. |
-| Acceptance | A valid signature, `pass` verdict, exact PR/preflight/review bindings, unchanged target-base binding at merge, identical protected inputs, all ten samples for all five fields, and every exact ratio at most 1.05 are all required. Correctness tests remain separate deterministic owners. |
+| Acceptance | A valid signature, `pass` verdict, exact PR/preflight/trusted-review bindings, unchanged target-base binding at merge, a signed merge-verification artifact whose merge remains reachable from the final fetched target, identical protected inputs, all ten samples for all five fields, and every exact ratio at most 1.05 are all required. Correctness tests remain separate deterministic owners. |
 
 `REVIEW_LOG` is the repository-standard pre-open review log outside the candidate repository. It
 must bind the candidate directly with `CLEAN`, or bind one reviewed ancestor with `FINDINGS` and a
-complete findings-fixed descendant chain ending at `CANDIDATE`. The controller records the log
-SHA-256 and bindings; it does not claim untrusted prose is independently authentic. Acceptance also
-requires the trusted-base PR attestation to carry the identical candidate, merge base, review head,
-reviewer, and clean/findings-fixed state. An edited log cannot create that required status.
+complete findings-fixed descendant chain ending at `CANDIDATE`. The controller records its exact
+SHA-256 and parsed bindings but does not treat caller-owned prose as authentic by itself.
+
+After the PR opens, the independent reviewer submits one native GitHub review whose body contains
+exactly one line `ALIGN_REVIEW_LOG_SHA256=<report log_sha256>`. Trusted-base CI queries that review
+directly and produces this single-line canonical JSON plus LF, with no whitespace outside strings:
+
+```text
+ReviewAttestation = {"repository":name,"pull_request":u64,"review_id":u64,
+  "reviewer":name,"review_commit":hex40,"review_state":ReviewState,
+  "review_log_sha256":hex64,"submitted_at":time}\n
+```
+
+For `clean`, the native review has GitHub state `APPROVED` on the candidate. For `fixed`, it has
+GitHub state `COMMENTED` with verdict `FINDINGS` on `review_head`, and the PR carries the complete finding dispositions
+and exact repair chain ending at the candidate. The trusted adapter requires repository identity,
+event PR number/head/base, reviewer identity/role, review database ID, commit, state, body marker,
+and report fields to agree. Missing, stale, author-owned, duplicate, edited-to-another-digest, or
+API/file substitution rejects. Fixture API responses own every failure before the verifier reads
+candidate-controlled content.
 
 ## Merged profile and fixed identities
 
@@ -149,12 +166,18 @@ rust-toolchain.toml            when present in either revision
 bench/.cargo/**                when present in either revision
 bench/json_decode/**
 bench/json_soa/**
+bench/json_escape/evidence/**
+scripts/benchmark_evidence/**
+tests/benchmark_evidence/**
 ```
 
 Presence, path, mode, type, blob bytes, and structural manifest must match across revisions.
 Optional-root presence mismatch rejects. This comparison covers scripts, kernels, harnesses,
-manifests, lockfiles, generators, output format, timing loops, and nested configuration before any
-candidate code executes.
+manifests, lockfiles, generators, output format, timing loops, the profile/public key, every
+installed controller/verifier/monitor source and installation manifest, their adversarial owners,
+and nested configuration before any candidate code executes. Any change requires a separately
+reviewed evidence-profile implementation and requalification before selecting a new baseline; it
+cannot coexist with the measured Request 7 candidate.
 
 ## Container and process boundary
 
@@ -370,7 +393,7 @@ GitModeOrEmpty = "" | GitMode
 PathKindOrEmpty = "" | PathKind
 OidOrEmpty = "" | hex40
 DigestOrEmpty = "" | hex64
-ReviewState = "clean" | "findings-fixed"
+ReviewState = "clean" | "fixed"
 Verdict = "pass" | "regression"
 FieldOrEmpty = "" | Field
 RevisionArm = "baseline" | "candidate"
@@ -406,17 +429,25 @@ follow pair ordinal; sorted samples are nondecreasing and exact permutations. `r
 candidate middle sum and `ratio_denominator` baseline middle sum.
 All cleanup counts are zero and booleans true before either verdict can be signed. The host lock is
 still held while signing and while both private-staging files and that directory become durable.
-The producer then releases the lock, atomically renames staging to `NEW_DIR`, fsyncs the parent, and
-only then prints accepted paths. Lock-release failure removes private staging, so signed bytes are
-not published as an accepted directory. Rename or parent-fsync failure likewise removes any visible
-but not yet accepted directory before returning failure.
+While still locked, the producer creates the profile-fixed root-owned publication-reservation file
+with no-follow exclusive creation, records the run/output identity, and fsyncs its directory. It then
+releases the lock, atomically renames staging to `NEW_DIR`, fsyncs the output parent, removes the
+reservation, fsyncs its directory, and only then prints accepted paths. Any invocation acquiring the
+lock while the reservation exists rejects before repository inspection. Unlock or publication
+failure removes private/output state where possible; a surviving reservation marks any output
+unaccepted and blocks future runs until the administrator validates and removes it. Reservation
+removal is a publication postcondition outside the already-signed measurement cleanup; accepted
+paths do not exist until that postcondition succeeds.
 `first_failed_field` is empty exactly for `pass`; for `regression` it is the first false field in
 field order. There are no conditional or omitted members.
 
 For a `clean` review, `review_head` equals the candidate and `repair_commits` is empty. For a
-`findings-fixed` review, `review_head` is the reviewed ancestor and `repair_commits` is the exact
+`fixed` review, `review_head` is the reviewed ancestor and `repair_commits` is the exact
 nonempty first-parent sequence after it, ending at the candidate; every listed commit is also in
 candidate `commits`, in the same order. `review_base` equals the reported baseline in either state.
+These literals exactly equal the repository preflight stamp and PR marker; a review log verdict
+`CLEAN` maps only to `clean`, while `FINDINGS` plus a nonempty accepted repair chain maps only to
+`fixed`.
 Each `ToolIdentity.source_manifest_blob` names the canonical installation-manifest blob in
 `source_commit`; `source_manifest_sha256` hashes those blob bytes, and the manifest in turn fixes
 every installed file used by that tool.
@@ -426,6 +457,24 @@ every installed file used by that tool.
 alone, with no LF. The digest is lowercase hex in the outer record. The signature covers the
 complete canonical outer record including its final LF in namespace
 `align-json-escape-benchmark-evidence-v1`.
+
+Each detached `.sig` is the pinned OpenSSH `SSHSIG` version-1 ASCII armor, never raw Ed25519 bytes.
+It is exactly `-----BEGIN SSH SIGNATURE-----\n`, RFC 4648 standard base64 of the binary SSHSIG record
+wrapped at 70 ASCII characters per line (the final line has 1 through 70 characters, required `=`
+padding retained), `\n` after every base64 line, and `-----END SSH SIGNATURE-----\n`. CR, spaces,
+blank lines, noncanonical padding/wrapping, or trailing bytes reject. All SSH strings use unsigned
+big-endian 32-bit length prefixes. The binary record is magic `SSHSIG`, version `1`, the exact
+profile Ed25519 public-key blob, the exact namespace, empty reserved string, hash algorithm
+`sha512`, and an SSH signature containing algorithm `ssh-ed25519` plus the 64-byte signature.
+
+The Ed25519 signing preimage is exactly magic `SSHSIG`, SSH string namespace, empty SSH string
+reserved, SSH string `sha512`, and SSH string containing the 64-byte SHA-512 of the complete
+canonical message bytes. Report and merge-verification namespaces are respectively
+`align-json-escape-benchmark-evidence-v1` and
+`align-json-escape-benchmark-merge-verification-v1`. The producer/verifier decode the armor, enforce
+every binary field and length, re-encode to identical armor bytes, and only then invoke the pinned
+`ssh-keygen -Y sign/verify` implementation. Signature SHA-256 fields hash the complete canonical
+armor including its final LF.
 
 The producer encodes `Body`, computes that domain-separated digest, encodes `Report`, reparses with
 duplicate rejection, re-encodes, and requires byte identity before signing. The verifier repeats
@@ -456,13 +505,16 @@ MergeVerification = {
 It uses the same scalar, string, member-order, whitespace, UTF-8, and rejection grammar as `Report`.
 The detached signature covers the complete bytes including LF under namespace
 `align-json-escape-benchmark-merge-verification-v1`. `report_sha256` hashes the complete report
-including LF; `report_signature_sha256` hashes its detached signature bytes. `target_oid` and
-`merge_oid` both equal the supplied `MERGE`; `parents` are exactly baseline then candidate; and
-`tree_oid` equals the report's expected candidate tree. The verifier records the raw merge-object
+including LF; `report_signature_sha256` hashes its detached signature bytes. `merge_oid` equals the
+supplied `MERGE`; `target_oid` is the locally fetched target tip and contains `merge_oid` on its
+first-parent chain; `parents` are exactly baseline then candidate; and `tree_oid` equals the
+report's expected candidate tree. The verifier records the raw merge-object
 SHA-256 only after all relationships pass. Complete golden, mutation, wrong-parent/tree/ref, stale
 report/signature, and raw-object swap owners cover this format. It obtains the same exclusive host
-lock before inspection and uses the same private-stage, file/directory fsync, unlock, atomic rename,
-parent-fsync, then path-publication sequence; any failure leaves `NEW_DIR` absent.
+lock before inspection and uses the same private-stage, file/directory fsync, durable publication
+reservation, unlock, atomic rename, parent fsync, reservation removal/directory fsync, then
+path-publication sequence; a surviving reservation makes any output unaccepted and blocks later
+work.
 
 An accepted PR carries the complete report/signature as unmodified files in an immutable artifact
 or base64-safe fenced attachment, plus verifier command/result. After merge, the trusted host stores
@@ -479,14 +531,18 @@ Measurement begins after one comprehensive review yields a clean exact-candidate
 consolidated findings-fixed chain. Any later commit, amend, rebase, merge, or protected-input change
 invalidates the report. Only raw commit OIDs/objects are identities.
 
-At publication, preflight and PR attestation must match the report candidate, merge base, review
+At publication, preflight, trusted review attestation, and PR markers must match the report candidate, merge base, review
 head, and state. Immediately before merge, target OID must still equal `BASE`; otherwise rebase from
 the new tip, select that parent as a new baseline, and repeat review/evidence/preflight. Merge binds
 the expected PR head. After the provider returns, the trusted host fetches that exact response OID,
-runs `verify-merge`, and accepts the signed merge-verification artifact only when the local target
-resolves to it, its first parent is `BASE`, its second parent is `CANDIDATE`, and its tree is
-candidate-identical. A race or unavailable object makes the result unshipped and it is reverted
-before dependent work; no lifecycle advances.
+runs `verify-merge`, and accepts the signed merge-verification artifact only when that merge remains
+on the fetched target's first-parent chain, its first parent is `BASE`, its second parent is
+`CANDIDATE`, and its tree is candidate-identical. After the artifact is durably stored and linked,
+the trusted lifecycle adapter fetches the provider target once more and repeats raw-object
+first-parent reachability before advancing Request 7. A normal later descendant preserves the
+artifact; any force-push, replacement, or movement that removes `MERGE` invalidates it and blocks or
+rolls back the lifecycle before dependent work. An unavailable object or failed final fetch is
+unshipped and no lifecycle advances.
 
 This postcondition is cleanup for a hosting transaction that cannot currently atomically accept an
 expected base OID. Before Request 7 starts, implementation must prove fail-closed merge/revert on a
@@ -512,22 +568,22 @@ It may not weaken the base rule.
 
 | Cell | Owner and exact regression |
 |---|---|
-| Trusted bootstrap and CLI | Root-owned installed producer/verifier/merge-verifier/monitor bytes must match their manifest and verified baseline blobs. Candidate/PATH/PYTHONPATH/current-directory substitution, installed-file replacement, missing/extra/repeated options, relative paths, malformed/same OIDs, existing output, untrusted repository, and ambient selectors reject before mutation. Trusted CI supplies expected baseline/candidate/PR body. `benchmark_evidence_bootstrap_cli_matrix`. |
+| Trusted bootstrap and CLI | Root-owned installed producer/verifier/merge-verifier/monitor bytes must match their manifest and verified baseline blobs. Candidate/PATH/PYTHONPATH/current-directory substitution, installed-file replacement, missing/extra/repeated options, relative paths, malformed/same OIDs, existing output, untrusted repository, and ambient selectors reject before mutation. Trusted CI supplies expected baseline/candidate/PR body and a canonical review attestation created from fixture-owned GitHub API responses; wrong repository/PR/reviewer role/review ID/commit/state/body digest, author review, dismissal, staleness, duplication, and API/file substitution reject before candidate-controlled content is read. `benchmark_evidence_bootstrap_cli_matrix`. |
 | Raw identity/construction | Cover clone/worktree, packed/loose objects, reviewed symlinks, hostile config/includes/hooks/filters/fsmonitor/commit-graph/replacements/grafts/alternates/promisor/shallow/missing objects, raw swap, path/type/mode collisions, and mutation race. `benchmark_evidence_raw_object_matrix`. |
 | Revision binding | Exact parent chain and two-sided added/deleted/modified path inventory succeed; wrong local target, unrelated ancestry, merge/side parent, ref movement, stale review, branch-after-drift, missing deletion, wrong old/new mode/type, and incomplete tree-union diff reject. `benchmark_evidence_revision_binding_matrix`. |
-| Protected inputs | Mutate presence/path/type/mode/bytes of every required/optional config, manifest, lock, script, kernel, harness, generator, output, and timing owner; reject before candidate execution. `benchmark_evidence_protected_input_matrix`. |
+| Protected inputs | Mutate presence/path/type/mode/bytes of every required/optional config, manifest, lock, script, kernel, harness, generator, output, timing owner, evidence profile/public key, installed-source manifest, controller/verifier/monitor source, and evidence owner test; reject before candidate execution. `benchmark_evidence_protected_input_matrix`. |
 | Toolchain/cache/offline | Image/tool/cache/config identity succeeds; tag/image/tool swap, missing/stale lock, incomplete cache, registry update, network, and source/cache/lock/target cross-write reject. `benchmark_evidence_toolchain_matrix`. |
 | Native host/isolation | Cover x86_64 success; ARM/emulation, CPU/microcode/kernel/daemon/runtime/cgroup/image mismatch, quota/writable source/network/device/capability/credential/socket/cross-revision exposure reject. A latched foreign scheduler/container, throttle/thermal/frequency, pressure/load, swap/memory event during any child, monitor loss/overflow/delay/death, duplicate/reused/overlapping range, wrong child ID, or orphan child observation rejects. `benchmark_evidence_host_isolation_matrix`. |
 | Descriptor/environment | Collide every inherited fd; cover missing CLOEXEC, unexpected fd, stdio swap, proxy/Cargo/Rust/Git/locale/home injection, truncation, and capture overflow. `benchmark_evidence_process_boundary_matrix`. |
 | Schedule | Four exact prepare children complete and their artifacts are sealed before exact warm-ups and odd B-C/even C-B pairs. Build/Cargo/compiler use during measurement, artifact mutation, overlap, reorder, retry, skip, duplicate, crash, timeout, signal, and nonzero reject. `benchmark_evidence_schedule_matrix`. |
 | Inner/outer statistics | Synthetic odd/even nanosecond sums, half-microsecond ties, equal middle values, overflow edges, and one arbitrarily low outlier pin the middle sum, round-half-up integer-microsecond quantization, and three-decimal rendering. Ten printed samples retain exact tokens; exact 1.05 passes and the next microsecond unit fails. `benchmark_evidence_statistic_matrix`. |
 | Parser/arithmetic | Exact titles, headers, three rows, all columns, and five retained fields succeed; wrong/duplicate/missing/extra line, row, header, or field and whitespace/sign/exponent/nonfinite/precision/ratio/zero/overflow reject. `benchmark_evidence_parser_ratio_matrix`. |
-| Report/signature | Bidirectional report and merge-verification goldens plus every field/order/type/width/duplicate/escape/trailing/derived mutation; wrong key/namespace/signature/profile/stale candidate/report/merge reject. `benchmark_evidence_report_v1_matrix`. |
-| Failure/cleanup | Cross each phase with error, timeout, signal, disk-full, file/directory/parent fsync, unlock, rename, removal, and signing failure. No accepted path remains; children, containers, mounts, fds, locks, staging, and private dirs are gone. `benchmark_evidence_cleanup_matrix`. |
-| Concurrent runs | Second run fails before Git/image/container work; lock releases only after cleanup, including signal/sign failure. `benchmark_evidence_exclusive_run`. |
+| Report/signature | Bidirectional report and merge-verification goldens plus every field/order/type/width/duplicate/escape/trailing/derived mutation; exact SSHSIG binary fields and signing preimage; armor header/footer/LF/base64 alphabet/wrap/padding; and wrong key/namespace/signature/profile/stale candidate/report/merge reject. `benchmark_evidence_report_v1_matrix`. |
+| Failure/cleanup | Cross each phase with error, timeout, signal, disk-full, file/directory/parent/reservation fsync, unlock, rename, reservation removal, ordinary removal, and signing failure. No accepted path remains; children, containers, mounts, fds, locks, staging, private dirs, output, and publication reservation are gone, or a surviving fail-closed reservation prevents acceptance and all later work. `benchmark_evidence_cleanup_matrix`. |
+| Concurrent runs | Second run fails before Git/image/container work while either the lock or publication reservation exists. Lock releases only after measurement cleanup and durable reservation creation; accepted publication removes and fsyncs the reservation. Crash/restart and administrator-recovery fixtures prove fail-closed behavior. `benchmark_evidence_exclusive_run`. |
 | TOCTOU swap | Opened executable/image/source identities are used or revalidated at privilege boundary; rename, replacement, daemon-image, and source swaps cannot substitute inspected bytes. `benchmark_evidence_bound_object_swap_matrix`. |
-| Forged/stale evidence | Unsigned, edited, replayed profile/target/review/candidate, truncated, concatenated, and valid-signature/wrong-namespace reports reject. PR/preflight mismatch blocks. `benchmark_evidence_stale_forged_matrix`. |
-| Base/integration race | Disposable remote covers target movement before/after run, precheck-to-merge race, unavailable/wrong response OID, local-target mismatch, wrong merge parents/tree, signed merge-verification mutation, failed revert, and exact merge. Failures never advance lifecycle. `benchmark_evidence_merge_race_matrix`. |
+| Forged/stale evidence | Unsigned, edited, replayed profile/target/review/candidate, truncated, concatenated, and valid-signature/wrong-namespace reports reject. PR/preflight/trusted-review mismatch blocks; `CLEAN` maps only to `clean`, and accepted `FINDINGS` with a nonempty repair chain maps only to `fixed`. `benchmark_evidence_stale_forged_matrix`. |
+| Base/integration race | Disposable remote covers target movement before/after run, precheck-to-merge race, unavailable/wrong response OID, local-target mismatch, wrong merge parents/tree, signed merge-verification mutation, a normal later first-parent descendant, force-push/removal before the final trusted refetch, failed revert, and exact merge. The merge must remain on the final target first-parent chain; failures never advance lifecycle. `benchmark_evidence_merge_race_matrix`. |
 
 Implementation maps every row to source and deterministic tests before review. Tests use fixture
 executors, a fake daemon, disposable repositories/remotes, and test keys; they do not run the
@@ -556,6 +612,17 @@ measurement remain named manual evidence.
 | P1 verifier could not observe the actual merge | The installed `verify-merge` mode consumes the fetched provider-response OID and emits a second host-signed canonical artifact bound to the report, target, raw merge object, parents, and tree. |
 | P2 unlock failure left accepted-looking durable output | Report bytes remain private while the lock is held; unlock precedes atomic publication, and any unlock/publication failure removes unpublished state. |
 | P2 Japanese mirror retained undefined `hex128` | Both languages now define only the used `hex40` and `hex64` grammars and carry the same schemas. |
+
+## Stable-candidate review closure
+
+| Finding | Ledger-first closure |
+|---|---|
+| P1 caller-owned review log could counterfeit trusted review | A token-isolated trusted-base adapter queries the GitHub review API and supplies one canonical attestation bound to repository, PR, reviewer role, review ID, commit, state, and exact log digest. Fixture API substitutions own every rejection. |
+| P1 evidence profile and controller sources were not protected inputs | The protected set now includes the profile/public key, installed-source manifests, controller/verifier/monitor sources, and their adversarial owners. Changing any of them requires a separate reviewed profile requalification before baseline selection. |
+| P1 target could move after merge verification | The signed artifact records the fetched target tip containing the exact merge on its first-parent chain; after durable storage the trusted lifecycle adapter refetches and requires that reachability again before advancing. |
+| P2 unlock-before-publication admitted a concurrent second run | A durable profile-global reservation is created while locked and remains through atomic publication. Every later invocation rejects before repository/image/container work; crash and cleanup failure remain fail-closed. |
+| P2 report review-state literal disagreed with repository metadata | The canonical literals are now exactly `clean` and `fixed`, with explicit one-way mappings from `CLEAN` and accepted `FINDINGS` plus its nonempty repair chain. |
+| P2 detached signature bytes were ambiguous | Both signatures now use one exact OpenSSH SSHSIG v1 binary record, SHA-512 signing preimage, canonical 70-column ASCII armor, final LF, and byte-for-byte decode/re-encode validation. |
 
 ## Author consistency pass
 
