@@ -3008,6 +3008,24 @@ is catastrophic; v1 does not auto-generate nonces (pair with `crypto.random`).
 
 A primitive, not a framework.
 
+The whole-body client has explicit receive limits at both reusable-client and request scope:
+
+```text
+cl.max_response_body_bytes(limit: i64) -> ()
+r.max_response_body_bytes(limit: i64) -> ()
+```
+
+Zero clears the client limit or makes a request inherit its client. A positive request limit can
+only narrow the positive client limit or the fixed 1 GiB default. Invalid values abort before state
+changes. The cap is enforced while Content-Length, chunked, or close-delimited payload bytes are
+received; exact fit succeeds, while the first recognizable excess returns the reserved
+`Error.Code(-1)` with no partial response and a closed connection. Bodyless `HEAD`/`204`/`304`
+responses validate their framing metadata but do not compare a valid declared magnitude with the
+cap. A configured 262,144-byte cap bounds aggregate live Align-owned response storage to 557,056
+bytes: body cap + 262,144-byte cumulative head allowance + one 32,768-byte read scratch. The full
+framing, allocation, cleanup, batch, TLS, and error-precedence contract is the Request 5 ledger in
+`docs/impl/std-design/http.md`.
+
 ```text
 request
 response

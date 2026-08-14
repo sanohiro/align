@@ -25,11 +25,13 @@ v1 proposal, Fable's settled shapes:
 ```text
 // Client
 cl := http.client()                         // owns a connection pool (Move)
+cl.max_response_body_bytes(limit: i64)      // 0 restores the fixed default; positive limits bound receive allocation
 cl.get(url: str) -> Result<response, Error>
 cl.post(url: str, body: bytes) -> Result<response, Error>
 cl.request(req: request) -> Result<response, Error>
 // Request/response building
 r := http.request(method: str, url: str)    // builder (Move — owns header list + body buf)
+r.max_response_body_bytes(limit: i64)       // 0 inherits the client; positive limits only narrow it
 r.header(name: str, value: str)
 r.body(data: bytes)
 resp.status() -> i64
@@ -1143,6 +1145,74 @@ align-llm rebuilds and pins Align in its next permitted
 consumer-prerequisite wave, switches its provider stream fixtures from Content-Length to chunked,
 and proves valid SSE, malformed/truncated rejection, and final status/header/body preservation. The
 sibling request register remains the lifecycle owner for that adoption evidence.
+
+## Bounded client response bodies (align-llm Request 5 — DESIGNED 2026-08-14)
+
+Provider calls need an operation-sized receive limit, not a check after the whole-body client has
+already allocated the response. Request 5 adds one client default and one request override to the
+Request 4 framing engine. It adds no streaming-input handle, second decoder, provider policy,
+ambient configuration, or package API.
+
+### Public-contract ledger
+
+| Surface / state | Exact contract |
+|---|---|
+| Public methods | `cl.max_response_body_bytes(limit: i64) -> ()` mutates a bound `http.client`; `r.max_response_body_bytes(limit: i64) -> ()` mutates a bound `http.request`. Like the existing timeout/header/body configuration methods, both are Pure setters that borrow rather than consume their Move receiver and perform no I/O. A request remains consumed only by `cl.request(r)`. |
+| Input and defaults | `limit == 0` clears the stored value. A cleared client means fixed `HTTP_MAX_BODY = 1,073,741,824`; a cleared request inherits its client. A positive value must be `1..=HTTP_MAX_BODY` and target-`usize` representable. A negative, larger, unrepresentable, or null-handle input aborts before changing the previous value and before network work. No ambient input participates. |
+| Selection | `get` and `post` use the client value. `request` uses `min(positive client or HTTP_MAX_BODY, positive request or HTTP_MAX_BODY)`. A bound is *explicit* when either stored value is positive, including positive `HTTP_MAX_BODY`; zero/unset is not explicit. `get_many` snapshots the client value once before workers start and passes it to every exchange. Source borrowing excludes a concurrent setter; atomic native storage makes the worker snapshot race-free. |
+| Success and ownership | Exact-limit payload succeeds and returns the existing Move `response`; `status()`, `header()`, and `body()` remain region-bound zero-copy views. An explicitly bounded response owns separate fixed header and body allocations until Drop; the opaque handle ABI and source ownership do not change. Neither setter retains an input view. |
+| Limit result | The first recognizable payload excess under an explicit bound returns stable `Error.Code(-1)`. Code `-1` is reserved for the `std.http` receive-body limit: it is outside HTTP status `100..=599` and the non-negative raw OS codes published by the common errno mapping. It is distinct from `Error.Invalid`, `Error.Timeout`, transport `Error.Code(errno)`, and a successful HTTP status such as 413. No partial response or body is returned. |
+| Native status mapping | Runtime uses HTTP-private `AL_HTTP_BODY_LIMIT = -1`. Only the client-response Result lowerers map that negative sentinel to `Error.Code(-1)` before the shared positive category/errno mapping. The sentinel cannot collide with a saturating `AL_CODE + errno`, never enters the generic errno decoder, and adds no `Error` variant or type-layout change. |
+| Content-Length | Parse every field as an arbitrary-precision normalized decimal magnitude. Syntax, equal-duplicate normalization, conflicting duplicates, and CL/TE conflict precede the cap. For a payload-bearing final response, a valid magnitude above an explicit selected cap is `Error.Code(-1)` even when also above `usize` or `HTTP_MAX_BODY`; without an explicit bound, target/global excess stays `Error.Invalid`. An explicit excess reserves nothing from the peer value and causes no later payload read. |
+| Method/status composition | Request 4's exact-uppercase `HEAD`/`CONNECT`, interim, `204`, and `304` rules remain authoritative. A bodyless final response validates framing metadata but does not compare its valid arbitrary CL magnitude with the cap, allocate a body, or read payload/chunk/trailer bytes. Only the returned final payload is capped. |
+| Chunked payload | Existing line/framing/trailer guards and grammar remain unchanged. Guard and complete-line syntax checks precede the cap. A valid chunk magnitude that would take cumulative decoded bytes over an explicit cap is `Error.Code(-1)` before target conversion, payload allocation, or another read; without an explicit bound, global excess remains `Error.Invalid`. A limit recognized before the terminal chunk performs no trailer read. |
+| Close-delimited payload | Consume co-read payload first. Before each later read, clamp the request to remaining selected bytes plus one scratch-only probe byte. The first excess byte is `Error.Code(-1)` for an explicit bound, never enters retained payload, and causes no later read. Read-to-close remains non-reusable on success. |
+| Read and error precedence | Setter/request validation precedes network work. For received bytes: complete head/framing syntax and conflicts; body selection; fixed guards; complete in-guard grammar; cap comparison; payload allocation/read. A timeout/transport error returned by a read wins when no excess byte or declared magnitude was yet available. Truncation and malformed framing stay `Error.Invalid`. |
+| Co-read exception | One fixed `HTTP_CLIENT_READ_CHUNK = 32,768` scratch read may contain bytes beyond a head or chunk-line boundary. After excess is recognized, they stay scratch-only, no excess byte enters retained storage, and no later read occurs. No other probe or staging allowance exists. |
+| Allocation | An explicit exchange uses one fixed `HTTP_MAX_HEADER_BLOCK` final-head allocation and one fixed scratch; after a payload-bearing final head is selected, it adds one exact `selected cap` body allocation. Neither grows or compacts, both are sized independently of peer CL/chunk magnitude, and success moves them allocation-preservingly into the opaque response. Peak Align-owned response bytes are at most `selected cap + HTTP_MAX_HEADER_BLOCK + HTTP_CLIENT_READ_CHUNK`; for 262,144 the exact ceiling is 557,056 bytes. Bodyless responses allocate no body region. Unconfigured exchanges retain Request 4's one-buffer geometric accumulator and ceilings. Allocation failure stays fatal no-unwind OOM. This explicit two-region layout deliberately amends R1's internal one-buffer rule only for configured bounds while preserving its zero-copy public requirement. |
+| Structural metadata | At most one interim/final header table is live; only final-header offsets survive. Trailer fields consume the final header-count remainder without bytes/offsets. Decoder state is constant-size; no capacity depends on body length, peer magnitude, chunk count, or trailer volume. |
+| Cleanup and reuse | On `Error.Code(-1)`, output stays null, accumulator/scratch are freed, the partial plaintext/TLS connection closes and is never pooled, and no stale retry occurs after any response byte. The client remains usable via a fresh connection. Exact bounded CL/chunked/bodyless success retains Request 4's reuse verdict; close-delimited success remains non-reusable. |
+| Batch | `get_many` runs every worker to completion, stores by input ordinal, and returns the lowest-index error independent of completion order. Any error yields no response array and frees successful siblings. A limit competes by ordinal like malformed, timeout, or transport errors. Each worker owns its own byte allowance. |
+| Plaintext / TLS | One selection and decoder state serves `Conn::Plain` and `Conn::Tls`. Align-owned TLS application scratch is inside the ceiling; kernel and opaque libssl buffers are excluded and may not derive capacity from peer length, chunk magnitude, selected cap, or accumulated body. |
+| Compiler/runtime owner | Sema owns exact receiver/method/arity/type and bound-local checks. Checked HIR owns receiver/`i64` envelopes. MIR owns setter rvalues and HTTP-private limit mapping. LLVM declares/calls setters and maps HTTP results. Runtime owns storage, snapshot, selection, decoder outcome, allocation, cleanup, and batch order. Package code owns none. |
+| ABI and identity | Add `void @align_rt_http_max_response_body_bytes(ptr, i64)` and `void @align_rt_http_client_max_response_body_bytes(ptr, i64)` to ABI row A66. No other signature, type tag, interface record, or handle ABI changes. Method spellings and MIR discriminants enter interface-format-6 and cache identities; exact edit/revert restores the prior hash. |
+| Prerequisite and adoption | Request 4 at `f04672bce6f8689c9b219d0a20e770571e2d638b` supplies framing. Align implementation precedes align-llm adoption. The sibling pins the merge, sets 262,144 at `provider_http`, proves the combined framing/cap/cleanup matrix, and keeps HTTP status handling distinct. |
+
+### Framing and limit matrix
+
+| Final selection | Explicit bound | Excess result / connection |
+|---|---:|---|
+| exact `HEAD`, `204`, or `304` bodyless | either | no comparison; empty body and normal bodyless reuse verdict |
+| Content-Length / chunked / close-delimited payload | no | fixed global excess is `Error.Invalid`; close |
+| Content-Length payload | yes | normalized magnitude above cap is `Error.Code(-1)` before reserve/read; close |
+| chunked payload | yes | checked cumulative decoded excess is `Error.Code(-1)` after valid guarded size line; no response/trailer read; close |
+| close-delimited payload | yes | co-read then remaining-plus-one scratch probe; excess is `Error.Code(-1)`; close |
+| malformed/conflicting/truncated framing | either | `Error.Invalid`; close |
+| deadline / transport failure before recognizable excess | either | existing `Error.Timeout` / `Error.Code(errno)`; close |
+
+### Implementation closure matrix
+
+This is one cross-layer capability: a public setter without the bounded decoder is dormant, while a
+decoder-only cap is unnameable. Reusing Request 4's state machine and owners keeps the expected
+hand-written change below roughly 1,000 lines.
+
+| Closure axis | Required evidence | Owner |
+|---|---|---|
+| Formation and setters | Both receivers, exact `i64`, arity, bound-local use, zero clear/inherit, positive endpoints, invalid abort-before-store, whole/per-unit spelling, interface/cache edit-revert. | Sema/checked-HIR/MIR owners plus abort fixtures |
+| Selection and concurrency | get/post inherit client; request min-selects both scopes; explicit `HTTP_MAX_BODY` differs from zero; `get_many` snapshots once. | runtime table + driver dispatch/batch |
+| Fixed-length receive | leading-zero/equal-duplicate CL, exact cap, cap+1, above-target/global, malformed/conflicting/truncated precedence, no reserve/read from excess declaration. | runtime parser/transport matrix |
+| Chunked receive | exact/cap+1, tiny chunks, oversized valid magnitude, invalid extension/guards, co-read excess, no trailer read after limit, terminal trailers/reuse. | Request 4 decoder owner + counters |
+| Close-delimited receive | exact/cap+1, same/split read, one-byte probe, no post-decision read, non-reuse. | plaintext/TLS transport fixtures |
+| Bodyless/interim | HEAD/204/304 arbitrary valid metadata and interim chains never compare/allocate body; malformed metadata and 101 stay Invalid; case-variant methods stay payload-bearing. | method/status matrix with cap twins |
+| Move-out and cleanup | Success transfers the header/body response allocations; every failure leaves null and frees each live allocation/scratch once; later client use is clean; `?`, `else`, `match`, and `map_err` retain ordinary Result ownership. | live allocation/response/fd counters + driver consumers |
+| Batch precedence | lowest-index malformed-vs-limit completion-order twins, exact-cap success, no array on failure, sibling Drop and failed-connection teardown. | `get_many` owner |
+| ABI / lowering | Two A66 setters, whole/per-unit lowering, HTTP sentinel to `Error.Code(-1)`, other statuses unchanged, malformed checked HIR rejected before LLVM. | MIR/LLVM assertions, ABI tripwire, checked-HIR negatives |
+| Resource ceiling | Positive 262,144 proves 557,056 maximum for CL, close, tiny-chunk, trailer, plaintext, and TLS; no peer-derived capacity; fixed structural state. | runtime high-water/failpoint instrumentation |
+| Consumer discriminants | Limit is `Code(-1)`, HTTP 413 is status data, malformed is Invalid, deadline is Timeout, OS fault is non-negative `Code(errno)`. | driver match fixture + align-llm adoption |
+
+No benchmark is required: this contract makes a resource ceiling, not a throughput claim. Runtime
+instrumentation measures the ceiling directly. Changing the code, allocation strategy, public
+method, framing precedence, or layer ownership reopens this ledger before implementation.
 
 ## Pitfalls
 

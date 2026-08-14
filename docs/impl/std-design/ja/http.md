@@ -24,12 +24,14 @@ v1 案として、Fable が確定させた形式:
 
 ```text
 // Client
-cl := http.client()                         // owns a connection pool (Move)
+cl := http.client()                         // コネクションプールを所有する (Move)
+cl.max_response_body_bytes(limit: i64)      // 0 は固定既定値へ戻し、正値は受信 allocation を制限する
 cl.get(url: str) -> Result<response, Error>
 cl.post(url: str, body: bytes) -> Result<response, Error>
 cl.request(req: request) -> Result<response, Error>
 // Request/response building
-r := http.request(method: str, url: str)    // builder (Move — owns header list + body buf)
+r := http.request(method: str, url: str)    // builder (Move — header list と body buf を所有する)
+r.max_response_body_bytes(limit: i64)       // 0 は client を継承し、正値は上限を狭めるだけ
 r.header(name: str, value: str)
 r.body(data: bytes)
 resp.status() -> i64
@@ -1112,6 +1114,71 @@ merge 後、align-llm は次の許可された consumer-prerequisite wave で Al
 stream fixture を Content-Length から chunked へ切り替え、valid SSE、malformed/truncated rejection、final
 status/header/body preservation を証明する。sibling request register が adoption evidence の lifecycle owner
 であり続ける。
+
+## Client response body の上限制御 (align-llm Request 5 — DESIGNED 2026-08-14)
+
+provider call には whole-body client が allocation した後の length check ではなく、受信中に効く
+operation-sized limit が必要である。Request 5 は Request 4 framing engine に client default と request
+override を一つずつ加える。streaming-input handle、第二 decoder、provider policy、ambient config、package
+API は加えない。
+
+### 公開契約台帳
+
+| Surface / state | 厳密な契約 |
+|---|---|
+| Public methods | `cl.max_response_body_bytes(limit: i64) -> ()` は bound `http.client`、`r.max_response_body_bytes(limit: i64) -> ()` は bound `http.request` を mutate する。既存の timeout/header/body 設定メソッドと同じく、どちらも I/O を行わない Pure setter で、Move receiver を consume せず borrow する。request を consume するのは `cl.request(r)` だけ。 |
+| Input and defaults | `limit == 0` は stored value を clear する。clear client は fixed `HTTP_MAX_BODY = 1,073,741,824`、clear request は client を inherit する。positive は `1..=HTTP_MAX_BODY` かつ target-`usize` representable。negative/larger/unrepresentable/null handle は previous value と network work より前に abort。ambient input は無い。 |
+| Selection | `get`/`post` は client value、`request` は `min(positive client or HTTP_MAX_BODY, positive request or HTTP_MAX_BODY)`。どちらかが positive なら positive `HTTP_MAX_BODY` 自体も *explicit*、zero/unset は non-explicit。`get_many` は worker start 前に client value を一度 snapshot。source borrow が concurrent setter を除外し、native atomic storage が race-free snapshot を保つ。 |
+| Success and ownership | exact-limit payload は既存 Move `response` を返し、`status()`/`header()`/`body()` は region-bound zero-copy view のまま。explicitly bounded response は fixed header/body allocation を別々に Drop まで所有するが opaque handle ABI/source ownership は不変。setter は input view を保持しない。 |
+| Limit result | explicit bound を超える payload を最初に認識した時点で stable `Error.Code(-1)` を返す。explicit bound が無い場合の target/global excess は従来どおり `Error.Invalid` である。`-1` は `std.http` receive-body limit 専用で、HTTP status `100..=599` と common errno mapping が公開する non-negative raw OS code の外にある。`Error.Timeout`、transport `Error.Code(errno)`、successful HTTP 413 とも異なり、partial response/body は返さない。 |
+| Native status mapping | runtime は HTTP-private `AL_HTTP_BODY_LIMIT = -1` を使う。client-response Result lowerer だけが positive な common category/errno mapping 前にこれを `Error.Code(-1)` へ写す。この sentinel は saturating `AL_CODE + errno` と衝突せず、generic errno decoder には入らず、`Error` variant/layout を増やさない。 |
+| Content-Length | 各 field を arbitrary-precision normalized decimal magnitude として parse。syntax、equal duplicate normalization、conflicting duplicate、CL/TE conflict が cap より先。payload-bearing final response の valid magnitude が explicit cap 超なら `usize`/`HTTP_MAX_BODY` 超でも `Error.Code(-1)`。explicit でなければ target/global excess は `Error.Invalid`。peer value から reserve せず、excess 後に payload read しない。 |
+| Method/status composition | Request 4 の exact-uppercase `HEAD`/`CONNECT`、interim、`204`、`304` rule を維持。bodyless final は metadata を validate するが cap compare、body allocate、payload/chunk/trailer read をしない。cap は returned final payload だけ。 |
+| Chunked payload | line/framing/trailer guard と grammar は不変。guard と complete-line syntax が cap より先。valid chunk magnitude で cumulative decoded bytes が explicit cap を超えるなら target conversion/payload allocation/next read 前に `Error.Code(-1)`。non-explicit global excess は `Error.Invalid`。terminal chunk 前の limit 後は trailer を読まない。 |
+| Close-delimited payload | co-read payload を先に consume。以後は remaining selected bytes + one scratch-only probe byte 以下だけ read。最初の excess byte は `Error.Code(-1)` で retained payload に入らず later read も無い。success でも non-reusable。 |
+| Read and error precedence | setter/request validation、complete head/framing syntax/conflict、body selection、fixed guard、complete in-guard grammar、cap comparison、payload allocation/read の順。recognizable excess がまだ無い read の timeout/transport error は既存 outcome。truncation/malformed framing は `Error.Invalid`。 |
+| Co-read exception | one fixed `HTTP_CLIENT_READ_CHUNK = 32,768` scratch read が head/chunk-line boundary 後の byte を含み得る。excess 判定後は scratch-only で retained storage/later read に入らない。他の probe/staging allowance は無い。 |
+| Allocation | explicit exchange は fixed `HTTP_MAX_HEADER_BLOCK` final-head allocation と fixed scratch を使い、payload-bearing final head を選んだ後だけ exact `selected cap` body allocation を加える。どちらも grow/compact せず peer CL/chunk magnitude から size を決めず、success へ allocation-preserving move。peak Align-owned response bytes は `selected cap + HTTP_MAX_HEADER_BLOCK + HTTP_CLIENT_READ_CHUNK` 以下。262,144 なら exact 557,056 bytes。bodyless は body region を allocate しない。unconfigured は Request 4 one-buffer geometric accumulator/ceiling を維持。allocation failure は fatal no-unwind OOM。configured bound に限り R1 の internal one-buffer rule を二領域へ amend するが public zero-copy requirement は維持。 |
+| Structural metadata | live な interim/final header table は最大一つ、survive する offset は final header だけ。trailer は bytes/offset 無しで final header-count remainder を消費。decoder state は constant-size。body length、peer magnitude、chunk count、trailer volume 由来の capacity は無い。 |
+| Cleanup and reuse | `Error.Code(-1)` では output null、accumulator/scratch を free、partial plaintext/TLS connection を close して pool/retry しない。client は fresh connection で再利用可能。exact bounded CL/chunked/bodyless success は Request 4 reuse verdict、close-delimited success は non-reusable。 |
+| Batch | `get_many` は全 worker を完了し input ordinal で store、completion order と無関係に lowest-index error を返す。error 時 response array は無く successful sibling を free。limit も malformed/timeout/transport と同じ ordinal rule。各 worker は独立 allowance を所有。 |
+| Plaintext / TLS | 一つの selection/decoder state が `Conn::Plain`/`Conn::Tls` を扱う。Align-owned TLS application scratch は ceiling 内。kernel/libssl opaque buffer は除外するが peer length/chunk magnitude/selected cap/body から capacity を導出しない。 |
+| Compiler/runtime owner | Sema は receiver/method/arity/type/bound-local、checked HIR は receiver/`i64` envelope、MIR は setter rvalue と HTTP-private limit mapping、LLVM は setter declaration/call と HTTP result mapping、runtime は storage/snapshot/selection/decoder/allocation/cleanup/batch order を所有。package owner は無い。 |
+| ABI and identity | A66 に `void @align_rt_http_max_response_body_bytes(ptr, i64)` と `void @align_rt_http_client_max_response_body_bytes(ptr, i64)` を追加。他の signature/type tag/interface record/handle ABI は不変。method spelling/MIR discriminant は interface-format-6/cache identity に入り、exact edit/revert で元 hash に戻る。 |
+| Prerequisite and adoption | Request 4 `f04672bce6f8689c9b219d0a20e770571e2d638b` が framing を供給。Align implementation 後、sibling が merge を pin、`provider_http` に 262,144 を設定し combined framing/cap/cleanup matrix と HTTP status 区別を証明する。 |
+
+### Framing と limit のマトリクス
+
+| 最終 body 選択 | Explicit bound | 超過結果 / connection |
+|---|---:|---|
+| exact `HEAD`、`204`、`304` bodyless | either | compare 無し。empty body + normal bodyless reuse verdict |
+| Content-Length / chunked / close-delimited payload | no | fixed global excess は `Error.Invalid`; close |
+| Content-Length payload | yes | normalized magnitude above cap は reserve/read 前に `Error.Code(-1)`; close |
+| chunked payload | yes | valid guarded size line 後の cumulative decoded excess は `Error.Code(-1)`; response/trailer read 無し; close |
+| close-delimited payload | yes | co-read 後 remaining-plus-one scratch probe; excess は `Error.Code(-1)`; close |
+| malformed/conflicting/truncated framing | either | `Error.Invalid`; close |
+| recognizable excess 前の deadline/transport failure | either | existing `Error.Timeout` / `Error.Code(errno)`; close |
+
+### 実装 closure matrix
+
+public setter だけでは dormant、decoder-only cap は unnameable なので一つの cross-layer capability とする。
+Request 4 state machine/owner を再利用し expected hand-written change は概ね 1,000 lines 未満。
+
+| Closure axis | 必須 evidence | Owner |
+|---|---|---|
+| Formation and setters | receiver 両方、exact `i64`、arity、bound-local、zero clear/inherit、positive endpoint、invalid abort-before-store、whole/per-unit spelling、interface/cache edit-revert。 | Sema/checked-HIR/MIR owner + abort fixture |
+| Selection and concurrency | get/post inheritance、request min-selection、explicit `HTTP_MAX_BODY` vs zero、one `get_many` snapshot。 | runtime table + driver dispatch/batch |
+| Fixed/chunked/close receive | CL normalization/precedence、exact/cap+1、oversized valid magnitude、guard/malformed/truncated、tiny chunks、co-read/probe、no post-limit read/trailer。 | runtime parser/decoder/transport matrix |
+| Bodyless/interim | HEAD/204/304/interim は valid metadata を cap compare/body allocate せず、malformed/101/case-variant control を維持。 | method/status cap twins |
+| Move-out and cleanup | success は header/body response allocation transfer、failure は null + 各 live allocation/scratch の exact free、later client use clean、ordinary `?`/`else`/`match`/`map_err` ownership。 | allocation/response/fd counter + driver consumer |
+| Batch precedence | lowest-index malformed-vs-limit completion twins、exact success、failure no array、sibling Drop、failed connection teardown。 | `get_many` owner |
+| ABI / lowering | two A66 setters、whole/per-unit、HTTP sentinel → `Error.Code(-1)`、他 status 不変、malformed checked HIR は LLVM 前に reject。 | MIR/LLVM/ABI/checked-HIR owner |
+| Resource ceiling | 262,144 で CL/close/tiny-chunk/trailer/plaintext/TLS の 557,056 maximum、peer-derived capacity 無し、fixed structural state。 | runtime high-water/failpoint instrumentation |
+| Consumer discriminants | limit `Code(-1)`、HTTP 413 は status data、malformed Invalid、deadline Timeout、OS fault non-negative `Code(errno)`。 | driver match + align-llm adoption |
+
+benchmark は不要。この contract は throughput ではなく resource ceiling を claim し、runtime instrumentation
+が直接測る。code/allocation/public method/framing precedence/layer ownership の変更は implementation 前に ledger
+を reopen する。
 
 ## Pitfalls
 
