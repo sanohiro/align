@@ -309,8 +309,10 @@ be arena-owned. Mixing allocation modes in one tuple, struct, sum value, or owne
 Replacing an owned field or element must preserve the existing mode, and the replaced leaf must be a
 `string` or `Option<string>` today — replacing any other owned leaf (a nested Move struct, an owned
 array) is a compile error naming the type; replace the whole aggregate instead. A bare
-`array<string>` **field** is likewise rejected at the declaration, in any struct, not only in a JSON
-schema; use `array<str>` or `array<Struct>`. Borrowed members do not
+`array<string>` is a valid ordinary struct field with element-wise Drop, but remains outside the
+closed JSON schema grammar. A finite Move struct containing that field retains the existing
+Option/Result/user-sum payload behavior and active-tag Drop. Use `array<str>` when the strings are
+borrowed. Borrowed members do not
 participate in this allocation-mode check. A path-dependent one-owner aggregate forwards its
 runtime mode, but mutation requires a definite mode. After generic substitution, a struct field may
 be Copy or recursively Move when its finite, non-recursive Drop plan is known; this does not make an
@@ -499,8 +501,9 @@ after a later required sibling fails is a separate ownership request. The scanne
 restriction does not narrow ordinary JSON behavior. A field may also
 be an owned `array<Struct>` (the `messages: array<Message>` shape) — decode fills an owned
 array-of-structs in the field (freed by the struct's drop) and encode renders it back, so a full
-OpenAI request/response round-trips. The element struct may itself be Move and is deep-dropped;
-bare `array<string>` fields remain deferred. `soa<T>` columns stay primitive/`str`.
+OpenAI request/response round-trips. The element struct may itself be Move and is deep-dropped.
+JSON decode/encode for bare `array<string>` fields remains deferred. `soa<T>` columns stay
+primitive/`str`.
 
 An owning package resource may expose a borrowed `soa<T>` view over its exact-length column buffer;
 that resource generation is then the lifetime root. `pkg.db.batch_soa<T: SoaPlain>` uses this form.
@@ -879,15 +882,18 @@ language-intrinsic global (like `builder()`), listed as a core area rather than 
 
 `array_builder<T>()` retains its individually owned heap/zero-copy-freeze form.
 Besides Copy scalars and `string`, it accepts nonempty naturally aligned declared records composed
-recursively only of Copy scalars, owned `string`, and the same record class. Such records contain no
-views or other owned collections. A Move record is pushed only when every reachable string owner is
-free-standing. A complete Move-record rvalue from a local, fresh literal, function result,
+recursively of Copy scalars, owned `string`, the same record class, `Option<T>` over the accepted
+field grammar, and `array<E>` whose element is a Copy scalar, `string`, or an accepted record.
+Options may nest; arrays of options or arrays remain outside the type representation. Such records
+contain no views. A Move record is pushed only when every reachable string and dynamic-array owner
+is free-standing. A complete Move-record rvalue from a local, fresh literal, function result,
 value-carrying branch/match/else, transparent block, or successful `?` unwrap (including
 `map_err(...)?`) can be pushed;
 push moves and nulls the selected source, while an incomplete, borrowed, already-consumed, or
 allocation-mode-ambiguous source rejects before growth. Unfinished-builder Drop recursively cleans
-the initialized prefix in both stack-local and boxed-header modes, and build transfers the same
-buffer to the ordinary deeply dropped `array<T>`. `append` remains Copy-scalar-only. The nominal
+the initialized prefix in both stack-local and boxed-header modes, including active Options,
+string-array elements, and arrays of Move records; build transfers the same buffer to the ordinary
+deeply dropped `array<T>`. `append` remains Copy-scalar-only. The nominal
 type plus its versioned interface graph and compiler Drop plan is the sole record identity; two
 same-shape declarations remain distinct and no runtime record descriptor is exposed.
 `array_builder<T>(out: region)` is the caller-region form for recursively plain values. It uses

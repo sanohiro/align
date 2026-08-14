@@ -83,8 +83,10 @@ Move-enum の `content` フィールドを所有する。drop は **deep** free:
 `array<Struct>` ローカルの `Stmt::Drop` からも呼ばれる。runtime のエラーパスも同様: `drop_decoded_owned`
 の kind-5 アームが各要素を deep-free（`sub_owns_buffers` で判定）し、`decode_struct_array_value` は
 mid-array パース失敗時に `buf[0..count]` の既 materialize 要素を解放する。**J3b で OpenAI chat ゲートウェイが
-エンドツーエンドで閉じる**（`Chat` が byte-identical にラウンドトリップ）。**引き続き拒否:** `array<string>`
-（bare-`string` 要素の array フィールド — 要素ごとの string free は別スライス、0b-2 で捕捉）。**制約:** Move
+エンドツーエンドで閉じる**（`Chat` が byte-identical にラウンドトリップ）。**引き続き拒否:** JSON
+decode/encode における `array<string>`（bare-`string` 要素の array フィールドには JSON descriptor arm
+がない）。Request 10 は standalone deep Drop を再利用して通常の所有 record construction ではこの field
+を有効にするが、JSON producer は追加しない。**制約:** Move
 構造体（array/Move-enum を所有）は関数境界を越える `Result`/`Option` Ok payload になれない — スコープ内で
 decode + 使用する。bare `array<Move-struct>` の `json.encode` とそのフィールド上の pipeline は制限される
 （decode→encode パススルーは動作）。

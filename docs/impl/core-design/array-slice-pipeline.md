@@ -58,6 +58,14 @@ dropped AoS array. `append` remains Copy-scalar-only. The complete contract and 
 matrix are [`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md)
 §7.5; the complete capability shipped on 2026-08-14.
 
+The accepted Request 10 extension widens that class to Options over the accepted field grammar and
+dynamic arrays whose element is a Copy scalar, `string`, or another accepted record. It retains no
+views, requires every reachable string/array buffer to be free-standing before push, deep-drops
+active Options, string arrays, and arrays of Move records, and adds no runtime ABI. Arrays of
+Options or arrays remain outside this capability. The exact ledger and implementation matrix are
+§7.6; they also close existing Option/Result/user-sum payloads over a record with a direct string
+array field. Implementation is pending.
+
 Region form (required L6, **shipped**):
 
 ```text
@@ -87,9 +95,9 @@ removed outright (no alias survives, per the no-backward-compat rule).
   borrowed, consumed-arm, type-divergent, or allocation-mode-ambiguous sources reject before growth.
 - Stack-local and boxed heap-builder headers share the same initialized-prefix Drop and build
   transfer; the header representation changes disposal only, never element ownership.
-- The heap form never retains a view. A record element may retain independently owned `string`
-  fields only when every reachable owner is free-standing before `push`; the region form is the
-  separate path for borrowed fields.
+- The heap form never retains a view. A record element may retain independently owned `string` and
+  dynamic-array fields only when every reachable owner is free-standing before `push`; the region
+  form is the separate path for borrowed fields.
 - An arena-owned result of `array_builder(out).build()` is consumed into its final aggregate in the
   same function; it is not passed by value through an ordinary call boundary.
 - Slices are Copy views; a `mut slice<T>` binding (or `out` param) is the one writable-view form.

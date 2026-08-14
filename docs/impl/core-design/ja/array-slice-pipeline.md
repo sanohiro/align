@@ -55,6 +55,14 @@ deep-drop される AoS array へ移譲する。`append` は引き続き Copy sc
 実装 matrix は [`../../17-library-boundary-prerequisites.md`](../../17-library-boundary-prerequisites.md)
 §7.5 にある。完全な capability は 2026-08-14 に実装された。
 
+Request 10 の受理済み拡張は、この class を、受け入れ済み field grammar に対する Option と、
+要素が Copy scalar、`string`、または別の受け入れ済み record である dynamic array まで広げる。
+view は保持せず、push 前に到達可能な全 string/array buffer が free-standing であることを要求し、
+active Option、string array、Move record array を deep-drop する。runtime ABI は増やさない。
+Option や array を要素とする array は対象外である。正確な ledger と implementation matrix は
+§7.6 にあり、直接 string-array field を持つ record に対する既存の Option/Result/user-sum payload
+も閉じる。実装は未完了である。
+
 region 形式（必須L6、**実装済み**）:
 
 ```text
@@ -80,8 +88,9 @@ storage: field 'f' owns independent heap storage`。設計は
   consumed-arm、型が分岐する join、allocation mode が曖昧な source は growth 前に拒否する。
 - stack-local と boxed の heap-builder header は同じ initialized-prefix Drop と build transfer を
   使う。header representation が変えるのは header の破棄だけで、element ownership は変えない。
-- heap 形式は view を保持しない。record element が独立所有の `string` field を保持できるのは、
-  `push` より前に到達可能な全 owner が free-standing と証明できる場合だけである。borrowed field
+- heap 形式は view を保持しない。record element が独立所有の `string` field や dynamic-array
+  field を保持できるのは、`push` より前に到達可能な全 owner が free-standing と証明できる場合
+  だけである。borrowed field
   には別経路である region 形式を使う。
 - `array_builder(out).build()` のarena-owned結果は同じfunction内でfinal aggregateへ
   consumeし、通常call boundaryをby-valueでは通さない。

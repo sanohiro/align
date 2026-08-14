@@ -274,9 +274,11 @@ User {
 
 There is no class / inheritance.
 
-One field type is rejected at the **declaration**, independently of JSON or any other use: a bare
-`array<string>` field ("an `array<string>` field is not supported yet — its per-element deep free is
-a later slice"). Use `array<str>` for borrowed strings, or `array<Struct>` with a `string` field.
+An owned `array<string>` is a valid ordinary struct field. Its Drop walks the initialized strings
+before freeing the array buffer. This does not make it a supported JSON field: JSON decoding and
+encoding retain their own closed schema grammar. A finite Move struct containing that field may be
+used in the existing `Option`, `Result`, and user-sum payload positions; Drop still follows only the
+active tag. Use `array<str>` when the strings are borrowed.
 
 ### Sum Type
 
@@ -2354,21 +2356,26 @@ borrowable `array<T>`.
 
 The individually owned heap form accepts **Copy scalars** (int/float/bool/char), **`string`**, and a
 closed recursively view-free declared-record class. An admitted record is nonempty, naturally
-aligned to at most 8 bytes, has no explicit layout/alignment, and contains only Copy scalars,
-`string`, or another admitted record. Dynamic/fixed arrays, options/results, sums, tuples, boxes,
-resources/refs, raw/function/builder values, empty or cyclic records, explicit layout/alignment,
-and every direct or nested view are rejected before construction. A concrete generic record is
-tested only after monomorphization; there is no new generic bound or runtime dictionary.
+aligned to at most 8 bytes, has no explicit layout/alignment, and contains Copy scalars, `string`,
+another admitted record, recursively admitted `Option<T>`, or an owned `array<E>` whose element is
+a Copy scalar, `string`, or an admitted record. Options may nest. Arrays whose elements are options
+or dynamic arrays remain outside the type representation; fixed arrays, results, sums, tuples,
+boxes, resources/refs, raw/function/builder values, empty or cyclic records, explicit
+layout/alignment, and every direct or nested view are rejected before construction. A concrete
+generic record is tested only after monomorphization; there is no new generic bound or runtime
+dictionary.
 
 A `string` or Move record element is **moved** into the builder by `push`: its complete source is
-nulled, and every reachable string owner must be free-standing before the growth side effect.
+nulled, and every reachable string or dynamic-array owner must be free-standing before the growth
+side effect.
 Bound locals, fresh literals, by-value function results, transparent block tails, value-carrying
 `if`/`match`/`else`, and successful `?` unwraps including `map_err(...)?` are complete source forms. Borrowed or
 partially projected records, already-consumed arms, type-divergent joins, and arena-owned, mixed, or
 path-dependent nested owners reject before push. Reallocation relocates initialized record bytes
 without dropping the old byte positions. An unfinished builder recursively drops its initialized
-prefix in both stack-local and boxed-header modes; `build` transfers the same buffer from either
-mode to the ordinary deeply dropped `array<T>`.
+prefix in both stack-local and boxed-header modes. Option Drop visits only `Some`; string arrays
+drop every element before their buffer; arrays of Move records recurse through every element.
+`build` transfers the same buffer from either mode to the ordinary deeply dropped `array<T>`.
 `append` — which bulk-copies a borrowed `slice<T>` — remains Copy-scalar-only. The builder retains
 no runtime reflection or self-describing record wire: its nominal element type, interface graph,
 and compiler `DropPlan` are the single type/cleanup identity, and two same-shape declarations remain
@@ -2446,8 +2453,8 @@ A field may also be an owned
 `array<Struct>` (the `messages: array<Message>` shape): decode parses the JSON
 array into an owned array-of-structs in the field (freed by the struct's drop),
 and encode renders it back — so a full nested/array/optional record round-trips.
-The array element struct may itself be Move; its elements are deep-dropped. A
-bare `array<string>` field remains deferred, and a `soa<Struct>` stays
+The array element struct may itself be Move; its elements are deep-dropped. JSON decode/encode for
+a bare `array<string>` field remains deferred, and a `soa<Struct>` stays
 primitive/`str` columns.
 
 ### Union (Sum-Type) Mapping

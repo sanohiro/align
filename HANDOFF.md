@@ -52,12 +52,12 @@ required MIR's borrow-owned lowering path. Both stages now route through
 Pinning align-llm to the merged commit is align-llm-side work.
 
 align-llm Request 6 adoption is closed by align-llm PR #84. Request 8's Align-owned heap
-declared-record `array_builder` contract and closure matrix were accepted in #799, after align-llm
-#86 reconciled the consumer request. The implementation capability now closes formation, complete
-Move-record transfer, recursive unfinished cleanup in stack and boxed header modes, build transfer,
-checked-HIR validation, and nominal interface/cache identity. After its merge, update the sibling
-request register, run the required batch release build, and select the next accepted consumer
-request; reopen §7.5 only for a public or ownership-strategy change.
+declared-record `array_builder` contract was accepted in #799 and shipped in #801 at
+`029e27465d79e24cd36d374aae41dca0ec7e6979`. The sibling request register records the merged
+surface and the required batch release build is green. Request 10 is the next consumer-owned
+extension: `docs/impl/17-library-boundary-prerequisites.md` §7.6 owns its Options/dynamic-array
+ledger, exact C6 field graph, tagged-wrapper closure, and implementation matrix. Its implementation
+remains unshipped; reopen §7.6 only for a public or ownership-strategy change after design review.
 
 Out-of-gate suites (everything outside `scripts/test-pr.sh`) are guarded by the
 nightly full-suite workflow, which builds once, runs every compiled test binary
@@ -164,10 +164,11 @@ facts must live in this repository.
   execution record. The framework is general-purpose REST infrastructure, not
   an LLM-gateway-specific subset.
 - **align-llm requests:** Request 4 is merged through Align design #798 and implementation #800;
-  Request 6 is closed after Align design #703, implementation #704, and align-llm adoption #84.
-  Request 8's Align-owned design #799 is accepted and its implementation capability is complete
-  for publication. Requests 5 and 7–14 otherwise remain proposed in
-  `../align-llm/docs/align-requests.md`; Request 9 remains the later C7 blocker.
+  Request 6 is closed after Align design #703, implementation #704, and align-llm adoption #84;
+  Request 8 is merged through Align design #799 and implementation #801. Request 10's next
+  Align-owned design is §7.6 and remains unimplemented. Requests 5, 7, and 9–14 otherwise remain
+  proposed in `../align-llm/docs/align-requests.md`; Request 9 remains the later C7 blocker after
+  Request 7.
 
 Consumer-gated deferrals that remain intentional:
 

@@ -2008,7 +2008,12 @@ green. **Next: M13** (codegen quality & link hygiene, the pre-LLVM-upgrade wave)
   2026-08-14: the heap form also accepts the closed view-free Copy/owned-string record graph from
   `17-library-boundary-prerequisites.md` §7.5, with complete move-in, recursive unfinished cleanup,
   nominal interface/cache identity, and ordinary AoS-array Drop after build. `append` remains
-  Copy-scalar-only. The third member of the
+  Copy-scalar-only. The follow-on align-llm Request 10 design is
+  `17-library-boundary-prerequisites.md` §7.6: Options and dynamic arrays are admitted inside the
+  same view-free record graph only when every array element is a Copy scalar, owned `string`, or an
+  admitted record. Its gate pins the exact C6 field graph and closes the newly reachable existing
+  Option/Result/user-sum payload paths for a record with a direct string-array field. It adds no
+  runtime ABI and remains unimplemented. The third member of the
   grow-then-freeze family (`builder`→`string`,
   `buffer`→bytes, now typed): a builder holds **no views**, so amortized realloc can never
   invalidate one — memory-safe by construction, which is exactly why growable `array<T>`
