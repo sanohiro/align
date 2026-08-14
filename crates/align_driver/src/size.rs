@@ -29,7 +29,7 @@ const TOP_SYMBOLS: usize = 10;
 pub fn run_size(path: &str, target: BuildTarget, profile: Profile, rt_lto: bool, thin_lto: bool, pgo: &align_driver::PgoMode, jobs: usize, cache_stats: bool) -> ExitCode {
     // Keep the complete executable private through the report. Another `size` process cannot
     // replace or remove it while llvm-readobj/llvm-nm are inspecting it.
-    let stage = match crate::ArtifactStage::temp("align-size") {
+    let stage = match align_driver::ArtifactStage::temp("align-size") {
         Ok(stage) => stage,
         Err(e) => {
             eprintln!("alignc: cannot create size staging directory: {e}");

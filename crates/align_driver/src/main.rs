@@ -36,7 +36,6 @@ use std::process::ExitCode;
 /// exercise the shipped configuration, mimalloc included.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use align_driver::{
     build_interface_summaries, build_per_unit, check, emit_llvm_ir, emit_object_cached,
@@ -1575,50 +1574,6 @@ fn stem(path: &str) -> String {
         .unwrap_or_else(|| "a".to_string())
 }
 
-static ARTIFACT_NONCE: AtomicU64 = AtomicU64::new(0);
-
-/// A process-private staging directory. `create_dir` is the atomic claim: a stale or racing path is
-/// skipped, and Drop removes only the directory this invocation successfully created.
-struct ArtifactStage {
-    dir: PathBuf,
-}
-
-impl ArtifactStage {
-    fn in_dir(parent: &Path, label: &str) -> std::io::Result<Self> {
-        let parent = std::fs::canonicalize(parent)?;
-        for _ in 0..1024 {
-            let nonce = ARTIFACT_NONCE.fetch_add(1, Ordering::Relaxed);
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let dir = parent.join(format!(".{label}-{}-{stamp}-{nonce}", std::process::id()));
-            match std::fs::create_dir(&dir) {
-                Ok(()) => return Ok(Self { dir }),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e),
-            }
-        }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "could not create a unique artifact staging directory",
-        ))
-    }
-
-    fn temp(label: &str) -> std::io::Result<Self> {
-        Self::in_dir(&std::env::temp_dir(), label)
-    }
-
-    fn path(&self) -> &Path {
-        &self.dir
-    }
-}
-
-impl Drop for ArtifactStage {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
 
 /// Compile `path` **per unit** (walk the import DAG bottom-up, one object per unit under the
 /// separate-compilation visibility model) and link the N objects into `exe`. The one build path for
@@ -1635,7 +1590,7 @@ fn build_per_unit_to(path: &str, exe: &Path, target: BuildTarget, profile: Profi
         return build_package_to(path, exe, target, profile, rt_lto, pgo, jobs, cache_stats, UnitReuse::Allowed);
     }
     let walk = walk_or_report(path).ok_or(ExitCode::FAILURE)?;
-    let object_stage = ArtifactStage::temp("align-per-unit-obj").map_err(|e| {
+    let object_stage = align_driver::ArtifactStage::temp("align-per-unit-obj").map_err(|e| {
         eprintln!("alignc: cannot create object staging directory: {e}");
         ExitCode::FAILURE
     })?;
@@ -1745,7 +1700,7 @@ fn build_package_to(path: &str, exe: &Path, target: BuildTarget, profile: Profil
     // than an exhaustive match.)
     let echo = if reuse == UnitReuse::Allowed { DiagnosticEcho::All } else { DiagnosticEcho::ErrorsOnly };
     let mut build = package_or_report(path, &CacheContext::from_env(), reuse, echo).ok_or(ExitCode::FAILURE)?;
-    let object_stage = ArtifactStage::temp("align-per-unit-obj").map_err(|e| {
+    let object_stage = align_driver::ArtifactStage::temp("align-per-unit-obj").map_err(|e| {
         eprintln!("alignc: cannot create object staging directory: {e}");
         ExitCode::FAILURE
     })?;
@@ -1790,7 +1745,7 @@ fn build_package_to(path: &str, exe: &Path, target: BuildTarget, profile: Profil
 fn finish_link(link_libs: &[String], obj_paths: &[PathBuf], exe: &Path, profile: Profile, target: &BuildTarget, pgo: &align_driver::PgoMode) -> Result<(), ExitCode> {
 
     let parent = exe.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-    let publish_stage = ArtifactStage::in_dir(parent, "align-publish").map_err(|e| {
+    let publish_stage = align_driver::ArtifactStage::in_dir(parent, "align-publish").map_err(|e| {
         eprintln!("alignc: cannot create executable staging directory: {e}");
         ExitCode::FAILURE
     })?;
@@ -1941,7 +1896,7 @@ fn run_cache_clear() -> ExitCode {
 
 #[allow(clippy::too_many_arguments)]
 fn run_run(path: &str, prog_args: &[String], target: BuildTarget, profile: Profile, rt_lto: bool, thin_lto: bool, pgo: &align_driver::PgoMode, jobs: usize, cache_stats: bool) -> ExitCode {
-    let stage = match ArtifactStage::temp("align-run") {
+    let stage = match align_driver::ArtifactStage::temp("align-run") {
         Ok(stage) => stage,
         Err(e) => {
             eprintln!("alignc: cannot create run staging directory: {e}");

@@ -120,6 +120,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "align_repl"
+version = "0.5.0"
+dependencies = [
+ "align_ast",
+ "align_diag",
+ "align_driver",
+ "align_lexer",
+ "align_parser",
+ "align_runtime",
+ "align_sema",
+ "align_span",
+]
+
+[[package]]
 name = "align_runtime"
 version = "0.5.0"
 dependencies = [

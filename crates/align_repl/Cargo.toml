@@ -1,0 +1,28 @@
+[package]
+name = "align_repl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "align-repl"
+path = "src/main.rs"
+
+[lib]
+name = "align_repl"
+path = "src/lib.rs"
+
+[dependencies]
+align_span = { path = "../align_span" }
+align_diag = { path = "../align_diag" }
+align_ast = { path = "../align_ast" }
+align_lexer = { path = "../align_lexer" }
+align_parser = { path = "../align_parser" }
+align_sema = { path = "../align_sema" }
+align_driver = { path = "../align_driver" }
+align_runtime = { path = "../align_runtime" }
+
+[features]
+# Reserved for the v2 line editor (`docs/impl/22-repl-plan.md` V2d). Kept non-default so a
+# `--workspace --locked` build never compiles a UX dependency it does not need.
+default = []
