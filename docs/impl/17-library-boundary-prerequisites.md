@@ -1120,7 +1120,8 @@ or DB-named compiler operation reaches runtime code.
 
 ### 7.5 Individually owned heap-record builder
 
-Status: designed for align-llm Request 8; implementation not shipped.
+Status: implementation candidate for align-llm Request 8; available from the merge commit that
+contains the compiler and owner tests mapped by this section.
 
 The heap constructor keeps the existing syntax and allocation visibility:
 

@@ -520,7 +520,7 @@ pub enum Ty {
     /// typed member of the grow-then-freeze family (`builder`->`string`, `buffer`->bytes,
     /// this->`array<T>`). An opaque
     /// owned **Move** handle; [`ArrayBuilderElem`] is the exact element type. `array_builder()` selects
-    /// individually owned heap storage for the existing primitive/`string` surface.
+    /// individually owned heap storage for primitives, `string`, and closed declared records.
     /// `array_builder(out)` selects region-owned chunks for concrete `RegionPlain` elements and
     /// retains view provenance through pushed values. `build()` consumes either form: heap storage
     /// transfers zero-copy, while region chunks compact once in `out`. Never rides an aggregate
@@ -2426,6 +2426,51 @@ pub fn struct_abi_layout(
     tagged_types: &[hir::TaggedType],
 ) -> (u64, u64) {
     ty_abi_layout(Ty::Struct(id), structs, enums, tagged_types)
+}
+
+/// Whether `id` is the closed, naturally aligned record shape admitted by a heap
+/// `array_builder<S>`. Every reachable record must be nonempty, use Align's natural layout, and
+/// contain only primitive values, owned strings, or another admitted record. Inline cycles and
+/// missing definitions fail closed so source checking and checked-HIR validation share one exact
+/// classifier.
+pub fn heap_array_builder_record(
+    id: u32,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    if !struct_acyclic(id, structs, enums, tagged_types, &[]) {
+        return false;
+    }
+
+    let mut work = vec![id];
+    let mut seen = HashSet::new();
+    let mut records = Vec::new();
+    while let Some(current) = work.pop() {
+        if !seen.insert(current) {
+            continue;
+        }
+        let Some(definition) = structs.get(current as usize) else {
+            return false;
+        };
+        if definition.fields.is_empty()
+            || definition.align.is_some()
+            || definition.c_repr
+        {
+            return false;
+        }
+        records.push(current);
+        for field in definition.fields.iter().rev() {
+            match field.ty {
+                Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::String => {}
+                Ty::Struct(child) => work.push(child),
+                _ => return false,
+            }
+        }
+    }
+    records
+        .into_iter()
+        .all(|record| struct_abi_layout(record, structs, enums, tagged_types).1 <= 8)
 }
 
 /// Whether `ty` is a Move (owned) type — owns a heap buffer consumed on move. Includes Move structs
@@ -13154,6 +13199,18 @@ impl<'a> EscapeCheck<'a> {
             } => self.check_spawn_capture(closure, group, depth),
             EscapeFlowOp::ArrayBuilderStore { builder, value, depth } => {
                 let destination = self.region_of(builder, depth);
+                let moves_heap_record = matches!(
+                    builder.ty.array_builder_element(),
+                    Some(ArrayBuilderElem::Scalar(Scalar::Struct(id)))
+                        if struct_is_move(id, self.structs, self.enums, self.tagged_types)
+                );
+                if moves_heap_record && !self.drop_is_individual(value, depth) {
+                    self.diags.error(
+                        "a heap array_builder record must own only free-standing values; clone arena-owned fields into heap storage before push"
+                            .to_string(),
+                        value.span,
+                    );
+                }
                 if destination != Region::Static
                     && self.region_bearing(value.ty)
                     && !self.region_of(value, depth).outlives(destination)
@@ -36643,10 +36700,13 @@ impl<'a, 't> Checker<'a, 't> {
         } else if !matches!(elem,
             ArrayBuilderElem::Scalar(
                 Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::String)
+        ) && !matches!(elem,
+            ArrayBuilderElem::Scalar(Scalar::Struct(id))
+                if heap_array_builder_record(id, self.structs, self.enums, self.tagged_types)
         ) {
             self.diags.error(
                 format!(
-                    "heap array_builder<{}> requires a Copy scalar or `string`; use `array_builder(out)` for RegionPlain values",
+                    "heap array_builder<{}> requires a Copy scalar, `string`, or a closed heap-record shape; use `array_builder(out)` for RegionPlain values",
                     elem.name()
                 ),
                 span,
@@ -36780,8 +36840,9 @@ impl<'a, 't> Checker<'a, 't> {
 
     /// `b.push(v)` (M12 A6) — append one element to a growable `array_builder`, borrowing the builder
     /// (mutated through its handle, not consumed). The receiver must be a `mut`-bound `array_builder`
-    /// local. A RegionPlain value is copied with its borrow provenance; a heap-form `string` is
-    /// **moved** in (its source is nulled and the builder deep-frees it on Drop). Calls through a
+    /// local. A RegionPlain or Copy heap record is copied with its provenance; a heap-form `string`
+    /// or Move heap record is **moved** in (its source is nulled and the builder deep-frees it on
+    /// Drop). Calls through a
     /// `borrow mut` parameter conservatively retain the roots of all view-bearing arguments in the
     /// caller's builder. Pure (growth).
     fn check_array_builder_push(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
@@ -36806,12 +36867,18 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(format!("'.push()' expects a {} element, got {}", ty_name(elem_ty), ty_name(value.ty)), v.span);
             return err;
         }
-        Expr { kind: ExprKind::ArrayBuilderPush { builder: Box::new(recv_expr), value: Box::new(value), moves_value: elem == ArrayBuilderElem::Scalar(Scalar::String)}, ty: Ty::Unit, span }
+        let moves_value = elem == ArrayBuilderElem::Scalar(Scalar::String)
+            || matches!(
+                elem,
+                ArrayBuilderElem::Scalar(Scalar::Struct(id))
+                    if struct_is_move(id, self.structs, self.enums, self.tagged_types)
+            );
+        Expr { kind: ExprKind::ArrayBuilderPush { builder: Box::new(recv_expr), value: Box::new(value), moves_value }, ty: Ty::Unit, span }
     }
 
     /// `b.append(xs)` (M12 A6) — bulk-append a `slice<T>` of Copy-scalar elements to a growable
-    /// `array_builder`, borrowing the builder (mutated in place) and copying `xs` in. Every admitted
-    /// non-`string` element is Copy; a `string` is added one at a time via `push`, which moves it in.
+    /// `array_builder`, borrowing the builder (mutated in place) and copying `xs` in. This remains
+    /// limited to the established primitive Copy scalars; records and strings use `push`.
     /// Pure (growth).
     fn check_array_builder_append(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
@@ -36820,9 +36887,9 @@ impl<'a, 't> Checker<'a, 't> {
         else {
             return err;
         };
-        if elem == ArrayBuilderElem::Scalar(Scalar::String) {
+        if matches!(elem, ArrayBuilderElem::Scalar(Scalar::String | Scalar::Struct(_))) {
             self.diags.error(
-                "'.append()' is not available on an array_builder<string> (append bulk-copies a borrowed slice; a `string` element is added with `push`, which moves it in)".to_string(),
+                format!("'.append()' is not available on an array_builder<{}>; record and `string` elements are added one at a time with `push`", elem.name()),
                 span,
             );
             return err;
@@ -51779,6 +51846,68 @@ fn exit_branch(flag: bool) -> i64 {
             "P { x: i64 }\nfn main() -> i32 {\n  xs := [P{x: 1}, P{x: 2}]\n  cs := xs.chunks(1)\n  return 0\n}\n",
         );
         assert!(d.has_errors(), "chunking a struct array must be rejected");
+    }
+
+    #[test]
+    fn heap_array_builder_record_classifier_is_closed_and_cycle_safe() {
+        let record = |name: &str, ty: Ty| StructDef {
+            name: name.to_string(),
+            source_name: name.to_string(),
+            fields: vec![FieldDef { name: "field".to_string(), ty }],
+            align: None,
+            c_repr: false,
+        };
+        let accepted = vec![
+            record("Inner", Ty::String),
+            record("Outer", Ty::Struct(0)),
+        ];
+        assert!(heap_array_builder_record(0, &accepted, &[], &[]));
+        assert!(heap_array_builder_record(1, &accepted, &[], &[]));
+        assert!(struct_is_move(1, &accepted, &[], &[]));
+
+        for (label, field) in [
+            ("unit", Ty::Unit),
+            ("view", Ty::Str),
+            ("slice", Ty::Slice(Scalar::Int(IntTy { bits: 64, signed: true }))),
+            ("resource-ref", Ty::ResourceRef(0)),
+            ("resource", Ty::Resource(0)),
+            ("raw", Ty::Raw),
+            ("function", Ty::Fn(0)),
+            ("builder", Ty::Builder),
+            ("dynamic-array", Ty::DynArray(Scalar::Int(IntTy { bits: 64, signed: true }))),
+            ("fixed-array", Ty::Array(Scalar::Int(IntTy { bits: 64, signed: true }), 2)),
+            ("option", Ty::Option(Scalar::String)),
+            ("result", Ty::Result(Scalar::String, Scalar::String)),
+            ("sum", Ty::Enum(0)),
+            ("tuple", Ty::Tuple(0)),
+            ("box", Ty::Box(Scalar::Int(IntTy { bits: 64, signed: true }))),
+            ("array-builder", Ty::ArrayBuilder(Scalar::String)),
+        ] {
+            assert!(
+                !heap_array_builder_record(0, &[record("Rejected", field)], &[], &[]),
+                "closed HeapRecord classifier admitted {label}"
+            );
+        }
+
+        let empty = StructDef {
+            name: "Empty".to_string(),
+            source_name: "Empty".to_string(),
+            fields: Vec::new(),
+            align: None,
+            c_repr: false,
+        };
+        assert!(!heap_array_builder_record(0, &[empty], &[], &[]));
+
+        let mut aligned = record("Aligned", Ty::Int(IntTy { bits: 64, signed: true }));
+        aligned.align = Some(16);
+        assert!(!heap_array_builder_record(0, &[aligned], &[], &[]));
+
+        let mut c_layout = record("CRow", Ty::Int(IntTy { bits: 64, signed: true }));
+        c_layout.c_repr = true;
+        assert!(!heap_array_builder_record(0, &[c_layout], &[], &[]));
+
+        assert!(!heap_array_builder_record(0, &[record("Unknown", Ty::Struct(99))], &[], &[]));
+        assert!(!heap_array_builder_record(0, &[record("Cycle", Ty::Struct(0))], &[], &[]));
     }
 
     #[test]

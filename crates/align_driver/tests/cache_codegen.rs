@@ -667,6 +667,52 @@ fn json_scan_copy_row_codegen_key_identity_owner() {
     );
 }
 
+#[test]
+fn record_builder_nominal_identity_and_definition_edit_revert() {
+    if !backend() {
+        return;
+    }
+    let v1 = "Left { value: i32 }\nRight { value: i32 }\nfn main() -> i32 {\n  mut left: array_builder<Left> := array_builder()\n  left.push(Left { value: 20 })\n  mut right: array_builder<Right> := array_builder()\n  right.push(Right { value: 22 })\n  return (left.build().len() + right.build().len() + 40) as i32\n}\n";
+    let v2 = "Left { value: i32 }\nRight { renamed: i32 }\nfn main() -> i32 {\n  mut left: array_builder<Left> := array_builder()\n  left.push(Left { value: 20 })\n  mut right: array_builder<Right> := array_builder()\n  right.push(Right { renamed: 22 })\n  return (left.build().len() + right.build().len() + 40) as i32\n}\n";
+    let project = Project::new("record-builder-nominal", &[("main.align", v1)], "main.align");
+    let cache = project.cache();
+    let cold = emit_all(
+        &project,
+        &cache,
+        Profile::Release,
+        BuildTarget::Baseline,
+        &no_exports(),
+        false,
+    );
+    assert!(cold.outcomes.iter().all(|outcome| !outcome.hit));
+
+    project.write("main.align", v2);
+    let edited = emit_all(
+        &project,
+        &cache,
+        Profile::Release,
+        BuildTarget::Baseline,
+        &no_exports(),
+        false,
+    );
+    assert!(!edited.outcome("main").hit, "reachable nominal definition edit must miss");
+    assert_eq!(edited.outcome("main").miss_reason, Some(FirstDiff::MirDigest));
+
+    project.write("main.align", v1);
+    let reverted = emit_all(
+        &project,
+        &cache,
+        Profile::Release,
+        BuildTarget::Baseline,
+        &no_exports(),
+        false,
+    );
+    assert!(reverted.outcome("main").hit, "exact definition revert must recover the old cache identity");
+    if cc_available() {
+        assert_eq!(reverted.run(&project, Profile::Release), "");
+    }
+}
+
 // ---- Gate 3: transitive A→B→C invalidation ------------------------------------------------------
 
 #[test]

@@ -2,9 +2,9 @@
 //! (`builder`->`string`, `buffer`->bytes, this->`array<T>`). `array_builder()` opens an empty
 //! builder; `b.push(v)` / `b.append(xs: slice<T>)` grow it in place (a `mut`-bound local); `b.build()`
 //! **consumes** it into an owned `array<T>` (a zero-copy ptr+len retype over `align_rt_realloc`
-//! storage). Element set v1 = Copy scalars + `string` (push MOVES a string in; the builder's own Drop
-//! deep-frees pushed-not-frozen strings). Move-handle exclusions (no aggregate riding, capture into
-//! par_map/spawn rejected). (`docs/impl/07-roadmap.md` M12 Slice A6; `draft.md` §18.2.)
+//! storage). Heap elements are primitive Copy scalars, `string`, or a closed declared record; push
+//! moves strings and Move records, and unfinished builders deep-drop their initialized prefix.
+//! Move-handle exclusions and capture restrictions remain unchanged.
 
 mod common;
 use common::*;
@@ -58,6 +58,155 @@ fn char_push_build_then_index() {
     let src = "fn main() -> i32 {\n  mut b: array_builder<char> := array_builder()\n  b.push('a')\n  b.push('z')\n  xs := b.build()\n  mut n := 0\n  if xs[0] == 'a' { n = n + 1 }\n  if xs[1] == 'z' { n = n + 2 }\n  return n\n}\n";
     let out = build_and_run("ab-char", src);
     assert_eq!(code(&out), Some(3), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+// --- closed heap records ------------------------------------------------------------------------
+
+/// Copy records use the same zero-copy AoS buffer for empty, singleton, and repeatedly grown
+/// builders. Reading fields after several reallocations verifies both stride and natural alignment.
+#[test]
+fn copy_record_push_build_zero_one_many_and_realloc() {
+    if !backend_available() {
+        return;
+    }
+    let src = "Point { x: i32, y: i32 }\nfn main() -> i32 {\n  mut empty: array_builder<Point> := array_builder()\n  e := empty.build()\n  mut one: array_builder<Point> := array_builder()\n  one.push(Point { x: 7, y: 9 })\n  a := one.build()\n  mut many: array_builder<Point> := array_builder()\n  mut i: i32 := 0\n  loop {\n    many.push(Point { x: i, y: i + 1 })\n    i = i + 1\n    if i >= 100 { break }\n  }\n  xs := many.build()\n  return e.len() as i32 + a[0].x + xs[99].y\n}\n";
+    let out = build_and_run("ab-copy-record", src);
+    assert_eq!(code(&out), Some(107), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// A nested Move record transfers every reachable string into the builder, survives growth, and
+/// becomes an ordinary `array<S>` whose Drop recursively frees each element.
+#[test]
+fn record_builder_realloc_preserves_nested_owners() {
+    if !backend_available() {
+        return;
+    }
+    let src = "Text { value: string }\nRow { id: i32, text: Text }\nfn main() -> i32 {\n  mut b: array_builder<Row> := array_builder()\n  mut i: i32 := 0\n  loop {\n    b.push(Row { id: i, text: Text { value: \"owned\".clone() } })\n    i = i + 1\n    if i >= 100 { break }\n  }\n  rows := b.build()\n  return rows.len() as i32\n}\n";
+    let out = build_and_run("ab-move-record-build", src);
+    assert_eq!(code(&out), Some(100), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// Dropping an unfinished Move-record builder runs the same recursive element DropPlan as the
+/// frozen array path. Repetition exercises both the initialized prefix and header cleanup.
+#[test]
+fn unfrozen_move_record_builder_deep_drops_initialized_prefix() {
+    if !backend_available() {
+        return;
+    }
+    let src = "Owned { text: string }\nfn main() -> i32 {\n  mut i := 0\n  loop {\n    mut b: array_builder<Owned> := array_builder()\n    b.push(Owned { text: \"left\".clone() })\n    b.push(Owned { text: \"right\".clone() })\n    i = i + 1\n    if i >= 2000 { break }\n  }\n  return 0\n}\n";
+    let out = build_and_run("ab-move-record-unfrozen", src);
+    assert_eq!(code(&out), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// Reassignment deep-drops the old initialized prefix before the local receives a fresh builder.
+#[test]
+fn record_builder_reassignment_drops_old_storage() {
+    if !backend_available() {
+        return;
+    }
+    let src = "Owned { text: string }\nfn main() -> i32 {\n  mut b: array_builder<Owned> := array_builder()\n  b.push(Owned { text: \"old-a\".clone() })\n  b.push(Owned { text: \"old-b\".clone() })\n  b = array_builder()\n  b.push(Owned { text: \"new\".clone() })\n  return b.build().len() as i32\n}\n";
+    let out = build_and_run("ab-record-reassign", src);
+    assert_eq!(code(&out), Some(1), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// Record builders preserve the existing owner model across `borrow mut`, by-value transfer, and
+/// return. The call-crossing header is boxed while element ownership remains exactly once.
+#[test]
+fn record_builder_by_value_parameter_return_and_borrow_mut() {
+    if !backend_available() {
+        return;
+    }
+    let src = "Owned { text: string }\nfn add(borrow mut b: array_builder<Owned>, text: string) {\n  b.push(Owned { text: text })\n}\nfn pass(b: array_builder<Owned>) -> array_builder<Owned> = b\nfn main() -> i32 {\n  mut b: array_builder<Owned> := array_builder()\n  add(b, \"first\".clone())\n  mut c := pass(b)\n  add(c, \"second\".clone())\n  return c.build().len() as i32\n}\n";
+    let out = build_and_run("ab-record-functions", src);
+    assert_eq!(code(&out), Some(2), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+
+    let consumes_borrow = "Owned { text: string }\nfn finish(borrow mut b: array_builder<Owned>) -> array<Owned> = b.build()\nfn main() -> i32 = 0\n";
+    assert!(check_errs("ab-record-consume-borrow", consumes_borrow));
+}
+
+/// A boxed header abandoned by a by-value callee drains its initialized Move-record prefix.
+#[test]
+fn boxed_record_builder_abandonment_deep_drops() {
+    if !backend_available() {
+        return;
+    }
+    let src = "Owned { text: string }\nfn abandon(b: array_builder<Owned>) {}\nfn main() -> i32 {\n  mut i := 0\n  loop {\n    mut b: array_builder<Owned> := array_builder()\n    b.push(Owned { text: \"boxed\".clone() })\n    abandon(b)\n    i = i + 1\n    if i >= 2000 { break }\n  }\n  return 0\n}\n";
+    let out = build_and_run("ab-record-boxed-abandon", src);
+    assert_eq!(code(&out), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// Stack-local unfinished builders clean their initialized prefix on early return, propagated
+/// error, branch/match joins, and loop back-edges/breaks.
+#[test]
+fn record_builder_abandonment_all_exit_kinds() {
+    if !backend_available() {
+        return;
+    }
+    let src = "Tag { A, B }\nOwned { text: string }\nfn early_return() -> i32 {\n  mut b: array_builder<Owned> := array_builder()\n  b.push(Owned { text: \"return\".clone() })\n  return 1\n}\nfn fail() -> Result<(), Error> = Err(Error.Code(7))\nfn early_error() -> Result<(), Error> {\n  mut b: array_builder<Owned> := array_builder()\n  b.push(Owned { text: \"error\".clone() })\n  fail()?\n  return Ok(())\n}\nfn branch(flag: bool) {\n  if flag {\n    mut b: array_builder<Owned> := array_builder()\n    b.push(Owned { text: \"branch-a\".clone() })\n  } else {\n    mut b: array_builder<Owned> := array_builder()\n    b.push(Owned { text: \"branch-b\".clone() })\n  }\n}\nfn matched(tag: Tag) {\n  match tag {\n    A => { mut b: array_builder<Owned> := array_builder(); b.push(Owned { text: \"match-a\".clone() }) }\n    B => { mut b: array_builder<Owned> := array_builder(); b.push(Owned { text: \"match-b\".clone() }) }\n  }\n}\nfn repeated() {\n  mut i := 0\n  loop {\n    mut b: array_builder<Owned> := array_builder()\n    b.push(Owned { text: \"loop\".clone() })\n    i = i + 1\n    if i >= 20 { break }\n  }\n}\nfn main() -> i32 {\n  n := early_return()\n  result := early_error()\n  branch(true)\n  branch(false)\n  matched(Tag.A)\n  matched(Tag.B)\n  repeated()\n  return match result { Ok(_) => 0, Err(_) => n }\n}\n";
+    let out = build_and_run("ab-record-abandonment", src);
+    assert_eq!(code(&out), Some(1), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// Failure while constructing the next Move record remains source-aggregate cleanup and cannot
+/// increment the builder's initialized length.
+#[test]
+fn record_builder_partial_element_failure_drops_fields() {
+    if !backend_available() {
+        return;
+    }
+    let src = "Pair { left: string, right: string }\nfn fail() -> Result<string, Error> = Err(Error.Code(9))\nfn attempt(borrow mut b: array_builder<Pair>) -> Result<(), Error> {\n  b.push(Pair { left: \"constructed\".clone(), right: fail()? })\n  return Ok(())\n}\nfn main() -> i32 {\n  mut b: array_builder<Pair> := array_builder()\n  result := attempt(b)\n  n := b.build().len() as i32\n  return match result { Ok(_) => 10, Err(_) => n }\n}\n";
+    let out = build_and_run("ab-record-partial", src);
+    assert_eq!(code(&out), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// Push consumes a Move record as a complete value, just like pushing a `string`.
+#[test]
+fn move_record_push_consumes_source() {
+    let src = "Owned { text: string }\nfn main() -> i32 {\n  value := Owned { text: \"owned\".clone() }\n  mut b: array_builder<Owned> := array_builder()\n  b.push(value)\n  print(value.text)\n  return 0\n}\n";
+    let diags = check_diagnostics("ab-move-record-source", src);
+    assert!(diags.contains("moved"), "expected a moved-value error, got:\n{diags}");
+}
+
+/// Complete Move-record rvalues transfer through every established value-producing source shape.
+/// Each selected source becomes exactly one initialized builder element.
+#[test]
+fn record_builder_move_source_matrix() {
+    if !backend_available() {
+        return;
+    }
+    let src = "MyErr { Bad }\nChoice { A, B }\nOwned { text: string }\nfn make(text: str) -> Owned = Owned { text: text.clone() }\nfn load() -> Result<Owned, Error> = Ok(make(\"try\"))\nfn load_custom() -> Result<Owned, MyErr> = Ok(make(\"map-err\"))\nfn to_error(error: MyErr) -> Error = Error.Code(1)\nfn main() -> Result<(), Error> {\n  mut b: array_builder<Owned> := array_builder()\n  local := make(\"local\")\n  b.push(local)\n  b.push(Owned { text: \"literal\".clone() })\n  b.push(make(\"result\"))\n  b.push({ Owned { text: \"block\".clone() } })\n  b.push(if true { make(\"if-a\") } else { make(\"if-b\") })\n  b.push(match Choice.A { A => make(\"match-a\"), B => make(\"match-b\") })\n  option: Option<Owned> := Some(make(\"option\"))\n  b.push(option else make(\"fallback\"))\n  b.push(load()?)\n  b.push(load_custom().map_err(to_error)?)\n  print(b.build().len())\n  return Ok(())\n}\n";
+    let out = build_and_run("ab-record-source-matrix", src);
+    assert_eq!(code(&out), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "9\n");
+
+    let borrowed = "Owned { text: string }\nfn push_borrow(borrow value: Owned, borrow mut b: array_builder<Owned>) { b.push(value) }\nfn main() -> i32 = 0\n";
+    assert!(check_errs("ab-record-borrowed-source", borrowed));
+
+    let field = "Owned { text: string }\nOuter { value: Owned }\nfn main() -> i32 {\n  outer := Outer { value: Owned { text: \"field\".clone() } }\n  mut b: array_builder<Owned> := array_builder()\n  b.push(outer.value)\n  return 0\n}\n";
+    assert!(check_errs("ab-record-field-source", field));
+}
+
+/// Heap records are intentionally closed: views, explicit layout attributes, and empty records do
+/// not acquire an accidental byte-copy ABI through `array_builder`.
+#[test]
+fn record_builder_field_predicate_rejects_closed_shapes() {
+    for (name, ty, declaration) in [
+        ("view", "View", "View { text: str }"),
+        ("empty", "Empty", "Empty { }"),
+        ("aligned", "Aligned", "align(16) Aligned { value: i64 }"),
+        ("c-layout", "CRow", "layout(C) CRow { value: i64 }"),
+    ] {
+        let src = format!("{declaration}\nfn main() -> i32 {{\n  mut b: array_builder<{ty}> := array_builder()\n  return 0\n}}\n");
+        assert!(check_errs(&format!("ab-record-reject-{name}"), &src), "{name} record unexpectedly admitted");
+    }
+}
+
+/// `append` keeps its primitive Copy-scalar contract; record elements use `push`, which preserves
+/// the complete-value ownership rule.
+#[test]
+fn record_builder_append_is_rejected() {
+    let src = "Point { x: i32 }\nfn main() -> i32 {\n  points := [Point { x: 1 }]\n  mut b: array_builder<Point> := array_builder()\n  b.append(points[..])\n  return 0\n}\n";
+    assert!(check_errs("ab-record-append", src));
 }
 
 // --- empty / append / order ----------------------------------------------------------------------

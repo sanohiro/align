@@ -6149,6 +6149,115 @@ fn body_test_local(
     }
 }
 
+#[test]
+fn heap_record_array_builder_rows_match_the_producer() {
+    fn record_program(record: StructDef, moves_value: bool) -> hir::Program {
+        let mut program = baseline_program();
+        program.structs = vec![record];
+        let elem = ArrayBuilderElem::Scalar(Scalar::Struct(0));
+        let builder_ty = Ty::array_builder(elem);
+        let array_ty = Ty::DynStructArray(0, Layout::Aos);
+        program.fns = vec![
+            body_tail_case(
+                "heap_record_new",
+                body_test_expr(
+                    hir::ExprKind::ArrayBuilderNew { elem, region: None },
+                    builder_ty,
+                ),
+                builder_ty,
+            ),
+            body_test_named_function(
+                "heap_record_push",
+                hir::Block {
+                    stmts: vec![hir::Stmt::Expr(body_test_expr(
+                        hir::ExprKind::ArrayBuilderPush {
+                            builder: Box::new(native_local(0, builder_ty)),
+                            value: Box::new(native_local(1, Ty::Struct(0))),
+                            moves_value,
+                        },
+                        Ty::Unit,
+                    ))],
+                    value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit))),
+                },
+                vec![
+                    body_test_local(0, "builder", builder_ty, true, false),
+                    body_test_local(1, "value", Ty::Struct(0), false, false),
+                ],
+                Ty::Unit,
+            ),
+            body_tail_case(
+                "heap_record_build",
+                body_test_expr(
+                    hir::ExprKind::ArrayBuilderBuild(Box::new(native_local(0, builder_ty))),
+                    array_ty,
+                ),
+                array_ty,
+            ),
+        ];
+        program.fns[2].locals = vec![body_test_local(0, "builder", builder_ty, false, false)];
+        program
+    }
+
+    let copy = record_program(
+        StructDef {
+            name: "CopyRow".to_string(),
+            source_name: "CopyRow".to_string(),
+            fields: vec![FieldDef { name: "value".to_string(), ty: int(64) }],
+            align: None,
+            c_repr: false,
+        },
+        false,
+    );
+    assert!(body_core_metadata_is_valid(&copy), "producer-valid Copy record rows rejected");
+
+    let owned = record_program(
+        StructDef {
+            name: "OwnedRow".to_string(),
+            source_name: "OwnedRow".to_string(),
+            fields: vec![FieldDef { name: "value".to_string(), ty: Ty::String }],
+            align: None,
+            c_repr: false,
+        },
+        true,
+    );
+    assert!(body_core_metadata_is_valid(&owned), "producer-valid Move record rows rejected");
+
+    let mut wrong_move = owned.clone();
+    let hir::Stmt::Expr(push) = &mut wrong_move.fns[1].body.stmts[0] else {
+        panic!("push row changed shape")
+    };
+    let hir::ExprKind::ArrayBuilderPush { moves_value, .. } = &mut push.kind else {
+        panic!("push row changed kind")
+    };
+    *moves_value = false;
+    assert!(!body_core_metadata_is_valid(&wrong_move), "inverted record move bit accepted");
+
+    for (label, mutate) in [
+        ("empty", 0_u8),
+        ("view", 1),
+        ("aligned", 2),
+        ("c-layout", 3),
+        ("unknown-child", 4),
+    ] {
+        let mut malformed = copy.clone();
+        match mutate {
+            0 => malformed.structs[0].fields.clear(),
+            1 => malformed.structs[0].fields[0].ty = Ty::Str,
+            2 => malformed.structs[0].align = Some(16),
+            3 => malformed.structs[0].c_repr = true,
+            4 => malformed.structs[0].fields[0].ty = Ty::Struct(99),
+            _ => unreachable!(),
+        }
+        assert!(!body_core_metadata_is_valid(&malformed), "malformed {label} record accepted");
+    }
+
+    let mut wrong_result = copy.clone();
+    wrong_result.fns[2].ret = Ty::DynStructArray(0, Layout::Soa);
+    wrong_result.fns[2].body.value.as_deref_mut().expect("build row").ty =
+        Ty::DynStructArray(0, Layout::Soa);
+    assert!(!body_core_metadata_is_valid(&wrong_result), "non-AoS build result accepted");
+}
+
 fn body_unit_case(name: &str, expression: hir::Expr) -> hir::Fn {
     body_test_named_function(
         name,

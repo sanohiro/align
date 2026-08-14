@@ -4211,8 +4211,14 @@ impl<'a> BodyValidator<'a> {
         let ArrayBuilderElem::Scalar(elem) = elem else {
             return false;
         };
-        align_sema::scalar_to_prim(elem).is_some()
-            && (elem == Scalar::String || self.scalar_copy_ok(elem))
+        matches!(elem, Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::String)
+            || matches!(elem, Scalar::Struct(id)
+                if align_sema::heap_array_builder_record(
+                    id,
+                    &self.program.structs,
+                    &self.program.enums,
+                    &self.program.tagged_types,
+                ))
     }
 
     fn array_builder_region_elem_ok(&self, elem: ArrayBuilderElem) -> bool {
@@ -7296,8 +7302,17 @@ impl<'a> BodyValidator<'a> {
                 if !(self.array_builder_elem_ok(elem) || self.array_builder_region_elem_ok(elem))
                     || !mutable_local(builder, Ty::array_builder(elem))
                     || !self.body_ty_matches(value.ty, elem.ty())
-                    || *moves_value
-                        != matches!(elem, ArrayBuilderElem::Scalar(Scalar::String))
+                    || *moves_value != (elem == ArrayBuilderElem::Scalar(Scalar::String)
+                        || matches!(
+                            elem,
+                            ArrayBuilderElem::Scalar(Scalar::Struct(id))
+                                if align_sema::struct_is_move(
+                                    id,
+                                    &self.program.structs,
+                                    &self.program.enums,
+                                    &self.program.tagged_types,
+                                )
+                        ))
                 {
                     return None;
                 }
@@ -7309,7 +7324,7 @@ impl<'a> BodyValidator<'a> {
                     return None;
                 };
                 if !(self.array_builder_elem_ok(elem) || self.array_builder_region_elem_ok(elem))
-                    || scalar == Scalar::String
+                    || matches!(scalar, Scalar::String | Scalar::Struct(_))
                     || !self.scalar_copy_ok(scalar)
                     || !mutable_local(builder, Ty::array_builder(elem))
                     || data.ty != Ty::Slice(scalar)

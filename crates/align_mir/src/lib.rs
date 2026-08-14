@@ -8577,7 +8577,7 @@ fn lower_bytes_read(b: &mut Builder, bytes: &hir::Expr, offset: &hir::Expr, be: 
 /// `buf.put_<scalar>_<le|be>(v)` → append `v`'s bytes to the growable buffer. A unit-valued
 /// side-effecting rvalue (the runtime grows the buffer); returns `()`.
 /// Lower an `array_builder<T>` op (M12 A6): new opens a builder sized to the element stride;
-/// push/append grow it (`push` of a `string` element moves the value in — null its source slot);
+/// push/append grow it (`push` of a Move element transfers the value and nulls its source slot);
 /// build freezes it into `array<T>` (consuming — null the builder slot). The backend derives exact
 /// target layout for region-plain aggregate copies. Out-of-line (`#[inline(never)]`) so its arm
 /// locals stay off the recursive `lower_expr` frame (#296).
@@ -8600,10 +8600,14 @@ fn lower_array_builder_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let val = lower_required!(b, lower_expr(b, value), Operand::Const(Const::Unit));
             let t = b.fresh_value(Ty::Unit);
             if *moves_value {
-                // A `string` element is moved into the builder; null its source slot so the source's
-                // exit `Drop` frees null (the builder now owns the buffer, deep-freed on its Drop).
+                // A Move element is transferred into the builder; null its source slot so its exit
+                // `Drop` frees null (the builder now owns every reachable allocation).
                 null_moved_source(b, value);
-                b.push(Stmt::Let(t, Rvalue::ArrayBuilderPushStr { builder: bop, value: val }));
+                if value.ty == Ty::String {
+                    b.push(Stmt::Let(t, Rvalue::ArrayBuilderPushStr { builder: bop, value: val }));
+                } else {
+                    b.push(Stmt::Let(t, Rvalue::ArrayBuilderPush { builder: bop, value: val, scalar: value.ty }));
+                }
             } else {
                 b.push(Stmt::Let(t, Rvalue::ArrayBuilderPush { builder: bop, value: val, scalar: value.ty }));
             }

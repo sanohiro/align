@@ -1069,9 +1069,9 @@ pub enum ExprKind {
     },
     /// `b.push(v)` — append one element to a growable `array_builder`, growing it (amortized). The
     /// `ty` is [`crate::Ty::Unit`]. The receiver must be a `mut array_builder` local (mutated in
-    /// place). `moves_value` is set for a `string` element: `v` is **moved** into the builder (its
-    /// source is nulled), so MoveCheck consumes it; a Copy region-plain element is copied while its
-    /// borrowed storage provenance is retained. Pure (growth).
+    /// place). `moves_value` is set for a `string` or Move heap-record element: `v` is **moved** into
+    /// the builder (its source is nulled), so MoveCheck consumes it; a Copy region-plain element is
+    /// copied while its borrowed storage provenance is retained. Pure (growth).
     ArrayBuilderPush { builder: Box<Expr>, value: Box<Expr>, moves_value: bool },
     /// `b.append(xs)` — bulk-append a `slice<T>` of Copy elements to a growable `array_builder`,
     /// copying them in and growing it. Heap mode remains scalar-only; region mode accepts validated

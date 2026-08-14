@@ -13099,9 +13099,9 @@ pub unsafe extern "C" fn align_rt_array_builder_push_str(b: *mut ArrayBuilder, p
     LIVE_ARRAY_BUILDER_STRINGS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// Append one arbitrary Copy element by copying exactly `elem_size` initialized bytes from `src`.
-/// Used for RegionPlain views, Options, sums, and structs whose physical value does not fit in the
-/// scalar-bits entry point.
+/// Append one arbitrary fixed-layout element by copying exactly `elem_size` initialized bytes from
+/// `src`. Used for RegionPlain values and for heap records; ownership of a Move record has already
+/// transferred at the checked compiler boundary before this byte copy.
 ///
 /// # Safety
 /// `b` must be a live builder and `src` must address one initialized element of its exact layout.

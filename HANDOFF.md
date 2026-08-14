@@ -37,12 +37,13 @@ and EXPLAIN are proved against PostgreSQL/pgvector; SQLite vec1 and the wider RD
 boundary are recorded without adding an extension loader or common vector/search abstraction. Any
 later direct native-vector mapping remains a separate consumer-driven, driver-qualified design.
 
-The next consumer-backed capability is align-llm Request 4: client-side HTTP/1.1 chunked response
-de-framing for the C1 provider-stream acceptance gate. Its public contract, framing/reuse matrix,
-allocation rule, and implementation closure matrix are accepted in
-`docs/impl/std-design/http.md` "Client response framing". It changes no public API or ABI. The next
-PR implements that reviewed runtime-only boundary across plaintext/TLS, `http.parse`, pooling, and
-the existing client calls; a public or allocation-strategy change reopens the matrix first.
+The active consumer-backed capability is align-llm Request 8: heap `array_builder<S>` support for
+closed declared records. Its design merged in #799 at
+`60622c60a4fc21b8586e1f6a907c32c025aa1658`; branch `agent/heap-record-array-builder` implements the
+shared HeapRecord classifier, complete-value Copy/Move push, recursive unfinished-builder cleanup,
+checked-HIR parity, generic concrete instances, imported interface graphs, and cache identity.
+After this capability merges and align-llm adopts its exact compiler commit, Request 4 remains the
+next independent accepted prerequisite: client-side HTTP/1.1 chunked response de-framing for C1.
 
 The align-llm compatibility break found by the v0.4.0-successor release
 compiler is closed on `main` by #786: Sema admitted both `str.clone()` and
@@ -53,15 +54,33 @@ required MIR's borrow-owned lowering path. Both stages now route through
 `docs/impl/19-hir-validation-ledger.md` "Producer-delegation closure matrix".
 Pinning align-llm to the merged commit is align-llm-side work.
 
-align-llm Request 6 adoption is now closed by align-llm PR #84. The next independent client
-prerequisite is Request 8's heap declared-record `array_builder`; branch
-`agent/heap-record-array-builder-design` is authoring its Align-owned public contract and closure
-matrix against `004b7f02086570b200b238d752a1f7ba67da7d04`. No implementation is accepted until that
-design is reviewed and merged. Its first comprehensive review at `cac65c77` found five valid gaps:
-checked-HIR New/Push/Build coverage, two align-llm request inconsistencies, incomplete Move-source
-enumeration, and missing stack/boxed cleanup proof. align-llm PR #86 merged the request
-reconciliation as `f4cffee`; the current repair closes the remaining design findings in active
-Align PR #799.
+align-llm Request 6 adoption is closed by align-llm PR #84. Request 8's Align-owned design is
+accepted after #799 and align-llm records it as ACCEPTED after PR #87. The active implementation
+checkpoint has passed the focused record builder driver owners, checked-HIR New/Push/Build rows,
+LLVM stack/boxed cleanup owner, concrete-generic owner, imported-interface parity owner, and
+nominal edit/revert cache owner. Exact publication preflight and comprehensive implementation
+review remain before merge; align-llm must not consume the surface until the merged commit is named.
+
+Latest durable Request 8 verification on `agent/heap-record-array-builder`:
+
+```text
+scripts/cargo.sh check -p align_sema -p align_mir -p align_codegen_llvm  PASS
+scripts/cargo.sh build --workspace  PASS
+scripts/cargo.sh test -p align_sema heap_array_builder_record_classifier_is_closed_and_cycle_safe -- --nocapture  PASS
+scripts/cargo.sh test -p align_mir heap_record_array_builder_rows_match_the_producer -- --nocapture  PASS
+scripts/cargo.sh test -p align_codegen_llvm move_record_array_builder_uses_typed_stack_and_boxed_cleanup -- --nocapture  PASS
+scripts/cargo.sh test -p align_driver --test m12_array_builder -- --nocapture  PASS (31/31)
+scripts/cargo.sh test -p align_driver --test m12_array_builder record_builder_move_source_matrix -- --exact --nocapture  PASS
+scripts/cargo.sh test -p align_driver --test m12_array_builder record_builder_abandonment_all_exit_kinds -- --exact --nocapture  PASS
+scripts/cargo.sh test -p align_driver --test m12_array_builder record_builder_partial_element_failure_drops_fields -- --exact --nocapture  PASS
+scripts/cargo.sh test -p align_driver --test generics record_builder_generic_instantiation -- --exact --nocapture  PASS
+scripts/cargo.sh test -p align_driver --test per_unit record_builder_imported_interface_graph -- --exact --nocapture  PASS
+scripts/cargo.sh test -p align_driver --test cache_codegen record_builder_nominal_identity_and_definition_edit_revert -- --exact --nocapture  PASS
+```
+
+Next actions are one comprehensive implementation review, consolidated finding repair when needed,
+exact publication preflight, and merge. Then update align-llm's pin and run the Request 8 client
+acceptance capability against the merged compiler.
 
 Out-of-gate suites (everything outside `scripts/test-pr.sh`) are guarded by the
 nightly full-suite workflow, which builds once, runs every compiled test binary
@@ -167,9 +186,10 @@ facts must live in this repository.
   `docs/impl/pkg-design/web.md`; `docs/impl/15-pkg-web-plan.md` is the completed
   execution record. The framework is general-purpose REST infrastructure, not
   an LLM-gateway-specific subset.
-- **align-llm requests:** Request 4 is accepted and designed for the next implementation PR.
-  Requests 5 and 7–14 remain proposed in `../align-llm/docs/align-requests.md`; Request 8's
-  Align-owned design is active but not yet accepted. Request 6 is closed after Align design #703,
+- **align-llm requests:** Request 8 is accepted and its heap-record builder implementation is active
+  on `agent/heap-record-array-builder`. Request 4 is accepted and remains the next independent
+  prerequisite after Request 8 adoption. Requests 5, 7, and 9–14 remain proposed in
+  `../align-llm/docs/align-requests.md`; Request 6 is closed after Align design #703,
   implementation #704, and align-llm adoption #84. Request 9 remains the later C7 blocker.
 
 Consumer-gated deferrals that remain intentional:

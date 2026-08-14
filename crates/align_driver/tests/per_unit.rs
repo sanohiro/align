@@ -182,6 +182,32 @@ fn cross_module_move_type_struct_accepts() {
 }
 
 #[test]
+fn record_builder_imported_interface_graph() {
+    let records = concat!(
+        "module records\n",
+        "pub Text { value: string }\n",
+        "pub Row { id: i32, text: Text }\n",
+        "pub fn make(id: i32) -> Row = Row { id: id, text: Text { value: \"owned\".clone() } }\n",
+    );
+    let main = concat!(
+        "module main\n",
+        "import records\n",
+        "fn main() -> i32 {\n",
+        "  mut rows: array_builder<records.Row> := array_builder()\n",
+        "  rows.push(records.make(1))\n",
+        "  rows.push(records.make(2))\n",
+        "  return rows.build().len() as i32\n",
+        "}\n",
+    );
+    let result = assert_same_verdict(
+        "s1b-record-builder-interface",
+        &[("records.align", records), ("main.align", main)],
+        "main.align",
+    );
+    assert!(!result.diags.has_errors());
+}
+
+#[test]
 fn cross_module_move_misuse_rejects() {
     // Use-after-move of an imported Move struct: consumed by `age_of`, then used again — both checkers
     // reject (MoveCheck is a pure function of the imported type definition).

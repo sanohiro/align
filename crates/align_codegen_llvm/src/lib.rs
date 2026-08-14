@@ -11053,13 +11053,49 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .map_err(|e| self.err(e))?;
                     } else if let Some(elem) = ty.array_builder_element() {
                         // An unfrozen `array_builder<T>`: free its storage + header. A `string` element
-                        // builder deep-frees each pushed-not-frozen string first (the same
-                        // `free_string_array`-class helper); a scalar builder frees the flat storage.
+                        // builder uses its specialized deep-free helper. A Move-record builder first
+                        // consumes the header into the ordinary AoS array representation, then uses
+                        // that record's compile-time DropPlan for every initialized element.
                         // Both are null-safe (a moved-out / never-grown slot drops harmlessly — the
                         // slot was nulled at `build`'s move site).
                         let stack = self.stack_header_slots.contains(slot);
                         let string_elem =
                             elem == ArrayBuilderElem::Scalar(align_sema::Scalar::String);
+                        let move_record = match elem {
+                            ArrayBuilderElem::Scalar(align_sema::Scalar::Struct(id))
+                                if align_sema::struct_is_move(
+                                    id,
+                                    self.structs,
+                                    self.enums,
+                                    self.tagged_defs,
+                                ) => Some(id),
+                            _ => None,
+                        };
+                        let p = self
+                            .builder
+                            .build_load(self.ctx.ptr_type(AddressSpace::default()), self.slots[slot], "dropab")
+                            .map_err(|e| self.err(e))?;
+                        if let Some(id) = move_record {
+                            let build = if stack {
+                                RuntimeKey::ArrayBuilderBuildStack
+                            } else {
+                                RuntimeKey::ArrayBuilderBuild
+                            };
+                            let frozen = self
+                                .builder
+                                .build_call(self.runtime(build), &[p.into()], "dropabbuild")
+                                .map_err(|e| self.err(e))?
+                                .try_as_basic_value()
+                                .basic()
+                                .expect("array_builder_build returns a {ptr,len}");
+                            let array = self.alloca_at_entry(
+                                slice_struct_type(self.ctx).into(),
+                                "dropabarray",
+                            )?;
+                            self.builder.build_store(array, frozen).map_err(|e| self.err(e))?;
+                            self.deep_free_struct_array(array, id)?;
+                            continue;
+                        }
                         let free_key = if string_elem && stack {
                             RuntimeKey::ArrayBuilderFreeStringsStack
                         } else if string_elem {
@@ -11069,10 +11105,6 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         } else {
                             RuntimeKey::ArrayBuilderFree
                         };
-                        let p = self
-                            .builder
-                            .build_load(self.ctx.ptr_type(AddressSpace::default()), self.slots[slot], "dropab")
-                            .map_err(|e| self.err(e))?;
                         self.builder
                             .build_call(self.runtime(free_key), &[p.into()], "")
                             .map_err(|e| self.err(e))?;
@@ -17807,9 +17839,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value().basic().expect("array_builder_new returns a pointer");
                 Ok(Some(v))
             }
-            // `b.push(v)` (Copy scalar) — reinterpret `v` to its raw i64 bits (a float bit-casts; a
-            // narrower int/bool/char zero-extends, so its low `elem_size` bytes are its value), then
-            // hand the bits to the runtime, which writes the element's `elem_size` low bytes.
+            // `b.push(v)` — primitive Copy scalars use their raw i64 bits. Fixed-layout aggregates,
+            // including Copy or transferred Move records, copy their complete initialized bytes.
             Rvalue::ArrayBuilderPush { builder, value, scalar } => {
                 let bp = self.operand(builder)?.into();
                 let i64t = self.ctx.i64_type();
@@ -23393,6 +23424,54 @@ mod tests {
         assert!(
             !out.contains("call void @align_rt_array_builder_free_strings("),
             "stack string array builder must not free caller storage as a Box:\n{out}"
+        );
+    }
+
+    #[test]
+    fn move_record_array_builder_uses_typed_stack_and_boxed_cleanup() {
+        let stack = ir(
+            "Owned { text: string }\n\
+             fn main() -> i32 {\n\
+               mut rows: array_builder<Owned> := array_builder()\n\
+               rows.push(Owned { text: \"stack\".clone() })\n\
+               return 0\n\
+             }\n",
+        );
+        let stack_main = function_body(&stack, "main");
+        assert!(
+            stack_main.contains("call { ptr, i64 } @align_rt_array_builder_build_stack("),
+            "unfinished local record builder must transfer its stack header for typed cleanup:\n{stack_main}"
+        );
+        assert!(
+            stack_main.contains("call void @align_rt_free("),
+            "typed cleanup must release initialized record fields and the AoS buffer:\n{stack_main}"
+        );
+        assert!(
+            !stack_main.contains("@align_rt_array_builder_free_stack("),
+            "a Move record must not take the shallow scalar cleanup path:\n{stack_main}"
+        );
+
+        let boxed = ir(
+            "Owned { text: string }\n\
+             fn abandon(rows: array_builder<Owned>) {}\n\
+             fn main() -> i32 {\n\
+               mut rows: array_builder<Owned> := array_builder()\n\
+               rows.push(Owned { text: \"boxed\".clone() })\n\
+               abandon(rows)\n\
+               return 0\n\
+             }\n",
+        );
+        assert!(
+            boxed.contains("call ptr @align_rt_array_builder_new("),
+            "a call-crossing record builder must keep the boxed header ABI:\n{boxed}"
+        );
+        assert!(
+            boxed.contains("call { ptr, i64 } @align_rt_array_builder_build("),
+            "boxed abandonment must transfer the payload into typed cleanup:\n{boxed}"
+        );
+        assert!(
+            !boxed.contains("call void @align_rt_array_builder_free("),
+            "a boxed Move record must not take the shallow scalar cleanup path:\n{boxed}"
         );
     }
 

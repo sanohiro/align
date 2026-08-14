@@ -190,6 +190,16 @@ fn region_plain_builder_remaps_a_concrete_generic_struct_element() {
 }
 
 #[test]
+fn record_builder_generic_instantiation() {
+    if !backend_available() {
+        return;
+    }
+    let src = "Wrap<T> { value: T }\nfn value(n: i32) -> i32 = n\nfn main() -> i32 {\n  mut b: array_builder<Wrap<i32>> := array_builder()\n  b.push(Wrap { value: value(42) })\n  rows := b.build()\n  return rows[0].value\n}\n";
+    let out = build_and_run("gen-record-builder", src);
+    assert_eq!(out.status.code(), Some(42), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
 fn region_plain_does_not_grant_equality() {
     let src = "fn same<T: RegionPlain>(a: T, b: T) -> bool = a == b\nfn main() -> i32 = 0\n";
     assert!(check_errs("gen-region-plain-eq", src));
