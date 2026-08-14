@@ -25,9 +25,11 @@ evidence profile/source set, rechecks final target reachability, serializes publ
 durable reservation, uses the repository's exact `clean`/`fixed` states, and fixes SSHSIG bytes.
 PR #813 is open. Author inspection of the next slice found that the current scripts make six Cargo
 invocations, not the four root builds named by the delivery prose; the exact-head repair now binds
-all six and identifies the two later `cargo run` replacements. Next: rerun docs publication
-preflight, update and merge PR #813 after required checks pass, then implement the benchmark-input
-and evidence-controller prerequisites before creating a Request 7 implementation branch.
+all six and identifies the two later `cargo run` replacements. The same pass makes the work-root
+safety and cleanup contract exact instead of leaving `unsafe` to implementation judgement. Next:
+rerun docs publication preflight, update and merge PR #813 after required checks pass, then implement
+the benchmark-input and evidence-controller prerequisites before creating a Request 7 implementation
+branch.
 
 The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit

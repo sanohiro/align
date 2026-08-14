@@ -150,6 +150,13 @@ revision source はread-only、empty target/bench-work/tmpはrevision-private wr
 read-only。`CARGO_TARGET_DIR`/`TMPDIR`/`ALIGN_BENCH_WORK_DIR`を固定。enabling implementationは両scriptを
 absent/nonempty/unsafe work dirでrejectさせ、`kernel.o`等すべてをそこへ限定する。
 
+benchmark-input sliceでは`ALIGN_BENCH_WORK_DIR`はrequiredで、absolute existing directoryを指しfinal componentは
+symlink不可。physical pathは`/`、repository root、repository内を不可とし、hidden entryを含め開始時empty。
+各scriptは`umask 077`でexact one private childを作り、root/detached Cargo target、`TMPDIR`、kernel object、
+全generated artifactをchild内へ限定する。success/error/signal/interruptでowned childだけをremove。
+relative/missing/non-directory/final-symlink/root/repository/in-repository/initially-nonempty/cleanup-failure/
+foreign-residueはforeign entryを削除せずrejectし、success cleanup後もcaller-owned empty directoryは残す。
+
 baseline選択前に両protected scriptをclosed two-phase interfaceにする。`run.sh prepare native`が
 root/detached Cargo buildと`alignc emit-obj`を行い、compiler/runtime/benchmark executable/kernel object/
 effective configのcanonical SHA-256/mode manifestをrevision-private work dirに作る。`run.sh native`は
@@ -430,7 +437,7 @@ bindするprovider CASをreviewed amendmentで導入する。base ruleを弱め�
 | Inner/outer statistic | synthetic odd/even ns sum、half-us tie、middle/outlier/overflow、round-half-up quantization/rendering、10 exact token、1.05 boundary。`benchmark_evidence_statistic_matrix`. |
 | Parser/arithmetic | exact line/row/fieldと全malformed。`benchmark_evidence_parser_ratio_matrix`. |
 | Report/signature | report/merge-verification bidirectional goldenと全field/order/type/width/duplicate/escape/trailing/derived mutation、exact SSHSIG binary/preimage、armor header/footer/LF/base64/wrap/padding、wrong key/namespace/profile/stale。`benchmark_evidence_report_v1_matrix`. |
-| Failure/cleanup | 全phase error/timeout/signal/disk/file+dir+parent+reservation fsync/unlock/rename/reservation remove/ordinary remove/sign。accepted pathなし。全resourceが消えるか、surviving fail-closed reservationがacceptとlater workを阻止。`benchmark_evidence_cleanup_matrix`. |
+| Failure/cleanup | benchmark-input ownerはabsent/relative/missing/non-directory/final-symlink/root/repository/in-repository/nonempty work root、foreign residue、success/error/signal cleanupとcaller entry非削除をcover。evidence ownerは全phase error/timeout/signal/disk/file+dir+parent+reservation fsync/unlock/rename/reservation remove/ordinary remove/signをcover。accepted pathなし。全resourceが消えるか、surviving fail-closed reservationがacceptとlater workを阻止。`benchmark_input_workdir_matrix`; `benchmark_evidence_cleanup_matrix`. |
 | Concurrent | lockまたはpublication reservation中のsecond runはGit/image/container前fail。lockはmeasurement cleanupとdurable reservation後にreleaseし、accepted publishはreservationをremove+fsync。crash/restart/admin recoveryもfail-closed。`benchmark_evidence_exclusive_run`. |
 | TOCTOU | executable/image/source rename/replacement/swap。`benchmark_evidence_bound_object_swap_matrix`. |
 | Forged/stale | unsigned/edit/replay/truncate/concat/wrong namespace、PR/preflight/trusted-review mismatch。`CLEAN`は`clean`のみ、accepted `FINDINGS` + nonempty repair chainは`fixed`のみにmap。`benchmark_evidence_stale_forged_matrix`. |
