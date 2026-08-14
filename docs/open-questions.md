@@ -2730,6 +2730,22 @@ every caller's Drops is the documented ideal, deferred. (Was Open, target M11; t
 run-Drops-then-exit vs. an immediate hard-exit API — both landed: the first as `exit`, the second as
 `abort`.)
 
+### `std.process` bounded text/byte capture — SETTLED (2026-08-14, align-llm Request 11)
+
+The command-local spelling is `c.max_capture_bytes(limit: i64)`. The non-negative limit applies
+independently to stdout and stderr; explicit zero accepts only empty streams, while no setter call is
+the existing unbounded behavior. Exact-limit output succeeds. The first observed byte beyond either
+stream's limit kills the child process group, closes the pipes, reaps the direct child, discards both
+partial streams, and returns `Error.Invalid`. Deadline checks precede poll/read processing, so an
+already-observable timeout remains `Error.Timeout` and wins over overflow at that checkpoint.
+
+The previously deferred binary tier is the separate `c.run_bytes() -> Result<run_bytes, Error>` terminal. It
+shares all command configuration, capture, cap, timeout, kill, reap, and allocation behavior with
+text `run()`, but exposes region-bound `slice<u8>` stdout/stderr views without UTF-8 validation.
+Text `run()` keeps its existing `str` views and `Error.Invalid` UTF-8 rejection. Both outputs are
+single-owner Move handles and never expose truncation or partial success. The authoritative ledger
+and implementation closure matrix are in `docs/impl/std-design/process.md`.
+
 ---
 
 ### Sequential control — the `loop` expression (SETTLED 2026-07-09; IMPLEMENTED 2026-07-10)

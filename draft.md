@@ -2777,19 +2777,29 @@ c.cwd(dir: str)                    // set the child's working directory  -> ()
 c.env(name: str, value: str)       // add/override one variable          -> ()
 c.env_clear()                      // start the child environment empty  -> ()
 c.timeout_ns(ns: i64)              // kill + Err(Timeout) past ns; 0 = no timeout  -> ()
+c.max_capture_bytes(limit: i64)    // per-stream stdout/stderr bound; explicit 0 = empty only  -> ()
 out := c.run() -> Result<run_output, Error>   // fork + capture; borrows c, so it is re-runnable
+raw := c.run_bytes() -> Result<run_bytes, Error> // same capture as bytes; borrows c
 
 out.code()   -> i64
 out.stdout() -> str    // captured stdout, a zero-copy view region-tied to `out`
 out.stderr() -> str    // ditto
+raw.code()   -> i64
+raw.stdout() -> slice<u8> // arbitrary bytes, zero-copy and region-tied to `raw`
+raw.stderr() -> slice<u8>
 ```
 
 The config methods are in-place setters on a bound local and yield `()`. A negative `timeout_ns`
-is a programmer error and aborts at the call. `run` is where `Error.Timeout` (§4 "Result") is
-produced: past the deadline the child is killed and the partial output discarded, so a timeout is
-never reported as a half-answer. `run_output` is a Move handle, not a by-value struct, because it
-owns both captured buffers; its `str` accessors validate UTF-8 and yield `Error.Invalid` on invalid
-bytes (a raw `bytes` tier is deferred).
+or capture limit is a programmer error and aborts at the call. An unset capture limit preserves the
+existing unbounded behavior; a selected non-negative limit applies independently to stdout and
+stderr, exact-limit output succeeds, and the first byte beyond either limit kills/reaps the child
+group, discards both partial streams, and returns `Error.Invalid`. A selected `0` therefore accepts
+only two empty streams. `run` is where `Error.Timeout` (§4 "Result") is produced: the drain checks
+the deadline before each poll/read checkpoint, so an already-observable timeout wins over cap
+overflow; either error is returned without a half-answer. `run_output` and `run_bytes` are Move
+handles, not by-value structs, because each owns both captured buffers. The text handle validates
+UTF-8 and returns `Error.Invalid` for invalid bytes; the byte handle preserves arbitrary bytes and
+embedded NUL. All four output views are region-bound to their handle.
 
 ```align
 c := process.command("git", ["git", "status", "--porcelain"])

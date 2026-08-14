@@ -10,8 +10,8 @@ module.
 > 2026-07-24** (align-llm Request 1): captured output + cwd / env / timeout via a `process.command`
 > builder + `run_output` handle — see "Extension" at the end of this file. **Slices 4–6 SHIPPED**
 > (`process.command`/`c.cwd`/`c.run` capture; `c.timeout_ns` + the core `Error.Timeout` variant;
-> `c.env`/`c.env_clear`). The extension is now **COMPLETE** except the deferred bytes tier
-> (`c.run_bytes()`, ship on demand).
+> `c.env`/`c.env_clear`). The bounded text/bytes extension is **DESIGNED** for align-llm Request 11;
+> implementation is pending.
 
 ## Overview
 
@@ -207,8 +207,8 @@ current-frame + global flush. (Record the gap honestly.)
 # Extension — captured output + cwd / env / timeout (align-llm Request 1)
 
 > **Status: SHIPPED (Slices 4–6, #630/#631/#632, 2026-07-24).** `process.command` + `cwd` +
-> `timeout_ns` + `env`/`env_clear` + `run` capture are built end-to-end; only the bytes tier
-> (`run_bytes`) stays deferred (Slice 7, no consumer yet). Motivated by `align-llm` (a real client)
+> `timeout_ns` + `env`/`env_clear` + `run` capture are built end-to-end. The bytes tier and explicit
+> cap now have a concrete consumer and are designed in the Request 11 extension below. Motivated by `align-llm` (a real client)
 > whose core loop runs build/test/lint commands and **parses their output**. Source:
 > `../align-llm/docs/align-requests.md` Request 1 (priority: critical — it blocked that loop).
 
@@ -345,10 +345,11 @@ Vec<u8> }`.
    a child that fills the stderr pipe while the parent reads stdout **deadlocks** (the classic
    two-pipe capture bug). Loop until both hit EOF.
 4. **Timeout**: if `timeout_ns > 0`, `poll` with the remaining deadline (ns→ms, clamp ≥1). On expiry:
-   `kill(pid, SIGKILL)`, keep draining until EOF (the child is dying — a bounded, non-blocking drain,
-   so the pipes don't wedge the reap), `waitpid`, then return **`AL_TIMEOUT`** (partial output is
-   discarded — "report timeout, don't return a half-answer"). `timeout_ns == 0` = no timeout (block).
-   Negative `timeout_ns` is rejected at `c.timeout_ns()` build time (abort, like `kill`'s sig range).
+   `SIGKILL` the child process group, close both read ends without another EOF drain, `waitpid` the
+   direct child, then return **`AL_TIMEOUT`** (partial output is discarded — "report timeout, don't
+   return a half-answer"). Closing the reads keeps a descendant that escaped the group from holding
+   capture open forever. `timeout_ns == 0` = no timeout (block). Negative `timeout_ns` is rejected at
+   `c.timeout_ns()` build time (abort, like `kill`'s sig range).
 5. `waitpid` the child (reaped here — no zombie); `out.code = decode_wait_status(status)`.
 6. **UTF-8**: validate `out.out` / `out.err` as UTF-8. Invalid → free and return `AL_INVALID` (the
    `fs.read_file` precedent — a `string`-typed accessor cannot expose non-UTF-8 bytes). See below.
@@ -357,16 +358,16 @@ Vec<u8> }`.
 `.stdout()`/`.stderr()` return `AlignStr { ptr: out.out.as_ptr(), len }` — a borrowed view, exactly
 like `align_rt_http_resp_body`.
 
-## UTF-8 policy (decision + the deferred bytes tier)
+## UTF-8 policy (decision + the bounded bytes tier)
 
 v1 `run()` returns `str` accessors, so it **validates UTF-8 and errors (`Error.Invalid`) on invalid
 bytes** — consistent with `fs.read_file` (string, validated) vs `read_bytes_view` (bytes). Build /
 test / lint output is UTF-8 in practice, and the client parses it as text. The robustness escape
-hatch for arbitrary binary tool output is a **deferred bytes tier** `c.run_bytes() -> Result<run_bytes,
-Error>` whose `.stdout()`/`.stderr()` return `slice<u8>` (no validation) — mirroring
-`read_file` vs `read_bytes_view` one-for-one. Deferred, not shipped in the first slices; designed so
-it drops in without disturbing the string tier (a sibling handle + accessors). Ship it if non-UTF-8
-tool output proves real for a consumer.
+hatch for arbitrary binary tool output is the Request 11 bytes tier `c.run_bytes() ->
+Result<run_bytes, Error>` whose `.stdout()`/`.stderr()` return `slice<u8>` (no validation) — mirroring
+`read_file` vs `read_bytes_view` one-for-one. It is a sibling handle + accessors over the same
+capture engine, so it does not disturb the string tier. The exact bound and ownership contract is
+in the extension ledger below.
 
 ## Effect classification
 
@@ -409,9 +410,9 @@ code 127 in `out.code()` (same convention as `spawn`), **not** an `Err` — the 
    threads the deadline into the two-pipe drain (`poll` with the remaining ns→ms, clamped `>= 1`);
    past the deadline it `SIGKILL`s the child's whole **process group** (the child `setpgid`s into its
    own group, so a `sh -c "sleep 10"` grandchild is reaped too — otherwise it holds the capture pipes
-   open and wedges the drain), drains to EOF, `waitpid`s, and returns `Err(Error.Timeout)` (partial
-   output discarded). `EINTR` on `poll` recomputes the remaining deadline; `timeout_ns == 0` keeps the
-   infinite `-1` `poll` (Slice-4 behavior exactly).
+   open and wedges the drain), closes both read ends without another EOF drain, `waitpid`s the direct
+   child, and returns `Err(Error.Timeout)` (partial output discarded). `EINTR` on `poll` recomputes
+   the remaining deadline; `timeout_ns == 0` keeps the infinite `-1` `poll` (Slice-4 behavior exactly).
 6. `c.env(name,value)` + `c.env_clear()` — **SHIPPED.** Both are in-place bound-local setters (`()`).
    `c.env(name, value)` records a `(name, value)` override; `c.env_clear()` marks the child to start
    from an empty environment. The runtime `Command` gains `env: Vec<(CString, CString)>` + `env_clear:
@@ -420,15 +421,16 @@ code 127 in `out.code()` (same convention as `spawn`), **not** an `Err` — the 
    name wins; an `env` after an `env_clear` survives). Names/values marshal to C strings in the PARENT
    (the child does no allocation, the `spawn`/Slice-4 async-signal-safety discipline); an interior-NUL
    / non-UTF-8 name or value aborts, and a name containing `=` aborts (`setenv` would reject it).
-7. *(deferred)* the bytes tier `c.run_bytes()` — ship on demand.
+7. *(designed below; implementation pending)* the bytes tier `c.run_bytes()` and command-local
+   `max_capture_bytes` bound — align-llm Request 11.
 
 ## Pitfalls
 
 - **P7 (two-pipe deadlock)** — the #1 correctness point. `poll` **both** read fds and drain both, or
   a child filling one pipe while the parent reads the other deadlocks. Test: a child that writes
   >64 KiB to *both* streams and exits nonzero → both fully captured, code correct.
-- **P8 (timeout must actually kill + reap)** — on expiry `SIGKILL` then keep draining to EOF and
-  `waitpid`; do not leak a zombie or wedge on a full pipe. Test: `sleep 10` with a 100 ms timeout →
+- **P8 (timeout must actually kill + reap)** — on expiry `SIGKILL`, close both capture reads, and
+  `waitpid`; do not leak a zombie or wedge on a full/escaped pipe. Test: `sleep 10` with a 100 ms timeout →
   `Err(Timeout)` within ~100 ms, no zombie.
 - **P9 (view region, like http P3)** — `.stdout()`/`.stderr()` are views into `out`; `region_of =
   region_of(out)`. Escape past `out` Drop rejected.
@@ -436,9 +438,9 @@ code 127 in `out.code()` (same convention as `spawn`), **not** an `Err` — the 
   skipped pass is a leak/double-free/UAF. Run `/align-self-review` gate 2.
 - **P11 (child async-signal-safety)** — `chdir`/`clearenv`/`setenv`/`execvp` after `fork` in a
   threaded parent carry the existing `spawn` hazard (documented; `posix_spawn` is the deferred ideal).
-- **P12 (unbounded capture)** — a runaway child (`yes`) grows the capture without bound. v1 is
-  unbounded (matches `read_file` reading a whole file); a `max_capture` cap is a recorded future knob,
-  not v1.
+- **P12 (unbounded capture)** — a runaway child (`yes`) grows the capture without bound. Existing
+  callers remain unbounded, while the Request 11 extension below supplies an explicit command-local
+  bound and the binary-output tier.
 
 ## Test checklist / gate
 
@@ -452,3 +454,131 @@ code 127 in `out.code()` (same convention as `spawn`), **not** an `Err` — the 
 - `.stdout()` view escaping past `out` Drop → rejected (P9).
 - `command` / `run_output` as an array element → rejected.
 - import-required.
+
+# Extension — bounded text and byte capture (align-llm Request 11)
+
+> **Status: DESIGN ACCEPTED (2026-08-14); implementation pending.** This extension closes P12 for
+> callers that select a bound and ships the previously deferred binary-output tier. Source:
+> `../align-llm/docs/align-requests.md` Request 11.
+
+## Public-contract ledger
+
+The ledger below is authoritative for the extension. The prose and implementation must not broaden
+it independently.
+
+| Surface | Exact contract |
+|---|---|
+| `c.max_capture_bytes(limit: i64) -> ()` | Bound-local, in-place `command` setter. `limit >= 0`; a negative value is a programmer error and aborts before a child or allocation. The latest call overwrites the previous bound. An explicit `0` permits only empty stdout and empty stderr. A command with no call retains the shipped unbounded behavior. The same bound applies independently to each stream and to every later `run()` or `run_bytes()` on that command. |
+| `c.run() -> Result<run_output, Error>` | Existing borrowed, re-runnable text capture. With a bound, each stream may contain at most `limit` bytes. Exact-limit output succeeds; the first observed byte beyond either stream's limit kills the child process group, reaps the direct child, discards both partial streams, and returns `Error.Invalid`. Completed in-bound output is UTF-8 validated exactly as today; invalid UTF-8 returns `Error.Invalid`. Nonzero exit remains `Ok(run_output)`. |
+| `c.run_bytes() -> Result<run_bytes, Error>` | New borrowed, re-runnable binary capture over the same command configuration, drain, cap, timeout, kill, and reap path as `run()`. It performs no UTF-8 validation. `run_bytes` is one opaque Move handle owning the exit code and both byte buffers. |
+| `out.code() -> i64` | Both `run_output` and `run_bytes` expose the shipped decoded exit code: `WEXITSTATUS`, `128 + signal`, or `127` when child-side `chdir`/`execvp` fails. Pure Copy read. |
+| `out.stdout()`, `out.stderr()` | `run_output` returns zero-copy `str` views; `run_bytes` returns zero-copy `slice<u8>` views. Empty output is an empty view. Each view is region-bound to its owning output handle and cannot escape its Drop. Embedded NUL is ordinary data in the byte tier; the text tier accepts it when the complete stream is valid UTF-8. |
+
+The cap is **per stream**, not combined. A selected limit `L` therefore permits at most `L` bytes of
+stdout and `L` bytes of stderr, for at most `2L` retained capture bytes. This preserves useful
+diagnostics when stdout uses its complete consumer-declared response budget and gives each pipe one
+stable rule independent of scheduling. C6 sets `65_536` for its helper command and `262_144` for its
+measurement command; it does not perform an unbounded run followed by a length check.
+
+### Inputs, defaults, errors, and precedence
+
+- `max_capture_bytes` takes an `i64` byte count. There is no ambient environment variable, global
+  default, or package setting. Unset is the only unbounded state; `0` is a real zero-byte bound.
+- Negative `limit` aborts at the setter before allocation or process creation. A bounded run first
+  validates its output slot, converts the non-negative limit to the platform allocation size, and
+  creates both capture stores plus the mode-specific empty output-handle shell. An unrepresentable
+  layout returns `Error.Invalid`; any allocation failure returns `Error.Code(ENOMEM)`. No child has
+  started in either case.
+- Pipe/fork failures retain the fixed errno mapping. Child-side `chdir`/`execvp` failure remains
+  `Ok` with code `127`. A nonzero child exit never outranks a capture failure.
+- The drain checks the monotonic deadline before every `poll` and before processing every positive
+  read. If expired, `Error.Timeout` wins. Otherwise a read that would cross either cap produces
+  `Error.Invalid`. Thus timeout wins whenever it is already observable at a checkpoint; a cap wins
+  only when overflow is observed first. Either error outranks later exit status or UTF-8 validation.
+- After both streams reach EOF, text `run()` validates stdout first and stderr second; either invalid
+  stream returns the same `Error.Invalid`, so no partial output or stream identity is exposed.
+- All error paths leave the result slot null, release both pipe fds and capture allocations, kill the
+  process group when a child exists, and reap the direct child exactly once. No partial bytes, exit
+  code, or truncation marker are returned.
+
+### Ownership, lifetime, allocation, and concurrency
+
+`command` remains a single-owner Move handle and `run()`/`run_bytes()` borrow it. The optional bound
+persists across repeated runs and both run modes. `run_bytes` follows the complete new-Move-type
+sweep: it may occupy only its constructor's `Result` Ok slot, cannot be an aggregate/array element or
+captured task value, zeroes its source on move, and drops its two buffers exactly once. Its views
+carry `region_of(run_bytes)` just as text views carry `region_of(run_output)`.
+
+For a bounded run, the runtime allocates one exact `L`-byte capture layout per stream and the empty
+mode-specific output-handle shell **before** pipe creation and fork; `L == 0` allocates neither byte
+layout. No capture allocation or reserved capture capacity is larger than `L`, and the two live
+capture layouts total exactly `2L`. The existing fixed 64 KiB stack read scratch, the command's
+argv/cwd/environment storage, two pipe descriptors, and the small output handle are outside that
+declared capture-store bound. Reads land in the fixed scratch first and copy only when the complete
+chunk fits the selected stream's remaining capacity. Success fills the existing shell and transfers
+the two layouts without another allocation; every error frees all three preallocated objects.
+Unbounded callers retain the existing growable `Vec` behavior and make no memory-bound claim.
+
+A command with either a positive timeout or an explicit capture bound creates the child as a process
+group leader. Timeout or overflow sends `SIGKILL` to the group and also to the direct pid as a
+race/fallback, closes both read ends without another EOF drain, then waits for the direct child with
+`EINTR` retry. Descendants that deliberately escape with `setsid` are outside the process-group
+contract; closing the read ends ensures they cannot keep the caller blocked. Distinct commands share
+no mutable state, so concurrent runs are independent. The same `command` cannot be mutably configured
+during a run in safe Align, and one synchronous run completes before that command is reused.
+
+### Runtime and cache identity
+
+The implementation adds these ABI entries without changing an existing signature:
+
+```text
+align_rt_command_max_capture(command: ptr, limit: i64) -> void
+align_rt_command_run_bytes(command: ptr, out: ptr<ptr>) -> i32
+align_rt_run_bytes_code(out: ptr) -> i64
+align_rt_run_bytes_stdout(out: ptr) -> { ptr, i64 }
+align_rt_run_bytes_stderr(out: ptr) -> { ptr, i64 }
+align_rt_run_bytes_free(out: ptr) -> void
+```
+
+`align_rt_command_run` keeps its ABI and consumes the new bound stored in `Command`. Both run entries
+delegate to one runtime capture engine; the only mode-specific step is completed-buffer UTF-8
+validation and output-handle construction. `run_bytes` has a new closed builtin type/scalar tag in
+HIR, MIR, LLVM lowering, checked-HIR validation, interface serialization, and cache identity. There
+is no runtime reflection, callback, persisted artifact, wire tag, or ambient cache input. Whole-
+program and per-unit compilation of the same source must select the same run mode and output type;
+changing between `run` and `run_bytes`, or adding/changing the bound call in source, invalidates the
+ordinary source-derived frontend/object cache entry.
+
+## Implementation closure matrix
+
+| Cell | Owner and required evidence |
+|---|---|
+| Setter formation and validation | Sema/HIR/MIR/codegen/runtime route `max_capture_bytes(i64)` only on a bound `command`; wrong arity/type and temporary receivers diagnose; negative aborts before side effects; `0`, overwrite, and unset states are distinct. Owner: `m11_process_command::command_capture_bound_formation_and_state`. |
+| Exact-limit text success | Shared drain admits empty, `L`, stdout-only, stderr-only, and simultaneous `L`/`L`; `run_output` retains existing code/text views. Owner: `command_capture_exact_limit_and_reuse`. |
+| One-byte overflow | Either stream at `L + 1`, including simultaneous pipe pressure, returns `Error.Invalid`, exposes no output, kills the group, closes fds, and reaps once. Owner: `command_capture_overflow_kills_group_and_discards_partial`. |
+| Timeout/cap/exit/UTF-8 precedence | Checkpoint order above is exercised for timeout-before-overflow, overflow-before-timeout, nonzero-overflow, and in-bound invalid UTF-8. Owner: `command_capture_error_precedence`. |
+| Binary tier | `run_bytes` preserves invalid UTF-8 and embedded NUL byte-for-byte, exposes region-bound byte views, supports nonzero exit, and shares exact-cap behavior. Owner: `command_run_bytes_preserves_arbitrary_output`. |
+| Move and Drop | Formation, construction, `Result` move-in/out, `?`, `else`, `match`, `map_err`, replacement, return, source nulling, and early exit drop each output once; aggregate/capture/temporary and escaped views reject. Owners: `m11_process_command` ownership matrix plus the checked-HIR variant tripwire. |
+| Allocation and malformed limits | Exact layouts are allocated before fork; first/second allocation failure frees prior state and starts no child; zero allocates none; unrepresentable layout is `Invalid`; capture capacity never exceeds `L`. Owner: runtime allocation failpoint/unit owners and `command_capture_allocation_bound`. |
+| Reuse and concurrency | One command repeats text and byte runs with the persisted/overwritten bound; two independent commands run concurrently without shared state. Owner: `command_capture_reuse_and_independent_concurrency`. |
+| Generic/interface/per-unit/cache parity | A function returning `Result<run_bytes, Error>` has identical whole-program and per-unit type/ABI; interface round-trip and exact edit/revert cache identity agree. Owners: process interface/per-unit/cache tests. |
+| Existing behavior | No-setter `run()` remains unbounded and byte-for-byte compatible; cwd/env/env_clear/timeout, large dual-pipe, nonzero exit, and text view owners remain green. Owner: complete `m11_process_command` target. |
+
+The explicit memory promise also requires a local `bench/process_capture` measurement. It records
+bounded text/byte throughput and the maximum live capture-layout bytes for the 65,536 and 262,144
+consumer limits versus the existing unbounded path. It is evidence for the resource contract, not a
+correctness gate.
+
+## Acceptance gate
+
+Before the implementation is marked shipped:
+
+1. every matrix row points to implementation and a regression owner, with the new type included in
+   the exhaustive variant tripwire;
+2. the English and Japanese process designs, `draft.md`, the condensed language specification,
+   design notes, Settled decisions, runtime ABI ledger, and align-llm request register agree;
+3. the focused process owner, bounded PR gate, library/binary Clippy, whole/per-unit/cache owners,
+   allocation failpoint, and local resource measurement pass on the final candidate; and
+4. align-llm may advance the request only after it pins the named merged implementation commit and
+   its focused helper/adapter target proves the 65,536/262,144 bounds, timeout/cap precedence,
+   process-group cleanup, and arbitrary-byte tier before the capability wave's final `make ci`.

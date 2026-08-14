@@ -9,8 +9,7 @@
 > 2026-07-24 に設計済み**（align-llm Request 1）です。`process.command` ビルダ + `run_output` ハンドルに
 > よる、出力キャプチャ + cwd / env / timeout — 本ファイル末尾の「Extension」を参照してください。**スライス
 > 4〜6 は実装済み**（`process.command`/`c.cwd`/`c.run` のキャプチャ、`c.timeout_ns` とコアの `Error.Timeout`
-> バリアント、`c.env`/`c.env_clear`）。これで拡張は後回しの bytes 層（`c.run_bytes()`、需要に応じて出荷）を
-> 除いて**完了**です。
+> バリアント、`c.env`/`c.env_clear`）。align-llm Request 11 の有界 text/bytes 拡張は**設計済み**で、実装待ちです。
 
 ## Overview
 
@@ -204,8 +203,8 @@ exit は単なるランタイム呼び出しではなく、先に関数(理想�
 # Extension — captured output + cwd / env / timeout (align-llm Request 1)
 
 > **ステータス: 出荷済み(Slice 4〜6、#630/#631/#632、2026-07-24)。** `process.command` + `cwd` +
-> `timeout_ns` + `env`/`env_clear` + `run` キャプチャがエンドツーエンドで構築済み。後回しは bytes 層
-> (`run_bytes`、Slice 7、需要待ち)のみ。実クライアントである `align-llm`(コアループが build/test/lint
+> `timeout_ns` + `env`/`env_clear` + `run` キャプチャがエンドツーエンドで構築済み。bytes 層と明示 cap は
+> concrete consumer を得て、下記 Request 11 拡張で設計済み。実クライアントである `align-llm`(コアループが build/test/lint
 > コマンドを走らせ、その**出力をパースする**)が動機である。出典:
 > `../align-llm/docs/align-requests.md` の Request 1(優先度: critical — このループを塞いでいた)。
 
@@ -338,10 +337,11 @@ env_clear: bool, timeout_ns: i64 }` を `align_rt_command_new(cmd, args)` で構
    stdout を読む間に子が stderr パイプを満たすと**デッドロック**する(古典的な 2 パイプキャプチャバグ)。両方が
    EOF に達するまでループする。
 4. **タイムアウト**:`timeout_ns > 0` なら、残りのデッドラインで `poll` する(ns→ms、≥1 にクランプ)。期限切れ時:
-   `kill(pid, SIGKILL)`、EOF までドレインし続け(子は死につつある — 有界の non-blocking なドレインなので、パイプが
-   reap を詰まらせない)、`waitpid` の後 **`AL_TIMEOUT`** を返す(部分出力は捨てる — 「タイムアウトを報告せよ、
-   半端な答えを返すな」)。`timeout_ns == 0` = タイムアウト無し(ブロック)。負の `timeout_ns` は
-   `c.timeout_ns()` の構築時に拒否する(`kill` のシグナル範囲と同じく abort)。
+   子の process group を `SIGKILL` し、EOF の再 drain 無しに両 read end を閉じ、直接の子を `waitpid` した後
+   **`AL_TIMEOUT`** を返す(部分出力は捨てる — 「タイムアウトを報告せよ、半端な答えを返すな」)。read を閉じる
+   ことで group を escape した descendant が capture を永遠に開いたままにできない。`timeout_ns == 0` =
+   タイムアウト無し(ブロック)。負の `timeout_ns` は `c.timeout_ns()` の構築時に拒否する(`kill` のシグナル範囲と
+   同じく abort)。
 5. 子を `waitpid`(ここで reap — ゾンビ無し);`out.code = decode_wait_status(status)`。
 6. **UTF-8**:`out.out` / `out.err` を UTF-8 として検証する。不正 → free して `AL_INVALID` を返す
    (`fs.read_file` の先例 — `string` 型のアクセサは非 UTF-8 バイトを晒せない)。下記参照。
@@ -350,15 +350,15 @@ env_clear: bool, timeout_ns: i64 }` を `align_rt_command_new(cmd, args)` で構
 `.stdout()`/`.stderr()` は `AlignStr { ptr: out.out.as_ptr(), len }` を返す — 借用ビューであり、
 `align_rt_http_resp_body` とまったく同じ。
 
-## UTF-8 policy (decision + the deferred bytes tier)
+## UTF-8 policy (decision + the bounded bytes tier)
 
 v1 の `run()` は `str` アクセサを返すので、**UTF-8 を検証し、不正バイトでエラー(`Error.Invalid`)にする** —
 `fs.read_file`(string、検証あり)対 `read_bytes_view`(bytes)と一貫する。build / test / lint の出力は実際上
 UTF-8 であり、クライアントはそれをテキストとしてパースする。任意のバイナリなツール出力に対する堅牢性の逃げ道は、
-**先送りの bytes 層** `c.run_bytes() -> Result<run_bytes, Error>` であり、その `.stdout()`/`.stderr()` は
-`slice<u8>` を返す(検証なし)— `read_file` 対 `read_bytes_view` を一対一で鏡写しにする。最初のスライスでは
-出荷しない先送りだが、string 層を乱さず落とし込めるよう設計する(兄弟ハンドル + アクセサ)。非 UTF-8 のツール
-出力が消費者にとって現実だと判明したら出荷する。
+Request 11 の bytes 層 `c.run_bytes() -> Result<run_bytes, Error>` であり、その `.stdout()`/`.stderr()` は
+`slice<u8>` を返す(検証なし)— `read_file` 対 `read_bytes_view` を一対一で鏡写しにする。同じ capture engine
+上の兄弟 handle + accessor なので string 層を乱さない。厳密な bound と ownership contract は下記 extension
+ledger に定める。
 
 ## Effect classification
 
@@ -398,8 +398,8 @@ fork/pipe/dup2/waitpid の失敗 → errno→`Error` テーブル(M9)。タイ�
    セッタ(`()`)。`ns == 0` = タイムアウト無し(スライス 4 の既定)、負の `ns` はビルド時に abort。`c.run()`
    はデッドラインを 2 パイプのドレインに通す(残り時間 ns→ms、`>= 1` にクランプして `poll`)。期限切れ時は子の
    **プロセスグループ**全体を `SIGKILL` し(子は自分のグループに `setpgid` するので、`sh -c "sleep 10"` の孫
-   プロセスも回収される。さもないとキャプチャパイプを開いたままドレインをハングさせる)、EOF までドレイン、
-   `waitpid`、そして `Err(Error.Timeout)` を返す(部分出力は破棄)。`poll` の `EINTR` は残りデッドラインを
+   プロセスも回収される。さもないとキャプチャパイプを開いたままドレインをハングさせる)、EOF の再 drain 無しに
+   両 read end を閉じ、直接の子を `waitpid` し、`Err(Error.Timeout)` を返す(部分出力は破棄)。`poll` の `EINTR` は残りデッドラインを
    再計算する。`timeout_ns == 0` は無限の `-1` `poll`(スライス 4 の挙動そのまま)を保つ。
 6. `c.env(name,value)` + `c.env_clear()` — **実装済み。** どちらもその場で書き換える束縛ローカルのセッタ
    (`()`)。`c.env(name, value)` は `(name, value)` の上書きを記録し、`c.env_clear()` は子環境を空から
@@ -409,15 +409,16 @@ fork/pipe/dup2/waitpid の失敗 → errno→`Error` テーブル(M9)。タイ�
    `env` は残る)。name/value は**親側**で C 文字列にマーシャルする(子は割り当てをしない。`spawn`/スライス 4 の
    非同期シグナル安全性の規律)。name/value の内部 NUL・非 UTF-8 は abort し、`=` を含む name も abort する
    (`setenv` が拒否するため)。
-7. *(先送り)* bytes 層 `c.run_bytes()` — 需要に応じて出荷。
+7. *(下記で設計済み、実装待ち)* bytes 層 `c.run_bytes()` とコマンドローカルな
+   `max_capture_bytes` 上限 — align-llm Request 11。
 
 ## Pitfalls
 
 - **P7(2 パイプデッドロック)** — 第 1 の正しさポイント。**両方**の read fd を `poll` し両方をドレインせよ。
   さもないと、子が一方のパイプを満たす間に親が他方を読むとデッドロックする。テスト:*両方*のストリームに
   >64 KiB を書き、非ゼロで終了する子 → 両方が完全にキャプチャされ、コードも正しい。
-- **P8(タイムアウトは実際に kill + reap すべし)** — 期限切れ時 `SIGKILL`、続いて EOF までドレインして
-  `waitpid`;ゾンビをリークせず、満杯のパイプで詰まらせない。テスト:100 ms タイムアウトの `sleep 10` →
+- **P8(タイムアウトは実際に kill + reap すべし)** — 期限切れ時 `SIGKILL`、両 capture read を閉じ、
+  `waitpid`;ゾンビをリークせず、満杯または escape したパイプで詰まらせない。テスト:100 ms タイムアウトの `sleep 10` →
   ~100 ms 以内に `Err(Timeout)`、ゾンビ無し。
 - **P9(ビューのリージョン、http P3 と同様)** — `.stdout()`/`.stderr()` は `out` へのビュー;`region_of =
   region_of(out)`。`out` の Drop を越える escape は拒否。
@@ -425,8 +426,8 @@ fork/pipe/dup2/waitpid の失敗 → errno→`Error` テーブル(M9)。タイ�
   パスは leak/double-free/UAF になる。`/align-self-review` gate 2 を回す。
 - **P11(子の async-signal-safety)** — スレッド化された親から `fork` した後の `chdir`/`clearenv`/`setenv`/`execvp`
   は既存の `spawn` ハザードを持つ(文書化済み;`posix_spawn` が先送りの理想)。
-- **P12(無制限キャプチャ)** — 暴走する子(`yes`)はキャプチャを無制限に増やす。v1 は無制限(`read_file` が
-  ファイル全体を読むのと同じ);`max_capture` の上限は記録済みの将来ノブであって v1 ではない。
+- **P12(無制限キャプチャ)** — 暴走する子(`yes`)はキャプチャを無制限に増やす。既存呼び出しは無制限のまま
+  保ち、下記 Request 11 拡張が明示的なコマンドローカル上限とバイナリ出力層を提供する。
 
 ## Test checklist / gate
 
@@ -440,3 +441,121 @@ fork/pipe/dup2/waitpid の失敗 → errno→`Error` テーブル(M9)。タイ�
 - `.stdout()` ビューが `out` の Drop を越えて escape → 拒否(P9)。
 - `command` / `run_output` を array の要素にする → 拒否。
 - import が必須であること。
+
+# 拡張 — 有界 text/byte キャプチャ（align-llm Request 11）
+
+> **ステータス: 設計 ACCEPTED（2026-08-14）、実装待ち。** この拡張は上限を選択した呼び出しについて P12 を
+> 閉じ、先送りしていたバイナリ出力層を出荷する。出典: `../align-llm/docs/align-requests.md` Request 11。
+
+## 公開契約 ledger
+
+次の ledger が本拡張の正本である。本文と実装は独立に範囲を広げてはならない。
+
+| Surface | 厳密な契約 |
+|---|---|
+| `c.max_capture_bytes(limit: i64) -> ()` | 束縛されたローカル `command` をその場で変更する setter。`limit >= 0`。負値はプログラマエラーとして、子プロセス生成や割り当てより前に abort する。最後の呼び出しが前の上限を上書きする。明示的な `0` は stdout と stderr の両方について空だけを許す。未呼び出しのコマンドだけが既存の無制限動作を保つ。同じ上限を各ストリームへ独立に適用し、その後のすべての `run()` / `run_bytes()` で使う。 |
+| `c.run() -> Result<run_output, Error>` | 既存の、借用され再実行可能な text キャプチャ。有界時は各ストリームを `limit` バイトまで許す。ちょうど上限は成功し、どちらかで最初に上限を超えるバイトを観測したら子のプロセスグループを kill し、直接の子を reap し、両方の部分出力を捨て、`Error.Invalid` を返す。上限内で完了した出力は従来どおり UTF-8 検証し、不正なら `Error.Invalid`。非ゼロ終了は従来どおり `Ok(run_output)`。 |
+| `c.run_bytes() -> Result<run_bytes, Error>` | 新しい、借用され再実行可能なバイナリキャプチャ。コマンド設定、両パイプ drain、上限、timeout、kill、reap は `run()` と同じ経路を使い、UTF-8 検証はしない。`run_bytes` は終了コードと2つの byte buffer を所有する単一の不透明 Move ハンドル。 |
+| `out.code() -> i64` | `run_output` と `run_bytes` の両方が既存の終了コード復号を公開する: `WEXITSTATUS`、`128 + signal`、または子側 `chdir`/`execvp` 失敗時の `127`。純粋な Copy 読み出し。 |
+| `out.stdout()`, `out.stderr()` | `run_output` は zero-copy `str` view、`run_bytes` は zero-copy `slice<u8>` view を返す。空出力は空 view。各 view は出力ハンドルの region に束縛され、Drop を越えて escape できない。埋め込み NUL は byte 層では通常データであり、text 層でもストリーム全体が正しい UTF-8 なら受理する。 |
+
+上限は合計ではなく**ストリームごと**である。選択した上限 `L` は stdout を最大 `L` バイト、stderr を最大
+`L` バイト、合計で最大 `2L` バイトの保持キャプチャとして許す。stdout が消費者指定の応答予算を全部使っても
+診断を保持でき、スケジューリングに依存しない1つの規則を各パイプに与える。C6 は helper command に `65_536`、
+measurement command に `262_144` を設定し、無制限実行後の長さ検査はしない。
+
+### 入力、既定値、エラー、優先順位
+
+- `max_capture_bytes` は `i64` のバイト数を受け取る。ambient な環境変数、グローバル既定値、package 設定は
+  無い。未設定だけが無制限で、`0` は実在する0バイト上限である。
+- 負の `limit` は割り当てやプロセス生成より前の setter で abort する。有界実行は最初に出力 slot を検証し、
+  非負上限を platform allocation size へ変換し、2つの capture store と mode 固有の空 output-handle shell を
+  生成する。表現不能な layout は `Error.Invalid`、いずれかの allocation failure は `Error.Code(ENOMEM)`。
+  どちらでも子はまだ開始していない。
+- pipe/fork failure は固定 errno 対応を保つ。子側 `chdir`/`execvp` failure は code `127` の `Ok` のまま。
+  非ゼロ終了は capture failure より優先されない。
+- drain は各 `poll` の前と各正の read を処理する前に monotonic deadline を検査する。期限切れなら
+  `Error.Timeout` が勝つ。そうでなければ、どちらかの上限を越える read が `Error.Invalid` を生む。したがって
+  checkpoint ですでに観測可能なら timeout が勝ち、overflow が先に観測された場合だけ cap が勝つ。いずれも
+  後の exit status や UTF-8 検証より優先する。
+- 両ストリーム EOF 後、text `run()` は stdout、stderr の順に検証する。どちらも同じ `Error.Invalid` なので、
+  部分出力や失敗ストリームの識別は公開しない。
+- すべての error path は result slot を null のまま保ち、両 pipe fd と capture allocation を解放し、子が
+  存在すれば process group を kill し、直接の子をちょうど1回 reap する。部分 bytes、exit code、truncation
+  marker は返さない。
+
+### 所有権、lifetime、allocation、並行性
+
+`command` は単一所有の Move handle のままで、`run()` / `run_bytes()` はそれを借用する。optional bound は反復
+実行と両 run mode を越えて持続する。`run_bytes` は新 Move type の完全 sweep に従う。constructor の `Result`
+Ok slot だけに置け、aggregate/array element や task capture にはできず、move 時に source を null にし、2つの
+buffer をちょうど1回 Drop する。その view は text view が `region_of(run_output)` を持つのと同じく
+`region_of(run_bytes)` を持つ。
+
+有界実行では、runtime が pipe 作成と fork の**前**に、ストリームごとに厳密な `L` バイトの capture layout と
+mode 固有の空 output-handle shell を割り当てる。`L == 0` ならどちらの byte layout も割り当てない。1つの
+capture allocation / reserved capacity は `L` より大きくなく、2つの live capture layout の合計は厳密に
+`2L` である。既存の固定64 KiB stack read scratch、command の argv/cwd/environment storage、2本の pipe
+descriptor、小さい output handle はこの capture-store 上限の外である。read は固定 scratch に入り、chunk 全体が
+選択ストリームの残容量へ収まる場合だけコピーする。成功時は既存 shell を埋め、追加 allocation 無しで2 layout を
+移す。すべての失敗で3つの preallocated object を解放する。無制限呼び出しは既存の growable `Vec` 動作を保ち、
+memory-bound claim を持たない。
+
+正の timeout または明示的 capture bound を持つ command は、子を process-group leader にする。timeout または
+overflow は group と、race/fallback として直接 pid の両方へ `SIGKILL` を送り、EOF の再 drain 無しに両 read
+end を閉じ、`EINTR` retry 付きで直接の子を待つ。意図的に `setsid` で escape した descendant は process-group
+契約外だが、read end を閉じるので呼び出し元を block し続けられない。別 command は mutable state を共有せず、
+並行実行は独立する。safe Align では実行中の同一 command を再設定できず、同期 run が完了してから再利用する。
+
+### Runtime と cache identity
+
+実装は既存 signature を変更せず、次の ABI entry を追加する。
+
+```text
+align_rt_command_max_capture(command: ptr, limit: i64) -> void
+align_rt_command_run_bytes(command: ptr, out: ptr<ptr>) -> i32
+align_rt_run_bytes_code(out: ptr) -> i64
+align_rt_run_bytes_stdout(out: ptr) -> { ptr, i64 }
+align_rt_run_bytes_stderr(out: ptr) -> { ptr, i64 }
+align_rt_run_bytes_free(out: ptr) -> void
+```
+
+`align_rt_command_run` は ABI を保ち、`Command` に保存した新 bound を読む。両 run entry は1つの runtime capture
+engine へ委譲し、mode 固有の処理は完了 buffer の UTF-8 検証と output-handle construction だけである。
+`run_bytes` は HIR、MIR、LLVM lowering、checked-HIR validation、interface serialization、cache identity に
+新しい閉じた builtin type/scalar tag を持つ。runtime reflection、callback、persisted artifact、wire tag、ambient
+cache input は無い。同じ source の whole-program/per-unit compile は同じ run mode と output type を選ばなければ
+ならない。`run` と `run_bytes` の変更、source 上の bound call の追加・変更は通常の source-derived frontend/object
+cache entry を無効化する。
+
+## 実装 closure matrix
+
+| Cell | Owner と必要な evidence |
+|---|---|
+| Setter formation と validation | Sema/HIR/MIR/codegen/runtime は束縛 `command` 上の `max_capture_bytes(i64)` だけを形成する。arity/type 違いと temporary receiver は診断し、負値は side effect 前に abort。`0`、overwrite、unset は別状態。Owner: `m11_process_command::command_capture_bound_formation_and_state`。 |
+| Exact-limit text success | 共通 drain は empty、`L`、stdout-only、stderr-only、同時 `L`/`L` を受理し、`run_output` は既存 code/text view を保つ。Owner: `command_capture_exact_limit_and_reuse`。 |
+| One-byte overflow | どちらかが `L + 1`、または両 pipe 同時圧力でも `Error.Invalid`、output 非公開、group kill、fd close、1回 reap。Owner: `command_capture_overflow_kills_group_and_discards_partial`。 |
+| Timeout/cap/exit/UTF-8 precedence | timeout-before-overflow、overflow-before-timeout、nonzero-overflow、in-bound invalid UTF-8 で上記 checkpoint order を検証。Owner: `command_capture_error_precedence`。 |
+| Binary tier | `run_bytes` は invalid UTF-8 と embedded NUL を byte-for-byte で保ち、region-bound byte view、nonzero exit、exact-cap 動作を共有。Owner: `command_run_bytes_preserves_arbitrary_output`。 |
+| Move と Drop | formation、construction、`Result` move-in/out、`?`、`else`、`match`、`map_err`、replacement、return、source nulling、early exit は各 output を1回 Drop。aggregate/capture/temporary と escaped view を拒否。Owner: `m11_process_command` ownership matrix と checked-HIR variant tripwire。 |
+| Allocation と malformed limit | exact layout を fork 前に割り当て、第1/第2 allocation failure は先行 state を free し子を開始しない。zero は allocation 無し、unrepresentable layout は `Invalid`、capture capacity は `L` を越えない。Owner: runtime allocation failpoint/unit owner と `command_capture_allocation_bound`。 |
+| Reuse と concurrency | 1 command が保持/上書き bound で text/byte run を反復し、2つの独立 command は shared state 無しで並行実行。Owner: `command_capture_reuse_and_independent_concurrency`。 |
+| Generic/interface/per-unit/cache parity | `Result<run_bytes, Error>` を返す関数は whole-program/per-unit で同じ type/ABI。interface round-trip と exact edit/revert cache identity が一致。Owner: process interface/per-unit/cache tests。 |
+| Existing behavior | setter 無し `run()` は無制限で byte-for-byte compatible。cwd/env/env_clear/timeout、large dual-pipe、nonzero exit、text view owner は green のまま。Owner: 完全な `m11_process_command` target。 |
+
+明示的な memory promise のため、local `bench/process_capture` measurement も必要である。65,536 と 262,144 の
+consumer limit について、有界 text/byte throughput と最大 live capture-layout bytes を既存無制限 path と比較して
+記録する。resource contract の evidence であり correctness gate ではない。
+
+## Acceptance gate
+
+実装を shipped とする前に:
+
+1. 各 matrix row が implementation と regression owner を指し、新 type が exhaustive variant tripwire に含まれる。
+2. 英日 process design、`draft.md`、condensed language spec、design notes、Settled decisions、runtime ABI ledger、
+   align-llm request register が一致する。
+3. focused process owner、bounded PR gate、library/binary Clippy、whole/per-unit/cache owner、allocation failpoint、
+   local resource measurement が final candidate で通る。
+4. align-llm は、named merged implementation commit を pin し、focused helper/adapter target が 65,536/262,144
+   bound、timeout/cap precedence、process-group cleanup、arbitrary-byte tier を証明し、その capability wave の final
+   `make ci` が通った後だけ request を進められる。

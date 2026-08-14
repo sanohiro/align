@@ -975,8 +975,13 @@ without UTF-8 validation, returning a `bytes` view so a GGUF/binary asset maps z
 listing can silently be short. `std.path`: `join`/`normalize` (owned), `base`/`dir`/`ext` (zero-copy
 substring views). `std.process`: `spawn`/`wait`/`kill`/`exec`, `exit` (runs cleanup) vs `abort`
 (immediate `_exit(1)`), `cpu_count()`, and the `command` builder — `process.command(cmd, args)` plus
-`cwd`/`env`/`env_clear`/`timeout_ns` setters and `run() -> Result<run_output, Error>` for captured
-`code()`/`stdout()`/`stderr()`. `std.env`: `get`/`set` only — `args` comes solely from
+`cwd`/`env`/`env_clear`/`timeout_ns` setters, the optional per-stream
+`max_capture_bytes(limit)` bound, `run() -> Result<run_output, Error>` for UTF-8 text capture, and
+`run_bytes() -> Result<run_bytes, Error>` for arbitrary bytes. Both output handles expose
+`code()`/`stdout()`/`stderr()` as region-bound zero-copy views. An unset capture bound preserves the
+existing unbounded behavior; explicit `0` permits only empty streams, exact-limit output succeeds,
+and overflow kills/reaps the child group, discards partial output, and returns `Error.Invalid`.
+`std.env`: `get`/`set` only — `args` comes solely from
 `main(args: array<str>)`, there is no `env.args`. `std.time`: one `i64`-nanosecond timeline, no
 `Duration` type — `now()`
 (wall), `instant()` (monotonic), `sleep(ns)`. Recoverably fallible `std` functions return
