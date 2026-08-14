@@ -206,9 +206,10 @@ All prepare-phase Cargo operations are visibly `--locked --offline`; `CARGO_NET_
 defense in depth. Registry/cache/source manifests are compared before/after; a lockfile, index,
 cache, source, or configuration write rejects. Each revision starts with an empty target and work
 directory, is prepared exactly once per benchmark, and retains only its verified private artifacts
-for warm-up and samples. The benchmark-input slice first locks the current four invocations; the
-evidence implementation then replaces their measurement-time `cargo run` shape with this protected
-prepare/direct-exec interface before `BASE` can exist.
+for warm-up and samples. The benchmark-input slice first locks all six current Cargo invocations:
+two root builds and one detached `cargo run` in each script. The evidence implementation then
+replaces the two measurement-time `cargo run` invocations with this protected prepare/direct-exec
+interface before `BASE` can exist.
 
 Before each child, the controller creates close-on-exec pipes, enumerates descriptors, and passes
 exactly stdin/stdout/stderr. It validates descriptor numbers after duplication, closes the inherited
@@ -552,8 +553,8 @@ It may not weaken the base rule.
 
 ## Delivery order
 
-1. Merge the benchmark-input slice: check in detached locks, remove ignores, make all four Cargo
-   invocations locked/offline, confine generated outputs, and add deterministic missing/stale/cache,
+1. Merge the benchmark-input slice: check in detached locks, remove ignores, make all six current
+   Cargo invocations locked/offline, confine generated outputs, and add deterministic missing/stale/cache,
    no-network, no-write, and cleanup owners.
 2. Merge evidence implementation: installed controller/verifier/monitor, profile, pinned image
    recipe/digest, public key, inner-median harness update, host guide, adversarial fixtures, format

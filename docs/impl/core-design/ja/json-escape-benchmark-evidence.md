@@ -156,7 +156,8 @@ effective configのcanonical SHA-256/mode manifestをrevision-private work dir�
 manifestをverifyしprepared executableをdirect exec、Cargo/compiler work・missing/extra/changed/wrong-mode
 artifact・prepare-only selectorをreject。argv arrayでshell interpolationなし。prepare Cargoはすべて
 `--locked --offline`。cache/source/config manifestをbefore/after比較しwriteをreject。benchmark-input
-sliceがcurrent 4 invocationをlock後、evidence implementationがbaseline前にprepare/direct-execへ置換する。
+sliceは各scriptのroot build 2回とdetached `cargo run` 1回、合計current 6 Cargo invocationをlockする。
+evidence implementationがbaseline前に2つの`cargo run`をprepare/direct-execへ置換する。
 
 child前にCLOEXEC pipeを作りfd enumerate、stdin/stdout/stderrだけを渡す。dup後番号確認、inherited range close、
 entrypointも`/proc/self/fd`確認。collision/inheritance/missing CLOEXEC/mapping changeはreject。bounded outputは
@@ -406,7 +407,7 @@ bindするprovider CASをreviewed amendmentで導入する。base ruleを弱め�
 
 ## Delivery order
 
-1. detached lock check-in、ignore削除、4 Cargo locked/offline、output confinement、missing/stale/cache/network/write/
+1. detached lock check-in、ignore削除、current 6 Cargo locked/offline、output confinement、missing/stale/cache/network/write/
    cleanup ownerのbenchmark-input sliceをmerge。
 2. installed controller/verifier/monitor、profile/image recipe+digest/public key、inner-median harness、host guide、
    adversarial fixture、format golden、merge-race ownerをmerge。performance claimなし。

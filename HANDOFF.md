@@ -23,9 +23,11 @@ close them together. The bounded review of redesigned head `0bb57285` found six 
 publication gaps. The current repair adds trusted GitHub review attestation, protects the complete
 evidence profile/source set, rechecks final target reachability, serializes publication with a
 durable reservation, uses the repository's exact `clean`/`fixed` states, and fixes SSHSIG bytes.
-Next: inspect this repair delta, run docs publication preflight, publish and merge the design, then
-implement the benchmark-input and evidence-controller prerequisites before creating a Request 7
-implementation branch.
+PR #813 is open. Author inspection of the next slice found that the current scripts make six Cargo
+invocations, not the four root builds named by the delivery prose; the exact-head repair now binds
+all six and identifies the two later `cargo run` replacements. Next: rerun docs publication
+preflight, update and merge PR #813 after required checks pass, then implement the benchmark-input
+and evidence-controller prerequisites before creating a Request 7 implementation branch.
 
 The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit
