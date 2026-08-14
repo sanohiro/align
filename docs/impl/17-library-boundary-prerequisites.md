@@ -1325,7 +1325,7 @@ same graph proof.
 
 ### 7.7 Bounded canonical JSON encoding
 
-Status: accepted design for align-llm Request 12 on 2026-08-14; implementation pending.
+Status: implemented for align-llm Request 12 on 2026-08-14.
 
 The evaluator must persist typed artifacts without first materializing an unbounded string. The
 one public addition is the fallible, individually owned sibling of `json.encode`:

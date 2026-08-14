@@ -62,12 +62,14 @@ stack/boxed recursive cleanup share the existing builder/runtime ABI. Reopen §7
 or ownership-strategy change after design review.
 
 align-llm Request 12 is the active prerequisite. Branch
-`agent/bounded-canonical-json-design` records the accepted public design in
+`agent/bounded-canonical-json` implements the accepted public design in
 `docs/impl/17-library-boundary-prerequisites.md` §7.7: `json.encode_bounded(value, max_bytes: i64)`
 shares `json.encode` bytes and schema, returns an owned `Result<string, Error>`, and rejects a
-negative or exceeded inclusive emitted-byte limit as `Error.Invalid`. Review and merge this design,
-then implement its complete Sema→checked-HIR→MIR→LLVM→runtime owner matrix. Do not build a second
-formatter, estimator pass, dynamic JSON value, or unbounded-encode-then-discard compatibility path.
+negative or exceeded inclusive emitted-byte limit as `Error.Invalid`. The runtime bounded builder,
+Sema/checked-HIR discriminator, MIR Result control flow, LLVM shared formatter path, typed ABI rows,
+and focused runtime/driver owners are implemented. Complete the focused ARM-native qualification,
+comprehensive review, repair, publication preflight, PR, and merge. Do not build a second formatter,
+estimator pass, dynamic JSON value, or unbounded-encode-then-discard compatibility path.
 
 Out-of-gate suites (everything outside `scripts/test-pr.sh`) are guarded by the
 nightly full-suite workflow, which builds once, runs every compiled test binary

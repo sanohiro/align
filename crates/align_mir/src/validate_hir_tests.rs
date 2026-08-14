@@ -9647,6 +9647,7 @@ fn hir_body_validator_pipeline_template_json_group() {
     let result_array = Ty::Result(Scalar::DynArray(PrimScalar::Int(IntTy { bits: 64, signed: true })), Scalar::Enum(error_id));
     let result_record_array = Ty::Result(Scalar::DynStructArray(0), Scalar::Enum(error_id));
     let result_union = Ty::Result(Scalar::Enum(union_id), Scalar::Enum(error_id));
+    let result_string = Ty::Result(Scalar::String, Scalar::Enum(error_id));
 
     add_tail(
         &mut program,
@@ -9699,6 +9700,19 @@ fn hir_body_validator_pipeline_template_json_group() {
             Ty::Str,
         ),
         Ty::Str,
+    );
+    add_tail(
+        &mut program,
+        "b2b2_json_encode_bounded",
+        Vec::new(),
+        body_test_expr(
+            hir::ExprKind::JsonEncodeBounded {
+                parts: vec![hir::TemplatePart::Text("{}".to_string())],
+                max_bytes: Box::new(body_test_expr(hir::ExprKind::Int(2), integer)),
+            },
+            result_string,
+        ),
+        result_string,
     );
     add_tail(
         &mut program,
@@ -10075,6 +10089,28 @@ fn hir_body_validator_pipeline_template_json_group() {
         panic!("template fixture lost its template")
     };
     parts.retain(|part| !matches!(part, hir::TemplatePart::PopComma));
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "b2b2_json_encode_bounded");
+    let hir::ExprKind::JsonEncodeBounded { max_bytes, .. } = &mut expression.kind else {
+        panic!("bounded encoder fixture lost its discriminator")
+    };
+    max_bytes.ty = Ty::Bool;
+    max_bytes.kind = hir::ExprKind::Bool(true);
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "b2b2_json_encode_bounded");
+    expression.ty = Ty::Result(Scalar::Str, Scalar::Enum(error_id));
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "b2b2_json_encode_bounded");
+    let hir::ExprKind::JsonEncodeBounded { parts, .. } = &mut expression.kind else {
+        panic!("bounded encoder fixture lost its discriminator")
+    };
+    parts.clear();
     assert!(!body_core_metadata_is_valid(&reject));
 
     let mut reject = program.clone();

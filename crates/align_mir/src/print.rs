@@ -615,6 +615,15 @@ fn rvalue_str(rv: &Rvalue) -> String {
                 .collect();
             format!("template[{}]", ps.join(", "))
         }
+        Rvalue::JsonEncodeBounded {
+            pieces,
+            max_bytes,
+            out,
+        } => format!(
+            "json_encode_bounded({} pieces, max={}, -> _{out})",
+            pieces.len(),
+            operand_str(max_bytes)
+        ),
         Rvalue::JsonDecode { struct_id, input, out } => {
             format!("json_decode(struct#{struct_id}, {}, -> _{out})", operand_str(input))
         }

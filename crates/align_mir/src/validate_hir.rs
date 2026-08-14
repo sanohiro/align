@@ -3717,6 +3717,9 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::Template(parts) => {
                 !parts.is_empty() && self.template_parts_envelope_ok(parts)
             }
+            hir::ExprKind::JsonEncodeBounded { parts, .. } => {
+                !parts.is_empty() && self.template_parts_envelope_ok(parts)
+            }
             hir::ExprKind::JsonDecode { struct_id, .. }
             | hir::ExprKind::JsonDecodeStructArray { struct_id, .. }
             | hir::ExprKind::JsonScan { struct_id, .. } => {
@@ -5434,6 +5437,27 @@ impl<'a> BodyValidator<'a> {
                 push_expr!(recv, context.clone());
             }
             hir::ExprKind::Template(parts) => {
+                for part in parts.iter().rev() {
+                    match part {
+                        hir::TemplatePart::Hole(expr)
+                        | hir::TemplatePart::JsonStr(expr) => {
+                            push_expr!(expr, context.clone());
+                        }
+                        hir::TemplatePart::OptionField { access, .. }
+                        | hir::TemplatePart::OptionStructField { access, .. }
+                        | hir::TemplatePart::StructArrayField { access, .. }
+                        | hir::TemplatePart::ScalarArrayField { access, .. }
+                        | hir::TemplatePart::UnionValue { access, .. } => {
+                            push_expr!(access, context.clone());
+                        }
+                        hir::TemplatePart::Text(_) | hir::TemplatePart::PopComma => {}
+                    }
+                }
+            }
+            hir::ExprKind::JsonEncodeBounded { parts, max_bytes } => {
+                // The source accesses encoded by `parts` are evaluated before the explicit limit.
+                // Push in reverse because this worklist is LIFO.
+                push_expr!(max_bytes, context.clone());
                 for part in parts.iter().rev() {
                     match part {
                         hir::TemplatePart::Hole(expr)
@@ -8735,6 +8759,26 @@ impl<'a> BodyValidator<'a> {
             }
             hir::ExprKind::Template(parts) => {
                 self.derive_template_expression(parts, context)
+            }
+            hir::ExprKind::JsonEncodeBounded { parts, max_bytes } => {
+                let (template_ty, template_falls, template_breaks) =
+                    self.derive_template_expression(parts, context)?;
+                let limit = self.expr_flow(max_bytes)?;
+                if template_ty != Ty::Str || limit.ty != i64_ty() {
+                    return None;
+                }
+                let template = BodyFlow {
+                    ty: template_ty,
+                    falls: template_falls,
+                    breaks: template_breaks,
+                };
+                let error = self.error_id()?;
+                let (falls, breaks) = strict_flow(&[template, limit]);
+                Some((
+                    Ty::Result(Scalar::String, Scalar::Enum(error)),
+                    falls,
+                    breaks,
+                ))
             }
             hir::ExprKind::JsonDecode { struct_id, input } => {
                 self.derive_json_decode_struct(*struct_id, input, context, false)

@@ -13,7 +13,7 @@ JSON を型付き境界とスキーマ未知境界の両方で扱う（draft §1
 
 ```text
 json.encode(x)   -> str                      // x: struct (nested structs recurse); str fields JSON-escaped
-json.encode_bounded(x, max_bytes: i64) -> Result<string, Error> // accepted design; implementation pending
+json.encode_bounded(x, max_bytes: i64) -> Result<string, Error>
 json.decode(s)   -> Result<T, Error>         // T from the binding/context: u: User := json.decode(s)?
 
 // decode targets, all verified:

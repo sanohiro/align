@@ -4515,8 +4515,8 @@ string-or-parts multimodal `content` union — v1 restricts `content` to `str`),
 
 ### JSON completeness — DESIGN SETTLED 2026-07-18 (owner-approved; the implementation source of truth)
 
-**Bounded canonical encode — ACCEPTED DESIGN 2026-08-14 (align-llm Request 12; implementation
-pending).** `json.encode_bounded(value, max_bytes: i64) -> Result<string, Error>` is the one
+**Bounded canonical encode — IMPLEMENTED 2026-08-14 (align-llm Request 12).**
+`json.encode_bounded(value, max_bytes: i64) -> Result<string, Error>` is the one
 resource-bounded sibling of typed `json.encode`. It borrows exactly the same admitted value graph
 and reuses the same ordered Template parts and runtime formatters. An inclusive emitted-UTF-8-byte
 ceiling succeeds on exact fit; a negative ceiling or first would-exceed byte is `Error.Invalid`,
@@ -4631,7 +4631,8 @@ prerequisite is accepted and merged.
 `json.token` **deleted** (doc + scan cover the realistic cases; no consumer — build it only if one
 appears, as a Future note); `json.field_table<T>` **deleted** (a compiler-internal artifact, not
 API). §18.1's core.json surface is now exactly: `decode`, `encode`, `encode_bounded`, `doc`, `scan`;
-the bounded operation is the accepted Request 12 addition pending implementation. This also
+the bounded operation shipped as Request 12 with one owned fallible result and the shared typed
+encode plan. This also
 closes the no-turbofish settled item's "schema-selector residual" — `scan` is the one survivor
 and it types from the binding annotation.
 
