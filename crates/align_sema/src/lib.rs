@@ -13153,8 +13153,11 @@ impl<'a> EscapeCheck<'a> {
                 // A by-value Move parameter has crossed the call boundary and is free-standing.
                 // A borrowed builder keeps the constructor modes admitted by its element type:
                 // `string` is heap-only, primitive scalars may use either constructor, and the
-                // remaining source element forms are region-only. This keeps a nested helper from
-                // treating a possibly region-backed incoming builder as definitely individual.
+                // remaining source element forms are region-only. A Move HeapTreeRecord is
+                // necessarily heap-only: every Move leaf in that grammar (`string` or a dynamic
+                // array) is rejected by RegionPlain. Copy records may use either constructor.
+                // This keeps a nested helper from treating a possibly region-backed incoming
+                // builder as definitely individual.
                 let (individual, may_individual) = match (borrowed_builder, local.ty) {
                     (true, Ty::ArrayBuilder(Scalar::String)) => {
                         (true, true)
@@ -52015,6 +52018,27 @@ fn exit_branch(flag: bool) -> i64 {
         ];
         assert!(heap_tree_record_type_ok(0, &valid, &tagged));
         assert!(heap_tree_record_type_ok(1, &valid, &tagged));
+
+        let copy_dual_mode = vec![structure("CopyDualMode", vec![("value", i64_ty)])];
+        assert!(heap_tree_record_type_ok(0, &copy_dual_mode, &[]));
+        assert!(region_plain_type_ok(
+            Ty::Struct(0),
+            &copy_dual_mode,
+            &[],
+            &[],
+        ));
+        let move_heap_only = vec![structure(
+            "MoveHeapOnly",
+            vec![("values", Ty::DynArray(Scalar::Int(IntTy {
+                bits: 64,
+                signed: true,
+            })))],
+        )];
+        assert!(heap_tree_record_type_ok(0, &move_heap_only, &[]));
+        assert!(
+            !region_plain_type_ok(Ty::Struct(0), &move_heap_only, &[], &[]),
+            "a Move HeapTreeRecord must never be dual-mode because RegionPlain rejects every owning leaf"
+        );
 
         for (name, excluded, expected) in [
             ("view", Ty::Str, "field 'bad' has excluded type str"),

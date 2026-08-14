@@ -16053,6 +16053,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .map_err(|e| self.err(e))?;
                     self.drop_ty_at(fp, ty)?;
                 }
+                // A direct `array<string>` field owns every element buffer as well as the outer
+                // array. Route it through the canonical dispatcher so aggregate cleanup is the
+                // same deep `FreeStringArray` operation as a standalone local or tagged payload.
+                ty @ Ty::DynArray(Scalar::String) => {
+                    let fp = self
+                        .builder
+                        .build_struct_gep(st, base, pi, "dropstrarr")
+                        .map_err(|e| self.err(e))?;
+                    self.drop_ty_at(fp, ty)?;
+                }
                 // An owned `array<T>` field (REST-gateway runway Slice C) with a **non-owned** element —
                 // free its single heap buffer (field 0 of the `{ptr,len}`; `free(null)` is a no-op for an
                 // empty array). A scalar / `str`-view / plain-data-struct element owns nothing, so this is
@@ -23464,6 +23474,10 @@ mod tests {
             stack.contains("dropdeep.head") && stack.contains("call void @align_rt_free("),
             "stack record builder must run ordinary array<Move-record> Drop:\n{stack}"
         );
+        assert!(
+            stack.contains("call void @align_rt_free_string_array("),
+            "stack record cleanup must deep-free direct and nested string-array fields:\n{stack}"
+        );
 
         let boxed = ir(
             "Leaf { name: string }\n\
@@ -23491,8 +23505,8 @@ mod tests {
             "boxed record builder must run ordinary array<Move-record> Drop:\n{boxed}"
         );
         assert!(
-            !boxed.contains("call void @align_rt_array_builder_free_strings("),
-            "record cleanup must use the compile-time recursive DropPlan, not the string-only runtime helper:\n{boxed}"
+            boxed.contains("call void @align_rt_free_string_array("),
+            "boxed record cleanup must deep-free direct and nested string-array fields:\n{boxed}"
         );
     }
 
