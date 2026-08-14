@@ -7,9 +7,9 @@ This is not a database-private escape hatch. It closes the general gap between o
 packages and native stateful libraries. `std.http`, `std.net`, `std.process`, and future
 FFI-backed packages must be able to use the same ownership and borrow machinery.
 
-Section 7.5 is a later, independently consumer-complete extension for align-llm Request 8. It
-reuses the shipped builder, region, generic, interface, and Drop machinery but is not a `pkg.db`
-prerequisite and is not yet implemented.
+Sections 7.5 and 7.6 are later, independently consumer-complete extensions for align-llm Requests
+8 and 10. Section 7.5 is implemented. Section 7.6 is the accepted design for the recursive
+Option/dynamic-array record graph and remains unimplemented. Neither is a `pkg.db` prerequisite.
 
 The implementation order in this document is mandatory. A database driver must not add another
 closed `Ty`/HIR/MIR family that recognizes `pkg.db` names, and it must not expose `raw` handles or
@@ -1198,6 +1198,78 @@ chain would either publish an unsafe record type or duplicate the same nominal-l
 and Drop proof across dormant boundaries; one consumer-complete capability has lower integration
 risk and less duplicated evidence.
 
+### 7.6 Recursive owned heap-record builder
+
+Status: accepted design for align-llm Request 10; implementation pending.
+
+This extension keeps the Request 8 syntax, owner model, nominal identity, and runtime allocation
+ABI. It widens only the admitted record graph needed by the named C6 evaluator records. There is no
+second builder, allocator selector, dynamic value tree, collection conversion, or implicit clone.
+
+#### Public-contract ledger
+
+| Field | Contract |
+|---|---|
+| Surface and owner | The surface remains `array_builder()` under an expected `array_builder<S>` type, `b.push(value: S)`, and consuming `b.build() -> array<S>`. Sema owns formation and allocation-mode proof; Move/Escape analysis owns transfer; MIR owns initialized-prefix cleanup; LLVM owns recursive element Drop; the runtime retains only raw checked byte growth. |
+| Recursive element predicate | `HeapTreeRecord(S)` requires the Request 8 root invariants: a nonempty, acyclic declared struct, natural alignment at most 8, and no `align(N)` or `layout(C)`. Each field is a Copy integer/float/`bool`/`char`, owned `string`, another `HeapTreeRecord`, `Option<T>` where `T` recursively satisfies this field grammar, or `array<E>` where `E` is a Copy scalar, owned `string`, or `HeapTreeRecord`. Options may nest; an array element is never another Option or dynamic array. |
+| Exact consumer closure | The grammar covers the C6 `SnapshotRequest`, `PromptEvaluationTask`, `PromptTaskRow`, `TaskAggregate`, `CorpusAggregate`, `RegressionReason`, `RunSnapshotAttestation`, `SnapshotResult`, and `TaskInputSnapshot` construction graphs: optional scalars/records/arrays, arrays of strings, and arrays of recursively owned records. The implementation owner uses representative shapes equivalent to these records rather than importing align-llm source. |
+| Closed exclusions | Direct or nested `str`, `slice`, `resource_ref`, resource, raw, function, builder, Result, user sum/enum, tuple, box, fixed array, response array, region-owned aggregate, and every other view or Move handle reject before construction. `array<Option<T>>`, `array<array<T>>`, and other composite-element dynamic arrays remain unrepresentable and outside this request. Unknown definitions, inline cycles, empty records, and explicit/over-aligned layouts fail closed. |
+| Type formation outside the builder | A direct `array<string>` record field becomes an ordinary valid Move field, matching the already valid `Option<array<string>>` path. Its element-wise string Drop is the existing standalone `array<string>` Drop. This is a language ownership closure only; it does not widen any JSON decode/encode mode, sum payload, fixed array, indexing, pipeline, or literal producer. |
+| Construction and move | `push` evaluates one complete record rvalue, verifies its exact nominal type and allocation mode, then transfers the entire value and zeros the selected source before growth. `None` owns no payload; `Some` transfers its one complete payload. Empty arrays use `{null,0}`; nonempty arrays transfer their existing buffer. No child is cloned or rebuilt by `push`. |
+| Allocation mode | Every reachable owned `string` and dynamic-array buffer, including array elements' recursive owners, must be uniformly free-standing at the selected push path. Arena-owned, mixed, unknown, or path-dependent ownership rejects in source field/index order before the runtime growth call. Copy fields and `None` contribute no owner. |
+| Growth and representation | The outer builder remains one amortized `align_rt_realloc` byte buffer with the compiler-computed stride of `S`. Reallocation relocates tags, `{ptr,len}` headers, and nested record bytes without running transient Drop. Children remain separate allocations owned by their relocated headers. `build` is the existing zero-copy outer-buffer transfer to AoS `array<S>`. |
+| Drop and cleanup | One compiler-owned recursive Drop plan is used for a complete source, an unfinished builder prefix, and the built array. Option Drop visits only `Some`; `array<string>` drops every initialized string then its buffer; `array<Move-record>` drops each element recursively then its buffer; Copy arrays free only their buffer. Dropping an unfinished stack or boxed builder consumes its header into `{ptr,len}` and invokes this ordinary array Drop once. |
+| Partial states | A failure while constructing the next record remains the source aggregate's responsibility and does not increment builder length. After `push` begins, capacity overflow and allocator failure are terminal and cannot expose a partial success. Replacement, return, `?`, `map_err`, branch/match/else joins, loop back-edges/breaks, early exit, and enclosing-record failure each leave exactly one cleanup owner. |
+| Builder ownership | The existing single-owner rules remain: typed by-value transfer and return are allowed; `borrow mut` is non-consuming and cannot escape; aggregate/Option/Result storage and task/closure capture are rejected. `append` remains available only for the pre-existing Copy scalar forms and never shallow-copies any record or Move element. |
+| Validation order | Parser/import/arity and expected-type inference; recursive type formation and representability; builder placement/receiver; source move state and exact nominal type; depth-first allocation-mode proof in declaration/index order; build result escape and cleanup. Whole-program, imported/per-unit, checked-HIR, and cache-replay paths preserve the same first failure and perform no allocation before their applicable validation completes. |
+| Interfaces and identity | Existing nominal producer identity plus the complete serialized reachable struct/tagged/array definition graph remains canonical. Concrete generic substitution finishes before admission. Same-shape declarations remain distinct; field/option/array/drop/layout edits invalidate interface and codegen caches, and an exact revert restores the prior identity. No `RecordBuilderDescV2`, runtime dictionary, reflection table, callback, or source/artifact read is added. |
+| Encoding and persistence | N/A. The builder has no wire form. Field names retain existing UTF-8 identifier semantics; owned string bytes retain the language string contract, including embedded NUL. JSON Requests 9 and 13 remain separate operation-specific materialization/codec work. |
+| Effects and overlap | Constructor, push, and build remain Pure in-memory operations. One mutable operation can target one builder at a time. Distinct builders and processes share no mutable builder state. Failure restoration is ordinary owner cleanup; no connection-global or process-global state exists. |
+| Allocation accounting | For already constructed children, each push adds no child allocation; only outer-buffer growth may allocate. Build adds none. A value containing `k` separately built arrays and their string elements retains exactly those owners plus the one outer builder buffer. Instrumented owner tests, not a benchmark, prove this correctness accounting because no latency or throughput threshold is promised. |
+| Prerequisite and adoption | Request 8 at `029e27465d79e24cd36d374aae41dca0ec7e6979` is the implementation base. The Align implementation must merge before align-llm runs `c6c2-request10-adoption`; C6f2 later runs its own `c6f2-array-builder-adoption`. Neither consumer checkpoint is part of Align's implementation gate. |
+
+The recursive grammar is intentionally not the unrestricted mathematical closure of `Option` and
+`array`. The named consumers need arrays of strings and records whose fields may themselves contain
+options and arrays. They do not need arrays whose elements are options or arrays. Those shapes need
+a new composite-element array representation and per-element move-out/indexing contract, so adding
+them here would cross a distinct language and ABI boundary without a consumer.
+
+#### Deterministic field and owner order
+
+The classifier and allocation-mode proof both use depth-first source order. An Option contributes
+its payload at the field position. An array contributes its buffer owner first, then element owners
+in increasing index order for runtime cleanup; static admission validates the element type at the
+field position. For multiple invalid fields, the first declaration-order path wins. For a selected
+Move source, type/source-state errors precede allocation-mode errors, and all precede growth.
+
+#### Implementation closure matrix
+
+| Closure cell | Required implementation closure | Owner evidence |
+|---|---|---|
+| Formation and closed grammar | Replace the Request 8 leaf-only walk with one cycle-safe, source-order `HeapTreeRecord` classifier over records, nested Options, and the exact dynamic-array element set. Reject every excluded leaf and malformed id before HIR publication. | Sema predicate unit matrix; `m12_array_builder` accepted/rejected graph and precedence matrix; whole/per-unit malformed producer twins |
+| Direct `array<string>` field | Remove only the direct-field prohibition after proving the existing deep string-array Drop is used through direct, Option-wrapped, nested-record, replacement, and partial-construction paths. Preserve every JSON/sum/fixed-array/indexing restriction. | declaration owner plus direct/nested `array<string>` construction/drop tests; unchanged JSON and sum rejection owners |
+| Concrete generic substitution | Admit a generic record only after every Option/array/record parameter is concrete and satisfies the same graph. No new bound or unresolved Param reaches checked HIR. | generic direct/nested positive and excluded composite-element negative; interface template mutation |
+| Copy/Move construction | Cover Copy-only records, `None`, `Some` scalars/strings/records/arrays, empty/nonempty string arrays, and arrays of Copy/Move records. Complete literals, locals, function results, transparent blocks, `if`/`match`/`else`, `?`, and `map_err(...)?` transfer once. | one parameterized `m12_array_builder` construction/source matrix with source-use-after-push negatives |
+| Allocation-mode proof | Walk every reachable string and array owner in deterministic field/index order; accept only uniform free-standing ownership and reject arena, mixed, unknown, and path-dependent paths before push. | Sema unit owner plus runtime-call-absence driver assertions for direct, Option, nested array, and array-element paths |
+| Relocation | Force outer reallocations around records containing `None`, `Some`, empty/nonempty arrays, nested Move records, and arrays of Move records; no transient child Drop occurs. | driver allocation/free instrumentation and runtime exact-size growth owner |
+| Unfinished cleanup | Normal exit, return, `?`, `map_err`, all joins, loop continue-by-back-edge/break, reassignment, and malformed-input exit drain every initialized element exactly once in stack and boxed header modes. | parameterized abandonment matrix plus LLVM structural stack/boxed owner using ordinary array Drop |
+| Recursive Drop | Close `None`/`Some`, direct and Option-wrapped `array<string>`, Copy arrays, `array<Move-record>`, arrays of records that themselves contain Options/arrays, and repeated nominal subgraphs through the canonical iterative Drop dispatcher. | Sema DropPlan graph tests; LLVM IR/runtime exact-free owners; deep finite graph non-recursion owner |
+| Partial and enclosing aggregates | Failure constructing the next nested Option/array record leaves builder length unchanged; failure after a built array enters an enclosing Move record drops the array and later sibling state exactly once. | driver partial-element and enclosing-record failure owners |
+| Build transfer | Stack and boxed builds transfer the same outer buffer and recursive obligation, dispose only the applicable header, and suppress later builder cleanup. Empty and nonempty results use ordinary AoS array Drop. | driver build/use-after-build/return owners plus LLVM header-mode structural owner |
+| Function and borrow boundary | Preserve typed by-value transfer/return and non-consuming `borrow mut`; reject aggregate storage, capture, task transfer, alias escape, and consuming a borrowed builder for the widened graph. | existing Request 8 boundary owner parameterized with a recursive record |
+| Interface, nominal remap, and cache | Serialize/remap every reachable Option/array/record definition; whole/per-unit and cold/cache-replay decisions agree; same-shape nominal twins differ; edit/revert restores identity. | generics, per-unit, interface corruption, nominal twin, and cache edit/revert owners |
+| Checked HIR | Rename/extend the shared `HR` predicate and require New/Push/Build to use it, exact move bits, exact root id, and AoS result. Wrong tagged id, array element, move bit, root/result id, or malformed reachable definition fails before MIR. | `19-hir-validation-ledger.md` rows and parameterized valid/malformed HIR mutations |
+| Runtime terminal boundaries | Raw push keeps checked `len * stride`, capacity, and allocation arithmetic; overflow/OOM remain terminal; distinct builders/processes remain independent. No runtime ABI symbol changes. | existing Request 8 runtime owners plus widened exact-stride and terminal-child cases |
+| Allocation parity | Count that push/build add no child allocation or clone and that every pre-existing child plus the outer buffer frees once on build/abandonment. | driver/runtime allocation instrumentation; no benchmark |
+| Compatibility | Scalar/string and Request 8 record builders, region builders, ordinary Option/array Drop, JSON routes, sum payload restrictions, bounded gate, and Clippy remain green. | existing owner suites and `scripts/test-pr.sh` |
+
+This is one consumer-complete implementation boundary. Admission without direct string-array Drop,
+allocation-mode proof, recursive unfinished cleanup, checked-HIR closure, and build transfer would
+publish an unsafe shallow-copy or leak. The expected hand-written diff may exceed roughly 1,000
+lines because the producer-to-cleanup chain crosses Sema, HIR validation, MIR, LLVM, interfaces,
+and owner tests; splitting it would publish no useful safe intermediate consumer and duplicate the
+same graph proof.
+
 ## 8. Recursive tagged Move payloads
 
 ### 8.1 Required surface
@@ -1969,7 +2041,7 @@ sema producer.
 
 | Cell | Required closure | Exact owner evidence |
 |---|---|---|
-| recursive field placement | Reject only a direct `array<string>` field, graph-valid nested owned-array shapes, and File collection elements; preserve the producer-valid `Option`/`Result`/`Tagged` nesting. | `valid_hir_type_placement_preflight_is_mir_identity`, direct-vs-nested `array<string>` twins, graph-valid nested-array and File-collection negatives |
+| recursive field placement | Reject graph-invalid nested owned-array shapes and File collection elements while preserving producer-valid `Option`/`Result`/`Tagged` nesting. A direct `array<string>` field becomes producer-valid only through the closed §7.6 capability; before that implementation lands, the producer rejection remains authoritative. | `valid_hir_type_placement_preflight_is_mir_identity`, §7.6 direct `array<string>` positive plus excluded composite-array twins, graph-invalid nested-array and File-collection negatives |
 | generic sum producer | `enum_payload_ok` and the placement predicate both admit `ResponseBuilder` after generic substitution; concrete `Fn` remains direct-only. | `generic_enum_response_builder_monomorph_is_producer_valid`, concrete/generic builder and `Fn` twins |
 | header type formation | Header returns/parameters use the exact `resolve_type` nameable set; body-only `CliParsed`, HTTP request/response/client/server, command, and run-output types reject. | `body_only_header_types_fail_placement_closed`, source/imported/FnTy header twins |
 | abstract box | `box` payload formation never admits `Param`, including an unreachable abstract `FnTy` node. | `abstract_box_param_fails_placement_closed` |

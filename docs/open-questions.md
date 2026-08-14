@@ -3636,13 +3636,20 @@ fast-systems-programming needs that any Align user hits, not engine-specific.
    construction; growable `array<T>` itself rejected on exactly that view-invalidation
    ground). Zero-copy freeze via a new `align_rt_realloc` (a Rust-`Vec` store was rejected —
    allocator-boundary mismatch with the C-free that frees `array<T>`). The shipped heap form
-   accepts Copy scalars + `string`. **Heap-record extension SETTLED 2026-08-14 (align-llm Request
-   8; implementation pending):** admit a closed view-free record graph containing only Copy
+   accepts Copy scalars + `string`. **Heap-record extension SETTLED and IMPLEMENTED 2026-08-14
+   (align-llm Request 8):** admit a closed view-free record graph containing only Copy
    scalars, free-standing `string`, and nested records of the same class. Move push nulls the
    complete source; unfinished Drop and the built array use the canonical recursive compile-time
    Drop plan. `append` stays Copy-scalar-only. The existing nominal interface graph is the sole
    type/cache identity; a self-describing `RecordBuilderDescV1` was rejected as a second identity.
-   Other Move handles remain excluded.
+   Other Move handles remain excluded. **Recursive owned-record extension SETTLED 2026-08-14
+   (align-llm Request 10; implementation pending):** admit nested Options and dynamic arrays only
+   where the record remains view-free. An array element is a Copy scalar, `string`, or another
+   admitted record; `array<Option<T>>` and `array<array<T>>` remain separate composite-element-array
+   work. Every nested buffer must be free-standing before push. Direct `array<string>` record fields
+   use the existing deep string-array Drop, while arrays of Move records use the existing recursive
+   element Drop. Full contract and implementation matrix: `impl/17-library-boundary-prerequisites.md`
+   §7.6.
    **Region form SETTLED 2026-07-27 (required before `pkg.db`):**
    `array_builder<T>(out: region)` accepts recursively `RegionPlain` scalars/views/structs. It
    deliberately rejects the heap form's independently owned `string` element (copy it to a

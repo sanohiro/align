@@ -977,6 +977,22 @@ direction, not a v1 commitment, and it must not distort the language into a GPU-
 
 ---
 
+## Why recursive heap record builders stop at record/string array elements
+
+The heap `array_builder` accepts Options and dynamic arrays inside its view-free record graph, but
+does not introduce arrays whose elements are Options or other arrays. The named evaluator consumer
+needs optional fields, arrays of owned strings, and arrays of records that themselves contain those
+fields. All use existing compact type representations and the canonical recursive Drop plan.
+
+An `array<Option<T>>` or `array<array<T>>` would instead need a new composite-element array type,
+element move-out/indexing rules, interface and ABI representation, and generic/pipeline coverage.
+Admitting that larger family merely because the words “recursive array” suggest it would violate
+compiler-friendly restriction and add an unconsumed second failure domain. The smaller closed
+grammar therefore preserves one typed builder and one Drop mechanism while leaving the genuinely
+new array representation for a consumer that needs it.
+
+---
+
 ## The package philosophy
 
 A dependency should be *ordinary source in your tree*, not a resolved artifact. Align's package layer

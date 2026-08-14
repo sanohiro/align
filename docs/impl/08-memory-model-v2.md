@@ -822,3 +822,25 @@ an internal error. That is the same drift class the validator's Copy delegation 
 closed the same way. Reading a field directly off a
 `slice<Struct>` element (`xs[i].field`) remains unsupported — a whole-element read (`row := xs[i]`)
 is the shape both this capability and `pkg.web` use.
+
+## 17. Recursive owned heap-record builders (accepted 2026-08-14)
+
+The align-llm Request 10 extension is specified by
+`17-library-boundary-prerequisites.md` §7.6. It does not add a memory model. It composes the shipped
+path-local owner bit and iterative Drop plan over one wider, closed record graph:
+
+- an Option owns only its active `Some` payload;
+- an owned dynamic-array header owns its buffer, and an owned element class recursively owns each
+  initialized element before that buffer;
+- moving the outer record zeros the complete source once rather than moving children separately;
+- reallocating the outer builder relocates only owner headers/tags and never drops old byte
+  positions;
+- an unfinished builder and its built AoS array invoke the same element Drop plan; and
+- every reachable string/array owner must be uniformly free-standing before a heap push.
+
+The admitted dynamic-array element is a Copy scalar, owned `string`, or an admitted record.
+Composite array elements such as Option and dynamic array remain deferred because they require a
+new type/ABI representation and element move-out contract. Direct `array<string>` record fields
+reuse the already shipped standalone deep string-array Drop; this does not widen JSON or sum
+payload modes. Allocation accounting is structural: push allocates no child, build allocates
+nothing, and only the outer builder growth can add storage to already constructed children.
