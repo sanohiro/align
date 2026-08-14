@@ -47,6 +47,14 @@ builder.push(value)
 builder.build() -> array<T>
 ```
 
+次の heap 拡張として、natural alignment を持つ空でない view-free declared record を受け入れる設計が
+確定している。field は再帰的に Copy scalar、free-standing な `string`、または同じ record class
+だけで構成する。owned string を持つ record の `push` は値を move して source を null にする。
+未完了 builder の Drop は初期化済み prefix を再帰的に解放し、`build` は同じ buffer を通常の
+deep-drop される AoS array へ移譲する。`append` は引き続き Copy scalar 専用である。完全な契約と
+実装 matrix は [`../../17-library-boundary-prerequisites.md`](../../17-library-boundary-prerequisites.md)
+§7.5 にある。この拡張は設計済みだが、まだ実装されていない。
+
 region 形式（必須L6、**実装済み**）:
 
 ```text
@@ -64,9 +72,17 @@ storage: field 'f' owns independent heap storage`。設計は
 
 - Fixed array は Copy 値である。**Move 要素** を持つ fixed array（所有権付きフィールドを持つ `[User{name}]` など）は、要素ごとの drop が実装されるまで拒否される。
 - Dynamic `array<T>` は再帰的な Drop を持つ Move 型である（str 要素の配列は deep-free される。#339 の前例を参照）。
-- `array_builder<T>` は1つのmutable-local Move ownerである。L2後は同じownerを
-  `borrow mut` parameter経由でhelperが変更できるが、builderをaggregate fieldやreturn
-  valueにはできない。
+- `array_builder<T>` は1つの Move owner である。heap 形式は通常の型付き parameter/return を
+  move でき、helper は同じ owner を `borrow mut` 経由で変更できる。builder は aggregate field
+  や task/closure capture にはできず、borrowed builder を consume または保持することもできない。
+- local、literal、function result、transparent block、value-carrying branch/match/else、成功した
+  `?` unwrap（`map_err(...)?` を含む）が生成する完全な heap Move-record rvalue は push できる。不完全、borrowed、
+  consumed-arm、型が分岐する join、allocation mode が曖昧な source は growth 前に拒否する。
+- stack-local と boxed の heap-builder header は同じ initialized-prefix Drop と build transfer を
+  使う。header representation が変えるのは header の破棄だけで、element ownership は変えない。
+- heap 形式は view を保持しない。record element が独立所有の `string` field を保持できるのは、
+  `push` より前に到達可能な全 owner が free-standing と証明できる場合だけである。borrowed field
+  には別経路である region 形式を使う。
 - `array_builder(out).build()` のarena-owned結果は同じfunction内でfinal aggregateへ
   consumeし、通常call boundaryをby-valueでは通さない。
 - Slice は Copy のビューである。`mut slice<T>` の束縛（または `out` 引数）が、唯一の書き込み可能なビュー形式となる。

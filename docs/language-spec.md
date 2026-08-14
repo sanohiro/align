@@ -878,11 +878,24 @@ Every name above is an importable module except `core.array_builder`: `array_bui
 language-intrinsic global (like `builder()`), listed as a core area rather than an `import` target.
 
 `array_builder<T>()` retains its individually owned heap/zero-copy-freeze form.
+Besides Copy scalars and `string`, it accepts nonempty naturally aligned declared records composed
+recursively only of Copy scalars, owned `string`, and the same record class. Such records contain no
+views or other owned collections. A Move record is pushed only when every reachable string owner is
+free-standing. A complete Move-record rvalue from a local, fresh literal, function result,
+value-carrying branch/match/else, transparent block, or successful `?` unwrap (including
+`map_err(...)?`) can be pushed;
+push moves and nulls the selected source, while an incomplete, borrowed, already-consumed, or
+allocation-mode-ambiguous source rejects before growth. Unfinished-builder Drop recursively cleans
+the initialized prefix in both stack-local and boxed-header modes, and build transfers the same
+buffer to the ordinary deeply dropped `array<T>`. `append` remains Copy-scalar-only. The nominal
+type plus its versioned interface graph and compiler Drop plan is the sole record identity; two
+same-shape declarations remain distinct and no runtime record descriptor is exposed.
 `array_builder<T>(out: region)` is the caller-region form for recursively plain values. It uses
 arena chunks with no hidden heap allocation and performs one documented compacting pass at
-`build()`. Shorter-lived views must first use `clone_in(out)`. Both forms remain one mutable-local
-Move owner; a helper may push through a `borrow mut` parameter but cannot store, return, or consume
-that borrowed builder.
+`build()`. Shorter-lived views must first use `clone_in(out)`. Both forms remain one Move owner and
+a helper may push through a `borrow mut` parameter but cannot store, return, or consume that borrowed
+builder. The heap owner may move through an ordinary typed parameter or return; the region-backed
+owner cannot outlive its explicit region and therefore retains its existing boundary restrictions.
 
 `core.hash`: one canonical non-crypto mixer (`wyhash`) over a byte view — `hash64(str|slice<u8>) ->
 u64`, `hash128(...) -> (u64, u64)`. No `Hash` trait; deterministic within a build; not crypto/DoS-

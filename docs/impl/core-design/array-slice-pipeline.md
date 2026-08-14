@@ -50,6 +50,14 @@ builder.push(value)
 builder.build() -> array<T>
 ```
 
+The accepted next heap extension admits a nonempty, naturally aligned, view-free declared record
+whose fields recursively contain only Copy scalars, free-standing `string`, or the same record
+class. `push` moves a record with owned strings and nulls its source; unfinished Drop recursively
+cleans the initialized prefix, while `build` transfers the same buffer to the ordinary deeply
+dropped AoS array. `append` remains Copy-scalar-only. The complete contract and implementation
+matrix are [`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md)
+§7.5; this extension is designed but not yet shipped.
+
 Region form (required L6, **shipped**):
 
 ```text
@@ -71,8 +79,17 @@ removed outright (no alias survives, per the no-backward-compat rule).
   are rejected pending per-element drop.
 - Dynamic `array<T>` is a Move type with recursive Drop (str-element arrays deep-free, #339
   precedent).
-- `array_builder<T>` is one mutable-local Move owner. A helper may mutate the same owner through a
-  `borrow mut` parameter after L2, but the builder is never an aggregate field or return value.
+- `array_builder<T>` is one Move owner. The heap form may move through an ordinary typed parameter
+  or return and a helper may mutate the same owner through `borrow mut`; a builder is never an
+  aggregate field or task/closure capture. A borrowed builder cannot be consumed or retained.
+- A complete heap Move-record rvalue from a local, literal, function result, transparent block,
+  value-carrying branch/match/else, or successful `?` unwrap including `map_err(...)?` may be pushed. Incomplete,
+  borrowed, consumed-arm, type-divergent, or allocation-mode-ambiguous sources reject before growth.
+- Stack-local and boxed heap-builder headers share the same initialized-prefix Drop and build
+  transfer; the header representation changes disposal only, never element ownership.
+- The heap form never retains a view. A record element may retain independently owned `string`
+  fields only when every reachable owner is free-standing before `push`; the region form is the
+  separate path for borrowed fields.
 - An arena-owned result of `array_builder(out).build()` is consumed into its final aggregate in the
   same function; it is not passed by value through an ordinary call boundary.
 - Slices are Copy views; a `mut slice<T>` binding (or `out` param) is the one writable-view form.
