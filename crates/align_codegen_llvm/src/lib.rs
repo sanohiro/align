@@ -11088,7 +11088,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                 .map_err(|e| self.err(e))?
                                 .try_as_basic_value()
                                 .basic()
-                                .expect("array_builder_build returns a {ptr,len}");
+                                .ok_or_else(|| {
+                                    self.err("array_builder_build did not return a {ptr,len}")
+                                })?;
                             let scratch = self.alloca_at_entry(
                                 slice_struct_type(self.ctx).into(),
                                 "dropab.array.slot",

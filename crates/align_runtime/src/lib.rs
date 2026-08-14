@@ -33237,7 +33237,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             match mode.to_string_lossy().as_ref() {
                 "count" => builder.len = usize::MAX,
                 "bytes" => builder.elem_size = usize::MAX,
-                other => panic!("unknown overflow mode {other}"),
+                _ => std::process::exit(79),
             }
             let record = [0_u8; 24];
             unsafe {

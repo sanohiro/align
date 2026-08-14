@@ -269,7 +269,7 @@ fn heap_record_array_builder_rows_match_the_producer() {
             "layout-c" => record.c_repr = true,
             "aligned" => record.align = Some(16),
             "cycle" => record.fields[0].ty = Ty::Struct(0),
-            _ => unreachable!(),
+            _ => {}
         }
         assert!(
             !crate::validate_hir::DelegatedGates::new(&rejected)
@@ -278,54 +278,49 @@ fn heap_record_array_builder_rows_match_the_producer() {
         );
     }
 
-    fn main_function(program: &mut hir::Program) -> &mut hir::Fn {
+    fn main_function(program: &mut hir::Program) -> Option<&mut hir::Fn> {
         program
             .fns
             .iter_mut()
             .find(|function| function.name == "main")
-            .expect("main function")
     }
 
     let mut reject = program.clone();
-    let function = main_function(&mut reject);
-    let hir::Stmt::Let { init, .. } = &mut function.body.stmts[0] else {
-        panic!("record builder fixture lost New binding")
-    };
-    let hir::ExprKind::ArrayBuilderNew { elem, .. } = &mut init.kind else {
-        panic!("record builder fixture lost New expression")
-    };
-    *elem = ArrayBuilderElem::Scalar(Scalar::String);
+    if let Some(function) = main_function(&mut reject)
+        && let Some(hir::Stmt::Let { init, .. }) = function.body.stmts.get_mut(0)
+        && let hir::ExprKind::ArrayBuilderNew { elem, .. } = &mut init.kind
+    {
+        *elem = ArrayBuilderElem::Scalar(Scalar::String);
+    }
     assert!(!body_core_metadata_is_valid(&reject));
 
     let mut reject = program.clone();
-    let function = main_function(&mut reject);
-    let hir::Stmt::Expr(push) = &mut function.body.stmts[1] else {
-        panic!("record builder fixture lost Push statement")
-    };
-    let hir::ExprKind::ArrayBuilderPush { moves_value, .. } = &mut push.kind else {
-        panic!("record builder fixture lost Push expression")
-    };
-    *moves_value = false;
+    if let Some(function) = main_function(&mut reject)
+        && let Some(hir::Stmt::Expr(push)) = function.body.stmts.get_mut(1)
+        && let hir::ExprKind::ArrayBuilderPush { moves_value, .. } = &mut push.kind
+    {
+        *moves_value = false;
+    }
     assert!(!body_core_metadata_is_valid(&reject));
 
     let mut reject = program.clone();
-    let function = main_function(&mut reject);
-    let hir::Stmt::Let { init, .. } = &mut function.body.stmts[2] else {
-        panic!("record builder fixture lost Build binding")
-    };
-    let hir::ExprKind::ArrayBuilderBuild(_) = &init.kind else {
-        panic!("record builder fixture lost Build expression")
-    };
-    init.ty = Ty::DynArray(Scalar::String);
+    if let Some(function) = main_function(&mut reject)
+        && let Some(hir::Stmt::Let { init, .. }) = function.body.stmts.get_mut(2)
+        && matches!(init.kind, hir::ExprKind::ArrayBuilderBuild(_))
+    {
+        init.ty = Ty::DynArray(Scalar::String);
+    }
     assert!(!body_core_metadata_is_valid(&reject));
 
     let mut reject = program.clone();
-    let record = reject
+    if let Some(record) = reject
         .structs
         .iter_mut()
         .find(|definition| definition.source_name == "Item")
-        .expect("record definition");
-    record.fields[0].ty = Ty::Str;
+        && let Some(field) = record.fields.get_mut(0)
+    {
+        field.ty = Ty::Str;
+    }
     assert!(!body_core_metadata_is_valid(&reject));
 }
 
@@ -12043,11 +12038,10 @@ fn hir_body_validator_native() {
         &mut reject,
         "native_heap_record_array_builder_new",
     );
-    let hir::ExprKind::ArrayBuilderNew { elem, .. } = &mut expression.kind else {
-        panic!("heap-record new fixture lost its constructor")
-    };
-    *elem = ArrayBuilderElem::Scalar(Scalar::Struct(0));
-    expression.ty = Ty::ArrayBuilder(Scalar::Struct(0));
+    if let hir::ExprKind::ArrayBuilderNew { elem, .. } = &mut expression.kind {
+        *elem = ArrayBuilderElem::Scalar(Scalar::Struct(0));
+        expression.ty = Ty::ArrayBuilder(Scalar::Struct(0));
+    }
     assert!(!body_core_metadata_is_valid(&reject));
 
     let mut reject = program.clone();
@@ -12055,10 +12049,9 @@ fn hir_body_validator_native() {
         &mut reject,
         "native_heap_record_array_builder_push",
     );
-    let hir::ExprKind::ArrayBuilderPush { moves_value, .. } = &mut expression.kind else {
-        panic!("heap-record push fixture lost its push")
-    };
-    *moves_value = false;
+    if let hir::ExprKind::ArrayBuilderPush { moves_value, .. } = &mut expression.kind {
+        *moves_value = false;
+    }
     assert!(!body_core_metadata_is_valid(&reject));
 
     let mut reject = program.clone();
