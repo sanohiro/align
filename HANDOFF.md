@@ -57,7 +57,11 @@ align-llm Request 6 adoption is now closed by align-llm PR #84. The next indepen
 prerequisite is Request 8's heap declared-record `array_builder`; branch
 `agent/heap-record-array-builder-design` is authoring its Align-owned public contract and closure
 matrix against `004b7f02086570b200b238d752a1f7ba67da7d04`. No implementation is accepted until that
-design is reviewed and merged.
+design is reviewed and merged. Its first comprehensive review at `cac65c77` found five valid gaps:
+checked-HIR New/Push/Build coverage, two align-llm request inconsistencies, incomplete Move-source
+enumeration, and missing stack/boxed cleanup proof. align-llm PR #86 merged the request
+reconciliation as `f4cffee`; the current repair closes the remaining design findings in active
+Align PR #799.
 
 Out-of-gate suites (everything outside `scripts/test-pr.sh`) are guarded by the
 nightly full-suite workflow, which builds once, runs every compiled test binary

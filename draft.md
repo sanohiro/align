@@ -2362,12 +2362,17 @@ tested only after monomorphization; there is no new generic bound or runtime dic
 
 A `string` or Move record element is **moved** into the builder by `push`: its complete source is
 nulled, and every reachable string owner must be free-standing before the growth side effect.
-Arena-owned, mixed, or path-dependent nested owners reject. Reallocation relocates initialized
-record bytes without dropping the old byte positions. An unfinished builder recursively drops its
-initialized prefix; `build` transfers the same buffer to the ordinary deeply dropped `array<T>`.
+Bound locals, fresh literals, by-value function results, transparent block tails, value-carrying
+`if`/`match`/`else`, and successful `?` unwraps including `map_err(...)?` are complete source forms. Borrowed or
+partially projected records, already-consumed arms, type-divergent joins, and arena-owned, mixed, or
+path-dependent nested owners reject before push. Reallocation relocates initialized record bytes
+without dropping the old byte positions. An unfinished builder recursively drops its initialized
+prefix in both stack-local and boxed-header modes; `build` transfers the same buffer from either
+mode to the ordinary deeply dropped `array<T>`.
 `append` — which bulk-copies a borrowed `slice<T>` — remains Copy-scalar-only. The builder retains
 no runtime reflection or self-describing record wire: its nominal element type, interface graph,
-and compiler `DropPlan` are the single type/cleanup identity.
+and compiler `DropPlan` are the single type/cleanup identity, and two same-shape declarations remain
+distinct nominal types.
 
 The region form is the required generalization for ordinary libraries. `out: region` comes from
 `arena out {}`. It accepts recursively plain scalars, options, fixed arrays, structs, and

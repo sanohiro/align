@@ -75,6 +75,11 @@ storage: field 'f' owns independent heap storage`。設計は
 - `array_builder<T>` は1つの Move owner である。heap 形式は通常の型付き parameter/return を
   move でき、helper は同じ owner を `borrow mut` 経由で変更できる。builder は aggregate field
   や task/closure capture にはできず、borrowed builder を consume または保持することもできない。
+- local、literal、function result、transparent block、value-carrying branch/match/else、成功した
+  `?` unwrap（`map_err(...)?` を含む）が生成する完全な heap Move-record rvalue は push できる。不完全、borrowed、
+  consumed-arm、型が分岐する join、allocation mode が曖昧な source は growth 前に拒否する。
+- stack-local と boxed の heap-builder header は同じ initialized-prefix Drop と build transfer を
+  使う。header representation が変えるのは header の破棄だけで、element ownership は変えない。
 - heap 形式は view を保持しない。record element が独立所有の `string` field を保持できるのは、
   `push` より前に到達可能な全 owner が free-standing と証明できる場合だけである。borrowed field
   には別経路である region 形式を使う。

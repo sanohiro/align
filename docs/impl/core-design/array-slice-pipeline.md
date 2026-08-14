@@ -82,6 +82,11 @@ removed outright (no alias survives, per the no-backward-compat rule).
 - `array_builder<T>` is one Move owner. The heap form may move through an ordinary typed parameter
   or return and a helper may mutate the same owner through `borrow mut`; a builder is never an
   aggregate field or task/closure capture. A borrowed builder cannot be consumed or retained.
+- A complete heap Move-record rvalue from a local, literal, function result, transparent block,
+  value-carrying branch/match/else, or successful `?` unwrap including `map_err(...)?` may be pushed. Incomplete,
+  borrowed, consumed-arm, type-divergent, or allocation-mode-ambiguous sources reject before growth.
+- Stack-local and boxed heap-builder headers share the same initialized-prefix Drop and build
+  transfer; the header representation changes disposal only, never element ownership.
 - The heap form never retains a view. A record element may retain independently owned `string`
   fields only when every reachable owner is free-standing before `push`; the region form is the
   separate path for borrowed fields.

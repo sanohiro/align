@@ -122,6 +122,13 @@ The following notation is closed and exact:
 - `owned(T)` is the existing recursive Move/Drop predicate. `view(T)` is a
   non-owning result whose return-borrow/region fact is derived from the named
   children or locals in the row. `copy(T)` is neither moved nor dropped.
+- `HR(id)` is the producer-owned, cycle-safe heap-record predicate from
+  `heap_array_builder_record`: `STRUCT(id)` is nonempty, naturally aligned at
+  most 8 with no explicit layout/alignment, and every reachable field in source
+  order is a Copy scalar, owned `string`, or another `HR`. The checked-HIR
+  validator calls that same helper; it does not infer admission merely from a
+  nonempty `DropPlan`. `HRMove(id)` means `HR(id)` and
+  `owned(Struct(id))`; a scalar-only `HR` is Copy.
 - `consume(x)` requires the semantic producer's MoveCheck transfer for `x`;
   `borrow(x)` preserves its owner; `mutate(x)` requires the producer's writable
   place rule. These are ownership facts, not alternate type checks.
@@ -860,10 +867,10 @@ merely because its `Ty` matches.
 | `BytesRead` | `env[be]`; `child[bytes,offset]`; `bytes,i64; result exact stored read scalar in {i8/u8/i16/u16/i32/u32/i64/u64/f32/f64}; be must be false for one-byte widths; borrowed bounds-checked read; Pure`. |
 | `BufferPut` | `env[be]`; `child[buffer,value]`; `SourceMutLocal(Buffer,buffer); value exact supported binary scalar; be false for one-byte widths; result Unit; buffer mutated; Pure`. |
 | `BufferAppend` | `env[]; child[buffer,data]`; `SourceMutLocal(Buffer,buffer),byte-view; result Unit; data borrowed, buffer mutated; Pure`. |
-| `ArrayBuilderNew` | `env[elem]`: exact nonrecursive descriptor `Scalar(S)` or `Aggregate(Vec(S,N) | Mask(S,N) | FixedArray(S,N) | FixedStructArray(id,N))`. The heap form admits only primitive Copy scalars or String; the region form requires the descriptor's concrete type to be recursively `RegionPlain`. `child[region?]`; result `ArrayBuilder(elem)`; new owned heap allocation or explicitly region-owned allocation; Pure. |
-| `ArrayBuilderPush` | `env[moves_value]`; `child[builder,value]`; `SourceMutLocal(ArrayBuilder(elem),builder), value exact `elem.ty()`; `moves_value` iff `elem == Scalar(String)`; result Unit; String consumed, every RegionPlain value copied with provenance, builder mutated; Pure. |
+| `ArrayBuilderNew` | `env[elem]`: exact nonrecursive descriptor `Scalar(S)` or `Aggregate(Vec(S,N) | Mask(S,N) | FixedArray(S,N) | FixedStructArray(id,N))`. `child[region?]`; with no region, admit exactly primitive Copy scalars, String, or `Scalar(Struct(id))` with `HR(id)`; with a region, require the descriptor's concrete type to be recursively `RegionPlain`. Result `ArrayBuilder(elem)`; new owned heap allocation or explicitly region-owned allocation; Pure. An unknown/malformed struct id or closed-predicate failure rejects before MIR allocation. |
+| `ArrayBuilderPush` | `env[moves_value]`; `child[builder,value]`; `SourceMutLocal(ArrayBuilder(elem),builder), value exact `elem.ty()`; `moves_value` iff `elem == Scalar(String)` or `elem == Scalar(Struct(id)) && HRMove(id)`; result Unit. A true bit consumes and nulls the complete source, a false bit copies the producer-valid value with any region provenance, and the builder is mutated. A wrong bit or malformed record graph rejects before MIR ownership transfer. |
 | `ArrayBuilderAppend` | `env[]; child[builder,data]`; descriptor must be `Scalar(copy elem)`, `SourceMutLocal(ArrayBuilder(elem),builder), data Slice(elem)`; result Unit; data borrowed, builder mutated; Pure. Aggregate descriptors use `push`. |
-| `ArrayBuilderBuild` | `env[]; child[builder]`; `ArrayBuilder(elem)`, consume-any; result `DynStructArray(id,Aos)` for `Scalar(Struct(id))`, `DynArray(S)` for every other scalar descriptor, or `DynAggregateArray(elem)` for an aggregate descriptor; transfer the complete producer-valid builder buffer once; Pure. |
+| `ArrayBuilderBuild` | `env[]; child[builder]`; `ArrayBuilder(elem)`, consume-any; result `DynStructArray(id,Aos)` for `Scalar(Struct(id))` with the exact same valid id, `DynArray(S)` for every other scalar descriptor, or `DynAggregateArray(elem)` for an aggregate descriptor; transfer the complete producer-valid builder buffer once; Pure. A mismatched/malformed result id rejects before MIR transfer. |
 | `FsWriteFile` | `env[builder]`; `child[path,data]`; `path Str; builder=false requires byte-view, true requires Builder; result ERR(Unit); both borrowed; Impure`. |
 | `FsExists` | `env[]; child[path]`; `Str; result Bool; borrowed; Impure`. |
 | `FsRemove` | `env[]; child[path]`; `Str; result ERR(Unit); borrowed; Impure`. |
@@ -995,6 +1002,20 @@ merely because its `Ty` matches.
 | `PathComponentKind::Dir` | Returns directory-prefix view. |
 | `PathComponentKind::Ext` | Returns extension view. |
 
+### Heap-record array-builder producer/validator closure
+
+Request 8 changes the producer-valid domain of three existing rows, so the same capability extends
+this authoritative boundary instead of relying on the older scalar/string validator list.
+
+| Cell | Exact closure | Owner evidence |
+|---|---|---|
+| Valid construction | Heap `ArrayBuilderNew` accepts Copy scalar, `string`, and every admitted Copy/Move `HR(id)`; region construction retains the existing `RegionPlain` domain. The stored result uses the exact element descriptor. | `validate_hir_tests::heap_record_array_builder_rows_match_the_producer`, parameterized over scalar-only, owned-string, nested, generic-monomorph, and region-record positives |
+| Malformed construction | Unknown struct id, empty/cyclic/explicit-layout/over-aligned record, every closed excluded field, region/heap predicate swap, invalid descriptor, and wrong stored result reject before MIR allocation in all entrypoints. | the same parameterized owner, mutating one New envelope/predicate/result fact at a time |
+| Valid push | For each admitted record, exact builder/value types and mutable source-local receiver are required. `moves_value` is false for Copy `HR`, true for `HRMove`, and remains true for top-level `string`; selected Move rvalues consume/null the complete source. | the same parameterized owner plus `align_driver::m12_array_builder::record_builder_move_source_matrix` |
+| Malformed push | Wrong/missing record id, wrong builder/value type, immutable/nonlocal receiver, inverted move bit, and malformed reachable definition reject before MIR ownership transfer. Source-expression construction and selected-arm cleanup remain producer-owned, not reconstructed by the boundary. | one-field mutations in `heap_record_array_builder_rows_match_the_producer`; source-shape owners stay in Sema/MIR |
+| Valid and malformed build | A record builder consumes any producer-valid owner and returns `DynStructArray(id,Aos)` with the exact same nominal id. Scalar/aggregate results stay unchanged. Wrong layout kind/id/result or malformed reachable record rejects before transfer. | parameterized Build rows in `heap_record_array_builder_rows_match_the_producer` |
+| Delegation drift | Sema formation and checked-HIR validation call the same `heap_array_builder_record` classifier and canonical recursive ownership predicate. A newly admitted/excluded field kind or Drop rule therefore changes both domains in one owner. | helper-domain sweep plus whole/per-unit producer HIR passed through `lower_program_checked` |
+
 ## Inventory closure
 
 The implementation must derive an exhaustiveness constant from the Rust enum
@@ -1053,7 +1074,7 @@ Eight occurrences; one diverged.
 | `ArraySortBy` element | `check_array_sort_by_key` | Identical rule. No change. |
 | `ArrayPartition` element | `check_array_partition` | Identical rule. No change. |
 | `ArrayChunks` element | `check_array_chunks` | Identical `scalar_to_prim` rule, but the validator *also* asks `scalar_copy_ok`. See the Move-value gate below. |
-| `array_builder_elem_ok` | `check_array_builder_new` | Wider, never narrower: sema admits `Int/Float/Bool/Char/String`; the validator additionally admits `Str`. A wider gate cannot reject a checked program, so it is outside this class. No change. |
+| `array_builder_elem_ok` | `check_array_builder_new` / `heap_array_builder_record` | **Delegated exact rule.** Heap scalar/string and `HR(id)` admission plus region-backed `RegionPlain` admission use the producer-owned classifiers; the validator must not retain an older wider/narrower list. Request 8 adds parameterized valid/malformed New/Push/Build owners. |
 | `ResourceViewFromRaw` view scalar (2 sites) | none | Structural: `Scalar::Slice` is *constructed from* a `PrimScalar`, so this is a representation conversion, not an admission rule. No change. |
 
 Two further admission gates diverged without being spelled `scalar_to_prim`:
@@ -1133,7 +1154,7 @@ a `slice<string>` parameter, not merely reasoned about:
 | Gate | Verdict | Evidence |
 |---|---|---|
 | `array_literal_element_ok` | Unreachable | The gate itself excludes Move (`!scalar.is_move()`), and sema rejects a Move fixed-array element (`string cannot be an element of a fixed array yet`). |
-| `array_builder_elem_ok` | Wider, never narrower | Explicitly admits `Scalar::String`. A wider validator gate cannot reject a checked program. |
+| `array_builder_elem_ok` | Delegated exact rule | Heap scalar/string/`HR(id)` and explicit-region `RegionPlain` use the producer-owned classifiers; the Request 8 valid/malformed row owner prevents drift. |
 | `ArrayBuilderAppend` | Unreachable | The validator refuses `Scalar::String` outright, and sema refuses the method: `'.append()' is not available` for a `string` builder. |
 | `ArrayZip` element / tuple source | Symmetric | Sema stops first with `'zip' v1 supports only Copy …`, for `count`, `map_into`, and `to_array` terminals alike. |
 | `BoxNew` / `BoxGet` / `BoxClone` | Unreachable | Sema: `a box payload must be a primitive` — `heap.new("a".clone())` never forms a `box<string>`. |
