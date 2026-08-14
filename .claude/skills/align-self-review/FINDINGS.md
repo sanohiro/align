@@ -30,7 +30,7 @@ invented exact counts here.
 
 | Root-cause key | Events | PRs | Prevention status |
 |---|---:|---:|---|
-| `validation-phase-completeness` | 17 | 8 | Recurred past the added owner (#727: static-validation-after-native-prepare; unvalidated v3 tail-reserved field; #770: batch layout checked after native advancement; #772: prepared-option, generation-metadata/cardinality, lease/measurement, and static/vector ordering; #773: descriptor-v6 count-thunk preflight; #798: exact response-head syntax before chunked framing selection). Required next: deduplicate copied header validators into one shared function so an ABI version bump has one owner, and extend the parameterized phase-order owner across prepared/transaction paths. |
+| `validation-phase-completeness` | 18 | 9 | Recurred past the added owner (#727: static-validation-after-native-prepare; unvalidated v3 tail-reserved field; #770: batch layout checked after native advancement; #772: prepared-option, generation-metadata/cardinality, lease/measurement, and static/vector ordering; #773: descriptor-v6 count-thunk preflight; #798: exact response-head syntax before chunked framing selection; #800: recognizable malformed response framing before the next blocking transport read). Required next: deduplicate copied header validators into one shared function so an ABI version bump has one owner, and extend the parameterized phase-order owner across prepared/transaction paths. |
 | `cross-stage-abi-exactness` | 7 | 2 | Covered by Gate 4 and exact ABI owner matrices; #772 additionally requires generated count evidence and canonical cross-driver context bytes. |
 | `native-api-version-boundary` | 4 | 1 | Covered by Gate 2 plus version/conversion goldens. |
 | `ownership-allocation-owner` | 6 | 4 | Three-plus events: scalar fixed-array admission now routes through the canonical recursive `DropPlan`, with source and handcrafted-HIR owners rejecting every non-struct element that lacks per-element cleanup. Gates 1, 2, and 4 still require every allocation, Drop path, and thunk to have one named owner; #772 pins present-empty binary bytea to a non-null zero-length sentinel owner, and #773 pins normalized-plan allocation/use provenance before native calls. |
@@ -55,6 +55,7 @@ invented exact counts here.
 | `performance-evidence-completeness` | 1 | 1 | Watch; measure the unaffected one-shot path before enabling a process-wide performance optimization by default. |
 | `infallible-entrypoint-contract` | 1 | 1 | Watch; an inspection entry point documented as infallible must stay fail-closed on input no producer emits (unchecked or hand-overridden HIR). Only the explicitly fallible boundary may reject, and every production path must use that boundary. |
 | `historical-workflow-source-boundary` | 1 | 1 | Watch; a workflow that checks out an older tag must not assume newly added helper scripts exist in that historical source tree. |
+| `hot-path-scan-regression` | 1 | 1 | Watch; incremental boundary discovery must retain the established bulk-search primitive rather than regress to a byte-at-a-time scan. |
 
 ## Event log
 
@@ -158,6 +159,8 @@ invented exact counts here.
 | #798 | `abc363c` | P1 | `resource-bound-completeness` | Add a cumulative chunk-framing byte bound with exact-limit and rejected-next owners. |
 | #798 | `abc363c` | P2 | `resource-bound-completeness` | Define an implementable capacity ceiling that counts transient old/new accumulator allocations. |
 | #798 | `4349bcb` | P2 | `source-of-truth-drift` | Synchronize the accepted Request 4 design with the mandatory align-llm lifecycle register and summary. |
+| #800 | `c725ea4` | P2 | `validation-phase-completeness` | Reject recognizable malformed response heads and chunk prefixes before issuing another blocking transport read. |
+| #800 | `c725ea4` | P2 | `hot-path-scan-regression` | Keep response-head delimiter discovery on the existing `memchr` bulk-search path. |
 
 The rows above are the reviews whose logs are reachable from this checkout's
 `.git/`. Capabilities produced in agent worktrees (#777 and later, other than

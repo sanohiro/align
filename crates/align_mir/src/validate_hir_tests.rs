@@ -190,6 +190,145 @@ fn checked_source_program(source: &str) -> hir::Program {
     program
 }
 
+#[test]
+fn heap_record_array_builder_rows_match_the_producer() {
+    let source = concat!(
+        "Item { name: string, value: i64 }\n",
+        "fn main() -> i32 {\n",
+        "  mut items: array_builder<Item> := array_builder()\n",
+        "  items.push(Item{name: \"owned\".clone(), value: 7})\n",
+        "  values := items.build()\n",
+        "  return values.len() as i32\n",
+        "}\n",
+    );
+    let program = checked_source_program(source);
+    assert!(body_core_metadata_is_valid(&program));
+    let gates = crate::validate_hir::DelegatedGates::new(&program);
+    assert!(gates.array_builder_append_elem_ok(ArrayBuilderElem::Scalar(
+        Scalar::Int(IntTy {
+            bits: 64,
+            signed: true,
+        }),
+    )));
+    assert!(
+        !gates.array_builder_append_elem_ok(ArrayBuilderElem::Scalar(Scalar::Struct(0))),
+        "widening heap construction to Copy records must not widen append"
+    );
+    assert!(gates.heap_array_builder_record_ok(0));
+    assert!(!gates.heap_array_builder_record_ok(99));
+
+    for excluded in [
+        Ty::Str,
+        Ty::Slice(Scalar::Int(IntTy {
+            bits: 64,
+            signed: true,
+        })),
+        Ty::ResourceRef(0),
+        Ty::Resource(0),
+        Ty::Raw,
+        Ty::Fn(0),
+        Ty::Builder,
+        Ty::DynArray(Scalar::Int(IntTy {
+            bits: 64,
+            signed: true,
+        })),
+        Ty::Array(
+            Scalar::Int(IntTy {
+                bits: 64,
+                signed: true,
+            }),
+            2,
+        ),
+        Ty::Option(Scalar::String),
+        Ty::Result(
+            Scalar::String,
+            Scalar::Int(IntTy {
+                bits: 32,
+                signed: true,
+            }),
+        ),
+        Ty::Enum(0),
+        Ty::Tuple(0),
+        Ty::Box(Scalar::String),
+        Ty::DynStructArray(0, Layout::Aos),
+    ] {
+        let mut rejected = program.clone();
+        rejected.structs[0].fields[0].ty = excluded;
+        assert!(
+            !crate::validate_hir::DelegatedGates::new(&rejected)
+                .heap_array_builder_record_ok(0),
+            "checked-HIR heap-record formation admitted excluded field {excluded:?}"
+        );
+    }
+
+    for malformed in ["empty", "layout-c", "aligned", "cycle"] {
+        let mut rejected = program.clone();
+        let record = &mut rejected.structs[0];
+        match malformed {
+            "empty" => record.fields.clear(),
+            "layout-c" => record.c_repr = true,
+            "aligned" => record.align = Some(16),
+            "cycle" => record.fields[0].ty = Ty::Struct(0),
+            _ => unreachable!(),
+        }
+        assert!(
+            !crate::validate_hir::DelegatedGates::new(&rejected)
+                .heap_array_builder_record_ok(0),
+            "checked-HIR heap-record formation admitted malformed {malformed} definition"
+        );
+    }
+
+    fn main_function(program: &mut hir::Program) -> &mut hir::Fn {
+        program
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "main")
+            .expect("main function")
+    }
+
+    let mut reject = program.clone();
+    let function = main_function(&mut reject);
+    let hir::Stmt::Let { init, .. } = &mut function.body.stmts[0] else {
+        panic!("record builder fixture lost New binding")
+    };
+    let hir::ExprKind::ArrayBuilderNew { elem, .. } = &mut init.kind else {
+        panic!("record builder fixture lost New expression")
+    };
+    *elem = ArrayBuilderElem::Scalar(Scalar::String);
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let function = main_function(&mut reject);
+    let hir::Stmt::Expr(push) = &mut function.body.stmts[1] else {
+        panic!("record builder fixture lost Push statement")
+    };
+    let hir::ExprKind::ArrayBuilderPush { moves_value, .. } = &mut push.kind else {
+        panic!("record builder fixture lost Push expression")
+    };
+    *moves_value = false;
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let function = main_function(&mut reject);
+    let hir::Stmt::Let { init, .. } = &mut function.body.stmts[2] else {
+        panic!("record builder fixture lost Build binding")
+    };
+    let hir::ExprKind::ArrayBuilderBuild(_) = &init.kind else {
+        panic!("record builder fixture lost Build expression")
+    };
+    init.ty = Ty::DynArray(Scalar::String);
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let record = reject
+        .structs
+        .iter_mut()
+        .find(|definition| definition.source_name == "Item")
+        .expect("record definition");
+    record.fields[0].ty = Ty::Str;
+    assert!(!body_core_metadata_is_valid(&reject));
+}
+
 /// What the driver actually does with `source`: run the frontend, and only if it checks cleanly,
 /// take it to the MIR boundary.
 ///
@@ -10000,6 +10139,23 @@ fn hir_body_validator_pipeline_template_json_group_control_flow() {
 #[test]
 fn hir_body_validator_native() {
     let mut program = baseline_program();
+    let heap_record = program.structs.len() as u32;
+    program.structs.push(StructDef {
+        name: "HeapRecord".to_string(),
+        source_name: "HeapRecord".to_string(),
+        fields: vec![
+            FieldDef {
+                name: "name".to_string(),
+                ty: Ty::String,
+            },
+            FieldDef {
+                name: "value".to_string(),
+                ty: int(64),
+            },
+        ],
+        align: None,
+        c_repr: false,
+    });
     let error = push_builtin_error(&mut program);
     let regex_match = push_builtin_regex_match(&mut program);
     let argon2_params = push_builtin_argon2_params(&mut program);
@@ -10369,6 +10525,18 @@ fn hir_body_validator_native() {
         Vec::new(),
         Ty::ArrayBuilder(Scalar::String)
     );
+    add!(
+        "native_heap_record_array_builder_new",
+        body_test_expr(
+            hir::ExprKind::ArrayBuilderNew {
+                elem: ArrayBuilderElem::Scalar(Scalar::Struct(heap_record)),
+                region: None,
+            },
+            Ty::ArrayBuilder(Scalar::Struct(heap_record)),
+        ),
+        Vec::new(),
+        Ty::ArrayBuilder(Scalar::Struct(heap_record))
+    );
     program.fns.push(body_test_named_function(
         "native_named_region_materialization",
         hir::Block {
@@ -10440,6 +10608,40 @@ fn hir_body_validator_native() {
         Ty::Unit
     );
     add!(
+        "native_heap_record_array_builder_push",
+        body_test_expr(
+            hir::ExprKind::ArrayBuilderPush {
+                builder: Box::new(native_local(
+                    0,
+                    Ty::ArrayBuilder(Scalar::Struct(heap_record)),
+                )),
+                value: Box::new(body_test_expr(
+                    hir::ExprKind::StructLit {
+                        struct_id: heap_record,
+                        fields: vec![
+                            body_test_expr(
+                                hir::ExprKind::StrClone(Box::new(native_str())),
+                                Ty::String,
+                            ),
+                            native_i64(),
+                        ],
+                    },
+                    Ty::Struct(heap_record),
+                )),
+                moves_value: true,
+            },
+            Ty::Unit,
+        ),
+        vec![body_test_local(
+            0,
+            "builder",
+            Ty::ArrayBuilder(Scalar::Struct(heap_record)),
+            true,
+            false,
+        )],
+        Ty::Unit
+    );
+    add!(
         "native_array_builder_append",
         body_test_expr(
             hir::ExprKind::ArrayBuilderAppend {
@@ -10480,6 +10682,24 @@ fn hir_body_validator_native() {
             false,
         )],
         Ty::DynArray(scalar_int(64))
+    );
+    add!(
+        "native_heap_record_array_builder_build",
+        body_test_expr(
+            hir::ExprKind::ArrayBuilderBuild(Box::new(native_local(
+                0,
+                Ty::ArrayBuilder(Scalar::Struct(heap_record)),
+            ))),
+            Ty::DynStructArray(heap_record, Layout::Aos),
+        ),
+        vec![body_test_local(
+            0,
+            "builder",
+            Ty::ArrayBuilder(Scalar::Struct(heap_record)),
+            false,
+            false,
+        )],
+        Ty::DynStructArray(heap_record, Layout::Aos)
     );
     let vector_element = AggregateArrayElem::Vec(scalar_int(32), 4);
     let vector_builder = Ty::array_builder(ArrayBuilderElem::Aggregate(vector_element));
@@ -11817,6 +12037,37 @@ fn hir_body_validator_native() {
         "native nominal metadata"
     );
     assert!(body_core_metadata_is_valid(&program), "native body metadata");
+
+    let mut reject = program.clone();
+    let expression = body_statement_expression_mut(
+        &mut reject,
+        "native_heap_record_array_builder_new",
+    );
+    let hir::ExprKind::ArrayBuilderNew { elem, .. } = &mut expression.kind else {
+        panic!("heap-record new fixture lost its constructor")
+    };
+    *elem = ArrayBuilderElem::Scalar(Scalar::Struct(0));
+    expression.ty = Ty::ArrayBuilder(Scalar::Struct(0));
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_statement_expression_mut(
+        &mut reject,
+        "native_heap_record_array_builder_push",
+    );
+    let hir::ExprKind::ArrayBuilderPush { moves_value, .. } = &mut expression.kind else {
+        panic!("heap-record push fixture lost its push")
+    };
+    *moves_value = false;
+    assert!(!body_core_metadata_is_valid(&reject));
+
+    let mut reject = program.clone();
+    let expression = body_statement_expression_mut(
+        &mut reject,
+        "native_heap_record_array_builder_build",
+    );
+    expression.ty = Ty::DynArray(Scalar::Struct(heap_record));
+    assert!(!body_core_metadata_is_valid(&reject));
 
     let mut reject = program.clone();
     let function = reject

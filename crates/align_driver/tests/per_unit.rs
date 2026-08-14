@@ -401,6 +401,31 @@ fn imported_impure_fn_value_effect_survives_indirect_call() {
 }
 
 #[test]
+fn record_builder_imported_interface_graph() {
+    let records = concat!(
+        "module records\n",
+        "pub Item { name: string, value: i64 }\n",
+        "pub fn make(value: i64) -> Item = Item{name: \"item\".clone(), value: value}\n",
+    );
+    let main = concat!(
+        "module main\n",
+        "import records\n",
+        "fn main() -> i32 {\n",
+        "  mut items: array_builder<records.Item> := array_builder()\n",
+        "  items.push(records.make(42))\n",
+        "  values := items.build()\n",
+        "  return (values.len() + values[0].value) as i32\n",
+        "}\n",
+    );
+    let result = assert_same_verdict(
+        "s1b-record-builder-interface",
+        &[("records.align", records), ("main.align", main)],
+        "main.align",
+    );
+    assert!(!result.diags.has_errors());
+}
+
+#[test]
 fn sequential_impure_imported_call_stays_legal() {
     // Calling an impure imported fn sequentially (not under par_map) is fine in both checkers.
     let geom = "module geom\npub fn noisy(x: i64) -> i64 {\n  print(x)\n  return x\n}\n";

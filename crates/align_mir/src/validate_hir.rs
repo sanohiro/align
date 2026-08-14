@@ -4211,8 +4211,33 @@ impl<'a> BodyValidator<'a> {
         let ArrayBuilderElem::Scalar(elem) = elem else {
             return false;
         };
-        align_sema::scalar_to_prim(elem).is_some()
-            && (elem == Scalar::String || self.scalar_copy_ok(elem))
+        (align_sema::scalar_to_prim(elem).is_some()
+            && (elem == Scalar::String || self.scalar_copy_ok(elem)))
+            || matches!(elem, Scalar::Struct(id)
+                if align_sema::heap_record_type_ok(id, &self.program.structs))
+    }
+
+    fn array_builder_moves_value(&self, elem: ArrayBuilderElem) -> bool {
+        match elem {
+            ArrayBuilderElem::Scalar(Scalar::String) => true,
+            ArrayBuilderElem::Scalar(Scalar::Struct(id)) => align_sema::struct_is_move(
+                id,
+                &self.program.structs,
+                &self.program.enums,
+                &self.program.tagged_types,
+            ),
+            _ => false,
+        }
+    }
+
+    fn array_builder_append_elem_ok(&self, elem: ArrayBuilderElem) -> bool {
+        let ArrayBuilderElem::Scalar(scalar) = elem else {
+            return false;
+        };
+        (self.array_builder_elem_ok(elem) || self.array_builder_region_elem_ok(elem))
+            && align_sema::scalar_to_prim(scalar).is_some()
+            && scalar != Scalar::String
+            && self.scalar_copy_ok(scalar)
     }
 
     fn array_builder_region_elem_ok(&self, elem: ArrayBuilderElem) -> bool {
@@ -7296,8 +7321,7 @@ impl<'a> BodyValidator<'a> {
                 if !(self.array_builder_elem_ok(elem) || self.array_builder_region_elem_ok(elem))
                     || !mutable_local(builder, Ty::array_builder(elem))
                     || !self.body_ty_matches(value.ty, elem.ty())
-                    || *moves_value
-                        != matches!(elem, ArrayBuilderElem::Scalar(Scalar::String))
+                    || *moves_value != self.array_builder_moves_value(elem)
                 {
                     return None;
                 }
@@ -7308,9 +7332,7 @@ impl<'a> BodyValidator<'a> {
                 let ArrayBuilderElem::Scalar(scalar) = elem else {
                     return None;
                 };
-                if !(self.array_builder_elem_ok(elem) || self.array_builder_region_elem_ok(elem))
-                    || scalar == Scalar::String
-                    || !self.scalar_copy_ok(scalar)
+                if !self.array_builder_append_elem_ok(elem)
                     || !mutable_local(builder, Ty::array_builder(elem))
                     || data.ty != Ty::Slice(scalar)
                 {
@@ -11009,6 +11031,15 @@ impl<'a> DelegatedGates<'a> {
 
     pub(crate) fn scalar_copy_ok(&self, scalar: Scalar) -> bool {
         self.0.scalar_copy_ok(scalar)
+    }
+
+    pub(crate) fn array_builder_append_elem_ok(&self, elem: ArrayBuilderElem) -> bool {
+        self.0.array_builder_append_elem_ok(elem)
+    }
+
+    pub(crate) fn heap_array_builder_record_ok(&self, id: u32) -> bool {
+        self.0
+            .array_builder_elem_ok(ArrayBuilderElem::Scalar(Scalar::Struct(id)))
     }
 
     /// The shape-tolerant type comparison the delegated cells use, so the negative owner can prove

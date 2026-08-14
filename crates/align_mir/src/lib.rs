@@ -1079,8 +1079,9 @@ pub enum Rvalue {
     /// preserves the existing individually-owned heap form. Physical element layout is computed by
     /// the target backend from `elem`.
     ArrayBuilderNew { elem: Ty, region: Option<Operand> },
-    /// `b.push(v)` — append one primitive scalar element (the `value` operand, passed as its raw
-    /// bits in an `i64`; `elem_size` sets how many low bytes) to the growable builder operand.
+    /// `b.push(v)` — append one primitive scalar or declared-record element. Primitive values use
+    /// raw bits in an `i64`; records are copied from their exact in-memory layout through the byte
+    /// entry point selected by codegen.
     ArrayBuilderPush { builder: Operand, value: Operand, scalar: Ty },
     /// `b.push(s)` — append one moved-in `string` element (the `value` operand, a `{ptr,len}`) to the
     /// growable `array_builder` operand. The source string is nulled at the move site.
@@ -8600,10 +8601,19 @@ fn lower_array_builder_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let val = lower_required!(b, lower_expr(b, value), Operand::Const(Const::Unit));
             let t = b.fresh_value(Ty::Unit);
             if *moves_value {
-                // A `string` element is moved into the builder; null its source slot so the source's
-                // exit `Drop` frees null (the builder now owns the buffer, deep-freed on its Drop).
+                // A Move element transfers into the builder. Null its complete source only after
+                // lowering the value, so the source's exit Drop becomes a no-op while the builder
+                // owns the recursively droppable bytes.
                 null_moved_source(b, value);
-                b.push(Stmt::Let(t, Rvalue::ArrayBuilderPushStr { builder: bop, value: val }));
+                if value.ty == Ty::String {
+                    b.push(Stmt::Let(t, Rvalue::ArrayBuilderPushStr { builder: bop, value: val }));
+                } else {
+                    b.push(Stmt::Let(t, Rvalue::ArrayBuilderPush {
+                        builder: bop,
+                        value: val,
+                        scalar: value.ty,
+                    }));
+                }
             } else {
                 b.push(Stmt::Let(t, Rvalue::ArrayBuilderPush { builder: bop, value: val, scalar: value.ty }));
             }

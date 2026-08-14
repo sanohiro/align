@@ -63,6 +63,33 @@ fn struct_type_argument() {
 }
 
 #[test]
+fn record_builder_generic_instantiation() {
+    if !backend_available() {
+        return;
+    }
+    let src = concat!(
+        "Pair<T> { left: T, right: T }\n",
+        "fn i32_value(value: i32) -> i32 = value\n",
+        "fn main() -> i32 {\n",
+        "  mut ints: array_builder<Pair<i32>> := array_builder()\n",
+        "  ints.push(Pair{left: i32_value(20), right: i32_value(22)})\n",
+        "  iv := ints.build()\n",
+        "  mut names: array_builder<Pair<string>> := array_builder()\n",
+        "  names.push(Pair{left: \"a\".clone(), right: \"b\".clone()})\n",
+        "  nv := names.build()\n",
+        "  return iv[0].left + iv[0].right + (nv.len() as i32)\n",
+        "}\n",
+    );
+    let out = build_and_run("generic-record-builder", src);
+    assert_eq!(
+        out.status.code(),
+        Some(43),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn return_type_inferred_from_context() {
     if !backend_available() {
         return;
