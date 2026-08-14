@@ -189,6 +189,18 @@ the base/feature runtime-export parity owners require all six definitions in eve
 while rejecting any missing, duplicate, near-spelled, or wrong-signature record. The capability must
 not add a direct declaration outside this registry.
 
+Request 5 bounded-HTTP design delta (not shipped until its implementation PR):
+
+| Planned runtime key | Exact symbol | Existing ABI row and exact declaration |
+|---|---|---|
+| `HttpMaxResponseBodyBytes` | `align_rt_http_max_response_body_bytes` | A66: `void @SYM(ptr, i64)`; no curated attributes |
+| `HttpClientMaxResponseBodyBytes` | `align_rt_http_client_max_response_body_bytes` | A66: `void @SYM(ptr, i64)`; no curated attributes |
+
+Both use ordinary keyed-native identity and become mandatory base exports when the capability
+activates. The implementation updates registry counts, bijection, declaration golden, and base
+runtime-export parity in the same change. The HTTP-private result sentinel is not an ABI symbol: MIR
+maps it to reserved `Error.Code(-1)` before the common status decoder.
+
 Unkeyed native records:
 
 | Owner | Exact LLVM declaration | Runtime export presence |

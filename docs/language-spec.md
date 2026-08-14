@@ -984,6 +984,16 @@ and overflow signals the owned process group when present, kills and reaps the d
 partial output, and returns `Error.Invalid`. The timeout deadline remains active through direct-child wait after pipe EOF; hard
 pipe/wait failures signal an owned group when present, kill/reap the direct child, and return
 `Error.Code` without partial output.
+`std.http` whole-body clients expose
+`cl.max_response_body_bytes(limit: i64)` and the request-local
+`r.max_response_body_bytes(limit: i64)`. Zero clears/inherits; a positive request value only
+narrows the client or fixed 1 GiB default, and an invalid value aborts before mutation. The selected
+cap is enforced during Content-Length, chunked, and close-delimited receive. Exact fit succeeds;
+the first recognizable explicit-cap excess returns reserved `Error.Code(-1)`, publishes no partial
+response, and closes the connection. Bodyless `HEAD`/`204`/`304` metadata is validated but not
+compared with the payload cap. With a 262,144-byte cap, live Align-owned response storage is bounded
+to 557,056 bytes. The exact framing/error/allocation matrix is in
+`docs/impl/std-design/http.md`.
 `std.env`: `get`/`set` only — `args` comes solely from
 `main(args: array<str>)`, there is no `env.args`. `std.time`: one `i64`-nanosecond timeline, no
 `Duration` type — `now()`

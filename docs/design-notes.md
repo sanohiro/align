@@ -1029,6 +1029,29 @@ cleanup shape and never masquerades as a nonzero successful run.
 
 ---
 
+## Why HTTP receive limits use two scopes and a reserved code
+
+A reusable client needs a safe default, while one provider operation often knows a smaller response
+budget. Keeping both `client.max_response_body_bytes` and
+`request.max_response_body_bytes` makes that policy visible at the transport boundary: the request
+may narrow but never widen its client. Zero has one meaning at each scope—restore the fixed default
+or inherit—so there is no hidden process setting or second client implementation.
+
+The limit must be distinguishable from malformed framing and from an HTTP status, but adding a new
+builtin `Error` variant would widen every exhaustive match for one library-specific resource
+condition. `Error.Code(-1)` is therefore reserved for this receive limit. Standard errno mapping
+publishes non-negative raw codes and HTTP statuses remain response data, so the negative code is
+stable without creating a second error type. The HTTP lowering owns its private native sentinel and
+converts it before the common errno-status decoder.
+
+The explicit path allocates fixed header and body regions from the protocol allowance and caller's
+cap, never from peer-declared framing, and uses one fixed scratch. The bodyless path allocates no body
+region. This makes the resource promise mechanically testable: body cap plus cumulative head
+allowance plus scratch. The default path keeps its existing one-buffer layout, while a caller asking
+for a hard bound accepts the explicit two-region response allocation needed to avoid transient growth.
+
+---
+
 ## The package philosophy
 
 A dependency should be *ordinary source in your tree*, not a resolved artifact. Align's package layer
