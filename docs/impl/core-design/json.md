@@ -8,16 +8,17 @@ anchors). Authored by the main loop (Fable).
 
 ## Overview
 
-JSON across typed and schema-unknown boundaries (draft §14). The surface has four operations:
-typed `encode` / `decode`, lazy schema-unknown `doc`, and streaming typed-row `scan`. Target and row
+JSON across typed and schema-unknown boundaries (draft §14). The surface has five operations:
+typed `encode` / `encode_bounded` / `decode`, lazy schema-unknown `doc`, and streaming typed-row `scan`. Target and row
 types are carried by **inference, never a written type argument** (settled: Align has no
 expression-position type-argument syntax / no turbofish). Requires `import core.json` (the
 capability-header rule applies to core.json exactly like std modules).
 
-## Signatures (verified)
+## Signatures (verified unless marked pending)
 
 ```text
 json.encode(x)   -> str                      // x: struct (nested structs recurse); str fields JSON-escaped
+json.encode_bounded(x, max_bytes: i64) -> Result<string, Error> // accepted design; implementation pending
 json.decode(s)   -> Result<T, Error>         // T from the binding/context: u: User := json.decode(s)?
 
 // decode targets, all verified:
@@ -164,6 +165,11 @@ The later Option, array-field, and union slices described above compose with thi
 ## Type & ownership classification
 
 - `encode` builds through the string builder; result is an arena-regioned `str`.
+- `encode_bounded` borrows the same accepted value graph and uses the same ordered encode pieces,
+  but returns one individually owned `string` on exact-fit-or-smaller success. Its inclusive
+  `max_bytes` ceiling applies to emitted UTF-8 bytes before growth; negative or exceeded limits are
+  `Error.Invalid`, with no partial result. It adds no accepted JSON shape; the separately reviewed
+  Request 13 graph widening must feed both encode operations through their shared part constructor.
 - `decode` into `array<T>`/`array<Struct>` produces an owned Move array (deep-dropped).
 - `decode` into `soa<T>` allocates columns in the enclosing arena (`align_rt_json_decode_soa`,
   one count pass + one value-parse pass sharing the Mison speculation via `FieldDst`).
@@ -182,6 +188,13 @@ errors, missing fields, type mismatches, **out-of-range integers** (sign-carryin
 field must appear exactly once: a duplicate declared key is an `Err` on both the strict and
 speculative paths, including at a position the learned pattern considered unqueried. Undeclared
 keys are skipped.
+
+`encode_bounded` is the fallible resource-boundary sibling of `encode`: a negative limit or the
+first emitted byte beyond the inclusive ceiling is `Err(Error.Invalid)`. An allocator failure keeps
+the language-wide terminal-abort policy. Successful bytes are byte-identical to `encode`, including
+declaration-order keys, numeric spelling, escaping, omitted `None`, arrays, and unions; “canonical”
+does not mean RFC 8785 sorting. The authoritative contract and closure matrix are in
+`../17-library-boundary-prerequisites.md` §7.7.
 
 ## Regions
 

@@ -571,6 +571,7 @@ no region; the `bytes`/`buffer` stay borrowed. (`draft.md` §12.)
 ```text
 json.decode
 json.encode
+json.encode_bounded
 json.doc
 json.scan
 ```
@@ -594,6 +595,13 @@ diagnostic placeholder uses the declared public local/imported spelling with con
 generic arguments; internal `$`-mangled and monomorph-interner names never appear.
 This restriction is scanner-only; the declaration remains a valid ordinary type. This is the complete surface —
 `validate<T>`, `token`, and `field_table<T>` are settled out (draft §18.1).
+
+`json.encode_bounded(value, max_bytes: i64) -> Result<string, Error>` accepts exactly the same
+borrowed typed values as `json.encode`. Its nonnegative inclusive ceiling counts emitted UTF-8
+bytes; exact fit succeeds, while a negative limit or the first byte beyond the limit yields
+`Error.Invalid` without a partial value or allocation beyond the ceiling. Success is byte-identical
+to `json.encode` and owns its `string`. This typed declaration-order encoding is Align's canonical
+artifact byte form; it is not RFC 8785 key sorting or a dynamic JSON canonicalizer.
 
 The scanner generic boundary is concrete-row-only. Concrete generic monomorphs
 such as `Wrap<i64>` remain eligible after row resolution, and ordinary generic

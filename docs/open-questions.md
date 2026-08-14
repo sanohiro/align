@@ -4515,6 +4515,17 @@ string-or-parts multimodal `content` union — v1 restricts `content` to `str`),
 
 ### JSON completeness — DESIGN SETTLED 2026-07-18 (owner-approved; the implementation source of truth)
 
+**Bounded canonical encode — ACCEPTED DESIGN 2026-08-14 (align-llm Request 12; implementation
+pending).** `json.encode_bounded(value, max_bytes: i64) -> Result<string, Error>` is the one
+resource-bounded sibling of typed `json.encode`. It borrows exactly the same admitted value graph
+and reuses the same ordered Template parts and runtime formatters. An inclusive emitted-UTF-8-byte
+ceiling succeeds on exact fit; a negative ceiling or first would-exceed byte is `Error.Invalid`,
+with no partial value or allocation beyond the cap. Success owns one free-standing `string` and is
+byte-identical to `json.encode`; this is declaration-order typed canonicalization, not RFC 8785 or
+a dynamic value tree. OOM remains terminal. The authoritative public ledger, validation order,
+runtime ABI, cleanup obligations, and implementation closure matrix are
+`impl/17-library-boundary-prerequisites.md` §7.7.
+
 **Owner directive (2026-07-18): make `core.json` *holistically complete* — no more piecemeal "this
 JSON shape is supported, that one isn't."** The design below was settled with the owner (three
 forks decided 2026-07-18: lazy document view / shape-directed unions / catalog trimmed). It is the

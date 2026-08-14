@@ -7,12 +7,13 @@
 
 ## Overview
 
-JSON を型付き境界とスキーマ未知境界の両方で扱う（draft §14）。表面は、型付きの `encode` / `decode`、遅延スキーマ未知ビューの `doc`、型付き行をストリーム処理する `scan` の4操作である。対象型と行型は **明示的な型引数ではなく型推論によって** 決定される（決定済: Align には式位置での型引数構文、つまり turbofish のような記法は存在しない）。使用には `import core.json` が必要である（capability-header のルールは `core.json` に対しても std モジュールと全く同様に適用される）。
+JSON を型付き境界とスキーマ未知境界の両方で扱う（draft §14）。表面は、型付きの `encode` / `encode_bounded` / `decode`、遅延スキーマ未知ビューの `doc`、型付き行をストリーム処理する `scan` の5操作である。対象型と行型は **明示的な型引数ではなく型推論によって** 決定される（決定済: Align には式位置での型引数構文、つまり turbofish のような記法は存在しない）。使用には `import core.json` が必要である（capability-header のルールは `core.json` に対しても std モジュールと全く同様に適用される）。
 
-## Signatures (verified)
+## Signatures (pending と明記したものを除き verified)
 
 ```text
 json.encode(x)   -> str                      // x: struct (nested structs recurse); str fields JSON-escaped
+json.encode_bounded(x, max_bytes: i64) -> Result<string, Error> // accepted design; implementation pending
 json.decode(s)   -> Result<T, Error>         // T from the binding/context: u: User := json.decode(s)?
 
 // decode targets, all verified:
@@ -152,6 +153,11 @@ region-tie される（`struct_has_str` が再帰する）。上で説明した�
 ## Type & ownership classification
 
 - `encode` は内部的に string builder を使用して文字列を構築する。戻り値は arena に region 付けされた `str` となる。
+- `encode_bounded` は同じ受理済み値グラフを借用し、同じ順序の encode piece を使うが、
+  inclusive な `max_bytes` 以下で成功したときは個別所有の `string` を1つ返す。上限は成長前の
+  UTF-8 出力バイトへ適用され、負値または超過は部分結果を返さず `Error.Invalid` になる。
+  新しい JSON shape は受理しない。別途 review される Request 13 の graph widening は、共有 part
+  constructor を介して両方の encode 操作へ適用しなければならない。
 - `array<T>` / `array<Struct>` への `decode` は、所有権を持つ Move 配列を生成する（破棄時は deep-drop される）。
 - `soa<T>` への `decode` は、外側の arena に列（カラム）を割り当てる（`align_rt_json_decode_soa` により、1 回のカウント用パスと 1 回の値パース用パスが `FieldDst` を介して Mison の投機的実行（speculation）パスを共有する）。
 - デコードされた `str` フィールドや列は、**入力された `str` へのビュー（参照）** である。そのため、入力データはデコード結果よりも長生きしなければならず、これは region チェッカによって強制される。
@@ -163,6 +169,12 @@ Pure（パース処理は純粋な計算であり、I/O は発生しない。バ
 ## Errors & aborts
 
 不正なデータはすべて `Err(Error)` として扱われ、パニックが発生したり、静かに誤った値が返されたりすることは決してない。これには構文エラー、フィールドの欠落、型の不一致、**範囲外の整数** が含まれる（符号を考慮するフィールドタグ、#295。`u64` フィールドは単一のディスパッチャを経由して `u64` の全範囲を受け入れる、#311）。宣言済みフィールドは正確に1回だけ現れなければならず、重複した宣言済みキーは strict path と speculative path の両方で `Err` になる。学習済みパターンが未照会位置とみなした場所に重複が現れた場合も同じであり、未宣言キーだけが読み飛ばされる。
+
+`encode_bounded` は `encode` の fallible なリソース境界版である。負の上限、または inclusive な上限を
+超える最初の出力バイトは `Err(Error.Invalid)` になる。allocator failure は言語全体で既存の terminal-abort
+方針を保つ。成功時のバイト列は、宣言順キー、数値表現、escape、`None` の省略、配列、union を含めて
+`encode` と byte-identical である。ここでいう “canonical” は RFC 8785 sorting を意味しない。
+正式な契約と closure matrix は `../17-library-boundary-prerequisites.md` §7.7 にある。
 
 ## Regions
 

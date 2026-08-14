@@ -846,3 +846,17 @@ payload syntax/ABI. Such a record remains usable in the existing Option, Result,
 payload positions, whose active-tag cleanup must now dispatch its string-array field. Allocation
 accounting is structural: push allocates no child, build allocates
 nothing, and only the outer builder growth can add storage to already constructed children.
+
+## 18. Bounded canonical JSON result ownership (accepted 2026-08-14)
+
+The align-llm Request 12 contract is
+`17-library-boundary-prerequisites.md` §7.7. It adds no ownership mode or region kind. The borrowed
+typed source follows ordinary `json.encode` region rules; the successful result is one
+free-standing owned `string` carried by the existing recursive `Result` Drop plan.
+
+The internal stack builder carries an inclusive byte ceiling and sticky limit-failure bit. Every
+write checks `len + additional` before capacity growth. Success consumes the header and transfers
+the buffer into `Ok(string)`; negative-limit and over-limit finishes consume the header, free the
+buffer, zero the output slot, and construct `Err(Error.Invalid)`. Actual OOM remains terminal under
+the allocator-wide rule. There is no partial owner, hidden second pass, arena fallback, source move,
+or path on which both the builder and Result own the same allocation.

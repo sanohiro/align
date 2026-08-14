@@ -2395,6 +2395,7 @@ freeze.
 ```text
 json.decode
 json.encode
+json.encode_bounded
 json.doc
 json.scan
 ```
@@ -2408,6 +2409,13 @@ json.scan(view)`). This is the complete surface: there is no `validate<T>`
 (decoding and discarding IS validation — one way), no SAX `token` tier (`doc` +
 `scan` cover it), and no public `field_table<T>` (a compiler-internal artifact).
 `doc` is the schema-unknown tier — see §14.
+
+`json.encode_bounded(value, max_bytes: i64) -> Result<string, Error>` is the owned, fallible sibling
+of `json.encode`. It accepts exactly the same borrowed typed values and emits exactly the same
+declaration-order bytes. `max_bytes` is an inclusive UTF-8 byte ceiling: exact fit succeeds; a
+negative ceiling or the first byte beyond it is `Error.Invalid`; no partial string or allocation
+beyond the ceiling is exposed. “Canonical” names this one typed encoder, not RFC 8785 sorting or a
+schema-unknown dynamic value surface.
 
 `json.scan` accepts only a recursively Copy row: the complete reachable row definition graph must
 require no `Drop` under Align's canonical ownership classification. Among rows admitted by the
