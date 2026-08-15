@@ -178,8 +178,15 @@ jobs:
         shell: bash
         run: |
           scripts/cargo.sh build --locked --profile dist -p align_runtime
+          # `align_repl` builds in the SAME invocation as `align_driver`, not a
+          # separate one: RUSTFLAGS is part of cargo's fingerprint, so a second
+          # build without `-Cprofile-use` would recompile the whole profiled
+          # dependency tree rather than reuse it. The REPL is not instrumented in
+          # phase 1 and contributes no training corpus of its own — it is a thin
+          # shell whose compile work happens inside the driver library that IS
+          # profiled, so its own functions simply carry no profile data.
           RUSTFLAGS="-Cprofile-use=$RUNNER_TEMP/merged.profdata" \
-            scripts/cargo.sh build --locked --profile dist -p align_driver
+            scripts/cargo.sh build --locked --profile dist -p align_driver -p align_repl
 
       - name: Smoke test compiler
         shell: bash
@@ -187,6 +194,11 @@ jobs:
           ./target/dist/alignc --version
           ./target/dist/alignc build examples/hello.align
           ./hello
+          # The REPL drives the same driver and locates libalign_runtime.a beside
+          # its own executable, so this proves the shipped pair works together —
+          # not just that the binary starts.
+          ./target/dist/align-repl --version
+          printf '40 + 2\n:quit\n' | ./target/dist/align-repl | grep -qx 42
 
       - name: Create archive
         shell: bash
@@ -195,10 +207,12 @@ jobs:
         run: |
           mkdir -p package
           cp target/dist/alignc package/
+          cp target/dist/align-repl package/
           cp target/dist/libalign_runtime.a package/
           cp LICENSE-APACHE LICENSE-MIT README.md README.ja.md package/
           tar -C package -czf "$ARTIFACT.tar.gz" \
-            alignc libalign_runtime.a LICENSE-APACHE LICENSE-MIT README.md README.ja.md
+            alignc align-repl libalign_runtime.a \
+            LICENSE-APACHE LICENSE-MIT README.md README.ja.md
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -256,12 +270,22 @@ jobs:
             mkdir -p "$ROOT/DEBIAN" "$ROOT/usr/bin" "$ROOT/usr/lib/align" \
               "$ROOT/usr/share/doc/alignc"
             tar -xzf "release/alignc-linux-$ARCHIVE_ARCH.tar.gz" \
-              -C "$ROOT/usr/lib/align" alignc libalign_runtime.a
+              -C "$ROOT/usr/lib/align" alignc align-repl libalign_runtime.a
             cat > "$ROOT/usr/bin/alignc" <<'EOF'
           #!/bin/sh
           exec /usr/lib/align/alignc "$@"
           EOF
             chmod 0755 "$ROOT/usr/bin/alignc"
+            # align-repl resolves libalign_runtime.a beside its OWN executable, so
+            # it has to live in /usr/lib/align next to the archive and be reached
+            # through a wrapper, exactly like alignc — a /usr/bin symlink would
+            # still resolve, but keeping the two identical means one shape to
+            # reason about.
+            cat > "$ROOT/usr/bin/align-repl" <<'EOF'
+          #!/bin/sh
+          exec /usr/lib/align/align-repl "$@"
+          EOF
+            chmod 0755 "$ROOT/usr/bin/align-repl"
             cp LICENSE-APACHE LICENSE-MIT README.md README.ja.md "$ROOT/usr/share/doc/alignc/"
             cat > "$ROOT/DEBIAN/control" <<EOF
           Package: alignc
@@ -273,6 +297,8 @@ jobs:
           Depends: llvm-22, clang-22, libclang-rt-22-dev, libssl-dev, zlib1g-dev, libzstd-dev
           Description: AOT compiler for the Align programming language
            Align is a data-oriented language with predictable native performance.
+           Ships alignc and align-repl, an AOT REPL that compiles and runs each
+           entry natively.
           EOF
             dpkg-deb --root-owner-group --build "$ROOT" "release/alignc_${VERSION}_${DEB_ARCH}.deb"
           done

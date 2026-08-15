@@ -129,7 +129,8 @@ These are the performance model speaking at the source line, not style rules. Fi
 
 ## align-repl
 
-A second binary, `align-repl`, is an AOT REPL. It takes no arguments:
+A second binary, `align-repl`, is an AOT REPL. It ships in the same release archive, `.deb`, and
+Homebrew formula as `alignc`, so a packaged install already has it. It takes no arguments:
 
 ```text
 $ align-repl
@@ -220,6 +221,9 @@ align> :time 3
 
 Ctrl-D and `:quit` both leave. Ctrl-C ends the session — and, while your program is running, ends
 the program with it, because the REPL installs no signal handler.
+
+There is no built-in line editing yet, so arrow-key history does not work. `rlwrap align-repl` adds
+it from outside if you want it.
 
 Two limits are worth knowing before you hit them. A region-scoped value cannot span entries:
 `arena` and `heap.new` are block-scoped by the language and each entry is one statement, so a box
