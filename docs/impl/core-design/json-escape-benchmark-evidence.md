@@ -163,6 +163,8 @@ Cargo.toml
 Cargo.lock
 rust-toolchain                 when present in either revision
 rust-toolchain.toml            when present in either revision
+scripts/cargo.sh
+scripts/dyld-env.sh
 bench/.cargo/**                when present in either revision
 bench/json_decode/**
 bench/json_soa/**
@@ -173,11 +175,11 @@ tests/benchmark_evidence/**
 
 Presence, path, mode, type, blob bytes, and structural manifest must match across revisions.
 Optional-root presence mismatch rejects. This comparison covers scripts, kernels, harnesses,
-manifests, lockfiles, generators, output format, timing loops, the profile/public key, every
-installed controller/verifier/monitor source and installation manifest, their adversarial owners,
-and nested configuration before any candidate code executes. Any change requires a separately
-reviewed evidence-profile implementation and requalification before selecting a new baseline; it
-cannot coexist with the measured Request 7 candidate.
+manifests, lockfiles, the repository Cargo/loader wrapper, generators, output format, timing loops,
+the profile/public key, every installed controller/verifier/monitor source and installation
+manifest, their adversarial owners, and nested configuration before any candidate code executes.
+Any change requires a separately reviewed evidence-profile implementation and requalification
+before selecting a new baseline; it cannot coexist with the measured Request 7 candidate.
 
 ## Container and process boundary
 
@@ -582,7 +584,7 @@ It may not weaken the base rule.
 | Trusted bootstrap and CLI | Root-owned installed producer/verifier/merge-verifier/monitor bytes must match their manifest and verified baseline blobs. Candidate/PATH/PYTHONPATH/current-directory substitution, installed-file replacement, missing/extra/repeated options, relative paths, malformed/same OIDs, existing output, untrusted repository, and ambient selectors reject before mutation. Trusted CI supplies expected baseline/candidate/PR body and a canonical review attestation created from fixture-owned GitHub API responses; wrong repository/PR/reviewer role/review ID/commit/state/body digest, author review, dismissal, staleness, duplication, and API/file substitution reject before candidate-controlled content is read. `benchmark_evidence_bootstrap_cli_matrix`. |
 | Raw identity/construction | Cover clone/worktree, packed/loose objects, reviewed symlinks, hostile config/includes/hooks/filters/fsmonitor/commit-graph/replacements/grafts/alternates/promisor/shallow/missing objects, raw swap, path/type/mode collisions, and mutation race. `benchmark_evidence_raw_object_matrix`. |
 | Revision binding | Exact parent chain and two-sided added/deleted/modified path inventory succeed; wrong local target, unrelated ancestry, merge/side parent, ref movement, stale review, branch-after-drift, missing deletion, wrong old/new mode/type, and incomplete tree-union diff reject. `benchmark_evidence_revision_binding_matrix`. |
-| Protected inputs | Mutate presence/path/type/mode/bytes of every required/optional config, manifest, lock, script, kernel, harness, generator, output, timing owner, evidence profile/public key, installed-source manifest, controller/verifier/monitor source, and evidence owner test; reject before candidate execution. `benchmark_evidence_protected_input_matrix`. |
+| Protected inputs | Mutate presence/path/type/mode/bytes of every required/optional config, manifest, lock, repository Cargo/loader wrapper, benchmark script, kernel, harness, generator, output, timing owner, evidence profile/public key, installed-source manifest, controller/verifier/monitor source, and evidence owner test; reject before candidate execution. `benchmark_evidence_protected_input_matrix`. |
 | Toolchain/cache/offline | Image/tool/cache/config identity succeeds; tag/image/tool swap, missing/stale lock, incomplete cache, registry update, network, and source/cache/lock/target cross-write reject. `benchmark_evidence_toolchain_matrix`. |
 | Native host/isolation | Cover x86_64 success; ARM/emulation, CPU/microcode/kernel/daemon/runtime/cgroup/image mismatch, quota/writable source/network/device/capability/credential/socket/cross-revision exposure reject. A latched foreign scheduler/container, throttle/thermal/frequency, pressure/load, swap/memory event during any child, monitor loss/overflow/delay/death, duplicate/reused/overlapping range, wrong child ID, or orphan child observation rejects. `benchmark_evidence_host_isolation_matrix`. |
 | Descriptor/environment | Collide every inherited fd; cover missing CLOEXEC, unexpected fd, stdio swap, proxy/Cargo/Rust/Git/locale/home injection, truncation, and capture overflow. `benchmark_evidence_process_boundary_matrix`. |

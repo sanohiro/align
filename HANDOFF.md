@@ -7,29 +7,33 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-15._ Align PR #812 merged align-llm Request 5's bounded HTTP
-response-body capability at `5aa5b23a`. Its exact-head native ARM64 preflight and every required
-GitHub check passed before merge. Active work is the separate align-llm Request 7
-benchmark-evidence prerequisite design on `agent/json-escape-benchmark-evidence-design`. The
-proposed contract is `docs/impl/core-design/json-escape-benchmark-evidence.md`: a trusted installed
-controller/verifier, continuously monitored native x86_64 host, digest-pinned offline OCI toolchain,
-read-only revision isolation, robust inner statistics plus fixed balanced sampling, a complete
-canonical report schema, and host-signed evidence. One independent review of `5ed19c85` found six
-valid issues; `65753fe7` closed that set and added the synchronized Japanese mirror and indexes. The
-required full-diff review of that repair found seven further valid contract gaps, so the design was
-re-scoped: exact median quantization, a prepare/direct-exec boundary, two-sided path changes, unique
-child-monitor partitions, signed actual-merge verification, and pre-publication unlock semantics now
-close them together. The bounded review of redesigned head `0bb57285` found six precise binding and
-publication gaps. The current repair adds trusted GitHub review attestation, protects the complete
-evidence profile/source set, rechecks final target reachability, serializes publication with a
-durable reservation, uses the repository's exact `clean`/`fixed` states, and fixes SSHSIG bytes.
-PR #813 is open. Author inspection of the next slice found that the current scripts make six Cargo
-invocations, not the four root builds named by the delivery prose; the exact-head repair now binds
-all six and identifies the two later `cargo run` replacements. The same pass makes the work-root
-safety and cleanup contract exact instead of leaving `unsafe` to implementation judgement. Next:
-rerun docs publication preflight, update and merge PR #813 after required checks pass, then implement
-the benchmark-input and evidence-controller prerequisites before creating a Request 7 implementation
-branch.
+_Last updated: 2026-08-15._ PR #813 merged the align-llm Request 7 benchmark-evidence prerequisite
+design at `734ae3ab`; its exact-head preflight, native ARM64/x86_64/macOS checks, and required
+PostgreSQL integration passed. The authoritative contract is
+`docs/impl/core-design/json-escape-benchmark-evidence.md`, with a synchronized Japanese mirror.
+
+Active work is the first implementation capability on `agent/json-benchmark-inputs`: both detached
+Cargo locks are checked in, all six current Cargo invocations are explicitly locked/offline, and a
+shared helper confines root/detached targets, temporary files, and kernel objects to one validated
+private work child outside the repository. `scripts/test-json-benchmark-inputs.sh` passes its
+nominal, invalid-root, foreign-residue, child-error, and signal-cleanup matrix; both detached
+`cargo metadata --locked --offline` checks also pass. Next: complete the author diff audit, commit,
+run one comprehensive review and repair its valid findings, then run exact-head publication
+preflight and merge the capability before starting the evidence controller.
+
+Author diff audit found that both benchmarks now call the repository Cargo/loader wrapper. The
+implementation branch therefore adds `scripts/cargo.sh` and `scripts/dyld-env.sh` to the English and
+Japanese protected-input set and mutation owner; otherwise a measured candidate could replace an
+unprotected build input. This is a required evidence-tool dependency closure, not a language/API
+change.
+
+Native Apple Silicon qualification uses `CARGO_BUILD_JOBS=1`. `json_decode/run.sh native` completed
+the real compiler/runtime/harness path and left its caller work root empty. The equivalent
+`json_soa` build reached a detached `zmij` build script that stayed at 0% CPU in `_dyld_start` even
+with `DYLD_SHARED_REGION=private`; `sample` confirmed the known host launch class, so the unchanged
+invocation was interrupted. Signal cleanup removed its private child and left only the empty
+caller-owned root, which was then removed. This is an incomplete host qualification, not a benchmark
+failure or an emulated result; the deterministic two-script owner remains green.
 
 The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit

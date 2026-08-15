@@ -6,8 +6,15 @@ column-major `soa<Row>` and running `where(.active).pay.sum()`, vs idiomatic Rus
 aggregate touches 2.
 
 ```sh
-bench/json_soa/run.sh [baseline|v3|native]   # default native
+work_dir="$(mktemp -d)"
+ALIGN_BENCH_WORK_DIR="$work_dir" bench/json_soa/run.sh [baseline|v3|native]   # default native
+rmdir "$work_dir"
 ```
+
+The required work directory must be an existing empty absolute directory outside the repository.
+The script keeps both Cargo targets, temporary files, and `kernel.o` in one private child and removes
+that child on every exit. Both workspace builds and the detached harness use their checked-in locks
+with Cargo offline.
 
 Unlike the flat `bench/`, the kernel pulls in the Align runtime (the JSON parser + arena), so the
 harness links `libalign_runtime.so` (a **cdylib** — dynamic, over the C-ABI, so its bundled std

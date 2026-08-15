@@ -127,6 +127,8 @@ Cargo.toml
 Cargo.lock
 rust-toolchain                 when present in either revision
 rust-toolchain.toml            when present in either revision
+scripts/cargo.sh
+scripts/dyld-env.sh
 bench/.cargo/**                when present in either revision
 bench/json_decode/**
 bench/json_soa/**
@@ -135,8 +137,9 @@ scripts/benchmark_evidence/**
 tests/benchmark_evidence/**
 ```
 
-presence/path/mode/type/blob/manifest equalityをcandidate実行前に要求し、script/kernel/harness/manifest/lock/
-generator/output/timing/config、profile/public key、installed source/manifest、adversarial ownerすべてを含む。
+presence/path/mode/type/blob/manifest equalityをcandidate実行前に要求し、repository Cargo/loader wrapper、
+benchmark script/kernel/harness/manifest/lock/generator/output/timing/config、profile/public key、installed
+source/manifest、adversarial ownerすべてを含む。
 変更はseparate reviewed profile implementation/requalificationが必要でRequest 7 candidateと併存不可。
 
 ## Container/process boundary
@@ -429,7 +432,7 @@ bindするprovider CASをreviewed amendmentで導入する。base ruleを弱め�
 | Trusted bootstrap/CLI | installed producer/verifier/merge-verifier/monitorをmanifest/baseline blobへ照合。candidate/PATH/PYTHONPATH/CWD substitution、replacement、引数/path/OID/output/ambient異常をmutation前にreject。trusted CIがexpected OID/PRとfixture-owned GitHub API responseから作ったcanonical review attestationを供給し、wrong repository/PR/reviewer role/review ID/commit/state/body digest、author review、dismiss/stale/duplicate、API/file substitutionをcandidate content読取前にreject。`benchmark_evidence_bootstrap_cli_matrix`. |
 | Raw identity/construction | clone/worktree、packed/loose、reviewed symlink、hostile Git state、missing/raw swap/path collision/mutation race。`benchmark_evidence_raw_object_matrix`. |
 | Revision binding | exact parent chain/two-sided add-delete-modify diff、wrong target/ancestry/merge/ref/stale review/drift、missing deletion、wrong old/new mode/type、incomplete tree union。`benchmark_evidence_revision_binding_matrix`. |
-| Protected input | required/optional config/manifest/lock/script/kernel/harness/generator/output/timing、evidence profile/public key、installed-source manifest、controller/verifier/monitor source、evidence owner testのpresence/path/type/mode/bytes mutationをcandidate前reject。`benchmark_evidence_protected_input_matrix`. |
+| Protected input | required/optional config/manifest/lock/repository Cargo+loader wrapper/benchmark script/kernel/harness/generator/output/timing、evidence profile/public key、installed-source manifest、controller/verifier/monitor source、evidence owner testのpresence/path/type/mode/bytes mutationをcandidate前reject。`benchmark_evidence_protected_input_matrix`. |
 | Toolchain/cache/offline | image/tool/cache/config、swap、lock/cache/network/write。`benchmark_evidence_toolchain_matrix`. |
 | Native host/isolation | native x86_64 success、ARM/emulation/mismatch/quota/exposure reject。child内latched event/monitor loss、duplicate/reused/overlap range、wrong child ID、orphan observationをreject。`benchmark_evidence_host_isolation_matrix`. |
 | Descriptor/environment | 全fd collision/CLOEXEC/mapping/env/truncation/capture。`benchmark_evidence_process_boundary_matrix`. |
