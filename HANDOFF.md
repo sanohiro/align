@@ -45,6 +45,11 @@ repair constructs the ledger's fixed execution environment, never removes a dire
 candidate teardown, verifies directory-only failure residue, and documents digest-bound two-phase
 native use in `bench/README.md`.
 
+The repair review of `d7235794` found two narrow documentation/owner issues: the empty-`HOME` shell
+assertion used the wrong parameter expansion, and the decode README still advertised the now-forbidden
+ambient profiling switch. The final repair asserts defined-and-empty `HOME` directly and marks the
+old profile numbers as historical, with no profiling switch on the sealed evidence interface.
+
 Latest durable verification after the exact-base review repair passed the serial owner aggregate:
 `scripts/test-benchmark-evidence-manifest.sh`, `scripts/test-benchmark-evidence-bootstrap.sh`,
 `scripts/test-benchmark-evidence-cli.sh`, `scripts/test-benchmark-evidence-git-objects.sh`,

@@ -219,7 +219,8 @@ elif has_arg build "$@"; then
 #!/usr/bin/env bash
 set -euo pipefail
 [[ "${CARGO_NET_OFFLINE:-}" == true ]]
-[[ "${HOME+x}:${HOME:-x}" == x: ]]
+[[ "${HOME+x}" == x ]]
+[[ -z "$HOME" ]]
 [[ "${LC_ALL:-}" == C ]]
 [[ "${PATH:-}" == /usr/bin:/bin ]]
 [[ "${TZ:-}" == UTC ]]

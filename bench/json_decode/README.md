@@ -66,11 +66,12 @@ autopsy's first fix (index build 47→18 ms vs the quote-heavy structural index)
 every parser change and watch the ratios; when a result disappoints, autopsy — don't guess (see
 `bench/README.md` methodology).
 
-## Profile finding (2026-06-29, native, 1M rows)
+## Historical profile finding (2026-06-29, native, 1M rows)
 
-`ALIGN_BENCH_WORK_DIR=/absolute/prepared/outside/repo ALIGN_BENCH_ARTIFACT_MANIFEST_SHA256=$PREPARE_TIME_DIGEST ALIGN_BENCH_PROFILE=1 bench/json_decode/run.sh native`
-adds decode-only entry points that return the
-row count after `json.decode`. Measured:
+These measurements predate the sealed evidence interface and used diagnostic decode-only entry
+points that return the row count after `json.decode`. The current prepare/direct-native workflow
+deliberately strips `ALIGN_BENCH_PROFILE` and emits only its fixed evidence rows; it has no profiling
+switch. Reintroducing diagnostic output requires a separate non-evidence interface. Measured:
 
 ```
 full decode-only   91.376 ms; aggregate delta    0.684 ms

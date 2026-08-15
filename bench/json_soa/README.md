@@ -77,7 +77,9 @@ after        ~83.5      ~94      ~86       ~1.03x
 ```
 
 So the SoA path went **≈0.82× → ≈1.03× of `serde_json`** — it now beats serde on the end-to-end
-column-analytics workload at 1M. The profile decomposition shows the direct fill is even ~8–9 ms
+column-analytics workload at 1M. This historical profile decomposition predates the sealed
+prepare/direct-native interface, whose fixed environment deliberately exposes no profiling switch.
+It shows the direct fill is even ~8–9 ms
 *faster* than the AoS decode-only path, because AoS still pays a heap materialize-copy of the whole
 array while the direct fill bump-writes columns in the arena. (The earlier 10–25 ms transpose penalty
 this benchmark measured is now gone — it drove this change, exactly the benchmark's job.)
