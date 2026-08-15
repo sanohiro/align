@@ -7,8 +7,9 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-16._ Align main is at `0e39c8b9` after the monitor lifecycle core
-(PR #837), following prepared-benchmark sealing (PR #827). align-llm Request 5's bounded HTTP response
+_Last updated: 2026-08-16._ Align main is at `a9999aee` after the adversarial process/schedule/
+cleanup/exclusive-run owners (PR #839), following prepared execution owners (PR #838), the monitor
+lifecycle core (PR #837), and prepared-benchmark sealing (PR #827). align-llm Request 5's bounded HTTP response
 body is shipped, and Request 7's evidence design (#813), benchmark inputs (#815/#821), installed
 manifest (#816), canonical JSON (#817), typed report schema (#818), SSHSIG framing (#820), strict
 controller CLI (#822), installed-manifest/profile binding (#823), raw Git object identity codec
@@ -27,9 +28,9 @@ the launcher, verifies the manifest below that retained descriptor, and executes
 bytes only after copying them into fully write-sealed anonymous memfds; macOS remains native ARM
 development qualification, not accepted evidence. Its focused owners are
 `scripts/test-benchmark-input.sh`, `scripts/test-benchmark-evidence-manifest.sh`, and
-`scripts/test-benchmark-evidence-statistics.sh`. The prepared execution boundary owners are shipped
-in this slice; the next Request 7 work is the remaining adversarial schedule/process/cleanup/race
-owners followed by the controller/verifier.
+`scripts/test-benchmark-evidence-statistics.sh`. The prepared execution and adversarial
+process/schedule/cleanup/exclusive-run owners are shipped in this slice; the next Request 7 work is
+the merge-race owner followed by the controller/verifier.
 
 The final integration review of `0dbbd709` against `c47e57c7` found three valid remaining handoff
 issues. The consolidated closure requires the trusted caller to retain prepare's manifest SHA-256
@@ -96,9 +97,8 @@ work directory, with the prepare-time digest supplied to direct execution and an
 sentinel excluded by the fixed launcher environment. The final-review-repair rerun produced decode
 digest `efca5a28a02e8b49636092413c0f92386c39f2bfcb754f7a9f5ddc83f090ef2c` and SoA digest
 `5b1ff95b9364253e4afb81d209d909dfdd5455616f681fcbe5c8c2403fbfaa3c`. These are
-correctness/boundary owners, not accepted x86_64 performance evidence. At #837's merge, the next
-eligible capabilities became prepared execution boundary owners, the remaining adversarial
-schedule/process/cleanup/race owners, and controller/verifier implementation;
+correctness/boundary owners, not accepted x86_64 performance evidence. At #839's merge, the next
+eligible capability is the merge-race owner, followed by controller/verifier implementation;
 native x86_64 host qualification and the Request 7 language implementation remain later gates. No
 emulation is accepted in any evidence lane.
 

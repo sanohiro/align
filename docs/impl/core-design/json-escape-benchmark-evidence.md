@@ -647,6 +647,21 @@ controller, verifier, or merge-race behavior.
 | Forged/stale evidence | Unsigned, edited, replayed profile/target/review/candidate, truncated, concatenated, and valid-signature/wrong-namespace reports reject. PR/preflight/trusted-review mismatch blocks; `CLEAN` maps only to `clean`, and accepted `FINDINGS` with a nonempty repair chain maps only to `fixed`. `benchmark_evidence_stale_forged_matrix`. |
 | Base/integration race | Disposable remote covers target movement before/after run, precheck-to-merge race, unavailable/wrong response OID, local-target mismatch, wrong merge parents/tree, signed merge-verification mutation, a normal later first-parent descendant, force-push/removal before the final trusted refetch, failed revert, and exact merge. The merge must remain on the final target first-parent chain; failures never advance lifecycle. `benchmark_evidence_merge_race_matrix`. |
 
+The next capability is intentionally limited to the base/integration race owner. It consumes the
+already merged identity, revision, report, signature, cleanup, and exclusive-run boundaries and does
+not introduce the controller, verifier, provider credentials, Docker execution, or lifecycle adapter.
+Its implementation closure matrix is:
+
+| Axis | Closure and owner |
+|---|---|
+| Disposable remote | Validate the target ref, commit objects, parent order, candidate tree, and response identity before any transition; keep all state in a fixture-owned remote. `benchmark_evidence_merge_race_matrix`. |
+| Base precheck | Bind the local target and remote target to `BASE`; a target move before the run or a local/remote mismatch rejects before merge and never advances lifecycle. `benchmark_evidence_merge_race_matrix`. |
+| Merge response | Bind the provider response OID to a freshly fetched raw object; unavailable, unknown, or wrong response identity rejects and leaves the transaction unshipped. `benchmark_evidence_merge_race_matrix`. |
+| Merge relationship | Require the fetched merge's exact two parents `(BASE, CANDIDATE)` and candidate tree; wrong parents or tree invoke fail-closed revert, and a failed revert leaves the remote blocked. `benchmark_evidence_merge_race_matrix`. |
+| Signed artifact | Verify the signed merge-verification payload against the fetched raw merge, then detect a payload/signature mutation before acceptance. `benchmark_evidence_merge_race_matrix`. |
+| Final refetch | After staging, accept a normal later first-parent descendant that still contains `MERGE`; a force-push, target removal, or unavailable final fetch rejects and never advances lifecycle. `benchmark_evidence_merge_race_matrix`. |
+| Revert/lifecycle | Exact merge reaches `accepted` only after every relationship and final refetch passes. Every failure reaches `rejected`, `reverted`, or `blocked`; no failure advances lifecycle or emits an accepted artifact. `benchmark_evidence_merge_race_matrix`. |
+
 Implementation maps every row to source and deterministic tests before review. Tests use fixture
 executors, a fake daemon, disposable repositories/remotes, and test keys; they do not run the
 performance workload or assert wall-clock ratios. Native host qualification and final Request 7
