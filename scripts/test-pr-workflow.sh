@@ -297,6 +297,7 @@ fake_codex="$fake_bin/codex"
   printf '  native-clean) echo "No findings." ;;\n'
   printf '  native-clean-readonly) echo "Read-only inspection found no actionable soundness or regression risks in the diff." ;;\n'
   printf '  native-clean-inspected) echo "No actionable soundness or regression issues were found in the inspected diff." ;;\n'
+  printf '  native-clean-risks) echo "No actionable soundness or regression risks were found in the inspected diff." ;;\n'
   printf '  native-findings) echo "- [P1] broken workflow — scripts/example.sh:1" ;;\n'
   printf '  stall) sleep 30 ;;\n'
   printf '  progress) for i in 1 2 3; do echo "phase-$i"; sleep 1; done; echo "ALIGN_REVIEW_VERDICT=CLEAN" ;;\n'
@@ -400,6 +401,10 @@ native_readonly_status=$?
   ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
   "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
 native_inspected_status=$?
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=native-clean-risks ALIGN_REVIEW_STALL_SECONDS=5 \
+  ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
+  "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
+native_risks_status=$?
 set -e
 [[ $findings_status -eq 2 ]] || {
   echo "findings review returned $findings_status, expected 2" >&2
@@ -429,7 +434,8 @@ set -e
   exit 1
 }
 [[ $native_clean_status -eq 0 && $native_readonly_status -eq 0 &&
-  $native_inspected_status -eq 0 && $native_findings_status -eq 2 ]] || {
+  $native_inspected_status -eq 0 && $native_risks_status -eq 0 &&
+  $native_findings_status -eq 2 ]] || {
   echo "native review output was classified incorrectly" >&2
   exit 1
 }
