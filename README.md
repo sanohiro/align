@@ -74,6 +74,18 @@ Run it with:
 ./target/release/alignc run hello.align
 ```
 
+Or try Align without a file at all. `align-repl` is an AOT REPL: every entry recompiles one growing
+program with the real compiler and runs the real binary, so nothing is interpreted.
+
+```sh
+./target/release/align-repl
+```
+
+```text
+align> 1 + 2
+3
+```
+
 ## Learn Align
 
 Start with the guide — a hands-on introduction to thinking and writing in Align:

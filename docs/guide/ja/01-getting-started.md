@@ -37,6 +37,21 @@ cargo build
 
 Ubuntu 24.04 標準の OpenSSL 3.0 を使用すれば、TLS、ハッシュ、HMAC、HKDF、AEAD などの機能を利用できます。ただし、`crypto.argon2id` のプロバイダは OpenSSL 3.2 で追加されたため、Argon2id が必要な場合は新しいバージョンの OpenSSL をインストールしてください。未対応の環境では、実行時に engine error が返されます。
 
+## まず REPL で試す
+
+`align-repl` は Align を動かしてみる最短の方法だ。引数なしで起動する:
+
+```text
+$ align-repl
+align> 1 + 2
+3
+align> name := "align"
+align> print(name)
+align
+```
+
+インタプリタではありません。入力した各エントリは 1 つの育っていくプログラムに差し込まれ、プログラム全体が本物のコンパイラで再コンパイルされ、本物のネイティブバイナリが実行されます。つまり画面に見えているものは `alignc` が行うことそのものです。`:save file.align` でそのプログラムを書き出し、`:quit`（または Ctrl-D）で終了します。セッションモデルとコマンド一式は [16 章](16-toolchain.md)にあります。
+
 ## Hello, Align
 
 次の内容を `hello.align` として保存します。
