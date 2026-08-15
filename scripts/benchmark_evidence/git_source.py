@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import secrets
 import stat
 import unicodedata
 from dataclasses import dataclass
@@ -22,6 +23,17 @@ from . import git_revision
 
 class SourceError(ValueError):
     """A raw source tree or its materialized representation is invalid."""
+
+
+def _close_fd_pair(root_fd: int, parent_fd: int) -> None:
+    errors: list[OSError] = []
+    for fd in (root_fd, parent_fd):
+        try:
+            os.close(fd)
+        except OSError as exc:
+            errors.append(exc)
+    if errors:
+        raise SourceError("cannot close materialized source descriptors") from errors[0]
 
 
 MAX_SOURCE_FILE_BYTES = git_revision.MAX_OBJECT_BYTES
@@ -44,6 +56,7 @@ class MaterializedSource:
     _name: str
     _root_identity: tuple[int, int]
     _closed: bool = False
+    _removed: bool = False
 
     @property
     def root_fd(self) -> int:
@@ -56,29 +69,56 @@ class MaterializedSource:
 
         if self._closed:
             return
-        errors: list[OSError] = []
-        for fd in (self._root_fd, self._parent_fd):
-            try:
-                os.close(fd)
-            except OSError as exc:
-                errors.append(exc)
-        self._closed = True
-        if errors:
-            raise SourceError("cannot close materialized source descriptors") from errors[0]
+        try:
+            _close_fd_pair(self._root_fd, self._parent_fd)
+        finally:
+            self._closed = True
 
     def remove(self) -> None:
         """Remove only the originally created root after identity checking."""
 
-        if self._closed:
+        if self._removed:
             return
+        root_fd = self._root_fd
+        parent_fd = self._parent_fd
+        reopened = self._closed
+        if reopened:
+            parts = _absolute_components(self.path, "source root")
+            parent_fd = _open_components(parts[:-1])
+            root_fd = -1
+            try:
+                root_fd = os.open(parts[-1], _DIRECTORY_FLAGS, dir_fd=parent_fd)
+                observed = os.fstat(root_fd)
+                if (observed.st_dev, observed.st_ino) != self._root_identity or not stat.S_ISDIR(observed.st_mode):
+                    _error("materialized source root was replaced")
+            except BaseException:
+                if root_fd >= 0:
+                    try:
+                        os.close(root_fd)
+                    except OSError:
+                        pass
+                try:
+                    os.close(parent_fd)
+                except OSError:
+                    pass
+                raise
         failure: BaseException | None = None
         try:
-            current = os.lstat(self._name, dir_fd=self._parent_fd)
+            current = os.lstat(self._name, dir_fd=parent_fd)
             if (current.st_dev, current.st_ino) != self._root_identity or not stat.S_ISDIR(current.st_mode):
                 raise SourceError("materialized source root was replaced")
-            _remove_tree_fd(self._root_fd)
-            os.rmdir(self._name, dir_fd=self._parent_fd)
-            os.fsync(self._parent_fd)
+            tombstone = f".align-source-remove-{os.getpid()}-{secrets.token_hex(16)}"
+            os.rename(self._name, tombstone, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            detached = os.lstat(tombstone, dir_fd=parent_fd)
+            if (detached.st_dev, detached.st_ino) != self._root_identity or not stat.S_ISDIR(detached.st_mode):
+                raise SourceError("materialized source root changed while detaching")
+            _remove_tree_fd(root_fd)
+            current = os.lstat(tombstone, dir_fd=parent_fd)
+            if (current.st_dev, current.st_ino) != self._root_identity or not stat.S_ISDIR(current.st_mode):
+                raise SourceError("materialized source root changed during cleanup")
+            os.rmdir(tombstone, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            self._removed = True
         except SourceError as exc:
             failure = exc
         except OSError as exc:
@@ -86,7 +126,10 @@ class MaterializedSource:
             failure.__cause__ = exc
         finally:
             try:
-                self.close()
+                if reopened:
+                    _close_fd_pair(root_fd, parent_fd)
+                else:
+                    self.close()
             except SourceError as exc:
                 if failure is None:
                     failure = exc
@@ -369,8 +412,16 @@ def _new_source(path: str, snapshot: git_revision.RevisionSnapshot) -> Materiali
     parts = _absolute_components(path, "source root")
     parent_fd = _open_components(parts[:-1])
     name = parts[-1]
+    root_fd = -1
+    created = False
+    created_identity: tuple[int, int] | None = None
     try:
         os.mkdir(name, 0o700, dir_fd=parent_fd)
+        created = True
+        created_stat = os.lstat(name, dir_fd=parent_fd)
+        if not stat.S_ISDIR(created_stat.st_mode):
+            raise SourceError("new source root is not a directory")
+        created_identity = (created_stat.st_dev, created_stat.st_ino)
         root_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
         observed = os.fstat(root_fd)
         if not stat.S_ISDIR(observed.st_mode):
@@ -383,12 +434,31 @@ def _new_source(path: str, snapshot: git_revision.RevisionSnapshot) -> Materiali
             _name=name,
             _root_identity=(observed.st_dev, observed.st_ino),
         )
-    except SourceError:
-        os.close(parent_fd)
+    except BaseException as exc:
+        if root_fd >= 0:
+            try:
+                os.close(root_fd)
+            except OSError:
+                pass
+        if created and created_identity is not None:
+            try:
+                current = os.lstat(name, dir_fd=parent_fd)
+                if (
+                    (current.st_dev, current.st_ino) == created_identity
+                    and stat.S_ISDIR(current.st_mode)
+                ):
+                    os.rmdir(name, dir_fd=parent_fd)
+            except OSError:
+                pass
+        try:
+            os.close(parent_fd)
+        except OSError:
+            pass
+        if isinstance(exc, SourceError):
+            raise
+        if isinstance(exc, OSError):
+            raise SourceError("cannot create the new source root") from exc
         raise
-    except OSError as exc:
-        os.close(parent_fd)
-        raise SourceError("cannot create the new source root") from exc
 
 
 def _close_directory_fds(directory_fds: dict[tuple[bytes, ...], int]) -> None:
@@ -453,14 +523,18 @@ def materialize_source(
         verify_source(reader, snapshot, source, reviewed_symlinks=reviewed_symlinks, _cache=cache)
         return source
     except BaseException as exc:
-        try:
-            _close_directory_fds(directory_fds)
-        except SourceError:
-            pass
+        cleanup_error: BaseException | None = None
         try:
             source.remove()
         except BaseException as cleanup:
-            raise SourceError("source construction failed and cleanup was incomplete") from cleanup
+            cleanup_error = cleanup
+        try:
+            _close_directory_fds(directory_fds)
+        except BaseException as cleanup:
+            if cleanup_error is None:
+                cleanup_error = cleanup
+        if cleanup_error is not None:
+            raise SourceError("source construction failed and cleanup was incomplete") from cleanup_error
         if isinstance(exc, SourceError):
             raise
         if isinstance(exc, OSError):

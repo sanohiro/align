@@ -265,13 +265,66 @@ def test_snapshot_and_cleanup_fail_closed() -> None:
     moved = ROOT / "root-replacement-moved"
     os.rename(destination, moved)
     destination.mkdir()
+    (destination / "replacement-marker").write_text("must survive", encoding="utf-8")
     expect_error(source.remove, "replaced")
-    assert (destination / "replacement-marker").parent.exists()
+    assert (destination / "replacement-marker").read_text(encoding="utf-8") == "must survive"
+    (destination / "replacement-marker").unlink()
     os.rmdir(destination)
     os.rename(moved, destination)
     # The failed removal closed its descriptors and deliberately left the
     # original tree for administrator recovery instead of deleting a swap.
     assert destination.joinpath("src/main.align").read_bytes() == b"main\n"
+
+    explicit = gs.materialize_source(
+        reader,
+        expected,
+        str(ROOT / "explicit-close"),
+        reviewed_symlinks=expected.paths,
+    )
+    explicit.close()
+    explicit.remove()
+    assert not (ROOT / "explicit-close").exists()
+
+    failing_identity = next(identity for identity in expected.paths if identity.path == b"bin/tool-copy")
+
+    class FailingReader:
+        def read(self, oid: str) -> go.VerifiedObject:
+            if oid == failing_identity.oid:
+                raise gr.GitRevisionError("fixture object failure")
+            return reader.read(oid)
+
+    expect_error(
+        lambda: gs.materialize_source(
+            FailingReader(),
+            expected,
+            str(ROOT / "mid-construction-failure"),
+            reviewed_symlinks=expected.paths,
+        ),
+        "cannot read source blob",
+    )
+    assert not (ROOT / "mid-construction-failure").exists()
+
+    original_open = gs.os.open
+
+    def fail_new_root_open(path, flags, *args, **kwargs):
+        if path == "partial-root" and flags == gs._DIRECTORY_FLAGS:
+            raise OSError("fixture root open failure")
+        return original_open(path, flags, *args, **kwargs)
+
+    gs.os.open = fail_new_root_open
+    try:
+        expect_error(
+            lambda: gs.materialize_source(
+                reader,
+                expected,
+                str(ROOT / "partial-root"),
+                reviewed_symlinks=expected.paths,
+            ),
+            "cannot create the new source root",
+        )
+    finally:
+        gs.os.open = original_open
+    assert not (ROOT / "partial-root").exists()
 
 
 test_materialize_and_retain_root()
