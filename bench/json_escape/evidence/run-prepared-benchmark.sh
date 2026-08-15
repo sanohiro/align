@@ -17,6 +17,7 @@ BENCH_DETACHED_TARGET_DIR=""
 BENCH_TMP_DIR=""
 BENCH_ALIGNC_CACHE_DIR=""
 BENCH_ARTIFACT_DIR=""
+BENCH_BOUND_ARTIFACT_DIR=""
 BENCH_CHILD_PID=""
 BENCH_PENDING_SIGNAL=""
 BENCH_WORK_DIR_VALIDATED=0
@@ -24,6 +25,7 @@ BENCH_KEEP_PRIVATE=0
 BENCH_EXPECT_PREPARED=0
 BENCH_PRIVATE_IDENTITY=""
 BENCH_PRIVATE_FD_OPEN=0
+BENCH_ARTIFACT_FD_OPEN=0
 BENCH_CLEANED=0
 
 directory_has_entries() {
@@ -69,6 +71,11 @@ work_dir_contains_only_private() {
   done
 }
 
+work_dir_contains_only_empty_private() {
+  work_dir_contains_only_private || return 1
+  ! directory_has_entries "$BENCH_PRIVATE_DIR"
+}
+
 private_identity_matches() {
   local current_identity
   current_identity="$(directory_identity "$BENCH_PRIVATE_DIR" 2>/dev/null || true)"
@@ -88,35 +95,8 @@ bind_private_directory() {
 }
 
 clear_bound_private_directory() {
-  python3 - <<'PY'
-import os
-import stat
-
-
-def clear(fd):
-    for entry in list(os.scandir(fd)):
-        value = os.stat(entry.name, dir_fd=fd, follow_symlinks=False)
-        if stat.S_ISDIR(value.st_mode):
-            flags = os.O_RDONLY | os.O_DIRECTORY
-            if hasattr(os, "O_CLOEXEC"):
-                flags |= os.O_CLOEXEC
-            if hasattr(os, "O_NOFOLLOW"):
-                flags |= os.O_NOFOLLOW
-            child_fd = os.open(entry.name, flags, dir_fd=fd)
-            try:
-                opened = os.fstat(child_fd)
-                if (value.st_dev, value.st_ino) != (opened.st_dev, opened.st_ino):
-                    raise RuntimeError("directory changed while opening for cleanup")
-                clear(child_fd)
-            finally:
-                os.close(child_fd)
-            os.rmdir(entry.name, dir_fd=fd)
-        else:
-            os.unlink(entry.name, dir_fd=fd)
-
-
-clear(9)
-PY
+  PYTHONDONTWRITEBYTECODE=1 python3 \
+    "$REPO_ROOT/scripts/benchmark_evidence/prepared_tree.py" clear
 }
 
 stop_child_group() {
@@ -200,12 +180,11 @@ cleanup() {
       echo "error: failed to clear the bound benchmark work child" >&2
       cleanup_failed=1
     fi
-    current_identity="$(directory_identity "$BENCH_PRIVATE_DIR" 2>/dev/null || true)"
-    if [[ -z "$BENCH_PRIVATE_IDENTITY" || "$current_identity" != "$BENCH_PRIVATE_IDENTITY" ]]; then
-      echo "error: refusing to remove a replaced benchmark work child" >&2
+    if ! private_identity_matches; then
+      echo "error: benchmark work child was replaced; cleared retained tree only" >&2
       cleanup_failed=1
-    elif ! rmdir "$BENCH_PRIVATE_DIR" || [[ -e "$BENCH_PRIVATE_DIR" || -L "$BENCH_PRIVATE_DIR" ]]; then
-      echo "error: failed to remove the benchmark work child" >&2
+    elif ! work_dir_contains_only_empty_private; then
+      echo "error: cleared benchmark work child is not the sole empty residue" >&2
       cleanup_failed=1
     fi
   fi
@@ -219,6 +198,8 @@ cleanup() {
         echo "error: benchmark work directory does not contain exactly the prepared artifact" >&2
         cleanup_failed=1
       fi
+    elif [[ "$BENCH_PRIVATE_FD_OPEN" -eq 1 ]] && work_dir_contains_only_empty_private; then
+      :
     elif directory_has_entries "$BENCH_WORK_DIR"; then
       echo "error: foreign residue remains in the benchmark work directory" >&2
       cleanup_failed=1
@@ -359,6 +340,17 @@ BENCH_ALIGNC_CACHE_DIR="$BENCH_BOUND_PRIVATE_DIR/alignc-cache"
 BENCH_ARTIFACT_DIR="$BENCH_BOUND_PRIVATE_DIR/artifacts"
 mkdir -p "$BENCH_ROOT_TARGET_DIR" "$BENCH_DETACHED_TARGET_DIR" "$BENCH_TMP_DIR" \
   "$BENCH_ALIGNC_CACHE_DIR" "$BENCH_ARTIFACT_DIR"
+if ! exec 8<"$BENCH_PRIVATE_DIR/artifacts"; then
+  echo "error: cannot retain the prepared artifacts directory" >&2
+  exit 1
+fi
+BENCH_ARTIFACT_FD_OPEN=1
+case "$(uname -s)" in
+  Linux) BENCH_BOUND_ARTIFACT_DIR="/proc/$$/fd/8" ;;
+  Darwin) BENCH_BOUND_ARTIFACT_DIR="$BENCH_PRIVATE_DIR/artifacts" ;;
+  *) echo "error: unsupported native benchmark host" >&2; exit 1 ;;
+esac
+BENCH_ARTIFACT_DIR="$BENCH_BOUND_ARTIFACT_DIR"
 
 build_alignc() {
   cd "$REPO_ROOT"
@@ -378,7 +370,7 @@ emit_kernel() {
   # shellcheck disable=SC2086
   ALIGNC_CACHE="$BENCH_ALIGNC_CACHE_DIR" TMPDIR="$BENCH_TMP_DIR" \
     "$BENCH_ARTIFACT_DIR/alignc" emit-obj "$SCRIPT_DIR/kernel.align" \
-    "$BENCH_ARTIFACT_DIR/kernel.o" --target-cpu native $BENCH_EXPORTS
+    kernel.o --target-cpu native $BENCH_EXPORTS
 }
 
 build_harness() {
@@ -390,44 +382,31 @@ build_harness() {
 
 run_child_group build_alignc
 run_child_group build_runtime
-cp "$BENCH_ROOT_TARGET_DIR/release/alignc" "$BENCH_ARTIFACT_DIR/alignc"
-chmod 755 "$BENCH_ARTIFACT_DIR/alignc"
-
-runtime_source=""
-for candidate in "$BENCH_ROOT_TARGET_DIR/release/libalign_runtime.so" \
-  "$BENCH_ROOT_TARGET_DIR/release/libalign_runtime.dylib"; do
-  if [[ -f "$candidate" && ! -L "$candidate" ]]; then
-    runtime_source="$candidate"
-    break
-  fi
-done
-if [[ -z "$runtime_source" ]]; then
-  echo "error: missing libalign_runtime dynamic library" >&2
-  exit 1
+PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/scripts/benchmark_evidence/prepared_tree.py" \
+  copy --source root-target/release/alignc --destination alignc --mode 0755
+runtime_name="$(PYTHONDONTWRITEBYTECODE=1 python3 \
+  "$REPO_ROOT/scripts/benchmark_evidence/prepared_tree.py" copy-runtime)"
+if [[ "$runtime_name" == *.dylib ]]; then
+  install_name_tool -id "@rpath/$runtime_name" "$BENCH_ARTIFACT_DIR/$runtime_name"
+  PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/scripts/benchmark_evidence/prepared_tree.py" \
+    chmod-artifact --name "$runtime_name" --mode 0755
 fi
-cp "$runtime_source" "$BENCH_ARTIFACT_DIR/${runtime_source##*/}"
-if [[ "$runtime_source" == *.dylib ]]; then
-  install_name_tool -id "@rpath/${runtime_source##*/}" \
-    "$BENCH_ARTIFACT_DIR/${runtime_source##*/}"
-fi
-chmod 755 "$BENCH_ARTIFACT_DIR/${runtime_source##*/}"
 
 run_child_group emit_kernel
-chmod 644 "$BENCH_ARTIFACT_DIR/kernel.o"
+PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/scripts/benchmark_evidence/prepared_tree.py" \
+  copy --source kernel.o --destination kernel.o --mode 0644
 run_child_group build_harness
-cp "$BENCH_DETACHED_TARGET_DIR/release/$BENCH_BINARY" "$BENCH_ARTIFACT_DIR/$BENCH_BINARY"
-chmod 755 "$BENCH_ARTIFACT_DIR/$BENCH_BINARY"
-
-printf '{"schema":"align.json_escape_benchmark_artifacts/v1","benchmark":"%s","target":"native"}\n' \
-  "$BENCH_NAME" > "$BENCH_BOUND_PRIVATE_DIR/configuration.json"
-chmod 644 "$BENCH_BOUND_PRIVATE_DIR/configuration.json"
-rm -rf "$BENCH_ROOT_TARGET_DIR" "$BENCH_DETACHED_TARGET_DIR" "$BENCH_TMP_DIR" \
-  "$BENCH_ALIGNC_CACHE_DIR"
-PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/scripts/benchmark_evidence/manifest.py" \
-  write --root "$BENCH_BOUND_PRIVATE_DIR" --manifest artifact-manifest.json >/dev/null
+PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/scripts/benchmark_evidence/prepared_tree.py" \
+  copy --source "detached-target/release/$BENCH_BINARY" \
+  --destination "$BENCH_BINARY" --mode 0755
+PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/scripts/benchmark_evidence/prepared_tree.py" \
+  write-configuration --benchmark "$BENCH_NAME"
+PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/scripts/benchmark_evidence/prepared_tree.py" \
+  prune root-target detached-target tmp alignc-cache kernel.o
+PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/scripts/benchmark_evidence/prepared_tree.py" \
+  verify-artifacts
 manifest_sha256="$(PYTHONDONTWRITEBYTECODE=1 python3 \
-  "$REPO_ROOT/scripts/benchmark_evidence/manifest.py" verify \
-  --root "$BENCH_BOUND_PRIVATE_DIR" --manifest artifact-manifest.json)"
+  "$REPO_ROOT/scripts/benchmark_evidence/prepared_tree.py" write-manifest)"
 
 if ! work_dir_contains_only_private; then
   echo "error: foreign residue appeared in the benchmark work directory" >&2

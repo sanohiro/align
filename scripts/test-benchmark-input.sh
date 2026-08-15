@@ -44,6 +44,17 @@ assert_empty() {
   fi
 }
 
+assert_cleared_private_child() {
+  [[ -d "$1/prepared" && ! -L "$1/prepared" ]] || fail "missing cleared private child: $1"
+  directory_has_entries "$1/prepared" && fail "cleared private child is not empty: $1"
+  local entry
+  for entry in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+    if [[ ( -e "$entry" || -L "$entry" ) && "$entry" != "$1/prepared" ]]; then
+      fail "foreign entry remains beside cleared private child: $entry"
+    fi
+  done
+}
+
 assert_rejected() {
   local label="$1"
   shift
@@ -188,6 +199,11 @@ elif has_arg build "$@"; then
     printf 'foreign\n' > "$FAKE_WORK_DIR_PHYSICAL/prepared/foreign"
     exit 75
   fi
+  if [[ "${FAKE_SWAP_ARTIFACTS:-0}" == 1 ]]; then
+    mv "$FAKE_WORK_DIR_PHYSICAL/prepared/artifacts" \
+      "$FAKE_WORK_DIR_PHYSICAL/prepared/original-artifacts"
+    ln -s "${FAKE_ARTIFACT_ESCAPE_DIR:?}" "$FAKE_WORK_DIR_PHYSICAL/prepared/artifacts"
+  fi
   if [[ -n "${FAKE_SLEEP:-}" ]]; then
     sleep "$FAKE_SLEEP"
   fi
@@ -209,16 +225,6 @@ fi
 FAKE_CARGO
   chmod 700 "$FAKE_BIN/cargo"
 
-  cat > "$FAKE_BIN/rmdir" <<'FAKE_RMDIR'
-#!/usr/bin/env bash
-set -euo pipefail
-if [[ "${FAKE_RMDIR_MODE:-}" == fail-child && "$*" == *"/prepared"* ]]; then
-  exit 1
-fi
-exec /bin/rmdir "$@"
-FAKE_RMDIR
-  chmod 700 "$FAKE_BIN/rmdir"
-
   cat > "$FAKE_BIN/mkdir" <<'FAKE_MKDIR'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -239,13 +245,24 @@ if [[ "${FAKE_SWAP_BEFORE_BOUND_EXEC:-0}" == 1 && "${1:-}" == */bound_exec.py ]]
   mv "$FAKE_WORK_DIR/prepared" "$FAKE_WORK_DIR/original-prepared-run"
   mv "${FAKE_REPLACEMENT_DIR:?}" "$FAKE_WORK_DIR/prepared"
 fi
+if [[ "${FAKE_PREPARED_TREE_CLEAR_FAIL:-0}" == 1 && \
+      "${1:-}" == */prepared_tree.py && "${2:-}" == clear ]]; then
+  exit 91
+fi
 "$ORIGINAL_PYTHON3" "$@"
 status=$?
-if [[ "$status" -eq 0 && "${FAKE_SWAP_AFTER_VERIFY:-0}" == 1 && \
-      "${1:-}" == */manifest.py && "${2:-}" == verify ]]; then
-  mv "$FAKE_WORK_DIR/prepared" "$FAKE_WORK_DIR/original-prepared-publish"
+if [[ "$status" -eq 0 && "${FAKE_SWAP_AFTER_VERIFY:-0}" == 1 ]]; then
+  if [[ ( "${1:-}" == */manifest.py && "${2:-}" == verify ) || \
+        ( "${1:-}" == */prepared_tree.py && "${2:-}" == write-manifest ) ]]; then
+    mv "$FAKE_WORK_DIR/prepared" "$FAKE_WORK_DIR/original-prepared-publish"
+    mkdir "$FAKE_WORK_DIR/prepared"
+    printf 'foreign\n' > "$FAKE_WORK_DIR/prepared/foreign"
+  fi
+fi
+if [[ "$status" -eq 0 && "${FAKE_SWAP_AFTER_VERIFY_EMPTY:-0}" == 1 && \
+      "${1:-}" == */prepared_tree.py && "${2:-}" == write-manifest ]]; then
+  mv "$FAKE_WORK_DIR/prepared" "$FAKE_WORK_DIR/original-prepared-empty-publish"
   mkdir "$FAKE_WORK_DIR/prepared"
-  printf 'foreign\n' > "$FAKE_WORK_DIR/prepared/foreign"
 fi
 exit "$status"
 FAKE_PYTHON
@@ -493,6 +510,28 @@ benchmark_input_workdir_matrix() {
   [[ -d "$FAKE_WORK_DIR/original-prepared-publish" ]] ||
     fail "post-verification replacement lost the owned directory"
 
+  FAKE_WORK_DIR="$TEST_ROOT/empty-replacement-after-verify-work"
+  mkdir -p "$FAKE_WORK_DIR"
+  if run_benchmark json_decode env FAKE_SWAP_AFTER_VERIFY_EMPTY=1; then
+    fail "empty prepared-directory replacement after verification was accepted"
+  fi
+  [[ -d "$FAKE_WORK_DIR/prepared" ]] || fail "empty replacement was removed"
+  directory_has_entries "$FAKE_WORK_DIR/prepared" && fail "empty replacement gained content"
+  [[ -d "$FAKE_WORK_DIR/original-prepared-empty-publish" ]] ||
+    fail "empty replacement lost the retained owned directory"
+
+  FAKE_WORK_DIR="$TEST_ROOT/replaced-artifacts-work"
+  artifact_escape="$TEST_ROOT/artifact-escape"
+  mkdir -p "$FAKE_WORK_DIR" "$artifact_escape"
+  printf 'caller owned\n' > "$artifact_escape/sentinel"
+  if run_benchmark json_decode env FAKE_SWAP_ARTIFACTS=1 \
+    FAKE_ARTIFACT_ESCAPE_DIR="$artifact_escape"; then
+    fail "prepared artifacts-directory replacement was accepted"
+  fi
+  [[ "$(find "$artifact_escape" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" -eq 1 ]] ||
+    fail "trusted preparation wrote through the replaced artifacts path"
+  [[ -f "$artifact_escape/sentinel" ]] || fail "artifact replacement removed caller data"
+
   FAKE_WORK_DIR="$TEST_ROOT/replaced-before-exec-work"
   replacement_dir="$TEST_ROOT/replacement-prepared"
   mkdir -p "$FAKE_WORK_DIR"
@@ -543,7 +582,7 @@ benchmark_input_workdir_matrix() {
     if kill -0 "$survivor_pid" 2>/dev/null; then
       fail "$bench first root build left its surviving descendant"
     fi
-    assert_empty "$FAKE_WORK_DIR"
+    assert_cleared_private_child "$FAKE_WORK_DIR"
   done
 
   FAKE_WORK_DIR="$TEST_ROOT/foreign-work"
@@ -552,18 +591,19 @@ benchmark_input_workdir_matrix() {
     fail "foreign residue was accepted"
   fi
   [[ -e "$FAKE_WORK_DIR/foreign" ]] || fail "foreign residue was deleted"
-  [[ ! -e "$FAKE_WORK_DIR/prepared" ]] || fail "owned prepared directory survived foreign-residue cleanup"
+  [[ -d "$FAKE_WORK_DIR/prepared" ]] || fail "cleared private child was removed"
+  directory_has_entries "$FAKE_WORK_DIR/prepared" && fail "cleared private child retained artifacts"
 
   FAKE_WORK_DIR="$TEST_ROOT/error-work"
   mkdir -p "$FAKE_WORK_DIR"
   if run_benchmark json_soa env FAKE_FAIL_MODE=detached; then
     fail "detached benchmark failure was accepted"
   fi
-  assert_empty "$FAKE_WORK_DIR"
+  assert_cleared_private_child "$FAKE_WORK_DIR"
 
   FAKE_WORK_DIR="$TEST_ROOT/cleanup-failure-work"
   mkdir -p "$FAKE_WORK_DIR"
-  if run_benchmark json_decode env FAKE_ADD_FOREIGN=1 FAKE_RMDIR_MODE=fail-child; then
+  if run_benchmark json_decode env FAKE_ADD_FOREIGN=1 FAKE_PREPARED_TREE_CLEAR_FAIL=1; then
     fail "cleanup failure was accepted"
   fi
   directory_has_entries "$FAKE_WORK_DIR" || fail "cleanup failure did not preserve evidence of failure"
@@ -612,7 +652,7 @@ benchmark_input_workdir_matrix() {
       fail "$bench signal cleanup left a child-process-group descendant"
     fi
     SIGNAL_DESCENDANT_PID=""
-    assert_empty "$FAKE_WORK_DIR"
+    assert_cleared_private_child "$FAKE_WORK_DIR"
   done
 }
 

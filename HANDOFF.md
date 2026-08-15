@@ -30,8 +30,17 @@ and supply it to every native invocation, keeps accepted Linux preparation write
 private-child descriptor, carries that descriptor into the launcher, and recursively cleans only
 the retained tree before an identity-checked non-recursive public-path removal.
 
-Latest durable verification after the integrated-review repair passed
-`scripts/test-benchmark-evidence-manifest.sh`, `scripts/test-benchmark-input.sh`, and
+The later exact-base review of `d81466f5` against `6adfa13d` found that path-based manifest creation
+could not consume the Linux proc-fd root, intermediate symlinks could still redirect trusted copies,
+and even non-recursive public-path removal retained a check/rmdir race. The final repair uses one
+descriptor-relative prepared-tree helper for copy/config/prune/manifest/cleanup, retains the
+`artifacts` descriptor before untrusted work, and leaves the exact empty owned child for trusted
+outer cleanup after candidate teardown instead of removing its public path in-script.
+
+Latest durable verification after the final-candidate repair passed the serial owner aggregate:
+`scripts/test-benchmark-evidence-manifest.sh`, `scripts/test-benchmark-evidence-bootstrap.sh`,
+`scripts/test-benchmark-evidence-cli.sh`, `scripts/test-benchmark-evidence-git-objects.sh`,
+`scripts/test-benchmark-evidence-git-batch.sh`, `scripts/test-benchmark-input.sh`, and
 `scripts/test-benchmark-evidence-statistics.sh`. Native Apple ARM64 also passed with
 `CARGO_BUILD_JOBS=1`: each of
 `bench/json_decode/run.sh prepare native` plus `run.sh native` and

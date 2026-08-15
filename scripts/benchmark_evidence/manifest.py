@@ -369,10 +369,14 @@ def _iter_tree(
                     child_stat.st_gid,
                 ):
                     raise ManifestError(f"installed directory changed while opening: {path}")
+                try:
+                    observed_mode = _mode("directory", child_stat.st_mode)
+                except ManifestError as exc:
+                    raise ManifestError(f"{exc}: {path}") from exc
                 yield _Observed(
                     path=path,
                     kind="directory",
-                    mode=_mode("directory", child_stat.st_mode),
+                    mode=observed_mode,
                     uid=child_stat.st_uid,
                     gid=child_stat.st_gid,
                     size=0,
@@ -411,10 +415,14 @@ def _iter_tree(
                 after.st_gid,
             ):
                 raise ManifestError(f"installed file changed while being hashed: {path}")
+            try:
+                observed_mode = _mode("file", before.st_mode)
+            except ManifestError as exc:
+                raise ManifestError(f"{exc}: {path}") from exc
             yield _Observed(
                 path=path,
                 kind="file",
-                mode=_mode("file", before.st_mode),
+                mode=observed_mode,
                 uid=before.st_uid,
                 gid=before.st_gid,
                 size=size,
@@ -462,6 +470,19 @@ def build_manifest(root: str, manifest_path: str = "manifest.json") -> dict[str,
 
     manifest_path = _relative_manifest_path(manifest_path)
     root_record, entries = _observed_tree(root, manifest_path)
+    return {
+        "schema": SCHEMA,
+        "manifest_path": manifest_path,
+        "root": root_record,
+        "entries": entries,
+    }
+
+
+def build_manifest_fd(root_fd: int, manifest_path: str = "manifest.json") -> dict[str, Any]:
+    """Observe an already-opened installed root and return its manifest object."""
+
+    manifest_path = _relative_manifest_path(manifest_path)
+    root_record, entries = _observed_tree_fd(root_fd, manifest_path)
     return {
         "schema": SCHEMA,
         "manifest_path": manifest_path,
@@ -627,23 +648,31 @@ def verify_manifest(root: str, manifest_path: str = "manifest.json") -> str:
         os.close(root_fd)
 
 
-def _write_manifest(root: str, path: str) -> str:
+def write_manifest_fd(root_fd: int, path: str = "manifest.json") -> str:
+    """Write a new manifest below an already-opened root."""
+
     path = _relative_manifest_path(path)
-    root = _absolute_directory(root)
-    absolute = os.path.join(root, *path.split("/"))
-    parent = os.path.dirname(absolute)
-    os.makedirs(parent, mode=0o700, exist_ok=True)
-    manifest = build_manifest(root, path)
+    manifest = build_manifest_fd(root_fd, path)
     raw = canonical_bytes(manifest)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    parts = path.split("/")
+    parent_fd = os.dup(root_fd)
+    os.set_inheritable(parent_fd, False)
     try:
-        fd = os.open(absolute, flags, 0o644)
-    except FileExistsError as exc:
-        raise ManifestError("refusing to overwrite an existing manifest") from exc
+        for part in parts[:-1]:
+            child_fd = _open_directory(parent_fd, part)
+            os.close(parent_fd)
+            parent_fd = child_fd
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(parts[-1], flags, 0o644, dir_fd=parent_fd)
+        except FileExistsError as exc:
+            raise ManifestError("refusing to overwrite an existing manifest") from exc
+    finally:
+        os.close(parent_fd)
     try:
         os.fchmod(fd, 0o644)
         written = 0
@@ -658,6 +687,18 @@ def _write_manifest(root: str, path: str) -> str:
     finally:
         os.close(fd)
     return manifest_sha256(raw)
+
+
+def _write_manifest(root: str, path: str) -> str:
+    path = _relative_manifest_path(path)
+    root = _absolute_directory(root)
+    absolute = os.path.join(root, *path.split("/"))
+    os.makedirs(os.path.dirname(absolute), mode=0o700, exist_ok=True)
+    root_fd = _open_root(root)
+    try:
+        return write_manifest_fd(root_fd, path)
+    finally:
+        os.close(root_fd)
 
 
 def _parser() -> argparse.ArgumentParser:

@@ -153,9 +153,11 @@ absent/nonempty/unsafe work dirでrejectさせ、`kernel.o`等すべてをそこ
 benchmark-input sliceでは`ALIGN_BENCH_WORK_DIR`はrequiredで、absolute existing directoryを指しfinal componentは
 symlink不可。physical pathは`/`、repository root、repository内を不可とし、hidden entryを含め開始時empty。
 各scriptは`umask 077`でexact one private childを作り、root/detached Cargo target、`TMPDIR`、kernel object、
-全generated artifactをchild内へ限定する。success/error/signal/interruptでowned childだけをremove。
+全generated artifactをchild内へ限定する。prepare successはsealed childをretainする。error/signal/interruptは
+retained descriptor配下だけをrecursive clearし、empty public childはcontainer/process teardown後にtrusted callerがremove。
 relative/missing/non-directory/final-symlink/root/repository/in-repository/initially-nonempty/cleanup-failure/
-foreign-residueはforeign entryを削除せずrejectし、success cleanup後もcaller-owned empty directoryは残す。
+foreign-residueはforeign entryを削除せずrejectし、script-level failure後はcaller-owned directoryとexact empty owned
+childを残す。outer controllerがcandidate container終了後にrace-freeでremoveする。
 repeated trailing separatorと`/.`でfinal-component symlinkを隠せない。各build/compiler/harness commandは
 own process groupで実行し、interrupt時はcomplete groupへbounded TERM/KILL escalationを行い、private file
 remove前にdirect childをreapする。
@@ -163,7 +165,7 @@ remove前にdirect childをreapする。
 scriptはuntrusted build開始前にprivate childをopenして保持する。accepted Linux pathでは全preparation pathを
 そのdescriptorの`/proc` handle配下にrootし、`prepared`のrename/replacementで後続Cargo/compiler/copy/chmod/
 manifest/cleanupを別treeへredirectできない。cleanupのrecursive removeはretained descriptor配下だけで行い、
-public pathにはretained device/inodeとの再一致後にnon-recursive `rmdir`だけを適用する。macOSはnative ARM
+candidate-side writerとraceし得る間はpublic pathをdeleteしない。macOSはnative ARM
 development qualificationのままでaccepted adversarial evidenceには使わない。
 
 baseline選択前に両protected scriptをclosed two-phase interfaceにする。`run.sh prepare native`が
@@ -454,7 +456,7 @@ bindするprovider CASをreviewed amendmentで導入する。base ruleを弱め�
 | Inner/outer statistic | synthetic odd/even ns sum、half-us tie、middle/outlier/overflow、round-half-up quantization/rendering、10 exact token、1.05 boundary。`benchmark_evidence_statistic_matrix`. |
 | Parser/arithmetic | exact line/row/fieldと全malformed。`benchmark_evidence_parser_ratio_matrix`. |
 | Report/signature | report/merge-verification bidirectional goldenと全field/order/type/width/duplicate/escape/trailing/derived mutation、exact SSHSIG binary/preimage、armor header/footer/LF/base64/wrap/padding、wrong key/namespace/profile/stale。`benchmark_evidence_report_v1_matrix`. |
-| Failure/cleanup | benchmark-input ownerはabsent/relative/missing/non-directory/final-symlink（repeated separatorと`/.` aliasを含む）/root/repository/in-repository/nonempty work root、foreign residue、success/error/signal cleanup、caller entry非削除、TERM-ignoring descendant非残存をcover。evidence ownerは全phase error/timeout/signal/disk/file+dir+parent+reservation fsync/unlock/rename/reservation remove/ordinary remove/signをcover。accepted pathなし。全resourceが消えるか、surviving fail-closed reservationがacceptとlater workを阻止。`benchmark_input_workdir_matrix`; `benchmark_evidence_cleanup_matrix`. |
+| Failure/cleanup | benchmark-input ownerはabsent/relative/missing/non-directory/final-symlink（repeated separatorと`/.` aliasを含む）/root/repository/in-repository/nonempty work root、foreign residue、error/signal後のdescriptor-relative clearing、caller entry非削除、TERM-ignoring descendant非残存をcover。script-level failureはexact empty owned childのみを残し、trusted outer controllerがcontainer/process teardown後にremove。evidence ownerは全phase error/timeout/signal/disk/file+dir+parent+reservation fsync/unlock/rename/reservation remove/ordinary remove/signをcover。accepted pathなし。全resourceが消えるか、surviving fail-closed reservationがacceptとlater workを阻止。`benchmark_input_workdir_matrix`; `benchmark_evidence_cleanup_matrix`. |
 | Concurrent | lockまたはpublication reservation中のsecond runはGit/image/container前fail。lockはmeasurement cleanupとdurable reservation後にreleaseし、accepted publishはreservationをremove+fsync。crash/restart/admin recoveryもfail-closed。`benchmark_evidence_exclusive_run`. |
 | TOCTOU | untrusted work前にpreparation rootをretainし、accepted Linux writeはすべてdescriptor配下。manifest digestはtrusted controller stateでprepare/native phaseを越え、root descriptorはshell/launcher boundaryを越える。manifest traversalもその配下で、executable/runtimeはexec/preload前にfully write-sealed anonymous descriptorへcopy。cleanupのrecursive mutationもretained treeのみ。image/sourceはopened identityを使用またはprivilege boundaryで再検証。root rename/replacement、same-inode artifact write、daemon-image/source swapをreject。`benchmark_input_workdir_matrix`; `benchmark_evidence_bound_object_swap_matrix`. |
 | Forged/stale | unsigned/edit/replay/truncate/concat/wrong namespace、PR/preflight/trusted-review mismatch。`CLEAN`は`clean`のみ、accepted `FINDINGS` + nonempty repair chainは`fixed`のみにmap。`benchmark_evidence_stale_forged_matrix`. |
@@ -510,7 +512,15 @@ ordinary testにしない。native host qualification/final measurementはmanual
 |---|---|
 | phase間でself-consistent treeがprepared stateをreplace可能 | prepareがcanonical manifest SHA-256をprint。trusted controllerがcandidate-writable state外で保持し、全native invocationがrequired inputとして受け、descriptor-relative verificationがartifact open前にdifferent current manifestをreject。 |
 | untrusted prepare childがlater path writeをredirect可能 | first build前にprivate-child descriptorをretain。accepted Linux preparation pathはすべてdescriptorの`/proc` handleを使い、publicationはpublic pathのsame device/inodeを要求。native ARM macOSはdevelopment qualificationのみ。 |
-| cleanup check/path raceがreplacementをrecursive delete可能 | recursive cleanupはretained private-child descriptorだけをwalk/unlink。public pathはdevice/inode再一致後のnon-recursive `rmdir`のみで、nonempty replacementをtraverse/deleteしない。 |
+| cleanup check/path raceがreplacementをrecursive delete可能 | recursive cleanupはretained private-child descriptorだけをwalk/unlink。candidate-side concurrency中はpublic pathをremoveせず、script-level failureのexact empty owned childをteardown後のtrusted outer cleanupへ渡す。 |
+
+## Final-candidate review closure
+
+| Finding | Closure |
+|---|---|
+| Linux proc-fd rootをpath-based manifest creationがreject | manifest moduleがalready-opened root descriptor配下でcanonical manifestをbuild/create/fsync/verify。prepareはdescriptor APIのみをcall。 |
+| intermediate symlinkがtrusted post-build copyをredirect可能 | untrusted work前にrootと`artifacts`両descriptorをretain。dedicated helperがsource全componentをno-follow openし、destinationをretained artifacts descriptor相対でcreate、source stabilityを確認、descriptor-relative pruneを行い、manifest前にpublic `artifacts` entryがretained objectと同一と検証。 |
+| check後`rmdir`がempty replacementをremove可能 | script cleanupはpublic childをremoveしない。retained descriptor配下だけをclearし、exact empty owned childをcandidate teardown後のouter controllerへ渡す。 |
 
 ## Author consistency pass
 
