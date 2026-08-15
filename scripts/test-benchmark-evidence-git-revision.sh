@@ -102,16 +102,18 @@ def test_pure_rejections() -> None:
         def __init__(self, response: bytes):
             self.stdin = io.BytesIO()
             self.stdout = io.BytesIO(response)
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
 
     response = blob_oid.encode("ascii") + b" blob 2\nx\n\n"
     assert gr.GitBatchObjectReader(FakeProcess(response), 2).read(blob_oid).payload == b"x\n"
-    expect_error(
-        lambda: gr.GitBatchObjectReader(
-            FakeProcess(blob_oid.encode("ascii") + b" blob 3\n"),
-            2,
-        ).read(blob_oid),
-        "fixed size bound",
-    )
+    oversized_process = FakeProcess(blob_oid.encode("ascii") + b" blob 3\n")
+    oversized_reader = gr.GitBatchObjectReader(oversized_process, 2)
+    expect_error(lambda: oversized_reader.read(blob_oid), "fixed size bound")
+    assert oversized_process.closed
+    expect_error(lambda: oversized_reader.read(blob_oid), "unusable")
     empty_tree_oid, empty_tree = fake_tree([])
     base_oid, base = fake_commit(empty_tree_oid)
     child_oid, child = fake_commit(empty_tree_oid, (base_oid,))

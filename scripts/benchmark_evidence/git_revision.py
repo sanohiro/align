@@ -234,8 +234,22 @@ class GitBatchObjectReader:
             raise GitRevisionError("Git object bound must be a positive integer")
         self._process = process
         self._max_object_bytes = max_object_bytes
+        self._failed = False
 
     def _response(self, requested: str | None) -> git_objects.VerifiedObject | None:
+        if self._failed:
+            _error("Git batch reader is unusable after a protocol error")
+        try:
+            return self._read_response(requested)
+        except GitRevisionError:
+            self._failed = True
+            try:
+                self._process.close()
+            except git_process.GitProcessError:
+                pass
+            raise
+
+    def _read_response(self, requested: str | None) -> git_objects.VerifiedObject | None:
         header = _read_line(self._process.stdout, "Git batch header")
         if not header.endswith(b"\n"):
             _error("Git batch header has no LF")
