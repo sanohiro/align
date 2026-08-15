@@ -144,7 +144,7 @@ ArtifactProducer = Callable[
     verifier.EvidenceArtifact,
 ]
 ArtifactVerifier = Callable[[verifier.EvidenceArtifact], verifier.VerifiedEvidence]
-Publisher = Callable[[verifier.VerifiedEvidence, str], None]
+Publisher = Callable[[verifier.VerifiedEvidence, verifier.EvidenceArtifact, str], None]
 
 
 @dataclass(frozen=True)
@@ -242,7 +242,6 @@ class Controller:
         run_id: str | None,
         output_dir: str | None,
         reservation_attempted: bool,
-        lease_reservation: bool,
         uncertain: bool,
         error: Exception,
     ) -> ControllerResult:
@@ -253,7 +252,6 @@ class Controller:
                 # reservation phase.  Install the same durable reservation
                 # before dropping the host lock so a later process cannot run.
                 self.lease.create_reservation(run_id, output_dir)
-                lease_reservation = True
             except Exception:
                 fail_closed = True
         try:
@@ -270,7 +268,7 @@ class Controller:
                 # An uncertain child/publication leaves the durable reservation
                 # for administrator recovery.  A known pre-publication failure
                 # may remove an unused reservation and release the lock.
-                self.lease.abort(remove_reservation=not uncertain and not lease_reservation)
+                self.lease.abort(remove_reservation=not uncertain)
             except Exception:
                 fail_closed = True
         return ControllerResult(
@@ -302,6 +300,10 @@ class Controller:
             phases.append("exclusive")
             self.lease.acquire()
             acquired = True
+            phases.append("reserve")
+            reservation_attempted = True
+            self.lease.create_reservation(run_id, invocation.output_dir)
+            lease_reservation = True
 
             for name, gate in self.hooks.gates:
                 phases.append(name)
@@ -367,6 +369,8 @@ class Controller:
             verified = self.hooks.verify_artifact(artifact)
             if not isinstance(verified, verifier.VerifiedEvidence):
                 _error("artifact verifier returned the wrong type")
+            if verified.artifact is not artifact:
+                _error("artifact verifier did not return the checked artifact")
             if (
                 verified.baseline != invocation.baseline
                 or verified.candidate != invocation.candidate
@@ -376,10 +380,6 @@ class Controller:
 
             phases.append("stage")
             transaction.stage_report()
-            phases.append("reserve")
-            reservation_attempted = True
-            self.lease.create_reservation(run_id, invocation.output_dir)
-            lease_reservation = True
             transaction.create_reservation()
             phases.append("unlock")
             self.lease.release_lock_for_publication()
@@ -387,7 +387,7 @@ class Controller:
 
             phases.append("publish")
             uncertain = True
-            self.hooks.publish(verified, invocation.output_dir)
+            self.hooks.publish(verified, verified.artifact, invocation.output_dir)
             transaction.publish_output()
             self.lease.mark_published()
             phases.append("finalize")
@@ -405,8 +405,8 @@ class Controller:
             )
         except Exception as exc:
             uncertain = uncertain or active_child or any(
-                phase in phases for phase in ("reserve", "unlock", "publish", "finalize")
-            )
+                phase in phases for phase in ("unlock", "publish", "finalize")
+            ) or (reservation_attempted and not lease_reservation)
             return self._failure(
                 phases=phases,
                 transaction=transaction,
@@ -414,7 +414,6 @@ class Controller:
                 run_id=run_id,
                 output_dir=invocation.output_dir if isinstance(invocation, cli.RunInvocation) else None,
                 reservation_attempted=reservation_attempted,
-                lease_reservation=lease_reservation,
                 uncertain=uncertain,
                 error=exc,
             )

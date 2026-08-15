@@ -139,6 +139,7 @@ class ReviewAttestation:
 class VerifiedEvidence:
     """The only verifier result the controller may pass to publication."""
 
+    artifact: EvidenceArtifact
     report_sha256: str
     body_sha256: str
     baseline: str
@@ -202,8 +203,50 @@ def _verify_preflight_markers(raw: bytes, *, baseline: str, candidate: str, revi
         f"<!-- align-preflight-review-head:{review['review_head']} -->",
         f"<!-- align-preflight-reviewer:{review['reviewer']} -->",
     )
+    recognized = [line for line in lines if line.startswith("<!-- align-preflight-")]
+    if len(recognized) != len(markers) or set(recognized) != set(markers):
+        _error("PR body contains an unknown or conflicting preflight marker")
     for marker in markers:
         _require_marker(lines, marker)
+
+
+def _verify_review_chain(body: cj.Object, expected: VerifierExpectations) -> None:
+    """Bind clean/fixed review state to the reported first-parent inventory."""
+
+    candidate = body["candidate"]
+    commits = candidate["commits"]
+    commit_ids = [commit["oid"] for commit in commits]
+    if not commit_ids or len(set(commit_ids)) != len(commit_ids):
+        _error("candidate commit inventory must be nonempty and unique")
+    if commit_ids[-1] != expected.candidate:
+        _error("candidate commit inventory does not end at the expected candidate")
+
+    review = body["review"]
+    repair = list(review["repair_commits"])
+    if review["state"] == "clean":
+        if review["review_head"] != expected.candidate or repair:
+            _error("clean review must name the candidate and have no repair commits")
+        return
+
+    if review["review_head"] == expected.candidate or not repair:
+        _error("fixed review must name an ancestor and a nonempty repair chain")
+    if review["review_head"] == expected.baseline:
+        start = -1
+    else:
+        try:
+            start = commit_ids.index(review["review_head"])
+        except ValueError as exc:
+            raise VerificationError("fixed review head is absent from candidate commits") from exc
+    if commit_ids[start + 1 :] != repair:
+        _error("repair commits are not the exact suffix after the reviewed ancestor")
+    by_id = {commit["oid"]: commit for commit in commits}
+    previous = review["review_head"]
+    for oid in repair:
+        if by_id[oid]["parents"] != [previous]:
+            _error("repair commits are not an exact first-parent sequence")
+        previous = oid
+    if previous != expected.candidate:
+        _error("repair chain does not end at the candidate")
 
 
 def _verify_report_bindings(
@@ -219,6 +262,8 @@ def _verify_report_bindings(
     if body["candidate"]["commit_oid"] != expected.candidate:
         _error("report candidate does not match trusted expectations")
     target = body["target"]
+    if target["run_oid"] != expected.baseline:
+        _error("report target run OID does not match the baseline")
     if target["expected_merge_base"] != expected.baseline:
         _error("report target merge base does not match baseline")
     if target["expected_merge_head"] != expected.candidate:
@@ -227,6 +272,7 @@ def _verify_report_bindings(
         _error("report target merge tree does not match candidate tree")
 
     review = body["review"]
+    _verify_review_chain(body, expected)
     if review["review_base"] != expected.baseline:
         _error("report review base does not match baseline")
     if review["review_head"] != expected.candidate and review["state"] == "clean":
@@ -301,6 +347,7 @@ def verify_artifact(
         _error("cryptographic signature check rejected the report")
 
     return VerifiedEvidence(
+        artifact=artifact,
         report_sha256=hashlib.sha256(artifact.report).hexdigest(),
         body_sha256=report["body_sha256"],
         baseline=expected.baseline,

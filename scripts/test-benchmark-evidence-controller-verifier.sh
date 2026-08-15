@@ -27,7 +27,7 @@ B = "a" * 40
 C = "b" * 40
 BASE_TREE = "c" * 40
 CANDIDATE_TREE = "d" * 40
-COMMIT = "e" * 40
+COMMIT = C
 H = "0" * 64
 H1 = "1" * 64
 PROFILE = "2" * 64
@@ -270,28 +270,28 @@ def key_blob():
     return struct.pack(">I", len(algorithm)) + algorithm + struct.pack(">I", len(key)) + key
 
 
-def attestation():
+def attestation(review_commit=C, review_state="clean"):
     return cj.encode(O(
         ("repository", "sanohiro/align"),
         ("pull_request", 7),
         ("review_id", 42),
         ("reviewer", "codex"),
-        ("review_commit", C),
-        ("review_state", "clean"),
+        ("review_commit", review_commit),
+        ("review_state", review_state),
         ("review_log_sha256", H),
         ("submitted_at", "2026-08-15T00:00:01.000000000Z"),
     ))
 
 
-def pr_body():
+def pr_body(review_head=C, review_state="clean"):
     return (
         b"Evidence candidate\n"
         b"<!-- align-preflight-version:1 -->\n"
         + f"<!-- align-preflight-head:{C} -->\n".encode()
         + b"<!-- align-preflight-base-ref:main -->\n"
         + f"<!-- align-preflight-base-sha:{B} -->\n".encode()
-        + b"<!-- align-preflight-review:clean -->\n"
-        + f"<!-- align-preflight-review-head:{C} -->\n".encode()
+        + f"<!-- align-preflight-review:{review_state} -->\n".encode()
+        + f"<!-- align-preflight-review-head:{review_head} -->\n".encode()
         + b"<!-- align-preflight-reviewer:codex -->\n"
     )
 
@@ -347,8 +347,45 @@ rejected("wrong report candidate", lambda: verifier.verify_artifact(
     ),
     lambda _preimage, _signature: True,
 ))
+wrong_target = replace(BODY["target"], "run_oid", C)
+rejected("target run OID drift", lambda: verifier.verify_artifact(
+    verifier.EvidenceArtifact(
+        rs.encode_report(replace(BODY, "target", wrong_target)),
+        SIGNATURE,
+        PR_BODY,
+        ATTESTATION,
+        EXPECTATIONS,
+    ),
+    lambda _preimage, _signature: True,
+))
+wrong_clean_review = replace(BODY["review"], "repair_commits", [C])
+rejected("clean review with repair commits", lambda: verifier.verify_artifact(
+    verifier.EvidenceArtifact(
+        rs.encode_report(replace(BODY, "review", wrong_clean_review)),
+        SIGNATURE,
+        PR_BODY,
+        ATTESTATION,
+        EXPECTATIONS,
+    ),
+    lambda _preimage, _signature: True,
+))
 rejected("wrong PR marker", lambda: verifier.verify_artifact(
     verifier.EvidenceArtifact(REPORT, SIGNATURE, PR_BODY + b"<!-- align-preflight-review:fixed -->\n", ATTESTATION, EXPECTATIONS),
+    lambda _preimage, _signature: True,
+))
+conflicting_pr_body = PR_BODY + b"<!-- align-preflight-review:fixed -->\n"
+conflicting_expectations = verifier.VerifierExpectations(
+    repository=EXPECTATIONS.repository,
+    pull_request=EXPECTATIONS.pull_request,
+    profile_sha256=EXPECTATIONS.profile_sha256,
+    baseline=EXPECTATIONS.baseline,
+    candidate=EXPECTATIONS.candidate,
+    pr_body_sha256=hashlib.sha256(conflicting_pr_body).hexdigest(),
+    review_attestation_sha256=EXPECTATIONS.review_attestation_sha256,
+    public_key_blob=EXPECTATIONS.public_key_blob,
+)
+rejected("conflicting PR marker with trusted digest", lambda: verifier.verify_artifact(
+    verifier.EvidenceArtifact(REPORT, SIGNATURE, conflicting_pr_body, ATTESTATION, conflicting_expectations),
     lambda _preimage, _signature: True,
 ))
 rejected("wrong review signature namespace", lambda: verifier.verify_artifact(
@@ -388,6 +425,51 @@ rejected("review attestation digest binding", lambda: verifier.verify_artifact(
     verifier.EvidenceArtifact(REPORT, SIGNATURE, PR_BODY, cj.encode(bad_attestation), EXPECTATIONS),
     lambda _preimage, _signature: True,
 ))
+
+FIXED_HEAD = "f" * 40
+fixed_commits = [
+    O(("oid", FIXED_HEAD), ("raw_sha256", H), ("tree_oid", CANDIDATE_TREE), ("parents", [B])),
+    O(("oid", C), ("raw_sha256", H1), ("tree_oid", CANDIDATE_TREE), ("parents", [FIXED_HEAD])),
+]
+fixed_candidate = replace(
+    replace(BODY["candidate"], "parents", [FIXED_HEAD]),
+    "commits",
+    fixed_commits,
+)
+fixed_review = replace(
+    replace(
+        replace(BODY["review"], "review_head", FIXED_HEAD),
+        "state",
+        "fixed",
+    ),
+    "repair_commits",
+    [C],
+)
+fixed_body = replace(replace(BODY, "candidate", fixed_candidate), "review", fixed_review)
+FIXED_ATTESTATION = attestation(FIXED_HEAD, "fixed")
+FIXED_PR_BODY = pr_body(FIXED_HEAD, "fixed")
+FIXED_EXPECTATIONS = verifier.VerifierExpectations(
+    repository="sanohiro/align",
+    pull_request=7,
+    profile_sha256=PROFILE,
+    baseline=B,
+    candidate=C,
+    pr_body_sha256=hashlib.sha256(FIXED_PR_BODY).hexdigest(),
+    review_attestation_sha256=hashlib.sha256(FIXED_ATTESTATION).hexdigest(),
+    public_key_blob=key_blob(),
+)
+fixed_verified = verifier.verify_artifact(
+    verifier.EvidenceArtifact(
+        rs.encode_report(fixed_body),
+        SIGNATURE,
+        FIXED_PR_BODY,
+        FIXED_ATTESTATION,
+        FIXED_EXPECTATIONS,
+    ),
+    lambda _preimage, _signature: True,
+)
+assert fixed_verified.review_state == "fixed"
+assert fixed_verified.artifact.review_attestation == FIXED_ATTESTATION
 
 
 class FixtureLease:
@@ -458,6 +540,7 @@ CONFIG = controller.ControllerConfig(
     image_digest="sha256:" + H,
 )
 FAKE_VERIFIED = verifier.VerifiedEvidence(
+    artifact=ARTIFACT,
     report_sha256=H,
     body_sha256=H,
     baseline=B,
@@ -528,9 +611,11 @@ def make_hooks(
         events.append("verify")
         if fail_verify:
             raise verifier.VerificationError("fixture verifier rejected")
+        assert artifact is ARTIFACT
         return FAKE_VERIFIED
 
-    def publish(verified_value, output_dir):
+    def publish(verified_value, artifact, output_dir):
+        assert verified_value.artifact is artifact
         events.append("publish")
         if fail_publish:
             raise controller.ControllerError("fixture publication failed")
@@ -555,8 +640,8 @@ assert result.error is None
 assert result.cleanup.accepted
 assert result.cleanup.fail_closed is False
 assert result.phases == (
-    "exclusive", "bootstrap", "host", "image", "source", "review", "schedule",
-    "manifests", "report", "verify", "stage", "reserve", "unlock", "publish",
+    "exclusive", "reserve", "bootstrap", "host", "image", "source", "review", "schedule",
+    "manifests", "report", "verify", "stage", "unlock", "publish",
     "finalize", "accepted",
 )
 assert lease.events == ["acquire", "reserve", "release", "mark", "finalize"]
@@ -569,7 +654,7 @@ lease = FixtureLease()
 result = controller.Controller(CONFIG, hooks, lease).run(invocation())
 assert result.state == "rejected"
 assert not result.cleanup.fail_closed
-assert result.phases == ("exclusive", "bootstrap", "host")
+assert result.phases == ("exclusive", "reserve", "bootstrap", "host")
 assert "image" not in events and not lease.reserved
 
 hooks, events = make_hooks(fail_child=0)

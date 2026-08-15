@@ -38,11 +38,11 @@ controller は provider API/credential を使わない。通常の GitHub public
 | Public merge verifier | `/opt/align-evidence/v1/bin/align-json-escape-evidence verify-merge --repository REPO --report REPORT --signature SIGNATURE --merge MERGE --output-dir NEW_DIR`。provider response exact object fetch後、reportを再verify、raw-object pathで`MERGE`を読み、local target first-parent chain、parents/treeを照合しexact `merge-verification.json`/`merge-verification.json.sig`を出力。`NEW_DIR`不存在、overrideなし。 |
 | Trusted review adapter | trusted-base CIだけがevent repo/PRのGitHub review APIをjob tokenでquery。PR author、write roleなし、dismissed/stale/duplicate/wrong commit、exact report `log_sha256`なしをreject。canonical `REVIEW_ATTESTATION`をcheckout外で作りverifierへ渡す。token/raw responseはcontroller/candidate/report/container/PR argumentへ渡さない。 |
 | Ambient state | semantic default なし。empty environment に fixed `PATH`, `LC_ALL=C`, `TZ=UTC`, empty `HOME`, `CARGO_NET_OFFLINE=true` と controller-created descriptor/config だけを置く。ambient Git/Cargo/Rust/Docker/locale/proxy/credential/target/tuning は渡さない。 |
-| Result | successはlock中にprivate report/signature/directoryをfsync、profile-global publication reservationをcreate/fsync、unlock、`NEW_DIR`へatomic rename、parent fsync、reservation remove/fsync、path出力。reservation中のsecond invocationはrepository/image/container前reject。threshold failureも同sequence。failureはstaging/output/reservationを削除しpathなし。crash/cleanup failureはreservationをfail-closedで残しadmin recovery。 |
+| Result | successはexclusive lockを取得し、repository/image/container/child work前にprofile-global publication reservationをcreate/fsyncする。その後lock中にprivate `report.json`/signature/directoryをfsyncし、unlock、`NEW_DIR`へatomic rename、parent fsync、reservation remove/fsync、path出力を行う。reservationはpre-publication crashでも残りadmin recoveryに渡る。reservation中のsecond invocationはrepository/image/container前reject。threshold failureも同sequence。failureはstaging/output/reservationを可能な限り削除しpathなし、uncertain cleanupはreservationをfail-closedで残す。 |
 | Controller owner | checked-in Python 3 controller、root-owned installed launcher、`scripts/` と `tests/benchmark_evidence/` の fixture tests。installed/source relation、installer manifest、interpreter、Git、Docker client/daemon、`ssh-keygen`、kernel、OCI image、host profile、executable SHA-256 をすべて記録する。candidate file は evidence root にならない。 |
 | Persisted format | canonical UTF-8 JSON `align.json_escape_benchmark_evidence/v1` と `align.json_escape_benchmark_merge_verification/v1`。それぞれhost Ed25519 keyとfixed namespaceでbyte-for-byte署名。unknown/missing/duplicate/reordered/non-ASCII key、non-integer/float、invalid UTF-8/escape、trailing/noncanonical bytesはreject。 |
 | Ownership/allocation | controller が temp dir、pipe、child、container、capture、report staging、cleanup を所有。benchmark child は stdin `/dev/null`、private stdout/stderr のみ。capture ceiling は profile 固定。report/signature/repository administration/controller/Docker socket/signing key/other revision writable dir は child に渡さない。 |
-| Concurrency | repository inspection前からsigning/cleanupまでhost-global lock。unlock前にprofile-global publication reservationをinstallし、publication完了までlater invocationはrepository/image/container work前にreject。baseline/candidate overlapなし。 |
+| Concurrency | repository inspectionまたはmutable child work前にhost-global lockとprofile-global publication reservationを取得し、signing/cleanupまでlockを保持する。reservationがdurableになる前にunlockしない。publication完了までlater invocationはrepository/image/container work前にreject。baseline/candidate overlapなし。 |
 | Prerequisites | benchmark-input slice、Request 7 の両 language prerequisite、本 design、evidence implementation、pinned image、host profile/public key、adversarial owner が merge 後にのみ `BASE` を選ぶ。`BASE` は当時の target tip かつ最初の Request 7 commit の exact parent。 |
 | Acceptance | valid signature、`pass`、exact PR/preflight/trusted-review binding、unchanged target base at merge、final fetched targetからmergeがreachableであるsigned merge artifact、identical protected input、5 field各10 sample、全ratio `<=1.05`。 |
 
@@ -368,9 +368,10 @@ benchmark順はdecode/soa、各preparation B/C、warmup B/C、pair 1..10 balance
 sortedはnondecreasing exact permutation。ratio numerator/denominatorはcandidate/baseline middle sum。
 
 cleanup countはzero、bool true。host lock保持中にsign/private staging fsync後、profile-fixed root-owned
-publication reservationをno-follow exclusive create・fsync。unlock後atomic rename・output parent fsync・reservation
-remove・reservation directory fsync後だけpathをprint。reservation存在中のlater invocationはrepository前reject。
-failureはstateを削除し、surviving reservationはoutputをunacceptedとしadmin recoveryまでfuture runをblock。
+publication reservationはchild work前にno-follow exclusive create・fsyncし、run/output identityを記録する。signing後に
+unlock、atomic rename・output parent fsync・reservation remove・reservation directory fsync後だけpathをprintする。
+reservation存在中のlater invocationはrepository前reject。failureはstateを削除し、surviving reservationはoutputを
+unacceptedとしadmin recoveryまでfuture runをblock。
 reservation removalはalready-signed measurement cleanup外のpublication postconditionで、成功までaccepted pathなし。
 `first_failed_field`はpassでempty、regressionで最初の
 false field。conditional/omitted memberなし。
@@ -424,7 +425,7 @@ namespace `align-json-escape-benchmark-merge-verification-v1`で署名。report/
 `merge_oid=MERGE`、`target_oid`はfetched target tipでmergeをfirst-parent chainに含み、parentsはbaseline/
 candidate、treeはreportのexpected tree。全relationship後に
 raw merge-object SHA-256を記録。golden/mutation/wrong parent/tree/ref/stale/swap ownerを持つ。
-同host lockをinspection前に取得し、private stage→file/dir fsync→durable publication reservation→unlock→
+同host lockとdurable publication reservationをchild work前に取得し、private stage→file/dir fsync→unlock→
 atomic rename→parent fsync→reservation remove/directory fsync→path publicationの同sequenceを使う。
 surviving reservationがあればoutputはunacceptedでlater workをblock。
 
@@ -512,12 +513,12 @@ integration、final Request 7 measurementは後続のnamed evidenceとする。
 | Axis | Closure / owner |
 |---|---|
 | Trusted bootstrap and invocation | run controllerはparsed済みの`cli.RunInvocation`だけをconsumeし、verifier portはparsed済みの`cli.VerifyInvocation`に対応するexplicit bytesをconsumeする。両方をfixed profile/tool identityへbindし、installed manifest、profile digest、target ref、OID、path、ambient selectorの不一致をgate/child前にrejectする。path resolutionは後続のtrusted adapterが所有する。`benchmark_evidence_controller_verifier_matrix`. |
-| Preflight gate ordering | immutable bootstrap、trusted host/image/source/review gateを宣言順に実行し、完了phaseを記録する。gate failureは次のgate前に停止し、child、report、signature、staging output、publication reservationを作らない。`benchmark_evidence_controller_verifier_matrix`. |
+| Preflight gate ordering | exclusive lockとdurable profile-global reservationを取得してからimmutable bootstrapを行い、trusted host/image/source/review gateを宣言順に実行し、完了phaseを記録する。gate failureは次のgate前に停止し、child、report、signature、staging outputを作らない。known pre-child cleanupはunused reservationをremoveし、uncertain cleanupはfail-closedで残す。`benchmark_evidence_controller_verifier_matrix`. |
 | Schedule/executor handoff | 既存の`ScheduleState`をfixture executorでdriveする。fixed preparation、warm-up、alternating sampleは各一回、unique child ID、sealed artifact digestを持ち、次child前にowned-resource ledgerからremoveする。overlap、reorder、retry、measurement中のbuild、artifact drift、timeout、signal、nonzero、incomplete scheduleはrejectする。`benchmark_evidence_controller_verifier_matrix`. |
 | Cleanup/publication ordering | 既存の`CleanupTransaction`をdriveし、report staging前にchildren/containers/mounts/fds/private directoriesがゼロでsource/cache manifestがunchangedであることを要求する。durable reservationをlock releaseより前、publicationをreservation removalより前に置く。publish、unlock、cleanupのfailureはaccepted resultを出さず、ownershipが不明ならfail-closed reservationを残す。`benchmark_evidence_controller_verifier_matrix`. |
-| Report/signature handoff | scheduleとcleanup完了後にtrusted fixture-owned producerから得たreport bytes/signature bytesだけを受け入れる。controllerはcandidate-provided reportを受け付けず、candidate moduleをopenせず、verifierがexact bytesを受け入れる前にpublishできない。`benchmark_evidence_controller_verifier_matrix`. |
-| Verifier binding | canonical reportをdecodeし、既存report schemaとbody digestを全検証する。profile/baseline/candidate/target/review fieldをexplicit trusted expectationへbindし、exact review attestationとPR-body preflight markerをparseし、fixed report namespace/keyに対するinjected cryptographic signature checkを要求する。wrong bytes、namespace、key、signature、attestation、PR marker、verdict、expected OIDはrepository/build/benchmark/network/output mutationなしにrejectする。`benchmark_evidence_controller_verifier_matrix`. |
-| Failure and restart | exceptionは必ずterminal rejectedまたはfail-closed resultになる。durable reservationがある間はsecond invocationをblockし、accepted stateはreport/signature pairをdurably publishしてreservationをremoveした後だけ到達できる。crash/restartとcleanup failureでもpartial stateをaccepted evidenceへ変えない。`benchmark_evidence_controller_verifier_matrix`. |
+| Report/signature handoff | scheduleとcleanup完了後にtrusted fixture-owned producerから得たreport bytes/signature bytesだけを受け入れる。verifierは実際にcheckしたimmutable artifactをresultへ返し、publicationはそのexact artifactを受け取る。controllerはcandidate-provided reportを受け付けず、candidate moduleをopenせず、別bytesをpublishできない。`benchmark_evidence_controller_verifier_matrix`. |
+| Verifier binding | canonical reportをdecodeし、既存report schemaとbody digestを全検証する。profile/baseline/candidate/target/review fieldをexplicit trusted expectationへbindし、`target.run_oid == BASE`、clean/fixed review-chain semantics、各candidate commit parent、recognized PR-body preflight markerのexact one valueを検証し、fixed report namespace/keyに対するinjected cryptographic signature checkを要求する。wrong bytes、namespace、key、signature、attestation、repair chain、marker、verdict、expected OIDはrepository/build/benchmark/network/output mutationなしにrejectする。`benchmark_evidence_controller_verifier_matrix`. |
+| Failure and restart | exceptionは必ずterminal rejectedまたはfail-closed resultになる。durable reservationはgate/child前にinstallし、unlock後とpublication settleまで保持してsecond invocationをblockする。accepted stateはcomplete report/signature pairをdurably publishしreservationをremoveした後だけ到達できる。crash/restartとcleanup failureでもpartial stateをaccepted evidenceへ変えない。`benchmark_evidence_controller_verifier_matrix`. |
 | Explicit deferrals | real host inspection、Docker daemon/image execution、GitHub review API/token isolation、`ssh-keygen`/Ed25519 signing、raw Git revision construction、providerとのmerge verification、post-merge lifecycle advanceは後続capabilityとし、このcoreで偽装しない。`benchmark_evidence_controller_verifier_matrix`. |
 
 controller/verifier ownerはaccepted Request 7 evidenceではなくorchestration boundaryである。既存producerを順序外で
