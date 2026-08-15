@@ -248,10 +248,20 @@ marker_count="$(grep -Ec '^ALIGN_REVIEW_VERDICT=(CLEAN|FINDINGS)$' "$native_resu
 if [[ "$marker_count" -eq 0 ]]; then
   if grep -Eq '^- \[P[0-3]\]' "$native_result"; then
     printf 'ALIGN_REVIEW_VERDICT=FINDINGS\n' | tee -a "$output"
-  elif grep -Fqx 'No findings.' "$native_result" ||
-    grep -Fqx 'Read-only inspection found no actionable soundness or regression risks in the diff.' "$native_result" ||
-    grep -Eq '^No actionable soundness or regression (issues|risks) were found in the inspected diff\.$' "$native_result" ||
-    grep -Fqx 'No actionable issues were found in the changed files.' "$native_result"
+  elif awk '
+    BEGIN { accepted = 0; invalid = 0 }
+    /^[[:space:]]*$/ { next }
+    $0 == "No findings." ||
+    $0 == "Read-only inspection found no actionable soundness or regression risks in the diff." ||
+    $0 ~ /^No actionable soundness or regression (issues|risks) were found in the inspected diff[.]$/ ||
+    $0 == "No actionable issues were found in the changed files." ||
+    $0 ~ /^[A-Z][[:print:]]* without introducing an actionable (soundness or regression )?(risk|risks|issue|issues|regression)[.]$/ {
+      accepted = 1
+      next
+    }
+    { invalid = 1 }
+    END { exit !(accepted && !invalid) }
+  ' "$native_result"
   then
     printf 'ALIGN_REVIEW_VERDICT=CLEAN\n' | tee -a "$output"
   else
