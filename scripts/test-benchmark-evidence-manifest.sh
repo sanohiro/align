@@ -35,10 +35,38 @@ chmod 644 "$tree/lib/private/data"
 digest="$(python3 "$MANIFEST_TOOL" write --root "$tree")"
 [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || fail "write did not return a SHA-256"
 [[ "$(python3 "$MANIFEST_TOOL" verify --root "$tree")" == "$digest" ]] || fail "fresh tree did not verify"
+[[ "$(python3 -c 'import os,sys; print(format(os.stat(sys.argv[1]).st_mode & 0o777, "o"))' "$tree/manifest.json")" == 644 ]] ||
+  fail "manifest mode is not 0644"
 [[ "$(sha256sum "$tree/manifest.json" | cut -d' ' -f1)" == "$digest" ]] || fail "manifest digest mismatch"
 tail -c 1 "$tree/manifest.json" | od -An -t x1 | grep -q '0a' || fail "manifest lacks final LF"
 grep -q '"schema":"align.json_escape_benchmark_install_manifest/v1"' "$tree/manifest.json" || fail "schema is not canonical"
 assert_rejected "manifest overwrite" python3 "$MANIFEST_TOOL" write --root "$tree"
+
+fd_tree="$TEST_ROOT/fd-root"
+fd_tree_moved="$TEST_ROOT/fd-root-moved"
+mkdir -m 700 "$fd_tree"
+printf 'bound root\n' > "$fd_tree/payload"
+chmod 644 "$fd_tree/payload"
+python3 "$MANIFEST_TOOL" write --root "$fd_tree" >/dev/null
+PYTHONDONTWRITEBYTECODE=1 python3 - "$fd_tree" "$fd_tree_moved" <<'PY'
+import os
+import sys
+
+from scripts.benchmark_evidence import manifest
+
+root, moved = sys.argv[1:]
+root_fd = manifest._open_root(root)
+os.rename(root, moved)
+os.mkdir(root, 0o700)
+try:
+    manifest.verify_manifest_fd(root_fd)
+finally:
+    os.close(root_fd)
+PY
+
+chmod 600 "$tree/manifest.json"
+assert_rejected "changed manifest mode" python3 "$MANIFEST_TOOL" verify --root "$tree"
+chmod 644 "$tree/manifest.json"
 
 good_manifest="$TEST_ROOT/manifest.good"
 cp "$tree/manifest.json" "$good_manifest"

@@ -4,11 +4,15 @@
 //! The workload touches 2 of 4 fields. Align lands the data column-major and the scan reads only the
 //! `active` + `pay` columns; Rust's `serde` deserializes every field into a `Vec<Row>` (AoS) and the
 //! filter drags whole 4-field records through cache. Both sides parse the SAME runtime-generated
-//! JSON (not a constant, so nothing folds). Rounds alternate and we take the min (the standard trap:
-//! never time all of A then all of B over a >cache working set — see `bench/README.md`).
+//! JSON (not a constant, so nothing folds). Rounds alternate and we take the exact integer median.
 
 use serde::Deserialize;
 use std::time::Instant;
+
+#[path = "../../json_escape/evidence/statistics.rs"]
+mod statistics;
+
+use statistics::{elapsed_nanoseconds, median_microseconds, milliseconds_token};
 
 /// Align passes a `str` as a `{ ptr, len }` value (SysV two-register), matching this `repr(C)`.
 #[repr(C)]
@@ -75,7 +79,9 @@ fn gen_json(n: usize) -> (String, i64) {
     let mut expected: i64 = 0;
     s.push('[');
     for i in 0..n {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let pay = ((state >> 33) % 1000) as i64;
         let score = ((state >> 20) % 500) as i64;
         let active = (state >> 40) & 1 == 0;
@@ -86,7 +92,11 @@ fn gen_json(n: usize) -> (String, i64) {
             s.push(',');
         }
         // `write!` straight into the buffer — avoids a temporary `String` alloc per record.
-        write!(s, "{{\"active\":{active},\"pay\":{pay},\"score\":{score},\"extra\":{i}}}").unwrap();
+        write!(
+            s,
+            "{{\"active\":{active},\"pay\":{pay},\"score\":{score},\"extra\":{i}}}"
+        )
+        .unwrap();
     }
     s.push(']');
     (s, expected)
@@ -99,79 +109,214 @@ fn main() {
     println!("JSON decode + where(.active).pay.sum() — Align soa / Align AoS / Align proj (narrow soa) vs serde_json");
     println!(
         "{:>9}  {:>8}  {:>9}  {:>9}  {:>9}  {:>9}  {:>8}  {:>8}  {:>9}",
-        "records", "json KB", "soa ms", "aos ms", "proj ms", "rust ms", "soa/rust", "aos/rust", "proj/rustP"
+        "records",
+        "json KB",
+        "soa ms",
+        "aos ms",
+        "proj ms",
+        "rust ms",
+        "soa/rust",
+        "aos/rust",
+        "proj/rustP"
     );
     for &n in &sizes {
         let (json, expected) = gen_json(n);
-        let astr = AlignStr { ptr: json.as_ptr(), len: json.len() as i64 };
+        let astr = AlignStr {
+            ptr: json.as_ptr(),
+            len: json.len() as i64,
+        };
 
         // Correctness: all four must agree with the generator before we trust the timing (the
         // projection variant reads the same two fields, so it must produce the same sum).
-        assert_eq!(unsafe { agg(AlignStr { ptr: astr.ptr, len: astr.len }) }, expected, "align soa wrong");
-        assert_eq!(unsafe { agg_aos(AlignStr { ptr: astr.ptr, len: astr.len }) }, expected, "align aos wrong");
-        assert_eq!(unsafe { agg_proj(AlignStr { ptr: astr.ptr, len: astr.len }) }, expected, "align proj wrong");
+        assert_eq!(
+            unsafe {
+                agg(AlignStr {
+                    ptr: astr.ptr,
+                    len: astr.len,
+                })
+            },
+            expected,
+            "align soa wrong"
+        );
+        assert_eq!(
+            unsafe {
+                agg_aos(AlignStr {
+                    ptr: astr.ptr,
+                    len: astr.len,
+                })
+            },
+            expected,
+            "align aos wrong"
+        );
+        assert_eq!(
+            unsafe {
+                agg_proj(AlignStr {
+                    ptr: astr.ptr,
+                    len: astr.len,
+                })
+            },
+            expected,
+            "align proj wrong"
+        );
         assert_eq!(rust_agg(&json), expected, "rust wrong");
         assert_eq!(rust_agg_proj(&json), expected, "rust proj wrong");
 
-        let (mut soa_min, mut aos_min, mut proj_min, mut rust_min, mut rustp_min) =
-            (f64::MAX, f64::MAX, f64::MAX, f64::MAX, f64::MAX);
+        let (mut soa_ns, mut aos_ns, mut proj_ns, mut rust_ns, mut rustp_ns) = (
+            Vec::with_capacity(rounds),
+            Vec::with_capacity(rounds),
+            Vec::with_capacity(rounds),
+            Vec::with_capacity(rounds),
+            Vec::with_capacity(rounds),
+        );
         for _ in 0..rounds {
             let t = Instant::now();
-            std::hint::black_box(unsafe { agg(AlignStr { ptr: astr.ptr, len: astr.len }) });
-            soa_min = soa_min.min(t.elapsed().as_secs_f64() * 1e3);
+            std::hint::black_box(unsafe {
+                agg(AlignStr {
+                    ptr: astr.ptr,
+                    len: astr.len,
+                })
+            });
+            soa_ns.push(elapsed_nanoseconds(t.elapsed()).expect("soa duration overflow"));
 
             let t = Instant::now();
-            std::hint::black_box(unsafe { agg_aos(AlignStr { ptr: astr.ptr, len: astr.len }) });
-            aos_min = aos_min.min(t.elapsed().as_secs_f64() * 1e3);
+            std::hint::black_box(unsafe {
+                agg_aos(AlignStr {
+                    ptr: astr.ptr,
+                    len: astr.len,
+                })
+            });
+            aos_ns.push(elapsed_nanoseconds(t.elapsed()).expect("aos duration overflow"));
 
             let t = Instant::now();
-            std::hint::black_box(unsafe { agg_proj(AlignStr { ptr: astr.ptr, len: astr.len }) });
-            proj_min = proj_min.min(t.elapsed().as_secs_f64() * 1e3);
+            std::hint::black_box(unsafe {
+                agg_proj(AlignStr {
+                    ptr: astr.ptr,
+                    len: astr.len,
+                })
+            });
+            proj_ns.push(elapsed_nanoseconds(t.elapsed()).expect("projection duration overflow"));
 
             let t = Instant::now();
             std::hint::black_box(rust_agg(&json));
-            rust_min = rust_min.min(t.elapsed().as_secs_f64() * 1e3);
+            rust_ns.push(elapsed_nanoseconds(t.elapsed()).expect("Rust duration overflow"));
 
             let t = Instant::now();
             std::hint::black_box(rust_agg_proj(&json));
-            rustp_min = rustp_min.min(t.elapsed().as_secs_f64() * 1e3);
+            rustp_ns
+                .push(elapsed_nanoseconds(t.elapsed()).expect("Rust projection duration overflow"));
         }
+        let soa = median_microseconds(&mut soa_ns).expect("soa median overflow");
+        let aos = median_microseconds(&mut aos_ns).expect("aos median overflow");
+        let proj = median_microseconds(&mut proj_ns).expect("projection median overflow");
+        let rust = median_microseconds(&mut rust_ns).expect("Rust median overflow");
+        let rustp = median_microseconds(&mut rustp_ns).expect("Rust projection median overflow");
         println!(
-            "{:>9}  {:>8}  {:>9.3}  {:>9.3}  {:>9.3}  {:>9.3}  {:>7.2}x  {:>7.2}x  {:>8.2}x",
+            "{:>9}  {:>8}  {:>9}  {:>9}  {:>9}  {:>9}  {:>7.2}x  {:>7.2}x  {:>8.2}x",
             n,
             json.len() / 1024,
-            soa_min,
-            aos_min,
-            proj_min,
-            rust_min,
-            rust_min / soa_min,
-            rust_min / aos_min,
-            rustp_min / proj_min
+            milliseconds_token(soa),
+            milliseconds_token(aos),
+            milliseconds_token(proj),
+            milliseconds_token(rust),
+            rust as f64 / soa as f64,
+            rust as f64 / aos as f64,
+            rustp as f64 / proj as f64
         );
 
         if profile && n == 1_000_000 {
-            assert_eq!(unsafe { agg_len(AlignStr { ptr: astr.ptr, len: astr.len }) }, n as i64, "align soa len wrong");
-            assert_eq!(unsafe { agg_aos_len(AlignStr { ptr: astr.ptr, len: astr.len }) }, n as i64, "align aos len wrong");
-            assert_eq!(unsafe { agg_proj_len(AlignStr { ptr: astr.ptr, len: astr.len }) }, n as i64, "align proj len wrong");
-            let (mut soa_len_min, mut aos_len_min, mut proj_len_min) = (f64::MAX, f64::MAX, f64::MAX);
+            assert_eq!(
+                unsafe {
+                    agg_len(AlignStr {
+                        ptr: astr.ptr,
+                        len: astr.len,
+                    })
+                },
+                n as i64,
+                "align soa len wrong"
+            );
+            assert_eq!(
+                unsafe {
+                    agg_aos_len(AlignStr {
+                        ptr: astr.ptr,
+                        len: astr.len,
+                    })
+                },
+                n as i64,
+                "align aos len wrong"
+            );
+            assert_eq!(
+                unsafe {
+                    agg_proj_len(AlignStr {
+                        ptr: astr.ptr,
+                        len: astr.len,
+                    })
+                },
+                n as i64,
+                "align proj len wrong"
+            );
+            let (mut soa_len_ns, mut aos_len_ns, mut proj_len_ns) = (
+                Vec::with_capacity(rounds),
+                Vec::with_capacity(rounds),
+                Vec::with_capacity(rounds),
+            );
             for _ in 0..rounds {
                 let t = Instant::now();
-                std::hint::black_box(unsafe { agg_len(AlignStr { ptr: astr.ptr, len: astr.len }) });
-                soa_len_min = soa_len_min.min(t.elapsed().as_secs_f64() * 1e3);
+                std::hint::black_box(unsafe {
+                    agg_len(AlignStr {
+                        ptr: astr.ptr,
+                        len: astr.len,
+                    })
+                });
+                soa_len_ns
+                    .push(elapsed_nanoseconds(t.elapsed()).expect("soa profile duration overflow"));
 
                 let t = Instant::now();
-                std::hint::black_box(unsafe { agg_aos_len(AlignStr { ptr: astr.ptr, len: astr.len }) });
-                aos_len_min = aos_len_min.min(t.elapsed().as_secs_f64() * 1e3);
+                std::hint::black_box(unsafe {
+                    agg_aos_len(AlignStr {
+                        ptr: astr.ptr,
+                        len: astr.len,
+                    })
+                });
+                aos_len_ns
+                    .push(elapsed_nanoseconds(t.elapsed()).expect("aos profile duration overflow"));
 
                 let t = Instant::now();
-                std::hint::black_box(unsafe { agg_proj_len(AlignStr { ptr: astr.ptr, len: astr.len }) });
-                proj_len_min = proj_len_min.min(t.elapsed().as_secs_f64() * 1e3);
+                std::hint::black_box(unsafe {
+                    agg_proj_len(AlignStr {
+                        ptr: astr.ptr,
+                        len: astr.len,
+                    })
+                });
+                proj_len_ns.push(
+                    elapsed_nanoseconds(t.elapsed()).expect("projection profile duration overflow"),
+                );
             }
+            let soa_len =
+                median_microseconds(&mut soa_len_ns).expect("soa profile median overflow");
+            let aos_len =
+                median_microseconds(&mut aos_len_ns).expect("aos profile median overflow");
+            let proj_len =
+                median_microseconds(&mut proj_len_ns).expect("projection profile median overflow");
             println!("profile 1M:");
-            println!("  soa decode-only (4 cols)  {:8.3} ms; aggregate delta {:8.3} ms", soa_len_min, soa_min - soa_len_min);
-            println!("  aos decode-only           {:8.3} ms; aggregate delta {:8.3} ms", aos_len_min, aos_min - aos_len_min);
-            println!("  proj decode-only (2 cols) {:8.3} ms; aggregate delta {:8.3} ms", proj_len_min, proj_min - proj_len_min);
-            println!("  decode-projection saving (soa 4col -> proj 2col) {:8.3} ms", soa_len_min - proj_len_min);
+            println!(
+                "  soa decode-only (4 cols)  {:>8} ms; aggregate delta {:8.3} ms",
+                milliseconds_token(soa_len),
+                (soa as f64 - soa_len as f64) / 1_000.0
+            );
+            println!(
+                "  aos decode-only           {:>8} ms; aggregate delta {:8.3} ms",
+                milliseconds_token(aos_len),
+                (aos as f64 - aos_len as f64) / 1_000.0
+            );
+            println!(
+                "  proj decode-only (2 cols) {:>8} ms; aggregate delta {:8.3} ms",
+                milliseconds_token(proj_len),
+                (proj as f64 - proj_len as f64) / 1_000.0
+            );
+            println!(
+                "  decode-projection saving (soa 4col -> proj 2col) {:8.3} ms",
+                (soa_len as f64 - proj_len as f64) / 1_000.0
+            );
         }
     }
 }

@@ -7,14 +7,20 @@ bar is concrete: **on its strong cases Align must match or beat the control**.
 ```sh
 bench/run.sh            # native (both sides at the host CPU's best — AVX2 etc.)
 bench/run.sh baseline   # the portable floor (x86-64-v2 on amd64)
-ALIGN_BENCH_WORK_DIR=/absolute/empty/outside/repo ALIGN_BENCH_PROFILE=1 \
-  bench/json_soa/run.sh native  # optional decomposition output
+work_dir="$(mktemp -d)"
+prepare_output="$(ALIGN_BENCH_WORK_DIR="$work_dir" bench/json_soa/run.sh prepare native)"
+digest="$(printf '%s\n' "$prepare_output" | sed -n 's/^artifact-manifest-sha256: //p')"
+ALIGN_BENCH_WORK_DIR="$work_dir" ALIGN_BENCH_ARTIFACT_MANIFEST_SHA256="$digest" \
+  bench/json_soa/run.sh native  # optional native decomposition output
 bench/deep_pipeline/run.sh native  # stage-depth scaling: 1/2/4/8/16/32
 bench/task_group/run.sh  # task-group split vs packed-record/cache-line probe
 ```
 
 The JSON benchmarks require `ALIGN_BENCH_WORK_DIR`: an existing, empty absolute directory outside
-the repository. They remove only their private child below it after each run.
+the repository. Preparation retains sealed artifacts for one or more direct native invocations.
+After the benchmark process (or its containing development environment) has terminated, the caller
+removes that work directory; script-level failure leaves only a directory skeleton below its owned
+child so candidate-side cleanup never removes a raced directory entry.
 
 ## How it works
 

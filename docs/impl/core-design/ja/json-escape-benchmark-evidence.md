@@ -131,6 +131,8 @@ bench/.cargo/**                when present in either revision
 bench/json_decode/**
 bench/json_soa/**
 bench/json_escape/evidence/**
+scripts/cargo.sh
+scripts/dyld-env.sh
 scripts/benchmark_evidence/**
 tests/benchmark_evidence/**
 ```
@@ -153,21 +155,51 @@ absent/nonempty/unsafe work dirでrejectさせ、`kernel.o`等すべてをそこ
 benchmark-input sliceでは`ALIGN_BENCH_WORK_DIR`はrequiredで、absolute existing directoryを指しfinal componentは
 symlink不可。physical pathは`/`、repository root、repository内を不可とし、hidden entryを含め開始時empty。
 各scriptは`umask 077`でexact one private childを作り、root/detached Cargo target、`TMPDIR`、kernel object、
-全generated artifactをchild内へ限定する。success/error/signal/interruptでowned childだけをremove。
+全configured build outputをchild内へ限定する。prepare successはsealed childをretainする。error/signal/interruptは
+retained descriptor配下のnon-directory entryだけをrecursive unlinkし、directory-only skeletonはcontainer/process
+teardown後にtrusted callerがremove。
 relative/missing/non-directory/final-symlink/root/repository/in-repository/initially-nonempty/cleanup-failure/
-foreign-residueはforeign entryを削除せずrejectし、success cleanup後もcaller-owned empty directoryは残す。
+foreign-residueはforeign entryを削除せずrejectし、script-level failure後はcaller-owned directoryとdirectory-only
+owned treeを残す。outer controllerがcandidate container終了後にrace-freeでremoveする。
 repeated trailing separatorと`/.`でfinal-component symlinkを隠せない。各build/compiler/harness commandは
 own process groupで実行し、interrupt時はcomplete groupへbounded TERM/KILL escalationを行い、private file
 remove前にdirect childをreapする。
 
+scriptはuntrusted build開始前にprivate childをopenして保持する。accepted Linux pathではouter controllerの
+read-only-root containerとcontroller-owned writable mountがarbitrary candidate build writeをconfineし、script単体を
+sandboxとはしない。configured Cargo/compiler outputはretained child配下、trusted post-build copy/chmod/manifest/
+cleanup mutationはすべてdescriptor-relativeであり、`prepared`のrename/replacementでcaller dataへpublicationを
+redirectできない。controller-owned writable mount内のcandidate escapeはforeign residueとなりrejectする。
+cleanupはretained descriptor配下のnon-directory entryだけをunlinkし、
+candidate-side writerとraceし得る間はdirectory entryをdeleteしない。success時のempty build-directory skeletonも
+prepared manifestに含め、measurementとcandidate teardown後にouter controllerがremoveする。macOSはnative ARM
+development qualificationのままでaccepted adversarial evidenceには使わない。
+
 baseline選択前に両protected scriptをclosed two-phase interfaceにする。`run.sh prepare native`が
 root/detached Cargo buildと`alignc emit-obj`を行い、compiler/runtime/benchmark executable/kernel object/
 effective configのcanonical SHA-256/mode manifestをrevision-private work dirに作る。`run.sh native`は
-manifestをverifyしprepared executableをdirect exec、Cargo/compiler work・missing/extra/changed/wrong-mode
-artifact・prepare-only selectorをreject。argv arrayでshell interpolationなし。prepare Cargoはすべて
+Cargo/compiler workを行わない。prepareはpublish前にprivate childのcaptured device/inode identityを再検証する。
+nativeはfinal componentをfollowせずprepared rootをopenし、retained descriptorとcaptured device/inodeを
+launcherへ渡す。launcherは一致を要求し、そのdescriptor配下でmanifestをverifyする。prepareはcanonical manifest
+SHA-256もprintし、trusted controllerがcandidate-writable state外で保持して、later native invocationごとにrequired
+`ALIGN_BENCH_ARTIFACT_MANIFEST_SHA256`として渡す。launcherはcurrent self-consistent treeのmanifestがその
+prepare-time digestと異なればartifact open前にrejectする。accepted Linux x86_64 pathは
+executable/runtimeをhashしながらanonymous `memfd`へcopyし、source metadataをcopy前後で確認し、
+Linux UAPI `MFD_EXEC` capabilityを要求して
+`F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL`を適用しsealed descriptorだけをdirect exec/preloadする。
+executable memfd非対応kernel（enforced `vm.memfd_noexec=2`を含む）はpath/unsealed fileへfallbackせず
+qualificationをreject。macOS pathはaccepted evidenceではなくnative ARM development qualificationのままで、
+repeated launchを安定させるため`DYLD_SHARED_REGION=private`を固定する。両platformともexec直前に
+descriptor-bound prepared tree全体をretained manifest/digestに対して再検証する。
+missing/extra/changed/wrong-mode/replaced/unsealable artifactとprepare-only selectorをreject。argv arrayでshell interpolationなし。prepare Cargoはすべて
 `--locked --offline`。cache/source/config manifestをbefore/after比較しwriteをreject。benchmark-input
 sliceは各scriptのroot build 2回とdetached `cargo run` 1回、合計current 6 Cargo invocationをlockする。
 evidence implementationがbaseline前に2つの`cargo run`をprepare/direct-execへ置換する。
+
+candidate-controlled Cargo/compiler work中はfinal artifactを作らない。全child process group終了後に
+descriptor-relative helperが各fixed outputをno-follow/nonblocking openし、read前にnon-regular fileをreject、source
+stabilityを確認してcomplete final artifact setを作る。buildはdeclared outputを生成できるが、manifest capture前の
+published runtime/kernel/compiler/harnessを書き換えられない。
 
 child前にCLOEXEC pipeを作りfd enumerate、stdin/stdout/stderrだけを渡す。dup後番号確認、inherited range close、
 entrypointも`/proc/self/fd`確認。collision/inheritance/missing CLOEXEC/mapping changeはreject。bounded outputは
@@ -440,9 +472,9 @@ bindするprovider CASをreviewed amendmentで導入する。base ruleを弱め�
 | Inner/outer statistic | synthetic odd/even ns sum、half-us tie、middle/outlier/overflow、round-half-up quantization/rendering、10 exact token、1.05 boundary。`benchmark_evidence_statistic_matrix`. |
 | Parser/arithmetic | exact line/row/fieldと全malformed。`benchmark_evidence_parser_ratio_matrix`. |
 | Report/signature | report/merge-verification bidirectional goldenと全field/order/type/width/duplicate/escape/trailing/derived mutation、exact SSHSIG binary/preimage、armor header/footer/LF/base64/wrap/padding、wrong key/namespace/profile/stale。`benchmark_evidence_report_v1_matrix`. |
-| Failure/cleanup | benchmark-input ownerはabsent/relative/missing/non-directory/final-symlink（repeated separatorと`/.` aliasを含む）/root/repository/in-repository/nonempty work root、foreign residue、success/error/signal cleanup、caller entry非削除、TERM-ignoring descendant非残存をcover。evidence ownerは全phase error/timeout/signal/disk/file+dir+parent+reservation fsync/unlock/rename/reservation remove/ordinary remove/signをcover。accepted pathなし。全resourceが消えるか、surviving fail-closed reservationがacceptとlater workを阻止。`benchmark_input_workdir_matrix`; `benchmark_evidence_cleanup_matrix`. |
+| Failure/cleanup | benchmark-input ownerはabsent/relative/missing/non-directory/final-symlink（repeated separatorと`/.` aliasを含む）/root/repository/in-repository/nonempty work root、foreign residue、error/signal後のdescriptor-relative file/symlink clearing、directory/caller entry非削除、TERM-ignoring descendant非残存をcover。script-level failureはdirectory-only owned treeのみを残し、trusted outer controllerがcontainer/process teardown後にremove。evidence ownerは全phase error/timeout/signal/disk/file+dir+parent+reservation fsync/unlock/rename/reservation remove/ordinary remove/signをcover。accepted pathなし。全resourceが消えるか、surviving fail-closed reservationがacceptとlater workを阻止。`benchmark_input_workdir_matrix`; `benchmark_evidence_cleanup_matrix`. |
 | Concurrent | lockまたはpublication reservation中のsecond runはGit/image/container前fail。lockはmeasurement cleanupとdurable reservation後にreleaseし、accepted publishはreservationをremove+fsync。crash/restart/admin recoveryもfail-closed。`benchmark_evidence_exclusive_run`. |
-| TOCTOU | executable/image/source rename/replacement/swap。`benchmark_evidence_bound_object_swap_matrix`. |
+| TOCTOU | untrusted work前にpreparation rootをretainし、accepted Linux writeはすべてdescriptor配下。manifest digestはtrusted controller stateでprepare/native phaseを越え、root descriptorはshell/launcher boundaryを越える。manifest traversalもその配下で、executable/runtimeはexec/preload前にfully write-sealed anonymous descriptorへcopy。cleanupのrecursive mutationもretained treeのみ。image/sourceはopened identityを使用またはprivilege boundaryで再検証。root rename/replacement、same-inode artifact write、daemon-image/source swapをreject。`benchmark_input_workdir_matrix`; `benchmark_evidence_bound_object_swap_matrix`. |
 | Forged/stale | unsigned/edit/replay/truncate/concat/wrong namespace、PR/preflight/trusted-review mismatch。`CLEAN`は`clean`のみ、accepted `FINDINGS` + nonempty repair chainは`fixed`のみにmap。`benchmark_evidence_stale_forged_matrix`. |
 | Base/integration race | target move、precheck race、unavailable/wrong response OID、local-target mismatch、wrong parent/tree、signed artifact mutation、normal later first-parent descendant、final trusted refetch前のforce-push/removal、revert failure、exact merge。final target first-parent chainにmergeが残らなければlifecycleを進めない。`benchmark_evidence_merge_race_matrix`. |
 
@@ -482,6 +514,43 @@ ordinary testにしない。native host qualification/final measurementはmanual
 | unlock-before-publicationでsecond runが開始可能 | lock中にdurable profile-global reservationを作りatomic publication完了まで保持。later invocationはrepository/image/container前rejectし、crash/cleanup failureもfail-closed。 |
 | report review-state literalがrepository metadataと不一致 | canonical literalを`clean`/`fixed`に統一し、`CLEAN`とaccepted `FINDINGS` + nonempty repair chainからのone-way mappingを明記。 |
 | detached signature bytesが曖昧 | exact OpenSSH SSHSIG v1 binary record、SHA-512 signing preimage、70-column canonical ASCII armor、final LF、byte-identical decode/re-encodeを固定。 |
+
+## Integrated-candidate review closure
+
+| Finding | Closure |
+|---|---|
+| retained prepared pathをverification後にreplace可能 | prepareはsuccess前にcaptured private-child device/inodeを再検証。nativeはcaptured identityをlauncherへ渡し、opened root descriptorとの一致を要求し、manifest traversalをそのdescriptor配下で実行。 |
+| hash後のsame-inode writeでbytesを変更可能 | accepted Linux pathはexecutable/runtimeをhashしながらanonymous memfdへcopyし、source metadataをcopy前後で確認、4つのwrite/size/seal sealを適用後sealed copyだけをexec/preload。deterministic ownerはshell/launcher handoffでrootをreplaceし、source変更後もsealed copyが不変かつwrite不能と確認。 |
+
+## Final-integration review closure
+
+| Finding | Closure |
+|---|---|
+| phase間でself-consistent treeがprepared stateをreplace可能 | prepareがcanonical manifest SHA-256をprint。trusted controllerがcandidate-writable state外で保持し、全native invocationがrequired inputとして受け、descriptor-relative verificationがartifact open前にdifferent current manifestをreject。 |
+| untrusted prepare childがlater path writeをredirect可能 | accepted controllerがread-only-root containerとcontroller-owned writable mountでarbitrary candidate writeをconfine。scriptはfirst build前にprivate-child descriptorをretainし、configured outputを配下に置き、全trusted post-build mutationをdescriptor-relativeにし、publicationはpublic pathのsame device/inodeを要求。script-only native ARM macOSはtrusted-checkout development qualificationのみ。 |
+| cleanup check/path raceがreplacementをrecursive delete可能 | recursive cleanupはretained private-child descriptorだけをwalkし、non-directory entryだけをunlink。candidate-side concurrency中は全directory entryを残し、script-level failureのdirectory-only owned treeをteardown後のtrusted outer cleanupへ渡す。 |
+
+## Final-candidate review closure
+
+| Finding | Closure |
+|---|---|
+| Linux proc-fd rootをpath-based manifest creationがreject | manifest moduleがalready-opened root descriptor配下でcanonical manifestをbuild/create/fsync/verify。prepareはdescriptor APIのみをcall。 |
+| intermediate symlinkがtrusted post-build copyをredirect可能 | untrusted work前にrootと`artifacts`両descriptorをretain。dedicated helperがsource全componentをno-follow openし、destinationをretained artifacts descriptor相対でcreate、source stabilityを確認、build-treeのnon-directory entryをdescriptor-relative clearし、manifest前にpublic `artifacts` entryがretained objectと同一と検証。 |
+| check後`rmdir`がempty replacementをremove可能 | script cleanupは`rmdir`を一切callしない。retained descriptor配下のnon-directory entryだけをunlinkし、success manifestにempty build-directory skeletonを含め、directory-only treeをcandidate teardown後のouter controllerへ渡す。 |
+| direct executionがambient loader/timing stateをinherit | launcherはledgerのfixed base environmentをconstructし、platform-owned runtime bindingとmacOSのfixed `DYLD_SHARED_REGION=private` policyだけを追加。ownerはambient sentinelをinjectし、harnessが全fixed valueとsentinel absenceをassert。 |
+| nested cleanupにもdirectory-entry raceが残存 | candidate-side prepare/cleanupは全directory entryをremoveしない。success/failure ownerがretained directory skeletonをrequireし、outer controllerだけがteardown後にremove。 |
+| top-level benchmark workflowがone-phase executionのまま | `bench/README.md`はprepare-time digest captureからdirect native executionまでを示し、process/environment teardown後のwork-tree removalをcaller ownershipにする。 |
+| build pathだけではarbitrary candidate writeをsandboxできない | script contractはcandidate code自体をsandboxすると主張しない。accepted evidenceはlater outer-controller container boundaryが必須。本sliceはconfigured outputと全trusted publication mutationをconfineし、script-only ARM qualificationはcheckoutをtrustする。 |
+| candidate workがpublished final artifactを書換可能 | 全build/compiler child group終了後にだけfinal artifactを作る。helperがfixed compiler/runtime/kernel/harness outputをdescriptor-relative copyし、manifest captureする。 |
+| FIFO outputがtrusted copyをblock可能 | sourceはnonblocking/no-follow descriptorでopenし、read前に全non-regular outputをreject。ownerはfixed runtime outputにFIFOを置きalarm内のrejectを要求する。 |
+| candidate-controlled Cargo wrapper dependencyがprotectedでない | exact protected-input setに`scripts/cargo.sh`とsourceされる`scripts/dyld-env.sh`を含め、preparationがreviewed evidence profileと独立にCargo/LLVM/linker選択を変更できないようにする。 |
+| manifest publicationがretained artifacts directoryを再bindしない | manifest publicationはrootの`artifacts` entryがretained descriptorと同一であることをmanifest create/verifyの前後で検証し、captured manifest subtreeをretained descriptorからのfresh walkとbyte-for-byte比較。persistent/transient replacementはsame retained artifactを記述しない限りreject。 |
+| bound executionがFIFO replacementのopenでblock可能 | Linux sealed-copyとnative ARM qualificationの両openをnonblocking/no-followにし、read前にnon-regular descriptorをreject。 |
+| bound executionが追加のself-consistent artifactをaccept | launcherはmanifestの`artifacts` subtreeをcompiler/runtime/kernel/selected harness/directory entryのexact setに限定し、extra entryをexecution前にreject。 |
+| sealed Linux artifactが明示的にexecutableでない | launcherはsealingとともにstable Linux UAPI `MFD_EXEC` flagを常に要求。unsupported kernelとenforced `vm.memfd_noexec=2`等のpolicyはhost qualificationでfail-closedし、mutable path bytesへfallbackしない。 |
+| initial verification後にnon-selected prepared fileを変更可能 | executable/runtime bind後、launcherがexec直前にdescriptor-bound prepared tree全体とretained manifest digestを再検証。deterministic ownerはbinding中にeffective configurationを変更し、executionへ到達しないことを証明。 |
+| macOS qualificationにrepositoryのshared-cache isolationがない | native ARM launcherはambient loader stateをinheritせず`DYLD_SHARED_REGION=private`を固定し、executed harnessがexact valueをassert。 |
+| macOS verificationがspecial fileのtype reject前にread | launcherはhash前にinitial descriptor modeを検査。FIFO ownerは`os.read`をrejecting sentinelへ置換し、両platform openerがreadなしでrejectすることを証明。 |
 
 ## Author consistency pass
 

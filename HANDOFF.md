@@ -7,64 +7,97 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-15._ Align PR #812 merged align-llm Request 5's bounded HTTP
-response-body capability at `5aa5b23a`, and Request 7 evidence prerequisites through PR #820 are
-now merged, with #820 at `19fbc786`. Its exact-head native ARM64 preflight and every required
-GitHub check passed before merge. Active work is the separate align-llm Request 7
-benchmark-evidence prerequisite implementation on `agent/request7-git-revision-binding`. The
-proposed contract is `docs/impl/core-design/json-escape-benchmark-evidence.md`: a trusted installed
-controller/verifier, continuously monitored native x86_64 host, digest-pinned offline OCI toolchain,
-read-only revision isolation, robust inner statistics plus fixed balanced sampling, a complete
-canonical report schema, and host-signed evidence. One independent review of `5ed19c85` found six
-valid issues; `65753fe7` closed that set and added the synchronized Japanese mirror and indexes. The
-required full-diff review of that repair found seven further valid contract gaps, so the design was
-re-scoped: exact median quantization, a prepare/direct-exec boundary, two-sided path changes, unique
-child-monitor partitions, signed actual-merge verification, and pre-publication unlock semantics now
-close them together. The bounded review of redesigned head `0bb57285` found six precise binding and
-publication gaps. The current repair adds trusted GitHub review attestation, protects the complete
-evidence profile/source set, rechecks final target reachability, serializes publication with a
-durable reservation, uses the repository's exact `clean`/`fixed` states, and fixes SSHSIG bytes.
-PR #813 merged at `734ae3ab`, and the benchmark-input prerequisite merged in PR #815 at
-`58dbb218`; the installed-source manifest foundation merged in PR #816 at `7db1af8c`.
-Author inspection of the benchmark-input slice found that the current scripts make six Cargo
-invocations, not the four root builds named by the delivery prose; the repair binds all six and
-identifies the two later `cargo run` replacements. The same pass makes the work-root safety and
-cleanup contract exact instead of leaving `unsafe` to implementation judgement. A post-merge
-independent audit found three narrow owner gaps in #815: final-symlink `//` and `/.` aliases,
-missing/stale detached locks, and TERM-ignoring descendants were not exercised, while foreground
-children could delay shell traps indefinitely. Active work on `agent/benchmark-input-hardening`
-closes those classes with explicit lock validation, per-command process groups, bounded TERM/KILL,
-direct-child reap, and exact regression fixtures. Comprehensive review of `36297622` found that
-signals could still land between child launch and PID capture and that the two root Cargo commands
-shared one group. The consolidated repair defers signals through PID capture, gives each Cargo
-command a distinct group, and adds survivor-before-next-command regressions for both benchmarks.
-The evidence implementation continues after this
-hardening: the no-follow installed-source manifest foundation is shipped in #816 at
-`7db1af8c`, canonical JSON primitives are shipped in #817 at `4ec35dfe`, the typed Report/Body
-schema is shipped in #818 at `41ce4f93`, and strict SSHSIG v1 binary/armor framing is shipped in
-#820 at `19fbc786`. PR #822 also shipped the exact producer/verifier/merge-verifier CLI boundary
-for modes, required options, absolute paths, OIDs, and new output directories, and PR #823 bound
-the no-follow installed-source manifest to the profile's fixed SHA-256 with directory-race closure.
-PR #830 fixed the pinned `/usr/bin/git` process/config boundary: a fixed argv and empty
-environment, disabled replacement/lazy-fetch/optional-lock behavior, no system/global Git config,
-and an owned process group. PR #831 then shipped the raw batch reader plus commit, tree, and
-two-sided revision binding. PR #832 shipped verified raw source materialization and
-retained-descriptor verification; it does not execute Docker, `ssh-keygen`, or the benchmark.
-PR #833 shipped canonical validation for the immutable x86_64 evidence profile, including the
-host-global lock path, Docker/image/toolchain identities, fixed observation limits, capture/timeouts,
-signing key, schedule, and benchmark inventory. PR #834 shipped the fixed container launch argv
-boundary at `8ce95870`, including digest-only local image selection, private namespaces, explicit
-resource/security limits, read-only source/toolchain mounts, private writable workspaces, and an
-explicit fixed environment. PR #835 shipped pure profile-bound qualification for image/config/registry
-identities, mutable-tag rejection, and toolchain/cache/configuration observations. Active work on
-`agent/request7-host-qualification` adds pure qualification for the named native host, Docker
-daemon/runtime, CPU quota, and bounded pre/between/post resource observations with adversarial
-owners. It does not read host filesystems, invoke Docker, start the monitor, provision a key, or
-execute the controller. Monitor lifecycle and full controller/verifier implementation remain later
-work. Materialization
-and retained verification intentionally shared one boundary because they depend on the same raw
-path layout, reviewed-symlink policy, descriptor identity, and cleanup proof; splitting them would
-have duplicated the boundary fixtures without leaving a stable consumer for either half.
+_Last updated: 2026-08-15._ Align main is at `3eaa2176`. align-llm Request 5's bounded HTTP response
+body is shipped, and Request 7's evidence design (#813), benchmark inputs (#815/#821), installed
+manifest (#816), canonical JSON (#817), typed report schema (#818), SSHSIG framing (#820), strict
+controller CLI (#822), installed-manifest/profile binding (#823), raw Git object identity codec
+(#825), pinned Git batch response codec (#828), pinned Git process boundary (#830), and two-sided
+Git revision/tree binding (#831), verified Git source materialization (#832), and canonical evidence
+profile validation (#833), fixed container launch binding (#834), pinned image qualification (#835),
+and native host qualification (#836) are merged.
+The align-repl user guide and release artifacts are shipped in #826/#829. The final requested work
+is PR #827 on
+`agent/request7-prepared-benchmarks`: both protected JSON benchmarks gain the reviewed two-phase
+`prepare native` / direct `native` interface, canonical artifact sealing, checked integer inner
+medians, descriptor-bound Linux evidence execution, and inode-aware cleanup. The integrated review
+of `845f0b90` against `863c20ba` found two valid P1 handoff races: retained-root replacement and
+same-inode writes after hashing. The consolidated repair carries the captured root device/inode into
+the launcher, verifies the manifest below that retained descriptor, and executes/preloads Linux
+bytes only after copying them into fully write-sealed anonymous memfds; macOS remains native ARM
+development qualification, not accepted evidence. Its focused owners are
+`scripts/test-benchmark-input.sh`, `scripts/test-benchmark-evidence-manifest.sh`, and
+`scripts/test-benchmark-evidence-statistics.sh`.
+
+The final integration review of `0dbbd709` against `c47e57c7` found three valid remaining handoff
+issues. The consolidated closure requires the trusted caller to retain prepare's manifest SHA-256
+and supply it to every native invocation, keeps accepted Linux preparation writes below a retained
+private-child descriptor, carries that descriptor into the launcher, and recursively cleans only
+the retained tree before an identity-checked non-recursive public-path removal.
+
+The later exact-base review of `d81466f5` against `6adfa13d` found that path-based manifest creation
+could not consume the Linux proc-fd root, intermediate symlinks could still redirect trusted copies,
+and even non-recursive public-path removal retained a check/rmdir race. The final repair uses one
+descriptor-relative prepared-tree helper for copy/config/prune/manifest/cleanup, retains the
+`artifacts` descriptor before untrusted work, and leaves a directory-only owned tree for trusted
+outer cleanup after candidate teardown instead of removing its public path in-script.
+
+The exact-base review of `3052c9ab` against `5a6ae64b` found three valid final integration gaps:
+direct execution inherited ambient loader/timing state, nested cleanup repeated the directory-entry
+race, and the top-level benchmark workflow still described one-phase execution. The consolidated
+repair constructs the ledger's fixed execution environment, never removes a directory entry before
+candidate teardown, verifies directory-only failure residue, and documents digest-bound two-phase
+native use in `bench/README.md`.
+
+The repair review of `d7235794` found two narrow documentation/owner issues: the empty-`HOME` shell
+assertion used the wrong parameter expansion, and the decode README still advertised the now-forbidden
+ambient profiling switch. The final repair asserts defined-and-empty `HOME` directly and marks the
+old profile numbers as historical, with no profiling switch on the sealed evidence interface.
+
+The exact-base integration review of `d9fca1e7` found that final artifacts existed during later
+candidate work, FIFO outputs could block copying, and the design overclaimed script-level sandboxing
+of arbitrary candidate writes. The repair publishes all final artifacts only after every child group
+exits, opens fixed outputs nonblocking/no-follow, and assigns arbitrary-write confinement to the
+already-required outer controller container; script-only ARM qualification trusts the checkout.
+
+The exact-base publication review of `5d471664` against `1c9e2e9a` found four final boundary gaps:
+the candidate-used Cargo wrapper and sourced loader helper were outside the protected-input set,
+manifest publication did not compare its artifact subtree to the retained descriptor, bound
+execution could block opening a FIFO replacement, and a self-consistent manifest could include
+extra artifacts. The consolidated repair protects both wrapper paths, rebinds manifest publication
+to a fresh retained-descriptor walk, uses nonblocking no-follow launcher opens, requires the exact
+five-entry artifact subtree, and adds focused regressions for all four findings.
+
+The final exact-base review of `4d2bfc29` against `f684b245` found one remaining Linux host
+capability gap: sealed memfds were not created with `MFD_EXEC`, so a host with a memfd no-exec
+policy could reject every otherwise-valid measurement. The repair requests the stable Linux UAPI
+flag explicitly, fails closed when the kernel or policy cannot provide executable sealed memfds,
+and adds the capability to the closure matrix and owner.
+
+The final exact-base review of `018b6b7f` against `8ce95870` found three launch-boundary gaps: the
+complete prepared tree was not revalidated after executable/runtime binding, macOS qualification
+omitted the repository's private shared-cache setting, and the macOS verifier read before its first
+regular-file check. The consolidated repair re-verifies the complete descriptor-bound tree and
+retained digest immediately before execution, fixes `DYLD_SHARED_REGION=private`, rejects special
+files before hashing, and owns each behavior with deterministic drift, environment, and no-read
+regressions.
+
+Latest durable verification after the final review repair passed the serial owner aggregate:
+`scripts/test-benchmark-evidence-manifest.sh`, `scripts/test-benchmark-evidence-bootstrap.sh`,
+`scripts/test-benchmark-evidence-cli.sh`, `scripts/test-benchmark-evidence-git-objects.sh`,
+`scripts/test-benchmark-evidence-git-batch.sh`, `scripts/test-benchmark-input.sh`, and
+`scripts/test-benchmark-evidence-statistics.sh`. Native Apple ARM64 also passed with
+`CARGO_BUILD_JOBS=1`: each of
+`bench/json_decode/run.sh prepare native` plus `run.sh native` and
+`bench/json_soa/run.sh prepare native` plus `run.sh native` completed serially from an empty external
+work directory, with the prepare-time digest supplied to direct execution and an injected ambient
+sentinel excluded by the fixed launcher environment. The final-review-repair rerun produced decode
+digest `efca5a28a02e8b49636092413c0f92386c39f2bfcb754f7a9f5ddc83f090ef2c` and SoA digest
+`5b1ff95b9364253e4afb81d209d909dfdd5455616f681fcbe5c8c2403fbfaa3c`. These are
+correctness/boundary owners, not accepted x86_64 performance evidence. At this PR's merge, no work
+is active by user request. The next eligible capabilities are monitor lifecycle, adversarial
+execution owners, and controller/verifier implementation;
+native x86_64 host qualification and the Request 7 language implementation remain later gates. No
+emulation is accepted in any evidence lane.
 
 The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit
@@ -241,9 +274,8 @@ facts must live in this repository.
   Request 8 is merged through Align design #799 and implementation #801; Request 10's §7.6
   implementation is merged; Requests 11 and 12 are implemented, and Request 5's bounded-HTTP
   implementation is merged at `5aa5b23a`. Request 7's benchmark-evidence design is active, and its
-  benchmark-input, manifest, canonical JSON, typed report, and SSHSIG prerequisites are merged;
-  Requests
-  9 and 13–14 remain proposed in
+  benchmark-input, manifest, canonical JSON, typed report, SSHSIG, CLI, and bootstrap-binding
+  prerequisites are merged; Requests 9 and 13–15 remain proposed in
   `../align-llm/docs/align-requests.md`; Request 9 remains the later C7 blocker after Request 7.
 
 Consumer-gated deferrals that remain intentional:

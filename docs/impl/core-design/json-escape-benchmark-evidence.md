@@ -167,6 +167,8 @@ bench/.cargo/**                when present in either revision
 bench/json_decode/**
 bench/json_soa/**
 bench/json_escape/evidence/**
+scripts/cargo.sh
+scripts/dyld-env.sh
 scripts/benchmark_evidence/**
 tests/benchmark_evidence/**
 ```
@@ -199,21 +201,60 @@ directory whose final path component is not a symbolic link. Its physical path m
 repository root, or inside the repository, and it must contain no entry, including a hidden entry,
 before the script starts. Each script enters `umask 077`, creates exactly one private child below
 that directory, binds root and detached Cargo targets, `TMPDIR`, the kernel object, and every
-generated artifact below that child, and removes only that owned child on success, error, signal, or
-interrupt. Relative, missing, non-directory, final-symlink, root, repository, in-repository,
+configured build output below that child. Prepare success retains the sealed child. Error, signal, and
+interrupt recursively unlink non-directory entries only below its retained descriptor and leave a
+directory-only skeleton for the trusted caller to remove after container/process teardown. Relative,
+final-symlink, root, repository, in-repository,
 initially nonempty, cleanup-failure, and foreign-residue cases reject without deleting the foreign
 entry. Repeated trailing separators and `/.` cannot disguise a final-component symbolic link. Each
 build, compiler, and harness command runs in its own process group; interruption applies bounded
 TERM/KILL escalation to the complete group and reaps the direct child before private files are
-removed. The caller-owned empty directory remains after successful cleanup.
+removed. The caller-owned directory and one directory-only owned tree remain after script-level
+failure; the outer controller owns their race-free removal after the candidate container is gone.
+
+The script opens and retains the private child before starting any untrusted build. On the accepted
+Linux path, the outer controller's read-only-root container and controller-owned writable mounts
+confine arbitrary candidate build writes; the script alone is not that sandbox. Configured
+Cargo/compiler outputs stay below the retained child, and every trusted post-build copy, chmod,
+manifest, and cleanup mutation is descriptor-relative, so renaming or replacing `prepared` cannot
+redirect publication into caller data. Any candidate escape within a controller-owned writable
+mount creates foreign residue and rejects.
+Cleanup recursively unlinks non-directory entries only through the retained descriptor and never
+deletes a directory entry while a candidate-side writer could race it. Empty build-directory
+skeletons are included in the prepared manifest on success and removed by the outer controller only
+after measurement and candidate teardown.
+macOS remains native ARM development qualification and never supplies accepted adversarial
+evidence.
 
 Commands are argv arrays without shell interpolation. Before baseline selection, the evidence
 implementation gives each protected script a closed two-phase interface. `run.sh prepare native`
 performs every root and detached Cargo build plus `alignc emit-obj`, then writes a canonical
 SHA-256/mode manifest for the compiler, runtime, detached benchmark executable, kernel object, and
 effective configuration into the revision-private work directory. `run.sh native` accepts no Cargo
-or compiler work: it verifies that manifest and directly execs the prepared benchmark executable.
-It rejects missing, extra, changed, or wrong-mode artifacts and any prepare-only selector.
+or compiler work. Prepare revalidates the captured device/inode identity before publishing the
+private child. Native opens the prepared root without following its final component and passes both
+the retained descriptor and captured device/inode to the launcher, which requires them to match and
+verifies the manifest through that descriptor. Prepare also prints the canonical manifest SHA-256;
+the trusted controller retains it outside candidate-writable state and supplies it as the required
+`ALIGN_BENCH_ARTIFACT_MANIFEST_SHA256` value to every later native invocation. The launcher rejects
+any current self-consistent tree whose manifest does not equal that prepare-time digest. On the
+accepted Linux x86_64 path it hashes the
+executable and runtime while copying them to anonymous `memfd` objects, checks source metadata
+before and after the copy, requests the Linux UAPI `MFD_EXEC` capability, applies
+`F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL`, and directly execs/preloads only those sealed
+descriptors. A kernel without executable memfds, including an enforced `vm.memfd_noexec=2` policy,
+rejects qualification rather than falling back to a path or unsealed file. The macOS path remains
+native ARM development qualification rather than accepted evidence and fixes
+`DYLD_SHARED_REGION=private` for stable repeated launches. Immediately before either platform
+executes, the launcher re-verifies the complete descriptor-bound prepared tree against the retained
+manifest and digest. Missing, extra, changed,
+wrong-mode, replaced, or unsealable artifacts and every prepare-only selector reject.
+
+No final artifact exists while candidate-controlled Cargo/compiler work can still run. After every
+child process group exits, the descriptor-relative helper opens each fixed output no-follow and
+nonblocking, rejects non-regular files before reading, checks source stability, and creates the
+complete final artifact set. Thus a build may produce its declared output, but it cannot rewrite an
+already-published runtime, kernel, compiler, or harness before manifest capture.
 
 All prepare-phase Cargo operations are visibly `--locked --offline`; `CARGO_NET_OFFLINE=true` is
 defense in depth. Registry/cache/source manifests are compared before/after; a lockfile, index,
@@ -593,9 +634,9 @@ It may not weaken the base rule.
 | Inner/outer statistics | Synthetic odd/even nanosecond sums, half-microsecond ties, equal middle values, overflow edges, and one arbitrarily low outlier pin the middle sum, round-half-up integer-microsecond quantization, and three-decimal rendering. Ten printed samples retain exact tokens; exact 1.05 passes and the next microsecond unit fails. `benchmark_evidence_statistic_matrix`. |
 | Parser/arithmetic | Exact titles, headers, three rows, all columns, and five retained fields succeed; wrong/duplicate/missing/extra line, row, header, or field and whitespace/sign/exponent/nonfinite/precision/ratio/zero/overflow reject. `benchmark_evidence_parser_ratio_matrix`. |
 | Report/signature | Bidirectional report and merge-verification goldens plus every field/order/type/width/duplicate/escape/trailing/derived mutation; exact SSHSIG binary fields and signing preimage; armor header/footer/LF/base64 alphabet/wrap/padding; and wrong key/namespace/signature/profile/stale candidate/report/merge reject. `benchmark_evidence_report_v1_matrix`. |
-| Failure/cleanup | The benchmark-input owner first covers absent/relative/missing/non-directory/final-symlink (including repeated-separator and `/.` aliases)/root/repository/in-repository/nonempty work roots, foreign residue, and cleanup after success/error/signal without deleting caller entries or leaving a TERM-ignoring descendant. The evidence owner crosses each phase with error, timeout, signal, disk-full, file/directory/parent/reservation fsync, unlock, rename, reservation removal, ordinary removal, and signing failure. No accepted path remains; children, containers, mounts, fds, locks, staging, private dirs, output, and publication reservation are gone, or a surviving fail-closed reservation prevents acceptance and all later work. `benchmark_input_workdir_matrix`; `benchmark_evidence_cleanup_matrix`. |
+| Failure/cleanup | The benchmark-input owner first covers absent/relative/missing/non-directory/final-symlink (including repeated-separator and `/.` aliases)/root/repository/in-repository/nonempty work roots, foreign residue, and descriptor-relative file/symlink clearing after error/signal without deleting directory entries, caller entries, or leaving a TERM-ignoring descendant. Script-level failure leaves at most its directory-only owned tree; the trusted outer controller removes it only after container/process teardown. The evidence owner crosses each phase with error, timeout, signal, disk-full, file/directory/parent/reservation fsync, unlock, rename, reservation removal, ordinary removal, and signing failure. No accepted path remains; children, containers, mounts, fds, locks, staging, private dirs, output, and publication reservation are gone, or a surviving fail-closed reservation prevents acceptance and all later work. `benchmark_input_workdir_matrix`; `benchmark_evidence_cleanup_matrix`. |
 | Concurrent runs | Second run fails before Git/image/container work while either the lock or publication reservation exists. Lock releases only after measurement cleanup and durable reservation creation; accepted publication removes and fsyncs the reservation. Crash/restart and administrator-recovery fixtures prove fail-closed behavior. `benchmark_evidence_exclusive_run`. |
-| TOCTOU swap | Opened executable/image/source identities are used or revalidated at privilege boundary; rename, replacement, daemon-image, and source swaps cannot substitute inspected bytes. `benchmark_evidence_bound_object_swap_matrix`. |
+| TOCTOU swap | The preparation root is retained before untrusted work and every accepted Linux write stays below its descriptor. Its manifest digest crosses the prepare/native phase boundary in trusted controller state; the root descriptor crosses the shell/launcher boundary; manifest traversal stays below it; and executable/runtime bytes are copied to fully write-sealed anonymous descriptors before exec/preload. Cleanup recursively mutates only the retained tree. Opened image/source identities are used or revalidated at their privilege boundary; root rename/replacement, same-inode artifact writes, daemon-image, and source swaps cannot substitute inspected bytes. `benchmark_input_workdir_matrix`; `benchmark_evidence_bound_object_swap_matrix`. |
 | Forged/stale evidence | Unsigned, edited, replayed profile/target/review/candidate, truncated, concatenated, and valid-signature/wrong-namespace reports reject. PR/preflight/trusted-review mismatch blocks; `CLEAN` maps only to `clean`, and accepted `FINDINGS` with a nonempty repair chain maps only to `fixed`. `benchmark_evidence_stale_forged_matrix`. |
 | Base/integration race | Disposable remote covers target movement before/after run, precheck-to-merge race, unavailable/wrong response OID, local-target mismatch, wrong merge parents/tree, signed merge-verification mutation, a normal later first-parent descendant, force-push/removal before the final trusted refetch, failed revert, and exact merge. The merge must remain on the final target first-parent chain; failures never advance lifecycle. `benchmark_evidence_merge_race_matrix`. |
 
@@ -637,6 +678,43 @@ measurement remain named manual evidence.
 | P2 unlock-before-publication admitted a concurrent second run | A durable profile-global reservation is created while locked and remains through atomic publication. Every later invocation rejects before repository/image/container work; crash and cleanup failure remain fail-closed. |
 | P2 report review-state literal disagreed with repository metadata | The canonical literals are now exactly `clean` and `fixed`, with explicit one-way mappings from `CLEAN` and accepted `FINDINGS` plus its nonempty repair chain. |
 | P2 detached signature bytes were ambiguous | Both signatures now use one exact OpenSSH SSHSIG v1 binary record, SHA-512 signing preimage, canonical 70-column ASCII armor, final LF, and byte-for-byte decode/re-encode validation. |
+
+## Integrated-candidate review closure
+
+| Finding | Ledger-first closure |
+|---|---|
+| P1 retained prepared path could be replaced after verification | Prepare revalidates its captured private-child device/inode before success. Native carries the captured identity into the launcher, which requires the opened root descriptor to match and performs all manifest traversal below that retained descriptor. |
+| P1 same-inode writes could change bytes after hashing | The accepted Linux path hashes while copying executable/runtime bytes into anonymous memfds, checks source metadata around the copy, applies all four write/size/seal seals, and execs/preloads only the sealed copies. The deterministic owner replaces the root at the shell/launcher handoff and proves a sealed copy remains unchanged and unwritable after its source changes. |
+
+## Final-integration review closure
+
+| Finding | Ledger-first closure |
+|---|---|
+| P1 a self-consistent tree could replace prepared state between phases | Prepare prints its canonical manifest SHA-256. The trusted controller retains that value outside candidate-writable state, every native invocation requires it, and descriptor-relative verification rejects a different current manifest before opening executable/runtime artifacts. |
+| P1 an untrusted prepare child could redirect later path writes | The accepted controller confines arbitrary candidate writes with its read-only-root container and controller-owned writable mounts. The script retains the private-child descriptor before the first build; configured outputs stay below it, every trusted post-build mutation is descriptor-relative, and publication requires the public path to retain the same device/inode. Script-only native ARM macOS remains trusted-checkout development qualification. |
+| P2 cleanup could recursively delete a replacement after a check/path race | Recursive cleanup walks only through the retained private-child descriptor, unlinks non-directory entries, and leaves all directory entries in place while candidate-side concurrency is possible. Script-level failure leaves its directory-only owned tree for trusted outer cleanup after teardown. |
+
+## Final-candidate review closure
+
+| Finding | Ledger-first closure |
+|---|---|
+| P1 the Linux proc-fd root was incompatible with path-based manifest creation | The manifest module now builds, creates, fsyncs, and verifies a canonical manifest directly below an already-opened root descriptor. Preparation calls only that descriptor API. |
+| P1 intermediate symlinks could redirect trusted post-build copies | Preparation retains both root and `artifacts` descriptors before untrusted work. A dedicated helper opens every source component no-follow, creates each destination relative to the retained artifacts descriptor, checks source stability, clears build-tree non-directory entries descriptor-relatively, and verifies the public `artifacts` entry still names the retained object before manifest creation. |
+| P2 check-then-`rmdir` could remove an empty replacement | Script cleanup never calls `rmdir`. It unlinks only non-directory entries below retained descriptors, includes empty build-directory skeletons in the success manifest, and leaves the directory-only tree for the outer controller after candidate teardown. |
+| P1 direct execution inherited ambient loader/timing state | The launcher constructs the ledger's fixed base environment, then adds only the platform-owned runtime binding and the fixed macOS `DYLD_SHARED_REGION=private` policy. The owner injects an ambient sentinel and makes the harness assert every fixed value and the sentinel's absence. |
+| P2 nested cleanup repeated the directory-entry race | Candidate-side preparation and cleanup never remove any directory entry. Both success and failure owners require the retained directory skeleton, and only the outer controller removes it after teardown. |
+| P2 the top-level benchmark workflow still described one-phase execution | `bench/README.md` now shows prepare-time digest capture followed by direct native execution and assigns final work-tree removal to the caller after process/environment teardown. |
+| P1 build paths alone did not sandbox arbitrary candidate writes | The script contract no longer claims to sandbox candidate code. Accepted evidence requires the later outer-controller container boundary; this slice confines configured outputs and all trusted publication mutations, while script-only ARM qualification trusts the checkout. |
+| P1 candidate work could rewrite already-published final artifacts | Final artifacts are created only after every build/compiler child group exits. The helper then copies the fixed compiler/runtime/kernel/harness outputs descriptor-relatively before manifest capture. |
+| P2 a FIFO output could block trusted copying | Source opens use nonblocking no-follow descriptors and reject every non-regular output before reading. The owner places a FIFO at the fixed runtime output and bounds rejection with an alarm. |
+| P1 candidate-controlled Cargo wrapper dependencies were not protected | The exact protected-input set includes `scripts/cargo.sh` and its sourced `scripts/dyld-env.sh`, so preparation cannot change Cargo/LLVM/linker selection independently of the reviewed evidence profile. |
+| P1 manifest publication did not rebind the retained artifacts directory | Manifest publication verifies that the root's `artifacts` entry names the retained descriptor before and after both manifest creation and verification, then compares the captured manifest subtree byte-for-byte with a fresh walk through the retained descriptor. Persistent and transient replacements therefore reject unless they describe the same retained artifacts. |
+| P2 bound execution could block while opening a FIFO replacement | Both Linux sealed-copy and native ARM qualification opens are nonblocking/no-follow and reject non-regular descriptors before reading. |
+| P2 bound execution accepted additional self-consistent artifacts | The launcher requires the manifest's `artifacts` subtree to be exactly the compiler, runtime, kernel, selected harness, and directory entry; every extra entry rejects before execution. |
+| P1 sealed Linux artifacts were not explicitly executable | The launcher always requests the stable Linux UAPI `MFD_EXEC` flag together with sealing. Unsupported kernels and policies such as enforced `vm.memfd_noexec=2` fail closed during host qualification; execution never falls back to mutable path bytes. |
+| P1 non-selected prepared files could change after initial verification | After binding the executable and runtime, the launcher re-verifies the complete descriptor-bound prepared tree and retained manifest digest immediately before `execve`. A deterministic owner mutates the effective configuration during binding and proves execution is never reached. |
+| P2 macOS qualification omitted the repository's shared-cache isolation | The native ARM launcher fixes `DYLD_SHARED_REGION=private` instead of inheriting ambient loader state, and the executed harness asserts the exact value. |
+| P2 macOS verification read a special file before rejecting its type | The launcher checks the initial descriptor mode before hashing. The FIFO owner replaces `os.read` with a rejecting sentinel and proves both platform openers reject without any read. |
 
 ## Author consistency pass
 
