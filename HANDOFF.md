@@ -26,8 +26,8 @@ the launcher, verifies the manifest below that retained descriptor, and executes
 bytes only after copying them into fully write-sealed anonymous memfds; macOS remains native ARM
 development qualification, not accepted evidence. Its focused owners are
 `scripts/test-benchmark-input.sh`, `scripts/test-benchmark-evidence-manifest.sh`, and
-`scripts/test-benchmark-evidence-statistics.sh`. The next Request 7 slice is the pure monitor
-lifecycle core, followed by adversarial execution owners and the controller/verifier.
+`scripts/test-benchmark-evidence-statistics.sh`. The pure monitor lifecycle core is shipped in this
+slice; the next Request 7 work is the adversarial execution owners followed by the controller/verifier.
 
 The final integration review of `0dbbd709` against `c47e57c7` found three valid remaining handoff
 issues. The consolidated closure requires the trusted caller to retain prepare's manifest SHA-256
