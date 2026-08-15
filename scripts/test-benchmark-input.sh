@@ -7,8 +7,17 @@ TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/align-benchmark-input.XXXXXX")"
 FAKE_BIN="$TEST_ROOT/bin"
 FAKE_LOG="$TEST_ROOT/cargo.log"
 ORIGINAL_PATH="$PATH"
+SIGNAL_SCRIPT_PID=""
+SIGNAL_DESCENDANT_PID=""
 
 cleanup_test_root() {
+  if [[ -n "$SIGNAL_SCRIPT_PID" ]]; then
+    kill -TERM "$SIGNAL_SCRIPT_PID" 2>/dev/null || true
+    wait "$SIGNAL_SCRIPT_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$SIGNAL_DESCENDANT_PID" ]]; then
+    kill -KILL "$SIGNAL_DESCENDANT_PID" 2>/dev/null || true
+  fi
   rm -rf "$TEST_ROOT"
 }
 trap cleanup_test_root EXIT HUP INT TERM
@@ -78,6 +87,28 @@ has_arg() {
 if has_arg --bin "$@" && has_arg alignc "$@"; then
   if [[ "${FAKE_FAIL_MODE:-}" == root ]]; then
     exit 70
+  fi
+  if [[ "${FAKE_BLOCK_MODE:-}" == root ]]; then
+    : "${FAKE_BLOCK_MARKER:?}"
+    : "${FAKE_DESCENDANT_MARKER:?}"
+    : > "$FAKE_BLOCK_MARKER"
+    trap '' TERM INT
+    (
+      trap '' TERM INT
+      while :; do sleep 1; done
+    ) &
+    printf '%s\n' "$!" > "$FAKE_DESCENDANT_MARKER"
+    while :; do sleep 1; done
+  fi
+  if [[ "${FAKE_SURVIVOR_MODE:-}" == root ]]; then
+    : "${FAKE_SURVIVOR_MARKER:?}"
+    trap '' TERM INT
+    (
+      trap '' TERM INT
+      while :; do sleep 1; done
+    ) &
+    printf '%s\n' "$!" > "$FAKE_SURVIVOR_MARKER"
+    exit 0
   fi
   mkdir -p "$CARGO_TARGET_DIR/release"
   cat > "$CARGO_TARGET_DIR/release/alignc" <<'FAKE_ALIGNC'
@@ -175,6 +206,10 @@ expect_invalid_workdirs() {
     "$REPO_ROOT/bench/json_decode/run.sh" native
   assert_rejected "final symlink work directory" env ALIGN_BENCH_WORK_DIR="$symlink_dir" \
     "$REPO_ROOT/bench/json_decode/run.sh" native
+  assert_rejected "final symlink with repeated separators" env ALIGN_BENCH_WORK_DIR="$symlink_dir//" \
+    "$REPO_ROOT/bench/json_decode/run.sh" native
+  assert_rejected "final symlink with dot suffix" env ALIGN_BENCH_WORK_DIR="$symlink_dir/." \
+    "$REPO_ROOT/bench/json_decode/run.sh" native
   assert_rejected "root work directory" env ALIGN_BENCH_WORK_DIR=/ \
     "$REPO_ROOT/bench/json_decode/run.sh" native
   assert_rejected "repository work directory" env ALIGN_BENCH_WORK_DIR="$REPO_ROOT" \
@@ -191,6 +226,45 @@ expect_invalid_workdirs() {
   [[ -e "$nonempty_dir/.hidden" ]] || fail "foreign entry was removed"
 }
 
+assert_lock_inputs() {
+  local bench
+  local lock
+  for bench in json_decode json_soa; do
+    lock="$REPO_ROOT/bench/$bench/Cargo.lock"
+    [[ -f "$lock" && ! -L "$lock" ]] || fail "$bench Cargo.lock is missing or symbolic"
+    git -C "$REPO_ROOT" ls-files --error-unmatch "bench/$bench/Cargo.lock" >/dev/null 2>&1 ||
+      fail "$bench Cargo.lock is not tracked"
+    if git -C "$REPO_ROOT" check-ignore -q "bench/$bench/Cargo.lock"; then
+      fail "$bench Cargo.lock is ignored"
+    fi
+    cargo metadata --locked --offline --format-version 1 \
+      --manifest-path "$REPO_ROOT/bench/$bench/Cargo.toml" >/dev/null
+  done
+
+  local missing_repo="$TEST_ROOT/missing-lock-repo"
+  local missing_work="$TEST_ROOT/missing-lock-work"
+  mkdir -p "$missing_repo/bench/json_decode" "$missing_work"
+  cp "$REPO_ROOT/bench/json_decode/run.sh" "$missing_repo/bench/json_decode/run.sh"
+  if ALIGN_BENCH_WORK_DIR="$missing_work" "$missing_repo/bench/json_decode/run.sh" native \
+    >"$TEST_ROOT/missing-lock.out" 2>"$TEST_ROOT/missing-lock.err"; then
+    fail "missing detached Cargo.lock was accepted"
+  fi
+  grep -Fq 'detached Cargo.lock must exist and must not be a symbolic link' \
+    "$TEST_ROOT/missing-lock.err" || fail "missing detached Cargo.lock reached another failure"
+  assert_empty "$missing_work"
+
+  local stale="$TEST_ROOT/stale-lock"
+  mkdir -p "$stale/src"
+  sed 's/serde_json = "1"/serde_json = "=1.0.0"/' \
+    "$REPO_ROOT/bench/json_decode/Cargo.toml" > "$stale/Cargo.toml"
+  cp "$REPO_ROOT/bench/json_decode/Cargo.lock" "$stale/Cargo.lock"
+  : > "$stale/src/main.rs"
+  if cargo metadata --locked --offline --format-version 1 \
+    --manifest-path "$stale/Cargo.toml" >/dev/null 2>&1; then
+    fail "stale detached Cargo.lock was accepted"
+  fi
+}
+
 assert_locked_offline_invocations() {
   local count
   count="$(wc -l < "$FAKE_LOG" | tr -d ' ')"
@@ -201,6 +275,7 @@ assert_locked_offline_invocations() {
 }
 
 benchmark_input_workdir_matrix() {
+  assert_lock_inputs
   expect_invalid_workdirs
   make_fake_tools
   [[ -f "$REPO_ROOT/bench/json_decode/Cargo.lock" ]] || fail "json_decode Cargo.lock is missing"
@@ -215,6 +290,29 @@ benchmark_input_workdir_matrix() {
     [[ ! -e "$REPO_ROOT/bench/$bench/kernel.o" ]] || fail "$bench wrote kernel.o beside its source"
   done
   assert_locked_offline_invocations
+
+  local survivor_marker
+  local survivor_pid
+  local attempt
+  for bench in json_decode json_soa; do
+    FAKE_WORK_DIR="$TEST_ROOT/survivor-work-$bench"
+    survivor_marker="$TEST_ROOT/survivor-marker-$bench"
+    mkdir -p "$FAKE_WORK_DIR"
+    if run_benchmark "$bench" env FAKE_SURVIVOR_MODE=root \
+      FAKE_SURVIVOR_MARKER="$survivor_marker"; then
+      fail "$bench accepted a surviving descendant from the first root build"
+    fi
+    [[ -f "$survivor_marker" ]] || fail "$bench survivor fixture did not create a descendant"
+    survivor_pid="$(sed -n '1p' "$survivor_marker")"
+    for attempt in $(seq 1 100); do
+      kill -0 "$survivor_pid" 2>/dev/null || break
+      sleep 0.05
+    done
+    if kill -0 "$survivor_pid" 2>/dev/null; then
+      fail "$bench first root build left its surviving descendant"
+    fi
+    assert_empty "$FAKE_WORK_DIR"
+  done
 
   FAKE_WORK_DIR="$TEST_ROOT/foreign-work"
   mkdir -p "$FAKE_WORK_DIR"
@@ -243,31 +341,50 @@ benchmark_input_workdir_matrix() {
   directory_has_entries "$FAKE_WORK_DIR" || fail "cleanup failure did not preserve evidence of failure"
   PATH="$ORIGINAL_PATH" rm -rf "$FAKE_WORK_DIR"
 
-  FAKE_WORK_DIR="$TEST_ROOT/signal-work"
-  mkdir -p "$FAKE_WORK_DIR"
-  set +e
-  PATH="$FAKE_BIN:$ORIGINAL_PATH" FAKE_LOG="$FAKE_LOG" FAKE_WORK_DIR="$FAKE_WORK_DIR" \
-    ALIGN_BENCH_WORK_DIR="$FAKE_WORK_DIR" \
-    FAKE_SLEEP=1 "$REPO_ROOT/bench/json_decode/run.sh" native &
-  local pid=$!
-  set -e
-  local ready=0
-  local attempt
-  for attempt in 1 2 3 4 5 6 7 8 9 10; do
-    if directory_has_entries "$FAKE_WORK_DIR"; then
-      ready=1
-      break
+  local block_marker
+  local descendant_marker
+  local ready
+  local signal_status
+  for bench in json_decode json_soa; do
+    FAKE_WORK_DIR="$TEST_ROOT/signal-work-$bench"
+    block_marker="$TEST_ROOT/block-marker-$bench"
+    descendant_marker="$TEST_ROOT/descendant-marker-$bench"
+    mkdir -p "$FAKE_WORK_DIR"
+    set +e
+    PATH="$FAKE_BIN:$ORIGINAL_PATH" FAKE_LOG="$FAKE_LOG" FAKE_WORK_DIR="$FAKE_WORK_DIR" \
+      ALIGN_BENCH_WORK_DIR="$FAKE_WORK_DIR" \
+      FAKE_BLOCK_MODE=root FAKE_BLOCK_MARKER="$block_marker" \
+      FAKE_DESCENDANT_MARKER="$descendant_marker" \
+      "$REPO_ROOT/bench/$bench/run.sh" native &
+    SIGNAL_SCRIPT_PID=$!
+    set -e
+    ready=0
+    for attempt in $(seq 1 100); do
+      if [[ -f "$block_marker" && -f "$descendant_marker" ]]; then
+        ready=1
+        break
+      fi
+      sleep 0.05
+    done
+    [[ "$ready" -eq 1 ]] || fail "$bench signal fixture never created the blocking descendant"
+    SIGNAL_DESCENDANT_PID="$(sed -n '1p' "$descendant_marker")"
+    kill -TERM "$SIGNAL_SCRIPT_PID"
+    set +e
+    wait "$SIGNAL_SCRIPT_PID"
+    signal_status=$?
+    set -e
+    SIGNAL_SCRIPT_PID=""
+    [[ "$signal_status" -ne 0 ]] || fail "$bench signal was accepted"
+    for attempt in $(seq 1 100); do
+      kill -0 "$SIGNAL_DESCENDANT_PID" 2>/dev/null || break
+      sleep 0.05
+    done
+    if kill -0 "$SIGNAL_DESCENDANT_PID" 2>/dev/null; then
+      fail "$bench signal cleanup left a child-process-group descendant"
     fi
-    sleep 0.1
+    SIGNAL_DESCENDANT_PID=""
+    assert_empty "$FAKE_WORK_DIR"
   done
-  [[ "$ready" -eq 1 ]] || fail "signal fixture never created a private child"
-  kill -TERM "$pid"
-  set +e
-  wait "$pid"
-  local signal_status=$?
-  set -e
-  [[ "$signal_status" -ne 0 ]] || fail "signal was accepted"
-  assert_empty "$FAKE_WORK_DIR"
 }
 
 benchmark_input_workdir_matrix
