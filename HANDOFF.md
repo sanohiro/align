@@ -23,12 +23,14 @@ close them together. The bounded review of redesigned head `0bb57285` found six 
 publication gaps. The current repair adds trusted GitHub review attestation, protects the complete
 evidence profile/source set, rechecks final target reachability, serializes publication with a
 durable reservation, uses the repository's exact `clean`/`fixed` states, and fixes SSHSIG bytes.
-PR #813 merged at `734ae3ab`. Author inspection of the next slice found that the current scripts make six Cargo
-invocations, not the four root builds named by the delivery prose; the exact-head repair now binds
-all six and identifies the two later `cargo run` replacements. The same pass makes the work-root
-safety and cleanup contract exact instead of leaving `unsafe` to implementation judgement. Next:
-finish and merge the benchmark-input prerequisite, then implement the evidence controller and host
-qualification before creating a Request 7 implementation branch.
+PR #813 merged at `734ae3ab`, and the benchmark-input prerequisite merged in PR #815 at
+`58dbb218`. Author inspection of that slice found that the current scripts make six Cargo
+invocations, not the four root builds named by the delivery prose; the repair binds all six and
+identifies the two later `cargo run` replacements. The same pass makes the work-root safety and
+cleanup contract exact instead of leaving `unsafe` to implementation judgement. Active work is the
+evidence implementation: this slice adds the no-follow installed-source manifest foundation, then
+the controller/verifier/monitor, profile, image recipe, and adversarial owners follow before host
+qualification and a Request 7 implementation branch.
 
 The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit
