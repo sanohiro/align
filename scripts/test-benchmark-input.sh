@@ -319,6 +319,9 @@ import sys
 sys.path.insert(0, os.path.join(sys.argv[1], "scripts", "benchmark_evidence"))
 import bound_exec
 
+if bound_exec.MFD_EXEC_FLAG != 0x0010:
+    raise SystemExit("bound execution uses the wrong Linux MFD_EXEC ABI flag")
+
 root = os.path.join(sys.argv[2], "sealed-copy")
 os.mkdir(root, 0o700)
 path = os.path.join(root, "payload")
@@ -404,6 +407,9 @@ import sys
 
 sys.path.insert(0, os.path.join(sys.argv[1], "scripts", "benchmark_evidence"))
 import bound_exec
+
+if bound_exec.MFD_EXEC_FLAG != 0x0010:
+    raise SystemExit("bound execution uses the wrong Linux MFD_EXEC ABI flag")
 
 root = os.path.join(sys.argv[2], "bound-special-file")
 os.mkdir(root, 0o700)

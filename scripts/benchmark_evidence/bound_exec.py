@@ -14,6 +14,9 @@ from typing import Any, Sequence
 import manifest
 
 
+MFD_EXEC_FLAG = getattr(os, "MFD_EXEC", 0x0010)
+
+
 class BoundExecError(ValueError):
     """Prepared artifacts cannot be bound safely for execution."""
 
@@ -68,10 +71,13 @@ def _copy_to_sealed_memfd(
 ) -> tuple[int, int, str]:
     if not hasattr(os, "memfd_create") or not hasattr(os, "MFD_ALLOW_SEALING"):
         raise BoundExecError("sealed benchmark execution requires Linux memfd seals")
-    flags = os.MFD_ALLOW_SEALING
+    flags = os.MFD_ALLOW_SEALING | MFD_EXEC_FLAG
     if hasattr(os, "MFD_CLOEXEC"):
         flags |= os.MFD_CLOEXEC
-    target_fd = os.memfd_create(f"align-benchmark-{name}", flags)
+    try:
+        target_fd = os.memfd_create(f"align-benchmark-{name}", flags)
+    except OSError as exc:
+        raise BoundExecError("executable sealed memfd capability is unavailable") from exc
     try:
         digest = hashlib.sha256()
         size = 0

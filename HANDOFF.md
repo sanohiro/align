@@ -66,6 +66,12 @@ extra artifacts. The consolidated repair protects both wrapper paths, rebinds ma
 to a fresh retained-descriptor walk, uses nonblocking no-follow launcher opens, requires the exact
 five-entry artifact subtree, and adds focused regressions for all four findings.
 
+The final exact-base review of `4d2bfc29` against `f684b245` found one remaining Linux host
+capability gap: sealed memfds were not created with `MFD_EXEC`, so a host with a memfd no-exec
+policy could reject every otherwise-valid measurement. The repair requests the stable Linux UAPI
+flag explicitly, fails closed when the kernel or policy cannot provide executable sealed memfds,
+and adds the capability to the closure matrix and owner.
+
 Latest durable verification after the exact-base review repair passed the serial owner aggregate:
 `scripts/test-benchmark-evidence-manifest.sh`, `scripts/test-benchmark-evidence-bootstrap.sh`,
 `scripts/test-benchmark-evidence-cli.sh`, `scripts/test-benchmark-evidence-git-objects.sh`,

@@ -185,9 +185,11 @@ SHA-256もprintし、trusted controllerがcandidate-writable state外で保持�
 `ALIGN_BENCH_ARTIFACT_MANIFEST_SHA256`として渡す。launcherはcurrent self-consistent treeのmanifestがその
 prepare-time digestと異なればartifact open前にrejectする。accepted Linux x86_64 pathは
 executable/runtimeをhashしながらanonymous `memfd`へcopyし、source metadataをcopy前後で確認し、
-`F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL`を適用してsealed descriptorだけをdirect exec/preloadする。
-macOS pathはaccepted evidenceではなくnative ARM development qualificationのまま。missing/extra/changed/
-wrong-mode/replaced/unsealable artifactとprepare-only selectorをreject。argv arrayでshell interpolationなし。prepare Cargoはすべて
+Linux UAPI `MFD_EXEC` capabilityを要求して
+`F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL`を適用しsealed descriptorだけをdirect exec/preloadする。
+executable memfd非対応kernel（enforced `vm.memfd_noexec=2`を含む）はpath/unsealed fileへfallbackせず
+qualificationをreject。macOS pathはaccepted evidenceではなくnative ARM development qualificationのまま。
+missing/extra/changed/wrong-mode/replaced/unsealable artifactとprepare-only selectorをreject。argv arrayでshell interpolationなし。prepare Cargoはすべて
 `--locked --offline`。cache/source/config manifestをbefore/after比較しwriteをreject。benchmark-input
 sliceは各scriptのroot build 2回とdetached `cargo run` 1回、合計current 6 Cargo invocationをlockする。
 evidence implementationがbaseline前に2つの`cargo run`をprepare/direct-execへ置換する。
@@ -543,6 +545,7 @@ ordinary testにしない。native host qualification/final measurementはmanual
 | manifest publicationがretained artifacts directoryを再bindしない | manifest publicationはrootの`artifacts` entryがretained descriptorと同一であることをmanifest create/verifyの前後で検証し、captured manifest subtreeをretained descriptorからのfresh walkとbyte-for-byte比較。persistent/transient replacementはsame retained artifactを記述しない限りreject。 |
 | bound executionがFIFO replacementのopenでblock可能 | Linux sealed-copyとnative ARM qualificationの両openをnonblocking/no-followにし、read前にnon-regular descriptorをreject。 |
 | bound executionが追加のself-consistent artifactをaccept | launcherはmanifestの`artifacts` subtreeをcompiler/runtime/kernel/selected harness/directory entryのexact setに限定し、extra entryをexecution前にreject。 |
+| sealed Linux artifactが明示的にexecutableでない | launcherはsealingとともにstable Linux UAPI `MFD_EXEC` flagを常に要求。unsupported kernelとenforced `vm.memfd_noexec=2`等のpolicyはhost qualificationでfail-closedし、mutable path bytesへfallbackしない。 |
 
 ## Author consistency pass
 

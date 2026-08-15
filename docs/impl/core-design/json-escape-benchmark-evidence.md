@@ -240,10 +240,12 @@ the trusted controller retains it outside candidate-writable state and supplies 
 any current self-consistent tree whose manifest does not equal that prepare-time digest. On the
 accepted Linux x86_64 path it hashes the
 executable and runtime while copying them to anonymous `memfd` objects, checks source metadata
-before and after the copy, applies `F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL`, and directly
-execs/preloads only those sealed descriptors. The macOS path remains native ARM development
-qualification rather than accepted evidence. Missing, extra, changed, wrong-mode, replaced, or
-unsealable artifacts and every prepare-only selector reject.
+before and after the copy, requests the Linux UAPI `MFD_EXEC` capability, applies
+`F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL`, and directly execs/preloads only those sealed
+descriptors. A kernel without executable memfds, including an enforced `vm.memfd_noexec=2` policy,
+rejects qualification rather than falling back to a path or unsealed file. The macOS path remains
+native ARM development qualification rather than accepted evidence. Missing, extra, changed,
+wrong-mode, replaced, or unsealable artifacts and every prepare-only selector reject.
 
 No final artifact exists while candidate-controlled Cargo/compiler work can still run. After every
 child process group exits, the descriptor-relative helper opens each fixed output no-follow and
@@ -706,6 +708,7 @@ measurement remain named manual evidence.
 | P1 manifest publication did not rebind the retained artifacts directory | Manifest publication verifies that the root's `artifacts` entry names the retained descriptor before and after both manifest creation and verification, then compares the captured manifest subtree byte-for-byte with a fresh walk through the retained descriptor. Persistent and transient replacements therefore reject unless they describe the same retained artifacts. |
 | P2 bound execution could block while opening a FIFO replacement | Both Linux sealed-copy and native ARM qualification opens are nonblocking/no-follow and reject non-regular descriptors before reading. |
 | P2 bound execution accepted additional self-consistent artifacts | The launcher requires the manifest's `artifacts` subtree to be exactly the compiler, runtime, kernel, selected harness, and directory entry; every extra entry rejects before execution. |
+| P1 sealed Linux artifacts were not explicitly executable | The launcher always requests the stable Linux UAPI `MFD_EXEC` flag together with sealing. Unsupported kernels and policies such as enforced `vm.memfd_noexec=2` fail closed during host qualification; execution never falls back to mutable path bytes. |
 
 ## Author consistency pass
 
