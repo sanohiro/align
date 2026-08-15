@@ -129,6 +129,76 @@ fn saved_file_builds_with_the_real_alignc_binary() {
 }
 
 #[test]
+fn saved_file_object_matches_the_real_alignc_binary() {
+    // O9 (`docs/impl/22-repl-plan.md` §12): the object the REPL emitted for a session is
+    // byte-identical to the object the SHIPPED `alignc` binary emits for the file `:save` wrote.
+    //
+    // Distinct from `build::repl_object_matches_the_alignc_build_path`, which reproduces the
+    // driver calls in-process against a hardcoded source string. That proves the library path is
+    // deterministic; it cannot see a change to `render`/`save`, and it never crosses into the
+    // compiler users actually run. This one starts from the bytes `:save` really wrote and ends at
+    // the real binary, so S4 is pinned end to end.
+    //
+    // The OBJECT, not the executable: a Mach-O image carries an `LC_UUID` and page hashes derived
+    // from link-time inputs, so two links of identical objects differ by construction. The object
+    // is what the codegen contract promises.
+    let stage = align_driver::ArtifactStage::temp("align-repl-object-parity")
+        .unwrap_or_else(|error| panic!("create object-parity stage: {error}"));
+    let source_path = stage.path().join("saved.align");
+    let mut repl = Session::new(Config {
+        jobs: 1,
+        ..Config::default()
+    })
+    .unwrap_or_else(|error| panic!("start align-repl session: {error}"));
+    assert!(matches!(repl.submit("P { a: i64, b: i64 }"), Outcome::Applied { .. }));
+    assert!(matches!(repl.submit("fn total(p: P) -> i64 = p.a + p.b"), Outcome::Applied { .. }));
+    assert!(matches!(repl.submit("p := P{a: 2, b: 40}"), Outcome::Applied { .. }));
+    assert!(matches!(repl.submit("print(total(p))"), Outcome::Applied { .. }));
+    repl.save(&source_path, false)
+        .unwrap_or_else(|error| panic!("save session source: {error:?}"));
+
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest.join("../..");
+    let cargo = workspace.join("scripts/cargo.sh");
+    let emitted = Command::new(&cargo)
+        .current_dir(stage.path())
+        .env("CARGO_BUILD_JOBS", "1")
+        .env("ALIGNC_JOBS", "1")
+        .args([
+            "run",
+            "--manifest-path",
+            workspace.join("Cargo.toml").to_string_lossy().as_ref(),
+            "-q",
+            "-p",
+            "align_driver",
+            "--bin",
+            "alignc",
+            "--",
+            "emit-obj",
+            "saved.align",
+            "alignc.o",
+        ])
+        .output()
+        .unwrap_or_else(|error| panic!("run real alignc emit-obj: {error}"));
+    assert!(
+        emitted.status.success(),
+        "alignc stdout:\n{}\nalignc stderr:\n{}",
+        String::from_utf8_lossy(&emitted.stdout),
+        String::from_utf8_lossy(&emitted.stderr)
+    );
+
+    let repl_object = std::fs::read(repl.object_path())
+        .unwrap_or_else(|error| panic!("read the repl object: {error}"));
+    let alignc_object = std::fs::read(stage.path().join("alignc.o"))
+        .unwrap_or_else(|error| panic!("read the alignc object: {error}"));
+    assert!(!repl_object.is_empty(), "the repl object must not be empty");
+    assert_eq!(
+        repl_object, alignc_object,
+        "the REPL's object diverged from the shipped compiler's object for the saved program"
+    );
+}
+
+#[test]
 fn cache_off_still_builds_and_runs() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_align-repl"))
         .env("ALIGNC_CACHE", "off")

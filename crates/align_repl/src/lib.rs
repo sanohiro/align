@@ -1268,6 +1268,20 @@ impl Session {
     pub fn last_output_was_truncated(&self) -> bool {
         self.baseline.last_was_truncated()
     }
+
+    /// The object this session's last successful build emitted.
+    ///
+    /// Exposed for the build-parity owner (`docs/impl/22-repl-plan.md` §12, O9), which compares it
+    /// byte-for-byte against what the real `alignc` binary emits for the file `:save` wrote. That
+    /// comparison is the only statement of S4 ("byte-identical to a production compile") that
+    /// crosses the process boundary into the shipped compiler; an in-process reproduction of the
+    /// driver calls can only show that the same library path is deterministic.
+    ///
+    /// A v1 session is always a one-unit package (`pkg.*` and user modules are a non-goal), so the
+    /// unit index is fixed at zero.
+    pub fn object_path(&self) -> std::path::PathBuf {
+        self.stage.path().join("unit0.o")
+    }
 }
 
 enum Resolved {
