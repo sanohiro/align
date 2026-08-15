@@ -485,6 +485,20 @@ deterministic ownerを含むhand-written implementationは1,000行を少し超�
 | Forged/stale | unsigned/edit/replay/truncate/concat/wrong namespace、PR/preflight/trusted-review mismatch。`CLEAN`は`clean`のみ、accepted `FINDINGS` + nonempty repair chainは`fixed`のみにmap。`benchmark_evidence_stale_forged_matrix`. |
 | Base/integration race | target move、precheck race、unavailable/wrong response OID、local-target mismatch、wrong parent/tree、signed artifact mutation、normal later first-parent descendant、final trusted refetch前のforce-push/removal、revert failure、exact merge。final target first-parent chainにmergeが残らなければlifecycleを進めない。`benchmark_evidence_merge_race_matrix`. |
 
+次のcapabilityはbase/integration race ownerに限定する。既にmerge済みのidentity、revision、report、
+signature、cleanup、exclusive-run boundaryをconsumeし、controller、verifier、provider credential、
+Docker execution、lifecycle adapterは追加しない。implementation closure matrixは次の通り。
+
+| Axis | Closure / owner |
+|---|---|
+| Disposable remote | target ref、commit object、parent order、candidate tree、response identityをtransition前に検証し、fixture-owned remote内だけでstateを保持する。`benchmark_evidence_merge_race_matrix`. |
+| Base precheck | local targetとremote targetを`BASE`にbindする。run前のtarget moveまたはlocal/remote mismatchはmerge前にrejectし、lifecycleを進めない。`benchmark_evidence_merge_race_matrix`. |
+| Merge response | provider response OIDをfresh fetchしたraw objectへbindする。unavailable、unknown、wrong response identityはrejectしtransactionをunshippedにする。`benchmark_evidence_merge_race_matrix`. |
+| Merge relationship | fetched mergeのexact two parents `(BASE, CANDIDATE)`とcandidate treeを要求する。wrong parent/treeはfail-closed revertを行い、revert failureならremoteをblockedに残す。`benchmark_evidence_merge_race_matrix`. |
+| Signed artifact | signed merge-verification payloadをfetched raw mergeへ照合し、accept前のpayload/signature mutationを検出する。`benchmark_evidence_merge_race_matrix`. |
+| Final refetch | staging後、`MERGE`を含むnormal later first-parent descendantはacceptする。force-push、target removal、final fetch unavailableはrejectしlifecycleを進めない。`benchmark_evidence_merge_race_matrix`. |
+| Revert/lifecycle | exact mergeは全relationshipとfinal refetchのsuccess後だけ`accepted`になる。failureは`rejected`、`reverted`、`blocked`のいずれかとなり、lifecycleを進めずaccepted artifactを出さない。`benchmark_evidence_merge_race_matrix`. |
+
 testsはfixture executor/fake daemon/disposable repo+remote/test keyを使いperformance workload/wall-clock ratioを
 ordinary testにしない。native host qualification/final measurementはmanual named evidence。
 
