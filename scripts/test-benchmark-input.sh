@@ -143,7 +143,20 @@ elif has_arg -p "$@" && has_arg align_runtime "$@"; then
     exit 73
   fi
   mkdir -p "$CARGO_TARGET_DIR/release"
-  printf 'fake runtime\n' > "$CARGO_TARGET_DIR/release/libalign_runtime.so"
+  printf 'int align_fake_runtime(void) { return 0; }\n' > "$CARGO_TARGET_DIR/release/fake-runtime.c"
+  case "$(uname -s)" in
+    Darwin)
+      cc -dynamiclib -Wl,-install_name,@rpath/libalign_runtime.dylib \
+        "$CARGO_TARGET_DIR/release/fake-runtime.c" \
+        -o "$CARGO_TARGET_DIR/release/libalign_runtime.dylib"
+      ;;
+    Linux)
+      cc -shared -fPIC -Wl,-soname,libalign_runtime.so \
+        "$CARGO_TARGET_DIR/release/fake-runtime.c" \
+        -o "$CARGO_TARGET_DIR/release/libalign_runtime.so"
+      ;;
+    *) exit 90 ;;
+  esac
 elif has_arg build "$@"; then
   if [[ "${FAKE_ADD_FOREIGN:-0}" == 1 && ! -e "$FAKE_WORK_DIR/foreign" ]]; then
     printf 'caller-owned residue\n' > "$FAKE_WORK_DIR/foreign"
@@ -158,6 +171,12 @@ elif has_arg build "$@"; then
   esac
   if [[ "${FAKE_FAIL_MODE:-}" == detached ]]; then
     exit 74
+  fi
+  if [[ "${FAKE_SWAP_PREPARED:-0}" == 1 ]]; then
+    mv "$FAKE_WORK_DIR_PHYSICAL/prepared" "$FAKE_WORK_DIR_PHYSICAL/original-prepared"
+    mkdir "$FAKE_WORK_DIR_PHYSICAL/prepared"
+    printf 'foreign\n' > "$FAKE_WORK_DIR_PHYSICAL/prepared/foreign"
+    exit 75
   fi
   if [[ -n "${FAKE_SLEEP:-}" ]]; then
     sleep "$FAKE_SLEEP"
@@ -189,6 +208,18 @@ fi
 exec /bin/rm "$@"
 FAKE_RM
   chmod 700 "$FAKE_BIN/rm"
+
+  cat > "$FAKE_BIN/mkdir" <<'FAKE_MKDIR'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${FAKE_MKDIR_COLLIDE:-0}" == 1 && "$#" -eq 1 && "$1" == "$(cd "$FAKE_WORK_DIR" && pwd -P)/prepared" ]]; then
+  /bin/mkdir "$1"
+  printf 'foreign\n' > "$1/foreign"
+  exit 1
+fi
+exec /bin/mkdir "$@"
+FAKE_MKDIR
+  chmod 700 "$FAKE_BIN/mkdir"
 }
 
 run_benchmark() {
@@ -345,6 +376,21 @@ benchmark_input_workdir_matrix() {
     fail "native measurement without prepare was accepted"
   fi
   assert_empty "$FAKE_WORK_DIR"
+
+  FAKE_WORK_DIR="$TEST_ROOT/mkdir-collision-work"
+  mkdir -p "$FAKE_WORK_DIR"
+  if run_benchmark json_decode env FAKE_MKDIR_COLLIDE=1; then
+    fail "prepared-directory mkdir collision was accepted"
+  fi
+  [[ -f "$FAKE_WORK_DIR/prepared/foreign" ]] || fail "mkdir collision deleted the foreign directory"
+
+  FAKE_WORK_DIR="$TEST_ROOT/replaced-prepared-work"
+  mkdir -p "$FAKE_WORK_DIR"
+  if run_benchmark json_decode env FAKE_SWAP_PREPARED=1; then
+    fail "prepared-directory identity replacement was accepted"
+  fi
+  [[ -f "$FAKE_WORK_DIR/prepared/foreign" ]] || fail "cleanup deleted a replaced prepared directory"
+  [[ -d "$FAKE_WORK_DIR/original-prepared" ]] || fail "identity replacement lost the owned directory"
 
   local survivor_marker
   local survivor_pid

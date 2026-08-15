@@ -21,6 +21,7 @@ BENCH_PENDING_SIGNAL=""
 BENCH_WORK_DIR_VALIDATED=0
 BENCH_KEEP_PRIVATE=0
 BENCH_EXPECT_PREPARED=0
+BENCH_PRIVATE_IDENTITY=""
 BENCH_CLEANED=0
 
 directory_has_entries() {
@@ -31,6 +32,19 @@ directory_has_entries() {
     fi
   done
   return 1
+}
+
+directory_identity() {
+  python3 - "$1" <<'PY'
+import os
+import stat
+import sys
+
+value = os.lstat(sys.argv[1])
+if not stat.S_ISDIR(value.st_mode):
+    raise SystemExit(1)
+print(f"{value.st_dev}:{value.st_ino}")
+PY
 }
 
 work_dir_contains_only_prepared() {
@@ -130,7 +144,11 @@ cleanup() {
   stop_child_group
 
   if [[ "$BENCH_KEEP_PRIVATE" -eq 0 && -n "$BENCH_PRIVATE_DIR" && ( -e "$BENCH_PRIVATE_DIR" || -L "$BENCH_PRIVATE_DIR" ) ]]; then
-    if ! rm -rf "$BENCH_PRIVATE_DIR" || [[ -e "$BENCH_PRIVATE_DIR" || -L "$BENCH_PRIVATE_DIR" ]]; then
+    current_identity="$(directory_identity "$BENCH_PRIVATE_DIR" 2>/dev/null || true)"
+    if [[ -z "$BENCH_PRIVATE_IDENTITY" || "$current_identity" != "$BENCH_PRIVATE_IDENTITY" ]]; then
+      echo "error: refusing to remove a replaced benchmark work child" >&2
+      cleanup_failed=1
+    elif ! rm -rf "$BENCH_PRIVATE_DIR" || [[ -e "$BENCH_PRIVATE_DIR" || -L "$BENCH_PRIVATE_DIR" ]]; then
       echo "error: failed to remove the benchmark work child" >&2
       cleanup_failed=1
     fi
@@ -237,16 +255,22 @@ if [[ "$BENCH_ACTION" == run ]]; then
   fi
   verify_prepared
   printf 'target: native\n'
-  exec "$BENCH_PREPARED_DIR/artifacts/$BENCH_BINARY"
+  exec env PYTHONDONTWRITEBYTECODE=1 python3 \
+    "$REPO_ROOT/scripts/benchmark_evidence/bound_exec.py" \
+    --root "$BENCH_PREPARED_DIR" --executable "$BENCH_BINARY"
 fi
 
 if directory_has_entries "$BENCH_WORK_DIR"; then
   echo "error: ALIGN_BENCH_WORK_DIR must initially be empty for prepare" >&2
   exit 2
 fi
-BENCH_PRIVATE_DIR="$BENCH_PREPARED_DIR"
-if ! mkdir "$BENCH_PRIVATE_DIR"; then
+if ! mkdir "$BENCH_PREPARED_DIR"; then
   echo "error: cannot create the prepared benchmark directory" >&2
+  exit 1
+fi
+BENCH_PRIVATE_DIR="$BENCH_PREPARED_DIR"
+if ! BENCH_PRIVATE_IDENTITY="$(directory_identity "$BENCH_PRIVATE_DIR")"; then
+  echo "error: cannot bind the prepared benchmark directory identity" >&2
   exit 1
 fi
 if ! chmod 700 "$BENCH_PRIVATE_DIR"; then
