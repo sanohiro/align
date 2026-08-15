@@ -7,11 +7,12 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-15._ Align main is at `5a6ae64b`. align-llm Request 5's bounded HTTP response
+_Last updated: 2026-08-15._ Align main is at `956d943d`. align-llm Request 5's bounded HTTP response
 body is shipped, and Request 7's evidence design (#813), benchmark inputs (#815/#821), installed
 manifest (#816), canonical JSON (#817), typed report schema (#818), SSHSIG framing (#820), strict
 controller CLI (#822), installed-manifest/profile binding (#823), raw Git object identity codec
-(#825), pinned Git batch response codec (#828), and pinned Git process boundary (#830) are merged.
+(#825), pinned Git batch response codec (#828), pinned Git process boundary (#830), and two-sided
+Git revision/tree binding (#831) are merged.
 The align-repl user guide and release artifacts are shipped in #826/#829. The final requested work
 is PR #827 on
 `agent/request7-prepared-benchmarks`: both protected JSON benchmarks gain the reviewed two-phase
@@ -61,8 +62,8 @@ Latest durable verification after the exact-base review repair passed the serial
 work directory, with the prepare-time digest supplied to direct execution and an injected ambient
 sentinel excluded by the fixed launcher environment. These are
 correctness/boundary owners, not accepted x86_64 performance evidence. At this PR's merge, no work
-is active by user request. The next eligible capability is the installed controller/verifier/monitor
-with revision binding and protected-input matching, followed by profile/image/adversarial owners;
+is active by user request. The next eligible capability is installed-source replacement protection
+and protected-input matching, followed by the controller/profile/image/adversarial owners;
 native x86_64 host qualification and the Request 7 language implementation remain later gates. No
 emulation is accepted in any evidence lane.
 
