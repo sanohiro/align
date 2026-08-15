@@ -88,9 +88,8 @@ def parse(raw: object) -> ParsedObject:
     _kind(kind)
     if not size_text or (len(size_text) > 1 and size_text[0] == "0") or not size_text.isdecimal():
         raise GitObjectError("raw object size is not canonical decimal")
-    size = int(size_text, 10)
     payload = raw[separator + 1 :]
-    if len(payload) != size:
+    if size_text != str(len(payload)):
         raise GitObjectError("raw object payload length does not match its header")
     if encode(kind, payload) != raw:
         raise GitObjectError("raw object is not canonical")

@@ -55,6 +55,7 @@ def main():
     expect_error(lambda: go.parse(b"blob 0 0\x00"), "wrong shape")
     expect_error(lambda: go.parse(b"bl\xffb 0\x00"), "ASCII")
     expect_error(lambda: go.parse(b"blob 0\x00trailing"), "payload length")
+    expect_error(lambda: go.parse(b"blob " + b"9" * 5000 + b"\x00"), "payload length")
     expect_error(lambda: go.verify("CE013625030BA8DBA906F756967F9E9CA394464A", raw), "40 lowercase")
     expect_error(lambda: go.verify("0" * 39, raw), "40 lowercase")
     expect_error(lambda: go.verify("0" * 40, raw), "does not match")
