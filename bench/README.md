@@ -7,10 +7,14 @@ bar is concrete: **on its strong cases Align must match or beat the control**.
 ```sh
 bench/run.sh            # native (both sides at the host CPU's best — AVX2 etc.)
 bench/run.sh baseline   # the portable floor (x86-64-v2 on amd64)
-ALIGN_BENCH_PROFILE=1 bench/json_soa/run.sh native  # optional decomposition output
+ALIGN_BENCH_WORK_DIR=/absolute/empty/outside/repo ALIGN_BENCH_PROFILE=1 \
+  bench/json_soa/run.sh native  # optional decomposition output
 bench/deep_pipeline/run.sh native  # stage-depth scaling: 1/2/4/8/16/32
 bench/task_group/run.sh  # task-group split vs packed-record/cache-line probe
 ```
+
+The JSON benchmarks require `ALIGN_BENCH_WORK_DIR`: an existing, empty absolute directory outside
+the repository. They remove only their private child below it after each run.
 
 ## How it works
 

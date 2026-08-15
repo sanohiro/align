@@ -12,8 +12,12 @@ Two shapes (each with a matching serde baseline):
   (serde ignores unknown fields by default, the same projection).
 
 ```sh
-bench/json_decode/run.sh [baseline|v3|native]   # default native
+ALIGN_BENCH_WORK_DIR=/absolute/empty/outside/repo bench/json_decode/run.sh [baseline|v3|native]
 ```
+
+`ALIGN_BENCH_WORK_DIR` is required. It must name an existing, empty absolute directory outside the
+repository. The script keeps every generated target, temporary file, and kernel object in one
+private child below it, then removes that child while leaving the caller-owned directory in place.
 
 Same plumbing as `bench/json_soa/`: the kernel is built with `alignc emit-obj` and the runtime is
 linked as a **cdylib** (dynamic, over the C-ABI). Standalone cargo project (own `[workspace]`).
@@ -52,7 +56,8 @@ every parser change and watch the ratios; when a result disappoints, autopsy —
 
 ## Profile finding (2026-06-29, native, 1M rows)
 
-`ALIGN_BENCH_PROFILE=1 bench/json_decode/run.sh native` adds decode-only entry points that return the
+`ALIGN_BENCH_WORK_DIR=/absolute/empty/outside/repo ALIGN_BENCH_PROFILE=1 bench/json_decode/run.sh native`
+adds decode-only entry points that return the
 row count after `json.decode`. Measured:
 
 ```

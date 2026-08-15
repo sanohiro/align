@@ -6,8 +6,12 @@ column-major `soa<Row>` and running `where(.active).pay.sum()`, vs idiomatic Rus
 aggregate touches 2.
 
 ```sh
-bench/json_soa/run.sh [baseline|v3|native]   # default native
+ALIGN_BENCH_WORK_DIR=/absolute/empty/outside/repo bench/json_soa/run.sh [baseline|v3|native]
 ```
+
+`ALIGN_BENCH_WORK_DIR` is required. It must name an existing, empty absolute directory outside the
+repository. The script keeps every generated target, temporary file, and kernel object in one
+private child below it, then removes that child while leaving the caller-owned directory in place.
 
 Unlike the flat `bench/`, the kernel pulls in the Align runtime (the JSON parser + arena), so the
 harness links `libalign_runtime.so` (a **cdylib** — dynamic, over the C-ABI, so its bundled std
