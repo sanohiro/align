@@ -37,6 +37,24 @@ The compiler is now at `./target/debug/alignc`. It is not on `PATH`; either call
 
 Ubuntu 24.04's default OpenSSL 3.0 is sufficient for TLS, hashes, HMAC, HKDF, and AEAD. The `crypto.argon2id` provider was added in OpenSSL 3.2; install a newer OpenSSL when you need that operation, otherwise it reports an engine error at runtime.
 
+## Try it in the REPL first
+
+`align-repl` is the quickest way to see Align run. Start it with no arguments:
+
+```text
+$ align-repl
+align> 1 + 2
+3
+align> name := "align"
+align> print(name)
+align
+```
+
+It is not an interpreter. Every entry is spliced into one growing program, the whole program is
+recompiled with the real compiler, and the real native binary runs — so what you see is what
+`alignc` would do. `:save file.align` writes that program out, and `:quit` (or Ctrl-D) leaves.
+Chapter [16](16-toolchain.md) covers the session model and the full command set.
+
 ## Hello, Align
 
 Save this as `hello.align`:

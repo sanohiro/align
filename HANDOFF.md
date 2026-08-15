@@ -7,10 +7,11 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-15._ Align main is at `863c20ba`. align-llm Request 5's bounded HTTP response
+_Last updated: 2026-08-15._ Align main is at `c47e57c7`. align-llm Request 5's bounded HTTP response
 body is shipped, and Request 7's evidence design (#813), benchmark inputs (#815/#821), installed
 manifest (#816), canonical JSON (#817), typed report schema (#818), SSHSIG framing (#820), strict
-controller CLI (#822), and installed-manifest/profile binding (#823) are merged. Active work is
+controller CLI (#822), installed-manifest/profile binding (#823), and raw Git object identity codec
+(#825) are merged. The align-repl user guide is also shipped in #826. Active work is
 `agent/request7-prepared-benchmarks`: both protected JSON benchmarks gain the reviewed two-phase
 `prepare native` / direct `native` interface, canonical artifact sealing, checked integer inner
 medians, descriptor-bound Linux evidence execution, and inode-aware cleanup. The integrated review
@@ -29,10 +30,10 @@ Latest durable verification after the integrated-review repair passed
 `bench/json_decode/run.sh prepare native` plus `run.sh native` and
 `bench/json_soa/run.sh prepare native` plus `run.sh native` completed serially from an empty external
 work directory. These are correctness/boundary owners, not accepted x86_64 performance evidence.
-After this capability merges, continue the installed controller/verifier/monitor with raw baseline
-matching, profile, image recipe, and remaining adversarial owners. Native x86_64 host qualification
-and the Request 7 language implementation branch remain later gates; no emulation is accepted in
-any evidence lane.
+After this capability merges, continue the installed controller/verifier/monitor with revision
+binding, protected-input matching, profile, image recipe, and remaining adversarial owners. Native
+x86_64 host qualification and the Request 7 language implementation branch remain later gates; no
+emulation is accepted in any evidence lane.
 
 The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit
