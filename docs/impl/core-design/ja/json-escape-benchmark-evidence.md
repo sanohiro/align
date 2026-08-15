@@ -188,7 +188,9 @@ executable/runtimeをhashしながらanonymous `memfd`へcopyし、source metada
 Linux UAPI `MFD_EXEC` capabilityを要求して
 `F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL`を適用しsealed descriptorだけをdirect exec/preloadする。
 executable memfd非対応kernel（enforced `vm.memfd_noexec=2`を含む）はpath/unsealed fileへfallbackせず
-qualificationをreject。macOS pathはaccepted evidenceではなくnative ARM development qualificationのまま。
+qualificationをreject。macOS pathはaccepted evidenceではなくnative ARM development qualificationのままで、
+repeated launchを安定させるため`DYLD_SHARED_REGION=private`を固定する。両platformともexec直前に
+descriptor-bound prepared tree全体をretained manifest/digestに対して再検証する。
 missing/extra/changed/wrong-mode/replaced/unsealable artifactとprepare-only selectorをreject。argv arrayでshell interpolationなし。prepare Cargoはすべて
 `--locked --offline`。cache/source/config manifestをbefore/after比較しwriteをreject。benchmark-input
 sliceは各scriptのroot build 2回とdetached `cargo run` 1回、合計current 6 Cargo invocationをlockする。
@@ -535,7 +537,7 @@ ordinary testにしない。native host qualification/final measurementはmanual
 | Linux proc-fd rootをpath-based manifest creationがreject | manifest moduleがalready-opened root descriptor配下でcanonical manifestをbuild/create/fsync/verify。prepareはdescriptor APIのみをcall。 |
 | intermediate symlinkがtrusted post-build copyをredirect可能 | untrusted work前にrootと`artifacts`両descriptorをretain。dedicated helperがsource全componentをno-follow openし、destinationをretained artifacts descriptor相対でcreate、source stabilityを確認、build-treeのnon-directory entryをdescriptor-relative clearし、manifest前にpublic `artifacts` entryがretained objectと同一と検証。 |
 | check後`rmdir`がempty replacementをremove可能 | script cleanupは`rmdir`を一切callしない。retained descriptor配下のnon-directory entryだけをunlinkし、success manifestにempty build-directory skeletonを含め、directory-only treeをcandidate teardown後のouter controllerへ渡す。 |
-| direct executionがambient loader/timing stateをinherit | launcherはledgerのfixed 5-variable environmentだけをconstructし、platform-owned sealed-runtime loader bindingを追加。ownerはambient sentinelをinjectし、harnessが全fixed valueとsentinel absenceをassert。 |
+| direct executionがambient loader/timing stateをinherit | launcherはledgerのfixed base environmentをconstructし、platform-owned runtime bindingとmacOSのfixed `DYLD_SHARED_REGION=private` policyだけを追加。ownerはambient sentinelをinjectし、harnessが全fixed valueとsentinel absenceをassert。 |
 | nested cleanupにもdirectory-entry raceが残存 | candidate-side prepare/cleanupは全directory entryをremoveしない。success/failure ownerがretained directory skeletonをrequireし、outer controllerだけがteardown後にremove。 |
 | top-level benchmark workflowがone-phase executionのまま | `bench/README.md`はprepare-time digest captureからdirect native executionまでを示し、process/environment teardown後のwork-tree removalをcaller ownershipにする。 |
 | build pathだけではarbitrary candidate writeをsandboxできない | script contractはcandidate code自体をsandboxすると主張しない。accepted evidenceはlater outer-controller container boundaryが必須。本sliceはconfigured outputと全trusted publication mutationをconfineし、script-only ARM qualificationはcheckoutをtrustする。 |
@@ -546,6 +548,9 @@ ordinary testにしない。native host qualification/final measurementはmanual
 | bound executionがFIFO replacementのopenでblock可能 | Linux sealed-copyとnative ARM qualificationの両openをnonblocking/no-followにし、read前にnon-regular descriptorをreject。 |
 | bound executionが追加のself-consistent artifactをaccept | launcherはmanifestの`artifacts` subtreeをcompiler/runtime/kernel/selected harness/directory entryのexact setに限定し、extra entryをexecution前にreject。 |
 | sealed Linux artifactが明示的にexecutableでない | launcherはsealingとともにstable Linux UAPI `MFD_EXEC` flagを常に要求。unsupported kernelとenforced `vm.memfd_noexec=2`等のpolicyはhost qualificationでfail-closedし、mutable path bytesへfallbackしない。 |
+| initial verification後にnon-selected prepared fileを変更可能 | executable/runtime bind後、launcherがexec直前にdescriptor-bound prepared tree全体とretained manifest digestを再検証。deterministic ownerはbinding中にeffective configurationを変更し、executionへ到達しないことを証明。 |
+| macOS qualificationにrepositoryのshared-cache isolationがない | native ARM launcherはambient loader stateをinheritせず`DYLD_SHARED_REGION=private`を固定し、executed harnessがexact valueをassert。 |
+| macOS verificationがspecial fileのtype reject前にread | launcherはhash前にinitial descriptor modeを検査。FIFO ownerは`os.read`をrejecting sentinelへ置換し、両platform openerがreadなしでrejectすることを証明。 |
 
 ## Author consistency pass
 

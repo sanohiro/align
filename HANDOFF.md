@@ -72,7 +72,15 @@ policy could reject every otherwise-valid measurement. The repair requests the s
 flag explicitly, fails closed when the kernel or policy cannot provide executable sealed memfds,
 and adds the capability to the closure matrix and owner.
 
-Latest durable verification after the exact-base review repair passed the serial owner aggregate:
+The final exact-base review of `018b6b7f` against `8ce95870` found three launch-boundary gaps: the
+complete prepared tree was not revalidated after executable/runtime binding, macOS qualification
+omitted the repository's private shared-cache setting, and the macOS verifier read before its first
+regular-file check. The consolidated repair re-verifies the complete descriptor-bound tree and
+retained digest immediately before execution, fixes `DYLD_SHARED_REGION=private`, rejects special
+files before hashing, and owns each behavior with deterministic drift, environment, and no-read
+regressions.
+
+Latest durable verification after the final review repair passed the serial owner aggregate:
 `scripts/test-benchmark-evidence-manifest.sh`, `scripts/test-benchmark-evidence-bootstrap.sh`,
 `scripts/test-benchmark-evidence-cli.sh`, `scripts/test-benchmark-evidence-git-objects.sh`,
 `scripts/test-benchmark-evidence-git-batch.sh`, `scripts/test-benchmark-input.sh`, and
@@ -81,9 +89,9 @@ Latest durable verification after the exact-base review repair passed the serial
 `bench/json_decode/run.sh prepare native` plus `run.sh native` and
 `bench/json_soa/run.sh prepare native` plus `run.sh native` completed serially from an empty external
 work directory, with the prepare-time digest supplied to direct execution and an injected ambient
-sentinel excluded by the fixed launcher environment. The post-publication-review rerun produced
-decode digest `8361a6fdecc40a88791ca689504d1aa37c8f73888129ce0c6912904928550bd1` and SoA
-digest `f345f9004bb6e9790c9dca8b320e24cf4814db6f85de829fad47d1b6a2a4ec54`. These are
+sentinel excluded by the fixed launcher environment. The final-review-repair rerun produced decode
+digest `efca5a28a02e8b49636092413c0f92386c39f2bfcb754f7a9f5ddc83f090ef2c` and SoA digest
+`5b1ff95b9364253e4afb81d209d909dfdd5455616f681fcbe5c8c2403fbfaa3c`. These are
 correctness/boundary owners, not accepted x86_64 performance evidence. At this PR's merge, no work
 is active by user request. The next eligible capability is installed-source replacement protection
 and protected-input matching, followed by image recipe/digest qualification, host/adversarial, and

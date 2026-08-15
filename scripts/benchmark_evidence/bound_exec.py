@@ -160,6 +160,8 @@ def _open_verified_file(parent_fd: int, name: str, expected: dict[str, Any]) -> 
     fd = os.open(name, flags, dir_fd=parent_fd)
     try:
         before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise BoundExecError(f"prepared artifact is not a regular file: {name}")
         digest = hashlib.sha256()
         size = 0
         while True:
@@ -185,6 +187,16 @@ def _open_verified_file(parent_fd: int, name: str, expected: dict[str, Any]) -> 
     except BaseException:
         os.close(fd)
         raise
+
+
+def _reverify_prepared_tree(
+    root_fd: int, expected_raw: bytes, expected_manifest_sha256: str
+) -> None:
+    """Revalidate the complete prepared tree immediately before execution."""
+
+    _captured, raw = manifest.verify_manifest_fd(root_fd, "artifact-manifest.json")
+    if raw != expected_raw or manifest.manifest_sha256(raw) != expected_manifest_sha256:
+        raise BoundExecError("prepared manifest changed while binding execution")
 
 
 def _fd_path(fd: int) -> str:
@@ -274,6 +286,7 @@ def execute(
         runtime_fd = _open_bound_file(artifacts_fd, runtime_name, entries[runtime_paths[0]])
         environment["LD_PRELOAD"] = _fd_path(runtime_fd)
         executable_fd_path = _fd_path(executable_fd)
+        _reverify_prepared_tree(root_fd, raw, expected_manifest_sha256)
         os.execve(executable_fd_path, [executable_path], environment)
     if sys.platform == "darwin":
         # macOS has neither fexecve(2) nor execveat(2). This path keeps native ARM developer
@@ -282,6 +295,8 @@ def execute(
         _open_verified_file(artifacts_fd, executable, entries[executable_path])
         _open_verified_file(artifacts_fd, runtime_name, entries[runtime_paths[0]])
         environment["DYLD_LIBRARY_PATH"] = "artifacts"
+        environment["DYLD_SHARED_REGION"] = "private"
+        _reverify_prepared_tree(root_fd, raw, expected_manifest_sha256)
         os.fchdir(root_fd)
         os.execve(executable_path, [executable_path], environment)
     raise BoundExecError("fd-bound benchmark execution requires Linux or macOS")

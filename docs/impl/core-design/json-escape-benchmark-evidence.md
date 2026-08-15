@@ -244,7 +244,10 @@ before and after the copy, requests the Linux UAPI `MFD_EXEC` capability, applie
 `F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL`, and directly execs/preloads only those sealed
 descriptors. A kernel without executable memfds, including an enforced `vm.memfd_noexec=2` policy,
 rejects qualification rather than falling back to a path or unsealed file. The macOS path remains
-native ARM development qualification rather than accepted evidence. Missing, extra, changed,
+native ARM development qualification rather than accepted evidence and fixes
+`DYLD_SHARED_REGION=private` for stable repeated launches. Immediately before either platform
+executes, the launcher re-verifies the complete descriptor-bound prepared tree against the retained
+manifest and digest. Missing, extra, changed,
 wrong-mode, replaced, or unsealable artifacts and every prepare-only selector reject.
 
 No final artifact exists while candidate-controlled Cargo/compiler work can still run. After every
@@ -698,7 +701,7 @@ measurement remain named manual evidence.
 | P1 the Linux proc-fd root was incompatible with path-based manifest creation | The manifest module now builds, creates, fsyncs, and verifies a canonical manifest directly below an already-opened root descriptor. Preparation calls only that descriptor API. |
 | P1 intermediate symlinks could redirect trusted post-build copies | Preparation retains both root and `artifacts` descriptors before untrusted work. A dedicated helper opens every source component no-follow, creates each destination relative to the retained artifacts descriptor, checks source stability, clears build-tree non-directory entries descriptor-relatively, and verifies the public `artifacts` entry still names the retained object before manifest creation. |
 | P2 check-then-`rmdir` could remove an empty replacement | Script cleanup never calls `rmdir`. It unlinks only non-directory entries below retained descriptors, includes empty build-directory skeletons in the success manifest, and leaves the directory-only tree for the outer controller after candidate teardown. |
-| P1 direct execution inherited ambient loader/timing state | The launcher constructs only the ledger's fixed five-variable environment, then adds the platform-owned sealed-runtime loader binding. The owner injects an ambient sentinel and makes the harness assert every fixed value and the sentinel's absence. |
+| P1 direct execution inherited ambient loader/timing state | The launcher constructs the ledger's fixed base environment, then adds only the platform-owned runtime binding and the fixed macOS `DYLD_SHARED_REGION=private` policy. The owner injects an ambient sentinel and makes the harness assert every fixed value and the sentinel's absence. |
 | P2 nested cleanup repeated the directory-entry race | Candidate-side preparation and cleanup never remove any directory entry. Both success and failure owners require the retained directory skeleton, and only the outer controller removes it after teardown. |
 | P2 the top-level benchmark workflow still described one-phase execution | `bench/README.md` now shows prepare-time digest capture followed by direct native execution and assigns final work-tree removal to the caller after process/environment teardown. |
 | P1 build paths alone did not sandbox arbitrary candidate writes | The script contract no longer claims to sandbox candidate code. Accepted evidence requires the later outer-controller container boundary; this slice confines configured outputs and all trusted publication mutations, while script-only ARM qualification trusts the checkout. |
@@ -709,6 +712,9 @@ measurement remain named manual evidence.
 | P2 bound execution could block while opening a FIFO replacement | Both Linux sealed-copy and native ARM qualification opens are nonblocking/no-follow and reject non-regular descriptors before reading. |
 | P2 bound execution accepted additional self-consistent artifacts | The launcher requires the manifest's `artifacts` subtree to be exactly the compiler, runtime, kernel, selected harness, and directory entry; every extra entry rejects before execution. |
 | P1 sealed Linux artifacts were not explicitly executable | The launcher always requests the stable Linux UAPI `MFD_EXEC` flag together with sealing. Unsupported kernels and policies such as enforced `vm.memfd_noexec=2` fail closed during host qualification; execution never falls back to mutable path bytes. |
+| P1 non-selected prepared files could change after initial verification | After binding the executable and runtime, the launcher re-verifies the complete descriptor-bound prepared tree and retained manifest digest immediately before `execve`. A deterministic owner mutates the effective configuration during binding and proves execution is never reached. |
+| P2 macOS qualification omitted the repository's shared-cache isolation | The native ARM launcher fixes `DYLD_SHARED_REGION=private` instead of inheriting ambient loader state, and the executed harness asserts the exact value. |
+| P2 macOS verification read a special file before rejecting its type | The launcher checks the initial descriptor mode before hashing. The FIFO owner replaces `os.read` with a rejecting sentinel and proves both platform openers reject without any read. |
 
 ## Author consistency pass
 

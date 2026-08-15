@@ -225,6 +225,11 @@ set -euo pipefail
 [[ "${PATH:-}" == /usr/bin:/bin ]]
 [[ "${TZ:-}" == UTC ]]
 [[ -z "${ALIGN_BENCH_AMBIENT_SENTINEL+x}" ]]
+if [[ "$(uname -s)" == Darwin ]]; then
+  [[ "${DYLD_SHARED_REGION:-}" == private ]]
+else
+  [[ -z "${DYLD_SHARED_REGION+x}" ]]
+fi
 printf 'fake prepared benchmark\n'
 FAKE_BENCHMARK
   chmod 700 "$CARGO_TARGET_DIR/release/$binary"
@@ -430,6 +435,14 @@ def timed_out(_signum, _frame):
 
 
 signal.signal(signal.SIGALRM, timed_out)
+original_read = bound_exec.os.read
+
+
+def forbidden_read(_fd, _size):
+    raise AssertionError("special file reached artifact read")
+
+
+bound_exec.os.read = forbidden_read
 try:
     for opener in (bound_exec._open_bound_file, bound_exec._open_verified_file):
         signal.alarm(2)
@@ -442,7 +455,67 @@ try:
         finally:
             signal.alarm(0)
 finally:
+    bound_exec.os.read = original_read
     os.close(parent_fd)
+PY
+}
+
+assert_complete_tree_revalidated_before_exec() {
+  PYTHONDONTWRITEBYTECODE=1 python3 - "$REPO_ROOT" "$FAKE_WORK_DIR" <<'PY'
+import os
+import sys
+
+sys.path.insert(0, os.path.join(sys.argv[1], "scripts", "benchmark_evidence"))
+import bound_exec
+import manifest
+
+
+class WouldExec(Exception):
+    pass
+
+
+root = os.path.join(sys.argv[2], "prepared")
+root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+root_stat = os.fstat(root_fd)
+_captured, raw = manifest.verify_manifest_fd(root_fd, "artifact-manifest.json")
+digest = manifest.manifest_sha256(raw)
+opener_name = "_open_verified_file" if sys.platform == "darwin" else "_open_bound_file"
+original_opener = getattr(bound_exec, opener_name)
+open_count = 0
+
+
+def mutate_after_binding(parent_fd, name, expected):
+    global open_count
+    result = original_opener(parent_fd, name, expected)
+    open_count += 1
+    if open_count == 2:
+        with open(os.path.join(root, "configuration.json"), "ab") as configuration:
+            configuration.write(b"\n")
+    return result
+
+
+def reject_exec(_path, _argv, _environment):
+    raise WouldExec
+
+
+setattr(bound_exec, opener_name, mutate_after_binding)
+bound_exec.os.execve = reject_exec
+try:
+    bound_exec.execute(
+        root,
+        root_fd,
+        f"{root_stat.st_dev}:{root_stat.st_ino}",
+        digest,
+        "json-decode-bench",
+    )
+except (bound_exec.BoundExecError, manifest.ManifestError):
+    pass
+except WouldExec:
+    raise SystemExit("complete prepared-tree drift reached exec")
+else:
+    raise SystemExit("complete prepared-tree drift was accepted")
+finally:
+    os.close(root_fd)
 PY
 }
 
@@ -588,6 +661,11 @@ benchmark_input_workdir_matrix() {
     [[ ! -e "$REPO_ROOT/bench/$bench/kernel.o" ]] || fail "$bench wrote kernel.o beside its source"
   done
   assert_locked_offline_invocations
+
+  FAKE_WORK_DIR="$TEST_ROOT/complete-tree-drift-work"
+  mkdir -p "$FAKE_WORK_DIR"
+  run_benchmark json_decode env
+  assert_complete_tree_revalidated_before_exec
 
   FAKE_WORK_DIR="$TEST_ROOT/mutated-work"
   mkdir -p "$FAKE_WORK_DIR"
