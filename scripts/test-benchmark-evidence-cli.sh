@@ -27,6 +27,12 @@ def expect_error(argv, fragment):
         raise AssertionError(f"accepted invalid invocation: {argv}")
 
 
+def with_value(argv, index, value):
+    result = list(argv)
+    result[index] = value
+    return result
+
+
 def main():
     with tempfile.TemporaryDirectory() as root:
         root = os.path.abspath(root)
@@ -132,15 +138,15 @@ def main():
     base_run = [
         "run",
         "--repository",
-        "/repo",
+        os.path.join(root, "repo"),
         "--baseline",
         OID,
         "--candidate",
         OTHER_OID,
         "--review-log",
-        "/review.log",
+        os.path.join(root, "review.log"),
         "--output-dir",
-        "/new-output",
+        os.path.join(root, "new-output"),
     ]
     expect_error([], "command mode")
     expect_error(["unknown"], "unknown command mode")
@@ -161,6 +167,45 @@ def main():
         [*base_run[:2], "relative", *base_run[3:]],
         "absolute path",
     )
+    expect_error(with_value(base_run, 2, ""), "absolute path")
+    expect_error(with_value(base_run, 2, "/repo\x00"), "absolute path")
+    expect_error(with_value(base_run, 2, "-repo"), "missing value")
+    expect_error(with_value(base_run, 2, 123), "arguments must be strings")
+
+    base_verify = [
+        "verify",
+        "--report",
+        os.path.join(root, "report.json"),
+        "--signature",
+        os.path.join(root, "report.json.sig"),
+        "--expected-baseline",
+        OID,
+        "--expected-candidate",
+        OTHER_OID,
+        "--pr-body",
+        os.path.join(root, "pr-body.txt"),
+        "--review-attestation",
+        os.path.join(root, "review-attestation.json"),
+    ]
+    expect_error(with_value(base_verify, 6, OID.upper()), "lowercase 40-hex")
+    expect_error(with_value(base_verify, 8, "0" * 39), "lowercase 40-hex")
+    expect_error(with_value(base_verify, 8, OID), "must differ")
+
+    base_merge = [
+        "verify-merge",
+        "--repository",
+        os.path.join(root, "repo"),
+        "--report",
+        os.path.join(root, "report.json"),
+        "--signature",
+        os.path.join(root, "report.json.sig"),
+        "--merge",
+        OID,
+        "--output-dir",
+        os.path.join(root, "merge-output"),
+    ]
+    expect_error(with_value(base_merge, 8, OID.upper()), "lowercase 40-hex")
+    expect_error(with_value(base_merge, 8, "0" * 39), "lowercase 40-hex")
 
     print("benchmark evidence CLI checks passed")
 
