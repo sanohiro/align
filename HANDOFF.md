@@ -7,26 +7,24 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-15._ Align main is at `19fbc786`: align-llm Request 5's bounded HTTP response
-body is shipped, and Request 7's evidence design (#813), benchmark inputs (#815), installed-source
-manifest (#816), canonical JSON (#817), typed report schema (#818), SSHSIG framing (#820), and
-benchmark-input hardening (#821) are merged. Active work is
+_Last updated: 2026-08-15._ Align main is at `863c20ba`. align-llm Request 5's bounded HTTP response
+body is shipped, and Request 7's evidence design (#813), benchmark inputs (#815/#821), installed
+manifest (#816), canonical JSON (#817), typed report schema (#818), SSHSIG framing (#820), strict
+controller CLI (#822), and installed-manifest/profile binding (#823) are merged. Active work is
 `agent/request7-prepared-benchmarks`: both protected JSON benchmarks gain the reviewed two-phase
-`prepare native` / direct `native` interface, canonical artifact sealing, and checked integer inner
-medians. Its focused owners are `scripts/test-benchmark-input.sh` and the
-`benchmark_evidence_statistic_matrix` test in
-`bench/json_escape/evidence/statistics.rs`. Next, finish native ARM64 owner verification with one
-compiler job, review and merge this capability, then implement the installed evidence
-controller/verifier/monitor, profile, image recipe, and remaining adversarial owners. Native x86_64
-host qualification and the Request 7 language implementation branch remain later gates; no
-emulation is accepted in any evidence lane.
+`prepare native` / direct `native` interface, canonical artifact sealing, checked integer inner
+medians, descriptor-bound Linux evidence execution, and inode-aware cleanup. Its focused owners are
+`scripts/test-benchmark-input.sh`, `scripts/test-benchmark-evidence-manifest.sh`, and
+`scripts/test-benchmark-evidence-statistics.sh`.
 
 Latest durable verification on native Apple ARM64 passed with `CARGO_BUILD_JOBS=1`: each of
 `bench/json_decode/run.sh prepare native` plus `run.sh native` and
-`bench/json_soa/run.sh prepare native` plus `run.sh native` completed from an empty external work
-directory. `scripts/test-benchmark-input.sh`, `scripts/test-benchmark-evidence-manifest.sh`, and
-`scripts/test-benchmark-evidence-statistics.sh` also pass; these are correctness/boundary owners,
-not accepted x86_64 performance evidence.
+`bench/json_soa/run.sh prepare native` plus `run.sh native` completed serially from an empty external
+work directory. These are correctness/boundary owners, not accepted x86_64 performance evidence.
+After this capability merges, continue the installed controller/verifier/monitor with raw baseline
+matching, profile, image recipe, and remaining adversarial owners. Native x86_64 host qualification
+and the Request 7 language implementation branch remain later gates; no emulation is accepted in
+any evidence lane.
 
 The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit
@@ -203,8 +201,8 @@ facts must live in this repository.
   Request 8 is merged through Align design #799 and implementation #801; Request 10's §7.6
   implementation is merged; Requests 11 and 12 are implemented, and Request 5's bounded-HTTP
   implementation is merged at `5aa5b23a`. Request 7's benchmark-evidence design is active, and its
-  benchmark-input prerequisite and evidence-format foundations are implemented; Requests
-  9 and 13–15 remain proposed in
+  benchmark-input, manifest, canonical JSON, typed report, SSHSIG, CLI, and bootstrap-binding
+  prerequisites are merged; Requests 9 and 13–15 remain proposed in
   `../align-llm/docs/align-requests.md`; Request 9 remains the later C7 blocker after Request 7.
 
 Consumer-gated deferrals that remain intentional:
