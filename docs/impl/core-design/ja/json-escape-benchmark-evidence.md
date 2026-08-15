@@ -485,9 +485,9 @@ deterministic ownerを含むhand-written implementationは1,000行を少し超�
 | Forged/stale | unsigned/edit/replay/truncate/concat/wrong namespace、PR/preflight/trusted-review mismatch。`CLEAN`は`clean`のみ、accepted `FINDINGS` + nonempty repair chainは`fixed`のみにmap。`benchmark_evidence_stale_forged_matrix`. |
 | Base/integration race | target move、precheck race、unavailable/wrong response OID、local-target mismatch、wrong parent/tree、signed artifact mutation、normal later first-parent descendant、final trusted refetch前のforce-push/removal、revert failure、exact merge。final target first-parent chainにmergeが残らなければlifecycleを進めない。`benchmark_evidence_merge_race_matrix`. |
 
-次のcapabilityはbase/integration race ownerに限定する。既にmerge済みのidentity、revision、report、
-signature、cleanup、exclusive-run boundaryをconsumeし、controller、verifier、provider credential、
-Docker execution、lifecycle adapterは追加しない。implementation closure matrixは次の通り。
+base/integration race capabilityはPR #840でmerge済みである。既にmerge済みのidentity、revision、report、
+signature、cleanup、exclusive-run boundaryをconsumeし、provider credentialやlive service adapterを導入せずに
+disposable provider/lifecycle relationshipを検証する。完了したclosure matrixは次の通り。
 
 | Axis | Closure / owner |
 |---|---|
@@ -499,8 +499,34 @@ Docker execution、lifecycle adapterは追加しない。implementation closure 
 | Final refetch | staging後、`MERGE`を含むnormal later first-parent descendantはacceptする。force-push、target removal、final fetch unavailableはrejectしlifecycleを進めない。`benchmark_evidence_merge_race_matrix`. |
 | Revert/lifecycle | exact mergeは全relationshipとfinal refetchのsuccess後だけ`accepted`になる。failureは`rejected`、`reverted`、`blocked`のいずれかとなり、lifecycleを進めずaccepted artifactを出さない。`benchmark_evidence_merge_race_matrix`. |
 
-testsはfixture executor/fake daemon/disposable repo+remote/test keyを使いperformance workload/wall-clock ratioを
-ordinary testにしない。native host qualification/final measurementはmanual named evidence。
+次のcapabilityはtrusted controller/verifier orchestration coreに限定する。merge済みのbootstrap、CLI、profile、
+host/image/container、source、process、monitor、schedule、cleanup、exclusive-run、report、signature、merge-race
+boundaryをconsumeし、fixture-ownedなdeterministic consumerとしてphase orderingとtrusted-artifact handoffを提供する。
+real host inspection、Docker起動、GitHub query、provider credential、performance workload、cryptographic key management、
+post-merge lifecycle advanceはこのPRに含めない。implementation closure matrixは次の通り。
+
+testsはfixture gate/executor/artifact store/test keyを使い、host inspection、provider接続、Docker、performance workload、
+wall-clock ratioを実行しない。native host qualification、cryptographic key-process integration、provider/review API
+integration、final Request 7 measurementは後続のnamed evidenceとする。
+
+| Axis | Closure / owner |
+|---|---|
+| Trusted bootstrap and invocation | run controllerはparsed済みの`cli.RunInvocation`だけをconsumeし、verifier portはparsed済みの`cli.VerifyInvocation`に対応するexplicit bytesをconsumeする。両方をfixed profile/tool identityへbindし、installed manifest、profile digest、target ref、OID、path、ambient selectorの不一致をgate/child前にrejectする。path resolutionは後続のtrusted adapterが所有する。`benchmark_evidence_controller_verifier_matrix`. |
+| Preflight gate ordering | immutable bootstrap、trusted host/image/source/review gateを宣言順に実行し、完了phaseを記録する。gate failureは次のgate前に停止し、child、report、signature、staging output、publication reservationを作らない。`benchmark_evidence_controller_verifier_matrix`. |
+| Schedule/executor handoff | 既存の`ScheduleState`をfixture executorでdriveする。fixed preparation、warm-up、alternating sampleは各一回、unique child ID、sealed artifact digestを持ち、次child前にowned-resource ledgerからremoveする。overlap、reorder、retry、measurement中のbuild、artifact drift、timeout、signal、nonzero、incomplete scheduleはrejectする。`benchmark_evidence_controller_verifier_matrix`. |
+| Cleanup/publication ordering | 既存の`CleanupTransaction`をdriveし、report staging前にchildren/containers/mounts/fds/private directoriesがゼロでsource/cache manifestがunchangedであることを要求する。durable reservationをlock releaseより前、publicationをreservation removalより前に置く。publish、unlock、cleanupのfailureはaccepted resultを出さず、ownershipが不明ならfail-closed reservationを残す。`benchmark_evidence_controller_verifier_matrix`. |
+| Report/signature handoff | scheduleとcleanup完了後にtrusted fixture-owned producerから得たreport bytes/signature bytesだけを受け入れる。controllerはcandidate-provided reportを受け付けず、candidate moduleをopenせず、verifierがexact bytesを受け入れる前にpublishできない。`benchmark_evidence_controller_verifier_matrix`. |
+| Verifier binding | canonical reportをdecodeし、既存report schemaとbody digestを全検証する。profile/baseline/candidate/target/review fieldをexplicit trusted expectationへbindし、exact review attestationとPR-body preflight markerをparseし、fixed report namespace/keyに対するinjected cryptographic signature checkを要求する。wrong bytes、namespace、key、signature、attestation、PR marker、verdict、expected OIDはrepository/build/benchmark/network/output mutationなしにrejectする。`benchmark_evidence_controller_verifier_matrix`. |
+| Failure and restart | exceptionは必ずterminal rejectedまたはfail-closed resultになる。durable reservationがある間はsecond invocationをblockし、accepted stateはreport/signature pairをdurably publishしてreservationをremoveした後だけ到達できる。crash/restartとcleanup failureでもpartial stateをaccepted evidenceへ変えない。`benchmark_evidence_controller_verifier_matrix`. |
+| Explicit deferrals | real host inspection、Docker daemon/image execution、GitHub review API/token isolation、`ssh-keygen`/Ed25519 signing、raw Git revision construction、providerとのmerge verification、post-merge lifecycle advanceは後続capabilityとし、このcoreで偽装しない。`benchmark_evidence_controller_verifier_matrix`. |
+
+controller/verifier ownerはaccepted Request 7 evidenceではなくorchestration boundaryである。既存producerを順序外で
+consumeできないことと、verifier failureがpublication boundaryを越えないことを証明する。host qualificationまたは
+measurementの前に、後続capabilityが各fixture gateを対応するprivileged adapterへ置き換える。
+
+このcapabilityはcontroller、verifier、shared adversarial ownerを合わせるとroughly 1,000 hand-written linesを超える。
+strict dormant producer-to-consumer chainを一つに保つことで、同じfull report/attestation fixtureがverifier bindingと
+publication barrierの両方を証明できる。分割するとfixtureを重複させ、controllerのartifact handoffを未reviewのまま残す。
 
 ## Design-review finding closure
 

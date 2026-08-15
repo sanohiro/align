@@ -647,10 +647,10 @@ controller, verifier, or merge-race behavior.
 | Forged/stale evidence | Unsigned, edited, replayed profile/target/review/candidate, truncated, concatenated, and valid-signature/wrong-namespace reports reject. PR/preflight/trusted-review mismatch blocks; `CLEAN` maps only to `clean`, and accepted `FINDINGS` with a nonempty repair chain maps only to `fixed`. `benchmark_evidence_stale_forged_matrix`. |
 | Base/integration race | Disposable remote covers target movement before/after run, precheck-to-merge race, unavailable/wrong response OID, local-target mismatch, wrong merge parents/tree, signed merge-verification mutation, a normal later first-parent descendant, force-push/removal before the final trusted refetch, failed revert, and exact merge. The merge must remain on the final target first-parent chain; failures never advance lifecycle. `benchmark_evidence_merge_race_matrix`. |
 
-The next capability is intentionally limited to the base/integration race owner. It consumes the
-already merged identity, revision, report, signature, cleanup, and exclusive-run boundaries and does
-not introduce the controller, verifier, provider credentials, Docker execution, or lifecycle adapter.
-Its implementation closure matrix is:
+The base/integration race capability is merged in PR #840. It consumes the already merged identity,
+revision, report, signature, cleanup, and exclusive-run boundaries and proves the disposable
+provider/lifecycle relationship without introducing provider credentials or a live service adapter.
+Its completed closure matrix is:
 
 | Axis | Closure and owner |
 |---|---|
@@ -662,10 +662,41 @@ Its implementation closure matrix is:
 | Final refetch | After staging, accept a normal later first-parent descendant that still contains `MERGE`; a force-push, target removal, or unavailable final fetch rejects and never advances lifecycle. `benchmark_evidence_merge_race_matrix`. |
 | Revert/lifecycle | Exact merge reaches `accepted` only after every relationship and final refetch passes. Every failure reaches `rejected`, `reverted`, or `blocked`; no failure advances lifecycle or emits an accepted artifact. `benchmark_evidence_merge_race_matrix`. |
 
+The next capability is intentionally limited to the trusted controller/verifier orchestration core.
+It consumes the merged bootstrap, CLI, profile, host/image/container, source, process, monitor,
+schedule, cleanup, exclusive-run, report, signature, and merge-race boundaries. It provides the
+phase ordering and trusted-artifact handoff as a deterministic fixture-owned consumer. It does not
+inspect a real host, invoke Docker, query GitHub, receive provider credentials, run the performance
+workload, perform cryptographic key management, or advance the post-merge lifecycle. Its
+implementation closure matrix is:
+
 Implementation maps every row to source and deterministic tests before review. Tests use fixture
-executors, a fake daemon, disposable repositories/remotes, and test keys; they do not run the
-performance workload or assert wall-clock ratios. Native host qualification and final Request 7
-measurement remain named manual evidence.
+gates, executors, artifact stores, and test keys; they do not inspect the host, contact a provider,
+run Docker, run the performance workload, or assert wall-clock ratios. Native host qualification,
+cryptographic key-process integration, provider/review API integration, and final Request 7
+measurement remain named later evidence.
+
+| Axis | Closure and owner |
+|---|---|
+| Trusted bootstrap and invocation | The run controller consumes only an already parsed `cli.RunInvocation`; the verifier port consumes the explicit bytes corresponding to a parsed `cli.VerifyInvocation`. Bind both to the fixed profile/tool identities and reject a mismatched installed manifest, profile digest, target ref, OID, path, or ambient selector before any gate or child. Path resolution remains a later trusted adapter. `benchmark_evidence_controller_verifier_matrix`. |
+| Preflight gate ordering | Run immutable bootstrap, trusted host/image/source/review gates in the declared order and record each completed phase. A gate failure stops before the next gate and cannot create a child, report, signature, staging output, or publication reservation. `benchmark_evidence_controller_verifier_matrix`. |
+| Schedule/executor handoff | Drive the existing `ScheduleState` with an injected fixture executor. Every fixed preparation, warm-up, and alternating sample is started once, has a unique child ID, carries the sealed artifact digest, and is removed from the owned-resource ledger before the next child. Overlap, reorder, retry, build during measurement, artifact drift, timeout, signal, nonzero, and incomplete schedule reject. `benchmark_evidence_controller_verifier_matrix`. |
+| Cleanup/publication ordering | Drive the existing `CleanupTransaction` and require zero children/containers/mounts/fds/private directories plus unchanged source/cache manifests before report staging. Durable reservation precedes lock release; publication precedes reservation removal; any publish, unlock, or cleanup failure emits no accepted result and leaves a fail-closed reservation when ownership is uncertain. `benchmark_evidence_controller_verifier_matrix`. |
+| Report/signature handoff | Accept report bytes and signature bytes only from trusted fixture-owned producers after schedule and cleanup completion. The controller does not accept a candidate-provided report, opens no candidate module, and cannot publish an artifact before the verifier accepts the exact bytes. `benchmark_evidence_controller_verifier_matrix`. |
+| Verifier binding | Decode the canonical report, validate the full existing report schema and body digest, bind profile/baseline/candidate/target/review fields to explicit trusted expectations, parse the exact review attestation and PR-body preflight markers, and require an injected cryptographic signature check with the fixed report namespace/key. Wrong bytes, namespace, key, signature, attestation, PR marker, verdict, or expected OID reject without repository, build, benchmark, network, or output mutation. `benchmark_evidence_controller_verifier_matrix`. |
+| Failure and restart | Every exception has one terminal rejected or fail-closed result. A second invocation remains blocked while a durable reservation exists; accepted state is reachable only after the complete report/signature pair is durably published and the reservation is removed. Crash/restart and cleanup-failure fixtures never turn partial state into accepted evidence. `benchmark_evidence_controller_verifier_matrix`. |
+| Explicit deferrals | Real host inspection, Docker daemon/image execution, GitHub review API/token isolation, `ssh-keygen`/Ed25519 signing, raw Git revision construction, merge verification against a provider, and post-merge lifecycle advancement remain later capabilities and are not faked by this core. `benchmark_evidence_controller_verifier_matrix`. |
+
+The controller/verifier owner is an orchestration boundary, not accepted Request 7 evidence. It
+proves that existing producers cannot be consumed out of order and that a verifier failure cannot
+cross the publication boundary; later capability owners must replace each fixture gate with the
+corresponding privileged adapter before host qualification or measurement.
+
+This capability is expected to exceed roughly 1,000 hand-written lines when its controller,
+verifier, and shared adversarial owner are counted. Keeping the strict dormant producer-to-consumer
+chain together lets one full report/attestation fixture prove both the verifier bindings and the
+publication barrier; splitting it would duplicate that fixture and leave the controller's artifact
+handoff unreviewed.
 
 ## Design-review finding closure
 
