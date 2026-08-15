@@ -28,8 +28,13 @@ PR #813 merged at `734ae3ab`, and the benchmark-input prerequisite merged in PR 
 Author inspection of the benchmark-input slice found that the current scripts make six Cargo
 invocations, not the four root builds named by the delivery prose; the repair binds all six and
 identifies the two later `cargo run` replacements. The same pass makes the work-root safety and
-cleanup contract exact instead of leaving `unsafe` to implementation judgement. Active work is the
-evidence implementation: the no-follow installed-source manifest foundation is shipped in #816 at
+cleanup contract exact instead of leaving `unsafe` to implementation judgement. A post-merge
+independent audit found three narrow owner gaps in #815: final-symlink `//` and `/.` aliases,
+missing/stale detached locks, and TERM-ignoring descendants were not exercised, while foreground
+children could delay shell traps indefinitely. Active work on `agent/benchmark-input-hardening`
+closes those classes with explicit lock validation, per-command process groups, bounded TERM/KILL,
+direct-child reap, and exact regression fixtures. The evidence implementation continues after this
+hardening: the no-follow installed-source manifest foundation is shipped in #816 at
 `7db1af8c`, canonical JSON primitives are shipped in #817 at `4ec35dfe`, and the current slice adds
 the complete typed Report/Body schema, ordered nested validation, and body-digest binding before
 the controller/verifier/monitor, profile, image recipe, and adversarial owners follow. Host
