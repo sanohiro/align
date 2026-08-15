@@ -50,15 +50,17 @@ environment, disabled replacement/lazy-fetch/optional-lock behavior, no system/g
 and an owned process group. PR #831 then shipped the raw batch reader plus commit, tree, and
 two-sided revision binding. PR #832 shipped verified raw source materialization and
 retained-descriptor verification; it does not execute Docker, `ssh-keygen`, or the benchmark.
-Active work on `agent/request7-profile-image` adds canonical validation for the immutable
-x86_64 evidence profile, including host-lock identity, Docker/image/toolchain identities, fixed
-observation limits, capture/timeouts, signing key, schedule, and benchmark inventory. It does not
-inspect the host or daemon, provision a key, build an image, or execute the controller. The image
-recipe, host qualification, adversarial owners, and full controller/verifier implementation remain
-later work. Materialization and retained verification intentionally shared one boundary because
-they depend on the same raw path layout, reviewed-symlink policy, descriptor identity, and cleanup
-proof; splitting them would have duplicated the boundary fixtures without leaving a stable consumer
-for either half.
+PR #833 shipped canonical validation for the immutable x86_64 evidence profile, including the
+host-global lock path, Docker/image/toolchain identities, fixed observation limits, capture/timeouts,
+signing key, schedule, and benchmark inventory. Active work on `agent/request7-image-recipe` adds
+the fixed container launch argv boundary: digest-only image selection, private namespaces, explicit
+resource/security limits, read-only source/toolchain mounts, private writable workspaces, and an
+explicit fixed environment. It does not call Docker, inspect the host or daemon, build an image,
+provision a key, or execute the controller. Image recipe/digest qualification, host qualification,
+adversarial owners, and full controller/verifier implementation remain later work. Materialization
+and retained verification intentionally shared one boundary because they depend on the same raw
+path layout, reviewed-symlink policy, descriptor identity, and cleanup proof; splitting them would
+have duplicated the boundary fixtures without leaving a stable consumer for either half.
 
 The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit
