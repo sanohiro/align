@@ -326,6 +326,7 @@ expected = {
     "size": len(payload),
     "sha256": hashlib.sha256(payload).hexdigest(),
 }
+
 parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
 sealed_fd = bound_exec._open_bound_file(parent_fd, "payload", expected)
 try:
@@ -343,6 +344,46 @@ try:
 finally:
     os.close(sealed_fd)
     os.close(parent_fd)
+PY
+}
+
+assert_special_file_copy_rejects_without_blocking() {
+  PYTHONDONTWRITEBYTECODE=1 python3 - "$REPO_ROOT" "$TEST_ROOT" <<'PY'
+import os
+import signal
+import sys
+
+sys.path.insert(0, os.path.join(sys.argv[1], "scripts", "benchmark_evidence"))
+import prepared_tree
+
+root = os.path.join(sys.argv[2], "special-file-copy")
+artifacts = os.path.join(root, "artifacts")
+release = os.path.join(root, "root-target", "release")
+os.makedirs(artifacts, mode=0o700)
+os.makedirs(release, mode=0o700)
+os.mkfifo(os.path.join(release, "libalign_runtime.so"), mode=0o600)
+root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+artifacts_fd = os.open(artifacts, os.O_RDONLY | os.O_DIRECTORY)
+os.dup2(root_fd, prepared_tree.ROOT_FD)
+os.dup2(artifacts_fd, prepared_tree.ARTIFACTS_FD)
+
+
+def timed_out(_signum, _frame):
+    raise TimeoutError("candidate FIFO blocked prepared-tree copy")
+
+
+signal.signal(signal.SIGALRM, timed_out)
+signal.alarm(2)
+try:
+    prepared_tree._copy_runtime()
+except (prepared_tree.PreparedTreeError, prepared_tree.manifest.ManifestError):
+    pass
+else:
+    raise SystemExit("candidate FIFO was accepted as a runtime artifact")
+finally:
+    signal.alarm(0)
+    os.close(root_fd)
+    os.close(artifacts_fd)
 PY
 }
 
@@ -448,6 +489,7 @@ benchmark_input_workdir_matrix() {
   expect_invalid_workdirs
   make_fake_tools
   assert_linux_sealed_copy
+  assert_special_file_copy_rejects_without_blocking
   [[ -f "$REPO_ROOT/bench/json_decode/Cargo.lock" ]] || fail "json_decode Cargo.lock is missing"
   [[ -f "$REPO_ROOT/bench/json_soa/Cargo.lock" ]] || fail "json_soa Cargo.lock is missing"
 

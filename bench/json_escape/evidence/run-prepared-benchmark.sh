@@ -370,19 +370,25 @@ emit_kernel() {
   # BENCH_EXPORTS is a fixed, wrapper-owned word list.
   # shellcheck disable=SC2086
   ALIGNC_CACHE="$BENCH_ALIGNC_CACHE_DIR" TMPDIR="$BENCH_TMP_DIR" \
-    "$BENCH_ARTIFACT_DIR/alignc" emit-obj "$SCRIPT_DIR/kernel.align" \
+    "$BENCH_ROOT_TARGET_DIR/release/alignc" emit-obj "$SCRIPT_DIR/kernel.align" \
     kernel.o --target-cpu native $BENCH_EXPORTS
 }
 
 build_harness() {
   cd "$SCRIPT_DIR"
   CARGO_TARGET_DIR="$BENCH_DETACHED_TARGET_DIR" TMPDIR="$BENCH_TMP_DIR" \
-    ALIGN_KERNEL_OBJ="$BENCH_ARTIFACT_DIR/kernel.o" ALIGN_RUNTIME_DIR="$BENCH_ARTIFACT_DIR" \
+    ALIGN_KERNEL_OBJ="$BENCH_BOUND_PRIVATE_DIR/kernel.o" \
+    ALIGN_RUNTIME_DIR="$BENCH_ROOT_TARGET_DIR/release" \
     "$REPO_ROOT/scripts/cargo.sh" build -q --release --locked --offline
 }
 
 run_child_group build_alignc
 run_child_group build_runtime
+run_child_group emit_kernel
+run_child_group build_harness
+
+# No final artifact exists while candidate-controlled build/compiler work can still run. Only the
+# descriptor-relative helper publishes the complete set after every child group has exited.
 PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/scripts/benchmark_evidence/prepared_tree.py" \
   copy --source root-target/release/alignc --destination alignc --mode 0755
 runtime_name="$(PYTHONDONTWRITEBYTECODE=1 python3 \
@@ -392,11 +398,8 @@ if [[ "$runtime_name" == *.dylib ]]; then
   PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/scripts/benchmark_evidence/prepared_tree.py" \
     chmod-artifact --name "$runtime_name" --mode 0755
 fi
-
-run_child_group emit_kernel
 PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/scripts/benchmark_evidence/prepared_tree.py" \
   copy --source kernel.o --destination kernel.o --mode 0644
-run_child_group build_harness
 PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/scripts/benchmark_evidence/prepared_tree.py" \
   copy --source "detached-target/release/$BENCH_BINARY" \
   --destination "$BENCH_BINARY" --mode 0755

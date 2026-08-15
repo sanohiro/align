@@ -51,6 +51,12 @@ assertion used the wrong parameter expansion, and the decode README still advert
 ambient profiling switch. The final repair asserts defined-and-empty `HOME` directly and marks the
 old profile numbers as historical, with no profiling switch on the sealed evidence interface.
 
+The exact-base integration review of `d9fca1e7` found that final artifacts existed during later
+candidate work, FIFO outputs could block copying, and the design overclaimed script-level sandboxing
+of arbitrary candidate writes. The repair publishes all final artifacts only after every child group
+exits, opens fixed outputs nonblocking/no-follow, and assigns arbitrary-write confinement to the
+already-required outer controller container; script-only ARM qualification trusts the checkout.
+
 Latest durable verification after the exact-base review repair passed the serial owner aggregate:
 `scripts/test-benchmark-evidence-manifest.sh`, `scripts/test-benchmark-evidence-bootstrap.sh`,
 `scripts/test-benchmark-evidence-cli.sh`, `scripts/test-benchmark-evidence-git-objects.sh`,

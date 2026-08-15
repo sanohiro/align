@@ -148,6 +148,8 @@ def _open_directory(parent_fd: int, name: str) -> int:
 
 def _open_file(parent_fd: int, name: str) -> int:
     flags = os.O_RDONLY
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):

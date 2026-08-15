@@ -199,7 +199,7 @@ directory whose final path component is not a symbolic link. Its physical path m
 repository root, or inside the repository, and it must contain no entry, including a hidden entry,
 before the script starts. Each script enters `umask 077`, creates exactly one private child below
 that directory, binds root and detached Cargo targets, `TMPDIR`, the kernel object, and every
-generated artifact below that child. Prepare success retains the sealed child. Error, signal, and
+configured build output below that child. Prepare success retains the sealed child. Error, signal, and
 interrupt recursively unlink non-directory entries only below its retained descriptor and leave a
 directory-only skeleton for the trusted caller to remove after container/process teardown. Relative,
 final-symlink, root, repository, in-repository,
@@ -211,8 +211,12 @@ removed. The caller-owned directory and one directory-only owned tree remain aft
 failure; the outer controller owns their race-free removal after the candidate container is gone.
 
 The script opens and retains the private child before starting any untrusted build. On the accepted
-Linux path every preparation path is rooted through that descriptor's `/proc` handle, so renaming or
-replacing `prepared` cannot redirect later Cargo, compiler, copy, chmod, manifest, or cleanup work.
+Linux path, the outer controller's read-only-root container and controller-owned writable mounts
+confine arbitrary candidate build writes; the script alone is not that sandbox. Configured
+Cargo/compiler outputs stay below the retained child, and every trusted post-build copy, chmod,
+manifest, and cleanup mutation is descriptor-relative, so renaming or replacing `prepared` cannot
+redirect publication into caller data. Any candidate escape within a controller-owned writable
+mount creates foreign residue and rejects.
 Cleanup recursively unlinks non-directory entries only through the retained descriptor and never
 deletes a directory entry while a candidate-side writer could race it. Empty build-directory
 skeletons are included in the prepared manifest on success and removed by the outer controller only
@@ -238,6 +242,12 @@ before and after the copy, applies `F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEA
 execs/preloads only those sealed descriptors. The macOS path remains native ARM development
 qualification rather than accepted evidence. Missing, extra, changed, wrong-mode, replaced, or
 unsealable artifacts and every prepare-only selector reject.
+
+No final artifact exists while candidate-controlled Cargo/compiler work can still run. After every
+child process group exits, the descriptor-relative helper opens each fixed output no-follow and
+nonblocking, rejects non-regular files before reading, checks source stability, and creates the
+complete final artifact set. Thus a build may produce its declared output, but it cannot rewrite an
+already-published runtime, kernel, compiler, or harness before manifest capture.
 
 All prepare-phase Cargo operations are visibly `--locked --offline`; `CARGO_NET_OFFLINE=true` is
 defense in depth. Registry/cache/source manifests are compared before/after; a lockfile, index,
@@ -674,7 +684,7 @@ measurement remain named manual evidence.
 | Finding | Ledger-first closure |
 |---|---|
 | P1 a self-consistent tree could replace prepared state between phases | Prepare prints its canonical manifest SHA-256. The trusted controller retains that value outside candidate-writable state, every native invocation requires it, and descriptor-relative verification rejects a different current manifest before opening executable/runtime artifacts. |
-| P1 an untrusted prepare child could redirect later path writes | The script retains the private-child descriptor before the first build. Every accepted Linux preparation path uses that descriptor's `/proc` handle, and publication requires the public path to retain the same device/inode. Native ARM macOS remains development qualification only. |
+| P1 an untrusted prepare child could redirect later path writes | The accepted controller confines arbitrary candidate writes with its read-only-root container and controller-owned writable mounts. The script retains the private-child descriptor before the first build; configured outputs stay below it, every trusted post-build mutation is descriptor-relative, and publication requires the public path to retain the same device/inode. Script-only native ARM macOS remains trusted-checkout development qualification. |
 | P2 cleanup could recursively delete a replacement after a check/path race | Recursive cleanup walks only through the retained private-child descriptor, unlinks non-directory entries, and leaves all directory entries in place while candidate-side concurrency is possible. Script-level failure leaves its directory-only owned tree for trusted outer cleanup after teardown. |
 
 ## Final-candidate review closure
@@ -687,6 +697,9 @@ measurement remain named manual evidence.
 | P1 direct execution inherited ambient loader/timing state | The launcher constructs only the ledger's fixed five-variable environment, then adds the platform-owned sealed-runtime loader binding. The owner injects an ambient sentinel and makes the harness assert every fixed value and the sentinel's absence. |
 | P2 nested cleanup repeated the directory-entry race | Candidate-side preparation and cleanup never remove any directory entry. Both success and failure owners require the retained directory skeleton, and only the outer controller removes it after teardown. |
 | P2 the top-level benchmark workflow still described one-phase execution | `bench/README.md` now shows prepare-time digest capture followed by direct native execution and assigns final work-tree removal to the caller after process/environment teardown. |
+| P1 build paths alone did not sandbox arbitrary candidate writes | The script contract no longer claims to sandbox candidate code. Accepted evidence requires the later outer-controller container boundary; this slice confines configured outputs and all trusted publication mutations, while script-only ARM qualification trusts the checkout. |
+| P1 candidate work could rewrite already-published final artifacts | Final artifacts are created only after every build/compiler child group exits. The helper then copies the fixed compiler/runtime/kernel/harness outputs descriptor-relatively before manifest capture. |
+| P2 a FIFO output could block trusted copying | Source opens use nonblocking no-follow descriptors and reject every non-regular output before reading. The owner places a FIFO at the fixed runtime output and bounds rejection with an alarm. |
 
 ## Author consistency pass
 

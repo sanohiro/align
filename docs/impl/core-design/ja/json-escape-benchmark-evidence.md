@@ -153,7 +153,7 @@ absent/nonempty/unsafe work dirでrejectさせ、`kernel.o`等すべてをそこ
 benchmark-input sliceでは`ALIGN_BENCH_WORK_DIR`はrequiredで、absolute existing directoryを指しfinal componentは
 symlink不可。physical pathは`/`、repository root、repository内を不可とし、hidden entryを含め開始時empty。
 各scriptは`umask 077`でexact one private childを作り、root/detached Cargo target、`TMPDIR`、kernel object、
-全generated artifactをchild内へ限定する。prepare successはsealed childをretainする。error/signal/interruptは
+全configured build outputをchild内へ限定する。prepare successはsealed childをretainする。error/signal/interruptは
 retained descriptor配下のnon-directory entryだけをrecursive unlinkし、directory-only skeletonはcontainer/process
 teardown後にtrusted callerがremove。
 relative/missing/non-directory/final-symlink/root/repository/in-repository/initially-nonempty/cleanup-failure/
@@ -163,9 +163,12 @@ repeated trailing separatorと`/.`でfinal-component symlinkを隠せない。�
 own process groupで実行し、interrupt時はcomplete groupへbounded TERM/KILL escalationを行い、private file
 remove前にdirect childをreapする。
 
-scriptはuntrusted build開始前にprivate childをopenして保持する。accepted Linux pathでは全preparation pathを
-そのdescriptorの`/proc` handle配下にrootし、`prepared`のrename/replacementで後続Cargo/compiler/copy/chmod/
-manifest/cleanupを別treeへredirectできない。cleanupはretained descriptor配下のnon-directory entryだけをunlinkし、
+scriptはuntrusted build開始前にprivate childをopenして保持する。accepted Linux pathではouter controllerの
+read-only-root containerとcontroller-owned writable mountがarbitrary candidate build writeをconfineし、script単体を
+sandboxとはしない。configured Cargo/compiler outputはretained child配下、trusted post-build copy/chmod/manifest/
+cleanup mutationはすべてdescriptor-relativeであり、`prepared`のrename/replacementでcaller dataへpublicationを
+redirectできない。controller-owned writable mount内のcandidate escapeはforeign residueとなりrejectする。
+cleanupはretained descriptor配下のnon-directory entryだけをunlinkし、
 candidate-side writerとraceし得る間はdirectory entryをdeleteしない。success時のempty build-directory skeletonも
 prepared manifestに含め、measurementとcandidate teardown後にouter controllerがremoveする。macOSはnative ARM
 development qualificationのままでaccepted adversarial evidenceには使わない。
@@ -186,6 +189,11 @@ wrong-mode/replaced/unsealable artifactとprepare-only selectorをreject。argv 
 `--locked --offline`。cache/source/config manifestをbefore/after比較しwriteをreject。benchmark-input
 sliceは各scriptのroot build 2回とdetached `cargo run` 1回、合計current 6 Cargo invocationをlockする。
 evidence implementationがbaseline前に2つの`cargo run`をprepare/direct-execへ置換する。
+
+candidate-controlled Cargo/compiler work中はfinal artifactを作らない。全child process group終了後に
+descriptor-relative helperが各fixed outputをno-follow/nonblocking openし、read前にnon-regular fileをreject、source
+stabilityを確認してcomplete final artifact setを作る。buildはdeclared outputを生成できるが、manifest capture前の
+published runtime/kernel/compiler/harnessを書き換えられない。
 
 child前にCLOEXEC pipeを作りfd enumerate、stdin/stdout/stderrだけを渡す。dup後番号確認、inherited range close、
 entrypointも`/proc/self/fd`確認。collision/inheritance/missing CLOEXEC/mapping changeはreject。bounded outputは
@@ -513,7 +521,7 @@ ordinary testにしない。native host qualification/final measurementはmanual
 | Finding | Closure |
 |---|---|
 | phase間でself-consistent treeがprepared stateをreplace可能 | prepareがcanonical manifest SHA-256をprint。trusted controllerがcandidate-writable state外で保持し、全native invocationがrequired inputとして受け、descriptor-relative verificationがartifact open前にdifferent current manifestをreject。 |
-| untrusted prepare childがlater path writeをredirect可能 | first build前にprivate-child descriptorをretain。accepted Linux preparation pathはすべてdescriptorの`/proc` handleを使い、publicationはpublic pathのsame device/inodeを要求。native ARM macOSはdevelopment qualificationのみ。 |
+| untrusted prepare childがlater path writeをredirect可能 | accepted controllerがread-only-root containerとcontroller-owned writable mountでarbitrary candidate writeをconfine。scriptはfirst build前にprivate-child descriptorをretainし、configured outputを配下に置き、全trusted post-build mutationをdescriptor-relativeにし、publicationはpublic pathのsame device/inodeを要求。script-only native ARM macOSはtrusted-checkout development qualificationのみ。 |
 | cleanup check/path raceがreplacementをrecursive delete可能 | recursive cleanupはretained private-child descriptorだけをwalkし、non-directory entryだけをunlink。candidate-side concurrency中は全directory entryを残し、script-level failureのdirectory-only owned treeをteardown後のtrusted outer cleanupへ渡す。 |
 
 ## Final-candidate review closure
@@ -526,6 +534,9 @@ ordinary testにしない。native host qualification/final measurementはmanual
 | direct executionがambient loader/timing stateをinherit | launcherはledgerのfixed 5-variable environmentだけをconstructし、platform-owned sealed-runtime loader bindingを追加。ownerはambient sentinelをinjectし、harnessが全fixed valueとsentinel absenceをassert。 |
 | nested cleanupにもdirectory-entry raceが残存 | candidate-side prepare/cleanupは全directory entryをremoveしない。success/failure ownerがretained directory skeletonをrequireし、outer controllerだけがteardown後にremove。 |
 | top-level benchmark workflowがone-phase executionのまま | `bench/README.md`はprepare-time digest captureからdirect native executionまでを示し、process/environment teardown後のwork-tree removalをcaller ownershipにする。 |
+| build pathだけではarbitrary candidate writeをsandboxできない | script contractはcandidate code自体をsandboxすると主張しない。accepted evidenceはlater outer-controller container boundaryが必須。本sliceはconfigured outputと全trusted publication mutationをconfineし、script-only ARM qualificationはcheckoutをtrustする。 |
+| candidate workがpublished final artifactを書換可能 | 全build/compiler child group終了後にだけfinal artifactを作る。helperがfixed compiler/runtime/kernel/harness outputをdescriptor-relative copyし、manifest captureする。 |
+| FIFO outputがtrusted copyをblock可能 | sourceはnonblocking/no-follow descriptorでopenし、read前に全non-regular outputをreject。ownerはfixed runtime outputにFIFOを置きalarm内のrejectを要求する。 |
 
 ## Author consistency pass
 
