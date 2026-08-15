@@ -12,7 +12,11 @@ from scripts.benchmark_evidence import container
 
 H64 = "0" * 64
 PROFILE = {
-    "image": {"registry_digest": "sha256:" + H64, "platform": "linux/amd64"},
+    "image": {
+        "registry_digest": "sha256:" + "1" * 64,
+        "local_image_id": H64,
+        "platform": "linux/amd64",
+    },
     "machine": {
         "architecture": "x86_64",
         "benchmark_cpu_set": "0-7",
@@ -72,6 +76,7 @@ def main():
     assert "--env=TZ=UTC" in argv
     assert "--env=HOME=/nonexistent" in argv
     assert "--env=CARGO_NET_OFFLINE=true" in argv
+    assert "--env=CARGO_HOME=/cargo" in argv
     assert "--env=CARGO_TARGET_DIR=/target" in argv
     assert "--env=TMPDIR=/tmp" in argv
     assert "--env=ALIGN_BENCH_WORK_DIR=/work" in argv
@@ -87,14 +92,14 @@ def main():
     expect_error(lambda: container.build_argv({"image": {}, "machine": {}}, launch()), "registry_digest")
     expect_error(
         lambda: container.build_argv(
-            {"image": {"registry_digest": "ubuntu:24.04", "platform": "linux/amd64"}, "machine": PROFILE["machine"]},
+            {"image": {"registry_digest": "ubuntu:24.04", "local_image_id": H64, "platform": "linux/amd64"}, "machine": PROFILE["machine"]},
             launch(),
         ),
         "registry_digest",
     )
     expect_error(
         lambda: container.build_argv(
-            {"image": {"registry_digest": "sha256:" + H64, "platform": "linux/arm64"}, "machine": PROFILE["machine"]},
+            {"image": {"registry_digest": "sha256:" + H64, "local_image_id": H64, "platform": "linux/arm64"}, "machine": PROFILE["machine"]},
             launch(),
         ),
         "linux/amd64",

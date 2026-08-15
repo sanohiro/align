@@ -85,14 +85,15 @@ def _profile_identity(profile: Any) -> tuple[str, str, str]:
     machine = _profile_field(profile, ("machine",))
     if not isinstance(image, Mapping) or not isinstance(machine, Mapping):
         _error("profile", "image and machine must be objects")
-    digest = _string(image.get("registry_digest"), _DIGEST, "profile.image.registry_digest")
+    _string(image.get("registry_digest"), _DIGEST, "profile.image.registry_digest")
+    local_image_id = _string(image.get("local_image_id"), _HEX64, "profile.image.local_image_id")
     if _string(image.get("platform"), _NAME, "profile.image.platform") != "linux/amd64":
         _error("profile.image.platform", "must be linux/amd64")
     if _string(machine.get("architecture"), _NAME, "profile.machine.architecture") != "x86_64":
         _error("profile.machine.architecture", "must be x86_64")
     cpu_set = _string(machine.get("benchmark_cpu_set"), _NAME, "profile.machine.benchmark_cpu_set")
     numa_set = _string(machine.get("numa_set"), _NAME, "profile.machine.numa_set")
-    return digest, cpu_set, numa_set
+    return f"sha256:{local_image_id}", cpu_set, numa_set
 
 
 def _command(command: Sequence[str]) -> tuple[str, ...]:
@@ -181,6 +182,7 @@ def build_argv(profile: Any, launch: ContainerLaunch) -> tuple[str, ...]:
         "--env=TZ=UTC",
         "--env=HOME=/nonexistent",
         "--env=CARGO_NET_OFFLINE=true",
+        "--env=CARGO_HOME=/cargo",
         "--env=CARGO_TARGET_DIR=/target",
         "--env=TMPDIR=/tmp",
         "--env=ALIGN_BENCH_WORK_DIR=/work",
