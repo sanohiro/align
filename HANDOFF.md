@@ -7,13 +7,14 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-15._ Align main is at `8ce95870`. align-llm Request 5's bounded HTTP response
+_Last updated: 2026-08-15._ Align main is at `95c142f3`. align-llm Request 5's bounded HTTP response
 body is shipped, and Request 7's evidence design (#813), benchmark inputs (#815/#821), installed
 manifest (#816), canonical JSON (#817), typed report schema (#818), SSHSIG framing (#820), strict
 controller CLI (#822), installed-manifest/profile binding (#823), raw Git object identity codec
 (#825), pinned Git batch response codec (#828), pinned Git process boundary (#830), and two-sided
 Git revision/tree binding (#831), verified Git source materialization (#832), and canonical evidence
-profile validation (#833), and fixed container launch binding (#834) are merged.
+profile validation (#833), fixed container launch binding (#834), and pinned image qualification
+(#835) are merged.
 The align-repl user guide and release artifacts are shipped in #826/#829. The final requested work
 is PR #827 on
 `agent/request7-prepared-benchmarks`: both protected JSON benchmarks gain the reviewed two-phase
@@ -93,8 +94,7 @@ sentinel excluded by the fixed launcher environment. The final-review-repair rer
 digest `efca5a28a02e8b49636092413c0f92386c39f2bfcb754f7a9f5ddc83f090ef2c` and SoA digest
 `5b1ff95b9364253e4afb81d209d909dfdd5455616f681fcbe5c8c2403fbfaa3c`. These are
 correctness/boundary owners, not accepted x86_64 performance evidence. At this PR's merge, no work
-is active by user request. The next eligible capability is installed-source replacement protection
-and protected-input matching, followed by image recipe/digest qualification, host/adversarial, and
+is active by user request. The next eligible capabilities are host/adversarial qualification and
 controller/verifier owners;
 native x86_64 host qualification and the Request 7 language implementation remain later gates. No
 emulation is accepted in any evidence lane.
