@@ -53,6 +53,8 @@ def _validate_string(value: str, label: str) -> None:
 
 def _validate(value: Any, label: str = "value") -> None:
     if isinstance(value, Object):
+        if tuple(value.items()) != value.pairs:
+            raise CanonicalJsonError(f"{label} object mapping does not match its ordered members")
         keys = [key for key, _ in value.pairs]
         if len(keys) != len(set(keys)):
             raise CanonicalJsonError(f"{label} contains a duplicate member")
@@ -103,7 +105,7 @@ def encode(value: Any) -> bytes:
         raise CanonicalJsonError(f"cannot encode canonical JSON: {exc}") from exc
 
 
-def decode(raw: bytes) -> Object | list[Any] | str | int:
+def decode(raw: bytes) -> Object | list[Any] | str | int | bool:
     """Decode bytes and require exact canonical re-encoding."""
 
     if not isinstance(raw, bytes):
@@ -115,9 +117,9 @@ def decode(raw: bytes) -> Object | list[Any] | str | int:
             parse_float=_reject_float,
             parse_constant=_reject_constant,
         )
-    except (UnicodeDecodeError, json.JSONDecodeError, CanonicalJsonError) as exc:
+        canonical = encode(value)
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise CanonicalJsonError(f"invalid canonical JSON: {exc}") from exc
-    canonical = encode(value)
     if raw != canonical:
         raise CanonicalJsonError("JSON is not canonical")
     return value
@@ -128,6 +130,8 @@ def require_object(value: Any, keys: Sequence[str], label: str) -> Object:
 
     if not isinstance(value, Object):
         raise CanonicalJsonError(f"{label} is not an object")
+    if tuple(value.items()) != value.pairs:
+        raise CanonicalJsonError(f"{label} object mapping does not match its ordered members")
     actual = tuple(key for key, _ in value.pairs)
     if actual != tuple(keys):
         raise CanonicalJsonError(f"{label} has the wrong member order or shape")

@@ -269,6 +269,9 @@ assert b"\\" not in report
 assert rs.body_digest(valid_body) == "6ec6977787caa144340e11a99540b1dd5bd6fef74441a9397559a5a94307d343"
 assert hashlib.sha256(report).hexdigest() == "caff6686e7ac7388712e6aad1600e8bea75904e898c5e731e92d42a517ac4237"
 assert rs.decode_report(report) == O(("body", valid_body), ("body_sha256", rs.body_digest(valid_body)))
+stale_body = O(*valid_body.pairs)
+stale_body["unexpected"] = 1
+rejected("stale report body mapping", lambda: rs.validate_body(stale_body))
 
 rejected("wrong outer member order", lambda: rs.decode_report(cj.encode(O(("body_sha256", rs.body_digest(valid_body)), ("body", valid_body)))))
 rejected("body digest mutation", lambda: rs.validate_report(replace(O(("body", valid_body), ("body_sha256", rs.body_digest(valid_body))), "body_sha256", H64_ONE)))
