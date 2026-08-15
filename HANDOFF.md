@@ -55,11 +55,13 @@ host-global lock path, Docker/image/toolchain identities, fixed observation limi
 signing key, schedule, and benchmark inventory. PR #834 shipped the fixed container launch argv
 boundary at `8ce95870`, including digest-only local image selection, private namespaces, explicit
 resource/security limits, read-only source/toolchain mounts, private writable workspaces, and an
-explicit fixed environment. Active work on `agent/request7-image-qualification` adds pure
-profile-bound qualification for image/config/registry identities, mutable-tag rejection, and
-toolchain/cache/configuration observations. It does not invoke Docker, inspect the host or daemon,
-build an image, provision a key, or execute the controller. Host qualification, adversarial owners,
-and full controller/verifier implementation remain later work. Materialization
+explicit fixed environment. PR #835 shipped pure profile-bound qualification for image/config/registry
+identities, mutable-tag rejection, and toolchain/cache/configuration observations. Active work on
+`agent/request7-host-qualification` adds pure qualification for the named native host, Docker
+daemon/runtime, CPU quota, and bounded pre/between/post resource observations with adversarial
+owners. It does not read host filesystems, invoke Docker, start the monitor, provision a key, or
+execute the controller. Monitor lifecycle and full controller/verifier implementation remain later
+work. Materialization
 and retained verification intentionally shared one boundary because they depend on the same raw
 path layout, reviewed-symlink policy, descriptor identity, and cleanup proof; splitting them would
 have duplicated the boundary fixtures without leaving a stable consumer for either half.
