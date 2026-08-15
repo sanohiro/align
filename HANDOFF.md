@@ -7,43 +7,26 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-15._ Align PR #812 merged align-llm Request 5's bounded HTTP
-response-body capability at `5aa5b23a`. Its exact-head native ARM64 preflight and every required
-GitHub check passed before merge. Active work is the separate align-llm Request 7
-benchmark-evidence prerequisite design on `agent/json-escape-benchmark-evidence-design`. The
-proposed contract is `docs/impl/core-design/json-escape-benchmark-evidence.md`: a trusted installed
-controller/verifier, continuously monitored native x86_64 host, digest-pinned offline OCI toolchain,
-read-only revision isolation, robust inner statistics plus fixed balanced sampling, a complete
-canonical report schema, and host-signed evidence. One independent review of `5ed19c85` found six
-valid issues; `65753fe7` closed that set and added the synchronized Japanese mirror and indexes. The
-required full-diff review of that repair found seven further valid contract gaps, so the design was
-re-scoped: exact median quantization, a prepare/direct-exec boundary, two-sided path changes, unique
-child-monitor partitions, signed actual-merge verification, and pre-publication unlock semantics now
-close them together. The bounded review of redesigned head `0bb57285` found six precise binding and
-publication gaps. The current repair adds trusted GitHub review attestation, protects the complete
-evidence profile/source set, rechecks final target reachability, serializes publication with a
-durable reservation, uses the repository's exact `clean`/`fixed` states, and fixes SSHSIG bytes.
-PR #813 merged at `734ae3ab`, and the benchmark-input prerequisite merged in PR #815 at
-`58dbb218`; the installed-source manifest foundation merged in PR #816 at `7db1af8c`.
-Author inspection of the benchmark-input slice found that the current scripts make six Cargo
-invocations, not the four root builds named by the delivery prose; the repair binds all six and
-identifies the two later `cargo run` replacements. The same pass makes the work-root safety and
-cleanup contract exact instead of leaving `unsafe` to implementation judgement. A post-merge
-independent audit found three narrow owner gaps in #815: final-symlink `//` and `/.` aliases,
-missing/stale detached locks, and TERM-ignoring descendants were not exercised, while foreground
-children could delay shell traps indefinitely. Active work on `agent/benchmark-input-hardening`
-closes those classes with explicit lock validation, per-command process groups, bounded TERM/KILL,
-direct-child reap, and exact regression fixtures. Comprehensive review of `36297622` found that
-signals could still land between child launch and PID capture and that the two root Cargo commands
-shared one group. The consolidated repair defers signals through PID capture, gives each Cargo
-command a distinct group, and adds survivor-before-next-command regressions for both benchmarks.
-The evidence implementation continues after this
-hardening: the no-follow installed-source manifest foundation is shipped in #816 at
-`7db1af8c`, canonical JSON primitives are shipped in #817 at `4ec35dfe`, and the typed Report/Body
-schema is shipped in #818 at `41ce4f93`. The current slice adds strict SSHSIG v1 binary/armor
-framing and signing-preimage helpers before key invocation, controller/verifier/monitor, profile,
-image recipe, and adversarial owners follow. Host qualification and a Request 7 implementation
-branch remain later work.
+_Last updated: 2026-08-15._ Align main is at `19fbc786`: align-llm Request 5's bounded HTTP response
+body is shipped, and Request 7's evidence design (#813), benchmark inputs (#815), installed-source
+manifest (#816), canonical JSON (#817), typed report schema (#818), SSHSIG framing (#820), and
+benchmark-input hardening (#821) are merged. Active work is
+`agent/request7-prepared-benchmarks`: both protected JSON benchmarks gain the reviewed two-phase
+`prepare native` / direct `native` interface, canonical artifact sealing, and checked integer inner
+medians. Its focused owners are `scripts/test-benchmark-input.sh` and the
+`benchmark_evidence_statistic_matrix` test in
+`bench/json_escape/evidence/statistics.rs`. Next, finish native ARM64 owner verification with one
+compiler job, review and merge this capability, then implement the installed evidence
+controller/verifier/monitor, profile, image recipe, and remaining adversarial owners. Native x86_64
+host qualification and the Request 7 language implementation branch remain later gates; no
+emulation is accepted in any evidence lane.
+
+Latest durable verification on native Apple ARM64 passed with `CARGO_BUILD_JOBS=1`: each of
+`bench/json_decode/run.sh prepare native` plus `run.sh native` and
+`bench/json_soa/run.sh prepare native` plus `run.sh native` completed from an empty external work
+directory. `scripts/test-benchmark-input.sh`, `scripts/test-benchmark-evidence-manifest.sh`, and
+`scripts/test-benchmark-evidence-statistics.sh` also pass; these are correctness/boundary owners,
+not accepted x86_64 performance evidence.
 
 The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit
@@ -220,8 +203,8 @@ facts must live in this repository.
   Request 8 is merged through Align design #799 and implementation #801; Request 10's §7.6
   implementation is merged; Requests 11 and 12 are implemented, and Request 5's bounded-HTTP
   implementation is merged at `5aa5b23a`. Request 7's benchmark-evidence design is active, and its
-  benchmark-input prerequisite is implemented; Requests
-  9 and 13–14 remain proposed in
+  benchmark-input prerequisite and evidence-format foundations are implemented; Requests
+  9 and 13–15 remain proposed in
   `../align-llm/docs/align-requests.md`; Request 9 remains the later C7 blocker after Request 7.
 
 Consumer-gated deferrals that remain intentional:

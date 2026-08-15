@@ -6,12 +6,20 @@ column-major `soa<Row>` and running `where(.active).pay.sum()`, vs idiomatic Rus
 aggregate touches 2.
 
 ```sh
-ALIGN_BENCH_WORK_DIR=/absolute/empty/outside/repo bench/json_soa/run.sh [baseline|v3|native]
+ALIGN_BENCH_WORK_DIR=/absolute/empty/outside/repo bench/json_soa/run.sh prepare native
+ALIGN_BENCH_WORK_DIR=/absolute/prepared/outside/repo bench/json_soa/run.sh native
 ```
 
-`ALIGN_BENCH_WORK_DIR` is required. It must name an existing, empty absolute directory outside the
-repository. The script keeps every generated target, temporary file, and kernel object in one
-private child below it, then removes that child while leaving the caller-owned directory in place.
+`ALIGN_BENCH_WORK_DIR` is required and must be an absolute directory outside the repository.
+`prepare native` requires it to be empty, builds the compiler, runtime, kernel, and detached harness
+once with locked offline Cargo, reduces the result to the executable artifacts, and writes a
+canonical content/mode manifest below `prepared/`. `native` requires exactly that sealed directory,
+verifies the manifest, and directly executes the harness without Cargo or compiler work. The
+prepared directory is retained for evidence-controller warm-ups and samples.
+
+Each reported duration is the checked integer median of the existing 30 inner timings, quantized
+once to integer microseconds with half-microseconds rounded upward and rendered as an exact
+three-decimal millisecond token. A single low outlier therefore cannot become the result.
 
 Unlike the flat `bench/`, the kernel pulls in the Align runtime (the JSON parser + arena), so the
 harness links `libalign_runtime.so` (a **cdylib** — dynamic, over the C-ABI, so its bundled std

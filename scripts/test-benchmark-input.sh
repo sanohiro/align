@@ -61,13 +61,14 @@ set -euo pipefail
 : "${FAKE_WORK_DIR:?}"
 : "${CARGO_TARGET_DIR:?}"
 : "${TMPDIR:?}"
+FAKE_WORK_DIR_PHYSICAL="$(cd "$FAKE_WORK_DIR" && pwd -P)"
 [[ -f Cargo.lock ]] || { echo "detached or root Cargo.lock is missing" >&2; exit 87; }
 case "$CARGO_TARGET_DIR" in
-  "$FAKE_WORK_DIR"/.align-bench.*/*) ;;
-  *) echo "cargo target escaped the private child" >&2; exit 81 ;;
+  "$FAKE_WORK_DIR_PHYSICAL"/prepared/*) ;;
+  *) echo "cargo target escaped the private child: $CARGO_TARGET_DIR" >&2; exit 81 ;;
 esac
 case "$TMPDIR" in
-  "$FAKE_WORK_DIR"/.align-bench.*/*) ;;
+  "$FAKE_WORK_DIR_PHYSICAL"/prepared/*) ;;
   *) echo "cargo temporary directory escaped the private child" >&2; exit 82 ;;
 esac
 printf 'cargo %s\n' "$*" >> "$FAKE_LOG"
@@ -116,6 +117,7 @@ if has_arg --bin "$@" && has_arg alignc "$@"; then
 set -euo pipefail
 : "${FAKE_WORK_DIR:?}"
 : "${ALIGNC_CACHE:?}"
+FAKE_WORK_DIR_PHYSICAL="$(cd "$FAKE_WORK_DIR" && pwd -P)"
 if [[ "${FAKE_FAIL_MODE:-}" == alignc ]]; then
   exit 71
 fi
@@ -123,11 +125,11 @@ if [[ "${1:-}" != emit-obj || "$#" -lt 3 ]]; then
   exit 72
 fi
 case "$3" in
-  "$FAKE_WORK_DIR"/.align-bench.*/*) ;;
+  "$FAKE_WORK_DIR_PHYSICAL"/prepared/*) ;;
   *) echo "kernel object escaped the private child" >&2; exit 83 ;;
 esac
 case "$ALIGNC_CACHE" in
-  "$FAKE_WORK_DIR"/.align-bench.*/*) ;;
+  "$FAKE_WORK_DIR_PHYSICAL"/prepared/*) ;;
   *) echo "alignc cache escaped the private child" >&2; exit 88 ;;
 esac
 printf 'fake kernel object\n' > "$3"
@@ -142,16 +144,16 @@ elif has_arg -p "$@" && has_arg align_runtime "$@"; then
   fi
   mkdir -p "$CARGO_TARGET_DIR/release"
   printf 'fake runtime\n' > "$CARGO_TARGET_DIR/release/libalign_runtime.so"
-elif has_arg run "$@"; then
+elif has_arg build "$@"; then
   if [[ "${FAKE_ADD_FOREIGN:-0}" == 1 && ! -e "$FAKE_WORK_DIR/foreign" ]]; then
     printf 'caller-owned residue\n' > "$FAKE_WORK_DIR/foreign"
   fi
   case "${ALIGN_KERNEL_OBJ:-}" in
-    "$FAKE_WORK_DIR"/.align-bench.*/*) ;;
+    "$FAKE_WORK_DIR_PHYSICAL"/prepared/*) ;;
     *) echo "detached kernel object escaped the private child" >&2; exit 84 ;;
   esac
   case "${ALIGN_RUNTIME_DIR:-}" in
-    "$FAKE_WORK_DIR"/.align-bench.*/*) ;;
+    "$FAKE_WORK_DIR_PHYSICAL"/prepared/*) ;;
     *) echo "runtime directory escaped the private child" >&2; exit 85 ;;
   esac
   if [[ "${FAKE_FAIL_MODE:-}" == detached ]]; then
@@ -160,6 +162,17 @@ elif has_arg run "$@"; then
   if [[ -n "${FAKE_SLEEP:-}" ]]; then
     sleep "$FAKE_SLEEP"
   fi
+  case "$PWD" in
+    */bench/json_decode) binary=json-decode-bench ;;
+    */bench/json_soa) binary=json-soa-bench ;;
+    *) echo "unexpected detached Cargo directory: $PWD" >&2; exit 89 ;;
+  esac
+  mkdir -p "$CARGO_TARGET_DIR/release"
+  cat > "$CARGO_TARGET_DIR/release/$binary" <<'FAKE_BENCHMARK'
+#!/usr/bin/env bash
+printf 'fake prepared benchmark\n'
+FAKE_BENCHMARK
+  chmod 700 "$CARGO_TARGET_DIR/release/$binary"
 else
   echo "unexpected cargo invocation: $*" >&2
   exit 86
@@ -170,7 +183,7 @@ FAKE_CARGO
   cat > "$FAKE_BIN/rm" <<'FAKE_RM'
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ "${FAKE_RM_MODE:-}" == fail-child && "$*" == *"/.align-bench."* ]]; then
+if [[ "${FAKE_RM_MODE:-}" == fail-child && "$*" == *"/prepared"* ]]; then
   exit 1
 fi
 exec /bin/rm "$@"
@@ -184,6 +197,12 @@ run_benchmark() {
   PATH="$FAKE_BIN:$ORIGINAL_PATH" \
     FAKE_LOG="$FAKE_LOG" FAKE_WORK_DIR="$FAKE_WORK_DIR" \
     ALIGN_BENCH_WORK_DIR="$FAKE_WORK_DIR" "$@" \
+    "$REPO_ROOT/bench/$bench/run.sh" prepare native
+}
+
+run_prepared_benchmark() {
+  local bench="$1"
+  PATH="$FAKE_BIN:$ORIGINAL_PATH" ALIGN_BENCH_WORK_DIR="$FAKE_WORK_DIR" \
     "$REPO_ROOT/bench/$bench/run.sh" native
 }
 
@@ -199,27 +218,35 @@ expect_invalid_workdirs() {
   ln -s "$target_dir" "$symlink_dir"
 
   assert_rejected "missing work directory" env ALIGN_BENCH_WORK_DIR="$TEST_ROOT/missing" \
-    "$REPO_ROOT/bench/json_decode/run.sh" native
+    "$REPO_ROOT/bench/json_decode/run.sh" prepare native
   assert_rejected "relative work directory" env ALIGN_BENCH_WORK_DIR=relative \
-    "$REPO_ROOT/bench/json_decode/run.sh" native
+    "$REPO_ROOT/bench/json_decode/run.sh" prepare native
   assert_rejected "non-directory work path" env ALIGN_BENCH_WORK_DIR="$file_path" \
-    "$REPO_ROOT/bench/json_decode/run.sh" native
+    "$REPO_ROOT/bench/json_decode/run.sh" prepare native
   assert_rejected "final symlink work directory" env ALIGN_BENCH_WORK_DIR="$symlink_dir" \
-    "$REPO_ROOT/bench/json_decode/run.sh" native
+    "$REPO_ROOT/bench/json_decode/run.sh" prepare native
   assert_rejected "final symlink with repeated separators" env ALIGN_BENCH_WORK_DIR="$symlink_dir//" \
-    "$REPO_ROOT/bench/json_decode/run.sh" native
+    "$REPO_ROOT/bench/json_decode/run.sh" prepare native
   assert_rejected "final symlink with dot suffix" env ALIGN_BENCH_WORK_DIR="$symlink_dir/." \
-    "$REPO_ROOT/bench/json_decode/run.sh" native
+    "$REPO_ROOT/bench/json_decode/run.sh" prepare native
   assert_rejected "root work directory" env ALIGN_BENCH_WORK_DIR=/ \
-    "$REPO_ROOT/bench/json_decode/run.sh" native
+    "$REPO_ROOT/bench/json_decode/run.sh" prepare native
   assert_rejected "repository work directory" env ALIGN_BENCH_WORK_DIR="$REPO_ROOT" \
-    "$REPO_ROOT/bench/json_decode/run.sh" native
+    "$REPO_ROOT/bench/json_decode/run.sh" prepare native
   assert_rejected "in-repository work directory" env ALIGN_BENCH_WORK_DIR="$REPO_ROOT/bench" \
-    "$REPO_ROOT/bench/json_decode/run.sh" native
+    "$REPO_ROOT/bench/json_decode/run.sh" prepare native
   assert_rejected "nonempty work directory" env ALIGN_BENCH_WORK_DIR="$nonempty_dir" \
-    "$REPO_ROOT/bench/json_decode/run.sh" native
+    "$REPO_ROOT/bench/json_decode/run.sh" prepare native
   assert_rejected "missing work-dir environment" env -u ALIGN_BENCH_WORK_DIR \
-    "$REPO_ROOT/bench/json_decode/run.sh" native
+    "$REPO_ROOT/bench/json_decode/run.sh" prepare native
+  assert_rejected "missing phase" env ALIGN_BENCH_WORK_DIR="$empty_dir" \
+    "$REPO_ROOT/bench/json_decode/run.sh"
+  assert_rejected "prepare without native target" env ALIGN_BENCH_WORK_DIR="$empty_dir" \
+    "$REPO_ROOT/bench/json_decode/run.sh" prepare
+  assert_rejected "removed baseline selector" env ALIGN_BENCH_WORK_DIR="$empty_dir" \
+    "$REPO_ROOT/bench/json_decode/run.sh" prepare baseline
+  assert_rejected "extra selector" env ALIGN_BENCH_WORK_DIR="$empty_dir" \
+    "$REPO_ROOT/bench/json_decode/run.sh" prepare native extra
   assert_empty "$empty_dir"
   assert_empty "$target_dir"
   [[ -L "$symlink_dir" ]] || fail "invalid final symlink was removed"
@@ -243,9 +270,11 @@ assert_lock_inputs() {
 
   local missing_repo="$TEST_ROOT/missing-lock-repo"
   local missing_work="$TEST_ROOT/missing-lock-work"
-  mkdir -p "$missing_repo/bench/json_decode" "$missing_work"
+  mkdir -p "$missing_repo/bench/json_decode" "$missing_repo/bench/json_escape/evidence" "$missing_work"
   cp "$REPO_ROOT/bench/json_decode/run.sh" "$missing_repo/bench/json_decode/run.sh"
-  if ALIGN_BENCH_WORK_DIR="$missing_work" "$missing_repo/bench/json_decode/run.sh" native \
+  cp "$REPO_ROOT/bench/json_escape/evidence/run-prepared-benchmark.sh" \
+    "$missing_repo/bench/json_escape/evidence/run-prepared-benchmark.sh"
+  if ALIGN_BENCH_WORK_DIR="$missing_work" "$missing_repo/bench/json_decode/run.sh" prepare native \
     >"$TEST_ROOT/missing-lock.out" 2>"$TEST_ROOT/missing-lock.err"; then
     fail "missing detached Cargo.lock was accepted"
   fi
@@ -282,14 +311,40 @@ benchmark_input_workdir_matrix() {
   [[ -f "$REPO_ROOT/bench/json_soa/Cargo.lock" ]] || fail "json_soa Cargo.lock is missing"
 
   local bench
+  local cargo_count_before
+  local cargo_count_after
+  local benchmark_output
   for bench in json_decode json_soa; do
     FAKE_WORK_DIR="$TEST_ROOT/work-$bench"
     mkdir -p "$FAKE_WORK_DIR"
     run_benchmark "$bench" env
-    assert_empty "$FAKE_WORK_DIR"
+    [[ -f "$FAKE_WORK_DIR/prepared/artifact-manifest.json" ]] || fail "$bench did not seal artifacts"
+    cargo_count_before="$(wc -l < "$FAKE_LOG" | tr -d ' ')"
+    benchmark_output="$(run_prepared_benchmark "$bench")"
+    [[ "$benchmark_output" == $'target: native\nfake prepared benchmark' ]] ||
+      fail "$bench measurement output did not use the fixed native target prelude"
+    cargo_count_after="$(wc -l < "$FAKE_LOG" | tr -d ' ')"
+    [[ "$cargo_count_after" -eq "$cargo_count_before" ]] || fail "$bench measurement invoked Cargo"
+    [[ -f "$FAKE_WORK_DIR/prepared/artifact-manifest.json" ]] || fail "$bench measurement removed artifacts"
     [[ ! -e "$REPO_ROOT/bench/$bench/kernel.o" ]] || fail "$bench wrote kernel.o beside its source"
   done
   assert_locked_offline_invocations
+
+  FAKE_WORK_DIR="$TEST_ROOT/mutated-work"
+  mkdir -p "$FAKE_WORK_DIR"
+  run_benchmark json_decode env
+  printf 'mutation\n' >> "$FAKE_WORK_DIR/prepared/artifacts/json-decode-bench"
+  if run_prepared_benchmark json_decode >/dev/null 2>&1; then
+    fail "mutated prepared executable was accepted"
+  fi
+  [[ -d "$FAKE_WORK_DIR/prepared" ]] || fail "failed verification deleted prepared evidence"
+
+  FAKE_WORK_DIR="$TEST_ROOT/empty-native-work"
+  mkdir -p "$FAKE_WORK_DIR"
+  if run_prepared_benchmark json_decode >/dev/null 2>&1; then
+    fail "native measurement without prepare was accepted"
+  fi
+  assert_empty "$FAKE_WORK_DIR"
 
   local survivor_marker
   local survivor_pid
@@ -320,11 +375,7 @@ benchmark_input_workdir_matrix() {
     fail "foreign residue was accepted"
   fi
   [[ -e "$FAKE_WORK_DIR/foreign" ]] || fail "foreign residue was deleted"
-  for entry in "$FAKE_WORK_DIR"/.align-bench.*; do
-    if [[ -e "$entry" || -L "$entry" ]]; then
-      fail "owned private child survived foreign-residue cleanup"
-    fi
-  done
+  [[ ! -e "$FAKE_WORK_DIR/prepared" ]] || fail "owned prepared directory survived foreign-residue cleanup"
 
   FAKE_WORK_DIR="$TEST_ROOT/error-work"
   mkdir -p "$FAKE_WORK_DIR"
@@ -355,7 +406,7 @@ benchmark_input_workdir_matrix() {
       ALIGN_BENCH_WORK_DIR="$FAKE_WORK_DIR" \
       FAKE_BLOCK_MODE=root FAKE_BLOCK_MARKER="$block_marker" \
       FAKE_DESCENDANT_MARKER="$descendant_marker" \
-      "$REPO_ROOT/bench/$bench/run.sh" native &
+      "$REPO_ROOT/bench/$bench/run.sh" prepare native &
     SIGNAL_SCRIPT_PID=$!
     set -e
     ready=0

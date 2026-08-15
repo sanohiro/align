@@ -12,12 +12,20 @@ Two shapes (each with a matching serde baseline):
   (serde ignores unknown fields by default, the same projection).
 
 ```sh
-ALIGN_BENCH_WORK_DIR=/absolute/empty/outside/repo bench/json_decode/run.sh [baseline|v3|native]
+ALIGN_BENCH_WORK_DIR=/absolute/empty/outside/repo bench/json_decode/run.sh prepare native
+ALIGN_BENCH_WORK_DIR=/absolute/prepared/outside/repo bench/json_decode/run.sh native
 ```
 
-`ALIGN_BENCH_WORK_DIR` is required. It must name an existing, empty absolute directory outside the
-repository. The script keeps every generated target, temporary file, and kernel object in one
-private child below it, then removes that child while leaving the caller-owned directory in place.
+`ALIGN_BENCH_WORK_DIR` is required and must be an absolute directory outside the repository.
+`prepare native` requires it to be empty, builds the compiler, runtime, kernel, and detached harness
+once with locked offline Cargo, reduces the result to the executable artifacts, and writes a
+canonical content/mode manifest below `prepared/`. `native` requires exactly that sealed directory,
+verifies the manifest, and directly executes the harness without Cargo or compiler work. The
+prepared directory is retained for evidence-controller warm-ups and samples.
+
+Each reported duration is the checked integer median of the existing 40 inner timings, quantized
+once to integer microseconds with half-microseconds rounded upward and rendered as an exact
+three-decimal millisecond token. A single low outlier therefore cannot become the result.
 
 Same plumbing as `bench/json_soa/`: the kernel is built with `alignc emit-obj` and the runtime is
 linked as a **cdylib** (dynamic, over the C-ABI). Standalone cargo project (own `[workspace]`).
@@ -56,7 +64,7 @@ every parser change and watch the ratios; when a result disappoints, autopsy —
 
 ## Profile finding (2026-06-29, native, 1M rows)
 
-`ALIGN_BENCH_WORK_DIR=/absolute/empty/outside/repo ALIGN_BENCH_PROFILE=1 bench/json_decode/run.sh native`
+`ALIGN_BENCH_WORK_DIR=/absolute/prepared/outside/repo ALIGN_BENCH_PROFILE=1 bench/json_decode/run.sh native`
 adds decode-only entry points that return the
 row count after `json.decode`. Measured:
 

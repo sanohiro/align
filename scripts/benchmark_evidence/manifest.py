@@ -504,6 +504,8 @@ def load_manifest(path: str) -> tuple[dict[str, Any], bytes]:
         before = os.fstat(fd)
         if not stat.S_ISREG(before.st_mode):
             raise ManifestError("manifest is not a regular file")
+        if stat.S_IMODE(before.st_mode) != 0o644:
+            raise ManifestError("manifest file mode must be 0644")
         raw = _read_fd(fd)
         after = os.fstat(fd)
         if (
@@ -561,6 +563,10 @@ def verify_manifest(root: str, manifest_path: str = "manifest.json") -> str:
         if manifest["manifest_path"] != manifest_path:
             raise ManifestError("manifest path does not match the requested path")
         expected_root, expected_entries = manifest["root"], manifest["entries"]
+        if stat.S_IMODE(before.st_mode) != 0o644:
+            raise ManifestError("manifest file mode must be 0644")
+        if (before.st_uid, before.st_gid) != (expected_root["uid"], expected_root["gid"]):
+            raise ManifestError("manifest owner does not match the installed root")
         observed_root, observed_entries = _observed_tree_fd(root_fd, manifest_path)
         if observed_root != expected_root or observed_entries != expected_entries:
             raise ManifestError("installed tree does not match the manifest")
@@ -587,6 +593,7 @@ def _write_manifest(root: str, path: str) -> str:
     except FileExistsError as exc:
         raise ManifestError("refusing to overwrite an existing manifest") from exc
     try:
+        os.fchmod(fd, 0o644)
         written = 0
         while written < len(raw):
             count = os.write(fd, raw[written:])
