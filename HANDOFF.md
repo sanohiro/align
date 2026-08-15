@@ -7,17 +7,17 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-15._ Align main is at `3eaa2176`. align-llm Request 5's bounded HTTP response
+_Last updated: 2026-08-15._ Align main is at `6ba1036f` after prepared-benchmark sealing
+(PR #827). align-llm Request 5's bounded HTTP response
 body is shipped, and Request 7's evidence design (#813), benchmark inputs (#815/#821), installed
 manifest (#816), canonical JSON (#817), typed report schema (#818), SSHSIG framing (#820), strict
 controller CLI (#822), installed-manifest/profile binding (#823), raw Git object identity codec
 (#825), pinned Git batch response codec (#828), pinned Git process boundary (#830), and two-sided
 Git revision/tree binding (#831), verified Git source materialization (#832), and canonical evidence
 profile validation (#833), fixed container launch binding (#834), pinned image qualification (#835),
-and native host qualification (#836) are merged.
-The align-repl user guide and release artifacts are shipped in #826/#829. The final requested work
-is PR #827 on
-`agent/request7-prepared-benchmarks`: both protected JSON benchmarks gain the reviewed two-phase
+and native host qualification (#836), and the prepared-benchmark boundary (#827) are merged.
+The align-repl user guide and release artifacts are shipped in #826/#829. PR #827's
+two protected JSON benchmarks gain the reviewed two-phase
 `prepare native` / direct `native` interface, canonical artifact sealing, checked integer inner
 medians, descriptor-bound Linux evidence execution, and inode-aware cleanup. The integrated review
 of `845f0b90` against `863c20ba` found two valid P1 handoff races: retained-root replacement and
@@ -26,7 +26,8 @@ the launcher, verifies the manifest below that retained descriptor, and executes
 bytes only after copying them into fully write-sealed anonymous memfds; macOS remains native ARM
 development qualification, not accepted evidence. Its focused owners are
 `scripts/test-benchmark-input.sh`, `scripts/test-benchmark-evidence-manifest.sh`, and
-`scripts/test-benchmark-evidence-statistics.sh`.
+`scripts/test-benchmark-evidence-statistics.sh`. The next Request 7 slice is the pure monitor
+lifecycle core, followed by adversarial execution owners and the controller/verifier.
 
 The final integration review of `0dbbd709` against `c47e57c7` found three valid remaining handoff
 issues. The consolidated closure requires the trusted caller to retain prepare's manifest SHA-256
@@ -93,9 +94,9 @@ work directory, with the prepare-time digest supplied to direct execution and an
 sentinel excluded by the fixed launcher environment. The final-review-repair rerun produced decode
 digest `efca5a28a02e8b49636092413c0f92386c39f2bfcb754f7a9f5ddc83f090ef2c` and SoA digest
 `5b1ff95b9364253e4afb81d209d909dfdd5455616f681fcbe5c8c2403fbfaa3c`. These are
-correctness/boundary owners, not accepted x86_64 performance evidence. At this PR's merge, no work
-is active by user request. The next eligible capabilities are monitor lifecycle, adversarial
-execution owners, and controller/verifier implementation;
+correctness/boundary owners, not accepted x86_64 performance evidence. At #827's merge, the next
+eligible capabilities became monitor lifecycle, adversarial execution owners, and controller/verifier
+implementation;
 native x86_64 host qualification and the Request 7 language implementation remain later gates. No
 emulation is accepted in any evidence lane.
 
