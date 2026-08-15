@@ -167,6 +167,8 @@ bench/.cargo/**                when present in either revision
 bench/json_decode/**
 bench/json_soa/**
 bench/json_escape/evidence/**
+scripts/cargo.sh
+scripts/dyld-env.sh
 scripts/benchmark_evidence/**
 tests/benchmark_evidence/**
 ```
@@ -700,6 +702,10 @@ measurement remain named manual evidence.
 | P1 build paths alone did not sandbox arbitrary candidate writes | The script contract no longer claims to sandbox candidate code. Accepted evidence requires the later outer-controller container boundary; this slice confines configured outputs and all trusted publication mutations, while script-only ARM qualification trusts the checkout. |
 | P1 candidate work could rewrite already-published final artifacts | Final artifacts are created only after every build/compiler child group exits. The helper then copies the fixed compiler/runtime/kernel/harness outputs descriptor-relatively before manifest capture. |
 | P2 a FIFO output could block trusted copying | Source opens use nonblocking no-follow descriptors and reject every non-regular output before reading. The owner places a FIFO at the fixed runtime output and bounds rejection with an alarm. |
+| P1 candidate-controlled Cargo wrapper dependencies were not protected | The exact protected-input set includes `scripts/cargo.sh` and its sourced `scripts/dyld-env.sh`, so preparation cannot change Cargo/LLVM/linker selection independently of the reviewed evidence profile. |
+| P1 manifest publication did not rebind the retained artifacts directory | Manifest publication verifies that the root's `artifacts` entry names the retained descriptor before and after both manifest creation and verification, then compares the captured manifest subtree byte-for-byte with a fresh walk through the retained descriptor. Persistent and transient replacements therefore reject unless they describe the same retained artifacts. |
+| P2 bound execution could block while opening a FIFO replacement | Both Linux sealed-copy and native ARM qualification opens are nonblocking/no-follow and reject non-regular descriptors before reading. |
+| P2 bound execution accepted additional self-consistent artifacts | The launcher requires the manifest's `artifacts` subtree to be exactly the compiler, runtime, kernel, selected harness, and directory entry; every extra entry rejects before execution. |
 
 ## Author consistency pass
 

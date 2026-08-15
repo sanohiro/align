@@ -261,6 +261,15 @@ if [[ "${FAKE_PREPARED_TREE_CLEAR_FAIL:-0}" == 1 && \
 fi
 "$ORIGINAL_PYTHON3" "$@"
 status=$?
+if [[ "$status" -eq 0 && "${FAKE_SWAP_ARTIFACTS_AFTER_VERIFY:-0}" == 1 && \
+      "${1:-}" == */prepared_tree.py && "${2:-}" == verify-artifacts ]]; then
+  cp -R "$FAKE_WORK_DIR/prepared/artifacts" \
+    "$FAKE_WORK_DIR/prepared/replacement-artifacts-after-verify"
+  mv "$FAKE_WORK_DIR/prepared/artifacts" \
+    "$FAKE_WORK_DIR/prepared/original-artifacts-after-verify"
+  mv "$FAKE_WORK_DIR/prepared/replacement-artifacts-after-verify" \
+    "$FAKE_WORK_DIR/prepared/artifacts"
+fi
 if [[ "$status" -eq 0 && "${FAKE_SWAP_AFTER_VERIFY:-0}" == 1 ]]; then
   if [[ ( "${1:-}" == */manifest.py && "${2:-}" == verify ) || \
         ( "${1:-}" == */prepared_tree.py && "${2:-}" == write-manifest ) ]]; then
@@ -387,6 +396,50 @@ finally:
 PY
 }
 
+assert_bound_exec_special_file_rejects_without_blocking() {
+  PYTHONDONTWRITEBYTECODE=1 python3 - "$REPO_ROOT" "$TEST_ROOT" <<'PY'
+import os
+import signal
+import sys
+
+sys.path.insert(0, os.path.join(sys.argv[1], "scripts", "benchmark_evidence"))
+import bound_exec
+
+root = os.path.join(sys.argv[2], "bound-special-file")
+os.mkdir(root, 0o700)
+os.mkfifo(os.path.join(root, "payload"), mode=0o600)
+parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+expected = {
+    "kind": "file",
+    "mode": "100600",
+    "uid": os.getuid(),
+    "gid": os.getgid(),
+    "size": 0,
+    "sha256": "0" * 64,
+}
+
+
+def timed_out(_signum, _frame):
+    raise TimeoutError("candidate FIFO blocked bound artifact open")
+
+
+signal.signal(signal.SIGALRM, timed_out)
+try:
+    for opener in (bound_exec._open_bound_file, bound_exec._open_verified_file):
+        signal.alarm(2)
+        try:
+            opener(parent_fd, "payload", expected)
+        except bound_exec.BoundExecError:
+            pass
+        else:
+            raise SystemExit("candidate FIFO was accepted by bound execution")
+        finally:
+            signal.alarm(0)
+finally:
+    os.close(parent_fd)
+PY
+}
+
 expect_invalid_workdirs() {
   local empty_dir="$TEST_ROOT/empty"
   local nonempty_dir="$TEST_ROOT/nonempty"
@@ -475,6 +528,19 @@ assert_lock_inputs() {
   fi
 }
 
+assert_protected_build_wrappers() {
+  local document
+  local dependency
+  for document in \
+    "$REPO_ROOT/docs/impl/core-design/json-escape-benchmark-evidence.md" \
+    "$REPO_ROOT/docs/impl/core-design/ja/json-escape-benchmark-evidence.md"; do
+    for dependency in scripts/cargo.sh scripts/dyld-env.sh; do
+      grep -Fxq "$dependency" "$document" ||
+        fail "$dependency is absent from the exact protected-input set in $document"
+    done
+  done
+}
+
 assert_locked_offline_invocations() {
   local count
   count="$(wc -l < "$FAKE_LOG" | tr -d ' ')"
@@ -486,10 +552,12 @@ assert_locked_offline_invocations() {
 
 benchmark_input_workdir_matrix() {
   assert_lock_inputs
+  assert_protected_build_wrappers
   expect_invalid_workdirs
   make_fake_tools
   assert_linux_sealed_copy
   assert_special_file_copy_rejects_without_blocking
+  assert_bound_exec_special_file_rejects_without_blocking
   [[ -f "$REPO_ROOT/bench/json_decode/Cargo.lock" ]] || fail "json_decode Cargo.lock is missing"
   [[ -f "$REPO_ROOT/bench/json_soa/Cargo.lock" ]] || fail "json_soa Cargo.lock is missing"
 
@@ -585,6 +653,25 @@ benchmark_input_workdir_matrix() {
   [[ "$(find "$artifact_escape" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" -eq 1 ]] ||
     fail "trusted preparation wrote through the replaced artifacts path"
   [[ -f "$artifact_escape/sentinel" ]] || fail "artifact replacement removed caller data"
+
+  FAKE_WORK_DIR="$TEST_ROOT/replaced-artifacts-after-verify-work"
+  mkdir -p "$FAKE_WORK_DIR"
+  if run_benchmark json_decode env FAKE_SWAP_ARTIFACTS_AFTER_VERIFY=1; then
+    fail "artifacts-directory replacement between verification and manifest was accepted"
+  fi
+  [[ -d "$FAKE_WORK_DIR/prepared/original-artifacts-after-verify" ]] ||
+    fail "post-verification artifacts replacement lost the retained directory"
+
+  FAKE_WORK_DIR="$TEST_ROOT/extra-artifact-work"
+  mkdir -p "$FAKE_WORK_DIR"
+  run_benchmark json_decode env
+  printf 'unexpected artifact\n' > "$FAKE_WORK_DIR/prepared/artifacts/extra"
+  unlink "$FAKE_WORK_DIR/prepared/artifact-manifest.json"
+  "$ORIGINAL_PYTHON3" "$REPO_ROOT/scripts/benchmark_evidence/manifest.py" \
+    write --root "$FAKE_WORK_DIR/prepared" --manifest artifact-manifest.json >/dev/null
+  if run_prepared_benchmark json_decode >/dev/null 2>&1; then
+    fail "additional self-consistent prepared artifact was accepted"
+  fi
 
   FAKE_WORK_DIR="$TEST_ROOT/replaced-before-exec-work"
   replacement_dir="$TEST_ROOT/replacement-prepared"

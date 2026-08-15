@@ -185,6 +185,35 @@ def _verify_artifacts_directory() -> None:
         raise PreparedTreeError("prepared artifacts directory was replaced")
 
 
+def _verify_manifest_artifacts(entries: Sequence[dict[str, object]]) -> None:
+    actual = os.fstat(ARTIFACTS_FD)
+    retained = [
+        {
+            "path": "artifacts",
+            "kind": "directory",
+            "mode": manifest._mode("directory", actual.st_mode),
+            "uid": actual.st_uid,
+            "gid": actual.st_gid,
+            "size": 0,
+            "sha256": "",
+        }
+    ]
+    retained.extend(
+        item.as_dict()
+        for item in manifest._iter_tree(
+            ARTIFACTS_FD, prefix="artifacts", excluded="", seen_files=set()
+        )
+    )
+    retained.sort(key=lambda item: os.fsencode(str(item["path"])))
+    captured = [
+        entry
+        for entry in entries
+        if entry["path"] == "artifacts" or str(entry["path"]).startswith("artifacts/")
+    ]
+    if captured != retained:
+        raise PreparedTreeError("prepared manifest does not describe retained artifacts")
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="benchmark-evidence-prepared-tree", allow_abbrev=False)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -223,8 +252,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "verify-artifacts":
             _verify_artifacts_directory()
         elif args.command == "write-manifest":
+            _verify_artifacts_directory()
             digest = manifest.write_manifest_fd(ROOT_FD, "artifact-manifest.json")
-            _, raw = manifest.verify_manifest_fd(ROOT_FD, "artifact-manifest.json")
+            _verify_artifacts_directory()
+            captured, raw = manifest.verify_manifest_fd(ROOT_FD, "artifact-manifest.json")
+            _verify_artifacts_directory()
+            _verify_manifest_artifacts(captured["entries"])
             if digest != manifest.manifest_sha256(raw):
                 raise PreparedTreeError("prepared manifest changed after writing")
             print(digest)

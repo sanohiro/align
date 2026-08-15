@@ -57,6 +57,14 @@ of arbitrary candidate writes. The repair publishes all final artifacts only aft
 exits, opens fixed outputs nonblocking/no-follow, and assigns arbitrary-write confinement to the
 already-required outer controller container; script-only ARM qualification trusts the checkout.
 
+The exact-base publication review of `5d471664` against `1c9e2e9a` found four final boundary gaps:
+the candidate-used Cargo wrapper and sourced loader helper were outside the protected-input set,
+manifest publication did not compare its artifact subtree to the retained descriptor, bound
+execution could block opening a FIFO replacement, and a self-consistent manifest could include
+extra artifacts. The consolidated repair protects both wrapper paths, rebinds manifest publication
+to a fresh retained-descriptor walk, uses nonblocking no-follow launcher opens, requires the exact
+five-entry artifact subtree, and adds focused regressions for all four findings.
+
 Latest durable verification after the exact-base review repair passed the serial owner aggregate:
 `scripts/test-benchmark-evidence-manifest.sh`, `scripts/test-benchmark-evidence-bootstrap.sh`,
 `scripts/test-benchmark-evidence-cli.sh`, `scripts/test-benchmark-evidence-git-objects.sh`,
@@ -66,7 +74,9 @@ Latest durable verification after the exact-base review repair passed the serial
 `bench/json_decode/run.sh prepare native` plus `run.sh native` and
 `bench/json_soa/run.sh prepare native` plus `run.sh native` completed serially from an empty external
 work directory, with the prepare-time digest supplied to direct execution and an injected ambient
-sentinel excluded by the fixed launcher environment. These are
+sentinel excluded by the fixed launcher environment. The post-publication-review rerun produced
+decode digest `8361a6fdecc40a88791ca689504d1aa37c8f73888129ce0c6912904928550bd1` and SoA
+digest `f345f9004bb6e9790c9dca8b320e24cf4814db6f85de829fad47d1b6a2a4ec54`. These are
 correctness/boundary owners, not accepted x86_64 performance evidence. At this PR's merge, no work
 is active by user request. The next eligible capability is installed-source replacement protection
 and protected-input matching, followed by the controller/profile/image/adversarial owners;

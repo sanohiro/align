@@ -131,6 +131,8 @@ bench/.cargo/**                when present in either revision
 bench/json_decode/**
 bench/json_soa/**
 bench/json_escape/evidence/**
+scripts/cargo.sh
+scripts/dyld-env.sh
 scripts/benchmark_evidence/**
 tests/benchmark_evidence/**
 ```
@@ -537,6 +539,10 @@ ordinary testにしない。native host qualification/final measurementはmanual
 | build pathだけではarbitrary candidate writeをsandboxできない | script contractはcandidate code自体をsandboxすると主張しない。accepted evidenceはlater outer-controller container boundaryが必須。本sliceはconfigured outputと全trusted publication mutationをconfineし、script-only ARM qualificationはcheckoutをtrustする。 |
 | candidate workがpublished final artifactを書換可能 | 全build/compiler child group終了後にだけfinal artifactを作る。helperがfixed compiler/runtime/kernel/harness outputをdescriptor-relative copyし、manifest captureする。 |
 | FIFO outputがtrusted copyをblock可能 | sourceはnonblocking/no-follow descriptorでopenし、read前に全non-regular outputをreject。ownerはfixed runtime outputにFIFOを置きalarm内のrejectを要求する。 |
+| candidate-controlled Cargo wrapper dependencyがprotectedでない | exact protected-input setに`scripts/cargo.sh`とsourceされる`scripts/dyld-env.sh`を含め、preparationがreviewed evidence profileと独立にCargo/LLVM/linker選択を変更できないようにする。 |
+| manifest publicationがretained artifacts directoryを再bindしない | manifest publicationはrootの`artifacts` entryがretained descriptorと同一であることをmanifest create/verifyの前後で検証し、captured manifest subtreeをretained descriptorからのfresh walkとbyte-for-byte比較。persistent/transient replacementはsame retained artifactを記述しない限りreject。 |
+| bound executionがFIFO replacementのopenでblock可能 | Linux sealed-copyとnative ARM qualificationの両openをnonblocking/no-followにし、read前にnon-regular descriptorをreject。 |
+| bound executionが追加のself-consistent artifactをaccept | launcherはmanifestの`artifacts` subtreeをcompiler/runtime/kernel/selected harness/directory entryのexact setに限定し、extra entryをexecution前にreject。 |
 
 ## Author consistency pass
 

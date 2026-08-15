@@ -103,6 +103,8 @@ def _copy_to_sealed_memfd(
 
 def _open_bound_file(parent_fd: int, name: str, expected: dict[str, Any]) -> int:
     flags = os.O_RDONLY
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
@@ -143,6 +145,8 @@ def _open_verified_file(parent_fd: int, name: str, expected: dict[str, Any]) -> 
     """Open and verify a source descriptor for native macOS qualification."""
 
     flags = os.O_RDONLY
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
@@ -236,6 +240,18 @@ def execute(
     ]
     if executable_path not in entries or len(runtime_paths) != 1:
         raise BoundExecError("prepared manifest lacks the exact executable/runtime pair")
+    expected_artifact_paths = {
+        "artifacts",
+        "artifacts/alignc",
+        "artifacts/kernel.o",
+        executable_path,
+        runtime_paths[0],
+    }
+    observed_artifact_paths = {
+        path for path in entries if path == "artifacts" or path.startswith("artifacts/")
+    }
+    if observed_artifact_paths != expected_artifact_paths:
+        raise BoundExecError("prepared manifest contains an unexpected artifact set")
 
     artifacts_fd = _open_directory(root_fd, "artifacts")
     runtime_name = runtime_paths[0].split("/", 1)[1]
