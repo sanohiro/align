@@ -64,11 +64,16 @@ set -euo pipefail
 : "${TMPDIR:?}"
 FAKE_WORK_DIR_PHYSICAL="$(cd "$FAKE_WORK_DIR" && pwd -P)"
 [[ -f Cargo.lock ]] || { echo "detached or root Cargo.lock is missing" >&2; exit 87; }
-case "$CARGO_TARGET_DIR" in
+resolve_path() {
+  "$ORIGINAL_PYTHON3" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"
+}
+resolved_target="$(resolve_path "$CARGO_TARGET_DIR")"
+resolved_tmp="$(resolve_path "$TMPDIR")"
+case "$resolved_target" in
   "$FAKE_WORK_DIR_PHYSICAL"/prepared/*) ;;
   *) echo "cargo target escaped the private child: $CARGO_TARGET_DIR" >&2; exit 81 ;;
 esac
-case "$TMPDIR" in
+case "$resolved_tmp" in
   "$FAKE_WORK_DIR_PHYSICAL"/prepared/*) ;;
   *) echo "cargo temporary directory escaped the private child" >&2; exit 82 ;;
 esac
@@ -125,11 +130,13 @@ fi
 if [[ "${1:-}" != emit-obj || "$#" -lt 3 ]]; then
   exit 72
 fi
-case "$3" in
+resolved_output="$($ORIGINAL_PYTHON3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$3")"
+case "$resolved_output" in
   "$FAKE_WORK_DIR_PHYSICAL"/prepared/*) ;;
   *) echo "kernel object escaped the private child" >&2; exit 83 ;;
 esac
-case "$ALIGNC_CACHE" in
+resolved_cache="$($ORIGINAL_PYTHON3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$ALIGNC_CACHE")"
+case "$resolved_cache" in
   "$FAKE_WORK_DIR_PHYSICAL"/prepared/*) ;;
   *) echo "alignc cache escaped the private child" >&2; exit 88 ;;
 esac
@@ -162,11 +169,13 @@ elif has_arg build "$@"; then
   if [[ "${FAKE_ADD_FOREIGN:-0}" == 1 && ! -e "$FAKE_WORK_DIR/foreign" ]]; then
     printf 'caller-owned residue\n' > "$FAKE_WORK_DIR/foreign"
   fi
-  case "${ALIGN_KERNEL_OBJ:-}" in
+  resolved_kernel="$($ORIGINAL_PYTHON3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${ALIGN_KERNEL_OBJ:-}")"
+  case "$resolved_kernel" in
     "$FAKE_WORK_DIR_PHYSICAL"/prepared/*) ;;
     *) echo "detached kernel object escaped the private child" >&2; exit 84 ;;
   esac
-  case "${ALIGN_RUNTIME_DIR:-}" in
+  resolved_runtime="$($ORIGINAL_PYTHON3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${ALIGN_RUNTIME_DIR:-}")"
+  case "$resolved_runtime" in
     "$FAKE_WORK_DIR_PHYSICAL"/prepared/*) ;;
     *) echo "runtime directory escaped the private child" >&2; exit 85 ;;
   esac
@@ -200,15 +209,15 @@ fi
 FAKE_CARGO
   chmod 700 "$FAKE_BIN/cargo"
 
-  cat > "$FAKE_BIN/rm" <<'FAKE_RM'
+  cat > "$FAKE_BIN/rmdir" <<'FAKE_RMDIR'
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ "${FAKE_RM_MODE:-}" == fail-child && "$*" == *"/prepared"* ]]; then
+if [[ "${FAKE_RMDIR_MODE:-}" == fail-child && "$*" == *"/prepared"* ]]; then
   exit 1
 fi
-exec /bin/rm "$@"
-FAKE_RM
-  chmod 700 "$FAKE_BIN/rm"
+exec /bin/rmdir "$@"
+FAKE_RMDIR
+  chmod 700 "$FAKE_BIN/rmdir"
 
   cat > "$FAKE_BIN/mkdir" <<'FAKE_MKDIR'
 #!/usr/bin/env bash
@@ -254,8 +263,12 @@ run_benchmark() {
 
 run_prepared_benchmark() {
   local bench="$1"
+  local digest
   shift
+  digest="$("$ORIGINAL_PYTHON3" "$REPO_ROOT/scripts/benchmark_evidence/manifest.py" \
+    verify --root "$FAKE_WORK_DIR/prepared" --manifest artifact-manifest.json)"
   PATH="$FAKE_BIN:$ORIGINAL_PATH" ALIGN_BENCH_WORK_DIR="$FAKE_WORK_DIR" \
+    ALIGN_BENCH_ARTIFACT_MANIFEST_SHA256="$digest" \
     FAKE_WORK_DIR="$FAKE_WORK_DIR" ORIGINAL_PYTHON3="$ORIGINAL_PYTHON3" "$@" \
     "$REPO_ROOT/bench/$bench/run.sh" native
 }
@@ -447,6 +460,15 @@ benchmark_input_workdir_matrix() {
   fi
   assert_empty "$FAKE_WORK_DIR"
 
+  FAKE_WORK_DIR="$TEST_ROOT/missing-digest-work"
+  mkdir -p "$FAKE_WORK_DIR"
+  run_benchmark json_decode env
+  if PATH="$FAKE_BIN:$ORIGINAL_PATH" ALIGN_BENCH_WORK_DIR="$FAKE_WORK_DIR" \
+    FAKE_WORK_DIR="$FAKE_WORK_DIR" ORIGINAL_PYTHON3="$ORIGINAL_PYTHON3" \
+    "$REPO_ROOT/bench/json_decode/run.sh" native >/dev/null 2>&1; then
+    fail "native measurement without the prepare-time digest was accepted"
+  fi
+
   FAKE_WORK_DIR="$TEST_ROOT/mkdir-collision-work"
   mkdir -p "$FAKE_WORK_DIR"
   if run_benchmark json_decode env FAKE_MKDIR_COLLIDE=1; then
@@ -476,12 +498,30 @@ benchmark_input_workdir_matrix() {
   mkdir -p "$FAKE_WORK_DIR"
   run_benchmark json_decode env
   cp -R "$FAKE_WORK_DIR/prepared" "$replacement_dir"
-  if run_prepared_benchmark json_decode env FAKE_SWAP_BEFORE_BOUND_EXEC=1 \
-    FAKE_REPLACEMENT_DIR="$replacement_dir" >/dev/null 2>&1; then
-    fail "prepared-directory replacement before descriptor binding was accepted"
-  fi
+  benchmark_output="$(run_prepared_benchmark json_decode env FAKE_SWAP_BEFORE_BOUND_EXEC=1 \
+    FAKE_REPLACEMENT_DIR="$replacement_dir")"
+  [[ "$benchmark_output" == $'target: native\nfake prepared benchmark' ]] ||
+    fail "descriptor-bound execution did not retain the shell-opened prepared root"
   [[ -d "$FAKE_WORK_DIR/original-prepared-run" ]] ||
     fail "pre-exec replacement lost the originally bound directory"
+
+  FAKE_WORK_DIR="$TEST_ROOT/replaced-between-phases-work"
+  phase_replacement="$TEST_ROOT/phase-replacement-prepared"
+  mkdir -p "$FAKE_WORK_DIR"
+  run_benchmark json_decode env
+  prepare_digest="$("$ORIGINAL_PYTHON3" "$REPO_ROOT/scripts/benchmark_evidence/manifest.py" \
+    verify --root "$FAKE_WORK_DIR/prepared" --manifest artifact-manifest.json)"
+  cp -R "$FAKE_WORK_DIR/prepared" "$phase_replacement"
+  printf 'changed configuration\n' > "$phase_replacement/configuration.json"
+  unlink "$phase_replacement/artifact-manifest.json"
+  "$ORIGINAL_PYTHON3" "$REPO_ROOT/scripts/benchmark_evidence/manifest.py" \
+    write --root "$phase_replacement" --manifest artifact-manifest.json >/dev/null
+  mv "$FAKE_WORK_DIR/prepared" "$FAKE_WORK_DIR/original-prepared-phase"
+  mv "$phase_replacement" "$FAKE_WORK_DIR/prepared"
+  if run_prepared_benchmark json_decode env \
+    ALIGN_BENCH_ARTIFACT_MANIFEST_SHA256="$prepare_digest" >/dev/null 2>&1; then
+    fail "self-consistent prepared replacement between phases was accepted"
+  fi
 
   local survivor_marker
   local survivor_pid
@@ -523,7 +563,7 @@ benchmark_input_workdir_matrix() {
 
   FAKE_WORK_DIR="$TEST_ROOT/cleanup-failure-work"
   mkdir -p "$FAKE_WORK_DIR"
-  if run_benchmark json_decode env FAKE_RM_MODE=fail-child; then
+  if run_benchmark json_decode env FAKE_ADD_FOREIGN=1 FAKE_RMDIR_MODE=fail-child; then
     fail "cleanup failure was accepted"
   fi
   directory_has_entries "$FAKE_WORK_DIR" || fail "cleanup failure did not preserve evidence of failure"

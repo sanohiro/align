@@ -7,15 +7,19 @@ aggregate touches 2.
 
 ```sh
 ALIGN_BENCH_WORK_DIR=/absolute/empty/outside/repo bench/json_soa/run.sh prepare native
-ALIGN_BENCH_WORK_DIR=/absolute/prepared/outside/repo bench/json_soa/run.sh native
+ALIGN_BENCH_WORK_DIR=/absolute/prepared/outside/repo \
+  ALIGN_BENCH_ARTIFACT_MANIFEST_SHA256=$PREPARE_TIME_DIGEST bench/json_soa/run.sh native
 ```
 
 `ALIGN_BENCH_WORK_DIR` is required and must be an absolute directory outside the repository.
 `prepare native` requires it to be empty, builds the compiler, runtime, kernel, and detached harness
 once with locked offline Cargo, reduces the result to the executable artifacts, and writes a
 canonical content/mode manifest below `prepared/`. `native` requires exactly that sealed directory,
-verifies the manifest, and directly executes the harness without Cargo or compiler work. The
-prepared directory is retained for evidence-controller warm-ups and samples.
+the lowercase SHA-256 printed by `prepare native` in
+`ALIGN_BENCH_ARTIFACT_MANIFEST_SHA256`, verifies that exact manifest, and directly executes the
+harness without Cargo or compiler work. The trusted caller retains the printed digest across the
+phase boundary; it must not rederive it from the later path. The prepared directory is retained for
+evidence-controller warm-ups and samples.
 
 Each reported duration is the checked integer median of the existing 30 inner timings, quantized
 once to integer microseconds with half-microseconds rounded upward and rendered as an exact

@@ -21,7 +21,9 @@ class BoundExecError(ValueError):
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="benchmark-evidence-bound-exec", allow_abbrev=False)
     parser.add_argument("--root", required=True)
+    parser.add_argument("--root-fd", required=True, type=int)
     parser.add_argument("--root-identity", required=True)
+    parser.add_argument("--manifest-sha256", required=True)
     parser.add_argument("--executable", required=True)
     return parser
 
@@ -193,18 +195,38 @@ def _parse_root_identity(value: str) -> tuple[int, int]:
     return identity
 
 
-def execute(root: str, root_identity: str, executable: str) -> None:
+def execute(
+    root: str,
+    root_fd_number: int,
+    root_identity: str,
+    expected_manifest_sha256: str,
+    executable: str,
+) -> None:
     if not os.path.isabs(root):
         raise BoundExecError("prepared root must be absolute")
     if "/" in executable or executable in ("", ".", ".."):
         raise BoundExecError("prepared executable must be one path component")
+    if (
+        len(expected_manifest_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in expected_manifest_sha256)
+    ):
+        raise BoundExecError("prepared manifest digest must be lowercase SHA-256")
 
     expected_root_identity = _parse_root_identity(root_identity)
-    root_fd = manifest._open_root(root)
+    try:
+        root_fd = os.dup(root_fd_number)
+    except OSError as exc:
+        raise BoundExecError(f"cannot retain prepared root descriptor: {exc}") from exc
+    os.set_inheritable(root_fd_number, False)
+    os.set_inheritable(root_fd, False)
     opened_root = os.fstat(root_fd)
+    if not stat.S_ISDIR(opened_root.st_mode):
+        raise BoundExecError("prepared root descriptor is not a directory")
     if (opened_root.st_dev, opened_root.st_ino) != expected_root_identity:
         raise BoundExecError("prepared root changed before descriptor binding")
-    captured, _ = manifest.verify_manifest_fd(root_fd, "artifact-manifest.json")
+    captured, raw = manifest.verify_manifest_fd(root_fd, "artifact-manifest.json")
+    if manifest.manifest_sha256(raw) != expected_manifest_sha256:
+        raise BoundExecError("prepared manifest does not match the prepare-time digest")
     entries = _entry_map(captured["entries"])
     executable_path = f"artifacts/{executable}"
     runtime_paths = [
@@ -232,14 +254,22 @@ def execute(root: str, root_identity: str, executable: str) -> None:
         # where verified bytes are copied to write-sealed anonymous descriptors above.
         _open_verified_file(artifacts_fd, executable, entries[executable_path])
         _open_verified_file(artifacts_fd, runtime_name, entries[runtime_paths[0]])
-        os.execve(os.path.join(root, executable_path), [executable_path], environment)
+        environment["DYLD_LIBRARY_PATH"] = "artifacts"
+        os.fchdir(root_fd)
+        os.execve(executable_path, [executable_path], environment)
     raise BoundExecError("fd-bound benchmark execution requires Linux or macOS")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        execute(args.root, args.root_identity, args.executable)
+        execute(
+            args.root,
+            args.root_fd,
+            args.root_identity,
+            args.manifest_sha256,
+            args.executable,
+        )
     except (BoundExecError, manifest.ManifestError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

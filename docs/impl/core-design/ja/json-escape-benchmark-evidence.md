@@ -160,12 +160,21 @@ repeated trailing separatorと`/.`でfinal-component symlinkを隠せない。�
 own process groupで実行し、interrupt時はcomplete groupへbounded TERM/KILL escalationを行い、private file
 remove前にdirect childをreapする。
 
+scriptはuntrusted build開始前にprivate childをopenして保持する。accepted Linux pathでは全preparation pathを
+そのdescriptorの`/proc` handle配下にrootし、`prepared`のrename/replacementで後続Cargo/compiler/copy/chmod/
+manifest/cleanupを別treeへredirectできない。cleanupのrecursive removeはretained descriptor配下だけで行い、
+public pathにはretained device/inodeとの再一致後にnon-recursive `rmdir`だけを適用する。macOSはnative ARM
+development qualificationのままでaccepted adversarial evidenceには使わない。
+
 baseline選択前に両protected scriptをclosed two-phase interfaceにする。`run.sh prepare native`が
 root/detached Cargo buildと`alignc emit-obj`を行い、compiler/runtime/benchmark executable/kernel object/
 effective configのcanonical SHA-256/mode manifestをrevision-private work dirに作る。`run.sh native`は
 Cargo/compiler workを行わない。prepareはpublish前にprivate childのcaptured device/inode identityを再検証する。
-nativeはそのidentityをlauncherへ渡し、launcherはfinal componentをfollowせずprepared rootをopenして
-device/inode一致を要求し、retained directory descriptor配下でmanifestをverifyする。accepted Linux x86_64 pathは
+nativeはfinal componentをfollowせずprepared rootをopenし、retained descriptorとcaptured device/inodeを
+launcherへ渡す。launcherは一致を要求し、そのdescriptor配下でmanifestをverifyする。prepareはcanonical manifest
+SHA-256もprintし、trusted controllerがcandidate-writable state外で保持して、later native invocationごとにrequired
+`ALIGN_BENCH_ARTIFACT_MANIFEST_SHA256`として渡す。launcherはcurrent self-consistent treeのmanifestがその
+prepare-time digestと異なればartifact open前にrejectする。accepted Linux x86_64 pathは
 executable/runtimeをhashしながらanonymous `memfd`へcopyし、source metadataをcopy前後で確認し、
 `F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL`を適用してsealed descriptorだけをdirect exec/preloadする。
 macOS pathはaccepted evidenceではなくnative ARM development qualificationのまま。missing/extra/changed/
@@ -447,7 +456,7 @@ bindするprovider CASをreviewed amendmentで導入する。base ruleを弱め�
 | Report/signature | report/merge-verification bidirectional goldenと全field/order/type/width/duplicate/escape/trailing/derived mutation、exact SSHSIG binary/preimage、armor header/footer/LF/base64/wrap/padding、wrong key/namespace/profile/stale。`benchmark_evidence_report_v1_matrix`. |
 | Failure/cleanup | benchmark-input ownerはabsent/relative/missing/non-directory/final-symlink（repeated separatorと`/.` aliasを含む）/root/repository/in-repository/nonempty work root、foreign residue、success/error/signal cleanup、caller entry非削除、TERM-ignoring descendant非残存をcover。evidence ownerは全phase error/timeout/signal/disk/file+dir+parent+reservation fsync/unlock/rename/reservation remove/ordinary remove/signをcover。accepted pathなし。全resourceが消えるか、surviving fail-closed reservationがacceptとlater workを阻止。`benchmark_input_workdir_matrix`; `benchmark_evidence_cleanup_matrix`. |
 | Concurrent | lockまたはpublication reservation中のsecond runはGit/image/container前fail。lockはmeasurement cleanupとdurable reservation後にreleaseし、accepted publishはreservationをremove+fsync。crash/restart/admin recoveryもfail-closed。`benchmark_evidence_exclusive_run`. |
-| TOCTOU | prepared root device/inodeをshell-to-launcher handoffで渡し、manifest traversalはretained descriptor配下、Linux executable/runtimeはexec/preload前にfully write-sealed anonymous descriptorへcopyする。image/sourceはopened identityを使用またはprivilege boundaryで再検証。root rename/replacement、same-inode artifact write、daemon-image/source swapをreject。`benchmark_input_workdir_matrix`; `benchmark_evidence_bound_object_swap_matrix`. |
+| TOCTOU | untrusted work前にpreparation rootをretainし、accepted Linux writeはすべてdescriptor配下。manifest digestはtrusted controller stateでprepare/native phaseを越え、root descriptorはshell/launcher boundaryを越える。manifest traversalもその配下で、executable/runtimeはexec/preload前にfully write-sealed anonymous descriptorへcopy。cleanupのrecursive mutationもretained treeのみ。image/sourceはopened identityを使用またはprivilege boundaryで再検証。root rename/replacement、same-inode artifact write、daemon-image/source swapをreject。`benchmark_input_workdir_matrix`; `benchmark_evidence_bound_object_swap_matrix`. |
 | Forged/stale | unsigned/edit/replay/truncate/concat/wrong namespace、PR/preflight/trusted-review mismatch。`CLEAN`は`clean`のみ、accepted `FINDINGS` + nonempty repair chainは`fixed`のみにmap。`benchmark_evidence_stale_forged_matrix`. |
 | Base/integration race | target move、precheck race、unavailable/wrong response OID、local-target mismatch、wrong parent/tree、signed artifact mutation、normal later first-parent descendant、final trusted refetch前のforce-push/removal、revert failure、exact merge。final target first-parent chainにmergeが残らなければlifecycleを進めない。`benchmark_evidence_merge_race_matrix`. |
 
@@ -494,6 +503,14 @@ ordinary testにしない。native host qualification/final measurementはmanual
 |---|---|
 | retained prepared pathをverification後にreplace可能 | prepareはsuccess前にcaptured private-child device/inodeを再検証。nativeはcaptured identityをlauncherへ渡し、opened root descriptorとの一致を要求し、manifest traversalをそのdescriptor配下で実行。 |
 | hash後のsame-inode writeでbytesを変更可能 | accepted Linux pathはexecutable/runtimeをhashしながらanonymous memfdへcopyし、source metadataをcopy前後で確認、4つのwrite/size/seal sealを適用後sealed copyだけをexec/preload。deterministic ownerはshell/launcher handoffでrootをreplaceし、source変更後もsealed copyが不変かつwrite不能と確認。 |
+
+## Final-integration review closure
+
+| Finding | Closure |
+|---|---|
+| phase間でself-consistent treeがprepared stateをreplace可能 | prepareがcanonical manifest SHA-256をprint。trusted controllerがcandidate-writable state外で保持し、全native invocationがrequired inputとして受け、descriptor-relative verificationがartifact open前にdifferent current manifestをreject。 |
+| untrusted prepare childがlater path writeをredirect可能 | first build前にprivate-child descriptorをretain。accepted Linux preparation pathはすべてdescriptorの`/proc` handleを使い、publicationはpublic pathのsame device/inodeを要求。native ARM macOSはdevelopment qualificationのみ。 |
+| cleanup check/path raceがreplacementをrecursive delete可能 | recursive cleanupはretained private-child descriptorだけをwalk/unlink。public pathはdevice/inode再一致後のnon-recursive `rmdir`のみで、nonempty replacementをtraverse/deleteしない。 |
 
 ## Author consistency pass
 

@@ -10,6 +10,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
 BENCH_WORK_DIR=""
 BENCH_PRIVATE_DIR=""
+BENCH_BOUND_PRIVATE_DIR=""
 BENCH_PREPARED_DIR=""
 BENCH_ROOT_TARGET_DIR=""
 BENCH_DETACHED_TARGET_DIR=""
@@ -22,6 +23,7 @@ BENCH_WORK_DIR_VALIDATED=0
 BENCH_KEEP_PRIVATE=0
 BENCH_EXPECT_PREPARED=0
 BENCH_PRIVATE_IDENTITY=""
+BENCH_PRIVATE_FD_OPEN=0
 BENCH_CLEANED=0
 
 directory_has_entries() {
@@ -71,6 +73,50 @@ private_identity_matches() {
   local current_identity
   current_identity="$(directory_identity "$BENCH_PRIVATE_DIR" 2>/dev/null || true)"
   [[ -n "$BENCH_PRIVATE_IDENTITY" && "$current_identity" == "$BENCH_PRIVATE_IDENTITY" ]]
+}
+
+bind_private_directory() {
+  if ! exec 9<"$BENCH_PRIVATE_DIR"; then
+    return 1
+  fi
+  BENCH_PRIVATE_FD_OPEN=1
+  case "$(uname -s)" in
+    Linux) BENCH_BOUND_PRIVATE_DIR="/proc/$$/fd/9" ;;
+    Darwin) BENCH_BOUND_PRIVATE_DIR="$BENCH_PRIVATE_DIR" ;;
+    *) return 1 ;;
+  esac
+}
+
+clear_bound_private_directory() {
+  python3 - <<'PY'
+import os
+import stat
+
+
+def clear(fd):
+    for entry in list(os.scandir(fd)):
+        value = os.stat(entry.name, dir_fd=fd, follow_symlinks=False)
+        if stat.S_ISDIR(value.st_mode):
+            flags = os.O_RDONLY | os.O_DIRECTORY
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            child_fd = os.open(entry.name, flags, dir_fd=fd)
+            try:
+                opened = os.fstat(child_fd)
+                if (value.st_dev, value.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise RuntimeError("directory changed while opening for cleanup")
+                clear(child_fd)
+            finally:
+                os.close(child_fd)
+            os.rmdir(entry.name, dir_fd=fd)
+        else:
+            os.unlink(entry.name, dir_fd=fd)
+
+
+clear(9)
+PY
 }
 
 stop_child_group() {
@@ -149,12 +195,16 @@ cleanup() {
 
   stop_child_group
 
-  if [[ "$BENCH_KEEP_PRIVATE" -eq 0 && -n "$BENCH_PRIVATE_DIR" && ( -e "$BENCH_PRIVATE_DIR" || -L "$BENCH_PRIVATE_DIR" ) ]]; then
+  if [[ "$BENCH_KEEP_PRIVATE" -eq 0 && "$BENCH_PRIVATE_FD_OPEN" -eq 1 ]]; then
+    if ! clear_bound_private_directory; then
+      echo "error: failed to clear the bound benchmark work child" >&2
+      cleanup_failed=1
+    fi
     current_identity="$(directory_identity "$BENCH_PRIVATE_DIR" 2>/dev/null || true)"
     if [[ -z "$BENCH_PRIVATE_IDENTITY" || "$current_identity" != "$BENCH_PRIVATE_IDENTITY" ]]; then
       echo "error: refusing to remove a replaced benchmark work child" >&2
       cleanup_failed=1
-    elif ! rm -rf "$BENCH_PRIVATE_DIR" || [[ -e "$BENCH_PRIVATE_DIR" || -L "$BENCH_PRIVATE_DIR" ]]; then
+    elif ! rmdir "$BENCH_PRIVATE_DIR" || [[ -e "$BENCH_PRIVATE_DIR" || -L "$BENCH_PRIVATE_DIR" ]]; then
       echo "error: failed to remove the benchmark work child" >&2
       cleanup_failed=1
     fi
@@ -263,10 +313,20 @@ if [[ "$BENCH_ACTION" == run ]]; then
     echo "error: cannot bind the prepared benchmark directory identity" >&2
     exit 2
   fi
+  if ! bind_private_directory; then
+    echo "error: cannot retain the prepared benchmark directory" >&2
+    exit 2
+  fi
+  manifest_sha256="${ALIGN_BENCH_ARTIFACT_MANIFEST_SHA256:-}"
+  if [[ "${#manifest_sha256}" -ne 64 || "$manifest_sha256" == *[!0-9a-f]* ]]; then
+    echo "error: ALIGN_BENCH_ARTIFACT_MANIFEST_SHA256 must be lowercase SHA-256" >&2
+    exit 2
+  fi
   printf 'target: native\n'
   exec env PYTHONDONTWRITEBYTECODE=1 python3 \
     "$REPO_ROOT/scripts/benchmark_evidence/bound_exec.py" \
-    --root "$BENCH_PREPARED_DIR" --root-identity "$BENCH_PRIVATE_IDENTITY" \
+    --root "$BENCH_PREPARED_DIR" --root-fd 9 --root-identity "$BENCH_PRIVATE_IDENTITY" \
+    --manifest-sha256 "$ALIGN_BENCH_ARTIFACT_MANIFEST_SHA256" \
     --executable "$BENCH_BINARY"
 fi
 
@@ -287,12 +347,16 @@ if ! chmod 700 "$BENCH_PRIVATE_DIR"; then
   echo "error: cannot secure the private benchmark work child" >&2
   exit 1
 fi
+if ! bind_private_directory; then
+  echo "error: cannot retain the prepared benchmark directory" >&2
+  exit 1
+fi
 
-BENCH_ROOT_TARGET_DIR="$BENCH_PRIVATE_DIR/root-target"
-BENCH_DETACHED_TARGET_DIR="$BENCH_PRIVATE_DIR/detached-target"
-BENCH_TMP_DIR="$BENCH_PRIVATE_DIR/tmp"
-BENCH_ALIGNC_CACHE_DIR="$BENCH_PRIVATE_DIR/alignc-cache"
-BENCH_ARTIFACT_DIR="$BENCH_PRIVATE_DIR/artifacts"
+BENCH_ROOT_TARGET_DIR="$BENCH_BOUND_PRIVATE_DIR/root-target"
+BENCH_DETACHED_TARGET_DIR="$BENCH_BOUND_PRIVATE_DIR/detached-target"
+BENCH_TMP_DIR="$BENCH_BOUND_PRIVATE_DIR/tmp"
+BENCH_ALIGNC_CACHE_DIR="$BENCH_BOUND_PRIVATE_DIR/alignc-cache"
+BENCH_ARTIFACT_DIR="$BENCH_BOUND_PRIVATE_DIR/artifacts"
 mkdir -p "$BENCH_ROOT_TARGET_DIR" "$BENCH_DETACHED_TARGET_DIR" "$BENCH_TMP_DIR" \
   "$BENCH_ALIGNC_CACHE_DIR" "$BENCH_ARTIFACT_DIR"
 
@@ -309,7 +373,7 @@ build_runtime() {
 }
 
 emit_kernel() {
-  cd "$BENCH_PRIVATE_DIR"
+  cd "$BENCH_BOUND_PRIVATE_DIR"
   # BENCH_EXPORTS is a fixed, wrapper-owned word list.
   # shellcheck disable=SC2086
   ALIGNC_CACHE="$BENCH_ALIGNC_CACHE_DIR" TMPDIR="$BENCH_TMP_DIR" \
@@ -355,15 +419,15 @@ cp "$BENCH_DETACHED_TARGET_DIR/release/$BENCH_BINARY" "$BENCH_ARTIFACT_DIR/$BENC
 chmod 755 "$BENCH_ARTIFACT_DIR/$BENCH_BINARY"
 
 printf '{"schema":"align.json_escape_benchmark_artifacts/v1","benchmark":"%s","target":"native"}\n' \
-  "$BENCH_NAME" > "$BENCH_PRIVATE_DIR/configuration.json"
-chmod 644 "$BENCH_PRIVATE_DIR/configuration.json"
+  "$BENCH_NAME" > "$BENCH_BOUND_PRIVATE_DIR/configuration.json"
+chmod 644 "$BENCH_BOUND_PRIVATE_DIR/configuration.json"
 rm -rf "$BENCH_ROOT_TARGET_DIR" "$BENCH_DETACHED_TARGET_DIR" "$BENCH_TMP_DIR" \
   "$BENCH_ALIGNC_CACHE_DIR"
 PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/scripts/benchmark_evidence/manifest.py" \
-  write --root "$BENCH_PRIVATE_DIR" --manifest artifact-manifest.json >/dev/null
-verify_root="$BENCH_PRIVATE_DIR"
-PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/scripts/benchmark_evidence/manifest.py" \
-  verify --root "$verify_root" --manifest artifact-manifest.json >/dev/null
+  write --root "$BENCH_BOUND_PRIVATE_DIR" --manifest artifact-manifest.json >/dev/null
+manifest_sha256="$(PYTHONDONTWRITEBYTECODE=1 python3 \
+  "$REPO_ROOT/scripts/benchmark_evidence/manifest.py" verify \
+  --root "$BENCH_BOUND_PRIVATE_DIR" --manifest artifact-manifest.json)"
 
 if ! work_dir_contains_only_private; then
   echo "error: foreign residue appeared in the benchmark work directory" >&2
@@ -377,3 +441,4 @@ fi
 BENCH_KEEP_PRIVATE=1
 BENCH_EXPECT_PREPARED=1
 printf '%s\n' "$BENCH_PREPARED_DIR/artifact-manifest.json"
+printf 'artifact-manifest-sha256: %s\n' "$manifest_sha256"

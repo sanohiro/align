@@ -11,8 +11,8 @@ _Last updated: 2026-08-15._ Align main is at `c47e57c7`. align-llm Request 5's b
 body is shipped, and Request 7's evidence design (#813), benchmark inputs (#815/#821), installed
 manifest (#816), canonical JSON (#817), typed report schema (#818), SSHSIG framing (#820), strict
 controller CLI (#822), installed-manifest/profile binding (#823), and raw Git object identity codec
-(#825) are merged. The align-repl user guide is also shipped in #826. Active work is
-`agent/request7-prepared-benchmarks`: both protected JSON benchmarks gain the reviewed two-phase
+(#825) are merged. The align-repl user guide is also shipped in #826. The final requested work is
+PR #827 on `agent/request7-prepared-benchmarks`: both protected JSON benchmarks gain the reviewed two-phase
 `prepare native` / direct `native` interface, canonical artifact sealing, checked integer inner
 medians, descriptor-bound Linux evidence execution, and inode-aware cleanup. The integrated review
 of `845f0b90` against `863c20ba` found two valid P1 handoff races: retained-root replacement and
@@ -23,16 +23,23 @@ development qualification, not accepted evidence. Its focused owners are
 `scripts/test-benchmark-input.sh`, `scripts/test-benchmark-evidence-manifest.sh`, and
 `scripts/test-benchmark-evidence-statistics.sh`.
 
+The final integration review of `0dbbd709` against `c47e57c7` found three valid remaining handoff
+issues. The consolidated closure requires the trusted caller to retain prepare's manifest SHA-256
+and supply it to every native invocation, keeps accepted Linux preparation writes below a retained
+private-child descriptor, carries that descriptor into the launcher, and recursively cleans only
+the retained tree before an identity-checked non-recursive public-path removal.
+
 Latest durable verification after the integrated-review repair passed
 `scripts/test-benchmark-evidence-manifest.sh`, `scripts/test-benchmark-input.sh`, and
 `scripts/test-benchmark-evidence-statistics.sh`. Native Apple ARM64 also passed with
 `CARGO_BUILD_JOBS=1`: each of
 `bench/json_decode/run.sh prepare native` plus `run.sh native` and
 `bench/json_soa/run.sh prepare native` plus `run.sh native` completed serially from an empty external
-work directory. These are correctness/boundary owners, not accepted x86_64 performance evidence.
-After this capability merges, continue the installed controller/verifier/monitor with revision
-binding, protected-input matching, profile, image recipe, and remaining adversarial owners. Native
-x86_64 host qualification and the Request 7 language implementation branch remain later gates; no
+work directory, with the prepare-time digest supplied to direct execution. These are
+correctness/boundary owners, not accepted x86_64 performance evidence. At this PR's merge, no work
+is active by user request. The next eligible capability is the installed controller/verifier/monitor
+with revision binding and protected-input matching, followed by profile/image/adversarial owners;
+native x86_64 host qualification and the Request 7 language implementation remain later gates. No
 emulation is accepted in any evidence lane.
 
 The C-B borrow/ownership capability is complete

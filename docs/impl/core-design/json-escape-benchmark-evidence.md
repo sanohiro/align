@@ -207,15 +207,27 @@ build, compiler, and harness command runs in its own process group; interruption
 TERM/KILL escalation to the complete group and reaps the direct child before private files are
 removed. The caller-owned empty directory remains after successful cleanup.
 
+The script opens and retains the private child before starting any untrusted build. On the accepted
+Linux path every preparation path is rooted through that descriptor's `/proc` handle, so renaming or
+replacing `prepared` cannot redirect later Cargo, compiler, copy, chmod, manifest, or cleanup work.
+Cleanup recursively removes entries only through the retained descriptor; it applies at most a
+non-recursive `rmdir` to the public path after the path still matches the retained device/inode.
+macOS remains native ARM development qualification and never supplies accepted adversarial
+evidence.
+
 Commands are argv arrays without shell interpolation. Before baseline selection, the evidence
 implementation gives each protected script a closed two-phase interface. `run.sh prepare native`
 performs every root and detached Cargo build plus `alignc emit-obj`, then writes a canonical
 SHA-256/mode manifest for the compiler, runtime, detached benchmark executable, kernel object, and
 effective configuration into the revision-private work directory. `run.sh native` accepts no Cargo
 or compiler work. Prepare revalidates the captured device/inode identity before publishing the
-private child. Native passes that identity to the launcher, which opens the prepared root without
-following its final component, requires the opened device/inode to match, and verifies the manifest
-through that retained directory descriptor. On the accepted Linux x86_64 path it hashes the
+private child. Native opens the prepared root without following its final component and passes both
+the retained descriptor and captured device/inode to the launcher, which requires them to match and
+verifies the manifest through that descriptor. Prepare also prints the canonical manifest SHA-256;
+the trusted controller retains it outside candidate-writable state and supplies it as the required
+`ALIGN_BENCH_ARTIFACT_MANIFEST_SHA256` value to every later native invocation. The launcher rejects
+any current self-consistent tree whose manifest does not equal that prepare-time digest. On the
+accepted Linux x86_64 path it hashes the
 executable and runtime while copying them to anonymous `memfd` objects, checks source metadata
 before and after the copy, applies `F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL`, and directly
 execs/preloads only those sealed descriptors. The macOS path remains native ARM development
@@ -602,7 +614,7 @@ It may not weaken the base rule.
 | Report/signature | Bidirectional report and merge-verification goldens plus every field/order/type/width/duplicate/escape/trailing/derived mutation; exact SSHSIG binary fields and signing preimage; armor header/footer/LF/base64 alphabet/wrap/padding; and wrong key/namespace/signature/profile/stale candidate/report/merge reject. `benchmark_evidence_report_v1_matrix`. |
 | Failure/cleanup | The benchmark-input owner first covers absent/relative/missing/non-directory/final-symlink (including repeated-separator and `/.` aliases)/root/repository/in-repository/nonempty work roots, foreign residue, and cleanup after success/error/signal without deleting caller entries or leaving a TERM-ignoring descendant. The evidence owner crosses each phase with error, timeout, signal, disk-full, file/directory/parent/reservation fsync, unlock, rename, reservation removal, ordinary removal, and signing failure. No accepted path remains; children, containers, mounts, fds, locks, staging, private dirs, output, and publication reservation are gone, or a surviving fail-closed reservation prevents acceptance and all later work. `benchmark_input_workdir_matrix`; `benchmark_evidence_cleanup_matrix`. |
 | Concurrent runs | Second run fails before Git/image/container work while either the lock or publication reservation exists. Lock releases only after measurement cleanup and durable reservation creation; accepted publication removes and fsyncs the reservation. Crash/restart and administrator-recovery fixtures prove fail-closed behavior. `benchmark_evidence_exclusive_run`. |
-| TOCTOU swap | The prepared root device/inode crosses the shell-to-launcher handoff, manifest traversal stays under that retained descriptor, and Linux executable/runtime bytes are copied to fully write-sealed anonymous descriptors before exec/preload. Opened image/source identities are used or revalidated at their privilege boundary; root rename/replacement, same-inode artifact writes, daemon-image, and source swaps cannot substitute inspected bytes. `benchmark_input_workdir_matrix`; `benchmark_evidence_bound_object_swap_matrix`. |
+| TOCTOU swap | The preparation root is retained before untrusted work and every accepted Linux write stays below its descriptor. Its manifest digest crosses the prepare/native phase boundary in trusted controller state; the root descriptor crosses the shell/launcher boundary; manifest traversal stays below it; and executable/runtime bytes are copied to fully write-sealed anonymous descriptors before exec/preload. Cleanup recursively mutates only the retained tree. Opened image/source identities are used or revalidated at their privilege boundary; root rename/replacement, same-inode artifact writes, daemon-image, and source swaps cannot substitute inspected bytes. `benchmark_input_workdir_matrix`; `benchmark_evidence_bound_object_swap_matrix`. |
 | Forged/stale evidence | Unsigned, edited, replayed profile/target/review/candidate, truncated, concatenated, and valid-signature/wrong-namespace reports reject. PR/preflight/trusted-review mismatch blocks; `CLEAN` maps only to `clean`, and accepted `FINDINGS` with a nonempty repair chain maps only to `fixed`. `benchmark_evidence_stale_forged_matrix`. |
 | Base/integration race | Disposable remote covers target movement before/after run, precheck-to-merge race, unavailable/wrong response OID, local-target mismatch, wrong merge parents/tree, signed merge-verification mutation, a normal later first-parent descendant, force-push/removal before the final trusted refetch, failed revert, and exact merge. The merge must remain on the final target first-parent chain; failures never advance lifecycle. `benchmark_evidence_merge_race_matrix`. |
 
@@ -651,6 +663,14 @@ measurement remain named manual evidence.
 |---|---|
 | P1 retained prepared path could be replaced after verification | Prepare revalidates its captured private-child device/inode before success. Native carries the captured identity into the launcher, which requires the opened root descriptor to match and performs all manifest traversal below that retained descriptor. |
 | P1 same-inode writes could change bytes after hashing | The accepted Linux path hashes while copying executable/runtime bytes into anonymous memfds, checks source metadata around the copy, applies all four write/size/seal seals, and execs/preloads only the sealed copies. The deterministic owner replaces the root at the shell/launcher handoff and proves a sealed copy remains unchanged and unwritable after its source changes. |
+
+## Final-integration review closure
+
+| Finding | Ledger-first closure |
+|---|---|
+| P1 a self-consistent tree could replace prepared state between phases | Prepare prints its canonical manifest SHA-256. The trusted controller retains that value outside candidate-writable state, every native invocation requires it, and descriptor-relative verification rejects a different current manifest before opening executable/runtime artifacts. |
+| P1 an untrusted prepare child could redirect later path writes | The script retains the private-child descriptor before the first build. Every accepted Linux preparation path uses that descriptor's `/proc` handle, and publication requires the public path to retain the same device/inode. Native ARM macOS remains development qualification only. |
+| P2 cleanup could recursively delete a replacement after a check/path race | Recursive cleanup walks and unlinks only through the retained private-child descriptor. The public path receives only non-recursive `rmdir` after another device/inode match, so a nonempty replacement is never traversed or deleted. |
 
 ## Author consistency pass
 
