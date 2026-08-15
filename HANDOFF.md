@@ -24,13 +24,15 @@ publication gaps. The current repair adds trusted GitHub review attestation, pro
 evidence profile/source set, rechecks final target reachability, serializes publication with a
 durable reservation, uses the repository's exact `clean`/`fixed` states, and fixes SSHSIG bytes.
 PR #813 merged at `734ae3ab`, and the benchmark-input prerequisite merged in PR #815 at
-`58dbb218`. Author inspection of that slice found that the current scripts make six Cargo
+`58dbb218`; the installed-source manifest foundation merged in PR #816 at `7db1af8c`.
+Author inspection of the benchmark-input slice found that the current scripts make six Cargo
 invocations, not the four root builds named by the delivery prose; the repair binds all six and
 identifies the two later `cargo run` replacements. The same pass makes the work-root safety and
 cleanup contract exact instead of leaving `unsafe` to implementation judgement. Active work is the
-evidence implementation: this slice adds the no-follow installed-source manifest foundation, then
-the controller/verifier/monitor, profile, image recipe, and adversarial owners follow before host
-qualification and a Request 7 implementation branch.
+evidence implementation: the no-follow installed-source manifest foundation is shipped, and the
+current slice adds canonical JSON primitives before the controller/verifier/monitor, profile, image
+recipe, and adversarial owners follow before host qualification and a Request 7 implementation
+branch.
 
 The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit
