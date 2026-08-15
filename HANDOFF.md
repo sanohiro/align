@@ -52,12 +52,14 @@ two-sided revision binding. PR #832 shipped verified raw source materialization 
 retained-descriptor verification; it does not execute Docker, `ssh-keygen`, or the benchmark.
 PR #833 shipped canonical validation for the immutable x86_64 evidence profile, including the
 host-global lock path, Docker/image/toolchain identities, fixed observation limits, capture/timeouts,
-signing key, schedule, and benchmark inventory. Active work on `agent/request7-image-recipe` adds
-the fixed container launch argv boundary: digest-only image selection, private namespaces, explicit
+signing key, schedule, and benchmark inventory. PR #834 shipped the fixed container launch argv
+boundary at `8ce95870`, including digest-only local image selection, private namespaces, explicit
 resource/security limits, read-only source/toolchain mounts, private writable workspaces, and an
-explicit fixed environment. It does not call Docker, inspect the host or daemon, build an image,
-provision a key, or execute the controller. Image recipe/digest qualification, host qualification,
-adversarial owners, and full controller/verifier implementation remain later work. Materialization
+explicit fixed environment. Active work on `agent/request7-image-qualification` adds pure
+profile-bound qualification for image/config/registry identities, mutable-tag rejection, and
+toolchain/cache/configuration observations. It does not invoke Docker, inspect the host or daemon,
+build an image, provision a key, or execute the controller. Host qualification, adversarial owners,
+and full controller/verifier implementation remain later work. Materialization
 and retained verification intentionally shared one boundary because they depend on the same raw
 path layout, reviewed-symlink policy, descriptor identity, and cleanup proof; splitting them would
 have duplicated the boundary fixtures without leaving a stable consumer for either half.
