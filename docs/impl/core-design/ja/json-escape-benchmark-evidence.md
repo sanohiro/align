@@ -163,8 +163,13 @@ remove前にdirect childをreapする。
 baseline選択前に両protected scriptをclosed two-phase interfaceにする。`run.sh prepare native`が
 root/detached Cargo buildと`alignc emit-obj`を行い、compiler/runtime/benchmark executable/kernel object/
 effective configのcanonical SHA-256/mode manifestをrevision-private work dirに作る。`run.sh native`は
-manifestをverifyしprepared executableをdirect exec、Cargo/compiler work・missing/extra/changed/wrong-mode
-artifact・prepare-only selectorをreject。argv arrayでshell interpolationなし。prepare Cargoはすべて
+Cargo/compiler workを行わない。prepareはpublish前にprivate childのcaptured device/inode identityを再検証する。
+nativeはそのidentityをlauncherへ渡し、launcherはfinal componentをfollowせずprepared rootをopenして
+device/inode一致を要求し、retained directory descriptor配下でmanifestをverifyする。accepted Linux x86_64 pathは
+executable/runtimeをhashしながらanonymous `memfd`へcopyし、source metadataをcopy前後で確認し、
+`F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL`を適用してsealed descriptorだけをdirect exec/preloadする。
+macOS pathはaccepted evidenceではなくnative ARM development qualificationのまま。missing/extra/changed/
+wrong-mode/replaced/unsealable artifactとprepare-only selectorをreject。argv arrayでshell interpolationなし。prepare Cargoはすべて
 `--locked --offline`。cache/source/config manifestをbefore/after比較しwriteをreject。benchmark-input
 sliceは各scriptのroot build 2回とdetached `cargo run` 1回、合計current 6 Cargo invocationをlockする。
 evidence implementationがbaseline前に2つの`cargo run`をprepare/direct-execへ置換する。
@@ -442,7 +447,7 @@ bindするprovider CASをreviewed amendmentで導入する。base ruleを弱め�
 | Report/signature | report/merge-verification bidirectional goldenと全field/order/type/width/duplicate/escape/trailing/derived mutation、exact SSHSIG binary/preimage、armor header/footer/LF/base64/wrap/padding、wrong key/namespace/profile/stale。`benchmark_evidence_report_v1_matrix`. |
 | Failure/cleanup | benchmark-input ownerはabsent/relative/missing/non-directory/final-symlink（repeated separatorと`/.` aliasを含む）/root/repository/in-repository/nonempty work root、foreign residue、success/error/signal cleanup、caller entry非削除、TERM-ignoring descendant非残存をcover。evidence ownerは全phase error/timeout/signal/disk/file+dir+parent+reservation fsync/unlock/rename/reservation remove/ordinary remove/signをcover。accepted pathなし。全resourceが消えるか、surviving fail-closed reservationがacceptとlater workを阻止。`benchmark_input_workdir_matrix`; `benchmark_evidence_cleanup_matrix`. |
 | Concurrent | lockまたはpublication reservation中のsecond runはGit/image/container前fail。lockはmeasurement cleanupとdurable reservation後にreleaseし、accepted publishはreservationをremove+fsync。crash/restart/admin recoveryもfail-closed。`benchmark_evidence_exclusive_run`. |
-| TOCTOU | executable/image/source rename/replacement/swap。`benchmark_evidence_bound_object_swap_matrix`. |
+| TOCTOU | prepared root device/inodeをshell-to-launcher handoffで渡し、manifest traversalはretained descriptor配下、Linux executable/runtimeはexec/preload前にfully write-sealed anonymous descriptorへcopyする。image/sourceはopened identityを使用またはprivilege boundaryで再検証。root rename/replacement、same-inode artifact write、daemon-image/source swapをreject。`benchmark_input_workdir_matrix`; `benchmark_evidence_bound_object_swap_matrix`. |
 | Forged/stale | unsigned/edit/replay/truncate/concat/wrong namespace、PR/preflight/trusted-review mismatch。`CLEAN`は`clean`のみ、accepted `FINDINGS` + nonempty repair chainは`fixed`のみにmap。`benchmark_evidence_stale_forged_matrix`. |
 | Base/integration race | target move、precheck race、unavailable/wrong response OID、local-target mismatch、wrong parent/tree、signed artifact mutation、normal later first-parent descendant、final trusted refetch前のforce-push/removal、revert failure、exact merge。final target first-parent chainにmergeが残らなければlifecycleを進めない。`benchmark_evidence_merge_race_matrix`. |
 
@@ -482,6 +487,13 @@ ordinary testにしない。native host qualification/final measurementはmanual
 | unlock-before-publicationでsecond runが開始可能 | lock中にdurable profile-global reservationを作りatomic publication完了まで保持。later invocationはrepository/image/container前rejectし、crash/cleanup failureもfail-closed。 |
 | report review-state literalがrepository metadataと不一致 | canonical literalを`clean`/`fixed`に統一し、`CLEAN`とaccepted `FINDINGS` + nonempty repair chainからのone-way mappingを明記。 |
 | detached signature bytesが曖昧 | exact OpenSSH SSHSIG v1 binary record、SHA-512 signing preimage、70-column canonical ASCII armor、final LF、byte-identical decode/re-encodeを固定。 |
+
+## Integrated-candidate review closure
+
+| Finding | Closure |
+|---|---|
+| retained prepared pathをverification後にreplace可能 | prepareはsuccess前にcaptured private-child device/inodeを再検証。nativeはcaptured identityをlauncherへ渡し、opened root descriptorとの一致を要求し、manifest traversalをそのdescriptor配下で実行。 |
+| hash後のsame-inode writeでbytesを変更可能 | accepted Linux pathはexecutable/runtimeをhashしながらanonymous memfdへcopyし、source metadataをcopy前後で確認、4つのwrite/size/seal sealを適用後sealed copyだけをexec/preload。deterministic ownerはshell/launcher handoffでrootをreplaceし、source変更後もsealed copyが不変かつwrite不能と確認。 |
 
 ## Author consistency pass
 

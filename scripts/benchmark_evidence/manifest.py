@@ -585,6 +585,35 @@ def load_manifest(path: str) -> tuple[dict[str, Any], bytes]:
     return _parse_manifest_bytes(raw)
 
 
+def verify_manifest_fd(
+    root_fd: int, manifest_path: str = "manifest.json"
+) -> tuple[dict[str, Any], bytes]:
+    """Verify an already-opened root and return its parsed manifest and exact bytes."""
+
+    manifest_path = _relative_manifest_path(manifest_path)
+    manifest_fd = _open_relative_file(root_fd, manifest_path)
+    try:
+        before = os.fstat(manifest_fd)
+        raw = _read_fd(manifest_fd)
+        after = os.fstat(manifest_fd)
+        if _metadata_signature(before) != _metadata_signature(after):
+            raise ManifestError("manifest changed while being read")
+    finally:
+        os.close(manifest_fd)
+    manifest, raw = _parse_manifest_bytes(raw)
+    if manifest["manifest_path"] != manifest_path:
+        raise ManifestError("manifest path does not match the requested path")
+    expected_root, expected_entries = manifest["root"], manifest["entries"]
+    if stat.S_IMODE(before.st_mode) != 0o644:
+        raise ManifestError("manifest file mode must be 0644")
+    if (before.st_uid, before.st_gid) != (expected_root["uid"], expected_root["gid"]):
+        raise ManifestError("manifest owner does not match the installed root")
+    observed_root, observed_entries = _observed_tree_fd(root_fd, manifest_path)
+    if observed_root != expected_root or observed_entries != expected_entries:
+        raise ManifestError("installed tree does not match the manifest")
+    return manifest, raw
+
+
 def verify_manifest(root: str, manifest_path: str = "manifest.json") -> str:
     """Verify the installed tree and return the manifest SHA-256."""
 
@@ -592,40 +621,7 @@ def verify_manifest(root: str, manifest_path: str = "manifest.json") -> str:
     root = _absolute_directory(root)
     root_fd = _open_root(root)
     try:
-        manifest_fd = _open_relative_file(root_fd, manifest_path)
-        try:
-            before = os.fstat(manifest_fd)
-            raw = _read_fd(manifest_fd)
-            after = os.fstat(manifest_fd)
-            if (
-                before.st_dev,
-                before.st_ino,
-                before.st_size,
-                stat.S_IMODE(before.st_mode),
-                before.st_uid,
-                before.st_gid,
-            ) != (
-                after.st_dev,
-                after.st_ino,
-                after.st_size,
-                stat.S_IMODE(after.st_mode),
-                after.st_uid,
-                after.st_gid,
-            ):
-                raise ManifestError("manifest changed while being read")
-        finally:
-            os.close(manifest_fd)
-        manifest, raw = _parse_manifest_bytes(raw)
-        if manifest["manifest_path"] != manifest_path:
-            raise ManifestError("manifest path does not match the requested path")
-        expected_root, expected_entries = manifest["root"], manifest["entries"]
-        if stat.S_IMODE(before.st_mode) != 0o644:
-            raise ManifestError("manifest file mode must be 0644")
-        if (before.st_uid, before.st_gid) != (expected_root["uid"], expected_root["gid"]):
-            raise ManifestError("manifest owner does not match the installed root")
-        observed_root, observed_entries = _observed_tree_fd(root_fd, manifest_path)
-        if observed_root != expected_root or observed_entries != expected_entries:
-            raise ManifestError("installed tree does not match the manifest")
+        _, raw = verify_manifest_fd(root_fd, manifest_path)
         return manifest_sha256(raw)
     finally:
         os.close(root_fd)

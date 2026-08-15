@@ -212,8 +212,15 @@ implementation gives each protected script a closed two-phase interface. `run.sh
 performs every root and detached Cargo build plus `alignc emit-obj`, then writes a canonical
 SHA-256/mode manifest for the compiler, runtime, detached benchmark executable, kernel object, and
 effective configuration into the revision-private work directory. `run.sh native` accepts no Cargo
-or compiler work: it verifies that manifest and directly execs the prepared benchmark executable.
-It rejects missing, extra, changed, or wrong-mode artifacts and any prepare-only selector.
+or compiler work. Prepare revalidates the captured device/inode identity before publishing the
+private child. Native passes that identity to the launcher, which opens the prepared root without
+following its final component, requires the opened device/inode to match, and verifies the manifest
+through that retained directory descriptor. On the accepted Linux x86_64 path it hashes the
+executable and runtime while copying them to anonymous `memfd` objects, checks source metadata
+before and after the copy, applies `F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL`, and directly
+execs/preloads only those sealed descriptors. The macOS path remains native ARM development
+qualification rather than accepted evidence. Missing, extra, changed, wrong-mode, replaced, or
+unsealable artifacts and every prepare-only selector reject.
 
 All prepare-phase Cargo operations are visibly `--locked --offline`; `CARGO_NET_OFFLINE=true` is
 defense in depth. Registry/cache/source manifests are compared before/after; a lockfile, index,
@@ -595,7 +602,7 @@ It may not weaken the base rule.
 | Report/signature | Bidirectional report and merge-verification goldens plus every field/order/type/width/duplicate/escape/trailing/derived mutation; exact SSHSIG binary fields and signing preimage; armor header/footer/LF/base64 alphabet/wrap/padding; and wrong key/namespace/signature/profile/stale candidate/report/merge reject. `benchmark_evidence_report_v1_matrix`. |
 | Failure/cleanup | The benchmark-input owner first covers absent/relative/missing/non-directory/final-symlink (including repeated-separator and `/.` aliases)/root/repository/in-repository/nonempty work roots, foreign residue, and cleanup after success/error/signal without deleting caller entries or leaving a TERM-ignoring descendant. The evidence owner crosses each phase with error, timeout, signal, disk-full, file/directory/parent/reservation fsync, unlock, rename, reservation removal, ordinary removal, and signing failure. No accepted path remains; children, containers, mounts, fds, locks, staging, private dirs, output, and publication reservation are gone, or a surviving fail-closed reservation prevents acceptance and all later work. `benchmark_input_workdir_matrix`; `benchmark_evidence_cleanup_matrix`. |
 | Concurrent runs | Second run fails before Git/image/container work while either the lock or publication reservation exists. Lock releases only after measurement cleanup and durable reservation creation; accepted publication removes and fsyncs the reservation. Crash/restart and administrator-recovery fixtures prove fail-closed behavior. `benchmark_evidence_exclusive_run`. |
-| TOCTOU swap | Opened executable/image/source identities are used or revalidated at privilege boundary; rename, replacement, daemon-image, and source swaps cannot substitute inspected bytes. `benchmark_evidence_bound_object_swap_matrix`. |
+| TOCTOU swap | The prepared root device/inode crosses the shell-to-launcher handoff, manifest traversal stays under that retained descriptor, and Linux executable/runtime bytes are copied to fully write-sealed anonymous descriptors before exec/preload. Opened image/source identities are used or revalidated at their privilege boundary; root rename/replacement, same-inode artifact writes, daemon-image, and source swaps cannot substitute inspected bytes. `benchmark_input_workdir_matrix`; `benchmark_evidence_bound_object_swap_matrix`. |
 | Forged/stale evidence | Unsigned, edited, replayed profile/target/review/candidate, truncated, concatenated, and valid-signature/wrong-namespace reports reject. PR/preflight/trusted-review mismatch blocks; `CLEAN` maps only to `clean`, and accepted `FINDINGS` with a nonempty repair chain maps only to `fixed`. `benchmark_evidence_stale_forged_matrix`. |
 | Base/integration race | Disposable remote covers target movement before/after run, precheck-to-merge race, unavailable/wrong response OID, local-target mismatch, wrong merge parents/tree, signed merge-verification mutation, a normal later first-parent descendant, force-push/removal before the final trusted refetch, failed revert, and exact merge. The merge must remain on the final target first-parent chain; failures never advance lifecycle. `benchmark_evidence_merge_race_matrix`. |
 
@@ -637,6 +644,13 @@ measurement remain named manual evidence.
 | P2 unlock-before-publication admitted a concurrent second run | A durable profile-global reservation is created while locked and remains through atomic publication. Every later invocation rejects before repository/image/container work; crash and cleanup failure remain fail-closed. |
 | P2 report review-state literal disagreed with repository metadata | The canonical literals are now exactly `clean` and `fixed`, with explicit one-way mappings from `CLEAN` and accepted `FINDINGS` plus its nonempty repair chain. |
 | P2 detached signature bytes were ambiguous | Both signatures now use one exact OpenSSH SSHSIG v1 binary record, SHA-512 signing preimage, canonical 70-column ASCII armor, final LF, and byte-for-byte decode/re-encode validation. |
+
+## Integrated-candidate review closure
+
+| Finding | Ledger-first closure |
+|---|---|
+| P1 retained prepared path could be replaced after verification | Prepare revalidates its captured private-child device/inode before success. Native carries the captured identity into the launcher, which requires the opened root descriptor to match and performs all manifest traversal below that retained descriptor. |
+| P1 same-inode writes could change bytes after hashing | The accepted Linux path hashes while copying executable/runtime bytes into anonymous memfds, checks source metadata around the copy, applies all four write/size/seal seals, and execs/preloads only the sealed copies. The deterministic owner replaces the root at the shell/launcher handoff and proves a sealed copy remains unchanged and unwritable after its source changes. |
 
 ## Author consistency pass
 

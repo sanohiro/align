@@ -13,11 +13,19 @@ manifest (#816), canonical JSON (#817), typed report schema (#818), SSHSIG frami
 controller CLI (#822), and installed-manifest/profile binding (#823) are merged. Active work is
 `agent/request7-prepared-benchmarks`: both protected JSON benchmarks gain the reviewed two-phase
 `prepare native` / direct `native` interface, canonical artifact sealing, checked integer inner
-medians, descriptor-bound Linux evidence execution, and inode-aware cleanup. Its focused owners are
+medians, descriptor-bound Linux evidence execution, and inode-aware cleanup. The integrated review
+of `845f0b90` against `863c20ba` found two valid P1 handoff races: retained-root replacement and
+same-inode writes after hashing. The consolidated repair carries the captured root device/inode into
+the launcher, verifies the manifest below that retained descriptor, and executes/preloads Linux
+bytes only after copying them into fully write-sealed anonymous memfds; macOS remains native ARM
+development qualification, not accepted evidence. Its focused owners are
 `scripts/test-benchmark-input.sh`, `scripts/test-benchmark-evidence-manifest.sh`, and
 `scripts/test-benchmark-evidence-statistics.sh`.
 
-Latest durable verification on native Apple ARM64 passed with `CARGO_BUILD_JOBS=1`: each of
+Latest durable verification after the integrated-review repair passed
+`scripts/test-benchmark-evidence-manifest.sh`, `scripts/test-benchmark-input.sh`, and
+`scripts/test-benchmark-evidence-statistics.sh`. Native Apple ARM64 also passed with
+`CARGO_BUILD_JOBS=1`: each of
 `bench/json_decode/run.sh prepare native` plus `run.sh native` and
 `bench/json_soa/run.sh prepare native` plus `run.sh native` completed serially from an empty external
 work directory. These are correctness/boundary owners, not accepted x86_64 performance evidence.

@@ -7,6 +7,7 @@ TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/align-benchmark-input.XXXXXX")"
 FAKE_BIN="$TEST_ROOT/bin"
 FAKE_LOG="$TEST_ROOT/cargo.log"
 ORIGINAL_PATH="$PATH"
+ORIGINAL_PYTHON3="$(command -v python3)"
 SIGNAL_SCRIPT_PID=""
 SIGNAL_DESCENDANT_PID=""
 
@@ -220,21 +221,89 @@ fi
 exec /bin/mkdir "$@"
 FAKE_MKDIR
   chmod 700 "$FAKE_BIN/mkdir"
+
+  cat > "$FAKE_BIN/python3" <<'FAKE_PYTHON'
+#!/usr/bin/env bash
+set -euo pipefail
+: "${ORIGINAL_PYTHON3:?}"
+if [[ "${FAKE_SWAP_BEFORE_BOUND_EXEC:-0}" == 1 && "${1:-}" == */bound_exec.py ]]; then
+  mv "$FAKE_WORK_DIR/prepared" "$FAKE_WORK_DIR/original-prepared-run"
+  mv "${FAKE_REPLACEMENT_DIR:?}" "$FAKE_WORK_DIR/prepared"
+fi
+"$ORIGINAL_PYTHON3" "$@"
+status=$?
+if [[ "$status" -eq 0 && "${FAKE_SWAP_AFTER_VERIFY:-0}" == 1 && \
+      "${1:-}" == */manifest.py && "${2:-}" == verify ]]; then
+  mv "$FAKE_WORK_DIR/prepared" "$FAKE_WORK_DIR/original-prepared-publish"
+  mkdir "$FAKE_WORK_DIR/prepared"
+  printf 'foreign\n' > "$FAKE_WORK_DIR/prepared/foreign"
+fi
+exit "$status"
+FAKE_PYTHON
+  chmod 700 "$FAKE_BIN/python3"
 }
 
 run_benchmark() {
   local bench="$1"
   shift
   PATH="$FAKE_BIN:$ORIGINAL_PATH" \
-    FAKE_LOG="$FAKE_LOG" FAKE_WORK_DIR="$FAKE_WORK_DIR" \
+    FAKE_LOG="$FAKE_LOG" FAKE_WORK_DIR="$FAKE_WORK_DIR" ORIGINAL_PYTHON3="$ORIGINAL_PYTHON3" \
     ALIGN_BENCH_WORK_DIR="$FAKE_WORK_DIR" "$@" \
     "$REPO_ROOT/bench/$bench/run.sh" prepare native
 }
 
 run_prepared_benchmark() {
   local bench="$1"
+  shift
   PATH="$FAKE_BIN:$ORIGINAL_PATH" ALIGN_BENCH_WORK_DIR="$FAKE_WORK_DIR" \
+    FAKE_WORK_DIR="$FAKE_WORK_DIR" ORIGINAL_PYTHON3="$ORIGINAL_PYTHON3" "$@" \
     "$REPO_ROOT/bench/$bench/run.sh" native
+}
+
+assert_linux_sealed_copy() {
+  [[ "$(uname -s)" == Linux ]] || return 0
+  PYTHONDONTWRITEBYTECODE=1 python3 - "$REPO_ROOT" "$TEST_ROOT" <<'PY'
+import hashlib
+import os
+import sys
+
+sys.path.insert(0, os.path.join(sys.argv[1], "scripts", "benchmark_evidence"))
+import bound_exec
+
+root = os.path.join(sys.argv[2], "sealed-copy")
+os.mkdir(root, 0o700)
+path = os.path.join(root, "payload")
+payload = b"verified bytes\n"
+with open(path, "wb") as stream:
+    stream.write(payload)
+os.chmod(path, 0o755)
+value = os.stat(path, follow_symlinks=False)
+expected = {
+    "kind": "file",
+    "mode": "100755",
+    "uid": value.st_uid,
+    "gid": value.st_gid,
+    "size": len(payload),
+    "sha256": hashlib.sha256(payload).hexdigest(),
+}
+parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+sealed_fd = bound_exec._open_bound_file(parent_fd, "payload", expected)
+try:
+    with open(path, "wb") as stream:
+        stream.write(b"changed source\n")
+    os.lseek(sealed_fd, 0, os.SEEK_SET)
+    if os.read(sealed_fd, len(payload) + 1) != payload:
+        raise SystemExit("sealed copy changed with its source")
+    try:
+        os.write(sealed_fd, b"x")
+    except OSError:
+        pass
+    else:
+        raise SystemExit("sealed copy remained writable")
+finally:
+    os.close(sealed_fd)
+    os.close(parent_fd)
+PY
 }
 
 expect_invalid_workdirs() {
@@ -338,6 +407,7 @@ benchmark_input_workdir_matrix() {
   assert_lock_inputs
   expect_invalid_workdirs
   make_fake_tools
+  assert_linux_sealed_copy
   [[ -f "$REPO_ROOT/bench/json_decode/Cargo.lock" ]] || fail "json_decode Cargo.lock is missing"
   [[ -f "$REPO_ROOT/bench/json_soa/Cargo.lock" ]] || fail "json_soa Cargo.lock is missing"
 
@@ -391,6 +461,27 @@ benchmark_input_workdir_matrix() {
   fi
   [[ -f "$FAKE_WORK_DIR/prepared/foreign" ]] || fail "cleanup deleted a replaced prepared directory"
   [[ -d "$FAKE_WORK_DIR/original-prepared" ]] || fail "identity replacement lost the owned directory"
+
+  FAKE_WORK_DIR="$TEST_ROOT/replaced-after-verify-work"
+  mkdir -p "$FAKE_WORK_DIR"
+  if run_benchmark json_decode env FAKE_SWAP_AFTER_VERIFY=1; then
+    fail "prepared-directory replacement after verification was accepted"
+  fi
+  [[ -f "$FAKE_WORK_DIR/prepared/foreign" ]] || fail "post-verification replacement was deleted"
+  [[ -d "$FAKE_WORK_DIR/original-prepared-publish" ]] ||
+    fail "post-verification replacement lost the owned directory"
+
+  FAKE_WORK_DIR="$TEST_ROOT/replaced-before-exec-work"
+  replacement_dir="$TEST_ROOT/replacement-prepared"
+  mkdir -p "$FAKE_WORK_DIR"
+  run_benchmark json_decode env
+  cp -R "$FAKE_WORK_DIR/prepared" "$replacement_dir"
+  if run_prepared_benchmark json_decode env FAKE_SWAP_BEFORE_BOUND_EXEC=1 \
+    FAKE_REPLACEMENT_DIR="$replacement_dir" >/dev/null 2>&1; then
+    fail "prepared-directory replacement before descriptor binding was accepted"
+  fi
+  [[ -d "$FAKE_WORK_DIR/original-prepared-run" ]] ||
+    fail "pre-exec replacement lost the originally bound directory"
 
   local survivor_marker
   local survivor_pid
@@ -449,6 +540,7 @@ benchmark_input_workdir_matrix() {
     mkdir -p "$FAKE_WORK_DIR"
     set +e
     PATH="$FAKE_BIN:$ORIGINAL_PATH" FAKE_LOG="$FAKE_LOG" FAKE_WORK_DIR="$FAKE_WORK_DIR" \
+      ORIGINAL_PYTHON3="$ORIGINAL_PYTHON3" \
       ALIGN_BENCH_WORK_DIR="$FAKE_WORK_DIR" \
       FAKE_BLOCK_MODE=root FAKE_BLOCK_MARKER="$block_marker" \
       FAKE_DESCENDANT_MARKER="$descendant_marker" \

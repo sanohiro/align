@@ -67,6 +67,12 @@ work_dir_contains_only_private() {
   done
 }
 
+private_identity_matches() {
+  local current_identity
+  current_identity="$(directory_identity "$BENCH_PRIVATE_DIR" 2>/dev/null || true)"
+  [[ -n "$BENCH_PRIVATE_IDENTITY" && "$current_identity" == "$BENCH_PRIVATE_IDENTITY" ]]
+}
+
 stop_child_group() {
   local pid="${BENCH_CHILD_PID:-}"
   local attempt
@@ -159,7 +165,7 @@ cleanup() {
       echo "error: benchmark work directory disappeared during cleanup" >&2
       cleanup_failed=1
     elif [[ "$BENCH_EXPECT_PREPARED" -eq 1 ]]; then
-      if ! work_dir_contains_only_prepared; then
+      if ! work_dir_contains_only_prepared || ! private_identity_matches; then
         echo "error: benchmark work directory does not contain exactly the prepared artifact" >&2
         cleanup_failed=1
       fi
@@ -253,11 +259,15 @@ if [[ "$BENCH_ACTION" == run ]]; then
     echo "error: benchmark work directory does not contain exactly one prepared artifact" >&2
     exit 2
   fi
-  verify_prepared
+  if ! BENCH_PRIVATE_IDENTITY="$(directory_identity "$BENCH_PRIVATE_DIR")"; then
+    echo "error: cannot bind the prepared benchmark directory identity" >&2
+    exit 2
+  fi
   printf 'target: native\n'
   exec env PYTHONDONTWRITEBYTECODE=1 python3 \
     "$REPO_ROOT/scripts/benchmark_evidence/bound_exec.py" \
-    --root "$BENCH_PREPARED_DIR" --executable "$BENCH_BINARY"
+    --root "$BENCH_PREPARED_DIR" --root-identity "$BENCH_PRIVATE_IDENTITY" \
+    --executable "$BENCH_BINARY"
 fi
 
 if directory_has_entries "$BENCH_WORK_DIR"; then
@@ -357,6 +367,10 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/scripts/benchmark_evidence/manifes
 
 if ! work_dir_contains_only_private; then
   echo "error: foreign residue appeared in the benchmark work directory" >&2
+  exit 1
+fi
+if ! private_identity_matches; then
+  echo "error: prepared benchmark directory identity changed before publication" >&2
   exit 1
 fi
 
