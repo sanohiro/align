@@ -12,6 +12,8 @@ It does not tour every syntax form or library module. It has succeeded when a pr
 
 Read a question. **Answer it out loud before reading the answer.** If you were right, keep going; if you were wrong, back up a few questions — the answer was built there. When a program appears, you may run it (`alignc run`), but try to be the compiler first: most questions can be answered with nothing but the previous page.
 
+Keeping `align-repl` open beside the book suits the drill rhythm: it starts empty, an answer is one line, and the program grows with you instead of becoming a new file per question. Predict the answer, type it, and compare. It compiles and runs natively rather than interpreting, so a wrong prediction is corrected by the real compiler; `:list` shows the program the chapter has built up so far, and `:save` turns it into a file when a drill grows into something you want to keep. See chapter [16](../guide/16-toolchain.md) of the guide.
+
 Some answers are one word. Some questions look identical to the one before — the difference is the lesson. And when a rule has earned it, it is carved into a **Commandment**.
 
 After the first trip through the book, take one program you liked and read it again without running it. Predict its answer. Trace the data. Point to where every value dies. Count the passes, allocations, and copies. [The final chapter](15-read-it-four-ways.md) teaches this second reading. Recognition makes a page feel familiar; recall makes the language yours.

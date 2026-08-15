@@ -7,7 +7,7 @@ Align を書くための実践的な入門です。仕様書(それは draft.md 
 ## 第 I 部 —— 基礎
 
 - [00 — なぜ Align か](00-why-align.md)
-- [01 — はじめる](01-getting-started.md)
+- [01 — はじめる](01-getting-started.md) — インストール、`align-repl`、最初のプログラム
 - [02 — 言語の基本](02-language-basics.md)
 - [03 — データをモデリングする: 構造体、直和型、match](03-modeling-data.md)
 - [04 — エラー: Option、Result、そして `?`](04-errors.md)
@@ -28,7 +28,7 @@ Align を書くための実践的な入門です。仕様書(それは draft.md 
 - [13 — std: ファイル、I/O、そして OS 境界](13-std-os.md)
 - [14 — std: encoding、regex、rand、cli](14-std-encoding-rand-cli.md)
 - [15 — 境界: unsafe と C FFI](15-unsafe-and-ffi.md)
-- [16 — ツールチェーン: alignc、フォーマッタ、lint](16-toolchain.md)
+- [16 — ツールチェーン: alignc、align-repl、フォーマッタ、lint](16-toolchain.md)
 - [17 — Align の流儀](17-the-align-way.md)
 - [18 — std services: network、HTTP、process、圧縮、暗号](18-std-services.md)
 
