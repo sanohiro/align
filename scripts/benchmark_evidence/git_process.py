@@ -13,7 +13,7 @@ import signal
 import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterator
+from typing import BinaryIO, Iterator
 
 
 class GitProcessError(RuntimeError):
@@ -241,6 +241,22 @@ class PinnedGitProcess:
         if self._process is None:
             raise GitProcessError("Git process has not started")
         return self._process.pid
+
+    @property
+    def stdin(self) -> BinaryIO:
+        """Return the owned child's binary stdin after start."""
+
+        if self._process is None or self._process.stdin is None:
+            raise GitProcessError("Git process stdin is unavailable")
+        return self._process.stdin
+
+    @property
+    def stdout(self) -> BinaryIO:
+        """Return the owned child's binary stdout after start."""
+
+        if self._process is None or self._process.stdout is None:
+            raise GitProcessError("Git process stdout is unavailable")
+        return self._process.stdout
 
     def start(self) -> "PinnedGitProcess":
         """Start the fixed child with no shell and a new process group."""
