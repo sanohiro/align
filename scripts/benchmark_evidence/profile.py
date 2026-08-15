@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import os
 import re
 from typing import Any, Sequence
 
@@ -31,6 +32,7 @@ FIELDS = ("A-full", "A-proj", "soa ms", "aos ms", "proj ms")
 
 _NAME = re.compile(r"[A-Za-z0-9._/:+=@-]{1,255}\Z")
 _FIELD_NAME = re.compile(r"[A-Za-z0-9._/:+=@ -]{1,255}\Z")
+_PATH = re.compile(r"/[A-Za-z0-9._/-]{1,4095}\Z")
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _FINGERPRINT = re.compile(r"SHA256:[A-Za-z0-9+/]{43}\Z")
@@ -41,6 +43,7 @@ _PROFILE_KEYS = (
     "profile_id",
     "target_ref",
     "host_id",
+    "host_lock_path",
     "machine",
     "observation_limits",
     "docker",
@@ -146,6 +149,16 @@ def _hash(value: Any, label: str) -> str:
     return _string(value, _HEX64, label)
 
 
+def _absolute_path(value: Any, label: str) -> str:
+    path = _string(value, _PATH, label)
+    if not os.path.isabs(path) or path == "/" or path.endswith("/"):
+        _error(label, "must be an absolute non-root path without a trailing separator")
+    parts = path.split("/")
+    if any(part in ("", ".", "..") for part in parts[1:]):
+        _error(label, "contains an empty or traversal component")
+    return path
+
+
 def _executable(value: Any, label: str) -> cj.Object:
     obj = _object(value, _EXECUTABLE_KEYS, label)
     _string(obj["version"], _NAME, f"{label}.version")
@@ -229,8 +242,7 @@ def _validate_signing(value: Any) -> cj.Object:
         raise ProfileError("signing.public_key_base64 is not valid base64") from exc
     if len(decoded) != 32:
         _error("signing.public_key_base64", "must decode to 32 bytes")
-    if _FINGERPRINT.fullmatch(obj["fingerprint"]) is None:
-        _error("signing.fingerprint", "has an invalid SHA256 fingerprint")
+    _string(obj["fingerprint"], _FINGERPRINT, "signing.fingerprint")
     return obj
 
 
@@ -270,6 +282,7 @@ def validate_profile(value: Any) -> cj.Object:
     if _string(obj["target_ref"], _NAME, "profile.target_ref") != TARGET_REF:
         _error("profile.target_ref", "must be refs/heads/main")
     _string(obj["host_id"], _NAME, "profile.host_id")
+    _absolute_path(obj["host_lock_path"], "profile.host_lock_path")
     _validate_machine(obj["machine"])
     _validate_observation_limits(obj["observation_limits"])
     _validate_docker(obj["docker"])

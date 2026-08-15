@@ -33,6 +33,7 @@ def valid_profile():
         ("profile_id", "linux-x86_64-v1"),
         ("target_ref", profile.TARGET_REF),
         ("host_id", "evidence-host-1"),
+        ("host_lock_path", "/run/lock/align-evidence-v1.lock"),
         (
             "machine",
             O(
@@ -158,6 +159,8 @@ def main():
 
     rejected(update(value, ("machine", "architecture"), "aarch64"), "must be x86_64")
     rejected(update(value, ("target_ref",), "refs/heads/release"), "refs/heads/main")
+    rejected(update(value, ("host_lock_path",), "relative-lock"), "host_lock_path")
+    rejected(update(value, ("host_lock_path",), "/"), "host_lock_path")
     rejected(update(value, ("schedule", "threshold_numerator"), 106), "must be 105")
     rejected(update(value, ("schedule", "pair_count"), 9), "must be 10")
     rejected(update(value, ("image", "platform"), "linux/arm64"), "linux/amd64")
@@ -165,6 +168,7 @@ def main():
     rejected(update(value, ("observation_limits",), [*value["observation_limits"][1:], value["observation_limits"][0]]), "phase order")
     rejected(update(value, ("signing", "public_key_base64"), "not-base64"), "public_key_base64")
     rejected(update(value, ("signing", "fingerprint"), "SHA256:short"), "fingerprint")
+    rejected(update(value, ("signing", "fingerprint"), None), "fingerprint")
     rejected(update(value, ("toolchain", "git", "executable_sha256"), "g" * 64), "executable_sha256")
 
     reordered = O(*reversed(value.pairs))
