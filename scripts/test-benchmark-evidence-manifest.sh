@@ -40,6 +40,135 @@ tail -c 1 "$tree/manifest.json" | od -An -t x1 | grep -q '0a' || fail "manifest 
 grep -q '"schema":"align.json_escape_benchmark_install_manifest/v1"' "$tree/manifest.json" || fail "schema is not canonical"
 assert_rejected "manifest overwrite" python3 "$MANIFEST_TOOL" write --root "$tree"
 
+good_manifest="$TEST_ROOT/manifest.good"
+cp "$tree/manifest.json" "$good_manifest"
+restore_manifest() {
+  cp "$good_manifest" "$tree/manifest.json"
+}
+
+printf '{"schema":"x","schema":"y"}\n' > "$tree/manifest.json"
+assert_rejected "duplicate manifest key" python3 "$MANIFEST_TOOL" verify --root "$tree"
+restore_manifest
+
+python3 - "$tree/manifest.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as stream:
+    value = json.load(stream)
+value["root"]["uid"] = "wrong-type"
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(value, stream, separators=(",", ":"))
+    stream.write("\n")
+PY
+assert_rejected "wrong manifest field type" python3 "$MANIFEST_TOOL" verify --root "$tree"
+restore_manifest
+
+python3 - "$tree/manifest.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as stream:
+    value = json.load(stream)
+del value["entries"]
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(value, stream, separators=(",", ":"))
+    stream.write("\n")
+PY
+assert_rejected "missing manifest member" python3 "$MANIFEST_TOOL" verify --root "$tree"
+restore_manifest
+
+python3 - "$tree/manifest.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as stream:
+    value = json.load(stream)
+value["entries"].insert(1, value["entries"][0])
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(value, stream, separators=(",", ":"))
+    stream.write("\n")
+PY
+assert_rejected "duplicate manifest entry" python3 "$MANIFEST_TOOL" verify --root "$tree"
+restore_manifest
+
+assert_rejected "manifest path traversal" python3 "$MANIFEST_TOOL" verify --root "$tree" --manifest ../manifest.json
+
+chmod 755 "$tree"
+assert_rejected "changed root mode" python3 "$MANIFEST_TOOL" verify --root "$tree"
+chmod 700 "$tree"
+
+python3 - "$tree/manifest.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as stream:
+    value = json.load(stream)
+value["root"]["uid"] = (value["root"]["uid"] + 1) % (2**32)
+value["entries"][0]["gid"] = (value["entries"][0]["gid"] + 1) % (2**32)
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(value, stream, separators=(",", ":"))
+    stream.write("\n")
+PY
+assert_rejected "changed manifest owner" python3 "$MANIFEST_TOOL" verify --root "$tree"
+restore_manifest
+
+printf 'module with a changed size\n' > "$tree/lib/module.py"
+assert_rejected "changed file size" python3 "$MANIFEST_TOOL" verify --root "$tree"
+printf 'module\n' > "$tree/lib/module.py"
+chmod 644 "$tree/lib/module.py"
+
+hard_tree="$TEST_ROOT/hard-links"
+mkdir -m 700 "$hard_tree"
+printf 'same inode\n' > "$hard_tree/first"
+chmod 644 "$hard_tree/first"
+ln "$hard_tree/first" "$hard_tree/second"
+assert_rejected "hard-linked files" python3 "$MANIFEST_TOOL" write --root "$hard_tree"
+
+race_tree="$TEST_ROOT/race"
+mkdir -m 700 "$race_tree" "$race_tree/child" "$race_tree/replacement"
+printf 'child\n' > "$race_tree/child/value"
+printf 'replacement\n' > "$race_tree/replacement/value"
+chmod 644 "$race_tree/child/value" "$race_tree/replacement/value"
+PYTHONDONTWRITEBYTECODE=1 python3 - "$race_tree" <<'PY'
+import sys
+
+from scripts.benchmark_evidence import manifest
+
+root = sys.argv[1]
+original = manifest._open_directory
+
+
+def swapped(parent_fd, name):
+    if name == "child":
+        return original(parent_fd, "replacement")
+    return original(parent_fd, name)
+
+
+manifest._open_directory = swapped
+try:
+    manifest.build_manifest(root)
+except manifest.ManifestError:
+    pass
+else:
+    raise SystemExit("directory identity swap was accepted")
+PY
+
+nested_tree="$TEST_ROOT/nested"
+outside="$TEST_ROOT/outside"
+mkdir -m 700 "$nested_tree" "$outside"
+printf 'nested\n' > "$nested_tree/payload"
+chmod 644 "$nested_tree/payload"
+python3 "$MANIFEST_TOOL" write --root "$nested_tree" --manifest metadata/manifest.json >/dev/null
+cp "$nested_tree/metadata/manifest.json" "$outside/manifest.json"
+mv "$nested_tree/metadata" "$nested_tree/metadata.real"
+ln -s "$outside" "$nested_tree/metadata"
+assert_rejected "nested manifest parent symlink" python3 "$MANIFEST_TOOL" verify --root "$nested_tree" --manifest metadata/manifest.json
+
 printf 'extra\n' > "$tree/lib/extra"
 chmod 644 "$tree/lib/extra"
 assert_rejected "extra file" python3 "$MANIFEST_TOOL" verify --root "$tree"

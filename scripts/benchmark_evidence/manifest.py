@@ -163,6 +163,98 @@ def _open_file(parent_fd: int, name: str) -> int:
     return fd
 
 
+def _open_root(root: str) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        expected = os.stat(root, follow_symlinks=False)
+        fd = os.open(root, flags)
+    except OSError as exc:
+        raise ManifestError(f"cannot open root without following symlinks: {exc}") from exc
+    try:
+        actual = os.fstat(fd)
+    except OSError as exc:
+        os.close(fd)
+        raise ManifestError(f"cannot stat opened root: {exc}") from exc
+    if (
+        expected.st_dev,
+        expected.st_ino,
+        stat.S_IMODE(expected.st_mode),
+        expected.st_uid,
+        expected.st_gid,
+    ) != (
+        actual.st_dev,
+        actual.st_ino,
+        stat.S_IMODE(actual.st_mode),
+        actual.st_uid,
+        actual.st_gid,
+    ):
+        os.close(fd)
+        raise ManifestError("root changed while it was being opened")
+    return fd
+
+
+def _open_relative_file(root_fd: int, path: str) -> int:
+    """Open a relative file below root without following any path component."""
+
+    parts = path.split("/")
+    parent_fd = os.dup(root_fd)
+    os.set_inheritable(parent_fd, False)
+    try:
+        for part in parts[:-1]:
+            child_fd = _open_directory(parent_fd, part)
+            os.close(parent_fd)
+            parent_fd = child_fd
+        return _open_file(parent_fd, parts[-1])
+    finally:
+        os.close(parent_fd)
+
+
+def _open_absolute_file(path: str) -> int:
+    """Open an absolute file without following any ancestor component."""
+
+    if not path.startswith("/"):
+        raise ManifestError("manifest file must be absolute")
+    relative = path[1:]
+    _relative_manifest_path(relative)
+    flags = os.O_RDONLY | os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        root_fd = os.open("/", flags)
+    except OSError as exc:
+        raise ManifestError(f"cannot open filesystem root: {exc}") from exc
+    try:
+        return _open_relative_file(root_fd, relative)
+    finally:
+        os.close(root_fd)
+
+
+def _read_fd(fd: int) -> bytes:
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+    except OSError as exc:
+        raise ManifestError(f"cannot seek manifest: {exc}") from exc
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        try:
+            block = os.read(fd, 1024 * 1024)
+        except OSError as exc:
+            raise ManifestError(f"cannot read manifest: {exc}") from exc
+        if not block:
+            return b"".join(chunks)
+        total += len(block)
+        if total > MAX_U64:
+            raise ManifestError("manifest exceeds u64 size")
+        chunks.append(block)
+
+
 @dataclass(frozen=True)
 class _Observed:
     path: str
@@ -185,7 +277,14 @@ class _Observed:
         }
 
 
-def _iter_tree(fd: int, prefix: str = "", excluded: str = "") -> Iterator[_Observed]:
+def _iter_tree(
+    fd: int,
+    prefix: str = "",
+    excluded: str = "",
+    seen_files: set[tuple[int, int]] | None = None,
+) -> Iterator[_Observed]:
+    if seen_files is None:
+        seen_files = set()
     try:
         entries = sorted(os.scandir(fd), key=lambda entry: os.fsencode(entry.name))
     except OSError as exc:
@@ -207,16 +306,31 @@ def _iter_tree(fd: int, prefix: str = "", excluded: str = "") -> Iterator[_Obser
         if stat.S_ISDIR(lstat.st_mode):
             child_fd = _open_directory(fd, name)
             try:
+                child_stat = os.fstat(child_fd)
+                if (
+                    lstat.st_dev,
+                    lstat.st_ino,
+                    stat.S_IMODE(lstat.st_mode),
+                    lstat.st_uid,
+                    lstat.st_gid,
+                ) != (
+                    child_stat.st_dev,
+                    child_stat.st_ino,
+                    stat.S_IMODE(child_stat.st_mode),
+                    child_stat.st_uid,
+                    child_stat.st_gid,
+                ):
+                    raise ManifestError(f"installed directory changed while opening: {path}")
                 yield _Observed(
                     path=path,
                     kind="directory",
-                    mode=_mode("directory", os.fstat(child_fd).st_mode),
-                    uid=lstat.st_uid,
-                    gid=lstat.st_gid,
+                    mode=_mode("directory", child_stat.st_mode),
+                    uid=child_stat.st_uid,
+                    gid=child_stat.st_gid,
                     size=0,
                     sha256="",
                 )
-                yield from _iter_tree(child_fd, path, excluded)
+                yield from _iter_tree(child_fd, path, excluded, seen_files)
             finally:
                 os.close(child_fd)
             continue
@@ -227,6 +341,10 @@ def _iter_tree(fd: int, prefix: str = "", excluded: str = "") -> Iterator[_Obser
             before = os.fstat(file_fd)
             if before.st_dev != lstat.st_dev or before.st_ino != lstat.st_ino:
                 raise ManifestError(f"installed entry changed while opening: {path}")
+            identity = (before.st_dev, before.st_ino)
+            if identity in seen_files:
+                raise ManifestError(f"hard-linked installed files are not permitted: {path}")
+            seen_files.add(identity)
             size, digest = _hash_fd(file_fd, before.st_size)
             after = os.fstat(file_fd)
             if (
@@ -258,18 +376,8 @@ def _iter_tree(fd: int, prefix: str = "", excluded: str = "") -> Iterator[_Obser
             os.close(file_fd)
 
 
-def _observed_tree(root: str, manifest_path: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    root = _absolute_directory(root)
+def _observed_tree_fd(root_fd: int, manifest_path: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     excluded = _relative_manifest_path(manifest_path)
-    flags = os.O_RDONLY | os.O_DIRECTORY
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        root_fd = os.open(root, flags)
-    except OSError as exc:
-        raise ManifestError(f"cannot open root without following symlinks: {exc}") from exc
     try:
         root_stat = os.fstat(root_fd)
         root_record = {
@@ -277,9 +385,18 @@ def _observed_tree(root: str, manifest_path: str) -> tuple[dict[str, Any], list[
             "uid": root_stat.st_uid,
             "gid": root_stat.st_gid,
         }
-        entries = [item.as_dict() for item in _iter_tree(root_fd, excluded=excluded)]
+        entries = [item.as_dict() for item in _iter_tree(root_fd, excluded=excluded, seen_files=set())]
         entries.sort(key=lambda item: os.fsencode(item["path"]))
         return root_record, entries
+    except OSError as exc:
+        raise ManifestError(f"cannot inspect installed root: {exc}") from exc
+
+
+def _observed_tree(root: str, manifest_path: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    root = _absolute_directory(root)
+    root_fd = _open_root(root)
+    try:
+        return _observed_tree_fd(root_fd, manifest_path)
     finally:
         os.close(root_fd)
 
@@ -357,16 +474,9 @@ def _validate_manifest_object(value: Any) -> dict[str, Any]:
     return dict(value)
 
 
-def load_manifest(path: str) -> tuple[dict[str, Any], bytes]:
-    """Read, parse, and canonicality-check a manifest file."""
+def _parse_manifest_bytes(raw: bytes) -> tuple[dict[str, Any], bytes]:
+    """Parse and canonicality-check manifest bytes already read from an fd."""
 
-    if not os.path.isabs(path) or os.path.islink(path):
-        raise ManifestError("manifest file must be an absolute non-symlink path")
-    try:
-        with open(path, "rb") as stream:
-            raw = stream.read()
-    except OSError as exc:
-        raise ManifestError(f"cannot read manifest: {exc}") from exc
     def reject_constant(_: str) -> Any:
         raise ManifestError("non-finite JSON number")
 
@@ -381,20 +491,82 @@ def load_manifest(path: str) -> tuple[dict[str, Any], bytes]:
     return manifest, raw
 
 
+def load_manifest(path: str) -> tuple[dict[str, Any], bytes]:
+    """Read, parse, and canonicality-check a manifest file."""
+
+    if not os.path.isabs(path) or os.path.islink(path):
+        raise ManifestError("manifest file must be an absolute non-symlink path")
+    try:
+        fd = _open_absolute_file(path)
+    except ManifestError:
+        raise
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ManifestError("manifest is not a regular file")
+        raw = _read_fd(fd)
+        after = os.fstat(fd)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            stat.S_IMODE(before.st_mode),
+            before.st_uid,
+            before.st_gid,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            stat.S_IMODE(after.st_mode),
+            after.st_uid,
+            after.st_gid,
+        ):
+            raise ManifestError("manifest changed while being read")
+    finally:
+        os.close(fd)
+    return _parse_manifest_bytes(raw)
+
+
 def verify_manifest(root: str, manifest_path: str = "manifest.json") -> str:
     """Verify the installed tree and return the manifest SHA-256."""
 
     manifest_path = _relative_manifest_path(manifest_path)
     root = _absolute_directory(root)
-    absolute_manifest = os.path.join(root, *manifest_path.split("/"))
-    manifest, raw = load_manifest(absolute_manifest)
-    if manifest["manifest_path"] != manifest_path:
-        raise ManifestError("manifest path does not match the requested path")
-    expected_root, expected_entries = manifest["root"], manifest["entries"]
-    observed_root, observed_entries = _observed_tree(root, manifest_path)
-    if observed_root != expected_root or observed_entries != expected_entries:
-        raise ManifestError("installed tree does not match the manifest")
-    return manifest_sha256(raw)
+    root_fd = _open_root(root)
+    try:
+        manifest_fd = _open_relative_file(root_fd, manifest_path)
+        try:
+            before = os.fstat(manifest_fd)
+            raw = _read_fd(manifest_fd)
+            after = os.fstat(manifest_fd)
+            if (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                stat.S_IMODE(before.st_mode),
+                before.st_uid,
+                before.st_gid,
+            ) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                stat.S_IMODE(after.st_mode),
+                after.st_uid,
+                after.st_gid,
+            ):
+                raise ManifestError("manifest changed while being read")
+        finally:
+            os.close(manifest_fd)
+        manifest, raw = _parse_manifest_bytes(raw)
+        if manifest["manifest_path"] != manifest_path:
+            raise ManifestError("manifest path does not match the requested path")
+        expected_root, expected_entries = manifest["root"], manifest["entries"]
+        observed_root, observed_entries = _observed_tree_fd(root_fd, manifest_path)
+        if observed_root != expected_root or observed_entries != expected_entries:
+            raise ManifestError("installed tree does not match the manifest")
+        return manifest_sha256(raw)
+    finally:
+        os.close(root_fd)
 
 
 def _write_manifest(root: str, path: str) -> str:
@@ -415,8 +587,15 @@ def _write_manifest(root: str, path: str) -> str:
     except FileExistsError as exc:
         raise ManifestError("refusing to overwrite an existing manifest") from exc
     try:
-        os.write(fd, raw)
+        written = 0
+        while written < len(raw):
+            count = os.write(fd, raw[written:])
+            if count <= 0:
+                raise ManifestError("manifest write made no progress")
+            written += count
         os.fsync(fd)
+        if os.fstat(fd).st_size != len(raw):
+            raise ManifestError("manifest write was truncated")
     finally:
         os.close(fd)
     return manifest_sha256(raw)
