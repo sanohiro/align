@@ -48,14 +48,17 @@ the no-follow installed-source manifest to the profile's fixed SHA-256 with dire
 PR #830 fixed the pinned `/usr/bin/git` process/config boundary: a fixed argv and empty
 environment, disabled replacement/lazy-fetch/optional-lock behavior, no system/global Git config,
 and an owned process group. PR #831 then shipped the raw batch reader plus commit, tree, and
-two-sided revision binding. Active work on `agent/request7-installed-source-protection` adds raw
-source materialization and retained-descriptor verification; it does not execute Docker,
-`ssh-keygen`, or the benchmark. Installed-source protection, profile, image recipe, and
-adversarial owners follow. Host qualification and the full controller/verifier implementation
-remain later work. Materialization and retained verification intentionally share this boundary
-even though the hand-written change is just over the rough line heuristic: both depend on the same
-raw path layout, reviewed-symlink policy, descriptor identity, and cleanup proof, so splitting them
-would duplicate the boundary fixtures without leaving a stable consumer for either half.
+two-sided revision binding. PR #832 shipped verified raw source materialization and
+retained-descriptor verification; it does not execute Docker, `ssh-keygen`, or the benchmark.
+Active work on `agent/request7-profile-image` adds canonical validation for the immutable
+x86_64 evidence profile, including host-lock identity, Docker/image/toolchain identities, fixed
+observation limits, capture/timeouts, signing key, schedule, and benchmark inventory. It does not
+inspect the host or daemon, provision a key, build an image, or execute the controller. The image
+recipe, host qualification, adversarial owners, and full controller/verifier implementation remain
+later work. Materialization and retained verification intentionally shared one boundary because
+they depend on the same raw path layout, reviewed-symlink policy, descriptor identity, and cleanup
+proof; splitting them would have duplicated the boundary fixtures without leaving a stable consumer
+for either half.
 
 The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit
