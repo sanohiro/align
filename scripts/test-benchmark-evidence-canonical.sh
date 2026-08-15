@@ -23,6 +23,11 @@ assert cj.sha256(expected) == "10f1ae68885a38a46009f0a8b3c7f98ce52dcba12c7d59f1b
 cj.require_object(value, ("schema", "count", "items"), "value")
 cj.require_string(value["schema"], "schema")
 assert cj.require_uint(value["count"], "count") == 42
+assert cj.require_uint(cj.MAX_U64, "max") == cj.MAX_U64
+assert cj.require_uint(2**32 - 1, "u32", maximum=(2**32 - 1)) == 2**32 - 1
+assert cj.decode(b'{"value":"a/b"}\n')["value"] == "a/b"
+recursive = cj.Object((("outer", cj.Object((("inner", [0, 1, 2]),))),))
+assert cj.decode(cj.encode(recursive)) == recursive
 
 
 def rejected(label, action):
@@ -38,13 +43,20 @@ rejected("trailing bytes", lambda: cj.decode(expected + b"x"))
 rejected("missing final LF", lambda: cj.decode(expected[:-1]))
 rejected("duplicate key", lambda: cj.decode(b'{"schema":"test/v1","schema":"test/v1"}\n'))
 rejected("escaped canonical string", lambda: cj.decode(b'{"schema":"test\\u002Fv1","count":42,"items":["A","B"]}\n'))
+rejected("escaped quote", lambda: cj.decode(b'{"value":"\\\""}\n'))
+rejected("escaped backslash", lambda: cj.decode(b'{"value":"\\\\"}\n'))
+rejected("invalid UTF-8", lambda: cj.decode(b'{"value":"\xff"}\n'))
 rejected("unicode string", lambda: cj.encode(cj.Object((("value", "é"),))))
 rejected("control string", lambda: cj.encode(cj.Object((("value", "line\nbreak"),))))
+rejected("quote string", lambda: cj.encode(cj.Object((("value", '"'),))))
+rejected("backslash string", lambda: cj.encode(cj.Object((("value", "\\"),))))
 rejected("float", lambda: cj.decode(b'{"value":1.0}\n'))
 rejected("negative", lambda: cj.decode(b'{"value":-1}\n'))
 rejected("overflow", lambda: cj.decode(b'{"value":18446744073709551616}\n'))
 rejected("null", lambda: cj.decode(b'{"value":null}\n'))
+rejected("decoded boolean", lambda: cj.decode(b'{"value":true}\n'))
 rejected("boolean", lambda: cj.require_uint(True, "value"))
+rejected("u32 overflow", lambda: cj.require_uint(2**32, "u32", maximum=(2**32 - 1)))
 rejected(
     "wrong member order",
     lambda: cj.require_object(

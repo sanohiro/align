@@ -47,8 +47,8 @@ def _reject_constant(_: str) -> Any:
 def _validate_string(value: str, label: str) -> None:
     for character in value:
         codepoint = ord(character)
-        if codepoint < 0x20 or codepoint > 0x7E:
-            raise CanonicalJsonError(f"{label} contains a non-ASCII or control character")
+        if codepoint < 0x20 or codepoint > 0x7E or character in ('"', "\\"):
+            raise CanonicalJsonError(f"{label} contains a prohibited character")
 
 
 def _validate(value: Any, label: str = "value") -> None:
