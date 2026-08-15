@@ -26,6 +26,8 @@ MERGE = "c" * 40
 WRONG_PARENT = "d" * 40
 WRONG_TREE = "e" * 40
 UNRELATED = "f" * 40
+SIDE_PARENT = "5" * 40
+OTHER_MERGE = "6" * 40
 LATER = "1" * 40
 BASE_TREE = "2" * 40
 CANDIDATE_TREE = "3" * 40
@@ -111,6 +113,13 @@ expect_error(
 )
 
 base, candidate, merge, remote = fixture()
+remote.target_ref = "refs/heads/release"
+expect_error(
+    "unexpected target ref",
+    lambda: transaction(remote, base, candidate),
+)
+
+base, candidate, merge, remote = fixture()
 remote.queue_merge(merge)
 current = transaction(remote, base, candidate)
 current.precheck(base.oid)
@@ -132,6 +141,62 @@ remote.set_target(later.oid)
 result = current.finalize()
 assert result.state == "accepted"
 assert result.target_oid == LATER
+
+base, candidate, merge, remote = fixture()
+current = staged(remote, base, candidate, merge)
+remote.target_ref = "refs/heads/release"
+expect_error("target ref movement before final refetch", current.finalize)
+assert current.state == "rejected"
+assert remote.target_oid == MERGE
+assert_unadvanced(current)
+
+base, candidate, merge, remote = fixture()
+current = staged(remote, base, candidate, merge)
+later = commit(LATER, (MERGE,), CANDIDATE_TREE, "unavailable-later")
+remote.add_commit(later)
+remote.set_target(later.oid)
+remote.set_fetch_failure(LATER)
+expect_error("unavailable descendant fetch", current.finalize)
+assert current.state == "rejected"
+assert remote.target_oid == LATER
+assert_unadvanced(current)
+
+base, candidate, merge, remote = fixture()
+unrelated = commit(UNRELATED, (), BASE_TREE, "side-parent-root")
+side_parent = commit(
+    SIDE_PARENT,
+    (UNRELATED, MERGE),
+    CANDIDATE_TREE,
+    "side-parent-target",
+)
+remote.add_commit(unrelated)
+remote.add_commit(side_parent)
+current = staged(remote, base, candidate, merge)
+remote.set_target(side_parent.oid)
+expect_error("merge reachable only through side parent", current.finalize)
+assert current.state == "rejected"
+assert remote.target_oid == SIDE_PARENT
+assert_unadvanced(current)
+
+base, candidate, merge, remote = fixture()
+remote.queue_merge(merge)
+current = transaction(remote, base, candidate)
+current.precheck(base.oid)
+current.merge()
+current.verify_merge()
+other_merge = commit(
+    OTHER_MERGE,
+    (BASE, CANDIDATE),
+    CANDIDATE_TREE,
+    "different-raw-merge",
+)
+expect_error(
+    "initial artifact mismatch",
+    lambda: current.store_artifact(SignedMergeArtifact.from_commit(other_merge)),
+)
+assert current.state == "reverted"
+assert remote.target_oid == BASE
+assert_unadvanced(current)
 
 base, candidate, merge, remote = fixture()
 remote.set_target(candidate.oid)
@@ -211,13 +276,17 @@ assert remote.target_oid == MERGE
 assert_unadvanced(current)
 
 base, candidate, merge, remote = fixture()
-unrelated = commit(UNRELATED, (), BASE_TREE, "unrelated-response")
+unrelated = commit(
+    UNRELATED,
+    (BASE, CANDIDATE),
+    CANDIDATE_TREE,
+    "unrelated-response",
+)
 remote.add_commit(unrelated)
 remote.queue_merge(merge, response_oid=unrelated.oid)
 current = transaction(remote, base, candidate)
 current.precheck(base.oid)
-current.merge()
-expect_error("wrong merge response identity", current.verify_merge)
+expect_error("wrong merge response identity", current.merge)
 assert current.state == "blocked"
 assert remote.target_oid == MERGE
 assert_unadvanced(current)

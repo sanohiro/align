@@ -22,6 +22,7 @@ _HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 _DEFAULT_RESPONSE = object()
 _SIGNATURE_DOMAIN = b"merge-verification-test-signature\0"
+_TARGET_REF = "refs/heads/main"
 
 
 def _oid(value: object, label: str) -> str:
@@ -167,7 +168,7 @@ class MergeArtifactStore:
 class DisposableRemote:
     """A validated in-memory remote used to exercise provider/lifecycle races."""
 
-    target_ref: ClassVar[str] = "refs/heads/main"
+    target_ref: ClassVar[str] = _TARGET_REF
 
     def __init__(self, base: RemoteCommit, candidate: RemoteCommit) -> None:
         if candidate.parents != (base.oid,):
@@ -300,9 +301,7 @@ class DisposableRemote:
             seen.add(current)
             if current == oid:
                 return True
-            commit = self._commits.get(current)
-            if commit is None:
-                return False
+            commit = self.fetch_commit(current)
             current = commit.parents[0] if commit.parents else None
         return False
 
@@ -332,6 +331,8 @@ class MergeRaceTransaction:
     ) -> None:
         if not isinstance(remote, DisposableRemote):
             raise MergeRaceError("merge transaction requires a disposable remote")
+        if remote.target_ref != _TARGET_REF:
+            raise MergeRaceError("transaction remote target ref is not the accepted ref")
         self._remote = remote
         self._base_oid = _oid(base_oid, "base oid")
         self._candidate_oid = _oid(candidate_oid, "candidate oid")
@@ -395,6 +396,8 @@ class MergeRaceTransaction:
 
     def precheck(self, local_target_oid: str) -> None:
         self._require("new")
+        if self._remote.target_ref != _TARGET_REF:
+            self._fail("remote target ref moved to an unaccepted ref")
         try:
             local_target_oid = _oid(local_target_oid, "local target oid")
         except MergeRaceError as exc:
@@ -407,6 +410,8 @@ class MergeRaceTransaction:
 
     def merge(self) -> None:
         self._require("prechecked")
+        if self._remote.target_ref != _TARGET_REF:
+            self._fail("remote target ref moved before merge")
         if self._remote.target_oid != self._base_oid:
             self._fail("remote target moved after precheck and before merge")
         try:
@@ -415,6 +420,8 @@ class MergeRaceTransaction:
             self._fail(str(exc), block=True)
         if response.merge_oid is None:
             self._fail("merge response is unavailable", block=True)
+        if response.merge_oid != self._remote.last_merge_oid:
+            self._fail("merge response does not identify the applied merge", block=True)
         try:
             commit = self._remote.fetch_commit(response.merge_oid)
         except MergeRaceError as exc:
@@ -453,9 +460,15 @@ class MergeRaceTransaction:
 
     def finalize(self) -> "MergeRaceResult":
         self._require("staged")
+        if self._remote.target_ref != _TARGET_REF:
+            self._fail("remote target ref moved before final refetch")
         if self._merge_oid is None:
             self._fail("merge identity was not retained for final refetch", block=True)
-        if not self._remote.first_parent_contains(self._merge_oid):
+        try:
+            retains_merge = self._remote.first_parent_contains(self._merge_oid)
+        except MergeRaceError as exc:
+            self._fail(str(exc))
+        if not retains_merge:
             self._fail("final target does not retain merge on its first-parent chain")
         try:
             final_commit = self._remote.fetch_commit(self._merge_oid)
