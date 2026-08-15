@@ -8,9 +8,10 @@ per-PR journals are preserved in
 neither is a source of current status.
 
 _Last updated: 2026-08-15._ Align PR #812 merged align-llm Request 5's bounded HTTP
-response-body capability at `5aa5b23a`. Its exact-head native ARM64 preflight and every required
+response-body capability at `5aa5b23a`, and Request 7 evidence prerequisites through PR #820 are
+now merged, with #820 at `19fbc786`. Its exact-head native ARM64 preflight and every required
 GitHub check passed before merge. Active work is the separate align-llm Request 7
-benchmark-evidence prerequisite design on `agent/json-escape-benchmark-evidence-design`. The
+benchmark-evidence prerequisite implementation on `agent/request7-controller-bootstrap`. The
 proposed contract is `docs/impl/core-design/json-escape-benchmark-evidence.md`: a trusted installed
 controller/verifier, continuously monitored native x86_64 host, digest-pinned offline OCI toolchain,
 read-only revision isolation, robust inner statistics plus fixed balanced sampling, a complete
@@ -39,11 +40,13 @@ shared one group. The consolidated repair defers signals through PID capture, gi
 command a distinct group, and adds survivor-before-next-command regressions for both benchmarks.
 The evidence implementation continues after this
 hardening: the no-follow installed-source manifest foundation is shipped in #816 at
-`7db1af8c`, canonical JSON primitives are shipped in #817 at `4ec35dfe`, and the typed Report/Body
-schema is shipped in #818 at `41ce4f93`. The current slice adds strict SSHSIG v1 binary/armor
-framing and signing-preimage helpers before key invocation, controller/verifier/monitor, profile,
-image recipe, and adversarial owners follow. Host qualification and a Request 7 implementation
-branch remain later work.
+`7db1af8c`, canonical JSON primitives are shipped in #817 at `4ec35dfe`, the typed Report/Body
+schema is shipped in #818 at `41ce4f93`, and strict SSHSIG v1 binary/armor framing is shipped in
+#820 at `19fbc786`. The current slice adds the exact producer/verifier/merge-verifier CLI boundary
+for modes, required options, absolute paths, OIDs, and new output directories. It does not invoke
+Git, Docker, `ssh-keygen`, or the benchmark; installed controller/verifier/monitor, profile, image
+recipe, and adversarial owners follow. Host qualification and the full controller/verifier
+implementation remain later work.
 
 The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit
@@ -220,7 +223,8 @@ facts must live in this repository.
   Request 8 is merged through Align design #799 and implementation #801; Request 10's §7.6
   implementation is merged; Requests 11 and 12 are implemented, and Request 5's bounded-HTTP
   implementation is merged at `5aa5b23a`. Request 7's benchmark-evidence design is active, and its
-  benchmark-input prerequisite is implemented; Requests
+  benchmark-input, manifest, canonical JSON, typed report, and SSHSIG prerequisites are merged;
+  Requests
   9 and 13–14 remain proposed in
   `../align-llm/docs/align-requests.md`; Request 9 remains the later C7 blocker after Request 7.
 
