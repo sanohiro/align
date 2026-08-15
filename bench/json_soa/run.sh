@@ -16,6 +16,7 @@ BENCH_DETACHED_TARGET_DIR=""
 BENCH_TMP_DIR=""
 BENCH_ALIGNC_CACHE_DIR=""
 BENCH_CHILD_PID=""
+BENCH_PENDING_SIGNAL=""
 BENCH_WORK_DIR_VALIDATED=0
 BENCH_CLEANED=0
 
@@ -46,6 +47,18 @@ stop_child_group() {
   BENCH_CHILD_PID=""
 }
 
+defer_signal() {
+  if [[ -z "$BENCH_PENDING_SIGNAL" ]]; then
+    BENCH_PENDING_SIGNAL="$1"
+  fi
+}
+
+install_signal_traps() {
+  trap 'on_signal 129' HUP
+  trap 'on_signal 130' INT
+  trap 'on_signal 143' TERM
+}
+
 run_child_group() {
   local monitor_was_set=0
   local pid
@@ -55,9 +68,17 @@ run_child_group() {
     *m*) monitor_was_set=1 ;;
   esac
   set -m
+  BENCH_PENDING_SIGNAL=""
+  trap 'defer_signal 129' HUP
+  trap 'defer_signal 130' INT
+  trap 'defer_signal 143' TERM
   "$@" &
   BENCH_CHILD_PID=$!
   pid="$BENCH_CHILD_PID"
+  install_signal_traps
+  if [[ -n "$BENCH_PENDING_SIGNAL" ]]; then
+    on_signal "$BENCH_PENDING_SIGNAL"
+  fi
   if [[ "$monitor_was_set" -eq 0 ]]; then
     set +m
   fi
@@ -114,9 +135,7 @@ on_signal() {
 }
 
 trap cleanup EXIT
-trap 'on_signal 129' HUP
-trap 'on_signal 130' INT
-trap 'on_signal 143' TERM
+install_signal_traps
 
 umask 077
 
@@ -197,10 +216,14 @@ case "$mode" in
   *) echo "usage: run.sh [baseline|v3|native]" >&2; exit 2 ;;
 esac
 
-build_root() {
+build_alignc() {
   cd "$REPO_ROOT"
   CARGO_TARGET_DIR="$BENCH_ROOT_TARGET_DIR" TMPDIR="$BENCH_TMP_DIR" \
     cargo build -q --release --locked --offline --bin alignc
+}
+
+build_runtime() {
+  cd "$REPO_ROOT"
   CARGO_TARGET_DIR="$BENCH_ROOT_TARGET_DIR" TMPDIR="$BENCH_TMP_DIR" \
     cargo build -q --release --locked --offline -p align_runtime
 }
@@ -214,7 +237,8 @@ emit_kernel() {
 
 # Build alignc + the runtime staticlib (release). Two invocations: the staticlib crate-type of
 # `align_runtime` is what produces `libalign_runtime.a`.
-run_child_group build_root
+run_child_group build_alignc
+run_child_group build_runtime
 ALIGNC="$BENCH_ROOT_TARGET_DIR/release/alignc"
 RT_DIR="$BENCH_ROOT_TARGET_DIR/release"
 [ -f "$RT_DIR/libalign_runtime.so" ] || [ -f "$RT_DIR/libalign_runtime.dylib" ] || { echo "missing libalign_runtime dynamic library (.so/.dylib) in $RT_DIR" >&2; exit 1; }

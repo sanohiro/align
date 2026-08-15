@@ -100,6 +100,16 @@ if has_arg --bin "$@" && has_arg alignc "$@"; then
     printf '%s\n' "$!" > "$FAKE_DESCENDANT_MARKER"
     while :; do sleep 1; done
   fi
+  if [[ "${FAKE_SURVIVOR_MODE:-}" == root ]]; then
+    : "${FAKE_SURVIVOR_MARKER:?}"
+    trap '' TERM INT
+    (
+      trap '' TERM INT
+      while :; do sleep 1; done
+    ) &
+    printf '%s\n' "$!" > "$FAKE_SURVIVOR_MARKER"
+    exit 0
+  fi
   mkdir -p "$CARGO_TARGET_DIR/release"
   cat > "$CARGO_TARGET_DIR/release/alignc" <<'FAKE_ALIGNC'
 #!/usr/bin/env bash
@@ -281,6 +291,29 @@ benchmark_input_workdir_matrix() {
   done
   assert_locked_offline_invocations
 
+  local survivor_marker
+  local survivor_pid
+  local attempt
+  for bench in json_decode json_soa; do
+    FAKE_WORK_DIR="$TEST_ROOT/survivor-work-$bench"
+    survivor_marker="$TEST_ROOT/survivor-marker-$bench"
+    mkdir -p "$FAKE_WORK_DIR"
+    if run_benchmark "$bench" env FAKE_SURVIVOR_MODE=root \
+      FAKE_SURVIVOR_MARKER="$survivor_marker"; then
+      fail "$bench accepted a surviving descendant from the first root build"
+    fi
+    [[ -f "$survivor_marker" ]] || fail "$bench survivor fixture did not create a descendant"
+    survivor_pid="$(sed -n '1p' "$survivor_marker")"
+    for attempt in $(seq 1 100); do
+      kill -0 "$survivor_pid" 2>/dev/null || break
+      sleep 0.05
+    done
+    if kill -0 "$survivor_pid" 2>/dev/null; then
+      fail "$bench first root build left its surviving descendant"
+    fi
+    assert_empty "$FAKE_WORK_DIR"
+  done
+
   FAKE_WORK_DIR="$TEST_ROOT/foreign-work"
   mkdir -p "$FAKE_WORK_DIR"
   if run_benchmark json_decode env FAKE_ADD_FOREIGN=1; then
@@ -311,7 +344,6 @@ benchmark_input_workdir_matrix() {
   local block_marker
   local descendant_marker
   local ready
-  local attempt
   local signal_status
   for bench in json_decode json_soa; do
     FAKE_WORK_DIR="$TEST_ROOT/signal-work-$bench"

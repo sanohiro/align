@@ -33,7 +33,11 @@ independent audit found three narrow owner gaps in #815: final-symlink `//` and 
 missing/stale detached locks, and TERM-ignoring descendants were not exercised, while foreground
 children could delay shell traps indefinitely. Active work on `agent/benchmark-input-hardening`
 closes those classes with explicit lock validation, per-command process groups, bounded TERM/KILL,
-direct-child reap, and exact regression fixtures. The evidence implementation continues after this
+direct-child reap, and exact regression fixtures. Comprehensive review of `36297622` found that
+signals could still land between child launch and PID capture and that the two root Cargo commands
+shared one group. The consolidated repair defers signals through PID capture, gives each Cargo
+command a distinct group, and adds survivor-before-next-command regressions for both benchmarks.
+The evidence implementation continues after this
 hardening: the no-follow installed-source manifest foundation is shipped in #816 at
 `7db1af8c`, canonical JSON primitives are shipped in #817 at `4ec35dfe`, and the current slice adds
 the complete typed Report/Body schema, ordered nested validation, and body-digest binding before
