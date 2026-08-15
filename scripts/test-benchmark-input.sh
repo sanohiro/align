@@ -84,6 +84,7 @@ if has_arg --bin "$@" && has_arg alignc "$@"; then
 #!/usr/bin/env bash
 set -euo pipefail
 : "${FAKE_WORK_DIR:?}"
+: "${ALIGNC_CACHE:?}"
 if [[ "${FAKE_FAIL_MODE:-}" == alignc ]]; then
   exit 71
 fi
@@ -93,6 +94,10 @@ fi
 case "$3" in
   "$FAKE_WORK_DIR"/.align-bench.*/*) ;;
   *) echo "kernel object escaped the private child" >&2; exit 83 ;;
+esac
+case "$ALIGNC_CACHE" in
+  "$FAKE_WORK_DIR"/.align-bench.*/*) ;;
+  *) echo "alignc cache escaped the private child" >&2; exit 88 ;;
 esac
 printf 'fake kernel object\n' > "$3"
 FAKE_ALIGNC

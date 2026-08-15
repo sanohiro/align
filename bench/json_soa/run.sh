@@ -14,6 +14,7 @@ BENCH_PRIVATE_DIR=""
 BENCH_ROOT_TARGET_DIR=""
 BENCH_DETACHED_TARGET_DIR=""
 BENCH_TMP_DIR=""
+BENCH_ALIGNC_CACHE_DIR=""
 BENCH_WORK_DIR_VALIDATED=0
 BENCH_CLEANED=0
 
@@ -122,7 +123,8 @@ fi
 BENCH_ROOT_TARGET_DIR="$BENCH_PRIVATE_DIR/root-target"
 BENCH_DETACHED_TARGET_DIR="$BENCH_PRIVATE_DIR/detached-target"
 BENCH_TMP_DIR="$BENCH_PRIVATE_DIR/tmp"
-mkdir -p "$BENCH_ROOT_TARGET_DIR" "$BENCH_DETACHED_TARGET_DIR" "$BENCH_TMP_DIR"
+BENCH_ALIGNC_CACHE_DIR="$BENCH_PRIVATE_DIR/alignc-cache"
+mkdir -p "$BENCH_ROOT_TARGET_DIR" "$BENCH_DETACHED_TARGET_DIR" "$BENCH_TMP_DIR" "$BENCH_ALIGNC_CACHE_DIR"
 
 cd "$SCRIPT_DIR"
 
@@ -154,7 +156,8 @@ RT_DIR="$BENCH_ROOT_TARGET_DIR/release"
 KOBJ="$BENCH_PRIVATE_DIR/kernel.o"
 (
   cd "$BENCH_PRIVATE_DIR"
-  TMPDIR="$BENCH_TMP_DIR" "$ALIGNC" emit-obj "$SCRIPT_DIR/kernel.align" "$KOBJ" --target-cpu "$align_tgt" \
+  ALIGNC_CACHE="$BENCH_ALIGNC_CACHE_DIR" TMPDIR="$BENCH_TMP_DIR" \
+    "$ALIGNC" emit-obj "$SCRIPT_DIR/kernel.align" "$KOBJ" --target-cpu "$align_tgt" \
   --export agg --export agg_len --export agg_aos --export agg_aos_len --export agg_proj --export agg_proj_len
 )
 
