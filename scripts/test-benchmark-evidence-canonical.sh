@@ -54,7 +54,7 @@ rejected("float", lambda: cj.decode(b'{"value":1.0}\n'))
 rejected("negative", lambda: cj.decode(b'{"value":-1}\n'))
 rejected("overflow", lambda: cj.decode(b'{"value":18446744073709551616}\n'))
 rejected("null", lambda: cj.decode(b'{"value":null}\n'))
-rejected("decoded boolean", lambda: cj.decode(b'{"value":true}\n'))
+assert cj.decode(b'{"value":true}\n')["value"] is True
 rejected("boolean", lambda: cj.require_uint(True, "value"))
 rejected("u32 overflow", lambda: cj.require_uint(2**32, "u32", maximum=(2**32 - 1)))
 rejected(

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Strict canonical JSON primitives for evidence records.
 
-Evidence records contain only ASCII enum/name/hex strings and unsigned integer
-scalars. This module makes those restrictions executable before the complete
+Evidence records contain only ASCII enum/name/hex strings, boolean, and
+unsigned integer scalars. This module makes those restrictions executable before the complete
 report schemas are layered on top: object member order is preserved, duplicate
 members are rejected, and decoding requires byte-for-byte canonical re-encode.
 """
@@ -77,7 +77,9 @@ def _validate(value: Any, label: str = "value") -> None:
     if isinstance(value, str):
         _validate_string(value, label)
         return
-    if isinstance(value, bool) or not isinstance(value, int):
+    if isinstance(value, bool):
+        return
+    if not isinstance(value, int):
         raise CanonicalJsonError(f"{label} is not an allowed JSON scalar")
     if value < 0 or value > MAX_U64:
         raise CanonicalJsonError(f"{label} is outside u64 range")
