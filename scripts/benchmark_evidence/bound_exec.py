@@ -240,8 +240,13 @@ def execute(
     artifacts_fd = _open_directory(root_fd, "artifacts")
     runtime_name = runtime_paths[0].split("/", 1)[1]
 
-    environment = dict(os.environ)
-    environment.pop("PYTHONDONTWRITEBYTECODE", None)
+    environment = {
+        "CARGO_NET_OFFLINE": "true",
+        "HOME": "",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "TZ": "UTC",
+    }
     if sys.platform.startswith("linux"):
         executable_fd = _open_bound_file(artifacts_fd, executable, entries[executable_path])
         runtime_fd = _open_bound_file(artifacts_fd, runtime_name, entries[runtime_paths[0]])

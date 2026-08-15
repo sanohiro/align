@@ -44,9 +44,11 @@ assert_empty() {
   fi
 }
 
-assert_cleared_private_child() {
+assert_cleared_private_tree() {
   [[ -d "$1/prepared" && ! -L "$1/prepared" ]] || fail "missing cleared private child: $1"
-  directory_has_entries "$1/prepared" && fail "cleared private child is not empty: $1"
+  if find "$1/prepared" ! -type d -print -quit | grep -q .; then
+    fail "cleared private child contains a non-directory entry: $1"
+  fi
   local entry
   for entry in "$1"/* "$1"/.[!.]* "$1"/..?*; do
     if [[ ( -e "$entry" || -L "$entry" ) && "$entry" != "$1/prepared" ]]; then
@@ -215,6 +217,13 @@ elif has_arg build "$@"; then
   mkdir -p "$CARGO_TARGET_DIR/release"
   cat > "$CARGO_TARGET_DIR/release/$binary" <<'FAKE_BENCHMARK'
 #!/usr/bin/env bash
+set -euo pipefail
+[[ "${CARGO_NET_OFFLINE:-}" == true ]]
+[[ "${HOME+x}:${HOME:-x}" == x: ]]
+[[ "${LC_ALL:-}" == C ]]
+[[ "${PATH:-}" == /usr/bin:/bin ]]
+[[ "${TZ:-}" == UTC ]]
+[[ -z "${ALIGN_BENCH_AMBIENT_SENTINEL+x}" ]]
 printf 'fake prepared benchmark\n'
 FAKE_BENCHMARK
   chmod 700 "$CARGO_TARGET_DIR/release/$binary"
@@ -451,12 +460,14 @@ benchmark_input_workdir_matrix() {
     run_benchmark "$bench" env
     [[ -f "$FAKE_WORK_DIR/prepared/artifact-manifest.json" ]] || fail "$bench did not seal artifacts"
     cargo_count_before="$(wc -l < "$FAKE_LOG" | tr -d ' ')"
-    benchmark_output="$(run_prepared_benchmark "$bench")"
+    benchmark_output="$(run_prepared_benchmark "$bench" env ALIGN_BENCH_AMBIENT_SENTINEL=leak)"
     [[ "$benchmark_output" == $'target: native\nfake prepared benchmark' ]] ||
       fail "$bench measurement output did not use the fixed native target prelude"
     cargo_count_after="$(wc -l < "$FAKE_LOG" | tr -d ' ')"
     [[ "$cargo_count_after" -eq "$cargo_count_before" ]] || fail "$bench measurement invoked Cargo"
     [[ -f "$FAKE_WORK_DIR/prepared/artifact-manifest.json" ]] || fail "$bench measurement removed artifacts"
+    [[ -d "$FAKE_WORK_DIR/prepared/root-target" ]] ||
+      fail "$bench removed a build directory before candidate teardown"
     [[ ! -e "$REPO_ROOT/bench/$bench/kernel.o" ]] || fail "$bench wrote kernel.o beside its source"
   done
   assert_locked_offline_invocations
@@ -582,7 +593,7 @@ benchmark_input_workdir_matrix() {
     if kill -0 "$survivor_pid" 2>/dev/null; then
       fail "$bench first root build left its surviving descendant"
     fi
-    assert_cleared_private_child "$FAKE_WORK_DIR"
+    assert_cleared_private_tree "$FAKE_WORK_DIR"
   done
 
   FAKE_WORK_DIR="$TEST_ROOT/foreign-work"
@@ -592,14 +603,16 @@ benchmark_input_workdir_matrix() {
   fi
   [[ -e "$FAKE_WORK_DIR/foreign" ]] || fail "foreign residue was deleted"
   [[ -d "$FAKE_WORK_DIR/prepared" ]] || fail "cleared private child was removed"
-  directory_has_entries "$FAKE_WORK_DIR/prepared" && fail "cleared private child retained artifacts"
+  if find "$FAKE_WORK_DIR/prepared" ! -type d -print -quit | grep -q .; then
+    fail "cleared private child retained a non-directory entry"
+  fi
 
   FAKE_WORK_DIR="$TEST_ROOT/error-work"
   mkdir -p "$FAKE_WORK_DIR"
   if run_benchmark json_soa env FAKE_FAIL_MODE=detached; then
     fail "detached benchmark failure was accepted"
   fi
-  assert_cleared_private_child "$FAKE_WORK_DIR"
+  assert_cleared_private_tree "$FAKE_WORK_DIR"
 
   FAKE_WORK_DIR="$TEST_ROOT/cleanup-failure-work"
   mkdir -p "$FAKE_WORK_DIR"
@@ -652,7 +665,7 @@ benchmark_input_workdir_matrix() {
       fail "$bench signal cleanup left a child-process-group descendant"
     fi
     SIGNAL_DESCENDANT_PID=""
-    assert_cleared_private_child "$FAKE_WORK_DIR"
+    assert_cleared_private_tree "$FAKE_WORK_DIR"
   done
 }
 

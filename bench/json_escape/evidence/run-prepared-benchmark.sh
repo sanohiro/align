@@ -71,9 +71,10 @@ work_dir_contains_only_private() {
   done
 }
 
-work_dir_contains_only_empty_private() {
+work_dir_contains_only_cleared_private() {
   work_dir_contains_only_private || return 1
-  ! directory_has_entries "$BENCH_PRIVATE_DIR"
+  PYTHONDONTWRITEBYTECODE=1 python3 \
+    "$REPO_ROOT/scripts/benchmark_evidence/prepared_tree.py" verify-cleared
 }
 
 private_identity_matches() {
@@ -183,8 +184,8 @@ cleanup() {
     if ! private_identity_matches; then
       echo "error: benchmark work child was replaced; cleared retained tree only" >&2
       cleanup_failed=1
-    elif ! work_dir_contains_only_empty_private; then
-      echo "error: cleared benchmark work child is not the sole empty residue" >&2
+    elif ! work_dir_contains_only_cleared_private; then
+      echo "error: cleared benchmark work child is not the sole directory-only residue" >&2
       cleanup_failed=1
     fi
   fi
@@ -198,7 +199,7 @@ cleanup() {
         echo "error: benchmark work directory does not contain exactly the prepared artifact" >&2
         cleanup_failed=1
       fi
-    elif [[ "$BENCH_PRIVATE_FD_OPEN" -eq 1 ]] && work_dir_contains_only_empty_private; then
+    elif [[ "$BENCH_PRIVATE_FD_OPEN" -eq 1 ]] && work_dir_contains_only_cleared_private; then
       :
     elif directory_has_entries "$BENCH_WORK_DIR"; then
       echo "error: foreign residue remains in the benchmark work directory" >&2
@@ -402,7 +403,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/scripts/benchmark_evidence/prepare
 PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/scripts/benchmark_evidence/prepared_tree.py" \
   write-configuration --benchmark "$BENCH_NAME"
 PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/scripts/benchmark_evidence/prepared_tree.py" \
-  prune root-target detached-target tmp alignc-cache kernel.o
+  clear-build-trees root-target detached-target tmp alignc-cache kernel.o
 PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/scripts/benchmark_evidence/prepared_tree.py" \
   verify-artifacts
 manifest_sha256="$(PYTHONDONTWRITEBYTECODE=1 python3 \

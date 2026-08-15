@@ -134,19 +134,18 @@ def _clear_directory(fd: int) -> None:
             try:
                 opened = os.fstat(child_fd)
                 if (value.st_dev, value.st_ino) != (opened.st_dev, opened.st_ino):
-                    raise PreparedTreeError("directory changed while opening for removal")
+                    raise PreparedTreeError("directory changed while opening for clearing")
                 _clear_directory(child_fd)
             finally:
                 os.close(child_fd)
-            os.rmdir(entry.name, dir_fd=fd)
         else:
             os.unlink(entry.name, dir_fd=fd)
 
 
-def _prune(names: Sequence[str]) -> None:
+def _clear_build_trees(names: Sequence[str]) -> None:
     for name in names:
         if "/" in name or name in ("", ".", "..", "artifacts"):
-            raise PreparedTreeError("invalid prepared-tree prune target")
+            raise PreparedTreeError("invalid prepared-tree clear target")
         value = os.stat(name, dir_fd=ROOT_FD, follow_symlinks=False)
         if not stat.S_ISDIR(value.st_mode):
             os.unlink(name, dir_fd=ROOT_FD)
@@ -155,11 +154,25 @@ def _prune(names: Sequence[str]) -> None:
         try:
             opened = os.fstat(child_fd)
             if (value.st_dev, value.st_ino) != (opened.st_dev, opened.st_ino):
-                raise PreparedTreeError(f"prune target changed while opening: {name}")
+                raise PreparedTreeError(f"clear target changed while opening: {name}")
             _clear_directory(child_fd)
         finally:
             os.close(child_fd)
-        os.rmdir(name, dir_fd=ROOT_FD)
+
+
+def _verify_cleared_directory(fd: int) -> None:
+    for entry in list(os.scandir(fd)):
+        value = os.stat(entry.name, dir_fd=fd, follow_symlinks=False)
+        if not stat.S_ISDIR(value.st_mode):
+            raise PreparedTreeError("cleared prepared tree contains a non-directory entry")
+        child_fd = manifest._open_directory(fd, entry.name)
+        try:
+            opened = os.fstat(child_fd)
+            if (value.st_dev, value.st_ino) != (opened.st_dev, opened.st_ino):
+                raise PreparedTreeError("cleared directory changed while opening")
+            _verify_cleared_directory(child_fd)
+        finally:
+            os.close(child_fd)
 
 
 def _verify_artifacts_directory() -> None:
@@ -185,11 +198,12 @@ def _parser() -> argparse.ArgumentParser:
     chmod = subparsers.add_parser("chmod-artifact", allow_abbrev=False)
     chmod.add_argument("--name", required=True)
     chmod.add_argument("--mode", required=True, choices=("0644", "0755"))
-    prune = subparsers.add_parser("prune", allow_abbrev=False)
-    prune.add_argument("names", nargs="+")
+    clear_build_trees = subparsers.add_parser("clear-build-trees", allow_abbrev=False)
+    clear_build_trees.add_argument("names", nargs="+")
     subparsers.add_parser("verify-artifacts", allow_abbrev=False)
     subparsers.add_parser("write-manifest", allow_abbrev=False)
     subparsers.add_parser("clear", allow_abbrev=False)
+    subparsers.add_parser("verify-cleared", allow_abbrev=False)
     return parser
 
 
@@ -204,8 +218,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             _create_configuration(args.benchmark)
         elif args.command == "chmod-artifact":
             _chmod_artifact(args.name, int(args.mode, 8))
-        elif args.command == "prune":
-            _prune(args.names)
+        elif args.command == "clear-build-trees":
+            _clear_build_trees(args.names)
         elif args.command == "verify-artifacts":
             _verify_artifacts_directory()
         elif args.command == "write-manifest":
@@ -214,6 +228,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             if digest != manifest.manifest_sha256(raw):
                 raise PreparedTreeError("prepared manifest changed after writing")
             print(digest)
+        elif args.command == "verify-cleared":
+            _verify_cleared_directory(ROOT_FD)
         else:
             _clear_directory(ROOT_FD)
     except (OSError, manifest.ManifestError, PreparedTreeError) as exc:

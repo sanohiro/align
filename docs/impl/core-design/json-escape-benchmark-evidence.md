@@ -200,21 +200,23 @@ repository root, or inside the repository, and it must contain no entry, includi
 before the script starts. Each script enters `umask 077`, creates exactly one private child below
 that directory, binds root and detached Cargo targets, `TMPDIR`, the kernel object, and every
 generated artifact below that child. Prepare success retains the sealed child. Error, signal, and
-interrupt recursively clear only its retained descriptor and leave the empty public child for the
-trusted caller to remove after container/process teardown. Relative, missing, non-directory,
+interrupt recursively unlink non-directory entries only below its retained descriptor and leave a
+directory-only skeleton for the trusted caller to remove after container/process teardown. Relative,
 final-symlink, root, repository, in-repository,
 initially nonempty, cleanup-failure, and foreign-residue cases reject without deleting the foreign
 entry. Repeated trailing separators and `/.` cannot disguise a final-component symbolic link. Each
 build, compiler, and harness command runs in its own process group; interruption applies bounded
 TERM/KILL escalation to the complete group and reaps the direct child before private files are
-removed. The caller-owned directory and one empty owned child remain after script-level failure;
-the outer controller owns their race-free removal after the candidate container is gone.
+removed. The caller-owned directory and one directory-only owned tree remain after script-level
+failure; the outer controller owns their race-free removal after the candidate container is gone.
 
 The script opens and retains the private child before starting any untrusted build. On the accepted
 Linux path every preparation path is rooted through that descriptor's `/proc` handle, so renaming or
 replacing `prepared` cannot redirect later Cargo, compiler, copy, chmod, manifest, or cleanup work.
-Cleanup recursively removes entries only through the retained descriptor and never deletes the
-public path while a candidate-side writer could race it.
+Cleanup recursively unlinks non-directory entries only through the retained descriptor and never
+deletes a directory entry while a candidate-side writer could race it. Empty build-directory
+skeletons are included in the prepared manifest on success and removed by the outer controller only
+after measurement and candidate teardown.
 macOS remains native ARM development qualification and never supplies accepted adversarial
 evidence.
 
@@ -615,7 +617,7 @@ It may not weaken the base rule.
 | Inner/outer statistics | Synthetic odd/even nanosecond sums, half-microsecond ties, equal middle values, overflow edges, and one arbitrarily low outlier pin the middle sum, round-half-up integer-microsecond quantization, and three-decimal rendering. Ten printed samples retain exact tokens; exact 1.05 passes and the next microsecond unit fails. `benchmark_evidence_statistic_matrix`. |
 | Parser/arithmetic | Exact titles, headers, three rows, all columns, and five retained fields succeed; wrong/duplicate/missing/extra line, row, header, or field and whitespace/sign/exponent/nonfinite/precision/ratio/zero/overflow reject. `benchmark_evidence_parser_ratio_matrix`. |
 | Report/signature | Bidirectional report and merge-verification goldens plus every field/order/type/width/duplicate/escape/trailing/derived mutation; exact SSHSIG binary fields and signing preimage; armor header/footer/LF/base64 alphabet/wrap/padding; and wrong key/namespace/signature/profile/stale candidate/report/merge reject. `benchmark_evidence_report_v1_matrix`. |
-| Failure/cleanup | The benchmark-input owner first covers absent/relative/missing/non-directory/final-symlink (including repeated-separator and `/.` aliases)/root/repository/in-repository/nonempty work roots, foreign residue, and descriptor-relative clearing after error/signal without deleting caller entries or leaving a TERM-ignoring descendant. Script-level failure leaves at most its exact empty owned child; the trusted outer controller removes it only after container/process teardown. The evidence owner crosses each phase with error, timeout, signal, disk-full, file/directory/parent/reservation fsync, unlock, rename, reservation removal, ordinary removal, and signing failure. No accepted path remains; children, containers, mounts, fds, locks, staging, private dirs, output, and publication reservation are gone, or a surviving fail-closed reservation prevents acceptance and all later work. `benchmark_input_workdir_matrix`; `benchmark_evidence_cleanup_matrix`. |
+| Failure/cleanup | The benchmark-input owner first covers absent/relative/missing/non-directory/final-symlink (including repeated-separator and `/.` aliases)/root/repository/in-repository/nonempty work roots, foreign residue, and descriptor-relative file/symlink clearing after error/signal without deleting directory entries, caller entries, or leaving a TERM-ignoring descendant. Script-level failure leaves at most its directory-only owned tree; the trusted outer controller removes it only after container/process teardown. The evidence owner crosses each phase with error, timeout, signal, disk-full, file/directory/parent/reservation fsync, unlock, rename, reservation removal, ordinary removal, and signing failure. No accepted path remains; children, containers, mounts, fds, locks, staging, private dirs, output, and publication reservation are gone, or a surviving fail-closed reservation prevents acceptance and all later work. `benchmark_input_workdir_matrix`; `benchmark_evidence_cleanup_matrix`. |
 | Concurrent runs | Second run fails before Git/image/container work while either the lock or publication reservation exists. Lock releases only after measurement cleanup and durable reservation creation; accepted publication removes and fsyncs the reservation. Crash/restart and administrator-recovery fixtures prove fail-closed behavior. `benchmark_evidence_exclusive_run`. |
 | TOCTOU swap | The preparation root is retained before untrusted work and every accepted Linux write stays below its descriptor. Its manifest digest crosses the prepare/native phase boundary in trusted controller state; the root descriptor crosses the shell/launcher boundary; manifest traversal stays below it; and executable/runtime bytes are copied to fully write-sealed anonymous descriptors before exec/preload. Cleanup recursively mutates only the retained tree. Opened image/source identities are used or revalidated at their privilege boundary; root rename/replacement, same-inode artifact writes, daemon-image, and source swaps cannot substitute inspected bytes. `benchmark_input_workdir_matrix`; `benchmark_evidence_bound_object_swap_matrix`. |
 | Forged/stale evidence | Unsigned, edited, replayed profile/target/review/candidate, truncated, concatenated, and valid-signature/wrong-namespace reports reject. PR/preflight/trusted-review mismatch blocks; `CLEAN` maps only to `clean`, and accepted `FINDINGS` with a nonempty repair chain maps only to `fixed`. `benchmark_evidence_stale_forged_matrix`. |
@@ -673,15 +675,18 @@ measurement remain named manual evidence.
 |---|---|
 | P1 a self-consistent tree could replace prepared state between phases | Prepare prints its canonical manifest SHA-256. The trusted controller retains that value outside candidate-writable state, every native invocation requires it, and descriptor-relative verification rejects a different current manifest before opening executable/runtime artifacts. |
 | P1 an untrusted prepare child could redirect later path writes | The script retains the private-child descriptor before the first build. Every accepted Linux preparation path uses that descriptor's `/proc` handle, and publication requires the public path to retain the same device/inode. Native ARM macOS remains development qualification only. |
-| P2 cleanup could recursively delete a replacement after a check/path race | Recursive cleanup walks and unlinks only through the retained private-child descriptor. It never removes the public path while candidate-side concurrency is possible; script-level failure leaves its exact empty owned child for trusted outer cleanup after teardown. |
+| P2 cleanup could recursively delete a replacement after a check/path race | Recursive cleanup walks only through the retained private-child descriptor, unlinks non-directory entries, and leaves all directory entries in place while candidate-side concurrency is possible. Script-level failure leaves its directory-only owned tree for trusted outer cleanup after teardown. |
 
 ## Final-candidate review closure
 
 | Finding | Ledger-first closure |
 |---|---|
 | P1 the Linux proc-fd root was incompatible with path-based manifest creation | The manifest module now builds, creates, fsyncs, and verifies a canonical manifest directly below an already-opened root descriptor. Preparation calls only that descriptor API. |
-| P1 intermediate symlinks could redirect trusted post-build copies | Preparation retains both root and `artifacts` descriptors before untrusted work. A dedicated helper opens every source component no-follow, creates each destination relative to the retained artifacts descriptor, checks source stability, prunes descriptor-relatively, and verifies the public `artifacts` entry still names the retained object before manifest creation. |
-| P2 check-then-`rmdir` could remove an empty replacement | Script cleanup no longer removes the public child. It clears only the retained descriptor and leaves the exact empty owned child for the outer controller after candidate teardown. |
+| P1 intermediate symlinks could redirect trusted post-build copies | Preparation retains both root and `artifacts` descriptors before untrusted work. A dedicated helper opens every source component no-follow, creates each destination relative to the retained artifacts descriptor, checks source stability, clears build-tree non-directory entries descriptor-relatively, and verifies the public `artifacts` entry still names the retained object before manifest creation. |
+| P2 check-then-`rmdir` could remove an empty replacement | Script cleanup never calls `rmdir`. It unlinks only non-directory entries below retained descriptors, includes empty build-directory skeletons in the success manifest, and leaves the directory-only tree for the outer controller after candidate teardown. |
+| P1 direct execution inherited ambient loader/timing state | The launcher constructs only the ledger's fixed five-variable environment, then adds the platform-owned sealed-runtime loader binding. The owner injects an ambient sentinel and makes the harness assert every fixed value and the sentinel's absence. |
+| P2 nested cleanup repeated the directory-entry race | Candidate-side preparation and cleanup never remove any directory entry. Both success and failure owners require the retained directory skeleton, and only the outer controller removes it after teardown. |
+| P2 the top-level benchmark workflow still described one-phase execution | `bench/README.md` now shows prepare-time digest capture followed by direct native execution and assigns final work-tree removal to the caller after process/environment teardown. |
 
 ## Author consistency pass
 

@@ -35,10 +35,17 @@ The later exact-base review of `d81466f5` against `6adfa13d` found that path-bas
 could not consume the Linux proc-fd root, intermediate symlinks could still redirect trusted copies,
 and even non-recursive public-path removal retained a check/rmdir race. The final repair uses one
 descriptor-relative prepared-tree helper for copy/config/prune/manifest/cleanup, retains the
-`artifacts` descriptor before untrusted work, and leaves the exact empty owned child for trusted
+`artifacts` descriptor before untrusted work, and leaves a directory-only owned tree for trusted
 outer cleanup after candidate teardown instead of removing its public path in-script.
 
-Latest durable verification after the final-candidate repair passed the serial owner aggregate:
+The exact-base review of `3052c9ab` against `5a6ae64b` found three valid final integration gaps:
+direct execution inherited ambient loader/timing state, nested cleanup repeated the directory-entry
+race, and the top-level benchmark workflow still described one-phase execution. The consolidated
+repair constructs the ledger's fixed execution environment, never removes a directory entry before
+candidate teardown, verifies directory-only failure residue, and documents digest-bound two-phase
+native use in `bench/README.md`.
+
+Latest durable verification after the exact-base review repair passed the serial owner aggregate:
 `scripts/test-benchmark-evidence-manifest.sh`, `scripts/test-benchmark-evidence-bootstrap.sh`,
 `scripts/test-benchmark-evidence-cli.sh`, `scripts/test-benchmark-evidence-git-objects.sh`,
 `scripts/test-benchmark-evidence-git-batch.sh`, `scripts/test-benchmark-input.sh`, and
@@ -46,7 +53,8 @@ Latest durable verification after the final-candidate repair passed the serial o
 `CARGO_BUILD_JOBS=1`: each of
 `bench/json_decode/run.sh prepare native` plus `run.sh native` and
 `bench/json_soa/run.sh prepare native` plus `run.sh native` completed serially from an empty external
-work directory, with the prepare-time digest supplied to direct execution. These are
+work directory, with the prepare-time digest supplied to direct execution and an injected ambient
+sentinel excluded by the fixed launcher environment. These are
 correctness/boundary owners, not accepted x86_64 performance evidence. At this PR's merge, no work
 is active by user request. The next eligible capability is the installed controller/verifier/monitor
 with revision binding and protected-input matching, followed by profile/image/adversarial owners;
