@@ -54,6 +54,12 @@ def _oid(oid: object) -> str:
     return oid
 
 
+def validate_oid(oid: object) -> str:
+    """Validate and return one lowercase SHA-1 object ID."""
+
+    return _oid(oid)
+
+
 def _payload(payload: object) -> bytes:
     if not isinstance(payload, bytes):
         raise GitObjectError("object payload must be bytes")
