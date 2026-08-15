@@ -251,7 +251,8 @@ if [[ "$marker_count" -eq 0 ]]; then
   elif grep -Fqx 'No findings.' "$native_result" ||
     grep -Fqx 'Read-only inspection found no actionable soundness or regression risks in the diff.' "$native_result" ||
     grep -Eq '^No actionable soundness or regression (issues|risks) were found in the inspected diff\.$' "$native_result" ||
-    grep -Fqx 'No actionable issues were found in the changed files.' "$native_result"
+    grep -Fqx 'No actionable issues were found in the changed files.' "$native_result" ||
+    grep -Eq '^[A-Z][^[:cntrl:]]* without introducing an actionable (soundness or regression )?(risk|risks|issue|issues|regression)\.$' "$native_result"
   then
     printf 'ALIGN_REVIEW_VERDICT=CLEAN\n' | tee -a "$output"
   else
