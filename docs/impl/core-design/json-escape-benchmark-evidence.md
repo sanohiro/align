@@ -621,6 +621,13 @@ It may not weaken the base rule.
 
 ## Implementation closure matrix
 
+The first adversarial-owner implementation deliberately groups the process boundary, exact schedule,
+cleanup/publication ordering, and exclusive-run reservation into one capability even though its
+hand-written implementation is just above 1,000 lines including deterministic owners. These four
+edges form one dormant producer-to-consumer chain; splitting them would duplicate failure-order
+fixtures and leave the controller consuming an unreviewed boundary. The slice does not include the
+controller, verifier, or merge-race behavior.
+
 | Cell | Owner and exact regression |
 |---|---|
 | Trusted bootstrap and CLI | Root-owned installed producer/verifier/merge-verifier/monitor bytes must match their manifest and verified baseline blobs. Candidate/PATH/PYTHONPATH/current-directory substitution, installed-file replacement, missing/extra/repeated options, relative paths, malformed/same OIDs, existing output, untrusted repository, and ambient selectors reject before mutation. Trusted CI supplies expected baseline/candidate/PR body and a canonical review attestation created from fixture-owned GitHub API responses; wrong repository/PR/reviewer role/review ID/commit/state/body digest, author review, dismissal, staleness, duplication, and API/file substitution reject before candidate-controlled content is read. `benchmark_evidence_bootstrap_cli_matrix`. |
