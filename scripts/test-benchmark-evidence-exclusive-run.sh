@@ -75,6 +75,17 @@ with tempfile.TemporaryDirectory(prefix="align-exclusive-owner-") as name:
         lambda: exclusive_run.ExclusiveRun("/", str(reservation)),
         "absolute non-root",
     )
+    path_invalid = exclusive_run.ExclusiveRun(str(lock), str(reservation))
+    path_invalid.acquire()
+    expect_error(
+        lambda: path_invalid.create_reservation(run_id, str(root / "résumé")),
+        "invalid path",
+    )
+    expect_error(
+        lambda: path_invalid.create_reservation(run_id, str(root / "line\nbreak")),
+        "invalid path",
+    )
+    path_invalid.abort(remove_reservation=True)
 
 print("exclusive-run checks passed")
 PY

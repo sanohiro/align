@@ -85,6 +85,8 @@ failed_live_result = failed_live.abort(cleanup_succeeded=False)
 assert not failed_live_result.accepted
 assert failed_live_result.fail_closed
 assert failed_live_result.staging_present is False
+assert failed_live_result.reservation_present
+assert not failed_live.snapshot().host_lock_held_for_signing
 
 print("cleanup checks passed")
 PY

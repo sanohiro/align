@@ -13,12 +13,13 @@ class ExclusiveRunError(RuntimeError):
 
 
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
+_SERIALIZED_PATH = re.compile(r"/[A-Za-z0-9._/:+=@-]+\Z")
 
 
 def _path(value: object, label: str) -> str:
     if not isinstance(value, str) or not os.path.isabs(value) or value == "/":
         raise ExclusiveRunError(f"{label} must be an absolute non-root path")
-    if "\x00" in value or value.endswith("/"):
+    if _SERIALIZED_PATH.fullmatch(value) is None or value.endswith("/"):
         raise ExclusiveRunError(f"{label} contains an invalid path")
     if any(part in ("", ".", "..") for part in value.split("/")[1:]):
         raise ExclusiveRunError(f"{label} contains a path alias")

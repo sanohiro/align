@@ -137,7 +137,7 @@ class CleanupTransaction:
         return self.result()
 
     def abort(self, *, cleanup_succeeded: bool, reservation_remove_succeeded: bool = True) -> CleanupResult:
-        """Suppress publication; a failed cleanup stays fail-closed."""
+        """Suppress publication; a failed cleanup installs a durable reservation."""
 
         self._require_live()
         if cleanup_succeeded and any(self._resources[kind] for kind in _RESOURCE_KINDS):
@@ -148,6 +148,16 @@ class CleanupTransaction:
             self._output = False
             if self._reservation and reservation_remove_succeeded:
                 self._reservation = False
+            self._lock_held = False
+            self._unlocked = True
+        else:
+            # The in-memory flock cannot protect a later run after this
+            # controller exits.  Model the durable fail-closed reservation
+            # before releasing that lock, even when owned resources remain.
+            if not self._reservation:
+                if not self._lock_held:
+                    raise CleanupError("failed cleanup has no lock for a durable reservation")
+                self._reservation = True
             self._lock_held = False
             self._unlocked = True
         self._failed = True

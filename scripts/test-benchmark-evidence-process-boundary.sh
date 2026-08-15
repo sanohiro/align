@@ -36,6 +36,24 @@ assert tuple(environment.as_dict()) == (
 assert environment.as_dict()["HOME"] == "/nonexistent"
 assert environment.sha256() == hashlib.sha256(environment.as_bytes()).hexdigest()
 boundary.validate_environment(environment.as_dict(), environment)
+native_environment = boundary.fixed_environment(phase="native", manifest_sha256="a" * 64)
+assert tuple(native_environment.as_dict()) == tuple(environment.as_dict()) + (
+    "ALIGN_BENCH_ARTIFACT_MANIFEST_SHA256",
+)
+assert native_environment.as_dict()["ALIGN_BENCH_ARTIFACT_MANIFEST_SHA256"] == "a" * 64
+boundary.validate_environment(native_environment.as_dict(), native_environment)
+expect_error(
+    lambda: boundary.fixed_environment(phase="native"),
+    "requires a lowercase artifact manifest digest",
+)
+expect_error(
+    lambda: boundary.fixed_environment(manifest_sha256="a" * 64),
+    "cannot receive an artifact manifest digest",
+)
+expect_error(
+    lambda: boundary.validate_environment(environment.as_dict(), native_environment),
+    "fixed environment",
+)
 expect_error(
     lambda: boundary.validate_environment(
         {**environment.as_dict(), "HTTP_PROXY": "injected"}, environment
@@ -58,13 +76,29 @@ expect_error(lambda: boundary.validate_argv(()), "non-empty")
 expect_error(lambda: boundary.validate_argv(("run\x00",)), "NUL-free")
 expect_error(lambda: boundary.validate_argv(("run\n",)), "printable ASCII")
 
-boundary.DescriptorMap(0, 1, 2).validate()
-boundary.validate_fd_inventory((2, 0, 1))
+boundary.DescriptorMap(
+    0,
+    1,
+    2,
+    fd_cloexec=((0, False), (1, False), (2, False), (3, True)),
+).validate()
+boundary.validate_fd_inventory(((2, False), (0, False), (1, False), (3, True)))
 expect_error(
     lambda: boundary.DescriptorMap(0, 1, 2, (3,)).validate(),
     "unexpected descriptors",
 )
-expect_error(lambda: boundary.validate_fd_inventory((0, 1, 3)), "exactly")
+expect_error(
+    lambda: boundary.validate_fd_inventory(((0, False), (1, True), (2, False))),
+    "must not have FD_CLOEXEC",
+)
+expect_error(
+    lambda: boundary.validate_fd_inventory(((0, False), (1, False), (2, False), (3, False))),
+    "must have FD_CLOEXEC",
+)
+expect_error(
+    lambda: boundary.validate_fd_inventory(((0, False), (1, False), (3, True))),
+    "include 0, 1, and 2",
+)
 
 capture = boundary.BoundedCapture(limit=8, tail_limit=4)
 capture.feed(b"abc")

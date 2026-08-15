@@ -33,6 +33,8 @@ _ENV_ORDER = (
     "TMPDIR",
     "ALIGN_BENCH_WORK_DIR",
 )
+_NATIVE_ENV_ORDER = _ENV_ORDER + ("ALIGN_BENCH_ARTIFACT_MANIFEST_SHA256",)
+_ENV_ORDERS = {"prepare": _ENV_ORDER, "native": _NATIVE_ENV_ORDER}
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 _ABS_GUEST_PATH = re.compile(r"/(?!/)[A-Za-z0-9._/-]+\Z")
 
@@ -64,9 +66,12 @@ class FixedEnvironment:
     """The complete environment passed to one evidence child."""
 
     values: tuple[tuple[str, str], ...]
+    phase: str = "prepare"
 
     def __post_init__(self) -> None:
-        if tuple(key for key, _ in self.values) != _ENV_ORDER:
+        if not isinstance(self.phase, str) or self.phase not in _ENV_ORDERS:
+            raise ProcessBoundaryError("child environment phase is not fixed")
+        if tuple(key for key, _ in self.values) != _ENV_ORDERS[self.phase]:
             raise ProcessBoundaryError("child environment has the wrong fixed key order")
         for key, value in self.values:
             if (
@@ -91,13 +96,23 @@ class FixedEnvironment:
 
 def fixed_environment(
     *,
+    phase: str = "prepare",
+    manifest_sha256: str | None = None,
     home: str = "/nonexistent",
     cargo_home: str = "/cargo",
     target: str = "/target",
     tmpdir: str = "/tmp",
     work: str = "/work",
 ) -> FixedEnvironment:
-    """Build the only environment accepted by a measurement child."""
+    """Build the only environment accepted by a prepare or native child."""
+
+    if not isinstance(phase, str) or phase not in _ENV_ORDERS:
+        raise ProcessBoundaryError("child environment phase is not fixed")
+    if phase == "native":
+        if not isinstance(manifest_sha256, str) or _HEX64.fullmatch(manifest_sha256) is None:
+            raise ProcessBoundaryError("native child requires a lowercase artifact manifest digest")
+    elif manifest_sha256 is not None:
+        raise ProcessBoundaryError("prepare child cannot receive an artifact manifest digest")
 
     for label, value in (
         ("HOME", home),
@@ -126,12 +141,16 @@ def fixed_environment(
         ("TMPDIR", tmpdir),
         ("ALIGN_BENCH_WORK_DIR", work),
     )
-    return FixedEnvironment(values)
+    if phase == "native":
+        values += (("ALIGN_BENCH_ARTIFACT_MANIFEST_SHA256", manifest_sha256),)
+    return FixedEnvironment(values, phase=phase)
 
 
 def validate_environment(value: Mapping[str, str], expected: FixedEnvironment) -> None:
     """Reject ambient additions, deletions, and value substitutions."""
 
+    if not isinstance(expected, FixedEnvironment):
+        raise ProcessBoundaryError("expected environment is invalid")
     if not isinstance(value, Mapping) or dict(value) != expected.as_dict():
         raise ProcessBoundaryError("child environment is not the fixed environment")
 
@@ -144,6 +163,7 @@ class DescriptorMap:
     stdout: int
     stderr: int
     inherited: tuple[int, ...] = ()
+    fd_cloexec: Mapping[int, bool] | Sequence[tuple[int, bool]] | None = None
 
     def validate(self) -> None:
         if any(type(fd) is not int for fd in (self.stdin, self.stdout, self.stderr)):
@@ -154,15 +174,39 @@ class DescriptorMap:
             raise ProcessBoundaryError("inherited descriptors must be non-negative integers")
         if self.inherited:
             raise ProcessBoundaryError("child inherited unexpected descriptors")
+        validate_fd_inventory(self.fd_cloexec)
 
 
-def validate_fd_inventory(fds: Sequence[int]) -> None:
-    """Validate an entrypoint's complete post-duplication fd inventory."""
+def validate_fd_inventory(
+    fds: Mapping[int, bool] | Sequence[tuple[int, bool]] | None,
+) -> None:
+    """Validate all pre-exec descriptors and their FD_CLOEXEC state."""
 
-    if any(type(fd) is not int for fd in fds):
-        raise ProcessBoundaryError("child descriptor inventory must contain integers")
-    if tuple(sorted(fds)) != (0, 1, 2) or len(set(fds)) != 3:
-        raise ProcessBoundaryError("child descriptor inventory must be exactly 0, 1, and 2")
+    if fds is None:
+        raise ProcessBoundaryError("child descriptor inventory requires CLOEXEC state")
+    if isinstance(fds, Mapping):
+        items = tuple(fds.items())
+    elif isinstance(fds, (tuple, list)):
+        items = tuple(fds)
+    else:
+        raise ProcessBoundaryError("child descriptor inventory must be fd/CLOEXEC pairs")
+    normalized: list[tuple[int, bool]] = []
+    for item in items:
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            raise ProcessBoundaryError("child descriptor inventory must be fd/CLOEXEC pairs")
+        fd, cloexec = item
+        if type(fd) is not int or fd < 0 or type(cloexec) is not bool:
+            raise ProcessBoundaryError("child descriptor inventory has an invalid fd or CLOEXEC flag")
+        normalized.append((fd, cloexec))
+    if len({fd for fd, _ in normalized}) != len(normalized):
+        raise ProcessBoundaryError("child descriptor inventory repeats an fd")
+    flags = dict(normalized)
+    if not {0, 1, 2}.issubset(flags):
+        raise ProcessBoundaryError("child descriptor inventory must include 0, 1, and 2")
+    if any(flags[fd] for fd in (0, 1, 2)):
+        raise ProcessBoundaryError("standard descriptors must not have FD_CLOEXEC")
+    if any(not cloexec for fd, cloexec in normalized if fd not in (0, 1, 2)):
+        raise ProcessBoundaryError("controller descriptors must have FD_CLOEXEC")
 
 
 @dataclass(frozen=True)
