@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import os
 import signal
-import stat
 import subprocess
+from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import Iterator
 
 
 class GitProcessError(RuntimeError):
@@ -46,47 +47,148 @@ _FIXED_ENV_KEYS = (
     "TZ",
 )
 _STOP_TIMEOUT_SECONDS = 1.0
+_FD_PATH_ROOT = "/dev/fd"
+try:
+    _DIRECTORY_FLAGS = (
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    )
+except AttributeError as exc:  # pragma: no cover - unsupported non-POSIX host
+    raise RuntimeError("pinned Git requires no-follow directory open flags") from exc
 
 
-@dataclass(frozen=True)
+@dataclass
 class GitProcessSpec:
-    """The complete immutable argv/environment contract for one Git child."""
+    """The argv/environment contract and owned repository directory FD."""
 
     repository: str
     home: str
     argv: tuple[str, ...]
     environment: tuple[tuple[str, str], ...]
+    repository_fd: int | None
 
     def env(self) -> dict[str, str]:
         """Return a fresh environment mapping for ``subprocess.Popen``."""
 
         return dict(self.environment)
 
+    def close(self) -> None:
+        """Close the repository FD exactly once."""
 
-def _directory(path: object, label: str, *, require_empty: bool) -> str:
+        if self.repository_fd is None:
+            return
+        fd = self.repository_fd
+        self.repository_fd = None
+        try:
+            os.close(fd)
+        except OSError as exc:
+            raise GitProcessError("failed to close the repository directory") from exc
+
+
+def _components(path: object, label: str) -> tuple[str, ...]:
     if not isinstance(path, str) or not path or "\x00" in path or not os.path.isabs(path):
         raise GitProcessError(f"{label} must be an absolute path without NUL")
+    parts = tuple(path.split("/")[1:])
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        raise GitProcessError(f"{label} must use canonical absolute path components")
+    return parts
+
+
+def _open_directory(path: object, label: str) -> int:
+    """Open every absolute path component with no-follow directory semantics."""
+
+    parts = _components(path, label)
+    fd: int | None = None
     try:
-        metadata = os.lstat(path)
+        fd = os.open("/", _DIRECTORY_FLAGS)
+        for part in parts:
+            next_fd = os.open(part, _DIRECTORY_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        return fd
     except OSError as exc:
-        raise GitProcessError(f"{label} is not an existing directory") from exc
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-        raise GitProcessError(f"{label} must be a non-symlink directory")
-    if require_empty:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise GitProcessError(f"{label} must be an existing non-symlink directory") from exc
+
+
+def _open_empty_directory(path: object, label: str) -> int:
+    fd = _open_directory(path, label)
+    try:
+        if os.listdir(fd):
+            raise GitProcessError(f"{label} must be empty")
+        return fd
+    except BaseException:
         try:
-            with os.scandir(path) as entries:
-                if next(entries, None) is not None:
-                    raise GitProcessError(f"{label} must be empty")
-        except OSError as exc:
-            raise GitProcessError(f"{label} cannot be inspected") from exc
-    return path
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
+@contextmanager
+def _defer_spawn_signals() -> Iterator[list[tuple[int, object]]]:
+    """Record process signals while Popen establishes child ownership."""
+
+    signals = tuple(
+        signum
+        for signum in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGHUP", None))
+        if signum is not None
+    )
+    previous: dict[int, object] = {}
+    deferred: list[tuple[int, object]] = []
+
+    def defer(signum, _frame):
+        deferred.append((signum, previous[signum]))
+
+    installed: list[int] = []
+    try:
+        for signum in signals:
+            previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, defer)
+            installed.append(signum)
+    except ValueError:
+        for signum in reversed(installed):
+            signal.signal(signum, previous[signum])
+        yield deferred
+        return
+
+    try:
+        yield deferred
+    finally:
+        for signum in reversed(installed):
+            signal.signal(signum, previous[signum])
+
+
+def _deliver_deferred(deferred: list[tuple[int, object]]) -> None:
+    for signum, handler in deferred:
+        if handler == signal.SIG_IGN:
+            continue
+        if callable(handler):
+            handler(signum, None)
+        else:
+            os.kill(os.getpid(), signum)
 
 
 def build_spec(repository: object, home: object) -> GitProcessSpec:
     """Build the fixed Git invocation without consulting ambient state."""
 
-    repository = _directory(repository, "repository", require_empty=False)
-    home = _directory(home, "home", require_empty=True)
+    _components(repository, "repository")
+    _components(home, "home")
+    repository_fd = _open_directory(repository, "repository")
+    try:
+        if not os.path.isdir(_FD_PATH_ROOT):
+            raise GitProcessError("the descriptor-relative cwd path is unavailable")
+        home_fd = _open_empty_directory(home, "home")
+        os.close(home_fd)
+    except BaseException:
+        try:
+            os.close(repository_fd)
+        except OSError:
+            pass
+        raise
     argv = [
         GIT_PATH,
         "--no-pager",
@@ -96,7 +198,7 @@ def build_spec(repository: object, home: object) -> GitProcessSpec:
     ]
     for config in _CONFIG:
         argv.extend(("-c", config))
-    argv.extend(("-C", repository, "cat-file", "--batch"))
+    argv.extend(("cat-file", "--batch"))
     environment = {
         "CARGO_NET_OFFLINE": "true",
         "GIT_ATTR_NOSYSTEM": "1",
@@ -120,6 +222,7 @@ def build_spec(repository: object, home: object) -> GitProcessSpec:
         home=home,
         argv=tuple(argv),
         environment=tuple(sorted(environment.items())),
+        repository_fd=repository_fd,
     )
 
 
@@ -146,22 +249,38 @@ class PinnedGitProcess:
             raise GitProcessError("Git process is already closed")
         if self._process is not None:
             raise GitProcessError("Git process has already started")
-        try:
-            self._process = subprocess.Popen(
-                self.spec.argv,
-                cwd=self.spec.repository,
-                env=self.spec.env(),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                close_fds=True,
-                start_new_session=True,
-                text=False,
-                shell=False,
-                bufsize=0,
-            )
-        except OSError as exc:
-            raise GitProcessError("failed to start pinned Git") from exc
+        repository_fd = self.spec.repository_fd
+        if repository_fd is None:
+            raise GitProcessError("repository directory is already closed")
+        process = None
+        with _defer_spawn_signals() as deferred:
+            try:
+                process = subprocess.Popen(
+                    self.spec.argv,
+                    cwd=f"{_FD_PATH_ROOT}/{repository_fd}",
+                    env=self.spec.env(),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    close_fds=True,
+                    pass_fds=(repository_fd,),
+                    start_new_session=True,
+                    text=False,
+                    shell=False,
+                    bufsize=0,
+                )
+                self._process = process
+                self.spec.close()
+            except BaseException:
+                if process is not None:
+                    self._process = process
+                    self.close()
+                else:
+                    self.spec.close()
+                raise
+        if deferred:
+            self.close()
+            _deliver_deferred(deferred)
         return self
 
     def close(self) -> None:
@@ -171,25 +290,28 @@ class PinnedGitProcess:
             return
         self._closed = True
         process = self._process
-        if process is None:
-            return
         try:
-            process.communicate(timeout=_STOP_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except OSError:
-                pass
+            if process is None:
+                return
             try:
                 process.communicate(timeout=_STOP_TIMEOUT_SECONDS)
             except subprocess.TimeoutExpired:
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    os.killpg(process.pid, signal.SIGTERM)
                 except OSError:
                     pass
-                process.communicate()
-        if process.returncode != 0:
-            raise GitProcessError(f"pinned Git exited with status {process.returncode}")
+                try:
+                    process.communicate(timeout=_STOP_TIMEOUT_SECONDS)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                    process.communicate()
+            if process.returncode != 0:
+                raise GitProcessError(f"pinned Git exited with status {process.returncode}")
+        finally:
+            self.spec.close()
 
     def __enter__(self) -> "PinnedGitProcess":
         return self.start()
