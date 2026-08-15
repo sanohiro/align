@@ -158,7 +158,8 @@ symlink不可。physical pathは`/`、repository root、repository内を不可�
 各scriptは`umask 077`でexact one private childを作り、root/detached Cargo target、`TMPDIR`、kernel object、
 全generated artifactをchild内へ限定する。success/error/signal/interruptでowned childだけをremove。
 relative/missing/non-directory/final-symlink/root/repository/in-repository/initially-nonempty/cleanup-failure/
-foreign-residueはforeign entryを削除せずrejectし、success cleanup後もcaller-owned empty directoryは残す。
+foreign-residueはforeign entryを削除せずrejectする。全compiler invocationは`ALIGNC_CACHE=off`を使い、
+ambient default cacheへのescapeを許さない。success cleanup後もcaller-owned empty directoryは残す。
 
 baseline選択前に両protected scriptをclosed two-phase interfaceにする。`run.sh prepare native`が
 root/detached Cargo buildと`alignc emit-obj`を行い、compiler/runtime/benchmark executable/kernel object/

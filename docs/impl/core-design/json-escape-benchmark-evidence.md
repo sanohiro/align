@@ -204,7 +204,8 @@ that directory, binds root and detached Cargo targets, `TMPDIR`, the kernel obje
 generated artifact below that child, and removes only that owned child on success, error, signal, or
 interrupt. Relative, missing, non-directory, final-symlink, root, repository, in-repository,
 initially nonempty, cleanup-failure, and foreign-residue cases reject without deleting the foreign
-entry. The caller-owned empty directory remains after successful cleanup.
+entry. Every compiler invocation uses `ALIGNC_CACHE=off`; no ambient default cache may escape the
+private child. The caller-owned empty directory remains after successful cleanup.
 
 Commands are argv arrays without shell interpolation. Before baseline selection, the evidence
 implementation gives each protected script a closed two-phase interface. `run.sh prepare native`

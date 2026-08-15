@@ -59,8 +59,9 @@ every parser change and watch the ratios; when a result disappoints, autopsy —
 
 ## Profile finding (2026-06-29, native, 1M rows)
 
-`ALIGN_BENCH_PROFILE=1 bench/json_decode/run.sh native` adds decode-only entry points that return the
-row count after `json.decode`. Measured:
+`ALIGN_BENCH_WORK_DIR="$work_dir" ALIGN_BENCH_PROFILE=1 bench/json_decode/run.sh native`, using the
+empty absolute `work_dir` created above, adds decode-only entry points that return the row count after
+`json.decode`. Measured:
 
 ```
 full decode-only   91.376 ms; aggregate delta    0.684 ms

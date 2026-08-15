@@ -15,11 +15,14 @@ PostgreSQL integration passed. The authoritative contract is
 Active work is the first implementation capability on `agent/json-benchmark-inputs`: both detached
 Cargo locks are checked in, all six current Cargo invocations are explicitly locked/offline, and a
 shared helper confines root/detached targets, temporary files, and kernel objects to one validated
-private work child outside the repository. `scripts/test-json-benchmark-inputs.sh` passes its
-nominal, invalid-root, foreign-residue, child-error, and signal-cleanup matrix; both detached
-`cargo metadata --locked --offline` checks also pass. Next: complete the author diff audit, commit,
-run one comprehensive review and repair its valid findings, then run exact-head publication
-preflight and merge the capability before starting the evidence controller.
+private work child outside the repository. Comprehensive host review of `f3c42d19` found five valid
+issues: one GNU-only test command, incomplete process-group cleanup, a post-`mktemp` trap window,
+trailing-slash symlink aliases, and stale benchmark examples. The consolidated repair replaces the
+test command with Bash globbing, gives each child a private process group with bounded TERM/KILL and
+reap, installs cleanup before allocation, normalizes trailing separators and `/.`, and updates every
+affected example. The same output-confinement audit now forces `ALIGNC_CACHE=off` for both compiler
+invocations. Next: commit the repair, run exact-head publication preflight, publish the review
+envelope and finding dispositions, and merge before starting the evidence controller.
 
 Author diff audit found that both benchmarks now call the repository Cargo/loader wrapper. The
 implementation branch therefore adds `scripts/cargo.sh` and `scripts/dyld-env.sh` to the English and
@@ -33,7 +36,10 @@ the real compiler/runtime/harness path and left its caller work root empty. The 
 with `DYLD_SHARED_REGION=private`; `sample` confirmed the known host launch class, so the unchanged
 invocation was interrupted. Signal cleanup removed its private child and left only the empty
 caller-owned root, which was then removed. This is an incomplete host qualification, not a benchmark
-failure or an emulated result; the deterministic two-script owner remains green.
+failure or an emulated result. The post-review owner rerun again stopped before fixture logic in the
+same macOS `_dyld_start` launch class and was interrupted without residue. Exact-head `bash -n`,
+`git diff --check`, all trailing-separator symlink negatives, and a TERM-ignoring descendant-group
+cleanup probe pass; Linux publication checks must supply the complete exact-head owner result.
 
 The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit

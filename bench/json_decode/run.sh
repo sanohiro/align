@@ -3,7 +3,7 @@
 # tracker for the parser rewrite. The kernel pulls in the Align runtime (JSON parser / arena), so
 # the harness links the runtime cdylib.
 #
-#   bench/json_decode/run.sh [baseline|v3|native]   (default: native — both sides at the host's best CPU)
+#   ALIGN_BENCH_WORK_DIR=/absolute/empty/work bench/json_decode/run.sh [baseline|v3|native]
 set -euo pipefail
 script_dir="$(cd "$(dirname "$0")" && pwd -P)"
 repo_root="$(cd "$script_dir/../.." && pwd -P)"
@@ -37,7 +37,7 @@ RT_DIR="$ALIGN_BENCH_ROOT_TARGET_DIR/release"
 [ -f "$RT_DIR/libalign_runtime.so" ] || [ -f "$RT_DIR/libalign_runtime.dylib" ] || { echo "missing libalign_runtime dynamic library (.so/.dylib) in $RT_DIR" >&2; exit 1; }
 
 KOBJ="$ALIGN_BENCH_PRIVATE_DIR/kernel.o"
-benchmark_input_run "$ALIGNC" emit-obj "$script_dir/kernel.align" "$KOBJ" --target-cpu "$align_tgt" \
+benchmark_input_run env ALIGNC_CACHE=off "$ALIGNC" emit-obj "$script_dir/kernel.align" "$KOBJ" --target-cpu "$align_tgt" \
   --export decode_full --export decode_full_len --export decode_proj --export decode_proj_len
 
 echo "target: $mode"

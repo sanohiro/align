@@ -4,7 +4,16 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd -P)"
 fixture_root="$(mktemp -d)"
+script_pid=""
+descendant_pid=""
 cleanup() {
+  if [[ -n "$script_pid" ]]; then
+    kill -TERM "$script_pid" 2>/dev/null || true
+    wait "$script_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$descendant_pid" ]]; then
+    kill -KILL "$descendant_pid" 2>/dev/null || true
+  fi
   chmod -R u+w "$fixture_root" 2>/dev/null || true
   rm -rf -- "$fixture_root"
 }
@@ -98,6 +107,7 @@ if [[ "$args" == *" --bin alignc "* ]]; then
 #!/usr/bin/env bash
 set -euo pipefail
 [[ "${1:-}" == emit-obj && $# -ge 3 ]] || exit 90
+[[ "${ALIGNC_CACHE:-}" == off ]] || exit 94
 printf 'fixture object\n' >"$3"
 ALIGNC
   chmod +x "$CARGO_TARGET_DIR/release/alignc"
@@ -107,7 +117,12 @@ elif [[ "$args" == *" -p align_runtime "* ]]; then
   fi
   if [[ "${FAKE_CARGO_BLOCK_ON:-}" == runtime ]]; then
     : >"$FAKE_BLOCK_MARKER"
-    trap 'exit 143' TERM INT
+    trap '' TERM INT
+    (
+      trap '' TERM INT
+      while :; do sleep 1; done
+    ) &
+    printf '%s\n' "$!" >"$FAKE_DESCENDANT_MARKER"
     while :; do sleep 1; done
   fi
   : >"$CARGO_TARGET_DIR/release/libalign_runtime.dylib"
@@ -172,7 +187,10 @@ after_status="$(git -C "$repo_root" status --porcelain --untracked-files=all)"
 [[ "$after_status" == "$before_status" ]] || fail "a nominal run changed the repository"
 [[ "$(wc -l <"$cargo_log" | tr -d ' ')" == 6 ]] || fail "the two scripts did not make exactly six Cargo invocations"
 [[ -f "$fake_cargo_home/.sentinel" ]] || fail "the read-only Cargo home was changed"
-[[ "$(find "$fake_cargo_home" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" == 1 ]] ||
+shopt -s nullglob dotglob
+cargo_home_entries=("$fake_cargo_home"/*)
+shopt -u nullglob dotglob
+[[ ${#cargo_home_entries[@]} == 1 && "${cargo_home_entries[0]}" == "$fake_cargo_home/.sentinel" ]] ||
   fail "the benchmark wrote into the read-only Cargo home"
 
 probe="$repo_root/bench/json_decode/run.sh"
@@ -189,6 +207,8 @@ symlink_target="$(new_work_root)"
 symlink_path="$fixture_root/work-link"
 ln -s "$symlink_target" "$symlink_path"
 expect_fail symlink "${fixture_env[@]}" ALIGN_BENCH_WORK_DIR="$symlink_path" "$probe" native
+expect_fail symlink_slashes "${fixture_env[@]}" ALIGN_BENCH_WORK_DIR="$symlink_path//" "$probe" native
+expect_fail symlink_dot "${fixture_env[@]}" ALIGN_BENCH_WORK_DIR="$symlink_path/." "$probe" native
 expect_fail root "${fixture_env[@]}" ALIGN_BENCH_WORK_DIR=/ "$probe" native
 expect_fail repository "${fixture_env[@]}" ALIGN_BENCH_WORK_DIR="$repo_root" "$probe" native
 expect_fail in_repository "${fixture_env[@]}" ALIGN_BENCH_WORK_DIR="$repo_root/bench" "$probe" native
@@ -209,7 +229,9 @@ expect_fail foreign_residue "${fixture_env[@]}" FAKE_FOREIGN_RESIDUE=1 \
 
 signal_root="$(new_work_root)"
 block_marker="$fixture_root/block-marker"
+descendant_marker="$fixture_root/descendant-marker"
 "${fixture_env[@]}" FAKE_CARGO_BLOCK_ON=runtime FAKE_BLOCK_MARKER="$block_marker" \
+  FAKE_DESCENDANT_MARKER="$descendant_marker" \
   ALIGN_BENCH_WORK_DIR="$signal_root" "$probe" native >"$fixture_root/signal.out" 2>"$fixture_root/signal.err" &
 script_pid=$!
 for _ in $(seq 1 100); do
@@ -217,10 +239,21 @@ for _ in $(seq 1 100); do
   sleep 0.05
 done
 [[ -f "$block_marker" ]] || fail "signal fixture did not reach the blocking child"
+[[ -f "$descendant_marker" ]] || fail "signal fixture did not create a descendant"
+descendant_pid="$(cat "$descendant_marker")"
 kill -TERM "$script_pid"
 if wait "$script_pid"; then
   fail "signalled benchmark unexpectedly succeeded"
 fi
+script_pid=""
+for _ in $(seq 1 100); do
+  kill -0 "$descendant_pid" 2>/dev/null || break
+  sleep 0.05
+done
+if kill -0 "$descendant_pid" 2>/dev/null; then
+  fail "signalled benchmark left a child-process-group descendant"
+fi
+descendant_pid=""
 assert_empty "$signal_root"
 
 echo "json benchmark input matrix: PASS"
