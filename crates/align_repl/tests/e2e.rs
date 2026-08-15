@@ -130,18 +130,27 @@ fn saved_file_builds_with_the_real_alignc_binary() {
 
 #[test]
 fn saved_file_object_matches_the_real_alignc_binary() {
-    // O9 (`docs/impl/22-repl-plan.md` §12): the object the REPL emitted for a session is
-    // byte-identical to the object the SHIPPED `alignc` binary emits for the file `:save` wrote.
+    // The build-parity owner from `docs/impl/22-repl-plan.md` §12: the object the REPL emitted for
+    // a session is byte-identical to the object the SHIPPED `alignc` binary emits for the file
+    // `:save` actually wrote.
     //
-    // Distinct from `build::repl_object_matches_the_alignc_build_path`, which reproduces the
-    // driver calls in-process against a hardcoded source string. That proves the library path is
+    // Distinct from `build::repl_object_matches_the_alignc_build_path`, which reproduces the driver
+    // calls in-process against a hardcoded source string. That proves the library path is
     // deterministic; it cannot see a change to `render`/`save`, and it never crosses into the
-    // compiler users actually run. This one starts from the bytes `:save` really wrote and ends at
-    // the real binary, so S4 is pinned end to end.
+    // compiler users run.
     //
-    // The OBJECT, not the executable: a Mach-O image carries an `LC_UUID` and page hashes derived
-    // from link-time inputs, so two links of identical objects differ by construction. The object
-    // is what the codegen contract promises.
+    // Scope, stated rather than implied: this pins the OBJECT only. `alignc build` stages its
+    // objects in an `ArtifactStage` that `Drop` removes, so `emit-obj` is the only externally
+    // observable object the shipped binary produces — and it is a different call site from the one
+    // §4.1 mirrors (`build_per_unit` + `emit_object_cached` rather than `build_package` +
+    // `codegen_package_parallel`). The two agree because both bottom out in the same
+    // `emit_object_file(mir, obj, target, profile, &[], rt_lto)`. The link line, the
+    // capability-library union, and the atomic publish are covered by the neighbouring
+    // `saved_file_builds_with_the_real_alignc_binary`, which runs the linked program.
+    //
+    // The object rather than the executable, deliberately: a Mach-O image carries an `LC_UUID` and
+    // page hashes derived from link-time inputs, so two links of identical objects differ by
+    // construction.
     let stage = align_driver::ArtifactStage::temp("align-repl-object-parity")
         .unwrap_or_else(|error| panic!("create object-parity stage: {error}"));
     let source_path = stage.path().join("saved.align");
@@ -150,10 +159,18 @@ fn saved_file_object_matches_the_real_alignc_binary() {
         ..Config::default()
     })
     .unwrap_or_else(|error| panic!("start align-repl session: {error}"));
-    assert!(matches!(repl.submit("P { a: i64, b: i64 }"), Outcome::Applied { .. }));
-    assert!(matches!(repl.submit("fn total(p: P) -> i64 = p.a + p.b"), Outcome::Applied { .. }));
-    assert!(matches!(repl.submit("p := P{a: 2, b: 40}"), Outcome::Applied { .. }));
-    assert!(matches!(repl.submit("print(total(p))"), Outcome::Applied { .. }));
+    for entry in [
+        "P { a: i64, b: i64 }",
+        "fn total(p: P) -> i64 = p.a + p.b",
+        "p := P{a: 2, b: 40}",
+        "print(total(p))",
+    ] {
+        match repl.submit(entry) {
+            Outcome::Applied { .. } => {}
+            Outcome::CompileFailed { rendered, .. } => panic!("`{entry}` did not compile:\n{rendered}"),
+            other => panic!("`{entry}` was not applied: {other:?}"),
+        }
+    }
     repl.save(&source_path, false)
         .unwrap_or_else(|error| panic!("save session source: {error:?}"));
 
@@ -162,8 +179,9 @@ fn saved_file_object_matches_the_real_alignc_binary() {
     let cargo = workspace.join("scripts/cargo.sh");
     let emitted = Command::new(&cargo)
         .current_dir(stage.path())
+        // Only `CARGO_BUILD_JOBS` matters here: `alignc` resolves its own job count for build
+        // verbs only, and `emit-obj` rejects `-j` outright.
         .env("CARGO_BUILD_JOBS", "1")
-        .env("ALIGNC_JOBS", "1")
         .args([
             "run",
             "--manifest-path",
@@ -187,15 +205,50 @@ fn saved_file_object_matches_the_real_alignc_binary() {
         String::from_utf8_lossy(&emitted.stderr)
     );
 
+    // `object_path` hardcodes unit0 on the one-unit assumption; enforce it here rather than trust
+    // it, so a future multi-unit session cannot silently reduce this owner to a fraction.
+    let session_stage = repl
+        .object_path()
+        .parent()
+        .unwrap_or_else(|| panic!("the session object has a parent directory"))
+        .to_path_buf();
+    let units: Vec<std::path::PathBuf> = std::fs::read_dir(&session_stage)
+        .unwrap_or_else(|error| panic!("read the session stage: {error}"))
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.extension().is_some_and(|ext| ext == "o")
+                && path
+                    .file_stem()
+                    .is_some_and(|stem| stem.to_string_lossy().starts_with("unit"))
+        })
+        .collect();
+    assert_eq!(units.len(), 1, "a v1 session must be a one-unit package, found {units:?}");
+
     let repl_object = std::fs::read(repl.object_path())
         .unwrap_or_else(|error| panic!("read the repl object: {error}"));
     let alignc_object = std::fs::read(stage.path().join("alignc.o"))
         .unwrap_or_else(|error| panic!("read the alignc object: {error}"));
     assert!(!repl_object.is_empty(), "the repl object must not be empty");
+    // Report the divergence by size and first differing offset: these are multi-kilobyte buffers,
+    // and `assert_eq!` on them prints both as decimal byte lists, twice.
     assert_eq!(
-        repl_object, alignc_object,
-        "the REPL's object diverged from the shipped compiler's object for the saved program"
+        repl_object.len(),
+        alignc_object.len(),
+        "object sizes differ: repl {} bytes, alignc {} bytes",
+        repl_object.len(),
+        alignc_object.len()
     );
+    if let Some(offset) = repl_object
+        .iter()
+        .zip(&alignc_object)
+        .position(|(left, right)| left != right)
+    {
+        panic!(
+            "the REPL's object diverged from the shipped compiler's object for the saved program \
+             at byte {offset}: repl {:#04x} vs alignc {:#04x}",
+            repl_object[offset], alignc_object[offset]
+        );
+    }
 }
 
 #[test]

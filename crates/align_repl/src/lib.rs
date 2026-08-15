@@ -1269,7 +1269,9 @@ impl Session {
         self.baseline.last_was_truncated()
     }
 
-    /// The object this session's last successful build emitted.
+    /// The object this session's last successful build emitted. Always present on disk: a live
+    /// `Session` has completed at least the startup probe build, because [`Session::new`] fails
+    /// with [`StartupError::FloorBuild`] otherwise.
     ///
     /// Exposed for the build-parity owner (`docs/impl/22-repl-plan.md` §12, O9), which compares it
     /// byte-for-byte against what the real `alignc` binary emits for the file `:save` wrote. That
