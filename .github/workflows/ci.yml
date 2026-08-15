@@ -434,7 +434,7 @@ jobs:
       # the release build and packaged smoke test on every PR.
       - name: Build release compiler
         if: ${{ !matrix.lint }}
-        run: scripts/cargo.sh build --locked --release -p align_runtime -p align_driver
+        run: scripts/cargo.sh build --locked --release -p align_runtime -p align_driver -p align_repl
 
       - name: Smoke test packaged command
         if: ${{ !matrix.lint }}
@@ -443,6 +443,11 @@ jobs:
           ./target/release/alignc --version
           ./target/release/alignc build examples/hello.align
           ./hello
+          # The release flow ships align-repl beside alignc, and that wiring only
+          # runs on a tag. Exercising the pair here is what keeps a packaging
+          # break from being discovered at release time.
+          ./target/release/align-repl --version
+          printf '40 + 2\n:quit\n' | ./target/release/align-repl | grep -x 42
 
       - name: Save Cargo caches
         if: github.ref == 'refs/heads/main'

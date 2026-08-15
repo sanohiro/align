@@ -1772,6 +1772,19 @@ if grep -Eq 'scripts/cargo\.sh build .* -p align_runtime -p align_driver' "$rele
   echo "release.yml instruments the runtime together with alignc again" >&2
   exit 1
 fi
+# `align_repl` depends on `align_runtime` and `align_driver` does not, so
+# selecting the REPL in the profiled invocation drags the archive in through the
+# dependency closure — invisible to the literal-flag check above, which is how
+# this shipped once. Whenever the profiled build names the REPL, the phase must
+# also restore the uninstrumented archive it stashed.
+# `-e` is required: both patterns begin with `-`/`c` and the first would
+# otherwise be parsed as grep options, silently disabling this check.
+if grep -Fq -e '-p align_driver -p align_repl' "$release_workflow"; then
+  grep -Fq -e 'cp "$RUNNER_TEMP/libalign_runtime.a" target/dist/libalign_runtime.a' "$release_workflow" || {
+    echo "release.yml profiles align_repl without restoring the uninstrumented runtime archive" >&2
+    exit 1
+  }
+fi
 release_runtime_builds="$(grep -Fc 'scripts/cargo.sh build --locked --profile dist -p align_runtime' "$release_workflow")"
 release_driver_builds="$(grep -Fc 'scripts/cargo.sh build --locked --profile dist -p align_driver' "$release_workflow")"
 [[ "$release_runtime_builds" -eq 2 && "$release_driver_builds" -eq 2 ]] || {

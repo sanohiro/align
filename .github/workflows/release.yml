@@ -185,8 +185,20 @@ jobs:
           # phase 1 and contributes no training corpus of its own — it is a thin
           # shell whose compile work happens inside the driver library that IS
           # profiled, so its own functions simply carry no profile data.
+          #
+          # BUT `align_repl` depends on `align_runtime` and `align_driver` does
+          # not, so selecting it under the profile-use RUSTFLAGS rebuilds the
+          # archive as a different fingerprint and uplifts it over the copy just
+          # built. Stash the uninstrumented archive and put it back afterwards:
+          # the packaged runtime must stay outside compiler-training
+          # instrumentation (docs/impl/11-release-distribution.md), because
+          # alignc links it into the programs compiled during training. Restoring
+          # explicitly rather than reordering keeps this independent of whether
+          # cargo re-uplifts an already-fresh artifact.
+          cp target/dist/libalign_runtime.a "$RUNNER_TEMP/libalign_runtime.a"
           RUSTFLAGS="-Cprofile-use=$RUNNER_TEMP/merged.profdata" \
             scripts/cargo.sh build --locked --profile dist -p align_driver -p align_repl
+          cp "$RUNNER_TEMP/libalign_runtime.a" target/dist/libalign_runtime.a
 
       - name: Smoke test compiler
         shell: bash
@@ -198,7 +210,7 @@ jobs:
           # its own executable, so this proves the shipped pair works together —
           # not just that the binary starts.
           ./target/dist/align-repl --version
-          printf '40 + 2\n:quit\n' | ./target/dist/align-repl | grep -qx 42
+          printf '40 + 2\n:quit\n' | ./target/dist/align-repl | grep -x 42
 
       - name: Create archive
         shell: bash
