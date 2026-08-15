@@ -459,6 +459,13 @@ bindするprovider CASをreviewed amendmentで導入する。base ruleを弱め�
 
 ## Implementation closure matrix
 
+最初のadversarial-owner implementationは、process boundary、exact schedule、
+cleanup/publication ordering、exclusive-run reservationを1つのcapabilityに意図的にまとめる。
+deterministic ownerを含むhand-written implementationは1,000行を少し超えるが、この4つのedgeは
+1つのdormant producer-to-consumer chainを形成するためである。分割するとfailure-order fixtureが
+重複し、controllerが未review boundaryをconsumeする。controller、verifier、merge-race behaviorは
+このsliceに含めない。
+
 | Cell | Owner / exact regression |
 |---|---|
 | Trusted bootstrap/CLI | installed producer/verifier/merge-verifier/monitorをmanifest/baseline blobへ照合。candidate/PATH/PYTHONPATH/CWD substitution、replacement、引数/path/OID/output/ambient異常をmutation前にreject。trusted CIがexpected OID/PRとfixture-owned GitHub API responseから作ったcanonical review attestationを供給し、wrong repository/PR/reviewer role/review ID/commit/state/body digest、author review、dismiss/stale/duplicate、API/file substitutionをcandidate content読取前にreject。`benchmark_evidence_bootstrap_cli_matrix`. |
