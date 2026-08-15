@@ -11,7 +11,7 @@ _Last updated: 2026-08-15._ Align PR #812 merged align-llm Request 5's bounded H
 response-body capability at `5aa5b23a`, and Request 7 evidence prerequisites through PR #820 are
 now merged, with #820 at `19fbc786`. Its exact-head native ARM64 preflight and every required
 GitHub check passed before merge. Active work is the separate align-llm Request 7
-benchmark-evidence prerequisite implementation on `agent/request7-bootstrap-manifest-binding`. The
+benchmark-evidence prerequisite implementation on `agent/request7-raw-baseline-identity`. The
 proposed contract is `docs/impl/core-design/json-escape-benchmark-evidence.md`: a trusted installed
 controller/verifier, continuously monitored native x86_64 host, digest-pinned offline OCI toolchain,
 read-only revision isolation, robust inner statistics plus fixed balanced sampling, a complete
@@ -43,12 +43,13 @@ hardening: the no-follow installed-source manifest foundation is shipped in #816
 `7db1af8c`, canonical JSON primitives are shipped in #817 at `4ec35dfe`, the typed Report/Body
 schema is shipped in #818 at `41ce4f93`, and strict SSHSIG v1 binary/armor framing is shipped in
 #820 at `19fbc786`. PR #822 also shipped the exact producer/verifier/merge-verifier CLI boundary
-for modes, required options, absolute paths, OIDs, and new output directories. The current slice
-binds the no-follow installed-source manifest to the profile's fixed SHA-256 without opening Git
-objects or executing installed code. It does not invoke Git, Docker, `ssh-keygen`, or the benchmark;
-raw baseline matching, installed replacement protection, profile, image recipe, and adversarial
-owners follow. Host qualification and the full controller/verifier implementation remain later
-work.
+for modes, required options, absolute paths, OIDs, and new output directories, and PR #823 bound
+the no-follow installed-source manifest to the profile's fixed SHA-256 with directory-race closure.
+The current slice fixes canonical raw Git object framing and SHA-1/SHA-256 identity before a later
+pinned Git reader consumes it. It does not traverse repositories, inspect config, execute Git,
+Docker, `ssh-keygen`, or the benchmark; revision graph binding, installed replacement protection,
+profile, image recipe, and adversarial owners follow. Host qualification and the full
+controller/verifier implementation remain later work.
 
 The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit
