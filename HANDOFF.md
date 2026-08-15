@@ -7,12 +7,12 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-15._ Align main is at `956d943d`. align-llm Request 5's bounded HTTP response
+_Last updated: 2026-08-15._ Align main is at `1c9e2e9a`. align-llm Request 5's bounded HTTP response
 body is shipped, and Request 7's evidence design (#813), benchmark inputs (#815/#821), installed
 manifest (#816), canonical JSON (#817), typed report schema (#818), SSHSIG framing (#820), strict
 controller CLI (#822), installed-manifest/profile binding (#823), raw Git object identity codec
 (#825), pinned Git batch response codec (#828), pinned Git process boundary (#830), and two-sided
-Git revision/tree binding (#831) are merged.
+Git revision/tree binding (#831), and verified Git source materialization (#832) are merged.
 The align-repl user guide and release artifacts are shipped in #826/#829. The final requested work
 is PR #827 on
 `agent/request7-prepared-benchmarks`: both protected JSON benchmarks gain the reviewed two-phase
