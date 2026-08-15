@@ -39,10 +39,11 @@ shared one group. The consolidated repair defers signals through PID capture, gi
 command a distinct group, and adds survivor-before-next-command regressions for both benchmarks.
 The evidence implementation continues after this
 hardening: the no-follow installed-source manifest foundation is shipped in #816 at
-`7db1af8c`, canonical JSON primitives are shipped in #817 at `4ec35dfe`, and the current slice adds
-the complete typed Report/Body schema, ordered nested validation, and body-digest binding before
-the controller/verifier/monitor, profile, image recipe, and adversarial owners follow. Host
-qualification and a Request 7 implementation branch remain later work.
+`7db1af8c`, canonical JSON primitives are shipped in #817 at `4ec35dfe`, and the typed Report/Body
+schema is shipped in #818 at `41ce4f93`. The current slice adds strict SSHSIG v1 binary/armor
+framing and signing-preimage helpers before key invocation, controller/verifier/monitor, profile,
+image recipe, and adversarial owners follow. Host qualification and a Request 7 implementation
+branch remain later work.
 
 The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit
