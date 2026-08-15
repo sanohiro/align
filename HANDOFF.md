@@ -29,10 +29,11 @@ Author inspection of the benchmark-input slice found that the current scripts ma
 invocations, not the four root builds named by the delivery prose; the repair binds all six and
 identifies the two later `cargo run` replacements. The same pass makes the work-root safety and
 cleanup contract exact instead of leaving `unsafe` to implementation judgement. Active work is the
-evidence implementation: the no-follow installed-source manifest foundation is shipped, and the
-current slice adds canonical JSON primitives before the controller/verifier/monitor, profile, image
-recipe, and adversarial owners follow before host qualification and a Request 7 implementation
-branch.
+evidence implementation: the no-follow installed-source manifest foundation is shipped in #816 at
+`7db1af8c`, canonical JSON primitives are shipped in #817 at `4ec35dfe`, and the current slice adds
+the complete typed Report/Body schema, ordered nested validation, and body-digest binding before
+the controller/verifier/monitor, profile, image recipe, and adversarial owners follow. Host
+qualification and a Request 7 implementation branch remain later work.
 
 The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit

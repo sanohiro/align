@@ -50,11 +50,19 @@ rejected("unicode string", lambda: cj.encode(cj.Object((("value", "é"),))))
 rejected("control string", lambda: cj.encode(cj.Object((("value", "line\nbreak"),))))
 rejected("quote string", lambda: cj.encode(cj.Object((("value", '"'),))))
 rejected("backslash string", lambda: cj.encode(cj.Object((("value", "\\"),))))
+stale = cj.Object((("value", 1),))
+stale["extra"] = 2
+rejected("stale object mapping", lambda: cj.encode(stale))
+stale_member = cj.Object((("value", 1),))
+stale_member["value"] = 2
+rejected("replaced object member", lambda: cj.require_object(stale_member, ("value",), "value"))
 rejected("float", lambda: cj.decode(b'{"value":1.0}\n'))
+rejected("oversized integer", lambda: cj.decode(b'{"value":' + b"9" * 5000 + b"}\n"))
+rejected("deep JSON", lambda: cj.decode(b"[" * 2000 + b"0" + b"]" * 2000 + b"\n"))
 rejected("negative", lambda: cj.decode(b'{"value":-1}\n'))
 rejected("overflow", lambda: cj.decode(b'{"value":18446744073709551616}\n'))
 rejected("null", lambda: cj.decode(b'{"value":null}\n'))
-rejected("decoded boolean", lambda: cj.decode(b'{"value":true}\n'))
+assert cj.decode(b'{"value":true}\n')["value"] is True
 rejected("boolean", lambda: cj.require_uint(True, "value"))
 rejected("u32 overflow", lambda: cj.require_uint(2**32, "u32", maximum=(2**32 - 1)))
 rejected(
