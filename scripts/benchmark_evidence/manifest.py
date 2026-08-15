@@ -277,6 +277,67 @@ class _Observed:
         }
 
 
+def _scan_directory(
+    fd: int,
+    prefix: str,
+    excluded: str,
+) -> list[tuple[str, str, os.stat_result]]:
+    try:
+        entries = sorted(os.scandir(fd), key=lambda entry: os.fsencode(entry.name))
+    except OSError as exc:
+        raise ManifestError(f"cannot enumerate installed tree: {exc}") from exc
+    scanned: list[tuple[str, str, os.stat_result]] = []
+    for entry in entries:
+        name = entry.name
+        if name in (".", "..") or "/" in name or "\\" in name or "\x00" in name:
+            raise ManifestError("installed path contains an invalid component")
+        path = f"{prefix}/{name}" if prefix else name
+        path = _relative_manifest_path(path)
+        try:
+            lstat = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except OSError as exc:
+            raise ManifestError(f"cannot inspect installed entry {path}: {exc}") from exc
+        if not (stat.S_ISDIR(lstat.st_mode) or stat.S_ISREG(lstat.st_mode)):
+            if stat.S_ISLNK(lstat.st_mode):
+                raise ManifestError(f"installed symlink is not permitted: {path}")
+            raise ManifestError(f"installed special file is not permitted: {path}")
+        scanned.append((name, path, lstat))
+    return scanned
+
+
+def _directory_signature(
+    entries: list[tuple[str, str, os.stat_result]],
+) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        (
+            path,
+            "directory" if stat.S_ISDIR(lstat.st_mode) else "file",
+            lstat.st_dev,
+            lstat.st_ino,
+            stat.S_IMODE(lstat.st_mode),
+            lstat.st_uid,
+            lstat.st_gid,
+            lstat.st_size,
+            lstat.st_mtime_ns,
+            lstat.st_ctime_ns,
+        )
+        for _, path, lstat in entries
+    )
+
+
+def _metadata_signature(stat_result: os.stat_result) -> tuple[object, ...]:
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat.S_IMODE(stat_result.st_mode),
+        stat_result.st_uid,
+        stat_result.st_gid,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+    )
+
+
 def _iter_tree(
     fd: int,
     prefix: str = "",
@@ -285,24 +346,11 @@ def _iter_tree(
 ) -> Iterator[_Observed]:
     if seen_files is None:
         seen_files = set()
-    try:
-        entries = sorted(os.scandir(fd), key=lambda entry: os.fsencode(entry.name))
-    except OSError as exc:
-        raise ManifestError(f"cannot enumerate installed tree: {exc}") from exc
-    for entry in entries:
-        name = entry.name
-        if name in (".", "..") or "/" in name or "\\" in name or "\x00" in name:
-            raise ManifestError("installed path contains an invalid component")
-        path = f"{prefix}/{name}" if prefix else name
-        path = _relative_manifest_path(path)
+    entries = _scan_directory(fd, prefix, excluded)
+    before_signature = _directory_signature(entries)
+    for name, path, lstat in entries:
         if path == excluded:
             continue
-        try:
-            lstat = os.stat(name, dir_fd=fd, follow_symlinks=False)
-        except OSError as exc:
-            raise ManifestError(f"cannot inspect installed entry {path}: {exc}") from exc
-        if stat.S_ISLNK(lstat.st_mode):
-            raise ManifestError(f"installed symlink is not permitted: {path}")
         if stat.S_ISDIR(lstat.st_mode):
             child_fd = _open_directory(fd, name)
             try:
@@ -374,12 +422,18 @@ def _iter_tree(
             )
         finally:
             os.close(file_fd)
+    after_signature = _directory_signature(_scan_directory(fd, prefix, excluded))
+    if after_signature != before_signature:
+        raise ManifestError(
+            f"installed directory changed while walking: {prefix or '.'}"
+        )
 
 
 def _observed_tree_fd(root_fd: int, manifest_path: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     excluded = _relative_manifest_path(manifest_path)
     try:
         root_stat = os.fstat(root_fd)
+        root_signature = _metadata_signature(root_stat)
         root_record = {
             "mode": _mode("directory", root_stat.st_mode),
             "uid": root_stat.st_uid,
@@ -387,6 +441,8 @@ def _observed_tree_fd(root_fd: int, manifest_path: str) -> tuple[dict[str, Any],
         }
         entries = [item.as_dict() for item in _iter_tree(root_fd, excluded=excluded, seen_files=set())]
         entries.sort(key=lambda item: os.fsencode(item["path"]))
+        if _metadata_signature(os.fstat(root_fd)) != root_signature:
+            raise ManifestError("installed root changed while being walked")
         return root_record, entries
     except OSError as exc:
         raise ManifestError(f"cannot inspect installed root: {exc}") from exc
