@@ -52,7 +52,10 @@ two-sided revision binding. Active work on `agent/request7-installed-source-prot
 source materialization and retained-descriptor verification; it does not execute Docker,
 `ssh-keygen`, or the benchmark. Installed-source protection, profile, image recipe, and
 adversarial owners follow. Host qualification and the full controller/verifier implementation
-remain later work.
+remain later work. Materialization and retained verification intentionally share this boundary
+even though the hand-written change is just over the rough line heuristic: both depend on the same
+raw path layout, reviewed-symlink policy, descriptor identity, and cleanup proof, so splitting them
+would duplicate the boundary fixtures without leaving a stable consumer for either half.
 
 The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit
