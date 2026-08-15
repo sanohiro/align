@@ -9,7 +9,7 @@ visible runtime definitions that occupy link identities. The keyed surface is
 generated from a trivial valid program; the complete base and `alloc-count`
 surfaces are independently compared with the Rust runtime exports.
 
-The combined bounded canonical JSON and process-capture capabilities have 291 `RuntimeKey`
+The combined bounded canonical JSON, process-capture, and bounded HTTP capabilities have 293 `RuntimeKey`
 variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
 `ArrayBuilderNewIn` and `ArrayBuilderPushBytes`; the four
 AEAD symbols that were previously selected from `AeadCipher × AeadDir` become
@@ -22,7 +22,7 @@ runtime records have no `RuntimeKey` and instead use the thirteen-variant
 `align_rt_f32_to_bits`, `align_rt_f32_from_bits`, `align_rt_f64_to_bits`,
 `align_rt_f64_from_bits`, `align_rt_f32_text_len`, `align_rt_f64_text_len`,
 `align_rt_f32_text_write`, and `align_rt_f64_text_write`. The base native registry
-therefore has 304 records. Request 12 adds the keyed bounded-builder stack initializer and
+therefore has 306 records. Request 12 adds the keyed bounded-builder stack initializer and
 consuming status/out-slot finish; both reuse existing ABI shapes A51 and A19.
 The explicit `alloc-count` runtime feature may expose four
 test/benchmark-only counter definitions. `par-map-probe` may expose four more:
@@ -32,10 +32,10 @@ test/benchmark-only counter definitions. `par-map-probe` may expose four more:
 `i64 @align_rt_test_par_map_workers()`. `task-group-probe` changes internal
 Rust state only and adds no unmangled native export.
 
-The compiler-visible native registry is always exactly the 304 base records.
+The compiler-visible native registry is always exactly the 306 base records.
 There is no target option, environment variable, Cargo feature, linked-runtime
 inspection, or other ambient input that changes it. The eight optional probe
-records extend only the verification-time maximum runtime-export table to 312.
+records extend only the verification-time maximum runtime-export table to 314.
 They never gain a `RuntimeKey`, callable/declaration policy, collision
 reservation, or compatible-extern reuse. Their spellings remain ordinary
 program/extern/export identities in a normal build. Probe-feature runtime
@@ -45,8 +45,8 @@ artifact, or cache identity. Registry membership is never inferred from symbol
 spelling.
 
 Request 11 adds six regular `RuntimeKey` rows for bounded process capture. Their runtime definitions
-and registry entries activated atomically: the combined exact counts are 291 keyed records, 304 base
-records, and 312 records in the maximum optional-probe export table. No unkeyed or probe category
+and registry entries activated atomically. The current combined exact counts after Request 5 are 293 keyed
+records, 306 base records, and 314 records in the maximum optional-probe export table. No unkeyed or probe category
 changed.
 
 The key-to-symbol mapping is `key -> "align_rt_" + snake_case(key)` except:
@@ -183,22 +183,22 @@ Request 11 keyed delta:
 
 All six use the regular `align_rt_` plus snake-case key mapping and occupy collision-reserved native
 identities as soon as the capability activates. `runtime_abi_registry_is_complete_and_unique` owns
-the 291/304 counts, key/symbol bijection, and reverse lookup; the exact extern-type matrix owns every
+the 293/306 counts, key/symbol bijection, and reverse lookup; the exact extern-type matrix owns every
 parameter/return/attribute cell; the checked-in declaration golden owns spelling and row order; and
 the base/feature runtime-export parity owners require all six definitions in every normal runtime
 while rejecting any missing, duplicate, near-spelled, or wrong-signature record. The capability must
 not add a direct declaration outside this registry.
 
-Request 5 bounded-HTTP design delta (not shipped until its implementation PR):
+Request 5 bounded-HTTP implementation delta (SHIPPED 2026-08-15):
 
-| Planned runtime key | Exact symbol | Existing ABI row and exact declaration |
+| Runtime key | Exact symbol | Existing ABI row and exact declaration |
 |---|---|---|
 | `HttpMaxResponseBodyBytes` | `align_rt_http_max_response_body_bytes` | A66: `void @SYM(ptr, i64)`; no curated attributes |
 | `HttpClientMaxResponseBodyBytes` | `align_rt_http_client_max_response_body_bytes` | A66: `void @SYM(ptr, i64)`; no curated attributes |
 
-Both use ordinary keyed-native identity and become mandatory base exports when the capability
-activates. The implementation updates registry counts, bijection, declaration golden, and base
-runtime-export parity in the same change. The HTTP-private negative result sentinel is not an ABI
+Both use ordinary keyed-native identity and are mandatory base exports. The implementation updates
+registry counts, bijection, declaration golden, and base runtime-export parity in the same change. The
+HTTP-private negative result sentinel is not an ABI
 symbol: client-response MIR maps it to reserved `Error.Code(-1)` before the common positive status
 decoder, so it cannot collide with a saturating encoded errno.
 
@@ -286,24 +286,24 @@ LLVM construction and receives no runtime-feature input.
 
 Tests compare:
 
-- all 291 keys, mapped symbols, LLVM declaration types, and default attributes
+- all 293 keys, mapped symbols, LLVM declaration types, and default attributes
   against this table through the checked-in
   `crates/align_codegen_llvm/tests/golden/runtime_abi_declarations.txt`;
-- the 304 base native symbols against default-feature `align_runtime` exports,
+- the 306 base native symbols against default-feature `align_runtime` exports,
   plus every actual Rust definition's normalized native return and ordered
   parameter types against the declaration golden, failing on either direction's
   difference through `scripts/test-runtime-abi-exports.sh`;
-- the 308 `alloc-count` and 308 `par-map-probe` native symbols against
+- the 310 `alloc-count` and 310 `par-map-probe` native symbols against
   `align_runtime` built with each feature separately, including the four exact
   probe signatures above;
-- the 312 maximum native symbols against `align_runtime` built with
+- the 314 maximum native symbols against `align_runtime` built with
   `alloc-count,par-map-probe,task-group-probe`, while proving
   `task-group-probe` adds no unmangled export;
 - rt-LTO off/on attributes for every guarded symbol, with missing,
   declaration-only, wrong-type, internal, private, available-externally, and
   non-C-calling-convention artifact negatives;
-- all 304 identities through the one `RuntimeAbiId`-keyed row iterator and all
-  304 exact registry function types through the production compatibility
+- all 306 identities through the one `RuntimeAbiId`-keyed row iterator and all
+  306 exact registry function types through the production compatibility
   predicate, one return mutation per row, and one mutation of every parameter
   ordinal; source-valid compatible reuse for a keyed builtin and the twelve
   source-reachable unkeyed rows; exact `ArgsBuild` `str` rejection plus the

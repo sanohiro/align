@@ -1031,7 +1031,8 @@ this authoritative boundary instead of relying on the older scalar/string valida
 ### Request 11 process-capture activation delta
 
 The five Request 11 expression rows above activated together with `Ty::RunBytes` /
-`Scalar::RunBytes`; there is no producer-only intermediate. The `ExprKind` inventory is 258, and
+`Scalar::RunBytes`; there is no producer-only intermediate. At that activation, the `ExprKind`
+inventory was 258; Request 5 later raises the current total to 260. The
 `variant_sweep_tripwire` must fail at compile time
 if any of those five variants is absent from validation or ownership analysis.
 
@@ -1047,7 +1048,7 @@ if any of those five variants is absent from validation or ownership analysis.
 
 The implementation must derive an exhaustiveness constant from the Rust enum
 definitions and assert that this file has exactly one owner id for every
-`Stmt`, all 258 `ExprKind` variants, `ArithMode`, `MathFn`, every
+`Stmt`, all 260 `ExprKind` variants, `ArithMode`, `MathFn`, every
 `BuilderWriteKind`, `StrPredKind`, `StrTrimKind`, `TemplatePart`, `StageKind`,
 `GroupSource`, `GroupAgg1`, `GroupOp`, `CliFlagKind`, `EncodingKind`, `CompressKind`,
 `PathComponentKind`, `AeadCipher`, `AeadDir`, and `HashAlgo`. The test fails on
@@ -1056,13 +1057,13 @@ an added, removed, duplicated, or unowned discriminator.
 Request 11 changed the asserted `ExprKind` total from 253 to 258 in the same integrated tree that
 already contains `JsonEncodeBounded`, and activated its five rows.
 
-### Request 5 bounded-HTTP planned delta
+### Request 5 bounded-HTTP delta (SHIPPED 2026-08-15)
 
-Request 5 activates both setters with the bounded decoder; neither discriminator may ship as a
+Request 5 activates both setters with the bounded decoder; neither discriminator ships as a
 dormant producer. The implementation adds exactly these two rows and changes the asserted current
 `ExprKind` total from 258 to 260 in that integrated tree:
 
-| Planned `ExprKind` | Exact producer and checked-HIR envelope |
+| `ExprKind` | Exact producer and checked-HIR envelope |
 |---|---|
 | `HttpRequestMaxResponseBodyBytes` | `env[]; child[req,limit]`; `LocalHandle(HttpRequest,req),i64; result Unit; req native state mutated without source mut; Pure`. |
 | `HttpClientMaxResponseBodyBytes` | `env[]; child[client,limit]`; `LocalHandle(HttpClient,client),i64; result Unit; client native state mutated without source mut; Pure`. |

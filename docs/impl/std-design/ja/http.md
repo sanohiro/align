@@ -883,7 +883,7 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
     ループは純粋に `Content-Length` でフレーミングする(リクエストメソッドやステータスで特別扱いしない)
     ため、決して来ないボディバイトを待ち続ける → 上と同じ無期限ブロックになる。v1 の表面は `HEAD` を
     手軽には出していない(`get`/`post`/`request` のみ)が、メソッド `HEAD` で組んだ `request` はこれに
-    当たる。**下記 align-llm Request 4 で設計済み、実装待ち。** 同じ capability が method/status-aware
+    当たる。**下記 align-llm Request 4 で実装済み。** 同じ capability が method/status-aware
     framing、informational response の advancement、client-side chunk de-framing を、二つ目の transport
     surface を増やさずに追加する。
 - **~~`https://` の拒否が粗い(DC-1, low)。~~ スライス 5 で解消。** `https://` はもはや `Error.Invalid`
@@ -1001,11 +1001,11 @@ HTTP/1.1 `Transfer-Encoding: chunked` を使う。Request 4 より前の whole-b
 を de-frame し、同じ owned `response` と zero-copy `resp.body()` view を返す。public type、method、
 option、ABI entry point、streaming-input handle、provider 固有 abstraction は追加しない。
 
-これは framing capability であり、設定可能な receive-bound capability ではない。既存の固定
-`HTTP_MAX_BODY` ceiling が decoded-body ceiling のままで、超過は `Error.Invalid` のままである。
-align-llm Request 5 が public client/request cap と limit-specific error を別途所有する。Request 5 が
-この capability より後に land する場合、両者を組み合わせた cap/framing adoption gate は Request 5 が
-所有する。
+これは framing capability であり、設定可能な receive-bound capability ではない。未設定の
+exchange では既存の固定 `HTTP_MAX_BODY` ceiling が decoded-body ceiling のままで、超過は
+`Error.Invalid` のままである。Request 5 は下記の explicit receive-bound behavior を追加する。
+align-llm Request 5 が public client/request cap と limit-specific error を別途所有する。両者を
+組み合わせた cap/framing adoption gate は Request 5 が所有する。
 
 ### Public-contract ledger
 
@@ -1032,9 +1032,9 @@ align-llm Request 5 が public client/request cap と limit-specific error を�
 上記 `Content-Length` の arbitrary-magnitude allowance は `HEAD` と `304` の metadata 専用である。
 leading zero を除いて digit sequence を比較し decimal magnitude を normalize する。`usize` へ変換せず、
 `HTTP_MAX_BODY` と比較せず、それから reserve せず、body を読まない。duplicate value は normalized
-magnitude で等しい(`003` は `3` と等しい)。payload-bearing length は Request 5 が wider
-arbitrary-magnitude/limit-specific comparison を提供するまで、既存の target-representable/global-cap
-requirement を保つ。
+magnitude で等しい(`003` は `3` と等しい)。payload-bearing length は explicit Request 5 bound
+が無ければ既存の target-representable/global-cap requirement を保ち、explicit bound では
+Request 5 の wider arbitrary-magnitude/limit-specific comparison を使う。
 
 ### Streaming decoder and retained layout
 
@@ -1115,7 +1115,7 @@ stream fixture を Content-Length から chunked へ切り替え、valid SSE、m
 status/header/body preservation を証明する。sibling request register が adoption evidence の lifecycle owner
 であり続ける。
 
-## Client response body の上限制御 (align-llm Request 5 — DESIGNED 2026-08-14)
+## Client response body の上限制御 (align-llm Request 5 — SHIPPED 2026-08-15)
 
 provider call には whole-body client が allocation した後の length check ではなく、受信中に効く
 operation-sized limit が必要である。Request 5 は Request 4 framing engine に client default と request

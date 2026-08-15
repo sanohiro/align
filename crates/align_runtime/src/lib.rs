@@ -18424,8 +18424,9 @@ unsafe fn http_client_perform(
     let selected_body_limit = [client_body_limit, req.max_response_body_bytes]
         .into_iter()
         .filter(|limit| *limit > 0)
+        .filter_map(|limit| usize::try_from(limit).ok())
         .min()
-        .unwrap_or(HTTP_MAX_BODY as i64) as usize;
+        .unwrap_or(HTTP_MAX_BODY);
     let explicit_body_limit = (client_body_limit > 0 || req.max_response_body_bytes > 0)
         .then_some(selected_body_limit);
     // 4. Render the request into ONE buffer (validates method / headers / smuggling — http.md R4).
@@ -20732,8 +20733,8 @@ mod tests {
                 None
             })
             .collect();
-        assert_eq!(runtime.len(), 298);
-        assert_eq!(registry.len(), 298);
+        assert_eq!(runtime.len(), 306);
+        assert_eq!(registry.len(), 306);
         assert_eq!(runtime, registry);
     }
 
@@ -30931,6 +30932,7 @@ mod tests {
 
     #[test]
     fn http_client_response_limit_exact_excess_and_request_narrowing() {
+        let _server_lock = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let client = align_rt_http_client_new();
         unsafe { align_rt_http_client_max_response_body_bytes(client, 4) };
         assert_eq!(
@@ -32775,6 +32777,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
 
     #[test]
     fn http_get_many_uses_the_snapshotted_client_body_limit() {
+        let _server_lock = GET_MANY_SERVER_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (port, server) = http_serve_once(
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\ndata!"
                 .to_vec(),

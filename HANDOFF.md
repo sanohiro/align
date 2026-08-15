@@ -7,7 +7,7 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-14._ The C-B borrow/ownership capability is complete
+_Last updated: 2026-08-15._ The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit
 region materialization is complete through L4 and L6. Direct, captured,
 imported, and function-value returns preserve exact owner provenance;
@@ -41,6 +41,12 @@ align-llm Request 4 is complete on `main`: #798 settled client-side HTTP/1.1 chu
 framing and #800 shipped the shared strict incremental decoder across plaintext/TLS, `http.parse`,
 pooling, and all existing client calls without a public API or ABI change. The sibling request
 register records the merged surface and the required align-llm batch release build is green.
+
+align-llm Request 5's bounded HTTP response-body capability is complete in Align: request- and
+client-local `max_response_body_bytes` setters, exact-capacity bounded framing across fixed,
+chunked, and close-delimited responses, bodyless-response handling, and the private limit-to-error
+mapping are implemented with the A66 runtime ABI additions. Align-llm adoption remains pending in
+the sibling request register.
 
 The align-llm compatibility break found by the v0.4.0-successor release
 compiler is closed on `main` by #786: Sema admitted both `str.clone()` and
@@ -181,7 +187,8 @@ facts must live in this repository.
   Request 6 is closed after Align design #703, implementation #704, and align-llm adoption #84;
   Request 8 is merged through Align design #799 and implementation #801; Request 10's §7.6
   implementation is merged; Request 11's bounded-capture implementation is complete and Request 12's
-  design is accepted. Requests 5, 7, 9, and 13–14 otherwise remain proposed in
+  design is accepted. Request 5's Align implementation is complete; Requests 7, 9, and 13–14
+  otherwise remain proposed in
   `../align-llm/docs/align-requests.md`; Request 9 remains the later C7 blocker after Request 7.
 
 Consumer-gated deferrals that remain intentional:

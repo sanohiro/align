@@ -904,7 +904,7 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
     purely by `Content-Length` (it does not special-case the request method or status), so it would
     wait for body bytes that never arrive → the same indefinite block as above. v1's surface does not
     expose `HEAD` conveniently (only `get`/`post`/`request`), but a caller-built `request` with method
-    `HEAD` hits this. **DESIGNED for align-llm Request 4 below; implementation pending.** The same
+    `HEAD` hits this. **Implemented by align-llm Request 4 below.** The same
     capability adds method/status-aware framing, informational-response advancement, and client-side
     chunk de-framing without adding a second transport surface.
 - **~~`https://` rejection is coarse (DC-1, low).~~ RESOLVED by Slice 5.** `https://` no longer maps
@@ -1029,10 +1029,11 @@ before the provider could see the body. Request 4 completes the existing `cl.req
 de-frames a chunked response into the same owned `response` and zero-copy `resp.body()` view. It adds no public
 type, method, option, ABI entry point, streaming-input handle, or provider-specific abstraction.
 
-This is a framing capability, not a configurable receive-bound capability. The existing fixed
-`HTTP_MAX_BODY` ceiling remains the decoded-body ceiling and an excess remains `Error.Invalid`.
-align-llm Request 5 separately owns the public client/request cap and its limit-specific error. If
-Request 5 lands after this capability, Request 5 owns their combined cap/framing adoption gate.
+This is a framing capability, not a configurable receive-bound capability. For an unconfigured
+exchange, the existing fixed `HTTP_MAX_BODY` ceiling remains the decoded-body ceiling and an excess
+remains `Error.Invalid`; Request 5 adds the explicit receive-bound behavior below.
+align-llm Request 5 separately owns the public client/request cap and its limit-specific error. Request 5 owns
+their combined cap/framing adoption gate.
 
 ### Public-contract ledger
 
@@ -1060,8 +1061,8 @@ The `Content-Length` arbitrary-magnitude allowance above is metadata-only for `H
 Normalize its decimal magnitude by removing leading zeroes and comparing digit sequences; do not
 convert it to `usize`, compare it with `HTTP_MAX_BODY`, reserve from it, or read a body. Equal
 duplicate values are equal by normalized magnitude (`003` equals `3`). Payload-bearing lengths keep
-the existing target-representable and global-cap requirements until Request 5 supplies its wider
-arbitrary-magnitude, limit-specific comparison.
+the existing target-representable and global-cap requirements without an explicit Request 5 bound;
+an explicit bound uses Request 5's wider arbitrary-magnitude, limit-specific comparison.
 
 ### Streaming decoder and retained layout
 
@@ -1146,7 +1147,7 @@ consumer-prerequisite wave, switches its provider stream fixtures from Content-L
 and proves valid SSE, malformed/truncated rejection, and final status/header/body preservation. The
 sibling request register remains the lifecycle owner for that adoption evidence.
 
-## Bounded client response bodies (align-llm Request 5 — DESIGNED 2026-08-14)
+## Bounded client response bodies (align-llm Request 5 — SHIPPED 2026-08-15)
 
 Provider calls need an operation-sized receive limit, not a check after the whole-body client has
 already allocated the response. Request 5 adds one client default and one request override to the

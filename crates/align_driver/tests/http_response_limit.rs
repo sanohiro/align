@@ -22,9 +22,6 @@ fn client_body_limit_maps_private_status_to_code_minus_one() {
     if !backend_available() {
         return;
     }
-    let (port, server) = spawn_http_server(
-        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\ndata!",
-    );
     let source = "\
 import std.http
 import std.cli
@@ -48,8 +45,17 @@ pub fn main(args: array<str>) -> Result<(), Error> {
   return Ok(())
 }
 ";
+    // Compile before the fixture begins blocking in `accept`, so a compiler regression cannot
+    // strand the server thread and turn the test failure into a process-wide hang.
+    let client = build_exe("http-response-limit", source);
+    let (port, server) = spawn_http_server(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\ndata!",
+    );
     let url = format!("http://127.0.0.1:{port}/bounded");
-    let output = build_and_run_args("http-response-limit", source, &["--url", &url]);
+    let output = std::process::Command::new(&client.exe)
+        .args(["--url", &url])
+        .output()
+        .expect("run bounded response client");
     server.join().unwrap();
     assert_eq!(
         output.status.code(),
