@@ -7,12 +7,13 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-15._ Align main is at `6adfa13d`. align-llm Request 5's bounded HTTP response
+_Last updated: 2026-08-15._ Align main is at `5a6ae64b`. align-llm Request 5's bounded HTTP response
 body is shipped, and Request 7's evidence design (#813), benchmark inputs (#815/#821), installed
 manifest (#816), canonical JSON (#817), typed report schema (#818), SSHSIG framing (#820), strict
 controller CLI (#822), installed-manifest/profile binding (#823), raw Git object identity codec
-(#825), and pinned Git batch response codec (#828) are merged. The align-repl user guide is also
-shipped in #826. The final requested work is PR #827 on
+(#825), pinned Git batch response codec (#828), and pinned Git process boundary (#830) are merged.
+The align-repl user guide and release artifacts are shipped in #826/#829. The final requested work
+is PR #827 on
 `agent/request7-prepared-benchmarks`: both protected JSON benchmarks gain the reviewed two-phase
 `prepare native` / direct `native` interface, canonical artifact sealing, checked integer inner
 medians, descriptor-bound Linux evidence execution, and inode-aware cleanup. The integrated review

@@ -703,7 +703,8 @@ abandon.
 | Nightly (`scripts/run-suite-binaries.sh`) | **Automatic; must be green.** | Nightly builds every workspace test binary and diffs against `scripts/known-failures.txt` both ways. The two binaries join automatically; **no manifest entry is added.** Cost ~7 s against a 30-minute cap. |
 | Clippy | **`--lib --bins` only.** | `scripts/pre-pr.sh` runs `clippy --workspace --lib --bins`, so the crate's **test** targets are not linted. Recorded so green Clippy is not mistaken for lint coverage of the tests. |
 | `scripts/lint-ratchet.sh` | **Three counts must not move.** | Zero panic sources, zero lossy casts, and the `fixture-bake` kind is scanned across every crate's `tests/` — so fixtures are read at runtime (`std::fs::read_to_string` under `CARGO_MANIFEST_DIR`), never `include_str!`. |
-| `db-verify-local.sh`, `preflight.yml`, `release.yml` | **None.** | No `apps/db` or `pkg_db_*` path touched. `release.yml` picks up one more small crate; `align-repl` is **not** in the released artifact set in v1. |
+| `db-verify-local.sh`, `preflight.yml` | **None.** | No `apps/db` or `pkg_db_*` path touched. |
+| `release.yml` | **Ships `align-repl`.** | Settled 2026-08-15, reversing the original v1 deferral (§15 row 6). The binary is built in the existing PGO phase-3 invocation, added to each `tar.gz`, installed into `/usr/lib/align` with a `/usr/bin` wrapper in the `.deb`, and installed with the same keg-only `LIBRARY_PATH` wrapper by the Homebrew formula. It is not instrumented in phase 1 and contributes no training corpus: the compile work happens inside the profiled driver library. |
 
 ## 11. Public-contract ledger
 
@@ -924,7 +925,7 @@ exists.
 | 3 | No line editing in v1; `rustyline` behind a non-default feature in V2d. This is partly a correctness question, not only ergonomics: without `rustyline`, Ctrl-C at the prompt kills the session (§8.10). |
 | 4 | `main` is fixed at `fn main() -> Result<(), Error>`; no exit codes (N8). |
 | 5 | A runtime abort keeps the entry (§3.7.2); `:undo` and `:drop` are the v1 escape hatches. |
-| 6 | `align-repl` is not in `release.yml`'s artifact set in v1; add it after V2a/V2b. |
+| 6 | **`align-repl` ships in the release artifacts from v1.** Reversed 2026-08-15. The original decision recorded no reason beyond the ordering — "add it after V2a/V2b". Read as a command-set-stability argument, the ordering does not hold: V2a and V2b *add* commands and improve diagnostics, and neither removes or changes one, so a shipped v1 REPL keeps working and simply gains commands at the next release — shipping does not freeze the surface. Meanwhile the guide now points a first-time reader at the REPL before `hello.align`, so withholding it from the packaged install would document a tool the reader cannot run, and behavior parity with a production compile is already a pinned owner (`e2e.rs::saved_file_object_matches_the_real_alignc_binary`) rather than a v2 aspiration. The remaining v1 rough edge, no line editing, is covered from outside by `rlwrap align-repl` with no change to the shipped binary; V2d's in-process editor (which also gives Ctrl-C prompt survival, §8.10) stays worth doing and is no longer a release gate. |
 | 7 | §4.1 publishes ~10 KB per entry into the shared `ALIGNC_CACHE` root. Accepted: forcing the cache off behind the user's back is a hidden ambient override, and `alignc cache clear` already owns cleanup. |
 | 8 | §3.4 case D (`_ := (E)`) moves a Result-typed place expression. Accepted: the alternative is silently discarding a fallible expression the user typed. The move is disclosed in the echo's `note:` line, pinned by §12's synthetic-consumption axis, and reversible with `:undo`. |
 | 9 | Build parity is proven by **object** comparison, not executable comparison (§12). |

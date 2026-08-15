@@ -20,20 +20,32 @@ class Align < Formula
   end
 
   def install
-    libexec.install "alignc", "libalign_runtime.a"
+    libexec.install "alignc", "align-repl", "libalign_runtime.a"
 
     # OpenSSL is keg-only, and alignc links capability libraries through the system C linker.
     # The wrapper makes the Homebrew prefixes visible without baking a machine-specific path into
     # the compiler or requiring users to export LIBRARY_PATH themselves.
-    (bin/"alignc").write <<~SH
-      #!/bin/bash
-      export LIBRARY_PATH="#{Formula["openssl@3"].opt_lib}:#{Formula["zstd"].opt_lib}${LIBRARY_PATH:+:$LIBRARY_PATH}"
-      exec "#{libexec}/alignc" "$@"
-    SH
-    (bin/"alignc").chmod 0755
+    #
+    # align-repl links every entry through the same driver, so it needs the same wrapper — a
+    # symlink into libexec would start the REPL but fail at the first entry that pulls a
+    # keg-only capability library. It also resolves libalign_runtime.a beside its own
+    # executable, which is why it is installed into libexec next to the archive.
+    %w[alignc align-repl].each do |tool|
+      (bin/tool).write <<~SH
+        #!/bin/bash
+        export LIBRARY_PATH="#{Formula["openssl@3"].opt_lib}:#{Formula["zstd"].opt_lib}${LIBRARY_PATH:+:$LIBRARY_PATH}"
+        exec "#{libexec}/#{tool}" "$@"
+      SH
+      (bin/tool).chmod 0755
+    end
   end
 
   test do
     assert_match "alignc #{version}", shell_output("#{bin}/alignc --version")
+    # `--version` deliberately, not a session: both binaries answer it before
+    # touching the toolchain, whereas a REPL entry compiles and links, which is
+    # more than a formula test should demand of the sandbox. The release
+    # workflow smoke-tests a real session against the artifact instead.
+    assert_match "align-repl #{version}", shell_output("#{bin}/align-repl --version")
   end
 end

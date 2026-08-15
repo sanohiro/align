@@ -10,7 +10,7 @@ This document records the release shape implemented under `.github/`. It is inte
 | `alignc-linux-x86_64.tar.gz` | `ubuntu-24.04` | tarball + amd64 `.deb` |
 | `alignc-linux-aarch64.tar.gz` | `ubuntu-24.04-arm` | tarball + arm64 `.deb` |
 
-These are native builds, not cross-compiles. That matters because the compiler links dynamically to LLVM 22, and because the emitted `alignc` rpath must describe the package layout on the target operating system. Every archive contains both `alignc` and its matching `libalign_runtime.a`; the compiler needs that archive beside its real executable when linking user programs.
+These are native builds, not cross-compiles. That matters because the compiler links dynamically to LLVM 22, and because the emitted `alignc` rpath must describe the package layout on the target operating system. Every archive contains `alignc`, `align-repl`, and their matching `libalign_runtime.a`; both binaries need that archive beside their real executable when linking user programs, because each resolves it relative to its own path.
 
 ## CI and release contracts
 
@@ -26,7 +26,7 @@ These are native builds, not cross-compiles. That matters because the compiler l
 4. updates `sanohiro/homebrew-align` when `HOMEBREW_TAP_TOKEN` exists;
 5. builds and deploys a signed apt repository when `APT_GPG_PRIVATE_KEY` exists.
 
-Only a versioned release pays for that tuning: ordinary `--release` builds stay on the untuned default so routine batch builds never carry the LTO/PGO cost. The compiler uses thin LTO, one codegen unit, and compiler-only PGO. Its packaged runtime uses the same dist optimization profile but stays outside compiler-training instrumentation because `alignc` links that archive into the programs compiled during training. The `alignc` binary links mimalloc in every profile.
+Only a versioned release pays for that tuning: ordinary `--release` builds stay on the untuned default so routine batch builds never carry the LTO/PGO cost. The compiler uses thin LTO, one codegen unit, and compiler-only PGO. Its packaged runtime uses the same dist optimization profile but stays outside compiler-training instrumentation because `alignc` links that archive into the programs compiled during training. `align-repl` is built in the same profile-use invocation as the compiler — it is a thin shell over the profiled driver and carries no training corpus of its own — but because it is the one workspace crate that depends on `align_runtime`, that invocation would otherwise rebuild the archive under the compiler's profile; the phase stashes the uninstrumented archive and restores it, and `scripts/test-pr-workflow.sh` fails if the restore is ever dropped. The `alignc` binary links mimalloc in every profile.
 
 The optional secrets make the external publishing steps fail closed: no secret means no tap or apt-repository mutation. Release assets are still produced.
 
@@ -39,7 +39,7 @@ The distributed compiler is not self-contained:
 - `clang-22` and compiler-rt are used by instrumented PGO.
 - zlib, zstd, and OpenSSL are linked only when the source program uses the corresponding standard-library capability. `crypto.argon2id` specifically requires OpenSSL 3.2 or newer.
 
-The Debian package therefore depends on LLVM/Clang 22 and the development packages that provide the capability-library linker names. It installs the real compiler and runtime archive together under `/usr/lib/align`, with `/usr/bin/alignc` as a small launcher. The apt installer configures apt.llvm.org before the Align repository. The Homebrew formula likewise installs both artifacts under `libexec`, and its launcher exposes the keg-only OpenSSL and zstd library directories through `LIBRARY_PATH` for the system linker.
+The Debian package therefore depends on LLVM/Clang 22 and the development packages that provide the capability-library linker names. It installs the real compiler, the REPL, and the runtime archive together under `/usr/lib/align`, with `/usr/bin/alignc` and `/usr/bin/align-repl` as small launchers. The apt installer configures apt.llvm.org before the Align repository. The Homebrew formula likewise installs all three artifacts under `libexec`, and its launchers expose the keg-only OpenSSL and zstd library directories through `LIBRARY_PATH` for the system linker — a bare symlink would not, and `align-repl` links a program on every entry.
 
 ## Repository setup required before the first published release
 
