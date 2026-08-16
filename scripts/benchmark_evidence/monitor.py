@@ -32,6 +32,12 @@ _COUNTER_FIELDS = (
     "foreign_container_events",
     "monitor_lost_events",
 )
+_MONOTONIC_TOTAL_FIELDS = (
+    "cpu_pressure_total_us",
+    "memory_pressure_total_us",
+    "swap_read_bytes",
+    "swap_write_bytes",
+)
 _EVENT_KINDS = {
     "throttle": "throttle_events",
     "thermal": "thermal_events",
@@ -268,6 +274,7 @@ def validate_report_observations(
 ) -> MonitorResult:
     """Replay report observations through the complete monitor lifecycle."""
 
+    observations = tuple(observations)
     lifecycle = MonitorLifecycle(expected_child_ids, max_sample_gap_ns)
     lifecycle.open()
     for ordinal, observation in enumerate(observations):
@@ -290,7 +297,10 @@ def validate_report_observations(
             lifecycle.record_post_run(snapshot)
         else:
             raise MonitorLifecycleError("report observation has an unknown phase")
-    return lifecycle.finish()
+    result = lifecycle.finish()
+    if result.observations != tuple(observations):
+        raise MonitorLifecycleError("replayed observations do not match the report")
+    return result
 
 
 def validate_child_ranges(
@@ -412,6 +422,16 @@ class MonitorLifecycle:
                     self._latch(f"monitor event counter changed: {field}")
                     if self._active_child is None:
                         self._latch("unattributed monitor event")
+            for field in _MONOTONIC_TOTAL_FIELDS:
+                before = getattr(self._last_snapshot, field)
+                after = getattr(snapshot, field)
+                if after < before:
+                    self._error(f"monitor counter reset: {field}")
+            if (
+                snapshot.swap_read_bytes > self._last_snapshot.swap_read_bytes
+                or snapshot.swap_write_bytes > self._last_snapshot.swap_write_bytes
+            ):
+                self._latch("monitor event: swap")
         observation = MonitorObservation.from_snapshot(
             len(self._observations), phase, child_id, snapshot
         )

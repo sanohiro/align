@@ -165,6 +165,8 @@ ReportProducer = Callable[
     verifier.ProducedEvidence,
 ]
 ProducedVerifier = Callable[[verifier.ProducedEvidence], verifier.VerifiedReport]
+Stager = Callable[[verifier.VerifiedReport, str], None]
+StagedCleanup = Callable[[str], None]
 Publisher = Callable[[verifier.VerifiedReport, str], None]
 
 
@@ -178,6 +180,8 @@ class ControllerHooks:
     manifests: ManifestCheck
     produce_report: ReportProducer
     verify_report: ProducedVerifier
+    stage_report: Stager
+    discard_staging: StagedCleanup
     publish: Publisher
 
     def __post_init__(self) -> None:
@@ -199,6 +203,8 @@ class ControllerHooks:
             ("manifests", self.manifests),
             ("produce_report", self.produce_report),
             ("verify_report", self.verify_report),
+            ("stage_report", self.stage_report),
+            ("discard_staging", self.discard_staging),
             ("publish", self.publish),
         ):
             if not callable(operation):
@@ -295,6 +301,7 @@ class Controller:
         acquired: bool,
         run_id: str | None,
         output_dir: str | None,
+        staging_attempted: bool,
         reservation_attempted: bool,
         uncertain: bool,
         error: Exception,
@@ -307,6 +314,15 @@ class Controller:
                 # before dropping the host lock so a later process cannot run.
                 self.lease.create_reservation(run_id, output_dir)
             except Exception:
+                fail_closed = True
+        if staging_attempted and output_dir is not None:
+            try:
+                # Staging is a trusted, lock-held publication input.  Its
+                # cleanup port is idempotent and must run before the model
+                # releases any guard after a later or partial failure.
+                self.hooks.discard_staging(output_dir)
+            except Exception:
+                uncertain = True
                 fail_closed = True
         try:
             cleanup_result = transaction.abort(
@@ -343,6 +359,7 @@ class Controller:
         uncertain = False
         active_child = False
         reservation_attempted = False
+        staging_attempted = False
         lease_reservation = False
         verified: verifier.VerifiedReport | None = None
         run_id: str | None = None
@@ -441,6 +458,8 @@ class Controller:
 
             phases.append("stage")
             transaction.stage_report()
+            staging_attempted = True
+            self.hooks.stage_report(verified, invocation.output_dir)
             transaction.create_reservation()
             phases.append("unlock")
             self.lease.release_lock_for_publication()
@@ -475,6 +494,7 @@ class Controller:
                 acquired=acquired,
                 run_id=run_id,
                 output_dir=invocation.output_dir if isinstance(invocation, cli.RunInvocation) else None,
+                staging_attempted=staging_attempted,
                 reservation_attempted=reservation_attempted,
                 uncertain=uncertain,
                 error=exc,

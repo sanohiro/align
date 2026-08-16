@@ -600,6 +600,60 @@ rejected("protected input changed path overlap", lambda: verifier.verify_artifac
     lambda _preimage, _signature: True,
 ))
 
+child_id_mismatch_observations = list(BODY["host_observations"])
+child_id_mismatch_observations[2] = replace(
+    child_id_mismatch_observations[2],
+    "child_id",
+    BODY["benchmarks"][0]["preparations"][1]["child_id"],
+)
+rejected("monitor child ID mismatch", lambda: verifier.verify_artifact(
+    verifier.EvidenceArtifact(
+        rs.encode_report(replace(BODY, "host_observations", child_id_mismatch_observations)),
+        SIGNATURE,
+        PR_BODY,
+        ATTESTATION,
+        EXPECTATIONS,
+    ),
+    lambda _preimage, _signature: True,
+))
+
+swap_observations = [
+    replace(observation, "swap_read_bytes", 0 if ordinal == 0 else 1)
+    for ordinal, observation in enumerate(BODY["host_observations"])
+]
+rejected("monitor swap event", lambda: verifier.verify_artifact(
+    verifier.EvidenceArtifact(
+        rs.encode_report(replace(BODY, "host_observations", swap_observations)),
+        SIGNATURE,
+        PR_BODY,
+        ATTESTATION,
+        EXPECTATIONS,
+    ),
+    lambda _preimage, _signature: True,
+))
+
+baseline_commit = O(
+    ("oid", B),
+    ("raw_sha256", H),
+    ("tree_oid", BASE_TREE),
+    ("parents", [B]),
+)
+baseline_in_candidate = replace(
+    BODY["candidate"],
+    "commits",
+    [baseline_commit, BODY["candidate"]["commits"][0]],
+)
+rejected("baseline pseudo-entry in candidate inventory", lambda: verifier.verify_artifact(
+    verifier.EvidenceArtifact(
+        rs.encode_report(replace(BODY, "candidate", baseline_in_candidate)),
+        SIGNATURE,
+        PR_BODY,
+        ATTESTATION,
+        EXPECTATIONS,
+    ),
+    lambda _preimage, _signature: True,
+))
+
 incomplete_observations = [
     replace(observation, "ordinal", ordinal)
     for ordinal, observation in enumerate(
@@ -999,6 +1053,8 @@ def make_hooks(
     fail_gate=None,
     fail_child=None,
     fail_verify=False,
+    fail_stage=False,
+    fail_discard=False,
     fail_publish=False,
     bad_manifests=False,
     bad_artifact_expectations=False,
@@ -1076,6 +1132,19 @@ def make_hooks(
         assert produced is PRODUCED
         return FAKE_VERIFIED
 
+    def stage(verified_value, output_dir):
+        assert verified_value.produced is PRODUCED or verified_value.produced is REGRESSION_PRODUCED
+        assert output_dir.startswith("/")
+        events.append("stage-report")
+        if fail_stage:
+            raise controller.ControllerError("fixture staging failed")
+
+    def discard(output_dir):
+        assert output_dir.startswith("/")
+        events.append("discard-stage")
+        if fail_discard:
+            raise controller.ControllerError("fixture staging discard failed")
+
     def publish(verified_value, output_dir):
         assert verified_value.produced is PRODUCED or verified_value.produced is REGRESSION_PRODUCED
         events.append("publish")
@@ -1089,6 +1158,8 @@ def make_hooks(
         manifests=manifests,
         produce_report=produce,
         verify_report=verify,
+        stage_report=stage,
+        discard_staging=discard,
         publish=publish,
     ), events
 
@@ -1109,7 +1180,7 @@ assert result.phases == (
 )
 assert lease.events == ["acquire", "reserve", "release", "mark", "finalize"]
 assert events[:4] == ["bootstrap", "host", "image", "source"]
-assert events[-3:] == ["produce", "verify-report", "publish"]
+assert events[-4:] == ["produce", "verify-report", "stage-report", "publish"]
 assert len([event for event in events if event.startswith("exec-")]) == len(schedule.full_schedule())
 
 hooks, events = make_hooks(regression=True)
@@ -1121,7 +1192,7 @@ assert result.verified is REGRESSION_REPORT_VERIFIED
 assert result.cleanup.accepted
 assert not lease.reserved
 assert result.phases[-1] == "regression"
-assert events[-3:] == ["produce", "verify-report", "publish"]
+assert events[-4:] == ["produce", "verify-report", "stage-report", "publish"]
 
 hooks, events = make_hooks(fail_gate="host")
 lease = FixtureLease()
@@ -1156,6 +1227,23 @@ assert not result.cleanup.fail_closed
 assert not lease.reserved
 assert "publish" not in events
 
+hooks, events = make_hooks(fail_stage=True)
+lease = FixtureLease()
+result = controller.Controller(CONFIG, hooks, lease).run(invocation())
+assert result.state == "rejected"
+assert not result.cleanup.fail_closed
+assert "publish" not in events
+assert events[-2:] == ["stage-report", "discard-stage"]
+assert not lease.reserved
+
+hooks, events = make_hooks(fail_stage=True, fail_discard=True)
+lease = FixtureLease()
+result = controller.Controller(CONFIG, hooks, lease).run(invocation())
+assert result.state == "fail-closed"
+assert result.cleanup.fail_closed
+assert lease.reserved
+assert events[-2:] == ["stage-report", "discard-stage"]
+
 hooks, events = make_hooks(bad_artifact_expectations=True)
 lease = FixtureLease()
 result = controller.Controller(CONFIG, hooks, lease).run(invocation())
@@ -1186,7 +1274,7 @@ result = controller.Controller(CONFIG, hooks, lease).run(invocation())
 assert result.state == "fail-closed"
 assert result.cleanup.fail_closed
 assert lease.reserved
-assert lease.events == ["acquire", "reserve", "release", "abort-keep"]
+assert events[-3:] == ["stage-report", "publish", "discard-stage"]
 
 print("trusted controller/verifier checks passed")
 PY

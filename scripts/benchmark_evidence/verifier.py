@@ -349,6 +349,8 @@ def _verify_review_chain(body: cj.Object, expected: ReportExpectations) -> None:
     commit_ids = [commit["oid"] for commit in commits]
     if not commit_ids or len(set(commit_ids)) != len(commit_ids):
         _error("candidate commit inventory must be nonempty and unique")
+    if expected.baseline in commit_ids:
+        _error("candidate commit inventory must not contain the baseline")
     if commit_ids[-1] != expected.candidate:
         _error("candidate commit inventory does not end at the expected candidate")
     by_id = {commit["oid"]: commit for commit in commits}
