@@ -478,7 +478,8 @@ nonempty-child observation: no range or child observation is reused or orphaned.
 carry the empty ID. Benchmarks are `json_decode`, then `json_soa`; each has preparations baseline
 then candidate, followed by warm-ups baseline then candidate. Pair ordinals are 1 through 10 with
 B/C arms in the specified balanced order. `Preparation.artifact_manifest_sha256` matches the
-manifest reverified by every later run of that benchmark/revision. `Run.samples` has fields in
+controller-owned schedule manifest for that benchmark/revision and the manifest reverified by
+every later run of that benchmark/revision. `Run.samples` has fields in
 benchmark order (two then three). Field results use the five field order above. Original samples
 follow pair ordinal; sorted samples are nondecreasing and exact permutations. `ratio_numerator` is
 candidate middle sum and `ratio_denominator` baseline middle sum.
@@ -494,7 +495,10 @@ surviving reservation marks any output unaccepted and blocks future runs until t
 validates and removes it. Reservation removal is a publication postcondition outside the
 already-signed measurement cleanup; accepted paths do not exist until that postcondition succeeds.
 `first_failed_field` is empty exactly for `pass`; for `regression` it is the first false field in
-field order. There are no conditional or omitted members.
+field order. The candidate `commit_sha256` equals the raw SHA-256 of the final candidate inventory
+entry. A controller may publish a valid `regression` report only as a distinct non-accepted result
+with exit status 1; a required-pass invocation rejects it before publication. There are no
+conditional or omitted members.
 
 For a `clean` review, `review_head` equals the candidate and `repair_commits` is empty. For a
 `fixed` review, `review_head` is the reviewed ancestor and `repair_commits` is the exact
@@ -683,7 +687,7 @@ measurement remain named later evidence.
 | Schedule/executor handoff | Drive the existing `ScheduleState` with an injected fixture executor. Every fixed preparation, warm-up, and alternating sample is started once, has a unique child ID, carries the sealed artifact digest, and is removed from the owned-resource ledger before the next child. Overlap, reorder, retry, build during measurement, artifact drift, timeout, signal, nonzero, and incomplete schedule reject. `benchmark_evidence_controller_verifier_matrix`. |
 | Cleanup/publication ordering | Drive the existing `CleanupTransaction` and require zero children/containers/mounts/fds/private directories plus unchanged source/cache manifests before report staging. Durable reservation precedes lock release; publication precedes reservation removal; any publish, unlock, or cleanup failure emits no accepted result and leaves a fail-closed reservation when ownership is uncertain. `benchmark_evidence_controller_verifier_matrix`. |
 | Report/signature handoff | Accept report bytes and signature bytes only from trusted fixture-owned producers after schedule and cleanup completion. The verifier returns the immutable artifact it actually checked, and publication receives that exact artifact through the result; the controller does not accept a candidate-provided report, opens no candidate module, and cannot publish different bytes. `benchmark_evidence_controller_verifier_matrix`. |
-| Report semantic reconstruction | Reconstruct the fixed child schedule and monitor ranges, every sample/token, baseline/candidate arrays, sorted permutations, middle sums, exact threshold comparison, verdict, run ID, baseline emptiness, candidate first-parent chain, and protected-input relationships; stored derived values are never trusted. `benchmark_evidence_controller_verifier_matrix`. |
+| Report semantic reconstruction | Reconstruct the fixed child schedule and monitor ranges, every sample/token, baseline/candidate arrays, sorted permutations, middle sums, exact threshold comparison, verdict, run ID, baseline emptiness, candidate first-parent chain, candidate final raw SHA-256, and protected-input relationships; bind every preparation manifest to the controller-owned schedule map; stored derived values are never trusted. A regression is published only as a distinct non-accepted result with exit status 1, and required-pass invocations reject it before publication. `benchmark_evidence_controller_verifier_matrix`. |
 | Verifier binding | Decode the canonical report, validate the full existing report schema and body digest, bind the complete profile identity bundle plus baseline/candidate/target/review fields to explicit trusted expectations, require `target.run_oid == BASE`, validate clean/fixed review-chain semantics and every candidate commit parent, parse exactly one value for every recognized PR-body preflight marker, and require an injected cryptographic signature check with the fixed report namespace/key. Wrong bytes, namespace, key, signature, attestation, repair chain, marker, identity, verdict, or expected OID reject without repository, build, benchmark, network, or output mutation. `benchmark_evidence_controller_verifier_matrix`. |
 | Failure and restart | Every exception has one terminal rejected or fail-closed result. The durable reservation is installed before any gate or child, remains while the lock is released and publication settles, and blocks a second invocation; final reservation removal reacquires the host lock and restores the reservation if its directory fsync fails. Accepted state is reachable only after the complete report/signature pair is durably published and the reservation is removed. Crash/restart and cleanup-failure fixtures never turn partial state into accepted evidence. `benchmark_evidence_controller_verifier_matrix`; `benchmark_evidence_exclusive_run`. |
 | Explicit deferrals | Real host inspection, Docker daemon/image execution, GitHub review API/token isolation, `ssh-keygen`/Ed25519 signing, raw Git revision construction, merge verification against a provider, and post-merge lifecycle advancement remain later capabilities and are not faked by this core. `benchmark_evidence_controller_verifier_matrix`. |
@@ -748,6 +752,9 @@ handoff unreviewed.
 | P1 pre-review candidate parents were unchecked | Every candidate inventory entry must have exactly one parent equal to the preceding OID from `BASE`; the final revision parent and tree must match the final inventory entry. The owner mutates the first entry's parent and requires rejection. |
 | P1 profile and execution identities were partial | One immutable trusted identity bundle is bound at the controller configuration and verifier expectation boundary. Profile ID, complete producer/verifier/monitor records, complete execution record, host ID, and image digest must match exactly; the owner mutates the image identity and requires rejection. |
 | P1 finalization could remove the only reservation before fsync failure | Finalization reacquires the host lock before removing the reservation. If unlink or parent fsync fails, the reservation is restored while that lock is held; the owner injects the post-unlink fsync failure and proves a second run remains blocked. |
+| P1 regression verdict collapsed into accepted state | Keep `regression` as a distinct non-accepted controller result and publish it with exit status 1; a required-pass invocation rejects it before publication. The owner runs a valid regression artifact through publication and asserts `result.accepted` is false. |
+| P1 preparation manifest was not bound to executed children | Compare every report preparation `(benchmark, revision)` manifest to the controller-owned `ScheduleState` map after verification and before staging. A semantically valid report with one altered preparation digest is rejected without publication. |
+| P2 candidate revision digest was not bound to its final inventory entry | Require `Revision.commit_sha256` to equal the final `CommitIdentity.raw_sha256`; a candidate report with only that digest altered is rejected. |
 
 ## Final-integration review closure
 

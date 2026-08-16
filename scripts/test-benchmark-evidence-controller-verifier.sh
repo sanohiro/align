@@ -88,7 +88,7 @@ def revision(*, candidate):
         )
     return O(
         ("commit_oid", C),
-        ("commit_sha256", H1),
+        ("commit_sha256", H),
         ("tree_oid", CANDIDATE_TREE),
         ("tree_manifest_sha256", H1),
         ("parents", [B]),
@@ -411,6 +411,87 @@ SIGNATURE = sshsig.encode_armor(sshsig.Signature(
 ARTIFACT = verifier.EvidenceArtifact(REPORT, SIGNATURE, PR_BODY, ATTESTATION, EXPECTATIONS)
 
 
+def bad_manifest_report():
+    benchmarks = []
+    for benchmark in BODY["benchmarks"]:
+        preparations = list(benchmark["preparations"])
+        if benchmark["name"] == "json_decode":
+            preparations[0] = replace(preparations[0], "artifact_manifest_sha256", H1)
+        benchmarks.append(replace(benchmark, "preparations", preparations))
+    return rs.encode_report(replace(BODY, "benchmarks", benchmarks))
+
+
+BAD_MANIFEST_REPORT = bad_manifest_report()
+BAD_MANIFEST_ARTIFACT = verifier.EvidenceArtifact(
+    BAD_MANIFEST_REPORT,
+    SIGNATURE,
+    PR_BODY,
+    ATTESTATION,
+    EXPECTATIONS,
+)
+BAD_MANIFEST_VERIFIED = verifier.verify_artifact(
+    BAD_MANIFEST_ARTIFACT,
+    lambda _preimage, _signature: True,
+)
+
+
+def regression_benchmarks():
+    result = []
+    for benchmark in BODY["benchmarks"]:
+        pairs = []
+        for pair in benchmark["pairs"]:
+            runs = []
+            for run in (pair["first"], pair["second"]):
+                if benchmark["name"] == "json_decode" and run["revision"] == "candidate":
+                    samples = list(run["samples"])
+                    samples[0] = replace(replace(samples[0], "microseconds", 2_000_000), "token", "2000.000")
+                    run = replace(run, "samples", samples)
+                runs.append(run)
+            pairs.append(O(("ordinal", pair["ordinal"]), ("first", runs[0]), ("second", runs[1])))
+        result.append(replace(benchmark, "pairs", pairs))
+    return result
+
+
+REGRESSION_BENCHMARKS = regression_benchmarks()
+REGRESSION_BODY = replace(
+    replace(
+        replace(
+            replace(BODY, "benchmarks", REGRESSION_BENCHMARKS),
+            "fields",
+            field_results(REGRESSION_BENCHMARKS),
+        ),
+        "verdict",
+        "regression",
+    ),
+    "first_failed_field",
+    "A-full",
+)
+REGRESSION_EXPECTATIONS = verifier.VerifierExpectations(
+    repository=EXPECTATIONS.repository,
+    pull_request=EXPECTATIONS.pull_request,
+    profile_sha256=EXPECTATIONS.profile_sha256,
+    identities=EXPECTATIONS.identities,
+    baseline=EXPECTATIONS.baseline,
+    candidate=EXPECTATIONS.candidate,
+    pr_body_sha256=EXPECTATIONS.pr_body_sha256,
+    review_attestation_sha256=EXPECTATIONS.review_attestation_sha256,
+    public_key_blob=EXPECTATIONS.public_key_blob,
+    require_pass=False,
+)
+REGRESSION_ARTIFACT = verifier.EvidenceArtifact(
+    rs.encode_report(REGRESSION_BODY),
+    SIGNATURE,
+    PR_BODY,
+    ATTESTATION,
+    REGRESSION_EXPECTATIONS,
+)
+REGRESSION_VERIFIED = verifier.verify_artifact(
+    REGRESSION_ARTIFACT,
+    lambda _preimage, _signature: True,
+)
+assert REGRESSION_VERIFIED.verdict == "regression"
+
+
 def rejected(label, action):
     try:
         action()
@@ -456,6 +537,18 @@ bad_candidate = replace(BODY["candidate"], "commits", [bad_commit])
 rejected("pre-review parent chain mismatch", lambda: verifier.verify_artifact(
     verifier.EvidenceArtifact(
         rs.encode_report(replace(BODY, "candidate", bad_candidate)),
+        SIGNATURE,
+        PR_BODY,
+        ATTESTATION,
+        EXPECTATIONS,
+    ),
+    lambda _preimage, _signature: True,
+))
+bad_commit_sha = replace(BODY["candidate"]["commits"][0], "raw_sha256", H1)
+bad_candidate_sha = replace(BODY["candidate"], "commits", [bad_commit_sha])
+rejected("candidate raw SHA mismatch", lambda: verifier.verify_artifact(
+    verifier.EvidenceArtifact(
+        rs.encode_report(replace(BODY, "candidate", bad_candidate_sha)),
         SIGNATURE,
         PR_BODY,
         ATTESTATION,
@@ -570,9 +663,13 @@ fixed_commits = [
     O(("oid", C), ("raw_sha256", H1), ("tree_oid", CANDIDATE_TREE), ("parents", [FIXED_HEAD])),
 ]
 fixed_candidate = replace(
-    replace(BODY["candidate"], "parents", [FIXED_HEAD]),
-    "commits",
-    fixed_commits,
+    replace(
+        replace(BODY["candidate"], "parents", [FIXED_HEAD]),
+        "commits",
+        fixed_commits,
+    ),
+    "commit_sha256",
+    H1,
 )
 fixed_review = replace(
     replace(
@@ -700,6 +797,8 @@ def make_hooks(
     fail_publish=False,
     bad_manifests=False,
     bad_artifact_expectations=False,
+    bad_report_manifests=False,
+    regression=False,
 ):
     events = []
 
@@ -746,12 +845,22 @@ def make_hooks(
                 public_key_blob=EXPECTATIONS.public_key_blob,
             )
             return verifier.EvidenceArtifact(REPORT, SIGNATURE, PR_BODY, ATTESTATION, wrong)
+        if bad_report_manifests:
+            return BAD_MANIFEST_ARTIFACT
+        if regression:
+            return REGRESSION_ARTIFACT
         return ARTIFACT
 
     def verify(artifact):
         events.append("verify")
         if fail_verify:
             raise verifier.VerificationError("fixture verifier rejected")
+        if bad_report_manifests:
+            assert artifact is BAD_MANIFEST_ARTIFACT
+            return BAD_MANIFEST_VERIFIED
+        if regression:
+            assert artifact is REGRESSION_ARTIFACT
+            return REGRESSION_VERIFIED
         assert artifact is ARTIFACT
         return FAKE_VERIFIED
 
@@ -790,6 +899,17 @@ assert events[:4] == ["bootstrap", "host", "image", "source"]
 assert events[-3:] == ["produce", "verify", "publish"]
 assert len([event for event in events if event.startswith("exec-")]) == len(schedule.full_schedule())
 
+hooks, events = make_hooks(regression=True)
+lease = FixtureLease()
+result = controller.Controller(CONFIG, hooks, lease).run(invocation())
+assert result.state == "regression"
+assert not result.accepted
+assert result.verified is REGRESSION_VERIFIED
+assert result.cleanup.accepted
+assert not lease.reserved
+assert result.phases[-1] == "regression"
+assert events[-3:] == ["produce", "verify", "publish"]
+
 hooks, events = make_hooks(fail_gate="host")
 lease = FixtureLease()
 result = controller.Controller(CONFIG, hooks, lease).run(invocation())
@@ -827,6 +947,15 @@ result = controller.Controller(CONFIG, hooks, lease).run(invocation())
 assert result.state == "rejected"
 assert not result.cleanup.fail_closed
 assert "produce" not in events
+assert not lease.reserved
+
+hooks, events = make_hooks(bad_report_manifests=True)
+lease = FixtureLease()
+result = controller.Controller(CONFIG, hooks, lease).run(invocation())
+assert result.state == "rejected"
+assert result.phases[-1] == "verify"
+assert not result.cleanup.fail_closed
+assert "publish" not in events
 assert not lease.reserved
 
 hooks, events = make_hooks(fail_publish=True)

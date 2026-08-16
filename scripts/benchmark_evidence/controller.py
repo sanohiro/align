@@ -16,6 +16,7 @@ from typing import Callable, Mapping
 
 from . import cleanup
 from . import cli
+from . import report_schema
 from . import schedule
 from . import verifier
 
@@ -221,6 +222,27 @@ def _fallback_cleanup(*, fail_closed: bool) -> cleanup.CleanupResult:
     )
 
 
+def _verify_artifact_manifests(
+    report_bytes: bytes,
+    expected: Mapping[tuple[str, str], str],
+) -> None:
+    """Bind report preparation manifests to the controller-owned schedule."""
+
+    try:
+        report = report_schema.decode_report(report_bytes)
+    except report_schema.ReportSchemaError as exc:
+        raise ControllerError(f"published report schema rejected: {exc}") from exc
+    actual: dict[tuple[str, str], str] = {}
+    for benchmark in report["body"]["benchmarks"]:
+        for preparation in benchmark["preparations"]:
+            key = (benchmark["name"], preparation["revision"])
+            if key in actual:
+                _error("report repeats a preparation manifest")
+            actual[key] = preparation["artifact_manifest_sha256"]
+    if actual != dict(expected):
+        _error("report preparation manifests do not match executed children")
+
+
 class Controller:
     """Drive one exact run from the exclusive lease to accepted publication."""
 
@@ -393,6 +415,11 @@ class Controller:
                 or verified.profile_sha256 != self.config.profile_sha256
             ):
                 _error("verified artifact is not bound to this invocation and profile")
+            if verified.verdict not in ("pass", "regression"):
+                _error("verified artifact has an unknown verdict")
+            if artifact.expectations.require_pass and verified.verdict != "pass":
+                _error("a required-pass invocation cannot publish a regression")
+            _verify_artifact_manifests(verified.artifact.report, schedule.manifest_map(state))
 
             phases.append("stage")
             transaction.stage_report()
@@ -410,10 +437,11 @@ class Controller:
             self.lease.finalize_publication()
             lease_reservation = False
             transaction.remove_reservation()
-            phases.append("accepted")
+            final_state = "regression" if verified.verdict == "regression" else "accepted"
+            phases.append(final_state)
             cleanup_result = transaction.accept()
             return ControllerResult(
-                state="accepted",
+                state=final_state,
                 phases=tuple(phases),
                 cleanup=cleanup_result,
                 verified=verified,

@@ -364,7 +364,7 @@ HostObservationはdense。全`Preparation`/`Run`はglobally unique `child_id`と
 first/lastは同IDのchild-start/end、interior child-sampleも同ID。rangeはglobal sequence順にstrictly
 increasing/disjointで、nonempty-child observation全体のexact partition。reuse/orphanなし。non-child phaseはempty ID。
 benchmark順はdecode/soa、各preparation B/C、warmup B/C、pair 1..10 balanced order。artifact manifestは
-同benchmark/revisionの全runで再verify。sample fieldは2/3順、field resultは5順。original sampleはpair順、
+controller-owned schedule mapの同benchmark/revision値と一致し、同benchmark/revisionの全runで再verify。sample fieldは2/3順、field resultは5順。original sampleはpair順、
 sortedはnondecreasing exact permutation。ratio numerator/denominatorはcandidate/baseline middle sum。
 
 cleanup countはzero、bool true。host lock保持中にsign/private staging fsync後、profile-fixed root-owned
@@ -374,7 +374,9 @@ reservation存在中のlater invocationはrepository前reject。failureはstate�
 unacceptedとしadmin recoveryまでfuture runをblock。
 reservation removalはalready-signed measurement cleanup外のpublication postconditionで、成功までaccepted pathなし。
 `first_failed_field`はpassでempty、regressionで最初の
-false field。conditional/omitted memberなし。
+false field。candidateの`commit_sha256`はfinal candidate inventory entryのraw SHA-256と一致する。
+controllerはvalidな`regression` reportをdistinctなnon-accepted result、exit status 1としてのみpublishし、
+`require_pass` invocationではpublication前にrejectする。conditional/omitted memberなし。
 
 `clean` reviewは`review_head=candidate`、`repair_commits=[]`。`fixed`はreviewed ancestorを
 `review_head`とし、その後candidateまでのnonempty exact first-parent順を`repair_commits`に記録する。
@@ -517,7 +519,7 @@ integration、final Request 7 measurementは後続のnamed evidenceとする。
 | Schedule/executor handoff | 既存の`ScheduleState`をfixture executorでdriveする。fixed preparation、warm-up、alternating sampleは各一回、unique child ID、sealed artifact digestを持ち、次child前にowned-resource ledgerからremoveする。overlap、reorder、retry、measurement中のbuild、artifact drift、timeout、signal、nonzero、incomplete scheduleはrejectする。`benchmark_evidence_controller_verifier_matrix`. |
 | Cleanup/publication ordering | 既存の`CleanupTransaction`をdriveし、report staging前にchildren/containers/mounts/fds/private directoriesがゼロでsource/cache manifestがunchangedであることを要求する。durable reservationをlock releaseより前、publicationをreservation removalより前に置く。publish、unlock、cleanupのfailureはaccepted resultを出さず、ownershipが不明ならfail-closed reservationを残す。`benchmark_evidence_controller_verifier_matrix`. |
 | Report/signature handoff | scheduleとcleanup完了後にtrusted fixture-owned producerから得たreport bytes/signature bytesだけを受け入れる。verifierは実際にcheckしたimmutable artifactをresultへ返し、publicationはそのexact artifactを受け取る。controllerはcandidate-provided reportを受け付けず、candidate moduleをopenせず、別bytesをpublishできない。`benchmark_evidence_controller_verifier_matrix`. |
-| Report semantic reconstruction | fixed child schedule、monitor range、各sample/token、baseline/candidate array、sorted permutation、middle sum、exact threshold比較、verdict、run ID、baseline empty、candidate first-parent chain、protected-input relationshipを再構成し、stored derived valueをtrustしない。`benchmark_evidence_controller_verifier_matrix`. |
+| Report semantic reconstruction | fixed child schedule、monitor range、各sample/token、baseline/candidate array、sorted permutation、middle sum、exact threshold比較、verdict、run ID、baseline empty、candidate first-parent chain、candidate final raw SHA-256、protected-input relationshipを再構成する。全preparation manifestをcontroller-owned schedule mapへbindし、stored derived valueをtrustしない。regressionはdistinctなnon-accepted result、exit status 1としてpublishし、`require_pass`ではpublication前にrejectする。`benchmark_evidence_controller_verifier_matrix`. |
 | Verifier binding | canonical reportをdecodeし、既存report schemaとbody digestを全検証する。complete profile identity bundleとprofile/baseline/candidate/target/review fieldをexplicit trusted expectationへbindし、`target.run_oid == BASE`、clean/fixed review-chain semantics、各candidate commit parent、recognized PR-body preflight markerのexact one valueを検証し、fixed report namespace/keyに対するinjected cryptographic signature checkを要求する。wrong bytes、namespace、key、signature、attestation、repair chain、marker、identity、verdict、expected OIDはrepository/build/benchmark/network/output mutationなしにrejectする。`benchmark_evidence_controller_verifier_matrix`. |
 | Failure and restart | exceptionは必ずterminal rejectedまたはfail-closed resultになる。durable reservationはgate/child前にinstallし、unlock後とpublication settleまで保持してsecond invocationをblockする。final reservation removal前にhost lockをreacquireし、directory fsync failureならreservationをrestoreする。accepted stateはcomplete report/signature pairをdurably publishしreservationをremoveした後だけ到達できる。crash/restartとcleanup failureでもpartial stateをaccepted evidenceへ変えない。`benchmark_evidence_controller_verifier_matrix`; `benchmark_evidence_exclusive_run`. |
 | Explicit deferrals | real host inspection、Docker daemon/image execution、GitHub review API/token isolation、`ssh-keygen`/Ed25519 signing、raw Git revision construction、providerとのmerge verification、post-merge lifecycle advanceは後続capabilityとし、このcoreで偽装しない。`benchmark_evidence_controller_verifier_matrix`. |
@@ -579,6 +581,9 @@ publication barrierの両方を証明できる。分割するとfixtureを重複
 | pre-review candidate parentが未検証 | candidate inventory全entryは`BASE`からpreceding OIDへのexact one-parent chainで、final revision parent/treeはfinal inventory entryと一致する。first entry parent mutation ownerでrejectを確認。 |
 | profile/execution identityがpartial binding | immutable trusted identity bundleをcontroller configとverifier expectation boundaryへbind。profile ID、producer/verifier/monitor complete record、complete execution record、host ID、image digestをexact matchし、image mutation ownerでrejectを確認。 |
 | fsync failure前にfinalizationが唯一のreservationをremove可能 | finalizationはreservation remove前にhost lockをreacquire。unlinkまたはparent fsync failure時はlock保持中にreservationをrestoreし、post-unlink fsync failure ownerでsecond runがblockされることを確認。 |
+| regression verdictがaccepted stateへcollapse | `regression`をdistinctなnon-accepted controller resultとして保持し、exit status 1でpublishする。`require_pass`ならpublication前にrejectし、valid regression artifactを通したownerで`result.accepted == false`を確認する。 |
+| preparation manifestがexecuted childへbindされていない | verification後・staging前に、reportの全`(benchmark, revision)` preparation manifestをcontroller-owned `ScheduleState` mapと比較する。preparation digestだけを変更したsemantically valid reportがpublicationなしでrejectされることをownerで確認する。 |
+| candidate revision digestがfinal inventory entryへbindされていない | `Revision.commit_sha256`がfinal `CommitIdentity.raw_sha256`と一致することを要求し、そのdigestだけを変更したcandidate reportをrejectするownerを持つ。 |
 
 ## Final-integration review closure
 

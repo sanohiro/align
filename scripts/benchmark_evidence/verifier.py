@@ -293,6 +293,8 @@ def _verify_review_chain(body: cj.Object, expected: VerifierExpectations) -> Non
         _error("candidate revision parents do not match its final commit")
     if by_id[commit_ids[-1]]["tree_oid"] != candidate["tree_oid"]:
         _error("candidate revision tree does not match its final commit")
+    if candidate["commit_sha256"] != by_id[commit_ids[-1]]["raw_sha256"]:
+        _error("candidate revision digest does not match its final commit")
 
     review = body["review"]
     repair = list(review["repair_commits"])
