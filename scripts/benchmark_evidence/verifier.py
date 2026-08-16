@@ -306,12 +306,11 @@ def _verify_review_chain(body: cj.Object, expected: VerifierExpectations) -> Non
     if review["review_head"] == expected.candidate or not repair:
         _error("fixed review must name an ancestor and a nonempty repair chain")
     if review["review_head"] == expected.baseline:
-        start = -1
-    else:
-        try:
-            start = commit_ids.index(review["review_head"])
-        except ValueError as exc:
-            raise VerificationError("fixed review head is absent from candidate commits") from exc
+        _error("fixed review must name a reviewed commit after the baseline")
+    try:
+        start = commit_ids.index(review["review_head"])
+    except ValueError as exc:
+        raise VerificationError("fixed review head is absent from candidate commits") from exc
     if commit_ids[start + 1 :] != repair:
         _error("repair commits are not the exact suffix after the reviewed ancestor")
     previous = review["review_head"]
@@ -328,6 +327,12 @@ def _checked_u64_sum(left: int, right: int, label: str) -> int:
     if value > cj.MAX_U64:
         _error(f"{label} overflows u64")
     return value
+
+
+def _checked_u64_product(left: int, right: int, label: str) -> int:
+    if left != 0 and right > cj.MAX_U64 // left:
+        _error(f"{label} overflows u64")
+    return left * right
 
 
 def _sample_token(microseconds: int) -> str:
@@ -492,7 +497,17 @@ def _verify_report_semantics(body: cj.Object, expected: VerifierExpectations) ->
             _error("ratio denominator is not the baseline middle sum")
         if baseline_middle_sum == 0:
             _error("baseline middle sum must be positive")
-        passed = candidate_middle_sum * 100 <= baseline_middle_sum * 105
+        candidate_threshold = _checked_u64_product(
+            candidate_middle_sum,
+            100,
+            "candidate threshold product",
+        )
+        baseline_threshold = _checked_u64_product(
+            baseline_middle_sum,
+            105,
+            "baseline threshold product",
+        )
+        passed = candidate_threshold <= baseline_threshold
         if field_result["passed"] is not passed:
             _error("field pass state does not match the exact threshold comparison")
 

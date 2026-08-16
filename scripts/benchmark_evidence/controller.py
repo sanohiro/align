@@ -222,6 +222,18 @@ def _fallback_cleanup(*, fail_closed: bool) -> cleanup.CleanupResult:
     )
 
 
+def _fail_closed_cleanup(result: cleanup.CleanupResult) -> cleanup.CleanupResult:
+    """Do not report a clean reservation when the external abort is uncertain."""
+
+    return cleanup.CleanupResult(
+        accepted=False,
+        fail_closed=True,
+        staging_present=result.staging_present,
+        output_present=result.output_present,
+        reservation_present=True,
+    )
+
+
 def _verify_artifact_manifests(
     report_bytes: bytes,
     expected: Mapping[tuple[str, str], str],
@@ -307,6 +319,7 @@ class Controller:
                 # may remove an unused reservation and release the lock.
                 self.lease.abort(remove_reservation=not uncertain)
             except Exception:
+                cleanup_result = _fail_closed_cleanup(cleanup_result)
                 fail_closed = True
         return ControllerResult(
             state="fail-closed" if fail_closed else "rejected",

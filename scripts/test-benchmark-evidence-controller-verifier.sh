@@ -492,6 +492,46 @@ REGRESSION_VERIFIED = verifier.verify_artifact(
 assert REGRESSION_VERIFIED.verdict == "regression"
 
 
+def overflow_benchmarks():
+    result = []
+    overflow_us = cj.MAX_U64 // 100 + 1
+    for benchmark in BODY["benchmarks"]:
+        pairs = []
+        for pair in benchmark["pairs"]:
+            runs = []
+            for run in (pair["first"], pair["second"]):
+                if benchmark["name"] == "json_decode" and run["revision"] == "baseline":
+                    samples = []
+                    for sample in run["samples"]:
+                        if sample["field"] == "A-full":
+                            sample = replace(
+                                replace(sample, "microseconds", overflow_us),
+                                "token",
+                                f"{overflow_us // 1_000}.{overflow_us % 1_000:03d}",
+                            )
+                        samples.append(sample)
+                    run = replace(run, "samples", samples)
+                runs.append(run)
+            pairs.append(O(("ordinal", pair["ordinal"]), ("first", runs[0]), ("second", runs[1])))
+        result.append(replace(benchmark, "pairs", pairs))
+    return result
+
+
+OVERFLOW_BENCHMARKS = overflow_benchmarks()
+OVERFLOW_BODY = replace(
+    replace(BODY, "benchmarks", OVERFLOW_BENCHMARKS),
+    "fields",
+    field_results(OVERFLOW_BENCHMARKS),
+)
+OVERFLOW_ARTIFACT = verifier.EvidenceArtifact(
+    rs.encode_report(OVERFLOW_BODY),
+    SIGNATURE,
+    PR_BODY,
+    ATTESTATION,
+    EXPECTATIONS,
+)
+
+
 def rejected(label, action):
     try:
         action()
@@ -554,6 +594,10 @@ rejected("candidate raw SHA mismatch", lambda: verifier.verify_artifact(
         ATTESTATION,
         EXPECTATIONS,
     ),
+    lambda _preimage, _signature: True,
+))
+rejected("threshold product overflow", lambda: verifier.verify_artifact(
+    OVERFLOW_ARTIFACT,
     lambda _preimage, _signature: True,
 ))
 rejected("wrong trusted execution identity", lambda: verifier.verify_artifact(
@@ -707,6 +751,35 @@ fixed_verified = verifier.verify_artifact(
 assert fixed_verified.review_state == "fixed"
 assert fixed_verified.artifact.review_attestation == FIXED_ATTESTATION
 
+BASELINE_FIXED_BODY = replace(
+    fixed_body,
+    "review",
+    replace(fixed_body["review"], "review_head", B),
+)
+BASELINE_FIXED_ATTESTATION = attestation(B, "fixed")
+BASELINE_FIXED_PR_BODY = pr_body(B, "fixed")
+BASELINE_FIXED_EXPECTATIONS = verifier.VerifierExpectations(
+    repository="sanohiro/align",
+    pull_request=7,
+    profile_sha256=PROFILE,
+    identities=IDENTITIES,
+    baseline=B,
+    candidate=C,
+    pr_body_sha256=hashlib.sha256(BASELINE_FIXED_PR_BODY).hexdigest(),
+    review_attestation_sha256=hashlib.sha256(BASELINE_FIXED_ATTESTATION).hexdigest(),
+    public_key_blob=key_blob(),
+)
+rejected("fixed review rooted at baseline", lambda: verifier.verify_artifact(
+    verifier.EvidenceArtifact(
+        rs.encode_report(BASELINE_FIXED_BODY),
+        SIGNATURE,
+        BASELINE_FIXED_PR_BODY,
+        BASELINE_FIXED_ATTESTATION,
+        BASELINE_FIXED_EXPECTATIONS,
+    ),
+    lambda _preimage, _signature: True,
+))
+
 
 class FixtureLease:
     def __init__(self):
@@ -714,6 +787,7 @@ class FixtureLease:
         self.locked = False
         self.reserved = False
         self.closed = False
+        self.fail_abort = False
 
     def acquire(self):
         assert not self.locked and not self.reserved
@@ -742,6 +816,8 @@ class FixtureLease:
         self.events.append("finalize")
 
     def abort(self, *, remove_reservation):
+        if self.fail_abort:
+            raise OSError("fixture abort failed")
         self.events.append("abort-remove" if remove_reservation else "abort-keep")
         self.locked = False
         if remove_reservation:
@@ -917,6 +993,15 @@ assert result.state == "rejected"
 assert not result.cleanup.fail_closed
 assert result.phases == ("exclusive", "reserve", "bootstrap", "host")
 assert "image" not in events and not lease.reserved
+
+hooks, events = make_hooks(fail_gate="host")
+lease = FixtureLease()
+lease.fail_abort = True
+result = controller.Controller(CONFIG, hooks, lease).run(invocation())
+assert result.state == "fail-closed"
+assert result.cleanup.fail_closed
+assert result.cleanup.reservation_present
+assert lease.reserved
 
 hooks, events = make_hooks(fail_child=0)
 lease = FixtureLease()
