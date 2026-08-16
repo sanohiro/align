@@ -37,7 +37,7 @@ controller は provider API/credential を使わない。通常の GitHub public
 | Public verifier | `/opt/align-evidence/v1/bin/align-json-escape-evidence verify --report REPORT --signature SIGNATURE --expected-baseline BASE --expected-candidate CANDIDATE --pr-body PR_BODY --review-attestation REVIEW_ATTESTATION`。bytes/signature/report/review/preflightをexplicit OID、PR body、trusted review attestationへ照合。localはdiagnostic、acceptanceはtrusted-base CIがGitHub event/APIからcheckout外で入力を作る。build/checkout/network/mutationなし。 |
 | Public merge verifier | `/opt/align-evidence/v1/bin/align-json-escape-evidence verify-merge --repository REPO --report REPORT --signature SIGNATURE --merge MERGE --output-dir NEW_DIR`。provider response exact object fetch後、reportを再verify、raw-object pathで`MERGE`を読み、local target first-parent chain、parents/treeを照合しexact `merge-verification.json`/`merge-verification.json.sig`を出力。`NEW_DIR`不存在、overrideなし。 |
 | Trusted review adapter | trusted-base CIだけがevent repo/PRのGitHub review APIをjob tokenでquery。PR author、write roleなし、dismissed/stale/duplicate/wrong commit、exact report `log_sha256`なしをreject。canonical `REVIEW_ATTESTATION`をcheckout外で作りverifierへ渡す。token/raw responseはcontroller/candidate/report/container/PR argumentへ渡さない。 |
-| Ambient state | semantic default なし。empty environment に fixed `PATH`, `LC_ALL=C`, `TZ=UTC`, empty `HOME`, `CARGO_NET_OFFLINE=true` と controller-created descriptor/config だけを置く。ambient Git/Cargo/Rust/Docker/locale/proxy/credential/target/tuning は渡さない。 |
+| Ambient state | semantic default なし。empty environment に fixed `PATH`, `LC_ALL=C`, `TZ=UTC`, empty `HOME`, `CARGO_NET_OFFLINE=true`, fixed `DOCKER_CONFIG=/etc/align-evidence/docker-empty`, fixed `DOCKER_HOST=unix:///var/run/docker.sock` と controller-created descriptor/config だけを置く。ambient Git/Cargo/Rust/Docker/locale/proxy/credential/target/tuning は渡さない。 |
 | Result | successはexclusive lockを取得し、repository/image/container/child work前にprofile-global publication reservationをcreate/fsyncする。その後lock中にprivate `report.json`/signature/directoryをfsyncし、unlock、`NEW_DIR`へatomic rename、parent fsync、reservation remove/fsync、path出力を行う。reservationはpre-publication crashでも残りadmin recoveryに渡る。reservation中のsecond invocationはrepository/image/container前reject。threshold failureも同sequence。failureはstaging/output/reservationを可能な限り削除しpathなし、uncertain cleanupはreservationをfail-closedで残す。 |
 | Controller owner | checked-in Python 3 controller、root-owned installed launcher、`scripts/` と `tests/benchmark_evidence/` の fixture tests。installed/source relation、installer manifest、interpreter、Git、Docker client/daemon、`ssh-keygen`、kernel、OCI image、host profile、executable SHA-256 をすべて記録する。candidate file は evidence root にならない。 |
 | Persisted format | canonical UTF-8 JSON `align.json_escape_benchmark_evidence/v1` と `align.json_escape_benchmark_merge_verification/v1`。それぞれhost Ed25519 keyとfixed namespaceでbyte-for-byte署名。unknown/missing/duplicate/reordered/non-ASCII key、non-integer/float、invalid UTF-8/escape、trailing/noncanonical bytesはreject。 |
@@ -78,14 +78,16 @@ canonical profile `bench/json_escape/evidence/linux-x86_64-v1.json` は以下を
 - schema/profile ID、fixed local target ref `refs/heads/main`、host ID、machine/kernel、CPU
   vendor/family/model/stepping/microcode、online/benchmark CPU set、NUMA、minimum memory。
 - host-global lock path と pre/between/post resource limit。
-- Docker client/daemon version/hash/architecture/storage/cgroup/runtime identity。
+- Docker client/daemon version/hash/architecture/storage/cgroup version/driver、全childが使うroot-level
+  cgroup parent、runtime identity。
 - image registry digest、local image/config digest、`linux/amd64`、Python/Git/Cargo/rustc/LLVM/CC/linker/
   `ssh-keygen` version/hash。
 - read-only Cargo home/cache manifest、fixed Cargo config、capture ceiling、phase timeout、public key/fingerprint。
 - threshold `105/100`、warm-up `1`、pair `10`、benchmark/field inventory。
 
 mutable tag、wildcard、caller override、optional identity、secret はない。変更は新しい reviewed profile ID。
-controller は lock、native x86_64 host/daemon、CPU/microcode/memory/no quota、executable、runtime、local
+controller は lock、native x86_64 host/daemon、CPU/microcode/memory/no quota、profile-bound root-level child
+cgroup parent、executable、runtime、local
 `--pull=never` image と digest/config/platform、load、image self-inspection の tool identity を確認する。
 ARM/Rosetta/QEMU/binfmt/cross-arch/mutable tag/change は reject。この lane は x86_64/ARM を emulate しない。
 
@@ -534,6 +536,102 @@ gateを対応するprivileged adapterへ置き換える。
 strict dormant producer-to-consumer chainを一つに保つことで、report-only producer fixtureとexplicit post-PR artifact
 fixtureがverifier bindingとpublication barrierを証明できる。さらに分割するとfixtureを重複させ、controllerのbyte
 handoffを未reviewのまま残す。
+
+## Native host qualification implementation closure
+
+PR #842でdeterministicなcontroller/verifier consumerをmergeした。次のcapabilityはprivilegedなnative host/daemon
+adapterである。named Linux hostとDockerのobservationを読み、既存の`host.qualify` boundaryへ渡すcanonical
+inspection recordを構築する。profileを広げず、candidate codeをinspectせず、imageをexecuteせず、benchmarkをstartせず、
+signing keyをprovisionせず、これだけでaccepted Request 7 evidenceをclaimしない。
+
+adapterはfixed absolute command、empty environment、bounded output、deterministic parserを使い、ownerではreader/runnerを
+injectする。real host runはadministratorのself-qualification operationであり、deterministic ownerはcurrent machineのCPU、
+kernel、cgroup、Docker、load stateに依存してはならない。
+
+このcapabilityではfixed source ownership、bounded process execution、Docker identity acquisition、canonical host assemblyを
+意図的に一つに保つ。このseamでdormant native producer chainを分割するとdescriptor/process cleanup proofが重複し、
+一つのacquisition boundaryとしてcheckされていないhost recordが残る。
+
+| Axis | Implementation / owner |
+|---|---|
+| Host identity | fixed machine identity、kernel、architecture、全`/proc/cpuinfo` processor record、microcode、online CPU set、NUMA set、physical memoryをno-follow/fixed sourceから読む。host IDとbenchmark CPU setはroot-ownedかつbenchmark accountからwrite不能な`/etc/align-evidence/host-id`と`/etc/align-evidence/benchmark-cpus`だけから読み、kernel sourceは`native_host.py`に固定した`/proc`/`/sys` pathとする。profile指定のx86_64 spellingだけをnormalizeし、selected benchmark CPUの全recordにprofileのvendor/family/model/stepping/microcodeを要求し、missing、repeated、malformed、heterogeneous、cross-architecture valueをrejectする。fixed-source openはregular-file validation前にnonblockingとする。`benchmark_evidence_native_host_matrix`. |
+| CPU and quota boundary | host cgroup quotaを読みprofileのunquotaed valueを要求する。cgroup v2はunquotaedとして`cpu.max=max <positive-period>`だけを受け入れ、v1 fallbackはpositive periodと`cpu.cfs_quota_us=-1`だけを受け入れ、malformed、zero、positive quotaをrejectする。Docker infoの`CgroupDriver`はprofileと一致しなければならない。profileはdriverに対応するroot-level child parentも固定する：`cgroupfs`は`/`、`systemd`は`-.slice`。container argvはこれを明示的に渡し、daemon/service-manager cgroupのfinite ancestorがchildをthrottleできないようにする。profile benchmark CPU setがonlineでcanonicalであること、NUMA setが存在することを要求し、alias、empty set、quota、migration、ARM/emulation identityをDocker前にrejectする。`benchmark_evidence_native_host_matrix`; `benchmark_evidence_container_matrix`. |
+| Docker daemon identity | pinned Docker clientだけをfixed argv、empty environment、root-owned emptyな`/etc/align-evidence/docker-empty` config directory、explicitなlocal `unix:///var/run/docker.sock` endpoint、bounded stdout/stderr、no shell、timeoutでinvokeする。retained executable descriptorをhashしてprofileと比較し、どちらのcommandより前に一致を要求してから同じdescriptor経由で両commandをexecuteする。client versionは`docker version.Client`からだけ取得し、全daemon field（`ServerVersion`、`Architecture`、storage driver、cgroup version、`CgroupDriver`、`DefaultRuntime`、`Runtimes`、`RuncCommit.ID`）は一つの`docker info` responseから取得する。fixed profile laneはprofile-bound cgroup driver、`DefaultRuntime=runc`、structuredな`Runtimes.runc` entryを要求し、daemon-reportedな`RuncCommit.ID` runtime identityを記録する。daemon unavailable、nonzero/truncated output、wrong architecture、alias-onlyまたはunselected runtime data、mixed daemon response、profile mismatchをrejectする。`benchmark_evidence_native_host_matrix`; `benchmark_evidence_process_boundary_matrix`. |
+| Qualification snapshots | `pre`、`between`、`post`のexact 3 snapshotを、実際のacquisition transitionでcaptureする。すなわち`docker version`前、`docker version`後かつ`docker info`前、`docker info`後とする。integer parsingとfixed counter unitを使い、pressure/swap counterのresetをrejectし、profile limit/orderは`host.qualify`をone validation boundaryとして保つ。missing source、reset/overflow、invalid unit、extra phaseはrejectする。`benchmark_evidence_native_host_matrix`. |
+| Ownership and failure | adapterは自分がopenしたdescriptorとspawnしたchildだけをownし、leaderが終了した後もcomplete process groupへbounded TERM/KILL cleanupを行い、`ESRCH`だけを既に消えたgroupとして扱い、全pathでclose/reapする。host configurationやrepository stateをmutateせず、timeout、close/reap uncertainty、parser error、cleanup failureの後はqualified recordを返さない。`benchmark_evidence_native_host_matrix`. |
+| Explicit deferrals | image self-inspection/toolchain reproduction、monitorのchild event stream、cryptographic key-process integration、provider/review API integration、performance measurement、merge verification、lifecycle advanceは後続capabilityとする。`benchmark_evidence_native_host_matrix`. |
+
+## Native host review closure
+
+最初のnative acquisition候補に対する独立reviewは5件のboundary gapをvalidとした。修正はこのcapability内に留まり、accepted evidenceのclaimは広げない。
+
+| Finding | Ledger-first closure |
+|---|---|
+| remote Docker contextをqualificationできた | fixed environmentはroot-owned empty Docker config directoryを指定し、両fixed command vectorはlocal Unix socketを明示する。ownerはexact vectorとenvironmentを確認し、user context、endpoint、credential、proxyによるdaemon redirectを許さない。 |
+| hashしたDocker bytesとexecute bytesが異なり得た | real Docker pathは一つのno-follow executable descriptorをopenしてhashし、`/proc/self/fd/<fd>`経由で両fixed commandを同じdescriptorからexecし、両command後にcloseする。path replacementはhash後の別clientを差し替えられない。 |
+| ineligible host stateがDockerへ到達した | native architectureとCPU quotaをfixed sourceのparse直後に、runner call前にrejectする。ownerはrejecting runnerで両pathがDocker-freeであることを証明する。 |
+| pressureまたはswap counterがsnapshot間でresetできた | 3つのobservationを順序どおり比較し、CPU-pressure、memory-pressure、swap read/write totalのmonotonicityを要求する。resetはterminal native acquisition errorとなる。 |
+| command leaderがdescendantを残せた | cleanupはowned process groupへsignalし、direct childをreapせずにobserveし、`SIGKILL`へescalateしてからreapする。ownerはleaderがexitするdescendantを起動し、遅延markerが書かれないことを証明する。 |
+
+## Native host second-review redesign closure
+
+改訂候補のreviewで、新しいP1と関連するprocess/configuration boundary gapが3件見つかった。
+実装前にnative-host process-trust axisのclosure matrixを再openした。accepted evidenceのclaimは変えない。
+
+| Finding | Ledger-first redesign / owner |
+|---|---|
+| mutableなDocker executableがhashとexecの間に変わり得た | `_open_executable`は、retained descriptorをhashまたはexecする前に、regular executableでroot所有かつbenchmark accountからwrite不能であることを要求する。root administrationは明示的なtrust boundaryとして残し、ownerはnon-root ownershipとgroup/other writeのmetadataを検証する。`benchmark_evidence_native_host_matrix`. |
+| fixed Docker config directory自体をtrustしていなかった | validatorは`/`、`etc`、`align-evidence`、`docker-empty`をdescriptor-relativeな`O_DIRECTORY|O_NOFOLLOW` openで順にwalkし、全componentのroot ownershipとbenchmark accountからのwrite不能、およびfinal directoryがemptyであることを要求する。どちらのDocker childもspawnする前に検証し、ownerはno-follow flag、cleanup、ownership、permission、nonempty rejectを確認する。`benchmark_evidence_native_host_matrix`. |
+| spawn後のexceptionがchildまたはstreamをleakできた | selector作成、stream setup、nonblocking設定、buffer構築をouter cleanup guard内に置く。injected setup failureでdescendantを起動し、owned group全体がteardownされることを証明する。`benchmark_evidence_process_boundary_matrix`; `benchmark_evidence_native_host_matrix`. |
+| leaderをfinal group signal前にreapするとPGIDを再利用し得た | accepted Linux pathは`waitid(WNOWAIT)`でdirect childのexitをreapせず観測し、`SIGTERM`、non-reaping observe、`SIGKILL`、最後に`Popen.wait`の順で処理する。non-reaping waitを持たない環境はsuccessful commandがboundaryを越える前にfail closedする。ownerはTERM/observe/KILL/reap順をassertする。`benchmark_evidence_process_boundary_matrix`. |
+
+## Native host identity and cleanup review closure
+
+次の改訂候補reviewで、identityとfail-closed cleanupに関するactionable gapが4件見つかった。
+実装前にnative-host identity-and-cleanup axisのclosure matrixを再openした。accepted evidenceのclaimは変えない。
+
+| Finding | Ledger-first redesign / owner |
+|---|---|
+| Docker runtime identityが`DefaultRuntime` aliasだけだった | adapterはDocker infoの`RuncCommit` objectを要求し、daemon-reportedなruntime versionまたはcommit identityであるnon-empty `ID`を記録する。name-onlyの`DefaultRuntime` valueは受け入れない。`benchmark_evidence_native_host_matrix`. |
+| profile外のDocker clientがdaemonへ接続できた | retained executable hashをno-follow/trust check後に`profile.docker.client_sha256`と比較し、どちらのDocker childをspawnするより前に一致を要求する。ownerはmismatchがconfig/open/hashで止まりrunner eventを出さないことを証明する。`benchmark_evidence_native_host_matrix`. |
+| profile host fileをin-placeで変更できた | trusted source readerはfixedな`host-id`と`benchmark-cpus` descriptorがread前にregular、root-owned、benchmark accountからwrite不能であることを要求する。injected metadataでownershipとgroup/other writeをcoverする。`benchmark_evidence_native_host_matrix`. |
+| process-group signal failureを隠していた | cleanupは`ESRCH`だけをignoreし、それ以外のTERM/KILL failureをbest-effort cleanup後のnative acquisition errorにする。cleanup uncertaintyを越えてsuccessful commandやqualified recordを返さない。ownerは`EPERM`をinjectしてrejectを要求する。`benchmark_evidence_process_boundary_matrix`; `benchmark_evidence_native_host_matrix`. |
+
+## Native host phase and daemon-coherence review closure
+
+次のfresh reviewで、phase境界に関する2件のP1と、関連するdaemon identity gapが1件見つかった。実装前に
+native-host phase-and-daemon-coherence axisのclosure matrixを再openした。accepted evidenceのclaimは変えない。
+
+| Finding | Ledger-first redesign / owner |
+|---|---|
+| Qualification phaseをDocker acquisition前にまとめて取得していた | `inspect`は`docker version`前に`pre`をcaptureし、version command後かつ`docker info`前にphase hookを呼んで`between`をcaptureし、info commandとparserの完了後にだけ`post`をcaptureする。ownerはsource readとcommand eventを記録して実際のtransition順を証明し、complete sequence後もmonotonic validationを行う。`benchmark_evidence_native_host_matrix`. |
+| selected Docker runtimeがprofiled laneにbindされていなかった | fixed laneはdaemonの`docker info.DefaultRuntime == "runc"`とstructuredな`docker info.Runtimes.runc` entryを要求してから`RuncCommit.ID`を受け入れる。`RuncCommit` fieldがあってもdefault runtimeが別ならqualificationしない。`benchmark_evidence_native_host_matrix`. |
+| daemon identityが2つのresponseを混ぜ得た | `docker version`はclient recordだけを供給する。`ServerVersion`、`Architecture`、storage driver、cgroup version、default runtime、runtime registry、`RuncCommit.ID`は同じ`docker info` responseから取得し、canonical daemon identityが別daemonのversion responseを混ぜないようにする。`benchmark_evidence_native_host_matrix`. |
+
+## Native host effective-quota and source-closure redesign
+
+`368afc0d`のfresh reviewで、phase/daemon-coherence repairの後にもP1が2件、P2が1件見つかった。従来のquota rowは
+cgroup rootだけをcheckしており、Dockerのdefault child parentがfinite ancestorを継承し得ること、また最初の
+`/proc/cpuinfo` recordを別のselected CPUに使っていたことが原因である。実装前にnative-host-effective-quota-and-source
+axisのclosure matrixを再openした。
+
+この redesign のpublic/profile ledgerは以下である。
+
+| Public record | Exact contract / owner |
+|---|---|
+| `profile.docker.cgroup_driver` | daemon `docker info.CgroupDriver`のexactな`cgroupfs`または`systemd`。profile-ownedでcaller default/overrideなし。native hostと`host.qualify`がDocker前にbindする。`benchmark_evidence_profile_matrix`; `benchmark_evidence_native_host_matrix`. |
+| `profile.docker.cgroup_parent` | driverに対応するroot-level child selectorをexactに持つ。`cgroupfs`は`/`、`systemd`は`-.slice`。trusted container argv builderだけがverbatimで渡し、caller-selected alternativeはない。`benchmark_evidence_profile_matrix`; `benchmark_evidence_container_matrix`. |
+| Container cgroup boundary | 全child argvに`--cgroup-parent=<profile.docker.cgroup_parent>`を含め、CPU-quota overrideは持たない。finite daemon/service-manager ancestorをselected child hierarchyの外に置き、root quotaはnative qualificationでrejectする。Docker自身のcreate/start errorはcandidate work前のterminal failure。`benchmark_evidence_container_matrix`. |
+| Selected CPU identity | 全processor recordをparseし、uniqueなdecimal processor IDを要求し、canonical benchmark CPU setの全IDが存在することを要求し、selected record全てのvendor/family/model/stepping/microcodeをprofileと比較する。全selected recordが一致した後、lowest selected IDをcanonical outputに使う。`benchmark_evidence_native_host_matrix`. |
+| Fixed-source open | 全fixed no-follow pre-validation open（source file、Docker executable、config directoryを含む）に`O_NONBLOCK`を加え、metadataでspecial fileをread/exec前にrejectする。`benchmark_evidence_native_host_matrix`. |
+
+| Closure axis | Implementation closure / exact regression |
+|---|---|
+| Formation and validation | 2つのexact Docker profile fieldを追加し、driver/parentのcross-field productをvalidateし、daemon identityと同じ`docker info`から`CgroupDriver`をparseし、unknown/mismatch productをDocker/container use前にrejectする。profile、host、native-host、container ownerが両driverとmalformed/mismatchをcoverする。 |
+| Construction and propagation | profileのcgroup parentをtrusted `container.build_argv`へ渡し、ambient daemon configまたはcaller inputから推論しない。argv ownerがexact optionとunbound alternativeのabsenceをassertする。 |
+| CPU source and joins | CPU identity construction前に全processor recordをparseし、benchmark CPU setでselectし、selected record全てをvalidateし、既存machine schemaには一つのcanonical selected recordだけを残す。heterogeneous first/non-first/missing/duplicate processorはDocker command前にrejectする。 |
+| Failure and cleanup | nonblocking special-file openはread/stat-dependent work前にrejectし、既存descriptor/child cleanupは保持する。FIFO ownerはalarm依存のhangなしにsource/executable pathをcoverする。 |
+| Mirrors and acceptance | English/Japanese public/profile prose、profile/host/container/native-host owner、既存native review chainを一致させる。このcapabilityはimageをexecuteせず、final Request 7 evidenceをclaimしない。 |
 
 ## Design-review finding closure
 

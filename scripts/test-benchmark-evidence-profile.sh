@@ -74,6 +74,8 @@ def valid_profile():
                 ("daemon_architecture", "x86_64"),
                 ("storage_driver", "overlay2"),
                 ("cgroup_version", "2"),
+                ("cgroup_driver", "cgroupfs"),
+                ("cgroup_parent", "/"),
                 ("oci_runtime", "runc-1.1"),
             ),
         ),
@@ -157,6 +159,13 @@ def main():
     assert profile.profile_sha256(raw) == hashlib.sha256(raw).hexdigest()
     assert cj.decode(raw).pairs == value.pairs
 
+    systemd = update(
+        update(value, ("docker", "cgroup_driver"), "systemd"),
+        ("docker", "cgroup_parent"),
+        "-.slice",
+    )
+    assert profile.encode_profile(systemd).endswith(b"\n")
+
     rejected(update(value, ("machine", "architecture"), "aarch64"), "must be x86_64")
     rejected(update(value, ("target_ref",), "refs/heads/release"), "refs/heads/main")
     rejected(update(value, ("host_lock_path",), "relative-lock"), "host_lock_path")
@@ -165,6 +174,16 @@ def main():
     rejected(update(value, ("schedule", "pair_count"), 9), "must be 10")
     rejected(update(value, ("image", "platform"), "linux/arm64"), "linux/amd64")
     rejected(update(value, ("docker", "daemon_architecture"), "aarch64"), "must be x86_64")
+    rejected(update(value, ("docker", "cgroup_driver"), "other"), "cgroupfs or systemd")
+    rejected(update(value, ("docker", "cgroup_parent"), "relative"), "cgroup_parent")
+    rejected(
+        update(
+            update(value, ("docker", "cgroup_driver"), "systemd"),
+            ("docker", "cgroup_parent"),
+            "/",
+        ),
+        "must be -.slice",
+    )
     rejected(update(value, ("observation_limits",), [*value["observation_limits"][1:], value["observation_limits"][0]]), "phase order")
     rejected(update(value, ("signing", "public_key_base64"), "not-base64"), "public_key_base64")
     rejected(update(value, ("signing", "fingerprint"), "SHA256:short"), "fingerprint")

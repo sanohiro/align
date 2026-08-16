@@ -22,6 +22,10 @@ PROFILE = {
         "benchmark_cpu_set": "0-7",
         "numa_set": "0",
     },
+    "docker": {
+        "cgroup_driver": "cgroupfs",
+        "cgroup_parent": "/",
+    },
 }
 
 
@@ -61,6 +65,7 @@ def main():
     assert f"--user={container.CONTAINER_UID}:{container.CONTAINER_GID}" in argv
     assert "--cpuset-cpus=0-7" in argv
     assert "--cpuset-mems=0" in argv
+    assert "--cgroup-parent=/" in argv
     assert f"--memory={container.MEMORY_BYTES}" in argv
     assert f"--memory-swap={container.MEMORY_SWAP_BYTES}" in argv
     assert f"--pids-limit={container.PIDS_LIMIT}" in argv
@@ -88,6 +93,14 @@ def main():
     assert "--workdir=/work" in argv
     assert argv[-3:] == ("sha256:" + H64, "/work/bench", "native")
     assert not any("privileged" in arg or "network=host" in arg for arg in argv)
+    assert not any(arg.startswith("--cpu-quota") or arg.startswith("--cpu-period") for arg in argv)
+
+    systemd_profile = {
+        **PROFILE,
+        "docker": {"cgroup_driver": "systemd", "cgroup_parent": "-.slice"},
+    }
+    systemd_argv = container.build_argv(systemd_profile, launch())
+    assert "--cgroup-parent=-.slice" in systemd_argv
 
     expect_error(lambda: container.build_argv({"image": {}, "machine": {}}, launch()), "registry_digest")
     expect_error(
@@ -127,6 +140,13 @@ def main():
             launch(),
         ),
         "benchmark_cpu_set",
+    )
+    expect_error(
+        lambda: container.build_argv(
+            {**PROFILE, "docker": {"cgroup_driver": "systemd", "cgroup_parent": "/"}},
+            launch(),
+        ),
+        "must be -.slice",
     )
 
 

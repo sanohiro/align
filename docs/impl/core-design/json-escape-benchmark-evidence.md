@@ -41,7 +41,7 @@ must not broaden it independently.
 | Public verifier | `/opt/align-evidence/v1/bin/align-json-escape-evidence verify --report REPORT --signature SIGNATURE --expected-baseline BASE --expected-candidate CANDIDATE --pr-body PR_BODY --review-attestation REVIEW_ATTESTATION`. It verifies bytes/signature and requires the report/review/preflight bindings to equal the explicit OIDs, PR body, and trusted review attestation below. Local use is diagnostic; acceptance runs this same installed verifier in trusted-base CI, with every expected input created from the GitHub event/API outside the checkout. It performs no build, checkout, benchmark, network, or repository mutation. |
 | Public merge verifier | `/opt/align-evidence/v1/bin/align-json-escape-evidence verify-merge --repository REPO --report REPORT --signature SIGNATURE --merge MERGE --output-dir NEW_DIR`. After the provider returns and the exact object is fetched, it verifies the report again, reads `MERGE` through the isolated raw-object path, requires the local target ref to contain it on its first-parent chain, checks its two parents and tree against the signed expectations, and emits exactly `merge-verification.json` and `merge-verification.json.sig`. `NEW_DIR` must not exist; no override exists. |
 | Trusted review adapter | Trusted-base CI alone queries the GitHub review API with its job token for the event repository/PR. It rejects the PR author, missing repository write role, dismissed/stale/duplicate reviews, wrong commit, and a body without the exact report `log_sha256`. It writes the canonical `REVIEW_ATTESTATION` outside the checkout and supplies it to the verifier. The controller, candidate, report, benchmark containers, and PR arguments never receive the token or raw API response. |
-| Ambient state | There are no semantic defaults. The launcher enters an empty environment containing only fixed `PATH`, `LC_ALL=C`, `TZ=UTC`, empty `HOME`, `CARGO_NET_OFFLINE=true`, and controller-created descriptor/configuration values. Ambient Git, Cargo, Rust, Docker, locale, proxy, credential, target, and tuning variables are omitted. |
+| Ambient state | There are no semantic defaults. The launcher enters an empty environment containing only fixed `PATH`, `LC_ALL=C`, `TZ=UTC`, empty `HOME`, `CARGO_NET_OFFLINE=true`, fixed `DOCKER_CONFIG=/etc/align-evidence/docker-empty`, fixed `DOCKER_HOST=unix:///var/run/docker.sock`, and controller-created descriptor/configuration values. Ambient Git, Cargo, Rust, Docker, locale, proxy, credential, target, and tuning variables are omitted. |
 | Result | Success obtains the exclusive lock and immediately creates and fsyncs the profile-global publication reservation before repository, image, container, or child work. It then writes and fsyncs `report.json` and `report.json.sig` in private staging while holding the lock, releases the lock, atomically renames staging to `NEW_DIR`, fsyncs its parent, removes/fsyncs the reservation, prints the two absolute paths, and exits zero. The reservation makes every second invocation reject before repository/image/container work and survives a pre-publication crash for administrator recovery. A threshold failure publishes a valid signed `regression` report by the same sequence and exits 1. Every other failure removes private staging, output, and reservation where possible, emits no accepted path, and exits nonzero; uncertain cleanup leaves the reservation fail-closed. |
 | Controller owner | A checked-in Python 3 controller, root-owned installed launcher, and fixture tests under `scripts/` and `tests/benchmark_evidence/`. The exact installed/source relationship, installer manifest, interpreter, Git, Docker client/daemon, `ssh-keygen`, kernel, OCI image, host profile, and executable SHA-256 identities are recorded. Candidate files are never executable evidence roots. |
 | Persisted format | Canonical UTF-8 JSON schemas `align.json_escape_benchmark_evidence/v1` and `align.json_escape_benchmark_merge_verification/v1`, each signed byte-for-byte with the host Ed25519 key under its fixed namespace. Unknown, missing, duplicate, reordered, non-ASCII key, non-integer number, float, invalid UTF-8/escape, trailing byte, or noncanonical serialization rejects. |
@@ -92,7 +92,7 @@ The implementation adds canonical profile
   microcode, online and benchmark CPU sets, NUMA nodes, and minimum physical memory;
 - host-global lock path and admissible pre/between/post load and resource observations;
 - Docker client/daemon versions, client hash, daemon architecture, storage driver, cgroup version,
-  and OCI runtime identity;
+  cgroup driver, the root-level cgroup parent used for every child, and OCI runtime identity;
 - image registry digest, local image ID/config digest, `linux/amd64` platform, and hashes/versions of
   Python, Git, Cargo, rustc, LLVM, C compiler, linker, and `ssh-keygen`;
 - SHA-256 of the read-only Cargo home/cache manifest and fixed Cargo configuration;
@@ -103,7 +103,8 @@ The profile has no mutable tag, wildcard version, caller override, optional iden
 Updating an item creates a new reviewed profile ID and cannot reinterpret an old report.
 
 Before work, the controller verifies the profile, exclusive lock, native x86_64 host/daemon, CPU
-topology and microcode, memory, absence of CPU quota, executable bytes, daemon/runtime identity,
+topology and microcode, memory, absence of CPU quota, the profile-bound root-level child cgroup
+parent, executable bytes, daemon/runtime identity,
 locally present image with `--pull=never`, image digest/config/platform, and load limit. A fixed image
 self-inspection with network disabled must reproduce all tool versions and hashes. ARM, Rosetta,
 QEMU/binfmt, a cross-architecture image, mutable tag resolution, or changed tool rejects. This lane
@@ -707,6 +708,110 @@ verifier, and shared adversarial owner are counted. Keeping the strict dormant p
 chain together lets one report-only producer fixture and one explicit post-PR artifact fixture prove
 both verifier bindings and the publication barrier; splitting the chain further would duplicate
 those fixtures and leave the controller's byte handoff unreviewed.
+
+## Native host qualification implementation closure
+
+PR #842 merged the deterministic controller/verifier consumer. The next capability is the
+privileged native host/daemon adapter. It reads the named Linux host and Docker observations,
+constructs the existing canonical inspection records, and passes them through the already merged
+`host.qualify` boundary. It does not widen the profile, inspect candidate code, execute the image,
+start a benchmark, provision a signing key, or claim accepted Request 7 evidence by itself.
+
+The adapter uses fixed absolute commands, an empty environment, bounded output, deterministic
+parsers, and injected readers/runners in its owner. A real host run is an administrator
+self-qualification operation; the deterministic owner must not depend on the current machine's
+CPU, kernel, cgroup, Docker, or load state.
+
+This capability intentionally keeps fixed-source ownership, bounded process execution, Docker
+identity acquisition, and canonical host assembly together. Splitting the dormant native producer
+chain at those seams would duplicate the descriptor/process cleanup proof and leave a host record
+that had not been checked as one acquisition boundary.
+
+| Axis | Implementation and owner |
+|---|---|
+| Host identity | Read the fixed machine identity, kernel, architecture, every `/proc/cpuinfo` processor record, microcode, online CPU set, NUMA set, and physical memory through no-follow/fixed sources. The host ID and benchmark CPU set come only from root-owned, benchmark-account-unwritable `/etc/align-evidence/host-id` and `/etc/align-evidence/benchmark-cpus`; the kernel sources are the fixed `/proc` and `/sys` paths in `native_host.py`. Normalize only the profile-specified x86_64 spelling; require every selected benchmark CPU record to carry the profile's vendor/family/model/stepping/microcode, and reject missing, repeated, malformed, heterogeneous, or cross-architecture values. Fixed-source opens are nonblocking before regular-file validation. `benchmark_evidence_native_host_matrix`. |
+| CPU and quota boundary | Read the host cgroup quota and require the profile's unquotaed value. cgroup v2 accepts only `cpu.max=max <positive-period>` for unquotaed execution; the v1 fallback accepts only `cpu.cfs_quota_us=-1` with a positive period, and rejects malformed, zero, or positive quotas. The Docker info `CgroupDriver` must match the profile. The profile also fixes a root-level child parent: `/` for `cgroupfs`, `-.slice` for `systemd`; the container argv passes it explicitly so a daemon/service-manager cgroup with a finite ancestor cannot throttle the child. Require the profile benchmark CPU set to be an online, canonical set and the NUMA set to be present; reject aliases, empty sets, quota, migration, and an ARM/emulation identity before Docker work. `benchmark_evidence_native_host_matrix`; `benchmark_evidence_container_matrix`. |
+| Docker daemon identity | Invoke only the pinned Docker client with fixed argv, empty environment, the root-owned empty `/etc/align-evidence/docker-empty` config directory, the explicit local `unix:///var/run/docker.sock` endpoint, bounded stdout/stderr, no shell, and a timeout. Hash the retained executable descriptor and compare it with the profile before either command executes; then execute both commands through that same descriptor. Take the client version from `docker version.Client`; take every daemon field (`ServerVersion`, `Architecture`, storage driver, cgroup version, `CgroupDriver`, `DefaultRuntime`, `Runtimes`, and `RuncCommit.ID`) from one `docker info` response. The fixed profile lane requires the profile-bound cgroup driver, `DefaultRuntime=runc`, and a structured `Runtimes.runc` entry, and records the daemon-reported `RuncCommit.ID` runtime identity. Reject daemon unavailability, nonzero/truncated output, wrong architecture, alias-only or unselected runtime data, mixed daemon responses, or profile mismatch. `benchmark_evidence_native_host_matrix`; `benchmark_evidence_process_boundary_matrix`. |
+| Qualification snapshots | Capture exactly `pre`, `between`, and `post` snapshots for load, CPU/memory pressure, free memory, and swap counters at the real acquisition transitions: before `docker version`, after `docker version` and before `docker info`, and after `docker info`. Use integer parsing and fixed counter units, reject any pressure/swap counter reset, then call `host.qualify` so profile limits and order remain one validation boundary. A missing source, reset/overflow, invalid unit, or extra phase rejects. `benchmark_evidence_native_host_matrix`. |
+| Ownership and failure | The adapter owns only opened descriptors and child processes it created; it closes/reaps them on every path, sends bounded TERM/KILL cleanup to the complete process group even after its leader exits, treats only `ESRCH` as an already-gone group, never mutates host configuration or repository state, and reports no qualified record after a timeout, close/reap uncertainty, parser error, or cleanup failure. `benchmark_evidence_native_host_matrix`. |
+| Explicit deferrals | Image self-inspection/toolchain reproduction, the monitor's child event stream, cryptographic key-process integration, provider/review API integration, performance measurement, merge verification, and lifecycle advancement remain later capabilities. `benchmark_evidence_native_host_matrix`. |
+
+## Native host review closure
+
+The first independent review of the native acquisition candidate found five valid boundary gaps. The
+fixes remain within this capability and do not widen the accepted evidence claim.
+
+| Finding | Ledger-first closure |
+|---|---|
+| Remote Docker context could be qualified | The fixed environment names the root-owned empty Docker config directory, both fixed command vectors pass the local Unix socket explicitly, and the owner verifies the exact vectors and environment. A user context, endpoint, credential, or proxy cannot redirect the daemon lookup. |
+| Hashed Docker bytes could differ from executed bytes | The real Docker path opens one no-follow executable descriptor, hashes it, executes both fixed commands through `/proc/self/fd/<fd>` with that descriptor passed across exec, and closes it only after both commands finish. Path replacement cannot substitute a second client between hashing and execution. |
+| Ineligible host state reached Docker | Native architecture and CPU quota are rejected immediately after their fixed sources are parsed, before the runner is called. The owner uses a rejecting runner to prove both paths are Docker-free. |
+| Pressure or swap counters could reset between snapshots | The three constructed observations are compared in order for monotonic CPU-pressure, memory-pressure, and swap read/write totals before Docker output is accepted. A reset is a terminal native acquisition error. |
+| A command leader could leave descendants | Cleanup always signals the owned process group, observes the direct child without reaping, escalates to `SIGKILL`, then reaps it. The owner starts a leader-exiting descendant and proves its delayed marker is never written. |
+
+## Native host second-review redesign closure
+
+The revised candidate review found one new P1 and three related process/configuration boundary gaps.
+The closure matrix was reopened on the native-host process-trust axis before implementation. The
+accepted evidence claim remains unchanged.
+
+| Finding | Ledger-first redesign and owner |
+|---|---|
+| A mutable Docker executable could still change between hash and exec | `_open_executable` now requires a regular executable owned by root and unwritable by the benchmark account before the retained descriptor is hashed or executed. Root administration remains the explicit trust boundary; the owner covers non-root ownership and group/other-write metadata. `benchmark_evidence_native_host_matrix`. |
+| The fixed Docker config directory was not itself trusted | The validator walks `/`, `etc`, `align-evidence`, and `docker-empty` through descriptor-relative `O_DIRECTORY|O_NOFOLLOW` opens, requires root ownership and no benchmark-account write permission at every component, and requires the final directory to be empty. Validation runs before either Docker child is spawned; the owner checks the no-follow flags, cleanup, ownership, permissions, and nonempty rejection. `benchmark_evidence_native_host_matrix`. |
+| An exception after spawn could leak the child or its streams | Selector creation, stream setup, nonblocking configuration, and buffer construction are inside the outer cleanup guard. An injected setup failure starts a descendant and proves the complete owned group is torn down. `benchmark_evidence_process_boundary_matrix`; `benchmark_evidence_native_host_matrix`. |
+| Reaping the leader before the final group signal could hit a reused PGID | The accepted Linux path observes direct-child exit with `waitid(WNOWAIT)`, sends `SIGTERM`, observes without reaping, sends `SIGKILL`, and only then calls `Popen.wait`. Unsupported non-reaping wait support fails closed before a successful command can cross the boundary. The owner asserts the TERM/observe/KILL/reap order. `benchmark_evidence_process_boundary_matrix`. |
+
+## Native host identity and cleanup review closure
+
+The next revised-candidate review found four actionable identity and fail-closed cleanup gaps. The
+closure matrix was reopened on the native-host identity-and-cleanup axis before implementation; the
+accepted evidence claim remains unchanged.
+
+| Finding | Ledger-first redesign and owner |
+|---|---|
+| Docker runtime identity was only the `DefaultRuntime` alias | The adapter now requires the Docker info `RuncCommit` object and records its non-empty `ID`, which is the daemon-reported runtime version or commit identity. A name-only `DefaultRuntime` value is not accepted. `benchmark_evidence_native_host_matrix`. |
+| An unprofiled Docker client could contact the daemon | The retained executable hash is compared with `profile.docker.client_sha256` after the no-follow/trust checks and before either Docker child is spawned. The owner proves a mismatch stops at config/open/hash with no runner event. `benchmark_evidence_native_host_matrix`. |
+| Profile host files could be changed in place | The trusted source reader requires the fixed `host-id` and `benchmark-cpus` descriptors to be regular, root-owned, and unwritable by the benchmark account before reading them; injected metadata cases cover ownership and group/other write. `benchmark_evidence_native_host_matrix`. |
+| Process-group signal failures were hidden | Cleanup ignores only `ESRCH`; every other TERM/KILL failure becomes a native acquisition error after best-effort cleanup, so no successful command or qualified record can cross uncertain cleanup. The owner injects `EPERM` and requires rejection. `benchmark_evidence_process_boundary_matrix`; `benchmark_evidence_native_host_matrix`. |
+
+## Native host phase and daemon-coherence review closure
+
+The next fresh review found two P1 boundary gaps and one related daemon-identity gap. The closure
+matrix was reopened on the native-host phase-and-daemon-coherence axis before implementation; the
+accepted evidence claim remains unchanged.
+
+| Finding | Ledger-first redesign and owner |
+|---|---|
+| Qualification phases were collected before Docker acquisition | `inspect` now captures `pre` before `docker version`, invokes the phase hook after the version command and before `docker info` for `between`, and captures `post` only after the info command and parser return. The owner records source reads and command events to prove the actual transition order; monotonic validation still runs after the complete sequence. `benchmark_evidence_native_host_matrix`. |
+| The selected Docker runtime was not bound to the profiled lane | The fixed lane requires `docker info.DefaultRuntime == "runc"` and a structured `docker info.Runtimes.runc` entry before accepting the daemon's `RuncCommit.ID`. A different default runtime cannot be qualified merely because a runc commit field is present. `benchmark_evidence_native_host_matrix`. |
+| Daemon identity could combine two responses | `docker version` supplies only the client record. `ServerVersion`, `Architecture`, storage driver, cgroup version, default runtime, runtime registry, and `RuncCommit.ID` all come from the same `docker info` response, so the canonical daemon identity cannot mix version responses from different daemon instances. `benchmark_evidence_native_host_matrix`. |
+
+## Native host effective-quota and source-closure redesign
+
+The fresh review of `368afc0d` found two P1 gaps and one P2 gap beyond the preceding phase and
+daemon-coherence repair. The review exposed that the old quota row checked only the cgroup root,
+while Docker's default child parent can inherit a finite ancestor; it also exposed that the first
+`/proc/cpuinfo` record was being used for a possibly different selected CPU. The closure matrix is
+reopened on the native-host-effective-quota-and-source axis before implementation.
+
+The public/profile ledger for this redesign is:
+
+| Public record | Exact contract and owner |
+|---|---|
+| `profile.docker.cgroup_driver` | Exact `cgroupfs` or `systemd` daemon `docker info.CgroupDriver`; profile-owned, no caller default or override; native host and `host.qualify` bind it before Docker work. `benchmark_evidence_profile_matrix`; `benchmark_evidence_native_host_matrix`. |
+| `profile.docker.cgroup_parent` | Exact root-level child selector paired with the driver: `/` for `cgroupfs`, `-.slice` for `systemd`; it is passed verbatim only by the trusted container argv builder and has no caller-selected alternative. `benchmark_evidence_profile_matrix`; `benchmark_evidence_container_matrix`. |
+| Container cgroup boundary | Every child argv contains `--cgroup-parent=<profile.docker.cgroup_parent>` and no CPU-quota override. A finite daemon/service-manager ancestor is therefore outside the selected child hierarchy; root quota is still rejected by native qualification. Docker's own creation/start error is terminal before candidate work. `benchmark_evidence_container_matrix`. |
+| Selected CPU identity | Parse every processor record, require unique decimal processor IDs, require every ID in the canonical benchmark CPU set to be present, and compare each selected record's vendor/family/model/stepping/microcode with the profile. Use the lowest selected ID as the canonical output after all selected records agree. `benchmark_evidence_native_host_matrix`. |
+| Fixed-source open | Add `O_NONBLOCK` to every fixed no-follow pre-validation open, including source files, the Docker executable, and config directories; reject special files from metadata before any read or exec. `benchmark_evidence_native_host_matrix`. |
+
+| Closure axis | Implementation closure and exact regression |
+|---|---|
+| Formation and validation | Add the two exact Docker profile fields, validate their cross-field driver/parent product, parse `CgroupDriver` from the same `docker info` response as all daemon identity, and reject unknown products before Docker/container use. Profile, host, native-host, and container owners cover both drivers and malformed/mismatched fields. |
+| Construction and propagation | Carry the profile cgroup parent through trusted `container.build_argv`; never infer it from ambient daemon configuration or caller input. The argv owner asserts the exact option and absence of an unbound alternative. |
+| CPU source and joins | Parse all processor records before CPU identity construction; select by benchmark CPU set, validate every selected record, and retain one canonical selected record for the existing machine schema. Heterogeneous first/non-first/missing/duplicate processor cases reject before Docker commands. |
+| Failure and cleanup | Nonblocking special-file opens reject before read/stat-dependent work; existing descriptor and child cleanup remains unchanged. FIFO owners cover source and executable paths without an alarm-dependent hang. |
+| Mirrors and acceptance | English and Japanese public/profile prose, profile/host/container/native-host owners, and the existing native review chain agree. This capability still does not execute an image or claim final Request 7 evidence. |
 
 ## Design-review finding closure
 
