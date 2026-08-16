@@ -335,6 +335,42 @@ BODY = O(
 REPORT = rs.encode_report(BODY)
 PUBLIC_KEY = key_blob()
 REPORT_SIGNATURE = sshsig.encode_armor(sshsig.Signature(PUBLIC_KEY, sshsig.REPORT_NAMESPACE, b"s" * 64))
+
+
+def regression_benchmarks():
+    result = []
+    for benchmark in BENCHMARKS:
+        pairs = []
+        for pair in benchmark["pairs"]:
+            runs = []
+            for run in (pair["first"], pair["second"]):
+                if benchmark["name"] == "json_decode" and run["revision"] == "candidate":
+                    samples = list(run["samples"])
+                    samples[0] = replace(
+                        replace(samples[0], "microseconds", 2_000_000),
+                        "token",
+                        "2000.000",
+                    )
+                    run = replace(run, "samples", samples)
+                runs.append(run)
+            pairs.append(O(("ordinal", pair["ordinal"]), ("first", runs[0]), ("second", runs[1])))
+        result.append(replace(benchmark, "pairs", pairs))
+    return result
+
+
+REGRESSION_BENCHMARKS = regression_benchmarks()
+REGRESSION_BODY = replace(
+    replace(
+        replace(BODY, "benchmarks", REGRESSION_BENCHMARKS),
+        "fields",
+        field_results(REGRESSION_BENCHMARKS),
+    ),
+    "verdict",
+    "regression",
+)
+REGRESSION_BODY = replace(REGRESSION_BODY, "first_failed_field", "A-full")
+REGRESSION_REPORT = rs.encode_report(REGRESSION_BODY)
+REGRESSION_SIGNATURE = sshsig.encode_armor(sshsig.Signature(PUBLIC_KEY, sshsig.REPORT_NAMESPACE, b"r" * 64))
 IDENTITIES = verifier.TrustedIdentities(
     profile_id=BODY["profile_id"],
     producer=cj.encode(BODY["producer"]),
@@ -348,11 +384,8 @@ signed_messages: list[bytes] = []
 
 
 def report_checker(message: bytes, signature: sshsig.Signature) -> bool:
-    return (
-        message == REPORT
-        and signature.namespace == sshsig.REPORT_NAMESPACE
-        and signature.signature == b"s" * 64
-    )
+    expected_signature = b"s" * 64 if message == REPORT else b"r" * 64 if message == REGRESSION_REPORT else None
+    return message in (REPORT, REGRESSION_REPORT) and signature.namespace == sshsig.REPORT_NAMESPACE and signature.signature == expected_signature
 
 
 def signer(message: bytes) -> bytes:
@@ -417,15 +450,17 @@ forged_reader = Reader({**OBJECTS, MERGE: forged_merge}, TARGET)
 expect_error("forged raw merge digest", lambda: mv.produce_signed(REPORT, REPORT_SIGNATURE, EXPECTATIONS, forged_reader, MERGE, record.verified_at, report_checker, signer, merge_checker))
 
 wrong_parent_oid, wrong_parent = commit(candidate_tree_oid, (CANDIDATE, BASE), b"wrong-parent\n")
-wrong_reader = Reader({**OBJECTS, wrong_parent.oid: wrong_parent}, TARGET)
+wrong_target_oid, wrong_target = commit(candidate_tree_oid, (wrong_parent_oid,), b"wrong-target\n")
+wrong_reader = Reader({**OBJECTS, wrong_parent.oid: wrong_parent, wrong_target.oid: wrong_target}, wrong_target_oid)
 expect_error("wrong merge parent order", lambda: mv.produce_signed(REPORT, REPORT_SIGNATURE, EXPECTATIONS, wrong_reader, wrong_parent_oid, record.verified_at, report_checker, signer, merge_checker))
 
 side_oid, side_commit = commit(candidate_tree_oid, (), b"side\n")
 side_reader = Reader({**OBJECTS, side_commit.oid: side_commit}, side_oid)
 expect_error("merge reachable only through a side target", lambda: mv.verify_signed(artifact, REPORT, REPORT_SIGNATURE, EXPECTATIONS, side_reader, MERGE, report_checker, merge_checker))
 
-bad_report = REPORT.replace(b'"verdict":"pass"', b'"verdict":"regression"', 1)
-expect_error("regression report after merge", lambda: mv.produce_signed(bad_report, REPORT_SIGNATURE, EXPECTATIONS, READER, MERGE, record.verified_at, report_checker, signer, merge_checker))
+before_regression_sign = len(signed_messages)
+expect_error("regression report after merge", lambda: mv.produce_signed(REGRESSION_REPORT, REGRESSION_SIGNATURE, EXPECTATIONS, READER, MERGE, record.verified_at, report_checker, signer, merge_checker))
+assert len(signed_messages) == before_regression_sign
 
 bad_report_signature = sshsig.encode_armor(sshsig.Signature(PUBLIC_KEY, sshsig.REPORT_NAMESPACE, b"x" * 64))
 expect_error("stale report signature", lambda: mv.produce_signed(REPORT, bad_report_signature, EXPECTATIONS, READER, MERGE, record.verified_at, report_checker, signer, merge_checker))
