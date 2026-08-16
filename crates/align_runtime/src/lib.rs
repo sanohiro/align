@@ -25712,7 +25712,7 @@ mod tests {
             sub: core::ptr::null(),
             opt_tag: -1,
         }];
-        let fields = descs.as_ptr().addr();
+        let fields = descs.as_ptr().expose_provenance();
         let n_fields = descs.len() as i64;
         std::thread::scope(|scope| {
             let left = scope.spawn(move || {
@@ -25721,7 +25721,7 @@ mod tests {
                     align_rt_json_decode(
                         br#"{"x":1}"#.as_ptr(),
                         7,
-                        fields as *const JsonField,
+                        core::ptr::with_exposed_provenance(fields),
                         n_fields,
                         out.as_mut_ptr(),
                         8,
@@ -25738,7 +25738,7 @@ mod tests {
                     align_rt_json_decode(
                         br#"{"x":2}"#.as_ptr(),
                         7,
-                        fields as *const JsonField,
+                        core::ptr::with_exposed_provenance(fields),
                         n_fields,
                         out.as_mut_ptr(),
                         8,
