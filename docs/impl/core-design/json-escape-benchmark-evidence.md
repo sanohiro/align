@@ -974,6 +974,36 @@ snapshots, sign or publish a report, verify a provider merge, or accept the Requ
 | Report construction and arithmetic | Partition each benchmark into two preparations, two warm-ups, and ten balanced pairs; require parsed field names and integer values in the fixed two/three-field order; emit canonical tokens without float conversion; aggregate ten samples per revision, sort exact permutations, add checked middle sums, and compare checked `candidate * 100 <= baseline * 105`. Mutated sequence, arm, field, token, sample, permutation, or overflow data rejects. `scripts/test-benchmark-evidence-controller-report.sh`; `benchmark_evidence_report_matrix`. |
 | Failure and ownership | No fragment is returned for an incomplete session, missing measurement, artifact drift, malformed monitor lifecycle, invalid arithmetic, or child failure. The session owns only in-memory execution facts; controller cleanup, report signing, staging/publication, merge verification, and lifecycle advancement remain downstream owners. English/Japanese contract and all fixed constants stay synchronized. `git diff --check`; `scripts/test-benchmark-evidence-controller-report.sh`. |
 
+## Merge verification implementation closure
+
+This capability consumes the verified report/signature pair and the provider's exact merge OID. It
+uses the existing pinned raw-Git reader to fetch the merge object and walk the target's first-parent
+chain, emits the canonical signed `MergeVerification` record, and rechecks that record against a
+fresh raw-object observation. The provider API, private key, durable publication transaction, and
+post-artifact lifecycle adapter remain injected downstream ports; this slice does not fake those
+boundaries or advance Request 7.
+
+### Public-contract ledger
+
+| Public surface | Exact contract, owner, and acceptance |
+|---|---|
+| `merge_verification.MergeVerificationRecord` | Immutable record with exact member order `schema`, `profile_id`, `profile_sha256`, `verifier`, `report_sha256`, `report_signature_sha256`, `target_ref`, `target_oid`, `merge_oid`, `merge_sha256`, `parents`, `tree_oid`, `verified_at`. The schema is `align.json_escape_benchmark_merge_verification/v1`; target ref is `refs/heads/main`; parents are exactly `(BASE, CANDIDATE)`; all IDs/digests/timestamps use the report grammar. `encode`/`decode` require canonical UTF-8 JSON and byte-identical re-encoding. `scripts/test-benchmark-evidence-merge-verification.sh`. |
+| `merge_verification.RawGitMergeReader` | Trusted port with `read(oid) -> git_objects.VerifiedObject` and `target_oid() -> hex40`. The implementation verifies the supplied merge OID's raw object, parses every first-parent commit through the port, rejects missing/non-commit/cyclic/unbounded walks, and accepts only when the target chain contains the exact merge. It owns no process or repository lifetime. `scripts/test-benchmark-evidence-merge-verification.sh`; `benchmark_evidence_git_revision_matrix`. |
+| `merge_verification.produce_signed` | Revalidates the complete report and report signature through `verifier.verify_produced_evidence`, requires verdict `pass`, binds merge parents/tree to the signed candidate, binds target reachability to the fetched raw objects, hashes complete report/signature bytes, and calls one injected signer with the complete merge record bytes. It returns only canonical record/signature bytes after key/namespace/signature validation. `scripts/test-benchmark-evidence-merge-verification.sh`; `scripts/test-benchmark-evidence-key-process.sh`. |
+| `merge_verification.verify_signed` | Revalidates the report, merge signature, canonical record, raw merge object, exact parents/tree, and fresh target first-parent reachability. Report, report signature, merge OID, target OID, raw merge digest, or signer identity changes reject before a caller can advance lifecycle. `scripts/test-benchmark-evidence-merge-verification.sh`; `scripts/test-benchmark-evidence-merge-race.sh`. |
+| Signing/publication boundary | The module receives a namespace-bound signer and signature checker; it never opens a key, calls a provider, writes an output directory, mutates refs, or advances lifecycle. `native_signing` and the existing lock-held durable staging/final-refetch owners remain the sole owners of those effects. `HANDOFF.md`; `../align-llm/docs/align-requests.md`. |
+
+### Implementation closure matrix
+
+| Axis | Implementation closure and exact regression |
+|---|---|
+| Record formation and validation | Fix every member, order, schema literal, scalar grammar, two-parent cardinality/order, target ref, and canonical LF. Reject duplicate/reordered/unknown members, noncanonical JSON, wrong namespace, malformed timestamp, and non-ASCII values before signing. `scripts/test-benchmark-evidence-merge-verification.sh`. |
+| Report revalidation and binding | Verify the complete original report bytes and report signature with trusted `ReportExpectations`; require `pass`, exact report/signature SHA-256, profile ID/digest, verifier identity, baseline/candidate, and candidate tree. Mutated report, stale signature, regression verdict, wrong profile/key, and candidate-tree mismatch produce no artifact. `scripts/test-benchmark-evidence-merge-verification.sh`; `scripts/test-benchmark-evidence-controller-verifier.sh`. |
+| Raw merge identity | Read the provider-returned OID through the pinned raw reader, require a commit object whose parsed parents are exactly `(BASE, CANDIDATE)` and tree equals the signed candidate tree, and retain the raw-object SHA-256. OID swap, malformed header, wrong kind, wrong parent/tree, missing object, and changed raw bytes reject. `scripts/test-benchmark-evidence-merge-verification.sh`; `scripts/test-benchmark-evidence-git-objects.sh`; `scripts/test-benchmark-evidence-git-revision.sh`. |
+| Target reachability | Resolve the fixed local target once through the same reader and walk first parents with a visited set and fixed bound. The exact merge must be reachable; side-parent-only reachability, force-push, target removal, cycle, missing descendant, or target-ref drift rejects. `scripts/test-benchmark-evidence-merge-verification.sh`; `scripts/test-benchmark-evidence-merge-race.sh`. |
+| Signature and handoff | Sign only complete canonical merge-record bytes under `sshsig.MERGE_NAMESPACE`; decode/re-encode and verify the returned armor against the profile key before return. The record/signature pair is immutable and ready for the existing staged publication port; no private key or provider response enters it. `scripts/test-benchmark-evidence-merge-verification.sh`; `scripts/test-benchmark-evidence-key-process.sh`. |
+| Failure, cleanup, and scope | The pure capability returns no accepted artifact on any report/raw-object/signature failure and leaves reader, lock, remote, staging, and lifecycle ownership with their existing callers. Final provider refetch and durable artifact publication remain a separate transaction gate. `git diff --check`; `scripts/test-benchmark-evidence-merge-verification.sh`. |
+
 ## Design-review finding closure
 
 | Finding | Ledger-first closure |
