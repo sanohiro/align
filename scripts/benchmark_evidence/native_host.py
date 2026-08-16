@@ -35,6 +35,8 @@ class NativeHostSourceMissing(NativeHostError):
 
 
 DOCKER = "/usr/bin/docker"
+DOCKER_CONFIG = "/etc/align-evidence/docker-empty"
+DOCKER_HOST = "unix:///var/run/docker.sock"
 HOST_ID_PATH = "/etc/align-evidence/host-id"
 BENCHMARK_CPU_SET_PATH = "/etc/align-evidence/benchmark-cpus"
 CPUINFO_PATH = "/proc/cpuinfo"
@@ -49,8 +51,8 @@ CGROUP_V2_CPU_MAX_PATH = "/sys/fs/cgroup/cpu.max"
 CGROUP_V1_CPU_QUOTA_PATH = "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"
 CGROUP_V1_CPU_PERIOD_PATH = "/sys/fs/cgroup/cpu/cpu.cfs_period_us"
 
-DOCKER_VERSION_ARGV = (DOCKER, "version", "--format", "{{json .}}")
-DOCKER_INFO_ARGV = (DOCKER, "info", "--format", "{{json .}}")
+DOCKER_VERSION_ARGV = (DOCKER, "--config", DOCKER_CONFIG, "--host", DOCKER_HOST, "version", "--format", "{{json .}}")
+DOCKER_INFO_ARGV = (DOCKER, "--config", DOCKER_CONFIG, "--host", DOCKER_HOST, "info", "--format", "{{json .}}")
 
 _ASCII_NAME = re.compile(r"[A-Za-z0-9._/:+=@-]{1,255}\Z")
 _CPU_SET = re.compile(r"(?:0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*))?(?:,(?:0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*))?)*\Z")
@@ -61,6 +63,8 @@ _COMMAND_TIMEOUT_SECONDS = 5.0
 _U64_MAX = (1 << 64) - 1
 
 _FIXED_ENV = {
+    "DOCKER_CONFIG": DOCKER_CONFIG,
+    "DOCKER_HOST": DOCKER_HOST,
     "HOME": "",
     "LC_ALL": "C",
     "PATH": "/usr/bin:/bin",
@@ -95,34 +99,30 @@ def _validate_argv(argv: Sequence[str]) -> tuple[str, ...]:
 def _stop_process(process: subprocess.Popen[bytes]) -> None:
     """Terminate and reap an owned command process group best-effort."""
 
-    if process.poll() is None:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except OSError:
-            pass
-        try:
-            process.wait(timeout=0.5)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except OSError:
-                pass
-            try:
-                process.wait(timeout=0.5)
-            except subprocess.TimeoutExpired:
-                _error("trusted command process group could not be reaped")
-    else:
-        try:
-            process.wait(timeout=0)
-        except subprocess.TimeoutExpired:
-            _error("trusted command process did not reap")
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        _error("trusted command process group could not be reaped")
 
 
-def run_command(
+def _run_command(
     argv: Sequence[str],
     *,
     timeout_seconds: float = _COMMAND_TIMEOUT_SECONDS,
     output_limit: int = _MAX_COMMAND_OUTPUT,
+    executable_fd: int | None = None,
 ) -> bytes:
     """Run one fixed command with an empty environment and bounded output."""
 
@@ -135,15 +135,23 @@ def run_command(
         _error("trusted command timeout must be positive")
     if type(output_limit) is not int or output_limit <= 0:
         _error("trusted command output limit must be positive")
+    if executable_fd is not None and (type(executable_fd) is not int or executable_fd < 0):
+        _error("trusted executable descriptor is invalid")
+    command_to_run = command
+    pass_fds: tuple[int, ...] = ()
+    if executable_fd is not None:
+        command_to_run = (f"/proc/self/fd/{executable_fd}", *command[1:])
+        pass_fds = (executable_fd,)
 
     try:
         process = subprocess.Popen(
-            command,
+            command_to_run,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=dict(_FIXED_ENV),
             close_fds=True,
+            pass_fds=pass_fds,
             start_new_session=True,
             shell=False,
             text=False,
@@ -158,6 +166,7 @@ def run_command(
     selector = selectors.DefaultSelector()
     streams = (process.stdout, process.stderr)
     buffers = {stream.fileno(): bytearray() for stream in streams}
+    cleanup_done = False
     try:
         for stream in streams:
             os.set_blocking(stream.fileno(), False)
@@ -195,17 +204,30 @@ def run_command(
             _error("trusted command exited nonzero")
         return bytes(buffers[stdout_fd])
     except BaseException:
+        cleanup_done = True
         _stop_process(process)
         raise
     finally:
+        if not cleanup_done:
+            cleanup_done = True
+            _stop_process(process)
         selector.close()
         for stream in streams:
             try:
                 stream.close()
             except OSError:
                 pass
-        if process.poll() is None:
-            _stop_process(process)
+
+
+def run_command(
+    argv: Sequence[str],
+    *,
+    timeout_seconds: float = _COMMAND_TIMEOUT_SECONDS,
+    output_limit: int = _MAX_COMMAND_OUTPUT,
+) -> bytes:
+    """Run one fixed path command without binding it to a retained descriptor."""
+
+    return _run_command(argv, timeout_seconds=timeout_seconds, output_limit=output_limit)
 
 
 def read_no_follow(path: str, *, limit: int = _MAX_SOURCE_BYTES) -> bytes:
@@ -248,14 +270,88 @@ def read_no_follow(path: str, *, limit: int = _MAX_SOURCE_BYTES) -> bytes:
             raise NativeHostError(f"native source close failed: {path}") from exc
 
 
+def _open_executable(path: str) -> int:
+    if not isinstance(path, str) or not path.startswith("/") or "\x00" in path:
+        _error("native executable path is invalid")
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            raise NativeHostSourceMissing(f"cannot open native executable {path}") from exc
+        raise NativeHostError(f"cannot open native executable {path}") from exc
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or not metadata.st_mode & 0o111:
+            _error(f"native executable is not a regular executable: {path}")
+        return fd
+    except OSError as exc:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise NativeHostError(f"native executable stat failed: {path}") from exc
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
+def _hash_fd(fd: int, path: str, *, limit: int = 128 << 20) -> str:
+    if type(limit) is not int or limit <= 0:
+        _error("native executable limit must be positive")
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            chunk = os.read(fd, min(64 * 1024, limit - size + 1))
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > limit:
+                _error(f"native executable exceeded the fixed limit: {path}")
+            digest.update(chunk)
+        os.lseek(fd, 0, os.SEEK_SET)
+    except OSError as exc:
+        raise NativeHostError(f"native executable read failed: {path}") from exc
+    result = digest.hexdigest()
+    if _HEX64.fullmatch(result) is None:
+        _error("native executable digest is malformed")
+    return result
+
+
 def hash_executable(path: str = DOCKER) -> str:
     """Hash one regular executable through a no-follow descriptor."""
 
-    raw = read_no_follow(path, limit=128 << 20)
-    digest = hashlib.sha256(raw).hexdigest()
-    if _HEX64.fullmatch(digest) is None:
-        _error("native executable digest is malformed")
-    return digest
+    fd = _open_executable(path)
+    try:
+        return _hash_fd(fd, path)
+    finally:
+        try:
+            os.close(fd)
+        except OSError as exc:
+            raise NativeHostError(f"native executable close failed: {path}") from exc
+
+
+def run_docker_pair() -> tuple[bytes, bytes, str]:
+    """Run version and info from the same retained Docker executable descriptor."""
+
+    fd = _open_executable(DOCKER)
+    try:
+        client_hash = _hash_fd(fd, DOCKER)
+        version = _run_command(DOCKER_VERSION_ARGV, executable_fd=fd)
+        info = _run_command(DOCKER_INFO_ARGV, executable_fd=fd)
+        return version, info, client_hash
+    finally:
+        try:
+            os.close(fd)
+        except OSError as exc:
+            raise NativeHostError(f"native executable close failed: {DOCKER}") from exc
 
 
 def _text(reader: Reader, path: str) -> str:
@@ -499,12 +595,17 @@ def _quota_milli(reader: Reader) -> int:
 
 
 def _docker(reader: Reader, runner: Runner, hasher: Hasher) -> cj.Object:
-    version = _json(runner(DOCKER_VERSION_ARGV), "docker version output")
+    if runner is run_command and hasher is hash_executable:
+        version_raw, info_raw, client_hash = run_docker_pair()
+    else:
+        version_raw = runner(DOCKER_VERSION_ARGV)
+        info_raw = runner(DOCKER_INFO_ARGV)
+        client_hash = hasher(DOCKER)
+    version = _json(version_raw, "docker version output")
     client = _object(version.get("Client"), "docker version Client")
     server = _object(version.get("Server"), "docker version Server")
-    info = _json(runner(DOCKER_INFO_ARGV), "docker info output")
+    info = _json(info_raw, "docker info output")
     daemon_architecture = _architecture(_json_string(server, "Arch", "docker version Server"), "docker daemon architecture")
-    client_hash = hasher(DOCKER)
     if not isinstance(client_hash, str) or _HEX64.fullmatch(client_hash) is None:
         _error("Docker client digest is not lowercase SHA-256")
     return cj.Object(
@@ -538,6 +639,26 @@ def _observation(reader: Reader, phase: str, page_size: int, memory_bytes: int) 
     )
 
 
+_MONOTONIC_COUNTERS = (
+    "cpu_pressure_total_us",
+    "memory_pressure_total_us",
+    "swap_read_bytes",
+    "swap_write_bytes",
+)
+
+
+def _check_monotonic_counters(observations: Sequence[Mapping[str, Any]]) -> None:
+    previous: Mapping[str, Any] | None = None
+    for index, observation in enumerate(observations):
+        if previous is not None:
+            for key in _MONOTONIC_COUNTERS:
+                current = observation[key]
+                prior = previous[key]
+                if current < prior:
+                    _error(f"{key} counter reset before observation {index}")
+        previous = observation
+
+
 def inspect(
     profile: Mapping[str, Any],
     *,
@@ -553,6 +674,8 @@ def inspect(
         _error("profile must be an object")
     system = uname()
     architecture = _architecture(getattr(system, "machine", ""), "host architecture")
+    if architecture != "x86_64":
+        _error("host architecture must be x86_64 before Docker qualification")
     kernel = _name(getattr(system, "release", ""), "host kernel")
     fields = _cpuinfo(_text(reader, CPUINFO_PATH))
     online = _line(reader, ONLINE_CPU_SET_PATH)
@@ -572,12 +695,15 @@ def inspect(
         _error("benchmark CPU set does not match the profile")
     memory = _memory_bytes(reader)
     quota = _quota_milli(reader)
+    if quota != 0:
+        _error("CPU quota must be zero before Docker qualification")
     if page_size is None:
         try:
             page_size = int(os.sysconf("SC_PAGESIZE"))
         except (AttributeError, OSError, ValueError) as exc:
             raise NativeHostError("cannot determine the native page size") from exc
     observations = [_observation(reader, phase, page_size, memory) for phase in ("pre", "between", "post")]
+    _check_monotonic_counters(observations)
     return cj.Object(
         (
             ("host_id", _line(reader, HOST_ID_PATH)),

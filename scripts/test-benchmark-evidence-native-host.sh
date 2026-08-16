@@ -10,6 +10,7 @@ python3 - <<'PY'
 import json
 import os
 import tempfile
+import time
 from types import SimpleNamespace
 
 from scripts.benchmark_evidence import canonical_json as cj
@@ -134,6 +135,8 @@ assert qualified.cpu_quota_milli == 0
 assert qualified.docker.client_sha256 == H64
 assert qualified.docker.daemon_architecture == "x86_64"
 assert tuple(calls) == (native_host.DOCKER_VERSION_ARGV, native_host.DOCKER_INFO_ARGV)
+assert native_host._FIXED_ENV["DOCKER_CONFIG"] == native_host.DOCKER_CONFIG
+assert native_host._FIXED_ENV["DOCKER_HOST"] == native_host.DOCKER_HOST
 
 inspection = native_host.inspect(
     PROFILE,
@@ -178,17 +181,24 @@ def qualify_with(reader_value=reader, runner_value=runner, uname_value="x86_64",
     )
 
 
+def forbidden_runner(_argv):
+    raise AssertionError("Docker was invoked before native host state was eligible")
+
+
 expect_error(
-    lambda: qualify_with(uname_value="aarch64"),
-    "inspection.machine.architecture",
+    lambda: qualify_with(uname_value="aarch64", runner_value=forbidden_runner),
+    "host architecture must be x86_64 before Docker qualification",
 )
 expect_error(
     lambda: qualify_with(reader_value=with_file(native_host.BENCHMARK_CPU_SET_PATH, b"0-1\n")),
     "does not match the profile",
 )
 expect_error(
-    lambda: qualify_with(reader_value=with_file(native_host.CGROUP_V2_CPU_MAX_PATH, b"100000 100000\n")),
-    "native host qualification rejected",
+    lambda: qualify_with(
+        reader_value=with_file(native_host.CGROUP_V2_CPU_MAX_PATH, b"100000 100000\n"),
+        runner_value=forbidden_runner,
+    ),
+    "CPU quota must be zero before Docker qualification",
 )
 expect_error(
     lambda: qualify_with(reader_value=with_file(native_host.ONLINE_CPU_SET_PATH, b"0-2\n")),
@@ -259,8 +269,27 @@ expect_error(
 small_quota = dict(FILES)
 small_quota[native_host.CGROUP_V2_CPU_MAX_PATH] = b"1 100000\n"
 expect_error(
-    lambda: qualify_with(reader_value=mapping_reader(small_quota)),
-    "native host qualification rejected",
+    lambda: qualify_with(reader_value=mapping_reader(small_quota), runner_value=forbidden_runner),
+    "CPU quota must be zero before Docker qualification",
+)
+
+
+swap_reads = 0
+
+
+def resetting_counter_reader(path):
+    global swap_reads
+    if path == native_host.VMSTAT_PATH:
+        swap_reads += 1
+        if swap_reads == 1:
+            return b"pswpin 1\npswpout 0\n"
+        return b"pswpin 0\npswpout 0\n"
+    return reader(path)
+
+
+expect_error(
+    lambda: qualify_with(reader_value=resetting_counter_reader),
+    "counter reset before observation",
 )
 
 expect_error(
@@ -310,6 +339,16 @@ with tempfile.TemporaryDirectory() as directory:
         lambda: native_host.read_no_follow(child_directory),
         "not a regular file",
     )
+
+with tempfile.TemporaryDirectory() as directory:
+    marker = os.path.join(directory, "descendant-marker")
+    command = f"(sleep 1; printf leaked > {marker}) & exit 0"
+    expect_error(
+        lambda: native_host.run_command(("/bin/sh", "-c", command), timeout_seconds=0.05),
+        "timed out",
+    )
+    time.sleep(1.2)
+    assert not os.path.exists(marker), "a descendant survived command-group cleanup"
 
 print("native host qualification checks passed")
 PY
