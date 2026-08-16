@@ -81,6 +81,12 @@ def _key_blob(value: object) -> bytes:
     return value
 
 
+def validate_public_key_blob(value: object) -> bytes:
+    """Validate one profile-owned Ed25519 public-key blob."""
+
+    return _key_blob(value)
+
+
 def _canonical_identity(raw: bytes, validator: Callable[[Any, str], cj.Object], label: str) -> bytes:
     if not isinstance(raw, bytes):
         _error(f"{label} must be canonical JSON bytes")
@@ -141,6 +147,27 @@ class TrustedIdentities:
 
 
 @dataclass(frozen=True)
+class ReportExpectations:
+    """Trusted values needed before post-PR material exists."""
+
+    profile_sha256: str
+    identities: TrustedIdentities
+    baseline: str
+    candidate: str
+    public_key_blob: bytes
+
+    def __post_init__(self) -> None:
+        _string(self.profile_sha256, _HEX64, "profile_sha256")
+        if not isinstance(self.identities, TrustedIdentities):
+            _error("identities has the wrong type")
+        _string(self.baseline, _HEX40, "baseline")
+        _string(self.candidate, _HEX40, "candidate")
+        if self.baseline == self.candidate:
+            _error("baseline and candidate must differ")
+        _key_blob(self.public_key_blob)
+
+
+@dataclass(frozen=True)
 class VerifierExpectations:
     """Trusted-base values that are never selected by report bytes."""
 
@@ -159,18 +186,27 @@ class VerifierExpectations:
         _string(self.repository, _NAME, "repository")
         if type(self.pull_request) is not int or not 0 < self.pull_request <= cj.MAX_U64:
             _error("pull_request must be a positive u64")
-        _string(self.profile_sha256, _HEX64, "profile_sha256")
-        if not isinstance(self.identities, TrustedIdentities):
-            _error("identities has the wrong type")
-        _string(self.baseline, _HEX40, "baseline")
-        _string(self.candidate, _HEX40, "candidate")
-        if self.baseline == self.candidate:
-            _error("baseline and candidate must differ")
+        ReportExpectations(
+            profile_sha256=self.profile_sha256,
+            identities=self.identities,
+            baseline=self.baseline,
+            candidate=self.candidate,
+            public_key_blob=self.public_key_blob,
+        )
         _string(self.pr_body_sha256, _HEX64, "pr_body_sha256")
         _string(self.review_attestation_sha256, _HEX64, "review_attestation_sha256")
-        _key_blob(self.public_key_blob)
         if type(self.require_pass) is not bool:
             _error("require_pass must be a boolean")
+
+    @property
+    def report_expectations(self) -> ReportExpectations:
+        return ReportExpectations(
+            profile_sha256=self.profile_sha256,
+            identities=self.identities,
+            baseline=self.baseline,
+            candidate=self.candidate,
+            public_key_blob=self.public_key_blob,
+        )
 
 
 @dataclass(frozen=True)
@@ -182,6 +218,23 @@ class EvidenceArtifact:
     pr_body: bytes
     review_attestation: bytes
     expectations: VerifierExpectations
+
+
+@dataclass(frozen=True)
+class ProducedEvidence:
+    """Report/signature bytes produced before PR publication exists."""
+
+    report: bytes
+    signature: bytes
+    expectations: ReportExpectations
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.report, bytes):
+            _error("produced report must be bytes")
+        if not isinstance(self.signature, bytes):
+            _error("produced signature must be bytes")
+        if not isinstance(self.expectations, ReportExpectations):
+            _error("produced expectations have the wrong type")
 
 
 @dataclass(frozen=True)
@@ -211,6 +264,20 @@ class VerifiedEvidence:
     review_state: str
     verdict: str
     review_attestation: ReviewAttestation
+
+
+@dataclass(frozen=True)
+class VerifiedReport:
+    """A producer report checked without post-PR inputs."""
+
+    produced: ProducedEvidence
+    report_sha256: str
+    body_sha256: str
+    baseline: str
+    candidate: str
+    profile_sha256: str
+    review_state: str
+    verdict: str
 
 
 def decode_review_attestation(raw: bytes) -> ReviewAttestation:
@@ -273,7 +340,7 @@ def _verify_preflight_markers(raw: bytes, *, baseline: str, candidate: str, revi
         _require_marker(lines, marker)
 
 
-def _verify_review_chain(body: cj.Object, expected: VerifierExpectations) -> None:
+def _verify_review_chain(body: cj.Object, expected: ReportExpectations) -> None:
     """Bind clean/fixed review state to the reported first-parent inventory."""
 
     candidate = body["candidate"]
@@ -376,7 +443,7 @@ def _verify_host_observations(body: cj.Object, records: list[cj.Object]) -> None
             _error("orphaned child observation is not named by a report record")
 
 
-def _verify_report_semantics(body: cj.Object, expected: VerifierExpectations) -> None:
+def _verify_report_semantics(body: cj.Object, expected: ReportExpectations) -> None:
     """Reconstruct every derived report relationship before publication."""
 
     if body["profile_id"] != expected.identities.profile_id:
@@ -414,6 +481,8 @@ def _verify_report_semantics(body: cj.Object, expected: VerifierExpectations) ->
     protected_paths = [entry["path_hex"] for entry in protected["entries"]]
     if protected_paths != sorted(set(protected_paths)):
         _error("protected inputs must be sorted and unique")
+    if set(paths).intersection(protected_paths):
+        _error("candidate changed paths must exclude protected inputs")
     if protected["baseline_manifest_sha256"] != protected["candidate_manifest_sha256"]:
         _error("protected input manifests differ")
 
@@ -512,11 +581,9 @@ def _verify_report_semantics(body: cj.Object, expected: VerifierExpectations) ->
             _error("field pass state does not match the exact threshold comparison")
 
 
-def _verify_report_bindings(
-    report: cj.Object,
-    expected: VerifierExpectations,
-    attestation: ReviewAttestation,
-) -> None:
+def _verify_report_core(report: cj.Object, expected: ReportExpectations) -> None:
+    """Verify report semantics and bindings available during producer run."""
+
     body = report["body"]
     _verify_report_semantics(body, expected)
     if body["profile_sha256"] != expected.profile_sha256:
@@ -541,6 +608,18 @@ def _verify_report_bindings(
         _error("report review base does not match baseline")
     if review["review_head"] != expected.candidate and review["state"] == "clean":
         _error("clean review must be bound to the candidate")
+
+
+def _verify_report_bindings(
+    report: cj.Object,
+    expected: VerifierExpectations,
+    attestation: ReviewAttestation,
+) -> None:
+    """Add the explicit PR/review bindings to an already trusted report."""
+
+    _verify_report_core(report, expected.report_expectations)
+    body = report["body"]
+    review = body["review"]
     if review["log_sha256"] != attestation.review_log_sha256:
         _error("report review log digest does not match the attestation")
     if review["review_head"] != attestation.review_commit:
@@ -552,6 +631,62 @@ def _verify_report_bindings(
 
     if expected.require_pass and body["verdict"] != "pass":
         _error("accepted verification requires a pass verdict")
+
+
+def _verify_signature(
+    report: bytes,
+    signature_bytes: bytes,
+    public_key_blob: bytes,
+    signature_checker: Callable[[bytes, sshsig.Signature], bool],
+) -> None:
+    try:
+        signature = sshsig.decode_armor(
+            signature_bytes,
+            expected_public_key_blob=public_key_blob,
+            expected_namespace=sshsig.REPORT_NAMESPACE,
+        )
+    except sshsig.SSHSigError as exc:
+        raise VerificationError(f"signature framing rejected: {exc}") from exc
+    try:
+        verified = signature_checker(sshsig.signing_preimage(report, sshsig.REPORT_NAMESPACE), signature)
+    except Exception as exc:
+        raise VerificationError(f"cryptographic signature check failed: {exc}") from exc
+    if verified is not True:
+        _error("cryptographic signature check rejected the report")
+
+
+def verify_produced_evidence(
+    produced: ProducedEvidence,
+    signature_checker: Callable[[bytes, sshsig.Signature], bool],
+) -> VerifiedReport:
+    """Verify producer output without requiring later PR body inputs."""
+
+    if not isinstance(produced, ProducedEvidence):
+        _error("produced evidence has the wrong type")
+    if not callable(signature_checker):
+        _error("signature checker is not callable")
+    try:
+        report = report_schema.decode_report(produced.report)
+    except report_schema.ReportSchemaError as exc:
+        raise VerificationError(f"report schema rejected: {exc}") from exc
+    expected = produced.expectations
+    _verify_report_core(report, expected)
+    _verify_signature(
+        produced.report,
+        produced.signature,
+        expected.public_key_blob,
+        signature_checker,
+    )
+    return VerifiedReport(
+        produced=produced,
+        report_sha256=hashlib.sha256(produced.report).hexdigest(),
+        body_sha256=report["body_sha256"],
+        baseline=expected.baseline,
+        candidate=expected.candidate,
+        profile_sha256=expected.profile_sha256,
+        review_state=report["body"]["review"]["state"],
+        verdict=report["body"]["verdict"],
+    )
 
 
 def verify_artifact(
@@ -595,20 +730,12 @@ def verify_artifact(
     )
     _verify_report_bindings(report, expected, attestation)
 
-    try:
-        signature = sshsig.decode_armor(
-            artifact.signature,
-            expected_public_key_blob=expected.public_key_blob,
-            expected_namespace=sshsig.REPORT_NAMESPACE,
-        )
-    except sshsig.SSHSigError as exc:
-        raise VerificationError(f"signature framing rejected: {exc}") from exc
-    try:
-        verified = signature_checker(sshsig.signing_preimage(artifact.report, sshsig.REPORT_NAMESPACE), signature)
-    except Exception as exc:
-        raise VerificationError(f"cryptographic signature check failed: {exc}") from exc
-    if verified is not True:
-        _error("cryptographic signature check rejected the report")
+    _verify_signature(
+        artifact.report,
+        artifact.signature,
+        expected.public_key_blob,
+        signature_checker,
+    )
 
     return VerifiedEvidence(
         artifact=artifact,

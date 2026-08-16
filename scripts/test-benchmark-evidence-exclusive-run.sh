@@ -75,6 +75,29 @@ with tempfile.TemporaryDirectory(prefix="align-exclusive-owner-") as name:
     failing.abort(remove_reservation=False)
     reservation.unlink()
 
+    closing = exclusive_run.ExclusiveRun(str(lock), str(reservation))
+    closing.acquire()
+    closing.create_reservation("d" * 64, str(output))
+    closing.release_lock_for_publication()
+    closing.mark_published()
+
+    def fail_final_lock_close():
+        raise OSError("injected finalization lock close failure")
+
+    closing._release_finalization_lock = fail_final_lock_close
+    try:
+        closing.finalize_publication()
+    except OSError as exc:
+        assert "injected finalization lock close failure" in str(exc)
+    else:
+        raise AssertionError("finalization lock close failure was accepted")
+    assert closing.locked
+    assert reservation.exists()
+    blocked = exclusive_run.ExclusiveRun(str(lock), str(reservation))
+    expect_error(blocked.acquire, "publication reservation")
+    closing.abort(remove_reservation=False)
+    reservation.unlink()
+
     second.acquire()
     second.abort(remove_reservation=False)
 

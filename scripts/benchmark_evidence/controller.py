@@ -53,6 +53,7 @@ class ControllerConfig:
     monitor_sha256: str
     host_id: str
     image_digest: str
+    public_key_blob: bytes
     identities: verifier.TrustedIdentities
     target_ref: str = "refs/heads/main"
 
@@ -67,6 +68,10 @@ class ControllerConfig:
             _string(getattr(self, label), _HEX64, label)
         _string(self.host_id, _NAME, "host_id")
         _string(self.image_digest, _IMAGE_DIGEST, "image_digest")
+        try:
+            verifier.validate_public_key_blob(self.public_key_blob)
+        except verifier.VerificationError as exc:
+            _error(str(exc))
         if not isinstance(self.identities, verifier.TrustedIdentities):
             _error("identities has the wrong type")
         if self.identities.profile_id != self.profile_id:
@@ -143,7 +148,7 @@ class ControllerResult:
     state: str
     phases: tuple[str, ...]
     cleanup: cleanup.CleanupResult
-    verified: verifier.VerifiedEvidence | None
+    verified: verifier.VerifiedReport | None
     error: str | None
 
     @property
@@ -155,12 +160,12 @@ Gate = Callable[[cli.RunInvocation, ControllerConfig], None]
 ChildIdFactory = Callable[[schedule.ChildPlan], str]
 Executor = Callable[[schedule.ChildPlan, str], ChildResult]
 ManifestCheck = Callable[[cli.RunInvocation], tuple[bool, bool]]
-ArtifactProducer = Callable[
+ReportProducer = Callable[
     [cli.RunInvocation, Mapping[tuple[str, str], str], tuple[str, ...]],
-    verifier.EvidenceArtifact,
+    verifier.ProducedEvidence,
 ]
-ArtifactVerifier = Callable[[verifier.EvidenceArtifact], verifier.VerifiedEvidence]
-Publisher = Callable[[verifier.VerifiedEvidence, verifier.EvidenceArtifact, str], None]
+ProducedVerifier = Callable[[verifier.ProducedEvidence], verifier.VerifiedReport]
+Publisher = Callable[[verifier.VerifiedReport, str], None]
 
 
 @dataclass(frozen=True)
@@ -171,8 +176,8 @@ class ControllerHooks:
     child_id: ChildIdFactory
     execute: Executor
     manifests: ManifestCheck
-    produce_artifact: ArtifactProducer
-    verify_artifact: ArtifactVerifier
+    produce_report: ReportProducer
+    verify_report: ProducedVerifier
     publish: Publisher
 
     def __post_init__(self) -> None:
@@ -192,8 +197,8 @@ class ControllerHooks:
             ("child_id", self.child_id),
             ("execute", self.execute),
             ("manifests", self.manifests),
-            ("produce_artifact", self.produce_artifact),
-            ("verify_artifact", self.verify_artifact),
+            ("produce_report", self.produce_report),
+            ("verify_report", self.verify_report),
             ("publish", self.publish),
         ):
             if not callable(operation):
@@ -339,7 +344,7 @@ class Controller:
         active_child = False
         reservation_attempted = False
         lease_reservation = False
-        verified: verifier.VerifiedEvidence | None = None
+        verified: verifier.VerifiedReport | None = None
         run_id: str | None = None
 
         try:
@@ -401,38 +406,38 @@ class Controller:
                 _error("source or cache manifest changed")
 
             phases.append("report")
-            artifact = self.hooks.produce_artifact(
+            produced = self.hooks.produce_report(
                 invocation,
                 schedule.manifest_map(state),
                 tuple(phases),
             )
-            if not isinstance(artifact, verifier.EvidenceArtifact):
-                _error("artifact producer returned the wrong type")
+            if not isinstance(produced, verifier.ProducedEvidence):
+                _error("report producer returned the wrong type")
+            expected = produced.expectations
             if (
-                artifact.expectations.baseline != invocation.baseline
-                or artifact.expectations.candidate != invocation.candidate
-                or artifact.expectations.profile_sha256 != self.config.profile_sha256
-                or artifact.expectations.identities != self.config.identities
+                expected.baseline != invocation.baseline
+                or expected.candidate != invocation.candidate
+                or expected.profile_sha256 != self.config.profile_sha256
+                or expected.identities != self.config.identities
+                or expected.public_key_blob != self.config.public_key_blob
             ):
-                _error("artifact expectations are not bound to this invocation and profile identities")
+                _error("produced evidence is not bound to this invocation and profile identities")
 
             phases.append("verify")
-            verified = self.hooks.verify_artifact(artifact)
-            if not isinstance(verified, verifier.VerifiedEvidence):
-                _error("artifact verifier returned the wrong type")
-            if verified.artifact is not artifact:
-                _error("artifact verifier did not return the checked artifact")
+            verified = self.hooks.verify_report(produced)
+            if not isinstance(verified, verifier.VerifiedReport):
+                _error("report verifier returned the wrong type")
+            if verified.produced is not produced:
+                _error("report verifier did not return the checked bytes")
             if (
                 verified.baseline != invocation.baseline
                 or verified.candidate != invocation.candidate
                 or verified.profile_sha256 != self.config.profile_sha256
             ):
-                _error("verified artifact is not bound to this invocation and profile")
+                _error("verified report is not bound to this invocation and profile")
             if verified.verdict not in ("pass", "regression"):
-                _error("verified artifact has an unknown verdict")
-            if artifact.expectations.require_pass and verified.verdict != "pass":
-                _error("a required-pass invocation cannot publish a regression")
-            _verify_artifact_manifests(verified.artifact.report, schedule.manifest_map(state))
+                _error("verified report has an unknown verdict")
+            _verify_artifact_manifests(verified.produced.report, schedule.manifest_map(state))
 
             phases.append("stage")
             transaction.stage_report()
@@ -443,7 +448,7 @@ class Controller:
 
             phases.append("publish")
             uncertain = True
-            self.hooks.publish(verified, verified.artifact, invocation.output_dir)
+            self.hooks.publish(verified, invocation.output_dir)
             transaction.publish_output()
             self.lease.mark_published()
             phases.append("finalize")

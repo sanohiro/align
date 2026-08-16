@@ -180,6 +180,13 @@ class ExclusiveRun:
             raise ExclusiveRunError("publication must follow lock release and precede finalization")
         self._published = True
 
+    def _release_finalization_lock(self) -> None:
+        """Close the reacquired descriptor; close releases its flock."""
+
+        if self._lock_fd < 0 or not self._locked:
+            raise ExclusiveRunError("finalization lock is not held")
+        os.close(self._lock_fd)
+
     def finalize_publication(self) -> None:
         if not self._published or not self._reserved:
             raise ExclusiveRunError("publication reservation is not ready for removal")
@@ -189,23 +196,24 @@ class ExclusiveRun:
         # fsync completes or a failed removal can be restored.
         self._acquire_finalization_lock()
         try:
-            try:
-                os.unlink(self.reservation_path)
-                _fsync_parent(self.reservation_path)
-            except BaseException:
-                self._restore_reservation()
-                raise
-            self._reserved = False
-            self._closed = True
-            fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
-            os.close(self._lock_fd)
-            self._lock_fd = -1
-            self._locked = False
+            os.unlink(self.reservation_path)
+            _fsync_parent(self.reservation_path)
         except BaseException:
-            # Keep the reopened lock held until the controller's fail-closed
-            # abort path decides how to release it.  The reservation remains
-            # present when restoration succeeded.
+            self._restore_reservation()
             raise
+        try:
+            # Keep the reservation state true until the descriptor close
+            # succeeds.  Closing the descriptor releases the flock, so a
+            # close failure can restore the reservation while still
+            # holding the host lock.
+            self._release_finalization_lock()
+        except BaseException:
+            self._restore_reservation()
+            raise
+        self._lock_fd = -1
+        self._locked = False
+        self._reserved = False
+        self._closed = True
 
     def abort(self, *, remove_reservation: bool) -> None:
         """Close local state; leaving the reservation blocks later runs."""

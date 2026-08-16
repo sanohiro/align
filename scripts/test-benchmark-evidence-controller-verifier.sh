@@ -298,7 +298,7 @@ def report_body():
             ("baseline_manifest_sha256", H),
             ("candidate_manifest_sha256", H),
             ("entries", [O(
-                ("path_hex", "616263"),
+                ("path_hex", "646566"),
                 ("mode", "100644"),
                 ("kind", "blob"),
                 ("oid", B),
@@ -404,12 +404,24 @@ EXPECTATIONS = verifier.VerifierExpectations(
     review_attestation_sha256=hashlib.sha256(ATTESTATION).hexdigest(),
     public_key_blob=key_blob(),
 )
+REPORT_EXPECTATIONS = verifier.ReportExpectations(
+    profile_sha256=EXPECTATIONS.profile_sha256,
+    identities=EXPECTATIONS.identities,
+    baseline=EXPECTATIONS.baseline,
+    candidate=EXPECTATIONS.candidate,
+    public_key_blob=EXPECTATIONS.public_key_blob,
+)
 SIGNATURE = sshsig.encode_armor(sshsig.Signature(
     public_key_blob=EXPECTATIONS.public_key_blob,
     namespace=sshsig.REPORT_NAMESPACE,
     signature=b"s" * 64,
 ))
 ARTIFACT = verifier.EvidenceArtifact(REPORT, SIGNATURE, PR_BODY, ATTESTATION, EXPECTATIONS)
+PRODUCED = verifier.ProducedEvidence(REPORT, SIGNATURE, REPORT_EXPECTATIONS)
+PRODUCED_VERIFIED = verifier.verify_produced_evidence(
+    PRODUCED,
+    lambda _preimage, _signature: True,
+)
 
 
 def bad_manifest_report():
@@ -429,6 +441,11 @@ BAD_MANIFEST_ARTIFACT = verifier.EvidenceArtifact(
     PR_BODY,
     ATTESTATION,
     EXPECTATIONS,
+)
+BAD_MANIFEST_PRODUCED = verifier.ProducedEvidence(
+    BAD_MANIFEST_REPORT,
+    SIGNATURE,
+    REPORT_EXPECTATIONS,
 )
 BAD_MANIFEST_VERIFIED = verifier.verify_artifact(
     BAD_MANIFEST_ARTIFACT,
@@ -486,11 +503,20 @@ REGRESSION_ARTIFACT = verifier.EvidenceArtifact(
     ATTESTATION,
     REGRESSION_EXPECTATIONS,
 )
+REGRESSION_PRODUCED = verifier.ProducedEvidence(
+    REGRESSION_ARTIFACT.report,
+    REGRESSION_ARTIFACT.signature,
+    REPORT_EXPECTATIONS,
+)
 REGRESSION_VERIFIED = verifier.verify_artifact(
     REGRESSION_ARTIFACT,
     lambda _preimage, _signature: True,
 )
 assert REGRESSION_VERIFIED.verdict == "regression"
+REGRESSION_REPORT_VERIFIED = verifier.verify_produced_evidence(
+    REGRESSION_PRODUCED,
+    lambda _preimage, _signature: True,
+)
 
 
 def overflow_benchmarks():
@@ -551,6 +577,25 @@ assert verified.candidate == C
 assert verified.profile_sha256 == PROFILE
 assert verified.review_attestation.review_id == 42
 assert preimage_lengths == [len(sshsig.signing_preimage(REPORT, sshsig.REPORT_NAMESPACE))]
+assert PRODUCED_VERIFIED.baseline == B
+assert PRODUCED_VERIFIED.candidate == C
+assert PRODUCED_VERIFIED.verdict == "pass"
+
+overlapping_protected = replace(
+    BODY["protected_inputs"],
+    "entries",
+    [replace(BODY["protected_inputs"]["entries"][0], "path_hex", "616263")],
+)
+rejected("protected input changed path overlap", lambda: verifier.verify_artifact(
+    verifier.EvidenceArtifact(
+        rs.encode_report(replace(BODY, "protected_inputs", overlapping_protected)),
+        SIGNATURE,
+        PR_BODY,
+        ATTESTATION,
+        EXPECTATIONS,
+    ),
+    lambda _preimage, _signature: True,
+))
 
 bad_sample = replace(BODY["benchmarks"][0]["pairs"][0]["first"]["samples"][0], "microseconds", 2_000_000)
 bad_sample = replace(bad_sample, "token", "2000.000")
@@ -851,10 +896,11 @@ CONFIG = controller.ControllerConfig(
     monitor_sha256=H,
     host_id="host-1",
     image_digest="sha256:" + H,
+    public_key_blob=EXPECTATIONS.public_key_blob,
     identities=IDENTITIES,
 )
-FAKE_VERIFIED = verifier.VerifiedEvidence(
-    artifact=ARTIFACT,
+FAKE_VERIFIED = verifier.VerifiedReport(
+    produced=PRODUCED,
     report_sha256=H,
     body_sha256=H,
     baseline=B,
@@ -862,7 +908,6 @@ FAKE_VERIFIED = verifier.VerifiedEvidence(
     profile_sha256=PROFILE,
     review_state="clean",
     verdict="pass",
-    review_attestation=verifier.decode_review_attestation(ATTESTATION),
 )
 
 
@@ -907,42 +952,49 @@ def make_hooks(
 
     def produce(inv, manifests, phases):
         assert set(manifests) == {(bench, rev) for bench in schedule.BENCHMARKS for rev in schedule.REVISIONS}
+        assert not hasattr(inv, "pr_body")
+        assert not hasattr(inv, "review_attestation")
         assert phases[-1] == "report"
         events.append("produce")
         if bad_artifact_expectations:
-            wrong = verifier.VerifierExpectations(
-                repository=EXPECTATIONS.repository,
-                pull_request=EXPECTATIONS.pull_request,
+            wrong = verifier.ReportExpectations(
                 profile_sha256=EXPECTATIONS.profile_sha256,
                 identities=EXPECTATIONS.identities,
                 baseline="f" * 40,
                 candidate=C,
-                pr_body_sha256=EXPECTATIONS.pr_body_sha256,
-                review_attestation_sha256=EXPECTATIONS.review_attestation_sha256,
                 public_key_blob=EXPECTATIONS.public_key_blob,
             )
-            return verifier.EvidenceArtifact(REPORT, SIGNATURE, PR_BODY, ATTESTATION, wrong)
+            return verifier.ProducedEvidence(REPORT, SIGNATURE, wrong)
         if bad_report_manifests:
-            return BAD_MANIFEST_ARTIFACT
+            return BAD_MANIFEST_PRODUCED
         if regression:
-            return REGRESSION_ARTIFACT
-        return ARTIFACT
+            return REGRESSION_PRODUCED
+        return PRODUCED
 
-    def verify(artifact):
-        events.append("verify")
+    def verify(produced):
+        events.append("verify-report")
         if fail_verify:
             raise verifier.VerificationError("fixture verifier rejected")
         if bad_report_manifests:
-            assert artifact is BAD_MANIFEST_ARTIFACT
-            return BAD_MANIFEST_VERIFIED
+            assert produced is BAD_MANIFEST_PRODUCED
+            return verifier.VerifiedReport(
+                produced=produced,
+                report_sha256=H,
+                body_sha256=H,
+                baseline=B,
+                candidate=C,
+                profile_sha256=PROFILE,
+                review_state="clean",
+                verdict="pass",
+            )
         if regression:
-            assert artifact is REGRESSION_ARTIFACT
-            return REGRESSION_VERIFIED
-        assert artifact is ARTIFACT
+            assert produced is REGRESSION_PRODUCED
+            return REGRESSION_REPORT_VERIFIED
+        assert produced is PRODUCED
         return FAKE_VERIFIED
 
-    def publish(verified_value, artifact, output_dir):
-        assert verified_value.artifact is artifact
+    def publish(verified_value, output_dir):
+        assert verified_value.produced is PRODUCED or verified_value.produced is REGRESSION_PRODUCED
         events.append("publish")
         if fail_publish:
             raise controller.ControllerError("fixture publication failed")
@@ -952,8 +1004,8 @@ def make_hooks(
         child_id=child_id,
         execute=execute,
         manifests=manifests,
-        produce_artifact=produce,
-        verify_artifact=verify,
+        produce_report=produce,
+        verify_report=verify,
         publish=publish,
     ), events
 
@@ -966,6 +1018,7 @@ assert result.state == "accepted"
 assert result.error is None
 assert result.cleanup.accepted
 assert result.cleanup.fail_closed is False
+assert result.verified is FAKE_VERIFIED
 assert result.phases == (
     "exclusive", "reserve", "bootstrap", "host", "image", "source", "review", "schedule",
     "manifests", "report", "verify", "stage", "unlock", "publish",
@@ -973,7 +1026,7 @@ assert result.phases == (
 )
 assert lease.events == ["acquire", "reserve", "release", "mark", "finalize"]
 assert events[:4] == ["bootstrap", "host", "image", "source"]
-assert events[-3:] == ["produce", "verify", "publish"]
+assert events[-3:] == ["produce", "verify-report", "publish"]
 assert len([event for event in events if event.startswith("exec-")]) == len(schedule.full_schedule())
 
 hooks, events = make_hooks(regression=True)
@@ -981,11 +1034,11 @@ lease = FixtureLease()
 result = controller.Controller(CONFIG, hooks, lease).run(invocation())
 assert result.state == "regression"
 assert not result.accepted
-assert result.verified is REGRESSION_VERIFIED
+assert result.verified is REGRESSION_REPORT_VERIFIED
 assert result.cleanup.accepted
 assert not lease.reserved
 assert result.phases[-1] == "regression"
-assert events[-3:] == ["produce", "verify", "publish"]
+assert events[-3:] == ["produce", "verify-report", "publish"]
 
 hooks, events = make_hooks(fail_gate="host")
 lease = FixtureLease()
