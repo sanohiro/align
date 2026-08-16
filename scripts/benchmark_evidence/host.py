@@ -49,6 +49,8 @@ _DOCKER_KEYS = (
     "daemon_architecture",
     "storage_driver",
     "cgroup_version",
+    "cgroup_driver",
+    "cgroup_parent",
     "oci_runtime",
 )
 _OBSERVATION_KEYS = (
@@ -87,6 +89,8 @@ class QualifiedDocker:
     daemon_architecture: str
     storage_driver: str
     cgroup_version: str
+    cgroup_driver: str
+    cgroup_parent: str
     oci_runtime: str
 
 
@@ -168,9 +172,23 @@ def _machine(value: Any) -> cj.Object:
 
 def _docker(value: Any) -> cj.Object:
     obj = _object(value, _DOCKER_KEYS, "inspection.docker")
-    for key in ("client_version", "daemon_version", "daemon_architecture", "storage_driver", "cgroup_version", "oci_runtime"):
+    for key in (
+        "client_version",
+        "daemon_version",
+        "daemon_architecture",
+        "storage_driver",
+        "cgroup_version",
+        "cgroup_driver",
+        "cgroup_parent",
+        "oci_runtime",
+    ):
         _string(obj[key], _NAME, f"inspection.docker.{key}")
     _string(obj["client_sha256"], _HEX64, "inspection.docker.client_sha256")
+    if obj["cgroup_driver"] not in ("cgroupfs", "systemd"):
+        _error("inspection.docker.cgroup_driver", "must be cgroupfs or systemd")
+    expected_parent = {"cgroupfs": "/", "systemd": "-.slice"}[obj["cgroup_driver"]]
+    if obj["cgroup_parent"] != expected_parent:
+        _error("inspection.docker.cgroup_parent", "does not match the cgroup driver")
     return obj
 
 
@@ -317,6 +335,8 @@ def qualify(profile: Mapping[str, Any], value: Any) -> QualifiedHost:
             daemon_architecture=docker["daemon_architecture"],
             storage_driver=docker["storage_driver"],
             cgroup_version=docker["cgroup_version"],
+            cgroup_driver=docker["cgroup_driver"],
+            cgroup_parent=docker["cgroup_parent"],
             oci_runtime=docker["oci_runtime"],
         ),
         observations=tuple(qualified_observations),

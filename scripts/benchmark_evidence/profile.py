@@ -87,6 +87,8 @@ _DOCKER_KEYS = (
     "daemon_architecture",
     "storage_driver",
     "cgroup_version",
+    "cgroup_driver",
+    "cgroup_parent",
     "oci_runtime",
 )
 _IMAGE_KEYS = ("registry_digest", "local_image_id", "config_digest", "platform")
@@ -202,6 +204,13 @@ def _validate_docker(value: Any) -> cj.Object:
     _hash(obj["client_sha256"], "docker.client_sha256")
     if obj["daemon_architecture"] != "x86_64":
         _error("docker.daemon_architecture", "must be x86_64")
+    cgroup_driver = _string(obj["cgroup_driver"], _NAME, "docker.cgroup_driver")
+    cgroup_parent = _string(obj["cgroup_parent"], _NAME, "docker.cgroup_parent")
+    expected_parent = {"cgroupfs": "/", "systemd": "-.slice"}.get(cgroup_driver)
+    if expected_parent is None:
+        _error("docker.cgroup_driver", "must be cgroupfs or systemd")
+    if cgroup_parent != expected_parent:
+        _error("docker.cgroup_parent", f"must be {expected_parent} for {cgroup_driver}")
     return obj
 
 

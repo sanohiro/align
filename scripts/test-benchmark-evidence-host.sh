@@ -31,6 +31,8 @@ DOCKER_KEYS = (
     "daemon_architecture",
     "storage_driver",
     "cgroup_version",
+    "cgroup_driver",
+    "cgroup_parent",
     "oci_runtime",
 )
 
@@ -59,6 +61,8 @@ DOCKER = {
     "daemon_architecture": "x86_64",
     "storage_driver": "overlay2",
     "cgroup_version": "2",
+    "cgroup_driver": "cgroupfs",
+    "cgroup_parent": "/",
     "oci_runtime": "runc-1.1.12",
 }
 LIMITS = [
@@ -164,7 +168,20 @@ def main():
     assert qualified.memory_bytes == 16 * 1024 * 1024 * 1024
     assert qualified.cpu_quota_milli == 0
     assert qualified.docker.client_version == "26.1.4"
+    assert qualified.docker.cgroup_driver == "cgroupfs"
+    assert qualified.docker.cgroup_parent == "/"
     assert tuple(item.phase for item in qualified.observations) == ("pre", "between", "post")
+
+    systemd_docker = {**DOCKER, "cgroup_driver": "systemd", "cgroup_parent": "-.slice"}
+    systemd_profile = {**PROFILE, "docker": systemd_docker}
+    systemd_inspection = replace_top(
+        inspection(),
+        "docker",
+        O(*((key, systemd_docker[key]) for key in DOCKER_KEYS)),
+    )
+    systemd_qualified = host.qualify(systemd_profile, systemd_inspection)
+    assert systemd_qualified.docker.cgroup_driver == "systemd"
+    assert systemd_qualified.docker.cgroup_parent == "-.slice"
 
     rejected("host ID", replace_top(inspection(), "host_id", "other-host"), "inspection.host_id")
     rejected("architecture", replace_nested(inspection(), "machine", "architecture", "aarch64"), "machine.architecture")
@@ -175,6 +192,8 @@ def main():
     rejected("Docker version", replace_nested(inspection(), "docker", "daemon_version", "27.0.0"), "inspection.docker.daemon_version")
     rejected("Docker client digest", replace_nested(inspection(), "docker", "client_sha256", "1" * 64), "inspection.docker.client_sha256")
     rejected("Docker architecture", replace_nested(inspection(), "docker", "daemon_architecture", "aarch64"), "daemon_architecture")
+    rejected("Docker cgroup driver", replace_nested(inspection(), "docker", "cgroup_driver", "systemd"), "cgroup_parent")
+    rejected("Docker cgroup parent", replace_nested(inspection(), "docker", "cgroup_parent", "relative"), "cgroup_parent")
     rejected("Docker order", replace_top(inspection(), "docker", O(*reversed(docker().pairs))), "wrong member order")
     rejected("observation count", replace_top(inspection(), "observations", []), "exactly three")
     reordered = list(inspection()["observations"])

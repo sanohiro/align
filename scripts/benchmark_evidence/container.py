@@ -80,7 +80,7 @@ def _profile_field(profile: Any, path: Sequence[str]) -> Any:
     return value
 
 
-def _profile_identity(profile: Any) -> tuple[str, str, str]:
+def _profile_identity(profile: Any) -> tuple[str, str, str, str]:
     image = _profile_field(profile, ("image",))
     machine = _profile_field(profile, ("machine",))
     if not isinstance(image, Mapping) or not isinstance(machine, Mapping):
@@ -93,7 +93,17 @@ def _profile_identity(profile: Any) -> tuple[str, str, str]:
         _error("profile.machine.architecture", "must be x86_64")
     cpu_set = _string(machine.get("benchmark_cpu_set"), _NAME, "profile.machine.benchmark_cpu_set")
     numa_set = _string(machine.get("numa_set"), _NAME, "profile.machine.numa_set")
-    return f"sha256:{local_image_id}", cpu_set, numa_set
+    docker = _profile_field(profile, ("docker",))
+    if not isinstance(docker, Mapping):
+        _error("profile", "docker must be an object")
+    cgroup_driver = _string(docker.get("cgroup_driver"), _NAME, "profile.docker.cgroup_driver")
+    cgroup_parent = _string(docker.get("cgroup_parent"), _NAME, "profile.docker.cgroup_parent")
+    expected_parent = {"cgroupfs": "/", "systemd": "-.slice"}.get(cgroup_driver)
+    if expected_parent is None:
+        _error("profile.docker.cgroup_driver", "must be cgroupfs or systemd")
+    if cgroup_parent != expected_parent:
+        _error("profile.docker.cgroup_parent", f"must be {expected_parent} for {cgroup_driver}")
+    return f"sha256:{local_image_id}", cpu_set, numa_set, cgroup_parent
 
 
 def _command(command: Sequence[str]) -> tuple[str, ...]:
@@ -150,7 +160,7 @@ def _mount(host: str, guest: str, read_only: bool) -> str:
 def build_argv(profile: Any, launch: ContainerLaunch) -> tuple[str, ...]:
     """Build one complete, fixed Docker invocation without reading ambient state."""
 
-    digest, cpu_set, numa_set = _profile_identity(profile)
+    digest, cpu_set, numa_set, cgroup_parent = _profile_identity(profile)
     launch = _launch(launch)
     name = f"{CONTAINER_PREFIX}{launch.child_id}"
     return (
@@ -167,6 +177,7 @@ def build_argv(profile: Any, launch: ContainerLaunch) -> tuple[str, ...]:
         f"--user={CONTAINER_UID}:{CONTAINER_GID}",
         f"--cpuset-cpus={cpu_set}",
         f"--cpuset-mems={numa_set}",
+        f"--cgroup-parent={cgroup_parent}",
         f"--memory={MEMORY_BYTES}",
         f"--memory-swap={MEMORY_SWAP_BYTES}",
         f"--pids-limit={PIDS_LIMIT}",

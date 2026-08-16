@@ -85,7 +85,7 @@ def _error(message: str) -> None:
 
 
 def _fixed_open_flags(*, directory: bool = False) -> int:
-    required = ["O_CLOEXEC", "O_NOFOLLOW"]
+    required = ["O_CLOEXEC", "O_NOFOLLOW", "O_NONBLOCK"]
     if directory:
         required.append("O_DIRECTORY")
     if any(not hasattr(os, name) for name in required):
@@ -628,22 +628,80 @@ def _subset(subset: tuple[tuple[int, int], ...], superset: tuple[tuple[int, int]
     return True
 
 
-def _cpuinfo(value: str) -> dict[str, str]:
-    record = value.split("\n\n", 1)[0]
-    fields: dict[str, str] = {}
-    for line in record.splitlines():
-        if ":" not in line:
-            continue
-        key, member = line.split(":", 1)
-        key = key.strip()
-        member = member.strip()
-        if not key or not member or key in fields:
-            _error("/proc/cpuinfo has a missing or repeated field")
-        fields[key] = member
-    required = ("vendor_id", "cpu family", "model", "stepping", "microcode")
-    if any(key not in fields for key in required):
-        _error("/proc/cpuinfo is missing a required identity field")
-    return fields
+def _cpuinfo(value: str) -> dict[int, dict[str, str]]:
+    records = value.split("\n\n")
+    if records and not records[-1].strip():
+        records.pop()
+    if not records or any(not record.strip() for record in records):
+        _error("/proc/cpuinfo has an empty processor record")
+    result: dict[int, dict[str, str]] = {}
+    required = ("processor", "vendor_id", "cpu family", "model", "stepping", "microcode")
+    for record in records:
+        fields: dict[str, str] = {}
+        for line in record.splitlines():
+            if ":" not in line:
+                continue
+            key, member = line.split(":", 1)
+            key = key.strip()
+            member = member.strip()
+            if not key or not member or key in fields:
+                _error("/proc/cpuinfo has a missing or repeated field")
+            fields[key] = member
+        if any(key not in fields for key in required):
+            _error("/proc/cpuinfo is missing a required identity field")
+        processor = _decimal_uint(fields["processor"], "/proc/cpuinfo processor")
+        if processor in result:
+            _error("/proc/cpuinfo has a repeated processor ID")
+        result[processor] = fields
+    return result
+
+
+def _cpu_set_count(ranges: tuple[tuple[int, int], ...], label: str) -> int:
+    total = 0
+    for start, end in ranges:
+        total = _uint(total + end - start + 1, label)
+    return total
+
+
+def _cpu_set_contains(ranges: tuple[tuple[int, int], ...], value: int) -> bool:
+    return any(start <= value <= end for start, end in ranges)
+
+
+def _selected_cpu_fields(
+    records: Mapping[int, Mapping[str, str]],
+    benchmark_ranges: tuple[tuple[int, int], ...],
+    expected_machine: Mapping[str, Any],
+) -> Mapping[str, str]:
+    expected_vendor = _name(expected_machine.get("cpu_vendor"), "profile.machine.cpu_vendor")
+    expected_family = _uint(expected_machine.get("cpu_family"), "profile.machine.cpu_family", 1_000_000)
+    expected_model = _name(expected_machine.get("cpu_model"), "profile.machine.cpu_model")
+    expected_stepping = _uint(
+        expected_machine.get("cpu_stepping"), "profile.machine.cpu_stepping", 1_000_000
+    )
+    expected_microcode = _name(expected_machine.get("microcode"), "profile.machine.microcode")
+    selected = [
+        (processor, fields)
+        for processor, fields in sorted(records.items())
+        if _cpu_set_contains(benchmark_ranges, processor)
+    ]
+    expected_count = _cpu_set_count(benchmark_ranges, "benchmark CPU set size")
+    if len(selected) != expected_count:
+        _error("/proc/cpuinfo is missing a selected benchmark CPU record")
+    for processor, fields in selected:
+        vendor = _name(fields["vendor_id"], f"CPU {processor} vendor")
+        family = _decimal_uint(fields["cpu family"], f"CPU {processor} family")
+        model = _name(fields["model"], f"CPU {processor} model")
+        stepping = _decimal_uint(fields["stepping"], f"CPU {processor} stepping")
+        microcode = _name(fields["microcode"], f"CPU {processor} microcode")
+        if (vendor, family, model, stepping, microcode) != (
+            expected_vendor,
+            expected_family,
+            expected_model,
+            expected_stepping,
+            expected_microcode,
+        ):
+            _error(f"CPU {processor} identity does not match the profile")
+    return selected[0][1]
 
 
 def _decimal_uint(value: str, label: str) -> int:
@@ -754,6 +812,7 @@ def _quota_milli(reader: Reader) -> int:
 
 
 def _docker(
+    profile: Mapping[str, Any],
     reader: Reader,
     runner: Runner,
     hasher: Hasher,
@@ -761,6 +820,18 @@ def _docker(
     *,
     between: PhaseHook | None = None,
 ) -> cj.Object:
+    expected_docker = _object(_profile_field(profile, ("docker",)), "profile.docker")
+    expected_cgroup_driver = _name(
+        expected_docker.get("cgroup_driver"), "profile.docker.cgroup_driver"
+    )
+    expected_cgroup_parent = _name(
+        expected_docker.get("cgroup_parent"), "profile.docker.cgroup_parent"
+    )
+    expected_parent = {"cgroupfs": "/", "systemd": "-.slice"}.get(expected_cgroup_driver)
+    if expected_parent is None:
+        _error("profile.docker.cgroup_driver must be cgroupfs or systemd")
+    if expected_cgroup_parent != expected_parent:
+        _error("profile.docker.cgroup_parent does not match the cgroup driver")
     if runner is run_command and hasher is hash_executable:
         version_raw, info_raw, client_hash = run_docker_pair(
             expected_client_hash, between=between
@@ -780,6 +851,9 @@ def _docker(
     daemon_architecture = _architecture(
         _json_string(info, "Architecture", "docker info"), "docker daemon architecture"
     )
+    cgroup_driver = _json_string(info, "CgroupDriver", "docker info")
+    if cgroup_driver != expected_cgroup_driver:
+        _error("Docker cgroup driver does not match the profile")
     default_runtime = _json_string(info, "DefaultRuntime", "docker info")
     if default_runtime != DOCKER_RUNTIME:
         _error("Docker default runtime is not the profiled runc runtime")
@@ -797,6 +871,8 @@ def _docker(
             ("daemon_architecture", daemon_architecture),
             ("storage_driver", _json_string(info, "Driver", "docker info")),
             ("cgroup_version", _json_string(info, "CgroupVersion", "docker info")),
+            ("cgroup_driver", cgroup_driver),
+            ("cgroup_parent", expected_cgroup_parent),
             ("oci_runtime", _json_string(runtime_commit, "ID", "docker info RuncCommit")),
         )
     )
@@ -865,6 +941,7 @@ def inspect(
     if architecture != "x86_64":
         _error("host architecture must be x86_64 before Docker qualification")
     kernel = _name(getattr(system, "release", ""), "host kernel")
+    expected_machine = _object(_profile_field(profile, ("machine",)), "profile.machine")
     fields = _cpuinfo(_text(reader, CPUINFO_PATH))
     online = _line(reader, ONLINE_CPU_SET_PATH)
     benchmark = _line(trusted_reader, BENCHMARK_CPU_SET_PATH)
@@ -874,13 +951,13 @@ def inspect(
     _parse_cpu_set(numa, "NUMA set")
     if not _subset(benchmark_ranges, online_ranges):
         _error("benchmark CPU set is not a subset of online CPUs")
-    expected_machine = _object(_profile_field(profile, ("machine",)), "profile.machine")
     expected_benchmark = expected_machine.get("benchmark_cpu_set")
     if not isinstance(expected_benchmark, str):
         _error("profile.machine.benchmark_cpu_set is not a string")
     _parse_cpu_set(expected_benchmark, "profile.machine.benchmark_cpu_set")
     if benchmark != expected_benchmark:
         _error("benchmark CPU set does not match the profile")
+    selected_fields = _selected_cpu_fields(fields, benchmark_ranges, expected_machine)
     memory = _memory_bytes(reader)
     quota = _quota_milli(reader)
     if quota != 0:
@@ -896,7 +973,7 @@ def inspect(
     def capture_between() -> None:
         observations.append(_observation(reader, "between", page_size, memory))
 
-    docker = _docker(reader, runner, hasher, expected_client_hash, between=capture_between)
+    docker = _docker(profile, reader, runner, hasher, expected_client_hash, between=capture_between)
     observations.append(_observation(reader, "post", page_size, memory))
     _check_monotonic_counters(observations)
     return cj.Object(
@@ -908,11 +985,11 @@ def inspect(
                     (
                         ("architecture", architecture),
                         ("kernel", kernel),
-                        ("cpu_vendor", _name(fields["vendor_id"], "CPU vendor")),
-                        ("cpu_family", _decimal_uint(fields["cpu family"], "CPU family")),
-                        ("cpu_model", _name(fields["model"], "CPU model")),
-                        ("cpu_stepping", _decimal_uint(fields["stepping"], "CPU stepping")),
-                        ("microcode", _name(fields["microcode"], "microcode")),
+                        ("cpu_vendor", _name(selected_fields["vendor_id"], "CPU vendor")),
+                        ("cpu_family", _decimal_uint(selected_fields["cpu family"], "CPU family")),
+                        ("cpu_model", _name(selected_fields["model"], "CPU model")),
+                        ("cpu_stepping", _decimal_uint(selected_fields["stepping"], "CPU stepping")),
+                        ("microcode", _name(selected_fields["microcode"], "microcode")),
                         ("online_cpu_set", online),
                         ("benchmark_cpu_set", benchmark),
                         ("numa_set", numa),

@@ -51,6 +51,8 @@ PROFILE = {
         "daemon_architecture": "x86_64",
         "storage_driver": "overlay2",
         "cgroup_version": "2",
+        "cgroup_driver": "cgroupfs",
+        "cgroup_parent": "/",
         "oci_runtime": "runc-1.1.12",
     },
     "observation_limits": [
@@ -74,6 +76,7 @@ DOCKER_VERSION = {
 DOCKER_INFO = {
     "Driver": "overlay2",
     "CgroupVersion": "2",
+    "CgroupDriver": "cgroupfs",
     "ServerVersion": "26.1.4",
     "Architecture": "amd64",
     "DefaultRuntime": "runc",
@@ -91,6 +94,18 @@ FILES = {
         b"model : 143\n"
         b"stepping : 8\n"
         b"microcode : 0x2b000643\n\n"
+        b"processor : 2\n"
+        b"vendor_id : GenuineIntel\n"
+        b"cpu family : 6\n"
+        b"model : 143\n"
+        b"stepping : 8\n"
+        b"microcode : 0x2b000643\n\n"
+        b"processor : 3\n"
+        b"vendor_id : GenuineIntel\n"
+        b"cpu family : 6\n"
+        b"model : 143\n"
+        b"stepping : 8\n"
+        b"microcode : 0x2b000643\n"
     ),
     native_host.MEMINFO_PATH: (
         b"MemTotal:       16777216 kB\n"
@@ -138,6 +153,8 @@ assert qualified.memory_bytes == 16 * 1024 * 1024 * 1024
 assert qualified.cpu_quota_milli == 0
 assert qualified.docker.client_sha256 == H64
 assert qualified.docker.daemon_architecture == "x86_64"
+assert qualified.docker.cgroup_driver == "cgroupfs"
+assert qualified.docker.cgroup_parent == "/"
 assert qualified.docker.oci_runtime == "runc-1.1.12"
 assert tuple(calls) == (native_host.DOCKER_VERSION_ARGV, native_host.DOCKER_INFO_ARGV)
 assert native_host._FIXED_ENV["DOCKER_CONFIG"] == native_host.DOCKER_CONFIG
@@ -171,6 +188,7 @@ native_host._validate_docker_config_dir(
 )
 assert [item[0] for item in config_opened] == ["/", "etc", "align-evidence", "docker-empty"]
 assert all(item[1] & getattr(native_host.os, "O_NOFOLLOW", 0) for item in config_opened)
+assert all(item[1] & getattr(native_host.os, "O_NONBLOCK", 0) for item in config_opened)
 assert config_closed == [13, 12, 11, 10]
 
 
@@ -347,6 +365,36 @@ def qualify_with(reader_value=reader, runner_value=runner, uname_value="x86_64",
     )
 
 
+cpu_records = FILES[native_host.CPUINFO_PATH].split(b"\n\n")
+
+
+def cpuinfo_with(records):
+    return with_file(native_host.CPUINFO_PATH, b"\n\n".join(records))
+
+
+non_selected_cpu_mismatch = list(cpu_records)
+non_selected_cpu_mismatch[0] = non_selected_cpu_mismatch[0].replace(b"model : 143", b"model : 999")
+assert qualify_with(reader_value=cpuinfo_with(non_selected_cpu_mismatch)).cpu_model == "143"
+
+selected_cpu_mismatch = list(cpu_records)
+selected_cpu_mismatch[2] = selected_cpu_mismatch[2].replace(b"model : 143", b"model : 999")
+expect_error(
+    lambda: qualify_with(reader_value=cpuinfo_with(selected_cpu_mismatch)),
+    "CPU 3 identity",
+)
+
+missing_selected_cpu = [record for record in cpu_records if b"processor : 3" not in record]
+expect_error(
+    lambda: qualify_with(reader_value=cpuinfo_with(missing_selected_cpu)),
+    "missing a selected benchmark CPU record",
+)
+
+expect_error(
+    lambda: qualify_with(reader_value=cpuinfo_with(cpu_records + [cpu_records[1]])),
+    "repeated processor ID",
+)
+
+
 def forbidden_runner(_argv):
     raise AssertionError("Docker was invoked before native host state was eligible")
 
@@ -376,6 +424,37 @@ def server_mismatch_runner(argv):
 
 coherent = qualify_with(runner_value=server_mismatch_runner)
 assert coherent.docker.daemon_version == "26.1.4"
+
+
+def systemd_runner(argv):
+    if argv == native_host.DOCKER_VERSION_ARGV:
+        return json.dumps(DOCKER_VERSION, separators=(",", ":")).encode("utf-8")
+    info = dict(DOCKER_INFO)
+    info["CgroupDriver"] = "systemd"
+    return json.dumps(info, separators=(",", ":")).encode("utf-8")
+
+
+systemd_profile = {
+    **PROFILE,
+    "docker": {**PROFILE["docker"], "cgroup_driver": "systemd", "cgroup_parent": "-.slice"},
+}
+systemd_qualified = qualify_with(runner_value=systemd_runner, profile=systemd_profile)
+assert systemd_qualified.docker.cgroup_driver == "systemd"
+assert systemd_qualified.docker.cgroup_parent == "-.slice"
+
+
+def cgroup_driver_mismatch_runner(argv):
+    if argv == native_host.DOCKER_VERSION_ARGV:
+        return json.dumps(DOCKER_VERSION, separators=(",", ":")).encode("utf-8")
+    info = dict(DOCKER_INFO)
+    info["CgroupDriver"] = "systemd"
+    return json.dumps(info, separators=(",", ":")).encode("utf-8")
+
+
+expect_error(
+    lambda: qualify_with(runner_value=cgroup_driver_mismatch_runner),
+    "cgroup driver",
+)
 
 
 phase_events = []
@@ -433,7 +512,7 @@ expect_error(
 def missing_runtime_runner(argv):
     if argv == native_host.DOCKER_VERSION_ARGV:
         return json.dumps(DOCKER_VERSION, separators=(",", ":")).encode("utf-8")
-    return b'{"Driver":"overlay2","CgroupVersion":"2","ServerVersion":"26.1.4","Architecture":"amd64","DefaultRuntime":"runc","Runtimes":{"runc":{"path":"runc"}}}'
+    return b'{"Driver":"overlay2","CgroupVersion":"2","CgroupDriver":"cgroupfs","ServerVersion":"26.1.4","Architecture":"amd64","DefaultRuntime":"runc","Runtimes":{"runc":{"path":"runc"}}}'
 
 
 expect_error(
@@ -570,6 +649,16 @@ with tempfile.TemporaryDirectory() as directory:
     expect_error(
         lambda: native_host.read_no_follow(child_directory),
         "not a regular file",
+    )
+    fifo = os.path.join(directory, "fifo")
+    os.mkfifo(fifo)
+    expect_error(
+        lambda: native_host.read_no_follow(fifo),
+        "not a regular file",
+    )
+    expect_error(
+        lambda: native_host._open_executable(fifo),
+        "not a regular executable",
     )
 
 with tempfile.TemporaryDirectory() as directory:
