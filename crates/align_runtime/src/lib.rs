@@ -4615,14 +4615,16 @@ unsafe fn write_field_indexed<D: FieldDst>(
     fi: usize,
     d: &JsonField,
     dst: &D,
-    arena: *mut Arena,
-    allow_arena_materialization: bool,
+    arena: Option<*mut Arena>,
 ) -> Option<()> {
     let kind = (d.tag >> 8) & 0xff;
     let width = field_width(d, kind)?;
     let p = unsafe { dst.field_ptr(fi, d, width)? };
     let colon = idx[k] as usize;
-    let write_arena = if allow_arena_materialization { arena } else { core::ptr::null_mut() };
+    // `None` is the speculation mode: it must not publish an arena allocation before fallback has
+    // confirmed the complete record. `Some(null)` remains a real decode with no caller arena and
+    // therefore rejects selected escaped strings in `write_value`.
+    let write_arena = arena.unwrap_or(core::ptr::null_mut());
     let mut vp = JsonParser { src, pos: skip_ws_at(src, colon + 1), arena: write_arena };
     // Optional field (`opt_tag >= 0`): JSON `null` → `None` (the element buffer is zeroed, so the tag
     // is already 0); any other value writes the payload at `p` (the `Option`'s payload slot) and sets
@@ -4678,14 +4680,17 @@ unsafe fn json_speculate<D: FieldDst>(
                 _ => return false,
             }
         }
-        let d = &ctx.descs[fi as usize];
+        let Ok(fi) = usize::try_from(fi) else {
+            return false;
+        };
+        let d = &ctx.descs[fi];
         if !key_matches_before_colon(src, idx[k] as usize, unsafe { field_name(d) }) {
             return false; // structure drifted from the pattern — fall back
         }
         // Do not publish an arena materialization from speculation: a later key/value mismatch
         // would make fallback decode the same selected escaped string a second time. Returning
         // false for that row keeps the single materialization in the fallback path.
-        if unsafe { write_field_indexed(src, idx, k, fi as usize, d, ctx.dst, ctx.arena, false) }.is_none() {
+        if unsafe { write_field_indexed(src, idx, k, fi, d, ctx.dst, None) }.is_none() {
             return false;
         }
     }
@@ -4719,7 +4724,7 @@ unsafe fn json_fallback<D: FieldDst>(
                 return None; // duplicate field
             }
             pat_field[o] = fi as i32;
-            unsafe { write_field_indexed(src, idx, k, fi, &ctx.descs[fi], ctx.dst, ctx.arena, true)? };
+            unsafe { write_field_indexed(src, idx, k, fi, &ctx.descs[fi], ctx.dst, Some(ctx.arena))? };
         }
     }
     if seen.all_required_seen(ctx.descs) {
@@ -6825,14 +6830,14 @@ fn json_string_equals(raw: &[u8], target: &[u8]) -> bool {
         let e = raw[i];
         i += 1;
         let scalar = match e {
-            b'"' => b'"' as u32,
-            b'\\' => b'\\' as u32,
-            b'/' => b'/' as u32,
+            b'"' => 0x22,
+            b'\\' => 0x5c,
+            b'/' => 0x2f,
             b'b' => 0x08,
             b'f' => 0x0c,
-            b'n' => b'\n' as u32,
-            b'r' => b'\r' as u32,
-            b't' => b'\t' as u32,
+            b'n' => 0x0a,
+            b'r' => 0x0d,
+            b't' => 0x09,
             b'u' => {
                 let Some(cp) = json_hex4(raw, i) else { return false };
                 i += 4;
@@ -6943,9 +6948,6 @@ fn key_before_colon(src: &[u8], cpos: usize) -> Option<&[u8]> {
 /// without materializing them. Any drift returns `false` and lets the caller use the fallback.
 #[inline]
 fn key_matches_before_colon(src: &[u8], cpos: usize, name: &[u8]) -> bool {
-    if let Some(raw) = key_before_colon(src, cpos) {
-        return json_string_equals(raw, name);
-    }
     // Skip whitespace between the key string and the colon (`"k" :` is legal).
     let mut e = cpos;
     while e > 0 && matches!(src[e - 1], b' ' | b'\t' | b'\n' | b'\r') {
@@ -6954,18 +6956,25 @@ fn key_matches_before_colon(src: &[u8], cpos: usize, name: &[u8]) -> bool {
     let nl = name.len();
     // Need room for `"` + name + `"`; the closing quote sits at `e-1`, the key at `[ks..e-1]`, the
     // opening quote at `ks-1`. `e >= nl + 2` keeps every index below in bounds (`ks >= 1`).
-    if e < nl + 2 || src[e - 1] != b'"' {
+    if e >= nl + 2 && src[e - 1] == b'"' {
+        let ks = e - 1 - nl; // key start
+        if src[ks - 1] == b'"'
+            && (ks < 2 || src[ks - 2] != b'\\')
+            // Equal-length compare against the known `name`; short and bounded, so it inlines (no
+            // memcmp call).
+            && src[ks..e - 1] == *name
+        {
+            return true;
+        }
+    }
+
+    // Only a key that could contain an escape needs the slower semantic matcher. The direct clean-key
+    // match above is the normal Mison path; malformed or structurally mismatched keys fall through
+    // so an escaped key that decodes to `name` still succeeds and every other drift falls back.
+    let Some(raw) = key_before_colon(src, cpos) else {
         return false;
-    }
-    let ks = e - 1 - nl; // key start
-    if src[ks - 1] != b'"' {
-        return false; // no opening quote where a `"name"` key would put it (length drift)
-    }
-    if ks >= 2 && src[ks - 2] == b'\\' {
-        return false; // an escaped opening quote `\"` — reject (matches key_before_colon)
-    }
-    // Equal-length compare against the known `name`; short and bounded, so it inlines (no memcmp call).
-    src[ks..e - 1] == *name
+    };
+    raw.contains(&b'\\') && json_string_equals(raw, name)
 }
 
 /// Resolve a raw JSON key body to a descriptor. Clean keys use the existing PHF fast path; escaped
@@ -7424,7 +7433,9 @@ impl<'a> DocBuilder<'a> {
         if self.p.peek() == Some(b'"') {
             let start = self.p.pos;
             let raw = self.p.string_body()?;
-            return Some(((start + 1) as u32, raw.len() as u32));
+            let start = u32::try_from(start.checked_add(1)?).ok()?;
+            let len = u32::try_from(raw.len()).ok()?;
+            return Some((start, len));
         }
         self.p.expect(b'"')?;
         let start = self.p.pos;
@@ -25415,11 +25426,13 @@ mod tests {
         assert_eq!(unsafe { read_str_at(&out, 16) }, "\u{1f600}".as_bytes());
         assert_eq!(unsafe { read_str_at(&out, 32) }, b"ok");
         assert_eq!(read_i64_at(&out, 48), 7);
-        let name_ptr = read_i64_at(&out, 0) as usize as *const u8;
-        let plain_ptr = read_i64_at(&out, 32) as usize as *const u8;
-        assert_ne!(name_ptr, src.as_ptr(), "escaped selected value is not an input view");
+        let name_addr = u64::try_from(read_i64_at(&out, 0)).ok();
+        let plain_addr = u64::try_from(read_i64_at(&out, 32)).ok();
+        let source_addr = u64::try_from(src.as_ptr().addr()).ok();
+        assert_ne!(name_addr, source_addr, "escaped selected value is not an input view");
         let plain_start = src.windows(2).position(|w| w == b"ok").expect("plain fixture value");
-        assert_eq!(plain_ptr, unsafe { src.as_ptr().add(plain_start) }, "clean value stays zero-copy");
+        let plain_source_addr = u64::try_from(unsafe { src.as_ptr().add(plain_start).addr() }).ok();
+        assert_eq!(plain_addr, plain_source_addr, "clean value stays zero-copy");
         unsafe { align_rt_arena_end(arena) };
 
         let mut no_arena = [0u8; 64];
@@ -25595,7 +25608,7 @@ mod tests {
         let (cols, _, _) = soa_layout(&[16, 8], 2).unwrap();
         let read_column_str = |off: usize| -> Vec<u8> {
             let ptr = unsafe { (out.ptr.add(off) as *const *const u8).read_unaligned() };
-            let len = unsafe { (out.ptr.add(off + 8) as *const i64).read_unaligned() } as usize;
+            let len = usize::try_from(unsafe { (out.ptr.add(off + 8) as *const i64).read_unaligned() }).unwrap_or_default();
             unsafe { core::slice::from_raw_parts(ptr, len) }.to_vec()
         };
         assert_eq!(read_column_str(cols[0].0), b"a");
