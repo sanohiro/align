@@ -226,6 +226,12 @@ def assemble(
     }
     preparation_manifests: dict[tuple[str, str], str] = {}
     for record in transcript.children:
+        product = (record.plan.benchmark, record.plan.revision)
+        sealed_digest = transcript.manifests.get(product)
+        if sealed_digest is None:
+            _error("child product has no sealed artifact manifest")
+        if record.result.artifact_manifest_sha256 != sealed_digest:
+            _error("child artifact manifest changed after preparation")
         child_range = ranges.get(record.result.child_id)
         if child_range is None:
             _error("child has no monitor range")

@@ -92,6 +92,18 @@ def _error(message: str) -> None:
     raise NativeMeasurementError(message)
 
 
+def _freeze(value: Any) -> Any:
+    """Recursively detach profile state from caller-owned mutable containers."""
+
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze(member) for key, member in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze(member) for member in value)
+    if isinstance(value, tuple):
+        return tuple(_freeze(member) for member in value)
+    return value
+
+
 def _hash(value: object, label: str) -> str:
     if not isinstance(value, str) or _HEX64.fullmatch(value) is None:
         _error(f"{label} must be lowercase SHA-256")
@@ -184,10 +196,12 @@ class NativeMeasurementConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.profile, Mapping):
             _error("measurement profile must be a mapping")
+        frozen_profile = _freeze(self.profile)
         try:
-            container._profile_identity(self.profile)
+            container._profile_identity(frozen_profile)
         except container.ContainerError as exc:
             raise NativeMeasurementError(str(exc)) from exc
+        object.__setattr__(self, "profile", frozen_profile)
         for phase in _PHASE_TIMEOUT_KEYS:
             _execution_limits(self.profile, phase)
         _hash(self.docker_client_sha256, "docker_client_sha256")

@@ -141,8 +141,8 @@ def observations(transcript):
     return lifecycle.finish().observations
 
 
-def profile_config():
-    profile = {
+def profile_value():
+    return {
         "image": {
             "registry_digest": "sha256:" + "1" * 64,
             "local_image_id": H,
@@ -165,6 +165,11 @@ def profile_config():
             "sample_ns": 60_000_000_000,
         },
     }
+
+
+def profile_config(profile=None):
+    if profile is None:
+        profile = profile_value()
     return nm.NativeMeasurementConfig(
         profile=profile,
         docker_client_sha256=H,
@@ -186,6 +191,17 @@ def profile_config():
 # production code.
 original_execute_child = nm.execute_child
 session_digests = {}
+
+source_profile = profile_value()
+source_config = profile_config(source_profile)
+source_profile["image"]["registry_digest"] = "sha256:" + "f" * 64
+assert source_config.profile["image"]["registry_digest"] == "sha256:" + "1" * 64
+try:
+    source_config.profile["image"]["registry_digest"] = "sha256:" + "f" * 64
+except TypeError:
+    pass
+else:
+    raise AssertionError("session profile remained mutable")
 
 
 def fake_execute_child(config, plan, child_id, *, runner, clock):
@@ -289,7 +305,7 @@ expect_error(
         controller.ExecutionTranscript(TRANSCRIPT.children, bad_manifests),
         observations(TRANSCRIPT),
     ),
-    "artifact manifests",
+    "artifact manifest",
     measurement_report.MeasurementReportError,
 )
 
