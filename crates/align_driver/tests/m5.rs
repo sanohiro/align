@@ -575,6 +575,29 @@ fn json_option_move_struct_payload_remains_admitted() {
 }
 
 #[test]
+fn json_option_move_struct_later_failure_cleans() {
+    if !backend_available() {
+        return;
+    }
+    // Request 15: the admitted Option<Move-struct> becomes Some before a later required sibling is
+    // checked. `?` returns the decode error from the generated program; a leak is invisible at the
+    // source level, while a double-free aborts the child, so this exercises the real compiler/runtime
+    // boundary in addition to the alloc-count descriptor owner.
+    let src = "import core.json\n\
+         Owned { xs: array<i64> }\n\
+         Doc { id: i64, meta: Option<Owned>, tail: i64 }\n\
+         fn decode(s: str) -> Result<(), Error> {\n  \
+           d: Doc := json.decode(s)?\n  \
+           return Ok(())\n\
+         }\n\
+         fn main() -> Result<(), Error> {\n  \
+           return decode(\"{\\\"id\\\":1,\\\"meta\\\":{\\\"xs\\\":[2,3]}}\")\n\
+         }\n";
+    let out = build_and_run("json-option-move-later-failure", src);
+    assert_eq!(out.status.code(), Some(1), "the missing required sibling returns Error.Code(1)");
+}
+
+#[test]
 fn json_array_struct_field_decode_read_and_roundtrip() {
     if !backend_available() {
         return;

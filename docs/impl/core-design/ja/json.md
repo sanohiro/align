@@ -421,6 +421,35 @@ draft §14 + §18.1）。以下は出荷済みスライスと、現在も残る�
 捨てるのが validation）、`json.token`（doc + scan で覆う。consumer なし）、`json.field_table<T>`
 （コンパイラ内部）。`json.decode<T>(...)` 呼び出し構文は恒久的に不採用（no turbofish）。
 
+## decoded owner 遷移の closure（Request 15）
+
+Request 15 は、既に受理されている decoded owner の遷移を、JSON schema の拡張、構文変更、runtime
+ABI の追加、エラー優先順位の変更なしに閉じる。live な `Option<Move-struct>` payload は、後続の
+recoverable な object failure 後に解放し、tag と payload を null にする。indexed AoS の speculation
+は owned field に対して transactional とし、失敗した speculation は fallback が同じ領域へ書く前に
+部分書き込みをすべて cleanup する。top-level AoS の staging は、element、delimiter、EOF、trailing-input
+failure のいずれでも、完了済み row と現在の partial row をすべて cleanup する。single-record の decode
+完了後に trailing-input 検査が拒否した場合も owned field を cleanup する。cleanup は exact-once かつ
+idempotent とし、成功時の construction、生成された `Drop`、move-out、replacement、既存の SoA/scanner
+non-owning 契約は変更しない。
+
+実装 closure matrix は次のとおり。
+
+| 遷移 | owner | regression |
+| --- | --- | --- |
+| optional-owner の formation と受理済み success | `align_sema` の JSON schema と既存 recursive `DropPlan` | `m5::json_option_move_struct_payload_remains_admitted` |
+| 後続 sibling/type/duplicate/malformed/trailing failure 後の optional payload | `align_rt_json_decode`、`parse_object`、`drop_decoded_owned` | `json_decoded_optional_owner_failure_matrix` |
+| indexed speculation の partial write → fallback success/failure | `json_speculate`、`json_fallback`、`write_field_indexed`、AoS destination | `json_decoded_owner_speculation_transition_matrix` |
+| malformed element、delimiter、EOF、trailing input 時の top-level AoS row | `align_rt_json_decode_struct_array` staging ledger と recursive cleanup | `json_decoded_owner_aos_slow_failure_matrix` |
+| nested record、Move union、field-array、scalar-array の互換性 | `parse_object`、`drop_decoded_union`、既存 descriptor-kind cleanup | `json_nested_move_struct_array_failure_no_double_free`、`json_array_of_move_struct_sibling_failure_deep_frees_every_element`、`json_union_array_arm_trailing_garbage_frees_buffer`、`json_scalar_array_field_sibling_failure_frees_buffer` |
+| success move、replacement、return、branch/loop exit、生成 `Drop` | 既存の MIR/codegen ownership path。runtime ABI は追加しない | `m5::json_option_move_struct_payload_remains_admitted`、`m5::json_option_move_struct_later_failure_cleans`、既存の Move/Drop control-flow owner |
+| whole/per-unit/interface/cache と concurrent call | 既存の structural fingerprint、変更しない descriptor、call-local runtime state | 既存の JSON cache/interface owner と `json_decoded_owner_same_process_pair_matrix` |
+
+実装では、該当する各行を最終 diff と regression witness に対応付ける。process-global allocation
+counter を読む runtime test は fixture 作成前に `ALLOC_COUNT_LOCK` を取得し、cleanup と最終 assertion
+まで保持する。この修正では process-global state、CLI input、persisted field、benchmark claim、scanner
+ownership を追加しない。
+
 ## Pitfalls
 
 - P1 — **デコードのターゲット文法はホワイトリスト制** であり、意味解析（sema）で強制される。ターゲットとなる型を追加するということは、既存の投機的パスやフォールバック機構（カウントパス、`FieldDst`、エラータグ）をすべて対応させることを意味する。特殊なデータ構造に対してパニックを引き起こすような不完全なサポートは、#295 で解決したバグクラスそのものである。その問題を再び引き起こしてはならない。
