@@ -3722,6 +3722,12 @@ pub unsafe extern "C" fn align_rt_json_decode(
         }
         Some(())
     })();
+    if ok.is_none() {
+        // `parse_object` cleans parse-time failures itself. This second idempotent pass also covers
+        // the failure after a complete object but before returning the value: trailing non-whitespace
+        // is checked outside `parse_object`, after all owned fields are live.
+        unsafe { drop_decoded_owned(out, descs, None) };
+    }
     if ok.is_some() {
         0
     } else {
@@ -4133,8 +4139,9 @@ unsafe fn sub_owns_buffers(descs: &[JsonField]) -> bool {
 /// sibling field failing after an `array` field decoded would leak that buffer). `only_seen` gates
 /// the top level to the fields actually written; a nested struct reached through a *seen* kind-4
 /// field is fully decoded (the strict contract), so its owned fields are freed unconditionally.
-/// Optional fields are non-owned by the field restrictions, so they are skipped. `align_rt_free(null)`
-/// is a no-op (an empty array / unwritten field).
+/// An optional field is cleaned only when its tag is `Some`; its payload and tag are then zeroed so a
+/// later outer cleanup is idempotent. `align_rt_free(null)` is a no-op (an empty array / unwritten
+/// field).
 ///
 /// # Safety
 /// `base`/`descs` must describe the struct actually being decoded; each kind-4/5/6 `sub` must be valid.
@@ -4143,11 +4150,26 @@ unsafe fn drop_decoded_owned(base: *mut u8, descs: &[JsonField], only_seen: Opti
         if only_seen.is_some_and(|s| !s.is_set(i)) {
             continue; // a field never written into the partial struct — nothing to free
         }
-        // Optional payloads are non-owned; a negative offset is a mis-built descriptor (skip safely).
-        if d.opt_tag >= 0 || d.offset < 0 {
-            continue;
+        let opt_tag = if d.opt_tag >= 0 {
+            let Ok(tag) = usize::try_from(d.opt_tag) else {
+                continue;
+            };
+            Some(tag)
+        } else {
+            None
+        };
+        if let Some(opt_tag) = opt_tag {
+            // Generated descriptors use 0/1 for the Option tag. Treat any non-zero value as live and
+            // clear it below; a zero tag is `None`, so its payload cannot own a live allocation.
+            if unsafe { *base.add(opt_tag) } == 0 {
+                continue;
+            }
         }
-        let off = d.offset as usize;
+        // A negative or otherwise unrepresentable offset is a mis-built descriptor; leave it untouched
+        // rather than forming an invalid pointer. Compiler-emitted descriptors never take this branch.
+        let Some(off) = usize::try_from(d.offset).ok() else {
+            continue;
+        };
         match (d.tag >> 8) & 0xff {
             5 => {
                 // Read the array `{ptr,len}` slot's pointer (first 8 bytes) and element count (next 8).
@@ -4202,6 +4224,31 @@ unsafe fn drop_decoded_owned(base: *mut u8, descs: &[JsonField], only_seen: Opti
             }
             _ => {}
         }
+        if let Some(opt_tag) = opt_tag {
+            // Clear the tag and complete payload, not only owned pointer fields. This makes a failed
+            // optional owner indistinguishable from `None` to any enclosing cleanup.
+            unsafe { *base.add(opt_tag) = 0 };
+            let width = field_width(d, (d.tag >> 8) & 0xff).and_then(|w| usize::try_from(w).ok());
+            if let Some(width) = width {
+                unsafe { core::ptr::write_bytes(base.add(off), 0, width) };
+            }
+        }
+    }
+}
+
+/// Deep-clean every zero-initialized or partially initialized row in a staged top-level AoS buffer.
+/// The staging `Vec` owns only the row bytes; any nested heap buffers belong to decoded fields and
+/// must be released before the Vec is dropped. Rows that never reached a successful object parse are
+/// safe because their slots were zeroed before parsing began, and `drop_decoded_owned` is idempotent.
+///
+/// # Safety
+/// Every complete `esz`-byte row in `buf` is described by `descs`; the buffer is writable.
+unsafe fn drop_decoded_staged_rows(buf: &mut [u8], esz: usize, descs: &[JsonField]) {
+    if esz == 0 {
+        return;
+    }
+    for row in buf.chunks_exact_mut(esz) {
+        unsafe { drop_decoded_owned(row.as_mut_ptr(), descs, None) };
     }
 }
 
@@ -4746,6 +4793,10 @@ pub unsafe extern "C" fn align_rt_json_decode_struct_array(
                         let spec = pat_ncol == rec_cols.len() as i64
                             && unsafe { json_speculate(src, &idx, &rec_cols, &pat_field, &ctx) };
                         if !spec {
+                            // Speculation can have written one or more owning fields before a key or
+                            // value disproves the learned layout. Fallback reuses the same row slot;
+                            // release those partial owners before it writes again.
+                            unsafe { drop_decoded_owned(eptr, descs, None) };
                             unsafe { json_fallback(src, &idx, &rec_cols, &ctx, &mut seen, &mut pat_field)? };
                             pat_ncol = rec_cols.len() as i64;
                         }
@@ -4777,6 +4828,9 @@ pub unsafe extern "C" fn align_rt_json_decode_struct_array(
         Some(())
     })();
     if ok.is_none() {
+        // The Vec is only staging storage. Any array/union buffers nested in completed or partial
+        // rows must be deep-freed before dropping that Vec on the decode Err path.
+        unsafe { drop_decoded_staged_rows(&mut buf, esz, descs) };
         return 1;
     }
 
@@ -25334,6 +25388,370 @@ mod tests {
         assert_ne!(rc, 0, "the malformed 3rd element must fail the decode");
         let (a1, f1) = (align_rt_alloc_count(), align_rt_free_count());
         assert_eq!(a1 - a0, f1 - f0, "every buffer allocated before the mid-array failure was freed (no leak)");
+    }
+
+    #[cfg(feature = "alloc-count")]
+    #[test]
+    fn json_decoded_optional_owner_failure_matrix() {
+        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Parent { meta: Option<Inner> @0/tag 0, tail: i64 @24 }; Inner { xs: array<i64> @0 }.
+        // The optional payload becomes Some only after its nested object succeeds. A later parent
+        // failure must then release the nested array and clear both the Option tag and payload.
+        let (xs, meta, tail) = (b"xs", b"meta", b"tail");
+        let xs_tag = (7 << 8) | 16 | (1 << 16) | (8 << 24);
+        let inner_descs = [JsonField {
+            name_ptr: xs.as_ptr(),
+            name_len: 2,
+            tag: xs_tag,
+            offset: 0,
+            sub: core::ptr::null(),
+            opt_tag: -1,
+        }];
+        let inner_sub = JsonSubTable {
+            descs: inner_descs.as_ptr(),
+            n_fields: 1,
+            store_size: 16,
+            phf: core::ptr::null(),
+            phf_len: 0,
+            phf_seed: 0,
+        };
+        let descs = [
+            JsonField {
+                name_ptr: meta.as_ptr(),
+                name_len: 4,
+                tag: 4 << 8,
+                offset: 8,
+                sub: &inner_sub,
+                opt_tag: 0,
+            },
+            JsonField {
+                name_ptr: tail.as_ptr(),
+                name_len: 4,
+                tag: 8,
+                offset: 24,
+                sub: core::ptr::null(),
+                opt_tag: -1,
+            },
+        ];
+        let cases: &[&[u8]] = &[
+            br#"{"meta":{"xs":[1,2]}}"#, // missing required sibling
+            br#"{"meta":{"xs":[1,2]},"tail":"bad"}"#, // later type failure
+            br#"{"meta":{"xs":[1,2]},"tail":7,"tail":8}"#, // later duplicate
+            br#"{"meta":{"xs":[1,2]},"tail":7"#, // later malformed object
+            br#"{"meta":{"xs":[1,2]},"tail":7} trailing"#, // post-object trailing failure
+        ];
+        for src in cases {
+            let (a0, f0) = (align_rt_alloc_count(), align_rt_free_count());
+            let mut out = [0u8; 32];
+            let rc = unsafe {
+                align_rt_json_decode(
+                    src.as_ptr(),
+                    src.len() as i64,
+                    descs.as_ptr(),
+                    descs.len() as i64,
+                    out.as_mut_ptr(),
+                    out.len() as i64,
+                    core::ptr::null(),
+                    0,
+                    0,
+                )
+            };
+            assert_ne!(rc, 0, "each later parent failure must reject the decode");
+            let (a1, f1) = (align_rt_alloc_count(), align_rt_free_count());
+            assert_eq!(a1 - a0, 1, "the optional nested array allocated exactly once");
+            assert_eq!(a1 - a0, f1 - f0, "optional-owner cleanup is exact-once");
+            assert_eq!(out[0], 0, "the failed Option is nulled to None");
+            assert!(out[8..24].iter().all(|&b| b == 0), "the failed Option payload is zeroed");
+        }
+    }
+
+    #[cfg(feature = "alloc-count")]
+    #[test]
+    fn json_decoded_owner_single_record_trailing_input() {
+        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // A required owned field can be fully decoded before the entrypoint's final trailing-input
+        // check rejects the document. That check is outside parse_object, so the entrypoint must run
+        // the idempotent whole-record cleanup itself.
+        let (x, arr) = (b"x", b"arr");
+        let inner_descs = [JsonField {
+            name_ptr: x.as_ptr(),
+            name_len: 1,
+            tag: 8,
+            offset: 0,
+            sub: core::ptr::null(),
+            opt_tag: -1,
+        }];
+        let inner_sub = JsonSubTable {
+            descs: inner_descs.as_ptr(),
+            n_fields: 1,
+            store_size: 8,
+            phf: core::ptr::null(),
+            phf_len: 0,
+            phf_seed: 0,
+        };
+        let descs = [JsonField {
+            name_ptr: arr.as_ptr(),
+            name_len: 3,
+            tag: (5 << 8) | 16,
+            offset: 0,
+            sub: &inner_sub,
+            opt_tag: -1,
+        }];
+        let src = br#"{"arr":[{"x":1}]} trailing"#;
+        let (a0, f0) = (align_rt_alloc_count(), align_rt_free_count());
+        let mut out = [0u8; 16];
+        let rc = unsafe {
+            align_rt_json_decode(
+                src.as_ptr(),
+                src.len() as i64,
+                descs.as_ptr(),
+                1,
+                out.as_mut_ptr(),
+                out.len() as i64,
+                core::ptr::null(),
+                0,
+                0,
+            )
+        };
+        assert_ne!(rc, 0, "trailing input must reject the complete object");
+        let (a1, f1) = (align_rt_alloc_count(), align_rt_free_count());
+        assert_eq!(a1 - a0, 1, "the required array allocated exactly once");
+        assert_eq!(a1 - a0, f1 - f0, "trailing-input cleanup is exact-once");
+        assert!(out[..16].iter().all(|&b| b == 0), "the failed record is nulled");
+    }
+
+    #[cfg(feature = "alloc-count")]
+    #[test]
+    fn json_decoded_owner_speculation_transition_matrix() {
+        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The first record learns [arr, req]. The second record writes a fresh `arr` during
+        // speculation, then its key mismatch forces fallback; fallback writes `arr` again and then
+        // fails because `req` is absent. Both the speculative owner and fallback owner must be freed.
+        let (x, arr, req) = (b"x", b"arr", b"req");
+        let inner_descs = [JsonField {
+            name_ptr: x.as_ptr(),
+            name_len: 1,
+            tag: 8,
+            offset: 0,
+            sub: core::ptr::null(),
+            opt_tag: -1,
+        }];
+        let inner_sub = JsonSubTable {
+            descs: inner_descs.as_ptr(),
+            n_fields: 1,
+            store_size: 8,
+            phf: core::ptr::null(),
+            phf_len: 0,
+            phf_seed: 0,
+        };
+        let descs = [
+            JsonField {
+                name_ptr: arr.as_ptr(),
+                name_len: 3,
+                tag: (5 << 8) | 16,
+                offset: 0,
+                sub: &inner_sub,
+                opt_tag: -1,
+            },
+            JsonField {
+                name_ptr: req.as_ptr(),
+                name_len: 3,
+                tag: 8,
+                offset: 16,
+                sub: core::ptr::null(),
+                opt_tag: -1,
+            },
+        ];
+        let src = br#"[{"arr":[{"x":1}],"req":1},{"arr":[{"x":2}],"bad":1}]"#;
+        let (a0, f0) = (align_rt_alloc_count(), align_rt_free_count());
+        let mut out = AlignStr { ptr: core::ptr::null_mut(), len: 0 };
+        let rc = unsafe {
+            align_rt_json_decode_struct_array(
+                src.as_ptr(),
+                src.len() as i64,
+                descs.as_ptr(),
+                descs.len() as i64,
+                24,
+                &mut out,
+                core::ptr::null(),
+                0,
+                0,
+            )
+        };
+        assert_ne!(rc, 0, "fallback must reject the missing required field");
+        assert!(out.ptr.is_null(), "failed staging must not publish an array");
+        let (a1, f1) = (align_rt_alloc_count(), align_rt_free_count());
+        assert!(a1 > a0, "the first row and speculative/fallback paths allocated owners");
+        assert_eq!(a1 - a0, f1 - f0, "speculation and fallback cleanup are exact-once");
+
+        // A second transition proves the same speculative owner cleanup when fallback succeeds. The
+        // first row teaches [arr, unknown]; the second row writes `arr`, sees a declared optional
+        // field in the unqueried position, cleans that owner, and fallback writes both fields.
+        let opt = b"opt";
+        let success_descs = [
+            JsonField {
+                name_ptr: arr.as_ptr(),
+                name_len: 3,
+                tag: (5 << 8) | 16,
+                offset: 0,
+                sub: &inner_sub,
+                opt_tag: -1,
+            },
+            JsonField {
+                name_ptr: opt.as_ptr(),
+                name_len: 3,
+                tag: 8,
+                offset: 16,
+                sub: core::ptr::null(),
+                opt_tag: 24,
+            },
+        ];
+        let success_src = br#"[{"arr":[{"x":1}],"unknown":0},{"arr":[{"x":2}],"opt":7}]"#;
+        let (a0, f0) = (align_rt_alloc_count(), align_rt_free_count());
+        let mut success_out = AlignStr { ptr: core::ptr::null_mut(), len: 0 };
+        let rc = unsafe {
+            align_rt_json_decode_struct_array(
+                success_src.as_ptr(),
+                success_src.len() as i64,
+                success_descs.as_ptr(),
+                success_descs.len() as i64,
+                32,
+                &mut success_out,
+                core::ptr::null(),
+                0,
+                0,
+            )
+        };
+        assert_eq!(rc, 0, "fallback may recover structural drift when all required fields remain present");
+        assert_eq!(success_out.len, 2, "both rows survive the successful fallback");
+        assert!(!success_out.ptr.is_null(), "successful staging publishes the outer AoS");
+        let staged_len = usize::try_from(success_out.len).expect("successful AoS length is non-negative") * 32;
+        unsafe {
+            let staged = core::slice::from_raw_parts_mut(success_out.ptr as *mut u8, staged_len);
+            drop_decoded_staged_rows(staged, 32, &success_descs);
+            align_rt_free(success_out.ptr as *mut u8);
+        }
+        let (a1, f1) = (align_rt_alloc_count(), align_rt_free_count());
+        assert_eq!(a1 - a0, 4, "two arrays, one speculative replacement, and one outer AoS were allocated");
+        assert_eq!(a1 - a0, f1 - f0, "successful fallback leaves no speculative owner behind");
+    }
+
+    #[cfg(feature = "alloc-count")]
+    #[test]
+    fn json_decoded_owner_aos_slow_failure_matrix() {
+        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // These cases exercise a completed row plus a current partial row across malformed element,
+        // missing top-level delimiter, and trailing-input failures. Staging bytes are not owners; all
+        // nested arrays must be deep-cleaned before the staging Vec is dropped.
+        let (x, arr) = (b"x", b"arr");
+        let inner_descs = [JsonField {
+            name_ptr: x.as_ptr(),
+            name_len: 1,
+            tag: 8,
+            offset: 0,
+            sub: core::ptr::null(),
+            opt_tag: -1,
+        }];
+        let inner_sub = JsonSubTable {
+            descs: inner_descs.as_ptr(),
+            n_fields: 1,
+            store_size: 8,
+            phf: core::ptr::null(),
+            phf_len: 0,
+            phf_seed: 0,
+        };
+        let descs = [JsonField {
+            name_ptr: arr.as_ptr(),
+            name_len: 3,
+            tag: (5 << 8) | 16,
+            offset: 0,
+            sub: &inner_sub,
+            opt_tag: -1,
+        }];
+        let cases: &[(&[u8], usize)] = &[
+            (br#"[] trailing"#, 0),
+            (br#"[{"arr":[{"x":1}]},{"arr":5}]"#, 1),
+            (br#"[{"arr":[{"x":1}]},{"arr":[{"x":2}]},{"arr":5}]"#, 2),
+            (br#"[{"arr":[{"x":1}]} ,"#, 1),
+            (br#"[{"arr":[{"x":1}]}] trailing"#, 1),
+        ];
+        for &(src, expected_allocations) in cases {
+            let (a0, f0) = (align_rt_alloc_count(), align_rt_free_count());
+            let mut out = AlignStr { ptr: core::ptr::null_mut(), len: 0 };
+            let rc = unsafe {
+                align_rt_json_decode_struct_array(
+                    src.as_ptr(),
+                    src.len() as i64,
+                    descs.as_ptr(),
+                    1,
+                    16,
+                    &mut out,
+                    core::ptr::null(),
+                    0,
+                    0,
+                )
+            };
+            assert_ne!(rc, 0, "malformed AoS input must reject");
+            assert!(out.ptr.is_null(), "failed staging must not publish an array");
+            let (a1, f1) = (align_rt_alloc_count(), align_rt_free_count());
+            assert_eq!(a1 - a0, expected_allocations as i64, "allocation count covers zero/one/many completed rows");
+            assert_eq!(a1 - a0, f1 - f0, "all staged rows are cleaned before Vec drop");
+        }
+    }
+
+    #[test]
+    fn json_decoded_owner_same_process_pair_matrix() {
+        // Two callers share immutable descriptors but keep independent parser position and output
+        // storage. The cleanup repair adds no process-global mutable state, so these calls may overlap.
+        let x = b"x";
+        let descs = [JsonField {
+            name_ptr: x.as_ptr(),
+            name_len: 1,
+            tag: 8,
+            offset: 0,
+            sub: core::ptr::null(),
+            opt_tag: -1,
+        }];
+        let fields = descs.as_ptr().expose_provenance();
+        let n_fields = descs.len() as i64;
+        std::thread::scope(|scope| {
+            let left = scope.spawn(move || {
+                let mut out = [0u8; 8];
+                let rc = unsafe {
+                    align_rt_json_decode(
+                        br#"{"x":1}"#.as_ptr(),
+                        7,
+                        core::ptr::with_exposed_provenance(fields),
+                        n_fields,
+                        out.as_mut_ptr(),
+                        8,
+                        core::ptr::null(),
+                        0,
+                        0,
+                    )
+                };
+                (rc, i64::from_le_bytes(out))
+            });
+            let right = scope.spawn(move || {
+                let mut out = [0u8; 8];
+                let rc = unsafe {
+                    align_rt_json_decode(
+                        br#"{"x":2}"#.as_ptr(),
+                        7,
+                        core::ptr::with_exposed_provenance(fields),
+                        n_fields,
+                        out.as_mut_ptr(),
+                        8,
+                        core::ptr::null(),
+                        0,
+                        0,
+                    )
+                };
+                (rc, i64::from_le_bytes(out))
+            });
+            assert_eq!(left.join().unwrap(), (0, 1));
+            assert_eq!(right.join().unwrap(), (0, 2));
+        });
     }
 
     #[test]

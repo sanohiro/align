@@ -505,6 +505,35 @@ the few boundaries that remain:
   admitted `Option<Move-struct>` JSON shape explicit; cleanup after a later required sibling decode
   error remains a separate ownership request.
 
+## Decoded-owner transition closure (Request 15)
+
+Request 15 closes the already-admitted decoded-owner transitions without widening the JSON schema,
+changing source syntax, adding a runtime ABI, or changing error precedence. A live
+`Option<Move-struct>` payload is released after any later recoverable object failure and its tag and
+payload are nulled. Indexed AoS speculation is transactional with respect to owned fields: a failed
+speculation cleans every partially written destination before fallback writes it. Top-level AoS staging
+cleans every completed row and the current partial row on element, delimiter, EOF, or trailing-input
+failure. A completed single-record decode cleans its owned fields when the final trailing-input check
+rejects. Cleanup is exact-once and idempotent; successful construction, generated `Drop`, move-out,
+replacement, and the existing SoA/scanner non-owning contracts remain unchanged.
+
+The implementation closure matrix is:
+
+| Transition | Owner | Regression |
+| --- | --- | --- |
+| Optional-owner formation and admitted success | `align_sema` JSON schema and existing recursive `DropPlan` | `m5::json_option_move_struct_payload_remains_admitted` |
+| Optional payload after later sibling/type/duplicate/malformed/trailing failure | `align_rt_json_decode`, `parse_object`, and `drop_decoded_owned` | `json_decoded_optional_owner_failure_matrix` |
+| Indexed speculation partial write → fallback success/failure | `json_speculate`, `json_fallback`, `write_field_indexed`, and the AoS destination | `json_decoded_owner_speculation_transition_matrix` |
+| Top-level AoS completed/current rows on malformed element, delimiter, EOF, or trailing input | `align_rt_json_decode_struct_array` staging ledger and recursive cleanup | `json_decoded_owner_aos_slow_failure_matrix` |
+| Nested record, Move union, field-array, and scalar-array compatibility | `parse_object`, `drop_decoded_union`, and existing descriptor-kind cleanup | `json_nested_move_struct_array_failure_no_double_free`, `json_array_of_move_struct_sibling_failure_deep_frees_every_element`, `json_union_array_arm_trailing_garbage_frees_buffer`, and `json_scalar_array_field_sibling_failure_frees_buffer` |
+| Success move, replacement, return, branch/loop exit, and generated `Drop` | existing MIR/codegen ownership paths; no new runtime ABI | `m5::json_option_move_struct_payload_remains_admitted`, `m5::json_option_move_struct_later_failure_cleans`, and existing Move/Drop control-flow owners |
+| Whole/per-unit/interface/cache and concurrent calls | existing structural fingerprints, unchanged descriptors, and per-call runtime state | existing JSON cache/interface owners plus `json_decoded_owner_same_process_pair_matrix` |
+
+The implementation must map every applicable row to the final diff and a regression witness. The
+runtime tests that read process-global allocation counters acquire `ALLOC_COUNT_LOCK` before fixture
+construction and hold it through cleanup and final assertions. No new process-global state, CLI input,
+persisted field, benchmark claim, or scanner ownership is introduced by this repair.
+
 Settled out (deleted from the catalog, not pending): `json.validate<T>` (decode-and-discard is
 validation), `json.token` (doc + scan cover it; no consumer), `json.field_table<T>`
 (compiler-internal). `json.decode<T>(...)` call syntax stays permanently out (no turbofish).
