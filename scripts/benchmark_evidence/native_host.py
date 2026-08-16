@@ -20,6 +20,7 @@ import signal
 import stat
 import subprocess
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
 from . import canonical_json as cj
@@ -78,6 +79,21 @@ Runner = Callable[[tuple[str, ...]], bytes]
 Hasher = Callable[[str], str]
 Uname = Callable[[], Any]
 PhaseHook = Callable[[], None]
+
+
+@dataclass(frozen=True)
+class CommandCapture:
+    """Bounded stdout and stderr from one completed trusted command."""
+
+    stdout: bytes
+    stderr: bytes
+
+    def __post_init__(self) -> None:
+        for label, value in (("stdout", self.stdout), ("stderr", self.stderr)):
+            if type(value) is not bytes:
+                raise NativeHostError(f"trusted command {label} capture is not bytes")
+            if len(value) > _MAX_COMMAND_OUTPUT:
+                raise NativeHostError(f"trusted command {label} capture exceeds the fixed limit")
 
 
 def _error(message: str) -> None:
@@ -182,15 +198,17 @@ def _waitid_without_reap(process: subprocess.Popen[bytes], timeout: float) -> in
         time.sleep(min(0.01, remaining))
 
 
-def _run_command(
+def _run_command_captured(
     argv: Sequence[str],
     *,
     timeout_seconds: float = _COMMAND_TIMEOUT_SECONDS,
     output_limit: int = _MAX_COMMAND_OUTPUT,
+    stdout_limit: int | None = None,
+    stderr_limit: int | None = None,
     executable_fd: int | None = None,
     extra_fds: Sequence[int] = (),
     stdin_fd: int | None = None,
-) -> bytes:
+) -> CommandCapture:
     """Run one fixed command with an empty environment and bounded output."""
 
     command = _validate_argv(argv)
@@ -202,6 +220,12 @@ def _run_command(
         _error("trusted command timeout must be positive")
     if type(output_limit) is not int or output_limit <= 0:
         _error("trusted command output limit must be positive")
+    stdout_limit = output_limit if stdout_limit is None else stdout_limit
+    stderr_limit = output_limit if stderr_limit is None else stderr_limit
+    if type(stdout_limit) is not int or stdout_limit <= 0:
+        _error("trusted command stdout limit must be positive")
+    if type(stderr_limit) is not int or stderr_limit <= 0:
+        _error("trusted command stderr limit must be positive")
     if executable_fd is not None and (type(executable_fd) is not int or executable_fd < 0):
         _error("trusted executable descriptor is invalid")
     if not isinstance(extra_fds, (tuple, list)):
@@ -248,11 +272,13 @@ def _run_command(
     streams = (process.stdout, process.stderr)
     buffers: dict[int, bytearray] = {}
     stdout_fd: int | None = None
+    stderr_fd: int | None = None
     cleanup_done = False
     try:
         assert process.stdout is not None
         assert process.stderr is not None
         stdout_fd = process.stdout.fileno()
+        stderr_fd = process.stderr.fileno()
         selector = selectors.DefaultSelector()
         buffers = {stream.fileno(): bytearray() for stream in streams if stream is not None}
         for stream in streams:
@@ -280,15 +306,16 @@ def _run_command(
                     key.fileobj.close()
                     continue
                 buffer = buffers[fd]
-                if len(buffer) + len(chunk) > output_limit:
+                stream_limit = stdout_limit if fd == stdout_fd else stderr_limit
+                if len(buffer) + len(chunk) > stream_limit:
                     _error("trusted command output exceeded the fixed limit")
                 buffer.extend(chunk)
 
         return_code = _wait_without_reap(process, max(0.0, deadline - time.monotonic()))
         if return_code != 0:
             _error("trusted command exited nonzero")
-        assert stdout_fd is not None
-        return bytes(buffers[stdout_fd])
+        assert stdout_fd is not None and stderr_fd is not None
+        return CommandCapture(bytes(buffers[stdout_fd]), bytes(buffers[stderr_fd]))
     except BaseException:
         cleanup_done = True
         _stop_process(process)
@@ -306,6 +333,46 @@ def _run_command(
                 stream.close()
             except OSError:
                 pass
+
+
+def _run_command(
+    argv: Sequence[str],
+    *,
+    timeout_seconds: float = _COMMAND_TIMEOUT_SECONDS,
+    output_limit: int = _MAX_COMMAND_OUTPUT,
+    executable_fd: int | None = None,
+    extra_fds: Sequence[int] = (),
+    stdin_fd: int | None = None,
+) -> bytes:
+    """Run one fixed command and return stdout for legacy native-host callers."""
+
+    return _run_command_captured(
+        argv,
+        timeout_seconds=timeout_seconds,
+        output_limit=output_limit,
+        executable_fd=executable_fd,
+        extra_fds=extra_fds,
+        stdin_fd=stdin_fd,
+    ).stdout
+
+
+def run_command_captured(
+    argv: Sequence[str],
+    *,
+    timeout_seconds: float = _COMMAND_TIMEOUT_SECONDS,
+    output_limit: int = _MAX_COMMAND_OUTPUT,
+    stdout_limit: int | None = None,
+    stderr_limit: int | None = None,
+) -> CommandCapture:
+    """Run one fixed path command and retain both bounded output streams."""
+
+    return _run_command_captured(
+        argv,
+        timeout_seconds=timeout_seconds,
+        output_limit=output_limit,
+        stdout_limit=stdout_limit,
+        stderr_limit=stderr_limit,
+    )
 
 
 def run_command(
@@ -581,6 +648,72 @@ def run_pinned_commands(
             raise NativeHostError(f"native executable close failed: {executable}") from exc
 
 
+def run_pinned_commands_captured(
+    executable: str,
+    commands: Sequence[Sequence[str]],
+    expected_executable_hash: str | None = None,
+    *,
+    between: PhaseHook | None = None,
+    extra_fds: Sequence[int] = (),
+    stdin_fd: int | None = None,
+    timeout_seconds: float = _COMMAND_TIMEOUT_SECONDS,
+    output_limit: int = _MAX_COMMAND_OUTPUT,
+    stdout_limit: int | None = None,
+    stderr_limit: int | None = None,
+) -> tuple[tuple[CommandCapture, ...], str]:
+    """Run fixed commands through one retained executable and retain both streams."""
+
+    _validate_argv((executable,))
+    if expected_executable_hash is not None:
+        expected_executable_hash = _client_hash(
+            expected_executable_hash,
+            "profile executable digest",
+        )
+    if not isinstance(commands, (tuple, list)) or not commands:
+        _error("pinned command sequence must be non-empty")
+    command_sequence = tuple(_validate_argv(command) for command in commands)
+    if any(command[0] != executable for command in command_sequence):
+        _error("pinned command sequence must use the selected executable")
+    if not isinstance(extra_fds, (tuple, list)):
+        _error("pinned inherited descriptors must be a sequence")
+    inherited_fds = tuple(extra_fds)
+    if any(type(fd) is not int or fd < 0 for fd in inherited_fds):
+        _error("pinned inherited descriptor is invalid")
+    if len(set(inherited_fds)) != len(inherited_fds):
+        _error("pinned inherited descriptors must be unique")
+    if stdin_fd is not None and (type(stdin_fd) is not int or stdin_fd < 0):
+        _error("pinned stdin descriptor is invalid")
+    if stdin_fd is not None and stdin_fd in inherited_fds:
+        _error("pinned stdin descriptor is duplicated")
+    fd = _open_executable(executable)
+    try:
+        executable_hash = _hash_fd(fd, executable)
+        if expected_executable_hash is not None and executable_hash != expected_executable_hash:
+            _error("pinned executable digest does not match profile before execution")
+        outputs: list[CommandCapture] = []
+        for index, command in enumerate(command_sequence):
+            outputs.append(
+                _run_command_captured(
+                    command,
+                    executable_fd=fd,
+                    extra_fds=inherited_fds,
+                    stdin_fd=stdin_fd,
+                    timeout_seconds=timeout_seconds,
+                    output_limit=output_limit,
+                    stdout_limit=stdout_limit,
+                    stderr_limit=stderr_limit,
+                )
+            )
+            if between is not None and index + 1 < len(command_sequence):
+                between()
+        return tuple(outputs), executable_hash
+    finally:
+        try:
+            os.close(fd)
+        except OSError as exc:
+            raise NativeHostError(f"native executable close failed: {executable}") from exc
+
+
 def run_docker_commands(
     commands: Sequence[Sequence[str]],
     expected_client_hash: str | None = None,
@@ -595,6 +728,31 @@ def run_docker_commands(
         commands,
         expected_client_hash,
         between=between,
+    )
+
+
+def run_docker_commands_captured(
+    commands: Sequence[Sequence[str]],
+    expected_client_hash: str | None = None,
+    *,
+    between: PhaseHook | None = None,
+    timeout_seconds: float = _COMMAND_TIMEOUT_SECONDS,
+    output_limit: int = _MAX_COMMAND_OUTPUT,
+    stdout_limit: int | None = None,
+    stderr_limit: int | None = None,
+) -> tuple[tuple[CommandCapture, ...], str]:
+    """Run fixed Docker commands through one retained client with both streams."""
+
+    _validate_docker_config_dir()
+    return run_pinned_commands_captured(
+        DOCKER,
+        commands,
+        expected_client_hash,
+        between=between,
+        timeout_seconds=timeout_seconds,
+        output_limit=output_limit,
+        stdout_limit=stdout_limit,
+        stderr_limit=stderr_limit,
     )
 
 

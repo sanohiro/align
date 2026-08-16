@@ -907,6 +907,43 @@ or advance Request 7's language lifecycle.
 | Failure and cleanup | Every sign/verify path closes the key/executable descriptors, reaps the complete process group, removes message/signature/allowed-signers files, and removes the private directory. Inject runner error, `BaseException`, child timeout/nonzero, output overflow, path replacement, read/close/unlink/rmdir failure, and second invocation; no signature or `True` crosses an uncertain cleanup boundary. `scripts/test-benchmark-evidence-key-process.sh`; `benchmark_evidence_process_boundary_matrix`. |
 | Scope and mirrors | No private key bytes enter Python objects, command argv, environment, container mounts, report bytes, or returned errors. English/Japanese contract, profile order, verifier handoff, native adapter, and owner use the same constants; host provisioning and live qualification remain explicit. `git diff --check`; `scripts/test-benchmark-evidence-key-process.sh`. |
 
+## Native performance measurement implementation closure
+
+This capability consumes the merged profile, image/container argv boundary, prepared native
+artifacts, fixed schedule, and process cleanup primitives. It supplies the first executable
+performance-measurement rail: one pinned Docker client launches one fixed prepared benchmark child,
+captures bounded stdout/stderr, parses the exact evidence output, and returns the retained inner
+median tokens as integer microseconds. It does not select `BASE`, publish a report, sign evidence,
+verify a merge, or accept a Request 7 language result.
+
+The implementation candidate is intentionally one larger capability boundary (about 1,100
+hand-written lines including its adversarial owner) because capture, profile limits, container
+construction, prepare/native digest binding, and output parsing have one producer-to-consumer
+proof. Splitting those pieces would leave each dormant without a stable consumer and duplicate
+the exact-output, cleanup, and profile-limit fixtures across multiple PRs.
+
+### Public-contract ledger
+
+| Public surface | Exact contract, owner, and acceptance |
+|---|---|
+| `native_host.CommandCapture` | Immutable bounded `stdout` and `stderr` bytes from one completed fixed command. Both streams use the existing 64 KiB ceiling, empty environment, no shell, new process group, complete group cleanup, and retained executable binding. `native_host.run_command_captured` and `run_docker_commands_captured` expose it; the existing output-only APIs remain wrappers for compatibility inside this pre-release repository. `benchmark_evidence_process_boundary_matrix`; `scripts/test-benchmark-evidence-native-measurement.sh`. |
+| `native_measurement.ChildWorkspace` | Trusted host paths for one `(benchmark, revision)` pair: read-only source, writable target, writable work, read-only Cargo home, read-only toolchain, and an optional artifact-manifest SHA-256. The digest is absent only for that pair's prepare child and is replaced by the exact prepare output before any native child. Paths are absolute, non-aliased, pair-local inputs to the existing container validator; no caller command or environment is accepted. `scripts/test-benchmark-evidence-native-measurement.sh`. |
+| `native_measurement.NativeMeasurementConfig` | Immutable trusted profile, pinned Docker-client SHA-256, and exactly one `ChildWorkspace` for each fixed benchmark/revision product. The map is complete before any child starts; native children use only their prepare-time manifest digest. Each child passes the profile's phase timeout and separate stdout/stderr capture ceilings to the pinned host runner; a profile ceiling above the native 64 KiB bound rejects. `scripts/test-benchmark-evidence-native-measurement.sh`. |
+| `native_measurement.execute_child` | Accepts one `schedule.ChildPlan` and controller-assigned 64-hex child ID. It builds only `/src/bench/{json_decode,json_soa}/run.sh` with the fixed `prepare native` or `native` suffix, calls the pinned Docker client once, and returns bounded stream hashes/tail, elapsed monotonic nanoseconds, the unchanged artifact digest, and parsed output. The surrounding `schedule.ScheduleState` rejects overlap, wrong order, and duplicate IDs before this port; this port performs no retry, native-time build, caller-selected image, option, mount, or environment. `benchmark_evidence_schedule_matrix`; `scripts/test-benchmark-evidence-native-measurement.sh`. |
+| Output parsers | Prepare output is exactly the fixed `/work/prepared/artifact-manifest.json` line plus one `artifact-manifest-sha256` line. Native output is exactly `target: native`, the benchmark title/header, and ordered `10000`, `100000`, `1000000` rows; only `A-full`/`A-proj` or `soa ms`/`aos ms`/`proj ms` million-row tokens become positive checked `u64` microseconds. Tabs, profiling lines, extra rows, malformed ratios/tokens, non-ASCII whitespace, warnings, and trailing bytes reject. `scripts/test-benchmark-evidence-native-measurement.sh`. |
+| Ownership and non-claims | The adapter owns only the Docker process and bounded captures returned by the pinned host runner. The trusted controller owns workspace creation, monitor ranges, schedule transitions, manifest comparison, report production, staging, and cleanup after `ChildExecution` returns. This slice does not claim accepted x86_64 evidence or wall-clock performance. `HANDOFF.md`; `../align-llm/docs/align-requests.md`. |
+
+### Implementation closure matrix
+
+| Axis | Implementation closure and exact regression |
+|---|---|
+| Formation and schedule | Require the exact full `schedule.ChildPlan`, complete four-entry workspace product, distinct child ID, fixed benchmark/revision/phase, and one prepared digest before native execution. A plan mutation, missing pair, duplicate ID, wrong guest path, or native child without a prepare digest rejects before Docker. `scripts/test-benchmark-evidence-native-measurement.sh`; `scripts/test-benchmark-evidence-schedule.sh`. |
+| Container construction | Reuse `container.build_argv` with the profile image, CPU/NUMA/cgroup selectors, read-only source/toolchain/Cargo mounts, writable pair-local target/work mounts, fixed environment, and the native `ALIGN_BENCH_ARTIFACT_MANIFEST_SHA256` value. No tag, network, host mount, profile switch, Cargo override, shell, or caller command crosses the boundary. `scripts/test-benchmark-evidence-native-measurement.sh`; `scripts/test-benchmark-evidence-container.sh`. |
+| Pinned process and capture | Hash the retained Docker executable before one invocation, execute exactly one command, bound stdout/stderr independently, record both digests and the stderr diagnostic tail, measure with a monotonic clock, and reap the complete group. Nonzero, timeout, overflow, hash drift, runner exception, and close/reap uncertainty return no child result. `scripts/test-benchmark-evidence-native-measurement.sh`; `benchmark_evidence_process_boundary_matrix`. |
+| Prepare/native join | Parse the prepare manifest digest from its exact two-line output and bind every later native child to that trusted value; never rederive it from the prepared path. Native output is parsed only after successful zero-exit completion and never triggers a build. `scripts/test-benchmark-evidence-native-measurement.sh`. |
+| Parser/arithmetic | Enforce exact title/header/row order and ASCII grammar, parse tokens without floating point, convert one three-decimal millisecond token to checked integer microseconds, and retain only the fixed five-field inventory across both benchmarks. Extra output, profile mode, ratio mutation, zero, overflow, field/row/order mutation, warning, and trailing-byte owners reject. `scripts/test-benchmark-evidence-native-measurement.sh`. |
+| Failure and scope | A failed child produces no parsed measurement and no retry; the controller remains responsible for resource ledger removal and later cleanup. Workspace path replacement, artifact-manifest drift, monitor event, report assembly, signing, publication, merge verification, and baseline selection remain explicit downstream gates. English/Japanese contract and owner use the same constants. `git diff --check`; `scripts/test-benchmark-evidence-native-measurement.sh`. |
+
 ## Design-review finding closure
 
 | Finding | Ledger-first closure |
