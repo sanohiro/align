@@ -33,16 +33,16 @@ controller は provider API/credential を使わない。通常の GitHub public
 
 | Field | Exact contract |
 |---|---|
-| Public producer | `/opt/align-evidence/v1/bin/align-json-escape-evidence run --repository REPO --baseline BASE --candidate CANDIDATE --review-log REVIEW_LOG --output-dir NEW_DIR`。root-owned launcher/module は merged evidence implementation から install され benchmark account から immutable、hash は host profile に埋め込む。verified `BASE` object から controller/profile/key blob を直接読み、installed copy と byte/mode equality を確認してから他の処理を行う。path は absolute、OID は lowercase 40-hex、`NEW_DIR` は不存在。override/追加引数なし。 |
+| Public producer | `/opt/align-evidence/v1/bin/align-json-escape-evidence run --repository REPO --baseline BASE --candidate CANDIDATE --review-log REVIEW_LOG --output-dir NEW_DIR`。root-owned launcher/module は merged evidence implementation から install され benchmark account から immutable、hash は host profile に埋め込む。verified `BASE` object から controller/profile/key blob を直接読み、installed copy と byte/mode equality を確認してから他の処理を行う。path は absolute、OID は lowercase 40-hex、`NEW_DIR` は不存在。override/追加引数なし。run path は signed report pair だけをproduce/publishし、PR bodyやpost-PR review attestation inputを持たない。 |
 | Public verifier | `/opt/align-evidence/v1/bin/align-json-escape-evidence verify --report REPORT --signature SIGNATURE --expected-baseline BASE --expected-candidate CANDIDATE --pr-body PR_BODY --review-attestation REVIEW_ATTESTATION`。bytes/signature/report/review/preflightをexplicit OID、PR body、trusted review attestationへ照合。localはdiagnostic、acceptanceはtrusted-base CIがGitHub event/APIからcheckout外で入力を作る。build/checkout/network/mutationなし。 |
 | Public merge verifier | `/opt/align-evidence/v1/bin/align-json-escape-evidence verify-merge --repository REPO --report REPORT --signature SIGNATURE --merge MERGE --output-dir NEW_DIR`。provider response exact object fetch後、reportを再verify、raw-object pathで`MERGE`を読み、local target first-parent chain、parents/treeを照合しexact `merge-verification.json`/`merge-verification.json.sig`を出力。`NEW_DIR`不存在、overrideなし。 |
 | Trusted review adapter | trusted-base CIだけがevent repo/PRのGitHub review APIをjob tokenでquery。PR author、write roleなし、dismissed/stale/duplicate/wrong commit、exact report `log_sha256`なしをreject。canonical `REVIEW_ATTESTATION`をcheckout外で作りverifierへ渡す。token/raw responseはcontroller/candidate/report/container/PR argumentへ渡さない。 |
 | Ambient state | semantic default なし。empty environment に fixed `PATH`, `LC_ALL=C`, `TZ=UTC`, empty `HOME`, `CARGO_NET_OFFLINE=true` と controller-created descriptor/config だけを置く。ambient Git/Cargo/Rust/Docker/locale/proxy/credential/target/tuning は渡さない。 |
-| Result | successはlock中にprivate report/signature/directoryをfsync、profile-global publication reservationをcreate/fsync、unlock、`NEW_DIR`へatomic rename、parent fsync、reservation remove/fsync、path出力。reservation中のsecond invocationはrepository/image/container前reject。threshold failureも同sequence。failureはstaging/output/reservationを削除しpathなし。crash/cleanup failureはreservationをfail-closedで残しadmin recovery。 |
+| Result | successはexclusive lockを取得し、repository/image/container/child work前にprofile-global publication reservationをcreate/fsyncする。その後lock中にprivate `report.json`/signature/directoryをfsyncし、unlock、`NEW_DIR`へatomic rename、parent fsync、reservation remove/fsync、path出力を行う。reservationはpre-publication crashでも残りadmin recoveryに渡る。reservation中のsecond invocationはrepository/image/container前reject。threshold failureも同sequence。failureはstaging/output/reservationを可能な限り削除しpathなし、uncertain cleanupはreservationをfail-closedで残す。 |
 | Controller owner | checked-in Python 3 controller、root-owned installed launcher、`scripts/` と `tests/benchmark_evidence/` の fixture tests。installed/source relation、installer manifest、interpreter、Git、Docker client/daemon、`ssh-keygen`、kernel、OCI image、host profile、executable SHA-256 をすべて記録する。candidate file は evidence root にならない。 |
 | Persisted format | canonical UTF-8 JSON `align.json_escape_benchmark_evidence/v1` と `align.json_escape_benchmark_merge_verification/v1`。それぞれhost Ed25519 keyとfixed namespaceでbyte-for-byte署名。unknown/missing/duplicate/reordered/non-ASCII key、non-integer/float、invalid UTF-8/escape、trailing/noncanonical bytesはreject。 |
 | Ownership/allocation | controller が temp dir、pipe、child、container、capture、report staging、cleanup を所有。benchmark child は stdin `/dev/null`、private stdout/stderr のみ。capture ceiling は profile 固定。report/signature/repository administration/controller/Docker socket/signing key/other revision writable dir は child に渡さない。 |
-| Concurrency | repository inspection前からsigning/cleanupまでhost-global lock。unlock前にprofile-global publication reservationをinstallし、publication完了までlater invocationはrepository/image/container work前にreject。baseline/candidate overlapなし。 |
+| Concurrency | repository inspectionまたはmutable child work前にhost-global lockとprofile-global publication reservationを取得し、signing/cleanupまでlockを保持する。reservationがdurableになる前にunlockしない。publication完了までlater invocationはrepository/image/container work前にreject。baseline/candidate overlapなし。 |
 | Prerequisites | benchmark-input slice、Request 7 の両 language prerequisite、本 design、evidence implementation、pinned image、host profile/public key、adversarial owner が merge 後にのみ `BASE` を選ぶ。`BASE` は当時の target tip かつ最初の Request 7 commit の exact parent。 |
 | Acceptance | valid signature、`pass`、exact PR/preflight/trusted-review binding、unchanged target base at merge、final fetched targetからmergeがreachableであるsigned merge artifact、identical protected input、5 field各10 sample、全ratio `<=1.05`。 |
 
@@ -364,18 +364,21 @@ HostObservationはdense。全`Preparation`/`Run`はglobally unique `child_id`と
 first/lastは同IDのchild-start/end、interior child-sampleも同ID。rangeはglobal sequence順にstrictly
 increasing/disjointで、nonempty-child observation全体のexact partition。reuse/orphanなし。non-child phaseはempty ID。
 benchmark順はdecode/soa、各preparation B/C、warmup B/C、pair 1..10 balanced order。artifact manifestは
-同benchmark/revisionの全runで再verify。sample fieldは2/3順、field resultは5順。original sampleはpair順、
+controller-owned schedule mapの同benchmark/revision値と一致し、同benchmark/revisionの全runで再verify。sample fieldは2/3順、field resultは5順。original sampleはpair順、
 sortedはnondecreasing exact permutation。ratio numerator/denominatorはcandidate/baseline middle sum。
 
 cleanup countはzero、bool true。host lock保持中にsign/private staging fsync後、profile-fixed root-owned
-publication reservationをno-follow exclusive create・fsync。unlock後atomic rename・output parent fsync・reservation
-remove・reservation directory fsync後だけpathをprint。reservation存在中のlater invocationはrepository前reject。
-failureはstateを削除し、surviving reservationはoutputをunacceptedとしadmin recoveryまでfuture runをblock。
+publication reservationはchild work前にno-follow exclusive create・fsyncし、run/output identityを記録する。signing後に
+unlock、atomic rename・output parent fsync・reservation remove・reservation directory fsync後だけpathをprintする。
+reservation存在中のlater invocationはrepository前reject。failureはstateを削除し、surviving reservationはoutputを
+unacceptedとしadmin recoveryまでfuture runをblock。
 reservation removalはalready-signed measurement cleanup外のpublication postconditionで、成功までaccepted pathなし。
 `first_failed_field`はpassでempty、regressionで最初の
-false field。conditional/omitted memberなし。
+false field。candidateの`commit_sha256`はfinal candidate inventory entryのraw SHA-256と一致する。
+controllerはvalidな`regression` reportをdistinctなnon-accepted result、exit status 1としてのみpublishし、
+`require_pass` invocationではpublication前にrejectする。conditional/omitted memberなし。
 
-`clean` reviewは`review_head=candidate`、`repair_commits=[]`。`fixed`はreviewed ancestorを
+`clean` reviewは`review_head=candidate`、`repair_commits=[]`。`fixed`はBASEよりstrictly後のreviewed ancestorを
 `review_head`とし、その後candidateまでのnonempty exact first-parent順を`repair_commits`に記録する。
 各commitはcandidate `commits`に同順で含まれる。どちらも`review_base=baseline`。
 literalはrepository preflight stamp/PR markerとexact一致。log `CLEAN`は`clean`のみ、`FINDINGS`+
@@ -400,8 +403,9 @@ canonical message bytesの64-byte SHA-512を持つSSH string。report/merge name
 armor/binary field/lengthをdecode・canonical re-encode equality後のみpinned `ssh-keygen -Y sign/verify`。
 signature SHA-256はfinal LF込みcomplete armorをhash。
 
-producerはBody encode→domain hash→Report encode→duplicate-reject parse/re-encode equality後にsign。verifierは
-schema/canonical/body digest/relationship/sample/median/comparison/expected OID/PR/identity/key/signatureを再計算。
+producerはBody encode→domain hash→Report encode→duplicate-reject parse/re-encode equality後にsign。run-side verifierは
+PR inputなしでreport-only bindingとsignatureをcheckする。post-PR verifierはtrusted PR bodyとreview attestationを受けてから
+schema/canonical/body digest/relationship/sample/median/comparison/expected OID/PR/identity/key/signatureを再計算する。
 complete minimal-pass/first-regression semantic fixture、exact one-line bytes、test signature、SHA-256をcheck inし、
 independent reference encoderを使う。全member/enum/width/cardinality/order/presence/duplicate/string/LF/domain/digest/
 signature/derived field mutationを所有する。
@@ -424,7 +428,7 @@ namespace `align-json-escape-benchmark-merge-verification-v1`で署名。report/
 `merge_oid=MERGE`、`target_oid`はfetched target tipでmergeをfirst-parent chainに含み、parentsはbaseline/
 candidate、treeはreportのexpected tree。全relationship後に
 raw merge-object SHA-256を記録。golden/mutation/wrong parent/tree/ref/stale/swap ownerを持つ。
-同host lockをinspection前に取得し、private stage→file/dir fsync→durable publication reservation→unlock→
+同host lockとdurable publication reservationをchild work前に取得し、private stage→file/dir fsync→unlock→
 atomic rename→parent fsync→reservation remove/directory fsync→path publicationの同sequenceを使う。
 surviving reservationがあればoutputはunacceptedでlater workをblock。
 
@@ -485,9 +489,9 @@ deterministic ownerを含むhand-written implementationは1,000行を少し超�
 | Forged/stale | unsigned/edit/replay/truncate/concat/wrong namespace、PR/preflight/trusted-review mismatch。`CLEAN`は`clean`のみ、accepted `FINDINGS` + nonempty repair chainは`fixed`のみにmap。`benchmark_evidence_stale_forged_matrix`. |
 | Base/integration race | target move、precheck race、unavailable/wrong response OID、local-target mismatch、wrong parent/tree、signed artifact mutation、normal later first-parent descendant、final trusted refetch前のforce-push/removal、revert failure、exact merge。final target first-parent chainにmergeが残らなければlifecycleを進めない。`benchmark_evidence_merge_race_matrix`. |
 
-次のcapabilityはbase/integration race ownerに限定する。既にmerge済みのidentity、revision、report、
-signature、cleanup、exclusive-run boundaryをconsumeし、controller、verifier、provider credential、
-Docker execution、lifecycle adapterは追加しない。implementation closure matrixは次の通り。
+base/integration race capabilityはPR #840でmerge済みである。既にmerge済みのidentity、revision、report、
+signature、cleanup、exclusive-run boundaryをconsumeし、provider credentialやlive service adapterを導入せずに
+disposable provider/lifecycle relationshipを検証する。完了したclosure matrixは次の通り。
 
 | Axis | Closure / owner |
 |---|---|
@@ -499,8 +503,37 @@ Docker execution、lifecycle adapterは追加しない。implementation closure 
 | Final refetch | staging後、`MERGE`を含むnormal later first-parent descendantはacceptする。force-push、target removal、final fetch unavailableはrejectしlifecycleを進めない。`benchmark_evidence_merge_race_matrix`. |
 | Revert/lifecycle | exact mergeは全relationshipとfinal refetchのsuccess後だけ`accepted`になる。failureは`rejected`、`reverted`、`blocked`のいずれかとなり、lifecycleを進めずaccepted artifactを出さない。`benchmark_evidence_merge_race_matrix`. |
 
-testsはfixture executor/fake daemon/disposable repo+remote/test keyを使いperformance workload/wall-clock ratioを
-ordinary testにしない。native host qualification/final measurementはmanual named evidence。
+次のcapabilityはtrusted controller/verifier orchestration coreに限定する。merge済みのbootstrap、CLI、profile、
+host/image/container、source、process、monitor、schedule、cleanup、exclusive-run、report、signature、merge-race
+boundaryをconsumeし、fixture-ownedなdeterministic consumerとしてphase orderingとtrusted-artifact handoffを提供する。
+real host inspection、Docker起動、GitHub query、provider credential、performance workload、cryptographic key management、
+post-merge lifecycle advanceはこのPRに含めない。implementation closure matrixは次の通り。
+
+testsはfixture gate/executor/artifact store/test keyを使い、host inspection、provider接続、Docker、performance workload、
+wall-clock ratioを実行しない。native host qualification、cryptographic key-process integration、provider/review API
+integration、final Request 7 measurementは後続のnamed evidenceとする。
+
+| Axis | Closure / owner |
+|---|---|
+| Trusted bootstrap and invocation | run controllerはparsed済みの`cli.RunInvocation`だけをconsumeし、verifier portはparsed済みの`cli.VerifyInvocation`に対応するexplicit bytesをconsumeする。profile ID、producer/verifier/monitor tool record、host、image、complete execution identityを含む一つのimmutable profile identity bundleへbindし、installed manifest、profile digest、target ref、OID、path、ambient selectorの不一致をgate/child前にrejectする。path resolutionは後続のtrusted adapterが所有する。`benchmark_evidence_controller_verifier_matrix`. |
+| Preflight gate ordering | exclusive lockとdurable profile-global reservationを取得してからimmutable bootstrapを行い、trusted host/image/source/review gateを宣言順に実行し、完了phaseを記録する。gate failureは次のgate前に停止し、child、report、signature、staging outputを作らない。known pre-child cleanupはunused reservationをremoveし、uncertain cleanupはfail-closedで残す。`benchmark_evidence_controller_verifier_matrix`. |
+| Schedule/executor handoff | 既存の`ScheduleState`をfixture executorでdriveする。fixed preparation、warm-up、alternating sampleは各一回、unique child ID、sealed artifact digestを持ち、次child前にowned-resource ledgerからremoveする。overlap、reorder、retry、measurement中のbuild、artifact drift、timeout、signal、nonzero、incomplete scheduleはrejectする。`benchmark_evidence_controller_verifier_matrix`. |
+| Cleanup/publication ordering | 既存の`CleanupTransaction`をdriveし、report staging前にchildren/containers/mounts/fds/private directoriesがゼロでsource/cache manifestがunchangedであることを要求する。trusted staging portはhost lock保持中にexact report/signature pairを書いてfsyncし、idempotent discard portはpartial stage cleanupを所有する。durable reservationをlock releaseより前、publicationをreservation removalより前に置く。publish、unlock、cleanupのfailureはaccepted resultを出さず、ownershipが不明ならfail-closed reservationを残す。`benchmark_evidence_controller_verifier_matrix`. |
+| Report/signature handoff | scheduleとcleanup完了後にtrusted fixture-owned producerから得たreport bytes/signature bytesだけを受け入れる。run-side verifierはPR inputなしでbytesをcheckし、実際にcheckしたimmutable produced recordをresultへ返す。lock-held staging portと後続publisherはexact recordをresult経由で受け取る。post-PR verifierはexplicit report/signature、PR body、review attestationを別境界でconsumeする。controllerはcandidate-provided reportを受け付けず、candidate moduleをopenせず、別bytesをpublishできない。`benchmark_evidence_controller_verifier_matrix`. |
+| Report semantic reconstruction | fixed child schedule、monitor range、各sample/token、baseline/candidate array、sorted permutation、middle sum、exact threshold比較、verdict、run ID、baselineのraw parentsとempty candidate inventory（`commits`と`changed_paths`）、candidate first-parent chain、candidate final raw SHA-256、protected-input relationshipを再構成する。全preparation manifestをcontroller-owned schedule mapへbindし、candidate changed pathとprotected inputのoverlapをrejectし、stored derived valueをtrustしない。regressionはdistinctなnon-accepted result、exit status 1としてpublishする。`benchmark_evidence_controller_verifier_matrix`. |
+| Verifier binding | canonical reportをdecodeし、既存report schemaとbody digestを全検証する。complete profile identity bundleとprofile/baseline/candidate/target/review fieldをexplicit trusted expectationへbindし、`target.run_oid == BASE`、fixed review headが`BASE`よりstrictly後であるclean/fixed review-chain semantics、各candidate commit parent、candidate commit inventoryへの`BASE`混入reject、threshold cross-product両方のoverflow rejection、baselineのraw parent listを保持しつつcandidate inventoryだけをemptyにすること、changed/protected path overlap rejection、recognized PR-body preflight markerのexact one valueを検証し、fixed report namespace/keyに対するinjected cryptographic signature checkを要求する。wrong bytes、namespace、key、signature、attestation、repair chain、marker、identity、verdict、expected OID、BASE-rooted review、baseline pseudo-entry、overflow、overlap、malformed baseline inventoryはrepository/build/benchmark/network/output mutationなしにrejectする。`benchmark_evidence_controller_verifier_matrix`. |
+| Failure and restart | exceptionは必ずterminal rejectedまたはfail-closed resultになる。durable reservationはgate/child前にinstallし、unlock後とpublication settleまで保持してsecond invocationをblockする。known abortはhost lock保持中だけreservationをremoveし、unlink/directory fsync failureならrestoreする。final reservation removal前にhost lockをreacquireし、unlink/directory fsync failureならreservationをrestoreする。`LOCK_UN`をfinal guard transitionとし、descriptor closeはその後のbest-effort cleanupだけにする。reservation creationまたはrestoreがfailureしてdurabilityがuncertainなら、leaseは両方のguardをreleaseせずhost lockを保持する。abort自体がfailureした場合はcleanup evidenceをconservativeなfail-closed状態へ置き、reservationの可能性を報告する。accepted stateはcomplete report/signature pairをdurably publishしreservationをremoveした後だけ到達できる。crash/restartとcleanup failureでもpartial stateをaccepted evidenceへ変えない。`benchmark_evidence_controller_verifier_matrix`; `benchmark_evidence_exclusive_run`. |
+| Explicit deferrals | real host inspection、Docker daemon/image execution、GitHub review API/token isolation、`ssh-keygen`/Ed25519 signing、raw Git revision construction、providerとのmerge verification、post-merge lifecycle advanceは後続capabilityとし、このcoreで偽装しない。`benchmark_evidence_controller_verifier_matrix`. |
+
+controller/verifier ownerはaccepted Request 7 evidenceではなくorchestration boundaryである。producerがpost-PR inputなしで
+report/signature bytesをpublishできること、separate verifierがそれを順序外でconsumeできないこと、verifier failureが
+publication boundaryを越えないことを証明する。host qualificationまたはmeasurementの前に、後続capabilityが各fixture
+gateを対応するprivileged adapterへ置き換える。
+
+このcapabilityはcontroller、verifier、shared adversarial ownerを合わせるとroughly 1,000 hand-written linesを超える。
+strict dormant producer-to-consumer chainを一つに保つことで、report-only producer fixtureとexplicit post-PR artifact
+fixtureがverifier bindingとpublication barrierを証明できる。さらに分割するとfixtureを重複させ、controllerのbyte
+handoffを未reviewのまま残す。
 
 ## Design-review finding closure
 
@@ -543,6 +576,22 @@ ordinary testにしない。native host qualification/final measurementはmanual
 | retained prepared pathをverification後にreplace可能 | prepareはsuccess前にcaptured private-child device/inodeを再検証。nativeはcaptured identityをlauncherへ渡し、opened root descriptorとの一致を要求し、manifest traversalをそのdescriptor配下で実行。 |
 | hash後のsame-inode writeでbytesを変更可能 | accepted Linux pathはexecutable/runtimeをhashしながらanonymous memfdへcopyし、source metadataをcopy前後で確認、4つのwrite/size/seal sealを適用後sealed copyだけをexec/preload。deterministic ownerはshell/launcher handoffでrootをreplaceし、source変更後もsealed copyが不変かつwrite不能と確認。 |
 
+## Revised-candidate review closure
+
+| Finding | Closure |
+|---|---|
+| verifierがstored derived measurementをtrust | fixed schedule、monitor range、sample/token array、sorted permutation、middle sum、exact `105/100`比較、verdictをsignature acceptance前に再構成。measured sampleだけをmutateしstored derived fieldを残すownerでrejectを確認。 |
+| pre-review candidate parentが未検証 | candidate inventory全entryは`BASE`からpreceding OIDへのexact one-parent chainで、final revision parent/treeはfinal inventory entryと一致する。first entry parent mutation ownerでrejectを確認。 |
+| profile/execution identityがpartial binding | immutable trusted identity bundleをcontroller configとverifier expectation boundaryへbind。profile ID、producer/verifier/monitor complete record、complete execution record、host ID、image digestをexact matchし、image mutation ownerでrejectを確認。 |
+| fsync failure前にfinalizationが唯一のreservationをremove可能 | finalizationはreservation remove前にhost lockをreacquire。unlinkまたはparent fsync failure時はlock保持中にreservationをrestoreし、post-unlink fsync failure ownerでsecond runがblockされることを確認。 |
+| regression verdictがaccepted stateへcollapse | `regression`をdistinctなnon-accepted controller resultとして保持し、exit status 1でpublishする。`require_pass`ならpublication前にrejectし、valid regression artifactを通したownerで`result.accepted == false`を確認する。 |
+| preparation manifestがexecuted childへbindされていない | verification後・staging前に、reportの全`(benchmark, revision)` preparation manifestをcontroller-owned `ScheduleState` mapと比較する。preparation digestだけを変更したsemantically valid reportがpublicationなしでrejectされることをownerで確認する。 |
+| candidate revision digestがfinal inventory entryへbindされていない | `Revision.commit_sha256`がfinal `CommitIdentity.raw_sha256`と一致することを要求し、そのdigestだけを変更したcandidate reportをrejectするownerを持つ。 |
+| fixed reviewがBASEをrootとしてaccepted | fixedの`review_head`は`BASE`よりstrictly後のcommitであることを要求し、BASEをreview headにしたreportをrepair suffixのaccept前にrejectする。 |
+| threshold cross-productがoverflow-checkされていない | `candidate_middle_sum * 100`と`baseline_middle_sum * 105`をchecked-u64 multiplicationで計算し、どちらかのoverflowをrejectする。valid middle sumをboundaryへmutateするownerで確認する。 |
+| abort failureでもcleanup evidenceがoptimistic | pre-publication abortまたはreservation removalがfailureした場合、possible reservationを報告するconservative fail-closed evidenceへcleanup resultを置換する。lease-abort failureをinjectし、state/evidenceの整合を確認する。 |
+| baseline raw parentsがempty inventoryとしてrejectされた | 通常のnon-root baselineの`Revision.parents`をexactに保持し、emptyなのはbaselineの`commits`と`changed_paths`だけにする。raw parentを持つbaselineをownerでsuccess verifyする。 |
+
 ## Final-integration review closure
 
 | Finding | Closure |
@@ -572,6 +621,21 @@ ordinary testにしない。native host qualification/final measurementはmanual
 | initial verification後にnon-selected prepared fileを変更可能 | executable/runtime bind後、launcherがexec直前にdescriptor-bound prepared tree全体とretained manifest digestを再検証。deterministic ownerはbinding中にeffective configurationを変更し、executionへ到達しないことを証明。 |
 | macOS qualificationにrepositoryのshared-cache isolationがない | native ARM launcherはambient loader stateをinheritせず`DYLD_SHARED_REGION=private`を固定し、executed harnessがexact valueをassert。 |
 | macOS verificationがspecial fileのtype reject前にread | launcherはhash前にinitial descriptor modeを検査。FIFO ownerは`os.read`をrejecting sentinelへ置換し、両platform openerがreadなしでrejectすることを証明。 |
+
+## Post-final-review boundary closure
+
+| Finding | Closure |
+|---|---|
+| verifierがincomplete monitor lifecycleをaccept | report observationを`MonitorObservation`へ戻し、dense ordinalとphase/child identity consistencyを要求したうえで、pre-build、全child boundary/sample、between-child、post-run、monotonic progression、counter monotonicity、delay ceiling、expected child order、latched event rejectionを含む完全な`MonitorLifecycle`へreplayする。ownerはphase欠落、ordinal/phase-child identityの破壊、time逆行、counter resetへvalid reportをmutateしてrejectを確認する。 |
+| known abortがunlock後にreservationをremove | `ExclusiveRun.abort(remove_reservation=True)`はhost flock保持中にreservationをremove/fsyncし、unlink/fsync failureならrestoreしてからexplicit unlockを行う。ownerはabort directory-fsync failureをinjectし、second acquisitionがblockされることを確認する。 |
+| producer `run`がpost-PR inputを要求 | `ProducedEvidence`と`EvidenceArtifact`を分離。run controllerはreport/signature bytesとreport-only expectationだけを受け、`verify_artifact`はexplicit PR bodyとtrusted review attestationを別途追加する。ownerはproducerにpost-PR fieldが渡らないことと、両verifier boundaryがexact bytesを保持することを確認する。 |
+| protected inputがcandidate changed pathにもなれる | report semanticsは`candidate.changed_paths`と`protected_inputs.entries`のset intersectionをrejectする。valid fixtureはdisjoint pathを使い、ownerがoverlapへmutateする。 |
+| final lock closeでreservationを失える | finalizationはexplicit `LOCK_UN`をguard transitionとし、descriptor closeはその後のbest-effort cleanupにする。`LOCK_UN` failureならlock保持中にreservationをrestoreし、real close failureはsuccessful `LOCK_UN`後のfinalization failureとして扱わない。ownerはguard transitionとreal close attemptを別々に確認する。 |
+| finalization recoveryが両方のguardをreleaseできる | reservation creationまたはfinalization後のrestore/durabilityがfailureした場合、`ExclusiveRun.abort(remove_reservation=False)`はreservationがuncertainなままheld lockをreleaseしない。ownerはcreation fsync failure、path absentのfinalization restore failure、path presentだがnot-durableなfinalization parent-fsync failureをinjectし、retained guardでsecond leaseがblockされることを確認してからfixture leaseとreservationを復旧する。 |
+| replayがchild IDをnormalizeする | dense ordinalを要求したうえで、replay後のcomplete lifecycle-produced observation tupleとsigned report tupleを比較する。sample/end observationがactive child IDを暗黙に継承できないようにし、ownerはinterior child IDをmutateしてrejectを確認する。 |
+| replayがreport-visible swap eventを落とす | replayとproduction lifecycle bookkeepingがreport-visibleなswap totalの増加/resetをlatched `swap` event/counter violationとして扱う。ownerはobservation streamのswap totalをmutateしてrejectを確認する。 |
+| unlockがdurable report stagingより先になる | explicitなlock-held `stage_report`とidempotent `discard_staging` portを追加し、cleanup validation後かつreservation/lock release前にstagingし、partialまたは後続failureではdiscardする。ownerは順序とfailure cleanupを確認する。 |
+| candidate inventoryにbaseline pseudo-entryが入る | first-parent再構成前にcandidate commit inventoryの`BASE`をrejectする。ownerはself-parent baseline recordをprependしてrejectを確認する。 |
 
 ## Author consistency pass
 

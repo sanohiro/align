@@ -450,6 +450,18 @@ def _execution(value: Any, label: str) -> cj.Object:
     return obj
 
 
+def validate_tool_identity(value: Any, label: str = "tool identity") -> cj.Object:
+    """Validate one standalone ``ToolIdentity`` record."""
+
+    return _tool_identity(value, label)
+
+
+def validate_execution_identity(value: Any, label: str = "execution identity") -> cj.Object:
+    """Validate one standalone ``ExecutionIdentity`` record."""
+
+    return _execution(value, label)
+
+
 def _host_observation(value: Any, label: str) -> cj.Object:
     obj = _object(value, _HOST_OBSERVATION_KEYS, label)
     _u32(obj["ordinal"], f"{label}.ordinal")

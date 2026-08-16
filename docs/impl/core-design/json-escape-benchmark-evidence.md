@@ -37,16 +37,16 @@ must not broaden it independently.
 
 | Field | Exact contract |
 |---|---|
-| Public producer | `/opt/align-evidence/v1/bin/align-json-escape-evidence run --repository REPO --baseline BASE --candidate CANDIDATE --review-log REVIEW_LOG --output-dir NEW_DIR`. The root-owned launcher and modules were installed from the merged evidence implementation, are immutable to the benchmark account, and have hashes embedded in the host profile. It reads the controller/profile/key blobs directly from verified `BASE` objects and requires byte/mode equality with its installed copies before other work. All paths are absolute. OIDs are lowercase 40-hex. `NEW_DIR` must not exist. No other arguments or overrides exist. |
+| Public producer | `/opt/align-evidence/v1/bin/align-json-escape-evidence run --repository REPO --baseline BASE --candidate CANDIDATE --review-log REVIEW_LOG --output-dir NEW_DIR`. The root-owned launcher and modules were installed from the merged evidence implementation, are immutable to the benchmark account, and have hashes embedded in the host profile. It reads the controller/profile/key blobs directly from verified `BASE` objects and requires byte/mode equality with its installed copies before other work. All paths are absolute. OIDs are lowercase 40-hex. `NEW_DIR` must not exist. No other arguments or overrides exist. The run path produces and publishes only the signed report pair; it has no PR body or post-PR review attestation input. |
 | Public verifier | `/opt/align-evidence/v1/bin/align-json-escape-evidence verify --report REPORT --signature SIGNATURE --expected-baseline BASE --expected-candidate CANDIDATE --pr-body PR_BODY --review-attestation REVIEW_ATTESTATION`. It verifies bytes/signature and requires the report/review/preflight bindings to equal the explicit OIDs, PR body, and trusted review attestation below. Local use is diagnostic; acceptance runs this same installed verifier in trusted-base CI, with every expected input created from the GitHub event/API outside the checkout. It performs no build, checkout, benchmark, network, or repository mutation. |
 | Public merge verifier | `/opt/align-evidence/v1/bin/align-json-escape-evidence verify-merge --repository REPO --report REPORT --signature SIGNATURE --merge MERGE --output-dir NEW_DIR`. After the provider returns and the exact object is fetched, it verifies the report again, reads `MERGE` through the isolated raw-object path, requires the local target ref to contain it on its first-parent chain, checks its two parents and tree against the signed expectations, and emits exactly `merge-verification.json` and `merge-verification.json.sig`. `NEW_DIR` must not exist; no override exists. |
 | Trusted review adapter | Trusted-base CI alone queries the GitHub review API with its job token for the event repository/PR. It rejects the PR author, missing repository write role, dismissed/stale/duplicate reviews, wrong commit, and a body without the exact report `log_sha256`. It writes the canonical `REVIEW_ATTESTATION` outside the checkout and supplies it to the verifier. The controller, candidate, report, benchmark containers, and PR arguments never receive the token or raw API response. |
 | Ambient state | There are no semantic defaults. The launcher enters an empty environment containing only fixed `PATH`, `LC_ALL=C`, `TZ=UTC`, empty `HOME`, `CARGO_NET_OFFLINE=true`, and controller-created descriptor/configuration values. Ambient Git, Cargo, Rust, Docker, locale, proxy, credential, target, and tuning variables are omitted. |
-| Result | Success writes and fsyncs `report.json` and `report.json.sig` in private staging while holding the exclusive lock, creates and fsyncs the profile-global publication reservation, releases the lock, atomically renames staging to `NEW_DIR`, fsyncs its parent, removes/fsyncs the reservation, prints the two absolute paths, and exits zero. The reservation makes every second invocation reject before repository/image/container work. A threshold failure publishes a valid signed `regression` report by the same sequence and exits 1. Every other failure removes private staging, output, and reservation where possible, emits no accepted path, and exits nonzero; a crash or failed cleanup leaves the reservation fail-closed for administrator recovery. |
+| Result | Success obtains the exclusive lock and immediately creates and fsyncs the profile-global publication reservation before repository, image, container, or child work. It then writes and fsyncs `report.json` and `report.json.sig` in private staging while holding the lock, releases the lock, atomically renames staging to `NEW_DIR`, fsyncs its parent, removes/fsyncs the reservation, prints the two absolute paths, and exits zero. The reservation makes every second invocation reject before repository/image/container work and survives a pre-publication crash for administrator recovery. A threshold failure publishes a valid signed `regression` report by the same sequence and exits 1. Every other failure removes private staging, output, and reservation where possible, emits no accepted path, and exits nonzero; uncertain cleanup leaves the reservation fail-closed. |
 | Controller owner | A checked-in Python 3 controller, root-owned installed launcher, and fixture tests under `scripts/` and `tests/benchmark_evidence/`. The exact installed/source relationship, installer manifest, interpreter, Git, Docker client/daemon, `ssh-keygen`, kernel, OCI image, host profile, and executable SHA-256 identities are recorded. Candidate files are never executable evidence roots. |
 | Persisted format | Canonical UTF-8 JSON schemas `align.json_escape_benchmark_evidence/v1` and `align.json_escape_benchmark_merge_verification/v1`, each signed byte-for-byte with the host Ed25519 key under its fixed namespace. Unknown, missing, duplicate, reordered, non-ASCII key, non-integer number, float, invalid UTF-8/escape, trailing byte, or noncanonical serialization rejects. |
 | Ownership/allocation | The controller owns all temporary directories, pipes, children, containers, captures, report staging, and cleanup. Benchmark children receive only stdin `/dev/null`, private stdout, and private stderr. Captures have fixed profile ceilings. No child receives the report, signature, repository administration, controller, Docker socket, signing key, or another revision's writable directory. |
-| Concurrency | One controller obtains the profile's host-global exclusive lock before repository inspection and holds it through signing and cleanup. Before unlocking it installs the profile-global publication reservation, which keeps every later invocation out of repository/image/container work until publication completes. Baseline and candidate never overlap. The fixed pair order is the only schedule. |
+| Concurrency | One controller obtains the profile's host-global exclusive lock and installs the profile-global publication reservation before repository inspection or any mutable child work. It holds the lock through signing and cleanup, releases it only after the reservation is durable, and removes the reservation only after publication completes. Every later invocation rejects before repository/image/container work while either guard exists. Baseline and candidate never overlap. The fixed pair order is the only schedule. |
 | Prerequisites | The benchmark-input slice, both Request 7 language prerequisites, this design, its evidence implementation, pinned image, host profile/public key, and controller adversarial owners merge before `BASE` is selected. `BASE` is the then-current target tip and exact parent of the first Request 7 implementation commit. |
 | Acceptance | A valid signature, `pass` verdict, exact PR/preflight/trusted-review bindings, unchanged target-base binding at merge, a signed merge-verification artifact whose merge remains reachable from the final fetched target, identical protected inputs, all ten samples for all five fields, and every exact ratio at most 1.05 are all required. Correctness tests remain separate deterministic owners. |
 
@@ -331,7 +331,8 @@ nonfinite token, invalid ratio suffix, or profiling output rejects. Each retaine
 harness's quantized inner median, is positive ASCII decimal with exactly three fractional digits, and converts without
 floating point or rounding to integer microseconds. Original token and integer are reported. For
 each field/revision, sort ten integers and define median `(sample[4] + sample[5]) / 2`. Store the
-middle sum and denominator `2`, never a rounded value. Compare exactly:
+middle sum and denominator `2`, never a rounded value. Compare exactly, after checked-u64
+multiplication of both products:
 
 ```text
 candidate_middle_sum * 100 <= baseline_middle_sum * 105
@@ -478,26 +479,31 @@ nonempty-child observation: no range or child observation is reused or orphaned.
 carry the empty ID. Benchmarks are `json_decode`, then `json_soa`; each has preparations baseline
 then candidate, followed by warm-ups baseline then candidate. Pair ordinals are 1 through 10 with
 B/C arms in the specified balanced order. `Preparation.artifact_manifest_sha256` matches the
-manifest reverified by every later run of that benchmark/revision. `Run.samples` has fields in
+controller-owned schedule manifest for that benchmark/revision and the manifest reverified by
+every later run of that benchmark/revision. `Run.samples` has fields in
 benchmark order (two then three). Field results use the five field order above. Original samples
 follow pair ordinal; sorted samples are nondecreasing and exact permutations. `ratio_numerator` is
 candidate middle sum and `ratio_denominator` baseline middle sum.
 All cleanup counts are zero and booleans true before either verdict can be signed. The host lock is
-still held while signing and while both private-staging files and that directory become durable.
-While still locked, the producer creates the profile-fixed root-owned publication-reservation file
-with no-follow exclusive creation, records the run/output identity, and fsyncs its directory. It then
-releases the lock, atomically renames staging to `NEW_DIR`, fsyncs the output parent, removes the
-reservation, fsyncs its directory, and only then prints accepted paths. Any invocation acquiring the
-lock while the reservation exists rejects before repository inspection. Unlock or publication
-failure removes private/output state where possible; a surviving reservation marks any output
-unaccepted and blocks future runs until the administrator validates and removes it. Reservation
-removal is a publication postcondition outside the already-signed measurement cleanup; accepted
-paths do not exist until that postcondition succeeds.
+still held while the early profile-fixed root-owned publication-reservation file and both
+private-staging files and that directory become durable. The reservation uses no-follow exclusive
+creation, records the run/output identity, and fsyncs its directory before repository inspection or
+child work. After signing, the producer releases the lock, atomically renames staging to `NEW_DIR`,
+fsyncs the output parent, removes the reservation, fsyncs its directory, and only then prints
+accepted paths. Any invocation acquiring the lock while the reservation exists rejects before
+repository inspection. Unlock or publication failure removes private/output state where possible; a
+surviving reservation marks any output unaccepted and blocks future runs until the administrator
+validates and removes it. Reservation removal is a publication postcondition outside the
+already-signed measurement cleanup; accepted paths do not exist until that postcondition succeeds.
 `first_failed_field` is empty exactly for `pass`; for `regression` it is the first false field in
-field order. There are no conditional or omitted members.
+field order. The candidate `commit_sha256` equals the raw SHA-256 of the final candidate inventory
+entry. A controller may publish a valid `regression` report only as a distinct non-accepted result
+with exit status 1; a required-pass invocation rejects it before publication. There are no
+conditional or omitted members.
 
 For a `clean` review, `review_head` equals the candidate and `repair_commits` is empty. For a
-`fixed` review, `review_head` is the reviewed ancestor and `repair_commits` is the exact
+`fixed` review, `review_head` is a reviewed ancestor strictly after the baseline and
+`repair_commits` is the exact
 nonempty first-parent sequence after it, ending at the candidate; every listed commit is also in
 candidate `commits`, in the same order. `review_base` equals the reported baseline in either state.
 These literals exactly equal the repository preflight stamp and PR marker; a review log verdict
@@ -532,10 +538,12 @@ every binary field and length, re-encode to identical armor bytes, and only then
 armor including its final LF.
 
 The producer encodes `Body`, computes that domain-separated digest, encodes `Report`, reparses with
-duplicate rejection, re-encodes, and requires byte identity before signing. The verifier repeats
+duplicate rejection, re-encodes, and requires byte identity before signing. The run-side verifier
+checks the report-only bindings and signature before publication. The post-PR verifier then repeats
 schema/canonical validation, the body digest, every relationship, sample reconstruction, medians,
 exact comparisons, explicit expected baseline/candidate/PR bindings, identities, key fingerprint,
-and signature; it trusts no stored derived value.
+and signature after it receives the trusted PR body and review attestation; it trusts no stored
+derived value.
 
 The implementation checks in complete minimal-pass and first-field-regression semantic fixtures,
 their exact one-line report bytes, detached test signatures, and SHA-256 files. A structurally
@@ -647,10 +655,10 @@ controller, verifier, or merge-race behavior.
 | Forged/stale evidence | Unsigned, edited, replayed profile/target/review/candidate, truncated, concatenated, and valid-signature/wrong-namespace reports reject. PR/preflight/trusted-review mismatch blocks; `CLEAN` maps only to `clean`, and accepted `FINDINGS` with a nonempty repair chain maps only to `fixed`. `benchmark_evidence_stale_forged_matrix`. |
 | Base/integration race | Disposable remote covers target movement before/after run, precheck-to-merge race, unavailable/wrong response OID, local-target mismatch, wrong merge parents/tree, signed merge-verification mutation, a normal later first-parent descendant, force-push/removal before the final trusted refetch, failed revert, and exact merge. The merge must remain on the final target first-parent chain; failures never advance lifecycle. `benchmark_evidence_merge_race_matrix`. |
 
-The next capability is intentionally limited to the base/integration race owner. It consumes the
-already merged identity, revision, report, signature, cleanup, and exclusive-run boundaries and does
-not introduce the controller, verifier, provider credentials, Docker execution, or lifecycle adapter.
-Its implementation closure matrix is:
+The base/integration race capability is merged in PR #840. It consumes the already merged identity,
+revision, report, signature, cleanup, and exclusive-run boundaries and proves the disposable
+provider/lifecycle relationship without introducing provider credentials or a live service adapter.
+Its completed closure matrix is:
 
 | Axis | Closure and owner |
 |---|---|
@@ -662,10 +670,43 @@ Its implementation closure matrix is:
 | Final refetch | After staging, accept a normal later first-parent descendant that still contains `MERGE`; a force-push, target removal, or unavailable final fetch rejects and never advances lifecycle. `benchmark_evidence_merge_race_matrix`. |
 | Revert/lifecycle | Exact merge reaches `accepted` only after every relationship and final refetch passes. Every failure reaches `rejected`, `reverted`, or `blocked`; no failure advances lifecycle or emits an accepted artifact. `benchmark_evidence_merge_race_matrix`. |
 
+The next capability is intentionally limited to the trusted controller/verifier orchestration core.
+It consumes the merged bootstrap, CLI, profile, host/image/container, source, process, monitor,
+schedule, cleanup, exclusive-run, report, signature, and merge-race boundaries. It provides the
+phase ordering and trusted-artifact handoff as a deterministic fixture-owned consumer. It does not
+inspect a real host, invoke Docker, query GitHub, receive provider credentials, run the performance
+workload, perform cryptographic key management, or advance the post-merge lifecycle. Its
+implementation closure matrix is:
+
 Implementation maps every row to source and deterministic tests before review. Tests use fixture
-executors, a fake daemon, disposable repositories/remotes, and test keys; they do not run the
-performance workload or assert wall-clock ratios. Native host qualification and final Request 7
-measurement remain named manual evidence.
+gates, executors, artifact stores, and test keys; they do not inspect the host, contact a provider,
+run Docker, run the performance workload, or assert wall-clock ratios. Native host qualification,
+cryptographic key-process integration, provider/review API integration, and final Request 7
+measurement remain named later evidence.
+
+| Axis | Closure and owner |
+|---|---|
+| Trusted bootstrap and invocation | The run controller consumes only an already parsed `cli.RunInvocation`; the verifier port consumes the explicit bytes corresponding to a parsed `cli.VerifyInvocation`. Bind both to one immutable profile identity bundle covering profile ID, producer/verifier/monitor tool records, host, image, and complete execution identity; reject a mismatched installed manifest, profile digest, target ref, OID, path, or ambient selector before any gate or child. Path resolution remains a later trusted adapter. `benchmark_evidence_controller_verifier_matrix`. |
+| Preflight gate ordering | Acquire the exclusive lock and durable profile-global reservation before immutable bootstrap, then run trusted host/image/source/review gates in the declared order and record each completed phase. A gate failure stops before the next gate and cannot create a child, report, signature, or staging output; known pre-child cleanup removes the unused reservation, while uncertain cleanup leaves it fail-closed. `benchmark_evidence_controller_verifier_matrix`. |
+| Schedule/executor handoff | Drive the existing `ScheduleState` with an injected fixture executor. Every fixed preparation, warm-up, and alternating sample is started once, has a unique child ID, carries the sealed artifact digest, and is removed from the owned-resource ledger before the next child. Overlap, reorder, retry, build during measurement, artifact drift, timeout, signal, nonzero, and incomplete schedule reject. `benchmark_evidence_controller_verifier_matrix`. |
+| Cleanup/publication ordering | Drive the existing `CleanupTransaction` and require zero children/containers/mounts/fds/private directories plus unchanged source/cache manifests before report staging. A trusted staging port writes and fsyncs the exact report/signature pair while the host lock is held; its idempotent discard port owns partial-stage cleanup. Durable reservation precedes lock release; publication precedes reservation removal; any publish, unlock, or cleanup failure emits no accepted result and leaves a fail-closed reservation when ownership is uncertain. `benchmark_evidence_controller_verifier_matrix`. |
+| Report/signature handoff | Accept report bytes and signature bytes only from trusted fixture-owned producers after schedule and cleanup completion. The run-side verifier checks those bytes without PR inputs and returns the immutable produced record it actually checked; the lock-held staging port and later publisher receive that exact record through the result. The post-PR verifier separately consumes the explicit report/signature, PR body, and review attestation. The controller does not accept a candidate-provided report, opens no candidate module, and cannot publish different bytes. `benchmark_evidence_controller_verifier_matrix`. |
+| Report semantic reconstruction | Reconstruct the fixed child schedule and monitor ranges, every sample/token, baseline/candidate arrays, sorted permutations, middle sums, exact threshold comparison, verdict, run ID, baseline raw parents with an empty candidate inventory (`commits` and `changed_paths`), candidate first-parent chain, candidate final raw SHA-256, and protected-input relationships; bind every preparation manifest to the controller-owned schedule map; reject any candidate changed path that is also protected; stored derived values are never trusted. A regression is published only as a distinct non-accepted result with exit status 1. `benchmark_evidence_controller_verifier_matrix`. |
+| Verifier binding | Decode the canonical report, validate the full existing report schema and body digest, bind the complete profile identity bundle plus baseline/candidate/target/review fields to explicit trusted expectations, require `target.run_oid == BASE`, validate clean/fixed review-chain semantics (a fixed review head must be strictly after `BASE`) and every candidate commit parent, reject a candidate commit inventory containing `BASE`, reject overflow in both threshold cross-products, preserve the baseline's raw parent list while requiring only its candidate inventory to be empty, reject a changed/protected path overlap, parse exactly one value for every recognized PR-body preflight marker, and require an injected cryptographic signature check with the fixed report namespace/key. Wrong bytes, namespace, key, signature, attestation, repair chain, marker, identity, verdict, expected OID, baseline-rooted review, baseline pseudo-entry, overflow, overlap, or a malformed baseline inventory reject without repository, build, benchmark, network, or output mutation. `benchmark_evidence_controller_verifier_matrix`. |
+| Failure and restart | Every exception has one terminal rejected or fail-closed result. The durable reservation is installed before any gate or child, remains while the lock is released and publication settles, and blocks a second invocation; known abort removes it only while the host lock is held and restores it if unlink or directory fsync fails. Final reservation removal reacquires the host lock and restores the reservation if unlink or directory fsync fails; `LOCK_UN` is the final guard transition, and descriptor close is best effort only after that transition. If reservation creation or restoration fails and durability is uncertain, the lease retains the host lock rather than releasing both guards. If abort itself fails, the returned cleanup evidence is conservatively fail-closed and reports the possible reservation. Accepted state is reachable only after the complete report/signature pair is durably published and the reservation is removed. Crash/restart and cleanup-failure fixtures never turn partial state into accepted evidence. `benchmark_evidence_controller_verifier_matrix`; `benchmark_evidence_exclusive_run`. |
+| Explicit deferrals | Real host inspection, Docker daemon/image execution, GitHub review API/token isolation, `ssh-keygen`/Ed25519 signing, raw Git revision construction, merge verification against a provider, and post-merge lifecycle advancement remain later capabilities and are not faked by this core. `benchmark_evidence_controller_verifier_matrix`. |
+
+The controller/verifier owner is an orchestration boundary, not accepted Request 7 evidence. It
+proves that a producer can publish report/signature bytes without post-PR inputs, that the separate
+verifier cannot consume them out of order, and that a verifier failure cannot cross the publication
+boundary; later capability owners must replace each fixture gate with the corresponding privileged
+adapter before host qualification or measurement.
+
+This capability is expected to exceed roughly 1,000 hand-written lines when its controller,
+verifier, and shared adversarial owner are counted. Keeping the strict dormant producer-to-consumer
+chain together lets one report-only producer fixture and one explicit post-PR artifact fixture prove
+both verifier bindings and the publication barrier; splitting the chain further would duplicate
+those fixtures and leave the controller's byte handoff unreviewed.
 
 ## Design-review finding closure
 
@@ -708,6 +749,22 @@ measurement remain named manual evidence.
 | P1 retained prepared path could be replaced after verification | Prepare revalidates its captured private-child device/inode before success. Native carries the captured identity into the launcher, which requires the opened root descriptor to match and performs all manifest traversal below that retained descriptor. |
 | P1 same-inode writes could change bytes after hashing | The accepted Linux path hashes while copying executable/runtime bytes into anonymous memfds, checks source metadata around the copy, applies all four write/size/seal seals, and execs/preloads only the sealed copies. The deterministic owner replaces the root at the shell/launcher handoff and proves a sealed copy remains unchanged and unwritable after its source changes. |
 
+## Revised-candidate review closure
+
+| Finding | Ledger-first closure |
+|---|---|
+| P1 verifier trusted stored derived measurements | The verifier reconstructs the fixed schedule, monitor ranges, sample/token arrays, sorted permutations, middle sums, exact `105/100` comparison, and verdict before signature acceptance. The owner mutates a measured sample while leaving every stored derived field unchanged and requires rejection. |
+| P1 pre-review candidate parents were unchecked | Every candidate inventory entry must have exactly one parent equal to the preceding OID from `BASE`; the final revision parent and tree must match the final inventory entry. The owner mutates the first entry's parent and requires rejection. |
+| P1 profile and execution identities were partial | One immutable trusted identity bundle is bound at the controller configuration and verifier expectation boundary. Profile ID, complete producer/verifier/monitor records, complete execution record, host ID, and image digest must match exactly; the owner mutates the image identity and requires rejection. |
+| P1 finalization could remove the only reservation before fsync failure | Finalization reacquires the host lock before removing the reservation. If unlink or parent fsync fails, the reservation is restored while that lock is held; the owner injects the post-unlink fsync failure and proves a second run remains blocked. |
+| P1 regression verdict collapsed into accepted state | Keep `regression` as a distinct non-accepted controller result and publish it with exit status 1; a required-pass invocation rejects it before publication. The owner runs a valid regression artifact through publication and asserts `result.accepted` is false. |
+| P1 preparation manifest was not bound to executed children | Compare every report preparation `(benchmark, revision)` manifest to the controller-owned `ScheduleState` map after verification and before staging. A semantically valid report with one altered preparation digest is rejected without publication. |
+| P2 candidate revision digest was not bound to its final inventory entry | Require `Revision.commit_sha256` to equal the final `CommitIdentity.raw_sha256`; a candidate report with only that digest altered is rejected. |
+| P1 fixed review rooted at the baseline was accepted | Require a fixed `review_head` to be a strict descendant of `BASE`; a fixed report whose review head is the baseline is rejected before accepting its repair suffix. |
+| P2 threshold cross-products were not overflow-checked | Compute both `candidate_middle_sum * 100` and `baseline_middle_sum * 105` with checked-u64 multiplication and reject either overflow; the owner mutates valid middle sums to the overflow boundary. |
+| P2 abort failure left cleanup evidence optimistic | If pre-publication abort or reservation removal fails, replace the normal cleanup result with conservative fail-closed evidence that reports a possible reservation; the owner injects lease-abort failure and checks state/evidence consistency. |
+| P1 baseline raw parents were rejected as empty inventory | Preserve `Revision.parents` exactly for a normal non-root baseline and require only baseline `commits` and `changed_paths` to be empty; the owner uses a baseline with a raw parent and verifies it successfully. |
+
 ## Final-integration review closure
 
 | Finding | Ledger-first closure |
@@ -737,6 +794,21 @@ measurement remain named manual evidence.
 | P1 non-selected prepared files could change after initial verification | After binding the executable and runtime, the launcher re-verifies the complete descriptor-bound prepared tree and retained manifest digest immediately before `execve`. A deterministic owner mutates the effective configuration during binding and proves execution is never reached. |
 | P2 macOS qualification omitted the repository's shared-cache isolation | The native ARM launcher fixes `DYLD_SHARED_REGION=private` instead of inheriting ambient loader state, and the executed harness asserts the exact value. |
 | P2 macOS verification read a special file before rejecting its type | The launcher checks the initial descriptor mode before hashing. The FIFO owner replaces `os.read` with a rejecting sentinel and proves both platform openers reject without any read. |
+
+## Post-final-review boundary closure
+
+| Finding | Ledger-first closure |
+|---|---|
+| P1 verifier accepted an incomplete monitor lifecycle | Reconstruct every report observation as a `MonitorObservation`, require dense ordinals and phase/child identity consistency, and replay the complete `MonitorLifecycle`, including pre-build, every child boundary/sample, between-child, post-run, monotonic progression, counter monotonicity, delay ceiling, expected child order, and latched-event rejection. The owner mutates a valid report to omit lifecycle phases, break ordinals or phase/child identity, move time backwards, and reset a counter. |
+| P1 known abort removed the reservation after unlocking | `ExclusiveRun.abort(remove_reservation=True)` removes and fsyncs the reservation while the host flock is held, restores it on any unlink/fsync failure, and only then performs the explicit unlock. The owner injects abort directory-fsync failure and proves a second acquisition remains blocked. |
+| P1 producer `run` required post-PR inputs | Split `ProducedEvidence` from `EvidenceArtifact`: the run controller accepts only report/signature bytes and report-only expectations, while `verify_artifact` separately adds the explicit PR body and trusted review attestation. The owner asserts that the producer receives no post-PR fields and that both verifier boundaries preserve exact bytes. |
+| P1 protected input could also be a candidate changed path | Report semantics now reject the set intersection between `candidate.changed_paths` and `protected_inputs.entries`; the valid fixture uses disjoint paths and the owner mutates it into an overlap. |
+| P1 final lock close could lose the reservation | Finalization treats explicit `LOCK_UN` as the guard transition and performs descriptor close only as best-effort cleanup afterward. A failed `LOCK_UN` restores the reservation while the lock is still held; a real close failure after successful `LOCK_UN` cannot be reported as a failed finalization, and the owner proves the guard transition and actual close attempt separately. |
+| P1 finalization recovery could release both guards | If reservation creation or finalization removes the reservation and restoration/durability fails, `ExclusiveRun.abort(remove_reservation=False)` refuses to release a held lock while the reservation is uncertain. The owner injects creation fsync failure, finalization restore failure with an absent path, and finalization parent-fsync failure with a present-but-not-durable path; it proves a second lease is blocked by the retained guard, then restores the reservation before releasing the fixture lease. |
+| P1 replay normalized a child ID | Replay compares the complete lifecycle-produced observation tuple with the signed report tuple after enforcing dense ordinals, so a sample/end observation cannot silently inherit the active child ID. The owner mutates a valid interior child ID and requires rejection. |
+| P1 replay omitted a report-visible swap event | Replay and production lifecycle bookkeeping treat an increase or reset of the report-visible swap totals as a latched `swap` event/counter violation. The owner mutates swap totals across the observation stream and requires rejection. |
+| P1 unlock could precede durable report staging | Add explicit lock-held `stage_report` and idempotent `discard_staging` ports. The controller calls staging only after cleanup validation and before reservation/lock release, and calls discard on every later or partial-stage failure; the owner proves the order and failure cleanup. |
+| P2 candidate inventory could contain a baseline pseudo-entry | Reject `BASE` in the candidate commit inventory before first-parent reconstruction. The owner prepends a self-parent baseline record and requires rejection. |
 
 ## Author consistency pass
 

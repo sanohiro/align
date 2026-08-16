@@ -52,6 +52,8 @@ class ExclusiveRun:
         self._reserved = False
         self._published = False
         self._closed = False
+        self._reservation_uncertain = False
+        self._reservation_raw: bytes | None = None
 
     @property
     def locked(self) -> bool:
@@ -88,13 +90,32 @@ class ExclusiveRun:
             os.close(fd)
             raise
 
-    def create_reservation(self, run_id: str, output_dir: str) -> None:
-        if not self._locked or self._reserved:
-            raise ExclusiveRunError("reservation requires the held host lock")
-        if _HEX64.fullmatch(run_id) is None:
-            raise ExclusiveRunError("reservation run ID must be lowercase 64-hex")
-        output_dir = _path(output_dir, "reservation output")
-        raw = f"run_id={run_id}\noutput_dir={output_dir}\n".encode("ascii")
+    def _acquire_finalization_lock(self) -> None:
+        if self._closed or self._locked:
+            raise ExclusiveRunError("run lease is not available for finalization")
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(self.lock_path, flags, 0o600)
+        except OSError as exc:
+            raise ExclusiveRunError(f"cannot reopen host lock: {exc}") from exc
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise ExclusiveRunError("host lock is held during finalization") from exc
+            self._lock_fd = fd
+            self._locked = True
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def _write_reservation_file(self) -> None:
+        if self._reservation_raw is None:
+            raise ExclusiveRunError("reservation contents are not available")
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
@@ -106,13 +127,14 @@ class ExclusiveRun:
             raise ExclusiveRunError(f"cannot create publication reservation: {exc}") from exc
         try:
             written = 0
-            while written < len(raw):
-                count = os.write(fd, raw[written:])
+            while written < len(self._reservation_raw):
+                count = os.write(fd, self._reservation_raw[written:])
                 if count <= 0:
                     raise ExclusiveRunError("publication reservation made no progress")
                 written += count
             os.fsync(fd)
         except BaseException:
+            self._reservation_uncertain = True
             try:
                 os.unlink(self.reservation_path)
             except OSError:
@@ -120,8 +142,43 @@ class ExclusiveRun:
             raise
         finally:
             os.close(fd)
-        _fsync_parent(self.reservation_path)
+
+    def _restore_reservation(self) -> None:
+        try:
+            if os.path.lexists(self.reservation_path):
+                _fsync_parent(self.reservation_path)
+            else:
+                self._write_reservation_file()
+                _fsync_parent(self.reservation_path)
+        except BaseException:
+            self._reservation_uncertain = True
+            raise
         self._reserved = True
+        self._reservation_uncertain = False
+
+    def create_reservation(self, run_id: str, output_dir: str) -> None:
+        if not self._locked or self._reserved:
+            raise ExclusiveRunError("reservation requires the held host lock")
+        if _HEX64.fullmatch(run_id) is None:
+            raise ExclusiveRunError("reservation run ID must be lowercase 64-hex")
+        output_dir = _path(output_dir, "reservation output")
+        self._reservation_raw = f"run_id={run_id}\noutput_dir={output_dir}\n".encode("ascii")
+        try:
+            self._write_reservation_file()
+        except BaseException:
+            self._reservation_uncertain = True
+            try:
+                os.unlink(self.reservation_path)
+            except OSError:
+                pass
+            raise
+        try:
+            _fsync_parent(self.reservation_path)
+        except BaseException:
+            self._reservation_uncertain = True
+            raise
+        self._reserved = True
+        self._reservation_uncertain = False
 
     def release_lock_for_publication(self) -> None:
         if not self._locked or not self._reserved:
@@ -136,24 +193,81 @@ class ExclusiveRun:
             raise ExclusiveRunError("publication must follow lock release and precede finalization")
         self._published = True
 
+    def _release_finalization_lock(self) -> None:
+        """Release the reacquired flock before best-effort descriptor close."""
+
+        if self._lock_fd < 0 or not self._locked:
+            raise ExclusiveRunError("finalization lock is not held")
+        # LOCK_UN is the transactional guard transition.  A close error after
+        # it succeeds cannot mean that another run was admitted by this
+        # lease; treating that best-effort descriptor cleanup as a failed
+        # finalization would falsely report a fail-closed reservation.
+        fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+        try:
+            os.close(self._lock_fd)
+        except OSError:
+            pass
+
     def finalize_publication(self) -> None:
         if not self._published or not self._reserved:
             raise ExclusiveRunError("publication reservation is not ready for removal")
-        os.unlink(self.reservation_path)
-        _fsync_parent(self.reservation_path)
+        # Reacquire the host lock while the reservation is removed.  The
+        # reservation is the first guard checked by a new process, and the
+        # lock closes the brief path-absent interval before its directory
+        # fsync completes or a failed removal can be restored.
+        self._acquire_finalization_lock()
+        try:
+            os.unlink(self.reservation_path)
+            _fsync_parent(self.reservation_path)
+        except BaseException:
+            self._restore_reservation()
+            raise
+        try:
+            self._release_finalization_lock()
+        except BaseException:
+            self._restore_reservation()
+            raise
+        self._lock_fd = -1
+        self._locked = False
         self._reserved = False
         self._closed = True
 
     def abort(self, *, remove_reservation: bool) -> None:
         """Close local state; leaving the reservation blocks later runs."""
 
+        removed = False
+        if remove_reservation and self._reserved:
+            if not self._locked or self._lock_fd < 0:
+                raise ExclusiveRunError("reservation removal requires the held host lock")
+            try:
+                os.unlink(self.reservation_path)
+                _fsync_parent(self.reservation_path)
+            except BaseException:
+                self._restore_reservation()
+                raise
+            removed = True
         if self._lock_fd >= 0:
-            fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
-            os.close(self._lock_fd)
+            if self._reservation_uncertain:
+                # A failed finalization or reservation creation leaves no proof
+                # that the path is durable.  Never release the fallback host
+                # lock in that state: the caller must retain this lease until
+                # a later recovery step restores a durable reservation.
+                raise ExclusiveRunError(
+                    "cannot release host lock without a durable reservation"
+                )
+            try:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+            except BaseException:
+                if removed:
+                    self._restore_reservation()
+                raise
+            try:
+                os.close(self._lock_fd)
+            except OSError:
+                pass
             self._lock_fd = -1
         self._locked = False
-        if remove_reservation and self._reserved:
-            os.unlink(self.reservation_path)
-            _fsync_parent(self.reservation_path)
+        if removed:
             self._reserved = False
+            self._reservation_uncertain = False
         self._closed = True

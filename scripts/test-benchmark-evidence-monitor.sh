@@ -17,15 +17,15 @@ CHILD_A = "1" * 64
 CHILD_B = "2" * 64
 
 
-def snapshot(t, *, throttle=0, lost=0):
+def snapshot(t, *, throttle=0, lost=0, swap_read=0, swap_write=0):
     return monitor.MonitorSnapshot(
         monotonic_ns=t,
         load_milli=10,
         cpu_pressure_total_us=20,
         memory_pressure_total_us=30,
         free_memory_bytes=4 * 1024 * 1024 * 1024,
-        swap_read_bytes=0,
-        swap_write_bytes=0,
+        swap_read_bytes=swap_read,
+        swap_write_bytes=swap_write,
         throttle_events=throttle,
         thermal_events=0,
         foreign_schedule_events=0,
@@ -153,6 +153,14 @@ counter.start_child(CHILD_A, snapshot(10))
 counter.end_child(snapshot(20, throttle=1))
 counter.record_post_run(snapshot(30, throttle=1))
 rejected("latched event counter", counter.finish, "counter changed")
+
+swap = monitor.MonitorLifecycle((CHILD_A,))
+swap.open()
+swap.record_pre_build(snapshot(0))
+swap.start_child(CHILD_A, snapshot(10, swap_read=1))
+swap.end_child(snapshot(20, swap_read=1))
+swap.record_post_run(snapshot(30, swap_read=1))
+rejected("swap event", swap.finish, "monitor event: swap")
 
 event = clean_lifecycle()
 event.record_event("monitor_lost", at_monotonic_ns=30)
