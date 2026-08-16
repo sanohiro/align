@@ -100,6 +100,10 @@ Do not re-litigate these. Full rationale is in `docs/open-questions.md`:
   `else` on `Result` deliberately discards the error while `?` propagates and
   `match` inspects it.
 
+Re-examining any of these goes through the friction-ledger protocol in
+`docs/impl/23-friction-ledger.md`, which requires recorded mechanical workarounds in real
+programs rather than argument, and fixes the only shape a widening may take.
+
 ## Editing conventions
 
 - Core code, comments, identifiers, diagnostics, the authoritative
