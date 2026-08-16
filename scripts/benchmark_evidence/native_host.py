@@ -115,23 +115,39 @@ def _supports_nonreaping_wait() -> bool:
     )
 
 
+def _signal_process_group(process: subprocess.Popen[bytes], signum: int) -> None:
+    try:
+        os.killpg(process.pid, signum)
+    except OSError as exc:
+        if exc.errno != errno.ESRCH:
+            raise NativeHostError("trusted command process-group signal failed") from exc
+
+
 def _stop_process(process: subprocess.Popen[bytes]) -> None:
     """Terminate and reap an owned command process group best-effort."""
 
+    cleanup_error: NativeHostError | None = None
     try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except OSError:
-        pass
+        _signal_process_group(process, signal.SIGTERM)
+    except NativeHostError as exc:
+        cleanup_error = exc
     if _supports_nonreaping_wait():
-        _waitid_without_reap(process, 0.5)
+        try:
+            _waitid_without_reap(process, 0.5)
+        except NativeHostError as exc:
+            cleanup_error = cleanup_error or exc
     try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except OSError:
-        pass
+        _signal_process_group(process, signal.SIGKILL)
+    except NativeHostError as exc:
+        cleanup_error = cleanup_error or exc
     try:
         process.wait(timeout=0.5)
     except subprocess.TimeoutExpired:
-        _error("trusted command process group could not be reaped")
+        cleanup_error = cleanup_error or NativeHostError(
+            "trusted command process group could not be reaped"
+        )
+    if cleanup_error is not None:
+        raise cleanup_error
 
 
 def _wait_without_reap(process: subprocess.Popen[bytes], timeout: float) -> int:
@@ -282,7 +298,14 @@ def run_command(
     return _run_command(argv, timeout_seconds=timeout_seconds, output_limit=output_limit)
 
 
-def read_no_follow(path: str, *, limit: int = _MAX_SOURCE_BYTES) -> bytes:
+def _validate_source_metadata(metadata: Any, path: str, *, require_trusted: bool) -> None:
+    if not stat.S_ISREG(metadata.st_mode):
+        _error(f"native source is not a regular file: {path}")
+    if require_trusted and (metadata.st_uid != 0 or metadata.st_mode & 0o022):
+        _error(f"native source is not root-owned and benchmark-account unwritable: {path}")
+
+
+def _read_no_follow(path: str, *, limit: int, require_trusted: bool) -> bytes:
     """Read one fixed regular file without following its final component."""
 
     if not isinstance(path, str) or not path.startswith("/") or "\x00" in path:
@@ -298,8 +321,7 @@ def read_no_follow(path: str, *, limit: int = _MAX_SOURCE_BYTES) -> bytes:
         raise NativeHostError(f"cannot open native source {path}") from exc
     try:
         metadata = os.fstat(fd)
-        if not stat.S_ISREG(metadata.st_mode):
-            _error(f"native source is not a regular file: {path}")
+        _validate_source_metadata(metadata, path, require_trusted=require_trusted)
         chunks: list[bytes] = []
         size = 0
         while True:
@@ -318,6 +340,16 @@ def read_no_follow(path: str, *, limit: int = _MAX_SOURCE_BYTES) -> bytes:
             os.close(fd)
         except OSError as exc:
             raise NativeHostError(f"native source close failed: {path}") from exc
+
+
+def read_no_follow(path: str, *, limit: int = _MAX_SOURCE_BYTES) -> bytes:
+    return _read_no_follow(path, limit=limit, require_trusted=False)
+
+
+def read_trusted_no_follow(path: str, *, limit: int = _MAX_SOURCE_BYTES) -> bytes:
+    """Read a root-owned, benchmark-account-unwritable fixed source."""
+
+    return _read_no_follow(path, limit=limit, require_trusted=True)
 
 
 def _validate_executable_metadata(metadata: Any, path: str) -> None:
@@ -446,13 +478,23 @@ def _validate_docker_config_dir(
             raise NativeHostError("Docker config directory close failed") from close_error
 
 
-def run_docker_pair() -> tuple[bytes, bytes, str]:
+def _client_hash(value: object, label: str = "Docker client digest") -> str:
+    if not isinstance(value, str) or _HEX64.fullmatch(value) is None:
+        _error(f"{label} is not lowercase SHA-256")
+    return value
+
+
+def run_docker_pair(expected_client_hash: str | None = None) -> tuple[bytes, bytes, str]:
     """Run version and info from the same retained Docker executable descriptor."""
 
+    if expected_client_hash is not None:
+        expected_client_hash = _client_hash(expected_client_hash, "profile Docker client digest")
     _validate_docker_config_dir()
     fd = _open_executable(DOCKER)
     try:
         client_hash = _hash_fd(fd, DOCKER)
+        if expected_client_hash is not None and client_hash != expected_client_hash:
+            _error("Docker client digest does not match profile before Docker execution")
         version = _run_command(DOCKER_VERSION_ARGV, executable_fd=fd)
         info = _run_command(DOCKER_INFO_ARGV, executable_fd=fd)
         return version, info, client_hash
@@ -703,20 +745,26 @@ def _quota_milli(reader: Reader) -> int:
     return _uint((quota * 1000 + period - 1) // period, "CPU quota milli")
 
 
-def _docker(reader: Reader, runner: Runner, hasher: Hasher) -> cj.Object:
+def _docker(
+    reader: Reader,
+    runner: Runner,
+    hasher: Hasher,
+    expected_client_hash: str,
+) -> cj.Object:
     if runner is run_command and hasher is hash_executable:
-        version_raw, info_raw, client_hash = run_docker_pair()
+        version_raw, info_raw, client_hash = run_docker_pair(expected_client_hash)
     else:
+        client_hash = _client_hash(hasher(DOCKER))
+        if client_hash != expected_client_hash:
+            _error("Docker client digest does not match profile before Docker execution")
         version_raw = runner(DOCKER_VERSION_ARGV)
         info_raw = runner(DOCKER_INFO_ARGV)
-        client_hash = hasher(DOCKER)
     version = _json(version_raw, "docker version output")
     client = _object(version.get("Client"), "docker version Client")
     server = _object(version.get("Server"), "docker version Server")
     info = _json(info_raw, "docker info output")
+    runtime_commit = _object(info.get("RuncCommit"), "docker info RuncCommit")
     daemon_architecture = _architecture(_json_string(server, "Arch", "docker version Server"), "docker daemon architecture")
-    if not isinstance(client_hash, str) or _HEX64.fullmatch(client_hash) is None:
-        _error("Docker client digest is not lowercase SHA-256")
     return cj.Object(
         (
             ("client_version", _json_string(client, "Version", "docker version Client")),
@@ -725,7 +773,7 @@ def _docker(reader: Reader, runner: Runner, hasher: Hasher) -> cj.Object:
             ("daemon_architecture", daemon_architecture),
             ("storage_driver", _json_string(info, "Driver", "docker info")),
             ("cgroup_version", _json_string(info, "CgroupVersion", "docker info")),
-            ("oci_runtime", _json_string(info, "DefaultRuntime", "docker info")),
+            ("oci_runtime", _json_string(runtime_commit, "ID", "docker info RuncCommit")),
         )
     )
 
@@ -772,6 +820,7 @@ def inspect(
     profile: Mapping[str, Any],
     *,
     reader: Reader = read_no_follow,
+    trusted_reader: Reader | None = None,
     runner: Runner = run_command,
     hasher: Hasher = hash_executable,
     uname: Uname = os.uname,
@@ -781,6 +830,12 @@ def inspect(
 
     if not isinstance(profile, Mapping):
         _error("profile must be an object")
+    if trusted_reader is None:
+        trusted_reader = read_trusted_no_follow if reader is read_no_follow else reader
+    expected_docker = _object(_profile_field(profile, ("docker",)), "profile.docker")
+    expected_client_hash = _client_hash(
+        expected_docker.get("client_sha256"), "profile Docker client digest"
+    )
     system = uname()
     architecture = _architecture(getattr(system, "machine", ""), "host architecture")
     if architecture != "x86_64":
@@ -788,7 +843,7 @@ def inspect(
     kernel = _name(getattr(system, "release", ""), "host kernel")
     fields = _cpuinfo(_text(reader, CPUINFO_PATH))
     online = _line(reader, ONLINE_CPU_SET_PATH)
-    benchmark = _line(reader, BENCHMARK_CPU_SET_PATH)
+    benchmark = _line(trusted_reader, BENCHMARK_CPU_SET_PATH)
     numa = _line(reader, NUMA_SET_PATH)
     online_ranges = _parse_cpu_set(online, "online CPU set")
     benchmark_ranges = _parse_cpu_set(benchmark, "benchmark CPU set")
@@ -806,6 +861,7 @@ def inspect(
     quota = _quota_milli(reader)
     if quota != 0:
         _error("CPU quota must be zero before Docker qualification")
+    host_id = _line(trusted_reader, HOST_ID_PATH)
     if page_size is None:
         try:
             page_size = int(os.sysconf("SC_PAGESIZE"))
@@ -815,7 +871,7 @@ def inspect(
     _check_monotonic_counters(observations)
     return cj.Object(
         (
-            ("host_id", _line(reader, HOST_ID_PATH)),
+            ("host_id", host_id),
             (
                 "machine",
                 cj.Object(
@@ -835,7 +891,7 @@ def inspect(
             ),
             ("memory_bytes", memory),
             ("cpu_quota_milli", quota),
-            ("docker", _docker(reader, runner, hasher)),
+            ("docker", _docker(reader, runner, hasher, expected_client_hash)),
             ("observations", observations),
         )
     )

@@ -548,11 +548,11 @@ kernel、cgroup、Docker、load stateに依存してはならない。
 
 | Axis | Implementation / owner |
 |---|---|
-| Host identity | fixed machine identity、kernel、architecture、CPU vendor/family/model/stepping、microcode、online CPU set、NUMA set、physical memoryをno-follow/fixed sourceから読む。host IDとbenchmark CPU setは`/etc/align-evidence/host-id`と`/etc/align-evidence/benchmark-cpus`だけから読み、kernel sourceは`native_host.py`に固定した`/proc`/`/sys` pathとする。profile指定のx86_64 spellingだけをnormalizeし、missing、repeated、malformed、cross-architecture valueをrejectする。`benchmark_evidence_native_host_matrix`. |
+| Host identity | fixed machine identity、kernel、architecture、CPU vendor/family/model/stepping、microcode、online CPU set、NUMA set、physical memoryをno-follow/fixed sourceから読む。host IDとbenchmark CPU setはroot-ownedかつbenchmark accountからwrite不能な`/etc/align-evidence/host-id`と`/etc/align-evidence/benchmark-cpus`だけから読み、kernel sourceは`native_host.py`に固定した`/proc`/`/sys` pathとする。profile指定のx86_64 spellingだけをnormalizeし、missing、repeated、malformed、cross-architecture valueをrejectする。`benchmark_evidence_native_host_matrix`. |
 | CPU and quota boundary | host cgroup quotaを読みprofileのunquotaed valueを要求する。cgroup v2はunquotaedとして`cpu.max=max <positive-period>`だけを受け入れ、v1 fallbackはpositive periodと`cpu.cfs_quota_us=-1`だけを受け入れ、malformed、zero、positive quotaをrejectする。profile benchmark CPU setがonlineでcanonicalであること、NUMA setが存在することを要求し、alias、empty set、quota、migration、ARM/emulation identityをDocker前にrejectする。`benchmark_evidence_native_host_matrix`. |
-| Docker daemon identity | pinned Docker clientだけをfixed argv、empty environment、root-owned emptyな`/etc/align-evidence/docker-empty` config directory、explicitなlocal `unix:///var/run/docker.sock` endpoint、bounded stdout/stderr、no shell、timeoutでinvokeする。retained executable descriptorをhashし、同じdescriptor経由で両commandをexecuteする。client/daemon version、client bytes、daemon architecture、storage driver、cgroup version、OCI runtimeをexisting canonical orderでparseし、daemon unavailable、nonzero/truncated output、wrong architecture、profile mismatchをrejectする。`benchmark_evidence_native_host_matrix`; `benchmark_evidence_process_boundary_matrix`. |
+| Docker daemon identity | pinned Docker clientだけをfixed argv、empty environment、root-owned emptyな`/etc/align-evidence/docker-empty` config directory、explicitなlocal `unix:///var/run/docker.sock` endpoint、bounded stdout/stderr、no shell、timeoutでinvokeする。retained executable descriptorをhashしてprofileと比較し、どちらのcommandより前に一致を要求してから同じdescriptor経由で両commandをexecuteする。client/daemon version、client bytes、daemon architecture、storage driver、cgroup version、daemon-reported `RuncCommit.ID` runtime identityをexisting canonical orderでparseし、daemon unavailable、nonzero/truncated output、alias-only runtime data、wrong architecture、profile mismatchをrejectする。`benchmark_evidence_native_host_matrix`; `benchmark_evidence_process_boundary_matrix`. |
 | Qualification snapshots | `pre`、`between`、`post`のexact 3 snapshotでload、CPU/memory pressure、free memory、swap counterをcaptureする。integer parsingとfixed counter unitを使い、pressure/swap counterのresetをrejectし、profile limit/orderは`host.qualify`をone validation boundaryとして保つ。missing source、reset/overflow、invalid unit、extra phaseはrejectする。`benchmark_evidence_native_host_matrix`. |
-| Ownership and failure | adapterは自分がopenしたdescriptorとspawnしたchildだけをownし、leaderが終了した後もcomplete process groupへbounded TERM/KILL cleanupを行い、全pathでclose/reapする。host configurationやrepository stateをmutateせず、timeout、close/reap uncertainty、parser error、cleanup failureの後はqualified recordを返さない。`benchmark_evidence_native_host_matrix`. |
+| Ownership and failure | adapterは自分がopenしたdescriptorとspawnしたchildだけをownし、leaderが終了した後もcomplete process groupへbounded TERM/KILL cleanupを行い、`ESRCH`だけを既に消えたgroupとして扱い、全pathでclose/reapする。host configurationやrepository stateをmutateせず、timeout、close/reap uncertainty、parser error、cleanup failureの後はqualified recordを返さない。`benchmark_evidence_native_host_matrix`. |
 | Explicit deferrals | image self-inspection/toolchain reproduction、monitorのchild event stream、cryptographic key-process integration、provider/review API integration、performance measurement、merge verification、lifecycle advanceは後続capabilityとする。`benchmark_evidence_native_host_matrix`. |
 
 ## Native host review closure
@@ -578,6 +578,18 @@ kernel、cgroup、Docker、load stateに依存してはならない。
 | fixed Docker config directory自体をtrustしていなかった | validatorは`/`、`etc`、`align-evidence`、`docker-empty`をdescriptor-relativeな`O_DIRECTORY|O_NOFOLLOW` openで順にwalkし、全componentのroot ownershipとbenchmark accountからのwrite不能、およびfinal directoryがemptyであることを要求する。どちらのDocker childもspawnする前に検証し、ownerはno-follow flag、cleanup、ownership、permission、nonempty rejectを確認する。`benchmark_evidence_native_host_matrix`. |
 | spawn後のexceptionがchildまたはstreamをleakできた | selector作成、stream setup、nonblocking設定、buffer構築をouter cleanup guard内に置く。injected setup failureでdescendantを起動し、owned group全体がteardownされることを証明する。`benchmark_evidence_process_boundary_matrix`; `benchmark_evidence_native_host_matrix`. |
 | leaderをfinal group signal前にreapするとPGIDを再利用し得た | accepted Linux pathは`waitid(WNOWAIT)`でdirect childのexitをreapせず観測し、`SIGTERM`、non-reaping observe、`SIGKILL`、最後に`Popen.wait`の順で処理する。non-reaping waitを持たない環境はsuccessful commandがboundaryを越える前にfail closedする。ownerはTERM/observe/KILL/reap順をassertする。`benchmark_evidence_process_boundary_matrix`. |
+
+## Native host identity and cleanup review closure
+
+次の改訂候補reviewで、identityとfail-closed cleanupに関するactionable gapが4件見つかった。
+実装前にnative-host identity-and-cleanup axisのclosure matrixを再openした。accepted evidenceのclaimは変えない。
+
+| Finding | Ledger-first redesign / owner |
+|---|---|
+| Docker runtime identityが`DefaultRuntime` aliasだけだった | adapterはDocker infoの`RuncCommit` objectを要求し、daemon-reportedなruntime versionまたはcommit identityであるnon-empty `ID`を記録する。name-onlyの`DefaultRuntime` valueは受け入れない。`benchmark_evidence_native_host_matrix`. |
+| profile外のDocker clientがdaemonへ接続できた | retained executable hashをno-follow/trust check後に`profile.docker.client_sha256`と比較し、どちらのDocker childをspawnするより前に一致を要求する。ownerはmismatchがconfig/open/hashで止まりrunner eventを出さないことを証明する。`benchmark_evidence_native_host_matrix`. |
+| profile host fileをin-placeで変更できた | trusted source readerはfixedな`host-id`と`benchmark-cpus` descriptorがread前にregular、root-owned、benchmark accountからwrite不能であることを要求する。injected metadataでownershipとgroup/other writeをcoverする。`benchmark_evidence_native_host_matrix`. |
+| process-group signal failureを隠していた | cleanupは`ESRCH`だけをignoreし、それ以外のTERM/KILL failureをbest-effort cleanup後のnative acquisition errorにする。cleanup uncertaintyを越えてsuccessful commandやqualified recordを返さない。ownerは`EPERM`をinjectしてrejectを要求する。`benchmark_evidence_process_boundary_matrix`; `benchmark_evidence_native_host_matrix`. |
 
 ## Design-review finding closure
 

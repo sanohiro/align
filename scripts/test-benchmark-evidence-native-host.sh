@@ -74,7 +74,8 @@ DOCKER_VERSION = {
 DOCKER_INFO = {
     "Driver": "overlay2",
     "CgroupVersion": "2",
-    "DefaultRuntime": "runc-1.1.12",
+    "DefaultRuntime": "runc",
+    "RuncCommit": {"ID": "runc-1.1.12"},
 }
 
 FILES = {
@@ -227,6 +228,27 @@ expect_error(
     ),
     "benchmark-account unwritable",
 )
+native_host._validate_source_metadata(
+    SimpleNamespace(st_mode=native_host.stat.S_IFREG | 0o644, st_uid=0),
+    native_host.HOST_ID_PATH,
+    require_trusted=True,
+)
+expect_error(
+    lambda: native_host._validate_source_metadata(
+        SimpleNamespace(st_mode=native_host.stat.S_IFREG | 0o644, st_uid=1000),
+        native_host.HOST_ID_PATH,
+        require_trusted=True,
+    ),
+    "root-owned",
+)
+expect_error(
+    lambda: native_host._validate_source_metadata(
+        SimpleNamespace(st_mode=native_host.stat.S_IFREG | 0o664, st_uid=0),
+        native_host.BENCHMARK_CPU_SET_PATH,
+        require_trusted=True,
+    ),
+    "benchmark-account unwritable",
+)
 
 docker_pair_events = []
 original_validate_config = native_host._validate_docker_config_dir
@@ -259,15 +281,22 @@ native_host._hash_fd = fake_hash_fd
 native_host._run_command = fake_run_command
 try:
     pair = native_host.run_docker_pair()
+    pair_events = list(docker_pair_events)
+    docker_pair_events.clear()
+    expect_error(
+        lambda: native_host.run_docker_pair(expected_client_hash="1" * 64),
+        "before Docker execution",
+    )
+    assert [event[0] for event in docker_pair_events] == ["config", "open", "hash"]
 finally:
     native_host._validate_docker_config_dir = original_validate_config
     native_host._open_executable = original_open_executable
     native_host._hash_fd = original_hash_fd
     native_host._run_command = original_run_command
 assert pair == (b"version", b"info", H64)
-assert [event[0] for event in docker_pair_events] == ["config", "open", "hash", "run", "run"]
-assert docker_pair_events[3][2] == docker_pair_events[1][1]
-assert docker_pair_events[4][2] == docker_pair_events[1][1]
+assert [event[0] for event in pair_events] == ["config", "open", "hash", "run", "run"]
+assert pair_events[3][2] == pair_events[1][1]
+assert pair_events[4][2] == pair_events[1][1]
 
 inspection = native_host.inspect(
     PROFILE,
@@ -338,6 +367,18 @@ expect_error(
 expect_error(
     lambda: qualify_with(runner_value=lambda _argv: b'{"Client":{"Version":"26.1.4"},"Client":{"Version":"26.1.4"}}'),
     "duplicate object member",
+)
+
+
+def missing_runtime_runner(argv):
+    if argv == native_host.DOCKER_VERSION_ARGV:
+        return json.dumps(DOCKER_VERSION, separators=(",", ":")).encode("utf-8")
+    return b'{"Driver":"overlay2","CgroupVersion":"2","DefaultRuntime":"runc"}'
+
+
+expect_error(
+    lambda: qualify_with(runner_value=missing_runtime_runner),
+    "RuncCommit",
 )
 expect_error(
     lambda: qualify_with(reader_value=with_file(native_host.CPU_PRESSURE_PATH, b"full total=1\n")),
@@ -532,6 +573,25 @@ assert cleanup_events[0] == ("kill", 123, native_host.signal.SIGTERM)
 assert cleanup_events[1] == ("waitid",)
 assert cleanup_events[2] == ("kill", 123, native_host.signal.SIGKILL)
 assert cleanup_events[3][0] == "wait"
+
+original_killpg = native_host.os.killpg
+original_waitid = native_host.os.waitid
+
+
+def denied_killpg(_pid, _signum):
+    raise OSError(native_host.errno.EPERM, "denied")
+
+
+native_host.os.killpg = denied_killpg
+native_host.os.waitid = fake_waitid
+try:
+    expect_error(
+        lambda: native_host._stop_process(FakeProcess()),
+        "process-group signal failed",
+    )
+finally:
+    native_host.os.killpg = original_killpg
+    native_host.os.waitid = original_waitid
 
 print("native host qualification checks passed")
 PY
