@@ -570,16 +570,16 @@ def rejected(label, action):
     raise AssertionError(f"{label} was accepted")
 
 
-preimage_lengths = []
+message_lengths = []
 verified = verifier.verify_artifact(
     ARTIFACT,
-    lambda preimage, signature: (preimage_lengths.append(len(preimage)) or True),
+    lambda message, signature: (message_lengths.append(len(message)) or True),
 )
 assert verified.baseline == B
 assert verified.candidate == C
 assert verified.profile_sha256 == PROFILE
 assert verified.review_attestation.review_id == 42
-assert preimage_lengths == [len(sshsig.signing_preimage(REPORT, sshsig.REPORT_NAMESPACE))]
+assert message_lengths == [len(REPORT)]
 assert PRODUCED_VERIFIED.baseline == B
 assert PRODUCED_VERIFIED.candidate == C
 assert PRODUCED_VERIFIED.verdict == "pass"

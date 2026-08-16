@@ -82,7 +82,8 @@ canonical profile `bench/json_escape/evidence/linux-x86_64-v1.json` は以下を
   cgroup parent、runtime identity。
 - image registry digest、local image/config digest、`linux/amd64`、Python/Git/Cargo/rustc/LLVM/CC/linker/
   `ssh-keygen` version/hash。
-- read-only Cargo home/cache manifest、fixed Cargo config、capture ceiling、phase timeout、public key/fingerprint。
+- read-only Cargo home/cache manifest、fixed Cargo config、capture ceiling、phase timeout、public key/fingerprint、
+  cleanup後だけ使うhost-side `ssh-keygen` version/executable SHA-256。
 - threshold `105/100`、warm-up `1`、pair `10`、benchmark/field inventory。
 
 mutable tag、wildcard、caller override、optional identity、secret はない。変更は新しい reviewed profile ID。
@@ -402,8 +403,9 @@ version 1、profile Ed25519 public-key blob、exact namespace、empty reserved�
 signing preimageはexact magic `SSHSIG`、SSH string namespace、empty reserved、SSH string `sha512`、complete
 canonical message bytesの64-byte SHA-512を持つSSH string。report/merge namespaceはそれぞれ
 `align-json-escape-benchmark-evidence-v1` / `align-json-escape-benchmark-merge-verification-v1`。
-armor/binary field/lengthをdecode・canonical re-encode equality後のみpinned `ssh-keygen -Y sign/verify`。
-signature SHA-256はfinal LF込みcomplete armorをhash。
+armor/binary field/lengthをdecode・canonical re-encode equality後のみpinned `ssh-keygen -Y sign/verify`を呼ぶ。
+native process adapterはalready-derived preimageではなくfixed fileまたはstdin boundaryからcomplete canonical messageを渡す。
+OpenSSH自身がpreimageを一度だけderiveするためである。signature SHA-256はfinal LF込みcomplete armorをhash。
 
 producerはBody encode→domain hash→Report encode→duplicate-reject parse/re-encode equality後にsign。run-side verifierは
 PR inputなしでreport-only bindingとsignatureをcheckする。post-PR verifierはtrusted PR bodyとreview attestationを受けてから
@@ -677,6 +679,43 @@ axisのclosure matrixを再openした。
 | CPU source and joins | CPU identity construction前に全processor recordをparseし、benchmark CPU setでselectし、selected record全てをvalidateし、既存machine schemaには一つのcanonical selected recordだけを残す。heterogeneous first/non-first/missing/duplicate processorはDocker command前にrejectする。 |
 | Failure and cleanup | nonblocking special-file openはread/stat-dependent work前にrejectし、既存descriptor/child cleanupは保持する。FIFO ownerはalarm依存のhangなしにsource/executable pathをcoverする。 |
 | Mirrors and acceptance | English/Japanese public/profile prose、profile/host/container/native-host owner、既存native review chainを一致させる。このcapabilityはimageをexecuteせず、final Request 7 evidenceをclaimしない。 |
+
+## Cryptographic key-process integration implementation closure
+
+このcapabilityはmerged済みのreport/signature framing、cleanup transaction、profile、native process
+boundaryをconsumeする。最初の実host-side cryptographic operationとして、pinned
+`ssh-keygen -Y sign` processがmeasurement resource release後だけadministrator-provisioned private
+keyをopenし、別のpinned `ssh-keygen -Y verify` processがprofile public keyに対してcomplete original
+messageをverifyする。private keyはcontainer mount、controller argument、benchmark child input、
+returned Python valueにならない。このsliceはsecret provisioning、workload、performance claim、
+provider merge verification、Request 7 language lifecycleを実行しない。
+
+### Public-contract ledger
+
+| Public surface | Exact contract、owner、acceptance |
+|---|---|
+| `profile.signing` | ordered objectは`key_type`、`public_key_base64`、`fingerprint`、`ssh_keygen_version`、`ssh_keygen_executable_sha256`。前3つはprofile Ed25519 key、後2つはimageの`toolchain.ssh_keygen`ではなく固定host executable `/usr/bin/ssh-keygen`をidentifyする。`profile.validate_profile`はmissing、extra、reordered、malformed、mismatchをrejectする。`benchmark_evidence_profile_matrix`、`scripts/test-benchmark-evidence-profile.sh`。 |
+| `native_signing.KeyProcessConfig` | host `ssh-keygen` executable SHA-256とcomplete SSH public-key blobだけを持つimmutable trusted state。`from_profile(profile)`はvalidated profile-shaped mappingだけを受け、exact 32 raw public-key bytesからblobを再構成し、derived OpenSSH `SHA256:` fingerprintが`profile.signing.fingerprint`と一致することを要求する。private-key bytesとcaller-selected pathは含まない。`benchmark_evidence_key_process_matrix`、`scripts/test-benchmark-evidence-key-process.sh`。 |
+| `native_signing.sign(config, message, cleanup_snapshot)` | final LFを含むcomplete canonical report/merge-verification bytes、declared namespace一つ、zero children/containers/mounts/fds/private directories、unchanged source/cache manifests、signing lock heldの`CleanupSnapshot`を受ける。fixed process成功後、embedded key/namespaceがconfigへdecodeできた場合のみcanonical SSHSIG armorを返す。message上限は64 MiB。validation、process、output、key mismatch、descriptor close、cleanup uncertaintyは`KeyProcessError`となりsignatureは返さない。`benchmark_evidence_key_process_matrix`、`scripts/test-benchmark-evidence-key-process.sh`。 |
+| `native_signing.verify(config, message, signature)` | complete original messageとdecoded/canonical SSHSIG recordを受ける。controller-owned private temporary filesだけを書き、profile public keyを含むallowed-signers recordでfixed verifierを呼び、exit zeroだけ`True`にする。framing、key、namespace、message、executable、timeout、nonzero、cleanup failureは成功verificationを作らない。private keyはopenしない。`benchmark_evidence_key_process_matrix`、`scripts/test-benchmark-evidence-key-process.sh`。 |
+| Fixed signer command | signingは`/usr/bin/ssh-keygen -Y sign -f /proc/self/fd/<key_fd> -n <namespace> <message_path>`だけでcaller optionなし。verificationは`/usr/bin/ssh-keygen -Y verify -f <allowed_signers_path> -I align-evidence -n <namespace> -s <signature_path>`だけで、complete original messageはone retained stdin descriptorから渡す。両方ともretained executable descriptor、profile hash、empty fixed environment、bounded output、no shell、new session、complete process-group cleanupを`native_host.run_pinned_commands`で使う。`benchmark_evidence_process_boundary_matrix`、`benchmark_evidence_key_process_matrix`。 |
+| Secret and temporary ownership | private keyは固定`/etc/align-evidence/signing-key`を`O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK`でopenし、regular root-ownedかつgroup/other permission bitsなしだけを受ける。temporary message/signature/allowed-signersはadministrator-created empty `/run/align-evidence/signing`、mode `0700`以下に置き、return前に全てremoveする。key descriptorはone signer processだけに渡し、signature parse前にcloseする。`benchmark_evidence_key_process_matrix`、`scripts/test-benchmark-evidence-key-process.sh`。 |
+| Verifier injection | `verifier.verify_produced_evidence`と`verify_artifact`はinjected checkerへcomplete report bytesとdecoded signatureを渡す。`sshsig.signing_preimage(report, namespace)`は渡さない。OpenSSHがoriginal messageを一度だけhashする必要があるためである。pure verifierはI/O-freeのまま、native adapterだけがprocessをownする。`benchmark_evidence_controller_verifier_matrix`、`scripts/test-benchmark-evidence-controller-verifier.sh`。 |
+| Prerequisite and non-claims | merged controller/verifier、profile、SSHSIG framing、cleanup、process boundaryが必要。administrator key provisioning、host self-qualification、benchmark、provider/review API、performance measurement、merge verification、language implementationは後続。benchmarkまたはwall-clock promiseはしない。`HANDOFF.md`、`../align-llm/docs/align-requests.md`。 |
+
+### Implementation closure matrix
+
+| Axis | Implementation closure and exact regression |
+|---|---|
+| Profile formation | host signer version/hash fieldをvalidateし、complete SSH public-key blobとfingerprintをderiveする。raw-key length、base64、algorithm、fingerprint、hash、order、extra-field mutationはfile open前にrejectする。`scripts/test-benchmark-evidence-profile.sh`、`scripts/test-benchmark-evidence-key-process.sh`。 |
+| Cleanup gate | private key open前にcomplete `CleanupSnapshot` proofを要求する。live child/container/mount/fd/private directory、source/cache変更、lock releaseはkey open/runner callなしでrejectする。`scripts/test-benchmark-evidence-key-process.sh`。 |
+| Key formation and ownership | fixed key pathをfinal component no-followでwalkし、regular root-owned、group/other permissionなしを要求する。one descriptorをretainし、success、process error、interrupt、parser error、cleanup error全pathでcloseする。key path replacement、symlink、directory、writable mode、non-root owner、close failure、duplicate openはrejectする。`scripts/test-benchmark-evidence-key-process.sh`、`benchmark_evidence_process_boundary_matrix`。 |
+| Signing construction | fixed namespaceと`/proc/self/fd/<key_fd>` argvだけをbuildし、process前にprofile executable hashへbindする。private message path、stdin/options/shellなし、candidate-controlled pathなし。exact argv、fd set、environment、output bound、command orderをassertする。`scripts/test-benchmark-evidence-key-process.sh`。 |
+| Signature join | bounded `.sig`一つをreadし、canonical armor/binary re-encode、profile public key、namespace、stdout/signature-path substitutionなしを要求する。wrong key/namespace、truncation、trailing、noncanonical armor、missing/oversized outputはreturn前にrejectする。`scripts/test-benchmark-evidence-key-process.sh`、`scripts/test-benchmark-evidence-signature.sh`。 |
+| Verification construction | profile public-key blobだけからfixed allowed-signers lineを作り、exact signature/message bytesを書き、fixed verifierを呼ぶ。exit zeroだけtrue。wrong message/key/namespace、signature mutation、signer identity、allowed-signers mutation、nonzero、timeout、output overflow、cleanup uncertaintyはverify不可。`scripts/test-benchmark-evidence-key-process.sh`。 |
+| Original-message handoff | pure verifier callback contractとowner expectationをderived-preimage bytesからcomplete report bytesへ変更する。fake checkerでexact bytesを記録し、native adapter ownerは同じmessageを一度だけsign/verifyする。`scripts/test-benchmark-evidence-controller-verifier.sh`、`scripts/test-benchmark-evidence-key-process.sh`。 |
+| Failure and cleanup | sign/verify全pathでkey/executable descriptor close、complete process group reap、message/signature/allowed-signers remove、private directory removeを行う。runner error、`BaseException`、timeout/nonzero、output overflow、path replacement、read/close/unlink/rmdir failure、second invocationをinjectし、uncertain cleanup境界をsignature/`True`が越えないことを確認する。`scripts/test-benchmark-evidence-key-process.sh`、`benchmark_evidence_process_boundary_matrix`。 |
+| Scope and mirrors | private key bytesはPython object、command argv、environment、container mount、report bytes、returned errorへ入らない。English/Japanese contract、profile order、verifier handoff、native adapter、ownerは同じconstantを使う。host provisioning/live qualificationは明示的に後続。`git diff --check`、`scripts/test-benchmark-evidence-key-process.sh`。 |
 
 ## Design-review finding closure
 

@@ -16,7 +16,8 @@ from scripts.benchmark_evidence import profile
 
 H64 = "0" * 64
 KEY = base64.b64encode(b"\x00" * 32).decode("ascii")
-FINGERPRINT = "SHA256:" + KEY.rstrip("=")
+KEY_BLOB = len(b"ssh-ed25519").to_bytes(4, "big") + b"ssh-ed25519" + len(b"\x00" * 32).to_bytes(4, "big") + b"\x00" * 32
+FINGERPRINT = "SHA256:" + base64.b64encode(hashlib.sha256(KEY_BLOB).digest()).decode("ascii").rstrip("=")
 
 
 def O(*pairs):
@@ -119,7 +120,13 @@ def valid_profile():
         ),
         (
             "signing",
-            O(("key_type", "ssh-ed25519"), ("public_key_base64", KEY), ("fingerprint", FINGERPRINT)),
+            O(
+                ("key_type", "ssh-ed25519"),
+                ("public_key_base64", KEY),
+                ("fingerprint", FINGERPRINT),
+                ("ssh_keygen_version", "OpenSSH_9.9"),
+                ("ssh_keygen_executable_sha256", H64),
+            ),
         ),
         (
             "schedule",
@@ -187,7 +194,11 @@ def main():
     rejected(update(value, ("observation_limits",), [*value["observation_limits"][1:], value["observation_limits"][0]]), "phase order")
     rejected(update(value, ("signing", "public_key_base64"), "not-base64"), "public_key_base64")
     rejected(update(value, ("signing", "fingerprint"), "SHA256:short"), "fingerprint")
+    rejected(update(value, ("signing", "fingerprint"), "SHA256:" + "A" * 43), "does not match public_key_base64")
     rejected(update(value, ("signing", "fingerprint"), None), "fingerprint")
+    rejected(update(value, ("signing", "ssh_keygen_version"), ""), "ssh_keygen_version")
+    rejected(update(value, ("signing", "ssh_keygen_executable_sha256"), "not-a-hash"), "ssh_keygen_executable_sha256")
+    rejected(update(value, ("signing", "ssh_keygen_executable_sha256"), None), "ssh_keygen_executable_sha256")
     rejected(update(value, ("toolchain", "git", "executable_sha256"), "g" * 64), "executable_sha256")
 
     reordered = O(*reversed(value.pairs))

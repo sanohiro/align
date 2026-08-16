@@ -1,8 +1,9 @@
 """Strict SSHSIG v1 framing for signed evidence artifacts.
 
 This module only handles the pinned OpenSSH SSHSIG bytes and signing preimage.
-Key management, ``ssh-keygen`` invocation, report semantics, and trust-policy
-decisions remain controller/verifier responsibilities.
+Key management and ``ssh-keygen`` invocation belong to the native signing
+adapter; report semantics and trust-policy decisions remain verifier
+responsibilities.
 """
 
 from __future__ import annotations

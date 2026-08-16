@@ -5,10 +5,12 @@ reads only bytes supplied by a trusted caller: a canonical report, its
 canonical SSHSIG armor, the trusted-base PR body, and the trusted review
 attestation.  It performs no repository, network, build, or output I/O.
 
-Cryptographic Ed25519 verification is an injected operation.  The later
-installed adapter owns the ``ssh-keygen``/key-process boundary; this module
-still fixes the exact SSHSIG namespace, key, and signing preimage before that
-operation is called.
+Cryptographic Ed25519 verification is an injected operation.  The installed
+adapter owns the ``ssh-keygen``/key-process boundary; this module still fixes
+the exact SSHSIG namespace and key before passing the complete original
+message to that operation.  The adapter must derive the SSHSIG preimage once,
+inside the pinned key process; passing an already-derived preimage would hash
+the message a second time.
 """
 
 from __future__ import annotations
@@ -659,7 +661,7 @@ def _verify_signature(
     except sshsig.SSHSigError as exc:
         raise VerificationError(f"signature framing rejected: {exc}") from exc
     try:
-        verified = signature_checker(sshsig.signing_preimage(report, sshsig.REPORT_NAMESPACE), signature)
+        verified = signature_checker(report, signature)
     except Exception as exc:
         raise VerificationError(f"cryptographic signature check failed: {exc}") from exc
     if verified is not True:

@@ -309,7 +309,7 @@ try:
     docker_pair_events.clear()
     expect_error(
         lambda: native_host.run_docker_pair(expected_client_hash="1" * 64),
-        "before Docker execution",
+        "before execution",
     )
     assert [event[0] for event in docker_pair_events] == ["config", "open", "hash"]
 finally:
