@@ -933,7 +933,7 @@ pub enum Rvalue {
     /// `json.decode` into struct `struct_id`: parse the `str` `input` and fill the `out`
     /// struct slot. Yields an `i32` status (0 = ok). codegen builds the field table (names,
     /// type tags, byte offsets) and calls the runtime parser.
-    JsonDecode { struct_id: u32, input: Operand, out: Slot },
+    JsonDecode { struct_id: u32, input: Operand, out: Slot, arena: Option<Operand> },
     /// `json.decode` into an owned `array<elem>` (MMv2 slice 8c): parse a JSON array of scalars
     /// and write the materialized `{ptr,len}` into the `out` slot. Yields an `i32` status
     /// (0 = ok). `elem` is the element scalar (its kind/width gives the runtime element tag).
@@ -946,7 +946,7 @@ pub enum Rvalue {
     /// into a freshly heap-allocated AoS and write the materialized `{ptr,len}` (len = element
     /// count) into the `out` slot. Yields an `i32` status (0 = ok). codegen builds the same field
     /// table as [`JsonDecode`] plus the element stride, and calls the runtime parser.
-    JsonDecodeStructArray { struct_id: u32, input: Operand, out: Slot },
+    JsonDecodeStructArray { struct_id: u32, input: Operand, out: Slot, arena: Option<Operand> },
     /// `json.decode` straight into a column-major `soa<Struct>` (the direct-fill rail): parse a JSON
     /// array of objects directly into arena-allocated columns — no AoS intermediate, no transpose —
     /// and write the soa `{ptr,len}` view (len = row count) into the `out` slot. Yields an `i32`
@@ -958,7 +958,7 @@ pub enum Rvalue {
     /// dispatch), write the payload into the `out` enum slot, and set the tag. Yields an `i32` status
     /// (0 = ok). codegen builds the [`JsonUnion`] descriptor (per-variant payload arms + the shape
     /// class → arm table).
-    JsonDecodeUnion { enum_id: u32, input: Operand, out: Slot },
+    JsonDecodeUnion { enum_id: u32, input: Operand, out: Slot, arena: Option<Operand> },
     /// `json.doc(input)` (J4): parse the `str` `input` into an arena-backed tape, writing the root
     /// `{tape,node}` handle into the `out` slot. Yields an `i32` status (0 = ok). `arena` is the
     /// enclosing arena handle the runtime bump-allocates the tape from. The tape is schema-unknown
@@ -12615,13 +12615,15 @@ fn donation_stages_ok(stages: &[hir::Stage]) -> bool {
 /// branch into `Ok(<struct>)` on status 0 or `Err(<code>)` otherwise, yielding the Result.
 /// `json.decode(input)` into a shape-directed union (`enum`) target → decode one value into an out
 /// enum slot via the runtime (status `i32`), then branch into `Ok(<enum>)` / `Err(<code>)`. Mirrors
-/// [`lower_json_decode`]; the decoded enum's `str` payloads are zero-copy views into the input.
+/// [`lower_json_decode`]; clean decoded enum `str` payloads borrow the input and selected escaped
+/// strings materialize in the enclosing arena.
 fn lower_json_decode_union(b: &mut Builder, enum_id: u32, input: &hir::Expr, result_ty: Ty) -> Operand {
     let ety = Ty::Enum(enum_id);
     let out = b.new_slot(ety);
     let inp = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
+    let arena = b.arenas.last().copied().map(Operand::Value);
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::JsonDecodeUnion { enum_id, input: inp, out }));
+    b.push(Stmt::Let(code, Rvalue::JsonDecodeUnion { enum_id, input: inp, out, arena }));
 
     let isok = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
@@ -12658,8 +12660,9 @@ fn lower_json_decode(b: &mut Builder, struct_id: u32, input: &hir::Expr, result_
     let sty = Ty::Struct(struct_id);
     let out = b.new_slot(sty);
     let inp = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
+    let arena = b.arenas.last().copied().map(Operand::Value);
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::JsonDecode { struct_id, input: inp, out }));
+    b.push(Stmt::Let(code, Rvalue::JsonDecode { struct_id, input: inp, out, arena }));
 
     let isok = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
@@ -14833,13 +14836,15 @@ fn lower_status_result(b: &mut Builder, code: ValueId, result_ty: Ty) -> Operand
 /// `json.decode(input)` into an owned `array<Struct>` (MMv2 slice 8d) → materialize the AoS into
 /// an out slot via the runtime parser (status `i32`), then branch `Ok(<array>)` / `Err(<code>)`.
 /// Mirrors [`lower_json_decode_array`]; the AoS buffer is heap-owned (the unwrapped local
-/// `Drop`-frees it), while its elements' `str` fields remain views into the input.
+/// `Drop`-frees it), while clean `str` fields view the input and selected escaped strings use the
+/// enclosing arena.
 fn lower_json_decode_struct_array(b: &mut Builder, struct_id: u32, input: &hir::Expr, result_ty: Ty) -> Operand {
     let arr_ty = Ty::DynStructArray(struct_id, Layout::Aos);
     let out = b.new_slot(arr_ty);
     let inp = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
+    let arena = b.arenas.last().copied().map(Operand::Value);
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::JsonDecodeStructArray { struct_id, input: inp, out }));
+    b.push(Stmt::Let(code, Rvalue::JsonDecodeStructArray { struct_id, input: inp, out, arena }));
 
     let isok = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));

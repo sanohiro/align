@@ -249,6 +249,10 @@ it explicit honors **Nothing hidden** (allocation is visible) and **Predictable 
 hardware-aligned choice: predictable allocation beats convenience, and an in-arena clone is a
 bump allocation, not a malloc cliff. (Convenience-first auto-copy was rejected for the same
 reason exceptions and GC were — it hides cost.)
+JSON follows the same boundary for escaped text: a clean token remains an input view, while a
+selected escaped token is decoded once into the caller's visible arena. The result therefore
+retains both input and arena provenance; a selected escape without an enclosing arena is an
+explicit decode error. Ignored tokens are still validated without a hidden proportional buffer.
 
 **Native state belongs behind one package-defined resource boundary.** A database connection,
 compiled regular expression, socket, process, and compression context are the same language

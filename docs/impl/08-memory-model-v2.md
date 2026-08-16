@@ -13,8 +13,9 @@ per-function return-borrow summaries. The settled library-boundary extension tha
 item and adds named destination regions/resources is §14; it is required but not yet implemented.
 
 It exists because the deferred "ideal forms" of M4 and M5 both rest on one foundation:
-- M5 `json.decode` for `str` / `array<T>` / nested fields → zero-copy views region-tied to
-  the input → **draft.md §19 runs in full** (true M5 completion).
+- M5 `json.decode` for clean `str` or string-bearing `array<T>` / nested fields → zero-copy views
+  region-tied to the input; selected escaped strings materialize once in the enclosing arena →
+  **draft.md §19 runs in full** (true M5 completion).
 - M4 carryover `where` / `scan` / `partition` / `sort` / `chunks` + array-valued results →
   built on owned, dynamic heap arrays with drop (materialization).
 
@@ -114,7 +115,8 @@ index/project an array-of-views  arr[i]   → region of the array's elements
 f(args)  returning a view                 → max region over the view-typed args it reborrows
 if/block/match yielding a view            → max region over the yielded branches
 struct literal { … }                      → max region over its fields  (Static if all owned/scalar)
-decoded str/array field                   → region of the decode input  (§9)
+decoded clean str/array field              → region of the decode input; escaped selected strings
+                                            → input + enclosing arena  (§9)
 ```
 
 \* Since 2026-07-15 an arena-free dynamic `template`/`json.encode` view is backed by a hidden scoped
@@ -280,10 +282,12 @@ land; no general generics are required for v2.
 
 ## 9. Zero-copy decode — borrow + explicit `.clone()` (locked)
 
-**Decision (locked):** a `json.decode`-d `str` / `array` / nested field is a **zero-copy
-view into the input buffer**, region-tied to the input (§3, §5). To make a decoded value
-outlive its input, the user **explicitly `.clone()`s** it. The compiler **never** silently
-inserts a copy on escape.
+**Decision (locked):** a clean `json.decode`-d `str` / `array` / nested field is a **zero-copy
+view into the input buffer**, region-tied to the input (§3, §5). A selected escaped string is
+decoded exactly once into the enclosing caller arena, so that result is tied to both input and
+arena; without an arena the decode reports an error. To make a clean decoded value outlive its
+input, the user **explicitly `.clone()`s** it. The compiler **never** silently inserts a copy on
+escape.
 
 Rationale (the four-way-alignment / hardware case):
 - The cache-friendly fast path — decode → process → discard, all over the input bytes with no
@@ -298,10 +302,10 @@ This **supersedes** the current draft.md §12 "Zero Copy" wording ("only when th
 escape is a decode buffer used"), which implied a compiler-inserted copy. §12 must be updated
 to the explicit-`.clone()` rule (§12 of this doc).
 
-`json.decode` then extends from "all-scalar flat struct" to: `str` fields (a `{ptr,len}` view
-into the input), `array<T>` fields (a length + a view/region over the input), and nested
-structs — each carrying the input's region. The §19 example (`array<User>` with a `str name`)
-runs by decoding inside the `arena {}` that holds the input, processing zero-copy, and only
+`json.decode` then extends from "all-scalar flat struct" to: clean `str` fields (a `{ptr,len}`
+view into the input), escaped selected `str` fields (an exact-size arena materialization),
+`array<T>` fields, and nested structs. The §19 example (`array<User>` with a `str name`) runs by
+decoding inside the `arena {}` that holds the input, processing clean values zero-copy, and only
 cloning anything that must outlive the arena.
 
 ---
@@ -393,10 +397,11 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
    policies remain follow-ups.
 6. **Zero-copy decode (str/array/nested).** Decoded views region-tied to the input; explicit
    `.clone()` to escape; **draft.md §19 runs in full** → M5 truly complete.
-   - **[done] 6a — `str` field decode.** `json.decode` now accepts `str` fields: each decodes
-     as a zero-copy `{ptr,len}` view into the input buffer (the runtime's `string()` already
-     borrows the input and rejects escapes, so its pointer is the content's absolute address;
-     codegen tags `str` fields `(3<<8)|16`). The decoded struct is **region-tied to its input**:
+   - **[done] 6a — `str` field decode.** `json.decode` now accepts `str` fields: clean strings
+     decode as zero-copy `{ptr,len}` views into the input buffer, while selected escaped strings
+     materialize once in the enclosing arena (the runtime's clean path still borrows the input;
+     the typed decode path validates and unescapes RFC 8259 escapes; codegen tags `str` fields
+     `(3<<8)|16`). The decoded struct is **region-tied to its input and, when needed, its arena**:
      `region_of(JsonDecode{input}) = region_of(input)` and `region_of(Try) = region_of(inner)`,
      so a view decoded from arena-allocated input cannot escape the arena (conservative — even a
      scalar-only struct is tied; decode from a `str` param/literal is Static, hence returnable,
@@ -533,12 +538,12 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
      `array<T>` (`Result<array<T>, Error>`, now representable thanks to 8b). New
      `ExprKind::JsonDecodeArray` + MIR `Rvalue::JsonDecodeArray` + runtime `align_rt_json_decode_array`,
      mirroring the struct-decode pattern (materialize into an out slot, branch `Ok(<array>)` /
-     `Err(<code>)`). The elements are **copied** into a fresh `malloc`'d buffer (not borrowed), so
-     the result is `Static`/returnable — *not* region-tied to the input (`region_of` leaves it at
-     the `Static` default; only the struct decode ties to its input for zero-copy `str` fields).
-     `check_json_decode` dispatches on the expected Ok scalar (`Struct` → object, `DynArray(prim)` →
-     array); int/float/bool elements only (a `str` element would be region-tied — deferred). Same
-     `(kind<<8)|width` element tag as struct fields. M5 cut: an empty array allocates nothing
+     `Err(<code>)`). Numeric elements are **copied** into a fresh `malloc`'d buffer (not borrowed),
+     so that scalar result is `Static`/returnable. Typed struct fields additionally admit
+     `array<str>`: clean elements borrow the input, while selected escaped elements materialize in
+     the enclosing arena, making the result region-tied to both sources. The arena-free top-level
+     scalar-array entry rejects selected escaped strings. Same `(kind<<8)|width` element tag as
+     struct fields, extended with the scalar element kind/width bits. M5 cut: an empty array allocates nothing
      (`{null,0}`). **Latent-bug fix surfaced here:** `null_moved_source` now sees through
      `Ok`/`Some`/`Err` wrappers, so `return Ok(xs)` of a *bound* owned local nulls its slot — else
      the local's exit `Drop` double-freed the buffer now owned by the returned aggregate (a slice-8a
@@ -551,10 +556,11 @@ Each slice is a vertical, test-backed PR; later slices depend on earlier ones.
      `ExprKind::JsonDecodeStructArray` + MIR `Rvalue::JsonDecodeStructArray` + runtime
      `align_rt_json_decode_struct_array` (parses a JSON array of objects, reusing the per-object
      `parse_object` helper factored out of the scalar struct decode, into a growing buffer then a
-     fresh `malloc`'d AoS). The buffer is owned, but each element's `str` fields are zero-copy
-     views into the input, so the array is **region-tied to the input** (`region_of` ties it like
-     the single-struct decode; `tracks_region` includes it) — a decoded array from an arena/param
-     input cannot escape that input (`.clone()` to escape — array clone is a later capability).
+     fresh `malloc`'d AoS). The buffer is owned, but each element's clean `str` fields borrow the
+     input and selected escaped strings materialize in the enclosing arena, so the array is
+     **region-tied to the input and, when needed, the arena** (`region_of` ties it like the
+     single-struct decode; `tracks_region` includes it) — a decoded array cannot escape either
+     source (`.clone()` to escape — array clone is a later capability).
      `.len()` works; the buffer is `Drop`-freed at scope exit, and the `return Ok(bound)` slot-null
      (slice 8c) covers a bound struct array too. Empty `[]` → `{null,0}` (no alloc). Decode-side
      only this slice — **the `.where(.active).field.sum()` pipeline over a dynamic struct array is

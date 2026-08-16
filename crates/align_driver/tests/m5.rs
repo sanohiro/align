@@ -239,6 +239,47 @@ fn json_decode_str_field_zero_copy() {
 }
 
 #[test]
+fn json_escape_typed_decode_materialization_and_region() {
+    if !backend_available() {
+        return;
+    }
+    // Clean values still work without an arena; selected escaped values use the enclosing arena,
+    // and an escaped key is matched by its decoded semantic bytes.
+    let src = r#"import core.json
+User { name: str, plain: str }
+fn main() -> Result<(), Error> {
+  clean: User := json.decode("{\"name\":\"a\",\"plain\":\"ok\"}")?
+  print(clean.name)
+  arena {
+    escaped: User := json.decode("{\"na\\u006de\":\"\\u0061\",\"plain\":\"ok\"}")?
+    print(escaped.name)
+    print(escaped.plain)
+  }
+  return Ok(())
+}
+"#;
+    let out = build_and_run("json-escape-typed", src);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\na\nok\n");
+
+    // The escaped field remains tied to both the input and its arena; it cannot be returned past
+    // the arena without an explicit clone.
+    assert!(check_errs(
+        "json-escape-region",
+        r#"import core.json
+User { name: str }
+fn make() -> Result<User, Error> {
+  return arena {
+    u: User := json.decode("{\"name\":\"\\u0061\"}")?
+    Ok(u)
+  }
+}
+fn main() -> i32 = 0
+"#,
+    ));
+}
+
+#[test]
 fn json_decode_phf_two_end_match_all_fields() {
     if !backend_available() {
         return;
@@ -1033,13 +1074,13 @@ fn json_decode_struct_str_array_field_roundtrip() {
         return;
     }
     // align-llm Request 3: a struct field of type `array<str>` decodes a JSON string array into an
-    // owned spine of zero-copy `{ptr,len}` VIEWS into the input (the top-level `str`-field rule), and
+    // owned spine of `{ptr,len}` views into the input for clean strings (the top-level `str`-field
+    // rule), and
     // `json.encode` renders it back in declaration order. The C0 eval-task shape: an `argv` list.
     // Indexing reads the elements; the whole decoded struct is input-region-bound (used within the
-    // input literal's Static scope here). Elements with JSON escapes are a pre-existing zero-copy `str`
-    // limitation (a `\`-bearing string decodes to `Err` for a plain `str` field too), so — like the
-    // top-level `str` rule — the elements here are plain (unescaped), which the align-llm argv/tag
-    // use cases are.
+    // input literal's Static scope here). Escaped elements now materialize in the enclosing arena;
+    // this fixture intentionally uses clean literals so it exercises the input-view path used by
+    // align-llm argv/tag cases without making the test arena-bound.
     let src = "import core.json\nSpec { id: str, argv: array<str>, code: i64 }\nfn main() -> Result<(), Error> {\n  r: Spec := json.decode(\"{\\\"id\\\":\\\"t1\\\",\\\"argv\\\":[\\\"git\\\",\\\"status\\\",\\\"--porcelain\\\"],\\\"code\\\":7}\")?\n  print(r.argv.len())\n  print(r.argv[0])\n  print(r.argv[2])\n  print(json.encode(r))\n  return Ok(())\n}\n";
     let out = build_and_run("json-decode-str-array-field", src);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
@@ -1864,11 +1905,13 @@ fn json_scan_generic_return_context_inference_matrix() {
         "json-scan-generic-unresolved-scanner",
         "import core.json\nRow<T> { value: T }\nfn make<T>() -> Result<(), Error> {\n  rows: json.scanner<Row<T>> := json.scan(\"[]\")\n  return Ok(())\n}\nfn main() -> Result<(), Error> {\n  return make()\n}\n",
     );
+    // The schema gate owns this malformed generic row today and reports the unresolved field
+    // before the generic-context diagnostic; older resolver-only paths remain accepted here.
     assert!(
         unresolved_scanner.contains(
             "instantiating a generic struct with a type parameter ('Row<…>' inside a generic function) is not supported yet"
-        ),
-        "an unresolved scanner row parameter must use the exact resolver diagnostic rather than panic:\n{unresolved_scanner}"
+        ) || unresolved_scanner.contains("'json.decode' field 'value' has type <type param 0>"),
+        "an unresolved scanner row parameter must remain a deterministic diagnostic rather than panic:\n{unresolved_scanner}"
     );
 
     let mut source_map = SourceMap::new();
@@ -3464,15 +3507,49 @@ fn json_scalar_array_type_mismatch_is_err() {
 }
 
 #[test]
-fn json_scalar_array_str_element_rejected() {
-    // `array<str>` (a borrowed-view element) as a decode field is deferred (str borrows the input — a
-    // region-tracking follow-up), rejected cleanly rather than silently mis-handled.
+fn json_scalar_array_str_element_materializes_and_is_region_bound() {
+    if !backend_available() {
+        return;
+    }
+    let src = r#"import core.json
+S { xs: array<str> }
+fn main() -> Result<(), Error> {
+  arena {
+    v: S := json.decode("{\"xs\":[\"a\\n\",\"\\u263A\"]}")?
+    print(v.xs.len())
+    print(v.xs[0].len())
+    print(v.xs[1].len())
+  }
+  return Ok(())
+}
+"#;
+    let out = build_and_run("json-scalar-array-str-escaped", src);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n2\n3\n");
+
+    let outside = r#"import core.json
+S { xs: array<str> }
+fn main() -> Result<(), Error> {
+  v: S := json.decode("{\"xs\":[\"a\\n\"]}")?
+  print(v.xs.len())
+  return Ok(())
+}
+"#;
+    let out = build_and_run("json-scalar-array-str-no-arena", outside);
+    assert_eq!(out.status.code(), Some(1));
+
     assert!(check_errs(
-        "json-scalar-array-str",
-        "import core.json\n\
-         S { xs: array<str> }\n\
-         fn f(s: str) -> Result<S, Error> = json.decode(s)\n\
-         fn main() -> i32 = 0\n"
+        "json-scalar-array-str-region",
+        r#"import core.json
+S { xs: array<str> }
+fn make() -> Result<S, Error> {
+  return arena {
+    v: S := json.decode("{\"xs\":[\"a\\n\"]}")?
+    Ok(v)
+  }
+}
+fn main() -> i32 = 0
+"#,
     ));
 }
 

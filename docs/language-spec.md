@@ -491,7 +491,13 @@ exactly-once (a missing or duplicated declared field is an `Err`; undeclared key
 enforced on both the strict fallback and the Mison speculative fast path (a duplicate at an unqueried
 position is re-checked against the declared set and rejected). A struct field may itself be a
 `Struct` — `decode` recurses into the nested object and `encode` renders it back (a nested record
-round-trips; the strict contract recurses; nested `str` fields stay zero-copy views into the input).
+round-trips; the strict contract recurses; clean nested `str` fields stay zero-copy views into the input; selected escaped strings materialize in the enclosing arena).
+Every JSON string token, including ignored keys and values, follows the RFC 8259 escape grammar:
+`\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`, and `\uXXXX`. Raw C0 bytes,
+malformed escapes, lone or reversed surrogates, and invalid UTF-8 are decode errors. A clean selected
+string borrows the input; an escaped selected string is decoded once into the caller arena. A
+selected escaped string outside an arena is an error, while ignored escaped tokens are validated
+without a proportional scratch buffer.
 A field may also be an `Option<T>` (payload scalar/`str`/nested struct): missing key or JSON `null`
 → `None`, type mismatch → `Err`, present → `Some`; `encode` omits a `None` field entirely, so
 `decode(encode(x))` round-trips (a non-`Option` field still errors when missing). The same JSON field

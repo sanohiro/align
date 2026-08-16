@@ -800,11 +800,12 @@ later slices (struct arrays, M5 strings/JSON).
   error). M5 cut: a flat struct of `i64`/`i32`/`bool` fields.
 - [done] `json.decode` for `float` fields (scalars are copied into the struct — no borrow
   concern). Combined with int/bool, `json.decode` now covers **all scalar fields**.
-- [done, via Memory Model v2] `json.decode` for `str` fields (zero-copy `{ptr,len}` views
-  region-tied to the input), owned `array<scalar>`, and owned `array<Struct>` (AoS) — the last
-  is the `draft.md` §19 headline. Field tables are emitted as compile-time constant globals.
-  Still deferred: nested-struct fields and SIMD scan. (`<T>` generic-call syntax is not deferred
+- [done, via Memory Model v2 + Request 7] `json.decode` for clean `str` fields uses zero-copy `{ptr,len}` views region-tied to the input; selected escaped strings materialize exactly once in the enclosing arena and bind the result to input plus arena.
+  This also covers escaped keys/values, nested records, unions, AoS, and direct SoA fill; ignored tokens validate without proportional scratch allocation. Owned `array<scalar>` and `array<Struct>` remain the existing surfaces.
+  Field tables are emitted as compile-time constant globals. `json.scan` has no arena and rejects escaped declared strings; `json.doc` materializes escaped accessors in its existing arena.
+  Still deferred: SIMD scan. (`<T>` generic-call syntax is not deferred
   but **settled away** — the binding annotation infers the target through `?`; no turbofish.)
+- [done] Request 7 escaped JSON strings — RFC 8259 short/Unicode escapes and surrogate validation across typed decode, ignored tokens, union/AoS/SoA paths, `json.doc`, and scanner rejection; canonical fixture and nullable arena ABI are recorded in `impl/core-design/json.md`.
 - [done] owned `string` / `bytes` and the const string pool. The `html` / `raw` / JSON-template
   variants remain deferred; only plain `template "…"` is shipped.
 

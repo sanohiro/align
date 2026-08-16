@@ -1766,8 +1766,15 @@ user: User := json.decode(data)?
 
 ### Zero Copy
 
-A decoded `str` / `array` / nested field is a view into the input buffer (no allocation),
-region-tied to that input (see the memory model, §6, and `docs/impl/08-memory-model-v2.md`).
+A decoded clean `str` or string-bearing `array` / nested field remains a view into the input buffer
+(no allocation), region-tied to that input. Numeric scalar arrays are copied into their owned
+buffer. JSON string tokens accept the RFC 8259 escapes `\"`, `\\`, `\/`, `\b`,
+`\f`, `\n`, `\r`, `\t`, and `\uXXXX`; raw C0 bytes, malformed escapes, and invalid
+surrogate sequences are errors.
+A selected escaped `str` is materialized exactly once in the caller's enclosing arena and the
+decoded value is region-bounded by both input and arena. Outside an arena, a selected escaped string
+is a decode error; clean strings retain the input-view path. Ignored escaped keys and values are
+validated without proportional scratch allocation.
 
 To make a decoded value outlive its input, the user clones it explicitly:
 

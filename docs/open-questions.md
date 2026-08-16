@@ -522,7 +522,7 @@ Record: `draft.md` §18.2, `docs/impl/17-library-boundary-prerequisites.md` Am-v
 
 ### `str` I/O UTF-8 validation — SETTLED + BUILT (2026-07-04)
 **Decision: every I/O boundary that produces a `str`/`string` validates its bytes as UTF-8; invalid content fails rather than yielding a malformed `str`.** `draft.md` §7/§12 make "a `str` is always valid UTF-8" a load-bearing invariant (it lets `str` APIs — `chars`, slicing, `find`, display — assume well-formedness), but the M9 std.fs / core.json surfaces produced `str` values directly from raw file/mmap/JSON bytes **without checking**, so a binary file → a malformed `str` → broken invariant (external report, 2026-07-03).
-- **Fixed at every `str`-returning entry point:** `fs.read_file` (both the fast `read_exact` path and the copy fallback), `fs.read_file_view` (both the mmap path — validated before the view is registered on the arena, `munmap` on failure — and the arena-copy fallback), and `json.decode` (validate the **whole input once** at the head; a decoded `str` field is a zero-copy substring view into that input, so one pass covers every field — the same one-shot check simdjson does). Invalid → `Error.Invalid` for the `fs.*` errno-mapped surfaces; a decode error for `json.decode` (whose error channel is `Error.Code`).
+- **Fixed at every `str`-returning entry point:** `fs.read_file` (both the fast `read_exact` path and the copy fallback), `fs.read_file_view` (both the mmap path — validated before the view is registered on the arena, `munmap` on failure — and the arena-copy fallback), and `json.decode` (validate the **whole input once** at the head; clean decoded `str` fields are substring views into that input, while selected escaped fields are validated and materialized in the caller arena — the same one-shot check covers every field). Invalid → `Error.Invalid` for the `fs.*` errno-mapped surfaces; a decode error for `json.decode` (whose error channel is `Error.Code`).
 - **Binary is a separate path:** `bytes`/`buffer` carry no UTF-8 invariant, so binary reads use `reader.read(buffer)` — no validation, no change. Stated in `draft.md` §18.2.
 - **`read_dir` non-UTF-8 filenames** (the M9 known caveat): a name that is not valid UTF-8 cannot be a `string`, so the entry is **excluded** from the listing (not an error that fails the whole enumeration, and not lossy retention). Chosen because enumeration is a discovery tool and such a file is unreachable through a `str` path anyway; recorded so the shorter-than-on-disk count is intended, not a bug.
 - **Implementation:** Lemire's range/lookup UTF-8 validator (simdjson `utf8_lookup4`) as AVX2 / NEON / scalar paths, dispatched at runtime, differentially fuzzed against `std::str::from_utf8` (isolated continuations, truncated/overlong sequences, surrogates, out-of-range 4-byte leads, block-boundary straddling). Cost is memcpy-class: ~14.8 GB/s SIMD vs ~15.3 GB/s memcpy (97%), ~4× the scalar 3.7 GB/s — so the decode/read paths degrade a few % at most, and the SIMD path is the main one.
@@ -2192,7 +2192,7 @@ Record: `impl/04-mir.md` (CFG), `non-goals.md`.
   path-dependent runtime mode, but mutation requires a definite mode; Move-struct construction
   retains completed field owners through direct struct and fixed-array `let` paths too.
 - **Explicit `.clone()` over hidden copy-on-escape**: a zero-copy decoded view that must escape its input is cloned explicitly (Nothing hidden + Predictable performance; supersedes the old `draft.md` auto-buffer wording). An in-arena clone is a bump allocation, so escaping is not a sudden heap cost.
-- **`json.decode`**: `str` and `array<Struct>` decode are zero-copy views region-tied to the input (a struct's `str` fields borrow it); `array<scalar>` is copied into a fresh buffer (owned / `Static` / returnable, not region-tied). Together → **`draft.md` §19 runs end-to-end except the `fs`/`io` std boundary**.
+- **`json.decode`**: clean `str` and `array<Struct>` views remain region-tied to the input; selected escaped strings materialize in the enclosing arena and therefore bind the result to input plus arena. `array<scalar>` is copied into a fresh buffer (owned / `Static` / returnable, not region-tied).
 SSO is **not** adopted (its own Settled entry above). Element indexing is implemented: `recv[index]` (array/slice/owned array → scalar; **struct array → whole struct by value**, a Copy load region-tied to the array via `region_of`) and `arr[index].field` (a struct-array element's field), both bounds-checked. Since-implemented on separate tracks: tuples / multi-value returns → `partition`; `array<slice<T>>` → `chunks` (`Ty::DynSliceArray`); `out` params + the no-alias check. Still open: `array<Struct>.clone()`, and emitting LLVM `noalias` (below).
 Record: `impl/08-memory-model-v2.md` (full model + slice ledger §11), `design-notes.md` ("one region lattice, explicit copies"), `draft.md` §6/§7/§14, `impl/07-roadmap.md` (Memory Model v2 — DONE).
 
@@ -4597,6 +4597,19 @@ iff any payload is Move (`array<T>` payloads — drop switches on the tag and fr
 payload; MoveCheck/`null_moved_source`/`drop_struct_fields` grow enum arms; element restriction =
 Slice C's non-owned rule). The Gate-1 sibling-pass sweep applies in full.
 
+**JSON escaped strings — SETTLED + BUILT (2026-08-16).** Typed JSON accepts the RFC 8259 string
+grammar for every string token: declared and ignored keys and values, nested records, union payloads,
+and `json.doc`. The short escapes are `\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`, and
+`\uXXXX`; raw C0 bytes, malformed escapes, lone or reversed surrogates, and invalid UTF-8 are decode
+errors. A clean selected string remains an input view. A selected escaped string is decoded exactly
+once into the caller's enclosing arena; outside an arena it is an error. Ignored escaped tokens are
+validated and discarded without proportional scratch allocation. `json.scan` has no arena and rejects
+an escaped declared string; `json.doc` materializes escaped accessors in its existing arena. The
+nullable arena handle is the final argument of the record, AoS, and union typed decode ABIs; descriptor
+layouts and cache identity do not change. Exact-size bump allocation is arena-owned and never
+individually freed. The implementation source, closure matrix, and canonical fixture hash are in
+`impl/core-design/json.md`.
+
 **T2 — dynamic JSON: `json.doc`, a lazy document view (SETTLED — NOT a serde-style value tree).**
 A `serde_json::Value` heap tree (per-node allocation, pointer-chasing) contradicts Nothing hidden
 + data-oriented and would drag in recursive enums and a map type; rejected. Instead the simdjson
@@ -4809,7 +4822,9 @@ runtime loop (`ScalarArrayField` template piece → `align_rt_json_encode_scalar
 (`drop_struct_fields`'s `DynArray` arm on success; `drop_decoded_owned` kind-7 on the decode error path;
 `sub_owns_buffers` gained kind 7). The structural MIR fingerprint includes the element scalar, so an
 `array<i64>`→`array<f64>` change invalidates the cache; the human MIR type name remains element-aware
-for inspection. `array<str>` (borrowed element) / `array<char>` deferred. v1
+for inspection. `array<str>` fields are now shipped by Request 7: clean elements borrow the input
+and selected escaped elements materialize in the enclosing arena; a top-level `array<str>` target
+and `array<char>` remain deferred. v1
 limits: `.sum()`/pipelines over an owned scalar-array field and `json.encode` of a bare `array<scalar>`
 stay restricted. Tests: `m5.rs` T1b, `cache_codegen` gate2d, runtime alloc-count. **T1b (part 2) — SHIPPED: top-level (bare) scalar decode targets** (`x: i64 := json.decode("42")?` for
 int / float / bool). Parses the WHOLE input as one JSON number / bool; the value is `Copy` (copied out,

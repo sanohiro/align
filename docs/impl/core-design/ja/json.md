@@ -9,6 +9,60 @@
 
 JSON を型付き境界とスキーマ未知境界の両方で扱う（draft §14）。表面は、型付きの `encode` / `encode_bounded` / `decode`、遅延スキーマ未知ビューの `doc`、型付き行をストリーム処理する `scan` の5操作である。対象型と行型は **明示的な型引数ではなく型推論によって** 決定される（決定済: Align には式位置での型引数構文、つまり turbofish のような記法は存在しない）。使用には `import core.json` が必要である（capability-header のルールは `core.json` に対しても std モジュールと全く同様に適用される）。
 
+## エスケープ文字列（Request 7）
+
+型付き JSON は、宣言されたキー・未宣言キー、宣言された値・未宣言値、ネストした値、union payload、
+`\"`、`\\`、`\/`、`\b`、`\f`、`\n`、`\r`、`\t`、`\uXXXX`
+の escape を含む RFC 8259 の文字列文法を、すべての文字列 token で受理する。`\uXXXX` には正しい
+surrogate pair が必要で、結果は UTF-8 の意味上のバイト列になる。raw C0 byte、不正・途中で終わる escape、
+単独または逆順の surrogate、不正な UTF-8 は `Error.Code(1)`（`json.doc` では `Err`）になる。有効な
+`\u0000` は埋め込み NUL であり、native boundary の validator は必要な箇所でこれを拒否する責任を持つ。
+
+clean な文字列は従来どおり入力への zero-copy view のままである。選択された escaped string は caller の
+enclosing arena にちょうど一度だけ materialize され、バイト列は arena が所有する。decode された値の region
+は入力と arena の両方に束縛される。arena の外では、選択された escaped string は decode error になるが、
+clean string の入力 view は従来どおり利用できる。無視される escaped string と key も、比例する scratch
+allocation なしで文法検証して破棄する。`json.scan` は arena operand を持たないため、escaped な declared string
+は拒否する。`json.doc` は既に arena を所有しており、escaped な `as_str` / `key` をそこへ materialize する。
+
+runtime ABI では、materialize を行う3つの typed entrypoint の最後の引数に nullable arena handle を渡す。
+`null` は clean-view-only mode を表す。descriptor layout（`JsonField`、`JsonSubTable`、`JsonUnion`）は変更しない。
+
+| Entry point | 最終 ABI 引数 | Escape の動作 |
+| --- | --- | --- |
+| `align_rt_json_decode` | `arena: *mut Arena` | record と nested field を arena に materialize |
+| `align_rt_json_decode_struct_array` | `arena: *mut Arena` | 全 AoS row が caller arena を共有 |
+| `align_rt_json_decode_union` | `arena: *mut Arena` | string と object arm が caller arena を共有 |
+| `align_rt_json_decode_soa` | 既存の `arena: *mut Arena` | ABI は変更せず、escaped column を arena に materialize |
+| `align_rt_json_scan_next` | なし | escaped declared string を拒否し、hidden allocation もしない |
+
+arena allocation は exact-size の bump-only で、個別 free は行わない。semantic failure では arena 終了まで
+到達不能な bytes が残ることがあるが、partial result は publish せず、最初の parser error を保持する。hidden
+arena、process-global decoder state、descriptor field、persisted format、JSON の第二表現は導入しない。
+
+canonical design fixture は `bench/json_escape/fixtures/canonical.json`、SHA-256 は最終 LF を含めて
+`57fab88300c5522cd49dae7bafe7f90c29e077148cbd50ab6079e70446186321` である。escaped declared key、
+short/Unicode escape、surrogate pair、escaped ignored key/value、clean value、scalar field を含む。
+実装はこの fixture と malformed mutation に対して semantic record と error precedence を保つ。
+
+### Request 7 implementation closure matrix
+
+| Transition | Owner | Required regression |
+| --- | --- | --- |
+| 文字列文法、UTF-8、short escape、Unicode/surrogate、決定的な error order | shared runtime string-token decoder と `json.doc` parser | `align_runtime::tests::json_escape_string_grammar_matrix`、`align_runtime::tests::json_doc_top_level_scalar_and_escapes` |
+| clean view と一度の arena materialization、arena 外の拒否、embedded NUL | `JsonParser`、arena writer、`align_rt_json_decode` | `align_runtime::tests::json_escape_record_lifecycle`、`m5::json_escape_typed_decode_materialization_and_region`、`m5::json_scalar_array_str_element_materializes_and_is_region_bound` |
+| escaped semantic key、duplicate detection、ignored key/value validation | semantic key matcher、`parse_object`、structural prevalidation | `align_runtime::tests::json_escape_aos_path_equivalence`、`align_runtime::tests::json_escape_nonmaterializing_paths`、`align_runtime::tests::json_escape_string_grammar_matrix` |
+| slow record と nested record の成功/失敗、return、Drop | `parse_object`、`write_value`、Request 15 の decoded-owner cleanup | `m5::json_decode_encode_nested_struct_roundtrip`、`m5::json_option_move_struct_later_failure_cleans`、`align_runtime::tests::json_array_field_error_path_frees_buffer` |
+| AoS の slow/speculative/fallback 同値性と row cleanup | `json_speculate`、`json_fallback`、`align_rt_json_decode_struct_array` | `align_runtime::tests::json_escape_aos_path_equivalence`、`m5::json_decode_struct_array_malformed_errors`、`align_runtime::tests::json_array_field_error_path_frees_buffer` |
+| SoA の direct fill と arena cleanup | `align_rt_json_decode_soa`、`SoaDst` | `align_runtime::tests::json_escape_soa_path_equivalence` |
+| union と scanner の materialization 境界 | `decode_union_value`、`align_rt_json_scan_next` | `align_runtime::tests::json_escape_nonmaterializing_paths`、`m5::json_union_decode_by_shape_class`、`m5::json_scan_malformed_row_errors` |
+| HIR/MIR arena operand、region meet、descriptor/cache identity、ABI | sema storage/region analysis、MIR Rvalue、LLVM runtime registry | `m5::json_escape_typed_decode_materialization_and_region`、`cache_codegen::gate2b_json_decode_field_rename_invalidates`、`align_codegen_llvm::runtime_abi_extern_type_matrix_is_exact_for_every_row_and_ordinal` |
+| canonical fixture identity | checked-in fixture と runtime oracle | `align_runtime::tests::json_escape_record_lifecycle` が fixture bytes と semantic-output oracle を検証し、SHA-256 は上記に固定 |
+
+implementation PR を開く前に、author-side matrix-to-diff pass で全 applicable row を実装と focused
+owner test に対応付ける。benchmark-evidence document は別の trusted measurement boundary であり、この
+language/runtime contract を定義しない。
+
 ## Signatures (pending と明記したものを除き verified)
 
 ```text
@@ -20,9 +74,9 @@ json.decode(s)   -> Result<T, Error>         // T from the binding/context: u: U
 //   i64 / f64 / bool       (a BARE scalar — parses the whole input as one JSON number/bool; Copy → Static/returnable; T1b)
 //   struct                 (flat OR with nested-struct / Option<T> / array<Struct> / array<scalar> fields; field order free; unknown keys ignored)
 //   array<i64> / array<f64>
-//   array<Struct>          (AoS; str fields = zero-copy views into the input; nested-struct + Option fields recurse)
+//   array<Struct>          (AoS; clean str fields = zero-copy views into the input; escaped selected fields use the caller arena; nested-struct + Option fields recurse)
 //   soa<Struct>            (direct columnar decode — no AoS intermediate, no transpose;
-//                           inside arena {}; str columns borrow the input text; primitive/str columns only,
+//                           inside arena {}; clean str columns borrow the input text; escaped selected columns use the caller arena; primitive/str columns only,
 //                           NO nested columns — the owned-columns deferral stands)
 //   enum (union)           (shape-directed: a JSON oneOf → a sum type; the variant is selected by the
 //                           value's shape class — str/number/bool/object/array; O(1) first-byte dispatch;
@@ -99,11 +153,11 @@ decode + 使用する。bare `array<Move-struct>` の `json.encode` とそのフ
 **3=str**、bits 20-23）・width（bits **24-28** — 5 ビット。`str` 要素の `{ptr,len}` は幅 16 で元の 4 ビットに
 収まらないため）・sign（bit 16）をタグ上位ビットに詰めるので、1 つのタグが両方を運ぶ。decode:
 `decode_scalar_array_value` が共有の per-scalar `write_value` で JSON 配列を所有バッファにパースするので、scalar
-*フィールド*と同じ範囲/符号/float 幅チェックが要素ごとに適用される。**`str` 要素（kind 3, 幅 16）は入力への
-zero-copy な `{ptr,len}` ビューとして書き込まれる**（top-level `str` フィールドと同じルール）ので、所有スパインの
-各エントリは入力を借用する — decode された構造体全体は `region_of(JsonDecode) = region_of(input)` により既に
-入力 region に束縛されているため、新たな仕組みは不要。`.clone()` は入力を越えてコピーする。JSON エスケープを含む
-要素（`\`）は escaped `str` フィールドと同じ既存の zero-copy 制限（`Err` に decode）。encode: `ScalarArrayField`
+*フィールド*と同じ範囲/符号/float 幅チェックが要素ごとに適用される。**clean な `str` 要素（kind 3, 幅 16）は入力への
+zero-copy な `{ptr,len}` ビューとして書き込まれる**（top-level `str` フィールドと同じルール）。選択された escaped 要素は
+enclosing arena に exact-size materialize されるので、所有スパインの各エントリは入力または arena を借用する。decode
+結果は input/arena region に束縛され、`.clone()` はその寿命を越えてコピーする。arena がなければ escaped 要素は
+`Err` になる。encode: `ScalarArrayField`
 テンプレートピース → `json_encode_scalar_array` がバッファをループして `[e0,e1,…]` を出力（`str` 要素は quote +
 `write_json_str_body` エスケープでレンダリング）。drop: 所有スパインを flat free（scalar / `str`-view 要素は何も
 所有しない — ビューは誰も free せず入力を借用する）— 成功時は `drop_struct_fields` の `DynArray` アーム、decode
@@ -178,7 +232,7 @@ Pure（パース処理は純粋な計算であり、I/O は発生しない。バ
 
 ## Regions
 
-`region_of(decoded str view) = region_of(input)`、`region_of(soa columns) = enclosing arena`。所有権を持つ（owned な）配列は自由にエスケープできる。デコード済みのビューを、その入力データの寿命を超えてエスケープさせようとした場合は、エスケープの時点でコンパイルエラーとして捕捉される（保持し続けたい場合は `.clone()` でコピーを取り出す必要がある）。
+`region_of(clean decoded str view) = region_of(input)`、escaped な選択文字列は入力と enclosing arena の両方に束縛され、`region_of(soa columns) = enclosing arena` となる。要素がすべて owned な配列だけは自由にエスケープできる。デコード済みのビューを入力または arena の寿命を超えてエスケープさせようとした場合は、エスケープの時点でコンパイルエラーとして捕捉される（保持し続けたい場合は `.clone()` でコピーを取り出す必要がある）。
 
 ## 完全対応の実装状況と残る境界
 

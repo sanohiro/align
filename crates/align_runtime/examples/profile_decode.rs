@@ -102,6 +102,7 @@ fn main() {
                 phf.as_ptr(),
                 phf.len() as i64,
                 seed as i64,
+                core::ptr::null_mut(),
             )
         };
         assert_eq!(rc, 0, "decode failed");
