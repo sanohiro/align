@@ -188,6 +188,8 @@ def _run_command(
     timeout_seconds: float = _COMMAND_TIMEOUT_SECONDS,
     output_limit: int = _MAX_COMMAND_OUTPUT,
     executable_fd: int | None = None,
+    extra_fds: Sequence[int] = (),
+    stdin_fd: int | None = None,
 ) -> bytes:
     """Run one fixed command with an empty environment and bounded output."""
 
@@ -202,16 +204,33 @@ def _run_command(
         _error("trusted command output limit must be positive")
     if executable_fd is not None and (type(executable_fd) is not int or executable_fd < 0):
         _error("trusted executable descriptor is invalid")
+    if not isinstance(extra_fds, (tuple, list)):
+        _error("trusted inherited descriptors must be a sequence")
+    inherited_fds = tuple(extra_fds)
+    if any(type(fd) is not int or fd < 0 for fd in inherited_fds):
+        _error("trusted inherited descriptor is invalid")
+    if len(set(inherited_fds)) != len(inherited_fds):
+        _error("trusted inherited descriptors must be unique")
+    if executable_fd is not None and executable_fd in inherited_fds:
+        _error("trusted executable descriptor is duplicated")
+    if stdin_fd is not None and (type(stdin_fd) is not int or stdin_fd < 0):
+        _error("trusted stdin descriptor is invalid")
+    if stdin_fd is not None and (
+        stdin_fd == executable_fd or stdin_fd in inherited_fds
+    ):
+        _error("trusted stdin descriptor is duplicated")
     command_to_run = command
     pass_fds: tuple[int, ...] = ()
     if executable_fd is not None:
         command_to_run = (f"/proc/self/fd/{executable_fd}", *command[1:])
-        pass_fds = (executable_fd,)
+        pass_fds = (executable_fd, *inherited_fds)
+    elif inherited_fds:
+        pass_fds = inherited_fds
 
     try:
         process = subprocess.Popen(
             command_to_run,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL if stdin_fd is None else stdin_fd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=dict(_FIXED_ENV),
@@ -502,42 +521,81 @@ def run_docker_pair(
     return version, info, client_hash
 
 
+def run_pinned_commands(
+    executable: str,
+    commands: Sequence[Sequence[str]],
+    expected_executable_hash: str | None = None,
+    *,
+    between: PhaseHook | None = None,
+    extra_fds: Sequence[int] = (),
+    stdin_fd: int | None = None,
+) -> tuple[tuple[bytes, ...], str]:
+    """Run fixed commands through one retained executable descriptor.
+
+    The returned bytes stay bounded by :func:`_run_command`.  ``between`` runs
+    only between commands, after the preceding process has been fully reaped.
+    """
+
+    _validate_argv((executable,))
+    if expected_executable_hash is not None:
+        expected_executable_hash = _client_hash(
+            expected_executable_hash,
+            "profile executable digest",
+        )
+    if not isinstance(commands, (tuple, list)) or not commands:
+        _error("pinned command sequence must be non-empty")
+    command_sequence = tuple(_validate_argv(command) for command in commands)
+    if any(command[0] != executable for command in command_sequence):
+        _error("pinned command sequence must use the selected executable")
+    if not isinstance(extra_fds, (tuple, list)):
+        _error("pinned inherited descriptors must be a sequence")
+    inherited_fds = tuple(extra_fds)
+    if any(type(fd) is not int or fd < 0 for fd in inherited_fds):
+        _error("pinned inherited descriptor is invalid")
+    if len(set(inherited_fds)) != len(inherited_fds):
+        _error("pinned inherited descriptors must be unique")
+    if stdin_fd is not None and (type(stdin_fd) is not int or stdin_fd < 0):
+        _error("pinned stdin descriptor is invalid")
+    if stdin_fd is not None and stdin_fd in inherited_fds:
+        _error("pinned stdin descriptor is duplicated")
+    fd = _open_executable(executable)
+    try:
+        executable_hash = _hash_fd(fd, executable)
+        if expected_executable_hash is not None and executable_hash != expected_executable_hash:
+            _error("pinned executable digest does not match profile before execution")
+        outputs: list[bytes] = []
+        for index, command in enumerate(command_sequence):
+            run_kwargs: dict[str, Any] = {"executable_fd": fd}
+            if inherited_fds:
+                run_kwargs["extra_fds"] = inherited_fds
+            if stdin_fd is not None:
+                run_kwargs["stdin_fd"] = stdin_fd
+            outputs.append(_run_command(command, **run_kwargs))
+            if between is not None and index + 1 < len(command_sequence):
+                between()
+        return tuple(outputs), executable_hash
+    finally:
+        try:
+            os.close(fd)
+        except OSError as exc:
+            raise NativeHostError(f"native executable close failed: {executable}") from exc
+
+
 def run_docker_commands(
     commands: Sequence[Sequence[str]],
     expected_client_hash: str | None = None,
     *,
     between: PhaseHook | None = None,
 ) -> tuple[tuple[bytes, ...], str]:
-    """Run fixed Docker commands through one retained executable descriptor.
+    """Run fixed Docker commands through one retained executable descriptor."""
 
-    The returned bytes stay bounded by :func:`_run_command`.  ``between`` runs
-    only between commands, after the preceding process has been fully reaped.
-    """
-
-    if expected_client_hash is not None:
-        expected_client_hash = _client_hash(expected_client_hash, "profile Docker client digest")
-    if not isinstance(commands, (tuple, list)) or not commands:
-        _error("Docker command sequence must be non-empty")
-    command_sequence = tuple(_validate_argv(command) for command in commands)
-    if any(command[0] != DOCKER for command in command_sequence):
-        _error("Docker command sequence must use the pinned Docker executable")
     _validate_docker_config_dir()
-    fd = _open_executable(DOCKER)
-    try:
-        client_hash = _hash_fd(fd, DOCKER)
-        if expected_client_hash is not None and client_hash != expected_client_hash:
-            _error("Docker client digest does not match profile before Docker execution")
-        outputs: list[bytes] = []
-        for index, command in enumerate(command_sequence):
-            outputs.append(_run_command(command, executable_fd=fd))
-            if between is not None and index + 1 < len(command_sequence):
-                between()
-        return tuple(outputs), client_hash
-    finally:
-        try:
-            os.close(fd)
-        except OSError as exc:
-            raise NativeHostError(f"native executable close failed: {DOCKER}") from exc
+    return run_pinned_commands(
+        DOCKER,
+        commands,
+        expected_client_hash,
+        between=between,
+    )
 
 
 def _text(reader: Reader, path: str) -> str:

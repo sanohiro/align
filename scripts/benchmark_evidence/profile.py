@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import os
 import re
 from typing import Any, Sequence
@@ -105,7 +106,13 @@ _TOOLCHAIN_KEYS = (
 )
 _CAPTURE_KEYS = ("stdout_max_bytes", "stderr_max_bytes", "stderr_tail_max_bytes")
 _TIMEOUT_KEYS = ("prepare_ns", "warmup_ns", "sample_ns", "monitor_ns", "cleanup_ns")
-_SIGNING_KEYS = ("key_type", "public_key_base64", "fingerprint")
+_SIGNING_KEYS = (
+    "key_type",
+    "public_key_base64",
+    "fingerprint",
+    "ssh_keygen_version",
+    "ssh_keygen_executable_sha256",
+)
 _SCHEDULE_KEYS = (
     "threshold_numerator",
     "threshold_denominator",
@@ -251,7 +258,18 @@ def _validate_signing(value: Any) -> cj.Object:
         raise ProfileError("signing.public_key_base64 is not valid base64") from exc
     if len(decoded) != 32:
         _error("signing.public_key_base64", "must decode to 32 bytes")
-    _string(obj["fingerprint"], _FINGERPRINT, "signing.fingerprint")
+    fingerprint = _string(obj["fingerprint"], _FINGERPRINT, "signing.fingerprint")
+    public_key_blob = (
+        len(b"ssh-ed25519").to_bytes(4, "big")
+        + b"ssh-ed25519"
+        + len(decoded).to_bytes(4, "big")
+        + decoded
+    )
+    expected_fingerprint = "SHA256:" + base64.b64encode(hashlib.sha256(public_key_blob).digest()).decode("ascii").rstrip("=")
+    if fingerprint != expected_fingerprint:
+        _error("signing.fingerprint", "does not match public_key_base64")
+    _string(obj["ssh_keygen_version"], _NAME, "signing.ssh_keygen_version")
+    _hash(obj["ssh_keygen_executable_sha256"], "signing.ssh_keygen_executable_sha256")
     return obj
 
 

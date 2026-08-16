@@ -96,7 +96,8 @@ The implementation adds canonical profile
 - image registry digest, local image ID/config digest, `linux/amd64` platform, and hashes/versions of
   Python, Git, Cargo, rustc, LLVM, C compiler, linker, and `ssh-keygen`;
 - SHA-256 of the read-only Cargo home/cache manifest and fixed Cargo configuration;
-- capture ceilings, phase timeouts, public Ed25519 key/fingerprint; and
+- capture ceilings, phase timeouts, the public Ed25519 key/fingerprint, and the
+  host-side `ssh-keygen` version and executable SHA-256 used only after cleanup; and
 - fixed threshold `105/100`, warm-up count `1`, pair count `10`, benchmark and field inventory.
 
 The profile has no mutable tag, wildcard version, caller override, optional identity, or secret.
@@ -535,8 +536,10 @@ canonical message bytes. Report and merge-verification namespaces are respective
 `align-json-escape-benchmark-evidence-v1` and
 `align-json-escape-benchmark-merge-verification-v1`. The producer/verifier decode the armor, enforce
 every binary field and length, re-encode to identical armor bytes, and only then invoke the pinned
-`ssh-keygen -Y sign/verify` implementation. Signature SHA-256 fields hash the complete canonical
-armor including its final LF.
+`ssh-keygen -Y sign/verify` implementation. The native process adapter gives `ssh-keygen` the
+complete canonical message through its fixed file or stdin boundary; it does not pass the
+already-derived preimage, because OpenSSH derives the SSHSIG preimage internally. Signature
+SHA-256 fields hash the complete canonical armor including its final LF.
 
 The producer encodes `Body`, computes that domain-separated digest, encodes `Report`, reparses with
 duplicate rejection, re-encodes, and requires byte identity before signing. The run-side verifier
@@ -865,6 +868,44 @@ The public/profile ledger for this redesign is:
 | CPU source and joins | Parse all processor records before CPU identity construction; select by benchmark CPU set, validate every selected record, and retain one canonical selected record for the existing machine schema. Heterogeneous first/non-first/missing/duplicate processor cases reject before Docker commands. |
 | Failure and cleanup | Nonblocking special-file opens reject before read/stat-dependent work; existing descriptor and child cleanup remains unchanged. FIFO owners cover source and executable paths without an alarm-dependent hang. |
 | Mirrors and acceptance | English and Japanese public/profile prose, profile/host/container/native-host owners, and the existing native review chain agree. This capability still does not execute an image or claim final Request 7 evidence. |
+
+## Cryptographic key-process integration implementation closure
+
+This capability consumes the merged report/signature framing, cleanup transaction, profile, and native
+process boundary. It supplies the first real host-side cryptographic operation: a pinned
+`ssh-keygen -Y sign` process opens the administrator-provisioned private key only after the
+measurement resources have been released, while a separate pinned `ssh-keygen -Y verify` process
+checks the complete original message against the profile public key. The private key is never a
+container mount, controller argument, child benchmark input, or returned Python value. This slice
+does not provision the secret, run the workload, make a performance claim, verify a provider merge,
+or advance Request 7's language lifecycle.
+
+### Public-contract ledger
+
+| Public surface | Exact contract, owner, and acceptance |
+|---|---|
+| `profile.signing` | The ordered object is `key_type`, `public_key_base64`, `fingerprint`, `ssh_keygen_version`, and `ssh_keygen_executable_sha256`. The first three identify the profile Ed25519 key; the last two identify the fixed host executable `/usr/bin/ssh-keygen`, not the image's `toolchain.ssh_keygen`. `profile.validate_profile` rejects missing, extra, reordered, malformed, or mismatched scalar values. `benchmark_evidence_profile_matrix`; `scripts/test-benchmark-evidence-profile.sh`. |
+| `native_signing.KeyProcessConfig` | Immutable trusted state containing the host `ssh-keygen` executable SHA-256 and the complete SSH public-key blob. `from_profile(profile)` accepts only a validated profile-shaped mapping, reconstructs the blob from the exact 32 raw public-key bytes, and requires its derived OpenSSH `SHA256:` fingerprint to equal `profile.signing.fingerprint`. It contains no private-key bytes or caller-selected paths. `benchmark_evidence_key_process_matrix`; `scripts/test-benchmark-evidence-key-process.sh`. |
+| `native_signing.sign(config, message, cleanup_snapshot)` | Accepts complete canonical report or merge-verification bytes, including their final LF, one declared namespace, and a `CleanupSnapshot` with zero children/containers/mounts/fds/private directories, unchanged source/cache manifests, and the signing lock held. It returns canonical SSHSIG armor only after the fixed process exits successfully and the embedded key/namespace decode back to the config. Message size is capped at 64 MiB. Any validation, process, output, key mismatch, descriptor-close, or cleanup uncertainty raises `KeyProcessError` and returns no signature. `benchmark_evidence_key_process_matrix`; `scripts/test-benchmark-evidence-key-process.sh`. |
+| `native_signing.verify(config, message, signature)` | Accepts the complete original message and one decoded/canonical SSHSIG record. It writes only controller-owned private temporary files, invokes the fixed verifier with an allowed-signers record containing the profile public key, and returns `True` only for exit zero. Framing, key, namespace, message, executable, timeout, nonzero, and cleanup failures never produce a successful verification. It does not open the private key. `benchmark_evidence_key_process_matrix`; `scripts/test-benchmark-evidence-key-process.sh`. |
+| Fixed signer command | The only signing command is `/usr/bin/ssh-keygen -Y sign -f /proc/self/fd/<key_fd> -n <namespace> <message_path>`, with no caller options. The only verification command is `/usr/bin/ssh-keygen -Y verify -f <allowed_signers_path> -I align-evidence -n <namespace> -s <signature_path>`, with the complete original message supplied through one retained stdin descriptor. Both use the retained executable descriptor, profile hash, empty fixed environment, bounded output, no shell, a new session, and complete process-group cleanup through `native_host.run_pinned_commands`. `benchmark_evidence_process_boundary_matrix`; `benchmark_evidence_key_process_matrix`. |
+| Secret and temporary ownership | The private key is fixed at `/etc/align-evidence/signing-key`, opened with `O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK`, and accepted only as a regular root-owned file with no group/other permission bits. Temporary message, signature, and allowed-signers files live below the administrator-created empty `/run/align-evidence/signing` root with mode `0700`; all are removed before the adapter returns. The key descriptor is passed only to the one signer process and closed before signature parsing. `benchmark_evidence_key_process_matrix`; `scripts/test-benchmark-evidence-key-process.sh`. |
+| Verifier injection | `verifier.verify_produced_evidence` and `verify_artifact` pass the complete report bytes plus the decoded signature to the injected checker. They do not pass `sshsig.signing_preimage(report, namespace)`: OpenSSH must hash the original message exactly once. The pure verifier remains I/O-free; the native adapter is the only process owner. `benchmark_evidence_controller_verifier_matrix`; `scripts/test-benchmark-evidence-controller-verifier.sh`. |
+| Prerequisite and non-claims | The merged controller/verifier, profile, SSHSIG framing, cleanup, and process boundaries are required. Administrator key provisioning, host self-qualification, benchmark execution, provider/review API access, performance measurement, merge verification, and language implementation remain later capabilities. No benchmark or wall-clock promise is made. `HANDOFF.md`; `../align-llm/docs/align-requests.md`. |
+
+### Implementation closure matrix
+
+| Axis | Implementation closure and exact regression |
+|---|---|
+| Profile formation | Validate the new host signer version/hash fields, derive the complete SSH public-key blob and fingerprint, reject raw-key length, base64, algorithm, fingerprint, hash, order, and extra-field mutations before opening any file. `scripts/test-benchmark-evidence-profile.sh`; `scripts/test-benchmark-evidence-key-process.sh`. |
+| Cleanup gate | Require the complete `CleanupSnapshot` proof before opening the private key. Any live child/container/mount/fd/private directory, changed source/cache manifest, or released lock rejects without a key open or runner call. `scripts/test-benchmark-evidence-key-process.sh`. |
+| Key formation and ownership | Walk the fixed key path without following the final component; require regular root-owned bytes with no group/other permissions, retain one descriptor, and close it on success, process error, interruption, parser error, and cleanup error. Key path replacement, symlink, directory, writable mode, non-root owner, close failure, and duplicate open cases reject. `scripts/test-benchmark-evidence-key-process.sh`; `benchmark_evidence_process_boundary_matrix`. |
+| Signing construction | Build only the fixed namespace and `/proc/self/fd/<key_fd>` argv; bind the profile executable hash before the process; use the private message path, no stdin/options/shell, and no candidate-controlled path. Assert the exact argv, fd set, environment, output bound, and command order. `scripts/test-benchmark-evidence-key-process.sh`. |
+| Signature join | Read one bounded `.sig`, require canonical armor/binary re-encode, exact profile public key, exact namespace, and no stdout/signature-path substitution. Wrong key, namespace, truncation, trailing bytes, noncanonical armor, missing output, and oversized output reject before return. `scripts/test-benchmark-evidence-key-process.sh`; `scripts/test-benchmark-evidence-signature.sh`. |
+| Verification construction | Convert only the profile public-key blob to one fixed allowed-signers line, write the exact signature/message bytes, invoke the fixed verifier, and treat only exit zero as true. Wrong message/key/namespace, signature mutation, signer identity, allowed-signers mutation, nonzero, timeout, output overflow, or cleanup uncertainty cannot verify. `scripts/test-benchmark-evidence-key-process.sh`. |
+| Original-message handoff | Change the pure verifier callback contract and owner expectation from derived-preimage bytes to complete report bytes; a fake checker records the exact bytes and the native adapter's verifier owner signs/verifies the same message once. `scripts/test-benchmark-evidence-controller-verifier.sh`; `scripts/test-benchmark-evidence-key-process.sh`. |
+| Failure and cleanup | Every sign/verify path closes the key/executable descriptors, reaps the complete process group, removes message/signature/allowed-signers files, and removes the private directory. Inject runner error, `BaseException`, child timeout/nonzero, output overflow, path replacement, read/close/unlink/rmdir failure, and second invocation; no signature or `True` crosses an uncertain cleanup boundary. `scripts/test-benchmark-evidence-key-process.sh`; `benchmark_evidence_process_boundary_matrix`. |
+| Scope and mirrors | No private key bytes enter Python objects, command argv, environment, container mounts, report bytes, or returned errors. English/Japanese contract, profile order, verifier handoff, native adapter, and owner use the same constants; host provisioning and live qualification remain explicit. `git diff --check`; `scripts/test-benchmark-evidence-key-process.sh`. |
 
 ## Design-review finding closure
 
