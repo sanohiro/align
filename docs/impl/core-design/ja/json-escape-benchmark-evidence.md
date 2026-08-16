@@ -781,6 +781,35 @@ Request 7 language acceptanceを行わない。
 | Report constructionとarithmetic | 各benchmarkを二つのpreparation、二つのwarm-up、ten balanced pairへpartitionし、parsed field名とinteger valueをfixed two/three-field orderで要求する。float変換なしでcanonical tokenをemitし、revisionごとにten sampleをaggregateし、exact permutationをsortし、checked middle sumを加算し、checked `candidate * 100 <= baseline * 105`を比較する。sequence、arm、field、token、sample、permutation、overflow mutationはrejectする。`scripts/test-benchmark-evidence-controller-report.sh`、`benchmark_evidence_report_matrix`。 |
 | Failureとownership | incomplete session、missing measurement、artifact drift、malformed monitor lifecycle、invalid arithmetic、child failureではfragmentを返さない。sessionはin-memory execution factsだけをownし、controller cleanup、report sign、staging/publication、merge verification、lifecycle advancementはdownstream ownerのままとする。English/Japanese contractとfixed constantsを同期する。`git diff --check`、`scripts/test-benchmark-evidence-controller-report.sh`。 |
 
+## Merge verification implementation closure
+
+このcapabilityはverified report/signature pairとproviderのexact merge OIDをconsumeする。既存の
+pinned raw-Git readerでmerge objectをfetchし、targetのfirst-parent chainをwalkして、canonicalな
+signed `MergeVerification` recordを生成する。fresh raw-object observationでrecordを再検証する。
+provider API、private key、durable publication transaction、post-artifact lifecycle adapterは
+injected downstream portのままであり、このsliceはそれらを偽装せずRequest 7をadvanceしない。
+
+### Public-contract ledger
+
+| Public surface | Exact contract、owner、acceptance |
+|---|---|
+| `merge_verification.MergeVerificationRecord` | member orderは`schema`、`profile_id`、`profile_sha256`、`verifier`、`report_sha256`、`report_signature_sha256`、`target_ref`、`target_oid`、`merge_oid`、`merge_sha256`、`parents`、`tree_oid`、`verified_at`。schemaは`align.json_escape_benchmark_merge_verification/v1`、target refは`refs/heads/main`、parentsはexact `(BASE, CANDIDATE)`、ID/digest/timeはreport grammar。`encode`/`decode`はcanonical UTF-8 JSONとbyte-identical re-encodeを要求する。`scripts/test-benchmark-evidence-merge-verification.sh`。 |
+| `merge_verification.RawGitMergeReader` | trusted portは`read(oid) -> git_objects.VerifiedObject`と`target_oid() -> hex40`。merge OIDのraw objectを検証し、first-parent commitをport経由でparseし、missing/non-commit/cycle/bound超過をrejectし、target chainがexact mergeを含む場合だけacceptする。process/repository lifetimeはownしない。`scripts/test-benchmark-evidence-merge-verification.sh`、`benchmark_evidence_git_revision_matrix`。 |
+| `merge_verification.produce_signed` | complete reportとreport signatureを`verifier.verify_produced_evidence`で再検証し、verdict `pass`を要求する。signed candidateのparents/treeにmergeをbindし、fetched raw objectにtarget reachabilityをbindし、complete merge record bytesをinjected signerへ一度だけ渡す。key/namespace/signature検証後だけcanonical record/signature bytesを返す。`scripts/test-benchmark-evidence-merge-verification.sh`、`scripts/test-benchmark-evidence-key-process.sh`。 |
+| `merge_verification.verify_signed` | report、merge signature、canonical record、raw merge object、exact parents/tree、fresh target first-parent reachabilityを再検証する。report、report signature、merge OID、target OID、raw merge digest、signer identityの変更はlifecycle advance前にrejectする。`scripts/test-benchmark-evidence-merge-verification.sh`、`scripts/test-benchmark-evidence-merge-race.sh`。 |
+| Signing/publication boundary | moduleはnamespace-bound signerとsignature checkerをreceiveするだけで、key open、provider call、output directory write、ref mutation、lifecycle advanceをしない。`native_signing`と既存のlock-held durable staging/final-refetch ownerがeffectを専有する。`HANDOFF.md`、`../align-llm/docs/align-requests.md`。 |
+
+### Implementation closure matrix
+
+| Axis | Implementation closureとexact regression |
+|---|---|
+| Record formation/validation | member、order、schema literal、scalar grammar、two-parent cardinality/order、target ref、canonical LFを固定する。duplicate/reordered/unknown member、noncanonical JSON、wrong namespace、malformed timestamp、non-ASCII valueはsign前にrejectする。`scripts/test-benchmark-evidence-merge-verification.sh`。 |
+| Report revalidation/binding | trusted `ReportExpectations`でoriginal report bytesとreport signatureをverifyし、`pass`、exact report/signature SHA-256、profile ID/digest、verifier identity、baseline/candidate、candidate treeを要求する。mutated report、stale signature、regression verdict、wrong profile/key、candidate-tree mismatchはartifactを作らない。`scripts/test-benchmark-evidence-merge-verification.sh`、`scripts/test-benchmark-evidence-controller-verifier.sh`。 |
+| Raw merge identity | provider-returned OIDをpinned raw readerでreadし、parsed parentsがexact `(BASE, CANDIDATE)`、treeがsigned candidate treeのcommit objectを要求し、raw-object SHA-256をretainする。OID swap、malformed header、wrong kind/parent/tree、missing object、raw byte変更はrejectする。`scripts/test-benchmark-evidence-merge-verification.sh`、`scripts/test-benchmark-evidence-git-objects.sh`、`scripts/test-benchmark-evidence-git-revision.sh`。 |
+| Target reachability | fixed local targetを同じreaderで一度resolveし、visited setとfixed boundでfirst parentをwalkする。exact mergeのreachabilityだけacceptし、side-parent-only、force-push、target removal、cycle、missing descendant、target-ref driftはrejectする。`scripts/test-benchmark-evidence-merge-verification.sh`、`scripts/test-benchmark-evidence-merge-race.sh`。 |
+| Signature/handoff | complete canonical merge-record bytesだけを`sshsig.MERGE_NAMESPACE`でsignし、profile keyに対してarmorをdecode/re-encode/verifyしてから返す。pairはimmutableで既存staged publication portへ渡せる。private key/provider responseは入れない。`scripts/test-benchmark-evidence-merge-verification.sh`、`scripts/test-benchmark-evidence-key-process.sh`。 |
+| Failure、cleanup、scope | report/raw-object/signature failureではaccepted artifactを返さない。reader、lock、remote、staging、lifecycle ownershipはcallerに残し、final provider refetchとdurable artifact publicationは別transaction gateとする。`git diff --check`、`scripts/test-benchmark-evidence-merge-verification.sh`。 |
+
 ## Design-review finding closure
 
 | Finding | Closure |
