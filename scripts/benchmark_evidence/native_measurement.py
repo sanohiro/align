@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Sequence
 
@@ -90,6 +90,18 @@ Clock = Callable[[], int]
 
 def _error(message: str) -> None:
     raise NativeMeasurementError(message)
+
+
+def _freeze(value: Any) -> Any:
+    """Recursively detach profile state from caller-owned mutable containers."""
+
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze(member) for key, member in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze(member) for member in value)
+    if isinstance(value, tuple):
+        return tuple(_freeze(member) for member in value)
+    return value
 
 
 def _hash(value: object, label: str) -> str:
@@ -184,10 +196,12 @@ class NativeMeasurementConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.profile, Mapping):
             _error("measurement profile must be a mapping")
+        frozen_profile = _freeze(self.profile)
         try:
-            container._profile_identity(self.profile)
+            container._profile_identity(frozen_profile)
         except container.ContainerError as exc:
             raise NativeMeasurementError(str(exc)) from exc
+        object.__setattr__(self, "profile", frozen_profile)
         for phase in _PHASE_TIMEOUT_KEYS:
             _execution_limits(self.profile, phase)
         _hash(self.docker_client_sha256, "docker_client_sha256")
@@ -285,6 +299,123 @@ class ChildExecution:
                 _error("prepare child cannot return a native measurement")
         elif not isinstance(self.measurement, ParsedBenchmark) or self.measurement.benchmark != self.benchmark:
             _error("native child must return its parsed benchmark")
+
+
+class NativeMeasurementSession:
+    """Consume the fixed child schedule and retain prepare/native state."""
+
+    def __init__(
+        self,
+        config: NativeMeasurementConfig,
+        *,
+        runner: Runner = native_host.run_docker_commands_captured,
+        clock: Clock = time.monotonic_ns,
+    ) -> None:
+        if not isinstance(config, NativeMeasurementConfig):
+            _error("measurement config has the wrong type")
+        if not callable(runner) or not callable(clock):
+            _error("runner and clock must be callable")
+        self._config = config
+        self._runner = runner
+        self._clock = clock
+        self._cursor = 0
+        self._seen_ids: set[str] = set()
+        self._executions: list[ChildExecution] = []
+        self._failed = False
+        self._finished = False
+
+    @property
+    def config(self) -> NativeMeasurementConfig:
+        """Return the current immutable config, including sealed digests."""
+
+        return self._config
+
+    @property
+    def executions(self) -> tuple[ChildExecution, ...]:
+        """Return the ordered successful child executions after completion."""
+
+        if not self._finished:
+            _error("measurement session is not complete")
+        return tuple(self._executions)
+
+    def _reject(self, message: str) -> None:
+        self._failed = True
+        _error(message)
+
+    def execute(self, plan: schedule.ChildPlan, child_id: str) -> ChildExecution:
+        """Execute one schedule item and commit its prepare digest exactly once."""
+
+        if self._failed:
+            _error("measurement session is already failed")
+        if self._finished:
+            _error("measurement session is already finished")
+        if not isinstance(plan, schedule.ChildPlan):
+            self._reject("session plan has the wrong type")
+        expected = schedule.full_schedule()[self._cursor] if self._cursor < len(schedule.full_schedule()) else None
+        if plan != expected:
+            self._reject("session plan is outside the fixed schedule order")
+        if not isinstance(child_id, str) or _HEX64.fullmatch(child_id) is None:
+            self._reject("session child_id must be lowercase 64-hex")
+        if child_id in self._seen_ids:
+            self._reject("session child_id was reused")
+
+        self._seen_ids.add(child_id)
+        try:
+            execution = execute_child(
+                self._config,
+                plan,
+                child_id,
+                runner=self._runner,
+                clock=self._clock,
+            )
+        except BaseException:
+            self._failed = True
+            raise
+
+        if (
+            execution.child_id != child_id
+            or execution.phase != plan.phase
+            or execution.benchmark != plan.benchmark
+            or execution.revision != plan.revision
+            or execution.build_attempted != (plan.phase == "prepare")
+        ):
+            self._reject("child execution does not match the session plan")
+
+        if plan.phase == "prepare":
+            workspace = self._config.workspaces[(plan.benchmark, plan.revision)]
+            if workspace.artifact_manifest_sha256 is not None:
+                self._reject("prepare child changed an already sealed workspace")
+            workspaces = dict(self._config.workspaces)
+            workspaces[(plan.benchmark, plan.revision)] = replace(
+                workspace,
+                artifact_manifest_sha256=execution.artifact_manifest_sha256,
+            )
+            self._config = replace(self._config, workspaces=workspaces)
+        else:
+            expected_digest = self._config.workspaces[(plan.benchmark, plan.revision)].artifact_manifest_sha256
+            if execution.artifact_manifest_sha256 != expected_digest:
+                self._reject("native child changed the prepared artifact digest")
+
+        self._executions.append(execution)
+        self._cursor += 1
+        return execution
+
+    def finish(self) -> tuple[ChildExecution, ...]:
+        """Close the session only after every fixed child has succeeded."""
+
+        if self._failed:
+            _error("measurement session is already failed")
+        if self._finished:
+            _error("measurement session is already finished")
+        if self._cursor != len(schedule.full_schedule()):
+            self._reject("measurement session ended before every child completed")
+        if any(
+            self._config.workspaces[key].artifact_manifest_sha256 is None
+            for key in PRODUCTS
+        ):
+            self._reject("measurement session did not seal every artifact")
+        self._finished = True
+        return self.executions
 
 
 def _split_lines(raw: bytes, label: str, *, ascii_only: bool = False) -> tuple[str, ...]:

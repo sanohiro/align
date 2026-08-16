@@ -752,6 +752,35 @@ fixtureを複数PRへ重複させるためである。
 | Parser/arithmetic | exact title/header/row orderとASCII grammarをenforceし、floatなしでparseし、three-decimal millisecond tokenをchecked integer microsecondsへ一度だけconvertし、fixed five-field inventoryだけretainする。extra/profile/ratio/zero/overflow/field/row/order/warning/trailing mutationはreject。ownerはnative-measurement。 |
 | Failureとscope | failed childはparsed measurementもretryも返さない。resource ledger removalとlater cleanupはcontrollerがownする。workspace replacement、manifest drift、monitor event、report assembly、sign、publication、merge verify、BASE selectionはdownstream gateとして残し、English/Japanese contractとownerは同じconstantを使う。`git diff --check`、`scripts/test-benchmark-evidence-native-measurement.sh`。 |
 
+## Native measurement/controller/report handoff implementation closure
+
+このcapabilityはnative child railとpure monitor lifecycleをconsumeする。最初のreal measurement resultを
+trusted controllerで使える形にし、stateful sessionが各prepare-time digestを対応するnative childの前に
+replaceし、controllerがexact ordered child transcriptをretainし、report assemblerがそのtranscriptと
+validated monitor observationからcanonical `preparations`/`warmups`/`pairs`/`samples`/five `fields`を作る。
+outer revision、identity、review、signature、staging、publication、merge-verifier adapterは既存のtrusted
+portのままとする。本sliceは`BASE`選択、host snapshot収集、report sign/publication、provider merge verify、
+Request 7 language acceptanceを行わない。
+
+### Public-contract ledger
+
+| Public surface | Exact contract、owner、acceptance |
+|---|---|
+| `native_measurement.NativeMeasurementSession` | 一つのimmutable `NativeMeasurementConfig`と、一つのexact `schedule.full_schedule()`のmutable in-memory stateをownする。planを一度だけorder通りに受け、`execute_child`を一度呼び、matching `(benchmark, revision)` のprepare digestを後続native childの前に保存し、reused ID、plan mutation、digest drift、retry、incomplete scheduleをrejectする。完了後だけimmutable ordered `ChildExecution` tupleを公開する。ownerはcontroller-report。 |
+| `controller.ChildExecutionRecord` / `ExecutionTranscript` | controllerが一つのschedule planをその`ChildResult`とoptional native `ChildExecution`にbindし、child ID/phase/product/build/digestの一致をcheckし、global orderを保存し、complete immutable transcriptとcontroller-owned manifest mapをreport producerへ渡す。generic orchestration coreではmissing executionを許すが、measurement report assemblerはrejectする。ownerはcontroller-report。 |
+| `measurement_report.assemble` | complete controller transcriptとmonitorのordered observationsを受ける。exact child IDでmonitor lifecycleをreplayし、各inclusive child rangeをbindし、parsed integer microsecondをcanonical three-decimal tokenへ戻し、fixed preparation/warm-up/pair orderとfive field orderをemitし、exact ten-sample permutation/middle sumをreconstructし、typed canonical report fragmentだけ返す。ownerはcontroller-report。 |
+| Report producer handoff | 既存のtrusted report producerはcontroller transcript path経由でassembler fragmentを受け、revision/identity/review/execution metadata、body encoding、signature、post-PR verification bindingを引き続きownする。candidate提供のtranscript、monitor range、sample、derived median、field verdictをcontroller-owned valueの代りにacceptしない。ownerはcontroller-report/verifier。 |
+
+### Implementation closure matrix
+
+| Axis | Implementation closureとexact regression |
+|---|---|
+| Session formationとstate | exact schedule tuple、planごとのunique controller child ID、prepareだけdigest absent、後続childはdigest present/unchangedを要求する。successful prepare parse後にmatching workspaceだけをreplaceし、caller mappingをmutateせず、failed childをretryしない。plan/order/ID reuse、prepare/native digest join、incomplete completion、failed-child stateをtestする。`scripts/test-benchmark-evidence-controller-report.sh`、`scripts/test-benchmark-evidence-native-measurement.sh`。 |
+| Controller constructionとhandoff | 各resultでexecutionのchild ID、phase、benchmark、revision、build flag、manifest digestがcontroller plan/resultと一致することを要求する。exact 48-child orderを保持し、一つのimmutable transcriptをproducerへ渡す。missing/mismatch executionはreport assembly前にrejectし、各agreement field mutationとproducer call未発生をtestする。`scripts/test-benchmark-evidence-controller-report.sh`、`scripts/test-benchmark-evidence-controller-verifier.sh`。 |
+| Monitor joinとrange | transcriptのIDでobservationsを`MonitorLifecycle`にreplayし、dense ordinalと全childのexact ordered/disjoint `ChildRange`を要求し、そのrangeをpreparation/warm-up/run recordに使う。missing、duplicate、reorder、interior、wrong-child、counter-reset、latched-event observationはfragment返却前にrejectする。`scripts/test-benchmark-evidence-controller-report.sh`、`benchmark_evidence_monitor_matrix`。 |
+| Report constructionとarithmetic | 各benchmarkを二つのpreparation、二つのwarm-up、ten balanced pairへpartitionし、parsed field名とinteger valueをfixed two/three-field orderで要求する。float変換なしでcanonical tokenをemitし、revisionごとにten sampleをaggregateし、exact permutationをsortし、checked middle sumを加算し、checked `candidate * 100 <= baseline * 105`を比較する。sequence、arm、field、token、sample、permutation、overflow mutationはrejectする。`scripts/test-benchmark-evidence-controller-report.sh`、`benchmark_evidence_report_matrix`。 |
+| Failureとownership | incomplete session、missing measurement、artifact drift、malformed monitor lifecycle、invalid arithmetic、child failureではfragmentを返さない。sessionはin-memory execution factsだけをownし、controller cleanup、report sign、staging/publication、merge verification、lifecycle advancementはdownstream ownerのままとする。English/Japanese contractとfixed constantsを同期する。`git diff --check`、`scripts/test-benchmark-evidence-controller-report.sh`。 |
+
 ## Design-review finding closure
 
 | Finding | Closure |
