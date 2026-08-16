@@ -75,6 +75,107 @@ with tempfile.TemporaryDirectory(prefix="align-exclusive-owner-") as name:
     failing.abort(remove_reservation=False)
     reservation.unlink()
 
+    reservation_create_uncertain = exclusive_run.ExclusiveRun(str(lock), str(reservation))
+    reservation_create_uncertain.acquire()
+    original_fsync_parent = exclusive_run._fsync_parent
+
+    def fail_create_fsync(path):
+        raise OSError("injected reservation creation fsync failure")
+
+    exclusive_run._fsync_parent = fail_create_fsync
+    try:
+        reservation_create_uncertain.create_reservation("f" * 64, str(output))
+    except OSError as exc:
+        assert "reservation creation fsync failure" in str(exc)
+    else:
+        raise AssertionError("reservation creation fsync failure was accepted")
+    finally:
+        exclusive_run._fsync_parent = original_fsync_parent
+    assert reservation.exists()
+    blocked = exclusive_run.ExclusiveRun(str(lock), str(reservation))
+    expect_error(blocked.acquire, "publication reservation")
+    expect_error(
+        lambda: reservation_create_uncertain.abort(remove_reservation=False),
+        "durable reservation",
+    )
+    assert reservation_create_uncertain.locked
+    reservation_create_uncertain._restore_reservation()
+    reservation_create_uncertain.abort(remove_reservation=False)
+    reservation.unlink()
+
+    unrecoverable = exclusive_run.ExclusiveRun(str(lock), str(reservation))
+    unrecoverable.acquire()
+    unrecoverable.create_reservation("f" * 64, str(output))
+    unrecoverable.release_lock_for_publication()
+    unrecoverable.mark_published()
+    original_write = unrecoverable._write_reservation_file
+    original_fsync_parent = exclusive_run._fsync_parent
+    unrecoverable_failures = []
+
+    def fail_unrecoverable_fsync(path):
+        unrecoverable_failures.append("fsync")
+        raise OSError("injected unrecoverable finalization fsync failure")
+
+    def fail_unrecoverable_restore_write():
+        unrecoverable_failures.append("restore")
+        raise OSError("injected reservation restore failure")
+
+    exclusive_run._fsync_parent = fail_unrecoverable_fsync
+    unrecoverable._write_reservation_file = fail_unrecoverable_restore_write
+    try:
+        unrecoverable.finalize_publication()
+    except OSError as exc:
+        assert "reservation restore failure" in str(exc)
+        assert unrecoverable_failures == ["fsync", "restore"]
+    else:
+        raise AssertionError("unrecoverable finalization failure was accepted")
+    finally:
+        exclusive_run._fsync_parent = original_fsync_parent
+        unrecoverable._write_reservation_file = original_write
+    assert unrecoverable.locked
+    assert not reservation.exists()
+    blocked = exclusive_run.ExclusiveRun(str(lock), str(reservation))
+    expect_error(blocked.acquire, "host lock")
+    expect_error(
+        lambda: unrecoverable.abort(remove_reservation=False),
+        "durable reservation",
+    )
+    assert unrecoverable.locked
+    unrecoverable._restore_reservation()
+    unrecoverable.abort(remove_reservation=False)
+    reservation.unlink()
+
+    uncertain_present = exclusive_run.ExclusiveRun(str(lock), str(reservation))
+    uncertain_present.acquire()
+    uncertain_present.create_reservation("a" * 64, str(output))
+    uncertain_present.release_lock_for_publication()
+    uncertain_present.mark_published()
+
+    def fail_present_fsync(path):
+        raise OSError("injected present reservation fsync failure")
+
+    exclusive_run._fsync_parent = fail_present_fsync
+    try:
+        uncertain_present.finalize_publication()
+    except OSError as exc:
+        assert "present reservation fsync failure" in str(exc)
+    else:
+        raise AssertionError("present reservation fsync failure was accepted")
+    finally:
+        exclusive_run._fsync_parent = original_fsync_parent
+    assert uncertain_present.locked
+    assert reservation.exists()
+    blocked = exclusive_run.ExclusiveRun(str(lock), str(reservation))
+    expect_error(blocked.acquire, "publication reservation")
+    expect_error(
+        lambda: uncertain_present.abort(remove_reservation=False),
+        "durable reservation",
+    )
+    assert uncertain_present.locked
+    uncertain_present._restore_reservation()
+    uncertain_present.abort(remove_reservation=False)
+    reservation.unlink()
+
     closing = exclusive_run.ExclusiveRun(str(lock), str(reservation))
     closing.acquire()
     closing.create_reservation("d" * 64, str(output))

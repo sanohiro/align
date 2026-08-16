@@ -52,6 +52,7 @@ class ExclusiveRun:
         self._reserved = False
         self._published = False
         self._closed = False
+        self._reservation_uncertain = False
         self._reservation_raw: bytes | None = None
 
     @property
@@ -133,6 +134,7 @@ class ExclusiveRun:
                 written += count
             os.fsync(fd)
         except BaseException:
+            self._reservation_uncertain = True
             try:
                 os.unlink(self.reservation_path)
             except OSError:
@@ -142,12 +144,17 @@ class ExclusiveRun:
             os.close(fd)
 
     def _restore_reservation(self) -> None:
-        if os.path.lexists(self.reservation_path):
-            self._reserved = True
-            return
-        self._write_reservation_file()
-        _fsync_parent(self.reservation_path)
+        try:
+            if os.path.lexists(self.reservation_path):
+                _fsync_parent(self.reservation_path)
+            else:
+                self._write_reservation_file()
+                _fsync_parent(self.reservation_path)
+        except BaseException:
+            self._reservation_uncertain = True
+            raise
         self._reserved = True
+        self._reservation_uncertain = False
 
     def create_reservation(self, run_id: str, output_dir: str) -> None:
         if not self._locked or self._reserved:
@@ -159,13 +166,19 @@ class ExclusiveRun:
         try:
             self._write_reservation_file()
         except BaseException:
+            self._reservation_uncertain = True
             try:
                 os.unlink(self.reservation_path)
             except OSError:
                 pass
             raise
-        _fsync_parent(self.reservation_path)
+        try:
+            _fsync_parent(self.reservation_path)
+        except BaseException:
+            self._reservation_uncertain = True
+            raise
         self._reserved = True
+        self._reservation_uncertain = False
 
     def release_lock_for_publication(self) -> None:
         if not self._locked or not self._reserved:
@@ -234,6 +247,14 @@ class ExclusiveRun:
                 raise
             removed = True
         if self._lock_fd >= 0:
+            if self._reservation_uncertain:
+                # A failed finalization or reservation creation leaves no proof
+                # that the path is durable.  Never release the fallback host
+                # lock in that state: the caller must retain this lease until
+                # a later recovery step restores a durable reservation.
+                raise ExclusiveRunError(
+                    "cannot release host lock without a durable reservation"
+                )
             try:
                 fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
             except BaseException:
@@ -248,4 +269,5 @@ class ExclusiveRun:
         self._locked = False
         if removed:
             self._reserved = False
+            self._reservation_uncertain = False
         self._closed = True
