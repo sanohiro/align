@@ -201,6 +201,8 @@ def _open_private_key() -> int:
     file_flags = native_host._fixed_open_flags()
     directories: list[int] = []
     key_fd: int | None = None
+    ownership_transferred = False
+    cleanup_errors: list[OSError] = []
     try:
         current = os.open("/", directory_flags)
         directories.append(current)
@@ -211,25 +213,30 @@ def _open_private_key() -> int:
         _validate_directory_metadata(os.fstat(current), "signing key parent")
         key_fd = os.open(components[-1], file_flags, dir_fd=current)
         _validate_private_key_metadata(os.fstat(key_fd))
+        while directories:
+            descriptor = directories[-1]
+            os.close(descriptor)
+            directories.pop()
+        ownership_transferred = True
         return key_fd
     except OSError as exc:
         if key_fd is None:
             raise KeyProcessError("cannot open signing key") from exc
         raise KeyProcessError("cannot inspect signing key") from exc
-    except BaseException:
-        if key_fd is not None:
+    finally:
+        if key_fd is not None and not ownership_transferred:
             try:
                 os.close(key_fd)
-            except OSError:
-                pass
-        raise
-    finally:
-        for descriptor in reversed(directories):
+            except OSError as exc:
+                cleanup_errors.append(exc)
+        while directories:
+            descriptor = directories.pop()
             try:
                 os.close(descriptor)
             except OSError as exc:
-                if key_fd is not None:
-                    raise KeyProcessError("signing key parent close failed") from exc
+                cleanup_errors.append(exc)
+        if cleanup_errors:
+            raise KeyProcessError("signing key descriptor cleanup is uncertain") from cleanup_errors[0]
 
 
 def _validate_work_root() -> None:
@@ -237,6 +244,20 @@ def _validate_work_root() -> None:
         native_host._validate_docker_config_dir(SIGNING_WORK_ROOT)
     except native_host.NativeHostError as exc:
         raise KeyProcessError(f"signing work root is not trusted: {exc}") from exc
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(SIGNING_WORK_ROOT, native_host._fixed_open_flags(directory=True))
+        metadata = os.fstat(descriptor)
+        if stat.S_IMODE(metadata.st_mode) != 0o700:
+            _error("signing work root mode is not 0700")
+    except OSError as exc:
+        raise KeyProcessError("cannot inspect signing work root") from exc
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                raise KeyProcessError("signing work root close failed") from exc
 
 
 def _write_private(path: str, value: bytes) -> None:

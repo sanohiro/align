@@ -97,6 +97,77 @@ expect_error(
     "regular file",
 )
 
+original_os_open = native_signing.os.open
+original_os_fstat = native_signing.os.fstat
+original_os_close = native_signing.os.close
+try:
+    close_events = []
+
+    def failing_key_fstat(descriptor):
+        if descriptor in (10, 11, 13):
+            return SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=0)
+        raise OSError("key fstat failed")
+
+    def fake_open(path, _flags, *, dir_fd=None):
+        if path == "/":
+            return 10
+        if path == "etc":
+            assert dir_fd == 10
+            return 11
+        assert path == "align-evidence" or path == "signing-key"
+        return 12 if path == "signing-key" else 13
+
+    def record_close(descriptor):
+        close_events.append(descriptor)
+
+    native_signing.os.open = fake_open
+    native_signing.os.fstat = failing_key_fstat
+    native_signing.os.close = record_close
+    expect_error(native_signing._open_private_key, "cannot inspect signing key")
+    assert 12 in close_events, close_events
+finally:
+    native_signing.os.open = original_os_open
+    native_signing.os.fstat = original_os_fstat
+    native_signing.os.close = original_os_close
+
+try:
+    close_events = []
+
+    def valid_key_fstat(descriptor):
+        if descriptor in (10, 11, 13):
+            return SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=0)
+        return SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=0)
+
+    def failing_parent_close(descriptor):
+        close_events.append(descriptor)
+        if descriptor == 11:
+            raise OSError("parent close failed")
+
+    native_signing.os.open = fake_open
+    native_signing.os.fstat = valid_key_fstat
+    native_signing.os.close = failing_parent_close
+    expect_error(native_signing._open_private_key, "cleanup is uncertain")
+    assert 12 in close_events, close_events
+finally:
+    native_signing.os.open = original_os_open
+    native_signing.os.fstat = original_os_fstat
+    native_signing.os.close = original_os_close
+
+original_validate_directory = native_host._validate_docker_config_dir
+try:
+    root_close_events = []
+    native_host._validate_docker_config_dir = lambda _path: None
+    native_signing.os.open = lambda _path, _flags: 42
+    native_signing.os.fstat = lambda _descriptor: SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0)
+    native_signing.os.close = lambda descriptor: root_close_events.append(descriptor)
+    expect_error(native_signing._validate_work_root, "mode is not 0700")
+    assert root_close_events == [42]
+finally:
+    native_host._validate_docker_config_dir = original_validate_directory
+    native_signing.os.open = original_os_open
+    native_signing.os.fstat = original_os_fstat
+    native_signing.os.close = original_os_close
+
 
 original_root = native_signing.SIGNING_WORK_ROOT
 original_validate_root = native_signing._validate_work_root
