@@ -195,6 +195,34 @@ native_workspaces = {
     for product, item in config().workspaces.items()
 }
 native_config = replace(config(), workspaces=native_workspaces)
+alias_workspaces = dict(config().workspaces)
+alias_workspaces[measurement.PRODUCTS[1]] = replace(
+    alias_workspaces[measurement.PRODUCTS[1]],
+    source=alias_workspaces[measurement.PRODUCTS[0]].source,
+)
+expect_error(
+    lambda: measurement.NativeMeasurementConfig(
+        profile=PROFILE,
+        docker_client_sha256=H64,
+        workspaces=alias_workspaces,
+    ),
+    "workspace paths must be distinct",
+)
+oversized_stderr_profile = {
+    **PROFILE,
+    "capture_limits": {
+        **PROFILE["capture_limits"],
+        "stderr_max_bytes": measurement._MAX_OUTPUT + 1,
+    },
+}
+expect_error(
+    lambda: measurement.NativeMeasurementConfig(
+        profile=oversized_stderr_profile,
+        docker_client_sha256=H64,
+        workspaces=config().workspaces,
+    ),
+    "capture limit exceeds",
+)
 native_calls = []
 native_plan = plans[4]
 native_result = measurement.execute_child(

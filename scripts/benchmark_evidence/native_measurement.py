@@ -134,7 +134,7 @@ def _execution_limits(profile: Mapping[str, Any], phase: str) -> tuple[float, in
     stdout_limit = _profile_uint(profile, "capture_limits", "stdout_max_bytes", "stdout_max_bytes")
     stderr_limit = _profile_uint(profile, "capture_limits", "stderr_max_bytes", "stderr_max_bytes")
     tail_limit = _profile_uint(profile, "capture_limits", "stderr_tail_max_bytes", "stderr_tail_max_bytes")
-    if stdout_limit > _MAX_OUTPUT:
+    if stdout_limit > _MAX_OUTPUT or stderr_limit > _MAX_OUTPUT:
         _error("profile capture limit exceeds the native host ceiling")
     if tail_limit > _STDERR_TAIL_BYTES or tail_limit > stderr_limit:
         _error("profile stderr tail limit exceeds the native host tail ceiling")
@@ -203,6 +203,18 @@ class NativeMeasurementConfig:
                 _error("workspace key is not in the fixed benchmark inventory")
             if not isinstance(workspace, ChildWorkspace):
                 _error("workspace value has the wrong type")
+        all_paths = tuple(
+            path
+            for workspace in workspaces.values()
+            for path in (
+                workspace.source,
+                workspace.target,
+                workspace.work,
+                workspace.cargo_home,
+                workspace.toolchain,
+            )
+        )
+        _validate_workspace_paths(all_paths)
         object.__setattr__(self, "workspaces", MappingProxyType(workspaces))
 
 
