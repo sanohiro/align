@@ -82,6 +82,18 @@ def _error(message: str) -> None:
     raise NativeHostError(message)
 
 
+def _fixed_open_flags(*, directory: bool = False) -> int:
+    required = ["O_CLOEXEC", "O_NOFOLLOW"]
+    if directory:
+        required.append("O_DIRECTORY")
+    if any(not hasattr(os, name) for name in required):
+        _error("native host lacks the required no-follow open flags")
+    flags = os.O_RDONLY
+    for name in required:
+        flags |= getattr(os, name)
+    return flags
+
+
 def _validate_argv(argv: Sequence[str]) -> tuple[str, ...]:
     if not isinstance(argv, (tuple, list)) or not argv:
         _error("trusted command argv must be non-empty")
@@ -96,6 +108,13 @@ def _validate_argv(argv: Sequence[str]) -> tuple[str, ...]:
     return result
 
 
+def _supports_nonreaping_wait() -> bool:
+    return all(
+        hasattr(os, name)
+        for name in ("waitid", "P_PID", "WEXITED", "WNOHANG", "WNOWAIT", "CLD_EXITED")
+    )
+
+
 def _stop_process(process: subprocess.Popen[bytes]) -> None:
     """Terminate and reap an owned command process group best-effort."""
 
@@ -103,10 +122,8 @@ def _stop_process(process: subprocess.Popen[bytes]) -> None:
         os.killpg(process.pid, signal.SIGTERM)
     except OSError:
         pass
-    try:
-        process.wait(timeout=0.5)
-    except subprocess.TimeoutExpired:
-        pass
+    if _supports_nonreaping_wait():
+        _waitid_without_reap(process, 0.5)
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except OSError:
@@ -115,6 +132,36 @@ def _stop_process(process: subprocess.Popen[bytes]) -> None:
         process.wait(timeout=0.5)
     except subprocess.TimeoutExpired:
         _error("trusted command process group could not be reaped")
+
+
+def _wait_without_reap(process: subprocess.Popen[bytes], timeout: float) -> int:
+    """Observe a direct-child exit while retaining its PID for group cleanup."""
+
+    result = _waitid_without_reap(process, timeout)
+    if result is None:
+        raise NativeHostError("trusted command did not exit after closing output")
+    return result
+
+
+def _waitid_without_reap(process: subprocess.Popen[bytes], timeout: float) -> int | None:
+    """Return a direct-child status without releasing its PID for reuse."""
+
+    if not _supports_nonreaping_wait():
+        _error("trusted command requires non-reaping child wait support")
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            result = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError as exc:
+            raise NativeHostError("trusted command child was reaped unexpectedly") from exc
+        if result is not None and result.si_pid != 0:
+            if result.si_code == os.CLD_EXITED:
+                return result.si_status
+            return -result.si_status
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(0.01, remaining))
 
 
 def _run_command(
@@ -160,15 +207,19 @@ def _run_command(
     except OSError as exc:
         raise NativeHostError(f"cannot start trusted command {command[0]}") from exc
 
-    assert process.stdout is not None
-    assert process.stderr is not None
-    stdout_fd = process.stdout.fileno()
-    selector = selectors.DefaultSelector()
+    selector = None
     streams = (process.stdout, process.stderr)
-    buffers = {stream.fileno(): bytearray() for stream in streams}
+    buffers: dict[int, bytearray] = {}
+    stdout_fd: int | None = None
     cleanup_done = False
     try:
+        assert process.stdout is not None
+        assert process.stderr is not None
+        stdout_fd = process.stdout.fileno()
+        selector = selectors.DefaultSelector()
+        buffers = {stream.fileno(): bytearray() for stream in streams if stream is not None}
         for stream in streams:
+            assert stream is not None
             os.set_blocking(stream.fileno(), False)
             selector.register(stream, selectors.EVENT_READ)
         deadline = time.monotonic() + timeout
@@ -196,12 +247,10 @@ def _run_command(
                     _error("trusted command output exceeded the fixed limit")
                 buffer.extend(chunk)
 
-        try:
-            return_code = process.wait(timeout=max(0.0, deadline - time.monotonic()))
-        except subprocess.TimeoutExpired as exc:
-            raise NativeHostError("trusted command did not exit after closing output") from exc
+        return_code = _wait_without_reap(process, max(0.0, deadline - time.monotonic()))
         if return_code != 0:
             _error("trusted command exited nonzero")
+        assert stdout_fd is not None
         return bytes(buffers[stdout_fd])
     except BaseException:
         cleanup_done = True
@@ -211,8 +260,11 @@ def _run_command(
         if not cleanup_done:
             cleanup_done = True
             _stop_process(process)
-        selector.close()
+        if selector is not None:
+            selector.close()
         for stream in streams:
+            if stream is None:
+                continue
             try:
                 stream.close()
             except OSError:
@@ -237,9 +289,7 @@ def read_no_follow(path: str, *, limit: int = _MAX_SOURCE_BYTES) -> bytes:
         _error("native source path is invalid")
     if type(limit) is not int or limit <= 0:
         _error("native source limit must be positive")
-    flags = os.O_RDONLY
-    flags |= getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags = _fixed_open_flags()
     try:
         fd = os.open(path, flags)
     except OSError as exc:
@@ -270,12 +320,17 @@ def read_no_follow(path: str, *, limit: int = _MAX_SOURCE_BYTES) -> bytes:
             raise NativeHostError(f"native source close failed: {path}") from exc
 
 
+def _validate_executable_metadata(metadata: Any, path: str) -> None:
+    if not stat.S_ISREG(metadata.st_mode) or not metadata.st_mode & 0o111:
+        _error(f"native executable is not a regular executable: {path}")
+    if metadata.st_uid != 0 or metadata.st_mode & 0o022:
+        _error(f"native executable is not root-owned and benchmark-account unwritable: {path}")
+
+
 def _open_executable(path: str) -> int:
     if not isinstance(path, str) or not path.startswith("/") or "\x00" in path:
         _error("native executable path is invalid")
-    flags = os.O_RDONLY
-    flags |= getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags = _fixed_open_flags()
     try:
         fd = os.open(path, flags)
     except OSError as exc:
@@ -284,8 +339,7 @@ def _open_executable(path: str) -> int:
         raise NativeHostError(f"cannot open native executable {path}") from exc
     try:
         metadata = os.fstat(fd)
-        if not stat.S_ISREG(metadata.st_mode) or not metadata.st_mode & 0o111:
-            _error(f"native executable is not a regular executable: {path}")
+        _validate_executable_metadata(metadata, path)
         return fd
     except OSError as exc:
         try:
@@ -338,9 +392,64 @@ def hash_executable(path: str = DOCKER) -> str:
             raise NativeHostError(f"native executable close failed: {path}") from exc
 
 
+def _validate_docker_config_dir(
+    path: str = DOCKER_CONFIG,
+    *,
+    opener: Callable[..., int] = os.open,
+    statter: Callable[[int], os.stat_result] = os.fstat,
+    lister: Callable[[int], list[str]] = os.listdir,
+    closer: Callable[[int], None] = os.close,
+) -> None:
+    """Validate the fixed Docker config directory without following a path component."""
+
+    if not isinstance(path, str) or not path.startswith("/") or "\x00" in path:
+        _error("Docker config directory path is invalid")
+    components = path.split("/")
+    if len(components) < 2 or components[0] != "" or any(
+        not component or component in (".", "..") for component in components[1:]
+    ):
+        _error("Docker config directory path is not canonical")
+    flags = _fixed_open_flags(directory=True)
+    descriptors: list[int] = []
+    try:
+        current = opener("/", flags)
+        descriptors.append(current)
+        for component in components[1:]:
+            metadata = statter(current)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != 0
+                or metadata.st_mode & 0o022
+            ):
+                _error("Docker config directory has an untrusted parent")
+            current = opener(component, flags, dir_fd=current)
+            descriptors.append(current)
+        metadata = statter(descriptors[-1])
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_mode & 0o022:
+            _error("Docker config directory is not root-owned and benchmark-account unwritable")
+        try:
+            entries = lister(descriptors[-1])
+        except OSError as exc:
+            raise NativeHostError("Docker config directory cannot be listed") from exc
+        if entries:
+            _error("Docker config directory is not empty")
+    except OSError as exc:
+        raise NativeHostError("cannot validate Docker config directory") from exc
+    finally:
+        close_error: OSError | None = None
+        for descriptor in reversed(descriptors):
+            try:
+                closer(descriptor)
+            except OSError as exc:
+                close_error = close_error or exc
+        if close_error is not None:
+            raise NativeHostError("Docker config directory close failed") from close_error
+
+
 def run_docker_pair() -> tuple[bytes, bytes, str]:
     """Run version and info from the same retained Docker executable descriptor."""
 
+    _validate_docker_config_dir()
     fd = _open_executable(DOCKER)
     try:
         client_hash = _hash_fd(fd, DOCKER)

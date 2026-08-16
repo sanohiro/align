@@ -741,7 +741,20 @@ fixes remain within this capability and do not widen the accepted evidence claim
 | Hashed Docker bytes could differ from executed bytes | The real Docker path opens one no-follow executable descriptor, hashes it, executes both fixed commands through `/proc/self/fd/<fd>` with that descriptor passed across exec, and closes it only after both commands finish. Path replacement cannot substitute a second client between hashing and execution. |
 | Ineligible host state reached Docker | Native architecture and CPU quota are rejected immediately after their fixed sources are parsed, before the runner is called. The owner uses a rejecting runner to prove both paths are Docker-free. |
 | Pressure or swap counters could reset between snapshots | The three constructed observations are compared in order for monotonic CPU-pressure, memory-pressure, and swap read/write totals before Docker output is accepted. A reset is a terminal native acquisition error. |
-| A command leader could leave descendants | Cleanup always signals the owned process group, waits for the direct child, escalates to `SIGKILL`, and reaps the leader even when it has already exited. The owner starts a leader-exiting descendant and proves its delayed marker is never written. |
+| A command leader could leave descendants | Cleanup always signals the owned process group, observes the direct child without reaping, escalates to `SIGKILL`, then reaps it. The owner starts a leader-exiting descendant and proves its delayed marker is never written. |
+
+## Native host second-review redesign closure
+
+The revised candidate review found one new P1 and three related process/configuration boundary gaps.
+The closure matrix was reopened on the native-host process-trust axis before implementation. The
+accepted evidence claim remains unchanged.
+
+| Finding | Ledger-first redesign and owner |
+|---|---|
+| A mutable Docker executable could still change between hash and exec | `_open_executable` now requires a regular executable owned by root and unwritable by the benchmark account before the retained descriptor is hashed or executed. Root administration remains the explicit trust boundary; the owner covers non-root ownership and group/other-write metadata. `benchmark_evidence_native_host_matrix`. |
+| The fixed Docker config directory was not itself trusted | The validator walks `/`, `etc`, `align-evidence`, and `docker-empty` through descriptor-relative `O_DIRECTORY|O_NOFOLLOW` opens, requires root ownership and no benchmark-account write permission at every component, and requires the final directory to be empty. Validation runs before either Docker child is spawned; the owner checks the no-follow flags, cleanup, ownership, permissions, and nonempty rejection. `benchmark_evidence_native_host_matrix`. |
+| An exception after spawn could leak the child or its streams | Selector creation, stream setup, nonblocking configuration, and buffer construction are inside the outer cleanup guard. An injected setup failure starts a descendant and proves the complete owned group is torn down. `benchmark_evidence_process_boundary_matrix`; `benchmark_evidence_native_host_matrix`. |
+| Reaping the leader before the final group signal could hit a reused PGID | The accepted Linux path observes direct-child exit with `waitid(WNOWAIT)`, sends `SIGTERM`, observes without reaping, sends `SIGKILL`, and only then calls `Popen.wait`. Unsupported non-reaping wait support fails closed before a successful command can cross the boundary. The owner asserts the TERM/observe/KILL/reap order. `benchmark_evidence_process_boundary_matrix`. |
 
 ## Design-review finding closure
 

@@ -565,7 +565,19 @@ kernel、cgroup、Docker、load stateに依存してはならない。
 | hashしたDocker bytesとexecute bytesが異なり得た | real Docker pathは一つのno-follow executable descriptorをopenしてhashし、`/proc/self/fd/<fd>`経由で両fixed commandを同じdescriptorからexecし、両command後にcloseする。path replacementはhash後の別clientを差し替えられない。 |
 | ineligible host stateがDockerへ到達した | native architectureとCPU quotaをfixed sourceのparse直後に、runner call前にrejectする。ownerはrejecting runnerで両pathがDocker-freeであることを証明する。 |
 | pressureまたはswap counterがsnapshot間でresetできた | 3つのobservationを順序どおり比較し、CPU-pressure、memory-pressure、swap read/write totalのmonotonicityを要求する。resetはterminal native acquisition errorとなる。 |
-| command leaderがdescendantを残せた | cleanupはowned process groupへ常にsignalし、direct childをwaitし、`SIGKILL`へescalateし、leaderが既にexitしていてもreapする。ownerはleaderがexitするdescendantを起動し、遅延markerが書かれないことを証明する。 |
+| command leaderがdescendantを残せた | cleanupはowned process groupへsignalし、direct childをreapせずにobserveし、`SIGKILL`へescalateしてからreapする。ownerはleaderがexitするdescendantを起動し、遅延markerが書かれないことを証明する。 |
+
+## Native host second-review redesign closure
+
+改訂候補のreviewで、新しいP1と関連するprocess/configuration boundary gapが3件見つかった。
+実装前にnative-host process-trust axisのclosure matrixを再openした。accepted evidenceのclaimは変えない。
+
+| Finding | Ledger-first redesign / owner |
+|---|---|
+| mutableなDocker executableがhashとexecの間に変わり得た | `_open_executable`は、retained descriptorをhashまたはexecする前に、regular executableでroot所有かつbenchmark accountからwrite不能であることを要求する。root administrationは明示的なtrust boundaryとして残し、ownerはnon-root ownershipとgroup/other writeのmetadataを検証する。`benchmark_evidence_native_host_matrix`. |
+| fixed Docker config directory自体をtrustしていなかった | validatorは`/`、`etc`、`align-evidence`、`docker-empty`をdescriptor-relativeな`O_DIRECTORY|O_NOFOLLOW` openで順にwalkし、全componentのroot ownershipとbenchmark accountからのwrite不能、およびfinal directoryがemptyであることを要求する。どちらのDocker childもspawnする前に検証し、ownerはno-follow flag、cleanup、ownership、permission、nonempty rejectを確認する。`benchmark_evidence_native_host_matrix`. |
+| spawn後のexceptionがchildまたはstreamをleakできた | selector作成、stream setup、nonblocking設定、buffer構築をouter cleanup guard内に置く。injected setup failureでdescendantを起動し、owned group全体がteardownされることを証明する。`benchmark_evidence_process_boundary_matrix`; `benchmark_evidence_native_host_matrix`. |
+| leaderをfinal group signal前にreapするとPGIDを再利用し得た | accepted Linux pathは`waitid(WNOWAIT)`でdirect childのexitをreapせず観測し、`SIGTERM`、non-reaping observe、`SIGKILL`、最後に`Popen.wait`の順で処理する。non-reaping waitを持たない環境はsuccessful commandがboundaryを越える前にfail closedする。ownerはTERM/observe/KILL/reap順をassertする。`benchmark_evidence_process_boundary_matrix`. |
 
 ## Design-review finding closure
 

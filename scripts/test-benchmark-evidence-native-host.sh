@@ -138,6 +138,137 @@ assert tuple(calls) == (native_host.DOCKER_VERSION_ARGV, native_host.DOCKER_INFO
 assert native_host._FIXED_ENV["DOCKER_CONFIG"] == native_host.DOCKER_CONFIG
 assert native_host._FIXED_ENV["DOCKER_HOST"] == native_host.DOCKER_HOST
 
+
+trusted_directory = SimpleNamespace(
+    st_mode=native_host.stat.S_IFDIR | 0o755,
+    st_uid=0,
+    st_gid=0,
+)
+config_opened = []
+config_closed = []
+
+
+def config_opener(path, flags, *, dir_fd=None):
+    descriptor = len(config_opened) + 10
+    config_opened.append((path, flags, dir_fd, descriptor))
+    return descriptor
+
+
+def config_statter(_fd):
+    return trusted_directory
+
+
+native_host._validate_docker_config_dir(
+    opener=config_opener,
+    statter=config_statter,
+    lister=lambda _fd: [],
+    closer=config_closed.append,
+)
+assert [item[0] for item in config_opened] == ["/", "etc", "align-evidence", "docker-empty"]
+assert all(item[1] & getattr(native_host.os, "O_NOFOLLOW", 0) for item in config_opened)
+assert config_closed == [13, 12, 11, 10]
+
+
+def config_with(statter=config_statter, lister=lambda _fd: []):
+    opened = []
+
+    def opener(path, flags, *, dir_fd=None):
+        descriptor = len(opened) + 20
+        opened.append((path, flags, dir_fd, descriptor))
+        return descriptor
+
+    closed = []
+    native_host._validate_docker_config_dir(
+        opener=opener,
+        statter=statter,
+        lister=lister,
+        closer=closed.append,
+    )
+
+
+expect_error(
+    lambda: config_with(lister=lambda _fd: ["config.json"]),
+    "not empty",
+)
+untrusted_directory = SimpleNamespace(
+    st_mode=native_host.stat.S_IFDIR | 0o755,
+    st_uid=1000,
+    st_gid=1000,
+)
+expect_error(
+    lambda: config_with(statter=lambda _fd: untrusted_directory),
+    "untrusted parent",
+)
+unwritable_directory = SimpleNamespace(
+    st_mode=native_host.stat.S_IFDIR | 0o775,
+    st_uid=0,
+    st_gid=0,
+)
+expect_error(
+    lambda: config_with(statter=lambda _fd: unwritable_directory),
+    "untrusted parent",
+)
+
+native_host._validate_executable_metadata(
+    SimpleNamespace(st_mode=native_host.stat.S_IFREG | 0o755, st_uid=0),
+    "/usr/bin/docker",
+)
+expect_error(
+    lambda: native_host._validate_executable_metadata(
+        SimpleNamespace(st_mode=native_host.stat.S_IFREG | 0o755, st_uid=1000),
+        "/usr/bin/docker",
+    ),
+    "root-owned",
+)
+expect_error(
+    lambda: native_host._validate_executable_metadata(
+        SimpleNamespace(st_mode=native_host.stat.S_IFREG | 0o775, st_uid=0),
+        "/usr/bin/docker",
+    ),
+    "benchmark-account unwritable",
+)
+
+docker_pair_events = []
+original_validate_config = native_host._validate_docker_config_dir
+original_open_executable = native_host._open_executable
+original_hash_fd = native_host._hash_fd
+original_run_command = native_host._run_command
+
+
+def fake_open_executable(_path):
+    descriptor = os.open(os.devnull, os.O_RDONLY)
+    docker_pair_events.append(("open", descriptor))
+    return descriptor
+
+
+def fake_hash_fd(descriptor, path):
+    docker_pair_events.append(("hash", descriptor, path))
+    return H64
+
+
+def fake_run_command(argv, *, executable_fd=None):
+    docker_pair_events.append(("run", argv, executable_fd))
+    if argv == native_host.DOCKER_VERSION_ARGV:
+        return b"version"
+    return b"info"
+
+
+native_host._validate_docker_config_dir = lambda: docker_pair_events.append(("config",))
+native_host._open_executable = fake_open_executable
+native_host._hash_fd = fake_hash_fd
+native_host._run_command = fake_run_command
+try:
+    pair = native_host.run_docker_pair()
+finally:
+    native_host._validate_docker_config_dir = original_validate_config
+    native_host._open_executable = original_open_executable
+    native_host._hash_fd = original_hash_fd
+    native_host._run_command = original_run_command
+assert pair == (b"version", b"info", H64)
+assert [event[0] for event in docker_pair_events] == ["config", "open", "hash", "run", "run"]
+assert docker_pair_events[3][2] == docker_pair_events[1][1]
+assert docker_pair_events[4][2] == docker_pair_events[1][1]
+
 inspection = native_host.inspect(
     PROFILE,
     reader=reader,
@@ -349,6 +480,58 @@ with tempfile.TemporaryDirectory() as directory:
     )
     time.sleep(1.2)
     assert not os.path.exists(marker), "a descendant survived command-group cleanup"
+
+with tempfile.TemporaryDirectory() as directory:
+    marker = os.path.join(directory, "setup-descendant-marker")
+    command = f"(sleep 1; printf leaked > {marker}) & exit 0"
+    original_set_blocking = native_host.os.set_blocking
+
+    def fail_during_setup(_fd, _blocking):
+        raise native_host.NativeHostError("injected setup failure")
+
+    native_host.os.set_blocking = fail_during_setup
+    try:
+        expect_error(
+            lambda: native_host.run_command(("/bin/sh", "-c", command)),
+            "injected setup failure",
+        )
+    finally:
+        native_host.os.set_blocking = original_set_blocking
+    time.sleep(1.2)
+    assert not os.path.exists(marker), "a descendant survived post-spawn setup cleanup"
+
+
+cleanup_events = []
+
+
+class FakeProcess:
+    pid = 123
+
+    def wait(self, timeout):
+        cleanup_events.append(("wait", timeout))
+        return 0
+
+
+original_killpg = native_host.os.killpg
+original_waitid = native_host.os.waitid
+native_host.os.killpg = lambda pid, signum: cleanup_events.append(("kill", pid, signum))
+
+
+def fake_waitid(*_args):
+    cleanup_events.append(("waitid",))
+    return SimpleNamespace(si_pid=123, si_code=native_host.os.CLD_EXITED, si_status=0)
+
+
+native_host.os.waitid = fake_waitid
+try:
+    native_host._stop_process(FakeProcess())
+finally:
+    native_host.os.killpg = original_killpg
+    native_host.os.waitid = original_waitid
+assert cleanup_events[0] == ("kill", 123, native_host.signal.SIGTERM)
+assert cleanup_events[1] == ("waitid",)
+assert cleanup_events[2] == ("kill", 123, native_host.signal.SIGKILL)
+assert cleanup_events[3][0] == "wait"
 
 print("native host qualification checks passed")
 PY
