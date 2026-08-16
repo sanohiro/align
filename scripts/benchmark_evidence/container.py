@@ -53,6 +53,7 @@ class ContainerLaunch:
     cargo_home: str
     toolchain: str
     command: tuple[str, ...]
+    artifact_manifest_sha256: str | None = None
 
 
 def _error(label: str, message: str) -> None:
@@ -143,6 +144,13 @@ def _launch(value: Any) -> ContainerLaunch:
         for right in host_paths[index + 1 :]:
             if right.startswith(left + "/") or left.startswith(right + "/"):
                 _error("launch", "source, target, work, Cargo home, and toolchain must not nest")
+    artifact_manifest_sha256 = value.artifact_manifest_sha256
+    if artifact_manifest_sha256 is not None:
+        _string(
+            artifact_manifest_sha256,
+            _HEX64,
+            "launch.artifact_manifest_sha256",
+        )
     return ContainerLaunch(
         child_id=child_id,
         source=paths[0][1],
@@ -151,6 +159,7 @@ def _launch(value: Any) -> ContainerLaunch:
         cargo_home=paths[3][1],
         toolchain=paths[4][1],
         command=_command(value.command),
+        artifact_manifest_sha256=artifact_manifest_sha256,
     )
 
 
@@ -197,6 +206,9 @@ def build_argv(profile: Any, launch: ContainerLaunch) -> tuple[str, ...]:
     digest, _cpu_set, _numa_set, _cgroup_parent = _profile_identity(profile)
     launch = _launch(launch)
     name = f"{CONTAINER_PREFIX}{launch.child_id}"
+    native_env = () if launch.artifact_manifest_sha256 is None else (
+        f"--env=ALIGN_BENCH_ARTIFACT_MANIFEST_SHA256={launch.artifact_manifest_sha256}",
+    )
     return _common_argv(profile, name) + (
         "--env=PATH=/toolchain/bin:/usr/bin:/bin",
         "--env=LC_ALL=C",
@@ -207,6 +219,7 @@ def build_argv(profile: Any, launch: ContainerLaunch) -> tuple[str, ...]:
         "--env=CARGO_TARGET_DIR=/target",
         "--env=TMPDIR=/tmp",
         "--env=ALIGN_BENCH_WORK_DIR=/work",
+    ) + native_env + (
         f"--mount={_mount(launch.source, PATH, True)}",
         f"--mount={_mount(launch.target, TARGET, False)}",
         f"--mount={_mount(launch.work, WORK, False)}",

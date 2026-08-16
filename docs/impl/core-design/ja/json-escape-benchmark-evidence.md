@@ -717,6 +717,41 @@ provider merge verification、Request 7 language lifecycleを実行しない。
 | Failure and cleanup | sign/verify全pathでkey/executable descriptor close、complete process group reap、message/signature/allowed-signers remove、private directory removeを行う。runner error、`BaseException`、timeout/nonzero、output overflow、path replacement、read/close/unlink/rmdir failure、second invocationをinjectし、uncertain cleanup境界をsignature/`True`が越えないことを確認する。`scripts/test-benchmark-evidence-key-process.sh`、`benchmark_evidence_process_boundary_matrix`。 |
 | Scope and mirrors | private key bytesはPython object、command argv、environment、container mount、report bytes、returned errorへ入らない。English/Japanese contract、profile order、verifier handoff、native adapter、ownerは同じconstantを使う。host provisioning/live qualificationは明示的に後続。`git diff --check`、`scripts/test-benchmark-evidence-key-process.sh`。 |
 
+## Native performance measurement implementation closure
+
+このcapabilityはmerged profile、image/container argv boundary、prepared native artifact、fixed
+schedule、process cleanup primitiveをconsumeする。最初の実行可能なperformance-measurement railとして、
+pinned Docker clientでfixed prepared benchmark childを一つだけ起動し、bounded stdout/stderrをcaptureし、
+exact evidence outputをparseし、inner median tokenをinteger microsecondsとして返す。`BASE`選択、report
+publication、sign、merge verify、Request 7 language resultのacceptanceは行わない。
+
+実装候補はadversarial ownerを含め約1,100行の一つのcapability boundaryにまとめる。capture、profile
+limit、container construction、prepare/native digest binding、output parserは一つのproducer-to-consumer
+proofを形成し、分割すると各pieceがstable consumerを持たないままexact-output、cleanup、profile-limit
+fixtureを複数PRへ重複させるためである。
+
+### Public-contract ledger
+
+| Public surface | Exact contract、owner、acceptance |
+|---|---|
+| `native_host.CommandCapture` | 一つのcompleted fixed commandのimmutable bounded `stdout`/`stderr` bytes。両streamは既存64 KiB ceiling、empty environment、no shell、new process group、complete group cleanup、retained executable bindingを使う。`run_command_captured`/`run_docker_commands_captured`が公開し、既存output-only APIはwrapperとして残す。`benchmark_evidence_process_boundary_matrix`、`scripts/test-benchmark-evidence-native-measurement.sh`。 |
+| `native_measurement.ChildWorkspace` | 一つの`(benchmark, revision)`のtrusted host path：read-only source、writable target/work、read-only Cargo home/toolchain、optional artifact-manifest SHA-256。digestはそのpairのprepare child前だけabsentで、native child前にprepare outputのexact valueへreplaceする。pathはabsolute/non-aliasedで既存container validatorへ渡し、caller command/environmentは受けない。ownerはnative-measurement。 |
+| `native_measurement.NativeMeasurementConfig` | immutable trusted profile、pinned Docker-client SHA-256、fixed benchmark/revision productごとに一つの`ChildWorkspace`。mapはchild開始前にcompleteとし、native childはprepare-time digestだけを使う。各childはprofileのphase timeoutとstdout/stderr別capture ceilingをpinned host runnerへ渡し、native 64 KiB ceiling超過profileはrejectする。ownerはnative-measurement。 |
+| `native_measurement.execute_child` | 一つの`schedule.ChildPlan`とcontroller-assigned 64-hex child IDを受ける。`/src/bench/{json_decode,json_soa}/run.sh`とfixed `prepare native`/`native` suffixだけをbuildし、pinned Docker clientを一度だけ呼び、bounded stream hash/tail、monotonic elapsed ns、unchanged artifact digest、parsed outputを返す。周囲の`schedule.ScheduleState`がこのport前にoverlap、order、duplicate IDをrejectし、このportはretry、native中build、caller image/option/mount/environmentを許可しない。ownerはnative-measurement。 |
+| Output parser | prepare outputはfixed `/work/prepared/artifact-manifest.json` lineと一つの`artifact-manifest-sha256` lineだけ。native outputは`target: native`、title/header、ordered `10000`/`100000`/`1000000` rowだけ。million rowからfixed five-field tokenだけをpositive checked `u64` microsecondsにする。tab、profile line、extra row、malformed ratio/token、non-ASCII whitespace、warning、trailing byteはreject。ownerはnative-measurement。 |
+| Ownershipとnon-claims | adapterがownするのはpinned host runnerから返るDocker processとbounded captureだけ。trusted controllerがworkspace creation、monitor range、schedule transition、manifest comparison、report/staging/cleanupをownする。本sliceはaccepted x86_64 evidenceやwall-clock performanceをclaimしない。`HANDOFF.md`、`../align-llm/docs/align-requests.md`。 |
+
+### Implementation closure matrix
+
+| Axis | Implementation closureとexact regression |
+|---|---|
+| Formationとschedule | exact full `schedule.ChildPlan`、complete four-entry workspace product、distinct child ID、fixed benchmark/revision/phase、native前のprepared digestを要求する。plan mutation、missing pair、duplicate ID、wrong guest path、digestなしnativeはDocker前にreject。`scripts/test-benchmark-evidence-native-measurement.sh`、`scripts/test-benchmark-evidence-schedule.sh`。 |
+| Container construction | profile image、CPU/NUMA/cgroup selector、read-only source/toolchain/Cargo mount、pair-local writable target/work、fixed environment、native `ALIGN_BENCH_ARTIFACT_MANIFEST_SHA256`を`container.build_argv`で再利用する。tag、network、host mount、profile switch、Cargo override、shell、caller commandはcrossしない。ownerはnative-measurement/container。 |
+| Pinned processとcapture | 一回のinvocation前にretained Docker executableをhashし、exactly one commandを実行し、stdout/stderrを独立bounded、digestとstderr tailを記録し、monotonic clockで測り、complete groupをreapする。nonzero、timeout、overflow、hash drift、runner exception、close/reap uncertaintyはchild resultを返さない。ownerはnative-measurement/process-boundary。 |
+| Prepare/native join | prepareのexact two-line outputからmanifest digestをparseし、後続native childをtrusted valueへbindする。prepared pathから再deriveしない。native outputは成功zero-exit後だけparseし、buildを起動しない。ownerはnative-measurement。 |
+| Parser/arithmetic | exact title/header/row orderとASCII grammarをenforceし、floatなしでparseし、three-decimal millisecond tokenをchecked integer microsecondsへ一度だけconvertし、fixed five-field inventoryだけretainする。extra/profile/ratio/zero/overflow/field/row/order/warning/trailing mutationはreject。ownerはnative-measurement。 |
+| Failureとscope | failed childはparsed measurementもretryも返さない。resource ledger removalとlater cleanupはcontrollerがownする。workspace replacement、manifest drift、monitor event、report assembly、sign、publication、merge verify、BASE selectionはdownstream gateとして残し、English/Japanese contractとownerは同じconstantを使う。`git diff --check`、`scripts/test-benchmark-evidence-native-measurement.sh`。 |
+
 ## Design-review finding closure
 
 | Finding | Closure |
