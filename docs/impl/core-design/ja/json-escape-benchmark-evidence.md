@@ -539,8 +539,8 @@ handoffを未reviewのまま残す。
 
 ## Native host qualification implementation closure
 
-PR #842でdeterministicなcontroller/verifier consumerをmergeした。次のcapabilityはprivilegedなnative host/daemon
-adapterである。named Linux hostとDockerのobservationを読み、既存の`host.qualify` boundaryへ渡すcanonical
+PR #843でdeterministicなcontroller/verifier consumerとprivilegedなnative host/daemon qualificationをmergeした。
+このsectionはそのcapabilityで完了したnative host/daemon adapterを記録する。named Linux hostとDockerのobservationを読み、既存の`host.qualify` boundaryへ渡すcanonical
 inspection recordを構築する。profileを広げず、candidate codeをinspectせず、imageをexecuteせず、benchmarkをstartせず、
 signing keyをprovisionせず、これだけでaccepted Request 7 evidenceをclaimしない。
 
@@ -560,6 +560,51 @@ kernel、cgroup、Docker、load stateに依存してはならない。
 | Qualification snapshots | `pre`、`between`、`post`のexact 3 snapshotを、実際のacquisition transitionでcaptureする。すなわち`docker version`前、`docker version`後かつ`docker info`前、`docker info`後とする。integer parsingとfixed counter unitを使い、pressure/swap counterのresetをrejectし、profile limit/orderは`host.qualify`をone validation boundaryとして保つ。missing source、reset/overflow、invalid unit、extra phaseはrejectする。`benchmark_evidence_native_host_matrix`. |
 | Ownership and failure | adapterは自分がopenしたdescriptorとspawnしたchildだけをownし、leaderが終了した後もcomplete process groupへbounded TERM/KILL cleanupを行い、`ESRCH`だけを既に消えたgroupとして扱い、全pathでclose/reapする。host configurationやrepository stateをmutateせず、timeout、close/reap uncertainty、parser error、cleanup failureの後はqualified recordを返さない。`benchmark_evidence_native_host_matrix`. |
 | Explicit deferrals | image self-inspection/toolchain reproduction、monitorのchild event stream、cryptographic key-process integration、provider/review API integration、performance measurement、merge verification、lifecycle advanceは後続capabilityとする。`benchmark_evidence_native_host_matrix`. |
+
+## Native image self-inspection implementation closure
+
+PR #843のnative Docker client/daemon boundaryをconsumeし、profile imageそのものをqualificationする。これはpinned
+imageを実際にexecuteする最初のpathだが、candidate build、benchmark、signing key、provider query、accepted Request 7
+evidenceは扱わない。
+
+host側のDocker inspectionはprofileのlocal image IDだけでimageをselectし、daemonのimage ID、repository digest、tag、OS、
+architectureを返す。次に同じdigest-pinned image内のfixed commandを一度だけ実行し、image-bundled config digest、全profile
+executableのversion/SHA-256、Cargo cache/config hashを返す。adapterはこの2つをdeclared orderでmergeし、既存のpure
+`image.qualify`へ渡す。
+
+### Public-contract ledger
+
+| Public record | Exact contract / owner |
+|---|---|
+| Host inspection | `/usr/bin/docker --config /etc/align-evidence/docker-empty --host unix:///var/run/docker.sock image inspect --platform=linux/amd64 --format=<fixed JSON template> sha256:<profile.image.local_image_id>`を使う。tag、repository selector、registry request、shell、caller formatはない。templateは`image_id`、`repo_digests`、`repo_tags`、`os`、`architecture`のexact orderを出す。`benchmark_evidence_native_image_matrix`. |
+| Image self-inspection | `docker run --rm --pull=never --network=none --read-only`と、既存profile-bound UID、seccomp/LSM、cpuset、NUMA、root cgroup parent、memory/pid/file limit、private namespace、fixed environment、host mountなしを要求する。image digest `sha256:<profile.image.local_image_id>`で`/opt/align-evidence/image-self-inspect`だけを実行し、`config_digest`、`toolchain`、`cargo_cache_manifest_sha256`、`cargo_config_sha256`のcanonical JSONを出す。`benchmark_evidence_container_matrix`; `benchmark_evidence_native_image_matrix`. |
+| Merged observation | `native_image.inspect(profile)`は既存`image.qualify` orderの`registry_digest`、`image_id`、`config_digest`、`platform`、`repo_tags`、`toolchain`、2つのhashを返す。host responseだけがimage ID/tag/platformを、self-inspectorだけがconfig/toolchain/cacheを供給し、adapterはself-inspector前にhost identityをprecheckする。merged recordのcomplete profile比較はpure validatorが行う。`benchmark_evidence_native_image_matrix`; `benchmark_evidence_image_matrix`. |
+| Identity | host responseはprofile local image IDと一致する一つの`sha256:` ID、profile registry digestと一致する一つのrepository digest、empty tag list、`linux`、`amd64`を持つ。missing、extra、mutable、mismatchはself-inspector前にrejectする。`benchmark_evidence_native_image_matrix`. |
+| Client / cleanup | 各Docker operationはfixed empty configとlocal socketを使い、real adapterではno-follow/root-owned descriptorをopenしてhashをprofileと比較し、そのdescriptorからexecuteする。`--rm`を通常cleanupとし、timeout/setup/uncertain client failure時はfixed `docker container rm --force --volumes align-evidence-image-<child_id>`を一度だけ試す。cleanup uncertaintyはqualified resultを返さない。`benchmark_evidence_native_host_matrix`; `benchmark_evidence_native_image_matrix`. |
+| Scope / acceptance | ownerはargv、parser、merge、identity、no-network/no-mount、client binding、failure cleanupをfixtureで証明する。real administrator self-qualificationはBASE前に必要であり、monitor、key、workload、merge verification、lifecycle advanceは後続である。`benchmark_evidence_native_image_matrix`. |
+
+### Implementation closure matrix
+
+| Axis | Implementation closure / exact regression |
+|---|---|
+| Formation / profile binding | profile IDとlocal image IDからfixed image child IDを導出し、image、machine、Docker、toolchainを検証してからargvを作る。missing/malformed、wrong architecture/digest、alternate commandはrejectする。`scripts/test-benchmark-evidence-native-image.sh`. |
+| Host observation | exact image inspect command、canonical five-member object、one image ID、one repository digest、empty tags、Linux/amd64を検証する。multiple image/digest、tag、wrong platform、name grammar、noncanonical/trailing outputはself-inspector前にrejectする。`scripts/test-benchmark-evidence-native-image.sh`. |
+| Self-inspection argv | `--pull=never`、`--network=none`、read-only root、cap/security/limit/private namespace、fixed env、mountなし、profile digest、deterministic name、sole inspector pathをassertする。caller command/tag/network/mount/privileged optionは入らない。`scripts/test-benchmark-evidence-native-image.sh`. |
+| Self-inspection parser | exact canonical four-member object、config digest、ordered eight-tool identity、2つのhashを検証する。missing/extra/reordered、tool/version/hash/cache/config mutation、noncanonical/empty/overflowはrejectする。`scripts/test-benchmark-evidence-native-image.sh`. |
+| Identity join | merged recordを`image.qualify`へ渡し、hostがtoolchain/cacheを、imageがdaemon image ID/tag/platformを供給できないことをownerで確認する。`scripts/test-benchmark-evidence-native-image.sh`; `scripts/test-benchmark-evidence-image.sh`. |
+| Process / cleanup | productionはretained Docker descriptor、fixed env、bounded output/time、complete process-group cleanupを使う。fixtureはhash-before-run、operation order、timeout、nonzero、overflow、cleanup success/failureをinjectする。`scripts/test-benchmark-evidence-native-image.sh`; `scripts/test-benchmark-evidence-native-host.sh`. |
+| TOCTOU / mirrors | tagではなくimmutable local IDを使い、inspect/run間のremove/replaceはfail closedとする。English/Japanese、`image.py`、`container.py`、`native_image.py`、ownerのfield order/command constantを一致させる。`git diff --check`; `scripts/test-benchmark-evidence-native-image.sh`. |
+
+## Native image review closure
+
+`7a38670d`の最初の独立reviewで、P1のboundary gapが2件、P2のordering gapが1件見つかった。capabilityのclaimは広げず、
+3件を一つのrepair commitで閉じた。
+
+| Finding | Ledger-first closure |
+|---|---|
+| Docker runのinterruptがcleanupをskipできた | production retained runnerからの`BaseException`を`NativeImageError`へ変換し、image-run pathのfixed force/removeへ必ず送る。ownerはproduction-runの`KeyboardInterrupt`、cleanup command、qualified record非生成を確認する。`benchmark_evidence_native_image_matrix`. |
+| image `ENTRYPOINT`がfixed inspectorを置換できた | image argvに`--entrypoint=/opt/align-evidence/image-self-inspect`を明示し、trailing commandを渡さない。image-defined startup codeを通らないことをargv ownerでassertする。`benchmark_evidence_container_matrix`; `benchmark_evidence_native_image_matrix`. |
+| host identityがself-inspection後に検証された | canonical host parse直後、`run_argv`のexecute前にlocal image IDとregistry digestをprofileとcompareする。ownerは各mutationでhost commandだけが走ることを確認する。`benchmark_evidence_native_image_matrix`. |
 
 ## Native host review closure
 

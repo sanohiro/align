@@ -7,7 +7,7 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-16._ Align main is at `6812ced5` after the trusted controller/verifier
+_Last updated: 2026-08-16._ Align main is at `15e1fa9d` after the trusted controller/verifier
 orchestration core (PR #842), the merge-race owners (PR #840) and
 the adversarial process/schedule/cleanup/exclusive-run owners (PR #839), following prepared execution owners (PR #838), the monitor
 lifecycle core (PR #837), and prepared-benchmark sealing (PR #827). align-llm Request 5's bounded HTTP response
@@ -17,11 +17,14 @@ controller CLI (#822), installed-manifest/profile binding (#823), raw Git object
 (#825), pinned Git batch response codec (#828), pinned Git process boundary (#830), and two-sided
 Git revision/tree binding (#831), verified Git source materialization (#832), and canonical evidence
 profile validation (#833), fixed container launch binding (#834), pinned image qualification (#835),
-and native host qualification (#836), the prepared-benchmark boundary (#827), and the pure monitor
+and native host qualification (#843), the prepared-benchmark boundary (#827), and the pure monitor
 lifecycle core (#837) are merged. PR #842 adds the trusted fixture-owned controller/verifier
 phase ordering, report-only producer handoff, lock-held durable staging, and fail-closed restart
 boundary; it does not inspect a real host, invoke Docker, run the workload, manage keys, query
-GitHub, or advance post-merge lifecycle.
+GitHub, or advance post-merge lifecycle. PR #843 adds fixed native source reads, trusted Docker
+client/configuration binding, bounded process cleanup, phase snapshots, profile-bound cgroup
+parent propagation, and selected-CPU identity validation; it does not execute the image, run the
+workload, manage keys, verify a merge, or advance lifecycle.
 The align-repl user guide and release artifacts are shipped in #826/#829. PR #827's
 two protected JSON benchmarks gain the reviewed two-phase
 `prepare native` / direct `native` interface, canonical artifact sealing, checked integer inner
@@ -35,9 +38,10 @@ development qualification, not accepted evidence. Its focused owners are
 `scripts/test-benchmark-evidence-statistics.sh`. The prepared execution and adversarial
 process/schedule/cleanup/exclusive-run owners are shipped in this slice; the merge-race owner is
 also shipped in PR #840, and the trusted controller/verifier orchestration core is shipped in PR
-#842. The next Request 7 work is privileged native x86_64 host/daemon qualification; image
-self-inspection, key-process integration, performance measurement, and merge verification remain
-later gates.
+#842 and #843. The next Request 7 work is native image self-inspection: fixed host-side image
+identity plus one network-disabled, read-only self-inspector inside the pinned image. Key-process
+integration, performance measurement, merge verification, and the Request 7 language implementation
+remain later gates.
 
 The final integration review of `0dbbd709` against `c47e57c7` found three valid remaining handoff
 issues. The consolidated closure requires the trusted caller to retain prepare's manifest SHA-256
@@ -104,10 +108,10 @@ work directory, with the prepare-time digest supplied to direct execution and an
 sentinel excluded by the fixed launcher environment. The final-review-repair rerun produced decode
 digest `efca5a28a02e8b49636092413c0f92386c39f2bfcb754f7a9f5ddc83f090ef2c` and SoA digest
 `5b1ff95b9364253e4afb81d209d909dfdd5455616f681fcbe5c8c2403fbfaa3c`. These are
-correctness/boundary owners, not accepted x86_64 performance evidence. At #842's merge, the next
-eligible capability is privileged native x86_64 host/daemon qualification; image self-inspection,
-key-process integration, performance measurement, merge verification, and the Request 7 language
-implementation remain later gates. No emulation is accepted in any evidence lane.
+correctness/boundary owners, not accepted x86_64 performance evidence. At #843's merge, the next
+eligible capability is native image self-inspection; key-process integration, performance
+measurement, merge verification, and the Request 7 language implementation remain later gates. No
+emulation is accepted in any evidence lane.
 
 The C-B borrow/ownership capability is complete
 through L2e, F-A native resources is complete through L3, and F-B explicit

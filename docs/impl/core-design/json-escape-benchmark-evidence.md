@@ -711,8 +711,9 @@ those fixtures and leave the controller's byte handoff unreviewed.
 
 ## Native host qualification implementation closure
 
-PR #842 merged the deterministic controller/verifier consumer. The next capability is the
-privileged native host/daemon adapter. It reads the named Linux host and Docker observations,
+PR #843 merged the deterministic controller/verifier consumer and privileged native host/daemon
+qualification. This section records the native host/daemon adapter completed in that capability.
+It reads the named Linux host and Docker observations,
 constructs the existing canonical inspection records, and passes them through the already merged
 `host.qualify` boundary. It does not widen the profile, inspect candidate code, execute the image,
 start a benchmark, provision a signing key, or claim accepted Request 7 evidence by itself.
@@ -735,6 +736,58 @@ that had not been checked as one acquisition boundary.
 | Qualification snapshots | Capture exactly `pre`, `between`, and `post` snapshots for load, CPU/memory pressure, free memory, and swap counters at the real acquisition transitions: before `docker version`, after `docker version` and before `docker info`, and after `docker info`. Use integer parsing and fixed counter units, reject any pressure/swap counter reset, then call `host.qualify` so profile limits and order remain one validation boundary. A missing source, reset/overflow, invalid unit, or extra phase rejects. `benchmark_evidence_native_host_matrix`. |
 | Ownership and failure | The adapter owns only opened descriptors and child processes it created; it closes/reaps them on every path, sends bounded TERM/KILL cleanup to the complete process group even after its leader exits, treats only `ESRCH` as an already-gone group, never mutates host configuration or repository state, and reports no qualified record after a timeout, close/reap uncertainty, parser error, or cleanup failure. `benchmark_evidence_native_host_matrix`. |
 | Explicit deferrals | Image self-inspection/toolchain reproduction, the monitor's child event stream, cryptographic key-process integration, provider/review API integration, performance measurement, merge verification, and lifecycle advancement remain later capabilities. `benchmark_evidence_native_host_matrix`. |
+
+## Native image self-inspection implementation closure
+
+PR #843 supplies the native Docker client/daemon boundary. This capability consumes that boundary
+to qualify the locally present profile image itself. It is the first path that executes the pinned
+image, but it does not execute a candidate build, run a benchmark, manage a signing key, query a
+provider, or claim accepted Request 7 evidence.
+
+The image boundary deliberately has two observations and one merge point. The host-side Docker
+inspection selects the image only by the profile's local image ID and returns the daemon's image
+ID, repository digests, tags, operating system, and architecture. A separate fixed command inside
+that same digest-pinned image returns the image-bundled config digest, every profiled executable's
+version and SHA-256, and the Cargo cache/config hashes. The adapter combines those records in the
+declared order and passes the result to the existing pure `image.qualify` validator.
+
+### Public-contract ledger
+
+| Public record | Exact contract and owner |
+|---|---|
+| Host inspection command | The native adapter invokes `/usr/bin/docker --config /etc/align-evidence/docker-empty --host unix:///var/run/docker.sock image inspect --platform=linux/amd64 --format=<fixed JSON template> sha256:<profile.image.local_image_id>`. It uses no tag, repository selector, registry request, shell, or caller-supplied format. The fixed template emits exactly `image_id`, `repo_digests`, `repo_tags`, `os`, and `architecture`, in that order. `benchmark_evidence_native_image_matrix`. |
+| Image self-inspection command | The trusted container argv builder invokes `docker run --rm --pull=never --network=none --read-only` with the existing profile-bound UID, seccomp/LSM, cpuset, NUMA set, root cgroup parent, memory/pid/file limits, private namespaces, fixed environment, and no host mounts. It selects `sha256:<profile.image.local_image_id>` and runs only `/opt/align-evidence/image-self-inspect`. The command emits canonical UTF-8 JSON with exactly `config_digest`, `toolchain`, `cargo_cache_manifest_sha256`, and `cargo_config_sha256`. `benchmark_evidence_container_matrix`; `benchmark_evidence_native_image_matrix`. |
+| Merged image observation | `native_image.inspect(profile)` returns canonical fields in the existing `image.qualify` order: `registry_digest` is the one digest suffix from the host `repo_digests` record; `image_id`, `repo_tags`, and `platform` come from the host response; the config/toolchain/cache fields come only from the image self-inspector. The adapter performs the two host-identity prechecks before starting the image, and the pure validator remains the complete profile comparison boundary for the merged record and returns `QualifiedImage`. `benchmark_evidence_native_image_matrix`; `benchmark_evidence_image_matrix`. |
+| Image identity | The host response must contain exactly one `sha256:` image ID equal to the profile local image ID, exactly one repository digest equal to the profile registry digest, an empty tag list, `os=linux`, and `architecture=amd64`. A missing, extra, mutable, or mismatched identity rejects before the self-inspector runs. `benchmark_evidence_native_image_matrix`. |
+| Docker executable binding | Both Docker operations use the fixed empty config and local socket. In the real adapter the executable is opened once per operation through a no-follow, root-owned descriptor, hashed before execution, and executed through that descriptor; the hash must equal `profile.docker.client_sha256`. The descriptor and all child pipes are closed/reaped before a qualified record can be returned. `benchmark_evidence_native_host_matrix`; `benchmark_evidence_native_image_matrix`. |
+| Failure/cleanup | `--rm` owns successful and ordinary nonzero image-container removal. A timeout, stream/setup failure, or uncertain Docker client exit triggers one fixed `docker container rm --force --volumes align-evidence-image-<child_id>` attempt. Cleanup uncertainty rejects and never returns a qualified image. No workload, source, target, Cargo cache mount, signing key, Docker socket, or controller path is visible inside the inspection container. `benchmark_evidence_native_image_matrix`; `benchmark_evidence_process_boundary_matrix`. |
+| Ownership and allocation | The native adapter owns bounded host/self-inspection output, Docker descriptors, process groups, and the deterministic container name. The image owns only read-only image bytes plus its private `/tmp`; no candidate-controlled input crosses the command boundary. Output is bounded by the existing native command ceiling and is parsed before the record crosses to `image.qualify`. `benchmark_evidence_native_image_matrix`. |
+| Acceptance and deferrals | Deterministic fixture owners prove argv, parser, merge, identity, no-network/no-mount isolation, client binding, and failure cleanup. A real administrator self-qualification is required before `BASE`; this capability does not monitor benchmark children, provision keys, run the performance workload, verify a merge, or advance lifecycle. `benchmark_evidence_native_image_matrix`. |
+
+### Implementation closure matrix
+
+| Axis | Implementation closure and exact regression |
+|---|---|
+| Formation and profile binding | Derive one fixed image child ID from the profile ID and local image ID; validate all profile image, machine, Docker, and toolchain fields before constructing argv. Missing/malformed profile fields, wrong architecture, digest grammar, and alternate child command reject. `scripts/test-benchmark-evidence-native-image.sh`. |
+| Host observation | Build the exact fixed `image inspect` command, decode one canonical object, require the exact five-member order, one local image ID, one repository digest, an empty tag list, Linux OS, and amd64 architecture. Multiple images/digests, tags, wrong platform, registry/name grammar, noncanonical JSON, and trailing output reject before image execution. `scripts/test-benchmark-evidence-native-image.sh`. |
+| Self-inspection construction | Extend the trusted container argv boundary with one fixed image-inspection command. Assert `--pull=never`, `--network=none`, read-only root, all capability/security/limit/private-namespace options, fixed environment, no mounts, the profile local digest, deterministic name, and the sole absolute inspector path. No caller-selected command, tag, network, mount, or privileged option can enter. `scripts/test-benchmark-evidence-native-image.sh`. |
+| Self-inspection parser | Decode the exact canonical four-member self-inspection object, validate the config digest, all eight ordered toolchain identities, and both hashes, then merge only those fields with the independent host observation. Missing/extra/reordered fields, tool/version/hash mutation, cache/config mutation, noncanonical bytes, stderr-only/empty output, and oversized output reject. `scripts/test-benchmark-evidence-native-image.sh`. |
+| Identity join | Pass the merged record through `image.qualify`; host identity cannot supply toolchain/cache fields and the image cannot supply Docker-reported image ID/tags/platform. Any cross-record mismatch rejects without exposing a qualified record. `scripts/test-benchmark-evidence-native-image.sh`; `scripts/test-benchmark-evidence-image.sh`. |
+| Client/process boundary | The production path uses the retained native Docker descriptor and fixed environment for each operation, validates the profile hash before spawning, bounds output/time, and tears down the complete process group. Fixture runners assert config validation, hash-before-run, command order, descriptor reuse within one operation, timeout, nonzero, output overflow, and cleanup errors. `scripts/test-benchmark-evidence-native-image.sh`; `scripts/test-benchmark-evidence-native-host.sh`. |
+| Container cleanup | The image run uses a fixed `--rm` name. On an uncertain run failure, the adapter performs the one fixed force/remove cleanup and rejects whether cleanup succeeds or fails; no later image operation or qualified result is emitted. The owner injects run failure, cleanup success, cleanup failure, and a second-operation attempt. `scripts/test-benchmark-evidence-native-image.sh`. |
+| TOCTOU and scope | The host selects by immutable local image ID rather than a tag; image removal or replacement between inspect and run fails closed because the exact ID is unavailable, and a different tag cannot redirect it. No repository, candidate, key, socket, or writable host mount appears in the image argv. The owner mutates target identity, tags, mount/network/security options, and operation order. `scripts/test-benchmark-evidence-native-image.sh`. |
+| Mirrors and acceptance | English and Japanese contracts, `image.py`, `container.py`, `native_image.py`, and the owner use the same field order and command constants. The HANDOFF records this as the current capability; real host qualification and all later Request 7 gates remain explicitly deferred. `git diff --check`; `scripts/test-benchmark-evidence-native-image.sh`. |
+
+## Native image review closure
+
+The first independent review of `7a38670d` found two P1 boundary gaps and one P2 ordering gap.
+The complete finding set is closed in one repair commit without widening the capability claim.
+
+| Finding | Ledger-first closure |
+|---|---|
+| A Docker-run interruption could bypass cleanup | `_run_one` converts interruptions and every other `BaseException` raised by the production retained Docker runner into `NativeImageError`; the image-run path then performs its one fixed force/remove attempt before returning failure. The owner injects a production-run `KeyboardInterrupt`, asserts the cleanup command, and proves no qualified record crosses the boundary. `benchmark_evidence_native_image_matrix`. |
+| Image `ENTRYPOINT` could replace the fixed inspector | The image argv now contains `--entrypoint=/opt/align-evidence/image-self-inspect` and supplies no trailing command. The daemon cannot route execution through image-defined startup code or treat the inspector as an argument. The argv owner asserts the explicit override and sole executable selector. `benchmark_evidence_container_matrix`; `benchmark_evidence_native_image_matrix`. |
+| Host image identity was checked after self-inspection | `_validate_host_identity` compares the Docker-reported local image ID and registry digest with the profile immediately after the canonical host parse and before `run_argv` is constructed/executed. The owner mutates each identity and asserts that only the host command ran. `benchmark_evidence_native_image_matrix`. |
 
 ## Native host review closure
 
