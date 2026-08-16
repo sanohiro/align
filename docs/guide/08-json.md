@@ -76,13 +76,13 @@ fn main() -> Result<(), Error> {
         print(s.len())                          // 3
         print(s.age.sum())                      // 96
         print(s.where(.active).age.sum())       // 71
-        print(s[0].name)                        // alice — a zero-copy view into `data`
+        print(s[0].name)                        // alice — clean strings view `data`
     }
     return Ok(())
 }
 ```
 
-`soa<User>` (chapter [11](11-data-oriented.md)) stores each field as its own contiguous column. Decoding into it builds the columns **directly while parsing** — no array-of-structs intermediate, no transpose afterwards — and string columns are zero-copy views borrowing the input text. That is why the decode lives in an `arena`: the columns share the arena's lifetime, the whole batch dies together, and the compiler holds you to it. This one-liner outruns typical hand-tuned decoders (it benchmarks at parity with Rust's serde_json at a million rows) because the *layout decision* removed the work, not a clever inner loop.
+`soa<User>` (chapter [11](11-data-oriented.md)) stores each field as its own contiguous column. Decoding into it builds the columns **directly while parsing** — no array-of-structs intermediate, no transpose afterwards — and clean string columns are zero-copy views borrowing the input text. Selected escaped strings are decoded once into the enclosing arena. That is why the decode lives in an `arena`: the columns share the arena's lifetime, the whole batch dies together, and the compiler holds you to it. This one-liner outruns typical hand-tuned decoders (it benchmarks at parity with Rust's serde_json at a million rows) because the *layout decision* removed the work, not a clever inner loop.
 
 ## The shape of a JSON program
 

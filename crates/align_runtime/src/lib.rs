@@ -3701,18 +3701,18 @@ pub unsafe extern "C" fn align_rt_json_decode(
     phf: *const i32,
     phf_len: i64,
     phf_seed: i64,
+    arena: *mut Arena,
 ) -> i32 {
     let src: &[u8] = unsafe { safe_slice(input, input_len) };
-    // A `str` field decoded from JSON is a zero-copy `{ptr,len}` view into `src`, so validating the
-    // whole input once guarantees every `str` field is valid UTF-8 (draft §7/§12; the same one-shot
-    // check simdjson does). Invalid → a decode error, before any view is handed out.
-    if !validate_utf8(src) {
+    // Clean `str` fields borrow `src`; escaped selected fields are materialized in `arena`.
+    // Validate the complete input before publishing either representation (draft §7/§12).
+    if !validate_utf8(src) || !validate_json_string_grammar(src) {
         return 1;
     }
     let descs: &[JsonField] = unsafe { safe_slice(fields, n_fields) };
     let phf = unsafe { phf_slice(phf, phf_len) };
 
-    let mut p = JsonParser { src, pos: 0 };
+    let mut p = JsonParser { src, pos: 0, arena };
     let ok = (|| -> Option<()> {
         unsafe { parse_object(&mut p, descs, out, out_size, phf, phf_seed as u64)? };
         p.ws();
@@ -3781,16 +3781,22 @@ unsafe fn decode_union_value(p: &mut JsonParser, u: &JsonUnion, base: *mut u8) -
 /// `union_desc` must be a valid [`JsonUnion`]; `out` must address `union_desc.store_size` writable,
 /// zeroed bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_json_decode_union(input: *const u8, input_len: i64, union_desc: *const JsonUnion, out: *mut u8) -> i32 {
+pub unsafe extern "C" fn align_rt_json_decode_union(
+    input: *const u8,
+    input_len: i64,
+    union_desc: *const JsonUnion,
+    out: *mut u8,
+    arena: *mut Arena,
+) -> i32 {
     if union_desc.is_null() || out.is_null() {
         return 1;
     }
     let src: &[u8] = unsafe { safe_slice(input, input_len) };
-    if !validate_utf8(src) {
+    if !validate_utf8(src) || !validate_json_string_grammar(src) {
         return 1;
     }
     let u = unsafe { &*union_desc };
-    let mut p = JsonParser { src, pos: 0 };
+    let mut p = JsonParser { src, pos: 0, arena };
     // `decode_union_value` is atomic: on failure it allocates nothing that survives (an
     // `array<Struct>` arm builds into a local `Vec` freed on the early return; the owned buffer is
     // materialized only after the value fully parses). So a decode failure needs no cleanup.
@@ -3969,8 +3975,9 @@ unsafe fn decode_nested(p: &mut JsonParser, sub: *const JsonSubTable, dst: *mut 
 /// Decode a JSON array-of-objects **value** at `p` (an `array<Struct>` field, REST-gateway runway
 /// Slice C) into a freshly heap-allocated owned AoS, returning its `{ptr, len}` (len = element
 /// count). Each element decodes via [`parse_object`] per the element `sub`-schema — so nested-struct
-/// / `Option` element fields recurse — into an `esz`-byte slot; `str` element fields stay zero-copy
-/// views into the input, so the array borrows the input (the parent struct is region-tied to it).
+/// / `Option` element fields recurse — into an `esz`-byte slot. Clean `str` fields borrow the input;
+/// selected escaped strings materialize once in the parser arena, so a string-bearing array is
+/// tied to the input and, when escapes are present, to that arena as well.
 /// The buffer is owned (freed by the struct's `Drop` — `drop_struct_fields`'s array arm). An empty
 /// array allocates nothing (`{null, 0}`). Returns `None` on any malformed element / structure.
 ///
@@ -3978,17 +3985,15 @@ unsafe fn decode_nested(p: &mut JsonParser, sub: *const JsonSubTable, dst: *mut 
 /// T1b — or `array<str>`) into a freshly heap-allocated owned buffer, returning its `{ptr, count}`.
 /// Each element is parsed by the shared per-scalar [`write_value`] into an `elem_width`-byte slot — so
 /// the same range / sign / float-width checks a scalar *field* gets apply per element. `elem_kind` is
-/// the scalar kind (0 = int, 1 = bool, 2 = float, 3 = str), `elem_signed` the int sign. A `str` element
-/// (kind 3, `elem_width == 16`) is a zero-copy `{ptr,len}` VIEW into the input `p` — the same borrowed
-/// model as a top-level `str` field — so the returned spine is owned but its elements borrow `p`. The
-/// buffer is owned (freed by the struct's `Drop` — `drop_struct_fields`'s flat `DynArray` free; a
-/// scalar/str-view element owns nothing, so no deep free). An empty array allocates nothing
-/// (`{null, 0}`). Returns `None` on any malformed element.
-///
+/// the scalar kind (0 = int, 1 = bool, 2 = float, 3 = str), `elem_signed` the int sign. A clean `str`
+/// element borrows the input; an escaped selected element is materialized exactly once in the parser
+/// arena and returns `None` when no arena was supplied. The owned spine is freed by the struct's Drop,
+/// while scalar/str elements themselves own nothing. An empty array allocates nothing (`{null, 0}`).
+/// Returns `None` on any malformed element or when a selected escaped string has no arena.
 /// # Safety
 /// `p` must be positioned at (optional whitespace then) the array's `[`; `elem_width ∈ {1,2,4,8,16}`
-/// (16 = a `str` view element). For a `str` element the returned spine's `{ptr,len}` entries borrow
-/// `p`'s input, so the result must not outlive `p`.
+/// (16 = a `str` view element). Clean entries borrow `p`'s input and escaped entries borrow its
+/// arena, so the result must not outlive those sources.
 unsafe fn decode_scalar_array_value(p: &mut JsonParser, elem_kind: i32, elem_width: usize, elem_signed: bool) -> Option<AlignStr> {
     p.ws();
     p.expect(b'[')?;
@@ -4363,13 +4368,13 @@ unsafe fn write_value(p: &mut JsonParser, kind: i32, width: i64, d: &JsonField, 
             Some(())
         }
         3 => {
-            // str: a zero-copy `{ptr,len}` view into the input buffer.
+            // Clean str values borrow the input; escaped selected values are arena materialized.
             if w != 16 {
                 return None;
             }
-            let s = p.string()?;
-            let ptr_bytes = (s.as_ptr() as usize as u64).to_le_bytes();
-            let len_bytes = (s.len() as i64).to_le_bytes();
+            let s = p.string_value()?;
+            let ptr_bytes = (s.ptr as usize as u64).to_le_bytes();
+            let len_bytes = s.len.to_le_bytes();
             unsafe {
                 std::ptr::copy_nonoverlapping(ptr_bytes.as_ptr(), dst, 8);
                 std::ptr::copy_nonoverlapping(len_bytes.as_ptr(), dst.add(8), 8);
@@ -4400,7 +4405,8 @@ unsafe fn write_value(p: &mut JsonParser, kind: i32, width: i64, d: &JsonField, 
 ///
 /// # Safety
 /// `out` must point to `out_size` writable, already-zeroed bytes; each descriptor's `name_ptr`
-/// must describe a valid byte range. `str` fields write a `{ptr,len}` view into `p`'s input.
+/// must describe a valid byte range. Clean str fields write a {ptr,len} view into p's input; escaped
+/// selected fields use p's caller arena.
 unsafe fn parse_object(
     p: &mut JsonParser,
     descs: &[JsonField],
@@ -4422,13 +4428,13 @@ unsafe fn parse_object(
     } else {
         loop {
             p.ws();
-            let key = p.string()?;
+            let key = p.string_body()?;
             p.ws();
             p.expect(b':')?;
             p.ws();
             // Find the matching field descriptor (unknown keys are skipped). O(1) via the
             // compile-time perfect-hash table when present, else a linear scan.
-            let idx = unsafe { find_field(descs, key, phf, phf_seed) };
+            let idx = unsafe { find_field_token(descs, key, phf, phf_seed) };
             match idx {
                 Some(i) => {
                     if !seen.mark(i) {
@@ -4590,6 +4596,7 @@ struct DecodeCtx<'a, D: FieldDst> {
     dst: &'a D,
     phf: Option<&'a [i32]>,
     phf_seed: u64,
+    arena: *mut Arena,
 }
 
 /// Write field `d`'s value into `dst` during the index-driven (Mison-style) decode. `k` is the
@@ -4601,12 +4608,24 @@ struct DecodeCtx<'a, D: FieldDst> {
 /// # Safety
 /// `dst` must resolve to `width` writable bytes for the field.
 #[inline]
-unsafe fn write_field_indexed<D: FieldDst>(src: &[u8], idx: &[u32], k: usize, fi: usize, d: &JsonField, dst: &D) -> Option<()> {
+unsafe fn write_field_indexed<D: FieldDst>(
+    src: &[u8],
+    idx: &[u32],
+    k: usize,
+    fi: usize,
+    d: &JsonField,
+    dst: &D,
+    arena: Option<*mut Arena>,
+) -> Option<()> {
     let kind = (d.tag >> 8) & 0xff;
     let width = field_width(d, kind)?;
     let p = unsafe { dst.field_ptr(fi, d, width)? };
     let colon = idx[k] as usize;
-    let mut vp = JsonParser { src, pos: skip_ws_at(src, colon + 1) };
+    // `None` is the speculation mode: it must not publish an arena allocation before fallback has
+    // confirmed the complete record. `Some(null)` remains a real decode with no caller arena and
+    // therefore rejects selected escaped strings in `write_value`.
+    let write_arena = arena.unwrap_or(core::ptr::null_mut());
+    let mut vp = JsonParser { src, pos: skip_ws_at(src, colon + 1), arena: write_arena };
     // Optional field (`opt_tag >= 0`): JSON `null` → `None` (the element buffer is zeroed, so the tag
     // is already 0); any other value writes the payload at `p` (the `Option`'s payload slot) and sets
     // the `Some` tag byte. A required field writes the value directly. The per-kind write (incl. the
@@ -4657,15 +4676,21 @@ unsafe fn json_speculate<D: FieldDst>(
             // An unqueried position (projection): still confirm its key is a plain, *undeclared* key,
             // or fall back so the strict duplicate/missing/malformed contract is enforced there.
             match key_before_colon(src, idx[k] as usize) {
-                Some(key) if unsafe { find_field(ctx.descs, key, ctx.phf, ctx.phf_seed) }.is_none() => continue,
+                Some(key) if unsafe { find_field_token(ctx.descs, key, ctx.phf, ctx.phf_seed) }.is_none() => continue,
                 _ => return false,
             }
         }
-        let d = &ctx.descs[fi as usize];
+        let Ok(fi) = usize::try_from(fi) else {
+            return false;
+        };
+        let d = &ctx.descs[fi];
         if !key_matches_before_colon(src, idx[k] as usize, unsafe { field_name(d) }) {
             return false; // structure drifted from the pattern — fall back
         }
-        if unsafe { write_field_indexed(src, idx, k, fi as usize, d, ctx.dst) }.is_none() {
+        // Do not publish an arena materialization from speculation: a later key/value mismatch
+        // would make fallback decode the same selected escaped string a second time. Returning
+        // false for that row keeps the single materialization in the fallback path.
+        if unsafe { write_field_indexed(src, idx, k, fi, d, ctx.dst, None) }.is_none() {
             return false;
         }
     }
@@ -4694,12 +4719,12 @@ unsafe fn json_fallback<D: FieldDst>(
         let Some(key) = key_before_colon(src, idx[k] as usize) else {
             return None; // a `:` not preceded by a `"..."` key — malformed object
         };
-        if let Some(fi) = unsafe { find_field(ctx.descs, key, ctx.phf, ctx.phf_seed) } {
+        if let Some(fi) = unsafe { find_field_token(ctx.descs, key, ctx.phf, ctx.phf_seed) } {
             if !seen.mark(fi) {
                 return None; // duplicate field
             }
             pat_field[o] = fi as i32;
-            unsafe { write_field_indexed(src, idx, k, fi, &ctx.descs[fi], ctx.dst)? };
+            unsafe { write_field_indexed(src, idx, k, fi, &ctx.descs[fi], ctx.dst, Some(ctx.arena))? };
         }
     }
     if seen.all_required_seen(ctx.descs) {
@@ -4712,9 +4737,9 @@ unsafe fn json_fallback<D: FieldDst>(
 /// Parse the JSON array of objects in `input` into a freshly heap-allocated owned `array<Struct>`
 /// (AoS), writing the materialized `{ptr, len}` (len = element count) to `out` (MMv2 slice 8d,
 /// the draft.md §19 headline). Each object is decoded by [`parse_object`] per the `fields`
-/// descriptors; `str` fields are zero-copy `{ptr,len}` views into `input`, so the result is
-/// owned (the buffer is freed by the generated `Drop`) yet borrows `input` for its string content
-/// — the compiler region-ties it to `input`. Returns 0 on success, 1 on a parse error (leaving
+/// descriptors; clean str fields are zero-copy {ptr,len} views into input, while escaped selected
+/// fields are materialized in the caller arena. The result is owned (the buffer is freed by the
+/// generated Drop) and region-tied to its borrowed input/arena sources. Returns 0 on success, 1 on a parse error (leaving
 /// `out` as the caller-zeroed `{null,0}`). An empty array allocates nothing (null buffer).
 ///
 /// # Safety
@@ -4731,11 +4756,11 @@ pub unsafe extern "C" fn align_rt_json_decode_struct_array(
     phf: *const i32,
     phf_len: i64,
     phf_seed: i64,
+    arena: *mut Arena,
 ) -> i32 {
     let src: &[u8] = unsafe { safe_slice(input, input_len) };
-    // Validate the whole input once — every decoded `str` field is a zero-copy view into `src`, so
-    // this covers all of them (draft §7/§12). Invalid UTF-8 → a decode error.
-    if !validate_utf8(src) {
+    // Validate the whole input once before any clean view or arena materialization is published.
+    if !validate_utf8(src) || !validate_json_string_grammar(src) {
         return 1;
     }
     let descs: &[JsonField] = unsafe { safe_slice(fields, n_fields) };
@@ -4789,7 +4814,7 @@ pub unsafe extern "C" fn align_rt_json_decode_struct_array(
                     if depth == 2 {
                         let eptr = unsafe { buf.as_mut_ptr().add(eoff) };
                         let dst = AosDst { eptr, esz: esz as i64 };
-                        let ctx = DecodeCtx { descs, dst: &dst, phf, phf_seed };
+                        let ctx = DecodeCtx { descs, dst: &dst, phf, phf_seed, arena };
                         let spec = pat_ncol == rec_cols.len() as i64
                             && unsafe { json_speculate(src, &idx, &rec_cols, &pat_field, &ctx) };
                         if !spec {
@@ -4877,8 +4902,9 @@ pub unsafe extern "C" fn align_rt_json_scan_next(
     // A well-formed cursor is a non-negative byte offset we wrote on the previous step; clamp
     // defensively (negative / >usize on a 32-bit target → treat as exhausted at end-of-input).
     let start = usize::try_from(unsafe { *cursor }).unwrap_or(usize::MAX).min(src.len());
-    // On the first step (`cursor == 0`), validate the whole input once — every decoded `str` field is
-    // a zero-copy view into `src`, so this covers them all (like the decode paths). Invalid → error.
+    // On the first step (cursor == 0), validate UTF-8 once. String-token grammar is validated by
+    // string_body/skip_string while each row is decoded; scanner rows have no arena, so an escaped
+    // selected string returns the normal malformed-row status without hidden allocation.
     if start == 0 && !validate_utf8(src) {
         return 2;
     }
@@ -4886,7 +4912,7 @@ pub unsafe extern "C" fn align_rt_json_scan_next(
     let phf = unsafe { phf_slice(phf, phf_len) };
     let Ok(osz) = usize::try_from(out_size) else { return 2 };
 
-    let mut p = JsonParser { src, pos: start };
+    let mut p = JsonParser { src, pos: start, arena: core::ptr::null_mut() };
     // Skip inter-value separators: whitespace (incl. newlines), a top-level array's `[`, and the `,`
     // between values. This is what unifies a JSON array and NDJSON in one scanner.
     loop {
@@ -4969,9 +4995,8 @@ pub unsafe extern "C" fn align_rt_json_decode_soa(
         return 1;
     }
     let src: &[u8] = unsafe { safe_slice(input, input_len) };
-    // Validate the whole input once — every decoded `str` column entry is a zero-copy view into
-    // `src`, so this covers all of them (draft §7/§12). Invalid UTF-8 → a decode error.
-    if !validate_utf8(src) {
+    // Clean strings borrow src; escaped selected strings materialize in arena.
+    if !validate_utf8(src) || !validate_json_string_grammar(src) {
         return 1;
     }
     let descs: &[JsonField] = unsafe { safe_slice(fields, n_fields) };
@@ -5066,7 +5091,7 @@ pub unsafe extern "C" fn align_rt_json_decode_soa(
                 b'}' => {
                     if depth == 2 {
                         let dst = SoaDst { base, row, cols: &cols };
-                        let ctx = DecodeCtx { descs, dst: &dst, phf, phf_seed };
+                        let ctx = DecodeCtx { descs, dst: &dst, phf, phf_seed, arena };
                         let spec = pat_ncol == rec_cols.len() as i64
                             && unsafe { json_speculate(src, &idx, &rec_cols, &pat_field, &ctx) };
                         if !spec {
@@ -5093,13 +5118,17 @@ pub unsafe extern "C" fn align_rt_json_decode_soa(
 /// Parse the JSON array in `input` into a freshly heap-allocated owned `array<T>`, writing the
 /// materialized `{ptr, len}` (len = element count) to `out` (MMv2 slice 8c). `elem_tag` is the
 /// element encoding `(signed << 16) | (kind << 8) | byte-width` (kind 0 = int, 1 = bool, 2 = float;
-/// bit 16 = int sign flag), matching the struct-field tags. Elements are *copied* into the new
-/// buffer (not borrowed), so the result is
-/// owned and freed by the generated `Drop`. Returns 0 on success, 1 on a parse error (leaving
-/// `out` as the caller-zeroed `{null,0}`). An empty array allocates nothing (null buffer).
+/// this top-level ABI accepts numeric elements only). Typed struct-field descriptors additionally
+/// use kind 3 for `str`: clean elements borrow the input and selected escaped elements require the
+/// arena-bearing path. Numeric elements are copied into the new buffer, whose spine is owned and
+/// freed by generated `Drop`.
+/// Returns 0 on success, 1 on a parse error (leaving `out` as the caller-zeroed `{null,0}`). An
+/// empty array allocates nothing (null buffer).
 ///
 /// # Safety
-/// `input` must describe a valid byte range; `out` must point to a writable `{ptr,len}`.
+/// `input` must describe a valid byte range; `out` must point to a writable `{ptr,len}`. The
+/// top-level scalar-array entry point has no arena, so a selected escaped `str` element is an
+/// intentional error; the typed struct-field path supplies the caller arena.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_json_decode_array(
     input: *const u8,
@@ -5108,10 +5137,9 @@ pub unsafe extern "C" fn align_rt_json_decode_array(
     out: *mut AlignStr,
 ) -> i32 {
     let src: &[u8] = unsafe { safe_slice(input, input_len) };
-    // A JSON `array<str>` element is a zero-copy view into `src`; validate the whole input once so
-    // every element is valid UTF-8 (draft §7/§12). Invalid UTF-8 → a decode error. (A scalar-element
-    // array carries no `str`, but the invariant that a decoded `str` is UTF-8 is uniform, so the
-    // one-shot check stays at every `json.decode` entry.)
+    // Validate UTF-8 for any `str` elements before publishing their input views. The arena-free
+    // top-level array entry point rejects selected escaped elements through `write_value`; the
+    // supported struct-field path supplies the caller arena for those materializations.
     if !validate_utf8(src) {
         return 1;
     }
@@ -5121,7 +5149,7 @@ pub unsafe extern "C" fn align_rt_json_decode_array(
     let mut bytes: Vec<u8> = Vec::new();
     let mut count: i64 = 0;
 
-    let mut p = JsonParser { src, pos: 0 };
+    let mut p = JsonParser::new(src);
     let ok = (|| -> Option<()> {
         p.ws();
         p.expect(b'[')?;
@@ -5218,7 +5246,7 @@ pub unsafe extern "C" fn align_rt_json_decode_scalar(input: *const u8, input_len
     let kind = (elem_tag >> 8) & 0xff;
     let width = (elem_tag & 0xff) as i64;
     let ed = JsonField { name_ptr: core::ptr::null(), name_len: 0, tag: elem_tag, offset: 0, sub: core::ptr::null(), opt_tag: -1 };
-    let mut p = JsonParser { src, pos: 0 };
+    let mut p = JsonParser::new(src);
     let ok = (|| -> Option<()> {
         p.ws();
         unsafe { write_value(&mut p, kind, width, &ed, out)? };
@@ -6424,12 +6452,10 @@ fn json_decode_index(src: &[u8], out: &mut Vec<u32>) {
 
 // ── UTF-8 validation (draft §7/§12: a `str`/`string` is always valid UTF-8) ──────────────────────
 // Every I/O surface that hands out a `str` — `fs.read_file`, `fs.read_file_view` (mmap + fallback),
-// `json.decode` (a decoded `str` field is a zero-copy view into the input, so validating the whole
-// input once covers every field, exactly as simdjson does) — runs its bytes through here first;
-// invalid → the operation fails rather than producing a `str` that breaks the invariant. Binary reads
-// take the `reader.read(buffer)` path instead (`bytes`/`buffer` carry no UTF-8 invariant, draft §18.2).
-//
-// Algorithm: Lemire's range/lookup table method (simdjson `utf8_lookup4`), with AVX2 (x86_64) / NEON
+// and `json.decode` — runs its bytes through here before publishing either a clean input view or
+// an arena-owned decoded escape; invalid input fails rather than producing a malformed `str`. Binary
+// reads take the `reader.read(buffer)` path instead (`bytes`/`buffer` carry no UTF-8 invariant, draft
+// §18.2).
 // (aarch64) / scalar paths. The scalar path is `std::str::from_utf8` — the correctness reference and
 // the oracle the SIMD paths are differentially tested against (same discipline as the decode index).
 
@@ -6687,11 +6713,195 @@ fn validate_utf8(bytes: &[u8]) -> bool {
     validate_utf8_scalar(bytes)
 }
 
+/// Decode the number of UTF-8 bytes produced by a JSON string body. The input has already passed the
+/// document-wide UTF-8 check at every public decode boundary; this pass owns the JSON string grammar:
+/// raw C0 bytes are rejected, short escapes are mapped, and Unicode escapes require valid surrogate
+/// pairing. It allocates nothing, so ignored keys and values can be validated without scratch space.
+fn json_unescaped_len(raw: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    let mut len = 0usize;
+    while i < raw.len() {
+        let b = raw[i];
+        if b != b'\\' {
+            if b < 0x20 || b == b'"' { return None; }
+            len = len.checked_add(1)?;
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let e = *raw.get(i)?;
+        i += 1;
+        match e {
+            b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {
+                len = len.checked_add(1)?;
+            }
+            b'u' => {
+                let cp = json_hex4(raw, i)?;
+                i += 4;
+                let scalar = if (0xD800..=0xDBFF).contains(&cp) {
+                    if raw.get(i) != Some(&b'\\') || raw.get(i + 1) != Some(&b'u') { return None; }
+                    let lo = json_hex4(raw, i + 2)?;
+                    if !(0xDC00..=0xDFFF).contains(&lo) { return None; }
+                    i += 6;
+                    0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+                } else if (0xDC00..=0xDFFF).contains(&cp) {
+                    return None;
+                } else {
+                    cp
+                };
+                len = len.checked_add(char::from_u32(scalar)?.len_utf8())?;
+            }
+            _ => return None,
+        }
+    }
+    Some(len)
+}
+
+/// Write a validated JSON string body into an exactly sized destination. Returns the number of
+/// bytes written; the destination is caller-owned and no temporary proportional buffer is used.
+fn json_unescape_to(raw: &[u8], dst: &mut [u8]) -> Option<usize> {
+    let expected = json_unescaped_len(raw)?;
+    if expected != dst.len() { return None; }
+    let mut i = 0;
+    let mut out = 0;
+    while i < raw.len() {
+        let b = raw[i];
+        if b != b'\\' {
+            dst[out] = b;
+            out += 1;
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let e = raw[i];
+        i += 1;
+        match e {
+            b'"' => dst[out] = b'"',
+            b'\\' => dst[out] = b'\\',
+            b'/' => dst[out] = b'/',
+            b'b' => dst[out] = 0x08,
+            b'f' => dst[out] = 0x0c,
+            b'n' => dst[out] = b'\n',
+            b'r' => dst[out] = b'\r',
+            b't' => dst[out] = b'\t',
+            b'u' => {
+                let cp = json_hex4(raw, i)?;
+                i += 4;
+                let scalar = if (0xD800..=0xDBFF).contains(&cp) {
+                    if raw.get(i) != Some(&b'\\') || raw.get(i + 1) != Some(&b'u') { return None; }
+                    let lo = json_hex4(raw, i + 2)?;
+                    if !(0xDC00..=0xDFFF).contains(&lo) { return None; }
+                    i += 6;
+                    0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+                } else if (0xDC00..=0xDFFF).contains(&cp) {
+                    return None;
+                } else {
+                    cp
+                };
+                let c = char::from_u32(scalar)?;
+                let mut buf = [0u8; 4];
+                let bytes = c.encode_utf8(&mut buf).as_bytes();
+                dst[out..out + bytes.len()].copy_from_slice(bytes);
+                out += bytes.len();
+                continue;
+            }
+            _ => return None,
+        }
+        out += 1;
+    }
+    (out == expected).then_some(out)
+}
+
+/// Compare a raw JSON string body to a clean semantic key without materializing the escaped body.
+fn json_string_equals(raw: &[u8], target: &[u8]) -> bool {
+    let Some(expected) = json_unescaped_len(raw) else { return false };
+    if expected != target.len() { return false; }
+    let mut i = 0;
+    let mut out = 0;
+    while i < raw.len() {
+        let b = raw[i];
+        if b != b'\\' {
+            if target.get(out) != Some(&b) { return false; }
+            out += 1;
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let e = raw[i];
+        i += 1;
+        let scalar = match e {
+            b'"' => 0x22,
+            b'\\' => 0x5c,
+            b'/' => 0x2f,
+            b'b' => 0x08,
+            b'f' => 0x0c,
+            b'n' => 0x0a,
+            b'r' => 0x0d,
+            b't' => 0x09,
+            b'u' => {
+                let Some(cp) = json_hex4(raw, i) else { return false };
+                i += 4;
+                if (0xD800..=0xDBFF).contains(&cp) {
+                    if raw.get(i) != Some(&b'\\') || raw.get(i + 1) != Some(&b'u') { return false; }
+                    let Some(lo) = json_hex4(raw, i + 2) else { return false };
+                    if !(0xDC00..=0xDFFF).contains(&lo) { return false; }
+                    i += 6;
+                    0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+                } else if (0xDC00..=0xDFFF).contains(&cp) {
+                    return false;
+                } else {
+                    cp
+                }
+            }
+            _ => return false,
+        };
+        let Some(c) = char::from_u32(scalar) else { return false };
+        let mut buf = [0u8; 4];
+        let bytes = c.encode_utf8(&mut buf).as_bytes();
+        if target.get(out..out + bytes.len()) != Some(bytes) { return false; }
+        out += bytes.len();
+    }
+    out == expected
+}
+
+/// Return the raw body and end quote for a JSON string starting at start. The returned body is
+/// validated before it is exposed, including raw C0 bytes and surrogate pairing.
+fn json_string_span(src: &[u8], start: usize) -> Option<(usize, usize)> {
+    if src.get(start) != Some(&b'"') { return None; }
+    let body_start = start + 1;
+    let mut pos = body_start;
+    loop {
+        let off = find_quote_or_escape(src.get(pos..)?)?;
+        pos += off;
+        match src.get(pos).copied()? {
+            b'"' => {
+                json_unescaped_len(&src[body_start..pos])?;
+                return Some((body_start, pos));
+            }
+            b'\\' => {
+                pos = pos.checked_add(2)?;
+                if pos > src.len() { return None; }
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Validate every JSON string token in src, including tokens ignored by a projected typed decode.
+fn validate_json_string_grammar(src: &[u8]) -> bool {
+    let mut pos = 0;
+    while let Some(rel) = memchr::memchr(b'"', &src[pos..]) {
+        let start = pos + rel;
+        let Some((_, end)) = json_string_span(src, start) else { return false };
+        pos = end + 1;
+    }
+    true
+}
+
 /// The key `"..."` immediately before the colon at byte position `cpos`, scanned from the raw bytes
 /// (the lean index holds no quotes). Skips whitespace, then the closing quote, back to the opening
-/// quote. `None` if the bytes there are not a plain `"..."` key — including an **escaped** key (any
-/// `\` in or escaping it), which is rejected (matching [`JsonParser::string`], so the record errors)
-/// rather than risk a wrong/shorter parse silently matching a declared field.
+/// quote. Returns the validated raw body, including an escaped key, so the caller can compare its
+/// decoded semantic bytes without allocating scratch storage.
 #[inline]
 fn key_before_colon(src: &[u8], cpos: usize) -> Option<&[u8]> {
     let mut e = cpos;
@@ -6703,32 +6913,39 @@ fn key_before_colon(src: &[u8], cpos: usize) -> Option<&[u8]> {
     }
     let close = e - 1;
     let mut s = close;
-    while s > 0 && src[s - 1] != b'"' {
+    while s > 0 {
         s -= 1;
+        if src[s] != b'"' {
+            continue;
+        }
+        let mut slashes = 0;
+        let mut q = s;
+        while q > 0 && src[q - 1] == b'\\' {
+            slashes += 1;
+            q -= 1;
+        }
+        if slashes % 2 == 0 {
+            break;
+        }
     }
     if s == 0 {
         return None;
     }
     // If the opening quote we stopped at is itself escaped (`\"`), the scan-back found a wrong,
     // shorter key that could silently match a declared field — reject it (so the record errors).
-    // This O(1) check covers the dangerous case. A backslash *inside* an otherwise-plain key
-    // (`"a\\b"`) is not separately rejected here (it just won't match any declared name → treated
-    // as unknown — a narrow relaxation vs `string()`'s strict reject, traded for not scanning every
-    // key on the hot path).
+    // This O(1) check covers the dangerous case. A backslash inside a key is otherwise handled by
+    // the validated semantic matcher; clean keys retain the original hot-path behavior.
     if s >= 2 && src[s - 2] == b'\\' {
         return None;
     }
-    Some(&src[s..close])
+    let raw = &src[s + 1..close];
+    json_unescaped_len(raw)?;
+    Some(raw)
 }
 
-/// Speculation-path key verify: is the key right before the colon at `cpos` exactly `"name"`?
-/// Unlike [`key_before_colon`] (which *delimits* an unknown key by scanning back to its opening
-/// quote, then the caller compares), speculation already knows the expected `name`, so the opening
-/// quote's position is computed from `name.len()` — no backward key scan — and the bytes are matched
-/// against `name` directly. This collapses the two hottest verify costs (the scan-back loop and the
-/// generic `memcmp` dispatch) into a bounded, inlinable check. Same soundness as the original: returns
-/// `true` only when the bytes are `"<name>"` (closing quote at the trimmed end, matching key bytes, a
-/// non-escaped opening quote). On any drift it returns `false` → the caller falls back.
+/// Speculation-path key verify: is the key right before the colon at `cpos` semantically equal to
+/// `name`? Clean keys use the bounded direct compare; escaped keys are decoded on the comparison path
+/// without materializing them. Any drift returns `false` and lets the caller use the fallback.
 #[inline]
 fn key_matches_before_colon(src: &[u8], cpos: usize, name: &[u8]) -> bool {
     // Skip whitespace between the key string and the colon (`"k" :` is legal).
@@ -6739,18 +6956,34 @@ fn key_matches_before_colon(src: &[u8], cpos: usize, name: &[u8]) -> bool {
     let nl = name.len();
     // Need room for `"` + name + `"`; the closing quote sits at `e-1`, the key at `[ks..e-1]`, the
     // opening quote at `ks-1`. `e >= nl + 2` keeps every index below in bounds (`ks >= 1`).
-    if e < nl + 2 || src[e - 1] != b'"' {
+    if e >= nl + 2 && src[e - 1] == b'"' {
+        let ks = e - 1 - nl; // key start
+        if src[ks - 1] == b'"'
+            && (ks < 2 || src[ks - 2] != b'\\')
+            // Equal-length compare against the known `name`; short and bounded, so it inlines (no
+            // memcmp call).
+            && src[ks..e - 1] == *name
+        {
+            return true;
+        }
+    }
+
+    // Only a key that could contain an escape needs the slower semantic matcher. The direct clean-key
+    // match above is the normal Mison path; malformed or structurally mismatched keys fall through
+    // so an escaped key that decodes to `name` still succeeds and every other drift falls back.
+    let Some(raw) = key_before_colon(src, cpos) else {
         return false;
+    };
+    raw.contains(&b'\\') && json_string_equals(raw, name)
+}
+
+/// Resolve a raw JSON key body to a descriptor. Clean keys use the existing PHF fast path; escaped
+/// keys are compared semantically without changing descriptor layout.
+unsafe fn find_field_token(descs: &[JsonField], raw: &[u8], phf: Option<&[i32]>, phf_seed: u64) -> Option<usize> {
+    if !raw.contains(&b'\\') {
+        return unsafe { find_field(descs, raw, phf, phf_seed) };
     }
-    let ks = e - 1 - nl; // key start
-    if src[ks - 1] != b'"' {
-        return false; // no opening quote where a `"name"` key would put it (length drift)
-    }
-    if ks >= 2 && src[ks - 2] == b'\\' {
-        return false; // an escaped opening quote `\"` — reject (matches key_before_colon)
-    }
-    // Equal-length compare against the known `name`; short and bounded, so it inlines (no memcmp call).
-    src[ks..e - 1] == *name
+    descs.iter().position(|d| json_string_equals(raw, unsafe { field_name(d) }))
 }
 
 /// A minimal JSON scanner over a byte slice (just what `json.decode` needs: objects with
@@ -6758,9 +6991,14 @@ fn key_matches_before_colon(src: &[u8], cpos: usize, name: &[u8]) -> bool {
 struct JsonParser<'a> {
     src: &'a [u8],
     pos: usize,
+    arena: *mut Arena,
 }
 
 impl<'a> JsonParser<'a> {
+    fn new(src: &'a [u8]) -> Self {
+        Self { src, pos: 0, arena: core::ptr::null_mut() }
+    }
+
     fn peek(&self) -> Option<u8> {
         self.src.get(self.pos).copied()
     }
@@ -6777,22 +7015,31 @@ impl<'a> JsonParser<'a> {
             None
         }
     }
-    /// Read a `"..."` string key (no escapes for the M5 cut). Borrows the input (`&'a`), so
-    /// it does not hold `self`, and the parser can keep advancing after. The body is located with
-    /// [`find_quote_or_escape`] (a SIMD scan for long strings).
-    fn string(&mut self) -> Option<&'a [u8]> {
-        self.expect(b'"')?;
-        let start = self.pos;
-        let rest = &self.src[self.pos..];
-        let off = find_quote_or_escape(rest)?;
-        if rest[off] == b'\\' {
-            return None; // escapes in keys unsupported (M5 cut)
-        }
-        self.pos += off; // at the closing quote
-        let s = &self.src[start..self.pos];
-        self.pos += 1; // consume `"`
-        Some(s)
+
+    /// Read and validate any JSON string body, returning the raw bytes between its quotes.
+    fn string_body(&mut self) -> Option<&'a [u8]> {
+        let (body, end) = json_string_span(self.src, self.pos)?;
+        self.pos = end + 1;
+        Some(&self.src[body..end])
     }
+
+    /// Read a JSON string as an Align str: clean strings borrow the input, while escaped selected
+    /// strings require the caller's arena and are materialized at their decoded size.
+    fn string_value(&mut self) -> Option<AlignStr> {
+        let raw = self.string_body()?;
+        if !raw.contains(&b'\\') {
+            return Some(AlignStr { ptr: raw.as_ptr(), len: raw.len() as i64 });
+        }
+        if self.arena.is_null() {
+            return None;
+        }
+        let len = json_unescaped_len(raw)?;
+        let dst = unsafe { (&mut *self.arena).alloc_uninit(len, 1) };
+        let output = unsafe { core::slice::from_raw_parts_mut(dst, len) };
+        json_unescape_to(raw, output)?;
+        Some(AlignStr { ptr: dst, len: len as i64 })
+    }
+
     fn integer(&mut self) -> Option<i64> {
         let neg = self.peek() == Some(b'-');
         if neg {
@@ -6955,29 +7202,11 @@ impl<'a> JsonParser<'a> {
             None
         }
     }
-    /// Skip a `"..."` string, honoring `\` escapes so an embedded `\"` does not end it early
-    /// (unlike [`string`], which is for zero-copy *keys* and rejects escapes). Used only to
-    /// discard an unknown value, so the escape bytes need not be decoded — just stepped over.
-    /// Each clean run is found with [`find_quote_or_escape`] (a SIMD scan for long strings).
+    /// Skip and validate a JSON string token without materializing its decoded bytes. This shared
+    /// path covers ignored keys and values, so malformed escapes are rejected without scratch
+    /// allocation proportional to the token.
     fn skip_string(&mut self) -> Option<()> {
-        self.expect(b'"')?;
-        loop {
-            let off = find_quote_or_escape(&self.src[self.pos..])?;
-            self.pos += off;
-            match self.src[self.pos] {
-                b'"' => {
-                    self.pos += 1;
-                    return Some(());
-                }
-                // `\`: step over the backslash and the escaped byte (`\"`, `\\`, the `u` of
-                // `\uXXXX` — the four hex digits are then skipped as ordinary clean bytes).
-                _ => {
-                    self.pos += 1;
-                    self.peek()?;
-                    self.pos += 1;
-                }
-            }
-        }
+        self.string_body().map(|_| ())
     }
     fn skip_null(&mut self) -> Option<()> {
         if self.src[self.pos..].starts_with(b"null") {
@@ -7140,6 +7369,9 @@ fn json_unescape_into(raw: &[u8], out: &mut Vec<u8>) -> bool {
     while i < raw.len() {
         let b = raw[i];
         if b != b'\\' {
+            if b < 0x20 || b == b'"' {
+                return false;
+            }
             out.push(b);
             i += 1;
             continue;
@@ -7198,6 +7430,13 @@ impl<'a> DocBuilder<'a> {
     /// Scan a `"..."` string, returning the raw content span `(start, len)` (escapes included) and
     /// advancing past the closing quote. Validates every escape (so `as_str` can always unescape).
     fn scan_string(&mut self) -> Option<(u32, u32)> {
+        if self.p.peek() == Some(b'"') {
+            let start = self.p.pos;
+            let raw = self.p.string_body()?;
+            let start = u32::try_from(start.checked_add(1)?).ok()?;
+            let len = u32::try_from(raw.len()).ok()?;
+            return Some((start, len));
+        }
         self.p.expect(b'"')?;
         let start = self.p.pos;
         loop {
@@ -7357,7 +7596,7 @@ pub unsafe extern "C" fn align_rt_json_doc_parse(input: *const u8, input_len: i6
     if !validate_utf8(src) {
         return 1;
     }
-    let mut db = DocBuilder { p: JsonParser { src, pos: 0 }, nodes: Vec::new(), scratch: Vec::new() };
+    let mut db = DocBuilder { p: JsonParser::new(src), nodes: Vec::new(), scratch: Vec::new() };
     let ok = (|| -> Option<()> {
         db.value(0)?;
         db.p.ws();
@@ -7470,11 +7709,7 @@ pub unsafe extern "C" fn align_rt_json_doc_get(tape: *const DocTape, node: i64, 
 /// Compare a raw JSON key span (escapes possible) to a plain wanted key. Fast path: no `\` → a byte
 /// compare. Escaped keys unescape into a temporary before comparing.
 fn doc_key_eq(raw: &[u8], want: &[u8]) -> bool {
-    if !raw.contains(&b'\\') {
-        return raw == want;
-    }
-    let mut buf = Vec::new();
-    json_unescape_into(raw, &mut buf) && buf == want
+    json_string_equals(raw, want)
 }
 
 /// `d.at(index)` — element `index` of an array, or `Missing` (out of range / not an array / already
@@ -7530,14 +7765,16 @@ unsafe fn doc_write_str(t: &DocTape, start: u32, len: u32, out: *mut AlignStr) -
         unsafe { out.write(AlignStr { ptr: raw.as_ptr(), len: raw.len() as i64 }) };
         return 1;
     }
-    let mut buf = Vec::new();
-    if !json_unescape_into(raw, &mut buf) {
+    let Some(decoded_len) = json_unescaped_len(raw) else {
+        return 0;
+    };
+    let arena_ref = unsafe { &mut *t.arena };
+    let dst = arena_ref.alloc_uninit(decoded_len, 1);
+    let output = unsafe { core::slice::from_raw_parts_mut(dst, decoded_len) };
+    if json_unescape_to(raw, output).is_none() {
         return 0;
     }
-    let arena_ref = unsafe { &mut *t.arena };
-    let dst = arena_ref.alloc_uninit(buf.len(), 1);
-    unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, buf.len()) };
-    unsafe { out.write(AlignStr { ptr: dst, len: buf.len() as i64 }) };
+    unsafe { out.write(AlignStr { ptr: dst, len: decoded_len as i64 }) };
     1
 }
 
@@ -22434,7 +22671,7 @@ mod tests {
         use std::hint::black_box;
 
         fn count_values(src: &[u8]) -> Option<usize> {
-            let mut p = JsonParser { src, pos: 0 };
+            let mut p = JsonParser { src, pos: 0, arena: core::ptr::null_mut() };
             p.ws();
             p.expect(b'[')?;
             p.ws();
@@ -22472,7 +22709,7 @@ mod tests {
             let count_i64 = i64::try_from(count).ok()?;
             let dst = align_rt_alloc(total_i64);
             let parsed = (|| -> Option<()> {
-                let mut p = JsonParser { src, pos: 0 };
+                let mut p = JsonParser { src, pos: 0, arena: core::ptr::null_mut() };
                 p.ws();
                 p.expect(b'[')?;
                 p.ws();
@@ -23890,19 +24127,19 @@ mod tests {
         // `skip_number` must advance the cursor over exactly the same token `number` parses, so
         // an unknown numeric field is skipped lexically without a float parse (work/ probe: ~3x).
         for s in ["0", "-1", "42", "3.14", "-0.5", "1e3", "6.022e23", "-2.5E-4", "1000000000000"] {
-            let mut p = JsonParser { src: s.as_bytes(), pos: 0 };
+            let mut p = JsonParser { src: s.as_bytes(), pos: 0, arena: core::ptr::null_mut() };
             let parsed = p.number();
             let after_parse = p.pos;
             assert!(parsed.is_some(), "number() should parse {s:?}");
 
-            let mut q = JsonParser { src: s.as_bytes(), pos: 0 };
+            let mut q = JsonParser { src: s.as_bytes(), pos: 0, arena: core::ptr::null_mut() };
             assert_eq!(q.skip_number(), Some(()), "skip_number() should accept {s:?}");
             assert_eq!(q.pos, after_parse, "skip and parse must consume the same span for {s:?}");
             assert_eq!(q.pos, s.len(), "whole token consumed for {s:?}");
         }
 
         // A trailing non-number byte bounds the token (number followed by `}`); only digits move.
-        let mut p = JsonParser { src: b"12,3", pos: 0 };
+        let mut p = JsonParser { src: b"12,3", pos: 0, arena: core::ptr::null_mut() };
         assert_eq!(p.skip_number(), Some(()));
         assert_eq!(p.pos, 2, "stops at the comma");
 
@@ -23910,10 +24147,10 @@ mod tests {
         // exponent (`1e`, `1e+`) — each consumes nothing and fails, in BOTH `skip_number` and
         // `number` (so the two agree on the accepted language, the point of sharing `number_span`).
         for bad in ["-", ".5", "x", "1.", "1e", "1e+"] {
-            let mut p = JsonParser { src: bad.as_bytes(), pos: 0 };
+            let mut p = JsonParser { src: bad.as_bytes(), pos: 0, arena: core::ptr::null_mut() };
             assert_eq!(p.skip_number(), None, "{bad:?} is not a JSON number");
             assert_eq!(p.pos, 0, "cursor restored for {bad:?}");
-            let mut q = JsonParser { src: bad.as_bytes(), pos: 0 };
+            let mut q = JsonParser { src: bad.as_bytes(), pos: 0, arena: core::ptr::null_mut() };
             assert_eq!(q.number(), None, "number() also rejects {bad:?}");
         }
     }
@@ -23937,7 +24174,7 @@ mod tests {
             r#"[1, "x", true, null, {"k": [false]}, [[]]]"#,
             r#"{"s":"has } and ] and \" inside"}"#, // structural bytes inside a string must not end it
         ] {
-            let mut p = JsonParser { src: s.as_bytes(), pos: 0 };
+            let mut p = JsonParser { src: s.as_bytes(), pos: 0, arena: core::ptr::null_mut() };
             assert_eq!(p.skip_value(), Some(()), "skip_value should accept {s:?}");
             assert_eq!(p.pos, s.len(), "whole value consumed for {s:?}");
         }
@@ -23945,24 +24182,24 @@ mod tests {
         // A skipped value bounded by a following member: `{"u":<obj>,"id":7}` — after skipping the
         // object value the cursor sits on the comma, ready for the next key.
         let s = r#"{"a":1},rest"#;
-        let mut p = JsonParser { src: s.as_bytes(), pos: 0 };
+        let mut p = JsonParser { src: s.as_bytes(), pos: 0, arena: core::ptr::null_mut() };
         assert_eq!(p.skip_value(), Some(()));
         assert_eq!(&s.as_bytes()[p.pos..], b",rest", "stops at the object's close");
 
         // Malformed / truncated values fail (no panic, no run-off): unterminated string, object,
         // and array; a bare `}`/`]`; an unterminated escape.
         for bad in [r#""no end"#, "{", "[", "}", "]", r#""x\"#, r#"{"k":}"#, "[,]"] {
-            let mut p = JsonParser { src: bad.as_bytes(), pos: 0 };
+            let mut p = JsonParser { src: bad.as_bytes(), pos: 0, arena: core::ptr::null_mut() };
             assert_eq!(p.skip_value(), None, "{bad:?} must not skip cleanly");
         }
 
         // Depth guard: 200 nested arrays exceed MAX_DEPTH (128) → rejected, not a stack overflow.
         let deep = "[".repeat(200) + &"]".repeat(200);
-        let mut p = JsonParser { src: deep.as_bytes(), pos: 0 };
+        let mut p = JsonParser { src: deep.as_bytes(), pos: 0, arena: core::ptr::null_mut() };
         assert_eq!(p.skip_value(), None, "over-deep nesting is rejected");
         // Just within the limit skips fine.
         let ok_depth = "[".repeat(100) + &"]".repeat(100);
-        let mut p = JsonParser { src: ok_depth.as_bytes(), pos: 0 };
+        let mut p = JsonParser { src: ok_depth.as_bytes(), pos: 0, arena: core::ptr::null_mut() };
         assert_eq!(p.skip_value(), Some(()), "depth 100 is within the limit");
     }
 
@@ -24442,12 +24679,12 @@ mod tests {
             (b"x", None),                    // no digits
         ];
         for (input, want) in cases {
-            let mut p = JsonParser { src: input, pos: 0 };
+            let mut p = JsonParser { src: input, pos: 0, arena: core::ptr::null_mut() };
             assert_eq!(p.integer(), *want, "integer({:?})", std::str::from_utf8(input).unwrap());
         }
         // On overflow the parser still consumes the whole number (ends past all digits), so it
         // doesn't try to re-parse the tail as a new token.
-        let mut p = JsonParser { src: b"9223372036854775808,", pos: 0 };
+        let mut p = JsonParser { src: b"9223372036854775808,", pos: 0, arena: core::ptr::null_mut() };
         assert_eq!(p.integer(), None);
         assert_eq!(p.peek(), Some(b','), "overflow should consume all 19 digits, leaving pos at ','");
     }
@@ -24467,28 +24704,28 @@ mod tests {
             (b"x", None),                    // no digits
         ];
         for (input, want) in cases {
-            let mut p = JsonParser { src: input, pos: 0 };
+            let mut p = JsonParser { src: input, pos: 0, arena: core::ptr::null_mut() };
             assert_eq!(p.integer_unsigned(), *want, "integer_unsigned({:?})", std::str::from_utf8(input).unwrap());
         }
         // On overflow / negative the cursor ends past the whole token (so a failed parse aborts cleanly).
-        let mut p = JsonParser { src: b"18446744073709551616,", pos: 0 };
+        let mut p = JsonParser { src: b"18446744073709551616,", pos: 0, arena: core::ptr::null_mut() };
         assert_eq!(p.integer_unsigned(), None);
         assert_eq!(p.peek(), Some(b','), "overflow consumes all digits");
-        let mut p = JsonParser { src: b"-5,", pos: 0 };
+        let mut p = JsonParser { src: b"-5,", pos: 0, arena: core::ptr::null_mut() };
         assert_eq!(p.integer_unsigned(), None);
         assert_eq!(p.peek(), Some(b','), "negative consumes the sign + digits");
 
         // `integer_field` routes width-8 unsigned to the full-range path, everything else to i64 +
         // range check. Spot-check the routing boundary (i64::MAX+1 into u64 vs i64, and truncation).
-        let mut p = JsonParser { src: b"9223372036854775808", pos: 0 };
+        let mut p = JsonParser { src: b"9223372036854775808", pos: 0, arena: core::ptr::null_mut() };
         assert_eq!(p.integer_field(8, false), Some(1u64 << 63), "i64::MAX+1 fits u64");
-        let mut p = JsonParser { src: b"9223372036854775808", pos: 0 };
+        let mut p = JsonParser { src: b"9223372036854775808", pos: 0, arena: core::ptr::null_mut() };
         assert_eq!(p.integer_field(8, true), None, "i64::MAX+1 overflows i64 (signed)");
-        let mut p = JsonParser { src: b"256", pos: 0 };
+        let mut p = JsonParser { src: b"256", pos: 0, arena: core::ptr::null_mut() };
         assert_eq!(p.integer_field(1, false), None, "256 out of u8 range");
-        let mut p = JsonParser { src: b"-1", pos: 0 };
+        let mut p = JsonParser { src: b"-1", pos: 0, arena: core::ptr::null_mut() };
         assert_eq!(p.integer_field(8, false), None, "-1 out of u64 range");
-        let mut p = JsonParser { src: b"-1", pos: 0 };
+        let mut p = JsonParser { src: b"-1", pos: 0, arena: core::ptr::null_mut() };
         assert_eq!(p.integer_field(8, true), Some(u64::MAX), "-1 into i64 = all-ones bit pattern");
     }
 
@@ -24539,6 +24776,7 @@ mod tests {
                     std::ptr::null(),
                     0,
                     0,
+                    core::ptr::null_mut(),
                 )
             };
             (rc, out)
@@ -25099,7 +25337,7 @@ mod tests {
         let src = br#"{"count":9,"inner":{ "name":"hi", "x":5 },"id":1}"#;
         let mut out = vec![0u8; 40];
         let rc = unsafe {
-            align_rt_json_decode(src.as_ptr(), src.len() as i64, descs.as_ptr(), 3, out.as_mut_ptr(), 40, core::ptr::null(), 0, 0)
+            align_rt_json_decode(src.as_ptr(), src.len() as i64, descs.as_ptr(), 3, out.as_mut_ptr(), 40, core::ptr::null(), 0, 0, core::ptr::null_mut())
         };
         assert_eq!(rc, 0, "valid nested input must decode");
         assert_eq!(read_i64_at(&out, 0), 1, "id");
@@ -25111,7 +25349,7 @@ mod tests {
         let bad = br#"{"id":1,"inner":{"x":5},"count":9}"#;
         let mut out2 = vec![0u8; 40];
         assert_ne!(
-            unsafe { align_rt_json_decode(bad.as_ptr(), bad.len() as i64, descs.as_ptr(), 3, out2.as_mut_ptr(), 40, core::ptr::null(), 0, 0) },
+            unsafe { align_rt_json_decode(bad.as_ptr(), bad.len() as i64, descs.as_ptr(), 3, out2.as_mut_ptr(), 40, core::ptr::null(), 0, 0, core::ptr::null_mut()) },
             0,
             "a missing nested field must reject"
         );
@@ -25142,7 +25380,7 @@ mod tests {
                        {"id":3,"inner":{"x":7,"name":"ccc"},"count":7}]"#;
         let mut out = AlignStr { ptr: core::ptr::null_mut(), len: 0 };
         let rc = unsafe {
-            align_rt_json_decode_struct_array(src.as_ptr(), src.len() as i64, descs.as_ptr(), 3, 40, &mut out, core::ptr::null(), 0, 0)
+            align_rt_json_decode_struct_array(src.as_ptr(), src.len() as i64, descs.as_ptr(), 3, 40, &mut out, core::ptr::null(), 0, 0, core::ptr::null_mut())
         };
         assert_eq!(rc, 0, "valid nested array must decode");
         assert_eq!(out.len, 3, "three records");
@@ -25155,6 +25393,311 @@ mod tests {
             assert_eq!(read_i64_at(buf, base + 32), *c, "count row {r}");
         }
         unsafe { align_rt_free(out.ptr as *mut u8) };
+    }
+
+    #[test]
+    fn json_escape_record_lifecycle() {
+        let src = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/json_escape/fixtures/canonical.json"));
+        let (name, emoji, plain, count) = (b"name", b"emoji", b"plain", b"count");
+        let descs = [
+            JsonField { name_ptr: name.as_ptr(), name_len: 4, tag: (3 << 8) | 16, offset: 0, sub: core::ptr::null(), opt_tag: -1 },
+            JsonField { name_ptr: emoji.as_ptr(), name_len: 5, tag: (3 << 8) | 16, offset: 16, sub: core::ptr::null(), opt_tag: -1 },
+            JsonField { name_ptr: plain.as_ptr(), name_len: 5, tag: (3 << 8) | 16, offset: 32, sub: core::ptr::null(), opt_tag: -1 },
+            JsonField { name_ptr: count.as_ptr(), name_len: 5, tag: 8, offset: 48, sub: core::ptr::null(), opt_tag: -1 },
+        ];
+        let arena = align_rt_arena_begin();
+        let mut out = [0u8; 64];
+        let rc = unsafe {
+            align_rt_json_decode(
+                src.as_ptr(),
+                src.len() as i64,
+                descs.as_ptr(),
+                descs.len() as i64,
+                out.as_mut_ptr(),
+                out.len() as i64,
+                core::ptr::null(),
+                0,
+                0,
+                arena,
+            )
+        };
+        assert_eq!(rc, 0, "canonical escaped fixture must decode");
+        assert_eq!(unsafe { read_str_at(&out, 0) }, b"line\n\xe2\x98\xba");
+        assert_eq!(unsafe { read_str_at(&out, 16) }, "\u{1f600}".as_bytes());
+        assert_eq!(unsafe { read_str_at(&out, 32) }, b"ok");
+        assert_eq!(read_i64_at(&out, 48), 7);
+        let name_addr = u64::try_from(read_i64_at(&out, 0)).ok();
+        let plain_addr = u64::try_from(read_i64_at(&out, 32)).ok();
+        let source_addr = u64::try_from(src.as_ptr().addr()).ok();
+        assert_ne!(name_addr, source_addr, "escaped selected value is not an input view");
+        let plain_start = src.windows(2).position(|w| w == b"ok").expect("plain fixture value");
+        let plain_source_addr = u64::try_from(unsafe { src.as_ptr().add(plain_start).addr() }).ok();
+        assert_eq!(plain_addr, plain_source_addr, "clean value stays zero-copy");
+        unsafe { align_rt_arena_end(arena) };
+
+        let mut no_arena = [0u8; 64];
+        let rc = unsafe {
+            align_rt_json_decode(
+                src.as_ptr(),
+                src.len() as i64,
+                descs.as_ptr(),
+                descs.len() as i64,
+                no_arena.as_mut_ptr(),
+                no_arena.len() as i64,
+                core::ptr::null(),
+                0,
+                0,
+                core::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 1, "selected escaped strings require an enclosing arena");
+    }
+
+    #[test]
+    fn json_escape_string_grammar_matrix() {
+        let name = b"name";
+        let desc = JsonField {
+            name_ptr: name.as_ptr(),
+            name_len: 4,
+            tag: (3 << 8) | 16,
+            offset: 0,
+            sub: core::ptr::null(),
+            opt_tag: -1,
+        };
+        let invalid: &[&[u8]] = &[
+            br#"{"name":"\ux"}"#,
+            br#"{"name":"\uD800"}"#,
+            br#"{"name":"\uDC00"}"#,
+            br#"{"name":"\uDC00\uD800"}"#,
+        ];
+        for src in invalid {
+            assert_ne!(
+                unsafe {
+                    align_rt_json_decode(
+                        src.as_ptr(),
+                        src.len() as i64,
+                        &desc,
+                        1,
+                        core::ptr::null_mut(),
+                        16,
+                        core::ptr::null(),
+                        0,
+                        0,
+                        core::ptr::null_mut(),
+                    )
+                },
+                0,
+                "malformed escape must be rejected",
+            );
+        }
+        let mut raw_c0 = b"{\"name\":\"ok\",\"ignored\":\"".to_vec();
+        raw_c0.push(1);
+        raw_c0.extend_from_slice(b"\"}");
+        assert_ne!(
+            unsafe {
+                align_rt_json_decode(
+                    raw_c0.as_ptr(),
+                    raw_c0.len() as i64,
+                    &desc,
+                    1,
+                    core::ptr::null_mut(),
+                    16,
+                    core::ptr::null(),
+                    0,
+                    0,
+                    core::ptr::null_mut(),
+                )
+            },
+            0,
+            "raw C0 in an ignored value must be rejected",
+        );
+        let valid = br#"{"name":"\u0000"}"#;
+        let arena = align_rt_arena_begin();
+        let mut out = [0u8; 16];
+        assert_eq!(
+            unsafe {
+                align_rt_json_decode(
+                    valid.as_ptr(),
+                    valid.len() as i64,
+                    &desc,
+                    1,
+                    out.as_mut_ptr(),
+                    16,
+                    core::ptr::null(),
+                    0,
+                    0,
+                    arena,
+                )
+            },
+            0
+        );
+        assert_eq!(unsafe { read_str_at(&out, 0) }, b"\0");
+        unsafe { align_rt_arena_end(arena) };
+    }
+
+    #[test]
+    fn json_escape_aos_path_equivalence() {
+        let name = b"name";
+        let count = b"count";
+        let descs = [
+            JsonField { name_ptr: name.as_ptr(), name_len: 4, tag: (3 << 8) | 16, offset: 0, sub: core::ptr::null(), opt_tag: -1 },
+            JsonField { name_ptr: count.as_ptr(), name_len: 5, tag: 8, offset: 16, sub: core::ptr::null(), opt_tag: -1 },
+        ];
+        let src = br#"[{"na\u006de":"\u0061","count":1,"ignored":"\u0000"},{"name":"b","count":2,"ignored":"\u0062"},{"name":"\u0063","ignored":"\u0000","count":3}]"#;
+        let arena = align_rt_arena_begin();
+        let mut out = AlignStr { ptr: core::ptr::null(), len: 0 };
+        assert_eq!(
+            unsafe {
+                align_rt_json_decode_struct_array(
+                    src.as_ptr(),
+                    src.len() as i64,
+                    descs.as_ptr(),
+                    2,
+                    24,
+                    &mut out,
+                    core::ptr::null(),
+                    0,
+                    0,
+                    arena,
+                )
+            },
+            0
+        );
+        assert_eq!(out.len, 3);
+        let rows = unsafe { core::slice::from_raw_parts(out.ptr, 72) };
+        assert_eq!(unsafe { read_str_at(rows, 0) }, b"a");
+        assert_eq!(read_i64_at(rows, 16), 1);
+        assert_eq!(unsafe { read_str_at(rows, 24) }, b"b");
+        assert_eq!(read_i64_at(rows, 40), 2);
+        assert_eq!(unsafe { read_str_at(rows, 48) }, b"c");
+        assert_eq!(read_i64_at(rows, 64), 3);
+        assert_eq!(unsafe { (&*arena).off }, 2, "speculation fallback must materialize each escaped value once");
+        unsafe {
+            align_rt_free(out.ptr as *mut u8);
+            align_rt_arena_end(arena);
+        }
+    }
+
+    #[test]
+    fn json_escape_soa_path_equivalence() {
+        let name = b"name";
+        let count = b"count";
+        let descs = [
+            JsonField { name_ptr: name.as_ptr(), name_len: 4, tag: (3 << 8) | 16, offset: 0, sub: core::ptr::null(), opt_tag: -1 },
+            JsonField { name_ptr: count.as_ptr(), name_len: 5, tag: 8, offset: 0, sub: core::ptr::null(), opt_tag: -1 },
+        ];
+        let src = br#"[{"name":"\u0061","count":1},{"name":"\u0062","count":2}]"#;
+        let arena = align_rt_arena_begin();
+        let mut out = AlignStr { ptr: core::ptr::null(), len: 0 };
+        assert_eq!(
+            unsafe {
+                align_rt_json_decode_soa(
+                    src.as_ptr(),
+                    src.len() as i64,
+                    descs.as_ptr(),
+                    2,
+                    arena,
+                    &mut out,
+                    core::ptr::null(),
+                    0,
+                    0,
+                )
+            },
+            0
+        );
+        let (cols, _, _) = soa_layout(&[16, 8], 2).unwrap();
+        let read_column_str = |off: usize| -> Vec<u8> {
+            let ptr = unsafe { (out.ptr.add(off) as *const *const u8).read_unaligned() };
+            let len = usize::try_from(unsafe { (out.ptr.add(off + 8) as *const i64).read_unaligned() }).unwrap_or_default();
+            unsafe { core::slice::from_raw_parts(ptr, len) }.to_vec()
+        };
+        assert_eq!(read_column_str(cols[0].0), b"a");
+        assert_eq!(read_column_str(cols[0].0 + 16), b"b");
+        assert_eq!(read_i64_at(unsafe { core::slice::from_raw_parts(out.ptr, cols[1].0 + 16) }, cols[1].0), 1);
+        assert_eq!(read_i64_at(unsafe { core::slice::from_raw_parts(out.ptr, cols[1].0 + 16) }, cols[1].0 + 8), 2);
+        unsafe { align_rt_arena_end(arena) };
+    }
+
+    #[test]
+    fn json_escape_nonmaterializing_paths() {
+        let name = b"name";
+        let desc = JsonField {
+            name_ptr: name.as_ptr(),
+            name_len: 4,
+            tag: (3 << 8) | 16,
+            offset: 0,
+            sub: core::ptr::null(),
+            opt_tag: -1,
+        };
+        let scanner_src = br#"[{"name":"\u0061","ignored":"\u0062"}]"#;
+        let mut cursor = 0;
+        let mut row = [0u8; 16];
+        assert_eq!(
+            unsafe {
+                align_rt_json_scan_next(
+                    scanner_src.as_ptr(),
+                    scanner_src.len() as i64,
+                    &mut cursor,
+                    &desc,
+                    1,
+                    row.as_mut_ptr(),
+                    16,
+                    core::ptr::null(),
+                    0,
+                    0,
+                )
+            },
+            2,
+            "scanner has no arena for selected escaped values",
+        );
+
+        let arm_name = b"payload";
+        let arm = JsonField {
+            name_ptr: arm_name.as_ptr(),
+            name_len: 7,
+            tag: (3 << 8) | 16,
+            offset: 8,
+            sub: core::ptr::null(),
+            opt_tag: -1,
+        };
+        let classes = [0, -1, -1, -1, -1];
+        let tags = [0];
+        let union = JsonUnion {
+            arms: &arm,
+            class_to_arm: classes.as_ptr(),
+            enum_tags: tags.as_ptr(),
+            n_arms: 1,
+            store_size: 24,
+        };
+        let union_src = br#""\u0061""#;
+        let arena = align_rt_arena_begin();
+        let mut out = [0u8; 24];
+        assert_eq!(
+            unsafe {
+                align_rt_json_decode_union(
+                    union_src.as_ptr(),
+                    union_src.len() as i64,
+                    &union,
+                    out.as_mut_ptr(),
+                    arena,
+                )
+            },
+            0
+        );
+        assert_eq!(unsafe { read_str_at(&out, 8) }, b"a");
+        assert_eq!(
+            unsafe {
+                align_rt_json_decode_union(
+                    union_src.as_ptr(),
+                    union_src.len() as i64,
+                    &union,
+                    out.as_mut_ptr(),
+                    core::ptr::null_mut(),
+                )
+            },
+            1
+        );
+        unsafe { align_rt_arena_end(arena) };
     }
 
     #[test]
@@ -25182,7 +25725,7 @@ mod tests {
         ];
         let src = br#"{"items":[{"x":1,"tag":"a"},{"x":2,"tag":"bb"}],"n":9}"#;
         let mut out = [0u8; 24];
-        let rc = unsafe { align_rt_json_decode(src.as_ptr(), src.len() as i64, descs.as_ptr(), 2, out.as_mut_ptr(), 24, core::ptr::null(), 0, 0) };
+        let rc = unsafe { align_rt_json_decode(src.as_ptr(), src.len() as i64, descs.as_ptr(), 2, out.as_mut_ptr(), 24, core::ptr::null(), 0, 0, core::ptr::null_mut()) };
         assert_eq!(rc, 0, "valid array-field input decodes");
         assert_eq!(read_i64_at(&out, 16), 9, "n");
         // The field slot holds the owned AoS {ptr,len}: len 2.
@@ -25232,7 +25775,7 @@ mod tests {
         let src = br#"{"arr":[{"x":1},{"x":2}]}"#; // `req` missing → fails after `arr` allocated
         let (a0, f0) = (align_rt_alloc_count(), align_rt_free_count());
         let mut out = [0u8; 24];
-        let rc = unsafe { align_rt_json_decode(src.as_ptr(), src.len() as i64, descs.as_ptr(), 2, out.as_mut_ptr(), 24, core::ptr::null(), 0, 0) };
+        let rc = unsafe { align_rt_json_decode(src.as_ptr(), src.len() as i64, descs.as_ptr(), 2, out.as_mut_ptr(), 24, core::ptr::null(), 0, 0, core::ptr::null_mut()) };
         assert_ne!(rc, 0, "a missing required field must fail the decode");
         let (a1, f1) = (align_rt_alloc_count(), align_rt_free_count());
         assert!(a1 > a0, "the array field allocated a buffer");
@@ -25265,7 +25808,7 @@ mod tests {
         let src = br#"{"inner":{"items":[{"v":1},{"v":2}]},"tail":5}"#; // inner.req missing
         let (a0, f0) = (align_rt_alloc_count(), align_rt_free_count());
         let mut out = [0u8; 32];
-        let rc = unsafe { align_rt_json_decode(src.as_ptr(), src.len() as i64, descs.as_ptr(), 2, out.as_mut_ptr(), 32, core::ptr::null(), 0, 0) };
+        let rc = unsafe { align_rt_json_decode(src.as_ptr(), src.len() as i64, descs.as_ptr(), 2, out.as_mut_ptr(), 32, core::ptr::null(), 0, 0, core::ptr::null_mut()) };
         assert_ne!(rc, 0, "the missing nested required field must fail");
         let (a1, f1) = (align_rt_alloc_count(), align_rt_free_count());
         // The inner `items` array allocated once; it must be freed EXACTLY once (no double-free).
@@ -25298,7 +25841,7 @@ mod tests {
         let src = br#"[{"kind":"a","text":"b"}] xyz"#; // valid array value, then trailing garbage
         let (a0, f0) = (align_rt_alloc_count(), align_rt_free_count());
         let mut out = [0u8; 40];
-        let rc = unsafe { align_rt_json_decode_union(src.as_ptr(), src.len() as i64, &u, out.as_mut_ptr()) };
+        let rc = unsafe { align_rt_json_decode_union(src.as_ptr(), src.len() as i64, &u, out.as_mut_ptr(), core::ptr::null_mut()) };
         assert_ne!(rc, 0, "trailing garbage must fail the union decode");
         let (a1, f1) = (align_rt_alloc_count(), align_rt_free_count());
         assert_eq!(a1 - a0, 1, "the array arm allocated one buffer");
@@ -25323,7 +25866,7 @@ mod tests {
         let src = br#"{"xs":[1,2,3]}"#; // `req` missing
         let (a0, f0) = (align_rt_alloc_count(), align_rt_free_count());
         let mut out = [0u8; 24];
-        let rc = unsafe { align_rt_json_decode(src.as_ptr(), src.len() as i64, descs.as_ptr(), 2, out.as_mut_ptr(), 24, core::ptr::null(), 0, 0) };
+        let rc = unsafe { align_rt_json_decode(src.as_ptr(), src.len() as i64, descs.as_ptr(), 2, out.as_mut_ptr(), 24, core::ptr::null(), 0, 0, core::ptr::null_mut()) };
         assert_ne!(rc, 0, "the missing required `req` must fail the decode");
         let (a1, f1) = (align_rt_alloc_count(), align_rt_free_count());
         assert_eq!(a1 - a0, 1, "the `xs` scalar array allocated one buffer");
@@ -25356,7 +25899,7 @@ mod tests {
         let src = br#"{"messages":[{"parts":[{"v":1},{"v":2}]},{"parts":[{"v":3},{"v":4}]}]}"#; // `n` missing
         let (a0, f0) = (align_rt_alloc_count(), align_rt_free_count());
         let mut out = [0u8; 24];
-        let rc = unsafe { align_rt_json_decode(src.as_ptr(), src.len() as i64, descs.as_ptr(), 2, out.as_mut_ptr(), 24, core::ptr::null(), 0, 0) };
+        let rc = unsafe { align_rt_json_decode(src.as_ptr(), src.len() as i64, descs.as_ptr(), 2, out.as_mut_ptr(), 24, core::ptr::null(), 0, 0, core::ptr::null_mut()) };
         assert_ne!(rc, 0, "the missing required `n` must fail the decode");
         let (a1, f1) = (align_rt_alloc_count(), align_rt_free_count());
         assert_eq!(a1 - a0, 3, "one messages AoS + one parts AoS per message");
@@ -25384,7 +25927,7 @@ mod tests {
         let src = br#"{"messages":[{"parts":[{"v":1}]},{"parts":[{"v":2}]},{"parts":5}]}"#;
         let (a0, f0) = (align_rt_alloc_count(), align_rt_free_count());
         let mut out = [0u8; 16];
-        let rc = unsafe { align_rt_json_decode(src.as_ptr(), src.len() as i64, descs.as_ptr(), 1, out.as_mut_ptr(), 16, core::ptr::null(), 0, 0) };
+        let rc = unsafe { align_rt_json_decode(src.as_ptr(), src.len() as i64, descs.as_ptr(), 1, out.as_mut_ptr(), 16, core::ptr::null(), 0, 0, core::ptr::null_mut()) };
         assert_ne!(rc, 0, "the malformed 3rd element must fail the decode");
         let (a1, f1) = (align_rt_alloc_count(), align_rt_free_count());
         assert_eq!(a1 - a0, f1 - f0, "every buffer allocated before the mid-array failure was freed (no leak)");
@@ -25454,6 +25997,7 @@ mod tests {
                     core::ptr::null(),
                     0,
                     0,
+                    core::ptr::null_mut(),
                 )
             };
             assert_ne!(rc, 0, "each later parent failure must reject the decode");
@@ -25511,6 +26055,7 @@ mod tests {
                 core::ptr::null(),
                 0,
                 0,
+                core::ptr::null_mut(),
             )
         };
         assert_ne!(rc, 0, "trailing input must reject the complete object");
@@ -25576,6 +26121,7 @@ mod tests {
                 core::ptr::null(),
                 0,
                 0,
+                core::ptr::null_mut(),
             )
         };
         assert_ne!(rc, 0, "fallback must reject the missing required field");
@@ -25620,6 +26166,7 @@ mod tests {
                 core::ptr::null(),
                 0,
                 0,
+                core::ptr::null_mut(),
             )
         };
         assert_eq!(rc, 0, "fallback may recover structural drift when all required fields remain present");
@@ -25689,6 +26236,7 @@ mod tests {
                     core::ptr::null(),
                     0,
                     0,
+                    core::ptr::null_mut(),
                 )
             };
             assert_ne!(rc, 0, "malformed AoS input must reject");
@@ -25728,6 +26276,7 @@ mod tests {
                         core::ptr::null(),
                         0,
                         0,
+                        core::ptr::null_mut(),
                     )
                 };
                 (rc, i64::from_le_bytes(out))
@@ -25745,6 +26294,7 @@ mod tests {
                         core::ptr::null(),
                         0,
                         0,
+                        core::ptr::null_mut(),
                     )
                 };
                 (rc, i64::from_le_bytes(out))
@@ -25777,6 +26327,7 @@ mod tests {
                     core::ptr::null(),
                     0,
                     0,
+                    core::ptr::null_mut(),
                 )
             };
             let mut buf = Vec::new();
@@ -28458,7 +29009,7 @@ mod tests {
         let decode = |src: &[u8]| -> i32 {
             let mut out = [0u8; 16];
             unsafe {
-                align_rt_json_decode(src.as_ptr(), src.len() as i64, descs.as_ptr(), 1, out.as_mut_ptr(), 16, core::ptr::null(), 0, 0)
+                align_rt_json_decode(src.as_ptr(), src.len() as i64, descs.as_ptr(), 1, out.as_mut_ptr(), 16, core::ptr::null(), 0, 0, core::ptr::null_mut())
             }
         };
         // Valid: ASCII and multibyte string values decode.

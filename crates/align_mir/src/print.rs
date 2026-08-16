@@ -624,7 +624,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
             pieces.len(),
             operand_str(max_bytes)
         ),
-        Rvalue::JsonDecode { struct_id, input, out } => {
+        Rvalue::JsonDecode { struct_id, input, out, .. } => {
             format!("json_decode(struct#{struct_id}, {}, -> _{out})", operand_str(input))
         }
         Rvalue::JsonDecodeArray { elem, input, out } => {
@@ -633,13 +633,13 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::JsonDecodeScalar { scalar, input, out } => {
             format!("json_decode_scalar({} : {}, -> _{out})", operand_str(input), crate::ty_name(*scalar))
         }
-        Rvalue::JsonDecodeStructArray { struct_id, input, out } => {
+        Rvalue::JsonDecodeStructArray { struct_id, input, out, .. } => {
             format!("json_decode_struct_array(struct#{struct_id}, {}, -> _{out})", operand_str(input))
         }
         Rvalue::JsonDecodeSoa { struct_id, input, out, arena } => {
             format!("json_decode_soa(struct#{struct_id}, {}, arena={}, -> _{out})", operand_str(input), operand_str(arena))
         }
-        Rvalue::JsonDecodeUnion { enum_id, input, out } => {
+        Rvalue::JsonDecodeUnion { enum_id, input, out, .. } => {
             format!("json_decode_union(enum#{enum_id}, {}, -> _{out})", operand_str(input))
         }
         Rvalue::JsonDoc { input, arena, out } => {

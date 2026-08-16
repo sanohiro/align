@@ -13733,16 +13733,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 None,
                 Some((max_bytes, *out)),
             )?,
-            Rvalue::JsonDecode { struct_id, input, out } => self.gen_json_decode(*struct_id, input, *out)?,
+            Rvalue::JsonDecode { struct_id, input, out, arena } => self.gen_json_decode(*struct_id, input, *out, arena.as_ref())?,
             Rvalue::JsonDecodeArray { elem, input, out } => self.gen_json_decode_array(*elem, input, *out)?,
             Rvalue::JsonDecodeScalar { scalar, input, out } => self.gen_json_decode_scalar(*scalar, input, *out)?,
-            Rvalue::JsonDecodeStructArray { struct_id, input, out } => {
-                self.gen_json_decode_struct_array(*struct_id, input, *out)?
+            Rvalue::JsonDecodeStructArray { struct_id, input, out, arena } => {
+                self.gen_json_decode_struct_array(*struct_id, input, *out, arena.as_ref())?
             }
             Rvalue::JsonDecodeSoa { struct_id, input, out, arena } => {
                 self.gen_json_decode_soa(*struct_id, input, *out, arena)?
             }
-            Rvalue::JsonDecodeUnion { enum_id, input, out } => self.gen_json_decode_union(*enum_id, input, *out)?,
+            Rvalue::JsonDecodeUnion { enum_id, input, out, arena } => self.gen_json_decode_union(*enum_id, input, *out, arena.as_ref())?,
             // json.doc (J4). `get`/`at` are void (the runtime writes the child handle into `out`).
             Rvalue::JsonDoc { input, arena, out } => self.gen_json_doc(input, arena, *out)?,
             Rvalue::JsonDocKind { doc } => self.gen_json_doc_kind(doc, result_ty)?,
@@ -16898,7 +16898,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // 20-23, elem-width bits 24-28 (5 bits — a `str` element's `{ptr,len}` is width 16, which
             // does not fit the original 4). `sub` is null (scalars/str views need no sub-schema). The
             // element's own (kind,width,sign) come from the scalar-field encoding, relocated here. A
-            // `str` element decodes/encodes as a zero-copy view into the input (the top-level `str` rule).
+            // clean `str` element borrows the input; a selected escaped element materializes in the
+            // caller arena, and the arena-free top-level entry rejects that case.
             Ty::DynArray(s @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Str)) => {
                 let (etag, _) = self.json_payload_tag_sub(scalar_to_ty(s), null)?;
                 let elem_kind = (etag >> 8) & 0xff;
@@ -17154,7 +17155,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// `json.decode` into a shape-directed union (`enum`) target (JSON completeness J1b): zero the out
     /// enum, then call the runtime union decoder with the emitted [`JsonUnion`] descriptor. Returns
     /// the i32 status.
-    fn gen_json_decode_union(&mut self, enum_id: u32, input: &Operand, out: Slot) -> Result<BasicValueEnum<'c>, CodegenError> {
+    fn gen_json_decode_union(
+        &mut self,
+        enum_id: u32,
+        input: &Operand,
+        out: Slot,
+        arena: Option<&Operand>,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
         let ety = self.enum_types[enum_id as usize];
         let out_ptr = self.slots[&out];
         // Zero the enum so an unset payload/tag reads as 0 (a failed decode leaves it zeroed).
@@ -17165,18 +17172,25 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let in_len = self.builder.build_extract_value(agg, 1, "jin_l").map_err(|e| self.err(e))?;
 
         let union_desc = self.emit_json_union(enum_id)?;
+        let arena_v = arena.map(|op| self.operand(op)).transpose()?.unwrap_or_else(|| self.ctx.ptr_type(AddressSpace::default()).const_null().into());
         let cs = self
             .builder
             .build_call(
                 self.runtime(RuntimeKey::JsonDecodeUnion),
-                &[in_ptr.into(), in_len.into(), union_desc.into(), out_ptr.into()],
+                &[in_ptr.into(), in_len.into(), union_desc.into(), out_ptr.into(), arena_v.into()],
                 "jdecu",
             )
             .map_err(|e| self.err(e))?;
         Ok(cs.try_as_basic_value().basic().expect("json_decode_union returns i32"))
     }
 
-    fn gen_json_decode(&mut self, struct_id: u32, input: &Operand, out: Slot) -> Result<BasicValueEnum<'c>, CodegenError> {
+    fn gen_json_decode(
+        &mut self,
+        struct_id: u32,
+        input: &Operand,
+        out: Slot,
+        arena: Option<&Operand>,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
         let sty = self.struct_types[struct_id as usize];
         let out_ptr = self.slots[&out];
         // Zero the struct so missing fields read as 0/false.
@@ -17192,11 +17206,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let size = i64t.const_int(t.store_size, false);
         let phf_len = i64t.const_int(t.phf_len, false);
         let phf_seed = i64t.const_int(t.phf_seed, false);
+        let arena_v = arena.map(|op| self.operand(op)).transpose()?.unwrap_or_else(|| self.ctx.ptr_type(AddressSpace::default()).const_null().into());
         let cs = self
             .builder
             .build_call(
                 self.runtime(RuntimeKey::JsonDecode),
-                &[in_ptr.into(), in_len.into(), t.descs.into(), n.into(), out_ptr.into(), size.into(), t.phf_ptr.into(), phf_len.into(), phf_seed.into()],
+                &[in_ptr.into(), in_len.into(), t.descs.into(), n.into(), out_ptr.into(), size.into(), t.phf_ptr.into(), phf_len.into(), phf_seed.into(), arena_v.into()],
                 "jdec",
             )
             .map_err(|e| self.err(e))?;
@@ -17338,9 +17353,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
 
     /// `json.decode` into an owned `array<Struct>` (MMv2 slice 8d): zero the out `{ptr,len}` slot,
     /// then call the runtime AoS parser with the same field table as the single-struct path plus
-    /// the element stride. The returned buffer is owned (freed by `Drop`); its `str` fields point
-    /// into the input. Returns the i32 status.
-    fn gen_json_decode_struct_array(&mut self, struct_id: u32, input: &Operand, out: Slot) -> Result<BasicValueEnum<'c>, CodegenError> {
+    /// the element stride. The returned buffer is owned (freed by `Drop`); clean `str` fields point
+    /// into the input and selected escaped strings use the caller arena. Returns the i32 status.
+    fn gen_json_decode_struct_array(
+        &mut self,
+        struct_id: u32,
+        input: &Operand,
+        out: Slot,
+        arena: Option<&Operand>,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
         let out_ptr = self.slots[&out];
         // Zero the {ptr,len} so a failed decode reads {null,0} (its Drop frees null).
         self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
@@ -17355,11 +17376,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let elem_size = i64t.const_int(t.store_size, false);
         let phf_len = i64t.const_int(t.phf_len, false);
         let phf_seed = i64t.const_int(t.phf_seed, false);
+        let arena_v = arena.map(|op| self.operand(op)).transpose()?.unwrap_or_else(|| self.ctx.ptr_type(AddressSpace::default()).const_null().into());
         let cs = self
             .builder
             .build_call(
                 self.runtime(RuntimeKey::JsonDecodeStructArray),
-                &[in_ptr.into(), in_len.into(), t.descs.into(), n.into(), elem_size.into(), out_ptr.into(), t.phf_ptr.into(), phf_len.into(), phf_seed.into()],
+                &[in_ptr.into(), in_len.into(), t.descs.into(), n.into(), elem_size.into(), out_ptr.into(), t.phf_ptr.into(), phf_len.into(), phf_seed.into(), arena_v.into()],
                 "jdecsa",
             )
             .map_err(|e| self.err(e))?;

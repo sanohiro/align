@@ -76,8 +76,9 @@ pub enum Scalar {
     /// An owned, dynamic-length array of structs (AoS), the struct dual of [`Scalar::DynArray`]
     /// (MMv2 slice 8d). Same `{ptr,len}` layout, Move, dropped/freed as a unit. Carries the struct
     /// id (non-recursive, so `Scalar` stays `Copy`). Produced by `json.decode<array<Struct>>`,
-    /// whose decoded `str` fields are zero-copy views into the input — so unlike a scalar
-    /// `array<T>`, a struct array is region-tied to that input and cannot escape it.
+    /// whose clean decoded `str` fields borrow the input and whose selected escaped strings use
+    /// the enclosing arena — so a struct array is region-tied to the input and, when needed, to
+    /// that arena.
     DynStructArray(u32),
     /// An owned, dynamic-length `array<response>` payload — a buffer of opaque `response` **Move**
     /// handles, the batched-`get_many` result riding a `Result` (`Result<array<response>, Error>`).
@@ -2227,10 +2228,12 @@ pub fn ty_may_borrow(
     false
 }
 
-/// Whether a struct transitively contains a zero-copy `str` view.
+/// Whether a struct transitively contains a decoded `str` view or a scalar-array slot that can
+/// materialize an escaped string in the caller arena.
 ///
 /// This is intentionally narrower than [`ty_may_borrow`]: it classifies decoded struct/SoA
-/// storage whose string columns borrow an input buffer. Header-mediated struct and enum edges use
+/// storage whose clean string fields borrow an input buffer and whose escaped selected fields may
+/// use an arena. Header-mediated struct and enum edges use
 /// one explicit worklist, so every finite validated graph is independent of the process stack.
 fn struct_contains_str(id: u32, structs: &[StructDef], enums: &[hir::EnumDef]) -> bool {
     let mut work = vec![Ty::Struct(id)];
@@ -2239,9 +2242,13 @@ fn struct_contains_str(id: u32, structs: &[StructDef], enums: &[hir::EnumDef]) -
     while let Some(ty) = work.pop() {
         match ty {
             Ty::Str | Ty::Option(Scalar::Str) | Ty::Slice(Scalar::Str) => return true,
-            Ty::Struct(id)
-            | Ty::Option(Scalar::Struct(id))
-            | Ty::Slice(Scalar::Struct(id))
+            // A decoded scalar-array field can hold arena-materialized escaped strings. Walk its
+            // element type so the enclosing decode result carries both input and arena regions.
+            Ty::Array(s, _) | Ty::DynArray(s) | Ty::Option(s) | Ty::Slice(s) => {
+                work.push(scalar_to_ty(s));
+            }
+            Ty::DynFixedArray(s, len) => work.push(Ty::Array(s, len)),
+            Ty::Struct(id) | Ty::StructArray(id, _) | Ty::DynStructArray(id, _)
                 if visited_structs.insert(id) =>
             {
                 if let Some(definition) = structs.get(id as usize) {
@@ -2252,11 +2259,7 @@ fn struct_contains_str(id: u32, structs: &[StructDef], enums: &[hir::EnumDef]) -
                 if let Some(definition) = enums.get(id as usize) {
                     for variant in definition.variants.iter().rev() {
                         for payload in variant.payload.iter().rev() {
-                            match *payload {
-                                Scalar::Str => return true,
-                                Scalar::Struct(id) => work.push(Ty::Struct(id)),
-                                _ => {}
-                            }
+                            work.push(scalar_to_ty(*payload));
                         }
                     }
                 }
@@ -14945,24 +14948,26 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::ArrayParMap { .. } => {
                 values.push(self.allocation_region(expression));
             }
-            // A decoded struct's `str`/array fields are zero-copy views into the input buffer
-            // (MMv2 slice 6), so the struct is region-tied to that input — it cannot outlive it.
-            // Conservative: even a scalar-only decoded struct is bound to the input region (no
-            // struct-field lookup here); use `.clone()` to escape. `?` preserves the region.
-            ExprKind::JsonDecode { input, .. } => work.push(Work::Eval(input, depth)),
-            // A decoded `array<Struct>` (slice 8d) likewise carries the input's region — its
-            // elements' `str` fields are zero-copy views into the input; `.clone()` to escape.
-            ExprKind::JsonDecodeStructArray { input, .. } => {
-                work.push(Work::Eval(input, depth));
+            // Clean decoded strings borrow the input; escaped selected strings additionally borrow
+            // the enclosing arena. The runtime ABI carries the nullable arena handle explicitly,
+            // so the inferred region is the meet of input and allocation region only for
+            // str-bearing targets.
+            ExprKind::JsonDecode { input, struct_id } if self.struct_has_str(*struct_id) => {
+                push_fold(&mut work, self.allocation_region(expression), vec![(input, depth, None)]);
             }
-            // A decoded shape-directed union (J1b): a `str`-payload variant is a zero-copy view into
-            // the input, so a `str`-bearing union carries the input's region; a scalar-only union
-            // borrows nothing and stays `Static` (freely returnable), mirroring `tracks_region`'s
-            // precision at the enum level (the region change is opt-in on a borrowing payload).
+            ExprKind::JsonDecode { input, .. } => work.push(Work::Eval(input, depth)),
+            ExprKind::JsonDecodeStructArray { input, struct_id } if self.struct_has_str(*struct_id) => {
+                push_fold(&mut work, self.allocation_region(expression), vec![(input, depth, None)]);
+            }
+            ExprKind::JsonDecodeStructArray { input, .. } => work.push(Work::Eval(input, depth)),
+            // A decoded shape-directed union (J1b): clean `str` payloads borrow the input and
+            // selected escaped payloads additionally use the enclosing arena, so a `str`-bearing
+            // union carries both applicable regions; a scalar-only union borrows nothing and stays
+            // `Static` (freely returnable), mirroring `tracks_region`'s precision at enum level.
             ExprKind::JsonDecodeUnion { input, enum_id }
                 if self.tracks_region(Ty::Enum(*enum_id)) =>
             {
-                work.push(Work::Eval(input, depth));
+                push_fold(&mut work, self.allocation_region(expression), vec![(input, depth, None)]);
             }
             ExprKind::JsonDecodeUnion { .. } => values.push(Region::Static),
             // `json.decode → soa`: the column buffer is arena-allocated, and a `str` column holds
@@ -37730,8 +37735,9 @@ impl<'a, 't> Checker<'a, 't> {
             // `array<T>` (elements copied → `Static`/returnable, not region-tied to the input).
             Some(Ty::Result(Scalar::DynArray(prim), _)) => {
                 let elem = scalar_to_ty(prim_to_scalar(prim));
-                // The element must be runtime-parseable. A `str` element would be a zero-copy
-                // view region-tied to the input (deferred — needs the array to carry that region).
+                // The element must be runtime-parseable. Scalar `str` elements are not admitted on
+                // this arena-free top-level path because selected escapes need an arena; typed struct
+                // fields use the arena-bearing decoder below.
                 if !matches!(elem, Ty::Int(_) | Ty::Float(_) | Ty::Bool) {
                     self.diags.error(
                         format!("'json.decode' into array<{}> is not supported yet (int/float/bool elements only)", ty_name(elem)),
@@ -37750,8 +37756,9 @@ impl<'a, 't> Checker<'a, 't> {
             }
             // `array<Struct>` target (MMv2 slice 8d, the draft.md §19 headline): parse a JSON
             // array of objects into an owned, dynamic AoS. Each element decodes like the single
-            // struct path; `str` fields are zero-copy views into the input, so the whole array is
-            // region-tied to that input (see `region_of`) and cannot escape it.
+            // struct path; clean `str` fields borrow the input and selected escaped strings use
+            // the enclosing arena, so the whole array is region-tied to both where applicable
+            // (see `region_of`) and cannot escape those sources.
             Some(Ty::Result(Scalar::DynStructArray(id), _)) => {
                 if !self.json_struct_fields_ok(id, span, JsonDir::Decode) {
                     return err;
@@ -37796,8 +37803,9 @@ impl<'a, 't> Checker<'a, 't> {
                 };
             }
             // A shape-directed **union** (`enum`) target (JSON completeness J1b): parse one JSON value
-            // and select the variant by its shape class. The decoded enum's `str` payloads are
-            // zero-copy views into the input, so the input's region bounds the result (`region_of`).
+            // and select the variant by its shape class. Clean decoded `str` payloads borrow the
+            // input and selected escaped payloads use the enclosing arena, so `region_of` keeps
+            // both sources live.
             Some(Ty::Result(Scalar::Enum(id), _)) => {
                 if !self.check_union_decodable(id, span, JsonDir::Decode) {
                     return err;
@@ -37843,9 +37851,9 @@ impl<'a, 't> Checker<'a, 't> {
         if !self.json_struct_fields_ok(sid, span, JsonDir::Decode) {
             return err;
         }
-        // The decoded struct's `str` fields are zero-copy views into the input, so the input's
-        // region constrains the result (see `region_of`). `check_str_init` accepts a `str` or
-        // auto-borrows an owned `string` (whose region then bounds the decoded value).
+        // Clean decoded `str` fields borrow the input; selected escaped fields additionally use
+        // the enclosing arena. `check_str_init` accepts a `str` or auto-borrows an owned `string`
+        // (whose region then bounds the decoded value).
         let input = self.check_str_init(&args[0]);
         Expr {
             kind: ExprKind::JsonDecode { struct_id: sid, input: Box::new(input) },
@@ -37931,8 +37939,9 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         }
-        // The rows' `str` fields are zero-copy views into the input, so the input's region bounds the
-        // scanner. `check_str_init` accepts a `str` or auto-borrows an owned `string`.
+        // Scanner rows have no arena, so their clean `str` fields borrow the input and escaped
+        // selected strings are rejected by the runtime. `check_str_init` accepts a `str` or
+        // auto-borrows an owned `string`.
         let input = self.check_str_init(&args[0]);
         if input.ty == Ty::Error {
             return err;

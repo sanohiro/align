@@ -14,6 +14,66 @@ types are carried by **inference, never a written type argument** (settled: Alig
 expression-position type-argument syntax / no turbofish). Requires `import core.json` (the
 capability-header rule applies to core.json exactly like std modules).
 
+## Escaped strings (Request 7)
+
+Typed JSON accepts the RFC 8259 string grammar on every string token: declared and undeclared
+keys, declared and undeclared values, nested values, union payloads, and `json.doc`. The accepted
+escape set is `\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`, and `\uXXXX`; `\uXXXX` requires
+valid surrogate pairing and produces UTF-8 semantic bytes. Raw C0 bytes, malformed/truncated
+escapes, lone or reversed surrogates, and invalid UTF-8 return `Error.Code(1)` (or `Err` from
+`json.doc`). A valid escaped `\u0000` is an embedded NUL; native-boundary validators retain
+responsibility for rejecting it where required.
+
+Clean strings remain zero-copy views into the input. A selected escaped string is materialized
+exactly once in the caller's enclosing arena; its bytes are arena-owned and the enclosing decoded
+value is region-bounded by both input and arena. Outside an arena, a selected escaped string is a
+decode error, while clean strings retain the existing input-view behavior. Ignored escaped strings
+and keys are validated and discarded without proportional scratch allocation. `json.scan` has no
+arena operand, so an escaped declared string remains rejected there; `json.doc` already owns an
+arena and materializes escaped `as_str`/`key` results there.
+
+The runtime ABI passes the nullable arena handle as the final argument of the three materializing
+typed entrypoints; `null` means clean-view-only mode. The descriptor layouts (`JsonField`,
+`JsonSubTable`, and `JsonUnion`) do not change:
+
+| Entry point | Final ABI argument | Escape behavior |
+| --- | --- | --- |
+| `align_rt_json_decode` | `arena: *mut Arena` | record and nested fields materialize in `arena` |
+| `align_rt_json_decode_struct_array` | `arena: *mut Arena` | every AoS row shares the caller arena |
+| `align_rt_json_decode_union` | `arena: *mut Arena` | string and object arms share the caller arena |
+| `align_rt_json_decode_soa` | existing `arena: *mut Arena` | unchanged ABI; escaped columns materialize in the arena |
+| `align_rt_json_scan_next` | none | escaped declared strings reject; no hidden allocation |
+
+The arena allocation is exact-size, bump-only, and never individually freed. A semantic failure may
+leave unreachable bytes until arena exit, but publishes no partial result and preserves the first
+parser error. No hidden arena, process-global decoder state, descriptor field, persisted format, or
+second JSON representation is introduced.
+
+The canonical design fixture is
+`bench/json_escape/fixtures/canonical.json`, SHA-256
+`57fab88300c5522cd49dae7bafe7f90c29e077148cbd50ab6079e70446186321` including its final LF. It
+contains an escaped declared key, short and Unicode escapes, a surrogate pair, an escaped ignored
+key/value, a clean value, and a scalar field. The implementation must preserve the semantic record
+and exact error precedence for this fixture and its malformed mutations.
+
+### Request 7 implementation closure matrix
+
+| Transition | Owner | Required regression |
+| --- | --- | --- |
+| String grammar, UTF-8, short escapes, Unicode/surrogates, and deterministic error order | shared runtime string-token decoder and `json.doc` parser | `align_runtime::tests::json_escape_string_grammar_matrix`, `align_runtime::tests::json_doc_top_level_scalar_and_escapes` |
+| Clean view versus one arena materialization, outside-arena rejection, embedded NUL | `JsonParser`, arena writer, `align_rt_json_decode` | `align_runtime::tests::json_escape_record_lifecycle`, `m5::json_escape_typed_decode_materialization_and_region`, `m5::json_scalar_array_str_element_materializes_and_is_region_bound` |
+| Escaped semantic keys, duplicate detection, ignored-key/value validation | semantic key matcher, `parse_object`, structural prevalidation | `align_runtime::tests::json_escape_aos_path_equivalence`, `align_runtime::tests::json_escape_nonmaterializing_paths`, `align_runtime::tests::json_escape_string_grammar_matrix` |
+| Slow record and nested-record success/failure, return and Drop | `parse_object`, `write_value`, decoded-owner cleanup from Request 15 | `m5::json_decode_encode_nested_struct_roundtrip`, `m5::json_option_move_struct_later_failure_cleans`, `align_runtime::tests::json_array_field_error_path_frees_buffer` |
+| AoS slow/speculative/fallback equivalence and row cleanup | `json_speculate`, `json_fallback`, `align_rt_json_decode_struct_array` | `align_runtime::tests::json_escape_aos_path_equivalence`, `m5::json_decode_struct_array_malformed_errors`, `align_runtime::tests::json_array_field_error_path_frees_buffer` |
+| SoA direct fill and arena cleanup | `align_rt_json_decode_soa`, `SoaDst` | `align_runtime::tests::json_escape_soa_path_equivalence` |
+| Union and scanner materialization boundaries | `decode_union_value`, `align_rt_json_scan_next` | `align_runtime::tests::json_escape_nonmaterializing_paths`, `m5::json_union_decode_by_shape_class`, `m5::json_scan_malformed_row_errors` |
+| HIR/MIR arena operand, region meet, descriptor/cache identity, and ABI | sema storage/region analysis, MIR Rvalues, LLVM runtime registry | `m5::json_escape_typed_decode_materialization_and_region`, `cache_codegen::gate2b_json_decode_field_rename_invalidates`, `align_codegen_llvm::runtime_abi_extern_type_matrix_is_exact_for_every_row_and_ordinal` |
+| Canonical fixture identity | checked-in fixture and runtime oracle | `align_runtime::tests::json_escape_record_lifecycle` includes the fixture bytes and semantic-output oracle; SHA-256 is recorded above |
+
+The author-side matrix-to-diff pass must point every applicable row to implementation and a focused
+owner test before the implementation PR is opened. The benchmark-evidence document remains the
+separate trusted measurement boundary; it does not define this language or runtime contract.
+
 ## Signatures (verified unless marked pending)
 
 ```text
@@ -25,9 +85,9 @@ json.decode(s)   -> Result<T, Error>         // T from the binding/context: u: U
 //   i64 / f64 / bool       (a BARE scalar — parses the whole input as one JSON number/bool; Copy → Static/returnable; T1b)
 //   struct                 (flat OR with nested-struct / Option<T> / array<Struct> / array<scalar> fields; field order free; unknown keys ignored)
 //   array<i64> / array<f64>
-//   array<Struct>          (AoS; str fields = zero-copy views into the input; nested-struct + Option fields recurse)
+//   array<Struct>          (AoS; clean str fields = zero-copy views into the input; escaped selected fields use the caller arena; nested-struct + Option fields recurse)
 //   soa<Struct>            (direct columnar decode — no AoS intermediate, no transpose;
-//                           inside arena {}; str columns borrow the input text; primitive/str columns only,
+//                           inside arena {}; clean str columns borrow the input text; escaped selected columns use the caller arena; primitive/str columns only,
 //                           NO nested columns — the owned-columns deferral stands)
 //   enum (union)           (shape-directed: a JSON oneOf → a sum type; the variant is selected by the
 //                           value's shape class — str/number/bool/object/array; O(1) first-byte dispatch;
@@ -106,11 +166,12 @@ token ids) **or `array<str>`** (argv lists, `stop`/`tags`, tool-name lists). A J
 `{ptr,len}` is width 16, which does not fit the original 4) and sign (bit 16) pack into the tag's upper
 bits, so one tag carries both. Decode: `decode_scalar_array_value` parses the JSON array into an owned
 buffer via the shared per-scalar `write_value`, so the same range / sign / float-width checks a scalar
-*field* gets apply per element. **A `str` element (kind 3, width 16) is written as a zero-copy `{ptr,len}`
-VIEW into the input** (the top-level `str`-field rule), so the owned spine's entries borrow the input —
-the whole decoded struct is already input-region-bound via `region_of(JsonDecode) = region_of(input)`,
-so nothing new is needed. `.clone()` copies past the input; a JSON-escaped element (`\`) is the same
-pre-existing zero-copy limitation as an escaped `str` field (decodes to `Err`). Encode: a
+*field* gets apply per element. **A clean `str` element (kind 3, width 16) is written as a zero-copy
+`{ptr,len}` VIEW into the input** (the top-level `str`-field rule); selected escaped elements
+materialize exactly once in the enclosing arena. The owned spine therefore borrows the input or
+arena, and the whole decoded struct is input/arena-region-bound. `.clone()` copies past those
+sources; without an arena an escaped element returns `Err`, so
+the decoded record remains input/arena-region-bound. Encode: a
 `ScalarArrayField` template piece → `json_encode_scalar_array` loops the buffer emitting `[e0,e1,…]`
 (a `str` element renders quoted + `write_json_str_body`-escaped). Drop: the owned SPINE flat-frees
 (scalar / `str`-view elements own nothing — the views are freed by no one, they borrow the input) —
@@ -198,9 +259,10 @@ does not mean RFC 8785 sorting. The authoritative contract and closure matrix ar
 
 ## Regions
 
-`region_of(decoded str view) = region_of(input)`; `region_of(soa columns) = enclosing arena`;
-owned arrays escape freely. Escaping a decoded view past its input is caught at the escape
-point (clone out to keep).
+`region_of(clean decoded str view) = region_of(input)`; an escaped selected string is bounded by
+the input and enclosing arena; `region_of(soa columns) = enclosing arena`; owned arrays escape
+freely only when all their elements are owned. Escaping a decoded view past its input or arena is
+caught at the escape point (clone out to keep).
 
 ## Completeness status and remaining boundaries
 

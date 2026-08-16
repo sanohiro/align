@@ -48,8 +48,9 @@ fn soa_of_a_non_struct_is_rejected() {
 
 #[test]
 fn soa_with_a_str_field_is_allowed() {
-    // A `str` column is a 16-byte `{ptr,len}` view column (zero-copy into the decode input); the
-    // soa is well-formed, and a primitive column still projects/reduces as before.
+    // A clean `str` column is a 16-byte `{ptr,len}` view column (zero-copy into the decode input);
+    // selected escaped values use the enclosing arena. The soa is well-formed, and a primitive
+    // column still projects/reduces as before.
     assert!(ok(concat!(
         "pub Rec { id: i64, name: str }\n",
         "pub fn k(r: soa<Rec>) -> i64 = r.id.sum()\n",
@@ -376,7 +377,8 @@ fn json_decode_into_soa_with_a_str_column() {
     if !backend_available() {
         return;
     }
-    // A `str` column decodes as a zero-copy view into the input. Read a str element field
+    // A clean `str` column decodes as a zero-copy view into the input; selected escaped values are
+    // arena-materialized. Read a str element field
     // (`s[1].name` = "bob" → len 3) alongside an int column reduction (age 30+25 = 55) to prove
     // both the str view and the mixed str/int column layout are correct.
     let out = build_and_run(
