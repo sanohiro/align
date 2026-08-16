@@ -215,6 +215,27 @@ class MonitorObservation:
             "container_manifest_sha256": self.container_manifest_sha256,
         }
 
+    def to_snapshot(self) -> MonitorSnapshot:
+        """Reconstruct the source snapshot represented by this observation."""
+
+        return MonitorSnapshot(
+            monotonic_ns=self.monotonic_ns,
+            load_milli=self.load_milli,
+            cpu_pressure_total_us=self.cpu_pressure_total_us,
+            memory_pressure_total_us=self.memory_pressure_total_us,
+            free_memory_bytes=self.free_memory_bytes,
+            swap_read_bytes=self.swap_read_bytes,
+            swap_write_bytes=self.swap_write_bytes,
+            throttle_events=self.throttle_events,
+            thermal_events=self.thermal_events,
+            foreign_schedule_events=self.foreign_schedule_events,
+            foreign_container_events=self.foreign_container_events,
+            monitor_lost_events=self.monitor_lost_events,
+            frequency_khz=self.frequency_khz,
+            temperature_millic=self.temperature_millic,
+            container_manifest_sha256=self.container_manifest_sha256,
+        )
+
 
 @dataclass(frozen=True)
 class ChildRange:
@@ -238,6 +259,38 @@ class MonitorResult:
 
     observations: tuple[MonitorObservation, ...]
     child_ranges: tuple[ChildRange, ...]
+
+
+def validate_report_observations(
+    observations: Sequence[MonitorObservation],
+    expected_child_ids: Sequence[str],
+    max_sample_gap_ns: int = 100_000_000,
+) -> MonitorResult:
+    """Replay report observations through the complete monitor lifecycle."""
+
+    lifecycle = MonitorLifecycle(expected_child_ids, max_sample_gap_ns)
+    lifecycle.open()
+    for ordinal, observation in enumerate(observations):
+        if not isinstance(observation, MonitorObservation):
+            raise MonitorLifecycleError("report observations have the wrong type")
+        if observation.ordinal != ordinal:
+            raise MonitorLifecycleError("observation ordinals must be dense and ordered")
+        snapshot = observation.to_snapshot()
+        if observation.phase == "pre-build":
+            lifecycle.record_pre_build(snapshot)
+        elif observation.phase == "child-start":
+            lifecycle.start_child(observation.child_id, snapshot)
+        elif observation.phase == "child-sample":
+            lifecycle.sample_child(snapshot)
+        elif observation.phase == "child-end":
+            lifecycle.end_child(snapshot)
+        elif observation.phase == "between-children":
+            lifecycle.record_between_children(snapshot)
+        elif observation.phase == "post-run":
+            lifecycle.record_post_run(snapshot)
+        else:
+            raise MonitorLifecycleError("report observation has an unknown phase")
+    return lifecycle.finish()
 
 
 def validate_child_ranges(

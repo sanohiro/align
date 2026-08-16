@@ -181,11 +181,19 @@ class ExclusiveRun:
         self._published = True
 
     def _release_finalization_lock(self) -> None:
-        """Close the reacquired descriptor; close releases its flock."""
+        """Release the reacquired flock before best-effort descriptor close."""
 
         if self._lock_fd < 0 or not self._locked:
             raise ExclusiveRunError("finalization lock is not held")
-        os.close(self._lock_fd)
+        # LOCK_UN is the transactional guard transition.  A close error after
+        # it succeeds cannot mean that another run was admitted by this
+        # lease; treating that best-effort descriptor cleanup as a failed
+        # finalization would falsely report a fail-closed reservation.
+        fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+        try:
+            os.close(self._lock_fd)
+        except OSError:
+            pass
 
     def finalize_publication(self) -> None:
         if not self._published or not self._reserved:
@@ -202,10 +210,6 @@ class ExclusiveRun:
             self._restore_reservation()
             raise
         try:
-            # Keep the reservation state true until the descriptor close
-            # succeeds.  Closing the descriptor releases the flock, so a
-            # close failure can restore the reservation while still
-            # holding the host lock.
             self._release_finalization_lock()
         except BaseException:
             self._restore_reservation()
@@ -218,13 +222,30 @@ class ExclusiveRun:
     def abort(self, *, remove_reservation: bool) -> None:
         """Close local state; leaving the reservation blocks later runs."""
 
+        removed = False
+        if remove_reservation and self._reserved:
+            if not self._locked or self._lock_fd < 0:
+                raise ExclusiveRunError("reservation removal requires the held host lock")
+            try:
+                os.unlink(self.reservation_path)
+                _fsync_parent(self.reservation_path)
+            except BaseException:
+                self._restore_reservation()
+                raise
+            removed = True
         if self._lock_fd >= 0:
-            fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
-            os.close(self._lock_fd)
+            try:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+            except BaseException:
+                if removed:
+                    self._restore_reservation()
+                raise
+            try:
+                os.close(self._lock_fd)
+            except OSError:
+                pass
             self._lock_fd = -1
         self._locked = False
-        if remove_reservation and self._reserved:
-            os.unlink(self.reservation_path)
-            _fsync_parent(self.reservation_path)
+        if removed:
             self._reserved = False
         self._closed = True

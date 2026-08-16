@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from . import canonical_json as cj
+from . import monitor
 from . import report_schema
 from . import schedule
 from . import sshsig
@@ -407,40 +408,48 @@ def _sample_token(microseconds: int) -> str:
 
 
 def _verify_host_observations(body: cj.Object, records: list[cj.Object]) -> None:
-    observations = body["host_observations"]
-    if [observation["ordinal"] for observation in observations] != list(range(len(observations))):
-        _error("host observations must have dense ordinals")
-    covered: set[int] = set()
-    previous_last = -1
+    try:
+        observations = tuple(
+            monitor.MonitorObservation(
+                ordinal=observation["ordinal"],
+                phase=observation["phase"],
+                monotonic_ns=observation["monotonic_ns"],
+                child_id=observation["child_id"],
+                load_milli=observation["load_milli"],
+                cpu_pressure_total_us=observation["cpu_pressure_total_us"],
+                memory_pressure_total_us=observation["memory_pressure_total_us"],
+                free_memory_bytes=observation["free_memory_bytes"],
+                swap_read_bytes=observation["swap_read_bytes"],
+                swap_write_bytes=observation["swap_write_bytes"],
+                throttle_events=observation["throttle_events"],
+                thermal_events=observation["thermal_events"],
+                foreign_schedule_events=observation["foreign_schedule_events"],
+                foreign_container_events=observation["foreign_container_events"],
+                monitor_lost_events=observation["monitor_lost_events"],
+                frequency_khz=observation["frequency_khz"],
+                temperature_millic=observation["temperature_millic"],
+                container_manifest_sha256=observation["container_manifest_sha256"],
+            )
+            for observation in body["host_observations"]
+        )
+    except monitor.MonitorLifecycleError as exc:
+        _error(f"monitor observation rejected: {exc}")
+    expected_child_ids = tuple(record["child_id"] for record in records)
+    try:
+        result = monitor.validate_report_observations(observations, expected_child_ids)
+    except monitor.MonitorLifecycleError as exc:
+        _error(f"monitor lifecycle rejected: {exc}")
+
+    by_child = {child_range.child_id: child_range for child_range in result.child_ranges}
     for record in records:
-        first = record["monitor_first"]
-        last = record["monitor_last"]
-        if first >= last or last >= len(observations) or first <= previous_last:
-            _error("child monitor ranges must be nonempty, ordered, and disjoint")
-        child_id = record["child_id"]
-        first_observation = observations[first]
-        last_observation = observations[last]
+        child_range = by_child.get(record["child_id"])
+        if child_range is None:
+            _error("report child is absent from monitor ranges")
         if (
-            first_observation["phase"] != "child-start"
-            or first_observation["child_id"] != child_id
-            or last_observation["phase"] != "child-end"
-            or last_observation["child_id"] != child_id
+            record["monitor_first"] != child_range.first
+            or record["monitor_last"] != child_range.last
         ):
-            _error("child monitor range boundaries do not match the child")
-        for index in range(first, last + 1):
-            observation = observations[index]
-            if observation["child_id"] != child_id:
-                _error("child monitor range contains another child")
-            if index not in (first, last) and observation["phase"] != "child-sample":
-                _error("child monitor range interior is not a sample")
-            covered.add(index)
-        previous_last = last
-    for index, observation in enumerate(observations):
-        if observation["child_id"] == "":
-            if observation["phase"] in ("child-start", "child-sample", "child-end"):
-                _error("non-child observation has a child phase")
-        elif index not in covered:
-            _error("orphaned child observation is not named by a report record")
+            _error("report child monitor range does not match the lifecycle")
 
 
 def _verify_report_semantics(body: cj.Object, expected: ReportExpectations) -> None:

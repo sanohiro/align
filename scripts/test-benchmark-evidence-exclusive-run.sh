@@ -81,21 +81,57 @@ with tempfile.TemporaryDirectory(prefix="align-exclusive-owner-") as name:
     closing.release_lock_for_publication()
     closing.mark_published()
 
-    def fail_final_lock_close():
-        raise OSError("injected finalization lock close failure")
+    original_release = closing._release_finalization_lock
+    original_close = exclusive_run.os.close
+    close_failed = [False]
 
-    closing._release_finalization_lock = fail_final_lock_close
+    def release_with_real_close_failure():
+        final_fd = closing._lock_fd
+
+        def fail_after_close(fd):
+            if fd == final_fd and not close_failed[0]:
+                original_close(fd)
+                close_failed[0] = True
+                raise OSError("injected finalization lock close failure")
+            return original_close(fd)
+
+        exclusive_run.os.close = fail_after_close
+        try:
+            original_release()
+        finally:
+            exclusive_run.os.close = original_close
+
+    closing._release_finalization_lock = release_with_real_close_failure
+    closing.finalize_publication()
+    assert close_failed[0]
+    assert not reservation.exists()
+
+    aborting = exclusive_run.ExclusiveRun(str(lock), str(reservation))
+    aborting.acquire()
+    aborting.create_reservation("e" * 64, str(output))
+    original_fsync_parent = exclusive_run._fsync_parent
+    abort_fsync_failed = [False]
+
+    def fail_abort_fsync(path):
+        if not abort_fsync_failed[0]:
+            abort_fsync_failed[0] = True
+            raise OSError("injected abort reservation fsync failure")
+        return original_fsync_parent(path)
+
+    exclusive_run._fsync_parent = fail_abort_fsync
     try:
-        closing.finalize_publication()
+        aborting.abort(remove_reservation=True)
     except OSError as exc:
-        assert "injected finalization lock close failure" in str(exc)
+        assert "injected abort reservation fsync failure" in str(exc)
     else:
-        raise AssertionError("finalization lock close failure was accepted")
-    assert closing.locked
+        raise AssertionError("abort reservation fsync failure was accepted")
+    finally:
+        exclusive_run._fsync_parent = original_fsync_parent
+    assert aborting.locked
     assert reservation.exists()
     blocked = exclusive_run.ExclusiveRun(str(lock), str(reservation))
     expect_error(blocked.acquire, "publication reservation")
-    closing.abort(remove_reservation=False)
+    aborting.abort(remove_reservation=False)
     reservation.unlink()
 
     second.acquire()

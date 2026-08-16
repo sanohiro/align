@@ -173,9 +173,9 @@ def make_benchmarks():
         name: {"preparations": [], "warmups": [], "pairs": []}
         for name in schedule.BENCHMARKS
     }
-    observations = []
+    observations = [observation(0, "pre-build", "")]
     plans = schedule.full_schedule()
-    for plan in plans:
+    for index, plan in enumerate(plans):
         prefix = "a" if plan.benchmark == "json_decode" else "b"
         child_id = f"{prefix}{plan.sequence:063x}"
         monitor_first = len(observations)
@@ -198,6 +198,9 @@ def make_benchmarks():
                 grouped[plan.benchmark]["warmups"].append(record)
             else:
                 grouped[plan.benchmark]["pairs"].append(record)
+        if index + 1 < len(plans):
+            observations.append(observation(len(observations), "between-children", ""))
+    observations.append(observation(len(observations), "post-run", ""))
     benchmarks = []
     for name in schedule.BENCHMARKS:
         records = grouped[name]
@@ -589,6 +592,86 @@ overlapping_protected = replace(
 rejected("protected input changed path overlap", lambda: verifier.verify_artifact(
     verifier.EvidenceArtifact(
         rs.encode_report(replace(BODY, "protected_inputs", overlapping_protected)),
+        SIGNATURE,
+        PR_BODY,
+        ATTESTATION,
+        EXPECTATIONS,
+    ),
+    lambda _preimage, _signature: True,
+))
+
+incomplete_observations = [
+    replace(observation, "ordinal", ordinal)
+    for ordinal, observation in enumerate(
+        observation
+        for observation in BODY["host_observations"]
+        if observation["phase"] in ("child-start", "child-sample", "child-end")
+    )
+]
+rejected("incomplete monitor lifecycle", lambda: verifier.verify_artifact(
+    verifier.EvidenceArtifact(
+        rs.encode_report(replace(BODY, "host_observations", incomplete_observations)),
+        SIGNATURE,
+        PR_BODY,
+        ATTESTATION,
+        EXPECTATIONS,
+    ),
+    lambda _preimage, _signature: True,
+))
+
+non_dense_observations = list(BODY["host_observations"])
+non_dense_observations[1] = replace(non_dense_observations[1], "ordinal", 99)
+rejected("non-dense monitor ordinal", lambda: verifier.verify_artifact(
+    verifier.EvidenceArtifact(
+        rs.encode_report(replace(BODY, "host_observations", non_dense_observations)),
+        SIGNATURE,
+        PR_BODY,
+        ATTESTATION,
+        EXPECTATIONS,
+    ),
+    lambda _preimage, _signature: True,
+))
+
+phase_child_mismatch = list(BODY["host_observations"])
+phase_child_mismatch[0] = replace(
+    phase_child_mismatch[0],
+    "child_id",
+    BODY["benchmarks"][0]["preparations"][0]["child_id"],
+)
+rejected("monitor phase child mismatch", lambda: verifier.verify_artifact(
+    verifier.EvidenceArtifact(
+        rs.encode_report(replace(BODY, "host_observations", phase_child_mismatch)),
+        SIGNATURE,
+        PR_BODY,
+        ATTESTATION,
+        EXPECTATIONS,
+    ),
+    lambda _preimage, _signature: True,
+))
+
+nonmonotonic_observations = list(BODY["host_observations"])
+nonmonotonic_observations[2] = replace(
+    nonmonotonic_observations[2],
+    "monotonic_ns",
+    nonmonotonic_observations[1]["monotonic_ns"],
+)
+rejected("nonmonotonic monitor observation", lambda: verifier.verify_artifact(
+    verifier.EvidenceArtifact(
+        rs.encode_report(replace(BODY, "host_observations", nonmonotonic_observations)),
+        SIGNATURE,
+        PR_BODY,
+        ATTESTATION,
+        EXPECTATIONS,
+    ),
+    lambda _preimage, _signature: True,
+))
+
+counter_reset_observations = list(BODY["host_observations"])
+counter_reset_observations[1] = replace(counter_reset_observations[1], "throttle_events", 1)
+counter_reset_observations[2] = replace(counter_reset_observations[2], "throttle_events", 0)
+rejected("monitor counter reset", lambda: verifier.verify_artifact(
+    verifier.EvidenceArtifact(
+        rs.encode_report(replace(BODY, "host_observations", counter_reset_observations)),
         SIGNATURE,
         PR_BODY,
         ATTESTATION,
