@@ -341,6 +341,7 @@ Operational rules:
 ```text
 Language semantics and surface       draft.md
 Current decisions and open items     docs/open-questions.md
+Settled-decision reopen protocol     docs/impl/23-friction-ledger.md
 Milestone implementation evidence    docs/impl/07-roadmap.md
 Current pkg.web contract             docs/impl/pkg-design/web.md
 Current pkg.db contract              docs/impl/pkg-design/db.md

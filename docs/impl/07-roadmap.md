@@ -3874,6 +3874,12 @@ cloud (after asym sig): pkg.s3 + SigV4  (one impl covers S3 / GCS-interop / R2 /
 
 ### Deferred / stance (pending confirmation in `open-questions.md`)
 
+- **Two implementation gaps, not restrictions** — a value-carrying `if`/`else` expression cannot
+  move an already-bound owned local out of an arm (every sibling form can), and a `sort_by_key` key
+  must be Copy because the fused sort path has no per-key Drop. Both are Category A in
+  `docs/impl/23-friction-ledger.md`: the design already describes the working behavior, so neither
+  needs a decision to change. Owned by `docs/open-questions.md` and
+  `docs/impl/19-hir-validation-ledger.md` respectively.
 - **YAML** — never in core/std; no "subset". If ever needed, a document-type parser
   (kubeconfig, compose), tested against that schema. Output is always JSON. (Only Ruby put YAML in
   its stdlib; it paid a ~10-year unsafe-load security cost.)

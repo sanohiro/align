@@ -13,6 +13,12 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+Re-examining an item in this section goes through the friction-ledger protocol first
+(`docs/impl/23-friction-ledger.md`): a proposal is admissible once that ledger records at least
+five mechanical workarounds across at least two independent real programs. Reaching the threshold
+only makes the proposal admissible; the re-examination itself follows the ordinary procedure in
+this file and the design gate in `CLAUDE.md`.
+
 ### `pkg.db.sqlite` scalar callbacks use static targets (SETTLED 2026-08-13)
 
 **Decision:** D14's first native-callback rail accepts one exact noncapturing named or lifted Align
