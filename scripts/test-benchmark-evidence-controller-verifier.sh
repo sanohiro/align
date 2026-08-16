@@ -1089,8 +1089,9 @@ def make_hooks(
     def manifests(inv):
         return (False, True) if bad_manifests else (True, True)
 
-    def produce(inv, manifests, phases):
-        assert set(manifests) == {(bench, rev) for bench in schedule.BENCHMARKS for rev in schedule.REVISIONS}
+    def produce(inv, transcript, phases):
+        assert set(transcript.manifests) == {(bench, rev) for bench in schedule.BENCHMARKS for rev in schedule.REVISIONS}
+        assert tuple(record.plan for record in transcript.children) == schedule.full_schedule()
         assert not hasattr(inv, "pr_body")
         assert not hasattr(inv, "review_attestation")
         assert phases[-1] == "report"

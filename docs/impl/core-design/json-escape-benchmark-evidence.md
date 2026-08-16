@@ -944,6 +944,36 @@ the exact-output, cleanup, and profile-limit fixtures across multiple PRs.
 | Parser/arithmetic | Enforce exact title/header/row order and ASCII grammar, parse tokens without floating point, convert one three-decimal millisecond token to checked integer microseconds, and retain only the fixed five-field inventory across both benchmarks. Extra output, profile mode, ratio mutation, zero, overflow, field/row/order mutation, warning, and trailing-byte owners reject. `scripts/test-benchmark-evidence-native-measurement.sh`. |
 | Failure and scope | A failed child produces no parsed measurement and no retry; the controller remains responsible for resource ledger removal and later cleanup. Workspace path replacement, artifact-manifest drift, monitor event, report assembly, signing, publication, merge verification, and baseline selection remain explicit downstream gates. English/Japanese contract and owner use the same constants. `git diff --check`; `scripts/test-benchmark-evidence-native-measurement.sh`. |
 
+## Native measurement/controller/report handoff implementation closure
+
+This capability consumes the native child rail and the pure monitor lifecycle. It makes the first
+real measurement result usable by the trusted controller: a stateful session replaces each
+prepare-time digest before the corresponding native children, the controller retains the exact
+ordered child transcript, and a report assembler turns that transcript plus validated monitor
+observations into the canonical `preparations`, `warmups`, `pairs`, `samples`, and five `fields`
+members. The outer revision, identity, review, signature, staging, publication, and merge-verifier
+adapters remain their existing trusted ports. This slice does not select `BASE`, collect host
+snapshots, sign or publish a report, verify a provider merge, or accept the Request 7 language.
+
+### Public-contract ledger
+
+| Public surface | Exact contract, owner, and acceptance |
+|---|---|
+| `native_measurement.NativeMeasurementSession` | Owns one immutable `NativeMeasurementConfig` plus the mutable in-memory state for one exact `schedule.full_schedule()`. It accepts each plan once in order, calls `execute_child` once, stores the prepare digest for that `(benchmark, revision)` before any later native child, rejects a reused ID, plan mutation, digest drift, retry, and incomplete schedule, and exposes only an immutable ordered `ChildExecution` tuple after completion. `scripts/test-benchmark-evidence-controller-report.sh`. |
+| `controller.ChildExecutionRecord` / `ExecutionTranscript` | The controller binds one schedule plan to its `ChildResult` and optional native `ChildExecution`, checks child ID/phase/product/build/digest agreement, preserves global order, and passes the complete immutable transcript plus the controller-owned manifest map to the report producer. A missing execution is allowed by the generic orchestration core but is rejected by the measurement report assembler. `scripts/test-benchmark-evidence-controller-verifier.sh`; `scripts/test-benchmark-evidence-controller-report.sh`. |
+| `measurement_report.assemble` | Accepts a complete controller transcript and the monitor's ordered observations. It replays the monitor lifecycle against the exact child IDs, binds every inclusive child range, converts each parsed integer microsecond value back to its canonical three-decimal token, emits the fixed preparation/warm-up/pair order and five field order, reconstructs exact ten-sample permutations and middle sums, and returns only typed canonical report fragments. `scripts/test-benchmark-evidence-controller-report.sh`. |
+| Report producer handoff | The existing trusted report producer receives the assembler fragments through the controller transcript path; it remains responsible for revision/identity/review/execution metadata, body encoding, signature, and post-PR verification binding. No candidate-provided transcript, monitor range, sample, derived median, or field verdict is accepted as a substitute for the controller-owned values. `scripts/test-benchmark-evidence-controller-report.sh`; `scripts/test-benchmark-evidence-controller-verifier.sh`. |
+
+### Implementation closure matrix
+
+| Axis | Implementation closure and exact regression |
+|---|---|
+| Session formation and state | Require the exact schedule tuple, one unique controller child ID per plan, a missing digest only for prepare, and a digest present and unchanged for every later child. Replace only the matching workspace after successful prepare parsing; never mutate a caller mapping or retry a failed child. Test plan/order/ID reuse, prepare/native digest joins, incomplete completion, and failed-child state. `scripts/test-benchmark-evidence-controller-report.sh`; `scripts/test-benchmark-evidence-native-measurement.sh`. |
+| Controller construction and handoff | For every result, require the execution's child ID, phase, benchmark, revision, build flag, and manifest digest to equal the controller plan/result. Preserve the exact 48-child order and pass one immutable transcript to the producer; a missing or mismatched execution is rejected before report assembly. Mutate each agreement field and assert no producer call follows rejection. `scripts/test-benchmark-evidence-controller-report.sh`; `scripts/test-benchmark-evidence-controller-verifier.sh`. |
+| Monitor join and ranges | Replay observations through `MonitorLifecycle` with the transcript's IDs, require dense ordinals and an exact ordered/disjoint `ChildRange` for every child, and use those ranges for preparation/warm-up/run records. Missing, duplicated, reordered, interior, wrong-child, counter-reset, and latched-event observations reject before a report fragment is returned. `scripts/test-benchmark-evidence-controller-report.sh`; `benchmark_evidence_monitor_matrix`. |
+| Report construction and arithmetic | Partition each benchmark into two preparations, two warm-ups, and ten balanced pairs; require parsed field names and integer values in the fixed two/three-field order; emit canonical tokens without float conversion; aggregate ten samples per revision, sort exact permutations, add checked middle sums, and compare checked `candidate * 100 <= baseline * 105`. Mutated sequence, arm, field, token, sample, permutation, or overflow data rejects. `scripts/test-benchmark-evidence-controller-report.sh`; `benchmark_evidence_report_matrix`. |
+| Failure and ownership | No fragment is returned for an incomplete session, missing measurement, artifact drift, malformed monitor lifecycle, invalid arithmetic, or child failure. The session owns only in-memory execution facts; controller cleanup, report signing, staging/publication, merge verification, and lifecycle advancement remain downstream owners. English/Japanese contract and all fixed constants stay synchronized. `git diff --check`; `scripts/test-benchmark-evidence-controller-report.sh`. |
+
 ## Design-review finding closure
 
 | Finding | Ledger-first closure |

@@ -12,10 +12,12 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Callable, Mapping
 
 from . import cleanup
 from . import cli
+from . import native_measurement
 from . import report_schema
 from . import schedule
 from . import verifier
@@ -116,6 +118,7 @@ class ChildResult:
     timed_out: bool = False
     truncated: bool = False
     resources: tuple[OwnedResource, ...] = ()
+    execution: native_measurement.ChildExecution | None = None
 
     def __post_init__(self) -> None:
         _string(self.child_id, _HEX64, "child_id")
@@ -139,6 +142,74 @@ class ChildResult:
             if key in tokens:
                 _error("a child may not return the same resource twice")
             tokens.add(key)
+        if self.execution is not None:
+            if not isinstance(self.execution, native_measurement.ChildExecution):
+                _error("execution must be a native ChildExecution")
+            if self.execution.child_id != self.child_id:
+                _error("execution child_id does not match child result")
+            if self.execution.artifact_manifest_sha256 != self.artifact_manifest_sha256:
+                _error("execution manifest digest does not match child result")
+            if self.execution.build_attempted != self.build_attempted:
+                _error("execution build flag does not match child result")
+
+
+@dataclass(frozen=True)
+class ChildExecutionRecord:
+    """One schedule plan bound to the controller result for that child."""
+
+    plan: schedule.ChildPlan
+    result: ChildResult
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.plan, schedule.ChildPlan):
+            _error("execution record plan has the wrong type")
+        if not isinstance(self.result, ChildResult):
+            _error("execution record result has the wrong type")
+        if self.result.child_id == "":
+            _error("execution record child ID is empty")
+        execution = self.result.execution
+        if execution is not None:
+            if (
+                execution.phase != self.plan.phase
+                or execution.benchmark != self.plan.benchmark
+                or execution.revision != self.plan.revision
+            ):
+                _error("execution record does not match its schedule plan")
+
+
+@dataclass(frozen=True)
+class ExecutionTranscript:
+    """The immutable ordered child facts handed to a trusted report producer."""
+
+    children: tuple[ChildExecutionRecord, ...]
+    manifests: Mapping[tuple[str, str], str]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.children, tuple):
+            _error("execution transcript must preserve child order")
+        if any(not isinstance(record, ChildExecutionRecord) for record in self.children):
+            _error("execution transcript contains an invalid child record")
+        expected_plans = schedule.full_schedule()
+        if tuple(record.plan for record in self.children) != expected_plans:
+            _error("execution transcript must contain the complete fixed schedule")
+        child_ids = tuple(record.result.child_id for record in self.children)
+        if len(set(child_ids)) != len(child_ids):
+            _error("execution transcript reuses a child ID")
+        if not isinstance(self.manifests, Mapping):
+            _error("execution transcript manifests must be a mapping")
+        actual = dict(self.manifests)
+        expected_keys = {
+            (benchmark, revision)
+            for benchmark in schedule.BENCHMARKS
+            for revision in schedule.REVISIONS
+        }
+        if set(actual) != expected_keys:
+            _error("execution transcript manifests do not cover the fixed products")
+        for key, digest in actual.items():
+            if not isinstance(key, tuple) or len(key) != 2 or key not in expected_keys:
+                _error("execution transcript manifest key is invalid")
+            _string(digest, _HEX64, "execution transcript manifest")
+        object.__setattr__(self, "manifests", MappingProxyType(actual))
 
 
 @dataclass(frozen=True)
@@ -161,7 +232,7 @@ ChildIdFactory = Callable[[schedule.ChildPlan], str]
 Executor = Callable[[schedule.ChildPlan, str], ChildResult]
 ManifestCheck = Callable[[cli.RunInvocation], tuple[bool, bool]]
 ReportProducer = Callable[
-    [cli.RunInvocation, Mapping[tuple[str, str], str], tuple[str, ...]],
+    [cli.RunInvocation, ExecutionTranscript, tuple[str, ...]],
     verifier.ProducedEvidence,
 ]
 ProducedVerifier = Callable[[verifier.ProducedEvidence], verifier.VerifiedReport]
@@ -382,6 +453,7 @@ class Controller:
                 gate(invocation, self.config)
 
             state = schedule.ScheduleState()
+            records: list[ChildExecutionRecord] = []
             phases.append("schedule")
             for plan in state.plans:
                 child_id = self.hooks.child_id(plan)
@@ -392,6 +464,7 @@ class Controller:
                     _error("child executor returned the wrong result type")
                 if result.child_id != child_id:
                     _error("child executor changed the controller-assigned child ID")
+                record = ChildExecutionRecord(plan, result)
                 for resource in result.resources:
                     transaction.attach(resource.kind, resource.token)
                 state.finish(
@@ -404,6 +477,7 @@ class Controller:
                 )
                 for resource in result.resources:
                     transaction.remove(resource.kind, resource.token)
+                records.append(record)
                 active_child = False
             state.finish_all()
 
@@ -425,7 +499,7 @@ class Controller:
             phases.append("report")
             produced = self.hooks.produce_report(
                 invocation,
-                schedule.manifest_map(state),
+                ExecutionTranscript(tuple(records), schedule.manifest_map(state)),
                 tuple(phases),
             )
             if not isinstance(produced, verifier.ProducedEvidence):
