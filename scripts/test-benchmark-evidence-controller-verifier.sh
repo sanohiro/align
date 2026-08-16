@@ -25,6 +25,7 @@ from scripts.benchmark_evidence import verifier
 
 B = "a" * 40
 C = "b" * 40
+PARENT = "e" * 40
 BASE_TREE = "c" * 40
 CANDIDATE_TREE = "d" * 40
 COMMIT = C
@@ -82,7 +83,7 @@ def revision(*, candidate):
             ("commit_sha256", H),
             ("tree_oid", BASE_TREE),
             ("tree_manifest_sha256", H),
-            ("parents", []),
+            ("parents", [PARENT]),
             ("commits", []),
             ("changed_paths", []),
         )

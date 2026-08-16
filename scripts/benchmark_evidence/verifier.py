@@ -404,7 +404,7 @@ def _verify_report_semantics(body: cj.Object, expected: VerifierExpectations) ->
         _error("report end time precedes its start time")
 
     baseline = body["baseline"]
-    if baseline["parents"] or baseline["commits"] or baseline["changed_paths"]:
+    if baseline["commits"] or baseline["changed_paths"]:
         _error("baseline revision must not contain candidate inventory")
     candidate = body["candidate"]
     paths = [change["path_hex"] for change in candidate["changed_paths"]]
