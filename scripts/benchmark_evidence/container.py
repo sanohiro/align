@@ -234,8 +234,8 @@ def build_image_inspection_argv(profile: Any, child_id: str) -> tuple[str, ...]:
         "--env=CARGO_HOME=/cargo",
         "--env=TMPDIR=/tmp",
         "--workdir=/",
+        f"--entrypoint={IMAGE_INSPECTION_EXECUTABLE}",
         digest,
-        IMAGE_INSPECTION_EXECUTABLE,
     )
 
 

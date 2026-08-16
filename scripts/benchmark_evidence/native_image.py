@@ -215,6 +215,24 @@ def _merge(host: cj.Object, self_inspection: cj.Object) -> cj.Object:
     )
 
 
+def _validate_host_identity(profile: Mapping[str, Any], host: cj.Object) -> None:
+    """Reject a daemon identity mismatch before starting the image."""
+
+    image_profile = _profile_field(profile, ("image",))
+    if not isinstance(image_profile, Mapping):
+        _error("profile.image must be an object")
+    expected_image_id = _local_image_digest(profile)
+    expected_registry_digest = _string(
+        image_profile.get("registry_digest"),
+        _DIGEST,
+        "profile.image.registry_digest",
+    )
+    if host["image_id"] != expected_image_id:
+        _error("host image_id does not match profile before self-inspection")
+    if host["registry_digest"] != expected_registry_digest:
+        _error("host registry_digest does not match profile before self-inspection")
+
+
 def _run_one(
     profile: Mapping[str, Any],
     argv: tuple[str, ...],
@@ -234,6 +252,8 @@ def _run_one(
         raise
     except native_host.NativeHostError as exc:
         raise NativeImageError(str(exc)) from exc
+    except BaseException as exc:
+        raise NativeImageError("native Docker command failed before cleanup") from exc
     if not isinstance(actual, str) or _HEX64.fullmatch(actual) is None:
         _error("Docker client hash is malformed")
     if actual != expected:
@@ -259,6 +279,7 @@ def inspect(
     child_id = _child_id(profile)
     run_argv = container.build_image_inspection_argv(profile, child_id)
     host = _parse_host(_run_one(profile, host_inspect_argv(profile), runner=runner, hasher=hasher))
+    _validate_host_identity(profile, host)
     try:
         self_raw = _run_one(profile, run_argv, runner=runner, hasher=hasher)
     except NativeImageError as run_error:

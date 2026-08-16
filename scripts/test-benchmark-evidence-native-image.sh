@@ -171,9 +171,10 @@ def main():
     assert "--env=CARGO_HOME=/cargo" in run_argv
     assert "--env=TMPDIR=/tmp" in run_argv
     assert run_argv.count("--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=67108864") == 1
+    assert "--entrypoint=" + container.IMAGE_INSPECTION_EXECUTABLE in run_argv
     assert not any(argument.startswith("--mount=") for argument in run_argv)
     assert not any("network=host" in argument or argument == "--privileged" for argument in run_argv)
-    assert run_argv[-2:] == (DIGEST, container.IMAGE_INSPECTION_EXECUTABLE)
+    assert run_argv[-1] == DIGEST
     assert cleanup_argv == (
         container.DOCKER,
         "container",
@@ -207,14 +208,24 @@ def main():
         native_host.run_docker_commands = original_run_docker_commands
     assert production_events == [(host_argv,), (run_argv,)]
 
+    host_mismatch_events = []
+    host_mismatch_runner, _unused, _host, _run, _cleanup = fixture_runner(
+        host_value=host_bytes(image_id=REGISTRY), events=host_mismatch_events
+    )
     expect_error(
-        lambda: native_image.qualify(
-            PROFILE,
-            runner=fixture_runner(host_value=host_bytes(image_id=REGISTRY))[0],
-            hasher=lambda _path: H64,
-        ),
+        lambda: native_image.qualify(PROFILE, runner=host_mismatch_runner, hasher=lambda _path: H64),
         "does not match profile",
     )
+    assert [event[1] for event in host_mismatch_events] == [host_argv]
+    registry_mismatch_events = []
+    registry_mismatch_runner, _unused, _host, _run, _cleanup = fixture_runner(
+        host_value=host_bytes(repo_digests=[REPOSITORY + "@" + DIGEST]), events=registry_mismatch_events
+    )
+    expect_error(
+        lambda: native_image.inspect(PROFILE, runner=registry_mismatch_runner, hasher=lambda _path: H64),
+        "registry_digest does not match profile",
+    )
+    assert [event[1] for event in registry_mismatch_events] == [host_argv]
     expect_error(
         lambda: native_image.inspect(
             PROFILE,
@@ -334,6 +345,29 @@ def main():
         "fixed container cleanup",
     )
     assert calls == [host_command, run_command, cleanup_command]
+
+    production_failure_events = []
+    original_run_docker_commands = native_host.run_docker_commands
+
+    def production_failure_runner(commands, expected_client_hash=None, *, between=None):
+        assert expected_client_hash == H64
+        assert between is None
+        command = tuple(commands)[0]
+        production_failure_events.append(command)
+        if command == host_command:
+            return (host_bytes(),), H64
+        if command == run_command:
+            raise KeyboardInterrupt()
+        if command == cleanup_command:
+            return (b"removed\n",), H64
+        raise AssertionError(command)
+
+    native_host.run_docker_commands = production_failure_runner
+    try:
+        expect_error(lambda: native_image.inspect(PROFILE), "fixed container cleanup")
+    finally:
+        native_host.run_docker_commands = original_run_docker_commands
+    assert production_failure_events == [host_command, run_command, cleanup_command]
 
     def cleanup_failure(argv):
         calls.append(argv)
