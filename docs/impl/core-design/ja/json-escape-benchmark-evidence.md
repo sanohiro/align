@@ -546,6 +546,10 @@ adapterはfixed absolute command、empty environment、bounded output、determin
 injectする。real host runはadministratorのself-qualification operationであり、deterministic ownerはcurrent machineのCPU、
 kernel、cgroup、Docker、load stateに依存してはならない。
 
+このcapabilityではfixed source ownership、bounded process execution、Docker identity acquisition、canonical host assemblyを
+意図的に一つに保つ。このseamでdormant native producer chainを分割するとdescriptor/process cleanup proofが重複し、
+一つのacquisition boundaryとしてcheckされていないhost recordが残る。
+
 | Axis | Implementation / owner |
 |---|---|
 | Host identity | fixed machine identity、kernel、architecture、CPU vendor/family/model/stepping、microcode、online CPU set、NUMA set、physical memoryをno-follow/fixed sourceから読む。host IDとbenchmark CPU setはroot-ownedかつbenchmark accountからwrite不能な`/etc/align-evidence/host-id`と`/etc/align-evidence/benchmark-cpus`だけから読み、kernel sourceは`native_host.py`に固定した`/proc`/`/sys` pathとする。profile指定のx86_64 spellingだけをnormalizeし、missing、repeated、malformed、cross-architecture valueをrejectする。`benchmark_evidence_native_host_matrix`. |

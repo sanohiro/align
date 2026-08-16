@@ -721,6 +721,11 @@ parsers, and injected readers/runners in its owner. A real host run is an admini
 self-qualification operation; the deterministic owner must not depend on the current machine's
 CPU, kernel, cgroup, Docker, or load state.
 
+This capability intentionally keeps fixed-source ownership, bounded process execution, Docker
+identity acquisition, and canonical host assembly together. Splitting the dormant native producer
+chain at those seams would duplicate the descriptor/process cleanup proof and leave a host record
+that had not been checked as one acquisition boundary.
+
 | Axis | Implementation and owner |
 |---|---|
 | Host identity | Read the fixed machine identity, kernel, architecture, CPU vendor/family/model/stepping, microcode, online CPU set, NUMA set, and physical memory through no-follow/fixed sources. The host ID and benchmark CPU set come only from root-owned, benchmark-account-unwritable `/etc/align-evidence/host-id` and `/etc/align-evidence/benchmark-cpus`; the kernel sources are the fixed `/proc` and `/sys` paths in `native_host.py`. Normalize only the profile-specified x86_64 spelling; reject missing, repeated, malformed, or cross-architecture values. `benchmark_evidence_native_host_matrix`. |
