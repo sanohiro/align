@@ -37,6 +37,7 @@ class NativeHostSourceMissing(NativeHostError):
 DOCKER = "/usr/bin/docker"
 DOCKER_CONFIG = "/etc/align-evidence/docker-empty"
 DOCKER_HOST = "unix:///var/run/docker.sock"
+DOCKER_RUNTIME = "runc"
 HOST_ID_PATH = "/etc/align-evidence/host-id"
 BENCHMARK_CPU_SET_PATH = "/etc/align-evidence/benchmark-cpus"
 CPUINFO_PATH = "/proc/cpuinfo"
@@ -76,6 +77,7 @@ Reader = Callable[[str], bytes]
 Runner = Callable[[tuple[str, ...]], bytes]
 Hasher = Callable[[str], str]
 Uname = Callable[[], Any]
+PhaseHook = Callable[[], None]
 
 
 def _error(message: str) -> None:
@@ -484,7 +486,11 @@ def _client_hash(value: object, label: str = "Docker client digest") -> str:
     return value
 
 
-def run_docker_pair(expected_client_hash: str | None = None) -> tuple[bytes, bytes, str]:
+def run_docker_pair(
+    expected_client_hash: str | None = None,
+    *,
+    between: PhaseHook | None = None,
+) -> tuple[bytes, bytes, str]:
     """Run version and info from the same retained Docker executable descriptor."""
 
     if expected_client_hash is not None:
@@ -496,6 +502,8 @@ def run_docker_pair(expected_client_hash: str | None = None) -> tuple[bytes, byt
         if expected_client_hash is not None and client_hash != expected_client_hash:
             _error("Docker client digest does not match profile before Docker execution")
         version = _run_command(DOCKER_VERSION_ARGV, executable_fd=fd)
+        if between is not None:
+            between()
         info = _run_command(DOCKER_INFO_ARGV, executable_fd=fd)
         return version, info, client_hash
     finally:
@@ -750,26 +758,42 @@ def _docker(
     runner: Runner,
     hasher: Hasher,
     expected_client_hash: str,
+    *,
+    between: PhaseHook | None = None,
 ) -> cj.Object:
     if runner is run_command and hasher is hash_executable:
-        version_raw, info_raw, client_hash = run_docker_pair(expected_client_hash)
+        version_raw, info_raw, client_hash = run_docker_pair(
+            expected_client_hash, between=between
+        )
     else:
         client_hash = _client_hash(hasher(DOCKER))
         if client_hash != expected_client_hash:
             _error("Docker client digest does not match profile before Docker execution")
         version_raw = runner(DOCKER_VERSION_ARGV)
+        if between is not None:
+            between()
         info_raw = runner(DOCKER_INFO_ARGV)
     version = _json(version_raw, "docker version output")
     client = _object(version.get("Client"), "docker version Client")
-    server = _object(version.get("Server"), "docker version Server")
     info = _json(info_raw, "docker info output")
+    daemon_version = _json_string(info, "ServerVersion", "docker info")
+    daemon_architecture = _architecture(
+        _json_string(info, "Architecture", "docker info"), "docker daemon architecture"
+    )
+    default_runtime = _json_string(info, "DefaultRuntime", "docker info")
+    if default_runtime != DOCKER_RUNTIME:
+        _error("Docker default runtime is not the profiled runc runtime")
+    runtimes = info.get("Runtimes")
+    if not isinstance(runtimes, Mapping) or not isinstance(
+        runtimes.get(DOCKER_RUNTIME), Mapping
+    ):
+        _error("Docker info does not register the profiled runc runtime")
     runtime_commit = _object(info.get("RuncCommit"), "docker info RuncCommit")
-    daemon_architecture = _architecture(_json_string(server, "Arch", "docker version Server"), "docker daemon architecture")
     return cj.Object(
         (
             ("client_version", _json_string(client, "Version", "docker version Client")),
             ("client_sha256", client_hash),
-            ("daemon_version", _json_string(server, "Version", "docker version Server")),
+            ("daemon_version", daemon_version),
             ("daemon_architecture", daemon_architecture),
             ("storage_driver", _json_string(info, "Driver", "docker info")),
             ("cgroup_version", _json_string(info, "CgroupVersion", "docker info")),
@@ -867,7 +891,13 @@ def inspect(
             page_size = int(os.sysconf("SC_PAGESIZE"))
         except (AttributeError, OSError, ValueError) as exc:
             raise NativeHostError("cannot determine the native page size") from exc
-    observations = [_observation(reader, phase, page_size, memory) for phase in ("pre", "between", "post")]
+    observations = [_observation(reader, "pre", page_size, memory)]
+
+    def capture_between() -> None:
+        observations.append(_observation(reader, "between", page_size, memory))
+
+    docker = _docker(reader, runner, hasher, expected_client_hash, between=capture_between)
+    observations.append(_observation(reader, "post", page_size, memory))
     _check_monotonic_counters(observations)
     return cj.Object(
         (
@@ -891,7 +921,7 @@ def inspect(
             ),
             ("memory_bytes", memory),
             ("cpu_quota_milli", quota),
-            ("docker", _docker(reader, runner, hasher, expected_client_hash)),
+            ("docker", docker),
             ("observations", observations),
         )
     )

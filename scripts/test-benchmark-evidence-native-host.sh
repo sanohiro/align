@@ -74,7 +74,10 @@ DOCKER_VERSION = {
 DOCKER_INFO = {
     "Driver": "overlay2",
     "CgroupVersion": "2",
+    "ServerVersion": "26.1.4",
+    "Architecture": "amd64",
     "DefaultRuntime": "runc",
+    "Runtimes": {"runc": {"path": "runc"}},
     "RuncCommit": {"ID": "runc-1.1.12"},
 }
 
@@ -135,6 +138,7 @@ assert qualified.memory_bytes == 16 * 1024 * 1024 * 1024
 assert qualified.cpu_quota_milli == 0
 assert qualified.docker.client_sha256 == H64
 assert qualified.docker.daemon_architecture == "x86_64"
+assert qualified.docker.oci_runtime == "runc-1.1.12"
 assert tuple(calls) == (native_host.DOCKER_VERSION_ARGV, native_host.DOCKER_INFO_ARGV)
 assert native_host._FIXED_ENV["DOCKER_CONFIG"] == native_host.DOCKER_CONFIG
 assert native_host._FIXED_ENV["DOCKER_HOST"] == native_host.DOCKER_HOST
@@ -280,7 +284,9 @@ native_host._open_executable = fake_open_executable
 native_host._hash_fd = fake_hash_fd
 native_host._run_command = fake_run_command
 try:
-    pair = native_host.run_docker_pair()
+    pair = native_host.run_docker_pair(
+        between=lambda: docker_pair_events.append(("between",))
+    )
     pair_events = list(docker_pair_events)
     docker_pair_events.clear()
     expect_error(
@@ -294,9 +300,9 @@ finally:
     native_host._hash_fd = original_hash_fd
     native_host._run_command = original_run_command
 assert pair == (b"version", b"info", H64)
-assert [event[0] for event in pair_events] == ["config", "open", "hash", "run", "run"]
+assert [event[0] for event in pair_events] == ["config", "open", "hash", "run", "between", "run"]
 assert pair_events[3][2] == pair_events[1][1]
-assert pair_events[4][2] == pair_events[1][1]
+assert pair_events[5][2] == pair_events[1][1]
 
 inspection = native_host.inspect(
     PROFILE,
@@ -345,6 +351,60 @@ def forbidden_runner(_argv):
     raise AssertionError("Docker was invoked before native host state was eligible")
 
 
+def nvidia_runner(argv):
+    if argv == native_host.DOCKER_VERSION_ARGV:
+        return json.dumps(DOCKER_VERSION, separators=(",", ":")).encode("utf-8")
+    info = dict(DOCKER_INFO)
+    info["DefaultRuntime"] = "nvidia"
+    info["Runtimes"] = {"nvidia": {"path": "nvidia-container-runtime"}}
+    return json.dumps(info, separators=(",", ":")).encode("utf-8")
+
+
+expect_error(
+    lambda: qualify_with(runner_value=nvidia_runner),
+    "default runtime",
+)
+
+
+def server_mismatch_runner(argv):
+    if argv == native_host.DOCKER_VERSION_ARGV:
+        version = dict(DOCKER_VERSION)
+        version["Server"] = {"Version": "stale", "Arch": "arm64"}
+        return json.dumps(version, separators=(",", ":")).encode("utf-8")
+    return runner(argv)
+
+
+coherent = qualify_with(runner_value=server_mismatch_runner)
+assert coherent.docker.daemon_version == "26.1.4"
+
+
+phase_events = []
+
+
+def phase_reader(path):
+    phase_events.append(("read", path))
+    return reader(path)
+
+
+def phase_runner(argv):
+    phase_events.append(("run", argv))
+    return runner(argv)
+
+
+qualify_with(reader_value=phase_reader, runner_value=phase_runner)
+version_event = phase_events.index(("run", native_host.DOCKER_VERSION_ARGV))
+info_event = phase_events.index(("run", native_host.DOCKER_INFO_ARGV))
+assert any(
+    event == ("read", native_host.VMSTAT_PATH)
+    for event in phase_events[:version_event]
+)
+assert any(
+    event == ("read", native_host.VMSTAT_PATH)
+    for event in phase_events[version_event + 1 : info_event]
+)
+assert any(event == ("read", native_host.VMSTAT_PATH) for event in phase_events[info_event + 1 :])
+
+
 expect_error(
     lambda: qualify_with(uname_value="aarch64", runner_value=forbidden_runner),
     "host architecture must be x86_64 before Docker qualification",
@@ -373,7 +433,7 @@ expect_error(
 def missing_runtime_runner(argv):
     if argv == native_host.DOCKER_VERSION_ARGV:
         return json.dumps(DOCKER_VERSION, separators=(",", ":")).encode("utf-8")
-    return b'{"Driver":"overlay2","CgroupVersion":"2","DefaultRuntime":"runc"}'
+    return b'{"Driver":"overlay2","CgroupVersion":"2","ServerVersion":"26.1.4","Architecture":"amd64","DefaultRuntime":"runc","Runtimes":{"runc":{"path":"runc"}}}'
 
 
 expect_error(
