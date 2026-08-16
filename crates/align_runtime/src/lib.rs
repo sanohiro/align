@@ -25625,7 +25625,7 @@ mod tests {
         assert_eq!(rc, 0, "fallback may recover structural drift when all required fields remain present");
         assert_eq!(success_out.len, 2, "both rows survive the successful fallback");
         assert!(!success_out.ptr.is_null(), "successful staging publishes the outer AoS");
-        let staged_len = success_out.len as usize * 32;
+        let staged_len = usize::try_from(success_out.len).expect("successful AoS length is non-negative") * 32;
         unsafe {
             let staged = core::slice::from_raw_parts_mut(success_out.ptr as *mut u8, staged_len);
             drop_decoded_staged_rows(staged, 32, &success_descs);
@@ -25712,7 +25712,7 @@ mod tests {
             sub: core::ptr::null(),
             opt_tag: -1,
         }];
-        let fields = descs.as_ptr() as usize;
+        let fields = descs.as_ptr().addr();
         let n_fields = descs.len() as i64;
         std::thread::scope(|scope| {
             let left = scope.spawn(move || {
