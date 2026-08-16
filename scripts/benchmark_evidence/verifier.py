@@ -20,6 +20,7 @@ from typing import Any, Callable
 
 from . import canonical_json as cj
 from . import report_schema
+from . import schedule
 from . import sshsig
 
 
@@ -80,6 +81,65 @@ def _key_blob(value: object) -> bytes:
     return value
 
 
+def _canonical_identity(raw: bytes, validator: Callable[[Any, str], cj.Object], label: str) -> bytes:
+    if not isinstance(raw, bytes):
+        _error(f"{label} must be canonical JSON bytes")
+    try:
+        value = cj.decode(raw)
+        validator(value, label)
+        if cj.encode(value) != raw:
+            _error(f"{label} is not canonical")
+    except cj.CanonicalJsonError as exc:
+        raise VerificationError(f"{label} is invalid: {exc}") from exc
+    return raw
+
+
+def _identity_member(raw: bytes, key: str, label: str) -> Any:
+    try:
+        value = cj.decode(raw)
+    except cj.CanonicalJsonError as exc:
+        raise VerificationError(f"{label} is invalid: {exc}") from exc
+    return value[key]
+
+
+@dataclass(frozen=True)
+class TrustedIdentities:
+    """Immutable profile-owned report identity records."""
+
+    profile_id: str
+    producer: bytes
+    verifier: bytes
+    monitor: bytes
+    execution: bytes
+
+    def __post_init__(self) -> None:
+        _string(self.profile_id, _NAME, "identities.profile_id")
+        _canonical_identity(self.producer, report_schema.validate_tool_identity, "identities.producer")
+        _canonical_identity(self.verifier, report_schema.validate_tool_identity, "identities.verifier")
+        _canonical_identity(self.monitor, report_schema.validate_tool_identity, "identities.monitor")
+        _canonical_identity(self.execution, report_schema.validate_execution_identity, "identities.execution")
+
+    @property
+    def producer_executable_sha256(self) -> str:
+        return _identity_member(self.producer, "executable_sha256", "identities.producer")
+
+    @property
+    def verifier_executable_sha256(self) -> str:
+        return _identity_member(self.verifier, "executable_sha256", "identities.verifier")
+
+    @property
+    def monitor_executable_sha256(self) -> str:
+        return _identity_member(self.monitor, "executable_sha256", "identities.monitor")
+
+    @property
+    def execution_host_id(self) -> str:
+        return _identity_member(self.execution, "host_id", "identities.execution")
+
+    @property
+    def execution_image_digest(self) -> str:
+        return _identity_member(self.execution, "image_digest", "identities.execution")
+
+
 @dataclass(frozen=True)
 class VerifierExpectations:
     """Trusted-base values that are never selected by report bytes."""
@@ -87,6 +147,7 @@ class VerifierExpectations:
     repository: str
     pull_request: int
     profile_sha256: str
+    identities: TrustedIdentities
     baseline: str
     candidate: str
     pr_body_sha256: str
@@ -99,6 +160,8 @@ class VerifierExpectations:
         if type(self.pull_request) is not int or not 0 < self.pull_request <= cj.MAX_U64:
             _error("pull_request must be a positive u64")
         _string(self.profile_sha256, _HEX64, "profile_sha256")
+        if not isinstance(self.identities, TrustedIdentities):
+            _error("identities has the wrong type")
         _string(self.baseline, _HEX40, "baseline")
         _string(self.candidate, _HEX40, "candidate")
         if self.baseline == self.candidate:
@@ -220,6 +283,16 @@ def _verify_review_chain(body: cj.Object, expected: VerifierExpectations) -> Non
         _error("candidate commit inventory must be nonempty and unique")
     if commit_ids[-1] != expected.candidate:
         _error("candidate commit inventory does not end at the expected candidate")
+    by_id = {commit["oid"]: commit for commit in commits}
+    previous = expected.baseline
+    for oid in commit_ids:
+        if by_id[oid]["parents"] != [previous]:
+            _error("candidate commit inventory is not an exact first-parent chain")
+        previous = oid
+    if candidate["parents"] != by_id[commit_ids[-1]]["parents"]:
+        _error("candidate revision parents do not match its final commit")
+    if by_id[commit_ids[-1]]["tree_oid"] != candidate["tree_oid"]:
+        _error("candidate revision tree does not match its final commit")
 
     review = body["review"]
     repair = list(review["repair_commits"])
@@ -239,7 +312,6 @@ def _verify_review_chain(body: cj.Object, expected: VerifierExpectations) -> Non
             raise VerificationError("fixed review head is absent from candidate commits") from exc
     if commit_ids[start + 1 :] != repair:
         _error("repair commits are not the exact suffix after the reviewed ancestor")
-    by_id = {commit["oid"]: commit for commit in commits}
     previous = review["review_head"]
     for oid in repair:
         if by_id[oid]["parents"] != [previous]:
@@ -249,12 +321,187 @@ def _verify_review_chain(body: cj.Object, expected: VerifierExpectations) -> Non
         _error("repair chain does not end at the candidate")
 
 
+def _checked_u64_sum(left: int, right: int, label: str) -> int:
+    value = left + right
+    if value > cj.MAX_U64:
+        _error(f"{label} overflows u64")
+    return value
+
+
+def _sample_token(microseconds: int) -> str:
+    return f"{microseconds // 1_000}.{microseconds % 1_000:03d}"
+
+
+def _verify_host_observations(body: cj.Object, records: list[cj.Object]) -> None:
+    observations = body["host_observations"]
+    if [observation["ordinal"] for observation in observations] != list(range(len(observations))):
+        _error("host observations must have dense ordinals")
+    covered: set[int] = set()
+    previous_last = -1
+    for record in records:
+        first = record["monitor_first"]
+        last = record["monitor_last"]
+        if first >= last or last >= len(observations) or first <= previous_last:
+            _error("child monitor ranges must be nonempty, ordered, and disjoint")
+        child_id = record["child_id"]
+        first_observation = observations[first]
+        last_observation = observations[last]
+        if (
+            first_observation["phase"] != "child-start"
+            or first_observation["child_id"] != child_id
+            or last_observation["phase"] != "child-end"
+            or last_observation["child_id"] != child_id
+        ):
+            _error("child monitor range boundaries do not match the child")
+        for index in range(first, last + 1):
+            observation = observations[index]
+            if observation["child_id"] != child_id:
+                _error("child monitor range contains another child")
+            if index not in (first, last) and observation["phase"] != "child-sample":
+                _error("child monitor range interior is not a sample")
+            covered.add(index)
+        previous_last = last
+    for index, observation in enumerate(observations):
+        if observation["child_id"] == "":
+            if observation["phase"] in ("child-start", "child-sample", "child-end"):
+                _error("non-child observation has a child phase")
+        elif index not in covered:
+            _error("orphaned child observation is not named by a report record")
+
+
+def _verify_report_semantics(body: cj.Object, expected: VerifierExpectations) -> None:
+    """Reconstruct every derived report relationship before publication."""
+
+    if body["profile_id"] != expected.identities.profile_id:
+        _error("report profile ID does not match the trusted identity bundle")
+    for label, actual, trusted in (
+        ("producer", body["producer"], expected.identities.producer),
+        ("verifier", body["verifier"], expected.identities.verifier),
+        ("monitor", body["monitor"], expected.identities.monitor),
+        ("execution", body["execution"], expected.identities.execution),
+    ):
+        if cj.encode(actual) != trusted:
+            _error(f"report {label} identity does not match the trusted profile")
+
+    expected_run_id = hashlib.sha256(
+        b"align-json-escape-evidence-controller-run-v1\0"
+        + expected.profile_sha256.encode("ascii")
+        + b"\0"
+        + expected.baseline.encode("ascii")
+        + b"\0"
+        + expected.candidate.encode("ascii")
+    ).hexdigest()
+    if body["run_id"] != expected_run_id:
+        _error("report run ID does not match the trusted invocation")
+    if body["started_at"] > body["ended_at"]:
+        _error("report end time precedes its start time")
+
+    baseline = body["baseline"]
+    if baseline["parents"] or baseline["commits"] or baseline["changed_paths"]:
+        _error("baseline revision must not contain candidate inventory")
+    candidate = body["candidate"]
+    paths = [change["path_hex"] for change in candidate["changed_paths"]]
+    if paths != sorted(set(paths)):
+        _error("candidate changed paths must be sorted and unique")
+    protected = body["protected_inputs"]
+    protected_paths = [entry["path_hex"] for entry in protected["entries"]]
+    if protected_paths != sorted(set(protected_paths)):
+        _error("protected inputs must be sorted and unique")
+    if protected["baseline_manifest_sha256"] != protected["candidate_manifest_sha256"]:
+        _error("protected input manifests differ")
+
+    records: list[cj.Object] = []
+    for benchmark in body["benchmarks"]:
+        name = benchmark["name"]
+        if (
+            benchmark["prepare_argv"] != f"bench/{name}/run.sh prepare native"
+            or benchmark["argv"] != f"bench/{name}/run.sh native"
+        ):
+            _error("benchmark argv does not match its declared name")
+        records.extend(benchmark["preparations"])
+    for benchmark in body["benchmarks"]:
+        records.extend(benchmark["warmups"])
+        for ordinal, pair in enumerate(benchmark["pairs"], 1):
+            if pair["ordinal"] != ordinal:
+                _error("benchmark pair ordinals are not consecutive")
+            records.extend((pair["first"], pair["second"]))
+    plans = schedule.full_schedule()
+    if len(records) != len(plans):
+        _error("report child inventory does not cover the fixed schedule")
+    child_ids: set[str] = set()
+    samples_by_benchmark: dict[str, dict[str, dict[str, list[Any]]]] = {}
+    for plan, record in zip(plans, records):
+        if record["sequence"] != plan.sequence or record["revision"] != plan.revision:
+            _error("report child sequence or revision differs from the fixed schedule")
+        if record["child_id"] in child_ids:
+            _error("report child ID was reused")
+        child_ids.add(record["child_id"])
+        if record["exit_code"] != 0:
+            _error("report contains a nonzero child result")
+        if plan.phase == "prepare":
+            continue
+        fields = schedule.FIELDS[:2] if plan.benchmark == "json_decode" else schedule.FIELDS[2:]
+        if [sample["field"] for sample in record["samples"]] != list(fields):
+            _error("run samples do not use the fixed benchmark field order")
+        for sample in record["samples"]:
+            if sample["microseconds"] == 0 or sample["token"] != _sample_token(sample["microseconds"]):
+                _error("run sample token is not the exact integer rendering")
+        if plan.phase == "sample":
+            benchmark_values = samples_by_benchmark.setdefault(
+                plan.benchmark,
+                {field: {"baseline": [], "candidate": [], "baseline_tokens": [], "candidate_tokens": []} for field in fields},
+            )
+            for sample in record["samples"]:
+                arm = record["revision"]
+                benchmark_values[sample["field"]][arm].append(sample["microseconds"])
+                benchmark_values[sample["field"]][f"{arm}_tokens"].append(sample["token"])
+    _verify_host_observations(body, records)
+
+    for field_result in body["fields"]:
+        benchmark_name = "json_decode" if field_result["field"] in schedule.FIELDS[:2] else "json_soa"
+        values = samples_by_benchmark[benchmark_name][field_result["field"]]
+        baseline_values = values["baseline"]
+        candidate_values = values["candidate"]
+        if len(baseline_values) != 10 or len(candidate_values) != 10:
+            _error("field result does not have ten samples per revision")
+        baseline_sorted = sorted(baseline_values)
+        candidate_sorted = sorted(candidate_values)
+        baseline_middle_sum = _checked_u64_sum(baseline_sorted[4], baseline_sorted[5], "baseline middle sum")
+        candidate_middle_sum = _checked_u64_sum(candidate_sorted[4], candidate_sorted[5], "candidate middle sum")
+        if field_result["baseline_tokens"] != values["baseline_tokens"]:
+            _error("baseline field tokens do not match the measured samples")
+        if field_result["candidate_tokens"] != values["candidate_tokens"]:
+            _error("candidate field tokens do not match the measured samples")
+        if field_result["baseline_samples_us"] != baseline_values:
+            _error("baseline field samples do not match the measured samples")
+        if field_result["candidate_samples_us"] != candidate_values:
+            _error("candidate field samples do not match the measured samples")
+        if field_result["baseline_sorted_us"] != baseline_sorted:
+            _error("baseline sorted samples are not the exact permutation")
+        if field_result["candidate_sorted_us"] != candidate_sorted:
+            _error("candidate sorted samples are not the exact permutation")
+        if field_result["baseline_middle_sum"] != baseline_middle_sum:
+            _error("baseline middle sum is not reconstructed from samples")
+        if field_result["candidate_middle_sum"] != candidate_middle_sum:
+            _error("candidate middle sum is not reconstructed from samples")
+        if field_result["ratio_numerator"] != candidate_middle_sum:
+            _error("ratio numerator is not the candidate middle sum")
+        if field_result["ratio_denominator"] != baseline_middle_sum:
+            _error("ratio denominator is not the baseline middle sum")
+        if baseline_middle_sum == 0:
+            _error("baseline middle sum must be positive")
+        passed = candidate_middle_sum * 100 <= baseline_middle_sum * 105
+        if field_result["passed"] is not passed:
+            _error("field pass state does not match the exact threshold comparison")
+
+
 def _verify_report_bindings(
     report: cj.Object,
     expected: VerifierExpectations,
     attestation: ReviewAttestation,
 ) -> None:
     body = report["body"]
+    _verify_report_semantics(body, expected)
     if body["profile_sha256"] != expected.profile_sha256:
         _error("report profile digest does not match trusted expectations")
     if body["baseline"]["commit_oid"] != expected.baseline:

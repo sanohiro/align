@@ -46,6 +46,35 @@ with tempfile.TemporaryDirectory(prefix="align-exclusive-owner-") as name:
     first.finalize_publication()
     assert not reservation.exists()
 
+    failing = exclusive_run.ExclusiveRun(str(lock), str(reservation))
+    failing.acquire()
+    failing.create_reservation("c" * 64, str(output))
+    failing.release_lock_for_publication()
+    failing.mark_published()
+    original_fsync_parent = exclusive_run._fsync_parent
+    fsync_failed = [False]
+
+    def fail_once(path):
+        if not fsync_failed[0]:
+            fsync_failed[0] = True
+            raise OSError("injected finalization fsync failure")
+        return original_fsync_parent(path)
+
+    exclusive_run._fsync_parent = fail_once
+    try:
+        failing.finalize_publication()
+    except OSError as exc:
+        assert "injected finalization fsync failure" in str(exc)
+    else:
+        raise AssertionError("finalization fsync failure was accepted")
+    finally:
+        exclusive_run._fsync_parent = original_fsync_parent
+    assert reservation.exists()
+    blocked = exclusive_run.ExclusiveRun(str(lock), str(reservation))
+    expect_error(blocked.acquire, "publication reservation")
+    failing.abort(remove_reservation=False)
+    reservation.unlink()
+
     second.acquire()
     second.abort(remove_reservation=False)
 

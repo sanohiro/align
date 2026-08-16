@@ -61,13 +61,13 @@ def path_side(presence, *, size=0, sha=H, mode="100644", kind="blob", oid=B):
     )
 
 
-def tool(version):
+def tool(version, executable_sha=H):
     return O(
         ("version", version),
         ("source_commit", B),
         ("source_manifest_blob", B),
         ("source_manifest_sha256", H),
-        ("executable_sha256", H),
+        ("executable_sha256", executable_sha),
     )
 
 
@@ -102,23 +102,40 @@ def revision(*, candidate):
     )
 
 
-def child(child_id, arm, sequence):
+def observation(ordinal, phase, child_id):
     return O(
+        ("ordinal", ordinal),
+        ("phase", phase),
+        ("monotonic_ns", ordinal + 1),
         ("child_id", child_id),
-        ("revision", arm),
-        ("sequence", sequence),
-        ("stdout_sha256", H),
-        ("stderr_sha256", H),
-        ("stderr_tail_hex", "00"),
-        ("exit_code", 0),
-        ("elapsed_ns", 1_000_000),
-        ("monitor_first", 0),
-        ("monitor_last", 0),
-        ("samples", []),
+        ("load_milli", 0),
+        ("cpu_pressure_total_us", 0),
+        ("memory_pressure_total_us", 0),
+        ("free_memory_bytes", 1 << 30),
+        ("swap_read_bytes", 0),
+        ("swap_write_bytes", 0),
+        ("throttle_events", 0),
+        ("thermal_events", 0),
+        ("foreign_schedule_events", 0),
+        ("foreign_container_events", 0),
+        ("monitor_lost_events", 0),
+        ("frequency_khz", 1),
+        ("temperature_millic", 1),
+        ("container_manifest_sha256", H),
     )
 
 
-def preparation(child_id, arm, sequence):
+def child(child_id, arm, sequence, monitor_first, monitor_last, benchmark_name):
+    fields = schedule.FIELDS[:2] if benchmark_name == "json_decode" else schedule.FIELDS[2:]
+    samples = [
+        O(
+            ("field", field),
+            ("token", f"{microseconds // 1_000}.{microseconds % 1_000:03d}"),
+            ("microseconds", microseconds),
+        )
+        for index, field in enumerate(fields)
+        for microseconds in (1_000_000 + index * 100 + (1 if arm == "candidate" else 0),)
+    ]
     return O(
         ("child_id", child_id),
         ("revision", arm),
@@ -128,64 +145,135 @@ def preparation(child_id, arm, sequence):
         ("stderr_tail_hex", "00"),
         ("exit_code", 0),
         ("elapsed_ns", 1_000_000),
-        ("monitor_first", 0),
-        ("monitor_last", 0),
+        ("monitor_first", monitor_first),
+        ("monitor_last", monitor_last),
+        ("samples", samples),
+    )
+
+
+def preparation(child_id, arm, sequence, monitor_first, monitor_last):
+    return O(
+        ("child_id", child_id),
+        ("revision", arm),
+        ("sequence", sequence),
+        ("stdout_sha256", H),
+        ("stderr_sha256", H),
+        ("stderr_tail_hex", "00"),
+        ("exit_code", 0),
+        ("elapsed_ns", 1_000_000),
+        ("monitor_first", monitor_first),
+        ("monitor_last", monitor_last),
         ("artifact_manifest_sha256", H),
     )
 
 
-def benchmark(name, prepare_argv, argv, prefix):
-    preparations = [preparation(f"{prefix}{i:063x}", arm, i) for i, arm in enumerate(("baseline", "candidate"), 1)]
-    warmups = [child(f"{prefix}{i:063x}", arm, i) for i, arm in enumerate(("baseline", "candidate"), 3)]
-    pairs = []
-    for ordinal in range(1, 11):
-        first_arm, second_arm = (("baseline", "candidate") if ordinal % 2 else ("candidate", "baseline"))
-        pairs.append(O(
-            ("ordinal", ordinal),
-            ("first", child(f"{prefix}{ordinal * 2 + 5:063x}", first_arm, ordinal * 2)),
-            ("second", child(f"{prefix}{ordinal * 2 + 6:063x}", second_arm, ordinal * 2 + 1)),
+def make_benchmarks():
+    grouped = {
+        name: {"preparations": [], "warmups": [], "pairs": []}
+        for name in schedule.BENCHMARKS
+    }
+    observations = []
+    plans = schedule.full_schedule()
+    for plan in plans:
+        prefix = "a" if plan.benchmark == "json_decode" else "b"
+        child_id = f"{prefix}{plan.sequence:063x}"
+        monitor_first = len(observations)
+        observations.append(observation(monitor_first, "child-start", child_id))
+        monitor_last = len(observations)
+        observations.append(observation(monitor_last, "child-end", child_id))
+        if plan.phase == "prepare":
+            record = preparation(child_id, plan.revision, plan.sequence, monitor_first, monitor_last)
+            grouped[plan.benchmark]["preparations"].append(record)
+        else:
+            record = child(
+                child_id,
+                plan.revision,
+                plan.sequence,
+                monitor_first,
+                monitor_last,
+                plan.benchmark,
+            )
+            if plan.phase == "warmup":
+                grouped[plan.benchmark]["warmups"].append(record)
+            else:
+                grouped[plan.benchmark]["pairs"].append(record)
+    benchmarks = []
+    for name in schedule.BENCHMARKS:
+        records = grouped[name]
+        pairs = []
+        for ordinal in range(1, 11):
+            first = records["pairs"][(ordinal - 1) * 2]
+            second = records["pairs"][(ordinal - 1) * 2 + 1]
+            pairs.append(O(("ordinal", ordinal), ("first", first), ("second", second)))
+        benchmarks.append(O(
+            ("name", name),
+            ("prepare_argv", f"bench/{name}/run.sh prepare native"),
+            ("argv", f"bench/{name}/run.sh native"),
+            ("preparations", records["preparations"]),
+            ("warmups", records["warmups"]),
+            ("pairs", pairs),
         ))
-    return O(
-        ("name", name),
-        ("prepare_argv", prepare_argv),
-        ("argv", argv),
-        ("preparations", preparations),
-        ("warmups", warmups),
-        ("pairs", pairs),
-    )
+    return benchmarks, observations
 
 
-def field_result(field, passed=True):
-    tokens = ["1.000"] * 10
-    samples = [1_000_000] * 10
-    return O(
-        ("field", field),
-        ("baseline_tokens", tokens),
-        ("candidate_tokens", list(tokens)),
-        ("baseline_samples_us", list(samples)),
-        ("candidate_samples_us", list(samples)),
-        ("baseline_sorted_us", list(samples)),
-        ("candidate_sorted_us", list(samples)),
-        ("baseline_middle_sum", 2_000_000),
-        ("candidate_middle_sum", 2_000_000),
-        ("median_denominator", 2),
-        ("ratio_numerator", 2_000_000),
-        ("ratio_denominator", 2_000_000),
-        ("threshold_numerator", 105),
-        ("threshold_denominator", 100),
-        ("passed", passed),
-    )
+def field_results(benchmarks):
+    by_field = {}
+    for benchmark in benchmarks:
+        for pair in benchmark["pairs"]:
+            for run in (pair["first"], pair["second"]):
+                for sample in run["samples"]:
+                    values = by_field.setdefault(sample["field"], {"baseline": [], "candidate": [], "baseline_tokens": [], "candidate_tokens": []})
+                    arm = run["revision"]
+                    values[arm].append(sample["microseconds"])
+                    values[f"{arm}_tokens"].append(sample["token"])
+    results = []
+    for field in schedule.FIELDS:
+        values = by_field[field]
+        baseline = values["baseline"]
+        candidate = values["candidate"]
+        baseline_sorted = sorted(baseline)
+        candidate_sorted = sorted(candidate)
+        baseline_middle = baseline_sorted[4] + baseline_sorted[5]
+        candidate_middle = candidate_sorted[4] + candidate_sorted[5]
+        results.append(O(
+            ("field", field),
+            ("baseline_tokens", values["baseline_tokens"]),
+            ("candidate_tokens", values["candidate_tokens"]),
+            ("baseline_samples_us", baseline),
+            ("candidate_samples_us", candidate),
+            ("baseline_sorted_us", baseline_sorted),
+            ("candidate_sorted_us", candidate_sorted),
+            ("baseline_middle_sum", baseline_middle),
+            ("candidate_middle_sum", candidate_middle),
+            ("median_denominator", 2),
+            ("ratio_numerator", candidate_middle),
+            ("ratio_denominator", baseline_middle),
+            ("threshold_numerator", 105),
+            ("threshold_denominator", 100),
+            ("passed", candidate_middle * 100 <= baseline_middle * 105),
+        ))
+    return results
+
+
+def controller_run_id():
+    return hashlib.sha256(
+        b"align-json-escape-evidence-controller-run-v1\0"
+        + PROFILE.encode("ascii")
+        + b"\0" + B.encode("ascii")
+        + b"\0" + C.encode("ascii")
+    ).hexdigest()
 
 
 def report_body():
+    benchmarks, observations = make_benchmarks()
     return O(
         ("schema", rs.BODY_SCHEMA),
         ("profile_id", "native-v1"),
         ("profile_sha256", PROFILE),
         ("producer", tool("producer")),
-        ("verifier", tool("verifier")),
+        ("verifier", tool("verifier", H1)),
         ("monitor", tool("monitor")),
-        ("run_id", H),
+        ("run_id", controller_run_id()),
         ("started_at", "2026-08-15T00:00:00.000000000Z"),
         ("ended_at", "2026-08-15T00:00:01.000000000Z"),
         ("baseline", revision(candidate=False)),
@@ -243,12 +331,9 @@ def report_body():
             ("limit_manifest_sha256", H),
             ("descriptor_manifest_sha256", H),
         )),
-        ("host_observations", []),
-        ("benchmarks", [
-            benchmark("json_decode", "bench/json_decode/run.sh prepare native", "bench/json_decode/run.sh native", "a"),
-            benchmark("json_soa", "bench/json_soa/run.sh prepare native", "bench/json_soa/run.sh native", "b"),
-        ]),
-        ("fields", [field_result(field) for field in ("A-full", "A-proj", "soa ms", "aos ms", "proj ms")]),
+        ("host_observations", observations),
+        ("benchmarks", benchmarks),
+        ("fields", field_results(benchmarks)),
         ("cleanup", O(
             ("children_remaining", 0),
             ("containers_remaining", 0),
@@ -300,10 +385,18 @@ BODY = report_body()
 REPORT = rs.encode_report(BODY)
 ATTESTATION = attestation()
 PR_BODY = pr_body()
+IDENTITIES = verifier.TrustedIdentities(
+    profile_id=BODY["profile_id"],
+    producer=cj.encode(BODY["producer"]),
+    verifier=cj.encode(BODY["verifier"]),
+    monitor=cj.encode(BODY["monitor"]),
+    execution=cj.encode(BODY["execution"]),
+)
 EXPECTATIONS = verifier.VerifierExpectations(
     repository="sanohiro/align",
     pull_request=7,
     profile_sha256=PROFILE,
+    identities=IDENTITIES,
     baseline=B,
     candidate=C,
     pr_body_sha256=hashlib.sha256(PR_BODY).hexdigest(),
@@ -336,6 +429,50 @@ assert verified.candidate == C
 assert verified.profile_sha256 == PROFILE
 assert verified.review_attestation.review_id == 42
 assert preimage_lengths == [len(sshsig.signing_preimage(REPORT, sshsig.REPORT_NAMESPACE))]
+
+bad_sample = replace(BODY["benchmarks"][0]["pairs"][0]["first"]["samples"][0], "microseconds", 2_000_000)
+bad_sample = replace(bad_sample, "token", "2000.000")
+bad_run = replace(
+    BODY["benchmarks"][0]["pairs"][0]["first"],
+    "samples",
+    [bad_sample] + BODY["benchmarks"][0]["pairs"][0]["first"]["samples"][1:],
+)
+bad_pair = replace(BODY["benchmarks"][0]["pairs"][0], "first", bad_run)
+bad_pairs = [bad_pair] + BODY["benchmarks"][0]["pairs"][1:]
+bad_benchmark = replace(BODY["benchmarks"][0], "pairs", bad_pairs)
+bad_benchmarks = [bad_benchmark, BODY["benchmarks"][1]]
+rejected("derived sample mismatch", lambda: verifier.verify_artifact(
+    verifier.EvidenceArtifact(
+        rs.encode_report(replace(BODY, "benchmarks", bad_benchmarks)),
+        SIGNATURE,
+        PR_BODY,
+        ATTESTATION,
+        EXPECTATIONS,
+    ),
+    lambda _preimage, _signature: True,
+))
+bad_commit = replace(BODY["candidate"]["commits"][0], "parents", [C])
+bad_candidate = replace(BODY["candidate"], "commits", [bad_commit])
+rejected("pre-review parent chain mismatch", lambda: verifier.verify_artifact(
+    verifier.EvidenceArtifact(
+        rs.encode_report(replace(BODY, "candidate", bad_candidate)),
+        SIGNATURE,
+        PR_BODY,
+        ATTESTATION,
+        EXPECTATIONS,
+    ),
+    lambda _preimage, _signature: True,
+))
+rejected("wrong trusted execution identity", lambda: verifier.verify_artifact(
+    verifier.EvidenceArtifact(
+        rs.encode_report(replace(BODY, "execution", replace(BODY["execution"], "image_digest", "sha256:" + H1))),
+        SIGNATURE,
+        PR_BODY,
+        ATTESTATION,
+        EXPECTATIONS,
+    ),
+    lambda _preimage, _signature: True,
+))
 
 rejected("wrong report candidate", lambda: verifier.verify_artifact(
     verifier.EvidenceArtifact(
@@ -378,6 +515,7 @@ conflicting_expectations = verifier.VerifierExpectations(
     repository=EXPECTATIONS.repository,
     pull_request=EXPECTATIONS.pull_request,
     profile_sha256=EXPECTATIONS.profile_sha256,
+    identities=EXPECTATIONS.identities,
     baseline=EXPECTATIONS.baseline,
     candidate=EXPECTATIONS.candidate,
     pr_body_sha256=hashlib.sha256(conflicting_pr_body).hexdigest(),
@@ -452,6 +590,7 @@ FIXED_EXPECTATIONS = verifier.VerifierExpectations(
     repository="sanohiro/align",
     pull_request=7,
     profile_sha256=PROFILE,
+    identities=IDENTITIES,
     baseline=B,
     candidate=C,
     pr_body_sha256=hashlib.sha256(FIXED_PR_BODY).hexdigest(),
@@ -538,6 +677,7 @@ CONFIG = controller.ControllerConfig(
     monitor_sha256=H,
     host_id="host-1",
     image_digest="sha256:" + H,
+    identities=IDENTITIES,
 )
 FAKE_VERIFIED = verifier.VerifiedEvidence(
     artifact=ARTIFACT,
@@ -598,6 +738,7 @@ def make_hooks(
                 repository=EXPECTATIONS.repository,
                 pull_request=EXPECTATIONS.pull_request,
                 profile_sha256=EXPECTATIONS.profile_sha256,
+                identities=EXPECTATIONS.identities,
                 baseline="f" * 40,
                 candidate=C,
                 pr_body_sha256=EXPECTATIONS.pr_body_sha256,

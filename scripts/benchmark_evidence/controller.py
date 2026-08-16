@@ -52,6 +52,7 @@ class ControllerConfig:
     monitor_sha256: str
     host_id: str
     image_digest: str
+    identities: verifier.TrustedIdentities
     target_ref: str = "refs/heads/main"
 
     def __post_init__(self) -> None:
@@ -65,6 +66,20 @@ class ControllerConfig:
             _string(getattr(self, label), _HEX64, label)
         _string(self.host_id, _NAME, "host_id")
         _string(self.image_digest, _IMAGE_DIGEST, "image_digest")
+        if not isinstance(self.identities, verifier.TrustedIdentities):
+            _error("identities has the wrong type")
+        if self.identities.profile_id != self.profile_id:
+            _error("identities.profile_id does not match profile_id")
+        if self.identities.producer_executable_sha256 != self.controller_sha256:
+            _error("producer identity does not match controller_sha256")
+        if self.identities.verifier_executable_sha256 != self.verifier_sha256:
+            _error("verifier identity does not match verifier_sha256")
+        if self.identities.monitor_executable_sha256 != self.monitor_sha256:
+            _error("monitor identity does not match monitor_sha256")
+        if self.identities.execution_host_id != self.host_id:
+            _error("execution identity does not match host_id")
+        if self.identities.execution_image_digest != self.image_digest:
+            _error("execution identity does not match image_digest")
         if self.target_ref != "refs/heads/main":
             _error("target_ref must be refs/heads/main")
 
@@ -362,8 +377,9 @@ class Controller:
                 artifact.expectations.baseline != invocation.baseline
                 or artifact.expectations.candidate != invocation.candidate
                 or artifact.expectations.profile_sha256 != self.config.profile_sha256
+                or artifact.expectations.identities != self.config.identities
             ):
-                _error("artifact expectations are not bound to this invocation and profile")
+                _error("artifact expectations are not bound to this invocation and profile identities")
 
             phases.append("verify")
             verified = self.hooks.verify_artifact(artifact)

@@ -52,6 +52,7 @@ class ExclusiveRun:
         self._reserved = False
         self._published = False
         self._closed = False
+        self._reservation_raw: bytes | None = None
 
     @property
     def locked(self) -> bool:
@@ -88,13 +89,32 @@ class ExclusiveRun:
             os.close(fd)
             raise
 
-    def create_reservation(self, run_id: str, output_dir: str) -> None:
-        if not self._locked or self._reserved:
-            raise ExclusiveRunError("reservation requires the held host lock")
-        if _HEX64.fullmatch(run_id) is None:
-            raise ExclusiveRunError("reservation run ID must be lowercase 64-hex")
-        output_dir = _path(output_dir, "reservation output")
-        raw = f"run_id={run_id}\noutput_dir={output_dir}\n".encode("ascii")
+    def _acquire_finalization_lock(self) -> None:
+        if self._closed or self._locked:
+            raise ExclusiveRunError("run lease is not available for finalization")
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(self.lock_path, flags, 0o600)
+        except OSError as exc:
+            raise ExclusiveRunError(f"cannot reopen host lock: {exc}") from exc
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise ExclusiveRunError("host lock is held during finalization") from exc
+            self._lock_fd = fd
+            self._locked = True
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def _write_reservation_file(self) -> None:
+        if self._reservation_raw is None:
+            raise ExclusiveRunError("reservation contents are not available")
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
@@ -106,8 +126,8 @@ class ExclusiveRun:
             raise ExclusiveRunError(f"cannot create publication reservation: {exc}") from exc
         try:
             written = 0
-            while written < len(raw):
-                count = os.write(fd, raw[written:])
+            while written < len(self._reservation_raw):
+                count = os.write(fd, self._reservation_raw[written:])
                 if count <= 0:
                     raise ExclusiveRunError("publication reservation made no progress")
                 written += count
@@ -120,6 +140,30 @@ class ExclusiveRun:
             raise
         finally:
             os.close(fd)
+
+    def _restore_reservation(self) -> None:
+        if os.path.lexists(self.reservation_path):
+            self._reserved = True
+            return
+        self._write_reservation_file()
+        _fsync_parent(self.reservation_path)
+        self._reserved = True
+
+    def create_reservation(self, run_id: str, output_dir: str) -> None:
+        if not self._locked or self._reserved:
+            raise ExclusiveRunError("reservation requires the held host lock")
+        if _HEX64.fullmatch(run_id) is None:
+            raise ExclusiveRunError("reservation run ID must be lowercase 64-hex")
+        output_dir = _path(output_dir, "reservation output")
+        self._reservation_raw = f"run_id={run_id}\noutput_dir={output_dir}\n".encode("ascii")
+        try:
+            self._write_reservation_file()
+        except BaseException:
+            try:
+                os.unlink(self.reservation_path)
+            except OSError:
+                pass
+            raise
         _fsync_parent(self.reservation_path)
         self._reserved = True
 
@@ -139,10 +183,29 @@ class ExclusiveRun:
     def finalize_publication(self) -> None:
         if not self._published or not self._reserved:
             raise ExclusiveRunError("publication reservation is not ready for removal")
-        os.unlink(self.reservation_path)
-        _fsync_parent(self.reservation_path)
-        self._reserved = False
-        self._closed = True
+        # Reacquire the host lock while the reservation is removed.  The
+        # reservation is the first guard checked by a new process, and the
+        # lock closes the brief path-absent interval before its directory
+        # fsync completes or a failed removal can be restored.
+        self._acquire_finalization_lock()
+        try:
+            try:
+                os.unlink(self.reservation_path)
+                _fsync_parent(self.reservation_path)
+            except BaseException:
+                self._restore_reservation()
+                raise
+            self._reserved = False
+            self._closed = True
+            fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+            os.close(self._lock_fd)
+            self._lock_fd = -1
+            self._locked = False
+        except BaseException:
+            # Keep the reopened lock held until the controller's fail-closed
+            # abort path decides how to release it.  The reservation remains
+            # present when restoration succeeded.
+            raise
 
     def abort(self, *, remove_reservation: bool) -> None:
         """Close local state; leaving the reservation blocks later runs."""
