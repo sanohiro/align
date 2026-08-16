@@ -708,6 +708,28 @@ chain together lets one report-only producer fixture and one explicit post-PR ar
 both verifier bindings and the publication barrier; splitting the chain further would duplicate
 those fixtures and leave the controller's byte handoff unreviewed.
 
+## Native host qualification implementation closure
+
+PR #842 merged the deterministic controller/verifier consumer. The next capability is the
+privileged native host/daemon adapter. It reads the named Linux host and Docker observations,
+constructs the existing canonical inspection records, and passes them through the already merged
+`host.qualify` boundary. It does not widen the profile, inspect candidate code, execute the image,
+start a benchmark, provision a signing key, or claim accepted Request 7 evidence by itself.
+
+The adapter uses fixed absolute commands, an empty environment, bounded output, deterministic
+parsers, and injected readers/runners in its owner. A real host run is an administrator
+self-qualification operation; the deterministic owner must not depend on the current machine's
+CPU, kernel, cgroup, Docker, or load state.
+
+| Axis | Implementation and owner |
+|---|---|
+| Host identity | Read the fixed machine identity, kernel, architecture, CPU vendor/family/model/stepping, microcode, online CPU set, NUMA set, and physical memory through no-follow/fixed sources. The host ID and benchmark CPU set come only from `/etc/align-evidence/host-id` and `/etc/align-evidence/benchmark-cpus`; the kernel sources are the fixed `/proc` and `/sys` paths in `native_host.py`. Normalize only the profile-specified x86_64 spelling; reject missing, repeated, malformed, or cross-architecture values. `benchmark_evidence_native_host_matrix`. |
+| CPU and quota boundary | Read the host cgroup quota and require the profile's unquotaed value. cgroup v2 accepts only `cpu.max=max <positive-period>` for unquotaed execution; the v1 fallback accepts only `cpu.cfs_quota_us=-1` with a positive period, and rejects malformed, zero, or positive quotas. Require the profile benchmark CPU set to be an online, canonical set and the NUMA set to be present; reject aliases, empty sets, quota, migration, and an ARM/emulation identity before Docker work. `benchmark_evidence_native_host_matrix`. |
+| Docker daemon identity | Invoke only the pinned Docker client with fixed argv, empty environment, bounded stdout/stderr, no shell, and a timeout; parse client/daemon version, client bytes, daemon architecture, storage driver, cgroup version, and OCI runtime in the existing canonical order; reject daemon unavailability, nonzero/truncated output, wrong architecture, or profile mismatch. `benchmark_evidence_native_host_matrix`; `benchmark_evidence_process_boundary_matrix`. |
+| Qualification snapshots | Capture exactly `pre`, `between`, and `post` snapshots for load, CPU/memory pressure, free memory, and swap counters; use integer parsing and fixed counter units, then call `host.qualify` so profile limits and order remain one validation boundary. A missing source, reset/overflow, invalid unit, or extra phase rejects. `benchmark_evidence_native_host_matrix`. |
+| Ownership and failure | The adapter owns only opened descriptors and child processes it created; it closes/reaps them on every path, never mutates host configuration or repository state, and reports no qualified record after a timeout, close/reap uncertainty, parser error, or cleanup failure. `benchmark_evidence_native_host_matrix`. |
+| Explicit deferrals | Image self-inspection/toolchain reproduction, the monitor's child event stream, cryptographic key-process integration, provider/review API integration, performance measurement, merge verification, and lifecycle advancement remain later capabilities. `benchmark_evidence_native_host_matrix`. |
+
 ## Design-review finding closure
 
 | Finding | Ledger-first closure |
