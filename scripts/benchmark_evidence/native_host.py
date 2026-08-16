@@ -493,19 +493,46 @@ def run_docker_pair(
 ) -> tuple[bytes, bytes, str]:
     """Run version and info from the same retained Docker executable descriptor."""
 
+    outputs, client_hash = run_docker_commands(
+        (DOCKER_VERSION_ARGV, DOCKER_INFO_ARGV),
+        expected_client_hash,
+        between=between,
+    )
+    version, info = outputs
+    return version, info, client_hash
+
+
+def run_docker_commands(
+    commands: Sequence[Sequence[str]],
+    expected_client_hash: str | None = None,
+    *,
+    between: PhaseHook | None = None,
+) -> tuple[tuple[bytes, ...], str]:
+    """Run fixed Docker commands through one retained executable descriptor.
+
+    The returned bytes stay bounded by :func:`_run_command`.  ``between`` runs
+    only between commands, after the preceding process has been fully reaped.
+    """
+
     if expected_client_hash is not None:
         expected_client_hash = _client_hash(expected_client_hash, "profile Docker client digest")
+    if not isinstance(commands, (tuple, list)) or not commands:
+        _error("Docker command sequence must be non-empty")
+    command_sequence = tuple(_validate_argv(command) for command in commands)
+    if any(command[0] != DOCKER for command in command_sequence):
+        _error("Docker command sequence must use the pinned Docker executable")
     _validate_docker_config_dir()
     fd = _open_executable(DOCKER)
     try:
         client_hash = _hash_fd(fd, DOCKER)
         if expected_client_hash is not None and client_hash != expected_client_hash:
             _error("Docker client digest does not match profile before Docker execution")
-        version = _run_command(DOCKER_VERSION_ARGV, executable_fd=fd)
-        if between is not None:
-            between()
-        info = _run_command(DOCKER_INFO_ARGV, executable_fd=fd)
-        return version, info, client_hash
+        outputs: list[bytes] = []
+        for index, command in enumerate(command_sequence):
+            outputs.append(_run_command(command, executable_fd=fd))
+            if between is not None and index + 1 < len(command_sequence):
+                between()
+        return tuple(outputs), client_hash
     finally:
         try:
             os.close(fd)

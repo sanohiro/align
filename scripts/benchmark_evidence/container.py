@@ -20,6 +20,8 @@ class ContainerError(ValueError):
 
 DOCKER = "/usr/bin/docker"
 CONTAINER_PREFIX = "align-evidence-"
+IMAGE_CONTAINER_PREFIX = "align-evidence-image-"
+IMAGE_INSPECTION_EXECUTABLE = "/opt/align-evidence/image-self-inspect"
 CONTAINER_UID = 65532
 CONTAINER_GID = 65532
 MEMORY_BYTES = 4 * 1024 * 1024 * 1024
@@ -157,12 +159,10 @@ def _mount(host: str, guest: str, read_only: bool) -> str:
     return f"type=bind,src={host},dst={guest}{suffix}"
 
 
-def build_argv(profile: Any, launch: ContainerLaunch) -> tuple[str, ...]:
-    """Build one complete, fixed Docker invocation without reading ambient state."""
+def _common_argv(profile: Any, name: str) -> tuple[str, ...]:
+    """Return the security and resource selectors shared by every image child."""
 
-    digest, cpu_set, numa_set, cgroup_parent = _profile_identity(profile)
-    launch = _launch(launch)
-    name = f"{CONTAINER_PREFIX}{launch.child_id}"
+    _digest, cpu_set, numa_set, cgroup_parent = _profile_identity(profile)
     return (
         DOCKER,
         "run",
@@ -188,6 +188,16 @@ def build_argv(profile: Any, launch: ContainerLaunch) -> tuple[str, ...]:
         "--uts=private",
         "--cgroupns=private",
         f"--name={name}",
+    )
+
+
+def build_argv(profile: Any, launch: ContainerLaunch) -> tuple[str, ...]:
+    """Build one complete, fixed Docker invocation without reading ambient state."""
+
+    digest, _cpu_set, _numa_set, _cgroup_parent = _profile_identity(profile)
+    launch = _launch(launch)
+    name = f"{CONTAINER_PREFIX}{launch.child_id}"
+    return _common_argv(profile, name) + (
         "--env=PATH=/toolchain/bin:/usr/bin:/bin",
         "--env=LC_ALL=C",
         "--env=TZ=UTC",
@@ -206,3 +216,33 @@ def build_argv(profile: Any, launch: ContainerLaunch) -> tuple[str, ...]:
         digest,
         *launch.command,
     )
+
+
+def build_image_inspection_argv(profile: Any, child_id: str) -> tuple[str, ...]:
+    """Build the fixed no-mount command that self-inspects the pinned image."""
+
+    digest, _cpu_set, _numa_set, _cgroup_parent = _profile_identity(profile)
+    child_id = _string(child_id, _HEX64, "image inspection child_id")
+    name = f"{IMAGE_CONTAINER_PREFIX}{child_id}"
+    return _common_argv(profile, name) + (
+        "--env=PATH=/toolchain/bin:/usr/bin:/bin",
+        "--env=LC_ALL=C",
+        "--env=TZ=UTC",
+        "--env=HOME=/nonexistent",
+        "--env=PYTHONDONTWRITEBYTECODE=1",
+        "--env=CARGO_NET_OFFLINE=true",
+        "--env=CARGO_HOME=/cargo",
+        "--env=TMPDIR=/tmp",
+        "--workdir=/",
+        digest,
+        IMAGE_INSPECTION_EXECUTABLE,
+    )
+
+
+def build_image_inspection_cleanup_argv(profile: Any, child_id: str) -> tuple[str, ...]:
+    """Build the one fixed best-effort removal command for an uncertain image run."""
+
+    _profile_identity(profile)
+    child_id = _string(child_id, _HEX64, "image inspection child_id")
+    name = f"{IMAGE_CONTAINER_PREFIX}{child_id}"
+    return (DOCKER, "container", "rm", "--force", "--volumes", name)
