@@ -246,9 +246,10 @@ cache-friendly fast path — borrow the input bytes, process, discard — is ide
 way; the difference is only the rare escape, where a copy is physically unavoidable. Making
 it explicit honors **Nothing hidden** (allocation is visible) and **Predictable performance**
 (a small edit that starts escaping a value does not silently jump its cost class). This is the
-hardware-aligned choice: predictable allocation beats convenience, and an in-arena clone is a
-bump allocation, not a malloc cliff. (Convenience-first auto-copy was rejected for the same
-reason exceptions and GC were — it hides cost.)
+hardware-aligned choice: predictable allocation beats convenience. In the current implementation,
+`str.clone()` is always a free-standing heap owner, including inside an arena, so the written clone
+has one stable lifetime/cost contract. (Convenience-first auto-copy was rejected for the same reason
+exceptions and GC were — it hides cost.)
 JSON follows the same boundary for escaped text: a clean token remains an input view, while a
 selected escaped token is decoded once into the caller's visible arena. The result therefore
 retains both input and arena provenance; a selected escape without an enclosing arena is an
@@ -786,6 +787,13 @@ competing for the same job ("one way" per job). Three deliberate rejections defi
   `Drop`, so semantic checking admits only rows whose complete reachable definition graph is
   recursively Copy under the canonical `DropPlan`. This is a scanner-only restriction; ordinary
   JSON decode and the declaration's other uses retain their own explicit ownership contracts.
+- **Owned decode is ownership-directed, not escape-directed.** A declared record whose closed graph
+  contains direct owned text selects a free-standing materializer at `json.decode`; a borrowed graph
+  keeps the zero-copy input/arena path, and a mixed graph rejects. The target's `string` types expose
+  the allocation choice before execution, so the result can outlive both input and an enclosing
+  arena without a hidden copy-on-escape. `encode` and `encode_bounded` consume the same graph and
+  ordered plan. The first flat graph is deliberately narrow; recursive owned JSON needs its own
+  consumer-reviewed cleanup graph.
 - **Request 6's scanner generic boundary is concrete-row-only.** Concrete generic monomorphs such
   as `Wrap<i64>` remain eligible after row resolution, and ordinary generic calls use expected-return
   propagation owned by `align_sema::Checker::check_generic_call`; numeric `IntVar`/`FloatVar` retain

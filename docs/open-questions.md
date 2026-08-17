@@ -2191,7 +2191,7 @@ Record: `impl/04-mir.md` (CFG), `non-goals.md`.
   borrowed members remain governed separately by Region. A one-owner aggregate can forward a
   path-dependent runtime mode, but mutation requires a definite mode; Move-struct construction
   retains completed field owners through direct struct and fixed-array `let` paths too.
-- **Explicit `.clone()` over hidden copy-on-escape**: a zero-copy decoded view that must escape its input is cloned explicitly (Nothing hidden + Predictable performance; supersedes the old `draft.md` auto-buffer wording). An in-arena clone is a bump allocation, so escaping is not a sudden heap cost.
+- **Explicit `.clone()` over hidden copy-on-escape**: a zero-copy decoded view that must escape its input is cloned explicitly (Nothing hidden + Predictable performance; supersedes the old `draft.md` auto-buffer wording). `str.clone()` is a free-standing heap owner even inside an arena; an arena-backed clone remains deferred rather than silently changing its lifetime.
 - **`json.decode`**: clean `str` and `array<Struct>` views remain region-tied to the input; selected escaped strings materialize in the enclosing arena and therefore bind the result to input plus arena. `array<scalar>` is copied into a fresh buffer (owned / `Static` / returnable, not region-tied).
 SSO is **not** adopted (its own Settled entry above). Element indexing is implemented: `recv[index]` (array/slice/owned array → scalar; **struct array → whole struct by value**, a Copy load region-tied to the array via `region_of`) and `arr[index].field` (a struct-array element's field), both bounds-checked. Since-implemented on separate tracks: tuples / multi-value returns → `partition`; `array<slice<T>>` → `chunks` (`Ty::DynSliceArray`); `out` params + the no-alias check. Still open: `array<Struct>.clone()`, and emitting LLVM `noalias` (below).
 Record: `impl/08-memory-model-v2.md` (full model + slice ledger §11), `design-notes.md` ("one region lattice, explicit copies"), `draft.md` §6/§7/§14, `impl/07-roadmap.md` (Memory Model v2 — DONE).
@@ -4510,9 +4510,10 @@ close the rest — no "this JSON shape works, that one doesn't" gap).**
   descriptors — symmetric, handles nested/Option/str/scalar). **Memory-safety:** the decode `Err`
   path frees any AoS buffers already written into the partial struct (`drop_decoded_owned`, the
   runtime dual of `drop_struct_fields`) — pinned by `json_array_field_error_path_frees_buffer`
-  (alloc==free). **Known constraint:** a Move struct (owns an array) can't be a `Result`/`Option`
-  Ok payload that crosses a function boundary (pre-existing) — decode + use it in the same scope.
-  Deferred: `array<scalar>` field decode (`array<i64>`), `array<string>`/owned-element arrays.
+  (alloc==free). At this slice's boundary a Move struct could not yet cross a function boundary as
+  a `Result`/`Option` Ok payload; L1b later shipped recursive tagged-payload Drop and removed that
+  constraint. `array<scalar>` field decode shipped later; `array<string>` remained deferred until
+  the settled direct-owned route recorded below. Other owned-element arrays remain deferred.
   `soa<T>` keeps excluding Move-fielded structs (the settled owned-columns deferral stands). Tests:
   m5 (`json_array_struct_field_decode_read_and_roundtrip`, `json_full_openai_response_shape_roundtrip`,
   `json_empty_array_struct_field`), runtime (`json_decode_array_struct_field_and_encode`,
@@ -4629,6 +4630,18 @@ region-tied to min(input, arena); nothing escapes the arena un-cloned. Implement
 recorded for the slice: `.at(i)`/`.get(k)` are linear at one nesting level (tape sibling-skip
 offsets make each hop O(1); use `elems()` for whole-level loops); an escaped string in `as_str()`
 unescapes into the arena (bump, bulk-freed — the one allocating accessor, documented).
+
+**Direct owned JSON records — SETTLED DESIGN (2026-08-17; implementation pending).** A direct
+record with at least one `string`, `Option<string>`, or `array<string>` field selects one closed
+owned route. Its only other fields are required fixed-width integers or bool; borrowed text,
+floats, nested aggregates, other optionals, and explicit layout/alignment reject before allocation.
+Decoded text is free-standing even inside `arena {}`, so the result has no input/arena provenance;
+the owned target types plus `json.decode` make materialization visible. Borrowed graphs keep the
+zero-copy Request 7 route, and mixed graphs reject instead of cloning. `json.encode` and
+`json.encode_bounded` use the same accepted graph and ordered encode plan. The compiler-private,
+target-local structural descriptor and the complete ownership/error matrix are fixed in
+`docs/impl/24-owned-json-plan.md`. This does not add top-level owned text, owned AoS/SoA/union/
+scanner rows, a dynamic JSON tree, or the later recursive Request 13 graph.
 
 **T3 — streaming: `json.scan` (SETTLED → SHIPPED as J5, #546 + #547; Request 6 safety gate pending).** NDJSON /
 top-level-array streaming typed by the binding annotation (`rows: json.scanner<Row> :=

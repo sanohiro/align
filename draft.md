@@ -1789,8 +1789,34 @@ first_name := arena {
 ```
 
 The compiler never silently inserts a copy on escape — allocation stays visible in source
-("Nothing hidden") and the cost class stays predictable. A `.clone()` inside an arena is a
-bump allocation (bulk-freed), so escaping is not a sudden heap cost.
+("Nothing hidden") and the cost class stays predictable. In the current implementation,
+`str.clone()` always produces a free-standing heap-owned `string`, including inside an arena, so
+the copied result may outlive the arena and carries its ordinary `Drop`.
+
+### Direct owned records
+
+A direct declared record containing `string`, `Option<string>`, or `array<string>` selects the
+owned JSON route (accepted design; implementation pending). The route is closed and flat: every
+other field is a required signed/unsigned 8/16/32/64-bit integer or `bool`. Borrowed text, floats,
+nested records/arrays/enums, other optional forms, and explicit record layout/alignment are rejected
+before allocation. A record without an owned text leaf keeps the existing borrowed route.
+
+Owned decode materializes every text value into free-standing storage. `array<string>` owns its
+spine and every element, and `Option<string>` owns only `Some`. The result has no input or arena
+dependency and remains free-standing when the call occurs inside `arena {}`. This is not a hidden
+copy: the declared owned field types plus `json.decode` select the materializing boundary. A mixed
+owned/borrowed graph is rejected instead of converted.
+
+`json.decode`, `json.encode`, and `json.encode_bounded` accept the same owned graph. Encode preserves
+declaration order and the existing JSON string grammar; bounded encode retains its inclusive byte
+ceiling and owned `Result<string, Error>`. Decode range-checks the exact integer width and supports
+the full unsigned 64-bit range. Missing and `null` map to `None`, encode omits `None`, and
+`Some("")` remains distinct. Recoverable failure drops every initialized direct owner exactly once;
+overflow and allocation failure retain the terminal-abort policy.
+
+The exact descriptor, error precedence, ownership matrix, and golden vectors are specified by
+`docs/impl/24-owned-json-plan.md`. AoS, SoA, union, scalar-array, `json.doc`, and `json.scan` routes
+are unchanged.
 
 ### Struct as Schema
 
@@ -2471,9 +2497,9 @@ A field may also be an owned
 `array<Struct>` (the `messages: array<Message>` shape): decode parses the JSON
 array into an owned array-of-structs in the field (freed by the struct's drop),
 and encode renders it back — so a full nested/array/optional record round-trips.
-The array element struct may itself be Move; its elements are deep-dropped. JSON decode/encode for
-a bare `array<string>` field remains deferred, and a `soa<Struct>` stays
-primitive/`str` columns.
+The array element struct may itself be Move; its elements are deep-dropped. The direct-owned route
+above admits a flat `array<string>` field; nested and AoS owned-text graphs remain deferred. A
+`soa<Struct>` stays primitive/`str` columns.
 
 ### Union (Sum-Type) Mapping
 

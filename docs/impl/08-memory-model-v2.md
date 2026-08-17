@@ -128,8 +128,9 @@ free-standing **owned** `array`/`string` is heap-owned and `Static`-lived *until
 frame-local array literal, or a view into a by-value parameter's interior), never for a
 view *parameter* (which borrows the caller → `Static`, returnable).
 
-\*\* Prose about making an in-arena clone a bump allocation has drifted from the current heap-owned
-implementation. Audit 13 leaves that contract as a Claude Code question rather than deciding it.
+\*\* Prose about making an in-arena clone a bump allocation drifted from the current heap-owned
+implementation. The current contract keeps `str.clone()` free-standing inside and outside an arena;
+an arena-backed clone remains deferred rather than silently changing that lifetime.
 
 Regions are never written by the user and never appear in a type. They live only in the
 checker (an inferred property of each binding), exactly like today's `region` map — just
@@ -295,8 +296,8 @@ Rationale (the four-way-alignment / hardware case):
 - The only difference is the rare escape path, where a copy is physically unavoidable; making
   it an explicit `.clone()` keeps **Nothing hidden** and **Predictable performance** (no
   silent cost-class jump when a value starts to escape).
-- An escaping `.clone()` *inside an arena* is a bump allocation (cache-local, bulk-freed), so
-  "escape" is not a malloc cliff.
+- An escaping `.clone()` remains a free-standing heap owner even inside an arena. The explicit
+  operation keeps the allocation and lifetime change visible; no arena-backed clone is inferred.
 
 This **supersedes** the current draft.md §12 "Zero Copy" wording ("only when there is an
 escape is a decode buffer used"), which implied a compiler-inserted copy. §12 must be updated
@@ -866,3 +867,33 @@ the buffer into `Ok(string)`; negative-limit and over-limit finishes consume the
 buffer, zero the output slot, and construct `Err(Error.Invalid)`. Actual OOM remains terminal under
 the allocator-wide rule. There is no partial owner, hidden second pass, arena fallback, source move,
 or path on which both the builder and Result own the same allocation.
+
+## 19. Ownership-directed JSON records (accepted design 2026-08-17)
+
+Align-llm Request 9 adds no region kind or second ownership model. It defines one general
+materializing boundary within typed JSON:
+
+```text
+borrowed JSON graph    input/arena-bounded views
+fully owned JSON graph free-standing owners
+mixed graph            compile-time rejection
+```
+
+The first accepted owned graph is a flat direct record containing at least one `string`,
+`Option<string>`, or `array<string>`, with only required fixed-width integer and bool siblings. The
+target declaration exposes the owning types, and `json.decode` is the explicit materializer. Every
+child owner is free-standing even when the call is lexically inside `arena {}`; the complete record
+therefore carries a set cleanup bit and no input/arena region. This is an operation contract, not an
+escape-time copy or an ambient allocator choice. Ordinary owned producers retain §6's arena default,
+and borrowed JSON retains Request 7's arena materialization.
+
+The result composes with the existing recursive `Result`/Option/user-sum `DropPlan` and path-local
+cleanup carrier. Moves clear the complete source. Replacement drops the old record first.
+Recoverable decode failure visits direct fields in declaration order; an `array<string>` visits its
+initialized elements in ascending order before its spine. All children use the same free-standing
+mode, so the one-aggregate/one-mode invariant remains intact. Overflow and allocation failure stay
+terminal and make no cleanup-after-abort promise.
+
+The exact graph, compiler-private descriptor, routing exclusions, and implementation matrix are in
+[`24-owned-json-plan.md`](24-owned-json-plan.md). The later recursive C6 graph must reuse this model
+through a separately reviewed finite graph; it may not widen this flat route implicitly.

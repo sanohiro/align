@@ -49,6 +49,23 @@ added the two bounded-HTTP setters. Their runtime definitions and registry entri
 atomically: the current exact counts are 293 keyed records, 306 base records, and 314 records in the
 maximum optional-probe export table. No unkeyed or probe category changed.
 
+## Planned Request 9 descriptor extension (not shipped)
+
+The accepted Request 9 design in `docs/impl/24-owned-json-plan.md` changes no
+native symbol, LLVM function type, attribute, registry key, or count in this
+ledger. It extends only the compiler/runtime interpretation of the existing
+`JsonField.tag` kind byte passed through A103/A80: kind `8`, width `16`, null
+`sub` is an owned `string`; kind `9`, width `16`, null `sub` is an owned
+`array<string>`. A direct `Option<string>` uses kind `8` with its validated
+nonnegative record-relative `opt_tag`; required forms use `-1`. Kinds `0..=7`
+retain their shipped meanings.
+
+Those rows are emitted only from a validated target-local `OwnedJsonDescV1`.
+Owned decode calls A103 with the existing final arena argument null; the new
+kind itself selects free-standing allocation. The `JsonField` C layout and A103
+signature do not change. Until the implementation lands, kinds `8` and `9`
+remain design records and the current runtime rejects them.
+
 The key-to-symbol mapping is `key -> "align_rt_" + snake_case(key)` except:
 
 ```text

@@ -498,6 +498,15 @@ malformed escapes, lone or reversed surrogates, and invalid UTF-8 are decode err
 string borrows the input; an escaped selected string is decoded once into the caller arena. A
 selected escaped string outside an arena is an error, while ignored escaped tokens are validated
 without a proportional scratch buffer.
+A direct record with at least one `string`, direct `Option<string>`, or direct `array<string>` field
+selects the owned JSON route (accepted design; implementation pending). That route is flat and
+closed: every other field is a required signed/unsigned 8/16/32/64-bit integer or `bool`; borrowed
+text, float, nested aggregate, other optional, and explicit-layout forms reject before allocation.
+Every decoded text value is free-standing, so the result has no input or arena dependency even when
+decoded inside `arena {}`. Mixed owned/borrowed graphs reject rather than clone. `json.decode`,
+`json.encode`, and `json.encode_bounded` share this graph; recoverable failures clean every live
+direct owner exactly once, and full-range `u64` never passes through a signed intermediate. The
+exact contract is `docs/impl/24-owned-json-plan.md`.
 A field may also be an `Option<T>` (payload scalar/`str`/nested struct): missing key or JSON `null`
 → `None`, type mismatch → `Err`, present → `Some`; `encode` omits a `None` field entirely, so
 `decode(encode(x))` round-trips (a non-`Option` field still errors when missing). The same JSON field
@@ -508,8 +517,8 @@ restriction does not narrow ordinary JSON behavior. A field may also
 be an owned `array<Struct>` (the `messages: array<Message>` shape) — decode fills an owned
 array-of-structs in the field (freed by the struct's drop) and encode renders it back, so a full
 OpenAI request/response round-trips. The element struct may itself be Move and is deep-dropped.
-JSON decode/encode for bare `array<string>` fields remains deferred. `soa<T>` columns stay
-primitive/`str`.
+The accepted direct-owned route above adds a flat `array<string>` field; nested and AoS owned-text
+graphs remain deferred. `soa<T>` columns stay primitive/`str`.
 
 An owning package resource may expose a borrowed `soa<T>` view over its exact-length column buffer;
 that resource generation is then the lifetime root. `pkg.db.batch_soa<T: SoaPlain>` uses this form.
@@ -604,8 +613,8 @@ This restriction is scanner-only; the declaration remains a valid ordinary type.
 `validate<T>`, `token`, and `field_table<T>` are settled out (draft §18.1).
 
 `json.encode_bounded(value, max_bytes: i64) -> Result<string, Error>` accepts exactly the same
-borrowed typed values as `json.encode`. Its nonnegative inclusive ceiling counts emitted UTF-8
-bytes; exact fit succeeds, while a negative limit or the first byte beyond the limit yields
+typed values as `json.encode`, including the accepted direct-owned graph. Its nonnegative inclusive
+ceiling counts emitted UTF-8 bytes; exact fit succeeds, while a negative limit or the first byte beyond the limit yields
 `Error.Invalid` without a partial value or allocation beyond the ceiling. Success is byte-identical
 to `json.encode` and owns its `string`. This typed declaration-order encoding is Align's canonical
 artifact byte form; it is not RFC 8785 key sorting or a dynamic JSON canonicalizer.

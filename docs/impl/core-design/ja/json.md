@@ -63,6 +63,45 @@ implementation PR を開く前に、author-side matrix-to-diff pass で全 appli
 owner test に対応付ける。benchmark-evidence document は別の trusted measurement boundary であり、この
 language/runtime contract を定義しない。
 
+## Direct owned record（Request 9 design）
+
+Request 9 は、既存の inferred operation に、closed で flat な owned-record graph を1つ追加する。
+design は accepted、implementation は pending である。direct record に direct `string`、
+`Option<string>`、`array<string>` のいずれかが1つ以上あれば owned route を選ぶ。選択後、その他の
+field は required な signed/unsigned 8/16/32/64-bit integer または `bool` だけでなければならない。
+`str`、`array<str>`、float、char、nested record/array/enum、その他の `Option`、明示的な
+`layout(C)`、`align(N)` があれば、descriptor 構築や runtime allocation より前に graph 全体を拒否する。
+owned text leaf を持たない record は既存 JSON route のままである。
+
+3つの operation は同じ accepted graph を共有する。
+
+```text
+json.decode(input: str) -> Result<T, Error>
+json.encode(value: T) -> str
+json.encode_bounded(value: T, max_bytes: i64) -> Result<string, Error>
+```
+
+owned decode は ownership-directed materializer である。各 text field は free-standing owner、
+`array<string>` は spine と各 element、`Option<string>` は `Some` のみを所有する。result は input
+にも arena にも依存せず、`arena {}` 内で decode しても free-standing のままである。owned target
+type と `json.decode` が allocation を可視にする。borrowed JSON は Request 7 の input/arena 動作を
+維持し、owned/borrowed の mixed graph は暗黙 clone せず拒否する。
+
+recoverable な parse、duplicate、shape、integer range、missing field、trailing-input failure は、
+`Error.Code(1)` を返す前に初期化済み direct owner を正確に1回解放する。cleanup は declaration 順、
+text-array element の昇順、最後に spine の順である。overflow と allocator failure は runtime 全体の
+terminal-abort policy を維持する。`u64` は signed intermediate を通さず `0..=u64::MAX` 全域を
+decode/encode する。missing と `null` は `None`、`None` は omit、`Some("")` は別状態である。
+
+checked compiler-private `OwnedJsonDescV1` は structural かつ target-local である。field name と
+declaration order、integer width/sign、natural-layout algorithm と offset、optional tag/payload offset、
+allocation/drop tag、`array<string>` element Drop-plan version を固定する。per-unit interface と cache
+identity に含むが、public artifact や reflection surface ではない。既存 AoS、SoA、union、fixed-array、
+scalar-array、`json.doc`、recursively-Copy `json.scan` route は変更しない。
+
+exact public ledger、descriptor bytes、error precedence、implementation closure matrix、golden vector の
+正本は [`../../24-owned-json-plan.md`](../../24-owned-json-plan.md) である。
+
 ## Signatures (pending と明記したものを除き verified)
 
 ```text
@@ -115,11 +154,9 @@ tag-switched な `drop_enum` で生きているバリアントを解放する。
 `match m.content { … }` は所有 payload をムーブアウトしフィールドをゼロ化する（`NullStructField` が型対応
 = `{tag,payloads}` 集約全体をゼロ化）ので、struct の `Drop` はそこで null を解放する（単一解放）。
 union のバリアントは構造化 MIR の型テーブルに含まれるので、バリアント変更で decode/encode キャッシュが
-無効化される。**境界:** Move struct は関数境界を越えて `Result`/`Option` の Ok
-payload になれない（Slice-C 制約）ため `Message` の decode ターゲットは `?` で束縛する。top-level
-Move union の decode も `?` で直接消費しなければならない。raw
-`Result<MoveUnion, Error>` の保持・返却は、再帰的 tagged-payload Drop が未実装のため L1b 診断となる。続く J3b
-スライスが所有要素の deep free を提供するため、`Message` が Move の場合も
+無効化される。有限で非再帰な Move struct/union は shipped recursive tagged `DropPlan` を使うので、raw
+`Result`/`Option` payload は通常の control-flow ownership path で bind/pass/return/transfer できる。続く
+J3b スライスが所有要素の deep free を提供するため、`Message` が Move の場合も
 `Chat { messages: array<Message> }` までラウンドトリップする。
 
 **`array<Struct>` フィールド（REST-gateway runway, Slice C）。** 構造体フィールドは所有の `array<Struct>`
@@ -139,11 +176,10 @@ Move-enum の `content` フィールドを所有する。drop は **deep** free:
 の kind-5 アームが各要素を deep-free（`sub_owns_buffers` で判定）し、`decode_struct_array_value` は
 mid-array パース失敗時に `buf[0..count]` の既 materialize 要素を解放する。**J3b で OpenAI chat ゲートウェイが
 エンドツーエンドで閉じる**（`Chat` が byte-identical にラウンドトリップ）。**引き続き拒否:** JSON
-decode/encode における `array<string>`（bare-`string` 要素の array フィールドには JSON descriptor arm
-がない）。Request 10 は standalone deep Drop を再利用して通常の所有 record construction ではこの field
-を有効にするが、JSON producer は追加しない。**制約:** Move
-構造体（array/Move-enum を所有）は関数境界を越える `Result`/`Option` Ok payload になれない — スコープ内で
-decode + 使用する。bare `array<Move-struct>` の `json.encode` とそのフィールド上の pipeline は制限される
+decode/encode における `array<string>`（bare-`string` 要素の array フィールドには shipped JSON
+descriptor arm がない）。Request 10 は standalone deep Drop を再利用して通常の所有 record construction
+ではこの field を有効にし、Request 9 の accepted design が direct flat JSON producer を追加する。bare
+`array<Move-struct>` の `json.encode` とそのフィールド上の pipeline は制限される
 （decode→encode パススルーは動作）。
 
 **`array<scalar>` フィールド（JSON 完全対応 T1b + `array<str>`, align-llm Request 3）。** 構造体フィールドは
