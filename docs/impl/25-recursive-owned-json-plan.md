@@ -1254,10 +1254,10 @@ fix commit.
 
 This design updates `draft.md`, `docs/language-spec.md`, `docs/design-notes.md`,
 `docs/impl/08-memory-model-v2.md`, the English/Japanese JSON designs, the
-interface/cache plan, checked-HIR and runtime ABI ledgers, `docs/open-questions.md`,
-and `HANDOFF.md`. The implementation updates status prose only where the shipped
-contract or capability state changes and adds the Align-owned C6 syntax/golden
-fixtures.
+native-boundary and interface/cache plans, checked-HIR and runtime ABI ledgers,
+`docs/open-questions.md`, and `HANDOFF.md`. The implementation updates status
+prose only where the shipped contract or capability state changes and adds the
+Align-owned C6 syntax/golden fixtures.
 
 Before implementation, the sibling request register mirrors this exact grammar,
 depth rule, V2 descriptor/envelope, format-8 transition, validation order,
@@ -1269,8 +1269,8 @@ final `make ci` remain sibling-repository work.
 
 ## 11. Author-side ledger consistency pass
 
-Completed before the initial independent review and repeated after closing its
-complete-manifest finding:
+Completed before the initial independent review and repeated after closing the
+complete-manifest and authoritative-ledger findings:
 
 - the three public operations, exact positional inputs, inference/default rules,
   results, errors, ownership, lifetime, allocation, and owners appear in §1 and
@@ -1301,3 +1301,11 @@ complete-manifest finding:
 - `draft.md`, `docs/language-spec.md`, design notes, memory/cache/HIR/ABI ledgers,
   English/Japanese JSON designs, settled decisions, and `HANDOFF.md` point to
   this ledger without claiming the implementation has shipped.
+
+## 12. Design-review finding-to-fix ledger
+
+| Finding | Closure |
+|---|---|
+| P1: the C6 record-name list did not fix the complete field/type/order graph, omitted `PromptEvaluationTask` and `RegressionLimits`, and left two incompatible `ContextPolicy` forms | Pin the clean sibling commit, Git blob, and file digest; materialize the authoritative 50-record/543-field Align manifest; include every dependency; select the seven-field C6b-memory policy explicitly; and require generated field/type/order/dependency assertions and per-root goldens. |
+| P2: the runtime ABI summary and machine owners retained the pre-Request-9 293/306/314 counts | Synchronize the current ledger to 294/307/315, the feature totals to 311/315, the runtime source-inventory assertion to 307, and the export/signature gate to the same exact counts. No ABI row or runtime behavior changes. |
+| P2: the native-boundary plan still called Request 13 hypothetical and deferred its bounded parity owners | Link the accepted plan from the Request 12 ledger and matrix, preserve shipped flat behavior until implementation, and assign the atomic V2 `encode`/`encode_bounded` parity and limit owners to Request 13. |

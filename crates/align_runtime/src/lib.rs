@@ -21152,8 +21152,8 @@ mod tests {
                 None
             })
             .collect();
-        assert_eq!(runtime.len(), 306);
-        assert_eq!(registry.len(), 306);
+        assert_eq!(runtime.len(), 307);
+        assert_eq!(registry.len(), 307);
         assert_eq!(runtime, registry);
     }
 
