@@ -673,7 +673,10 @@ plan's status and those sources only where the shipped contract or capability
 state changes. It also
 adds the Align-owned syntax/golden fixtures.
 
-After Align merges the implementation, update the sibling request register with
-the merged PR, exact ownership surface and limits, leave that edit uncommitted,
+Before implementation, the sibling request register must mirror this exact
+bounded/unbounded surface, format-7 target envelope, unsigned writer, validation
+order, and 17-variant/153-pair matrix; that synchronization remains uncommitted
+in the sibling repository. After Align merges the implementation, update the same
+register with the merged PR and final shipped status, still leave it uncommitted,
 and run exactly `cargo build --release --workspace`. align-llm adoption and its
 final `make ci` remain sibling-repository work.

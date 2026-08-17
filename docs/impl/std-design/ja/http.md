@@ -1144,7 +1144,7 @@ API は加えない。
 | Batch | `get_many` は全 worker を完了し input ordinal で store、completion order と無関係に lowest-index error を返す。error 時 response array は無く successful sibling を free。limit も malformed/timeout/transport と同じ ordinal rule。各 worker は独立 allowance を所有。 |
 | Plaintext / TLS | 一つの selection/decoder state が `Conn::Plain`/`Conn::Tls` を扱う。Align-owned TLS application scratch は ceiling 内。kernel/libssl opaque buffer は除外するが peer length/chunk magnitude/selected cap/body から capacity を導出しない。 |
 | Compiler/runtime owner | Sema は receiver/method/arity/type/bound-local、checked HIR は receiver/`i64` envelope、MIR は setter rvalue と HTTP-private limit mapping、LLVM は setter declaration/call と HTTP result mapping、runtime は storage/snapshot/selection/decoder/allocation/cleanup/batch order を所有。package owner は無い。 |
-| ABI and identity | A66 に `void @align_rt_http_max_response_body_bytes(ptr, i64)` と `void @align_rt_http_client_max_response_body_bytes(ptr, i64)` を追加。他の signature/type tag/interface record/handle ABI は不変。method spelling/MIR discriminant は interface-format-6/cache identity に入り、exact edit/revert で元 hash に戻る。 |
+| ABI and identity | A66 に `void @align_rt_http_max_response_body_bytes(ptr, i64)` と `void @align_rt_http_client_max_response_body_bytes(ptr, i64)` を追加。他の signature/type tag/interface record/handle ABI は不変。method spelling/MIR discriminant は shipped interface-format-6/cache identity に入り、accepted Request 9 の format-7 bump でもその record を維持し、exact edit/revert で元 hash に戻る。 |
 | Prerequisite and adoption | Request 4 `f04672bce6f8689c9b219d0a20e770571e2d638b` が framing を供給。Align implementation 後、sibling が merge を pin、`provider_http` に 262,144 を設定し combined framing/cap/cleanup matrix と HTTP status 区別を証明する。 |
 
 ### Framing と limit のマトリクス
