@@ -59,43 +59,735 @@ rejected before descriptor construction or runtime allocation. A `str` anywhere
 inside a selected graph is the mixed-owned/borrowed diagnostic; no implicit
 clone is inserted.
 
-The required C6 acceptance fixture instantiates and syntax-checks the persisted
-graphs named by `docs/specs/c6-prompt-context-optimizer.md`: prompt text,
-variant, context, scope, corpus revision, context/generation/provider/environment
-policies, artifact references and digests, snapshot requests/results and run
-attestations, adapter/source-verifier requests and results, environment probe and
-identity, input/generation/seed identities, candidate/experiment/evaluation
-records, task measurements and rows, trace overflow, activation records,
-acceptance policy, task/corpus aggregates, regression reasons, evaluation
-evidence, and the gate manifest/source locator. The fixture is copied into Align
-as a build input; the sibling repository is never read by a compiler test.
+The C6 provenance is the clean align-llm commit
+`871a0fad8284571b3500a964b45a40d20303c982`, whose
+`docs/specs/c6-prompt-context-optimizer.md` Git blob is
+`ed5d92b0ce6e445c931af0a600f3dec6b9c0995e` and whose exact file SHA-256 is
+`a6e8d01e8298464921ea717c85f8fcb80d465fd95e5c1397e8e1298fd4b79e03`.
+That sibling document is provenance only. The following complete Align-side
+manifest is the authoritative Request 13 build input; no compiler test reads a
+sibling checkout. A sibling change has no effect until this ledger, its checked-in
+fixture, semantic goldens, and descriptor-byte goldens change together.
 
-The fixed root manifest is:
+The sibling specification uses `str` as wire-schema notation. This manifest maps
+every persisted text, path, digest, status, and discriminator field to owned
+`string`; `array<str>` to `array<string>`; `Option<str>` to
+`Option<string>`; every schema version, count, index, byte size, duration, seed,
+and ppm field to `i64`; and every predicate field to `bool`. Label alternatives
+such as `PARENT | CANDIDATE` remain semantically validated strings, not Align
+enums. The sibling document contains both the shipped four-field renderer-core
+`ContextPolicy` and the deferred C6b-memory extension. Request 13 deliberately
+pins the seven-field C6b-memory form below because the persisted C6 graph consumes
+that final policy shape; the four-field form is not a second accepted declaration.
+
+Fields in every record below are in exact source declaration order. These 50
+nominal records are the complete persisted declaration graph. The fixture
+syntax-checks each persisted envelope as a root and checks the complete reachable
+definition graph for every root; supporting records are not silently replaced by
+shape-equivalent declarations.
 
 ```text
-PromptTextArtifact ArtifactReference PromptVariant ContextSources
-RenderedPromptArtifact PromptScope CorpusRevision ContextPolicy
-ArtifactDigest ArtifactExpectation SnapshotRequest WorkspacePreflightRequest
-WorkspacePreflightResult SnapshotResult TaskInputSnapshot RunSnapshotAttestation
-GenerationPolicy EvaluationProviderControl EnvironmentPolicy EnvironmentVariable
-PromptSourceVerifierPolicy TaskAdapterRequest EnvironmentProbe
-EnvironmentIdentityCore EnvironmentIdentity EvaluationInputIdentity
-GenerationRequestIdentity SeedCapabilityAttestation CandidateProposal
-PromptExperimentResult PromptSourceVerifierRequest PromptSourceVerifierResult
-PromptEvaluationCorpus TaskMeasurement PromptTaskRow PromptTraceOverflow
-PromptEvaluationResult PromptVerifierTrust PromptExpectedInputDigest
-PromptEvaluationEvidence PromptActivation PromptActivationResult
-PromptAcceptancePolicy TaskAggregate CorpusAggregate RegressionReason
-PromptGateManifest PromptGateSourceLocator
+PromptTextArtifact {
+  schema_version: i64
+  artifact_kind: string
+  artifact_id: string
+  text: string
+  content_sha256: string
+}
+
+ArtifactReference {
+  artifact_kind: string
+  path: string
+  artifact_id: string
+  content_sha256: string
+}
+
+PromptVariant {
+  schema_version: i64
+  artifact_kind: string
+  variant_id: string
+  base_prompt: PromptTextArtifact
+  repo_prompt: PromptTextArtifact
+  learned_prompt_append: string
+  context_policy: ContextPolicy
+  candidate_id: string
+  content_sha256: string
+}
+
+ContextSources {
+  schema_version: i64
+  artifact_kind: string
+  task_id: string
+  patch_evaluation: PromptTextArtifact
+  failure_memory_jsonl: PromptTextArtifact
+  diagnostic_stdout: PromptTextArtifact
+  diagnostic_stderr: PromptTextArtifact
+  content_sha256: string
+}
+
+RenderedPromptArtifact {
+  schema_version: i64
+  artifact_kind: string
+  task_id: string
+  variant_id: string
+  variant_sha256: string
+  task_prompt_sha256: string
+  context_sources_sha256: string
+  text: string
+  content_sha256: string
+}
+
+PromptScope {
+  schema_version: i64
+  artifact_kind: string
+  repo_id: string
+  repo_profile_revision: string
+  align_revision: string
+  corpus_id: string
+  corpus_revision: CorpusRevision
+  evaluation_provider_kind: string
+  evaluation_provider_model: string
+  generation_policy_sha256: string
+  acceptance_policy_sha256: string
+  base_prompt_sha256: string
+  repo_prompt_sha256: string
+  content_sha256: string
+}
+
+CorpusRevision {
+  schema_version: i64
+  artifact_kind: string
+  source_kind: string
+  source_repository_id: string
+  source_sha256: string
+  content_sha256: string
+}
+
+ContextPolicy {
+  include_patch_evaluation: bool
+  include_failure_memory: bool
+  include_diagnostics: bool
+  max_patch_evaluation_bytes: i64
+  max_failure_events: i64
+  max_failure_context_bytes: i64
+  max_diagnostic_bytes_per_stream: i64
+}
+
+ArtifactDigest {
+  path: string
+  mode: string
+  byte_count: i64
+  sha256: string
+}
+
+ArtifactExpectation {
+  path: string
+  kind: string
+  expected_sha256: string
+}
+
+SnapshotRequest {
+  schema_version: i64
+  artifact_kind: string
+  task_id: string
+  project_root: string
+  repo_path: string
+  repo_revision: string
+  require_clean_repo: bool
+  static_expectations: array<ArtifactExpectation>
+  additional_files: array<string>
+  workspace_path: string
+  allowed_workspace_entries: array<string>
+  content_sha256: string
+}
+
+WorkspacePreflightRequest {
+  schema_version: i64
+  artifact_kind: string
+  evaluation_id: string
+  project_root: string
+  workspace_path: string
+  content_sha256: string
+}
+
+WorkspacePreflightResult {
+  schema_version: i64
+  artifact_kind: string
+  evaluation_id: string
+  status: string
+  error_code: string
+  error: string
+  physical_project_root: string
+  physical_workspace_path: string
+  environment_probe: Option<EnvironmentProbe>
+  content_sha256: string
+}
+
+SnapshotResult {
+  schema_version: i64
+  artifact_kind: string
+  task_id: string
+  status: string
+  error_code: string
+  error: string
+  environment_probe: Option<EnvironmentProbe>
+  artifact_digests: array<ArtifactDigest>
+  content_sha256: string
+}
+
+TaskInputSnapshot {
+  schema_version: i64
+  artifact_kind: string
+  task_id: string
+  task_manifest_sha256: string
+  artifact_digests: array<ArtifactDigest>
+  environment_sha256: string
+  content_sha256: string
+}
+
+RunSnapshotAttestation {
+  schema_version: i64
+  artifact_kind: string
+  task_id: string
+  sample_index: i64
+  variant: string
+  status: string
+  error_code: string
+  error: string
+  snapshot_request_sha256: string
+  before_snapshot_result_sha256: string
+  after_snapshot_result_sha256: Option<string>
+  before_input_snapshot_sha256: Option<string>
+  after_input_snapshot_sha256: Option<string>
+  content_sha256: string
+}
+
+GenerationPolicy {
+  schema_version: i64
+  artifact_kind: string
+  generation_policy_id: string
+  evaluation_provider_kind: string
+  evaluation_provider_endpoint_id: string
+  evaluation_provider_model: string
+  provider_control_sha256: string
+  provider_service_revision: string
+  max_prompt_bytes: i64
+  max_tokens: i64
+  temperature_micros: i64
+  seed_mode: string
+  seed_base: i64
+  content_sha256: string
+}
+
+EvaluationProviderControl {
+  schema_version: i64
+  artifact_kind: string
+  provider_control_id: string
+  provider_kind: string
+  endpoint: string
+  endpoint_id: string
+  model: string
+  api_key_env: Option<string>
+  tokenize_endpoint: Option<string>
+  timeout_ns: i64
+  max_response_bytes: i64
+  content_sha256: string
+}
+
+EnvironmentPolicy {
+  schema_version: i64
+  artifact_kind: string
+  policy_id: string
+  allowed_variables: array<EnvironmentVariable>
+  executable_paths: array<string>
+  locale: string
+  content_sha256: string
+}
+
+EnvironmentVariable {
+  name: string
+  non_secret_value: string
+  source: string
+  precedence: i64
+}
+
+PromptSourceVerifierPolicy {
+  schema_version: i64
+  artifact_kind: string
+  policy_id: string
+  helper_path: string
+  helper_sha256: string
+  helper_runtime: string
+  git_executable_sha256: string
+  content_sha256: string
+}
+
+TaskAdapterRequest {
+  schema_version: i64
+  artifact_kind: string
+  evaluation_id: string
+  task_id: string
+  sample_index: i64
+  variant: string
+  variant_path: string
+  variant_sha256: string
+  rendered_prompt_path: string
+  rendered_prompt_sha256: string
+  generation_policy_path: string
+  generation_policy_sha256: string
+  provider_control_path: string
+  provider_control_sha256: string
+  workspace_path: string
+  result_path: string
+  paired_seed: i64
+  credential_env_name: Option<string>
+  environment_policy_sha256: string
+  content_sha256: string
+}
+
+EnvironmentProbe {
+  schema_version: i64
+  artifact_kind: string
+  producer: string
+  os: string
+  os_release: string
+  architecture: string
+  cpu: string
+  logical_cpu_count: Option<i64>
+  gpu: string
+  runtime_identity: string
+  content_sha256: string
+}
+
+EnvironmentIdentityCore {
+  schema_version: i64
+  artifact_kind: string
+  os: string
+  os_release: string
+  architecture: string
+  cpu: string
+  logical_cpu_count: Option<i64>
+  gpu: string
+  align_llm_commit: string
+  align_revision: string
+  measurement_adapter_runtime: string
+  snapshot_helper_runtime: string
+  source_verifier_runtime: string
+  source_verifier_policy_sha256: string
+  environment_policy_sha256: string
+}
+
+EnvironmentIdentity {
+  schema_version: i64
+  artifact_kind: string
+  core: EnvironmentIdentityCore
+  environment_id: string
+  content_sha256: string
+}
+
+EvaluationInputIdentity {
+  schema_version: i64
+  artifact_kind: string
+  task_id: string
+  task_input_snapshot_sha256: string
+  parent_variant_sha256: string
+  candidate_variant_sha256: string
+  task_prompt_sha256: string
+  context_sources_sha256: string
+  generation_policy_sha256: string
+  generation_request_sha256: string
+  adapter_request_sha256: string
+  environment_policy_sha256: string
+  environment_sha256: string
+  sample_index: i64
+  paired_seed: i64
+  content_sha256: string
+}
+
+GenerationRequestIdentity {
+  schema_version: i64
+  artifact_kind: string
+  rendered_prompt_sha256: string
+  system_text_sha256: string
+  user_text_sha256: string
+  generation_policy_sha256: string
+  provider_control_sha256: string
+  environment_policy_sha256: string
+  max_tokens: i64
+  temperature_micros: i64
+  paired_seed: i64
+  provider_request_sha256: string
+  seed_attestation_sha256: string
+  content_sha256: string
+}
+
+SeedCapabilityAttestation {
+  schema_version: i64
+  artifact_kind: string
+  provider_kind: string
+  provider_model: string
+  requested_seed: i64
+  result: string
+  applied_seed: Option<i64>
+  provider_request_sha256: string
+  content_sha256: string
+}
+
+CandidateProposal {
+  schema_version: i64
+  summary: string
+  learned_prompt_append: string
+  context_policy: ContextPolicy
+}
+
+PromptExperimentResult {
+  schema_version: i64
+  artifact_kind: string
+  experiment_id: Option<string>
+  status: string
+  error_code: string
+  error: string
+  parent_activation: Option<ArtifactReference>
+  scope: Option<PromptScope>
+  opportunity: Option<ArtifactReference>
+  proposal_provider_kind: Option<string>
+  proposal_provider_endpoint_id: Option<string>
+  proposal_provider_model: Option<string>
+  proposal_elapsed_ns: i64
+  proposal_status_code: Option<i64>
+  proposal_summary: string
+  candidate_variant: Option<PromptVariant>
+  bounded_provider_output: string
+  content_sha256: string
+}
+
+PromptSourceVerifierRequest {
+  schema_version: i64
+  artifact_kind: string
+  mode: string
+  align_llm_repository_path: string
+  expected_align_llm_commit: string
+  tested_align_llm_head: Option<string>
+  align_repository_path: string
+  expected_align_revision: string
+  corpus_source_path: string
+  corpus_source_kind: string
+  corpus_file_set_manifest_path: Option<string>
+  expected_corpus_source_repository_id: string
+  expected_corpus_source_sha256: string
+  git_executable_path: string
+  git_executable_sha256: string
+  content_sha256: string
+}
+
+PromptSourceVerifierResult {
+  schema_version: i64
+  artifact_kind: string
+  status: string
+  error_code: string
+  error: string
+  align_llm_reachability: string
+  align_llm_observed_head: Option<string>
+  align_reachability: string
+  align_observed_revision: Option<string>
+  corpus_reachability: string
+  corpus_observed_source_sha256: Option<string>
+  content_sha256: string
+}
+
+PromptEvaluationCorpus {
+  schema_version: i64
+  artifact_kind: string
+  corpus_id: string
+  corpus_revision: CorpusRevision
+  task_files: array<string>
+  content_sha256: string
+}
+
+PromptEvaluationTask {
+  schema_version: i64
+  artifact_kind: string
+  task_id: string
+  repo_id: string
+  repo_revision: string
+  repo_path: string
+  require_clean_repo: bool
+  cmd: string
+  argv: array<string>
+  snapshot_cmd: string
+  snapshot_argv: array<string>
+  measurement_adapter_runtime: string
+  snapshot_helper_runtime: string
+  cwd: string
+  timeout_ns: i64
+  task_prompt_path: string
+  context_sources_path: string
+  generation_policy_path: string
+  provider_control_path: string
+  environment_policy_path: string
+  artifacts: array<ArtifactExpectation>
+  regression_limits: RegressionLimits
+  content_sha256: string
+}
+
+RegressionLimits {
+  maximum_unrelated_diff_count: i64
+  maximum_patch_size_bytes: i64
+  maximum_public_api_change_count: i64
+  maximum_repair_loops: i64
+  maximum_benchmark_regression_ppm: Option<i64>
+}
+
+TaskMeasurement {
+  schema_version: i64
+  artifact_kind: string
+  status: string
+  failure_kind: string
+  build_status: string
+  test_status: string
+  repair_loop_count: i64
+  unrelated_diff_count: i64
+  patch_size_bytes: i64
+  public_api_change_count: i64
+  policy_violation_count: i64
+  cleanup_passed: bool
+  containment_passed: bool
+  benchmark_regression_ppm: Option<i64>
+  generation_to_passing_patch_ns: Option<i64>
+  rendered_prompt_sha256: string
+  generation_request: GenerationRequestIdentity
+  environment_probe: EnvironmentProbe
+  seed_attestation: SeedCapabilityAttestation
+  diagnostic_summary: string
+  diagnostic_stdout: string
+  diagnostic_stderr: string
+  content_sha256: string
+}
+
+PromptTaskRow {
+  schema_version: i64
+  artifact_kind: string
+  evaluation_id: string
+  task_id: string
+  sample_index: i64
+  variant: string
+  variant_id: string
+  variant_sha256: string
+  prompt_preparation_ns: i64
+  time_to_passing_patch_ns: Option<i64>
+  evaluation_input: EvaluationInputIdentity
+  measurement: TaskMeasurement
+  content_sha256: string
+}
+
+PromptTraceOverflow {
+  schema_version: i64
+  artifact_kind: string
+  attempted_invocation_count: i64
+  trace_record_count: i64
+  trace_digest_sha256: string
+  content_sha256: string
+}
+
+PromptEvaluationResult {
+  schema_version: i64
+  artifact_kind: string
+  evaluation_id: Option<string>
+  status: string
+  error_code: string
+  error: string
+  experiment: Option<ArtifactReference>
+  experiment_artifact: Option<PromptExperimentResult>
+  parent_activation: Option<ArtifactReference>
+  parent_activation_artifact: Option<PromptActivationResult>
+  scope: Option<PromptScope>
+  parent_variant: Option<PromptVariant>
+  candidate_variant: Option<PromptVariant>
+  corpus_source: Option<ArtifactReference>
+  corpus: Option<PromptEvaluationCorpus>
+  tasks: array<PromptEvaluationTask>
+  acceptance_policy_source: Option<ArtifactReference>
+  acceptance_policy: Option<PromptAcceptancePolicy>
+  generation_policy_source: Option<ArtifactReference>
+  generation_policy: Option<GenerationPolicy>
+  provider_control_source: Option<ArtifactReference>
+  provider_control: Option<EvaluationProviderControl>
+  workspace_preflight_source: Option<ArtifactReference>
+  workspace_preflight_request: Option<WorkspacePreflightRequest>
+  workspace_preflight: Option<WorkspacePreflightResult>
+  environment: Option<EnvironmentIdentity>
+  snapshot_requests: array<SnapshotRequest>
+  snapshot_results: array<SnapshotResult>
+  input_snapshots: array<TaskInputSnapshot>
+  snapshot_attestations: array<RunSnapshotAttestation>
+  trace_failure: Option<PromptTraceOverflow>
+  sample_count: i64
+  gate_eligible: bool
+  rows: array<PromptTaskRow>
+  task_aggregates: array<TaskAggregate>
+  corpus_aggregate: Option<CorpusAggregate>
+  serious_regression_reasons: array<RegressionReason>
+  content_sha256: string
+}
+
+PromptVerifierTrust {
+  schema_version: i64
+  artifact_kind: string
+  expected_align_llm_commit: string
+  expected_align_revision: string
+  expected_corpus_source_kind: string
+  expected_corpus_source_repository_id: string
+  expected_corpus_source_sha256: string
+  align_llm_reachability: string
+  align_llm_observed_head: Option<string>
+  align_reachability: string
+  align_observed_revision: Option<string>
+  corpus_reachability: string
+  corpus_observed_source_sha256: Option<string>
+  content_sha256: string
+}
+
+PromptExpectedInputDigest {
+  schema_version: i64
+  artifact_kind: string
+  task_id: string
+  sample_index: i64
+  variant: string
+  rendered_prompt_sha256: string
+  context_sources_sha256: string
+  generation_request_sha256: string
+  adapter_request_sha256: string
+  provider_request_sha256: string
+  content_sha256: string
+}
+
+PromptEvaluationEvidence {
+  schema_version: i64
+  artifact_kind: string
+  evaluation_id: string
+  evaluation_result_sha256: string
+  trust: PromptVerifierTrust
+  expected_inputs: array<PromptExpectedInputDigest>
+  content_sha256: string
+}
+
+PromptActivation {
+  schema_version: i64
+  artifact_kind: string
+  activation_id: string
+  operation: string
+  scope: PromptScope
+  parent_activation_id: string
+  parent_activation_sha256: string
+  effective_variant: PromptVariant
+  accepted_evaluation_id: string
+  accepted_evaluation_sha256: string
+  rollback_target_activation_id: string
+  rollback_target_activation_sha256: string
+  decision_reason: string
+  content_sha256: string
+}
+
+PromptActivationResult {
+  schema_version: i64
+  artifact_kind: string
+  decision_id: Option<string>
+  status: string
+  error_code: string
+  error: string
+  activation: Option<PromptActivation>
+  content_sha256: string
+}
+
+PromptAcceptancePolicy {
+  schema_version: i64
+  artifact_kind: string
+  policy_id: string
+  minimum_task_count: i64
+  minimum_samples_per_variant: i64
+  minimum_completion_gain_count: i64
+  minimum_time_improvement_ppm: i64
+  maximum_time_regression_ppm: i64
+  maximum_repair_loop_regression_count: i64
+  content_sha256: string
+}
+
+TaskAggregate {
+  task_id: string
+  parent_pass_count: i64
+  candidate_pass_count: i64
+  parent_repair_loop_count: i64
+  candidate_repair_loop_count: i64
+  paired_pass_count: i64
+  parent_paired_median_time_ns: Option<i64>
+  candidate_paired_median_time_ns: Option<i64>
+  time_improvement_ppm: Option<i64>
+  time_regression_ppm: Option<i64>
+}
+
+CorpusAggregate {
+  task_count: i64
+  sample_count: i64
+  parent_pass_count: i64
+  candidate_pass_count: i64
+  parent_repair_loop_count: i64
+  candidate_repair_loop_count: i64
+  paired_pass_count: i64
+  parent_paired_median_time_ns: Option<i64>
+  candidate_paired_median_time_ns: Option<i64>
+  completion_gain_count: i64
+  time_improvement_ppm: Option<i64>
+  time_regression_ppm: Option<i64>
+  repair_loop_regression_count: i64
+}
+
+RegressionReason {
+  task_id: string
+  sample_index: i64
+  code: string
+  parent_value: string
+  candidate_value: string
+  limit: string
+}
+
+PromptGateManifest {
+  schema_version: i64
+  artifact_kind: string
+  gate_id: string
+  source_locator: PromptGateSourceLocator
+  baseline_activation: ArtifactReference
+  improved_evaluation: ArtifactReference
+  improved_evaluation_evidence: ArtifactReference
+  accepted_activation: ArtifactReference
+  rollback_activation: ArtifactReference
+  content_sha256: string
+}
+
+PromptGateSourceLocator {
+  schema_version: i64
+  artifact_kind: string
+  source_bundle_id: string
+  align_llm_source_relative_path: string
+  align_source_relative_path: string
+  corpus_source_relative_path: string
+  corpus_file_set_manifest_relative_path: Option<string>
+  source_verifier_policy_relative_path: string
+  source_verifier_policy_sha256: string
+  source_verifier_relative_path: string
+  source_verifier_sha256: string
+  source_verifier_runtime: string
+  git_executable_sha256: string
+  content_sha256: string
+}
 ```
 
-The sibling specification uses `str` as wire-schema notation. The owned Align
-fixture maps every persisted text field to `string`, every `array<str>` to
-`array<string>`, and every `Option<str>` to `Option<string>` before syntax
-checking. Label alternatives such as `PARENT | CANDIDATE` remain validated
-strings, not Align enums. Ephemeral renderer/scorer-only records that are never
-passed to JSON are not roots; if a consumer later persists one, it must be added
-to this manifest and exercised without widening the accepted grammar.
+`PromptRender`, top-level command request records such as
+`PromptEvaluateRequest`, and scorer-internal `Score*` records are not persisted
+through this capability and are not roots. The content-bound helper and adapter
+request records explicitly listed above are persisted and remain in the graph.
+If a consumer later persists another record, it must be added here with exact
+ordered fields and exercised without widening the accepted type grammar
+implicitly.
 
 The maximum reachable constructor depth is 128, measured with the root record
 at depth one and incremented at every record, `Option`, or dynamic-array edge.
@@ -527,7 +1219,7 @@ phase through sema, interface decode, checked-HIR replay, and all lowerers.
 | Cell | Implementation owner | Required owner |
 | --- | --- | --- |
 | route selection, concrete generics, grammar, cycle/DAG/constructor-depth, explicit layout, mixed graph, and first-invalid order | one iterative `align_sema` V2 classifier shared with checked-HIR reconstruction | `recursive_owned_json_formation_matrix`, including every tag, depth 128/129, generic substitution, and multi-invalid permutation |
-| exact C6 graph coverage and exclusions | checked-in Align declarations generated from a reviewed fixed manifest, syntax checked separately from positional calls | `recursive_owned_json_c6_graph_manifest` plus one exclusion per unsupported constructor |
+| exact C6 graph coverage and exclusions | checked-in Align declarations generated from the pinned 50-record, 543-field manifest, syntax checked separately from positional calls | `recursive_owned_json_c6_graph_manifest`, generated exact field/type/order/dependency assertions and per-root semantic/descriptor goldens, plus one exclusion per unsupported constructor |
 | checked-HIR envelope, stored/rebuilt plan, malformed-node refusal, and enum-consumer sweep | existing `JsonOwned*` nodes with V2 plan; exhaustive visitors/hash/clone/replay/lowerers | parameterized `validate_hir` mutation sweep and `variant_sweep_tripwire` |
 | root/nested construction, option None/Some, scalar/string/record arrays, empty/nonempty/DAG | V2 `JsonSubTable` graph and A103 null-arena decode | `recursive_owned_json_decode_states` |
 | input/arena independence, move-in/out, raw Result, parameter/return/replacement/source nulling | ordinary recursive Move/Drop carrier with V2 allocation mode | `recursive_owned_json_transfer_matrix` and inside-arena/input-drop runtime owner |
@@ -577,7 +1269,8 @@ final `make ci` remain sibling-repository work.
 
 ## 11. Author-side ledger consistency pass
 
-Completed before independent review:
+Completed before the initial independent review and repeated after closing its
+complete-manifest finding:
 
 - the three public operations, exact positional inputs, inference/default rules,
   results, errors, ownership, lifetime, allocation, and owners appear in §1 and
@@ -586,6 +1279,12 @@ Completed before independent review:
   cycle/DAG case, depth boundary, generic state, and C6 root; nested option and
   composite-array element states are explicitly unavailable rather than
   silently collapsed;
+- the C6 provenance commit, Git blob, and file digest are pinned; all 50 nominal
+  declarations and 543 ordered fields are materialized locally; every referenced
+  record resolves inside the manifest; `PromptEvaluationTask` and
+  `RegressionLimits` are in the `PromptEvaluationResult` closure; and the
+  seven-field C6b-memory `ContextPolicy` is selected explicitly over the sibling
+  document's incompatible four-field renderer-core form;
 - UTF-8, embedded NUL, interface ASCII, validation-before-runtime, runtime error
   cleanup, and absence of external side effects are fixed in §4;
 - the V2 format fixes every scalar width/tag, record/field/type order, target ABI
