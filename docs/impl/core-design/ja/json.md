@@ -63,10 +63,10 @@ implementation PR を開く前に、author-side matrix-to-diff pass で全 appli
 owner test に対応付ける。benchmark-evidence document は別の trusted measurement boundary であり、この
 language/runtime contract を定義しない。
 
-## Direct owned record（Request 9 design）
+## Direct owned record（Request 9）
 
 Request 9 は、既存の inferred operation に、closed で flat な owned-record graph を1つ追加する。
-design は accepted、implementation は pending である。direct record に direct `string`、
+implementation は shipped である。direct record に direct `string`、
 `Option<string>`、`array<string>` のいずれかが1つ以上あれば owned route を選ぶ。選択後、その他の
 field は required な signed/unsigned 8/16/32/64-bit integer または `bool` だけでなければならない。
 `str`、`array<str>`、float、char、nested record/array/enum、その他の `Option`、明示的な
@@ -179,10 +179,10 @@ Move-enum の `content` フィールドを所有する。drop は **deep** free:
 `array<Struct>` ローカルの `Stmt::Drop` からも呼ばれる。runtime のエラーパスも同様: `drop_decoded_owned`
 の kind-5 アームが各要素を deep-free（`sub_owns_buffers` で判定）し、`decode_struct_array_value` は
 mid-array パース失敗時に `buf[0..count]` の既 materialize 要素を解放する。**J3b で OpenAI chat ゲートウェイが
-エンドツーエンドで閉じる**（`Chat` が byte-identical にラウンドトリップ）。**引き続き拒否:** JSON
-decode/encode における `array<string>`（bare-`string` 要素の array フィールドには shipped JSON
-descriptor arm がない）。Request 10 は standalone deep Drop を再利用して通常の所有 record construction
-ではこの field を有効にし、Request 9 の accepted design が direct flat JSON producer を追加する。bare
+エンドツーエンドで閉じる**（`Chat` が byte-identical にラウンドトリップ）。borrowed/nested/AoS route は
+bare-`string` 要素の array field を引き続き拒否する。Request 10 は standalone deep Drop を再利用して通常の
+owned record construction ではこの field を有効にし、Request 9 は closed direct-owned flat-record JSON
+route だけでこの field を受理する。bare
 `array<Move-struct>` の `json.encode` とそのフィールド上の pipeline は制限される
 （decode→encode パススルーは動作）。
 

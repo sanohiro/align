@@ -500,7 +500,7 @@ string borrows the input; an escaped selected string is decoded once into the ca
 selected escaped string outside an arena is an error, while ignored escaped tokens are validated
 without a proportional scratch buffer.
 A direct record with at least one `string`, direct `Option<string>`, or direct `array<string>` field
-selects the owned JSON route (accepted design; implementation pending). That route is flat and
+selects the owned JSON route. That route is flat and
 closed: every other field is a required signed/unsigned 8/16/32/64-bit integer or `bool`; borrowed
 text, float, nested aggregate, other optional, and explicit-layout forms reject before allocation.
 Every decoded text value is free-standing, so the result has no input or arena dependency even when

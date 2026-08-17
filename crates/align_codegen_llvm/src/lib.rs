@@ -5221,6 +5221,15 @@ fn bounded_json_piece_is_type_safe(
         }
         align_mir::TemplatePiece::StrHole(operand)
         | align_mir::TemplatePiece::JsonStrHole(operand) => operand_ty(operand) == Some(Ty::Str),
+        align_mir::TemplatePiece::OwnedJsonString(operand) => {
+            operand_ty(operand) == Some(Ty::String)
+        }
+        align_mir::TemplatePiece::OwnedJsonOptionStringField { opt, .. } => {
+            operand_ty(opt) == Some(Ty::Option(Scalar::String))
+        }
+        align_mir::TemplatePiece::OwnedJsonStringArray(operand) => {
+            operand_ty(operand) == Some(Ty::DynArray(Scalar::String))
+        }
         align_mir::TemplatePiece::BoolHole(operand) => operand_ty(operand) == Some(Ty::Bool),
         align_mir::TemplatePiece::CharHole(operand) => operand_ty(operand) == Some(Ty::Char),
         align_mir::TemplatePiece::FloatHole(operand) => {
@@ -13734,6 +13743,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 Some((max_bytes, *out)),
             )?,
             Rvalue::JsonDecode { struct_id, input, out, arena } => self.gen_json_decode(*struct_id, input, *out, arena.as_ref())?,
+            Rvalue::JsonOwnedDecode {
+                struct_id,
+                input,
+                out,
+            } => self.gen_json_owned_decode(*struct_id, input, *out)?,
             Rvalue::JsonDecodeArray { elem, input, out } => self.gen_json_decode_array(*elem, input, *out)?,
             Rvalue::JsonDecodeScalar { scalar, input, out } => self.gen_json_decode_scalar(*scalar, input, *out)?,
             Rvalue::JsonDecodeStructArray { struct_id, input, out, arena } => {
@@ -16953,12 +16967,29 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// the recursion terminates. The table is a private constant global (no per-call alloca → safe
     /// inside a loop). Shared by single-struct and `array<Struct>` decode (MMv2 slice 8d).
     fn emit_desc_table(&mut self, struct_id: u32) -> Result<DescTable<'c>, CodegenError> {
+        self.emit_desc_table_mode(struct_id, false)
+    }
+
+    fn emit_owned_desc_table(&mut self, struct_id: u32) -> Result<DescTable<'c>, CodegenError> {
+        self.emit_desc_table_mode(struct_id, true)
+    }
+
+    fn emit_desc_table_mode(
+        &mut self,
+        struct_id: u32,
+        owned: bool,
+    ) -> Result<DescTable<'c>, CodegenError> {
         let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
         let i64t = self.ctx.i64_type();
         let i32t = self.ctx.i32_type();
         let desc_ty = self.json_desc_ty();
         let null = ptr_ty.const_null();
-        let fields = self.structs[struct_id as usize].fields.clone();
+        let fields = self
+            .structs
+            .get(struct_id as usize)
+            .ok_or_else(|| self.err(format!("unknown JSON descriptor struct id {struct_id}")))?
+            .fields
+            .clone();
         let mut descs: Vec<inkwell::values::StructValue> = Vec::with_capacity(fields.len());
         for (i, f) in fields.iter().enumerate() {
             let desc = {
@@ -16975,14 +17006,46 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // the payload slot inside the `Option` (`{ i8 tag, payload }`) and `opt_tag` = the
                 // field's own byte offset (the tag byte). A required field is `opt_tag = -1` with
                 // `offset` = the field itself.
-                let (tag, sub_ptr, offset, opt_tag): (u64, inkwell::values::PointerValue, u64, i64) = match f.ty {
-                    Ty::Option(s) => {
-                        let (tag, sub_ptr) = self.json_payload_tag_sub(scalar_to_ty(s), null)?;
-                        (tag, sub_ptr, field_off + self.option_payload_offset(s), field_off as i64)
+                let (tag, sub_ptr, offset, opt_tag):
+                    (u64, inkwell::values::PointerValue, u64, i64) = if owned {
+                    match f.ty {
+                        Ty::Option(Scalar::String) => (
+                            (8 << 8) | 16,
+                            null,
+                            field_off + self.option_payload_offset(Scalar::String),
+                            field_off as i64,
+                        ),
+                        Ty::String => ((8 << 8) | 16, null, field_off, -1),
+                        Ty::DynArray(Scalar::String) => ((9 << 8) | 16, null, field_off, -1),
+                        Ty::Int(it) => (
+                            ((it.signed as u64) << 16) | (it.bits / 8) as u64,
+                            null,
+                            field_off,
+                            -1,
+                        ),
+                        Ty::Bool => ((1 << 8) | 1, null, field_off, -1),
+                        other => {
+                            return Err(self.err(format!(
+                                "owned JSON descriptor: {other:?} is outside the closed field grammar"
+                            )));
+                        }
                     }
-                    other => {
-                        let (tag, sub_ptr) = self.json_payload_tag_sub(other, null)?;
-                        (tag, sub_ptr, field_off, -1)
+                } else {
+                    match f.ty {
+                        Ty::Option(s) => {
+                            let (tag, sub_ptr) =
+                                self.json_payload_tag_sub(scalar_to_ty(s), null)?;
+                            (
+                                tag,
+                                sub_ptr,
+                                field_off + self.option_payload_offset(s),
+                                field_off as i64,
+                            )
+                        }
+                        other => {
+                            let (tag, sub_ptr) = self.json_payload_tag_sub(other, null)?;
+                            (tag, sub_ptr, field_off, -1)
+                        }
                     }
                 };
                 desc_ty.const_named_struct(&[
@@ -17048,7 +17111,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// Emit the field-descriptor table for decoding struct `struct_id`, wrapping [`emit_desc_table`]
     /// with the struct's ABI allocation size. The table is a private constant global (safe inside a loop).
     fn decode_field_table(&mut self, struct_id: u32) -> Result<DecodeTable<'c>, CodegenError> {
-        let sty = self.struct_types[struct_id as usize];
+        let sty = self
+            .struct_types
+            .get(struct_id as usize)
+            .copied()
+            .ok_or_else(|| self.err(format!("unknown JSON decode struct id {struct_id}")))?;
         let t = self.emit_desc_table(struct_id)?;
         Ok(DecodeTable {
             descs: t.descs,
@@ -17163,7 +17230,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
         arena: Option<&Operand>,
     ) -> Result<BasicValueEnum<'c>, CodegenError> {
         let ety = self.enum_types[enum_id as usize];
-        let out_ptr = self.slots[&out];
+        let out_ptr = self
+            .slots
+            .get(&out)
+            .copied()
+            .ok_or_else(|| self.err(format!("missing JSON decode output slot {out}")))?;
         // Zero the enum so an unset payload/tag reads as 0 (a failed decode leaves it zeroed).
         self.builder.build_store(out_ptr, ety.const_zero()).map_err(|e| self.err(e))?;
 
@@ -17191,8 +17262,36 @@ impl<'c, 'a> FnGen<'c, 'a> {
         out: Slot,
         arena: Option<&Operand>,
     ) -> Result<BasicValueEnum<'c>, CodegenError> {
-        let sty = self.struct_types[struct_id as usize];
-        let out_ptr = self.slots[&out];
+        self.gen_json_decode_record(struct_id, input, out, arena, false)
+    }
+
+    fn gen_json_owned_decode(
+        &mut self,
+        struct_id: u32,
+        input: &Operand,
+        out: Slot,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
+        self.gen_json_decode_record(struct_id, input, out, None, true)
+    }
+
+    fn gen_json_decode_record(
+        &mut self,
+        struct_id: u32,
+        input: &Operand,
+        out: Slot,
+        arena: Option<&Operand>,
+        owned: bool,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let sty = self
+            .struct_types
+            .get(struct_id as usize)
+            .copied()
+            .ok_or_else(|| self.err(format!("unknown JSON decode struct id {struct_id}")))?;
+        let out_ptr = self
+            .slots
+            .get(&out)
+            .copied()
+            .ok_or_else(|| self.err(format!("missing JSON decode output slot {out}")))?;
         // Zero the struct so missing fields read as 0/false.
         self.builder.build_store(out_ptr, sty.const_zero()).map_err(|e| self.err(e))?;
 
@@ -17201,7 +17300,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let in_len = self.builder.build_extract_value(agg, 1, "jin_l").map_err(|e| self.err(e))?;
 
         let i64t = self.ctx.i64_type();
-        let t = self.decode_field_table(struct_id)?;
+        let t = if owned {
+            let t = self.emit_owned_desc_table(struct_id)?;
+            DecodeTable {
+                descs: t.descs,
+                n_fields: t.n_fields,
+                store_size: self.element_allocation_size(sty.into()),
+                phf_ptr: t.phf_ptr,
+                phf_len: t.phf_len,
+                phf_seed: t.phf_seed,
+            }
+        } else {
+            self.decode_field_table(struct_id)?
+        };
         let n = i64t.const_int(t.n_fields, false);
         let size = i64t.const_int(t.store_size, false);
         let phf_len = i64t.const_int(t.phf_len, false);
@@ -17766,8 +17877,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     } else {
                         v
                     };
+                    let key = if is_signed(ty) {
+                        RuntimeKey::BuilderWriteInt
+                    } else {
+                        RuntimeKey::BuilderWriteUint
+                    };
                     self.builder
-                        .build_call(self.runtime(RuntimeKey::BuilderWriteInt), &[bptr.into(), wide.into()], "")
+                        .build_call(self.runtime(key), &[bptr.into(), wide.into()], "")
                         .map_err(|e| self.err(e))?;
                 }
                 align_mir::TemplatePiece::BoolHole(op) => {
@@ -17799,6 +17915,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let (ptr, len) = self.display_view(op, "a json.encode str field")?;
                     self.builder
                         .build_call(self.runtime(RuntimeKey::BuilderWriteJsonStr), &[bptr.into(), ptr.into(), len.into()], "")
+                        .map_err(|e| self.err(e))?;
+                }
+                align_mir::TemplatePiece::OwnedJsonString(op) => {
+                    let (ptr, len) = self.display_view(op, "an owned json.encode string field")?;
+                    self.builder
+                        .build_call(
+                            self.runtime(RuntimeKey::BuilderWriteJsonStr),
+                            &[bptr.into(), ptr.into(), len.into()],
+                            "",
+                        )
                         .map_err(|e| self.err(e))?;
                 }
                 // `json.encode` `Option<T>` field: when `Some`, append `"name":<payload>,`; else
@@ -17884,8 +18010,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             } else {
                                 v
                             };
+                            let key = if is_signed(ity) {
+                                RuntimeKey::BuilderWriteInt
+                            } else {
+                                RuntimeKey::BuilderWriteUint
+                            };
                             self.builder
-                                .build_call(self.runtime(RuntimeKey::BuilderWriteInt), &[bptr.into(), wide.into()], "")
+                                .build_call(self.runtime(key), &[bptr.into(), wide.into()], "")
                                 .map_err(|e| self.err(e))?;
                         }
                         other => {
@@ -17901,6 +18032,74 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .map_err(|e| self.err(e))?;
                     self.builder.build_unconditional_branch(cont_bb).map_err(|e| self.err(e))?;
                     self.builder.position_at_end(cont_bb);
+                }
+                align_mir::TemplatePiece::OwnedJsonOptionStringField { opt, name } => {
+                    let agg = self.operand(opt)?.into_struct_value();
+                    let tag = self
+                        .builder
+                        .build_extract_value(agg, 0, "oostring.tag")
+                        .map_err(|e| self.err(e))?
+                        .into_int_value();
+                    let payload = self
+                        .builder
+                        .build_extract_value(agg, 1, "oostring.payload")
+                        .map_err(|e| self.err(e))?
+                        .into_struct_value();
+                    let is_some = self
+                        .builder
+                        .build_int_compare(
+                            IntPredicate::NE,
+                            tag,
+                            tag.get_type().const_zero(),
+                            "oostring.some",
+                        )
+                        .map_err(|e| self.err(e))?;
+                    let func = self
+                        .builder
+                        .get_insert_block()
+                        .and_then(|block| block.get_parent())
+                        .ok_or_else(|| self.err("no enclosing function for owned Option<string>"))?;
+                    let some = self.ctx.append_basic_block(func, "owned.opt.some");
+                    let cont = self.ctx.append_basic_block(func, "owned.opt.cont");
+                    self.builder
+                        .build_conditional_branch(is_some, some, cont)
+                        .map_err(|e| self.err(e))?;
+                    self.builder.position_at_end(some);
+                    let (prefix, prefix_len) = self.str_global(&format!("\"{name}\":"));
+                    self.builder
+                        .build_call(
+                            self.runtime(RuntimeKey::BuilderWrite),
+                            &[bptr.into(), prefix.into(), prefix_len.into()],
+                            "",
+                        )
+                        .map_err(|e| self.err(e))?;
+                    let ptr = self
+                        .builder
+                        .build_extract_value(payload, 0, "oostring.ptr")
+                        .map_err(|e| self.err(e))?;
+                    let len = self
+                        .builder
+                        .build_extract_value(payload, 1, "oostring.len")
+                        .map_err(|e| self.err(e))?;
+                    self.builder
+                        .build_call(
+                            self.runtime(RuntimeKey::BuilderWriteJsonStr),
+                            &[bptr.into(), ptr.into(), len.into()],
+                            "",
+                        )
+                        .map_err(|e| self.err(e))?;
+                    let (comma, comma_len) = self.str_global(",");
+                    self.builder
+                        .build_call(
+                            self.runtime(RuntimeKey::BuilderWrite),
+                            &[bptr.into(), comma.into(), comma_len.into()],
+                            "",
+                        )
+                        .map_err(|e| self.err(e))?;
+                    self.builder
+                        .build_unconditional_branch(cont)
+                        .map_err(|e| self.err(e))?;
+                    self.builder.position_at_end(cont);
                 }
                 // `json.encode` of an `Option<struct>` field (T1b): when `Some`, write `"name":`, render
                 // the payload struct via the runtime descriptor-driven encoder (the same schema decode
@@ -17986,6 +18185,25 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let etag = self.ctx.i32_type().const_int(etag, false);
                     self.builder
                         .build_call(self.runtime(RuntimeKey::JsonEncodeScalarArray), &[bptr.into(), ptr.into(), len.into(), etag.into()], "")
+                        .map_err(|e| self.err(e))?;
+                }
+                align_mir::TemplatePiece::OwnedJsonStringArray(array) => {
+                    let agg = self.operand(array)?.into_struct_value();
+                    let ptr = self
+                        .builder
+                        .build_extract_value(agg, 0, "owned.sa.ptr")
+                        .map_err(|e| self.err(e))?;
+                    let len = self
+                        .builder
+                        .build_extract_value(agg, 1, "owned.sa.len")
+                        .map_err(|e| self.err(e))?;
+                    let tag = self.ctx.i32_type().const_int((3 << 8) | 16, false);
+                    self.builder
+                        .build_call(
+                            self.runtime(RuntimeKey::JsonEncodeScalarArray),
+                            &[bptr.into(), ptr.into(), len.into(), tag.into()],
+                            "",
+                        )
                         .map_err(|e| self.err(e))?;
                 }
                 // `json.encode` of a shape-directed union: materialize the enum value in memory (the

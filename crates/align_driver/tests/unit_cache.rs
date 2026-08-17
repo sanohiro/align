@@ -143,6 +143,92 @@ fn two_module(tag: &str) -> Proj {
     )
 }
 
+#[test]
+fn owned_json_descriptor_participates_in_cold_edit_revert_cache_identity() {
+    let _serial = serial();
+    let original = concat!(
+        "module lib\n",
+        "import core.json\n",
+        "pub Value { id: string, tags: array<string>, note: Option<string> }\n",
+        "pub fn parse(input: str) -> Result<Value, Error> = json.decode(input)\n",
+    );
+    let main = concat!(
+        "import lib\n",
+        "fn main() -> Result<(), Error> {\n",
+        "  value := lib.parse(\"{\\\"id\\\":\\\"x\\\",\\\"tags\\\":[] }\")?\n",
+        "  print(value.id.len())\n",
+        "  return Ok(())\n",
+        "}\n",
+    );
+    let project = Proj::new(
+        "owned-json-descriptor",
+        &[("lib.align", original), ("main.align", main)],
+    );
+    let cold = project.build(UnitReuse::Allowed);
+    assert!(!hit(&cold, "lib") && !hit(&cold, "main"));
+    let cold_descriptor = cold
+        .units
+        .iter()
+        .find(|unit| unit.unit == "lib")
+        .unwrap()
+        .summary
+        .owned_json_descriptors[0]
+        .envelope
+        .clone();
+
+    let warm = project.build(UnitReuse::Allowed);
+    assert!(hit(&warm, "lib") && hit(&warm, "main"));
+
+    project.write(
+        "lib.align",
+        &original.replace(
+            "pub fn parse(input: str) -> Result<Value, Error> = json.decode(input)",
+            "pub fn parse(input: str) -> Result<Value, Error> { value: Value := json.decode(input)?; return Ok(value) }",
+        ),
+    );
+    let body_edited = project.build(UnitReuse::Allowed);
+    assert!(!hit(&body_edited, "lib"));
+    assert!(hit(&body_edited, "main"), "a body-only edit preserves descriptor/interface identity");
+    assert_eq!(
+        &body_edited
+            .units
+            .iter()
+            .find(|unit| unit.unit == "lib")
+            .unwrap()
+            .summary
+            .owned_json_descriptors[0]
+            .envelope,
+        &cold_descriptor
+    );
+    project.write("lib.align", original);
+    let restored = project.build(UnitReuse::Allowed);
+    assert!(hit(&restored, "lib") && hit(&restored, "main"));
+
+    project.write(
+        "lib.align",
+        &original.replace(
+            "pub Value { id: string, tags: array<string>, note: Option<string> }",
+            "pub Value { id: string, enabled: bool, tags: array<string>, note: Option<string> }",
+        ),
+    );
+    let edited = project.build(UnitReuse::Allowed);
+    assert!(!hit(&edited, "lib"));
+    assert!(!hit(&edited, "main"), "descriptor/public-layout edits invalidate consumers");
+
+    project.write("lib.align", original);
+    let reverted = project.build(UnitReuse::Allowed);
+    assert!(hit(&reverted, "lib") && hit(&reverted, "main"));
+    let reverted_descriptor = &reverted
+        .units
+        .iter()
+        .find(|unit| unit.unit == "lib")
+        .unwrap()
+        .summary
+        .owned_json_descriptors[0]
+        .envelope;
+    assert_eq!(reverted_descriptor, &cold_descriptor);
+}
+
 // ---- P1 / P3: what an edit invalidates -------------------------------------------------------
 
 #[test]

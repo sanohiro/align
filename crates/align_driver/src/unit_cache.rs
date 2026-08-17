@@ -551,7 +551,18 @@ pub fn lookup(root: &Path, key: &UnitKey, source_len: usize) -> UnitLookup {
             // Steps 8 then 9, in that order: decode the summary before range-checking the spans, so
             // a manifest that fails both reports the earlier cause. Both are past the key
             // comparison, so both mean damage to an entry that provably is ours.
-            let Ok(summary) = align_interface::deserialize(&entry.summary_bytes) else {
+            let object_format = match key.object_format {
+                0 => align_interface::OwnedJsonObjectFormat::Elf,
+                1 => align_interface::OwnedJsonObjectFormat::MachO,
+                _ => return corrupt(&path),
+            };
+            let target = align_interface::OwnedJsonTarget {
+                triple: key.target_triple.clone(),
+                object_format,
+            };
+            let Ok(summary) =
+                align_interface::deserialize_for_target(&entry.summary_bytes, &target)
+            else {
                 return corrupt(&path);
             };
             if entry
@@ -695,7 +706,7 @@ mod tests {
         // -- key region --
         "01000000",                         // key_format_version = 1
         "01000000000000000200000000000000", // compiler_fingerprint = Hash128 { lo: 1, hi: 2 }
-        "06000000",                         // frontend_schema = align_interface::FORMAT_VERSION = 6
+        "07000000",                         // frontend_schema = align_interface::FORMAT_VERSION = 7
         "04000000",                         // env_toggles: exactly 4
         "10000000414c49474e5f434f4e53545f504f4f4c", "00",             // ALIGN_CONST_POOL   Absent
         "12000000414c49474e5f4e4545444c455f484f495354", "01", "030000006f6666", // ..NEEDLE_HOIST Present("off")
@@ -783,8 +794,8 @@ mod tests {
     fn golden_vector_semantic_to_byte() {
         assert_eq!(
             align_interface::FORMAT_VERSION,
-            6,
-            "the golden vector transcribes frontend_schema = 6; re-transcribe it if the interface \
+            7,
+            "the golden vector transcribes frontend_schema = 7; re-transcribe it if the interface \
              codec version moves"
         );
         let prefix = from_hex(GOLDEN_PREFIX_HEX);

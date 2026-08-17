@@ -73,6 +73,11 @@ fn transparent_record_diverges(record: BodyRecord<'_>) -> bool {
         BodyRecord::TemplatePart(part) => match part {
             TemplatePart::Hole(expression)
             | TemplatePart::JsonStr(expression)
+            | TemplatePart::OwnedJsonString { access: expression }
+            | TemplatePart::OwnedJsonOptionStringField {
+                access: expression, ..
+            }
+            | TemplatePart::OwnedJsonStringArray { access: expression }
             | TemplatePart::OptionField {
                 access: expression, ..
             }
@@ -324,7 +329,11 @@ fn walk_body_records<'a>(
                 StageKind::WhereField { .. } | StageKind::Project { .. } => {}
             },
             BodyRecord::TemplatePart(part) => match part {
-                TemplatePart::Hole(expr) | TemplatePart::JsonStr(expr) => {
+                TemplatePart::Hole(expr)
+                | TemplatePart::JsonStr(expr)
+                | TemplatePart::OwnedJsonString { access: expr }
+                | TemplatePart::OwnedJsonOptionStringField { access: expr, .. }
+                | TemplatePart::OwnedJsonStringArray { access: expr } => {
                     work.push((BodyRecord::Expr(expr), child_depth));
                 }
                 TemplatePart::OptionField { access, .. }
@@ -719,6 +728,7 @@ fn walk_body_records<'a>(
                 | ExprKind::StrTrim { recv, .. }
                 | ExprKind::ArrayToSoa { source: recv, .. }
                 | ExprKind::JsonDecode { input: recv, .. }
+                | ExprKind::JsonOwnedDecode { input: recv, .. }
                 | ExprKind::JsonDecodeArray { input: recv, .. }
                 | ExprKind::JsonDecodeScalar { input: recv, .. }
                 | ExprKind::JsonDecodeStructArray { input: recv, .. }
@@ -972,7 +982,7 @@ fn walk_body_records<'a>(
                     );
                     work.push((BodyRecord::Expr(dst), child_depth));
                 }
-                ExprKind::Template(parts) => {
+                ExprKind::Template(parts) | ExprKind::JsonOwnedEncode { parts, .. } => {
                     work.extend(
                         parts
                             .iter()
@@ -980,6 +990,9 @@ fn walk_body_records<'a>(
                     );
                 }
                 ExprKind::JsonEncodeBounded {
+                    parts, max_bytes, ..
+                }
+                | ExprKind::JsonOwnedEncodeBounded {
                     parts, max_bytes, ..
                 } => {
                     work.extend(

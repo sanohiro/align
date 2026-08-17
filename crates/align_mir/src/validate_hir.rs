@@ -2607,6 +2607,8 @@ impl<'a> LocalScopeValidator<'a> {
             | hir::ExprKind::SoaColumn { base: local, .. }
             | hir::ExprKind::IndexField { base: local, .. }
             | hir::ExprKind::JsonEncodeBounded { base: local, .. }
+            | hir::ExprKind::JsonOwnedEncode { base: local, .. }
+            | hir::ExprKind::JsonOwnedEncodeBounded { base: local, .. }
             | hir::ExprKind::ArrayGroupAgg { base: local, .. }
             | hir::ExprKind::ArrayGroupAggMulti { base: local, .. }
             | hir::ExprKind::ArrayDictEncode { base: local, .. } => Some(*local),
@@ -3778,13 +3780,28 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::Template(parts) => {
                 !parts.is_empty() && self.template_parts_envelope_ok(parts)
             }
+            hir::ExprKind::JsonOwnedEncode { base, parts } => {
+                self.local_ok(context, *base)
+                    && !parts.is_empty()
+                    && self.template_parts_envelope_ok(parts)
+                    && self.owned_json_parts_match_source(*base, parts, context)
+            }
             hir::ExprKind::JsonEncodeBounded { parts, .. } => {
                 !parts.is_empty() && self.json_encode_parts_envelope_ok(parts)
+            }
+            hir::ExprKind::JsonOwnedEncodeBounded { base, parts, .. } => {
+                self.local_ok(context, *base)
+                    && !parts.is_empty()
+                    && self.template_parts_envelope_ok(parts)
+                    && self.owned_json_parts_match_source(*base, parts, context)
             }
             hir::ExprKind::JsonDecode { struct_id, .. }
             | hir::ExprKind::JsonDecodeStructArray { struct_id, .. }
             | hir::ExprKind::JsonScan { struct_id, .. } => {
                 self.json_struct_descriptor_ok(*struct_id, false)
+            }
+            hir::ExprKind::JsonOwnedDecode { struct_id, .. } => {
+                self.owned_json_struct_ok(*struct_id)
             }
             hir::ExprKind::JsonDecodeArray { elem, .. }
             | hir::ExprKind::JsonDecodeScalar { scalar: elem, .. } => {
@@ -4755,6 +4772,11 @@ impl<'a> BodyValidator<'a> {
     fn template_parts_envelope_ok(&self, parts: &[hir::TemplatePart]) -> bool {
         parts.iter().all(|part| match part {
             hir::TemplatePart::Text(_) | hir::TemplatePart::Hole(_) | hir::TemplatePart::JsonStr(_) => true,
+            hir::TemplatePart::OwnedJsonString { .. }
+            | hir::TemplatePart::OwnedJsonStringArray { .. } => true,
+            hir::TemplatePart::OwnedJsonOptionStringField { name, .. } => {
+                valid_declaration_name(name)
+            }
             hir::TemplatePart::OptionField { name, .. } => valid_declaration_name(name),
             hir::TemplatePart::OptionStructField {
                 name, struct_id, ..
@@ -4774,6 +4796,135 @@ impl<'a> BodyValidator<'a> {
                     && self.json_union_descriptor_ok(*enum_id, true)
             }
         })
+    }
+
+    fn owned_json_struct_ok(&self, struct_id: u32) -> bool {
+        let Some(definition) = self.program.structs.get(struct_id as usize) else {
+            return false;
+        };
+        if definition.c_repr || definition.align.is_some() {
+            return false;
+        }
+        let selected = definition.fields.iter().any(|field| {
+            matches!(
+                field.ty,
+                Ty::String | Ty::Option(Scalar::String) | Ty::DynArray(Scalar::String)
+            )
+        });
+        selected
+            && definition.fields.iter().all(|field| {
+                matches!(
+                    field.ty,
+                    Ty::Int(align_sema::IntTy { bits: 8 | 16 | 32 | 64, .. })
+                        | Ty::Bool
+                        | Ty::String
+                        | Ty::Option(Scalar::String)
+                        | Ty::DynArray(Scalar::String)
+                )
+            })
+            && {
+                let plan = align_sema::drop_plan(
+                    Ty::Struct(struct_id),
+                    &self.program.structs,
+                    &self.program.enums,
+                    &self.program.tagged_types,
+                );
+                plan.is_valid() && plan.needs_drop()
+            }
+    }
+
+    fn owned_json_parts_match_source(
+        &self,
+        base: hir::LocalId,
+        parts: &[hir::TemplatePart],
+        context: &BodyContext,
+    ) -> bool {
+        fn access_matches(
+            validator: &BodyValidator<'_>,
+            expression: &hir::Expr,
+            base: hir::LocalId,
+            field: u32,
+            ty: Ty,
+        ) -> bool {
+            validator.body_ty_matches(expression.ty, ty)
+                && matches!(
+                    &expression.kind,
+                    hir::ExprKind::Field { root, path }
+                        if *root == base && path.as_slice() == [field]
+                )
+        }
+
+        let Some(Ty::Struct(struct_id)) = self.local_type(context, base) else {
+            return false;
+        };
+        if !self.owned_json_struct_ok(struct_id) {
+            return false;
+        }
+        let Some(definition) = self.program.structs.get(struct_id as usize) else {
+            return false;
+        };
+        let has_option = definition
+            .fields
+            .iter()
+            .any(|field| field.ty == Ty::Option(Scalar::String));
+        let mut next = 0usize;
+        let mut take = |predicate: &dyn Fn(&hir::TemplatePart) -> bool| {
+            let matched = parts.get(next).is_some_and(predicate);
+            next += usize::from(matched);
+            matched
+        };
+        if !take(&|part| matches!(part, hir::TemplatePart::Text(text) if text == "{")) {
+            return false;
+        }
+        for (index, field) in definition.fields.iter().enumerate() {
+            if field.ty == Ty::Option(Scalar::String) {
+                if !take(&|part| matches!(
+                    part,
+                    hir::TemplatePart::OwnedJsonOptionStringField { access, name }
+                        if name == &field.name
+                            && access_matches(self, access, base, index as u32, field.ty)
+                )) {
+                    return false;
+                }
+                continue;
+            }
+            let separator = if has_option || index == 0 { "" } else { "," };
+            let prefix = format!("{separator}\"{}\":", field.name);
+            if !take(&|part| matches!(part, hir::TemplatePart::Text(text) if text == &prefix)) {
+                return false;
+            }
+            let value_ok = match field.ty {
+                Ty::String => take(&|part| matches!(
+                    part,
+                    hir::TemplatePart::OwnedJsonString { access }
+                        if access_matches(self, access, base, index as u32, field.ty)
+                )),
+                Ty::DynArray(Scalar::String) => take(&|part| matches!(
+                    part,
+                    hir::TemplatePart::OwnedJsonStringArray { access }
+                        if access_matches(self, access, base, index as u32, field.ty)
+                )),
+                Ty::Int(_) | Ty::Bool => take(&|part| matches!(
+                    part,
+                    hir::TemplatePart::Hole(access)
+                        if access_matches(self, access, base, index as u32, field.ty)
+                )),
+                _ => false,
+            };
+            if !value_ok {
+                return false;
+            }
+            if has_option
+                && !take(&|part| matches!(part, hir::TemplatePart::Text(text) if text == ","))
+            {
+                return false;
+            }
+        }
+        if has_option && !take(&|part| matches!(part, hir::TemplatePart::PopComma)) {
+            return false;
+        }
+        take(&|part| matches!(part, hir::TemplatePart::Text(text) if text == "}"))
+            && next == parts.len()
     }
 
     fn json_encode_parts_envelope_ok(&self, parts: &[hir::TemplatePart]) -> bool {
@@ -5796,18 +5947,21 @@ impl<'a> BodyValidator<'a> {
                 push_expr!(index, context.clone());
                 push_expr!(recv, context.clone());
             }
-            hir::ExprKind::Template(parts) => {
+            hir::ExprKind::Template(parts) | hir::ExprKind::JsonOwnedEncode { parts, .. } => {
                 for part in parts.iter().rev() {
                     match part {
                         hir::TemplatePart::Hole(expr)
-                        | hir::TemplatePart::JsonStr(expr) => {
+                        | hir::TemplatePart::JsonStr(expr)
+                        | hir::TemplatePart::OwnedJsonString { access: expr }
+                        | hir::TemplatePart::OwnedJsonStringArray { access: expr } => {
                             push_expr!(expr, context.clone());
                         }
                         hir::TemplatePart::OptionField { access, .. }
                         | hir::TemplatePart::OptionStructField { access, .. }
                         | hir::TemplatePart::StructArrayField { access, .. }
                         | hir::TemplatePart::ScalarArrayField { access, .. }
-                        | hir::TemplatePart::UnionValue { access, .. } => {
+                        | hir::TemplatePart::UnionValue { access, .. }
+                        | hir::TemplatePart::OwnedJsonOptionStringField { access, .. } => {
                             push_expr!(access, context.clone());
                         }
                         hir::TemplatePart::Text(_) | hir::TemplatePart::PopComma => {}
@@ -5816,6 +5970,9 @@ impl<'a> BodyValidator<'a> {
             }
             hir::ExprKind::JsonEncodeBounded {
                 parts, max_bytes, ..
+            }
+            | hir::ExprKind::JsonOwnedEncodeBounded {
+                parts, max_bytes, ..
             } => {
                 // The source accesses encoded by `parts` are evaluated before the explicit limit.
                 // Push in reverse because this worklist is LIFO.
@@ -5823,14 +5980,17 @@ impl<'a> BodyValidator<'a> {
                 for part in parts.iter().rev() {
                     match part {
                         hir::TemplatePart::Hole(expr)
-                        | hir::TemplatePart::JsonStr(expr) => {
+                        | hir::TemplatePart::JsonStr(expr)
+                        | hir::TemplatePart::OwnedJsonString { access: expr }
+                        | hir::TemplatePart::OwnedJsonStringArray { access: expr } => {
                             push_expr!(expr, context.clone());
                         }
                         hir::TemplatePart::OptionField { access, .. }
                         | hir::TemplatePart::OptionStructField { access, .. }
                         | hir::TemplatePart::StructArrayField { access, .. }
                         | hir::TemplatePart::ScalarArrayField { access, .. }
-                        | hir::TemplatePart::UnionValue { access, .. } => {
+                        | hir::TemplatePart::UnionValue { access, .. }
+                        | hir::TemplatePart::OwnedJsonOptionStringField { access, .. } => {
                             push_expr!(access, context.clone());
                         }
                         hir::TemplatePart::Text(_) | hir::TemplatePart::PopComma => {}
@@ -5838,6 +5998,7 @@ impl<'a> BodyValidator<'a> {
                 }
             }
             hir::ExprKind::JsonDecode { input, .. }
+            | hir::ExprKind::JsonOwnedDecode { input, .. }
             | hir::ExprKind::JsonDecodeArray { input, .. }
             | hir::ExprKind::JsonDecodeScalar { input, .. }
             | hir::ExprKind::JsonDecodeStructArray { input, .. }
@@ -9163,6 +9324,9 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::Template(parts) => {
                 self.derive_template_expression(parts, context)
             }
+            hir::ExprKind::JsonOwnedEncode { base, parts } => {
+                self.derive_owned_json_encode_expression(*base, parts, context)
+            }
             hir::ExprKind::JsonEncodeBounded {
                 base,
                 parts,
@@ -9187,8 +9351,45 @@ impl<'a> BodyValidator<'a> {
                     breaks,
                 ))
             }
+            hir::ExprKind::JsonOwnedEncodeBounded {
+                base,
+                parts,
+                max_bytes,
+            } => {
+                let (template_ty, template_falls, template_breaks) =
+                    self.derive_owned_json_encode_expression(*base, parts, context)?;
+                let limit = self.expr_flow(max_bytes)?;
+                if template_ty != Ty::Str || limit.ty != i64_ty() {
+                    return None;
+                }
+                let template = BodyFlow {
+                    ty: template_ty,
+                    falls: template_falls,
+                    breaks: template_breaks,
+                };
+                let error = self.error_id()?;
+                let (falls, breaks) = strict_flow(&[template, limit]);
+                Some((
+                    Ty::Result(Scalar::String, Scalar::Enum(error)),
+                    falls,
+                    breaks,
+                ))
+            }
             hir::ExprKind::JsonDecode { struct_id, input } => {
                 self.derive_json_decode_struct(*struct_id, input, context, false)
+            }
+            hir::ExprKind::JsonOwnedDecode { struct_id, input } => {
+                let flow = self.expr_flow(input)?;
+                if flow.ty != Ty::Str || !self.owned_json_struct_ok(*struct_id) {
+                    return None;
+                }
+                let error = self.error_id()?;
+                let (falls, breaks) = strict_flow(&[flow]);
+                Some((
+                    Ty::Result(Scalar::Struct(*struct_id), Scalar::Enum(error)),
+                    falls,
+                    breaks,
+                ))
             }
             hir::ExprKind::JsonDecodeArray { elem, input } => {
                 self.derive_json_decode_array(*elem, input, context)
@@ -9403,6 +9604,9 @@ impl<'a> BodyValidator<'a> {
                     }
                     flows.push(flow);
                 }
+                hir::TemplatePart::OwnedJsonString { .. }
+                | hir::TemplatePart::OwnedJsonOptionStringField { .. }
+                | hir::TemplatePart::OwnedJsonStringArray { .. } => return None,
                 hir::TemplatePart::OptionField { access, name } => {
                     if !valid_declaration_name(name)
                         || object_has_option.last().is_none()
@@ -9809,6 +10013,9 @@ impl<'a> BodyValidator<'a> {
                     }
                     flow
                 }
+                hir::TemplatePart::OwnedJsonString { .. }
+                | hir::TemplatePart::OwnedJsonOptionStringField { .. }
+                | hir::TemplatePart::OwnedJsonStringArray { .. } => return None,
                 hir::TemplatePart::OptionField { access, name } => {
                     let flow = self.expr_flow(access)?;
                     if !valid_declaration_name(name)
@@ -9860,6 +10067,64 @@ impl<'a> BodyValidator<'a> {
                     }
                     flow
                 }
+            };
+            flows.push(flow);
+        }
+        let (falls, breaks) = strict_flow(&flows);
+        Some((Ty::Str, falls, breaks))
+    }
+
+    fn derive_owned_json_encode_expression(
+        &self,
+        base: hir::LocalId,
+        parts: &[hir::TemplatePart],
+        context: &BodyContext,
+    ) -> Option<(Ty, bool, Vec<Ty>)> {
+        if !self.owned_json_parts_match_source(base, parts, context) {
+            return None;
+        }
+        let mut flows = Vec::new();
+        for part in parts {
+            let flow = match part {
+                hir::TemplatePart::Text(_) | hir::TemplatePart::PopComma => continue,
+                hir::TemplatePart::Hole(expression) => {
+                    let flow = self.expr_flow(expression)?;
+                    if !matches!(flow.ty, Ty::Int(integer) if valid_int(integer.bits))
+                        && flow.ty != Ty::Bool
+                    {
+                        return None;
+                    }
+                    flow
+                }
+                hir::TemplatePart::OwnedJsonString { access } => {
+                    let flow = self.expr_flow(access)?;
+                    if flow.ty != Ty::String {
+                        return None;
+                    }
+                    flow
+                }
+                hir::TemplatePart::OwnedJsonOptionStringField { access, name } => {
+                    let flow = self.expr_flow(access)?;
+                    if !valid_declaration_name(name)
+                        || flow.ty != Ty::Option(Scalar::String)
+                    {
+                        return None;
+                    }
+                    flow
+                }
+                hir::TemplatePart::OwnedJsonStringArray { access } => {
+                    let flow = self.expr_flow(access)?;
+                    if flow.ty != Ty::DynArray(Scalar::String) {
+                        return None;
+                    }
+                    flow
+                }
+                hir::TemplatePart::JsonStr(_)
+                | hir::TemplatePart::OptionField { .. }
+                | hir::TemplatePart::OptionStructField { .. }
+                | hir::TemplatePart::StructArrayField { .. }
+                | hir::TemplatePart::ScalarArrayField { .. }
+                | hir::TemplatePart::UnionValue { .. } => return None,
             };
             flows.push(flow);
         }

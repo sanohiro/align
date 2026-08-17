@@ -55,6 +55,38 @@ fn cross_module_type_accepts() {
 }
 
 #[test]
+fn cross_module_owned_json_record_keeps_descriptor_and_ownership_parity() {
+    let owned = concat!(
+        "module owned\n",
+        "import core.json\n",
+        "pub Value { id: string, tags: array<string>, note: Option<string> }\n",
+        "pub fn parse(input: str) -> Result<Value, Error> = json.decode(input)\n",
+    );
+    let main = concat!(
+        "module main\n",
+        "import owned\n",
+        "fn main() -> Result<(), Error> {\n",
+        "  value := owned.parse(\"{\\\"id\\\":\\\"x\\\",\\\"tags\\\":[\\\"a\\\"]}\")?\n",
+        "  print(value.id.len())\n",
+        "  return Ok(())\n",
+        "}\n",
+    );
+    let result = assert_same_verdict(
+        "s1b-owned-json",
+        &[("owned.align", owned), ("main.align", main)],
+        "main.align",
+    );
+    assert!(!result.diags.has_errors());
+    let summary = result
+        .summaries
+        .iter()
+        .find(|summary| summary.unit == "owned")
+        .expect("owned summary");
+    assert_eq!(summary.owned_json_descriptors.len(), 1);
+    assert_eq!(summary.owned_json_descriptors[0].type_name, "Value");
+}
+
+#[test]
 fn cross_module_sum_type_accepts() {
     let shapes = concat!(
         "module shapes\n",

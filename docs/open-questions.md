@@ -4631,7 +4631,7 @@ recorded for the slice: `.at(i)`/`.get(k)` are linear at one nesting level (tape
 offsets make each hop O(1); use `elems()` for whole-level loops); an escaped string in `as_str()`
 unescapes into the arena (bump, bulk-freed — the one allocating accessor, documented).
 
-**Direct owned JSON records — SETTLED DESIGN (2026-08-17; implementation pending).** A direct
+**Direct owned JSON records — SETTLED AND IMPLEMENTED (2026-08-17).** A direct
 record with at least one `string`, `Option<string>`, or `array<string>` field selects one closed
 owned route. Its only other fields are required fixed-width integers or bool; borrowed text,
 floats, nested aggregates, other optionals, and explicit layout/alignment reject before allocation.
@@ -4704,7 +4704,7 @@ and it types from the binding annotation.
 json.decode(s)?` — SHIPPED, #539), `array<scalar>` struct fields (SHIPPED, #538), `Option<struct>`
 ENCODE (the B follow-up — SHIPPED, #540). Rule: any composition of supported constructors closes; the
 shipped v1 borrowed-JSON boundaries stay explicit (`array<string>` has ordinary deep Drop; the
-separately settled, implementation-pending direct-owned route supplies its only JSON
+separately settled and implemented direct-owned route supplies its only JSON
 descriptor/producer arm).
 **`array<Option<T>>` DEFERRED (not a JSON gap — a language-type gap).** The T1b sketch listed it as a
 "supported-constructor composition", but it is NOT one: an owned `array<T>`'s element is a

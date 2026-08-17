@@ -47,12 +47,18 @@
 
 mod codec;
 mod hash;
+mod owned_json;
 pub mod static_artifact;
 
 pub use codec::{
-    deserialize, encode_interface_surface, serialize, DecodeError, FORMAT_VERSION,
+    deserialize, deserialize_for_target, encode_interface_surface, serialize, DecodeError,
+    FORMAT_VERSION,
 };
 pub use hash::Hash128;
+pub use owned_json::{
+    encode_owned_json_descriptor, encode_owned_json_envelope, OwnedJsonInterfaceEntry,
+    OwnedJsonObjectFormat, OwnedJsonTarget,
+};
 pub use static_artifact::{
     decode_static_artifact, decode_static_command, decode_static_query, encode_static_command,
     encode_static_query, static_artifact_digest, static_options_hash, BindRetention, BindingEntry, CanonicalContract,
@@ -209,6 +215,9 @@ pub struct InterfaceSummary {
     pub fns: Vec<IFnSig>,
     /// Exported structs, sorted by name.
     pub structs: Vec<IStructDef>,
+    /// Target-bound descriptors for every exported, concrete direct-owned JSON record, in the same
+    /// name order as the selected subset of `structs`.
+    pub owned_json_descriptors: Vec<OwnedJsonInterfaceEntry>,
     /// Exported sum types, sorted by name.
     pub enums: Vec<IEnumDef>,
     /// Exported native resources, sorted by nominal name.
@@ -388,8 +397,16 @@ pub fn build_summaries(
     program: &align_sema::hir::Program,
     mir: &align_mir::Program,
     sources: &HashMap<String, String>,
-) -> Vec<InterfaceSummary> {
-    build_summaries_with_effects(modules, program, mir, sources, &HashMap::new())
+    target: &OwnedJsonTarget,
+) -> Result<Vec<InterfaceSummary>, String> {
+    build_summaries_with_effects(
+        modules,
+        program,
+        mir,
+        sources,
+        &HashMap::new(),
+        target,
+    )
 }
 
 /// Fingerprint the complete MIR program passed to one object-codegen invocation.
@@ -414,7 +431,8 @@ pub fn build_summaries_with_effects(
     mir: &align_mir::Program,
     sources: &HashMap<String, String>,
     external_effects: &HashMap<String, align_sema::FnEffect>,
-) -> Vec<InterfaceSummary> {
+    target: &OwnedJsonTarget,
+) -> Result<Vec<InterfaceSummary>, String> {
     let effects: HashMap<String, Effect> = align_sema::fn_effects(program, external_effects)
         .into_iter()
         .map(|(k, v)| (k, v.into()))
@@ -688,6 +706,9 @@ pub fn build_summaries_with_effects(
         resources.sort_by(|a, b| a.name.cmp(&b.name));
         consts.sort_by(|a, b| a.name.cmp(&b.name));
 
+        let owned_json_descriptors = owned_json::entries_for_structs(&structs, target)
+            .ok_or_else(|| format!("unit '{}' has an unencodable owned JSON record", m.path))?;
+
         let mut capabilities = caps_by_unit.get(&m.path).cloned().unwrap_or_default();
         capabilities.sort();
         capabilities.dedup();
@@ -697,6 +718,7 @@ pub fn build_summaries_with_effects(
             unit: m.path.clone(),
             fns,
             structs,
+            owned_json_descriptors,
             enums,
             resources,
             consts,
@@ -713,7 +735,7 @@ pub fn build_summaries_with_effects(
             impl_hash_by_unit.get(&m.path).copied().unwrap_or_else(|| Hash128::of(src.as_bytes()));
         summaries.push(summary);
     }
-    summaries
+    Ok(summaries)
 }
 
 /// Attribute each MIR function's capabilities to the unit that owns its base name, unioning per unit.

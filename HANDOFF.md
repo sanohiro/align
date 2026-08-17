@@ -306,9 +306,9 @@ facts must live in this repository.
   implementation is merged; Requests 11 and 12 are implemented, and Request 5's bounded-HTTP
   implementation is merged at `5aa5b23a`. Request 7 is `ALIGN_MERGED` through #850, including its
   evidence boundary, decoded-owner prerequisite, and escaped-string implementation. Request 15 is
-  also `ALIGN_MERGED`; Requests 9, 13, and 14 remain proposed in
-  `../align-llm/docs/align-requests.md`. Request 9's accepted Align design is
-  `docs/impl/24-owned-json-plan.md`; implementation is the next Align-owned capability.
+  also `ALIGN_MERGED`. Request 9's direct owned-record JSON implementation is complete against
+  `docs/impl/24-owned-json-plan.md`; Requests 13 and 14 remain proposed in
+  `../align-llm/docs/align-requests.md`.
 
 Consumer-gated deferrals that remain intentional:
 

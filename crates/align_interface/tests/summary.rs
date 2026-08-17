@@ -4,11 +4,12 @@
 use std::collections::HashMap;
 
 use align_interface::{
-    DecodeError, Effect, FORMAT_VERSION, Hash128, IParam, IType, ITypeParam,
+    DecodeError, Effect, Hash128, IParam, IType, ITypeParam,
     ImportCompatibilityError,
     InterfaceSummary, ParamMode, ReturnBorrowSummary, ReturnRegionSummary, build_summaries,
-    deserialize, encode_interface_surface, serialize, summary_to_source,
+    deserialize, deserialize_for_target, encode_interface_surface, serialize, summary_to_source,
     validate_for_import,
+    OwnedJsonObjectFormat, OwnedJsonTarget,
 };
 
 /// One in-memory source module for a test program.
@@ -149,7 +150,12 @@ fn summaries(units: &[Unit]) -> Vec<InterfaceSummary> {
     let mir = align_mir::lower_program(&hir);
     let sources: HashMap<String, String> =
         units.iter().map(|u| (u.path.to_string(), u.src.clone())).collect();
-    build_summaries(&modules, &hir, &mir, &sources)
+    let target = OwnedJsonTarget {
+        triple: "x86_64-pc-linux-gnu".to_string(),
+        object_format: OwnedJsonObjectFormat::Elf,
+    };
+    build_summaries(&modules, &hir, &mir, &sources, &target)
+        .expect("checked fixtures have encodable interface summaries")
 }
 
 /// A single-entry-module program.
@@ -767,10 +773,10 @@ fn summary_source_deduplicates_builtin_and_dependency_imports() {
 fn deserialize_unknown_version_fails_closed() {
     let sums = one("pub fn f() -> i64 = 1\nfn main() -> i32 = 0\n");
     let mut bytes = serialize(&sums[0]);
-    // Corrupt the leading format-version u32.
-    bytes[0] = bytes[0].wrapping_add(7);
+    // A format-6 artifact is rejected before any later list or descriptor byte is read.
+    bytes[..4].copy_from_slice(&6u32.to_le_bytes());
     match deserialize(&bytes) {
-        Err(DecodeError::UnknownVersion(v)) => assert_ne!(v, FORMAT_VERSION),
+        Err(DecodeError::UnknownVersion(v)) => assert_eq!(v, 6),
         other => panic!("expected UnknownVersion, got {other:?}"),
     }
 }
@@ -785,6 +791,35 @@ fn deserialize_truncated_and_trailing_fail_closed() {
     let mut extra = bytes.clone();
     extra.push(0);
     assert_eq!(deserialize(&extra), Err(DecodeError::TrailingBytes));
+}
+
+#[test]
+fn exported_owned_json_records_carry_one_target_bound_format_7_descriptor() {
+    let summary = one(
+        "pub Owned { id: string, n: u64, tags: array<string>, note: Option<string> }\n\
+         Private { text: string }\n\
+         pub Generic<T> { value: T, text: string }\n\
+         fn main() -> i32 = 0\n",
+    )
+    .remove(0);
+    assert_eq!(summary.owned_json_descriptors.len(), 1);
+    assert_eq!(summary.owned_json_descriptors[0].type_name, "Owned");
+    let target = OwnedJsonTarget {
+        triple: "x86_64-pc-linux-gnu".to_string(),
+        object_format: OwnedJsonObjectFormat::Elf,
+    };
+    assert_eq!(
+        deserialize_for_target(&serialize(&summary), &target),
+        Ok(summary.clone())
+    );
+    let wrong = OwnedJsonTarget {
+        triple: "aarch64-unknown-linux-gnu".to_string(),
+        object_format: OwnedJsonObjectFormat::Elf,
+    };
+    assert_eq!(
+        deserialize_for_target(&serialize(&summary), &wrong),
+        Err(DecodeError::InvalidOwnedJson("target triple mismatch"))
+    );
 }
 
 #[test]
@@ -2395,7 +2430,7 @@ fn parameter_mode_codec_has_a_byte_golden_and_rejects_unknown_tags() {
     let hex = surface.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
     assert_eq!(
         hex,
-        "06000000040000006d61696e0100000007000000696e73706563740000000001000000010005000000736c696365010000000003000000693634000000000003000000693634000000000000000000000000000000000000000000000000000000000000"
+        "07000000040000006d61696e0100000007000000696e73706563740000000001000000010005000000736c69636501000000000300000069363400000000000300000069363400000000000000000000000000000000000000000000000000000000000000000000"
     );
 
     let mut artifact = serialize(&summary);
@@ -2413,21 +2448,21 @@ fn parameter_mode_codec_has_a_byte_golden_and_rejects_unknown_tags() {
 
     // This one-function surface ends with the function's borrow tag, region tag, cleanup ABI,
     // effect, empty parallel-transfer sequence, resource-hook-body bit, generic body option, then
-    // the empty top-level struct/enum/resource/const sequences.
+    // the empty top-level struct/owned-descriptor/enum/resource/const sequences.
     let mut bad_borrow = serialize(&summary);
-    bad_borrow[surface.len() - 26] = 0xff;
+    bad_borrow[surface.len() - 30] = 0xff;
     assert_eq!(
         deserialize(&bad_borrow),
         Err(DecodeError::BadTag { what: "return-borrow summary", tag: 0xff })
     );
     let mut bad_region = serialize(&summary);
-    bad_region[surface.len() - 25] = 0xff;
+    bad_region[surface.len() - 29] = 0xff;
     assert_eq!(
         deserialize(&bad_region),
         Err(DecodeError::BadTag { what: "return-region summary", tag: 0xff })
     );
     let mut bad_cleanup = serialize(&summary);
-    bad_cleanup[surface.len() - 24] = 0xff;
+    bad_cleanup[surface.len() - 28] = 0xff;
     assert_eq!(
         deserialize(&bad_cleanup),
         Err(DecodeError::BadTag {

@@ -6384,6 +6384,14 @@ fn body_statement_expression_mut<'a>(
     expression
 }
 
+fn body_first_let_init_mut<'a>(program: &'a mut hir::Program, name: &str) -> &'a mut hir::Expr {
+    let statement = body_first_statement_mut(program, name);
+    let hir::Stmt::Let { init, .. } = statement else {
+        panic!("statement fixture {name} does not start with a binding")
+    };
+    init
+}
+
 fn body_value_expression_mut<'a>(
     program: &'a mut hir::Program,
     name: &str,
@@ -10271,6 +10279,170 @@ fn hir_body_validator_pipeline_template_json_group_control_flow() {
     assert!(!body_core_metadata_is_valid(&reject));
 }
 
+fn assert_owned_json_body_mutation(
+    base: &hir::Program,
+    label: &str,
+    mutate: impl FnOnce(&mut hir::Program),
+) {
+    let mut malformed = base.clone();
+    mutate(&mut malformed);
+    assert_body_entrypoints_empty(label, &malformed);
+}
+
+#[test]
+fn owned_json_checked_hir_mutation_sweep_fails_closed_at_all_lowering_entrypoints() {
+    let source = r#"
+import core.json
+Owned { text: string, note: Option<string>, tags: array<string>, count: u64 }
+fn owned_decode(input: str) -> Result<Owned, Error> = json.decode(input)
+fn owned_encode(value: Owned) -> i32 {
+  output := json.encode(value)
+  return output.len() as i32
+}
+fn owned_bounded(value: Owned, limit: i64) -> i32 {
+  output := json.encode_bounded(value, limit)
+  return match output { Ok(text) => text.len() as i32, Err(_) => -1 }
+}
+fn main() -> i32 = 0
+"#;
+    let base = checked_source_program(source);
+    assert!(
+        align_sema::checked_hir_body_facts_are_valid(&base),
+        "the producer's owned JSON HIR must survive independent replay",
+    );
+    assert!(body_core_metadata_is_valid(&base));
+    assert!(!is_empty(&lower_program(&base)));
+
+    assert_owned_json_body_mutation(&base, "owned-decode-unknown-struct", |program| {
+        let expression = body_value_expression_mut(program, "owned_decode");
+        let hir::ExprKind::JsonOwnedDecode { struct_id, .. } = &mut expression.kind else {
+            panic!("owned decode fixture lost its discriminator")
+        };
+        *struct_id = u32::MAX;
+    });
+    assert_owned_json_body_mutation(&base, "owned-decode-wrong-input", |program| {
+        let expression = body_value_expression_mut(program, "owned_decode");
+        let hir::ExprKind::JsonOwnedDecode { input, .. } = &mut expression.kind else {
+            panic!("owned decode fixture lost its discriminator")
+        };
+        input.kind = hir::ExprKind::Bool(true);
+        input.ty = Ty::Bool;
+    });
+    assert_owned_json_body_mutation(&base, "owned-decode-wrong-result", |program| {
+        body_value_expression_mut(program, "owned_decode").ty = Ty::Str;
+    });
+    assert_owned_json_body_mutation(&base, "owned-decode-borrowed-discriminator", |program| {
+        let expression = body_value_expression_mut(program, "owned_decode");
+        let hir::ExprKind::JsonOwnedDecode { struct_id, input } = &mut expression.kind else {
+            panic!("owned decode fixture lost its discriminator")
+        };
+        expression.kind = hir::ExprKind::JsonDecode {
+            struct_id: *struct_id,
+            input: input.clone(),
+        };
+    });
+    assert_owned_json_body_mutation(&base, "owned-decode-layout-attribute", |program| {
+        program.structs[0].c_repr = true;
+    });
+    assert_owned_json_body_mutation(&base, "owned-decode-mixed-graph", |program| {
+        program.structs[0].fields[0].ty = Ty::Str;
+    });
+
+    assert_owned_json_body_mutation(&base, "owned-encode-unknown-base", |program| {
+        let expression = body_first_let_init_mut(program, "owned_encode");
+        let hir::ExprKind::JsonOwnedEncode { base, .. } = &mut expression.kind else {
+            panic!("owned encode fixture lost its discriminator")
+        };
+        *base = u32::MAX;
+    });
+    assert_owned_json_body_mutation(&base, "owned-encode-empty-plan", |program| {
+        let expression = body_first_let_init_mut(program, "owned_encode");
+        let hir::ExprKind::JsonOwnedEncode { parts, .. } = &mut expression.kind else {
+            panic!("owned encode fixture lost its discriminator")
+        };
+        parts.clear();
+    });
+    assert_owned_json_body_mutation(&base, "owned-encode-static-byte", |program| {
+        let expression = body_first_let_init_mut(program, "owned_encode");
+        let hir::ExprKind::JsonOwnedEncode { parts, .. } = &mut expression.kind else {
+            panic!("owned encode fixture lost its discriminator")
+        };
+        parts[1] = hir::TemplatePart::Text("\"wrong\":".to_string());
+    });
+    assert_owned_json_body_mutation(&base, "owned-encode-part-kind", |program| {
+        let expression = body_first_let_init_mut(program, "owned_encode");
+        let hir::ExprKind::JsonOwnedEncode { parts, .. } = &mut expression.kind else {
+            panic!("owned encode fixture lost its discriminator")
+        };
+        let hir::TemplatePart::OwnedJsonString { access } = parts.remove(2) else {
+            panic!("owned encode fixture lost its string part")
+        };
+        parts.insert(2, hir::TemplatePart::Hole(access));
+    });
+    assert_owned_json_body_mutation(&base, "owned-encode-field-access", |program| {
+        let expression = body_first_let_init_mut(program, "owned_encode");
+        let hir::ExprKind::JsonOwnedEncode { parts, .. } = &mut expression.kind else {
+            panic!("owned encode fixture lost its discriminator")
+        };
+        let hir::TemplatePart::OwnedJsonString { access } = &mut parts[2] else {
+            panic!("owned encode fixture lost its string part")
+        };
+        let hir::ExprKind::Field { path, .. } = &mut access.kind else {
+            panic!("owned string part lost its field access")
+        };
+        path[0] = 2;
+    });
+    assert_owned_json_body_mutation(&base, "owned-encode-option-name", |program| {
+        let expression = body_first_let_init_mut(program, "owned_encode");
+        let hir::ExprKind::JsonOwnedEncode { parts, .. } = &mut expression.kind else {
+            panic!("owned encode fixture lost its discriminator")
+        };
+        let option = parts.iter_mut().find_map(|part| match part {
+            hir::TemplatePart::OwnedJsonOptionStringField { name, .. } => Some(name),
+            _ => None,
+        });
+        *option.unwrap_or_else(|| panic!("owned encode fixture lost its optional field")) =
+            "other".to_string();
+    });
+    assert_owned_json_body_mutation(&base, "owned-encode-array-kind", |program| {
+        let expression = body_first_let_init_mut(program, "owned_encode");
+        let hir::ExprKind::JsonOwnedEncode { parts, .. } = &mut expression.kind else {
+            panic!("owned encode fixture lost its discriminator")
+        };
+        let array = parts
+            .iter_mut()
+            .find(|part| matches!(part, hir::TemplatePart::OwnedJsonStringArray { .. }))
+            .unwrap_or_else(|| panic!("owned encode fixture lost its array field"));
+        let access = match array {
+            hir::TemplatePart::OwnedJsonStringArray { access } => access.clone(),
+            _ => panic!("owned array part lost its field access"),
+        };
+        *array = hir::TemplatePart::OwnedJsonString { access };
+    });
+    assert_owned_json_body_mutation(&base, "owned-encode-wrong-result", |program| {
+        body_first_let_init_mut(program, "owned_encode").ty = Ty::String;
+    });
+
+    assert_owned_json_body_mutation(&base, "owned-bounded-wrong-limit", |program| {
+        let expression = body_first_let_init_mut(program, "owned_bounded");
+        let hir::ExprKind::JsonOwnedEncodeBounded { max_bytes, .. } = &mut expression.kind else {
+            panic!("owned bounded fixture lost its discriminator")
+        };
+        max_bytes.kind = hir::ExprKind::Bool(true);
+        max_bytes.ty = Ty::Bool;
+    });
+    assert_owned_json_body_mutation(&base, "owned-bounded-wrong-result", |program| {
+        body_first_let_init_mut(program, "owned_bounded").ty = Ty::Error;
+    });
+    assert_owned_json_body_mutation(&base, "owned-bounded-reordered-plan", |program| {
+        let expression = body_first_let_init_mut(program, "owned_bounded");
+        let hir::ExprKind::JsonOwnedEncodeBounded { parts, .. } = &mut expression.kind else {
+            panic!("owned bounded fixture lost its discriminator")
+        };
+        parts.swap(1, 2);
+    });
+}
+
 #[test]
 fn request11_process_rows_match_the_producer() {
     let mut program = baseline_program();
@@ -10512,7 +10684,7 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        variants, 260,
+        variants, 263,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }

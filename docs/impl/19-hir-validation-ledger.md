@@ -742,12 +742,12 @@ means:
 | `ArrayGroupAggMulti` | `env[base,struct_id,key_field,aggs,source]`: source is producer-supported AosStr first cut; key is Str; nonempty aggs and each GroupAgg1 row valid. `child[]`; `post[result exact tuple of key array followed by one i64 array per agg; one fused pass; ownership/provenance as single aggregate]`. |
 | `ArrayDictEncode` | `env[base,struct_id,key_field]`: base is exactly DynStructArray(struct_id,Aos), key field is Str. `child[]`; `post[result DictEncoded(struct_id,key_field); dense ids owned, dictionary/source slices borrow base]`. |
 
-#### Planned Request 9 owned JSON HIR extension (not shipped)
+#### Request 9 owned JSON HIR extension
 
-`docs/impl/24-owned-json-plan.md` adds a dedicated owned route. Until that
-implementation lands, the shipped `JsonDecode`, `Template`, and
-`JsonEncodeBounded` rows above retain their existing borrowed predicates and do
-not admit the new graph. The implementation adds these exact body-ledger rows:
+`docs/impl/24-owned-json-plan.md` adds a dedicated owned route. The existing
+`JsonDecode`, `Template`, and `JsonEncodeBounded` rows above retain their borrowed
+predicates and do not admit the new graph. The implementation adds these exact
+body-ledger rows:
 
 | Discriminator | Exact envelope, children, and postcondition |
 |---|---|
@@ -1112,7 +1112,7 @@ if any of those five variants is absent from validation or ownership analysis.
 | One-field malformed mutations | For each row, mutate every child type, the stored result type, child count/order, receiver locality, and receiver handle kind independently. Validation rejects before MIR allocation, runtime declaration, ownership transfer, or cache publication. | parameterized complete-envelope mutations in `request11_process_rows_match_the_producer` |
 | Diagnostic precedence | A malformed child expression is visited before the receiver/result post relation; an equal-typed temporary receiver rejects only after its child validates. Negative `limit` is not a HIR-malformation discriminator and remains the runtime programmer-error abort. | accepted-local/temporary twins plus an invalid later-child twin in the same owner |
 | Closed Move classification | `RunBytes` is owned and dropped exactly like `RunOutput`: it is permitted only in its `Result` Ok carrier/local flow, nulls on move, is excluded from aggregates, arrays, task captures, and Copy/region-plain domains, and its byte views inherit only its owner region. | `run_bytes_type_classification_tripwire` sweeps Copy/Move/Drop/region/aggregate/capture/return and every control-flow cleanup owner |
-| Canonical/interface parity | Whole-program and imported/per-unit checked HIR resolve source `run_bytes` to the same closed type. Canonical type codec v3 tags are exactly `Ty=60` and `Scalar=36`; shipped interface format 6 retains named-type tag 0/path `run_bytes`/zero args, and the accepted Request 9 format-7 bump preserves those bytes before its new descriptor-list position. | bidirectional golden and unknown/truncated-tag owners named in the process design, plus exact edit/revert unit-cache identity |
+| Canonical/interface parity | Whole-program and imported/per-unit checked HIR resolve source `run_bytes` to the same closed type. Canonical type codec v3 tags are exactly `Ty=60` and `Scalar=36`; current interface format 7 preserves format 6's named-type tag 0/path `run_bytes`/zero args before its new descriptor-list position. | bidirectional golden and unknown/truncated-tag owners named in the process design, plus exact edit/revert unit-cache identity |
 
 ## Inventory closure
 

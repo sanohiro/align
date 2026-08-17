@@ -74,10 +74,10 @@ The author-side matrix-to-diff pass must point every applicable row to implement
 owner test before the implementation PR is opened. The benchmark-evidence document remains the
 separate trusted measurement boundary; it does not define this language or runtime contract.
 
-## Direct owned records (Request 9 design)
+## Direct owned records (Request 9)
 
 Request 9 extends the existing inferred operations with one closed, flat owned-record graph. The
-design is accepted; implementation is pending. A direct record selects the owned route when it has
+implementation ships. A direct record selects the owned route when it has
 at least one direct `string`, `Option<string>`, or `array<string>` field. Once selected, every other
 field must be a required signed/unsigned 8/16/32/64-bit integer or `bool`. A `str`, `array<str>`,
 float, char, nested record/array/enum, other `Option`, explicit `layout(C)`, or `align(N)` makes the
@@ -194,10 +194,10 @@ Move-enum field), then frees the AoS — called from both the struct-field drop 
 `array<Struct>` local's `Stmt::Drop`. The runtime error path mirrors it: `drop_decoded_owned`'s kind-5
 arm deep-frees each element (gated by `sub_owns_buffers`), and `decode_struct_array_value` frees the
 elements already materialized in `buf[0..count]` on a mid-array parse failure. **With J3b the OpenAI
-chat gateway closes end-to-end** (`Chat` round-trips byte-identically). **Still rejected:**
-JSON decode/encode of `array<string>` (a bare-`string`-element array field has no shipped JSON
-descriptor arm). Request 10 makes that field valid for ordinary owned record construction by
-reusing the standalone deep Drop; Request 9's accepted design adds the direct flat JSON producer.
+chat gateway closes end-to-end** (`Chat` round-trips byte-identically). The borrowed/nested/AoS
+routes still reject a bare-`string`-element array field. Request 10 makes that field valid for
+ordinary owned record construction by reusing the standalone deep Drop; Request 9 admits it only
+through the closed direct-owned flat-record JSON route.
 `json.encode` of a bare `array<Move-struct>` and pipelines over such a field stay restricted
 (decode→encode passthrough works).
 

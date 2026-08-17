@@ -463,12 +463,16 @@ impl OwnedStringList {
         self.0.iter().any(|s| unsafe { safe_slice(s.ptr, s.len) } == bytes)
     }
 
+    fn push_owned(&mut self, value: AlignStr) {
+        self.0.push(value);
+    }
+
     /// Publish the header array and transfer every payload to its generic deep-drop owner.
     /// On any size error, `Drop` frees all payloads accumulated so far.
-    unsafe fn publish(mut self, out: *mut AlignStr) -> Result<(), ()> {
+    fn into_array(mut self) -> Result<AlignStr, ()> {
         let n = self.0.len();
         if n == 0 {
-            return Ok(());
+            return Ok(AlignStr { ptr: core::ptr::null(), len: 0 });
         }
         let hdr_bytes = n
             .checked_mul(core::mem::size_of::<AlignStr>())
@@ -477,9 +481,15 @@ impl OwnedStringList {
         let len = i64::try_from(n).map_err(|_| ())?;
         let hdr = align_rt_alloc(hdr_bytes) as *mut AlignStr;
         unsafe { core::ptr::copy_nonoverlapping(self.0.as_ptr(), hdr, n) };
-        unsafe { out.write(AlignStr { ptr: hdr as *const u8, len }) };
-        // Payload ownership is now represented by the published header array.
         self.0.clear();
+        Ok(AlignStr { ptr: hdr as *const u8, len })
+    }
+
+    /// Publish the header array and transfer every payload to its generic deep-drop owner.
+    /// On any size error, `Drop` frees all payloads accumulated so far.
+    unsafe fn publish(self, out: *mut AlignStr) -> Result<(), ()> {
+        let value = self.into_array()?;
+        unsafe { out.write(value) };
         Ok(())
     }
 }
@@ -3189,6 +3199,19 @@ pub unsafe extern "C" fn align_rt_builder_write_int(b: *mut Builder, v: i64) {
     builder_push_i64(&mut b.buf, v);
 }
 
+/// Append an unsigned decimal integer without reinterpreting its high bit as a sign.
+///
+/// # Safety
+/// `b` must be a valid `Builder` pointer for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_builder_write_uint(b: *mut Builder, v: u64) {
+    let b = unsafe { &mut *b };
+    if b.buf.failed_limit() {
+        return;
+    }
+    builder_push_u64(&mut b.buf, v);
+}
+
 /// Append `prefix + decimal integer + suffix` in one runtime call. This is the batched form of the
 /// common generated pattern `b.write("..."); b.write_int(x); b.write("...")`.
 ///
@@ -4042,6 +4065,36 @@ unsafe fn decode_scalar_array_value(p: &mut JsonParser, elem_kind: i32, elem_wid
     Some(AlignStr { ptr: dst, len: count })
 }
 
+/// Decode a JSON array of strings into one owned header spine whose elements each own a distinct
+/// free-standing byte allocation. The staging list frees every completed element on any malformed
+/// current element or delimiter failure; ownership transfers only after the closing `]`.
+fn decode_owned_string_array_value(p: &mut JsonParser<'_>) -> Option<AlignStr> {
+    p.ws();
+    p.expect(b'[')?;
+    p.ws();
+    let mut items = OwnedStringList::default();
+    if p.peek() == Some(b']') {
+        p.pos += 1;
+        return items.into_array().ok();
+    }
+    loop {
+        let value = p.owned_string_value()?;
+        items.push_owned(value);
+        p.ws();
+        match p.peek() {
+            Some(b',') => {
+                p.pos += 1;
+                p.ws();
+            }
+            Some(b']') => {
+                p.pos += 1;
+                return items.into_array().ok();
+            }
+            _ => return None,
+        }
+    }
+}
+
 /// # Safety
 /// `sub` must be a valid [`JsonSubTable`] (element schema; `store_size` = element stride); `p` must
 /// be positioned at (optional whitespace then) the array's `[`.
@@ -4126,7 +4179,7 @@ unsafe fn sub_owns_buffers(descs: &[JsonField]) -> bool {
         // kind 5 = array<Struct>, 6 = union (owned payload possible), 7 = array<scalar> — all own a
         // heap buffer `drop_decoded_owned` frees.
         5 | 6 => !d.sub.is_null(),
-        7 => true,
+        7 | 8 | 9 => true,
         4 if !d.sub.is_null() => {
             let sub = unsafe { &*d.sub };
             let sub_descs = unsafe { safe_slice(sub.descs, sub.n_fields) };
@@ -4225,6 +4278,43 @@ unsafe fn drop_decoded_owned(base: *mut u8, descs: &[JsonField], only_seen: Opti
                 unsafe { core::ptr::copy_nonoverlapping(base.add(off), pb.as_mut_ptr(), 8) };
                 let ptr = usize::from_le_bytes(pb) as *mut u8;
                 unsafe { align_rt_free(ptr) };
+                unsafe { core::ptr::write_bytes(base.add(off), 0, 16) };
+            }
+            // A directly owned JSON `string` field (kind 8): free its byte allocation and null the
+            // complete `{ptr,len}` slot. `Option<string>` uses the same kind with `opt_tag >= 0`.
+            8 => {
+                let mut pb = [0u8; 8];
+                unsafe { core::ptr::copy_nonoverlapping(base.add(off), pb.as_mut_ptr(), 8) };
+                let ptr = usize::from_le_bytes(pb) as *mut u8;
+                unsafe { align_rt_free(ptr) };
+                unsafe { core::ptr::write_bytes(base.add(off), 0, 16) };
+            }
+            // An owned `array<string>` field (kind 9): free initialized element payloads in index
+            // order, then the header spine, and finally null the published slot.
+            9 => {
+                let mut pb = [0u8; 8];
+                let mut lb = [0u8; 8];
+                unsafe {
+                    core::ptr::copy_nonoverlapping(base.add(off), pb.as_mut_ptr(), 8);
+                    core::ptr::copy_nonoverlapping(base.add(off + 8), lb.as_mut_ptr(), 8);
+                }
+                let ptr = usize::from_le_bytes(pb) as *mut AlignStr;
+                let stored_len = i64::from_le_bytes(lb);
+                let len = if stored_len <= 0 {
+                    0
+                } else {
+                    match usize::try_from(stored_len) {
+                        Ok(len) => len,
+                        Err(_) => 0,
+                    }
+                };
+                if !ptr.is_null() {
+                    for index in 0..len {
+                        let value = unsafe { *ptr.add(index) };
+                        unsafe { align_rt_free(value.ptr as *mut u8) };
+                    }
+                }
+                unsafe { align_rt_free(ptr as *mut u8) };
                 unsafe { core::ptr::write_bytes(base.add(off), 0, 16) };
             }
             _ => {}
@@ -4336,6 +4426,35 @@ unsafe fn write_value(p: &mut JsonParser, kind: i32, width: i64, d: &JsonField, 
             let elem_width = ((d.tag >> 24) & 0x1f) as usize; // 5 bits: a `str` element is width 16
             let arr = unsafe { decode_scalar_array_value(p, elem_kind, elem_width, elem_signed)? };
             let ptr_bytes = (arr.ptr as usize as u64).to_le_bytes();
+            let len_bytes = arr.len.to_le_bytes();
+            unsafe {
+                std::ptr::copy_nonoverlapping(ptr_bytes.as_ptr(), dst, 8);
+                std::ptr::copy_nonoverlapping(len_bytes.as_ptr(), dst.add(8), 8);
+            }
+            Some(())
+        }
+        // Direct-owned JSON string. Unlike kind 3, this never borrows the input or arena.
+        8 => {
+            if w != 16 {
+                return None;
+            }
+            let s = p.owned_string_value()?;
+            let ptr_bytes = u64::try_from(s.ptr.addr()).ok()?.to_le_bytes();
+            let len_bytes = s.len.to_le_bytes();
+            unsafe {
+                std::ptr::copy_nonoverlapping(ptr_bytes.as_ptr(), dst, 8);
+                std::ptr::copy_nonoverlapping(len_bytes.as_ptr(), dst.add(8), 8);
+            }
+            Some(())
+        }
+        // Direct-owned `array<string>`: each element and the header spine are independent heap
+        // owners. Staging cleanup happens inside `decode_owned_string_array_value`.
+        9 => {
+            if w != 16 {
+                return None;
+            }
+            let arr = decode_owned_string_array_value(p)?;
+            let ptr_bytes = u64::try_from(arr.ptr.addr()).ok()?.to_le_bytes();
             let len_bytes = arr.len.to_le_bytes();
             unsafe {
                 std::ptr::copy_nonoverlapping(ptr_bytes.as_ptr(), dst, 8);
@@ -7038,6 +7157,31 @@ impl<'a> JsonParser<'a> {
         let output = unsafe { core::slice::from_raw_parts_mut(dst, len) };
         json_unescape_to(raw, output)?;
         Some(AlignStr { ptr: dst, len: len as i64 })
+    }
+
+    /// Read a JSON string into a free-standing owned allocation. Clean and escaped tokens follow
+    /// the same path: the returned bytes never borrow the input or the current arena.
+    fn owned_string_value(&mut self) -> Option<AlignStr> {
+        let raw = self.string_body()?;
+        let len = if raw.contains(&b'\\') {
+            json_unescaped_len(raw)?
+        } else {
+            raw.len()
+        };
+        let len_i64 = i64::try_from(len).ok()?;
+        let dst = align_rt_alloc(len_i64);
+        if len > 0 {
+            if raw.contains(&b'\\') {
+                let output = unsafe { core::slice::from_raw_parts_mut(dst, len) };
+                if json_unescape_to(raw, output).is_none() {
+                    unsafe { align_rt_free(dst) };
+                    return None;
+                }
+            } else {
+                unsafe { core::ptr::copy_nonoverlapping(raw.as_ptr(), dst, len) };
+            }
+        }
+        Some(AlignStr { ptr: dst, len: len_i64 })
     }
 
     fn integer(&mut self) -> Option<i64> {
@@ -13598,7 +13742,22 @@ const MAP_FAILED: *mut core::ffi::c_void = usize::MAX as *mut core::ffi::c_void;
 // the non-aborting raw allocation entry separate so a best-effort capacity hint may fail without
 // changing the public `align_rt_alloc` fail-fast contract. A future allocator replacement changes
 // these three helpers together; builders and the exported ABI cannot silently diverge.
+#[cfg(test)]
+static OWNED_ALLOC_FAIL_AFTER: core::sync::atomic::AtomicI64 =
+    core::sync::atomic::AtomicI64::new(-1);
+
+#[cfg(test)]
+fn owned_allocator_failpoint() -> bool {
+    let remaining = OWNED_ALLOC_FAIL_AFTER.load(core::sync::atomic::Ordering::Relaxed);
+    remaining >= 0
+        && OWNED_ALLOC_FAIL_AFTER.fetch_sub(1, core::sync::atomic::Ordering::Relaxed) == 0
+}
+
 unsafe fn owned_raw_alloc(size: usize) -> *mut u8 {
+    #[cfg(test)]
+    if owned_allocator_failpoint() {
+        return core::ptr::null_mut();
+    }
     unsafe { malloc(size) as *mut u8 }
 }
 
@@ -13607,6 +13766,10 @@ unsafe fn owned_raw_free(ptr: *mut u8) {
 }
 
 unsafe fn owned_raw_realloc(ptr: *mut u8, size: usize) -> *mut u8 {
+    #[cfg(test)]
+    if owned_allocator_failpoint() {
+        return core::ptr::null_mut();
+    }
     unsafe { realloc(ptr as *mut core::ffi::c_void, size) as *mut u8 }
 }
 
@@ -24273,6 +24436,19 @@ mod tests {
     }
 
     #[test]
+    fn builder_write_uint_matches_format_including_u64_max() {
+        for value in [0u64, 7, 42, u32::MAX as u64, i64::MAX as u64, u64::MAX] {
+            let mut builder = builder_value(std::ptr::null_mut(), 0);
+            unsafe { align_rt_builder_write_uint(&mut builder, value) };
+            assert_eq!(
+                String::from_utf8(builder.buf.as_slice().to_vec()).unwrap(),
+                format!("{value}"),
+                "write_uint({value})"
+            );
+        }
+    }
+
+    #[test]
     fn builder_write_str_int_str_matches_three_writes() {
         for v in [0i64, 7, -1, 42, -123, 999, -999, i64::MAX, i64::MIN] {
             let mut batched = builder_value(std::ptr::null_mut(), 0);
@@ -25780,6 +25956,351 @@ mod tests {
         let (a1, f1) = (align_rt_alloc_count(), align_rt_free_count());
         assert!(a1 > a0, "the array field allocated a buffer");
         assert_eq!(a1 - a0, f1 - f0, "the error path freed every buffer it allocated (no leak)");
+    }
+
+    #[cfg(feature = "alloc-count")]
+    #[test]
+    fn json_owned_string_and_string_array_sibling_failure_free_every_owner() {
+        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let (id, argv, required) = (b"id", b"argv", b"required");
+        let descriptors = [
+            JsonField {
+                name_ptr: id.as_ptr(),
+                name_len: 2,
+                tag: (8 << 8) | 16,
+                offset: 0,
+                sub: core::ptr::null(),
+                opt_tag: -1,
+            },
+            JsonField {
+                name_ptr: argv.as_ptr(),
+                name_len: 4,
+                tag: (9 << 8) | 16,
+                offset: 16,
+                sub: core::ptr::null(),
+                opt_tag: -1,
+            },
+            JsonField {
+                name_ptr: required.as_ptr(),
+                name_len: 8,
+                tag: 8,
+                offset: 32,
+                sub: core::ptr::null(),
+                opt_tag: -1,
+            },
+        ];
+        let source = br#"{"id":"owner","argv":["first","second"]}"#;
+        let (alloc_before, free_before) = (align_rt_alloc_count(), align_rt_free_count());
+        let mut output = [0u8; 40];
+        let status = unsafe {
+            align_rt_json_decode(
+                source.as_ptr(),
+                source.len() as i64,
+                descriptors.as_ptr(),
+                descriptors.len() as i64,
+                output.as_mut_ptr(),
+                output.len() as i64,
+                core::ptr::null(),
+                0,
+                0,
+                core::ptr::null_mut(),
+            )
+        };
+        assert_ne!(status, 0, "the missing required sibling must fail");
+        let (alloc_after, free_after) = (align_rt_alloc_count(), align_rt_free_count());
+        assert_eq!(alloc_after - alloc_before, 4, "id + two elements + array spine");
+        assert_eq!(
+            free_after - free_before,
+            alloc_after - alloc_before,
+            "partial-record cleanup frees every direct owner"
+        );
+        assert!(output.iter().all(|byte| *byte == 0), "cleanup nulls every published owner");
+    }
+
+    #[cfg(feature = "alloc-count")]
+    #[test]
+    fn json_owned_string_array_mid_element_failure_frees_staging_payloads() {
+        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let argv = b"argv";
+        let descriptors = [JsonField {
+            name_ptr: argv.as_ptr(),
+            name_len: 4,
+            tag: (9 << 8) | 16,
+            offset: 0,
+            sub: core::ptr::null(),
+            opt_tag: -1,
+        }];
+        let source = br#"{"argv":["first","second",7]}"#;
+        let (alloc_before, free_before) = (align_rt_alloc_count(), align_rt_free_count());
+        let mut output = [0u8; 16];
+        let status = unsafe {
+            align_rt_json_decode(
+                source.as_ptr(),
+                source.len() as i64,
+                descriptors.as_ptr(),
+                1,
+                output.as_mut_ptr(),
+                output.len() as i64,
+                core::ptr::null(),
+                0,
+                0,
+                core::ptr::null_mut(),
+            )
+        };
+        assert_ne!(status, 0, "a non-string element must fail");
+        let (alloc_after, free_after) = (align_rt_alloc_count(), align_rt_free_count());
+        assert_eq!(alloc_after - alloc_before, 2, "two elements allocated before failure");
+        assert_eq!(free_after - free_before, 2, "staging cleanup frees both elements");
+        assert!(output.iter().all(|byte| *byte == 0));
+    }
+
+    #[cfg(feature = "alloc-count")]
+    #[test]
+    fn json_owned_recoverable_failure_prefix_matrix_frees_every_live_owner() {
+        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let (id, note, argv, count) = (b"id", b"note", b"argv", b"count");
+        let descriptors = [
+            JsonField {
+                name_ptr: id.as_ptr(),
+                name_len: 2,
+                tag: (8 << 8) | 16,
+                offset: 0,
+                sub: core::ptr::null(),
+                opt_tag: -1,
+            },
+            JsonField {
+                name_ptr: note.as_ptr(),
+                name_len: 4,
+                tag: (8 << 8) | 16,
+                offset: 16,
+                sub: core::ptr::null(),
+                opt_tag: 32,
+            },
+            JsonField {
+                name_ptr: argv.as_ptr(),
+                name_len: 4,
+                tag: (9 << 8) | 16,
+                offset: 40,
+                sub: core::ptr::null(),
+                opt_tag: -1,
+            },
+            JsonField {
+                name_ptr: count.as_ptr(),
+                name_len: 5,
+                tag: (1 << 16) | 8,
+                offset: 56,
+                sub: core::ptr::null(),
+                opt_tag: -1,
+            },
+        ];
+        let cases: &[(&str, &[u8], i64)] = &[
+            ("required-null", br#"{"id":null}"#, 0),
+            ("malformed-first-string", br#"{"id":"\ud800","argv":[],"count":1}"#, 0),
+            ("duplicate-after-id", br#"{"id":"a","id":"b","argv":[],"count":1}"#, 1),
+            ("wrong-array-after-optional", br#"{"id":"a","note":"b","argv":false,"count":1}"#, 2),
+            ("mid-array-element", br#"{"id":"a","note":"b","argv":["c","d",7],"count":1}"#, 4),
+            ("wrong-sibling-after-array", br#"{"id":"a","note":"b","argv":["c","d"],"count":false}"#, 5),
+            ("missing-sibling-after-array", br#"{"id":"a","note":"b","argv":["c","d"]}"#, 5),
+            ("trailing-input", br#"{"id":"a","note":"b","argv":["c","d"],"count":1} x"#, 5),
+            ("missing-first-field", br#"{"note":"b","argv":["c"],"count":1}"#, 3),
+            ("invalid-unknown-value", br#"{"id":"a","unknown":"\ud800","argv":[],"count":1}"#, 0),
+        ];
+        for (label, source, expected_allocations) in cases {
+            let (alloc_before, free_before) = (align_rt_alloc_count(), align_rt_free_count());
+            let mut output = [0u8; 64];
+            let status = unsafe {
+                align_rt_json_decode(
+                    source.as_ptr(),
+                    source.len() as i64,
+                    descriptors.as_ptr(),
+                    descriptors.len() as i64,
+                    output.as_mut_ptr(),
+                    output.len() as i64,
+                    core::ptr::null(),
+                    0,
+                    0,
+                    core::ptr::null_mut(),
+                )
+            };
+            assert_ne!(status, 0, "{label}: malformed input must be recoverable");
+            let (alloc_after, free_after) = (align_rt_alloc_count(), align_rt_free_count());
+            assert_eq!(
+                alloc_after - alloc_before,
+                *expected_allocations,
+                "{label}: unexpected live-owner prefix",
+            );
+            assert_eq!(
+                free_after - free_before,
+                alloc_after - alloc_before,
+                "{label}: every owner allocated before failure must be freed",
+            );
+            assert_eq!(read_i64_at(&output, 0), 0, "{label}: required string pointer");
+            assert_eq!(read_i64_at(&output, 16), 0, "{label}: optional string pointer");
+            assert_eq!(output[32], 0, "{label}: optional tag");
+            assert_eq!(read_i64_at(&output, 40), 0, "{label}: array spine pointer");
+        }
+    }
+
+    #[cfg(feature = "alloc-count")]
+    #[test]
+    fn json_owned_text_array_success_transition_matrix_drops_elements_then_spine_once() {
+        let _serial = ALLOC_COUNT_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let (id, note, argv) = (b"id", b"note", b"argv");
+        let descriptors = [
+            JsonField {
+                name_ptr: id.as_ptr(),
+                name_len: 2,
+                tag: (8 << 8) | 16,
+                offset: 0,
+                sub: core::ptr::null(),
+                opt_tag: -1,
+            },
+            JsonField {
+                name_ptr: note.as_ptr(),
+                name_len: 4,
+                tag: (8 << 8) | 16,
+                offset: 16,
+                sub: core::ptr::null(),
+                opt_tag: 32,
+            },
+            JsonField {
+                name_ptr: argv.as_ptr(),
+                name_len: 4,
+                tag: (9 << 8) | 16,
+                offset: 40,
+                sub: core::ptr::null(),
+                opt_tag: -1,
+            },
+        ];
+        for (label, source, expected_allocations) in [
+            ("empty", br#"{"id":"a","note":null,"argv":[]}"#.as_slice(), 1),
+            ("one", br#"{"id":"a","note":"b","argv":["c"]}"#.as_slice(), 4),
+            ("many", br#"{"id":"a","note":"b","argv":["c","d","e"]}"#.as_slice(), 6),
+        ] {
+            let (alloc_before, free_before) = (align_rt_alloc_count(), align_rt_free_count());
+            let mut output = [0u8; 56];
+            let status = unsafe {
+                align_rt_json_decode(
+                    source.as_ptr(),
+                    source.len() as i64,
+                    descriptors.as_ptr(),
+                    descriptors.len() as i64,
+                    output.as_mut_ptr(),
+                    output.len() as i64,
+                    core::ptr::null(),
+                    0,
+                    0,
+                    core::ptr::null_mut(),
+                )
+            };
+            assert_eq!(status, 0, "{label}: valid value must publish");
+            let allocated = align_rt_alloc_count() - alloc_before;
+            assert_eq!(allocated, expected_allocations, "{label}: allocation shape");
+            unsafe { drop_decoded_owned(output.as_mut_ptr(), &descriptors, None) };
+            let freed_once = align_rt_free_count() - free_before;
+            assert_eq!(freed_once, allocated, "{label}: complete Drop frees every owner");
+            unsafe { drop_decoded_owned(output.as_mut_ptr(), &descriptors, None) };
+            assert_eq!(
+                align_rt_free_count() - free_before,
+                freed_once,
+                "{label}: nulled source makes recursive Drop idempotent",
+            );
+        }
+    }
+
+    #[test]
+    fn json_owned_terminal_allocation_failpoints_abort_in_child_processes() {
+        const MODE: &str = "ALIGN_JSON_OWNED_ALLOC_FAIL_MODE";
+        if let Some(mode) = std::env::var_os(MODE) {
+            let mode = mode.to_string_lossy();
+            let fail_after = if mode == "decode-growth" { 1 } else { 0 };
+            OWNED_ALLOC_FAIL_AFTER.store(fail_after, core::sync::atomic::Ordering::Relaxed);
+            match mode.as_ref() {
+                "allocation" => {
+                    let _ = align_rt_alloc(8);
+                }
+                "decode-growth" => {
+                    let (id, argv) = (b"id", b"argv");
+                    let descriptors = [
+                        JsonField {
+                            name_ptr: id.as_ptr(),
+                            name_len: 2,
+                            tag: (8 << 8) | 16,
+                            offset: 0,
+                            sub: core::ptr::null(),
+                            opt_tag: -1,
+                        },
+                        JsonField {
+                            name_ptr: argv.as_ptr(),
+                            name_len: 4,
+                            tag: (9 << 8) | 16,
+                            offset: 16,
+                            sub: core::ptr::null(),
+                            opt_tag: -1,
+                        },
+                    ];
+                    let source = br#"{"id":"allocated","argv":["must-abort"]}"#;
+                    let mut output = [0u8; 32];
+                    let _ = unsafe {
+                        align_rt_json_decode(
+                            source.as_ptr(),
+                            source.len() as i64,
+                            descriptors.as_ptr(),
+                            descriptors.len() as i64,
+                            output.as_mut_ptr(),
+                            output.len() as i64,
+                            core::ptr::null(),
+                            0,
+                            0,
+                            core::ptr::null_mut(),
+                        )
+                    };
+                }
+                "encode-growth" => {
+                    let mut builder = Builder {
+                        buf: BuilderBuf::new(0),
+                        arena: core::ptr::null_mut(),
+                    };
+                    let text = b"must-abort";
+                    unsafe {
+                        align_rt_builder_write_json_str(
+                            &mut builder,
+                            text.as_ptr(),
+                            text.len() as i64,
+                        )
+                    };
+                }
+                _ => panic!("unknown owned allocator failpoint mode: {mode}"),
+            }
+            panic!("{mode} allocator failpoint returned instead of aborting");
+        }
+
+        for mode in ["allocation", "decode-growth", "encode-growth"] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::json_owned_terminal_allocation_failpoints_abort_in_child_processes",
+                    "--nocapture",
+                ])
+                .env(MODE, mode)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn owned allocation failpoint child");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait().expect("poll owned allocation child") {
+                    assert!(!status.success(), "{mode} allocation failure must abort");
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().expect("kill stalled owned allocation child");
+                    child.wait().expect("reap stalled owned allocation child");
+                    panic!("{mode} allocation failpoint child exceeded watchdog");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
     }
 
     #[cfg(feature = "alloc-count")]

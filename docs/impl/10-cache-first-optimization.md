@@ -393,7 +393,7 @@ Consumers depend on the public-interface hash, not the implementation hash. Fina
 all implementation artifacts and the union of link summaries. Canonical encodings must not contain
 process-local numeric ids or hash-map iteration order.
 
-> **Accepted Request 9 extension (not shipped):** `docs/impl/24-owned-json-plan.md`
+> **Shipped Request 9 extension:** `docs/impl/24-owned-json-plan.md`
 > adds a sorted descriptor list for each accepted non-generic exported owned-JSON
 > record after the interface struct table. Each target-local `OwnedJsonDescV1` is
 > carried only inside `OwnedJsonInterfaceEnvelopeV1`, which binds the canonical
