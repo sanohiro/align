@@ -5221,14 +5221,10 @@ fn bounded_json_piece_is_type_safe(
         }
         align_mir::TemplatePiece::StrHole(operand)
         | align_mir::TemplatePiece::JsonStrHole(operand) => operand_ty(operand) == Some(Ty::Str),
-        align_mir::TemplatePiece::OwnedJsonString(operand) => {
-            operand_ty(operand) == Some(Ty::String)
-        }
-        align_mir::TemplatePiece::OwnedJsonOptionStringField { opt, .. } => {
-            operand_ty(opt) == Some(Ty::Option(Scalar::String))
-        }
-        align_mir::TemplatePiece::OwnedJsonStringArray(operand) => {
-            operand_ty(operand) == Some(Ty::DynArray(Scalar::String))
+        align_mir::TemplatePiece::OwnedJsonObject { value, plan } => {
+            operand_ty(value) == Some(Ty::Struct(plan.root))
+                && align_sema::owned_json_graph_plan_v2(&program.structs, plan.root)
+                    .is_ok_and(|rebuilt| rebuilt == *plan)
         }
         align_mir::TemplatePiece::BoolHole(operand) => operand_ty(operand) == Some(Ty::Bool),
         align_mir::TemplatePiece::CharHole(operand) => operand_ty(operand) == Some(Ty::Char),
@@ -7593,6 +7589,7 @@ struct DecodeTable<'c> {
 /// The field-descriptor table (+ PHF) `emit_desc_table` emits for one struct, without the ABI
 /// allocation size. A nested-struct field's `JsonSubTable` global bundles this with the ABI
 /// allocation size; the top-level `DecodeTable` adds the same size for the decode call.
+#[derive(Clone, Copy)]
 struct DescTable<'c> {
     descs: inkwell::values::PointerValue<'c>,
     n_fields: u64,
@@ -13736,23 +13733,28 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 pieces,
                 max_bytes,
                 out,
-            } => self.gen_template(
-                result_id,
-                pieces,
-                None,
-                Some((max_bytes, *out)),
-            )?,
-            Rvalue::JsonDecode { struct_id, input, out, arena } => self.gen_json_decode(*struct_id, input, *out, arena.as_ref())?,
-            Rvalue::JsonOwnedDecode {
+            } => self.gen_template(result_id, pieces, None, Some((max_bytes, *out)))?,
+            Rvalue::JsonDecode {
                 struct_id,
                 input,
                 out,
-            } => self.gen_json_owned_decode(*struct_id, input, *out)?,
-            Rvalue::JsonDecodeArray { elem, input, out } => self.gen_json_decode_array(*elem, input, *out)?,
-            Rvalue::JsonDecodeScalar { scalar, input, out } => self.gen_json_decode_scalar(*scalar, input, *out)?,
-            Rvalue::JsonDecodeStructArray { struct_id, input, out, arena } => {
-                self.gen_json_decode_struct_array(*struct_id, input, *out, arena.as_ref())?
+                arena,
+            } => self.gen_json_decode(*struct_id, input, *out, arena.as_ref())?,
+            Rvalue::JsonOwnedDecode { plan, input, out } => {
+                self.gen_json_owned_decode(plan, input, *out)?
             }
+            Rvalue::JsonDecodeArray { elem, input, out } => {
+                self.gen_json_decode_array(*elem, input, *out)?
+            }
+            Rvalue::JsonDecodeScalar { scalar, input, out } => {
+                self.gen_json_decode_scalar(*scalar, input, *out)?
+            }
+            Rvalue::JsonDecodeStructArray {
+                struct_id,
+                input,
+                out,
+                arena,
+            } => self.gen_json_decode_struct_array(*struct_id, input, *out, arena.as_ref())?,
             Rvalue::JsonDecodeSoa { struct_id, input, out, arena } => {
                 self.gen_json_decode_soa(*struct_id, input, *out, arena)?
             }
@@ -16967,17 +16969,61 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// the recursion terminates. The table is a private constant global (no per-call alloca → safe
     /// inside a loop). Shared by single-struct and `array<Struct>` decode (MMv2 slice 8d).
     fn emit_desc_table(&mut self, struct_id: u32) -> Result<DescTable<'c>, CodegenError> {
-        self.emit_desc_table_mode(struct_id, false)
+        self.emit_desc_table_mode(struct_id, None)
     }
 
-    fn emit_owned_desc_table(&mut self, struct_id: u32) -> Result<DescTable<'c>, CodegenError> {
-        self.emit_desc_table_mode(struct_id, true)
+    fn owned_json_payload_tag_sub(
+        &mut self,
+        ty: Ty,
+        null: inkwell::values::PointerValue<'c>,
+        subtables: &HashMap<u32, inkwell::values::PointerValue<'c>>,
+    ) -> Result<(u64, inkwell::values::PointerValue<'c>), CodegenError> {
+        Ok(match ty {
+            Ty::Int(integer) if matches!(integer.bits, 8 | 16 | 32 | 64) => (
+                ((integer.signed as u64) << 16) | u64::from(integer.bits / 8),
+                null,
+            ),
+            Ty::Bool => ((1 << 8) | 1, null),
+            Ty::String => ((8 << 8) | 16, null),
+            Ty::Struct(id) => (
+                4 << 8,
+                subtables.get(&id).copied().ok_or_else(|| {
+                    self.err(format!(
+                        "owned JSON V2 record {id} was not emitted before its parent"
+                    ))
+                })?,
+            ),
+            Ty::DynStructArray(id, _) => (
+                (5 << 8) | 16,
+                subtables.get(&id).copied().ok_or_else(|| {
+                    self.err(format!(
+                        "owned JSON V2 record {id} was not emitted before its parent"
+                    ))
+                })?,
+            ),
+            Ty::DynArray(Scalar::String) => ((9 << 8) | 16, null),
+            Ty::DynArray(element @ (Scalar::Int(_) | Scalar::Bool)) => {
+                let (element_tag, _) = self.json_payload_tag_sub(scalar_to_ty(element), null)?;
+                let kind = (element_tag >> 8) & 0xff;
+                let width = element_tag & 0xff;
+                let signed = (element_tag >> 16) & 1;
+                (
+                    (7 << 8) | 16 | (signed << 16) | (kind << 20) | (width << 24),
+                    null,
+                )
+            }
+            other => {
+                return Err(self.err(format!(
+                    "owned JSON V2 descriptor: {other:?} is outside the closed graph"
+                )));
+            }
+        })
     }
 
     fn emit_desc_table_mode(
         &mut self,
         struct_id: u32,
-        owned: bool,
+        owned_subtables: Option<&HashMap<u32, inkwell::values::PointerValue<'c>>>,
     ) -> Result<DescTable<'c>, CodegenError> {
         let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
         let i64t = self.ctx.i64_type();
@@ -17006,28 +17052,30 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // the payload slot inside the `Option` (`{ i8 tag, payload }`) and `opt_tag` = the
                 // field's own byte offset (the tag byte). A required field is `opt_tag = -1` with
                 // `offset` = the field itself.
-                let (tag, sub_ptr, offset, opt_tag):
-                    (u64, inkwell::values::PointerValue, u64, i64) = if owned {
+                let (tag, sub_ptr, offset, opt_tag): (
+                    u64,
+                    inkwell::values::PointerValue,
+                    u64,
+                    i64,
+                ) = if let Some(subtables) = owned_subtables {
                     match f.ty {
-                        Ty::Option(Scalar::String) => (
-                            (8 << 8) | 16,
-                            null,
-                            field_off + self.option_payload_offset(Scalar::String),
-                            field_off as i64,
-                        ),
-                        Ty::String => ((8 << 8) | 16, null, field_off, -1),
-                        Ty::DynArray(Scalar::String) => ((9 << 8) | 16, null, field_off, -1),
-                        Ty::Int(it) => (
-                            ((it.signed as u64) << 16) | (it.bits / 8) as u64,
-                            null,
-                            field_off,
-                            -1,
-                        ),
-                        Ty::Bool => ((1 << 8) | 1, null, field_off, -1),
+                        Ty::Option(payload) => {
+                            let (tag, sub) = self.owned_json_payload_tag_sub(
+                                scalar_to_ty(payload),
+                                null,
+                                subtables,
+                            )?;
+                            (
+                                tag,
+                                sub,
+                                field_off + self.option_payload_offset(payload),
+                                field_off as i64,
+                            )
+                        }
                         other => {
-                            return Err(self.err(format!(
-                                "owned JSON descriptor: {other:?} is outside the closed field grammar"
-                            )));
+                            let (tag, sub) =
+                                self.owned_json_payload_tag_sub(other, null, subtables)?;
+                            (tag, sub, field_off, -1)
                         }
                     }
                 } else {
@@ -17106,6 +17154,83 @@ impl<'c, 'a> FnGen<'c, 'a> {
         g.set_constant(true);
         mark_private_unnamed_addr(g);
         Ok(g.as_pointer_value())
+    }
+
+    fn emit_owned_json_subtable_from_table(
+        &mut self,
+        struct_id: u32,
+        inner: DescTable<'c>,
+    ) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
+        let struct_ty = self
+            .struct_types
+            .get(struct_id as usize)
+            .copied()
+            .ok_or_else(|| self.err(format!("unknown owned JSON V2 record id {struct_id}")))?;
+        let store_size = self.element_allocation_size(struct_ty.into());
+        let i64t = self.ctx.i64_type();
+        let subtable_ty = self.json_subtable_ty();
+        let value = subtable_ty.const_named_struct(&[
+            inner.descs.into(),
+            i64t.const_int(inner.n_fields, false).into(),
+            i64t.const_int(store_size, false).into(),
+            inner.phf_ptr.into(),
+            i64t.const_int(inner.phf_len, false).into(),
+            i64t.const_int(inner.phf_seed, false).into(),
+        ]);
+        let global = self
+            .module
+            .add_global(subtable_ty, None, "owned_json_v2_sub");
+        global.set_initializer(&value);
+        global.set_constant(true);
+        mark_private_unnamed_addr(global);
+        Ok(global.as_pointer_value())
+    }
+
+    fn owned_json_record_dependency(ty: Ty) -> Option<u32> {
+        match ty {
+            Ty::Struct(id) | Ty::DynStructArray(id, _) => Some(id),
+            Ty::Option(Scalar::Struct(id) | Scalar::DynStructArray(id)) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// Emit a complete V2 descriptor graph without following the source record graph on the Rust
+    /// call stack. Checked HIR has already proved the graph acyclic and bounded; this pass still
+    /// fails closed if no dependency-ready record remains.
+    fn emit_owned_desc_graph(
+        &mut self,
+        plan: &hir::OwnedJsonGraphPlanV2,
+    ) -> Result<DescTable<'c>, CodegenError> {
+        let mut subtables = HashMap::new();
+        let mut tables = HashMap::new();
+        while tables.len() < plan.records.len() {
+            let mut progressed = false;
+            for record in plan.records.iter().rev() {
+                if tables.contains_key(&record.id) {
+                    continue;
+                }
+                if record
+                    .fields
+                    .iter()
+                    .filter_map(|field| Self::owned_json_record_dependency(field.ty))
+                    .any(|id| !subtables.contains_key(&id))
+                {
+                    continue;
+                }
+                let table = self.emit_desc_table_mode(record.id, Some(&subtables))?;
+                let subtable = self.emit_owned_json_subtable_from_table(record.id, table)?;
+                tables.insert(record.id, table);
+                subtables.insert(record.id, subtable);
+                progressed = true;
+            }
+            if !progressed {
+                return Err(self.err("owned JSON V2 descriptor graph is cyclic or incomplete"));
+            }
+        }
+        tables
+            .get(&plan.root)
+            .copied()
+            .ok_or_else(|| self.err("owned JSON V2 descriptor graph omits its root"))
     }
 
     /// Emit the field-descriptor table for decoding struct `struct_id`, wrapping [`emit_desc_table`]
@@ -17262,16 +17387,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
         out: Slot,
         arena: Option<&Operand>,
     ) -> Result<BasicValueEnum<'c>, CodegenError> {
-        self.gen_json_decode_record(struct_id, input, out, arena, false)
+        self.gen_json_decode_record(struct_id, input, out, arena, None)
     }
 
     fn gen_json_owned_decode(
         &mut self,
-        struct_id: u32,
+        plan: &hir::OwnedJsonGraphPlanV2,
         input: &Operand,
         out: Slot,
     ) -> Result<BasicValueEnum<'c>, CodegenError> {
-        self.gen_json_decode_record(struct_id, input, out, None, true)
+        self.gen_json_decode_record(plan.root, input, out, None, Some(plan))
     }
 
     fn gen_json_decode_record(
@@ -17280,7 +17405,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         input: &Operand,
         out: Slot,
         arena: Option<&Operand>,
-        owned: bool,
+        owned: Option<&hir::OwnedJsonGraphPlanV2>,
     ) -> Result<BasicValueEnum<'c>, CodegenError> {
         let sty = self
             .struct_types
@@ -17300,8 +17425,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let in_len = self.builder.build_extract_value(agg, 1, "jin_l").map_err(|e| self.err(e))?;
 
         let i64t = self.ctx.i64_type();
-        let t = if owned {
-            let t = self.emit_owned_desc_table(struct_id)?;
+        let t = if let Some(plan) = owned {
+            let t = self.emit_owned_desc_graph(plan)?;
             DecodeTable {
                 descs: t.descs,
                 n_fields: t.n_fields,
@@ -17917,12 +18042,28 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .build_call(self.runtime(RuntimeKey::BuilderWriteJsonStr), &[bptr.into(), ptr.into(), len.into()], "")
                         .map_err(|e| self.err(e))?;
                 }
-                align_mir::TemplatePiece::OwnedJsonString(op) => {
-                    let (ptr, len) = self.display_view(op, "an owned json.encode string field")?;
+                align_mir::TemplatePiece::OwnedJsonObject { value, plan } => {
+                    if self.f.operand_ty(value) != Ty::Struct(plan.root) {
+                        return Err(
+                            self.err("owned JSON V2 root operand type does not match its plan")
+                        );
+                    }
+                    let sty = self
+                        .struct_types
+                        .get(plan.root as usize)
+                        .copied()
+                        .ok_or_else(|| self.err("owned JSON V2 plan references an unknown root"))?;
+                    let root = self.operand(value)?;
+                    let slot = self.alloca_at_entry(sty.into(), "owned_json_v2_root")?;
+                    self.builder
+                        .build_store(slot, root)
+                        .map_err(|e| self.err(e))?;
+                    let table = self.emit_owned_desc_graph(plan)?;
+                    let count = i64t.const_int(table.n_fields, false);
                     self.builder
                         .build_call(
-                            self.runtime(RuntimeKey::BuilderWriteJsonStr),
-                            &[bptr.into(), ptr.into(), len.into()],
+                            self.runtime(RuntimeKey::JsonEncodeObject),
+                            &[bptr.into(), slot.into(), table.descs.into(), count.into()],
                             "",
                         )
                         .map_err(|e| self.err(e))?;
@@ -18033,74 +18174,6 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     self.builder.build_unconditional_branch(cont_bb).map_err(|e| self.err(e))?;
                     self.builder.position_at_end(cont_bb);
                 }
-                align_mir::TemplatePiece::OwnedJsonOptionStringField { opt, name } => {
-                    let agg = self.operand(opt)?.into_struct_value();
-                    let tag = self
-                        .builder
-                        .build_extract_value(agg, 0, "oostring.tag")
-                        .map_err(|e| self.err(e))?
-                        .into_int_value();
-                    let payload = self
-                        .builder
-                        .build_extract_value(agg, 1, "oostring.payload")
-                        .map_err(|e| self.err(e))?
-                        .into_struct_value();
-                    let is_some = self
-                        .builder
-                        .build_int_compare(
-                            IntPredicate::NE,
-                            tag,
-                            tag.get_type().const_zero(),
-                            "oostring.some",
-                        )
-                        .map_err(|e| self.err(e))?;
-                    let func = self
-                        .builder
-                        .get_insert_block()
-                        .and_then(|block| block.get_parent())
-                        .ok_or_else(|| self.err("no enclosing function for owned Option<string>"))?;
-                    let some = self.ctx.append_basic_block(func, "owned.opt.some");
-                    let cont = self.ctx.append_basic_block(func, "owned.opt.cont");
-                    self.builder
-                        .build_conditional_branch(is_some, some, cont)
-                        .map_err(|e| self.err(e))?;
-                    self.builder.position_at_end(some);
-                    let (prefix, prefix_len) = self.str_global(&format!("\"{name}\":"));
-                    self.builder
-                        .build_call(
-                            self.runtime(RuntimeKey::BuilderWrite),
-                            &[bptr.into(), prefix.into(), prefix_len.into()],
-                            "",
-                        )
-                        .map_err(|e| self.err(e))?;
-                    let ptr = self
-                        .builder
-                        .build_extract_value(payload, 0, "oostring.ptr")
-                        .map_err(|e| self.err(e))?;
-                    let len = self
-                        .builder
-                        .build_extract_value(payload, 1, "oostring.len")
-                        .map_err(|e| self.err(e))?;
-                    self.builder
-                        .build_call(
-                            self.runtime(RuntimeKey::BuilderWriteJsonStr),
-                            &[bptr.into(), ptr.into(), len.into()],
-                            "",
-                        )
-                        .map_err(|e| self.err(e))?;
-                    let (comma, comma_len) = self.str_global(",");
-                    self.builder
-                        .build_call(
-                            self.runtime(RuntimeKey::BuilderWrite),
-                            &[bptr.into(), comma.into(), comma_len.into()],
-                            "",
-                        )
-                        .map_err(|e| self.err(e))?;
-                    self.builder
-                        .build_unconditional_branch(cont)
-                        .map_err(|e| self.err(e))?;
-                    self.builder.position_at_end(cont);
-                }
                 // `json.encode` of an `Option<struct>` field (T1b): when `Some`, write `"name":`, render
                 // the payload struct via the runtime descriptor-driven encoder (the same schema decode
                 // uses), then a trailing comma; when `None`, emit nothing. The payload struct is stored
@@ -18185,25 +18258,6 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let etag = self.ctx.i32_type().const_int(etag, false);
                     self.builder
                         .build_call(self.runtime(RuntimeKey::JsonEncodeScalarArray), &[bptr.into(), ptr.into(), len.into(), etag.into()], "")
-                        .map_err(|e| self.err(e))?;
-                }
-                align_mir::TemplatePiece::OwnedJsonStringArray(array) => {
-                    let agg = self.operand(array)?.into_struct_value();
-                    let ptr = self
-                        .builder
-                        .build_extract_value(agg, 0, "owned.sa.ptr")
-                        .map_err(|e| self.err(e))?;
-                    let len = self
-                        .builder
-                        .build_extract_value(agg, 1, "owned.sa.len")
-                        .map_err(|e| self.err(e))?;
-                    let tag = self.ctx.i32_type().const_int((3 << 8) | 16, false);
-                    self.builder
-                        .build_call(
-                            self.runtime(RuntimeKey::JsonEncodeScalarArray),
-                            &[bptr.into(), ptr.into(), len.into(), tag.into()],
-                            "",
-                        )
                         .map_err(|e| self.err(e))?;
                 }
                 // `json.encode` of a shape-directed union: materialize the enum value in memory (the

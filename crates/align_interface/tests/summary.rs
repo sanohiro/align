@@ -794,7 +794,7 @@ fn deserialize_truncated_and_trailing_fail_closed() {
 }
 
 #[test]
-fn exported_owned_json_records_carry_one_target_bound_format_7_descriptor() {
+fn exported_owned_json_records_carry_one_target_bound_format_8_graph() {
     let summary = one(
         "pub Owned { id: string, n: u64, tags: array<string>, note: Option<string> }\n\
          Private { text: string }\n\
@@ -802,8 +802,8 @@ fn exported_owned_json_records_carry_one_target_bound_format_7_descriptor() {
          fn main() -> i32 = 0\n",
     )
     .remove(0);
-    assert_eq!(summary.owned_json_descriptors.len(), 1);
-    assert_eq!(summary.owned_json_descriptors[0].type_name, "Owned");
+    assert_eq!(summary.owned_json_graphs.len(), 1);
+    assert_eq!(summary.owned_json_graphs[0].type_name, "Owned");
     let target = OwnedJsonTarget {
         triple: "x86_64-pc-linux-gnu".to_string(),
         object_format: OwnedJsonObjectFormat::Elf,
@@ -2430,7 +2430,7 @@ fn parameter_mode_codec_has_a_byte_golden_and_rejects_unknown_tags() {
     let hex = surface.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
     assert_eq!(
         hex,
-        "07000000040000006d61696e0100000007000000696e73706563740000000001000000010005000000736c69636501000000000300000069363400000000000300000069363400000000000000000000000000000000000000000000000000000000000000000000"
+        "08000000040000006d61696e0100000007000000696e73706563740000000001000000010005000000736c69636501000000000300000069363400000000000300000069363400000000000000000000000000000000000000000000000000000000000000000000"
     );
 
     let mut artifact = serialize(&summary);

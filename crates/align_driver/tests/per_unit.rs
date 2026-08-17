@@ -82,8 +82,8 @@ fn cross_module_owned_json_record_keeps_descriptor_and_ownership_parity() {
         .iter()
         .find(|summary| summary.unit == "owned")
         .expect("owned summary");
-    assert_eq!(summary.owned_json_descriptors.len(), 1);
-    assert_eq!(summary.owned_json_descriptors[0].type_name, "Value");
+    assert_eq!(summary.owned_json_graphs.len(), 1);
+    assert_eq!(summary.owned_json_graphs[0].type_name, "Value");
 }
 
 #[test]

@@ -1421,10 +1421,194 @@ enum JsonShapeRoot {
     Enum(u32),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum OwnedJsonRoute {
     Existing,
-    Owned,
+    Owned(hir::OwnedJsonGraphPlanV2),
+}
+
+const OWNED_JSON_MAX_CONSTRUCTOR_DEPTH: u16 = 128;
+
+/// Reconstruct the closed Request-13 owned-JSON graph without recursion. The record list is the
+/// canonical root-first DFS order; a repeated completed record is a DAG edge, while an active
+/// record is a cycle. Constructor depth counts the root record as one and every record, Option, or
+/// dynamic-array edge thereafter.
+pub fn owned_json_graph_plan_v2(
+    structs: &[hir::StructDef],
+    root: u32,
+) -> Result<hir::OwnedJsonGraphPlanV2, String> {
+    enum Work {
+        Record(u32, u16),
+        Type(Ty, u16),
+        Exit(u32),
+    }
+
+    fn next_depth(depth: u16) -> Result<u16, String> {
+        let next = depth
+            .checked_add(1)
+            .ok_or_else(|| "owned JSON constructor depth overflow".to_string())?;
+        if next > OWNED_JSON_MAX_CONSTRUCTOR_DEPTH {
+            return Err(format!(
+                "owned JSON graph exceeds maximum constructor depth {OWNED_JSON_MAX_CONSTRUCTOR_DEPTH}"
+            ));
+        }
+        Ok(next)
+    }
+
+    let mut records = Vec::new();
+    let mut discovered = HashSet::new();
+    let mut active = HashSet::new();
+    let mut work = vec![Work::Record(root, 1)];
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Exit(id) => {
+                active.remove(&id);
+            }
+            Work::Record(id, depth) => {
+                if depth > OWNED_JSON_MAX_CONSTRUCTOR_DEPTH {
+                    return Err(format!(
+                        "owned JSON graph exceeds maximum constructor depth {OWNED_JSON_MAX_CONSTRUCTOR_DEPTH}"
+                    ));
+                }
+                if active.contains(&id) {
+                    return Err("owned JSON graph contains a record cycle".to_string());
+                }
+                if !discovered.insert(id) {
+                    continue;
+                }
+                let definition = structs
+                    .get(id as usize)
+                    .ok_or_else(|| "owned JSON graph references an unknown record".to_string())?;
+                if definition.c_repr {
+                    return Err(format!(
+                        "owned JSON record '{}' cannot use `layout(C)`",
+                        definition.source_name
+                    ));
+                }
+                if definition.align.is_some() {
+                    return Err(format!(
+                        "owned JSON record '{}' cannot use explicit `align(N)`",
+                        definition.source_name
+                    ));
+                }
+                if definition.fields.is_empty() {
+                    return Err(format!(
+                        "owned JSON record '{}' must have at least one field",
+                        definition.source_name
+                    ));
+                }
+                active.insert(id);
+                records.push(id);
+                work.push(Work::Exit(id));
+                for field in definition.fields.iter().rev() {
+                    work.push(Work::Type(field.ty, depth));
+                }
+            }
+            Work::Type(ty, depth) => match ty {
+                Ty::Int(IntTy {
+                    bits: 8 | 16 | 32 | 64,
+                    ..
+                })
+                | Ty::Bool
+                | Ty::String => {}
+                Ty::Struct(id) => work.push(Work::Record(id, next_depth(depth)?)),
+                Ty::Option(payload) => {
+                    let depth = next_depth(depth)?;
+                    match payload {
+                        Scalar::Int(IntTy {
+                            bits: 8 | 16 | 32 | 64,
+                            ..
+                        })
+                        | Scalar::Bool
+                        | Scalar::String => {}
+                        Scalar::Struct(id) => work.push(Work::Record(id, next_depth(depth)?)),
+                        Scalar::DynArray(
+                            PrimScalar::Int(IntTy {
+                                bits: 8 | 16 | 32 | 64,
+                                ..
+                            })
+                            | PrimScalar::Bool
+                            | PrimScalar::String,
+                        ) => {
+                            next_depth(depth)?;
+                        }
+                        Scalar::DynStructArray(id) => {
+                            work.push(Work::Record(id, next_depth(next_depth(depth)?)?));
+                        }
+                        _ => {
+                            return Err(format!(
+                                "owned JSON Option payload has unsupported type {}",
+                                scalar_name(payload)
+                            ));
+                        }
+                    }
+                }
+                Ty::DynArray(
+                    Scalar::Int(IntTy {
+                        bits: 8 | 16 | 32 | 64,
+                        ..
+                    })
+                    | Scalar::Bool
+                    | Scalar::String,
+                ) => {
+                    next_depth(depth)?;
+                }
+                Ty::DynStructArray(id, _) => {
+                    work.push(Work::Record(id, next_depth(next_depth(depth)?)?));
+                }
+                other => {
+                    return Err(format!(
+                        "owned JSON graph has unsupported type {}",
+                        ty_name(other)
+                    ));
+                }
+            },
+        }
+    }
+    let records = records
+        .into_iter()
+        .map(|id| {
+            let definition = &structs[id as usize];
+            hir::OwnedJsonGraphRecordV2 {
+                id,
+                fields: definition
+                    .fields
+                    .iter()
+                    .map(|field| hir::OwnedJsonGraphFieldV2 {
+                        name: field.name.clone(),
+                        ty: field.ty,
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+    Ok(hir::OwnedJsonGraphPlanV2 { root, records })
+}
+
+fn struct_has_transitive_owned_json_text(structs: &[hir::StructDef], root: u32) -> bool {
+    let mut records = HashSet::new();
+    let mut work = vec![Ty::Struct(root)];
+    while let Some(ty) = work.pop() {
+        match ty {
+            Ty::String
+            | Ty::Option(Scalar::String)
+            | Ty::DynArray(Scalar::String)
+            | Ty::Option(Scalar::DynArray(PrimScalar::String)) => return true,
+            Ty::Struct(id) => {
+                if records.insert(id) {
+                    if let Some(definition) = structs.get(id as usize) {
+                        work.extend(definition.fields.iter().rev().map(|field| field.ty));
+                    }
+                }
+            }
+            Ty::Option(Scalar::Struct(id)) => work.push(Ty::Struct(id)),
+            Ty::DynStructArray(id, _) | Ty::Option(Scalar::DynStructArray(id)) => {
+                work.push(Ty::Struct(id));
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 impl JsonDir {
@@ -7769,7 +7953,6 @@ fn compact_abstract_nominal_instances(
             | ExprKind::ArrayToSoa { struct_id, .. }
             | ExprKind::ElemField { struct_id, .. }
             | ExprKind::JsonDecode { struct_id, .. }
-            | ExprKind::JsonOwnedDecode { struct_id, .. }
             | ExprKind::JsonDecodeStructArray { struct_id, .. }
             | ExprKind::JsonDecodeSoa { struct_id, .. }
             | ExprKind::JsonScan { struct_id, .. }
@@ -7777,6 +7960,17 @@ fn compact_abstract_nominal_instances(
             | ExprKind::ArrayGroupAggMulti { struct_id, .. }
             | ExprKind::ArrayDictEncode { struct_id, .. } => {
                 remap_id(struct_id, &remap.structs, valid)
+            }
+            ExprKind::JsonOwnedEncode { plan, .. }
+            | ExprKind::JsonOwnedEncodeBounded { plan, .. }
+            | ExprKind::JsonOwnedDecode { plan, .. } => {
+                remap_id(&mut plan.root, &remap.structs, valid);
+                for record in &mut plan.records {
+                    remap_id(&mut record.id, &remap.structs, valid);
+                    for field in &mut record.fields {
+                        remap_ty(&mut field.ty, remap, valid);
+                    }
+                }
             }
             ExprKind::ResourceFromRaw { resource, .. }
             | ExprKind::ResourceBorrow { resource, .. }
@@ -7816,13 +8010,12 @@ fn compact_abstract_nominal_instances(
             }
             ExprKind::JsonDecodeScalar { scalar, .. }
             | ExprKind::JsonDocAsScalar { scalar, .. } => remap_ty(scalar, remap, valid),
-            ExprKind::Template(parts) | ExprKind::JsonOwnedEncode { parts, .. } => {
+            ExprKind::Template(parts) => {
                 for part in parts {
                     remap_template_part(part, remap, valid);
                 }
             }
-            ExprKind::JsonEncodeBounded { parts, .. }
-            | ExprKind::JsonOwnedEncodeBounded { parts, .. } => {
+            ExprKind::JsonEncodeBounded { parts, .. } => {
                 for part in parts {
                     remap_template_part(part, remap, valid);
                 }
@@ -12701,33 +12894,27 @@ impl EffectScan<'_> {
                 walk!(needle);
             }
             ExprKind::StrTrim { recv, .. } => walk!(recv),
-            ExprKind::Template(parts) | ExprKind::JsonOwnedEncode { parts, .. } => {
+            ExprKind::Template(parts) => {
                 for p in parts {
                     match p {
-                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h)
-                        | TemplatePart::OwnedJsonString { access: h }
-                        | TemplatePart::OwnedJsonStringArray { access: h } => walk!(h),
-                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } | TemplatePart::OwnedJsonOptionStringField { access, .. } => walk!(access),
+                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => walk!(h),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => walk!(access),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
             }
-            ExprKind::JsonEncodeBounded {
-                parts, max_bytes, ..
-            } | ExprKind::JsonOwnedEncodeBounded {
-                parts, max_bytes, ..
-            } => {
+            ExprKind::JsonEncodeBounded { parts, max_bytes, .. } => {
                 for p in parts {
                     match p {
-                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h)
-                        | TemplatePart::OwnedJsonString { access: h }
-                        | TemplatePart::OwnedJsonStringArray { access: h } => walk!(h),
-                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } | TemplatePart::OwnedJsonOptionStringField { access, .. } => walk!(access),
+                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => walk!(h),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => walk!(access),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
                 walk!(max_bytes);
             }
+            ExprKind::JsonOwnedEncode { .. } => {}
+            ExprKind::JsonOwnedEncodeBounded { max_bytes, .. } => walk!(max_bytes),
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonOwnedDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. }
             | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. }
             // `json.scan(input)` is Pure (build a streaming scanner — no I/O); walk the input (J5).
@@ -17613,33 +17800,27 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::ElseUnwrap { .. } => {
                 unreachable!("escape control expressions use explicit walk items");
             }
-            ExprKind::Template(parts) | ExprKind::JsonOwnedEncode { parts, .. } => {
+            ExprKind::Template(parts) => {
                 for p in parts {
                     match p {
-                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h)
-                        | TemplatePart::OwnedJsonString { access: h }
-                        | TemplatePart::OwnedJsonStringArray { access: h } => self.walk(h, depth),
-                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } | TemplatePart::OwnedJsonOptionStringField { access, .. } => self.walk(access, depth),
+                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.walk(h, depth),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.walk(access, depth),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
             }
-            ExprKind::JsonEncodeBounded {
-                parts, max_bytes, ..
-            } | ExprKind::JsonOwnedEncodeBounded {
-                parts, max_bytes, ..
-            } => {
+            ExprKind::JsonEncodeBounded { parts, max_bytes, .. } => {
                 for p in parts {
                     match p {
-                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h)
-                        | TemplatePart::OwnedJsonString { access: h }
-                        | TemplatePart::OwnedJsonStringArray { access: h } => self.walk(h, depth),
-                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } | TemplatePart::OwnedJsonOptionStringField { access, .. } => self.walk(access, depth),
+                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.walk(h, depth),
+                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.walk(access, depth),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
                 self.walk(max_bytes, depth);
             }
+            ExprKind::JsonOwnedEncode { .. } => {}
+            ExprKind::JsonOwnedEncodeBounded { max_bytes, .. } => self.walk(max_bytes, depth),
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonOwnedDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.walk(input, depth),
             // `json.doc(...)` and the doc accessors: walk their operands (J4).
             ExprKind::JsonDoc { input } => self.walk(input, depth),
@@ -25406,31 +25587,62 @@ impl<'a> MoveCheck<'a> {
                     return false;
                 }
             }
-            ExprKind::Template(parts) | ExprKind::JsonOwnedEncode { parts, .. } => {
+            ExprKind::Template(parts) => {
                 for p in parts {
                     // A hole / option-field value is read (copied) into the builder, not moved out.
                     match p {
-                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) | TemplatePart::OwnedJsonString { access: h } | TemplatePart::OwnedJsonStringArray { access: h } => move_expr!(self, h, moved, false, false),
-                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } | TemplatePart::OwnedJsonOptionStringField { access, .. } => move_expr!(self, access, moved, false, false),
+                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => {
+                            move_expr!(self, h, moved, false, false)
+                        }
+                        TemplatePart::OptionField { access, .. }
+                        | TemplatePart::OptionStructField { access, .. }
+                        | TemplatePart::StructArrayField { access, .. }
+                        | TemplatePart::ScalarArrayField { access, .. }
+                        | TemplatePart::UnionValue { access, .. } => {
+                            move_expr!(self, access, moved, false, false)
+                        }
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
             }
             ExprKind::JsonEncodeBounded {
                 parts, max_bytes, ..
-            } | ExprKind::JsonOwnedEncodeBounded {
-                parts, max_bytes, ..
             } => {
                 for p in parts {
                     match p {
-                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) | TemplatePart::OwnedJsonString { access: h } | TemplatePart::OwnedJsonStringArray { access: h } => move_expr!(self, h, moved, false, false),
-                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } | TemplatePart::OwnedJsonOptionStringField { access, .. } => move_expr!(self, access, moved, false, false),
+                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => {
+                            move_expr!(self, h, moved, false, false)
+                        }
+                        TemplatePart::OptionField { access, .. }
+                        | TemplatePart::OptionStructField { access, .. }
+                        | TemplatePart::StructArrayField { access, .. }
+                        | TemplatePart::ScalarArrayField { access, .. }
+                        | TemplatePart::UnionValue { access, .. } => {
+                            move_expr!(self, access, moved, false, false)
+                        }
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
                 move_expr!(self, max_bytes, moved, false, false);
             }
-            ExprKind::JsonDecode { input, .. } | ExprKind::JsonOwnedDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => move_expr!(self, input, moved, false, false),
+            ExprKind::JsonOwnedEncode { base, .. } => {
+                self.check_borrow_use(*base, e.span);
+            }
+            ExprKind::JsonOwnedEncodeBounded {
+                base, max_bytes, ..
+            } => {
+                self.check_borrow_use(*base, e.span);
+                move_expr!(self, max_bytes, moved, false, false);
+            }
+            ExprKind::JsonDecode { input, .. }
+            | ExprKind::JsonOwnedDecode { input, .. }
+            | ExprKind::JsonDecodeArray { input, .. }
+            | ExprKind::JsonDecodeScalar { input, .. }
+            | ExprKind::JsonDecodeStructArray { input, .. }
+            | ExprKind::JsonDecodeSoa { input, .. }
+            | ExprKind::JsonDecodeUnion { input, .. } => {
+                move_expr!(self, input, moved, false, false)
+            }
             // `json.scan(input)` reads the input as a borrowed `str` view (never consumed) — J5.
             ExprKind::JsonScan { input, .. } => move_expr!(self, input, moved, false, false),
             // `json.doc(...)` and the doc accessors read their operands — a `str` input / key (borrowed),
@@ -31748,13 +31960,22 @@ impl<'a, 't> Checker<'a, 't> {
             }
         }
         self.constrain(Ty::Str, expected, span);
-        let static_text = hparts.iter().try_fold(String::new(), |mut text, part| match part {
-            TemplatePart::Text(part) => {
-                text.push_str(part);
-                Some(text)
-            }
-            TemplatePart::Hole(_) | TemplatePart::JsonStr(_) | TemplatePart::OwnedJsonString { .. } | TemplatePart::OwnedJsonOptionStringField { .. } | TemplatePart::OwnedJsonStringArray { .. } | TemplatePart::OptionField { .. } | TemplatePart::OptionStructField { .. } | TemplatePart::PopComma | TemplatePart::StructArrayField { .. } | TemplatePart::ScalarArrayField { .. } | TemplatePart::UnionValue { .. } => None,
-        });
+        let static_text = hparts
+            .iter()
+            .try_fold(String::new(), |mut text, part| match part {
+                TemplatePart::Text(part) => {
+                    text.push_str(part);
+                    Some(text)
+                }
+                TemplatePart::Hole(_)
+                | TemplatePart::JsonStr(_)
+                | TemplatePart::OptionField { .. }
+                | TemplatePart::OptionStructField { .. }
+                | TemplatePart::PopComma
+                | TemplatePart::StructArrayField { .. }
+                | TemplatePart::ScalarArrayField { .. }
+                | TemplatePart::UnionValue { .. } => None,
+            });
         if let Some(text) = static_text {
             return Expr { kind: ExprKind::Str(text), ty: Ty::Str, span };
         }
@@ -37639,121 +37860,27 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// Select and validate the direct-owned JSON route. Selection itself only observes direct
-    /// owned-text leaves; once selected, attributes and fields are checked in their deterministic
-    /// public-contract order. A record without such a leaf remains owned by the existing route.
+    /// Select and validate the recursive owned JSON route. Selection observes the complete record
+    /// graph; once a transitive owned-text leaf selects V2, the closed grammar is replayed in
+    /// deterministic source order before HIR construction.
     fn owned_json_route(&mut self, sid: u32, span: Span, dir: JsonDir) -> Option<OwnedJsonRoute> {
-        let Some(definition) = self.structs.get(sid as usize) else {
-            self.diags.error(format!("'{}' target has an unknown struct definition", dir.name()), span);
+        if self.structs.get(sid as usize).is_none() {
+            self.diags.error(
+                format!("'{}' target has an unknown struct definition", dir.name()),
+                span,
+            );
             return None;
-        };
-        let selected = definition.fields.iter().any(|field| {
-            matches!(
-                field.ty,
-                Ty::String | Ty::Option(Scalar::String) | Ty::DynArray(Scalar::String)
-            )
-        });
-        if !selected {
+        }
+        if !struct_has_transitive_owned_json_text(self.structs, sid) {
             return Some(OwnedJsonRoute::Existing);
         }
-        if definition.c_repr {
-            self.diags.error(
-                format!("'{}' owned JSON target '{}' cannot use `layout(C)`", dir.name(), definition.name),
-                span,
-            );
-            return None;
-        }
-        if definition.align.is_some() {
-            self.diags.error(
-                format!("'{}' owned JSON target '{}' cannot use explicit `align(N)`", dir.name(), definition.name),
-                span,
-            );
-            return None;
-        }
-        for field in &definition.fields {
-            let accepted = match field.ty {
-                Ty::Int(IntTy { bits: 8 | 16 | 32 | 64, .. })
-                | Ty::Bool
-                | Ty::String
-                | Ty::Option(Scalar::String)
-                | Ty::DynArray(Scalar::String) => true,
-                Ty::Str | Ty::DynArray(Scalar::Str) => {
-                    self.diags.error(
-                        format!(
-                            "'{}' owned JSON field '{}' has mixed borrowed type {}",
-                            dir.name(),
-                            field.name,
-                            ty_name(field.ty)
-                        ),
-                        span,
-                    );
-                    return None;
-                }
-                _ => false,
-            };
-            if !accepted {
-                self.diags.error(
-                    format!(
-                        "'{}' owned JSON field '{}' has unsupported type {} (int8/16/32/64, bool, string, Option<string>, or array<string> only)",
-                        dir.name(),
-                        field.name,
-                        ty_name(field.ty)
-                    ),
-                    span,
-                );
-                return None;
+        match owned_json_graph_plan_v2(self.structs, sid) {
+            Ok(plan) => Some(OwnedJsonRoute::Owned(plan)),
+            Err(reason) => {
+                self.diags.error(format!("'{}' {reason}", dir.name()), span);
+                None
             }
         }
-        Some(OwnedJsonRoute::Owned)
-    }
-
-    fn owned_json_encode_parts(
-        &self,
-        base: LocalId,
-        sid: u32,
-        span: Span,
-    ) -> Option<Vec<TemplatePart>> {
-        let definition = self.structs.get(sid as usize)?;
-        let has_option = definition
-            .fields
-            .iter()
-            .any(|field| field.ty == Ty::Option(Scalar::String));
-        let mut parts = vec![TemplatePart::Text("{".to_string())];
-        for (index, field) in definition.fields.iter().enumerate() {
-            let access = Expr {
-                kind: ExprKind::Field {
-                    root: base,
-                    path: vec![index as u32],
-                },
-                ty: field.ty,
-                span,
-            };
-            if field.ty == Ty::Option(Scalar::String) {
-                parts.push(TemplatePart::OwnedJsonOptionStringField {
-                    access,
-                    name: field.name.clone(),
-                });
-                continue;
-            }
-            let separator = if has_option || index == 0 { "" } else { "," };
-            parts.push(TemplatePart::Text(format!("{separator}\"{}\":", field.name)));
-            match field.ty {
-                Ty::String => parts.push(TemplatePart::OwnedJsonString { access }),
-                Ty::DynArray(Scalar::String) => {
-                    parts.push(TemplatePart::OwnedJsonStringArray { access })
-                }
-                Ty::Int(_) | Ty::Bool => parts.push(TemplatePart::Hole(access)),
-                _ => return None,
-            }
-            if has_option {
-                parts.push(TemplatePart::Text(",".to_string()));
-            }
-        }
-        if has_option {
-            parts.push(TemplatePart::PopComma);
-        }
-        parts.push(TemplatePart::Text("}".to_string()));
-        Some(parts)
     }
 
     /// `json.encode(s)` — encode a flat struct into a JSON object `str`. Desugars to the
@@ -37774,7 +37901,7 @@ impl<'a, 't> Checker<'a, 't> {
         };
         let kind = match route {
             OwnedJsonRoute::Existing => ExprKind::Template(parts),
-            OwnedJsonRoute::Owned => ExprKind::JsonOwnedEncode { base, parts },
+            OwnedJsonRoute::Owned(plan) => ExprKind::JsonOwnedEncode { base, plan },
         };
         Expr { kind, ty: Ty::Str, span }
     }
@@ -37796,16 +37923,22 @@ impl<'a, 't> Checker<'a, 't> {
         let mut ok = true;
         match ty {
             // A single struct → a JSON object.
-            Ty::Struct(sid) => {
-                match self.owned_json_route(sid, value.span, dir)? {
-                    OwnedJsonRoute::Existing => {
-                        self.json_object_parts(base, sid, None, &[], &[], &mut parts, value.span, &mut ok, dir);
-                    }
-                    OwnedJsonRoute::Owned => {
-                        parts = self.owned_json_encode_parts(base, sid, value.span)?;
-                    }
+            Ty::Struct(sid) => match self.owned_json_route(sid, value.span, dir)? {
+                OwnedJsonRoute::Existing => {
+                    self.json_object_parts(
+                        base,
+                        sid,
+                        None,
+                        &[],
+                        &[],
+                        &mut parts,
+                        value.span,
+                        &mut ok,
+                        dir,
+                    );
                 }
-            }
+                OwnedJsonRoute::Owned(_) => {}
+            },
             // A fixed struct-array → a JSON array of objects (unrolled; length is static).
             Ty::StructArray(sid, n) => {
                 parts.push(TemplatePart::Text("[".to_string()));
@@ -37875,9 +38008,9 @@ impl<'a, 't> Checker<'a, 't> {
                 parts,
                 max_bytes: Box::new(max_bytes),
             },
-            OwnedJsonRoute::Owned => ExprKind::JsonOwnedEncodeBounded {
+            OwnedJsonRoute::Owned(plan) => ExprKind::JsonOwnedEncodeBounded {
                 base,
-                parts,
+                plan,
                 max_bytes: Box::new(max_bytes),
             },
         };
@@ -38027,7 +38160,7 @@ impl<'a, 't> Checker<'a, 't> {
             Some(route) => route,
             None => return err,
         };
-        if route == OwnedJsonRoute::Existing
+        if matches!(route, OwnedJsonRoute::Existing)
             && !self.json_struct_fields_ok(sid, span, JsonDir::Decode)
         {
             return err;
@@ -38041,8 +38174,8 @@ impl<'a, 't> Checker<'a, 't> {
                 struct_id: sid,
                 input: Box::new(input),
             },
-            OwnedJsonRoute::Owned => ExprKind::JsonOwnedDecode {
-                struct_id: sid,
+            OwnedJsonRoute::Owned(plan) => ExprKind::JsonOwnedDecode {
+                plan,
                 input: Box::new(input),
             },
         };
@@ -43562,30 +43695,44 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(opt);
                 self.finalize_expr(fallback);
             }
-            ExprKind::Template(parts) | ExprKind::JsonOwnedEncode { parts, .. } => {
+            ExprKind::Template(parts) => {
                 for p in parts {
                     match p {
-                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) | TemplatePart::OwnedJsonString { access: h } | TemplatePart::OwnedJsonStringArray { access: h } => self.finalize_expr(h),
-                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } | TemplatePart::OwnedJsonOptionStringField { access, .. } => self.finalize_expr(access),
+                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.finalize_expr(h),
+                        TemplatePart::OptionField { access, .. }
+                        | TemplatePart::OptionStructField { access, .. }
+                        | TemplatePart::StructArrayField { access, .. }
+                        | TemplatePart::ScalarArrayField { access, .. }
+                        | TemplatePart::UnionValue { access, .. } => self.finalize_expr(access),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
             }
             ExprKind::JsonEncodeBounded {
                 parts, max_bytes, ..
-            } | ExprKind::JsonOwnedEncodeBounded {
-                parts, max_bytes, ..
             } => {
                 for p in parts {
                     match p {
-                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) | TemplatePart::OwnedJsonString { access: h } | TemplatePart::OwnedJsonStringArray { access: h } => self.finalize_expr(h),
-                        TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } | TemplatePart::OwnedJsonOptionStringField { access, .. } => self.finalize_expr(access),
+                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.finalize_expr(h),
+                        TemplatePart::OptionField { access, .. }
+                        | TemplatePart::OptionStructField { access, .. }
+                        | TemplatePart::StructArrayField { access, .. }
+                        | TemplatePart::ScalarArrayField { access, .. }
+                        | TemplatePart::UnionValue { access, .. } => self.finalize_expr(access),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
                 self.finalize_expr(max_bytes);
             }
-            ExprKind::JsonDecode { input, .. } | ExprKind::JsonOwnedDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.finalize_expr(input),
+            ExprKind::JsonOwnedEncode { .. } => {}
+            ExprKind::JsonOwnedEncodeBounded { max_bytes, .. } => self.finalize_expr(max_bytes),
+            ExprKind::JsonDecode { input, .. }
+            | ExprKind::JsonOwnedDecode { input, .. }
+            | ExprKind::JsonDecodeArray { input, .. }
+            | ExprKind::JsonDecodeScalar { input, .. }
+            | ExprKind::JsonDecodeStructArray { input, .. }
+            | ExprKind::JsonDecodeSoa { input, .. }
+            | ExprKind::JsonDecodeUnion { input, .. } => self.finalize_expr(input),
             ExprKind::JsonDoc { input } => self.finalize_expr(input),
             ExprKind::JsonScan { input, .. } => self.finalize_expr(input),
             ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } | ExprKind::JsonDocElems { doc } => self.finalize_expr(doc),
@@ -53574,6 +53721,55 @@ fn exit_branch(flag: bool) -> i64 {
             .expect("spawn deep JSON descriptor owner")
             .join()
             .expect("deep JSON descriptor owner");
+    }
+
+    #[test]
+    fn recursive_owned_json_constructor_depth_and_dag_are_exact() {
+        let source = |depth: usize| {
+            let mut source = String::from("import core.json\n");
+            for id in 0..depth {
+                if id + 1 == depth {
+                    source.push_str(&format!("OwnedDepth{id} {{ text: string }}\n"));
+                } else {
+                    source.push_str(&format!(
+                        "OwnedDepth{id} {{ next: OwnedDepth{} }}\n",
+                        id + 1
+                    ));
+                }
+            }
+            source.push_str(
+                "fn decode(data: str) -> Result<OwnedDepth0, Error> = json.decode(data)\nfn main() -> i32 = 0\n",
+            );
+            source
+        };
+
+        let (_, accepted) = check(&source(128));
+        assert!(
+            !accepted.has_errors(),
+            "depth 128 must be accepted: {:?}",
+            accepted
+                .iter()
+                .map(|diagnostic| &diagnostic.message)
+                .collect::<Vec<_>>()
+        );
+        let (_, rejected) = check(&source(129));
+        assert!(
+            rejected
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("maximum constructor depth 128"))
+        );
+
+        let dag = "import core.json\nLeaf { text: string }\nLeft { leaf: Leaf }\nRight { leaf: Leaf }\nRoot { left: Left, right: Right }\nfn decode(data: str) -> Result<Root, Error> = json.decode(data)\nfn main() -> i32 = 0\n";
+        let (program, diagnostics) = check(dag);
+        assert!(!diagnostics.has_errors());
+        let plan = owned_json_graph_plan_v2(&program.structs, 3).expect("DAG plan");
+        assert_eq!(
+            plan.records
+                .iter()
+                .map(|record| record.id)
+                .collect::<Vec<_>>(),
+            vec![3, 1, 0, 2]
+        );
     }
 
     #[test]

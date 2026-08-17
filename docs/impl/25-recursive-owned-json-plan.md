@@ -1237,6 +1237,40 @@ phase through sema, interface decode, checked-HIR replay, and all lowerers.
 | same-process and process concurrency | per-call state and immutable tables | 153-pair matrix expanded over recursive shapes plus two-process cache/runtime owner |
 | stack and malformed-input safety | iterative compiler graph machinery, max type depth 128, existing input depth 128 | type-depth 128/129, unknown-value depth 128/129, deeply surrounding expression out-of-line dispatch, malformed descriptor no-panic sweep |
 
+Implementation closure is owned by the checked-in tests named below. Rows that
+cross several control-flow or constructor cells use one parameterized owner as
+permitted by the repository test policy.
+
+- Formation, routing, generic substitution, exclusions, and diagnostic order:
+  `owned_json_formation_routing_and_multi_invalid_precedence_are_deterministic`
+  plus `recursive_owned_json_constructor_depth_and_dag_are_exact`.
+- The exact 50-record/543-field graph:
+  `recursive_owned_json_c6_graph_manifest`; field names, resolved types, source
+  order, and dependencies are pinned by one canonical graph hash and every root
+  rebuilds a V2 plan.
+- Checked-HIR and visitor closure:
+  `owned_json_checked_hir_mutation_sweep_fails_closed_at_all_lowering_entrypoints`
+  plus `owned_json_encoders_use_stack_safe_dispatch` and the existing variant
+  sweep tripwire.
+- Construction, canonical bytes, bounded parity, transfer, branch/error paths,
+  and source lifetime:
+  `recursive_owned_json_records_options_and_arrays_round_trip_canonically`,
+  `owned_json_decode_encode_and_bounded_round_trip_without_an_arena`, and
+  `owned_json_result_transfer_control_flow_replacement_and_drop_matrix`.
+- Failure cleanup, array staging, completed/current elements, and terminal
+  allocation policy: the `json_owned_*`, `json_nested_move_struct_array_*`, and
+  `json_array_of_move_struct_*` allocation-count owners in `align_runtime`.
+- Descriptor/envelope bytes and malformed input:
+  `recursive_descriptor_and_envelope_match_normative_goldens` and
+  `target_and_descriptor_mutations_fail_closed`, including every descriptor byte
+  and envelope truncation point.
+- Interface, cache, whole/per-unit, and concurrency parity:
+  `exported_owned_json_records_carry_one_target_bound_format_8_graph`,
+  `owned_json_descriptor_participates_in_cold_edit_revert_cache_identity`,
+  `cross_module_owned_json_record_keeps_descriptor_and_ownership_parity`,
+  `all_json_operation_variants_overlap_in_the_full_153_pair_matrix`, and
+  `owned_json_calls_are_independent_in_two_concurrent_processes`.
+
 This capability crosses type formation, checked HIR, MIR, interfaces/caches,
 LLVM layout/table generation, runtime parse/encode/allocation, and recursive
 cleanup. Splitting the producer-to-consumer chain would leave either a dormant

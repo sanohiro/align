@@ -56,8 +56,8 @@ pub use codec::{
 };
 pub use hash::Hash128;
 pub use owned_json::{
-    encode_owned_json_descriptor, encode_owned_json_envelope, OwnedJsonInterfaceEntry,
-    OwnedJsonObjectFormat, OwnedJsonTarget,
+    OwnedJsonGraphInterfaceEntry, OwnedJsonObjectFormat, OwnedJsonTarget,
+    encode_owned_json_graph_descriptor, encode_owned_json_graph_envelope,
 };
 pub use static_artifact::{
     decode_static_artifact, decode_static_command, decode_static_query, encode_static_command,
@@ -217,7 +217,7 @@ pub struct InterfaceSummary {
     pub structs: Vec<IStructDef>,
     /// Target-bound descriptors for every exported, concrete direct-owned JSON record, in the same
     /// name order as the selected subset of `structs`.
-    pub owned_json_descriptors: Vec<OwnedJsonInterfaceEntry>,
+    pub owned_json_graphs: Vec<OwnedJsonGraphInterfaceEntry>,
     /// Exported sum types, sorted by name.
     pub enums: Vec<IEnumDef>,
     /// Exported native resources, sorted by nominal name.
@@ -706,7 +706,7 @@ pub fn build_summaries_with_effects(
         resources.sort_by(|a, b| a.name.cmp(&b.name));
         consts.sort_by(|a, b| a.name.cmp(&b.name));
 
-        let owned_json_descriptors = owned_json::entries_for_structs(&structs, target)
+        let owned_json_graphs = owned_json::entries_for_structs(&structs, target)
             .ok_or_else(|| format!("unit '{}' has an unencodable owned JSON record", m.path))?;
 
         let mut capabilities = caps_by_unit.get(&m.path).cloned().unwrap_or_default();
@@ -718,7 +718,7 @@ pub fn build_summaries_with_effects(
             unit: m.path.clone(),
             fns,
             structs,
-            owned_json_descriptors,
+            owned_json_graphs,
             enums,
             resources,
             consts,

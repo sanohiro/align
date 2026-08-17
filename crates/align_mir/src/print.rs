@@ -601,14 +601,13 @@ fn rvalue_str(rv: &Rvalue) -> String {
                     crate::TemplatePiece::CharHole(o) => format!("char({})", operand_str(o)),
                     crate::TemplatePiece::FloatHole(o) => format!("float({})", operand_str(o)),
                     crate::TemplatePiece::JsonStrHole(o) => format!("json_str({})", operand_str(o)),
-                    crate::TemplatePiece::OwnedJsonString(o) => {
-                        format!("owned_json_str({})", operand_str(o))
-                    }
-                    crate::TemplatePiece::OwnedJsonOptionStringField { opt, name } => {
-                        format!("owned_opt_string_field({name:?}, {})", operand_str(opt))
-                    }
-                    crate::TemplatePiece::OwnedJsonStringArray(o) => {
-                        format!("owned_string_array({})", operand_str(o))
+                    crate::TemplatePiece::OwnedJsonObject { value, plan } => {
+                        format!(
+                            "owned_json_v2(root=struct#{}, graph={:?}, {})",
+                            plan.root,
+                            plan.records,
+                            operand_str(value)
+                        )
                     }
                     crate::TemplatePiece::OptionField { opt, name } => format!("opt_field({name:?}, {})", operand_str(opt)),
                     crate::TemplatePiece::OptionStructField { opt, name, struct_id } => {
@@ -636,8 +635,13 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::JsonDecode { struct_id, input, out, .. } => {
             format!("json_decode(struct#{struct_id}, {}, -> _{out})", operand_str(input))
         }
-        Rvalue::JsonOwnedDecode { struct_id, input, out } => {
-            format!("json_owned_decode(struct#{struct_id}, {}, -> _{out})", operand_str(input))
+        Rvalue::JsonOwnedDecode { plan, input, out } => {
+            format!(
+                "json_owned_decode_v2(struct#{}, graph={:?}, {}, -> _{out})",
+                plan.root,
+                plan.records,
+                operand_str(input)
+            )
         }
         Rvalue::JsonDecodeArray { elem, input, out } => {
             format!("json_decode_array({} x {}, -> _{out})", operand_str(input), crate::ty_name(*elem))
