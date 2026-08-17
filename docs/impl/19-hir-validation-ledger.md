@@ -742,6 +742,51 @@ means:
 | `ArrayGroupAggMulti` | `env[base,struct_id,key_field,aggs,source]`: source is producer-supported AosStr first cut; key is Str; nonempty aggs and each GroupAgg1 row valid. `child[]`; `post[result exact tuple of key array followed by one i64 array per agg; one fused pass; ownership/provenance as single aggregate]`. |
 | `ArrayDictEncode` | `env[base,struct_id,key_field]`: base is exactly DynStructArray(struct_id,Aos), key field is Str. `child[]`; `post[result DictEncoded(struct_id,key_field); dense ids owned, dictionary/source slices borrow base]`. |
 
+#### Planned Request 9 owned JSON HIR extension (not shipped)
+
+`docs/impl/24-owned-json-plan.md` adds a dedicated owned route. Until that
+implementation lands, the shipped `JsonDecode`, `Template`, and
+`JsonEncodeBounded` rows above retain their existing borrowed predicates and do
+not admit the new graph. The implementation adds these exact body-ledger rows:
+
+| Discriminator | Exact envelope, children, and postcondition |
+|---|---|
+| `JsonOwnedDecode` | `env[struct_id]`: an existing natural-layout direct record with at least one direct `String`, `Option<String>`, or `DynArray(String)` field; every other field is a required 8/16/32/64-bit signed/unsigned integer or Bool; the operation-specific classifier rejects every borrowed/nested/explicit-layout shape; its recursive `DropPlan`, free-standing allocation mode, and reconstructed `OwnedJsonDescV1` are exact. `child[input]`; `post[input Str; result ERR(Struct(struct_id)); every decoded owner is free-standing at every arena depth; no input/arena provenance; successful ownership transfers once]`. |
+| `JsonOwnedEncode` | `env[base,parts.len]`: base is one visible local of an accepted direct-owned record; reconstructing the complete graph and `OwnedJsonDescV1` exactly matches every part name, access root/path, type, declaration ordinal, and descriptor identity; parts are nonempty. `child[parts in canonical order]`; `post[result Str under the existing template-view lifetime; every access borrows base; base is neither moved nor mutated; hidden builder cleanup/transfer exact]`. |
+| `JsonOwnedEncodeBounded` | `env[base,parts.len]`: the same source and exact-plan reconstruction as `JsonOwnedEncode`. `child[parts in canonical order,max_bytes]`; `post[max_bytes exactly i64 after all source parts; result exactly Result<String,builtin Error>; source borrowed; success owns one free-standing String and failure owns no partial output]`. |
+
+The only new part discriminants are:
+
+| Discriminator | Exact operand contract |
+|---|---|
+| `OwnedJsonString` | `child[access]`; access is the exact direct owned String field recorded at this source ordinal; borrow its bytes and append one JSON string without transfer. |
+| `OwnedJsonOptionStringField` | `env[name]`: exact nonempty ASCII declared field name. `child[access]`; access is the exact direct Option(String) field; omit None and encode Some once without transfer. |
+| `OwnedJsonStringArray` | `child[access]`; access is the exact direct DynArray(String) field; borrow the spine/elements and emit them in index order without transfer. |
+
+These nodes do not reuse or widen `json_struct_descriptor_ok`, the scanner Copy
+predicate, the AoS predicate, or the generic template grammar. One dedicated
+iterative classifier is shared only by the three `JsonOwned*` validators. The
+active body gate first applies its existing span/global/placement/header order,
+then checks the owned node envelope, graph/layout/Drop/descriptor reconstruction,
+children in the table order, stored expression result type, and ownership facts.
+Any failure returns canonical-empty MIR with the body-validation pass identity
+from whole-program, located, per-unit, and located-per-unit lowering before
+descriptor emission or a runtime call.
+
+The parameterized owner mutates each owned node into every sibling discriminator;
+unknown and borrowed-only record ids; each disallowed field/layout; every integer
+width/sign and each owned field kind; missing/reordered/duplicated/wrong-root or
+wrong-type parts; descriptor/allocation/Drop disagreement; wrong input/limit/result
+types; and active-arena depth. It proves the three positive nodes and every
+mutation across all four lowering entrypoints, with whole/per-unit identity. The
+interface owner separately rejects malformed `OwnedJsonDescV1` before this gate;
+the body owner recomputes the semantic descriptor so handcrafted HIR cannot forge
+or bypass that interface check. The same owner plus `variant_sweep_tripwire`
+requires every exhaustive HIR/MIR visitor, replay/clone walk, child enumerator,
+source-shape/implementation-hash encoder, validator, and lowering dispatcher to
+classify the new nodes and parts explicitly; a wildcard may not silently skip an
+analysis pass.
+
 #### Fixed-array element admission closure
 
 The `ArrayLit` producer and validator close the ownership boundary by element class:

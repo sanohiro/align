@@ -1789,9 +1789,8 @@ first_name := arena {
 ```
 
 The compiler never silently inserts a copy on escape — allocation stays visible in source
-("Nothing hidden") and the cost class stays predictable. In the current implementation,
-`str.clone()` always produces a free-standing heap-owned `string`, including inside an arena, so
-the copied result may outlive the arena and carries its ordinary `Drop`.
+("Nothing hidden") and the cost class stays predictable. A `.clone()` inside an arena is a
+bump allocation (bulk-freed), so escaping is not a sudden heap cost.
 
 ### Direct owned records
 

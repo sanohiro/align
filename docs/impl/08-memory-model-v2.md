@@ -128,9 +128,8 @@ free-standing **owned** `array`/`string` is heap-owned and `Static`-lived *until
 frame-local array literal, or a view into a by-value parameter's interior), never for a
 view *parameter* (which borrows the caller → `Static`, returnable).
 
-\*\* Prose about making an in-arena clone a bump allocation drifted from the current heap-owned
-implementation. The current contract keeps `str.clone()` free-standing inside and outside an arena;
-an arena-backed clone remains deferred rather than silently changing that lifetime.
+\*\* Prose about making an in-arena clone a bump allocation has drifted from the current heap-owned
+implementation. Audit 13 leaves that contract as a Claude Code question rather than deciding it.
 
 Regions are never written by the user and never appear in a type. They live only in the
 checker (an inferred property of each binding), exactly like today's `region` map — just
@@ -296,8 +295,8 @@ Rationale (the four-way-alignment / hardware case):
 - The only difference is the rare escape path, where a copy is physically unavoidable; making
   it an explicit `.clone()` keeps **Nothing hidden** and **Predictable performance** (no
   silent cost-class jump when a value starts to escape).
-- An escaping `.clone()` remains a free-standing heap owner even inside an arena. The explicit
-  operation keeps the allocation and lifetime change visible; no arena-backed clone is inferred.
+- An escaping `.clone()` *inside an arena* is a bump allocation (cache-local, bulk-freed), so
+  "escape" is not a malloc cliff.
 
 This **supersedes** the current draft.md §12 "Zero Copy" wording ("only when there is an
 escape is a decode buffer used"), which implied a compiler-inserted copy. §12 must be updated

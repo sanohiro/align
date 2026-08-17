@@ -109,9 +109,9 @@ one reviewed recursive graph.
 
 | Surface | Exact input and defaults | Result and errors | Ownership, lifetime, allocation | Compiler/runtime owner | Artifact and cache identity | Prerequisite and acceptance owner |
 | --- | --- | --- | --- | --- | --- | --- |
-| `json.decode(input: str) -> Result<T, Error>` where `T` is the closed direct-owned record | One positional `str`; no default or ambient input. Expected-result inference chooses `T`. | `Ok(T)` or existing `Error.Code(1)`. Compile-time capability, arity, inference, graph, and layout failures remain diagnostics. Runtime UTF-8, string grammar, object syntax, duplicate, shape, range, missing-field, and trailing-input failures are recoverable. Capacity overflow and allocation failure retain the runtime-wide terminal-abort policy. | Every `string` is an independent free-standing owner. `array<string>` owns one dynamic spine and every element string. `Option<string>` owns only `Some`. The result is `Static`, has no input or arena dependency, and remains free-standing even when the call appears inside `arena {}`. The owned target makes this allocation choice visible. | `align_sema` route and graph validation; MIR result/out-slot construction; LLVM descriptors and recursive Drop; runtime parse, allocation, cleanup, and integer writers. | `OwnedJsonDescV1` below is structural, target-local, and part of interface/cache identity. Existing HIR/MIR record definitions remain the semantic source. | Request 7 grammar and Request 15 cleanup are merged. Focused owners are the implementation matrix in §8. |
-| `json.encode(value: T) -> str` | One positional bound direct-record value. The source is borrowed for the call and is neither moved nor mutated. | Infallible after compile-time graph/descriptor validation. | Uses the existing template builder. Inside an arena the returned view is arena-backed. Outside an arena it has the existing hidden scoped string owner and cannot escape the frame. Persisting it requires explicit `.clone()`. Source owners remain live and unchanged. | Shared checked encode plan, MIR template pieces, LLVM field access, runtime canonical string/array writers. | The same `OwnedJsonDescV1` graph and target-local offsets as decode. Field order is declaration order. | Exact canonical vectors and source-nonmutation owners in §8. |
-| `json.encode_bounded(value: T, max_bytes: i64) -> Result<string, Error>` | The same direct-record value plus exact `i64` inclusive limit. No default. | Existing bounded semantics: negative or exceeded limit is `Err(Error.Invalid)`; success is `Ok(string)`; allocation failure is terminal. | Success owns one free-standing `string`. The source is borrowed and unchanged. No unbounded-first pass or discarded partial public value exists. | The same checked encode plan as `json.encode`; existing bounded builder/finalizer owns limit behavior. | Identical graph/descriptor identity and canonical bytes to `json.encode`. | Existing Request 12 bounded owners plus owned-field byte-parity and limit-boundary rows in §8. |
+| `json.decode(input: str) -> Result<T, Error>` where `T` is the closed direct-owned record | One positional `str`; no default or ambient input. Expected-result inference chooses `T`. | `Ok(T)` or existing `Error.Code(1)`. Compile-time capability, arity, inference, graph, and layout failures remain diagnostics. Runtime UTF-8, string grammar, object syntax, duplicate, shape, range, missing-field, and trailing-input failures are recoverable. Capacity overflow and allocation failure retain the runtime-wide terminal-abort policy. | Every `string` is an independent free-standing owner. `array<string>` owns one dynamic spine and every element string. `Option<string>` owns only `Some`. The result is `Static`, has no input or arena dependency, and remains free-standing even when the call appears inside `arena {}`. The owned target makes this allocation choice visible. | `align_sema` route and graph validation; checked-HIR route/envelope validation; MIR result/out-slot construction; LLVM descriptors and recursive Drop; runtime parse, allocation, cleanup, and integer writers. | `OwnedJsonDescV1` below is structural, target-local, and part of interface/cache identity. Existing HIR/MIR record definitions remain the semantic source. | Request 7 grammar and Request 15 cleanup are merged. Focused owners are the implementation matrix in §8. |
+| `json.encode(value: T) -> str` | One positional bound direct-record value. The source is borrowed for the call and is neither moved nor mutated. | Infallible after compile-time graph/descriptor validation. | Uses the existing template builder. Inside an arena the returned view is arena-backed. Outside an arena it has the existing hidden scoped string owner and cannot escape the frame. Persisting it requires explicit `.clone()`. Source owners remain live and unchanged. | Shared sema plan plus dedicated checked-HIR plan reconstruction; MIR template pieces; LLVM field access; runtime canonical string/array writers. | The same `OwnedJsonDescV1` graph and target-local offsets as decode. Field order is declaration order. | Exact canonical vectors and source-nonmutation owners in §8. |
+| `json.encode_bounded(value: T, max_bytes: i64) -> Result<string, Error>` | The same direct-record value plus exact `i64` inclusive limit. No default. | Existing bounded semantics: negative or exceeded limit is `Err(Error.Invalid)`; success is `Ok(string)`; allocation failure is terminal. | Success owns one free-standing `string`. The source is borrowed and unchanged. No unbounded-first pass or discarded partial public value exists. | The same sema and checked-HIR plan as `json.encode`; existing bounded builder/finalizer owns limit behavior. | Identical graph/descriptor identity and canonical bytes to `json.encode`. | Existing Request 12 bounded owners plus owned-field byte-parity and limit-boundary rows in §8. |
 
 The two encode operations must share one accepted graph and ordered plan. A
 field accepted by one and rejected by the other is a compiler bug.
@@ -173,6 +173,23 @@ Validation precedence is deterministic:
 5. missing required fields at object close;
 6. non-whitespace trailing input;
 7. successful result publication and Move transfer.
+
+Encode has a separate deterministic compile-time order:
+
+1. import/capability and arity;
+2. source-local/place formation and resolved target class;
+3. operation-specific route selection, complete graph, natural layout,
+   recursive `DropPlan`, descriptor identity, and exact canonical part plan;
+4. for `encode_bounded` only, `max_bytes` expression checking followed by the
+   exact-`i64` requirement.
+
+An unsupported owned graph therefore wins over a simultaneously non-`i64`
+limit. After checked HIR, runtime evaluation reads the already-bound source
+parts in canonical plan order, then evaluates `max_bytes`, then initializes the
+builder. A negative limit makes that builder sticky-invalid with zero payload
+allocation; exact-limit success and first-byte-over-limit failure follow the
+existing bounded writer order. Source reads may precede the negative-limit
+decision, but no source is moved or mutated and no output owner is published.
 
 A recoverable failure preserves the first error and publishes no partial value.
 It drops live direct fields in source declaration order. A live
@@ -287,10 +304,33 @@ The independent descriptor golden owner must construct this byte sequence from
 the semantic declaration and decode the same bytes back to the semantic fields,
 including `attempts` at record offset 72, `enabled` at 74, and the nonzero
 `note` field's record-relative payload/tag offsets 56/48. One-field mutations
-cover version, layout mode/algorithm, count/length truncation and overflow,
-name grammar/duplicate/order, type payload, signedness, offset, optional sentinel,
-size/alignment, allocation/drop agreement, array element/drop-plan pair, and
-trailing bytes.
+cover version, layout mode/algorithm, zero count, count/length truncation and
+overflow, name grammar/duplicate/order, unknown/reserved type tag, type payload,
+signedness, offset, optional sentinel, size/alignment, allocation/drop agreement,
+array element/drop-plan pair, and trailing bytes.
+
+Descriptor validation has one deterministic failure order:
+
+1. target triple and ABI identity;
+2. seven-byte header availability, then schema version, layout mode, layout
+   algorithm, nonzero field count, and equality to the expected direct-record
+   field count in that order;
+3. each source-ordinal field in order: name-length availability and checked
+   remaining-byte bound, nonempty ASCII identifier grammar, uniqueness and
+   equality to the expected field name, accepted type tag, exact tag-specific
+   payload, physical payload offset, optional tag offset/sentinel, ABI size,
+   ABI alignment, allocation mode, and drop tag;
+4. exact end of record, rejecting any trailing byte.
+
+The first failing check is the only reported cause. An imported interface with
+malformed bytes or a semantic mismatch is rejected as an interface decode
+diagnostic before cache lookup, checked-HIR lowering, or codegen; it is never
+silently rebuilt. A well-formed descriptor whose identity differs at an object
+cache lookup is an ordinary cache miss and is rebuilt from current checked HIR.
+Whole-program compilation constructs the descriptor from validated semantic
+types, while handcrafted malformed HIR fails the checked-HIR gate before the
+descriptor producer. These outcomes are identical for whole-program and
+per-unit compilation.
 
 The descriptor is structural over the complete accepted direct graph. Field
 rename/reorder/type/width/signedness/layout/allocation/drop changes invalidate
@@ -334,6 +374,13 @@ Kinds `0..=7` retain their existing meanings. For the two new kinds the packed
 integer signedness bit is zero and `sub` is null. The table's `offset` is the
 record-relative payload offset already validated by `OwnedJsonDescV1`; no runtime
 host-layout reconstruction is permitted.
+
+Kinds `8` and `9` are legal only on the direct-owned A103 decode path and its
+internal failure cleanup. Encode never passes them to A80. `OwnedJsonString` and
+`OwnedJsonOptionStringField` use the existing JSON-string writer A73;
+`OwnedJsonStringArray` uses A74 with the existing read-only `str` element tag
+`(3 << 8) | 16`, since owned `string` and borrowed `str` share the same
+`{ptr,len}` read layout. This changes no encode runtime function type.
 
 ## 6. Routing and exclusions
 
@@ -386,11 +433,54 @@ owned route classifier and checked plan, then thread that exact plan through
 construction and cleanup. Existing routes remain executable throughout local
 development.
 
+### 7.1 Checked-HIR and MIR boundary
+
+The owned route uses dedicated HIR discriminants so malformed or imported HIR
+cannot reinterpret an existing borrowed, AoS, union, or scanner node:
+
+```text
+JsonOwnedDecode { struct_id, input }
+JsonOwnedEncode { base, parts }
+JsonOwnedEncodeBounded { base, parts, max_bytes }
+```
+
+Its exact new template parts are `OwnedJsonString { access }`,
+`OwnedJsonOptionStringField { name, access }`, and
+`OwnedJsonStringArray { access }`. Static object syntax remains in `Text` parts;
+all Copy fields retain their existing exact writer parts. Existing `JsonDecode`,
+`Template`, `JsonEncodeBounded`, `JsonDecodeStructArray`, union, SoA, and
+`JsonScan` discriminants retain their current predicates and reject the new
+owned graph.
+
+The active checked-HIR body gate independently reconstructs the closed direct
+graph and `OwnedJsonDescV1` from `struct_id`/`base`, validates natural layout,
+the recursive `DropPlan`, exact result type, every part name/access/type/order,
+and the operation-specific allocation mode, then compares the reconstructed
+plan to the stored parts. `JsonOwnedDecode` requires `input: str`, returns exact
+`Result<Struct, Error>`, and records free-standing output even at nonzero arena
+depth. The two encode nodes require one visible bound source local and borrow
+every access; bounded encode additionally validates `max_bytes: i64` after all
+source parts and returns exact `Result<string, Error>`.
+
+Validated owned decode lowers to a distinct MIR `JsonOwnedDecode` rvalue so its
+free-standing allocation and recursive cleanup cannot be confused with the
+nullable-arena borrowed rvalue. Owned encode lowers to the existing builder
+machinery only after its dedicated HIR plan has validated; its three new part
+kinds remain distinct through MIR and LLVM writer selection. All whole-program,
+located, per-unit, and located-per-unit entrypoints run the same active body
+gate. Any malformed owned node or part returns the canonical empty MIR with the
+body-validation pass identity before descriptor emission or runtime calls.
+Adding these HIR nodes, part kinds, and the MIR rvalue also extends every
+exhaustive visitor, replay/clone walk, source-shape/implementation-hash encoder,
+child enumerator, validator, lowering dispatcher, and enum-sweep tripwire in the
+same commit. No wildcard arm may make a new node silently skip an analysis pass.
+
 ## 8. Implementation closure matrix
 
 | Cell | Implementation owner | Required owner |
 | --- | --- | --- |
-| formation, inference, selected/non-selected route, mixed/nested/layout rejection | `align_sema` direct-owned classifier beside existing JSON shape checks | `m5_owned_json::formation_and_target_routing` plus generic substitutions |
+| formation, inference, selected/non-selected route, mixed/nested/layout rejection | `align_sema` direct-owned classifier beside existing JSON shape checks | `m5_owned_json::formation_and_target_routing` plus every integer width/sign and generic substitutions |
+| checked-HIR route, envelope, plan reconstruction, ownership mode, malformed-node refusal, and new-variant consumer sweep | dedicated `JsonOwned*`/owned-part validator in the active body gate; exhaustive HIR/MIR visitors and source-shape/hash encoders; existing route predicates unchanged | parameterized `validate_hir` mutation sweep over node, type, field, part, descriptor, allocation, whole/per-unit, all four lowering entrypoints, and `variant_sweep_tripwire` |
 | construction of direct string, optional string, and text array; empty/NUL/UTF-8/escape states | MIR owned decode result + runtime owned writers | `decode_owned_text_states_detach_from_input` |
 | allocation inside/outside arena, input drop, move-out, return | sema region/allocation mode + MIR cleanup bit | `owned_decode_is_free_standing_inside_arena` and `owned_decode_outlives_input` |
 | move-in/out, raw `Result`, parameter/return/reassignment, source nulling | canonical recursive Move/Drop paths | `owned_json_result_transfer_matrix` |
@@ -415,10 +505,10 @@ of the complete root-cause class before the one fix commit.
 
 This design commit updates `draft.md`, `docs/language-spec.md`,
 `docs/design-notes.md`, `docs/impl/08-memory-model-v2.md`, the English/Japanese
-JSON designs, the runtime ABI ledger, `docs/open-questions.md`, and `HANDOFF.md`.
-The implementation must update this plan's status and those sources only where
-the shipped contract or capability state changes. It also adds the Align-owned
-syntax/golden fixtures.
+JSON designs, the checked-HIR and runtime ABI ledgers, `docs/open-questions.md`,
+and `HANDOFF.md`. The implementation must update this plan's status and those
+sources only where the shipped contract or capability state changes. It also
+adds the Align-owned syntax/golden fixtures.
 
 After Align merges the implementation, update the sibling request register with
 the merged PR, exact ownership surface and limits, leave that edit uncommitted,
