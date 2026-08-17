@@ -4639,8 +4639,9 @@ Decoded text is free-standing even inside `arena {}`, so the result has no input
 the owned target types plus `json.decode` make materialization visible. Borrowed graphs keep the
 zero-copy Request 7 route, and mixed graphs reject instead of cloning. `json.encode` and
 `json.encode_bounded` use the same accepted graph and ordered encode plan. The compiler-private,
-target-local structural descriptor and the complete ownership/error matrix are fixed in
-`docs/impl/24-owned-json-plan.md`. This does not add top-level owned text, owned AoS/SoA/union/
+target-local structural descriptor is serialized only inside its canonical target/ABI-bound
+interface envelope; the complete artifact, validation-order, and ownership/error matrices are fixed
+in `docs/impl/24-owned-json-plan.md`. This does not add top-level owned text, owned AoS/SoA/union/
 scanner rows, a dynamic JSON tree, or the later recursive Request 13 graph.
 
 **T3 — streaming: `json.scan` (SETTLED → SHIPPED as J5, #546 + #547; Request 6 safety gate pending).** NDJSON /

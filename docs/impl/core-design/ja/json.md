@@ -95,8 +95,10 @@ decode/encode する。missing と `null` は `None`、`None` は omit、`Some("
 
 checked compiler-private `OwnedJsonDescV1` は structural かつ target-local である。field name と
 declaration order、integer width/sign、natural-layout algorithm と offset、optional tag/payload offset、
-allocation/drop tag、`array<string>` element Drop-plan version を固定する。per-unit interface と cache
-identity に含むが、public artifact や reflection surface ではない。既存 AoS、SoA、union、fixed-array、
+allocation/drop tag、`array<string>` element Drop-plan version を固定する。naked には serialize せず、
+per-unit interface は canonical LLVM target triple、object format、関連する exact ABI cell を
+`OwnedJsonInterfaceEnvelopeV1` で bind してから cache identity に含める。envelope は descriptor offset を
+trust する前に target/ABI mismatch を拒否し、public artifact や reflection surface ではない。既存 AoS、SoA、union、fixed-array、
 scalar-array、`json.doc`、recursively-Copy `json.scan` route は変更しない。
 
 exact public ledger、descriptor bytes、error precedence、implementation closure matrix、golden vector の

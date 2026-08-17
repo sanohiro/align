@@ -109,12 +109,21 @@ one reviewed recursive graph.
 
 | Surface | Exact input and defaults | Result and errors | Ownership, lifetime, allocation | Compiler/runtime owner | Artifact and cache identity | Prerequisite and acceptance owner |
 | --- | --- | --- | --- | --- | --- | --- |
-| `json.decode(input: str) -> Result<T, Error>` where `T` is the closed direct-owned record | One positional `str`; no default or ambient input. Expected-result inference chooses `T`. | `Ok(T)` or existing `Error.Code(1)`. Compile-time capability, arity, inference, graph, and layout failures remain diagnostics. Runtime UTF-8, string grammar, object syntax, duplicate, shape, range, missing-field, and trailing-input failures are recoverable. Capacity overflow and allocation failure retain the runtime-wide terminal-abort policy. | Every `string` is an independent free-standing owner. `array<string>` owns one dynamic spine and every element string. `Option<string>` owns only `Some`. The result is `Static`, has no input or arena dependency, and remains free-standing even when the call appears inside `arena {}`. The owned target makes this allocation choice visible. | `align_sema` route and graph validation; checked-HIR route/envelope validation; MIR result/out-slot construction; LLVM descriptors and recursive Drop; runtime parse, allocation, cleanup, and integer writers. | `OwnedJsonDescV1` below is structural, target-local, and part of interface/cache identity. Existing HIR/MIR record definitions remain the semantic source. | Request 7 grammar and Request 15 cleanup are merged. Focused owners are the implementation matrix in §8. |
+| `json.decode(input: str) -> Result<T, Error>` where `T` is the closed direct-owned record | One positional `str`; no default or ambient input. Expected-result inference chooses `T`. | `Ok(T)` or existing `Error.Code(1)`. Compile-time capability, arity, inference, graph, and layout failures remain diagnostics. Runtime UTF-8, string grammar, object syntax, duplicate, shape, range, missing-field, and trailing-input failures are recoverable. Capacity overflow and allocation failure retain the runtime-wide terminal-abort policy. | Every `string` is an independent free-standing owner. `array<string>` owns one dynamic spine and every element string. `Option<string>` owns only `Some`. The result is `Static`, has no input or arena dependency, and remains free-standing even when the call appears inside `arena {}`. The owned target makes this allocation choice visible. | `align_sema` route and graph validation; interface target-envelope validation; checked-HIR route/envelope validation; MIR result/out-slot construction; LLVM descriptors and recursive Drop; runtime parse, allocation, cleanup, and integer writers. | `OwnedJsonDescV1` below is structural and target-local. A serialized descriptor is carried only in the exact target-bound interface envelope below; both are part of interface/cache identity. Existing HIR/MIR record definitions remain the semantic source. | Request 7 grammar and Request 15 cleanup are merged. Focused owners are the implementation matrix in §8. |
 | `json.encode(value: T) -> str` | One positional bound direct-record value. The source is borrowed for the call and is neither moved nor mutated. | Infallible after compile-time graph/descriptor validation. | Uses the existing template builder. Inside an arena the returned view is arena-backed. Outside an arena it has the existing hidden scoped string owner and cannot escape the frame. Persisting it requires explicit `.clone()`. Source owners remain live and unchanged. | Shared sema plan plus dedicated checked-HIR plan reconstruction; MIR template pieces; LLVM field access; runtime canonical string/array writers. | The same `OwnedJsonDescV1` graph and target-local offsets as decode. Field order is declaration order. | Exact canonical vectors and source-nonmutation owners in §8. |
 | `json.encode_bounded(value: T, max_bytes: i64) -> Result<string, Error>` | The same direct-record value plus exact `i64` inclusive limit. No default. | Existing bounded semantics: negative or exceeded limit is `Err(Error.Invalid)`; success is `Ok(string)`; allocation failure is terminal. | Success owns one free-standing `string`. The source is borrowed and unchanged. No unbounded-first pass or discarded partial public value exists. | The same sema and checked-HIR plan as `json.encode`; existing bounded builder/finalizer owns limit behavior. | Identical graph/descriptor identity and canonical bytes to `json.encode`. | Existing Request 12 bounded owners plus owned-field byte-parity and limit-boundary rows in §8. |
 
 The two encode operations must share one accepted graph and ordered plan. A
 field accepted by one and rejected by the other is a compiler bug.
+
+`align_sema` owns the shared semantic classifier and `TypeLayoutCache` values.
+The driver supplies the canonical target triple/object format to
+`align_interface`, which owns the exported-record list, envelope codec, hash,
+and import validation without depending on LLVM codegen. `align_codegen_llvm`
+independently compares the accepted offsets and ABI cells with the current
+`TargetData` before emitting a runtime table. Private/current-unit records and
+consumer monomorphs use the same semantic encoder through their checked-HIR/MIR
+identity path. No layer reconstructs target identity from descriptor offsets.
 
 No performance threshold is part of this capability. Whole/per-unit allocation
 parity is a correctness measurement, not a benchmark promise.
@@ -162,33 +171,50 @@ map to `None` only for `Option<string>`; `None` is omitted on encode, while
 `Some("")` emits an explicit empty string. Required fields reject missing and
 `null`; an `array<string>` element rejects `null`.
 
-Validation precedence is deterministic:
+Validation precedence is deterministic. Route selection first confirms a direct
+record and scans its resolved fields only to decide whether at least one direct
+`string`, `Option<string>`, or `array<string>` leaf exists. With no such leaf the
+existing route owns all later validation. Once an owned leaf selects this route,
+the owned classifier uses this exact order:
 
 1. import/capability, arity, and expected-type inference;
-2. direct-owned route selection, closed graph, natural layout, recursive
-   `DropPlan`, allocation mode, interface identity, and input type;
-3. complete input UTF-8 and JSON string-token grammar validation;
-4. object parsing in input order: syntax, declared-key duplicate, value shape,
+2. direct-record identity, then `layout(C)`, then `align(N)` rejection;
+3. fields in source declaration order. For one field, resolved-type completeness
+   precedes the outer constructor; integer width/sign or exact `string` payload
+   follows that constructor. `Option` accepts only `string`; dynamic array accepts
+   only `string`; a direct `str` or `array<str>` reports the mixed-borrowed error;
+   every other constructor reports the unsupported-owned-field error. The first
+   failing field is the only graph diagnostic;
+4. canonical natural layout, recursive `DropPlan`, free-standing allocation mode,
+   target-bound interface identity, and input type in that order;
+5. complete input UTF-8 and JSON string-token grammar validation;
+6. object parsing in input order: syntax, declared-key duplicate, value shape,
    integer range, and array-element failures;
-5. missing required fields at object close;
-6. non-whitespace trailing input;
-7. successful result publication and Move transfer.
+7. missing required fields at object close;
+8. non-whitespace trailing input;
+9. successful result publication and Move transfer.
 
 Encode has a separate deterministic compile-time order:
 
 1. import/capability and arity;
 2. source-local/place formation and resolved target class;
-3. operation-specific route selection, complete graph, natural layout,
-   recursive `DropPlan`, descriptor identity, and exact canonical part plan;
-4. for `encode_bounded` only, `max_bytes` expression checking followed by the
+3. the same owned-leaf selector, attribute order, source-ordinal field order,
+   natural layout, `DropPlan`, allocation mode, and target-bound descriptor
+   identity used by decode;
+4. exact canonical part plan in source ordinal order;
+5. for `encode_bounded` only, `max_bytes` expression checking followed by the
    exact-`i64` requirement.
 
-An unsupported owned graph therefore wins over a simultaneously non-`i64`
-limit. After checked HIR, runtime evaluation reads the already-bound source
-parts in canonical plan order, then evaluates `max_bytes`, then initializes the
-builder. A negative limit makes that builder sticky-invalid with zero payload
-allocation; exact-limit success and first-byte-over-limit failure follow the
-existing bounded writer order. Source reads may precede the negative-limit
+An explicit layout error wins over every field error; otherwise the earliest
+invalid source field wins, and that graph error wins over a simultaneously
+non-`i64` limit. A parameterized multi-invalid owner permutes attribute, field
+ordinal, field-shape, target-envelope, input, part, and limit failures through
+sema, interface import, checked-HIR replay, and all four lowerers and requires
+this same first cause. After checked HIR, runtime evaluation reads the
+already-bound source parts in canonical plan order, then evaluates `max_bytes`,
+then initializes the builder. A negative limit makes that builder sticky-invalid
+with zero payload allocation; exact-limit success and first-byte-over-limit
+failure follow the existing bounded writer order. Source reads may precede the negative-limit
 decision, but no source is moved or mutated and no output owner is published.
 
 A recoverable failure preserves the first error and publishes no partial value.
@@ -241,10 +267,12 @@ input.
 
 ## 5. Checked descriptor and ABI
 
-`OwnedJsonDescV1` is a compiler-private canonical byte record. It is serialized
-in per-unit interface data and included in the implementation/cache fingerprint.
-Whole-program compilation constructs the identical record. It is not a public
-file format or runtime-reflection API.
+`OwnedJsonDescV1` is a compiler-private canonical byte record. It is target-local
+and is never serialized naked. Per-unit interface data carries it in the exact
+target-bound `OwnedJsonInterfaceEnvelopeV1` below, and both records participate
+in interface/cache identity. Whole-program compilation constructs the identical
+inner descriptor for its current target. Neither record is a public file format
+or runtime-reflection API.
 
 ```text
 descriptor := u8 schema_version (= 1)
@@ -286,6 +314,79 @@ algorithm must equal the compiler's canonical `TypeLayoutCache`/
 `logical_to_physical` result. Counts, lengths, and offsets use checked arithmetic.
 Trailing bytes reject.
 
+The interface codec adds `owned_json_descriptors` after the exported struct
+definitions and before exported enums. It is a `u32` little-endian count followed
+by this record, sorted by exported local struct name:
+
+```text
+owned_json_interface_entry := u32 type_name_len_le
+                              u8[type_name_len] type_name_ascii
+                              u32 envelope_len_le
+                              u8[envelope_len] envelope
+
+envelope := u8 envelope_version (= 1)
+            u32 target_triple_len_le
+            u8[target_triple_len] llvm_canonical_target_triple_ascii
+            u8 object_format        // 0 ELF, 1 Mach-O
+            u8 endian               // 0 little; no other v1 value
+            u8 pointer_size         // 8
+            u8 pointer_align        // 8
+            u8 string_size          // 16
+            u8 string_align         // 8
+            u8 array_header_size    // 16
+            u8 array_header_align   // 8
+            u8 option_string_size   // 24
+            u8 option_string_align  // 8
+            u8 option_tag_offset    // 0
+            u8 option_payload_offset // 8
+            u64 abi_hash_lo_le
+            u64 abi_hash_hi_le
+            u32 descriptor_len_le
+            u8[descriptor_len] OwnedJsonDescV1
+```
+
+The canonical target triple is exactly `align_codegen_llvm::default_triple()`;
+it is nonempty ASCII with no NUL and is not a Rust distribution target alias.
+The ABI bytes deliberately name every target-dependent layout fact used by the
+v1 graph. The three supported release targets must match this 64-bit
+little-endian ABI tuple; a future target with any different value cannot produce
+or import a v1 envelope. `abi_hash` is existing `Hash128::of` over the envelope
+bytes from `envelope_version` through `option_payload_offset`, in exact encoded
+order. It is a local non-cryptographic consistency identity, not an authenticity
+claim. The enclosing interface hash covers the entry name, complete envelope,
+hash, and inner descriptor.
+
+The list contains exactly one entry for each non-generic exported struct that
+matches the direct-owned grammar, in the same name order as the corresponding
+interface struct table. Generic definitions remain semantic interface records;
+each accepted concrete monomorph constructs its target-local envelope in the
+consumer and folds it into that consumer's structural MIR implementation hash.
+Private/current-unit concrete descriptors likewise live in checked HIR/MIR and
+the implementation hash, never the public interface hash. This preserves the
+interface/implementation split: a private body edit cannot invalidate consumers.
+Duplicate, missing, extra, generic, unknown-name, or out-of-order entries reject.
+Identity is explicit: inner descriptor and ABI envelope bytes are structural;
+the interface entry's `type_name` association is nominal within `summary.unit`.
+The enclosing interface hash therefore changes on either nominal rename or any
+reachable accepted-graph/envelope change. A consumer monomorph's descriptor is
+structural over the complete resolved direct graph; the existing MIR type record
+retains its ordinary nominal identity separately.
+
+For the required x86_64 Linux baseline, LLVM's canonical triple is
+`x86_64-pc-linux-gnu`. The exact 36-byte ABI prefix and its following 16-byte
+little-endian hash are:
+
+```text
+abi-prefix 01 13 00 00 00 78 38 36 5f 36 34 2d 70 63 2d 6c 69 6e 75 78 2d 67 6e 75 00 00 08 08 10 08 10 08 18 08 00 08
+abi-hash   d4 df f2 a5 8e c8 21 27 2a f3 26 2f 96 1a eb a5
+desc-len   d6 00 00 00
+```
+
+Appending the 214 descriptor bytes below yields an exact 270-byte envelope.
+The independent envelope golden owner encodes these semantic ABI cells to those
+bytes and hash, decodes them back, and then consumes the inner golden; it does
+not copy the production encoder or hash-byte assembly.
+
 For the `OwnedTask` declaration above on the required x86_64 Linux baseline,
 the exact 214-byte descriptor is grouped by header then source field:
 
@@ -309,23 +410,36 @@ overflow, name grammar/duplicate/order, unknown/reserved type tag, type payload,
 signedness, offset, optional sentinel, size/alignment, allocation/drop agreement,
 array element/drop-plan pair, and trailing bytes.
 
-Descriptor validation has one deterministic failure order:
+Interface-envelope and descriptor validation has one deterministic failure
+order:
 
-1. target triple and ABI identity;
-2. seven-byte header availability, then schema version, layout mode, layout
+1. entry count availability, then each sorted entry's name length/bound,
+   identifier grammar, known non-generic exported struct, uniqueness, source
+   order, envelope length, and exact envelope bound;
+2. envelope version, target-triple length/bound, nonempty canonical ASCII triple,
+   object-format tag, endian tag, then pointer/string/array/option size, alignment,
+   and option-offset cells in encoded order;
+3. stored ABI hash equality, current compiler target-triple equality, current
+   object format, and current target ABI tuple in that order. These checks finish
+   before descriptor length or any descriptor offset is trusted;
+4. descriptor length availability/bound and exact envelope end;
+5. seven-byte descriptor header availability, then schema version, layout mode, layout
    algorithm, nonzero field count, and equality to the expected direct-record
    field count in that order;
-3. each source-ordinal field in order: name-length availability and checked
+6. each source-ordinal field in order: name-length availability and checked
    remaining-byte bound, nonempty ASCII identifier grammar, uniqueness and
    equality to the expected field name, accepted type tag, exact tag-specific
    payload, physical payload offset, optional tag offset/sentinel, ABI size,
    ABI alignment, allocation mode, and drop tag;
-4. exact end of record, rejecting any trailing byte.
+7. exact descriptor end, then exact list cardinality, rejecting any trailing byte
+   or missing/extra accepted exported record.
 
 The first failing check is the only reported cause. An imported interface with
-malformed bytes or a semantic mismatch is rejected as an interface decode
-diagnostic before cache lookup, checked-HIR lowering, or codegen; it is never
-silently rebuilt. A well-formed descriptor whose identity differs at an object
+malformed bytes, a target/ABI mismatch, or a semantic mismatch is rejected as an
+interface decode diagnostic before cache lookup, checked-HIR lowering, or
+codegen; it is never silently rebuilt. The persistent frontend key's existing
+target triple remains a redundant cache partition, not the authenticity evidence
+for an envelope. A well-formed descriptor whose identity differs at an object
 cache lookup is an ordinary cache miss and is rebuilt from current checked HIR.
 Whole-program compilation constructs the descriptor from validated semantic
 types, while handcrafted malformed HIR fails the checked-HIR gate before the
@@ -335,8 +449,9 @@ per-unit compilation.
 The descriptor is structural over the complete accepted direct graph. Field
 rename/reorder/type/width/signedness/layout/allocation/drop changes invalidate
 identity; edit/revert restores it. It contains no pointer, local type id, source
-position, or declaration hash. Target triple precedes descriptor validation, so
-cross-target interface reuse rejects before codegen. The exact required baseline
+position, or declaration hash. The envelope, rather than ambient cache state,
+binds the target triple and every relevant ABI cell before descriptor validation,
+so cross-target interface reuse rejects before codegen. The exact required baseline
 is `x86_64-unknown-linux-gnu` on Ubuntu 24.04 with Rust 1.96 and LLVM 22. The
 release-target acceptance environments are `aarch64-unknown-linux-gnu` on Ubuntu
 24.04-arm and `aarch64-apple-darwin` on macOS 15 with the same Rust/LLVM majors.
@@ -479,7 +594,7 @@ same commit. No wildcard arm may make a new node silently skip an analysis pass.
 
 | Cell | Implementation owner | Required owner |
 | --- | --- | --- |
-| formation, inference, selected/non-selected route, mixed/nested/layout rejection | `align_sema` direct-owned classifier beside existing JSON shape checks | `m5_owned_json::formation_and_target_routing` plus every integer width/sign and generic substitutions |
+| formation, inference, selected/non-selected route, mixed/nested/layout rejection, and first-invalid precedence | `align_sema` direct-owned classifier beside existing JSON shape checks; explicit attributes before source-ordinal fields | `m5_owned_json::formation_and_target_routing` plus every integer width/sign, generic substitutions, and the attribute/field/type multi-invalid permutation owner |
 | checked-HIR route, envelope, plan reconstruction, ownership mode, malformed-node refusal, and new-variant consumer sweep | dedicated `JsonOwned*`/owned-part validator in the active body gate; exhaustive HIR/MIR visitors and source-shape/hash encoders; existing route predicates unchanged | parameterized `validate_hir` mutation sweep over node, type, field, part, descriptor, allocation, whole/per-unit, all four lowering entrypoints, and `variant_sweep_tripwire` |
 | construction of direct string, optional string, and text array; empty/NUL/UTF-8/escape states | MIR owned decode result + runtime owned writers | `decode_owned_text_states_detach_from_input` |
 | allocation inside/outside arena, input drop, move-out, return | sema region/allocation mode + MIR cleanup bit | `owned_decode_is_free_standing_inside_arena` and `owned_decode_outlives_input` |
@@ -491,8 +606,9 @@ same commit. No wildcard arm may make a new node silently skip an analysis pass.
 | overflow versus OOM terminal policy | checked runtime arithmetic and allocator failpoint | separate decode-growth, encode-growth, and allocation child owners |
 | canonical bytes, `u64::MAX`, optional states, source nonmutation | shared encode plan and runtime writers | `owned_json_canonical_vectors` |
 | bounded exact-limit/rejected-next and unbounded byte parity | existing bounded builder with owned plan | `owned_json_bounded_parity` |
-| `OwnedJsonDescV1` malformed record, target-local offsets, edit/revert | interface codec, layout cache, codegen validation | descriptor golden/malformed matrix and target mismatch owner |
-| whole/per-unit/monomorph/cache parity | interface import and structural cache identity | generic, per-unit, cold/edit/revert owners |
+| target-local descriptor provenance, cross-target rejection, and interface/implementation split | `OwnedJsonInterfaceEnvelopeV1`, exported non-generic descriptor list, consumer-created monomorph envelopes, interface and MIR hashes | independent 270-byte envelope/hash round trip; every prefix/hash/list mutation; x86_64/aarch64 Linux and Apple mismatch; private-body non-invalidation |
+| `OwnedJsonDescV1` malformed record, target-local offsets, edit/revert | target envelope before interface descriptor codec, layout cache, codegen validation | descriptor golden/malformed matrix and target mismatch owner |
+| whole/per-unit/monomorph/cache parity | interface import and structural cache identity | generic, per-unit, cold/edit/revert owners plus producer/consumer ABI-envelope equality |
 | existing borrowed/AoS/SoA/union/scanner/fixed-array routes | unchanged route-specific gates | parameterized compatibility owner including `array<bool>` top-level decode |
 | same-process and process concurrency | per-call state; immutable descriptor globals | full 153-pair operation-variant matrix and two-process owner |
 
@@ -501,13 +617,27 @@ a regression that would fail on the pre-change compiler. Reused tests count only
 when the changed defect would make them fail. A review finding triggers a sweep
 of the complete root-cause class before the one fix commit.
 
+### Reopened axis: target provenance and deterministic invalid-graph order
+
+The revised-diff review found that the original matrix treated a target-local
+descriptor as if the ambient per-unit cache key authenticated its bytes, and
+grouped invalid graph shapes without an intra-phase order. This reopens the
+artifact/provenance and validation-order axes. The capability boundary now owns
+the target envelope, interface-list placement, generic/private split, independent
+envelope golden, and cross-target rejection as one interface-codec failure domain;
+it also owns one shared source-ordinal classifier used by sema and checked-HIR
+replay. Implementation may not split either producer from its validating
+consumer, and may not rely on cache partitioning or duplicated field walks as
+proof.
+
 ## 9. Documentation and lifecycle
 
 This design commit updates `draft.md`, `docs/language-spec.md`,
-`docs/design-notes.md`, `docs/impl/08-memory-model-v2.md`, the English/Japanese
-JSON designs, the checked-HIR and runtime ABI ledgers, `docs/open-questions.md`,
-and `HANDOFF.md`. The implementation must update this plan's status and those
-sources only where the shipped contract or capability state changes. It also
+`docs/design-notes.md`, `docs/impl/08-memory-model-v2.md`, the cache/interface
+plan, the English/Japanese JSON designs, the checked-HIR and runtime ABI ledgers,
+`docs/open-questions.md`, and `HANDOFF.md`. The implementation must update this
+plan's status and those sources only where the shipped contract or capability
+state changes. It also
 adds the Align-owned syntax/golden fixtures.
 
 After Align merges the implementation, update the sibling request register with

@@ -393,6 +393,15 @@ Consumers depend on the public-interface hash, not the implementation hash. Fina
 all implementation artifacts and the union of link summaries. Canonical encodings must not contain
 process-local numeric ids or hash-map iteration order.
 
+> **Accepted Request 9 extension (not shipped):** `docs/impl/24-owned-json-plan.md`
+> adds a sorted descriptor list for each accepted non-generic exported owned-JSON
+> record after the interface struct table. Each target-local `OwnedJsonDescV1` is
+> carried only inside `OwnedJsonInterfaceEnvelopeV1`, which binds the canonical
+> LLVM target triple, object format, and every relevant ABI cell before offsets
+> are trusted. Concrete generic monomorphs and private/current-unit records instead
+> bind the same envelope to structural MIR/implementation identity, so a private
+> body edit still cannot change a consumer's interface hash.
+
 Soundness is fail-closed: an absent/unknown summary forces a conservative assumption or rebuild. It
 must never recover the whole-program optimizer's former optimistic fact by guessing across a unit
 boundary.
@@ -600,7 +609,9 @@ K2  compiler fingerprint                   cache::compiler_build_id(); an enable
                                            guarantees it is a REAL identity, never a guessed one
 K3  frontend schema                        align_interface::FORMAT_VERSION
 K4  the four ALIGN_* toggles               fixed order, Absent | Present(value)
-K5  target triple + object format          defensive; MIR lowering is target-independent today
+K5  target triple + object format          defensive for the shipped target-independent MIR;
+                                           an active safety partition for Request 9 target-bound
+                                           interface descriptors once that plan ships
 K6  unit module path + entry flag
 K7  digest of the unit's exact source bytes
 K8  the TRANSITIVE import closure, DFS order, EVERY member tagged

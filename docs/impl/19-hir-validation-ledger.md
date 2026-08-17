@@ -773,14 +773,32 @@ Any failure returns canonical-empty MIR with the body-validation pass identity
 from whole-program, located, per-unit, and located-per-unit lowering before
 descriptor emission or a runtime call.
 
+That classifier first selects the owned route by the presence of a direct owned
+text leaf without diagnosing unrelated fields. Once selected, it rejects
+`layout(C)`, then `align(N)`, then validates fields by source ordinal. Within one
+field it validates resolved-type completeness, the outer constructor, and that
+constructor's exact width/sign or `string` payload in that order. Natural layout,
+`DropPlan`, allocation mode, target-bound descriptor identity, and operation
+operand type follow the complete field walk. Sema and this gate call the same
+classifier and therefore cannot disagree on a multi-invalid first cause.
+
+An imported owned descriptor reaches this body gate only after
+`OwnedJsonInterfaceEnvelopeV1` has validated its canonical target triple, object
+format, complete 64-bit little-endian ABI tuple, ABI hash, inner length, and
+exported-record association. The frontend cache target key is redundant
+partitioning, not proof. Concrete generic monomorphs and private types construct
+the same envelope locally and bind it to the structural MIR implementation hash;
+only accepted non-generic exported records appear in interface-hash order.
+
 The parameterized owner mutates each owned node into every sibling discriminator;
 unknown and borrowed-only record ids; each disallowed field/layout; every integer
 width/sign and each owned field kind; missing/reordered/duplicated/wrong-root or
 wrong-type parts; descriptor/allocation/Drop disagreement; wrong input/limit/result
 types; and active-arena depth. It proves the three positive nodes and every
 mutation across all four lowering entrypoints, with whole/per-unit identity. The
-interface owner separately rejects malformed `OwnedJsonDescV1` before this gate;
-the body owner recomputes the semantic descriptor so handcrafted HIR cannot forge
+interface owner separately rejects malformed target envelopes and
+`OwnedJsonDescV1` before this gate; the body owner recomputes the semantic
+descriptor so handcrafted HIR cannot forge
 or bypass that interface check. The same owner plus `variant_sweep_tripwire`
 requires every exhaustive HIR/MIR visitor, replay/clone walk, child enumerator,
 source-shape/implementation-hash encoder, validator, and lowering dispatcher to

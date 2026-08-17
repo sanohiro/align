@@ -793,6 +793,11 @@ competing for the same job ("one way" per job). Three deliberate rejections defi
   arena without a hidden copy-on-escape. `encode` and `encode_bounded` consume the same graph and
   ordered plan. The first flat graph is deliberately narrow; recursive owned JSON needs its own
   consumer-reviewed cleanup graph.
+- **A target-local JSON descriptor is never ambiently authenticated.** Per-unit serialization wraps
+  it in the canonical target triple, object format, and complete relevant ABI tuple and validates
+  that envelope before reading an offset. The frontend target cache key remains redundant
+  partitioning, not evidence. Public non-generic records participate in interface identity;
+  private records and concrete consumer monomorphs participate only in implementation identity.
 - **Request 6's scanner generic boundary is concrete-row-only.** Concrete generic monomorphs such
   as `Wrap<i64>` remain eligible after row resolution, and ordinary generic calls use expected-return
   propagation owned by `align_sema::Checker::check_generic_call`; numeric `IntVar`/`FloatVar` retain

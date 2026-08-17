@@ -60,7 +60,10 @@ ledger. It extends only the compiler/runtime interpretation of the existing
 nonnegative record-relative `opt_tag`; required forms use `-1`. Kinds `0..=7`
 retain their shipped meanings.
 
-Those rows are emitted only from a validated target-local `OwnedJsonDescV1`.
+Those rows are emitted only from a target-local `OwnedJsonDescV1` whose
+`OwnedJsonInterfaceEnvelopeV1` target/ABI identity has already validated before
+descriptor offsets are read; whole-program/private/monomorph producers construct
+the same envelope locally.
 Owned decode calls A103 with the existing final arena argument null; the new
 kind itself selects free-standing allocation. The `JsonField` C layout and A103
 signature do not change. Owned encode does not pass these kinds through A80:

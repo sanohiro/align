@@ -108,8 +108,10 @@ encodes the complete `0..=u64::MAX` range without a signed intermediate. Missing
 The checked compiler-private `OwnedJsonDescV1` is structural and target-local. It fixes field names
 and declaration order, integer width/sign, natural-layout algorithm and offsets, optional tag and
 payload offsets, allocation/drop tags, and the `array<string>` element Drop-plan version. It is
-serialized in per-unit interfaces and included in cache identity, but is not a public artifact or
-reflection surface. Existing AoS, SoA, union, fixed-array, scalar-array, `json.doc`, and
+never serialized naked: a per-unit interface binds it to the canonical LLVM target triple, object
+format, and exact relevant ABI cells in `OwnedJsonInterfaceEnvelopeV1` before including it in cache
+identity. The envelope rejects a target/ABI mismatch before trusting descriptor offsets and is not
+a public artifact or reflection surface. Existing AoS, SoA, union, fixed-array, scalar-array, `json.doc`, and
 recursively-Copy `json.scan` routes are unchanged.
 
 The exact public ledger, descriptor bytes, error precedence, implementation closure matrix, and
