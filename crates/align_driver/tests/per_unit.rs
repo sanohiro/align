@@ -87,6 +87,61 @@ fn cross_module_owned_json_record_keeps_descriptor_and_ownership_parity() {
 }
 
 #[test]
+fn cross_module_owned_json_graph_resolves_qualified_and_generic_records() {
+    let dependency = |extra: &str| {
+        format!(
+            "module dep\npub Leaf {{ text: string{extra} }}\npub Wrapper<T> {{ value: T }}\n"
+        )
+    };
+    let owner = concat!(
+        "module owner\n",
+        "import core.json\n",
+        "import dep\n",
+        "pub Envelope { leaf: dep.Leaf, wrapped: dep.Wrapper<string>, label: string }\n",
+        "pub fn parse(input: str) -> Result<Envelope, Error> = json.decode(input)\n",
+    );
+    let main = "module main\nimport owner\nfn main() -> i32 = 0\n";
+    let first = assert_same_verdict(
+        "s1b-owned-json-imported-graph-a",
+        &[
+            ("dep.align", &dependency("")),
+            ("owner.align", owner),
+            ("main.align", main),
+        ],
+        "main.align",
+    );
+    assert!(!first.diags.has_errors());
+    let first_entry = first
+        .summaries
+        .iter()
+        .find(|summary| summary.unit == "owner")
+        .and_then(|summary| summary.owned_json_graphs.first())
+        .expect("owner graph")
+        .clone();
+
+    let second = assert_same_verdict(
+        "s1b-owned-json-imported-graph-b",
+        &[
+            ("dep.align", &dependency(", enabled: bool")),
+            ("owner.align", owner),
+            ("main.align", main),
+        ],
+        "main.align",
+    );
+    assert!(!second.diags.has_errors());
+    let second_entry = second
+        .summaries
+        .iter()
+        .find(|summary| summary.unit == "owner")
+        .and_then(|summary| summary.owned_json_graphs.first())
+        .expect("owner graph");
+    assert_ne!(
+        first_entry.envelope, second_entry.envelope,
+        "an imported reachable definition must participate in the producer interface identity"
+    );
+}
+
+#[test]
 fn cross_module_sum_type_accepts() {
     let shapes = concat!(
         "module shapes\n",

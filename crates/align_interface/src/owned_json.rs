@@ -57,11 +57,7 @@ fn valid_name(name: &[u8]) -> bool {
 }
 
 fn record_index(path: &str, names: &HashMap<&str, usize>) -> Option<usize> {
-    names.get(path).copied().or_else(|| {
-        path.rsplit('.')
-            .next()
-            .and_then(|name| names.get(name).copied())
-    })
+    names.get(path).copied()
 }
 
 fn integer(path: &str) -> Option<(u8, bool)> {
@@ -215,6 +211,7 @@ fn build_graph(structs: &[IStructDef], root: usize) -> Result<Option<Graph>, ()>
     }
     let mut records = Vec::new();
     let mut discovered = HashSet::new();
+    let mut maximum_depth = HashMap::new();
     let mut active = HashSet::new();
     let mut work = vec![Work::Enter(root, 1)];
     while let Some(item) = work.pop() {
@@ -226,9 +223,11 @@ fn build_graph(structs: &[IStructDef], root: usize) -> Result<Option<Graph>, ()>
                 if depth > MAX_CONSTRUCTOR_DEPTH || active.contains(&id) {
                     return Err(());
                 }
-                if !discovered.insert(id) {
+                if maximum_depth.get(&id).is_some_and(|seen| *seen >= depth) {
                     continue;
                 }
+                maximum_depth.insert(id, depth);
+                let first_visit = discovered.insert(id);
                 let definition = structs.get(id).ok_or(())?;
                 if !definition.type_params.is_empty()
                     || definition.c_repr
@@ -238,7 +237,9 @@ fn build_graph(structs: &[IStructDef], root: usize) -> Result<Option<Graph>, ()>
                     return Err(());
                 }
                 active.insert(id);
-                records.push(id);
+                if first_visit {
+                    records.push(id);
+                }
                 work.push(Work::Exit(id));
                 let mut edges = Vec::new();
                 for (field_name, ty) in &definition.fields {
@@ -392,6 +393,13 @@ pub fn encode_owned_json_graph_descriptor(
     let root = structs
         .iter()
         .position(|definition| definition.name == root_name)?;
+    encode_owned_json_graph_descriptor_at(structs, root)
+}
+
+fn encode_owned_json_graph_descriptor_at(
+    structs: &[IStructDef],
+    root: usize,
+) -> Option<Vec<u8>> {
     let graph = build_graph(structs, root).ok()??;
     let names = structs
         .iter()
@@ -458,6 +466,26 @@ pub(crate) fn entries_for_structs(
         let descriptor = encode_owned_json_graph_descriptor(structs, &definition.name)?;
         entries.push(OwnedJsonGraphInterfaceEntry {
             type_name: definition.name.clone(),
+            envelope: encode_owned_json_graph_envelope(target, &descriptor)?,
+        });
+    }
+    entries.sort_by(|left, right| left.type_name.cmp(&right.type_name));
+    Some(entries)
+}
+
+pub(crate) fn entries_for_resolved_structs(
+    structs: &[IStructDef],
+    roots: &[(String, usize)],
+    target: &OwnedJsonTarget,
+) -> Option<Vec<OwnedJsonGraphInterfaceEntry>> {
+    let mut entries = Vec::new();
+    for (type_name, root) in roots {
+        let Ok(Some(_)) = build_graph(structs, *root) else {
+            continue;
+        };
+        let descriptor = encode_owned_json_graph_descriptor_at(structs, *root)?;
+        entries.push(OwnedJsonGraphInterfaceEntry {
+            type_name: type_name.clone(),
             envelope: encode_owned_json_graph_envelope(target, &descriptor)?,
         });
     }
@@ -723,6 +751,152 @@ fn validate_descriptor(
     Ok(())
 }
 
+fn descriptor_node(
+    cursor: &mut Cursor<'_>,
+    record_names: &[String],
+    depth: u8,
+) -> Result<IType, &'static str> {
+    if depth > 2 {
+        return Err("owned JSON type-node depth");
+    }
+    let tag = cursor.u8()?;
+    cursor.u32()?;
+    cursor.u32()?;
+    cursor.u8()?;
+    cursor.u8()?;
+    let named = |path: String| IType::Named { path, args: Vec::new() };
+    match tag {
+        0x01 => {
+            let bits = cursor.u8()?;
+            let unsigned = cursor.u8()?;
+            Ok(named(format!("{}{}", if unsigned == 0 { 'i' } else { 'u' }, bits)))
+        }
+        0x03 => Ok(named("bool".to_string())),
+        0x10 => Ok(named("string".to_string())),
+        0x20 => {
+            let ordinal = usize::try_from(cursor.u32()?)
+                .map_err(|_| "owned JSON record reference bounds")?;
+            let name = record_names.get(ordinal).ok_or("owned JSON record reference bounds")?;
+            Ok(named(name.clone()))
+        }
+        0x21 => {
+            cursor.u32()?;
+            cursor.u32()?;
+            Ok(IType::Named {
+                path: "Option".to_string(),
+                args: vec![descriptor_node(cursor, record_names, depth + 1)?],
+            })
+        }
+        0x22 => {
+            cursor.u8()?;
+            Ok(IType::Named {
+                path: "array".to_string(),
+                args: vec![descriptor_node(cursor, record_names, depth + 1)?],
+            })
+        }
+        _ => Err("owned JSON type tag"),
+    }
+}
+
+fn descriptor_structs(
+    root_name: &str,
+    descriptor: &[u8],
+) -> Result<Vec<IStructDef>, &'static str> {
+    let mut cursor = Cursor { bytes: descriptor, pos: 0 };
+    cursor.u8()?;
+    cursor.u8()?;
+    cursor.u8()?;
+    let record_count =
+        usize::try_from(cursor.u32()?).map_err(|_| "owned JSON record count")?;
+    if record_count == 0 || record_count > descriptor.len() / 14 {
+        return Err("owned JSON record count");
+    }
+    cursor.u32()?;
+    let record_names = (0..record_count)
+        .map(|ordinal| {
+            if ordinal == 0 {
+                root_name.to_string()
+            } else {
+                format!("__owned_json_record_{ordinal}")
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut structs = Vec::new();
+    for name in &record_names {
+        cursor.u32()?;
+        cursor.u32()?;
+        cursor.u8()?;
+        cursor.u8()?;
+        let field_count =
+            usize::try_from(cursor.u32()?).map_err(|_| "owned JSON field count")?;
+        if field_count == 0 || field_count > descriptor.len() / 5 {
+            return Err("owned JSON field count");
+        }
+        let mut fields = Vec::new();
+        for _ in 0..field_count {
+            let name_len = usize::try_from(cursor.u32()?)
+                .map_err(|_| "owned JSON field name length")?;
+            let field_name = std::str::from_utf8(cursor.take(name_len)?)
+                .map_err(|_| "owned JSON field name grammar")?
+                .to_string();
+            let ty = descriptor_node(&mut cursor, &record_names, 0)?;
+            cursor.u32()?;
+            fields.push((field_name, ty));
+        }
+        structs.push(IStructDef {
+            name: name.clone(),
+            type_params: Vec::new(),
+            fields,
+            align: None,
+            c_repr: false,
+            generic_body: None,
+        });
+    }
+    if cursor.pos != descriptor.len() {
+        return Err("owned JSON descriptor trailing bytes");
+    }
+    Ok(structs)
+}
+
+fn root_shape_matches(expected: &IStructDef, actual: &IStructDef) -> bool {
+    fn ty_matches(expected: &IType, actual: &IType) -> bool {
+        let (
+            IType::Named { path: expected_path, args: expected_args },
+            IType::Named { path: actual_path, args: actual_args },
+        ) = (expected, actual)
+        else {
+            return false;
+        };
+        if matches!(expected_path.as_str(), "Option" | "array") {
+            return expected_path == actual_path
+                && expected_args.len() == 1
+                && actual_args.len() == 1
+                && ty_matches(&expected_args[0], &actual_args[0]);
+        }
+        if integer(expected_path).is_some()
+            || matches!(expected_path.as_str(), "bool" | "string")
+        {
+            return expected_path == actual_path
+                && expected_args.is_empty()
+                && actual_args.is_empty();
+        }
+        if matches!(
+            expected_path.as_str(),
+            "str" | "char" | "f32" | "f64" | "Result" | "slice" | "soa" | "raw" | "()"
+        ) {
+            return false;
+        }
+        actual_path.starts_with("__owned_json_record_") && actual_args.is_empty()
+    }
+
+    expected.fields.len() == actual.fields.len()
+        && expected.fields.iter().zip(&actual.fields).all(
+            |((expected_name, expected_ty), (actual_name, actual_ty))| {
+                expected_name == actual_name && ty_matches(expected_ty, actual_ty)
+            },
+        )
+}
+
 pub(crate) fn validate_entries(
     structs: &[IStructDef],
     entries: &[OwnedJsonGraphInterfaceEntry],
@@ -736,15 +910,29 @@ pub(crate) fn validate_entries(
         }),
     )
     .ok_or("owned JSON graph")?;
-    if entries.len() != expected.len() {
-        return Err("owned JSON graph cardinality");
-    }
-    for (entry, expected_entry) in entries.iter().zip(expected) {
+    let expected_names = expected
+        .iter()
+        .map(|entry| entry.type_name.as_str())
+        .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    let mut previous = None;
+    for entry in entries {
         if !valid_name(entry.type_name.as_bytes()) {
             return Err("owned JSON graph entry name grammar");
         }
-        if entry.type_name != expected_entry.type_name {
+        if previous.is_some_and(|name| name >= entry.type_name.as_str()) {
             return Err("owned JSON graph name/order");
+        }
+        previous = Some(entry.type_name.as_str());
+        if !seen.insert(entry.type_name.as_str()) {
+            return Err("owned JSON graph name/order");
+        }
+        let root = structs
+            .iter()
+            .position(|definition| definition.name == entry.type_name)
+            .ok_or("owned JSON graph root")?;
+        if !structs[root].type_params.is_empty() {
+            return Err("owned JSON graph root");
         }
         let mut cursor = Cursor {
             bytes: &entry.envelope,
@@ -796,7 +984,19 @@ pub(crate) fn validate_entries(
         if cursor.pos != entry.envelope.len() {
             return Err("owned JSON envelope trailing bytes");
         }
-        validate_descriptor(structs, &entry.type_name, descriptor)?;
+        match build_graph(structs, root) {
+            Ok(Some(_)) => validate_descriptor(structs, &entry.type_name, descriptor)?,
+            Ok(None) | Err(()) => {
+                let descriptor_definitions = descriptor_structs(&entry.type_name, descriptor)?;
+                if !root_shape_matches(&structs[root], &descriptor_definitions[0]) {
+                    return Err("owned JSON root field graph");
+                }
+                validate_descriptor(&descriptor_definitions, &entry.type_name, descriptor)?;
+            }
+        }
+    }
+    if !expected_names.is_subset(&seen) {
+        return Err("owned JSON graph cardinality");
     }
     Ok(())
 }
@@ -892,6 +1092,34 @@ mod tests {
         assert_eq!(
             &envelope[36..52],
             &hex("17 73 45 bb fc 42 7d 00 dc a3 b5 9c f9 79 f1 c8")
+        );
+    }
+
+    #[test]
+    fn shared_dag_depth_is_checked_on_every_path() {
+        let mut structs = vec![
+            definition("Leaf", vec![("text", ty("string"))]),
+            definition("Shared", vec![("leaf", ty("Leaf"))]),
+        ];
+        for id in 0..126 {
+            let next = if id == 125 {
+                "Shared".to_string()
+            } else {
+                format!("Chain{}", id + 1)
+            };
+            structs.push(definition(
+                &format!("Chain{id}"),
+                vec![("next", ty(&next))],
+            ));
+        }
+        let root = structs.len();
+        structs.push(definition(
+            "Root",
+            vec![("shallow", ty("Shared")), ("deep", ty("Chain0"))],
+        ));
+        assert!(
+            build_graph(&structs, root).is_err(),
+            "the deeper occurrence of Shared carries Leaf past depth 128"
         );
     }
 

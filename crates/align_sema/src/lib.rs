@@ -1457,6 +1457,7 @@ pub fn owned_json_graph_plan_v2(
 
     let mut records = Vec::new();
     let mut discovered = HashSet::new();
+    let mut maximum_depth = HashMap::new();
     let mut active = HashSet::new();
     let mut work = vec![Work::Record(root, 1)];
     while let Some(item) = work.pop() {
@@ -1473,9 +1474,11 @@ pub fn owned_json_graph_plan_v2(
                 if active.contains(&id) {
                     return Err("owned JSON graph contains a record cycle".to_string());
                 }
-                if !discovered.insert(id) {
+                if maximum_depth.get(&id).is_some_and(|seen| *seen >= depth) {
                     continue;
                 }
+                maximum_depth.insert(id, depth);
+                let first_visit = discovered.insert(id);
                 let definition = structs
                     .get(id as usize)
                     .ok_or_else(|| "owned JSON graph references an unknown record".to_string())?;
@@ -1498,7 +1501,9 @@ pub fn owned_json_graph_plan_v2(
                     ));
                 }
                 active.insert(id);
-                records.push(id);
+                if first_visit {
+                    records.push(id);
+                }
                 work.push(Work::Exit(id));
                 for field in definition.fields.iter().rev() {
                     work.push(Work::Type(field.ty, depth));
@@ -1595,10 +1600,10 @@ fn struct_has_transitive_owned_json_text(structs: &[hir::StructDef], root: u32) 
             | Ty::DynArray(Scalar::String)
             | Ty::Option(Scalar::DynArray(PrimScalar::String)) => return true,
             Ty::Struct(id) => {
-                if records.insert(id) {
-                    if let Some(definition) = structs.get(id as usize) {
-                        work.extend(definition.fields.iter().rev().map(|field| field.ty));
-                    }
+                if records.insert(id)
+                    && let Some(definition) = structs.get(id as usize)
+                {
+                    work.extend(definition.fields.iter().rev().map(|field| field.ty));
                 }
             }
             Ty::Option(Scalar::Struct(id)) => work.push(Ty::Struct(id)),
@@ -53769,6 +53774,32 @@ fn exit_branch(flag: bool) -> i64 {
                 .map(|record| record.id)
                 .collect::<Vec<_>>(),
             vec![3, 1, 0, 2]
+        );
+
+        let mut shared_depth = String::from(
+            "import core.json\nLeaf { text: string }\nShared { leaf: Leaf }\n",
+        );
+        for id in 0..126 {
+            if id == 125 {
+                shared_depth.push_str("Chain125 { next: Shared }\n");
+            } else {
+                shared_depth.push_str(&format!(
+                    "Chain{id} {{ next: Chain{} }}\n",
+                    id + 1
+                ));
+            }
+        }
+        shared_depth.push_str(
+            "SharedDepthRoot { shallow: Shared, deep: Chain0 }\n\
+             fn decode(data: str) -> Result<SharedDepthRoot, Error> = json.decode(data)\n\
+             fn main() -> i32 = 0\n",
+        );
+        let (_, shared_rejected) = check(&shared_depth);
+        assert!(
+            shared_rejected.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("maximum constructor depth 128")),
+            "a shared record first visited shallowly must be rechecked on a deeper path"
         );
     }
 

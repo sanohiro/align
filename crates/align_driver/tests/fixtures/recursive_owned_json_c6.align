@@ -690,4 +690,3 @@ PromptGateSourceLocator {
   git_executable_sha256: string
   content_sha256: string
 }
-
