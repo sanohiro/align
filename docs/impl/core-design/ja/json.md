@@ -106,6 +106,31 @@ scalar-array、`json.doc`、recursively-Copy `json.scan` route は変更しな�
 exact public ledger、descriptor bytes、error precedence、implementation closure matrix、golden vector の
 正本は [`../../24-owned-json-plan.md`](../../24-owned-json-plan.md) である。
 
+## Recursive owned record（Request 13、design accepted）
+
+Request 13 は同じ3つの inferred operation を維持したまま、flat な owned implementation boundary を
+acyclic で view-free な単一 graph に置き換える。transitive な owned `string` が route を選ぶ。graph
+全体は fixed-width signed/unsigned integer、bool、owned `string`、nonempty natural-layout record、
+`Option<T>` payload、および element が integer、bool、string、accepted record のいずれかである dynamic
+array を受理する。missing と `null` は同じ absence state であるため、option payload 自身を
+option にすることはできない。record/option/dynamic-array constructor depth は最大128である。
+option/array の array、borrowed text、float、
+char、enum、fixed array、明示的 layout/alignment、その他の constructor は descriptor 構築や allocation
+より前に拒否する。transitive owned string を持たない root は既存 route のままであり、狭めない。
+
+decode は `arena {}` 内でも全 reachable owner を free-standing にする。recursive failure cleanup は
+live field を declaration 順、`Some` になった option payload、array element を昇順、最後に spine の順で
+処理する。encode と bounded encode は同じ root を borrow し、単一の descriptor-driven writer で
+declaration 順の bytes を生成する。bounded success は byte-identical で Request 12 の inclusive limit を
+維持する。
+
+`OwnedJsonGraphDescV2` と `OwnedJsonInterfaceEnvelopeV2` は全 owned root について flat V1 record を
+置き換える。interface format 8 は format 7 を atomic に置き換え、compatibility decoder や parallel
+runtime route は追加しない。A103 decode と A80 encode の ABI は変えない。accepted grammar、exact V2
+bytes、validation order、C6 fixture scope、implementation matrix の正本は
+[`../../25-recursive-owned-json-plan.md`](../../25-recursive-owned-json-plan.md) である。implementation は
+pending であり、直前の Request 9 section が現在 shipped している compiler behavior である。
+
 ## Signatures (pending と明記したものを除き verified)
 
 ```text
@@ -250,8 +275,8 @@ region-tie される（`struct_has_str` が再帰する）。上で説明した�
 - `encode_bounded` は同じ受理済み値グラフを借用し、同じ順序の encode piece を使うが、
   inclusive な `max_bytes` 以下で成功したときは個別所有の `string` を1つ返す。上限は成長前の
   UTF-8 出力バイトへ適用され、負値または超過は部分結果を返さず `Error.Invalid` になる。
-  新しい JSON shape は受理しない。別途 review される Request 13 の graph widening は、共有 part
-  constructor を介して両方の encode 操作へ適用しなければならない。
+  shipped operation 自体は新しい JSON shape を受理しない。accepted Request 13 implementation は、
+  flat owned part を両方の encode operation が共有する単一の V2 descriptor-driven root writer に置き換える。
 - `array<T>` / `array<Struct>` への `decode` は、所有権を持つ Move 配列を生成する（破棄時は deep-drop される）。
 - `soa<T>` への `decode` は、外側の arena に列（カラム）を割り当てる（`align_rt_json_decode_soa` により、1 回のカウント用パスと 1 回の値パース用パスが `FieldDst` を介して Mison の投機的実行（speculation）パスを共有する）。
 - デコードされた `str` フィールドや列は、**入力された `str` へのビュー（参照）** である。そのため、入力データはデコード結果よりも長生きしなければならず、これは region チェッカによって強制される。

@@ -84,9 +84,29 @@ signature do not change. Owned encode does not pass these kinds through A80:
 direct and optional strings use A73's existing JSON-string writer, and
 `array<string>` uses A74 with the shipped borrowed-element tag
 `(3 << 8) | 16` because encode only reads each `{ptr,len}`. A80 retains its
-current descriptor domain. Until the implementation lands, `BuilderWriteUint`
-and kinds `8`/`9` remain design records; the exact shipped counts and A66 row
-elsewhere in this ledger remain unchanged.
+current descriptor domain. `BuilderWriteUint` and kinds `8`/`9` are shipped;
+the exact counts and A66 row above are current.
+
+## Request 13 recursive owned JSON replacement (design accepted)
+
+Request 13 adds no runtime key, symbol, LLVM function shape, C signature, or
+optional probe. The exact keyed/base/maximum counts therefore remain
+294/307/315. Its implementation atomically replaces V1 descriptor production
+with `OwnedJsonGraphDescV2` while retaining A103 decode and A80 encode:
+
+| Existing ABI | V2 use |
+|---|---|
+| A103 `i32 @SYM(ptr, i64, ptr, i64, ptr, i64, ptr, i64, i64, ptr)` / `align_rt_json_decode` | root `JsonField` table, null arena, recursive kind-4/5/7 edges, and owned leaf kinds 8/9 |
+| A80 `void @SYM(ptr, ptr, ptr, i64)` / `align_rt_json_encode_object` | one root builder/base/table call; kind 8 reads owned string as the existing `{ptr,len}` string layout and kind 9 reads `array<string>`; nested tables use the same validated graph |
+
+Kinds 8/9 remain illegal for arbitrary borrowed/AoS/union tables. They enter A80
+only from a validated V2 owned graph. Options retain `opt_tag`; nested records
+and record arrays retain `JsonField.sub`; no C layout changes. The implementation
+must prove A103/A80 table identity and registry counts unchanged, and delete the
+flat V1 encode-part path rather than keep two runtime producers. Exact graph
+bytes, allocation/drop tags, and owner matrix are in
+`docs/impl/25-recursive-owned-json-plan.md`. Until that implementation lands, the
+preceding Request 9 rows are the shipped ABI domain.
 
 The key-to-symbol mapping is `key -> "align_rt_" + snake_case(key)` except:
 

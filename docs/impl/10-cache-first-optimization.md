@@ -404,6 +404,17 @@ process-local numeric ids or hash-map iteration order.
 > bind the same envelope to structural MIR/implementation identity, so a private
 > body edit still cannot change a consumer's interface hash.
 
+> **Accepted Request 13 replacement (implementation pending):**
+> `docs/impl/25-recursive-owned-json-plan.md` atomically advances format 7 to 8
+> and replaces the flat descriptor list with root-name-associated
+> `OwnedJsonGraphDescV2` records inside `OwnedJsonInterfaceEnvelopeV2`. Canonical
+> root-first DFS ordinals replace process-local type ids; every reachable field,
+> type node, layout, allocation, and Drop cell participates in structural bytes.
+> Exported root association remains nominal within the unit. Concrete generic
+> monomorphs and private roots continue to affect implementation identity only.
+> Format 7 rejects before the V2 list is parsed; no V1/V2 compatibility path is
+> retained after implementation.
+
 Soundness is fail-closed: an absent/unknown summary forces a conservative assumption or rebuild. It
 must never recover the whole-program optimizer's former optimistic fact by guessing across a unit
 boundary.

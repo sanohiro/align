@@ -500,7 +500,7 @@ string borrows the input; an escaped selected string is decoded once into the ca
 selected escaped string outside an arena is an error, while ignored escaped tokens are validated
 without a proportional scratch buffer.
 A direct record with at least one `string`, direct `Option<string>`, or direct `array<string>` field
-selects the owned JSON route. That route is flat and
+selects the shipped owned JSON route. That route is flat and
 closed: every other field is a required signed/unsigned 8/16/32/64-bit integer or `bool`; borrowed
 text, float, nested aggregate, other optional, and explicit-layout forms reject before allocation.
 Every decoded text value is free-standing, so the result has no input or arena dependency even when
@@ -508,6 +508,16 @@ decoded inside `arena {}`. Mixed owned/borrowed graphs reject rather than clone.
 `json.encode`, and `json.encode_bounded` share this graph; recoverable failures clean every live
 direct owner exactly once, and full-range `u64` never passes through a signed intermediate. The
 exact contract is `docs/impl/24-owned-json-plan.md`.
+The accepted recursive extension selects the same route when any reachable field is owned `string`.
+Its acyclic, view-free, natural-layout graph admits fixed-width integers, bool, `string`, records,
+`Option<T>` payloads, and dynamic arrays whose elements are integers, bool, `string`, or accepted
+records. An option payload cannot itself be an option because missing and `null` are one absence
+state. Record/option/dynamic-array constructor depth is at most 128. Arrays of options/arrays and every borrowed, float,
+char, enum, fixed-array, explicit-layout, or other constructor reject before allocation. Decode
+materializes the complete graph free-standing; the three JSON operations share one canonical graph,
+recursive cleanup, and target-bound V2 descriptor. The V2 design replaces V1 and interface format 7
+rather than adding a parallel path; `docs/impl/25-recursive-owned-json-plan.md` is authoritative and
+implementation is pending.
 A field may also be an `Option<T>` (payload scalar/`str`/nested struct): missing key or JSON `null`
 → `None`, type mismatch → `Err`, present → `Some`; `encode` omits a `None` field entirely, so
 `decode(encode(x))` round-trips (a non-`Option` field still errors when missing). The same JSON field
@@ -518,8 +528,9 @@ restriction does not narrow ordinary JSON behavior. A field may also
 be an owned `array<Struct>` (the `messages: array<Message>` shape) — decode fills an owned
 array-of-structs in the field (freed by the struct's drop) and encode renders it back, so a full
 OpenAI request/response round-trips. The element struct may itself be Move and is deep-dropped.
-The accepted direct-owned route above adds a flat `array<string>` field; nested and AoS owned-text
-graphs remain deferred. `soa<T>` columns stay primitive/`str`.
+The shipped direct-owned route above adds a flat `array<string>` field. The accepted Request 13
+extension adds nested owned record/option/array graphs under its closed V2 predicate; top-level AoS
+selection remains on the existing route. `soa<T>` columns stay primitive/`str`.
 
 An owning package resource may expose a borrowed `soa<T>` view over its exact-length column buffer;
 that resource generation is then the lifetime root. `pkg.db.batch_soa<T: SoaPlain>` uses this form.
