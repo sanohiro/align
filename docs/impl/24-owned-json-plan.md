@@ -124,6 +124,9 @@ independently compares the accepted offsets and ABI cells with the current
 `TargetData` before emitting a runtime table. Private/current-unit records and
 consumer monomorphs use the same semantic encoder through their checked-HIR/MIR
 identity path. No layer reconstructs target identity from descriptor offsets.
+Every integer template piece retains its exact `Ty::Int` width and signedness;
+LLVM selects the signed or unsigned runtime decimal writer from that type. There
+is no signed `i64` reinterpretation of an unsigned source.
 
 No performance threshold is part of this capability. Whole/per-unit allocation
 parity is a correctness measurement, not a benchmark promise.
@@ -314,7 +317,13 @@ algorithm must equal the compiler's canonical `TypeLayoutCache`/
 `logical_to_physical` result. Counts, lengths, and offsets use checked arithmetic.
 Trailing bytes reject.
 
-The interface codec adds `owned_json_descriptors` after the exported struct
+The implementation bumps `align_interface::FORMAT_VERSION` from `6` to exactly
+`7` before adding this field. A v6 artifact therefore fails as
+`UnknownVersion(6)` before any field count, envelope, hash, or descriptor byte is
+read; `7` is included in the interface surface hash and the frontend K3 schema
+key. No compatibility decoder or v6/v7 alternate path is added.
+
+Format 7 adds `owned_json_descriptors` after the exported struct
 definitions and before exported enums. It is a `u32` little-endian count followed
 by this record, sorted by exported local struct name:
 
@@ -457,7 +466,7 @@ release-target acceptance environments are `aarch64-unknown-linux-gnu` on Ubuntu
 24.04-arm and `aarch64-apple-darwin` on macOS 15 with the same Rust/LLVM majors.
 No 32-bit contract is added.
 
-The runtime keeps the existing C ABI:
+The decode runtime keeps the existing C ABI:
 
 ```text
 align_rt_json_decode(
@@ -472,9 +481,15 @@ align_rt_json_decode(
 Owned direct decode passes a null arena and uses new owned descriptor kinds in
 the existing `JsonField` table. Those kinds allocate free-standing strings and
 deep-owned text arrays. Borrowed decode keeps the Request 7 arena behavior.
-Existing encode builder ABIs remain unchanged; owned `string` is read as bytes,
-and `array<string>` uses the existing scalar-array writer shape with owned
-elements. Runtime descriptor kinds are generated only from a validated
+Encode adds exactly one keyed runtime ABI,
+`align_rt_builder_write_uint(builder: *mut Builder, value: u64) -> ()`, reusing
+the LLVM A66 shape `void @SYM(ptr, i64)`. Its wrapper checks the existing sticky
+limit and calls the existing internal `builder_push_u64`; allocation, failure,
+and builder ownership do not change. Signed integers keep
+`align_rt_builder_write_int`; every unsigned width is zero-extended to `i64`
+bits and calls the new unsigned writer. Owned `string` is read as bytes, and
+`array<string>` uses the existing scalar-array writer shape with owned elements.
+Runtime descriptor kinds are generated only from a validated
 `OwnedJsonDescV1`; malformed interface records reject before LLVM/runtime use.
 
 The `JsonField.tag` kind-byte extension is exact:
@@ -562,7 +577,11 @@ JsonOwnedEncodeBounded { base, parts, max_bytes }
 Its exact new template parts are `OwnedJsonString { access }`,
 `OwnedJsonOptionStringField { name, access }`, and
 `OwnedJsonStringArray { access }`. Static object syntax remains in `Text` parts;
-all Copy fields retain their existing exact writer parts. Existing `JsonDecode`,
+Copy fields retain their existing exact `Hole` parts. `IntHole` preserves the
+exact signed/unsigned `Ty::Int`: codegen sign-extends signed widths into
+`BuilderWriteInt` and zero-extends every unsigned width into the new
+`BuilderWriteUint`; `u64` therefore never reinterprets its high bit as a sign.
+Existing `JsonDecode`,
 `Template`, `JsonEncodeBounded`, `JsonDecodeStructArray`, union, SoA, and
 `JsonScan` discriminants retain their current predicates and reject the new
 owned graph.
@@ -604,9 +623,10 @@ same commit. No wildcard arm may make a new node silently skip an analysis pass.
 | malformed/duplicate/type/range/missing/trailing failure after each live-owner prefix | runtime parser and direct decoded-owner cleanup | `owned_json_recoverable_failure_prefix_matrix` |
 | array growth/current element/completed elements/spine cleanup | runtime text-array staging | `owned_json_text_array_transition_matrix` |
 | overflow versus OOM terminal policy | checked runtime arithmetic and allocator failpoint | separate decode-growth, encode-growth, and allocation child owners |
-| canonical bytes, `u64::MAX`, optional states, source nonmutation | shared encode plan and runtime writers | `owned_json_canonical_vectors` |
+| canonical bytes, every integer width/sign including `u64::MAX`, optional states, source nonmutation | typed `IntHole`; signed A66 writer and new unsigned A66 writer share the builder | `template_unsigned_decimal_boundaries` plus `owned_json_canonical_vectors`, with signed/unsigned boundary pairs through ordinary templates and unbounded/bounded encode |
 | bounded exact-limit/rejected-next and unbounded byte parity | existing bounded builder with owned plan | `owned_json_bounded_parity` |
 | target-local descriptor provenance, cross-target rejection, and interface/implementation split | `OwnedJsonInterfaceEnvelopeV1`, exported non-generic descriptor list, consumer-created monomorph envelopes, interface and MIR hashes | independent 270-byte envelope/hash round trip; every prefix/hash/list mutation; x86_64/aarch64 Linux and Apple mismatch; private-body non-invalidation |
+| interface schema transition | `align_interface::FORMAT_VERSION = 7`; descriptor list exists only in format 7; frontend K3 consumes the same constant | exact v7 surface/hash golden, v6 `UnknownVersion(6)` before list parsing, cold/edit/revert and cross-process cache owners |
 | `OwnedJsonDescV1` malformed record, target-local offsets, edit/revert | target envelope before interface descriptor codec, layout cache, codegen validation | descriptor golden/malformed matrix and target mismatch owner |
 | whole/per-unit/monomorph/cache parity | interface import and structural cache identity | generic, per-unit, cold/edit/revert owners plus producer/consumer ABI-envelope equality |
 | existing borrowed/AoS/SoA/union/scanner/fixed-array routes | unchanged route-specific gates | parameterized compatibility owner including `array<bool>` top-level decode |
@@ -630,11 +650,24 @@ replay. Implementation may not split either producer from its validating
 consumer, and may not rely on cache partitioning or duplicated field walks as
 proof.
 
+### Reopened axis: scalar signedness and interface schema transition
+
+The post-redesign review found two producer/consumer cells still hidden inside
+broader rows: `IntHole` preserved an unsigned type but codegen always selected
+the signed decimal ABI, and the new interface list lacked its mandatory format
+transition. This reopens the scalar-writer and artifact-version axes. The owned
+encode boundary now includes the `BuilderWriteUint` registry key, runtime export,
+LLVM selection, and signed/unsigned boundary owner in the same capability. The
+interface boundary includes the format-7 constant, encoder, decoder, surface
+hash, frontend K3 key, stale-v6 rejection, and codec/cache goldens. Neither may
+land as a dormant producer without its consumer and mutation owner.
+
 ## 9. Documentation and lifecycle
 
 This design commit updates `draft.md`, `docs/language-spec.md`,
 `docs/design-notes.md`, `docs/impl/08-memory-model-v2.md`, the cache/interface
 plan, the English/Japanese JSON designs, the checked-HIR and runtime ABI ledgers,
+the library-boundary plan, dependent interface-format ledgers and mirrors,
 `docs/open-questions.md`, and `HANDOFF.md`. The implementation must update this
 plan's status and those sources only where the shipped contract or capability
 state changes. It also

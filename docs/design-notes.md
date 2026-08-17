@@ -798,6 +798,10 @@ competing for the same job ("one way" per job). Three deliberate rejections defi
   that envelope before reading an offset. The frontend target cache key remains redundant
   partitioning, not evidence. Public non-generic records participate in interface identity;
   private records and concrete consumer monomorphs participate only in implementation identity.
+- **Integer display follows declared signedness through the runtime call.** A template `IntHole`
+  retains its exact `Ty::Int`; codegen chooses the signed or unsigned decimal builder ABI after
+  sign- or zero-extension. This keeps full-range `u64` JSON canonical without a JSON-only formatter
+  or signed reinterpretation.
 - **Request 6's scanner generic boundary is concrete-row-only.** Concrete generic monomorphs such
   as `Wrap<i64>` remain eligible after row resolution, and ordinary generic calls use expected-return
   propagation owned by `align_sema::Checker::check_generic_call`; numeric `IntVar`/`FloatVar` retain

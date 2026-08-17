@@ -275,9 +275,10 @@ User {
 There is no class / inheritance.
 
 An owned `array<string>` is a valid ordinary struct field. Its Drop walks the initialized strings
-before freeing the array buffer. This does not make it a supported JSON field: JSON decoding and
-encoding retain their own closed schema grammar. A finite Move struct containing that field may be
-used in the existing `Option`, `Result`, and user-sum payload positions; Drop still follows only the
+before freeing the array buffer. The shipped borrowed JSON schema still excludes it; the accepted
+direct-owned JSON route in §18.1 admits it only in that route's closed flat record. A finite Move
+struct containing that field may be used in the existing `Option`, `Result`, and user-sum payload
+positions; Drop still follows only the
 active tag. Use `array<str>` when the strings are borrowed.
 
 ### Sum Type
@@ -2446,8 +2447,9 @@ json.scan(view)`). This is the complete surface: there is no `validate<T>`
 `doc` is the schema-unknown tier — see §14.
 
 `json.encode_bounded(value, max_bytes: i64) -> Result<string, Error>` is the owned, fallible sibling
-of `json.encode`. It accepts exactly the same borrowed typed values and emits exactly the same
-declaration-order bytes. `max_bytes` is an inclusive UTF-8 byte ceiling: exact fit succeeds; a
+of `json.encode`. It accepts exactly the same typed values, including the accepted flat direct-owned
+record graph, and emits exactly the same declaration-order bytes. `max_bytes` is an inclusive UTF-8
+byte ceiling: exact fit succeeds; a
 negative ceiling or the first byte beyond it is `Error.Invalid`; no partial string or allocation
 beyond the ceiling is exposed. “Canonical” names this one typed encoder, not RFC 8785 sorting or a
 schema-unknown dynamic value surface.

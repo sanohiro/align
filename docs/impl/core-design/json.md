@@ -102,7 +102,8 @@ Recoverable parse, duplicate, shape, integer-range, missing-field, and trailing-
 every initialized direct owner exactly once before returning `Error.Code(1)`. Cleanup visits fields
 in declaration order, initialized text-array elements in ascending index order, then the spine.
 Overflow and allocator failure retain the runtime-wide terminal-abort policy. `u64` accepts and
-encodes the complete `0..=u64::MAX` range without a signed intermediate. Missing and `null` map to
+encodes the complete `0..=u64::MAX` range: typed integer holes select the dedicated unsigned
+builder ABI without a signed intermediate. Missing and `null` map to
 `None`; `None` is omitted, while `Some("")` is distinct.
 
 The checked compiler-private `OwnedJsonDescV1` is structural and target-local. It fixes field names
@@ -110,7 +111,8 @@ and declaration order, integer width/sign, natural-layout algorithm and offsets,
 payload offsets, allocation/drop tags, and the `array<string>` element Drop-plan version. It is
 never serialized naked: a per-unit interface binds it to the canonical LLVM target triple, object
 format, and exact relevant ABI cells in `OwnedJsonInterfaceEnvelopeV1` before including it in cache
-identity. The envelope rejects a target/ABI mismatch before trusting descriptor offsets and is not
+identity. Interface format 7 owns the new descriptor list and rejects format 6 before parsing it.
+The envelope rejects a target/ABI mismatch before trusting descriptor offsets and is not
 a public artifact or reflection surface. Existing AoS, SoA, union, fixed-array, scalar-array, `json.doc`, and
 recursively-Copy `json.scan` routes are unchanged.
 

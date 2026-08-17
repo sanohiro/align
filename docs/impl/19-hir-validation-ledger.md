@@ -763,6 +763,13 @@ The only new part discriminants are:
 | `OwnedJsonOptionStringField` | `env[name]`: exact nonempty ASCII declared field name. `child[access]`; access is the exact direct Option(String) field; omit None and encode Some once without transfer. |
 | `OwnedJsonStringArray` | `child[access]`; access is the exact direct DynArray(String) field; borrow the spine/elements and emit them in index order without transfer. |
 
+Copy scalar fields retain the existing `Hole`/`IntHole`/`BoolHole` path, but an
+`IntHole`'s operand type is part of its checked contract. Signed integer widths
+select `BuilderWriteInt`; unsigned widths select `BuilderWriteUint` after exact
+zero extension. The validator rejects a hole whose operand width/sign differs
+from the source-ordinal descriptor field, and the MIR preflight retains that
+exact `Ty::Int` through all four lowerers.
+
 These nodes do not reuse or widen `json_struct_descriptor_ok`, the scanner Copy
 predicate, the AoS predicate, or the generic template grammar. One dedicated
 iterative classifier is shared only by the three `JsonOwned*` validators. The
@@ -1105,7 +1112,7 @@ if any of those five variants is absent from validation or ownership analysis.
 | One-field malformed mutations | For each row, mutate every child type, the stored result type, child count/order, receiver locality, and receiver handle kind independently. Validation rejects before MIR allocation, runtime declaration, ownership transfer, or cache publication. | parameterized complete-envelope mutations in `request11_process_rows_match_the_producer` |
 | Diagnostic precedence | A malformed child expression is visited before the receiver/result post relation; an equal-typed temporary receiver rejects only after its child validates. Negative `limit` is not a HIR-malformation discriminator and remains the runtime programmer-error abort. | accepted-local/temporary twins plus an invalid later-child twin in the same owner |
 | Closed Move classification | `RunBytes` is owned and dropped exactly like `RunOutput`: it is permitted only in its `Result` Ok carrier/local flow, nulls on move, is excluded from aggregates, arrays, task captures, and Copy/region-plain domains, and its byte views inherit only its owner region. | `run_bytes_type_classification_tripwire` sweeps Copy/Move/Drop/region/aggregate/capture/return and every control-flow cleanup owner |
-| Canonical/interface parity | Whole-program and imported/per-unit checked HIR resolve source `run_bytes` to the same closed type. Canonical type codec v3 tags are exactly `Ty=60` and `Scalar=36`; interface format 6 retains named-type tag 0/path `run_bytes`/zero args. | bidirectional golden and unknown/truncated-tag owners named in the process design, plus exact edit/revert unit-cache identity |
+| Canonical/interface parity | Whole-program and imported/per-unit checked HIR resolve source `run_bytes` to the same closed type. Canonical type codec v3 tags are exactly `Ty=60` and `Scalar=36`; shipped interface format 6 retains named-type tag 0/path `run_bytes`/zero args, and the accepted Request 9 format-7 bump preserves those bytes before its new descriptor-list position. | bidirectional golden and unknown/truncated-tag owners named in the process design, plus exact edit/revert unit-cache identity |
 
 ## Inventory closure
 

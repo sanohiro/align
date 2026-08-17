@@ -398,7 +398,9 @@ process-local numeric ids or hash-map iteration order.
 > record after the interface struct table. Each target-local `OwnedJsonDescV1` is
 > carried only inside `OwnedJsonInterfaceEnvelopeV1`, which binds the canonical
 > LLVM target triple, object format, and every relevant ABI cell before offsets
-> are trusted. Concrete generic monomorphs and private/current-unit records instead
+> are trusted. This atomically bumps `align_interface::FORMAT_VERSION` from 6 to
+> 7; version 6 rejects before the new list is parsed, and frontend K3 consumes 7.
+> Concrete generic monomorphs and private/current-unit records instead
 > bind the same envelope to structural MIR/implementation identity, so a private
 > body edit still cannot change a consumer's interface hash.
 

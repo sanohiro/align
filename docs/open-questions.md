@@ -4703,7 +4703,8 @@ and it types from the binding annotation.
 **T1b — matrix fill (impl, no new design): COMPLETE.** top-level scalar/bool targets (`x: i64 :=
 json.decode(s)?` — SHIPPED, #539), `array<scalar>` struct fields (SHIPPED, #538), `Option<struct>`
 ENCODE (the B follow-up — SHIPPED, #540). Rule: any composition of supported constructors closes; the
-v1 JSON boundaries stay explicit (`array<string>` has ordinary deep Drop but still waits for a JSON
+shipped v1 borrowed-JSON boundaries stay explicit (`array<string>` has ordinary deep Drop; the
+separately settled, implementation-pending direct-owned route supplies its only JSON
 descriptor/producer arm).
 **`array<Option<T>>` DEFERRED (not a JSON gap — a language-type gap).** The T1b sketch listed it as a
 "supported-constructor composition", but it is NOT one: an owned `array<T>`'s element is a

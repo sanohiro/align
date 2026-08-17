@@ -49,11 +49,25 @@ added the two bounded-HTTP setters. Their runtime definitions and registry entri
 atomically: the current exact counts are 293 keyed records, 306 base records, and 314 records in the
 maximum optional-probe export table. No unkeyed or probe category changed.
 
-## Planned Request 9 descriptor extension (not shipped)
+## Planned Request 9 owned JSON extension (not shipped)
 
-The accepted Request 9 design in `docs/impl/24-owned-json-plan.md` changes no
-native symbol, LLVM function type, attribute, registry key, or count in this
-ledger. It extends only the compiler/runtime interpretation of the existing
+The accepted Request 9 design in `docs/impl/24-owned-json-plan.md` adds exactly
+one keyed base record while reusing an existing LLVM function shape:
+
+| Planned runtime key | Exact symbol | Existing ABI row and exact declaration |
+|---|---|---|
+| `BuilderWriteUint` | `align_rt_builder_write_uint` | A66: `void @SYM(ptr, i64)`; Rust receives `(*mut Builder, u64)`; no curated attributes |
+
+The implementation changes the exact counts from 293 to 294 `RuntimeKey`
+variants, 306 to 307 base records, and 314 to 315 maximum optional-probe exports.
+The key, registry row, LLVM declaration/selection, unmangled Rust export,
+key↔symbol bijection, and base/export parity must land atomically. The wrapper
+checks the existing sticky limit and calls the existing internal
+`builder_push_u64`; signed widths keep `BuilderWriteInt`, while every unsigned
+width is zero-extended and selects `BuilderWriteUint`. The ABI still carries the
+same 64 bits as LLVM `i64`; only Rust's decimal interpretation is unsigned.
+
+Request 9 also extends the compiler/runtime interpretation of the existing
 `JsonField.tag` kind byte passed through A103: kind `8`, width `16`, null
 `sub` is an owned `string`; kind `9`, width `16`, null `sub` is an owned
 `array<string>`. A direct `Option<string>` uses kind `8` with its validated
@@ -70,8 +84,9 @@ signature do not change. Owned encode does not pass these kinds through A80:
 direct and optional strings use A73's existing JSON-string writer, and
 `array<string>` uses A74 with the shipped borrowed-element tag
 `(3 << 8) | 16` because encode only reads each `{ptr,len}`. A80 retains its
-current descriptor domain. Until the implementation lands, kinds `8` and `9`
-remain design records and the current runtime rejects them.
+current descriptor domain. Until the implementation lands, `BuilderWriteUint`
+and kinds `8`/`9` remain design records; the exact shipped counts and A66 row
+elsewhere in this ledger remain unchanged.
 
 The key-to-symbol mapping is `key -> "align_rt_" + snake_case(key)` except:
 

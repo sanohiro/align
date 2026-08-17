@@ -90,15 +90,17 @@ type と `json.decode` が allocation を可視にする。borrowed JSON は Req
 recoverable な parse、duplicate、shape、integer range、missing field、trailing-input failure は、
 `Error.Code(1)` を返す前に初期化済み direct owner を正確に1回解放する。cleanup は declaration 順、
 text-array element の昇順、最後に spine の順である。overflow と allocator failure は runtime 全体の
-terminal-abort policy を維持する。`u64` は signed intermediate を通さず `0..=u64::MAX` 全域を
-decode/encode する。missing と `null` は `None`、`None` は omit、`Some("")` は別状態である。
+terminal-abort policy を維持する。`u64` は typed integer hole が dedicated unsigned builder ABI を
+選ぶため、signed intermediate を通さず `0..=u64::MAX` 全域を decode/encode する。missing と `null` は
+`None`、`None` は omit、`Some("")` は別状態である。
 
 checked compiler-private `OwnedJsonDescV1` は structural かつ target-local である。field name と
 declaration order、integer width/sign、natural-layout algorithm と offset、optional tag/payload offset、
 allocation/drop tag、`array<string>` element Drop-plan version を固定する。naked には serialize せず、
 per-unit interface は canonical LLVM target triple、object format、関連する exact ABI cell を
 `OwnedJsonInterfaceEnvelopeV1` で bind してから cache identity に含める。envelope は descriptor offset を
-trust する前に target/ABI mismatch を拒否し、public artifact や reflection surface ではない。既存 AoS、SoA、union、fixed-array、
+trust する前に target/ABI mismatch を拒否する。interface format 7 が新 descriptor list を所有し、
+format 6 は list parse 前に拒否する。public artifact や reflection surface ではない。既存 AoS、SoA、union、fixed-array、
 scalar-array、`json.doc`、recursively-Copy `json.scan` route は変更しない。
 
 exact public ledger、descriptor bytes、error precedence、implementation closure matrix、golden vector の

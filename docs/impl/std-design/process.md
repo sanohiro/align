@@ -587,8 +587,9 @@ validation and output-handle construction.
   semantic-to-byte and byte-to-semantic golden is `RunBytes <-> [3, 0, 0, 0, 0, 60]`; the scalar
   field golden is `RunBytes <-> [36]`. Tags are never inserted or renumbered. Unknown tags `61` and
   `37`, and a truncated root `[3, 0, 0, 0, 0]`, reject before cache publication.
-- interface summary format 6 already represents every source type as `IType::Named`; it does not
-  gain a type discriminator or version bump. `run_bytes` uses existing type tag `0`, UTF-8 path
+- shipped interface summary format 6 already represents every source type as `IType::Named`; it does
+  not gain a type discriminator or version bump for `run_bytes`. The accepted Request 9 codec-wide
+  format-7 bump preserves this named-type record. `run_bytes` uses existing type tag `0`, UTF-8 path
   `run_bytes`, and zero type arguments. Its field-local golden is
   `[0, 9, 0, 0, 0, 114, 117, 110, 95, 98, 121, 116, 101, 115, 0, 0, 0, 0]` in both directions.
   Unknown type tag `3`, a truncated name/argument count, invalid UTF-8, or trailing bytes rejects
@@ -644,7 +645,7 @@ implementation remain one mergeable capability.
 |---|---|
 | P1 recoverable OOM contradicted the locked allocation model | The error/allocation rows now retain fatal OOM with no unwind; only unrepresentable layouts return `Error.Invalid`, and subprocess failpoints prove abort-before-fork. |
 | P1 HIR and native owner ledgers omitted the new surface | `docs/impl/19-hir-validation-ledger.md` reserves the five exact expression rows and malformed fixtures; `docs/impl/20-runtime-abi-ledger.md` reserves all six keyed symbols, declarations, attributes, counts, and registry owners. |
-| P2 compiler type encodings were implementation-defined | The canonical codec keeps version 3 and appends exact `Ty`/`Scalar` tags 60/36 with bidirectional and malformed vectors; interface format 6 uses its existing named-type record with an exact byte vector. |
+| P2 compiler type encodings were implementation-defined | The canonical codec keeps version 3 and appends exact `Ty`/`Scalar` tags 60/36 with bidirectional and malformed vectors; shipped interface format 6 uses its existing named-type record with an exact byte vector, and Request 9 format 7 preserves that record. |
 | P2 the external request register remained proposed | The sibling register records the accepted per-stream/text/bytes/ownership/error contract and the final reviewed design commit; the edit remains uncommitted in that repository as required. |
 | P1 deadline ended at pipe EOF | The reopened lifecycle keeps the deadline active until direct-child reap; EOF/live uses `waitpid(WNOHANG)` plus allocation-free zero-fd `poll`, with its own owner. |
 | P1 bounded poll allocated after fork | The allocation row requires exact stores/shell before pipes, fixed stack poll/scratch state, pre-fork nonblocking setup, and no parent-side bounded post-fork heap allocation. |

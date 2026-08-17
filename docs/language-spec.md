@@ -310,7 +310,8 @@ Replacing an owned field or element must preserve the existing mode, and the rep
 `string` or `Option<string>` today — replacing any other owned leaf (a nested Move struct, an owned
 array) is a compile error naming the type; replace the whole aggregate instead. A bare
 `array<string>` is a valid ordinary struct field with element-wise Drop, but remains outside the
-closed JSON schema grammar. A finite Move struct containing that field retains the existing
+shipped borrowed JSON schema. The accepted direct-owned JSON route below admits it only in that
+route's closed flat record. A finite Move struct containing that field retains the existing
 Option/Result/user-sum payload behavior and active-tag Drop. Use `array<str>` when the strings are
 borrowed. Borrowed members do not
 participate in this allocation-mode check. A path-dependent one-owner aggregate forwards its

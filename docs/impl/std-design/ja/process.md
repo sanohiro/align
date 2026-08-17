@@ -554,8 +554,9 @@ engine へ委譲し、mode 固有の処理は完了 buffer の UTF-8 検証と o
   `Scalar::RunBytes` は既存最大 `35` の後の leaf tag `36`。root の semantic-to-byte / byte-to-semantic golden は
   `RunBytes <-> [3, 0, 0, 0, 0, 60]`、scalar field golden は `RunBytes <-> [36]`。tag の挿入や renumber はしない。
   unknown tag `61`/`37` と truncated root `[3, 0, 0, 0, 0]` は cache publication 前に拒否する。
-- interface summary format 6 は全 source type を既存 `IType::Named` で表すため、新 discriminator や version bump は
-  無い。`run_bytes` は既存 type tag `0`、UTF-8 path `run_bytes`、type argument 0個を使う。field-local golden は双方向で
+- shipped interface summary format 6 は全 source type を既存 `IType::Named` で表すため、`run_bytes` のための
+  新 discriminator や version bump は無い。accepted Request 9 の codec 全体の format-7 bump でもこの
+  named-type record は変更しない。`run_bytes` は既存 type tag `0`、UTF-8 path `run_bytes`、type argument 0個を使う。field-local golden は双方向で
   `[0, 9, 0, 0, 0, 114, 117, 110, 95, 98, 121, 116, 101, 115, 0, 0, 0, 0]`。unknown type tag `3`、
   truncated name/argument count、invalid UTF-8、trailing bytes は semantic import 前に拒否する。
 
@@ -605,7 +606,7 @@ truncated-success path が reachable のままなので、design/implementation 
 |---|---|
 | P1 recoverable OOM が locked allocation model と矛盾 | error/allocation row は no-unwind fatal OOM を維持する。表現不能 layout だけが `Error.Invalid` で、subprocess failpoint が abort-before-fork を証明する。 |
 | P1 HIR/native owner ledger に新 surface が無い | `docs/impl/19-hir-validation-ledger.md` が5つの厳密な expression row と malformed fixture を予約し、`docs/impl/20-runtime-abi-ledger.md` が6つの keyed symbol、declaration、attribute、count、registry owner を予約する。 |
-| P2 compiler type encoding が実装依存 | canonical codec version 3 に exact `Ty`/`Scalar` tag 60/36 と双方向/malformed vector を追加し、interface format 6 は既存 named-type record を exact byte vector 付きで使う。 |
+| P2 compiler type encoding が実装依存 | canonical codec version 3 に exact `Ty`/`Scalar` tag 60/36 と双方向/malformed vector を追加し、shipped interface format 6 は既存 named-type record を exact byte vector 付きで使い、Request 9 format 7 もその record を維持する。 |
 | P2 external request register が proposed のまま | sibling register に accepted per-stream/text/bytes/ownership/error contract と final reviewed design commit を記録し、指示どおりその repository では uncommitted のままにする。 |
 | P1 deadline が pipe EOF で終わっていた | reopen した lifecycle は direct-child reap まで deadline を維持する。EOF/live は `waitpid(WNOHANG)` + allocation-free zero-fd `poll` と専用 owner を使う。 |
 | P1 bounded poll が fork 後に allocation | allocation row は exact store/shell を pipe 前に用意し、fixed stack poll/scratch state、pre-fork nonblocking setup、親側 bounded post-fork heap allocation 0を要求する。 |
