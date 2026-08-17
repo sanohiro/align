@@ -7,7 +7,9 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-16._ Align main is at `293f0afa` after the trusted controller/verifier
+_Last updated: 2026-08-17._ Request 7's signed merge verification (#848), decoded-owner cleanup
+prerequisite (#849), and escaped-string language design and
+implementation (#850), following the trusted controller/verifier
 orchestration core (PR #842), the merge-race owners (PR #840) and
 the adversarial process/schedule/cleanup/exclusive-run owners (PR #839), following prepared execution owners (PR #838), the monitor
 lifecycle core (PR #837), and prepared-benchmark sealing (PR #827). align-llm Request 5's bounded HTTP response
@@ -41,8 +43,8 @@ digest, and parses the exact native output into checked integer microseconds. It
 lifecycle. PR #847 adds the immutable native session, exact fixed-schedule execution transcript,
 and report assembler that consumes those child facts into fixed benchmark/report fragments with
 manifest, sample-order, integer-arithmetic, and threshold checks. It does not sign or publish the
-report, verify a provider merge, or advance the Request 7 language lifecycle. The next Request 7
-work is merge verification.
+report or verify a provider merge; those boundaries are now closed by #848. Request 7's language
+and runtime capability is merged by #850. Its remaining pin/adoption gate belongs to align-llm.
 The align-repl user guide and release artifacts are shipped in #826/#829. PR #827's
 two protected JSON benchmarks gain the reviewed two-phase
 `prepare native` / direct `native` interface, canonical artifact sealing, checked integer inner
@@ -56,8 +58,8 @@ development qualification, not accepted evidence. Its focused owners are
 `scripts/test-benchmark-evidence-statistics.sh`. The prepared execution and adversarial
 process/schedule/cleanup/exclusive-run owners are shipped in this slice; the merge-race owner is
 also shipped in PR #840, and the trusted controller/verifier orchestration core is shipped in PR
-#842–#847. The next Request 7 work is merge verification. The Request 7 language implementation
-remains a later gate.
+#842–#848. Request 7's decoded-owner prerequisite and language/runtime implementation are shipped
+in #849/#850.
 
 The final integration review of `0dbbd709` against `c47e57c7` found three valid remaining handoff
 issues. The consolidated closure requires the trusted caller to retain prepare's manifest SHA-256
@@ -124,9 +126,8 @@ work directory, with the prepare-time digest supplied to direct execution and an
 sentinel excluded by the fixed launcher environment. The final-review-repair rerun produced decode
 digest `efca5a28a02e8b49636092413c0f92386c39f2bfcb754f7a9f5ddc83f090ef2c` and SoA digest
 `5b1ff95b9364253e4afb81d209d909dfdd5455616f681fcbe5c8c2403fbfaa3c`. These are
-correctness/boundary owners, not accepted x86_64 performance evidence. At #847's merge, the next
-eligible capability is merge verification; the Request 7 language implementation remains a later
-gate. No emulation is accepted
+correctness/boundary owners, not accepted x86_64 performance evidence. Request 7 is now
+`ALIGN_MERGED`; no emulation is accepted
 in any evidence lane.
 
 The C-B borrow/ownership capability is complete
@@ -303,10 +304,11 @@ facts must live in this repository.
   Request 6 is closed after Align design #703, implementation #704, and align-llm adoption #84;
   Request 8 is merged through Align design #799 and implementation #801; Request 10's §7.6
   implementation is merged; Requests 11 and 12 are implemented, and Request 5's bounded-HTTP
-  implementation is merged at `5aa5b23a`. Request 7's benchmark-evidence design is active, and its
-  benchmark-input, manifest, canonical JSON, typed report, SSHSIG, CLI, and bootstrap-binding
-  prerequisites are merged; Requests 9 and 13–15 remain proposed in
-  `../align-llm/docs/align-requests.md`; Request 9 remains the later C7 blocker after Request 7.
+  implementation is merged at `5aa5b23a`. Request 7 is `ALIGN_MERGED` through #850, including its
+  evidence boundary, decoded-owner prerequisite, and escaped-string implementation. Request 15 is
+  also `ALIGN_MERGED`; Requests 9, 13, and 14 remain proposed in
+  `../align-llm/docs/align-requests.md`. Request 9's accepted Align design is
+  `docs/impl/24-owned-json-plan.md`; implementation is the next Align-owned capability.
 
 Consumer-gated deferrals that remain intentional:
 
@@ -382,6 +384,7 @@ Source-correctness fixes             docs/impl/source-correctness-fixes-2026-07-
 Checked-HIR validation ledger        docs/impl/19-hir-validation-ledger.md
 Runtime ABI ledger                   docs/impl/20-runtime-abi-ledger.md
 Build performance track              docs/impl/21-build-perf-plan.md
+Owned declared JSON plan             docs/impl/24-owned-json-plan.md
 Out-of-gate failure baseline         scripts/known-failures.txt
 Historical session journal           docs/archive/HANDOFF-2026-08-13.md
 Earlier session journal              docs/archive/HANDOFF-2026-07-25.md

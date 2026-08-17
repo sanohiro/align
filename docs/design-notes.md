@@ -786,6 +786,22 @@ competing for the same job ("one way" per job). Three deliberate rejections defi
   `Drop`, so semantic checking admits only rows whose complete reachable definition graph is
   recursively Copy under the canonical `DropPlan`. This is a scanner-only restriction; ordinary
   JSON decode and the declaration's other uses retain their own explicit ownership contracts.
+- **Owned decode is ownership-directed, not escape-directed.** A declared record whose closed graph
+  contains direct owned text selects a free-standing materializer at `json.decode`; a borrowed graph
+  keeps the zero-copy input/arena path, and a mixed graph rejects. The target's `string` types expose
+  the allocation choice before execution, so the result can outlive both input and an enclosing
+  arena without a hidden copy-on-escape. `encode` and `encode_bounded` consume the same graph and
+  ordered plan. The first flat graph is deliberately narrow; recursive owned JSON needs its own
+  consumer-reviewed cleanup graph.
+- **A target-local JSON descriptor is never ambiently authenticated.** Per-unit serialization wraps
+  it in the canonical target triple, object format, and complete relevant ABI tuple and validates
+  that envelope before reading an offset. The frontend target cache key remains redundant
+  partitioning, not evidence. Public non-generic records participate in interface identity;
+  private records and concrete consumer monomorphs participate only in implementation identity.
+- **Integer display follows declared signedness through the runtime call.** A template `IntHole`
+  retains its exact `Ty::Int`; codegen chooses the signed or unsigned decimal builder ABI after
+  sign- or zero-extension. This keeps full-range `u64` JSON canonical without a JSON-only formatter
+  or signed reinterpretation.
 - **Request 6's scanner generic boundary is concrete-row-only.** Concrete generic monomorphs such
   as `Wrap<i64>` remain eligible after row resolution, and ordinary generic calls use expected-return
   propagation owned by `align_sema::Checker::check_generic_call`; numeric `IntVar`/`FloatVar` retain

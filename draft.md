@@ -275,9 +275,10 @@ User {
 There is no class / inheritance.
 
 An owned `array<string>` is a valid ordinary struct field. Its Drop walks the initialized strings
-before freeing the array buffer. This does not make it a supported JSON field: JSON decoding and
-encoding retain their own closed schema grammar. A finite Move struct containing that field may be
-used in the existing `Option`, `Result`, and user-sum payload positions; Drop still follows only the
+before freeing the array buffer. The shipped borrowed JSON schema still excludes it; the accepted
+direct-owned JSON route in §18.1 admits it only in that route's closed flat record. A finite Move
+struct containing that field may be used in the existing `Option`, `Result`, and user-sum payload
+positions; Drop still follows only the
 active tag. Use `array<str>` when the strings are borrowed.
 
 ### Sum Type
@@ -1792,6 +1793,31 @@ The compiler never silently inserts a copy on escape — allocation stays visibl
 ("Nothing hidden") and the cost class stays predictable. A `.clone()` inside an arena is a
 bump allocation (bulk-freed), so escaping is not a sudden heap cost.
 
+### Direct owned records
+
+A direct declared record containing `string`, `Option<string>`, or `array<string>` selects the
+owned JSON route (accepted design; implementation pending). The route is closed and flat: every
+other field is a required signed/unsigned 8/16/32/64-bit integer or `bool`. Borrowed text, floats,
+nested records/arrays/enums, other optional forms, and explicit record layout/alignment are rejected
+before allocation. A record without an owned text leaf keeps the existing borrowed route.
+
+Owned decode materializes every text value into free-standing storage. `array<string>` owns its
+spine and every element, and `Option<string>` owns only `Some`. The result has no input or arena
+dependency and remains free-standing when the call occurs inside `arena {}`. This is not a hidden
+copy: the declared owned field types plus `json.decode` select the materializing boundary. A mixed
+owned/borrowed graph is rejected instead of converted.
+
+`json.decode`, `json.encode`, and `json.encode_bounded` accept the same owned graph. Encode preserves
+declaration order and the existing JSON string grammar; bounded encode retains its inclusive byte
+ceiling and owned `Result<string, Error>`. Decode range-checks the exact integer width and supports
+the full unsigned 64-bit range. Missing and `null` map to `None`, encode omits `None`, and
+`Some("")` remains distinct. Recoverable failure drops every initialized direct owner exactly once;
+overflow and allocation failure retain the terminal-abort policy.
+
+The exact descriptor, error precedence, ownership matrix, and golden vectors are specified by
+`docs/impl/24-owned-json-plan.md`. AoS, SoA, union, scalar-array, `json.doc`, and `json.scan` routes
+are unchanged.
+
 ### Struct as Schema
 
 ```align
@@ -2421,8 +2447,9 @@ json.scan(view)`). This is the complete surface: there is no `validate<T>`
 `doc` is the schema-unknown tier — see §14.
 
 `json.encode_bounded(value, max_bytes: i64) -> Result<string, Error>` is the owned, fallible sibling
-of `json.encode`. It accepts exactly the same borrowed typed values and emits exactly the same
-declaration-order bytes. `max_bytes` is an inclusive UTF-8 byte ceiling: exact fit succeeds; a
+of `json.encode`. It accepts exactly the same typed values, including the accepted flat direct-owned
+record graph, and emits exactly the same declaration-order bytes. `max_bytes` is an inclusive UTF-8
+byte ceiling: exact fit succeeds; a
 negative ceiling or the first byte beyond it is `Error.Invalid`; no partial string or allocation
 beyond the ceiling is exposed. “Canonical” names this one typed encoder, not RFC 8785 sorting or a
 schema-unknown dynamic value surface.
@@ -2471,9 +2498,9 @@ A field may also be an owned
 `array<Struct>` (the `messages: array<Message>` shape): decode parses the JSON
 array into an owned array-of-structs in the field (freed by the struct's drop),
 and encode renders it back — so a full nested/array/optional record round-trips.
-The array element struct may itself be Move; its elements are deep-dropped. JSON decode/encode for
-a bare `array<string>` field remains deferred, and a `soa<Struct>` stays
-primitive/`str` columns.
+The array element struct may itself be Move; its elements are deep-dropped. The direct-owned route
+above admits a flat `array<string>` field; nested and AoS owned-text graphs remain deferred. A
+`soa<Struct>` stays primitive/`str` columns.
 
 ### Union (Sum-Type) Mapping
 

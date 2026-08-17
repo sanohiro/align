@@ -74,6 +74,51 @@ The author-side matrix-to-diff pass must point every applicable row to implement
 owner test before the implementation PR is opened. The benchmark-evidence document remains the
 separate trusted measurement boundary; it does not define this language or runtime contract.
 
+## Direct owned records (Request 9 design)
+
+Request 9 extends the existing inferred operations with one closed, flat owned-record graph. The
+design is accepted; implementation is pending. A direct record selects the owned route when it has
+at least one direct `string`, `Option<string>`, or `array<string>` field. Once selected, every other
+field must be a required signed/unsigned 8/16/32/64-bit integer or `bool`. A `str`, `array<str>`,
+float, char, nested record/array/enum, other `Option`, explicit `layout(C)`, or `align(N)` makes the
+complete owned graph reject before descriptor construction or runtime allocation. Records without
+an owned text leaf keep the existing JSON route unchanged.
+
+The three operations share one accepted graph:
+
+```text
+json.decode(input: str) -> Result<T, Error>
+json.encode(value: T) -> str
+json.encode_bounded(value: T, max_bytes: i64) -> Result<string, Error>
+```
+
+Owned decode is an ownership-directed materializer. Every text field is a free-standing owner;
+`array<string>` owns its spine and every element; `Option<string>` owns only `Some`. The result has
+no input or arena provenance and remains free-standing when decoded inside `arena {}`. The owned
+target types and `json.decode` make allocation explicit. Borrowed JSON keeps Request 7's input/arena
+behavior, and a mixed owned/borrowed graph is rejected rather than silently cloned.
+
+Recoverable parse, duplicate, shape, integer-range, missing-field, and trailing-input failures drop
+every initialized direct owner exactly once before returning `Error.Code(1)`. Cleanup visits fields
+in declaration order, initialized text-array elements in ascending index order, then the spine.
+Overflow and allocator failure retain the runtime-wide terminal-abort policy. `u64` accepts and
+encodes the complete `0..=u64::MAX` range: typed integer holes select the dedicated unsigned
+builder ABI without a signed intermediate. Missing and `null` map to
+`None`; `None` is omitted, while `Some("")` is distinct.
+
+The checked compiler-private `OwnedJsonDescV1` is structural and target-local. It fixes field names
+and declaration order, integer width/sign, natural-layout algorithm and offsets, optional tag and
+payload offsets, allocation/drop tags, and the `array<string>` element Drop-plan version. It is
+never serialized naked: a per-unit interface binds it to the canonical LLVM target triple, object
+format, and exact relevant ABI cells in `OwnedJsonInterfaceEnvelopeV1` before including it in cache
+identity. Interface format 7 owns the new descriptor list and rejects format 6 before parsing it.
+The envelope rejects a target/ABI mismatch before trusting descriptor offsets and is not
+a public artifact or reflection surface. Existing AoS, SoA, union, fixed-array, scalar-array, `json.doc`, and
+recursively-Copy `json.scan` routes are unchanged.
+
+The exact public ledger, descriptor bytes, error precedence, implementation closure matrix, and
+golden vectors are authoritative in [`../24-owned-json-plan.md`](../24-owned-json-plan.md).
+
 ## Signatures (verified unless marked pending)
 
 ```text
@@ -126,12 +171,10 @@ runtime `drop_decoded_owned` grew a **kind-6** arm (`→ drop_decoded_union`) to
 payload on the decode error path. `match m.content { … }` moves the owned payload out and zeroes the
 field (`NullStructField` became type-aware — the whole `{tag,payloads}` aggregate), so the struct's
 `Drop` frees null there (single-free). The union's variants are part of the structural MIR type
-tables, so a variant change invalidates the decode/encode cache. **Boundary:** because a
-Move struct cannot be a `Result`/`Option` Ok payload across a function boundary (Slice-C constraint), a
-`Message` decode target binds with `?`. A top-level Move-union decode must likewise be consumed
-directly with `?`; retaining or returning its raw `Result<MoveUnion, Error>` is an L1b diagnostic
-because recursive tagged-payload Drop is not yet available. The following J3b slice supplies
-owned-element deep free, so
+tables, so a variant change invalidates the decode/encode cache. Finite non-recursive Move structs
+and unions use the shipped recursive tagged `DropPlan`, so raw `Result`/`Option` payloads may be
+bound, passed, returned, and transferred through ordinary control-flow ownership paths. The
+following J3b slice supplies owned-element deep free, so
 `Chat { messages: array<Message> }` also round-trips when `Message` is Move.
 
 **`array<Struct>` fields (REST-gateway runway, Slice C).** A struct field may be an owned
@@ -152,11 +195,11 @@ Move-enum field), then frees the AoS — called from both the struct-field drop 
 arm deep-frees each element (gated by `sub_owns_buffers`), and `decode_struct_array_value` frees the
 elements already materialized in `buf[0..count]` on a mid-array parse failure. **With J3b the OpenAI
 chat gateway closes end-to-end** (`Chat` round-trips byte-identically). **Still rejected:**
-JSON decode/encode of `array<string>` (a bare-`string`-element array field has no JSON descriptor
-arm). Request 10 makes that field valid for ordinary owned record construction by reusing the
-standalone deep Drop; it does not add the JSON producer. **Constraint:** a Move struct (owns an array/Move-enum) can't be a `Result`/`Option`
-Ok payload across a function boundary — decode + use in-scope; `json.encode` of a bare
-`array<Move-struct>` and pipelines over such a field stay restricted (decode→encode passthrough works).
+JSON decode/encode of `array<string>` (a bare-`string`-element array field has no shipped JSON
+descriptor arm). Request 10 makes that field valid for ordinary owned record construction by
+reusing the standalone deep Drop; Request 9's accepted design adds the direct flat JSON producer.
+`json.encode` of a bare `array<Move-struct>` and pipelines over such a field stay restricted
+(decode→encode passthrough works).
 
 **`array<scalar>` fields (JSON completeness T1b + `array<str>`, align-llm Request 3).** A struct field
 may be an owned `array<i64>` / `array<f64>` / `array<bool>` (the align-LLM data shapes — embeddings,

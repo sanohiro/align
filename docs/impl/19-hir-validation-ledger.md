@@ -742,6 +742,76 @@ means:
 | `ArrayGroupAggMulti` | `env[base,struct_id,key_field,aggs,source]`: source is producer-supported AosStr first cut; key is Str; nonempty aggs and each GroupAgg1 row valid. `child[]`; `post[result exact tuple of key array followed by one i64 array per agg; one fused pass; ownership/provenance as single aggregate]`. |
 | `ArrayDictEncode` | `env[base,struct_id,key_field]`: base is exactly DynStructArray(struct_id,Aos), key field is Str. `child[]`; `post[result DictEncoded(struct_id,key_field); dense ids owned, dictionary/source slices borrow base]`. |
 
+#### Planned Request 9 owned JSON HIR extension (not shipped)
+
+`docs/impl/24-owned-json-plan.md` adds a dedicated owned route. Until that
+implementation lands, the shipped `JsonDecode`, `Template`, and
+`JsonEncodeBounded` rows above retain their existing borrowed predicates and do
+not admit the new graph. The implementation adds these exact body-ledger rows:
+
+| Discriminator | Exact envelope, children, and postcondition |
+|---|---|
+| `JsonOwnedDecode` | `env[struct_id]`: an existing natural-layout direct record with at least one direct `String`, `Option<String>`, or `DynArray(String)` field; every other field is a required 8/16/32/64-bit signed/unsigned integer or Bool; the operation-specific classifier rejects every borrowed/nested/explicit-layout shape; its recursive `DropPlan`, free-standing allocation mode, and reconstructed `OwnedJsonDescV1` are exact. `child[input]`; `post[input Str; result ERR(Struct(struct_id)); every decoded owner is free-standing at every arena depth; no input/arena provenance; successful ownership transfers once]`. |
+| `JsonOwnedEncode` | `env[base,parts.len]`: base is one visible local of an accepted direct-owned record; reconstructing the complete graph and `OwnedJsonDescV1` exactly matches every part name, access root/path, type, declaration ordinal, and descriptor identity; parts are nonempty. `child[parts in canonical order]`; `post[result Str under the existing template-view lifetime; every access borrows base; base is neither moved nor mutated; hidden builder cleanup/transfer exact]`. |
+| `JsonOwnedEncodeBounded` | `env[base,parts.len]`: the same source and exact-plan reconstruction as `JsonOwnedEncode`. `child[parts in canonical order,max_bytes]`; `post[max_bytes exactly i64 after all source parts; result exactly Result<String,builtin Error>; source borrowed; success owns one free-standing String and failure owns no partial output]`. |
+
+The only new part discriminants are:
+
+| Discriminator | Exact operand contract |
+|---|---|
+| `OwnedJsonString` | `child[access]`; access is the exact direct owned String field recorded at this source ordinal; borrow its bytes and append one JSON string without transfer. |
+| `OwnedJsonOptionStringField` | `env[name]`: exact nonempty ASCII declared field name. `child[access]`; access is the exact direct Option(String) field; omit None and encode Some once without transfer. |
+| `OwnedJsonStringArray` | `child[access]`; access is the exact direct DynArray(String) field; borrow the spine/elements and emit them in index order without transfer. |
+
+Copy scalar fields retain the existing `Hole`/`IntHole`/`BoolHole` path, but an
+`IntHole`'s operand type is part of its checked contract. Signed integer widths
+select `BuilderWriteInt`; unsigned widths select `BuilderWriteUint` after exact
+zero extension. The validator rejects a hole whose operand width/sign differs
+from the source-ordinal descriptor field, and the MIR preflight retains that
+exact `Ty::Int` through all four lowerers.
+
+These nodes do not reuse or widen `json_struct_descriptor_ok`, the scanner Copy
+predicate, the AoS predicate, or the generic template grammar. One dedicated
+iterative classifier is shared only by the three `JsonOwned*` validators. The
+active body gate first applies its existing span/global/placement/header order,
+then checks the owned node envelope, graph/layout/Drop/descriptor reconstruction,
+children in the table order, stored expression result type, and ownership facts.
+Any failure returns canonical-empty MIR with the body-validation pass identity
+from whole-program, located, per-unit, and located-per-unit lowering before
+descriptor emission or a runtime call.
+
+That classifier first selects the owned route by the presence of a direct owned
+text leaf without diagnosing unrelated fields. Once selected, it rejects
+`layout(C)`, then `align(N)`, then validates fields by source ordinal. Within one
+field it validates resolved-type completeness, the outer constructor, and that
+constructor's exact width/sign or `string` payload in that order. Natural layout,
+`DropPlan`, allocation mode, target-bound descriptor identity, and operation
+operand type follow the complete field walk. Sema and this gate call the same
+classifier and therefore cannot disagree on a multi-invalid first cause.
+
+An imported owned descriptor reaches this body gate only after
+`OwnedJsonInterfaceEnvelopeV1` has validated its canonical target triple, object
+format, complete 64-bit little-endian ABI tuple, ABI hash, inner length, and
+exported-record association. The frontend cache target key is redundant
+partitioning, not proof. Concrete generic monomorphs and private types construct
+the same envelope locally and bind it to the structural MIR implementation hash;
+only accepted non-generic exported records appear in interface-hash order.
+
+The parameterized owner mutates each owned node into every sibling discriminator;
+unknown and borrowed-only record ids; each disallowed field/layout; every integer
+width/sign and each owned field kind; missing/reordered/duplicated/wrong-root or
+wrong-type parts; descriptor/allocation/Drop disagreement; wrong input/limit/result
+types; and active-arena depth. It proves the three positive nodes and every
+mutation across all four lowering entrypoints, with whole/per-unit identity. The
+interface owner separately rejects malformed target envelopes and
+`OwnedJsonDescV1` before this gate; the body owner recomputes the semantic
+descriptor so handcrafted HIR cannot forge
+or bypass that interface check. The same owner plus `variant_sweep_tripwire`
+requires every exhaustive HIR/MIR visitor, replay/clone walk, child enumerator,
+source-shape/implementation-hash encoder, validator, and lowering dispatcher to
+classify the new nodes and parts explicitly; a wildcard may not silently skip an
+analysis pass.
+
 #### Fixed-array element admission closure
 
 The `ArrayLit` producer and validator close the ownership boundary by element class:
@@ -1042,7 +1112,7 @@ if any of those five variants is absent from validation or ownership analysis.
 | One-field malformed mutations | For each row, mutate every child type, the stored result type, child count/order, receiver locality, and receiver handle kind independently. Validation rejects before MIR allocation, runtime declaration, ownership transfer, or cache publication. | parameterized complete-envelope mutations in `request11_process_rows_match_the_producer` |
 | Diagnostic precedence | A malformed child expression is visited before the receiver/result post relation; an equal-typed temporary receiver rejects only after its child validates. Negative `limit` is not a HIR-malformation discriminator and remains the runtime programmer-error abort. | accepted-local/temporary twins plus an invalid later-child twin in the same owner |
 | Closed Move classification | `RunBytes` is owned and dropped exactly like `RunOutput`: it is permitted only in its `Result` Ok carrier/local flow, nulls on move, is excluded from aggregates, arrays, task captures, and Copy/region-plain domains, and its byte views inherit only its owner region. | `run_bytes_type_classification_tripwire` sweeps Copy/Move/Drop/region/aggregate/capture/return and every control-flow cleanup owner |
-| Canonical/interface parity | Whole-program and imported/per-unit checked HIR resolve source `run_bytes` to the same closed type. Canonical type codec v3 tags are exactly `Ty=60` and `Scalar=36`; interface format 6 retains named-type tag 0/path `run_bytes`/zero args. | bidirectional golden and unknown/truncated-tag owners named in the process design, plus exact edit/revert unit-cache identity |
+| Canonical/interface parity | Whole-program and imported/per-unit checked HIR resolve source `run_bytes` to the same closed type. Canonical type codec v3 tags are exactly `Ty=60` and `Scalar=36`; shipped interface format 6 retains named-type tag 0/path `run_bytes`/zero args, and the accepted Request 9 format-7 bump preserves those bytes before its new descriptor-list position. | bidirectional golden and unknown/truncated-tag owners named in the process design, plus exact edit/revert unit-cache identity |
 
 ## Inventory closure
 

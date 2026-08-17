@@ -866,3 +866,33 @@ the buffer into `Ok(string)`; negative-limit and over-limit finishes consume the
 buffer, zero the output slot, and construct `Err(Error.Invalid)`. Actual OOM remains terminal under
 the allocator-wide rule. There is no partial owner, hidden second pass, arena fallback, source move,
 or path on which both the builder and Result own the same allocation.
+
+## 19. Ownership-directed JSON records (accepted design 2026-08-17)
+
+Align-llm Request 9 adds no region kind or second ownership model. It defines one general
+materializing boundary within typed JSON:
+
+```text
+borrowed JSON graph    input/arena-bounded views
+fully owned JSON graph free-standing owners
+mixed graph            compile-time rejection
+```
+
+The first accepted owned graph is a flat direct record containing at least one `string`,
+`Option<string>`, or `array<string>`, with only required fixed-width integer and bool siblings. The
+target declaration exposes the owning types, and `json.decode` is the explicit materializer. Every
+child owner is free-standing even when the call is lexically inside `arena {}`; the complete record
+therefore carries a set cleanup bit and no input/arena region. This is an operation contract, not an
+escape-time copy or an ambient allocator choice. Ordinary owned producers retain §6's arena default,
+and borrowed JSON retains Request 7's arena materialization.
+
+The result composes with the existing recursive `Result`/Option/user-sum `DropPlan` and path-local
+cleanup carrier. Moves clear the complete source. Replacement drops the old record first.
+Recoverable decode failure visits direct fields in declaration order; an `array<string>` visits its
+initialized elements in ascending order before its spine. All children use the same free-standing
+mode, so the one-aggregate/one-mode invariant remains intact. Overflow and allocation failure stay
+terminal and make no cleanup-after-abort promise.
+
+The exact graph, compiler-private descriptor, routing exclusions, and implementation matrix are in
+[`24-owned-json-plan.md`](24-owned-json-plan.md). The later recursive C6 graph must reuse this model
+through a separately reviewed finite graph; it may not widen this flat route implicitly.

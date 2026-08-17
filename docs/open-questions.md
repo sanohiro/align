@@ -4510,9 +4510,10 @@ close the rest — no "this JSON shape works, that one doesn't" gap).**
   descriptors — symmetric, handles nested/Option/str/scalar). **Memory-safety:** the decode `Err`
   path frees any AoS buffers already written into the partial struct (`drop_decoded_owned`, the
   runtime dual of `drop_struct_fields`) — pinned by `json_array_field_error_path_frees_buffer`
-  (alloc==free). **Known constraint:** a Move struct (owns an array) can't be a `Result`/`Option`
-  Ok payload that crosses a function boundary (pre-existing) — decode + use it in the same scope.
-  Deferred: `array<scalar>` field decode (`array<i64>`), `array<string>`/owned-element arrays.
+  (alloc==free). At this slice's boundary a Move struct could not yet cross a function boundary as
+  a `Result`/`Option` Ok payload; L1b later shipped recursive tagged-payload Drop and removed that
+  constraint. `array<scalar>` field decode shipped later; `array<string>` remained deferred until
+  the settled direct-owned route recorded below. Other owned-element arrays remain deferred.
   `soa<T>` keeps excluding Move-fielded structs (the settled owned-columns deferral stands). Tests:
   m5 (`json_array_struct_field_decode_read_and_roundtrip`, `json_full_openai_response_shape_roundtrip`,
   `json_empty_array_struct_field`), runtime (`json_decode_array_struct_field_and_encode`,
@@ -4630,6 +4631,19 @@ recorded for the slice: `.at(i)`/`.get(k)` are linear at one nesting level (tape
 offsets make each hop O(1); use `elems()` for whole-level loops); an escaped string in `as_str()`
 unescapes into the arena (bump, bulk-freed — the one allocating accessor, documented).
 
+**Direct owned JSON records — SETTLED DESIGN (2026-08-17; implementation pending).** A direct
+record with at least one `string`, `Option<string>`, or `array<string>` field selects one closed
+owned route. Its only other fields are required fixed-width integers or bool; borrowed text,
+floats, nested aggregates, other optionals, and explicit layout/alignment reject before allocation.
+Decoded text is free-standing even inside `arena {}`, so the result has no input/arena provenance;
+the owned target types plus `json.decode` make materialization visible. Borrowed graphs keep the
+zero-copy Request 7 route, and mixed graphs reject instead of cloning. `json.encode` and
+`json.encode_bounded` use the same accepted graph and ordered encode plan. The compiler-private,
+target-local structural descriptor is serialized only inside its canonical target/ABI-bound
+interface envelope; the complete artifact, validation-order, and ownership/error matrices are fixed
+in `docs/impl/24-owned-json-plan.md`. This does not add top-level owned text, owned AoS/SoA/union/
+scanner rows, a dynamic JSON tree, or the later recursive Request 13 graph.
+
 **T3 — streaming: `json.scan` (SETTLED → SHIPPED as J5, #546 + #547; Request 6 safety gate pending).** NDJSON /
 top-level-array streaming typed by the binding annotation (`rows: json.scanner<Row> :=
 json.scan(view)` — the schema-selector residual resolves the same way `decode` does; never a
@@ -4689,7 +4703,8 @@ and it types from the binding annotation.
 **T1b — matrix fill (impl, no new design): COMPLETE.** top-level scalar/bool targets (`x: i64 :=
 json.decode(s)?` — SHIPPED, #539), `array<scalar>` struct fields (SHIPPED, #538), `Option<struct>`
 ENCODE (the B follow-up — SHIPPED, #540). Rule: any composition of supported constructors closes; the
-v1 JSON boundaries stay explicit (`array<string>` has ordinary deep Drop but still waits for a JSON
+shipped v1 borrowed-JSON boundaries stay explicit (`array<string>` has ordinary deep Drop; the
+separately settled, implementation-pending direct-owned route supplies its only JSON
 descriptor/producer arm).
 **`array<Option<T>>` DEFERRED (not a JSON gap — a language-type gap).** The T1b sketch listed it as a
 "supported-constructor composition", but it is NOT one: an owned `array<T>`'s element is a
