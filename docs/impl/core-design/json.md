@@ -119,6 +119,31 @@ recursively-Copy `json.scan` routes are unchanged.
 The exact public ledger, descriptor bytes, error precedence, implementation closure matrix, and
 golden vectors are authoritative in [`../24-owned-json-plan.md`](../24-owned-json-plan.md).
 
+## Recursive owned records (Request 13, design accepted)
+
+Request 13 replaces the flat owned implementation boundary with one acyclic, view-free graph while
+keeping the same three inferred operations. A transitive owned `string` selects the route. The
+complete graph admits fixed-width signed/unsigned integers, bool, owned `string`, nonempty
+natural-layout records, `Option<T>` payloads, and dynamic arrays whose elements are an integer, bool,
+string, or accepted record. An option payload cannot itself be an option because missing and `null`
+are one absence state. Record/option/dynamic-array constructor depth is at most 128. Arrays of options/arrays, borrowed
+text, floats, char, enums, fixed arrays, explicit layout/alignment, and every other constructor
+reject before descriptor construction or allocation. A root with no transitive owned string keeps
+the existing route and is not narrowed.
+
+Decode makes every reachable owner free-standing, including inside `arena {}`. Recursive failure
+cleanup visits live fields in declaration order, option payloads only after `Some`, array elements
+in ascending order, then array spines. Encode and bounded encode borrow the same root and use one
+descriptor-driven declaration-order writer; bounded success is byte-identical and retains Request
+12's inclusive limit behavior.
+
+`OwnedJsonGraphDescV2` and `OwnedJsonInterfaceEnvelopeV2` replace the flat V1 records for every
+owned root. Interface format 8 replaces format 7 atomically; there is no compatibility decoder or
+parallel runtime route. A103 decode and A80 encode keep their ABIs. The accepted grammar, exact V2
+bytes, validation order, C6 fixture scope, and implementation matrix are authoritative in
+[`../25-recursive-owned-json-plan.md`](../25-recursive-owned-json-plan.md). Implementation is
+pending; the preceding Request 9 section remains the current shipped compiler behavior.
+
 ## Signatures (verified unless marked pending)
 
 ```text
@@ -272,8 +297,9 @@ The later Option, array-field, and union slices described above compose with thi
 - `encode_bounded` borrows the same accepted value graph and uses the same ordered encode pieces,
   but returns one individually owned `string` on exact-fit-or-smaller success. Its inclusive
   `max_bytes` ceiling applies to emitted UTF-8 bytes before growth; negative or exceeded limits are
-  `Error.Invalid`, with no partial result. It adds no accepted JSON shape; the separately reviewed
-  Request 13 graph widening must feed both encode operations through their shared part constructor.
+  `Error.Invalid`, with no partial result. The shipped operation adds no shape by itself. The
+  accepted Request 13 implementation replaces the flat owned parts with one V2 descriptor-driven
+  root writer shared by both encode operations.
 - `decode` into `array<T>`/`array<Struct>` produces an owned Move array (deep-dropped).
 - `decode` into `soa<T>` allocates columns in the enclosing arena (`align_rt_json_decode_soa`,
   one count pass + one value-parse pass sharing the Mison speculation via `FieldDst`).

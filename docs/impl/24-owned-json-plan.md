@@ -4,7 +4,8 @@ Status: **IMPLEMENTED**.
 
 This document is the plan of record for align-llm Request 9. It extends the
 existing declared-record JSON path with one closed, directly owned text graph.
-It does not define the later recursive C6 graph from Request 13.
+It does not define the recursive C6 graph from Request 13; that accepted
+replacement design is `25-recursive-owned-json-plan.md`.
 
 The implementation starts only from a commit containing this reviewed design.
 The public source form remains the existing inferred `core.json` surface. The
@@ -102,8 +103,9 @@ fn use_mapped(input: str) -> Result<OwnedTask, Error> {
 
 The direct-record restriction is deliberate. It gives the first consumer an
 independently owned result without silently widening AoS, SoA, union, scanner,
-or nested-graph cleanup. Request 13 may later consume this ownership model for
-one reviewed recursive graph.
+or nested-graph cleanup. Request 13 consumes this ownership model through the
+separately reviewed recursive graph in `25-recursive-owned-json-plan.md`; V1
+remains the shipped boundary until that replacement implementation lands.
 
 ## 2. Public-contract ledger
 

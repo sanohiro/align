@@ -787,12 +787,14 @@ competing for the same job ("one way" per job). Three deliberate rejections defi
   recursively Copy under the canonical `DropPlan`. This is a scanner-only restriction; ordinary
   JSON decode and the declaration's other uses retain their own explicit ownership contracts.
 - **Owned decode is ownership-directed, not escape-directed.** A declared record whose closed graph
-  contains direct owned text selects a free-standing materializer at `json.decode`; a borrowed graph
+  contains owned text selects a free-standing materializer at `json.decode`; a borrowed graph
   keeps the zero-copy input/arena path, and a mixed graph rejects. The target's `string` types expose
   the allocation choice before execution, so the result can outlive both input and an enclosing
   arena without a hidden copy-on-escape. `encode` and `encode_bounded` consume the same graph and
-  ordered plan. The first flat graph is deliberately narrow; recursive owned JSON needs its own
-  consumer-reviewed cleanup graph.
+  ordered plan. The shipped flat graph is deliberately narrow. Its accepted recursive successor is
+  still a closed, acyclic, view-free grammar with a 128-level bound; it replaces the flat descriptor
+  and runtime route rather than creating a second JSON ownership model. This lets C6 persist nested
+  records/options/arrays while keeping every allocation mode visible in the declared types.
 - **A target-local JSON descriptor is never ambiently authenticated.** Per-unit serialization wraps
   it in the canonical target triple, object format, and complete relevant ABI tuple and validates
   that envelope before reading an offset. The frontend target cache key remains redundant

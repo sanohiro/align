@@ -275,8 +275,9 @@ User {
 There is no class / inheritance.
 
 An owned `array<string>` is a valid ordinary struct field. Its Drop walks the initialized strings
-before freeing the array buffer. The shipped borrowed JSON schema still excludes it; the accepted
-direct-owned JSON route in §18.1 admits it only in that route's closed flat record. A finite Move
+before freeing the array buffer. The shipped borrowed JSON schema still excludes it; the shipped
+direct-owned JSON route in §18.1 admits it in a closed flat record. The accepted recursive owned
+extension also admits it at any reachable field and inside an accepted record array. A finite Move
 struct containing that field may be used in the existing `Option`, `Result`, and user-sum payload
 positions; Drop still follows only the
 active tag. Use `array<str>` when the strings are borrowed.
@@ -1818,6 +1819,28 @@ The exact descriptor, error precedence, ownership matrix, and golden vectors are
 `docs/impl/24-owned-json-plan.md`. AoS, SoA, union, scalar-array, `json.doc`, and `json.scan` routes
 are unchanged.
 
+### Recursive owned records
+
+The accepted Request 13 extension replaces that flat implementation boundary with one recursive,
+view-free graph. A direct natural-layout record selects the owned route when any reachable field is
+an owned `string`. The complete graph may contain fixed-width signed/unsigned integers, bool,
+`string`, nonempty natural-layout records, `Option<T>` payloads, and dynamic `array<T>`. An option
+payload may not itself be an option because missing and `null` are one absence state. Array elements
+are integers, bool, `string`, or an accepted record; arrays of options/arrays remain outside the
+language's element representation. The graph must be acyclic and at most 128
+record/option/dynamic-array constructor levels.
+`str`, floats, char, enums, fixed arrays, explicit layout/alignment, and every other constructor
+reject before descriptor construction or allocation.
+
+All decoded owners are free-standing, including nested option payloads, array spines, strings, and
+record elements. Partial construction and recoverable failure recursively drop live fields in
+declaration order and array elements in ascending order exactly once. `json.decode`, `json.encode`,
+and `json.encode_bounded` share the same graph and declaration-order canonical bytes. The V2
+structural graph descriptor replaces V1 for flat and recursive roots, travels only in a target-bound
+V2 envelope, and atomically advances the compiler interface format from 7 to 8; there is no
+flat/recursive compatibility path. The exact accepted design and implementation closure matrix are
+`docs/impl/25-recursive-owned-json-plan.md`; implementation is pending.
+
 ### Struct as Schema
 
 ```align
@@ -2447,8 +2470,9 @@ json.scan(view)`). This is the complete surface: there is no `validate<T>`
 `doc` is the schema-unknown tier — see §14.
 
 `json.encode_bounded(value, max_bytes: i64) -> Result<string, Error>` is the owned, fallible sibling
-of `json.encode`. It accepts exactly the same typed values, including the accepted flat direct-owned
-record graph, and emits exactly the same declaration-order bytes. `max_bytes` is an inclusive UTF-8
+of `json.encode`. It accepts exactly the same typed values, including the shipped flat direct-owned
+graph and the accepted recursive owned graph once implemented, and emits exactly the same
+declaration-order bytes. `max_bytes` is an inclusive UTF-8
 byte ceiling: exact fit succeeds; a
 negative ceiling or the first byte beyond it is `Error.Invalid`; no partial string or allocation
 beyond the ceiling is exposed. “Canonical” names this one typed encoder, not RFC 8785 sorting or a
@@ -2498,8 +2522,9 @@ A field may also be an owned
 `array<Struct>` (the `messages: array<Message>` shape): decode parses the JSON
 array into an owned array-of-structs in the field (freed by the struct's drop),
 and encode renders it back — so a full nested/array/optional record round-trips.
-The array element struct may itself be Move; its elements are deep-dropped. The direct-owned route
-above admits a flat `array<string>` field; nested and AoS owned-text graphs remain deferred. A
+The array element struct may itself be Move; its elements are deep-dropped. The shipped direct-owned
+route admits a flat `array<string>` field. The accepted Request 13 route admits owned text through
+its separately reviewed recursive record graph; top-level owned AoS selection remains separate. A
 `soa<Struct>` stays primitive/`str` columns.
 
 ### Union (Sum-Type) Mapping

@@ -896,3 +896,24 @@ terminal and make no cleanup-after-abort promise.
 The exact graph, compiler-private descriptor, routing exclusions, and implementation matrix are in
 [`24-owned-json-plan.md`](24-owned-json-plan.md). The later recursive C6 graph must reuse this model
 through a separately reviewed finite graph; it may not widen this flat route implicitly.
+
+## 20. Recursive ownership-directed JSON records (design accepted 2026-08-17)
+
+Request 13 supplies that separate review. It does not add a region or allocation mode. The owned
+selector now scans the complete reachable record graph; a transitive `string` selects one
+free-standing materializer, while any borrowed member makes the selected graph invalid. The closed
+acyclic grammar, 128-level bound, and exclusions are fixed in
+[`25-recursive-owned-json-plan.md`](25-recursive-owned-json-plan.md).
+
+The root retains one path-local cleanup bit. Every nested record, `Some` payload, dynamic-array
+spine, owned element, and string uses the same free-standing mode. Construction keeps nested output
+zeroed, sets an option tag only after its payload succeeds, and advances an array length only after
+the current element succeeds. Recoverable failure walks declaration-order fields recursively,
+completed array elements in ascending order, one current partial element, then the spine, nulling
+each owner as it goes. Move, raw Result, replacement, return, control-flow joins, and Drop reuse the
+ordinary recursive carrier; there is no JSON-specific ownership bit per member.
+
+The V2 graph descriptor replaces V1 and records every reachable layout/Drop fact. Decode continues
+to pass a null arena to A103, so the runtime's leaf allocation kinds remain free-standing. A80 reads
+the same validated table for encode without consuming the source. Implementation is pending; §19
+remains the exact shipped flat behavior until the V2 capability lands atomically.

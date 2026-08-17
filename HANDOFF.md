@@ -306,9 +306,10 @@ facts must live in this repository.
   implementation is merged; Requests 11 and 12 are implemented, and Request 5's bounded-HTTP
   implementation is merged at `5aa5b23a`. Request 7 is `ALIGN_MERGED` through #850, including its
   evidence boundary, decoded-owner prerequisite, and escaped-string implementation. Request 15 is
-  also `ALIGN_MERGED`. Request 9's direct owned-record JSON implementation is complete against
-  `docs/impl/24-owned-json-plan.md`; Requests 13 and 14 remain proposed in
-  `../align-llm/docs/align-requests.md`.
+  also `ALIGN_MERGED`. Request 9's direct owned-record JSON implementation is merged through #852
+  against `docs/impl/24-owned-json-plan.md`. Request 13's recursive owned-JSON public contract is
+  accepted in `docs/impl/25-recursive-owned-json-plan.md` and awaits its implementation PR;
+  Request 14 remains proposed in `../align-llm/docs/align-requests.md`.
 
 Consumer-gated deferrals that remain intentional:
 
@@ -385,6 +386,7 @@ Checked-HIR validation ledger        docs/impl/19-hir-validation-ledger.md
 Runtime ABI ledger                   docs/impl/20-runtime-abi-ledger.md
 Build performance track              docs/impl/21-build-perf-plan.md
 Owned declared JSON plan             docs/impl/24-owned-json-plan.md
+Recursive owned JSON plan            docs/impl/25-recursive-owned-json-plan.md
 Out-of-gate failure baseline         scripts/known-failures.txt
 Historical session journal           docs/archive/HANDOFF-2026-08-13.md
 Earlier session journal              docs/archive/HANDOFF-2026-07-25.md

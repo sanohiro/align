@@ -4644,6 +4644,21 @@ interface envelope; the complete artifact, validation-order, and ownership/error
 in `docs/impl/24-owned-json-plan.md`. This does not add top-level owned text, owned AoS/SoA/union/
 scanner rows, a dynamic JSON tree, or the later recursive Request 13 graph.
 
+**Recursive owned JSON records — DESIGN SETTLED 2026-08-17 (implementation pending).** Request 13
+reuses the ownership-directed materializer for one acyclic, view-free graph of fixed-width integers,
+bool, owned `string`, natural-layout records, `Option<T>` payloads, and dynamic arrays whose elements
+are an integer, bool, string, or accepted record. An option payload cannot itself be an option because
+missing and `null` are one absence state. Any transitive owned string selects the route;
+with none, the existing route remains authoritative. Mixed borrowed text, floats, chars, enums,
+fixed arrays, explicit layout/alignment, cycles, constructor depth above 128, and unrepresentable array element
+constructors reject before allocation. Decode makes every reachable owner free-standing and deep
+failure cleanup follows the ordinary recursive Move/Drop carrier. Encode and bounded encode use the
+same graph and canonical declaration order. `OwnedJsonGraphDescV2` and its target-bound V2 envelope
+replace V1 for both flat and recursive roots while interface format 7 advances atomically to 8; no
+compatibility decoder or second runtime route is added. A103 and A80 keep their signatures, with A80
+admitting owned kinds 8/9 only from a validated V2 graph. Exact bytes, precedence, C6 fixture scope,
+and the implementation closure matrix are fixed in `impl/25-recursive-owned-json-plan.md`.
+
 **T3 — streaming: `json.scan` (SETTLED → SHIPPED as J5, #546 + #547; Request 6 safety gate pending).** NDJSON /
 top-level-array streaming typed by the binding annotation (`rows: json.scanner<Row> :=
 json.scan(view)` — the schema-selector residual resolves the same way `decode` does; never a

@@ -812,6 +812,28 @@ source-shape/implementation-hash encoder, validator, and lowering dispatcher to
 classify the new nodes and parts explicitly; a wildcard may not silently skip an
 analysis pass.
 
+#### Request 13 recursive owned JSON replacement (design accepted, implementation pending)
+
+`docs/impl/25-recursive-owned-json-plan.md` retains the three `JsonOwned*`
+discriminants but replaces their flat stored plan and direct owned template parts
+with one `OwnedJsonGraphPlanV2 { root, graph }`. The preceding rows remain the
+shipped V1 behavior until this replacement lands atomically.
+
+| Discriminator | V2 envelope, children, and postcondition |
+|---|---|
+| `JsonOwnedDecode` | `env[root,graph]`: root is an existing nonempty natural-layout record; a non-diagnosing scan finds a transitive owned String; iterative root-first validation admits only fixed-width integers, Bool, String, accepted records, non-nested Options, and dynamic arrays of integer/Bool/String/record; graph is acyclic, view-free, constructor depth ≤ 128, exact under recursive `DropPlan`, and byte-equal to reconstructed `OwnedJsonGraphDescV2`. `child[input]`; `post[input Str; exact Result<Struct(root),Error>; every reachable owner free-standing; no input/arena provenance; one complete transfer]`. |
+| `JsonOwnedEncode` | `env[root,graph,base]`: the same reconstructed V2 graph and one stable visible root place; no unrolled recursive template parts remain. `child[base borrow]`; `post[exact Str under existing builder lifetime; A80 visits declaration-order graph; source not moved or mutated]`. |
+| `JsonOwnedEncodeBounded` | `env[root,graph,base]`: same V2 source plan. `child[base borrow,max_bytes]`; `post[max_bytes exact i64 after source-plan validation; exact Result<String,Error>; bounded A80 bytes equal unbounded on success; no partial owner]`. |
+
+Interface format 8 validates `OwnedJsonInterfaceEnvelopeV2` and the complete V2
+graph before cache lookup or HIR construction. The body gate reconstructs it
+again from definitions and compares exact bytes. Graph discovery, codec,
+validation, Drop comparison, hashing, clone/replay, and table construction use
+explicit worklists; an active record is the cycle error, a completed record is a
+shared DAG reference, and depth 128/129 is accepted/rejected deterministically.
+The Request 9 owned template-part variants are deleted in the same implementation
+commit, so no V1 flat producer survives without its V2 consumer.
+
 #### Fixed-array element admission closure
 
 The `ArrayLit` producer and validator close the ownership boundary by element class:
