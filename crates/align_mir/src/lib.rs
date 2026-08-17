@@ -4895,7 +4895,7 @@ fn lower_template_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
                 .pieces
                 .push(TemplatePiece::PopComma),
             Action::Child(part, child) => {
-                if matches!(child.kind, hir::ExprKind::Template(_)) {
+                if expression_uses_template_spine(child) {
                     frames
                         .last_mut()
                         .expect("a nested template has a parent frame")
@@ -5089,6 +5089,9 @@ fn lower_wildcard_match_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
 /// Expressions whose parent-specific child protocol must run outside the giant eager dispatcher.
 /// This includes structured control/scopes and multi-child ownership boundaries such as calls.
 fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
+    if expression_uses_template_spine(e) {
+        return true;
+    }
     matches!(
         &e.kind,
         hir::ExprKind::Binary {
@@ -5107,8 +5110,8 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
             | hir::ExprKind::Arena(_)
             | hir::ExprKind::NamedArena { .. }
             | hir::ExprKind::TaskGroup(_)
-            | hir::ExprKind::Template(_)
             | hir::ExprKind::JsonEncodeBounded { .. }
+            | hir::ExprKind::JsonOwnedEncodeBounded { .. }
             | hir::ExprKind::FileCreateRw { .. }
             | hir::ExprKind::FileOpenRw { .. }
             | hir::ExprKind::FilePread { .. }
@@ -5179,6 +5182,13 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
             | hir::ExprKind::HttpStreamReject { .. }
             | hir::ExprKind::HttpStreamSend { .. }
             | hir::ExprKind::HttpStreamFinish { .. }
+    )
+}
+
+fn expression_uses_template_spine(e: &hir::Expr) -> bool {
+    matches!(
+        e.kind,
+        hir::ExprKind::Template(_) | hir::ExprKind::JsonOwnedEncode { .. }
     )
 }
 
@@ -5261,8 +5271,13 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::Arena(block) => lower_arena_block(b, block),
         hir::ExprKind::NamedArena { local, block } => lower_named_arena_block(b, *local, block),
         hir::ExprKind::TaskGroup(block) => lower_task_group_block(b, block),
-        hir::ExprKind::Template(_) => lower_template_spine(b, e),
+        hir::ExprKind::Template(_) | hir::ExprKind::JsonOwnedEncode { .. } => {
+            lower_template_spine(b, e)
+        }
         hir::ExprKind::JsonEncodeBounded {
+            parts, max_bytes, ..
+        }
+        | hir::ExprKind::JsonOwnedEncodeBounded {
             parts, max_bytes, ..
         } => {
             lower_json_encode_bounded(b, parts, max_bytes, e.ty)
@@ -15894,6 +15909,51 @@ mod tests {
             d.iter().map(|diag| &diag.message).collect::<Vec<_>>()
         );
         lower_program(&hir)
+    }
+
+    #[test]
+    fn owned_json_encoders_use_stack_safe_dispatch() {
+        let span = align_span::Span::new(0, 0, 0);
+        let i64_ty = Ty::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        let mut max_bytes = hir::Expr {
+            kind: hir::ExprKind::Int(0),
+            ty: i64_ty,
+            span,
+        };
+        for _ in 1..128 {
+            max_bytes = hir::Expr {
+                kind: hir::ExprKind::Unary {
+                    op: UnOp::Neg,
+                    expr: Box::new(max_bytes),
+                },
+                ty: i64_ty,
+                span,
+            };
+        }
+        let owned = hir::Expr {
+            kind: hir::ExprKind::JsonOwnedEncode {
+                base: 0,
+                parts: Vec::new(),
+            },
+            ty: Ty::Str,
+            span,
+        };
+        let bounded = hir::Expr {
+            kind: hir::ExprKind::JsonOwnedEncodeBounded {
+                base: 0,
+                parts: Vec::new(),
+                max_bytes: Box::new(max_bytes),
+            },
+            ty: Ty::Result(Scalar::String, Scalar::Enum(0)),
+            span,
+        };
+
+        assert!(expression_uses_template_spine(&owned));
+        assert!(expression_uses_out_of_line_dispatch(&owned));
+        assert!(expression_uses_out_of_line_dispatch(&bounded));
     }
 
     fn check_modules<'a>(sources: &'a [(&'a str, bool, &'a str)]) -> (hir::Program, Diagnostics) {

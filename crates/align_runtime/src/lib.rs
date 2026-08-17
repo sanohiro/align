@@ -4179,7 +4179,7 @@ unsafe fn sub_owns_buffers(descs: &[JsonField]) -> bool {
         // kind 5 = array<Struct>, 6 = union (owned payload possible), 7 = array<scalar> — all own a
         // heap buffer `drop_decoded_owned` frees.
         5 | 6 => !d.sub.is_null(),
-        7 | 8 | 9 => true,
+        7..=9 => true,
         4 if !d.sub.is_null() => {
             let sub = unsafe { &*d.sub };
             let sub_descs = unsafe { safe_slice(sub.descs, sub.n_fields) };
@@ -4303,10 +4303,7 @@ unsafe fn drop_decoded_owned(base: *mut u8, descs: &[JsonField], only_seen: Opti
                 let len = if stored_len <= 0 {
                     0
                 } else {
-                    match usize::try_from(stored_len) {
-                        Ok(len) => len,
-                        Err(_) => 0,
-                    }
+                    usize::try_from(stored_len).unwrap_or_default()
                 };
                 if !ptr.is_null() {
                     for index in 0..len {
