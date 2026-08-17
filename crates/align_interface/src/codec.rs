@@ -12,13 +12,14 @@
 
 use crate::{
     Effect, Hash128, IConst, IEnumDef, IFnSig, IParam, IResourceDef, IStructDef, IType, ITypeParam,
-    InterfaceSummary, ParamMode, ReturnBorrowSummary, ReturnRegionSummary,
+    InterfaceSummary, OwnedJsonInterfaceEntry, OwnedJsonTarget, ParamMode, ReturnBorrowSummary,
+    ReturnRegionSummary,
 };
 
 /// The interface-artifact format version. Bump on ANY encoding change; a bump invalidates every
 /// cached summary (an old version fails closed on read) and changes `interface_hash` (the version is
 /// part of the hashed surface).
-pub const FORMAT_VERSION: u32 = 6;
+pub const FORMAT_VERSION: u32 = 7;
 
 /// Narrow a length to the format's `u32` length-prefix width, or panic loudly. This is
 /// producer-side, compiler-internal data (interface surfaces built from the compiler's own source
@@ -194,6 +195,12 @@ fn write_struct(w: &mut Writer, s: &IStructDef) {
     w.opt_str(&s.generic_body);
 }
 
+fn write_owned_json_entry(w: &mut Writer, entry: &OwnedJsonInterfaceEntry) {
+    w.str(&entry.type_name);
+    w.u32(u32_len(entry.envelope.len()));
+    w.buf.extend_from_slice(&entry.envelope);
+}
+
 fn write_enum(w: &mut Writer, e: &IEnumDef) {
     w.str(&e.name);
     write_type_params(w, &e.type_params);
@@ -233,6 +240,7 @@ fn write_surface(w: &mut Writer, s: &InterfaceSummary) {
     w.str(&s.unit);
     w.seq(&s.fns, write_fn);
     w.seq(&s.structs, write_struct);
+    w.seq(&s.owned_json_descriptors, write_owned_json_entry);
     w.seq(&s.enums, write_enum);
     w.seq(&s.resources, write_resource);
     w.seq(&s.consts, write_const);
@@ -280,6 +288,9 @@ pub enum DecodeError {
     /// A provenance summary was not canonical or referenced a root unavailable in an exported
     /// interface.
     InvalidSummary(&'static str),
+    /// A target-bound owned-JSON envelope or descriptor was malformed, non-canonical, or belonged
+    /// to a different compiler target.
+    InvalidOwnedJson(&'static str),
 }
 
 impl std::fmt::Display for DecodeError {
@@ -295,6 +306,9 @@ impl std::fmt::Display for DecodeError {
             DecodeError::InterfaceHashMismatch => write!(f, "interface artifact surface does not match its stored hash"),
             DecodeError::InvalidSummary(reason) => {
                 write!(f, "invalid interface provenance summary: {reason}")
+            }
+            DecodeError::InvalidOwnedJson(reason) => {
+                write!(f, "invalid owned JSON interface descriptor: {reason}")
             }
         }
     }
@@ -577,10 +591,39 @@ fn read_const(r: &mut Reader<'_>) -> Result<IConst, DecodeError> {
     Ok(IConst { name, ty, value_src: r.str()? })
 }
 
+fn read_owned_json_entry(
+    r: &mut Reader<'_>,
+) -> Result<OwnedJsonInterfaceEntry, DecodeError> {
+    let type_name = r.str()?;
+    let len = usize::try_from(r.u32()?)
+        .map_err(|_| DecodeError::InvalidOwnedJson("owned JSON envelope length"))?;
+    let envelope = r.take(len)?.to_vec();
+    Ok(OwnedJsonInterfaceEntry {
+        type_name,
+        envelope,
+    })
+}
+
 /// Deserialize a complete summary from its artifact byte form. Fail-closed: an unknown format
 /// version, a truncated buffer, a bad tag, invalid UTF-8, trailing bytes, or a stale/mismatched
 /// surface hash all return an error.
 pub fn deserialize(bytes: &[u8]) -> Result<InterfaceSummary, DecodeError> {
+    deserialize_impl(bytes, None)
+}
+
+/// Decode and additionally bind every owned-JSON descriptor envelope to `target` before returning
+/// the summary to an interface consumer or cache lookup.
+pub fn deserialize_for_target(
+    bytes: &[u8],
+    target: &OwnedJsonTarget,
+) -> Result<InterfaceSummary, DecodeError> {
+    deserialize_impl(bytes, Some(target))
+}
+
+fn deserialize_impl(
+    bytes: &[u8],
+    target: Option<&OwnedJsonTarget>,
+) -> Result<InterfaceSummary, DecodeError> {
     let mut r = Reader::new(bytes);
     let version = r.u32()?;
     if version != FORMAT_VERSION {
@@ -589,6 +632,7 @@ pub fn deserialize(bytes: &[u8]) -> Result<InterfaceSummary, DecodeError> {
     let unit = r.str()?;
     let fns = r.seq(read_fn)?;
     let structs = r.seq(read_struct)?;
+    let owned_json_descriptors = r.seq(read_owned_json_entry)?;
     let enums = r.seq(read_enum)?;
     let resources = r.seq(read_resource)?;
     let consts = r.seq(read_const)?;
@@ -601,6 +645,7 @@ pub fn deserialize(bytes: &[u8]) -> Result<InterfaceSummary, DecodeError> {
         unit,
         fns,
         structs,
+        owned_json_descriptors,
         enums,
         resources,
         consts,
@@ -613,6 +658,12 @@ pub fn deserialize(bytes: &[u8]) -> Result<InterfaceSummary, DecodeError> {
             "parallel-transfer root is not borrow-capable",
         ));
     }
+    crate::owned_json::validate_entries(
+        &summary.structs,
+        &summary.owned_json_descriptors,
+        target,
+    )
+    .map_err(DecodeError::InvalidOwnedJson)?;
     if Hash128::of(&bytes[..surface_len]) != summary.interface_hash {
         return Err(DecodeError::InterfaceHashMismatch);
     }
@@ -636,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn run_bytes_named_type_has_the_exact_format_6_field_encoding() {
+    fn run_bytes_named_type_has_the_exact_format_7_field_encoding() {
         let ty = IType::Named { path: "run_bytes".to_string(), args: Vec::new() };
         let mut writer = Writer { buf: Vec::new() };
         write_type(&mut writer, &ty);

@@ -867,7 +867,7 @@ buffer, zero the output slot, and construct `Err(Error.Invalid)`. Actual OOM rem
 the allocator-wide rule. There is no partial owner, hidden second pass, arena fallback, source move,
 or path on which both the builder and Result own the same allocation.
 
-## 19. Ownership-directed JSON records (accepted design 2026-08-17)
+## 19. Ownership-directed JSON records (implemented 2026-08-17)
 
 Align-llm Request 9 adds no region kind or second ownership model. It defines one general
 materializing boundary within typed JSON:

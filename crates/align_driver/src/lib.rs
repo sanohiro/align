@@ -60,6 +60,17 @@ pub use static_runtime::{
 // to depend on the interface crate just to construct a static input request.
 pub use align_interface::{Driver, DriverRestriction};
 
+fn current_owned_json_target() -> Result<align_interface::OwnedJsonTarget, String> {
+    let object_format = match target_object_format()? {
+        ObjectFormat::Elf => align_interface::OwnedJsonObjectFormat::Elf,
+        ObjectFormat::MachO => align_interface::OwnedJsonObjectFormat::MachO,
+    };
+    Ok(align_interface::OwnedJsonTarget {
+        triple: align_codegen_llvm::default_triple(),
+        object_format,
+    })
+}
+
 /// Whether a PostgreSQL native parameter type is the exact wire mapping for the generated Align
 /// binder shape. Keep this decision on the closed generated tag: source `str`/`string` and
 /// `slice<u8>`/`array<u8>` have already converged to their one runtime representation here, while
@@ -2417,7 +2428,25 @@ pub fn build_interface_summaries(
         .iter()
         .map(|l| (l.path.clone(), l.src.clone()))
         .collect();
-    let mut summaries = align_interface::build_summaries(&modules, &hir, &mir, &sources);
+    let target = match current_owned_json_target() {
+        Ok(target) => target,
+        Err(reason) => {
+            diags.error(reason, align_span::Span::new(0, 0, 0));
+            return (Vec::new(), diags);
+        }
+    };
+    let mut summaries = match align_interface::build_summaries(
+        &modules, &hir, &mir, &sources, &target,
+    ) {
+        Ok(summaries) => summaries,
+        Err(reason) => {
+            diags.error(
+                format!("cannot form owned JSON interface descriptor: {reason}"),
+                align_span::Span::new(0, 0, 0),
+            );
+            return (Vec::new(), diags);
+        }
+    };
     for summary in &mut summaries {
         match static_interface_hash(
             summary.interface_hash,
@@ -2967,13 +2996,30 @@ fn walk_inner(
                 }
             };
             let sources: HashMap<String, String> = HashMap::from([(u.path.clone(), u.src.clone())]);
-            let mut built = align_interface::build_summaries_with_effects(
+            let target = match current_owned_json_target() {
+                Ok(target) => target,
+                Err(reason) => {
+                    diags.error(reason, align_span::Span::new(0, 0, 0));
+                    continue;
+                }
+            };
+            let mut built = match align_interface::build_summaries_with_effects(
                 &unit_module,
                 &program,
                 &mir,
                 &sources,
                 &external_effects,
-            );
+                &target,
+            ) {
+                Ok(built) => built,
+                Err(reason) => {
+                    diags.error(
+                        format!("cannot form owned JSON interface descriptor: {reason}"),
+                        align_span::Span::new(0, 0, 0),
+                    );
+                    continue;
+                }
+            };
             if let Some(mut s) = built.pop() {
                 // Static-input resolution is keyed by the producer before its descriptor bodies are
                 // replaced. The final implementation hash below fingerprints the exact generated
@@ -3745,13 +3791,16 @@ impl RehydrateCtx {
         }];
         let sources: HashMap<String, String> =
             HashMap::from([(unit.path.clone(), unit.src.clone())]);
+        let target = current_owned_json_target().map_err(|_| RehydrateFailure::Summary)?;
         let mut built = align_interface::build_summaries_with_effects(
             &unit_module,
             &program,
             &mir,
             &sources,
             &external_effects,
-        );
+            &target,
+        )
+        .map_err(|_| RehydrateFailure::Summary)?;
         let Some(mut summary) = built.pop() else {
             return Err(RehydrateFailure::Summary);
         };

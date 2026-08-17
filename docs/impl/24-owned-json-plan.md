@@ -1,6 +1,6 @@
 # Owned declared JSON plan
 
-Status: **ACCEPTED DESIGN; IMPLEMENTATION PENDING**.
+Status: **IMPLEMENTED**.
 
 This document is the plan of record for align-llm Request 9. It extends the
 existing declared-record JSON path with one closed, directly owned text graph.

@@ -934,6 +934,9 @@ pub enum Rvalue {
     /// struct slot. Yields an `i32` status (0 = ok). codegen builds the field table (names,
     /// type tags, byte offsets) and calls the runtime parser.
     JsonDecode { struct_id: u32, input: Operand, out: Slot, arena: Option<Operand> },
+    /// Direct-owned record JSON decode. Its descriptor kinds materialize every text leaf into
+    /// free-standing allocations; no arena operand is legal.
+    JsonOwnedDecode { struct_id: u32, input: Operand, out: Slot },
     /// `json.decode` into an owned `array<elem>` (MMv2 slice 8c): parse a JSON array of scalars
     /// and write the materialized `{ptr,len}` into the `out` slot. Yields an `i32` status
     /// (0 = ok). `elem` is the element scalar (its kind/width gives the runtime element tag).
@@ -1530,6 +1533,12 @@ pub enum TemplatePiece {
     FloatHole(Operand),
     /// A `str` operand emitted as a JSON string literal (quoted + escaped). From `json.encode`.
     JsonStrHole(Operand),
+    /// A direct owned `string` field, read through its `{ptr,len}` byte layout.
+    OwnedJsonString(Operand),
+    /// A direct `Option<string>` field; `None` omits the complete key/value pair.
+    OwnedJsonOptionStringField { opt: Operand, name: String },
+    /// A direct `array<string>` field, read-only during encode.
+    OwnedJsonStringArray(Operand),
     /// A `json.encode` `Option<T>` field (REST-gateway runway, Slice B): when `opt` is `Some`, append
     /// `"name":<payload>,` (payload rendered per its scalar kind — int/float/bool raw, str
     /// JSON-escaped — with a trailing comma); when `None`, append nothing. `opt`'s type
@@ -4645,8 +4654,9 @@ struct TemplateFrame<'a> {
 }
 
 fn template_frame<'a>(b: &mut Builder, expr: &'a hir::Expr) -> TemplateFrame<'a> {
-    let hir::ExprKind::Template(parts) = &expr.kind else {
-        unreachable!("a template frame starts at a Template expression")
+    let parts = match &expr.kind {
+        hir::ExprKind::Template(parts) | hir::ExprKind::JsonOwnedEncode { parts, .. } => parts,
+        _ => unreachable!("a template frame starts at a template-producing expression"),
     };
     // Register before holes: a `?` inside one may emit an early cleanup edge.
     let owner =
@@ -4676,6 +4686,18 @@ fn template_piece(part: &hir::TemplatePart, operand: Operand) -> TemplatePiece {
             }
         }
         hir::TemplatePart::JsonStr(_) => TemplatePiece::JsonStrHole(operand),
+        hir::TemplatePart::OwnedJsonString { .. } => {
+            TemplatePiece::OwnedJsonString(operand)
+        }
+        hir::TemplatePart::OwnedJsonOptionStringField { name, .. } => {
+            TemplatePiece::OwnedJsonOptionStringField {
+                opt: operand,
+                name: name.clone(),
+            }
+        }
+        hir::TemplatePart::OwnedJsonStringArray { .. } => {
+            TemplatePiece::OwnedJsonStringArray(operand)
+        }
         hir::TemplatePart::OptionField { name, .. } => TemplatePiece::OptionField {
             opt: operand,
             name: name.clone(),
@@ -4711,6 +4733,9 @@ fn template_part_expr(part: &hir::TemplatePart) -> Option<&hir::Expr> {
     match part {
         hir::TemplatePart::Hole(expr)
         | hir::TemplatePart::JsonStr(expr)
+        | hir::TemplatePart::OwnedJsonString { access: expr }
+        | hir::TemplatePart::OwnedJsonOptionStringField { access: expr, .. }
+        | hir::TemplatePart::OwnedJsonStringArray { access: expr }
         | hir::TemplatePart::OptionField { access: expr, .. }
         | hir::TemplatePart::OptionStructField { access: expr, .. }
         | hir::TemplatePart::StructArrayField { access: expr, .. }
@@ -4870,7 +4895,7 @@ fn lower_template_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
                 .pieces
                 .push(TemplatePiece::PopComma),
             Action::Child(part, child) => {
-                if matches!(child.kind, hir::ExprKind::Template(_)) {
+                if expression_uses_template_spine(child) {
                     frames
                         .last_mut()
                         .expect("a nested template has a parent frame")
@@ -5064,6 +5089,9 @@ fn lower_wildcard_match_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
 /// Expressions whose parent-specific child protocol must run outside the giant eager dispatcher.
 /// This includes structured control/scopes and multi-child ownership boundaries such as calls.
 fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
+    if expression_uses_template_spine(e) {
+        return true;
+    }
     matches!(
         &e.kind,
         hir::ExprKind::Binary {
@@ -5082,8 +5110,8 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
             | hir::ExprKind::Arena(_)
             | hir::ExprKind::NamedArena { .. }
             | hir::ExprKind::TaskGroup(_)
-            | hir::ExprKind::Template(_)
             | hir::ExprKind::JsonEncodeBounded { .. }
+            | hir::ExprKind::JsonOwnedEncodeBounded { .. }
             | hir::ExprKind::FileCreateRw { .. }
             | hir::ExprKind::FileOpenRw { .. }
             | hir::ExprKind::FilePread { .. }
@@ -5154,6 +5182,13 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
             | hir::ExprKind::HttpStreamReject { .. }
             | hir::ExprKind::HttpStreamSend { .. }
             | hir::ExprKind::HttpStreamFinish { .. }
+    )
+}
+
+fn expression_uses_template_spine(e: &hir::Expr) -> bool {
+    matches!(
+        e.kind,
+        hir::ExprKind::Template(_) | hir::ExprKind::JsonOwnedEncode { .. }
     )
 }
 
@@ -5236,8 +5271,13 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::Arena(block) => lower_arena_block(b, block),
         hir::ExprKind::NamedArena { local, block } => lower_named_arena_block(b, *local, block),
         hir::ExprKind::TaskGroup(block) => lower_task_group_block(b, block),
-        hir::ExprKind::Template(_) => lower_template_spine(b, e),
+        hir::ExprKind::Template(_) | hir::ExprKind::JsonOwnedEncode { .. } => {
+            lower_template_spine(b, e)
+        }
         hir::ExprKind::JsonEncodeBounded {
+            parts, max_bytes, ..
+        }
+        | hir::ExprKind::JsonOwnedEncodeBounded {
             parts, max_bytes, ..
         } => {
             lower_json_encode_bounded(b, parts, max_bytes, e.ty)
@@ -5509,14 +5549,22 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 elem,
                 len: _,
             } => finish_const_array(b, elems, *elem, e.ty),
-            hir::ExprKind::Template(_) => lower_template_spine(b, e),
+            hir::ExprKind::Template(_) | hir::ExprKind::JsonOwnedEncode { .. } => {
+                lower_template_spine(b, e)
+            }
             hir::ExprKind::JsonEncodeBounded {
+                parts, max_bytes, ..
+            }
+            | hir::ExprKind::JsonOwnedEncodeBounded {
                 parts, max_bytes, ..
             } => {
                 lower_json_encode_bounded(b, parts, max_bytes, e.ty)
             }
             hir::ExprKind::JsonDecode { struct_id, input } => {
-                lower_json_decode(b, *struct_id, input, e.ty)
+                lower_json_decode_record(b, *struct_id, input, e.ty, false)
+            }
+            hir::ExprKind::JsonOwnedDecode { struct_id, input } => {
+                lower_json_decode_record(b, *struct_id, input, e.ty, true)
             }
             hir::ExprKind::JsonDecodeArray { elem, input } => {
                 lower_json_decode_array(b, *elem, input, e.ty)
@@ -12656,13 +12704,33 @@ fn lower_json_decode_union(b: &mut Builder, enum_id: u32, input: &hir::Expr, res
     Operand::Value(r)
 }
 
-fn lower_json_decode(b: &mut Builder, struct_id: u32, input: &hir::Expr, result_ty: Ty) -> Operand {
+fn lower_json_decode_record(
+    b: &mut Builder,
+    struct_id: u32,
+    input: &hir::Expr,
+    result_ty: Ty,
+    owned: bool,
+) -> Operand {
     let sty = Ty::Struct(struct_id);
     let out = b.new_slot(sty);
     let inp = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
-    let arena = b.arenas.last().copied().map(Operand::Value);
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::JsonDecode { struct_id, input: inp, out, arena }));
+    let rvalue = if owned {
+        Rvalue::JsonOwnedDecode {
+            struct_id,
+            input: inp,
+            out,
+        }
+    } else {
+        let arena = b.arenas.last().copied().map(Operand::Value);
+        Rvalue::JsonDecode {
+            struct_id,
+            input: inp,
+            out,
+            arena,
+        }
+    };
+    b.push(Stmt::Let(code, rvalue));
 
     let isok = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
@@ -15841,6 +15909,51 @@ mod tests {
             d.iter().map(|diag| &diag.message).collect::<Vec<_>>()
         );
         lower_program(&hir)
+    }
+
+    #[test]
+    fn owned_json_encoders_use_stack_safe_dispatch() {
+        let span = align_span::Span::new(0, 0, 0);
+        let i64_ty = Ty::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        let mut max_bytes = hir::Expr {
+            kind: hir::ExprKind::Int(0),
+            ty: i64_ty,
+            span,
+        };
+        for _ in 1..128 {
+            max_bytes = hir::Expr {
+                kind: hir::ExprKind::Unary {
+                    op: UnOp::Neg,
+                    expr: Box::new(max_bytes),
+                },
+                ty: i64_ty,
+                span,
+            };
+        }
+        let owned = hir::Expr {
+            kind: hir::ExprKind::JsonOwnedEncode {
+                base: 0,
+                parts: Vec::new(),
+            },
+            ty: Ty::Str,
+            span,
+        };
+        let bounded = hir::Expr {
+            kind: hir::ExprKind::JsonOwnedEncodeBounded {
+                base: 0,
+                parts: Vec::new(),
+                max_bytes: Box::new(max_bytes),
+            },
+            ty: Ty::Result(Scalar::String, Scalar::Enum(0)),
+            span,
+        };
+
+        assert!(expression_uses_template_spine(&owned));
+        assert!(expression_uses_out_of_line_dispatch(&owned));
+        assert!(expression_uses_out_of_line_dispatch(&bounded));
     }
 
     fn check_modules<'a>(sources: &'a [(&'a str, bool, &'a str)]) -> (hir::Program, Diagnostics) {

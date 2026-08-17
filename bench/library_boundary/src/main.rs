@@ -47,6 +47,7 @@ fn interface_fixture() -> InterfaceSummary {
             return_region: ReturnRegionSummary::None,
             return_cleanup: align_sema::hir::ReturnCleanupAbi::None,
             effect: Effect::Pure,
+            parallel_transfer_params: Vec::new(),
             generic_body: None,
             resource_hook_body: false,
         });
@@ -55,6 +56,7 @@ fn interface_fixture() -> InterfaceSummary {
         unit: "bench.surface".to_string(),
         fns: functions,
         structs: Vec::new(),
+        owned_json_descriptors: Vec::new(),
         enums: Vec::new(),
         consts: Vec::new(),
         resources: Vec::new(),
@@ -217,6 +219,7 @@ fn import_validation_fixture() -> InterfaceSummary {
             },
             return_cleanup: align_sema::hir::ReturnCleanupAbi::None,
             effect: Effect::Pure,
+            parallel_transfer_params: Vec::new(),
             generic_body: None,
             resource_hook_body: false,
         })
@@ -225,6 +228,7 @@ fn import_validation_fixture() -> InterfaceSummary {
         unit: "bench.provenance".to_string(),
         fns: functions,
         structs: structures,
+        owned_json_descriptors: Vec::new(),
         enums: Vec::new(),
         consts: Vec::new(),
         resources: Vec::new(),

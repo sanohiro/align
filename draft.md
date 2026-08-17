@@ -1796,7 +1796,7 @@ bump allocation (bulk-freed), so escaping is not a sudden heap cost.
 ### Direct owned records
 
 A direct declared record containing `string`, `Option<string>`, or `array<string>` selects the
-owned JSON route (accepted design; implementation pending). The route is closed and flat: every
+owned JSON route. The route is closed and flat: every
 other field is a required signed/unsigned 8/16/32/64-bit integer or `bool`. Borrowed text, floats,
 nested records/arrays/enums, other optional forms, and explicit record layout/alignment are rejected
 before allocation. A record without an owned text leaf keeps the existing borrowed route.

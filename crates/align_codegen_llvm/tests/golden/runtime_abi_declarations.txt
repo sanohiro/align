@@ -46,6 +46,7 @@ key|BuilderWriteF64|builder_write_f64|declare void @align_rt_builder_write_f64(p
 key|BuilderWriteInt|builder_write_int|declare void @align_rt_builder_write_int(ptr, i64)
 key|BuilderWriteJsonStr|builder_write_json_str|declare void @align_rt_builder_write_json_str(ptr, ptr, i64)
 key|BuilderWriteStrIntStr|builder_write_str_int_str|declare void @align_rt_builder_write_str_int_str(ptr, ptr, i64, i64, ptr, i64)
+key|BuilderWriteUint|builder_write_uint|declare void @align_rt_builder_write_uint(ptr, i64)
 key|BytesAsStr|bytes_as_str|declare i32 @align_rt_bytes_as_str(ptr, i64, ptr)
 key|ChildFree|child_free|declare void @align_rt_child_free(ptr)
 key|ChildKill|child_kill|declare i32 @align_rt_child_kill(ptr, i64)

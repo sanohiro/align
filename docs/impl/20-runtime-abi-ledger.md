@@ -49,16 +49,16 @@ added the two bounded-HTTP setters. Their runtime definitions and registry entri
 atomically: the current exact counts are 293 keyed records, 306 base records, and 314 records in the
 maximum optional-probe export table. No unkeyed or probe category changed.
 
-## Planned Request 9 owned JSON extension (not shipped)
+## Request 9 owned JSON extension
 
-The accepted Request 9 design in `docs/impl/24-owned-json-plan.md` adds exactly
+The implemented Request 9 design in `docs/impl/24-owned-json-plan.md` adds exactly
 one keyed base record while reusing an existing LLVM function shape:
 
-| Planned runtime key | Exact symbol | Existing ABI row and exact declaration |
+| Runtime key | Exact symbol | Existing ABI row and exact declaration |
 |---|---|---|
 | `BuilderWriteUint` | `align_rt_builder_write_uint` | A66: `void @SYM(ptr, i64)`; Rust receives `(*mut Builder, u64)`; no curated attributes |
 
-The implementation changes the exact counts from 293 to 294 `RuntimeKey`
+The implementation changed the exact counts from 293 to 294 `RuntimeKey`
 variants, 306 to 307 base records, and 314 to 315 maximum optional-probe exports.
 The key, registry row, LLVM declaration/selection, unmangled Rust export,
 key↔symbol bijection, and base/export parity must land atomically. The wrapper
