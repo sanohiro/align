@@ -3247,8 +3247,8 @@ mod tests {
             name: "Root".to_string(),
             source_name: "Root".to_string(),
             fields: vec![
-                field("direct", Ty::Option(Scalar::Struct(1))),
                 field("nested", Ty::Option(Scalar::Struct(2))),
+                field("direct", Ty::Option(Scalar::Struct(1))),
             ],
             align: None,
             c_repr: false,
@@ -3256,8 +3256,8 @@ mod tests {
         program.structs = vec![root, child, parent];
 
         assert_eq!(
-            validate(Ty::Struct(0), &program).unwrap(),
-            [Node::Struct(0), Node::Struct(1), Node::Struct(2)]
+            validate(Ty::Struct(0), &program),
+            Ok(vec![Node::Struct(0), Node::Struct(2), Node::Struct(1)])
         );
     }
 
