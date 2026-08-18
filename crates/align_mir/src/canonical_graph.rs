@@ -515,10 +515,15 @@ impl<'a> GraphValidator<'a> {
             reverse.entry(edge.to).or_default().push(edge.from);
         }
 
+        // Mark a node when it is entered, not when its siblings are scheduled. Marking every
+        // child while pushing a whole sibling list can make a shared DAG look cyclic in the
+        // second pass: a later parent sees its child as already finished even though its finish
+        // order was never recorded. The entry-time mark also leaves active back-edges for the
+        // SCC pass, so genuine self and mutual cycles remain rejected.
         let mut seen = HashSet::new();
         let mut finish = Vec::with_capacity(self.order.len());
         for &start in &self.order {
-            if !seen.insert(start) {
+            if seen.contains(&start) {
                 continue;
             }
             let mut work = vec![(start, false)];
@@ -527,12 +532,13 @@ impl<'a> GraphValidator<'a> {
                     finish.push(node);
                     continue;
                 }
+                if !seen.insert(node) {
+                    continue;
+                }
                 work.push((node, true));
                 if let Some(children) = forward.get(&node) {
                     for &child in children.iter().rev() {
-                        if seen.insert(child) {
-                            work.push((child, false));
-                        }
+                        work.push((child, false));
                     }
                 }
             }
@@ -3213,6 +3219,45 @@ mod tests {
         assert_eq!(
             validate(Ty::Struct(0), &boxed).unwrap(),
             [Node::Struct(0)]
+        );
+    }
+
+    #[test]
+    fn canonical_graph_allows_shared_inline_dag() {
+        let mut program = baseline_program();
+        let field = |name: &str, ty: Ty| align_sema::hir::FieldDef {
+            name: name.to_string(),
+            ty,
+        };
+        let child = align_sema::hir::StructDef {
+            name: "Child".to_string(),
+            source_name: "Child".to_string(),
+            fields: vec![field("value", Ty::Str)],
+            align: None,
+            c_repr: false,
+        };
+        let parent = align_sema::hir::StructDef {
+            name: "Parent".to_string(),
+            source_name: "Parent".to_string(),
+            fields: vec![field("child", Ty::Option(Scalar::Struct(1)))],
+            align: None,
+            c_repr: false,
+        };
+        let root = align_sema::hir::StructDef {
+            name: "Root".to_string(),
+            source_name: "Root".to_string(),
+            fields: vec![
+                field("direct", Ty::Option(Scalar::Struct(1))),
+                field("nested", Ty::Option(Scalar::Struct(2))),
+            ],
+            align: None,
+            c_repr: false,
+        };
+        program.structs = vec![root, child, parent];
+
+        assert_eq!(
+            validate(Ty::Struct(0), &program).unwrap(),
+            [Node::Struct(0), Node::Struct(1), Node::Struct(2)]
         );
     }
 
