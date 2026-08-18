@@ -33,7 +33,7 @@ non-entry module は独自の `Error` を宣言でき、その場合 bare lookup
 
 ## Type & ownership classification
 
-`Option<T>` / `Result<T,E>` は通常のジェネリックな sum 型である（モノモルフィゼーションされる）。[`../../17-library-boundary-prerequisites.md`](../../17-library-boundary-prerequisites.md) の L1a/L1b は完了している。ひとつの再帰的なタグ付き `DropPlan` が有限かつ非再帰な Move payloadを受け入れ、tagged container自体をMoveとし、活性payloadだけをDropし、構築 / `match` / `else` / `?` でmove元を無効化する。recursive type、任意の新しいMove-element collection layout、L2のdynamic path-selected return cleanupは別の担当restrictionとして残る。新しいlibrary handleへcompiler-known exceptionを追加してはならない。
+`Option<T>` / `Result<T,E>` は通常のジェネリックな sum 型である（モノモルフィゼーションされる）。[`../../17-library-boundary-prerequisites.md`](../../17-library-boundary-prerequisites.md) の L1a/L1b は完了している。ひとつの再帰的なタグ付き `DropPlan` が有限かつ非再帰な Move payloadを受け入れ、tagged container自体をMoveとし、活性payloadだけをDropし、構築および owning-place の `match` / `else` / `?` でmove元を無効化する。admitted borrowed-place の `match` は既存の borrow ABI で活性payloadをその場で読み、source ownerを変更しない。この契約は [`26-borrowed-sum-projection-plan.md`](../26-borrowed-sum-projection-plan.md) が定める。recursive type、任意の新しいMove-element collection layout、L2のdynamic path-selected return cleanupは別の担当restrictionとして残る。新しいlibrary handleへcompiler-known exceptionを追加してはならない。
 
 historical checkpoint境界は厳密だった。L1aがまず所有権付きstruct field leafとして
 `Option<string>` だけを許可し、L1bがMove struct/sumをOption/Result/user sumのpayloadとして

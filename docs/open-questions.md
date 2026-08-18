@@ -3920,9 +3920,10 @@ type design (see the section body above), so this section is otherwise complete.
 
 `Option<T>`, `Result<T,E>`, and user sum variants accept any finite, non-recursive payload with a
 compiler-known recursive Drop plan. The tagged container is Move if any possible live payload is
-Move. Drop switches on the tag; construction and extraction move/null the active payload; all
-normal, error, branch, loop, reassignment, `match`, `else`, `?`, and `map_err` paths preserve the
-one-owner rule. A struct field such as `Option<string>` uses the same conditional plan.
+Move. Drop switches on the tag; construction and owning-place extraction move/null the active
+payload; all normal, error, branch, loop, reassignment, `match`, `else`, `?`, and `map_err` paths
+preserve the one-owner rule. An admitted borrowed-place `match` reads the active payload without
+clearing its source. A struct field such as `Option<string>` uses the same conditional plan.
 
 Every recursively Move function return carries the selected path-local cleanup bit through direct,
 indirect, and imported ABIs. The caller stores it beside the returned value; return region/borrow
@@ -4027,8 +4028,11 @@ from those forms. Tuples, arrays, collections, resources, opaque handles, and ot
 shapes retain the borrowed-place diagnostic. The tag and active admitted payload are read in place,
 and a non-Copy arm binding is a caller-owned read-only projection with the original static payload
 type, source owner generation, and no independent `Drop` or cleanup bit. Copy fields remain readable;
-an owned `string` leaf uses the existing non-consuming `str` path; `.clone()` is the explicit owned
-copy. The source is not shallow-copied or nulled, and it remains usable after the match. Returning,
+an owned `string` leaf uses the existing non-consuming `str` path and may use the existing `.clone()`
+operation for an explicit owned copy. Aggregate and nested-sum clone operations are outside this
+capability. A borrowed arm binding is not a stable place for a nested borrowed `match`; that use is
+rejected and never falls back to consuming extraction from the outer source. The source is not
+shallow-copied or nulled, and it remains usable after the match. Returning,
 storing, capturing, sending, or consuming the whole non-Copy/Move payload is rejected; existing
 Copy/view matching retains its current result behavior, and views derived from an admitted payload
 use the existing return-borrow and region checks.

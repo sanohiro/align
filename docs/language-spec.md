@@ -187,8 +187,11 @@ handles, and other unsupported Move shapes retain the borrowed-place diagnostic.
 non-Copy payload binding is a caller-owned read-only projection: it keeps the payload's static type
 for field and method checking, but has no independent `Drop` or cleanup bit, does not move or null
 the source, and does not trigger a hidden aggregate copy. Copy fields remain readable, owned
-`string` fields can use the existing non-consuming conversion to `str`, and `.clone()` is the
-explicit owned copy. Returning, storing, capturing, sending, or consuming the whole non-Copy/Move
+`string` fields can use the existing non-consuming conversion to `str`, and that owned string leaf
+may use the existing `.clone()` operation for an explicit owned copy. A borrowed arm binding is not
+a stable place for a nested borrowed `match`; that use is rejected and never falls back to consuming
+extraction from the outer source. Returning, storing, capturing, sending, or consuming the whole
+non-Copy/Move
 payload is rejected by the ordinary borrowed-place diagnostics; existing Copy/view matching retains
 its current result behavior. Views derived from an admitted payload follow the existing inferred
 owner-generation and region rules. A free-standing or otherwise owning scrutinee retains the
@@ -347,7 +350,9 @@ otherwise unsupported container element legal.
 
 `Option`, `Result`, and user sum payloads recursively accept finite non-recursive types with a
 known Drop plan. A tagged value is Move when any possible live payload is Move; Drop follows the
-active tag, while construction/extraction moves the payload and clears its old owner. Structured
+active tag, while construction and owning-place extraction move the payload and clear its old owner.
+An admitted borrowed-place `match` reads the active payload in place and leaves the source owner
+unchanged. Structured
 owned errors and `Result<Option<MoveOutput>, MoveError>` therefore use the one existing error and
 ownership models. Arbitrary collections of Move elements remain a separate container capability.
 

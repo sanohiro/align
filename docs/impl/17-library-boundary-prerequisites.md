@@ -1428,7 +1428,9 @@ The settled rule is:
 - the enclosing value is Move iff any live payload is Move;
 - Drop first tests the active tag and recursively drops only the live payload;
 - construction moves the payload and clears its source ownership;
-- extraction through `match`, `else`, or `?` moves the live payload and clears the container;
+- owning-place extraction through `match`, `else`, or `?` moves the live payload and clears the
+  container; an admitted borrowed-place `match` reads the active payload in place and leaves the
+  source owner unchanged;
 - early return, branch/loop join, reassignment, and partially initialized construction retain the
   existing path-local cleanup discipline;
 - borrowed payload provenance remains recursive and independent of the cleanup plan;

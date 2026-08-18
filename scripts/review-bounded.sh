@@ -4,12 +4,13 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: scripts/review-bounded.sh [--base REF] [--output FILE]" >&2
+  echo "usage: scripts/review-bounded.sh [--base REF] [--output FILE] [--reopen-axis AXIS]" >&2
   exit 2
 }
 
 base="origin/main"
 output=""
+reopen_axis=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --base)
@@ -20,6 +21,11 @@ while [[ $# -gt 0 ]]; do
     --output)
       [[ $# -ge 2 ]] || usage
       output="$2"
+      shift 2
+      ;;
+    --reopen-axis)
+      [[ $# -ge 2 && -n "$2" ]] || usage
+      reopen_axis="$2"
       shift 2
       ;;
     *)
@@ -124,6 +130,56 @@ base_sha="$(git merge-base HEAD "$base_tip" 2>/dev/null || true)"
   echo "cannot compute the merge base of HEAD and $base" >&2
   exit 1
 }
+
+# A second full-diff review on a descendant commit is the review-as-design
+# loop. Continue against the changed slice instead. A genuinely redesigned
+# contract may reopen the full review only through the same authoritative
+# closure-matrix commit and trailer that release the preflight tripwire.
+prior_review_head=""
+prior_review_distance=""
+for prior_log in "$git_dir"/align-review-*.log "$git_dir"/align-review-cycle-*; do
+  [[ -f "$prior_log" ]] || continue
+  [[ "$(sed -n 's/^ALIGN_REVIEW_KIND=//p' "$prior_log" | head -1)" == "HOST" ]] || continue
+  candidate_base="$(sed -n 's/^ALIGN_REVIEW_BASE=//p' "$prior_log" | head -1)"
+  candidate_head="$(sed -n 's/^ALIGN_REVIEW_HEAD=//p' "$prior_log" | head -1)"
+  [[ "$candidate_base" == "$base_sha" && "$candidate_head" != "$head_sha" ]] || continue
+  [[ "$candidate_head" =~ ^[0-9a-f]{40}$ ]] || continue
+  git merge-base --is-ancestor "$candidate_head" "$head_sha" 2>/dev/null || continue
+  candidate_distance="$(git rev-list --count "$candidate_head".."$head_sha")"
+  if [[ -z "$prior_review_distance" || "$candidate_distance" -lt "$prior_review_distance" ]]; then
+    prior_review_head="$candidate_head"
+    prior_review_distance="$candidate_distance"
+  fi
+done
+
+if [[ -n "$prior_review_head" ]]; then
+  matrix_reopened=false
+  if [[ -n "$reopen_axis" ]]; then
+    while IFS= read -r commit; do
+      git log -1 --format='%B' "$commit" |
+        grep -Fqx "Closure-Matrix-Reopened: $reopen_axis" || continue
+      while IFS= read -r path; do
+        case "$path" in
+          docs/impl/*/ja/*|docs/impl/ja/*) ;;
+          docs/impl/*|CLAUDE.md) matrix_reopened=true ;;
+        esac
+      done < <(git show --no-renames --name-only --format= "$commit")
+    done < <(git rev-list --reverse "$prior_review_head".."$head_sha")
+  fi
+  [[ "$matrix_reopened" == true ]] || {
+    echo "full-diff review already exists for ancestor $prior_review_head" >&2
+    echo "continue only with the changed slice; do not restart discovery on the complete diff" >&2
+    echo "a high-risk redesign requires --reopen-axis AXIS and a matching" >&2
+    echo "'Closure-Matrix-Reopened: AXIS' commit that changes CLAUDE.md or docs/impl" >&2
+    exit 1
+  }
+fi
+cycle_record="$git_dir/align-review-cycle-$head_sha"
+{
+  printf 'ALIGN_REVIEW_KIND=HOST\n'
+  printf 'ALIGN_REVIEW_HEAD=%s\n' "$head_sha"
+  printf 'ALIGN_REVIEW_BASE=%s\n' "$base_sha"
+} >"$cycle_record"
 prompt="Review git diff ${base_sha}...${head_sha} for soundness and regression risks. Inspect only: do not modify files and do not run cargo, tests, builds, benchmarks, or network commands. Use read-only git/rg/sed inspection as needed. Report actionable findings first. End with exactly one line: ALIGN_REVIEW_VERDICT=CLEAN when there are no actionable findings, or ALIGN_REVIEW_VERDICT=FINDINGS when there are any."
 {
   printf 'ALIGN_REVIEW_KIND=HOST\n'

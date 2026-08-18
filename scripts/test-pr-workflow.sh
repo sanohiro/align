@@ -451,6 +451,32 @@ set -e
   exit 1
 }
 
+# A completed full-diff review on an ancestor blocks another complete review
+# after an ordinary fix. Re-opening is explicit and requires both the owning
+# matrix change and the exact trailer named on the command line.
+printf '\ndescendant review fix\n' >>"$docs_repo/docs/notes.md"
+git -C "$docs_repo" add docs/notes.md
+git -C "$docs_repo" commit -qm 'docs: close review findings'
+set +e
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=clean \
+  ALIGN_REVIEW_STALL_SECONDS=5 ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
+  "$repo_root/scripts/review-bounded.sh" --base main ) >/dev/null 2>&1
+descendant_review_status=$?
+set -e
+[[ $descendant_review_status -eq 1 ]] || {
+  echo "descendant full-diff review was not blocked" >&2
+  exit 1
+}
+mkdir -p "$docs_repo/docs/impl"
+printf '\n## Reopened review axis\n' >>"$docs_repo/docs/impl/00-plan.md"
+git -C "$docs_repo" add docs/impl/00-plan.md
+git -C "$docs_repo" commit -qm 'docs(impl): reopen review axis
+
+Closure-Matrix-Reopened: review topology'
+( cd "$docs_repo" && PATH="$fake_bin:$PATH" FAKE_CODEX_MODE=clean \
+  ALIGN_REVIEW_STALL_SECONDS=5 ALIGN_REVIEW_PROGRESS_INTERVAL_SECONDS=1 \
+  "$repo_root/scripts/review-bounded.sh" --base main --reopen-axis 'review topology' ) >/dev/null
+
 # The classifier's two evidence lists must stay equal to what the machinery
 # actually references; recompute both from the repository so adding a gate
 # target or embedding a new document cannot silently widen the light tier.

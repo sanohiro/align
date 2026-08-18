@@ -296,9 +296,11 @@ admits Copy scalars/views, `string`, and finite acyclic structs and tagged value
 from those forms; arrays, collections, resources, opaque handles, and other unsupported Move shapes
 remain on the existing borrowed-place diagnostic. The arm binding is a read-only projection with the
 original static payload type, source generation, and no independent cleanup bit. Copy fields and
-borrowed text leaves remain cheap reads, while an owned text leaf becomes owned only through an
-explicit `.clone()`. Returning or retaining the whole non-Copy/Move payload is still an ownership
-error, while existing Copy/view matching keeps its current result behavior. Keeping this as a
+borrowed text leaves remain cheap reads, while an owned text leaf can use the existing explicit
+`.clone()` operation. Aggregate and nested-sum clone operations are outside this capability. A
+borrowed arm binding is not a stable place for a nested borrowed `match`; that use is rejected
+without an owning fallback. Returning or retaining the whole non-Copy/Move payload is still an ownership error, while existing
+Copy/view matching keeps its current result behavior. Keeping this as a
 compiler projection over the existing flattened tagged layout preserves **Nothing hidden**, avoids
 a shallow Move aggregate copy, and leaves owning-place match, `else`, and `?` semantics unchanged.
 A package-specific wrapper or alternate error/result API would create a second ownership model, so
@@ -309,8 +311,9 @@ needs owned message/detail fields because the foreign buffer dies at the call bo
 compound operation may return a Move output through the same `Result`. Replacing that with numeric
 codes, empty-string sentinels, or an opaque boxed error would create a second weaker error model.
 The proper completion is recursive tagged Move payloads: `Option`, `Result`, and user sums derive
-the same Drop plan as structs, drop only the active payload, and move/null it through `match`,
-`else`, and `?`. The success path allocates nothing for an unused Move error. This is a general
+the same Drop plan as structs, drop only the active payload, and move/null it through owning-place
+`match`, `else`, and `?`; an admitted borrowed-place match reads the payload without clearing its
+source. The success path allocates nothing for an unused Move error. This is a general
 language completeness fix with the database as consumer, not database error magic.
 
 **Minimal generics must compose through ordinary package signatures.** Rejecting `array<R>` or a

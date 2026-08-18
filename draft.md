@@ -342,9 +342,12 @@ ordinary borrowed-place diagnostic. The match reads the tag in place and binds a
 payload as a caller-owned borrow projection. The binding retains the payload's static type for field
 and method checking, but it receives no independent `Drop` or cleanup bit, does not move or null the
 source, and does not make a hidden aggregate copy. Copy fields can be read, and an owned `string`
-field can be passed to a `str` consumer without moving it; `.clone()` is the explicit way to create
-an owned copy. Returning, storing, capturing, sending, or consuming the whole non-Copy/Move payload
-is rejected by the ordinary borrowed-place diagnostics; existing Copy/view matching retains its
+field can be passed to a `str` consumer without moving it; that owned string leaf may use the existing
+`.clone()` operation to create an owned copy. Aggregate and nested-sum clone operations are not part
+of this capability. A borrowed arm binding is not a stable place for a nested borrowed `match`; that
+use is rejected and never falls back to consuming extraction from the outer source. Returning,
+storing, capturing, sending, or consuming the whole non-Copy/Move payload is rejected by the ordinary
+borrowed-place diagnostics; existing Copy/view matching retains its
 current result behavior. Views derived from the payload follow the existing inferred owner-generation
 and region rules. A free-standing or otherwise owning scrutinee keeps the existing consuming match
 behavior.
@@ -926,8 +929,9 @@ and fixed-array bindings retain every completed field owner until initialization
 Tagged values use the same ownership rule recursively. `Option<T>`, `Result<T,E>`, and user sum
 variants may carry any finite, non-recursive type whose Drop plan is known. The enclosing value is
 Move when any possible live payload is Move. Drop tests the active tag and drops only that payload;
-construction moves the payload and clears its source; `match`, `else`, and `?` move a selected
-payload out and clear the container. An `Ok` success path does not allocate merely because its
+construction moves the payload and clears its source; an owning-place `match`, `else`, and `?` move a
+selected payload out and clear the container, while an admitted borrowed-place `match` reads it in
+place without clearing the source. An `Ok` success path does not allocate merely because its
 error type owns strings. This supports structured owned errors and
 `Result<Option<MoveOutput>, MoveError>` without a second error model. It does not imply arbitrary
 arrays of Move elements; collection element layout/drop remains a separate explicit capability.
