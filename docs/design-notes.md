@@ -290,15 +290,19 @@ not a package exemption, and it still rejects temporaries.
 
 **Borrowed sum matching is a projection, not a copy.** The same distinction matters when a library
 must inspect an owned `Option`, `Result`, or user sum without taking it from its caller. A match over
-a stable place reached through `borrow` or `borrow mut` reads the tag and active payload in place;
-the arm binding is a read-only projection with the original static payload type, source generation,
-and no independent cleanup bit. Copy fields and borrowed text leaves remain cheap reads, while an
-owned text leaf becomes owned only through an explicit `.clone()`. Returning or retaining the whole
-payload is still an ownership error. Keeping this as a compiler projection over the existing
-flattened tagged layout preserves **Nothing hidden**, avoids a shallow Move aggregate copy, and
-leaves owning-place match, `else`, and `?` semantics unchanged. A package-specific wrapper or
-alternate error/result API would create a second ownership model, so the language capability is the
-correct boundary.
+a stable place whose exact root/path pair is directly shared- or exclusively-borrowed reads the tag
+and active payload in place; a descendant field fact never promotes an owning parent. The new path
+admits Copy scalars/views, `string`, and finite acyclic structs and tagged values built recursively
+from those forms; arrays, collections, resources, opaque handles, and other unsupported Move shapes
+remain on the existing borrowed-place diagnostic. The arm binding is a read-only projection with the
+original static payload type, source generation, and no independent cleanup bit. Copy fields and
+borrowed text leaves remain cheap reads, while an owned text leaf becomes owned only through an
+explicit `.clone()`. Returning or retaining the whole non-Copy/Move payload is still an ownership
+error, while existing Copy/view matching keeps its current result behavior. Keeping this as a
+compiler projection over the existing flattened tagged layout preserves **Nothing hidden**, avoids
+a shallow Move aggregate copy, and leaves owning-place match, `else`, and `?` semantics unchanged.
+A package-specific wrapper or alternate error/result API would create a second ownership model, so
+the language capability is the correct boundary.
 
 **Structured owned errors complete the existing tagged-value model.** A native library error
 needs owned message/detail fields because the foreign buffer dies at the call boundary, while a

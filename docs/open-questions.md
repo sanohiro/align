@@ -4019,14 +4019,19 @@ The exact surface and compiler contract are in
 
 ### Borrow-safe sum-payload matching — Settled 2026-08-18 (language prerequisite)
 
-An exhaustive `match` over a stable place reached through `borrow` or `borrow mut` may inspect an
-owned `Option<T>`, `Result<T,E>`, or user sum without consuming it. The tag and active payload are
-read in place, and a non-Copy arm binding is a caller-owned read-only projection with the original
-static payload type, source owner generation, and no independent `Drop` or cleanup bit. Copy fields
-remain readable; an owned `string` leaf uses the existing non-consuming `str` path; `.clone()` is
-the explicit owned copy. The source is not shallow-copied or nulled, and it remains usable after the
-match. Returning, storing, capturing, sending, or consuming the whole borrowed payload is rejected;
-views derived from it use the existing return-borrow and region checks.
+An exhaustive `match` over a stable place whose exact root/path pair has a direct `borrow` or
+`borrow mut` fact may inspect an owned `Option<T>`, `Result<T,E>`, or user sum without consuming it;
+a descendant field fact never promotes an owning parent or mixed-provenance local. Borrowed mode
+admits Copy scalars/views, `string`, and finite acyclic structs and tagged values built recursively
+from those forms. Tuples, arrays, collections, resources, opaque handles, and other unsupported Move
+shapes retain the borrowed-place diagnostic. The tag and active admitted payload are read in place,
+and a non-Copy arm binding is a caller-owned read-only projection with the original static payload
+type, source owner generation, and no independent `Drop` or cleanup bit. Copy fields remain readable;
+an owned `string` leaf uses the existing non-consuming `str` path; `.clone()` is the explicit owned
+copy. The source is not shallow-copied or nulled, and it remains usable after the match. Returning,
+storing, capturing, sending, or consuming the whole non-Copy/Move payload is rejected; existing
+Copy/view matching retains its current result behavior, and views derived from an admitted payload
+use the existing return-borrow and region checks.
 
 Owning-place matches retain their current Move extraction, source nulling, cleanup, `else`, `?`,
 branch, loop, and early-exit behavior. There is no new syntax, reference type, lifetime annotation,

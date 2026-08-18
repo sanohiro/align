@@ -332,17 +332,22 @@ warm := match signal {
 `match` also works on `Option` / `Result`; `else`-unwrap and `?` are the ergonomic shorthands for the
 common unwrap / propagate cases.
 
-When the scrutinee is a stable place reached through `borrow` or `borrow mut` — either the borrowed
-parameter itself or a checked struct-field path below it — `match` performs a read-only projection.
-It reads the tag in place and binds the active payload as a caller-owned borrow projection. The
-binding retains the payload's static type for field and method checking, but it receives no
-independent `Drop` or cleanup bit, does not move or null the source, and does not make a hidden
-aggregate copy. Copy fields can be read, and an owned `string` field can be passed to a `str`
-consumer without moving it; `.clone()` is the explicit way to create an owned copy. Returning,
-storing, capturing, sending, or consuming the whole borrowed payload is rejected by the ordinary
-borrowed-place diagnostics. Views derived from the payload follow the existing inferred
-owner-generation and region rules. A free-standing or otherwise owning scrutinee keeps the
-existing consuming match behavior.
+When the scrutinee is a stable place whose complete root/path pair has a direct shared or exclusive
+borrow fact — either the borrowed parameter itself or a checked struct-field path below it — `match`
+performs a read-only projection. A descendant field's borrow fact does not promote an owning parent
+or a mixed-provenance local. The selected payload must be a Copy scalar/view, `string`, or a finite
+acyclic struct, `Option`, `Result`, or user sum whose reachable leaves recursively have those forms;
+tuples, arrays, collections, resources, opaque handles, and other unsupported Move shapes keep the
+ordinary borrowed-place diagnostic. The match reads the tag in place and binds an admitted active
+payload as a caller-owned borrow projection. The binding retains the payload's static type for field
+and method checking, but it receives no independent `Drop` or cleanup bit, does not move or null the
+source, and does not make a hidden aggregate copy. Copy fields can be read, and an owned `string`
+field can be passed to a `str` consumer without moving it; `.clone()` is the explicit way to create
+an owned copy. Returning, storing, capturing, sending, or consuming the whole non-Copy/Move payload
+is rejected by the ordinary borrowed-place diagnostics; existing Copy/view matching retains its
+current result behavior. Views derived from the payload follow the existing inferred owner-generation
+and region rules. A free-standing or otherwise owning scrutinee keeps the existing consuming match
+behavior.
 
 ### Loop
 

@@ -196,9 +196,13 @@ msg = b.to_string()
 `html`/`json` insert context-specific escaping (`write_html_escaped` etc.) on the value parts. If the total length of the static parts is known, the builder's initial capacity is preallocated (1 `Alloc`).
 
 ### 2.6 match
-Lowered to tag tests and a chain/tree of ordinary `Branch` terminators, with
-`EnumPayload` extraction in the selected arm. Exhaustiveness is already guaranteed by typecheck
-(`03`).
+Lowered to tag tests and a chain/tree of ordinary `Branch` terminators. An owning scrutinee uses
+the existing `EnumPayload` extraction in the selected arm; a borrowed-place scrutinee uses the
+checked `BorrowedProjection` path and projects the active payload pointer in place. The latter
+never emits an aggregate extraction, creates a Move binding cleanup bit, or nulls the source. The
+borrowed path is admitted only for the exact stable place and recursive payload grammar owned by
+`docs/impl/26-borrowed-sum-projection-plan.md`; malformed metadata fails validation rather than
+falling back to the owning extraction. Exhaustiveness is already guaranteed by typecheck (`03`).
 
 ---
 
