@@ -4017,6 +4017,23 @@ These are the common library-boundary mechanisms for native stateful packages, i
 The exact surface and compiler contract are in
 `impl/17-library-boundary-prerequisites.md` §§2–3.
 
+### Borrow-safe sum-payload matching — Settled 2026-08-18 (language prerequisite)
+
+An exhaustive `match` over a stable place reached through `borrow` or `borrow mut` may inspect an
+owned `Option<T>`, `Result<T,E>`, or user sum without consuming it. The tag and active payload are
+read in place, and a non-Copy arm binding is a caller-owned read-only projection with the original
+static payload type, source owner generation, and no independent `Drop` or cleanup bit. Copy fields
+remain readable; an owned `string` leaf uses the existing non-consuming `str` path; `.clone()` is
+the explicit owned copy. The source is not shallow-copied or nulled, and it remains usable after the
+match. Returning, storing, capturing, sending, or consuming the whole borrowed payload is rejected;
+views derived from it use the existing return-borrow and region checks.
+
+Owning-place matches retain their current Move extraction, source nulling, cleanup, `else`, `?`,
+branch, loop, and early-exit behavior. There is no new syntax, reference type, lifetime annotation,
+runtime representation, ABI field, allocation path, JSON exception, or package-specific API. The
+complete public contract, projection path, checked-HIR/MIR boundary, and closure matrix are in
+`docs/impl/26-borrowed-sum-projection-plan.md`.
+
 ### Exposing SIMD intrinsics in std
 In addition to auto-vectorization, whether to place explicit intrinsics in std (`impl/04-mir.md` §9).
 

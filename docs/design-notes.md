@@ -288,6 +288,18 @@ but it needs the same explicit pointer-to-caller-storage mode when a large struc
 producer-generated typed callback must avoid a hidden by-value copy. This is one general ABI rule,
 not a package exemption, and it still rejects temporaries.
 
+**Borrowed sum matching is a projection, not a copy.** The same distinction matters when a library
+must inspect an owned `Option`, `Result`, or user sum without taking it from its caller. A match over
+a stable place reached through `borrow` or `borrow mut` reads the tag and active payload in place;
+the arm binding is a read-only projection with the original static payload type, source generation,
+and no independent cleanup bit. Copy fields and borrowed text leaves remain cheap reads, while an
+owned text leaf becomes owned only through an explicit `.clone()`. Returning or retaining the whole
+payload is still an ownership error. Keeping this as a compiler projection over the existing
+flattened tagged layout preserves **Nothing hidden**, avoids a shallow Move aggregate copy, and
+leaves owning-place match, `else`, and `?` semantics unchanged. A package-specific wrapper or
+alternate error/result API would create a second ownership model, so the language capability is the
+correct boundary.
+
 **Structured owned errors complete the existing tagged-value model.** A native library error
 needs owned message/detail fields because the foreign buffer dies at the call boundary, while a
 compound operation may return a Move output through the same `Result`. Replacing that with numeric

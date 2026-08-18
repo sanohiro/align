@@ -178,6 +178,17 @@ A sum type models variation (there is no class / inheritance). Construct with `T
 **or-pattern** `A | B` (bare variant names, binds nothing). `Option<T>` / `Result<T,E>` are sum
 types; `match` works on them, with `else`-unwrap and `?` as the common-case shorthands.
 
+When the scrutinee is a stable place reached through `borrow` or `borrow mut` — the borrowed
+parameter itself or a checked struct-field path below it — `match` reads the tag and active payload
+in place. A non-Copy payload binding is a caller-owned read-only projection: it keeps the payload's
+static type for field and method checking, but has no independent `Drop` or cleanup bit, does not
+move or null the source, and does not trigger a hidden aggregate copy. Copy fields remain readable,
+owned `string` fields can use the existing non-consuming conversion to `str`, and `.clone()` is the
+explicit owned copy. Returning, storing, capturing, sending, or consuming the whole borrowed
+payload is rejected by the ordinary borrowed-place diagnostics. Views derived from it follow the
+existing inferred owner-generation and region rules. A free-standing or otherwise owning
+scrutinee retains the existing consuming match behavior.
+
 ```align
 area := match s {
   Circle(r)  => 3.14159 * r * r,
@@ -284,6 +295,11 @@ For an owned value, the same selected edge forwards a path-local bit that distin
 heap ownership from arena ownership. Moves clear the source; scope exit drops only a live
 individually owned value. A `mut` binding may therefore change allocation region when every assigned
 value outlives its scope, without leaking heap storage or individually freeing arena storage.
+
+For a borrowed-place `match`, the selected Move payload is a read-only projection with the source's
+owner generation and no independent cleanup bit; the source is neither copied nor nulled. Its
+derived views follow the ordinary borrow summary and region checks. An owning-place `match` keeps
+the consuming extraction and source-clearing rule.
 
 One restriction applies to `if` today: a value-carrying `if`/`else` **expression** cannot move an
 already-bound owned local out of an arm (`c := if n > 2 { a } else { … }` is rejected, and so are

@@ -332,6 +332,18 @@ warm := match signal {
 `match` also works on `Option` / `Result`; `else`-unwrap and `?` are the ergonomic shorthands for the
 common unwrap / propagate cases.
 
+When the scrutinee is a stable place reached through `borrow` or `borrow mut` — either the borrowed
+parameter itself or a checked struct-field path below it — `match` performs a read-only projection.
+It reads the tag in place and binds the active payload as a caller-owned borrow projection. The
+binding retains the payload's static type for field and method checking, but it receives no
+independent `Drop` or cleanup bit, does not move or null the source, and does not make a hidden
+aggregate copy. Copy fields can be read, and an owned `string` field can be passed to a `str`
+consumer without moving it; `.clone()` is the explicit way to create an owned copy. Returning,
+storing, capturing, sending, or consuming the whole borrowed payload is rejected by the ordinary
+borrowed-place diagnostics. Views derived from the payload follow the existing inferred
+owner-generation and region rules. A free-standing or otherwise owning scrutinee keeps the
+existing consuming match behavior.
+
 ### Loop
 
 `loop` is the one sequential-control construct: it repeats its block until a `break` executes.
@@ -808,7 +820,7 @@ it is not recomputed from the joined region.
 |---|---|---|
 | `{ ...; value }` | The trailing value's region. | Moves the trailing owned value and forwards its cleanup bit; the moved source is cleared. |
 | `if c { a } else { b }` | The shorter of the continuing arms' regions. | Each arm stores its value and cleanup bit into the join; only the selected pair reaches the consumer. |
-| `match x { ... }` | The shortest region among the continuing arm values. | A payload binding inherits `x`'s bit; each selected arm then forwards its result bit and clears any moved source. |
+| `match x { ... }` | The shortest region among the continuing arm values. | An owning scrutinee transfers a selected Move payload and clears its source; a borrowed-place scrutinee binds a read-only projection with no independent cleanup bit. Each selected arm forwards its result bit under the existing join rules. |
 | `opt else fallback` | The shorter of the `Some`/`Ok` payload and fallback regions. | `Some`/`Ok` moves the payload and clears the container; the fallback moves normally. Their bits join with the value. |
 | `result?` | The `Ok` payload's region. | `Ok` moves the payload and its bit, clearing the input; `Err` drops live individually owned locals, closes regions, and returns early. |
 | `loop { ... break v }` | `Static` — every accepted `break` value obeys the return-escape rule, so the loop value never borrows a per-iteration (or enclosing-arena) local. | Each `break` moves its value and forwards its cleanup bit; per-iteration owned locals are dropped at the back edge and at every `break`, with the moved-out break value nulled first. |
