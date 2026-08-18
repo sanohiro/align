@@ -547,6 +547,15 @@ accepts any path entirely outside the repository.
 
 - Run one review for an exact `HEAD`/base pair. Do not launch a duplicate review
   for the same pair while the first is still running.
+- A branch ancestry gets one full-diff host review. After findings, validate the
+  coherent fix against the finding ledger and changed slice; do not launch a
+  second complete-diff discovery pass. `scripts/review-bounded.sh` records
+  every started review under the worktree Git directory and refuses a
+  descendant full-diff review when an ancestor record exists. Only a
+  high-risk redesign may override this with `--reopen-axis <axis>`, and only
+  when a commit after the reviewed head changes `CLAUDE.md` or an authoritative
+  `docs/impl` plan and carries the exact
+  `Closure-Matrix-Reopened: <axis>` trailer.
 - A stall stop, explicit user bound, missing machine-readable verdict, or killed
   process means **INCOMPLETE**, never CLEAN. Preserve the log, elapsed time,
   last completed area, and process state.

@@ -39,10 +39,12 @@ rejects the collision. No `import core` exists or is required.
 `Option<T>`/`Result<T,E>` are ordinary generic sum types (monomorphized). L1a/L1b in
 [`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md) are complete:
 one recursive tagged `DropPlan` admits finite non-recursive Move payloads, makes the tagged
-container Move, drops only the active payload, and moves/nulls it through
-construction/`match`/`else`/`?`. Recursive types, arbitrary new Move-element collection layouts,
-and L2's dynamic path-selected return cleanup remain separately owned restrictions; new library
-handles must not add compiler-known exceptions.
+container Move, drops only the active payload, and moves/nulls it through construction and
+owning-place `match`/`else`/`?`. An admitted borrowed-place `match` uses the existing borrow ABI to
+read the active payload in place and leaves the source owner unchanged; it is specified by
+[`26-borrowed-sum-projection-plan.md`](../26-borrowed-sum-projection-plan.md). Recursive types,
+arbitrary new Move-element collection layouts, and L2's dynamic path-selected return cleanup remain
+separately owned restrictions; new library handles must not add compiler-known exceptions.
 
 The historical checkpoint boundary was exact: L1a first admitted only `Option<string>` as an owned
 struct-field leaf, then L1b admitted Move structs/sums as Option/Result/user-sum payloads and

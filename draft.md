@@ -332,6 +332,26 @@ warm := match signal {
 `match` also works on `Option` / `Result`; `else`-unwrap and `?` are the ergonomic shorthands for the
 common unwrap / propagate cases.
 
+When the scrutinee is a stable place whose complete root/path pair has a direct shared or exclusive
+borrow fact — either the borrowed parameter itself or a checked struct-field path below it — `match`
+performs a read-only projection. A descendant field's borrow fact does not promote an owning parent
+or a mixed-provenance local. The selected payload must be a Copy scalar/view, `string`, or a finite
+acyclic struct, `Option`, `Result`, or user sum whose reachable leaves recursively have those forms;
+tuples, arrays, collections, resources, opaque handles, and other unsupported Move shapes keep the
+ordinary borrowed-place diagnostic. The match reads the tag in place and binds an admitted active
+payload as a caller-owned borrow projection. The binding retains the payload's static type for field
+and method checking, but it receives no independent `Drop` or cleanup bit, does not move or null the
+source, and does not make a hidden aggregate copy. Copy fields can be read, and an owned `string`
+field can be passed to a `str` consumer without moving it; that owned string leaf may use the existing
+`.clone()` operation to create an owned copy. Aggregate and nested-sum clone operations are not part
+of this capability. A borrowed arm binding is not a stable place for a nested borrowed `match`; that
+use is rejected and never falls back to consuming extraction from the outer source. Returning,
+storing, capturing, sending, or consuming the whole non-Copy/Move payload is rejected by the ordinary
+borrowed-place diagnostics; existing Copy/view matching retains its
+current result behavior. Views derived from the payload follow the existing inferred owner-generation
+and region rules. A free-standing or otherwise owning scrutinee keeps the existing consuming match
+behavior.
+
 ### Loop
 
 `loop` is the one sequential-control construct: it repeats its block until a `break` executes.
@@ -808,7 +828,7 @@ it is not recomputed from the joined region.
 |---|---|---|
 | `{ ...; value }` | The trailing value's region. | Moves the trailing owned value and forwards its cleanup bit; the moved source is cleared. |
 | `if c { a } else { b }` | The shorter of the continuing arms' regions. | Each arm stores its value and cleanup bit into the join; only the selected pair reaches the consumer. |
-| `match x { ... }` | The shortest region among the continuing arm values. | A payload binding inherits `x`'s bit; each selected arm then forwards its result bit and clears any moved source. |
+| `match x { ... }` | The shortest region among the continuing arm values. | An owning scrutinee transfers a selected Move payload and clears its source; a borrowed-place scrutinee binds a read-only projection with no independent cleanup bit. Each selected arm forwards its result bit under the existing join rules. |
 | `opt else fallback` | The shorter of the `Some`/`Ok` payload and fallback regions. | `Some`/`Ok` moves the payload and clears the container; the fallback moves normally. Their bits join with the value. |
 | `result?` | The `Ok` payload's region. | `Ok` moves the payload and its bit, clearing the input; `Err` drops live individually owned locals, closes regions, and returns early. |
 | `loop { ... break v }` | `Static` — every accepted `break` value obeys the return-escape rule, so the loop value never borrows a per-iteration (or enclosing-arena) local. | Each `break` moves its value and forwards its cleanup bit; per-iteration owned locals are dropped at the back edge and at every `break`, with the moved-out break value nulled first. |
@@ -909,8 +929,9 @@ and fixed-array bindings retain every completed field owner until initialization
 Tagged values use the same ownership rule recursively. `Option<T>`, `Result<T,E>`, and user sum
 variants may carry any finite, non-recursive type whose Drop plan is known. The enclosing value is
 Move when any possible live payload is Move. Drop tests the active tag and drops only that payload;
-construction moves the payload and clears its source; `match`, `else`, and `?` move a selected
-payload out and clear the container. An `Ok` success path does not allocate merely because its
+construction moves the payload and clears its source; an owning-place `match`, `else`, and `?` move a
+selected payload out and clear the container, while an admitted borrowed-place `match` reads it in
+place without clearing the source. An `Ok` success path does not allocate merely because its
 error type owns strings. This supports structured owned errors and
 `Result<Option<MoveOutput>, MoveError>` without a second error model. It does not imply arbitrary
 arrays of Move elements; collection element layout/drop remains a separate explicit capability.

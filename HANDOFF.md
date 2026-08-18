@@ -7,7 +7,7 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-17._ Request 7's signed merge verification (#848), decoded-owner cleanup
+_Last updated: 2026-08-18._ Request 7's signed merge verification (#848), decoded-owner cleanup
 prerequisite (#849), and escaped-string language design and
 implementation (#850), following the trusted controller/verifier
 orchestration core (PR #842), the merge-race owners (PR #840) and
@@ -274,6 +274,24 @@ Completion terms are fixed across the roadmap. The first public `pkg.db`
 release is L1a–L7 plus D1–D12. The complete committed `pkg.db` roadmap also
 includes D13 batch/SoA/native breadth and D14 dynamic SQL/proved callbacks.
 
+## Request 13 merge handoff
+
+PR #854 (`https://github.com/sanohiro/align/pull/854`) merged on 2026-08-18 as
+`340a3304724fefb56c2b1aa642e6b2b2c169e6d7`. Its implementation head was
+`23680fc9c5e1457c37101dfc03de6c54e158cd43`; the reviewed candidate was
+`0e1152925938b987867ff350050e97192dbf47a4`. The independent review log was
+`.git/align-review-0e1152925938b987867ff350050e97192dbf47a4.log`, and the
+final preflight stamp was
+`.git/align-preflight/23680fc9c5e1457c37101dfc03de6c54e158cd43`.
+
+Owner tests, the bounded gate, Clippy, lint ratchet, Preflight, CI, and the
+required `Post-open review` status passed. The branch policy required
+`--auto --merge`; the merge completed after the final status was present.
+The Request 13 entry in `../align-llm/docs/align-requests.md` now records
+`ALIGN_MERGED`, PR #854, and the merge commit; that sibling edit remains
+intentionally uncommitted. The required `cargo build --release --workspace`
+also passed. Do not start Request 14.
+
 ## Start here
 
 1. Read `CLAUDE.md` for repository rules, sources of truth, and the required
@@ -307,8 +325,9 @@ facts must live in this repository.
   implementation is merged at `5aa5b23a`. Request 7 is `ALIGN_MERGED` through #850, including its
   evidence boundary, decoded-owner prerequisite, and escaped-string implementation. Request 15 is
   also `ALIGN_MERGED`. Request 9's direct owned-record JSON implementation is merged through #852
-  against `docs/impl/24-owned-json-plan.md`. Request 13's recursive owned-JSON public contract is
-  accepted in `docs/impl/25-recursive-owned-json-plan.md` and awaits its implementation PR;
+  against `docs/impl/24-owned-json-plan.md`. Request 13's recursive owned-JSON implementation is
+  merged through PR #854 as `340a3304724fefb56c2b1aa642e6b2b2c169e6d7` against
+  `docs/impl/25-recursive-owned-json-plan.md`; its align-llm adoption gate remains pending.
   Request 14 remains proposed in `../align-llm/docs/align-requests.md`.
 
 Consumer-gated deferrals that remain intentional:

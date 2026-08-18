@@ -178,6 +178,25 @@ A sum type models variation (there is no class / inheritance). Construct with `T
 **or-pattern** `A | B` (bare variant names, binds nothing). `Option<T>` / `Result<T,E>` are sum
 types; `match` works on them, with `else`-unwrap and `?` as the common-case shorthands.
 
+When the scrutinee is a stable place whose complete root/path pair has a direct shared or exclusive
+borrow fact — the borrowed parameter itself or a checked struct-field path below it — `match` reads
+the tag and active payload in place. A descendant field fact does not promote an owning parent or a
+mixed-provenance local. Borrowed mode admits Copy scalars/views, `string`, and finite acyclic structs
+and tagged values built recursively from those forms; tuples, arrays, collections, resources, opaque
+handles, and other unsupported Move shapes retain the borrowed-place diagnostic. An admitted
+non-Copy payload binding is a caller-owned read-only projection: it keeps the payload's static type
+for field and method checking, but has no independent `Drop` or cleanup bit, does not move or null
+the source, and does not trigger a hidden aggregate copy. Copy fields remain readable, owned
+`string` fields can use the existing non-consuming conversion to `str`, and that owned string leaf
+may use the existing `.clone()` operation for an explicit owned copy. A borrowed arm binding is not
+a stable place for a nested borrowed `match`; that use is rejected and never falls back to consuming
+extraction from the outer source. Returning, storing, capturing, sending, or consuming the whole
+non-Copy/Move
+payload is rejected by the ordinary borrowed-place diagnostics; existing Copy/view matching retains
+its current result behavior. Views derived from an admitted payload follow the existing inferred
+owner-generation and region rules. A free-standing or otherwise owning scrutinee retains the
+existing consuming match behavior.
+
 ```align
 area := match s {
   Circle(r)  => 3.14159 * r * r,
@@ -285,6 +304,16 @@ heap ownership from arena ownership. Moves clear the source; scope exit drops on
 individually owned value. A `mut` binding may therefore change allocation region when every assigned
 value outlives its scope, without leaking heap storage or individually freeing arena storage.
 
+For a borrowed-place `match`, the exact stable root/path pair must have a direct shared or exclusive
+borrow fact; a descendant field fact does not promote an owning parent or mixed-provenance local.
+An admitted non-Copy/Move payload is a read-only projection with the source's owner generation and
+no independent cleanup bit; the source is neither copied nor nulled. Admitted payloads are Copy
+scalars/views, `string`, and finite acyclic structs and tagged values built recursively from those
+forms. Tuples, arrays, collections, resources, opaque handles, and other unsupported Move shapes
+retain the borrowed-place diagnostic. Derived views follow the ordinary borrow summary and region
+checks, while existing Copy/view matching retains its current result behavior. An owning-place
+`match` keeps the consuming extraction and source-clearing rule.
+
 One restriction applies to `if` today: a value-carrying `if`/`else` **expression** cannot move an
 already-bound owned local out of an arm (`c := if n > 2 { a } else { … }` is rejected, and so are
 the argument and `return` positions). `match`, `else`-unwrap, a block tail, and a statement-form
@@ -321,7 +350,9 @@ otherwise unsupported container element legal.
 
 `Option`, `Result`, and user sum payloads recursively accept finite non-recursive types with a
 known Drop plan. A tagged value is Move when any possible live payload is Move; Drop follows the
-active tag, while construction/extraction moves the payload and clears its old owner. Structured
+active tag, while construction and owning-place extraction move the payload and clear its old owner.
+An admitted borrowed-place `match` reads the active payload in place and leaves the source owner
+unchanged. Structured
 owned errors and `Result<Option<MoveOutput>, MoveError>` therefore use the one existing error and
 ownership models. Arbitrary collections of Move elements remain a separate container capability.
 
