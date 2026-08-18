@@ -172,7 +172,7 @@ fn owned_json_descriptor_participates_in_cold_edit_revert_cache_identity() {
         .find(|unit| unit.unit == "lib")
         .unwrap()
         .summary
-        .owned_json_descriptors[0]
+        .owned_json_graphs[0]
         .envelope
         .clone();
 
@@ -196,7 +196,7 @@ fn owned_json_descriptor_participates_in_cold_edit_revert_cache_identity() {
             .find(|unit| unit.unit == "lib")
             .unwrap()
             .summary
-            .owned_json_descriptors[0]
+            .owned_json_graphs[0]
             .envelope,
         &cold_descriptor
     );
@@ -224,7 +224,7 @@ fn owned_json_descriptor_participates_in_cold_edit_revert_cache_identity() {
         .find(|unit| unit.unit == "lib")
         .unwrap()
         .summary
-        .owned_json_descriptors[0]
+        .owned_json_graphs[0]
         .envelope;
     assert_eq!(reverted_descriptor, &cold_descriptor);
 }

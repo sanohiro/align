@@ -12,14 +12,14 @@
 
 use crate::{
     Effect, Hash128, IConst, IEnumDef, IFnSig, IParam, IResourceDef, IStructDef, IType, ITypeParam,
-    InterfaceSummary, OwnedJsonInterfaceEntry, OwnedJsonTarget, ParamMode, ReturnBorrowSummary,
-    ReturnRegionSummary,
+    InterfaceSummary, OwnedJsonGraphInterfaceEntry, OwnedJsonTarget, ParamMode,
+    ReturnBorrowSummary, ReturnRegionSummary,
 };
 
 /// The interface-artifact format version. Bump on ANY encoding change; a bump invalidates every
 /// cached summary (an old version fails closed on read) and changes `interface_hash` (the version is
 /// part of the hashed surface).
-pub const FORMAT_VERSION: u32 = 7;
+pub const FORMAT_VERSION: u32 = 8;
 
 /// Narrow a length to the format's `u32` length-prefix width, or panic loudly. This is
 /// producer-side, compiler-internal data (interface surfaces built from the compiler's own source
@@ -195,7 +195,7 @@ fn write_struct(w: &mut Writer, s: &IStructDef) {
     w.opt_str(&s.generic_body);
 }
 
-fn write_owned_json_entry(w: &mut Writer, entry: &OwnedJsonInterfaceEntry) {
+fn write_owned_json_entry(w: &mut Writer, entry: &OwnedJsonGraphInterfaceEntry) {
     w.str(&entry.type_name);
     w.u32(u32_len(entry.envelope.len()));
     w.buf.extend_from_slice(&entry.envelope);
@@ -240,7 +240,7 @@ fn write_surface(w: &mut Writer, s: &InterfaceSummary) {
     w.str(&s.unit);
     w.seq(&s.fns, write_fn);
     w.seq(&s.structs, write_struct);
-    w.seq(&s.owned_json_descriptors, write_owned_json_entry);
+    w.seq(&s.owned_json_graphs, write_owned_json_entry);
     w.seq(&s.enums, write_enum);
     w.seq(&s.resources, write_resource);
     w.seq(&s.consts, write_const);
@@ -591,14 +591,12 @@ fn read_const(r: &mut Reader<'_>) -> Result<IConst, DecodeError> {
     Ok(IConst { name, ty, value_src: r.str()? })
 }
 
-fn read_owned_json_entry(
-    r: &mut Reader<'_>,
-) -> Result<OwnedJsonInterfaceEntry, DecodeError> {
+fn read_owned_json_entry(r: &mut Reader<'_>) -> Result<OwnedJsonGraphInterfaceEntry, DecodeError> {
     let type_name = r.str()?;
     let len = usize::try_from(r.u32()?)
         .map_err(|_| DecodeError::InvalidOwnedJson("owned JSON envelope length"))?;
     let envelope = r.take(len)?.to_vec();
-    Ok(OwnedJsonInterfaceEntry {
+    Ok(OwnedJsonGraphInterfaceEntry {
         type_name,
         envelope,
     })
@@ -632,7 +630,7 @@ fn deserialize_impl(
     let unit = r.str()?;
     let fns = r.seq(read_fn)?;
     let structs = r.seq(read_struct)?;
-    let owned_json_descriptors = r.seq(read_owned_json_entry)?;
+    let owned_json_graphs = r.seq(read_owned_json_entry)?;
     let enums = r.seq(read_enum)?;
     let resources = r.seq(read_resource)?;
     let consts = r.seq(read_const)?;
@@ -645,7 +643,7 @@ fn deserialize_impl(
         unit,
         fns,
         structs,
-        owned_json_descriptors,
+        owned_json_graphs,
         enums,
         resources,
         consts,
@@ -658,12 +656,8 @@ fn deserialize_impl(
             "parallel-transfer root is not borrow-capable",
         ));
     }
-    crate::owned_json::validate_entries(
-        &summary.structs,
-        &summary.owned_json_descriptors,
-        target,
-    )
-    .map_err(DecodeError::InvalidOwnedJson)?;
+    crate::owned_json::validate_entries(&summary.structs, &summary.owned_json_graphs, target)
+        .map_err(DecodeError::InvalidOwnedJson)?;
     if Hash128::of(&bytes[..surface_len]) != summary.interface_hash {
         return Err(DecodeError::InterfaceHashMismatch);
     }
@@ -687,8 +681,11 @@ mod tests {
     }
 
     #[test]
-    fn run_bytes_named_type_has_the_exact_format_7_field_encoding() {
-        let ty = IType::Named { path: "run_bytes".to_string(), args: Vec::new() };
+    fn run_bytes_named_type_has_the_exact_format_8_field_encoding() {
+        let ty = IType::Named {
+            path: "run_bytes".to_string(),
+            args: Vec::new(),
+        };
         let mut writer = Writer { buf: Vec::new() };
         write_type(&mut writer, &ty);
         let expected = [

@@ -144,18 +144,6 @@ fn clone_template_part(clones: &mut ChildValues, part: &TemplatePart) -> Option<
         TemplatePart::Text(text) => TemplatePart::Text(text.clone()),
         TemplatePart::Hole(_) => TemplatePart::Hole(clones.expr()?),
         TemplatePart::JsonStr(_) => TemplatePart::JsonStr(clones.expr()?),
-        TemplatePart::OwnedJsonString { .. } => TemplatePart::OwnedJsonString {
-            access: clones.expr()?,
-        },
-        TemplatePart::OwnedJsonOptionStringField { name, .. } => {
-            TemplatePart::OwnedJsonOptionStringField {
-                access: clones.expr()?,
-                name: name.clone(),
-            }
-        }
-        TemplatePart::OwnedJsonStringArray { .. } => TemplatePart::OwnedJsonStringArray {
-            access: clones.expr()?,
-        },
         TemplatePart::OptionField { name, .. } => TemplatePart::OptionField {
             access: clones.expr()?,
             name: name.clone(),
@@ -797,9 +785,9 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             struct_id: *struct_id,
         },
         ExprKind::Template(parts) => ExprKind::Template(clones.parts(parts.len())?),
-        ExprKind::JsonOwnedEncode { base, parts } => ExprKind::JsonOwnedEncode {
+        ExprKind::JsonOwnedEncode { base, plan } => ExprKind::JsonOwnedEncode {
             base: *base,
-            parts: clones.parts(parts.len())?,
+            plan: plan.clone(),
         },
         ExprKind::JsonEncodeBounded {
             base,
@@ -812,19 +800,19 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         },
         ExprKind::JsonOwnedEncodeBounded {
             base,
-            parts,
+            plan,
             max_bytes,
         } => ExprKind::JsonOwnedEncodeBounded {
             base: *base,
-            parts: clones.parts(parts.len())?,
+            plan: plan.clone(),
             max_bytes: boxed!(max_bytes),
         },
         ExprKind::JsonDecode { struct_id, input } => ExprKind::JsonDecode {
             struct_id: *struct_id,
             input: boxed!(input),
         },
-        ExprKind::JsonOwnedDecode { struct_id, input } => ExprKind::JsonOwnedDecode {
-            struct_id: *struct_id,
+        ExprKind::JsonOwnedDecode { plan, input } => ExprKind::JsonOwnedDecode {
+            plan: plan.clone(),
             input: boxed!(input),
         },
         ExprKind::JsonDecodeArray { elem, input } => ExprKind::JsonDecodeArray {
@@ -1754,15 +1742,11 @@ fn drop_functions(fns: Vec<hir::Fn>) {
             }
             DropWork::TemplatePart(part) => match part {
                 TemplatePart::Text(text) => drop(text),
-                TemplatePart::Hole(expr)
-                | TemplatePart::JsonStr(expr)
-                | TemplatePart::OwnedJsonString { access: expr }
-                | TemplatePart::OwnedJsonStringArray { access: expr } => {
+                TemplatePart::Hole(expr) | TemplatePart::JsonStr(expr) => {
                     work.push(DropWork::Expr(expr));
                 }
                 TemplatePart::OptionField { access, name }
-                | TemplatePart::OptionStructField { access, name, .. }
-                | TemplatePart::OwnedJsonOptionStringField { access, name } => {
+                | TemplatePart::OptionStructField { access, name, .. } => {
                     drop(name);
                     work.push(DropWork::Expr(access));
                 }
@@ -2374,16 +2358,15 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             stages!(stages);
             one!(dst);
         }
-        ExprKind::Template(parts) | ExprKind::JsonOwnedEncode { parts, .. } => parts!(parts),
+        ExprKind::Template(parts) => parts!(parts),
         ExprKind::JsonEncodeBounded {
-            parts, max_bytes, ..
-        }
-        | ExprKind::JsonOwnedEncodeBounded {
             parts, max_bytes, ..
         } => {
             parts!(parts);
             one!(max_bytes);
         }
+        ExprKind::JsonOwnedEncode { .. } => {}
+        ExprKind::JsonOwnedEncodeBounded { max_bytes, .. } => one!(max_bytes),
         ExprKind::JsonDocGet { doc, key }
         | ExprKind::JsonDocAt { doc, index: key }
         | ExprKind::JsonDocKey { doc, index: key } => {

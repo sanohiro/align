@@ -73,11 +73,6 @@ fn transparent_record_diverges(record: BodyRecord<'_>) -> bool {
         BodyRecord::TemplatePart(part) => match part {
             TemplatePart::Hole(expression)
             | TemplatePart::JsonStr(expression)
-            | TemplatePart::OwnedJsonString { access: expression }
-            | TemplatePart::OwnedJsonOptionStringField {
-                access: expression, ..
-            }
-            | TemplatePart::OwnedJsonStringArray { access: expression }
             | TemplatePart::OptionField {
                 access: expression, ..
             }
@@ -329,11 +324,7 @@ fn walk_body_records<'a>(
                 StageKind::WhereField { .. } | StageKind::Project { .. } => {}
             },
             BodyRecord::TemplatePart(part) => match part {
-                TemplatePart::Hole(expr)
-                | TemplatePart::JsonStr(expr)
-                | TemplatePart::OwnedJsonString { access: expr }
-                | TemplatePart::OwnedJsonOptionStringField { access: expr, .. }
-                | TemplatePart::OwnedJsonStringArray { access: expr } => {
+                TemplatePart::Hole(expr) | TemplatePart::JsonStr(expr) => {
                     work.push((BodyRecord::Expr(expr), child_depth));
                 }
                 TemplatePart::OptionField { access, .. }
@@ -982,7 +973,7 @@ fn walk_body_records<'a>(
                     );
                     work.push((BodyRecord::Expr(dst), child_depth));
                 }
-                ExprKind::Template(parts) | ExprKind::JsonOwnedEncode { parts, .. } => {
+                ExprKind::Template(parts) => {
                     work.extend(
                         parts
                             .iter()
@@ -991,15 +982,16 @@ fn walk_body_records<'a>(
                 }
                 ExprKind::JsonEncodeBounded {
                     parts, max_bytes, ..
-                }
-                | ExprKind::JsonOwnedEncodeBounded {
-                    parts, max_bytes, ..
                 } => {
                     work.extend(
                         parts
                             .iter()
                             .map(|part| (BodyRecord::TemplatePart(part), child_depth)),
                     );
+                    work.push((BodyRecord::Expr(max_bytes), child_depth));
+                }
+                ExprKind::JsonOwnedEncode { .. } => {}
+                ExprKind::JsonOwnedEncodeBounded { max_bytes, .. } => {
                     work.push((BodyRecord::Expr(max_bytes), child_depth));
                 }
                 ExprKind::FilePread {

@@ -56,8 +56,8 @@ pub use codec::{
 };
 pub use hash::Hash128;
 pub use owned_json::{
-    encode_owned_json_descriptor, encode_owned_json_envelope, OwnedJsonInterfaceEntry,
-    OwnedJsonObjectFormat, OwnedJsonTarget,
+    OwnedJsonGraphInterfaceEntry, OwnedJsonObjectFormat, OwnedJsonTarget,
+    encode_owned_json_graph_descriptor, encode_owned_json_graph_envelope,
 };
 pub use static_artifact::{
     decode_static_artifact, decode_static_command, decode_static_query, encode_static_command,
@@ -217,7 +217,7 @@ pub struct InterfaceSummary {
     pub structs: Vec<IStructDef>,
     /// Target-bound descriptors for every exported, concrete direct-owned JSON record, in the same
     /// name order as the selected subset of `structs`.
-    pub owned_json_descriptors: Vec<OwnedJsonInterfaceEntry>,
+    pub owned_json_graphs: Vec<OwnedJsonGraphInterfaceEntry>,
     /// Exported sum types, sorted by name.
     pub enums: Vec<IEnumDef>,
     /// Exported native resources, sorted by nominal name.
@@ -289,6 +289,59 @@ fn convert_ret(ret: &Option<align_ast::Type>) -> IType {
         Some(t) => convert_type(t),
         None => unit_type(),
     }
+}
+
+fn resolved_owned_json_type(
+    ty: align_sema::Ty,
+    structs: &[align_sema::hir::StructDef],
+) -> IType {
+    let named = |path: String, args: Vec<IType>| IType::Named { path, args };
+    match ty {
+        align_sema::Ty::Int(value) => named(value.name(), Vec::new()),
+        align_sema::Ty::Bool => named("bool".to_string(), Vec::new()),
+        align_sema::Ty::String => named("string".to_string(), Vec::new()),
+        align_sema::Ty::Struct(id) => structs
+            .get(id as usize)
+            .map(|definition| named(definition.name.clone(), Vec::new()))
+            .unwrap_or_else(|| named("__unknown_owned_json_record".to_string(), Vec::new())),
+        align_sema::Ty::Option(payload) => named(
+            "Option".to_string(),
+            vec![resolved_owned_json_type(align_sema::scalar_to_ty(payload), structs)],
+        ),
+        align_sema::Ty::DynArray(element) => named(
+            "array".to_string(),
+            vec![resolved_owned_json_type(align_sema::scalar_to_ty(element), structs)],
+        ),
+        align_sema::Ty::DynStructArray(id, align_sema::Layout::Aos) => named(
+            "array".to_string(),
+            vec![resolved_owned_json_type(align_sema::Ty::Struct(id), structs)],
+        ),
+        _ => named("__unsupported_owned_json_type".to_string(), Vec::new()),
+    }
+}
+
+fn resolved_owned_json_structs(program: &align_sema::hir::Program) -> Vec<IStructDef> {
+    program
+        .structs
+        .iter()
+        .map(|definition| IStructDef {
+            name: definition.name.clone(),
+            type_params: Vec::new(),
+            fields: definition
+                .fields
+                .iter()
+                .map(|field| {
+                    (
+                        field.name.clone(),
+                        resolved_owned_json_type(field.ty, &program.structs),
+                    )
+                })
+                .collect(),
+            align: definition.align,
+            c_repr: definition.c_repr,
+            generic_body: None,
+        })
+        .collect()
 }
 
 fn apply_function_cleanup_metadata(
@@ -706,7 +759,30 @@ pub fn build_summaries_with_effects(
         resources.sort_by(|a, b| a.name.cmp(&b.name));
         consts.sort_by(|a, b| a.name.cmp(&b.name));
 
-        let owned_json_descriptors = owned_json::entries_for_structs(&structs, target)
+        let resolved_structs = resolved_owned_json_structs(program);
+        let resolved_roots = structs
+            .iter()
+            .filter(|definition| definition.type_params.is_empty())
+            .map(|definition| {
+                let canonical = mangle(&m.path, m.is_entry, &definition.name);
+                let root = program
+                    .structs
+                    .iter()
+                    .position(|candidate| candidate.source_name == canonical)
+                    .ok_or_else(|| {
+                        format!(
+                            "exported owned JSON record '{}' has no resolved definition",
+                            definition.name
+                        )
+                    })?;
+                Ok((definition.name.clone(), root))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let owned_json_graphs = owned_json::entries_for_resolved_structs(
+            &resolved_structs,
+            &resolved_roots,
+            target,
+        )
             .ok_or_else(|| format!("unit '{}' has an unencodable owned JSON record", m.path))?;
 
         let mut capabilities = caps_by_unit.get(&m.path).cloned().unwrap_or_default();
@@ -718,7 +794,7 @@ pub fn build_summaries_with_effects(
             unit: m.path.clone(),
             fns,
             structs,
-            owned_json_descriptors,
+            owned_json_graphs,
             enums,
             resources,
             consts,

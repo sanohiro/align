@@ -1,9 +1,75 @@
-//! Request 9: direct records whose text leaves are free-standing owners.
+//! Requests 9 and 13: recursive records whose text leaves are free-standing owners.
 
 mod common;
 use common::*;
 use std::fmt::Write as _;
 use std::process::{Command, Stdio};
+
+#[test]
+fn recursive_owned_json_c6_graph_manifest() {
+    let source = fixture("crates/align_driver/tests/fixtures/recursive_owned_json_c6.align");
+    let mut source_map = SourceMap::new();
+    let checked = check(&mut source_map, "recursive-owned-json-c6", source);
+    assert!(
+        !checked.diags.has_errors(),
+        "C6 manifest must syntax- and type-check:\n{}",
+        align_driver::format_diagnostics(&source_map, &checked.diags)
+    );
+    let manifest = checked.hir.structs.get(..50).expect("50 C6 declarations");
+    assert_eq!(
+        manifest
+            .last()
+            .map(|definition| definition.source_name.as_str()),
+        Some("PromptGateSourceLocator")
+    );
+    assert_eq!(
+        manifest
+            .iter()
+            .map(|definition| definition.fields.len())
+            .sum::<usize>(),
+        543,
+        "pinned C6 field count"
+    );
+
+    let mut canonical = Vec::new();
+    for definition in manifest {
+        canonical.extend_from_slice(definition.source_name.as_bytes());
+        canonical.push(0);
+        for field in &definition.fields {
+            canonical.extend_from_slice(field.name.as_bytes());
+            canonical.push(b':');
+            canonical.extend_from_slice(format!("{:?}", field.ty).as_bytes());
+            canonical.push(0);
+        }
+    }
+    assert_eq!(
+        Hash128::of(&canonical),
+        Hash128 {
+            lo: 0x58d3_5040_52bd_9cad,
+            hi: 0xf9c5_a3bc_3498_fe23
+        },
+        "field names, resolved types, declaration order, and dependencies"
+    );
+
+    for root in 0..manifest.len() as u32 {
+        let plan = align_sema::owned_json_graph_plan_v2(&checked.hir.structs, root)
+            .unwrap_or_else(|error| panic!("C6 root {root} must form a V2 graph: {error}"));
+        assert_eq!(plan.root, root);
+        let mut ids = std::collections::HashSet::new();
+        for record in &plan.records {
+            assert!(
+                ids.insert(record.id),
+                "record ids are first-encounter unique"
+            );
+            let definition = &checked.hir.structs[record.id as usize];
+            assert_eq!(record.fields.len(), definition.fields.len());
+            for (planned, declared) in record.fields.iter().zip(&definition.fields) {
+                assert_eq!(planned.name, declared.name);
+                assert_eq!(planned.ty, declared.ty);
+            }
+        }
+    }
+}
 
 #[test]
 fn owned_json_decode_encode_and_bounded_round_trip_without_an_arena() {
@@ -239,16 +305,51 @@ fn main() -> Result<(), Error> {
 }
 
 #[test]
-fn owned_json_rejects_mixed_and_nested_graphs_before_lowering() {
-    for source in [
-        "import core.json\nMixed { owned: string, borrowed: str }\nfn main() -> Result<(), Error> { value: Mixed := json.decode(\"{}\")?; return Ok(()) }\n",
-        "import core.json\nInner { text: string }\nOuter { inner: Inner }\nfn main() -> Result<(), Error> { value: Outer := json.decode(\"{}\")?; return Ok(()) }\n",
-        "import core.json\nBad { values: Option<array<string>> }\nfn main() -> Result<(), Error> { value: Bad := json.decode(\"{}\")?; return Ok(()) }\n",
-    ] {
-        let mut source_map = SourceMap::new();
-        let checked = check(&mut source_map, "owned-json-reject", source);
-        assert!(checked.diags.has_errors());
+fn recursive_owned_json_records_options_and_arrays_round_trip_canonically() {
+    if !backend_available() {
+        return;
     }
+    let source = r#"
+import core.json
+Leaf { ok: bool, text: string }
+Envelope {
+  version: u16,
+  child: Leaf,
+  note: Option<string>,
+  items: array<Leaf>,
+  counts: array<i32>,
+  names: Option<array<string>>,
+  optional_items: Option<array<Leaf>>,
+}
+fn main() -> Result<(), Error> {
+  value: Envelope := json.decode("{\"version\":1,\"child\":{\"ok\":true,\"text\":\"nul:\\u0000\"},\"note\":null,\"items\":[{\"ok\":false,\"text\":\"\\u20ac\"}],\"counts\":[1,-2],\"names\":[\"a\",\"b\"],\"optional_items\":[{\"ok\":true,\"text\":\"z\"}],\"ignored\":{\"deep\":[1,true,\"ok\"]}}")?
+  plain := json.encode(value)
+  bounded := json.encode_bounded(value, plain.len())?
+  print(plain)
+  print(bounded)
+  return Ok(())
+}
+"#;
+    let out = build_and_run("recursive-owned-json-round-trip", source);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let canonical = "{\"version\":1,\"child\":{\"ok\":true,\"text\":\"nul:\\u0000\"},\"items\":[{\"ok\":false,\"text\":\"€\"}],\"counts\":[1,-2],\"names\":[\"a\",\"b\"],\"optional_items\":[{\"ok\":true,\"text\":\"z\"}]}";
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{canonical}\n{canonical}\n")
+    );
+
+    let mut source_map = SourceMap::new();
+    let checked = check(
+        &mut source_map,
+        "recursive-owned-json-mixed",
+        "import core.json\nMixed { owned: string, borrowed: str }\nfn main() -> Result<(), Error> { value: Mixed := json.decode(\"{}\")?; return Ok(()) }\n",
+    );
+    assert!(checked.diags.has_errors());
 }
 
 #[test]
@@ -264,37 +365,37 @@ fn owned_json_formation_routing_and_multi_invalid_precedence_are_deterministic()
             "layout-before-fields",
             "import core.json\nlayout(C) Bad { first: str, owned: string }\nfn main() -> Result<(), Error> { value: Bad := json.decode(\"{}\")?; return Ok(()) }\n",
             "cannot use `layout(C)`",
-            ["mixed borrowed", "unsupported type"],
+            ["unsupported type str", "unsupported type f64"],
         ),
         (
             "align-before-fields",
             "import core.json\nalign(16) Bad { first: str, owned: string }\nfn main() -> Result<(), Error> { value: Bad := json.decode(\"{}\")?; return Ok(()) }\n",
             "cannot use explicit `align(N)`",
-            ["mixed borrowed", "unsupported type"],
+            ["unsupported type str", "unsupported type f64"],
         ),
         (
             "first-unsupported-field",
             "import core.json\nBad { first: f64, second: str, owned: string }\nfn main() -> Result<(), Error> { value: Bad := json.decode(\"{}\")?; return Ok(()) }\n",
-            "field 'first' has unsupported type f64",
-            ["field 'second'", "mixed borrowed"],
+            "owned JSON graph has unsupported type f64",
+            ["unsupported type str", "max_bytes"],
         ),
         (
             "first-mixed-field",
             "import core.json\nBad { first: str, second: f64, owned: string }\nfn main() -> Result<(), Error> { value: Bad := json.decode(\"{}\")?; return Ok(()) }\n",
-            "field 'first' has mixed borrowed type str",
-            ["field 'second'", "unsupported type f64"],
+            "owned JSON graph has unsupported type str",
+            ["unsupported type f64", "max_bytes"],
         ),
         (
             "graph-before-bounded-limit",
             "import core.json\nBad { first: f64, owned: string }\nfn main() -> i32 { value := Bad { first: 1.0, owned: \"x\".clone() }; json.encode_bounded(value, true); return 0 }\n",
-            "field 'first' has unsupported type f64",
+            "owned JSON graph has unsupported type f64",
             ["max_bytes", "must be i64"],
         ),
         (
             "generic-substitution",
             "import core.json\nGeneric<T> { value: T, note: Option<string> }\nfn main() -> Result<(), Error> { value: Generic<str> := json.decode(\"{}\")?; return Ok(()) }\n",
-            "field 'value' has mixed borrowed type str",
-            ["field 'note'", "unsupported type"],
+            "owned JSON graph has unsupported type str",
+            ["field 'note'", "unsupported type string"],
         ),
     ];
     for (name, source, expected, absent) in cases {

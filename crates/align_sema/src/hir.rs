@@ -862,7 +862,7 @@ pub enum ExprKind {
     /// template so checked-HIR validation can replay the owned graph and allocation contract.
     JsonOwnedEncode {
         base: LocalId,
-        parts: Vec<TemplatePart>,
+        plan: OwnedJsonGraphPlanV2,
     },
     /// `json.encode_bounded(value, max_bytes)` — the same ordered typed encode parts as
     /// `json.encode`, emitted into an individually owned builder with an inclusive byte ceiling.
@@ -876,7 +876,7 @@ pub enum ExprKind {
     /// The bounded encoder for the same closed direct-owned record graph.
     JsonOwnedEncodeBounded {
         base: LocalId,
-        parts: Vec<TemplatePart>,
+        plan: OwnedJsonGraphPlanV2,
         max_bytes: Box<Expr>,
     },
     /// `json.decode(input)` for struct `struct_id` — parse the `str` `input` into that
@@ -884,7 +884,10 @@ pub enum ExprKind {
     JsonDecode { struct_id: u32, input: Box<Expr> },
     /// `json.decode(input)` for a direct record containing owned text. Runtime materialization is
     /// always free-standing and therefore carries no input or arena region.
-    JsonOwnedDecode { struct_id: u32, input: Box<Expr> },
+    JsonOwnedDecode {
+        plan: OwnedJsonGraphPlanV2,
+        input: Box<Expr>,
+    },
     /// `json.decode(input)` targeting an owned `array<T>` (MMv2 slice 8c) — parse a JSON array of
     /// scalars into a freshly heap-allocated owned `array<T>` (the elements are *copied*, so the
     /// result is `Static`/returnable, not region-tied to the input). `elem` is the (primitive)
@@ -1903,6 +1906,26 @@ pub enum StrTrimKind {
     End,
 }
 
+/// Checked, deterministic root-first record graph for the recursive owned-JSON route.
+/// Record ids are compiler-local; interface transport uses its independent structural V2 bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedJsonGraphPlanV2 {
+    pub root: u32,
+    pub records: Vec<OwnedJsonGraphRecordV2>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedJsonGraphRecordV2 {
+    pub id: u32,
+    pub fields: Vec<OwnedJsonGraphFieldV2>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedJsonGraphFieldV2 {
+    pub name: String,
+    pub ty: crate::Ty,
+}
+
 #[derive(Clone, Debug)]
 pub enum TemplatePart {
     Text(String),
@@ -1911,13 +1934,6 @@ pub enum TemplatePart {
     /// A `str` expression to be emitted as a JSON string literal (quoted + escaped).
     /// Produced by `json.encode` desugaring, not by surface `template` syntax.
     JsonStr(Expr),
-    /// An owned `string` field emitted through the JSON string writer. Its byte layout matches a
-    /// `str` view, but retaining the kind keeps checked-HIR route validation exact.
-    OwnedJsonString { access: Expr },
-    /// A direct `Option<string>` field. `None` is omitted; `Some` writes its name and JSON string.
-    OwnedJsonOptionStringField { access: Expr, name: String },
-    /// A direct `array<string>` field emitted as a JSON string array.
-    OwnedJsonStringArray { access: Expr },
     /// `json.encode` of an **`Option<T>` field** (REST-gateway runway, Slice B): when the option is
     /// `Some`, emit `"name":<payload>,` (the payload rendered per its scalar kind — int/float/bool
     /// raw, str JSON-escaped — with a **trailing comma**); when `None`, emit nothing. `access` is the

@@ -2838,7 +2838,7 @@ unsafe fn json_encode_value(b: &mut Builder, fp: *const u8, d: &JsonField, kind:
                 push_float(&mut b.buf, f64::from_le_bytes(bytes));
             }
         }
-        3 => {
+        3 | 8 => {
             // `str` field `{ptr,len}` → quoted + escaped.
             let mut pb = [0u8; 8];
             let mut lb = [0u8; 8];
@@ -2872,6 +2872,7 @@ unsafe fn json_encode_value(b: &mut Builder, fp: *const u8, d: &JsonField, kind:
             let elem_width = ((d.tag >> 24) & 0x1f) as usize; // 5 bits: a `str` element is width 16
             unsafe { json_encode_scalar_array_at(b, fp, elem_kind, elem_width, elem_signed) };
         }
+        9 => unsafe { json_encode_scalar_array_at(b, fp, 3, 16, false) },
         // A shape-directed union (`enum`) field (JSON completeness J1b-2b): `d.sub` is a [`JsonUnion`];
         // emit the live variant's payload bare at `fp`.
         6 => {

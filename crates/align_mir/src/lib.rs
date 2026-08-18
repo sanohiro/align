@@ -936,7 +936,11 @@ pub enum Rvalue {
     JsonDecode { struct_id: u32, input: Operand, out: Slot, arena: Option<Operand> },
     /// Direct-owned record JSON decode. Its descriptor kinds materialize every text leaf into
     /// free-standing allocations; no arena operand is legal.
-    JsonOwnedDecode { struct_id: u32, input: Operand, out: Slot },
+    JsonOwnedDecode {
+        plan: hir::OwnedJsonGraphPlanV2,
+        input: Operand,
+        out: Slot,
+    },
     /// `json.decode` into an owned `array<elem>` (MMv2 slice 8c): parse a JSON array of scalars
     /// and write the materialized `{ptr,len}` into the `out` slot. Yields an `i32` status
     /// (0 = ok). `elem` is the element scalar (its kind/width gives the runtime element tag).
@@ -1533,12 +1537,11 @@ pub enum TemplatePiece {
     FloatHole(Operand),
     /// A `str` operand emitted as a JSON string literal (quoted + escaped). From `json.encode`.
     JsonStrHole(Operand),
-    /// A direct owned `string` field, read through its `{ptr,len}` byte layout.
-    OwnedJsonString(Operand),
-    /// A direct `Option<string>` field; `None` omits the complete key/value pair.
-    OwnedJsonOptionStringField { opt: Operand, name: String },
-    /// A direct `array<string>` field, read-only during encode.
-    OwnedJsonStringArray(Operand),
+    /// One recursive owned-record root rendered through the validated V2 descriptor graph.
+    OwnedJsonObject {
+        value: Operand,
+        plan: hir::OwnedJsonGraphPlanV2,
+    },
     /// A `json.encode` `Option<T>` field (REST-gateway runway, Slice B): when `opt` is `Some`, append
     /// `"name":<payload>,` (payload rendered per its scalar kind — int/float/bool raw, str
     /// JSON-escaped — with a trailing comma); when `None`, append nothing. `opt`'s type
@@ -4655,7 +4658,7 @@ struct TemplateFrame<'a> {
 
 fn template_frame<'a>(b: &mut Builder, expr: &'a hir::Expr) -> TemplateFrame<'a> {
     let parts = match &expr.kind {
-        hir::ExprKind::Template(parts) | hir::ExprKind::JsonOwnedEncode { parts, .. } => parts,
+        hir::ExprKind::Template(parts) => parts,
         _ => unreachable!("a template frame starts at a template-producing expression"),
     };
     // Register before holes: a `?` inside one may emit an early cleanup edge.
@@ -4686,18 +4689,6 @@ fn template_piece(part: &hir::TemplatePart, operand: Operand) -> TemplatePiece {
             }
         }
         hir::TemplatePart::JsonStr(_) => TemplatePiece::JsonStrHole(operand),
-        hir::TemplatePart::OwnedJsonString { .. } => {
-            TemplatePiece::OwnedJsonString(operand)
-        }
-        hir::TemplatePart::OwnedJsonOptionStringField { name, .. } => {
-            TemplatePiece::OwnedJsonOptionStringField {
-                opt: operand,
-                name: name.clone(),
-            }
-        }
-        hir::TemplatePart::OwnedJsonStringArray { .. } => {
-            TemplatePiece::OwnedJsonStringArray(operand)
-        }
         hir::TemplatePart::OptionField { name, .. } => TemplatePiece::OptionField {
             opt: operand,
             name: name.clone(),
@@ -4733,9 +4724,6 @@ fn template_part_expr(part: &hir::TemplatePart) -> Option<&hir::Expr> {
     match part {
         hir::TemplatePart::Hole(expr)
         | hir::TemplatePart::JsonStr(expr)
-        | hir::TemplatePart::OwnedJsonString { access: expr }
-        | hir::TemplatePart::OwnedJsonOptionStringField { access: expr, .. }
-        | hir::TemplatePart::OwnedJsonStringArray { access: expr }
         | hir::TemplatePart::OptionField { access: expr, .. }
         | hir::TemplatePart::OptionStructField { access: expr, .. }
         | hir::TemplatePart::StructArrayField { access: expr, .. }
@@ -4764,6 +4752,39 @@ fn lower_template_parts(b: &mut Builder, parts: &[hir::TemplatePart]) -> Option<
     Some(pieces)
 }
 
+fn owned_json_piece(
+    b: &mut Builder,
+    base: hir::LocalId,
+    plan: &hir::OwnedJsonGraphPlanV2,
+) -> TemplatePiece {
+    let value = b.fresh_value(Ty::Struct(plan.root));
+    b.push(Stmt::Let(value, Rvalue::Load(base)));
+    TemplatePiece::OwnedJsonObject {
+        value: Operand::Value(value),
+        plan: plan.clone(),
+    }
+}
+
+#[inline(never)]
+fn lower_owned_json_encode(
+    b: &mut Builder,
+    base: hir::LocalId,
+    plan: &hir::OwnedJsonGraphPlanV2,
+    expression: &hir::Expr,
+) -> Operand {
+    let piece = owned_json_piece(b, base, plan);
+    let arena = b.arenas.last().map(|handle| Operand::Value(*handle));
+    let result = b.fresh_value(expression.ty);
+    b.push(Stmt::Let(result, Rvalue::Template(vec![piece], arena)));
+    if owns_hidden_string(expression, !b.arenas.is_empty()) {
+        let owner = b.new_synthetic_owner(Ty::String);
+        b.push(Stmt::Store(owner, Operand::Value(result)));
+        b.set_drop_flag(owner, true);
+        b.attach_borrow_owners(result, [owner]);
+    }
+    Operand::Value(result)
+}
+
 #[inline(never)]
 fn lower_json_encode_bounded(
     b: &mut Builder,
@@ -4774,6 +4795,27 @@ fn lower_json_encode_bounded(
     let Some(pieces) = lower_template_parts(b, parts) else {
         return terminated_operand();
     };
+    lower_json_encode_bounded_pieces(b, pieces, max_bytes, result_ty)
+}
+
+#[inline(never)]
+fn lower_owned_json_encode_bounded(
+    b: &mut Builder,
+    base: hir::LocalId,
+    plan: &hir::OwnedJsonGraphPlanV2,
+    max_bytes: &hir::Expr,
+    result_ty: Ty,
+) -> Operand {
+    let piece = owned_json_piece(b, base, plan);
+    lower_json_encode_bounded_pieces(b, vec![piece], max_bytes, result_ty)
+}
+
+fn lower_json_encode_bounded_pieces(
+    b: &mut Builder,
+    pieces: Vec<TemplatePiece>,
+    max_bytes: &hir::Expr,
+    result_ty: Ty,
+) -> Operand {
     let limit = lower_expr(b, max_bytes);
     if !lowering_continues(b) {
         return terminated_operand();
@@ -5110,6 +5152,7 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
             | hir::ExprKind::Arena(_)
             | hir::ExprKind::NamedArena { .. }
             | hir::ExprKind::TaskGroup(_)
+            | hir::ExprKind::JsonOwnedEncode { .. }
             | hir::ExprKind::JsonEncodeBounded { .. }
             | hir::ExprKind::JsonOwnedEncodeBounded { .. }
             | hir::ExprKind::FileCreateRw { .. }
@@ -5186,10 +5229,7 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
 }
 
 fn expression_uses_template_spine(e: &hir::Expr) -> bool {
-    matches!(
-        e.kind,
-        hir::ExprKind::Template(_) | hir::ExprKind::JsonOwnedEncode { .. }
-    )
+    matches!(e.kind, hir::ExprKind::Template(_))
 }
 
 /// Strict eager parents perform no parent action between their source-ordered children. They can
@@ -5271,17 +5311,16 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::Arena(block) => lower_arena_block(b, block),
         hir::ExprKind::NamedArena { local, block } => lower_named_arena_block(b, *local, block),
         hir::ExprKind::TaskGroup(block) => lower_task_group_block(b, block),
-        hir::ExprKind::Template(_) | hir::ExprKind::JsonOwnedEncode { .. } => {
-            lower_template_spine(b, e)
-        }
+        hir::ExprKind::Template(_) => lower_template_spine(b, e),
+        hir::ExprKind::JsonOwnedEncode { base, plan } => lower_owned_json_encode(b, *base, plan, e),
         hir::ExprKind::JsonEncodeBounded {
             parts, max_bytes, ..
-        }
-        | hir::ExprKind::JsonOwnedEncodeBounded {
-            parts, max_bytes, ..
-        } => {
-            lower_json_encode_bounded(b, parts, max_bytes, e.ty)
-        }
+        } => lower_json_encode_bounded(b, parts, max_bytes, e.ty),
+        hir::ExprKind::JsonOwnedEncodeBounded {
+            base,
+            plan,
+            max_bytes,
+        } => lower_owned_json_encode_bounded(b, *base, plan, max_bytes, e.ty),
         hir::ExprKind::FileCreateRw { .. }
         | hir::ExprKind::FileOpenRw { .. }
         | hir::ExprKind::FilePread { .. }
@@ -5549,22 +5588,23 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 elem,
                 len: _,
             } => finish_const_array(b, elems, *elem, e.ty),
-            hir::ExprKind::Template(_) | hir::ExprKind::JsonOwnedEncode { .. } => {
-                lower_template_spine(b, e)
+            hir::ExprKind::Template(_) => lower_template_spine(b, e),
+            hir::ExprKind::JsonOwnedEncode { base, plan } => {
+                lower_owned_json_encode(b, *base, plan, e)
             }
             hir::ExprKind::JsonEncodeBounded {
                 parts, max_bytes, ..
-            }
-            | hir::ExprKind::JsonOwnedEncodeBounded {
-                parts, max_bytes, ..
-            } => {
-                lower_json_encode_bounded(b, parts, max_bytes, e.ty)
-            }
+            } => lower_json_encode_bounded(b, parts, max_bytes, e.ty),
+            hir::ExprKind::JsonOwnedEncodeBounded {
+                base,
+                plan,
+                max_bytes,
+            } => lower_owned_json_encode_bounded(b, *base, plan, max_bytes, e.ty),
             hir::ExprKind::JsonDecode { struct_id, input } => {
-                lower_json_decode_record(b, *struct_id, input, e.ty, false)
+                lower_json_decode_record(b, *struct_id, input, e.ty, None)
             }
-            hir::ExprKind::JsonOwnedDecode { struct_id, input } => {
-                lower_json_decode_record(b, *struct_id, input, e.ty, true)
+            hir::ExprKind::JsonOwnedDecode { plan, input } => {
+                lower_json_decode_record(b, plan.root, input, e.ty, Some(plan.clone()))
             }
             hir::ExprKind::JsonDecodeArray { elem, input } => {
                 lower_json_decode_array(b, *elem, input, e.ty)
@@ -12709,15 +12749,15 @@ fn lower_json_decode_record(
     struct_id: u32,
     input: &hir::Expr,
     result_ty: Ty,
-    owned: bool,
+    owned: Option<hir::OwnedJsonGraphPlanV2>,
 ) -> Operand {
     let sty = Ty::Struct(struct_id);
     let out = b.new_slot(sty);
     let inp = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
-    let rvalue = if owned {
+    let rvalue = if let Some(plan) = owned {
         Rvalue::JsonOwnedDecode {
-            struct_id,
+            plan,
             input: inp,
             out,
         }
@@ -15936,7 +15976,10 @@ mod tests {
         let owned = hir::Expr {
             kind: hir::ExprKind::JsonOwnedEncode {
                 base: 0,
-                parts: Vec::new(),
+                plan: hir::OwnedJsonGraphPlanV2 {
+                    root: 0,
+                    records: Vec::new(),
+                },
             },
             ty: Ty::Str,
             span,
@@ -15944,14 +15987,17 @@ mod tests {
         let bounded = hir::Expr {
             kind: hir::ExprKind::JsonOwnedEncodeBounded {
                 base: 0,
-                parts: Vec::new(),
+                plan: hir::OwnedJsonGraphPlanV2 {
+                    root: 0,
+                    records: Vec::new(),
+                },
                 max_bytes: Box::new(max_bytes),
             },
             ty: Ty::Result(Scalar::String, Scalar::Enum(0)),
             span,
         };
 
-        assert!(expression_uses_template_spine(&owned));
+        assert!(!expression_uses_template_spine(&owned));
         assert!(expression_uses_out_of_line_dispatch(&owned));
         assert!(expression_uses_out_of_line_dispatch(&bounded));
     }
