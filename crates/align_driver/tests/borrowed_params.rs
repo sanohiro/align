@@ -298,10 +298,14 @@ fn main() -> i32 {\n\
 }
 
 #[test]
-fn borrowed_sum_match_passes_a_view_leaf_through_an_indirect_call() {
+fn borrowed_sum_match_passes_a_move_projection_through_shared_calls() {
     let source = "\
-fn length(value: str) -> i64 = value.len()\n\
-fn apply(f: fn(str) -> i64, borrow value: Option<string>) -> i64 = match value {\n\
+fn length(borrow value: string) -> i64 = value.len()\n\
+fn direct(borrow value: Option<string>) -> i64 = match value {\n\
+  Some(text) => length(text)\n\
+  None => 0\n\
+}\n\
+fn apply(f: fn(borrow string) -> i64, borrow value: Option<string>) -> i64 = match value {\n\
   Some(text) => f(text)\n\
   None => 0\n\
 }\n\
@@ -309,17 +313,17 @@ fn main() -> i32 {\n\
   value: Option<string> := Some(\"hello\".clone())\n\
   f := length\n\
   result := apply(f, value)\n\
-  if result == 5 && match value { Some(text) => text.len() None => 0 } == 5 { return 42 }\n\
+  if direct(value) == 5 && result == 5 && match value { Some(text) => text.len() None => 0 } == 5 { return 42 }\n\
   return 0\n\
 }\n\
 ";
     assert!(
-        !check_errs("borrowed-sum-indirect-view", source),
+        !check_errs("borrowed-sum-shared-calls", source),
         "{}",
-        check_diagnostics("borrowed-sum-indirect-view", source)
+        check_diagnostics("borrowed-sum-shared-calls", source)
     );
     if backend_available() {
-        assert_eq!(build_and_run("borrowed-sum-indirect-view", source).status.code(), Some(42));
+        assert_eq!(build_and_run("borrowed-sum-shared-calls", source).status.code(), Some(42));
     }
 }
 

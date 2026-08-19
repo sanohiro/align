@@ -8801,10 +8801,14 @@ fn borrowed_match_metadata_is_valid(program: &hir::Program) -> bool {
                     for (ordinal, binding) in arm.bindings.iter().copied().enumerate() {
                         let Some(&scalar) = payloads.get(ordinal) else { return false };
                         let static_ty = scalar_to_ty(scalar);
+                        let resolved_static_ty = expand_tagged_ty(static_ty, &program.tagged_types);
                         if function
                             .locals
                             .get(binding as usize)
-                            .is_none_or(|local| local.ty != static_ty)
+                            .is_none_or(|local| {
+                                expand_tagged_ty(local.ty, &program.tagged_types)
+                                    != resolved_static_ty
+                            })
                         {
                             return false;
                         }
@@ -8877,6 +8881,28 @@ fn borrowed_match_metadata_is_valid(program: &hir::Program) -> bool {
             .iter()
             .chain(function.drop_individual_locals.iter())
             .any(|local| projection_locals.contains(local))
+        {
+            return false;
+        }
+        let projection_expr_spans = hir_depth::body_events(&function.body)
+            .into_iter()
+            .filter_map(|event| match event {
+                hir_depth::BodyEvent::ExprEnter(expression)
+                    if matches!(
+                        &expression.kind,
+                        ExprKind::Local(local) if projection_locals.contains(local)
+                    )
+                    || matches!(
+                        &expression.kind,
+                        ExprKind::Field { root, .. } if projection_locals.contains(root)
+                    ) => Some(expression.span),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        if function
+            .drop_individual_exprs
+            .keys()
+            .any(|span| projection_expr_spans.contains(span))
         {
             return false;
         }
@@ -13808,6 +13834,18 @@ impl<'a> EscapeCheck<'a> {
         }
     }
 
+    /// A projection-only match binding aliases caller-owned sum storage. It has no independent
+    /// allocation provenance, even when its static type is a Drop-bearing Move type. Keep this
+    /// predicate limited to places rooted at the binding; a call or control-flow result using the
+    /// binding may itself produce a fresh owned value and still needs ordinary tracking.
+    fn is_borrowed_projection_place(&self, expression: &Expr) -> bool {
+        match &expression.kind {
+            ExprKind::Local(local) => self.borrowed_projection_locals.contains(local),
+            ExprKind::Field { root, .. } => self.borrowed_projection_locals.contains(root),
+            _ => false,
+        }
+    }
+
     /// Resolve one return-region root at a call site. A borrowed Move/resource parameter exposes
     /// storage owned by the caller's place, not merely the value's inherited dependency region.
     /// Cap that storage at the caller frame unless the place is itself a borrowed parameter.
@@ -14846,6 +14884,13 @@ impl<'a> EscapeCheck<'a> {
                     }
                 }
                 Work::Record(expression) => {
+                    if self.is_borrowed_projection_place(expression) {
+                        // Projection-only bindings are aliases for the borrowed sum storage, not
+                        // independently owned expressions. In particular, do not publish a
+                        // drop_individual_exprs entry that would make MIR attach a cleanup bit to
+                        // a pointer into the caller's aggregate.
+                        continue;
+                    }
                     let individual = *values.last().expect("ownership expression result");
                     // The same syntax node can be replayed at more than one CFG state. Retain the
                     // conservative conjunction; runtime local moves do not consume this static entry.
@@ -51712,8 +51757,35 @@ fn exit_branch(flag: bool) -> i64 {
             "Content { Text(string) , Empty }\nfn inspect(borrow value: Content) -> i64 = match value {\n  Text(text) => text.len()\n  Empty => 0\n}\n",
         ];
         for source in accepted {
-            let (_program, diagnostics) = check(&format!("{source}fn main() -> i32 = 0\n"));
+            let (program, diagnostics) = check(&format!("{source}fn main() -> i32 = 0\n"));
             assert!(!diagnostics.has_errors(), "borrowed sum projection should check: {:?}", diagnostics.iter().collect::<Vec<_>>());
+            let inspect = program
+                .fns
+                .iter()
+                .find(|function| function.name == "inspect")
+                .expect("borrowed projection owner");
+            let projection_locals = borrowed_projection_locals(&inspect.body);
+            let projection_spans = hir_depth::body_events(&inspect.body)
+                .into_iter()
+                .filter_map(|event| match event {
+                    hir_depth::BodyEvent::ExprEnter(expression)
+                        if matches!(
+                            &expression.kind,
+                            ExprKind::Local(local) if projection_locals.contains(local)
+                        )
+                        || matches!(
+                            &expression.kind,
+                            ExprKind::Field { root, .. } if projection_locals.contains(root)
+                        ) => Some(expression.span),
+                    _ => None,
+                })
+                .collect::<HashSet<_>>();
+            assert!(
+                projection_spans
+                    .iter()
+                    .all(|span| !inspect.drop_individual_exprs.contains_key(span)),
+                "projection-only aliases must not acquire expression cleanup metadata"
+            );
         }
 
         let consuming = "fn take(value: string) -> i64 = value.len()\nfn inspect(borrow value: Option<string>) -> i64 = match value {\n  Some(text) => take(text)\n  None => 0\n}\n";

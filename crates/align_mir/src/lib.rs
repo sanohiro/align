@@ -8006,28 +8006,48 @@ fn lower_borrowed_place(
     e: &hir::Expr,
     mode: align_ast::ParamMode,
 ) -> Operand {
-    let (slot, fields) = match &e.kind {
-        hir::ExprKind::Local(local) => (*local, Vec::new()),
-        hir::ExprKind::Field { root, path } => (*root, path.clone()),
+    let is_projection = match &e.kind {
+        hir::ExprKind::Local(local) => b.borrowed_bindings.contains_key(local),
+        hir::ExprKind::Field { root, .. } => b.borrowed_bindings.contains_key(root),
+        _ => false,
+    };
+    let mut place = match &e.kind {
+        hir::ExprKind::Local(local) => b.borrowed_bindings.get(local).cloned().unwrap_or(
+            BorrowedPlace {
+                slot: *local,
+                path: Vec::new(),
+                ty: e.ty,
+                cleanup: None,
+            },
+        ),
+        hir::ExprKind::Field { root, path } => {
+            let mut place = b.borrowed_bindings.get(root).cloned().unwrap_or(
+                BorrowedPlace {
+                    slot: *root,
+                    path: Vec::new(),
+                    ty: e.ty,
+                    cleanup: None,
+                },
+            );
+            place
+                .path
+                .extend(path.iter().copied().map(hir::BorrowedPathSegment::StructField));
+            place.ty = e.ty;
+            place
+        }
         _ => unreachable!("sema admitted a non-place borrowed argument"),
     };
-    let path = fields
-        .into_iter()
-        .map(hir::BorrowedPathSegment::StructField)
-        .collect::<Vec<_>>();
     let needs_cleanup = mode == align_ast::ParamMode::BorrowMut
-        && path.is_empty()
+        && !is_projection
+        && place.path.is_empty()
         && needs_drop_flag(e.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types);
     let cleanup = needs_cleanup.then(|| {
-        b.drop_flags[slot as usize]
+        b.drop_flags[place.slot as usize]
             .expect("whole-Move BorrowMut place has a caller-visible cleanup slot")
     });
-    Operand::BorrowedPlace(Box::new(BorrowedPlace {
-        slot,
-        path,
-        ty: e.ty,
-        cleanup,
-    }))
+    place.ty = e.ty;
+    place.cleanup = cleanup;
+    Operand::BorrowedPlace(Box::new(place))
 }
 
 fn borrowed_match_root_place(_b: &Builder, scrutinee: &hir::Expr) -> Option<BorrowedPlace> {
