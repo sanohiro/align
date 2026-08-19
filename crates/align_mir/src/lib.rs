@@ -1586,7 +1586,10 @@ pub enum Operand {
 #[derive(Clone, Debug)]
 pub struct BorrowedPlace {
     pub slot: Slot,
-    pub path: Vec<u32>,
+    /// Canonical projection path from the root slot. Struct fields and sum payloads are kept as
+    /// typed segments so codegen can address a payload in place without first extracting the
+    /// enclosing aggregate by value.
+    pub path: Vec<hir::BorrowedPathSegment>,
     pub ty: Ty,
     /// Caller-side cleanup-bit slot for an exclusive borrow of a whole Move place. `None` for a
     /// shared borrow, a Copy pointee, or a Copy field of a Move aggregate.
@@ -3102,6 +3105,10 @@ struct Builder {
     /// Static per-expression allocation provenance produced by escape analysis. Branch lowering
     /// combines these constants with path-local flags loaded from moved locals.
     drop_individual_exprs: std::collections::HashMap<Span, bool>,
+    /// Match-arm Move bindings that are read-only projections into a stable borrowed sum place.
+    /// These locals have no MIR storage initialization or cleanup; uses resolve directly to the
+    /// retained pointer path while the arm body is lowered.
+    borrowed_bindings: std::collections::HashMap<Slot, BorrowedPlace>,
     /// Tuple defs — to tell whether a `Ty::Tuple` slot is a Move tuple (holds an owned element),
     /// which `null_moved_source` must null on move so its exit `Drop` doesn't double-free.
     tuples: Vec<hir::TupleDef>,
@@ -3517,6 +3524,7 @@ fn lower_fn(
         drop_flags,
         drop_individual_locals: f.drop_individual_locals.clone(),
         drop_individual_exprs: f.drop_individual_exprs.clone(),
+        borrowed_bindings: std::collections::HashMap::new(),
         tuples: tuples.to_vec(),
         structs: structs.to_vec(),
         enums: enums.to_vec(),
@@ -3884,7 +3892,7 @@ fn lower_expr_for_borrow(b: &mut Builder, e: &hir::Expr) -> Operand {
     }
     match &e.kind {
         hir::ExprKind::If { cond, then, els } => lower_if(b, cond, then, els, e.ty, true),
-        hir::ExprKind::Match { scrutinee, arms } => lower_match(b, scrutinee, arms, e.ty, true),
+        hir::ExprKind::Match { scrutinee, arms, .. } => lower_match(b, scrutinee, arms, e.ty, true),
         hir::ExprKind::ElseUnwrap { opt, fallback } => lower_else_unwrap(b, opt, fallback, e.ty, true),
         hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) => {
             lower_block_for_borrow(b, block).unwrap_or(Operand::Const(Const::Unit))
@@ -3977,6 +3985,11 @@ fn lower_borrowed_owned(b: &mut Builder, e: &hir::Expr) -> Operand {
 fn lower_view_retype(b: &mut Builder, operand: Operand, ty: Ty) -> Operand {
     if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
+    }
+    if let Operand::BorrowedPlace(place) = operand {
+        let mut place = *place;
+        place.ty = ty;
+        return Operand::BorrowedPlace(Box::new(place));
     }
     let value = b.fresh_value(ty);
     inherit_borrow_owners(b, value, [&operand]);
@@ -5037,7 +5050,7 @@ fn wildcard_match_parts<'a>(
     b: &Builder,
     expr: &'a hir::Expr,
 ) -> Option<(&'a hir::Expr, &'a hir::Expr)> {
-    let hir::ExprKind::Match { scrutinee, arms } = &expr.kind else {
+    let hir::ExprKind::Match { scrutinee, arms, .. } = &expr.kind else {
         return None;
     };
     let [arm] = arms.as_slice() else {
@@ -5088,7 +5101,7 @@ fn lower_wildcard_match_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
     }
 
     if !started {
-        let hir::ExprKind::Match { scrutinee, arms } = &root.kind else {
+        let hir::ExprKind::Match { scrutinee, arms, .. } = &root.kind else {
             unreachable!("a wildcard match spine starts at Match")
         };
         return lower_match(b, scrutinee, arms, root.ty, false);
@@ -6421,6 +6434,9 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             | hir::ExprKind::HttpStreamFinish { .. } => lower_http(b, e),
             hir::ExprKind::Bool(v) => Operand::Const(Const::Bool(*v)),
             hir::ExprKind::Local(id) => {
+                if let Some(place) = b.borrowed_bindings.get(id) {
+                    return Operand::BorrowedPlace(Box::new(place.clone()));
+                }
                 let v = b.fresh_value(e.ty);
                 b.push(Stmt::Let(v, Rvalue::Load(*id)));
                 Operand::Value(v)
@@ -6566,6 +6582,14 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             hir::ExprKind::Match { .. } => lower_wildcard_match_spine(b, e),
             hir::ExprKind::ResultMapErr { result, f } => lower_map_err(b, result, f, e.ty),
             hir::ExprKind::Field { root, path } => {
+                if let Some(place) = b.borrowed_bindings.get(root) {
+                    let mut place = place.clone();
+                    place
+                        .path
+                        .extend(path.iter().copied().map(hir::BorrowedPathSegment::StructField));
+                    place.ty = e.ty;
+                    return Operand::BorrowedPlace(Box::new(place));
+                }
                 let v = b.fresh_value(e.ty);
                 b.push(Stmt::Let(v, Rvalue::Field(*root, path.clone())));
                 Operand::Value(v)
@@ -7982,24 +8006,94 @@ fn lower_borrowed_place(
     e: &hir::Expr,
     mode: align_ast::ParamMode,
 ) -> Operand {
-    let (slot, path) = match &e.kind {
-        hir::ExprKind::Local(local) => (*local, Vec::new()),
-        hir::ExprKind::Field { root, path } => (*root, path.clone()),
+    let is_projection = match &e.kind {
+        hir::ExprKind::Local(local) => b.borrowed_bindings.contains_key(local),
+        hir::ExprKind::Field { root, .. } => b.borrowed_bindings.contains_key(root),
+        _ => false,
+    };
+    let mut place = match &e.kind {
+        hir::ExprKind::Local(local) => b.borrowed_bindings.get(local).cloned().unwrap_or(
+            BorrowedPlace {
+                slot: *local,
+                path: Vec::new(),
+                ty: e.ty,
+                cleanup: None,
+            },
+        ),
+        hir::ExprKind::Field { root, path } => {
+            let mut place = b.borrowed_bindings.get(root).cloned().unwrap_or(
+                BorrowedPlace {
+                    slot: *root,
+                    path: Vec::new(),
+                    ty: e.ty,
+                    cleanup: None,
+                },
+            );
+            place
+                .path
+                .extend(path.iter().copied().map(hir::BorrowedPathSegment::StructField));
+            place.ty = e.ty;
+            place
+        }
         _ => unreachable!("sema admitted a non-place borrowed argument"),
     };
     let needs_cleanup = mode == align_ast::ParamMode::BorrowMut
-        && path.is_empty()
+        && !is_projection
+        && place.path.is_empty()
         && needs_drop_flag(e.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types);
     let cleanup = needs_cleanup.then(|| {
-        b.drop_flags[slot as usize]
+        b.drop_flags[place.slot as usize]
             .expect("whole-Move BorrowMut place has a caller-visible cleanup slot")
     });
-    Operand::BorrowedPlace(Box::new(BorrowedPlace {
+    place.ty = e.ty;
+    place.cleanup = cleanup;
+    Operand::BorrowedPlace(Box::new(place))
+}
+
+fn borrowed_match_root_place(_b: &Builder, scrutinee: &hir::Expr) -> Option<BorrowedPlace> {
+    let (slot, fields) = match &scrutinee.kind {
+        hir::ExprKind::Local(local) => (*local, Vec::new()),
+        hir::ExprKind::Field { root, path } => (*root, path.clone()),
+        _ => return None,
+    };
+    Some(BorrowedPlace {
         slot,
-        path,
-        ty: e.ty,
-        cleanup,
-    }))
+        path: fields
+            .into_iter()
+            .map(hir::BorrowedPathSegment::StructField)
+            .collect(),
+        ty: scrutinee.ty,
+        cleanup: None,
+    })
+}
+
+fn borrowed_projection_place(
+    b: &Builder,
+    scrutinee: &hir::Expr,
+    projection: &hir::BorrowedProjection,
+) -> Option<BorrowedPlace> {
+    let mut place = borrowed_match_root_place(b, scrutinee)?;
+    if projection.path.first() != Some(&hir::BorrowedPathSegment::RootSlot) {
+        return None;
+    }
+    place.path = projection.path.get(1..)?.to_vec();
+    place.ty = projection.static_ty;
+    place.cleanup = None;
+    Some(place)
+}
+
+fn enter_borrowed_match_arm(b: &mut Builder, scrutinee: &hir::Expr, arm: &hir::MatchArm) {
+    for projection in &arm.borrowed_bindings {
+        if let Some(place) = borrowed_projection_place(b, scrutinee, projection) {
+            b.borrowed_bindings.insert(projection.binding_local, place);
+        }
+    }
+}
+
+fn leave_borrowed_match_arm(b: &mut Builder, arm: &hir::MatchArm) {
+    for projection in &arm.borrowed_bindings {
+        b.borrowed_bindings.remove(&projection.binding_local);
+    }
 }
 
 /// Lower an indirect call out-of-line so temporary-owner propagation does not enlarge the deeply
@@ -15162,12 +15256,28 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
     // A Copy-only binding borrows the sum value, including bound-place arms of a control-flow
     // scrutinee. A Move binding transfers the selected payload, so a control join must own its
     // selected source before extraction.
+    let borrowed_sum = arms.iter().any(|arm| !arm.borrowed_bindings.is_empty())
+        && borrowed_match_root_place(b, scrutinee).is_some();
     let binds_move_payload = arms.iter().flat_map(|arm| &arm.bindings).any(|local| {
-        b.slots.get(*local as usize).is_some_and(|ty| {
-            needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
-        })
+        let projected = arms.iter().any(|arm| {
+            arm.borrowed_bindings
+                .iter()
+                .any(|projection| projection.binding_local == *local)
+        });
+        !projected
+            && b.slots.get(*local as usize).is_some_and(|ty| {
+                needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
+            })
     });
-    let scrut = if binds_move_payload {
+    let scrut = if borrowed_sum {
+        let Some(root) = borrowed_match_root_place(b, scrutinee) else {
+            // `lower_program_checked` rejects this mismatch before MIR construction. Keep the
+            // infallible inspection wrapper fail-closed if a caller bypasses that boundary.
+            b.terminate(Term::Unreachable);
+            return Operand::Const(Const::Unit);
+        };
+        Operand::BorrowedPlace(Box::new(root))
+    } else if binds_move_payload {
         lower_expr(b, scrutinee)
     } else {
         lower_expr_for_borrow(b, scrutinee)
@@ -15306,6 +15416,13 @@ fn lower_match_enum(
     let bind_payload = |b: &mut Builder, arm: &hir::MatchArm| {
         if let [v] = arm.variants[..] {
             for (slot, &local) in arm.bindings.iter().enumerate() {
+                if arm
+                    .borrowed_bindings
+                    .iter()
+                    .any(|projection| projection.binding_local == local)
+                {
+                    continue;
+                }
                 bind_local(b, local, Rvalue::EnumPayload { enum_id, variant: v, slot: slot as u32, operand: scrut.clone() }, scrut_flag.clone());
             }
         }
@@ -15331,9 +15448,14 @@ fn lower_match_enum(
             }
         }
         b.cur = arm_bb;
+        enter_borrowed_match_arm(b, scrutinee, arm);
         bind_payload(b, arm);
         let transfers_payload = arm.bindings.iter().any(|local| {
-            b.slots.get(*local as usize).is_some_and(|ty| {
+            !arm
+                .borrowed_bindings
+                .iter()
+                .any(|projection| projection.binding_local == *local)
+                && b.slots.get(*local as usize).is_some_and(|ty| {
                 needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
             })
         });
@@ -15345,12 +15467,17 @@ fn lower_match_enum(
         let active_may_own = enum_match_arm_may_own(b, enum_id, arm);
         discharge_match_scrutinee(b, scrut_owner, transfers_payload, active_may_own);
         finish_arm(b, &arm.body, result_slot, result_flag, result_temp_flag, join_bb, borrow_result);
+        leave_borrowed_match_arm(b, arm);
         b.cur = next_bb;
     }
     let d = &arms[default_idx];
+    enter_borrowed_match_arm(b, scrutinee, d);
     bind_payload(b, d);
     let transfers_payload = d.bindings.iter().any(|local| {
-        b.slots.get(*local as usize).is_some_and(|ty| {
+        !d.borrowed_bindings
+            .iter()
+            .any(|projection| projection.binding_local == *local)
+            && b.slots.get(*local as usize).is_some_and(|ty| {
             needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
         })
     });
@@ -15360,6 +15487,7 @@ fn lower_match_enum(
     let active_may_own = enum_match_arm_may_own(b, enum_id, d);
     discharge_match_scrutinee(b, scrut_owner, transfers_payload, active_may_own);
     finish_arm(b, &d.body, result_slot, result_flag, result_temp_flag, join_bb, borrow_result);
+    leave_borrowed_match_arm(b, d);
 }
 
 /// Builtin `Option`/`Result` (exactly two variants): one boolean branch on `IsSome`/`IsOk`, the
@@ -15402,9 +15530,14 @@ fn lower_match_binary(
     let neg_bb = b.new_block();
     b.terminate(Term::Branch(Operand::Value(cond), pos_bb, neg_bb));
     b.cur = pos_bb;
+    enter_borrowed_match_arm(b, scrutinee, pos);
     bind_binary(b, ty, true, pos, scrut, scrut_flag.clone());
     let pos_transfers = pos.bindings.iter().any(|local| {
-        b.slots.get(*local as usize).is_some_and(|ty| {
+        !pos
+            .borrowed_bindings
+            .iter()
+            .any(|projection| projection.binding_local == *local)
+            && b.slots.get(*local as usize).is_some_and(|ty| {
             needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
         })
     });
@@ -15416,10 +15549,16 @@ fn lower_match_binary(
     let pos_may_own = binary_match_arm_may_own(b, ty, true);
     discharge_match_scrutinee(b, scrut_owner, pos_transfers, pos_may_own);
     finish_arm(b, &pos.body, result_slot, result_flag, result_temp_flag, join_bb, borrow_result);
+    leave_borrowed_match_arm(b, pos);
     b.cur = neg_bb;
+    enter_borrowed_match_arm(b, scrutinee, neg);
     bind_binary(b, ty, false, neg, scrut, scrut_flag);
     let neg_transfers = neg.bindings.iter().any(|local| {
-        b.slots.get(*local as usize).is_some_and(|ty| {
+        !neg
+            .borrowed_bindings
+            .iter()
+            .any(|projection| projection.binding_local == *local)
+            && b.slots.get(*local as usize).is_some_and(|ty| {
             needs_drop_flag(*ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
         })
     });
@@ -15429,6 +15568,7 @@ fn lower_match_binary(
     let neg_may_own = binary_match_arm_may_own(b, ty, false);
     discharge_match_scrutinee(b, scrut_owner, neg_transfers, neg_may_own);
     finish_arm(b, &neg.body, result_slot, result_flag, result_temp_flag, join_bb, borrow_result);
+    leave_borrowed_match_arm(b, neg);
 }
 
 /// Discharge the hidden owner of a fresh/materialized match scrutinee on the selected arm.
@@ -15501,6 +15641,11 @@ fn binary_match_arm_may_own(b: &Builder, ty: Ty, positive: bool) -> bool {
 fn bind_binary(b: &mut Builder, ty: Ty, is_pos: bool, arm: &hir::MatchArm, scrut: &Operand, scrut_flag: Option<Operand>) {
     // A wildcard / or-pattern arm binds nothing (no bindings); only a single Some/Ok/Err arm does.
     if arm.bindings.is_empty() {
+        return;
+    }
+    if arm.borrowed_bindings.iter().any(|projection| {
+        projection.binding_local == arm.bindings[0]
+    }) {
         return;
     }
     let rv = match (ty, is_pos) {
@@ -16578,6 +16723,7 @@ fn main() -> i32 {
             drop_flags: Vec::new(),
             drop_individual_locals: Default::default(),
             drop_individual_exprs: Default::default(),
+            borrowed_bindings: Default::default(),
             tuples: Vec::new(),
             structs: Vec::new(),
             enums: Vec::new(),

@@ -1137,7 +1137,7 @@ impl<'a> Analyzer<'a> {
                             report,
                         });
                     }
-                    ExprKind::Match { scrutinee, arms } => {
+                    ExprKind::Match { scrutinee, arms, .. } => {
                         let Some(site) = self.site(expr) else {
                             last = Flow::dead();
                             continue;

@@ -219,13 +219,69 @@ pub enum ReturnRegionSummary {
     Roots { params: Vec<u32>, captures: Vec<u32> },
 }
 
+/// The segment of a stable place used by the checked borrowed-sum projection record.
+///
+/// `RootSlot` is explicit in the checked record even though MIR keeps the root slot in a separate
+/// field. Keeping it in the canonical path makes forged or stale records unambiguous at the HIR
+/// validation boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum BorrowedPathSegment {
+    RootSlot,
+    StructField(u32),
+    EnumPayload { variant: u32, payload_ordinal: u32 },
+    OptionSome,
+    ResultOk,
+    ResultErr,
+}
+
+/// One producer-owned borrow root fact attached to a checked borrowed sum place.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BorrowedRootFact {
+    pub kind: BorrowedRootKind,
+    pub ordinal: u32,
+    pub path: Vec<BorrowedPathSegment>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum BorrowedRootKind {
+    Local,
+    Param,
+    ParamStorage,
+}
+
+/// Exact checked metadata for a match scrutinee whose storage is already owned by a stable
+/// borrowed place. This is intentionally narrower than a general borrow expression: the producer
+/// records only a direct borrowed parameter or a checked struct-field path rooted in one.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BorrowedMatchPlace {
+    pub root_local: LocalId,
+    pub root_struct_path: Vec<u32>,
+    pub sum_ty: Ty,
+    pub mode: align_ast::ParamMode,
+    pub owner_fact: Vec<BorrowedRootFact>,
+}
+
+/// One Move payload binding lowered as a read-only projection. The static type is retained for
+/// field/method checking; the runtime representation remains a pointer into the root place.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BorrowedProjection {
+    pub binding_local: LocalId,
+    pub variant: u32,
+    pub payload_ordinal: u32,
+    pub static_ty: Ty,
+    pub path: Vec<BorrowedPathSegment>,
+}
+
 /// One checked `match` arm. `variants` = the covered variant tags: empty = the `_` wildcard, one
 /// = a simple arm, many = an or-pattern (`A | B`). `bindings` are the locals bound to the variant's
-/// payload (one per payload slot, in order); an or-pattern / wildcard binds nothing.
+/// payload (one per payload slot, in order); an or-pattern / wildcard binds nothing. A non-empty
+/// `borrowed_bindings` list marks Move payload bindings that are read-only projections into the
+/// exact stable place recorded by the enclosing `ExprKind::Match`.
 #[derive(Clone, Debug)]
 pub struct MatchArm {
     pub variants: Vec<u32>,
     pub bindings: Vec<crate::LocalId>,
+    pub borrowed_bindings: Vec<BorrowedProjection>,
     pub body: Expr,
 }
 
@@ -494,7 +550,11 @@ pub enum ExprKind {
     EnumValue { enum_id: u32, variant: u32, payload: Vec<Expr> },
     /// `match scrutinee { … }` — exhaustive match over a sum type. `arms` are in source order; a
     /// `variant` of `None` is the `_` wildcard. The expression's value is the matched arm's value.
-    Match { scrutinee: Box<Expr>, arms: Vec<MatchArm> },
+    Match {
+        scrutinee: Box<Expr>,
+        arms: Vec<MatchArm>,
+        borrowed_place: Option<BorrowedMatchPlace>,
+    },
     /// `result.map_err(f)` — map a `Result`'s error with `f: fn(E) -> E'` (`Ok` passes through).
     ResultMapErr { result: Box<Expr>, f: Box<Expr> },
     /// `spawn(fn { … })` — defer a task; `closure` is the spawned closure value. `fallible` = the

@@ -1262,6 +1262,152 @@ pub fn expand_tagged_ty(ty: Ty, tagged_types: &[hir::TaggedType]) -> Ty {
     }
 }
 
+/// Whether a sum payload may be exposed as a read-only projection from a stable borrowed place.
+///
+/// This is deliberately a closed, cycle-safe classifier. It admits primitive values and views,
+/// owned `string`, and finite acyclic structs/sums whose reachable payload graph stays within the
+/// same set. Aggregate buffers, builders, boxes, resources, and opaque handles remain outside the
+/// first borrowed-sum capability because their projection/drop/escape contracts are not defined.
+pub fn borrowed_sum_payload_is_admissible(
+    ty: Ty,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    fn visit(
+        ty: Ty,
+        structs: &[StructDef],
+        enums: &[hir::EnumDef],
+        tagged_types: &[hir::TaggedType],
+        active_structs: &mut HashSet<u32>,
+        active_enums: &mut HashSet<u32>,
+        active_tagged: &mut HashSet<u32>,
+    ) -> bool {
+        match ty {
+            Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Unit | Ty::Str | Ty::String
+            | Ty::Slice(_) | Ty::Soa(_) | Ty::Raw | Ty::Rng => true,
+            Ty::Struct(id) => {
+                if !active_structs.insert(id) {
+                    return false;
+                }
+                let result = structs.get(id as usize).is_some_and(|definition| {
+                    definition.fields.iter().all(|field| {
+                        visit(
+                            field.ty,
+                            structs,
+                            enums,
+                            tagged_types,
+                            active_structs,
+                            active_enums,
+                            active_tagged,
+                        )
+                    })
+                });
+                active_structs.remove(&id);
+                result
+            }
+            Ty::Enum(id) => {
+                if !active_enums.insert(id) {
+                    return false;
+                }
+                let result = enums.get(id as usize).is_some_and(|definition| {
+                    definition.variants.iter().all(|variant| {
+                        variant.payload.iter().copied().map(scalar_to_ty).all(|payload| {
+                            visit(
+                                payload,
+                                structs,
+                                enums,
+                                tagged_types,
+                                active_structs,
+                                active_enums,
+                                active_tagged,
+                            )
+                        })
+                    })
+                });
+                active_enums.remove(&id);
+                result
+            }
+            Ty::Option(payload) => visit(
+                scalar_to_ty(payload),
+                structs,
+                enums,
+                tagged_types,
+                active_structs,
+                active_enums,
+                active_tagged,
+            ),
+            Ty::Result(ok, err) => {
+                visit(
+                    scalar_to_ty(ok),
+                    structs,
+                    enums,
+                    tagged_types,
+                    active_structs,
+                    active_enums,
+                    active_tagged,
+                ) && visit(
+                    scalar_to_ty(err),
+                    structs,
+                    enums,
+                    tagged_types,
+                    active_structs,
+                    active_enums,
+                    active_tagged,
+                )
+            }
+            Ty::Tagged(id) => {
+                if !active_tagged.insert(id) {
+                    return false;
+                }
+                let result = tagged_types.get(id as usize).is_some_and(|tagged| match *tagged {
+                    hir::TaggedType::Option(payload) => visit(
+                        scalar_to_ty(payload),
+                        structs,
+                        enums,
+                        tagged_types,
+                        active_structs,
+                        active_enums,
+                        active_tagged,
+                    ),
+                    hir::TaggedType::Result(ok, err) => {
+                        visit(
+                            scalar_to_ty(ok),
+                            structs,
+                            enums,
+                            tagged_types,
+                            active_structs,
+                            active_enums,
+                            active_tagged,
+                        ) && visit(
+                            scalar_to_ty(err),
+                            structs,
+                            enums,
+                            tagged_types,
+                            active_structs,
+                            active_enums,
+                            active_tagged,
+                        )
+                    }
+                });
+                active_tagged.remove(&id);
+                result
+            }
+            _ => false,
+        }
+    }
+
+    visit(
+        ty,
+        structs,
+        enums,
+        tagged_types,
+        &mut HashSet::new(),
+        &mut HashSet::new(),
+        &mut HashSet::new(),
+    )
+}
+
 fn intern_tagged_type(tagged_types: &mut Vec<hir::TaggedType>, tagged: hir::TaggedType) -> u32 {
     tagged_types
         .iter()
@@ -8353,6 +8499,7 @@ fn run_body_analysis_passes(
             borrow_fact_cache: std::cell::RefCell::new(None),
             collecting_move_children: false,
             move_children: Vec::new(),
+            borrowed_projection_locals: borrowed_projection_locals(&f.body),
         }
         .check();
         let (region, drop_individual, drop_individual_exprs) = {
@@ -8372,6 +8519,7 @@ fn run_body_analysis_passes(
                 drop_individual: std::collections::HashMap::new(),
                 drop_individual_exprs: std::collections::HashMap::new(),
                 decl_depth: std::collections::HashMap::new(),
+                borrowed_projection_locals: borrowed_projection_locals(&f.body),
                 task_group_regions: Vec::new(),
                 allocation_regions: Vec::new(),
                 allocation_region_by_expr: std::collections::HashMap::new(),
@@ -8399,11 +8547,13 @@ fn run_body_analysis_passes(
                     .then_some(local)
             })
             .collect::<std::collections::HashSet<_>>();
+        let borrowed_projection_locals = borrowed_projection_locals(&f.body);
         let drops: Vec<LocalId> = f
             .locals
             .iter()
             .filter(|l| {
                 !borrowed_params.contains(&l.id)
+                    && !borrowed_projection_locals.contains(&l.id)
                     && (is_owned_droppable(l.ty, structs, enums, tagged_types)
                         || ty_tuple_is_move(l.ty, tuples))
             })
@@ -8547,8 +8697,273 @@ pub fn checked_hir_body_facts_are_valid(program: &hir::Program) -> bool {
     .unwrap_or(false)
 }
 
+fn borrowed_match_variants(
+    ty: Ty,
+    program: &hir::Program,
+) -> Option<Vec<Vec<Scalar>>> {
+    match expand_tagged_ty(ty, &program.tagged_types) {
+        Ty::Enum(id) => program
+            .enums
+            .get(id as usize)
+            .map(|definition| definition.variants.iter().map(|variant| variant.payload.clone()).collect()),
+        Ty::Option(payload) => Some(vec![vec![payload], Vec::new()]),
+        Ty::Result(ok, err) => Some(vec![vec![ok], vec![err]]),
+        _ => None,
+    }
+}
+
+fn borrowed_match_projection_path(
+    sum_ty: Ty,
+    program: &hir::Program,
+    root_struct_path: &[u32],
+    variant: u32,
+    payload_ordinal: u32,
+) -> Option<Vec<hir::BorrowedPathSegment>> {
+    let mut path = Vec::with_capacity(root_struct_path.len() + 2);
+    path.push(hir::BorrowedPathSegment::RootSlot);
+    path.extend(
+        root_struct_path
+            .iter()
+            .copied()
+            .map(hir::BorrowedPathSegment::StructField),
+    );
+    match expand_tagged_ty(sum_ty, &program.tagged_types) {
+        Ty::Enum(_) => path.push(hir::BorrowedPathSegment::EnumPayload {
+            variant,
+            payload_ordinal,
+        }),
+        Ty::Option(_) if variant == 0 && payload_ordinal == 0 => {
+            path.push(hir::BorrowedPathSegment::OptionSome)
+        }
+        Ty::Result(..) if variant == 0 && payload_ordinal == 0 => {
+            path.push(hir::BorrowedPathSegment::ResultOk)
+        }
+        Ty::Result(..) if variant == 1 && payload_ordinal == 0 => {
+            path.push(hir::BorrowedPathSegment::ResultErr)
+        }
+        _ => return None,
+    }
+    Some(path)
+}
+
+/// Validate the producer-owned borrowed-sum records independently of replayed body facts. This is
+/// deliberately kept at the checked-HIR boundary: MIR/codegen may trust the record only after the
+/// exact parameter root, field path, payload grammar, ordinals, and projection-only cleanup
+/// invariants have all been replayed from the canonical program tables.
+fn borrowed_match_metadata_is_valid(program: &hir::Program) -> bool {
+    for function in &program.fns {
+        let mut projection_locals = std::collections::HashSet::new();
+        for event in hir_depth::body_events(&function.body) {
+            let hir_depth::BodyEvent::ExprEnter(Expr {
+                kind:
+                    ExprKind::Match {
+                        scrutinee,
+                        arms,
+                        borrowed_place,
+                    },
+                ..
+            }) = event
+            else {
+                continue;
+            };
+            let stable = stable_borrowed_match_place_for_fn_with_program(
+                function,
+                scrutinee,
+                scrutinee.ty,
+                program,
+            );
+            let Some(variants) = borrowed_match_variants(scrutinee.ty, program) else {
+                return false;
+            };
+            let mut any_projection = false;
+            for arm in arms {
+                if arm
+                    .bindings
+                    .iter()
+                    .any(|binding| function.locals.get(*binding as usize).is_none())
+                {
+                    return false;
+                }
+                let mut expected = Vec::new();
+                if arm.variants.len() > 1 && !arm.bindings.is_empty() {
+                    return false;
+                }
+                if arm.variants.is_empty() && !arm.bindings.is_empty() {
+                    return false;
+                }
+                if let [variant] = arm.variants.as_slice() {
+                    let Some(payloads) = variants.get(*variant as usize) else {
+                        return false;
+                    };
+                    if payloads.len() != arm.bindings.len() {
+                        return false;
+                    }
+                    for (ordinal, binding) in arm.bindings.iter().copied().enumerate() {
+                        let Some(&scalar) = payloads.get(ordinal) else { return false };
+                        let static_ty = scalar_to_ty(scalar);
+                        let resolved_static_ty = expand_tagged_ty(static_ty, &program.tagged_types);
+                        if function
+                            .locals
+                            .get(binding as usize)
+                            .is_none_or(|local| {
+                                expand_tagged_ty(local.ty, &program.tagged_types)
+                                    != resolved_static_ty
+                            })
+                        {
+                            return false;
+                        }
+                        let is_move = ty_is_move(
+                            static_ty,
+                            &program.structs,
+                            &program.tuples,
+                            &program.enums,
+                            &program.tagged_types,
+                        );
+                        let admissible = borrowed_sum_payload_is_admissible(
+                            static_ty,
+                            &program.structs,
+                            &program.enums,
+                            &program.tagged_types,
+                        );
+                        if stable.is_some() && is_move && !admissible {
+                            // The producer rejects this shape before checked HIR exists. Keep the
+                            // independent validator equally strict so a forged mixed arm cannot
+                            // route an unsupported Move payload through borrowed MIR lowering.
+                            return false;
+                        }
+                        if is_move && admissible {
+                            let Some(place) = stable.as_ref() else { continue };
+                            let Some(path) = borrowed_match_projection_path(
+                                scrutinee.ty,
+                                program,
+                                &place.root_struct_path,
+                                *variant,
+                                ordinal as u32,
+                            ) else {
+                                return false;
+                            };
+                            expected.push(hir::BorrowedProjection {
+                                binding_local: binding,
+                                variant: *variant,
+                                payload_ordinal: ordinal as u32,
+                                static_ty,
+                                path,
+                            });
+                        }
+                    }
+                }
+                if arm.borrowed_bindings != expected {
+                    return false;
+                }
+                if arm
+                    .borrowed_bindings
+                    .windows(2)
+                    .any(|pair| pair[0].payload_ordinal >= pair[1].payload_ordinal)
+                {
+                    return false;
+                }
+                for projection in &arm.borrowed_bindings {
+                    if !projection_locals.insert(projection.binding_local) {
+                        return false;
+                    }
+                }
+                any_projection |= !arm.borrowed_bindings.is_empty();
+            }
+            if borrowed_place.is_some() != any_projection {
+                return false;
+            }
+            if any_projection && borrowed_place.as_ref() != stable.as_ref() {
+                return false;
+            }
+        }
+        if function
+            .drop_locals
+            .iter()
+            .chain(function.drop_individual_locals.iter())
+            .any(|local| projection_locals.contains(local))
+        {
+            return false;
+        }
+        let projection_expr_spans = hir_depth::body_events(&function.body)
+            .into_iter()
+            .filter_map(|event| match event {
+                hir_depth::BodyEvent::ExprEnter(expression)
+                    if matches!(
+                        &expression.kind,
+                        ExprKind::Local(local) if projection_locals.contains(local)
+                    )
+                    || matches!(
+                        &expression.kind,
+                        ExprKind::Field { root, .. } if projection_locals.contains(root)
+                    ) => Some(expression.span),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        if function
+            .drop_individual_exprs
+            .keys()
+            .any(|span| projection_expr_spans.contains(span))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn stable_borrowed_match_place_for_fn_with_program(
+    function: &hir::Fn,
+    scrutinee: &hir::Expr,
+    sum_ty: Ty,
+    program: &hir::Program,
+) -> Option<hir::BorrowedMatchPlace> {
+    let (root_local, root_struct_path) = match &scrutinee.kind {
+        ExprKind::Local(local) => (*local, Vec::new()),
+        ExprKind::Field { root, path } => (*root, path.clone()),
+        _ => return None,
+    };
+    let position = function.params.iter().position(|local| *local == root_local)?;
+    let mode = *function.param_modes.get(position)?;
+    if !matches!(mode, ast::ParamMode::Borrow | ast::ParamMode::BorrowMut) {
+        return None;
+    }
+    let mut ty = function.locals.get(root_local as usize)?.ty;
+    for field in &root_struct_path {
+        let Ty::Struct(id) = ty else { return None };
+        ty = program
+            .structs
+            .get(id as usize)
+            .and_then(|definition| definition.fields.get(*field as usize))
+            .map(|field| field.ty)?;
+    }
+    if ty != sum_ty {
+        return None;
+    }
+    let mut path = Vec::with_capacity(root_struct_path.len() + 1);
+    path.push(hir::BorrowedPathSegment::RootSlot);
+    path.extend(
+        root_struct_path
+            .iter()
+            .copied()
+            .map(hir::BorrowedPathSegment::StructField),
+    );
+    Some(hir::BorrowedMatchPlace {
+        root_local,
+        root_struct_path,
+        sum_ty,
+        mode,
+        owner_fact: vec![hir::BorrowedRootFact {
+            kind: hir::BorrowedRootKind::Param,
+            ordinal: position as u32,
+            path,
+        }],
+    })
+}
+
 fn checked_hir_body_facts_are_valid_impl(program: &hir::Program) -> bool {
     if !hir_depth::checked_hir_body_depth_is_valid(program) {
+        return false;
+    }
+    if !borrowed_match_metadata_is_valid(program) {
         return false;
     }
     let Some(mut replay) = replay_clone::clone_program(program) else {
@@ -8664,6 +9079,7 @@ fn body_analysis_facts_equal(expected: &hir::Program, actual: &Program) -> bool 
             || expected.drop_locals != actual.drop_locals
             || expected.drop_individual_locals != actual.drop_individual_locals
             || expected.drop_individual_exprs != actual.drop_individual_exprs
+            || !borrowed_match_metadata_equal(&expected.body, &actual.body)
             || assignment_facts(expected) != assignment_facts(actual)
             || sqlite_callback_descriptor_facts(expected)
                 != sqlite_callback_descriptor_facts(actual)
@@ -8676,6 +9092,53 @@ fn body_analysis_facts_equal(expected: &hir::Program, actual: &Program) -> bool 
         .iter()
         .zip(&actual.fn_types)
         .all(|(expected, actual)| expected.effect.get() == actual.effect.get())
+}
+
+fn borrowed_match_metadata_equal(expected: &hir::Block, actual: &hir::Block) -> bool {
+    let expected_matches = hir_depth::body_events(expected)
+        .into_iter()
+        .filter_map(|event| match event {
+            hir_depth::BodyEvent::ExprEnter(Expr {
+                kind:
+                    ExprKind::Match {
+                        borrowed_place,
+                        arms,
+                        ..
+                    },
+                ..
+            }) => Some((borrowed_place, arms)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let actual_matches = hir_depth::body_events(actual)
+        .into_iter()
+        .filter_map(|event| match event {
+            hir_depth::BodyEvent::ExprEnter(Expr {
+                kind:
+                    ExprKind::Match {
+                        borrowed_place,
+                        arms,
+                        ..
+                    },
+                ..
+            }) => Some((borrowed_place, arms)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    expected_matches.len() == actual_matches.len()
+        && expected_matches
+            .iter()
+            .zip(actual_matches)
+            .all(|((expected_place, expected_arms), (actual_place, actual_arms))| {
+                **expected_place == *actual_place
+                    && expected_arms.len() == actual_arms.len()
+                    && expected_arms
+                        .iter()
+                        .zip(actual_arms)
+                        .all(|(expected, actual)| {
+                            expected.borrowed_bindings == actual.borrowed_bindings
+                        })
+            })
 }
 
 fn sqlite_callback_descriptor_facts(
@@ -9265,6 +9728,7 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
             borrow_fact_cache: std::cell::RefCell::new(None),
             collecting_move_children: false,
             move_children: Vec::new(),
+            borrowed_projection_locals: borrowed_projection_locals(&function.body),
         }
         .check();
         if !dependencies_recorded[index] {
@@ -12822,7 +13286,7 @@ impl EffectScan<'_> {
                     walk!(p);
                 }
             }
-            ExprKind::Match { scrutinee, arms } => {
+            ExprKind::Match { scrutinee, arms, .. } => {
                 walk!(scrutinee);
                 return arms
                     .iter()
@@ -13122,6 +13586,7 @@ enum EscapeFlowOp<'a> {
     MatchBindings {
         scrutinee: &'a Expr,
         bindings: &'a [LocalId],
+        borrowed_bindings: &'a [hir::BorrowedProjection],
         depth: u32,
     },
     ArenaExit {
@@ -13324,6 +13789,10 @@ struct EscapeCheck<'a> {
     /// Exact semantic region represented by each explicit named-arena capability local. Local ids
     /// are function-unique, so entries remain usable by later HIR queries after lexical exit.
     region_capabilities: std::collections::HashMap<LocalId, Region>,
+    /// Locals introduced as read-only projections of a borrowed sum payload. They are aliases for
+    /// caller-owned storage, not frame-owned bindings, so an auto-borrow of one must retain the
+    /// borrowed root's returnable lifetime.
+    borrowed_projection_locals: std::collections::HashSet<LocalId>,
     /// Compact checked-HIR CFG built before solving escape state.
     flow: EscapeFlowCfg<'a>,
     /// Block currently receiving lowered escape operations.
@@ -13344,6 +13813,9 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::Field { root, .. } => *root,
             _ => return false,
         };
+        if self.borrowed_projection_locals.contains(&root) {
+            return true;
+        }
         self.f
             .params
             .iter()
@@ -13359,6 +13831,18 @@ impl<'a> EscapeCheck<'a> {
             Region::Static
         } else {
             Region::Frame
+        }
+    }
+
+    /// A projection-only match binding aliases caller-owned sum storage. It has no independent
+    /// allocation provenance, even when its static type is a Drop-bearing Move type. Keep this
+    /// predicate limited to places rooted at the binding; a call or control-flow result using the
+    /// binding may itself produce a fresh owned value and still needs ordinary tracking.
+    fn is_borrowed_projection_place(&self, expression: &Expr) -> bool {
+        match &expression.kind {
+            ExprKind::Local(local) => self.borrowed_projection_locals.contains(local),
+            ExprKind::Field { root, .. } => self.borrowed_projection_locals.contains(root),
+            _ => false,
         }
     }
 
@@ -13533,8 +14017,9 @@ impl<'a> EscapeCheck<'a> {
             EscapeFlowOp::MatchBindings {
                 scrutinee,
                 bindings,
+                borrowed_bindings,
                 depth,
-            } => self.apply_match_bindings(scrutinee, bindings, depth),
+            } => self.apply_match_bindings(scrutinee, bindings, borrowed_bindings, depth),
             EscapeFlowOp::ArenaExit {
                 value,
                 value_depth,
@@ -14399,6 +14884,13 @@ impl<'a> EscapeCheck<'a> {
                     }
                 }
                 Work::Record(expression) => {
+                    if self.is_borrowed_projection_place(expression) {
+                        // Projection-only bindings are aliases for the borrowed sum storage, not
+                        // independently owned expressions. In particular, do not publish a
+                        // drop_individual_exprs entry that would make MIR attach a cleanup bit to
+                        // a pointer into the caller's aggregate.
+                        continue;
+                    }
                     let individual = *values.last().expect("ownership expression result");
                     // The same syntax node can be replayed at more than one CFG state. Retain the
                     // conservative conjunction; runtime local moves do not consume this static entry.
@@ -16473,7 +16965,7 @@ impl<'a> EscapeCheck<'a> {
                                 });
                             }
                         }
-                        ExprKind::Match { scrutinee, arms } => {
+                        ExprKind::Match { scrutinee, arms, .. } => {
                             work.push(EscapeWalkItem::ExprExit(expression, depth));
                             work.push(EscapeWalkItem::MatchAfterScrutinee {
                                 scrutinee,
@@ -16824,6 +17316,7 @@ impl<'a> EscapeCheck<'a> {
                     self.push_flow_op(EscapeFlowOp::MatchBindings {
                         scrutinee,
                         bindings: &arm.bindings,
+                        borrowed_bindings: &arm.borrowed_bindings,
                         depth,
                     });
                     work.push(EscapeWalkItem::MatchArmDone { arm, join });
@@ -17438,6 +17931,7 @@ impl<'a> EscapeCheck<'a> {
         &mut self,
         scrutinee: &Expr,
         bindings: &[LocalId],
+        borrowed_bindings: &[hir::BorrowedProjection],
         depth: u32,
     ) {
         let region = self
@@ -17449,6 +17943,12 @@ impl<'a> EscapeCheck<'a> {
             self.mentions_slice(scrutinee.ty) && self.slice_is_local(scrutinee);
         for binding in bindings {
             self.decl_depth.insert(*binding, depth);
+            if borrowed_bindings
+                .iter()
+                .any(|projection| projection.binding_local == *binding)
+            {
+                continue;
+            }
             if self.f.locals.get(*binding as usize).is_some_and(|local| {
                 is_owned_droppable(local.ty, self.structs, self.enums, self.tagged_types)
                     || ty_tuple_is_move(local.ty, self.tuples)
@@ -18453,7 +18953,7 @@ fn hir_diverges(root: HirDivergenceNode<'_>) -> bool {
                     | ExprKind::Unsafe(block) => {
                         work.push(HirDivergenceWork::Eval(HirDivergenceNode::Block(block)));
                     }
-                    ExprKind::Match { scrutinee, arms } if !arms.is_empty() => {
+                    ExprKind::Match { scrutinee, arms, .. } if !arms.is_empty() => {
                         // The scrutinee is strict; arm bodies are alternatives.
                         work.push(HirDivergenceWork::Any(2));
                         work.push(HirDivergenceWork::All(arms.len()));
@@ -18610,6 +19110,10 @@ struct MoveCheck<'a> {
     /// being lowered onto the explicit Move worklist.
     collecting_move_children: bool,
     move_children: Vec<(&'a Expr, bool, bool)>,
+    /// Locals introduced as read-only projections of a borrowed sum payload. These locals are
+    /// initialized per arm but never own an independent value, so any consuming use must be
+    /// rejected and no Drop slot may be derived for them.
+    borrowed_projection_locals: std::collections::HashSet<LocalId>,
 }
 
 /// What has been moved out of a local. A whole-local move (`a := xs`, `f(xs)`, destructure) and a
@@ -19164,6 +19668,20 @@ fn clear_moved(moved: &mut MovedSet, id: LocalId) {
     moved.retain(|k| !matches!(k, MovedKey::Whole(l) | MovedKey::Field(l, _) if *l == id));
 }
 
+fn borrowed_projection_locals(body: &hir::Block) -> std::collections::HashSet<LocalId> {
+    let mut locals = std::collections::HashSet::new();
+    for event in hir_depth::body_events(body) {
+        if let hir_depth::BodyEvent::MatchArmEnter { arm, .. } = event {
+            locals.extend(
+                arm.borrowed_bindings
+                    .iter()
+                    .map(|projection| projection.binding_local),
+            );
+        }
+    }
+    locals
+}
+
 macro_rules! move_expr {
     ($checker:expr, $expression:expr, $moved:expr, $consuming:expr, $direct:expr $(,)?) => {
         if !$checker.expr($expression, $moved, $consuming, $direct) {
@@ -19173,6 +19691,16 @@ macro_rules! move_expr {
 }
 
 impl<'a> MoveCheck<'a> {
+    fn arm_moves_payload(&self, arm: &MatchArm) -> bool {
+        arm.bindings.iter().any(|binding| {
+            self.is_move(*binding)
+                && !arm
+                    .borrowed_bindings
+                    .iter()
+                    .any(|projection| projection.binding_local == *binding)
+        })
+    }
+
     fn check(mut self) -> MoveCheckResult {
         for (position, &local) in self.f.params.iter().enumerate() {
             let mode = self
@@ -22119,6 +22647,13 @@ impl<'a> MoveCheck<'a> {
         loop {
             match &expression.kind {
                 ExprKind::Local(id) if self.is_move(*id) => {
+                    if self.borrowed_projection_locals.contains(id) {
+                        self.diags.error(
+                            "cannot move a borrowed match payload projection".to_string(),
+                            expression.span,
+                        );
+                        return;
+                    }
                     if self.borrowed_param_mode(*id).is_some() {
                         let name = &self.f.locals[*id as usize].name;
                         self.diags.error(
@@ -22167,6 +22702,14 @@ impl<'a> MoveCheck<'a> {
                                 )
                         )
                     {
+                        if self.borrowed_projection_locals.contains(root) {
+                            self.diags.error(
+                                "cannot move a field out of a borrowed match payload projection"
+                                    .to_string(),
+                                expression.span,
+                            );
+                            return;
+                        }
                         if self.borrowed_param_mode(*root).is_some() {
                             let name = &self.f.locals[*root as usize].name;
                             self.diags.error(
@@ -23165,13 +23708,10 @@ impl<'a> MoveCheck<'a> {
                         };
                         (child, true, false, false, Post::None)
                     }
-                    ExprKind::Match { scrutinee, arms }
+                    ExprKind::Match { scrutinee, arms, .. }
                         if !arms.is_empty() =>
                     {
-                        let has_move_binding = arms
-                            .iter()
-                            .flat_map(|arm| &arm.bindings)
-                            .any(|binding| self.is_move(*binding));
+                        let has_move_binding = arms.iter().any(|arm| self.arm_moves_payload(arm));
                         let consuming_control = has_move_binding
                             && match_scrutinee_materializes_result(
                                 scrutinee,
@@ -24441,10 +24981,7 @@ impl<'a> MoveCheck<'a> {
     ) -> MoveMatchPrepared {
         let evaluated = moved.clone();
         let evaluated_borrows = self.borrows.clone();
-        let has_move_binding = arms
-            .iter()
-            .flat_map(|arm| &arm.bindings)
-            .any(|binding| self.is_move(*binding));
+        let has_move_binding = arms.iter().any(|arm| self.arm_moves_payload(arm));
         let (consumed, consumed_borrows) = if has_move_binding {
             if consuming_control {
                 (
@@ -24516,10 +25053,7 @@ impl<'a> MoveCheck<'a> {
         arm: &MatchArm,
         moved: &mut MovedSet,
     ) {
-        let arm_moves_payload = arm
-            .bindings
-            .iter()
-            .any(|binding| self.is_move(*binding));
+        let arm_moves_payload = self.arm_moves_payload(arm);
         *moved = if arm_moves_payload {
             prepared
                 .consumed
@@ -24769,6 +25303,13 @@ impl<'a> MoveCheck<'a> {
                 } else {
                     self.check_borrow_use(*id, e.span);
                     if consuming && self.is_move(*id) {
+                        if self.borrowed_projection_locals.contains(id) {
+                            self.diags.error(
+                                "cannot move a borrowed match payload projection".to_string(),
+                                e.span,
+                            );
+                            return true;
+                        }
                         if self.borrowed_param_mode(*id).is_some() {
                             let name = &self.f.locals[*id as usize].name;
                             self.diags.error(
@@ -24819,6 +25360,14 @@ impl<'a> MoveCheck<'a> {
                             || is_move_handle(e.ty)
                             || matches!(e.ty, Ty::Enum(id) if enum_is_move(id, self.structs, self.enums, self.tagged_types)))
                     {
+                        if self.borrowed_projection_locals.contains(base) {
+                            self.diags.error(
+                                "cannot move a field out of a borrowed match payload projection"
+                                    .to_string(),
+                                e.span,
+                            );
+                            return true;
+                        }
                         if self.borrowed_param_mode(*base).is_some() {
                             let name = &self.f.locals[*base as usize].name;
                             self.diags.error(
@@ -25407,7 +25956,7 @@ impl<'a> MoveCheck<'a> {
                     move_expr!(self, p, moved, true, true);
                 }
             }
-            ExprKind::Match { scrutinee, arms } => {
+            ExprKind::Match { scrutinee, arms, .. } => {
                 // Arms are mutually exclusive, so each is checked in the *same* incoming state:
                 // clone `moved` per arm and join, exactly like `if`/`else` generalised to N arms.
                 // Without this the arms share one set, so a value consumed in arm A is wrongly seen
@@ -25421,10 +25970,7 @@ impl<'a> MoveCheck<'a> {
                 // path-local `null_moved_source`. Non-binding/Copy arms retain the incoming state.
                 // This single walk also emits any use-after-move or unsupported conditional-move
                 // diagnostic once rather than once per arm.
-                let has_move_binding = arms
-                    .iter()
-                    .flat_map(|arm| &arm.bindings)
-                    .any(|binding| self.is_move(*binding));
+                let has_move_binding = arms.iter().any(|arm| self.arm_moves_payload(arm));
                 // Evaluate once for every arm. If a Move payload can be extracted, derive its
                 // transfer state in that same walk for a control-joined scrutinee; a direct place
                 // stays borrowed until the selected Move-binding arm extracts it.
@@ -25462,7 +26008,7 @@ impl<'a> MoveCheck<'a> {
                 let mut joined: Option<MovedSet> = None;
                 let mut joined_borrows: Option<BorrowState> = None;
                 for a in arms {
-                    let arm_moves_payload = a.bindings.iter().any(|binding| self.is_move(*binding));
+                    let arm_moves_payload = self.arm_moves_payload(a);
                     let mut m = if arm_moves_payload {
                         consumed.as_ref().expect("Move binding has consumed state").clone()
                     } else {
@@ -26138,6 +26684,11 @@ struct Checker<'a, 't> {
     float_parent: Vec<u32>,
     /// All locals of the current function (slots), never shrinks.
     locals: Vec<Local>,
+    /// Parameter roots of the function currently being checked. These are checker-local facts
+    /// used to form the exact stable-place record for borrowed sum matching; they are not an
+    /// ambient lifetime model and are never serialized separately from the checked HIR record.
+    current_params: Vec<LocalId>,
+    current_param_modes: Vec<ast::ParamMode>,
     /// Visibility stack: (name, id). Truncated on block exit.
     scope: Vec<(String, LocalId)>,
     /// Enclosing function's return type, so `return` checks against it.
@@ -26337,6 +26888,8 @@ impl<'a, 't> Checker<'a, 't> {
             float_vars: Vec::new(),
             float_parent: Vec::new(),
             locals: Vec::new(),
+            current_params: Vec::new(),
+            current_param_modes: Vec::new(),
             scope: Vec::new(),
             ret_hint: Ty::Unit,
             json_scan_source_spelling: None,
@@ -26890,6 +27443,8 @@ impl<'a, 't> Checker<'a, 't> {
             self.locals[id as usize].is_param = true;
             params.push(id);
         }
+        self.current_params = params.clone();
+        self.current_param_modes = f.params.iter().map(|p| p.mode).collect();
 
         let body = match &f.body {
             ast::FnBody::Block(b) => {
@@ -29824,7 +30379,7 @@ impl<'a, 't> Checker<'a, 't> {
         let mut checked = Vec::with_capacity(args.len());
         for (a, (mode, p)) in args.iter().zip(&params) {
             let pt = scalar_to_ty(*p);
-            let e = self.check_expr(a, Some(pt));
+            let e = self.check_arg(a, Some(pt));
             if e.ty != Ty::Error && !self.source_ty_matches(e.ty, pt) {
                 self.diags.error(
                     format!("argument type mismatch: expected {}, got {}", self.ty_display(pt), self.ty_display(e.ty)),
@@ -34863,6 +35418,8 @@ impl<'a, 't> Checker<'a, 't> {
         let saved_int_parent = std::mem::take(&mut self.int_parent);
         let saved_float_vars = std::mem::take(&mut self.float_vars);
         let saved_float_parent = std::mem::take(&mut self.float_parent);
+        let saved_current_params = std::mem::take(&mut self.current_params);
+        let saved_current_param_modes = std::mem::take(&mut self.current_param_modes);
         let saved_ret = self.ret_hint;
         let saved_json_scan_source_spelling = self.json_scan_source_spelling.take();
         let saved_json_scan_local_spellings = std::mem::take(&mut self.json_scan_local_spellings);
@@ -34911,6 +35468,11 @@ impl<'a, 't> Checker<'a, 't> {
             }
             param_ids.push(id);
         }
+        // LocalIds restart at zero in the lifted function. Keep stable borrowed-place formation
+        // scoped to this function's own by-value lambda parameters rather than accidentally
+        // reusing the enclosing function's parameter facts.
+        self.current_params = param_ids.clone();
+        self.current_param_modes = vec![ast::ParamMode::ByValue; param_ids.len()];
         let checked = self.check_block(body, expected_ret);
         let ret = match expected_ret {
             Some(t) => t,
@@ -34945,6 +35507,8 @@ impl<'a, 't> Checker<'a, 't> {
                 self.int_parent = saved_int_parent;
                 self.float_vars = saved_float_vars;
                 self.float_parent = saved_float_parent;
+                self.current_params = saved_current_params;
+                self.current_param_modes = saved_current_param_modes;
                 self.ret_hint = saved_ret;
                 self.json_scan_source_spelling = saved_json_scan_source_spelling;
                 self.json_scan_local_spellings = saved_json_scan_local_spellings;
@@ -35009,6 +35573,8 @@ impl<'a, 't> Checker<'a, 't> {
         self.int_parent = saved_int_parent;
         self.float_vars = saved_float_vars;
         self.float_parent = saved_float_parent;
+        self.current_params = saved_current_params;
+        self.current_param_modes = saved_current_param_modes;
         self.ret_hint = saved_ret;
         self.json_scan_source_spelling = saved_json_scan_source_spelling;
         self.json_scan_local_spellings = saved_json_scan_local_spellings;
@@ -42857,6 +43423,88 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// Form the exact stable place record admitted by the borrowed-sum capability. The source
+    /// expression must be a direct borrowed parameter or a struct-field path rooted in one; a
+    /// local copied from that parameter and every fresh/control-flow result deliberately fail this
+    /// predicate so they continue through the ordinary owning-match path.
+    fn stable_borrowed_match_place(&self, scrutinee: &Expr, sum_ty: Ty) -> Option<hir::BorrowedMatchPlace> {
+        let (root_local, root_struct_path) = match &scrutinee.kind {
+            ExprKind::Local(local) => (*local, Vec::new()),
+            ExprKind::Field { root, path } => (*root, path.clone()),
+            _ => return None,
+        };
+        let position = self.current_params.iter().position(|local| *local == root_local)?;
+        let mode = *self.current_param_modes.get(position)?;
+        if !matches!(mode, ast::ParamMode::Borrow | ast::ParamMode::BorrowMut) {
+            return None;
+        }
+        let mut ty = self.locals.get(root_local as usize)?.ty;
+        for field in &root_struct_path {
+            let Ty::Struct(id) = ty else { return None };
+            ty = self
+                .structs
+                .get(id as usize)
+                .and_then(|definition| definition.fields.get(*field as usize))
+                .map(|field| field.ty)?;
+        }
+        if ty != sum_ty {
+            return None;
+        }
+        let mut path = Vec::with_capacity(root_struct_path.len() + 1);
+        path.push(hir::BorrowedPathSegment::RootSlot);
+        path.extend(
+            root_struct_path
+                .iter()
+                .copied()
+                .map(hir::BorrowedPathSegment::StructField),
+        );
+        Some(hir::BorrowedMatchPlace {
+            root_local,
+            root_struct_path,
+            sum_ty,
+            mode,
+            owner_fact: vec![hir::BorrowedRootFact {
+                kind: hir::BorrowedRootKind::Param,
+                ordinal: position as u32,
+                path,
+            }],
+        })
+    }
+
+    fn borrowed_match_projection_path(
+        &self,
+        sum_ty: Ty,
+        root_struct_path: &[u32],
+        variant: u32,
+        payload_ordinal: u32,
+    ) -> Option<Vec<hir::BorrowedPathSegment>> {
+        let mut path = Vec::with_capacity(root_struct_path.len() + 2);
+        path.push(hir::BorrowedPathSegment::RootSlot);
+        path.extend(
+            root_struct_path
+                .iter()
+                .copied()
+                .map(hir::BorrowedPathSegment::StructField),
+        );
+        match self.resolve(sum_ty) {
+            Ty::Enum(_) => path.push(hir::BorrowedPathSegment::EnumPayload {
+                variant,
+                payload_ordinal,
+            }),
+            Ty::Option(_) if variant == 0 && payload_ordinal == 0 => {
+                path.push(hir::BorrowedPathSegment::OptionSome)
+            }
+            Ty::Result(..) if payload_ordinal == 0 && variant == 0 => {
+                path.push(hir::BorrowedPathSegment::ResultOk)
+            }
+            Ty::Result(..) if payload_ordinal == 0 && variant == 1 => {
+                path.push(hir::BorrowedPathSegment::ResultErr)
+            }
+            _ => return None,
+        }
+        Some(path)
+    }
+
     /// `match scrutinee { Variant => body, _ => body }` — exhaustive match over a sum type (a user
     /// `enum`, or builtin `Option`/`Result`). Each arm's body unifies to the match's type; every
     /// variant must be covered, or a `_` wildcard.
@@ -42867,7 +43515,9 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         let scrutinee_diverges = hir_expr_diverges(&s);
-        let Some((type_name, variants)) = self.match_variants(self.resolve(s.ty)) else {
+        let resolved_scrutinee_ty = self.resolve(s.ty);
+        let borrowed_place = self.stable_borrowed_match_place(&s, resolved_scrutinee_ty);
+        let Some((type_name, variants)) = self.match_variants(resolved_scrutinee_ty) else {
             self.diags.error(format!("`match` expects a sum type, got {}", ty_name(s.ty)), scrutinee.span);
             return err;
         };
@@ -42878,9 +43528,10 @@ impl<'a, 't> Checker<'a, 't> {
         // double-free. Reject the nested-place case cleanly (defer, like a nested `string`-field move);
         // a bare local and a depth-1 field both null correctly and stay allowed. A binding-less match
         // (`Or`/`_` patterns only) moves nothing, so it is fine at any depth.
-        if matches!(self.resolve(s.ty), Ty::Enum(eid) if enum_is_move(eid, self.structs, self.enums, self.tagged_types))
+        if matches!(resolved_scrutinee_ty, Ty::Enum(eid) if enum_is_move(eid, self.structs, self.enums, self.tagged_types))
             && matches!(&s.kind, ExprKind::Field { path, .. } if path.len() > 1)
             && arms.iter().any(|a| matches!(&a.pattern, ast::MatchPattern::Variant { bindings, .. } if !bindings.is_empty()))
+            && borrowed_place.is_none()
         {
             self.diags.error(
                 "matching a Move sum type through a nested struct field and binding its payload is not supported yet — bind the field to a local first, or clone".to_string(),
@@ -42914,6 +43565,7 @@ impl<'a, 't> Checker<'a, 't> {
                     }
                 }
             };
+            let mut borrowed_bindings = Vec::new();
             let (variant_tags, bindings) = match &arm.pattern {
                 ast::MatchPattern::Wildcard(_) => {
                     if has_wildcard {
@@ -42947,7 +43599,7 @@ impl<'a, 't> Checker<'a, 't> {
                     // body resolves even when the count is wrong. Binding names must be
                     // distinct — `Rect(w, w)` would otherwise silently shadow.
                     let mut seen_bindings = std::collections::HashSet::new();
-                    let locals = bindings
+                    let locals: Vec<LocalId> = bindings
                         .iter()
                         .enumerate()
                         .map(|(i, b)| {
@@ -42967,9 +43619,83 @@ impl<'a, 't> Checker<'a, 't> {
                             // scope end). No special sema handling — the same path Result/Option already
                             // use for their Move payloads.
                             let ty = payload.get(i).map(|&s| scalar_to_ty(s)).unwrap_or(Ty::Error);
+                            if borrowed_place.is_some()
+                                && ty_is_move(
+                                    ty,
+                                    self.structs,
+                                    self.tuples,
+                                    self.enums,
+                                    self.tagged_types,
+                                )
+                                && !borrowed_sum_payload_is_admissible(
+                                    ty,
+                                    self.structs,
+                                    self.enums,
+                                    self.tagged_types,
+                                )
+                            {
+                                let borrowed_place_name = match &s.kind {
+                                    ExprKind::Local(local) => format!(
+                                        "borrowed parameter '{}'",
+                                        self.locals
+                                            .get(*local as usize)
+                                            .map(|local| local.name.as_str())
+                                            .unwrap_or("<unknown>"),
+                                    ),
+                                    ExprKind::Field { root, .. } => format!(
+                                        "field of borrowed parameter '{}'",
+                                        self.locals
+                                            .get(*root as usize)
+                                            .map(|local| local.name.as_str())
+                                            .unwrap_or("<unknown>"),
+                                    ),
+                                    _ => "borrowed match place".to_string(),
+                                };
+                                self.diags.error(
+                                    format!(
+                                        "cannot bind an unsupported Move payload through {borrowed_place_name}"
+                                    ),
+                                    b.span,
+                                );
+                            }
                             self.declare(&b.name, ty, false)
                         })
                         .collect();
+                    if bindings.len() == payload.len()
+                        && let Some(place) = borrowed_place.as_ref()
+                    {
+                        for (index, local) in locals.iter().copied().enumerate() {
+                            let payload_ty = scalar_to_ty(payload[index]);
+                            if ty_is_move(
+                                payload_ty,
+                                self.structs,
+                                self.tuples,
+                                self.enums,
+                                self.tagged_types,
+                            )
+                                && borrowed_sum_payload_is_admissible(
+                                    payload_ty,
+                                    self.structs,
+                                    self.enums,
+                                    self.tagged_types,
+                                )
+                                && let Some(path) = self.borrowed_match_projection_path(
+                                    resolved_scrutinee_ty,
+                                    &place.root_struct_path,
+                                    idx,
+                                    index as u32,
+                                )
+                            {
+                                borrowed_bindings.push(hir::BorrowedProjection {
+                                    binding_local: local,
+                                    variant: idx,
+                                    payload_ordinal: index as u32,
+                                    static_ty: payload_ty,
+                                    path,
+                                });
+                            }
+                        }
+                    }
                     (vec![idx], locals)
                 }
             };
@@ -42990,7 +43716,12 @@ impl<'a, 't> Checker<'a, 't> {
                 result_ty = Some(body.ty);
             }
             self.scope.truncate(scope_mark);
-            checked.push(hir::MatchArm { variants: variant_tags, bindings, body });
+            checked.push(hir::MatchArm {
+                variants: variant_tags,
+                bindings,
+                borrowed_bindings,
+                body,
+            });
         }
         // Exhaustiveness: every variant covered, or a `_` wildcard present.
         if !has_wildcard {
@@ -43010,7 +43741,18 @@ impl<'a, 't> Checker<'a, 't> {
             self.reconcile_diverging_completion_expr(&checked[index].body, ty);
         }
         self.constrain(ty, expected, span);
-        Expr { kind: ExprKind::Match { scrutinee: Box::new(s), arms: checked }, ty, span }
+        let borrowed_place = borrowed_place.filter(|_| {
+            checked.iter().any(|arm| !arm.borrowed_bindings.is_empty())
+        });
+        Expr {
+            kind: ExprKind::Match {
+                scrutinee: Box::new(s),
+                arms: checked,
+                borrowed_place,
+            },
+            ty,
+            span,
+        }
     }
 
     fn check_if(&mut self, cond: &ast::Expr, then: &ast::Block, els: Option<&ast::Expr>, expected: Option<Ty>, span: Span) -> Expr {
@@ -43563,7 +44305,7 @@ impl<'a, 't> Checker<'a, 't> {
                     self.finalize_expr(p);
                 }
             }
-            ExprKind::Match { scrutinee, arms } => {
+            ExprKind::Match { scrutinee, arms, .. } => {
                 self.finalize_expr(scrutinee);
                 for a in arms {
                     self.finalize_expr(&mut a.body);
@@ -48961,6 +49703,7 @@ fn main() -> i32 = 0
             borrow_fact_cache: std::cell::RefCell::new(None),
             collecting_move_children: false,
             move_children: Vec::new(),
+            borrowed_projection_locals: borrowed_projection_locals(&function.body),
         };
         let mut fact = BorrowFact::default();
         fact.projected.insert(
@@ -49289,6 +50032,7 @@ fn main() -> i32 = 0
             borrow_fact_cache: std::cell::RefCell::new(None),
             collecting_move_children: false,
             move_children: Vec::new(),
+            borrowed_projection_locals: borrowed_projection_locals(&function.body),
         };
         assert!(
             checker.intentional_borrow_mut_snapshot(call, MoveCheck::expr_key(&args[0])),
@@ -51005,34 +51749,125 @@ fn exit_branch(flag: bool) -> i64 {
     }
 
     #[test]
-    fn match_cannot_extract_a_move_payload_from_a_borrowed_parameter() {
-        let cases = [
-            (
-                "fn inspect(borrow value: Option<string>) -> i64 = match value {\n  Some(text) => text.len()\n  None => 0\n}\n",
-                "cannot move borrowed parameter 'value'",
-            ),
-            (
-                "fn inspect(borrow value: Result<string, string>) -> i64 = match value {\n  Ok(text) => text.len()\n  Err(text) => text.len()\n}\n",
-                "cannot move borrowed parameter 'value'",
-            ),
-            (
-                "Box { value: Option<string> }\nfn inspect(borrow wrapper: Box) -> i64 = match wrapper.value {\n  Some(text) => text.len()\n  None => 0\n}\n",
-                "cannot move a field out of borrowed parameter 'wrapper'",
-            ),
+    fn borrowed_sum_match_projects_move_payload_without_owning_it() {
+        let accepted = [
+            "fn inspect(borrow value: Option<string>) -> i64 = match value {\n  Some(text) => text.len()\n  None => 0\n}\n",
+            "fn inspect(borrow value: Result<string, string>) -> i64 = match value {\n  Ok(text) => text.len()\n  Err(text) => text.len()\n}\n",
+            "Box { value: Option<string> }\nfn inspect(borrow wrapper: Box) -> i64 = match wrapper.value {\n  Some(text) => text.len()\n  None => 0\n}\n",
+            "Content { Text(string) , Empty }\nfn inspect(borrow value: Content) -> i64 = match value {\n  Text(text) => text.len()\n  Empty => 0\n}\n",
         ];
-        for (source, expected) in cases {
-            let (_program, diagnostics) = check(&format!("{source}fn main() -> i32 = 0\n"));
+        for source in accepted {
+            let (program, diagnostics) = check(&format!("{source}fn main() -> i32 = 0\n"));
+            assert!(!diagnostics.has_errors(), "borrowed sum projection should check: {:?}", diagnostics.iter().collect::<Vec<_>>());
+            let inspect = program
+                .fns
+                .iter()
+                .find(|function| function.name == "inspect")
+                .expect("borrowed projection owner");
+            let projection_locals = borrowed_projection_locals(&inspect.body);
+            let projection_spans = hir_depth::body_events(&inspect.body)
+                .into_iter()
+                .filter_map(|event| match event {
+                    hir_depth::BodyEvent::ExprEnter(expression)
+                        if matches!(
+                            &expression.kind,
+                            ExprKind::Local(local) if projection_locals.contains(local)
+                        )
+                        || matches!(
+                            &expression.kind,
+                            ExprKind::Field { root, .. } if projection_locals.contains(root)
+                        ) => Some(expression.span),
+                    _ => None,
+                })
+                .collect::<HashSet<_>>();
             assert!(
-                diagnostics.iter().any(|diagnostic| diagnostic
-                    .message
-                    .contains(expected)),
-                "a Move payload binding must not copy storage out of a shared-borrowed sum: {:?}",
-                diagnostics
+                projection_spans
                     .iter()
-                    .map(|diagnostic| diagnostic.message.as_str())
-                    .collect::<Vec<_>>(),
+                    .all(|span| !inspect.drop_individual_exprs.contains_key(span)),
+                "projection-only aliases must not acquire expression cleanup metadata"
             );
         }
+
+        let consuming = "fn take(value: string) -> i64 = value.len()\nfn inspect(borrow value: Option<string>) -> i64 = match value {\n  Some(text) => take(text)\n  None => 0\n}\n";
+        let (_program, diagnostics) = check(&format!("{consuming}fn main() -> i32 = 0\n"));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("borrowed match payload")),
+            "a projected Move payload must reject whole-value consumption: {:?}",
+            diagnostics.iter().collect::<Vec<_>>(),
+        );
+
+        let unsupported = "fn inspect(borrow value: Option<array<i64>>) -> i64 = match value {\n  Some(values) => values.len()\n  None => 0\n}\n";
+        let (_program, diagnostics) = check(&format!("{unsupported}fn main() -> i32 = 0\n"));
+        assert!(diagnostics.has_errors(), "aggregate payload projection must stay unsupported");
+
+        let owning = "fn inspect(value: Option<string>) -> i64 = match value {\n  Some(text) => text.len()\n  None => 0\n}\n";
+        let (_program, diagnostics) = check(&format!("{owning}fn main() -> i32 = 0\n"));
+        assert!(!diagnostics.has_errors(), "owning match behavior must remain valid");
+    }
+
+    #[test]
+    fn borrowed_sum_match_metadata_rejects_forged_records() {
+        let source = "fn inspect(borrow value: Option<string>) -> i64 = match value {\n  Some(text) => text.len()\n  None => 0\n}\nfn main() -> i32 = 0\n";
+        let (program, diagnostics) = check(source);
+        assert!(!diagnostics.has_errors(), "fixture must check before metadata mutation");
+        assert!(checked_hir_body_facts_are_valid(&program));
+
+        let mut forged_owner = program.clone();
+        let inspect = forged_owner
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "inspect")
+            .expect("inspect function");
+        let ExprKind::Match {
+            borrowed_place: Some(place),
+            ..
+        } = &mut inspect
+            .body
+            .value
+            .as_mut()
+            .expect("inspect body value")
+            .kind
+        else {
+            panic!("borrowed match metadata missing");
+        };
+        place.owner_fact[0].ordinal = 99;
+        assert!(!checked_hir_body_facts_are_valid(&forged_owner));
+
+        let mut forged_projection = program.clone();
+        let inspect = forged_projection
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "inspect")
+            .expect("inspect function");
+        let ExprKind::Match { arms, .. } = &mut inspect
+            .body
+            .value
+            .as_mut()
+            .expect("inspect body value")
+            .kind
+        else {
+            panic!("match metadata missing");
+        };
+        arms[0].borrowed_bindings[0].static_ty = Ty::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        assert!(!checked_hir_body_facts_are_valid(&forged_projection));
+
+        let mut forged_cleanup = program;
+        let inspect = forged_cleanup
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "inspect")
+            .expect("inspect function");
+        let binding = match &inspect.body.value.as_ref().expect("inspect body value").kind {
+            ExprKind::Match { arms, .. } => arms[0].borrowed_bindings[0].binding_local,
+            _ => panic!("match metadata missing"),
+        };
+        inspect.drop_locals.push(binding);
+        assert!(!checked_hir_body_facts_are_valid(&forged_cleanup));
     }
 
     #[test]

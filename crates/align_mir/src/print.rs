@@ -3,6 +3,7 @@
 
 use crate::{ty_name, Block, Const, Function, Operand, ParMapStageKind, Program, Rvalue, Stmt, Term};
 use align_ast::{BinOp, UnOp};
+use align_sema::hir;
 use std::fmt::Write;
 
 pub fn program_to_string(p: &Program) -> String {
@@ -1016,7 +1017,17 @@ fn operand_str(op: &Operand) -> String {
             let suffix = place
                 .path
                 .iter()
-                .map(|field| format!(".{field}"))
+                .map(|segment| match segment {
+                    hir::BorrowedPathSegment::RootSlot => String::new(),
+                    hir::BorrowedPathSegment::StructField(field) => format!(".{field}"),
+                    hir::BorrowedPathSegment::EnumPayload {
+                        variant,
+                        payload_ordinal,
+                    } => format!(".variant{variant}.payload{payload_ordinal}"),
+                    hir::BorrowedPathSegment::OptionSome => ".Some".to_string(),
+                    hir::BorrowedPathSegment::ResultOk => ".Ok".to_string(),
+                    hir::BorrowedPathSegment::ResultErr => ".Err".to_string(),
+                })
                 .collect::<String>();
             format!("borrow slot{}{}", place.slot, suffix)
         }

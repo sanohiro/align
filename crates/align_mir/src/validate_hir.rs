@@ -2447,7 +2447,7 @@ impl<'a> LocalScopeValidator<'a> {
                             work.push(LocalScopeWork::EnterBlock(then));
                             work.push(LocalScopeWork::EnterExpr(cond));
                         }
-                        hir::ExprKind::Match { scrutinee, arms } => {
+                        hir::ExprKind::Match { scrutinee, arms, .. } => {
                             for arm in arms.iter().rev() {
                                 work.push(LocalScopeWork::EnterArm(arm));
                             }
@@ -5558,7 +5558,7 @@ impl<'a> BodyValidator<'a> {
                 child.pooled_initializer = None;
                 work.push(BodyWork::EnterBlock(block, child));
             }
-            hir::ExprKind::Match { scrutinee, arms } => {
+            hir::ExprKind::Match { scrutinee, arms, .. } => {
                 for arm in arms.iter().rev() {
                     let mut arm_context = context.clone();
                     arm_context.pooled_initializer = None;
@@ -6176,7 +6176,7 @@ impl<'a> BodyValidator<'a> {
                 let (falls, breaks) = strict_flow(&flows);
                 Some((Ty::Enum(*enum_id), falls, breaks))
             }
-            hir::ExprKind::Match { scrutinee, arms } => {
+            hir::ExprKind::Match { scrutinee, arms, .. } => {
                 let scrutinee_flow = self.expr_flow(scrutinee)?;
                 let payloads = self.sum_payloads(scrutinee_flow.ty)?;
                 if arms.is_empty() {
@@ -7502,7 +7502,7 @@ impl<'a> BodyValidator<'a> {
                         || else_flow.reaches_break,
                 })
             }
-            hir::ExprKind::Match { scrutinee, arms } => {
+            hir::ExprKind::Match { scrutinee, arms, .. } => {
                 let scrutinee_flow = *self
                     .producer_exprs
                     .get(&ptr_key(scrutinee.as_ref()))?;
