@@ -144,6 +144,9 @@ fn block_to_string(out: &mut String, b: &Block) {
             Stmt::DropElemField(slot, idx, path) => {
                 let _ = writeln!(out, "    drop_elem_field _{slot}[{}]{}", operand_str(idx), path_str(path));
             }
+            Stmt::BorrowedElementReservation { token, root } => {
+                let _ = writeln!(out, "    borrow_reserve #{token} _{root}");
+            }
             Stmt::DropValue(op) => {
                 let _ = writeln!(out, "    drop_value {}", operand_str(op));
             }
@@ -1035,6 +1038,12 @@ fn operand_str(op: &Operand) -> String {
                 .collect::<String>();
             format!("borrow slot{}{}", place.slot, suffix)
         }
+        Operand::BorrowedElementPlace(place) => format!(
+            "borrow-element {}[{}] reservation #{}",
+            operand_str(&Operand::BorrowedPlace(Box::new(place.base.clone()))),
+            operand_str(&place.index),
+            place.guard.reservation,
+        ),
         Operand::BorrowedCleanupArg(index) => format!("arg{index}.cleanup"),
     }
 }

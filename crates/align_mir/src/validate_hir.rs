@@ -3772,6 +3772,31 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::Len(_)
             | hir::ExprKind::Index { .. }
             | hir::ExprKind::SliceRange { .. } => true,
+            hir::ExprKind::BorrowedIndex { base, index } => {
+                let element_ty = match base.array_ty {
+                    Ty::DynArray(element) => Some(align_sema::scalar_to_ty(element)),
+                    Ty::DynStructArray(id, align_sema::Layout::Aos) => Some(Ty::Struct(id)),
+                    _ => None,
+                };
+                self.program
+                    .fns
+                    .get(context.function)
+                    .and_then(|function| function.locals.get(base.root_local as usize))
+                    .is_some()
+                    && base.path.first() == Some(&hir::BorrowedPathSegment::RootSlot)
+                    && !base.owner_fact.is_empty()
+                    && base.owner_fact.windows(2).all(|pair| pair[0] < pair[1])
+                    && base.owner_fact.iter().all(|fact| {
+                        fact.path.first() == Some(&hir::BorrowedPathSegment::RootSlot)
+                    })
+                    && element_ty
+                        .is_some_and(|element| self.body_ty_matches(element, base.element_ty))
+                    && self.body_ty_matches(expression.ty, base.element_ty)
+                    && (index.ty == Ty::Int(align_sema::IntTy {
+                        bits: 64,
+                        signed: true,
+                    }) || align_sema::hir_expr_diverges(index))
+            }
             hir::ExprKind::ElemField {
                 path, struct_id, ..
             } => {
@@ -5822,6 +5847,9 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::Index { recv, index } => {
                 push_expr!(index, context.clone());
                 push_expr!(recv, context.clone());
+            }
+            hir::ExprKind::BorrowedIndex { index, .. } => {
+                push_expr!(index, context.clone());
             }
             hir::ExprKind::SliceRange { recv, start, end } => {
                 if let Some(end) = end {
@@ -9065,7 +9093,7 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::Index { recv, index } => {
                 let receiver = self.expr_flow(recv)?;
                 let index_flow = self.expr_flow(index)?;
-                if index_flow.ty != i64_ty() {
+                if index_flow.falls && index_flow.ty != i64_ty() {
                     return None;
                 }
                 let result = match receiver.ty {
@@ -9115,6 +9143,31 @@ impl<'a> BodyValidator<'a> {
                 }
                 let (falls, breaks) = strict_flow(&[receiver, index_flow]);
                 Some((result, falls, breaks))
+            }
+            hir::ExprKind::BorrowedIndex { base, index } => {
+                let index_flow = self.expr_flow(index)?;
+                if index_flow.falls && index_flow.ty != i64_ty() {
+                    return None;
+                }
+                let element_ty = match base.array_ty {
+                    Ty::DynArray(element) => align_sema::scalar_to_ty(element),
+                    Ty::DynStructArray(id, Layout::Aos) => Ty::Struct(id),
+                    _ => return None,
+                };
+                if !self.body_ty_matches(element_ty, base.element_ty)
+                    || !self.body_ty_matches(expression.ty, element_ty)
+                    || !align_sema::ty_is_move(
+                        element_ty,
+                        &self.program.structs,
+                        &self.program.tuples,
+                        &self.program.enums,
+                        &self.program.tagged_types,
+                    )
+                {
+                    return None;
+                }
+                let (falls, breaks) = strict_flow(&[index_flow]);
+                Some((element_ty, falls, breaks))
             }
             hir::ExprKind::SliceRange { recv, start, end } => {
                 let receiver = self.expr_flow(recv)?;
@@ -10928,6 +10981,11 @@ impl<'a> BodyValidator<'a> {
         let (root, field) = match &argument.kind {
             hir::ExprKind::Local(local) => (*local, false),
             hir::ExprKind::Field { root, .. } => (*root, true),
+            hir::ExprKind::BorrowedIndex { base, .. }
+                if mode == align_ast::ParamMode::Borrow =>
+            {
+                (base.root_local, false)
+            }
             _ => return false,
         };
         let Some(local) = self

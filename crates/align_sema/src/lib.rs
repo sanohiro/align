@@ -1265,9 +1265,10 @@ pub fn expand_tagged_ty(ty: Ty, tagged_types: &[hir::TaggedType]) -> Ty {
 /// Whether a sum payload may be exposed as a read-only projection from a stable borrowed place.
 ///
 /// This is deliberately a closed, cycle-safe classifier. It admits primitive values and views,
-/// owned `string`, and finite acyclic structs/sums whose reachable payload graph stays within the
-/// same set. Aggregate buffers, builders, boxes, resources, and opaque handles remain outside the
-/// first borrowed-sum capability because their projection/drop/escape contracts are not defined.
+/// owned `string`, ordinary dynamic scalar/AoS-record arrays, and finite acyclic structs/sums whose
+/// reachable payload graph stays within the same set. Fixed/specialized arrays, aggregate buffers,
+/// builders, boxes, resources, and opaque handles remain outside because their projection/drop/
+/// escape contracts are not defined.
 pub fn borrowed_sum_payload_is_admissible(
     ty: Ty,
     structs: &[StructDef],
@@ -1285,7 +1286,7 @@ pub fn borrowed_sum_payload_is_admissible(
     ) -> bool {
         match ty {
             Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Unit | Ty::Str | Ty::String
-            | Ty::Slice(_) | Ty::Soa(_) | Ty::Raw | Ty::Rng => true,
+            | Ty::Slice(_) | Ty::Raw | Ty::Rng => true,
             Ty::Struct(id) => {
                 if !active_structs.insert(id) {
                     return false;
@@ -1306,6 +1307,24 @@ pub fn borrowed_sum_payload_is_admissible(
                 active_structs.remove(&id);
                 result
             }
+            Ty::DynArray(
+                Scalar::Int(_)
+                | Scalar::Float(_)
+                | Scalar::Bool
+                | Scalar::Char
+                | Scalar::Unit
+                | Scalar::String
+                | Scalar::Str,
+            ) => true,
+            Ty::DynStructArray(id, Layout::Aos) => visit(
+                Ty::Struct(id),
+                structs,
+                enums,
+                tagged_types,
+                active_structs,
+                active_enums,
+                active_tagged,
+            ),
             Ty::Enum(id) => {
                 if !active_enums.insert(id) {
                     return false;
@@ -8910,6 +8929,364 @@ fn borrowed_match_metadata_is_valid(program: &hir::Program) -> bool {
     true
 }
 
+fn borrowed_element_path_ty(
+    function: &hir::Fn,
+    base: &hir::BorrowedElementBase,
+    program: &hir::Program,
+) -> Option<Ty> {
+    if base.path.first() != Some(&hir::BorrowedPathSegment::RootSlot)
+        || base
+            .path
+            .iter()
+            .skip(1)
+            .any(|segment| matches!(segment, hir::BorrowedPathSegment::RootSlot))
+    {
+        return None;
+    }
+    let mut ty = function.locals.get(base.root_local as usize)?.ty;
+    for segment in base.path.iter().skip(1) {
+        ty = match segment {
+            hir::BorrowedPathSegment::RootSlot => return None,
+            hir::BorrowedPathSegment::StructField(field) => {
+                let Ty::Struct(id) = ty else { return None };
+                program
+                    .structs
+                    .get(id as usize)?
+                    .fields
+                    .get(*field as usize)?
+                    .ty
+            }
+            hir::BorrowedPathSegment::EnumPayload {
+                variant,
+                payload_ordinal,
+            } => {
+                let Ty::Enum(id) = ty else { return None };
+                scalar_to_ty(
+                    *program
+                        .enums
+                        .get(id as usize)?
+                        .variants
+                        .get(*variant as usize)?
+                        .payload
+                        .get(*payload_ordinal as usize)?,
+                )
+            }
+            hir::BorrowedPathSegment::OptionSome => match expand_tagged_ty(ty, &program.tagged_types) {
+                Ty::Option(payload) => scalar_to_ty(payload),
+                _ => return None,
+            },
+            hir::BorrowedPathSegment::ResultOk => match expand_tagged_ty(ty, &program.tagged_types) {
+                Ty::Result(ok, _) => scalar_to_ty(ok),
+                _ => return None,
+            },
+            hir::BorrowedPathSegment::ResultErr => match expand_tagged_ty(ty, &program.tagged_types) {
+                Ty::Result(_, err) => scalar_to_ty(err),
+                _ => return None,
+            },
+        };
+    }
+    Some(ty)
+}
+
+fn borrowed_element_payload_path_is_active(
+    base: &hir::BorrowedElementBase,
+    active_arms: &[(&Expr, Option<LocalId>, &[hir::BorrowedProjection])],
+) -> bool {
+    base.path.iter().enumerate().all(|(index, segment)| {
+        if !matches!(
+            segment,
+            hir::BorrowedPathSegment::EnumPayload { .. }
+                | hir::BorrowedPathSegment::OptionSome
+                | hir::BorrowedPathSegment::ResultOk
+                | hir::BorrowedPathSegment::ResultErr
+        ) {
+            return true;
+        }
+        let prefix = &base.path[..=index];
+        active_arms
+            .iter()
+            .rev()
+            .any(|(_, root_local, projections)| {
+                *root_local == Some(base.root_local)
+                    && projections
+                        .iter()
+                        .any(|projection| projection.path == prefix)
+            })
+    })
+}
+
+/// Record the borrowed-index nodes whose root is a real, currently live HIR place. `Fn::locals`
+/// is a function-wide type table, not source-order evidence: a later declaration, an exited sibling
+/// scope, or a projection-only match binding can all have a valid local id and type without owning
+/// storage at this use site.
+fn borrowed_element_live_root_uses(function: &hir::Fn) -> Option<HashSet<usize>> {
+    enum Frame<'a> {
+        Scope(Vec<LocalId>),
+        Statement(&'a hir::Stmt),
+        Other,
+    }
+
+    fn declare(
+        local: LocalId,
+        function: &hir::Fn,
+        live: &mut HashSet<LocalId>,
+        frames: &mut [(usize, Frame<'_>)],
+    ) -> bool {
+        if function.locals.get(local as usize).is_none() || !live.insert(local) {
+            return false;
+        }
+        let Some(Frame::Scope(locals)) = frames.iter_mut().rev().find_map(|(_, frame)| {
+            matches!(frame, Frame::Scope(_)).then_some(frame)
+        }) else {
+            return false;
+        };
+        locals.push(local);
+        true
+    }
+
+    let projection_locals = borrowed_projection_locals(&function.body);
+    let mut live = function.params.iter().copied().collect::<HashSet<_>>();
+    if live.len() != function.params.len()
+        || live
+            .iter()
+            .any(|local| function.locals.get(*local as usize).is_none())
+    {
+        return None;
+    }
+    let mut valid = HashSet::new();
+    let mut frames: Vec<(usize, Frame<'_>)> = Vec::new();
+    for event in hir_depth::clone_events(&function.body)? {
+        match event {
+            hir_depth::CloneEvent::RecordEnter { id, record } => {
+                let frame = match record {
+                    hir_depth::BodyRecord::Block(_) => Frame::Scope(Vec::new()),
+                    hir_depth::BodyRecord::MatchArm { arm, .. } => {
+                        let mut locals = Vec::with_capacity(arm.bindings.len());
+                        for local in &arm.bindings {
+                            if function.locals.get(*local as usize).is_none()
+                                || !live.insert(*local)
+                            {
+                                return None;
+                            }
+                            locals.push(*local);
+                        }
+                        Frame::Scope(locals)
+                    }
+                    hir_depth::BodyRecord::Stmt(statement) => Frame::Statement(statement),
+                    hir_depth::BodyRecord::Expr(expression) => {
+                        if let ExprKind::BorrowedIndex { base, .. } = &expression.kind
+                            && live.contains(&base.root_local)
+                            && !projection_locals.contains(&base.root_local)
+                        {
+                            valid.insert(expression as *const Expr as usize);
+                        }
+                        Frame::Other
+                    }
+                    hir_depth::BodyRecord::Stage(_)
+                    | hir_depth::BodyRecord::TemplatePart(_)
+                    | hir_depth::BodyRecord::BlockExit { .. }
+                    | hir_depth::BodyRecord::StmtExit { .. }
+                    | hir_depth::BodyRecord::ExprExit { .. }
+                    | hir_depth::BodyRecord::MatchArmExit { .. }
+                    | hir_depth::BodyRecord::StageExit { .. }
+                    | hir_depth::BodyRecord::TemplatePartExit { .. } => Frame::Other,
+                };
+                frames.push((id, frame));
+            }
+            hir_depth::CloneEvent::RecordExit { id } => {
+                let (entered, frame) = frames.pop()?;
+                if entered != id {
+                    return None;
+                }
+                match frame {
+                    Frame::Scope(locals) => {
+                        for local in locals {
+                            if !live.remove(&local) {
+                                return None;
+                            }
+                        }
+                    }
+                    Frame::Statement(hir::Stmt::Let { local, .. }) => {
+                        if !declare(*local, function, &mut live, &mut frames) {
+                            return None;
+                        }
+                    }
+                    Frame::Statement(hir::Stmt::LetTuple { locals, .. }) => {
+                        for local in locals.iter().flatten() {
+                            if !declare(*local, function, &mut live, &mut frames) {
+                                return None;
+                            }
+                        }
+                    }
+                    Frame::Statement(
+                        hir::Stmt::Assign { .. }
+                        | hir::Stmt::AssignIndex { .. }
+                        | hir::Stmt::AssignVecLane { .. }
+                        | hir::Stmt::AssignField { .. }
+                        | hir::Stmt::AssignElemField { .. }
+                        | hir::Stmt::AssignElem { .. }
+                        | hir::Stmt::Return(_)
+                        | hir::Stmt::Break { .. }
+                        | hir::Stmt::Expr(_),
+                    )
+                    | Frame::Other => {}
+                }
+            }
+        }
+    }
+    frames.is_empty().then_some(valid)
+}
+
+fn borrowed_element_metadata_is_valid(program: &hir::Program) -> bool {
+    let named_modes = program
+        .fns
+        .iter()
+        .map(|function| (function.name.as_str(), function.param_modes.as_slice()))
+        .chain(
+            program
+                .imported_fns
+                .iter()
+                .map(|function| (function.name.as_str(), function.param_modes.as_slice())),
+        )
+        .collect::<HashMap<_, _>>();
+    for function in &program.fns {
+        let events = hir_depth::body_events(&function.body);
+        let Some(live_root_uses) = borrowed_element_live_root_uses(function) else {
+            return false;
+        };
+        let mut admitted_arguments = HashSet::new();
+        let mut active_payload_paths = HashSet::new();
+        let mut active_arms: Vec<(&Expr, Option<LocalId>, &[hir::BorrowedProjection])> = Vec::new();
+        for event in &events {
+            match event {
+                hir_depth::BodyEvent::MatchArmEnter { scrutinee, arm } => {
+                    let root_local = stable_borrowed_match_place_for_fn_with_program(
+                        function,
+                        scrutinee,
+                        scrutinee.ty,
+                        program,
+                    )
+                    .map(|place| place.root_local);
+                    active_arms.push((&arm.body, root_local, &arm.borrowed_bindings));
+                }
+                hir_depth::BodyEvent::ExprExit { expression, .. } => {
+                    if active_arms
+                        .last()
+                        .is_some_and(|(body, _, _)| std::ptr::eq(*body, *expression))
+                    {
+                        active_arms.pop();
+                    }
+                }
+                hir_depth::BodyEvent::ExprEnter(expression) => {
+                    if let ExprKind::BorrowedIndex { base, .. } = &expression.kind
+                        && borrowed_element_payload_path_is_active(base, &active_arms)
+                    {
+                        active_payload_paths.insert(*expression as *const Expr as usize);
+                    }
+                    match &expression.kind {
+                        ExprKind::Call { func, args, .. } => {
+                            if let Some(modes) = named_modes.get(func.as_str()) {
+                                for (argument, mode) in args.iter().zip(*modes) {
+                                    if *mode == ast::ParamMode::Borrow
+                                        && matches!(argument.kind, ExprKind::BorrowedIndex { .. })
+                                    {
+                                        admitted_arguments.insert(argument as *const Expr as usize);
+                                    }
+                                }
+                            }
+                        }
+                        ExprKind::CallFnValue { callee, args } => {
+                            if let Ty::Fn(id) = callee.ty
+                                && let Some(signature) = program.fn_types.get(id as usize)
+                            {
+                                for (argument, (mode, _)) in args.iter().zip(&signature.params) {
+                                    if *mode == ast::ParamMode::Borrow
+                                        && matches!(argument.kind, ExprKind::BorrowedIndex { .. })
+                                    {
+                                        admitted_arguments.insert(argument as *const Expr as usize);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                hir_depth::BodyEvent::StmtEnter(_) | hir_depth::BodyEvent::StmtExit(_) => {}
+            }
+        }
+        for event in events {
+            let hir_depth::BodyEvent::ExprEnter(expression) = event else { continue };
+            let ExprKind::BorrowedIndex { base, index } = &expression.kind else { continue };
+            if !admitted_arguments.contains(&(expression as *const Expr as usize))
+                || !active_payload_paths.contains(&(expression as *const Expr as usize))
+                || !live_root_uses.contains(&(expression as *const Expr as usize))
+                || (index.ty != Ty::Int(IntTy { bits: 64, signed: true })
+                    && !hir_expr_diverges(index))
+                || expression.ty != base.element_ty
+                || borrowed_element_path_ty(function, base, program) != Some(base.array_ty)
+            {
+                return false;
+            }
+            let expected_element = match base.array_ty {
+                Ty::DynArray(element) => Some(scalar_to_ty(element)),
+                Ty::DynStructArray(id, Layout::Aos) => Some(Ty::Struct(id)),
+                _ => None,
+            };
+            if expected_element != Some(base.element_ty)
+                || !ty_is_move(
+                    base.element_ty,
+                    &program.structs,
+                    &program.tuples,
+                    &program.enums,
+                    &program.tagged_types,
+                )
+                || !borrowed_sum_payload_is_admissible(
+                    base.element_ty,
+                    &program.structs,
+                    &program.enums,
+                    &program.tagged_types,
+                )
+            {
+                return false;
+            }
+            let parameter = function
+                .params
+                .iter()
+                .position(|local| *local == base.root_local)
+                .filter(|position| {
+                    matches!(
+                        function.param_modes.get(*position),
+                        Some(ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
+                    )
+                });
+            let expected_owner = if let Some(position) = parameter {
+                vec![
+                    hir::BorrowedRootFact {
+                        kind: hir::BorrowedRootKind::Param,
+                        ordinal: position as u32,
+                        path: base.path.clone(),
+                    },
+                    hir::BorrowedRootFact {
+                        kind: hir::BorrowedRootKind::ParamStorage,
+                        ordinal: position as u32,
+                        path: base.path.clone(),
+                    },
+                ]
+            } else {
+                vec![hir::BorrowedRootFact {
+                    kind: hir::BorrowedRootKind::Local,
+                    ordinal: base.root_local,
+                    path: base.path.clone(),
+                }]
+            };
+            if base.owner_fact != expected_owner {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn stable_borrowed_match_place_for_fn_with_program(
     function: &hir::Fn,
     scrutinee: &hir::Expr,
@@ -8964,6 +9341,9 @@ fn checked_hir_body_facts_are_valid_impl(program: &hir::Program) -> bool {
         return false;
     }
     if !borrowed_match_metadata_is_valid(program) {
+        return false;
+    }
+    if !borrowed_element_metadata_is_valid(program) {
         return false;
     }
     let Some(mut replay) = replay_clone::clone_program(program) else {
@@ -13339,6 +13719,7 @@ impl EffectScan<'_> {
                 walk!(recv);
                 walk!(index);
             }
+            ExprKind::BorrowedIndex { index, .. } => walk!(index),
             ExprKind::SliceRange { recv, start, end } => {
                 walk!(recv);
                 if let Some(s) = start { walk!(s); }
@@ -13817,6 +14198,7 @@ impl<'a> EscapeCheck<'a> {
         let root = match &expression.kind {
             ExprKind::Local(local) => *local,
             ExprKind::Field { root, .. } => *root,
+            ExprKind::BorrowedIndex { base, .. } => base.root_local,
             _ => return false,
         };
         if self.borrowed_projection_locals.contains(&root) {
@@ -13901,7 +14283,21 @@ impl<'a> EscapeCheck<'a> {
                     Ty::Resource(_)
                 )
                 && self.f.param_modes.get(position) == Some(&ast::ParamMode::BorrowMut);
-            if local.ty == Ty::ArenaHandle || borrowed_builder || borrowed_region_destination {
+            let borrowed_dynamic_storage = matches!(
+                self.f.param_modes.get(position),
+                Some(ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
+            ) && ty_owns_dyn_array_storage(
+                local.ty,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            );
+            if local.ty == Ty::ArenaHandle
+                || borrowed_builder
+                || borrowed_region_destination
+                || borrowed_dynamic_storage
+            {
                 self.state
                     .region
                     .insert(param, Region::Caller(position as u32));
@@ -15773,6 +16169,13 @@ impl<'a> EscapeCheck<'a> {
                         .then_some(Region::Frame),
                 )],
             ),
+            ExprKind::BorrowedIndex { base, .. } => values.push(
+                self.state
+                    .region
+                    .get(&base.root_local)
+                    .copied()
+                    .unwrap_or(Region::Static),
+            ),
             // A range slice is a borrowed view into the receiver's storage (a sub-`str` or a
             // sub-`slice`), so it lives exactly as long as the receiver — inherit its region (the
             // same rule as `Index` / `StrTrim`; the bounds are scalar `i64`, never region-tracked).
@@ -16589,6 +16992,7 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::TupleIndex { recv, .. }
             | ExprKind::Index { recv, .. }
             | ExprKind::ElemField { recv, .. } => work.push(recv),
+            ExprKind::BorrowedIndex { .. } => {}
             ExprKind::StructLit { fields, .. } => work.extend(fields.iter().rev()),
             ExprKind::Field { root, .. } if self.state.local_backed_slice.contains(root) => {
                 return true;
@@ -18208,6 +18612,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(recv, depth);
                 self.walk(index, depth);
             }
+            ExprKind::BorrowedIndex { index, .. } => self.walk(index, depth),
             ExprKind::RawLoad { ptr, offset, .. } | ExprKind::RawOffset { ptr, offset } => {
                 self.walk(ptr, depth);
                 self.walk(offset, depth);
@@ -18879,7 +19284,9 @@ fn diverging_block_result_ty(block: &Block, expected: Option<Ty>) -> Ty {
 /// Whether a HIR expression in tail position always diverges. An `if` diverges only when **both**
 /// arms do; a block-wrapping expr defers to its block; an exhaustive `match` diverges when every arm
 /// does. `?` may continue through its success payload, so it remains conservatively non-diverging.
-fn hir_expr_diverges(e: &Expr) -> bool {
+/// Whether a checked HIR expression certainly has no fallthrough edge. MIR validation consumes
+/// this same authority for operands whose value type matters only when evaluation continues.
+pub fn hir_expr_diverges(e: &Expr) -> bool {
     hir_diverges(HirDivergenceNode::Expr(e))
 }
 
@@ -20213,6 +20620,19 @@ impl<'a> MoveCheck<'a> {
         roots
     }
 
+    /// The storage generation reserved by an indexed shared borrow. Dynamic aggregate storage is
+    /// itself the borrowed object even when its element type carries no view provenance, so this
+    /// must not inherit `local_storage_roots`' view-only admission condition.
+    fn borrowed_element_roots(&self, id: LocalId) -> BorrowRoots {
+        let mut roots = self.local_storage_roots(id);
+        if let Some(position) = self.borrowed_param_position(id) {
+            roots.insert(BorrowRoot::ParamStorage(position));
+        } else {
+            roots.insert(BorrowRoot::Local(id));
+        }
+        roots
+    }
+
     fn local_borrow_fact(&self, id: LocalId) -> BorrowFact {
         let mut fact = self.borrows.facts.get(&id).cloned().unwrap_or_default();
         let region_param = self
@@ -20400,6 +20820,9 @@ impl<'a> MoveCheck<'a> {
             ExprKind::Index { recv, .. }
             | ExprKind::ElemField { recv, .. }
             | ExprKind::TupleIndex { recv, .. } => roots.extend(self.storage_roots(recv)),
+            ExprKind::BorrowedIndex { base, .. } => {
+                roots.extend(self.borrowed_element_roots(base.root_local));
+            }
             // A valueless block is Unit: nothing to borrow. (A block WITH a value never reaches
             // this match — `borrow_transparent_value` forwarded it above.)
             ExprKind::Block(_) | ExprKind::Unsafe(_) => {}
@@ -20476,13 +20899,7 @@ impl<'a> MoveCheck<'a> {
         if self.non_fallthrough.contains(&e.span) {
             return fact;
         }
-        if !ty_may_borrow(
-            e.ty,
-            self.structs,
-            self.tuples,
-            self.enums,
-            self.tagged_types,
-        ) {
+        if !self.value_snapshot_needed(e) {
             return fact;
         }
         let key = Self::expr_key(e);
@@ -20508,6 +20925,17 @@ impl<'a> MoveCheck<'a> {
 
     fn expr_key(e: &Expr) -> usize {
         e as *const Expr as usize
+    }
+
+    fn value_snapshot_needed(&self, e: &Expr) -> bool {
+        matches!(e.kind, ExprKind::BorrowedIndex { .. })
+            || ty_may_borrow(
+                e.ty,
+                self.structs,
+                self.tuples,
+                self.enums,
+                self.tagged_types,
+            )
     }
 
     fn clear_value_snapshot(&mut self, key: usize) {
@@ -21496,6 +21924,9 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::Field { root: base, .. } => self.local_storage_roots(*base),
             ExprKind::Index { recv, .. }
             | ExprKind::ElemField { recv, .. } => self.storage_roots(recv),
+            ExprKind::BorrowedIndex { base, .. } => {
+                self.borrowed_element_roots(base.root_local)
+            }
             // Chunks are views into the source slots themselves. The materializing transforms below
             // instead copy view values into fresh storage, so they inherit only the source value's
             // already-flattened provenance, not ownership of its array header.
@@ -22815,13 +23246,7 @@ impl<'a> MoveCheck<'a> {
         {
             return self.expr_non_borrowing_binary_tree(e, moved);
         }
-        let may_borrow = ty_may_borrow(
-            e.ty,
-            self.structs,
-            self.tuples,
-            self.enums,
-            self.tagged_types,
-        );
+        let may_borrow = self.value_snapshot_needed(e);
         let key = Self::expr_key(e);
         // A loop refinement or another repeated structural walk may revisit the same source node
         // under a stronger state. Never let that prior pass answer this evaluation's fact query.
@@ -22861,6 +23286,12 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn expr_uses_eager_worklist(&self, expression: &Expr) -> bool {
+        // This node establishes a storage-generation reservation before its index child runs.
+        // The generic worklist discovers children before evaluating them, so keep this one on the
+        // recursive path where the reservation encloses the child's complete evaluation.
+        if matches!(expression.kind, ExprKind::BorrowedIndex { .. }) {
+            return false;
+        }
         if pipeline_stages(&expression.kind).is_some() {
             return false;
         }
@@ -22918,13 +23349,7 @@ impl<'a> MoveCheck<'a> {
                         ));
                         continue;
                     }
-                    let may_borrow = ty_may_borrow(
-                        expression.ty,
-                        self.structs,
-                        self.tuples,
-                        self.enums,
-                        self.tagged_types,
-                    );
+                    let may_borrow = self.value_snapshot_needed(expression);
                     let key = Self::expr_key(expression);
                     if may_borrow {
                         self.clear_value_snapshot(key);
@@ -25707,6 +26132,27 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, recv, moved, false, false);
                 move_expr!(self, index, moved, false, false);
             }
+            ExprKind::BorrowedIndex { base, index } => {
+                self.check_borrow_use(base.root_local, e.span);
+                if whole_moved(moved, base.root_local) {
+                    let name = &self.f.locals[base.root_local as usize].name;
+                    self.diags.error(format!("use of moved value '{name}'"), e.span);
+                }
+                // Reserve the source generation before evaluating the index. The ordinary eager
+                // parent snapshot is formed after a child completes, which is too late for an
+                // index expression that itself replaces or moves the array.
+                let reservation = Self::expr_key(e);
+                self.borrows.begin_value_source(
+                    reservation,
+                    self.borrowed_element_roots(base.root_local),
+                );
+                if !self.expr(index, moved, false, false) {
+                    self.borrows.finish_value_source(reservation);
+                    return false;
+                }
+                self.validate_value_snapshot(reservation, reservation, e.span);
+                self.borrows.finish_value_source(reservation);
+            }
             // A range slice borrows the receiver (a view, never consumed) and reads the bounds.
             ExprKind::SliceRange { recv, start, end } => {
                 move_expr!(self, recv, moved, false, false);
@@ -26654,6 +27100,12 @@ enum GenericMatchContext {
     ExpectedReturn,
 }
 
+#[derive(Clone)]
+struct CheckedBorrowedProjectionPlace {
+    root_local: LocalId,
+    path: Vec<hir::BorrowedPathSegment>,
+}
+
 struct Checker<'a, 't> {
     diags: &'a mut Diagnostics,
     sigs: &'a HashMap<String, FnSig>,
@@ -26711,6 +27163,9 @@ struct Checker<'a, 't> {
     /// ambient lifetime model and are never serialized separately from the checked HIR record.
     current_params: Vec<LocalId>,
     current_param_modes: Vec<ast::ParamMode>,
+    /// Arm-scoped roots of plan-26 borrowed payload bindings. A binding has no independent slot;
+    /// indexed shared borrows must continue the checked path to the original borrowed parameter.
+    borrowed_projection_places: HashMap<LocalId, CheckedBorrowedProjectionPlace>,
     /// Visibility stack: (name, id). Truncated on block exit.
     scope: Vec<(String, LocalId)>,
     /// Enclosing function's return type, so `return` checks against it.
@@ -26912,6 +27367,7 @@ impl<'a, 't> Checker<'a, 't> {
             locals: Vec::new(),
             current_params: Vec::new(),
             current_param_modes: Vec::new(),
+            borrowed_projection_places: HashMap::new(),
             scope: Vec::new(),
             ret_hint: Ty::Unit,
             json_scan_source_spelling: None,
@@ -30324,6 +30780,220 @@ impl<'a, 't> Checker<'a, 't> {
         self.check_indirect_call(callee, args, expected, span)
     }
 
+    fn borrowed_dynamic_array_element(&self, ty: Ty) -> Option<Ty> {
+        match self.resolve(ty) {
+            Ty::DynArray(element) => Some(scalar_to_ty(element)),
+            Ty::DynStructArray(id, Layout::Aos) => Some(Ty::Struct(id)),
+            _ => None,
+        }
+    }
+
+    fn borrowed_element_owner_fact(
+        &self,
+        root_local: LocalId,
+        path: &[hir::BorrowedPathSegment],
+    ) -> Vec<hir::BorrowedRootFact> {
+        if let Some(position) = self
+            .current_params
+            .iter()
+            .position(|parameter| *parameter == root_local)
+            .filter(|position| {
+                matches!(
+                    self.current_param_modes.get(*position),
+                    Some(ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
+                )
+            })
+        {
+            return vec![
+                hir::BorrowedRootFact {
+                    kind: hir::BorrowedRootKind::Param,
+                    ordinal: position as u32,
+                    path: path.to_vec(),
+                },
+                hir::BorrowedRootFact {
+                    kind: hir::BorrowedRootKind::ParamStorage,
+                    ordinal: position as u32,
+                    path: path.to_vec(),
+                },
+            ];
+        }
+        vec![hir::BorrowedRootFact {
+            kind: hir::BorrowedRootKind::Local,
+            ordinal: root_local,
+            path: path.to_vec(),
+        }]
+    }
+
+    fn borrowed_element_base(&self, receiver: &Expr) -> Option<hir::BorrowedElementBase> {
+        let (root_local, mut path) = match &receiver.kind {
+            ExprKind::Local(local) => {
+                if let Some(projection) = self.borrowed_projection_places.get(local) {
+                    (projection.root_local, projection.path.clone())
+                } else {
+                    (*local, vec![hir::BorrowedPathSegment::RootSlot])
+                }
+            }
+            ExprKind::Field { root, path: fields } => {
+                if let Some(projection) = self.borrowed_projection_places.get(root) {
+                    let mut path = projection.path.clone();
+                    path.extend(
+                        fields
+                            .iter()
+                            .copied()
+                            .map(hir::BorrowedPathSegment::StructField),
+                    );
+                    (projection.root_local, path)
+                } else {
+                    let mut path = vec![hir::BorrowedPathSegment::RootSlot];
+                    path.extend(
+                        fields
+                            .iter()
+                            .copied()
+                            .map(hir::BorrowedPathSegment::StructField),
+                    );
+                    (*root, path)
+                }
+            }
+            _ => return None,
+        };
+        let element_ty = self.borrowed_dynamic_array_element(receiver.ty)?;
+        let owner_fact = self.borrowed_element_owner_fact(root_local, &path);
+        Some(hir::BorrowedElementBase {
+            root_local,
+            path: std::mem::take(&mut path),
+            array_ty: self.resolve(receiver.ty),
+            element_ty,
+            owner_fact,
+        })
+    }
+
+    /// Check an array index with its i64 inference context while admitting a non-fallthrough index.
+    fn check_array_index_expr(&mut self, index: &ast::Expr) -> Expr {
+        let expected = Ty::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        let errors_before = self.diags.error_count();
+        // Thread the established index context into generic-call inference, but do not require a
+        // value from an expression that terminates before the bounds check. The ordinary
+        // `check_expr` wrapper cannot make that distinction because it reconciles every eager
+        // expression unconditionally after checking its producer.
+        let result = self.check_expr_inner(index, Some(expected));
+        if self.diags.error_count() == errors_before && !hir_expr_diverges(&result) {
+            self.constrain(result.ty, Some(expected), index.span);
+        }
+        result
+    }
+
+    /// Check an immediate shared-borrow argument without first forming the ordinary by-value Index
+    /// node, whose Move-element guard must remain closed everywhere else.
+    fn check_indexed_borrow_argument(
+        &mut self,
+        receiver: &ast::Expr,
+        index: &ast::Expr,
+        span: Span,
+    ) -> Expr {
+        let err = || Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let receiver = self.check_expr(receiver, None);
+        if receiver.ty == Ty::Error {
+            return err();
+        }
+        let Some(element_ty) = self.borrowed_dynamic_array_element(receiver.ty) else {
+            self.diags.error(
+                "an indexed shared borrow requires an ordinary dynamic scalar array or AoS record array"
+                    .to_string(),
+                span,
+            );
+            return err();
+        };
+        let base = if ty_is_move(
+            element_ty,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        ) {
+            let Some(base) = self.borrowed_element_base(&receiver) else {
+                self.diags.error(
+                    "an indexed shared borrow requires a stable named local, borrowed projection, or struct-field array base"
+                        .to_string(),
+                    span,
+                );
+                return err();
+            };
+            if !borrowed_sum_payload_is_admissible(
+                element_ty,
+                self.structs,
+                self.enums,
+                self.tagged_types,
+            ) {
+                self.diags.error(
+                    format!(
+                        "cannot shared-borrow an indexed element of the unsupported Move type {}",
+                        self.ty_display(element_ty)
+                    ),
+                    span,
+                );
+                return err();
+            }
+            Some(base)
+        } else {
+            None
+        };
+        let index = self.check_array_index_expr(index);
+        if index.ty == Ty::Error {
+            return err();
+        }
+        if !hir_expr_diverges(&index) && !index.ty.is_int_like() {
+            self.diags.error(
+                format!("an array index must be an integer, got {}", ty_name(index.ty)),
+                index.span,
+            );
+            return err();
+        }
+        let Some(base) = base else {
+            // Copy elements keep their existing by-value Index representation. The ordinary stable
+            // borrow-argument gate then retains its pre-existing rejection of an indexed temporary.
+            return Expr {
+                kind: ExprKind::Index {
+                    recv: Box::new(receiver),
+                    index: Box::new(index),
+                },
+                ty: element_ty,
+                span,
+            };
+        };
+        Expr {
+            kind: ExprKind::BorrowedIndex {
+                base,
+                index: Box::new(index),
+            },
+            ty: element_ty,
+            span,
+        }
+    }
+
+    fn check_call_argument_for_mode(
+        &mut self,
+        argument: &ast::Expr,
+        expected: Option<Ty>,
+        mode: ast::ParamMode,
+        json_scan_spelling: Option<String>,
+    ) -> Expr {
+        if mode == ast::ParamMode::Borrow
+            && let ast::ExprKind::Index { recv, index } = &argument.kind
+        {
+            let checked = self.check_indexed_borrow_argument(recv, index, argument.span);
+            self.constrain(checked.ty, expected, argument.span);
+            return checked;
+        }
+        self.check_arg_with_json_scan_source_spelling(
+            argument,
+            expected,
+            json_scan_spelling,
+        )
+    }
+
     fn validate_borrow_argument(
         &mut self,
         argument: &Expr,
@@ -30336,6 +31006,9 @@ impl<'a, 't> Checker<'a, 't> {
         let root = match &argument.kind {
             ExprKind::Local(local) => Some(*local),
             ExprKind::Field { root, .. } => Some(*root),
+            ExprKind::BorrowedIndex { base, .. } if mode == ast::ParamMode::Borrow => {
+                Some(base.root_local)
+            }
             _ => None,
         };
         let Some(root) = root else {
@@ -30401,7 +31074,7 @@ impl<'a, 't> Checker<'a, 't> {
         let mut checked = Vec::with_capacity(args.len());
         for (a, (mode, p)) in args.iter().zip(&params) {
             let pt = scalar_to_ty(*p);
-            let e = self.check_arg(a, Some(pt));
+            let e = self.check_call_argument_for_mode(a, Some(pt), *mode, None);
             if e.ty != Ty::Error && !self.source_ty_matches(e.ty, pt) {
                 self.diags.error(
                     format!("argument type mismatch: expected {}, got {}", self.ty_display(pt), self.ty_display(e.ty)),
@@ -30637,9 +31310,13 @@ impl<'a, 't> Checker<'a, 't> {
             .iter()
             .enumerate()
             .map(|(i, a)| {
-                self.check_arg_with_json_scan_source_spelling(
+                self.check_call_argument_for_mode(
                     a,
                     param_tys.get(i).copied(),
+                    param_modes
+                        .get(i)
+                        .copied()
+                        .unwrap_or(ast::ParamMode::ByValue),
                     json_scan_param_spellings.get(i).cloned().flatten(),
                 )
             })
@@ -30896,11 +31573,27 @@ impl<'a, 't> Checker<'a, 't> {
                 // argument unconstrained. A later argument or the final expected-result boundary
                 // may still bind the slot.
                 self.reject_bare_array_value(a, None, "a generic argument");
-                self.check_expr_with_json_scan_source_spelling(a, None, argument_spelling.clone())
+                if param_modes[i] == ast::ParamMode::Borrow
+                    && matches!(a.kind, ast::ExprKind::Index { .. })
+                {
+                    self.check_call_argument_for_mode(
+                        a,
+                        None,
+                        param_modes[i],
+                        argument_spelling.clone(),
+                    )
+                } else {
+                    self.check_expr_with_json_scan_source_spelling(
+                        a,
+                        None,
+                        argument_spelling.clone(),
+                    )
+                }
             } else {
-                self.check_arg_with_json_scan_source_spelling(
+                self.check_call_argument_for_mode(
                     a,
                     expected_param,
+                    param_modes[i],
                     argument_spelling.clone(),
                 )
             };
@@ -35451,6 +36144,8 @@ impl<'a, 't> Checker<'a, 't> {
         let saved_float_parent = std::mem::take(&mut self.float_parent);
         let saved_current_params = std::mem::take(&mut self.current_params);
         let saved_current_param_modes = std::mem::take(&mut self.current_param_modes);
+        let saved_borrowed_projection_places =
+            std::mem::take(&mut self.borrowed_projection_places);
         let saved_ret = self.ret_hint;
         let saved_json_scan_source_spelling = self.json_scan_source_spelling.take();
         let saved_json_scan_local_spellings = std::mem::take(&mut self.json_scan_local_spellings);
@@ -35540,6 +36235,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.float_parent = saved_float_parent;
                 self.current_params = saved_current_params;
                 self.current_param_modes = saved_current_param_modes;
+                self.borrowed_projection_places = saved_borrowed_projection_places;
                 self.ret_hint = saved_ret;
                 self.json_scan_source_spelling = saved_json_scan_source_spelling;
                 self.json_scan_local_spellings = saved_json_scan_local_spellings;
@@ -35606,6 +36302,7 @@ impl<'a, 't> Checker<'a, 't> {
         self.float_parent = saved_float_parent;
         self.current_params = saved_current_params;
         self.current_param_modes = saved_current_param_modes;
+        self.borrowed_projection_places = saved_borrowed_projection_places;
         self.ret_hint = saved_ret;
         self.json_scan_source_spelling = saved_json_scan_source_spelling;
         self.json_scan_local_spellings = saved_json_scan_local_spellings;
@@ -39544,11 +40241,11 @@ impl<'a, 't> Checker<'a, 't> {
         // The index is an `i64` (matching `.len()` and loop counters). A non-integer index must
         // bail with `Ty::Error` — returning a typed `Index` node with a bad index would feed a
         // non-int operand into the MIR bounds-check `icmp` and panic codegen.
-        let i = self.check_expr(index, Some(Ty::Int(IntTy { bits: 64, signed: true })));
+        let i = self.check_array_index_expr(index);
         if i.ty == Ty::Error {
             return err;
         }
-        if !i.ty.is_int_like() {
+        if !hir_expr_diverges(&i) && !i.ty.is_int_like() {
             self.diags.error(format!("an array index must be an integer, got {}", ty_name(i.ty)), index.span);
             return err;
         }
@@ -43770,6 +44467,17 @@ impl<'a, 't> Checker<'a, 't> {
                     (vec![idx], locals)
                 }
             };
+            for projection in &borrowed_bindings {
+                if let Some(place) = borrowed_place.as_ref() {
+                    self.borrowed_projection_places.insert(
+                        projection.binding_local,
+                        CheckedBorrowedProjectionPlace {
+                            root_local: place.root_local,
+                            path: projection.path.clone(),
+                        },
+                    );
+                }
+            }
             // Each fallthrough arm is checked against the running result type. A diverging arm
             // contributes no value to the join; direct process completion also retains its exact
             // Unit HIR type instead of being coerced to the match result. The first non-diverging,
@@ -43787,6 +44495,10 @@ impl<'a, 't> Checker<'a, 't> {
                 result_ty = Some(body.ty);
             }
             self.scope.truncate(scope_mark);
+            for projection in &borrowed_bindings {
+                self.borrowed_projection_places
+                    .remove(&projection.binding_local);
+            }
             checked.push(hir::MatchArm {
                 variants: variant_tags,
                 bindings,
@@ -44442,6 +45154,11 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ExprKind::Index { recv, index } | ExprKind::ElemField { recv, index, .. } => {
                 self.finalize_expr(recv);
+                self.finalize_expr(index);
+            }
+            ExprKind::BorrowedIndex { base, index } => {
+                base.array_ty = self.finalize(base.array_ty);
+                base.element_ty = self.finalize(base.element_ty);
                 self.finalize_expr(index);
             }
             ExprKind::SliceRange { recv, start, end } => {
@@ -51874,13 +52591,489 @@ fn exit_branch(flag: bool) -> i64 {
             diagnostics.iter().collect::<Vec<_>>(),
         );
 
-        let unsupported = "fn inspect(borrow value: Option<array<i64>>) -> i64 = match value {\n  Some(values) => values.len()\n  None => 0\n}\n";
-        let (_program, diagnostics) = check(&format!("{unsupported}fn main() -> i32 = 0\n"));
-        assert!(diagnostics.has_errors(), "aggregate payload projection must stay unsupported");
+        let array_payload = "fn inspect(borrow value: Option<array<i64>>) -> i64 = match value {\n  Some(values) => values.len()\n  None => 0\n}\n";
+        let (_program, diagnostics) = check(&format!("{array_payload}fn main() -> i32 = 0\n"));
+        assert!(!diagnostics.has_errors(), "ordinary dynamic-array payload projection must check");
 
         let owning = "fn inspect(value: Option<string>) -> i64 = match value {\n  Some(text) => text.len()\n  None => 0\n}\n";
         let (_program, diagnostics) = check(&format!("{owning}fn main() -> i32 = 0\n"));
         assert!(!diagnostics.has_errors(), "owning match behavior must remain valid");
+    }
+
+    #[test]
+    fn borrowed_payload_classifier_admits_only_ordinary_dynamic_array_graphs() {
+        fn structure(name: &str, fields: Vec<(&str, Ty)>) -> StructDef {
+            StructDef {
+                name: name.to_string(),
+                source_name: name.to_string(),
+                fields: fields
+                    .into_iter()
+                    .map(|(name, ty)| FieldDef {
+                        name: name.to_string(),
+                        ty,
+                    })
+                    .collect(),
+                align: None,
+                c_repr: false,
+            }
+        }
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let records = vec![
+            structure("Record", vec![("text", Ty::String)]),
+            structure(
+                "ArrayHolder",
+                vec![(
+                    "values",
+                    Ty::DynArray(Scalar::Int(IntTy {
+                        bits: 64,
+                        signed: true,
+                    })),
+                )],
+            ),
+            structure("Specialized", vec![("rows", Ty::Soa(0))]),
+        ];
+        let variants = vec![hir::EnumDef {
+            name: "Choice".to_string(),
+            source_name: "Choice".to_string(),
+            variants: vec![hir::EnumVariant {
+                name: "Records".to_string(),
+                payload: vec![Scalar::DynStructArray(0)],
+                field_base: 1,
+            }],
+        }];
+        for admitted in [
+            Ty::DynArray(Scalar::Int(IntTy { bits: 64, signed: true })),
+            Ty::DynArray(Scalar::String),
+            Ty::DynStructArray(0, Layout::Aos),
+            Ty::Struct(1),
+            Ty::Option(Scalar::DynArray(PrimScalar::Int(IntTy {
+                bits: 64,
+                signed: true,
+            }))),
+            Ty::Result(Scalar::DynStructArray(0), Scalar::Bool),
+            Ty::Enum(0),
+        ] {
+            assert!(
+                borrowed_sum_payload_is_admissible(admitted, &records, &variants, &[]),
+                "ordinary dynamic aggregate {admitted:?} must be admitted"
+            );
+        }
+        for excluded in [
+            Ty::Array(Scalar::Int(IntTy { bits: 64, signed: true }), 2),
+            Ty::DynStructArray(0, Layout::Soa),
+            Ty::StructArray(0, 2),
+            Ty::DynVecArray(Scalar::Int(IntTy { bits: 64, signed: true }), 4),
+            Ty::DynMaskArray(Scalar::Int(IntTy { bits: 64, signed: true }), 4),
+            Ty::DynFixedArray(Scalar::Int(IntTy { bits: 64, signed: true }), 4),
+            Ty::DynFixedStructArray(0, 4),
+            Ty::DynSliceArray(PrimScalar::Int(IntTy { bits: 64, signed: true })),
+            Ty::DynResponseArray,
+            Ty::Buffer,
+            Ty::ArrayBuilder(Scalar::Int(IntTy { bits: 64, signed: true })),
+            Ty::DynArray(Scalar::DynArray(PrimScalar::Int(IntTy {
+                bits: 64,
+                signed: true,
+            }))),
+            Ty::DynStructArray(2, Layout::Aos),
+            Ty::DynStructArray(99, Layout::Aos),
+        ] {
+            assert!(
+                !borrowed_sum_payload_is_admissible(excluded, &records, &[], &[]),
+                "excluded aggregate {excluded:?} must fail closed"
+            );
+        }
+        let cyclic = vec![structure("Cycle", vec![("next", Ty::Struct(0)), ("n", i64_ty)])];
+        assert!(!borrowed_sum_payload_is_admissible(
+            Ty::DynStructArray(0, Layout::Aos),
+            &cyclic,
+            &[],
+            &[],
+        ));
+    }
+
+    #[test]
+    fn borrowed_copy_projection_classifiers_cover_every_region_plain_view_leaf() {
+        fn structure(name: &str, fields: Vec<(&str, Ty)>) -> StructDef {
+            StructDef {
+                name: name.to_string(),
+                source_name: name.to_string(),
+                fields: fields
+                    .into_iter()
+                    .map(|(name, ty)| FieldDef {
+                        name: name.to_string(),
+                        ty,
+                    })
+                    .collect(),
+                align: None,
+                c_repr: false,
+            }
+        }
+
+        let bytes = Ty::Slice(Scalar::Int(IntTy {
+            bits: 8,
+            signed: false,
+        }));
+        let leaves = [("str", Ty::Str), ("slice<u8>", bytes)];
+        for (name, leaf) in leaves {
+            assert!(
+                region_plain_type_ok(leaf, &[], &[], &[]),
+                "{name} is an admitted region-array Copy leaf"
+            );
+            assert!(
+                !ty_is_move(leaf, &[], &[], &[], &[]),
+                "{name} must remain Copy"
+            );
+            assert!(
+                ty_may_borrow(leaf, &[], &[], &[], &[]),
+                "{name} must report borrow provenance"
+            );
+            assert_eq!(
+                borrow_leaf_paths_for_type(leaf, &[], &[], &[], &[]),
+                vec![Vec::<BorrowProjection>::new()],
+                "{name} must preserve its direct source root"
+            );
+        }
+
+        let records = vec![
+            structure("Text", vec![("value", Ty::Str)]),
+            structure("Bytes", vec![("value", bytes)]),
+            structure("NestedText", vec![("inner", Ty::Struct(0))]),
+            structure("NestedBytes", vec![("inner", Ty::Struct(1))]),
+        ];
+        for (name, id, expected) in [
+            (
+                "direct str",
+                0,
+                vec![BorrowProjection::StructField(0)],
+            ),
+            (
+                "direct slice<u8>",
+                1,
+                vec![BorrowProjection::StructField(0)],
+            ),
+            (
+                "nested str",
+                2,
+                vec![
+                    BorrowProjection::StructField(0),
+                    BorrowProjection::StructField(0),
+                ],
+            ),
+            (
+                "nested slice<u8>",
+                3,
+                vec![
+                    BorrowProjection::StructField(0),
+                    BorrowProjection::StructField(0),
+                ],
+            ),
+        ] {
+            let ty = Ty::Struct(id);
+            assert!(region_plain_type_ok(ty, &records, &[], &[]));
+            assert!(!ty_is_move(ty, &records, &[], &[], &[]));
+            assert_eq!(
+                borrow_leaf_paths_for_type(ty, &records, &[], &[], &[]),
+                vec![expected],
+                "{name} must retain the exact field path"
+            );
+        }
+    }
+
+    #[test]
+    fn borrowed_element_metadata_rejects_field_complete_forgery() {
+        let source = "Record { value: string }\nHolder { records: array<Record>, other: array<Record> }\nfn inspect(borrow record: Record) -> i64 = record.value.len()\nfn use(borrow holder: Holder, borrow spare: array<Record>) -> i64 = inspect(holder.records[0])\nfn main() -> i32 = 0\n";
+        let (program, diagnostics) = check(source);
+        assert!(!diagnostics.has_errors(), "fixture must check");
+        assert!(checked_hir_body_facts_are_valid(&program));
+
+        fn argument(program: &mut hir::Program) -> &mut Expr {
+            let function = program
+                .fns
+                .iter_mut()
+                .find(|function| function.name == "use")
+                .expect("use function");
+            let ExprKind::Call { args, .. } = &mut function
+                .body
+                .value
+                .as_mut()
+                .expect("use body value")
+                .kind
+            else {
+                panic!("use body must be a call");
+            };
+            &mut args[0]
+        }
+
+        type Mutation = fn(&mut hir::BorrowedElementBase);
+        let mutations: &[(&str, Mutation)] = &[
+            ("empty facts", |base| base.owner_fact.clear()),
+            ("removed first fact", |base| { base.owner_fact.remove(0); }),
+            ("removed second fact", |base| { base.owner_fact.pop(); }),
+            ("extra distinct fact", |base| {
+                let mut extra = base.owner_fact[0].clone();
+                extra.kind = hir::BorrowedRootKind::Local;
+                extra.ordinal = base.root_local;
+                base.owner_fact.insert(0, extra);
+            }),
+            ("duplicate facts", |base| { base.owner_fact[1] = base.owner_fact[0].clone(); }),
+            ("unsorted facts", |base| base.owner_fact.swap(0, 1)),
+            ("first fact local kind", |base| base.owner_fact[0].kind = hir::BorrowedRootKind::Local),
+            ("first fact storage kind", |base| base.owner_fact[0].kind = hir::BorrowedRootKind::ParamStorage),
+            ("second fact local kind", |base| base.owner_fact[1].kind = hir::BorrowedRootKind::Local),
+            ("second fact param kind", |base| base.owner_fact[1].kind = hir::BorrowedRootKind::Param),
+            ("out-of-range ordinal", |base| base.owner_fact[0].ordinal = 99),
+            ("wrong in-range first ordinal", |base| base.owner_fact[0].ordinal = 1),
+            ("wrong in-range second ordinal", |base| base.owner_fact[1].ordinal = 1),
+            ("missing first fact path", |base| { base.owner_fact[0].path.clear(); }),
+            ("missing second fact path", |base| { base.owner_fact[1].path.clear(); }),
+            ("invalid fact path", |base| base.owner_fact[0].path.push(hir::BorrowedPathSegment::StructField(99))),
+            ("valid other fact path", |base| {
+                base.owner_fact[0].path[1] = hir::BorrowedPathSegment::StructField(1);
+            }),
+            ("missing base root", |base| { base.path.clear(); }),
+            ("invalid base path", |base| base.path.push(hir::BorrowedPathSegment::StructField(99))),
+            ("valid other base path", |base| {
+                base.path[1] = hir::BorrowedPathSegment::StructField(1);
+            }),
+            ("out-of-range root local", |base| base.root_local = 99),
+            ("valid other root local", |base| {
+                base.root_local = 1;
+                base.path.truncate(1);
+            }),
+            ("wrong array type", |base| base.array_ty = Ty::String),
+            ("wrong element type", |base| base.element_ty = Ty::String),
+        ];
+        for (name, mutate) in mutations {
+            let mut forged = program.clone();
+            let ExprKind::BorrowedIndex { base, .. } = &mut argument(&mut forged).kind else {
+                panic!("indexed argument metadata missing");
+            };
+            mutate(base);
+            assert!(
+                !checked_hir_body_facts_are_valid(&forged),
+                "{name} must fail checked-HIR validation"
+            );
+        }
+
+        let mut wrong_index = program.clone();
+        let ExprKind::BorrowedIndex { index, .. } = &mut argument(&mut wrong_index).kind else {
+            panic!("indexed argument metadata missing");
+        };
+        index.ty = Ty::Bool;
+        assert!(!checked_hir_body_facts_are_valid(&wrong_index));
+
+        let mut wrong_mode = program;
+        wrong_mode
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "inspect")
+            .expect("inspect function")
+            .param_modes[0] = ast::ParamMode::ByValue;
+        assert!(!checked_hir_body_facts_are_valid(&wrong_mode));
+    }
+
+    #[test]
+    fn borrowed_element_root_must_be_live_storage_at_its_use_site() {
+        fn base_in_statement(function: &mut hir::Fn, statement: usize) -> &mut hir::BorrowedElementBase {
+            let hir::Stmt::Let { init, .. } = &mut function.body.stmts[statement] else {
+                panic!("indexed call statement must be a let");
+            };
+            let ExprKind::Call { args, .. } = &mut init.kind else {
+                panic!("indexed call initializer must be a call");
+            };
+            let ExprKind::BorrowedIndex { base, .. } = &mut args[0].kind else {
+                panic!("indexed call argument must retain borrowed metadata");
+            };
+            base
+        }
+
+        fn retarget_local(base: &mut hir::BorrowedElementBase, local: LocalId) {
+            base.root_local = local;
+            base.path = vec![hir::BorrowedPathSegment::RootSlot];
+            base.owner_fact = vec![hir::BorrowedRootFact {
+                kind: hir::BorrowedRootKind::Local,
+                ordinal: local,
+                path: base.path.clone(),
+            }];
+        }
+
+        let declarations = "Record { value: string }\nfn make() -> array<Record> { mut builder: array_builder<Record> := array_builder(); builder.push(Record { value: \"x\".clone() }); return builder.build() }\nfn inspect(borrow record: Record) -> i64 = record.value.len()\n";
+        let later_source = format!(
+            "{declarations}fn use() -> i64 {{\n  values := make()\n  result := inspect(values[0])\n  later := make()\n  return result + later.len()\n}}\nfn main() -> i32 = 0\n"
+        );
+        let (mut later, diagnostics) = check(&later_source);
+        assert!(!diagnostics.has_errors(), "later-local fixture must check");
+        assert!(checked_hir_body_facts_are_valid(&later));
+        let function = later
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "use")
+            .expect("use function");
+        let later_local = function
+            .locals
+            .iter()
+            .find(|local| local.name == "later")
+            .expect("later local")
+            .id;
+        retarget_local(base_in_statement(function, 1), later_local);
+        assert!(
+            !checked_hir_body_facts_are_valid(&later),
+            "a local declared after the indexed use must fail checked HIR"
+        );
+
+        let exited_source = format!(
+            "{declarations}fn use() -> i64 {{\n  retained := {{ nested := make(); nested }}\n  values := make()\n  result := inspect(values[0])\n  return result + retained.len()\n}}\nfn main() -> i32 = 0\n"
+        );
+        let (mut exited, diagnostics) = check(&exited_source);
+        assert!(!diagnostics.has_errors(), "exited-scope fixture must check");
+        assert!(checked_hir_body_facts_are_valid(&exited));
+        let function = exited
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "use")
+            .expect("use function");
+        let nested_local = function
+            .locals
+            .iter()
+            .find(|local| local.name == "nested")
+            .expect("nested local")
+            .id;
+        retarget_local(base_in_statement(function, 2), nested_local);
+        assert!(
+            !checked_hir_body_facts_are_valid(&exited),
+            "an exited nested-scope local must fail checked HIR"
+        );
+    }
+
+    #[test]
+    fn borrowed_element_payload_path_requires_its_active_match_arm() {
+        let fixtures = [
+            (
+                "OptionSome",
+                "Record { value: string }\nfn inspect(borrow record: Record) -> i64 = record.value.len()\nfn use(borrow maybe: Option<array<Record>>) -> i64 = match maybe {\n  Some(records) => inspect(records[0])\n  None => 0\n}\nfn main() -> i32 = 0\n",
+                0,
+            ),
+            (
+                "ResultOk",
+                "Record { value: string }\nfn inspect(borrow record: Record) -> i64 = record.value.len()\nfn use(borrow result: Result<array<Record>, array<Record>>) -> i64 = match result {\n  Ok(records) => inspect(records[0])\n  Err(records) => inspect(records[0])\n}\nfn main() -> i32 = 0\n",
+                0,
+            ),
+            (
+                "ResultErr",
+                "Record { value: string }\nfn inspect(borrow record: Record) -> i64 = record.value.len()\nfn use(borrow result: Result<array<Record>, array<Record>>) -> i64 = match result {\n  Ok(records) => inspect(records[0])\n  Err(records) => inspect(records[0])\n}\nfn main() -> i32 = 0\n",
+                1,
+            ),
+            (
+                "EnumPayload",
+                "Record { value: string }\nHolder { records: array<Record> }\nChoice { Wrapped(Holder), Empty }\nfn inspect(borrow record: Record) -> i64 = record.value.len()\nfn use(borrow choice: Choice) -> i64 = match choice {\n  Wrapped(holder) => inspect(holder.records[0])\n  Empty => 0\n}\nfn main() -> i32 = 0\n",
+                0,
+            ),
+        ];
+        for (segment, source, arm_index) in fixtures {
+            let (program, diagnostics) = check(source);
+            assert!(
+                !diagnostics.has_errors(),
+                "{segment} active-arm fixture must check: {:?}",
+                diagnostics.iter().collect::<Vec<_>>()
+            );
+            assert!(checked_hir_body_facts_are_valid(&program));
+
+            let mut outside_arm = program;
+            let function = outside_arm
+                .fns
+                .iter_mut()
+                .find(|function| function.name == "use")
+                .expect("use function");
+            let moved_call = match &function
+                .body
+                .value
+                .as_ref()
+                .expect("use body value")
+                .kind
+            {
+                ExprKind::Match { arms, .. } => arms[arm_index].body.clone(),
+                _ => panic!("use body must be a match"),
+            };
+            function.body.value = Some(Box::new(moved_call));
+            assert!(
+                !checked_hir_body_facts_are_valid(&outside_arm),
+                "a {segment} path outside the arm that activated it must fail closed"
+            );
+        }
+
+        let source = "Record { value: string }\nfn inspect(borrow record: Record) -> i64 = record.value.len()\nfn use(borrow active: Option<array<Record>>, borrow inactive: Option<array<Record>>) -> i64 = match active {\n  Some(records) => inspect(records[0])\n  None => 0\n}\nfn main() -> i32 = 0\n";
+        let (mut wrong_root, diagnostics) = check(source);
+        assert!(
+            !diagnostics.has_errors(),
+            "same-shape root fixture must check: {:?}",
+            diagnostics.iter().collect::<Vec<_>>()
+        );
+        assert!(checked_hir_body_facts_are_valid(&wrong_root));
+        let function = wrong_root
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "use")
+            .expect("use function");
+        let inactive = function.params[1];
+        let ExprKind::Match { arms, .. } = &mut function
+            .body
+            .value
+            .as_mut()
+            .expect("use body value")
+            .kind
+        else {
+            panic!("use body must be a match");
+        };
+        let ExprKind::Call { args, .. } = &mut arms[0].body.kind else {
+            panic!("Some arm must call inspect");
+        };
+        let ExprKind::BorrowedIndex { base, .. } = &mut args[0].kind else {
+            panic!("inspect argument must retain its borrowed-element record");
+        };
+        base.root_local = inactive;
+        for fact in &mut base.owner_fact {
+            fact.ordinal = 1;
+        }
+        assert!(
+            !checked_hir_body_facts_are_valid(&wrong_root),
+            "an active path from a different same-shaped root must fail closed"
+        );
+
+        let projection_source = "Record { value: string }\nfn inspect(borrow record: Record) -> i64 = record.value.len()\nfn use(borrow active: Option<array<Record>>) -> i64 = match active {\n  Some(records) => inspect(records[0])\n  None => 0\n}\nfn main() -> i32 = 0\n";
+        let (mut projection_root, diagnostics) = check(projection_source);
+        assert!(!diagnostics.has_errors(), "projection-root fixture must check");
+        let function = projection_root
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "use")
+            .expect("use function");
+        let ExprKind::Match { arms, .. } = &mut function
+            .body
+            .value
+            .as_mut()
+            .expect("use body value")
+            .kind
+        else {
+            panic!("use body must be a match");
+        };
+        let binding = arms[0].borrowed_bindings[0].binding_local;
+        let ExprKind::Call { args, .. } = &mut arms[0].body.kind else {
+            panic!("Some arm must call inspect");
+        };
+        let ExprKind::BorrowedIndex { base, .. } = &mut args[0].kind else {
+            panic!("inspect argument must retain borrowed metadata");
+        };
+        base.root_local = binding;
+        base.path = vec![hir::BorrowedPathSegment::RootSlot];
+        base.owner_fact = vec![hir::BorrowedRootFact {
+            kind: hir::BorrowedRootKind::Local,
+            ordinal: binding,
+            path: base.path.clone(),
+        }];
+        assert!(
+            !checked_hir_body_facts_are_valid(&projection_root),
+            "a projection-only binding must not become an independent storage root"
+        );
     }
 
     #[test]

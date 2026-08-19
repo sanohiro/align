@@ -282,6 +282,7 @@ impl Function {
             Operand::Value(v) => self.value_tys[*v as usize],
             Operand::Arg(i) => self.slots[self.params[*i as usize] as usize],
             Operand::BorrowedPlace(place) => place.ty,
+            Operand::BorrowedElementPlace(place) => place.element_ty,
             Operand::BorrowedCleanupArg(_) => Ty::Bool,
         }
     }
@@ -386,6 +387,11 @@ pub enum Stmt {
     /// `index` of a fixed struct-array slot: free that field's buffer before it is overwritten by an
     /// element-field store (`us[i].name = new` / `us[i].addr.name = new`, Slice 4b). Null-safe.
     DropElemField(Slot, Operand, Vec<u32>),
+    /// Inert identity marker for the start of an indexed shared-borrow reservation. The token is
+    /// function-local and monotonic. Post-lowering MIR rewrites preserve this non-movable statement;
+    /// validation locates its final block/statement position instead of retaining stale container
+    /// coordinates in [`BorrowedElementGuard`]. Emits no backend instruction.
+    BorrowedElementReservation { token: u32, root: Slot },
     /// Free the buffer of a free-standing owned `array<T>` *value* (a `{ptr,len}` operand that
     /// is not backed by a slot — an unbound `.to_array()` temporary consumed in place). Used to
     /// free the materialized buffer right after the loop that consumes it (null-safe).
@@ -1585,6 +1591,9 @@ pub enum Operand {
     /// A stable caller-owned place passed by shared or exclusive borrow. The root slot remains
     /// owned by the caller; `path` selects a nested struct field without loading or moving it.
     BorrowedPlace(Box<BorrowedPlace>),
+    /// A bounds-guarded dynamic-array element place. This is not a pointer: codegen derives the
+    /// element address only while lowering the enclosing shared-borrow call action.
+    BorrowedElementPlace(Box<BorrowedElementPlace>),
     /// Cleanup bit carried beside an incoming whole-Move `BorrowMut` parameter.
     BorrowedCleanupArg(u32),
 }
@@ -1600,6 +1609,25 @@ pub struct BorrowedPlace {
     /// Caller-side cleanup-bit slot for an exclusive borrow of a whole Move place. `None` for a
     /// shared borrow, a Copy pointee, or a Copy field of a Move aggregate.
     pub cleanup: Option<Slot>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BorrowedElementPlace {
+    pub base: BorrowedPlace,
+    pub index: Operand,
+    pub element_ty: Ty,
+    /// Stable reservation identity plus the checked array length. Backends reconstruct the exact
+    /// successful bounds edge after MIR rewrites and prove it dominates the call action before
+    /// forming a pointer; the descriptor itself remains pointer-free.
+    pub guard: BorrowedElementGuard,
+}
+
+#[derive(Clone, Debug)]
+pub struct BorrowedElementGuard {
+    /// Function-local identity of the inert reservation marker emitted before index evaluation.
+    /// Block and statement coordinates are deliberately derived only after MIR rewrites finish.
+    pub reservation: u32,
+    pub len: Operand,
 }
 
 #[derive(Clone, Debug)]
@@ -2937,7 +2965,10 @@ fn builder_key(op: &Operand, loads: &std::collections::HashMap<ValueId, Slot>) -
     match op {
         Operand::Value(v) => Some(loads.get(v).map(|s| BuilderKey::Slot(*s)).unwrap_or(BuilderKey::Value(*v))),
         Operand::Arg(i) => Some(BuilderKey::Arg(*i)),
-        Operand::Const(_) | Operand::BorrowedPlace(_) | Operand::BorrowedCleanupArg(_) => None,
+        Operand::Const(_)
+        | Operand::BorrowedPlace(_)
+        | Operand::BorrowedElementPlace(_)
+        | Operand::BorrowedCleanupArg(_) => None,
     }
 }
 
@@ -3172,6 +3203,9 @@ struct BuilderCtx {
     eager_expr_results: std::collections::HashMap<usize, Operand>,
     /// Whether an outer `lower_expr` invocation currently owns `eager_expr_results`.
     eager_expr_active: bool,
+    /// Monotonic identity for indexed shared-borrow reservation markers. Kept behind the existing
+    /// context box so the recursively passed [`Builder`] retains its established stack footprint.
+    next_borrow_reservation: u32,
 }
 
 /// Located-lowering state carried through one function's [`BuilderCtx`].
@@ -3292,6 +3326,12 @@ impl Builder {
         let s = self.alias_scope;
         self.alias_scope += 1;
         s
+    }
+
+    fn fresh_borrow_reservation(&mut self) -> u32 {
+        let token = self.ctx.next_borrow_reservation;
+        self.ctx.next_borrow_reservation += 1;
+        token
     }
 
     fn new_slot(&mut self, ty: Ty) -> Slot {
@@ -3551,6 +3591,7 @@ fn lower_fn(
             return_cleanup: f.return_cleanup,
             eager_expr_results: std::collections::HashMap::new(),
             eager_expr_active: false,
+            next_borrow_reservation: 0,
         }),
     };
     let entry = b.new_block();
@@ -6569,6 +6610,13 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             }
             hir::ExprKind::CallFnValue { .. } => lower_call_fn_value(b, e),
             hir::ExprKind::Call { .. } => lower_direct_call(b, e),
+            hir::ExprKind::BorrowedIndex { .. } => {
+                // The checked variant is legal only through `lower_borrowed_place`, which emits its
+                // bounds guard and keeps the result call-scoped. Fail closed if malformed HIR puts
+                // it in an ordinary value position.
+                b.terminate(Term::Unreachable);
+                Operand::Const(Const::Unit)
+            }
             hir::ExprKind::If { cond, then, els } => lower_if(b, cond, then, els, e.ty, false),
             // Delegated to an out-of-line (`#[inline(never)]`) helper taking only `(b, e)` — no locals in
             // this arm — so it does not enlarge this giant recursive `lower_expr` frame (the `expr_depth`
@@ -8027,10 +8075,48 @@ fn null_consumed_struct_sources(b: &mut Builder, value: &hir::Expr) {
 }
 
 fn lower_borrowed_place(
-    b: &Builder,
+    b: &mut Builder,
     e: &hir::Expr,
     mode: align_ast::ParamMode,
 ) -> Operand {
+    if let hir::ExprKind::BorrowedIndex { base, index } = &e.kind {
+        debug_assert_eq!(mode, align_ast::ParamMode::Borrow);
+        let reservation = b.fresh_borrow_reservation();
+        b.push(Stmt::BorrowedElementReservation {
+            token: reservation,
+            root: base.root_local,
+        });
+        let index = lower_expr(b, index);
+        if !lowering_continues(b) {
+            return Operand::Const(Const::Unit);
+        }
+        let Some(path) = base.path.strip_prefix(&[hir::BorrowedPathSegment::RootSlot]) else {
+            b.terminate(Term::Unreachable);
+            return Operand::Const(Const::Unit);
+        };
+        let base_place = BorrowedPlace {
+            slot: base.root_local,
+            path: path.to_vec(),
+            ty: base.array_ty,
+            cleanup: None,
+        };
+        let len = b.fresh_value(i64_ty());
+        b.push(Stmt::Let(
+            len,
+            Rvalue::SliceLen(Operand::BorrowedPlace(Box::new(base_place.clone()))),
+        ));
+        let checked_len = Operand::Value(len);
+        emit_bounds_check(b, &index, checked_len.clone());
+        return Operand::BorrowedElementPlace(Box::new(BorrowedElementPlace {
+            base: base_place,
+            index,
+            element_ty: base.element_ty,
+            guard: BorrowedElementGuard {
+                reservation,
+                len: checked_len,
+            },
+        }));
+    }
     let is_projection = match &e.kind {
         hir::ExprKind::Local(local) => b.borrowed_bindings.contains_key(local),
         hir::ExprKind::Field { root, .. } => b.borrowed_bindings.contains_key(root),
@@ -8875,7 +8961,7 @@ fn lower_vec_div(b: &mut Builder, op: BinOp, l: Operand, r: Operand, s: align_se
 /// `if index < 0 || index >= len { bounds_fail(index, len); unreachable }`. Leaves `b.cur` at the
 /// in-bounds block so the caller emits the element load. Out-of-bounds is a hard error (the
 /// settled panic model — never a silent OOB read).
-fn emit_bounds_check(b: &mut Builder, idx: &Operand, len: Operand) {
+fn emit_bounds_check(b: &mut Builder, idx: &Operand, len: Operand) -> BlockId {
     let lo = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(lo, Rvalue::Bin(BinOp::Lt, idx.clone(), Operand::Const(Const::Int(0, i64_ty())))));
     let hi = b.fresh_value(Ty::Bool);
@@ -8897,6 +8983,7 @@ fn emit_bounds_check(b: &mut Builder, idx: &Operand, len: Operand) {
     b.terminate(Term::Unreachable);
 
     b.cur = ok;
+    ok
 }
 
 /// The byte width (1/2/4/8) of a binary scalar read/written by [`Rvalue::BytesRead`] /
@@ -16769,6 +16856,7 @@ fn main() -> i32 {
                 return_cleanup: hir::ReturnCleanupAbi::None,
                 eager_expr_results: std::collections::HashMap::new(),
                 eager_expr_active: false,
+                next_borrow_reservation: 0,
             }),
         };
         let entry = builder.new_block();

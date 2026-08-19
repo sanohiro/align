@@ -386,6 +386,7 @@ fn walk_body_records<'a>(
                 | ExprKind::BuilderToString(expr)
                 | ExprKind::ArrayToSlice(expr)
                 | ExprKind::Len(expr)
+                | ExprKind::BorrowedIndex { index: expr, .. }
                 | ExprKind::ArrayBuilderBuild(expr) => {
                     work.push((BodyRecord::Expr(expr), child_depth));
                 }

@@ -272,6 +272,18 @@ pub struct BorrowedProjection {
     pub path: Vec<BorrowedPathSegment>,
 }
 
+/// Exact checked base of an owning dynamic-array element that may be shared-borrowed only for one
+/// call action. The path is rooted by `RootSlot`; `owner_fact` is canonical source-generation and
+/// contained-region provenance independently replayed before MIR construction.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BorrowedElementBase {
+    pub root_local: LocalId,
+    pub path: Vec<BorrowedPathSegment>,
+    pub array_ty: Ty,
+    pub element_ty: Ty,
+    pub owner_fact: Vec<BorrowedRootFact>,
+}
+
 /// One checked `match` arm. `variants` = the covered variant tags: empty = the `_` wildcard, one
 /// = a simple arm, many = an or-pattern (`A | B`). `bindings` are the locals bound to the variant's
 /// payload (one per payload slot, in order); an or-pattern / wildcard binds nothing. A non-empty
@@ -901,6 +913,10 @@ pub enum ExprKind {
     /// is the scalar element). Lowering emits a bounds check (`0 <= index < len`) that aborts on
     /// an out-of-range index (the settled panic model). `index` is an `i64`.
     Index { recv: Box<Expr>, index: Box<Expr> },
+    /// A Move element selected from an ordinary dynamic array for one immediate shared-borrow call
+    /// argument. The index is evaluated once and bounds-checked before later arguments; MIR keeps
+    /// the result as a guarded place descriptor and forms the pointer only at the call action.
+    BorrowedIndex { base: BorrowedElementBase, index: Box<Expr> },
     /// `recv[start..end]` — a half-open range slice of a `str` / `array<T>` / `slice<T>`. The result
     /// is a borrowed view (`ty` = `str` for a `str` receiver, else `slice<T>`) into the receiver's
     /// storage — no allocation, region inherited from `recv` (it cannot outlive it). `start` defaults

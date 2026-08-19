@@ -1,6 +1,6 @@
 # Borrow-safe dynamic aggregate projection
 
-Status: **DESIGN SETTLED; implementation pending; required by align-llm Request 17.**
+Status: **IMPLEMENTED; exact align-llm Request 17 adoption pending.**
 
 This document extends the borrowed sum-payload projection shipped by
 `26-borrowed-sum-projection-plan.md`. The shipped capability intentionally rejects every dynamic
@@ -223,7 +223,11 @@ The exact Rust representation may differ, but it must preserve those three field
 only at an explicit shared-borrow call position after MIR has emitted the existing bounds-failure
 CFG at that argument position. `base` retains the root slot and ordered static struct/sum path;
 `index` is the once-evaluated checked integer operand; `element_ty` is recomputed from the concrete
-dynamic-array class. The record is a guarded descriptor, not a materialized pointer. Direct,
+dynamic-array class. The record is a guarded descriptor, not a materialized pointer. Its guard
+names a unique inert reservation marker emitted before index evaluation and the exact checked
+length value; it never stores block or statement ordinals. After all MIR rewrites, validation
+locates that marker and reconstructs the unique canonical bounds-success edge from the checked
+length and index, so block compaction and statement fusion cannot stale the proof. Direct,
 imported, and indirect call lowering preserve and validate the selected function type's parameter
 mode. MIR validation rejects a mismatched base type, unsupported array class, wrong element type,
 missing slot/path, non-`borrow` target mode, cleanup bit, malformed index operand, a use not
@@ -256,7 +260,7 @@ behavior. No interface-format or runtime-ABI version changes.
 | Move-in, move-out, source nulling, replacement, and return | Projection and indexed borrow perform none. Whole projected payload/array/element consumption, storage, return, capture, and mutable element replacement reject. Owning matches and ordinary whole-array moves remain unchanged. | MoveCheck parameterized negative matrix; repeated source use; owning parity; source replacement invalidates returned views. |
 | Borrow roots and escape | Indexed element calls substitute the complete array storage roots, generation, and contained region roots into returned views and mutable destinations. Apply exact direct `BorrowMutRetentionSummary` rows and conservative imported/indirect/missing-body fallback; require the destination to outlive every substituted root. | returned and mutably retained string/slice view positives; exact direct versus fallback retention; arena/local/destination escape negatives; move/drop/borrow-mut peer invalidation; no index-as-root artifact. |
 | Control flow and eager call evaluation | Match and indexed calls compose with `if`, nested ordinary blocks, loop joins, divergent arms, and early return without manufacturing moves or fallthrough. Reserve the source root before evaluating the index once in argument order and carry the eager snapshot through every later argument to the call action; reject same/overlapping-root move, Drop, replacement, by-value transfer, or `borrow mut`, conservatively reject uncertain imported/indirect invalidation, and permit unrelated-root mutation. A terminating index creates no guard/descriptor/later argument/action; a terminating later argument creates no action-boundary pointer/call. `else`, `?`, and nested match over a projected binding retain their existing exclusions. | direct control-family owner matrix; `?`/return/break/exit/abort/diverge index no-guard/no-descriptor/no-later-argument/no-call twins; same-root invalidation in the index and each earlier/middle/final later-argument position for every operation; uncertain indirect/imported negative; unrelated mutation positive; return/break/exit/abort/diverge later-argument twins; side-effecting index and multi-argument order runtime owner; unchanged plan-26 negatives and owning control owners. |
-| MIR and checked HIR | Recompute exact payload eligibility and cleanup exclusions; validate Copy `Index`/`ElemField` projection roots and every borrowed element base/index/type/mode and direct/indirect selected mode; include the descriptor in exhaustive traversal, printing, fingerprinting, and variant tripwires. A terminating index emits no action. On fallthrough MIR emits the existing bounds-failure CFG at the argument position, carries no pointer through later arguments, and validation requires its exact successful guard to dominate the action plus root preservation on every intervening fallthrough path. | forged payload/static type/path/cleanup and Copy-view root records; malformed element slot/path/class/index/type/mode/target/guard; parameterized `BorrowedElementBase.owner_fact` mutation owners for empty, each removed fact, extra, duplicate, unsorted, each alternate/wrong `kind`, out-of-range and wrong in-range `ordinal`, missing-root/invalid-segment/valid-other-place `path`, and stale replacement/move/Drop/join generation or contained-root set; forced terminating-index guard/descriptor rejection; intervening invalidation and missing action revalidation; bounds-failure no-later-argument/no-call owner; terminating-later-argument no-pointer/no-call owner; print/fingerprint goldens and validator rejection. |
+| MIR and checked HIR | Recompute exact payload eligibility and cleanup exclusions; validate Copy `Index`/`ElemField` projection roots and every borrowed element base/index/type/mode and direct/indirect selected mode; include the descriptor in exhaustive traversal, printing, fingerprinting, and variant tripwires. A terminating index emits no action. On fallthrough MIR emits one inert, uniquely identified reservation marker before index evaluation and the existing bounds-failure CFG at the argument position, carries no pointer through later arguments, and validation locates the marker and reconstructs the unique canonical successful guard after every MIR rewrite. The descriptor stores no block or statement ordinal. The reconstructed success edge must dominate the action, and every intervening fallthrough path must preserve the root. | forged payload/static type/path/cleanup and Copy-view root records; malformed element slot/path/class/index/type/mode/target/guard; parameterized `BorrowedElementBase.owner_fact` mutation owners for empty, each removed fact, extra, duplicate, unsorted, each alternate/wrong `kind`, out-of-range and wrong in-range `ordinal`, missing-root/invalid-segment/valid-other-place `path`, and stale replacement/move/Drop/join generation or contained-root set; forced terminating-index guard/descriptor rejection; intervening invalidation and missing action revalidation; bounds-failure no-later-argument/no-call owner; terminating-later-argument no-pointer/no-call owner; block-compaction and statement-fusion owners proving reservation/guard identity survives all post-lowering rewrites; print/fingerprint goldens and validator rejection. |
 | LLVM and layout | Address tags, headers, elements, and record fields in place with canonical type tables after MIR's dominating bounds guard; LLVM performs pure pointer lowering with no second bounds semantic decision, owner aggregate load, element copy, source null, cleanup, allocation, or runtime call. | raw MIR CFG/dominance and LLVM assertions for scalar/string/Move-record arrays, nested field base, alignment/stride, and malformed lowering errors rather than panic. |
 | Generic, interface, and cache | Concrete substitution reruns both predicates; whole/per-unit results agree; reachable element-graph edits invalidate exact dependents while unrelated edits remain hits. | generic and imported driver owners; interface hash and isolated cold/hit/edit/revert cache owner. |
 | Real consumer | The exact `PromptEvaluationResult`/`PromptEvaluationEvidence` graph matches array-bearing options, passes Move task/row/trace/aggregate/reason/expected-input elements to borrowed helpers, and leaves both decoded roots usable. | align-llm `c6-borrowed-array-adoption`, complete C6c2 owner matrix, whole/per-unit check, and final `make ci`. |
@@ -264,6 +268,148 @@ behavior. No interface-format or runtime-ABI version changes.
 One parameterized owner may close multiple rows when it fails for every listed defect. No benchmark
 is required: this capability makes no performance/resource promise. Pointer/no-copy and allocation
 absence are correctness assertions.
+
+### Closure matrix reopened: post-lowering MIR identity
+
+The implementation review found that the first candidate stored the reservation block/statement
+ordinals and bounds-success block ordinal in `BorrowedElementGuard`. Those coordinates were valid
+when lowering created the descriptor but became stale when `simplify_known_drop_flags` compacted
+blocks or `fuse_builder_writes` deleted earlier statements. The missed invariant is that a safety
+proof consumed after MIR rewrites must use identities preserved by every rewrite, not positions in
+the pre-rewrite container.
+
+The redesigned boundary emits one inert reservation statement with a function-local monotonic
+token before index evaluation. The descriptor stores that token and the checked length value only.
+Validation after all rewrites requires exactly one matching marker for the same root, derives the
+unique canonical bounds branch from the descriptor's index and length values, and then performs
+dominance and root-preservation checks using the marker's final block/statement location and the
+derived final success block. MIR rewrites preserve the marker as a non-movable statement and need
+no descriptor-specific coordinate remapping. Dedicated owners force both block deletion/compaction
+and statement fusion before validating the resulting indexed-borrow call.
+
+### Closure matrix reopened: validator dominance and complete action boundary
+
+The redesigned-candidate review found four cells that structural type equality alone did not
+close. Checked HIR could name a valid sum-payload path outside the arm that activated that payload;
+MIR validation did not prove that the reservation marker preceded its SSA index/length evidence
+within a shared block; root preservation stopped immediately before the call and therefore missed
+an overlapping `borrow mut` argument in that same action; and recursive dynamic-record admission
+inherited the pre-extension classifier's `Soa` leaf even though this plan excludes every
+specialized collection.
+
+The validator boundary is reopened on one complete-dominance invariant:
+
+- every sum-payload segment in a borrowed element base must have an exact active
+  `BorrowedProjection` prefix in the currently traversed match arm, and that fact expires when the
+  arm body exits;
+- the stable reservation marker must dominate the final index and checked-length definitions and
+  precede either definition when they share its block;
+- root-preservation inspection includes the call statement itself, so any same-root `borrow mut`
+  argument conflicts with the interior shared borrow before pointer formation; and
+- the recursive payload classifier treats `Soa` as an excluded leaf at every depth, with a nested
+  dynamic-record witness beside the existing top-level specialized-array exclusions.
+
+Owner mutations move a valid projected indexed call outside its activating arm, move the marker
+after its length evidence, alias a valid disjoint `borrow mut` call argument to the indexed root,
+and place a `Soa` field inside an otherwise admitted AoS dynamic record. Each must fail at its
+own checked-HIR, MIR, or classifier boundary while the corresponding valid twin remains accepted.
+
+### Closure matrix reopened: activation root identity
+
+The next redesigned-candidate review found that active-arm validation compared the exact payload
+path but not the root that owns that path. Two borrowed sums of the same type therefore had
+identical path shapes, and an active arm for one root could incorrectly authorize forged indexed
+metadata for the other root.
+
+Payload activation is the pair `(root_local, exact projection-path prefix)`. Every sum segment in a
+borrowed element path must match both components from one currently active arm; neither component
+can be borrowed from another arm entry. The owner uses two same-shaped borrowed sum parameters,
+keeps the first arm active, rewrites the indexed metadata and canonical owner facts to the second
+parameter, and requires checked-HIR rejection while the unmodified first-root twin remains valid.
+
+### Closure matrix reopened: call invalidation and dynamic element grammar
+
+The following redesigned-candidate review found two remaining enumeration gaps. The complete call
+action classified a same-root `borrow mut` peer as invalidating but not a by-value Move argument
+loaded from the same root, and the recursive payload classifier reused itself for `DynArray`'s
+element even though the language representation excludes nested dynamic arrays.
+
+Call-action validation uses one mode-complete invalidation classifier. A `borrow` peer is read-only;
+a same-root `borrow mut` place invalidates the reservation; and a by-value argument invalidates it
+when its `Arg`/`Load`/`Use` provenance reaches the reserved root. Direct, imported, indirect, and
+cleanup-returning calls all use that classifier. The malformed owner redirects a valid disjoint
+by-value peer's load to the reserved root and requires rejection at the same pre-pointer boundary
+as the existing mutable-peer owner.
+
+`DynArray` is a grammar boundary rather than another recursive edge. Its element is one of the
+ordinary primitive, `string`, or `str` scalar representations; nested dynamic arrays and every
+other aggregate/specialized scalar tag fail closed. AoS `DynStructArray` remains the sole recursive
+dynamic-record edge, and its record fields continue through the closed cycle-safe classifier. A
+direct nested-`DynArray` classifier witness sits beside the existing specialized-array exclusions.
+
+### Closure matrix reopened: action-bounded function validation index
+
+The next redesigned-candidate review found three related failures in the post-rewrite MIR proof.
+Root-preservation reachability crossed the current call action and followed a loop back-edge into a
+later iteration; a forged `RawCall` could carry a borrowed-element descriptor even though raw calls
+are not an admitted target; and each descriptor independently rescanned definitions and recomputed
+dominators, making validation scale roughly cubically on functions with many indexed borrows.
+
+LLVM preflight now builds one validation index per MIR function containing a reservation marker.
+The index records CFG adjacency, entry reachability, dominators, unique SSA-definition positions,
+and reservation positions once. Each descriptor performs only indexed lookups plus an
+action-bounded path query: forward traversal stops at the current action before intersecting the
+blocks that can reach that action, so no later loop iteration enters the preservation interval.
+Functions without reservation markers take a constant-shape early return and do not compute
+dominators. Raw calls reject every borrowed-element operand during callable preflight, independently
+of forged signature modes; the shared call-invalidation classifier also handles raw calls
+defensively for malformed MIR that reaches preservation analysis.
+
+The owner matrix adds a loop whose source mutation occurs only after the valid call action and a
+forged typed raw call carrying the otherwise valid descriptor. The first must lower successfully;
+the second must fail in callable preflight before pointer construction. Existing multi-argument and
+multi-call owners exercise repeated descriptors through the one function-scoped index. This closes
+the missed action boundary, target-kind exhaustiveness, and validation-cost axes without adding a
+performance promise or benchmark.
+
+### Closure matrix reopened: root-derived ownership termination
+
+The subsequent full review found that slot-targeted invalidation and by-value call consumption did
+not cover `DropValue` applied to an SSA value loaded from the reserved array root. It also found
+that the `Arg`/`Load`/`Use` provenance walk still found each definition by rescanning all blocks,
+undermining the function-scoped validation index.
+
+One indexed provenance query now follows `Arg`, `Load`, and `Use` through unique definitions from
+the function index. It is shared by by-value call invalidation and every statement-level ownership
+terminator whose operand can name derived storage: `DropValue`, arena/raw/task-group termination,
+and generated column-batch finish/drop. A cycle, duplicate definition, absent definition, or other
+rvalue fails to prove derivation; the surrounding callable/type preflight remains responsible for
+rejecting malformed operand kinds. The dedicated malformed-MIR owner loads the reserved array root,
+drops that SSA value before the call, and requires rejection before pointer formation. Existing
+by-value direct-call and `Use`-chain owners exercise the same indexed provenance authority.
+
+### Closure matrix reopened: use-site root validity
+
+The next full review showed that type-table membership was being mistaken for a live HIR place and
+that MIR derivation omitted direct borrowed-place operands. A forged descriptor could therefore
+name a same-typed local declared later, an exited sibling-scope local, or a projection-only binding
+with no independent storage; an operand-based terminator could also free the root through a direct
+`BorrowedPlace` while the reservation remained apparently valid.
+
+Checked HIR now performs one source-ordered, scope-aware root-use pass over the existing stack-safe
+body event topology. Parameters start live; a `let` or tuple binding becomes live only after its
+initializer completes; block and match-arm scopes remove their locals on exit; and borrowed
+projection bindings are never accepted as storage roots. Every `BorrowedIndex` must name one of
+those live roots at its exact expression-enter event before path typing, active-payload proof, and
+owner-fact equality are considered. MIR's shared indexed derivation authority recognizes `Arg`,
+`Load`, `Use`, direct `BorrowedPlace`, and nested `BorrowedElementPlace` roots, so all call and
+ownership-termination consumers see the same place closure.
+
+Mutation owners retarget a valid descriptor to a later local, an exited nested-block local, and an
+active projection-only binding; each must fail checked HIR before MIR. A separate malformed-MIR
+owner drops a direct borrowed place during the reservation and must fail before pointer formation.
+Together these owners close formation order, lexical lifetime, projection storage, and direct-place
+derivation as one use-site validity axis.
 
 ## 6. PR boundaries and gates
 
@@ -328,3 +474,19 @@ The author-side ledger-to-prose pass is complete:
 | P1: ordinary Copy-view indexing from an array-bearing borrowed projection lacked region owners | Add a dedicated public ledger and closure row for direct/field/projected `array<str>` and AoS Copy-record-with-view indexing. Existing `Index`/`ElemField` facts must inherit the projection generation and contained input/arena roots through return, exact/fallback mutable retention, control, and escape checks. The specifications, HIR contract, prerequisite row, and real owner matrix now include both region-tracked sibling shapes. |
 | P1: slice-bearing Copy-record projections had no exact acceptance owner | Define Copy projection provenance over the complete array/record-admitted Copy and canonical borrow/region-classifier intersection, not a `str` special case. Add direct and nested `slice<T>` witnesses beside `str` plus a parameterized type-class sweep that fails whenever any admitted region-bearing Copy leaf lacks `Index`/`ElemField` provenance and escape owners. |
 | P2: `BorrowedElementBase.owner_fact` rejection had no field-complete mutation owner | Make the validation evidence exhaustive over vector shape, canonical ordering, every record field, typed path structure, and stale flow state. The representation contract and closure matrix now name empty/removal/extra/duplicate/order, all `kind`/`ordinal`/`path` mutations, and replacement/move/Drop/join staleness for multi-root facts. |
+| P1 implementation review: borrowed-element guards stored block and statement ordinals that post-lowering MIR rewrites did not maintain | Reopen the closure matrix on post-lowering identity. Replace every stored coordinate with one inert function-local reservation token, derive the unique canonical bounds-success edge from stable value identities after rewrites, and locate the marker's final position before checking dominance and root preservation. Block-compaction and statement-fusion owners close both rewrite classes without transform-specific descriptor remapping. |
+| P1 redesigned-candidate review: a typed sum-payload path could be used outside the match arm that activated it | Track exact active `BorrowedProjection` path prefixes while traversing each arm and expire them at the arm body's exit. A forged projected indexed call moved outside its arm must fail checked-HIR validation. |
+| P1 redesigned-candidate review: block dominance did not prove that the reservation marker preceded same-block bounds evidence | Locate the final index and length SSA definitions after rewrites, require marker-block dominance, and require marker-before-definition ordering when either definition shares the marker block. A marker moved after the length owner fails before pointer lowering. |
+| P1 redesigned-candidate review: preservation scanning excluded the call action and missed an overlapping `borrow mut` peer argument | Include the current call statement in the preservation interval. A disjoint peer remains valid, while mutating its borrowed-place slot to the indexed root fails before either pointer can be used. |
+| P2 redesigned-candidate review: recursive AoS admission inherited the explicitly excluded `Soa` leaf | Remove `Soa` from the closed recursive payload grammar and add a nested-field classifier owner so no ordinary dynamic record can smuggle in a specialized collection. |
+| P1 activation-identity review: an active payload path on one borrowed sum authorized the same path shape on another root | Reopen activation as the exact `(root_local, projection path)` pair. A two-parameter mutation owner redirects valid indexed metadata and its canonical owner facts to the inactive same-shaped root and requires checked-HIR rejection. |
+| P1 call-invalidation review: a by-value Move peer could consume the indexed root at the same call action | Replace the mutable-only call check with a mode-complete invalidation classifier. Trace by-value `Arg`/`Load`/`Use` provenance to the reserved root and add a malformed direct-call owner that redirects a valid disjoint peer load. |
+| P2 dynamic-element review: recursive `DynArray` admission accepted the explicitly excluded `array<array<T>>` shape | Make `DynArray` a non-recursive grammar boundary over ordinary primitive, `string`, and `str` elements. Add a nested dynamic-array classifier witness beside the closed specialized-array set. |
+| P2 action-boundary review: root-preservation scanning followed a loop back-edge beyond the current call action | Bound forward reachability at the current action before intersecting paths that can reach it. Add a valid loop owner whose same-root mutation is reachable only after the action and on the next iteration. |
+| P1 raw-call review: forged MIR could pass a borrowed-element descriptor through `RawCall`, outside the admitted target set | Reject every borrowed-element operand in raw-call callable preflight regardless of forged signature mode, and retain defensive raw-call invalidation classification. Add a typed forged-raw-call owner that fails before pointer construction. |
+| P2 validation-cost review: each descriptor repeatedly scanned all definitions and recomputed CFG dominance | Build one marker-gated validation index per function with adjacency, reachability, dominators, SSA definitions, and reservations. Descriptor checks use indexed lookups and one action-bounded path traversal; existing repeated-call owners cover reuse. |
+| P1 ownership-termination review: `DropValue` could free a root-derived array SSA value during a live reservation | Route every operand-based ownership terminator through the same root-derivation query used by by-value calls. Add a malformed-MIR owner that loads and drops the reserved root before the action and must fail before pointer construction. |
+| P2 provenance-cost review: `Arg`/`Load`/`Use` tracing rescanned every block for each value | Resolve every value through the function-scoped unique-definition index and retain cycle detection. The by-value and value-drop owners share this indexed authority. |
+| P1 use-site-root review: checked HIR accepted a same-typed local that was declared later, out of scope, or projection-only | Add one stack-safe source-order/scope pass. Require the exact root to be live at the `BorrowedIndex` event and independently storage-owning before path and owner-fact validation. Add later-local, exited-scope, and projection-binding mutations. |
+| P1 direct-place review: operand-based termination could free the root through `BorrowedPlace` | Extend the shared derivation query to direct and nested borrowed places, and add a malformed direct-place `DropValue` owner that fails before pointer construction. |
+| P2 final review: index checking dropped the i64 result context needed to infer generic index-producing calls | Route ordinary and borrowed-element indices through one index-specific contextual checker. It supplies i64 to producer inference, skips final value reconciliation only when the checked index cannot fall through, and retains the existing integer rejection on reachable values. One owner covers generic result inference in both index paths; the termination-family owners preserve return, break, exit, abort, and divergence behavior. |
