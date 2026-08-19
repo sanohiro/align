@@ -388,6 +388,29 @@ rejecting malformed operand kinds. The dedicated malformed-MIR owner loads the r
 drops that SSA value before the call, and requires rejection before pointer formation. Existing
 by-value direct-call and `Use`-chain owners exercise the same indexed provenance authority.
 
+### Closure matrix reopened: use-site root validity
+
+The next full review showed that type-table membership was being mistaken for a live HIR place and
+that MIR derivation omitted direct borrowed-place operands. A forged descriptor could therefore
+name a same-typed local declared later, an exited sibling-scope local, or a projection-only binding
+with no independent storage; an operand-based terminator could also free the root through a direct
+`BorrowedPlace` while the reservation remained apparently valid.
+
+Checked HIR now performs one source-ordered, scope-aware root-use pass over the existing stack-safe
+body event topology. Parameters start live; a `let` or tuple binding becomes live only after its
+initializer completes; block and match-arm scopes remove their locals on exit; and borrowed
+projection bindings are never accepted as storage roots. Every `BorrowedIndex` must name one of
+those live roots at its exact expression-enter event before path typing, active-payload proof, and
+owner-fact equality are considered. MIR's shared indexed derivation authority recognizes `Arg`,
+`Load`, `Use`, direct `BorrowedPlace`, and nested `BorrowedElementPlace` roots, so all call and
+ownership-termination consumers see the same place closure.
+
+Mutation owners retarget a valid descriptor to a later local, an exited nested-block local, and an
+active projection-only binding; each must fail checked HIR before MIR. A separate malformed-MIR
+owner drops a direct borrowed place during the reservation and must fail before pointer formation.
+Together these owners close formation order, lexical lifetime, projection storage, and direct-place
+derivation as one use-site validity axis.
+
 ## 6. PR boundaries and gates
 
 The design lands first. Its independent adversarial review must resolve the public grammar,
@@ -464,3 +487,5 @@ The author-side ledger-to-prose pass is complete:
 | P2 validation-cost review: each descriptor repeatedly scanned all definitions and recomputed CFG dominance | Build one marker-gated validation index per function with adjacency, reachability, dominators, SSA definitions, and reservations. Descriptor checks use indexed lookups and one action-bounded path traversal; existing repeated-call owners cover reuse. |
 | P1 ownership-termination review: `DropValue` could free a root-derived array SSA value during a live reservation | Route every operand-based ownership terminator through the same root-derivation query used by by-value calls. Add a malformed-MIR owner that loads and drops the reserved root before the action and must fail before pointer construction. |
 | P2 provenance-cost review: `Arg`/`Load`/`Use` tracing rescanned every block for each value | Resolve every value through the function-scoped unique-definition index and retain cycle detection. The by-value and value-drop owners share this indexed authority. |
+| P1 use-site-root review: checked HIR accepted a same-typed local that was declared later, out of scope, or projection-only | Add one stack-safe source-order/scope pass. Require the exact root to be live at the `BorrowedIndex` event and independently storage-owning before path and owner-fact validation. Add later-local, exited-scope, and projection-binding mutations. |
+| P1 direct-place review: operand-based termination could free the root through `BorrowedPlace` | Extend the shared derivation query to direct and nested borrowed places, and add a malformed direct-place `DropValue` owner that fails before pointer construction. |

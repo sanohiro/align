@@ -19265,6 +19265,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
     ) -> bool {
         match operand {
             Operand::Arg(index) => self.f.params.get(*index as usize) == Some(&root),
+            Operand::BorrowedPlace(place) => place.slot == root,
+            Operand::BorrowedElementPlace(place) => place.base.slot == root,
             Operand::Value(value) if visited.insert(*value) => {
                 let Some((_, _, rvalue)) = self.unique_mir_value_def(*value) else {
                     return false;
@@ -20377,6 +20379,46 @@ mod tests {
         assert_lowering(
             emit_llvm_ir(&dropped_value, &BuildTarget::Baseline, false, &[], None)
                 .expect_err("dropping a root-derived value during a reservation must fail"),
+            "borrowed element array root changes between its bounds guard and call action",
+        );
+
+        let mut dropped_place = mir(source);
+        let function = dropped_place
+            .fns
+            .iter_mut()
+            .find(|function| function.name.as_str().ends_with("use"))
+            .unwrap_or_else(|| panic!("place-drop fixture function"));
+        let (block_index, call_position, place) = function
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(block_index, block)| {
+                block
+                    .stmts
+                    .iter()
+                    .enumerate()
+                    .find_map(|(statement, value)| match value {
+                        Stmt::Let(_, Rvalue::Call(_, arguments)) => arguments
+                            .iter()
+                            .find_map(|argument| match argument {
+                                Operand::BorrowedElementPlace(place) => Some((
+                                    block_index,
+                                    statement,
+                                    place.base.clone(),
+                                )),
+                                _ => None,
+                            }),
+                        _ => None,
+                    })
+            })
+            .unwrap_or_else(|| panic!("place-drop fixture call"));
+        function.blocks[block_index].stmts.insert(
+            call_position,
+            Stmt::DropValue(Operand::BorrowedPlace(Box::new(place))),
+        );
+        assert_lowering(
+            emit_llvm_ir(&dropped_place, &BuildTarget::Baseline, false, &[], None)
+                .expect_err("dropping a direct borrowed root place during a reservation must fail"),
             "borrowed element array root changes between its bounds guard and call action",
         );
 

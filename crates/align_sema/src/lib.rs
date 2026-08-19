@@ -9015,6 +9015,128 @@ fn borrowed_element_payload_path_is_active(
     })
 }
 
+/// Record the borrowed-index nodes whose root is a real, currently live HIR place. `Fn::locals`
+/// is a function-wide type table, not source-order evidence: a later declaration, an exited sibling
+/// scope, or a projection-only match binding can all have a valid local id and type without owning
+/// storage at this use site.
+fn borrowed_element_live_root_uses(function: &hir::Fn) -> Option<HashSet<usize>> {
+    enum Frame<'a> {
+        Scope(Vec<LocalId>),
+        Statement(&'a hir::Stmt),
+        Other,
+    }
+
+    fn declare(
+        local: LocalId,
+        function: &hir::Fn,
+        live: &mut HashSet<LocalId>,
+        frames: &mut [(usize, Frame<'_>)],
+    ) -> bool {
+        if function.locals.get(local as usize).is_none() || !live.insert(local) {
+            return false;
+        }
+        let Some(Frame::Scope(locals)) = frames.iter_mut().rev().find_map(|(_, frame)| {
+            matches!(frame, Frame::Scope(_)).then_some(frame)
+        }) else {
+            return false;
+        };
+        locals.push(local);
+        true
+    }
+
+    let projection_locals = borrowed_projection_locals(&function.body);
+    let mut live = function.params.iter().copied().collect::<HashSet<_>>();
+    if live.len() != function.params.len()
+        || live
+            .iter()
+            .any(|local| function.locals.get(*local as usize).is_none())
+    {
+        return None;
+    }
+    let mut valid = HashSet::new();
+    let mut frames: Vec<(usize, Frame<'_>)> = Vec::new();
+    for event in hir_depth::clone_events(&function.body)? {
+        match event {
+            hir_depth::CloneEvent::RecordEnter { id, record } => {
+                let frame = match record {
+                    hir_depth::BodyRecord::Block(_) => Frame::Scope(Vec::new()),
+                    hir_depth::BodyRecord::MatchArm { arm, .. } => {
+                        let mut locals = Vec::with_capacity(arm.bindings.len());
+                        for local in &arm.bindings {
+                            if function.locals.get(*local as usize).is_none()
+                                || !live.insert(*local)
+                            {
+                                return None;
+                            }
+                            locals.push(*local);
+                        }
+                        Frame::Scope(locals)
+                    }
+                    hir_depth::BodyRecord::Stmt(statement) => Frame::Statement(statement),
+                    hir_depth::BodyRecord::Expr(expression) => {
+                        if let ExprKind::BorrowedIndex { base, .. } = &expression.kind
+                            && live.contains(&base.root_local)
+                            && !projection_locals.contains(&base.root_local)
+                        {
+                            valid.insert(expression as *const Expr as usize);
+                        }
+                        Frame::Other
+                    }
+                    hir_depth::BodyRecord::Stage(_)
+                    | hir_depth::BodyRecord::TemplatePart(_)
+                    | hir_depth::BodyRecord::BlockExit { .. }
+                    | hir_depth::BodyRecord::StmtExit { .. }
+                    | hir_depth::BodyRecord::ExprExit { .. }
+                    | hir_depth::BodyRecord::MatchArmExit { .. }
+                    | hir_depth::BodyRecord::StageExit { .. }
+                    | hir_depth::BodyRecord::TemplatePartExit { .. } => Frame::Other,
+                };
+                frames.push((id, frame));
+            }
+            hir_depth::CloneEvent::RecordExit { id } => {
+                let (entered, frame) = frames.pop()?;
+                if entered != id {
+                    return None;
+                }
+                match frame {
+                    Frame::Scope(locals) => {
+                        for local in locals {
+                            if !live.remove(&local) {
+                                return None;
+                            }
+                        }
+                    }
+                    Frame::Statement(hir::Stmt::Let { local, .. }) => {
+                        if !declare(*local, function, &mut live, &mut frames) {
+                            return None;
+                        }
+                    }
+                    Frame::Statement(hir::Stmt::LetTuple { locals, .. }) => {
+                        for local in locals.iter().flatten() {
+                            if !declare(*local, function, &mut live, &mut frames) {
+                                return None;
+                            }
+                        }
+                    }
+                    Frame::Statement(
+                        hir::Stmt::Assign { .. }
+                        | hir::Stmt::AssignIndex { .. }
+                        | hir::Stmt::AssignVecLane { .. }
+                        | hir::Stmt::AssignField { .. }
+                        | hir::Stmt::AssignElemField { .. }
+                        | hir::Stmt::AssignElem { .. }
+                        | hir::Stmt::Return(_)
+                        | hir::Stmt::Break { .. }
+                        | hir::Stmt::Expr(_),
+                    )
+                    | Frame::Other => {}
+                }
+            }
+        }
+    }
+    frames.is_empty().then_some(valid)
+}
+
 fn borrowed_element_metadata_is_valid(program: &hir::Program) -> bool {
     let named_modes = program
         .fns
@@ -9029,6 +9151,9 @@ fn borrowed_element_metadata_is_valid(program: &hir::Program) -> bool {
         .collect::<HashMap<_, _>>();
     for function in &program.fns {
         let events = hir_depth::body_events(&function.body);
+        let Some(live_root_uses) = borrowed_element_live_root_uses(function) else {
+            return false;
+        };
         let mut admitted_arguments = HashSet::new();
         let mut active_payload_paths = HashSet::new();
         let mut active_arms: Vec<(&Expr, Option<LocalId>, &[hir::BorrowedProjection])> = Vec::new();
@@ -9094,6 +9219,7 @@ fn borrowed_element_metadata_is_valid(program: &hir::Program) -> bool {
             let ExprKind::BorrowedIndex { base, index } = &expression.kind else { continue };
             if !admitted_arguments.contains(&(expression as *const Expr as usize))
                 || !active_payload_paths.contains(&(expression as *const Expr as usize))
+                || !live_root_uses.contains(&(expression as *const Expr as usize))
                 || (index.ty != Ty::Int(IntTy { bits: 64, signed: true })
                     && !hir_expr_diverges(index))
                 || expression.ty != base.element_ty
@@ -52749,6 +52875,79 @@ fn exit_branch(flag: bool) -> i64 {
     }
 
     #[test]
+    fn borrowed_element_root_must_be_live_storage_at_its_use_site() {
+        fn base_in_statement(function: &mut hir::Fn, statement: usize) -> &mut hir::BorrowedElementBase {
+            let hir::Stmt::Let { init, .. } = &mut function.body.stmts[statement] else {
+                panic!("indexed call statement must be a let");
+            };
+            let ExprKind::Call { args, .. } = &mut init.kind else {
+                panic!("indexed call initializer must be a call");
+            };
+            let ExprKind::BorrowedIndex { base, .. } = &mut args[0].kind else {
+                panic!("indexed call argument must retain borrowed metadata");
+            };
+            base
+        }
+
+        fn retarget_local(base: &mut hir::BorrowedElementBase, local: LocalId) {
+            base.root_local = local;
+            base.path = vec![hir::BorrowedPathSegment::RootSlot];
+            base.owner_fact = vec![hir::BorrowedRootFact {
+                kind: hir::BorrowedRootKind::Local,
+                ordinal: local,
+                path: base.path.clone(),
+            }];
+        }
+
+        let declarations = "Record { value: string }\nfn make() -> array<Record> { mut builder: array_builder<Record> := array_builder(); builder.push(Record { value: \"x\".clone() }); return builder.build() }\nfn inspect(borrow record: Record) -> i64 = record.value.len()\n";
+        let later_source = format!(
+            "{declarations}fn use() -> i64 {{\n  values := make()\n  result := inspect(values[0])\n  later := make()\n  return result + later.len()\n}}\nfn main() -> i32 = 0\n"
+        );
+        let (mut later, diagnostics) = check(&later_source);
+        assert!(!diagnostics.has_errors(), "later-local fixture must check");
+        assert!(checked_hir_body_facts_are_valid(&later));
+        let function = later
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "use")
+            .expect("use function");
+        let later_local = function
+            .locals
+            .iter()
+            .find(|local| local.name == "later")
+            .expect("later local")
+            .id;
+        retarget_local(base_in_statement(function, 1), later_local);
+        assert!(
+            !checked_hir_body_facts_are_valid(&later),
+            "a local declared after the indexed use must fail checked HIR"
+        );
+
+        let exited_source = format!(
+            "{declarations}fn use() -> i64 {{\n  retained := {{ nested := make(); nested }}\n  values := make()\n  result := inspect(values[0])\n  return result + retained.len()\n}}\nfn main() -> i32 = 0\n"
+        );
+        let (mut exited, diagnostics) = check(&exited_source);
+        assert!(!diagnostics.has_errors(), "exited-scope fixture must check");
+        assert!(checked_hir_body_facts_are_valid(&exited));
+        let function = exited
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "use")
+            .expect("use function");
+        let nested_local = function
+            .locals
+            .iter()
+            .find(|local| local.name == "nested")
+            .expect("nested local")
+            .id;
+        retarget_local(base_in_statement(function, 2), nested_local);
+        assert!(
+            !checked_hir_body_facts_are_valid(&exited),
+            "an exited nested-scope local must fail checked HIR"
+        );
+    }
+
+    #[test]
     fn borrowed_element_payload_path_requires_its_active_match_arm() {
         let fixtures = [
             (
@@ -52840,6 +53039,42 @@ fn exit_branch(flag: bool) -> i64 {
         assert!(
             !checked_hir_body_facts_are_valid(&wrong_root),
             "an active path from a different same-shaped root must fail closed"
+        );
+
+        let projection_source = "Record { value: string }\nfn inspect(borrow record: Record) -> i64 = record.value.len()\nfn use(borrow active: Option<array<Record>>) -> i64 = match active {\n  Some(records) => inspect(records[0])\n  None => 0\n}\nfn main() -> i32 = 0\n";
+        let (mut projection_root, diagnostics) = check(projection_source);
+        assert!(!diagnostics.has_errors(), "projection-root fixture must check");
+        let function = projection_root
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "use")
+            .expect("use function");
+        let ExprKind::Match { arms, .. } = &mut function
+            .body
+            .value
+            .as_mut()
+            .expect("use body value")
+            .kind
+        else {
+            panic!("use body must be a match");
+        };
+        let binding = arms[0].borrowed_bindings[0].binding_local;
+        let ExprKind::Call { args, .. } = &mut arms[0].body.kind else {
+            panic!("Some arm must call inspect");
+        };
+        let ExprKind::BorrowedIndex { base, .. } = &mut args[0].kind else {
+            panic!("inspect argument must retain borrowed metadata");
+        };
+        base.root_local = binding;
+        base.path = vec![hir::BorrowedPathSegment::RootSlot];
+        base.owner_fact = vec![hir::BorrowedRootFact {
+            kind: hir::BorrowedRootKind::Local,
+            ordinal: binding,
+            path: base.path.clone(),
+        }];
+        assert!(
+            !checked_hir_body_facts_are_valid(&projection_root),
+            "a projection-only binding must not become an independent storage root"
         );
     }
 
