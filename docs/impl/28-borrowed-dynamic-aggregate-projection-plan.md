@@ -314,6 +314,19 @@ after its length evidence, alias a valid disjoint `borrow mut` call argument to 
 and place a `Soa` field inside an otherwise admitted AoS dynamic record. Each must fail at its
 own checked-HIR, MIR, or classifier boundary while the corresponding valid twin remains accepted.
 
+### Closure matrix reopened: activation root identity
+
+The next redesigned-candidate review found that active-arm validation compared the exact payload
+path but not the root that owns that path. Two borrowed sums of the same type therefore had
+identical path shapes, and an active arm for one root could incorrectly authorize forged indexed
+metadata for the other root.
+
+Payload activation is the pair `(root_local, exact projection-path prefix)`. Every sum segment in a
+borrowed element path must match both components from one currently active arm; neither component
+can be borrowed from another arm entry. The owner uses two same-shaped borrowed sum parameters,
+keeps the first arm active, rewrites the indexed metadata and canonical owner facts to the second
+parameter, and requires checked-HIR rejection while the unmodified first-root twin remains valid.
+
 ## 6. PR boundaries and gates
 
 The design lands first. Its independent adversarial review must resolve the public grammar,
@@ -382,3 +395,4 @@ The author-side ledger-to-prose pass is complete:
 | P1 redesigned-candidate review: block dominance did not prove that the reservation marker preceded same-block bounds evidence | Locate the final index and length SSA definitions after rewrites, require marker-block dominance, and require marker-before-definition ordering when either definition shares the marker block. A marker moved after the length owner fails before pointer lowering. |
 | P1 redesigned-candidate review: preservation scanning excluded the call action and missed an overlapping `borrow mut` peer argument | Include the current call statement in the preservation interval. A disjoint peer remains valid, while mutating its borrowed-place slot to the indexed root fails before either pointer can be used. |
 | P2 redesigned-candidate review: recursive AoS admission inherited the explicitly excluded `Soa` leaf | Remove `Soa` from the closed recursive payload grammar and add a nested-field classifier owner so no ordinary dynamic record can smuggle in a specialized collection. |
+| P1 activation-identity review: an active payload path on one borrowed sum authorized the same path shape on another root | Reopen activation as the exact `(root_local, projection path)` pair. A two-parameter mutation owner redirects valid indexed metadata and its canonical owner facts to the inactive same-shaped root and requires checked-HIR rejection. |

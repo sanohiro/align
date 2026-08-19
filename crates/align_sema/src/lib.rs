@@ -8990,7 +8990,7 @@ fn borrowed_element_path_ty(
 
 fn borrowed_element_payload_path_is_active(
     base: &hir::BorrowedElementBase,
-    active_arms: &[(&Expr, &[hir::BorrowedProjection])],
+    active_arms: &[(&Expr, Option<LocalId>, &[hir::BorrowedProjection])],
 ) -> bool {
     base.path.iter().enumerate().all(|(index, segment)| {
         if !matches!(
@@ -9003,11 +9003,15 @@ fn borrowed_element_payload_path_is_active(
             return true;
         }
         let prefix = &base.path[..=index];
-        active_arms.iter().rev().any(|(_, projections)| {
-            projections
-                .iter()
-                .any(|projection| projection.path == prefix)
-        })
+        active_arms
+            .iter()
+            .rev()
+            .any(|(_, root_local, projections)| {
+                *root_local == Some(base.root_local)
+                    && projections
+                        .iter()
+                        .any(|projection| projection.path == prefix)
+            })
     })
 }
 
@@ -9027,16 +9031,23 @@ fn borrowed_element_metadata_is_valid(program: &hir::Program) -> bool {
         let events = hir_depth::body_events(&function.body);
         let mut admitted_arguments = HashSet::new();
         let mut active_payload_paths = HashSet::new();
-        let mut active_arms: Vec<(&Expr, &[hir::BorrowedProjection])> = Vec::new();
+        let mut active_arms: Vec<(&Expr, Option<LocalId>, &[hir::BorrowedProjection])> = Vec::new();
         for event in &events {
             match event {
-                hir_depth::BodyEvent::MatchArmEnter { arm, .. } => {
-                    active_arms.push((&arm.body, &arm.borrowed_bindings));
+                hir_depth::BodyEvent::MatchArmEnter { scrutinee, arm } => {
+                    let root_local = stable_borrowed_match_place_for_fn_with_program(
+                        function,
+                        scrutinee,
+                        scrutinee.ty,
+                        program,
+                    )
+                    .map(|place| place.root_local);
+                    active_arms.push((&arm.body, root_local, &arm.borrowed_bindings));
                 }
                 hir_depth::BodyEvent::ExprExit { expression, .. } => {
                     if active_arms
                         .last()
-                        .is_some_and(|(body, _)| std::ptr::eq(*body, *expression))
+                        .is_some_and(|(body, _, _)| std::ptr::eq(*body, *expression))
                     {
                         active_arms.pop();
                     }
@@ -52788,6 +52799,44 @@ fn exit_branch(flag: bool) -> i64 {
                 "a {segment} path outside the arm that activated it must fail closed"
             );
         }
+
+        let source = "Record { value: string }\nfn inspect(borrow record: Record) -> i64 = record.value.len()\nfn use(borrow active: Option<array<Record>>, borrow inactive: Option<array<Record>>) -> i64 = match active {\n  Some(records) => inspect(records[0])\n  None => 0\n}\nfn main() -> i32 = 0\n";
+        let (mut wrong_root, diagnostics) = check(source);
+        assert!(
+            !diagnostics.has_errors(),
+            "same-shape root fixture must check: {:?}",
+            diagnostics.iter().collect::<Vec<_>>()
+        );
+        assert!(checked_hir_body_facts_are_valid(&wrong_root));
+        let function = wrong_root
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "use")
+            .expect("use function");
+        let inactive = function.params[1];
+        let ExprKind::Match { arms, .. } = &mut function
+            .body
+            .value
+            .as_mut()
+            .expect("use body value")
+            .kind
+        else {
+            panic!("use body must be a match");
+        };
+        let ExprKind::Call { args, .. } = &mut arms[0].body.kind else {
+            panic!("Some arm must call inspect");
+        };
+        let ExprKind::BorrowedIndex { base, .. } = &mut args[0].kind else {
+            panic!("inspect argument must retain its borrowed-element record");
+        };
+        base.root_local = inactive;
+        for fact in &mut base.owner_fact {
+            fact.ordinal = 1;
+        }
+        assert!(
+            !checked_hir_body_facts_are_valid(&wrong_root),
+            "an active path from a different same-shaped root must fail closed"
+        );
     }
 
     #[test]
