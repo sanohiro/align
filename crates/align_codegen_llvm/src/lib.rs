@@ -19221,7 +19221,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 0
             };
             let limit = if block.id == action {
-                action_statement.min(block.stmts.len())
+                action_statement
+                    .checked_add(1)
+                    .filter(|limit| *limit <= block.stmts.len())
+                    .ok_or_else(|| self.err("borrowed element call action position is malformed"))?
             } else {
                 block.stmts.len()
             };
@@ -19281,21 +19284,66 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let Operand::Value(len_value) = place.guard.len else {
             return Err(self.err("borrowed element guard length lacks a checked array-length value"));
         };
-        let sources = self
+        let length_definitions = self
             .f
             .blocks
             .iter()
-            .filter(|block| Self::mir_value_def(block, len_value).is_some())
+            .flat_map(|block| {
+                block
+                    .stmts
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(statement, candidate)| match candidate {
+                        Stmt::Let(candidate, rvalue) if *candidate == len_value => {
+                            Some((block, statement, rvalue))
+                        }
+                        _ => None,
+                    })
+            })
             .collect::<Vec<_>>();
-        let [source] = sources.as_slice() else {
+        let [(source, length_statement, length_rvalue)] = length_definitions.as_slice() else {
             return Err(self.err("borrowed element guard length has no unique definition"));
         };
         let expected_base = Operand::BorrowedPlace(Box::new(place.base.clone()));
         if !matches!(
-            Self::mir_value_def(source, len_value),
-            Some(Rvalue::SliceLen(base)) if Self::mir_operand_same(base, &expected_base)
+            length_rvalue,
+            Rvalue::SliceLen(base) if Self::mir_operand_same(base, &expected_base)
         ) {
             return Err(self.err("borrowed element guard length was not read from its array base"));
+        }
+        if !self.mir_block_dominates(*reservation_block, source.id)
+            || (source.id == *reservation_block
+                && *reservation_statement >= *length_statement)
+        {
+            return Err(self.err("borrowed element reservation does not precede its length evidence"));
+        }
+        if let Operand::Value(index_value) = place.index {
+            let index_definitions = self
+                .f
+                .blocks
+                .iter()
+                .flat_map(|block| {
+                    block
+                        .stmts
+                        .iter()
+                        .enumerate()
+                        .filter_map(move |(statement, candidate)| match candidate {
+                            Stmt::Let(candidate, _) if *candidate == index_value => {
+                                Some((block.id, statement))
+                            }
+                            _ => None,
+                        })
+                })
+                .collect::<Vec<_>>();
+            let [(index_block, index_statement)] = index_definitions.as_slice() else {
+                return Err(self.err("borrowed element index has no unique definition"));
+            };
+            if !self.mir_block_dominates(*reservation_block, *index_block)
+                || (*index_block == *reservation_block
+                    && *reservation_statement >= *index_statement)
+            {
+                return Err(self.err("borrowed element reservation does not precede its index evidence"));
+            }
         }
         let Term::Branch(Operand::Value(condition), failure, success) = &source.term else {
             return Err(self.err("borrowed element bounds guard has no canonical successful edge"));
@@ -20090,6 +20138,89 @@ mod tests {
         assert_lowering(
             emit_llvm_ir(&stale_before_guard, &BuildTarget::Baseline, false, &[], None)
                 .expect_err("a descriptor whose root changed during index evaluation must fail"),
+            "borrowed element array root changes between its bounds guard and call action",
+        );
+
+        let mut marker_after_length = mir(source);
+        let (function_index, place) = borrowed_element_place(&marker_after_length);
+        let Operand::Value(length) = place.guard.len else {
+            panic!("borrowed element length must be an SSA value")
+        };
+        let block = marker_after_length.fns[function_index]
+            .blocks
+            .iter_mut()
+            .find(|block| {
+                block.stmts.iter().any(|statement| {
+                    matches!(
+                        statement,
+                        Stmt::BorrowedElementReservation { token, .. }
+                            if *token == place.guard.reservation
+                    )
+                }) && block.stmts.iter().any(|statement| {
+                    matches!(statement, Stmt::Let(candidate, _) if *candidate == length)
+                })
+            })
+            .unwrap_or_else(|| panic!("same-block reservation and length evidence"));
+        let marker_position = block
+            .stmts
+            .iter()
+            .position(|statement| {
+                matches!(
+                    statement,
+                    Stmt::BorrowedElementReservation { token, .. }
+                        if *token == place.guard.reservation
+                )
+            })
+            .unwrap_or_else(|| panic!("reservation marker position"));
+        let marker = block.stmts.remove(marker_position);
+        let length_position = block
+            .stmts
+            .iter()
+            .position(|statement| {
+                matches!(statement, Stmt::Let(candidate, _) if *candidate == length)
+            })
+            .unwrap_or_else(|| panic!("length evidence position"));
+        block.stmts.insert(length_position + 1, marker);
+        assert_lowering(
+            emit_llvm_ir(&marker_after_length, &BuildTarget::Baseline, false, &[], None)
+                .expect_err("a reservation moved after its length evidence must fail"),
+            "borrowed element reservation does not precede its length evidence",
+        );
+
+        let overlapping_source = r#"Record { value: string }
+fn inspect(borrow record: Record, borrow mut other: array<Record>) -> i64 =
+  record.value.len() + other.len()
+fn use(borrow records: array<Record>, borrow mut other: array<Record>) -> i64 =
+  inspect(records[0], other)
+fn main() -> i32 = 0
+"#;
+        let mut overlapping_action = mir(overlapping_source);
+        let function = overlapping_action
+            .fns
+            .iter_mut()
+            .find(|function| function.name.as_str().ends_with("use"))
+            .unwrap_or_else(|| panic!("overlap fixture function"));
+        let arguments = function
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, Rvalue::Call(DirectCall::Program(target), arguments))
+                    if target.as_str().ends_with("inspect") => Some(arguments),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("overlap fixture call"));
+        let root = match &arguments[0] {
+            Operand::BorrowedElementPlace(place) => place.base.slot,
+            _ => panic!("first argument must be an indexed borrowed place"),
+        };
+        let Operand::BorrowedPlace(peer) = &mut arguments[1] else {
+            panic!("second argument must be a mutable borrowed place")
+        };
+        peer.slot = root;
+        assert_lowering(
+            emit_llvm_ir(&overlapping_action, &BuildTarget::Baseline, false, &[], None)
+                .expect_err("an indexed borrow and same-action borrow-mut peer must conflict"),
             "borrowed element array root changes between its bounds guard and call action",
         );
     }

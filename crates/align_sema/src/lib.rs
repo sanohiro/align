@@ -1286,7 +1286,7 @@ pub fn borrowed_sum_payload_is_admissible(
     ) -> bool {
         match ty {
             Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Unit | Ty::Str | Ty::String
-            | Ty::Slice(_) | Ty::Soa(_) | Ty::Raw | Ty::Rng => true,
+            | Ty::Slice(_) | Ty::Raw | Ty::Rng => true,
             Ty::Struct(id) => {
                 if !active_structs.insert(id) {
                     return false;
@@ -8988,6 +8988,29 @@ fn borrowed_element_path_ty(
     Some(ty)
 }
 
+fn borrowed_element_payload_path_is_active(
+    base: &hir::BorrowedElementBase,
+    active_arms: &[(&Expr, &[hir::BorrowedProjection])],
+) -> bool {
+    base.path.iter().enumerate().all(|(index, segment)| {
+        if !matches!(
+            segment,
+            hir::BorrowedPathSegment::EnumPayload { .. }
+                | hir::BorrowedPathSegment::OptionSome
+                | hir::BorrowedPathSegment::ResultOk
+                | hir::BorrowedPathSegment::ResultErr
+        ) {
+            return true;
+        }
+        let prefix = &base.path[..=index];
+        active_arms.iter().rev().any(|(_, projections)| {
+            projections
+                .iter()
+                .any(|projection| projection.path == prefix)
+        })
+    })
+}
+
 fn borrowed_element_metadata_is_valid(program: &hir::Program) -> bool {
     let named_modes = program
         .fns
@@ -9003,40 +9026,63 @@ fn borrowed_element_metadata_is_valid(program: &hir::Program) -> bool {
     for function in &program.fns {
         let events = hir_depth::body_events(&function.body);
         let mut admitted_arguments = HashSet::new();
+        let mut active_payload_paths = HashSet::new();
+        let mut active_arms: Vec<(&Expr, &[hir::BorrowedProjection])> = Vec::new();
         for event in &events {
-            let hir_depth::BodyEvent::ExprEnter(expression) = event else { continue };
-            match &expression.kind {
-                ExprKind::Call { func, args, .. } => {
-                    if let Some(modes) = named_modes.get(func.as_str()) {
-                        for (argument, mode) in args.iter().zip(*modes) {
-                            if *mode == ast::ParamMode::Borrow
-                                && matches!(argument.kind, ExprKind::BorrowedIndex { .. })
-                            {
-                                admitted_arguments.insert(argument as *const Expr as usize);
-                            }
-                        }
-                    }
+            match event {
+                hir_depth::BodyEvent::MatchArmEnter { arm, .. } => {
+                    active_arms.push((&arm.body, &arm.borrowed_bindings));
                 }
-                ExprKind::CallFnValue { callee, args } => {
-                    if let Ty::Fn(id) = callee.ty
-                        && let Some(signature) = program.fn_types.get(id as usize)
+                hir_depth::BodyEvent::ExprExit { expression, .. } => {
+                    if active_arms
+                        .last()
+                        .is_some_and(|(body, _)| std::ptr::eq(*body, *expression))
                     {
-                        for (argument, (mode, _)) in args.iter().zip(&signature.params) {
-                            if *mode == ast::ParamMode::Borrow
-                                && matches!(argument.kind, ExprKind::BorrowedIndex { .. })
-                            {
-                                admitted_arguments.insert(argument as *const Expr as usize);
-                            }
-                        }
+                        active_arms.pop();
                     }
                 }
-                _ => {}
+                hir_depth::BodyEvent::ExprEnter(expression) => {
+                    if let ExprKind::BorrowedIndex { base, .. } = &expression.kind
+                        && borrowed_element_payload_path_is_active(base, &active_arms)
+                    {
+                        active_payload_paths.insert(*expression as *const Expr as usize);
+                    }
+                    match &expression.kind {
+                        ExprKind::Call { func, args, .. } => {
+                            if let Some(modes) = named_modes.get(func.as_str()) {
+                                for (argument, mode) in args.iter().zip(*modes) {
+                                    if *mode == ast::ParamMode::Borrow
+                                        && matches!(argument.kind, ExprKind::BorrowedIndex { .. })
+                                    {
+                                        admitted_arguments.insert(argument as *const Expr as usize);
+                                    }
+                                }
+                            }
+                        }
+                        ExprKind::CallFnValue { callee, args } => {
+                            if let Ty::Fn(id) = callee.ty
+                                && let Some(signature) = program.fn_types.get(id as usize)
+                            {
+                                for (argument, (mode, _)) in args.iter().zip(&signature.params) {
+                                    if *mode == ast::ParamMode::Borrow
+                                        && matches!(argument.kind, ExprKind::BorrowedIndex { .. })
+                                    {
+                                        admitted_arguments.insert(argument as *const Expr as usize);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                hir_depth::BodyEvent::StmtEnter(_) | hir_depth::BodyEvent::StmtExit(_) => {}
             }
         }
         for event in events {
             let hir_depth::BodyEvent::ExprEnter(expression) = event else { continue };
             let ExprKind::BorrowedIndex { base, index } = &expression.kind else { continue };
             if !admitted_arguments.contains(&(expression as *const Expr as usize))
+                || !active_payload_paths.contains(&(expression as *const Expr as usize))
                 || (index.ty != Ty::Int(IntTy { bits: 64, signed: true })
                     && !hir_expr_diverges(index))
                 || expression.ty != base.element_ty
@@ -52449,6 +52495,7 @@ fn exit_branch(flag: bool) -> i64 {
                     })),
                 )],
             ),
+            structure("Specialized", vec![("rows", Ty::Soa(0))]),
         ];
         let variants = vec![hir::EnumDef {
             name: "Choice".to_string(),
@@ -52488,6 +52535,7 @@ fn exit_branch(flag: bool) -> i64 {
             Ty::DynResponseArray,
             Ty::Buffer,
             Ty::ArrayBuilder(Scalar::Int(IntTy { bits: 64, signed: true })),
+            Ty::DynStructArray(2, Layout::Aos),
             Ty::DynStructArray(99, Layout::Aos),
         ] {
             assert!(
@@ -52683,6 +52731,63 @@ fn exit_branch(flag: bool) -> i64 {
             .expect("inspect function")
             .param_modes[0] = ast::ParamMode::ByValue;
         assert!(!checked_hir_body_facts_are_valid(&wrong_mode));
+    }
+
+    #[test]
+    fn borrowed_element_payload_path_requires_its_active_match_arm() {
+        let fixtures = [
+            (
+                "OptionSome",
+                "Record { value: string }\nfn inspect(borrow record: Record) -> i64 = record.value.len()\nfn use(borrow maybe: Option<array<Record>>) -> i64 = match maybe {\n  Some(records) => inspect(records[0])\n  None => 0\n}\nfn main() -> i32 = 0\n",
+                0,
+            ),
+            (
+                "ResultOk",
+                "Record { value: string }\nfn inspect(borrow record: Record) -> i64 = record.value.len()\nfn use(borrow result: Result<array<Record>, array<Record>>) -> i64 = match result {\n  Ok(records) => inspect(records[0])\n  Err(records) => inspect(records[0])\n}\nfn main() -> i32 = 0\n",
+                0,
+            ),
+            (
+                "ResultErr",
+                "Record { value: string }\nfn inspect(borrow record: Record) -> i64 = record.value.len()\nfn use(borrow result: Result<array<Record>, array<Record>>) -> i64 = match result {\n  Ok(records) => inspect(records[0])\n  Err(records) => inspect(records[0])\n}\nfn main() -> i32 = 0\n",
+                1,
+            ),
+            (
+                "EnumPayload",
+                "Record { value: string }\nHolder { records: array<Record> }\nChoice { Wrapped(Holder), Empty }\nfn inspect(borrow record: Record) -> i64 = record.value.len()\nfn use(borrow choice: Choice) -> i64 = match choice {\n  Wrapped(holder) => inspect(holder.records[0])\n  Empty => 0\n}\nfn main() -> i32 = 0\n",
+                0,
+            ),
+        ];
+        for (segment, source, arm_index) in fixtures {
+            let (program, diagnostics) = check(source);
+            assert!(
+                !diagnostics.has_errors(),
+                "{segment} active-arm fixture must check: {:?}",
+                diagnostics.iter().collect::<Vec<_>>()
+            );
+            assert!(checked_hir_body_facts_are_valid(&program));
+
+            let mut outside_arm = program;
+            let function = outside_arm
+                .fns
+                .iter_mut()
+                .find(|function| function.name == "use")
+                .expect("use function");
+            let moved_call = match &function
+                .body
+                .value
+                .as_ref()
+                .expect("use body value")
+                .kind
+            {
+                ExprKind::Match { arms, .. } => arms[arm_index].body.clone(),
+                _ => panic!("use body must be a match"),
+            };
+            function.body.value = Some(Box::new(moved_call));
+            assert!(
+                !checked_hir_body_facts_are_valid(&outside_arm),
+                "a {segment} path outside the arm that activated it must fail closed"
+            );
+        }
     }
 
     #[test]

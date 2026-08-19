@@ -287,6 +287,33 @@ derived final success block. MIR rewrites preserve the marker as a non-movable s
 no descriptor-specific coordinate remapping. Dedicated owners force both block deletion/compaction
 and statement fusion before validating the resulting indexed-borrow call.
 
+### Closure matrix reopened: validator dominance and complete action boundary
+
+The redesigned-candidate review found four cells that structural type equality alone did not
+close. Checked HIR could name a valid sum-payload path outside the arm that activated that payload;
+MIR validation did not prove that the reservation marker preceded its SSA index/length evidence
+within a shared block; root preservation stopped immediately before the call and therefore missed
+an overlapping `borrow mut` argument in that same action; and recursive dynamic-record admission
+inherited the pre-extension classifier's `Soa` leaf even though this plan excludes every
+specialized collection.
+
+The validator boundary is reopened on one complete-dominance invariant:
+
+- every sum-payload segment in a borrowed element base must have an exact active
+  `BorrowedProjection` prefix in the currently traversed match arm, and that fact expires when the
+  arm body exits;
+- the stable reservation marker must dominate the final index and checked-length definitions and
+  precede either definition when they share its block;
+- root-preservation inspection includes the call statement itself, so any same-root `borrow mut`
+  argument conflicts with the interior shared borrow before pointer formation; and
+- the recursive payload classifier treats `Soa` as an excluded leaf at every depth, with a nested
+  dynamic-record witness beside the existing top-level specialized-array exclusions.
+
+Owner mutations move a valid projected indexed call outside its activating arm, move the marker
+after its length evidence, alias a valid disjoint `borrow mut` call argument to the indexed root,
+and place a `Soa` field inside an otherwise admitted AoS dynamic record. Each must fail at its
+own checked-HIR, MIR, or classifier boundary while the corresponding valid twin remains accepted.
+
 ## 6. PR boundaries and gates
 
 The design lands first. Its independent adversarial review must resolve the public grammar,
@@ -351,3 +378,7 @@ The author-side ledger-to-prose pass is complete:
 | P1: slice-bearing Copy-record projections had no exact acceptance owner | Define Copy projection provenance over the complete array/record-admitted Copy and canonical borrow/region-classifier intersection, not a `str` special case. Add direct and nested `slice<T>` witnesses beside `str` plus a parameterized type-class sweep that fails whenever any admitted region-bearing Copy leaf lacks `Index`/`ElemField` provenance and escape owners. |
 | P2: `BorrowedElementBase.owner_fact` rejection had no field-complete mutation owner | Make the validation evidence exhaustive over vector shape, canonical ordering, every record field, typed path structure, and stale flow state. The representation contract and closure matrix now name empty/removal/extra/duplicate/order, all `kind`/`ordinal`/`path` mutations, and replacement/move/Drop/join staleness for multi-root facts. |
 | P1 implementation review: borrowed-element guards stored block and statement ordinals that post-lowering MIR rewrites did not maintain | Reopen the closure matrix on post-lowering identity. Replace every stored coordinate with one inert function-local reservation token, derive the unique canonical bounds-success edge from stable value identities after rewrites, and locate the marker's final position before checking dominance and root preservation. Block-compaction and statement-fusion owners close both rewrite classes without transform-specific descriptor remapping. |
+| P1 redesigned-candidate review: a typed sum-payload path could be used outside the match arm that activated it | Track exact active `BorrowedProjection` path prefixes while traversing each arm and expire them at the arm body's exit. A forged projected indexed call moved outside its arm must fail checked-HIR validation. |
+| P1 redesigned-candidate review: block dominance did not prove that the reservation marker preceded same-block bounds evidence | Locate the final index and length SSA definitions after rewrites, require marker-block dominance, and require marker-before-definition ordering when either definition shares the marker block. A marker moved after the length owner fails before pointer lowering. |
+| P1 redesigned-candidate review: preservation scanning excluded the call action and missed an overlapping `borrow mut` peer argument | Include the current call statement in the preservation interval. A disjoint peer remains valid, while mutating its borrowed-place slot to the indexed root fails before either pointer can be used. |
+| P2 redesigned-candidate review: recursive AoS admission inherited the explicitly excluded `Soa` leaf | Remove `Soa` from the closed recursive payload grammar and add a nested-field classifier owner so no ordinary dynamic record can smuggle in a specialized collection. |
