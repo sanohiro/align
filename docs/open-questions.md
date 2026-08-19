@@ -2714,6 +2714,33 @@ Settled ahead of any `std.io`/`std.fs`/`std.path`/`std.env`/`std.time` implement
    dispatch + required `import`.** "`std` as a real Align-over-FFI library" remains a Future item —
    not reopened for M9.
 
+### Request 14 — exclusive filesystem publication (DESIGN SETTLED 2026-08-19; implementation pending)
+
+`std.fs` adds the explicit publication primitives
+`fs.create_exclusive(path: str) -> Result<writer, Error>` and
+`fs.rename_no_replace(source: str, destination: str) -> Result<(), Error>`. The first uses one
+native exclusive create (`O_CREAT|O_EXCL`, with close-on-exec and final-component no-following on
+the accepted Unix targets), returns the existing owned `writer`, and maps every occupied final
+entry—including symlink and special-file entries—to `Error.Code(native EEXIST)` without opening,
+truncating, replacing, or removing it. The second uses one native no-replace rename
+(`renameat2(..., RENAME_NOREPLACE)` on Linux or `renameatx_np(..., RENAME_EXCL)` on macOS); it
+never follows, removes, or replaces an occupied destination and moves the source as an entry.
+Both borrow NUL-free valid UTF-8 paths for the call, use ephemeral bounded NUL-terminated native
+copies, validate source before destination for rename, and map checked capacity overflow to
+`Error.Invalid`. Actual allocation failure remains the locked terminal OOM policy. `EEXIST`,
+`EXDEV`, unsupported-volume errors, and other unmapped native failures remain `Error.Code(errno)`;
+no `AlreadyExists` variant, ordinary-rename fallback, cross-device copy, subprocess, durability
+promise, or hidden cleanup is added.
+
+The operations are independent and provide no two-file transaction. C6f2 owns the trusted-path and
+single-writer precondition, closes both writers, rechecks both final paths, publishes result then
+evidence, and explicitly removes only its own residue. Clean staging/finalization failures map to
+`OUTPUT_WRITE`; an owned cleanup or required recheck failure maps to
+`OUTPUT_PAIR_CLEANUP_FAILED` with the exact surviving evaluator-owned paths. The accepted design,
+ABI boundary, platform floor, and closure matrix are authoritative in
+`docs/impl/27-fs-exclusive-publication-plan.md` and `docs/impl/std-design/fs.md`. Implementation
+is pending; M9 remains closed.
+
 ### M10 scope decision (2026-07-04)
 
 Settled ahead of any `std.encoding`/`std.rand`/`std.cli` implementation (`impl/07-roadmap.md` M10;

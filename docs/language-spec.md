@@ -1025,12 +1025,24 @@ require the buffer argument to be a bare local declared with `mut`; temporaries 
 are rejected before the operation is formed.
 
 `std.fs`: `read_file`/`write_file`/`open`/`create`/
-`exists`/`remove`/`read_dir`, plus `create_rw` / `open_rw` (the `file` constructors — `O_RDWR` fresh
-or must-exist), `read_file_view` (a `str` mmap view — requires an enclosing
+`create_exclusive`/`rename_no_replace`/`exists`/`remove`/`read_dir`, plus `create_rw` / `open_rw`
+(the `file` constructors — `O_RDWR` fresh or must-exist), `read_file_view` (a `str` mmap view — requires an enclosing
 arena, escapes via `.clone()`) and `read_bytes_view` (its binary sibling — the same arena mmap
 without UTF-8 validation, returning a `bytes` view so a GGUF/binary asset maps zero-copy).
 `read_dir` returns owned strings and **excludes** any entry whose name is not valid UTF-8, so a
-listing can silently be short. `std.path`: `join`/`normalize` (owned), `base`/`dir`/`ext` (zero-copy
+listing can silently be short. `fs.create_exclusive(path: str) -> Result<writer, Error>` creates
+one new regular file with native exclusive-create semantics; an occupied final entry, including a
+symlink or special file, returns `Error.Code(native EEXIST)` without opening, truncating, replacing,
+or removing it. The returned writer uses the existing Move/Drop contract and a failed write may
+leave a partial file for explicit caller cleanup. `fs.rename_no_replace(source: str,
+destination: str) -> Result<(), Error>` performs one native no-replace rename and never follows,
+removes, or replaces an occupied destination. It moves the source entry as the OS does, maps
+native failures through the fixed errno table, does not emulate cross-device or unsupported
+filesystems, and makes no crash-durability or pair-transaction promise. Both operations borrow
+NUL-free valid UTF-8 paths for the call; validation and ephemeral NUL-terminated marshalling occur
+before the native operation, with source before destination for rename. A checked capacity
+overflow is `Error.Invalid`; actual allocation failure is terminal OOM. `std.fs` does not classify
+filesystem types or hide a publication cleanup lock. `std.path`: `join`/`normalize` (owned), `base`/`dir`/`ext` (zero-copy
 substring views). `std.process`: `spawn`/`wait`/`kill`/`exec`, `exit` (runs cleanup) vs `abort`
 (immediate `_exit(1)`), `cpu_count()`, and the `command` builder — `process.command(cmd, args)` plus
 `cwd`/`env`/`env_clear`/`timeout_ns` setters, the optional per-stream

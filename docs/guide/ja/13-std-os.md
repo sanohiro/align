@@ -25,6 +25,31 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 
 `read_file`、`write_file`、`exists`、`remove`、`read_dir` は、ファイル全体を一括で扱うための高レベルな API です。1回の関数呼び出しで処理が完了し、プログラマがハンドルを管理する必要はありません。`write_file` は `str`、`builder`、`buffer` などのデータを受け取ります。`read_dir` はディレクトリ内のファイル名を `array<string>` として返します。テキストを読み込む関数は入力が正しい UTF-8 であるかを検証し（不正なバイナリが含まれる場合は `Error.Invalid` を返します）、純粋なバイナリデータの読み書きは後述するストリーミング API やメモリマップ API を使用します。
 
+## 排他的な公開
+
+既存のエントリを暗黙に置き換えずに成果物を公開するため、`std.fs` には次の 2 つの
+プリミティブがあります。
+
+```text
+fs.create_exclusive(path: str) -> Result<writer, Error>
+fs.rename_no_replace(source: str, destination: str) -> Result<(), Error>
+```
+
+`create_exclusive` は OS の排他的な create 操作を 1 回実行します。ファイル、ディレクトリ、
+シンボリックリンク、FIFO、デバイスなど、末尾のエントリがすでに存在する場合は
+`Error.Code(native EEXIST)` となり、開くことも、切り詰めることも、置換・削除することもありません。
+返される `writer` は通常の所有 Move ハンドルです。`Drop` は fd を閉じますがファイルは削除しないため、
+書き込みや flush の失敗で部分ファイルが残る場合は呼び出し側が明示的に後始末します。
+
+`rename_no_replace` は同一ファイルシステム上で OS の no-replace rename を 1 回実行します。
+宛先を追跡・削除・置換することはなく、ソースはディレクトリエントリとして移動され、ネイティブ
+エラーは標準の errno マッピングに従います。別ファイルシステムへのコピー、クラッシュ耐久性、
+2 ファイルのトランザクション、隠れた cleanup は提供しません。パスは呼び出し中だけ借用され、
+空でない有効な UTF-8 で NUL を含まず、記述されたまま渡されます。容量の検査可能なオーバーフローは
+`Error.Invalid`、実際のメモリ不足は terminal OOM です。2 つのファイルを公開する側は、両 writer を
+閉じ、両方の最終パスを再確認し、result then evidence の順に rename し、自分が所有するパスだけを
+明示的に削除しなければなりません。
+
 ## ゼロコピー読み込み: `read_file_view`
 
 ```align
