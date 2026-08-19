@@ -1307,15 +1307,15 @@ pub fn borrowed_sum_payload_is_admissible(
                 active_structs.remove(&id);
                 result
             }
-            Ty::DynArray(element) => visit(
-                scalar_to_ty(element),
-                structs,
-                enums,
-                tagged_types,
-                active_structs,
-                active_enums,
-                active_tagged,
-            ),
+            Ty::DynArray(
+                Scalar::Int(_)
+                | Scalar::Float(_)
+                | Scalar::Bool
+                | Scalar::Char
+                | Scalar::Unit
+                | Scalar::String
+                | Scalar::Str,
+            ) => true,
             Ty::DynStructArray(id, Layout::Aos) => visit(
                 Ty::Struct(id),
                 structs,
@@ -52546,6 +52546,10 @@ fn exit_branch(flag: bool) -> i64 {
             Ty::DynResponseArray,
             Ty::Buffer,
             Ty::ArrayBuilder(Scalar::Int(IntTy { bits: 64, signed: true })),
+            Ty::DynArray(Scalar::DynArray(PrimScalar::Int(IntTy {
+                bits: 64,
+                signed: true,
+            }))),
             Ty::DynStructArray(2, Layout::Aos),
             Ty::DynStructArray(99, Layout::Aos),
         ] {

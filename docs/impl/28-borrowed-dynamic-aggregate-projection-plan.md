@@ -327,6 +327,26 @@ can be borrowed from another arm entry. The owner uses two same-shaped borrowed 
 keeps the first arm active, rewrites the indexed metadata and canonical owner facts to the second
 parameter, and requires checked-HIR rejection while the unmodified first-root twin remains valid.
 
+### Closure matrix reopened: call invalidation and dynamic element grammar
+
+The following redesigned-candidate review found two remaining enumeration gaps. The complete call
+action classified a same-root `borrow mut` peer as invalidating but not a by-value Move argument
+loaded from the same root, and the recursive payload classifier reused itself for `DynArray`'s
+element even though the language representation excludes nested dynamic arrays.
+
+Call-action validation uses one mode-complete invalidation classifier. A `borrow` peer is read-only;
+a same-root `borrow mut` place invalidates the reservation; and a by-value argument invalidates it
+when its `Arg`/`Load`/`Use` provenance reaches the reserved root. Direct, imported, indirect, and
+cleanup-returning calls all use that classifier. The malformed owner redirects a valid disjoint
+by-value peer's load to the reserved root and requires rejection at the same pre-pointer boundary
+as the existing mutable-peer owner.
+
+`DynArray` is a grammar boundary rather than another recursive edge. Its element is one of the
+ordinary primitive, `string`, or `str` scalar representations; nested dynamic arrays and every
+other aggregate/specialized scalar tag fail closed. AoS `DynStructArray` remains the sole recursive
+dynamic-record edge, and its record fields continue through the closed cycle-safe classifier. A
+direct nested-`DynArray` classifier witness sits beside the existing specialized-array exclusions.
+
 ## 6. PR boundaries and gates
 
 The design lands first. Its independent adversarial review must resolve the public grammar,
@@ -396,3 +416,5 @@ The author-side ledger-to-prose pass is complete:
 | P1 redesigned-candidate review: preservation scanning excluded the call action and missed an overlapping `borrow mut` peer argument | Include the current call statement in the preservation interval. A disjoint peer remains valid, while mutating its borrowed-place slot to the indexed root fails before either pointer can be used. |
 | P2 redesigned-candidate review: recursive AoS admission inherited the explicitly excluded `Soa` leaf | Remove `Soa` from the closed recursive payload grammar and add a nested-field classifier owner so no ordinary dynamic record can smuggle in a specialized collection. |
 | P1 activation-identity review: an active payload path on one borrowed sum authorized the same path shape on another root | Reopen activation as the exact `(root_local, projection path)` pair. A two-parameter mutation owner redirects valid indexed metadata and its canonical owner facts to the inactive same-shaped root and requires checked-HIR rejection. |
+| P1 call-invalidation review: a by-value Move peer could consume the indexed root at the same call action | Replace the mutable-only call check with a mode-complete invalidation classifier. Trace by-value `Arg`/`Load`/`Use` provenance to the reserved root and add a malformed direct-call owner that redirects a valid disjoint peer load. |
+| P2 dynamic-element review: recursive `DynArray` admission accepted the explicitly excluded `array<array<T>>` shape | Make `DynArray` a non-recursive grammar boundary over ordinary primitive, `string`, and `str` elements. Add a nested dynamic-array classifier witness beside the closed specialized-array set. |

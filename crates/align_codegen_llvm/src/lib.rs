@@ -19089,15 +19089,44 @@ impl<'c, 'a> FnGen<'c, 'a> {
         }
     }
 
-    fn mir_call_borrow_mutates_root(
+    fn mir_operand_moves_root_inner(
+        &self,
+        operand: &Operand,
+        root: Slot,
+        visited: &mut HashSet<ValueId>,
+    ) -> bool {
+        match operand {
+            Operand::Arg(index) => self.f.params.get(*index as usize) == Some(&root),
+            Operand::Value(value) if visited.insert(*value) => self.f.blocks.iter().any(|block| {
+                block.stmts.iter().any(|statement| match statement {
+                    Stmt::Let(candidate, Rvalue::Load(slot)) if candidate == value => *slot == root,
+                    Stmt::Let(candidate, Rvalue::Use(source)) if candidate == value => {
+                        self.mir_operand_moves_root_inner(source, root, visited)
+                    }
+                    _ => false,
+                })
+            }),
+            _ => false,
+        }
+    }
+
+    fn mir_operand_moves_root(&self, operand: &Operand, root: Slot) -> bool {
+        self.mir_operand_moves_root_inner(operand, root, &mut HashSet::new())
+    }
+
+    fn mir_call_invalidates_root(
         &self,
         modes: &[align_ast::ParamMode],
         arguments: &[Operand],
         root: Slot,
     ) -> bool {
         arguments.iter().enumerate().any(|(index, argument)| {
-            modes.get(index) == Some(&align_ast::ParamMode::BorrowMut)
-                && Self::mir_operand_is_place_root(argument, root)
+            matches!(
+                modes.get(index),
+                Some(align_ast::ParamMode::BorrowMut)
+                    if Self::mir_operand_is_place_root(argument, root)
+            ) || matches!(modes.get(index), Some(align_ast::ParamMode::ByValue))
+                && self.mir_operand_moves_root(argument, root)
         })
     }
 
@@ -19108,7 +19137,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 .declarations
                 .get(target)
                 .is_some_and(|declaration| {
-                    self.mir_call_borrow_mutates_root(
+                    self.mir_call_invalidates_root(
                         &declaration.signature.modes,
                         arguments,
                         root,
@@ -19119,7 +19148,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 .declarations
                 .get(&call.target)
                 .is_some_and(|declaration| {
-                    self.mir_call_borrow_mutates_root(
+                    self.mir_call_invalidates_root(
                         &declaration.signature.modes,
                         &call.args,
                         root,
@@ -19127,9 +19156,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 }),
             Rvalue::CallIndirect {
                 args, signature, ..
-            } => self.mir_call_borrow_mutates_root(&signature.param_modes, args, root),
+            } => self.mir_call_invalidates_root(&signature.param_modes, args, root),
             Rvalue::CallIndirectWithCleanup(call) => {
-                self.mir_call_borrow_mutates_root(&call.signature.param_modes, &call.args, root)
+                self.mir_call_invalidates_root(&call.signature.param_modes, &call.args, root)
             }
             _ => false,
         }
@@ -20221,6 +20250,54 @@ fn main() -> i32 = 0
         assert_lowering(
             emit_llvm_ir(&overlapping_action, &BuildTarget::Baseline, false, &[], None)
                 .expect_err("an indexed borrow and same-action borrow-mut peer must conflict"),
+            "borrowed element array root changes between its bounds guard and call action",
+        );
+
+        let by_value_source = r#"Record { value: string }
+fn inspect(borrow record: Record, other: array<Record>) -> i64 =
+  record.value.len() + other.len()
+fn use(borrow records: array<Record>, other: array<Record>) -> i64 =
+  inspect(records[0], other)
+fn main() -> i32 = 0
+"#;
+        let mut by_value_action = mir(by_value_source);
+        let function = by_value_action
+            .fns
+            .iter_mut()
+            .find(|function| function.name.as_str().ends_with("use"))
+            .unwrap_or_else(|| panic!("by-value overlap fixture function"));
+        let (root, peer_value) = function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(_, Rvalue::Call(DirectCall::Program(target), arguments))
+                    if target.as_str().ends_with("inspect") => {
+                        let root = match &arguments[0] {
+                            Operand::BorrowedElementPlace(place) => place.base.slot,
+                            _ => return None,
+                        };
+                        let Operand::Value(peer_value) = &arguments[1] else {
+                            return None;
+                        };
+                        Some((root, *peer_value))
+                    }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("by-value overlap fixture call"));
+        let peer_slot = function
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::Let(candidate, Rvalue::Load(slot)) if *candidate == peer_value => Some(slot),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("by-value peer load"));
+        *peer_slot = root;
+        assert_lowering(
+            emit_llvm_ir(&by_value_action, &BuildTarget::Baseline, false, &[], None)
+                .expect_err("a same-action by-value peer must not consume the indexed root"),
             "borrowed element array root changes between its bounds guard and call action",
         );
     }
