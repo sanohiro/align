@@ -1019,6 +1019,9 @@ pub enum Rvalue {
     /// `fs.create(path)`: create/truncate `path` for writing, writing the owned `writer` handle into
     /// `out`. Yields an `i32` errno-status (0 = ok).
     WriterCreate { path: Operand, out: Slot },
+    /// `fs.create_exclusive(path)`: atomically create a new final entry, writing the owned `writer`
+    /// handle into `out`. Yields an `i32` errno-status (0 = ok).
+    WriterCreateExclusive { path: Operand, out: Slot },
     /// `io.stdin` — a `reader` over fd 0 (an owned handle; std.io).
     ReaderStdin,
     /// `io.stdout` / `io.stderr` / `io.stdout.buffered()` — a `writer` over `fd` (1 = stdout,
@@ -1118,6 +1121,9 @@ pub enum Rvalue {
     FsExists { path: Operand },
     /// `fs.remove(path)` — delete the file at `path`. Yields an `i32` errno-status (0 = ok).
     FsRemove { path: Operand },
+    /// `fs.rename_no_replace(source, destination)` — atomically move the source entry to an absent
+    /// destination. Yields an `i32` errno-status (0 = ok).
+    RenameNoReplace { source: Operand, destination: Operand },
     /// `fs.read_dir(path)` — the entry names of directory `path` as an owned `array<string>`
     /// (`{ptr,len}`) written into `out`. Yields an `i32` errno-status (0 = ok).
     FsReadDir { path: Operand, out: Slot },
@@ -5703,6 +5709,12 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                     out,
                 })
             }
+            hir::ExprKind::CreateExclusive { path } => {
+                lower_open_handle(b, path, Ty::Writer, e.ty, |p, out| Rvalue::WriterCreateExclusive {
+                    path: p,
+                    out,
+                })
+            }
             // All A4 `file` ops — the two constructors (`fs.create_rw`/`fs.open_rw`, `Result<file, Error>`)
             // and the three methods (`pread`/`pwrite`/`len`, `Result<i64, Error>`) — go through ONE
             // `#[inline(never)]` dispatcher, so they add a single tiny arm to the recursive `lower_expr`
@@ -5897,6 +5909,19 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 lower_required_binding!(b, pop = lower_expr(b, path), Operand::Const(Const::Unit));
                 let code = b.fresh_value(status_ty());
                 b.push(Stmt::Let(code, Rvalue::FsRemove { path: pop }));
+                lower_status_result(b, code, e.ty)
+            }
+            hir::ExprKind::RenameNoReplace { source, destination } => {
+                lower_required_binding!(b, source_op = lower_expr(b, source), Operand::Const(Const::Unit));
+                lower_required_binding!(b, destination_op = lower_expr(b, destination), Operand::Const(Const::Unit));
+                let code = b.fresh_value(status_ty());
+                b.push(Stmt::Let(
+                    code,
+                    Rvalue::RenameNoReplace {
+                        source: source_op,
+                        destination: destination_op,
+                    },
+                ));
                 lower_status_result(b, code, e.ty)
             }
             // `fs.read_dir(path)` yields `Result<array<string>, Error>` — the same out-slot shape as

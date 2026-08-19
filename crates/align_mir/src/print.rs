@@ -681,6 +681,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         }
         Rvalue::ReaderOpen { path, out } => format!("fs_open({}, -> _{out})", operand_str(path)),
         Rvalue::WriterCreate { path, out } => format!("fs_create({}, -> _{out})", operand_str(path)),
+        Rvalue::WriterCreateExclusive { path, out } => format!("fs_create_exclusive({}, -> _{out})", operand_str(path)),
         Rvalue::ReaderStdin => "io_reader_stdin()".to_string(),
         Rvalue::WriterStd { fd, buffered } => format!("io_writer_std(fd={fd}, buffered={buffered})"),
         Rvalue::ReaderRead(r, buf) => format!("io_read({}, {})", operand_str(r), operand_str(buf)),
@@ -718,6 +719,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::FsWriteFileBuilder { path, builder } => format!("fs_write_file_builder({}, {})", operand_str(path), operand_str(builder)),
         Rvalue::FsExists { path } => format!("fs_exists({})", operand_str(path)),
         Rvalue::FsRemove { path } => format!("fs_remove({})", operand_str(path)),
+        Rvalue::RenameNoReplace { source, destination } => {
+            format!("fs_rename_no_replace({}, {})", operand_str(source), operand_str(destination))
+        }
         Rvalue::FsReadDir { path, out } => format!("fs_read_dir({}, -> _{out})", operand_str(path)),
         Rvalue::DnsResolve { host, out } => format!("dns_resolve({}, -> _{out})", operand_str(host)),
         Rvalue::TcpConnect { host, port, timeout_ns, out } => {
