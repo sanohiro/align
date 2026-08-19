@@ -645,6 +645,23 @@ fn records() -> array<Record> { mut builder: array_builder<Record> := array_buil
 }
 
 #[test]
+fn index_preserves_i64_context_for_generic_result_inference() {
+    let source = "\
+Record { value: string }\n\
+fn make_index<T>(seed: i64) -> T { loop {} }\n\
+fn inspect(borrow record: Record) -> i64 = record.value.len()\n\
+fn ordinary(values: array<i64>) -> i64 = values[make_index(0)]\n\
+fn borrowed(values: array<Record>) -> i64 = inspect(values[make_index(0)])\n\
+fn main() -> i32 = 0\n\
+";
+    assert!(
+        !check_errs("borrowed-index-generic-result-context", source),
+        "{}",
+        check_diagnostics("borrowed-index-generic-result-context", source)
+    );
+}
+
+#[test]
 fn indexed_shared_borrow_termination_family_forms_no_element_descriptor() {
     let prefix = "\
 import std.process\n\

@@ -30867,6 +30867,24 @@ impl<'a, 't> Checker<'a, 't> {
         })
     }
 
+    /// Check an array index with its i64 inference context while admitting a non-fallthrough index.
+    fn check_array_index_expr(&mut self, index: &ast::Expr) -> Expr {
+        let expected = Ty::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
+        let errors_before = self.diags.error_count();
+        // Thread the established index context into generic-call inference, but do not require a
+        // value from an expression that terminates before the bounds check. The ordinary
+        // `check_expr` wrapper cannot make that distinction because it reconciles every eager
+        // expression unconditionally after checking its producer.
+        let result = self.check_expr_inner(index, Some(expected));
+        if self.diags.error_count() == errors_before && !hir_expr_diverges(&result) {
+            self.constrain(result.ty, Some(expected), index.span);
+        }
+        result
+    }
+
     /// Check an immediate shared-borrow argument without first forming the ordinary by-value Index
     /// node, whose Move-element guard must remain closed everywhere else.
     fn check_indexed_borrow_argument(
@@ -30922,19 +30940,9 @@ impl<'a, 't> Checker<'a, 't> {
         } else {
             None
         };
-        let index = self.check_expr(index, None);
+        let index = self.check_array_index_expr(index);
         if index.ty == Ty::Error {
             return err();
-        }
-        if !hir_expr_diverges(&index) {
-            self.constrain(
-                index.ty,
-                Some(Ty::Int(IntTy {
-                    bits: 64,
-                    signed: true,
-                })),
-                index.span,
-            );
         }
         if !hir_expr_diverges(&index) && !index.ty.is_int_like() {
             self.diags.error(
@@ -40233,19 +40241,9 @@ impl<'a, 't> Checker<'a, 't> {
         // The index is an `i64` (matching `.len()` and loop counters). A non-integer index must
         // bail with `Ty::Error` — returning a typed `Index` node with a bad index would feed a
         // non-int operand into the MIR bounds-check `icmp` and panic codegen.
-        let i = self.check_expr(index, None);
+        let i = self.check_array_index_expr(index);
         if i.ty == Ty::Error {
             return err;
-        }
-        if !hir_expr_diverges(&i) {
-            self.constrain(
-                i.ty,
-                Some(Ty::Int(IntTy {
-                    bits: 64,
-                    signed: true,
-                })),
-                i.span,
-            );
         }
         if !hir_expr_diverges(&i) && !i.ty.is_int_like() {
             self.diags.error(format!("an array index must be an integer, got {}", ty_name(i.ty)), index.span);
