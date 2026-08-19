@@ -1,6 +1,6 @@
 # `std.fs` exclusive creation and no-replace publication
 
-Status: **PROPOSED DESIGN; implementation not authorized.**
+Status: **ACCEPTED DESIGN; implementation pending.**
 
 This document is the public-contract ledger and implementation plan for
 align-llm Request 14. It adds the two filesystem operations needed by C6f2 to
@@ -553,6 +553,8 @@ closure axis:
 | The first exclusive create still returned the primitive's raw error | C6f2 maps every clean temporary/finalization failure, including the first temporary create, to `OUTPUT_WRITE`; the native cause is internal to the pair owner. |
 | Recoverable `AL_CODE` path allocation contradicted locked OOM behavior | Checked capacity overflow is `Error.Invalid` before allocation; actual path and writer allocations use the existing infallible allocator policy and abort on OOM, with no new recoverable post-open constructor path. |
 
-The second review log also remains outside the worktree under `.git`. A new
-changed-slice review must confirm these two closures and the complete
-ledger-to-prose pass before this design is marked accepted.
+The second review log and the focused continuation log remain outside the
+worktree under `.git`. The continuation review against the final head
+confirmed both closures and the complete ledger-to-prose pass. Implementation
+is now authorized only after this accepted design is propagated to the
+contract sources listed in §7 and that propagation has merged.
