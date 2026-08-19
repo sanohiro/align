@@ -11,11 +11,11 @@ _Last updated: 2026-08-19._ Request 14's exclusive-create and no-replace publica
 merged in Align PR #861 at `3c2edd2f399c9e2c9551b4227c61b36d6a041e20`; its
 `c6f2-request14-adoption` real-client gate remains pending. Request 16's borrow-safe sum-payload match projection is merged in
 Align PR #857 at `8557c1525aefd9a4afef02d1ec5c2f88e16db4e4`; its
-`c6-borrowed-option-adoption` real-client gate exposed the next required boundary: array-bearing
-optional records and indexed Move record elements remain unreadable through shared borrow. Request
-17's general dynamic aggregate projection design is recorded in
-`docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; implementation and the exact C6c2
-adoption remain pending. Request 7's signed merge verification (#848), decoded-owner cleanup
+`c6-borrowed-option-adoption` real-client gate exposed the next required boundary: shared-borrow
+access to array-bearing optional records and indexed Move record elements. Request 17's general
+dynamic aggregate projection implementation closes that compiler boundary under
+`docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; only the exact C6c2 adoption remains
+pending. Request 7's signed merge verification (#848), decoded-owner cleanup
 prerequisite (#849), and escaped-string language design and
 implementation (#850), following the trusted controller/verifier
 orchestration core (PR #842), the merge-race owners (PR #840) and

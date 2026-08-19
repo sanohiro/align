@@ -1,6 +1,6 @@
 # Borrow-safe dynamic aggregate projection
 
-Status: **DESIGN SETTLED; implementation pending; required by align-llm Request 17.**
+Status: **IMPLEMENTED; exact align-llm Request 17 adoption pending.**
 
 This document extends the borrowed sum-payload projection shipped by
 `26-borrowed-sum-projection-plan.md`. The shipped capability intentionally rejects every dynamic
@@ -347,6 +347,31 @@ other aggregate/specialized scalar tag fail closed. AoS `DynStructArray` remains
 dynamic-record edge, and its record fields continue through the closed cycle-safe classifier. A
 direct nested-`DynArray` classifier witness sits beside the existing specialized-array exclusions.
 
+### Closure matrix reopened: action-bounded function validation index
+
+The next redesigned-candidate review found three related failures in the post-rewrite MIR proof.
+Root-preservation reachability crossed the current call action and followed a loop back-edge into a
+later iteration; a forged `RawCall` could carry a borrowed-element descriptor even though raw calls
+are not an admitted target; and each descriptor independently rescanned definitions and recomputed
+dominators, making validation scale roughly cubically on functions with many indexed borrows.
+
+LLVM preflight now builds one validation index per MIR function containing a reservation marker.
+The index records CFG adjacency, entry reachability, dominators, unique SSA-definition positions,
+and reservation positions once. Each descriptor performs only indexed lookups plus an
+action-bounded path query: forward traversal stops at the current action before intersecting the
+blocks that can reach that action, so no later loop iteration enters the preservation interval.
+Functions without reservation markers take a constant-shape early return and do not compute
+dominators. Raw calls reject every borrowed-element operand during callable preflight, independently
+of forged signature modes; the shared call-invalidation classifier also handles raw calls
+defensively for malformed MIR that reaches preservation analysis.
+
+The owner matrix adds a loop whose source mutation occurs only after the valid call action and a
+forged typed raw call carrying the otherwise valid descriptor. The first must lower successfully;
+the second must fail in callable preflight before pointer construction. Existing multi-argument and
+multi-call owners exercise repeated descriptors through the one function-scoped index. This closes
+the missed action boundary, target-kind exhaustiveness, and validation-cost axes without adding a
+performance promise or benchmark.
+
 ## 6. PR boundaries and gates
 
 The design lands first. Its independent adversarial review must resolve the public grammar,
@@ -418,3 +443,6 @@ The author-side ledger-to-prose pass is complete:
 | P1 activation-identity review: an active payload path on one borrowed sum authorized the same path shape on another root | Reopen activation as the exact `(root_local, projection path)` pair. A two-parameter mutation owner redirects valid indexed metadata and its canonical owner facts to the inactive same-shaped root and requires checked-HIR rejection. |
 | P1 call-invalidation review: a by-value Move peer could consume the indexed root at the same call action | Replace the mutable-only call check with a mode-complete invalidation classifier. Trace by-value `Arg`/`Load`/`Use` provenance to the reserved root and add a malformed direct-call owner that redirects a valid disjoint peer load. |
 | P2 dynamic-element review: recursive `DynArray` admission accepted the explicitly excluded `array<array<T>>` shape | Make `DynArray` a non-recursive grammar boundary over ordinary primitive, `string`, and `str` elements. Add a nested dynamic-array classifier witness beside the closed specialized-array set. |
+| P2 action-boundary review: root-preservation scanning followed a loop back-edge beyond the current call action | Bound forward reachability at the current action before intersecting paths that can reach it. Add a valid loop owner whose same-root mutation is reachable only after the action and on the next iteration. |
+| P1 raw-call review: forged MIR could pass a borrowed-element descriptor through `RawCall`, outside the admitted target set | Reject every borrowed-element operand in raw-call callable preflight regardless of forged signature mode, and retain defensive raw-call invalidation classification. Add a typed forged-raw-call owner that fails before pointer construction. |
+| P2 validation-cost review: each descriptor repeatedly scanned all definitions and recomputed CFG dominance | Build one marker-gated validation index per function with adjacency, reachability, dominators, SSA definitions, and reservations. Descriptor checks use indexed lookups and one action-bounded path traversal; existing repeated-call owners cover reuse. |

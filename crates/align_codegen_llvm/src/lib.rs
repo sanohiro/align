@@ -2811,6 +2811,7 @@ fn build_module<'c>(
     for f in &program.fns {
         let builder = ctx.create_builder();
         let stack_headers = stack_header_plan(f);
+        let borrowed_element_validation = BorrowedElementValidationIndex::new(f);
         let func = program_funcs
             .get(&f.name)
             .copied()
@@ -2857,6 +2858,7 @@ fn build_module<'c>(
             tuples: &program.tuples,
             target_data: &target_data,
             f,
+            borrowed_element_validation: &borrowed_element_validation,
             func,
             slots: HashMap::new(),
             borrow_mut_cleanup_ptrs: HashMap::new(),
@@ -4603,6 +4605,12 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                                     (Operand::BorrowedPlace(_), align_ast::ParamMode::ByValue)
                                 )
                             })
+                            // Raw calls are not an admitted target for call-only indexed borrows.
+                            // Reject the descriptor itself before LLVM call construction, even if
+                            // a forged signature labels the operand as a shared borrow.
+                            || args
+                                .iter()
+                                .any(|operand| matches!(operand, Operand::BorrowedElementPlace(_)))
                             || !operands_match_modes(
                                 args,
                                 &signature.param_modes,
@@ -8285,6 +8293,214 @@ enum CloneInWork<'c> {
     RebuildArray { base: ArrayValue<'c>, elements: u32 },
 }
 
+#[derive(Clone, Copy)]
+struct MirStatementPosition {
+    block: align_mir::BlockId,
+    statement: usize,
+}
+
+#[derive(Clone, Copy)]
+struct BorrowedElementReservationPosition {
+    position: MirStatementPosition,
+    root: Slot,
+}
+
+struct BorrowedElementValidationIndex {
+    valid_cfg: bool,
+    reachable: Vec<bool>,
+    dominators: Vec<HashSet<align_mir::BlockId>>,
+    successors: Vec<Vec<align_mir::BlockId>>,
+    predecessors: Vec<Vec<align_mir::BlockId>>,
+    value_definitions: HashMap<ValueId, Vec<MirStatementPosition>>,
+    reservations: HashMap<u32, Vec<BorrowedElementReservationPosition>>,
+}
+
+impl BorrowedElementValidationIndex {
+    fn new(function: &Function) -> Self {
+        if !function.blocks.iter().any(|block| {
+            block
+                .stmts
+                .iter()
+                .any(|statement| matches!(statement, Stmt::BorrowedElementReservation { .. }))
+        }) {
+            return Self {
+                valid_cfg: false,
+                reachable: Vec::new(),
+                dominators: Vec::new(),
+                successors: Vec::new(),
+                predecessors: Vec::new(),
+                value_definitions: HashMap::new(),
+                reservations: HashMap::new(),
+            };
+        }
+        let count = function.blocks.len();
+        let mut valid_cfg = (function.entry as usize) < count;
+        let mut successors = vec![Vec::new(); count];
+        let mut predecessors = vec![Vec::new(); count];
+        let mut value_definitions: HashMap<ValueId, Vec<MirStatementPosition>> = HashMap::new();
+        let mut reservations: HashMap<u32, Vec<BorrowedElementReservationPosition>> = HashMap::new();
+        for (expected, block) in function.blocks.iter().enumerate() {
+            if block.id as usize != expected {
+                valid_cfg = false;
+                continue;
+            }
+            for (statement, value) in block.stmts.iter().enumerate() {
+                match value {
+                    Stmt::Let(id, _) => value_definitions
+                        .entry(*id)
+                        .or_default()
+                        .push(MirStatementPosition {
+                            block: block.id,
+                            statement,
+                        }),
+                    Stmt::BorrowedElementReservation { token, root } => reservations
+                        .entry(*token)
+                        .or_default()
+                        .push(BorrowedElementReservationPosition {
+                            position: MirStatementPosition {
+                                block: block.id,
+                                statement,
+                            },
+                            root: *root,
+                        }),
+                    _ => {}
+                }
+            }
+            let targets = match block.term {
+                Term::Goto(next) => vec![next],
+                Term::Branch(_, yes, no) => vec![yes, no],
+                Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => Vec::new(),
+            };
+            for target in targets {
+                if target as usize >= count {
+                    valid_cfg = false;
+                    continue;
+                }
+                successors[block.id as usize].push(target);
+                predecessors[target as usize].push(block.id);
+            }
+        }
+
+        let mut reachable = vec![false; count];
+        if valid_cfg {
+            let mut work = vec![function.entry];
+            while let Some(block) = work.pop() {
+                if !reachable[block as usize] {
+                    reachable[block as usize] = true;
+                    work.extend(successors[block as usize].iter().copied());
+                }
+            }
+        }
+        let reachable_set = reachable
+            .iter()
+            .enumerate()
+            .filter_map(|(id, reached)| reached.then_some(id as u32))
+            .collect::<HashSet<_>>();
+        let mut dominators = (0..count)
+            .map(|id| {
+                if reachable.get(id).copied().unwrap_or(false) {
+                    reachable_set.clone()
+                } else {
+                    HashSet::from([id as u32])
+                }
+            })
+            .collect::<Vec<_>>();
+        if valid_cfg {
+            dominators[function.entry as usize] = HashSet::from([function.entry]);
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for id in 0..count as u32 {
+                    if id == function.entry || !reachable[id as usize] {
+                        continue;
+                    }
+                    let mut incoming = predecessors[id as usize]
+                        .iter()
+                        .copied()
+                        .filter(|predecessor| reachable[*predecessor as usize]);
+                    let mut next = incoming
+                        .next()
+                        .map_or_else(HashSet::new, |first| dominators[first as usize].clone());
+                    for predecessor in incoming {
+                        next.retain(|candidate| {
+                            dominators[predecessor as usize].contains(candidate)
+                        });
+                    }
+                    next.insert(id);
+                    if next != dominators[id as usize] {
+                        dominators[id as usize] = next;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        Self {
+            valid_cfg,
+            reachable,
+            dominators,
+            successors,
+            predecessors,
+            value_definitions,
+            reservations,
+        }
+    }
+
+    fn dominates(&self, dominator: align_mir::BlockId, target: align_mir::BlockId) -> bool {
+        self.valid_cfg
+            && self.reachable.get(target as usize) == Some(&true)
+            && self
+                .dominators
+                .get(target as usize)
+                .is_some_and(|set| set.contains(&dominator))
+    }
+
+    fn unique_value_definition(&self, value: ValueId) -> Option<MirStatementPosition> {
+        let [position] = self.value_definitions.get(&value)?.as_slice() else {
+            return None;
+        };
+        Some(*position)
+    }
+
+    fn unique_reservation(&self, token: u32) -> Option<BorrowedElementReservationPosition> {
+        let [reservation] = self.reservations.get(&token)?.as_slice() else {
+            return None;
+        };
+        Some(*reservation)
+    }
+
+    fn blocks_between(
+        &self,
+        start: align_mir::BlockId,
+        action: align_mir::BlockId,
+    ) -> Option<HashSet<align_mir::BlockId>> {
+        if !self.valid_cfg
+            || self.reachable.get(start as usize) != Some(&true)
+            || self.reachable.get(action as usize) != Some(&true)
+        {
+            return None;
+        }
+        let mut forward = HashSet::new();
+        let mut work = vec![start];
+        while let Some(block) = work.pop() {
+            if forward.insert(block) && block != action {
+                work.extend(self.successors.get(block as usize)?.iter().copied());
+            }
+        }
+        if !forward.contains(&action) {
+            return None;
+        }
+        let mut reverse = HashSet::new();
+        let mut work = vec![action];
+        while let Some(block) = work.pop() {
+            if reverse.insert(block) {
+                work.extend(self.predecessors.get(block as usize)?.iter().copied());
+            }
+        }
+        forward.retain(|block| reverse.contains(block));
+        Some(forward)
+    }
+}
+
 struct FnGen<'c, 'a> {
     ctx: &'c Context,
     module: &'a Module<'c>,
@@ -8322,6 +8538,7 @@ struct FnGen<'c, 'a> {
     /// Target layout — used to compute struct field byte offsets for `json.decode`.
     target_data: &'a inkwell::targets::TargetData,
     f: &'a Function,
+    borrowed_element_validation: &'a BorrowedElementValidationIndex,
     func: FunctionValue<'c>,
     slots: HashMap<Slot, inkwell::values::PointerValue<'c>>,
     /// Hidden caller cleanup-bit pointers for whole-Move `BorrowMut` parameters, keyed by their
@@ -19018,67 +19235,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
         }
     }
 
-    fn mir_value_def(block: &align_mir::Block, value: ValueId) -> Option<&Rvalue> {
-        block.stmts.iter().find_map(|statement| match statement {
-            Stmt::Let(candidate, rvalue) if *candidate == value => Some(rvalue),
-            _ => None,
-        })
-    }
-
-    fn mir_block_dominates(&self, dominator: align_mir::BlockId, target: align_mir::BlockId) -> bool {
-        let count = self.f.blocks.len();
-        if dominator as usize >= count || target as usize >= count || self.f.entry as usize >= count {
-            return false;
-        }
-        let all = (0..count as u32).collect::<HashSet<_>>();
-        let mut predecessors = vec![Vec::new(); count];
-        for block in &self.f.blocks {
-            if block.id as usize >= count {
-                return false;
-            }
-            let mut edge = |successor: align_mir::BlockId| {
-                if let Some(entries) = predecessors.get_mut(successor as usize) {
-                    entries.push(block.id);
-                    true
-                } else {
-                    false
-                }
-            };
-            let valid = match block.term {
-                Term::Goto(next) => edge(next),
-                Term::Branch(_, yes, no) => edge(yes) && edge(no),
-                Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => true,
-            };
-            if !valid {
-                return false;
-            }
-        }
-        let mut sets = vec![all.clone(); count];
-        sets[self.f.entry as usize] = HashSet::from([self.f.entry]);
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for id in 0..count as u32 {
-                if id == self.f.entry {
-                    continue;
-                }
-                let mut next = if let Some((&first, rest)) = predecessors[id as usize].split_first() {
-                    let mut intersection = sets[first as usize].clone();
-                    for predecessor in rest {
-                        intersection.retain(|candidate| sets[*predecessor as usize].contains(candidate));
-                    }
-                    intersection
-                } else {
-                    HashSet::new()
-                };
-                next.insert(id);
-                if next != sets[id as usize] {
-                    sets[id as usize] = next;
-                    changed = true;
-                }
-            }
-        }
-        sets[target as usize].contains(&dominator)
+    fn unique_mir_value_def(
+        &self,
+        value: ValueId,
+    ) -> Option<(&align_mir::Block, usize, &Rvalue)> {
+        let position = self
+            .borrowed_element_validation
+            .unique_value_definition(value)?;
+        let block = self.f.blocks.get(position.block as usize)?;
+        let Stmt::Let(candidate, rvalue) = block.stmts.get(position.statement)? else {
+            return None;
+        };
+        (*candidate == value).then_some((block, position.statement, rvalue))
     }
 
     fn mir_operand_is_place_root(operand: &Operand, root: Slot) -> bool {
@@ -19160,6 +19328,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::CallIndirectWithCleanup(call) => {
                 self.mir_call_invalidates_root(&call.signature.param_modes, &call.args, root)
             }
+            Rvalue::RawCall {
+                args, signature, ..
+            } => self.mir_call_invalidates_root(&signature.param_modes, args, root),
             _ => false,
         }
     }
@@ -19183,42 +19354,6 @@ impl<'c, 'a> FnGen<'c, 'a> {
         }
     }
 
-    fn mir_reachable_blocks(&self, start: align_mir::BlockId, reverse: bool) -> HashSet<align_mir::BlockId> {
-        let count = self.f.blocks.len();
-        if start as usize >= count {
-            return HashSet::new();
-        }
-        let mut edges = vec![Vec::new(); count];
-        for block in &self.f.blocks {
-            if block.id as usize >= count {
-                return HashSet::new();
-            }
-            let successors = match block.term {
-                Term::Goto(next) => vec![next],
-                Term::Branch(_, yes, no) => vec![yes, no],
-                Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => Vec::new(),
-            };
-            for successor in successors {
-                if successor as usize >= count {
-                    return HashSet::new();
-                }
-                if reverse {
-                    edges[successor as usize].push(block.id);
-                } else {
-                    edges[block.id as usize].push(successor);
-                }
-            }
-        }
-        let mut reached = HashSet::new();
-        let mut work = vec![start];
-        while let Some(block) = work.pop() {
-            if reached.insert(block) {
-                work.extend(edges[block as usize].iter().copied());
-            }
-        }
-        reached
-    }
-
     fn checked_borrowed_element_root_preserved(
         &self,
         place: &align_mir::BorrowedElementPlace,
@@ -19230,18 +19365,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let action_statement = self
             .current_mir_statement
             .ok_or_else(|| self.err("borrowed element place has no MIR action statement"))?;
-        if !self.mir_block_dominates(reservation_block, success)
-            || !self.mir_block_dominates(reservation_block, action)
+        if !self
+            .borrowed_element_validation
+            .dominates(reservation_block, success)
+            || !self
+                .borrowed_element_validation
+                .dominates(reservation_block, action)
         {
             return Err(self.err("borrowed element reservation does not dominate its guard and call action"));
         }
-        let from_guard = self.mir_reachable_blocks(reservation_block, false);
-        let to_action = self.mir_reachable_blocks(action, true);
-        if from_guard.is_empty() || to_action.is_empty() {
-            return Err(self.err("borrowed element root preservation path is malformed"));
-        }
+        let between = self
+            .borrowed_element_validation
+            .blocks_between(reservation_block, action)
+            .ok_or_else(|| self.err("borrowed element root preservation path is malformed"))?;
         for block in &self.f.blocks {
-            if !from_guard.contains(&block.id) || !to_action.contains(&block.id) {
+            if !between.contains(&block.id) {
                 continue;
             }
             let start = if block.id == reservation_block {
@@ -19279,31 +19417,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let action = self
             .current_mir_block
             .ok_or_else(|| self.err("borrowed element place was checked outside a MIR action"))?;
-        let reservations = self
-            .f
-            .blocks
-            .iter()
-            .flat_map(|block| {
-                block
-                    .stmts
-                    .iter()
-                    .enumerate()
-                    .filter_map(move |(statement, candidate)| match candidate {
-                        Stmt::BorrowedElementReservation { token, root }
-                            if *token == place.guard.reservation =>
-                        {
-                            Some((block.id, statement, *root))
-                        }
-                        _ => None,
-                    })
-            })
-            .collect::<Vec<_>>();
-        let [(reservation_block, reservation_statement, reservation_root)] =
-            reservations.as_slice()
+        let Some(reservation) = self
+            .borrowed_element_validation
+            .unique_reservation(place.guard.reservation)
         else {
             return Err(self.err("borrowed element reservation marker is not unique"));
         };
-        if *reservation_root != place.base.slot {
+        let reservation_block = reservation.position.block;
+        let reservation_statement = reservation.position.statement;
+        if reservation.root != place.base.slot {
             return Err(self.err("borrowed element reservation marker has the wrong root"));
         }
         let signed_i64 = Ty::Int(IntTy { bits: 64, signed: true });
@@ -19313,24 +19435,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let Operand::Value(len_value) = place.guard.len else {
             return Err(self.err("borrowed element guard length lacks a checked array-length value"));
         };
-        let length_definitions = self
-            .f
-            .blocks
-            .iter()
-            .flat_map(|block| {
-                block
-                    .stmts
-                    .iter()
-                    .enumerate()
-                    .filter_map(move |(statement, candidate)| match candidate {
-                        Stmt::Let(candidate, rvalue) if *candidate == len_value => {
-                            Some((block, statement, rvalue))
-                        }
-                        _ => None,
-                    })
-            })
-            .collect::<Vec<_>>();
-        let [(source, length_statement, length_rvalue)] = length_definitions.as_slice() else {
+        let Some((source, length_statement, length_rvalue)) =
+            self.unique_mir_value_def(len_value)
+        else {
             return Err(self.err("borrowed element guard length has no unique definition"));
         };
         let expected_base = Operand::BorrowedPlace(Box::new(place.base.clone()));
@@ -19340,36 +19447,24 @@ impl<'c, 'a> FnGen<'c, 'a> {
         ) {
             return Err(self.err("borrowed element guard length was not read from its array base"));
         }
-        if !self.mir_block_dominates(*reservation_block, source.id)
-            || (source.id == *reservation_block
-                && *reservation_statement >= *length_statement)
+        if !self
+            .borrowed_element_validation
+            .dominates(reservation_block, source.id)
+            || (source.id == reservation_block && reservation_statement >= length_statement)
         {
             return Err(self.err("borrowed element reservation does not precede its length evidence"));
         }
         if let Operand::Value(index_value) = place.index {
-            let index_definitions = self
-                .f
-                .blocks
-                .iter()
-                .flat_map(|block| {
-                    block
-                        .stmts
-                        .iter()
-                        .enumerate()
-                        .filter_map(move |(statement, candidate)| match candidate {
-                            Stmt::Let(candidate, _) if *candidate == index_value => {
-                                Some((block.id, statement))
-                            }
-                            _ => None,
-                        })
-                })
-                .collect::<Vec<_>>();
-            let [(index_block, index_statement)] = index_definitions.as_slice() else {
+            let Some((index_source, index_statement, _)) =
+                self.unique_mir_value_def(index_value)
+            else {
                 return Err(self.err("borrowed element index has no unique definition"));
             };
-            if !self.mir_block_dominates(*reservation_block, *index_block)
-                || (*index_block == *reservation_block
-                    && *reservation_statement >= *index_statement)
+            if !self
+                .borrowed_element_validation
+                .dominates(reservation_block, index_source.id)
+                || (index_source.id == reservation_block
+                    && reservation_statement >= index_statement)
             {
                 return Err(self.err("borrowed element reservation does not precede its index evidence"));
             }
@@ -19377,7 +19472,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let Term::Branch(Operand::Value(condition), failure, success) = &source.term else {
             return Err(self.err("borrowed element bounds guard has no canonical successful edge"));
         };
-        if !self.mir_block_dominates(*success, action) {
+        if !self.borrowed_element_validation.dominates(*success, action) {
             return Err(self.err("borrowed element bounds guard does not dominate its call action"));
         };
         let failure = self
@@ -19407,22 +19502,27 @@ impl<'c, 'a> FnGen<'c, 'a> {
         {
             return Err(self.err("borrowed element guard failure edge disagrees with its descriptor"));
         }
-        let Some(Rvalue::Bin(BinOp::Or, Operand::Value(lo), Operand::Value(hi))) =
-            Self::mir_value_def(source, *condition)
+        let Some((condition_block, _, Rvalue::Bin(BinOp::Or, Operand::Value(lo), Operand::Value(hi)))) =
+            self.unique_mir_value_def(*condition)
         else {
             return Err(self.err("borrowed element guard condition is not the canonical bounds predicate"));
         };
+        if condition_block.id != source.id {
+            return Err(self.err("borrowed element guard condition is not in its bounds block"));
+        }
         let zero = Operand::Const(Const::Int(0, signed_i64));
         let low_ok = matches!(
-            Self::mir_value_def(source, *lo),
-            Some(Rvalue::Bin(BinOp::Lt, index, bound))
-                if Self::mir_operand_same(index, &place.index)
+            self.unique_mir_value_def(*lo),
+            Some((block, _, Rvalue::Bin(BinOp::Lt, index, bound)))
+                if block.id == source.id
+                    && Self::mir_operand_same(index, &place.index)
                     && Self::mir_operand_same(bound, &zero)
         );
         let high_ok = matches!(
-            Self::mir_value_def(source, *hi),
-            Some(Rvalue::Bin(BinOp::Ge, index, len))
-                if Self::mir_operand_same(index, &place.index)
+            self.unique_mir_value_def(*hi),
+            Some((block, _, Rvalue::Bin(BinOp::Ge, index, len)))
+                if block.id == source.id
+                    && Self::mir_operand_same(index, &place.index)
                     && Self::mir_operand_same(len, &place.guard.len)
         );
         if !low_ok || !high_ok {
@@ -19431,8 +19531,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
         self.checked_borrowed_element_root_preserved(
             place,
             action,
-            *reservation_block,
-            *reservation_statement,
+            reservation_block,
+            reservation_statement,
             *success,
         )?;
         Ok(())
@@ -20016,6 +20116,81 @@ mod tests {
         let program = mir(source);
         emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
             .unwrap_or_else(|error| panic!("valid borrowed element guard must lower: {error}"));
+
+        let looped = mir(
+            "Record { value: string }\nfn records() -> array<Record> {\n  mut builder: array_builder<Record> := array_builder()\n  builder.push(Record { value: \"x\".clone() })\n  return builder.build()\n}\nfn inspect(borrow record: Record) -> i64 = record.value.len()\nfn use() -> i64 {\n  mut values := records()\n  mut again := true\n  loop {\n    result := inspect(values[0])\n    if !again { break result }\n    values = records()\n    again = false\n  }\n}\nfn main() -> i32 = 0\n",
+        );
+        emit_llvm_ir(&looped, &BuildTarget::Baseline, false, &[], None)
+            .unwrap_or_else(|error| panic!("post-action mutation in a later loop path is valid: {error}"));
+
+        let mut raw_action = mir(source);
+        let function = raw_action
+            .fns
+            .iter_mut()
+            .find(|function| function.name.as_str().ends_with("use"))
+            .unwrap_or_else(|| panic!("raw-action fixture function"));
+        let (block_index, statement_index) = function
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(block_index, block)| {
+                block
+                    .stmts
+                    .iter()
+                    .position(|statement| {
+                        matches!(
+                            statement,
+                            Stmt::Let(_, Rvalue::Call(_, arguments))
+                                if arguments.iter().any(|argument| matches!(
+                                    argument,
+                                    Operand::BorrowedElementPlace(_)
+                                ))
+                        )
+                    })
+                    .map(|statement| (block_index, statement))
+            })
+            .unwrap_or_else(|| panic!("raw-action fixture call"));
+        let (result, arguments, param_ty, ret_ty) =
+            match &function.blocks[block_index].stmts[statement_index] {
+                Stmt::Let(result, Rvalue::Call(_, arguments)) => {
+                    let param_ty = arguments
+                        .iter()
+                        .find_map(|argument| match argument {
+                            Operand::BorrowedElementPlace(place) => Some(place.element_ty),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| panic!("raw-action borrowed element"));
+                    (*result, arguments.clone(), param_ty, function.value_tys[*result as usize])
+                }
+                _ => panic!("raw-action call changed during mutation"),
+            };
+        let callee = function.value_tys.len() as ValueId;
+        function.value_tys.push(Ty::Raw);
+        let block = &mut function.blocks[block_index];
+        block
+            .stmts
+            .insert(statement_index, Stmt::Let(callee, Rvalue::RawNull));
+        block.stmts[statement_index + 1] = Stmt::Let(
+            result,
+            Rvalue::RawCall {
+                callee: Operand::Value(callee),
+                args: arguments,
+                param_tys: vec![param_ty],
+                ret_ty,
+                signature: Box::new(align_mir::FnSignatureFacts {
+                    param_modes: vec![align_ast::ParamMode::Borrow],
+                    return_borrow: hir::ReturnBorrowSummary::None,
+                    return_region: hir::ReturnRegionSummary::None,
+                    return_cleanup: hir::ReturnCleanupAbi::None,
+                }),
+            },
+        );
+        let raw_error = emit_llvm_ir(&raw_action, &BuildTarget::Baseline, false, &[], None)
+            .expect_err("raw calls must reject forged borrowed-element operands");
+        assert!(
+            raw_error.to_string().contains("callable metadata invalid"),
+            "raw-call rejection must happen in callable preflight: {raw_error}"
+        );
 
         let mut missing_guard = program.clone();
         borrowed_element_place_mut(&mut missing_guard).guard.reservation = u32::MAX;
