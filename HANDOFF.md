@@ -294,10 +294,10 @@ required `Post-open review` status passed. The branch policy required
 The Request 13 entry in `../align-llm/docs/align-requests.md` now records
 `ALIGN_MERGED`, PR #854, and the merge commit; that sibling edit remains
 intentionally uncommitted. The required `cargo build --release --workspace`
-also passed. Request 14's design is now accepted and merged; its implementation
-is the next capability.
+also passed. Request 14's design and implementation are now merged; its
+`c6f2-request14-adoption` align-llm gate remains pending.
 
-## Request 14 design handoff
+## Request 14 merge handoff
 
 PR #859 (`https://github.com/sanohiro/align/pull/859`) merged on 2026-08-19 as
 `a21eb8416f2088df68026f10c63a38cd0bd65538`, with design head
@@ -310,8 +310,12 @@ The primitives use native exclusive-create/no-replace operations, preserve the
 existing errno and writer ownership models, and do not provide pair atomicity,
 filesystem classification, replacement, or hidden cleanup. C6f2 owns the
 trusted-path/single-writer precondition and explicit result-then-evidence
-cleanup. Align implementation, owner tests, the ABI golden, and the
-`c6f2-request14-adoption` gate remain pending.
+cleanup. The implementation merged in PR #861
+(`https://github.com/sanohiro/align/pull/861`) as
+`3c2edd2f399c9e2c9551b4227c61b36d6a041e20`, with implementation head
+`cc89e637106343c87e9b6fe463d2d8b6f1b8676b`. Owner tests, the ABI golden, and
+the native race/symlink regressions are shipped; the
+`c6f2-request14-adoption` gate remains pending.
 
 ## Start here
 
@@ -349,9 +353,9 @@ facts must live in this repository.
   against `docs/impl/24-owned-json-plan.md`. Request 13's recursive owned-JSON implementation is
   merged through PR #854 as `340a3304724fefb56c2b1aa642e6b2b2c169e6d7` against
   `docs/impl/25-recursive-owned-json-plan.md`; its align-llm adoption gate remains pending.
-  Request 14 is `ACCEPTED` with design PR #859 merged as
-  `a21eb8416f2088df68026f10c63a38cd0bd65538`; its implementation and align-llm adoption gate
-  remain pending. Request 16 is `ALIGN_MERGED` through #857; its align-llm adoption gate remains
+  Request 14 is `ALIGN_MERGED` through implementation PR #861, merged as
+  `3c2edd2f399c9e2c9551b4227c61b36d6a041e20`; its align-llm adoption gate remains pending.
+  Request 16 is `ALIGN_MERGED` through #857; its align-llm adoption gate remains
   pending.
 
 Consumer-gated deferrals that remain intentional:
