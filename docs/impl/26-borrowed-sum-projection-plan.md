@@ -12,6 +12,11 @@ The capability is not an application workaround, a verifier-specific API, or a s
 model. It is accepted only when the public contract and this closure matrix are reviewed and
 merged before implementation begins.
 
+The shipped Request 16 grammar in this document deliberately excludes dynamic arrays. The general
+extension required by align-llm Request 17 is specified separately in
+`28-borrowed-dynamic-aggregate-projection-plan.md`; it does not retroactively widen this plan's
+historical implementation evidence.
+
 The implementation boundary intentionally spans HIR metadata, MoveCheck/EscapeCheck, checked-HIR
 replay, MIR, LLVM lowering, and owner tests. Splitting that dormant producer-to-consumer chain
 would duplicate the exact-path and cleanup proof while leaving unstable intermediate consumers;
@@ -239,3 +244,11 @@ The author-side consistency pass was completed before implementation. It verifie
 
 The implementation follows from the reviewed design merge and reopens this matrix only if the
 strategy or public contract changes.
+
+## 8. Dynamic aggregate extension
+
+Plan 28 widens `BorrowedSumPayload` through the ordinary dynamic scalar and AoS record-array forms
+and adds shared-only indexed borrowing of an admitted Move element. Until that implementation
+merges, the exclusions and diagnostics in this plan remain the shipped behavior. Plan 28 owns the
+new public ledger, lifetime and validation-order rules, checked element-place representation,
+closure matrix, and real-client adoption gate.

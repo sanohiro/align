@@ -181,10 +181,11 @@ types; `match` works on them, with `else`-unwrap and `?` as the common-case shor
 When the scrutinee is a stable place whose complete root/path pair has a direct shared or exclusive
 borrow fact — the borrowed parameter itself or a checked struct-field path below it — `match` reads
 the tag and active payload in place. A descendant field fact does not promote an owning parent or a
-mixed-provenance local. Borrowed mode admits Copy scalars/views, `string`, and finite acyclic structs
-and tagged values built recursively from those forms; tuples, arrays, collections, resources, opaque
-handles, and other unsupported Move shapes retain the borrowed-place diagnostic. An admitted
-non-Copy payload binding is a caller-owned read-only projection: it keeps the payload's static type
+mixed-provenance local. Borrowed mode admits Copy scalars/views, `string`, ordinary dynamic scalar
+and AoS record arrays, and finite acyclic structs and tagged values built recursively from those
+forms; array elements obey the same closed grammar. Fixed and specialized arrays, tuples, other
+collections, resources, opaque handles, and other unsupported Move shapes retain the borrowed-place
+diagnostic. An admitted non-Copy payload binding is a caller-owned read-only projection: it keeps the payload's static type
 for field and method checking, but has no independent `Drop` or cleanup bit, does not move or null
 the source, and does not trigger a hidden aggregate copy. Copy fields remain readable, owned
 `string` fields can use the existing non-consuming conversion to `str`, and that owned string leaf
@@ -196,6 +197,26 @@ payload is rejected by the ordinary borrowed-place diagnostics; existing Copy/vi
 its current result behavior. Views derived from an admitted payload follow the existing inferred
 owner-generation and region rules. A free-standing or otherwise owning scrutinee retains the
 existing consuming match behavior.
+
+Ordinary indexing of an admitted `array<str>` or AoS array of Copy records with any admitted
+region-bearing Copy field, including direct or nested `str` and `slice<T>` fields,
+preserves the complete owner generation and input/arena roots for direct, field, and
+borrowed-projection bases. Return and `borrow mut` retention cannot outlive those roots. A
+terminating index forms no bounds action or result.
+
+An indexed Move element of an admitted ordinary dynamic array may be passed only to an explicit
+shared-`borrow` parameter selected by a direct, imported, or function-value call. The array base
+must be a stable local, borrowed/projection binding, or struct-field path. Its complete root is
+reserved from once-only index evaluation through every later argument and the call action; any
+possibly overlapping move, Drop, replacement, transfer, or mutable borrow is rejected. MIR emits
+the existing bounds check at the indexed argument's source position only after the index falls
+through, retains no pointer while later arguments evaluate, and forms the pointer only after every
+later argument falls through and the root is revalidated. A terminating index forms no guard,
+descriptor, later argument, pointer, or call; a terminating later argument forms no pointer or
+call. The element stays
+caller-owned, and a returned or mutably retained view remains rooted in the array generation and
+contained region roots. By-value Move-element indexing, temporary or nested-index bases, and
+element `borrow mut` remain rejected.
 
 ```align
 area := match s {
@@ -308,11 +329,25 @@ For a borrowed-place `match`, the exact stable root/path pair must have a direct
 borrow fact; a descendant field fact does not promote an owning parent or mixed-provenance local.
 An admitted non-Copy/Move payload is a read-only projection with the source's owner generation and
 no independent cleanup bit; the source is neither copied nor nulled. Admitted payloads are Copy
-scalars/views, `string`, and finite acyclic structs and tagged values built recursively from those
-forms. Tuples, arrays, collections, resources, opaque handles, and other unsupported Move shapes
-retain the borrowed-place diagnostic. Derived views follow the ordinary borrow summary and region
-checks, while existing Copy/view matching retains its current result behavior. An owning-place
+scalars/views, `string`, ordinary dynamic scalar/AoS-record arrays, and finite acyclic structs and
+tagged values built recursively from those forms; array elements follow the same closed grammar.
+Fixed and specialized arrays, tuples, other collections, resources, opaque handles, and other
+unsupported Move shapes retain the borrowed-place diagnostic. Derived views follow the ordinary
+borrow summary and region checks, while existing Copy/view matching retains its current result behavior. An owning-place
 `match` keeps the consuming extraction and source-clearing rule.
+
+An admitted projected `array<str>` element or view-bearing field of an AoS Copy record preserves
+the source generation and every contained region through ordinary indexing, return, and mutable
+destination retention. A terminating index forms no bounds action or result.
+
+An indexed Move element is a stable call place only for an explicit shared-`borrow` parameter on a
+direct, imported, or function-value target and a stable ordinary dynamic-array base. The base root
+cannot be invalidated during once-only index evaluation, any later argument, or the call action.
+MIR checks bounds at the indexed argument position after index fallthrough, revalidates the root
+after later arguments, and forms the pointer only at the call. A terminating index forms none of
+those actions. The element remains caller-owned, and returned or mutably
+retained views retain the array's generation and contained region roots. By-value and mutable
+element forms remain unsupported.
 
 One restriction applies to `if` today: a value-carrying `if`/`else` **expression** cannot move an
 already-bound owned local out of an arm (`c := if n > 2 { a } else { … }` is rejected, and so are

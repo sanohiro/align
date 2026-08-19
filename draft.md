@@ -335,11 +335,12 @@ common unwrap / propagate cases.
 When the scrutinee is a stable place whose complete root/path pair has a direct shared or exclusive
 borrow fact — either the borrowed parameter itself or a checked struct-field path below it — `match`
 performs a read-only projection. A descendant field's borrow fact does not promote an owning parent
-or a mixed-provenance local. The selected payload must be a Copy scalar/view, `string`, or a finite
-acyclic struct, `Option`, `Result`, or user sum whose reachable leaves recursively have those forms;
-tuples, arrays, collections, resources, opaque handles, and other unsupported Move shapes keep the
-ordinary borrowed-place diagnostic. The match reads the tag in place and binds an admitted active
-payload as a caller-owned borrow projection. The binding retains the payload's static type for field
+or a mixed-provenance local. The selected payload must be a Copy scalar/view, `string`, an ordinary
+dynamic scalar/AoS-record array, or a finite acyclic struct, `Option`, `Result`, or user sum whose
+reachable leaves recursively have those forms. The array element must satisfy the same closed
+grammar. Fixed and specialized arrays, tuples, other collections, resources, opaque handles, and
+other unsupported Move shapes keep the ordinary borrowed-place diagnostic. The match reads the tag
+in place and binds an admitted active payload as a caller-owned borrow projection. The binding retains the payload's static type for field
 and method checking, but it receives no independent `Drop` or cleanup bit, does not move or null the
 source, and does not make a hidden aggregate copy. Copy fields can be read, and an owned `string`
 field can be passed to a `str` consumer without moving it; that owned string leaf may use the existing
@@ -351,6 +352,29 @@ borrowed-place diagnostics; existing Copy/view matching retains its
 current result behavior. Views derived from the payload follow the existing inferred owner-generation
 and region rules. A free-standing or otherwise owning scrutinee keeps the existing consuming match
 behavior.
+
+Ordinary indexing of an admitted `array<str>` or AoS array of Copy records with any admitted
+region-bearing Copy field, including direct or nested `str` and `slice<T>` fields, keeps
+those same owner-generation and input/arena roots through direct, field, and borrowed-projection
+bases. Returned views and views retained into a `borrow mut` destination cannot outlive those roots.
+If the index expression terminates, no bounds action or result is formed.
+
+An explicit shared-`borrow` call may take one indexed Move element from an ordinary dynamic scalar
+or AoS record array: `inspect(values[i])` is valid only when the selected direct, imported, or
+function-value target's corresponding parameter is `borrow` and `values` is a stable local,
+borrowed/projection binding, or struct-field path. The complete array root is reserved from the
+once-only index evaluation through every later call argument and the call action: an operation that
+might move, drop, replace, transfer, or mutably borrow an overlapping root is rejected, while
+unrelated mutation remains valid. MIR performs the existing bounds check at the indexed argument's
+source position only after the index falls through, retains no pointer while later arguments
+evaluate, and forms the element pointer only after every later argument falls through and the root
+is revalidated. A terminating index forms no guard, descriptor, later argument, pointer, or call; a
+terminating later argument forms no pointer or call. The callee receives a pointer to caller-owned
+element storage.
+No element value, cleanup bit, allocation, or ownership transfer is created. A returned view or one
+retained through an existing `borrow mut` destination summary remains rooted in the array generation
+and contained region roots. By-value Move-element indexing, temporary-array bases, nested indexed
+bases, and element `borrow mut` remain rejected.
 
 ### Loop
 

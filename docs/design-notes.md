@@ -292,10 +292,11 @@ not a package exemption, and it still rejects temporaries.
 must inspect an owned `Option`, `Result`, or user sum without taking it from its caller. A match over
 a stable place whose exact root/path pair is directly shared- or exclusively-borrowed reads the tag
 and active payload in place; a descendant field fact never promotes an owning parent. The new path
-admits Copy scalars/views, `string`, and finite acyclic structs and tagged values built recursively
-from those forms; arrays, collections, resources, opaque handles, and other unsupported Move shapes
-remain on the existing borrowed-place diagnostic. The arm binding is a read-only projection with the
-original static payload type, source generation, and no independent cleanup bit. Copy fields and
+admits Copy scalars/views, `string`, ordinary dynamic scalar/AoS-record arrays, and finite acyclic
+structs and tagged values built recursively from those forms; an array element obeys the same
+closed grammar. Fixed and specialized arrays, other collections, resources, opaque handles, and
+other unsupported Move shapes remain on the existing borrowed-place diagnostic. The arm binding is
+a read-only projection with the original static payload type, source generation, and no independent cleanup bit. Copy fields and
 borrowed text leaves remain cheap reads, while an owned text leaf can use the existing explicit
 `.clone()` operation. Aggregate and nested-sum clone operations are outside this capability. A
 borrowed arm binding is not a stable place for a nested borrowed `match`; that use is rejected
@@ -305,6 +306,31 @@ compiler projection over the existing flattened tagged layout preserves **Nothin
 a shallow Move aggregate copy, and leaves owning-place match, `else`, and `?` semantics unchanged.
 A package-specific wrapper or alternate error/result API would create a second ownership model, so
 the language capability is the correct boundary.
+
+**A Copy view read through a borrowed array projection keeps the projection roots.** Widening the
+payload grammar to `array<str>` and AoS arrays of Copy records is unsafe if ordinary `Index` or
+field projection silently treats the projected binding as static. Direct, field, and projected
+bases therefore feed the same source generation and contained input/arena roots into return and
+`borrow mut` retention summaries for every admitted region-bearing Copy leaf, including direct or
+nested `str` and `slice<T>`. The implementation follows the canonical Copy/borrow classifiers, not
+a `str` special case. A terminating index produces no bounds action or result. This is the existing
+inferred-region model applied to a new reachable path, not a reference type or array special case.
+
+**A borrowed Move array element is a call place, not a value.** Decoded artifact graphs store Move
+records in ordinary AoS dynamic arrays. Loading `rows[i]` by value would either copy one owner or
+require partial element transfer and cleanup, neither of which a read-only verifier intends. The
+general completion is narrower and explicit: `inspect(rows[i])` is accepted when the selected
+direct, imported, or function-value target declares that parameter `borrow`, the base is a stable
+local/field/projection place, and its root is reserved from once-only index evaluation through all
+later arguments and the call action. A same-root move, Drop, replacement, transfer, or mutable
+borrow during that interval rejects; unrelated mutation remains valid. After index fallthrough, MIR
+emits the bounds-failure branch at the indexed argument position, carries only a guarded descriptor
+through later argument evaluation, and revalidates the root before LLVM forms and passes the
+existing address at the call. A terminating index forms no guard, descriptor, later argument,
+pointer, or call; a terminating later argument forms no pointer or call. No header/element owner,
+cleanup bit, or allocation is manufactured. Returned views and views retained through existing `borrow mut`
+summaries retain the array generation and contained region roots. Keeping by-value and `borrow mut`
+element forms rejected preserves visible ownership and avoids a second partial-element state model.
 
 **Structured owned errors complete the existing tagged-value model.** A native library error
 needs owned message/detail fields because the foreign buffer dies at the call boundary, while a
