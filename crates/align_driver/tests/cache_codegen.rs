@@ -831,6 +831,116 @@ fn record_builder_nominal_identity_and_definition_edit_revert() {
     assert!(reverted.all_hit(), "an exact reachable-definition revert must restore the original identities");
 }
 
+#[test]
+fn borrowed_element_graph_edit_invalidates_exact_dependents_and_reverts() {
+    if !backend() {
+        return;
+    }
+    let records_v1 = concat!(
+        "module records\n",
+        "pub Record { value: string }\n",
+        "fn adjustment() -> i64 = 1\n",
+        "pub fn inspect(borrow record: Record) -> i64 = record.value.len() + adjustment()\n",
+        "pub fn make() -> array<Record> { mut b: array_builder<Record> := array_builder()\n",
+        "  b.push(Record { value: \"align\".clone() })\n",
+        "  return b.build() }\n",
+    );
+    let records_v2 = concat!(
+        "module records\n",
+        "pub Record { value: string, marker: i64 }\n",
+        "fn adjustment() -> i64 = 1\n",
+        "pub fn inspect(borrow record: Record) -> i64 = record.value.len() + record.marker + adjustment()\n",
+        "pub fn make() -> array<Record> { mut b: array_builder<Record> := array_builder()\n",
+        "  b.push(Record { value: \"align\".clone(), marker: 1 })\n",
+        "  return b.build() }\n",
+    );
+    let records_private_edit = records_v1.replace(
+        "fn adjustment() -> i64 = 1",
+        "fn adjustment() -> i64 = 2",
+    );
+    let main = concat!(
+        "module main\n",
+        "import records\n",
+        "fn main() -> i32 { values := records.make()\n",
+        "  return records.inspect(values[0]) as i32 }\n",
+    );
+    let project = Project::new(
+        "borrowed-element-graph",
+        &[("records.align", records_v1), ("main.align", main)],
+        "main.align",
+    );
+    let cache = project.cache();
+
+    let cold = emit_all(
+        &project,
+        &cache,
+        Profile::Release,
+        BuildTarget::Baseline,
+        &no_exports(),
+        false,
+    );
+    assert!(cold.outcomes.iter().all(|outcome| !outcome.hit));
+    let hot = emit_all(
+        &project,
+        &cache,
+        Profile::Release,
+        BuildTarget::Baseline,
+        &no_exports(),
+        false,
+    );
+    assert!(hot.all_hit(), "the unchanged borrowed-element graph must hit");
+
+    project.write("records.align", records_v2);
+    let edited = emit_all(
+        &project,
+        &cache,
+        Profile::Release,
+        BuildTarget::Baseline,
+        &no_exports(),
+        false,
+    );
+    assert!(
+        !edited.outcome("records").hit,
+        "the element graph owner must miss after its public definition changes"
+    );
+    assert!(
+        !edited.outcome("main").hit,
+        "the indexed-borrow consumer must miss with the changed dependency identity"
+    );
+
+    project.write("records.align", records_v1);
+    let reverted = emit_all(
+        &project,
+        &cache,
+        Profile::Release,
+        BuildTarget::Baseline,
+        &no_exports(),
+        false,
+    );
+    assert!(
+        reverted.all_hit(),
+        "an exact graph revert must restore both prior artifacts"
+    );
+
+    project.write("records.align", &records_private_edit);
+    let unrelated = emit_all(
+        &project,
+        &cache,
+        Profile::Release,
+        BuildTarget::Baseline,
+        &no_exports(),
+        false,
+    );
+    assert!(
+        !unrelated.outcome("records").hit,
+        "the private body owner must miss on its own edit"
+    );
+    assert!(
+        unrelated.outcome("main").hit,
+        "a private body edit must not invalidate the unchanged indexed-borrow consumer"
+    );
+}
+
 // ---- Gate 6: corrupted blob → corruption event + rebuild + correct binary ------------------------
 
 #[test]

@@ -127,7 +127,13 @@ fn borrowed_sum_match_imported_body_matches_whole_program() {
         ),
     ];
     let differential = diff_check_multi("borrowed-sum-import", files, "main.align");
-    assert_eq!(differential.whole_errors, differential.per_unit_errors);
+    assert_eq!(
+        differential.whole_errors,
+        differential.per_unit_errors,
+        "whole: {}\nper-unit: {}",
+        differential.whole_diags,
+        differential.per_unit_diags
+    );
     assert!(!differential.whole_errors, "whole: {}\nper-unit: {}", differential.whole_diags, differential.per_unit_diags);
     if backend_available() {
         assert_eq!(
@@ -180,11 +186,27 @@ fn main() -> i32 {\n\
 }
 
 #[test]
-fn borrowed_sum_match_rejects_unsupported_payloads_and_consumption() {
-    assert!(check_errs(
+fn borrowed_sum_match_accepts_arrays_but_rejects_nested_projection_and_consumption() {
+    assert!(!check_errs(
         "borrowed-sum-array",
         "fn inspect(borrow value: Option<array<i64>>) -> i64 = match value { Some(values) => values.len() None => 0 }\nfn main() -> i32 = 0\n",
     ));
+    let aggregate_graphs = "\
+Record { value: string }\n\
+Holder { values: array<Record> }\n\
+Choice { Numbers(array<i64>), Wrapped(Holder), Empty }\n\
+fn inspect(borrow value: Record) -> i64 = value.value.len()\n\
+fn option_strings(borrow value: Option<array<string>>) -> i64 = match value { Some(values) => values.len() None => 0 }\n\
+fn option_records(borrow value: Option<array<Record>>) -> i64 = match value { Some(values) => inspect(values[0]) None => 0 }\n\
+fn result_records(borrow value: Result<array<Record>, Error>) -> i64 = match value { Ok(values) => inspect(values[0]) Err(_) => 0 }\n\
+fn choice_records(borrow value: Choice) -> i64 = match value { Numbers(values) => values.len() Wrapped(holder) => inspect(holder.values[0]) Empty => 0 }\n\
+fn main() -> i32 = 0\n\
+";
+    assert!(
+        !check_errs("borrowed-sum-aggregate-graphs", aggregate_graphs),
+        "{}",
+        check_diagnostics("borrowed-sum-aggregate-graphs", aggregate_graphs)
+    );
     assert!(check_errs(
         "borrowed-sum-nested-match",
         "fn inspect(borrow value: Option<Option<string>>) -> i64 = match value { Some(inner) => match inner { Some(text) => text.len() None => 0 } None => 0 }\nfn main() -> i32 = 0\n",
@@ -203,7 +225,7 @@ fn borrowed_sum_match_rejects_unsupported_payloads_and_consumption() {
         "borrowed-sum-store",
         "Holder { value: string }\nfn inspect(borrow value: Option<string>) -> Holder = match value { Some(text) => Holder { value: text } None => Holder { value: \"empty\".clone() } }\nfn main() -> i32 = 0\n",
     ));
-    assert!(check_errs(
+    assert!(!check_errs(
         "borrowed-sum-mixed-nested",
         "Holder { choice: Mixed }\nMixed { Text(string), Bad(array<i64>) }\nfn inspect(borrow value: Holder) -> i64 = match value.choice { Text(text) => text.len() Bad(values) => values.len() }\nfn main() -> i32 = 0\n",
     ));
@@ -325,6 +347,517 @@ fn main() -> i32 {\n\
     if backend_available() {
         assert_eq!(build_and_run("borrowed-sum-shared-calls", source).status.code(), Some(42));
     }
+}
+
+#[test]
+fn indexed_shared_borrow_addresses_dynamic_record_elements_at_the_call_action() {
+    let source = "\
+Record { text: string, value: i64 }\n\
+Inspector { call: fn(borrow Record) -> i64 }\n\
+RecordHolder { values: array<Record> }\n\
+fn inspect(borrow record: Record) -> i64 = record.text.len() + record.value\n\
+fn inspect_text(borrow text: string) -> i64 = text.len()\n\
+fn generic<T>(borrow value: T) -> i64 = 7\n\
+fn records() -> array<Record> {\n\
+  mut values: array_builder<Record> := array_builder()\n\
+  values.push(Record { text: \"first\".clone(), value: 1 })\n\
+  values.push(Record { text: \"second\".clone(), value: 36 })\n\
+  return values.build()\n\
+}\n\
+fn strings() -> array<string> {\n\
+  mut values: array_builder<string> := array_builder()\n\
+  values.push(\"scalar\".clone())\n\
+  return values.build()\n\
+}\n\
+fn field_base(borrow holder: RecordHolder) -> i64 = inspect(holder.values[1])\n\
+fn projected(borrow values: Option<array<Record>>) -> i64 = match values {\n\
+  Some(records) => inspect(records[1])\n\
+  None => 0\n\
+}\n\
+fn main() -> i32 {\n\
+  values := records()\n\
+  f := inspect\n\
+  holder := Inspector { call: inspect }\n\
+  joined := if values.len() == 2 { inspect } else { f }\n\
+  direct := inspect(values[0])\n\
+  indirect := f(values[1])\n\
+  joined_result := joined(values[0])\n\
+  field_result := holder.call(values[0])\n\
+  generic_result := generic(values[0])\n\
+  aggregate_holder := RecordHolder { values: records() }\n\
+  nested_base_result := field_base(aggregate_holder)\n\
+  text_values := strings()\n\
+  scalar_string_result := inspect_text(text_values[0])\n\
+  wrapped: Option<array<Record>> := Some(records())\n\
+  if direct == 6 && indirect == 42 && joined_result == 6 && field_result == 6 && generic_result == 7 && nested_base_result == 42 && scalar_string_result == 6 && projected(wrapped) == 42 && values.len() == 2 { return 42 }\n\
+  return 0\n\
+}\n\
+";
+    assert!(
+        !check_errs("borrowed-indexed-record", source),
+        "{}",
+        check_diagnostics("borrowed-indexed-record", source)
+    );
+    let mut source_map = SourceMap::new();
+    let checked = check(&mut source_map, "borrowed-indexed-record-mir", source);
+    assert!(align_sema::checked_hir_body_facts_are_valid(&checked.hir));
+    let mir = align_mir::lower_program_checked(&checked.hir, false, None)
+        .expect("indexed borrowed HIR must validate");
+    let rendered = align_mir::print::program_to_string(&mir);
+    assert!(
+        rendered.contains("borrow-element"),
+        "indexed borrow must remain a MIR place descriptor:\n{rendered}"
+    );
+    if backend_available() {
+        assert_eq!(
+            build_and_run("borrowed-indexed-record", source)
+                .status
+                .code(),
+            Some(42)
+        );
+    }
+}
+
+#[test]
+fn indexed_shared_borrow_reserves_the_array_across_index_and_later_arguments() {
+    let prefix = "\
+Record { value: string }\n\
+fn inspect(borrow record: Record) -> i64 = record.value.len()\n\
+fn inspect_with(borrow record: Record, value: i64) -> i64 = record.value.len() + value\n\
+fn inspect_many(borrow record: Record, first: i64, middle: i64, last: i64) -> i64 = record.value.len() + first + middle + last\n\
+fn consume(records: array<Record>) -> i64 = records.len()\n\
+fn replace(borrow mut values: array<Record>) -> i64 { values = records(\"replacement\"); return 0 }\n\
+fn observe_mut(borrow mut values: array<Record>) -> i64 = values.len()\n\
+fn records(value: str) -> array<Record> {\n\
+  mut builder: array_builder<Record> := array_builder()\n\
+  builder.push(Record { value: value.clone() })\n\
+  return builder.build()\n\
+}\n\
+";
+    let during_index = format!(
+        "{prefix}fn main() -> i32 {{ values := records(\"x\"); return inspect(values[consume(values)]) as i32 }}\n"
+    );
+    let diagnostics = check_diagnostics("borrowed-index-self-invalidation", &during_index);
+    assert!(
+        diagnostics.contains("value snapshot was invalidated"),
+        "the pre-index reservation must reject self-invalidation:\n{diagnostics}"
+    );
+
+    let during_later_argument = format!(
+        "{prefix}fn main() -> i32 {{ values := records(\"x\"); return inspect_with(values[0], consume(values)) as i32 }}\n"
+    );
+    let diagnostics = check_diagnostics(
+        "borrowed-index-later-invalidation",
+        &during_later_argument,
+    );
+    assert!(
+        diagnostics.contains("value snapshot was invalidated"),
+        "the guarded descriptor must retain its reservation through later arguments:\n{diagnostics}"
+    );
+
+    for (operation, expression) in [
+        ("move", "consume(values)"),
+        ("replace", "replace(values)"),
+        ("borrow-mut", "observe_mut(values)"),
+    ] {
+        let during_index = format!(
+            "{prefix}fn main() -> i32 {{ mut values := records(\"x\"); return inspect(values[{expression}]) as i32 }}\n"
+        );
+        let diagnostics = check_diagnostics(
+            &format!("borrowed-index-{operation}-during-index"),
+            &during_index,
+        );
+        assert!(
+            diagnostics.contains("value snapshot was invalidated"),
+            "{operation} during index evaluation must invalidate the reservation:\n{diagnostics}"
+        );
+
+        for (position, arguments) in [
+            ("first", format!("{expression}, 0, 0")),
+            ("middle", format!("0, {expression}, 0")),
+            ("last", format!("0, 0, {expression}")),
+        ] {
+            let during_later = format!(
+                "{prefix}fn main() -> i32 {{ mut values := records(\"x\"); return inspect_many(values[0], {arguments}) as i32 }}\n"
+            );
+            let diagnostics = check_diagnostics(
+                &format!("borrowed-index-{operation}-later-{position}"),
+                &during_later,
+            );
+            assert!(
+                diagnostics.contains("value snapshot was invalidated"),
+                "{operation} in the {position} later argument must invalidate the reservation:\n{diagnostics}"
+            );
+        }
+    }
+
+    let unrelated = format!(
+        "{prefix}fn main() -> i32 {{ values := records(\"forty-two\"); other := records(\"other\"); if inspect_with(values[0], consume(other)) == 10 {{ return 42 }}; return 0 }}\n"
+    );
+    assert!(
+        !check_errs("borrowed-index-unrelated", &unrelated),
+        "{}",
+        check_diagnostics("borrowed-index-unrelated", &unrelated)
+    );
+    if backend_available() {
+        assert_eq!(
+            build_and_run("borrowed-index-unrelated", &unrelated)
+                .status
+                .code(),
+            Some(42)
+        );
+    }
+}
+
+#[test]
+fn indexed_shared_borrow_substitutes_return_and_mutable_retention_roots() {
+    let prefix = "\
+Record { value: string }\n\
+View { text: str }\n\
+fn element_text(borrow record: Record) -> str { text: str := record.value; return text }\n\
+fn retain_text(borrow record: Record, borrow mut destination: View) { text: str := record.value; destination.text = text }\n\
+fn first_text(borrow records: array<Record>) -> str = element_text(records[0])\n\
+fn retain_first(borrow records: array<Record>, borrow mut destination: View) { retain_text(records[0], destination) }\n\
+fn retain_first_indirect(borrow records: array<Record>, borrow mut destination: View) { f := retain_text; f(records[0], destination) }\n\
+fn records() -> array<Record> {\n\
+  mut builder: array_builder<Record> := array_builder()\n\
+  builder.push(Record { value: \"forty-two\".clone() })\n\
+  return builder.build()\n\
+}\n\
+";
+    let positive = format!(
+        "{prefix}fn main() -> i32 {{ values := records(); mut output := View {{ text: \"\" }}; mut indirect_output := View {{ text: \"\" }}; direct := first_text(values); retain_first(values, output); retain_first_indirect(values, indirect_output); if direct.len() == 9 && output.text.len() == 9 && indirect_output.text.len() == 9 && values.len() == 1 {{ return 42 }}; return 0 }}\n"
+    );
+    assert!(
+        !check_errs("borrowed-index-summary-positive", &positive),
+        "{}",
+        check_diagnostics("borrowed-index-summary-positive", &positive)
+    );
+    if backend_available() {
+        assert_eq!(
+            build_and_run("borrowed-index-summary-positive", &positive)
+                .status
+                .code(),
+            Some(42)
+        );
+    }
+
+    for (name, body) in [
+        (
+            "return",
+            "values := records(); view := first_text(values); consumed := values; print(consumed.len()); print(view)",
+        ),
+        (
+            "retention",
+            "values := records(); mut output := View { text: \"\" }; retain_first(values, output); consumed := values; print(consumed.len()); print(output.text)",
+        ),
+        (
+            "indirect-retention",
+            "values := records(); mut output := View { text: \"\" }; retain_first_indirect(values, output); consumed := values; print(consumed.len()); print(output.text)",
+        ),
+    ] {
+        let source = format!("{prefix}fn main() -> i32 {{ {body}; return 0 }}\n");
+        let diagnostics = check_diagnostics(&format!("borrowed-index-summary-{name}"), &source);
+        assert!(
+            diagnostics.contains("invalidated") || diagnostics.contains("moved"),
+            "indexed {name} roots must remain tied to the array generation:\n{diagnostics}"
+        );
+    }
+}
+
+#[test]
+fn indexed_shared_borrow_rejects_non_shared_or_unstable_element_places() {
+    let prefix = "\
+Record { value: string }\n\
+fn inspect(borrow record: Record) -> i64 = record.value.len()\n\
+fn consume(record: Record) -> i64 = record.value.len()\n\
+fn mutate(borrow mut record: Record) { record.value = \"changed\".clone() }\n\
+fn records() -> array<Record> { mut builder: array_builder<Record> := array_builder(); builder.push(Record { value: \"x\".clone() }); return builder.build() }\n\
+";
+    for (name, body) in [
+        ("by-value", "values := records(); print(consume(values[0]))"),
+        ("borrow-mut", "mut values := records(); mutate(values[0])"),
+        ("temporary", "print(inspect(records()[0]))"),
+    ] {
+        let source = format!("{prefix}fn main() -> i32 {{ {body}; return 0 }}\n");
+        assert!(
+            check_errs(&format!("borrowed-index-reject-{name}"), &source),
+            "indexed Move element {name} form must stay rejected"
+        );
+    }
+
+    let unstable_bad_index =
+        format!("{prefix}fn main() -> i32 {{ print(inspect(records()[true])); return 0 }}\n");
+    let diagnostics = check_diagnostics(
+        "borrowed-index-unstable-precedes-index",
+        &unstable_bad_index,
+    );
+    assert!(
+        diagnostics.contains("stable named local"),
+        "the unstable base must be rejected first:\n{diagnostics}"
+    );
+    assert!(
+        !diagnostics.contains("array index must be an integer"),
+        "index checking must not run after base formation fails:\n{diagnostics}"
+    );
+}
+
+#[test]
+fn indexed_shared_borrow_preserves_termination_and_bounds_order() {
+    let prefix = "\
+Record { value: string }\n\
+fn inspect_with(borrow record: Record, value: i64) -> i64 = record.value.len() + value\n\
+fn fail_index() -> Result<i64, Error> = Err(Error.Invalid)\n\
+fn later() -> i64 { print(99); return 0 }\n\
+fn records() -> array<Record> { mut builder: array_builder<Record> := array_builder(); builder.push(Record { value: \"x\".clone() }); return builder.build() }\n\
+";
+    let cases = [
+        (
+            "index-terminates",
+            "fn run() -> Result<i64, Error> { values := records(); return Ok(inspect_with(values[fail_index()?], later())) }\nfn main() -> Result<(), Error> { print(run()?); return Ok(()) }\n",
+        ),
+        (
+            "later-terminates",
+            "fn run() -> Result<i64, Error> { values := records(); return Ok(inspect_with(values[0], fail_index()?)) }\nfn main() -> Result<(), Error> { print(run()?); return Ok(()) }\n",
+        ),
+        (
+            "bounds-before-later",
+            "fn main() -> i32 { values := records(); print(inspect_with(values[2], later())); return 0 }\n",
+        ),
+    ];
+    for (name, body) in cases {
+        let source = format!("{prefix}{body}");
+        assert!(
+            !check_errs(&format!("borrowed-index-{name}"), &source),
+            "{}",
+            check_diagnostics(&format!("borrowed-index-{name}"), &source)
+        );
+        if backend_available() {
+            let output = build_and_run(&format!("borrowed-index-{name}"), &source);
+            assert_ne!(output.status.code(), Some(0), "{name} must terminate before success");
+            assert!(
+                output.stdout.is_empty(),
+                "{name} must not evaluate or call the later printing action: {:?}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
+}
+
+#[test]
+fn indexed_shared_borrow_termination_family_forms_no_element_descriptor() {
+    let prefix = "\
+import std.process\n\
+Record { value: string }\n\
+fn inspect_with(borrow record: Record, value: i64) -> i64 = record.value.len() + value\n\
+fn later() -> i64 { print(99); return 0 }\n\
+fn records() -> array<Record> { mut builder: array_builder<Record> := array_builder(); builder.push(Record { value: \"x\".clone() }); return builder.build() }\n\
+";
+    let cases = [
+        (
+            "index-return",
+            "fn run() -> i64 { values := records(); return inspect_with(values[{ return 7 }], later()) }\n",
+        ),
+        (
+            "index-break",
+            "fn run() -> i64 { values := records(); return loop { inspect_with(values[{ break 7 }], later()) } }\n",
+        ),
+        (
+            "index-exit",
+            "fn run() -> i64 { values := records(); return inspect_with(values[process.exit(7)], later()) }\n",
+        ),
+        (
+            "index-abort",
+            "fn run() -> i64 { values := records(); return inspect_with(values[process.abort()], later()) }\n",
+        ),
+        (
+            "index-diverge",
+            "fn run() -> i64 { values := records(); return inspect_with(values[loop {}], later()) }\n",
+        ),
+        (
+            "later-return",
+            "fn run() -> i64 { values := records(); return inspect_with(values[0], { return 7 }) }\n",
+        ),
+        (
+            "later-break",
+            "fn run() -> i64 { values := records(); return loop { inspect_with(values[0], { break 7 }) } }\n",
+        ),
+        (
+            "later-exit",
+            "fn run() -> i64 { values := records(); return inspect_with(values[0], { process.exit(7) }) }\n",
+        ),
+        (
+            "later-abort",
+            "fn run() -> i64 { values := records(); return inspect_with(values[0], { process.abort() }) }\n",
+        ),
+        (
+            "later-diverge",
+            "fn run() -> i64 { values := records(); return inspect_with(values[0], loop {}) }\n",
+        ),
+    ];
+    for (name, body) in cases {
+        let source = format!("{prefix}{body}fn main() -> i32 = 0\n");
+        let mut source_map = SourceMap::new();
+        let checked = check(
+            &mut source_map,
+            &format!("borrowed-index-termination-{name}"),
+            &source,
+        );
+        assert!(
+            !checked.diags.has_errors(),
+            "{name}: {}",
+            align_driver::format_diagnostics(&source_map, &checked.diags)
+        );
+        assert!(align_sema::checked_hir_body_facts_are_valid(&checked.hir));
+        let mir = align_mir::lower_program_checked(&checked.hir, false, None)
+            .expect("terminating indexed-borrow HIR must validate");
+        let rendered = align_mir::print::program_to_string(&mir);
+        assert!(
+            !rendered.contains("borrow-element"),
+            "{name} must not retain an element descriptor after termination:\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn copy_view_index_termination_family_forms_no_load_or_result_fact() {
+    let prefix = "import std.process\n";
+    let cases = [
+        (
+            "return",
+            "fn run(borrow values: array<str>) -> str { return values[{ return \"done\" }] }\n",
+        ),
+        (
+            "break",
+            "fn run(borrow values: array<str>) -> str { return loop { values[{ break \"done\" }] } }\n",
+        ),
+        (
+            "exit",
+            "fn run(borrow values: array<str>) -> str { return values[process.exit(7)] }\n",
+        ),
+        (
+            "abort",
+            "fn run(borrow values: array<str>) -> str { return values[process.abort()] }\n",
+        ),
+        (
+            "diverge",
+            "fn run(borrow values: array<str>) -> str { return values[loop {}] }\n",
+        ),
+    ];
+    for (name, body) in cases {
+        let source = format!("{prefix}{body}fn main() -> i32 = 0\n");
+        let mut source_map = SourceMap::new();
+        let checked = check(
+            &mut source_map,
+            &format!("copy-index-termination-{name}"),
+            &source,
+        );
+        assert!(
+            !checked.diags.has_errors(),
+            "{name}: {}",
+            align_driver::format_diagnostics(&source_map, &checked.diags)
+        );
+        assert!(align_sema::checked_hir_body_facts_are_valid(&checked.hir));
+        let mir = align_mir::lower_program_checked(&checked.hir, false, None)
+            .expect("terminating Copy index HIR must validate");
+        assert!(
+            mir.fns.iter().all(|function| function.blocks.iter().all(|block| {
+                block.stmts.iter().all(|statement| {
+                    !matches!(
+                        statement,
+                        align_mir::Stmt::Let(
+                            _,
+                            align_mir::Rvalue::Index(..) | align_mir::Rvalue::SliceIndex(..)
+                        )
+                    )
+                })
+            })),
+            "{name} must form no element load or Copy result fact"
+        );
+    }
+}
+
+#[test]
+fn copy_view_indices_preserve_direct_field_and_projected_array_roots() {
+    let source = "\
+Holder { values: array<str> }\n\
+View { text: str }\n\
+fn retain(value: str, borrow mut destination: View) { destination.text = value }\n\
+fn direct(borrow values: array<str>) -> str = values[0]\n\
+fn field(borrow holder: Holder) -> str = holder.values[0]\n\
+fn projected(borrow values: Option<array<str>>) -> str = match values { Some(items) => items[0] None => \"\" }\n\
+fn retain_both(borrow values: array<str>) -> i64 { mut destination := View { text: \"\" }; retain(values[0], destination); f := retain; f(values[0], destination); return destination.text.len() }\n\
+fn main() -> i32 = 0\n\
+";
+    assert!(
+        !check_errs("borrowed-copy-index-roots", source),
+        "{}",
+        check_diagnostics("borrowed-copy-index-roots", source)
+    );
+    let mut source_map = SourceMap::new();
+    let checked = check(&mut source_map, "borrowed-copy-index-roots-hir", source);
+    assert!(align_sema::checked_hir_body_facts_are_valid(&checked.hir));
+
+    let invalidated = "\
+fn consume(values: array<str>) -> i64 = values.len()\n\
+fn first(borrow values: array<str>) -> str = values[0]\n\
+fn main(args: array<str>) -> Result<(), Error> { view := first(args); print(consume(args)); print(view); return Ok(()) }\n\
+";
+    let diagnostics = check_diagnostics("borrowed-copy-index-invalidation", invalidated);
+    assert!(
+        diagnostics.contains("invalidated") || diagnostics.contains("moved"),
+        "a copied view must retain its source array generation:\n{diagnostics}"
+    );
+
+    for (name, retain) in [
+        ("direct", "retain(args[0], output)"),
+        ("indirect", "f := retain; f(args[0], output)"),
+    ] {
+        let invalidated = format!(
+            "View {{ text: str }}\nfn consume(values: array<str>) -> i64 = values.len()\nfn retain(value: str, borrow mut destination: View) {{ destination.text = value }}\nfn main(args: array<str>) -> Result<(), Error> {{ mut output := View {{ text: \"\" }}; {retain}; print(consume(args)); print(output.text); return Ok(()) }}\n"
+        );
+        let diagnostics = check_diagnostics(
+            &format!("borrowed-copy-index-retention-{name}"),
+            &invalidated,
+        );
+        assert!(
+            diagnostics.contains("invalidated") || diagnostics.contains("moved"),
+            "{name} mutable retention must preserve the indexed array root:\n{diagnostics}"
+        );
+    }
+}
+
+#[test]
+fn copy_record_indices_preserve_every_direct_and_nested_view_leaf() {
+    let source = "\
+Inner { text: str, bytes: slice<u8> }\n\
+Views { text: str, bytes: slice<u8>, inner: Inner }\n\
+Holder { values: array<Views> }\n\
+fn whole(borrow values: array<Views>) -> Views = values[0]\n\
+fn direct_text(borrow values: array<Views>) -> str = values[0].text\n\
+fn direct_bytes(borrow values: array<Views>) -> slice<u8> = values[0].bytes\n\
+fn nested_text(borrow values: array<Views>) -> str = values[0].inner.text\n\
+fn nested_bytes(borrow values: array<Views>) -> slice<u8> = values[0].inner.bytes\n\
+fn field_text(borrow holder: Holder) -> str = holder.values[0].text\n\
+fn projected_bytes(borrow values: Option<array<Views>>) -> slice<u8> = match values { Some(items) => items[0].inner.bytes None => \"\".bytes() }\n\
+fn main() -> i32 = 0\n\
+";
+    assert!(
+        !check_errs("borrowed-copy-record-index-roots", source),
+        "{}",
+        check_diagnostics("borrowed-copy-record-index-roots", source)
+    );
+
+    let escape = "\
+Inner { text: str, bytes: slice<u8> }\n\
+Views { text: str, bytes: slice<u8>, inner: Inner }\n\
+fn bad(text: str, bytes: slice<u8>) -> Views { arena out { mut builder: array_builder<Views> := array_builder(out); builder.push(Views { text: text, bytes: bytes, inner: Inner { text: text, bytes: bytes } }); values := builder.build(); return values[0] } }\n\
+fn main() -> i32 = 0\n\
+";
+    assert!(
+        check_errs("borrowed-copy-record-index-escape", escape),
+        "a copied record must not outlive its source array generation"
+    );
 }
 
 #[test]
@@ -542,6 +1075,49 @@ fn shared_imported_call_matches_whole_program() {
                 .status
                 .code(),
             Some(42),
+        );
+    }
+}
+
+#[test]
+fn indexed_shared_borrow_matches_imported_whole_and_per_unit_modes() {
+    let files = &[
+        (
+            "records.align",
+            "module records\npub Record { value: string }\npub View { text: str }\npub fn inspect(borrow record: Record) -> i64 = record.value.len()\npub fn element_text(borrow record: Record) -> str { text: str := record.value; return text }\npub fn retain_text(borrow record: Record, borrow mut destination: View) { text: str := record.value; destination.text = text }\npub fn make() -> array<Record> { mut builder: array_builder<Record> := array_builder(); builder.push(Record { value: \"forty-two\".clone() }); return builder.build() }\n",
+        ),
+        (
+            "main.align",
+            "module main\nimport records\nfn main() -> i32 { values := records.make(); f := records.inspect; view := records.element_text(values[0]); mut output := records.View { text: \"\" }; records.retain_text(values[0], output); if records.inspect(values[0]) == 9 && f(values[0]) == 9 && view.len() == 9 && output.text.len() == 9 && values.len() == 1 { return 42 }; return 0 }\n",
+        ),
+    ];
+    let differential = diff_check_multi("borrow-index-import", files, "main.align");
+    assert_eq!(
+        differential.whole_errors,
+        differential.per_unit_errors,
+        "whole: {}\nper-unit: {}",
+        differential.whole_diags,
+        differential.per_unit_diags
+    );
+    assert!(
+        !differential.whole_errors,
+        "whole: {}\nper-unit: {}",
+        differential.whole_diags,
+        differential.per_unit_diags
+    );
+    if backend_available() {
+        assert_eq!(
+            build_and_run_multi("borrow-index-import-whole", files, "main.align")
+                .status
+                .code(),
+            Some(42)
+        );
+        assert_eq!(
+            build_per_unit_multi("borrow-index-import-per-unit", files, "main.align")
+                .link_and_run()
+                .status
+                .code(),
+            Some(42)
         );
     }
 }

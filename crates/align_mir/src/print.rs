@@ -1035,6 +1035,14 @@ fn operand_str(op: &Operand) -> String {
                 .collect::<String>();
             format!("borrow slot{}{}", place.slot, suffix)
         }
+        Operand::BorrowedElementPlace(place) => format!(
+            "borrow-element {}[{}] reserved-at bb{}:{} guarded-by bb{}",
+            operand_str(&Operand::BorrowedPlace(Box::new(place.base.clone()))),
+            operand_str(&place.index),
+            place.guard.reservation_block,
+            place.guard.reservation_statement,
+            place.guard.success,
+        ),
         Operand::BorrowedCleanupArg(index) => format!("arg{index}.cleanup"),
     }
 }

@@ -2868,6 +2868,8 @@ fn build_module<'c>(
             stack_template_values: stack_headers.template_values,
             stack_template_headers: HashMap::new(),
             blocks: Vec::new(),
+            current_mir_block: None,
+            current_mir_statement: None,
             alias_scopes: HashMap::new(),
             dibuilder: debug_ctx.as_ref().map(|dc| &dc.dib),
             subprogram,
@@ -2998,6 +3000,7 @@ fn validate_resource_rvalues(program: &Program) -> Result<(), CodegenError> {
                 *function.slots.get(slot as usize)?
             }
             align_mir::Operand::BorrowedPlace(place) => place.ty,
+            align_mir::Operand::BorrowedElementPlace(place) => place.element_ty,
             align_mir::Operand::BorrowedCleanupArg(_) => Ty::Bool,
         })
     }
@@ -5214,6 +5217,10 @@ fn preflight_operand_ty(function: &Function, operand: &Operand) -> Option<Ty> {
             .slots
             .get(place.slot as usize)
             .map(|_| place.ty),
+        Operand::BorrowedElementPlace(place) => function
+            .slots
+            .get(place.base.slot as usize)
+            .map(|_| place.element_ty),
         Operand::BorrowedCleanupArg(_) => Some(Ty::Bool),
     }
 }
@@ -5283,6 +5290,9 @@ fn operands_match_modes(
                 (Operand::BorrowedPlace(place), align_ast::ParamMode::Borrow) => {
                     place.cleanup.is_none()
                 }
+                (Operand::BorrowedElementPlace(place), align_ast::ParamMode::Borrow) => {
+                    place.base.cleanup.is_none() && place.element_ty == *ty
+                }
                 (Operand::BorrowedPlace(place), align_ast::ParamMode::BorrowMut) => {
                     let move_pointee = align_sema::needs_drop_flag(
                         *ty,
@@ -5303,7 +5313,7 @@ fn operands_match_modes(
                             &program.enums,
                             &program.tagged_types,
                         ) => true,
-                (Operand::BorrowedPlace(_), _) => false,
+                (Operand::BorrowedPlace(_) | Operand::BorrowedElementPlace(_), _) => false,
                 (_, align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut) => false,
                 _ => true,
             })
@@ -8330,6 +8340,10 @@ struct FnGen<'c, 'a> {
     stack_template_values: HashSet<ValueId>,
     stack_template_headers: HashMap<ValueId, inkwell::values::PointerValue<'c>>,
     blocks: Vec<BasicBlock<'c>>,
+    /// MIR block currently being emitted. Bounds-guarded borrowed element descriptors validate
+    /// their successful guard against this action block before codegen forms any pointer.
+    current_mir_block: Option<align_mir::BlockId>,
+    current_mir_statement: Option<usize>,
     /// Per-`map_into`-loop scoped-`noalias` metadata, keyed by the MIR loop's scope id: the
     /// `(in_list, out_list)` scope lists (each a one-scope MDNode) built lazily on first use. The
     /// `in`/`out` scopes share a fresh disjoint domain per id, so the loop's source load
@@ -10817,13 +10831,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
         for b in &self.f.blocks {
             let bb = self.blocks[b.id as usize];
             self.builder.position_at_end(bb);
+            self.current_mir_block = Some(b.id);
             self.gen_block(b)?;
         }
+        self.current_mir_block = None;
+        self.current_mir_statement = None;
         Ok(())
     }
 
     fn gen_block(&mut self, b: &Block) -> Result<(), CodegenError> {
         for (i, s) in b.stmts.iter().enumerate() {
+            self.current_mir_statement = Some(i);
             // Anchor this statement's instructions to its source line (opt-in debug info). Keep the
             // previous location for a statement with no recorded line (`(0, 0)`).
             if let Some(&(line, col)) = b.stmt_lines.get(i)
@@ -11394,6 +11412,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 }
             }
         }
+        self.current_mir_statement = None;
         self.gen_term(&b.term)
     }
 
@@ -18843,6 +18862,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .ok_or_else(|| self.err(format!("parameter index {index} references missing slot {slot}")))
             }
             Operand::BorrowedPlace(place) => self.checked_borrowed_place_ty(place),
+            Operand::BorrowedElementPlace(place) => {
+                self.checked_borrowed_element_place_ty(place)
+            }
             Operand::BorrowedCleanupArg(index) => {
                 self.f
                     .borrow_mut_cleanup_slots
@@ -18943,6 +18965,395 @@ impl<'c, 'a> FnGen<'c, 'a> {
             return Err(self.err("borrowed place cleanup slot is missing or not bool"));
         }
         Ok(ty)
+    }
+
+    fn checked_borrowed_element_place_ty(
+        &self,
+        place: &align_mir::BorrowedElementPlace,
+    ) -> Result<Ty, CodegenError> {
+        let base_ty = self.checked_borrowed_place_ty(&place.base)?;
+        let element_ty = match base_ty {
+            Ty::DynArray(element) => align_sema::scalar_to_ty(element),
+            Ty::DynStructArray(id, align_sema::Layout::Aos) => Ty::Struct(id),
+            _ => {
+                return Err(self.err(
+                    "borrowed element place base is not an ordinary dynamic array",
+                ));
+            }
+        };
+        if element_ty != place.element_ty {
+            return Err(self.err("borrowed element place type disagrees with its array base"));
+        }
+        if !matches!(self.checked_operand_ty(&place.index)?, Ty::Int(_)) {
+            return Err(self.err("borrowed element place index is not an integer"));
+        }
+        self.checked_borrowed_element_guard(place)?;
+        Ok(element_ty)
+    }
+
+    fn mir_operand_same(left: &Operand, right: &Operand) -> bool {
+        match (left, right) {
+            (Operand::Const(Const::Int(a, at)), Operand::Const(Const::Int(b, bt))) => {
+                a == b && at == bt
+            }
+            (Operand::Const(Const::Float(a, at)), Operand::Const(Const::Float(b, bt))) => {
+                a.to_bits() == b.to_bits() && at == bt
+            }
+            (Operand::Const(Const::Char(a)), Operand::Const(Const::Char(b))) => a == b,
+            (Operand::Const(Const::Bool(a)), Operand::Const(Const::Bool(b))) => a == b,
+            (Operand::Const(Const::Unit), Operand::Const(Const::Unit)) => true,
+            (Operand::Value(a), Operand::Value(b)) | (Operand::Arg(a), Operand::Arg(b)) => a == b,
+            (Operand::BorrowedCleanupArg(a), Operand::BorrowedCleanupArg(b)) => a == b,
+            (Operand::BorrowedPlace(a), Operand::BorrowedPlace(b)) => {
+                a.slot == b.slot
+                    && a.path == b.path
+                    && a.ty == b.ty
+                    && a.cleanup == b.cleanup
+            }
+            _ => false,
+        }
+    }
+
+    fn mir_value_def<'m>(block: &'m align_mir::Block, value: ValueId) -> Option<&'m Rvalue> {
+        block.stmts.iter().find_map(|statement| match statement {
+            Stmt::Let(candidate, rvalue) if *candidate == value => Some(rvalue),
+            _ => None,
+        })
+    }
+
+    fn mir_block_dominates(&self, dominator: align_mir::BlockId, target: align_mir::BlockId) -> bool {
+        let count = self.f.blocks.len();
+        if dominator as usize >= count || target as usize >= count || self.f.entry as usize >= count {
+            return false;
+        }
+        let all = (0..count as u32).collect::<HashSet<_>>();
+        let mut predecessors = vec![Vec::new(); count];
+        for block in &self.f.blocks {
+            if block.id as usize >= count {
+                return false;
+            }
+            let mut edge = |successor: align_mir::BlockId| {
+                if let Some(entries) = predecessors.get_mut(successor as usize) {
+                    entries.push(block.id);
+                    true
+                } else {
+                    false
+                }
+            };
+            let valid = match block.term {
+                Term::Goto(next) => edge(next),
+                Term::Branch(_, yes, no) => edge(yes) && edge(no),
+                Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => true,
+            };
+            if !valid {
+                return false;
+            }
+        }
+        let mut sets = vec![all.clone(); count];
+        sets[self.f.entry as usize] = HashSet::from([self.f.entry]);
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for id in 0..count as u32 {
+                if id == self.f.entry {
+                    continue;
+                }
+                let mut next = if let Some((&first, rest)) = predecessors[id as usize].split_first() {
+                    let mut intersection = sets[first as usize].clone();
+                    for predecessor in rest {
+                        intersection.retain(|candidate| sets[*predecessor as usize].contains(candidate));
+                    }
+                    intersection
+                } else {
+                    HashSet::new()
+                };
+                next.insert(id);
+                if next != sets[id as usize] {
+                    sets[id as usize] = next;
+                    changed = true;
+                }
+            }
+        }
+        sets[target as usize].contains(&dominator)
+    }
+
+    fn mir_operand_is_place_root(operand: &Operand, root: Slot) -> bool {
+        match operand {
+            Operand::BorrowedPlace(place) => place.slot == root,
+            Operand::BorrowedElementPlace(place) => place.base.slot == root,
+            _ => false,
+        }
+    }
+
+    fn mir_call_borrow_mutates_root(
+        &self,
+        modes: &[align_ast::ParamMode],
+        arguments: &[Operand],
+        root: Slot,
+    ) -> bool {
+        arguments.iter().enumerate().any(|(index, argument)| {
+            modes.get(index) == Some(&align_ast::ParamMode::BorrowMut)
+                && Self::mir_operand_is_place_root(argument, root)
+        })
+    }
+
+    fn mir_rvalue_mutates_root(&self, rvalue: &Rvalue, root: Slot) -> bool {
+        match rvalue {
+            Rvalue::Call(DirectCall::Program(target), arguments) => self
+                .callable_preflight
+                .declarations
+                .get(target)
+                .is_some_and(|declaration| {
+                    self.mir_call_borrow_mutates_root(
+                        &declaration.signature.modes,
+                        arguments,
+                        root,
+                    )
+                }),
+            Rvalue::CallWithCleanup(call) => self
+                .callable_preflight
+                .declarations
+                .get(&call.target)
+                .is_some_and(|declaration| {
+                    self.mir_call_borrow_mutates_root(
+                        &declaration.signature.modes,
+                        &call.args,
+                        root,
+                    )
+                }),
+            Rvalue::CallIndirect {
+                args, signature, ..
+            } => self.mir_call_borrow_mutates_root(&signature.param_modes, args, root),
+            Rvalue::CallIndirectWithCleanup(call) => {
+                self.mir_call_borrow_mutates_root(&call.signature.param_modes, &call.args, root)
+            }
+            _ => false,
+        }
+    }
+
+    fn mir_statement_mutates_root(&self, statement: &Stmt, root: Slot) -> bool {
+        match statement {
+            Stmt::Let(_, rvalue) => self.mir_rvalue_mutates_root(rvalue, root),
+            Stmt::Store(slot, _)
+            | Stmt::StoreField(slot, ..)
+            | Stmt::StoreIndex(slot, ..)
+            | Stmt::StoreConstArray { slot, .. }
+            | Stmt::StoreElemField(slot, ..)
+            | Stmt::DropFlagInit(slot)
+            | Stmt::NullTupleField(slot, _)
+            | Stmt::NullStructField(slot, _)
+            | Stmt::Drop(slot)
+            | Stmt::DropElem(slot, ..)
+            | Stmt::DropElemField(slot, ..) => *slot == root,
+            Stmt::StoreElemFieldPtr { base, .. } => Self::mir_operand_is_place_root(base, root),
+            _ => false,
+        }
+    }
+
+    fn mir_reachable_blocks(&self, start: align_mir::BlockId, reverse: bool) -> HashSet<align_mir::BlockId> {
+        let count = self.f.blocks.len();
+        if start as usize >= count {
+            return HashSet::new();
+        }
+        let mut edges = vec![Vec::new(); count];
+        for block in &self.f.blocks {
+            if block.id as usize >= count {
+                return HashSet::new();
+            }
+            let successors = match block.term {
+                Term::Goto(next) => vec![next],
+                Term::Branch(_, yes, no) => vec![yes, no],
+                Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => Vec::new(),
+            };
+            for successor in successors {
+                if successor as usize >= count {
+                    return HashSet::new();
+                }
+                if reverse {
+                    edges[successor as usize].push(block.id);
+                } else {
+                    edges[block.id as usize].push(successor);
+                }
+            }
+        }
+        let mut reached = HashSet::new();
+        let mut work = vec![start];
+        while let Some(block) = work.pop() {
+            if reached.insert(block) {
+                work.extend(edges[block as usize].iter().copied());
+            }
+        }
+        reached
+    }
+
+    fn checked_borrowed_element_root_preserved(
+        &self,
+        place: &align_mir::BorrowedElementPlace,
+        action: align_mir::BlockId,
+    ) -> Result<(), CodegenError> {
+        let action_statement = self
+            .current_mir_statement
+            .ok_or_else(|| self.err("borrowed element place has no MIR action statement"))?;
+        if !self.mir_block_dominates(place.guard.reservation_block, place.guard.success)
+            || !self.mir_block_dominates(place.guard.reservation_block, action)
+        {
+            return Err(self.err("borrowed element reservation does not dominate its guard and call action"));
+        }
+        let from_guard = self.mir_reachable_blocks(place.guard.reservation_block, false);
+        let to_action = self.mir_reachable_blocks(action, true);
+        if from_guard.is_empty() || to_action.is_empty() {
+            return Err(self.err("borrowed element root preservation path is malformed"));
+        }
+        for block in &self.f.blocks {
+            if !from_guard.contains(&block.id) || !to_action.contains(&block.id) {
+                continue;
+            }
+            let start = if block.id == place.guard.reservation_block {
+                place.guard.reservation_statement as usize
+            } else {
+                0
+            };
+            let limit = if block.id == action {
+                action_statement.min(block.stmts.len())
+            } else {
+                block.stmts.len()
+            };
+            if start > limit
+                || block.stmts[start..limit]
+                .iter()
+                .any(|statement| self.mir_statement_mutates_root(statement, place.base.slot))
+            {
+                return Err(self.err(
+                    "borrowed element array root changes between its bounds guard and call action",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Reconstruct MIR's exact signed bounds predicate and prove its success edge dominates the
+    /// current call action. This rejects a hand-built/stale descriptor before pointer formation.
+    fn checked_borrowed_element_guard(
+        &self,
+        place: &align_mir::BorrowedElementPlace,
+    ) -> Result<(), CodegenError> {
+        let action = self
+            .current_mir_block
+            .ok_or_else(|| self.err("borrowed element place was checked outside a MIR action"))?;
+        if !self.mir_block_dominates(place.guard.success, action) {
+            return Err(self.err("borrowed element bounds guard does not dominate its call action"));
+        }
+        let signed_i64 = Ty::Int(IntTy { bits: 64, signed: true });
+        if self.checked_operand_ty(&place.guard.len)? != signed_i64 {
+            return Err(self.err("borrowed element bounds guard length is not i64"));
+        }
+        let sources = self
+            .f
+            .blocks
+            .iter()
+            .filter_map(|block| match block.term {
+                Term::Branch(Operand::Value(condition), failure, success)
+                    if success == place.guard.success => Some((block, condition, failure)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [(source, condition, failure)] = sources.as_slice() else {
+            return Err(self.err("borrowed element bounds guard has no unique successful edge"));
+        };
+        let failure = self
+            .f
+            .blocks
+            .get(*failure as usize)
+            .filter(|block| block.id == *failure)
+            .ok_or_else(|| self.err("borrowed element bounds guard failure block is missing"))?;
+        let bounds_calls = failure
+            .stmts
+            .iter()
+            .filter_map(|statement| match statement {
+                Stmt::Let(
+                    _,
+                    Rvalue::Call(DirectCall::Runtime(RuntimeKey::BoundsFail), arguments),
+                ) => Some(arguments.as_slice()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [arguments] = bounds_calls.as_slice() else {
+            return Err(self.err("borrowed element guard failure edge lacks one bounds failure"));
+        };
+        if !matches!(failure.term, Term::Unreachable)
+            || arguments.len() != 2
+            || !Self::mir_operand_same(&arguments[0], &place.index)
+            || !Self::mir_operand_same(&arguments[1], &place.guard.len)
+        {
+            return Err(self.err("borrowed element guard failure edge disagrees with its descriptor"));
+        }
+        let Operand::Value(len_value) = place.guard.len else {
+            return Err(self.err("borrowed element guard length lacks a checked array-length value"));
+        };
+        let expected_base = Operand::BorrowedPlace(Box::new(place.base.clone()));
+        if !matches!(
+            Self::mir_value_def(source, len_value),
+            Some(Rvalue::SliceLen(base)) if Self::mir_operand_same(base, &expected_base)
+        ) {
+            return Err(self.err("borrowed element guard length was not read from its array base"));
+        }
+        let Some(Rvalue::Bin(BinOp::Or, Operand::Value(lo), Operand::Value(hi))) =
+            Self::mir_value_def(source, *condition)
+        else {
+            return Err(self.err("borrowed element guard condition is not the canonical bounds predicate"));
+        };
+        let zero = Operand::Const(Const::Int(0, signed_i64));
+        let low_ok = matches!(
+            Self::mir_value_def(source, *lo),
+            Some(Rvalue::Bin(BinOp::Lt, index, bound))
+                if Self::mir_operand_same(index, &place.index)
+                    && Self::mir_operand_same(bound, &zero)
+        );
+        let high_ok = matches!(
+            Self::mir_value_def(source, *hi),
+            Some(Rvalue::Bin(BinOp::Ge, index, len))
+                if Self::mir_operand_same(index, &place.index)
+                    && Self::mir_operand_same(len, &place.guard.len)
+        );
+        if !low_ok || !high_ok {
+            return Err(self.err("borrowed element guard comparisons disagree with its descriptor"));
+        }
+        self.checked_borrowed_element_root_preserved(place, action)?;
+        Ok(())
+    }
+
+    fn borrowed_element_ptr(
+        &self,
+        place: &align_mir::BorrowedElementPlace,
+    ) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
+        self.checked_borrowed_element_place_ty(place)?;
+        let header = self.borrowed_place_ptr(&place.base)?;
+        let data_field = self
+            .builder
+            .build_struct_gep(slice_struct_type(self.ctx), header, 0, "borrow.element.data.field")
+            .map_err(|error| self.err(error))?;
+        let data = self
+            .builder
+            .build_load(
+                self.ctx.ptr_type(AddressSpace::default()),
+                data_field,
+                "borrow.element.data",
+            )
+            .map_err(|error| self.err(error))?
+            .into_pointer_value();
+        let index = self.operand(&place.index)?.into_int_value();
+        // MIR's successful bounds block dominates this call action. This GEP has no independent
+        // bounds decision and is formed only now, after every later argument has fallen through.
+        unsafe {
+            self.builder
+                .build_gep(
+                    self.llvm_type(place.element_ty),
+                    data,
+                    &[index],
+                    "borrow.element.ptr",
+                )
+                .map_err(|error| self.err(error))
+        }
     }
 
     fn borrowed_place_ptr(
@@ -19095,9 +19506,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// by-value read; a projection operand is a pointer only while crossing an explicit borrow
     /// or borrow-mut call boundary.
     fn operand_for_borrow(&self, op: &Operand) -> Result<BasicValueEnum<'c>, CodegenError> {
-        let Operand::BorrowedPlace(place) = op else {
-            return self.operand(op);
-        };
+        if let Operand::BorrowedElementPlace(place) = op {
+            return Ok(self.borrowed_element_ptr(place)?.into());
+        }
+        let Operand::BorrowedPlace(place) = op else { return self.operand(op) };
         let pointer = self.borrowed_place_ptr(place)?;
         if let Some(cleanup) = place.cleanup {
             let cleanup_pointer = self
@@ -19247,6 +19659,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder
                     .build_load(self.llvm_type(place.ty), pointer, "borrow.load")
                     .map_err(|error| self.err(error))?
+            }
+            Operand::BorrowedElementPlace(_) => {
+                return Err(self.err(
+                    "borrowed element place was used outside a shared-borrow call action",
+                ));
             }
             Operand::BorrowedCleanupArg(index) => {
                 let slot = *self
@@ -19437,6 +19854,141 @@ mod tests {
             d.iter().map(|diagnostic| &diagnostic.message).collect::<Vec<_>>(),
         );
         lower_program(&hir)
+    }
+
+    fn borrowed_element_place_mut(program: &mut Program) -> &mut align_mir::BorrowedElementPlace {
+        for function in &mut program.fns {
+            for block in &mut function.blocks {
+                for statement in &mut block.stmts {
+                    let Stmt::Let(_, Rvalue::Call(_, arguments)) = statement else {
+                        continue;
+                    };
+                    if let Some(place) = arguments.iter_mut().find_map(|argument| match argument {
+                        Operand::BorrowedElementPlace(place) => Some(place.as_mut()),
+                        _ => None,
+                    }) {
+                        return place;
+                    }
+                }
+            }
+        }
+        panic!("borrowed element descriptor missing")
+    }
+
+    fn borrowed_element_place(program: &Program) -> (usize, align_mir::BorrowedElementPlace) {
+        for (function_index, function) in program.fns.iter().enumerate() {
+            for block in &function.blocks {
+                for statement in &block.stmts {
+                    let Stmt::Let(_, Rvalue::Call(_, arguments)) = statement else {
+                        continue;
+                    };
+                    if let Some(place) = arguments.iter().find_map(|argument| match argument {
+                        Operand::BorrowedElementPlace(place) => Some(place.as_ref().clone()),
+                        _ => None,
+                    }) {
+                        return (function_index, place);
+                    }
+                }
+            }
+        }
+        panic!("borrowed element descriptor missing")
+    }
+
+    #[test]
+    fn borrowed_element_guard_fails_closed_before_pointer_codegen() {
+        let source = "Record { value: string }\nfn inspect(borrow record: Record) -> i64 = record.value.len()\nfn use(borrow records: array<Record>) -> i64 = inspect(records[0])\nfn main() -> i32 = 0\n";
+        let program = mir(source);
+        emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+            .unwrap_or_else(|error| panic!("valid borrowed element guard must lower: {error}"));
+
+        let mut missing_guard = program.clone();
+        borrowed_element_place_mut(&mut missing_guard).guard.success = 0;
+        assert_lowering(
+            emit_llvm_ir(&missing_guard, &BuildTarget::Baseline, false, &[], None)
+                .expect_err("a descriptor without its exact success edge must fail"),
+            "borrowed element bounds guard has no unique successful edge",
+        );
+
+        let mut wrong_len = program.clone();
+        borrowed_element_place_mut(&mut wrong_len).guard.len = Operand::Const(Const::Int(
+            0,
+            Ty::Int(IntTy { bits: 64, signed: true }),
+        ));
+        assert_lowering(
+            emit_llvm_ir(&wrong_len, &BuildTarget::Baseline, false, &[], None)
+                .expect_err("a descriptor with unrelated length evidence must fail"),
+            "borrowed element guard failure edge disagrees with its descriptor",
+        );
+
+        let mut invalid_base = program;
+        borrowed_element_place_mut(&mut invalid_base)
+            .base
+            .path
+            .push(hir::BorrowedPathSegment::StructField(99));
+        assert_lowering(
+            emit_llvm_ir(&invalid_base, &BuildTarget::Baseline, false, &[], None)
+                .expect_err("a descriptor with an invalid array path must fail"),
+            "borrowed place field path crosses a non-struct type",
+        );
+
+        let mut stale_root = mir(source);
+        let mut inserted = false;
+        for function in &mut stale_root.fns {
+            for block in &mut function.blocks {
+                let Some(position) = block.stmts.iter().position(|statement| {
+                    matches!(
+                        statement,
+                        Stmt::Let(_, Rvalue::Call(_, arguments))
+                            if arguments.iter().any(|argument| matches!(
+                                argument,
+                                Operand::BorrowedElementPlace(_)
+                            ))
+                    )
+                }) else {
+                    continue;
+                };
+                let root = match &block.stmts[position] {
+                    Stmt::Let(_, Rvalue::Call(_, arguments)) => arguments
+                        .iter()
+                        .find_map(|argument| match argument {
+                            Operand::BorrowedElementPlace(place) => Some(place.base.slot),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| panic!("borrowed element root")),
+                    _ => panic!("borrowed element call changed during test mutation"),
+                };
+                block.stmts.insert(position, Stmt::DropFlagInit(root));
+                inserted = true;
+                break;
+            }
+            if inserted {
+                break;
+            }
+        }
+        assert!(inserted, "stale-root mutation point missing");
+        assert_lowering(
+            emit_llvm_ir(&stale_root, &BuildTarget::Baseline, false, &[], None)
+                .expect_err("a descriptor whose root generation changed must fail"),
+            "borrowed element array root changes between its bounds guard and call action",
+        );
+
+        let mut stale_before_guard = mir(source);
+        let (function_index, place) = borrowed_element_place(&stale_before_guard);
+        let reservation_block = stale_before_guard.fns[function_index]
+            .blocks
+            .iter_mut()
+            .find(|block| block.id == place.guard.reservation_block)
+            .unwrap_or_else(|| panic!("borrowed element reservation block"));
+        let reservation_statement = usize::try_from(place.guard.reservation_statement)
+            .unwrap_or_else(|_| panic!("test reservation statement fits usize"));
+        reservation_block
+            .stmts
+            .insert(reservation_statement, Stmt::DropFlagInit(place.base.slot));
+        assert_lowering(
+            emit_llvm_ir(&stale_before_guard, &BuildTarget::Baseline, false, &[], None)
+                .expect_err("a descriptor whose root changed during index evaluation must fail"),
+            "borrowed element array root changes between its bounds guard and call action",
+        );
     }
 
     fn sqlite_callback_contract_fixture() -> (Program, ProgramSignature) {

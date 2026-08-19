@@ -774,6 +774,10 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             recv: boxed!(recv),
             index: boxed!(index),
         },
+        ExprKind::BorrowedIndex { base, index } => ExprKind::BorrowedIndex {
+            base: base.clone(),
+            index: boxed!(index),
+        },
         ExprKind::SliceRange { recv, start, end } => ExprKind::SliceRange {
             recv: boxed!(recv),
             start: take_optional_boxed_expr(clones, start.is_some())?,
@@ -2274,6 +2278,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             one!(recv);
             one!(index);
         }
+        ExprKind::BorrowedIndex { index, .. } => one!(index),
         ExprKind::ArrayBuilderNew { region, .. } => optional!(region),
         ExprKind::BuilderNew { capacity } => optional!(capacity),
         ExprKind::SliceRange { recv, start, end } => {
