@@ -198,14 +198,21 @@ its current result behavior. Views derived from an admitted payload follow the e
 owner-generation and region rules. A free-standing or otherwise owning scrutinee retains the
 existing consuming match behavior.
 
+Ordinary indexing of an admitted `array<str>` or AoS array of Copy records with view fields
+preserves the complete owner generation and input/arena roots for direct, field, and
+borrowed-projection bases. Return and `borrow mut` retention cannot outlive those roots. A
+terminating index forms no bounds action or result.
+
 An indexed Move element of an admitted ordinary dynamic array may be passed only to an explicit
 shared-`borrow` parameter selected by a direct, imported, or function-value call. The array base
 must be a stable local, borrowed/projection binding, or struct-field path. Its complete root is
 reserved from once-only index evaluation through every later argument and the call action; any
 possibly overlapping move, Drop, replacement, transfer, or mutable borrow is rejected. MIR emits
-the existing bounds check at the indexed argument's source position, retains no pointer while later
-arguments evaluate, and forms the pointer only after every later argument falls through and the
-root is revalidated. A terminating later argument forms no pointer or call. The element stays
+the existing bounds check at the indexed argument's source position only after the index falls
+through, retains no pointer while later arguments evaluate, and forms the pointer only after every
+later argument falls through and the root is revalidated. A terminating index forms no guard,
+descriptor, later argument, pointer, or call; a terminating later argument forms no pointer or
+call. The element stays
 caller-owned, and a returned or mutably retained view remains rooted in the array generation and
 contained region roots. By-value Move-element indexing, temporary or nested-index bases, and
 element `borrow mut` remain rejected.
@@ -328,11 +335,16 @@ unsupported Move shapes retain the borrowed-place diagnostic. Derived views foll
 borrow summary and region checks, while existing Copy/view matching retains its current result behavior. An owning-place
 `match` keeps the consuming extraction and source-clearing rule.
 
+An admitted projected `array<str>` element or view-bearing field of an AoS Copy record preserves
+the source generation and every contained region through ordinary indexing, return, and mutable
+destination retention. A terminating index forms no bounds action or result.
+
 An indexed Move element is a stable call place only for an explicit shared-`borrow` parameter on a
 direct, imported, or function-value target and a stable ordinary dynamic-array base. The base root
 cannot be invalidated during once-only index evaluation, any later argument, or the call action.
-MIR checks bounds at the indexed argument position, revalidates the root after later arguments, and
-forms the pointer only at the call. The element remains caller-owned, and returned or mutably
+MIR checks bounds at the indexed argument position after index fallthrough, revalidates the root
+after later arguments, and forms the pointer only at the call. A terminating index forms none of
+those actions. The element remains caller-owned, and returned or mutably
 retained views retain the array's generation and contained region roots. By-value and mutable
 element forms remain unsupported.
 

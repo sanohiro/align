@@ -206,17 +206,23 @@ borrowed path is admitted only for the exact stable place and recursive payload 
 rather than falling back to the owning extraction. Exhaustiveness is already guaranteed by
 typecheck (`03`).
 
+Ordinary `Index` and `ElemField` over an admitted `array<str>` or AoS Copy record array reached
+through a `BorrowedProjection` retain the projection's owner generation and every contained
+input/arena root. A terminating index emits no bounds action, load, result, or retained fact. The
+fallthrough path uses the existing MIR bounds CFG and Copy load; no new MIR or LLVM node is needed.
+
 An indexed Move element passed to an explicit shared-`borrow` parameter lowers as a checked dynamic
 element place through direct, imported, and indirect targets: the base borrowed place,
 once-evaluated index operand, and exact element type. The source root is reserved from index
 evaluation through every later argument and the call action, so no possibly overlapping move, Drop,
-replacement, transfer, or mutable borrow can invalidate it. MIR emits the existing bounds-failure
-CFG at the indexed argument position and carries only a guarded place descriptor through later
-argument evaluation. Validation requires that exact guard to dominate the call use and requires
+replacement, transfer, or mutable borrow can invalidate it. Only index fallthrough emits the
+existing bounds-failure CFG at the indexed argument position and carries a guarded place descriptor
+through later argument evaluation. Validation requires that exact guard to dominate the call use and requires
 every intervening fallthrough path to preserve the root; a terminating later argument has no place
-use or call. The unchanged borrowed ABI receives the element pointer. LLVM forms that pointer only
-while lowering the call; it does not decide bounds semantics. MIR never loads, moves, nulls, or
-assigns cleanup to the element.
+use or call. A terminating index has no guard, descriptor, later argument, place use, or call. The
+unchanged borrowed ABI receives the element pointer. LLVM forms that pointer only while lowering
+the call; it does not decide bounds semantics. MIR never loads, moves, nulls, or assigns cleanup to
+the element.
 
 ---
 

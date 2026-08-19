@@ -353,6 +353,11 @@ current result behavior. Views derived from the payload follow the existing infe
 and region rules. A free-standing or otherwise owning scrutinee keeps the existing consuming match
 behavior.
 
+Ordinary indexing of an admitted `array<str>` or AoS array of Copy records with view fields keeps
+those same owner-generation and input/arena roots through direct, field, and borrowed-projection
+bases. Returned views and views retained into a `borrow mut` destination cannot outlive those roots.
+If the index expression terminates, no bounds action or result is formed.
+
 An explicit shared-`borrow` call may take one indexed Move element from an ordinary dynamic scalar
 or AoS record array: `inspect(values[i])` is valid only when the selected direct, imported, or
 function-value target's corresponding parameter is `borrow` and `values` is a stable local,
@@ -360,9 +365,11 @@ borrowed/projection binding, or struct-field path. The complete array root is re
 once-only index evaluation through every later call argument and the call action: an operation that
 might move, drop, replace, transfer, or mutably borrow an overlapping root is rejected, while
 unrelated mutation remains valid. MIR performs the existing bounds check at the indexed argument's
-source position, retains no pointer while later arguments evaluate, and forms the element pointer
-only after every later argument falls through and the root is revalidated. A terminating later
-argument forms no pointer or call. The callee receives a pointer to caller-owned element storage.
+source position only after the index falls through, retains no pointer while later arguments
+evaluate, and forms the element pointer only after every later argument falls through and the root
+is revalidated. A terminating index forms no guard, descriptor, later argument, pointer, or call; a
+terminating later argument forms no pointer or call. The callee receives a pointer to caller-owned
+element storage.
 No element value, cleanup bit, allocation, or ownership transfer is created. A returned view or one
 retained through an existing `borrow mut` destination summary remains rooted in the array generation
 and contained region roots. By-value Move-element indexing, temporary-array bases, nested indexed

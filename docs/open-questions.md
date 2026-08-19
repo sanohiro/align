@@ -4065,15 +4065,21 @@ storing, capturing, sending, or consuming the whole non-Copy/Move payload is rej
 Copy/view matching retains its current result behavior, and views derived from an admitted payload
 use the existing return-borrow and region checks.
 
+Ordinary indexing of an admitted `array<str>` or AoS array of Copy records with view fields
+preserves the complete source generation and input/arena roots through direct, field, and borrowed
+projection bases, including return and `borrow mut` destination retention. A terminating index
+forms no bounds action or result.
+
 The dynamic-aggregate extension also permits an indexed Move element of an admitted ordinary
 dynamic array only as the argument to an explicit shared-`borrow` parameter on a direct, imported,
 or function-value target. Its base must be a stable local, borrowed/projection binding, or
 struct-field path. The complete source root is reserved from once-only index evaluation through all
 later arguments and the call action; a move, Drop, replacement, transfer, or mutable borrow that
 might overlap it is rejected, while unrelated mutation remains valid. MIR emits the existing bounds
-failure at the indexed argument position, carries no pointer through later argument evaluation, and
-revalidates the root before the call forms the element address. A terminating later argument forms
-no pointer or call. The caller retains the array and element, no cleanup/allocation/transfer occurs,
+failure at the indexed argument position only after index fallthrough, carries no pointer through
+later argument evaluation, and revalidates the root before the call forms the element address. A
+terminating index forms no guard, descriptor, later argument, pointer, or call; a terminating later
+argument forms no pointer or call. The caller retains the array and element, no cleanup/allocation/transfer occurs,
 and a returned or mutably retained view is rooted in the array generation and contained region
 roots. By-value Move-element indexing, temporary/nested-index bases, and element `borrow mut`
 remain rejected.

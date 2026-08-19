@@ -307,6 +307,14 @@ a shallow Move aggregate copy, and leaves owning-place match, `else`, and `?` se
 A package-specific wrapper or alternate error/result API would create a second ownership model, so
 the language capability is the correct boundary.
 
+**A Copy view read through a borrowed array projection keeps the projection roots.** Widening the
+payload grammar to `array<str>` and AoS arrays of Copy records is unsafe if ordinary `Index` or
+field projection silently treats the projected binding as static. Direct, field, and projected
+bases therefore feed the same source generation and contained input/arena roots into return and
+`borrow mut` retention summaries. A terminating index produces no bounds action or result. This is
+the existing inferred-region model applied to a new reachable path, not a reference type or array
+special case.
+
 **A borrowed Move array element is a call place, not a value.** Decoded artifact graphs store Move
 records in ordinary AoS dynamic arrays. Loading `rows[i]` by value would either copy one owner or
 require partial element transfer and cleanup, neither of which a read-only verifier intends. The
@@ -314,11 +322,12 @@ general completion is narrower and explicit: `inspect(rows[i])` is accepted when
 direct, imported, or function-value target declares that parameter `borrow`, the base is a stable
 local/field/projection place, and its root is reserved from once-only index evaluation through all
 later arguments and the call action. A same-root move, Drop, replacement, transfer, or mutable
-borrow during that interval rejects; unrelated mutation remains valid. MIR emits the bounds-failure
-branch at the indexed argument position, carries only a guarded descriptor through later argument
-evaluation, and revalidates the root before LLVM forms and passes the existing address at the call.
-A terminating later argument forms no pointer or call. No header/element owner, cleanup bit, or
-allocation is manufactured. Returned views and views retained through existing `borrow mut`
+borrow during that interval rejects; unrelated mutation remains valid. After index fallthrough, MIR
+emits the bounds-failure branch at the indexed argument position, carries only a guarded descriptor
+through later argument evaluation, and revalidates the root before LLVM forms and passes the
+existing address at the call. A terminating index forms no guard, descriptor, later argument,
+pointer, or call; a terminating later argument forms no pointer or call. No header/element owner,
+cleanup bit, or allocation is manufactured. Returned views and views retained through existing `borrow mut`
 summaries retain the array generation and contained region roots. Keeping by-value and `borrow mut`
 element forms rejected preserves visible ownership and avoids a second partial-element state model.
 
