@@ -7,7 +7,9 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-19._ Request 16's borrow-safe sum-payload match projection is merged in
+_Last updated: 2026-08-19._ Request 14's exclusive-create and no-replace publication primitives are
+merged in Align PR #861 at `3c2edd2f399c9e2c9551b4227c61b36d6a041e20`; its
+`c6f2-request14-adoption` real-client gate remains pending. Request 16's borrow-safe sum-payload match projection is merged in
 Align PR #857 at `8557c1525aefd9a4afef02d1ec5c2f88e16db4e4`; its
 `c6-borrowed-option-adoption` real-client gate remains pending. Request 7's signed merge verification (#848), decoded-owner cleanup
 prerequisite (#849), and escaped-string language design and

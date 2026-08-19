@@ -6,9 +6,10 @@ The accepted public-contract ledger is
 
 > 🌐 **English** · [Japanese](./ja/fs.md)
 
-> **Status:** DESIGN ACCEPTED 2026-08-19 (Align PR #859, merged as
-> `a21eb8416f2088df68026f10c63a38cd0bd65538`). Implementation and the
-> align-llm adoption gate are pending.
+> **Status:** IMPLEMENTED 2026-08-19 (design PR #859, merged as
+> `a21eb8416f2088df68026f10c63a38cd0bd65538`; implementation PR #861, merged as
+> `3c2edd2f399c9e2c9551b4227c61b36d6a041e20`). The align-llm adoption gate is
+> pending.
 
 ## Overview
 

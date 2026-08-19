@@ -1,6 +1,7 @@
 # `std.fs` exclusive creation and no-replace publication
 
-Status: **ACCEPTED DESIGN; implementation pending.**
+Status: **IMPLEMENTED; implementation merged in Align PR #861 as
+`3c2edd2f399c9e2c9551b4227c61b36d6a041e20`; align-llm adoption pending.**
 
 This document is the public-contract ledger and implementation plan for
 align-llm Request 14. It adds the two filesystem operations needed by C6f2 to
