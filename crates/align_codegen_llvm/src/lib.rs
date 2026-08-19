@@ -11410,6 +11410,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     self.builder.build_store(scratch, value).map_err(|e| self.err(e))?;
                     self.drop_ty_at(scratch, ty)?;
                 }
+                // Analysis-only identity marker. Keeping it as a non-movable MIR statement lets
+                // post-lowering validation recover the reservation's final position after block
+                // compaction or statement fusion without emitting any LLVM instruction.
+                Stmt::BorrowedElementReservation { .. } => {}
             }
         }
         self.current_mir_statement = None;
@@ -19014,7 +19018,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         }
     }
 
-    fn mir_value_def<'m>(block: &'m align_mir::Block, value: ValueId) -> Option<&'m Rvalue> {
+    fn mir_value_def(block: &align_mir::Block, value: ValueId) -> Option<&Rvalue> {
         block.stmts.iter().find_map(|statement| match statement {
             Stmt::Let(candidate, rvalue) if *candidate == value => Some(rvalue),
             _ => None,
@@ -19190,16 +19194,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
         &self,
         place: &align_mir::BorrowedElementPlace,
         action: align_mir::BlockId,
+        reservation_block: align_mir::BlockId,
+        reservation_statement: usize,
+        success: align_mir::BlockId,
     ) -> Result<(), CodegenError> {
         let action_statement = self
             .current_mir_statement
             .ok_or_else(|| self.err("borrowed element place has no MIR action statement"))?;
-        if !self.mir_block_dominates(place.guard.reservation_block, place.guard.success)
-            || !self.mir_block_dominates(place.guard.reservation_block, action)
+        if !self.mir_block_dominates(reservation_block, success)
+            || !self.mir_block_dominates(reservation_block, action)
         {
             return Err(self.err("borrowed element reservation does not dominate its guard and call action"));
         }
-        let from_guard = self.mir_reachable_blocks(place.guard.reservation_block, false);
+        let from_guard = self.mir_reachable_blocks(reservation_block, false);
         let to_action = self.mir_reachable_blocks(action, true);
         if from_guard.is_empty() || to_action.is_empty() {
             return Err(self.err("borrowed element root preservation path is malformed"));
@@ -19208,8 +19215,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             if !from_guard.contains(&block.id) || !to_action.contains(&block.id) {
                 continue;
             }
-            let start = if block.id == place.guard.reservation_block {
-                place.guard.reservation_statement as usize
+            let start = if block.id == reservation_block {
+                reservation_statement
             } else {
                 0
             };
@@ -19240,25 +19247,61 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let action = self
             .current_mir_block
             .ok_or_else(|| self.err("borrowed element place was checked outside a MIR action"))?;
-        if !self.mir_block_dominates(place.guard.success, action) {
-            return Err(self.err("borrowed element bounds guard does not dominate its call action"));
+        let reservations = self
+            .f
+            .blocks
+            .iter()
+            .flat_map(|block| {
+                block
+                    .stmts
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(statement, candidate)| match candidate {
+                        Stmt::BorrowedElementReservation { token, root }
+                            if *token == place.guard.reservation =>
+                        {
+                            Some((block.id, statement, *root))
+                        }
+                        _ => None,
+                    })
+            })
+            .collect::<Vec<_>>();
+        let [(reservation_block, reservation_statement, reservation_root)] =
+            reservations.as_slice()
+        else {
+            return Err(self.err("borrowed element reservation marker is not unique"));
+        };
+        if *reservation_root != place.base.slot {
+            return Err(self.err("borrowed element reservation marker has the wrong root"));
         }
         let signed_i64 = Ty::Int(IntTy { bits: 64, signed: true });
         if self.checked_operand_ty(&place.guard.len)? != signed_i64 {
             return Err(self.err("borrowed element bounds guard length is not i64"));
         }
+        let Operand::Value(len_value) = place.guard.len else {
+            return Err(self.err("borrowed element guard length lacks a checked array-length value"));
+        };
         let sources = self
             .f
             .blocks
             .iter()
-            .filter_map(|block| match block.term {
-                Term::Branch(Operand::Value(condition), failure, success)
-                    if success == place.guard.success => Some((block, condition, failure)),
-                _ => None,
-            })
+            .filter(|block| Self::mir_value_def(block, len_value).is_some())
             .collect::<Vec<_>>();
-        let [(source, condition, failure)] = sources.as_slice() else {
-            return Err(self.err("borrowed element bounds guard has no unique successful edge"));
+        let [source] = sources.as_slice() else {
+            return Err(self.err("borrowed element guard length has no unique definition"));
+        };
+        let expected_base = Operand::BorrowedPlace(Box::new(place.base.clone()));
+        if !matches!(
+            Self::mir_value_def(source, len_value),
+            Some(Rvalue::SliceLen(base)) if Self::mir_operand_same(base, &expected_base)
+        ) {
+            return Err(self.err("borrowed element guard length was not read from its array base"));
+        }
+        let Term::Branch(Operand::Value(condition), failure, success) = &source.term else {
+            return Err(self.err("borrowed element bounds guard has no canonical successful edge"));
+        };
+        if !self.mir_block_dominates(*success, action) {
+            return Err(self.err("borrowed element bounds guard does not dominate its call action"));
         };
         let failure = self
             .f
@@ -19287,16 +19330,6 @@ impl<'c, 'a> FnGen<'c, 'a> {
         {
             return Err(self.err("borrowed element guard failure edge disagrees with its descriptor"));
         }
-        let Operand::Value(len_value) = place.guard.len else {
-            return Err(self.err("borrowed element guard length lacks a checked array-length value"));
-        };
-        let expected_base = Operand::BorrowedPlace(Box::new(place.base.clone()));
-        if !matches!(
-            Self::mir_value_def(source, len_value),
-            Some(Rvalue::SliceLen(base)) if Self::mir_operand_same(base, &expected_base)
-        ) {
-            return Err(self.err("borrowed element guard length was not read from its array base"));
-        }
         let Some(Rvalue::Bin(BinOp::Or, Operand::Value(lo), Operand::Value(hi))) =
             Self::mir_value_def(source, *condition)
         else {
@@ -19318,7 +19351,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
         if !low_ok || !high_ok {
             return Err(self.err("borrowed element guard comparisons disagree with its descriptor"));
         }
-        self.checked_borrowed_element_root_preserved(place, action)?;
+        self.checked_borrowed_element_root_preserved(
+            place,
+            action,
+            *reservation_block,
+            *reservation_statement,
+            *success,
+        )?;
         Ok(())
     }
 
@@ -19902,11 +19941,65 @@ mod tests {
             .unwrap_or_else(|error| panic!("valid borrowed element guard must lower: {error}"));
 
         let mut missing_guard = program.clone();
-        borrowed_element_place_mut(&mut missing_guard).guard.success = 0;
+        borrowed_element_place_mut(&mut missing_guard).guard.reservation = u32::MAX;
         assert_lowering(
             emit_llvm_ir(&missing_guard, &BuildTarget::Baseline, false, &[], None)
-                .expect_err("a descriptor without its exact success edge must fail"),
-            "borrowed element bounds guard has no unique successful edge",
+                .expect_err("a descriptor without its exact reservation marker must fail"),
+            "borrowed element reservation marker is not unique",
+        );
+
+        let mut duplicate_guard = program.clone();
+        let (_, place) = borrowed_element_place(&duplicate_guard);
+        let function = duplicate_guard
+            .fns
+            .iter_mut()
+            .find(|function| {
+                function.blocks.iter().any(|block| {
+                    block.stmts.iter().any(|statement| {
+                        matches!(
+                            statement,
+                            Stmt::BorrowedElementReservation { token, .. }
+                                if *token == place.guard.reservation
+                        )
+                    })
+                })
+            })
+            .unwrap_or_else(|| panic!("borrowed element reservation function"));
+        function.blocks[function.entry as usize]
+            .stmts
+            .insert(0, Stmt::BorrowedElementReservation {
+                token: place.guard.reservation,
+                root: place.base.slot,
+            });
+        assert_lowering(
+            emit_llvm_ir(&duplicate_guard, &BuildTarget::Baseline, false, &[], None)
+                .expect_err("duplicate reservation identities must fail"),
+            "borrowed element reservation marker is not unique",
+        );
+
+        let mut wrong_root = program.clone();
+        let (_, place) = borrowed_element_place(&wrong_root);
+        let marker = wrong_root
+            .fns
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.stmts)
+            .find(|statement| {
+                matches!(
+                    statement,
+                    Stmt::BorrowedElementReservation { token, .. }
+                        if *token == place.guard.reservation
+                )
+            })
+            .unwrap_or_else(|| panic!("borrowed element reservation marker"));
+        let Stmt::BorrowedElementReservation { root, .. } = marker else {
+            panic!("selected reservation statement changed during test mutation")
+        };
+        *root = root.saturating_add(1);
+        assert_lowering(
+            emit_llvm_ir(&wrong_root, &BuildTarget::Baseline, false, &[], None)
+                .expect_err("a reservation marker for another root must fail"),
+            "borrowed element reservation marker has the wrong root",
         );
 
         let mut wrong_len = program.clone();
@@ -19917,7 +20010,7 @@ mod tests {
         assert_lowering(
             emit_llvm_ir(&wrong_len, &BuildTarget::Baseline, false, &[], None)
                 .expect_err("a descriptor with unrelated length evidence must fail"),
-            "borrowed element guard failure edge disagrees with its descriptor",
+            "borrowed element guard length lacks a checked array-length value",
         );
 
         let mut invalid_base = program;
@@ -19974,21 +20067,70 @@ mod tests {
 
         let mut stale_before_guard = mir(source);
         let (function_index, place) = borrowed_element_place(&stale_before_guard);
-        let reservation_block = stale_before_guard.fns[function_index]
+        let (reservation_block, reservation_statement) = stale_before_guard.fns[function_index]
             .blocks
             .iter_mut()
-            .find(|block| block.id == place.guard.reservation_block)
-            .unwrap_or_else(|| panic!("borrowed element reservation block"));
-        let reservation_statement = usize::try_from(place.guard.reservation_statement)
-            .unwrap_or_else(|_| panic!("test reservation statement fits usize"));
+            .find_map(|block| {
+                block
+                    .stmts
+                    .iter()
+                    .position(|statement| {
+                        matches!(
+                            statement,
+                            Stmt::BorrowedElementReservation { token, .. }
+                                if *token == place.guard.reservation
+                        )
+                    })
+                    .map(|statement| (block, statement))
+            })
+            .unwrap_or_else(|| panic!("borrowed element reservation marker"));
         reservation_block
             .stmts
-            .insert(reservation_statement, Stmt::DropFlagInit(place.base.slot));
+            .insert(reservation_statement + 1, Stmt::DropFlagInit(place.base.slot));
         assert_lowering(
             emit_llvm_ir(&stale_before_guard, &BuildTarget::Baseline, false, &[], None)
                 .expect_err("a descriptor whose root changed during index evaluation must fail"),
             "borrowed element array root changes between its bounds guard and call action",
         );
+    }
+
+    #[test]
+    fn borrowed_element_guard_identity_survives_post_lowering_rewrites() {
+        // `value` is moved immediately before the loop break, so known-drop simplification removes
+        // and compacts at least one conditional destructor block before this call. The three builder
+        // writes fuse in the call's eventual predecessor and delete statements before the reservation
+        // marker. Both rewrites used to stale the descriptor's stored block/statement coordinates.
+        let source = r#"Record { value: string }
+fn inspect(borrow record: Record) -> i64 = record.value.len()
+fn use(borrow records: array<Record>, n: i64) -> i64 {
+  loop {
+    value := "owned".clone()
+    moved := value
+    break
+  }
+  b := builder()
+  b.write("left")
+  b.write_int(n)
+  b.write("right")
+  rendered := b.to_string()
+  return inspect(records[0]) + rendered.len()
+}
+fn main() -> i32 = 0
+"#;
+        let program = mir(source);
+        let function = program
+            .fns
+            .iter()
+            .find(|function| function.name.as_str().ends_with("use"))
+            .unwrap_or_else(|| panic!("rewrite fixture function"));
+        assert!(function.blocks.iter().flat_map(|block| &block.stmts).any(|statement| {
+            matches!(statement, Stmt::Let(_, Rvalue::BuilderWriteStrIntStr(..)))
+        }), "builder statement fusion must run before validation");
+        assert!(function.blocks.iter().flat_map(|block| &block.stmts).any(|statement| {
+            matches!(statement, Stmt::BorrowedElementReservation { .. })
+        }), "the stable reservation marker must survive both rewrites");
+        emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+            .unwrap_or_else(|error| panic!("rewritten borrowed element guard must lower: {error}"));
     }
 
     fn sqlite_callback_contract_fixture() -> (Program, ProgramSignature) {

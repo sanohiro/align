@@ -3784,7 +3784,7 @@ impl<'a> BodyValidator<'a> {
                     .and_then(|function| function.locals.get(base.root_local as usize))
                     .is_some()
                     && base.path.first() == Some(&hir::BorrowedPathSegment::RootSlot)
-                    && base.owner_fact.first().is_some()
+                    && !base.owner_fact.is_empty()
                     && base.owner_fact.windows(2).all(|pair| pair[0] < pair[1])
                     && base.owner_fact.iter().all(|fact| {
                         fact.path.first() == Some(&hir::BorrowedPathSegment::RootSlot)

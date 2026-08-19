@@ -387,6 +387,11 @@ pub enum Stmt {
     /// `index` of a fixed struct-array slot: free that field's buffer before it is overwritten by an
     /// element-field store (`us[i].name = new` / `us[i].addr.name = new`, Slice 4b). Null-safe.
     DropElemField(Slot, Operand, Vec<u32>),
+    /// Inert identity marker for the start of an indexed shared-borrow reservation. The token is
+    /// function-local and monotonic. Post-lowering MIR rewrites preserve this non-movable statement;
+    /// validation locates its final block/statement position instead of retaining stale container
+    /// coordinates in [`BorrowedElementGuard`]. Emits no backend instruction.
+    BorrowedElementReservation { token: u32, root: Slot },
     /// Free the buffer of a free-standing owned `array<T>` *value* (a `{ptr,len}` operand that
     /// is not backed by a slot — an unbound `.to_array()` temporary consumed in place). Used to
     /// free the materialized buffer right after the loop that consumes it (null-safe).
@@ -1611,17 +1616,17 @@ pub struct BorrowedElementPlace {
     pub base: BorrowedPlace,
     pub index: Operand,
     pub element_ty: Ty,
-    /// Successful edge of the exact bounds check that admitted this descriptor, plus the checked
-    /// array length. Backends must prove this block dominates the call action before forming a
-    /// pointer; the descriptor itself remains pointer-free.
+    /// Stable reservation identity plus the checked array length. Backends reconstruct the exact
+    /// successful bounds edge after MIR rewrites and prove it dominates the call action before
+    /// forming a pointer; the descriptor itself remains pointer-free.
     pub guard: BorrowedElementGuard,
 }
 
 #[derive(Clone, Debug)]
 pub struct BorrowedElementGuard {
-    pub reservation_block: BlockId,
-    pub reservation_statement: u32,
-    pub success: BlockId,
+    /// Function-local identity of the inert reservation marker emitted before index evaluation.
+    /// Block and statement coordinates are deliberately derived only after MIR rewrites finish.
+    pub reservation: u32,
     pub len: Operand,
 }
 
@@ -3198,6 +3203,9 @@ struct BuilderCtx {
     eager_expr_results: std::collections::HashMap<usize, Operand>,
     /// Whether an outer `lower_expr` invocation currently owns `eager_expr_results`.
     eager_expr_active: bool,
+    /// Monotonic identity for indexed shared-borrow reservation markers. Kept behind the existing
+    /// context box so the recursively passed [`Builder`] retains its established stack footprint.
+    next_borrow_reservation: u32,
 }
 
 /// Located-lowering state carried through one function's [`BuilderCtx`].
@@ -3318,6 +3326,12 @@ impl Builder {
         let s = self.alias_scope;
         self.alias_scope += 1;
         s
+    }
+
+    fn fresh_borrow_reservation(&mut self) -> u32 {
+        let token = self.ctx.next_borrow_reservation;
+        self.ctx.next_borrow_reservation += 1;
+        token
     }
 
     fn new_slot(&mut self, ty: Ty) -> Slot {
@@ -3577,6 +3591,7 @@ fn lower_fn(
             return_cleanup: f.return_cleanup,
             eager_expr_results: std::collections::HashMap::new(),
             eager_expr_active: false,
+            next_borrow_reservation: 0,
         }),
     };
     let entry = b.new_block();
@@ -8066,15 +8081,11 @@ fn lower_borrowed_place(
 ) -> Operand {
     if let hir::ExprKind::BorrowedIndex { base, index } = &e.kind {
         debug_assert_eq!(mode, align_ast::ParamMode::Borrow);
-        let reservation_block = b.cur;
-        let Some(reservation_statement) = usize::try_from(b.cur)
-            .ok()
-            .and_then(|block| b.blocks.get(block))
-            .and_then(|block| u32::try_from(block.stmts.len()).ok())
-        else {
-            b.terminate(Term::Unreachable);
-            return Operand::Const(Const::Unit);
-        };
+        let reservation = b.fresh_borrow_reservation();
+        b.push(Stmt::BorrowedElementReservation {
+            token: reservation,
+            root: base.root_local,
+        });
         let index = lower_expr(b, index);
         if !lowering_continues(b) {
             return Operand::Const(Const::Unit);
@@ -8095,15 +8106,13 @@ fn lower_borrowed_place(
             Rvalue::SliceLen(Operand::BorrowedPlace(Box::new(base_place.clone()))),
         ));
         let checked_len = Operand::Value(len);
-        let success = emit_bounds_check(b, &index, checked_len.clone());
+        emit_bounds_check(b, &index, checked_len.clone());
         return Operand::BorrowedElementPlace(Box::new(BorrowedElementPlace {
             base: base_place,
             index,
             element_ty: base.element_ty,
             guard: BorrowedElementGuard {
-                reservation_block,
-                reservation_statement,
-                success,
+                reservation,
                 len: checked_len,
             },
         }));
@@ -16847,6 +16856,7 @@ fn main() -> i32 {
                 return_cleanup: hir::ReturnCleanupAbi::None,
                 eager_expr_results: std::collections::HashMap::new(),
                 eager_expr_active: false,
+                next_borrow_reservation: 0,
             }),
         };
         let entry = builder.new_block();
