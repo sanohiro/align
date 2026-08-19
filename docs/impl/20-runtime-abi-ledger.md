@@ -90,6 +90,30 @@ direct and optional strings use A73's existing JSON-string writer, and
 current descriptor domain. `BuilderWriteUint` and kinds `8`/`9` are shipped;
 the exact counts and A66 row above are current.
 
+## Request 14 exclusive filesystem publication (design accepted; implementation pending)
+
+Request 14 adds two planned keyed records and no new ABI shape. Until the
+implementation lands, the current registry remains 294 keyed / 307 base / 315
+maximum optional-probe records. The implementation must add these rows
+atomically with the HIR/MIR/runtime support:
+
+| Planned runtime key | Exact symbol | Existing ABI row and exact declaration |
+|---|---|---|
+| `IoWriterCreateExclusive` | `align_rt_io_writer_create_exclusive` | A08: `i32 @SYM(ptr, i64, ptr)` |
+| `FsRenameNoReplace` | `align_rt_fs_rename_no_replace` | A09: `i32 @SYM(ptr, i64, ptr, i64)` |
+
+The constructor row keeps the existing `writer` output-slot convention: the
+runtime checks a null `out_writer` first, clears it before later validation, and
+never publishes a writer on a recoverable failure. Both path operands are
+borrowed views; the native runtime constructs ephemeral NUL-terminated copies,
+constructing rename's source before its destination. The native implementation
+must use Linux `renameat2(..., RENAME_NOREPLACE)` or macOS
+`renameatx_np(..., RENAME_EXCL)` and must not fall back to ordinary replacing
+rename, existence checks, `link` plus remove, or a subprocess. The full path,
+allocation, platform, pair-cleanup, and owner matrix is in
+`docs/impl/27-fs-exclusive-publication-plan.md` and
+`docs/impl/std-design/fs.md`.
+
 ## Request 13 recursive owned JSON replacement (design accepted)
 
 Request 13 adds no runtime key, symbol, LLVM function shape, C signature, or

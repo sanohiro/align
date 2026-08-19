@@ -180,6 +180,19 @@ work runs the corresponding real-resource target in an unrestricted
 environment. A test should be added to an existing owner target when possible;
 do not create another cross-cutting integration matrix for a unit-level rule.
 
+Request 14's exclusive filesystem publication implementation keeps its owner
+evidence in the existing filesystem boundary. `crates/align_driver/tests/m9_fs.rs`
+owns source formation, imports, execution, writer ownership, control flow, and
+readback. `align_runtime` owners cover malformed ABI views, exclusive-open and
+no-replace native flags, errno mapping, partial writes, Drop, fd cleanup, and
+accepted-platform controls. The runtime ABI declaration golden owns the exact
+planned symbols and shapes. The sibling `c6f2-request14-adoption` target owns
+the two-final absence rechecks, result-then-evidence race, interruption,
+cleanup-status precedence, controlled ext4/tmpfs or APFS environment, and
+forbidden-workaround checks. No benchmark is required. A Rust implementation
+still uses `align-self-review`, the focused owner target, the bounded gate, and
+Clippy before the normal review/preflight/PR flow.
+
 ### Service-dependent required suites run locally first
 
 The required `PostgreSQL integration` CI job gates its suites on

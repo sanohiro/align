@@ -14,6 +14,36 @@ The implementation order in this document is mandatory. A database driver must n
 closed `Ty`/HIR/MIR family that recognizes `pkg.db` names, and it must not expose `raw` handles or
 manual close functions through its safe public API.
 
+## Request 14 native filesystem boundary (design accepted; implementation pending)
+
+The accepted `std.fs` publication extension is a consumer of the same general
+native-boundary discipline recorded here, not a new package-private escape:
+
+```text
+fs.create_exclusive(path: str) -> Result<writer, Error>
+fs.rename_no_replace(source: str, destination: str) -> Result<(), Error>
+```
+
+The implementation must form two distinct semantic/HIR/MIR operations and
+thread them through checked-HIR validation, replay, generic rechecking, LLVM,
+the typed runtime-key registry, and the native runtime. Path operands remain
+borrowed `str` views; the existing nominal `writer` Move type and Drop path are
+the only returned resource. The runtime boundary validates checkable length,
+null, UTF-8, empty, and NUL conditions before side effects, constructs
+ephemeral NUL-terminated path copies, and uses terminal OOM for actual
+allocation failure. The create ABI clears its output slot before path
+processing; rename marshals source before destination.
+
+The native capability is deliberately direct: exclusive create and native
+no-replace rename only. No ordinary replacing rename, existence-check race,
+`link` plus remove, subprocess, filesystem-class query, path sandbox, or hidden
+cleanup lock is permitted. The accepted Linux/macOS primitives, A08/A09 ABI
+rows, whole/per-unit identity, and C6f2 consumer-owned trusted-path and
+single-writer precondition are authoritative in
+`docs/impl/27-fs-exclusive-publication-plan.md` and
+`docs/impl/std-design/fs.md`. This section records the boundary before its
+implementation activates any new `RuntimeKey` or validator variant.
+
 ## 1. Decisions
 
 Seven prerequisites are accepted:

@@ -25,6 +25,33 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 
 `read_file` / `write_file` / `exists` / `remove` / `read_dir` are the whole-file tier — one call, no handle to manage. `write_file` accepts a `str`, a `builder`, or a `buffer`'s bytes. `read_dir` returns `array<string>` of names. Text reads validate UTF-8 (`Error.Invalid` on binary garbage); binary data goes through the streaming tier below.
 
+## Exclusive publication
+
+`std.fs` also exposes the two primitives needed to publish an artifact without
+silently replacing a competing entry:
+
+```text
+fs.create_exclusive(path: str) -> Result<writer, Error>
+fs.rename_no_replace(source: str, destination: str) -> Result<(), Error>
+```
+
+`create_exclusive` performs one native exclusive create. An existing final
+entry—including a file, directory, symlink, FIFO, or device—returns
+`Error.Code(native EEXIST)` and is never opened, truncated, replaced, or
+removed. The returned `writer` is the normal owned Move handle: `Drop` closes
+it but does not delete the file, so a failed write or flush may leave a partial
+file for explicit cleanup.
+
+`rename_no_replace` performs one native no-replace rename on one filesystem.
+The destination is never followed, removed, or replaced; the source is moved
+as a directory entry, and native errors use the standard errno mapping. There
+is no cross-device copy fallback, crash-durability promise, pair transaction,
+or hidden cleanup. Paths are borrowed only for the call, must be non-empty
+valid UTF-8 without NUL bytes, and are passed as written. A checked path
+capacity overflow is `Error.Invalid`; actual allocation failure is terminal
+OOM. A two-file publisher must close both writers, recheck both final paths,
+rename result then evidence, and explicitly remove only paths it owns.
+
 ## Zero-copy reads: `read_file_view`
 
 ```align

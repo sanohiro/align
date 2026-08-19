@@ -2808,12 +2808,47 @@ fs.read_bytes_view(path: str) -> Result<bytes, Error>
 fs.write_file(path: str, data: str | bytes | builder) -> Result<(), Error>
 fs.open(path: str)   -> Result<reader, Error>
 fs.create(path: str) -> Result<writer, Error>
+fs.create_exclusive(path: str) -> Result<writer, Error>
+fs.rename_no_replace(source: str, destination: str) -> Result<(), Error>
 fs.create_rw(path: str) -> Result<file, Error>   // O_RDWR|O_CREAT|O_TRUNC — a fresh random-access file
 fs.open_rw(path: str)   -> Result<file, Error>   // O_RDWR, must exist — in-place update (see std.io `file`)
 fs.exists(path: str) -> bool
 fs.remove(path: str) -> Result<(), Error>
 fs.read_dir(path: str) -> Result<array<string>, Error>   // v1: owned strings
 ```
+
+`fs.create_exclusive` creates one new regular file entry with the native
+exclusive-create operation (`O_CREAT|O_EXCL`, plus close-on-exec and final
+component no-following on the accepted Unix targets). An occupied final entry
+—including a regular file, directory, symlink, FIFO, or device—returns
+`Error.Code(native EEXIST)` and is never opened, truncated, replaced, or
+removed. The returned value is the existing owned `writer`; its `Drop` closes
+the descriptor and does not remove the file. A failed write or flush may leave
+a partial file for the caller to remove explicitly. The path is borrowed only
+for the call: it must be non-empty, valid UTF-8, and contain no NUL, and the
+runtime uses an ephemeral bounded NUL-terminated copy without lexical
+normalization or hidden parent checks.
+
+`fs.rename_no_replace` performs one native no-replace directory-entry rename
+(`renameat2(..., RENAME_NOREPLACE)` on Linux or
+`renameatx_np(..., RENAME_EXCL)` on macOS). It succeeds only when the
+destination entry is absent; an occupied destination returns
+`Error.Code(native EEXIST)` and is not followed, removed, or replaced. The
+source is moved as an entry, so a source symlink or special file is not opened
+or inspected first. Missing source, cross-device, unsupported-volume, parent,
+permission, and other failures use the fixed errno table above. The operation
+does not emulate across filesystems, promise crash durability, or roll back a
+previous operation. Both borrowed paths are validated and marshalled in
+source-before-destination order before the native call; a checked `len + 1`
+capacity overflow is `Error.Invalid`, while actual allocation failure follows
+the language's terminal OOM policy.
+
+These operations are independent primitives, not a pair transaction. A
+consumer that publishes two artifacts must close both writers, recheck both
+final paths, rename result then evidence, and explicitly clean only its own
+temporary or already-published paths. The consumer owns any single-writer and
+trusted-path precondition; `std.fs` does not classify filesystems or provide a
+hidden cleanup lock.
 
 Any read that yields a `str`/`string` (`read_file`, `read_file_view`, and a decoded `str` from `json.decode`) validates the bytes as UTF-8 — `str` is always valid UTF-8 (§7, §12), so non-UTF-8 content fails with `Error.Invalid`; read binary zero-copy with `read_bytes_view` (a `bytes` mmap view, no validation) or into an owned buffer with `reader.read(buffer)` — `bytes`/`buffer` carry no UTF-8 invariant. `read_bytes_view` shares `read_file_view`'s v1 limitations: special / zero-length files fall back to an owned arena copy (not zero-copy), and concurrent truncation of a mapped file can raise `SIGBUS` (no handler is installed — a process-global signal handler is the hidden side effect Align forbids). For the same reason `read_dir` **excludes** any directory entry whose name is not valid UTF-8 (it cannot be a `string`, and is unreachable through a `str` path regardless).
 

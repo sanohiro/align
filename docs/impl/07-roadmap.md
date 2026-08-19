@@ -1518,6 +1518,10 @@ rationale for the I/O fast-path and mmap items already lives in `docs/open-quest
   owners with view retention and per-iteration cleanup. The bound-receiver rule remains separate.
 - **Streaming × pipeline integration** — a `reader`/`writer` as a `map`/`where`/`reduce` pipeline
   source/sink is not wired up.
+- **Exclusive filesystem publication** — Request 14's `fs.create_exclusive` and
+  `fs.rename_no_replace` design is accepted in `docs/impl/std-design/fs.md` and
+  `docs/impl/27-fs-exclusive-publication-plan.md`; implementation and the C6f2 adoption gate
+  remain pending. This is a post-M9 consumer capability and does not reopen M9's completion.
 - **M10+ modules** (unstarted, out of this milestone's scope): `std.net`, `std.http`, `std.cli`,
   `std.process`, `std.encoding`, `std.compress`, `std.rand`, `std.crypto`.
 
