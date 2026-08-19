@@ -19257,7 +19257,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         }
     }
 
-    fn mir_operand_moves_root_inner(
+    fn mir_operand_derives_root_inner(
         &self,
         operand: &Operand,
         root: Slot,
@@ -19265,21 +19265,24 @@ impl<'c, 'a> FnGen<'c, 'a> {
     ) -> bool {
         match operand {
             Operand::Arg(index) => self.f.params.get(*index as usize) == Some(&root),
-            Operand::Value(value) if visited.insert(*value) => self.f.blocks.iter().any(|block| {
-                block.stmts.iter().any(|statement| match statement {
-                    Stmt::Let(candidate, Rvalue::Load(slot)) if candidate == value => *slot == root,
-                    Stmt::Let(candidate, Rvalue::Use(source)) if candidate == value => {
-                        self.mir_operand_moves_root_inner(source, root, visited)
+            Operand::Value(value) if visited.insert(*value) => {
+                let Some((_, _, rvalue)) = self.unique_mir_value_def(*value) else {
+                    return false;
+                };
+                match rvalue {
+                    Rvalue::Load(slot) => *slot == root,
+                    Rvalue::Use(source) => {
+                        self.mir_operand_derives_root_inner(source, root, visited)
                     }
                     _ => false,
-                })
-            }),
+                }
+            }
             _ => false,
         }
     }
 
-    fn mir_operand_moves_root(&self, operand: &Operand, root: Slot) -> bool {
-        self.mir_operand_moves_root_inner(operand, root, &mut HashSet::new())
+    fn mir_operand_derives_root(&self, operand: &Operand, root: Slot) -> bool {
+        self.mir_operand_derives_root_inner(operand, root, &mut HashSet::new())
     }
 
     fn mir_call_invalidates_root(
@@ -19294,7 +19297,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 Some(align_ast::ParamMode::BorrowMut)
                     if Self::mir_operand_is_place_root(argument, root)
             ) || matches!(modes.get(index), Some(align_ast::ParamMode::ByValue))
-                && self.mir_operand_moves_root(argument, root)
+                && self.mir_operand_derives_root(argument, root)
         })
     }
 
@@ -19350,6 +19353,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
             | Stmt::DropElem(slot, ..)
             | Stmt::DropElemField(slot, ..) => *slot == root,
             Stmt::StoreElemFieldPtr { base, .. } => Self::mir_operand_is_place_root(base, root),
+            Stmt::ArenaEnd(operand)
+            | Stmt::RawFree(operand)
+            | Stmt::ColumnBatchFinish {
+                payload: operand, ..
+            }
+            | Stmt::ColumnBatchDrop {
+                payload: operand, ..
+            }
+            | Stmt::TgEnd(operand)
+            | Stmt::DropValue(operand) => self.mir_operand_derives_root(operand, root),
             _ => false,
         }
     }
@@ -20314,6 +20327,56 @@ mod tests {
         assert_lowering(
             emit_llvm_ir(&stale_root, &BuildTarget::Baseline, false, &[], None)
                 .expect_err("a descriptor whose root generation changed must fail"),
+            "borrowed element array root changes between its bounds guard and call action",
+        );
+
+        let mut dropped_value = mir(source);
+        let function = dropped_value
+            .fns
+            .iter_mut()
+            .find(|function| function.name.as_str().ends_with("use"))
+            .unwrap_or_else(|| panic!("value-drop fixture function"));
+        let (block_index, call_position, root) = function
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(block_index, block)| {
+                block
+                    .stmts
+                    .iter()
+                    .enumerate()
+                    .find_map(|(statement, value)| match value {
+                        Stmt::Let(_, Rvalue::Call(_, arguments)) => arguments
+                            .iter()
+                            .find_map(|argument| match argument {
+                                Operand::BorrowedElementPlace(place) => Some((
+                                    block_index,
+                                    statement,
+                                    place.base.slot,
+                                )),
+                                _ => None,
+                            }),
+                        _ => None,
+                    })
+            })
+            .unwrap_or_else(|| panic!("value-drop fixture call"));
+        let root_ty = function.slots[root as usize];
+        let loaded = function.value_tys.len() as ValueId;
+        function.value_tys.push(root_ty);
+        let alias = function.value_tys.len() as ValueId;
+        function.value_tys.push(root_ty);
+        function.blocks[block_index]
+            .stmts
+            .insert(call_position, Stmt::Let(loaded, Rvalue::Load(root)));
+        function.blocks[block_index]
+            .stmts
+            .insert(call_position + 1, Stmt::Let(alias, Rvalue::Use(Operand::Value(loaded))));
+        function.blocks[block_index]
+            .stmts
+            .insert(call_position + 2, Stmt::DropValue(Operand::Value(alias)));
+        assert_lowering(
+            emit_llvm_ir(&dropped_value, &BuildTarget::Baseline, false, &[], None)
+                .expect_err("dropping a root-derived value during a reservation must fail"),
             "borrowed element array root changes between its bounds guard and call action",
         );
 

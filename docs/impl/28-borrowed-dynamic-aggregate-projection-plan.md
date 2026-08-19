@@ -372,6 +372,22 @@ multi-call owners exercise repeated descriptors through the one function-scoped 
 the missed action boundary, target-kind exhaustiveness, and validation-cost axes without adding a
 performance promise or benchmark.
 
+### Closure matrix reopened: root-derived ownership termination
+
+The subsequent full review found that slot-targeted invalidation and by-value call consumption did
+not cover `DropValue` applied to an SSA value loaded from the reserved array root. It also found
+that the `Arg`/`Load`/`Use` provenance walk still found each definition by rescanning all blocks,
+undermining the function-scoped validation index.
+
+One indexed provenance query now follows `Arg`, `Load`, and `Use` through unique definitions from
+the function index. It is shared by by-value call invalidation and every statement-level ownership
+terminator whose operand can name derived storage: `DropValue`, arena/raw/task-group termination,
+and generated column-batch finish/drop. A cycle, duplicate definition, absent definition, or other
+rvalue fails to prove derivation; the surrounding callable/type preflight remains responsible for
+rejecting malformed operand kinds. The dedicated malformed-MIR owner loads the reserved array root,
+drops that SSA value before the call, and requires rejection before pointer formation. Existing
+by-value direct-call and `Use`-chain owners exercise the same indexed provenance authority.
+
 ## 6. PR boundaries and gates
 
 The design lands first. Its independent adversarial review must resolve the public grammar,
@@ -446,3 +462,5 @@ The author-side ledger-to-prose pass is complete:
 | P2 action-boundary review: root-preservation scanning followed a loop back-edge beyond the current call action | Bound forward reachability at the current action before intersecting paths that can reach it. Add a valid loop owner whose same-root mutation is reachable only after the action and on the next iteration. |
 | P1 raw-call review: forged MIR could pass a borrowed-element descriptor through `RawCall`, outside the admitted target set | Reject every borrowed-element operand in raw-call callable preflight regardless of forged signature mode, and retain defensive raw-call invalidation classification. Add a typed forged-raw-call owner that fails before pointer construction. |
 | P2 validation-cost review: each descriptor repeatedly scanned all definitions and recomputed CFG dominance | Build one marker-gated validation index per function with adjacency, reachability, dominators, SSA definitions, and reservations. Descriptor checks use indexed lookups and one action-bounded path traversal; existing repeated-call owners cover reuse. |
+| P1 ownership-termination review: `DropValue` could free a root-derived array SSA value during a live reservation | Route every operand-based ownership terminator through the same root-derivation query used by by-value calls. Add a malformed-MIR owner that loads and drops the reserved root before the action and must fail before pointer construction. |
+| P2 provenance-cost review: `Arg`/`Load`/`Use` tracing rescanned every block for each value | Resolve every value through the function-scoped unique-definition index and retain cycle detection. The by-value and value-drop owners share this indexed authority. |
