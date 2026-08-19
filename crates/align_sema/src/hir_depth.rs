@@ -482,6 +482,10 @@ fn walk_body_records<'a>(
                     data: rhs,
                     ..
                 }
+                | ExprKind::RenameNoReplace {
+                    source: lhs,
+                    destination: rhs,
+                }
                 | ExprKind::TcpConnect {
                     host: lhs,
                     port: rhs,
@@ -735,6 +739,7 @@ fn walk_body_records<'a>(
                 | ExprKind::FsReadFile { path: recv }
                 | ExprKind::ReaderOpen { path: recv }
                 | ExprKind::WriterCreate { path: recv }
+                | ExprKind::CreateExclusive { path: recv }
                 | ExprKind::ReaderBuffered { reader: recv }
                 | ExprKind::BytesAsStr { bytes: recv }
                 | ExprKind::WriterFlush { writer: recv }

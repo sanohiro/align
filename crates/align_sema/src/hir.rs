@@ -1059,6 +1059,10 @@ pub enum ExprKind {
     /// `Result<writer, Error>`. The returned `writer` owns its fd (flushed + closed on `Drop`).
     /// Impure.
     WriterCreate { path: Box<Expr> },
+    /// `fs.create_exclusive(path)` — atomically create a new regular file without replacing an
+    /// existing final entry; the `ty` is `Result<writer, Error>`. The returned `writer` owns its
+    /// fd (flushed + closed on `Drop`). Impure.
+    CreateExclusive { path: Box<Expr> },
     /// `r.read(b: mut buffer)` — read up to `b`'s capacity into `b` (overwriting its length),
     /// borrowing both `reader` and `buffer` (neither consumed). The `ty` is `Result<i64, Error>`
     /// (bytes read; `0` = EOF). Impure.
@@ -1177,6 +1181,10 @@ pub enum ExprKind {
     FsExists { path: Box<Expr> },
     /// `fs.remove(path)` — delete the file at `path`. The `ty` is `Result<(), Error>`. Impure.
     FsRemove { path: Box<Expr> },
+    /// `fs.rename_no_replace(source, destination)` — atomically move one directory entry to an
+    /// absent destination; the `ty` is `Result<(), Error>`. Both paths are borrowed for the call.
+    /// Impure.
+    RenameNoReplace { source: Box<Expr>, destination: Box<Expr> },
     /// `fs.read_dir(path)` — the entry names of directory `path` as a freshly heap-allocated owned
     /// `array<string>` (each element owns its buffer; a **deep** `Drop`). The `ty` is
     /// `Result<array<string>, Error>`. Owned/returnable (borrows nothing). Impure.

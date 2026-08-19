@@ -12579,10 +12579,16 @@ impl EffectScan<'_> {
             }
             ExprKind::ArrayBuilderBuild(builder) => walk!(builder),
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
+            | ExprKind::CreateExclusive { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
             | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } => {
                 walk!(path);
+                self.impure_direct = true;
+            }
+            ExprKind::RenameNoReplace { source, destination } => {
+                walk!(source);
+                walk!(destination);
                 self.impure_direct = true;
             }
             // `dns.resolve(host)` is impure (a name-resolution syscall) — excluded from `par_map`.
@@ -16359,6 +16365,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ReaderOpen { .. }
             | ExprKind::WriterStd { .. }
             | ExprKind::WriterCreate { .. }
+            | ExprKind::CreateExclusive { .. }
             | ExprKind::ReaderRead { .. }
             | ExprKind::ReaderReadLine { .. }
             | ExprKind::WriterWrite { .. }
@@ -16380,6 +16387,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::FsExists { .. }
             | ExprKind::FsRemove { .. }
             | ExprKind::FsReadDir { .. }
+            | ExprKind::RenameNoReplace { .. }
             | ExprKind::DnsResolve { .. }
             | ExprKind::TcpConnect { .. }
             | ExprKind::TcpListen { .. }
@@ -16745,6 +16753,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ReaderOpen { .. }
             | ExprKind::WriterStd { .. }
             | ExprKind::WriterCreate { .. }
+            | ExprKind::CreateExclusive { .. }
             | ExprKind::ReaderRead { .. }
             | ExprKind::ReaderBuffered { .. }
             | ExprKind::ReaderReadLine { .. }
@@ -16770,6 +16779,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::FsExists { .. }
             | ExprKind::FsRemove { .. }
             | ExprKind::FsReadDir { .. }
+            | ExprKind::RenameNoReplace { .. }
             | ExprKind::DnsResolve { .. }
             | ExprKind::TcpConnect { .. }
             | ExprKind::ConnReader { .. }
@@ -18340,9 +18350,14 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(index, depth);
             }
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
+            | ExprKind::CreateExclusive { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
             | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } => self.walk(path, depth),
+            ExprKind::RenameNoReplace { source, destination } => {
+                self.walk(source, depth);
+                self.walk(destination, depth);
+            }
             ExprKind::DnsResolve { host } => self.walk(host, depth),
             ExprKind::TcpConnect { host, port } => {
                 self.walk(host, depth);
@@ -21688,7 +21703,8 @@ impl<'a> MoveCheck<'a> {
             //   the escape check enforces via `region_of`; `OptionNone` carries no payload.
             ExprKind::Str(..) | ExprKind::FnValue(..) | ExprKind::OptionNone
             | ExprKind::ConstArray { .. } | ExprKind::ReaderStdin | ExprKind::ReaderOpen { .. }
-            | ExprKind::WriterStd { .. } | ExprKind::WriterCreate { .. } | ExprKind::FsReadFileView { .. }
+            | ExprKind::WriterStd { .. } | ExprKind::WriterCreate { .. } | ExprKind::CreateExclusive { .. }
+            | ExprKind::FsReadFileView { .. }
             | ExprKind::FsReadBytesView { .. } => BorrowRoots::new(),
             // (2) Results whose type never borrows (scalars, `Unit`, freshly owned `string` /
             //   `buffer` / `array<string>` / Move handles), so the `ty_may_borrow` gate at the top of
@@ -21730,6 +21746,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ArrayBuilderNew { region: None, .. } | ExprKind::ArrayBuilderPush { .. }
             | ExprKind::ArrayBuilderAppend { .. } | ExprKind::FsWriteFile { .. }
             | ExprKind::FsExists { .. } | ExprKind::FsRemove { .. } | ExprKind::FsReadDir { .. }
+            | ExprKind::RenameNoReplace { .. }
             | ExprKind::DnsResolve { .. } | ExprKind::TcpConnect { .. } | ExprKind::TcpListen { .. }
             | ExprKind::TcpAccept { .. } | ExprKind::UdpBind { .. } | ExprKind::UdpSendTo { .. }
             | ExprKind::UdpRecvFrom { .. } | ExprKind::PathJoin { .. } | ExprKind::PathNormalize { .. }
@@ -26209,9 +26226,14 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, index, moved, false, false);
             }
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
+            | ExprKind::CreateExclusive { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
             | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } => move_expr!(self, path, moved, false, false),
+            ExprKind::RenameNoReplace { source, destination } => {
+                move_expr!(self, source, moved, false, false);
+                move_expr!(self, destination, moved, false, false);
+            }
             // `dns.resolve(host)` borrows its `str` host (never consumed).
             ExprKind::DnsResolve { host } => move_expr!(self, host, moved, false, false),
             // `tcp.connect(host, port)` borrows `host` (str, never consumed); `port` is a Copy i64.
@@ -31669,6 +31691,11 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.fs", &format!("fs.{method}"), span);
                 return self.check_fs_open_create(method == "create", args, span);
             }
+            // `fs.create_exclusive(path)` -> Result<writer, Error>; the final entry must be absent.
+            if module == "fs" && method == "create_exclusive" {
+                self.require_import("std.fs", "fs.create_exclusive", span);
+                return self.check_fs_create_exclusive(args, span);
+            }
             // `fs.create_rw(path)` (O_RDWR|O_CREAT|O_TRUNC) / `fs.open_rw(path)` (O_RDWR, must exist)
             // -> Result<file, Error> — the offset-addressed block I/O handle (A4).
             if module == "fs" && (method == "create_rw" || method == "open_rw") {
@@ -31685,6 +31712,10 @@ impl<'a, 't> Checker<'a, 't> {
             if module == "fs" && matches!(method, "exists" | "remove" | "read_dir" | "read_file_view" | "read_bytes_view") {
                 self.require_import("std.fs", &format!("fs.{method}"), span);
                 return self.check_fs_path_op(method, args, span);
+            }
+            if module == "fs" && method == "rename_no_replace" {
+                self.require_import("std.fs", "fs.rename_no_replace", span);
+                return self.check_fs_rename_no_replace(args, span);
             }
             // `std.net` — `dns.resolve(host)` -> Result<array<string>, Error> (owned IP strings).
             if module == "dns" && method == "resolve" {
@@ -39746,6 +39777,46 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// `fs.create_exclusive(path)` -> `Result<writer, Error>`. The runtime performs one native
+    /// exclusive create and never truncates, replaces, or removes an existing final entry.
+    fn check_fs_create_exclusive(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        if args.len() != 1 {
+            self.diags.error(
+                format!("'fs.create_exclusive' expects 1 argument (the path), got {}", args.len()),
+                span,
+            );
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        }
+        let path = self.check_str_init(&args[0]);
+        Expr {
+            kind: ExprKind::CreateExclusive { path: Box::new(path) },
+            ty: Ty::Result(Scalar::Writer, Scalar::Enum(self.error_enum_id)),
+            span,
+        }
+    }
+
+    /// `fs.rename_no_replace(source, destination)` -> `Result<(), Error>`. Both paths are
+    /// borrowed for the single native no-replace directory-entry operation.
+    fn check_fs_rename_no_replace(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+        if args.len() != 2 {
+            self.diags.error(
+                format!(
+                    "'fs.rename_no_replace' expects 2 arguments (the source and destination), got {}",
+                    args.len()
+                ),
+                span,
+            );
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        }
+        let source = self.check_str_init(&args[0]);
+        let destination = self.check_str_init(&args[1]);
+        Expr {
+            kind: ExprKind::RenameNoReplace { source: Box::new(source), destination: Box::new(destination) },
+            ty: Ty::Result(Scalar::Unit, Scalar::Enum(self.error_enum_id)),
+            span,
+        }
+    }
+
     /// `fs.create_rw(path)` (`O_RDWR|O_CREAT|O_TRUNC`) / `fs.open_rw(path)` (`O_RDWR`, must exist) ->
     /// `Result<file, Error>` (A4). The offset-addressed block read+write handle; the `file` owns its
     /// fd (closed on `Drop`). Mirrors [`Self::check_fs_open_create`]; the path is a `str` (owned
@@ -44492,9 +44563,14 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(index);
             }
             ExprKind::FsReadFile { path } | ExprKind::ReaderOpen { path } | ExprKind::WriterCreate { path }
+            | ExprKind::CreateExclusive { path }
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
             | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } => self.finalize_expr(path),
+            ExprKind::RenameNoReplace { source, destination } => {
+                self.finalize_expr(source);
+                self.finalize_expr(destination);
+            }
             ExprKind::DnsResolve { host } => self.finalize_expr(host),
             ExprKind::TcpConnect { host, port } => {
                 self.finalize_expr(host);

@@ -13908,6 +13908,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // fs.open / fs.create — write the handle into `out`, return an i32 errno-status.
             Rvalue::ReaderOpen { path, out } => self.gen_open_handle(RuntimeKey::IoReaderOpen, path, *out)?,
             Rvalue::WriterCreate { path, out } => self.gen_open_handle(RuntimeKey::IoWriterCreate, path, *out)?,
+            Rvalue::WriterCreateExclusive { path, out } => {
+                self.gen_open_handle(RuntimeKey::IoWriterCreateExclusive, path, *out)?
+            }
             // All A4 `file` rvalues (create_rw/open_rw + pread/pwrite/len) go through ONE
             // `#[inline(never)]` helper, so `gen_rvalue` gains a single tiny arm rather than five inline
             // bodies — `gen_rvalue` is depth-recursive (via operand materialization), so keeping its
@@ -14109,6 +14112,21 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.runtime(RuntimeKey::FsRemove), &[p_ptr.into(), p_len.into()], "frm")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("fs_remove returns i32")
+            }
+            Rvalue::RenameNoReplace { source, destination } => {
+                let (s_ptr, s_len) = self.split_str(source)?;
+                let (d_ptr, d_len) = self.split_str(destination)?;
+                let call = self
+                    .builder
+                    .build_call(
+                        self.runtime(RuntimeKey::FsRenameNoReplace),
+                        &[s_ptr.into(), s_len.into(), d_ptr.into(), d_len.into()],
+                        "frnr",
+                    )
+                    .map_err(|e| self.err(e))?;
+                call.try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| self.err("fs_rename_no_replace returns void"))?
             }
             // fs.read_dir — write the owned array<string> `{ptr,len}` into `out`, return i32 status.
             Rvalue::FsReadDir { path, out } => {

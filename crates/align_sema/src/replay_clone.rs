@@ -871,6 +871,7 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         ExprKind::FsReadFile { path } => ExprKind::FsReadFile { path: boxed!(path) },
         ExprKind::ReaderOpen { path } => ExprKind::ReaderOpen { path: boxed!(path) },
         ExprKind::WriterCreate { path } => ExprKind::WriterCreate { path: boxed!(path) },
+        ExprKind::CreateExclusive { path } => ExprKind::CreateExclusive { path: boxed!(path) },
         ExprKind::ReaderRead { reader, buffer } => ExprKind::ReaderRead {
             reader: boxed!(reader),
             buffer: boxed!(buffer),
@@ -969,6 +970,10 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         },
         ExprKind::FsExists { path } => ExprKind::FsExists { path: boxed!(path) },
         ExprKind::FsRemove { path } => ExprKind::FsRemove { path: boxed!(path) },
+        ExprKind::RenameNoReplace { source, destination } => ExprKind::RenameNoReplace {
+            source: boxed!(source),
+            destination: boxed!(destination),
+        },
         ExprKind::FsReadDir { path } => ExprKind::FsReadDir { path: boxed!(path) },
         ExprKind::DnsResolve { host } => ExprKind::DnsResolve { host: boxed!(host) },
         ExprKind::TcpConnect { host, port } => ExprKind::TcpConnect {
@@ -1928,6 +1933,10 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             data: rhs,
             ..
         }
+        | ExprKind::RenameNoReplace {
+            source: lhs,
+            destination: rhs,
+        }
         | ExprKind::TcpConnect {
             host: lhs,
             port: rhs,
@@ -2204,6 +2213,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::FsReadFile { path: recv }
         | ExprKind::ReaderOpen { path: recv }
         | ExprKind::WriterCreate { path: recv }
+        | ExprKind::CreateExclusive { path: recv }
         | ExprKind::ReaderBuffered { reader: recv }
         | ExprKind::BytesAsStr { bytes: recv }
         | ExprKind::WriterFlush { writer: recv }

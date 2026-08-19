@@ -443,6 +443,37 @@ pub unsafe extern "C" fn align_rt_fs_remove(path: *const u8, path_len: i64) -> i
     }
 }
 
+/// `fs.rename_no_replace(source, destination)` — perform one platform no-replace directory-entry
+/// rename. The complete source path is validated and copied before the destination is inspected or
+/// copied; no native operation runs until both ephemeral paths exist. There is deliberately no
+/// ordinary-rename, existence-check, or link+remove fallback.
+///
+/// # Safety
+/// Both path views must describe readable immutable byte ranges when valid. Foreign callers that
+/// violate those pointer-range preconditions are outside this ABI contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_fs_rename_no_replace(
+    source: *const u8,
+    source_len: i64,
+    destination: *const u8,
+    destination_len: i64,
+) -> i32 {
+    let source = match unsafe { abi_exclusive_path(source, source_len) } {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+    let destination = match unsafe { abi_exclusive_path(destination, destination_len) } {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+    unsafe {
+        native_rename_no_replace(
+            source.as_ptr() as *const u8,
+            destination.as_ptr() as *const u8,
+        )
+    }
+}
+
 /// RAII staging for an `array<string>` whose payloads are already in their final allocations.
 /// Until publication, `Drop` owns every payload; publication transfers them to the header array.
 #[derive(Default)]
@@ -8325,6 +8356,31 @@ unsafe fn abi_c_string(ptr: *const u8, len: i64) -> Option<std::ffi::CString> {
     std::ffi::CString::new(view.as_bytes()).ok()
 }
 
+/// Validate a filesystem path at the exclusive-publication ABI boundary and copy it into the
+/// ephemeral NUL-terminated representation required by the native path operations. Unlike the
+/// older `abi_c_string` helper, this contract rejects negative, empty, null-positive, non-UTF-8,
+/// and embedded-NUL views. The `len + 1` check is explicit so an impossible native-string capacity
+/// is recoverable `Error.Invalid` before allocation; the allocator itself remains Align's locked
+/// abort-on-OOM boundary.
+///
+/// # Safety
+/// A positive length and non-null pointer must describe a readable immutable byte range.
+unsafe fn abi_exclusive_path(ptr: *const u8, len: i64) -> Result<std::ffi::CString, i32> {
+    let n = safe_len(len).map_err(|_| AL_INVALID)?;
+    if n == 0 || ptr.is_null() {
+        return Err(AL_INVALID);
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, n) };
+    if std::str::from_utf8(bytes).is_err() || bytes.contains(&0) {
+        return Err(AL_INVALID);
+    }
+    n.checked_add(1).ok_or(AL_INVALID)?;
+    // The checks above prove that `CString::new` cannot reject the bytes. Keep the conversion
+    // fail-closed anyway; its allocation remains intentionally infallible under the locked OOM
+    // policy.
+    std::ffi::CString::new(bytes).map_err(|_| AL_INVALID)
+}
+
 // --- std.regex -------------------------------------------------------------------------------
 
 /// Maximum UTF-8 source length accepted by `regex.compile`. This independently caps parser work
@@ -9130,6 +9186,46 @@ pub unsafe extern "C" fn align_rt_io_writer_create(path: *const u8, path_len: i6
         }
         Err(e) => io_error_to_status(&e),
     }
+}
+
+/// `fs.create_exclusive(path)` — atomically create a new regular file without replacing an
+/// existing final directory entry. The native open uses create+exclusive+no-follow-final-component
+/// plus close-on-exec; no existence check, truncation, replacement, or cleanup fallback is used.
+/// The returned writer owns the descriptor and follows the ordinary buffered writer Drop path.
+///
+/// # Safety
+/// `path`/`path_len` must describe a readable immutable byte range when valid, and `out` must be a
+/// writable writer-pointer slot. A foreign caller violating those pointer-range preconditions is
+/// outside this ABI contract.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_writer_create_exclusive(
+    path: *const u8,
+    path_len: i64,
+    out: *mut *mut Writer,
+) -> i32 {
+    // Output-slot nullness has the documented precedence over every path check. A valid slot is
+    // cleared before any later recoverable failure, so an Err path can never expose a writer.
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *out = core::ptr::null_mut() };
+    let path = match unsafe { abi_exclusive_path(path, path_len) } {
+        Ok(path) => path,
+        Err(status) => return status,
+    };
+    let fd = unsafe { native_open_exclusive(path.as_ptr() as *const u8) };
+    if fd < 0 {
+        return io_error_to_status(&std::io::Error::last_os_error());
+    }
+    unsafe {
+        *out = Box::into_raw(Box::new(Writer {
+            fd,
+            owns_fd: true,
+            buffered: true,
+            buf: Vec::with_capacity(BUF_WRITER_CAP),
+        }));
+    }
+    0
 }
 
 /// `w.write(bytes)` — append `ptr`/`len` bytes to the writer. An unbuffered writer streams straight
@@ -13529,6 +13625,14 @@ unsafe extern "C" {
     fn pread(fd: i32, buf: *mut core::ffi::c_void, count: usize, offset: i64) -> isize;
     // POSIX `close(2)` — a file-backed `reader`/`writer` closes the fd it owns at `Drop`.
     fn close(fd: i32) -> i32;
+    // Exclusive filesystem publication primitives. Linux uses `open` with O_CREAT|O_EXCL and
+    // `renameat2(RENAME_NOREPLACE)`; macOS uses the same open flags and `renameatx_np(RENAME_EXCL)`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn open(path: *const u8, flags: i32, ...) -> i32;
+    #[cfg(target_os = "linux")]
+    fn renameat2(olddirfd: i32, oldpath: *const u8, newdirfd: i32, newpath: *const u8, flags: u32) -> i32;
+    #[cfg(target_os = "macos")]
+    fn renameatx_np(olddirfd: i32, oldpath: *const u8, newdirfd: i32, newpath: *const u8, flags: u32) -> i32;
     // POSIX `_exit(2)` — `process.abort()`: terminate immediately with `status`, skipping all
     // `atexit`/stdio-flush handling (unlike libc `exit`). Never returns.
     fn _exit(status: i32) -> !;
@@ -13658,8 +13762,82 @@ const F_SETFL: i32 = 4;
 const O_NONBLOCK: i32 = 0o4000;
 #[cfg(target_os = "linux")]
 const O_CLOEXEC: i32 = 0o2000000;
+#[cfg(target_os = "linux")]
+const O_WRONLY: i32 = 0o1;
+#[cfg(target_os = "linux")]
+const O_CREAT: i32 = 0o100;
+#[cfg(target_os = "linux")]
+const O_EXCL: i32 = 0o200;
+#[cfg(target_os = "linux")]
+const O_NOFOLLOW: i32 = 0o400000;
 #[cfg(not(target_os = "linux"))]
 const O_NONBLOCK: i32 = 0x0004;
+#[cfg(target_os = "macos")]
+const O_CLOEXEC: i32 = 0x01000000;
+#[cfg(target_os = "macos")]
+const O_WRONLY: i32 = 0x0001;
+#[cfg(target_os = "macos")]
+const O_CREAT: i32 = 0x0200;
+#[cfg(target_os = "macos")]
+const O_EXCL: i32 = 0x0800;
+#[cfg(target_os = "macos")]
+const O_NOFOLLOW: i32 = 0x0100;
+
+#[cfg(target_os = "linux")]
+const AT_FDCWD: i32 = -100;
+#[cfg(target_os = "macos")]
+const AT_FDCWD: i32 = -2;
+#[cfg(target_os = "linux")]
+const RENAME_NOREPLACE: u32 = 0x1;
+#[cfg(target_os = "macos")]
+const RENAME_EXCL: u32 = 0x4;
+
+/// One native exclusive file creation. Unsupported targets fail closed without emulating the
+/// operation through a weaker API; the accepted implementation floor is Linux/macOS.
+unsafe fn native_open_exclusive(path: *const u8) -> i32 {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        unsafe {
+            open(
+                path,
+                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                0o666,
+            )
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = path;
+        -1
+    }
+}
+
+/// One native no-replace directory-entry rename. No ordinary `rename` fallback is permitted.
+unsafe fn native_rename_no_replace(source: *const u8, destination: *const u8) -> i32 {
+    #[cfg(target_os = "linux")]
+    {
+        let rc = unsafe { renameat2(AT_FDCWD, source, AT_FDCWD, destination, RENAME_NOREPLACE) };
+        if rc == 0 {
+            0
+        } else {
+            io_error_to_status(&std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let rc = unsafe { renameatx_np(AT_FDCWD, source, AT_FDCWD, destination, RENAME_EXCL) };
+        if rc == 0 {
+            0
+        } else {
+            io_error_to_status(&std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (source, destination);
+        AL_INVALID
+    }
+}
 
 /// `SOCK_CLOEXEC` (Linux) — OR'd into a `socket`/`accept4` type so the new fd is close-on-exec, kept
 /// out of a spawned child (`std.process` P3). macOS has no such flag (uses `set_cloexec` instead).
@@ -21153,8 +21331,8 @@ mod tests {
                 None
             })
             .collect();
-        assert_eq!(runtime.len(), 307);
-        assert_eq!(registry.len(), 307);
+        assert_eq!(runtime.len(), 309);
+        assert_eq!(registry.len(), 309);
         assert_eq!(runtime, registry);
     }
 
@@ -27959,6 +28137,305 @@ mod tests {
         assert_eq!(unsafe { align_rt_fs_write_file(pp, pl, std::ptr::null(), 0) }, 0);
         assert_eq!(std::fs::read(&path).unwrap(), b"");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fs_exclusive_create_and_rename_no_replace_native_semantics() {
+        use std::io::ErrorKind;
+
+        let source = tmp_path("exclusive-source");
+        let destination = tmp_path("exclusive-destination");
+        let occupied = tmp_path("exclusive-occupied");
+        for path in [&source, &destination, &occupied] {
+            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_dir_all(path);
+        }
+
+        let source_s = source.display().to_string();
+        let (source_p, source_l) = view_of(&source_s);
+        let mut writer: *mut Writer = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { align_rt_io_writer_create_exclusive(source_p, source_l, &mut writer) },
+            0,
+            "a missing path is created exactly once",
+        );
+        assert!(!writer.is_null());
+        assert_eq!(unsafe { align_rt_io_writer_write(writer, b"staged".as_ptr(), 6) }, 0);
+        unsafe { align_rt_io_writer_free(writer) };
+        assert_eq!(std::fs::read(&source).unwrap(), b"staged");
+
+        // A second create reports the platform's native EEXIST encoding, leaves the existing
+        // bytes intact, and clears the output slot before returning.
+        let expected_eexist = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&source)
+            .expect_err("the exclusive source already exists");
+        assert_eq!(expected_eexist.kind(), ErrorKind::AlreadyExists);
+        let mut rejected = core::ptr::dangling_mut::<Writer>();
+        assert_eq!(
+            unsafe { align_rt_io_writer_create_exclusive(source_p, source_l, &mut rejected) },
+            io_error_to_status(&expected_eexist),
+        );
+        assert!(rejected.is_null());
+        assert_eq!(std::fs::read(&source).unwrap(), b"staged");
+
+        let destination_s = destination.display().to_string();
+        let (destination_p, destination_l) = view_of(&destination_s);
+        assert_eq!(
+            unsafe {
+                align_rt_fs_rename_no_replace(source_p, source_l, destination_p, destination_l)
+            },
+            0,
+        );
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"staged");
+
+        // An occupied destination is never replaced or removed; the source remains available for
+        // an explicit retry/cleanup decision by the caller.
+        std::fs::write(&source, b"retry-source").unwrap();
+        std::fs::write(&occupied, b"existing-destination").unwrap();
+        let occupied_s = occupied.display().to_string();
+        let (occupied_p, occupied_l) = view_of(&occupied_s);
+        let expected_eexist_rename = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&occupied)
+            .expect_err("the rename destination already exists");
+        assert_eq!(
+            unsafe {
+                align_rt_fs_rename_no_replace(source_p, source_l, occupied_p, occupied_l)
+            },
+            io_error_to_status(&expected_eexist_rename),
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"retry-source");
+        assert_eq!(std::fs::read(&occupied).unwrap(), b"existing-destination");
+
+        // Directories are occupied final entries too: exclusive creation must not open or alter
+        // one as a writer.
+        let occupied_dir = tmp_path("exclusive-occupied-directory");
+        let _ = std::fs::remove_dir_all(&occupied_dir);
+        std::fs::create_dir(&occupied_dir).unwrap();
+        let occupied_dir_s = occupied_dir.display().to_string();
+        let (occupied_dir_p, occupied_dir_l) = view_of(&occupied_dir_s);
+        let expected_eexist_dir = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&occupied_dir)
+            .expect_err("the exclusive directory path already exists");
+        let mut directory_rejected = core::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                align_rt_io_writer_create_exclusive(
+                    occupied_dir_p,
+                    occupied_dir_l,
+                    &mut directory_rejected,
+                )
+            },
+            io_error_to_status(&expected_eexist_dir),
+        );
+        assert!(directory_rejected.is_null());
+        assert!(occupied_dir.is_dir());
+
+        let expected_eexist_rename_dir = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&occupied_dir)
+            .expect_err("the rename destination directory already exists");
+        assert_eq!(
+            unsafe {
+                align_rt_fs_rename_no_replace(source_p, source_l, occupied_dir_p, occupied_dir_l)
+            },
+            io_error_to_status(&expected_eexist_rename_dir),
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"retry-source");
+
+        // Validation happens before any syscall and the create output slot is cleared even when
+        // the path is invalid. Negative, empty, embedded-NUL, and invalid-UTF-8 paths are all
+        // recoverable Error.Invalid cases.
+        let mut invalid_out = core::ptr::dangling_mut::<Writer>();
+        assert_eq!(unsafe { align_rt_io_writer_create_exclusive(core::ptr::null(), 0, &mut invalid_out) }, AL_INVALID);
+        assert!(invalid_out.is_null());
+        assert_eq!(unsafe { align_rt_io_writer_create_exclusive(b"x".as_ptr(), -1, &mut invalid_out) }, AL_INVALID);
+        assert!(invalid_out.is_null());
+        assert_eq!(unsafe { align_rt_io_writer_create_exclusive(b"a\0b".as_ptr(), 3, &mut invalid_out) }, AL_INVALID);
+        assert!(invalid_out.is_null());
+        assert_eq!(unsafe { align_rt_io_writer_create_exclusive([0xff].as_ptr(), 1, &mut invalid_out) }, AL_INVALID);
+        assert!(invalid_out.is_null());
+        assert_eq!(unsafe { align_rt_io_writer_create_exclusive(core::ptr::null(), 1, &mut invalid_out) }, AL_INVALID);
+        assert!(invalid_out.is_null());
+        assert_eq!(unsafe { align_rt_io_writer_create_exclusive(b"x".as_ptr(), 1, core::ptr::null_mut()) }, AL_INVALID);
+
+        // A malformed destination is rejected after the valid source is copied but before any
+        // rename syscall, leaving the source and occupied destination unchanged.
+        assert_eq!(
+            unsafe { align_rt_fs_rename_no_replace(source_p, source_l, b"bad\0path".as_ptr(), 8) },
+            AL_INVALID,
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"retry-source");
+        assert_eq!(std::fs::read(&occupied).unwrap(), b"existing-destination");
+
+        let _ = std::fs::remove_file(&source);
+        let _ = std::fs::remove_file(&destination);
+        let _ = std::fs::remove_file(&occupied);
+        let _ = std::fs::remove_dir_all(&occupied_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_exclusive_paths_treat_final_symlinks_as_entries() {
+        use std::os::unix::fs::symlink;
+
+        let source = tmp_path("exclusive-symlink-source");
+        let destination = tmp_path("exclusive-symlink-destination");
+        let target = tmp_path("exclusive-symlink-target");
+        for path in [&source, &destination, &target] {
+            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_dir_all(path);
+        }
+
+        // create_exclusive refuses an occupied final symlink, including a dangling one.
+        symlink(&target, &destination).unwrap();
+        let destination_s = destination.display().to_string();
+        let (destination_p, destination_l) = view_of(&destination_s);
+        let mut writer: *mut Writer = core::ptr::null_mut();
+        assert_ne!(
+            unsafe { align_rt_io_writer_create_exclusive(destination_p, destination_l, &mut writer) },
+            0,
+        );
+        assert!(writer.is_null());
+        assert_eq!(std::fs::read_link(&destination).unwrap(), target);
+        std::fs::remove_file(&destination).unwrap();
+
+        // rename_no_replace moves a source symlink as a directory entry; it does not pre-open or
+        // type-check the source target.
+        symlink(&target, &source).unwrap();
+        let source_s = source.display().to_string();
+        let (source_p, source_l) = view_of(&source_s);
+        assert_eq!(
+            unsafe {
+                align_rt_fs_rename_no_replace(source_p, source_l, destination_p, destination_l)
+            },
+            0,
+        );
+        assert!(!source.exists());
+        assert_eq!(std::fs::read_link(&destination).unwrap(), target);
+
+        // An occupied final symlink is also rejected without changing either directory entry.
+        std::fs::write(&source, b"source remains").unwrap();
+        assert_ne!(
+            unsafe {
+                align_rt_fs_rename_no_replace(source_p, source_l, destination_p, destination_l)
+            },
+            0,
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"source remains");
+        assert_eq!(std::fs::read_link(&destination).unwrap(), target);
+
+        let _ = std::fs::remove_file(&destination);
+        let _ = std::fs::remove_file(&source);
+        let _ = std::fs::remove_file(&target);
+    }
+
+    #[test]
+    fn fs_exclusive_operations_have_one_race_winner() {
+        use std::sync::{Arc, Barrier};
+
+        const N: usize = 8;
+        let create_path = tmp_path("exclusive-create-race");
+        let _ = std::fs::remove_file(&create_path);
+        let create_s = Arc::new(create_path.display().to_string());
+        let create_barrier = Arc::new(Barrier::new(N));
+        let create_threads: Vec<_> = (0..N)
+            .map(|_| {
+                let path = Arc::clone(&create_s);
+                let barrier = Arc::clone(&create_barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let (ptr, len) = view_of(path.as_str());
+                    let mut writer: *mut Writer = core::ptr::null_mut();
+                    let rc = unsafe { align_rt_io_writer_create_exclusive(ptr, len, &mut writer) };
+                    if rc == 0 {
+                        unsafe { align_rt_io_writer_free(writer) };
+                    }
+                    rc
+                })
+            })
+            .collect();
+        let create_results: Vec<i32> = create_threads
+            .into_iter()
+            .map(|thread| thread.join().expect("exclusive create race thread"))
+            .collect();
+        assert_eq!(create_results.iter().filter(|&&rc| rc == 0).count(), 1, "one O_EXCL caller wins");
+        let expected_eexist = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&create_path)
+            .expect_err("the create race winner created the destination");
+        assert!(create_results
+            .iter()
+            .filter(|&&rc| rc != 0)
+            .all(|&rc| rc == io_error_to_status(&expected_eexist)));
+        assert_eq!(std::fs::read(&create_path).unwrap(), b"");
+        let _ = std::fs::remove_file(&create_path);
+
+        let rename_destination = tmp_path("exclusive-rename-race-destination");
+        let _ = std::fs::remove_file(&rename_destination);
+        let rename_sources: Vec<_> = (0..N)
+            .map(|i| {
+                let path = tmp_path(&format!("exclusive-rename-race-source-{i}"));
+                let _ = std::fs::remove_file(&path);
+                std::fs::write(&path, format!("source-{i}")).unwrap();
+                path
+            })
+            .collect();
+        let destination_s = Arc::new(rename_destination.display().to_string());
+        let rename_barrier = Arc::new(Barrier::new(N));
+        let rename_threads: Vec<_> = rename_sources
+            .iter()
+            .map(|source| {
+                let source = Arc::new(source.display().to_string());
+                let destination = Arc::clone(&destination_s);
+                let barrier = Arc::clone(&rename_barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let (source_ptr, source_len) = view_of(source.as_str());
+                    let (destination_ptr, destination_len) = view_of(destination.as_str());
+                    unsafe {
+                        align_rt_fs_rename_no_replace(
+                            source_ptr,
+                            source_len,
+                            destination_ptr,
+                            destination_len,
+                        )
+                    }
+                })
+            })
+            .collect();
+        let rename_results: Vec<i32> = rename_threads
+            .into_iter()
+            .map(|thread| thread.join().expect("no-replace rename race thread"))
+            .collect();
+        assert_eq!(rename_results.iter().filter(|&&rc| rc == 0).count(), 1, "one rename wins");
+        let expected_eexist = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&rename_destination)
+            .expect_err("the rename winner created the destination");
+        assert!(rename_results
+            .iter()
+            .filter(|&&rc| rc != 0)
+            .all(|&rc| rc == io_error_to_status(&expected_eexist)));
+        assert_eq!(
+            rename_sources.iter().filter(|source| source.exists()).count(),
+            N - 1,
+            "only the winning source entry disappeared",
+        );
+
+        let _ = std::fs::remove_file(&rename_destination);
+        for source in rename_sources {
+            let _ = std::fs::remove_file(source);
+        }
     }
 
     #[test]

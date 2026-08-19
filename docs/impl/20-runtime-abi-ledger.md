@@ -9,9 +9,9 @@ visible runtime definitions that occupy link identities. The keyed surface is
 generated from a trivial valid program; the complete base and `alloc-count`
 surfaces are independently compared with the Rust runtime exports.
 
-With bounded canonical JSON, process capture, bounded HTTP response bodies, and
-owned JSON, there are 294 `RuntimeKey` variants and a one-to-one native-symbol
-record. Relative to Am-c1, F-B added
+With bounded canonical JSON, process capture, bounded HTTP response bodies,
+owned JSON, and exclusive filesystem publication, there are 296 `RuntimeKey`
+variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
 `ArrayBuilderNewIn` and `ArrayBuilderPushBytes`; the four
 AEAD symbols that were previously selected from `AeadCipher × AeadDir` become
 ordinary typed keys; they may no longer bypass the registry. Thirteen always-built
@@ -23,7 +23,7 @@ runtime records have no `RuntimeKey` and instead use the thirteen-variant
 `align_rt_f32_to_bits`, `align_rt_f32_from_bits`, `align_rt_f64_to_bits`,
 `align_rt_f64_from_bits`, `align_rt_f32_text_len`, `align_rt_f64_text_len`,
 `align_rt_f32_text_write`, and `align_rt_f64_text_write`. The base native registry
-therefore has 307 records. Request 12 adds the keyed bounded-builder stack
+therefore has 309 records. Request 12 adds the keyed bounded-builder stack
 initializer and consuming status/out-slot finish; both reuse existing ABI shapes
 A51 and A19.
 The explicit `alloc-count` runtime feature may expose four
@@ -34,10 +34,10 @@ test/benchmark-only counter definitions. `par-map-probe` may expose four more:
 `i64 @align_rt_test_par_map_workers()`. `task-group-probe` changes internal
 Rust state only and adds no unmangled native export.
 
-The compiler-visible native registry is always exactly the 307 base records.
+The compiler-visible native registry is always exactly the 309 base records.
 There is no target option, environment variable, Cargo feature, linked-runtime
 inspection, or other ambient input that changes it. The eight optional probe
-records extend only the verification-time maximum runtime-export table to 315.
+records extend only the verification-time maximum runtime-export table to 317.
 They never gain a `RuntimeKey`, callable/declaration policy, collision
 reservation, or compatible-extern reuse. Their spellings remain ordinary
 program/extern/export identities in a normal build. Probe-feature runtime
@@ -49,7 +49,7 @@ spelling.
 Request 11 added six regular `RuntimeKey` rows for bounded process capture. Request 5 subsequently
 added the two bounded-HTTP setters, and Request 9 then added `BuilderWriteUint`.
 Their runtime definitions and registry entries activated atomically: the current
-exact counts are 294 keyed records, 307 base records, and 315 records in the
+exact counts are 296 keyed records, 309 base records, and 317 records in the
 maximum optional-probe export table. No unkeyed or probe category changed.
 
 ## Request 9 owned JSON extension
@@ -90,14 +90,13 @@ direct and optional strings use A73's existing JSON-string writer, and
 current descriptor domain. `BuilderWriteUint` and kinds `8`/`9` are shipped;
 the exact counts and A66 row above are current.
 
-## Request 14 exclusive filesystem publication (design accepted; implementation pending)
+## Request 14 exclusive filesystem publication (implementation candidate)
 
-Request 14 adds two planned keyed records and no new ABI shape. Until the
-implementation lands, the current registry remains 294 keyed / 307 base / 315
-maximum optional-probe records. The implementation must add these rows
-atomically with the HIR/MIR/runtime support:
+Request 14 adds exactly two keyed records and no new ABI shape. The implementation
+candidate activates these rows atomically with the HIR/MIR/runtime support, taking
+the registry to 296 keyed / 309 base / 317 maximum optional-probe records:
 
-| Planned runtime key | Exact symbol | Existing ABI row and exact declaration |
+| Runtime key | Exact symbol | Existing ABI row and exact declaration |
 |---|---|---|
 | `IoWriterCreateExclusive` | `align_rt_io_writer_create_exclusive` | A08: `i32 @SYM(ptr, i64, ptr)` |
 | `FsRenameNoReplace` | `align_rt_fs_rename_no_replace` | A09: `i32 @SYM(ptr, i64, ptr, i64)` |
@@ -116,10 +115,10 @@ allocation, platform, pair-cleanup, and owner matrix is in
 
 ## Request 13 recursive owned JSON replacement (design accepted)
 
-Request 13 adds no runtime key, symbol, LLVM function shape, C signature, or
-optional probe. The exact keyed/base/maximum counts therefore remain
-294/307/315. Its implementation atomically replaces V1 descriptor production
-with `OwnedJsonGraphDescV2` while retaining A103 decode and A80 encode:
+Request 13 added no runtime key, symbol, LLVM function shape, C signature, or
+optional probe. At that capability boundary its implementation preserved the
+then-current 294/307/315 counts while atomically replacing V1 descriptor
+production with `OwnedJsonGraphDescV2` and retaining A103 decode and A80 encode:
 
 | Existing ABI | V2 use |
 |---|---|
@@ -269,8 +268,9 @@ Request 11 keyed delta:
 | `RunBytesFree` | `align_rt_run_bytes_free` | A62: `void @SYM(ptr)`; no curated attributes |
 
 All six use the regular `align_rt_` plus snake-case key mapping and occupy collision-reserved native
-identities as soon as the capability activates. `runtime_abi_registry_is_complete_and_unique` owns
-the 294/307 counts, key/symbol bijection, and reverse lookup; the exact extern-type matrix owns every
+identities as soon as the capability activates. At that capability boundary,
+`runtime_abi_registry_is_complete_and_unique` owned the then-current 294/307 counts,
+key/symbol bijection, and reverse lookup; the exact extern-type matrix owns every
 parameter/return/attribute cell; the checked-in declaration golden owns spelling and row order; and
 the base/feature runtime-export parity owners require all six definitions in every normal runtime
 while rejecting any missing, duplicate, near-spelled, or wrong-signature record. The capability must
@@ -373,24 +373,24 @@ LLVM construction and receives no runtime-feature input.
 
 Tests compare:
 
-- all 294 keys, mapped symbols, LLVM declaration types, and default attributes
+- all 296 keys, mapped symbols, LLVM declaration types, and default attributes
   against this table through the checked-in
   `crates/align_codegen_llvm/tests/golden/runtime_abi_declarations.txt`;
-- the 307 base native symbols against default-feature `align_runtime` exports,
+- the 309 base native symbols against default-feature `align_runtime` exports,
   plus every actual Rust definition's normalized native return and ordered
   parameter types against the declaration golden, failing on either direction's
   difference through `scripts/test-runtime-abi-exports.sh`;
-- the 311 `alloc-count` and 311 `par-map-probe` native symbols against
+- the 313 `alloc-count` and 313 `par-map-probe` native symbols against
   `align_runtime` built with each feature separately, including the four exact
   probe signatures above;
-- the 315 maximum native symbols against `align_runtime` built with
+- the 317 maximum native symbols against `align_runtime` built with
   `alloc-count,par-map-probe,task-group-probe`, while proving
   `task-group-probe` adds no unmangled export;
 - rt-LTO off/on attributes for every guarded symbol, with missing,
   declaration-only, wrong-type, internal, private, available-externally, and
   non-C-calling-convention artifact negatives;
-- all 307 identities through the one `RuntimeAbiId`-keyed row iterator and all
-  307 exact registry function types through the production compatibility
+- all 309 identities through the one `RuntimeAbiId`-keyed row iterator and all
+  309 exact registry function types through the production compatibility
   predicate, one return mutation per row, and one mutation of every parameter
   ordinal; source-valid compatible reuse for a keyed builtin and the twelve
   source-reachable unkeyed rows; exact `ArgsBuild` `str` rejection plus the

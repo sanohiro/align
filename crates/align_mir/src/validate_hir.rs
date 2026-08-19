@@ -3856,6 +3856,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::ReaderOpen { .. }
             | hir::ExprKind::WriterStd { .. }
             | hir::ExprKind::WriterCreate { .. }
+            | hir::ExprKind::CreateExclusive { .. }
             | hir::ExprKind::ReaderRead { .. }
             | hir::ExprKind::ReaderBuffered { .. }
             | hir::ExprKind::ReaderReadLine { .. }
@@ -3883,6 +3884,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::FsExists { .. }
             | hir::ExprKind::FsRemove { .. }
             | hir::ExprKind::FsReadDir { .. }
+            | hir::ExprKind::RenameNoReplace { .. }
             | hir::ExprKind::DnsResolve { .. }
             | hir::ExprKind::TcpConnect { .. }
             | hir::ExprKind::ConnReader { .. }
@@ -4177,6 +4179,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::ReaderStdin
             | hir::ExprKind::ReaderOpen { .. }
             | hir::ExprKind::WriterCreate { .. }
+            | hir::ExprKind::CreateExclusive { .. }
             | hir::ExprKind::ReaderRead { .. }
             | hir::ExprKind::ReaderBuffered { .. }
             | hir::ExprKind::ReaderReadLine { .. }
@@ -4198,6 +4201,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::FsExists { .. }
             | hir::ExprKind::FsRemove { .. }
             | hir::ExprKind::FsReadDir { .. }
+            | hir::ExprKind::RenameNoReplace { .. }
             | hir::ExprKind::DnsResolve { .. }
             | hir::ExprKind::TcpConnect { .. }
             | hir::ExprKind::ConnReader { .. }
@@ -7598,6 +7602,9 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::WriterCreate { path } => {
                 (path.ty == Ty::Str).then(|| result(Ty::Writer, &[path.as_ref()]))?
             }
+            hir::ExprKind::CreateExclusive { path } => {
+                (path.ty == Ty::Str).then(|| result(Ty::Writer, &[path.as_ref()]))?
+            }
             hir::ExprKind::ReaderRead { reader, buffer } => {
                 if !self.reader_place(reader, context)
                     || !mutable_local(buffer, Ty::Buffer)
@@ -7787,6 +7794,10 @@ impl<'a> BodyValidator<'a> {
             }
             hir::ExprKind::FsRemove { path } => {
                 (path.ty == Ty::Str).then(|| result(Ty::Unit, &[path]))?
+            }
+            hir::ExprKind::RenameNoReplace { source, destination } => {
+                (source.ty == Ty::Str && destination.ty == Ty::Str)
+                    .then(|| result(Ty::Unit, &[source, destination]))?
             }
             hir::ExprKind::FsReadDir { path } | hir::ExprKind::DnsResolve { host: path } => {
                 (path.ty == Ty::Str)

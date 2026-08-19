@@ -155,6 +155,75 @@ pub fn main(args: array<str>) -> Result<(), Error> {
     assert_eq!(out.status.code(), Some(1), "removing a missing file is Error.NotFound (tag 0 -> exit 1)");
 }
 
+// --- exclusive publication --------------------------------------------------------------------
+
+/// `fs.create_exclusive` creates a buffered writer whose Drop flushes the staged bytes. A second
+/// invocation against the same final entry returns an error and cannot truncate the first result.
+#[test]
+fn create_exclusive_is_atomic_and_non_replacing() {
+    if !backend_available() {
+        return;
+    }
+    let output = TempFile::out("exclusive-create");
+    let prog = "\
+import std.fs
+import std.io
+pub fn main(args: array<str>) -> Result<(), Error> {
+  w := fs.create_exclusive(args[1])?
+  w.write(\"first publication\")?
+  return Ok(())
+}
+";
+    let first = build_and_run_args("m9fs-exclusive-create", prog, &[&output.str()]);
+    assert_eq!(first.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&first.stderr));
+    assert_eq!(std::fs::read(&output.path).unwrap(), b"first publication");
+
+    let second = build_and_run_args("m9fs-exclusive-create-again", prog, &[&output.str()]);
+    assert_ne!(second.status.code(), Some(0), "an occupied final entry is an Error.Code failure");
+    assert_eq!(std::fs::read(&output.path).unwrap(), b"first publication", "EEXIST never truncates");
+}
+
+/// `fs.rename_no_replace` moves a source entry when the destination is absent and leaves both
+/// entries unchanged when a destination race/occupation wins.
+#[test]
+fn rename_no_replace_moves_and_never_replaces() {
+    if !backend_available() {
+        return;
+    }
+    let source = TempFile::new("rename-source", b"source bytes");
+    let destination = TempFile::out("rename-destination");
+    let prog = "\
+import std.fs
+pub fn main(args: array<str>) -> Result<(), Error> {
+  fs.rename_no_replace(args[1], args[2])?
+  return Ok(())
+}
+";
+    let moved = build_and_run_args("m9fs-rename-no-replace", prog, &[&source.str(), &destination.str()]);
+    assert_eq!(moved.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&moved.stderr));
+    assert!(!source.path.exists(), "the source entry moved");
+    assert_eq!(std::fs::read(&destination.path).unwrap(), b"source bytes");
+
+    let occupied_source = TempFile::new("rename-occupied-source", b"source remains");
+    let occupied_destination = TempFile::new("rename-occupied-destination", b"destination remains");
+    let rejected = build_and_run_args(
+        "m9fs-rename-no-replace-occupied",
+        prog,
+        &[&occupied_source.str(), &occupied_destination.str()],
+    );
+    assert_ne!(rejected.status.code(), Some(0), "occupied destination maps to an Error.Code failure");
+    assert_eq!(std::fs::read(&occupied_source.path).unwrap(), b"source remains");
+    assert_eq!(std::fs::read(&occupied_destination.path).unwrap(), b"destination remains");
+}
+
+#[test]
+fn exclusive_publication_requires_exact_arguments_and_import() {
+    let no_import = "fn main() -> Result<(), Error> { fs.create_exclusive(\"x\")? return Ok(()) }\n";
+    assert!(check_errs("m9fs-exclusive-no-import", no_import));
+    let wrong_rename = "import std.fs\nfn main() -> Result<(), Error> { fs.rename_no_replace(\"x\")? return Ok(()) }\n";
+    assert!(check_errs("m9fs-rename-wrong-arity", wrong_rename));
+}
+
 // --- read_dir ---------------------------------------------------------------------------------
 
 /// `fs.read_dir` returns an owned `array<string>` of the directory's entry names; `.len()` reports
