@@ -353,7 +353,8 @@ current result behavior. Views derived from the payload follow the existing infe
 and region rules. A free-standing or otherwise owning scrutinee keeps the existing consuming match
 behavior.
 
-Ordinary indexing of an admitted `array<str>` or AoS array of Copy records with view fields keeps
+Ordinary indexing of an admitted `array<str>` or AoS array of Copy records with any admitted
+region-bearing Copy field, including direct or nested `str` and `slice<T>` fields, keeps
 those same owner-generation and input/arena roots through direct, field, and borrowed-projection
 bases. Returned views and views retained into a `borrow mut` destination cannot outlive those roots.
 If the index expression terminates, no bounds action or result is formed.

@@ -311,9 +311,10 @@ the language capability is the correct boundary.
 payload grammar to `array<str>` and AoS arrays of Copy records is unsafe if ordinary `Index` or
 field projection silently treats the projected binding as static. Direct, field, and projected
 bases therefore feed the same source generation and contained input/arena roots into return and
-`borrow mut` retention summaries. A terminating index produces no bounds action or result. This is
-the existing inferred-region model applied to a new reachable path, not a reference type or array
-special case.
+`borrow mut` retention summaries for every admitted region-bearing Copy leaf, including direct or
+nested `str` and `slice<T>`. The implementation follows the canonical Copy/borrow classifiers, not
+a `str` special case. A terminating index produces no bounds action or result. This is the existing
+inferred-region model applied to a new reachable path, not a reference type or array special case.
 
 **A borrowed Move array element is a call place, not a value.** Decoded artifact graphs store Move
 records in ordinary AoS dynamic arrays. Loading `rows[i]` by value would either copy one owner or

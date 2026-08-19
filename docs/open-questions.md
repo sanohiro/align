@@ -4065,7 +4065,8 @@ storing, capturing, sending, or consuming the whole non-Copy/Move payload is rej
 Copy/view matching retains its current result behavior, and views derived from an admitted payload
 use the existing return-borrow and region checks.
 
-Ordinary indexing of an admitted `array<str>` or AoS array of Copy records with view fields
+Ordinary indexing of an admitted `array<str>` or AoS array of Copy records with any admitted
+region-bearing Copy field, including direct or nested `str` and `slice<T>` fields,
 preserves the complete source generation and input/arena roots through direct, field, and borrowed
 projection bases, including return and `borrow mut` destination retention. A terminating index
 forms no bounds action or result.
