@@ -23,6 +23,330 @@ fn main() -> i32 {
 }
 
 #[test]
+fn borrowed_sum_match_projects_move_payloads_and_preserves_the_root() {
+    let source = "\
+Holder { choice: Option<string> }\n\
+Inner { choice: Option<string> }\n\
+Outer { inner: Inner }\n\
+Content { Text(string), Empty }\n\
+TextValue { text: string }\n\
+NestedContent { Item(TextValue), Empty }\n\
+fn option_len(borrow value: Option<string>) -> i64 {\n\
+  first := match value {\n\
+    Some(text) => text.len()\n\
+    None => 0\n\
+  }\n\
+  second := match value {\n\
+    Some(text) => text.len()\n\
+    None => 0\n\
+  }\n\
+  return first + second\n\
+}\n\
+fn result_len(borrow value: Result<string, string>) -> i64 = match value {\n\
+  Ok(text) => text.len()\n\
+  Err(text) => text.len()\n\
+}\n\
+fn holder_len(borrow value: Holder) -> i64 = match value.choice {\n\
+  Some(text) => text.len()\n\
+  None => 0\n\
+}\n\
+fn nested_holder_len(borrow value: Outer) -> i64 = match value.inner.choice {\n\
+  Some(text) => text.len()\n\
+  None => 0\n\
+}\n\
+fn exclusive_option_len(borrow mut value: Option<string>) -> i64 = match value {\n\
+  Some(text) => text.len()\n\
+  None => 0\n\
+}\n\
+fn content_len(borrow value: Content) -> i64 = match value {\n\
+  Text(text) => text.len()\n\
+  Empty => 0\n\
+}\n\
+fn nested_content_len(borrow value: NestedContent) -> i64 = match value {\n\
+  Item(item) => item.text.len()\n\
+  Empty => 0\n\
+}\n\
+fn option_struct_len(borrow value: Option<TextValue>) -> i64 = match value {\n\
+  Some(item) => item.text.len()\n\
+  None => 0\n\
+}\n\
+fn cloned_len(borrow value: Option<string>) -> i64 = match value {\n\
+  Some(text) => text.clone().len()\n\
+  None => 0\n\
+}\n\
+fn main() -> i32 {\n\
+  option: Option<string> := Some(\"hello\".clone())\n\
+  ok: Result<string, string> := Ok(\"ok\".clone())\n\
+  err: Result<string, string> := Err(\"bad\".clone())\n\
+  holder := Holder { choice: Some(\"field\".clone()) }\n\
+  nested := Outer { inner: Inner { choice: Some(\"nested\".clone()) } }\n\
+  mut exclusive: Option<string> := Some(\"exclusive\".clone())\n\
+  content := Content.Text(\"payload\".clone())\n\
+  nested_content := NestedContent.Item(TextValue { text: \"deep\".clone() })\n\
+  option_struct: Option<TextValue> := Some(TextValue { text: \"option\".clone() })\n\
+  if option_len(option) != 10 { return 1 }\n\
+  if option_len(option) != 10 { return 2 }\n\
+  if result_len(ok) != 2 { return 3 }\n\
+  if result_len(err) != 3 { return 4 }\n\
+  if holder_len(holder) != 5 { return 5 }\n\
+  if holder_len(holder) != 5 { return 6 }\n\
+  if nested_holder_len(nested) != 6 { return 7 }\n\
+  if nested_holder_len(nested) != 6 { return 8 }\n\
+  if exclusive_option_len(exclusive) != 9 { return 9 }\n\
+  if option_len(exclusive) != 18 { return 10 }\n\
+  if content_len(content) != 7 { return 11 }\n\
+  if content_len(content) != 7 { return 12 }\n\
+  if nested_content_len(nested_content) != 4 { return 13 }\n\
+  if nested_content_len(nested_content) != 4 { return 14 }\n\
+  if option_struct_len(option_struct) != 6 { return 15 }\n\
+  if option_struct_len(option_struct) != 6 { return 16 }\n\
+  if cloned_len(option) != 5 { return 17 }\n\
+  return 42\n\
+}\n\
+";
+    assert!(
+        !check_errs("borrowed-sum-match", source),
+        "{}",
+        check_diagnostics("borrowed-sum-match", source)
+    );
+    if backend_available() {
+        assert_eq!(build_and_run("borrowed-sum-match", source).status.code(), Some(42));
+    }
+}
+
+#[test]
+fn borrowed_sum_match_imported_body_matches_whole_program() {
+    let files = &[
+        (
+            "views.align",
+            "module views\npub fn inspect(borrow value: Option<string>) -> i64 = match value { Some(text) => text.len() None => 0 }\n",
+        ),
+        (
+            "main.align",
+            "import views\nfn main() -> i32 { value: Option<string> := Some(\"cross-unit\".clone()); if views.inspect(value) == 10 { return 42 }; return 0 }\n",
+        ),
+    ];
+    let differential = diff_check_multi("borrowed-sum-import", files, "main.align");
+    assert_eq!(differential.whole_errors, differential.per_unit_errors);
+    assert!(!differential.whole_errors, "whole: {}\nper-unit: {}", differential.whole_diags, differential.per_unit_diags);
+    if backend_available() {
+        assert_eq!(
+            build_and_run_multi("borrowed-sum-import-whole", files, "main.align")
+                .status
+                .code(),
+            Some(42),
+        );
+        assert_eq!(
+            build_per_unit_multi("borrowed-sum-import-per-unit", files, "main.align")
+                .link_and_run()
+                .status
+                .code(),
+            Some(42),
+        );
+    }
+}
+
+#[test]
+fn borrowed_sum_match_uses_pointer_projections_without_move_cleanup() {
+    let source = "\
+Content { Text(string), Empty }\n\
+fn inspect(borrow value: Content) -> i64 = match value {\n\
+  Text(text) => text.len()\n\
+  Empty => 0\n\
+}\n\
+fn main() -> i32 {\n\
+  value := Content.Empty\n\
+  return inspect(value) as i32\n\
+}\n\
+";
+    let mut sm = SourceMap::new();
+    let checked = check(&mut sm, "borrowed-sum-mir", source);
+    assert!(!checked.diags.has_errors(), "unexpected diagnostics");
+    let mir = lower_to_mir(&checked.hir);
+    let rendered = align_mir::print::program_to_string(&mir);
+    let inspect = rendered
+        .split("fn inspect")
+        .nth(1)
+        .and_then(|body| body.split("fn main").next())
+        .expect("borrowed inspect MIR");
+    assert!(inspect.contains("borrow slot"), "projection must retain a borrowed place:\n{rendered}");
+    assert!(
+        inspect.contains("variant0.payload0"),
+        "user-sum payload must be addressed by its typed path:\n{rendered}"
+    );
+    assert!(!inspect.contains("enum_payload("), "borrowed projection must not extract an aggregate:\n{rendered}");
+    assert!(!inspect.contains("null "), "borrowed projection must not null the source:\n{rendered}");
+    assert!(!inspect.contains("drop "), "projection locals/root must not gain cleanup:\n{rendered}");
+}
+
+#[test]
+fn borrowed_sum_match_rejects_unsupported_payloads_and_consumption() {
+    assert!(check_errs(
+        "borrowed-sum-array",
+        "fn inspect(borrow value: Option<array<i64>>) -> i64 = match value { Some(values) => values.len() None => 0 }\nfn main() -> i32 = 0\n",
+    ));
+    assert!(check_errs(
+        "borrowed-sum-nested-match",
+        "fn inspect(borrow value: Option<Option<string>>) -> i64 = match value { Some(inner) => match inner { Some(text) => text.len() None => 0 } None => 0 }\nfn main() -> i32 = 0\n",
+    ));
+    let consuming = "fn take(value: string) -> i64 = value.len()\nfn inspect(borrow value: Option<string>) -> i64 = match value { Some(text) => take(text) None => 0 }\nfn main() -> i32 = 0\n";
+    let diagnostics = check_diagnostics("borrowed-sum-consume", consuming);
+    assert!(
+        diagnostics.contains("borrowed match payload"),
+        "whole payload consumption must remain rejected:\n{diagnostics}"
+    );
+    assert!(check_errs(
+        "borrowed-sum-return",
+        "fn inspect(borrow value: Option<string>) -> string = match value { Some(text) => text None => \"empty\".clone() }\nfn main() -> i32 = 0\n",
+    ));
+    assert!(check_errs(
+        "borrowed-sum-store",
+        "Holder { value: string }\nfn inspect(borrow value: Option<string>) -> Holder = match value { Some(text) => Holder { value: text } None => Holder { value: \"empty\".clone() } }\nfn main() -> i32 = 0\n",
+    ));
+    assert!(check_errs(
+        "borrowed-sum-mixed-nested",
+        "Holder { choice: Mixed }\nMixed { Text(string), Bad(array<i64>) }\nfn inspect(borrow value: Holder) -> i64 = match value.choice { Text(text) => text.len() Bad(values) => values.len() }\nfn main() -> i32 = 0\n",
+    ));
+}
+
+#[test]
+fn borrowed_sum_match_reads_copy_scalars_through_nested_move_payloads() {
+    let source = "\
+Record { text: string, count: i64 }\n\
+Wrapped { Item(Record), Empty }\n\
+fn inspect(borrow value: Wrapped) -> i64 = match value {\n\
+  Item(item) => item.count + item.text.len()\n\
+  Empty => 0\n\
+}\n\
+fn main() -> i32 {\n\
+  value := Wrapped.Item(Record { text: \"hello\".clone(), count: 37 })\n\
+  if inspect(value) == 42 && inspect(value) == 42 { return 42 }\n\
+  return 0\n\
+}\n\
+";
+    assert!(
+        !check_errs("borrowed-sum-copy-scalar", source),
+        "{}",
+        check_diagnostics("borrowed-sum-copy-scalar", source)
+    );
+    if backend_available() {
+        assert_eq!(
+            build_and_run("borrowed-sum-copy-scalar", source)
+                .status
+                .code(),
+            Some(42)
+        );
+    }
+}
+
+#[test]
+fn borrowed_sum_match_borrow_mut_keeps_the_sum_unchanged() {
+    let source = "\
+Holder { choice: Option<string> }\n\
+Inner { choice: Option<string> }\n\
+Outer { inner: Inner }\n\
+Content { Text(string), Empty }\n\
+fn option_len(borrow value: Option<string>) -> i64 {\n\
+  first := match value {\n\
+    Some(text) => text.len()\n\
+    None => 0\n\
+  }\n\
+  second := match value {\n\
+    Some(text) => text.len()\n\
+    None => 0\n\
+  }\n\
+  return first + second\n\
+}\n\
+fn exclusive_option_len(borrow mut value: Option<string>) -> i64 = match value {\n\
+  Some(text) => text.len()\n\
+  None => 0\n\
+}\n\
+fn main() -> i32 {\n\
+  mut value: Option<string> := Some(\"stable\".clone())\n\
+  if exclusive_option_len(value) != 6 { return 1 }\n\
+  if option_len(value) != 12 { return 2 }\n\
+  return 42\n\
+  return 0\n\
+}\n\
+";
+    assert_eq!(build_and_run("borrowed-sum-borrow-mut", source).status.code(), Some(42));
+}
+
+#[test]
+fn borrowed_sum_match_can_return_a_view_of_a_string_leaf() {
+    let source = "\
+fn identity(value: str) -> str = value\n\
+fn view(borrow value: Option<string>) -> str = match value {\n\
+  Some(text) => identity(text)\n\
+  None => \"\"\n\
+}\n\
+fn main() -> i32 {\n\
+  value: Option<string> := Some(\"hello\".clone())\n\
+  result := view(value)\n\
+  if result.len() == 5 && match value { Some(text) => text.len() None => 0 } == 5 { return 42 }\n\
+  return 0\n\
+}\n\
+";
+    assert!(
+        !check_errs("borrowed-sum-view", source),
+        "{}",
+        check_diagnostics("borrowed-sum-view", source)
+    );
+    if backend_available() {
+        assert_eq!(build_and_run("borrowed-sum-view", source).status.code(), Some(42));
+    }
+}
+
+#[test]
+fn borrowed_sum_match_passes_a_view_leaf_through_an_indirect_call() {
+    let source = "\
+fn length(value: str) -> i64 = value.len()\n\
+fn apply(f: fn(str) -> i64, borrow value: Option<string>) -> i64 = match value {\n\
+  Some(text) => f(text)\n\
+  None => 0\n\
+}\n\
+fn main() -> i32 {\n\
+  value: Option<string> := Some(\"hello\".clone())\n\
+  f := length\n\
+  result := apply(f, value)\n\
+  if result == 5 && match value { Some(text) => text.len() None => 0 } == 5 { return 42 }\n\
+  return 0\n\
+}\n\
+";
+    assert!(
+        !check_errs("borrowed-sum-indirect-view", source),
+        "{}",
+        check_diagnostics("borrowed-sum-indirect-view", source)
+    );
+    if backend_available() {
+        assert_eq!(build_and_run("borrowed-sum-indirect-view", source).status.code(), Some(42));
+    }
+}
+
+#[test]
+fn borrowed_sum_match_passes_copy_projection_to_runtime_calls() {
+    let source = "\
+fn inspect(borrow value: Option<string>) -> i64 = match value {\n\
+  Some(text) => { print(text); 1 }\n\
+  None => 0\n\
+}\n\
+fn main() -> i32 {\n\
+  value: Option<string> := Some(\"hello\".clone())\n\
+  if inspect(value) == 1 && inspect(value) == 1 { return 42 }\n\
+  return 0\n\
+}\n\
+";
+    assert!(
+        !check_errs("borrowed-sum-runtime-call", source),
+        "{}",
+        check_diagnostics("borrowed-sum-runtime-call", source)
+    );
+    if backend_available() {
+        assert_eq!(build_and_run("borrowed-sum-runtime-call", source).status.code(), Some(42));
+    }
+}
+
+#[test]
 fn shared_function_value_preserves_mode_and_owner() {
     if !backend_available() {
         return;

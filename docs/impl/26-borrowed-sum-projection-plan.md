@@ -1,6 +1,6 @@
 # Borrow-safe sum-payload match projection
 
-Status: **PROPOSED DESIGN; implementation pending.**
+Status: **IMPLEMENTED; owner regressions complete; publication pending.**
 
 This document is the design and implementation plan for read-only matching of an owned
 `Option<T>`, `Result<T, E>`, or user sum through a stable borrowed place. It closes the general
@@ -11,6 +11,12 @@ generic rechecking, and cache validation.
 The capability is not an application workaround, a verifier-specific API, or a second ownership
 model. It is accepted only when the public contract and this closure matrix are reviewed and
 merged before implementation begins.
+
+The implementation boundary intentionally spans HIR metadata, MoveCheck/EscapeCheck, checked-HIR
+replay, MIR, LLVM lowering, and owner tests. Splitting that dormant producer-to-consumer chain
+would duplicate the exact-path and cleanup proof while leaving unstable intermediate consumers;
+one capability boundary keeps the representation and safety invariants coupled and lowers
+integration risk.
 
 ## 1. Public-contract ledger
 
@@ -215,7 +221,7 @@ parity and pointer-vs-copy assertions are correctness evidence, not a performanc
 
 ## 7. Author-side consistency pass
 
-Before implementation begins, verify that:
+The author-side consistency pass was completed before implementation. It verified that:
 
 - the Match paragraphs in `draft.md` and `docs/language-spec.md`, the rationale in
   `docs/design-notes.md`, this ledger, and the Settled entry in `docs/open-questions.md` use the
@@ -231,6 +237,5 @@ Before implementation begins, verify that:
   owner; and
 - the plan does not consume evaluator/provider work or any later C6 milestone.
 
-The capability is not implementation-ready until this pass and one independent design review are
-complete. Implementation follows from the reviewed merge and reopens this matrix only if the
+The implementation follows from the reviewed design merge and reopens this matrix only if the
 strategy or public contract changes.

@@ -4590,6 +4590,16 @@ fn validate_tagged_program(program: &Program) -> Result<(), CodegenError> {
                         if preflight_operand_ty(f, callee) != Some(Ty::Raw)
                             || !types_match
                             || !result_matches
+                            // A raw-call signature is an externally supplied bare-pointer ABI;
+                            // it cannot reinterpret a typed borrowed-place operand as a by-value
+                            // argument. Ordinary checked program calls may load a Copy projection,
+                            // but raw calls must retain their explicit borrow mode.
+                            || args.iter().zip(&signature.param_modes).any(|(operand, mode)| {
+                                matches!(
+                                    (operand, mode),
+                                    (Operand::BorrowedPlace(_), align_ast::ParamMode::ByValue)
+                                )
+                            })
                             || !operands_match_modes(
                                 args,
                                 &signature.param_modes,
@@ -5284,6 +5294,15 @@ fn operands_match_modes(
                     place.cleanup.is_some() == move_pointee
                         && (!move_pointee || place.path.is_empty())
                 }
+                (Operand::BorrowedPlace(place), align_ast::ParamMode::ByValue)
+                    if place.cleanup.is_none()
+                        && !align_sema::needs_drop_flag(
+                            *ty,
+                            &program.structs,
+                            &program.tuples,
+                            &program.enums,
+                            &program.tagged_types,
+                        ) => true,
                 (Operand::BorrowedPlace(_), _) => false,
                 (_, align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut) => false,
                 _ => true,
@@ -5534,7 +5553,20 @@ fn callable_preflight(
                             .is_some_and(|(args, ret)| {
                                 direct_runtime_key_is_valid(*key, args, ret, program)
                             })
-                            || args.iter().any(|argument| matches!(argument, Operand::BorrowedPlace(_)))
+                            || args.iter().any(|argument| {
+                                matches!(
+                                    argument,
+                                    Operand::BorrowedPlace(place)
+                                        if place.cleanup.is_some()
+                                            || align_sema::needs_drop_flag(
+                                                place.ty,
+                                                &program.structs,
+                                                &program.tuples,
+                                                &program.enums,
+                                                &program.tagged_types,
+                                            )
+                                )
+                            })
                         {
                             return Err(CodegenError::Lowering(
                                 "callable metadata invalid:InvalidGraph".to_owned(),
@@ -8644,6 +8676,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
         self.field_perm[struct_id as usize][logical as usize]
     }
 
+    fn checked_pfield(&self, struct_id: u32, logical: u32) -> Result<u32, CodegenError> {
+        self.field_perm
+            .get(struct_id as usize)
+            .and_then(|perm| perm.get(logical as usize))
+            .copied()
+            .ok_or_else(|| self.err("borrowed place has no physical field mapping"))
+    }
+
     /// Validate and resolve a compiler-generated AoS field stage. MIR stores field indices in the
     /// language's logical order; the LLVM aggregate may reorder non-`layout(C)` fields, so every
     /// range-kernel projection/filter must pass through the same permutation as ordinary field
@@ -11457,7 +11497,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// `result_ty` is the type of the value being defined (needed to build a bare `None`).
     fn gen_rvalue(&mut self, result_id: ValueId, rv: &Rvalue, result_ty: Ty) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
         let v: BasicValueEnum<'c> = match rv {
-            Rvalue::Use(op) => self.operand(op)?,
+            Rvalue::Use(op) => self.operand_by_value(op)?,
             Rvalue::Load(slot) => {
                 let ty = self.llvm_type(self.f.slots[*slot as usize]);
                 self.builder
@@ -11725,22 +11765,38 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 .into()
             }
             Rvalue::OptionIsSome(op) => {
-                let agg = self.operand(op)?.into_struct_value();
-                let tag = self
-                    .builder
-                    .build_extract_value(agg, 0, "tag")
-                    .map_err(|e| self.err(e))?
-                    .into_int_value();
+                let tag = if let Operand::BorrowedPlace(place) = op {
+                    if !matches!(align_sema::expand_tagged_ty(place.ty, self.tagged_defs), Ty::Option(_)) {
+                        return Err(self.err("borrowed Option tag test has a non-Option input"));
+                    }
+                    self.borrowed_sum_tag(place)?
+                } else {
+                    let agg = self.operand(op)?.into_struct_value();
+                    self.builder
+                        .build_extract_value(agg, 0, "tag")
+                        .map_err(|e| self.err(e))?
+                }
+                .into_int_value();
                 self.builder
                     .build_int_compare(IntPredicate::EQ, tag, self.ctx.i8_type().const_int(1, false), "issome")
                     .map_err(|e| self.err(e))?
                     .into()
             }
             Rvalue::OptionUnwrap(op) => {
-                let agg = self.operand(op)?.into_struct_value();
-                self.builder
-                    .build_extract_value(agg, 1, "some")
-                    .map_err(|e| self.err(e))?
+                if let Operand::BorrowedPlace(place) = op {
+                    let mut payload = (**place).clone();
+                    payload.path.push(align_sema::hir::BorrowedPathSegment::OptionSome);
+                    let Ty::Option(_) = align_sema::expand_tagged_ty(place.ty, self.tagged_defs) else {
+                        return Err(self.err("borrowed Option unwrap has the wrong input type"));
+                    };
+                    payload.ty = result_ty;
+                    self.operand_by_value(&Operand::BorrowedPlace(Box::new(payload)))?
+                } else {
+                    let agg = self.operand(op)?.into_struct_value();
+                    self.builder
+                        .build_extract_value(agg, 1, "some")
+                        .map_err(|e| self.err(e))?
+                }
             }
             Rvalue::ResultOk(op) => {
                 let Ty::Result(o, e) = result_ty else {
@@ -11795,28 +11851,54 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .into()
             }
             Rvalue::ResultIsOk(op) => {
-                let agg = self.operand(op)?.into_struct_value();
-                let tag = self
-                    .builder
-                    .build_extract_value(agg, 0, "tag")
-                    .map_err(|e| self.err(e))?
-                    .into_int_value();
+                let tag = if let Operand::BorrowedPlace(place) = op {
+                    if !matches!(align_sema::expand_tagged_ty(place.ty, self.tagged_defs), Ty::Result(..)) {
+                        return Err(self.err("borrowed Result tag test has a non-Result input"));
+                    }
+                    self.borrowed_sum_tag(place)?
+                } else {
+                    let agg = self.operand(op)?.into_struct_value();
+                    self.builder
+                        .build_extract_value(agg, 0, "tag")
+                        .map_err(|e| self.err(e))?
+                }
+                .into_int_value();
                 self.builder
                     .build_int_compare(IntPredicate::EQ, tag, self.ctx.i8_type().const_int(0, false), "isok")
                     .map_err(|e| self.err(e))?
                     .into()
             }
             Rvalue::ResultUnwrapOk(op) => {
-                let agg = self.operand(op)?.into_struct_value();
-                self.builder
-                    .build_extract_value(agg, 1, "ok")
-                    .map_err(|e| self.err(e))?
+                if let Operand::BorrowedPlace(place) = op {
+                    let mut payload = (**place).clone();
+                    payload.path.push(align_sema::hir::BorrowedPathSegment::ResultOk);
+                    let Ty::Result(_, _) = align_sema::expand_tagged_ty(place.ty, self.tagged_defs) else {
+                        return Err(self.err("borrowed Result unwrap has the wrong input type"));
+                    };
+                    payload.ty = result_ty;
+                    self.operand_by_value(&Operand::BorrowedPlace(Box::new(payload)))?
+                } else {
+                    let agg = self.operand(op)?.into_struct_value();
+                    self.builder
+                        .build_extract_value(agg, 1, "ok")
+                        .map_err(|e| self.err(e))?
+                }
             }
             Rvalue::ResultUnwrapErr(op) => {
-                let agg = self.operand(op)?.into_struct_value();
-                self.builder
-                    .build_extract_value(agg, 2, "err")
-                    .map_err(|e| self.err(e))?
+                if let Operand::BorrowedPlace(place) = op {
+                    let mut payload = (**place).clone();
+                    payload.path.push(align_sema::hir::BorrowedPathSegment::ResultErr);
+                    let Ty::Result(_, _) = align_sema::expand_tagged_ty(place.ty, self.tagged_defs) else {
+                        return Err(self.err("borrowed Result unwrap has the wrong input type"));
+                    };
+                    payload.ty = result_ty;
+                    self.operand_by_value(&Operand::BorrowedPlace(Box::new(payload)))?
+                } else {
+                    let agg = self.operand(op)?.into_struct_value();
+                    self.builder
+                        .build_extract_value(agg, 2, "err")
+                        .map_err(|e| self.err(e))?
+                }
             }
             Rvalue::MakeEnum { enum_id, variant, payload } => {
                 // `{ i32 tag, … }`: store the variant tag, then this variant's payload fields.
@@ -11837,9 +11919,30 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 }
                 agg.into()
             }
-            Rvalue::EnumTagEq { scrutinee, variant, .. } => {
-                let agg = self.operand(scrutinee)?.into_struct_value();
-                let tag = self.builder.build_extract_value(agg, 0, "tag").map_err(|e| self.err(e))?.into_int_value();
+            Rvalue::EnumTagEq {
+                enum_id,
+                scrutinee,
+                variant,
+            } => {
+                let tag = if let Operand::BorrowedPlace(place) = scrutinee {
+                    let Ty::Enum(actual_id) = place.ty else {
+                        return Err(self.err("borrowed enum tag test has a non-enum input"));
+                    };
+                    if actual_id != *enum_id
+                        || self
+                            .enums
+                            .get(*enum_id as usize)
+                            .and_then(|definition| definition.variants.get(*variant as usize))
+                            .is_none()
+                    {
+                        return Err(self.err("borrowed enum tag test has an invalid enum or variant"));
+                    }
+                    self.borrowed_sum_tag(place)?
+                } else {
+                    let agg = self.operand(scrutinee)?.into_struct_value();
+                    self.builder.build_extract_value(agg, 0, "tag").map_err(|e| self.err(e))?
+                }
+                .into_int_value();
                 let want = self.ctx.i32_type().const_int(*variant as u64, false);
                 self.builder
                     .build_int_compare(IntPredicate::EQ, tag, want, "tageq")
@@ -11847,6 +11950,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .into()
             }
             Rvalue::EnumPayload { enum_id, variant, slot, operand } => {
+                if let Operand::BorrowedPlace(place) = operand {
+                    self.validate_borrowed_enum_payload(place, *enum_id, *variant, *slot, result_ty)?;
+                    let mut payload = (**place).clone();
+                    payload.path.push(align_sema::hir::BorrowedPathSegment::EnumPayload {
+                        variant: *variant,
+                        payload_ordinal: *slot,
+                    });
+                    payload.ty = result_ty;
+                    return Ok(Some(self.operand_by_value(&Operand::BorrowedPlace(Box::new(payload)))?));
+                }
                 let agg = self.operand(operand)?.into_struct_value();
                 let base = self.enums[*enum_id as usize].variants[*variant as usize].field_base;
                 self.builder
@@ -13440,7 +13553,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::StrClone(op) => {
                 // Extract the source `{ptr,len}` view, deep-copy the bytes into a fresh heap
                 // buffer, and yield the owned `string` `{ptr,len}` the runtime returns.
-                let agg = self.operand(op)?.into_struct_value();
+                let agg = self.operand_by_value(op)?.into_struct_value();
                 let ptr = self.builder.build_extract_value(agg, 0, "srcptr").map_err(|e| self.err(e))?;
                 let len = self.builder.build_extract_value(agg, 1, "srclen").map_err(|e| self.err(e))?;
                 self.builder
@@ -13464,7 +13577,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     align_sema::hir::StrTrimKind::Start => RuntimeKey::StrTrimStart,
                     align_sema::hir::StrTrimKind::End => RuntimeKey::StrTrimEnd,
                 };
-                let agg = self.operand(recv)?.into_struct_value();
+                let agg = self.operand_by_value(recv)?.into_struct_value();
                 let ptr = self.builder.build_extract_value(agg, 0, "trimptr").map_err(|e| self.err(e))?;
                 let len = self.builder.build_extract_value(agg, 1, "trimlen").map_err(|e| self.err(e))?;
                 self.builder
@@ -13477,8 +13590,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::StrPredicate { kind, haystack, needle } => {
                 use align_sema::hir::StrPredKind;
                 // Extract both `{ptr,len}` views; the runtime call + result shaping differ per kind.
-                let ha = self.operand(haystack)?.into_struct_value();
-                let ne = self.operand(needle)?.into_struct_value();
+                let ha = self.operand_by_value(haystack)?.into_struct_value();
+                let ne = self.operand_by_value(needle)?.into_struct_value();
                 let hp = self.builder.build_extract_value(ha, 0, "hp").map_err(|e| self.err(e))?;
                 let hl = self.builder.build_extract_value(ha, 1, "hl").map_err(|e| self.err(e))?;
                 let np = self.builder.build_extract_value(ne, 0, "np").map_err(|e| self.err(e))?;
@@ -15098,12 +15211,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .into()
             }
             Rvalue::SliceLen(op) => {
-                let agg = self.operand(op)?.into_struct_value();
-                self.builder.build_extract_value(agg, 1, "len").map_err(|e| self.err(e))?
+                if let Operand::BorrowedPlace(place) = op {
+                    self.borrowed_view_part(place, 1, "borrow.view.len")?
+                } else {
+                    let agg = self.operand(op)?.into_struct_value();
+                    self.builder.build_extract_value(agg, 1, "len").map_err(|e| self.err(e))?
+                }
             }
             Rvalue::SlicePtr(op) => {
-                let agg = self.operand(op)?.into_struct_value();
-                self.builder.build_extract_value(agg, 0, "ptr").map_err(|e| self.err(e))?
+                if let Operand::BorrowedPlace(place) = op {
+                    self.borrowed_view_part(place, 0, "borrow.view.ptr")?
+                } else {
+                    let agg = self.operand(op)?.into_struct_value();
+                    self.builder.build_extract_value(agg, 0, "ptr").map_err(|e| self.err(e))?
+                }
             }
             Rvalue::SliceIndex(s, idx) => {
                 let agg = self.operand(s)?.into_struct_value();
@@ -15273,7 +15394,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     Some(abi) => {
                         let mut v: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::with_capacity(args.len());
                         for (o, pa) in args.iter().zip(&abi.params) {
-                            let val = self.operand(o)?;
+                            let val = self.operand_by_value(o)?;
                             match pa {
                                 ParamAbi::Direct => v.push(val.into()),
                                 ParamAbi::ViewPtr => {
@@ -15306,8 +15427,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     }
                     None => args
                         .iter()
-                        .map(|o| self.operand(o).map(Into::into))
-                        .collect::<Result<_, _>>()?,
+                        .enumerate()
+                        .map(|(index, operand)| {
+                            let mode = declaration
+                                .signature
+                                .modes
+                                .get(index)
+                                .copied()
+                                .unwrap_or(align_ast::ParamMode::ByValue);
+                            Ok(self.operand_for_mode(operand, mode)?.into())
+                        })
+                        .collect::<Result<_, CodegenError>>()?,
                 };
                 let cs = self
                     .builder
@@ -15349,7 +15479,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .ok_or_else(|| callable_target_error(target))?;
                 let argv = args
                     .iter()
-                    .map(|operand| self.operand(operand).map(Into::into))
+                    .zip(&declaration.signature.modes)
+                    .map(|(operand, mode)| self.operand_for_mode(operand, *mode).map(Into::into))
                     .collect::<Result<Vec<BasicMetadataValueEnum<'c>>, _>>()?;
                 let returned = self
                     .builder
@@ -15505,8 +15636,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     )
                 }));
                 let mut argv: Vec<inkwell::values::BasicMetadataValueEnum> = vec![env.into()];
-                for o in args {
-                    argv.push(inkwell::values::BasicMetadataValueEnum::from(self.operand(o)?));
+                for (o, mode) in args.iter().zip(&signature.param_modes) {
+                    argv.push(inkwell::values::BasicMetadataValueEnum::from(
+                        self.operand_for_mode(o, *mode)?,
+                    ));
                 }
                 if *ret_ty == Ty::Unit {
                     // Align `()` functions use LLVM `void`, including their env-ABI fn-value
@@ -15557,7 +15690,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .collect::<Vec<BasicMetadataTypeEnum>>();
                 let argv = args
                     .iter()
-                    .map(|operand| self.operand(operand).map(Into::into))
+                    .zip(&signature.param_modes)
+                    .map(|(operand, mode)| self.operand_for_mode(operand, *mode).map(Into::into))
                     .collect::<Result<Vec<BasicMetadataValueEnum<'c>>, _>>()?;
                 if *ret_ty == Ty::Unit {
                     let fn_ty = self.ctx.void_type().fn_type(&param_meta, false);
@@ -15619,9 +15753,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         }),
                 );
                 let mut argv: Vec<inkwell::values::BasicMetadataValueEnum> = vec![env.into()];
-                for operand in args {
+                for (operand, mode) in args.iter().zip(&signature.param_modes) {
                     argv.push(inkwell::values::BasicMetadataValueEnum::from(
-                        self.operand(operand)?,
+                        self.operand_for_mode(operand, *mode)?,
                     ));
                 }
                 let return_ty = align_return_type(
@@ -17750,7 +17884,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// for every runtime call that takes a view as a `ptr`+`len` pair (`fs.write_file`, `fs.exists`,
     /// `fs.remove`, `fs.read_dir`, `fs.read_file_view` paths).
     fn split_str(&mut self, op: &Operand) -> Result<(BasicValueEnum<'c>, BasicValueEnum<'c>), CodegenError> {
-        let agg = self.operand(op)?.into_struct_value();
+        let agg = self.operand_by_value(op)?.into_struct_value();
         let ptr = self.builder.build_extract_value(agg, 0, "sv_ptr").map_err(|e| self.err(e))?;
         let len = self.builder.build_extract_value(agg, 1, "sv_len").map_err(|e| self.err(e))?;
         Ok((ptr, len))
@@ -18713,18 +18847,75 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .get(place.slot as usize)
             .copied()
             .ok_or_else(|| self.err(format!("borrowed place references missing slot {}", place.slot)))?;
-        for &field in &place.path {
-            let Ty::Struct(id) = ty else {
-                return Err(self.err("borrowed place field path crosses a non-struct type"));
+        for segment in &place.path {
+            ty = match segment {
+                align_sema::hir::BorrowedPathSegment::RootSlot => {
+                    return Err(self.err("borrowed place contains a non-leading root segment"));
+                }
+                align_sema::hir::BorrowedPathSegment::StructField(field) => {
+                    let Ty::Struct(id) = ty else {
+                        return Err(self.err("borrowed place field path crosses a non-struct type"));
+                    };
+                    self.structs
+                        .get(id as usize)
+                        .and_then(|definition| definition.fields.get(*field as usize))
+                        .map(|field| field.ty)
+                        .ok_or_else(|| self.err("borrowed place field path is out of bounds"))?
+                }
+                align_sema::hir::BorrowedPathSegment::EnumPayload {
+                    variant,
+                    payload_ordinal,
+                } => {
+                    let Ty::Enum(id) = ty else {
+                        return Err(self.err("borrowed place enum payload crosses a non-enum type"));
+                    };
+                    self.enums
+                        .get(id as usize)
+                        .and_then(|definition| definition.variants.get(*variant as usize))
+                        .and_then(|variant| variant.payload.get(*payload_ordinal as usize))
+                        .copied()
+                        .map(align_sema::scalar_to_ty)
+                        .ok_or_else(|| self.err("borrowed place enum payload is out of bounds"))?
+                }
+                align_sema::hir::BorrowedPathSegment::OptionSome => match ty {
+                    Ty::Option(payload) => align_sema::scalar_to_ty(payload),
+                    Ty::Tagged(id) => match self.tagged_defs.get(id as usize) {
+                        Some(align_sema::hir::TaggedType::Option(payload)) => {
+                            align_sema::scalar_to_ty(*payload)
+                        }
+                        _ => return Err(self.err("borrowed place Option projection has the wrong type")),
+                    },
+                    _ => return Err(self.err("borrowed place Option projection crosses a non-Option type")),
+                },
+                align_sema::hir::BorrowedPathSegment::ResultOk
+                | align_sema::hir::BorrowedPathSegment::ResultErr => match ty {
+                    Ty::Result(ok, err) => {
+                        if matches!(segment, align_sema::hir::BorrowedPathSegment::ResultOk) {
+                            align_sema::scalar_to_ty(ok)
+                        } else {
+                            align_sema::scalar_to_ty(err)
+                        }
+                    }
+                    Ty::Tagged(id) => match self.tagged_defs.get(id as usize) {
+                        Some(align_sema::hir::TaggedType::Result(ok, err)) => {
+                            if matches!(segment, align_sema::hir::BorrowedPathSegment::ResultOk) {
+                                align_sema::scalar_to_ty(*ok)
+                            } else {
+                                align_sema::scalar_to_ty(*err)
+                            }
+                        }
+                        _ => return Err(self.err("borrowed place Result projection has the wrong type")),
+                    },
+                    _ => return Err(self.err("borrowed place Result projection crosses a non-Result type")),
+                },
             };
-            ty = self
-                .structs
-                .get(id as usize)
-                .and_then(|definition| definition.fields.get(field as usize))
-                .map(|field| field.ty)
-                .ok_or_else(|| self.err("borrowed place field path is out of bounds"))?;
         }
-        if ty != place.ty {
+        let layout_retype = matches!((ty, place.ty),
+            (Ty::String, Ty::Str)
+                | (Ty::String, Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })))
+                | (Ty::Str, Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })))
+        );
+        if ty != place.ty && !layout_retype {
             return Err(self.err("borrowed place type disagrees with its field path"));
         }
         if place
@@ -18748,7 +18939,261 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 .copied()
                 .ok_or_else(|| self.err(format!("borrowed place references missing slot {}", place.slot)));
         }
-        self.field_path_ptr(place.slot, &place.path)
+        let mut ty = self
+            .f
+            .slots
+            .get(place.slot as usize)
+            .copied()
+            .ok_or_else(|| self.err(format!("borrowed place references missing slot {}", place.slot)))?;
+        let mut ptr = self
+            .slots
+            .get(&place.slot)
+            .copied()
+            .ok_or_else(|| self.err(format!("borrowed place references missing slot {}", place.slot)))?;
+        for segment in &place.path {
+            match segment {
+                align_sema::hir::BorrowedPathSegment::RootSlot => {
+                    return Err(self.err("borrowed place contains a non-leading root segment"));
+                }
+                align_sema::hir::BorrowedPathSegment::StructField(field) => {
+                    let Ty::Struct(id) = ty else {
+                        return Err(self.err("borrowed place field path crosses a non-struct type"));
+                    };
+                    let st = self
+                        .struct_types
+                        .get(id as usize)
+                        .copied()
+                        .ok_or_else(|| self.err("borrowed place struct id is out of bounds"))?;
+                    let definition = self
+                        .structs
+                        .get(id as usize)
+                        .ok_or_else(|| self.err("borrowed place struct id is out of bounds"))?;
+                    let field_ty = definition
+                        .fields
+                        .get(*field as usize)
+                        .map(|field| field.ty)
+                        .ok_or_else(|| self.err("borrowed place field path is out of bounds"))?;
+                    ptr = self
+                        .builder
+                        .build_struct_gep(
+                            st,
+                            ptr,
+                            self.checked_pfield(id, *field)?,
+                            "borrow.fld",
+                        )
+                        .map_err(|e| self.err(e))?;
+                    ty = field_ty;
+                }
+                align_sema::hir::BorrowedPathSegment::EnumPayload {
+                    variant,
+                    payload_ordinal,
+                } => {
+                    let Ty::Enum(id) = ty else {
+                        return Err(self.err("borrowed place enum payload crosses a non-enum type"));
+                    };
+                    let definition = self.enums.get(id as usize).ok_or_else(|| self.err("borrowed place enum id is out of bounds"))?;
+                    let variant_def = definition
+                        .variants
+                        .get(*variant as usize)
+                        .ok_or_else(|| self.err("borrowed place enum variant is out of bounds"))?;
+                    let payload = variant_def
+                        .payload
+                        .get(*payload_ordinal as usize)
+                        .copied()
+                        .ok_or_else(|| self.err("borrowed place enum payload is out of bounds"))?;
+                    let enum_ty = self
+                        .enum_types
+                        .get(id as usize)
+                        .copied()
+                        .ok_or_else(|| self.err("borrowed place enum id is out of bounds"))?;
+                    ptr = self
+                        .builder
+                        .build_struct_gep(
+                            enum_ty,
+                            ptr,
+                            variant_def.field_base + *payload_ordinal,
+                            "borrow.enum.payload",
+                        )
+                        .map_err(|e| self.err(e))?;
+                    ty = align_sema::scalar_to_ty(payload);
+                }
+                align_sema::hir::BorrowedPathSegment::OptionSome => {
+                    let (payload, option_ty) = match ty {
+                        Ty::Option(payload) => (payload, option_struct_type(self.ctx, payload, self.struct_types, self.enum_types, self.tagged_types)),
+                        Ty::Tagged(id) => match self.tagged_defs.get(id as usize) {
+                            Some(align_sema::hir::TaggedType::Option(payload)) => (*payload, option_struct_type(self.ctx, *payload, self.struct_types, self.enum_types, self.tagged_types)),
+                            _ => return Err(self.err("borrowed place Option projection has the wrong type")),
+                        },
+                        _ => return Err(self.err("borrowed place Option projection crosses a non-Option type")),
+                    };
+                    ptr = self.builder.build_struct_gep(option_ty, ptr, 1, "borrow.option.some").map_err(|e| self.err(e))?;
+                    ty = align_sema::scalar_to_ty(payload);
+                }
+                align_sema::hir::BorrowedPathSegment::ResultOk
+                | align_sema::hir::BorrowedPathSegment::ResultErr => {
+                    let (ok, err, result_ty) = match ty {
+                        Ty::Result(ok, err) => (ok, err, result_struct_type(self.ctx, ok, err, self.struct_types, self.enum_types, self.tagged_types)),
+                        Ty::Tagged(id) => match self.tagged_defs.get(id as usize) {
+                            Some(align_sema::hir::TaggedType::Result(ok, err)) => (*ok, *err, result_struct_type(self.ctx, *ok, *err, self.struct_types, self.enum_types, self.tagged_types)),
+                            _ => return Err(self.err("borrowed place Result projection has the wrong type")),
+                        },
+                        _ => return Err(self.err("borrowed place Result projection crosses a non-Result type")),
+                    };
+                    let is_ok = matches!(segment, align_sema::hir::BorrowedPathSegment::ResultOk);
+                    ptr = self
+                        .builder
+                        .build_struct_gep(result_ty, ptr, if is_ok { 1 } else { 2 }, "borrow.result.payload")
+                        .map_err(|e| self.err(e))?;
+                    ty = align_sema::scalar_to_ty(if is_ok { ok } else { err });
+                }
+            }
+        }
+        Ok(ptr)
+    }
+
+    /// Materialize a by-value read only at a consumer that explicitly requires an aggregate. A
+    /// borrowed match payload itself never uses this helper; tag tests, length/pointer reads, and
+    /// explicit string cloning use the projection pointer directly or load the selected leaf at
+    /// this seam.
+    fn operand_for_mode(
+        &self,
+        op: &Operand,
+        mode: align_ast::ParamMode,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
+        match mode {
+            align_ast::ParamMode::ByValue | align_ast::ParamMode::Out => self.operand_by_value(op),
+            align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut => {
+                self.operand_for_borrow(op)
+            }
+        }
+    }
+
+    fn operand_by_value(&self, op: &Operand) -> Result<BasicValueEnum<'c>, CodegenError> {
+        self.operand(op)
+    }
+
+    /// Materialize a borrowed argument in the ABI shape selected by its parameter mode. This is
+    /// deliberately separate from [`Self::operand`], whose normal expression contract is a
+    /// by-value read; a projection operand is a pointer only while crossing an explicit borrow
+    /// or borrow-mut call boundary.
+    fn operand_for_borrow(&self, op: &Operand) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let Operand::BorrowedPlace(place) = op else {
+            return self.operand(op);
+        };
+        let pointer = self.borrowed_place_ptr(place)?;
+        if let Some(cleanup) = place.cleanup {
+            let cleanup_pointer = self
+                .slots
+                .get(&cleanup)
+                .copied()
+                .ok_or_else(|| self.err(format!("borrowed cleanup slot {cleanup} is missing")))?;
+            let pair = self.ctx.struct_type(
+                &[
+                    self.ctx.ptr_type(AddressSpace::default()).into(),
+                    self.ctx.ptr_type(AddressSpace::default()).into(),
+                ],
+                false,
+            );
+            let with_pointer = self
+                .builder
+                .build_insert_value(pair.get_poison(), pointer, 0, "borrow.mut.pair.ptr")
+                .map_err(|error| self.err(error))?;
+            Ok(self
+                .builder
+                .build_insert_value(
+                    with_pointer,
+                    cleanup_pointer,
+                    1,
+                    "borrow.mut.pair.cleanup",
+                )
+                .map_err(|error| self.err(error))?
+                .into_struct_value()
+                .into())
+        } else {
+            Ok(pointer.into())
+        }
+    }
+
+    fn borrowed_view_part(
+        &self,
+        place: &align_mir::BorrowedPlace,
+        index: u32,
+        name: &str,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let ptr = self.borrowed_place_ptr(place)?;
+        let field = self
+            .builder
+            .build_struct_gep(slice_struct_type(self.ctx), ptr, index, name)
+            .map_err(|e| self.err(e))?;
+        let field_ty: BasicTypeEnum<'c> = if index == 0 {
+            self.ctx.ptr_type(AddressSpace::default()).into()
+        } else {
+            self.ctx.i64_type().into()
+        };
+        self.builder
+            .build_load(field_ty, field, name)
+            .map_err(|e| self.err(e))
+    }
+
+    fn borrowed_sum_tag(
+        &self,
+        place: &align_mir::BorrowedPlace,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let ptr = self.borrowed_place_ptr(place)?;
+        let ty = align_sema::expand_tagged_ty(place.ty, self.tagged_defs);
+        let (struct_ty, tag_ty): (inkwell::types::StructType<'c>, BasicTypeEnum<'c>) = match ty {
+            Ty::Option(payload) => (
+                option_struct_type(self.ctx, payload, self.struct_types, self.enum_types, self.tagged_types),
+                self.ctx.i8_type().into(),
+            ),
+            Ty::Result(ok, err) => (
+                result_struct_type(self.ctx, ok, err, self.struct_types, self.enum_types, self.tagged_types),
+                self.ctx.i8_type().into(),
+            ),
+            Ty::Enum(id) => (
+                self.enum_types
+                    .get(id as usize)
+                    .copied()
+                    .ok_or_else(|| self.err("borrowed sum enum id is out of bounds"))?,
+                self.ctx.i32_type().into(),
+            ),
+            _ => return Err(self.err("borrowed sum tag has a non-sum type")),
+        };
+        let tag_ptr = self
+            .builder
+            .build_struct_gep(struct_ty, ptr, 0, "borrow.sum.tag")
+            .map_err(|e| self.err(e))?;
+        self.builder
+            .build_load(tag_ty, tag_ptr, "borrow.sum.tag.load")
+            .map_err(|e| self.err(e))
+    }
+
+    fn validate_borrowed_enum_payload(
+        &self,
+        place: &align_mir::BorrowedPlace,
+        enum_id: u32,
+        variant: u32,
+        payload_ordinal: u32,
+        result_ty: Ty,
+    ) -> Result<(), CodegenError> {
+        let Ty::Enum(actual_id) = place.ty else {
+            return Err(self.err("borrowed enum payload has a non-enum input"));
+        };
+        if actual_id != enum_id {
+            return Err(self.err("borrowed enum payload enum id disagrees with its input"));
+        }
+        let payload = self
+            .enums
+            .get(enum_id as usize)
+            .and_then(|definition| definition.variants.get(variant as usize))
+            .and_then(|definition| definition.payload.get(payload_ordinal as usize))
+            .copied()
+            .map(align_sema::scalar_to_ty)
+            .ok_or_else(|| self.err("borrowed enum payload variant or ordinal is out of bounds"))?;
+        if payload != result_ty {
+            return Err(self.err("borrowed enum payload type disagrees with its result"));
+        }
+        Ok(())
     }
 
     /// Read an operand's LLVM value. **Fallible on purpose:** the two non-constant forms look the
@@ -18781,36 +19226,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 .ok_or_else(|| self.err(format!("parameter index {i} is out of range")))?,
             Operand::BorrowedPlace(place) => {
                 let pointer = self.borrowed_place_ptr(place)?;
-                if let Some(cleanup) = place.cleanup {
-                    let cleanup_pointer = self
-                        .slots
-                        .get(&cleanup)
-                        .copied()
-                        .ok_or_else(|| self.err(format!("borrowed cleanup slot {cleanup} is missing")))?;
-                    let pair = self.ctx.struct_type(
-                        &[
-                            self.ctx.ptr_type(AddressSpace::default()).into(),
-                            self.ctx.ptr_type(AddressSpace::default()).into(),
-                        ],
-                        false,
-                    );
-                    let with_pointer = self
-                        .builder
-                        .build_insert_value(pair.get_poison(), pointer, 0, "borrow.mut.pair.ptr")
-                        .map_err(|error| self.err(error))?;
-                    self.builder
-                        .build_insert_value(
-                            with_pointer,
-                            cleanup_pointer,
-                            1,
-                            "borrow.mut.pair.cleanup",
-                        )
-                        .map_err(|error| self.err(error))?
-                        .into_struct_value()
-                        .into()
-                } else {
-                    pointer.into()
-                }
+                self.builder
+                    .build_load(self.llvm_type(place.ty), pointer, "borrow.load")
+                    .map_err(|error| self.err(error))?
             }
             Operand::BorrowedCleanupArg(index) => {
                 let slot = *self
@@ -19364,6 +19782,64 @@ mod tests {
         let error = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
             .expect_err("a borrowed place with a forged type must fail closed");
         assert_lowering(error, "callable target invalid:696e7370656374");
+    }
+
+    #[test]
+    fn malformed_borrowed_sum_path_fails_before_llvm_gep() {
+        let mut program = mir(
+            "Content { Text(string), Empty }\n\
+             fn inspect(borrow value: Content) -> i64 = match value { Text(text) => text.len() Empty => 0 }\n\
+             fn main() -> i32 = 0\n",
+        );
+        let mut changed = false;
+        for function in &mut program.fns {
+            for block in &mut function.blocks {
+                for statement in &mut block.stmts {
+                    let Stmt::Let(
+                        _,
+                        Rvalue::EnumTagEq { scrutinee, .. },
+                    ) = statement
+                    else {
+                        continue;
+                    };
+                    if let Operand::BorrowedPlace(place) = scrutinee {
+                        place
+                            .path
+                            .insert(0, hir::BorrowedPathSegment::StructField(0));
+                        changed = true;
+                    }
+                }
+            }
+        }
+        assert!(changed, "fixture must contain the borrowed sum tag operand");
+        let error = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+            .expect_err("a forged borrowed sum path must fail closed before GEP construction");
+        assert_lowering(error, "borrowed place field path crosses a non-struct type");
+    }
+
+    #[test]
+    fn malformed_borrowed_sum_variant_fails_before_llvm_gep() {
+        let mut program = mir(
+            "Content { Text(string), Empty }\n\
+             fn inspect(borrow value: Content) -> i64 = match value { Text(text) => text.len() Empty => 0 }\n\
+             fn main() -> i32 = 0\n",
+        );
+        let mut changed = false;
+        for function in &mut program.fns {
+            for block in &mut function.blocks {
+                for statement in &mut block.stmts {
+                    let Stmt::Let(_, Rvalue::EnumTagEq { variant, .. }) = statement else {
+                        continue;
+                    };
+                    *variant = 99;
+                    changed = true;
+                }
+            }
+        }
+        assert!(changed, "fixture must contain the borrowed sum tag comparison");
+        let error = emit_llvm_ir(&program, &BuildTarget::Baseline, false, &[], None)
+            .expect_err("a forged borrowed sum variant must fail closed before GEP construction");
+        assert_lowering(error, "borrowed enum tag test has an invalid enum or variant");
     }
 
     #[test]

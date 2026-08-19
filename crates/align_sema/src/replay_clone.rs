@@ -113,6 +113,7 @@ fn clone_match_arm(clones: &mut ChildValues, arm: &hir::MatchArm) -> Option<hir:
     Some(hir::MatchArm {
         variants: arm.variants.clone(),
         bindings: arm.bindings.clone(),
+        borrowed_bindings: arm.borrowed_bindings.clone(),
         body: clones.expr()?,
     })
 }
@@ -377,9 +378,14 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             variant: *variant,
             payload: take_exprs(clones, payload.len())?,
         },
-        ExprKind::Match { scrutinee, arms } => ExprKind::Match {
+        ExprKind::Match {
+            scrutinee,
+            arms,
+            borrowed_place,
+        } => ExprKind::Match {
             scrutinee: boxed!(scrutinee),
             arms: clones.arms(arms.len())?,
+            borrowed_place: borrowed_place.clone(),
         },
         ExprKind::ResultMapErr { result, f } => ExprKind::ResultMapErr {
             result: boxed!(result),
@@ -1723,6 +1729,7 @@ fn drop_functions(fns: Vec<hir::Fn>) {
                     variants,
                     bindings,
                     body,
+                    ..
                 } = arm;
                 drop((variants, bindings));
                 work.push(DropWork::Expr(body));
@@ -2164,7 +2171,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::NamedArena { block, .. }
         | ExprKind::Unsafe(block) => block!(block),
         ExprKind::Loop { body, .. } => block!(body),
-        ExprKind::Match { scrutinee, arms } => {
+        ExprKind::Match { scrutinee, arms, .. } => {
             one!(scrutinee);
             arms!(arms);
         }

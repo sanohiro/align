@@ -700,7 +700,7 @@ fn walk_body_records<'a>(
                 ExprKind::Loop { body, .. } => {
                     work.push((BodyRecord::Block(body), child_depth));
                 }
-                ExprKind::Match { scrutinee, arms } => {
+                ExprKind::Match { scrutinee, arms, .. } => {
                     work.push((BodyRecord::Expr(scrutinee), child_depth));
                     work.extend(
                         arms.iter()
@@ -1386,8 +1386,10 @@ mod tests {
                     arms: vec![MatchArm {
                         variants: Vec::new(),
                         bindings: Vec::new(),
+                        borrowed_bindings: Vec::new(),
                         body: child,
                     }],
+                    borrowed_place: None,
                 },
                 2,
             ),
@@ -1885,11 +1887,13 @@ mod tests {
                         MatchArm {
                             variants: Vec::new(),
                             bindings: Vec::new(),
+                            borrowed_bindings: Vec::new(),
                             body: expression,
                         },
                         MatchArm {
                             variants: Vec::new(),
                             bindings: Vec::new(),
+                            borrowed_bindings: Vec::new(),
                             body: Expr {
                                 kind: ExprKind::StrBorrow(Box::new(Expr {
                                     kind: ExprKind::Local(0),
@@ -1901,6 +1905,7 @@ mod tests {
                             },
                         },
                     ],
+                    borrowed_place: None,
                 },
                 MoveControlShape::MatchSecond => ExprKind::Match {
                     scrutinee: Box::new(leaf()),
@@ -1908,6 +1913,7 @@ mod tests {
                         MatchArm {
                             variants: Vec::new(),
                             bindings: Vec::new(),
+                            borrowed_bindings: Vec::new(),
                             body: Expr {
                                 kind: ExprKind::StrBorrow(Box::new(Expr {
                                     kind: ExprKind::Local(0),
@@ -1921,17 +1927,21 @@ mod tests {
                         MatchArm {
                             variants: Vec::new(),
                             bindings: Vec::new(),
+                            borrowed_bindings: Vec::new(),
                             body: expression,
                         },
                     ],
+                    borrowed_place: None,
                 },
                 MoveControlShape::MatchScrutinee => ExprKind::Match {
                     scrutinee: Box::new(expression),
                     arms: vec![MatchArm {
                         variants: Vec::new(),
                         bindings: Vec::new(),
+                        borrowed_bindings: Vec::new(),
                         body: leaf(),
                     }],
+                    borrowed_place: None,
                 },
                 MoveControlShape::BlockLet => ExprKind::Block(Block {
                     stmts: vec![Stmt::Let {
@@ -2307,6 +2317,7 @@ mod tests {
                         borrow_fact_cache: std::cell::RefCell::new(None),
                         collecting_move_children: false,
                         move_children: Vec::new(),
+                        borrowed_projection_locals: crate::borrowed_projection_locals(&move_program.fns[0].body),
                     }
                     .check();
                     assert!(
@@ -2341,6 +2352,7 @@ mod tests {
                         allocation_regions: Vec::new(),
                         allocation_region_by_expr: std::collections::HashMap::new(),
                         region_capabilities: std::collections::HashMap::new(),
+                        borrowed_projection_locals: crate::borrowed_projection_locals(&function.body),
                         flow: crate::EscapeFlowCfg::new(),
                         flow_current: 0,
                         loop_exit_blocks: Vec::new(),

@@ -4606,8 +4606,10 @@ fn with_match_arm_body_depth(depth: usize) -> hir::Program {
                 arms: vec![hir::MatchArm {
                     variants: Vec::new(),
                     bindings: Vec::new(),
+                    borrowed_bindings: Vec::new(),
                     body: expr,
                 }],
+                borrowed_place: None,
             },
             ty: result_ty,
             span,
@@ -4782,14 +4784,17 @@ fn with_binary_match_body_depth(depth: usize) -> hir::Program {
                     hir::MatchArm {
                         variants: vec![1],
                         bindings: Vec::new(),
+                        borrowed_bindings: Vec::new(),
                         body: expr,
                     },
                     hir::MatchArm {
                         variants: Vec::new(),
                         bindings: Vec::new(),
+                        borrowed_bindings: Vec::new(),
                         body: default_body,
                     },
                 ],
+                borrowed_place: None,
             },
             ty,
             span,
@@ -6536,6 +6541,7 @@ fn hir_body_validator_accepts_structural_function_value_match_join() {
                 hir::MatchArm {
                     variants: vec![0],
                     bindings: Vec::new(),
+                    borrowed_bindings: Vec::new(),
                     body: body_test_expr(
                         hir::ExprKind::FnValue("noop".to_string()),
                         Ty::Fn(fn_one),
@@ -6544,12 +6550,14 @@ fn hir_body_validator_accepts_structural_function_value_match_join() {
                 hir::MatchArm {
                     variants: vec![1],
                     bindings: vec![1],
+                    borrowed_bindings: Vec::new(),
                     body: body_test_expr(
                         hir::ExprKind::FnValue("noop".to_string()),
                         Ty::Fn(fn_two),
                     ),
                 },
             ],
+            borrowed_place: None,
         },
         Ty::Fn(fn_one),
     );
@@ -7301,8 +7309,10 @@ fn hir_body_validator_expression_inventory() {
                 arms: vec![hir::MatchArm {
                     variants: Vec::new(),
                     bindings: Vec::new(),
+                    borrowed_bindings: Vec::new(),
                     body: body_test_expr(hir::ExprKind::Unit, Ty::Unit),
                 }],
+                borrowed_place: None,
             },
             Ty::Unit,
         ),
@@ -7463,14 +7473,17 @@ fn hir_body_validator_expression_inventory() {
                         hir::MatchArm {
                             variants: vec![0],
                             bindings: Vec::new(),
+                            borrowed_bindings: Vec::new(),
                             body: body_test_expr(hir::ExprKind::Int(1), integer),
                         },
                         hir::MatchArm {
                             variants: vec![1],
                             bindings: vec![0],
+                            borrowed_bindings: Vec::new(),
                             body: body_test_expr(hir::ExprKind::Bool(true), Ty::Bool),
                         },
                     ],
+                    borrowed_place: None,
                 },
                 integer,
             ),
