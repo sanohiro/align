@@ -201,8 +201,15 @@ the existing `EnumPayload` extraction in the selected arm; a borrowed-place scru
 checked `BorrowedProjection` path and projects the active payload pointer in place. The latter
 never emits an aggregate extraction, creates a Move binding cleanup bit, or nulls the source. The
 borrowed path is admitted only for the exact stable place and recursive payload grammar owned by
-`docs/impl/26-borrowed-sum-projection-plan.md`; malformed metadata fails validation rather than
-falling back to the owning extraction. Exhaustiveness is already guaranteed by typecheck (`03`).
+`docs/impl/26-borrowed-sum-projection-plan.md` and its ordinary dynamic-array extension in
+`docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; malformed metadata fails validation
+rather than falling back to the owning extraction. Exhaustiveness is already guaranteed by
+typecheck (`03`).
+
+An indexed Move element passed to an explicit shared-`borrow` parameter lowers as a checked dynamic
+element place: the base borrowed place, once-evaluated index operand, and exact element type. Bounds
+checking precedes element-address formation and the call. The unchanged borrowed ABI receives the
+element pointer; MIR never loads, moves, nulls, or assigns cleanup to the element.
 
 ---
 

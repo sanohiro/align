@@ -4045,15 +4045,16 @@ These are the common library-boundary mechanisms for native stateful packages, i
 The exact surface and compiler contract are in
 `impl/17-library-boundary-prerequisites.md` §§2–3.
 
-### Borrow-safe sum-payload matching — Settled 2026-08-18 (language prerequisite)
+### Borrow-safe sum and dynamic aggregate projection — Settled 2026-08-18; extended 2026-08-19
 
 An exhaustive `match` over a stable place whose exact root/path pair has a direct `borrow` or
 `borrow mut` fact may inspect an owned `Option<T>`, `Result<T,E>`, or user sum without consuming it;
 a descendant field fact never promotes an owning parent or mixed-provenance local. Borrowed mode
-admits Copy scalars/views, `string`, and finite acyclic structs and tagged values built recursively
-from those forms. Tuples, arrays, collections, resources, opaque handles, and other unsupported Move
-shapes retain the borrowed-place diagnostic. The tag and active admitted payload are read in place,
-and a non-Copy arm binding is a caller-owned read-only projection with the original static payload
+admits Copy scalars/views, `string`, ordinary dynamic scalar/AoS-record arrays, and finite acyclic
+structs and tagged values built recursively from those forms. Array elements obey the same closed
+grammar. Fixed and specialized arrays, tuples, other collections, resources, opaque handles, and
+other unsupported Move shapes retain the borrowed-place diagnostic. The tag and active admitted
+payload are read in place, and a non-Copy arm binding is a caller-owned read-only projection with the original static payload
 type, source owner generation, and no independent `Drop` or cleanup bit. Copy fields remain readable;
 an owned `string` leaf uses the existing non-consuming `str` path and may use the existing `.clone()`
 operation for an explicit owned copy. Aggregate and nested-sum clone operations are outside this
@@ -4064,11 +4065,20 @@ storing, capturing, sending, or consuming the whole non-Copy/Move payload is rej
 Copy/view matching retains its current result behavior, and views derived from an admitted payload
 use the existing return-borrow and region checks.
 
+The dynamic-aggregate extension also permits an indexed Move element of an admitted ordinary
+dynamic array only as the argument to an explicit shared-`borrow` parameter. Its base must be a
+stable local, borrowed/projection binding, or struct-field path; the index is evaluated once and
+bounds-checked before the callee receives the existing element address. The caller retains the
+array and element, no cleanup/allocation/transfer occurs, and a returned view is rooted in the array
+generation. By-value Move-element indexing, temporary/nested-index bases, and element `borrow mut`
+remain rejected.
+
 Owning-place matches retain their current Move extraction, source nulling, cleanup, `else`, `?`,
 branch, loop, and early-exit behavior. There is no new syntax, reference type, lifetime annotation,
 runtime representation, ABI field, allocation path, JSON exception, or package-specific API. The
-complete public contract, projection path, checked-HIR/MIR boundary, and closure matrix are in
-`docs/impl/26-borrowed-sum-projection-plan.md`.
+complete base contract and extension, projection paths, checked-HIR/MIR boundaries, and closure
+matrices are in `docs/impl/26-borrowed-sum-projection-plan.md` and
+`docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`.
 
 ### Exposing SIMD intrinsics in std
 In addition to auto-vectorization, whether to place explicit intrinsics in std (`impl/04-mir.md` §9).

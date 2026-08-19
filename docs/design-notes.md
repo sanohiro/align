@@ -292,10 +292,11 @@ not a package exemption, and it still rejects temporaries.
 must inspect an owned `Option`, `Result`, or user sum without taking it from its caller. A match over
 a stable place whose exact root/path pair is directly shared- or exclusively-borrowed reads the tag
 and active payload in place; a descendant field fact never promotes an owning parent. The new path
-admits Copy scalars/views, `string`, and finite acyclic structs and tagged values built recursively
-from those forms; arrays, collections, resources, opaque handles, and other unsupported Move shapes
-remain on the existing borrowed-place diagnostic. The arm binding is a read-only projection with the
-original static payload type, source generation, and no independent cleanup bit. Copy fields and
+admits Copy scalars/views, `string`, ordinary dynamic scalar/AoS-record arrays, and finite acyclic
+structs and tagged values built recursively from those forms; an array element obeys the same
+closed grammar. Fixed and specialized arrays, other collections, resources, opaque handles, and
+other unsupported Move shapes remain on the existing borrowed-place diagnostic. The arm binding is
+a read-only projection with the original static payload type, source generation, and no independent cleanup bit. Copy fields and
 borrowed text leaves remain cheap reads, while an owned text leaf can use the existing explicit
 `.clone()` operation. Aggregate and nested-sum clone operations are outside this capability. A
 borrowed arm binding is not a stable place for a nested borrowed `match`; that use is rejected
@@ -305,6 +306,16 @@ compiler projection over the existing flattened tagged layout preserves **Nothin
 a shallow Move aggregate copy, and leaves owning-place match, `else`, and `?` semantics unchanged.
 A package-specific wrapper or alternate error/result API would create a second ownership model, so
 the language capability is the correct boundary.
+
+**A borrowed Move array element is a call place, not a value.** Decoded artifact graphs store Move
+records in ordinary AoS dynamic arrays. Loading `rows[i]` by value would either copy one owner or
+require partial element transfer and cleanup, neither of which a read-only verifier intends. The
+general completion is narrower and explicit: `inspect(rows[i])` is accepted when `inspect` declares
+that parameter `borrow`, the base is a stable local/field/projection place, and the index is checked
+once before the call. LLVM passes the existing element address; no header/element owner, cleanup bit,
+or allocation is manufactured. Returned views retain the array generation. Keeping by-value and
+`borrow mut` element forms rejected preserves visible ownership and avoids a second partial-element
+state model.
 
 **Structured owned errors complete the existing tagged-value model.** A native library error
 needs owned message/detail fields because the foreign buffer dies at the call boundary, while a

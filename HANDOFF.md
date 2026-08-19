@@ -11,7 +11,11 @@ _Last updated: 2026-08-19._ Request 14's exclusive-create and no-replace publica
 merged in Align PR #861 at `3c2edd2f399c9e2c9551b4227c61b36d6a041e20`; its
 `c6f2-request14-adoption` real-client gate remains pending. Request 16's borrow-safe sum-payload match projection is merged in
 Align PR #857 at `8557c1525aefd9a4afef02d1ec5c2f88e16db4e4`; its
-`c6-borrowed-option-adoption` real-client gate remains pending. Request 7's signed merge verification (#848), decoded-owner cleanup
+`c6-borrowed-option-adoption` real-client gate exposed the next required boundary: array-bearing
+optional records and indexed Move record elements remain unreadable through shared borrow. Request
+17's general dynamic aggregate projection design is recorded in
+`docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; implementation and the exact C6c2
+adoption remain pending. Request 7's signed merge verification (#848), decoded-owner cleanup
 prerequisite (#849), and escaped-string language design and
 implementation (#850), following the trusted controller/verifier
 orchestration core (PR #842), the merge-race owners (PR #840) and
@@ -356,7 +360,8 @@ facts must live in this repository.
   Request 14 is `ALIGN_MERGED` through implementation PR #861, merged as
   `3c2edd2f399c9e2c9551b4227c61b36d6a041e20`; its align-llm adoption gate remains pending.
   Request 16 is `ALIGN_MERGED` through #857; its align-llm adoption gate remains
-  pending.
+  pending on Request 17. Request 17's dynamic aggregate projection design is settled in
+  `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; implementation is next.
 
 Consumer-gated deferrals that remain intentional:
 
@@ -435,6 +440,7 @@ Build performance track              docs/impl/21-build-perf-plan.md
 Owned declared JSON plan             docs/impl/24-owned-json-plan.md
 Recursive owned JSON plan            docs/impl/25-recursive-owned-json-plan.md
 Borrowed sum projection plan         docs/impl/26-borrowed-sum-projection-plan.md
+Borrowed dynamic aggregate plan      docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md
 Out-of-gate failure baseline         scripts/known-failures.txt
 Historical session journal           docs/archive/HANDOFF-2026-08-13.md
 Earlier session journal              docs/archive/HANDOFF-2026-07-25.md
