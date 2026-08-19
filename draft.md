@@ -356,14 +356,17 @@ behavior.
 An explicit shared-`borrow` call may take one indexed Move element from an ordinary dynamic scalar
 or AoS record array: `inspect(values[i])` is valid only when the selected direct, imported, or
 function-value target's corresponding parameter is `borrow` and `values` is a stable local,
-borrowed/projection binding, or struct-field path. The complete array root is reserved while the
-index is evaluated once in source order: an operation that might move, drop, replace, or mutably
-borrow an overlapping root is rejected, while unrelated mutation remains valid. MIR performs the
-existing bounds check before forming the element place or calling the target. The callee receives a
-pointer to caller-owned element storage. No element value, cleanup bit, allocation, or ownership
-transfer is created. A returned view or one retained through an existing `borrow mut` destination
-summary remains rooted in the array generation and contained region roots. By-value Move-element
-indexing, temporary-array bases, nested indexed bases, and element `borrow mut` remain rejected.
+borrowed/projection binding, or struct-field path. The complete array root is reserved from the
+once-only index evaluation through every later call argument and the call action: an operation that
+might move, drop, replace, transfer, or mutably borrow an overlapping root is rejected, while
+unrelated mutation remains valid. MIR performs the existing bounds check at the indexed argument's
+source position, retains no pointer while later arguments evaluate, and forms the element pointer
+only after every later argument falls through and the root is revalidated. A terminating later
+argument forms no pointer or call. The callee receives a pointer to caller-owned element storage.
+No element value, cleanup bit, allocation, or ownership transfer is created. A returned view or one
+retained through an existing `borrow mut` destination summary remains rooted in the array generation
+and contained region roots. By-value Move-element indexing, temporary-array bases, nested indexed
+bases, and element `borrow mut` remain rejected.
 
 ### Loop
 

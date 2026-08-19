@@ -201,11 +201,14 @@ existing consuming match behavior.
 An indexed Move element of an admitted ordinary dynamic array may be passed only to an explicit
 shared-`borrow` parameter selected by a direct, imported, or function-value call. The array base
 must be a stable local, borrowed/projection binding, or struct-field path. Its complete root is
-reserved while the index is evaluated once; any possibly overlapping move, Drop, replacement, or
-mutable borrow is rejected before MIR emits the existing bounds check and forms the element place.
-The element stays caller-owned, and a returned or mutably retained view remains rooted in the array
-generation and contained region roots. By-value Move-element indexing, temporary or nested-index
-bases, and element `borrow mut` remain rejected.
+reserved from once-only index evaluation through every later argument and the call action; any
+possibly overlapping move, Drop, replacement, transfer, or mutable borrow is rejected. MIR emits
+the existing bounds check at the indexed argument's source position, retains no pointer while later
+arguments evaluate, and forms the pointer only after every later argument falls through and the
+root is revalidated. A terminating later argument forms no pointer or call. The element stays
+caller-owned, and a returned or mutably retained view remains rooted in the array generation and
+contained region roots. By-value Move-element indexing, temporary or nested-index bases, and
+element `borrow mut` remain rejected.
 
 ```align
 area := match s {
@@ -327,9 +330,11 @@ borrow summary and region checks, while existing Copy/view matching retains its 
 
 An indexed Move element is a stable call place only for an explicit shared-`borrow` parameter on a
 direct, imported, or function-value target and a stable ordinary dynamic-array base. The base root
-cannot be invalidated during once-only index evaluation. MIR checks bounds before place formation.
-The element remains caller-owned, and returned or mutably retained views retain the array's
-generation and contained region roots. By-value and mutable element forms remain unsupported.
+cannot be invalidated during once-only index evaluation, any later argument, or the call action.
+MIR checks bounds at the indexed argument position, revalidates the root after later arguments, and
+forms the pointer only at the call. The element remains caller-owned, and returned or mutably
+retained views retain the array's generation and contained region roots. By-value and mutable
+element forms remain unsupported.
 
 One restriction applies to `if` today: a value-carrying `if`/`else` **expression** cannot move an
 already-bound owned local out of an arm (`c := if n > 2 { a } else { … }` is rejected, and so are

@@ -208,13 +208,15 @@ typecheck (`03`).
 
 An indexed Move element passed to an explicit shared-`borrow` parameter lowers as a checked dynamic
 element place through direct, imported, and indirect targets: the base borrowed place,
-once-evaluated index operand, and exact element type. The source root is reserved across index
-evaluation, so no possibly overlapping move, Drop, replacement, or mutable borrow can invalidate
-it. MIR emits the existing bounds-failure CFG after index evaluation and forms the element place
-only in the success block; validation requires that exact guard to dominate every use. The
-unchanged borrowed ABI receives the element pointer. LLVM only lowers that guarded place to pointer
-arithmetic; it does not decide bounds semantics. MIR never loads, moves, nulls, or assigns cleanup
-to the element.
+once-evaluated index operand, and exact element type. The source root is reserved from index
+evaluation through every later argument and the call action, so no possibly overlapping move, Drop,
+replacement, transfer, or mutable borrow can invalidate it. MIR emits the existing bounds-failure
+CFG at the indexed argument position and carries only a guarded place descriptor through later
+argument evaluation. Validation requires that exact guard to dominate the call use and requires
+every intervening fallthrough path to preserve the root; a terminating later argument has no place
+use or call. The unchanged borrowed ABI receives the element pointer. LLVM forms that pointer only
+while lowering the call; it does not decide bounds semantics. MIR never loads, moves, nulls, or
+assigns cleanup to the element.
 
 ---
 
