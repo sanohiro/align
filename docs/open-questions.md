@@ -4066,12 +4066,15 @@ Copy/view matching retains its current result behavior, and views derived from a
 use the existing return-borrow and region checks.
 
 The dynamic-aggregate extension also permits an indexed Move element of an admitted ordinary
-dynamic array only as the argument to an explicit shared-`borrow` parameter. Its base must be a
-stable local, borrowed/projection binding, or struct-field path; the index is evaluated once and
-bounds-checked before the callee receives the existing element address. The caller retains the
-array and element, no cleanup/allocation/transfer occurs, and a returned view is rooted in the array
-generation. By-value Move-element indexing, temporary/nested-index bases, and element `borrow mut`
-remain rejected.
+dynamic array only as the argument to an explicit shared-`borrow` parameter on a direct, imported,
+or function-value target. Its base must be a stable local, borrowed/projection binding, or
+struct-field path. The complete source root is reserved while the index is evaluated once; a move,
+Drop, replacement, or mutable borrow that might overlap it is rejected, while unrelated mutation
+remains valid. MIR emits the existing bounds failure before the callee receives the element
+address. The caller retains the array and element, no cleanup/allocation/transfer occurs, and a
+returned or mutably retained view is rooted in the array generation and contained region roots.
+By-value Move-element indexing, temporary/nested-index bases, and element `borrow mut` remain
+rejected.
 
 Owning-place matches retain their current Move extraction, source nulling, cleanup, `else`, `?`,
 branch, loop, and early-exit behavior. There is no new syntax, reference type, lifetime annotation,

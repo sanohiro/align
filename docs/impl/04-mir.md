@@ -207,9 +207,14 @@ rather than falling back to the owning extraction. Exhaustiveness is already gua
 typecheck (`03`).
 
 An indexed Move element passed to an explicit shared-`borrow` parameter lowers as a checked dynamic
-element place: the base borrowed place, once-evaluated index operand, and exact element type. Bounds
-checking precedes element-address formation and the call. The unchanged borrowed ABI receives the
-element pointer; MIR never loads, moves, nulls, or assigns cleanup to the element.
+element place through direct, imported, and indirect targets: the base borrowed place,
+once-evaluated index operand, and exact element type. The source root is reserved across index
+evaluation, so no possibly overlapping move, Drop, replacement, or mutable borrow can invalidate
+it. MIR emits the existing bounds-failure CFG after index evaluation and forms the element place
+only in the success block; validation requires that exact guard to dominate every use. The
+unchanged borrowed ABI receives the element pointer. LLVM only lowers that guarded place to pointer
+arithmetic; it does not decide bounds semantics. MIR never loads, moves, nulls, or assigns cleanup
+to the element.
 
 ---
 

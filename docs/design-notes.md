@@ -310,12 +310,15 @@ the language capability is the correct boundary.
 **A borrowed Move array element is a call place, not a value.** Decoded artifact graphs store Move
 records in ordinary AoS dynamic arrays. Loading `rows[i]` by value would either copy one owner or
 require partial element transfer and cleanup, neither of which a read-only verifier intends. The
-general completion is narrower and explicit: `inspect(rows[i])` is accepted when `inspect` declares
-that parameter `borrow`, the base is a stable local/field/projection place, and the index is checked
-once before the call. LLVM passes the existing element address; no header/element owner, cleanup bit,
-or allocation is manufactured. Returned views retain the array generation. Keeping by-value and
-`borrow mut` element forms rejected preserves visible ownership and avoids a second partial-element
-state model.
+general completion is narrower and explicit: `inspect(rows[i])` is accepted when the selected
+direct, imported, or function-value target declares that parameter `borrow`, the base is a stable
+local/field/projection place, and its root is reserved across once-only index evaluation. A
+same-root move, Drop, replacement, or mutable borrow during that evaluation rejects; unrelated
+mutation remains valid. MIR emits the bounds-failure branch before the element place, and LLVM only
+passes the guarded existing address. No header/element owner, cleanup bit, or allocation is
+manufactured. Returned views and views retained through existing `borrow mut` summaries retain the
+array generation and contained region roots. Keeping by-value and `borrow mut` element forms
+rejected preserves visible ownership and avoids a second partial-element state model.
 
 **Structured owned errors complete the existing tagged-value model.** A native library error
 needs owned message/detail fields because the foreign buffer dies at the call boundary, while a
