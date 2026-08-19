@@ -1,6 +1,6 @@
 # Borrow-safe sum-payload match projection
 
-Status: **IMPLEMENTED; owner regressions complete; publication pending.**
+Status: **IMPLEMENTED; owner regressions complete; merged in Align PR #857; align-llm adoption pending.**
 
 This document is the design and implementation plan for read-only matching of an owned
 `Option<T>`, `Result<T, E>`, or user sum through a stable borrowed place. It closes the general

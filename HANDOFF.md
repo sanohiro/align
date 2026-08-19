@@ -7,7 +7,9 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-18._ Request 7's signed merge verification (#848), decoded-owner cleanup
+_Last updated: 2026-08-19._ Request 16's borrow-safe sum-payload match projection is merged in
+Align PR #857 at `8557c1525aefd9a4afef02d1ec5c2f88e16db4e4`; its
+`c6-borrowed-option-adoption` real-client gate remains pending. Request 7's signed merge verification (#848), decoded-owner cleanup
 prerequisite (#849), and escaped-string language design and
 implementation (#850), following the trusted controller/verifier
 orchestration core (PR #842), the merge-race owners (PR #840) and
@@ -290,7 +292,8 @@ required `Post-open review` status passed. The branch policy required
 The Request 13 entry in `../align-llm/docs/align-requests.md` now records
 `ALIGN_MERGED`, PR #854, and the merge commit; that sibling edit remains
 intentionally uncommitted. The required `cargo build --release --workspace`
-also passed. Do not start Request 14.
+also passed. Request 14 is the next planned capability; begin with its public-contract ledger
+and independent design review before implementation.
 
 ## Start here
 
@@ -328,7 +331,9 @@ facts must live in this repository.
   against `docs/impl/24-owned-json-plan.md`. Request 13's recursive owned-JSON implementation is
   merged through PR #854 as `340a3304724fefb56c2b1aa642e6b2b2c169e6d7` against
   `docs/impl/25-recursive-owned-json-plan.md`; its align-llm adoption gate remains pending.
-  Request 14 remains proposed in `../align-llm/docs/align-requests.md`.
+  Request 14 remains proposed in `../align-llm/docs/align-requests.md`; it is the next planned
+  Align capability. Request 16 is `ALIGN_MERGED` through #857; its align-llm adoption gate remains
+  pending.
 
 Consumer-gated deferrals that remain intentional:
 
@@ -406,6 +411,7 @@ Runtime ABI ledger                   docs/impl/20-runtime-abi-ledger.md
 Build performance track              docs/impl/21-build-perf-plan.md
 Owned declared JSON plan             docs/impl/24-owned-json-plan.md
 Recursive owned JSON plan            docs/impl/25-recursive-owned-json-plan.md
+Borrowed sum projection plan         docs/impl/26-borrowed-sum-projection-plan.md
 Out-of-gate failure baseline         scripts/known-failures.txt
 Historical session journal           docs/archive/HANDOFF-2026-08-13.md
 Earlier session journal              docs/archive/HANDOFF-2026-07-25.md
