@@ -9,7 +9,7 @@
 > **ステータス:** Request 14 は 2026-08-19 に実装済み（設計 PR #859 は
 > `a21eb8416f2088df68026f10c63a38cd0bd65538`、実装 PR #861 は
 > `3c2edd2f399c9e2c9551b4227c61b36d6a041e20` として merge）。align-llm の adoption gate は未完了。
-> Request 18 の retained-root regular-file access は承認済み設計で、実装は開始していない。
+> Request 18 の retained-root regular-file access は実装済みで、align-llm の adoption gate は未完了。
 
 ## 概要
 

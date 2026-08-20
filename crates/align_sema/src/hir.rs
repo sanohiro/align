@@ -1066,6 +1066,13 @@ pub enum ExprKind {
     /// `fs.open(path)` — open `path` (a `str`) for reading; the `ty` is `Result<reader, Error>`. The
     /// returned `reader` owns its fd (closed on `Drop`). Impure (touches the filesystem).
     ReaderOpen { path: Box<Expr> },
+    /// `fs.open_beneath(root, relative)` — open a regular file below one retained directory
+    /// without following root, intermediate, or final symlinks. Both paths are borrowed for the
+    /// call; the `ty` is `Result<reader, Error>` and the returned reader owns its fd. Impure.
+    ReaderOpenBeneath {
+        root: Box<Expr>,
+        relative: Box<Expr>,
+    },
     /// `io.stdout` / `io.stderr` / `io.stdout.buffered()` — a `writer` over a standard-stream fd
     /// (`fd`: 1 = stdout, 2 = stderr), `buffered` selecting the O(buffer) accumulator ("one type,
     /// many constructors"). The `ty` is [`crate::Ty::Writer`] (an owned Move handle; its fd is
@@ -1079,6 +1086,13 @@ pub enum ExprKind {
     /// existing final entry; the `ty` is `Result<writer, Error>`. The returned `writer` owns its
     /// fd (flushed + closed on `Drop`). Impure.
     CreateExclusive { path: Box<Expr> },
+    /// `fs.create_exclusive_beneath(root, relative)` — atomically create a new regular file below
+    /// one retained directory without following symlinks. Both paths are borrowed for the call;
+    /// the `ty` is `Result<writer, Error>` and the returned writer owns its fd. Impure.
+    CreateExclusiveBeneath {
+        root: Box<Expr>,
+        relative: Box<Expr>,
+    },
     /// `r.read(b: mut buffer)` — read up to `b`'s capacity into `b` (overwriting its length),
     /// borrowing both `reader` and `buffer` (neither consumed). The `ty` is `Result<i64, Error>`
     /// (bytes read; `0` = EOF). Impure.

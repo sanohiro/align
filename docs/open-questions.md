@@ -2741,7 +2741,7 @@ ABI boundary, platform floor, and closure matrix are authoritative in
 `docs/impl/27-fs-exclusive-publication-plan.md` and `docs/impl/std-design/fs.md`. The implementation
 shipped in PR #861; M9 remains closed.
 
-### Request 18 — retained-root regular-file access (DESIGN SETTLED 2026-08-20; implementation pending)
+### Request 18 — retained-root regular-file access (IMPLEMENTED 2026-08-20; adoption pending)
 
 `std.fs` adds
 `fs.open_beneath(root: str, relative: str) -> Result<reader, Error>` and
@@ -2765,8 +2765,8 @@ regular inode while its writer remains live, so immutable-input consumers must r
 The exact grammar, validation precedence, A12 ABI rows, race semantics, platform boundary,
 implementation closure matrix, and
 real-client owner are authoritative in `docs/impl/29-fs-retained-root-plan.md` and
-`docs/impl/std-design/fs.md`. Implementation starts only after this independently reviewed design
-merges; M9 remains closed.
+`docs/impl/std-design/fs.md`. The independently reviewed design and the complete compiler/runtime
+capability are shipped; real-client adoption remains next and M9 remains closed.
 
 ### M10 scope decision (2026-07-04)
 

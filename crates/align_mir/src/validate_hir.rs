@@ -3879,9 +3879,11 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::FsReadFile { .. }
             | hir::ExprKind::ReaderStdin
             | hir::ExprKind::ReaderOpen { .. }
+            | hir::ExprKind::ReaderOpenBeneath { .. }
             | hir::ExprKind::WriterStd { .. }
             | hir::ExprKind::WriterCreate { .. }
             | hir::ExprKind::CreateExclusive { .. }
+            | hir::ExprKind::CreateExclusiveBeneath { .. }
             | hir::ExprKind::ReaderRead { .. }
             | hir::ExprKind::ReaderBuffered { .. }
             | hir::ExprKind::ReaderReadLine { .. }
@@ -4203,8 +4205,10 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::FsReadFile { .. }
             | hir::ExprKind::ReaderStdin
             | hir::ExprKind::ReaderOpen { .. }
+            | hir::ExprKind::ReaderOpenBeneath { .. }
             | hir::ExprKind::WriterCreate { .. }
             | hir::ExprKind::CreateExclusive { .. }
+            | hir::ExprKind::CreateExclusiveBeneath { .. }
             | hir::ExprKind::ReaderRead { .. }
             | hir::ExprKind::ReaderBuffered { .. }
             | hir::ExprKind::ReaderReadLine { .. }
@@ -7623,6 +7627,9 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::ReaderOpen { path } => {
                 (path.ty == Ty::Str).then(|| result(Ty::Reader, &[path.as_ref()]))?
             }
+            hir::ExprKind::ReaderOpenBeneath { root, relative } => (root.ty == Ty::Str
+                && relative.ty == Ty::Str)
+                .then(|| result(Ty::Reader, &[root, relative]))?,
             hir::ExprKind::WriterStd { fd, .. } => {
                 (matches!(*fd, 1 | 2) && expression.ty == Ty::Writer)
                     .then_some((Ty::Writer, true, Vec::new()))
@@ -7633,6 +7640,9 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::CreateExclusive { path } => {
                 (path.ty == Ty::Str).then(|| result(Ty::Writer, &[path.as_ref()]))?
             }
+            hir::ExprKind::CreateExclusiveBeneath { root, relative } => (root.ty == Ty::Str
+                && relative.ty == Ty::Str)
+                .then(|| result(Ty::Writer, &[root, relative]))?,
             hir::ExprKind::ReaderRead { reader, buffer } => {
                 if !self.reader_place(reader, context)
                     || !mutable_local(buffer, Ty::Buffer)

@@ -12971,6 +12971,12 @@ impl EffectScan<'_> {
                 walk!(destination);
                 self.impure_direct = true;
             }
+            ExprKind::ReaderOpenBeneath { root, relative }
+            | ExprKind::CreateExclusiveBeneath { root, relative } => {
+                walk!(root);
+                walk!(relative);
+                self.impure_direct = true;
+            }
             // `dns.resolve(host)` is impure (a name-resolution syscall) — excluded from `par_map`.
             ExprKind::DnsResolve { host } => {
                 walk!(host);
@@ -16766,9 +16772,11 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::FsReadFile { .. }
             | ExprKind::ReaderStdin
             | ExprKind::ReaderOpen { .. }
+            | ExprKind::ReaderOpenBeneath { .. }
             | ExprKind::WriterStd { .. }
             | ExprKind::WriterCreate { .. }
             | ExprKind::CreateExclusive { .. }
+            | ExprKind::CreateExclusiveBeneath { .. }
             | ExprKind::ReaderRead { .. }
             | ExprKind::ReaderReadLine { .. }
             | ExprKind::WriterWrite { .. }
@@ -17155,9 +17163,11 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::FsReadFile { .. }
             | ExprKind::ReaderStdin
             | ExprKind::ReaderOpen { .. }
+            | ExprKind::ReaderOpenBeneath { .. }
             | ExprKind::WriterStd { .. }
             | ExprKind::WriterCreate { .. }
             | ExprKind::CreateExclusive { .. }
+            | ExprKind::CreateExclusiveBeneath { .. }
             | ExprKind::ReaderRead { .. }
             | ExprKind::ReaderBuffered { .. }
             | ExprKind::ReaderReadLine { .. }
@@ -18762,6 +18772,11 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::RenameNoReplace { source, destination } => {
                 self.walk(source, depth);
                 self.walk(destination, depth);
+            }
+            ExprKind::ReaderOpenBeneath { root, relative }
+            | ExprKind::CreateExclusiveBeneath { root, relative } => {
+                self.walk(root, depth);
+                self.walk(relative, depth);
             }
             ExprKind::DnsResolve { host } => self.walk(host, depth),
             ExprKind::TcpConnect { host, port } => {
@@ -22134,7 +22149,9 @@ impl<'a> MoveCheck<'a> {
             //   the escape check enforces via `region_of`; `OptionNone` carries no payload.
             ExprKind::Str(..) | ExprKind::FnValue(..) | ExprKind::OptionNone
             | ExprKind::ConstArray { .. } | ExprKind::ReaderStdin | ExprKind::ReaderOpen { .. }
+            | ExprKind::ReaderOpenBeneath { .. }
             | ExprKind::WriterStd { .. } | ExprKind::WriterCreate { .. } | ExprKind::CreateExclusive { .. }
+            | ExprKind::CreateExclusiveBeneath { .. }
             | ExprKind::FsReadFileView { .. }
             | ExprKind::FsReadBytesView { .. } => BorrowRoots::new(),
             // (2) Results whose type never borrows (scalars, `Unit`, freshly owned `string` /
@@ -26679,6 +26696,11 @@ impl<'a> MoveCheck<'a> {
             ExprKind::RenameNoReplace { source, destination } => {
                 move_expr!(self, source, moved, false, false);
                 move_expr!(self, destination, moved, false, false);
+            }
+            ExprKind::ReaderOpenBeneath { root, relative }
+            | ExprKind::CreateExclusiveBeneath { root, relative } => {
+                move_expr!(self, root, moved, false, false);
+                move_expr!(self, relative, moved, false, false);
             }
             // `dns.resolve(host)` borrows its `str` host (never consumed).
             ExprKind::DnsResolve { host } => move_expr!(self, host, moved, false, false),
@@ -32388,6 +32410,12 @@ impl<'a, 't> Checker<'a, 't> {
             if module == "fs" && method == "create_exclusive" {
                 self.require_import("std.fs", "fs.create_exclusive", span);
                 return self.check_fs_create_exclusive(args, span);
+            }
+            // Descriptor-relative regular-file constructors rooted at one retained directory.
+            if module == "fs" && (method == "open_beneath" || method == "create_exclusive_beneath")
+            {
+                self.require_import("std.fs", &format!("fs.{method}"), span);
+                return self.check_fs_beneath(method == "create_exclusive_beneath", args, span);
             }
             // `fs.create_rw(path)` (O_RDWR|O_CREAT|O_TRUNC) / `fs.open_rw(path)` (O_RDWR, must exist)
             // -> Result<file, Error> — the offset-addressed block I/O handle (A4).
@@ -40492,6 +40520,62 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    /// `fs.open_beneath(root, relative)` / `fs.create_exclusive_beneath(root, relative)`.
+    /// Both operands are checked in source order even when the first is invalid. A malformed
+    /// operand never enters checked HIR as one of these operations.
+    fn check_fs_beneath(&mut self, create: bool, args: &[ast::Expr], span: Span) -> Expr {
+        let name = if create {
+            "fs.create_exclusive_beneath"
+        } else {
+            "fs.open_beneath"
+        };
+        if args.len() != 2 {
+            self.diags.error(
+                format!(
+                    "'{name}' expects 2 arguments (the root and relative path), got {}",
+                    args.len()
+                ),
+                span,
+            );
+            return Expr {
+                kind: ExprKind::Bool(false),
+                ty: Ty::Error,
+                span,
+            };
+        }
+        let root = self.check_str_init(&args[0]);
+        let relative = self.check_str_init(&args[1]);
+        if root.ty != Ty::Str || relative.ty != Ty::Str {
+            return Expr {
+                kind: ExprKind::Bool(false),
+                ty: Ty::Error,
+                span,
+            };
+        }
+        let (kind, ok) = if create {
+            (
+                ExprKind::CreateExclusiveBeneath {
+                    root: Box::new(root),
+                    relative: Box::new(relative),
+                },
+                Scalar::Writer,
+            )
+        } else {
+            (
+                ExprKind::ReaderOpenBeneath {
+                    root: Box::new(root),
+                    relative: Box::new(relative),
+                },
+                Scalar::Reader,
+            )
+        };
+        Expr {
+            kind,
+            ty: Ty::Result(ok, Scalar::Enum(self.error_enum_id)),
+            span,
+        }
+    }
+
     /// `fs.rename_no_replace(source, destination)` -> `Result<(), Error>`. Both paths are
     /// borrowed for the single native no-replace directory-entry operation.
     fn check_fs_rename_no_replace(&mut self, args: &[ast::Expr], span: Span) -> Expr {
@@ -45287,6 +45371,11 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::RenameNoReplace { source, destination } => {
                 self.finalize_expr(source);
                 self.finalize_expr(destination);
+            }
+            ExprKind::ReaderOpenBeneath { root, relative }
+            | ExprKind::CreateExclusiveBeneath { root, relative } => {
+                self.finalize_expr(root);
+                self.finalize_expr(relative);
             }
             ExprKind::DnsResolve { host } => self.finalize_expr(host),
             ExprKind::TcpConnect { host, port } => {

@@ -14147,10 +14147,25 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::FsReadFile { path, out } => self.gen_fs_read_file(path, *out)?,
             // fs.open / fs.create — write the handle into `out`, return an i32 errno-status.
             Rvalue::ReaderOpen { path, out } => self.gen_open_handle(RuntimeKey::IoReaderOpen, path, *out)?,
+            Rvalue::ReaderOpenBeneath {
+                root,
+                relative,
+                out,
+            } => self.gen_beneath_handle(RuntimeKey::IoReaderOpenBeneath, root, relative, *out)?,
             Rvalue::WriterCreate { path, out } => self.gen_open_handle(RuntimeKey::IoWriterCreate, path, *out)?,
             Rvalue::WriterCreateExclusive { path, out } => {
                 self.gen_open_handle(RuntimeKey::IoWriterCreateExclusive, path, *out)?
             }
+            Rvalue::WriterCreateExclusiveBeneath {
+                root,
+                relative,
+                out,
+            } => self.gen_beneath_handle(
+                RuntimeKey::IoWriterCreateExclusiveBeneath,
+                root,
+                relative,
+                *out,
+            )?,
             // All A4 `file` rvalues (create_rw/open_rw + pread/pwrite/len) go through ONE
             // `#[inline(never)]` helper, so `gen_rvalue` gains a single tiny arm rather than five inline
             // bodies — `gen_rvalue` is depth-recursive (via operand materialization), so keeping its
@@ -18259,6 +18274,60 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .build_call(self.runtime(key), &[p_ptr.into(), p_len.into(), out_ptr.into()], "open")
             .map_err(|e| self.err(e))?;
         Ok(cs.try_as_basic_value().basic().expect("open returns i32 status"))
+    }
+
+    /// Descriptor-relative two-path constructor. Evaluate and unpack root before relative, then
+    /// call the A12 runtime row `(ptr, i64, ptr, i64, ptr) -> i32`.
+    fn gen_beneath_handle(
+        &mut self,
+        key: RuntimeKey,
+        root: &Operand,
+        relative: &Operand,
+        out: Slot,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let out_ptr = self.slots[&out];
+        self.builder
+            .build_store(
+                out_ptr,
+                self.ctx.ptr_type(AddressSpace::default()).const_null(),
+            )
+            .map_err(|e| self.err(e))?;
+        let root = self.operand(root)?.into_struct_value();
+        let root_ptr = self
+            .builder
+            .build_extract_value(root, 0, "root_p")
+            .map_err(|e| self.err(e))?;
+        let root_len = self
+            .builder
+            .build_extract_value(root, 1, "root_l")
+            .map_err(|e| self.err(e))?;
+        let relative = self.operand(relative)?.into_struct_value();
+        let relative_ptr = self
+            .builder
+            .build_extract_value(relative, 0, "relative_p")
+            .map_err(|e| self.err(e))?;
+        let relative_len = self
+            .builder
+            .build_extract_value(relative, 1, "relative_l")
+            .map_err(|e| self.err(e))?;
+        let status = self
+            .builder
+            .build_call(
+                self.runtime(key),
+                &[
+                    root_ptr.into(),
+                    root_len.into(),
+                    relative_ptr.into(),
+                    relative_len.into(),
+                    out_ptr.into(),
+                ],
+                "open_beneath",
+            )
+            .map_err(|e| self.err(e))?;
+        Ok(status
+            .try_as_basic_value()
+            .basic()
+            .expect("open_beneath returns i32 status"))
     }
 
     /// Read a display operand as an integer, reporting a compiler error instead of panicking when

@@ -874,8 +874,16 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         },
         ExprKind::FsReadFile { path } => ExprKind::FsReadFile { path: boxed!(path) },
         ExprKind::ReaderOpen { path } => ExprKind::ReaderOpen { path: boxed!(path) },
+        ExprKind::ReaderOpenBeneath { root, relative } => ExprKind::ReaderOpenBeneath {
+            root: boxed!(root),
+            relative: boxed!(relative),
+        },
         ExprKind::WriterCreate { path } => ExprKind::WriterCreate { path: boxed!(path) },
         ExprKind::CreateExclusive { path } => ExprKind::CreateExclusive { path: boxed!(path) },
+        ExprKind::CreateExclusiveBeneath { root, relative } => ExprKind::CreateExclusiveBeneath {
+            root: boxed!(root),
+            relative: boxed!(relative),
+        },
         ExprKind::ReaderRead { reader, buffer } => ExprKind::ReaderRead {
             reader: boxed!(reader),
             buffer: boxed!(buffer),
@@ -1940,6 +1948,14 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::RenameNoReplace {
             source: lhs,
             destination: rhs,
+        }
+        | ExprKind::ReaderOpenBeneath {
+            root: lhs,
+            relative: rhs,
+        }
+        | ExprKind::CreateExclusiveBeneath {
+            root: lhs,
+            relative: rhs,
         }
         | ExprKind::TcpConnect {
             host: lhs,

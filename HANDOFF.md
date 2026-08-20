@@ -7,10 +7,9 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-20._ Request 18's retained-root regular-file constructors have an accepted
-design in
-`docs/impl/29-fs-retained-root-plan.md` to unblock align-llm C6d; implementation has not started and
-begins after that independently reviewed design merges. Request 16's sum-payload projection and
+_Last updated: 2026-08-20._ Request 18's retained-root regular-file constructors are implemented
+against the accepted design in `docs/impl/29-fs-retained-root-plan.md`; align-llm C6d adoption is
+next. Request 16's sum-payload projection and
 Request 17's
 dynamic aggregate projection are implemented and real-client verified by align-llm PR #98 at
 `e44b3cca9f834266d6f541d7a68eec2b2c3de9ec`, pinned to this Align revision; C6c2 is complete.
@@ -363,7 +362,7 @@ facts must live in this repository.
   Request 16 is `ALIGN_LLM_VERIFIED` through Align #857 and align-llm #98. Request 17's dynamic
   aggregate projection implementation is merged through Align PR #865 at
   `cdf333dc0707edbc4984dc8b1cb6b52edf7b48d0` and is `ALIGN_LLM_VERIFIED` through align-llm #98.
-  Request 18's design is accepted; its Align implementation and C6d adoption are next.
+  Request 18's Align capability is implemented; its C6d adoption is next.
 
 Consumer-gated deferrals that remain intentional:
 

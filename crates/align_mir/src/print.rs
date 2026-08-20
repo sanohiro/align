@@ -683,8 +683,30 @@ fn rvalue_str(rv: &Rvalue) -> String {
             format!("fs_read_file({}, -> _{out})", operand_str(path))
         }
         Rvalue::ReaderOpen { path, out } => format!("fs_open({}, -> _{out})", operand_str(path)),
+        Rvalue::ReaderOpenBeneath {
+            root,
+            relative,
+            out,
+        } => {
+            format!(
+                "fs_open_beneath({}, {}, -> _{out})",
+                operand_str(root),
+                operand_str(relative)
+            )
+        }
         Rvalue::WriterCreate { path, out } => format!("fs_create({}, -> _{out})", operand_str(path)),
         Rvalue::WriterCreateExclusive { path, out } => format!("fs_create_exclusive({}, -> _{out})", operand_str(path)),
+        Rvalue::WriterCreateExclusiveBeneath {
+            root,
+            relative,
+            out,
+        } => {
+            format!(
+                "fs_create_exclusive_beneath({}, {}, -> _{out})",
+                operand_str(root),
+                operand_str(relative)
+            )
+        }
         Rvalue::ReaderStdin => "io_reader_stdin()".to_string(),
         Rvalue::WriterStd { fd, buffered } => format!("io_writer_std(fd={fd}, buffered={buffered})"),
         Rvalue::ReaderRead(r, buf) => format!("io_read({}, {})", operand_str(r), operand_str(buf)),

@@ -10668,7 +10668,7 @@ fn request11_expr_kind_inventory_tripwire() {
         }
     }
     assert_eq!(
-        variants, 266,
+        variants, 268,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -10746,6 +10746,18 @@ fn hir_body_validator_native() {
         native_result(Ty::Reader, error)
     );
     add!(
+        "native_reader_open_beneath",
+        body_test_expr(
+            hir::ExprKind::ReaderOpenBeneath {
+                root: Box::new(native_str()),
+                relative: Box::new(native_str()),
+            },
+            native_result(Ty::Reader, error),
+        ),
+        Vec::new(),
+        native_result(Ty::Reader, error)
+    );
+    add!(
         "native_writer_std",
         body_test_expr(
             hir::ExprKind::WriterStd {
@@ -10785,6 +10797,18 @@ fn hir_body_validator_native() {
         body_test_expr(
             hir::ExprKind::WriterCreate {
                 path: Box::new(native_str()),
+            },
+            native_result(Ty::Writer, error),
+        ),
+        Vec::new(),
+        native_result(Ty::Writer, error)
+    );
+    add!(
+        "native_writer_create_exclusive_beneath",
+        body_test_expr(
+            hir::ExprKind::CreateExclusiveBeneath {
+                root: Box::new(native_str()),
+                relative: Box::new(native_str()),
             },
             native_result(Ty::Writer, error),
         ),
@@ -12654,6 +12678,56 @@ fn hir_body_validator_native() {
         "native nominal metadata"
     );
     assert!(body_core_metadata_is_valid(&program), "native body metadata");
+
+    for name in [
+        "native_reader_open_beneath",
+        "native_writer_create_exclusive_beneath",
+    ] {
+        let mut reject = program.clone();
+        let expression = body_value_expression_mut(&mut reject, name);
+        match &mut expression.kind {
+            hir::ExprKind::ReaderOpenBeneath { root, .. }
+            | hir::ExprKind::CreateExclusiveBeneath { root, .. } => root.ty = Ty::Bool,
+            _ => panic!("{name}: retained-root fixture lost its discriminator"),
+        }
+        assert!(
+            !body_core_metadata_is_valid(&reject),
+            "{name}: malformed root operand"
+        );
+
+        let mut reject = program.clone();
+        let expression = body_value_expression_mut(&mut reject, name);
+        match &mut expression.kind {
+            hir::ExprKind::ReaderOpenBeneath { relative, .. }
+            | hir::ExprKind::CreateExclusiveBeneath { relative, .. } => relative.ty = Ty::Bool,
+            _ => panic!("{name}: retained-root fixture lost its discriminator"),
+        }
+        assert!(
+            !body_core_metadata_is_valid(&reject),
+            "{name}: malformed relative operand"
+        );
+
+        let mut reject = program.clone();
+        body_value_expression_mut(&mut reject, name).ty = Ty::Bool;
+        assert!(
+            !body_core_metadata_is_valid(&reject),
+            "{name}: malformed result type"
+        );
+    }
+
+    let mut reject = program.clone();
+    let expression = body_value_expression_mut(&mut reject, "native_reader_open_beneath");
+    let hir::ExprKind::ReaderOpenBeneath { root, relative } = &expression.kind else {
+        panic!("reader retained-root fixture lost its discriminator")
+    };
+    expression.kind = hir::ExprKind::CreateExclusiveBeneath {
+        root: root.clone(),
+        relative: relative.clone(),
+    };
+    assert!(
+        !body_core_metadata_is_valid(&reject),
+        "operation substitution cannot preserve a stale reader result"
+    );
 
     let mut reject = program.clone();
     let expression =

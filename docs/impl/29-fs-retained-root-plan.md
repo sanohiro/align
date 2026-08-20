@@ -1,6 +1,6 @@
 # `std.fs` retained-root regular-file access
 
-Status: **ACCEPTED DESIGN for align-llm Request 18. Implementation has not started.**
+Status: **IMPLEMENTED in Align for align-llm Request 18. Real-client adoption is pending.**
 
 This document is the authoritative public-contract ledger and implementation plan for two
 descriptor-relative filesystem constructors:
@@ -15,8 +15,8 @@ is reached below one retained directory without following a root, intermediate, 
 It does not add general metadata reflection, a directory-handle value, a sandbox, a path
 canonicalizer, or application-specific lifecycle behavior.
 
-Implementation begins only after this ledger receives one fresh independent adversarial review,
-all design findings are resolved here first, and the design commit merges. The implementation is
+Implementation began after this ledger received one fresh independent adversarial review,
+all design findings were resolved here first, and the design commit merged. The implementation is
 one consumer-complete compiler/runtime boundary: both constructors share one trusted traversal
 algorithm, existing reader/writer ownership, checked HIR, MIR/LLVM lowering, runtime ABI, and the
 real align-llm adoption owner. Splitting the constructors from that shared proof would either leave
@@ -28,7 +28,7 @@ proof and lowers integration risk.
 
 | Surface | Exact inputs and defaults | Result and deterministic errors | Ownership, lifetime, allocation, and cleanup | Compiler/runtime owner | Identity, prerequisite, and acceptance |
 | --- | --- | --- | --- | --- | --- |
-| `fs.open_beneath(root: str, relative: str)` | Exactly two positional `str` values and no options, defaults, environment input, process-global root, or retained path. `root` names an existing directory. It may be absolute, relative to the existing process current directory, the exact `.` root, or `/`; every other component is non-empty and not `.` or `..`, with no trailing slash. `relative` is non-empty and relative, has no leading/trailing slash, and has no empty, `.` or `..` component. `/` is the only separator on the accepted Unix targets; backslash is an ordinary filename byte. | `Ok(reader)` only after the final entry is opened from the retained parent and proven to be the same regular file observed immediately before open. `NotFound` for the first missing root/parent/final component; `Denied` for the first permission failure; `Invalid` for invalid ABI text/grammar, a symlink component, a non-directory root/intermediate, a non-regular final, or a final identity/type change between observation and open; all other native failures use the fixed errno table. Output-slot validation wins, then complete root grammar, complete relative grammar, root traversal in written order, relative parents in written order, and the final entry. No later error replaces the first. | Both paths are borrowed only for the call. Per-call NUL-terminated copies and directory descriptors are explicitly released on every recoverable path. Checked length/capacity overflow is `Invalid`; actual allocation failure uses the locked immediate-abort OOM policy. Success transfers exactly one existing Move `reader`; its descriptor, read, `?`, `map_err`, branch/loop/return, and Drop rules are unchanged. No byte is read by the constructor. | A distinct `ReaderOpenBeneath` HIR/MIR operation, checked-HIR/replay/visitor closure, one runtime key/symbol, and a shared retained-directory runtime helper. The final reader uses the existing reader constructor and cleanup. | Builtin spelling and runtime key enter the compiler/runtime capability and MIR/cache identity. No type/interface format changes. The implementation is blocked on the accepted design; align-llm then owns `c6d-request18-adoption` plus its C6d lifecycle owner. |
+| `fs.open_beneath(root: str, relative: str)` | Exactly two positional `str` values and no options, defaults, environment input, process-global root, or retained path. `root` names an existing directory. It may be absolute, relative to the existing process current directory, the exact `.` root, or `/`; every other component is non-empty and not `.` or `..`, with no trailing slash. `relative` is non-empty and relative, has no leading/trailing slash, and has no empty, `.` or `..` component. `/` is the only separator on the accepted Unix targets; backslash is an ordinary filename byte. | `Ok(reader)` only after the final entry is opened from the retained parent and proven to be the same regular file observed immediately before open. `NotFound` for the first missing root/parent/final component; `Denied` for the first permission failure; `Invalid` for invalid ABI text/grammar, a symlink component, a non-directory root/intermediate, a non-regular final, or a final identity/type change between observation and open; all other native failures use the fixed errno table. Output-slot validation wins, then complete root grammar, complete relative grammar, root traversal in written order, relative parents in written order, and the final entry. No later error replaces the first. | Both paths are borrowed only for the call. Per-call NUL-terminated copies and directory descriptors are explicitly released on every recoverable path. Checked length/capacity overflow is `Invalid`; actual allocation failure uses the locked immediate-abort OOM policy. Success transfers exactly one existing Move `reader`; its descriptor, read, `?`, `map_err`, branch/loop/return, and Drop rules are unchanged. No byte is read by the constructor. | A distinct `ReaderOpenBeneath` HIR/MIR operation, checked-HIR/replay/visitor closure, one runtime key/symbol, and a shared retained-directory runtime helper. The final reader uses the existing reader constructor and cleanup. | Builtin spelling and runtime key enter the compiler/runtime capability and MIR/cache identity. No type/interface format changes. Align implements the capability; align-llm owns `c6d-request18-adoption` plus its C6d lifecycle owner. |
 | `fs.create_exclusive_beneath(root: str, relative: str)` | The same two-argument root/relative grammar and validation order. The root and every parent must already exist as real directories; the final component must be absent. There is no mode, umask override, temporary-name policy, overwrite switch, current-directory mutation, or implicit parent creation. | `Ok(writer)` only after one native exclusive create relative to the retained final parent. Any occupied final entry—regular, directory, symlink, FIFO, socket, or device—returns the existing native EEXIST-backed `Error.Code` and remains unchanged. Root/parent grammar, missing, denied, symlink, non-directory, and other errors match `open_beneath`. The output slot is null on every recoverable failure. | Paths and traversal storage are per-call borrows/owners. Success returns the existing Move `writer`; its 64 KiB buffer, write/flush/`?`/`map_err`/branch/loop/return/Drop, partial-file, and explicit cleanup rules are exactly Request 14's. Drop never removes the new file. No hidden rollback, retry, or delete occurs. | A distinct `CreateExclusiveBeneath` HIR/MIR operation and runtime key/symbol reuse the same retained-directory helper and existing writer construction. The final native call is `openat`-style `O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW`, never check-then-create. | Same identity rules; no new writer type or interface field. The real-client owner acquires this writer as CLI output preflight before decoded request-field validation, then writes one bounded canonical result or explicitly cleans a failed partial output. Request 14's pair-publication adoption remains separate. |
 
 Both operations are Impure because they inspect external directory state and may open/create a file.
@@ -227,7 +227,7 @@ Both use the existing open-handle `Result` CFG, status reconstruction, source op
 handle cleanup. MIR printing/fingerprints distinguish the operations from `fs.open`, `fs.create`,
 and `fs.create_exclusive`.
 
-The proposed runtime symbols are:
+The runtime symbols are:
 
 ```text
 align_rt_io_reader_open_beneath(
@@ -295,6 +295,33 @@ operation pairing. No benchmark is required: this capability makes no speed, res
 latency claim beyond path-bounded memory and constant live descriptor count, which are
 correctness owners.
 
+The author-side matrix-to-diff pass closes the implementation rows as follows:
+
+- `retained_root_open_and_create_round_trip`,
+  `retained_root_formation_diagnostics_and_per_unit_generic_paths`, and
+  `retained_root_mir_and_llvm_abi_are_distinct` own source formation, owned-string borrowing,
+  generic/per-unit lowering, handle transfer, MIR/cache discriminators, and exact A12 calls;
+- `fs_beneath_validation_types_and_same_final_matrix` owns lexical precedence, every accepted root
+  form, missing/denied/type mapping, regular/symlink/dangling/FIFO/socket/device controls, caller-byte
+  preservation, Reader/Writer transfer, and all four same-final open/create states;
+- `fs_beneath_observe_open_races_and_retained_ancestor` owns directory/final replacement barriers
+  and the retained-ancestor rename proof; `fs_beneath_exclusive_race_has_one_winner` owns the
+  synchronized creator race;
+- `fs_beneath_descriptor_cycles_balance` runs in an isolated child and owns every injected native
+  traversal/open/revalidation/nonblocking failure plus repeated success/missing fd parity;
+- `hir_body_validator_native` plus `request11_expr_kind_inventory_tripwire` own malformed/stale HIR
+  and the exhaustive enum sweep, while the existing parameterized reader/writer control-flow and
+  Drop owners continue to own `if`/`match`/`else`/`?`/`map_err`/join/return behavior for the unchanged
+  handle types; and
+- the runtime-key registry tests, exact declaration golden, source/export reverse inventory, and
+  `scripts/test-runtime-abi-exports.sh` own all 298 keyed rows, 311 base exports, 319 maximum probe
+  exports, whole/per-unit declarations, and runtime ABI parity.
+
+Linux runs these focused owners locally. The repository's existing macOS and Linux architecture CI
+legs own the same libc call/flag compilation on their target. The real-client row is deliberately
+deferred to the separate align-llm `c6d-request18-adoption` capability; it does not weaken or widen
+the shipped Align primitive.
+
 ## 5. Acceptance and delivery boundary
 
 The implementation extends the existing filesystem owner rather than creating a second broad suite:
@@ -320,7 +347,7 @@ Public-contract propagation is exact: this ledger owns the detailed record;
 `docs/impl/std-design/ja/fs.md` its synchronized Japanese mirror; `draft.md` and
 `docs/language-spec.md` own the authoritative and condensed language surfaces;
 `docs/design-notes.md` owns the rationale; `docs/open-questions.md` owns the settled decision;
-`docs/impl/20-runtime-abi-ledger.md` owns the proposed rows and later shipped inventory;
+`docs/impl/20-runtime-abi-ledger.md` owns the shipped rows and inventory;
 `docs/impl/07-roadmap.md` and `HANDOFF.md` own capability status; and
 `docs/guide/13-std-os.md` plus `docs/guide/ja/13-std-os.md` own the synchronized end-user summary.
 The sibling `align-llm/docs/align-requests.md` remains the real-client request/adoption register.

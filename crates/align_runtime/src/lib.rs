@@ -8374,11 +8374,415 @@ unsafe fn abi_exclusive_path(ptr: *const u8, len: i64) -> Result<std::ffi::CStri
     if std::str::from_utf8(bytes).is_err() || bytes.contains(&0) {
         return Err(AL_INVALID);
     }
-    n.checked_add(1).ok_or(AL_INVALID)?;
+    n.checked_add(1)
+        .filter(|capacity| *capacity <= isize::MAX as usize)
+        .ok_or(AL_INVALID)?;
     // The checks above prove that `CString::new` cannot reject the bytes. Keep the conversion
     // fail-closed anyway; its allocation remains intentionally infallible under the locked OOM
     // policy.
     std::ffi::CString::new(bytes).map_err(|_| AL_INVALID)
+}
+
+/// One validated, private, NUL-delimited path copy for the retained-root filesystem boundary.
+/// `components` contains byte offsets into `bytes`; after complete grammar validation every `/`
+/// separator in the private copy is replaced by NUL, so each offset is directly usable by
+/// `fstatat`/`openat`. Caller storage is never modified.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct BeneathPath {
+    bytes: Vec<u8>,
+    components: Vec<usize>,
+    absolute: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl BeneathPath {
+    fn component_ptr(&self, index: usize) -> *const libc::c_char {
+        // Every recorded offset is inside `bytes`, and grammar validation plus the trailing NUL
+        // guarantees a terminator before the allocation ends.
+        unsafe { self.bytes.as_ptr().add(self.components[index]).cast() }
+    }
+}
+
+/// Validate/copy either the root grammar or the strict relative grammar. The owned copy is made
+/// before component parsing, and separators are rewritten only after the entire grammar succeeds.
+///
+/// # Safety
+/// A positive length and non-null pointer must describe a readable immutable byte range.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+unsafe fn abi_beneath_path(ptr: *const u8, len: i64, root: bool) -> Result<BeneathPath, i32> {
+    let n = safe_len(len).map_err(|_| AL_INVALID)?;
+    if n == 0 || ptr.is_null() {
+        return Err(AL_INVALID);
+    }
+    let capacity = n
+        .checked_add(1)
+        .filter(|capacity| *capacity <= isize::MAX as usize)
+        .ok_or(AL_INVALID)?;
+    let source = unsafe { std::slice::from_raw_parts(ptr, n) };
+    if std::str::from_utf8(source).is_err() || source.contains(&0) {
+        return Err(AL_INVALID);
+    }
+
+    let mut bytes = Vec::with_capacity(capacity);
+    bytes.extend_from_slice(source);
+    bytes.push(0);
+
+    if root && source == b"." {
+        return Ok(BeneathPath {
+            bytes,
+            components: Vec::new(),
+            absolute: false,
+        });
+    }
+    if root && source == b"/" {
+        return Ok(BeneathPath {
+            bytes,
+            components: Vec::new(),
+            absolute: true,
+        });
+    }
+
+    let absolute = root && source[0] == b'/';
+    if (!root && source[0] == b'/') || source[n - 1] == b'/' {
+        return Err(AL_INVALID);
+    }
+    let mut start = usize::from(absolute);
+    let mut components = Vec::new();
+    while start < n {
+        let end = source[start..]
+            .iter()
+            .position(|byte| *byte == b'/')
+            .map_or(n, |offset| start + offset);
+        let component = &source[start..end];
+        if component.is_empty() || component == b"." || component == b".." {
+            return Err(AL_INVALID);
+        }
+        components.push(start);
+        if end == n {
+            break;
+        }
+        start = end + 1;
+    }
+    if components.is_empty() {
+        return Err(AL_INVALID);
+    }
+    for byte in &mut bytes[..n] {
+        if *byte == b'/' {
+            *byte = 0;
+        }
+    }
+    Ok(BeneathPath {
+        bytes,
+        components,
+        absolute,
+    })
+}
+
+/// RAII owner for every retained traversal descriptor and for a final descriptor until it is
+/// transferred into the existing Reader/Writer owner.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct BeneathFd(i32);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl BeneathFd {
+    fn into_raw(self) -> i32 {
+        let fd = self.0;
+        core::mem::forget(self);
+        fd
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for BeneathFd {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.0) };
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn beneath_stat_at(parent: i32, name: *const libc::c_char) -> Result<libc::stat, i32> {
+    let mut stat = core::mem::MaybeUninit::<libc::stat>::zeroed();
+    let rc = unsafe { libc::fstatat(parent, name, stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
+    if rc != 0 {
+        return Err(io_error_to_status(&std::io::Error::last_os_error()));
+    }
+    Ok(unsafe { stat.assume_init() })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn beneath_stat_fd(fd: i32) -> Result<libc::stat, i32> {
+    let mut stat = core::mem::MaybeUninit::<libc::stat>::zeroed();
+    let rc = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(io_error_to_status(&std::io::Error::last_os_error()));
+    }
+    Ok(unsafe { stat.assume_init() })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn beneath_is_dir(stat: &libc::stat) -> bool {
+    (stat.st_mode as libc::mode_t & libc::S_IFMT) == libc::S_IFDIR
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn beneath_is_regular(stat: &libc::stat) -> bool {
+    (stat.st_mode as libc::mode_t & libc::S_IFMT) == libc::S_IFREG
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn beneath_same_identity(observed: &libc::stat, opened: &libc::stat) -> bool {
+    observed.st_dev == opened.st_dev && observed.st_ino == opened.st_ino
+}
+
+/// Once no-follow observation has succeeded, a disappearance, symlink substitution, or
+/// non-directory substitution before `openat` is an identity/type race and therefore Invalid.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn beneath_post_observation_error() -> i32 {
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ENOENT) | Some(libc::ELOOP) | Some(libc::ENOTDIR) => AL_INVALID,
+        _ => io_error_to_status(&error),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn beneath_open_start(absolute: bool) -> Result<BeneathFd, i32> {
+    #[cfg(test)]
+    if beneath_test_fail(BeneathTestFailpoint::StartOpen) {
+        return Err(AL_CODE + libc::EIO);
+    }
+    let name = if absolute {
+        b"/\0".as_ptr()
+    } else {
+        b".\0".as_ptr()
+    };
+    let fd = unsafe {
+        libc::open(
+            name.cast(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        Err(io_error_to_status(&std::io::Error::last_os_error()))
+    } else {
+        Ok(BeneathFd(fd))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn beneath_open_directory(parent: i32, name: *const libc::c_char) -> Result<BeneathFd, i32> {
+    #[cfg(test)]
+    if beneath_test_fail(BeneathTestFailpoint::DirectoryObserve) {
+        return Err(AL_CODE + libc::EIO);
+    }
+    let observed = beneath_stat_at(parent, name)?;
+    if !beneath_is_dir(&observed) {
+        return Err(AL_INVALID);
+    }
+    #[cfg(test)]
+    beneath_test_checkpoint(BeneathTestCheckpoint::DirectoryObserved, name);
+    #[cfg(test)]
+    if beneath_test_fail(BeneathTestFailpoint::DirectoryOpen) {
+        return Err(AL_CODE + libc::EIO);
+    }
+    let fd = unsafe {
+        libc::openat(
+            parent,
+            name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(beneath_post_observation_error());
+    }
+    let fd = BeneathFd(fd);
+    #[cfg(test)]
+    if beneath_test_fail(BeneathTestFailpoint::DirectoryRevalidate) {
+        return Err(AL_CODE + libc::EIO);
+    }
+    let opened = beneath_stat_fd(fd.0)?;
+    if !beneath_is_dir(&opened) || !beneath_same_identity(&observed, &opened) {
+        return Err(AL_INVALID);
+    }
+    #[cfg(test)]
+    beneath_test_checkpoint(BeneathTestCheckpoint::DirectoryOpened, name);
+    Ok(fd)
+}
+
+#[derive(Clone, Copy)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+enum BeneathOperation {
+    OpenRegular,
+    CreateExclusive,
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum BeneathTestFailpoint {
+    StartOpen,
+    DirectoryObserve,
+    DirectoryOpen,
+    DirectoryRevalidate,
+    FinalObserve,
+    FinalOpen,
+    FinalRevalidate,
+    NonblockGet,
+    NonblockSet,
+    CreateFinal,
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+static BENEATH_TEST_FAILPOINT: std::sync::Mutex<Option<BeneathTestFailpoint>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn beneath_test_fail(point: BeneathTestFailpoint) -> bool {
+    *BENEATH_TEST_FAILPOINT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        == Some(point)
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum BeneathTestCheckpoint {
+    DirectoryObserved,
+    DirectoryOpened,
+    FinalObserved,
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+struct BeneathTestGate {
+    checkpoint: BeneathTestCheckpoint,
+    component: Vec<u8>,
+    entered: std::sync::Barrier,
+    release: std::sync::Barrier,
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+static BENEATH_TEST_GATE: std::sync::Mutex<Option<std::sync::Arc<BeneathTestGate>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn beneath_test_checkpoint(checkpoint: BeneathTestCheckpoint, name: *const libc::c_char) {
+    let gate = BENEATH_TEST_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let Some(gate) = gate else { return };
+    let component = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
+    if gate.checkpoint == checkpoint && gate.component == component {
+        gate.entered.wait();
+        gate.release.wait();
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn beneath_open_regular(parent: i32, name: *const libc::c_char) -> Result<BeneathFd, i32> {
+    #[cfg(test)]
+    if beneath_test_fail(BeneathTestFailpoint::FinalObserve) {
+        return Err(AL_CODE + libc::EIO);
+    }
+    let observed = beneath_stat_at(parent, name)?;
+    if !beneath_is_regular(&observed) {
+        return Err(AL_INVALID);
+    }
+    #[cfg(test)]
+    beneath_test_checkpoint(BeneathTestCheckpoint::FinalObserved, name);
+    #[cfg(test)]
+    if beneath_test_fail(BeneathTestFailpoint::FinalOpen) {
+        return Err(AL_CODE + libc::EIO);
+    }
+    let fd = unsafe {
+        libc::openat(
+            parent,
+            name,
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(beneath_post_observation_error());
+    }
+    let fd = BeneathFd(fd);
+    #[cfg(test)]
+    if beneath_test_fail(BeneathTestFailpoint::FinalRevalidate) {
+        return Err(AL_CODE + libc::EIO);
+    }
+    let opened = beneath_stat_fd(fd.0)?;
+    if !beneath_is_regular(&opened) || !beneath_same_identity(&observed, &opened) {
+        return Err(AL_INVALID);
+    }
+
+    #[cfg(test)]
+    if beneath_test_fail(BeneathTestFailpoint::NonblockGet) {
+        return Err(AL_CODE + libc::EIO);
+    }
+    let flags = unsafe { libc::fcntl(fd.0, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io_error_to_status(&std::io::Error::last_os_error()));
+    }
+    if flags & libc::O_NONBLOCK != 0 {
+        #[cfg(test)]
+        if beneath_test_fail(BeneathTestFailpoint::NonblockSet) {
+            return Err(AL_CODE + libc::EIO);
+        }
+        let rc = unsafe { libc::fcntl(fd.0, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
+        if rc < 0 {
+            return Err(io_error_to_status(&std::io::Error::last_os_error()));
+        }
+    }
+    Ok(fd)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn beneath_create_exclusive(parent: i32, name: *const libc::c_char) -> Result<BeneathFd, i32> {
+    #[cfg(test)]
+    if beneath_test_fail(BeneathTestFailpoint::CreateFinal) {
+        return Err(AL_CODE + libc::EIO);
+    }
+    let fd = unsafe {
+        libc::openat(
+            parent,
+            name,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o666 as libc::mode_t,
+        )
+    };
+    if fd < 0 {
+        Err(io_error_to_status(&std::io::Error::last_os_error()))
+    } else {
+        Ok(BeneathFd(fd))
+    }
+}
+
+/// Validate root completely before inspecting/allocating relative, retain the final parent with
+/// O(1) live traversal descriptors, and perform exactly one operation-specific final action.
+///
+/// # Safety
+/// Positive non-null inputs must describe readable immutable ranges.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+unsafe fn native_open_beneath(
+    root_ptr: *const u8,
+    root_len: i64,
+    relative_ptr: *const u8,
+    relative_len: i64,
+    operation: BeneathOperation,
+) -> Result<BeneathFd, i32> {
+    let root = unsafe { abi_beneath_path(root_ptr, root_len, true) }?;
+    let relative = unsafe { abi_beneath_path(relative_ptr, relative_len, false) }?;
+
+    let mut parent = beneath_open_start(root.absolute)?;
+    for index in 0..root.components.len() {
+        parent = beneath_open_directory(parent.0, root.component_ptr(index))?;
+    }
+    for index in 0..relative.components.len() - 1 {
+        parent = beneath_open_directory(parent.0, relative.component_ptr(index))?;
+    }
+    let final_name = relative.component_ptr(relative.components.len() - 1);
+    match operation {
+        BeneathOperation::OpenRegular => beneath_open_regular(parent.0, final_name),
+        BeneathOperation::CreateExclusive => beneath_create_exclusive(parent.0, final_name),
+    }
 }
 
 // --- std.regex -------------------------------------------------------------------------------
@@ -8906,6 +9310,50 @@ pub unsafe extern "C" fn align_rt_io_reader_open(path: *const u8, path_len: i64,
     }
 }
 
+/// `fs.open_beneath(root, relative)` — open one regular file below a retained directory without
+/// following root, intermediate, or final symlinks. Complete lexical validation precedes every
+/// descriptor operation; the final descriptor is identity-revalidated before publication.
+///
+/// # Safety
+/// Positive non-null path views must describe readable immutable byte ranges. `out` must point to
+/// one writable reader slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_reader_open_beneath(
+    root_ptr: *const u8,
+    root_len: i64,
+    relative_ptr: *const u8,
+    relative_len: i64,
+    out: *mut *mut Reader,
+) -> i32 {
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *out = core::ptr::null_mut() };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        match unsafe {
+            native_open_beneath(
+                root_ptr,
+                root_len,
+                relative_ptr,
+                relative_len,
+                BeneathOperation::OpenRegular,
+            )
+        } {
+            Ok(fd) => {
+                unsafe { *out = Box::into_raw(Box::new(Reader::unbuffered(fd.into_raw(), true))) };
+                0
+            }
+            Err(status) => status,
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (root_ptr, root_len, relative_ptr, relative_len);
+        AL_INVALID
+    }
+}
+
 /// `r.read(b: mut buffer)` — read up to `b`'s capacity from the reader's fd into `b`, overwriting
 /// `b`'s length. Returns the number of bytes read (`0` = EOF) on success, or `-(status)` where
 /// `status` is the errno mapped through [`io_error_to_status`] (always `>= 1`, so an error is a
@@ -9226,6 +9674,57 @@ pub unsafe extern "C" fn align_rt_io_writer_create_exclusive(
         }));
     }
     0
+}
+
+/// `fs.create_exclusive_beneath(root, relative)` — retain and verify every directory component,
+/// then perform one `openat(O_CREAT|O_EXCL|O_NOFOLLOW)` against the final parent. No absence check,
+/// truncation, retry, rollback, or removal path exists.
+///
+/// # Safety
+/// Positive non-null path views must describe readable immutable byte ranges. `out` must point to
+/// one writable writer slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_writer_create_exclusive_beneath(
+    root_ptr: *const u8,
+    root_len: i64,
+    relative_ptr: *const u8,
+    relative_len: i64,
+    out: *mut *mut Writer,
+) -> i32 {
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { *out = core::ptr::null_mut() };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        match unsafe {
+            native_open_beneath(
+                root_ptr,
+                root_len,
+                relative_ptr,
+                relative_len,
+                BeneathOperation::CreateExclusive,
+            )
+        } {
+            Ok(fd) => {
+                unsafe {
+                    *out = Box::into_raw(Box::new(Writer {
+                        fd: fd.into_raw(),
+                        owns_fd: true,
+                        buffered: true,
+                        buf: Vec::with_capacity(BUF_WRITER_CAP),
+                    }))
+                };
+                0
+            }
+            Err(status) => status,
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (root_ptr, root_len, relative_ptr, relative_len);
+        AL_INVALID
+    }
 }
 
 /// `w.write(bytes)` — append `ptr`/`len` bytes to the writer. An unbuffered writer streams straight
@@ -21331,8 +21830,8 @@ mod tests {
                 None
             })
             .collect();
-        assert_eq!(runtime.len(), 309);
-        assert_eq!(registry.len(), 309);
+        assert_eq!(runtime.len(), 311);
+        assert_eq!(registry.len(), 311);
         assert_eq!(runtime, registry);
     }
 
@@ -28110,6 +28609,56 @@ mod tests {
         (s.as_ptr(), s.len() as i64)
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn beneath_reader(root: &str, relative: &str) -> (i32, *mut Reader) {
+        let mut out = core::ptr::dangling_mut::<Reader>();
+        let status = unsafe {
+            align_rt_io_reader_open_beneath(
+                root.as_ptr(),
+                root.len() as i64,
+                relative.as_ptr(),
+                relative.len() as i64,
+                &mut out,
+            )
+        };
+        (status, out)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn beneath_writer(root: &str, relative: &str) -> (i32, *mut Writer) {
+        let mut out = core::ptr::dangling_mut::<Writer>();
+        let status = unsafe {
+            align_rt_io_writer_create_exclusive_beneath(
+                root.as_ptr(),
+                root.len() as i64,
+                relative.as_ptr(),
+                relative.len() as i64,
+                &mut out,
+            )
+        };
+        (status, out)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn read_beneath_reader(reader: *mut Reader) -> Vec<u8> {
+        let mut bytes = vec![0u8; 128];
+        let count = unsafe {
+            libc::read(
+                (*reader).fd,
+                bytes.as_mut_ptr().cast::<libc::c_void>(),
+                bytes.len(),
+            )
+        };
+        assert!(
+            count >= 0,
+            "read from retained reader failed: {}",
+            std::io::Error::last_os_error()
+        );
+        bytes.truncate(count as usize);
+        unsafe { align_rt_io_reader_free(reader) };
+        bytes
+    }
+
     #[test]
     fn fs_write_exists_remove_round_trip() {
         let path = tmp_path("wer");
@@ -28436,6 +28985,446 @@ mod tests {
         for source in rename_sources {
             let _ = std::fs::remove_file(source);
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn fs_beneath_validation_types_and_same_final_matrix() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+
+        let root = tmp_path("beneath-contract");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/input"), b"retained input").unwrap();
+        let root_s = root.to_str().unwrap();
+
+        // Output-slot validation wins and every later recoverable failure leaves the slot null.
+        assert_eq!(
+            unsafe {
+                align_rt_io_reader_open_beneath(
+                    root_s.as_ptr(),
+                    root_s.len() as i64,
+                    b"nested/input".as_ptr(),
+                    12,
+                    core::ptr::null_mut(),
+                )
+            },
+            AL_INVALID,
+        );
+        for bad_root in ["", "a/", "a//b", "a/./b", "a/../b", "//a"] {
+            let (status, out) = beneath_reader(bad_root, "nested/input");
+            assert_eq!(status, AL_INVALID, "root grammar: {bad_root:?}");
+            assert!(out.is_null());
+        }
+        for bad_relative in ["", "/a", "a/", "a//b", "a/./b", "a/../b", ".", ".."] {
+            let (status, out) = beneath_reader(root_s, bad_relative);
+            assert_eq!(status, AL_INVALID, "relative grammar: {bad_relative:?}");
+            assert!(out.is_null());
+        }
+        let mut out = core::ptr::dangling_mut::<Reader>();
+        assert_eq!(
+            unsafe {
+                align_rt_io_reader_open_beneath(
+                    b"bad//root".as_ptr(),
+                    9,
+                    core::ptr::null(),
+                    1,
+                    &mut out,
+                )
+            },
+            AL_INVALID,
+            "complete root grammar is rejected before the malformed relative view",
+        );
+        assert!(out.is_null());
+        assert_eq!(
+            unsafe {
+                align_rt_io_reader_open_beneath(
+                    root_s.as_ptr(),
+                    root_s.len() as i64,
+                    b"nested/input".as_ptr(),
+                    -1,
+                    &mut out,
+                )
+            },
+            AL_INVALID,
+        );
+        assert!(out.is_null());
+        assert_eq!(
+            unsafe {
+                align_rt_io_reader_open_beneath(
+                    root_s.as_ptr(),
+                    root_s.len() as i64,
+                    b"bad\0name".as_ptr(),
+                    8,
+                    &mut out,
+                )
+            },
+            AL_INVALID,
+        );
+        assert!(out.is_null());
+        assert_eq!(
+            unsafe {
+                align_rt_io_reader_open_beneath(
+                    root_s.as_ptr(),
+                    root_s.len() as i64,
+                    [0xff].as_ptr(),
+                    1,
+                    &mut out,
+                )
+            },
+            AL_INVALID,
+        );
+        assert!(out.is_null());
+
+        // Absolute roots, `/`, `.`, and relative roots all resolve from a retained starting fd.
+        let (status, reader) = beneath_reader(root_s, "nested/input");
+        assert_eq!(status, 0);
+        assert_eq!(read_beneath_reader(reader), b"retained input");
+        let slash_input = root.join("nested/input");
+        let from_slash = slash_input.strip_prefix("/").unwrap().to_str().unwrap();
+        let (status, reader) = beneath_reader("/", from_slash);
+        assert_eq!(status, 0);
+        assert_eq!(read_beneath_reader(reader), b"retained input");
+
+        let cwd_name = format!("align-rt-beneath-cwd-{}", std::process::id());
+        let cwd_root = std::env::current_dir().unwrap().join(&cwd_name);
+        let _ = std::fs::remove_dir_all(&cwd_root);
+        std::fs::create_dir_all(&cwd_root).unwrap();
+        std::fs::write(cwd_root.join("input"), b"cwd input").unwrap();
+        let (status, reader) = beneath_reader(".", &format!("{cwd_name}/input"));
+        assert_eq!(status, 0);
+        assert_eq!(read_beneath_reader(reader), b"cwd input");
+        let (status, reader) = beneath_reader(&cwd_name, "input");
+        assert_eq!(status, 0);
+        assert_eq!(read_beneath_reader(reader), b"cwd input");
+        std::fs::remove_dir_all(&cwd_root).unwrap();
+
+        // Caller storage remains byte-for-byte unchanged while private copies are NUL-delimited.
+        let root_bytes = root_s.as_bytes().to_vec();
+        let relative_bytes = b"nested/input".to_vec();
+        let root_before = root_bytes.clone();
+        let relative_before = relative_bytes.clone();
+        let mut unchanged_out = core::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                align_rt_io_reader_open_beneath(
+                    root_bytes.as_ptr(),
+                    root_bytes.len() as i64,
+                    relative_bytes.as_ptr(),
+                    relative_bytes.len() as i64,
+                    &mut unchanged_out,
+                )
+            },
+            0,
+        );
+        unsafe { align_rt_io_reader_free(unchanged_out) };
+        assert_eq!(root_bytes, root_before);
+        assert_eq!(relative_bytes, relative_before);
+
+        // Missing is NotFound. Every no-follow type rejection is Invalid and never publishes a
+        // special descriptor. Exclusive create sees every occupied final kind as native EEXIST.
+        assert_eq!(beneath_reader(root_s, "nested/missing").0, AL_NOT_FOUND);
+        std::fs::create_dir(root.join("nested/directory")).unwrap();
+        symlink("input", root.join("nested/link")).unwrap();
+        symlink("missing-target", root.join("nested/dangling-link")).unwrap();
+        std::fs::write(root.join("plain-parent"), b"not a directory").unwrap();
+        let fifo = root.join("nested/fifo");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let socket = std::os::unix::net::UnixDatagram::bind(root.join("nested/socket")).unwrap();
+        for relative in [
+            "nested/directory",
+            "nested/link",
+            "nested/dangling-link",
+            "nested/fifo",
+            "nested/socket",
+        ] {
+            let (status, rejected) = beneath_reader(root_s, relative);
+            assert_eq!(status, AL_INVALID, "input type: {relative}");
+            assert!(rejected.is_null());
+            let (status, rejected) = beneath_writer(root_s, relative);
+            assert_eq!(
+                status,
+                AL_CODE + libc::EEXIST,
+                "occupied output: {relative}"
+            );
+            assert!(rejected.is_null());
+        }
+        assert_eq!(beneath_reader(root_s, "plain-parent/input").0, AL_INVALID);
+        assert_eq!(beneath_writer(root_s, "plain-parent/input").0, AL_INVALID);
+        assert_eq!(beneath_reader(root_s, "missing/input").0, AL_NOT_FOUND);
+        assert_eq!(beneath_writer(root_s, "missing/output").0, AL_NOT_FOUND);
+        let missing_root = root.join("missing-root");
+        assert_eq!(
+            beneath_reader(missing_root.to_str().unwrap(), "input").0,
+            AL_NOT_FOUND
+        );
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let denied = root.join("denied");
+            std::fs::create_dir(&denied).unwrap();
+            std::fs::write(denied.join("input"), b"denied").unwrap();
+            std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0)).unwrap();
+            assert_eq!(beneath_reader(root_s, "denied/input").0, AL_DENIED);
+            assert_eq!(beneath_writer(root_s, "denied/output").0, AL_DENIED);
+            std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        symlink("nested", root.join("dir-link")).unwrap();
+        assert_eq!(beneath_reader(root_s, "dir-link/input").0, AL_INVALID);
+        assert_eq!(beneath_writer(root_s, "dir-link/output").0, AL_INVALID);
+        assert_eq!(beneath_reader("/", "dev/null").0, AL_INVALID);
+        assert_eq!(beneath_writer("/", "dev/null").0, AL_CODE + libc::EEXIST);
+
+        // Same-final open/create outcomes: absent observation loses with NotFound; an installed
+        // writer is immediately openable on the same inode; pre-existing regular/non-regular
+        // entries produce the fixed create/open combinations without exclusion or replacement.
+        assert_eq!(beneath_reader(root_s, "nested/output").0, AL_NOT_FOUND);
+        let (status, writer) = beneath_writer(root_s, "nested/output");
+        assert_eq!(status, 0);
+        let (status, reader) = beneath_reader(root_s, "nested/output");
+        assert_eq!(status, 0);
+        assert_eq!(read_beneath_reader(reader), b"");
+        assert_eq!(
+            unsafe { align_rt_io_writer_write(writer, b"published".as_ptr(), 9) },
+            0
+        );
+        unsafe { align_rt_io_writer_free(writer) };
+        assert_eq!(
+            std::fs::read(root.join("nested/output")).unwrap(),
+            b"published"
+        );
+        let (status, rejected) = beneath_writer(root_s, "nested/output");
+        assert_eq!(status, AL_CODE + libc::EEXIST);
+        assert!(rejected.is_null());
+        let (status, reader) = beneath_reader(root_s, "nested/output");
+        assert_eq!(status, 0);
+        unsafe { align_rt_io_reader_free(reader) };
+        let (status, rejected) = beneath_writer(root_s, "nested/directory");
+        assert_eq!(status, AL_CODE + libc::EEXIST);
+        assert!(rejected.is_null());
+        assert_eq!(beneath_reader(root_s, "nested/directory").0, AL_INVALID);
+
+        drop(socket);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn fs_beneath_observe_open_races_and_retained_ancestor() {
+        fn install_gate(
+            checkpoint: BeneathTestCheckpoint,
+            component: &str,
+        ) -> std::sync::Arc<BeneathTestGate> {
+            let gate = std::sync::Arc::new(BeneathTestGate {
+                checkpoint,
+                component: component.as_bytes().to_vec(),
+                entered: std::sync::Barrier::new(2),
+                release: std::sync::Barrier::new(2),
+            });
+            *BENEATH_TEST_GATE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(std::sync::Arc::clone(&gate));
+            gate
+        }
+        fn clear_gate() {
+            *BENEATH_TEST_GATE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+
+        let root = tmp_path("beneath-races");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let root_s = root.to_str().unwrap().to_string();
+
+        // A final regular-file replacement after observation is rejected by device/inode identity.
+        std::fs::write(root.join("victim"), b"old").unwrap();
+        let gate = install_gate(BeneathTestCheckpoint::FinalObserved, "victim");
+        let worker_root = root_s.clone();
+        let worker = std::thread::spawn(move || {
+            let (status, reader) = beneath_reader(&worker_root, "victim");
+            (status, reader as usize)
+        });
+        gate.entered.wait();
+        std::fs::rename(root.join("victim"), root.join("victim-old")).unwrap();
+        std::fs::write(root.join("victim"), b"new").unwrap();
+        gate.release.wait();
+        let (status, rejected) = worker.join().unwrap();
+        clear_gate();
+        assert_eq!(status, AL_INVALID);
+        assert_eq!(rejected, 0);
+
+        // A directory replacement between observation and open is likewise rejected.
+        std::fs::create_dir(root.join("step")).unwrap();
+        std::fs::write(root.join("step/input"), b"old step").unwrap();
+        let gate = install_gate(BeneathTestCheckpoint::DirectoryObserved, "step");
+        let worker_root = root_s.clone();
+        let worker = std::thread::spawn(move || {
+            let (status, reader) = beneath_reader(&worker_root, "step/input");
+            (status, reader as usize)
+        });
+        gate.entered.wait();
+        std::fs::rename(root.join("step"), root.join("step-old")).unwrap();
+        std::fs::create_dir(root.join("step")).unwrap();
+        std::fs::write(root.join("step/input"), b"new step").unwrap();
+        gate.release.wait();
+        let (status, rejected) = worker.join().unwrap();
+        clear_gate();
+        assert_eq!(status, AL_INVALID);
+        assert_eq!(rejected, 0);
+
+        // Once the ancestor descriptor has been opened and identity-checked, renaming its public
+        // path cannot redirect the remaining traversal to a replacement directory.
+        std::fs::create_dir(root.join("held")).unwrap();
+        std::fs::write(root.join("held/input"), b"retained bytes").unwrap();
+        let gate = install_gate(BeneathTestCheckpoint::DirectoryOpened, "held");
+        let worker_root = root_s.clone();
+        let worker = std::thread::spawn(move || {
+            let (status, reader) = beneath_reader(&worker_root, "held/input");
+            (status, reader as usize)
+        });
+        gate.entered.wait();
+        std::fs::rename(root.join("held"), root.join("held-moved")).unwrap();
+        std::fs::create_dir(root.join("held")).unwrap();
+        std::fs::write(root.join("held/input"), b"replacement bytes").unwrap();
+        gate.release.wait();
+        let (status, reader) = worker.join().unwrap();
+        clear_gate();
+        assert_eq!(status, 0);
+        assert_eq!(
+            read_beneath_reader(reader as *mut Reader),
+            b"retained bytes"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn fs_beneath_exclusive_race_has_one_winner() {
+        use std::sync::{Arc, Barrier};
+
+        const CALLERS: usize = 8;
+        let root = tmp_path("beneath-create-race");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let root = Arc::new(root.to_str().unwrap().to_string());
+        let barrier = Arc::new(Barrier::new(CALLERS));
+        let workers: Vec<_> = (0..CALLERS)
+            .map(|_| {
+                let root = Arc::clone(&root);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let (status, writer) = beneath_writer(&root, "winner");
+                    if status == 0 {
+                        unsafe { align_rt_io_writer_free(writer) };
+                    }
+                    status
+                })
+            })
+            .collect();
+        let statuses: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(statuses.iter().filter(|status| **status == 0).count(), 1);
+        assert!(
+            statuses
+                .iter()
+                .filter(|status| **status != 0)
+                .all(|status| *status == AL_CODE + libc::EEXIST)
+        );
+        assert_eq!(
+            std::fs::read(std::path::Path::new(root.as_str()).join("winner")).unwrap(),
+            b""
+        );
+        std::fs::remove_dir_all(root.as_str()).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fs_beneath_descriptor_cycles_balance() {
+        const CHILD: &str = "ALIGN_BENEATH_FD_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::fs_beneath_descriptor_cycles_balance",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let root = tmp_path("beneath-fd-balance");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::write(root.join("a/b/input"), b"x").unwrap();
+        let root_s = root.to_str().unwrap();
+        let baseline = std::fs::read_dir("/proc/self/fd").unwrap().count();
+        for failpoint in [
+            BeneathTestFailpoint::StartOpen,
+            BeneathTestFailpoint::DirectoryObserve,
+            BeneathTestFailpoint::DirectoryOpen,
+            BeneathTestFailpoint::DirectoryRevalidate,
+            BeneathTestFailpoint::FinalObserve,
+            BeneathTestFailpoint::FinalOpen,
+            BeneathTestFailpoint::FinalRevalidate,
+            BeneathTestFailpoint::NonblockGet,
+            BeneathTestFailpoint::NonblockSet,
+        ] {
+            *BENEATH_TEST_FAILPOINT
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(failpoint);
+            let (status, rejected) = beneath_reader(root_s, "a/b/input");
+            *BENEATH_TEST_FAILPOINT
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            assert_eq!(status, AL_CODE + libc::EIO);
+            assert!(rejected.is_null());
+            assert_eq!(
+                std::fs::read_dir("/proc/self/fd").unwrap().count(),
+                baseline
+            );
+        }
+        *BENEATH_TEST_FAILPOINT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(BeneathTestFailpoint::CreateFinal);
+        let (status, rejected) = beneath_writer(root_s, "a/b/output");
+        *BENEATH_TEST_FAILPOINT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        assert_eq!(status, AL_CODE + libc::EIO);
+        assert!(rejected.is_null());
+        assert!(!root.join("a/b/output").exists());
+        assert_eq!(
+            std::fs::read_dir("/proc/self/fd").unwrap().count(),
+            baseline
+        );
+
+        for _ in 0..200 {
+            let (status, reader) = beneath_reader(root_s, "a/b/input");
+            assert_eq!(status, 0);
+            unsafe { align_rt_io_reader_free(reader) };
+            let (status, rejected) = beneath_reader(root_s, "a/b/missing");
+            assert_eq!(status, AL_NOT_FOUND);
+            assert!(rejected.is_null());
+            let (status, rejected) = beneath_reader(root_s, "a/missing/input");
+            assert_eq!(status, AL_NOT_FOUND);
+            assert!(rejected.is_null());
+        }
+        assert_eq!(
+            std::fs::read_dir("/proc/self/fd").unwrap().count(),
+            baseline
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

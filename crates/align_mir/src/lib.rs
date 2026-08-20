@@ -1022,12 +1022,26 @@ pub enum Rvalue {
     /// `fs.open(path)`: open `path` for reading, writing the owned `reader` handle into `out`.
     /// Yields an `i32` errno-status (0 = ok; see [`make_error_from_status`]).
     ReaderOpen { path: Operand, out: Slot },
+    /// `fs.open_beneath(root, relative)`: descriptor-relative regular-file open below a retained
+    /// root. The runtime writes the owned reader into `out` and returns an errno-status.
+    ReaderOpenBeneath {
+        root: Operand,
+        relative: Operand,
+        out: Slot,
+    },
     /// `fs.create(path)`: create/truncate `path` for writing, writing the owned `writer` handle into
     /// `out`. Yields an `i32` errno-status (0 = ok).
     WriterCreate { path: Operand, out: Slot },
     /// `fs.create_exclusive(path)`: atomically create a new final entry, writing the owned `writer`
     /// handle into `out`. Yields an `i32` errno-status (0 = ok).
     WriterCreateExclusive { path: Operand, out: Slot },
+    /// `fs.create_exclusive_beneath(root, relative)`: descriptor-relative exclusive regular-file
+    /// create below a retained root. The runtime writes the owned writer into `out`.
+    WriterCreateExclusiveBeneath {
+        root: Operand,
+        relative: Operand,
+        out: Slot,
+    },
     /// `io.stdin` — a `reader` over fd 0 (an owned handle; std.io).
     ReaderStdin,
     /// `io.stdout` / `io.stderr` / `io.stdout.buffered()` — a `writer` over `fd` (1 = stdout,
@@ -5754,6 +5768,24 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 lower_open_handle(b, path, Ty::Writer, e.ty, |p, out| Rvalue::WriterCreateExclusive {
                     path: p,
                     out,
+                })
+            }
+            hir::ExprKind::ReaderOpenBeneath { root, relative } => {
+                lower_beneath_handle(b, root, relative, Ty::Reader, e.ty, |r, p, out| {
+                    Rvalue::ReaderOpenBeneath {
+                        root: r,
+                        relative: p,
+                        out,
+                    }
+                })
+            }
+            hir::ExprKind::CreateExclusiveBeneath { root, relative } => {
+                lower_beneath_handle(b, root, relative, Ty::Writer, e.ty, |r, p, out| {
+                    Rvalue::WriterCreateExclusiveBeneath {
+                        root: r,
+                        relative: p,
+                        out,
+                    }
                 })
             }
             // All A4 `file` ops — the two constructors (`fs.create_rw`/`fs.open_rw`, `Result<file, Error>`)
@@ -14008,6 +14040,37 @@ fn lower_open_handle(
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, open_rv(p, out)));
 
+    emit_open_handle_result(b, code, out, handle_ty, result_ty)
+}
+
+/// The descriptor-relative two-path sibling of [`lower_open_handle`]. Root is lowered before
+/// relative, preserving source evaluation order through the runtime call.
+fn lower_beneath_handle(
+    b: &mut Builder,
+    root: &hir::Expr,
+    relative: &hir::Expr,
+    handle_ty: Ty,
+    result_ty: Ty,
+    open_rv: impl FnOnce(Operand, Operand, Slot) -> Rvalue,
+) -> Operand {
+    let out = b.new_slot(handle_ty);
+    let root = lower_required!(b, lower_expr(b, root), Operand::Const(Const::Unit));
+    let relative = lower_required!(b, lower_expr(b, relative), Operand::Const(Const::Unit));
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(code, open_rv(root, relative, out)));
+
+    emit_open_handle_result(b, code, out, handle_ty, result_ty)
+}
+
+/// Reconstruct the existing `Result<reader/writer, Error>` CFG from a runtime status and handle
+/// output slot. Both path-only and retained-root constructors use this exact ownership transfer.
+fn emit_open_handle_result(
+    b: &mut Builder,
+    code: ValueId,
+    out: Slot,
+    handle_ty: Ty,
+    result_ty: Ty,
+) -> Operand {
     let isok = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
     let ok_bb = b.new_block();
