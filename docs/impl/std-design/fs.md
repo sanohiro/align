@@ -10,7 +10,7 @@ The public-contract ledgers are
 > **Status:** Request 14 IMPLEMENTED 2026-08-19 (design PR #859, merged as
 > `a21eb8416f2088df68026f10c63a38cd0bd65538`; implementation PR #861, merged as
 > `3c2edd2f399c9e2c9551b4227c61b36d6a041e20`). The align-llm adoption gate is
-> pending. Request 18 retained-root regular-file access is a DESIGN CANDIDATE; implementation has not
+> pending. Request 18 retained-root regular-file access is an ACCEPTED DESIGN; implementation has not
 > started.
 
 ## Overview
@@ -162,9 +162,9 @@ align_rt_io_writer_create_exclusive_beneath(
 ) -> i32
 ```
 
-Output-slot validation is first, then complete root validation/copy, complete relative
-validation/copy, complete lexical component parsing, root traversal, relative-parent traversal, and
-the final operation. Both slots are null on recoverable failure. Checked copy-size overflow is
+Output-slot validation is first, then complete root validation/copy/grammar, complete relative
+validation/copy/grammar, root traversal, relative-parent traversal, and the final operation. Invalid
+root grammar therefore wins over every relative-view error. Both slots are null on recoverable failure. Checked copy-size overflow is
 `Error.Invalid`; actual OOM is terminal. Private full-path copies become NUL-delimited component
 storage only after complete grammar validation; caller bytes are unchanged. At most two traversal
 directory descriptors are live, and all path/component owners end with the call.
@@ -213,7 +213,9 @@ performed after a partial write.
 The retained-root operations are also `Impure`. They use the same fixed error model while mapping
 an unsafe grammar, symlink/non-directory traversal component, non-regular input, or identity change
 to `Error.Invalid`. Their two path operands are borrowed, and their successful reader/writer uses
-the unchanged existing Move/Drop path.
+the unchanged existing Move/Drop path. A same-final open/create pair has no hidden exclusion or
+snapshot: open returns `NotFound` if it observes absence, but may acquire the newly created regular
+inode while its writer is live. Consumers requiring immutable input must reject that overlap.
 
 ## Platform boundary and non-goals
 

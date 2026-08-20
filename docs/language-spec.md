@@ -1087,7 +1087,9 @@ the output constructor performs one exclusive create from the retained final par
 existing owned writer. They do not change cwd, retain a global root, publish a directory handle,
 create parents, normalize paths, or add rollback, durability, or transaction behavior. Missing,
 denied, invalid/type, and other native failures use the fixed `Error` mapping, and every ephemeral
-path copy and traversal descriptor is released on recoverable failure.
+path copy and traversal descriptor is released on recoverable failure. A same-final open/create pair
+has no implicit exclusion or byte snapshot: open may return `NotFound` before creation or acquire
+the new regular inode while its writer is live, so immutable-input consumers reject that overlap.
 `std.path`: `join`/`normalize` (owned), `base`/`dir`/`ext` (zero-copy
 substring views). `std.process`: `spawn`/`wait`/`kill`/`exec`, `exit` (runs cleanup) vs `abort`
 (immediate `_exit(1)`), `cpu_count()`, and the `command` builder — `process.command(cmd, args)` plus

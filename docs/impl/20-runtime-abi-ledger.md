@@ -113,9 +113,9 @@ allocation, platform, pair-cleanup, and owner matrix is in
 `docs/impl/27-fs-exclusive-publication-plan.md` and
 `docs/impl/std-design/fs.md`.
 
-## Request 18 retained-root regular-file access (design candidate)
+## Request 18 retained-root regular-file access (accepted design)
 
-Request 18 proposes exactly two keyed records and no new ABI shape. These rows are reserved by the
+Request 18 defines exactly two keyed records and no new ABI shape. These rows are reserved by the
 design but do not enter registry counts, declarations, exports, or generated runtime inventories
 until the implementation lands atomically:
 
@@ -125,9 +125,10 @@ until the implementation lands atomically:
 | `IoWriterCreateExclusiveBeneath` | `align_rt_io_writer_create_exclusive_beneath` | A12: `i32 @SYM(ptr, i64, ptr, i64, ptr)` |
 
 Both constructors keep the existing reader/writer output-slot convention: validate the slot first,
-clear it, validate and copy root before relative, parse both complete component sequences before a
-filesystem call, then traverse from retained directory descriptors. The runtime publishes a handle
-only after the final regular-file open or exclusive create succeeds. The implementation must update
+clear it, validate/copy/parse the complete root before inspecting relative, then
+validate/copy/parse the complete relative before a filesystem call and traverse from retained
+directory descriptors. The runtime publishes a handle only after the final regular-file open or
+exclusive create succeeds. The implementation must update
 the exact declaration golden, key/symbol bijection, exports, whole/per-unit declarations, and rt-LTO
 inventory in one change. The public contract and closure matrix are in
 `docs/impl/29-fs-retained-root-plan.md` and `docs/impl/std-design/fs.md`.

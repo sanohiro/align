@@ -9,7 +9,7 @@
 > **ステータス:** Request 14 は 2026-08-19 に実装済み（設計 PR #859 は
 > `a21eb8416f2088df68026f10c63a38cd0bd65538`、実装 PR #861 は
 > `3c2edd2f399c9e2c9551b4227c61b36d6a041e20` として merge）。align-llm の adoption gate は未完了。
-> Request 18 の retained-root regular-file access は設計候補で、実装は開始していない。
+> Request 18 の retained-root regular-file access は承認済み設計で、実装は開始していない。
 
 ## 概要
 
@@ -140,8 +140,9 @@ align_rt_io_writer_create_exclusive_beneath(
 ) -> i32
 ```
 
-検査順は output slot、root 全体の validation/copy、relative 全体の validation/copy、全 lexical component の
-parse、root traversal、relative-parent traversal、final operation とする。recoverable failure では両 slot とも
+検査順は output slot、root 全体の validation/copy/grammar、relative 全体の validation/copy/grammar、
+root traversal、relative-parent traversal、final operation とする。したがって不正な root grammar はすべての
+relative-view error より先になる。recoverable failure では両 slot とも
 null のままである。checked copy-size overflow は `Error.Invalid`、実際の OOM は terminal とする。完全な grammar
 検証後にだけ private な full-path copy を NUL 区切りの component storage にし、caller の byte は変更しない。
 走査中に live な directory descriptor は最大 2 つで、すべての path/component owner は call とともに終了する。
@@ -182,7 +183,9 @@ path operand は借用された `str` view であり、move も保持もされ�
 
 retained-root 操作も `Impure` である。同じ固定 error model を使い、unsafe grammar、symlink/non-directory
 traversal component、non-regular input、identity change を `Error.Invalid` にする。2 つの path operand は借用で、
-成功した reader/writer は既存の Move/Drop 経路をそのまま使う。
+成功した reader/writer は既存の Move/Drop 経路をそのまま使う。同じ final の open/create pair に hidden exclusion
+や snapshot はない。open が不在を観測すれば `NotFound`、create 後なら writer が live の間に新しい regular inode
+を取得し得る。immutable input が必要な consumer はこの overlap を拒否しなければならない。
 
 ## platform 境界と non-goal
 

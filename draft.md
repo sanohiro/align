@@ -2889,7 +2889,10 @@ denied, invalid/symlink/type, and other native failures use the fixed `Error` ma
 are borrowed only for the call; checked copy overflow is `Error.Invalid`, actual OOM is terminal,
 and all temporary path storage and directory descriptors are released on recoverable exits. The
 operations add no public directory handle, metadata API, canonical path, sandbox, parent creation,
-rollback, durability, or multi-file transaction.
+rollback, durability, or multi-file transaction. A same-final open/create pair has no implicit
+exclusion or snapshot: open returns `NotFound` if it observes absence, or may acquire the newly
+created regular inode while the writer is still live. An immutable-input consumer must reject that
+overlap itself.
 
 Any read that yields a `str`/`string` (`read_file`, `read_file_view`, and a decoded `str` from `json.decode`) validates the bytes as UTF-8 — `str` is always valid UTF-8 (§7, §12), so non-UTF-8 content fails with `Error.Invalid`; read binary zero-copy with `read_bytes_view` (a `bytes` mmap view, no validation) or into an owned buffer with `reader.read(buffer)` — `bytes`/`buffer` carry no UTF-8 invariant. `read_bytes_view` shares `read_file_view`'s v1 limitations: special / zero-length files fall back to an owned arena copy (not zero-copy), and concurrent truncation of a mapped file can raise `SIGBUS` (no handler is installed — a process-global signal handler is the hidden side effect Align forbids). For the same reason `read_dir` **excludes** any directory entry whose name is not valid UTF-8 (it cannot be a `string`, and is unreachable through a `str` path regardless).
 

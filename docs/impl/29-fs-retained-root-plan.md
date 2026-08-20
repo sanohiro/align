@@ -1,6 +1,6 @@
 # `std.fs` retained-root regular-file access
 
-Status: **DESIGN CANDIDATE for align-llm Request 18. Implementation has not started.**
+Status: **ACCEPTED DESIGN for align-llm Request 18. Implementation has not started.**
 
 This document is the authoritative public-contract ledger and implementation plan for two
 descriptor-relative filesystem constructors:
@@ -49,18 +49,18 @@ contract.
 The exact validation order is:
 
 1. reject a null output slot, then write a non-null slot to null;
-2. validate and copy the complete root view;
-3. validate and copy the complete relative view;
-4. parse the complete root and relative component grammars without a filesystem call;
-5. open and retain the starting directory and walk root components in written order;
-6. walk relative parent components in written order; and
-7. perform the operation-specific final observation/open or exclusive create.
+2. validate and copy the complete root view, then parse its complete component grammar;
+3. validate and copy the complete relative view, then parse its complete component grammar;
+4. open and retain the starting directory and walk root components in written order;
+5. walk relative parent components in written order; and
+6. perform the operation-specific final observation/open or exclusive create.
 
-Thus two malformed text inputs report the root error; a valid root with two invalid relative
-components reports the earlier component; and no directory descriptor or final operation exists
-until both complete lexical inputs are valid. UTF-8 byte sequences are preserved exactly. There is
-no Unicode normalization, case folding, separator rewriting, lossy filename conversion, or trailing
-slash removal.
+Thus invalid root grammar wins over every relative-view error, two malformed views report the root
+error, and a valid root with two invalid relative components reports the earlier component. No
+relative allocation occurs after an invalid root, and no directory descriptor or final operation
+exists until both complete lexical inputs are valid. UTF-8 byte sequences are preserved exactly.
+There is no Unicode normalization, case folding, caller-input rewriting, lossy filename conversion,
+or trailing-slash removal.
 
 Each complete owned path copy checks `len + 1` before allocation, appends one NUL, and lives through
 the call. After full grammar validation, the runtime replaces separator bytes only in those private
@@ -184,6 +184,7 @@ The complete operation-pair policy is:
 | --- | --- |
 | two `open_beneath` calls, same or different roots/files | supported independently |
 | `open_beneath` plus `create_exclusive_beneath`, disjoint finals | supported independently |
+| `open_beneath` plus `create_exclusive_beneath`, same final | no exclusion, wait, or snapshot is added. If the final is absent when the reader's no-follow observation runs, the reader returns `NotFound`; if exclusive create has already installed the regular entry, the reader may succeed on that same inode while the writer is still live and may later observe partial or changing bytes. For a pre-existing regular entry, create returns EEXIST and open may succeed; for a pre-existing non-regular entry, create returns EEXIST and open returns `Invalid`. C6 forbids this input/output overlap under its immutable-input/single-writer precondition. |
 | two `create_exclusive_beneath` calls, disjoint finals | supported independently |
 | two exclusive creates of the same final | exactly one native winner; the loser receives EEXIST and does not change the winner |
 | aggregate/focused test process plus another independent process | supported when their caller-owned paths are disjoint; same-output competition follows the row above |
@@ -283,7 +284,7 @@ must point to its final diff and passing owner or be explicitly deferred here.
 | MIR/LLVM/ABI | Distinct rvalues and exact A12 runtime rows, root-before-relative call order, existing status/handle CFG. | MIR print and fingerprint goldens; LLVM declaration/call/body assertions; runtime ABI golden; key/export reverse parity. |
 | Interfaces/cache | No format addition; imported/generic whole/per-unit calls retain exact behavior and identity. | interface compile/run, definition edit/substitution/revert cache owner, corrupted interface/checked-HIR rejection. |
 | Allocation/failure | Path/component owners and every intermediate fd balance on all recoverable failures; checked overflow is Invalid and actual OOM terminal. | allocation/fd counter matrix for zero/one/many components, each native failure injection, terminal OOM child, repeated cycles. |
-| Concurrency | Per-call state only; independent calls overlap; same create has one winner; failed second calls restore nothing global. | same-process full pair matrix, aggregate-plus-focused process pair, two-process independent and competing output cases. |
+| Concurrency | Per-call state only; independent calls overlap; same create has one winner; same-final open/create has the exact timing-dependent outcomes above and no byte snapshot; failed second calls restore nothing global. | Same-process full pair matrix, including barrier-controlled absent, newly installed, pre-existing regular, and pre-existing non-regular same-final open/create; aggregate-plus-focused process pair; two-process independent and competing output cases. |
 | Platform | Linux x86_64/ARM64 and macOS Apple Silicon implement the same descriptor contract without `/proc`. | local ext4/tmpfs and APFS owners, linked-worktree path, target-specific syscall/flag assertions, unsupported-platform compile disposition. |
 | Real client | C6d uses these operations before artifact decode/write, maps standard errors deterministically, and keeps verifier/lineage semantics separate. Lexical path rejection is `INVALID_PATH`; a referenced-input `NotFound` is `INPUT_NOT_FOUND`, `Invalid` (including a no-follow/type rejection) is `INPUT_TYPE`, and `Denied`/other read failures are `INPUT_READ`. Output-constructor failure remains the CLI filesystem `Result` boundary and emits no result artifact. | align-llm `c6d-request18-adoption`, then the complete `prompt-state-smoke`; no `exists`/ordinary `open`/`write_file`, subprocess, or app FFI on this boundary. |
 
@@ -330,3 +331,20 @@ Implementation follows the repository's cross-cutting gate: author matrix-to-dif
 one consolidated valid-finding repair, exact-head preflight, PR/CI, and merge. The sibling request
 register is updated with the merged surface and evidence, but remains uncommitted there until its
 align-llm adoption PR.
+
+## 6. Independent design-review disposition
+
+The fresh inspection-only review ran against base
+`cdf333dc0707edbc4984dc8b1cb6b52edf7b48d0` and design head
+`7f1a33dc73ac37e0424a1b5315d58a1fb85e6484`. Its two P2 findings are closed in this ledger and
+propagated through the public summaries before implementation authorization:
+
+| Finding | Closure in this design pass |
+| --- | --- |
+| Root grammar and malformed relative-view precedence conflicted | Validation now completes root view validation, owned copy, and full grammar parsing before inspecting or allocating relative. Invalid root grammar therefore wins over every relative error, matching the public table and owner matrix. |
+| The complete overlap matrix omitted same-final open/create | The overlap table now fixes absent, newly installed, pre-existing regular, and pre-existing non-regular outcomes; it promises no wait or byte snapshot, assigns barrier-controlled owner cases, and keeps C6's same-final input/output overlap forbidden by the consumer precondition. |
+
+The review log remains outside the worktree under `.git`. This table is the author-side
+finding-to-fix ledger. Neither closure changes the two-operation capability boundary, public type,
+ABI shape, ownership strategy, or implementation-layer split, so the repository's one-review/one-fix
+flow requires no second full-diff discovery review.

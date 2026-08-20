@@ -73,7 +73,8 @@ Missing and denied entries use `Error.NotFound` and `Error.Denied`. Unsafe gramm
 non-directory traversal, non-regular input, and identity change use `Error.Invalid`; other native
 errors keep the fixed errno mapping. These operations do not change cwd, retain a global root,
 return directory handles or canonical paths, create parents, or provide rollback, durability, or a
-transaction.
+transaction. They also add no same-final reader/writer synchronization: an open racing an exclusive
+create may see absence or acquire the new regular inode while its writer remains live.
 
 ## Zero-copy reads: `read_file_view`
 

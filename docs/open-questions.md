@@ -2741,7 +2741,7 @@ ABI boundary, platform floor, and closure matrix are authoritative in
 `docs/impl/27-fs-exclusive-publication-plan.md` and `docs/impl/std-design/fs.md`. The implementation
 shipped in PR #861; M9 remains closed.
 
-### Request 18 — retained-root regular-file access (DESIGN CANDIDATE 2026-08-20)
+### Request 18 — retained-root regular-file access (DESIGN SETTLED 2026-08-20; implementation pending)
 
 `std.fs` adds
 `fs.open_beneath(root: str, relative: str) -> Result<reader, Error>` and
@@ -2759,11 +2759,14 @@ denied entries retain `NotFound` and `Denied`; other native failures retain `Cod
 ephemeral bounded path/component owners and at most two live traversal descriptors, with terminal
 OOM and existing reader/writer Drop behavior. They do not change cwd, install a process-global
 root, return a directory handle or canonical path, expose general metadata, create parents, retry,
-delete, roll back, promise durability, or create a transaction. The exact grammar, validation
-precedence, A12 ABI rows, race semantics, platform boundary, implementation closure matrix, and
+delete, roll back, promise durability, or create a transaction. Same-final open/create adds no
+exclusion or byte snapshot: open may return `NotFound` before creation or acquire the newly created
+regular inode while its writer remains live, so immutable-input consumers must reject that overlap.
+The exact grammar, validation precedence, A12 ABI rows, race semantics, platform boundary,
+implementation closure matrix, and
 real-client owner are authoritative in `docs/impl/29-fs-retained-root-plan.md` and
-`docs/impl/std-design/fs.md`. Implementation starts only after this design is independently
-reviewed and merged; M9 remains closed.
+`docs/impl/std-design/fs.md`. Implementation starts only after this independently reviewed design
+merges; M9 remains closed.
 
 ### M10 scope decision (2026-07-04)
 

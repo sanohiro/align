@@ -69,7 +69,9 @@ constructor 自身は byte を読みません。`create_exclusive_beneath` は�
 missing と denied は `Error.NotFound` と `Error.Denied` です。unsafe grammar、symlink または
 non-directory traversal、非通常 input、identity change は `Error.Invalid` で、その他は固定 errno mapping を
 使います。これらの操作は cwd を変更せず、global root を保持せず、directory handle や canonical path を
-返さず、parent の作成、rollback、durability、transaction を提供しません。
+返さず、parent の作成、rollback、durability、transaction を提供しません。同じ final の reader/writer
+synchronization も追加しないため、exclusive create と競合する open は不在を観測するか、writer が live の間に
+新しい regular inode を取得し得ます。
 
 ## ゼロコピー読み込み: `read_file_view`
 

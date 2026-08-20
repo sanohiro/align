@@ -1522,10 +1522,10 @@ rationale for the I/O fast-path and mmap items already lives in `docs/open-quest
   `fs.rename_no_replace` design is accepted in `docs/impl/std-design/fs.md` and
   `docs/impl/27-fs-exclusive-publication-plan.md`; implementation is shipped and the C6f2 adoption
   gate remains pending. This is a post-M9 consumer capability and does not reopen M9's completion.
-- **Retained-root regular-file access** — Request 18 proposes `fs.open_beneath` and
+- **Retained-root regular-file access** — Request 18's accepted design adds `fs.open_beneath` and
   `fs.create_exclusive_beneath` under `docs/impl/29-fs-retained-root-plan.md`. They return the
   existing reader/writer after descriptor-relative no-follow traversal and add no directory-handle
-  or metadata surface. Implementation and the C6d adoption owner begin only after the design merges;
+  or metadata surface. Implementation and the C6d adoption owner begin after the design merges;
   this is another post-M9 consumer capability and does not reopen M9.
 - **M10+ modules** (unstarted, out of this milestone's scope): `std.net`, `std.http`, `std.cli`,
   `std.process`, `std.encoding`, `std.compress`, `std.rand`, `std.crypto`.
