@@ -224,6 +224,157 @@ fn exclusive_publication_requires_exact_arguments_and_import() {
     assert!(check_errs("m9fs-rename-wrong-arity", wrong_rename));
 }
 
+/// The retained-root constructors lower through the real runtime ABI, preserve the ordinary
+/// reader/writer ownership paths, and borrow owned-string operands rather than consuming them.
+#[test]
+fn retained_root_open_and_create_round_trip() {
+    if !backend_available() {
+        return;
+    }
+    let root = TempDir::new("beneath-roundtrip");
+    std::fs::create_dir_all(root.path.join("nested")).unwrap();
+    std::fs::write(root.path.join("nested/input"), b"retained payload").unwrap();
+    let prog = "\
+import std.fs
+import std.io
+fn open_for<T>(root: str, relative: str, marker: T) -> Result<reader, Error> = fs.open_beneath(root, relative)
+pub fn main(args: array<str>) -> Result<(), Error> {
+  root_owned := args[1].clone()
+  relative_owned := \"nested/input\".clone()
+  r := open_for(root_owned, relative_owned, 1)?
+  mut data := buffer(64)
+  n := r.read(data)?
+  w := fs.create_exclusive_beneath(root_owned, \"nested/output\")?
+  w.write(data.bytes())?
+  print(n)
+  print(root_owned.len())
+  print(relative_owned.len())
+  return Ok(())
+}
+";
+    let output = build_and_run_args("m9fs-beneath-roundtrip", prog, &[&root.str()]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("16\n{}\n12\n", root.str().len())
+    );
+    assert_eq!(
+        std::fs::read(root.path.join("nested/output")).unwrap(),
+        b"retained payload"
+    );
+}
+
+#[test]
+fn retained_root_formation_diagnostics_and_per_unit_generic_paths() {
+    let no_import =
+        "fn main() -> Result<(), Error> { r := fs.open_beneath(\".\", \"x\")? return Ok(()) }\n";
+    assert!(check_errs("m9fs-beneath-no-import", no_import));
+    for (name, call) in [
+        ("open", "fs.open_beneath(\".\")"),
+        (
+            "create",
+            "fs.create_exclusive_beneath(\".\", \"x\", \"extra\")",
+        ),
+    ] {
+        let source = format!(
+            "import std.fs\nfn main() -> Result<(), Error> {{ h := {call}? return Ok(()) }}\n"
+        );
+        assert!(check_errs(&format!("m9fs-beneath-{name}-arity"), &source));
+    }
+    let both_bad = "import std.fs\nfn main() -> Result<(), Error> {\n  r := fs.open_beneath(1, true)?\n  return Ok(())\n}\n";
+    let diagnostics = check_diagnostics("m9fs-beneath-both-types", both_bad);
+    assert_eq!(
+        diagnostics.matches(" vs str").count(),
+        2,
+        "both operands are checked in source order:\n{diagnostics}"
+    );
+
+    let helper = "module helper\nimport std.fs\npub fn open<T>(root: str, relative: str, marker: T) -> Result<reader, Error> = fs.open_beneath(root, relative)\npub fn create<T>(root: str, relative: str, marker: T) -> Result<writer, Error> = fs.create_exclusive_beneath(root, relative)\n";
+    let main = "module main\nimport helper\nfn main() -> Result<(), Error> {\n  r := helper.open(\".\", \"input\", 1)?\n  w := helper.create(\".\", \"output\", true)?\n  return Ok(())\n}\n";
+    let per_unit = check_per_unit_multi(
+        "m9fs-beneath-per-unit",
+        &[("helper.align", helper), ("main.align", main)],
+        "main.align",
+    );
+    assert!(
+        !per_unit.diags.has_errors(),
+        "generic imported retained-root calls must survive per-unit validation"
+    );
+}
+
+#[test]
+fn retained_root_mir_and_llvm_abi_are_distinct() {
+    if !backend_available() {
+        return;
+    }
+    let source = "\
+import std.fs
+fn main() -> Result<(), Error> {
+  r := fs.open_beneath(\".\", \"input\")?
+  w := fs.create_exclusive_beneath(\".\", \"output\")?
+  return Ok(())
+}
+";
+    let mut sources = SourceMap::new();
+    let checked = check(&mut sources, "m9fs-beneath-mir", source);
+    assert!(
+        !checked.diags.has_errors(),
+        "unexpected errors: {}",
+        align_driver::format_diagnostics(&sources, &checked.diags)
+    );
+    let mir = lower_to_mir(&checked.hir);
+    let rendered = align_mir::print::program_to_string(&mir);
+    assert!(rendered.contains("fs_open_beneath("), "{rendered}");
+    assert!(
+        rendered.contains("fs_create_exclusive_beneath("),
+        "{rendered}"
+    );
+    let identity = align_mir::print::codegen_input_to_string(&mir);
+    assert!(identity.contains("ReaderOpenBeneath"), "{identity}");
+    assert!(
+        identity.contains("WriterCreateExclusiveBeneath"),
+        "{identity}"
+    );
+
+    let llvm = emit_llvm(source);
+    for symbol in [
+        "align_rt_io_reader_open_beneath",
+        "align_rt_io_writer_create_exclusive_beneath",
+    ] {
+        let declaration = llvm
+            .lines()
+            .find(|line| line.starts_with("declare i32") && line.contains(&format!("@{symbol}(")))
+            .unwrap_or_else(|| panic!("missing declaration for {symbol}:\n{llvm}"));
+        assert!(
+            declaration.contains("(ptr, i64, ptr, i64, ptr)"),
+            "wrong A12 declaration: {declaration}"
+        );
+        let call = llvm
+            .lines()
+            .find(|line| line.contains("call i32") && line.contains(&format!("@{symbol}(")))
+            .unwrap_or_else(|| panic!("missing call for {symbol}:\n{llvm}"));
+        let arguments = call
+            .split_once(&format!("@{symbol}("))
+            .and_then(|(_, rest)| rest.rsplit_once(')'))
+            .map(|(arguments, _)| arguments)
+            .unwrap_or_else(|| panic!("malformed call: {call}"));
+        let argument_types: Vec<_> = arguments
+            .split(", ")
+            .map(|argument| argument.split_whitespace().next().unwrap())
+            .collect();
+        assert_eq!(
+            argument_types,
+            ["ptr", "i64", "ptr", "i64", "ptr"],
+            "wrong A12 call: {call}"
+        );
+    }
+}
+
 // --- read_dir ---------------------------------------------------------------------------------
 
 /// `fs.read_dir` returns an owned `array<string>` of the directory's entry names; `.len()` reports

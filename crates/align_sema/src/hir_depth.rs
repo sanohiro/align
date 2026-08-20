@@ -487,6 +487,14 @@ fn walk_body_records<'a>(
                     source: lhs,
                     destination: rhs,
                 }
+                | ExprKind::ReaderOpenBeneath {
+                    root: lhs,
+                    relative: rhs,
+                }
+                | ExprKind::CreateExclusiveBeneath {
+                    root: lhs,
+                    relative: rhs,
+                }
                 | ExprKind::TcpConnect {
                     host: lhs,
                     port: rhs,

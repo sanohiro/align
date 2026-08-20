@@ -28,5 +28,6 @@ task-group-probe = []
 
 [dependencies]
 align_hash = { path = "../align_hash" }
+libc = "0.2"
 memchr = "2.8.2"
 regex = "1.13.1"

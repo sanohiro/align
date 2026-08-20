@@ -10,8 +10,8 @@ The public-contract ledgers are
 > **Status:** Request 14 IMPLEMENTED 2026-08-19 (design PR #859, merged as
 > `a21eb8416f2088df68026f10c63a38cd0bd65538`; implementation PR #861, merged as
 > `3c2edd2f399c9e2c9551b4227c61b36d6a041e20`). The align-llm adoption gate is
-> pending. Request 18 retained-root regular-file access is an ACCEPTED DESIGN; implementation has not
-> started.
+> pending. Request 18 retained-root regular-file access is IMPLEMENTED; its align-llm adoption gate
+> is pending.
 
 ## Overview
 
