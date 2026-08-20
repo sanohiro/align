@@ -90,10 +90,10 @@ direct and optional strings use A73's existing JSON-string writer, and
 current descriptor domain. `BuilderWriteUint` and kinds `8`/`9` are shipped;
 the exact counts and A66 row above are current.
 
-## Request 14 exclusive filesystem publication (implementation candidate)
+## Request 14 exclusive filesystem publication (implemented)
 
 Request 14 adds exactly two keyed records and no new ABI shape. The implementation
-candidate activates these rows atomically with the HIR/MIR/runtime support, taking
+activated these rows atomically with the HIR/MIR/runtime support, taking
 the registry to 296 keyed / 309 base / 317 maximum optional-probe records:
 
 | Runtime key | Exact symbol | Existing ABI row and exact declaration |
@@ -112,6 +112,26 @@ rename, existence checks, `link` plus remove, or a subprocess. The full path,
 allocation, platform, pair-cleanup, and owner matrix is in
 `docs/impl/27-fs-exclusive-publication-plan.md` and
 `docs/impl/std-design/fs.md`.
+
+## Request 18 retained-root regular-file access (accepted design)
+
+Request 18 defines exactly two keyed records and no new ABI shape. These rows are reserved by the
+design but do not enter registry counts, declarations, exports, or generated runtime inventories
+until the implementation lands atomically:
+
+| Runtime key | Exact symbol | Existing ABI row and exact declaration |
+|---|---|---|
+| `IoReaderOpenBeneath` | `align_rt_io_reader_open_beneath` | A12: `i32 @SYM(ptr, i64, ptr, i64, ptr)` |
+| `IoWriterCreateExclusiveBeneath` | `align_rt_io_writer_create_exclusive_beneath` | A12: `i32 @SYM(ptr, i64, ptr, i64, ptr)` |
+
+Both constructors keep the existing reader/writer output-slot convention: validate the slot first,
+clear it, validate/copy/parse the complete root before inspecting relative, then
+validate/copy/parse the complete relative before a filesystem call and traverse from retained
+directory descriptors. The runtime publishes a handle only after the final regular-file open or
+exclusive create succeeds. The implementation must update
+the exact declaration golden, key/symbol bijection, exports, whole/per-unit declarations, and rt-LTO
+inventory in one change. The public contract and closure matrix are in
+`docs/impl/29-fs-retained-root-plan.md` and `docs/impl/std-design/fs.md`.
 
 ## Request 13 recursive owned JSON replacement (design accepted)
 

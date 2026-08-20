@@ -2714,7 +2714,7 @@ Settled ahead of any `std.io`/`std.fs`/`std.path`/`std.env`/`std.time` implement
    dispatch + required `import`.** "`std` as a real Align-over-FFI library" remains a Future item —
    not reopened for M9.
 
-### Request 14 — exclusive filesystem publication (DESIGN SETTLED 2026-08-19; implementation pending)
+### Request 14 — exclusive filesystem publication (SHIPPED 2026-08-19)
 
 `std.fs` adds the explicit publication primitives
 `fs.create_exclusive(path: str) -> Result<writer, Error>` and
@@ -2738,8 +2738,35 @@ evidence, and explicitly removes only its own residue. Clean staging/finalizatio
 `OUTPUT_WRITE`; an owned cleanup or required recheck failure maps to
 `OUTPUT_PAIR_CLEANUP_FAILED` with the exact surviving evaluator-owned paths. The accepted design,
 ABI boundary, platform floor, and closure matrix are authoritative in
-`docs/impl/27-fs-exclusive-publication-plan.md` and `docs/impl/std-design/fs.md`. Implementation
-is pending; M9 remains closed.
+`docs/impl/27-fs-exclusive-publication-plan.md` and `docs/impl/std-design/fs.md`. The implementation
+shipped in PR #861; M9 remains closed.
+
+### Request 18 — retained-root regular-file access (DESIGN SETTLED 2026-08-20; implementation pending)
+
+`std.fs` adds
+`fs.open_beneath(root: str, relative: str) -> Result<reader, Error>` and
+`fs.create_exclusive_beneath(root: str, relative: str) -> Result<writer, Error>`. Both validate the
+complete borrowed root and strict relative path before filesystem access, then retain and walk
+directory descriptors without following a root, intermediate, or final symlink. The input
+constructor observes, opens, and revalidates the same regular final file before returning the
+existing Move `reader`; it reads no artifact byte. The output constructor performs one native
+exclusive create from the retained final parent and returns the existing Move `writer`; every
+occupied final entry stays unchanged.
+
+The operations use the fixed errno-to-`Error` model. Unsafe grammar, symlink/non-directory
+traversal, non-regular input, and observed/opened identity change are `Error.Invalid`; missing and
+denied entries retain `NotFound` and `Denied`; other native failures retain `Code(errno)`. Both use
+ephemeral bounded path/component owners and at most two live traversal descriptors, with terminal
+OOM and existing reader/writer Drop behavior. They do not change cwd, install a process-global
+root, return a directory handle or canonical path, expose general metadata, create parents, retry,
+delete, roll back, promise durability, or create a transaction. Same-final open/create adds no
+exclusion or byte snapshot: open may return `NotFound` before creation or acquire the newly created
+regular inode while its writer remains live, so immutable-input consumers must reject that overlap.
+The exact grammar, validation precedence, A12 ABI rows, race semantics, platform boundary,
+implementation closure matrix, and
+real-client owner are authoritative in `docs/impl/29-fs-retained-root-plan.md` and
+`docs/impl/std-design/fs.md`. Implementation starts only after this independently reviewed design
+merges; M9 remains closed.
 
 ### M10 scope decision (2026-07-04)
 

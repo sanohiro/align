@@ -50,6 +50,29 @@ fs.rename_no_replace(source: str, destination: str) -> Result<(), Error>
 閉じ、両方の最終パスを再確認し、result then evidence の順に rename し、自分が所有するパスだけを
 明示的に削除しなければなりません。
 
+## retained root 配下の通常ファイル
+
+通常の pathname resolution ではなく symlink traversal の拒否が必要な場合、`std.fs` は次の 2 つの
+明示的な constructor を提供します。
+
+```text
+fs.open_beneath(root: str, relative: str) -> Result<reader, Error>
+fs.create_exclusive_beneath(root: str, relative: str) -> Result<writer, Error>
+```
+
+2 番目の path は空でない strict relative path です。両操作は root と relative の完全な綴りを検証し、
+directory descriptor を保持して、root・中間・末尾の symlink を追跡せずに走査します。
+`open_beneath` は末尾が open 前後で同じ通常ファイルであることを要求し、通常の所有 `reader` を返します。
+constructor 自身は byte を読みません。`create_exclusive_beneath` は保持した parent から存在しない末尾を
+1 つ作成し、通常の所有 `writer` を返します。占有済みの entry は変更されません。
+
+missing と denied は `Error.NotFound` と `Error.Denied` です。unsafe grammar、symlink または
+non-directory traversal、非通常 input、identity change は `Error.Invalid` で、その他は固定 errno mapping を
+使います。これらの操作は cwd を変更せず、global root を保持せず、directory handle や canonical path を
+返さず、parent の作成、rollback、durability、transaction を提供しません。同じ final の reader/writer
+synchronization も追加しないため、exclusive create と競合する open は不在を観測するか、writer が live の間に
+新しい regular inode を取得し得ます。
+
 ## ゼロコピー読み込み: `read_file_view`
 
 ```align

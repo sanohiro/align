@@ -1060,7 +1060,7 @@ require the buffer argument to be a bare local declared with `mut`; temporaries 
 are rejected before the operation is formed.
 
 `std.fs`: `read_file`/`write_file`/`open`/`create`/
-`create_exclusive`/`rename_no_replace`/`exists`/`remove`/`read_dir`, plus `create_rw` / `open_rw`
+`create_exclusive`/`rename_no_replace`/`open_beneath`/`create_exclusive_beneath`/`exists`/`remove`/`read_dir`, plus `create_rw` / `open_rw`
 (the `file` constructors — `O_RDWR` fresh or must-exist), `read_file_view` (a `str` mmap view — requires an enclosing
 arena, escapes via `.clone()`) and `read_bytes_view` (its binary sibling — the same arena mmap
 without UTF-8 validation, returning a `bytes` view so a GGUF/binary asset maps zero-copy).
@@ -1077,7 +1077,20 @@ filesystems, and makes no crash-durability or pair-transaction promise. Both ope
 NUL-free valid UTF-8 paths for the call; validation and ephemeral NUL-terminated marshalling occur
 before the native operation, with source before destination for rename. A checked capacity
 overflow is `Error.Invalid`; actual allocation failure is terminal OOM. `std.fs` does not classify
-filesystem types or hide a publication cleanup lock. `std.path`: `join`/`normalize` (owned), `base`/`dir`/`ext` (zero-copy
+filesystem types or hide a publication cleanup lock.
+`fs.open_beneath(root: str, relative: str) -> Result<reader, Error>` and
+`fs.create_exclusive_beneath(root: str, relative: str) -> Result<writer, Error>` validate both
+complete paths, then walk from a retained root without following root, intermediate, or final
+symlinks. The second path is strict and relative. The input constructor requires and revalidates
+the same regular final file before returning the existing owned reader and reads no bytes itself;
+the output constructor performs one exclusive create from the retained final parent and returns the
+existing owned writer. They do not change cwd, retain a global root, publish a directory handle,
+create parents, normalize paths, or add rollback, durability, or transaction behavior. Missing,
+denied, invalid/type, and other native failures use the fixed `Error` mapping, and every ephemeral
+path copy and traversal descriptor is released on recoverable failure. A same-final open/create pair
+has no implicit exclusion or byte snapshot: open may return `NotFound` before creation or acquire
+the new regular inode while its writer is live, so immutable-input consumers reject that overlap.
+`std.path`: `join`/`normalize` (owned), `base`/`dir`/`ext` (zero-copy
 substring views). `std.process`: `spawn`/`wait`/`kill`/`exec`, `exit` (runs cleanup) vs `abort`
 (immediate `_exit(1)`), `cpu_count()`, and the `command` builder — `process.command(cmd, args)` plus
 `cwd`/`env`/`env_clear`/`timeout_ns` setters, the optional per-stream

@@ -52,6 +52,30 @@ capacity overflow is `Error.Invalid`; actual allocation failure is terminal
 OOM. A two-file publisher must close both writers, recheck both final paths,
 rename result then evidence, and explicitly remove only paths it owns.
 
+## Retained-root regular files
+
+When a caller must reject symlink traversal rather than use ordinary pathname resolution, `std.fs`
+provides two explicit constructors:
+
+```text
+fs.open_beneath(root: str, relative: str) -> Result<reader, Error>
+fs.create_exclusive_beneath(root: str, relative: str) -> Result<writer, Error>
+```
+
+The second path is a strict non-empty relative path. Both operations validate the complete root and
+relative spelling, retain directory descriptors, and walk without following root, intermediate, or
+final symlinks. `open_beneath` requires the final entry to be the same regular file before and after
+open and returns the normal owned `reader`; it reads no bytes in the constructor.
+`create_exclusive_beneath` creates one absent final entry from the retained parent and returns the
+normal owned `writer`; an occupied entry stays unchanged.
+
+Missing and denied entries use `Error.NotFound` and `Error.Denied`. Unsafe grammar, symlink or
+non-directory traversal, non-regular input, and identity change use `Error.Invalid`; other native
+errors keep the fixed errno mapping. These operations do not change cwd, retain a global root,
+return directory handles or canonical paths, create parents, or provide rollback, durability, or a
+transaction. They also add no same-final reader/writer synchronization: an open racing an exclusive
+create may see absence or acquire the new regular inode while its writer remains live.
+
 ## Zero-copy reads: `read_file_view`
 
 ```align
