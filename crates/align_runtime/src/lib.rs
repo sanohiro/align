@@ -8540,7 +8540,15 @@ fn beneath_same_identity(observed: &libc::stat, opened: &libc::stat) -> bool {
 fn beneath_post_observation_error() -> i32 {
     let error = std::io::Error::last_os_error();
     match error.raw_os_error() {
-        Some(libc::ENOENT) | Some(libc::ELOOP) | Some(libc::ENOTDIR) => AL_INVALID,
+        // The entry was a directory/regular file at the no-follow observation. These errors are
+        // therefore evidence that it disappeared or became a symlink, non-directory, socket, or
+        // unavailable device before open, rather than an error of the observed object.
+        Some(libc::ENOENT)
+        | Some(libc::ELOOP)
+        | Some(libc::ENOTDIR)
+        | Some(libc::ENXIO)
+        | Some(libc::ENODEV)
+        | Some(libc::EOPNOTSUPP) => AL_INVALID,
         _ => io_error_to_status(&error),
     }
 }
@@ -29255,6 +29263,29 @@ mod tests {
         clear_gate();
         assert_eq!(status, AL_INVALID);
         assert_eq!(rejected, 0);
+
+        // A type replacement that refuses ordinary open (a Unix socket reports ENXIO on Linux)
+        // is still an observed-to-open type race, never an operation-specific native Code error.
+        std::fs::write(root.join("socket-victim"), b"old socket victim").unwrap();
+        let gate = install_gate(BeneathTestCheckpoint::FinalObserved, "socket-victim");
+        let worker_root = root_s.clone();
+        let worker = std::thread::spawn(move || {
+            let (status, reader) = beneath_reader(&worker_root, "socket-victim");
+            (status, reader as usize)
+        });
+        gate.entered.wait();
+        std::fs::rename(
+            root.join("socket-victim"),
+            root.join("socket-victim-old"),
+        )
+        .unwrap();
+        let socket = std::os::unix::net::UnixDatagram::bind(root.join("socket-victim")).unwrap();
+        gate.release.wait();
+        let (status, rejected) = worker.join().unwrap();
+        clear_gate();
+        assert_eq!(status, AL_INVALID);
+        assert_eq!(rejected, 0);
+        drop(socket);
 
         // A directory replacement between observation and open is likewise rejected.
         std::fs::create_dir(root.join("step")).unwrap();
