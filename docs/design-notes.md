@@ -1119,6 +1119,30 @@ for a hard bound accepts the explicit two-region response allocation needed to a
 
 ---
 
+## Why trusted filesystem access returns a file handle, not a path or directory handle
+
+A canonical pathname is only a string observation. Reopening it would repeat ambient pathname
+resolution and lose the directory identities that made the first observation trustworthy.
+`fs.open_beneath` therefore performs the no-follow walk and returns the existing owned `reader`
+bound to the final descriptor. `fs.create_exclusive_beneath` follows the same rule for the existing
+owned `writer`. The proof and the usable capability are one value, with the language's normal Move
+and Drop behavior.
+
+The public surface remains deliberately narrower than an `openat` wrapper. A root plus strict
+relative path makes containment visible in source, while a public directory-handle type, metadata
+reflection, canonicalization, or mode flags would introduce new ownership and policy surfaces before
+a consumer establishes them. Two named regular-file constructors also keep input validation and
+exclusive output creation explicit; a mode bit that changed the final type or mutation behavior
+would hide a material effect.
+
+Descriptor-relative traversal closes ancestor replacement without changing cwd or installing a
+global root. The constructor validates both complete strings first, walks with no-follow semantics,
+revalidates object identity, and releases all temporary owners on failure. Native failures still use
+the one settled `Error` mapping, so the safety boundary does not invent a filesystem-specific error
+model.
+
+---
+
 ## The package philosophy
 
 A dependency should be *ordinary source in your tree*, not a resolved artifact. Align's package layer

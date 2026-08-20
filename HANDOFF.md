@@ -7,15 +7,14 @@ per-PR journals are preserved in
 [`docs/archive/HANDOFF-2026-07-25.md`](docs/archive/HANDOFF-2026-07-25.md);
 neither is a source of current status.
 
-_Last updated: 2026-08-19._ Request 14's exclusive-create and no-replace publication primitives are
+_Last updated: 2026-08-20._ Request 18's retained-root regular-file constructors are proposed in
+`docs/impl/29-fs-retained-root-plan.md` to unblock align-llm C6d; implementation has not started and
+must follow the independently reviewed design. Request 16's sum-payload projection and Request 17's
+dynamic aggregate projection are implemented and real-client verified by align-llm PR #98 at
+`e44b3cca9f834266d6f541d7a68eec2b2c3de9ec`, pinned to this Align revision; C6c2 is complete.
+Request 14's exclusive-create and no-replace publication primitives are
 merged in Align PR #861 at `3c2edd2f399c9e2c9551b4227c61b36d6a041e20`; its
-`c6f2-request14-adoption` real-client gate remains pending. Request 16's borrow-safe sum-payload match projection is merged in
-Align PR #857 at `8557c1525aefd9a4afef02d1ec5c2f88e16db4e4`; its
-`c6-borrowed-option-adoption` real-client gate exposed the next required boundary: shared-borrow
-access to array-bearing optional records and indexed Move record elements. Request 17's general
-dynamic aggregate projection implementation closes that compiler boundary under
-`docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; only the exact C6c2 adoption remains
-pending. Request 7's signed merge verification (#848), decoded-owner cleanup
+`c6f2-request14-adoption` real-client gate remains pending. Request 7's signed merge verification (#848), decoded-owner cleanup
 prerequisite (#849), and escaped-string language design and
 implementation (#850), following the trusted controller/verifier
 orchestration core (PR #842), the merge-race owners (PR #840) and
@@ -356,12 +355,13 @@ facts must live in this repository.
   also `ALIGN_MERGED`. Request 9's direct owned-record JSON implementation is merged through #852
   against `docs/impl/24-owned-json-plan.md`. Request 13's recursive owned-JSON implementation is
   merged through PR #854 as `340a3304724fefb56c2b1aa642e6b2b2c169e6d7` against
-  `docs/impl/25-recursive-owned-json-plan.md`; its align-llm adoption gate remains pending.
+  `docs/impl/25-recursive-owned-json-plan.md`; its align-llm adoption is verified.
   Request 14 is `ALIGN_MERGED` through implementation PR #861, merged as
   `3c2edd2f399c9e2c9551b4227c61b36d6a041e20`; its align-llm adoption gate remains pending.
-  Request 16 is `ALIGN_MERGED` through #857; its align-llm adoption gate remains
-  pending on Request 17. Request 17's dynamic aggregate projection design is settled in
-  `docs/impl/28-borrowed-dynamic-aggregate-projection-plan.md`; implementation is next.
+  Request 16 is `ALIGN_LLM_VERIFIED` through Align #857 and align-llm #98. Request 17's dynamic
+  aggregate projection implementation is merged through Align PR #865 at
+  `cdf333dc0707edbc4984dc8b1cb6b52edf7b48d0` and is `ALIGN_LLM_VERIFIED` through align-llm #98.
+  Request 18 is the current design prerequisite for C6d and is not implemented.
 
 Consumer-gated deferrals that remain intentional:
 

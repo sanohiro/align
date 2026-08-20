@@ -2834,6 +2834,8 @@ fs.open(path: str)   -> Result<reader, Error>
 fs.create(path: str) -> Result<writer, Error>
 fs.create_exclusive(path: str) -> Result<writer, Error>
 fs.rename_no_replace(source: str, destination: str) -> Result<(), Error>
+fs.open_beneath(root: str, relative: str) -> Result<reader, Error>
+fs.create_exclusive_beneath(root: str, relative: str) -> Result<writer, Error>
 fs.create_rw(path: str) -> Result<file, Error>   // O_RDWR|O_CREAT|O_TRUNC — a fresh random-access file
 fs.open_rw(path: str)   -> Result<file, Error>   // O_RDWR, must exist — in-place update (see std.io `file`)
 fs.exists(path: str) -> bool
@@ -2873,6 +2875,21 @@ final paths, rename result then evidence, and explicitly clean only its own
 temporary or already-published paths. The consumer owns any single-writer and
 trusted-path precondition; `std.fs` does not classify filesystems or provide a
 hidden cleanup lock.
+
+`fs.open_beneath` and `fs.create_exclusive_beneath` are separate retained-root constructors. The
+root may be absolute, relative, exactly `.`, or exactly `/`; the second argument is a non-empty
+strict relative path. Both reject empty, `.` or `..` components, validate both complete inputs
+before filesystem access, retain and walk directory descriptors without following root or
+intermediate symlinks, and never change process cwd or install a global root. `open_beneath`
+observes and opens the final entry without following it, requires the same regular-file identity
+before and after open, reads no byte in the constructor, and returns the existing owned `reader`.
+`create_exclusive_beneath` performs one exclusive no-follow create from the retained final parent
+and returns the existing owned `writer`; every occupied final entry remains unchanged. Missing,
+denied, invalid/symlink/type, and other native failures use the fixed `Error` mapping. Both paths
+are borrowed only for the call; checked copy overflow is `Error.Invalid`, actual OOM is terminal,
+and all temporary path storage and directory descriptors are released on recoverable exits. The
+operations add no public directory handle, metadata API, canonical path, sandbox, parent creation,
+rollback, durability, or multi-file transaction.
 
 Any read that yields a `str`/`string` (`read_file`, `read_file_view`, and a decoded `str` from `json.decode`) validates the bytes as UTF-8 — `str` is always valid UTF-8 (§7, §12), so non-UTF-8 content fails with `Error.Invalid`; read binary zero-copy with `read_bytes_view` (a `bytes` mmap view, no validation) or into an owned buffer with `reader.read(buffer)` — `bytes`/`buffer` carry no UTF-8 invariant. `read_bytes_view` shares `read_file_view`'s v1 limitations: special / zero-length files fall back to an owned arena copy (not zero-copy), and concurrent truncation of a mapped file can raise `SIGBUS` (no handler is installed — a process-global signal handler is the hidden side effect Align forbids). For the same reason `read_dir` **excludes** any directory entry whose name is not valid UTF-8 (it cannot be a `string`, and is unreachable through a `str` path regardless).
 
