@@ -8560,13 +8560,13 @@ fn beneath_open_start(absolute: bool) -> Result<BeneathFd, i32> {
         return Err(AL_CODE + libc::EIO);
     }
     let name = if absolute {
-        b"/\0".as_ptr()
+        c"/".as_ptr()
     } else {
-        b".\0".as_ptr()
+        c".".as_ptr()
     };
     let fd = unsafe {
         libc::open(
-            name.cast(),
+            name,
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
