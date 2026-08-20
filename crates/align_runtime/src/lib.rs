@@ -8748,12 +8748,15 @@ fn beneath_create_exclusive(parent: i32, name: *const libc::c_char) -> Result<Be
     if beneath_test_fail(BeneathTestFailpoint::CreateFinal) {
         return Err(AL_CODE + libc::EIO);
     }
+    // `openat` is variadic, so C's default argument promotions require an
+    // unsigned int even where `mode_t` itself is narrower (notably macOS).
+    let mode: libc::c_uint = 0o666;
     let fd = unsafe {
         libc::openat(
             parent,
             name,
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o666 as libc::mode_t,
+            mode,
         )
     };
     if fd < 0 {
