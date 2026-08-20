@@ -18324,10 +18324,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 "open_beneath",
             )
             .map_err(|e| self.err(e))?;
-        Ok(status
+        status
             .try_as_basic_value()
             .basic()
-            .expect("open_beneath returns i32 status"))
+            .ok_or_else(|| self.err("open_beneath runtime row returned no status value"))
     }
 
     /// Read a display operand as an integer, reporting a compiler error instead of panicking when

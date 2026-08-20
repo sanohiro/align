@@ -8375,7 +8375,7 @@ unsafe fn abi_exclusive_path(ptr: *const u8, len: i64) -> Result<std::ffi::CStri
         return Err(AL_INVALID);
     }
     n.checked_add(1)
-        .filter(|capacity| *capacity <= isize::MAX as usize)
+        .filter(|capacity| *capacity <= isize::MAX.unsigned_abs())
         .ok_or(AL_INVALID)?;
     // The checks above prove that `CString::new` cannot reject the bytes. Keep the conversion
     // fail-closed anyway; its allocation remains intentionally infallible under the locked OOM
@@ -8416,7 +8416,7 @@ unsafe fn abi_beneath_path(ptr: *const u8, len: i64, root: bool) -> Result<Benea
     }
     let capacity = n
         .checked_add(1)
-        .filter(|capacity| *capacity <= isize::MAX as usize)
+        .filter(|capacity| *capacity <= isize::MAX.unsigned_abs())
         .ok_or(AL_INVALID)?;
     let source = unsafe { std::slice::from_raw_parts(ptr, n) };
     if std::str::from_utf8(source).is_err() || source.contains(&0) {
@@ -28662,7 +28662,7 @@ mod tests {
             "read from retained reader failed: {}",
             std::io::Error::last_os_error()
         );
-        bytes.truncate(count as usize);
+        bytes.truncate(usize::try_from(count).unwrap_or_default());
         unsafe { align_rt_io_reader_free(reader) };
         bytes
     }
@@ -29253,7 +29253,7 @@ mod tests {
         let worker_root = root_s.clone();
         let worker = std::thread::spawn(move || {
             let (status, reader) = beneath_reader(&worker_root, "victim");
-            (status, reader as usize)
+            (status, reader.is_null())
         });
         gate.entered.wait();
         std::fs::rename(root.join("victim"), root.join("victim-old")).unwrap();
@@ -29262,7 +29262,7 @@ mod tests {
         let (status, rejected) = worker.join().unwrap();
         clear_gate();
         assert_eq!(status, AL_INVALID);
-        assert_eq!(rejected, 0);
+        assert!(rejected);
 
         // A type replacement that refuses ordinary open (a Unix socket reports ENXIO on Linux)
         // is still an observed-to-open type race, never an operation-specific native Code error.
@@ -29271,7 +29271,7 @@ mod tests {
         let worker_root = root_s.clone();
         let worker = std::thread::spawn(move || {
             let (status, reader) = beneath_reader(&worker_root, "socket-victim");
-            (status, reader as usize)
+            (status, reader.is_null())
         });
         gate.entered.wait();
         std::fs::rename(
@@ -29284,7 +29284,7 @@ mod tests {
         let (status, rejected) = worker.join().unwrap();
         clear_gate();
         assert_eq!(status, AL_INVALID);
-        assert_eq!(rejected, 0);
+        assert!(rejected);
         drop(socket);
 
         // A directory replacement between observation and open is likewise rejected.
@@ -29294,7 +29294,7 @@ mod tests {
         let worker_root = root_s.clone();
         let worker = std::thread::spawn(move || {
             let (status, reader) = beneath_reader(&worker_root, "step/input");
-            (status, reader as usize)
+            (status, reader.is_null())
         });
         gate.entered.wait();
         std::fs::rename(root.join("step"), root.join("step-old")).unwrap();
@@ -29304,7 +29304,7 @@ mod tests {
         let (status, rejected) = worker.join().unwrap();
         clear_gate();
         assert_eq!(status, AL_INVALID);
-        assert_eq!(rejected, 0);
+        assert!(rejected);
 
         // Once the ancestor descriptor has been opened and identity-checked, renaming its public
         // path cannot redirect the remaining traversal to a replacement directory.
@@ -29314,20 +29314,18 @@ mod tests {
         let worker_root = root_s.clone();
         let worker = std::thread::spawn(move || {
             let (status, reader) = beneath_reader(&worker_root, "held/input");
-            (status, reader as usize)
+            let bytes = (status == 0).then(|| read_beneath_reader(reader));
+            (status, bytes)
         });
         gate.entered.wait();
         std::fs::rename(root.join("held"), root.join("held-moved")).unwrap();
         std::fs::create_dir(root.join("held")).unwrap();
         std::fs::write(root.join("held/input"), b"replacement bytes").unwrap();
         gate.release.wait();
-        let (status, reader) = worker.join().unwrap();
+        let (status, bytes) = worker.join().unwrap();
         clear_gate();
         assert_eq!(status, 0);
-        assert_eq!(
-            read_beneath_reader(reader as *mut Reader),
-            b"retained bytes"
-        );
+        assert_eq!(bytes.as_deref(), Some(b"retained bytes".as_slice()));
 
         std::fs::remove_dir_all(&root).unwrap();
     }
