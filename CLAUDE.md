@@ -365,6 +365,15 @@ milestone gates, and specialized verification bundles.
 `../align-llm/docs/align-requests.md` is the request register for the external
 align-llm client. For align-llm-driven work:
 
+The sibling `../align-llm` repository is an external consumer. Work there is
+limited to reading its requests and writing Align's answers or status back to
+this register. Unless the user explicitly asks for additional work in that
+repository, never modify its code, tests, fixtures, build machinery, branches,
+commits, pull requests, or merge state. In particular, do not perform
+align-llm adoption work merely to advance a request from `ALIGN_MERGED` to
+`ALIGN_LLM_VERIFIED` or `CLOSED`; report that consumer-owned work as pending
+and continue only with in-scope Align work.
+
 1. Read the register before starting.
 2. Implement the request in Align's normal design-first discipline.
 3. Update the same register with Align's status, shipped surface, ownership
