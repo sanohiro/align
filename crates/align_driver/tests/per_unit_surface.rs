@@ -186,7 +186,9 @@ fn cli_build_run_size_match_library_reference() {
     let proj = Proj::new("cli-equiv", &[("app.align", src)]);
 
     // Library whole-program reference, emitted at exactly the path the CLI will use so nothing
-    // path-dependent can differ, and read into memory before the CLI overwrites it.
+    // path-dependent can differ, and read into memory before the CLI overwrites it. This gate is
+    // about per-unit/whole-program parity, not the CLI's profile-based rt-LTO default, so hold both
+    // sides explicitly OFF (the same isolation used by the N=1 LLVM parity owner below).
     let obj = proj.dir.join("app.o");
     let exe = proj.dir.join("app");
     let mut sm = SourceMap::new();
@@ -202,7 +204,7 @@ fn cli_build_run_size_match_library_reference() {
     // The OBJECT is the portable form of this gate, and the stronger one: it is the compiler's
     // actual output, with no linker- or platform-dependent content in it. `emit-obj` is the same
     // per-unit pipeline `build` runs.
-    let emitted = proj.run(&["emit-obj", "app.align"]);
+    let emitted = proj.run(&["emit-obj", "--no-rt-lto", "app.align"]);
     assert!(emitted.status.success(), "emit-obj failed: {}", String::from_utf8_lossy(&emitted.stderr));
     let cli_obj_bytes = std::fs::read(&obj).expect("read cli object");
     assert_eq!(
@@ -212,7 +214,7 @@ fn cli_build_run_size_match_library_reference() {
 
     // `build`: the produced `<stem>` executable runs and, where the platform permits, is
     // byte-identical to the reference link.
-    let built = proj.run(&["build", "app.align"]);
+    let built = proj.run(&["build", "--no-rt-lto", "app.align"]);
     assert!(built.status.success(), "build failed: {}", String::from_utf8_lossy(&built.stderr));
     let cli_exe_bytes = std::fs::read(&exe).expect("read cli exe");
 
@@ -233,12 +235,12 @@ fn cli_build_run_size_match_library_reference() {
     }
 
     // `run`: program output is identical.
-    let ran = proj.run(&["run", "app.align"]);
+    let ran = proj.run(&["run", "--no-rt-lto", "app.align"]);
     assert!(ran.status.success(), "run failed: {}", String::from_utf8_lossy(&ran.stderr));
     assert_eq!(ran.stdout, b"1234\n", "run output must match the program");
 
     // `size`: a report is produced for the built executable.
-    let sized = proj.run(&["size", "app.align"]);
+    let sized = proj.run(&["size", "--no-rt-lto", "app.align"]);
     assert!(sized.status.success(), "size failed: {}", String::from_utf8_lossy(&sized.stderr));
     assert!(
         String::from_utf8_lossy(&sized.stdout).contains("total size:"),

@@ -28,7 +28,6 @@ json_scan_identity	json_scan_cross_compiler_identity	env
 m5	json_scalar_array_str_element_rejected
 m5	json_scan_generic_return_context_inference_matrix
 owned_structs	move_struct_in_unsupported_containers_rejected
-per_unit_surface	cli_build_run_size_match_library_reference
 pkg_db_q5b1	meta_query_rejects_non_live_execution_targets_before_materialization
 pkg_db_q6	layer1_case_fingerprints_match_the_golden
 pkg_db_q6	postgres_compound_shaping_dispatches_once_on_connection_and_transaction
@@ -42,7 +41,6 @@ unit_cache	a_descriptor_owning_unit_is_never_cached
 vectorize_shapes	canonical_indexed_loop_skeleton_raw
 
 # Triage of this baseline (see backlog for detail):
-#   B: per_unit_surface — rt_lto size mismatch, fix approach known
-#   C: five out-of-gate pkg.db cells (pkg_db_q5b1, pkg_db_q6, and the
+#   A: five out-of-gate pkg.db cells (pkg_db_q5b1, pkg_db_q6, and the
 #      descriptor-owning unit_cache case) — owned by the db session
-#   D: the remaining nine legacy reds — triaged one by one
+#   B: the remaining nine legacy reds — triaged one by one
