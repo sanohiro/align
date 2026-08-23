@@ -3399,11 +3399,11 @@ fn json_standalone_array_of_move_struct_local_drops_clean() {
 }
 
 #[test]
-fn json_array_of_move_struct_with_string_field_rejected_via_element() {
-    // Request 10 makes the bare `array<string>` field a valid ordinary Move field, but does not
-    // widen JSON's recursive element grammar. JSON must still reject an `array<Struct>` whose
-    // element owns that field before descriptor/codegen publication.
-    assert!(check_errs(
+fn json_array_of_move_struct_with_string_field_uses_recursive_owned_route() {
+    // Request 10 widened the recursive owned-JSON graph together with the ordinary Move field:
+    // an `array<Struct>` element may itself own `array<string>`. The focused recursive-owned JSON
+    // suite owns runtime construction and cleanup; this original boundary fixture pins admission.
+    assert!(!check_errs(
         "json-arr-move-arrstring",
         "import core.json\n\
          Bag { words: array<string> }\n\

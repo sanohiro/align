@@ -211,7 +211,7 @@ concurrently through `scripts/run-suite-binaries.sh`, and diffs the observed
 failures against `scripts/known-failures.txt` in both directions. That manifest —
 not this file — is the live baseline: a new failure is named, and a line whose
 test starts passing is red until the fixing change deletes it. The 2026-08-13
-baseline (#782, run 31669771705) is now burned down to 14 strict entries plus
+baseline (#782, run 31669771705) is now burned down to 12 strict entries plus
 one environment-dependent entry in two triage classes recorded in the manifest's
 own comment, and running
 `scripts/run-suite-binaries.sh` with no arguments reproduces the same judgement
@@ -223,8 +223,7 @@ class (#745), the open-world callback rule that had broken `apps/web` since #672
 and the silent-empty-MIR break it hid (#742), the validator's private copy of
 the mangling scheme (#744), and fixed struct-array slicing for the router
 (#743). What remains red is exactly `scripts/known-failures.txt`; its triage
-comment carries the open questions, including the two `m5` owners that expect
-rejections the compiler no longer emits.
+comment carries the open questions.
 
 The silent-empty-MIR class — a body validator re-deriving a fact the producer
 owns — reached eight occurrences and is closed at its root by #774: the fallible
