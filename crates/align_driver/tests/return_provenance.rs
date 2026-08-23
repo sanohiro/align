@@ -405,6 +405,20 @@ pub fn deferred_pipeline_projection(first: str, second: str) -> str {
 }
 
 #[test]
+fn borrowed_str_element_stores_run_for_fixed_dynamic_and_slice_bases() {
+    if !backend_available() {
+        return;
+    }
+    let src = "fn install(out values: slice<str>, value: str) {\n  values[0] = value\n}\nfn main() -> i32 {\n  mut fixed := [\"old\", \"keep\"]\n  fixed[0] = \"fixed\"\n  mut dynamic := [\"left\", \"right\"].to_array()\n  dynamic[1] = \"fixed\"\n  install(dynamic, \"slice\")\n  if fixed[0] == \"fixed\" && dynamic[0] == \"slice\" && dynamic[1] == \"fixed\" { return 0 }\n  return 9\n}\n";
+    assert_eq!(
+        build_and_run("l2b-a2-indexed-str-stores", src)
+            .status
+            .code(),
+        Some(0)
+    );
+}
+
+#[test]
 fn source_order_snapshots_drive_imported_owner_liveness() {
     let producer = (
         "views.align",

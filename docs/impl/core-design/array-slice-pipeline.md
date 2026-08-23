@@ -30,7 +30,7 @@ slice<T>         borrowed view {ptr,len}, Copy, region = the data it points into
 xs.len()   -> i64        // direct length: str/string, slice, array (fixed = const), soa, buffer
 xs[i]                    // index (bounds-checked abort): scalar elem / chunk slice / struct gather / vec lane
 xs[a..b]   -> slice<T>   // range view; scalar elements only; either bound omittable
-xs[i] = v                // scalar element write — needs mut local or out slice param
+xs[i] = v                // Copy scalar / borrowed str write; mut local or out slice; no owned string/Move
 arr[i] = structval       // whole-struct element write (POD; Move structs into FIXED arrays only)
 arr[i].f = v             // element-field write, nested paths ok; dynamic arrays: primitive leaf only
 fn f(out dst: slice<T>)  // writable-slice param; caller passes a mut binding; no-alias enforced

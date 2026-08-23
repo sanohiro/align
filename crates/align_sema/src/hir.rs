@@ -454,8 +454,9 @@ pub enum Stmt {
         drop_old: std::cell::Cell<bool>,
         drop_new: std::cell::Cell<bool>,
     },
-    /// `base[index] = value` — element store into a `mut` array local or `out` slice parameter.
-    /// Lowering emits a bounds check (abort on out-of-range), like an element read.
+    /// `base[index] = value` — Copy-scalar or borrowed-`str` element store into a `mut` array local
+    /// or `out` slice parameter. Lowering emits a bounds check (abort on out-of-range), like an
+    /// element read.
     AssignIndex { base: LocalId, index: Expr, value: Expr },
     /// `v[lane] = value` — write one lane of a `mut vecN<T>` local (M6): `v = insertelement(v,
     /// value, lane)`. `lane` is a constant in `0..N`.

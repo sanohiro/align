@@ -446,6 +446,12 @@ fn move_copy_positions_are_refused_by_the_producer_not_the_boundary() {
             "fn fill(src: slice<string>, out dst: slice<string>) {\n  src.map_into(dst)\n}\nfn main() -> i32 = 0\n",
             "'map_into' cannot write a Move element",
         ),
+        // Direct element replacement also overwrites a header without drop-old/source-nulling.
+        (
+            "assign-index-move-element",
+            "fn replace(out xs: slice<string>, value: string) {\n  xs[0] = value\n}\nfn main() -> i32 = 0\n",
+            "element assignment of string is not supported yet",
+        ),
     ] {
         let outcome = frontend_then_boundary(source);
         let Err(message) = &outcome else {
@@ -470,6 +476,9 @@ fn move_copy_positions_are_refused_by_the_producer_not_the_boundary() {
         ("copy-element-shuffle", "import std.rand\nfn scramble(out xs: slice<i64>) {\n  mut r := rand.seed_with(1)\n  r.shuffle(xs)\n}\nfn main() -> i32 = 0\n", 2),
         ("copy-element-sample", "import std.rand\nfn pick(xs: slice<i64>) -> i64 {\n  mut r := rand.seed_with(1)\n  s := r.sample(xs, 1)\n  return s.len()\n}\nfn main() -> i32 = 0\n", 2),
         ("copy-element-map-into", "fn fill(src: slice<i64>, out dst: slice<i64>) {\n  src.map_into(dst)\n}\nfn main() -> i32 = 0\n", 2),
+        ("borrowed-str-fixed-store", "fn replace(first: str) -> str {\n  mut values := [\"fixed\"]\n  values[0] = first\n  return values[0]\n}\nfn main() -> i32 = 0\n", 2),
+        ("borrowed-str-dynamic-store", "fn replace() -> i64 {\n  mut values := [\"a\", \"bb\"].to_array()\n  values[0] = \"ccc\"\n  return values[0].len()\n}\nfn main() -> i32 = 0\n", 2),
+        ("borrowed-str-slice-store", "fn replace(out values: slice<str>, value: str) {\n  values[0] = value\n}\nfn main() -> i32 = 0\n", 2),
         // The declarable-but-unbuildable parameter type itself must keep checking and lowering.
         ("move-slice-param-still-lowers", slice_param, 1),
     ] {
@@ -478,6 +487,87 @@ fn move_copy_positions_are_refused_by_the_producer_not_the_boundary() {
             Err(message) => panic!("{name}: must still lower:\n{message}"),
         }
     }
+}
+
+#[test]
+fn hir_body_validator_rejects_forged_move_element_assign_index() {
+    let mut program = checked_source_program(
+        "fn replace(out values: slice<str>, value: str) {\n  values[0] = value\n}\nfn main() -> i32 = 0\n",
+    );
+    assert!(
+        validate_hir::body_only_metadata_is_valid(&program),
+        "the source-formed borrowed-str store must survive the body gate",
+    );
+
+    let function = program
+        .fns
+        .iter_mut()
+        .find(|function| function.name == "replace");
+    assert!(function.is_some(), "indexed-store fixture lost replace");
+    let Some(function) = function else {
+        return;
+    };
+    let base = function
+        .locals
+        .iter()
+        .find(|local| local.name == "values")
+        .map(|local| local.id);
+    assert!(base.is_some(), "indexed-store fixture lost values");
+    let Some(base) = base else {
+        return;
+    };
+    let rhs = function
+        .locals
+        .iter()
+        .find(|local| local.name == "value")
+        .map(|local| local.id);
+    assert!(rhs.is_some(), "indexed-store fixture lost value");
+    let Some(rhs) = rhs else {
+        return;
+    };
+    let base_local = function
+        .locals
+        .iter_mut()
+        .find(|local| local.id == base);
+    assert!(base_local.is_some(), "indexed-store fixture lost base local");
+    let Some(base_local) = base_local else {
+        return;
+    };
+    base_local.ty = Ty::Slice(Scalar::String);
+    let rhs_local = function
+        .locals
+        .iter_mut()
+        .find(|local| local.id == rhs);
+    assert!(rhs_local.is_some(), "indexed-store fixture lost RHS local");
+    let Some(rhs_local) = rhs_local else {
+        return;
+    };
+    rhs_local.ty = Ty::String;
+    let statement = function.body.stmts.first_mut();
+    assert!(statement.is_some(), "indexed-store fixture lost statement");
+    let Some(statement) = statement else {
+        return;
+    };
+    assert!(
+        matches!(statement, hir::Stmt::AssignIndex { .. }),
+        "indexed-store fixture lost AssignIndex"
+    );
+    let hir::Stmt::AssignIndex {
+        base: stored_base,
+        value,
+        ..
+    } = statement
+    else {
+        return;
+    };
+    assert_eq!(*stored_base, base);
+    assert!(matches!(value.kind, hir::ExprKind::Local(local) if local == rhs));
+    value.ty = Ty::String;
+
+    assert!(
+        !validate_hir::body_only_metadata_is_valid(&program),
+        "a forged Move-string AssignIndex must fail at the checked-HIR body boundary",
+    );
 }
 
 /// Producer-delegation matrix owner: every source shape sema accepts must survive the body
@@ -14386,7 +14476,40 @@ fn delegated_ownership_and_shape_gates_agree_with_sema() {
             gates.body_ty_ok(element) && element_read_ok(element),
             "the validator's element gate must be structural validity plus sema's rule for {scalar:?}"
         );
+        assert_eq!(
+            gates.indexed_element_store_ok(element),
+            align_sema::indexed_element_store_ok(element),
+            "the validator's indexed-store class must be sema's rule for {scalar:?}"
+        );
     }
+
+    for admitted in [
+        Ty::Int(IntTy { bits: 64, signed: true }),
+        Ty::Float(FloatTy { bits: 64 }),
+        Ty::Bool,
+        Ty::Char,
+        Ty::Str,
+    ] {
+        assert!(
+            align_sema::indexed_element_store_ok(admitted),
+            "source store class for {admitted:?}"
+        );
+        assert!(
+            gates.indexed_element_store_ok(admitted),
+            "validator store class for {admitted:?}"
+        );
+    }
+    assert!(!align_sema::indexed_element_store_ok(Ty::String));
+    assert!(!gates.indexed_element_store_ok(Ty::String));
+    let malformed_width = Ty::Int(IntTy { bits: 7, signed: true });
+    assert!(
+        align_sema::indexed_element_store_ok(malformed_width),
+        "source classification is independent of malformed stored widths"
+    );
+    assert!(
+        !gates.indexed_element_store_ok(malformed_width),
+        "the validator must retain its own stored-width check"
+    );
 
     // A handle is never readable out of a collection: the copy would close the same fd twice.
     for &handle in align_sema::MOVE_HANDLE_TYPES {

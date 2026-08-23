@@ -2865,6 +2865,30 @@ pub fn collection_element_read_ok(
     !ty_capture_is_move(elem, structs, tuples, enums, tagged_types)
 }
 
+/// Whether a plain indexed element store may overwrite its destination without a per-element
+/// Drop or source-nulling operation.
+///
+/// Integer, float, bool, char, and borrowed `str` are Copy. Owned `string` is also representable
+/// as a [`PrimScalar`], but must stay excluded: `AssignIndex` lowers to a raw element store and
+/// cannot drop the old string or null a moved RHS. Source checking and the checked-HIR boundary
+/// both delegate to this classifier so borrowed-text support cannot drift into an internal error
+/// and Move text cannot be admitted by widening `scalar_to_prim`.
+///
+/// This class predicate assumes producer-validated scalar widths. The checked-HIR boundary retains
+/// its independent stored-width check for malformed input.
+pub fn indexed_element_store_ok(elem: Ty) -> bool {
+    matches!(
+        ty_to_scalar(elem).and_then(scalar_to_prim),
+        Some(
+            PrimScalar::Int(_)
+                | PrimScalar::Float(_)
+                | PrimScalar::Bool
+                | PrimScalar::Char
+                | PrimScalar::Str
+        )
+    )
+}
+
 /// Whether struct `id` has a recursive Drop plan. The canonical plan is cycle-safe and fail-closed
 /// for malformed definitions; the definition-validation pass emits the user-facing diagnostic.
 pub fn struct_is_move(
@@ -22906,8 +22930,8 @@ impl<'a> MoveCheck<'a> {
                         );
                     }
                 }
-                // `base[index] = value` — primitive array elements are Copy, so the index and value
-                // are read without consuming either.
+                // `base[index] = value` — AssignIndex admits only Copy scalars and borrowed `str`,
+                // so the index and value are read without consuming either.
                 Stmt::AssignIndex { base, index, value } => {
                     self.check_borrow_use(*base, index.span);
                     if whole_moved(moved, *base) {
@@ -28834,12 +28858,12 @@ impl<'a, 't> Checker<'a, 't> {
                     return Place::Err;
                 }
             };
-            // First cut: element stores are primitive-scalar only (int/float/bool/char). A `str`
-            // element store would need a region check (storing a borrowed view into the buffer);
-            // struct / Move elements need whole-struct / ownership handling. Both deferred.
-            if ty_to_scalar(elem).and_then(scalar_to_prim).is_none() {
+            // Plain element stores support Copy scalars and borrowed `str`; EscapeCheck owns the
+            // view-region constraint. Move elements need drop-old and source-nulling operations,
+            // while structs use the dedicated whole-element path above.
+            if !indexed_element_store_ok(elem) {
                 self.diags.error(
-                    format!("element assignment of {} is not supported yet (primitive elements only for now)", ty_name(elem)),
+                    format!("element assignment of {} is not supported yet (Copy scalar or borrowed `str` elements only for now)", ty_name(elem)),
                     place.span,
                 );
                 return Place::Err;

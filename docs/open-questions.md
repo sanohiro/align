@@ -4178,7 +4178,8 @@ A type/allocation alignment attribute (`align(256) Node { … }`, `align(4096) d
 ### `out` parameters + `noalias` — DONE (write mechanism + no-alias check + `map_into` + scoped `!noalias` emission)
 `out` params (`draft.md` §7) are a no-alias optimization. **All three layers landed:**
 1. **Write mechanism** — `out dst: slice<T>` is a writable output buffer and `place[i] = v`
-   (bounds-checked) writes a `mut` array local or `out` slice (primitive elements).
+   (bounds-checked) writes a `mut` array local or `out` slice for Copy scalar and borrowed `str`
+   elements. Owned `string` and other Move elements remain excluded.
 2. **No-alias check** — at a call site an `out` argument must not alias another argument, compared
    by **root buffer**: a slice local's provenance is tracked back to the array it borrows
    (`s: slice := a`), so `fill(a, s)` and `fill(s1, s2)` (two slices of `a`) are both rejected, not

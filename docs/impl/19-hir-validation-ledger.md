@@ -567,7 +567,7 @@ with parent-plus-first-child and first-child-plus-later-child pairs.
 | `Let` | `env[local]`: `L(local)` and the id is the declaration at this statement. `child[init before bind]`. `post[init.ty == LT(local); initialize local once; Move init is consumed into local; recomputed individual flag matches local membership; the new binding is then visible in the enclosing block]`. |
 | `LetTuple` | `env[locals,tuple_id]`: `TUPLE(tuple_id)`; vector length equals tuple arity; every present id is distinct and `L(id)` with the matching tuple element type. `child[init before all binds]`. `post[init.ty == Ty::Tuple(tuple_id); each present binding receives its ordinal projection exactly once and becomes visible after init; init is evaluated once]`. |
 | `Assign` | `env[local,drop_old,drop_new]`: `MV(local)`. `child[value]`. `post[value.ty == LT(local); replacement Move transfer/nulling is exact; both cells equal the recomputed facts]`. |
-| `AssignIndex` | `env[base]`: `MV(base)` is fixed/dynamic scalar array or writable slice. `child[index,value]`. `post[index.ty == i64; value.ty equals the exact element type; base is mutated, index/value are borrowed or consumed according to value type; bounds action occurs only after both children]`. |
+| `AssignIndex` | `env[base]`: `MV(base)` is a fixed/dynamic scalar array or writable slice whose exact element satisfies sema-owned `indexed_element_store_ok` (integer, float, bool, char, or borrowed `str`) and the validator-owned stored-width rule. `child[index,value]`. `post[index.ty == i64; value.ty equals the exact element type; base is mutated; index/value are borrowed without consumption; bounds action occurs only after both children]`. |
 | `AssignVecLane` | `env[local,lane]`: `MV(local)` has `Ty::Vec(s,n)` and `lane < n`. `child[value]`. `post[value.ty == scalar_to_ty(s); vector replacement is Copy]`. |
 | `AssignField` | `env[root,path]`: `MV(root)` and `P(root,path)` succeeds. `child[value]`. `post[value.ty == P(root,path); replacement/drop-old fact for the leaf is recomputed; root remains the owner]`. |
 | `AssignElemField` | `env[base,path,struct_id,soa]`: non-empty `path`; `STRUCT(struct_id)`; `MV(base)` agrees exactly with `soa` (`Soa(struct_id)` when true, fixed/dynamic struct array of that id when false); path succeeds from that struct; SoA path length is one and leaf is a permitted SoA scalar. `child[index,value]`. `post[index.ty == i64; value.ty == EP(Struct(struct_id),path); base mutation and fixed/dynamic old-leaf Drop are recomputed]`. |
@@ -1244,7 +1244,23 @@ a `slice<string>` parameter, not merely reasoned about:
 | `sort` / `sum` / `min` / `max` element | Symmetric | Rejected earlier as non-numeric. |
 | Index / slice-range of a Move collection | Symmetric | `indexing an array of the Move type string` / `slicing a collection of the Move type string`. |
 
-**Still deferred: actually admitting these.** Lowering a Move key or element
+### `AssignIndex` store closure
+
+`AssignIndex` is the write-side sibling of the element-read rows above. The source checker used
+`scalar_to_prim(...).is_some()` as its admission rule, which includes both borrowed `str` and owned
+`string`; the body validator independently accepted only integers, floats, bool, and char. The
+split rejected the settled `str` replacement path at the MIR boundary, while merely adding `str`
+to the validator would leave the source checker able to form an owned-`string` overwrite whose raw
+store has no drop-old or source-nulling operation.
+
+| Closure axis | Exact rule | Owner evidence |
+|---|---|---|
+| Formation and validation | Fixed scalar arrays, dynamic scalar arrays, and writable slices admit integer, float, bool, char, and borrowed `str` element stores through one sema-owned `indexed_element_store_ok` predicate. Owned `string` and every other Move/non-scalar element reject before HIR formation. The body validator delegates the same class rule and separately checks stored integer/float widths, mutability, index type, and exact value type. | fixed/dynamic/slice frontend-to-MIR positives; delegated constructible-scalar/malformed-width sweep; source and forged-HIR Move-`string` negatives |
+| Construction and replacement | Index and RHS evaluate in source order. A terminating child emits no bounds check or store. Fixed arrays use the existing checked `StoreIndex`; dynamic arrays and writable slices use the existing checked pointer store. A `str` replacement copies only its view header, and EscapeCheck requires the incoming view to outlive the destination storage. | existing continuation twins and arena-to-outer-element rejection; `return_provenance::{borrowed_str_element_stores_run_for_fixed_dynamic_and_slice_bases,product_projection_summaries_select_exact_parameter_roots}` |
+| Ownership lifecycle | Every admitted value is Copy: there is no move-in, move-out, source nulling, per-element Drop, replacement Drop, or return cleanup bit. A Move value is rejected on both the source and malformed-HIR paths, so the raw store can never overwrite an owned header. Whole-struct and element-field replacement remain in `AssignElem`/`AssignElemField` and are unchanged. | Move-`string` producer/boundary negative plus Copy-`str` whole/per-unit positive |
+| Public/interface boundary | The source surface and ABI do not widen. The already-settled `str` write publishes the exact selected parameter root through whole-program and per-unit summary formation; no projection trie or store classifier is serialized. | exact summary assertions and whole/per-unit verdict parity |
+
+**Still deferred: admitting Move keys or elements.** Lowering either
 needs per-element Drop in the owning path — the same shape as #739's deferred
 fixed-array Move elements, not a validator edit. That remains a separate
 capability. Do not "fix" a Copy gate without the MIR support: accepting a Move
