@@ -662,8 +662,11 @@ recursive types or arbitrary Move-element collections.
 
 `borrow x: T` is a shared parameter mode for stable bound Copy or Move storage. For Copy it makes
 the no-copy pointer ABI explicit while ordinary by-value passing remains the default. `borrow mut
-x: T` accepts a writable Move or Copy place, updates caller storage, and ends the previous
-generation. Neither mode accepts a temporary or rvalue; the language creates no hidden addressable
+x: T` accepts a writable Move or Copy place and updates caller storage. The storage-generation
+transition is refined by §15.4: only a displaced owned dynamic allocation ends and advances to a
+fresh generation; fixed inline storage preserves its generation while replacing content, and a
+Copy view detaches/rebinds its header without ending either backing. Other replacement-owned value
+generations still follow their ordinary Drop plan. Neither mode accepts a temporary or rvalue; the language creates no hidden addressable
 temporary. They are not reference types and introduce no writable lifetime syntax. `BorrowState`
 tracks that generation beside the
 existing lexical `Region`, so an old row/buffer/resource view becomes invalid even when it remains
@@ -716,7 +719,9 @@ remain unchanged.
 
 The implementation must cover direct and aggregate view provenance through normal return, `?`,
 `if`, `match`, `loop`/`break`, reassignment, destructuring, function interfaces, and resource Drop.
-A mutable borrow kills the old generation on every continuing and error result path. Every new
+A mutable borrow applies its replacement transition on every continuing and error result path;
+§15.4 narrows storage generations so only a displaced owned dynamic destination is killed, while
+fixed inline storage is preserved and a Copy view is detached/rebound without killing its backing. Every new
 type/HIR/MIR/interface variant participates in the exhaustive region, move, cleanup, effect, task,
 ABI, print, and codec classifications; a catch-all default is a soundness defect.
 
@@ -873,6 +878,67 @@ These rules apply to the shared `AssignIndex`/`AssignElemField`/`AssignElem`
 analysis arm even where the current source classifier admits only a subset of
 region-bearing element shapes. That keeps a later admitted shape from reviving
 the same storage/contents split.
+
+### 15.4 Stable storage generations and projected observers (2026-08-24)
+
+The second review of §15.3 found that a local id was still doing two jobs: the
+identity of a buffer observed through aliases and the place that currently
+releases that buffer. A Move changes the latter but not the former. Aggregate
+and closure construction likewise preserve the buffer while placing its header
+under a projection. Treating either transition as a new top-level local loses
+observers; keeping the old local as both identity and owner makes source
+rebinding cross-publish unrelated contents.
+
+The authoritative reopened matrix is
+`19-hir-validation-ledger.md` “Reopened axis: stable storage generations and
+projected observers.” Its memory-model consequences are:
+
+- each tracked writable allocation has an analysis-local storage generation
+  distinct from its current release owner; a Move transfers an individually
+  released owner (or preserves an arena allocation) and keeps existing aliases
+  live, while replacing/reallocating the current owner ends the old generation
+  and rebinding a non-owning header does not; specialized non-writable carriers
+  such as `chunks` retain their existing outer release tracking while their
+  contained views carry stable generation dependencies;
+- allocated generations use a finite concrete-producer-site plus
+  result-ordinal origin, with `Current` and summarized `Prior` recencies so a
+  loop's fresh value remains distinct from its ended old aliases while still
+  converging; `partition`'s two buffers use distinct ordinals, and fixed arrays
+  instead use their inline place and the same recency transition, so copying or
+  moving them materializes destination storage rather than transferring a
+  dynamic-buffer identity;
+- collection headers inside structs, tuples, `Option`/`Result`, user sums, and
+  callable captures retain a projection-preserving generation fact; scalar
+  element views do not;
+- each fresh tracked producer initializes its generation and projected content
+  together: partition outputs share the completed element fact under distinct
+  identities, string-key grouping retains only the key dependency, and fixed
+  or owned call results seed their caller-materialized storage from the existing
+  flattened selected input/capture summary;
+- `json.doc.elems()` separates its fresh arena-owned handle buffer from the
+  source document/tape dependency; the mmap-backed `fs.read_bytes_view` remains
+  read-only and outside writable-generation tracking, with writes rejected
+  before either analysis changes state;
+- each generation owns one shared projected-content entry, so stores update
+  that entry once and every aggregate, callable, or completed operand that
+  still names the generation observes the update; a `soa` column selects its
+  exact field, while runtime indices and offset-free ranges use one finite
+  conservative wildcard, never values that merely borrow the same element
+  owner;
+- closure creation snapshots capture headers before later rebinding, and only
+  return-summary-selected captures can affect the callable result region;
+- `partition` outputs and match payload bindings project exact allocation
+  backing before the receiving binding's ownership adjustment; and
+- eager snapshots, short-circuit skip/evaluate joins, and other local joins
+  carry this topology; successful `borrow mut` calls advance only displaced
+  owned dynamic destinations, preserve fixed
+  inline storage, and detach/rebind Copy view headers without ending their
+  backings, while `out` preserves the destination generation; public return and
+  mutable-retention summaries remain the existing parameter/capture root sets.
+
+The implementation lands as one boundary because generation transfer without
+projected observers and projected observers without generation transfer are
+each incomplete safety strategies.
 
 ## 16. Fixed and owned struct-array range slicing (2026-08-11)
 
