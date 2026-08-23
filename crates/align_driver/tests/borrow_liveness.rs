@@ -350,7 +350,11 @@ fn ok(data: str) -> Result<i64, Error> {
 }
 fn main() -> i32 = 0
 ";
-    assert!(!check_errs("borrow-materialized-soa", src));
+    let diagnostics = check_diagnostics("borrow-materialized-soa", src);
+    assert!(
+        diagnostics.is_empty(),
+        "materializing primitive SoA columns must detach them from the source array:\n{diagnostics}"
+    );
 }
 
 #[test]

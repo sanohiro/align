@@ -741,15 +741,17 @@ record.
 
 Three shared authorities, each consumed by every store, return, and break path:
 
-- Destination authority — `mutable_root_storage_region(root, depth)`: the
-  caller place for a `borrow mut` parameter root, else the root's lexical
-  frame/arena scope with the longer default depth when the declaration is
-  unrecorded. Used by `mutable_destination_storage_region`, the `AssignField`
-  target, and the whole-`Assign` target (whose rejection message gains
-  caller-target wording).
+- Destination authority — backing-storage state plus
+  `mutable_root_storage_region(root, depth)`: the caller place for a
+  `borrow mut`/`out` parameter root, else the exact fixed, individually owned,
+  or region-backed storage selected by the root and any slice alias. Used by
+  `mutable_destination_storage_region`, the `AssignField` target, the
+  whole-`Assign` target, and every `AssignIndex`/`AssignElemField`/`AssignElem`
+  target. A writable slice copies this state through array-to-slice coercions,
+  ranges, aliases, reassignment, and control-flow joins; an unknown backing is
+  fail-closed for a region-bearing write.
 - Incoming authority — `retained_contained_region` becomes the incoming-value
-  region for `AssignField`, whole-`Assign`, and element stores (incoming side
-  only; the element-store target keeps its stricter owned-array rule). Its
+  region for `AssignField`, whole-`Assign`, and element stores. Its
   root extraction looks through `SliceRange`/`ArrayToSlice` wrappers so an
   outer-frame array sliced inside an arena keeps its declaration depth instead
   of inheriting the use-site arena.
@@ -800,6 +802,77 @@ false-positive residual (arena-sliced outer arrays and tuple projections at
 exact storage edges) is pinned by the wrapper-aware declaration-depth controls
 above. The stale `ty_mentions_slice` comment claiming struct fields cannot be
 slices is corrected alongside.
+
+### 15.3 Reopened element-store/`out` retention axis (2026-08-23)
+
+The `AssignIndex` classifier follow-up exposed two omissions in §15.1: an
+element store still read the base's current content region instead of the
+destination authority, and mutable-retention summaries ignored `out` buffers.
+The authoritative closure matrix is now
+`19-hir-validation-ledger.md` “Reopened axis: backing storage and `out`
+retention.” The memory-model consequences are:
+
+- destination lifetime and contained provenance are separate path-sensitive
+  facts; a content overwrite never changes where the backing buffer dies;
+- a slice binding inherits its backing roots and storage region, including
+  through coercion, range, alias, reassignment, and joins;
+- a fresh SoA allocation mints a backing identity, while a Copy SoA alias or
+  proven forwarding call keeps the source identity; materialization retains
+  element owners but strips the source collection/header generation; an
+  unresolved producer stays unknown but retains possible source roots and
+  cannot remain falsely tied to a later reassignment of the receiving local;
+- every region-bearing element write through a caller-backed slice/soa parameter
+  requires a `borrow mut` or `out` signature, including an owner-free static
+  value; copying a by-value/shared-borrow parameter into a `mut` local does not
+  manufacture a caller transition;
+- scalar-only slices and primitive SoA columns do not carry element retention,
+  so their mutable calls do not require a resolved backing fact;
+- direct element stores update the visible slice, its backing roots, and every
+  already-live alias that can observe those roots, including collection headers
+  nested in source-reachable structs, tuples, `Option`/`Result` values, and user
+  sums; a scalar element view is not a collection-header observer of unrelated
+  slot writes;
+- each eager call argument separately snapshots element contents, whole-value
+  retained provenance, reachable storage, and backing at completion before a
+  later argument can rebind the same local; storage-bearing non-borrowing
+  collections receive the same storage/backing snapshot, and a stable
+  `borrow mut` local or field reserves that exact place until the call action;
+  a call-valued argument forms its result from its completed child facts rather
+  than re-reading child syntax after a nested later argument retargets a place,
+  advances tracked storage, or writes an observable collection backing, and
+  an indirect callee's target-relative captures complete before argument zero;
+  a returned mutable argument selects its post-call content and storage facts;
+  copying a slice header whole keeps its backing lifetime, while an `out`
+  destination self-edge names only its previous elements;
+- direct transparent, direct eager, and indirect calls publish any selected
+  worker-transfer roots from those pre-call completion facts before advancing a
+  mutable destination generation;
+- mutable-call result content and allocation storage remain distinct: fixed and
+  owned dynamic collection results materialize their own buffers, compatible
+  slice/SoA views may forward selected storage roots, and summary-selected
+  writable backing remains unknown while retaining compatible observer roots;
+- whole dynamic-array replacement updates must/may individual ownership,
+  storage, backing, and the local-storage marker together, so heap replacement
+  re-marks local ownership and caller-region replacement clears it; and
+- source-visible built-in mutations share one exhaustive action descriptor for
+  eager-operand classification, exact-destination self-exemption, and the
+  post-operand transition; the action invalidates an earlier overlapping
+  `borrow mut` place (including a backing alias) without self-invalidating its
+  own exact destination; builder reallocation advances the builder
+  allocation/header only, while element owners remain content provenance and a
+  region builder keeps its constructor-selected storage region;
+- returning calls retain strong header and backing-fact replacement for
+  `borrow mut`, including unknown/non-retaining sources; an indexed
+  `borrow mut` additionally validates and joins its possible backing contents,
+  while `out` uses only the non-invalidating backing/observer join; and
+- same-program bodies provide exact roots while missing imported bodies keep
+  the existing all-compatible-input fallback. No new serialized interface fact
+  or function-value representation is introduced.
+
+These rules apply to the shared `AssignIndex`/`AssignElemField`/`AssignElem`
+analysis arm even where the current source classifier admits only a subset of
+region-bearing element shapes. That keeps a later admitted shape from reviving
+the same storage/contents split.
 
 ## 16. Fixed and owned struct-array range slicing (2026-08-11)
 

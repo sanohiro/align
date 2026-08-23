@@ -1262,6 +1262,121 @@ pub fn expand_tagged_ty(ty: Ty, tagged_types: &[hir::TaggedType]) -> Ty {
     }
 }
 
+fn contiguous_indexed_element(ty: Ty, tagged_types: &[hir::TaggedType]) -> Option<Scalar> {
+    match expand_tagged_ty(ty, tagged_types) {
+        Ty::Array(element, _) | Ty::DynArray(element) | Ty::Slice(element) => Some(element),
+        Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => Some(Scalar::Struct(id)),
+        _ => None,
+    }
+}
+
+/// Whether a result owns or embeds its own top-level indexed allocation rather than forwarding an
+/// argument's storage header. The dynamic aggregate-array variants are distinct `Ty` shapes but
+/// have the same ownership rule as `DynArray`/`DynStructArray` here.
+fn materializes_indexed_result_storage(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
+    matches!(
+        expand_tagged_ty(ty, tagged_types),
+        Ty::Array(..)
+            | Ty::StructArray(..)
+            | Ty::DynSliceArray(_)
+            | Ty::DynArray(..)
+            | Ty::DynStructArray(..)
+            | Ty::DynVecArray(..)
+            | Ty::DynMaskArray(..)
+            | Ty::DynFixedArray(..)
+            | Ty::DynFixedStructArray(..)
+            | Ty::DynResponseArray
+    )
+}
+
+/// Whether two values can name the same mutable buffer after a whole-header replacement.
+/// Fixed/dynamic arrays and slices share the contiguous representation for one element type;
+/// SoA columns only alias the same concrete SoA shape.
+fn indexed_backing_compatible(
+    destination: Ty,
+    source: Ty,
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    match (
+        contiguous_indexed_element(destination, tagged_types),
+        contiguous_indexed_element(source, tagged_types),
+    ) {
+        (Some(destination), Some(source)) => destination == source,
+        _ => {
+            let destination = expand_tagged_ty(destination, tagged_types);
+            let source = expand_tagged_ty(source, tagged_types);
+            matches!(
+                (destination, source),
+                (Ty::Soa(left), Ty::Soa(right)) if left == right
+            ) || matches!(
+                (destination, source),
+                (Ty::SoaParam(left), Ty::SoaParam(right)) if left == right
+            )
+        }
+    }
+}
+
+/// Whether a callee may install `source` as the complete post-call value of `destination`.
+///
+/// This is directional: a slice header can be replaced with a view of any compatible contiguous
+/// collection, while an owned dynamic array can only be replaced by the same owned type. Fixed
+/// arrays never retarget their inline storage and are handled by their callers before this test.
+fn mutable_replacement_backing_compatible(
+    destination: Ty,
+    source: Ty,
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    let destination = expand_tagged_ty(destination, tagged_types);
+    let source = expand_tagged_ty(source, tagged_types);
+    match destination {
+        Ty::Slice(element) => contiguous_indexed_element(source, tagged_types) == Some(element),
+        Ty::DynArray(element) => matches!(source, Ty::DynArray(other) if other == element),
+        Ty::DynStructArray(id, layout) => {
+            matches!(source, Ty::DynStructArray(other, other_layout)
+                if other == id && other_layout == layout)
+        }
+        Ty::Soa(id) => matches!(source, Ty::Soa(other) if other == id),
+        Ty::SoaParam(id) => matches!(source, Ty::SoaParam(other) if other == id),
+        _ => destination == source,
+    }
+}
+
+/// Whether every reachable result path materializes fresh SoA column storage. Copying a header or
+/// receiving one from an unresolved producer must not mint a destination-local alias identity.
+fn materializes_fresh_soa_storage(expression: &Expr) -> bool {
+    match &expression.kind {
+        ExprKind::ArrayToSoa { .. } | ExprKind::JsonDecodeSoa { .. } => true,
+        ExprKind::OptionSome(inner)
+        | ExprKind::ResultOk(inner)
+        | ExprKind::ResultErr(inner)
+        | ExprKind::Try(inner) => materializes_fresh_soa_storage(inner),
+        ExprKind::Block(block)
+        | ExprKind::Unsafe(block)
+        | ExprKind::Arena(block)
+        | ExprKind::NamedArena { block, .. }
+        | ExprKind::TaskGroup(block) => block
+            .value
+            .as_deref()
+            .is_some_and(materializes_fresh_soa_storage),
+        ExprKind::If { then, els, .. } => [then, els].into_iter().all(|block| {
+            hir_block_diverges(block)
+                || block
+                    .value
+                    .as_deref()
+                    .is_some_and(materializes_fresh_soa_storage)
+        }),
+        ExprKind::Match { arms, .. } => !arms.is_empty()
+            && arms.iter().all(|arm| {
+                hir_expr_diverges(&arm.body) || materializes_fresh_soa_storage(&arm.body)
+            }),
+        ExprKind::ElseUnwrap { opt, fallback } => {
+            materializes_fresh_soa_storage(opt)
+                && materializes_fresh_soa_storage(fallback)
+        }
+        _ => false,
+    }
+}
+
 /// Whether a sum payload may be exposed as a read-only projection from a stable borrowed place.
 ///
 /// This is deliberately a closed, cycle-safe classifier. It admits primitive values and views,
@@ -8531,6 +8646,11 @@ fn run_body_analysis_passes(
             loop_value_facts: std::collections::HashMap::new(),
             control_value_facts: std::collections::HashMap::new(),
             walked_value_facts: std::collections::HashMap::new(),
+            walked_storage_facts: std::collections::HashMap::new(),
+            walked_backing_facts: std::collections::HashMap::new(),
+            pending_call_completions: std::collections::HashMap::new(),
+            mutable_call_argument_snapshots: std::collections::HashSet::new(),
+            borrow_mut_place_snapshots: std::collections::HashSet::new(),
             value_snapshot_frames: Vec::new(),
             reported_invalid_value_actions: std::collections::HashSet::new(),
             loop_iter_drops: Vec::new(),
@@ -10121,6 +10241,11 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
             loop_value_facts: std::collections::HashMap::new(),
             control_value_facts: std::collections::HashMap::new(),
             walked_value_facts: std::collections::HashMap::new(),
+            walked_storage_facts: std::collections::HashMap::new(),
+            walked_backing_facts: std::collections::HashMap::new(),
+            pending_call_completions: std::collections::HashMap::new(),
+            mutable_call_argument_snapshots: std::collections::HashSet::new(),
+            borrow_mut_place_snapshots: std::collections::HashSet::new(),
             value_snapshot_frames: Vec::new(),
             reported_invalid_value_actions: std::collections::HashSet::new(),
             loop_iter_drops: Vec::new(),
@@ -13913,16 +14038,145 @@ impl Region {
             other
         }
     }
+
+    /// The longer-lived (lower-ordinal) of two regions. Destination backing facts use this at a
+    /// control-flow join: a write must be valid for every possible reaching buffer, so the
+    /// longest-lived possible buffer is the strict target. Distinct caller parameters have the
+    /// same lifetime class; choose the lower position to keep joins commutative and stable.
+    fn longer(self, other: Region) -> Region {
+        match self.ord().cmp(&other.ord()) {
+            std::cmp::Ordering::Less => self,
+            std::cmp::Ordering::Greater => other,
+            std::cmp::Ordering::Equal => match (self, other) {
+                (Region::Caller(left), Region::Caller(right)) => {
+                    Region::Caller(left.min(right))
+                }
+                _ => self,
+            },
+        }
+    }
 }
 
-/// Path-sensitive escape provenance at one control-flow point. Both components form finite
-/// may-lattices: a local's joined region is the shortest region it may carry, and slice provenance
-/// is present when any reaching path may still borrow function-local storage. Owned provenance
-/// keeps both the must-individual and may-individual facts so a heap/arena join stays distinct from
-/// definite arena ownership.
+/// Backing storage selected by one writable array/slice value. `region` is where the buffer dies,
+/// independently of the views currently stored in it. `roots` are the local collection values
+/// whose contained-region state must observe an element mutation through an alias. Unknown facts
+/// retain any roots already proved on another reaching path, but use a process-lifetime target so
+/// a region-bearing write fails closed.
+#[derive(Clone, PartialEq, Eq)]
+struct EscapeBackingStorage {
+    region: Region,
+    roots: std::collections::BTreeSet<LocalId>,
+    known: bool,
+}
+
+impl EscapeBackingStorage {
+    fn known(region: Region) -> Self {
+        Self {
+            region,
+            roots: std::collections::BTreeSet::new(),
+            known: true,
+        }
+    }
+
+    fn unknown() -> Self {
+        Self {
+            region: Region::Static,
+            roots: std::collections::BTreeSet::new(),
+            known: false,
+        }
+    }
+
+    fn rooted(mut self, root: LocalId) -> Self {
+        self.roots.insert(root);
+        self
+    }
+
+    fn join(&self, other: &Self) -> Self {
+        let mut roots = self.roots.clone();
+        roots.extend(other.roots.iter().copied());
+        Self {
+            region: self.region.longer(other.region),
+            roots,
+            known: self.known && other.known,
+        }
+    }
+
+    fn destination_region(&self) -> Region {
+        if self.known {
+            self.region
+        } else {
+            Region::Static
+        }
+    }
+}
+
+/// Escape facts captured when one eager call argument finishes. A later argument may reassign the
+/// same source local or slice alias, but the already-evaluated value keeps its pure element/content
+/// region, whole-value retained region, storage region, and selected mutable backing. The call
+/// action consumes the snapshots atomically.
+#[derive(Clone, PartialEq, Eq)]
+struct EscapeArgumentSnapshot {
+    content_region: Region,
+    retained_contained_region: Region,
+    storage_region: Region,
+    mutable_backing: EscapeBackingStorage,
+    /// Numeric and otherwise non-region-bearing slices still need the settled local-storage bit
+    /// when a parent completion fact is formed after a later eager child mutated live state.
+    storage_is_local: bool,
+    /// Allocation-mode provenance for an owned dynamic collection. These are the same must/may
+    /// halves carried by `EscapeState`: `(true, true)` is individually released, `(false, false)`
+    /// is region-owned, and `(false, true)` is path-dependent. Copy/view values leave both false.
+    individual: bool,
+    may_individual: bool,
+}
+
+impl EscapeArgumentSnapshot {
+    fn fail_closed() -> Self {
+        Self {
+            content_region: Region::Static,
+            retained_contained_region: Region::Static,
+            storage_region: Region::Static,
+            mutable_backing: EscapeBackingStorage::unknown(),
+            storage_is_local: true,
+            individual: false,
+            may_individual: true,
+        }
+    }
+
+    fn join(&self, other: &Self) -> Self {
+        Self {
+            content_region: self.content_region.shorter(other.content_region),
+            retained_contained_region: self
+                .retained_contained_region
+                .shorter(other.retained_contained_region),
+            storage_region: self.storage_region.shorter(other.storage_region),
+            mutable_backing: self.mutable_backing.join(&other.mutable_backing),
+            storage_is_local: self.storage_is_local || other.storage_is_local,
+            individual: self.individual && other.individual,
+            may_individual: self.may_individual || other.may_individual,
+        }
+    }
+}
+
+/// Path-sensitive escape provenance at one control-flow point. Content regions and slice-locality
+/// form may-lattices, while backing storage is a separate destination lattice: roots union and the
+/// region joins toward the longest-lived possible buffer. Owned provenance keeps both the
+/// must-individual and may-individual facts so a heap/arena join stays distinct from definite arena
+/// ownership.
 #[derive(Clone, Default, PartialEq, Eq)]
 struct EscapeState {
     region: std::collections::HashMap<LocalId, Region>,
+    backing_storage: std::collections::HashMap<LocalId, EscapeBackingStorage>,
+    /// Completion-time eager-argument facts, keyed by call-expression identity and argument
+    /// ordinal. Entries are overwritten on each loop iteration and consumed by `MutableCall`.
+    argument_snapshots: std::collections::HashMap<(usize, usize), EscapeArgumentSnapshot>,
+    /// Completion facts for every evaluated expression node. Parent expressions consume these
+    /// instead of re-reading child syntax from state already changed by a later eager sibling.
+    completed_expressions: std::collections::HashMap<usize, EscapeArgumentSnapshot>,
+    /// Return-relevant capture region of an indirect callee, frozen immediately after the callee
+    /// expression completes and before argument zero runs. The callable value itself may be
+    /// rebound by a later eager argument, but the runtime still invokes the completed value.
+    callable_capture_snapshots: std::collections::HashMap<usize, Region>,
     /// Region contributed to an indirect result by the selected callable's captured values. This
     /// is distinct from `region`: a capturing closure value is frame-local because its environment
     /// buffer lives in this frame, while a view returned from that environment may point into a
@@ -13943,6 +14197,46 @@ impl EscapeState {
             joined
                 .region
                 .entry(local)
+                .and_modify(|current| *current = current.shorter(region))
+                .or_insert(region);
+        }
+        let backing_locals = self
+            .backing_storage
+            .keys()
+            .chain(other.backing_storage.keys())
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        for local in backing_locals {
+            let backing = match (
+                self.backing_storage.get(&local),
+                other.backing_storage.get(&local),
+            ) {
+                (Some(left), Some(right)) => left.join(right),
+                (Some(known), None) | (None, Some(known)) => {
+                    known.join(&EscapeBackingStorage::unknown())
+                }
+                (None, None) => continue,
+            };
+            joined.backing_storage.insert(local, backing);
+        }
+        for (&key, snapshot) in &other.argument_snapshots {
+            joined
+                .argument_snapshots
+                .entry(key)
+                .and_modify(|current| *current = current.join(snapshot))
+                .or_insert_with(|| snapshot.clone());
+        }
+        for (&key, snapshot) in &other.completed_expressions {
+            joined
+                .completed_expressions
+                .entry(key)
+                .and_modify(|current| *current = current.join(snapshot))
+                .or_insert_with(|| snapshot.clone());
+        }
+        for (&call, &region) in &other.callable_capture_snapshots {
+            joined
+                .callable_capture_snapshots
+                .entry(call)
                 .and_modify(|current| *current = current.shorter(region))
                 .or_insert(region);
         }
@@ -13997,6 +14291,10 @@ struct EscapeFlowBlock<'a> {
 #[derive(Clone)]
 enum EscapeFlowOp<'a> {
     Stmt(&'a Stmt, u32),
+    /// Clear a prior loop iteration's fact before this exact expression starts evaluating.
+    ExpressionStart(usize),
+    /// Publish the expression's four completion facts after every eager child and call action.
+    ExpressionComplete(&'a Expr, u32),
     /// Record heap-vs-arena provenance even when an owned expression is not assigned to a local.
     /// MIR needs this for synthetic owners of directly consumed temporaries.
     DropProvenance(&'a Expr, u32),
@@ -14028,13 +14326,28 @@ enum EscapeFlowOp<'a> {
         value: &'a Expr,
         depth: u32,
     },
-    /// A returning `borrow mut` call replaces the destination's contained provenance with the
-    /// exact source arguments inferred from an available body, or every compatible argument when
-    /// the body/fact is unavailable. The source regions are captured before the destination state
-    /// changes so retaining the old destination is well-defined.
-    BorrowMutCall {
+    /// Capture an eager argument immediately after it finishes and before the next argument may
+    /// mutate any local used by its contained/storage/backing provenance.
+    ArgumentComplete {
+        call: usize,
+        index: usize,
+        argument: &'a Expr,
+    },
+    /// Freeze the return-relevant capture selected by an already-evaluated function value before
+    /// any explicit argument can rebind the local or aggregate that produced it.
+    CallableCaptureComplete {
+        call: usize,
+        callee: &'a Expr,
+        depth: u32,
+    },
+    /// A returning `borrow mut`/`out` call installs contained provenance selected from the exact
+    /// same-program summary, or every compatible argument when the body/fact is unavailable. All
+    /// source and destination facts are captured before any destination changes. `borrow mut`
+    /// keeps whole-place replacement; `out` joins an element mutation into its backing roots.
+    MutableCall {
+        call: usize,
         args: &'a [Expr],
-        destinations: Vec<(usize, Vec<BorrowMutRetentionSource>)>,
+        destinations: Vec<(usize, ast::ParamMode, Vec<BorrowMutRetentionSource>)>,
         depth: u32,
     },
     /// Region-backed builders may cross a call boundary only through `borrow mut`; a shared or out
@@ -14224,6 +14537,135 @@ struct EscapeCheck<'a> {
 }
 
 impl<'a> EscapeCheck<'a> {
+    fn indexed_backing_type(&self, ty: Ty) -> bool {
+        matches!(
+            expand_tagged_ty(ty, self.tagged_types),
+            Ty::Array(..)
+                | Ty::StructArray(..)
+                | Ty::DynArray(..)
+                | Ty::DynStructArray(..)
+                | Ty::Slice(..)
+                | Ty::Soa(..)
+                | Ty::SoaParam(..)
+        )
+    }
+
+    fn return_storage_compatible(&self, result: Ty, source: Ty) -> bool {
+        let result = expand_tagged_ty(result, self.tagged_types);
+        let source = expand_tagged_ty(source, self.tagged_types);
+        if materializes_indexed_result_storage(result, self.tagged_types) {
+            // An owned/fixed result materializes its own slot or buffer. A return summary may
+            // select an argument for element provenance without making that argument the result's
+            // storage owner.
+            return false;
+        }
+        result == source
+            || (matches!(result, Ty::Slice(..) | Ty::Soa(..) | Ty::SoaParam(..))
+                && indexed_backing_compatible(result, source, self.tagged_types))
+    }
+
+    /// Whether mutating this collection's contents can publish borrowed-region provenance into
+    /// its backing. A primitive slice or primitive-only SoA still has a borrowed header, but its
+    /// scalar elements/columns cannot retain an owner; whole-place `borrow mut` replacement is
+    /// handled separately and therefore must not be made conditional on this predicate.
+    fn indexed_content_may_retain_region(&self, ty: Ty) -> bool {
+        let element = match expand_tagged_ty(ty, self.tagged_types) {
+            Ty::Array(element, _) | Ty::DynArray(element) | Ty::Slice(element) => {
+                scalar_to_ty(element)
+            }
+            Ty::StructArray(id, _) | Ty::DynStructArray(id, _) | Ty::Soa(id) => Ty::Struct(id),
+            // Abstract SoA is substituted before emitted HIR, but its closed bound admits `str`
+            // columns. Keep analysis conservative if malformed/template HIR reaches this pass.
+            Ty::SoaParam(_) => return true,
+            _ => return false,
+        };
+        ty_may_borrow(
+            element,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        )
+    }
+
+    fn parameter_backing_storage(
+        &self,
+        local: LocalId,
+        position: usize,
+        ty: Ty,
+    ) -> EscapeBackingStorage {
+        let mode = self
+            .f
+            .param_modes
+            .get(position)
+            .copied()
+            .unwrap_or(ast::ParamMode::ByValue);
+        let caller_storage = matches!(
+            expand_tagged_ty(ty, self.tagged_types),
+            Ty::Slice(..) | Ty::Soa(..) | Ty::SoaParam(..)
+        )
+            || matches!(
+                mode,
+                ast::ParamMode::Borrow | ast::ParamMode::BorrowMut | ast::ParamMode::Out
+            );
+        EscapeBackingStorage::known(if caller_storage {
+            Region::Caller(position as u32)
+        } else {
+            Region::Frame
+        })
+        .rooted(local)
+    }
+
+    /// Whether every caller-backed parameter root has a post-call retention transition. A plain
+    /// by-value/shared slice can be copied into a `mut` local, but that must not manufacture the
+    /// `out`/`borrow mut` summary needed to keep a newly stored owner alive in the caller.
+    fn backing_retention_is_visible(&self, backing: &EscapeBackingStorage) -> bool {
+        backing.roots.iter().all(|root| {
+            let Some(position) = self
+                .f
+                .params
+                .iter()
+                .position(|parameter| parameter == root)
+            else {
+                return true;
+            };
+            let mode = self
+                .f
+                .param_modes
+                .get(position)
+                .copied()
+                .unwrap_or(ast::ParamMode::ByValue);
+            let Some(ty) = self.f.locals.get(*root as usize).map(|local| local.ty) else {
+                return false;
+            };
+            let caller_backed = matches!(
+                expand_tagged_ty(ty, self.tagged_types),
+                Ty::Slice(..) | Ty::Soa(..) | Ty::SoaParam(..)
+            ) || matches!(
+                mode,
+                ast::ParamMode::Borrow | ast::ParamMode::BorrowMut | ast::ParamMode::Out
+            );
+            !caller_backed
+                || matches!(mode, ast::ParamMode::BorrowMut | ast::ParamMode::Out)
+        })
+    }
+
+    /// Locals whose already-evaluated collection headers can observe a write to any selected
+    /// backing root. Known aliases and unresolved call-return aliases share the same root set; the
+    /// latter remain non-writable but still receive conservative content-region transitions.
+    fn backing_content_observers(
+        &self,
+        roots: &std::collections::BTreeSet<LocalId>,
+    ) -> std::collections::BTreeSet<LocalId> {
+        self.state
+            .backing_storage
+            .iter()
+            .filter_map(|(&local, backing)| {
+                (!backing.roots.is_disjoint(roots)).then_some(local)
+            })
+            .collect()
+    }
+
     fn borrowed_param_place(&self, expression: &Expr) -> bool {
         let root = match &expression.kind {
             ExprKind::Local(local) => *local,
@@ -14288,6 +14730,10 @@ impl<'a> EscapeCheck<'a> {
             // Parameters live the whole frame; recording depth 0 keeps the lexical-storage caps
             // from inheriting a use-site arena depth when a parameter is sliced inside one.
             self.decl_depth.insert(param, 0);
+            if self.indexed_backing_type(local.ty) {
+                let backing = self.parameter_backing_storage(param, position, local.ty);
+                self.state.backing_storage.insert(param, backing);
+            }
             // A by-value Move parameter owning dynamic-array storage is dropped at this frame's
             // exit, so its views are frame-local; borrowed modes view caller storage and stay
             // returnable through provenance.
@@ -14312,7 +14758,10 @@ impl<'a> EscapeCheck<'a> {
                     expand_tagged_ty(local.ty, self.tagged_types),
                     Ty::Resource(_)
                 )
-                && self.f.param_modes.get(position) == Some(&ast::ParamMode::BorrowMut);
+                && matches!(
+                    self.f.param_modes.get(position),
+                    Some(ast::ParamMode::BorrowMut | ast::ParamMode::Out)
+                );
             let borrowed_dynamic_storage = matches!(
                 self.f.param_modes.get(position),
                 Some(ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
@@ -14432,10 +14881,211 @@ impl<'a> EscapeCheck<'a> {
         }
     }
 
+    fn escape_completion_snapshot(
+        &mut self,
+        expression: &Expr,
+        depth: u32,
+    ) -> EscapeArgumentSnapshot {
+        let owns_dynamic_storage = ty_owns_dyn_array_storage(
+            expression.ty,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        );
+        let (individual, may_individual) = if owns_dynamic_storage {
+            (
+                self.drop_is_individual(expression, depth),
+                self.drop_may_be_individual(expression, depth),
+            )
+        } else {
+            (false, false)
+        };
+        EscapeArgumentSnapshot {
+            // The recursive resolvers consult already-completed children, so a later eager sibling
+            // cannot rewrite the element, retained whole-value, storage, or backing fact.
+            content_region: self.region_of(expression, depth),
+            retained_contained_region: self.retained_contained_region(expression, depth),
+            storage_region: self.retained_storage_region(expression, depth),
+            mutable_backing: self.backing_storage_of_expr(expression, depth),
+            storage_is_local: self.slice_is_local(expression),
+            individual,
+            may_individual,
+        }
+    }
+
+    /// Select the post-call value facts named by a return summary. Mutable-call actions rewrite
+    /// `argument_snapshots` before this runs, so a callee that replaces `borrow mut dst` and then
+    /// returns `dst` cannot freeze the result to the pre-call actual. Content provenance and result
+    /// storage stay separate: a fresh `array<str>` may borrow a `str` argument while owning a new
+    /// buffer, whereas a returned slice/collection header selects the argument's storage too.
+    fn call_completion_snapshot(
+        &mut self,
+        expression: &Expr,
+        depth: u32,
+    ) -> EscapeArgumentSnapshot {
+        let baseline = self.escape_completion_snapshot(expression, depth);
+        let call = Self::expr_key(expression);
+        let (args, selected, modes, capture_region): (
+            &[Expr],
+            Vec<usize>,
+            Vec<ast::ParamMode>,
+            Region,
+        ) = match &expression.kind {
+            ExprKind::Call { func, args, .. } => {
+                let selected = match self.named_return_region.get(func) {
+                    Some(hir::ReturnRegionSummary::Roots { params, .. }) => params
+                        .iter()
+                        .filter_map(|&index| usize::try_from(index).ok())
+                        .collect(),
+                    Some(hir::ReturnRegionSummary::None) => return baseline,
+                    None => (0..args.len()).collect(),
+                };
+                (
+                    args.as_slice(),
+                    selected,
+                    self.named_param_modes.get(func).cloned().unwrap_or_default(),
+                    Region::Static,
+                )
+            }
+            ExprKind::CallFnValue { callee, args } => {
+                let (selected, modes, capture_region) = match self
+                    .callable_type_id(callee)
+                    .and_then(|id| self.fn_types.get(id as usize))
+                {
+                    Some(function) => match &function.return_region {
+                        hir::ReturnRegionSummary::None => return baseline,
+                        hir::ReturnRegionSummary::Roots { params, captures } => (
+                            params
+                                .iter()
+                                .filter_map(|&index| usize::try_from(index).ok())
+                                .collect(),
+                            function
+                                .params
+                                .iter()
+                                .map(|(mode, _)| *mode)
+                                .collect(),
+                            if captures.is_empty() {
+                                Region::Static
+                            } else {
+                                self.state
+                                    .callable_capture_snapshots
+                                    .get(&call)
+                                    .copied()
+                                    .unwrap_or(Region::Frame)
+                            },
+                        ),
+                    },
+                    None => (
+                        (0..args.len()).collect(),
+                        Vec::new(),
+                        self.state
+                            .callable_capture_snapshots
+                            .get(&call)
+                            .copied()
+                            .unwrap_or(Region::Frame),
+                    ),
+                };
+                (args.as_slice(), selected, modes, capture_region)
+            }
+            _ => return baseline,
+        };
+
+        let mut content_region = capture_region;
+        let mut storage_selected = Vec::new();
+        for &index in &selected {
+            let Some(argument) = args.get(index) else {
+                continue;
+            };
+            let snapshot = self
+                .state
+                .argument_snapshots
+                .get(&(call, index))
+                .cloned()
+                .unwrap_or_else(EscapeArgumentSnapshot::fail_closed);
+            let cap = modes
+                .get(index)
+                .copied()
+                .and_then(|mode| self.call_return_root_cap(argument, mode));
+            content_region = content_region.shorter(
+                cap.map_or(snapshot.content_region, |cap| {
+                    snapshot.content_region.shorter(cap)
+                }),
+            );
+            if self.return_storage_compatible(expression.ty, argument.ty) {
+                storage_selected.push((snapshot, cap));
+            }
+        }
+
+        if storage_selected.is_empty() {
+            return EscapeArgumentSnapshot {
+                content_region,
+                retained_contained_region: if baseline.storage_is_local {
+                    content_region.shorter(baseline.storage_region)
+                } else {
+                    content_region
+                },
+                storage_region: baseline.storage_region.shorter(content_region),
+                ..baseline
+            };
+        }
+
+        let mut retained_contained_region = Region::Static;
+        let mut storage_region = Region::Static;
+        let mut storage_is_local = false;
+        let mut backing_roots = std::collections::BTreeSet::new();
+        for (snapshot, cap) in storage_selected {
+            let cap_region = |region: Region| cap.map_or(region, |cap| region.shorter(cap));
+            retained_contained_region = retained_contained_region
+                .shorter(cap_region(snapshot.retained_contained_region));
+            storage_region = storage_region.shorter(cap_region(snapshot.storage_region));
+            storage_is_local |= snapshot.storage_is_local
+                || cap.is_some_and(|cap| !cap.is_returnable());
+            backing_roots.extend(snapshot.mutable_backing.roots);
+        }
+        retained_contained_region = retained_contained_region.shorter(content_region);
+        storage_region = storage_region.shorter(content_region);
+        // A return summary proves dependency on the selected value, not exact writable-header
+        // identity. Preserve roots for observer propagation but keep direct writes fail-closed.
+        let mut mutable_backing = EscapeBackingStorage::unknown();
+        mutable_backing.roots = backing_roots;
+        EscapeArgumentSnapshot {
+            content_region,
+            retained_contained_region,
+            storage_region,
+            mutable_backing,
+            storage_is_local,
+            individual: baseline.individual,
+            may_individual: baseline.may_individual,
+        }
+    }
+
     fn apply_flow_op(&mut self, op: EscapeFlowOp<'a>, state: &mut EscapeState) {
         self.state = state.clone();
         match op {
             EscapeFlowOp::Stmt(stmt, depth) => self.apply_stmt(stmt, depth),
+            EscapeFlowOp::ExpressionStart(expression) => {
+                self.state.completed_expressions.remove(&expression);
+                self.state
+                    .argument_snapshots
+                    .retain(|(call, _), _| *call != expression);
+                self.state.callable_capture_snapshots.remove(&expression);
+            }
+            EscapeFlowOp::ExpressionComplete(expression, depth) => {
+                let key = Self::expr_key(expression);
+                self.state.completed_expressions.remove(&key);
+                let snapshot = self.call_completion_snapshot(expression, depth);
+                self.state.completed_expressions.insert(key, snapshot);
+                if matches!(expression.kind, ExprKind::Call { .. } | ExprKind::CallFnValue { .. })
+                {
+                    self.state
+                        .argument_snapshots
+                        .retain(|(call, _), _| *call != key);
+                }
+                if matches!(expression.kind, ExprKind::CallFnValue { .. }) {
+                    self.state.callable_capture_snapshots.remove(&key);
+                }
+            }
             EscapeFlowOp::DropProvenance(expr, depth) => {
                 if self.aggregate_contains_mixed_ownership(expr, depth) {
                     self.diags.error(
@@ -14516,11 +15166,42 @@ impl<'a> EscapeCheck<'a> {
                     );
                 }
             }
-            EscapeFlowOp::BorrowMutCall {
+            EscapeFlowOp::ArgumentComplete {
+                call,
+                index,
+                argument,
+            } => {
+                let snapshot = self
+                    .state
+                    .completed_expressions
+                    .get(&Self::expr_key(argument))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        self.diags.error(
+                            "call argument did not produce an escape completion snapshot"
+                                .to_string(),
+                            argument.span,
+                        );
+                        EscapeArgumentSnapshot::fail_closed()
+                    });
+                self.state
+                    .argument_snapshots
+                    .insert((call, index), snapshot);
+            }
+            EscapeFlowOp::CallableCaptureComplete {
+                call,
+                callee,
+                depth,
+            } => {
+                let capture = self.callable_capture_return_region(callee, depth);
+                self.state.callable_capture_snapshots.insert(call, capture);
+            }
+            EscapeFlowOp::MutableCall {
+                call,
                 args,
                 destinations,
                 depth,
-            } => self.apply_borrow_mut_calls(args, &destinations, depth),
+            } => self.apply_mutable_calls(call, args, &destinations, depth),
             EscapeFlowOp::RegionBuilderNonMutBorrow { builder, depth } => {
                 if !self.drop_is_individual(builder, depth) {
                     self.diags.error(
@@ -15961,6 +16642,32 @@ impl<'a> EscapeCheck<'a> {
         self.replace_callable_region_path(local, &path, value, depth);
     }
 
+    /// Contained region visible through one collection local. A sibling slice alias does not get a
+    /// bespoke write on every mutation; instead it resolves the shared backing roots here. This
+    /// keeps reads and returns through any alias synchronized with direct and `out` element stores.
+    fn local_contained_region(&self, local: LocalId) -> Region {
+        let mut region = self
+            .state
+            .region
+            .get(&local)
+            .copied()
+            .unwrap_or(Region::Static);
+        if let Some(backing) = self.state.backing_storage.get(&local) {
+            for root in &backing.roots {
+                if *root != local {
+                    region = region.shorter(
+                        self.state
+                            .region
+                            .get(root)
+                            .copied()
+                            .unwrap_or(Region::Static),
+                    );
+                }
+            }
+        }
+        region
+    }
+
     /// The [`Region`] a region-bearing (`box`/`str`) value is bound to. `Static` = no region
     /// (a leaked/static str, a box param — none exist — etc.). Recurses through value forms so
     /// it can't slip out via an `if`/block value.
@@ -15988,7 +16695,16 @@ impl<'a> EscapeCheck<'a> {
         let mut values = Vec::new();
         while let Some(item) = work.pop() {
             match item {
-                Work::Eval(expression, depth) => match &expression.kind {
+                Work::Eval(expression, depth) => {
+                    if let Some(snapshot) = self
+                        .state
+                        .completed_expressions
+                        .get(&Self::expr_key(expression))
+                    {
+                        values.push(snapshot.content_region);
+                        continue;
+                    }
+                    match &expression.kind {
             // Arena allocations are bound to the enclosing arena. An arena-free template is backed
             // by a hidden owned string in MIR, so its `str` view is Frame-bounded rather than the
             // old process-lifetime leak; it may be consumed/stored locally but cannot escape.
@@ -16199,13 +16915,9 @@ impl<'a> EscapeCheck<'a> {
                         .then_some(Region::Frame),
                 )],
             ),
-            ExprKind::BorrowedIndex { base, .. } => values.push(
-                self.state
-                    .region
-                    .get(&base.root_local)
-                    .copied()
-                    .unwrap_or(Region::Static),
-            ),
+            ExprKind::BorrowedIndex { base, .. } => {
+                values.push(self.local_contained_region(base.root_local));
+            }
             // A range slice is a borrowed view into the receiver's storage (a sub-`str` or a
             // sub-`slice`), so it lives exactly as long as the receiver — inherit its region (the
             // same rule as `Index` / `StrTrim`; the bounds are scalar `i64`, never region-tracked).
@@ -16481,8 +17193,7 @@ impl<'a> EscapeCheck<'a> {
                 self.region_capabilities
                     .get(p)
                     .copied()
-                    .or_else(|| self.state.region.get(p).copied())
-                    .unwrap_or(Region::Static),
+                    .unwrap_or_else(|| self.local_contained_region(*p)),
             ),
             // A region builder and the array frozen from it are tied to the explicit destination
             // capability. The heap form has no region operand and remains independently owned.
@@ -16508,13 +17219,7 @@ impl<'a> EscapeCheck<'a> {
                     .collect(),
             ),
             // A field read inherits its base struct's region (the field may be a view into it).
-            ExprKind::Field { root, .. } => values.push(
-                self.state
-                    .region
-                    .get(root)
-                    .copied()
-                    .unwrap_or(Region::Static),
-            ),
+            ExprKind::Field { root, .. } => values.push(self.local_contained_region(*root)),
             // A str-key (or dict-encoded) `group_by` yields `(array<str>, array<i64>)` whose key views
             // borrow `base`'s string storage, so the tuple inherits `base`'s region — it must not
             // outlive the source. (An i64-key group_by yields owned arrays that borrow nothing → the
@@ -16527,13 +17232,9 @@ impl<'a> EscapeCheck<'a> {
             // `str` column it is a `slice<str>` whose views borrow the soa's buffer/input, so it
             // inherits the soa local's region. (A primitive column `slice<i64>` is not region-tracked,
             // so inheriting is harmless — never checked.)
-            | ExprKind::SoaColumn { base, .. } => values.push(
-                self.state
-                    .region
-                    .get(base)
-                    .copied()
-                    .unwrap_or(Region::Static),
-            ),
+            | ExprKind::SoaColumn { base, .. } => {
+                values.push(self.local_contained_region(*base));
+            }
             ExprKind::Block(block) => {
                 if let Some(value) = block.value.as_deref() {
                     work.push(Work::Eval(value, depth));
@@ -16605,13 +17306,9 @@ impl<'a> EscapeCheck<'a> {
             }
             // `arr[const].field` reads a field of a struct-array element; a `str` field is a view
             // into the array's storage, so it inherits the array's region (like `ElemField`).
-            ExprKind::IndexField { base, .. } => values.push(
-                self.state
-                    .region
-                    .get(base)
-                    .copied()
-                    .unwrap_or(Region::Static),
-            ),
+            ExprKind::IndexField { base, .. } => {
+                values.push(self.local_contained_region(*base));
+            }
             // `t.get()` exposes the task's result; a region-tracked result borrows whatever the
             // task closure did, so it inherits the inner value's region (conservative, never longer).
             ExprKind::TaskGet(inner) => work.push(Work::Eval(inner, depth)),
@@ -16926,7 +17623,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::JsonOwnedDecode { .. }
             | ExprKind::RawNull
             | ExprKind::SqliteCallbackDescriptor { .. } => values.push(Region::Static),
-                },
+                    }
+                }
                 Work::Shorter(count, initial) => {
                     let start = values
                         .len()
@@ -16967,6 +17665,16 @@ impl<'a> EscapeCheck<'a> {
     fn slice_is_local(&self, e: &Expr) -> bool {
         let mut work = vec![e];
         while let Some(expression) = work.pop() {
+            if let Some(snapshot) = self
+                .state
+                .completed_expressions
+                .get(&Self::expr_key(expression))
+            {
+                if snapshot.storage_is_local {
+                    return true;
+                }
+                continue;
+            }
             match &expression.kind {
             // `buf.bytes()` views storage owned by the `buffer` local (`Drop`-freed at frame exit),
             // so the `slice<u8>` is frame-local and must not be returned — like a slice of a local array.
@@ -17349,6 +18057,7 @@ impl<'a> EscapeCheck<'a> {
                         self.allocation_region_by_expr
                             .insert(Self::expr_key(expression), region);
                     }
+                    self.push_flow_op(EscapeFlowOp::ExpressionStart(Self::expr_key(expression)));
                     match &expression.kind {
                         ExprKind::Arena(block) => {
                             let inner = depth + 1;
@@ -17451,6 +18160,7 @@ impl<'a> EscapeCheck<'a> {
                         }
                         ExprKind::Call { func, args, .. } => {
                             work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            let call = Self::expr_key(expression);
                             let borrows_args =
                                 matches!(func.as_str(), "print" | "hash64" | "hash128");
                             let modes = self.named_param_modes.get(func);
@@ -17464,11 +18174,19 @@ impl<'a> EscapeCheck<'a> {
                                         EscapeFlowOp::CallTransfer(argument, depth),
                                     ));
                                 }
+                                work.push(EscapeWalkItem::Op(
+                                    EscapeFlowOp::ArgumentComplete {
+                                        call,
+                                        index,
+                                        argument,
+                                    },
+                                ));
                                 work.push(EscapeWalkItem::Expr(argument, depth));
                             }
                         }
                         ExprKind::CallFnValue { callee, args } => {
                             work.push(EscapeWalkItem::ExprExit(expression, depth));
+                            let call = Self::expr_key(expression);
                             let modes = match callee.ty {
                                 Ty::Fn(id) => self.fn_types.get(id as usize).map(|function| {
                                     function
@@ -17489,8 +18207,22 @@ impl<'a> EscapeCheck<'a> {
                                         EscapeFlowOp::CallTransfer(argument, depth),
                                     ));
                                 }
+                                work.push(EscapeWalkItem::Op(
+                                    EscapeFlowOp::ArgumentComplete {
+                                        call,
+                                        index,
+                                        argument,
+                                    },
+                                ));
                                 work.push(EscapeWalkItem::Expr(argument, depth));
                             }
+                            work.push(EscapeWalkItem::Op(
+                                EscapeFlowOp::CallableCaptureComplete {
+                                    call,
+                                    callee,
+                                    depth,
+                                },
+                            ));
                             work.push(EscapeWalkItem::Expr(callee, depth));
                         }
                         ExprKind::Try(result) => {
@@ -17549,7 +18281,8 @@ impl<'a> EscapeCheck<'a> {
                                     .named_borrow_mut_retention
                                     .get(func)
                                     .cloned();
-                                self.record_borrow_mut_call_modes(
+                                self.record_mutable_call_modes(
+                                    Self::expr_key(expression),
                                     args,
                                     &modes,
                                     summary.as_ref(),
@@ -17567,7 +18300,8 @@ impl<'a> EscapeCheck<'a> {
                                         .collect::<Vec<_>>()
                                 })
                             {
-                                self.record_borrow_mut_call_modes(
+                                self.record_mutable_call_modes(
+                                    Self::expr_key(expression),
                                     args,
                                     &modes,
                                     None,
@@ -17577,6 +18311,10 @@ impl<'a> EscapeCheck<'a> {
                         }
                         _ => {}
                     }
+                    self.push_flow_op(EscapeFlowOp::ExpressionComplete(
+                        expression,
+                        depth,
+                    ));
                     if needs_drop_flag(
                         expression.ty,
                         self.structs,
@@ -17813,8 +18551,361 @@ impl<'a> EscapeCheck<'a> {
         }
     }
 
+    fn selected_explicit_region_backing(
+        &self,
+        summary: &hir::ReturnRegionSummary,
+        args: &[Expr],
+        depth: u32,
+    ) -> Option<EscapeBackingStorage> {
+        let hir::ReturnRegionSummary::Roots { params, .. } = summary else {
+            return None;
+        };
+        params
+            .iter()
+            .filter_map(|&index| {
+                let argument = args.get(index as usize)?;
+                (argument.ty == Ty::ArenaHandle)
+                    .then(|| EscapeBackingStorage::known(self.region_of(argument, depth)))
+            })
+            .reduce(|left, right| left.join(&right))
+    }
+
+    /// Possible collection roots selected by a call's return summary. A return-region summary
+    /// proves lifetime dependence, not that a returned slice preserves the exact writable header,
+    /// so these roots make an unresolved alias an observer without making it writable.
+    fn selected_return_backing_roots(
+        &self,
+        summary: &hir::ReturnRegionSummary,
+        args: &[Expr],
+        depth: u32,
+    ) -> (bool, std::collections::BTreeSet<LocalId>) {
+        let hir::ReturnRegionSummary::Roots { params, .. } = summary else {
+            return (false, std::collections::BTreeSet::new());
+        };
+        let mut selected_collection = false;
+        let mut roots = std::collections::BTreeSet::new();
+        for &index in params {
+            let Some(argument) = args.get(index as usize) else {
+                continue;
+            };
+            if self.indexed_backing_type(argument.ty) {
+                selected_collection = true;
+                roots.extend(self.backing_storage_of_expr(argument, depth).roots);
+            }
+        }
+        (selected_collection, roots)
+    }
+
+    fn call_backing_storage(
+        &self,
+        summary: Option<&hir::ReturnRegionSummary>,
+        args: &[Expr],
+        depth: u32,
+        owner_lexical: Option<Region>,
+    ) -> EscapeBackingStorage {
+        if let Some(lexical) = owner_lexical {
+            return summary
+                .and_then(|summary| {
+                    self.selected_explicit_region_backing(summary, args, depth)
+                })
+                .unwrap_or_else(|| EscapeBackingStorage::known(lexical));
+        }
+        let (selected_collection, roots) = summary.map_or_else(
+            || (false, std::collections::BTreeSet::new()),
+            |summary| self.selected_return_backing_roots(summary, args, depth),
+        );
+        if !selected_collection
+            && let Some(explicit) = summary.and_then(|summary| {
+                self.selected_explicit_region_backing(summary, args, depth)
+            })
+        {
+            return explicit;
+        }
+        let mut backing = EscapeBackingStorage::unknown();
+        if selected_collection {
+            backing.roots = roots;
+        }
+        backing
+    }
+
+    /// Resolve the writable storage selected by an array/slice expression. This deliberately
+    /// follows only value-preserving view wrappers and control-flow joins. A producer not named
+    /// here is unknown rather than inheriting its content region: for example, a call may return
+    /// a heap-owned array whose elements borrow an arena, and those are different lifetimes.
+    fn backing_storage_of_expr(&self, expression: &Expr, depth: u32) -> EscapeBackingStorage {
+        self.backing_storage_of_expr_with_owner(expression, depth, None)
+    }
+
+    /// Resolve an owned dynamic collection while it is being installed into a binding. Fresh
+    /// arena-free producers are individually freed with that binding, so their storage is the
+    /// binding's lexical region rather than `Static`. Keeping this fallback out of the general
+    /// resolver is essential: an unresolved slice/alias origin must remain fail-closed.
+    fn backing_storage_of_owned_expr(
+        &self,
+        expression: &Expr,
+        depth: u32,
+        lexical: Region,
+    ) -> EscapeBackingStorage {
+        self.backing_storage_of_expr_with_owner(expression, depth, Some(lexical))
+    }
+
+    fn backing_storage_of_expr_with_owner(
+        &self,
+        expression: &Expr,
+        depth: u32,
+        owner_lexical: Option<Region>,
+    ) -> EscapeBackingStorage {
+        enum Work<'e> {
+            Eval(&'e Expr, u32),
+            Join(usize),
+        }
+
+        fn push_join<'e>(
+            work: &mut Vec<Work<'e>>,
+            children: Vec<(&'e Expr, u32)>,
+        ) {
+            work.push(Work::Join(children.len()));
+            work.extend(
+                children
+                    .into_iter()
+                    .rev()
+                    .map(|(child, depth)| Work::Eval(child, depth)),
+            );
+        }
+
+        let mut work = vec![Work::Eval(expression, depth)];
+        let mut values = Vec::new();
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Eval(expression, depth) => {
+                    if owner_lexical.is_none()
+                        && let Some(snapshot) = self
+                            .state
+                            .completed_expressions
+                            .get(&Self::expr_key(expression))
+                    {
+                        values.push(snapshot.mutable_backing.clone());
+                        continue;
+                    }
+                    match &expression.kind {
+                    ExprKind::Local(local) => values.push(
+                        self.state
+                            .backing_storage
+                            .get(local)
+                            .cloned()
+                            .unwrap_or_else(EscapeBackingStorage::unknown),
+                    ),
+                    ExprKind::ArrayToSlice(inner) | ExprKind::SliceRange { recv: inner, .. } => {
+                        work.push(Work::Eval(inner, depth));
+                    }
+                    ExprKind::Block(block) | ExprKind::Unsafe(block) => {
+                        if let Some(value) = block.value.as_deref() {
+                            work.push(Work::Eval(value, depth));
+                        } else {
+                            values.push(EscapeBackingStorage::unknown());
+                        }
+                    }
+                    ExprKind::Arena(block)
+                    | ExprKind::NamedArena { block, .. }
+                    | ExprKind::TaskGroup(block) => {
+                        if let Some(value) = block.value.as_deref() {
+                            work.push(Work::Eval(value, depth + 1));
+                        } else {
+                            values.push(EscapeBackingStorage::unknown());
+                        }
+                    }
+                    ExprKind::If { then, els, .. } => push_join(
+                        &mut work,
+                        [then, els]
+                            .into_iter()
+                            .filter(|block| !hir_block_diverges(block))
+                            .filter_map(|block| {
+                                block.value.as_deref().map(|value| (value, depth))
+                            })
+                            .collect(),
+                    ),
+                    ExprKind::Match { arms, .. } => push_join(
+                        &mut work,
+                        arms.iter()
+                            .filter(|arm| !hir_expr_diverges(&arm.body))
+                            .map(|arm| (&arm.body, depth))
+                            .collect(),
+                    ),
+                    ExprKind::ArrayLit { .. } => values.push(EscapeBackingStorage::known(
+                        Region::Frame.shorter(Region::arena(depth)),
+                    )),
+                    ExprKind::ConstArray { .. } => {
+                        values.push(EscapeBackingStorage::known(Region::Static));
+                    }
+                    ExprKind::ArrayBuilderBuild(builder) => {
+                        let region = self.region_of(builder, depth);
+                        values.push(EscapeBackingStorage::known(
+                            if region == Region::Static {
+                                owner_lexical.unwrap_or(region)
+                            } else {
+                                region
+                            },
+                        ));
+                    }
+                    ExprKind::Try(inner) => work.push(Work::Eval(inner, depth)),
+                    ExprKind::Call { func, args, .. } => values.push(
+                        self.call_backing_storage(
+                            self.named_return_region.get(func),
+                            args,
+                            depth,
+                            owner_lexical,
+                        ),
+                    ),
+                    // Function-value results cannot select an explicit region capability, so an
+                    // owned collection result uses free-standing storage owned by the binding.
+                    ExprKind::CallFnValue { .. } => values.push(owner_lexical.map_or_else(
+                        EscapeBackingStorage::unknown,
+                        EscapeBackingStorage::known,
+                    )),
+                    ExprKind::RawCall {
+                        args,
+                        return_region,
+                        ..
+                    } => values.push(self.call_backing_storage(
+                        Some(return_region),
+                        args,
+                        depth,
+                        owner_lexical,
+                    )),
+                    // These collection producers materialize fresh buffers. Only an explicit
+                    // arena entry is useful here: `Static` is also the sentinel for an absent
+                    // allocation entry, while an arena-free dynamic buffer is individually freed
+                    // with its binding and must use that binding's lexical region below.
+                    ExprKind::ArrayToArray { .. }
+                    | ExprKind::ArrayScan { .. }
+                    | ExprKind::ArraySort { .. }
+                    | ExprKind::ArraySortBy { .. }
+                    | ExprKind::ArrayParMap { .. }
+                    | ExprKind::JsonDecodeArray { .. }
+                    | ExprKind::JsonDecodeStructArray { .. } => {
+                        let region = self.allocation_region(expression);
+                        values.push(if region == Region::Static {
+                            owner_lexical.map_or_else(
+                                EscapeBackingStorage::unknown,
+                                EscapeBackingStorage::known,
+                            )
+                        } else {
+                            EscapeBackingStorage::known(region)
+                        });
+                    }
+                    // These producers' column buffers are always allocated in the explicit current
+                    // arena. Their element/content region may additionally borrow an input, so use
+                    // allocation provenance and never `region_of(expression)` here.
+                    ExprKind::ArrayToSoa { .. } | ExprKind::JsonDecodeSoa { .. } => {
+                        values.push(EscapeBackingStorage::known(
+                            self.allocation_region(expression),
+                        ));
+                    }
+                    _ => values.push(EscapeBackingStorage::unknown()),
+                    }
+                }
+                Work::Join(count) => {
+                    let Some(start) = values.len().checked_sub(count) else {
+                        values.push(EscapeBackingStorage::unknown());
+                        continue;
+                    };
+                    let mut children = values.drain(start..);
+                    let joined = children.next().map_or_else(
+                        EscapeBackingStorage::unknown,
+                        |first| children.fold(first, |fact, child| fact.join(&child)),
+                    );
+                    values.push(joined);
+                }
+            }
+        }
+        values
+            .pop()
+            .unwrap_or_else(EscapeBackingStorage::unknown)
+    }
+
+    /// Install the backing selected by a new/reassigned local. Slices copy their source fact.
+    /// Fixed and individually released arrays die with their binding. Pure region arrays and soa
+    /// buffers retain the exact allocation region, while the local remains a content-observation
+    /// root for later writes through aliases.
+    fn installed_dynamic_backing_storage(
+        &self,
+        local: LocalId,
+        selected: EscapeBackingStorage,
+        individual: bool,
+        may_individual: bool,
+        depth: u32,
+    ) -> EscapeBackingStorage {
+        let lexical = self.mutable_root_storage_region(local, depth);
+        let mut backing = if individual {
+            // A moved/free-standing dynamic buffer is released with its new binding, even if the
+            // source binding lived in a longer frame or arena.
+            EscapeBackingStorage::known(lexical)
+        } else if may_individual {
+            // A dynamic-cleanup value may select caller-owned region storage on one path and an
+            // individually freed buffer on another. Writes must satisfy the longer-lived target.
+            if selected.known {
+                EscapeBackingStorage::known(lexical.longer(selected.region))
+            } else {
+                EscapeBackingStorage::unknown()
+            }
+        } else if selected.known {
+            EscapeBackingStorage::known(selected.region)
+        } else {
+            // A definitely region-owned value without named allocation provenance is not assumed
+            // to belong to the current use-site arena. Region-bearing writes stay fail-closed.
+            EscapeBackingStorage::unknown()
+        };
+        // Moving an owned header transfers the storage identity to this exact destination. Source
+        // locals no longer observe the moved buffer and must not remain reverse-alias roots.
+        backing.roots.clear();
+        backing.roots.insert(local);
+        backing
+    }
+
+    fn install_local_backing_storage(&mut self, local: LocalId, value: &Expr, depth: u32) {
+        let Some(ty) = self.f.locals.get(local as usize).map(|local| local.ty) else {
+            return;
+        };
+        if !self.indexed_backing_type(ty) {
+            self.state.backing_storage.remove(&local);
+            return;
+        }
+
+        let expanded = expand_tagged_ty(ty, self.tagged_types);
+        let backing = match expanded {
+            Ty::Slice(..) => self.backing_storage_of_expr(value, depth),
+            Ty::Array(..) | Ty::StructArray(..) => {
+                EscapeBackingStorage::known(self.mutable_root_storage_region(local, depth))
+                    .rooted(local)
+            }
+            Ty::DynArray(..) | Ty::DynStructArray(..) => {
+                let lexical = self.mutable_root_storage_region(local, depth);
+                let selected = self.backing_storage_of_owned_expr(value, depth, lexical);
+                let individual = self.drop_is_individual(value, depth);
+                let may_individual = self.drop_may_be_individual(value, depth);
+                self.installed_dynamic_backing_storage(
+                    local,
+                    selected,
+                    individual,
+                    may_individual,
+                    depth,
+                )
+            }
+            Ty::Soa(..) | Ty::SoaParam(..) => {
+                let backing = self.backing_storage_of_expr(value, depth);
+                if materializes_fresh_soa_storage(value) {
+                    backing.rooted(local)
+                } else {
+                    backing
+                }
+            }
+            _ => EscapeBackingStorage::unknown(),
+        };
+        self.state.backing_storage.insert(local, backing);
+    }
+
     /// Storage region of a mutable place rooted at `root`: the symbolic caller place for a
-    /// `borrow mut` parameter, else the root's lexical frame/arena scope. This is the one
+    /// `borrow mut`/`out` parameter, else the root's lexical frame/arena scope. This is the one
     /// destination-side authority; every store path (`Assign`, `AssignField`, and call-site
     /// destination snapshots) must derive its target from here so the caller-place branch cannot
     /// be forgotten in one copy. An unrecorded declaration defaults to the *use-site* depth — the
@@ -17826,7 +18917,10 @@ impl<'a> EscapeCheck<'a> {
             .iter()
             .position(|&parameter| parameter == root)
             .filter(|&position| {
-                self.f.param_modes.get(position) == Some(&ast::ParamMode::BorrowMut)
+                matches!(
+                    self.f.param_modes.get(position),
+                    Some(ast::ParamMode::BorrowMut | ast::ParamMode::Out)
+                )
             })
         {
             Region::Caller(position as u32)
@@ -17863,7 +18957,27 @@ impl<'a> EscapeCheck<'a> {
     /// region still bounds arena-owned contents, while the caller place bounds free-standing and
     /// inline storage that `region_of(Local)` otherwise classifies as `Static`.
     fn retained_storage_region(&self, argument: &Expr, depth: u32) -> Region {
+        if let Some(snapshot) = self
+            .state
+            .completed_expressions
+            .get(&Self::expr_key(argument))
+        {
+            return snapshot.storage_region;
+        }
         let value_region = self.region_of(argument, depth);
+        if argument.ty.is_array_builder() {
+            // A builder's mutable storage belongs to its constructor-selected heap/region. The
+            // local is only the linear header, so applying the ordinary local declaration cap
+            // would turn a caller-region builder into false frame-local storage at every helper
+            // call that retains its existing contents.
+            return value_region;
+        }
+        if self.indexed_backing_type(argument.ty) {
+            let backing = self.backing_storage_of_expr(argument, depth);
+            if backing.known {
+                return value_region.shorter(backing.region);
+            }
+        }
         if self.borrowed_param_place(argument) {
             return value_region;
         }
@@ -17894,6 +19008,13 @@ impl<'a> EscapeCheck<'a> {
     /// separate local-storage bit because their element type has no region; fold that parallel fact
     /// into the same lexical cap before a mutable destination can retain the slice.
     fn retained_contained_region(&self, argument: &Expr, depth: u32) -> Region {
+        if let Some(snapshot) = self
+            .state
+            .completed_expressions
+            .get(&Self::expr_key(argument))
+        {
+            return snapshot.retained_contained_region;
+        }
         let value_region = self.region_of(argument, depth);
         if self.slice_is_local(argument) {
             value_region.shorter(self.retained_storage_region(argument, depth))
@@ -17902,56 +19023,271 @@ impl<'a> EscapeCheck<'a> {
         }
     }
 
-    fn apply_borrow_mut_calls(
-        &mut self,
+    fn borrow_mut_replacement_snapshot(
+        &self,
+        destination: &Expr,
+        destination_root: Option<(LocalId, bool)>,
+        completion: Option<&EscapeArgumentSnapshot>,
+        sources: &[BorrowMutRetentionSource],
         args: &[Expr],
-        destinations: &[(usize, Vec<BorrowMutRetentionSource>)],
+        completed: &[Option<EscapeArgumentSnapshot>],
+        depth: u32,
+    ) -> EscapeArgumentSnapshot {
+        let destination_ty = expand_tagged_ty(destination.ty, self.tagged_types);
+        // A fixed array's slot is the backing; whole-value assignment replaces elements but cannot
+        // retarget that storage. Header-bearing views and dynamic owners may select new storage.
+        if matches!(destination_ty, Ty::Array(..) | Ty::StructArray(..)) {
+            return completion
+                .cloned()
+                .unwrap_or_else(EscapeArgumentSnapshot::fail_closed);
+        }
+
+        let mut selected = std::collections::BTreeSet::new();
+        for source in sources {
+            let index = source.index();
+            let Some(argument) = args.get(index) else {
+                continue;
+            };
+            if argument.ty == Ty::ArenaHandle
+                || mutable_replacement_backing_compatible(
+                    destination.ty,
+                    argument.ty,
+                    self.tagged_types,
+                )
+            {
+                selected.insert(index);
+            }
+        }
+        let mut replacement = selected
+            .into_iter()
+            .filter_map(|index| {
+                let argument = args.get(index)?;
+                let snapshot = completed.get(index)?.as_ref()?.clone();
+                if argument.ty == Ty::ArenaHandle {
+                    let region = snapshot.content_region;
+                    Some(EscapeArgumentSnapshot {
+                        content_region: Region::Static,
+                        retained_contained_region: region,
+                        storage_region: region,
+                        mutable_backing: EscapeBackingStorage::known(region),
+                        storage_is_local: !region.is_returnable(),
+                        individual: false,
+                        may_individual: false,
+                    })
+                } else {
+                    Some(snapshot)
+                }
+            })
+            .reduce(|left, right| left.join(&right))
+            .unwrap_or_else(EscapeArgumentSnapshot::fail_closed);
+
+        if matches!(destination_ty, Ty::DynArray(..) | Ty::DynStructArray(..))
+            && let Some((root, true)) = destination_root
+        {
+            let selected_backing = replacement.mutable_backing.clone();
+            let selected_storage = replacement.storage_region;
+            replacement.mutable_backing = self.installed_dynamic_backing_storage(
+                root,
+                selected_backing,
+                replacement.individual,
+                replacement.may_individual,
+                depth,
+            );
+            let lexical = self.mutable_root_storage_region(root, depth);
+            replacement.storage_region = if replacement.individual {
+                lexical
+            } else if replacement.may_individual {
+                lexical.shorter(selected_storage)
+            } else {
+                selected_storage
+            };
+            replacement.storage_is_local |= replacement.may_individual
+                || !replacement.mutable_backing.known
+                || !replacement.storage_region.is_returnable();
+        } else if replacement.mutable_backing.roots.is_empty()
+            && replacement.mutable_backing.known
+            && let Some((root, true)) = destination_root
+        {
+            // A region-selected fresh buffer has no source collection identity. The destination
+            // becomes its content-observation root after the strong header update.
+            replacement.mutable_backing = replacement.mutable_backing.rooted(root);
+        }
+        replacement
+    }
+
+    fn apply_mutable_calls(
+        &mut self,
+        call: usize,
+        args: &[Expr],
+        destinations: &[(usize, ast::ParamMode, Vec<BorrowMutRetentionSource>)],
         depth: u32,
     ) {
-        // Every summary source denotes the pre-call value. Snapshot the complete call before
-        // changing any destination: a callee may swap two mutable view-bearing places, and reading
-        // the second source after updating the first would validate the wrong arena lifetime.
-        let snapshots = destinations
-            .iter()
-            .filter_map(|(destination, sources)| {
-                let destination = args.get(*destination)?;
-                // A resource's region is the lifetime of its opaque parent handle. Mutating native
-                // resource state cannot replace that provenance with an ordinary call argument;
-                // doing so would suppress a child resource's Drop hook.
-                if matches!(
-                    expand_tagged_ty(destination.ty, self.tagged_types),
-                    Ty::Resource(_)
-                ) {
-                    return None;
-                }
-                let destination_region =
-                    self.mutable_destination_storage_region(destination, depth);
-                let source_regions = sources
-                    .iter()
-                    .filter_map(|&source| {
-                        let index = source.index();
-                        let argument = args.get(index)?;
-                        self.region_bearing(argument.ty).then(|| {
-                            let region = match source {
-                                BorrowMutRetentionSource::Contained(_) => {
-                                    self.retained_contained_region(argument, depth)
-                                }
-                                BorrowMutRetentionSource::Storage(_) => {
-                                    self.retained_storage_region(argument, depth)
-                                }
-                            };
-                            (index, region)
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                Some((destination, destination_region, source_regions))
-            })
+        struct DestinationSnapshot<'e> {
+            destination_index: usize,
+            mode: ast::ParamMode,
+            destination: &'e Expr,
+            destination_root: Option<(LocalId, bool)>,
+            whole_place_region: Option<Region>,
+            backing: Option<EscapeBackingStorage>,
+            completion: EscapeArgumentSnapshot,
+            replacement: Option<EscapeArgumentSnapshot>,
+            source_regions: Vec<(usize, Region, bool)>,
+            initial_contained_region: Region,
+            backing_observers: std::collections::BTreeSet<LocalId>,
+        }
+
+        // These entries were captured immediately after each argument completed. Keep the vector
+        // through `ExpressionComplete(Call)`: mutable destinations rewrite their entries to
+        // post-call values, and the return summary must select those rather than live syntax or
+        // pre-call actuals. `ExpressionStart` clears stale entries before a later loop iteration.
+        let argument_snapshots = (0..args.len())
+            .map(|index| self.state.argument_snapshots.get(&(call, index)).cloned())
             .collect::<Vec<_>>();
+        let mut snapshots = Vec::new();
+        for (destination_index, mode, sources) in destinations {
+            let Some(destination) = args.get(*destination_index) else {
+                continue;
+            };
+            // A resource's region is the lifetime of its opaque parent handle. Mutating native
+            // resource state cannot replace that provenance with an ordinary call argument;
+            // doing so would suppress a child resource's Drop hook.
+            if matches!(
+                expand_tagged_ty(destination.ty, self.tagged_types),
+                Ty::Resource(_)
+            ) {
+                continue;
+            }
+            let completion = argument_snapshots
+                .get(*destination_index)
+                .and_then(Option::as_ref)
+                .cloned()
+                .unwrap_or_else(EscapeArgumentSnapshot::fail_closed);
+            let destination_root = self.mutable_destination_root(destination);
+            let replacement = (*mode == ast::ParamMode::BorrowMut
+                && self.indexed_backing_type(destination.ty))
+                .then(|| {
+                    self.borrow_mut_replacement_snapshot(
+                        destination,
+                        destination_root,
+                        Some(&completion),
+                        sources,
+                        args,
+                        &argument_snapshots,
+                        depth,
+                    )
+                });
+            let indexed_retention = self.indexed_backing_type(destination.ty)
+                && self.indexed_content_may_retain_region(destination.ty);
+            let backing = (matches!(mode, ast::ParamMode::Out | ast::ParamMode::BorrowMut)
+                && indexed_retention)
+                .then(|| {
+                    if *mode == ast::ParamMode::BorrowMut {
+                        replacement.as_ref().map_or_else(
+                            || completion.mutable_backing.clone(),
+                            |replacement| {
+                                completion
+                                    .mutable_backing
+                                    .join(&replacement.mutable_backing)
+                            },
+                        )
+                    } else {
+                        completion.mutable_backing.clone()
+                    }
+                });
+            let source_regions = sources
+                .iter()
+                .filter_map(|&source| {
+                    let index = source.index();
+                    let argument = args.get(index)?;
+                    if !self.region_bearing(argument.ty) {
+                        return None;
+                    }
+                    let captured = argument_snapshots.get(index).and_then(Option::as_ref);
+                    let region = captured.map_or(Region::Static, |snapshot| match source {
+                        // `out` mutates elements in the captured destination backing; retaining
+                        // its pre-call elements does not retain the destination slice header.
+                        // Every other contained source is a whole evaluated value, so a numeric
+                        // slice must carry its selected storage lifetime as well as its elements.
+                        BorrowMutRetentionSource::Contained(_)
+                            if *mode == ast::ParamMode::Out
+                                && index == *destination_index =>
+                        {
+                            snapshot.content_region
+                        }
+                        BorrowMutRetentionSource::Contained(_) => {
+                            snapshot.retained_contained_region
+                        }
+                        BorrowMutRetentionSource::Storage(_) => snapshot.storage_region,
+                    });
+                    Some((index, region, captured.is_some()))
+                })
+                .collect::<Vec<_>>();
+            let initial_contained_region = match (*mode, destination_root) {
+                (ast::ParamMode::Out, _) => completion.content_region,
+                (ast::ParamMode::BorrowMut, Some((_, false))) => {
+                    completion.retained_contained_region
+                }
+                _ => Region::Static,
+            };
+            let whole_place_region = (*mode == ast::ParamMode::BorrowMut)
+                .then(|| self.mutable_destination_storage_region(destination, depth));
+            let mut backing_observers = std::collections::BTreeSet::new();
+            if let Some(backing) = &backing {
+                // Do not add the syntactic destination local unconditionally. An `out` slice
+                // header was captured by value when its argument completed; a later eager
+                // argument may legally rebind that local while the call still writes the old
+                // backing. Reverse selection adds the local only when its current fact continues
+                // to observe one of the captured roots. `borrow mut` keeps its separate strong
+                // place update below (and a later rebind is rejected by the place analysis).
+                backing_observers.extend(self.backing_content_observers(&backing.roots));
+            }
+            snapshots.push(DestinationSnapshot {
+                destination_index: *destination_index,
+                mode: *mode,
+                destination,
+                destination_root,
+                whole_place_region,
+                backing,
+                completion,
+                replacement,
+                source_regions,
+                initial_contained_region,
+                backing_observers,
+            });
+        }
 
         let mut updates = std::collections::HashMap::<LocalId, Region>::new();
-        for (destination, destination_region, source_regions) in snapshots {
-            for (source, region) in &source_regions {
-                if !region.outlives(destination_region)
+        let mut backing_updates =
+            std::collections::HashMap::<LocalId, EscapeBackingStorage>::new();
+        let mut local_backed_updates = std::collections::HashMap::<LocalId, bool>::new();
+        let mut individual_updates = std::collections::HashMap::<LocalId, bool>::new();
+        let mut individual_may_updates = std::collections::HashMap::<LocalId, bool>::new();
+        let mut post_argument_updates = std::collections::HashMap::new();
+        for snapshot in snapshots {
+            if let Some(backing) = &snapshot.backing {
+                if !backing.known {
+                    self.diags.error(
+                        "cannot retain through this mutable call because the indexed destination's backing storage is unknown"
+                            .to_string(),
+                        snapshot.destination.span,
+                    );
+                } else if !self.backing_retention_is_visible(backing) {
+                    self.diags.error(
+                        "a caller-backed array element may retain a borrowed view only through an `out` or `borrow mut` parameter"
+                            .to_string(),
+                        snapshot.destination.span,
+                    );
+                }
+            }
+            for (source, region, captured) in &snapshot.source_regions {
+                let whole_place_ok = snapshot
+                    .whole_place_region
+                    .is_none_or(|destination| region.outlives(destination));
+                let backing_ok = snapshot
+                    .backing
+                    .as_ref()
+                    .is_none_or(|backing| !backing.known || region.outlives(backing.region));
+                if (!captured || !whole_place_ok || !backing_ok)
                     && let Some(source) = args.get(*source)
                 {
                     self.diags.error(
@@ -17961,33 +19297,149 @@ impl<'a> EscapeCheck<'a> {
                     );
                 }
             }
-            if destination.ty.is_array_builder() {
+            if snapshot.destination.ty.is_array_builder() {
                 continue;
             }
-            let Some((root, whole_place)) = self.mutable_destination_root(destination) else {
-                continue;
-            };
-            let mut retained = if whole_place {
-                Region::Static
-            } else {
-                self.state.region.get(&root).copied().unwrap_or(Region::Static)
-            };
-            for (_, region) in source_regions {
-                retained = retained.shorter(region);
+            let mut retained = snapshot.initial_contained_region;
+            for (_, region, _) in &snapshot.source_regions {
+                retained = retained.shorter(*region);
             }
-            updates
-                .entry(root)
-                .and_modify(|current| *current = current.shorter(retained))
-                .or_insert(retained);
+
+            // `borrow mut` remains a strong whole-header/place update. Indexed mutable calls also
+            // may have changed elements, so every distinct backing root and existing alias joins
+            // the new contained region instead of losing its previous possible contents.
+            if snapshot.mode == ast::ParamMode::BorrowMut
+                && let Some((root, _)) = snapshot.destination_root
+            {
+                updates
+                    .entry(root)
+                    .and_modify(|existing| *existing = existing.shorter(retained))
+                    .or_insert(retained);
+                if self
+                    .f
+                    .locals
+                    .get(root as usize)
+                    .is_some_and(|local| self.indexed_backing_type(local.ty))
+                    && let Some(replacement) = &snapshot.replacement
+                {
+                    let backing = replacement.mutable_backing.clone();
+                    backing_updates
+                        .entry(root)
+                        .and_modify(|existing| *existing = existing.join(&backing))
+                        .or_insert(backing);
+                    if matches!(
+                        self.f.locals.get(root as usize).map(|local| {
+                            expand_tagged_ty(local.ty, self.tagged_types)
+                        }),
+                        Some(Ty::Slice(..))
+                    ) {
+                        local_backed_updates.insert(
+                            root,
+                            replacement.storage_is_local
+                                || !replacement.mutable_backing.known,
+                        );
+                    } else if matches!(
+                        self.f.locals.get(root as usize).map(|local| {
+                            expand_tagged_ty(local.ty, self.tagged_types)
+                        }),
+                        Some(Ty::DynArray(..) | Ty::DynStructArray(..))
+                    ) && snapshot.destination_root == Some((root, true))
+                    {
+                        local_backed_updates.insert(
+                            root,
+                            replacement.may_individual
+                                || replacement.storage_is_local
+                                || !replacement.mutable_backing.known,
+                        );
+                        individual_updates
+                            .entry(root)
+                            .and_modify(|current| *current &= replacement.individual)
+                            .or_insert(replacement.individual);
+                        individual_may_updates
+                            .entry(root)
+                            .and_modify(|current| *current |= replacement.may_individual)
+                            .or_insert(replacement.may_individual);
+                    }
+                }
+            }
+            if snapshot.mode == ast::ParamMode::Out
+                || (snapshot.mode == ast::ParamMode::BorrowMut
+                    && snapshot.backing.is_some())
+            {
+                for root in snapshot.backing_observers {
+                    if snapshot.mode == ast::ParamMode::BorrowMut
+                        && snapshot
+                            .destination_root
+                            .is_some_and(|(destination, _)| destination == root)
+                    {
+                        continue;
+                    }
+                    let current = self
+                        .state
+                        .region
+                        .get(&root)
+                        .copied()
+                        .unwrap_or(Region::Static);
+                    let next = current.shorter(retained);
+                    updates
+                        .entry(root)
+                        .and_modify(|existing| *existing = existing.shorter(next))
+                        .or_insert(next);
+                }
+            }
+
+            let post = match snapshot.mode {
+                ast::ParamMode::BorrowMut => {
+                    let mut post = snapshot
+                        .replacement
+                        .clone()
+                        .unwrap_or_else(|| snapshot.completion.clone());
+                    post.content_region = retained;
+                    post.retained_contained_region = retained;
+                    post.storage_region = post.storage_region.shorter(retained);
+                    post
+                }
+                ast::ParamMode::Out => {
+                    let mut post = snapshot.completion.clone();
+                    post.content_region = post.content_region.shorter(retained);
+                    post.retained_contained_region =
+                        post.retained_contained_region.shorter(retained);
+                    post.storage_region = post.storage_region.shorter(retained);
+                    post
+                }
+                ast::ParamMode::ByValue | ast::ParamMode::Borrow => {
+                    snapshot.completion.clone()
+                }
+            };
+            post_argument_updates
+                .entry(snapshot.destination_index)
+                .and_modify(|current: &mut EscapeArgumentSnapshot| {
+                    *current = current.join(&post)
+                })
+                .or_insert(post);
         }
         self.state.region.extend(updates);
+        self.state.backing_storage.extend(backing_updates);
+        self.state.individual.extend(individual_updates);
+        self.state.individual_may.extend(individual_may_updates);
+        for (local, is_local) in local_backed_updates {
+            if is_local {
+                self.state.local_backed_slice.insert(local);
+            } else {
+                self.state.local_backed_slice.remove(&local);
+            }
+        }
+        for (index, snapshot) in post_argument_updates {
+            self.state.argument_snapshots.insert((call, index), snapshot);
+        }
     }
 
     /// Record concrete caller-region checks for every region-bearing mutable destination. Exact
     /// same-program facts name only arguments retained after return; indirect/imported/malformed
     /// calls keep the conservative all-argument fallback.
-    fn record_borrow_mut_call_modes(
+    fn record_mutable_call_modes(
         &mut self,
+        call: usize,
         args: &'a [Expr],
         modes: &[ast::ParamMode],
         summary: Option<&BorrowMutRetentionSummary>,
@@ -18007,17 +19459,20 @@ impl<'a> EscapeCheck<'a> {
                 });
                 continue;
             }
-            if mode != ast::ParamMode::BorrowMut {
+            if !matches!(mode, ast::ParamMode::BorrowMut | ast::ParamMode::Out) {
                 continue;
             }
-            if !self.region_bearing(destination.ty) {
+            if !self.region_bearing(destination.ty)
+                && !self.indexed_backing_type(destination.ty)
+            {
                 continue;
             }
             let sources = borrow_mut_source_indices(summary, index, args.len());
-            destinations.push((index, sources));
+            destinations.push((index, mode, sources));
         }
         if !destinations.is_empty() {
-            self.push_flow_op(EscapeFlowOp::BorrowMutCall {
+            self.push_flow_op(EscapeFlowOp::MutableCall {
+                call,
                 args,
                 destinations,
                 depth,
@@ -18077,11 +19532,13 @@ impl<'a> EscapeCheck<'a> {
                 if self.dyn_storage_binding_is_local(init.ty, init, depth) {
                     self.state.local_backed_slice.insert(*local);
                 }
+                self.install_local_backing_storage(*local, init, depth);
             }
             // `base[index] = value` / `base[index].field = value`. The store itself targets the
             // element slot; recurse into the index/value for nested escapes, and — when the element
-            // is region-tracked (a `str` element) — reject storing a shorter-lived value into the
-            // longer-lived array (the `Assign`/`AssignField` region rule, extended to elements).
+            // is region-tracked — validate against the backing buffer rather than its previous
+            // contents. The content transition reaches the syntactic base and every collection root
+            // visible through an alias; backing lifetime remains unchanged.
             Stmt::AssignIndex {
                 base,
                 index: _,
@@ -18127,12 +19584,40 @@ impl<'a> EscapeCheck<'a> {
                     }
                 }
                 if self.region_bearing(value.ty) {
-                    let target = self.state.region.get(base).copied().unwrap_or(Region::Static);
-                    if !self.retained_contained_region(value, depth).outlives(target) {
+                    let backing = self
+                        .state
+                        .backing_storage
+                        .get(base)
+                        .cloned()
+                        .unwrap_or_else(EscapeBackingStorage::unknown);
+                    let incoming = self.retained_contained_region(value, depth);
+                    if !backing.known {
                         self.diags.error(
                             "this value cannot be stored into a longer-lived array element (it would escape its region)".to_string(),
                             value.span,
                         );
+                    } else if !self.backing_retention_is_visible(&backing) {
+                        self.diags.error(
+                            "a caller-backed array element may retain a borrowed view only through an `out` or `borrow mut` parameter"
+                                .to_string(),
+                            value.span,
+                        );
+                    } else if !incoming.outlives(backing.destination_region()) {
+                        self.diags.error(
+                            "this value cannot be stored into a longer-lived array element (it would escape its region)".to_string(),
+                            value.span,
+                        );
+                    }
+                    let mut content_roots = self.backing_content_observers(&backing.roots);
+                    content_roots.insert(*base);
+                    for root in content_roots {
+                        let current = self
+                            .state
+                            .region
+                            .get(&root)
+                            .copied()
+                            .unwrap_or(Region::Static);
+                        self.state.region.insert(root, current.shorter(incoming));
                     }
                 }
                 match s {
@@ -18204,8 +19689,9 @@ impl<'a> EscapeCheck<'a> {
                         self.state.local_backed_slice.remove(local);
                     }
                 }
+                self.install_local_backing_storage(*local, value, depth);
                 if self.region_bearing(value.ty) {
-                    let r = self.retained_contained_region(value, depth);
+                    let retained = self.retained_contained_region(value, depth);
                     // The binding's scope through the one destination authority: the symbolic
                     // caller place for a `borrow mut` parameter, else at least the frame (a
                     // depth-0 binding lives the whole frame, region `Frame`), or the enclosing
@@ -18216,7 +19702,7 @@ impl<'a> EscapeCheck<'a> {
                     // binding stays rejected, and a frame-local view assigned whole into a
                     // `borrow mut` parameter place is rejected against its caller lifetime.
                     let target = self.mutable_root_storage_region(*local, depth);
-                    if !r.outlives(target) {
+                    if !retained.outlives(target) {
                         let message = if matches!(target, Region::Caller(_)) {
                             "this value cannot be stored into a longer-lived mutable destination (it would escape its region)"
                         } else {
@@ -18228,7 +19714,13 @@ impl<'a> EscapeCheck<'a> {
                         // the shorter region from all reaching paths, while a straight-line overwrite
                         // can precisely replace an obsolete shorter-lived view. Owned Move locals may
                         // now change region: their path-local MIR flag keeps cleanup provenance exact.
-                        self.state.region.insert(*local, r);
+                        // The check above includes the assigned value's storage; this state records
+                        // only its contents because `backing_storage` owns the separate header/buffer
+                        // lifetime. Otherwise rebinding a slice to longer-lived storage would make
+                        // its static elements spuriously inherit that storage region.
+                        self.state
+                            .region
+                            .insert(*local, self.region_of(value, depth));
                     }
                 }
             }
@@ -18359,6 +19851,9 @@ impl<'a> EscapeCheck<'a> {
                         self.state.callable_capture_region.insert(*local, selected);
                     }
                 }
+                for local in locals.iter().flatten() {
+                    self.install_local_backing_storage(*local, init, depth);
+                }
             }
             // `break e` carries `e` out of the loop, so `e` escapes the loop exactly as a returned
             // value escapes the function: it must be `Static`-region (a borrowed Frame/arena view
@@ -18428,6 +19923,7 @@ impl<'a> EscapeCheck<'a> {
             if owns {
                 self.state.local_backed_slice.insert(*binding);
             }
+            self.install_local_backing_storage(*binding, scrutinee, depth);
         }
     }
 
@@ -19480,8 +20976,9 @@ struct MoveCheck<'a> {
     /// storage and therefore neither transfer ownership nor contribute their value facts as if
     /// they were by-value copies.
     named_param_modes: &'a std::collections::HashMap<String, Vec<ast::ParamMode>>,
-    /// Same-program exact post-call mutable-retention facts. Absence means the callee body is not
-    /// available and therefore selects the conservative all-compatible-input fallback.
+    /// Same-program exact post-call mutable-retention facts for `borrow mut` and `out`
+    /// destinations. Absence means the callee body is unavailable and therefore selects the
+    /// conservative all-compatible-input fallback.
     named_borrow_mut_retention: &'a BorrowMutRetentionMap,
     /// Direct named calls observed by the exhaustive expression walk. Present only while building
     /// the reverse worklist for named-return inference.
@@ -19527,6 +21024,26 @@ struct MoveCheck<'a> {
     /// through. Parent formation reads these snapshots so a later eager sibling cannot rewrite an
     /// earlier runtime value's provenance in a product, residual aggregate, or call.
     walked_value_facts: std::collections::HashMap<usize, BorrowFact>,
+    /// Storage roots captured when each borrow-capable expression completes. Mutable call actions
+    /// consume these alongside `walked_value_facts`; consulting the live local state after a later
+    /// eager argument ran would retarget an already-evaluated slice header.
+    walked_storage_facts: std::collections::HashMap<usize, BorrowFact>,
+    /// Mutable backing identities captured at the same completion boundary. This is distinct from
+    /// storage roots because it names every collection whose element facts observe a write.
+    walked_backing_facts: std::collections::HashMap<usize, MutableBackingFact>,
+    /// Post-action completion overrides for calls with mutable destinations. Operand snapshots
+    /// remain pre-call for validation; only the enclosing call result consumes these post-call
+    /// value, storage, and backing facts.
+    pending_call_completions:
+        std::collections::HashMap<usize, MoveExpressionCompletion>,
+    /// Exact argument expressions of calls whose returning action may mutate at least one
+    /// destination. These receive completion-time storage/backing facts even when their value type
+    /// itself cannot carry a borrow (notably numeric owned arrays selected by `ParamStorage`).
+    mutable_call_argument_snapshots: std::collections::HashSet<usize>,
+    /// Stable local/field actuals passed as `borrow mut`. Their expression-completion snapshot also
+    /// reserves the source place, so a later eager argument cannot retarget the pointer that MIR
+    /// will pass when the call action begins.
+    borrow_mut_place_snapshots: std::collections::HashSet<usize>,
     /// Direct borrow-capable children completed while each enclosing expression is evaluated.
     /// Eager operations validate these snapshots at their action boundary; transparent/control
     /// containers defer validation to the operation that consumes their selected result.
@@ -19557,8 +21074,8 @@ struct MoveCheck<'a> {
     return_roots: BorrowRoots,
     /// Symbolic parameter roots observed at worker-transfer sinks, including transitive callees.
     parallel_transfer_roots: BorrowRoots,
-    /// Union of the exact parameter roots stored in every mutable destination at each returning
-    /// function edge. Entries are indexed by this function's parameter positions.
+    /// Union of the exact parameter roots stored in every `borrow mut`/`out` destination at each
+    /// returning function edge. Entries are indexed by this function's parameter positions.
     borrow_mut_retention: BorrowMutRetentionSummary,
     /// Expressions proven not to reach their result edge during this exact source-order walk.
     /// Provenance queries use this to exclude diverging alternatives and unreachable block tails.
@@ -19628,11 +21145,12 @@ enum BorrowRoot {
 
 type BorrowRoots = std::collections::BTreeSet<BorrowRoot>;
 
-/// Analysis-local roots that may remain stored in each parameter after a returning `borrow mut`
-/// call. Entries are indexed by destination parameter; every root is relative to a source
+/// Analysis-local roots that may remain stored in each parameter after a returning `borrow mut` or
+/// `out` call. Entries are indexed by destination parameter; every root is relative to a source
 /// parameter of the same function. The fact is deliberately not serialized: a checked-HIR replay
-/// recomputes it from the available same-program bodies, while unavailable bodies use the
-/// conservative all-compatible-input fallback at their call sites.
+/// recomputes it from available same-program bodies, while unavailable bodies use the conservative
+/// all-compatible-input fallback at their call sites. The historical type name remains internal so
+/// the one summary path is extended rather than shadowed by an `out`-only fact.
 type BorrowMutRetentionSummary = Vec<BorrowRoots>;
 type BorrowMutRetentionMap =
     std::collections::HashMap<String, BorrowMutRetentionSummary>;
@@ -19896,12 +21414,116 @@ impl BorrowFact {
             .collect()
     }
 
+    fn without_root_sources(mut self, excluded: &BorrowRoots) -> Self {
+        let retain = |root: &BorrowRoot| {
+            !excluded.contains(root)
+                && !root
+                    .ended_source()
+                    .is_some_and(|(source, _)| excluded.contains(&source))
+        };
+        self.direct.retain(&retain);
+        for roots in self.projected.values_mut() {
+            roots.retain(&retain);
+        }
+        self.projected.retain(|_, roots| !roots.is_empty());
+        self
+    }
+
 }
 
 /// Which ended source generations a borrower depends on, and how each ended. `Ord` on
 /// [`BorrowEnd`] makes the join's per-owner merge commutative (`Consumed` < `Dropped`, so a source
 /// that was consumed on one path and dropped on another reports the consumption).
 type EndedRoots = std::collections::BTreeMap<BorrowRoot, BorrowEnd>;
+
+/// Storage identities reachable through a mutable collection value. These are deliberately kept
+/// separate from [`BorrowFact`]: a slice may contain views rooted in `Local(x)` while its writable
+/// slots live in an entirely different `Local(y)`. Conflating those two roles makes an element
+/// write update the previous contents instead of every collection that can observe the write.
+///
+/// `unknown` is sticky across control-flow joins. The escape analysis owns the corresponding
+/// lifetime rejection; MoveCheck must nevertheless preserve the distinction so it never pretends
+/// an unresolved slice aliases only its short-lived header local.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct MutableBackingFact {
+    roots: BorrowRoots,
+    unknown: bool,
+}
+
+#[derive(Clone)]
+struct MoveExpressionCompletion {
+    value: BorrowFact,
+    storage: BorrowFact,
+    backing: MutableBackingFact,
+}
+
+/// One shared inventory of built-ins whose completed operands are followed by a source-visible
+/// mutation. Snapshot exemption, eager-lane classification, and the post-operand transition all
+/// consume this descriptor so a new mutating HIR variant cannot drift between three parallel
+/// lists.
+enum SourceVisibleMutationAction<'a> {
+    Storage(&'a Expr),
+    Builder {
+        builder: &'a Expr,
+        retained: &'a Expr,
+    },
+    Source(&'a Expr),
+    Shuffle {
+        source: &'a Expr,
+        collection: &'a Expr,
+    },
+    Collection(&'a Expr),
+}
+
+impl SourceVisibleMutationAction<'_> {
+    fn exact_destination_matches(&self, snapshot: usize) -> bool {
+        let matches = |expression: &Expr| MoveCheck::expr_key(expression) == snapshot;
+        match self {
+            Self::Storage(destination)
+            | Self::Builder {
+                builder: destination,
+                ..
+            }
+            | Self::Source(destination)
+            | Self::Collection(destination) => matches(destination),
+            Self::Shuffle { source, collection } => matches(source) || matches(collection),
+        }
+    }
+}
+
+/// One stable source place reserved after an eager `borrow mut` argument completes. This is
+/// deliberately separate from value/storage provenance: rebinding a Copy slice header retargets
+/// the place without ending the old backing owner's generation.
+#[derive(Clone, PartialEq, Eq)]
+struct MutablePlaceSnapshot {
+    root: LocalId,
+    path: Vec<u32>,
+}
+
+impl MutableBackingFact {
+    fn known(roots: BorrowRoots) -> Self {
+        Self {
+            roots,
+            unknown: false,
+        }
+    }
+
+    fn unknown() -> Self {
+        Self {
+            roots: BorrowRoots::new(),
+            unknown: true,
+        }
+    }
+
+    fn join(&self, other: &Self) -> Self {
+        let mut roots = self.roots.clone();
+        roots.extend(&other.roots);
+        Self {
+            roots,
+            unknown: self.unknown || other.unknown,
+        }
+    }
+}
 
 /// Flow-sensitive provenance for locals that borrow storage owned by other locals. `sources`
 /// stores the flattened owner roots of each live borrower. `invalid` records which source
@@ -19911,11 +21533,16 @@ type EndedRoots = std::collections::BTreeMap<BorrowRoot, BorrowEnd>;
 struct BorrowState {
     sources: std::collections::HashMap<LocalId, BorrowRoots>,
     facts: std::collections::HashMap<LocalId, BorrowFact>,
+    /// Path-sensitive identities of the writable storage reached by collection locals. An owned
+    /// array names itself; a slice copies the fact of the array/slice expression it views.
+    mutable_backing: std::collections::HashMap<LocalId, MutableBackingFact>,
     invalid: std::collections::HashMap<LocalId, EndedRoots>,
     pipeline_sources: std::collections::HashMap<usize, BorrowRoots>,
     invalid_pipeline_sources: std::collections::HashMap<usize, EndedRoots>,
     value_sources: std::collections::HashMap<usize, BorrowRoots>,
     invalid_value_sources: std::collections::HashMap<usize, EndedRoots>,
+    mutable_place_sources: std::collections::HashMap<usize, MutablePlaceSnapshot>,
+    invalid_mutable_place_sources: std::collections::HashMap<usize, BorrowEnd>,
 }
 
 #[derive(Clone)]
@@ -19995,6 +21622,45 @@ impl BorrowState {
     fn finish_value_source(&mut self, snapshot: usize) {
         self.value_sources.remove(&snapshot);
         self.invalid_value_sources.remove(&snapshot);
+        self.mutable_place_sources.remove(&snapshot);
+        self.invalid_mutable_place_sources.remove(&snapshot);
+    }
+
+    fn begin_mutable_place_source(&mut self, snapshot: usize, place: MutablePlaceSnapshot) {
+        self.invalid_mutable_place_sources.remove(&snapshot);
+        self.mutable_place_sources.insert(snapshot, place);
+    }
+
+    fn finish_mutable_place_source(&mut self, snapshot: usize) {
+        self.mutable_place_sources.remove(&snapshot);
+        self.invalid_mutable_place_sources.remove(&snapshot);
+    }
+
+    /// End every active reservation whose place overlaps `root.path`. Empty paths denote the
+    /// complete local. A call action retires its own completed argument reservation first, while
+    /// an enclosing call's earlier reservation remains active and is invalidated here.
+    fn invalidate_mutable_places(
+        &mut self,
+        root: LocalId,
+        path: &[u32],
+        how: BorrowEnd,
+    ) {
+        let invalidated = self
+            .mutable_place_sources
+            .iter()
+            .filter_map(|(&snapshot, place)| {
+                (place.root == root
+                    && (place.path.starts_with(path) || path.starts_with(&place.path)))
+                .then_some(snapshot)
+            })
+            .collect::<Vec<_>>();
+        for snapshot in invalidated {
+            let entry = self
+                .invalid_mutable_place_sources
+                .entry(snapshot)
+                .or_insert(how);
+            *entry = (*entry).min(how);
+        }
     }
 
     /// End every source generation matching `ended`. One entry point for both endings: a named
@@ -20050,6 +21716,12 @@ impl BorrowState {
                 .and_modify(|current| *current = current.join(fact))
                 .or_insert_with(|| fact.clone());
         }
+        for (&local, backing) in &b.mutable_backing {
+            out.mutable_backing
+                .entry(local)
+                .and_modify(|current| *current = current.join(backing))
+                .or_insert_with(|| backing.clone());
+        }
         for (&local, roots) in &b.invalid {
             let into = out.invalid.entry(local).or_default();
             for (&owner, &how) in roots {
@@ -20088,6 +21760,18 @@ impl BorrowState {
                 let entry = into.entry(owner).or_insert(how);
                 *entry = (*entry).min(how);
             }
+        }
+        for (&snapshot, place) in &b.mutable_place_sources {
+            out.mutable_place_sources
+                .entry(snapshot)
+                .or_insert_with(|| place.clone());
+        }
+        for (&snapshot, &how) in &b.invalid_mutable_place_sources {
+            let entry = out
+                .invalid_mutable_place_sources
+                .entry(snapshot)
+                .or_insert(how);
+            *entry = (*entry).min(how);
         }
         out
     }
@@ -20162,7 +21846,58 @@ impl<'a> MoveCheck<'a> {
         })
     }
 
+    /// Identify the narrow set of expressions whose completion facts a later mutable call action
+    /// consumes. Ordinary borrow-capable expressions already snapshot themselves; this registry
+    /// adds non-borrowing storage arguments and exact `borrow mut` place reservations without
+    /// putting every scalar/local expression on the snapshot path.
+    fn prepare_mutable_call_snapshots(&mut self) {
+        let mut arguments = std::collections::HashSet::new();
+        let mut places = std::collections::HashSet::new();
+        for event in hir_depth::body_events(&self.f.body) {
+            let hir_depth::BodyEvent::ExprEnter(expression) = event else {
+                continue;
+            };
+            let (call_arguments, modes) = match &expression.kind {
+                ExprKind::Call { func, args, .. } => (
+                    args.as_slice(),
+                    self.named_param_modes.get(func).cloned(),
+                ),
+                ExprKind::CallFnValue { callee, args } => (
+                    args.as_slice(),
+                    match callee.ty {
+                        Ty::Fn(id) => self.fn_types.get(id as usize).map(|function| {
+                            function
+                                .params
+                                .iter()
+                                .map(|(mode, _)| *mode)
+                                .collect::<Vec<_>>()
+                        }),
+                        _ => None,
+                    },
+                ),
+                _ => continue,
+            };
+            let Some(modes) = modes else {
+                continue;
+            };
+            if !modes.iter().any(|mode| {
+                matches!(mode, ast::ParamMode::BorrowMut | ast::ParamMode::Out)
+            }) {
+                continue;
+            }
+            arguments.extend(call_arguments.iter().map(Self::expr_key));
+            places.extend(call_arguments.iter().enumerate().filter_map(|(index, argument)| {
+                (modes.get(index) == Some(&ast::ParamMode::BorrowMut)
+                    && Self::mutable_actual_root(argument).is_some())
+                .then(|| Self::expr_key(argument))
+            }));
+        }
+        self.mutable_call_argument_snapshots = arguments;
+        self.borrow_mut_place_snapshots = places;
+    }
+
     fn check(mut self) -> MoveCheckResult {
+        self.prepare_mutable_call_snapshots();
         for (position, &local) in self.f.params.iter().enumerate() {
             let mode = self
                 .f
@@ -20170,13 +21905,41 @@ impl<'a> MoveCheck<'a> {
                 .get(position)
                 .copied()
                 .unwrap_or(ast::ParamMode::ByValue);
+            if self
+                .f
+                .locals
+                .get(local as usize)
+                .is_some_and(|local| self.mutable_collection_ty(local.ty))
+            {
+                let backing = self.local_default_mutable_backing(local);
+                self.borrows.mutable_backing.insert(local, backing);
+            }
+            let local_ty = self.f.locals.get(local as usize).map(|local| local.ty);
+            let tracks_dynamic_storage = local_ty.is_some_and(|ty| {
+                ty.is_array_builder()
+                    || matches!(
+                        expand_tagged_ty(ty, self.tagged_types),
+                        Ty::DynArray(..) | Ty::DynStructArray(..)
+                    )
+            });
             if !self.local_may_borrow(local)
-                && !matches!(mode, ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
+                && !tracks_dynamic_storage
+                && !matches!(
+                    mode,
+                    ast::ParamMode::Borrow
+                        | ast::ParamMode::BorrowMut
+                        | ast::ParamMode::Out
+                )
             {
                 continue;
             }
             let mut roots = BorrowRoots::new();
-            roots.insert(BorrowRoot::Param(position as u32));
+            if self.local_may_borrow(local) || !tracks_dynamic_storage {
+                roots.insert(BorrowRoot::Param(position as u32));
+            }
+            if tracks_dynamic_storage {
+                roots.insert(BorrowRoot::ParamStorage(position as u32));
+            }
             let ty = self.f.locals[local as usize].ty;
             let fact =
                 self.normalize_borrow_fact(ty, BorrowFact::from_direct(roots));
@@ -20207,6 +21970,8 @@ impl<'a> MoveCheck<'a> {
 
     /// Join the mutable destinations visible at one returning edge. Projection precision remains
     /// inside `BorrowState`; the interprocedural fact needs only exact source-parameter roots.
+    /// `borrow mut` and `out` share this one summary: their caller transitions differ, not the
+    /// callee-side question of which roots may remain stored in a destination.
     fn collect_borrow_mut_exit_roots(&mut self) {
         for (destination, (&local, mode)) in self
             .f
@@ -20215,7 +21980,7 @@ impl<'a> MoveCheck<'a> {
             .zip(self.f.param_modes.iter().copied())
             .enumerate()
         {
-            if mode != ast::ParamMode::BorrowMut {
+            if !matches!(mode, ast::ParamMode::BorrowMut | ast::ParamMode::Out) {
                 continue;
             }
             let Some(summary) = self.borrow_mut_retention.get_mut(destination) else {
@@ -20272,6 +22037,443 @@ impl<'a> MoveCheck<'a> {
         })
     }
 
+    fn parameter_position(&self, id: LocalId) -> Option<u32> {
+        self.f
+            .params
+            .iter()
+            .position(|&param| param == id)
+            .map(|position| position as u32)
+    }
+
+    fn mutable_collection_ty(&self, ty: Ty) -> bool {
+        matches!(
+            expand_tagged_ty(ty, self.tagged_types),
+            Ty::Array(..)
+                | Ty::StructArray(..)
+                | Ty::DynArray(..)
+                | Ty::DynStructArray(..)
+                | Ty::Slice(..)
+                | Ty::Soa(..)
+                | Ty::SoaParam(..)
+        )
+    }
+
+    fn mutable_collection_contents_may_borrow(&self, ty: Ty) -> bool {
+        let content = match expand_tagged_ty(ty, self.tagged_types) {
+            Ty::Array(element, _) | Ty::DynArray(element) | Ty::Slice(element) => {
+                scalar_to_ty(element)
+            }
+            Ty::StructArray(id, _)
+            | Ty::DynStructArray(id, _)
+            | Ty::Soa(id) => Ty::Struct(id),
+            // Concrete emitted HIR substitutes this symbolic form. Keeping an unresolved template
+            // conservative avoids silently skipping a future borrow-capable instantiation.
+            Ty::SoaParam(_) => return true,
+            _ => return false,
+        };
+        ty_may_borrow(
+            content,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+        )
+    }
+
+    /// Whether a value can contain a collection header whose slots may be observed through an
+    /// alias. This is intentionally broader than a top-level collection test: a struct/sum/tuple
+    /// can retain a slice or SoA header. Plain scalar borrowers such as `str` are not observers of
+    /// every later write to the collection from which one element was read.
+    fn ty_contains_mutable_collection_header(&self, ty: Ty) -> bool {
+        fn visit(
+            ty: Ty,
+            structs: &[StructDef],
+            tuples: &[hir::TupleDef],
+            enums: &[hir::EnumDef],
+            tagged_types: &[hir::TaggedType],
+            active_structs: &mut std::collections::HashSet<u32>,
+            active_tuples: &mut std::collections::HashSet<u32>,
+            active_enums: &mut std::collections::HashSet<u32>,
+            active_tagged: &mut std::collections::HashSet<u32>,
+        ) -> bool {
+            match ty {
+                Ty::Array(..)
+                | Ty::StructArray(..)
+                | Ty::DynArray(..)
+                | Ty::DynStructArray(..)
+                | Ty::Slice(..)
+                | Ty::Soa(..)
+                | Ty::SoaParam(..) => true,
+                Ty::Struct(id) => {
+                    if !active_structs.insert(id) {
+                        return true;
+                    }
+                    let result = structs.get(id as usize).map_or(true, |definition| {
+                        definition.fields.iter().any(|field| {
+                            visit(
+                                field.ty,
+                                structs,
+                                tuples,
+                                enums,
+                                tagged_types,
+                                active_structs,
+                                active_tuples,
+                                active_enums,
+                                active_tagged,
+                            )
+                        })
+                    });
+                    active_structs.remove(&id);
+                    result
+                }
+                Ty::Tuple(id) => {
+                    if !active_tuples.insert(id) {
+                        return true;
+                    }
+                    let result = tuples.get(id as usize).map_or(true, |definition| {
+                        definition.elems.iter().copied().any(|element| {
+                            visit(
+                                scalar_to_ty(element),
+                                structs,
+                                tuples,
+                                enums,
+                                tagged_types,
+                                active_structs,
+                                active_tuples,
+                                active_enums,
+                                active_tagged,
+                            )
+                        })
+                    });
+                    active_tuples.remove(&id);
+                    result
+                }
+                Ty::Enum(id) => {
+                    if !active_enums.insert(id) {
+                        return true;
+                    }
+                    let result = enums.get(id as usize).map_or(true, |definition| {
+                        definition.variants.iter().any(|variant| {
+                            variant.payload.iter().copied().any(|payload| {
+                                visit(
+                                    scalar_to_ty(payload),
+                                    structs,
+                                    tuples,
+                                    enums,
+                                    tagged_types,
+                                    active_structs,
+                                    active_tuples,
+                                    active_enums,
+                                    active_tagged,
+                                )
+                            })
+                        })
+                    });
+                    active_enums.remove(&id);
+                    result
+                }
+                Ty::Option(payload) | Ty::Box(payload) => visit(
+                    scalar_to_ty(payload),
+                    structs,
+                    tuples,
+                    enums,
+                    tagged_types,
+                    active_structs,
+                    active_tuples,
+                    active_enums,
+                    active_tagged,
+                ),
+                Ty::Result(ok, err) => {
+                    visit(
+                        scalar_to_ty(ok),
+                        structs,
+                        tuples,
+                        enums,
+                        tagged_types,
+                        active_structs,
+                        active_tuples,
+                        active_enums,
+                        active_tagged,
+                    ) || visit(
+                        scalar_to_ty(err),
+                        structs,
+                        tuples,
+                        enums,
+                        tagged_types,
+                        active_structs,
+                        active_tuples,
+                        active_enums,
+                        active_tagged,
+                    )
+                }
+                Ty::Tagged(id) => {
+                    if !active_tagged.insert(id) {
+                        return true;
+                    }
+                    let result = tagged_types.get(id as usize).map_or(true, |definition| {
+                        match definition {
+                            hir::TaggedType::Option(payload) => visit(
+                                scalar_to_ty(*payload),
+                                structs,
+                                tuples,
+                                enums,
+                                tagged_types,
+                                active_structs,
+                                active_tuples,
+                                active_enums,
+                                active_tagged,
+                            ),
+                            hir::TaggedType::Result(ok, err) => {
+                                visit(
+                                    scalar_to_ty(*ok),
+                                    structs,
+                                    tuples,
+                                    enums,
+                                    tagged_types,
+                                    active_structs,
+                                    active_tuples,
+                                    active_enums,
+                                    active_tagged,
+                                ) || visit(
+                                    scalar_to_ty(*err),
+                                    structs,
+                                    tuples,
+                                    enums,
+                                    tagged_types,
+                                    active_structs,
+                                    active_tuples,
+                                    active_enums,
+                                    active_tagged,
+                                )
+                            }
+                        }
+                    });
+                    active_tagged.remove(&id);
+                    result
+                }
+                _ => false,
+            }
+        }
+
+        visit(
+            ty,
+            self.structs,
+            self.tuples,
+            self.enums,
+            self.tagged_types,
+            &mut std::collections::HashSet::new(),
+            &mut std::collections::HashSet::new(),
+            &mut std::collections::HashSet::new(),
+            &mut std::collections::HashSet::new(),
+        )
+    }
+
+    fn mutable_view_ty(&self, ty: Ty) -> bool {
+        matches!(
+            expand_tagged_ty(ty, self.tagged_types),
+            Ty::Slice(..)
+        )
+    }
+
+    fn caller_backed_view_ty(&self, ty: Ty) -> bool {
+        matches!(
+            expand_tagged_ty(ty, self.tagged_types),
+            Ty::Slice(..) | Ty::Soa(..) | Ty::SoaParam(..)
+        )
+    }
+
+    fn local_default_mutable_backing(&self, local: LocalId) -> MutableBackingFact {
+        let Some(local_ty) = self.f.locals.get(local as usize).map(|local| local.ty)
+        else {
+            return MutableBackingFact::unknown();
+        };
+        if !self.mutable_collection_ty(local_ty) {
+            return MutableBackingFact::unknown();
+        }
+        if let Some(position) = self.parameter_position(local) {
+            let mode = self
+                .f
+                .param_modes
+                .get(position as usize)
+                .copied()
+                .unwrap_or(ast::ParamMode::ByValue);
+            if self.caller_backed_view_ty(local_ty)
+                || matches!(
+                    mode,
+                    ast::ParamMode::Borrow
+                        | ast::ParamMode::BorrowMut
+                        | ast::ParamMode::Out
+                )
+            {
+                return MutableBackingFact::known(
+                    [BorrowRoot::ParamStorage(position)]
+                        .into_iter()
+                        .collect(),
+                );
+            }
+        }
+        if self.mutable_view_ty(local_ty) {
+            MutableBackingFact::unknown()
+        } else {
+            MutableBackingFact::known(
+                [BorrowRoot::Local(local)].into_iter().collect(),
+            )
+        }
+    }
+
+    /// A destructured owned collection transfers/copies its slots into the new binding. Slice and
+    /// SoA payloads remain views whose projection identity is not represented here, but fixed and
+    /// dynamic arrays have a definite new intra-function content-fact target.
+    fn destructured_mutable_backing(&self, local: LocalId) -> MutableBackingFact {
+        let Some(ty) = self.f.locals.get(local as usize).map(|record| record.ty) else {
+            return MutableBackingFact::unknown();
+        };
+        if matches!(
+            expand_tagged_ty(ty, self.tagged_types),
+            Ty::Array(..)
+                | Ty::StructArray(..)
+                | Ty::DynArray(..)
+                | Ty::DynStructArray(..)
+        ) {
+            MutableBackingFact::known(
+                [BorrowRoot::Local(local)].into_iter().collect(),
+            )
+        } else {
+            MutableBackingFact::unknown()
+        }
+    }
+
+    fn local_mutable_backing(&self, local: LocalId) -> MutableBackingFact {
+        self.borrows
+            .mutable_backing
+            .get(&local)
+            .cloned()
+            .unwrap_or_else(|| self.local_default_mutable_backing(local))
+    }
+
+    fn block_mutable_backing(&self, block: &Block) -> MutableBackingFact {
+        if block
+            .stmts
+            .iter()
+            .all(|statement| self.walked_stmt_falls_through(statement))
+        {
+            block.value.as_deref().map_or_else(
+                MutableBackingFact::unknown,
+                |value| self.mutable_backing(value),
+            )
+        } else {
+            MutableBackingFact::unknown()
+        }
+    }
+
+    /// Resolve the storage identities reached by a mutable collection expression. Unlike
+    /// `storage_roots`, this never includes owners of views merely contained in the collection.
+    fn mutable_backing(&self, expression: &Expr) -> MutableBackingFact {
+        if let Some(backing) = self
+            .walked_backing_facts
+            .get(&Self::expr_key(expression))
+        {
+            return backing.clone();
+        }
+        if let Some(inner) = borrow_transparent_value(expression) {
+            return self.mutable_backing(inner);
+        }
+        match &expression.kind {
+            ExprKind::Local(local) => self.local_mutable_backing(*local),
+            ExprKind::ArrayToSlice(inner)
+            | ExprKind::SliceRange { recv: inner, .. } => {
+                self.mutable_backing(inner)
+            }
+            ExprKind::Arena(block)
+            | ExprKind::NamedArena { block, .. }
+            | ExprKind::TaskGroup(block) => self.block_mutable_backing(block),
+            ExprKind::If { then, els, .. } => self
+                .block_mutable_backing(then)
+                .join(&self.block_mutable_backing(els)),
+            ExprKind::Match { arms, .. } => arms
+                .iter()
+                .filter(|arm| !self.non_fallthrough.contains(&arm.body.span))
+                .map(|arm| self.mutable_backing(&arm.body))
+                .reduce(|left, right| left.join(&right))
+                .unwrap_or_else(MutableBackingFact::unknown),
+            // The success carrier of an Option/Result and a loop break need projection-aware
+            // backing facts. Until that representation exists they remain explicitly unknown;
+            // EscapeCheck rejects a non-static retained value through the unresolved view.
+            ExprKind::ElseUnwrap { .. } | ExprKind::Try(_) | ExprKind::Loop { .. } => {
+                MutableBackingFact::unknown()
+            }
+            _ => MutableBackingFact::unknown(),
+        }
+    }
+
+    fn forwards_mutable_backing(expression: &Expr) -> bool {
+        if let Some(inner) = borrow_transparent_value(expression) {
+            return Self::forwards_mutable_backing(inner);
+        }
+        match &expression.kind {
+            ExprKind::Local(_)
+            | ExprKind::ArrayToSlice(_)
+            | ExprKind::SliceRange { .. } => true,
+            ExprKind::Arena(block)
+            | ExprKind::NamedArena { block, .. }
+            | ExprKind::TaskGroup(block)
+            | ExprKind::Block(block)
+            | ExprKind::Unsafe(block) => block
+                .value
+                .as_deref()
+                .is_some_and(Self::forwards_mutable_backing),
+            ExprKind::If { then, els, .. } => then
+                .value
+                .as_deref()
+                .is_some_and(Self::forwards_mutable_backing)
+                && els
+                    .value
+                    .as_deref()
+                    .is_some_and(Self::forwards_mutable_backing),
+            ExprKind::Match { arms, .. } => !arms.is_empty()
+                && arms
+                    .iter()
+                    .all(|arm| Self::forwards_mutable_backing(&arm.body)),
+            _ => false,
+        }
+    }
+
+    fn assign_mutable_backing(&mut self, local: LocalId, value: &Expr) {
+        let Some(local_ty) = self.f.locals.get(local as usize).map(|local| local.ty)
+        else {
+            return;
+        };
+        if !self.mutable_collection_ty(local_ty) {
+            self.borrows.mutable_backing.remove(&local);
+            return;
+        }
+        let expanded = expand_tagged_ty(local_ty, self.tagged_types);
+        let backing = if self.mutable_view_ty(local_ty) {
+            self.mutable_backing(value)
+        } else if matches!(expanded, Ty::Soa(..) | Ty::SoaParam(..)) {
+            if Self::forwards_mutable_backing(value) {
+                self.mutable_backing(value)
+            } else if materializes_fresh_soa_storage(value) {
+                MutableBackingFact::known(
+                    [BorrowRoot::Local(local)].into_iter().collect(),
+                )
+            } else {
+                // A call or mixed control result may forward an existing header. Unknown must
+                // overwrite any stale known identity instead of being mislabeled as fresh.
+                self.mutable_backing(value)
+            }
+        } else {
+            // Fixed and dynamic arrays own the visible slot storage after a bind/move/copy. The
+            // escape pass separately tracks whether that allocation is frame-, arena-, or
+            // caller-owned; MoveCheck needs only the collection identity whose content fact
+            // changes after an indexed write.
+            MutableBackingFact::known(
+                [BorrowRoot::Local(local)].into_iter().collect(),
+            )
+        };
+        self.borrows.mutable_backing.insert(local, backing);
+    }
+
     fn borrowed_param_position(&self, id: LocalId) -> Option<u32> {
         self.f
             .params
@@ -20291,6 +22493,279 @@ impl<'a> MoveCheck<'a> {
             .and_then(|position| self.f.param_modes.get(position as usize).copied())
     }
 
+    fn borrow_mut_replacement_backing(
+        &self,
+        destination: &Expr,
+        sources: &[BorrowMutRetentionSource],
+        args: &[Expr],
+        completed: &[MutableBackingFact],
+    ) -> MutableBackingFact {
+        if matches!(
+            expand_tagged_ty(destination.ty, self.tagged_types),
+            Ty::Array(..)
+                | Ty::StructArray(..)
+                | Ty::DynArray(..)
+                | Ty::DynStructArray(..)
+        ) {
+            return match destination.kind {
+                ExprKind::Local(local) => MutableBackingFact::known(
+                    [BorrowRoot::Local(local)].into_iter().collect(),
+                ),
+                _ => self.mutable_backing(destination),
+            };
+        }
+
+        let selected = sources
+            .iter()
+            .filter_map(|source| {
+                let index = source.index();
+                args.get(index)
+                    .is_some_and(|argument| {
+                        mutable_replacement_backing_compatible(
+                            destination.ty,
+                            argument.ty,
+                            self.tagged_types,
+                        )
+                    })
+                    .then_some(index)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        selected
+            .into_iter()
+            .filter_map(|index| completed.get(index))
+            .cloned()
+            .reduce(|left, right| left.join(&right))
+            .unwrap_or_else(MutableBackingFact::unknown)
+    }
+
+    fn borrow_mut_replacement_storage_fact(
+        &self,
+        destination: &Expr,
+        sources: &[BorrowMutRetentionSource],
+        args: &[Expr],
+        completed: &[MoveExpressionCompletion],
+        replacement: Option<&MutableBackingFact>,
+    ) -> BorrowFact {
+        if matches!(
+            expand_tagged_ty(destination.ty, self.tagged_types),
+            Ty::Array(..) | Ty::StructArray(..)
+        ) {
+            return completed
+                .get(
+                    args.iter()
+                        .position(|argument| std::ptr::eq(argument, destination))
+                        .unwrap_or(args.len()),
+                )
+                .map(|completion| completion.storage.clone())
+                .unwrap_or_default();
+        }
+
+        let mut storage = BorrowFact::default();
+        let mut selected = false;
+        for source in sources {
+            let index = source.index();
+            let Some(argument) = args.get(index) else {
+                continue;
+            };
+            if argument.ty != Ty::ArenaHandle
+                && !mutable_replacement_backing_compatible(
+                    destination.ty,
+                    argument.ty,
+                    self.tagged_types,
+                )
+            {
+                continue;
+            }
+            let Some(completion) = completed.get(index) else {
+                continue;
+            };
+            storage = storage.join(&completion.storage);
+            storage
+                .direct
+                .extend(completion.backing.roots.iter().filter_map(|root| root.live()));
+            selected = true;
+        }
+        if !selected {
+            // An exact empty source set represents a fresh replacement. Its new caller-visible
+            // generation is still named by the replacement backing when one exists.
+            storage = BorrowFact::default();
+        }
+        if let Some(replacement) = replacement {
+            storage
+                .direct
+                .extend(replacement.roots.iter().filter_map(|root| root.live()));
+        }
+        storage
+    }
+
+    fn call_result_backing_from_indices(
+        &self,
+        result: Ty,
+        args: &[Expr],
+        completed: &[MoveExpressionCompletion],
+        indices: impl IntoIterator<Item = usize>,
+    ) -> MutableBackingFact {
+        if materializes_indexed_result_storage(result, self.tagged_types) {
+            return MutableBackingFact::unknown();
+        }
+        let mut roots = BorrowRoots::new();
+        for index in indices {
+            let Some((argument, completion)) = args.get(index).zip(completed.get(index)) else {
+                continue;
+            };
+            if matches!(
+                expand_tagged_ty(result, self.tagged_types),
+                Ty::Slice(..) | Ty::Soa(..) | Ty::SoaParam(..)
+            ) && indexed_backing_compatible(result, argument.ty, self.tagged_types)
+            {
+                roots.extend(&completion.backing.roots);
+            }
+        }
+        MutableBackingFact {
+            roots,
+            // A return summary proves dependency, not exact writable-header identity.
+            unknown: true,
+        }
+    }
+
+    fn call_result_storage_compatible(&self, result: Ty, source: Ty) -> bool {
+        let result = expand_tagged_ty(result, self.tagged_types);
+        let source = expand_tagged_ty(source, self.tagged_types);
+        if materializes_indexed_result_storage(result, self.tagged_types) {
+            // A return summary can select one argument for element provenance without making an
+            // owned or inline result reuse that argument's allocation.
+            return false;
+        }
+        result == source
+            || (matches!(result, Ty::Slice(..) | Ty::Soa(..) | Ty::SoaParam(..))
+                && indexed_backing_compatible(result, source, self.tagged_types))
+    }
+
+    fn conservative_call_value(completed: &[MoveExpressionCompletion]) -> BorrowFact {
+        completed.iter().fold(BorrowFact::default(), |fact, completion| {
+            fact.join(&completion.value)
+        })
+    }
+
+    fn mutable_call_result_completion(
+        &self,
+        action: &Expr,
+        args: &[Expr],
+        modes: &[ast::ParamMode],
+        completed: &[MoveExpressionCompletion],
+    ) -> MoveExpressionCompletion {
+        let select_fact = |index: usize| {
+            completed.get(index).map(|completion| {
+                if matches!(
+                    modes.get(index),
+                    Some(
+                        ast::ParamMode::Borrow
+                            | ast::ParamMode::BorrowMut
+                            | ast::ParamMode::Out
+                    )
+                ) {
+                    completion.storage.clone()
+                } else {
+                    completion.value.clone()
+                }
+            })
+        };
+
+        let (value, selected) = match &action.kind {
+            ExprKind::Call { func, .. } => match self.named_return_borrow.get(func) {
+                Some(hir::ReturnBorrowSummary::None) => {
+                    (BorrowFact::default(), std::collections::BTreeSet::new())
+                }
+                Some(hir::ReturnBorrowSummary::Roots { params, captures })
+                    if captures.is_empty()
+                        && params.iter().all(|index| (*index as usize) < args.len()) =>
+                {
+                    let value = params.iter().fold(BorrowFact::default(), |fact, &index| {
+                        select_fact(index as usize)
+                            .map_or(fact.clone(), |selected| fact.join(&selected))
+                    });
+                    (
+                        value,
+                        params
+                            .iter()
+                            .map(|index| *index as usize)
+                            .collect::<std::collections::BTreeSet<_>>(),
+                    )
+                }
+                Some(hir::ReturnBorrowSummary::Roots { .. }) | None => (
+                    Self::conservative_call_value(completed),
+                    (0..args.len()).collect(),
+                ),
+            },
+            ExprKind::CallFnValue { callee, .. } => {
+                let arguments = args
+                    .iter()
+                    .enumerate()
+                    .map(|(index, argument)| {
+                        (
+                            argument.ty,
+                            select_fact(index).unwrap_or_else(|| {
+                                Self::conservative_call_value(completed)
+                            }),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let value = self.callable_return_fact_from_facts(callee, &arguments);
+                let mut selected = std::collections::BTreeSet::new();
+                let targets = match callee.ty {
+                    Ty::Fn(id) => self.callable_targets.get(id as usize),
+                    _ => None,
+                };
+                let well_formed = targets.is_some_and(|targets| {
+                    !targets.is_empty()
+                        && targets.values().all(|summary| match summary {
+                            hir::ReturnBorrowSummary::None => true,
+                            hir::ReturnBorrowSummary::Roots { params, .. } => params
+                                .iter()
+                                .all(|index| (*index as usize) < args.len()),
+                        })
+                });
+                if well_formed {
+                    for summary in targets.into_iter().flat_map(|targets| targets.values()) {
+                        if let hir::ReturnBorrowSummary::Roots { params, .. } = summary {
+                            selected.extend(params.iter().map(|index| *index as usize));
+                        }
+                    }
+                } else {
+                    selected.extend(0..args.len());
+                }
+                (value, selected)
+            }
+            _ => (
+                Self::conservative_call_value(completed),
+                (0..args.len()).collect(),
+            ),
+        };
+        let backing = self.call_result_backing_from_indices(
+            action.ty,
+            args,
+            completed,
+            selected.iter().copied(),
+        );
+        let mut storage = selected
+            .iter()
+            .filter_map(|index| args.get(*index).zip(completed.get(*index)))
+            .filter(|(argument, _)| {
+                self.call_result_storage_compatible(action.ty, argument.ty)
+            })
+            .fold(BorrowFact::default(), |fact, (_, completion)| {
+                fact.join(&completion.storage)
+            });
+        if let Some(root) = self.temp_owner_root(action) {
+            storage.direct.insert(root);
+        }
+        MoveExpressionCompletion {
+            value,
+            storage,
+            backing,
+        }
+    }
+
     fn refresh_borrow_mut_place(&mut self, argument: &Expr) {
         let root = match argument.kind {
             ExprKind::Local(local) => Some(local),
@@ -20302,8 +22777,9 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
-    fn apply_direct_borrow_mut_call_effects(
+    fn apply_direct_mutable_call_effects(
         &mut self,
+        action: &Expr,
         function: &str,
         args: &[Expr],
         moved: &MovedSet,
@@ -20312,79 +22788,325 @@ impl<'a> MoveCheck<'a> {
             return;
         };
         let summary = self.named_borrow_mut_retention.get(function).cloned();
-        self.apply_borrow_mut_call_effects(args, &modes, summary.as_ref(), moved);
+        self.apply_mutable_call_effects(action, args, &modes, summary.as_ref(), moved);
     }
 
     /// Apply one returning call as an atomic mutable-place transition. Argument evaluation has
-    /// completed, but no destination generation has changed yet. Snapshot every contained fact and
-    /// invalidation root first so multiple mutable destinations (including swaps) all observe the
-    /// same pre-call values.
-    fn apply_borrow_mut_call_effects(
+    /// completed, but no destination generation or element fact has changed yet. Snapshot every
+    /// whole-value/element fact, backing identity, and invalidation root first so multiple mutable
+    /// destinations (including swaps) all observe the same pre-call values. `borrow mut` advances a
+    /// generation; `out` only joins borrow-capable element contents into existing backing storage.
+    fn apply_mutable_call_effects(
         &mut self,
+        action: &Expr,
         args: &[Expr],
         modes: &[ast::ParamMode],
         summary: Option<&BorrowMutRetentionSummary>,
         moved: &MovedSet,
     ) {
-        let contained_argument_facts = args
+        let action_key = Self::expr_key(action);
+        if !modes.iter().any(|mode| {
+            matches!(mode, ast::ParamMode::BorrowMut | ast::ParamMode::Out)
+        }) {
+            return;
+        }
+        for (index, argument) in args.iter().enumerate() {
+            let snapshot = Self::expr_key(argument);
+            if self.mutable_call_argument_snapshots.contains(&snapshot)
+                && (!self.walked_value_facts.contains_key(&snapshot)
+                    || !self.walked_storage_facts.contains_key(&snapshot)
+                    || !self.walked_backing_facts.contains_key(&snapshot))
+            {
+                self.diags.error(
+                    "mutable call argument did not produce a completion snapshot".to_string(),
+                    argument.span,
+                );
+            }
+            self.validate_value_snapshot(action_key, snapshot, action.span);
+            if modes.get(index) == Some(&ast::ParamMode::BorrowMut) {
+                self.validate_mutable_place_snapshot(action_key, snapshot, action.span);
+            }
+        }
+        let value_argument_facts = args
             .iter()
-            .map(|argument| {
-                let fallback = self.borrow_fact(argument);
-                self.stored_argument_fact(argument, &fallback)
+            .map(|argument| self.completed_value_fact(argument))
+            .collect::<Vec<_>>();
+        let whole_argument_facts = args
+            .iter()
+            .zip(&value_argument_facts)
+            .map(|(argument, completed)| {
+                let backing = self.completed_backing_fact(argument);
+                self.retained_argument_fact(argument, completed.clone(), &backing)
+            })
+            .collect::<Vec<_>>();
+        let element_argument_facts = args
+            .iter()
+            .zip(&whole_argument_facts)
+            .map(|(argument, whole)| {
+                let backing = self.completed_backing_fact(argument);
+                self.element_argument_fact(whole.clone(), &backing)
             })
             .collect::<Vec<_>>();
         let storage_argument_facts = args
             .iter()
-            .map(|argument| BorrowFact::from_direct(self.storage_roots(argument)))
+            .map(|argument| self.completed_storage_fact(argument))
             .collect::<Vec<_>>();
+        let backing_argument_facts = args
+            .iter()
+            .map(|argument| self.completed_backing_fact(argument))
+            .collect::<Vec<_>>();
+        let pre_argument_completions = value_argument_facts
+            .iter()
+            .cloned()
+            .zip(storage_argument_facts.iter().cloned())
+            .zip(backing_argument_facts.iter().cloned())
+            .map(|((value, storage), backing)| MoveExpressionCompletion {
+                value,
+                storage,
+                backing,
+            })
+            .collect::<Vec<_>>();
+        let mut post_argument_completions = pre_argument_completions.clone();
         let destinations = modes
             .iter()
             .copied()
             .enumerate()
             .filter_map(|(index, mode)| {
-                if mode != ast::ParamMode::BorrowMut {
+                if !matches!(mode, ast::ParamMode::BorrowMut | ast::ParamMode::Out) {
                     return None;
                 }
                 let argument = args.get(index)?;
+                let old_backing = backing_argument_facts
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(MutableBackingFact::unknown);
+                let storage = storage_argument_facts
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_default();
+                let sources = borrow_mut_source_indices(summary, index, args.len());
+                let replacement_backing = (mode == ast::ParamMode::BorrowMut
+                    && self.mutable_collection_ty(argument.ty))
+                    .then(|| {
+                        self.borrow_mut_replacement_backing(
+                            argument,
+                            &sources,
+                            args,
+                            &backing_argument_facts,
+                        )
+                    });
+                let possible_backing = replacement_backing.as_ref().map_or_else(
+                    || old_backing.clone(),
+                    |replacement| old_backing.join(replacement),
+                );
+                let retains_contents =
+                    self.mutable_collection_contents_may_borrow(argument.ty);
+                let mut observers =
+                    self.mutable_observer_locals(&possible_backing, &storage);
+                if retains_contents
+                    && self.mutable_actual_observes_completion(
+                        argument,
+                        &possible_backing,
+                        &storage,
+                    )
+                    && let Some(actual) = Self::mutable_actual_root(argument)
+                {
+                    observers.insert(actual);
+                }
                 Some((
                     index,
-                    self.borrow_mut_invalidation_roots(argument),
-                    borrow_mut_source_indices(summary, index, args.len()),
+                    mode,
+                    self.completed_borrow_mut_invalidation_roots(argument, &storage),
+                    possible_backing,
+                    replacement_backing,
+                    observers,
+                    retains_contents,
+                    sources,
                 ))
             })
             .collect::<Vec<_>>();
 
-        for (index, roots, _) in &destinations {
-            if let Some(argument) = args.get(*index) {
+        for (index, mode, roots, _, _, _, _, _) in &destinations {
+            if *mode == ast::ParamMode::BorrowMut
+                && let Some(argument) = args.get(*index)
+            {
                 self.reject_live_resource_dependents_of_roots(roots, moved, argument.span);
             }
         }
-        for (_, roots, _) in &destinations {
-            self.borrows.invalidate_roots(roots, BorrowEnd::Consumed);
+        for (index, mode, _, _, _, _, _, _) in &destinations {
+            if *mode == ast::ParamMode::BorrowMut
+                && let Some(argument) = args.get(*index)
+            {
+                self.borrows
+                    .finish_mutable_place_source(Self::expr_key(argument));
+            }
         }
-        for (index, _, sources) in destinations {
-            if let Some(argument) = args.get(index) {
-                self.refresh_borrow_mut_call(
-                    argument,
-                    &contained_argument_facts,
-                    &storage_argument_facts,
-                    &sources,
+        let mutated_backing_places = destinations
+            .iter()
+            .flat_map(|(_, _, _, backing, _, observers, _, _)| {
+                self.resolved_mutable_destinations(backing, observers)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        for local in mutated_backing_places {
+            self.invalidate_mutable_place(local, &[]);
+        }
+        for (index, _, _, _, _, _, _, _) in &destinations {
+            if let Some(argument) = args.get(*index)
+                && let Some(place) = Self::mutable_actual_place(argument)
+            {
+                self.borrows.invalidate_mutable_places(
+                    place.root,
+                    &place.path,
+                    BorrowEnd::Consumed,
                 );
             }
         }
+        for (_, mode, roots, _, _, _, _, _) in &destinations {
+            if *mode == ast::ParamMode::BorrowMut {
+                self.borrows.invalidate_roots(roots, BorrowEnd::Consumed);
+            }
+        }
+        let mut backing_updates = std::collections::HashMap::new();
+        for (index, mode, _, _, replacement, _, _, _) in &destinations {
+            if *mode == ast::ParamMode::BorrowMut
+                && let Some(replacement) = replacement
+                && let Some(Expr {
+                    kind: ExprKind::Local(local),
+                    ..
+                }) = args.get(*index)
+            {
+                backing_updates
+                    .entry(*local)
+                    .and_modify(|current: &mut MutableBackingFact| {
+                        *current = current.join(replacement)
+                    })
+                    .or_insert_with(|| replacement.clone());
+            }
+        }
+        self.borrows.mutable_backing.extend(backing_updates);
+
+        for (index, mode, _, backing, replacement, observers, retains_contents, sources) in destinations {
+            if let Some(argument) = args.get(index) {
+                let incoming = self.mutable_retention_fact(
+                    &whole_argument_facts,
+                    &element_argument_facts,
+                    &storage_argument_facts,
+                    index,
+                    mode,
+                    &sources,
+                );
+                match mode {
+                    ast::ParamMode::BorrowMut => {
+                        // Preserve the historical strong header/place replacement, then publish
+                        // the summary's possible indexed contents to every other backing observer.
+                        self.refresh_borrow_mut_call(argument, incoming.clone());
+                        if retains_contents {
+                            self.join_borrow_mut_backing_contents(
+                                argument,
+                                &backing,
+                                &observers,
+                                &incoming,
+                            );
+                        }
+                        if let Some(post) = post_argument_completions.get_mut(index) {
+                            let replacement_storage = self.borrow_mut_replacement_storage_fact(
+                                argument,
+                                &sources,
+                                args,
+                                &pre_argument_completions,
+                                replacement.as_ref(),
+                            );
+                            post.value = self.normalize_borrow_fact(argument.ty, incoming.clone());
+                            post.storage = replacement_storage.join(&post.value);
+                            post.backing = replacement
+                                .clone()
+                                .unwrap_or_else(MutableBackingFact::unknown);
+                        }
+                    }
+                    ast::ParamMode::Out => {
+                        if retains_contents {
+                            self.join_out_call_contents(
+                                argument,
+                                &backing,
+                                &observers,
+                                incoming.clone(),
+                            );
+                        }
+                        if let Some(post) = post_argument_completions.get_mut(index) {
+                            post.value = post.value.join(&incoming);
+                            post.storage = post.storage.join(&incoming);
+                        }
+                    }
+                    ast::ParamMode::ByValue | ast::ParamMode::Borrow => {}
+                }
+            }
+        }
+        if self.completion_snapshot_needed(action) {
+            let completion = self.mutable_call_result_completion(
+                action,
+                args,
+                modes,
+                &post_argument_completions,
+            );
+            self.pending_call_completions.insert(action_key, completion);
+        }
     }
 
-    /// Refresh one caller place with the roots a returning mutable callee may have installed.
-    /// `argument_facts` are captured before any destination generation is invalidated, so a
-    /// summary that retains its destination preserves the old embedded fields without retaining
-    /// the destination place's own generation as though it were backing storage.
-    fn refresh_borrow_mut_call(
-        &mut self,
-        argument: &Expr,
-        contained_argument_facts: &[BorrowFact],
+    /// Select the roots one returning mutable callee may have installed. An `out` destination's
+    /// self-source denotes old elements; every other contained source denotes a copied whole value,
+    /// including its backing. Facts are captured before any destination generation is invalidated.
+    fn mutable_retention_fact(
+        &self,
+        whole_argument_facts: &[BorrowFact],
+        element_argument_facts: &[BorrowFact],
         storage_argument_facts: &[BorrowFact],
+        destination: usize,
+        mode: ast::ParamMode,
         sources: &[BorrowMutRetentionSource],
-    ) {
+    ) -> BorrowFact {
+        let mut incoming = BorrowFact::default();
+        let mut join_source = |source: BorrowMutRetentionSource| {
+            let source_fact = match source {
+                BorrowMutRetentionSource::Contained(index)
+                    if mode == ast::ParamMode::Out && index == destination =>
+                {
+                    element_argument_facts.get(index)
+                }
+                BorrowMutRetentionSource::Contained(index) => whole_argument_facts.get(index),
+                BorrowMutRetentionSource::Storage(index) => storage_argument_facts.get(index),
+            };
+            let Some(source_fact) = source_fact else {
+                // A malformed exact fact must not become an empty, fail-open update.
+                incoming = BorrowFact::default();
+                for index in 0..whole_argument_facts.len() {
+                    let contained = if mode == ast::ParamMode::Out && index == destination {
+                        element_argument_facts.get(index)
+                    } else {
+                        whole_argument_facts.get(index)
+                    };
+                    if let Some(contained) = contained {
+                        incoming = incoming.join(contained);
+                    }
+                    if let Some(storage) = storage_argument_facts.get(index) {
+                        incoming = incoming.join(storage);
+                    }
+                }
+                return false;
+            };
+            incoming = incoming.join(source_fact);
+            true
+        };
+        for &source in sources {
+            if !join_source(source) {
+                break;
+            }
+        }
+        incoming
+    }
+
+    /// Refresh one caller place after an exclusive `borrow mut` call. This is replacement, not an
+    /// element join: the call advanced the old generation and may have replaced the whole value.
+    fn refresh_borrow_mut_call(&mut self, argument: &Expr, incoming: BorrowFact) {
         self.refresh_borrow_mut_place(argument);
         if !ty_may_borrow(
             argument.ty,
@@ -20406,33 +23128,6 @@ impl<'a> MoveCheck<'a> {
             ),
             _ => return,
         };
-        let mut incoming = BorrowFact::default();
-        let mut join_source = |source: BorrowMutRetentionSource| {
-            let source_fact = match source {
-                BorrowMutRetentionSource::Contained(index) => {
-                    contained_argument_facts.get(index)
-                }
-                BorrowMutRetentionSource::Storage(index) => storage_argument_facts.get(index),
-            };
-            let Some(source_fact) = source_fact else {
-                // A malformed exact fact must not become an empty, fail-open update.
-                incoming = BorrowFact::default();
-                for (contained, storage) in contained_argument_facts
-                    .iter()
-                    .zip(storage_argument_facts)
-                {
-                    incoming = incoming.join(contained).join(storage);
-                }
-                return false;
-            };
-            incoming = incoming.join(source_fact);
-            true
-        };
-        for &source in sources {
-            if !join_source(source) {
-                break;
-            }
-        }
         if path.is_empty() {
             let ty = self.f.locals.get(local as usize).map(|local| local.ty);
             let Some(ty) = ty else {
@@ -20449,41 +23144,243 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
-    /// Provenance of the value contained in an argument place, excluding the place's own storage
-    /// generation. Retaining a `str` field copies its pointer/length and depends on the field's
-    /// backing owner, not on the aggregate header local from which those two scalars were read.
-    fn stored_argument_fact(&self, argument: &Expr, fallback: &BorrowFact) -> BorrowFact {
-        match &argument.kind {
-            ExprKind::Local(local) => self
-                .borrows
-                .facts
-                .get(local)
-                .cloned()
-                .unwrap_or_default(),
-            ExprKind::Field { root, path } => {
-                let Some(root_ty) = self.f.locals.get(*root as usize).map(|local| local.ty) else {
-                    return fallback.clone();
-                };
-                let root_fact = self
-                    .borrows
-                    .facts
-                    .get(root)
-                    .cloned()
-                    .unwrap_or_default();
-                let projections = path
-                    .iter()
-                    .copied()
-                    .map(BorrowProjection::StructField)
-                    .collect::<Vec<_>>();
-                self.project_fact_or_flatten(
-                    root_ty,
-                    root_fact,
-                    &projections,
-                    argument.ty,
-                )
-            }
-            _ => fallback.clone(),
+    fn join_local_mutable_contents(&mut self, local: LocalId, incoming: &BorrowFact) {
+        if !self.local_may_borrow(local) {
+            return;
         }
+        let Some(ty) = self.f.locals.get(local as usize).map(|local| local.ty)
+        else {
+            return;
+        };
+        let current = self
+            .borrows
+            .facts
+            .get(&local)
+            .cloned()
+            .unwrap_or_default();
+        let incoming = self.normalize_borrow_fact(ty, incoming.clone());
+        self.borrows.update_fact(local, current.join(&incoming));
+    }
+
+    fn backing_root_local(&self, root: BorrowRoot) -> Option<LocalId> {
+        match root {
+            BorrowRoot::Local(local) => Some(local),
+            BorrowRoot::ParamStorage(position) => {
+                self.f.params.get(position as usize).copied()
+            }
+            BorrowRoot::IterTemp(_)
+            | BorrowRoot::Param(_)
+            | BorrowRoot::EndedLocal(..)
+            | BorrowRoot::EndedIterTemp(..)
+            | BorrowRoot::EndedParam(..)
+            | BorrowRoot::EndedParamStorage(..) => None,
+        }
+    }
+
+    fn roots_intersect(left: &BorrowRoots, right: &BorrowRoots) -> bool {
+        left.iter().any(|root| right.contains(root))
+    }
+
+    fn mutable_backing_evidence(
+        backing: &MutableBackingFact,
+        storage: &BorrowFact,
+    ) -> BorrowRoots {
+        if backing.roots.is_empty() {
+            // A rootless unresolved view has no projection-aware backing identity. Its captured
+            // storage roots are the only conservative reverse-alias evidence available.
+            storage.live_roots()
+        } else {
+            // Do not mix contained owners from `storage` into an already-resolved backing set:
+            // two independent arrays may legitimately hold views of the same string owner.
+            backing.roots.clone()
+        }
+    }
+
+    /// Snapshot every already-created mutable collection that can observe a destination's slots.
+    /// Exact backing roots cover ordinary aliases; flattened storage-borrow roots retain the
+    /// conservative reverse edge for a view returned through an unresolved helper.
+    fn mutable_observer_locals(
+        &self,
+        backing: &MutableBackingFact,
+        storage: &BorrowFact,
+    ) -> std::collections::BTreeSet<LocalId> {
+        let evidence = Self::mutable_backing_evidence(backing, storage);
+        if evidence.is_empty() {
+            return std::collections::BTreeSet::new();
+        }
+
+        let mut candidates = self
+            .borrows
+            .mutable_backing
+            .keys()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        candidates.extend(self.borrows.sources.keys().copied());
+        candidates.retain(|local| {
+            self.f
+                .locals
+                .get(*local as usize)
+                .is_some_and(|local| {
+                    self.ty_contains_mutable_collection_header(local.ty)
+                })
+                && (self.borrows
+                    .mutable_backing
+                    .get(local)
+                    .is_some_and(|candidate| {
+                        Self::roots_intersect(&candidate.roots, &evidence)
+                    })
+                    || self
+                        .borrows
+                        .sources
+                        .get(local)
+                        .is_some_and(|roots| Self::roots_intersect(roots, &evidence)))
+        });
+        candidates
+    }
+
+    fn mutable_actual_root(argument: &Expr) -> Option<LocalId> {
+        match argument.kind {
+            ExprKind::Local(local) => Some(local),
+            ExprKind::Field { root, .. } => Some(root),
+            _ => None,
+        }
+    }
+
+    fn mutable_actual_place(argument: &Expr) -> Option<MutablePlaceSnapshot> {
+        match &argument.kind {
+            ExprKind::Local(local) => Some(MutablePlaceSnapshot {
+                root: *local,
+                path: Vec::new(),
+            }),
+            ExprKind::Field { root, path } => Some(MutablePlaceSnapshot {
+                root: *root,
+                path: path.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether the syntactic actual still denotes the header/storage captured when its argument
+    /// completed. `out` passes a slice descriptor by value, so a later eager rebind must update the
+    /// old backing without attaching the installed owner to the now-unrelated local.
+    fn mutable_actual_observes_completion(
+        &self,
+        argument: &Expr,
+        backing: &MutableBackingFact,
+        storage: &BorrowFact,
+    ) -> bool {
+        let Some(actual) = Self::mutable_actual_root(argument) else {
+            return false;
+        };
+        let evidence = Self::mutable_backing_evidence(backing, storage);
+        self.borrows
+            .mutable_backing
+            .get(&actual)
+            .is_some_and(|current| Self::roots_intersect(&current.roots, &evidence))
+            || self
+                .borrows
+                .sources
+                .get(&actual)
+                .is_some_and(|roots| Self::roots_intersect(roots, &evidence))
+    }
+
+    fn resolved_mutable_destinations(
+        &self,
+        backing: &MutableBackingFact,
+        observers: &std::collections::BTreeSet<LocalId>,
+    ) -> std::collections::BTreeSet<LocalId> {
+        let mut destinations = observers.clone();
+        for &root in &backing.roots {
+            if let Some(local) = self.backing_root_local(root)
+                && self
+                    .f
+                    .locals
+                    .get(local as usize)
+                    .is_some_and(|record| self.mutable_collection_ty(record.ty))
+                && self
+                    .borrows
+                    .mutable_backing
+                    .get(&local)
+                    .is_some_and(|current| {
+                        Self::roots_intersect(&current.roots, &backing.roots)
+                    })
+            {
+                destinations.insert(local);
+            }
+        }
+        destinations
+    }
+
+    /// A `borrow mut` call may be either a whole-place replacement or an indexed mutation. The
+    /// actual keeps the strong replacement above; every *other* possible backing/observer receives
+    /// a conservative content join because the analysis-local summary has no discriminator.
+    fn join_borrow_mut_backing_contents(
+        &mut self,
+        argument: &Expr,
+        backing: &MutableBackingFact,
+        observers: &std::collections::BTreeSet<LocalId>,
+        incoming: &BorrowFact,
+    ) {
+        let actual = Self::mutable_actual_root(argument);
+        for local in self.resolved_mutable_destinations(backing, observers) {
+            if Some(local) != actual {
+                self.join_local_mutable_contents(local, incoming);
+            }
+        }
+    }
+
+    /// `out` mutates elements without replacing the slice header or ending a backing allocation
+    /// generation. Join the callee result into the visible actual and every resolved collection
+    /// identity so reads through a sibling alias observe the installed owner dependency.
+    fn join_out_call_contents(
+        &mut self,
+        _argument: &Expr,
+        backing: &MutableBackingFact,
+        observers: &std::collections::BTreeSet<LocalId>,
+        incoming: BorrowFact,
+    ) {
+        for local in self.resolved_mutable_destinations(backing, observers) {
+            self.join_local_mutable_contents(local, &incoming);
+        }
+    }
+
+    /// Provenance retained by copying the completed argument value. Strip only a distinct
+    /// syntactic header local; the backing roots are part of a slice/collection value and must
+    /// survive a whole-place or field replacement through `borrow mut`.
+    fn retained_argument_fact(
+        &self,
+        argument: &Expr,
+        mut completed: BorrowFact,
+        backing: &MutableBackingFact,
+    ) -> BorrowFact {
+        let invalid = self
+            .borrows
+            .invalid_value_sources
+            .get(&Self::expr_key(argument));
+        completed.direct.extend(backing.roots.iter().copied().map(|root| {
+            invalid
+                .and_then(|ended| ended.get(&root))
+                .map_or(root, |&how| root.ended(how))
+        }));
+        let mut excluded = BorrowRoots::new();
+        if let Some(local) = Self::mutable_actual_root(argument) {
+            let header = BorrowRoot::Local(local);
+            if !backing.roots.contains(&header) {
+                excluded.insert(header);
+            }
+        }
+        completed.without_root_sources(&excluded)
+    }
+
+    /// Provenance of values already stored in a collection, excluding the collection/header
+    /// storage itself. An `out` destination's self-source denotes these old elements rather than a
+    /// copied slice header, so retaining it must not install a backing self-root.
+    fn element_argument_fact(
+        &self,
+        whole: BorrowFact,
+        backing: &MutableBackingFact,
+    ) -> BorrowFact {
+        whole.without_root_sources(&backing.roots)
     }
 
     fn mutable_place_roots(&self, argument: &Expr) -> Option<BorrowRoots> {
@@ -20888,6 +23785,25 @@ impl<'a> MoveCheck<'a> {
         self.borrow_mut_alias_roots(argument)
     }
 
+    fn completed_borrow_mut_invalidation_roots(
+        &self,
+        argument: &Expr,
+        storage: &BorrowFact,
+    ) -> BorrowRoots {
+        if argument.ty.is_array_builder()
+            || matches!(
+                expand_tagged_ty(argument.ty, self.tagged_types),
+                Ty::Resource(_)
+            )
+            || !self.borrow_mut_uses_reachable_storage(argument)
+        {
+            self.mutable_place_roots(argument)
+                .unwrap_or_else(|| storage.live_roots())
+        } else {
+            storage.live_roots()
+        }
+    }
+
     /// Flatten the owner-local provenance carried by a borrow-producing expression. Producers are
     /// classified once here; control flow and invalidation share MoveCheck's existing dataflow.
     /// The classification in [`Self::borrow_sources_inner`] is **exhaustive** — no `_` tail —
@@ -20968,6 +23884,11 @@ impl<'a> MoveCheck<'a> {
 
     fn value_snapshot_needed(&self, e: &Expr) -> bool {
         matches!(e.kind, ExprKind::BorrowedIndex { .. })
+            || e.ty.is_array_builder()
+            || matches!(
+                expand_tagged_ty(e.ty, self.tagged_types),
+                Ty::DynArray(..) | Ty::DynStructArray(..)
+            )
             || ty_may_borrow(
                 e.ty,
                 self.structs,
@@ -20977,14 +23898,91 @@ impl<'a> MoveCheck<'a> {
             )
     }
 
+    fn completion_snapshot_needed(&self, e: &Expr) -> bool {
+        self.value_snapshot_needed(e)
+            || self
+                .mutable_call_argument_snapshots
+                .contains(&Self::expr_key(e))
+    }
+
     fn clear_value_snapshot(&mut self, key: usize) {
         self.walked_value_facts.remove(&key);
+        self.walked_storage_facts.remove(&key);
+        self.walked_backing_facts.remove(&key);
+        self.pending_call_completions.remove(&key);
         self.borrows.finish_value_source(key);
         for frame in &mut self.loop_borrow_breaks {
             for state in frame {
                 state.finish_value_source(key);
             }
         }
+    }
+
+    fn record_value_completion(&mut self, expression: &Expr, fact: BorrowFact) {
+        let key = Self::expr_key(expression);
+        let (fact, mut storage, backing) = self
+            .pending_call_completions
+            .remove(&key)
+            .map_or_else(
+                || {
+                    let backing = self.mutable_backing(expression);
+                    let storage = BorrowFact::from_direct(self.storage_roots(expression));
+                    (fact, storage, backing)
+                },
+                |completion| {
+                    (
+                        completion.value,
+                        completion.storage,
+                        completion.backing,
+                    )
+                },
+            );
+        if self.mutable_collection_ty(expression.ty) {
+            storage
+                .direct
+                .extend(backing.roots.iter().filter_map(|root| root.live()));
+        }
+        let mut completion_roots = fact.live_roots();
+        completion_roots.extend(storage.live_roots());
+        completion_roots.extend(backing.roots.iter().filter_map(|root| root.live()));
+        self.borrows.begin_value_source(key, completion_roots);
+        if self.borrow_mut_place_snapshots.contains(&key)
+            && let Some(place) = Self::mutable_actual_place(expression)
+        {
+            self.borrows.begin_mutable_place_source(key, place);
+        }
+        self.walked_value_facts.insert(key, fact);
+        self.walked_storage_facts.insert(key, storage);
+        self.walked_backing_facts.insert(key, backing);
+    }
+
+    fn completed_value_fact(&self, expression: &Expr) -> BorrowFact {
+        let key = Self::expr_key(expression);
+        let Some(mut fact) = self.walked_value_facts.get(&key).cloned() else {
+            return self.borrow_fact(expression);
+        };
+        if let Some(invalid) = self.borrows.invalid_value_sources.get(&key) {
+            fact.mark_ended(invalid);
+        }
+        fact
+    }
+
+    fn completed_storage_fact(&self, expression: &Expr) -> BorrowFact {
+        let key = Self::expr_key(expression);
+        let Some(mut fact) = self.walked_storage_facts.get(&key).cloned() else {
+            return BorrowFact::from_direct(self.storage_roots(expression));
+        };
+        if let Some(invalid) = self.borrows.invalid_value_sources.get(&key) {
+            fact.mark_ended(invalid);
+        }
+        fact
+    }
+
+    fn completed_backing_fact(&self, expression: &Expr) -> MutableBackingFact {
+        self.walked_backing_facts
+            .get(&Self::expr_key(expression))
+            .cloned()
+            .unwrap_or_else(|| self.mutable_backing(expression))
     }
 
     fn ended_value_snapshot(&self, key: usize) -> Option<(BorrowRoot, BorrowEnd)> {
@@ -21043,6 +24041,43 @@ impl<'a> MoveCheck<'a> {
         self.diags.error(message, span);
     }
 
+    fn validate_mutable_place_snapshot(
+        &mut self,
+        action: usize,
+        snapshot: usize,
+        span: Span,
+    ) {
+        let Some(&how) = self
+            .borrows
+            .invalid_mutable_place_sources
+            .get(&snapshot)
+        else {
+            return;
+        };
+        if !self
+            .reported_invalid_value_actions
+            .insert((action, snapshot))
+        {
+            return;
+        }
+        let owner = self
+            .borrows
+            .mutable_place_sources
+            .get(&snapshot)
+            .and_then(|place| self.f.locals.get(place.root as usize))
+            .map_or("<place>", |local| local.name.as_str());
+        let why = match how {
+            BorrowEnd::Consumed => "was reassigned or mutated by a later eager operand",
+            BorrowEnd::Dropped => "was dropped before the call action",
+        };
+        self.diags.error(
+            format!(
+                "borrow mut argument place was invalidated before the call action: '{owner}' {why}"
+            ),
+            span,
+        );
+    }
+
     fn defers_child_snapshot_validation(kind: &ExprKind) -> bool {
         matches!(
             kind,
@@ -21062,12 +24097,11 @@ impl<'a> MoveCheck<'a> {
         )
     }
 
-    /// A `borrow mut` argument is deliberately advanced by the call itself. When that call returns
-    /// a value rooted in the fresh post-call generation (for example `db.next(rows)`), validating
-    /// the argument's pre-call snapshot after the mutation would reject the intended generation
-    /// transition. Only the exact mutable argument snapshot is exempt: a callee or another eager
-    /// value may retain the same pre-call roots and must still be rejected after the advancement.
-    fn intentional_borrow_mut_snapshot(&self, expression: &Expr, snapshot: usize) -> bool {
+    /// A mutable operand is deliberately advanced by its own enclosing action. Validating that
+    /// exact pre-action operand snapshot after the mutation would reject the intended generation
+    /// transition. Only the exact destination snapshot is exempt: a callee, source value, or
+    /// another eager operand may retain the same pre-action roots and must still be rejected.
+    fn intentional_action_snapshot(&self, expression: &Expr, snapshot: usize) -> bool {
         let is_exact_snapshot = |argument: &Expr| Self::expr_key(argument) == snapshot;
         match &expression.kind {
             ExprKind::Call { func, args, .. } => {
@@ -21088,7 +24122,8 @@ impl<'a> MoveCheck<'a> {
                 }),
                 _ => false,
             },
-            _ => false,
+            _ => Self::source_visible_mutation_action(&expression.kind)
+                .is_some_and(|action| action.exact_destination_matches(snapshot)),
         }
     }
 
@@ -21204,12 +24239,18 @@ impl<'a> MoveCheck<'a> {
 
     fn pipeline_element_fact(&self, source: &Expr, stages: &[Stage]) -> (Ty, BorrowFact) {
         let mut element_ty = self.collection_element_ty(source.ty).unwrap_or(source.ty);
-        let mut fact = if self.fixed_array_shape(source.ty).is_some() {
+        let fact = if self.fixed_array_shape(source.ty).is_some() {
             self.normalize_borrow_fact(source.ty, self.borrow_fact(source))
                 .project_array_elements()
         } else {
             BorrowFact::from_direct(self.borrow_sources(source))
         };
+        // A materializing pipeline copies element values into fresh storage. Retain owners used by
+        // those values, but not the source collection/header generation itself. Completed value
+        // facts deliberately include that generation even for a primitive dynamic collection so
+        // an eager mutable call can reserve it; leaking the same root into a materialized result
+        // would make a later source reassignment invalidate independent ArrayToSoa/ToArray output.
+        let mut fact = self.element_argument_fact(fact, &self.mutable_backing(source));
         for stage in stages {
             match &stage.kind {
                 StageKind::Project { field } => {
@@ -21285,12 +24326,16 @@ impl<'a> MoveCheck<'a> {
                 let fact = if signature.is_some_and(|signature| {
                     matches!(
                         signature.params.get(index).map(|(mode, _)| mode),
-                        Some(ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
+                        Some(
+                            ast::ParamMode::Borrow
+                                | ast::ParamMode::BorrowMut
+                                | ast::ParamMode::Out
+                        )
                     )
                 }) {
-                    BorrowFact::from_direct(self.storage_roots(argument))
+                    self.completed_storage_fact(argument)
                 } else {
-                    self.borrow_fact(argument)
+                    self.completed_value_fact(argument)
                 };
                 (argument.ty, fact)
             })
@@ -21339,7 +24384,9 @@ impl<'a> MoveCheck<'a> {
             return BorrowFact::from_direct(unresolved().flatten());
         }
         let mut fact = BorrowFact::default();
-        let environment = self.borrow_fact(callee);
+        // The callable expression completed before argument zero. A later eager argument may
+        // rebind its source local, but the runtime invokes the already-evaluated environment.
+        let environment = self.completed_value_fact(callee);
         for (&target, summary) in targets {
             let hir::ReturnBorrowSummary::Roots { params, captures } = summary else {
                 continue;
@@ -21364,11 +24411,15 @@ impl<'a> MoveCheck<'a> {
     fn parallel_argument_fact(&self, argument: &Expr, mode: Option<ast::ParamMode>) -> BorrowFact {
         if matches!(
             mode,
-            Some(ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
+            Some(
+                ast::ParamMode::Borrow
+                    | ast::ParamMode::BorrowMut
+                    | ast::ParamMode::Out
+            )
         ) {
-            BorrowFact::from_direct(self.storage_roots(argument))
+            self.completed_storage_fact(argument)
         } else {
-            self.borrow_fact(argument)
+            self.completed_value_fact(argument)
         }
     }
 
@@ -21439,7 +24490,7 @@ impl<'a> MoveCheck<'a> {
         if targets.is_empty() {
             return unresolved();
         }
-        let environment = self.borrow_fact(callee);
+        let environment = self.completed_value_fact(callee);
         let mut fact = BorrowFact::default();
         for target in targets.keys().copied() {
             let Some(summary) = self.callable_parallel_targets.get(&target) else {
@@ -21886,12 +24937,16 @@ impl<'a> MoveCheck<'a> {
                 if modes.is_some_and(|modes| {
                     matches!(
                         modes.get(index as usize),
-                        Some(ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
+                        Some(
+                            ast::ParamMode::Borrow
+                                | ast::ParamMode::BorrowMut
+                                | ast::ParamMode::Out
+                        )
                     )
                 }) {
-                    roots.extend(self.storage_roots(value));
+                    roots.extend(self.completed_storage_fact(value).flatten());
                 } else {
-                    roots.extend(self.borrow_sources(value));
+                    roots.extend(self.completed_value_fact(value).flatten());
                 }
             }
         }
@@ -22278,7 +25333,14 @@ impl<'a> MoveCheck<'a> {
         }
     }
     fn assign_borrow(&mut self, local: LocalId, value: &Expr) {
-        let fact = if self.local_may_borrow(local) {
+        let tracks_dynamic_storage = self.f.locals.get(local as usize).is_some_and(|local| {
+            local.ty.is_array_builder()
+                || matches!(
+                    expand_tagged_ty(local.ty, self.tagged_types),
+                    Ty::DynArray(..) | Ty::DynStructArray(..)
+                )
+        });
+        let fact = if self.local_may_borrow(local) || tracks_dynamic_storage {
             let fact = self.borrow_fact(value);
             let ty = self.f.locals[local as usize].ty;
             self.normalize_borrow_fact(ty, fact)
@@ -22386,6 +25448,36 @@ impl<'a> MoveCheck<'a> {
         self.borrows.update_fact(local, current);
     }
 
+    /// Apply one indexed content transition to the syntactic base and every storage identity that
+    /// can be observed through another alias. The backing snapshot is taken before any fact update;
+    /// a computed fixed index and dynamic/slice storage retain the existing conservative join.
+    fn update_mutable_collection_contents(
+        &mut self,
+        base: LocalId,
+        index: &Expr,
+        field_path: &[u32],
+        value: &Expr,
+    ) {
+        let backing = self.local_mutable_backing(base);
+        let storage = BorrowFact::from_direct(self.local_storage_roots(base));
+        let observers = self.mutable_observer_locals(&backing, &storage);
+        for local in self.resolved_mutable_destinations(&backing, &observers) {
+            self.invalidate_mutable_place(local, &[]);
+        }
+        // Only the syntactic fixed-array base has an index in its own coordinate space. A slice or
+        // range may carry an offset that the analysis-local backing fact deliberately does not
+        // encode, so reusing `index` for an underlying fixed array could replace the wrong element
+        // fact (`values[1..2][0]` is `values[1]`, not `values[0]`). Keep the visible base precise and
+        // conservatively join the incoming owner into every distinct backing collection and
+        // pre-existing observer captured before the visible fact changes.
+        self.update_local_array_projection(base, index, field_path, value);
+        let mut destinations = self.resolved_mutable_destinations(&backing, &observers);
+        destinations.remove(&base);
+        for local in destinations {
+            self.join_local_borrow_fallback(local, value);
+        }
+    }
+
     fn join_local_borrow_fallback(&mut self, local: LocalId, value: &Expr) {
         if !self.local_may_borrow(local) {
             return;
@@ -22402,6 +25494,35 @@ impl<'a> MoveCheck<'a> {
 
     fn invalidate_owner(&mut self, owner: LocalId) {
         self.borrows.invalidate_owner(owner, BorrowEnd::Consumed);
+    }
+
+    fn invalidate_mutable_place(&mut self, root: LocalId, path: &[u32]) {
+        self.borrows
+            .invalidate_mutable_places(root, path, BorrowEnd::Consumed);
+    }
+
+    fn invalidate_source_mutation_target(&mut self, target: &Expr) {
+        if let Some(place) = Self::mutable_actual_place(target) {
+            self.invalidate_mutable_place(place.root, &place.path);
+        }
+    }
+
+    /// Invalidate exact-place reservations for every collection header that can observe a write to
+    /// the completed target. Backing/storage facts come from operand completion, so a later eager
+    /// sibling cannot retarget an already-evaluated slice alias before the action runs.
+    fn invalidate_collection_mutation_target(&mut self, target: &Expr) {
+        let backing = self.completed_backing_fact(target);
+        let storage = self.completed_storage_fact(target);
+        let observers = self.mutable_observer_locals(&backing, &storage);
+        let mut destinations = self.resolved_mutable_destinations(&backing, &observers);
+        if self.mutable_actual_observes_completion(target, &backing, &storage)
+            && let Some(actual) = Self::mutable_actual_root(target)
+        {
+            destinations.insert(actual);
+        }
+        for local in destinations {
+            self.invalidate_mutable_place(local, &[]);
+        }
     }
 
     /// A resource/reference borrower is itself live native state, not merely a view whose later use
@@ -22465,10 +25586,22 @@ impl<'a> MoveCheck<'a> {
     /// buffer whatever names it. A temporary root reaching here is left alone: the operation
     /// replaces the *named* storage, not the hidden owner, which only its loop edge frees.
     fn invalidate_storage(&mut self, storage: &Expr) {
-        for root in self.storage_roots(storage) {
+        self.invalidate_source_mutation_target(storage);
+        for root in self.completed_storage_fact(storage).live_roots() {
             if let BorrowRoot::Local(owner) = root {
+                self.invalidate_mutable_place(owner, &[]);
                 self.invalidate_owner(owner);
             }
+        }
+    }
+
+    /// A builder reallocation advances the builder slot, not the owners of borrowed views already
+    /// copied into its elements. `completed_storage_fact(builder)` deliberately contains both, so
+    /// the generic storage invalidator would end valid element provenance on the next push.
+    fn invalidate_builder_storage(&mut self, builder: &Expr) {
+        self.invalidate_source_mutation_target(builder);
+        if let Some(place) = Self::mutable_actual_place(builder) {
+            self.invalidate_owner(place.root);
         }
     }
 
@@ -22861,6 +25994,7 @@ impl<'a> MoveCheck<'a> {
                 Stmt::Let { local, init } => {
                     move_expr!(self, init, moved, true, true);
                     self.assign_borrow(*local, init);
+                    self.assign_mutable_backing(*local, init);
                     clear_moved(moved, *local);
                 }
                 Stmt::Assign { local, value, drop_old, .. } => {
@@ -22874,11 +26008,15 @@ impl<'a> MoveCheck<'a> {
                     // locals never drop. (`s = make(s.len())` borrows, not moves → still drops.)
                     let consumed_by_rhs = whole_moved(moved, *local) && !was_moved;
                     drop_old.set(self.is_move(*local) && !consumed_by_rhs);
+                    if !matches!(value.kind, ExprKind::Local(source) if source == *local) {
+                        self.invalidate_mutable_place(*local, &[]);
+                    }
                     if self.local_owns_view_storage(*local) {
                         self.reject_live_resource_dependents(*local, moved, value.span);
                         self.invalidate_owner(*local);
                     }
                     self.assign_borrow(*local, value);
+                    self.assign_mutable_backing(*local, value);
                     clear_moved(moved, *local);
                 }
                 // `root.field = value` — writing a field is a use of `root` (an owned struct could
@@ -22918,6 +26056,7 @@ impl<'a> MoveCheck<'a> {
                         self.invalidate_owner(*root);
                     }
                     if !self_assign {
+                        self.invalidate_mutable_place(*root, path);
                         let projections = path
                             .iter()
                             .copied()
@@ -22940,7 +26079,7 @@ impl<'a> MoveCheck<'a> {
                     }
                     move_expr!(self, index, moved, false, false);
                     move_expr!(self, value, moved, false, false);
-                    self.update_local_array_projection(*base, index, &[], value);
+                    self.update_mutable_collection_contents(*base, index, &[], value);
                 }
                 // Struct element-field and whole-element stores may install an owned `string` or
                 // Move struct. MIR drops the old destination and nulls a moved RHS source, so
@@ -22963,7 +26102,7 @@ impl<'a> MoveCheck<'a> {
                     if self.is_move_ty(value.ty) {
                         self.invalidate_owner(*base);
                     }
-                    self.update_local_array_projection(*base, index, path, value);
+                    self.update_mutable_collection_contents(*base, index, path, value);
                 }
                 Stmt::AssignElem { base, index, value, .. } => {
                     self.check_borrow_use(*base, index.span);
@@ -22976,10 +26115,11 @@ impl<'a> MoveCheck<'a> {
                     if self.is_move_ty(value.ty) {
                         self.invalidate_owner(*base);
                     }
-                    self.update_local_array_projection(*base, index, &[], value);
+                    self.update_mutable_collection_contents(*base, index, &[], value);
                 }
-                Stmt::AssignVecLane { value, .. } => {
+                Stmt::AssignVecLane { local, value, .. } => {
                     move_expr!(self, value, moved, false, false);
+                    self.invalidate_mutable_place(*local, &[]);
                 }
                 Stmt::Return(Some(e)) => {
                     move_expr!(self, e, moved, true, true);
@@ -23050,6 +26190,18 @@ impl<'a> MoveCheck<'a> {
                             BorrowFact::default()
                         };
                         self.borrows.assign(*local, local_fact);
+                        if self
+                            .f
+                            .locals
+                            .get(*local as usize)
+                            .is_some_and(|local| self.mutable_collection_ty(local.ty))
+                        {
+                            let backing = self.destructured_mutable_backing(*local);
+                            self.borrows.mutable_backing.insert(
+                                *local,
+                                backing,
+                            );
+                        }
                         clear_moved(moved, *local);
                     }
                 }
@@ -23105,16 +26257,10 @@ impl<'a> MoveCheck<'a> {
             ExprKind::ArrayBuilderPush { builder, value, .. } => {
                 move_expr!(self, builder, moved, false, false);
                 move_expr!(self, value, moved, true, true);
-                if let ExprKind::Local(local) = builder.kind {
-                    self.join_local_borrow_fallback(local, value);
-                }
             }
             ExprKind::ArrayBuilderAppend { builder, data } => {
                 move_expr!(self, builder, moved, false, false);
                 move_expr!(self, data, moved, false, false);
-                if let ExprKind::Local(local) = builder.kind {
-                    self.join_local_borrow_fallback(local, data);
-                }
             }
             ExprKind::ArrayBuilderBuild(i) => {
                 move_expr!(self, i, moved, true, true);
@@ -23162,6 +26308,7 @@ impl<'a> MoveCheck<'a> {
                         );
                     }
                     self.reject_live_resource_dependents(*id, moved, expression.span);
+                    self.invalidate_mutable_place(*id, &[]);
                     self.invalidate_owner(*id);
                     moved.insert(MovedKey::Whole(*id));
                     return;
@@ -23208,6 +26355,7 @@ impl<'a> MoveCheck<'a> {
                             return;
                         }
                         self.reject_live_resource_dependents(*root, moved, expression.span);
+                        self.invalidate_mutable_place(*root, &[field]);
                         self.invalidate_owner(*root);
                         moved.insert(MovedKey::Field(*root, field));
                     } else if self.is_move_ty(expression.ty) {
@@ -23287,16 +26435,16 @@ impl<'a> MoveCheck<'a> {
         {
             return self.expr_non_borrowing_binary_tree(e, moved);
         }
-        let may_borrow = self.value_snapshot_needed(e);
+        let value_snapshot = self.value_snapshot_needed(e);
+        let completion_snapshot = self.completion_snapshot_needed(e);
         let key = Self::expr_key(e);
         // A loop refinement or another repeated structural walk may revisit the same source node
         // under a stronger state. Never let that prior pass answer this evaluation's fact query.
-        if may_borrow {
+        if completion_snapshot {
             self.clear_value_snapshot(key);
         }
         self.value_snapshot_frames.push(Vec::new());
-        let falls_through =
-            self.expr_inner(e, moved, consuming, direct);
+        let falls_through = self.expr_inner(e, moved, consuming, direct);
         let child_snapshots = self
             .value_snapshot_frames
             .pop()
@@ -23305,21 +26453,26 @@ impl<'a> MoveCheck<'a> {
             && !Self::defers_child_snapshot_validation(&e.kind)
         {
             for snapshot in child_snapshots {
-                if !self.intentional_borrow_mut_snapshot(e, snapshot) {
-                self.validate_value_snapshot(key, snapshot, e.span);
+                if !self.intentional_action_snapshot(e, snapshot) {
+                    self.validate_value_snapshot(key, snapshot, e.span);
+                }
             }
-        }
         }
         if !falls_through {
             self.non_fallthrough.insert(e.span);
-        } else if may_borrow {
+        } else if completion_snapshot {
             // Every eager child has already stored its own completion-time fact. Forming this
             // parent from those child snapshots preserves runtime source order even if a later
             // sibling reassigned a local mentioned by an earlier child.
-            let fact = self.borrow_fact(e);
-            self.borrows.begin_value_source(key, fact.live_roots());
-            self.walked_value_facts.insert(key, fact);
-            if let Some(parent) = self.value_snapshot_frames.last_mut() {
+            let fact = if value_snapshot {
+                self.borrow_fact(e)
+            } else {
+                BorrowFact::default()
+            };
+            self.record_value_completion(e, fact);
+            if value_snapshot
+                && let Some(parent) = self.value_snapshot_frames.last_mut()
+            {
                 parent.push(key);
             }
         }
@@ -23372,7 +26525,8 @@ impl<'a> MoveCheck<'a> {
             Finish {
                 expression: &'e Expr,
                 key: usize,
-                may_borrow: bool,
+                value_snapshot: bool,
+                completion_snapshot: bool,
             },
         }
 
@@ -23390,9 +26544,10 @@ impl<'a> MoveCheck<'a> {
                         ));
                         continue;
                     }
-                    let may_borrow = self.value_snapshot_needed(expression);
+                    let value_snapshot = self.value_snapshot_needed(expression);
+                    let completion_snapshot = self.completion_snapshot_needed(expression);
                     let key = Self::expr_key(expression);
-                    if may_borrow {
+                    if completion_snapshot {
                         self.clear_value_snapshot(key);
                     }
                     self.value_snapshot_frames.push(Vec::new());
@@ -23410,7 +26565,8 @@ impl<'a> MoveCheck<'a> {
                     work.push(Work::Finish {
                         expression,
                         key,
-                        may_borrow,
+                        value_snapshot,
+                        completion_snapshot,
                     });
                     work.push(Work::Children {
                         children,
@@ -23443,7 +26599,8 @@ impl<'a> MoveCheck<'a> {
                 Work::Finish {
                     expression,
                     key,
-                    may_borrow,
+                    value_snapshot,
+                    completion_snapshot,
                 } => {
                     let falls_through =
                         values.pop().expect("Move expression result");
@@ -23460,20 +26617,22 @@ impl<'a> MoveCheck<'a> {
                         )
                     {
                         for snapshot in child_snapshots {
-                            if !self.intentional_borrow_mut_snapshot(expression, snapshot) {
+                            if !self.intentional_action_snapshot(expression, snapshot) {
                                 self.validate_value_snapshot(key, snapshot, expression.span);
                             }
                         }
                     }
                     if !falls_through {
                         self.non_fallthrough.insert(expression.span);
-                    } else if may_borrow {
-                        let fact = self.borrow_fact(expression);
-                        self.borrows
-                            .begin_value_source(key, fact.live_roots());
-                        self.walked_value_facts.insert(key, fact);
-                        if let Some(parent) =
-                            self.value_snapshot_frames.last_mut()
+                    } else if completion_snapshot {
+                        let fact = if value_snapshot {
+                            self.borrow_fact(expression)
+                        } else {
+                            BorrowFact::default()
+                        };
+                        self.record_value_completion(expression, fact);
+                        if value_snapshot
+                            && let Some(parent) = self.value_snapshot_frames.last_mut()
                         {
                             parent.push(key);
                         }
@@ -23488,10 +26647,11 @@ impl<'a> MoveCheck<'a> {
     fn finish_eager_move_action(&mut self, expression: &Expr, moved: &MovedSet) {
         match &expression.kind {
             ExprKind::Call { func, args, .. } => {
-                self.apply_direct_borrow_mut_call_effects(func, args, moved);
                 self.add_direct_parallel_transfer(func, args);
+                self.apply_direct_mutable_call_effects(expression, func, args, moved);
             }
             ExprKind::CallFnValue { callee, args } => {
+                self.add_indirect_parallel_transfer(callee, args);
                 let modes = match callee.ty {
                     Ty::Fn(id) => self.fn_types.get(id as usize).map(|function| {
                         function
@@ -23503,9 +26663,8 @@ impl<'a> MoveCheck<'a> {
                     _ => None,
                 };
                 if let Some(modes) = modes {
-                    self.apply_borrow_mut_call_effects(args, &modes, None, moved);
+                    self.apply_mutable_call_effects(expression, args, &modes, None, moved);
                 }
-                self.add_indirect_parallel_transfer(callee, args);
             }
             ExprKind::Spawn { closure, .. } => {
                 self.parallel_transfer_roots
@@ -23526,14 +26685,85 @@ impl<'a> MoveCheck<'a> {
                     .flatten();
                 self.parallel_transfer_roots.extend(roots);
             }
-            ExprKind::ReaderReadLine { buffer, .. } => {
-                self.invalidate_storage(buffer);
-            }
-            ExprKind::BufferPut { buffer, .. }
-            | ExprKind::BufferAppend { buffer, .. } => {
-                self.invalidate_storage(buffer);
-            }
             _ => {}
+        }
+        self.apply_builtin_mutation_action(expression);
+    }
+
+    fn source_visible_mutation_action(
+        kind: &ExprKind,
+    ) -> Option<SourceVisibleMutationAction<'_>> {
+        match kind {
+            ExprKind::ReaderRead { buffer, .. }
+            | ExprKind::ReaderReadLine { buffer, .. }
+            | ExprKind::FilePread { buffer, .. }
+            | ExprKind::UdpRecvFrom { buffer, .. }
+            | ExprKind::CryptoRandom { out: buffer }
+            | ExprKind::BufferPut { buffer, .. }
+            | ExprKind::BufferAppend { buffer, .. } => {
+                Some(SourceVisibleMutationAction::Storage(buffer))
+            }
+            ExprKind::ArrayBuilderPush { builder, value, .. } => {
+                Some(SourceVisibleMutationAction::Builder {
+                    builder,
+                    retained: value,
+                })
+            }
+            ExprKind::ArrayBuilderAppend { builder, data } => {
+                Some(SourceVisibleMutationAction::Builder {
+                    builder,
+                    retained: data,
+                })
+            }
+            ExprKind::RandNext { rng }
+            | ExprKind::RandRange { rng, .. }
+            | ExprKind::RandSample { rng, .. } => {
+                Some(SourceVisibleMutationAction::Source(rng))
+            }
+            ExprKind::RandShuffle { rng, xs, .. } => {
+                Some(SourceVisibleMutationAction::Shuffle {
+                    source: rng,
+                    collection: xs,
+                })
+            }
+            ExprKind::VecStore { dst, .. } | ExprKind::ArrayMapInto { dst, .. } => {
+                Some(SourceVisibleMutationAction::Collection(dst))
+            }
+            _ => None,
+        }
+    }
+
+    fn kind_has_source_visible_mutation(kind: &ExprKind) -> bool {
+        Self::source_visible_mutation_action(kind).is_some()
+    }
+
+    /// Apply the source-binding mutations emitted by built-ins after all eager operands complete.
+    /// Opaque handle interiors are deliberately absent: only operations that replace a visible
+    /// source place or write a caller-visible collection backing end a place reservation.
+    fn apply_builtin_mutation_action(&mut self, expression: &Expr) {
+        let Some(action) = Self::source_visible_mutation_action(&expression.kind) else {
+            return;
+        };
+        match action {
+            SourceVisibleMutationAction::Storage(destination) => {
+                self.invalidate_storage(destination);
+            }
+            SourceVisibleMutationAction::Builder { builder, retained } => {
+                self.invalidate_builder_storage(builder);
+                if let ExprKind::Local(local) = builder.kind {
+                    self.join_local_borrow_fallback(local, retained);
+                }
+            }
+            SourceVisibleMutationAction::Source(destination) => {
+                self.invalidate_source_mutation_target(destination);
+            }
+            SourceVisibleMutationAction::Shuffle { source, collection } => {
+                self.invalidate_source_mutation_target(source);
+                self.invalidate_collection_mutation_target(collection);
+            }
+            SourceVisibleMutationAction::Collection(destination) => {
+                self.invalidate_collection_mutation_target(destination);
+            }
         }
     }
 
@@ -23560,7 +26790,7 @@ impl<'a> MoveCheck<'a> {
             DirectCall {
                 function: &'e str,
                 args: &'e [Expr],
-                borrow_mut: bool,
+                mutable: bool,
             },
             IfAfterCondition {
                 then: &'e Block,
@@ -23626,6 +26856,9 @@ impl<'a> MoveCheck<'a> {
                 path: &'e [u32],
                 value: &'e Expr,
                 self_assign: bool,
+            },
+            BlockAssignVecLane {
+                local: LocalId,
             },
             BlockPairAfterIndex {
                 base: LocalId,
@@ -23965,7 +27198,7 @@ impl<'a> MoveCheck<'a> {
                                 [Stmt::AssignVecLane { .. }]
                             ) =>
                     {
-                        let [Stmt::AssignVecLane { value, .. }] =
+                        let [Stmt::AssignVecLane { local, value, .. }] =
                             block.stmts.as_slice()
                         else {
                             unreachable!("single vector lane assign guard")
@@ -23978,7 +27211,7 @@ impl<'a> MoveCheck<'a> {
                             ),
                             false,
                             false,
-                            Post::None,
+                            Post::BlockAssignVecLane { local: *local },
                         )
                     }
                     ExprKind::Block(block)
@@ -24497,11 +27730,24 @@ impl<'a> MoveCheck<'a> {
                             self.check_call_borrow_aliases(func, args, &modes);
                         }
                         let consumes = func != "print"
-                            && !matches!(mode, ast::ParamMode::Borrow | ast::ParamMode::BorrowMut);
+                            && !matches!(
+                                mode,
+                                ast::ParamMode::Borrow
+                                    | ast::ParamMode::BorrowMut
+                                    | ast::ParamMode::Out
+                            );
+                        let mutable = self.named_param_modes.get(func).is_some_and(|modes| {
+                            modes.iter().any(|mode| {
+                                matches!(
+                                    mode,
+                                    ast::ParamMode::BorrowMut | ast::ParamMode::Out
+                                )
+                            })
+                        });
                         let post = Post::DirectCall {
                             function: func,
                             args,
-                            borrow_mut: mode == ast::ParamMode::BorrowMut,
+                            mutable,
                         };
                         (&args[0], false, consumes, consumes, post)
                     }
@@ -24556,14 +27802,7 @@ impl<'a> MoveCheck<'a> {
                     _ => break,
                     }
                 };
-            let may_borrow = ty_may_borrow(
-                current.ty,
-                self.structs,
-                self.tuples,
-                self.enums,
-                self.tagged_types,
-            );
-            if may_borrow {
+            if self.completion_snapshot_needed(current) {
                 self.clear_value_snapshot(Self::expr_key(current));
             }
             self.value_snapshot_frames.push(Vec::new());
@@ -24878,14 +28117,22 @@ impl<'a> MoveCheck<'a> {
                             self.parallel_transfer_roots.extend(self.borrow_sources(capture));
                         }
                     }
+                    if falls_through && matches!(wrapper.kind, ExprKind::ArrayMapInto { .. }) {
+                        self.apply_builtin_mutation_action(wrapper);
+                    }
                     None
                 }
-                Post::DirectCall { function, args, borrow_mut } => {
+                Post::DirectCall { function, args, mutable } => {
                     if falls_through {
-                        if borrow_mut {
-                            self.apply_direct_borrow_mut_call_effects(function, args, moved);
-                        }
                         self.add_direct_parallel_transfer(function, args);
+                        if mutable {
+                            self.apply_direct_mutable_call_effects(
+                                wrapper,
+                                function,
+                                args,
+                                moved,
+                            );
+                        }
                     }
                     None
                 }
@@ -25129,6 +28376,7 @@ impl<'a> MoveCheck<'a> {
                 Post::BlockLet { local, init } => {
                     if falls_through {
                         self.assign_borrow(local, init);
+                        self.assign_mutable_backing(local, init);
                         clear_moved(moved, local);
                     }
                     None
@@ -25145,11 +28393,15 @@ impl<'a> MoveCheck<'a> {
                         drop_old.set(
                             self.is_move(local) && !consumed_by_rhs,
                         );
+                        if !matches!(value.kind, ExprKind::Local(source) if source == local) {
+                            self.invalidate_mutable_place(local, &[]);
+                        }
                         if self.local_owns_view_storage(local) {
                             self.reject_live_resource_dependents(local, moved, wrapper.span);
                             self.invalidate_owner(local);
                         }
                         self.assign_borrow(local, value);
+                        self.assign_mutable_backing(local, value);
                         clear_moved(moved, local);
                     }
                     None
@@ -25195,6 +28447,18 @@ impl<'a> MoveCheck<'a> {
                                 BorrowFact::default()
                             };
                             self.borrows.assign(*local, local_fact);
+                            if self
+                                .f
+                                .locals
+                                .get(*local as usize)
+                                .is_some_and(|local| self.mutable_collection_ty(local.ty))
+                            {
+                                let backing = self.destructured_mutable_backing(*local);
+                                self.borrows.mutable_backing.insert(
+                                    *local,
+                                    backing,
+                                );
+                            }
                             clear_moved(moved, *local);
                         }
                     }
@@ -25250,6 +28514,7 @@ impl<'a> MoveCheck<'a> {
                             self.invalidate_owner(root);
                         }
                         if !self_assign {
+                            self.invalidate_mutable_place(root, path);
                             let projections = path
                                 .iter()
                                 .copied()
@@ -25261,6 +28526,12 @@ impl<'a> MoveCheck<'a> {
                                 value,
                             );
                         }
+                    }
+                    None
+                }
+                Post::BlockAssignVecLane { local } => {
+                    if falls_through {
+                        self.invalidate_mutable_place(local, &[]);
                     }
                     None
                 }
@@ -25284,7 +28555,7 @@ impl<'a> MoveCheck<'a> {
                             {
                                 self.invalidate_owner(base);
                             }
-                            self.update_local_array_projection(
+                            self.update_mutable_collection_contents(
                                 base,
                                 match &wrapper.kind {
                                     ExprKind::Block(block)
@@ -25321,7 +28592,7 @@ impl<'a> MoveCheck<'a> {
                         {
                             self.invalidate_owner(base);
                         }
-                        self.update_local_array_projection(base, index, field_path, value);
+                        self.update_mutable_collection_contents(base, index, field_path, value);
                     }
                     None
                 }
@@ -25386,22 +28657,22 @@ impl<'a> MoveCheck<'a> {
                 }
                 if !Self::defers_child_snapshot_validation(&wrapper.kind) {
                     for snapshot in child_snapshots {
-                        if !self.intentional_borrow_mut_snapshot(wrapper, snapshot) {
+                        if !self.intentional_action_snapshot(wrapper, snapshot) {
                             self.validate_value_snapshot(key, snapshot, wrapper.span);
                         }
                     }
                 }
-                if ty_may_borrow(
-                    wrapper.ty,
-                    self.structs,
-                    self.tuples,
-                    self.enums,
-                    self.tagged_types,
-                ) {
-                    let fact = self.borrow_fact(wrapper);
-                    self.borrows.begin_value_source(key, fact.live_roots());
-                    self.walked_value_facts.insert(key, fact);
-                    if let Some(parent) = self.value_snapshot_frames.last_mut() {
+                let value_snapshot = self.value_snapshot_needed(wrapper);
+                if self.completion_snapshot_needed(wrapper) {
+                    let fact = if value_snapshot {
+                        self.borrow_fact(wrapper)
+                    } else {
+                        BorrowFact::default()
+                    };
+                    self.record_value_completion(wrapper, fact);
+                    if value_snapshot
+                        && let Some(parent) = self.value_snapshot_frames.last_mut()
+                    {
                         parent.push(key);
                     }
                 }
@@ -25564,6 +28835,18 @@ impl<'a> MoveCheck<'a> {
                 *binding,
             );
             self.borrows.assign(*binding, fact);
+            if self
+                .f
+                .locals
+                .get(*binding as usize)
+                .is_some_and(|local| self.mutable_collection_ty(local.ty))
+            {
+                let backing = self.destructured_mutable_backing(*binding);
+                self.borrows.mutable_backing.insert(
+                    *binding,
+                    backing,
+                );
+            }
             clear_moved(moved, *binding);
         }
     }
@@ -25670,7 +28953,9 @@ impl<'a> MoveCheck<'a> {
     /// shared iterative divergence result.
     fn expr_is_move_neutral(&self, root: &Expr) -> bool {
         for expression in hir_depth::expr_postorder(root) {
-            if self.is_move_ty(expression.ty)
+            if self.completion_snapshot_needed(expression)
+                || Self::kind_has_source_visible_mutation(&expression.kind)
+                || self.is_move_ty(expression.ty)
                 || ty_may_borrow(
                     expression.ty,
                     self.structs,
@@ -25722,7 +29007,8 @@ impl<'a> MoveCheck<'a> {
     fn eager_binary_tree_is_non_borrowing(&self, root: &Expr) -> bool {
         let mut work = vec![root];
         while let Some(node) = work.pop() {
-            if ty_may_borrow(
+            if self.completion_snapshot_needed(node)
+                || ty_may_borrow(
                 node.ty,
                 self.structs,
                 self.tuples,
@@ -25812,6 +29098,7 @@ impl<'a> MoveCheck<'a> {
                             );
                         }
                         self.reject_live_resource_dependents(*id, moved, e.span);
+                        self.invalidate_mutable_place(*id, &[]);
                         self.invalidate_owner(*id);
                         moved.insert(MovedKey::Whole(*id));
                     }
@@ -25870,6 +29157,7 @@ impl<'a> MoveCheck<'a> {
                         // argument) reaches here non-consuming (wrapped in `StrBorrow`/`Len`), so it
                         // is allowed and moves nothing.
                         self.reject_live_resource_dependents(*base, moved, e.span);
+                        self.invalidate_mutable_place(*base, &[fld]);
                         self.invalidate_owner(*base);
                         moved.insert(MovedKey::Field(*base, fld));
                     } else if consuming && self.is_move_ty(e.ty) {
@@ -25954,7 +29242,11 @@ impl<'a> MoveCheck<'a> {
                             self.named_param_modes
                                 .get(func)
                                 .and_then(|modes| modes.get(index)),
-                            Some(ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
+                            Some(
+                                ast::ParamMode::Borrow
+                                    | ast::ParamMode::BorrowMut
+                                    | ast::ParamMode::Out
+                            )
                         );
                     move_expr!(self, a, moved, consuming, consuming);
                 }
@@ -25993,7 +29285,11 @@ impl<'a> MoveCheck<'a> {
                     };
                     let consuming = !matches!(
                         mode,
-                        Some(ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
+                        Some(
+                            ast::ParamMode::Borrow
+                                | ast::ParamMode::BorrowMut
+                                | ast::ParamMode::Out
+                        )
                     );
                     move_expr!(self, a, moved, consuming, consuming);
                 }
@@ -27106,6 +30402,7 @@ impl<'a> MoveCheck<'a> {
                                 if self.tuples.get(tid as usize).and_then(|td| td.elems.get(*index as usize)).is_some_and(|s| s.is_move()));
                             if owned && consuming {
                                 self.reject_live_resource_dependents(*t, moved, e.span);
+                                self.invalidate_mutable_place(*t, &[]);
                                 self.invalidate_owner(*t);
                                 moved.insert(MovedKey::Field(*t, *index));
                             }
@@ -50090,6 +53387,82 @@ mod tests {
     use align_parser::parse_file;
 
     #[test]
+    fn indexed_result_storage_materialization_inventory_is_closed() {
+        let int = Scalar::Int(IntTy {
+            signed: true,
+            bits: 64,
+        });
+        let primitive_int = PrimScalar::Int(IntTy {
+            signed: true,
+            bits: 64,
+        });
+        let owned = [
+            Ty::Array(int, 1),
+            Ty::StructArray(0, 1),
+            Ty::DynSliceArray(primitive_int),
+            Ty::DynArray(int),
+            Ty::DynStructArray(0, Layout::Aos),
+            Ty::DynVecArray(int, 4),
+            Ty::DynMaskArray(int, 4),
+            Ty::DynFixedArray(int, 2),
+            Ty::DynFixedStructArray(0, 2),
+            Ty::DynResponseArray,
+        ];
+        assert!(owned
+            .into_iter()
+            .all(|ty| materializes_indexed_result_storage(ty, &[])));
+
+        for view in [Ty::Slice(int), Ty::Soa(0), Ty::SoaParam(0)] {
+            assert!(
+                !materializes_indexed_result_storage(view, &[]),
+                "a borrowed indexed header must remain eligible to forward compatible storage",
+            );
+        }
+    }
+
+    #[test]
+    fn mutable_calls_publish_parallel_transfer_before_advancing_destinations() {
+        let (program, diagnostics) = check(
+            "\
+fn length(value: str) -> i64 = value.len()
+fn one(borrow mut values: slice<str>) -> i64 = values.par_map(length).sum()
+fn many(borrow mut values: slice<str>, offset: i64) -> i64 = values.par_map(length).sum() + offset
+fn scalar(borrow mut value: string) -> i64 {
+  view: str := value
+  return [view].par_map(length).sum()
+}
+fn direct(borrow mut values: slice<str>) -> i64 = one(values)
+fn eager(borrow mut values: slice<str>) -> i64 = many(values, 0)
+fn indirect(borrow mut value: string) -> i64 {
+  apply := scalar
+  return apply(value)
+}
+fn main() -> i32 = 0
+",
+        );
+        assert!(
+            !diagnostics.has_errors(),
+            "parallel-transfer owner must form valid HIR: {:?}",
+            diagnostics.iter().collect::<Vec<_>>()
+        );
+        let expected = hir::ReturnBorrowSummary::Roots {
+            params: vec![0],
+            captures: vec![],
+        };
+        for name in ["direct", "eager", "indirect"] {
+            let function = program
+                .fns
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("missing {name} function"));
+            assert_eq!(
+                function.parallel_transfer, expected,
+                "{name} must map its callee's worker-transfer root through the pre-call mutable-argument snapshot",
+            );
+        }
+    }
+
+    #[test]
     fn run_bytes_is_not_a_function_value_return() {
         assert!(!fn_value_ret_ok(Ty::RunBytes));
         assert!(fn_value_ret_ok(Ty::Result(
@@ -50598,6 +53971,11 @@ fn main() -> i32 = 0
             loop_value_facts: std::collections::HashMap::new(),
             control_value_facts: std::collections::HashMap::new(),
             walked_value_facts: std::collections::HashMap::new(),
+            walked_storage_facts: std::collections::HashMap::new(),
+            walked_backing_facts: std::collections::HashMap::new(),
+            pending_call_completions: std::collections::HashMap::new(),
+            mutable_call_argument_snapshots: std::collections::HashSet::new(),
+            borrow_mut_place_snapshots: std::collections::HashSet::new(),
             value_snapshot_frames: Vec::new(),
             reported_invalid_value_actions: std::collections::HashSet::new(),
             loop_iter_drops: Vec::new(),
@@ -50927,6 +54305,11 @@ fn main() -> i32 = 0
             loop_value_facts: std::collections::HashMap::new(),
             control_value_facts: std::collections::HashMap::new(),
             walked_value_facts: std::collections::HashMap::new(),
+            walked_storage_facts: std::collections::HashMap::new(),
+            walked_backing_facts: std::collections::HashMap::new(),
+            pending_call_completions: std::collections::HashMap::new(),
+            mutable_call_argument_snapshots: std::collections::HashSet::new(),
+            borrow_mut_place_snapshots: std::collections::HashSet::new(),
             value_snapshot_frames: Vec::new(),
             reported_invalid_value_actions: std::collections::HashSet::new(),
             loop_iter_drops: Vec::new(),
@@ -50941,11 +54324,11 @@ fn main() -> i32 = 0
             borrowed_projection_locals: borrowed_projection_locals(&function.body),
         };
         assert!(
-            checker.intentional_borrow_mut_snapshot(call, MoveCheck::expr_key(&args[0])),
+            checker.intentional_action_snapshot(call, MoveCheck::expr_key(&args[0])),
             "the exact exclusive-argument snapshot is the one intentional generation transition",
         );
         assert!(
-            !checker.intentional_borrow_mut_snapshot(call, MoveCheck::expr_key(callee)),
+            !checker.intentional_action_snapshot(call, MoveCheck::expr_key(callee)),
             "a single borrow-mut argument must not suppress the callee snapshot",
         );
 
