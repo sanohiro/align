@@ -99,14 +99,23 @@ fn region_free_move_resource_reassign_keeps_the_new_flag_live() {
 }
 
 #[test]
-fn owned_call_result_stays_individual_with_an_arena_borrow_argument() {
-    // Escape Region conservatively follows the arena-backed argument, but the callee cannot return
-    // arena storage across its function boundary. The returned string is heap-owned on both writes.
+fn owned_call_result_forwards_cleanup_with_an_arena_borrow_argument() {
+    // Escape Region conservatively follows the arena-backed argument, but ownership is carried by
+    // the callee's path-selected cleanup bit. Both call results must forward that bit into `out`;
+    // the caller may not infer a constant from the argument region or the result type.
     let text = mir_text("fn copy(s: str) -> string = s.clone()\nfn main() -> i32 {\n  arena {\n    s := \"a\"\n    source := template \"{s}b\"\n    mut out := copy(source)\n    out = copy(source)\n    return out.len() as i32\n  }\n}\n");
     let main = main_fn(&text);
-    assert!(
-        main.lines().filter(|line| line.contains("_3 <- true")).count() >= 2,
-        "owned call results must not inherit an argument's arena allocation mode:\n{main}"
+    assert_eq!(
+        main.matches("call_with_cleanup program copy(").count(),
+        2,
+        "both owned calls must return cleanup bits:\n{main}"
+    );
+    assert_eq!(
+        main.lines()
+            .filter(|line| line.trim_start().starts_with("_3 <- %"))
+            .count(),
+        2,
+        "both returned cleanup bits must be stored in the result flag:\n{main}"
     );
 }
 
@@ -144,14 +153,25 @@ fn reassign_consuming_runtime_no_double_free() {
 }
 
 #[test]
-fn arena_to_heap_reassign_sets_a_path_local_drop_flag() {
+fn arena_to_heap_reassign_forwards_a_path_local_drop_flag() {
     // `xs` starts arena-owned (flag false). Only the conditional reassign installs a heap value
-    // (flag true), so the shared exit conditionally drops it without ever freeing the arena pointer.
+    // whose callee-selected cleanup bit is forwarded, so the shared exit conditionally drops it
+    // without ever freeing the arena pointer.
     let text = mir_text("fn make() -> array<i64> = [1, 2, 3].to_array()\nfn main() -> i32 {\n  arena {\n    mut xs := [10, 20, 30, 40].to_array()\n    if xs[0] > 100 { xs = make() }\n  }\n  return 0\n}\n");
     let main = main_fn(&text);
     assert!(main.contains("_1 <- false"), "arena path must clear the flag:\n{main}");
-    assert!(main.contains("_1 <- true"), "heap replacement must set the flag:\n{main}");
-    assert!(main.contains("drop _0"), "the true flag edge must drop the slot:\n{main}");
+    assert!(
+        main.contains("call_with_cleanup program make()"),
+        "owned call must return a cleanup bit:\n{main}"
+    );
+    assert_eq!(
+        main.lines()
+            .filter(|line| line.trim_start().starts_with("_1 <- %"))
+            .count(),
+        1,
+        "heap replacement must store the returned cleanup bit:\n{main}"
+    );
+    assert!(main.contains("drop _0"), "the set flag edge must drop the slot:\n{main}");
 }
 
 #[test]
