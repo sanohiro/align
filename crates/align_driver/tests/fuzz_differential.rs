@@ -746,8 +746,66 @@ fn option_else_unwrap_computes_the_oracle_value() {
 // short-circuit point, a dropped payload, or a mis-propagated code all surface as a wrong exit code.
 // Codes are 1..120 (a distinct, byte-fitting nonzero); Ok payloads are i32 expressions. ---
 
+/// Run one generated `Result` program under a local deadline. This owner was quarantined after a
+/// generated executable stopped making progress; keeping the deadline at this boundary turns any
+/// recurrence into a seed-named failure instead of blocking the complete differential binary.
+fn run_result_program(
+    name: &str,
+    src: &str,
+    timeout: std::time::Duration,
+) -> Result<std::process::ExitStatus, String> {
+    let built = build_exe(name, src);
+    let mut child = std::process::Command::new(&built.exe)
+        .spawn()
+        .map_err(|error| format!("run generated Result program '{name}': {error}"))?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                let kill_error = child.kill().err();
+                let wait_error = child.wait().err();
+                return Err(format!(
+                    "poll generated Result program '{name}': {error}; kill error: {kill_error:?}; \
+                     reap error: {wait_error:?}"
+                ));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let kill_error = child.kill().err();
+            let wait_error = child.wait().err();
+            return Err(format!(
+                "generated Result program '{name}' exceeded {} milliseconds; kill error: \
+                 {kill_error:?}; reap error: {wait_error:?}",
+                timeout.as_millis()
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 #[test]
-#[ignore = "hangs indefinitely (HANDOFF: result_question_chain); run explicitly after triage"]
+fn result_program_deadline_reaps_a_nonterminating_child() {
+    if !backend_available() {
+        return;
+    }
+    let error = run_result_program(
+        "diffres-timeout-owner",
+        "fn main() -> i32 = loop {}\n",
+        std::time::Duration::from_millis(50),
+    )
+    .expect_err("an infinite generated program must reach the local deadline");
+    assert!(
+        error.contains("diffres-timeout-owner")
+            && error.contains("exceeded 50 milliseconds")
+            && error.contains("kill error: None")
+            && error.contains("reap error: None"),
+        "the timeout must identify the generated program and bound: {error}"
+    );
+}
+
+#[test]
 fn result_question_chain_computes_the_oracle_value() {
     if !backend_available() {
         return;
@@ -795,8 +853,13 @@ fn result_question_chain_computes_the_oracle_value() {
         );
         let final_val = wrap(oracle, ITy::I32);
         let expected = if cfg!(windows) { final_val as i32 } else { (final_val as i32 as u8) as i32 };
-        let out = build_and_run(&format!("diffres-{seed}"), &src);
-        let code = out.status.code().unwrap_or(-1);
+        let status = run_result_program(
+            &format!("diffres-{seed}"),
+            &src,
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        let code = status.code().unwrap_or(-1);
         assert_eq!(
             code, expected,
             "miscompile on seed {seed} ({tag} path): expected {expected} (oracle {oracle}), got {code}\n--- program ---\n{src}"
