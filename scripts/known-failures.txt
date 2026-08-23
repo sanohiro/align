@@ -34,9 +34,8 @@ reassign_drop	owned_call_result_stays_individual_with_an_arena_borrow_argument
 return_provenance	product_projection_summaries_select_exact_parameter_roots
 runway_a2_binary_codec	append_own_bytes_survives_reallocation
 unit_cache	a_descriptor_owning_unit_is_never_cached
-vectorize_shapes	canonical_indexed_loop_skeleton_raw
 
 # Triage of this baseline (see backlog for detail):
 #   A: five out-of-gate pkg.db cells (pkg_db_q5b1, pkg_db_q6, and the
 #      descriptor-owning unit_cache case) — owned by the db session
-#   B: the remaining five legacy reds — triaged one by one
+#   B: the remaining four legacy reds — triaged one by one
