@@ -402,10 +402,27 @@ fn mutation_k7_raw_is_not_vectorized() {
 fn fn_body(ir: &str, name: &str) -> String {
     // Match the `define` line itself, not the first `@name(` occurrence — a declare or a call
     // site earlier in the module would otherwise anchor the extraction to the wrong function.
-    let needle = format!("@{name}(");
+    // Ordinary program functions use the canonical collision-free symbol; retain the direct-name
+    // candidate for explicit exports and the C entry.
+    let encoded = format!(
+        "align_fn${}${}",
+        name.len(),
+        name.as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    let needles = [
+        format!("@{name}("),
+        format!("@\"{name}\"("),
+        format!("@{encoded}("),
+        format!("@\"{encoded}\"("),
+    ];
     let line = ir
         .lines()
-        .find(|l| l.starts_with("define ") && l.contains(&needle))
+        .find(|line| {
+            line.starts_with("define ") && needles.iter().any(|needle| line.contains(needle))
+        })
         .unwrap_or_else(|| panic!("no `define ... @{name}(` in:\n{ir}"));
     let start = line.as_ptr() as usize - ir.as_ptr() as usize;
     let rest = &ir[start..];
