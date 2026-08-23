@@ -127,13 +127,11 @@ fn http_request_ctx_field_type_checks() {
 }
 
 #[test]
-fn option_of_handle_field_stays_rejected() {
-    // `is_field_ok` admits a bare handle, and `Option<T>` recurses into its payload — so
-    // `Option<http_request_ctx>` would reach `is_field_ok = true`. But `drop_struct_fields` has no
-    // Option-with-Move-payload arm (it would leak the handle when `Some`), so the owned-Option-
-    // payload rejection (pass 0b-2) MUST still fire, keeping that leak path unreachable. Defense in
-    // depth pinned here because F1② made handle scalars field-eligible.
-    assert!(check_errs(
+fn option_of_handle_field_type_checks() {
+    // Tagged Move payloads use the recursive field/drop path, so an optional request context is a
+    // valid owning field. Runtime construction and destruction of tagged handles is covered by the
+    // tagged Move payload owner tests; this test pins the handle-specific field-formation surface.
+    assert!(!check_errs(
         "opt-handle",
         "H { x: Option<http_request_ctx> }\nfn main() -> Result<(), Error> { return Ok(()) }\n"
     ));
