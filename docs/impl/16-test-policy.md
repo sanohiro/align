@@ -169,10 +169,8 @@ scripts/cargo.sh test -p align_runtime --lib http_client
 scripts/cargo.sh test -p align_runtime --lib par_map
 ```
 
-`fuzz_differential` is an owner check for its other cases only:
-`result_question_chain_computes_the_oracle_value` hangs indefinitely (see
-HANDOFF.md) and carries `#[ignore]`, so it is triage-pending, not part of the
-running owner check, until that triage lands and the attribute comes off.
+`fuzz_differential` runs every deterministic oracle case, including the
+`Result` `?`-propagation chain, in its ordinary owner target.
 
 A correctness-only change that does not alter a performance path uses its owner
 target and the bounded code gate. Network, filesystem, timeout, process, and fd

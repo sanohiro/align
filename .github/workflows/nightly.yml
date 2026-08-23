@@ -135,11 +135,7 @@ jobs:
         run: scripts/check-libpq-version.sh
 
       # The db-required suites run in skip/SQLite-only mode here (no PostgreSQL
-      # service); the per-PR required CI job owns that coverage. The one known
-      # hang (HANDOFF.md: fuzz_differential::result_question_chain_computes_the_
-      # oracle_value, pre-existing) carries #[ignore] at its definition, so it
-      # is excluded by default. Re-add `--ignored` once its triage lands and
-      # the attribute comes off.
+      # service); the per-PR required CI job owns that coverage.
       #
       # The script performs its own two-stage build — `cargo build` for the
       # runtime staticlib the driver tests link against, then the

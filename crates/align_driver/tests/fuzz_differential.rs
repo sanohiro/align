@@ -747,7 +747,6 @@ fn option_else_unwrap_computes_the_oracle_value() {
 // Codes are 1..120 (a distinct, byte-fitting nonzero); Ok payloads are i32 expressions. ---
 
 #[test]
-#[ignore = "hangs indefinitely (HANDOFF: result_question_chain); run explicitly after triage"]
 fn result_question_chain_computes_the_oracle_value() {
     if !backend_available() {
         return;

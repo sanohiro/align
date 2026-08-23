@@ -217,15 +217,6 @@ recorded in the manifest's own triage comment, and running
 locally. The job budget is 30 minutes and exceeding it is the signal, not
 something to raise.
 
-Known remaining pre-existing hang (found 2026-08-10, reproduced twice
-including a build without the owned-string validator change, both at CPU 0 for
-40+ minutes): `fuzz_differential::result_question_chain_computes_the_oracle_value`
-never completes. Its generators are integer-only Result chains, untouched by
-the owned-string validator work; triage the hang (likely a generated binary
-blocking) before relying on the nightly full-suite signal, which it will
-otherwise consume up to the job timeout (the test now carries `#[ignore]` so
-`cargo test` excludes it by default until then).
-
 The nightly's own findings are closed: the Gate-3 rejected-operand sentinel
 class (#745), the open-world callback rule that had broken `apps/web` since #672
 and the silent-empty-MIR break it hid (#742), the validator's private copy of
