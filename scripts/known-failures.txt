@@ -25,8 +25,6 @@
 # #781); burn-down list — delete lines as fixes land
 
 json_scan_identity	json_scan_cross_compiler_identity	env
-m5	json_scalar_array_str_element_rejected
-m5	json_scan_generic_return_context_inference_matrix
 owned_structs	move_struct_in_unsupported_containers_rejected
 pkg_db_q5b1	meta_query_rejects_non_live_execution_targets_before_materialization
 pkg_db_q6	layer1_case_fingerprints_match_the_golden
@@ -43,4 +41,4 @@ vectorize_shapes	canonical_indexed_loop_skeleton_raw
 # Triage of this baseline (see backlog for detail):
 #   A: five out-of-gate pkg.db cells (pkg_db_q5b1, pkg_db_q6, and the
 #      descriptor-owning unit_cache case) — owned by the db session
-#   B: the remaining nine legacy reds — triaged one by one
+#   B: the remaining seven legacy reds — triaged one by one
