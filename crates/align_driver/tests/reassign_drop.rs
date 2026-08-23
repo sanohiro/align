@@ -49,6 +49,43 @@ fn count_slot_drops(text: &str, slot: &str) -> usize {
         .count()
 }
 
+/// Assert that every cleanup bit returned by calls to `callee` is forwarded, in order, into the
+/// selected drop-flag slot. Matching the exact SSA ids keeps this owner sensitive to a lowering
+/// bug that stores a different boolean temporary in the flag.
+fn assert_call_cleanup_bits_forwarded(text: &str, callee: &str, flag_slot: &str, expected: usize) {
+    let main = main_fn(text);
+    let call_prefix = format!("call_with_cleanup program {callee}(");
+    let cleanup_ids = main
+        .lines()
+        .filter(|line| line.contains(&call_prefix))
+        .map(|line| {
+            let (_, id) = line
+                .rsplit_once(" -> %")
+                .unwrap_or_else(|| panic!("cleanup call has no returned SSA id:\n{line}"));
+            assert!(
+                !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()),
+                "cleanup call has a malformed returned SSA id:\n{line}"
+            );
+            id
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        cleanup_ids.len(),
+        expected,
+        "unexpected cleanup-call count for {callee}:\n{main}"
+    );
+
+    let store_prefix = format!("{flag_slot} <- %");
+    let stored_ids = main
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix(&store_prefix))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stored_ids, cleanup_ids,
+        "each returned cleanup bit must be stored in {flag_slot}:\n{main}"
+    );
+}
+
 #[test]
 fn mir_reassign_drops_old_string() {
     // `s` is slot _0 (the only local). It is reassigned once, then dropped at the function exit:
@@ -104,19 +141,7 @@ fn owned_call_result_forwards_cleanup_with_an_arena_borrow_argument() {
     // the callee's path-selected cleanup bit. Both call results must forward that bit into `out`;
     // the caller may not infer a constant from the argument region or the result type.
     let text = mir_text("fn copy(s: str) -> string = s.clone()\nfn main() -> i32 {\n  arena {\n    s := \"a\"\n    source := template \"{s}b\"\n    mut out := copy(source)\n    out = copy(source)\n    return out.len() as i32\n  }\n}\n");
-    let main = main_fn(&text);
-    assert_eq!(
-        main.matches("call_with_cleanup program copy(").count(),
-        2,
-        "both owned calls must return cleanup bits:\n{main}"
-    );
-    assert_eq!(
-        main.lines()
-            .filter(|line| line.trim_start().starts_with("_3 <- %"))
-            .count(),
-        2,
-        "both returned cleanup bits must be stored in the result flag:\n{main}"
-    );
+    assert_call_cleanup_bits_forwarded(&text, "copy", "_3", 2);
 }
 
 #[test]
@@ -160,17 +185,7 @@ fn arena_to_heap_reassign_forwards_a_path_local_drop_flag() {
     let text = mir_text("fn make() -> array<i64> = [1, 2, 3].to_array()\nfn main() -> i32 {\n  arena {\n    mut xs := [10, 20, 30, 40].to_array()\n    if xs[0] > 100 { xs = make() }\n  }\n  return 0\n}\n");
     let main = main_fn(&text);
     assert!(main.contains("_1 <- false"), "arena path must clear the flag:\n{main}");
-    assert!(
-        main.contains("call_with_cleanup program make()"),
-        "owned call must return a cleanup bit:\n{main}"
-    );
-    assert_eq!(
-        main.lines()
-            .filter(|line| line.trim_start().starts_with("_1 <- %"))
-            .count(),
-        1,
-        "heap replacement must store the returned cleanup bit:\n{main}"
-    );
+    assert_call_cleanup_bits_forwarded(&text, "make", "_1", 1);
     assert!(main.contains("drop _0"), "the set flag edge must drop the slot:\n{main}");
 }
 
