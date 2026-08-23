@@ -137,15 +137,14 @@ fn recursive_struct_still_rejected() {
 }
 
 #[test]
-fn move_struct_in_unsupported_containers_rejected() {
-    // A Move struct can't yet live where the container's drop is scalar-shaped and wouldn't recurse
-    // into the struct's owned fields (leak / double-free). Each must be a clean sema error.
-    // (A fixed *array* of Move structs is now supported — Slice 4a — see `owned_structs_arrays.rs`.)
+fn move_struct_in_tagged_containers_is_admitted() {
+    // L1b gives Option, Result, and user sums one recursive tagged DropPlan for Move payloads.
+    // `owned_tagged_payloads` owns runtime/control-flow cleanup; this original boundary fixture
+    // pins formation of all three tagged containers.
     let u = "User { name: string, age: i64 }\n";
-    // `Option` / `Result` / user-enum payloads (their drop frees a flat `{ptr,len}`, not a struct).
-    assert!(check_errs("ms-option", &format!("{u}fn f() -> Option<User> = Some(User{{name: \"a\".clone(), age: 1}})\nfn main() -> i32 = 0\n")));
-    assert!(check_errs("ms-result", &format!("{u}fn f() -> Result<User, Error> = Ok(User{{name: \"a\".clone(), age: 1}})\nfn main() -> i32 = 0\n")));
-    assert!(check_errs("ms-enum", &format!("{u}Wrap {{ W(User) }}\nfn main() -> i32 = 0\n")));
+    assert!(!check_errs("ms-option", &format!("{u}fn f() -> Option<User> = Some(User{{name: \"a\".clone(), age: 1}})\nfn main() -> i32 = 0\n")));
+    assert!(!check_errs("ms-result", &format!("{u}fn f() -> Result<User, Error> = Ok(User{{name: \"a\".clone(), age: 1}})\nfn main() -> i32 = 0\n")));
+    assert!(!check_errs("ms-enum", &format!("{u}Wrap {{ W(User) }}\nfn main() -> i32 = 0\n")));
 }
 
 #[test]
