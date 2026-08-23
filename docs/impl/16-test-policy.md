@@ -170,7 +170,9 @@ scripts/cargo.sh test -p align_runtime --lib par_map
 ```
 
 `fuzz_differential` runs every deterministic oracle case, including the
-`Result` `?`-propagation chain, in its ordinary owner target.
+`Result` `?`-propagation chain, in its ordinary owner target. The Result-chain
+owner gives each generated executable a five-second deadline and has a direct
+nonterminating-child regression for kill/reap cleanup.
 
 A correctness-only change that does not alter a performance path uses its owner
 target and the bounded code gate. Network, filesystem, timeout, process, and fd
