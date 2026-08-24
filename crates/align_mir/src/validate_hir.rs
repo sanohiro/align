@@ -603,6 +603,12 @@ fn summary_valid(
                                 &program.tuples,
                                 &program.enums,
                                 &program.tagged_types,
+                            ) || align_sema::ty_is_move(
+                                ty,
+                                &program.structs,
+                                &program.tuples,
+                                &program.enums,
+                                &program.tagged_types,
                             )
                         })
                     })

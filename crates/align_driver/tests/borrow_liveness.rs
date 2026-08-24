@@ -570,22 +570,8 @@ fn main() -> i32 {
     assert!(!check_errs("borrow-loop-break-moves-owned", src));
 }
 
-/// **KNOWN OVER-REJECTION — pinned so its fix is noticed. Not unsound; the safe direction.**
-///
-/// The scope-end-drop rule keys on the *type* boundary predicate `needs_drop_flag` (what puts a
-/// local in `Fn::drop_locals`), because `MoveCheck` runs **before** `EscapeCheck` and therefore
-/// cannot see the individual-vs-arena ownership bit. An array allocated **inside an enclosing
-/// `arena {}`** is arena-owned: its runtime drop flag is never set, MIR's back-edge
-/// `emit_drop_if_live` folds away, and nothing is freed until `arena_end`. So the view below stays
-/// valid for the whole arena and this program is rejected although it is safe.
-///
-/// The same shape with a **heap**-owned source (a `string` from `.clone()`, which is malloc'd even
-/// inside an arena) is a genuine use-after-free and *must* stay rejected — the two are
-/// indistinguishable to a type-level predicate, which is why the rule takes the conservative side.
-///
-/// The real fix is the recorded structural follow-up: borrow liveness belongs in the checked-HIR
-/// escape CFG, which already carries regions, ownership provenance, and loop fixpoints. When it
-/// moves there, flip this assertion.
+/// Arena-owned loop locals stay allocated until the enclosing `arena` exits. Their views may cross
+/// an iteration edge, unlike the same shape over a heap-owned local, which is dropped at the edge.
 #[test]
 fn over_rejects_a_view_of_an_arena_allocated_loop_local() {
     let src = "\
@@ -604,11 +590,86 @@ fn main() -> i32 {
   return 0
 }
 ";
+    let diagnostics = check_diagnostics("borrow-arena-loop-owner", src);
     assert!(
-        check_errs("borrow-arena-loop-over-reject", src),
-        "KNOWN OVER-REJECTION: this is safe (the array lives in the enclosing arena, freed only at \
-         `arena_end`). If it now checks, borrow liveness gained the ownership bit — flip this."
+        diagnostics.is_empty(),
+        "an arena-owned loop local lives until the enclosing arena exits:\n{diagnostics}"
     );
+
+    let heap_owned = "\
+fn main() -> i32 {
+  mut n := 0
+  arena {
+    mut keep: str := \"start\"
+    loop {
+      owned := \"heap-owned-loop-local\".clone()
+      keep = owned
+      n = n + 1
+      if n > 3 { break }
+    }
+    print(keep)
+  }
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("borrow-arena-loop-heap-owner", heap_owned);
+    assert!(
+        diagnostics.contains("use of invalidated borrow 'keep'")
+            && diagnostics.contains("source 'owned' was dropped at the end of the loop iteration"),
+        "a heap-owned loop local is still dropped at the iteration edge:\n{diagnostics}"
+    );
+
+    let arena_exit = "\
+fn main() -> i32 {
+  seed := [0]
+  mut keep: slice<i64> := seed
+  arena {
+    source := [1, 2, 3].to_array()
+    keep = source
+    _ := keep.len()
+  }
+  return keep.len() as i32
+}
+";
+    let diagnostics = check_diagnostics("borrow-arena-owner-exit", arena_exit);
+    assert!(
+        diagnostics.contains("use of invalidated borrow 'keep'"),
+        "the enclosing arena exit must end its generation before a later observer:\n{diagnostics}"
+    );
+
+    for (inner_name, inner_arena) in [
+        (
+            "anonymous-inner",
+            "    arena {\n      copied := \"outer-owned\".bytes().clone_in(outer)\n      alias = copied\n    }",
+        ),
+        (
+            "named-inner",
+            "    arena inner {\n      copied := \"outer-owned\".bytes().clone_in(outer)\n      alias = copied\n    }",
+        ),
+    ] {
+        let retained = format!(
+            "fn main() -> i32 {{\n  seed := \"seed\".bytes()\n  mut alias: slice<u8> := seed\n  arena outer {{\n    mut iteration := 0\n    loop {{\n      if iteration > 0 {{ _ := alias[0] }}\n{inner_arena}\n      iteration = iteration + 1\n      if iteration > 1 {{ break }}\n    }}\n    _ := alias[0]\n  }}\n  return 0\n}}\n"
+        );
+        let diagnostics = check_diagnostics(
+            &format!("borrow-outer-clone-in-{inner_name}-retained"),
+            &retained,
+        );
+        assert!(
+            diagnostics.is_empty(),
+            "clone_in(outer) formed in {inner_name} must survive that arena's exit and the loop iteration edge:\n{diagnostics}"
+        );
+
+        let ended = retained.replace(
+            "    _ := alias[0]\n  }\n  return 0",
+            "    _ := alias[0]\n  }\n  _ := alias[0]\n  return 0",
+        );
+        let diagnostics =
+            check_diagnostics(&format!("borrow-outer-clone-in-{inner_name}-ended"), &ended);
+        assert!(
+            diagnostics.contains("use of invalidated borrow 'alias'"),
+            "the outer arena exit must end clone_in(outer) formed in {inner_name}:\n{diagnostics}"
+        );
+    }
 }
 
 // --- The other half of a loop iteration's drop set: MIR's HIDDEN owners. A Move value with no
@@ -649,7 +710,10 @@ fn every_shape_that_materializes_a_temporary_owner_is_covered() {
     // sliced in place. All four printed garbage before the `IterTemp` root existed.
     let cases: [(&str, &str); 4] = [
         ("call", "keep = mk(\"AAAAAAAAAAAAAAAAAAAAAAAA\")"),
-        ("view-of-temp", "keep = identity(mk(\"AAAAAAAAAAAAAAAAAAAAAAAA\"))"),
+        (
+            "view-of-temp",
+            "keep = identity(mk(\"AAAAAAAAAAAAAAAAAAAAAAAA\"))",
+        ),
         ("try", "keep = mkr(\"AAAAAAAAAAAAAAAAAAAAAAAA\")?"),
         ("array-slice", "ks = [1, 2, 3].map(dbl).to_array()[..]"),
     ];
@@ -806,7 +870,10 @@ fn main() -> i32 {
   return r.name.len() as i32
 }
 ";
-    assert!(!check_errs("borrow-loop-move-struct-into-owner", owned_struct));
+    assert!(!check_errs(
+        "borrow-loop-move-struct-into-owner",
+        owned_struct
+    ));
 }
 
 #[test]
@@ -874,7 +941,10 @@ fn main() -> Result<(), Error> {
 fn a_block_wrapper_does_not_launder_a_view_of_a_dropped_source() {
     let cases: [(&str, &str); 7] = [
         ("bare", "keep = { inner }"),
-        ("decl-inside", "keep = { made := mk(\"AAAAAAAAAAAAAAAA\"); made }"),
+        (
+            "decl-inside",
+            "keep = { made := mk(\"AAAAAAAAAAAAAAAA\"); made }",
+        ),
         ("unsafe", "keep = unsafe { inner }"),
         ("task-group", "keep = task_group { inner }"),
         (
@@ -951,10 +1021,7 @@ fn main() -> i32 {
   return 0
 }
 ";
-    assert!(!check_errs(
-        "borrow-task-group-outer-source",
-        task_group_ok
-    ));
+    assert!(!check_errs("borrow-task-group-outer-source", task_group_ok));
 }
 
 /// **KNOWN OVER-REJECTION — the third of the family, pinned so a reader doesn't assume otherwise.**
@@ -1267,7 +1334,10 @@ fn main() -> i32 {
 }
 ",
     );
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "start-0-1-2-3-4");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "start-0-1-2-3-4"
+    );
 }
 
 /// **The second hole the exhaustiveness sweep found.** A sum-type constructor is the exact sibling
@@ -1463,4 +1533,527 @@ fn main() -> i32 {
         "storing the template's `str` into a struct field must carry its provenance, not launder \
          it: {diags}"
     );
+}
+
+#[test]
+fn storage_generation_move_replacement_cleanup_control_matrix() {
+    let mut failures = Vec::new();
+
+    for (name, src, expected_invalidated) in [
+        (
+            "move-preserves-alias",
+            "fn main() -> i32 {\n  mut source := [1, 2].to_array()\n  alias: slice<i64> := source\n  moved := source\n  _ := moved.len()\n  _ := alias.len()\n  return 0\n}\n",
+            false,
+        ),
+        (
+            "replacement-ends-alias",
+            "fn main() -> i32 {\n  mut source := [1, 2].to_array()\n  alias: slice<i64> := source\n  source = [3, 4].to_array()\n  _ := alias.len()\n  return 0\n}\n",
+            true,
+        ),
+        (
+            "replacement-reborrow",
+            "fn main() -> i32 {\n  mut source := [1, 2].to_array()\n  mut alias: slice<i64> := source\n  source = [3, 4].to_array()\n  alias = source\n  _ := alias.len()\n  return 0\n}\n",
+            false,
+        ),
+    ] {
+        let diagnostics = check_diagnostics(&format!("storage-generation-{name}"), src);
+        let invalidated = diagnostics.contains("use of invalidated borrow 'alias'");
+        if invalidated != expected_invalidated || (!expected_invalidated && !diagnostics.is_empty())
+        {
+            failures.push(format!(
+                "move/replacement case `{name}` had the wrong generation result:\n{diagnostics}"
+            ));
+        }
+    }
+
+    for (name, src) in [
+        (
+            "dynamic-local",
+            "fn main() -> i32 {\n  mut source := [1, 2].to_array()\n  alias: slice<i64> := source\n  source = source\n  _ := alias.len()\n  return 0\n}\n",
+        ),
+        (
+            "fixed-local",
+            "fn main() -> i32 {\n  mut source := [1, 2]\n  alias: slice<i64> := source\n  source = source\n  _ := alias.len()\n  return 0\n}\n",
+        ),
+        (
+            "copy-view",
+            "fn main() -> i32 {\n  mut source := [1, 2]\n  mut view: slice<i64> := source\n  alias := view\n  view = view\n  _ := alias.len()\n  return 0\n}\n",
+        ),
+        (
+            "copy-view-field",
+            "Holder { values: slice<i64> }\nfn main() -> i32 {\n  source := [1, 2]\n  mut holder := Holder { values: source }\n  alias := holder.values\n  holder.values = holder.values\n  _ := alias.len()\n  return 0\n}\n",
+        ),
+    ] {
+        let diagnostics = check_diagnostics(&format!("storage-generation-self-{name}"), src);
+        if !diagnostics.is_empty() {
+            failures.push(format!(
+                "exact self-assignment `{name}` must be a generation no-op:\n{diagnostics}"
+            ));
+        }
+    }
+
+    for (name, src, expected) in [
+        (
+            "transparent-wrapper",
+            "fn main() -> i32 {\n  mut source := [1, 2].to_array()\n  alias: slice<i64> := source\n  source = { source }\n  _ := alias.len()\n  return 0\n}\n",
+            "use of invalidated borrow 'alias'",
+        ),
+        (
+            "different-place",
+            "fn main() -> i32 {\n  mut source := [1, 2].to_array()\n  alias: slice<i64> := source\n  replacement := [3, 4].to_array()\n  source = replacement\n  _ := alias.len()\n  return 0\n}\n",
+            "use of invalidated borrow 'alias'",
+        ),
+        (
+            "projected-owned-rejected",
+            "Holder { values: array<i64> }\nfn main() -> i32 {\n  mut holder := Holder { values: [1, 2].to_array() }\n  holder.values = holder.values\n  return 0\n}\n",
+            "field replacement of array<i64> is not supported yet",
+        ),
+    ] {
+        let diagnostics = check_diagnostics(&format!("storage-generation-self-{name}"), src);
+        if !diagnostics.contains(expected) {
+            failures.push(format!(
+                "non-exact or unsupported self-assignment control `{name}` must retain ordinary assignment behavior:\n{diagnostics}"
+            ));
+        }
+    }
+
+    for (shape, action) in [
+        (
+            "aggregate",
+            "_ := Holder { values: source, ignored: {sink} }",
+        ),
+        ("call", "_ := consume(source, {sink})"),
+    ] {
+        for (sink_name, sink) in [
+            ("later-return", "{ _ := alias.len()\n    return 7\n  }"),
+            ("later-exit", "{ _ := alias.len()\n    process.exit(7)\n  }"),
+            (
+                "later-abort",
+                "{ _ := alias.len()\n    process.abort()\n  }",
+            ),
+        ] {
+            let action = action.replace("{sink}", sink);
+            let process_import = if sink_name == "later-return" {
+                ""
+            } else {
+                "import std.process\n"
+            };
+            let src = format!(
+                "{process_import}Holder {{ values: array<i64>, ignored: i32 }}\nfn consume(values: array<i64>, ignored: i32) -> i32 = ignored\nfn probe() -> i32 {{\n  source := [1, 2].to_array()\n  alias: slice<i64> := source\n  {action}\n}}\nfn main() -> i32 = 0\n"
+            );
+            let diagnostics = check_diagnostics(
+                &format!("storage-generation-staged-{shape}-{sink_name}"),
+                &src,
+            );
+            if !diagnostics.is_empty() {
+                failures.push(format!(
+                    "the source-order owner for staged {shape} with {sink_name} must not perform its Move action before the later operand:\n{diagnostics}"
+                ));
+            }
+        }
+    }
+
+    let staged_shapes = [
+        ("direct-call", "_ := consume(source, {sink})"),
+        (
+            "fn-value-call",
+            "callee := consume\n  _ := callee(source, {sink})",
+        ),
+        ("struct", "_ := Holder { values: source, ignored: {sink} }"),
+        ("tuple", "_ := (source, {sink})"),
+        ("user-sum", "_ := Choice.Pair(source, {sink})"),
+    ];
+    let staged_prelude = "Holder { values: array<i64>, ignored: i64 }\nChoice { Pair(array<i64>, i64), Empty }\nfn consume(values: array<i64>, ignored: i64) -> i64 = ignored\n";
+
+    for &(shape, action) in &staged_shapes {
+        let nonfallthrough = action.replace("{sink}", "{ _ := source.len()\n    return 7; 0\n  }");
+        let src = format!(
+            "{staged_prelude}fn probe() -> i32 {{\n  source := [1, 2].to_array()\n  {nonfallthrough}\n}}\nfn main() -> i32 = 0\n"
+        );
+        let diagnostics = check_diagnostics(
+            &format!("storage-generation-staged-bound-{shape}-later-return"),
+            &src,
+        );
+        if !diagnostics.is_empty() {
+            failures.push(format!(
+                "a bound Move in {shape} must remain available to a later non-fallthrough operand until the parent action completes:\n{diagnostics}"
+            ));
+        }
+
+        let successful = action.replace("{sink}", "0");
+        let src = format!(
+            "{staged_prelude}fn main() -> i32 {{\n  source := [1, 2].to_array()\n  {successful}\n  return source.len() as i32\n}}\n"
+        );
+        let diagnostics = check_diagnostics(
+            &format!("storage-generation-staged-bound-{shape}-success"),
+            &src,
+        );
+        if !diagnostics.contains("use of moved value 'source'") {
+            failures.push(format!(
+                "a successful {shape} must perform the staged bound Move after every operand completes:\n{diagnostics}"
+            ));
+        }
+    }
+
+    for &(shape, action) in &staged_shapes {
+        let fallthrough = action.replace("{sink}", "{ source = [3, 4].to_array()\n    0\n  }");
+        let src = format!(
+            "{staged_prelude}fn main() -> i32 {{\n  mut source := [1, 2].to_array()\n  alias: slice<i64> := source\n  {fallthrough}\n  _ := source.len()\n  _ := alias.len()\n  return 0\n}}\n"
+        );
+        let diagnostics = check_diagnostics(
+            &format!("storage-generation-staged-rebind-{shape}-fallthrough"),
+            &src,
+        );
+        if !diagnostics.contains("use of invalidated borrow 'alias'")
+            || diagnostics.contains("use of moved value 'source'")
+        {
+            failures.push(format!(
+                "a later fallthrough rebind in {shape} must invalidate the completed old snapshot without consuming the rebound local:\n{diagnostics}"
+            ));
+        }
+
+        let nonfallthrough = action.replace(
+            "{sink}",
+            "{ source = [3, 4].to_array()\n    _ := source.len()\n    return 7; 0\n  }",
+        );
+        let src = format!(
+            "{staged_prelude}fn probe() -> i32 {{\n  mut source := [1, 2].to_array()\n  alias: slice<i64> := source\n  {nonfallthrough}\n}}\nfn main() -> i32 = 0\n"
+        );
+        let diagnostics = check_diagnostics(
+            &format!("storage-generation-staged-rebind-{shape}-later-return"),
+            &src,
+        );
+        if !diagnostics.is_empty() {
+            failures.push(format!(
+                "a later non-fallthrough rebind in {shape} must publish neither its old snapshot action nor a phantom Move of the rebound local:\n{diagnostics}"
+            ));
+        }
+    }
+
+    for (shape, action) in [
+        (
+            "aggregate",
+            "_ := Holder { values: [1, 2].to_array(), ignored: { return 7 } }",
+        ),
+        ("call", "_ := consume([1, 2].to_array(), { return 7 })"),
+    ] {
+        let src = format!(
+            "Holder {{ values: array<i64>, ignored: i32 }}\nfn consume(values: array<i64>, ignored: i32) -> i32 = ignored\nfn probe() -> i32 {{\n  {action}\n}}\nfn main() -> i32 = 0\n"
+        );
+        let diagnostics = check_diagnostics(
+            &format!("storage-generation-staged-{shape}-fresh-first-return"),
+            &src,
+        );
+        if !diagnostics.is_empty() {
+            failures.push(format!(
+                "a fresh first operand followed by a non-fallthrough operand must leave no staged action ({shape}):\n{diagnostics}"
+            ));
+        }
+    }
+
+    for (shape, action) in [
+        ("aggregate", "_ := Holder { values: source, ignored: 0 }"),
+        ("call", "_ := consume(source, 0)"),
+    ] {
+        let src = format!(
+            "Holder {{ values: array<i64>, ignored: i32 }}\nfn consume(values: array<i64>, ignored: i32) -> i32 = ignored\nfn main() -> i32 {{\n  source := [1, 2].to_array()\n  {action}\n  return source.len() as i32\n}}\n"
+        );
+        let diagnostics = check_diagnostics(
+            &format!("storage-generation-staged-{shape}-successful-action"),
+            &src,
+        );
+        if !diagnostics.contains("use of moved value 'source'") {
+            failures.push(format!(
+                "a successful staged {shape} must perform exactly one source Move after all operands complete:\n{diagnostics}"
+            ));
+        }
+    }
+
+    for (name, operator, rhs, expected_invalidated) in [
+        (
+            "and-joined-replacement",
+            "&&",
+            "{ source = [3, 4].to_array()\n    true\n  }",
+            true,
+        ),
+        (
+            "and-nonfallthrough",
+            "&&",
+            "{ source = [3, 4].to_array()\n    return 1\n  }",
+            false,
+        ),
+        (
+            "or-nonfallthrough",
+            "||",
+            "{ source = [3, 4].to_array()\n    return 1\n  }",
+            false,
+        ),
+    ] {
+        let src = format!(
+            "fn probe(condition: bool) -> i32 {{\n  mut source := [1, 2].to_array()\n  alias: slice<i64> := source\n  _ := condition {operator} {rhs}\n  _ := alias.len()\n  return 0\n}}\nfn main() -> i32 = 0\n"
+        );
+        let diagnostics =
+            check_diagnostics(&format!("storage-generation-short-circuit-{name}"), &src);
+        let invalidated = diagnostics.contains("use of invalidated borrow 'alias'");
+        if invalidated != expected_invalidated || (!expected_invalidated && !diagnostics.is_empty())
+        {
+            failures.push(format!(
+                "short-circuit case `{name}` joined the wrong post-expression state:\n{diagnostics}"
+            ));
+        }
+    }
+
+    for (name, body, expected_invalidated) in [
+        (
+            "ok-forwards-receiver",
+            "mut owner := \"ok\".clone()\n  view: str := owner\n  result: Result<str, ViewError> := Ok(view)\n  mapped := result.map_err(keep_error)\n  owner = \"replacement\".clone()\n  _ := match mapped { Ok(value) => value.len(), Err(_) => 0 }",
+            true,
+        ),
+        (
+            "ok-does-not-select-mapper-capture",
+            "mut owner := \"capture\".clone()\n  view: str := owner\n  result: Result<str, ViewError> := Ok(\"fixed\")\n  mapper := fn _: ViewError { ViewError.Text(view) }\n  mapped := result.map_err(mapper)\n  owner = \"replacement\".clone()\n  _ := match mapped { Ok(value) => value.len(), Err(_) => 0 }",
+            false,
+        ),
+        (
+            "err-selects-mapper-capture",
+            "mut owner := \"capture\".clone()\n  view: str := owner\n  result: Result<str, ViewError> := Err(ViewError.Fixed)\n  mapper := fn _: ViewError { ViewError.Text(view) }\n  mapped := result.map_err(mapper)\n  owner = \"replacement\".clone()\n  _ := match mapped { Ok(value) => value.len(), Err(error) => match error { Text(value) => value.len(), Fixed => 0 } }",
+            true,
+        ),
+    ] {
+        let src = format!(
+            "ViewError {{ Text(str), Fixed }}\nfn keep_error(error: ViewError) -> ViewError = error\nfn main() -> i32 {{\n  {body}\n  return 0\n}}\n"
+        );
+        let diagnostics = check_diagnostics(&format!("storage-generation-map-err-{name}"), &src);
+        let invalidated = diagnostics.contains("use of invalidated borrow 'mapped'");
+        if invalidated != expected_invalidated || (!expected_invalidated && !diagnostics.is_empty())
+        {
+            failures.push(format!(
+                "ResultMapErr case `{name}` selected the wrong projected owner:\n{diagnostics}"
+            ));
+        }
+    }
+
+    let owned_err = "\
+fn replace(values: array<i64>) -> array<i64> = [values.len()].to_array()
+fn main() -> i32 {
+  source := [1, 2].to_array()
+  alias: slice<i64> := source
+  result: Result<(), array<i64>> := Err(source)
+  mapped := result.map_err(replace)
+  _ := match mapped { Ok(_) => 0, Err(values) => values.len() }
+  _ := alias.len()
+  return 0
+}
+";
+    let diagnostics = check_diagnostics("storage-generation-map-err-owned-input", owned_err);
+    if !diagnostics.contains("use of invalidated borrow 'alias'") {
+        failures.push(format!(
+            "ResultMapErr must consume the owned Err input while publishing a distinct usable mapper result:\n{diagnostics}"
+        ));
+    }
+
+    let terminating_mapper = "\
+import std.process
+fn discard(values: array<i64>) -> i64 = values.len()
+fn probe() -> i32 {
+  source := [1, 2].to_array()
+  alias: slice<i64> := source
+  result: Result<(), array<i64>> := Err(source)
+  _ := result.map_err(if false { discard } else {
+    _ := alias.len()
+    process.abort()
+  })
+  return 0
+}
+fn main() -> i32 = 0
+";
+    let diagnostics = check_diagnostics(
+        "storage-generation-map-err-terminating-mapper",
+        terminating_mapper,
+    );
+    if !diagnostics.is_empty() {
+        failures.push(format!(
+            "a non-fallthrough mapper operand must leave its completed Err input live and publish no call action or result generation:\n{diagnostics}"
+        ));
+    }
+
+    for (name, read_prior, expected_invalidated) in [
+        ("latest-current", "", false),
+        ("ended-prior", "  _ := prior.len()\n", true),
+    ] {
+        let src = format!(
+            "fn main() -> i32 {{\n  mut values := [0].to_array()\n  mut prior: slice<i64> := values\n  mut latest: slice<i64> := values\n  mut n := 0\n  loop {{\n    values = [n].to_array()\n    if n == 0 {{\n      prior = values\n    }} else {{\n      latest = values\n      break\n    }}\n    n = n + 1\n  }}\n  _ := latest.len()\n{read_prior}  return 0\n}}\n"
+        );
+        let diagnostics = check_diagnostics(&format!("storage-generation-recency-{name}"), &src);
+        let invalidated = diagnostics.contains("use of invalidated borrow 'prior'");
+        if invalidated != expected_invalidated || (!expected_invalidated && !diagnostics.is_empty())
+        {
+            failures.push(format!(
+                "Current/Prior case `{name}` resolved the wrong producer generation:\n{diagnostics}"
+            ));
+        }
+    }
+
+    for (name, read_prior, expected_invalidated) in [
+        ("latest-content", "", false),
+        ("prior-content", "    _ := prior[0].len()\n", true),
+    ] {
+        let src = format!(
+            "fn main() -> i32 {{\n  mut old_owner := \"old\".clone()\n  old_view: str := old_owner\n  new_owner := \"new\".clone()\n  new_view: str := new_owner\n  arena {{\n    mut values := [\"seed\"].to_array()\n    mut prior: slice<str> := values\n    mut latest: slice<str> := values\n    mut first := true\n    loop {{\n      values = [\"seed\"].to_array()\n      if first {{\n        prior = values\n        prior[0] = old_view\n        first = false\n      }} else {{\n        latest = values\n        latest[0] = new_view\n        break\n      }}\n    }}\n    old_owner = \"replacement\".clone()\n    _ := latest[0].len()\n{read_prior}  }}\n  return 0\n}}\n"
+        );
+        let diagnostics = check_diagnostics(&format!("storage-generation-recency-{name}"), &src);
+        let invalidated = diagnostics.contains("use of invalidated borrow 'prior'")
+            && diagnostics.contains("source 'old_owner'");
+        if invalidated != expected_invalidated || (!expected_invalidated && !diagnostics.is_empty())
+        {
+            failures.push(format!(
+                "Current/Prior content case `{name}` must keep new Current content distinct from the arena-live Prior generation:\n{diagnostics}"
+            ));
+        }
+    }
+
+    for (name, src) in [
+        (
+            "fixed-copy-keeps-source",
+            "fn main() -> i32 {\n  mut source := [1, 2]\n  alias: slice<i64> := source\n  copied := source\n  _ := copied[0]\n  _ := alias.len()\n  return 0\n}\n",
+        ),
+        (
+            "assigned-view-field-move",
+            "Holder { values: slice<i64> }\nfn main() -> i32 {\n  first := [1, 2].to_array()\n  second := [3, 4].to_array()\n  second_view: slice<i64> := second\n  mut holder := Holder { values: first }\n  holder.values = second_view\n  alias := holder.values\n  moved := second\n  _ := moved.len()\n  _ := alias.len()\n  return 0\n}\n",
+        ),
+        (
+            "tuple-binding-move",
+            "fn keep(value: i64) -> bool = value > 0\nfn main() -> i32 {\n  (selected, _) := [1, 2].partition(keep)\n  alias: slice<i64> := selected\n  moved := selected\n  _ := moved.len()\n  _ := alias.len()\n  return 0\n}\n",
+        ),
+        (
+            "match-binding-move",
+            "Choice { Values(array<i64>), Empty }\nfn main() -> i32 {\n  choice := Choice.Values([1, 2].to_array())\n  return match choice {\n    Values(values) => {\n      alias: slice<i64> := values\n      moved := values\n      _ := moved.len()\n      _ := alias.len()\n      0\n    }\n    Empty => 0\n  }\n}\n",
+        ),
+    ] {
+        let diagnostics = check_diagnostics(
+            &format!("storage-generation-projected-transfer-{name}"),
+            src,
+        );
+        if !diagnostics.is_empty() {
+            failures.push(format!(
+                "projected transfer case `{name}` must preserve the pre-Move alias:\n{diagnostics}"
+            ));
+        }
+    }
+
+    for (name, src) in [
+        (
+            "dynamic-index",
+            "fn main() -> i32 {\n  old_owner := \"old\".clone()\n  old_view: str := old_owner\n  mut values := [old_view].to_array()\n  snapshot := values[0]\n  mut new_owner := \"new\".clone()\n  new_view: str := new_owner\n  values[0] = new_view\n  new_owner = \"replacement\".clone()\n  _ := snapshot.len()\n  return 0\n}\n",
+        ),
+        (
+            "soa-elem-field",
+            "import core.json\nRow { value: str }\nfn main() -> Result<(), Error> {\n  old_owner := \"old\".clone()\n  old_view: str := old_owner\n  mut new_owner := \"new\".clone()\n  new_view: str := new_owner\n  arena {\n    mut rows: soa<Row> := json.decode(\"[{\\\"value\\\":\\\"seed\\\"}]\")?\n    rows[0].value = old_view\n    snapshot := rows[0].value\n    rows[0].value = new_view\n    new_owner = \"replacement\".clone()\n    _ := snapshot.len()\n  }\n  return Ok(())\n}\n",
+        ),
+    ] {
+        let diagnostics =
+            check_diagnostics(&format!("storage-generation-scalar-snapshot-{name}"), src);
+        if !diagnostics.is_empty() {
+            failures.push(format!(
+                "scalar snapshot `{name}` must not become a live header observer:\n{diagnostics}"
+            ));
+        }
+    }
+
+    for (name, selection) in [
+        ("if", "if condition { live } else { return 1; dead }"),
+        (
+            "match",
+            "match Some(condition) { Some(_) => live, None => { return 1; dead } }",
+        ),
+        ("else-unwrap", "Some(live) else { return 1; dead }"),
+    ] {
+        let src = format!(
+            "fn probe(condition: bool) -> i32 {{\n  live_owner := [1].to_array()\n  mut dead_owner := [2].to_array()\n  live: slice<i64> := live_owner\n  dead: slice<i64> := dead_owner\n  selected := {selection}\n  dead_owner = [3].to_array()\n  _ := selected.len()\n  return 0\n}}\nfn main() -> i32 = 0\n"
+        );
+        let diagnostics = check_diagnostics(
+            &format!("storage-generation-fallthrough-header-{name}"),
+            &src,
+        );
+        if !diagnostics.is_empty() {
+            failures.push(format!(
+                "control result `{name}` must exclude the non-fallthrough tail header:\n{diagnostics}"
+            ));
+        }
+    }
+
+    for (name, src, ending) in [
+        (
+            "consumed-after-move",
+            "fn consume(values: array<i64>) -> i64 = values.len()\nfn main() -> i32 {\n  source := [1, 2].to_array()\n  alias: slice<i64> := source\n  moved := source\n  _ := consume(moved)\n  _ := alias.len()\n  return 0\n}\n",
+            "was moved or reassigned",
+        ),
+        (
+            "dropped-after-move",
+            "fn main() -> i32 {\n  seed := [0]\n  mut alias: slice<i64> := seed\n  loop {\n    source := [1, 2].to_array()\n    alias = source\n    moved := source\n    _ := moved.len()\n    break\n  }\n  _ := alias.len()\n  return 0\n}\n",
+            "was dropped at the end of the loop iteration",
+        ),
+    ] {
+        let diagnostics = check_diagnostics(&format!("storage-generation-release-end-{name}"), src);
+        if !(diagnostics.contains("use of invalidated borrow 'alias'")
+            && diagnostics.contains("source 'moved'")
+            && diagnostics.contains(ending))
+        {
+            failures.push(format!(
+                "release ending `{name}` must follow the post-Move owner:\n{diagnostics}"
+            ));
+        }
+    }
+
+    for (name, after_loop, expected_invalidated) in [
+        (
+            "break-transfer-keeps-alias",
+            "_ := result.len()\n  _ := alias.len()",
+            false,
+        ),
+        (
+            "result-consume-ends-alias",
+            "_ := consume(result)\n  _ := alias.len()",
+            true,
+        ),
+    ] {
+        let src = format!(
+            "fn consume(values: array<i64>) -> i64 = values.len()\nfn main() -> i32 {{\n  seed := [0]\n  mut alias: slice<i64> := seed\n  result := loop {{\n    source := [1, 2].to_array()\n    alias = source\n    break source\n  }}\n  {after_loop}\n  return 0\n}}\n"
+        );
+        let diagnostics =
+            check_diagnostics(&format!("storage-generation-loop-result-{name}"), &src);
+        let invalidated = diagnostics.contains("use of invalidated borrow 'alias'");
+        if invalidated != expected_invalidated || (!expected_invalidated && !diagnostics.is_empty())
+        {
+            failures.push(format!(
+                "loop-result release transfer `{name}` ended the wrong generation:\n{diagnostics}"
+            ));
+        }
+    }
+
+    for (name, body, expected_invalidated) in [
+        (
+            "old-backing-ended",
+            "mut old_source := [\"old\"].to_array()\n  alias: slice<str> := old_source\n  holder := fn { alias[0] }\n  old_source = [\"replacement\"].to_array()\n  _ := holder().len()",
+            true,
+        ),
+        (
+            "new-backing-only-ended",
+            "old_source := [\"old\"].to_array()\n  mut alias: slice<str> := old_source\n  holder := fn { alias[0] }\n  mut new_source := [\"new\"].to_array()\n  alias = new_source\n  new_source = [\"replacement\"].to_array()\n  _ := holder().len()",
+            false,
+        ),
+    ] {
+        let src = format!("fn main() -> i32 {{\n  {body}\n  return 0\n}}\n");
+        let diagnostics =
+            check_diagnostics(&format!("storage-generation-closure-capture-{name}"), &src);
+        let invalidated = diagnostics.contains("use of invalidated borrow 'holder'");
+        if invalidated != expected_invalidated || (!expected_invalidated && !diagnostics.is_empty())
+        {
+            failures.push(format!(
+                "closure capture `{name}` must retain the backing selected when the closure was formed:\n{diagnostics}"
+            ));
+        }
+    }
+
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }

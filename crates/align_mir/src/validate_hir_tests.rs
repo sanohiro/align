@@ -1490,10 +1490,30 @@ fn malformed_hir_declaration_header_metadata_fails_closed() {
             captures: Vec::new(),
         };
     });
-    assert_one_header_mutation("stored-summary-non-borrowable", &summary_base, |program| {
-        program.fns[0].locals[1].ty = Ty::String;
+    let mut move_summary = summary_base.clone();
+    move_summary.fns[0].locals[1].ty = Ty::String;
+    assert!(
+        validate_hir::declaration_header_metadata_is_valid(&move_summary),
+        "a by-value Move parameter may supply ownership provenance",
+    );
+    assert_one_header_mutation("stored-summary-non-provenance-capable", &summary_base, |program| {
+        program.fns[0].locals[1].ty = Ty::Int(align_sema::IntTy {
+            bits: 64,
+            signed: true,
+        });
         program.fns[0].return_borrow = ReturnBorrowSummary::Roots {
             params: vec![1],
+            captures: Vec::new(),
+        };
+        program.fns[0].return_region = ReturnRegionSummary::Roots {
+            params: vec![1],
+            captures: Vec::new(),
+        };
+    });
+    assert_one_header_mutation("stored-summary-mismatched-move-root", &summary_base, |program| {
+        program.fns[0].locals[1].ty = Ty::String;
+        program.fns[0].return_borrow = ReturnBorrowSummary::Roots {
+            params: vec![0],
             captures: Vec::new(),
         };
         program.fns[0].return_region = ReturnRegionSummary::Roots {

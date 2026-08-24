@@ -1880,6 +1880,34 @@ impl<'a> CapabilityAnalysis<'a> {
         let facts = self.eval_borrow(ty, type_params, &self.borrow);
         facts.intrinsic || facts.params.into_iter().any(|dependent| dependent)
     }
+
+    fn may_supply_return_provenance(&self, ty: &IType, type_params: &[ITypeParam]) -> bool {
+        self.may_borrow(ty, type_params)
+            || self.return_cleanup(ty, type_params)
+                == Some(align_sema::hir::ReturnCleanupAbi::DynamicBit)
+            || self.contains_noncleanup_move_builtin(ty)
+    }
+
+    fn contains_noncleanup_move_builtin(&self, ty: &IType) -> bool {
+        let mut work = vec![ty];
+        while let Some(current) = work.pop() {
+            match current {
+                IType::Tuple(elements) => work.extend(elements),
+                IType::Fn { .. } => {}
+                IType::Named { path, args } => {
+                    if align_sema::builtin_spelling_is_move(path) == Some(true)
+                        && align_sema::builtin_spelling_needs_return_cleanup(path) == Some(false)
+                    {
+                        return true;
+                    }
+                    if matches!(path.as_str(), "Option" | "Result") {
+                        work.extend(args);
+                    }
+                }
+            }
+        }
+        false
+    }
 }
 
 /// Authenticate decoded parallel-transfer roots against the complete interface type graph.
@@ -2321,10 +2349,10 @@ fn validate_import_summaries(
     analysis: &CapabilityAnalysis<'_>,
     type_params: &[ITypeParam],
 ) -> Result<(), ImportCompatibilityError> {
-    let ret_may_borrow = analysis.may_borrow(ret, type_params);
-    let param_may_borrow = params
+    let ret_may_supply_provenance = analysis.may_supply_return_provenance(ret, type_params);
+    let param_may_supply_provenance = params
         .iter()
-        .map(|param| analysis.may_borrow(&param.ty, type_params))
+        .map(|param| analysis.may_supply_return_provenance(&param.ty, type_params))
         .collect::<Vec<_>>();
     for roots in [
         match borrow {
@@ -2343,22 +2371,22 @@ fn validate_import_summaries(
     .into_iter()
     .flatten()
     {
-        if !ret_may_borrow {
+        if !ret_may_supply_provenance {
             return Err(ImportCompatibilityError::ReturnSummaryOnNonBorrowingType);
         }
         if !roots.1.is_empty() {
             return Err(ImportCompatibilityError::ReturnSummaryCaptureRoot);
         }
         for &index in roots.0 {
-            let Some((parameter, &may_borrow)) = params
+            let Some((parameter, &may_supply_provenance)) = params
                 .get(index as usize)
-                .zip(param_may_borrow.get(index as usize))
+                .zip(param_may_supply_provenance.get(index as usize))
             else {
                 return Err(ImportCompatibilityError::ReturnSummaryRootCannotBorrow(
                     index,
                 ));
             };
-            if !may_borrow
+            if !may_supply_provenance
                 && !matches!(parameter.mode, ParamMode::Borrow | ParamMode::BorrowMut)
             {
                 return Err(ImportCompatibilityError::ReturnSummaryRootCannotBorrow(

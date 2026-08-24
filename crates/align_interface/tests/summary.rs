@@ -1035,8 +1035,24 @@ fn semantic_import_rejects_return_roots_incapable_of_borrowing() {
     };
     assert_eq!(
         validate_for_import(&non_borrowing_root),
-        Err(align_interface::ImportCompatibilityError::ReturnSummaryRootCannotBorrow(0)),
-        "owned builtin handles must not be mistaken for generic nominal types"
+        Ok(()),
+        "Move parameters may supply ownership provenance even when they carry no borrowed field"
+    );
+
+    non_borrowing_root.fns[0].params[0].ty = IType::Named {
+        path: "Option".to_string(),
+        args: vec![IType::Named {
+            path: "box".to_string(),
+            args: vec![IType::Named {
+                path: "i64".to_string(),
+                args: vec![],
+            }],
+        }],
+    };
+    assert_eq!(
+        validate_for_import(&non_borrowing_root),
+        Ok(()),
+        "region-owned Move builtins may supply provenance without a cleanup bit"
     );
 
     for builtin in [

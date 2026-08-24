@@ -19,12 +19,12 @@ use align_span::{SourceMap, Span};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
-pub mod print;
 mod canonical_graph;
 mod generated_id;
+pub mod print;
+mod runtime_key;
 mod source_shape;
 mod validate_hir;
-mod runtime_key;
 
 pub use canonical_graph::{
     CanonicalCodecError, CanonicalFnAbi, CanonicalTy, FunctionTypeDef, ProgramCall,
@@ -109,8 +109,7 @@ pub struct Program {
     pub fns: Vec<Function>,
     /// Target-owned effect facts for functions named by SQLite callback descriptors. This table is
     /// recomputed from checked HIR bodies independently of each descriptor's copied effect bit.
-    pub sqlite_callback_effects:
-        std::collections::BTreeMap<ProgramCall, align_sema::FnEffect>,
+    pub sqlite_callback_effects: std::collections::BTreeMap<ProgramCall, align_sema::FnEffect>,
     /// Foreign (`extern "C"`) declarations, passed through from HIR unchanged; codegen emits an
     /// external LLVM declaration for each, keyed by the C symbol so a `Rvalue::Call` resolves.
     pub externs: Vec<ProgramExtern>,
@@ -230,11 +229,21 @@ fn combined_par_map_stage_work_weight(
         _ => stage
             .func
             .as_ref()
-            .map(|name| weights.get(name).copied().unwrap_or(PAR_MAP_DEFAULT_WORK_WEIGHT))
+            .map(|name| {
+                weights
+                    .get(name)
+                    .copied()
+                    .unwrap_or(PAR_MAP_DEFAULT_WORK_WEIGHT)
+            })
             .unwrap_or(0),
     });
     let total = stage_weights
-        .chain(std::iter::once(weights.get(terminal).copied().unwrap_or(PAR_MAP_DEFAULT_WORK_WEIGHT)))
+        .chain(std::iter::once(
+            weights
+                .get(terminal)
+                .copied()
+                .unwrap_or(PAR_MAP_DEFAULT_WORK_WEIGHT),
+        ))
         .map(u16::from)
         .fold(0u16, u16::saturating_add);
     match total {
@@ -257,11 +266,21 @@ fn annotate_par_map_work(fns: &mut [Function]) {
             for stmt in &mut block.stmts {
                 let Stmt::Let(_, rv) = stmt else { continue };
                 match rv {
-                    Rvalue::ParMapParallel { func, stages, work_weight, .. } => {
+                    Rvalue::ParMapParallel {
+                        func,
+                        stages,
+                        work_weight,
+                        ..
+                    } => {
                         *work_weight = combined_par_map_stage_work_weight(stages, func, &weights);
                     }
-                    Rvalue::ParMapReduce { func, work_weight, .. } => {
-                        *work_weight = weights.get(func).copied().unwrap_or(PAR_MAP_DEFAULT_WORK_WEIGHT);
+                    Rvalue::ParMapReduce {
+                        func, work_weight, ..
+                    } => {
+                        *work_weight = weights
+                            .get(func)
+                            .copied()
+                            .unwrap_or(PAR_MAP_DEFAULT_WORK_WEIGHT);
                     }
                     _ => {}
                 }
@@ -320,7 +339,11 @@ pub enum Stmt {
     /// for a read-only binding LLVM then forwards the constant and eliminates both the alloca and
     /// the copy. The slot keeps its fixed `array<T>` type (Copy) — this only replaces the `n`
     /// per-element stores, so it participates in no ownership/drop bookkeeping.
-    StoreConstArray { slot: Slot, elems: Vec<ConstElem>, elem: Ty },
+    StoreConstArray {
+        slot: Slot,
+        elems: Vec<ConstElem>,
+        elem: Ty,
+    },
     /// `ptr[index] <- value` — store into a raw element pointer (the buffer of an owned
     /// `array<T>` being filled). The element type comes from `value`.
     PtrStore(Operand, Operand, Operand),
@@ -329,11 +352,22 @@ pub enum Stmt {
     /// / `!noalias !{in}`. Emitted only for the `dst` store of a `map_into` loop whose source is a
     /// slice with a proven-disjoint root (sema's alias gate), so the vectorizer may drop its runtime
     /// overlap guard. See [`Rvalue::SliceIndexNoalias`] (the matching source load).
-    PtrStoreNoalias { ptr: Operand, index: Operand, value: Operand, scope: u32 },
+    PtrStoreNoalias {
+        ptr: Operand,
+        index: Operand,
+        value: Operand,
+        scope: u32,
+    },
     /// `s.store(i, v)` — store the `n` lanes of vector `value` into a `slice<T>` (`{ptr,len}`) at
     /// `index..index+n` (M6). Codegen GEPs the slice buffer to `&buf[index]` and emits a `<n x T>`
     /// store at the element alignment. Bounds are checked before this statement is emitted.
-    VecStore { slice: Operand, index: Operand, value: Operand, elem: Ty, n: u32 },
+    VecStore {
+        slice: Operand,
+        index: Operand,
+        value: Operand,
+        elem: Ty,
+        n: u32,
+    },
     /// `slot[index].f0.f1.… <- value` (struct-array element nested-field store). The field `path`
     /// (length ≥ 1) walks the element struct to the leaf being written; codegen GEPs
     /// `[0, index, *pfield(path)]` into the `[N x %Struct]` slot (each level through the
@@ -345,21 +379,44 @@ pub enum Stmt {
     /// map). `value` is a scalar (POD) leaf — sema gates `str`/owned fields off, since a
     /// pointer-based per-element drop of the overwritten field is not modeled. Bounds are checked
     /// (by [`Stmt`]s emitted before this one) via the loaded view length.
-    StoreElemFieldPtr { base: Operand, index: Operand, path: Vec<u32>, struct_id: u32, value: Operand },
+    StoreElemFieldPtr {
+        base: Operand,
+        index: Operand,
+        path: Vec<u32>,
+        struct_id: u32,
+        value: Operand,
+    },
     /// Store `value` into column `field` at row `index` of a `soa<Struct>` column-major buffer
     /// `base` (the [`Rvalue::SoaAlloc`] base pointer; `len` rows). The write counterpart of
     /// [`Rvalue::IndexColumn`] — codegen reuses its per-column `align_up` offset chain. Used by
     /// `to_soa` to scatter each AoS element's fields into their columns.
-    StoreColumn { base: Operand, len: Operand, index: Operand, field: u32, struct_id: u32, value: Operand },
+    StoreColumn {
+        base: Operand,
+        len: Operand,
+        index: Operand,
+        field: u32,
+        struct_id: u32,
+        value: Operand,
+    },
     /// End an arena, freeing all its allocations (the operand is the arena handle).
     ArenaEnd(Operand),
     /// `raw.free(p)` (unsafe): free a `raw` pointer from [`Rvalue::RawAlloc`]. Side-effecting, unit.
     RawFree(Operand),
     /// Finalize or destroy one generated direct-column batch payload.
-    ColumnBatchFinish { payload: Operand, struct_id: u32 },
-    ColumnBatchDrop { payload: Operand, struct_id: u32 },
+    ColumnBatchFinish {
+        payload: Operand,
+        struct_id: u32,
+    },
+    ColumnBatchDrop {
+        payload: Operand,
+        struct_id: u32,
+    },
     /// `raw.store(p, offset, v)` (unsafe): write the primitive scalar `value` at `ptr + offset` bytes.
-    RawStore { ptr: Operand, offset: Operand, value: Operand },
+    RawStore {
+        ptr: Operand,
+        offset: Operand,
+        value: Operand,
+    },
     /// Run all deferred tasks of a `task_group` and clear the list (`wait()`). Operand = the
     /// task-group handle. ④b-1 runs them sequentially; ④b-2 joins threads.
     TgWait(Operand),
@@ -391,7 +448,10 @@ pub enum Stmt {
     /// function-local and monotonic. Post-lowering MIR rewrites preserve this non-movable statement;
     /// validation locates its final block/statement position instead of retaining stale container
     /// coordinates in [`BorrowedElementGuard`]. Emits no backend instruction.
-    BorrowedElementReservation { token: u32, root: Slot },
+    BorrowedElementReservation {
+        token: u32,
+        root: Slot,
+    },
     /// Free the buffer of a free-standing owned `array<T>` *value* (a `{ptr,len}` operand that
     /// is not backed by a slot — an unbound `.to_array()` temporary consumed in place). Used to
     /// free the materialized buffer right after the loop that consumes it (null-safe).
@@ -410,8 +470,12 @@ pub enum ParMapStageKind {
     /// Compiler-generated pure `str.contains` filter. It carries one `str` needle capture and
     /// preserves the current `str` element for the stable count/prefix/scatter path.
     FilterStrContains,
-    Project { field: u32 },
-    FilterField { field: u32 },
+    Project {
+        field: u32,
+    },
+    FilterField {
+        field: u32,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -466,7 +530,10 @@ pub struct StaticDataRelocation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StaticDataTarget {
-    Bytes { bytes: Vec<u8>, nul_terminated: bool },
+    Bytes {
+        bytes: Vec<u8>,
+        nul_terminated: bool,
+    },
     Function(ProgramCall),
     /// Another immutable relocation-bearing record. The containing relocation receives the
     /// nested record's address; records are trees (never back-references), so lowering and
@@ -504,16 +571,30 @@ pub enum Rvalue {
     /// scalars (int / float / char); codegen picks truncate / sign-or-zero-extend (int→int),
     /// `sitofp`/`uitofp` (int→float), `fpext`/`fptrunc` (float→float), or the saturating
     /// `fptosi`/`fptoui` (float→int, no UB on overflow / NaN).
-    Cast { operand: Operand, from: Ty, to: Ty },
+    Cast {
+        operand: Operand,
+        from: Ty,
+        to: Ty,
+    },
     Bin(BinOp, Operand, Operand),
     /// Explicit-overflow integer arithmetic (`core.math`): `op` is `Add`/`Sub`/`Mul` on the
     /// integer type `int_ty`. `Saturating` → the clamped result (`int_ty`); `Checked` → an
     /// `Option<int_ty>` (`None` on overflow). Lowers to the LLVM `{s,u}OP.sat` / `{s,u}OP.with.overflow`
     /// intrinsics (signedness from `int_ty`).
-    IntArith { op: BinOp, mode: align_sema::ArithMode, int_ty: Ty, a: Operand, b: Operand },
+    IntArith {
+        op: BinOp,
+        mode: align_sema::ArithMode,
+        int_ty: Ty,
+        a: Operand,
+        b: Operand,
+    },
     /// A scalar math builtin (`core.math`): `abs` (1 operand) / `min` / `max` (2). `ty` is the
     /// numeric operand/result type; lowers to the matching LLVM intrinsic (signedness/float from `ty`).
-    MathOp { fn_: align_sema::MathFn, ty: Ty, operands: Vec<Operand> },
+    MathOp {
+        fn_: align_sema::MathFn,
+        ty: Ty,
+        operands: Vec<Operand>,
+    },
     Call(DirectCall, Vec<Operand>),
     /// One immutable `pkg.db.sqlite.scalar_function` descriptor plus its generated reverse-C
     /// trampoline. This is a compile-time producer value, not a normal function pointer.
@@ -522,7 +603,10 @@ pub enum Rvalue {
     /// cleanup bit. Codegen defines both `result` and `cleanup` from the one physical call.
     CallWithCleanup(Box<DirectCallWithCleanup>),
     /// The address of a top-level function as a value (`Ty::Fn`) — a function pointer.
-    FnAddr { target: ProgramCall, signature: Box<FnSignatureFacts> },
+    FnAddr {
+        target: ProgramCall,
+        signature: Box<FnSignatureFacts>,
+    },
     /// A capturing closure value: the lifted function `lifted` (which takes the captures as
     /// trailing parameters) plus the captured values. Codegen copies the captures into a
     /// frame-local environment and builds `{ thunk_ptr, env_ptr }`, where the thunk unpacks the
@@ -560,11 +644,19 @@ pub enum Rvalue {
     Field(Slot, Vec<u32>),
     /// `cond ? a : b` — branchless select (LLVM `select`). `a`/`b` share a type; `cond` is `bool`.
     /// Used for branchless `where` reductions (`acc += cond ? value : identity`).
-    Select { cond: Operand, a: Operand, b: Operand },
+    Select {
+        cond: Operand,
+        a: Operand,
+        b: Operand,
+    },
     /// Project one column of a `soa<Struct>` value in `slot` (a `{ ptr, len }` column-major buffer)
     /// as the `field`-th column's `slice<FieldTy>` — `{ ptr + len * prefix_bytes, len }`, where
     /// `prefix_bytes` (the sizes of the preceding fields) is computed in codegen from `struct_id`.
-    SoaColumn { base: Slot, struct_id: u32, field: u32 },
+    SoaColumn {
+        base: Slot,
+        struct_id: u32,
+        field: u32,
+    },
     /// `Some(operand)` — build an `Option` aggregate (tag = Some).
     OptionSome(Operand),
     /// `None` — build an `Option` aggregate (tag = None); the type is the value's.
@@ -585,16 +677,33 @@ pub enum Rvalue {
     ResultUnwrapErr(Operand),
     /// `Type.Variant(payload…)` — build a sum-type aggregate `{ i32 tag, … }`: store the variant
     /// tag in field 0 and each payload operand in this variant's fields.
-    MakeEnum { enum_id: u32, variant: u32, payload: Vec<Operand> },
+    MakeEnum {
+        enum_id: u32,
+        variant: u32,
+        payload: Vec<Operand>,
+    },
     /// Build the builtin `Error` aggregate `{ i32 tag, i32 code }` from **runtime** `tag`/`code`
     /// operands — the one way a std runtime errno-status becomes an `Error` ([`make_error_from_status`]).
     /// Unlike [`Self::MakeEnum`] (a compile-time variant), the tag is computed at runtime, so the
     /// category (`NotFound`/`Invalid`/`Denied`) vs `Code(errno)` is selected branchlessly.
-    MakeError { enum_id: u32, tag: Operand, code: Operand },
+    MakeError {
+        enum_id: u32,
+        tag: Operand,
+        code: Operand,
+    },
     /// Whether a sum-type operand's tag equals `variant` (the `match`-arm test).
-    EnumTagEq { enum_id: u32, scrutinee: Operand, variant: u32 },
+    EnumTagEq {
+        enum_id: u32,
+        scrutinee: Operand,
+        variant: u32,
+    },
     /// The `slot`-th payload field of a sum-type operand for `variant` (valid only on that variant).
-    EnumPayload { enum_id: u32, variant: u32, slot: u32, operand: Operand },
+    EnumPayload {
+        enum_id: u32,
+        variant: u32,
+        slot: u32,
+        operand: Operand,
+    },
     /// Open a new arena; the value is its handle.
     ArenaBegin,
     /// Open a `task_group`; the value is its handle (a `*TaskGroup`).
@@ -603,11 +712,20 @@ pub enum Rvalue {
     /// task-group region, allocate the result slot there, and register the task. Yields the slot
     /// pointer (the `Task<R>` handle). `tg` = the task-group handle, `closure` = the `{fn, env}`
     /// value, `capture_tys` give the env layout (empty = non-capturing), `r` = the result scalar.
-    SpawnTask { tg: Operand, closure: Operand, capture_tys: Vec<Ty>, r: Ty, fallible: bool },
+    SpawnTask {
+        tg: Operand,
+        closure: Operand,
+        capture_tys: Vec<Ty>,
+        r: Ty,
+        fallible: bool,
+    },
     /// `wait()` as a value: join the task_group and yield its outcome. `fallible` → build
     /// `Result<(), Error>` from the runtime's lowest-spawn-index error code (`Ok(())` if `0`, else `Err(code)`);
     /// otherwise yields `()`.
-    TgWaitResult { tg: Operand, fallible: bool },
+    TgWaitResult {
+        tg: Operand,
+        fallible: bool,
+    },
     /// `heap.new(init)` in an arena: bump-allocate, store `init`, yield the `box` pointer.
     /// First operand is the arena handle, second is the initial value.
     HeapAlloc(Operand, Operand),
@@ -616,7 +734,10 @@ pub enum Rvalue {
     RawAlloc(Operand),
     /// Generated direct-column batch storage. The static producer supplies a concrete struct id;
     /// no package name, reflection, or artifact lookup reaches lowering.
-    ColumnBatchCreate { max_rows: Operand, struct_id: u32 },
+    ColumnBatchCreate {
+        max_rows: Operand,
+        struct_id: u32,
+    },
     ColumnBatchAppend {
         payload: Operand,
         inputs: Vec<ColumnBatchInput>,
@@ -638,16 +759,29 @@ pub enum Rvalue {
     /// `raw.null()` (unsafe): the null raw pointer constant for a native ABI argument or sentinel.
     RawNull,
     /// `raw.load(p, offset)` (unsafe): read the primitive `scalar` at `ptr + offset` bytes.
-    RawLoad { ptr: Operand, offset: Operand, scalar: align_sema::Scalar },
+    RawLoad {
+        ptr: Operand,
+        offset: Operand,
+        scalar: align_sema::Scalar,
+    },
     /// Load one native pointer-sized value from raw memory. This stays distinct from `RawLoad`:
     /// `raw` is not an aggregate payload [`align_sema::Scalar`], and a descriptor relocation is a
     /// pointer fact rather than a numeric or `layout(C)` value.
-    RawPointerLoad { ptr: Operand, offset: Operand },
+    RawPointerLoad {
+        ptr: Operand,
+        offset: Operand,
+    },
     /// Load one fixed `{raw data, i64 len}` slot from compiler-owned static descriptor storage and
     /// expose it as an allocation-free `str` view.
-    StaticDescriptorView { ptr: Operand, offset: u32 },
+    StaticDescriptorView {
+        ptr: Operand,
+        offset: u32,
+    },
     /// `raw.offset(p, n)` (unsafe): a new `raw` pointer `ptr + offset` bytes (pointer arithmetic).
-    RawOffset { ptr: Operand, offset: Operand },
+    RawOffset {
+        ptr: Operand,
+        offset: Operand,
+    },
     /// Safe null test used before transferring a native handle into a resource.
     RawIsNull(Operand),
     /// Opaque resource-pointer operations. The resource id is retained for validation and thunk
@@ -658,9 +792,18 @@ pub enum Rvalue {
         parent: Option<Operand>,
         abort_on_null: bool,
     },
-    ResourceBorrow { owner: Operand, resource: u32 },
-    ResourceRaw { reference: Operand, resource: u32 },
-    ResourceIntoRaw { owner: Operand, resource: u32 },
+    ResourceBorrow {
+        owner: Operand,
+        resource: u32,
+    },
+    ResourceRaw {
+        reference: Operand,
+        resource: u32,
+    },
+    ResourceIntoRaw {
+        owner: Operand,
+        resource: u32,
+    },
     ResourceViewFromRaw {
         owner: Operand,
         ptr: Operand,
@@ -683,80 +826,164 @@ pub enum Rvalue {
     IndexField(Slot, Operand, Vec<u32>),
     /// Build a `vecN<T>` register value `<n x elem>` from its lane operands — an `insertelement`
     /// chain over a poison vector (M6). `elem`/`n` give the vector type.
-    MakeVec { elems: Vec<Operand>, elem: Ty, n: u32 },
+    MakeVec {
+        elems: Vec<Operand>,
+        elem: Ty,
+        n: u32,
+    },
     /// Read lane `lane` of a vector operand (`extractelement`); the result is the element `elem`.
-    VecExtract { vec: Operand, lane: u32, elem: Ty },
+    VecExtract {
+        vec: Operand,
+        lane: u32,
+        elem: Ty,
+    },
     /// Write `value` into lane `lane` of vector `vec` (`insertelement`), yielding the new vector
     /// (M6 `v[lane] = x`, which then re-stores into the vector local).
-    VecInsert { vec: Operand, value: Operand, lane: u32 },
+    VecInsert {
+        vec: Operand,
+        value: Operand,
+        lane: u32,
+    },
     /// `vec.sum_where(mask)` — masked horizontal sum (M6): `select(mask, vec, 0)` then add all `n`
     /// lanes, yielding the element scalar `elem`.
-    VecSumWhere { vec: Operand, mask: Operand, elem: Ty, n: u32 },
+    VecSumWhere {
+        vec: Operand,
+        mask: Operand,
+        elem: Ty,
+        n: u32,
+    },
     /// `dot(a, b)` — the dot product of two `vecN<T>` (M6): multiply lane-wise then add all `n`
     /// lanes, yielding the element scalar `elem`.
-    VecDot { a: Operand, b: Operand, elem: Ty, n: u32 },
+    VecDot {
+        a: Operand,
+        b: Operand,
+        elem: Ty,
+        n: u32,
+    },
     /// `v.min()` / `v.max()` — the horizontal min/max of a `vecN<T>` (M6): fold the `n` lanes with
     /// the scalar min/max intrinsic, yielding the element scalar `elem`. `max` selects max vs min.
-    VecMinMax { vec: Operand, elem: Ty, n: u32, max: bool },
+    VecMinMax {
+        vec: Operand,
+        elem: Ty,
+        n: u32,
+        max: bool,
+    },
     /// `v.sum()` — the horizontal sum of a `vecN<T>` (M6): add all `n` lanes, yielding the element
     /// scalar `elem` (the unmasked sibling of [`VecSumWhere`]).
-    VecSum { vec: Operand, elem: Ty, n: u32 },
+    VecSum {
+        vec: Operand,
+        elem: Ty,
+        n: u32,
+    },
     /// Reduce a `mask` (`<N x i1>`) to a scalar `bool` that is true iff **any** lane is set
     /// (an OR-fold of the `n` lanes). Used by the vector `/`/`%` divisor guard:
     /// `any(divisor == 0)` → abort. Yields `Ty::Bool`.
-    MaskAny { mask: Operand, n: u32 },
+    MaskAny {
+        mask: Operand,
+        n: u32,
+    },
     /// `s.load(i)` — load `n` consecutive elements of a `slice<T>` (`{ptr,len}`) starting at `index`
     /// into a `<n x T>` vector (M6). Codegen GEPs `&buf[index]` and emits a `<n x T>` load. `align`
     /// is a *statically proven* load alignment in bytes (`Some(N)` only when the slice is a whole
     /// borrow of an `align(N)` binding and the address is a multiple of `N` — see
     /// `proven_vec_load_align`); `None` falls back to the element alignment. An over-stated `align`
     /// would be UB, so it defaults conservatively. Bounds are checked before this rvalue.
-    VecLoad { slice: Operand, index: Operand, elem: Ty, n: u32, align: Option<u32> },
+    VecLoad {
+        slice: Operand,
+        index: Operand,
+        elem: Ty,
+        n: u32,
+        align: Option<u32>,
+    },
     /// `base[index].field` for a `{ptr,len}` view of struct `struct_id` (an owned, dynamic
     /// `array<Struct>`, MMv2 slice 8d-2). Like [`IndexField`] but addressed through the loaded
     /// buffer pointer (`getelementptr %Struct, ptr, index, field`) rather than a stack slot, so a
     /// fused pipeline (`users.where(.active).score.sum()`) can run over a runtime-length AoS.
-    IndexFieldPtr { base: Operand, index: Operand, field: u32, struct_id: u32 },
+    IndexFieldPtr {
+        base: Operand,
+        index: Operand,
+        field: u32,
+        struct_id: u32,
+    },
     /// `base.field[index]` for a `soa<Struct>` view: `base` is the `{ptr,len}` column-major buffer,
     /// so column `field` begins at `ptr + len*prefix_bytes(field)` and element `index` is
     /// `column_base + index*field_size`. The SoA counterpart of [`Rvalue::IndexFieldPtr`] — a scan
     /// reads only the columns it touches.
-    IndexColumn { base: Operand, index: Operand, field: u32, struct_id: u32 },
+    IndexColumn {
+        base: Operand,
+        index: Operand,
+        field: u32,
+        struct_id: u32,
+    },
     /// `s[index]` — gather a **whole** `struct_id` value from a `soa<Struct>` (`{ptr,len}`
     /// column-major view) at `index`: load every column's element and build the struct aggregate (M6).
     /// The soa is primitive-only, so the gather copies — the result is a free Copy value.
-    SoaGather { base: Operand, index: Operand, struct_id: u32 },
+    SoaGather {
+        base: Operand,
+        index: Operand,
+        struct_id: u32,
+    },
     /// `base[index]` — load a **whole** struct element of `struct_id` from a `{ptr,len}` view of
     /// an owned, dynamic `array<Struct>` (GEP `%Struct, ptr, index`, then load the aggregate). The
     /// field-less analogue of [`Rvalue::IndexFieldPtr`]; emitted by `map(f)` whose `f` consumes a
     /// struct element by value (a fixed stack `array<Struct>` uses [`Rvalue::Index`] instead).
-    IndexPtr { base: Operand, index: Operand, struct_id: u32 },
+    IndexPtr {
+        base: Operand,
+        index: Operand,
+        struct_id: u32,
+    },
     /// `(e0, e1, ...)` — build a tuple aggregate value of `tuple_id` from its element operands
     /// (an anonymous LLVM struct, by value). The whole-value analogue of a struct literal.
-    MakeTuple { tuple_id: u32, elems: Vec<Operand> },
+    MakeTuple {
+        tuple_id: u32,
+        elems: Vec<Operand>,
+    },
     /// `recv.N` — extract element `index` from a tuple value (by value).
-    TupleIndex { tuple: Operand, index: u32 },
+    TupleIndex {
+        tuple: Operand,
+        index: u32,
+    },
     /// Borrow array `slot` (length `n`) as a slice value `{ &slot[0], n }`.
     MakeSlice(Slot, i128),
     /// Bump-allocate `count` elements of type `elem` in the arena `handle`; yields the
     /// element pointer (used to build an owned `array<T>` via [`Rvalue::MakeDynArray`]).
-    ArenaAlloc { handle: Operand, count: Operand, elem: Ty },
+    ArenaAlloc {
+        handle: Operand,
+        count: Operand,
+        elem: Ty,
+    },
     /// Heap-allocate `count` elements of type `elem` (free-standing owned array, outside any
     /// arena). Yields the element pointer; freed by a later [`Stmt::Drop`].
-    HeapAllocBuf { count: Operand, elem: Ty },
+    HeapAllocBuf {
+        count: Operand,
+        elem: Ty,
+    },
     /// Bump-allocate the **column-major buffer** for a `soa<Struct>` of `len` rows in the arena
     /// `handle`; yields the buffer base pointer. The total size is the end of the last column —
     /// codegen walks the same per-column `align_up` offset chain as [`Rvalue::IndexColumn`] from
     /// `struct_id`'s field sizes (`to_soa`).
-    SoaAlloc { handle: Operand, len: Operand, struct_id: u32 },
+    SoaAlloc {
+        handle: Operand,
+        len: Operand,
+        struct_id: u32,
+    },
     /// Build an owned `array<T>` value `{ ptr, len }` from a buffer pointer and a length.
-    MakeDynArray { ptr: Operand, len: Operand },
+    MakeDynArray {
+        ptr: Operand,
+        len: Operand,
+    },
     /// Column-oriented grouped aggregate (`group_by(.key).<op>(...)`): fold the i64 `vals` column by
     /// the i64 `keys` column into the caller `out_keys`/`out_vals` buffers (each sized to the column
     /// length), via the runtime `align_rt_group_{sum,min,max,count}_i64` per `op`. Yields the group
     /// count (i64). `keys`/`vals` are `{ptr,len}` slices (soa columns; `vals` is unused for `count`);
     /// `out_keys`/`out_vals` are buffer pointers (from [`Rvalue::HeapAllocBuf`]).
-    GroupAgg { keys: Operand, vals: Operand, out_keys: Operand, out_vals: Operand, op: hir::GroupOp },
+    GroupAgg {
+        keys: Operand,
+        vals: Operand,
+        out_keys: Operand,
+        out_vals: Operand,
+        op: hir::GroupOp,
+    },
     /// `group_by(.str_key).{sum,min,max}(.i64_value)` / `.count()` over a `soa<Struct>` with a **str
     /// key column** — the columnar counterpart of [`Self::GroupAggStr`]. `keys` is the `str` key
     /// column (`{ptr,len}` over `[AlignStr]`), `vals` the i64 value column (both soa columns; `vals`
@@ -764,7 +991,13 @@ pub enum Rvalue {
     /// `align_rt_group_{sum,min,max,count}_str_cols`, which interns the `str` keys to dense ids and
     /// aggregates. `out_keys` is a buffer of `str` views (borrowing the soa's string storage),
     /// `out_vals` a buffer of i64 aggregates; yields the group count (i64).
-    GroupAggStrCols { keys: Operand, vals: Operand, out_keys: Operand, out_vals: Operand, op: hir::GroupOp },
+    GroupAggStrCols {
+        keys: Operand,
+        vals: Operand,
+        out_keys: Operand,
+        out_vals: Operand,
+        op: hir::GroupOp,
+    },
     /// `group_by(.str_key).{sum,min,max}(.i64_value)` / `.count()` over an AoS `array<Struct>` (the
     /// dictionary-id rail). `base` is the source struct-array slot (a `{ptr,len}` over `[%Struct]`);
     /// codegen derives the per-row stride and the `key_field`/`value_field` byte offsets from the
@@ -772,7 +1005,15 @@ pub enum Rvalue {
     /// to dense ids and aggregates the values per group. `out_keys` is a buffer of `str` views
     /// (`AlignStr`s borrowing `base`), `out_vals` a buffer of i64 aggregates; yields the group count
     /// (i64). `value_field` is `None` for `count` (no value column); `op` selects the runtime entry.
-    GroupAggStr { base: Slot, struct_id: u32, key_field: u32, value_field: Option<u32>, op: hir::GroupOp, out_keys: Operand, out_vals: Operand },
+    GroupAggStr {
+        base: Slot,
+        struct_id: u32,
+        key_field: u32,
+        value_field: Option<u32>,
+        op: hir::GroupOp,
+        out_keys: Operand,
+        out_vals: Operand,
+    },
     /// `group_by(.str_key).agg(sum(.a), max(.b), count(), …)` over an AoS `array<Struct>` — the
     /// **fused multi-aggregate** str rail. One pass interns each `str` key once and folds every
     /// aggregate in `aggs` into its own column (the `HashMap<&str,[i64;K]>` shape). codegen derives the
@@ -780,31 +1021,65 @@ pub enum Rvalue {
     /// runtime spec table (`(val_off, op, out_vals)` each), and calls `align_rt_group_multi_str`.
     /// `out_keys` is a buffer of `str` views (borrowing `base`); `out_vals[j]` is aggregate `j`'s i64
     /// output column. Yields the group count (i64). `aggs[j].value_field` is `None` for `count`.
-    GroupAggMultiStr { base: Slot, struct_id: u32, key_field: u32, aggs: Vec<(hir::GroupOp, Option<u32>)>, out_keys: Operand, out_vals: Vec<Operand> },
+    GroupAggMultiStr {
+        base: Slot,
+        struct_id: u32,
+        key_field: u32,
+        aggs: Vec<(hir::GroupOp, Option<u32>)>,
+        out_keys: Operand,
+        out_vals: Vec<Operand>,
+    },
     /// `s.dict_encode(.key)` — intern the `str` `key_field` column of the AoS array-of-`struct_id` in
     /// slot `base` (codegen derives the per-row stride + key byte offset) into the caller `out_ids`
     /// (dense i64 ids, one per row) + `out_dict` (the `str` dictionary), via `align_rt_dict_encode_str`.
     /// Yields the dictionary size (distinct count, i64). `out_ids`/`out_dict` are [`Rvalue::HeapAllocBuf`]
     /// pointers.
-    DictEncode { base: Slot, struct_id: u32, key_field: u32, out_ids: Operand, out_dict: Operand },
+    DictEncode {
+        base: Slot,
+        struct_id: u32,
+        key_field: u32,
+        out_ids: Operand,
+        out_dict: Operand,
+    },
     /// Assemble a `dict_encoded` value from its three `{ptr,len}` slices `{ source, ids, dict }` (an
     /// anonymous 3-slice LLVM struct, by value). `source` borrows the AoS; `ids`/`dict` are owned.
-    MakeDictEncoded { source: Operand, ids: Operand, dict: Operand },
+    MakeDictEncoded {
+        source: Operand,
+        ids: Operand,
+        dict: Operand,
+    },
     /// Extract one of a `dict_encoded` slot's three `{ptr,len}` slices by index (`0` = source AoS,
     /// `1` = ids `array<i64>`, `2` = dict `array<str>`) — a load + extract, yielding the slice value.
-    DictField { base: Slot, idx: u32 },
+    DictField {
+        base: Slot,
+        idx: u32,
+    },
     /// Gather the strided `i64` `field` column of the AoS array-of-`struct_id` `source` (`{ptr,len}`)
     /// into the contiguous buffer `out` (`align_rt_gather_i64`) — the value projection of an encoded
     /// `group_by`. Yields unit.
-    GatherColumnI64 { source: Operand, struct_id: u32, field: u32, out: Operand },
+    GatherColumnI64 {
+        source: Operand,
+        struct_id: u32,
+        field: u32,
+        out: Operand,
+    },
     /// Label a dense-id column back to `str` views: `out[i] = dict[ids[i]]` over `n` ids
     /// (`align_rt_dict_lookup`) — the A2 result step. `ids`/`dict` are `{ptr,len}` slices, `out` a
     /// buffer pointer. Yields unit.
-    DictLookup { ids: Operand, n: Operand, dict: Operand, out: Operand },
+    DictLookup {
+        ids: Operand,
+        n: Operand,
+        dict: Operand,
+        out: Operand,
+    },
     /// `chunks(n)`: split the `{ptr,len}` slice `src` (element size `elem`) into length-`n`
     /// sub-slices, yielding an owned `array<slice<T>>` value `{ chunk_buf, count }` (via the
     /// runtime `align_rt_chunks`). The element slices borrow `src`.
-    Chunks { src: Operand, n: Operand, elem: Ty },
+    Chunks {
+        src: Operand,
+        n: Operand,
+        elem: Ty,
+    },
     /// `par_map(f)` over a `{ptr,len}` source `src` — apply the Pure `func` to each element in
     /// parallel (runtime `align_rt_par_map` + a generated whole-range kernel), materializing an
     /// owned `array<elem_out>` `{ out_buf, count }`. A chunk source is an `array<slice<T>>` view;
@@ -859,12 +1134,21 @@ pub enum Rvalue {
     /// / `!noalias !{out}`. The matching source load for [`Stmt::PtrStoreNoalias`]; the two share a
     /// scope id, and the `in`/`out` scopes are declared disjoint, which is what lets the vectorizer
     /// prove the loop's load and store never overlap.
-    SliceIndexNoalias { slice: Operand, index: Operand, scope: u32 },
+    SliceIndexNoalias {
+        slice: Operand,
+        index: Operand,
+        scope: u32,
+    },
     /// `recv[start..end]` — build a borrowed sub-view `{ base.ptr + start, len }` of the `{ptr,len}`
     /// `base` (a `str` / `slice` / owned-array value). `start` offsets the base pointer by whole
     /// `elem`-sized steps (`u8` bytes for a `str`); `len` is the sub-view length (`end - start`,
     /// computed by the caller). The bounds (`0 <= start <= end <= base.len`) are checked before this.
-    SubSlice { base: Operand, start: Operand, len: Operand, elem: Ty },
+    SubSlice {
+        base: Operand,
+        start: Operand,
+        len: Operand,
+        elem: Ty,
+    },
     /// A string literal — a `str` view `{ &bytes, len }` over a constant.
     StrLit(String),
     /// A top-level **aggregate constant** — a `slice<elem>` view `{ &rodata, len }` over a per-unit
@@ -872,7 +1156,10 @@ pub enum Rvalue {
     /// `Ty::Str` element array lays out as `[N x {ptr,len}]` (each pointing into the string pool),
     /// any other scalar as `[N x elem]`. The array-literal analogue of [`Rvalue::StrLit`]: it borrows
     /// nothing, is `Static`, and is never moved or dropped.
-    ConstArray { elems: Vec<ConstElem>, elem: Ty },
+    ConstArray {
+        elems: Vec<ConstElem>,
+        elem: Ty,
+    },
     /// A pointer to an immutable relocation-bearing record. This is a general object-data
     /// primitive: semantics and validation of a particular record belong to its MIR producer;
     /// codegen only lowers the checked byte image and relocations.
@@ -882,32 +1169,49 @@ pub enum Rvalue {
     StrClone(Operand),
     /// Copy a `str`/`bytes` view into the exact explicit arena handle, yielding a same-shaped view.
     /// Codegen emits the arena allocation and byte copy directly; there is no ambient allocator.
-    CloneIn { value: Operand, handle: Operand },
+    CloneIn {
+        value: Operand,
+        handle: Operand,
+    },
     /// `s.contains(n)` / `s.starts_with(p)` / `s.ends_with(s)` — a byte-oriented `str` predicate,
     /// yielding `bool` (`i1`). Both operands are `str` `{ptr,len}` views; backed by a runtime
     /// `memchr`-class scan. Pure read, no allocation.
-    StrPredicate { kind: hir::StrPredKind, haystack: Operand, needle: Operand },
+    StrPredicate {
+        kind: hir::StrPredKind,
+        haystack: Operand,
+        needle: Operand,
+    },
     /// Build a repeated-needle substring-search plan from an invariant `needle` `str` `{ptr,len}`
     /// (doc-13 §6.6 / §11 P3). Emitted **once before** a recognised where-pipeline loop
     /// (`xs.where(fn(s) = s.contains(NEEDLE)).…`); yields an owned [`Ty::StrFinder`] handle stored in a
     /// synthetic path-local owner slot (freed once on every exit path via the drop-flag machinery).
     /// Codegen splits the `{ptr,len}` and calls the allocator-class `align_rt_str_finder_new`. The
     /// needle bytes are copied into the plan, so the plan outlives the needle view.
-    StrFinderNew { needle: Operand },
+    StrFinderNew {
+        needle: Operand,
+    },
     /// Search `haystack` (a `str` `{ptr,len}` element) with a prepared [`Ty::StrFinder`] `plan`,
     /// yielding an `i64` byte index or `-1` (doc-13 §6.6). The per-element counterpart of
     /// [`Self::StrFinderNew`]; MIR compares the result `>= 0` to reproduce the `contains` predicate
     /// bit-identically. Codegen calls `align_rt_str_finder_find` (declared `memory(argmem: read)` —
     /// the search does no CPU-feature detection, which happened in `finder_new`). Pure read, no
     /// allocation.
-    StrFinderFind { plan: Operand, haystack: Operand },
+    StrFinderFind {
+        plan: Operand,
+        haystack: Operand,
+    },
     /// `s.trim()` / `s.trim_start()` / `s.trim_end()` — yield a borrowed sub-`str` `{ptr,len}` of
     /// the receiver with ASCII whitespace stripped from one or both ends. Pure read, no allocation;
     /// the result aliases the receiver's bytes.
-    StrTrim { kind: hir::StrTrimKind, recv: Operand },
+    StrTrim {
+        kind: hir::StrTrimKind,
+        recv: Operand,
+    },
     /// `builder()` / `builder(capacity)` — open a builder, yielding an opaque handle (MMv2 slice 7c).
     /// `capacity` (bytes) pre-sizes the backing buffer; 0 = default.
-    BuilderNew { capacity: Operand },
+    BuilderNew {
+        capacity: Operand,
+    },
     /// `b.write(s)` — append a `str` operand's bytes to the builder. Side-effecting; yields unit.
     BuilderWriteStr(Operand, Operand),
     /// `b.write_int(n)` — append a decimal integer (widened to `i64`) to the builder. Yields unit.
@@ -939,7 +1243,12 @@ pub enum Rvalue {
     /// `json.decode` into struct `struct_id`: parse the `str` `input` and fill the `out`
     /// struct slot. Yields an `i32` status (0 = ok). codegen builds the field table (names,
     /// type tags, byte offsets) and calls the runtime parser.
-    JsonDecode { struct_id: u32, input: Operand, out: Slot, arena: Option<Operand> },
+    JsonDecode {
+        struct_id: u32,
+        input: Operand,
+        out: Slot,
+        arena: Option<Operand>,
+    },
     /// Direct-owned record JSON decode. Its descriptor kinds materialize every text leaf into
     /// free-standing allocations; no arena operand is legal.
     JsonOwnedDecode {
@@ -950,78 +1259,145 @@ pub enum Rvalue {
     /// `json.decode` into an owned `array<elem>` (MMv2 slice 8c): parse a JSON array of scalars
     /// and write the materialized `{ptr,len}` into the `out` slot. Yields an `i32` status
     /// (0 = ok). `elem` is the element scalar (its kind/width gives the runtime element tag).
-    JsonDecodeArray { elem: Ty, input: Operand, out: Slot },
+    JsonDecodeArray {
+        elem: Ty,
+        input: Operand,
+        out: Slot,
+    },
     /// `json.decode` into a bare **scalar** (JSON completeness T1b): parse the whole input as one JSON
     /// number / bool and write it into the `out` scalar slot. Yields an `i32` status (0 = ok). `scalar`
     /// is the target (int / float / bool); its kind/width/sign give the runtime scalar tag.
-    JsonDecodeScalar { scalar: Ty, input: Operand, out: Slot },
+    JsonDecodeScalar {
+        scalar: Ty,
+        input: Operand,
+        out: Slot,
+    },
     /// `json.decode` into an owned `array<Struct>` (MMv2 slice 8d): parse a JSON array of objects
     /// into a freshly heap-allocated AoS and write the materialized `{ptr,len}` (len = element
     /// count) into the `out` slot. Yields an `i32` status (0 = ok). codegen builds the same field
     /// table as [`JsonDecode`] plus the element stride, and calls the runtime parser.
-    JsonDecodeStructArray { struct_id: u32, input: Operand, out: Slot, arena: Option<Operand> },
+    JsonDecodeStructArray {
+        struct_id: u32,
+        input: Operand,
+        out: Slot,
+        arena: Option<Operand>,
+    },
     /// `json.decode` straight into a column-major `soa<Struct>` (the direct-fill rail): parse a JSON
     /// array of objects directly into arena-allocated columns — no AoS intermediate, no transpose —
     /// and write the soa `{ptr,len}` view (len = row count) into the `out` slot. Yields an `i32`
     /// status (0 = ok). `arena` is the enclosing arena handle the runtime bump-allocates the column
     /// buffer from. codegen builds the same field table as [`JsonDecode`] and passes `arena`.
-    JsonDecodeSoa { struct_id: u32, input: Operand, out: Slot, arena: Operand },
+    JsonDecodeSoa {
+        struct_id: u32,
+        input: Operand,
+        out: Slot,
+        arena: Operand,
+    },
     /// `json.decode` into a shape-directed **union** (`enum`) target (JSON completeness J1b): parse
     /// one JSON value, select the variant by its shape class (Str/Number/Bool/Object; O(1) first-byte
     /// dispatch), write the payload into the `out` enum slot, and set the tag. Yields an `i32` status
     /// (0 = ok). codegen builds the [`JsonUnion`] descriptor (per-variant payload arms + the shape
     /// class → arm table).
-    JsonDecodeUnion { enum_id: u32, input: Operand, out: Slot, arena: Option<Operand> },
+    JsonDecodeUnion {
+        enum_id: u32,
+        input: Operand,
+        out: Slot,
+        arena: Option<Operand>,
+    },
     /// `json.doc(input)` (J4): parse the `str` `input` into an arena-backed tape, writing the root
     /// `{tape,node}` handle into the `out` slot. Yields an `i32` status (0 = ok). `arena` is the
     /// enclosing arena handle the runtime bump-allocates the tape from. The tape is schema-unknown
     /// and generic.
-    JsonDoc { input: Operand, arena: Operand, out: Slot },
+    JsonDoc {
+        input: Operand,
+        arena: Operand,
+        out: Slot,
+    },
     /// `d.kind()` on a `json.doc`: the runtime returns the `json.kind` tag directly as an `i32`
     /// (codegen wraps it into the tag-only enum aggregate). Total.
-    JsonDocKind { doc: Operand },
+    JsonDocKind {
+        doc: Operand,
+    },
     /// `d.get(key)` on a `json.doc`: the runtime writes the child `{tape,node}` handle (`Missing` if
     /// absent / not an object) into the `out` slot. No status (navigation is total).
-    JsonDocGet { doc: Operand, key: Operand, out: Slot },
+    JsonDocGet {
+        doc: Operand,
+        key: Operand,
+        out: Slot,
+    },
     /// `d.at(index)` on a `json.doc`: the runtime writes the element `{tape,node}` handle (`Missing`
     /// if out of range / not an array) into the `out` slot. No status (navigation is total).
-    JsonDocAt { doc: Operand, index: Operand, out: Slot },
+    JsonDocAt {
+        doc: Operand,
+        index: Operand,
+        out: Slot,
+    },
     /// `d.as_str()` on a `json.doc`: the runtime writes a `str` view (`{ptr,len}`) into the `out`
     /// slot and returns an `i32` present flag (1 = a JSON string → `Some`, 0 → `None`).
-    JsonDocAsStr { doc: Operand, out: Slot },
+    JsonDocAsStr {
+        doc: Operand,
+        out: Slot,
+    },
     /// `d.as_i64()` / `d.as_f64()` / `d.as_bool()` on a `json.doc`: the runtime writes the leaf scalar
     /// into the `out` slot and returns an `i32` present flag (1 → `Some`, 0 → `None`). `scalar` is the
     /// target leaf type (int / float / bool), selecting the runtime accessor.
-    JsonDocAsScalar { scalar: Ty, doc: Operand, out: Slot },
+    JsonDocAsScalar {
+        scalar: Ty,
+        doc: Operand,
+        out: Slot,
+    },
     /// `d.len()` on a `json.doc`: the runtime returns the member/element count directly as an `i64`
     /// (0 for a non-container / Missing). Total.
-    JsonDocLen { doc: Operand },
+    JsonDocLen {
+        doc: Operand,
+    },
     /// `d.key(index)` on a `json.doc`: the runtime writes the `index`-th object member key (a `str`
     /// view `{ptr,len}`) into the `out` slot and returns an `i32` present flag (1 = an object member
     /// at that index → `Some`, 0 → `None`).
-    JsonDocKey { doc: Operand, index: Operand, out: Slot },
+    JsonDocKey {
+        doc: Operand,
+        index: Operand,
+        out: Slot,
+    },
     /// `d.elems()` on a `json.doc`: the runtime materializes the level's child handles into an
     /// arena-allocated buffer and writes the `slice<json.doc>` `{ptr,len}` into the `out` slot. No
     /// status (an empty container / non-container → an empty slice). `arena` is the enclosing arena.
-    JsonDocElems { doc: Operand, arena: Operand, out: Slot },
+    JsonDocElems {
+        doc: Operand,
+        arena: Operand,
+        out: Slot,
+    },
     /// `json.scan(input)` (J5): build a streaming typed-row scanner over the JSON `input` view. The
     /// scanner value *is* the input view (`{ptr,len}`) — no allocation, no arena — retyped as
     /// `json.scanner<Row>`; the row schema lives at codegen (via the value's `json.scanner<Row>` type),
     /// not in the value. A Copy handle, no `Drop`.
-    JsonScanNew { input: Operand },
+    JsonScanNew {
+        input: Operand,
+    },
     /// One streaming step of a `json.scanner<Row>` fused terminal (J5): decode the next JSON object at
     /// `*cursor` in the scanner's input into the `row` slot, advancing `*cursor` past it. Returns an
     /// `i32` status: `0` = a row was decoded, `1` = the stream is exhausted (top-level `]` / EOF),
     /// `2` = a malformed row (the terminal yields `Err`). Reuses the decode descriptor of
     /// `struct_id`.
-    JsonScanNext { scanner: Operand, struct_id: u32, cursor: Slot, row: Slot },
+    JsonScanNext {
+        scanner: Operand,
+        struct_id: u32,
+        cursor: Slot,
+        row: Slot,
+    },
     /// `fs.read_file(path)`: read the file named by the `str` `path` into a freshly heap-allocated
     /// owned `string`, writing its `{ptr,len}` into the `out` slot. Yields an `i32` status
     /// (0 = ok). The first `std.fs` surface.
-    FsReadFile { path: Operand, out: Slot },
+    FsReadFile {
+        path: Operand,
+        out: Slot,
+    },
     /// `fs.open(path)`: open `path` for reading, writing the owned `reader` handle into `out`.
     /// Yields an `i32` errno-status (0 = ok; see [`make_error_from_status`]).
-    ReaderOpen { path: Operand, out: Slot },
+    ReaderOpen {
+        path: Operand,
+        out: Slot,
+    },
     /// `fs.open_beneath(root, relative)`: descriptor-relative regular-file open below a retained
     /// root. The runtime writes the owned reader into `out` and returns an errno-status.
     ReaderOpenBeneath {
@@ -1031,10 +1407,16 @@ pub enum Rvalue {
     },
     /// `fs.create(path)`: create/truncate `path` for writing, writing the owned `writer` handle into
     /// `out`. Yields an `i32` errno-status (0 = ok).
-    WriterCreate { path: Operand, out: Slot },
+    WriterCreate {
+        path: Operand,
+        out: Slot,
+    },
     /// `fs.create_exclusive(path)`: atomically create a new final entry, writing the owned `writer`
     /// handle into `out`. Yields an `i32` errno-status (0 = ok).
-    WriterCreateExclusive { path: Operand, out: Slot },
+    WriterCreateExclusive {
+        path: Operand,
+        out: Slot,
+    },
     /// `fs.create_exclusive_beneath(root, relative)`: descriptor-relative exclusive regular-file
     /// create below a retained root. The runtime writes the owned writer into `out`.
     WriterCreateExclusiveBeneath {
@@ -1046,7 +1428,10 @@ pub enum Rvalue {
     ReaderStdin,
     /// `io.stdout` / `io.stderr` / `io.stdout.buffered()` — a `writer` over `fd` (1 = stdout,
     /// 2 = stderr), `buffered` selecting the accumulator. An owned handle (std.io).
-    WriterStd { fd: i32, buffered: bool },
+    WriterStd {
+        fd: i32,
+        buffered: bool,
+    },
     /// `r.read(b)` — read up to `b`'s capacity into the `buffer` `b`, borrowing both reader and
     /// buffer. Yields an `i64`: bytes read (`0` = EOF) on success, or `-(status)` on error.
     ReaderRead(Operand, Operand),
@@ -1063,7 +1448,10 @@ pub enum Rvalue {
     /// the zero-copy `str` view `{ptr,len}` (the same storage) into `out`. Yields an `i32`
     /// errno-status (0 = ok, `AL_INVALID` on bad UTF-8). Mirrors [`Self::FsReadBytesView`]'s
     /// out-slot-view + status shape, minus the arena/mmap. (A7.)
-    BytesAsStr { bytes: Operand, out: Slot },
+    BytesAsStr {
+        bytes: Operand,
+        out: Slot,
+    },
     /// `w.write(x)` — append a `str`/`bytes` operand's bytes to a `writer`. Yields an `i32`
     /// errno-status (0 = ok).
     WriterWrite(Operand, Operand),
@@ -1077,22 +1465,38 @@ pub enum Rvalue {
     IoCopy(Operand, Operand),
     /// `fs.create_rw(path)`: open `path` `O_RDWR|O_CREAT|O_TRUNC`, writing the owned `file` handle
     /// into `out`. Yields an `i32` errno-status (0 = ok). Mirrors [`Self::ReaderOpen`]. (A4.)
-    FileCreateRw { path: Operand, out: Slot },
+    FileCreateRw {
+        path: Operand,
+        out: Slot,
+    },
     /// `fs.open_rw(path)`: open an existing `path` `O_RDWR`, writing the owned `file` handle into
     /// `out`. Yields an `i32` errno-status (0 = ok). (A4.)
-    FileOpenRw { path: Operand, out: Slot },
+    FileOpenRw {
+        path: Operand,
+        out: Slot,
+    },
     /// `f.pread(b, off)` — one positionless read at file offset `off` into the `buffer` `b`,
     /// borrowing both. Yields an `i64`: actual bytes read (`0` = EOF) on success, or `-(status)` on
     /// error (the [`Self::ReaderRead`] sign convention). A negative `off` aborts in the runtime. (A4.)
-    FilePread { file: Operand, buffer: Operand, offset: Operand },
+    FilePread {
+        file: Operand,
+        buffer: Operand,
+        offset: Operand,
+    },
     /// `f.pwrite(data, off)` — write **all** of the `data` (`bytes`) operand at file offset `off`,
     /// borrowing the file. Yields an `i64`: the full byte count on success, or `-(status)` on error
     /// (the [`Self::ReaderRead`] sign convention). A negative `off` aborts in the runtime. (A4.)
-    FilePwrite { file: Operand, data: Operand, offset: Operand },
+    FilePwrite {
+        file: Operand,
+        data: Operand,
+        offset: Operand,
+    },
     /// `f.len()` — the file's live byte length (a fresh `fstat`), borrowing the file. Yields an
     /// `i64`: the length (`>= 0`) on success, or `-(status)` on error (the [`Self::ReaderRead`] sign
     /// convention). (A4.)
-    FileLen { file: Operand },
+    FileLen {
+        file: Operand,
+    },
     /// `buffer(cap)` — open an owned byte buffer with read window `cap`, yielding an opaque handle.
     BufferNew(Operand),
     /// `b.bytes()` — a `slice<u8>` view `{ptr,len}` of the buffer's current contents (borrow).
@@ -1104,53 +1508,100 @@ pub enum Rvalue {
     /// selects big-endian. Bounds are checked (`emit_range_bounds_check`) **before** this rvalue, so
     /// the load itself is unguarded. Lowers to an alignment-1 load (+ a `bswap` for `be`; a float
     /// loads its bits then bitcasts).
-    BytesRead { bytes: Operand, offset: Operand, scalar: Ty, be: bool },
+    BytesRead {
+        bytes: Operand,
+        offset: Operand,
+        scalar: Ty,
+        be: bool,
+    },
     /// `buf.put_<scalar>_<le|be>(v)` — append the `value` operand's bytes to the growable `buffer`
     /// operand in the given byte order. `scalar` is `value`'s type (sets the width; a float is
     /// bit-reinterpreted); `be` selects big-endian. Grows the buffer.
-    BufferPut { buffer: Operand, value: Operand, scalar: Ty, be: bool },
+    BufferPut {
+        buffer: Operand,
+        value: Operand,
+        scalar: Ty,
+        be: bool,
+    },
     /// `buf.append(data)` — append the raw `slice<u8>` operand `data` (copied) to the growable
     /// `buffer` operand, growing it.
-    BufferAppend { buffer: Operand, data: Operand },
+    BufferAppend {
+        buffer: Operand,
+        data: Operand,
+    },
     /// Open an empty typed array builder. `region` selects arena-backed chunk storage; `None`
     /// preserves the existing individually-owned heap form. Physical element layout is computed by
     /// the target backend from `elem`.
-    ArrayBuilderNew { elem: Ty, region: Option<Operand> },
+    ArrayBuilderNew {
+        elem: Ty,
+        region: Option<Operand>,
+    },
     /// `b.push(v)` — append one primitive scalar or declared-record element. Primitive values use
     /// raw bits in an `i64`; records are copied from their exact in-memory layout through the byte
     /// entry point selected by codegen.
-    ArrayBuilderPush { builder: Operand, value: Operand, scalar: Ty },
+    ArrayBuilderPush {
+        builder: Operand,
+        value: Operand,
+        scalar: Ty,
+    },
     /// `b.push(s)` — append one moved-in `string` element (the `value` operand, a `{ptr,len}`) to the
     /// growable `array_builder` operand. The source string is nulled at the move site.
-    ArrayBuilderPushStr { builder: Operand, value: Operand },
+    ArrayBuilderPushStr {
+        builder: Operand,
+        value: Operand,
+    },
     /// `b.append(xs)` — bulk-append the `slice<T>` operand `data` (`{ptr,len}` of Copy-scalar
     /// elements) to the growable `array_builder` operand. `data`'s `len` is the element count; the
     /// element stride is stored in the builder header (set at construction), so no stride here.
-    ArrayBuilderAppend { builder: Operand, data: Operand },
+    ArrayBuilderAppend {
+        builder: Operand,
+        data: Operand,
+    },
     /// `b.build()` — freeze the builder into an `array<T>` `{ptr,len}`, consuming it (its slot is
     /// nulled at the move site). Heap storage transfers zero-copy; region chunks compact once into
     /// the same arena.
-    ArrayBuilderBuild { builder: Operand },
+    ArrayBuilderBuild {
+        builder: Operand,
+    },
     /// `fs.write_file(path, data)` — write all of the `str`/`bytes` operand `data` to `path`, then
     /// close. Yields an `i32` errno-status (0 = ok).
-    FsWriteFile { path: Operand, data: Operand },
+    FsWriteFile {
+        path: Operand,
+        data: Operand,
+    },
     /// `fs.write_file(path, builder)` — the `builder`-source form (writes the builder's bytes).
-    FsWriteFileBuilder { path: Operand, builder: Operand },
+    FsWriteFileBuilder {
+        path: Operand,
+        builder: Operand,
+    },
     /// `fs.exists(path)` — `1` if `path` exists, else `0` (an `i32` used directly as a `bool`; every
     /// error folds to `0`, so there is no status branch).
-    FsExists { path: Operand },
+    FsExists {
+        path: Operand,
+    },
     /// `fs.remove(path)` — delete the file at `path`. Yields an `i32` errno-status (0 = ok).
-    FsRemove { path: Operand },
+    FsRemove {
+        path: Operand,
+    },
     /// `fs.rename_no_replace(source, destination)` — atomically move the source entry to an absent
     /// destination. Yields an `i32` errno-status (0 = ok).
-    RenameNoReplace { source: Operand, destination: Operand },
+    RenameNoReplace {
+        source: Operand,
+        destination: Operand,
+    },
     /// `fs.read_dir(path)` — the entry names of directory `path` as an owned `array<string>`
     /// (`{ptr,len}`) written into `out`. Yields an `i32` errno-status (0 = ok).
-    FsReadDir { path: Operand, out: Slot },
+    FsReadDir {
+        path: Operand,
+        out: Slot,
+    },
     /// `dns.resolve(host)` — the IP-address strings of `host` as an owned `array<string>`
     /// (`{ptr,len}`) written into `out`. Yields an `i32` status (0 = ok). Same shape as
     /// [`Rvalue::FsReadDir`].
-    DnsResolve { host: Operand, out: Slot },
+    DnsResolve {
+        host: Operand,
+        out: Slot,
+    },
     /// `tcp.connect(host, port)` — resolve `host` and open a TCP connection to `port`, writing the
     /// owned `tcp_conn` handle (a bare pointer) into `out`. Yields an `i32` status (0 = ok, else the
     /// shared errno/status table; a bad port or bad host is `AL_INVALID`). Mirrors [`Rvalue::ReaderOpen`]
@@ -1158,7 +1609,12 @@ pub enum Rvalue {
     /// The `timeout_ns` operand bounds each candidate's `connect`: `0` (the constant the raw
     /// `tcp.connect` surface lowers, since Align has no optional args) preserves the exact blocking
     /// connect; a positive value bounds the handshake with a deadline and can yield `AL_TIMEOUT`.
-    TcpConnect { host: Operand, port: Operand, timeout_ns: Operand, out: Slot },
+    TcpConnect {
+        host: Operand,
+        port: Operand,
+        timeout_ns: Operand,
+        out: Slot,
+    },
     /// `c.reader()` — borrow an M9 `reader` over the `tcp_conn` operand's socket fd (`owns_fd:false`).
     /// Yields the reader handle pointer (like [`Rvalue::ReaderStdin`], but over the conn's fd).
     ConnReader(Operand),
@@ -1168,49 +1624,83 @@ pub enum Rvalue {
     /// `c.read_timeout_ns(ns)` — arm (`ns > 0`) or clear (`ns == 0`) an `SO_RCVTIMEO` receive deadline
     /// on the `tcp_conn`'s socket fd, in place. No value (`Ty::Unit`). A negative `ns` aborts at
     /// runtime. The conn operand is borrowed (not consumed), the `ns` operand is a Copy `i64`. Impure.
-    TcpReadTimeout { conn: Operand, ns: Operand },
+    TcpReadTimeout {
+        conn: Operand,
+        ns: Operand,
+    },
     /// `c.write_timeout_ns(ns)` — arm/clear an `SO_SNDTIMEO` send deadline on the `tcp_conn`'s socket
     /// fd, in place. No value (`Ty::Unit`). Same operand/abort contract as [`Rvalue::TcpReadTimeout`].
-    TcpWriteTimeout { conn: Operand, ns: Operand },
+    TcpWriteTimeout {
+        conn: Operand,
+        ns: Operand,
+    },
     /// `tcp.listen(host, port)` — resolve `host` (`AI_PASSIVE`) and bind+listen on `port`, writing the
     /// owned `tcp_listener` handle (a bare pointer) into `out`. Yields an `i32` status (0 = ok, else
     /// the shared errno/status table; a bad port/host is `AL_INVALID`). Mirrors [`Rvalue::TcpConnect`]
     /// with a `tcp_listener` handle payload.
-    TcpListen { host: Operand, port: Operand, out: Slot },
+    TcpListen {
+        host: Operand,
+        port: Operand,
+        out: Slot,
+    },
     /// `l.accept()` — block for an inbound connection on the `tcp_listener` operand, writing the new
     /// owned `tcp_conn` handle into `out`. Yields an `i32` status (0 = ok, else the shared errno
     /// table). Mirrors [`Rvalue::TcpConnect`] but takes a listener operand instead of host/port.
-    TcpAccept { listener: Operand, out: Slot },
+    TcpAccept {
+        listener: Operand,
+        out: Slot,
+    },
     /// `udp.bind(host, port)` — resolve `host` (`AI_PASSIVE`) and open a `SOCK_DGRAM` socket bound to
     /// `port`, writing the owned `udp_socket` handle (a bare pointer) into `out`. Yields an `i32`
     /// status (0 = ok, else the shared errno/status table; a bad port/host is `AL_INVALID`). Mirrors
     /// [`Rvalue::TcpListen`] with a `udp_socket` handle payload.
-    UdpBind { host: Operand, port: Operand, out: Slot },
+    UdpBind {
+        host: Operand,
+        port: Operand,
+        out: Slot,
+    },
     /// `u.send_to(data, host, port)` — resolve `host`/`port` (`SOCK_DGRAM`, per call) and `sendto` the
     /// byte view `data` as one datagram from the `udp_socket` operand's fd. Yields an `i64`: the bytes
     /// sent (`>= 0`, `Ok`) or `-(status)` on error (the [`Rvalue::ReaderRead`] sign convention).
-    UdpSendTo { sock: Operand, data: Operand, host: Operand, port: Operand },
+    UdpSendTo {
+        sock: Operand,
+        data: Operand,
+        host: Operand,
+        port: Operand,
+    },
     /// `u.recv_from(buf)` — block for one inbound datagram on the `udp_socket` operand, filling the
     /// `buffer` operand up to its capacity (overwriting its length). Yields an `i64`: the bytes
     /// received (`>= 0`, `Ok`) or `-(status)` on error (the [`Rvalue::ReaderRead`] sign convention).
-    UdpRecvFrom { sock: Operand, buffer: Operand },
+    UdpRecvFrom {
+        sock: Operand,
+        buffer: Operand,
+    },
     /// `process.spawn(cmd, args)` — `fork` + `execvp(cmd, argv)`. `cmd` is a `str` view (the lookup
     /// path); `args` is a str-view collection `{ptr,len}` (the child's full argv, incl. argv[0]). On
     /// success writes the owned `child` handle (a bare pointer) into `out`. Yields an `i32` status (0 =
     /// ok, else the shared errno/status table; a `fork` failure is the mapped errno, an interior-NUL /
     /// empty argv is `AL_INVALID`). An `execvp` failure is NOT reported here — the forked child
     /// `_exit(127)`s. Mirrors [`Rvalue::UdpBind`] with a `child` handle payload.
-    ProcessSpawn { cmd: Operand, args: Operand, out: Slot },
+    ProcessSpawn {
+        cmd: Operand,
+        args: Operand,
+        out: Slot,
+    },
     /// `ch.wait()` — block in `waitpid` for the `child` operand to exit, marking it reaped (through the
     /// borrow — the receiver is read, not consumed). Yields an `i64`: the exit code (`>= 0`:
     /// `WEXITSTATUS`, or `128 + signal` for a signal-killed child) on success, or `-(status)` on error
     /// (a double-wait / `waitpid` failure — the [`Rvalue::ReaderRead`] sign convention).
-    ChildWait { child: Operand },
+    ChildWait {
+        child: Operand,
+    },
     /// `ch.kill(sig)` — send signal `sig` (an `i64`) to the `child` operand via libc `kill`. Yields an
     /// `i32` errno-status (0 = ok; a negative / out-of-range `sig`, or killing an already-`reaped` child,
     /// is `AL_INVALID`; `EPERM`/`ESRCH` map through the shared table). `child` is borrowed (read, not
     /// consumed — like [`Rvalue::ChildWait`]). Wrapped into `Result<(), Error>` by `lower_status_result`.
-    ChildKill { child: Operand, sig: Operand },
+    ChildKill {
+        child: Operand,
+        sig: Operand,
+    },
     /// `process.exec(cmd, args)` — `execvp(cmd, argv)` **in the current process**. `cmd` is a `str` view
     /// (the lookup path); `args` is a str-view collection `{ptr,len}` (the new image's full argv, incl.
     /// argv[0]). On **success it replaces the image and never returns** — so this yields an `i32`
@@ -1218,32 +1708,57 @@ pub enum Rvalue {
     /// wrapped into `Result<(), Error>` by `lower_status_result` (whose `Err` arm is the only observable
     /// one). **No cleanup is emitted** (unlike `process.exit`): `execvp` discards the address space, so
     /// pending `Drop`s / arena ends / buffered writers are inherently lost on success.
-    ProcessExec { cmd: Operand, args: Operand },
+    ProcessExec {
+        cmd: Operand,
+        args: Operand,
+    },
     /// `fs.read_file_view(path)` — mmap the regular file `path` read-only into `arena`, writing the
     /// `str` view `{ptr,len}` into `out`. Yields an `i32` errno-status (0 = ok). The mapping is
     /// `munmap`ped at arena end (the region rule) — no `Drop`.
-    FsReadFileView { path: Operand, arena: Operand, out: Slot },
+    FsReadFileView {
+        path: Operand,
+        arena: Operand,
+        out: Slot,
+    },
     /// `fs.read_bytes_view(path)` — the binary sibling of [`Self::FsReadFileView`]: the same
     /// arena `mmap` (regular-file fast path + owned-copy fallback, `munmap` at arena end) minus the
     /// UTF-8 validation, writing the `bytes` (`slice<u8>`) view `{ptr,len}` into `out`. Yields an
     /// `i32` errno-status (0 = ok). No `Drop` — the view aliases the arena.
-    FsReadBytesView { path: Operand, arena: Operand, out: Slot },
+    FsReadBytesView {
+        path: Operand,
+        arena: Operand,
+        out: Slot,
+    },
     /// `path.join(a, b)` — join two path fragments into a freshly heap-allocated owned `string`,
     /// returned by value as a `{ptr,len}` (like `str_clone`). Pure.
-    PathJoin { a: Operand, b: Operand },
+    PathJoin {
+        a: Operand,
+        b: Operand,
+    },
     /// `path.base`/`dir`/`ext(p)` — a zero-copy substring `str` view `{ptr,len}` of `p` (aliases its
     /// bytes, no allocation — like `StrTrim`), returned by value. `kind` selects the component. Pure.
-    PathComponent { kind: hir::PathComponentKind, path: Operand },
+    PathComponent {
+        kind: hir::PathComponentKind,
+        path: Operand,
+    },
     /// `path.normalize(p)` — lexically normalize `p` into a freshly heap-allocated owned `string`,
     /// returned by value as a `{ptr,len}`. Pure.
-    PathNormalize { path: Operand },
+    PathNormalize {
+        path: Operand,
+    },
     /// `env.get(name)` — write the owned `string` value `{ptr,len}` of environment variable `name`
     /// into `out` (or `{null,0}` if unset), returning an `i32` present flag (`1` = set, `0` = unset).
     /// The caller branches into `Some`/`None`. Impure.
-    EnvGet { name: Operand, out: Slot },
+    EnvGet {
+        name: Operand,
+        out: Slot,
+    },
     /// `env.set(name, value)` — set environment variable `name` to `value`. Yields an `i32`
     /// errno-status (0 = ok). Impure.
-    EnvSet { name: Operand, value: Operand },
+    EnvSet {
+        name: Operand,
+        value: Operand,
+    },
     /// `time.now()` — wall-clock UNIX-epoch nanoseconds (`CLOCK_REALTIME`), an `i64`. Impure.
     TimeNow,
     /// `process.cpu_count()` — the parallelism available to this process, an `i64` (>= 1). Impure.
@@ -1252,78 +1767,152 @@ pub enum Rvalue {
     TimeInstant,
     /// `time.sleep(ns)` — suspend the thread for `ns` nanoseconds (negative = no-op). Yields no
     /// meaningful value (the expression's type is `()`); codegen emits the void call. Impure.
-    TimeSleep { ns: Operand },
+    TimeSleep {
+        ns: Operand,
+    },
     /// `encoding.base64_encode`/`base64url_encode`/`hex_encode(data)` — encode the byte view `data`
     /// (`{ptr,len}`) into a freshly heap-allocated owned `string`, returned by value as a `{ptr,len}`
     /// (like `PathNormalize`). `kind` selects the alphabet. Pure.
-    EncodingEncode { kind: hir::EncodingKind, data: Operand },
+    EncodingEncode {
+        kind: hir::EncodingKind,
+        data: Operand,
+    },
     /// `encoding.base64_decode`/`base64url_decode`/`hex_decode(s)` — decode the `str` view `input`
     /// (`{ptr,len}`) into an owned `buffer` handle written to `out`; yields an `i32` status
     /// (0 = ok, `AL_INVALID` -> `Error.Invalid`; see [`make_error_from_status`]). The caller branches
     /// `Ok(buffer)` / `Err`. Pure.
     /// `regex.compile(pattern)` — compile `pattern` (`{ptr,len}`) into an owned regex handle written
     /// to `out`, returning an `i32` status (0 success, `AL_INVALID` for syntax/resource rejection).
-    RegexCompile { pattern: Operand, out: Slot },
+    RegexCompile {
+        pattern: Operand,
+        out: Slot,
+    },
     /// `re.is_match(text)` — runtime i32 present flag; lowering compares it with zero for Align bool.
-    RegexIsMatch { regex: Operand, text: Operand },
+    RegexIsMatch {
+        regex: Operand,
+        text: Operand,
+    },
     /// `re.find[_at](text, start)` — write the builtin `regex_match` struct into `out`, returning an
     /// i32 present flag. `start` is always explicit here (`find` lowers as zero).
-    RegexFind { regex: Operand, text: Operand, start: Operand, out: Slot },
+    RegexFind {
+        regex: Operand,
+        text: Operand,
+        start: Operand,
+        out: Slot,
+    },
     /// `re.find_all(text)` / `re.split(text)` — materialize an owned `array<regex_match>` `{ptr,len}`
     /// into `out` (the buffer is `align_rt_alloc`-owned; `Drop` shallow-frees it). Returns an i32
     /// status (always 0). `split` selects the between-match spans; `find_all` the match spans.
-    RegexFindAll { regex: Operand, text: Operand, out: Slot },
-    RegexSplit { regex: Operand, text: Operand, out: Slot },
+    RegexFindAll {
+        regex: Operand,
+        text: Operand,
+        out: Slot,
+    },
+    RegexSplit {
+        regex: Operand,
+        text: Operand,
+        out: Slot,
+    },
     /// `re.replace[_all](text, repl)` — return a fresh owned `string` `{ptr,len}` by value with
     /// matches replaced by `repl` (`$`-expanded). `all` selects first-only vs every match.
-    RegexReplace { regex: Operand, text: Operand, repl: Operand, all: bool },
+    RegexReplace {
+        regex: Operand,
+        text: Operand,
+        repl: Operand,
+        all: bool,
+    },
     /// `re.captures(text)` — write an owned `captures` handle ptr into `out`, returning an i32
     /// present flag (1 = a match, 0 = none). Lowering builds the `Option<captures>`.
-    RegexCaptures { regex: Operand, text: Operand, out: Slot },
+    RegexCaptures {
+        regex: Operand,
+        text: Operand,
+        out: Slot,
+    },
     /// `re.group_count()` — the pattern's total capture-group count (incl. group 0) as an i64.
-    RegexGroupCount { regex: Operand },
+    RegexGroupCount {
+        regex: Operand,
+    },
     /// `re.group_index(name)` — a named group's index, or `-1` if absent. Lowering builds `Option<i64>`.
-    RegexGroupIndex { regex: Operand, name: Operand },
+    RegexGroupIndex {
+        regex: Operand,
+        name: Operand,
+    },
     /// `caps.group(i)` — write the builtin `regex_match` into `out`, returning an i32 present flag
     /// (0 = non-participating group). An out-of-range `i` aborts in the runtime.
-    CapturesGroup { caps: Operand, index: Operand, out: Slot },
-    EncodingDecode { kind: hir::EncodingKind, input: Operand, out: Slot },
+    CapturesGroup {
+        caps: Operand,
+        index: Operand,
+        out: Slot,
+    },
+    EncodingDecode {
+        kind: hir::EncodingKind,
+        input: Operand,
+        out: Slot,
+    },
     /// `compress.gzip_compress(data, level)` — compress the byte view `data` at `level` (an i64).
     /// The runtime writes an owned `buffer` handle into `out` and returns an i32 status (0 = ok;
     /// `AL_INVALID` -> `Error.Invalid`; `>= AL_CODE` -> `Error.Code`). An out-of-range level aborts
     /// in the runtime. Value = the i32 status; the wrapped buffer is owned (the local `Drop`s it).
-    CompressCompress { kind: hir::CompressKind, data: Operand, level: Operand, out: Slot },
+    CompressCompress {
+        kind: hir::CompressKind,
+        data: Operand,
+        level: Operand,
+        out: Slot,
+    },
     /// `compress.gzip_decompress(data)` — inflate the gzip byte view `data`; the runtime writes an
     /// owned `buffer` handle into `out` and returns an i32 status (corrupt/truncated/bomb ->
     /// `AL_INVALID`). Value = the i32 status; the wrapped buffer is owned.
-    CompressDecompress { kind: hir::CompressKind, data: Operand, out: Slot },
+    CompressDecompress {
+        kind: hir::CompressKind,
+        data: Operand,
+        out: Slot,
+    },
     /// `encoding.utf8_valid(b)` — whether the byte view `b` (`{ptr,len}`) is valid UTF-8, an `i32`
     /// used directly as a `bool` (`1`/`0`). Pure.
-    Utf8Valid { data: Operand },
+    Utf8Valid {
+        data: Operand,
+    },
     /// `crypto.constant_time_equal(a, b)` — a constant-time byte-equality test over two byte views
     /// (each `{ptr,len}`), an `i32` used directly as a `bool` (`1` = equal, `0` = not, like
     /// [`Self::Utf8Valid`]). The input length is public (differing lengths → `0`); the runtime's
     /// equal-length compare is branchless (no early return). Pure.
-    CryptoCtEqual { a: Operand, b: Operand },
+    CryptoCtEqual {
+        a: Operand,
+        b: Operand,
+    },
     /// `crypto.random(out)` — fill the whole `buffer` `out` (its full capacity, by handle pointer)
     /// with OS CSPRNG bytes. Yields no value (the expression type is `()`); codegen emits the void
     /// call. A CSPRNG failure aborts in the runtime. Impure.
-    CryptoRandom { out: Operand },
+    CryptoRandom {
+        out: Operand,
+    },
     /// `crypto.sha256(data)` / `crypto.sha512(data)` — the cryptographic digest of the byte view
     /// `data` (`{ptr,len}`), a fresh *owned* `array<u8>` of fixed length (32 / 64) returned by value
     /// as a `{ptr,len}` (like [`Self::RandSample`]). `algo` param-swaps the EVP digest. The bound
     /// local `Drop`-frees the array. Impure (a libcrypto call).
-    CryptoHash { algo: hir::HashAlgo, data: Operand },
+    CryptoHash {
+        algo: hir::HashAlgo,
+        data: Operand,
+    },
     /// `crypto.hmac_sha256(key, data)` — the 32-byte HMAC-SHA-256 tag of the byte views `key` / `data`
     /// (each `{ptr,len}`), a fresh *owned* `array<u8>` returned by value as a `{ptr,len}` (the
     /// [`Self::CryptoHash`] shape). The bound local `Drop`-frees the array. Impure (a libcrypto call).
-    CryptoHmac { key: Operand, data: Operand },
+    CryptoHmac {
+        key: Operand,
+        data: Operand,
+    },
     /// `crypto.hkdf_sha256(salt, ikm, info, len)` — derive `len` bytes with HKDF-SHA-256 over the byte
     /// views `salt` / `ikm` / `info` (each `{ptr,len}`). The runtime writes an owned `buffer` handle
     /// into `out` and returns an `i32` status (0 ok, `AL_INVALID` bad-`len`/rejected-params,
     /// `AL_CODE+n` engine failure — see [`make_error_from_status`]); the caller branches
     /// `Ok(<buffer>)` / `Err(<mapped>)` via [`emit_status_buffer_result`]. Impure.
-    CryptoHkdf { salt: Operand, ikm: Operand, info: Operand, len: Operand, out: Slot },
+    CryptoHkdf {
+        salt: Operand,
+        ikm: Operand,
+        info: Operand,
+        len: Operand,
+        out: Slot,
+    },
     /// `crypto.{aes_gcm,chacha20_poly1305}_{seal,open}(key, nonce, input, aad)` — AEAD over the byte
     /// views `key` / `nonce` / `input` (plaintext on seal, `ciphertext || tag` on open) / `aad` (each
     /// `{ptr,len}`). `cipher` param-swaps the fetched `EVP_CIPHER`; `dir` picks seal vs open (codegen
@@ -1332,7 +1921,15 @@ pub enum Rvalue {
     /// for a bad key/nonce length, a too-short/corrupt open input, or an open auth failure — the
     /// single opaque failure, P2; `AL_CODE+n` → `Error.Code` only for a **seal** engine failure). The
     /// caller branches `Ok(<buffer>)` / `Err(<mapped>)` via [`emit_status_buffer_result`]. Impure.
-    CryptoAead { cipher: hir::AeadCipher, dir: hir::AeadDir, key: Operand, nonce: Operand, input: Operand, aad: Operand, out: Slot },
+    CryptoAead {
+        cipher: hir::AeadCipher,
+        dir: hir::AeadDir,
+        key: Operand,
+        nonce: Operand,
+        input: Operand,
+        aad: Operand,
+        out: Slot,
+    },
     /// `crypto.argon2id(password, salt, params)` — Argon2id via OpenSSL's `EVP_KDF("ARGON2ID")`.
     /// `password` / `salt` are byte views (`{ptr,len}`); the four `i64` tuning knobs are the fields of
     /// the caller's `argon2_params` struct, read out at lowering (`m_cost` KiB, `t_cost` iterations,
@@ -1348,55 +1945,105 @@ pub enum Rvalue {
     /// `rand.seed()` / `rand.seed_with(s)` — initialize an `rng` (four `i64`s, Xoshiro256++) into the
     /// slot `out`. `seed` is `None` for the OS-seeded form (`getrandom`), `Some(s)` for the
     /// deterministic form. Yields no value (the caller `Load`s `out` for the `rng` aggregate).
-    RandSeed { seed: Option<Operand>, out: Slot },
+    RandSeed {
+        seed: Option<Operand>,
+        out: Slot,
+    },
     /// `r.next()` — advance the rng in slot `rng` (in place, by pointer) and return the next `i64`.
-    RandNext { rng: Slot },
+    RandNext {
+        rng: Slot,
+    },
     /// `r.range(lo, hi)` — a uniform `i64` in `[lo, hi)` from the rng in slot `rng` (advanced in
     /// place); `lo >= hi` aborts at runtime.
-    RandRange { rng: Slot, lo: Operand, hi: Operand },
+    RandRange {
+        rng: Slot,
+        lo: Operand,
+        hi: Operand,
+    },
     /// `r.shuffle(out xs)` — Fisher-Yates the slice `xs` (`{ptr,len}`) in place, using (and
     /// advancing) the rng in slot `rng`. `elem` sizes each element (byte swaps). Yields no value.
-    RandShuffle { rng: Slot, xs: Operand, elem: Ty },
+    RandShuffle {
+        rng: Slot,
+        xs: Operand,
+        elem: Ty,
+    },
     /// `r.sample(xs, k)` — draw `k` elements of `xs` (`{ptr,len}`) without replacement into a fresh
     /// owned `array<T>`, returned by value as a `{ptr,len}` (freed by the bound local's `Drop`).
     /// Uses/advances the rng in slot `rng`; `k < 0` or `k > len` aborts at runtime. `elem` sizes each
     /// element.
-    RandSample { rng: Slot, xs: Operand, k: Operand, elem: Ty },
+    RandSample {
+        rng: Slot,
+        xs: Operand,
+        k: Operand,
+        elem: Ty,
+    },
     /// `cli.command(name)` — allocate a `cli command` handle named `name` (a `str` `{ptr,len}`),
     /// returned by value as an opaque pointer (the bound local `Drop`-frees it). Pure.
-    CliCommand { name: Operand },
+    CliCommand {
+        name: Operand,
+    },
     /// `c.flag_bool/str/i64(...)` — register a flag into the command handle `cmd` (an opaque
     /// pointer), mutating it in place. `kind` selects the runtime symbol; `name` is a `str`
     /// `{ptr,len}`; `default` is the `str` default `{ptr,len}` (`flag_str`) or the `i64` default
     /// (`flag_i64`), `None` for `flag_bool`. Yields no value. Pure.
-    CliFlag { cmd: Operand, kind: hir::CliFlagKind, name: Operand, default: Option<Operand> },
+    CliFlag {
+        cmd: Operand,
+        kind: hir::CliFlagKind,
+        name: Operand,
+        default: Option<Operand>,
+    },
     /// `c.parse(args)` — parse the argv `array<str>` `args` (`{ptr,len}` = an `AlignStr` buffer +
     /// count) against the command handle `cmd`, writing an owned `cli parsed` handle into `out` and
     /// returning an `i32` status (0 = ok, `AL_INVALID` -> `Error.Invalid`). The caller branches
     /// `Ok(parsed)` / `Err`. Pure.
-    CliParse { cmd: Operand, args: Operand, out: Slot },
+    CliParse {
+        cmd: Operand,
+        args: Operand,
+        out: Slot,
+    },
     /// `p.get_bool(name)` — the parsed `bool` for flag `name` (a `str` `{ptr,len}`) from the parsed
     /// handle `parsed`, an `i32` (1/0) used as a `bool`. Aborts at runtime on unregistered /
     /// wrong-kind. Pure.
-    CliGetBool { parsed: Operand, name: Operand },
+    CliGetBool {
+        parsed: Operand,
+        name: Operand,
+    },
     /// `p.get_i64(name)` — the parsed `i64` for flag `name`. Aborts on unregistered / wrong-kind. Pure.
-    CliGetI64 { parsed: Operand, name: Operand },
+    CliGetI64 {
+        parsed: Operand,
+        name: Operand,
+    },
     /// `p.get_str(name)` — the parsed `str` **view** (`{ptr,len}`) for flag `name`, borrowing the
     /// parsed handle's storage (region-bound to `parsed`). Aborts on unregistered / wrong-kind. Pure.
-    CliGetStr { parsed: Operand, name: Operand },
+    CliGetStr {
+        parsed: Operand,
+        name: Operand,
+    },
     /// `c.usage()` — render the command handle `cmd`'s flag table into a fresh owned `string`,
     /// returned by value as a `{ptr,len}` (the bound local `Drop`-frees it). Pure.
-    CliUsage { cmd: Operand },
+    CliUsage {
+        cmd: Operand,
+    },
     /// `http.request(method, url)` — allocate an `http request` builder (opaque pointer), returned by
     /// value (the bound local `Drop`-frees it via `http_request_free`). `method`/`url` are `str`
     /// `{ptr,len}`. Pure.
-    HttpRequest { method: Operand, url: Operand },
+    HttpRequest {
+        method: Operand,
+        url: Operand,
+    },
     /// `r.header(name, value)` — append a header to the request handle `req` (opaque pointer), in
     /// place. `name`/`value` are `str` `{ptr,len}`. Aborts at runtime on CR/LF/NUL (P6). No value. Pure.
-    HttpHeader { req: Operand, name: Operand, value: Operand },
+    HttpHeader {
+        req: Operand,
+        name: Operand,
+        value: Operand,
+    },
     /// `r.body(data)` — copy the byte view `data` (`{ptr,len}`) into the request handle `req`'s body.
     /// No value. Pure.
-    HttpBody { req: Operand, data: Operand },
+    HttpBody {
+        req: Operand,
+        data: Operand,
+    },
     /// `r.timeout(ns)` — set the request handle `req`'s per-request I/O timeout (`ns` an `i64`
     /// nanosecond count), in place. No value. `ns == 0` = inherit the client default; a negative `ns`
     /// aborts at runtime. Pure (a field store; the deadline is applied at perform time).
@@ -1425,49 +2072,94 @@ pub enum Rvalue {
     /// (opaque pointer), returned by value (the bound local `Drop`-frees it via `command_free`).
     /// `cmd`/`args` are `{ptr,len}` str views (the argv is marshalled to C strings by the runtime; a
     /// malformed argv aborts). Impure.
-    Command { cmd: Operand, args: Operand },
+    Command {
+        cmd: Operand,
+        args: Operand,
+    },
     /// `c.cwd(dir)` — set the command handle `command`'s working directory (`dir` a `{ptr,len}` str
     /// view), in place. No value. A `dir` with an interior NUL aborts at runtime. Impure.
-    CommandCwd { command: Operand, dir: Operand },
+    CommandCwd {
+        command: Operand,
+        dir: Operand,
+    },
     /// `c.timeout_ns(ns)` — set the command handle `command`'s run timeout (`ns` an `i64` nanosecond
     /// count), in place. No value. `ns == 0` = no timeout; a negative `ns` aborts at runtime. Impure.
-    CommandTimeout { command: Operand, ns: Operand },
+    CommandTimeout {
+        command: Operand,
+        ns: Operand,
+    },
     /// Persist a per-stream capture bound on a command handle.
-    CommandMaxCapture { command: Operand, limit: Operand },
+    CommandMaxCapture {
+        command: Operand,
+        limit: Operand,
+    },
     /// `c.env(name, value)` — add or override one environment variable the child sees (`name`/`value`
     /// `{ptr,len}` str views), in place. No value. A `name`/`value` with an interior NUL, or a `name`
     /// containing `=`, aborts at runtime. Impure.
-    CommandEnv { command: Operand, name: Operand, value: Operand },
+    CommandEnv {
+        command: Operand,
+        name: Operand,
+        value: Operand,
+    },
     /// `c.env_clear()` — start the child's environment empty (the child `clearenv`s before applying any
     /// `env` pairs), in place. No value. Impure.
-    CommandEnvClear { command: Operand },
+    CommandEnvClear {
+        command: Operand,
+    },
     /// `c.run()` — fork + capture: the runtime writes an owned `run_output` handle to `out` and returns
     /// an `i32` status (0 = ok; else `AL_INVALID` for non-UTF-8 output / a mapped errno). The caller
     /// branches `Ok(run_output)` / `Err`. `command` is borrowed (re-runnable). Impure.
-    CommandRun { command: Operand, out: Slot },
+    CommandRun {
+        command: Operand,
+        out: Slot,
+    },
     /// Binary captured run returning an owned `run_bytes` handle through `out`.
-    CommandRunBytes { command: Operand, out: Slot },
+    CommandRunBytes {
+        command: Operand,
+        out: Slot,
+    },
     /// `out.code()` — the run's exit code (`i64`) of the run-output handle `out`. Pure.
-    RunOutputCode { out: Operand },
+    RunOutputCode {
+        out: Operand,
+    },
     /// `out.stdout()` / `out.stderr()` — the captured stdout / stderr as a `str` **view** `{ptr,len}`
     /// into `out`'s owned buffer (region-bound to `out`). `err` selects the stderr buffer. Pure.
-    RunOutputView { out: Operand, err: bool },
+    RunOutputView {
+        out: Operand,
+        err: bool,
+    },
     /// Exit-code accessor for a `run_bytes` handle.
-    RunBytesCode { out: Operand },
+    RunBytesCode {
+        out: Operand,
+    },
     /// Byte-slice stdout/stderr view for a `run_bytes` handle.
-    RunBytesView { out: Operand, err: bool },
+    RunBytesView {
+        out: Operand,
+        err: bool,
+    },
     /// `http.parse(data)` — parse the response byte view `data` (`{ptr,len}`) into an owned `http
     /// response` handle written to `out`, returning an `i32` status (0 = ok, `AL_INVALID` ->
     /// `Error.Invalid`). The caller branches `Ok(response)` / `Err`. Pure.
-    HttpParse { data: Operand, out: Slot },
+    HttpParse {
+        data: Operand,
+        out: Slot,
+    },
     /// `resp.status()` — the parsed status code (`i64`) of the response handle `resp`. Pure.
-    HttpRespStatus { resp: Operand },
+    HttpRespStatus {
+        resp: Operand,
+    },
     /// `resp.header(name)` — a case-insensitive header lookup on `resp`, writing a `str` **view**
     /// `{ptr,len}` (region-bound to `resp`) to `out` and returning an `i32` present flag (1/0). Pure.
-    HttpRespHeader { resp: Operand, name: Operand, out: Slot },
+    HttpRespHeader {
+        resp: Operand,
+        name: Operand,
+        out: Slot,
+    },
     /// `resp.body()` — the response body as a `slice<u8>` **view** `{ptr,len}` into `resp`'s buffer
     /// (region-bound to `resp`). Pure.
-    HttpRespBody { resp: Operand },
+    HttpRespBody {
+        resp: Operand,
+    },
     /// `http.client()` — allocate an `http client` handle (opaque pointer), returned by value (the
     /// bound local `Drop`-frees it via `http_client_free`). No operands. Pure (no I/O — the requests
     /// are impure). Slice 2 carries no pooled state.
@@ -1475,20 +2167,38 @@ pub enum Rvalue {
     /// `cl.get(url)` — perform a `GET url` over a fresh connection: the runtime writes an owned `http
     /// response` handle to `out` and returns an `i32` status (0 = ok — a 4xx/5xx is still ok, status is
     /// data; else `AL_INVALID` / errno → `Error`). The caller branches `Ok(response)` / `Err`. Impure.
-    HttpClientGet { client: Operand, url: Operand, out: Slot },
+    HttpClientGet {
+        client: Operand,
+        url: Operand,
+        out: Slot,
+    },
     /// `cl.post(url, body)` — perform a `POST url` with `body` (auto `Content-Length`). Same out-slot +
     /// i32-status contract as [`Rvalue::HttpClientGet`]. Impure.
-    HttpClientPost { client: Operand, url: Operand, body: Operand, out: Slot },
+    HttpClientPost {
+        client: Operand,
+        url: Operand,
+        body: Operand,
+        out: Slot,
+    },
     /// `cl.request(req)` — perform the fully-built request handle `req` (an opaque pointer, **moved
     /// in** — the runtime frees it, so the MIR nulls its source slot). Same out-slot + i32-status
     /// contract as [`Rvalue::HttpClientGet`]. Impure.
-    HttpClientRequest { client: Operand, req: Operand, out: Slot },
+    HttpClientRequest {
+        client: Operand,
+        req: Operand,
+        out: Slot,
+    },
     /// `cl.get_many(urls, max_concurrency)` — batched concurrent GET: the runtime writes an owned
     /// `array<response>` `{ptr,len}` header (a buffer of `response` handles, input order) to `out` and
     /// returns an `i32` status (0 = ok; else the lowest-index transport/parse error). `client` is
     /// borrowed (shared across the workers); `urls` is a `slice<str>` view; `max_concurrency` is an
     /// `i64` (`<= 0` aborts). The caller branches `Ok(array<response>)` / `Err`. Impure. std.http R5.
-    HttpGetMany { client: Operand, urls: Operand, max_concurrency: Operand, out: Slot },
+    HttpGetMany {
+        client: Operand,
+        urls: Operand,
+        max_concurrency: Operand,
+        out: Slot,
+    },
     /// `http.serve(host, port)` — bind a listening socket: the runtime writes an owned `http_server`
     /// handle (opaque pointer) to `out` and returns an `i32` status (0 = ok; else `AL_INVALID` / errno →
     /// `Error`). The caller branches `Ok(http_server)` / `Err`. Impure.
@@ -1496,59 +2206,102 @@ pub enum Rvalue {
     /// `shared` selects the prefork sibling `http.serve_shared` (`SO_REUSEPORT` on the listener,
     /// http.md item 9 ①) — a field, not a variant, so every pass keeps treating it as `http.serve`;
     /// only the runtime symbol codegen calls differs.
-    HttpServe { host: Operand, port: Operand, out: Slot, shared: bool },
+    HttpServe {
+        host: Operand,
+        port: Operand,
+        out: Slot,
+        shared: bool,
+    },
     /// `srv.accept()` — accept + parse one request: the runtime writes an owned `http_request_ctx`
     /// handle (opaque pointer) to `out` and returns an `i32` status (0 = ok; else `AL_INVALID` / errno →
     /// `Error`). The caller branches `Ok(http_request_ctx)` / `Err`. Impure.
-    HttpAccept { server: Operand, out: Slot },
+    HttpAccept {
+        server: Operand,
+        out: Slot,
+    },
     /// `ctx.method()` / `ctx.path()` — the request method / target as a `str` **view** `{ptr,len}` into
     /// `ctx`'s buffer (region-bound to `ctx`). Pure.
-    HttpCtxMethod { ctx: Operand },
-    HttpCtxPath { ctx: Operand },
+    HttpCtxMethod {
+        ctx: Operand,
+    },
+    HttpCtxPath {
+        ctx: Operand,
+    },
     /// `hs.get(name)` — a case-insensitive request-header lookup through a `http_headers` view,
     /// writing a `str` **view** `{ptr,len}` to `out` and returning an `i32` present flag (1/0). Pure.
     /// The `ctx` operand is the view itself, whose representation IS the `http_request_ctx` pointer
     /// (http.md item 10 ②), so the runtime call is unchanged from when this was `ctx.header(name)`.
-    HttpCtxHeader { ctx: Operand, name: Operand, out: Slot },
+    HttpCtxHeader {
+        ctx: Operand,
+        name: Operand,
+        out: Slot,
+    },
     /// `ctx.body()` — the request body as a `slice<u8>` **view** `{ptr,len}` into `ctx`'s buffer
     /// (region-bound to `ctx`). Pure.
-    HttpCtxBody { ctx: Operand },
+    HttpCtxBody {
+        ctx: Operand,
+    },
     /// `http.response(status)` — allocate a `response_builder` handle (opaque pointer), returned by
     /// value (the bound local `Drop`-frees it via `http_response_free`). Pure.
-    HttpResponseBuilder { status: Operand },
+    HttpResponseBuilder {
+        status: Operand,
+    },
     /// `rb.header(name, value)` — append a header to the response builder `rb` (mutated in place; aborts
     /// on CR/LF/NUL, P6). Yields `()`. Pure.
-    HttpRbHeader { rb: Operand, name: Operand, value: Operand },
+    HttpRbHeader {
+        rb: Operand,
+        name: Operand,
+        value: Operand,
+    },
     /// `rb.body(data)` — set the response builder `rb`'s body to a copy of `data`. Yields `()`. Pure.
-    HttpRbBody { rb: Operand, data: Operand },
+    HttpRbBody {
+        rb: Operand,
+        data: Operand,
+    },
     /// `ctx.respond(rb)` — serialize `rb`, write the response to `ctx`'s connection, close the fd.
     /// **Both** `ctx` and `rb` are opaque pointers **moved in** (the runtime frees both, so the MIR nulls
     /// both source slots). Returns an `i32` status (0 = ok; else `AL_INVALID` / errno → `Error`); the
     /// caller branches `Ok(())` / `Err`. Impure.
-    HttpRespond { ctx: Operand, rb: Operand },
+    HttpRespond {
+        ctx: Operand,
+        rb: Operand,
+    },
     /// `ctx.respond_stream(rb)` — validate + serialize `rb`'s head + the transfer framing (stored in
     /// the stream, written lazily by the first send), lift the fd out of `ctx`, and write an owned
     /// `http_stream` handle (opaque pointer) to `out`. `rb` is an opaque pointer **moved in** (the
     /// runtime frees it, so the MIR nulls its source slot); `ctx` is **borrowed** (stays with the
     /// caller, spent — its views remain valid; http.md item 8 ①). Returns an `i32` status (0 = ok;
     /// else `AL_INVALID` → `Error`); the caller branches `Ok(http_stream)` / `Err`. Impure.
-    HttpRespondStream { ctx: Operand, rb: Operand, out: Slot },
+    HttpRespondStream {
+        ctx: Operand,
+        rb: Operand,
+        out: Slot,
+    },
     /// `s.send(chunk)` / `s.send_event(data)` — write one streamed chunk to the stream `s` (opaque
     /// pointer, **borrowed** — mutated in place, not consumed); `chunk` is a byte view `{ptr,len}`.
     /// With `event` set the runtime wraps the payload as one WHATWG SSE frame (`data: {data}\n\n`)
     /// in the same single write. Returns an `i32` status (0 = ok, incl. the plain-send empty-chunk
     /// no-op; else errno → `Error`); the caller branches `Ok(())` / `Err`. Impure.
-    HttpStreamSend { stream: Operand, chunk: Operand, event: bool },
+    HttpStreamSend {
+        stream: Operand,
+        chunk: Operand,
+        event: bool,
+    },
     /// `s.finish()` — write the terminator (framed mode) + close the fd. `s` is an opaque pointer
     /// **moved in** (the runtime frees it, so the MIR nulls its source slot). Returns an `i32` status
     /// (0 = ok; else `AL_INVALID` → `Error`); the caller branches `Ok(())` / `Err`. Impure.
-    HttpStreamFinish { stream: Operand },
+    HttpStreamFinish {
+        stream: Operand,
+    },
     /// `s.reject(rb)` — discard the lazy head and answer with a complete NORMAL response instead of
     /// streaming (legal only before the first send). **Both** `s` and `rb` are opaque pointers
     /// **moved in** (the runtime frees both, so the MIR nulls both source slots). Returns an `i32`
     /// status (0 = ok; else `AL_INVALID` / errno → `Error`); the caller branches `Ok(())` / `Err`.
     /// Impure.
-    HttpStreamReject { stream: Operand, rb: Operand },
+    HttpStreamReject {
+        stream: Operand,
+        rb: Operand,
+    },
 }
 
 /// One piece of a lowered `template`: a static run, or an interpolated value.
@@ -1572,28 +2325,44 @@ pub enum TemplatePiece {
     /// `"name":<payload>,` (payload rendered per its scalar kind — int/float/bool raw, str
     /// JSON-escaped — with a trailing comma); when `None`, append nothing. `opt`'s type
     /// (`Ty::Option(scalar)`) tells codegen the payload kind. Paired with [`PopComma`].
-    OptionField { opt: Operand, name: String },
+    OptionField {
+        opt: Operand,
+        name: String,
+    },
     /// `json.encode` of an `Option<struct>` field (JSON completeness T1b): when `opt` is `Some`, append
     /// `"name":{…},` (the payload struct rendered by the runtime descriptor-driven encoder); when
     /// `None`, append nothing. `struct_id` is the payload struct (codegen emits its descriptor table).
     /// Paired with [`PopComma`].
-    OptionStructField { opt: Operand, name: String, struct_id: u32 },
+    OptionStructField {
+        opt: Operand,
+        name: String,
+        struct_id: u32,
+    },
     /// Drop a single trailing `,` — the "omit `None`" comma fixup before an `Option`-bearing object's
     /// closing `}`.
     PopComma,
     /// `json.encode` of an `array<Struct>` field (REST-gateway runway Slice C): emit the owned AoS
     /// `array` (`{ptr,len}`) as `[{...},...]` via the runtime descriptor-driven encoder. `struct_id`
     /// is the element struct (codegen emits its schema + element stride for the runtime call).
-    StructArrayField { array: Operand, struct_id: u32 },
+    StructArrayField {
+        array: Operand,
+        struct_id: u32,
+    },
     /// `json.encode` of an `array<scalar>` field (JSON completeness T1b): emit the owned scalar buffer
     /// (`{ptr,len}`) as `[e0,e1,…]` via the runtime encoder. `elem` is the element scalar
     /// (int/float/bool); codegen packs its kind/width/sign into the runtime call's element tag. The
     /// structural Program fingerprint includes `elem`.
-    ScalarArrayField { array: Operand, elem: align_sema::Scalar },
+    ScalarArrayField {
+        array: Operand,
+        elem: align_sema::Scalar,
+    },
     /// `json.encode` of a shape-directed **union** (`enum`) value (JSON completeness J1b): emit the
     /// live variant's payload **bare** (no wrapper key) via the runtime union encoder, so
     /// `decode(encode(x))` round-trips. `enum_id` selects the [`JsonUnion`] descriptor codegen emits.
-    UnionValue { value: Operand, enum_id: u32 },
+    UnionValue {
+        value: Operand,
+        enum_id: u32,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -2019,10 +2788,22 @@ fn hir_program_validation_reason(
     /// One gate: its identity and its predicate.
     type Gate = (ValidationPass, fn(&hir::Program) -> bool);
     let gates: [Gate; 7] = [
-        (ValidationPass::BodyDepth, align_sema::checked_hir_body_depth_is_valid),
-        (ValidationPass::GlobalTypes, validate_hir::global_type_metadata_is_valid),
-        (ValidationPass::TypePlacement, validate_hir::type_placement_metadata_is_valid),
-        (ValidationPass::NominalLink, validate_hir::nominal_link_metadata_is_valid),
+        (
+            ValidationPass::BodyDepth,
+            align_sema::checked_hir_body_depth_is_valid,
+        ),
+        (
+            ValidationPass::GlobalTypes,
+            validate_hir::global_type_metadata_is_valid,
+        ),
+        (
+            ValidationPass::TypePlacement,
+            validate_hir::type_placement_metadata_is_valid,
+        ),
+        (
+            ValidationPass::NominalLink,
+            validate_hir::nominal_link_metadata_is_valid,
+        ),
         (
             ValidationPass::DeclarationHeaders,
             validate_hir::declaration_header_metadata_is_valid,
@@ -2031,7 +2812,10 @@ fn hir_program_validation_reason(
             validate_hir::json_scan_validation_reason(program).is_ok()
         }),
         // `Bodies` is checked between JsonScan and BodyFacts, below, so it can name its function.
-        (ValidationPass::BodyFacts, align_sema::checked_hir_body_facts_are_valid),
+        (
+            ValidationPass::BodyFacts,
+            align_sema::checked_hir_body_facts_are_valid,
+        ),
     ];
     // Destructured, not indexed: `Bodies` runs between them so it can name its function, and a
     // magic 6 in two places is how that split silently loses a gate when one is added.
@@ -2288,15 +3072,11 @@ pub fn function_embedded_types(f: &Function) -> Vec<Ty> {
                         types.extend(call.param_tys.iter().copied());
                         types.push(call.ret_ty);
                     }
-                    Rvalue::SpawnTask {
-                        capture_tys, r, ..
-                    } => {
+                    Rvalue::SpawnTask { capture_tys, r, .. } => {
                         types.extend(capture_tys.iter().copied());
                         types.push(*r);
                     }
-                    Rvalue::RawLoad { scalar, .. } => {
-                        types.push(align_sema::scalar_to_ty(*scalar))
-                    }
+                    Rvalue::RawLoad { scalar, .. } => types.push(align_sema::scalar_to_ty(*scalar)),
                     Rvalue::MakeVec { elem, .. }
                     | Rvalue::VecExtract { elem, .. }
                     | Rvalue::VecSumWhere { elem, .. }
@@ -2385,11 +3165,7 @@ fn canonicalize_tagged_types(program: &mut Program) {
     ) {
         match ty {
             Ty::Tagged(id) => collect_scalar(Scalar::Tagged(id), table, reachable),
-            Ty::Option(s)
-            | Ty::Box(s)
-            | Ty::Slice(s)
-            | Ty::DynArray(s)
-            | Ty::Task(s) => {
+            Ty::Option(s) | Ty::Box(s) | Ty::Slice(s) | Ty::DynArray(s) | Ty::Task(s) => {
                 collect_scalar(s, table, reachable)
             }
             Ty::ArrayBuilder(s) => collect_scalar(s, table, reachable),
@@ -2562,11 +3338,7 @@ fn canonicalize_tagged_types(program: &mut Program) {
                     *id = *new;
                 }
             }
-            Ty::Option(s)
-            | Ty::Box(s)
-            | Ty::Slice(s)
-            | Ty::DynArray(s)
-            | Ty::Task(s) => {
+            Ty::Option(s) | Ty::Box(s) | Ty::Slice(s) | Ty::DynArray(s) | Ty::Task(s) => {
                 remap_scalar(s, remap)
             }
             Ty::ArrayBuilder(s) => remap_scalar(s, remap),
@@ -2819,7 +3591,10 @@ fn simplify_known_drop_flags(f: &mut Function) {
     fn operand_state(op: &Operand, values: &[BoolState]) -> BoolState {
         match op {
             Operand::Const(Const::Bool(value)) => BoolState::Const(*value),
-            Operand::Value(value) => values.get(*value as usize).copied().unwrap_or(BoolState::Unknown),
+            Operand::Value(value) => values
+                .get(*value as usize)
+                .copied()
+                .unwrap_or(BoolState::Unknown),
             _ => BoolState::Unknown,
         }
     }
@@ -2855,7 +3630,9 @@ fn simplify_known_drop_flags(f: &mut Function) {
         for value in touched_values.drain(..) {
             values[value] = BoolState::Unknown;
         }
-        let mut slots = incoming[block_id as usize].clone().expect("queued MIR block is reachable");
+        let mut slots = incoming[block_id as usize]
+            .clone()
+            .expect("queued MIR block is reachable");
         let block = &f.blocks[block_id as usize];
         for stmt in &block.stmts {
             match stmt {
@@ -2875,7 +3652,9 @@ fn simplify_known_drop_flags(f: &mut Function) {
         }
 
         let branch_state = match &block.term {
-            Term::Branch(cond, ..) if is_drop_guard(f, &block.term) => Some(operand_state(cond, &values)),
+            Term::Branch(cond, ..) if is_drop_guard(f, &block.term) => {
+                Some(operand_state(cond, &values))
+            }
             _ => None,
         };
         known_terms[block_id as usize] = branch_state.and_then(|state| match state {
@@ -2975,9 +3754,17 @@ enum BuilderKey {
 
 /// Resolve a builder operand to a [`BuilderKey`]. `loads` maps a value id to the slot it loads (when
 /// the value was produced by `Load(slot)`), so repeated `Load(slot)` operands compare equal.
-fn builder_key(op: &Operand, loads: &std::collections::HashMap<ValueId, Slot>) -> Option<BuilderKey> {
+fn builder_key(
+    op: &Operand,
+    loads: &std::collections::HashMap<ValueId, Slot>,
+) -> Option<BuilderKey> {
     match op {
-        Operand::Value(v) => Some(loads.get(v).map(|s| BuilderKey::Slot(*s)).unwrap_or(BuilderKey::Value(*v))),
+        Operand::Value(v) => Some(
+            loads
+                .get(v)
+                .map(|s| BuilderKey::Slot(*s))
+                .unwrap_or(BuilderKey::Value(*v)),
+        ),
         Operand::Arg(i) => Some(BuilderKey::Arg(*i)),
         Operand::Const(_)
         | Operand::BorrowedPlace(_)
@@ -2993,7 +3780,9 @@ fn builder_key(op: &Operand, loads: &std::collections::HashMap<ValueId, Slot>) -
 fn is_movable_stmt(s: &Stmt) -> bool {
     matches!(
         s,
-        Stmt::Let(_, Rvalue::Load(_)) | Stmt::Let(_, Rvalue::StrLit(_)) | Stmt::Let(_, Rvalue::Use(_))
+        Stmt::Let(_, Rvalue::Load(_))
+            | Stmt::Let(_, Rvalue::StrLit(_))
+            | Stmt::Let(_, Rvalue::Use(_))
     )
 }
 
@@ -3105,10 +3894,14 @@ fn find_next_write(
     for (offset, s) in stmts[start..end].iter().enumerate() {
         let idx = start + offset;
         match (shape, s) {
-            (WriteShape::Int, Stmt::Let(_, Rvalue::BuilderWriteInt(b, n))) if builder_key(b, loads) == Some(key) => {
+            (WriteShape::Int, Stmt::Let(_, Rvalue::BuilderWriteInt(b, n)))
+                if builder_key(b, loads) == Some(key) =>
+            {
                 return Some((idx, n.clone()));
             }
-            (WriteShape::Str, Stmt::Let(_, Rvalue::BuilderWriteStr(b, s2))) if builder_key(b, loads) == Some(key) => {
+            (WriteShape::Str, Stmt::Let(_, Rvalue::BuilderWriteStr(b, s2)))
+                if builder_key(b, loads) == Some(key) =>
+            {
                 return Some((idx, s2.clone()));
             }
             _ if is_movable_stmt(s) => continue,
@@ -3306,8 +4099,12 @@ impl Builder {
     }
 
     fn value_drop_flag(&self, operand: &Operand) -> Option<Operand> {
-        let Operand::Value(value) = operand else { return None };
-        self.value_drop_flags.get(*value as usize).and_then(Clone::clone)
+        let Operand::Value(value) = operand else {
+            return None;
+        };
+        self.value_drop_flags
+            .get(*value as usize)
+            .and_then(Clone::clone)
     }
 
     fn attach_value_temp_drop_flag(&mut self, value: ValueId, flag: Operand) {
@@ -3315,8 +4112,13 @@ impl Builder {
     }
 
     fn value_temp_drop_flag(&self, operand: &Operand) -> Option<Operand> {
-        let Operand::Value(value) = operand else { return None };
-        self.ctx.value_temp_drop_flags.get(*value as usize).and_then(Clone::clone)
+        let Operand::Value(value) = operand else {
+            return None;
+        };
+        self.ctx
+            .value_temp_drop_flags
+            .get(*value as usize)
+            .and_then(Clone::clone)
     }
 
     fn attach_borrow_owners(&mut self, value: ValueId, owners: impl IntoIterator<Item = Slot>) {
@@ -3329,8 +4131,14 @@ impl Builder {
     }
 
     fn borrow_owners(&self, operand: &Operand) -> Vec<Slot> {
-        let Operand::Value(value) = operand else { return Vec::new() };
-        self.ctx.value_borrow_owners.get(*value as usize).cloned().unwrap_or_default()
+        let Operand::Value(value) = operand else {
+            return Vec::new();
+        };
+        self.ctx
+            .value_borrow_owners
+            .get(*value as usize)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// A fresh alias-scope id for a `map_into` loop — its `in`/`out` scopes are declared disjoint
@@ -3597,7 +4405,12 @@ fn lower_fn(
             synthetic_drop_slots: Vec::new(),
             value_borrow_owners: Vec::new(),
             slot_borrow_owners: std::collections::HashMap::new(),
-            dbg: lines.map(|l| Box::new(LineCtx { lines: Rc::clone(l), cur_span: None })),
+            dbg: lines.map(|l| {
+                Box::new(LineCtx {
+                    lines: Rc::clone(l),
+                    cur_span: None,
+                })
+            }),
             fn_types: Rc::clone(fn_types),
             named_return_cleanup: Rc::clone(named_return_cleanup),
             named_param_modes: Rc::clone(named_param_modes),
@@ -3646,7 +4459,9 @@ fn lower_fn(
         } else {
             None
         };
-        if f.ret != Ty::Unit && let Some(v) = &f.body.value {
+        if f.ret != Ty::Unit
+            && let Some(v) = &f.body.value
+        {
             null_moved_source(&mut b, v);
         }
         let tail = tail.filter(|_| f.ret != Ty::Unit);
@@ -3765,7 +4580,9 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         // A bound owned local moved into a wrapper (`return Ok(xs)` / `Some(xs)` / `Err(xs)`) is
         // consumed by the construction — see through the wrapper to null the source slot, else the
         // local's exit `Drop` double-frees the buffer now owned by the aggregate.
-        hir::ExprKind::ResultOk(inner) | hir::ExprKind::ResultErr(inner) | hir::ExprKind::OptionSome(inner) => {
+        hir::ExprKind::ResultOk(inner)
+        | hir::ExprKind::ResultErr(inner)
+        | hir::ExprKind::OptionSome(inner) => {
             null_moved_source(b, inner);
         }
         // A bound owned local moved into a sum-type variant (`Content.Parts(xs)`, J2) is consumed by
@@ -3833,7 +4650,10 @@ fn moved_drop_flag(b: &mut Builder, e: &hir::Expr) -> Option<Operand> {
     // ownership bit is that block's tail's. Kept on the shared enumeration so this, its sibling in
     // `temporary_drop_flag`, and `borrow_mode_differs` cannot drift apart.
     let runtime = if let Some(block) = borrow_transparent_scope_block(e) {
-        block.value.as_ref().and_then(|value| moved_drop_flag(b, value))
+        block
+            .value
+            .as_ref()
+            .and_then(|value| moved_drop_flag(b, value))
     } else {
         match &e.kind {
             hir::ExprKind::Local(id) => {
@@ -3882,7 +4702,10 @@ fn temporary_drop_flag(b: &mut Builder, e: &hir::Expr, operand: &Operand) -> Opt
         return lowered_drop_flag(b, e, operand);
     }
     if let Some(block) = borrow_transparent_scope_block(e) {
-        return block.value.as_ref().and_then(|value| temporary_drop_flag(b, value, operand));
+        return block
+            .value
+            .as_ref()
+            .and_then(|value| temporary_drop_flag(b, value, operand));
     }
     match &e.kind {
         hir::ExprKind::Local(_)
@@ -3944,7 +4767,9 @@ fn lower_expr_for_borrow(b: &mut Builder, e: &hir::Expr) -> Operand {
         return lower_expr(b, e);
     }
     debug_assert!(
-        !b.ctx.eager_expr_results.contains_key(&(std::ptr::from_ref(e) as usize)),
+        !b.ctx
+            .eager_expr_results
+            .contains_key(&(std::ptr::from_ref(e) as usize)),
         "the eager worklist pre-lowered a borrow edge in non-borrow mode: a parent that lowers a \
          child through this helper must filter it in `eager_worklist_children`",
     );
@@ -3953,8 +4778,12 @@ fn lower_expr_for_borrow(b: &mut Builder, e: &hir::Expr) -> Operand {
     }
     match &e.kind {
         hir::ExprKind::If { cond, then, els } => lower_if(b, cond, then, els, e.ty, true),
-        hir::ExprKind::Match { scrutinee, arms, .. } => lower_match(b, scrutinee, arms, e.ty, true),
-        hir::ExprKind::ElseUnwrap { opt, fallback } => lower_else_unwrap(b, opt, fallback, e.ty, true),
+        hir::ExprKind::Match {
+            scrutinee, arms, ..
+        } => lower_match(b, scrutinee, arms, e.ty, true),
+        hir::ExprKind::ElseUnwrap { opt, fallback } => {
+            lower_else_unwrap(b, opt, fallback, e.ty, true)
+        }
         hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) => {
             lower_block_for_borrow(b, block).unwrap_or(Operand::Const(Const::Unit))
         }
@@ -4075,7 +4904,11 @@ fn disarm_borrow_owners(b: &mut Builder, operand: &Operand) {
     }
 }
 
-fn inherit_borrow_owners<'a>(b: &mut Builder, value: ValueId, operands: impl IntoIterator<Item = &'a Operand>) {
+fn inherit_borrow_owners<'a>(
+    b: &mut Builder,
+    value: ValueId,
+    operands: impl IntoIterator<Item = &'a Operand>,
+) {
     let mut owners = Vec::new();
     for operand in operands {
         for owner in b.borrow_owners(operand) {
@@ -4135,11 +4968,13 @@ fn store_control_result(
 ) {
     if let Some(slot) = value_slot {
         if let Some(flag_slot) = flag_slot {
-            let flag = lowered_drop_flag(b, expr, &operand).unwrap_or(Operand::Const(Const::Bool(false)));
+            let flag =
+                lowered_drop_flag(b, expr, &operand).unwrap_or(Operand::Const(Const::Bool(false)));
             b.push(Stmt::Store(flag_slot, flag));
         }
         if let Some(temp_flag_slot) = temp_flag_slot {
-            let flag = temporary_drop_flag(b, expr, &operand).unwrap_or(Operand::Const(Const::Bool(false)));
+            let flag = temporary_drop_flag(b, expr, &operand)
+                .unwrap_or(Operand::Const(Const::Bool(false)));
             b.push(Stmt::Store(temp_flag_slot, flag));
         }
         let owners = b.borrow_owners(&operand);
@@ -4164,7 +4999,9 @@ fn load_control_result(
     flag_slot: Option<Slot>,
     temp_flag_slot: Option<Slot>,
 ) -> Operand {
-    let Some(value_slot) = value_slot else { return Operand::Const(Const::Unit) };
+    let Some(value_slot) = value_slot else {
+        return Operand::Const(Const::Unit);
+    };
     let value = b.fresh_value(ty);
     b.push(Stmt::Let(value, Rvalue::Load(value_slot)));
     if let Some(flag_slot) = flag_slot {
@@ -4299,10 +5136,16 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 // (doc-13 §8.4, S3) instead copies once from a per-unit rodata global (the #514
                 // mechanism) — sema sets `pooled` only for a non-`mut`, non-`align(N)`, fixed
                 // `array<T>` binding whose every element folds to a constant scalar.
-                hir::ExprKind::ArrayLit { elems, elem, pooled: true } => {
-                    store_const_array_pooled(b, *local, elems, *elem)
-                }
-                hir::ExprKind::ArrayLit { elems, elem, pooled: false } => {
+                hir::ExprKind::ArrayLit {
+                    elems,
+                    elem,
+                    pooled: true,
+                } => store_const_array_pooled(b, *local, elems, *elem),
+                hir::ExprKind::ArrayLit {
+                    elems,
+                    elem,
+                    pooled: false,
+                } => {
                     inherited_flag = store_array_elems(b, *local, elems, *elem);
                     if !lowering_continues(b) {
                         return;
@@ -4324,7 +5167,12 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 None => b.set_drop_flag(*local, b.drop_individual_locals.contains(local)),
             }
         }
-        hir::Stmt::Assign { local, value, drop_old, drop_new } => {
+        hir::Stmt::Assign {
+            local,
+            value,
+            drop_old,
+            drop_new,
+        } => {
             // Compute the new value first (the RHS may read the old). Then, if reassigning an owned
             // local whose old value the RHS did not move out (`drop_old`, set by sema's move
             // analysis), conditionally free the buffer being overwritten — else it leaks. The
@@ -4414,7 +5262,14 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 other => unreachable!("element assignment into non-array/slice {other:?}"),
             }
         }
-        hir::Stmt::AssignElemField { base, index, path, struct_id, soa, value } => {
+        hir::Stmt::AssignElemField {
+            base,
+            index,
+            path,
+            struct_id,
+            soa,
+            value,
+        } => {
             // `base[index].f0.f1.… = value` — bounds-checked element-(nested-)field store (the write
             // counterpart of the `base[index].f0.f1.…` read). A `soa<Struct>` writes one column
             // (`StoreColumn`, the column-major `align_up` offset chain; soa columns are scalar, so
@@ -4433,8 +5288,12 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 // The column buffer's element-pointer type is opaque, so the `Box` scalar is
                 // irrelevant (matches `transpose_to_soa`) — use the first field's. A soa struct
                 // always has ≥1 field (sema enforces non-empty).
-                let first_field = b.structs[*struct_id as usize].fields.first().expect("a soa struct has at least one field");
-                let first_scalar = align_sema::ty_to_scalar(first_field.ty).expect("soa field is a scalar");
+                let first_field = b.structs[*struct_id as usize]
+                    .fields
+                    .first()
+                    .expect("a soa struct has at least one field");
+                let first_scalar =
+                    align_sema::ty_to_scalar(first_field.ty).expect("soa field is a scalar");
                 let ptr = b.fresh_value(Ty::Box(first_scalar));
                 b.push(Stmt::Let(ptr, Rvalue::SlicePtr(Operand::Value(sv))));
                 // A soa column is scalar, so sema restricts the path to a single field.
@@ -4484,7 +5343,13 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 }
             }
         }
-        hir::Stmt::AssignElem { base, index, struct_id, soa, value } => {
+        hir::Stmt::AssignElem {
+            base,
+            index,
+            struct_id,
+            soa,
+            value,
+        } => {
             // `base[index] = value` — bounds-checked whole-element store (the write counterpart of
             // the `base[index]` read / `s[i]` gather). A `soa<Struct>` scatters the value's fields
             // into their columns (`StoreColumn` per field); a fixed `array<Struct>` stores the whole
@@ -4501,8 +5366,16 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 emit_bounds_check(b, &idx, Operand::Value(len));
                 // Snapshot the field types once (each is Copy) so the scatter loop neither
                 // re-indexes `b.structs` nor holds a borrow of `b` across its `b.push` calls.
-                let field_tys: Vec<Ty> = b.structs[*struct_id as usize].fields.iter().map(|f| f.ty).collect();
-                let first_scalar = align_sema::ty_to_scalar(*field_tys.first().expect("a soa struct has at least one field"))
+                let field_tys: Vec<Ty> = b.structs[*struct_id as usize]
+                    .fields
+                    .iter()
+                    .map(|f| f.ty)
+                    .collect();
+                let first_scalar = align_sema::ty_to_scalar(
+                    *field_tys
+                        .first()
+                        .expect("a soa struct has at least one field"),
+                )
                     .expect("soa field is a scalar");
                 let ptr = b.fresh_value(Ty::Box(first_scalar));
                 b.push(Stmt::Let(ptr, Rvalue::SlicePtr(Operand::Value(sv))));
@@ -4547,7 +5420,14 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             let cur = b.fresh_value(vty);
             b.push(Stmt::Let(cur, Rvalue::Load(*local)));
             let newv = b.fresh_value(vty);
-            b.push(Stmt::Let(newv, Rvalue::VecInsert { vec: Operand::Value(cur), value: val, lane: *lane }));
+            b.push(Stmt::Let(
+                newv,
+                Rvalue::VecInsert {
+                    vec: Operand::Value(cur),
+                    value: val,
+                    lane: *lane,
+                },
+            ));
             b.push(Stmt::Store(*local, Operand::Value(newv)));
         }
         hir::Stmt::Return(value) => {
@@ -4639,7 +5519,13 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 if let Some(lid) = lid {
                     let ety = b.slots[*lid as usize];
                     let v = b.fresh_value(ety);
-                    b.push(Stmt::Let(v, Rvalue::TupleIndex { tuple: tup.clone(), index: i as u32 }));
+                    b.push(Stmt::Let(
+                        v,
+                        Rvalue::TupleIndex {
+                            tuple: tup.clone(),
+                            index: i as u32,
+                        },
+                    ));
                     b.push(Stmt::Store(*lid, Operand::Value(v)));
                     match inherited_flag.clone() {
                         Some(flag) => b.set_drop_flag_operand(*lid, flag),
@@ -4774,12 +5660,10 @@ fn template_piece(part: &hir::TemplatePart, operand: Operand) -> TemplatePiece {
             name: name.clone(),
             struct_id: *struct_id,
         },
-        hir::TemplatePart::StructArrayField { struct_id, .. } => {
-            TemplatePiece::StructArrayField {
+        hir::TemplatePart::StructArrayField { struct_id, .. } => TemplatePiece::StructArrayField {
                 array: operand,
                 struct_id: *struct_id,
-            }
-        }
+        },
         hir::TemplatePart::ScalarArrayField { elem, .. } => TemplatePiece::ScalarArrayField {
             array: operand,
             elem: *elem,
@@ -4807,7 +5691,10 @@ fn template_part_expr(part: &hir::TemplatePart) -> Option<&hir::Expr> {
     }
 }
 
-fn lower_template_parts(b: &mut Builder, parts: &[hir::TemplatePart]) -> Option<Vec<TemplatePiece>> {
+fn lower_template_parts(
+    b: &mut Builder,
+    parts: &[hir::TemplatePart],
+) -> Option<Vec<TemplatePiece>> {
     let mut pieces = Vec::with_capacity(parts.len());
     for part in parts {
         match part {
@@ -4989,10 +5876,7 @@ fn lower_template_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
                 let frame = frames.pop().expect("one template frame is active");
                 let arena = b.arenas.last().map(|handle| Operand::Value(*handle));
                 let result = b.fresh_value(frame.expr.ty);
-                b.push(Stmt::Let(
-                    result,
-                    Rvalue::Template(frame.pieces, arena),
-                ));
+                b.push(Stmt::Let(result, Rvalue::Template(frame.pieces, arena)));
                 if let Some(owner) = frame.owner {
                     b.push(Stmt::Store(owner, Operand::Value(result)));
                     b.set_drop_flag(owner, true);
@@ -5045,9 +5929,7 @@ fn lower_plain_block_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
 
     let mut posts = Vec::new();
     let mut current = root;
-    while let hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) =
-        &current.kind
-    {
+    while let hir::ExprKind::Block(block) | hir::ExprKind::Unsafe(block) = &current.kind {
         if block.stmts.is_empty()
             && let Some(value) = block.value.as_deref()
         {
@@ -5058,13 +5940,7 @@ fn lower_plain_block_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
         }
         if block.value.is_none()
             && let [hir::Stmt::Expr(expr)] = block.stmts.as_slice()
-            && !needs_drop_flag(
-                expr.ty,
-                &b.structs,
-                &b.tuples,
-                &b.enums,
-                &b.tagged_types,
-            )
+            && !needs_drop_flag(expr.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
         {
             b.set_span(expr.span);
             posts.push(Post::ExprStmt);
@@ -5111,7 +5987,10 @@ fn wildcard_match_parts<'a>(
     b: &Builder,
     expr: &'a hir::Expr,
 ) -> Option<(&'a hir::Expr, &'a hir::Expr)> {
-    let hir::ExprKind::Match { scrutinee, arms, .. } = &expr.kind else {
+    let hir::ExprKind::Match {
+        scrutinee, arms, ..
+    } = &expr.kind
+    else {
         return None;
     };
     let [arm] = arms.as_slice() else {
@@ -5142,8 +6021,7 @@ fn lower_wildcard_match_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
     let mut terminated_while_descending = false;
     while let Some((scrutinee, body)) = wildcard_match_parts(b, current) {
         started = true;
-        let (result_slot, result_flag, result_temp_flag) =
-            control_result_slots(b, current.ty);
+        let (result_slot, result_flag, result_temp_flag) = control_result_slots(b, current.ty);
         let _scrutinee = lower_expr_for_borrow(b, scrutinee);
         if !lowering_continues(b) {
             terminated_while_descending = true;
@@ -5162,7 +6040,10 @@ fn lower_wildcard_match_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
     }
 
     if !started {
-        let hir::ExprKind::Match { scrutinee, arms, .. } = &root.kind else {
+        let hir::ExprKind::Match {
+            scrutinee, arms, ..
+        } = &root.kind
+        else {
             unreachable!("a wildcard match spine starts at Match")
         };
         return lower_match(b, scrutinee, arms, root.ty, false);
@@ -5354,7 +6235,10 @@ fn expression_uses_eager_worklist(e: &hir::Expr) -> bool {
 /// per-arm SSA values from blocks that do not dominate them (`docs/impl/05-backend-llvm.md` §1).
 fn eager_worklist_children(parent: &hir::Expr) -> Vec<&hir::Expr> {
     let mut children = align_sema::direct_expr_children(parent);
-    if matches!(parent.kind, hir::ExprKind::StrBorrow(_) | hir::ExprKind::StrClone(_)) {
+    if matches!(
+        parent.kind,
+        hir::ExprKind::StrBorrow(_) | hir::ExprKind::StrClone(_)
+    ) {
         children.retain(|child| !borrow_mode_differs(child));
     }
     children
@@ -5765,9 +6649,8 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 })
             }
             hir::ExprKind::CreateExclusive { path } => {
-                lower_open_handle(b, path, Ty::Writer, e.ty, |p, out| Rvalue::WriterCreateExclusive {
-                    path: p,
-                    out,
+                lower_open_handle(b, path, Ty::Writer, e.ty, |p, out| {
+                    Rvalue::WriterCreateExclusive { path: p, out }
                 })
             }
             hir::ExprKind::ReaderOpenBeneath { root, relative } => {
@@ -5984,9 +6867,20 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 b.push(Stmt::Let(code, Rvalue::FsRemove { path: pop }));
                 lower_status_result(b, code, e.ty)
             }
-            hir::ExprKind::RenameNoReplace { source, destination } => {
-                lower_required_binding!(b, source_op = lower_expr(b, source), Operand::Const(Const::Unit));
-                lower_required_binding!(b, destination_op = lower_expr(b, destination), Operand::Const(Const::Unit));
+            hir::ExprKind::RenameNoReplace {
+                source,
+                destination,
+            } => {
+                lower_required_binding!(
+                    b,
+                    source_op = lower_expr(b, source),
+                    Operand::Const(Const::Unit)
+                );
+                lower_required_binding!(
+                    b,
+                    destination_op = lower_expr(b, destination),
+                    Operand::Const(Const::Unit)
+                );
                 let code = b.fresh_value(status_ty());
                 b.push(Stmt::Let(
                     code,
@@ -6689,9 +7583,11 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             hir::ExprKind::Field { root, path } => {
                 if let Some(place) = b.borrowed_bindings.get(root) {
                     let mut place = place.clone();
-                    place
-                        .path
-                        .extend(path.iter().copied().map(hir::BorrowedPathSegment::StructField));
+                    place.path.extend(
+                        path.iter()
+                            .copied()
+                            .map(hir::BorrowedPathSegment::StructField),
+                    );
                     place.ty = e.ty;
                     return Operand::BorrowedPlace(Box::new(place));
                 }
@@ -7175,7 +8071,11 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             }
             hir::ExprKind::CloneIn { value, region } => {
                 lower_required_binding!(b, src = lower_expr(b, value), Operand::Const(Const::Unit));
-                lower_required_binding!(b, handle = lower_expr(b, region), Operand::Const(Const::Unit));
+                lower_required_binding!(
+                    b,
+                    handle = lower_expr(b, region),
+                    Operand::Const(Const::Unit)
+                );
                 let v = b.fresh_value(e.ty);
                 b.push(Stmt::Let(v, Rvalue::CloneIn { value: src, handle }));
                 Operand::Value(v)
@@ -8011,7 +8911,10 @@ fn lower_consumed_aggregate_parts(
                 None => part_flag,
                 Some(previous) => {
                     let both = b.fresh_value(Ty::Bool);
-                    b.push(Stmt::Let(both, Rvalue::Bin(BinOp::And, previous, part_flag)));
+                    b.push(Stmt::Let(
+                        both,
+                        Rvalue::Bin(BinOp::And, previous, part_flag),
+                    ));
                     Operand::Value(both)
                 }
             });
@@ -8053,14 +8956,8 @@ fn store_consumed_struct_fields(
         hir::ExprKind::StructLit { fields, .. } => {
             for (index, field) in fields.iter().enumerate() {
                 path.push(index as u32);
-                let complete = store_consumed_struct_fields(
-                    b,
-                    slot,
-                    path,
-                    field,
-                    owners,
-                    aggregate_drop_flag,
-                );
+                let complete =
+                    store_consumed_struct_fields(b, slot, path, field, owners, aggregate_drop_flag);
                 path.pop();
                 if !complete {
                     return false;
@@ -8106,11 +9003,7 @@ fn null_consumed_struct_sources(b: &mut Builder, value: &hir::Expr) {
     }
 }
 
-fn lower_borrowed_place(
-    b: &mut Builder,
-    e: &hir::Expr,
-    mode: align_ast::ParamMode,
-) -> Operand {
+fn lower_borrowed_place(b: &mut Builder, e: &hir::Expr, mode: align_ast::ParamMode) -> Operand {
     if let hir::ExprKind::BorrowedIndex { base, index } = &e.kind {
         debug_assert_eq!(mode, align_ast::ParamMode::Borrow);
         let reservation = b.fresh_borrow_reservation();
@@ -8122,7 +9015,10 @@ fn lower_borrowed_place(
         if !lowering_continues(b) {
             return Operand::Const(Const::Unit);
         }
-        let Some(path) = base.path.strip_prefix(&[hir::BorrowedPathSegment::RootSlot]) else {
+        let Some(path) = base
+            .path
+            .strip_prefix(&[hir::BorrowedPathSegment::RootSlot])
+        else {
             b.terminate(Term::Unreachable);
             return Operand::Const(Const::Unit);
         };
@@ -8155,26 +9051,33 @@ fn lower_borrowed_place(
         _ => false,
     };
     let mut place = match &e.kind {
-        hir::ExprKind::Local(local) => b.borrowed_bindings.get(local).cloned().unwrap_or(
-            BorrowedPlace {
+        hir::ExprKind::Local(local) => {
+            b.borrowed_bindings
+                .get(local)
+                .cloned()
+                .unwrap_or(BorrowedPlace {
                 slot: *local,
                 path: Vec::new(),
                 ty: e.ty,
                 cleanup: None,
-            },
-        ),
+                })
+        }
         hir::ExprKind::Field { root, path } => {
-            let mut place = b.borrowed_bindings.get(root).cloned().unwrap_or(
-                BorrowedPlace {
+            let mut place = b
+                .borrowed_bindings
+                .get(root)
+                .cloned()
+                .unwrap_or(BorrowedPlace {
                     slot: *root,
                     path: Vec::new(),
                     ty: e.ty,
                     cleanup: None,
-                },
+                });
+            place.path.extend(
+                path.iter()
+                    .copied()
+                    .map(hir::BorrowedPathSegment::StructField),
             );
-            place
-                .path
-                .extend(path.iter().copied().map(hir::BorrowedPathSegment::StructField));
             place.ty = e.ty;
             place
         }
@@ -8267,11 +9170,7 @@ fn lower_call_fn_value(b: &mut Builder, e: &hir::Expr) -> Operand {
         );
         let (op, owner) = if borrowed {
             (
-                lower_borrowed_place(
-                    b,
-                    arg,
-                    signature.param_modes[index],
-                ),
+                lower_borrowed_place(b, arg, signature.param_modes[index]),
                 Vec::new(),
             )
         } else {
@@ -8303,14 +9202,7 @@ fn lower_call_fn_value(b: &mut Builder, e: &hir::Expr) -> Operand {
     for owner in arg_owners.into_iter().flatten() {
         b.set_drop_flag(owner, false);
     }
-    let result = emit_indirect_call(
-        b,
-        c.clone(),
-        ops.clone(),
-        param_tys,
-        e.ty,
-        signature,
-    );
+    let result = emit_indirect_call(b, c.clone(), ops.clone(), param_tys, e.ty, signature);
     if let Operand::Value(v) = &result {
         inherit_borrow_owners(b, *v, std::iter::once(&c).chain(ops.iter()));
     } else {
@@ -8418,11 +9310,7 @@ fn lower_raw_call(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
         Operand::Const(Const::Unit)
     } else {
-        inherit_borrow_owners(
-            b,
-            value,
-            std::iter::once(&callee).chain(operands.iter()),
-        );
+        inherit_borrow_owners(b, value, std::iter::once(&callee).chain(operands.iter()));
         Operand::Value(value)
     }
 }
@@ -8467,7 +9355,11 @@ fn emit_indirect_call(
     }
     // Align Unit is a value, but its function ABI is LLVM `void`. Keep the call statement for its
     // effects while giving every enclosing value context the canonical MIR Unit operand.
-    if ret_ty == Ty::Unit { Operand::Const(Const::Unit) } else { Operand::Value(v) }
+    if ret_ty == Ty::Unit {
+        Operand::Const(Const::Unit)
+    } else {
+        Operand::Value(v)
+    }
 }
 
 /// Finish a function-value action after all required children have fallen through. These helpers do
@@ -8556,7 +9448,11 @@ fn emit_named_call(b: &mut Builder, func: ProgramCall, args: Vec<Operand>, ret_t
             return Operand::Const(Const::Unit);
         }
     }
-    if ret_ty == Ty::Unit { Operand::Const(Const::Unit) } else { Operand::Value(v) }
+    if ret_ty == Ty::Unit {
+        Operand::Const(Const::Unit)
+    } else {
+        Operand::Value(v)
+    }
 }
 
 fn direct_call_target(func: &str, args: &[hir::Expr]) -> DirectCall {
@@ -8606,8 +9502,11 @@ fn lower_consumed_call_arg(b: &mut Builder, e: &hir::Expr) -> (Operand, Vec<Slot
     // each component through its own exact flag.
     match &e.kind {
         hir::ExprKind::Tuple { tuple_id, elems } => {
-            let Some(LoweredAggregateParts { operands, owners, drop_flag }) =
-                lower_consumed_aggregate_parts(b, elems)
+            let Some(LoweredAggregateParts {
+                operands,
+                owners,
+                drop_flag,
+            }) = lower_consumed_aggregate_parts(b, elems)
             else {
                 return (Operand::Const(Const::Unit), Vec::new());
             };
@@ -8623,11 +9522,21 @@ fn lower_consumed_call_arg(b: &mut Builder, e: &hir::Expr) -> (Operand, Vec<Slot
                 b.attach_value_drop_flag(value, flag.clone());
                 b.attach_value_temp_drop_flag(value, flag);
             }
-            return (Operand::Value(value), owners.into_iter().flatten().collect());
+            return (
+                Operand::Value(value),
+                owners.into_iter().flatten().collect(),
+            );
         }
-        hir::ExprKind::EnumValue { enum_id, variant, payload } => {
-            let Some(LoweredAggregateParts { operands, owners, drop_flag }) =
-                lower_consumed_aggregate_parts(b, payload)
+        hir::ExprKind::EnumValue {
+            enum_id,
+            variant,
+            payload,
+        } => {
+            let Some(LoweredAggregateParts {
+                operands,
+                owners,
+                drop_flag,
+            }) = lower_consumed_aggregate_parts(b, payload)
             else {
                 return (Operand::Const(Const::Unit), Vec::new());
             };
@@ -8644,7 +9553,10 @@ fn lower_consumed_call_arg(b: &mut Builder, e: &hir::Expr) -> (Operand, Vec<Slot
                 b.attach_value_drop_flag(value, flag.clone());
                 b.attach_value_temp_drop_flag(value, flag);
             }
-            return (Operand::Value(value), owners.into_iter().flatten().collect());
+            return (
+                Operand::Value(value),
+                owners.into_iter().flatten().collect(),
+            );
         }
         hir::ExprKind::StructLit { .. } => {
             let slot = b.new_slot(e.ty);
@@ -8678,8 +9590,7 @@ fn lower_consumed_call_arg(b: &mut Builder, e: &hir::Expr) -> (Operand, Vec<Slot
     // This is a transferring context, not a borrow. Transparent region wrappers may end with a
     // bound local whose ownership is moving into this hidden slot, so preserve its ordinary
     // runtime bit (the borrow-only classifier would deliberately report that local as not owned).
-    let live = lowered_drop_flag(b, e, &operand)
-        .unwrap_or(Operand::Const(Const::Bool(false)));
+    let live = lowered_drop_flag(b, e, &operand).unwrap_or(Operand::Const(Const::Bool(false)));
     b.push(Stmt::Store(owner, operand.clone()));
     b.set_drop_flag_operand(owner, live.clone());
     if let Operand::Value(value) = &operand {
@@ -8737,7 +9648,10 @@ fn lower_direct_call(b: &mut Builder, e: &hir::Expr) -> Operand {
     // `error(code)` is the language-level constructor for the scalar Error representation. It is
     // an identity in MIR, not a program or runtime callable, so it never enters either namespace.
     if func == "error" {
-        return ops.into_iter().next().unwrap_or(Operand::Const(Const::Unit));
+        return ops
+            .into_iter()
+            .next()
+            .unwrap_or(Operand::Const(Const::Unit));
     }
     // A by-value owned-array argument is moved into the callee. Borrow-only intrinsics retain the
     // source, matching their sema contract.
@@ -8787,13 +9701,19 @@ fn lower_direct_call(b: &mut Builder, e: &hir::Expr) -> Operand {
 
 /// The i64 type used for array indices / loop counters.
 fn i64_ty() -> Ty {
-    Ty::Int(IntTy { bits: 64, signed: true })
+    Ty::Int(IntTy {
+        bits: 64,
+        signed: true,
+    })
 }
 
 /// The i32 status code a runtime builtin (`fs`/`json`/`io`) returns, before it is wrapped into
 /// `Error.Code`.
 fn status_ty() -> Ty {
-    Ty::Int(IntTy { bits: 32, signed: true })
+    Ty::Int(IntTy {
+        bits: 32,
+        signed: true,
+    })
 }
 
 /// `x / -1` / `x % -1` (a *known* `-1` divisor): fold to the defined two's-complement result
@@ -8803,7 +9723,10 @@ fn fold_div_neg_one(b: &mut Builder, op: BinOp, l: Operand, ty: Ty) -> Operand {
     match op {
         BinOp::Div => {
             let w = b.fresh_value(ty);
-            b.push(Stmt::Let(w, Rvalue::Bin(BinOp::Sub, Operand::Const(Const::Int(0, ty)), l)));
+            b.push(Stmt::Let(
+                w,
+                Rvalue::Bin(BinOp::Sub, Operand::Const(Const::Int(0, ty)), l),
+            ));
             Operand::Value(w)
         }
         _ => Operand::Const(Const::Int(0, ty)),
@@ -8845,13 +9768,19 @@ fn lower_int_div(b: &mut Builder, op: BinOp, l: Operand, r: Operand, ty: Ty) -> 
     }
     // divisor == 0 → report and abort (cold edge), the same shape as `emit_bounds_check`.
     let is_zero = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(is_zero, Rvalue::Bin(BinOp::Eq, r.clone(), Operand::Const(Const::Int(0, ty)))));
+    b.push(Stmt::Let(
+        is_zero,
+        Rvalue::Bin(BinOp::Eq, r.clone(), Operand::Const(Const::Int(0, ty))),
+    ));
     let fail = b.new_block();
     let ok = b.new_block();
     b.terminate(Term::Branch(Operand::Value(is_zero), fail, ok));
     b.cur = fail;
     let t = b.fresh_value(Ty::Unit);
-    b.push(Stmt::Let(t, Rvalue::Call(DirectCall::Runtime(RuntimeKey::DivFail), vec![])));
+    b.push(Stmt::Let(
+        t,
+        Rvalue::Call(DirectCall::Runtime(RuntimeKey::DivFail), vec![]),
+    ));
     b.terminate(Term::Unreachable);
     b.cur = ok;
 
@@ -8863,20 +9792,37 @@ fn lower_int_div(b: &mut Builder, op: BinOp, l: Operand, r: Operand, ty: Ty) -> 
     }
     // Signed: fold away the `INT_MIN / -1` UB. `is_neg1` selects the wrapped result.
     let is_neg1 = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(is_neg1, Rvalue::Bin(BinOp::Eq, r.clone(), Operand::Const(Const::Int(-1, ty)))));
+    b.push(Stmt::Let(
+        is_neg1,
+        Rvalue::Bin(BinOp::Eq, r.clone(), Operand::Const(Const::Int(-1, ty))),
+    ));
     // Divide by `1` instead of `-1` so the raw sdiv/srem never triggers UB; the select below
     // replaces its result on the `-1` path regardless.
     let safe = b.fresh_value(ty);
     b.push(Stmt::Let(
         safe,
-        Rvalue::Select { cond: Operand::Value(is_neg1), a: Operand::Const(Const::Int(1, ty)), b: r },
+        Rvalue::Select {
+            cond: Operand::Value(is_neg1),
+            a: Operand::Const(Const::Int(1, ty)),
+            b: r,
+        },
     ));
     let raw = b.fresh_value(ty);
-    b.push(Stmt::Let(raw, Rvalue::Bin(op, l.clone(), Operand::Value(safe))));
+    b.push(Stmt::Let(
+        raw,
+        Rvalue::Bin(op, l.clone(), Operand::Value(safe)),
+    ));
     // Wrapped result on the `-1` path: `x / -1 == 0 - x` (wraps at INT_MIN); `x % -1 == 0`.
     let wrapped = fold_div_neg_one(b, op, l, ty);
     let v = b.fresh_value(ty);
-    b.push(Stmt::Let(v, Rvalue::Select { cond: Operand::Value(is_neg1), a: wrapped, b: Operand::Value(raw) }));
+    b.push(Stmt::Let(
+        v,
+        Rvalue::Select {
+            cond: Operand::Value(is_neg1),
+            a: wrapped,
+            b: Operand::Value(raw),
+        },
+    ));
     Operand::Value(v)
 }
 
@@ -8896,14 +9842,29 @@ fn lower_int_div(b: &mut Builder, op: BinOp, l: Operand, r: Operand, ty: Ty) -> 
 /// `lower_int_div` (a known non-zero, non-`-1` divisor has no UB). A constant *vector* divisor
 /// (`v / [a,b,c,d]`) isn't inspectable as an `Operand` here, so it keeps the guard — which folds away
 /// under the optimizer, and still (correctly) aborts on a constant zero lane.
-fn lower_vec_div(b: &mut Builder, op: BinOp, l: Operand, r: Operand, s: align_sema::Scalar, n: u32, rhs_ty: Ty) -> Operand {
+fn lower_vec_div(
+    b: &mut Builder,
+    op: BinOp,
+    l: Operand,
+    r: Operand,
+    s: align_sema::Scalar,
+    n: u32,
+    rhs_ty: Ty,
+) -> Operand {
     let elem = align_sema::scalar_to_ty(s);
     let vec_ty = Ty::Vec(s, n);
     let signed = matches!(elem, Ty::Int(IntTy { signed: true, .. }));
     // Splat a constant scalar into a `<N x T>` vector value.
     let splat = |b: &mut Builder, val: i128| -> Operand {
         let v = b.fresh_value(vec_ty);
-        b.push(Stmt::Let(v, Rvalue::MakeVec { elems: vec![Operand::Const(Const::Int(val, elem)); n as usize], elem, n }));
+        b.push(Stmt::Let(
+            v,
+            Rvalue::MakeVec {
+                elems: vec![Operand::Const(Const::Int(val, elem)); n as usize],
+                elem,
+                n,
+            },
+        ));
         Operand::Value(v)
     };
     // The wrapped result where the divisor is `-1`: `x / -1 == 0 - x` (wraps at INT_MIN), `x % -1 == 0`.
@@ -8927,7 +9888,9 @@ fn lower_vec_div(b: &mut Builder, op: BinOp, l: Operand, r: Operand, s: align_se
     // broadcast (scalar) divisor is a single `Operand::Const`; a constant vector is a `MakeVec` value.
     // A constant `0` divisor is left out (`None`) so it falls through to the runtime guard, which aborts.
     let broadcast_nonzero = match &r {
-        Operand::Const(Const::Int(val, _)) if !matches!(rhs_ty, Ty::Vec(..)) && *val != 0 => Some(*val),
+        Operand::Const(Const::Int(val, _)) if !matches!(rhs_ty, Ty::Vec(..)) && *val != 0 => {
+            Some(*val)
+        }
         _ => None,
     };
     if let Some(val) = broadcast_nonzero {
@@ -8944,7 +9907,14 @@ fn lower_vec_div(b: &mut Builder, op: BinOp, l: Operand, r: Operand, s: align_se
         r
     } else {
         let v = b.fresh_value(vec_ty);
-        b.push(Stmt::Let(v, Rvalue::MakeVec { elems: vec![r; n as usize], elem, n }));
+        b.push(Stmt::Let(
+            v,
+            Rvalue::MakeVec {
+                elems: vec![r; n as usize],
+                elem,
+                n,
+            },
+        ));
         Operand::Value(v)
     };
     let mask_ty = Ty::Mask(s, n);
@@ -8953,15 +9923,27 @@ fn lower_vec_div(b: &mut Builder, op: BinOp, l: Operand, r: Operand, s: align_se
     // `<N x T>` operands, not a bare scalar constant (codegen would splat it, but keep the IR honest).
     let zero_vec = splat(b, 0);
     let is_zero = b.fresh_value(mask_ty);
-    b.push(Stmt::Let(is_zero, Rvalue::Bin(BinOp::Eq, rvec.clone(), zero_vec)));
+    b.push(Stmt::Let(
+        is_zero,
+        Rvalue::Bin(BinOp::Eq, rvec.clone(), zero_vec),
+    ));
     let any_zero = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(any_zero, Rvalue::MaskAny { mask: Operand::Value(is_zero), n }));
+    b.push(Stmt::Let(
+        any_zero,
+        Rvalue::MaskAny {
+            mask: Operand::Value(is_zero),
+            n,
+        },
+    ));
     let fail = b.new_block();
     let ok = b.new_block();
     b.terminate(Term::Branch(Operand::Value(any_zero), fail, ok));
     b.cur = fail;
     let t = b.fresh_value(Ty::Unit);
-    b.push(Stmt::Let(t, Rvalue::Call(DirectCall::Runtime(RuntimeKey::DivFail), vec![])));
+    b.push(Stmt::Let(
+        t,
+        Rvalue::Call(DirectCall::Runtime(RuntimeKey::DivFail), vec![]),
+    ));
     b.terminate(Term::Unreachable);
     b.cur = ok;
 
@@ -8975,17 +9957,37 @@ fn lower_vec_div(b: &mut Builder, op: BinOp, l: Operand, r: Operand, s: align_se
     // Again compare vector-vs-vector (splat the `-1`) to keep the MIR node well-typed.
     let neg1_vec = splat(b, -1);
     let is_neg1 = b.fresh_value(mask_ty);
-    b.push(Stmt::Let(is_neg1, Rvalue::Bin(BinOp::Eq, rvec.clone(), neg1_vec)));
+    b.push(Stmt::Let(
+        is_neg1,
+        Rvalue::Bin(BinOp::Eq, rvec.clone(), neg1_vec),
+    ));
     // Remap each `-1` lane to `1` so the raw vector div/rem never triggers UB; the select below
     // replaces the result on those lanes regardless.
     let one_vec = splat(b, 1);
     let safe = b.fresh_value(vec_ty);
-    b.push(Stmt::Let(safe, Rvalue::Select { cond: Operand::Value(is_neg1), a: one_vec, b: rvec }));
+    b.push(Stmt::Let(
+        safe,
+        Rvalue::Select {
+            cond: Operand::Value(is_neg1),
+            a: one_vec,
+            b: rvec,
+        },
+    ));
     let raw = b.fresh_value(vec_ty);
-    b.push(Stmt::Let(raw, Rvalue::Bin(op, l.clone(), Operand::Value(safe))));
+    b.push(Stmt::Let(
+        raw,
+        Rvalue::Bin(op, l.clone(), Operand::Value(safe)),
+    ));
     let wrapped = neg1_wrapped(b, l);
     let v = b.fresh_value(vec_ty);
-    b.push(Stmt::Let(v, Rvalue::Select { cond: Operand::Value(is_neg1), a: wrapped, b: Operand::Value(raw) }));
+    b.push(Stmt::Let(
+        v,
+        Rvalue::Select {
+            cond: Operand::Value(is_neg1),
+            a: wrapped,
+            b: Operand::Value(raw),
+        },
+    ));
     Operand::Value(v)
 }
 
@@ -8995,11 +9997,24 @@ fn lower_vec_div(b: &mut Builder, op: BinOp, l: Operand, r: Operand, s: align_se
 /// settled panic model — never a silent OOB read).
 fn emit_bounds_check(b: &mut Builder, idx: &Operand, len: Operand) -> BlockId {
     let lo = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(lo, Rvalue::Bin(BinOp::Lt, idx.clone(), Operand::Const(Const::Int(0, i64_ty())))));
+    b.push(Stmt::Let(
+        lo,
+        Rvalue::Bin(
+            BinOp::Lt,
+            idx.clone(),
+            Operand::Const(Const::Int(0, i64_ty())),
+        ),
+    ));
     let hi = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(hi, Rvalue::Bin(BinOp::Ge, idx.clone(), len.clone())));
+    b.push(Stmt::Let(
+        hi,
+        Rvalue::Bin(BinOp::Ge, idx.clone(), len.clone()),
+    ));
     let oob = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(oob, Rvalue::Bin(BinOp::Or, Operand::Value(lo), Operand::Value(hi))));
+    b.push(Stmt::Let(
+        oob,
+        Rvalue::Bin(BinOp::Or, Operand::Value(lo), Operand::Value(hi)),
+    ));
 
     let fail = b.new_block();
     let ok = b.new_block();
@@ -9010,7 +10025,10 @@ fn emit_bounds_check(b: &mut Builder, idx: &Operand, len: Operand) -> BlockId {
     let t = b.fresh_value(Ty::Unit);
     b.push(Stmt::Let(
         t,
-        Rvalue::Call(DirectCall::Runtime(RuntimeKey::BoundsFail), vec![idx.clone(), len]),
+        Rvalue::Call(
+            DirectCall::Runtime(RuntimeKey::BoundsFail),
+            vec![idx.clone(), len],
+        ),
     ));
     b.terminate(Term::Unreachable);
 
@@ -9032,17 +10050,38 @@ fn binary_scalar_width(scalar: Ty) -> i128 {
 /// The range check `0 <= off <= off+width <= len` aborts on violation (like `slice[i]`); the load
 /// itself is then unguarded. `off + width` uses wrapping add, but the `start > end` arm of the
 /// range check catches an overflowing `off`, so no out-of-range address is ever formed.
-fn lower_bytes_read(b: &mut Builder, bytes: &hir::Expr, offset: &hir::Expr, be: bool, scalar: Ty) -> Operand {
+fn lower_bytes_read(
+    b: &mut Builder,
+    bytes: &hir::Expr,
+    offset: &hir::Expr,
+    be: bool,
+    scalar: Ty,
+) -> Operand {
     let width = binary_scalar_width(scalar);
     let sv = lower_required!(b, lower_expr(b, bytes), Operand::Const(Const::Unit));
     let off = lower_required!(b, lower_expr(b, offset), Operand::Const(Const::Unit));
     let len = b.fresh_value(i64_ty());
     b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
     let end = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(end, Rvalue::Bin(BinOp::Add, off.clone(), Operand::Const(Const::Int(width, i64_ty())))));
+    b.push(Stmt::Let(
+        end,
+        Rvalue::Bin(
+            BinOp::Add,
+            off.clone(),
+            Operand::Const(Const::Int(width, i64_ty())),
+        ),
+    ));
     emit_range_bounds_check(b, &off, &Operand::Value(end), Operand::Value(len));
     let v = b.fresh_value(scalar);
-    b.push(Stmt::Let(v, Rvalue::BytesRead { bytes: sv, offset: off, scalar, be }));
+    b.push(Stmt::Let(
+        v,
+        Rvalue::BytesRead {
+            bytes: sv,
+            offset: off,
+            scalar,
+            be,
+        },
+    ));
     Operand::Value(v)
 }
 
@@ -9061,13 +10100,20 @@ fn lower_array_builder_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                 lower_required!(b, lower_expr(b, region), Operand::Const(Const::Unit))
             });
             let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::ArrayBuilderNew {
+            b.push(Stmt::Let(
+                v,
+                Rvalue::ArrayBuilderNew {
                 elem: elem.ty(),
                 region,
-            }));
+                },
+            ));
             Operand::Value(v)
         }
-        hir::ExprKind::ArrayBuilderPush { builder, value, moves_value } => {
+        hir::ExprKind::ArrayBuilderPush {
+            builder,
+            value,
+            moves_value,
+        } => {
             let bop = lower_required!(b, lower_expr(b, builder), Operand::Const(Const::Unit));
             let val = lower_required!(b, lower_expr(b, value), Operand::Const(Const::Unit));
             let t = b.fresh_value(Ty::Unit);
@@ -9077,16 +10123,32 @@ fn lower_array_builder_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                 // owns the recursively droppable bytes.
                 null_moved_source(b, value);
                 if value.ty == Ty::String {
-                    b.push(Stmt::Let(t, Rvalue::ArrayBuilderPushStr { builder: bop, value: val }));
+                    b.push(Stmt::Let(
+                        t,
+                        Rvalue::ArrayBuilderPushStr {
+                            builder: bop,
+                            value: val,
+                        },
+                    ));
                 } else {
-                    b.push(Stmt::Let(t, Rvalue::ArrayBuilderPush {
+                    b.push(Stmt::Let(
+                        t,
+                        Rvalue::ArrayBuilderPush {
                         builder: bop,
                         value: val,
                         scalar: value.ty,
-                    }));
+                        },
+                    ));
                 }
             } else {
-                b.push(Stmt::Let(t, Rvalue::ArrayBuilderPush { builder: bop, value: val, scalar: value.ty }));
+                b.push(Stmt::Let(
+                    t,
+                    Rvalue::ArrayBuilderPush {
+                        builder: bop,
+                        value: val,
+                        scalar: value.ty,
+                    },
+                ));
             }
             Operand::Const(Const::Unit)
         }
@@ -9096,7 +10158,13 @@ fn lower_array_builder_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let bop = lower_required!(b, lower_expr(b, builder), Operand::Const(Const::Unit));
             let dop = lower_required!(b, lower_expr(b, data), Operand::Const(Const::Unit));
             let t = b.fresh_value(Ty::Unit);
-            b.push(Stmt::Let(t, Rvalue::ArrayBuilderAppend { builder: bop, data: dop }));
+            b.push(Stmt::Let(
+                t,
+                Rvalue::ArrayBuilderAppend {
+                    builder: bop,
+                    data: dop,
+                },
+            ));
             Operand::Const(Const::Unit)
         }
         hir::ExprKind::ArrayBuilderBuild(builder) => {
@@ -9117,7 +10185,15 @@ fn lower_buffer_put(b: &mut Builder, buffer: &hir::Expr, value: &hir::Expr, be: 
     let bufop = lower_required!(b, lower_expr(b, buffer), Operand::Const(Const::Unit));
     let val = lower_required!(b, lower_expr(b, value), Operand::Const(Const::Unit));
     let t = b.fresh_value(Ty::Unit);
-    b.push(Stmt::Let(t, Rvalue::BufferPut { buffer: bufop, value: val, scalar, be }));
+    b.push(Stmt::Let(
+        t,
+        Rvalue::BufferPut {
+            buffer: bufop,
+            value: val,
+            scalar,
+            be,
+        },
+    ));
     Operand::Const(Const::Unit)
 }
 
@@ -9126,7 +10202,13 @@ fn lower_buffer_append(b: &mut Builder, buffer: &hir::Expr, data: &hir::Expr) ->
     let bufop = lower_required!(b, lower_expr(b, buffer), Operand::Const(Const::Unit));
     let dop = lower_required!(b, lower_expr(b, data), Operand::Const(Const::Unit));
     let t = b.fresh_value(Ty::Unit);
-    b.push(Stmt::Let(t, Rvalue::BufferAppend { buffer: bufop, data: dop }));
+    b.push(Stmt::Let(
+        t,
+        Rvalue::BufferAppend {
+            buffer: bufop,
+            data: dop,
+        },
+    ));
     Operand::Const(Const::Unit)
 }
 
@@ -9162,7 +10244,11 @@ fn lower_chunks_count(b: &mut Builder, src_len: Operand, n: Operand) -> Operand 
     let src_positive = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(
         src_positive,
-        Rvalue::Bin(BinOp::Gt, src_len.clone(), Operand::Const(Const::Int(0, i64_ty()))),
+        Rvalue::Bin(
+            BinOp::Gt,
+            src_len.clone(),
+            Operand::Const(Const::Int(0, i64_ty())),
+        ),
     ));
     let valid = if matches!(n, Operand::Const(Const::Int(_, _))) {
         Operand::Value(src_positive)
@@ -9170,12 +10256,20 @@ fn lower_chunks_count(b: &mut Builder, src_len: Operand, n: Operand) -> Operand 
         let n_positive = b.fresh_value(Ty::Bool);
         b.push(Stmt::Let(
             n_positive,
-            Rvalue::Bin(BinOp::Gt, n.clone(), Operand::Const(Const::Int(0, i64_ty()))),
+            Rvalue::Bin(
+                BinOp::Gt,
+                n.clone(),
+                Operand::Const(Const::Int(0, i64_ty())),
+            ),
         ));
         let valid = b.fresh_value(Ty::Bool);
         b.push(Stmt::Let(
             valid,
-            Rvalue::Bin(BinOp::And, Operand::Value(src_positive), Operand::Value(n_positive)),
+            Rvalue::Bin(
+                BinOp::And,
+                Operand::Value(src_positive),
+                Operand::Value(n_positive),
+            ),
         ));
         Operand::Value(valid)
     };
@@ -9191,11 +10285,18 @@ fn lower_chunks_count(b: &mut Builder, src_len: Operand, n: Operand) -> Operand 
         Rvalue::Bin(BinOp::Sub, src_len, Operand::Const(Const::Int(1, i64_ty()))),
     ));
     let quotient = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(quotient, Rvalue::Bin(BinOp::Div, Operand::Value(minus_one), n)));
+    b.push(Stmt::Let(
+        quotient,
+        Rvalue::Bin(BinOp::Div, Operand::Value(minus_one), n),
+    ));
     let count = b.fresh_value(i64_ty());
     b.push(Stmt::Let(
         count,
-        Rvalue::Bin(BinOp::Add, Operand::Value(quotient), Operand::Const(Const::Int(1, i64_ty()))),
+        Rvalue::Bin(
+            BinOp::Add,
+            Operand::Value(quotient),
+            Operand::Const(Const::Int(1, i64_ty())),
+        ),
     ));
     b.push(Stmt::Store(result, Operand::Value(count)));
     b.terminate(Term::Goto(exit));
@@ -9218,7 +10319,14 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
             _ => unreachable!("sema requires a constant vector lane index"),
         };
         let v = b.fresh_value(elem_ty);
-        b.push(Stmt::Let(v, Rvalue::VecExtract { vec: vv, lane, elem: elem_ty }));
+        b.push(Stmt::Let(
+            v,
+            Rvalue::VecExtract {
+                vec: vv,
+                lane,
+                elem: elem_ty,
+            },
+        ));
         return Operand::Value(v);
     }
     // `s[i]` on a `soa<Struct>` → gather the whole struct from the columns at `i` (bounds-checked).
@@ -9229,7 +10337,14 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
         b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
         emit_bounds_check(b, &idx, Operand::Value(len));
         let v = b.fresh_value(elem_ty);
-        b.push(Stmt::Let(v, Rvalue::SoaGather { base: sv, index: idx, struct_id }));
+        b.push(Stmt::Let(
+            v,
+            Rvalue::SoaGather {
+                base: sv,
+                index: idx,
+                struct_id,
+            },
+        ));
         return Operand::Value(v);
     }
     if let hir::ExprKind::ArrayChunks { source, n, elem } = &recv.kind {
@@ -9262,7 +10377,11 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
         let chunk_len = b.fresh_value(i64_ty());
         b.push(Stmt::Let(
             chunk_len,
-            Rvalue::Select { cond: Operand::Value(short), a: Operand::Value(remaining), b: n },
+            Rvalue::Select {
+                cond: Operand::Value(short),
+                a: Operand::Value(remaining),
+                b: n,
+            },
         ));
         let chunk = b.fresh_value(elem_ty);
         b.push(Stmt::Let(
@@ -9344,21 +10463,47 @@ fn emit_vec_bounds_check(b: &mut Builder, slice: &Operand, idx: &Operand, n: u32
     let len = b.fresh_value(i64_ty());
     b.push(Stmt::Let(len, Rvalue::SliceLen(slice.clone())));
     let end = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(end, Rvalue::Bin(BinOp::Add, idx.clone(), Operand::Const(Const::Int(n as i128, i64_ty())))));
+    b.push(Stmt::Let(
+        end,
+        Rvalue::Bin(
+            BinOp::Add,
+            idx.clone(),
+            Operand::Const(Const::Int(n as i128, i64_ty())),
+        ),
+    ));
     emit_range_bounds_check(b, idx, &Operand::Value(end), Operand::Value(len));
 }
 
 fn emit_range_bounds_check(b: &mut Builder, start: &Operand, end: &Operand, len: Operand) {
     let neg = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(neg, Rvalue::Bin(BinOp::Lt, start.clone(), Operand::Const(Const::Int(0, i64_ty())))));
+    b.push(Stmt::Let(
+        neg,
+        Rvalue::Bin(
+            BinOp::Lt,
+            start.clone(),
+            Operand::Const(Const::Int(0, i64_ty())),
+        ),
+    ));
     let inv = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(inv, Rvalue::Bin(BinOp::Gt, start.clone(), end.clone())));
+    b.push(Stmt::Let(
+        inv,
+        Rvalue::Bin(BinOp::Gt, start.clone(), end.clone()),
+    ));
     let over = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(over, Rvalue::Bin(BinOp::Gt, end.clone(), len.clone())));
+    b.push(Stmt::Let(
+        over,
+        Rvalue::Bin(BinOp::Gt, end.clone(), len.clone()),
+    ));
     let e1 = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(e1, Rvalue::Bin(BinOp::Or, Operand::Value(neg), Operand::Value(inv))));
+    b.push(Stmt::Let(
+        e1,
+        Rvalue::Bin(BinOp::Or, Operand::Value(neg), Operand::Value(inv)),
+    ));
     let oob = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(oob, Rvalue::Bin(BinOp::Or, Operand::Value(e1), Operand::Value(over))));
+    b.push(Stmt::Let(
+        oob,
+        Rvalue::Bin(BinOp::Or, Operand::Value(e1), Operand::Value(over)),
+    ));
 
     let fail = b.new_block();
     let ok = b.new_block();
@@ -9385,10 +10530,17 @@ fn emit_utf8_boundary_check(b: &mut Builder, base: &Operand, index: &Operand, le
     let at_start = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(
         at_start,
-        Rvalue::Bin(BinOp::Eq, index.clone(), Operand::Const(Const::Int(0, i64_ty()))),
+        Rvalue::Bin(
+            BinOp::Eq,
+            index.clone(),
+            Operand::Const(Const::Int(0, i64_ty())),
+        ),
     ));
     let at_end = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(at_end, Rvalue::Bin(BinOp::Eq, index.clone(), len.clone())));
+    b.push(Stmt::Let(
+        at_end,
+        Rvalue::Bin(BinOp::Eq, index.clone(), len.clone()),
+    ));
     let at_edge = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(
         at_edge,
@@ -9401,9 +10553,15 @@ fn emit_utf8_boundary_check(b: &mut Builder, base: &Operand, index: &Operand, le
     b.terminate(Term::Branch(Operand::Value(at_edge), ok, check));
 
     b.cur = check;
-    let u8_ty = Ty::Int(IntTy { bits: 8, signed: false });
+    let u8_ty = Ty::Int(IntTy {
+        bits: 8,
+        signed: false,
+    });
     let byte = b.fresh_value(u8_ty);
-    b.push(Stmt::Let(byte, Rvalue::SliceIndex(base.clone(), index.clone())));
+    b.push(Stmt::Let(
+        byte,
+        Rvalue::SliceIndex(base.clone(), index.clone()),
+    ));
     let prefix = b.fresh_value(u8_ty);
     b.push(Stmt::Let(
         prefix,
@@ -9442,10 +10600,19 @@ fn emit_utf8_boundary_check(b: &mut Builder, base: &Operand, index: &Operand, le
 /// check. The base `{ptr,len}` comes from the receiver (a fixed `array<T>` borrows to a slice
 /// first; `str`/`slice`/owned-array are already `{ptr,len}`). `result_ty` is the view type — `str`
 /// (byte-stride pointer offset) or `slice<T>` (element-stride).
-fn lower_slice_range(b: &mut Builder, recv: &hir::Expr, start: Option<&hir::Expr>, end: Option<&hir::Expr>, result_ty: Ty) -> Operand {
+fn lower_slice_range(
+    b: &mut Builder,
+    recv: &hir::Expr,
+    start: Option<&hir::Expr>,
+    end: Option<&hir::Expr>,
+    result_ty: Ty,
+) -> Operand {
     // The element type driving the pointer-offset stride: a `u8` byte for a `str`, else the element.
     let elem = match result_ty {
-        Ty::Str => Ty::Int(IntTy { bits: 8, signed: false }),
+        Ty::Str => Ty::Int(IntTy {
+            bits: 8,
+            signed: false,
+        }),
         Ty::Slice(s) => align_sema::scalar_to_ty(s),
         _ => unreachable!("slice range result is str or slice"),
     };
@@ -9489,10 +10656,21 @@ fn lower_slice_range(b: &mut Builder, recv: &hir::Expr, start: Option<&hir::Expr
         emit_utf8_boundary_check(b, &base, &end_op, &len);
     }
     let new_len = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(new_len, Rvalue::Bin(BinOp::Sub, end_op, start_op.clone())));
+    b.push(Stmt::Let(
+        new_len,
+        Rvalue::Bin(BinOp::Sub, end_op, start_op.clone()),
+    ));
     let v = b.fresh_value(result_ty);
     inherit_borrow_owners(b, v, [&base]);
-    b.push(Stmt::Let(v, Rvalue::SubSlice { base, start: start_op, len: Operand::Value(new_len), elem }));
+    b.push(Stmt::Let(
+        v,
+        Rvalue::SubSlice {
+            base,
+            start: start_op,
+            len: Operand::Value(new_len),
+            elem,
+        },
+    ));
     Operand::Value(v)
 }
 
@@ -9500,7 +10678,14 @@ fn lower_slice_range(b: &mut Builder, recv: &hir::Expr, start: Option<&hir::Expr
 /// A fixed stack `array<Struct>` uses the slot-based `IndexField`; an owned dynamic
 /// `array<Struct>` uses the pointer-based `IndexFieldPtr` (same addressing as a fused pipeline
 /// projection). Only the one field (a scalar or a `str` view) is loaded — no whole-struct copy.
-fn lower_index_field(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, path: &[u32], struct_id: u32, leaf_ty: Ty) -> Operand {
+fn lower_index_field(
+    b: &mut Builder,
+    recv: &hir::Expr,
+    index: &hir::Expr,
+    path: &[u32],
+    struct_id: u32,
+    leaf_ty: Ty,
+) -> Operand {
     let idx = lower_required!(b, lower_expr(b, index), Operand::Const(Const::Unit));
     // Set the element-field address up the same way the fused pipeline does (one shared seam,
     // `lower_field_access`): a fixed `array<Struct>` is slot-addressed, an owned dynamic
@@ -9526,7 +10711,12 @@ fn lower_index_field(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, path:
             if !lowering_continues(b) {
                 return Operand::Const(Const::Unit);
             }
-            (None, None, slot, Some(Operand::Const(Const::Int(n, i64_ty()))))
+            (
+                None,
+                None,
+                slot,
+                Some(Operand::Const(Const::Int(n, i64_ty()))),
+            )
         }
     };
     let Some(first_ty) = checked_struct_field_path(b, struct_id, path, leaf_ty) else {
@@ -9624,7 +10814,11 @@ fn proven_vec_load_align(b: &Builder, src: &hir::Expr, index: &hir::Expr, elem: 
     // Peel a whole-array borrow to (underlying array expr, element start offset).
     let (arr, start): (&hir::Expr, i128) = match &src.kind {
         hir::ExprKind::ArrayToSlice(inner) => (inner, 0),
-        hir::ExprKind::SliceRange { recv, start, end: _ } => {
+        hir::ExprKind::SliceRange {
+            recv,
+            start,
+            end: _,
+        } => {
             let s = match start {
                 None => 0,
                 Some(e) => const_int_expr(e)?,
@@ -9634,7 +10828,9 @@ fn proven_vec_load_align(b: &Builder, src: &hir::Expr, index: &hir::Expr, elem: 
         _ => return None,
     };
     // Only a bare local carries a binding alignment (slot index == LocalId).
-    let hir::ExprKind::Local(id) = &arr.kind else { return None };
+    let hir::ExprKind::Local(id) = &arr.kind else {
+        return None;
+    };
     let n = (*b.slot_align.get(*id as usize)?)?;
     let idx = const_int_expr(index)?;
     let elem_bytes = ty_byte_size(elem)?;
@@ -9706,7 +10902,11 @@ fn accumulate_mask(b: &mut Builder, mask: Option<Operand>, pred: Operand) -> Ope
 fn extreme_of(ty: Ty, is_max: bool) -> Operand {
     match ty {
         Ty::Float(_) => {
-            let v = if is_max { f64::NEG_INFINITY } else { f64::INFINITY };
+            let v = if is_max {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            };
             Operand::Const(Const::Float(v, ty))
         }
         Ty::Int(IntTy { bits, signed }) => {
@@ -9716,7 +10916,11 @@ fn extreme_of(ty: Ty, is_max: bool) -> Operand {
                 if signed { -(1i128 << (bits - 1)) } else { 0 }
             } else {
                 // type maximum
-                if signed { (1i128 << (bits - 1)) - 1 } else { (1i128 << bits) - 1 }
+                if signed {
+                    (1i128 << (bits - 1)) - 1
+                } else {
+                    (1i128 << bits) - 1
+                }
             };
             Operand::Const(Const::Int(v, ty))
         }
@@ -9745,10 +10949,7 @@ fn array_source_slot(b: &mut Builder, source: &hir::Expr) -> (Slot, i128) {
             };
             let live = store_array_elems(b, slot, elems, *elem);
             if owns_elements && lowering_continues(b) {
-                b.set_drop_flag_operand(
-                    slot,
-                    live.unwrap_or(Operand::Const(Const::Bool(false))),
-                );
+                b.set_drop_flag_operand(slot, live.unwrap_or(Operand::Const(Const::Bool(false))));
             }
             (slot, elems.len() as i128)
         }
@@ -9774,7 +10975,9 @@ fn array_source_slot(b: &mut Builder, source: &hir::Expr) -> (Slot, i128) {
 fn field_ty_at(b: &Builder, slot: Slot, path: &[u32]) -> Ty {
     let mut ty = b.slots[slot as usize];
     for &f in path {
-        let Ty::Struct(sid) = ty else { return Ty::Error };
+        let Ty::Struct(sid) = ty else {
+            return Ty::Error;
+        };
         match b.structs[sid as usize].fields.get(f as usize) {
             Some(field) => ty = field.ty,
             None => return Ty::Error,
@@ -9824,7 +11027,10 @@ fn store_const_array_pooled(b: &mut Builder, slot: Slot, elems: &[hir::Expr], el
             hir::ExprKind::Bool(bl) => ConstElem::Bool(*bl),
             hir::ExprKind::Char(c) => ConstElem::Char(*c),
             // A negated numeric literal (`-5`, `-1.5`) — sema restricts the operand to Int/Float.
-            hir::ExprKind::Unary { op: align_ast::UnOp::Neg, expr } => match &expr.kind {
+            hir::ExprKind::Unary {
+                op: align_ast::UnOp::Neg,
+                expr,
+            } => match &expr.kind {
                 hir::ExprKind::Int(v) => ConstElem::Int(v.wrapping_neg()),
                 hir::ExprKind::Float(v) => ConstElem::Float(-*v),
                 _ => unreachable!("pooled negated element is a numeric literal (sema-checked)"),
@@ -9833,7 +11039,11 @@ fn store_const_array_pooled(b: &mut Builder, slot: Slot, elems: &[hir::Expr], el
         }
     }
     let cvals: Vec<ConstElem> = elems.iter().map(fold).collect();
-    b.push(Stmt::StoreConstArray { slot, elems: cvals, elem });
+    b.push(Stmt::StoreConstArray {
+        slot,
+        elems: cvals,
+        elem,
+    });
 }
 
 fn store_array_elems(
@@ -9856,8 +11066,8 @@ fn store_array_elems(
             if !lowering_continues(b) {
                 return None;
             }
-            let element_flag = lowered_drop_flag(b, e, &operand)
-                .unwrap_or(Operand::Const(Const::Bool(false)));
+            let element_flag =
+                lowered_drop_flag(b, e, &operand).unwrap_or(Operand::Const(Const::Bool(false)));
             array_drop_flag = Some(match array_drop_flag {
                 None => element_flag,
                 Some(previous) => {
@@ -9891,7 +11101,12 @@ fn store_array_elems(
                     if !lowering_continues(b) {
                         return None;
                     }
-                    b.push(Stmt::StoreElemField(slot, index_const(i), vec![j as u32], v));
+                    b.push(Stmt::StoreElemField(
+                        slot,
+                        index_const(i),
+                        vec![j as u32],
+                        v,
+                    ));
                 }
             } else {
                 // ANY OTHER struct-valued element — a call (`[mk(1), mk(2)]`, the route-table shape
@@ -9930,9 +11145,16 @@ enum Reducer {
     Count,
     /// `reduce(init, f)`: `f(acc, element)`. `captures` are a lifted lambda's captured values,
     /// passed after the `(acc, element)` arguments.
-    Fold { func: ProgramCall, captures: Vec<Operand> },
+    Fold {
+        func: ProgramCall,
+        captures: Vec<Operand>,
+    },
     /// `any(p)` / `all(p)`: `acc || p(element)` / `acc && p(element)`. `captures` as `Fold`.
-    AnyAll { func: ProgramCall, captures: Vec<Operand>, all: bool },
+    AnyAll {
+        func: ProgramCall,
+        captures: Vec<Operand>,
+        all: bool,
+    },
     /// `min` / `max`: keep `element` when it is smaller / larger than `acc`.
     MinMax { is_max: bool },
 }
@@ -9940,9 +11162,18 @@ enum Reducer {
 enum ReducerSpec<'a> {
     Sum,
     Count,
-    Fold { func: &'a str, captures: &'a [hir::Expr] },
-    AnyAll { func: &'a str, captures: &'a [hir::Expr], all: bool },
-    MinMax { is_max: bool },
+    Fold {
+        func: &'a str,
+        captures: &'a [hir::Expr],
+    },
+    AnyAll {
+        func: &'a str,
+        captures: &'a [hir::Expr],
+        all: bool,
+    },
+    MinMax {
+        is_max: bool,
+    },
 }
 
 enum ReduceInit<'a> {
@@ -9968,7 +11199,11 @@ fn prepare_reducer(b: &mut Builder, spec: ReducerSpec<'_>) -> Option<Reducer> {
             func: ProgramCall::from_validated(func),
             captures: lower_captures(b, captures)?,
         },
-        ReducerSpec::AnyAll { func, captures, all } => Reducer::AnyAll {
+        ReducerSpec::AnyAll {
+            func,
+            captures,
+            all,
+        } => Reducer::AnyAll {
             func: ProgramCall::from_validated(func),
             captures: lower_captures(b, captures)?,
             all,
@@ -10080,7 +11315,10 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> Option<SrcSetup> {
         for source in sources {
             let setup = setup_source(b, source)?;
             debug_assert!(setup.zip.is_none(), "nested zip is rejected in sema");
-            debug_assert!(setup.temp_free.is_none(), "zip v1 sources are borrowed places/literals");
+            debug_assert!(
+                setup.temp_free.is_none(),
+                "zip v1 sources are borrowed places/literals"
+            );
             if let Some(want) = &bound {
                 emit_len_eq_check(b, setup.bound.clone(), want.clone());
             } else {
@@ -10090,7 +11328,11 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> Option<SrcSetup> {
                 Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => align_sema::scalar_to_ty(s),
                 _ => unreachable!("zip source type is sema-restricted to scalar arrays/slices"),
             };
-            inputs.push(ZipInputSetup { slot: setup.slot, slice_val: setup.slice_val, elem });
+            inputs.push(ZipInputSetup {
+                slot: setup.slot,
+                slice_val: setup.slice_val,
+                elem,
+            });
         }
         return Some(SrcSetup {
             slot: 0,
@@ -10099,15 +11341,17 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> Option<SrcSetup> {
             scalar_slot: false,
             struct_view: None,
             temp_free: None,
-            zip: Some(ZipSetup { tuple_id: *tuple_id, inputs }),
+            zip: Some(ZipSetup {
+                tuple_id: *tuple_id,
+                inputs,
+            }),
         });
     }
     match source.ty {
         // `slice<T>`, owned `array<T>`, and `array<slice<T>>` (a `chunks` result, element =
         // `slice<T>`) all share the `{ptr,len}` layout and runtime length.
         Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) => {
-            let needs_drop =
-                pipeline_source_needs_drop(b, source, b.arenas.is_empty());
+            let needs_drop = pipeline_source_needs_drop(b, source, b.arenas.is_empty());
             // A pipeline reads its source through the terminal loop. Preserve bound ownership
             // through `if`/`match`/`else` joins and register a hidden owner for a selected fresh
             // value before evaluating later operands. Their early return/`?`/divergence then
@@ -10132,7 +11376,15 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> Option<SrcSetup> {
             // freed here. Materializing terminals instead arena-allocate inside an arena, so the loop
             // frees those only outside one.
             let temp_free = needs_drop.then(|| sv.clone());
-            Some(SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, struct_view: None, temp_free, zip: None })
+            Some(SrcSetup {
+                slot: 0,
+                slice_val: Some(sv),
+                bound: Operand::Value(len),
+                scalar_slot: false,
+                struct_view: None,
+                temp_free,
+                zip: None,
+            })
         }
         // An owned, dynamic `array<Struct>`: a `{ptr,len}` view addressed by pointer for field
         // projection (slice 8d-2). It is a bound local borrow (sema requires a variable source),
@@ -10144,7 +11396,15 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> Option<SrcSetup> {
             }
             let len = b.fresh_value(i64_ty());
             b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
-            Some(SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, struct_view: Some((id, layout)), temp_free: None, zip: None })
+            Some(SrcSetup {
+                slot: 0,
+                slice_val: Some(sv),
+                bound: Operand::Value(len),
+                scalar_slot: false,
+                struct_view: Some((id, layout)),
+                temp_free: None,
+                zip: None,
+            })
         }
         // A `soa<Struct>` view: a `{ptr,len}` column-major buffer. Same `{ptr,len}` handling as an
         // owned struct array, but the `Layout::Soa` struct-view makes field access column-addressed.
@@ -10155,7 +11415,15 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> Option<SrcSetup> {
             }
             let len = b.fresh_value(i64_ty());
             b.push(Stmt::Let(len, Rvalue::SliceLen(sv.clone())));
-            Some(SrcSetup { slot: 0, slice_val: Some(sv), bound: Operand::Value(len), scalar_slot: false, struct_view: Some((id, Layout::Soa)), temp_free: None, zip: None })
+            Some(SrcSetup {
+                slot: 0,
+                slice_val: Some(sv),
+                bound: Operand::Value(len),
+                scalar_slot: false,
+                struct_view: Some((id, Layout::Soa)),
+                temp_free: None,
+                zip: None,
+            })
         }
         _ => {
             let (slot, n) = array_source_slot(b, source);
@@ -10178,14 +11446,21 @@ fn setup_source(b: &mut Builder, source: &hir::Expr) -> Option<SrcSetup> {
 /// Load one index from every lazy-zip input and assemble the ephemeral tuple in SSA. Runtime slice
 /// loads may share the pipeline's single input alias scope against `map_into`'s destination; no
 /// metadata ever claims that the inputs are mutually disjoint.
-fn lower_zip_element(b: &mut Builder, zip: &ZipSetup, index: &Operand, alias_scope: Option<u32>) -> Operand {
+fn lower_zip_element(
+    b: &mut Builder,
+    zip: &ZipSetup,
+    index: &Operand,
+    alias_scope: Option<u32>,
+) -> Operand {
     let mut elems = Vec::with_capacity(zip.inputs.len());
     for input in &zip.inputs {
         let value = b.fresh_value(input.elem);
         let load = match (&input.slice_val, alias_scope) {
-            (Some(slice), Some(scope)) => {
-                Rvalue::SliceIndexNoalias { slice: slice.clone(), index: index.clone(), scope }
-            }
+            (Some(slice), Some(scope)) => Rvalue::SliceIndexNoalias {
+                slice: slice.clone(),
+                index: index.clone(),
+                scope,
+            },
             (Some(slice), None) => Rvalue::SliceIndex(slice.clone(), index.clone()),
             (None, _) => Rvalue::Index(input.slot, index.clone()),
         };
@@ -10193,7 +11468,13 @@ fn lower_zip_element(b: &mut Builder, zip: &ZipSetup, index: &Operand, alias_sco
         elems.push(Operand::Value(value));
     }
     let tuple = b.fresh_value(Ty::Tuple(zip.tuple_id));
-    b.push(Stmt::Let(tuple, Rvalue::MakeTuple { tuple_id: zip.tuple_id, elems }));
+    b.push(Stmt::Let(
+        tuple,
+        Rvalue::MakeTuple {
+            tuple_id: zip.tuple_id,
+            elems,
+        },
+    ));
     Operand::Value(tuple)
 }
 
@@ -10220,7 +11501,9 @@ fn lower_field_access(
             Layout::Aos => b.push(Stmt::Let(
                 v,
                 Rvalue::IndexFieldPtr {
-                    base: slice_val.clone().expect("a struct-view source has a {ptr,len} value"),
+                    base: slice_val
+                        .clone()
+                        .expect("a struct-view source has a {ptr,len} value"),
                     index: index.clone(),
                     field,
                     struct_id,
@@ -10231,14 +11514,19 @@ fn lower_field_access(
             Layout::Soa => b.push(Stmt::Let(
                 v,
                 Rvalue::IndexColumn {
-                    base: slice_val.clone().expect("a soa source has a {ptr,len} value"),
+                    base: slice_val
+                        .clone()
+                        .expect("a soa source has a {ptr,len} value"),
                     index: index.clone(),
                     field,
                     struct_id,
                 },
             )),
         },
-        None => b.push(Stmt::Let(v, Rvalue::IndexField(slot, index.clone(), vec![field]))),
+        None => b.push(Stmt::Let(
+            v,
+            Rvalue::IndexField(slot, index.clone(), vec![field]),
+        )),
     }
     v
 }
@@ -10262,7 +11550,9 @@ fn lower_struct_elem(
             Layout::Aos => b.push(Stmt::Let(
                 v,
                 Rvalue::IndexPtr {
-                    base: slice_val.clone().expect("a struct-view source has a {ptr,len} value"),
+                    base: slice_val
+                        .clone()
+                        .expect("a struct-view source has a {ptr,len} value"),
                     index: index.clone(),
                     struct_id: sid,
                 },
@@ -10272,7 +11562,9 @@ fn lower_struct_elem(
             Layout::Soa => b.push(Stmt::Let(
                 v,
                 Rvalue::SoaGather {
-                    base: slice_val.clone().expect("a soa source has a {ptr,len} value"),
+                    base: slice_val
+                        .clone()
+                        .expect("a soa source has a {ptr,len} value"),
                     index: index.clone(),
                     struct_id: sid,
                 },
@@ -10307,10 +11599,7 @@ enum NeedleLower {
 /// and `CacheContext::from_env` force-disables the object cache when it is set) the plan is NOT built
 /// and the body reconstructs the searcher per element — same fused loop, differing only in reuse.
 /// Must be called after `setup_source` and before the loop header is emitted.
-fn prepare_pipeline_stages(
-    b: &mut Builder,
-    stages: &[hir::Stage],
-) -> Option<Vec<PreparedStage>> {
+fn prepare_pipeline_stages(b: &mut Builder, stages: &[hir::Stage]) -> Option<Vec<PreparedStage>> {
     // Read the toggle at MIR lowering (never in codegen): the object cache key fingerprints the
     // structural MIR program, so reading it here makes the two shapes cache-distinct, and
     // `CacheContext::from_env` additionally forces the cache off whenever this var is set.
@@ -10319,8 +11608,14 @@ fn prepare_pipeline_stages(
     for stage in stages {
         let mut captures = Vec::new();
         let needle = match &stage.kind {
-            hir::StageKind::Map { captures: expressions, .. }
-            | hir::StageKind::Where { captures: expressions, .. } => {
+            hir::StageKind::Map {
+                captures: expressions,
+                ..
+            }
+            | hir::StageKind::Where {
+                captures: expressions,
+                ..
+            } => {
                 for expression in expressions {
                     captures.push(lower_expr(b, expression));
                     if !lowering_continues(b) {
@@ -10363,9 +11658,18 @@ fn lower_where_str_contains_pred(b: &mut Builder, nl: &NeedleLower, elem: Operan
             let plan = b.fresh_value(Ty::StrFinder);
             b.push(Stmt::Let(plan, Rvalue::Load(*plan_slot)));
             let idx = b.fresh_value(i64_ty());
-            b.push(Stmt::Let(idx, Rvalue::StrFinderFind { plan: Operand::Value(plan), haystack: elem }));
+            b.push(Stmt::Let(
+                idx,
+                Rvalue::StrFinderFind {
+                    plan: Operand::Value(plan),
+                    haystack: elem,
+                },
+            ));
             let pred = b.fresh_value(Ty::Bool);
-            b.push(Stmt::Let(pred, Rvalue::Bin(BinOp::Ge, Operand::Value(idx), index_const(0))));
+            b.push(Stmt::Let(
+                pred,
+                Rvalue::Bin(BinOp::Ge, Operand::Value(idx), index_const(0)),
+            ));
             pred
         }
         NeedleLower::PerCall(needle) => {
@@ -10407,9 +11711,7 @@ fn lower_array_par_map_reduce(
 ) -> Operand {
     let free_src = pipeline_source_needs_drop(b, source, b.arenas.is_empty());
     let src = match source.ty {
-        Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) => {
-            lower_borrowed_owned(b, source)
-        }
+        Ty::Slice(_) | Ty::DynArray(_) | Ty::DynSliceArray(_) => lower_borrowed_owned(b, source),
         Ty::Array(_, _) => {
             let (slot, n) = array_source_slot(b, source);
             if !lowering_continues(b) {
@@ -10433,7 +11735,9 @@ fn lower_array_par_map_reduce(
         }
     }
     let v = b.fresh_value(elem_out);
-    b.push(Stmt::Let(v, Rvalue::ParMapReduce {
+    b.push(Stmt::Let(
+        v,
+        Rvalue::ParMapReduce {
         src: src.clone(),
         func: ProgramCall::from_validated(func),
         captures: capture_ops,
@@ -10441,7 +11745,8 @@ fn lower_array_par_map_reduce(
         elem_in,
         elem_out,
         work_weight: PAR_MAP_DEFAULT_WORK_WEIGHT,
-    }));
+        },
+    ));
     if free_src {
         // The reduction has consumed the source bytes before returning its scalar result.
         drop_borrow_owners(b, &src);
@@ -10458,7 +11763,16 @@ fn lower_array_reduce(
     reducer: ReducerSpec<'_>,
 ) -> Operand {
     let elem_ty = acc_ty;
-    let Some(SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src, struct_view, temp_free, zip }) = setup_source(b, source) else {
+    let Some(SrcSetup {
+        slot,
+        slice_val,
+        bound,
+        scalar_slot: scalar_slot_src,
+        struct_view,
+        temp_free,
+        zip,
+    }) = setup_source(b, source)
+    else {
         return Operand::Const(Const::Unit);
     };
     let Some(prepared_stages) = prepare_pipeline_stages(b, stages) else {
@@ -10500,14 +11814,24 @@ fn lower_array_reduce(
     let mut seen_where = false;
     let mut guard_rejected = false;
     for stage in stages {
-        if seen_where && matches!(&stage.kind, hir::StageKind::Map { .. } | hir::StageKind::Where { .. }) {
+        if seen_where
+            && matches!(
+                &stage.kind,
+                hir::StageKind::Map { .. } | hir::StageKind::Where { .. }
+            )
+        {
             guard_rejected = true;
             break;
         }
         // `WhereStrContains` is a filtering `where` (it marks `seen_where`) but, like `WhereField`,
         // its predicate is a total/non-trapping builtin, so it is NOT a guard trigger above — it
         // stays maskable/branchless.
-        if matches!(&stage.kind, hir::StageKind::Where { .. } | hir::StageKind::WhereField { .. } | hir::StageKind::WhereStrContains { .. }) {
+        if matches!(
+            &stage.kind,
+            hir::StageKind::Where { .. }
+                | hir::StageKind::WhereField { .. }
+                | hir::StageKind::WhereStrContains { .. }
+        ) {
             seen_where = true;
         }
     }
@@ -10520,7 +11844,10 @@ fn lower_array_reduce(
     let i_val = b.fresh_value(i64_ty());
     b.push(Stmt::Let(i_val, Rvalue::Load(iv)));
     let cond = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(cond, Rvalue::Bin(BinOp::Lt, Operand::Value(i_val), bound)));
+    b.push(Stmt::Let(
+        cond,
+        Rvalue::Bin(BinOp::Lt, Operand::Value(i_val), bound),
+    ));
     b.terminate(Term::Branch(Operand::Value(cond), body, exit));
 
     // body: address element i, run the stages, accumulate.
@@ -10564,7 +11891,15 @@ fn lower_array_reduce(
     for (stage_idx, stage) in stages.iter().enumerate() {
         match &stage.kind {
             hir::StageKind::Project { field } => {
-                let v = lower_field_access(b, struct_view, &slice_val, slot, &index, *field, stage.out_ty);
+                let v = lower_field_access(
+                    b,
+                    struct_view,
+                    &slice_val,
+                    slot,
+                    &index,
+                    *field,
+                    stage.out_ty,
+                );
                 cur = Some(Operand::Value(v));
             }
             hir::StageKind::Map { func, .. } => {
@@ -10575,9 +11910,18 @@ fn lower_array_reduce(
                     None => {
                         let sid = match source.ty {
                             Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => id,
-                            _ => unreachable!("map with no loaded element must be over a struct array"),
+                            _ => unreachable!(
+                                "map with no loaded element must be over a struct array"
+                            ),
                         };
-                        Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
+                        Operand::Value(lower_struct_elem(
+                            b,
+                            struct_view,
+                            &slice_val,
+                            slot,
+                            &index,
+                            sid,
+                        ))
                     }
                 };
                 let call_args = stage_call_args(arg, &prepared_stages[stage_idx].captures);
@@ -10597,9 +11941,18 @@ fn lower_array_reduce(
                     None => {
                         let sid = match source.ty {
                             Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => id,
-                            _ => unreachable!("where with no loaded element must be over a struct array"),
+                            _ => unreachable!(
+                                "where with no loaded element must be over a struct array"
+                            ),
                         };
-                        Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
+                        Operand::Value(lower_struct_elem(
+                            b,
+                            struct_view,
+                            &slice_val,
+                            slot,
+                            &index,
+                            sid,
+                        ))
                     }
                 };
                 let call_args = stage_call_args(arg, &prepared_stages[stage_idx].captures);
@@ -10624,8 +11977,13 @@ fn lower_array_reduce(
                 // the current `str` element, reusing the plan built once before the loop. Total and
                 // non-trapping, so it masks branchlessly like `WhereField` (or branches under a
                 // guarded suffix). `where` keeps the element, so `cur` is unchanged.
-                let elem = cur.clone().expect("where(str.contains) requires a loaded str element");
-                let nl = prepared_stages[stage_idx].needle.as_ref().expect("a WhereStrContains stage has a lowered needle");
+                let elem = cur
+                    .clone()
+                    .expect("where(str.contains) requires a loaded str element");
+                let nl = prepared_stages[stage_idx]
+                    .needle
+                    .as_ref()
+                    .expect("a WhereStrContains stage has a lowered needle");
                 let pred = lower_where_str_contains_pred(b, nl, elem);
                 if guard_rejected {
                     let accepted = b.new_block();
@@ -10637,7 +11995,8 @@ fn lower_array_reduce(
             }
             hir::StageKind::WhereField { field } => {
                 // Predicate on a struct element's (bool) field; the element is unchanged.
-                let pred = lower_field_access(b, struct_view, &slice_val, slot, &index, *field, Ty::Bool);
+                let pred =
+                    lower_field_access(b, struct_view, &slice_val, slot, &index, *field, Ty::Bool);
                 if guard_rejected {
                     let accepted = b.new_block();
                     b.terminate(Term::Branch(Operand::Value(pred), accepted, cont));
@@ -10663,13 +12022,23 @@ fn lower_array_reduce(
             let inc = match &mask {
                 Some(m) => {
                     let s = b.fresh_value(acc_ty);
-                    b.push(Stmt::Let(s, Rvalue::Select { cond: m.clone(), a: one, b: index_const(0) }));
+                    b.push(Stmt::Let(
+                        s,
+                        Rvalue::Select {
+                            cond: m.clone(),
+                            a: one,
+                            b: index_const(0),
+                        },
+                    ));
                     Operand::Value(s)
                 }
                 None => one,
             };
             let n = b.fresh_value(acc_ty);
-            b.push(Stmt::Let(n, Rvalue::Bin(BinOp::Add, Operand::Value(a), inc)));
+            b.push(Stmt::Let(
+                n,
+                Rvalue::Bin(BinOp::Add, Operand::Value(a), inc),
+            ));
             Operand::Value(n)
         }
         // `sum`: acc + (mask ? cur : 0).
@@ -10678,19 +12047,32 @@ fn lower_array_reduce(
             let contribution = match &mask {
                 Some(m) => {
                     let s = b.fresh_value(acc_ty);
-                    b.push(Stmt::Let(s, Rvalue::Select { cond: m.clone(), a: cur, b: zero_of(acc_ty) }));
+                    b.push(Stmt::Let(
+                        s,
+                        Rvalue::Select {
+                            cond: m.clone(),
+                            a: cur,
+                            b: zero_of(acc_ty),
+                        },
+                    ));
                     Operand::Value(s)
                 }
                 None => cur,
             };
             let n = b.fresh_value(acc_ty);
-            b.push(Stmt::Let(n, Rvalue::Bin(BinOp::Add, Operand::Value(a), contribution)));
+            b.push(Stmt::Let(
+                n,
+                Rvalue::Bin(BinOp::Add, Operand::Value(a), contribution),
+            ));
             Operand::Value(n)
         }
         // A callable reducer is control-flow guarded after `where`, so only surviving elements call
         // it. Without `where`, every element reaches it directly.
         Reducer::Fold { func, captures } => {
-            debug_assert!(mask.is_none(), "a callable reducer after where must use control flow");
+            debug_assert!(
+                mask.is_none(),
+                "a callable reducer after where must use control flow"
+            );
             let cur = cur.expect("reduce needs a scalar element");
             let mut args = vec![Operand::Value(a), cur];
             args.extend(captures.iter().cloned());
@@ -10698,15 +12080,28 @@ fn lower_array_reduce(
         }
         // `any`/`all` are likewise guarded after `where`. They deliberately remain a full fold (no
         // early exit), preserving exactly-once predicate calls for every surviving element.
-        Reducer::AnyAll { func, captures, all } => {
-            debug_assert!(mask.is_none(), "a callable predicate after where must use control flow");
+        Reducer::AnyAll {
+            func,
+            captures,
+            all,
+        } => {
+            debug_assert!(
+                mask.is_none(),
+                "a callable predicate after where must use control flow"
+            );
             let cur = cur.expect("any/all needs a scalar element");
             let t = b.fresh_value(Ty::Bool);
             let args = stage_call_args(cur, captures);
-            b.push(Stmt::Let(t, Rvalue::Call(DirectCall::Program(func.clone()), args)));
+            b.push(Stmt::Let(
+                t,
+                Rvalue::Call(DirectCall::Program(func.clone()), args),
+            ));
             let op = if *all { BinOp::And } else { BinOp::Or };
             let n = b.fresh_value(Ty::Bool);
-            b.push(Stmt::Let(n, Rvalue::Bin(op, Operand::Value(a), Operand::Value(t))));
+            b.push(Stmt::Let(
+                n,
+                Rvalue::Bin(op, Operand::Value(a), Operand::Value(t)),
+            ));
             Operand::Value(n)
         }
         // `min`/`max`: acc = (cur `op` acc) ? cur : acc — the branchless min/max reduction idiom
@@ -10722,16 +12117,33 @@ fn lower_array_reduce(
             let cur = match &mask {
                 Some(m) => {
                     let s = b.fresh_value(acc_ty);
-                    b.push(Stmt::Let(s, Rvalue::Select { cond: m.clone(), a: cur, b: extreme_of(acc_ty, *is_max) }));
+                    b.push(Stmt::Let(
+                        s,
+                        Rvalue::Select {
+                            cond: m.clone(),
+                            a: cur,
+                            b: extreme_of(acc_ty, *is_max),
+                        },
+                    ));
                     Operand::Value(s)
                 }
                 None => cur,
             };
             let op = if *is_max { BinOp::Gt } else { BinOp::Lt };
             let cmp = b.fresh_value(Ty::Bool);
-            b.push(Stmt::Let(cmp, Rvalue::Bin(op, cur.clone(), Operand::Value(a))));
+            b.push(Stmt::Let(
+                cmp,
+                Rvalue::Bin(op, cur.clone(), Operand::Value(a)),
+            ));
             let n = b.fresh_value(acc_ty);
-            b.push(Stmt::Let(n, Rvalue::Select { cond: Operand::Value(cmp), a: cur, b: Operand::Value(a) }));
+            b.push(Stmt::Let(
+                n,
+                Rvalue::Select {
+                    cond: Operand::Value(cmp),
+                    a: cur,
+                    b: Operand::Value(a),
+                },
+            ));
             Operand::Value(n)
         }
     };
@@ -10743,7 +12155,10 @@ fn lower_array_reduce(
     let i2 = b.fresh_value(i64_ty());
     b.push(Stmt::Let(i2, Rvalue::Load(iv)));
     let inc = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(inc, Rvalue::Bin(BinOp::Add, Operand::Value(i2), index_const(1))));
+    b.push(Stmt::Let(
+        inc,
+        Rvalue::Bin(BinOp::Add, Operand::Value(i2), index_const(1)),
+    ));
     b.push(Stmt::Store(iv, Operand::Value(inc)));
     b.terminate(Term::Goto(header));
 
@@ -10831,14 +12246,36 @@ fn lower_json_scan_reduce(
     // header: status = next(scanner, cursor -> row); 0 → body, 1 → ok_exit, 2 → err_exit.
     b.cur = header;
     let status = b.fresh_value(status_ty());
-    b.push(Stmt::Let(status, Rvalue::JsonScanNext { scanner: scanner.clone(), struct_id, cursor, row }));
+    b.push(Stmt::Let(
+        status,
+        Rvalue::JsonScanNext {
+            scanner: scanner.clone(),
+            struct_id,
+            cursor,
+            row,
+        },
+    ));
     let is_row = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(is_row, Rvalue::Bin(BinOp::Eq, Operand::Value(status), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        is_row,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(status),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let after_row = b.new_block();
     b.terminate(Term::Branch(Operand::Value(is_row), body, after_row));
     b.cur = after_row;
     let is_done = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(is_done, Rvalue::Bin(BinOp::Eq, Operand::Value(status), Operand::Const(Const::Int(1, status_ty())))));
+    b.push(Stmt::Let(
+        is_done,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(status),
+            Operand::Const(Const::Int(1, status_ty())),
+        ),
+    ));
     b.terminate(Term::Branch(Operand::Value(is_done), ok_exit, err_exit));
 
     // body: run the stages over `row[0]`, fold the survivor, goto cont. A failed `where` branches to
@@ -10853,7 +12290,9 @@ fn lower_json_scan_reduce(
                 cur = Some(Operand::Value(v));
             }
             hir::StageKind::Map { func, .. } => {
-                let arg = cur.take().unwrap_or_else(|| Operand::Value(lower_struct_elem(b, None, &None, row, &index, struct_id)));
+                let arg = cur.take().unwrap_or_else(|| {
+                    Operand::Value(lower_struct_elem(b, None, &None, row, &index, struct_id))
+                });
                 let call_args = stage_call_args(arg, &prepared_stages[stage_idx].captures);
                 cur = Some(emit_named_call(
                     b,
@@ -10865,7 +12304,9 @@ fn lower_json_scan_reduce(
             hir::StageKind::Where { func, .. } => {
                 let arg = match &cur {
                     Some(a) => a.clone(),
-                    None => Operand::Value(lower_struct_elem(b, None, &None, row, &index, struct_id)),
+                    None => {
+                        Operand::Value(lower_struct_elem(b, None, &None, row, &index, struct_id))
+                    }
                 };
                 let call_args = stage_call_args(arg, &prepared_stages[stage_idx].captures);
                 let pred = b.fresh_value(Ty::Bool);
@@ -10887,8 +12328,13 @@ fn lower_json_scan_reduce(
                 b.cur = accepted;
             }
             hir::StageKind::WhereStrContains { .. } => {
-                let elem = cur.clone().expect("where(str.contains) requires a loaded str element");
-                let nl = prepared_stages[stage_idx].needle.as_ref().expect("a WhereStrContains stage has a lowered needle");
+                let elem = cur
+                    .clone()
+                    .expect("where(str.contains) requires a loaded str element");
+                let nl = prepared_stages[stage_idx]
+                    .needle
+                    .as_ref()
+                    .expect("a WhereStrContains stage has a lowered needle");
                 let pred = lower_where_str_contains_pred(b, nl, elem);
                 let accepted = b.new_block();
                 b.terminate(Term::Branch(Operand::Value(pred), accepted, cont));
@@ -10901,13 +12347,19 @@ fn lower_json_scan_reduce(
     let next: Operand = match &reducer {
         Reducer::Count => {
             let n = b.fresh_value(acc_ty);
-            b.push(Stmt::Let(n, Rvalue::Bin(BinOp::Add, Operand::Value(a), index_const(1))));
+            b.push(Stmt::Let(
+                n,
+                Rvalue::Bin(BinOp::Add, Operand::Value(a), index_const(1)),
+            ));
             Operand::Value(n)
         }
         Reducer::Sum => {
             let cur = cur.expect("sum needs a scalar element");
             let n = b.fresh_value(acc_ty);
-            b.push(Stmt::Let(n, Rvalue::Bin(BinOp::Add, Operand::Value(a), cur)));
+            b.push(Stmt::Let(
+                n,
+                Rvalue::Bin(BinOp::Add, Operand::Value(a), cur),
+            ));
             Operand::Value(n)
         }
         // `reduce(init, f)`: `acc = f(acc, cur)` (+ captures). Rejected rows already branched to `cont`
@@ -10915,7 +12367,9 @@ fn lower_json_scan_reduce(
         // arg is a projected scalar when a `.field`/`map` produced one, else the whole row struct (a
         // fold whose function consumes the struct by value — `reduce(0, fn(a, u) { a + u.score })`).
         Reducer::Fold { func, captures } => {
-            let cur = cur.unwrap_or_else(|| Operand::Value(lower_struct_elem(b, None, &None, row, &index, struct_id)));
+            let cur = cur.unwrap_or_else(|| {
+                Operand::Value(lower_struct_elem(b, None, &None, row, &index, struct_id))
+            });
             let mut args = vec![Operand::Value(a), cur];
             args.extend(captures.iter().cloned());
             emit_named_call(b, func.clone(), args, acc_ty)
@@ -10923,14 +12377,26 @@ fn lower_json_scan_reduce(
         // `any(p)`/`all(p)`: `acc = acc || p(cur)` / `acc && p(cur)` — a full fold (no early exit),
         // exactly-once predicate calls per surviving row. `p`'s arg is a projected scalar or (no
         // projection) the whole row struct (`rows.any(fn(u) { u.score > 8 })`).
-        Reducer::AnyAll { func, captures, all } => {
-            let cur = cur.unwrap_or_else(|| Operand::Value(lower_struct_elem(b, None, &None, row, &index, struct_id)));
+        Reducer::AnyAll {
+            func,
+            captures,
+            all,
+        } => {
+            let cur = cur.unwrap_or_else(|| {
+                Operand::Value(lower_struct_elem(b, None, &None, row, &index, struct_id))
+            });
             let t = b.fresh_value(Ty::Bool);
             let args = stage_call_args(cur, captures);
-            b.push(Stmt::Let(t, Rvalue::Call(DirectCall::Program(func.clone()), args)));
+            b.push(Stmt::Let(
+                t,
+                Rvalue::Call(DirectCall::Program(func.clone()), args),
+            ));
             let op = if *all { BinOp::And } else { BinOp::Or };
             let n = b.fresh_value(Ty::Bool);
-            b.push(Stmt::Let(n, Rvalue::Bin(op, Operand::Value(a), Operand::Value(t))));
+            b.push(Stmt::Let(
+                n,
+                Rvalue::Bin(op, Operand::Value(a), Operand::Value(t)),
+            ));
             Operand::Value(n)
         }
         // `min`/`max`: `acc = (cur `op` acc) ? cur : acc` — the branchless reduction idiom (the array
@@ -10939,9 +12405,19 @@ fn lower_json_scan_reduce(
             let cur = cur.expect("min/max needs a scalar element");
             let op = if *is_max { BinOp::Gt } else { BinOp::Lt };
             let cmp = b.fresh_value(Ty::Bool);
-            b.push(Stmt::Let(cmp, Rvalue::Bin(op, cur.clone(), Operand::Value(a))));
+            b.push(Stmt::Let(
+                cmp,
+                Rvalue::Bin(op, cur.clone(), Operand::Value(a)),
+            ));
             let n = b.fresh_value(acc_ty);
-            b.push(Stmt::Let(n, Rvalue::Select { cond: Operand::Value(cmp), a: cur, b: Operand::Value(a) }));
+            b.push(Stmt::Let(
+                n,
+                Rvalue::Select {
+                    cond: Operand::Value(cmp),
+                    a: cur,
+                    b: Operand::Value(a),
+                },
+            ));
             Operand::Value(n)
         }
     };
@@ -10968,7 +12444,10 @@ fn lower_json_scan_reduce(
     // exactly, rather than leaking the scan-internal status code.
     b.cur = err_exit;
     let malformed = b.fresh_value(status_ty());
-    b.push(Stmt::Let(malformed, Rvalue::Use(Operand::Const(Const::Int(1, status_ty())))));
+    b.push(Stmt::Let(
+        malformed,
+        Rvalue::Use(Operand::Const(Const::Int(1, status_ty()))),
+    ));
     let ec = make_error_code(b, malformed, result_ty);
     let errv = b.fresh_value(result_ty);
     b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
@@ -10988,12 +12467,20 @@ enum CollectKind<'a> {
     /// `scan(init, f)`: thread an accumulator (`acc = f(acc, element)`, seeded with `init`) and
     /// append the running accumulator. `captures` are a lifted lambda's captured values, passed
     /// after the `(acc, element)` arguments.
-    Scan { func: &'a str, init: &'a hir::Expr, captures: &'a [hir::Expr] },
+    Scan {
+        func: &'a str,
+        init: &'a hir::Expr,
+        captures: &'a [hir::Expr],
+    },
 }
 
 enum PreparedCollectKind {
     Collect,
-    Scan { func: ProgramCall, init: Operand, captures: Vec<Operand> },
+    Scan {
+        func: ProgramCall,
+        init: Operand,
+        captures: Vec<Operand>,
+    },
 }
 
 /// `source.….to_array()` / `.scan(init, f)` — the fused loop, but each surviving element is
@@ -11014,7 +12501,16 @@ fn lower_array_collect(
     // — `make()` returns an owned array nothing else holds). The copy loop consumes it into the
     // new output buffer, so free that source temporary at the exit (the result is a separate
     // buffer). `temp_free` is None for slots / bound locals / arena temporaries.
-    let Some(SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src, struct_view, temp_free, zip }) = setup_source(b, source) else {
+    let Some(SrcSetup {
+        slot,
+        slice_val,
+        bound,
+        scalar_slot: scalar_slot_src,
+        struct_view,
+        temp_free,
+        zip,
+    }) = setup_source(b, source)
+    else {
         return (Operand::Const(Const::Unit), Vec::new());
     };
     let Some(prepared_stages) = prepare_pipeline_stages(b, stages) else {
@@ -11022,7 +12518,11 @@ fn lower_array_collect(
     };
     let kind = match kind {
         CollectKind::Collect => PreparedCollectKind::Collect,
-        CollectKind::Scan { func, init, captures } => {
+        CollectKind::Scan {
+            func,
+            init,
+            captures,
+        } => {
             let init = lower_expr(b, init);
             if !lowering_continues(b) {
                 return (Operand::Const(Const::Unit), Vec::new());
@@ -11077,14 +12577,25 @@ fn lower_array_collect(
         // both stay plain (non-`noalias`) so the vectorizer keeps its in-place read-before-write
         // guarantee. `out_idx <= i` (compaction) and identical element size keep every store within
         // the allocation and behind the already-loaded element.
-        Rvalue::SlicePtr(slice_val.clone().expect("a donatable scalar source has a {ptr,len} value"))
+        Rvalue::SlicePtr(
+            slice_val
+                .clone()
+                .expect("a donatable scalar source has a {ptr,len} value"),
+        )
     } else {
         match arena {
-            Some(h) => Rvalue::ArenaAlloc { handle: Operand::Value(h), count: bound.clone(), elem },
+            Some(h) => Rvalue::ArenaAlloc {
+                handle: Operand::Value(h),
+                count: bound.clone(),
+                elem,
+            },
             // Outside an arena the returned buffer is individually owned. A binding gets its ordinary
             // drop slot; an unbound consumer gets the path-local synthetic owner installed by
             // `lower_borrowed_owned`. Arena mode remains bulk-freed.
-            None => Rvalue::HeapAllocBuf { count: bound.clone(), elem },
+            None => Rvalue::HeapAllocBuf {
+                count: bound.clone(),
+                elem,
+            },
         }
     };
     b.push(Stmt::Let(out_ptr, alloc));
@@ -11115,7 +12626,10 @@ fn lower_array_collect(
     let i_val = b.fresh_value(i64_ty());
     b.push(Stmt::Let(i_val, Rvalue::Load(iv)));
     let cond = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(cond, Rvalue::Bin(BinOp::Lt, Operand::Value(i_val), bound)));
+    b.push(Stmt::Let(
+        cond,
+        Rvalue::Bin(BinOp::Lt, Operand::Value(i_val), bound),
+    ));
     b.terminate(Term::Branch(Operand::Value(cond), body, exit));
 
     // body: address element i, run the stages, append survivors.
@@ -11152,7 +12666,15 @@ fn lower_array_collect(
     for (stage_idx, stage) in stages.iter().enumerate() {
         match &stage.kind {
             hir::StageKind::Project { field } => {
-                let v = lower_field_access(b, struct_view, &slice_val, slot, &index, *field, stage.out_ty);
+                let v = lower_field_access(
+                    b,
+                    struct_view,
+                    &slice_val,
+                    slot,
+                    &index,
+                    *field,
+                    stage.out_ty,
+                );
                 cur = Some(Operand::Value(v));
             }
             hir::StageKind::Map { func, .. } => {
@@ -11163,9 +12685,18 @@ fn lower_array_collect(
                     None => {
                         let sid = match source.ty {
                             Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => id,
-                            _ => unreachable!("map with no loaded element must be over a struct array"),
+                            _ => unreachable!(
+                                "map with no loaded element must be over a struct array"
+                            ),
                         };
-                        Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
+                        Operand::Value(lower_struct_elem(
+                            b,
+                            struct_view,
+                            &slice_val,
+                            slot,
+                            &index,
+                            sid,
+                        ))
                     }
                 };
                 let call_args = stage_call_args(arg, &prepared_stages[stage_idx].captures);
@@ -11185,9 +12716,18 @@ fn lower_array_collect(
                     None => {
                         let sid = match source.ty {
                             Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => id,
-                            _ => unreachable!("where with no loaded element must be over a struct array"),
+                            _ => unreachable!(
+                                "where with no loaded element must be over a struct array"
+                            ),
                         };
-                        Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
+                        Operand::Value(lower_struct_elem(
+                            b,
+                            struct_view,
+                            &slice_val,
+                            slot,
+                            &index,
+                            sid,
+                        ))
                     }
                 };
                 let call_args = stage_call_args(arg, &prepared_stages[stage_idx].captures);
@@ -11206,15 +12746,21 @@ fn lower_array_collect(
             hir::StageKind::WhereStrContains { .. } => {
                 // Hoisted repeated-needle predicate (doc-13 §6.6): keep the element iff
                 // `finder_find(plan, s) >= 0`, reusing the plan built once before the loop.
-                let elem_op = cur.clone().expect("where(str.contains) requires a loaded str element");
-                let nl = prepared_stages[stage_idx].needle.as_ref().expect("a WhereStrContains stage has a lowered needle");
+                let elem_op = cur
+                    .clone()
+                    .expect("where(str.contains) requires a loaded str element");
+                let nl = prepared_stages[stage_idx]
+                    .needle
+                    .as_ref()
+                    .expect("a WhereStrContains stage has a lowered needle");
                 let pred = lower_where_str_contains_pred(b, nl, elem_op);
                 let keep = b.new_block();
                 b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
                 b.cur = keep;
             }
             hir::StageKind::WhereField { field } => {
-                let pred = lower_field_access(b, struct_view, &slice_val, slot, &index, *field, Ty::Bool);
+                let pred =
+                    lower_field_access(b, struct_view, &slice_val, slot, &index, *field, Ty::Bool);
                 let keep = b.new_block();
                 b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
                 b.cur = keep;
@@ -11234,7 +12780,14 @@ fn lower_array_collect(
                 Ty::StructArray(id, _) | Ty::DynStructArray(id, _) | Ty::Soa(id) => id,
                 _ => unreachable!("a collect without a loaded element must be over a struct array"),
             };
-            Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
+            Operand::Value(lower_struct_elem(
+                b,
+                struct_view,
+                &slice_val,
+                slot,
+                &index,
+                sid,
+            ))
         }
     };
     let value = match (&kind, scan_acc) {
@@ -11251,9 +12804,16 @@ fn lower_array_collect(
     };
     let out_idx = b.fresh_value(i64_ty());
     b.push(Stmt::Let(out_idx, Rvalue::Load(acc)));
-    b.push(Stmt::PtrStore(Operand::Value(out_ptr), Operand::Value(out_idx), value));
+    b.push(Stmt::PtrStore(
+        Operand::Value(out_ptr),
+        Operand::Value(out_idx),
+        value,
+    ));
     let next = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(next, Rvalue::Bin(BinOp::Add, Operand::Value(out_idx), index_const(1))));
+    b.push(Stmt::Let(
+        next,
+        Rvalue::Bin(BinOp::Add, Operand::Value(out_idx), index_const(1)),
+    ));
     b.push(Stmt::Store(acc, Operand::Value(next)));
     b.terminate(Term::Goto(cont));
 
@@ -11262,7 +12822,10 @@ fn lower_array_collect(
     let i2 = b.fresh_value(i64_ty());
     b.push(Stmt::Let(i2, Rvalue::Load(iv)));
     let inc = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(inc, Rvalue::Bin(BinOp::Add, Operand::Value(i2), index_const(1))));
+    b.push(Stmt::Let(
+        inc,
+        Rvalue::Bin(BinOp::Add, Operand::Value(i2), index_const(1)),
+    ));
     b.push(Stmt::Store(iv, Operand::Value(inc)));
     b.terminate(Term::Goto(header));
 
@@ -11275,7 +12838,13 @@ fn lower_array_collect(
         _ => Ty::DynArray(scalar_of(elem)),
     };
     let arr = b.fresh_value(array_ty);
-    b.push(Stmt::Let(arr, Rvalue::MakeDynArray { ptr: Operand::Value(out_ptr), len: Operand::Value(len) }));
+    b.push(Stmt::Let(
+        arr,
+        Rvalue::MakeDynArray {
+            ptr: Operand::Value(out_ptr),
+            len: Operand::Value(len),
+        },
+    ));
     // Free the source temporary now its elements have been copied into the new buffer — UNLESS its
     // storage was donated to `arr` above, in which case the result array now owns that buffer and is
     // its single free (dropping the source here would be a double-free of the donated allocation).
@@ -11294,7 +12863,10 @@ fn lower_array_collect(
 /// a branch to a `-> !` reporting block (`Unreachable`), continuing in the `ok` block.
 fn emit_len_eq_check(b: &mut Builder, have: Operand, want: Operand) {
     let ne = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(ne, Rvalue::Bin(BinOp::Ne, have.clone(), want.clone())));
+    b.push(Stmt::Let(
+        ne,
+        Rvalue::Bin(BinOp::Ne, have.clone(), want.clone()),
+    ));
     let fail = b.new_block();
     let ok = b.new_block();
     b.terminate(Term::Branch(Operand::Value(ne), fail, ok));
@@ -11302,7 +12874,10 @@ fn emit_len_eq_check(b: &mut Builder, have: Operand, want: Operand) {
     let t = b.fresh_value(Ty::Unit);
     b.push(Stmt::Let(
         t,
-        Rvalue::Call(DirectCall::Runtime(RuntimeKey::LenMismatchFail), vec![have, want]),
+        Rvalue::Call(
+            DirectCall::Runtime(RuntimeKey::LenMismatchFail),
+            vec![have, want],
+        ),
     ));
     b.terminate(Term::Unreachable);
     b.cur = ok;
@@ -11316,8 +12891,23 @@ fn emit_len_eq_check(b: &mut Builder, have: Operand, want: Operand) {
 /// source load and `dst` store are tagged with the loop's disjoint `in`/`out` alias scopes
 /// ([`Rvalue::SliceIndexNoalias`]/[`Stmt::PtrStoreNoalias`]) — sema proved `dst` is disjoint from the
 /// source — so the vectorizer drops its runtime overlap guard. Yields `()`.
-fn lower_array_map_into(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], dst: &hir::Expr, elem: Ty) -> Operand {
-    let Some(SrcSetup { slot, slice_val, bound, scalar_slot, struct_view, temp_free, zip }) = setup_source(b, source) else {
+fn lower_array_map_into(
+    b: &mut Builder,
+    source: &hir::Expr,
+    stages: &[hir::Stage],
+    dst: &hir::Expr,
+    elem: Ty,
+) -> Operand {
+    let Some(SrcSetup {
+        slot,
+        slice_val,
+        bound,
+        scalar_slot,
+        struct_view,
+        temp_free,
+        zip,
+    }) = setup_source(b, source)
+    else {
         return Operand::Const(Const::Unit);
     };
     let Some(prepared_stages) = prepare_pipeline_stages(b, stages) else {
@@ -11328,11 +12918,16 @@ fn lower_array_map_into(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stag
     // sub-slice of one, or a fixed array literal — never a fn-returned owned `array<T>` or a nested
     // materializing terminal — so `setup_source` cannot hand back a `temp_free`. Assert the
     // invariant rather than silently leak (or double-free) if that gate ever loosens.
-    debug_assert!(temp_free.is_none(), "map_into source must not own a fresh buffer (sema alias gate)");
+    debug_assert!(
+        temp_free.is_none(),
+        "map_into source must not own a fresh buffer (sema alias gate)"
+    );
     // The source load is scope-tagged only when it reads a runtime slice buffer (`SliceIndex`); a
     // fixed stack-array source (`Index`) can't alias a caller slice, so it needs no metadata.
     let emit_noalias = slice_val.is_some()
-        || zip.as_ref().is_some_and(|zip| zip.inputs.iter().any(|input| input.slice_val.is_some()));
+        || zip
+            .as_ref()
+            .is_some_and(|zip| zip.inputs.iter().any(|input| input.slice_val.is_some()));
     let scope = b.fresh_alias_scope();
 
     // Destination `{ptr,len}`: its buffer pointer (store target) and length (for the guard).
@@ -11360,7 +12955,10 @@ fn lower_array_map_into(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stag
     let i_val = b.fresh_value(i64_ty());
     b.push(Stmt::Let(i_val, Rvalue::Load(iv)));
     let cond = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(cond, Rvalue::Bin(BinOp::Lt, Operand::Value(i_val), bound.clone())));
+    b.push(Stmt::Let(
+        cond,
+        Rvalue::Bin(BinOp::Lt, Operand::Value(i_val), bound.clone()),
+    ));
     b.terminate(Term::Branch(Operand::Value(cond), body, exit));
 
     b.cur = body;
@@ -11381,7 +12979,11 @@ fn lower_array_map_into(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stag
         };
         let x = b.fresh_value(src_elem);
         let load = if emit_noalias {
-            Rvalue::SliceIndexNoalias { slice: sv.clone(), index: index.clone(), scope }
+            Rvalue::SliceIndexNoalias {
+                slice: sv.clone(),
+                index: index.clone(),
+                scope,
+            }
         } else {
             Rvalue::SliceIndex(sv.clone(), index.clone())
         };
@@ -11403,7 +13005,15 @@ fn lower_array_map_into(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stag
     for (stage_idx, stage) in stages.iter().enumerate() {
         match &stage.kind {
             hir::StageKind::Project { field } => {
-                let v = lower_field_access(b, struct_view, &slice_val, slot, &index, *field, stage.out_ty);
+                let v = lower_field_access(
+                    b,
+                    struct_view,
+                    &slice_val,
+                    slot,
+                    &index,
+                    *field,
+                    stage.out_ty,
+                );
                 cur = Some(Operand::Value(v));
             }
             hir::StageKind::Map { func, .. } => {
@@ -11412,9 +13022,18 @@ fn lower_array_map_into(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stag
                     None => {
                         let sid = match source.ty {
                             Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => id,
-                            _ => unreachable!("map with no loaded element must be over a struct array"),
+                            _ => unreachable!(
+                                "map with no loaded element must be over a struct array"
+                            ),
                         };
-                        Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
+                        Operand::Value(lower_struct_elem(
+                            b,
+                            struct_view,
+                            &slice_val,
+                            slot,
+                            &index,
+                            sid,
+                        ))
                     }
                 };
                 let call_args = stage_call_args(arg, &prepared_stages[stage_idx].captures);
@@ -11425,7 +13044,9 @@ fn lower_array_map_into(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stag
                     stage.out_ty,
                 ));
             }
-            hir::StageKind::Where { .. } | hir::StageKind::WhereField { .. } | hir::StageKind::WhereStrContains { .. } => {
+            hir::StageKind::Where { .. }
+            | hir::StageKind::WhereField { .. }
+            | hir::StageKind::WhereStrContains { .. } => {
                 unreachable!("map_into rejects filtering `where` stages in sema")
             }
         }
@@ -11433,14 +13054,22 @@ fn lower_array_map_into(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stag
 
     let value = cur.expect("map_into needs a scalar element");
     let store = if emit_noalias {
-        Stmt::PtrStoreNoalias { ptr: Operand::Value(dst_ptr), index: index.clone(), value, scope }
+        Stmt::PtrStoreNoalias {
+            ptr: Operand::Value(dst_ptr),
+            index: index.clone(),
+            value,
+            scope,
+        }
     } else {
         Stmt::PtrStore(Operand::Value(dst_ptr), index.clone(), value)
     };
     b.push(store);
 
     let inc = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(inc, Rvalue::Bin(BinOp::Add, index, index_const(1))));
+    b.push(Stmt::Let(
+        inc,
+        Rvalue::Bin(BinOp::Add, index, index_const(1)),
+    ));
     b.push(Stmt::Store(iv, Operand::Value(inc)));
     b.terminate(Term::Goto(header));
 
@@ -11457,7 +13086,14 @@ fn lower_array_map_into(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stag
 fn lower_array_to_soa(b: &mut Builder, source: &hir::Expr, struct_id: u32) -> Operand {
     // The source is a whole-struct array (no stages), so `struct_view`/`slot` address its elements;
     // `bound` is the row count `len` (a constant for a fixed array, a runtime value otherwise).
-    let Some(SrcSetup { slot, slice_val, bound, struct_view, .. }) = setup_source(b, source) else {
+    let Some(SrcSetup {
+        slot,
+        slice_val,
+        bound,
+        struct_view,
+        ..
+    }) = setup_source(b, source)
+    else {
         return Operand::Const(Const::Unit);
     };
     transpose_to_soa(b, struct_view, &slice_val, slot, bound, struct_id)
@@ -11477,15 +13113,31 @@ fn transpose_to_soa(
     len: Operand,
     struct_id: u32,
 ) -> Operand {
-    let handle = *b.arenas.last().expect("to_soa outside an arena (sema-checked)");
-    let field_tys: Vec<Ty> = b.structs[struct_id as usize].fields.iter().map(|f| f.ty).collect();
+    let handle = *b
+        .arenas
+        .last()
+        .expect("to_soa outside an arena (sema-checked)");
+    let field_tys: Vec<Ty> = b.structs[struct_id as usize]
+        .fields
+        .iter()
+        .map(|f| f.ty)
+        .collect();
 
     // Allocate the column-major buffer (`len` rows). The element-pointer type is opaque, so the
     // `Box` scalar is irrelevant — use the first field's. A soa struct always has ≥1 field (sema).
-    let first_ty = *field_tys.first().expect("a soa struct has at least one field");
+    let first_ty = *field_tys
+        .first()
+        .expect("a soa struct has at least one field");
     let first_scalar = align_sema::ty_to_scalar(first_ty).expect("soa field is a scalar");
     let buf = b.fresh_value(Ty::Box(first_scalar));
-    b.push(Stmt::Let(buf, Rvalue::SoaAlloc { handle: Operand::Value(handle), len: len.clone(), struct_id }));
+    b.push(Stmt::Let(
+        buf,
+        Rvalue::SoaAlloc {
+            handle: Operand::Value(handle),
+            len: len.clone(),
+            struct_id,
+        },
+    ));
 
     // for i in 0..len: scatter element i's fields into their columns.
     let iv = b.new_slot(i64_ty());
@@ -11499,7 +13151,10 @@ fn transpose_to_soa(
     let i_val = b.fresh_value(i64_ty());
     b.push(Stmt::Let(i_val, Rvalue::Load(iv)));
     let cond = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(cond, Rvalue::Bin(BinOp::Lt, Operand::Value(i_val), len.clone())));
+    b.push(Stmt::Let(
+        cond,
+        Rvalue::Bin(BinOp::Lt, Operand::Value(i_val), len.clone()),
+    ));
     b.terminate(Term::Branch(Operand::Value(cond), body, exit));
 
     b.cur = body;
@@ -11518,14 +13173,23 @@ fn transpose_to_soa(
         });
     }
     let inc = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(inc, Rvalue::Bin(BinOp::Add, index.clone(), index_const(1))));
+    b.push(Stmt::Let(
+        inc,
+        Rvalue::Bin(BinOp::Add, index.clone(), index_const(1)),
+    ));
     b.push(Stmt::Store(iv, Operand::Value(inc)));
     b.terminate(Term::Goto(header));
 
     // exit: build the soa `{ ptr, len }` view over the column buffer.
     b.cur = exit;
     let soa = b.fresh_value(Ty::Soa(struct_id));
-    b.push(Stmt::Let(soa, Rvalue::MakeDynArray { ptr: Operand::Value(buf), len }));
+    b.push(Stmt::Let(
+        soa,
+        Rvalue::MakeDynArray {
+            ptr: Operand::Value(buf),
+            len,
+        },
+    ));
     Operand::Value(soa)
 }
 
@@ -11535,18 +13199,41 @@ fn transpose_to_soa(
 /// arena, and fills them in one value-parse pass — no AoS intermediate, no transpose. Mirrors
 /// [`lower_json_decode_struct_array`]'s Ok/Err branch. The soa columns are all primitive scalars
 /// (sema-enforced), so the result is self-contained — bound to the arena, not the input.
-fn lower_json_decode_soa(b: &mut Builder, struct_id: u32, input: &hir::Expr, result_ty: Ty) -> Operand {
+fn lower_json_decode_soa(
+    b: &mut Builder,
+    struct_id: u32,
+    input: &hir::Expr,
+    result_ty: Ty,
+) -> Operand {
     let soa_ty = Ty::Soa(struct_id);
     let out = b.new_slot(soa_ty);
     let inp = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
     // The column buffer is arena-bump-allocated (sema requires `json.decode → soa` inside an arena),
     // so the runtime needs the innermost arena handle.
-    let arena = *b.arenas.last().expect("json.decode → soa outside an arena (sema-checked)");
+    let arena = *b
+        .arenas
+        .last()
+        .expect("json.decode → soa outside an arena (sema-checked)");
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::JsonDecodeSoa { struct_id, input: inp, out, arena: Operand::Value(arena) }));
+    b.push(Stmt::Let(
+        code,
+        Rvalue::JsonDecodeSoa {
+            struct_id,
+            input: inp,
+            out,
+            arena: Operand::Value(arena),
+        },
+    ));
 
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -11582,18 +13269,40 @@ fn lower_json_decode_soa(b: &mut Builder, struct_id: u32, input: &hir::Expr, res
 /// runtime hash-aggregate for the op, and builds the result tuple `(array<i64>, array<i64>)`
 /// (distinct keys, per-key aggregate). The output arrays are owned (heap, `Drop`-freed) so the tuple
 /// can escape; the runtime's internal table is its own concern.
-fn lower_array_group_agg(b: &mut Builder, base: u32, struct_id: u32, key_field: u32, value_field: Option<u32>, op: hir::GroupOp, tuple_id: u32) -> Operand {
+fn lower_array_group_agg(
+    b: &mut Builder,
+    base: u32,
+    struct_id: u32,
+    key_field: u32,
+    value_field: Option<u32>,
+    op: hir::GroupOp,
+    tuple_id: u32,
+) -> Operand {
     let i64s = scalar_of(i64_ty());
     let islice = Ty::Slice(i64s);
     // The key column (always) and the value column (sum/min/max). `count` has no value column, so it
     // reuses the key column as the (codegen-ignored) `vals` operand — the runtime `count` entry point
     // takes no values.
     let key_col = b.fresh_value(islice);
-    b.push(Stmt::Let(key_col, Rvalue::SoaColumn { base, struct_id, field: key_field }));
+    b.push(Stmt::Let(
+        key_col,
+        Rvalue::SoaColumn {
+            base,
+            struct_id,
+            field: key_field,
+        },
+    ));
     let val_col = match value_field {
         Some(vf) => {
             let v = b.fresh_value(islice);
-            b.push(Stmt::Let(v, Rvalue::SoaColumn { base, struct_id, field: vf }));
+            b.push(Stmt::Let(
+                v,
+                Rvalue::SoaColumn {
+                    base,
+                    struct_id,
+                    field: vf,
+                },
+            ));
             v
         }
         None => key_col,
@@ -11602,9 +13311,21 @@ fn lower_array_group_agg(b: &mut Builder, base: u32, struct_id: u32, key_field: 
     b.push(Stmt::Let(len, Rvalue::SliceLen(Operand::Value(key_col))));
     // Output buffers (owned heap, sized at the column length = an upper bound on the group count).
     let out_keys = b.fresh_value(Ty::Box(i64s));
-    b.push(Stmt::Let(out_keys, Rvalue::HeapAllocBuf { count: Operand::Value(len), elem: i64_ty() }));
+    b.push(Stmt::Let(
+        out_keys,
+        Rvalue::HeapAllocBuf {
+            count: Operand::Value(len),
+            elem: i64_ty(),
+        },
+    ));
     let out_vals = b.fresh_value(Ty::Box(i64s));
-    b.push(Stmt::Let(out_vals, Rvalue::HeapAllocBuf { count: Operand::Value(len), elem: i64_ty() }));
+    b.push(Stmt::Let(
+        out_vals,
+        Rvalue::HeapAllocBuf {
+            count: Operand::Value(len),
+            elem: i64_ty(),
+        },
+    ));
     // Aggregate → group count.
     let count = b.fresh_value(i64_ty());
     b.push(Stmt::Let(
@@ -11619,11 +13340,29 @@ fn lower_array_group_agg(b: &mut Builder, base: u32, struct_id: u32, key_field: 
     ));
     // Build the two owned result arrays and the tuple.
     let karr = b.fresh_value(Ty::DynArray(i64s));
-    b.push(Stmt::Let(karr, Rvalue::MakeDynArray { ptr: Operand::Value(out_keys), len: Operand::Value(count) }));
+    b.push(Stmt::Let(
+        karr,
+        Rvalue::MakeDynArray {
+            ptr: Operand::Value(out_keys),
+            len: Operand::Value(count),
+        },
+    ));
     let varr = b.fresh_value(Ty::DynArray(i64s));
-    b.push(Stmt::Let(varr, Rvalue::MakeDynArray { ptr: Operand::Value(out_vals), len: Operand::Value(count) }));
+    b.push(Stmt::Let(
+        varr,
+        Rvalue::MakeDynArray {
+            ptr: Operand::Value(out_vals),
+            len: Operand::Value(count),
+        },
+    ));
     let tup = b.fresh_value(Ty::Tuple(tuple_id));
-    b.push(Stmt::Let(tup, Rvalue::MakeTuple { tuple_id, elems: vec![Operand::Value(karr), Operand::Value(varr)] }));
+    b.push(Stmt::Let(
+        tup,
+        Rvalue::MakeTuple {
+            tuple_id,
+            elems: vec![Operand::Value(karr), Operand::Value(varr)],
+        },
+    ));
     Operand::Value(tup)
 }
 
@@ -11633,17 +13372,39 @@ fn lower_array_group_agg(b: &mut Builder, base: u32, struct_id: u32, key_field: 
 /// path, but interns the `str` keys — the two contiguous columns feed [`Rvalue::GroupAggStrCols`]
 /// (`align_rt_group_*_str_cols`). Result tuple `(array<str>, array<i64>)`; the owned key buffer's
 /// `str` elements borrow the soa's string storage, so the tuple is region-tied to the source (sema).
-fn lower_array_group_str_cols(b: &mut Builder, base: u32, struct_id: u32, key_field: u32, value_field: Option<u32>, op: hir::GroupOp, tuple_id: u32) -> Operand {
+fn lower_array_group_str_cols(
+    b: &mut Builder,
+    base: u32,
+    struct_id: u32,
+    key_field: u32,
+    value_field: Option<u32>,
+    op: hir::GroupOp,
+    tuple_id: u32,
+) -> Operand {
     let strs = scalar_of(Ty::Str);
     let i64s = scalar_of(i64_ty());
     // The str key column (always) and the i64 value column (sum/min/max). `count` has no value
     // column, so it reuses the key column as the (runtime-ignored) `vals` operand.
     let key_col = b.fresh_value(Ty::Slice(strs));
-    b.push(Stmt::Let(key_col, Rvalue::SoaColumn { base, struct_id, field: key_field }));
+    b.push(Stmt::Let(
+        key_col,
+        Rvalue::SoaColumn {
+            base,
+            struct_id,
+            field: key_field,
+        },
+    ));
     let val_col = match value_field {
         Some(vf) => {
             let v = b.fresh_value(Ty::Slice(i64s));
-            b.push(Stmt::Let(v, Rvalue::SoaColumn { base, struct_id, field: vf }));
+            b.push(Stmt::Let(
+                v,
+                Rvalue::SoaColumn {
+                    base,
+                    struct_id,
+                    field: vf,
+                },
+            ));
             v
         }
         None => key_col,
@@ -11652,9 +13413,21 @@ fn lower_array_group_str_cols(b: &mut Builder, base: u32, struct_id: u32, key_fi
     b.push(Stmt::Let(len, Rvalue::SliceLen(Operand::Value(key_col))));
     // Output buffers (owned heap): `str`-view keys + i64 aggregates, each sized at the row count.
     let out_keys = b.fresh_value(Ty::Box(strs));
-    b.push(Stmt::Let(out_keys, Rvalue::HeapAllocBuf { count: Operand::Value(len), elem: Ty::Str }));
+    b.push(Stmt::Let(
+        out_keys,
+        Rvalue::HeapAllocBuf {
+            count: Operand::Value(len),
+            elem: Ty::Str,
+        },
+    ));
     let out_vals = b.fresh_value(Ty::Box(i64s));
-    b.push(Stmt::Let(out_vals, Rvalue::HeapAllocBuf { count: Operand::Value(len), elem: i64_ty() }));
+    b.push(Stmt::Let(
+        out_vals,
+        Rvalue::HeapAllocBuf {
+            count: Operand::Value(len),
+            elem: i64_ty(),
+        },
+    ));
     // Intern + aggregate over the two columns → group count.
     let count = b.fresh_value(i64_ty());
     b.push(Stmt::Let(
@@ -11669,11 +13442,29 @@ fn lower_array_group_str_cols(b: &mut Builder, base: u32, struct_id: u32, key_fi
     ));
     // Build the two owned result arrays and the tuple.
     let karr = b.fresh_value(Ty::DynArray(strs));
-    b.push(Stmt::Let(karr, Rvalue::MakeDynArray { ptr: Operand::Value(out_keys), len: Operand::Value(count) }));
+    b.push(Stmt::Let(
+        karr,
+        Rvalue::MakeDynArray {
+            ptr: Operand::Value(out_keys),
+            len: Operand::Value(count),
+        },
+    ));
     let varr = b.fresh_value(Ty::DynArray(i64s));
-    b.push(Stmt::Let(varr, Rvalue::MakeDynArray { ptr: Operand::Value(out_vals), len: Operand::Value(count) }));
+    b.push(Stmt::Let(
+        varr,
+        Rvalue::MakeDynArray {
+            ptr: Operand::Value(out_vals),
+            len: Operand::Value(count),
+        },
+    ));
     let tup = b.fresh_value(Ty::Tuple(tuple_id));
-    b.push(Stmt::Let(tup, Rvalue::MakeTuple { tuple_id, elems: vec![Operand::Value(karr), Operand::Value(varr)] }));
+    b.push(Stmt::Let(
+        tup,
+        Rvalue::MakeTuple {
+            tuple_id,
+            elems: vec![Operand::Value(karr), Operand::Value(varr)],
+        },
+    ));
     Operand::Value(tup)
 }
 
@@ -11682,7 +13473,15 @@ fn lower_array_group_str_cols(b: &mut Builder, base: u32, struct_id: u32, key_fi
 /// buffer (each sized at the row count), interns + sums via [`Rvalue::GroupAggStr`], and builds the
 /// result tuple `(array<str>, array<i64>)`. The key buffer is owned (heap, `Drop`-freed) but its
 /// elements are `str` views borrowing `base`, so the tuple is region-tied to the source (sema).
-fn lower_array_group_str(b: &mut Builder, base: u32, struct_id: u32, key_field: u32, value_field: Option<u32>, op: hir::GroupOp, tuple_id: u32) -> Operand {
+fn lower_array_group_str(
+    b: &mut Builder,
+    base: u32,
+    struct_id: u32,
+    key_field: u32,
+    value_field: Option<u32>,
+    op: hir::GroupOp,
+    tuple_id: u32,
+) -> Operand {
     let strs = scalar_of(Ty::Str);
     let i64s = scalar_of(i64_ty());
     // Load the AoS array to get its length (an upper bound on the group count).
@@ -11692,9 +13491,21 @@ fn lower_array_group_str(b: &mut Builder, base: u32, struct_id: u32, key_field: 
     b.push(Stmt::Let(len, Rvalue::SliceLen(Operand::Value(arr))));
     // Output buffers (owned heap): `str`-view keys + i64 sums, each sized at the row count.
     let out_keys = b.fresh_value(Ty::Box(strs));
-    b.push(Stmt::Let(out_keys, Rvalue::HeapAllocBuf { count: Operand::Value(len), elem: Ty::Str }));
+    b.push(Stmt::Let(
+        out_keys,
+        Rvalue::HeapAllocBuf {
+            count: Operand::Value(len),
+            elem: Ty::Str,
+        },
+    ));
     let out_vals = b.fresh_value(Ty::Box(i64s));
-    b.push(Stmt::Let(out_vals, Rvalue::HeapAllocBuf { count: Operand::Value(len), elem: i64_ty() }));
+    b.push(Stmt::Let(
+        out_vals,
+        Rvalue::HeapAllocBuf {
+            count: Operand::Value(len),
+            elem: i64_ty(),
+        },
+    ));
     // Intern + aggregate → group count.
     let count = b.fresh_value(i64_ty());
     b.push(Stmt::Let(
@@ -11711,11 +13522,29 @@ fn lower_array_group_str(b: &mut Builder, base: u32, struct_id: u32, key_field: 
     ));
     // Build the two owned result arrays and the tuple.
     let karr = b.fresh_value(Ty::DynArray(strs));
-    b.push(Stmt::Let(karr, Rvalue::MakeDynArray { ptr: Operand::Value(out_keys), len: Operand::Value(count) }));
+    b.push(Stmt::Let(
+        karr,
+        Rvalue::MakeDynArray {
+            ptr: Operand::Value(out_keys),
+            len: Operand::Value(count),
+        },
+    ));
     let varr = b.fresh_value(Ty::DynArray(i64s));
-    b.push(Stmt::Let(varr, Rvalue::MakeDynArray { ptr: Operand::Value(out_vals), len: Operand::Value(count) }));
+    b.push(Stmt::Let(
+        varr,
+        Rvalue::MakeDynArray {
+            ptr: Operand::Value(out_vals),
+            len: Operand::Value(count),
+        },
+    ));
     let tup = b.fresh_value(Ty::Tuple(tuple_id));
-    b.push(Stmt::Let(tup, Rvalue::MakeTuple { tuple_id, elems: vec![Operand::Value(karr), Operand::Value(varr)] }));
+    b.push(Stmt::Let(
+        tup,
+        Rvalue::MakeTuple {
+            tuple_id,
+            elems: vec![Operand::Value(karr), Operand::Value(varr)],
+        },
+    ));
     Operand::Value(tup)
 }
 
@@ -11725,7 +13554,14 @@ fn lower_array_group_str(b: &mut Builder, base: u32, struct_id: u32, key_field: 
 /// single-pass [`Rvalue::GroupAggMultiStr`] (intern key once, fold K accumulators), and builds the
 /// result tuple `(array<str>, array<i64> × K)`. The key buffer's `str` elements borrow `base`, so the
 /// tuple is region-tied to the source (sema).
-fn lower_array_group_multi_str(b: &mut Builder, base: u32, struct_id: u32, key_field: u32, aggs: &[hir::GroupAgg1], tuple_id: u32) -> Operand {
+fn lower_array_group_multi_str(
+    b: &mut Builder,
+    base: u32,
+    struct_id: u32,
+    key_field: u32,
+    aggs: &[hir::GroupAgg1],
+    tuple_id: u32,
+) -> Operand {
     let strs = scalar_of(Ty::Str);
     let i64s = scalar_of(i64_ty());
     // Load the AoS array to get its length (an upper bound on the group count).
@@ -11736,12 +13572,24 @@ fn lower_array_group_multi_str(b: &mut Builder, base: u32, struct_id: u32, key_f
     // Owned `str`-view key buffer + one owned i64 output column per aggregate, each sized at the row
     // count (the upper bound on the group count).
     let out_keys = b.fresh_value(Ty::Box(strs));
-    b.push(Stmt::Let(out_keys, Rvalue::HeapAllocBuf { count: Operand::Value(len), elem: Ty::Str }));
+    b.push(Stmt::Let(
+        out_keys,
+        Rvalue::HeapAllocBuf {
+            count: Operand::Value(len),
+            elem: Ty::Str,
+        },
+    ));
     let out_vals: Vec<ValueId> = aggs
         .iter()
         .map(|_| {
             let v = b.fresh_value(Ty::Box(i64s));
-            b.push(Stmt::Let(v, Rvalue::HeapAllocBuf { count: Operand::Value(len), elem: i64_ty() }));
+            b.push(Stmt::Let(
+                v,
+                Rvalue::HeapAllocBuf {
+                    count: Operand::Value(len),
+                    elem: i64_ty(),
+                },
+            ));
             v
         })
         .collect();
@@ -11760,11 +13608,23 @@ fn lower_array_group_multi_str(b: &mut Builder, base: u32, struct_id: u32, key_f
     ));
     // Build the result tuple: distinct keys + one owned array per aggregate column.
     let karr = b.fresh_value(Ty::DynArray(strs));
-    b.push(Stmt::Let(karr, Rvalue::MakeDynArray { ptr: Operand::Value(out_keys), len: Operand::Value(count) }));
+    b.push(Stmt::Let(
+        karr,
+        Rvalue::MakeDynArray {
+            ptr: Operand::Value(out_keys),
+            len: Operand::Value(count),
+        },
+    ));
     let mut elems = vec![Operand::Value(karr)];
     for v in &out_vals {
         let varr = b.fresh_value(Ty::DynArray(i64s));
-        b.push(Stmt::Let(varr, Rvalue::MakeDynArray { ptr: Operand::Value(*v), len: Operand::Value(count) }));
+        b.push(Stmt::Let(
+            varr,
+            Rvalue::MakeDynArray {
+                ptr: Operand::Value(*v),
+                len: Operand::Value(count),
+            },
+        ));
         elems.push(Operand::Value(varr));
     }
     let tup = b.fresh_value(Ty::Tuple(tuple_id));
@@ -11787,20 +13647,60 @@ fn lower_dict_encode(b: &mut Builder, base: u32, struct_id: u32, key_field: u32)
     b.push(Stmt::Let(len, Rvalue::SliceLen(Operand::Value(arr))));
     // Owned outputs: a dense id per row, and the dictionary (<= row count distinct keys).
     let out_ids = b.fresh_value(Ty::Box(i64s));
-    b.push(Stmt::Let(out_ids, Rvalue::HeapAllocBuf { count: Operand::Value(len), elem: i64_ty() }));
+    b.push(Stmt::Let(
+        out_ids,
+        Rvalue::HeapAllocBuf {
+            count: Operand::Value(len),
+            elem: i64_ty(),
+        },
+    ));
     let out_dict = b.fresh_value(Ty::Box(strs));
-    b.push(Stmt::Let(out_dict, Rvalue::HeapAllocBuf { count: Operand::Value(len), elem: Ty::Str }));
+    b.push(Stmt::Let(
+        out_dict,
+        Rvalue::HeapAllocBuf {
+            count: Operand::Value(len),
+            elem: Ty::Str,
+        },
+    ));
     // Intern → dictionary size (distinct count).
     let count = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(count, Rvalue::DictEncode { base, struct_id, key_field, out_ids: Operand::Value(out_ids), out_dict: Operand::Value(out_dict) }));
+    b.push(Stmt::Let(
+        count,
+        Rvalue::DictEncode {
+            base,
+            struct_id,
+            key_field,
+            out_ids: Operand::Value(out_ids),
+            out_dict: Operand::Value(out_dict),
+        },
+    ));
     // ids length = row count; dict length = distinct count.
     let ids = b.fresh_value(Ty::DynArray(i64s));
-    b.push(Stmt::Let(ids, Rvalue::MakeDynArray { ptr: Operand::Value(out_ids), len: Operand::Value(len) }));
+    b.push(Stmt::Let(
+        ids,
+        Rvalue::MakeDynArray {
+            ptr: Operand::Value(out_ids),
+            len: Operand::Value(len),
+        },
+    ));
     let dict = b.fresh_value(Ty::DynArray(strs));
-    b.push(Stmt::Let(dict, Rvalue::MakeDynArray { ptr: Operand::Value(out_dict), len: Operand::Value(count) }));
+    b.push(Stmt::Let(
+        dict,
+        Rvalue::MakeDynArray {
+            ptr: Operand::Value(out_dict),
+            len: Operand::Value(count),
+        },
+    ));
     // Assemble the 3-slice `dict_encoded` value.
     let enc = b.fresh_value(Ty::DictEncoded(struct_id, key_field));
-    b.push(Stmt::Let(enc, Rvalue::MakeDictEncoded { source: Operand::Value(arr), ids: Operand::Value(ids), dict: Operand::Value(dict) }));
+    b.push(Stmt::Let(
+        enc,
+        Rvalue::MakeDictEncoded {
+            source: Operand::Value(arr),
+            ids: Operand::Value(ids),
+            dict: Operand::Value(dict),
+        },
+    ));
     Operand::Value(enc)
 }
 
@@ -11810,7 +13710,14 @@ fn lower_dict_encode(b: &mut Builder, base: u32, struct_id: u32, key_field: u32)
 /// precomputed interning), then labels the distinct dense ids back to `str` keys through the dictionary
 /// ([`Rvalue::DictLookup`]). Builds the same result tuple `(array<str>, array<i64>)` as the A1 str-key
 /// path. The gathered value column and the distinct-id scratch buffer are freed in place.
-fn lower_array_group_encoded(b: &mut Builder, base: u32, struct_id: u32, value_field: Option<u32>, op: hir::GroupOp, tuple_id: u32) -> Operand {
+fn lower_array_group_encoded(
+    b: &mut Builder,
+    base: u32,
+    struct_id: u32,
+    value_field: Option<u32>,
+    op: hir::GroupOp,
+    tuple_id: u32,
+) -> Operand {
     let strs = scalar_of(Ty::Str);
     let i64s = scalar_of(i64_ty());
     // Extract the encoded value's slices: source AoS (borrowed), ids (dense column), dict.
@@ -11828,44 +13735,120 @@ fn lower_array_group_encoded(b: &mut Builder, base: u32, struct_id: u32, value_f
     let (vals_op, vals_scratch) = match value_field {
         Some(vf) => {
             let buf = b.fresh_value(Ty::Box(i64s));
-            b.push(Stmt::Let(buf, Rvalue::HeapAllocBuf { count: Operand::Value(n), elem: i64_ty() }));
+            b.push(Stmt::Let(
+                buf,
+                Rvalue::HeapAllocBuf {
+                    count: Operand::Value(n),
+                    elem: i64_ty(),
+                },
+            ));
             let g = b.fresh_value(Ty::Unit);
-            b.push(Stmt::Let(g, Rvalue::GatherColumnI64 { source: Operand::Value(source), struct_id, field: vf, out: Operand::Value(buf) }));
+            b.push(Stmt::Let(
+                g,
+                Rvalue::GatherColumnI64 {
+                    source: Operand::Value(source),
+                    struct_id,
+                    field: vf,
+                    out: Operand::Value(buf),
+                },
+            ));
             let varr = b.fresh_value(Ty::DynArray(i64s));
-            b.push(Stmt::Let(varr, Rvalue::MakeDynArray { ptr: Operand::Value(buf), len: Operand::Value(n) }));
+            b.push(Stmt::Let(
+                varr,
+                Rvalue::MakeDynArray {
+                    ptr: Operand::Value(buf),
+                    len: Operand::Value(n),
+                },
+            ));
             (Operand::Value(varr), Some(varr))
         }
         None => (Operand::Value(ids), None),
     };
     // Aggregate over the dense ids → distinct ids (scratch) + per-group aggregates (kept).
     let out_ids = b.fresh_value(Ty::Box(i64s));
-    b.push(Stmt::Let(out_ids, Rvalue::HeapAllocBuf { count: Operand::Value(n), elem: i64_ty() }));
+    b.push(Stmt::Let(
+        out_ids,
+        Rvalue::HeapAllocBuf {
+            count: Operand::Value(n),
+            elem: i64_ty(),
+        },
+    ));
     let out_vals = b.fresh_value(Ty::Box(i64s));
-    b.push(Stmt::Let(out_vals, Rvalue::HeapAllocBuf { count: Operand::Value(n), elem: i64_ty() }));
+    b.push(Stmt::Let(
+        out_vals,
+        Rvalue::HeapAllocBuf {
+            count: Operand::Value(n),
+            elem: i64_ty(),
+        },
+    ));
     let count = b.fresh_value(i64_ty());
     b.push(Stmt::Let(
         count,
-        Rvalue::GroupAgg { keys: Operand::Value(ids), vals: vals_op, out_keys: Operand::Value(out_ids), out_vals: Operand::Value(out_vals), op },
+        Rvalue::GroupAgg {
+            keys: Operand::Value(ids),
+            vals: vals_op,
+            out_keys: Operand::Value(out_ids),
+            out_vals: Operand::Value(out_vals),
+            op,
+        },
     ));
     // Label the distinct dense ids back to `str` keys through the dictionary.
     let out_keys = b.fresh_value(Ty::Box(strs));
-    b.push(Stmt::Let(out_keys, Rvalue::HeapAllocBuf { count: Operand::Value(count), elem: Ty::Str }));
+    b.push(Stmt::Let(
+        out_keys,
+        Rvalue::HeapAllocBuf {
+            count: Operand::Value(count),
+            elem: Ty::Str,
+        },
+    ));
     let lk = b.fresh_value(Ty::Unit);
-    b.push(Stmt::Let(lk, Rvalue::DictLookup { ids: Operand::Value(out_ids), n: Operand::Value(count), dict: Operand::Value(dict), out: Operand::Value(out_keys) }));
+    b.push(Stmt::Let(
+        lk,
+        Rvalue::DictLookup {
+            ids: Operand::Value(out_ids),
+            n: Operand::Value(count),
+            dict: Operand::Value(dict),
+            out: Operand::Value(out_keys),
+        },
+    ));
     // Build the result tuple `(array<str>, array<i64>)`.
     let karr = b.fresh_value(Ty::DynArray(strs));
-    b.push(Stmt::Let(karr, Rvalue::MakeDynArray { ptr: Operand::Value(out_keys), len: Operand::Value(count) }));
+    b.push(Stmt::Let(
+        karr,
+        Rvalue::MakeDynArray {
+            ptr: Operand::Value(out_keys),
+            len: Operand::Value(count),
+        },
+    ));
     let varr = b.fresh_value(Ty::DynArray(i64s));
-    b.push(Stmt::Let(varr, Rvalue::MakeDynArray { ptr: Operand::Value(out_vals), len: Operand::Value(count) }));
+    b.push(Stmt::Let(
+        varr,
+        Rvalue::MakeDynArray {
+            ptr: Operand::Value(out_vals),
+            len: Operand::Value(count),
+        },
+    ));
     let tup = b.fresh_value(Ty::Tuple(tuple_id));
-    b.push(Stmt::Let(tup, Rvalue::MakeTuple { tuple_id, elems: vec![Operand::Value(karr), Operand::Value(varr)] }));
+    b.push(Stmt::Let(
+        tup,
+        Rvalue::MakeTuple {
+            tuple_id,
+            elems: vec![Operand::Value(karr), Operand::Value(varr)],
+        },
+    ));
     // Free the transient buffers (the gathered value column + the distinct-id scratch); the result
     // owns the labels + aggregate buffers (freed by the tuple's `Drop`).
     if let Some(varr) = vals_scratch {
         b.push(Stmt::DropValue(Operand::Value(varr)));
     }
     let dense = b.fresh_value(Ty::DynArray(i64s));
-    b.push(Stmt::Let(dense, Rvalue::MakeDynArray { ptr: Operand::Value(out_ids), len: Operand::Value(count) }));
+    b.push(Stmt::Let(
+        dense,
+        Rvalue::MakeDynArray {
+            ptr: Operand::Value(out_ids),
+            len: Operand::Value(count),
+        },
+    ));
     b.push(Stmt::DropValue(Operand::Value(dense)));
     Operand::Value(tup)
 }
@@ -11884,7 +13867,16 @@ fn lower_array_partition(
     tuple_id: u32,
 ) -> Operand {
     let arena = b.arenas.last().copied();
-    let Some(SrcSetup { slot, slice_val, bound, scalar_slot: scalar_slot_src, struct_view, temp_free, zip }) = setup_source(b, source) else {
+    let Some(SrcSetup {
+        slot,
+        slice_val,
+        bound,
+        scalar_slot: scalar_slot_src,
+        struct_view,
+        temp_free,
+        zip,
+    }) = setup_source(b, source)
+    else {
         return Operand::Const(Const::Unit);
     };
     let Some(prepared_stages) = prepare_pipeline_stages(b, stages) else {
@@ -11902,10 +13894,17 @@ fn lower_array_partition(
     let alloc_buf = |b: &mut Builder| {
         let p = b.fresh_value(Ty::Box(scalar_of(elem)));
         let alloc = match arena {
-            Some(h) => Rvalue::ArenaAlloc { handle: Operand::Value(h), count: bound.clone(), elem },
+            Some(h) => Rvalue::ArenaAlloc {
+                handle: Operand::Value(h),
+                count: bound.clone(),
+                elem,
+            },
             // Unbound free-standing buffers leak if the result tuple is never destructured (same
             // bounded caveat as `to_array`); destructured into owned locals, they are freed once.
-            None => Rvalue::HeapAllocBuf { count: bound.clone(), elem },
+            None => Rvalue::HeapAllocBuf {
+                count: bound.clone(),
+                elem,
+            },
         };
         b.push(Stmt::Let(p, alloc));
         p
@@ -11930,7 +13929,10 @@ fn lower_array_partition(
     let i_val = b.fresh_value(i64_ty());
     b.push(Stmt::Let(i_val, Rvalue::Load(iv)));
     let cond = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(cond, Rvalue::Bin(BinOp::Lt, Operand::Value(i_val), bound.clone())));
+    b.push(Stmt::Let(
+        cond,
+        Rvalue::Bin(BinOp::Lt, Operand::Value(i_val), bound.clone()),
+    ));
     b.terminate(Term::Branch(Operand::Value(cond), body, exit));
 
     // body: address element i, run the stages.
@@ -11967,7 +13969,15 @@ fn lower_array_partition(
     for (stage_idx, stage) in stages.iter().enumerate() {
         match &stage.kind {
             hir::StageKind::Project { field } => {
-                let v = lower_field_access(b, struct_view, &slice_val, slot, &index, *field, stage.out_ty);
+                let v = lower_field_access(
+                    b,
+                    struct_view,
+                    &slice_val,
+                    slot,
+                    &index,
+                    *field,
+                    stage.out_ty,
+                );
                 cur = Some(Operand::Value(v));
             }
             hir::StageKind::Map { func, .. } => {
@@ -11976,9 +13986,18 @@ fn lower_array_partition(
                     None => {
                         let sid = match source.ty {
                             Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => id,
-                            _ => unreachable!("map with no loaded element must be over a struct array"),
+                            _ => unreachable!(
+                                "map with no loaded element must be over a struct array"
+                            ),
                         };
-                        Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
+                        Operand::Value(lower_struct_elem(
+                            b,
+                            struct_view,
+                            &slice_val,
+                            slot,
+                            &index,
+                            sid,
+                        ))
                     }
                 };
                 let call_args = stage_call_args(arg, &prepared_stages[stage_idx].captures);
@@ -11995,9 +14014,18 @@ fn lower_array_partition(
                     None => {
                         let sid = match source.ty {
                             Ty::StructArray(id, _) | Ty::DynStructArray(id, _) => id,
-                            _ => unreachable!("where with no loaded element must be over a struct array"),
+                            _ => unreachable!(
+                                "where with no loaded element must be over a struct array"
+                            ),
                         };
-                        Operand::Value(lower_struct_elem(b, struct_view, &slice_val, slot, &index, sid))
+                        Operand::Value(lower_struct_elem(
+                            b,
+                            struct_view,
+                            &slice_val,
+                            slot,
+                            &index,
+                            sid,
+                        ))
                     }
                 };
                 let call_args = stage_call_args(arg, &prepared_stages[stage_idx].captures);
@@ -12016,15 +14044,21 @@ fn lower_array_partition(
             hir::StageKind::WhereStrContains { .. } => {
                 // Hoisted repeated-needle predicate (doc-13 §6.6): keep the element iff
                 // `finder_find(plan, s) >= 0`, reusing the plan built once before the loop.
-                let elem_op = cur.clone().expect("where(str.contains) requires a loaded str element");
-                let nl = prepared_stages[stage_idx].needle.as_ref().expect("a WhereStrContains stage has a lowered needle");
+                let elem_op = cur
+                    .clone()
+                    .expect("where(str.contains) requires a loaded str element");
+                let nl = prepared_stages[stage_idx]
+                    .needle
+                    .as_ref()
+                    .expect("a WhereStrContains stage has a lowered needle");
                 let pred = lower_where_str_contains_pred(b, nl, elem_op);
                 let keep = b.new_block();
                 b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
                 b.cur = keep;
             }
             hir::StageKind::WhereField { field } => {
-                let pred = lower_field_access(b, struct_view, &slice_val, slot, &index, *field, Ty::Bool);
+                let pred =
+                    lower_field_access(b, struct_view, &slice_val, slot, &index, *field, Ty::Bool);
                 let keep = b.new_block();
                 b.terminate(Term::Branch(Operand::Value(pred), keep, cont));
                 b.cur = keep;
@@ -12050,9 +14084,16 @@ fn lower_array_partition(
     let append = |b: &mut Builder, buf: ValueId, acc: Slot| {
         let oi = b.fresh_value(i64_ty());
         b.push(Stmt::Let(oi, Rvalue::Load(acc)));
-        b.push(Stmt::PtrStore(Operand::Value(buf), Operand::Value(oi), cur.clone()));
+        b.push(Stmt::PtrStore(
+            Operand::Value(buf),
+            Operand::Value(oi),
+            cur.clone(),
+        ));
         let n = b.fresh_value(i64_ty());
-        b.push(Stmt::Let(n, Rvalue::Bin(BinOp::Add, Operand::Value(oi), index_const(1))));
+        b.push(Stmt::Let(
+            n,
+            Rvalue::Bin(BinOp::Add, Operand::Value(oi), index_const(1)),
+        ));
         b.push(Stmt::Store(acc, Operand::Value(n)));
         b.terminate(Term::Goto(cont));
     };
@@ -12066,7 +14107,10 @@ fn lower_array_partition(
     let i2 = b.fresh_value(i64_ty());
     b.push(Stmt::Let(i2, Rvalue::Load(iv)));
     let inc = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(inc, Rvalue::Bin(BinOp::Add, Operand::Value(i2), index_const(1))));
+    b.push(Stmt::Let(
+        inc,
+        Rvalue::Bin(BinOp::Add, Operand::Value(i2), index_const(1)),
+    ));
     b.push(Stmt::Store(iv, Operand::Value(inc)));
     b.terminate(Term::Goto(header));
 
@@ -12075,16 +14119,34 @@ fn lower_array_partition(
     let la = b.fresh_value(i64_ty());
     b.push(Stmt::Let(la, Rvalue::Load(acc_a)));
     let arr_a = b.fresh_value(Ty::DynArray(scalar_of(elem)));
-    b.push(Stmt::Let(arr_a, Rvalue::MakeDynArray { ptr: Operand::Value(out_a), len: Operand::Value(la) }));
+    b.push(Stmt::Let(
+        arr_a,
+        Rvalue::MakeDynArray {
+            ptr: Operand::Value(out_a),
+            len: Operand::Value(la),
+        },
+    ));
     let lb = b.fresh_value(i64_ty());
     b.push(Stmt::Let(lb, Rvalue::Load(acc_b)));
     let arr_b = b.fresh_value(Ty::DynArray(scalar_of(elem)));
-    b.push(Stmt::Let(arr_b, Rvalue::MakeDynArray { ptr: Operand::Value(out_b), len: Operand::Value(lb) }));
+    b.push(Stmt::Let(
+        arr_b,
+        Rvalue::MakeDynArray {
+            ptr: Operand::Value(out_b),
+            len: Operand::Value(lb),
+        },
+    ));
     if let Some(tmp) = temp_free {
         drop_borrow_owners(b, &tmp);
     }
     let tup = b.fresh_value(Ty::Tuple(tuple_id));
-    b.push(Stmt::Let(tup, Rvalue::MakeTuple { tuple_id, elems: vec![Operand::Value(arr_a), Operand::Value(arr_b)] }));
+    b.push(Stmt::Let(
+        tup,
+        Rvalue::MakeTuple {
+            tuple_id,
+            elems: vec![Operand::Value(arr_a), Operand::Value(arr_b)],
+        },
+    ));
     Operand::Value(tup)
 }
 
@@ -12215,7 +14277,14 @@ fn sort_not(b: &mut Builder, x: Operand) -> Operand {
 fn sort_min(b: &mut Builder, x: Operand, y: Operand) -> Operand {
     let lt = sort_cmp(b, BinOp::Lt, x.clone(), y.clone());
     let v = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(v, Rvalue::Select { cond: lt, a: x, b: y }));
+    b.push(Stmt::Let(
+        v,
+        Rvalue::Select {
+            cond: lt,
+            a: x,
+            b: y,
+        },
+    ));
     Operand::Value(v)
 }
 
@@ -12239,9 +14308,21 @@ fn sort_read(b: &mut Builder, buf: &Operand, idx: Operand, ty: Ty) -> Operand {
 /// the same transient-scratch discipline `group_by` uses.
 fn sort_alloc_buf(b: &mut Builder, ty: Ty, len: &Operand) -> (Operand, Operand) {
     let ptr = b.fresh_value(Ty::Box(scalar_of(ty)));
-    b.push(Stmt::Let(ptr, Rvalue::HeapAllocBuf { count: len.clone(), elem: ty }));
+    b.push(Stmt::Let(
+        ptr,
+        Rvalue::HeapAllocBuf {
+            count: len.clone(),
+            elem: ty,
+        },
+    ));
     let val = b.fresh_value(Ty::DynArray(scalar_of(ty)));
-    b.push(Stmt::Let(val, Rvalue::MakeDynArray { ptr: Operand::Value(ptr), len: len.clone() }));
+    b.push(Stmt::Let(
+        val,
+        Rvalue::MakeDynArray {
+            ptr: Operand::Value(ptr),
+            len: len.clone(),
+        },
+    ));
     (Operand::Value(ptr), Operand::Value(val))
 }
 
@@ -12309,12 +14390,24 @@ fn sort_copy_step(
 /// Independently of key order, the ping buffers (`tmp`, and keyed `ktmp`) are allocated only behind
 /// a `len > 32` gate, so a `len <= 32` sort — handled entirely by the insertion base case — makes
 /// zero ping-buffer allocations. Worst case stays a stable O(n log n) merge.
-fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], elem: Ty, sort_key: Option<SortKey>) -> Operand {
+fn lower_array_sort(
+    b: &mut Builder,
+    source: &hir::Expr,
+    stages: &[hir::Stage],
+    elem: Ty,
+    sort_key: Option<SortKey>,
+) -> Operand {
     let terminal_captures = sort_key
         .as_ref()
         .map_or(&[][..], |key| key.captures.as_slice());
-    let (arr, lowered_captures) =
-        lower_array_collect(b, source, stages, elem, CollectKind::Collect, terminal_captures);
+    let (arr, lowered_captures) = lower_array_collect(
+        b,
+        source,
+        stages,
+        elem,
+        CollectKind::Collect,
+        terminal_captures,
+    );
     if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
     }
@@ -12343,7 +14436,9 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
 
     // The key-scalar ordering decides whether the adaptive ordered-run fast paths (doc-12 §4.1) are
     // emitted at all. Fail-closed: a non-scalar / unclassifiable key keeps the plain merge path.
-    let key_order = align_sema::ty_to_scalar(kty).map(|s| sort_key_order(&s)).unwrap_or(KeyOrder::PartialFloat);
+    let key_order = align_sema::ty_to_scalar(kty)
+        .map(|s| sort_key_order(&s))
+        .unwrap_or(KeyOrder::PartialFloat);
 
     // The adaptive total-order fast paths (doc-12 §4.1) are on by default (the shipped shape). Setting
     // `ALIGN_SORT_ADAPTIVE=off` reverts to the pre-change algorithm (no ordered early exit, no
@@ -12391,8 +14486,11 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
     // `tmp` (and, when keyed, the key ping buffer `ktmp`) are deferred behind the `len > 32` merge
     // gate below, so a `len <= 32` sort performs zero ping-buffer allocations (doc-12 §4.1). When
     // `!has_keys`, `keys` is an unused dummy (`arr`) that no code path reads or frees.
-    let (keys_ptr, keys_val) =
-        if has_keys { sort_alloc_buf(b, kty, &len) } else { (arr_ptr.clone(), arr.clone()) };
+    let (keys_ptr, keys_val) = if has_keys {
+        sort_alloc_buf(b, kty, &len)
+    } else {
+        (arr_ptr.clone(), arr.clone())
+    };
 
     // Pre-change baseline (`!delay_scratch`): allocate the ping buffers up front, like the original
     // algorithm, so the `none` variant is byte-for-byte the pre-change shape (minus the adaptive
@@ -12401,7 +14499,11 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
         None
     } else {
         let (tp, tv) = sort_alloc_buf(b, elem, &len);
-        let (kp, kv) = if has_keys { sort_alloc_buf(b, kty, &len) } else { (arr_ptr.clone(), arr.clone()) };
+        let (kp, kv) = if has_keys {
+            sort_alloc_buf(b, kty, &len)
+        } else {
+            (arr_ptr.clone(), arr.clone())
+        };
         Some((tp, tv, kp, kv))
     };
 
@@ -12440,7 +14542,11 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
     // the decorated `keys` when sorting by key, else the collected elements themselves. Reading it
     // never re-calls the key function (keys are already decorated), so the key evaluation count is
     // unchanged. Owned (cloned) so later `DropValue(keys_val)` / `arr` moves stay unentangled.
-    let cmp_src = if has_keys { keys_val.clone() } else { arr.clone() };
+    let cmp_src = if has_keys {
+        keys_val.clone()
+    } else {
+        arr.clone()
+    };
 
     // (1) Whole-input ordered early exit — total-order keys only (doc-12 §4.1). Scan adjacent key
     // pairs; if none is out of order the input is already sorted, so return `arr` untouched without
@@ -12497,7 +14603,12 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
     b.cur = base_run;
     let run_start = sort_load(b, rs);
     let run_end = {
-        let e = sort_int(b, BinOp::Add, run_start.clone(), index_const(SORT_INSERTION_THRESHOLD));
+        let e = sort_int(
+            b,
+            BinOp::Add,
+            run_start.clone(),
+            index_const(SORT_INSERTION_THRESHOLD),
+        );
         sort_min(b, e, len.clone())
     };
     // insertion sort arr[run_start .. run_end): i from run_start+1, shift down to run_start.
@@ -12518,7 +14629,11 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
     let ivb = sort_load(b, ii);
     // Save the element (and its key) being inserted before any shifting overwrites arr[i].
     let cur_elem = sort_read(b, &arr, ivb.clone(), elem);
-    let cur_key = if has_keys { sort_read(b, &keys_val, ivb.clone(), kty) } else { cur_elem.clone() };
+    let cur_key = if has_keys {
+        sort_read(b, &keys_val, ivb.clone(), kty)
+    } else {
+        cur_elem.clone()
+    };
     let jj = b.new_slot(i64_ty());
     let j0 = sort_int(b, BinOp::Sub, ivb.clone(), index_const(1));
     b.push(Stmt::Store(jj, j0));
@@ -12563,7 +14678,11 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
     b.cur = ins_place;
     let jvp = sort_load(b, jj);
     let jf1 = sort_int(b, BinOp::Add, jvp, index_const(1));
-    b.push(Stmt::PtrStore(arr_ptr.clone(), jf1.clone(), cur_elem.clone()));
+    b.push(Stmt::PtrStore(
+        arr_ptr.clone(),
+        jf1.clone(),
+        cur_elem.clone(),
+    ));
     if has_keys {
         b.push(Stmt::PtrStore(keys_ptr.clone(), jf1, cur_key.clone()));
     }
@@ -12573,7 +14692,12 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
 
     // base_next: advance to the next run.
     b.cur = base_next;
-    let rsn = sort_int(b, BinOp::Add, run_start, index_const(SORT_INSERTION_THRESHOLD));
+    let rsn = sort_int(
+        b,
+        BinOp::Add,
+        run_start,
+        index_const(SORT_INSERTION_THRESHOLD),
+    );
     b.push(Stmt::Store(rs, rsn));
     b.terminate(Term::Goto(base_head));
 
@@ -12584,14 +14708,23 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
     // pre-change baseline), the ping buffers were already allocated up front.
     b.cur = merge_setup;
     let (tmp_ptr, tmp_val, ktmp_ptr, ktmp_val) = if delay_scratch {
-        let need_merge = sort_cmp(b, BinOp::Gt, len.clone(), index_const(SORT_INSERTION_THRESHOLD));
+        let need_merge = sort_cmp(
+            b,
+            BinOp::Gt,
+            len.clone(),
+            index_const(SORT_INSERTION_THRESHOLD),
+        );
         let alloc_scratch = b.new_block();
         b.terminate(Term::Branch(need_merge, alloc_scratch, free_keys));
         // alloc_scratch dominates every merge/copyback block (they are reachable only through it), so
         // the ping-buffer SSA values are defined before use on every path that reads them.
         b.cur = alloc_scratch;
         let (tp, tv) = sort_alloc_buf(b, elem, &len);
-        let (kp, kv) = if has_keys { sort_alloc_buf(b, kty, &len) } else { (arr_ptr.clone(), arr.clone()) };
+        let (kp, kv) = if has_keys {
+            sort_alloc_buf(b, kty, &len)
+        } else {
+            (arr_ptr.clone(), arr.clone())
+        };
         (tp, tv, kp, kv)
     } else {
         // Up-front buffers (baseline); `b.cur` stays `merge_setup`, which falls straight into the
@@ -12658,7 +14791,12 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
         // Width threshold ([`SORT_BOUNDARY_MIN_WIDTH`]): on the narrow early pass (`width == 32`) skip
         // the boundary check entirely and comparison-merge — it costs the most and helps the least
         // there. `width` is loop-invariant within a pass, so this guard predicts perfectly.
-        let wide = sort_cmp(b, BinOp::Ge, width.clone(), Operand::Const(Const::Int(SORT_BOUNDARY_MIN_WIDTH.into(), i64_ty())));
+        let wide = sort_cmp(
+            b,
+            BinOp::Ge,
+            width.clone(),
+            Operand::Const(Const::Int(SORT_BOUNDARY_MIN_WIDTH.into(), i64_ty())),
+        );
         let bstart = b.new_block();
         b.terminate(Term::Branch(wide, bstart, do_merge));
         b.cur = bstart;
@@ -12727,17 +14865,29 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
     b.cur = m_cmp;
     let ci = sort_load(b, mi);
     let cj = sort_load(b, mj);
-    let key_i = if has_keys { sort_read(b, &keys_val, ci.clone(), kty) } else { sort_read(b, &arr, ci.clone(), elem) };
-    let key_j = if has_keys { sort_read(b, &keys_val, cj.clone(), kty) } else { sort_read(b, &arr, cj.clone(), elem) };
+    let key_i = if has_keys {
+        sort_read(b, &keys_val, ci.clone(), kty)
+    } else {
+        sort_read(b, &arr, ci.clone(), elem)
+    };
+    let key_j = if has_keys {
+        sort_read(b, &keys_val, cj.clone(), kty)
+    } else {
+        sort_read(b, &arr, cj.clone(), elem)
+    };
     let take_right = sort_cmp(b, BinOp::Lt, key_j, key_i);
     b.terminate(Term::Branch(take_right, take_r, take_l));
 
     b.cur = take_r;
-    sort_copy_step(b, has_keys, elem, kty, &arr, &keys_val, &tmp_ptr, &ktmp_ptr, mj, mk);
+    sort_copy_step(
+        b, has_keys, elem, kty, &arr, &keys_val, &tmp_ptr, &ktmp_ptr, mj, mk,
+    );
     b.terminate(Term::Goto(m_head));
 
     b.cur = take_l;
-    sort_copy_step(b, has_keys, elem, kty, &arr, &keys_val, &tmp_ptr, &ktmp_ptr, mi, mk);
+    sort_copy_step(
+        b, has_keys, elem, kty, &arr, &keys_val, &tmp_ptr, &ktmp_ptr, mi, mk,
+    );
     b.terminate(Term::Goto(m_head));
 
     // drain_l: copy the rest of the left run.
@@ -12747,7 +14897,9 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
     b.terminate(Term::Branch(dlc, drain_l_body, drain_r_head));
 
     b.cur = drain_l_body;
-    sort_copy_step(b, has_keys, elem, kty, &arr, &keys_val, &tmp_ptr, &ktmp_ptr, mi, mk);
+    sort_copy_step(
+        b, has_keys, elem, kty, &arr, &keys_val, &tmp_ptr, &ktmp_ptr, mi, mk,
+    );
     b.terminate(Term::Goto(drain_l_head));
 
     // drain_r: copy the rest of the right run.
@@ -12757,7 +14909,9 @@ fn lower_array_sort(b: &mut Builder, source: &hir::Expr, stages: &[hir::Stage], 
     b.terminate(Term::Branch(drc, drain_r_body, merge_done));
 
     b.cur = drain_r_body;
-    sort_copy_step(b, has_keys, elem, kty, &arr, &keys_val, &tmp_ptr, &ktmp_ptr, mj, mk);
+    sort_copy_step(
+        b, has_keys, elem, kty, &arr, &keys_val, &tmp_ptr, &ktmp_ptr, mj, mk,
+    );
     b.terminate(Term::Goto(drain_r_head));
 
     // merge_done: advance to the next run pair (lo += 2*width).
@@ -12851,7 +15005,10 @@ fn lower_array_dot(b: &mut Builder, a: &hir::Expr, bex: &hir::Expr, elem: Ty) ->
     let i_val = b.fresh_value(i64_ty());
     b.push(Stmt::Let(i_val, Rvalue::Load(iv)));
     let cond = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(cond, Rvalue::Bin(BinOp::Lt, Operand::Value(i_val), bound)));
+    b.push(Stmt::Let(
+        cond,
+        Rvalue::Bin(BinOp::Lt, Operand::Value(i_val), bound),
+    ));
     b.terminate(Term::Branch(Operand::Value(cond), body, exit));
 
     // body: acc += a[i] * b[i].
@@ -12864,11 +15021,17 @@ fn lower_array_dot(b: &mut Builder, a: &hir::Expr, bex: &hir::Expr, elem: Ty) ->
     let xb = b.fresh_value(elem);
     b.push(Stmt::Let(xb, Rvalue::Index(b_slot, index)));
     let prod = b.fresh_value(elem);
-    b.push(Stmt::Let(prod, Rvalue::Bin(BinOp::Mul, Operand::Value(xa), Operand::Value(xb))));
+    b.push(Stmt::Let(
+        prod,
+        Rvalue::Bin(BinOp::Mul, Operand::Value(xa), Operand::Value(xb)),
+    ));
     let a_acc = b.fresh_value(elem);
     b.push(Stmt::Let(a_acc, Rvalue::Load(acc)));
     let next = b.fresh_value(elem);
-    b.push(Stmt::Let(next, Rvalue::Bin(BinOp::Add, Operand::Value(a_acc), Operand::Value(prod))));
+    b.push(Stmt::Let(
+        next,
+        Rvalue::Bin(BinOp::Add, Operand::Value(a_acc), Operand::Value(prod)),
+    ));
     b.push(Stmt::Store(acc, Operand::Value(next)));
     b.terminate(Term::Goto(cont));
 
@@ -12877,7 +15040,10 @@ fn lower_array_dot(b: &mut Builder, a: &hir::Expr, bex: &hir::Expr, elem: Ty) ->
     let i2 = b.fresh_value(i64_ty());
     b.push(Stmt::Let(i2, Rvalue::Load(iv)));
     let inc = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(inc, Rvalue::Bin(BinOp::Add, Operand::Value(i2), index_const(1))));
+    b.push(Stmt::Let(
+        inc,
+        Rvalue::Bin(BinOp::Add, Operand::Value(i2), index_const(1)),
+    ));
     b.push(Stmt::Store(iv, Operand::Value(inc)));
     b.terminate(Term::Goto(header));
 
@@ -12932,9 +15098,12 @@ fn donation_layouts_match(src: Ty, out_elem: Ty) -> bool {
 /// `WhereStrContains` (a `str` element) and `Project`/`WhereField` (a struct source) are excluded —
 /// the latter cannot even reach a scalar donated source, but the check fails closed regardless.
 fn donation_stages_ok(stages: &[hir::Stage]) -> bool {
-    stages
-        .iter()
-        .all(|s| matches!(s.kind, hir::StageKind::Map { .. } | hir::StageKind::Where { .. }))
+    stages.iter().all(|s| {
+        matches!(
+            s.kind,
+            hir::StageKind::Map { .. } | hir::StageKind::Where { .. }
+        )
+    })
 }
 
 /// `json.decode(input)` → fill an out struct via the runtime parser (status `i32`), then
@@ -12943,16 +15112,36 @@ fn donation_stages_ok(stages: &[hir::Stage]) -> bool {
 /// enum slot via the runtime (status `i32`), then branch into `Ok(<enum>)` / `Err(<code>)`. Mirrors
 /// [`lower_json_decode`]; clean decoded enum `str` payloads borrow the input and selected escaped
 /// strings materialize in the enclosing arena.
-fn lower_json_decode_union(b: &mut Builder, enum_id: u32, input: &hir::Expr, result_ty: Ty) -> Operand {
+fn lower_json_decode_union(
+    b: &mut Builder,
+    enum_id: u32,
+    input: &hir::Expr,
+    result_ty: Ty,
+) -> Operand {
     let ety = Ty::Enum(enum_id);
     let out = b.new_slot(ety);
     let inp = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
     let arena = b.arenas.last().copied().map(Operand::Value);
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::JsonDecodeUnion { enum_id, input: inp, out, arena }));
+    b.push(Stmt::Let(
+        code,
+        Rvalue::JsonDecodeUnion {
+            enum_id,
+            input: inp,
+            out,
+            arena,
+        },
+    ));
 
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -13011,7 +15200,14 @@ fn lower_json_decode_record(
     b.push(Stmt::Let(code, rvalue));
 
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -13049,10 +15245,24 @@ fn lower_json_decode_array(b: &mut Builder, elem: Ty, input: &hir::Expr, result_
     let out = b.new_slot(arr_ty);
     let inp = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::JsonDecodeArray { elem, input: inp, out }));
+    b.push(Stmt::Let(
+        code,
+        Rvalue::JsonDecodeArray {
+            elem,
+            input: inp,
+            out,
+        },
+    ));
 
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -13086,14 +15296,33 @@ fn lower_json_decode_array(b: &mut Builder, elem: Ty, input: &hir::Expr, result_
 /// JSON number / bool into an out scalar slot via the runtime parser (status `i32`), then branch into
 /// `Ok(<scalar>)` / `Err(<code>)`. Mirrors [`lower_json_decode_array`]; the scalar is `Copy` (nothing
 /// to drop).
-fn lower_json_decode_scalar(b: &mut Builder, scalar: Ty, input: &hir::Expr, result_ty: Ty) -> Operand {
+fn lower_json_decode_scalar(
+    b: &mut Builder,
+    scalar: Ty,
+    input: &hir::Expr,
+    result_ty: Ty,
+) -> Operand {
     let out = b.new_slot(scalar);
     let inp = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::JsonDecodeScalar { scalar, input: inp, out }));
+    b.push(Stmt::Let(
+        code,
+        Rvalue::JsonDecodeScalar {
+            scalar,
+            input: inp,
+            out,
+        },
+    ));
 
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -13130,14 +15359,31 @@ fn lower_json_decode_scalar(b: &mut Builder, scalar: Ty, input: &hir::Expr, resu
 /// `expr_depth` headroom (#296).
 #[inline(never)]
 fn lower_json_doc(b: &mut Builder, input: &hir::Expr, result_ty: Ty) -> Operand {
-    let arena = *b.arenas.last().expect("json.doc outside an arena (sema-checked)");
+    let arena = *b
+        .arenas
+        .last()
+        .expect("json.doc outside an arena (sema-checked)");
     let out = b.new_slot(Ty::JsonDoc);
     let inp = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::JsonDoc { input: inp, arena: Operand::Value(arena), out }));
+    b.push(Stmt::Let(
+        code,
+        Rvalue::JsonDoc {
+            input: inp,
+            arena: Operand::Value(arena),
+            out,
+        },
+    ));
 
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -13176,19 +15422,38 @@ fn lower_json_doc_get(b: &mut Builder, doc: &hir::Expr, key: &hir::Expr, result_
     let d = lower_required!(b, lower_expr(b, doc), Operand::Const(Const::Unit));
     let k = lower_required!(b, lower_expr(b, key), Operand::Const(Const::Unit));
     let unit = b.fresh_value(Ty::Unit);
-    b.push(Stmt::Let(unit, Rvalue::JsonDocGet { doc: d, key: k, out }));
+    b.push(Stmt::Let(
+        unit,
+        Rvalue::JsonDocGet {
+            doc: d,
+            key: k,
+            out,
+        },
+    ));
     let v = b.fresh_value(result_ty);
     b.push(Stmt::Let(v, Rvalue::Load(out)));
     Operand::Value(v)
 }
 
 #[inline(never)]
-fn lower_json_doc_at(b: &mut Builder, doc: &hir::Expr, index: &hir::Expr, result_ty: Ty) -> Operand {
+fn lower_json_doc_at(
+    b: &mut Builder,
+    doc: &hir::Expr,
+    index: &hir::Expr,
+    result_ty: Ty,
+) -> Operand {
     let out = b.new_slot(Ty::JsonDoc);
     let d = lower_required!(b, lower_expr(b, doc), Operand::Const(Const::Unit));
     let i = lower_required!(b, lower_expr(b, index), Operand::Const(Const::Unit));
     let unit = b.fresh_value(Ty::Unit);
-    b.push(Stmt::Let(unit, Rvalue::JsonDocAt { doc: d, index: i, out }));
+    b.push(Stmt::Let(
+        unit,
+        Rvalue::JsonDocAt {
+            doc: d,
+            index: i,
+            out,
+        },
+    ));
     let v = b.fresh_value(result_ty);
     b.push(Stmt::Let(v, Rvalue::Load(out)));
     Operand::Value(v)
@@ -13210,11 +15475,23 @@ fn lower_json_doc_as_str(b: &mut Builder, doc: &hir::Expr, result_ty: Ty) -> Ope
 /// into an out slot and returns an `i32` present flag; branch `Some(<scalar>)` / `None`. The scalar is
 /// copied out (`Static` — no region tie).
 #[inline(never)]
-fn lower_json_doc_as_scalar(b: &mut Builder, doc: &hir::Expr, scalar: Ty, result_ty: Ty) -> Operand {
+fn lower_json_doc_as_scalar(
+    b: &mut Builder,
+    doc: &hir::Expr,
+    scalar: Ty,
+    result_ty: Ty,
+) -> Operand {
     let out = b.new_slot(scalar);
     let d = lower_required!(b, lower_expr(b, doc), Operand::Const(Const::Unit));
     let flag = b.fresh_value(status_ty());
-    b.push(Stmt::Let(flag, Rvalue::JsonDocAsScalar { scalar, doc: d, out }));
+    b.push(Stmt::Let(
+        flag,
+        Rvalue::JsonDocAsScalar {
+            scalar,
+            doc: d,
+            out,
+        },
+    ));
     lower_json_doc_option(b, flag, out, scalar, result_ty)
 }
 
@@ -13222,20 +15499,45 @@ fn lower_json_doc_as_scalar(b: &mut Builder, doc: &hir::Expr, scalar: Ty, result
 /// an out slot and returns an `i32` present flag; branch `Some(<view>)` / `None`. The key view borrows
 /// `doc` (region-bound in sema), like `as_str`.
 #[inline(never)]
-fn lower_json_doc_key(b: &mut Builder, doc: &hir::Expr, index: &hir::Expr, result_ty: Ty) -> Operand {
+fn lower_json_doc_key(
+    b: &mut Builder,
+    doc: &hir::Expr,
+    index: &hir::Expr,
+    result_ty: Ty,
+) -> Operand {
     let out = b.new_slot(Ty::Str);
     let d = lower_required!(b, lower_expr(b, doc), Operand::Const(Const::Unit));
     let i = lower_required!(b, lower_expr(b, index), Operand::Const(Const::Unit));
     let flag = b.fresh_value(status_ty());
-    b.push(Stmt::Let(flag, Rvalue::JsonDocKey { doc: d, index: i, out }));
+    b.push(Stmt::Let(
+        flag,
+        Rvalue::JsonDocKey {
+            doc: d,
+            index: i,
+            out,
+        },
+    ));
     lower_json_doc_option(b, flag, out, Ty::Str, result_ty)
 }
 
 /// The shared `Some(load out)` / `None` branch for a `json.doc` leaf accessor: `flag != 0` → the value
 /// at `out` (of type `payload`) is present. The payload is a Copy view / scalar (no `Drop` either arm).
-fn lower_json_doc_option(b: &mut Builder, flag: ValueId, out: Slot, payload: Ty, result_ty: Ty) -> Operand {
+fn lower_json_doc_option(
+    b: &mut Builder,
+    flag: ValueId,
+    out: Slot,
+    payload: Ty,
+    result_ty: Ty,
+) -> Operand {
     let present = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(present, Rvalue::Bin(BinOp::Ne, Operand::Value(flag), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        present,
+        Rvalue::Bin(
+            BinOp::Ne,
+            Operand::Value(flag),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let some_bb = b.new_block();
     let none_bb = b.new_block();
     let join = b.new_block();
@@ -13275,7 +15577,11 @@ fn make_error_code(b: &mut Builder, code: ValueId, result_ty: Ty) -> Operand {
     let ev = b.fresh_value(Ty::Enum(error_id));
     b.push(Stmt::Let(
         ev,
-        Rvalue::MakeEnum { enum_id: error_id, variant: align_sema::ERROR_VARIANT_CODE, payload: vec![Operand::Value(code)] },
+        Rvalue::MakeEnum {
+            enum_id: error_id,
+            variant: align_sema::ERROR_VARIANT_CODE,
+            payload: vec![Operand::Value(code)],
+        },
     ));
     Operand::Value(ev)
 }
@@ -13296,20 +15602,61 @@ fn make_error_from_status(b: &mut Builder, status: ValueId, result_ty: Ty) -> Op
     let s = Operand::Value(status);
     // tag = min(status - 1, 4)  (Code is now tag 4 — a `Timeout` category was inserted at tag 3)
     let sm1 = b.fresh_value(i32t);
-    b.push(Stmt::Let(sm1, Rvalue::Bin(BinOp::Sub, s.clone(), Operand::Const(Const::Int(1, i32t)))));
+    b.push(Stmt::Let(
+        sm1,
+        Rvalue::Bin(BinOp::Sub, s.clone(), Operand::Const(Const::Int(1, i32t))),
+    ));
     let ge4 = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(ge4, Rvalue::Bin(BinOp::Ge, Operand::Value(sm1), Operand::Const(Const::Int(4, i32t)))));
+    b.push(Stmt::Let(
+        ge4,
+        Rvalue::Bin(
+            BinOp::Ge,
+            Operand::Value(sm1),
+            Operand::Const(Const::Int(4, i32t)),
+        ),
+    ));
     let tag = b.fresh_value(i32t);
-    b.push(Stmt::Let(tag, Rvalue::Select { cond: Operand::Value(ge4), a: Operand::Const(Const::Int(4, i32t)), b: Operand::Value(sm1) }));
+    b.push(Stmt::Let(
+        tag,
+        Rvalue::Select {
+            cond: Operand::Value(ge4),
+            a: Operand::Const(Const::Int(4, i32t)),
+            b: Operand::Value(sm1),
+        },
+    ));
     // code = max(status - 5, 0)  (a raw errno rides `AL_CODE = 5` + errno)
     let sm5 = b.fresh_value(i32t);
-    b.push(Stmt::Let(sm5, Rvalue::Bin(BinOp::Sub, s, Operand::Const(Const::Int(5, i32t)))));
+    b.push(Stmt::Let(
+        sm5,
+        Rvalue::Bin(BinOp::Sub, s, Operand::Const(Const::Int(5, i32t))),
+    ));
     let ge0 = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(ge0, Rvalue::Bin(BinOp::Ge, Operand::Value(sm5), Operand::Const(Const::Int(0, i32t)))));
+    b.push(Stmt::Let(
+        ge0,
+        Rvalue::Bin(
+            BinOp::Ge,
+            Operand::Value(sm5),
+            Operand::Const(Const::Int(0, i32t)),
+        ),
+    ));
     let code = b.fresh_value(i32t);
-    b.push(Stmt::Let(code, Rvalue::Select { cond: Operand::Value(ge0), a: Operand::Value(sm5), b: Operand::Const(Const::Int(0, i32t)) }));
+    b.push(Stmt::Let(
+        code,
+        Rvalue::Select {
+            cond: Operand::Value(ge0),
+            a: Operand::Value(sm5),
+            b: Operand::Const(Const::Int(0, i32t)),
+        },
+    ));
     let ev = b.fresh_value(Ty::Enum(error_id));
-    b.push(Stmt::Let(ev, Rvalue::MakeError { enum_id: error_id, tag: Operand::Value(tag), code: Operand::Value(code) }));
+    b.push(Stmt::Let(
+        ev,
+        Rvalue::MakeError {
+            enum_id: error_id,
+            tag: Operand::Value(tag),
+            code: Operand::Value(code),
+        },
+    ));
     Operand::Value(ev)
 }
 
@@ -13368,7 +15715,14 @@ fn lower_fs_read_file(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> Opera
     b.push(Stmt::Let(code, Rvalue::FsReadFile { path: p, out }));
 
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -13409,7 +15763,14 @@ fn lower_env_get(b: &mut Builder, name: &hir::Expr, result_ty: Ty) -> Operand {
     b.push(Stmt::Let(flag, Rvalue::EnvGet { name: n, out }));
 
     let present = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(present, Rvalue::Bin(BinOp::Ne, Operand::Value(flag), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        present,
+        Rvalue::Bin(
+            BinOp::Ne,
+            Operand::Value(flag),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let some_bb = b.new_block();
     let none_bb = b.new_block();
     let join = b.new_block();
@@ -13449,7 +15810,14 @@ fn lower_fs_read_dir(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> Operan
     b.push(Stmt::Let(code, Rvalue::FsReadDir { path: p, out }));
 
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -13490,7 +15858,14 @@ fn lower_dns_resolve(b: &mut Builder, host: &hir::Expr, result_ty: Ty) -> Operan
     b.push(Stmt::Let(code, Rvalue::DnsResolve { host: h, out }));
 
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -13524,7 +15899,12 @@ fn lower_dns_resolve(b: &mut Builder, host: &hir::Expr, result_ty: Ty) -> Operan
 /// owned `tcp_conn` handle into an out slot, returning a status; branch `Ok(<conn>)` /
 /// `Err(<mapped status>)`. Mirrors [`lower_open_handle`] with a second `port` operand and a
 /// `tcp_conn` handle payload.
-fn lower_tcp_connect(b: &mut Builder, host: &hir::Expr, port: &hir::Expr, result_ty: Ty) -> Operand {
+fn lower_tcp_connect(
+    b: &mut Builder,
+    host: &hir::Expr,
+    port: &hir::Expr,
+    result_ty: Ty,
+) -> Operand {
     let out = b.new_slot(Ty::TcpConn);
     let h = lower_required!(b, lower_expr(b, host), Operand::Const(Const::Unit));
     let p = lower_required!(b, lower_expr(b, port), Operand::Const(Const::Unit));
@@ -13533,10 +15913,25 @@ fn lower_tcp_connect(b: &mut Builder, host: &hir::Expr, port: &hir::Expr, result
     // this Rvalue with its own effective-timeout operand instead.
     let timeout_ns = Operand::Const(Const::Int(0, i64_ty()));
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::TcpConnect { host: h, port: p, timeout_ns, out }));
+    b.push(Stmt::Let(
+        code,
+        Rvalue::TcpConnect {
+            host: h,
+            port: p,
+            timeout_ns,
+            out,
+        },
+    ));
 
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -13574,10 +15969,24 @@ fn lower_tcp_listen(b: &mut Builder, host: &hir::Expr, port: &hir::Expr, result_
     let h = lower_required!(b, lower_expr(b, host), Operand::Const(Const::Unit));
     let p = lower_required!(b, lower_expr(b, port), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::TcpListen { host: h, port: p, out }));
+    b.push(Stmt::Let(
+        code,
+        Rvalue::TcpListen {
+            host: h,
+            port: p,
+            out,
+        },
+    ));
 
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -13618,7 +16027,14 @@ fn lower_tcp_accept(b: &mut Builder, listener: &hir::Expr, result_ty: Ty) -> Ope
     b.push(Stmt::Let(code, Rvalue::TcpAccept { listener: l, out }));
 
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -13656,10 +16072,24 @@ fn lower_udp_bind(b: &mut Builder, host: &hir::Expr, port: &hir::Expr, result_ty
     let h = lower_required!(b, lower_expr(b, host), Operand::Const(Const::Unit));
     let p = lower_required!(b, lower_expr(b, port), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::UdpBind { host: h, port: p, out }));
+    b.push(Stmt::Let(
+        code,
+        Rvalue::UdpBind {
+            host: h,
+            port: p,
+            out,
+        },
+    ));
 
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -13692,39 +16122,84 @@ fn lower_udp_bind(b: &mut Builder, host: &hir::Expr, port: &hir::Expr, result_ty
 /// `u.send_to(data, host, port)` → the runtime `sendto`s one datagram from the socket's fd, returning
 /// the bytes sent (`>= 0`) or `-(status)`; wrap into `Result<i64, Error>` via the shared count/status
 /// helper (the `reader.read` sign convention).
-fn lower_udp_send_to(b: &mut Builder, sock: &hir::Expr, data: &hir::Expr, host: &hir::Expr, port: &hir::Expr, result_ty: Ty) -> Operand {
+fn lower_udp_send_to(
+    b: &mut Builder,
+    sock: &hir::Expr,
+    data: &hir::Expr,
+    host: &hir::Expr,
+    port: &hir::Expr,
+    result_ty: Ty,
+) -> Operand {
     let s = lower_required!(b, lower_expr(b, sock), Operand::Const(Const::Unit));
     let d = lower_required!(b, lower_expr(b, data), Operand::Const(Const::Unit));
     let h = lower_required!(b, lower_expr(b, host), Operand::Const(Const::Unit));
     let p = lower_required!(b, lower_expr(b, port), Operand::Const(Const::Unit));
     let n = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(n, Rvalue::UdpSendTo { sock: s, data: d, host: h, port: p }));
+    b.push(Stmt::Let(
+        n,
+        Rvalue::UdpSendTo {
+            sock: s,
+            data: d,
+            host: h,
+            port: p,
+        },
+    ));
     lower_count_or_status_result(b, n, result_ty)
 }
 
 /// `u.recv_from(buf)` → the runtime blocks for one datagram, filling `buf` and returning the bytes
 /// received (`>= 0`) or `-(status)`; wrap into `Result<i64, Error>` via the shared count/status
 /// helper (the `reader.read` sign convention).
-fn lower_udp_recv_from(b: &mut Builder, sock: &hir::Expr, buffer: &hir::Expr, result_ty: Ty) -> Operand {
+fn lower_udp_recv_from(
+    b: &mut Builder,
+    sock: &hir::Expr,
+    buffer: &hir::Expr,
+    result_ty: Ty,
+) -> Operand {
     let s = lower_required!(b, lower_expr(b, sock), Operand::Const(Const::Unit));
     let buf = lower_required!(b, lower_expr(b, buffer), Operand::Const(Const::Unit));
     let n = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(n, Rvalue::UdpRecvFrom { sock: s, buffer: buf }));
+    b.push(Stmt::Let(
+        n,
+        Rvalue::UdpRecvFrom {
+            sock: s,
+            buffer: buf,
+        },
+    ));
     lower_count_or_status_result(b, n, result_ty)
 }
 
 /// `process.spawn(cmd, args)` → the runtime `fork`s + `execvp`s, writing the owned `child` handle into
 /// an out slot and returning an errno-status; branch `Ok(<child>)` / `Err(<mapped status>)`. Mirrors
 /// [`lower_udp_bind`] with a `child` handle payload (the unwrapped local owns it — `Drop` reaps it).
-fn lower_process_spawn(b: &mut Builder, cmd: &hir::Expr, args: &hir::Expr, result_ty: Ty) -> Operand {
+fn lower_process_spawn(
+    b: &mut Builder,
+    cmd: &hir::Expr,
+    args: &hir::Expr,
+    result_ty: Ty,
+) -> Operand {
     let out = b.new_slot(Ty::Child);
     let c = lower_required!(b, lower_expr(b, cmd), Operand::Const(Const::Unit));
     let a = lower_required!(b, lower_expr(b, args), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::ProcessSpawn { cmd: c, args: a, out }));
+    b.push(Stmt::Let(
+        code,
+        Rvalue::ProcessSpawn {
+            cmd: c,
+            args: a,
+            out,
+        },
+    ));
 
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -13764,17 +16239,33 @@ fn lower_file_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
     let result_ty = e.ty;
     match &e.kind {
         hir::ExprKind::FileCreateRw { path } => {
-            lower_open_handle(b, path, Ty::File, result_ty, |p, out| Rvalue::FileCreateRw { path: p, out })
+            lower_open_handle(b, path, Ty::File, result_ty, |p, out| {
+                Rvalue::FileCreateRw { path: p, out }
+            })
         }
         hir::ExprKind::FileOpenRw { path } => {
-            lower_open_handle(b, path, Ty::File, result_ty, |p, out| Rvalue::FileOpenRw { path: p, out })
+            lower_open_handle(b, path, Ty::File, result_ty, |p, out| Rvalue::FileOpenRw {
+                path: p,
+                out,
+            })
         }
-        hir::ExprKind::FilePread { file, buffer, offset } => {
+        hir::ExprKind::FilePread {
+            file,
+            buffer,
+            offset,
+        } => {
             let fop = lower_required!(b, lower_expr(b, file), Operand::Const(Const::Unit));
             let bop = lower_required!(b, lower_expr(b, buffer), Operand::Const(Const::Unit));
             let oop = lower_required!(b, lower_expr(b, offset), Operand::Const(Const::Unit));
             let n = b.fresh_value(i64_ty());
-            b.push(Stmt::Let(n, Rvalue::FilePread { file: fop, buffer: bop, offset: oop }));
+            b.push(Stmt::Let(
+                n,
+                Rvalue::FilePread {
+                    file: fop,
+                    buffer: bop,
+                    offset: oop,
+                },
+            ));
             lower_count_or_status_result(b, n, result_ty)
         }
         hir::ExprKind::FilePwrite { file, data, offset } => {
@@ -13782,7 +16273,14 @@ fn lower_file_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let dop = lower_required!(b, lower_expr(b, data), Operand::Const(Const::Unit));
             let oop = lower_required!(b, lower_expr(b, offset), Operand::Const(Const::Unit));
             let n = b.fresh_value(i64_ty());
-            b.push(Stmt::Let(n, Rvalue::FilePwrite { file: fop, data: dop, offset: oop }));
+            b.push(Stmt::Let(
+                n,
+                Rvalue::FilePwrite {
+                    file: fop,
+                    data: dop,
+                    offset: oop,
+                },
+            ));
             lower_count_or_status_result(b, n, result_ty)
         }
         hir::ExprKind::FileLen { file } => {
@@ -13818,16 +16316,48 @@ fn lower_child_kill(b: &mut Builder, child: &hir::Expr, sig: &hir::Expr, result_
 
 /// `process.exec(cmd, args)` → the runtime `execvp`s in place. On **success it replaces the image and
 /// never returns**, so control falls through to the status check only on failure — the runtime returns
-/// the mapped errno, which the shared status helper wraps into the `Err` arm of `Result<(), Error>`
-/// (the only observable arm). No cleanup is emitted (unlike `process.exit`): `execvp` discards the
-/// address space, so pending `Drop`s / arena ends / buffered writers are inherently lost on success —
+/// the mapped errno, which the dedicated failure edge wraps directly into the `Err` arm of
+/// `Result<(), Error>` (the only observable arm). No cleanup is emitted (unlike `process.exit`):
+/// `execvp` discards the address space, so pending `Drop`s / arena ends / buffered writers are
+/// inherently lost on success —
 /// this is the settled abort-class treatment (`docs/impl/std-design/process.md`).
-fn lower_process_exec(b: &mut Builder, cmd: &hir::Expr, args: &hir::Expr, result_ty: Ty) -> Operand {
+fn lower_process_exec(
+    b: &mut Builder,
+    cmd: &hir::Expr,
+    args: &hir::Expr,
+    result_ty: Ty,
+) -> Operand {
     let c = lower_required!(b, lower_expr(b, cmd), Operand::Const(Const::Unit));
     let a = lower_required!(b, lower_expr(b, args), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(code, Rvalue::ProcessExec { cmd: c, args: a }));
-    lower_status_result(b, code, result_ty)
+
+    // `align_rt_process_exec` returns only after `execvp` fails. Keep the impossible zero-status
+    // edge explicit in MIR because it is the successful image replacement: like `process.abort`,
+    // it performs no Align cleanup and has no continuation. The sole returning edge constructs an
+    // `Err` directly; routing this operation through `lower_status_result` would invent an `Ok`
+    // value and let an eager parent publish an action after a call that cannot return successfully.
+    let succeeded = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(
+        succeeded,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
+    let success = b.new_block();
+    let failure = b.new_block();
+    b.terminate(Term::Branch(Operand::Value(succeeded), success, failure));
+
+    b.cur = success;
+    b.terminate(Term::Unreachable);
+
+    b.cur = failure;
+    let error = make_error_from_status(b, code, result_ty);
+    let result = b.fresh_value(result_ty);
+    b.push(Stmt::Let(result, Rvalue::ResultErr(error)));
+    Operand::Value(result)
 }
 
 /// `fs.read_file_view(path)` → the runtime mmaps the file into the enclosing arena, writing the
@@ -13836,14 +16366,31 @@ fn lower_process_exec(b: &mut Builder, cmd: &hir::Expr, args: &hir::Expr, result
 /// is threaded so the runtime registers the mapping for `munmap` at arena end. Mirrors
 /// [`lower_fs_read_file`] with a `str` view payload (no `Drop` — it borrows the arena).
 fn lower_fs_read_file_view(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> Operand {
-    let arena = *b.arenas.last().expect("read_file_view outside an arena (sema-checked)");
+    let arena = *b
+        .arenas
+        .last()
+        .expect("read_file_view outside an arena (sema-checked)");
     let out = b.new_slot(Ty::Str);
     let p = lower_required!(b, lower_expr(b, path), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::FsReadFileView { path: p, arena: Operand::Value(arena), out }));
+    b.push(Stmt::Let(
+        code,
+        Rvalue::FsReadFileView {
+            path: p,
+            arena: Operand::Value(arena),
+            out,
+        },
+    ));
 
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -13879,15 +16426,35 @@ fn lower_fs_read_file_view(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> 
 /// shape as the `str` view (identical `{ptr,len}` payload, no `Drop` — it borrows the arena); the
 /// only difference is the runtime skips UTF-8 validation, so binary content is accepted.
 fn lower_fs_read_bytes_view(b: &mut Builder, path: &hir::Expr, result_ty: Ty) -> Operand {
-    let arena = *b.arenas.last().expect("read_bytes_view outside an arena (sema-checked)");
-    let elem = align_sema::Scalar::Int(IntTy { bits: 8, signed: false });
+    let arena = *b
+        .arenas
+        .last()
+        .expect("read_bytes_view outside an arena (sema-checked)");
+    let elem = align_sema::Scalar::Int(IntTy {
+        bits: 8,
+        signed: false,
+    });
     let out = b.new_slot(Ty::Slice(elem));
     let p = lower_required!(b, lower_expr(b, path), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::FsReadBytesView { path: p, arena: Operand::Value(arena), out }));
+    b.push(Stmt::Let(
+        code,
+        Rvalue::FsReadBytesView {
+            path: p,
+            arena: Operand::Value(arena),
+            out,
+        },
+    ));
 
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -13995,7 +16562,14 @@ fn lower_bytes_as_str(b: &mut Builder, bytes: &hir::Expr, result_ty: Ty) -> Oper
     b.push(Stmt::Let(code, Rvalue::BytesAsStr { bytes: src, out }));
 
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -14072,7 +16646,14 @@ fn emit_open_handle_result(
     result_ty: Ty,
 ) -> Operand {
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -14106,11 +16687,23 @@ fn emit_open_handle_result(
 /// returns an `i32` status (0 = ok; `AL_INVALID` -> `Error.Invalid`). Branch `Ok(<buffer>)` /
 /// `Err(<mapped status>)`. Mirrors [`lower_open_handle`], but the source is a `str` **view**
 /// (not a path) and there is no arena. The wrapped buffer is owned — the unwrapped local `Drop`s it.
-fn lower_encoding_decode(b: &mut Builder, kind: hir::EncodingKind, input: &hir::Expr, result_ty: Ty) -> Operand {
+fn lower_encoding_decode(
+    b: &mut Builder,
+    kind: hir::EncodingKind,
+    input: &hir::Expr,
+    result_ty: Ty,
+) -> Operand {
     let out = b.new_slot(Ty::Buffer);
     let inp = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::EncodingDecode { kind, input: inp, out }));
+    b.push(Stmt::Let(
+        code,
+        Rvalue::EncodingDecode {
+            kind,
+            input: inp,
+            out,
+        },
+    ));
     emit_status_buffer_result(b, code, out, result_ty)
 }
 
@@ -14121,7 +16714,14 @@ fn lower_encoding_decode(b: &mut Builder, kind: hir::EncodingKind, input: &hir::
 /// Shared by `encoding.*_decode` and the `std.compress` codecs.
 fn emit_status_buffer_result(b: &mut Builder, code: ValueId, out: Slot, result_ty: Ty) -> Operand {
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -14168,14 +16768,30 @@ fn lower_crypto_hmac(b: &mut Builder, key: &hir::Expr, data: &hir::Expr, ty: Ty)
 /// machinery. Out-of-line (`#[inline(never)]`) so its locals stay off the recursive `lower_expr`
 /// frame (see the call site).
 #[inline(never)]
-fn lower_crypto_hkdf(b: &mut Builder, salt: &hir::Expr, ikm: &hir::Expr, info: &hir::Expr, len: &hir::Expr, ty: Ty) -> Operand {
+fn lower_crypto_hkdf(
+    b: &mut Builder,
+    salt: &hir::Expr,
+    ikm: &hir::Expr,
+    info: &hir::Expr,
+    len: &hir::Expr,
+    ty: Ty,
+) -> Operand {
     let out = b.new_slot(Ty::Buffer);
     let sv = lower_required!(b, lower_expr(b, salt), Operand::Const(Const::Unit));
     let iv = lower_required!(b, lower_expr(b, ikm), Operand::Const(Const::Unit));
     let nv = lower_required!(b, lower_expr(b, info), Operand::Const(Const::Unit));
     let lv = lower_required!(b, lower_expr(b, len), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::CryptoHkdf { salt: sv, ikm: iv, info: nv, len: lv, out }));
+    b.push(Stmt::Let(
+        code,
+        Rvalue::CryptoHkdf {
+            salt: sv,
+            ikm: iv,
+            info: nv,
+            len: lv,
+            out,
+        },
+    ));
     emit_status_buffer_result(b, code, out, ty)
 }
 
@@ -14201,7 +16817,18 @@ fn lower_crypto_aead(
     let iv = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
     let av = lower_required!(b, lower_expr(b, aad), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::CryptoAead { cipher, dir, key: kv, nonce: nv, input: iv, aad: av, out }));
+    b.push(Stmt::Let(
+        code,
+        Rvalue::CryptoAead {
+            cipher,
+            dir,
+            key: kv,
+            nonce: nv,
+            input: iv,
+            aad: av,
+            out,
+        },
+    ));
     emit_status_buffer_result(b, code, out, ty)
 }
 
@@ -14213,7 +16840,13 @@ fn lower_crypto_aead(
 /// then passed to the runtime as flat scalars. Out-of-line (`#[inline(never)]`) so its locals stay
 /// off the recursive `lower_expr` frame (see the call site — the #296 `expr_depth` headroom).
 #[inline(never)]
-fn lower_crypto_argon2(b: &mut Builder, password: &hir::Expr, salt: &hir::Expr, params: &hir::Expr, ty: Ty) -> Operand {
+fn lower_crypto_argon2(
+    b: &mut Builder,
+    password: &hir::Expr,
+    salt: &hir::Expr,
+    params: &hir::Expr,
+    ty: Ty,
+) -> Operand {
     let out = b.new_slot(Ty::Buffer);
     let pw = lower_required!(b, lower_expr(b, password), Operand::Const(Const::Unit));
     let sv = lower_required!(b, lower_expr(b, salt), Operand::Const(Const::Unit));
@@ -14235,7 +16868,15 @@ fn lower_crypto_argon2(b: &mut Builder, password: &hir::Expr, salt: &hir::Expr, 
     let code = b.fresh_value(status_ty());
     b.push(Stmt::Let(
         code,
-        Rvalue::CryptoArgon2(Box::new(Argon2Args { password: pw, salt: sv, m_cost, t_cost, parallelism, len, out })),
+        Rvalue::CryptoArgon2(Box::new(Argon2Args {
+            password: pw,
+            salt: sv,
+            m_cost,
+            t_cost,
+            parallelism,
+            len,
+            out,
+        })),
     ));
     emit_status_buffer_result(b, code, out, ty)
 }
@@ -14249,10 +16890,24 @@ fn lower_cli_parse(b: &mut Builder, cmd: &hir::Expr, args: &hir::Expr, result_ty
     let cop = lower_required!(b, lower_expr(b, cmd), Operand::Const(Const::Unit));
     let av = lower_required!(b, lower_expr(b, args), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::CliParse { cmd: cop, args: av, out }));
+    b.push(Stmt::Let(
+        code,
+        Rvalue::CliParse {
+            cmd: cop,
+            args: av,
+            out,
+        },
+    ));
 
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -14303,7 +16958,13 @@ fn lower_command(b: &mut Builder, e: &hir::Expr) -> Operand {
             let cm = lower_required!(b, lower_expr(b, command), Operand::Const(Const::Unit));
             let d = lower_required!(b, lower_expr(b, dir), Operand::Const(Const::Unit));
             let v = b.fresh_value(Ty::Unit);
-            b.push(Stmt::Let(v, Rvalue::CommandCwd { command: cm, dir: d }));
+            b.push(Stmt::Let(
+                v,
+                Rvalue::CommandCwd {
+                    command: cm,
+                    dir: d,
+                },
+            ));
             Operand::Const(Const::Unit)
         }
         // `c.timeout_ns(ns)` → set the command handle's run timeout in place; no value.
@@ -14318,16 +16979,33 @@ fn lower_command(b: &mut Builder, e: &hir::Expr) -> Operand {
             let cm = lower_required!(b, lower_expr(b, command), Operand::Const(Const::Unit));
             let n = lower_required!(b, lower_expr(b, limit), Operand::Const(Const::Unit));
             let v = b.fresh_value(Ty::Unit);
-            b.push(Stmt::Let(v, Rvalue::CommandMaxCapture { command: cm, limit: n }));
+            b.push(Stmt::Let(
+                v,
+                Rvalue::CommandMaxCapture {
+                    command: cm,
+                    limit: n,
+                },
+            ));
             Operand::Const(Const::Unit)
         }
         // `c.env(name, value)` → add/override one child environment variable in place; no value.
-        hir::ExprKind::CommandEnv { command, name, value } => {
+        hir::ExprKind::CommandEnv {
+            command,
+            name,
+            value,
+        } => {
             let cm = lower_required!(b, lower_expr(b, command), Operand::Const(Const::Unit));
             let n = lower_required!(b, lower_expr(b, name), Operand::Const(Const::Unit));
             let val = lower_required!(b, lower_expr(b, value), Operand::Const(Const::Unit));
             let v = b.fresh_value(Ty::Unit);
-            b.push(Stmt::Let(v, Rvalue::CommandEnv { command: cm, name: n, value: val }));
+            b.push(Stmt::Let(
+                v,
+                Rvalue::CommandEnv {
+                    command: cm,
+                    name: n,
+                    value: val,
+                },
+            ));
             Operand::Const(Const::Unit)
         }
         // `c.env_clear()` → start the child environment empty, in place; no value.
@@ -14376,7 +17054,13 @@ fn lower_command(b: &mut Builder, e: &hir::Expr) -> Operand {
             let is_err = matches!(&e.kind, hir::ExprKind::RunOutputStderr { .. });
             let o = lower_required!(b, lower_expr(b, out), Operand::Const(Const::Unit));
             let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::RunOutputView { out: o, err: is_err }));
+            b.push(Stmt::Let(
+                v,
+                Rvalue::RunOutputView {
+                    out: o,
+                    err: is_err,
+                },
+            ));
             Operand::Value(v)
         }
         hir::ExprKind::RunBytesCode { out } => {
@@ -14389,7 +17073,13 @@ fn lower_command(b: &mut Builder, e: &hir::Expr) -> Operand {
             let is_err = matches!(&e.kind, hir::ExprKind::RunBytesStderr { .. });
             let o = lower_required!(b, lower_expr(b, out), Operand::Const(Const::Unit));
             let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::RunBytesView { out: o, err: is_err }));
+            b.push(Stmt::Let(
+                v,
+                Rvalue::RunBytesView {
+                    out: o,
+                    err: is_err,
+                },
+            ));
             Operand::Value(v)
         }
         other => unreachable!("lower_command called with non-command expr: {other:?}"),
@@ -14418,7 +17108,14 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
             let nm = lower_required!(b, lower_expr(b, name), Operand::Const(Const::Unit));
             let vl = lower_required!(b, lower_expr(b, value), Operand::Const(Const::Unit));
             let v = b.fresh_value(Ty::Unit);
-            b.push(Stmt::Let(v, Rvalue::HttpHeader { req: rq, name: nm, value: vl }));
+            b.push(Stmt::Let(
+                v,
+                Rvalue::HttpHeader {
+                    req: rq,
+                    name: nm,
+                    value: vl,
+                },
+            ));
             Operand::Const(Const::Unit)
         }
         // `r.body(data)` → copy the byte view into the request handle's body; no value.
@@ -14456,7 +17153,10 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
             let cl = lower_required!(b, lower_expr(b, client), Operand::Const(Const::Unit));
             let n = lower_required!(b, lower_expr(b, ns), Operand::Const(Const::Unit));
             let v = b.fresh_value(Ty::Unit);
-            b.push(Stmt::Let(v, Rvalue::HttpClientTimeout { client: cl, ns: n }));
+            b.push(Stmt::Let(
+                v,
+                Rvalue::HttpClientTimeout { client: cl, ns: n },
+            ));
             Operand::Const(Const::Unit)
         }
         // `cl.max_response_body_bytes(limit)` → set/clear the client-default receive cap; no value.
@@ -14561,9 +17261,11 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
         // `cl.get_many(urls, max_concurrency)` → `Result<array<response>, Error>`. The runtime writes an
         // owned `array<response>` into an out slot + returns an i32 status; branch Ok(array)/Err — the
         // owned-array-from-runtime shape of `fs.read_dir`, not the single-handle `lower_http_response_result`.
-        hir::ExprKind::HttpGetMany { client, urls, max_concurrency } => {
-            lower_http_get_many(b, client, urls, max_concurrency, e.ty)
-        }
+        hir::ExprKind::HttpGetMany {
+            client,
+            urls,
+            max_concurrency,
+        } => lower_http_get_many(b, client, urls, max_concurrency, e.ty),
         // `http.serve(host, port)` → `Result<http_server, Error>` (shared out-slot + i32-status
         // lowering, `ok_ty = HttpServer`). `host`/`port` are read.
         hir::ExprKind::HttpServe { host, port, shared } => {
@@ -14622,7 +17324,9 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
         // `hs.get(name)` → `Option<str>` (out-slot + i32 present flag; see below). The `headers`
         // operand is the same pointer `ctx` was, so the existing runtime call is reused verbatim.
-        hir::ExprKind::HttpCtxHeader { headers, name } => lower_http_ctx_header(b, headers, name, e.ty),
+        hir::ExprKind::HttpCtxHeader { headers, name } => {
+            lower_http_ctx_header(b, headers, name, e.ty)
+        }
         // `ctx.body()` → a `slice<u8>` view `{ptr,len}` into the ctx buffer (region-bound to `ctx`).
         hir::ExprKind::HttpCtxBody { ctx } => {
             let cx = lower_required!(b, lower_expr(b, ctx), Operand::Const(Const::Unit));
@@ -14644,7 +17348,14 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
             let nm = lower_required!(b, lower_expr(b, name), Operand::Const(Const::Unit));
             let vl = lower_required!(b, lower_expr(b, value), Operand::Const(Const::Unit));
             let v = b.fresh_value(Ty::Unit);
-            b.push(Stmt::Let(v, Rvalue::HttpRbHeader { rb: r, name: nm, value: vl }));
+            b.push(Stmt::Let(
+                v,
+                Rvalue::HttpRbHeader {
+                    rb: r,
+                    name: nm,
+                    value: vl,
+                },
+            ));
             Operand::Value(v)
         }
         // `rb.body(data)` → `()`. `rb` is borrowed (mutated in place); `data` is a byte view.
@@ -14691,11 +17402,22 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
         // `s.send(chunk)` / `s.send_event(data)` → `Result<(), Error>`. `s` is **borrowed** (mutated
         // in place — not consumed); the payload is a byte view.
-        hir::ExprKind::HttpStreamSend { stream, chunk, event } => {
+        hir::ExprKind::HttpStreamSend {
+            stream,
+            chunk,
+            event,
+        } => {
             let s = lower_required!(b, lower_expr(b, stream), Operand::Const(Const::Unit));
             let ch = lower_required!(b, lower_expr(b, chunk), Operand::Const(Const::Unit));
             let code = b.fresh_value(status_ty());
-            b.push(Stmt::Let(code, Rvalue::HttpStreamSend { stream: s, chunk: ch, event: *event }));
+            b.push(Stmt::Let(
+                code,
+                Rvalue::HttpStreamSend {
+                    stream: s,
+                    chunk: ch,
+                    event: *event,
+                },
+            ));
             lower_status_result(b, code, e.ty)
         }
         // `s.finish()` → `Result<(), Error>`. `s` is **consumed** (the runtime frees it): null its source
@@ -14715,7 +17437,10 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
             null_moved_source(b, stream);
             null_moved_source(b, rb);
             let code = b.fresh_value(status_ty());
-            b.push(Stmt::Let(code, Rvalue::HttpStreamReject { stream: s, rb: r }));
+            b.push(Stmt::Let(
+                code,
+                Rvalue::HttpStreamReject { stream: s, rb: r },
+            ));
             lower_status_result(b, code, e.ty)
         }
         _ => unreachable!("lower_http on a non-http expr"),
@@ -14760,10 +17485,25 @@ fn lower_http_get_many(
         Operand::Const(Const::Unit)
     );
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::HttpGetMany { client: c, urls: u, max_concurrency: mc, out }));
+    b.push(Stmt::Let(
+        code,
+        Rvalue::HttpGetMany {
+            client: c,
+            urls: u,
+            max_concurrency: mc,
+            out,
+        },
+    ));
 
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -14798,9 +17538,22 @@ fn lower_http_get_many(
 /// Build an `Option<payload>` from a runtime present-flag + out-slot: `flag != 0` → `Some(Load(out))`,
 /// else `None` (the out slot was zeroed, so `None` owns nothing). Shared by `re.captures` (payload =
 /// owned `captures` handle) and `caps.group` (payload = Copy `regex_match`), mirroring `env.get`.
-fn lower_present_flag_option(b: &mut Builder, flag: ValueId, out: Slot, payload_ty: Ty, result_ty: Ty) -> Operand {
+fn lower_present_flag_option(
+    b: &mut Builder,
+    flag: ValueId,
+    out: Slot,
+    payload_ty: Ty,
+    result_ty: Ty,
+) -> Operand {
     let present = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(present, Rvalue::Bin(BinOp::Ne, Operand::Value(flag), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        present,
+        Rvalue::Bin(
+            BinOp::Ne,
+            Operand::Value(flag),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let some_bb = b.new_block();
     let none_bb = b.new_block();
     let join = b.new_block();
@@ -14853,7 +17606,11 @@ fn lower_regex_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let matched = b.fresh_value(Ty::Bool);
             b.push(Stmt::Let(
                 matched,
-                Rvalue::Bin(BinOp::Ne, Operand::Value(flag), Operand::Const(Const::Int(0, status_ty()))),
+                Rvalue::Bin(
+                    BinOp::Ne,
+                    Operand::Value(flag),
+                    Operand::Const(Const::Int(0, status_ty())),
+                ),
             ));
             Operand::Value(matched)
         }
@@ -14872,12 +17629,24 @@ fn lower_regex_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
                 return Operand::Const(Const::Unit);
             }
             let flag = b.fresh_value(status_ty());
-            b.push(Stmt::Let(flag, Rvalue::RegexFind { regex: re, text: t, start, out }));
+            b.push(Stmt::Let(
+                flag,
+                Rvalue::RegexFind {
+                    regex: re,
+                    text: t,
+                    start,
+                    out,
+                },
+            ));
 
             let present = b.fresh_value(Ty::Bool);
             b.push(Stmt::Let(
                 present,
-                Rvalue::Bin(BinOp::Ne, Operand::Value(flag), Operand::Const(Const::Int(0, status_ty()))),
+                Rvalue::Bin(
+                    BinOp::Ne,
+                    Operand::Value(flag),
+                    Operand::Const(Const::Int(0, status_ty())),
+                ),
             ));
             let some_bb = b.new_block();
             let none_bb = b.new_block();
@@ -14914,22 +17683,43 @@ fn lower_regex_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let t = lower_required!(b, lower_expr(b, text), Operand::Const(Const::Unit));
             let status = b.fresh_value(status_ty());
             let rv = if is_split {
-                Rvalue::RegexSplit { regex: re, text: t, out }
+                Rvalue::RegexSplit {
+                    regex: re,
+                    text: t,
+                    out,
+                }
             } else {
-                Rvalue::RegexFindAll { regex: re, text: t, out }
+                Rvalue::RegexFindAll {
+                    regex: re,
+                    text: t,
+                    out,
+                }
             };
             b.push(Stmt::Let(status, rv));
             let a = b.fresh_value(e.ty);
             b.push(Stmt::Let(a, Rvalue::Load(out)));
             Operand::Value(a)
         }
-        hir::ExprKind::RegexReplace { regex, text, repl, all } => {
+        hir::ExprKind::RegexReplace {
+            regex,
+            text,
+            repl,
+            all,
+        } => {
             // Owned `string` returned by value (the `PathNormalize` shape); the bound local `Drop`s it.
             let re = lower_required!(b, lower_expr(b, regex), Operand::Const(Const::Unit));
             let t = lower_required!(b, lower_expr(b, text), Operand::Const(Const::Unit));
             let r = lower_required!(b, lower_expr(b, repl), Operand::Const(Const::Unit));
             let v = b.fresh_value(e.ty);
-            b.push(Stmt::Let(v, Rvalue::RegexReplace { regex: re, text: t, repl: r, all: *all }));
+            b.push(Stmt::Let(
+                v,
+                Rvalue::RegexReplace {
+                    regex: re,
+                    text: t,
+                    repl: r,
+                    all: *all,
+                },
+            ));
             Operand::Value(v)
         }
         hir::ExprKind::RegexCaptures { regex, text } => {
@@ -14938,7 +17728,14 @@ fn lower_regex_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let re = lower_required!(b, lower_expr(b, regex), Operand::Const(Const::Unit));
             let t = lower_required!(b, lower_expr(b, text), Operand::Const(Const::Unit));
             let flag = b.fresh_value(status_ty());
-            b.push(Stmt::Let(flag, Rvalue::RegexCaptures { regex: re, text: t, out }));
+            b.push(Stmt::Let(
+                flag,
+                Rvalue::RegexCaptures {
+                    regex: re,
+                    text: t,
+                    out,
+                },
+            ));
             lower_present_flag_option(b, flag, out, Ty::Captures, e.ty)
         }
         hir::ExprKind::CapturesGroup { caps, index } => {
@@ -14950,7 +17747,14 @@ fn lower_regex_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let c = lower_required!(b, lower_expr(b, caps), Operand::Const(Const::Unit));
             let idx = lower_required!(b, lower_expr(b, index), Operand::Const(Const::Unit));
             let flag = b.fresh_value(status_ty());
-            b.push(Stmt::Let(flag, Rvalue::CapturesGroup { caps: c, index: idx, out }));
+            b.push(Stmt::Let(
+                flag,
+                Rvalue::CapturesGroup {
+                    caps: c,
+                    index: idx,
+                    out,
+                },
+            ));
             lower_present_flag_option(b, flag, out, Ty::Struct(match_id), e.ty)
         }
         hir::ExprKind::RegexGroupCount { regex } => {
@@ -14964,11 +17768,18 @@ fn lower_regex_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             let re = lower_required!(b, lower_expr(b, regex), Operand::Const(Const::Unit));
             let n = lower_required!(b, lower_expr(b, name), Operand::Const(Const::Unit));
             let idx = b.fresh_value(i64_ty());
-            b.push(Stmt::Let(idx, Rvalue::RegexGroupIndex { regex: re, name: n }));
+            b.push(Stmt::Let(
+                idx,
+                Rvalue::RegexGroupIndex { regex: re, name: n },
+            ));
             let present = b.fresh_value(Ty::Bool);
             b.push(Stmt::Let(
                 present,
-                Rvalue::Bin(BinOp::Ge, Operand::Value(idx), Operand::Const(Const::Int(0, i64_ty()))),
+                Rvalue::Bin(
+                    BinOp::Ge,
+                    Operand::Value(idx),
+                    Operand::Const(Const::Int(0, i64_ty())),
+                ),
             ));
             let some_bb = b.new_block();
             let none_bb = b.new_block();
@@ -15018,7 +17829,14 @@ fn lower_http_response_result(
     b.push(Stmt::Let(code, code_rv));
 
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -15057,15 +17875,34 @@ fn lower_http_response_result(
 /// sema). Mirrors [`lower_env_get`], but the payload is a borrowed `str` view (not an owned string —
 /// the None arm's zeroed out slot needs no free either way). Out-of-line for `expr_depth` headroom.
 #[inline(never)]
-fn lower_http_resp_header(b: &mut Builder, resp: &hir::Expr, name: &hir::Expr, result_ty: Ty) -> Operand {
+fn lower_http_resp_header(
+    b: &mut Builder,
+    resp: &hir::Expr,
+    name: &hir::Expr,
+    result_ty: Ty,
+) -> Operand {
     let out = b.new_slot(Ty::Str);
     let rp = lower_required!(b, lower_expr(b, resp), Operand::Const(Const::Unit));
     let nm = lower_required!(b, lower_expr(b, name), Operand::Const(Const::Unit));
     let flag = b.fresh_value(status_ty());
-    b.push(Stmt::Let(flag, Rvalue::HttpRespHeader { resp: rp, name: nm, out }));
+    b.push(Stmt::Let(
+        flag,
+        Rvalue::HttpRespHeader {
+            resp: rp,
+            name: nm,
+            out,
+        },
+    ));
 
     let present = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(present, Rvalue::Bin(BinOp::Ne, Operand::Value(flag), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        present,
+        Rvalue::Bin(
+            BinOp::Ne,
+            Operand::Value(flag),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let some_bb = b.new_block();
     let none_bb = b.new_block();
     let join = b.new_block();
@@ -15099,15 +17936,34 @@ fn lower_http_resp_header(b: &mut Builder, resp: &hir::Expr, name: &hir::Expr, r
 /// unchanged. The view borrows the request buffer (region-bound in sema — it inherits `headers`'s
 /// region). The exact read-dual of [`lower_http_resp_header`]. Out-of-line for `expr_depth` headroom.
 #[inline(never)]
-fn lower_http_ctx_header(b: &mut Builder, headers: &hir::Expr, name: &hir::Expr, result_ty: Ty) -> Operand {
+fn lower_http_ctx_header(
+    b: &mut Builder,
+    headers: &hir::Expr,
+    name: &hir::Expr,
+    result_ty: Ty,
+) -> Operand {
     let out = b.new_slot(Ty::Str);
     let cx = lower_required!(b, lower_expr(b, headers), Operand::Const(Const::Unit));
     let nm = lower_required!(b, lower_expr(b, name), Operand::Const(Const::Unit));
     let flag = b.fresh_value(status_ty());
-    b.push(Stmt::Let(flag, Rvalue::HttpCtxHeader { ctx: cx, name: nm, out }));
+    b.push(Stmt::Let(
+        flag,
+        Rvalue::HttpCtxHeader {
+            ctx: cx,
+            name: nm,
+            out,
+        },
+    ));
 
     let present = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(present, Rvalue::Bin(BinOp::Ne, Operand::Value(flag), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        present,
+        Rvalue::Bin(
+            BinOp::Ne,
+            Operand::Value(flag),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let some_bb = b.new_block();
     let none_bb = b.new_block();
     let join = b.new_block();
@@ -15148,7 +18004,14 @@ fn lower_reader_read(b: &mut Builder, reader: Operand, buffer: Operand, result_t
 /// `reader.read` and `io.copy` (identical sign convention).
 fn lower_count_or_status_result(b: &mut Builder, n: ValueId, result_ty: Ty) -> Operand {
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Ge, Operand::Value(n), Operand::Const(Const::Int(0, i64_ty())))));
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(
+            BinOp::Ge,
+            Operand::Value(n),
+            Operand::Const(Const::Int(0, i64_ty())),
+        ),
+    ));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -15165,9 +18028,23 @@ fn lower_count_or_status_result(b: &mut Builder, n: ValueId, result_ty: Ty) -> O
     // Err: the status is `-n`, narrowed to i32 for the fixed-table decode.
     b.cur = err_bb;
     let neg = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(neg, Rvalue::Bin(BinOp::Sub, Operand::Const(Const::Int(0, i64_ty())), Operand::Value(n))));
+    b.push(Stmt::Let(
+        neg,
+        Rvalue::Bin(
+            BinOp::Sub,
+            Operand::Const(Const::Int(0, i64_ty())),
+            Operand::Value(n),
+        ),
+    ));
     let status = b.fresh_value(status_ty());
-    b.push(Stmt::Let(status, Rvalue::Cast { operand: Operand::Value(neg), from: i64_ty(), to: status_ty() }));
+    b.push(Stmt::Let(
+        status,
+        Rvalue::Cast {
+            operand: Operand::Value(neg),
+            from: i64_ty(),
+            to: status_ty(),
+        },
+    ));
     let errv = b.fresh_value(result_ty);
     let ec = make_error_from_status(b, status, result_ty);
     b.push(Stmt::Let(errv, Rvalue::ResultErr(ec)));
@@ -15184,7 +18061,14 @@ fn lower_count_or_status_result(b: &mut Builder, n: ValueId, result_ty: Ty) -> O
 /// `Err(<mapped status>)`. The `writer.write` / `writer.flush` tail.
 fn lower_status_result(b: &mut Builder, code: ValueId, result_ty: Ty) -> Operand {
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -15193,7 +18077,10 @@ fn lower_status_result(b: &mut Builder, code: ValueId, result_ty: Ty) -> Operand
 
     b.cur = ok_bb;
     let okv = b.fresh_value(result_ty);
-    b.push(Stmt::Let(okv, Rvalue::ResultOk(Operand::Const(Const::Unit))));
+    b.push(Stmt::Let(
+        okv,
+        Rvalue::ResultOk(Operand::Const(Const::Unit)),
+    ));
     b.push(Stmt::Store(rslot, Operand::Value(okv)));
     b.terminate(Term::Goto(join));
 
@@ -15215,16 +18102,36 @@ fn lower_status_result(b: &mut Builder, code: ValueId, result_ty: Ty) -> Operand
 /// Mirrors [`lower_json_decode_array`]; the AoS buffer is heap-owned (the unwrapped local
 /// `Drop`-frees it), while clean `str` fields view the input and selected escaped strings use the
 /// enclosing arena.
-fn lower_json_decode_struct_array(b: &mut Builder, struct_id: u32, input: &hir::Expr, result_ty: Ty) -> Operand {
+fn lower_json_decode_struct_array(
+    b: &mut Builder,
+    struct_id: u32,
+    input: &hir::Expr,
+    result_ty: Ty,
+) -> Operand {
     let arr_ty = Ty::DynStructArray(struct_id, Layout::Aos);
     let out = b.new_slot(arr_ty);
     let inp = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
     let arena = b.arenas.last().copied().map(Operand::Value);
     let code = b.fresh_value(status_ty());
-    b.push(Stmt::Let(code, Rvalue::JsonDecodeStructArray { struct_id, input: inp, out, arena }));
+    b.push(Stmt::Let(
+        code,
+        Rvalue::JsonDecodeStructArray {
+            struct_id,
+            input: inp,
+            out,
+            arena,
+        },
+    ));
 
     let isok = b.fresh_value(Ty::Bool);
-    b.push(Stmt::Let(isok, Rvalue::Bin(BinOp::Eq, Operand::Value(code), Operand::Const(Const::Int(0, status_ty())))));
+    b.push(Stmt::Let(
+        isok,
+        Rvalue::Bin(
+            BinOp::Eq,
+            Operand::Value(code),
+            Operand::Const(Const::Int(0, status_ty())),
+        ),
+    ));
     let ok_bb = b.new_block();
     let err_bb = b.new_block();
     let join = b.new_block();
@@ -15254,6 +18161,28 @@ fn lower_json_decode_struct_array(b: &mut Builder, struct_id: u32, input: &hir::
     Operand::Value(r)
 }
 
+/// Whether an expression spine can deliver only the failure returned by `process.exec`. Plain and
+/// unsafe blocks preserve their tail directly; arena and task-group scopes append cleanup only on
+/// that returning failure edge. None of these wrappers invents a returning `Ok` edge.
+fn process_exec_failure_spine(mut expression: &hir::Expr) -> bool {
+    loop {
+        match &expression.kind {
+            hir::ExprKind::ProcessExec { .. } => return true,
+            hir::ExprKind::Block(block)
+            | hir::ExprKind::Unsafe(block)
+            | hir::ExprKind::Arena(block)
+            | hir::ExprKind::TaskGroup(block)
+            | hir::ExprKind::NamedArena { block, .. } => {
+                let Some(value) = block.value.as_deref() else {
+                    return false;
+                };
+                expression = value;
+            }
+            _ => return false,
+        }
+    }
+}
+
 /// `expr?` → branch on the Result tag. `Err` propagates (early-return an `Err` of the
 /// function's own return type — the cold edge); `Ok` continues with the unwrapped value.
 fn lower_try(b: &mut Builder, inner: &hir::Expr, ok_ty: Ty) -> Operand {
@@ -15273,6 +18202,25 @@ fn lower_try(b: &mut Builder, inner: &hir::Expr, ok_ty: Ty) -> Operand {
     // that provenance rule for this edge against `inner.ty` below.
     let inner_owners = b.borrow_owners(&r);
 
+    // `process.exec` has no returning `Ok` value: its zero-status edge already ended in
+    // `Unreachable`, and the current block is exclusively the runtime-failure edge containing the
+    // exact `ResultErr` built by `lower_process_exec`. Propagate that error directly. Reintroducing
+    // a generic `ResultIsOk` branch here would recreate a fictitious parent-action path after a
+    // successful image replacement and could run cleanup on the no-cleanup success edge.
+    if process_exec_failure_spine(inner) {
+        let err = b.fresh_value(ret_err_ty);
+        b.push(Stmt::Let(err, Rvalue::ResultUnwrapErr(r)));
+        let propagated = b.fresh_value(b.ret);
+        b.push(Stmt::Let(
+            propagated,
+            Rvalue::ResultErr(Operand::Value(err)),
+        ));
+        null_moved_source(b, inner);
+        b.emit_exit_cleanup();
+        b.terminate_return(Some(Operand::Value(propagated)), inner_flag, inner.ty);
+        return Operand::Const(Const::Unit);
+    }
+
     let is_ok = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(is_ok, Rvalue::ResultIsOk(r.clone())));
     let ok_bb = b.new_block();
@@ -15286,7 +18234,10 @@ fn lower_try(b: &mut Builder, inner: &hir::Expr, ok_ty: Ty) -> Operand {
     let err = b.fresh_value(ret_err_ty);
     b.push(Stmt::Let(err, Rvalue::ResultUnwrapErr(r.clone())));
     let propagated = b.fresh_value(b.ret);
-    b.push(Stmt::Let(propagated, Rvalue::ResultErr(Operand::Value(err))));
+    b.push(Stmt::Let(
+        propagated,
+        Rvalue::ResultErr(Operand::Value(err)),
+    ));
     // `?` consumes the Result on both edges. A bound source with an owned Err payload must be
     // cleared before exit cleanup, or its local Drop frees the same payload now owned by the
     // returned `Err` (use-after-free / double-free in the caller).
@@ -15295,7 +18246,11 @@ fn lower_try(b: &mut Builder, inner: &hir::Expr, ok_ty: Ty) -> Operand {
     b.emit_exit_cleanup();
     // The propagated `Err` re-wraps the operand's own error payload, so the operand's type — not
     // the function's return type — is what the cleanup bit describes.
-    b.terminate_return(Some(Operand::Value(propagated)), inner_flag.clone(), inner.ty);
+    b.terminate_return(
+        Some(Operand::Value(propagated)),
+        inner_flag.clone(),
+        inner.ty,
+    );
 
     // Ok: continue with the unwrapped value. If the operand was a bound local holding an owned
     // payload (e.g. `r: Result<string,E>`), the payload is now moved into `v`, so null the source
@@ -15319,7 +18274,13 @@ fn lower_try(b: &mut Builder, inner: &hir::Expr, ok_ty: Ty) -> Operand {
 
 /// `opt else fallback` → branch on the Option tag; `Some` unwraps the payload into the
 /// result slot, `None` evaluates the fallback (which writes the slot or diverges).
-fn lower_else_unwrap(b: &mut Builder, opt: &hir::Expr, fallback: &hir::Expr, ty: Ty, borrow_result: bool) -> Operand {
+fn lower_else_unwrap(
+    b: &mut Builder,
+    opt: &hir::Expr,
+    fallback: &hir::Expr,
+    ty: Ty,
+    borrow_result: bool,
+) -> Operand {
     // `else` unwraps an `Option` (Some/None) or a `Result` (Ok/Err) — the same two-way shape, just
     // a different discriminant/unwrap rvalue. A Move container is consumed into one hidden owner:
     // the positive edge transfers its payload and clears that owner, while the negative edge drops
@@ -15346,7 +18307,11 @@ fn lower_else_unwrap(b: &mut Builder, opt: &hir::Expr, fallback: &hir::Expr, ty:
     }
 
     let is_pos = b.fresh_value(Ty::Bool);
-    let test = if is_result { Rvalue::ResultIsOk(opt_op.clone()) } else { Rvalue::OptionIsSome(opt_op.clone()) };
+    let test = if is_result {
+        Rvalue::ResultIsOk(opt_op.clone())
+    } else {
+        Rvalue::OptionIsSome(opt_op.clone())
+    };
     b.push(Stmt::Let(is_pos, test));
     let some_bb = b.new_block();
     let none_bb = b.new_block();
@@ -15359,16 +18324,28 @@ fn lower_else_unwrap(b: &mut Builder, opt: &hir::Expr, fallback: &hir::Expr, ty:
     // {null,0} payload).
     b.cur = some_bb;
     let val = b.fresh_value(ty);
-    let unwrap = if is_result { Rvalue::ResultUnwrapOk(opt_op) } else { Rvalue::OptionUnwrap(opt_op) };
+    let unwrap = if is_result {
+        Rvalue::ResultUnwrapOk(opt_op)
+    } else {
+        Rvalue::OptionUnwrap(opt_op)
+    };
     b.push(Stmt::Let(val, unwrap));
     b.attach_borrow_owners(val, opt_owners);
     if let Some(flag_slot) = result_flag {
-        b.push(Stmt::Store(flag_slot, opt_flag.clone().unwrap_or(Operand::Const(Const::Bool(false)))));
+        b.push(Stmt::Store(
+            flag_slot,
+            opt_flag
+                .clone()
+                .unwrap_or(Operand::Const(Const::Bool(false))),
+        ));
     }
     if let Some(flag_slot) = result_temp_flag {
         // Unwrapping consumes the positive payload; unlike a direct local borrow, the result now
         // needs a temporary owner if the payload is individually owned.
-        b.push(Stmt::Store(flag_slot, opt_flag.unwrap_or(Operand::Const(Const::Bool(false)))));
+        b.push(Stmt::Store(
+            flag_slot,
+            opt_flag.unwrap_or(Operand::Const(Const::Bool(false))),
+        ));
     }
     if let Some(result_slot) = result_slot {
         let owners = b.borrow_owners(&Operand::Value(val));
@@ -15420,7 +18397,13 @@ fn lower_else_unwrap(b: &mut Builder, opt: &hir::Expr, fallback: &hir::Expr, ty:
 
 /// `match scrutinee { … }`: lower per scrutinee kind — a user `enum` (a tag-compare chain over the
 /// non-union struct) or builtin `Option`/`Result` (a single 2-way branch on `IsSome`/`IsOk`).
-fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], ty: Ty, borrow_result: bool) -> Operand {
+fn lower_match(
+    b: &mut Builder,
+    scrutinee: &hir::Expr,
+    arms: &[hir::MatchArm],
+    ty: Ty,
+    borrow_result: bool,
+) -> Operand {
     // A zero-arm `match` is already a (non-exhaustive) sema error; lower the scrutinee for its
     // effects and yield unit so we never panic on the indexing below.
     if arms.is_empty() {
@@ -15480,8 +18463,7 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
                 .clone()
                 .unwrap_or(Operand::Const(Const::Bool(false)))
         } else {
-            temporary_drop_flag(b, scrutinee, &scrut)
-                .unwrap_or(Operand::Const(Const::Bool(false)))
+            temporary_drop_flag(b, scrutinee, &scrut).unwrap_or(Operand::Const(Const::Bool(false)))
         };
         b.set_drop_flag_operand(owner, live);
         // A consuming match transferred every fresh/materialized source into this owner. Copy-only
@@ -15493,8 +18475,7 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
     });
     let join_bb = b.new_block();
     match scrutinee.ty {
-        Ty::Enum(enum_id) => {
-            lower_match_enum(
+        Ty::Enum(enum_id) => lower_match_enum(
                 b,
                 enum_id,
                 arms,
@@ -15509,10 +18490,8 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
                 ),
                 scrutinee,
                 scrut_flag,
-            )
-        }
-        Ty::Option(_) | Ty::Result(..) => {
-            lower_match_binary(
+        ),
+        Ty::Option(_) | Ty::Result(..) => lower_match_binary(
                 b,
                 scrutinee.ty,
                 arms,
@@ -15527,8 +18506,7 @@ fn lower_match(b: &mut Builder, scrutinee: &hir::Expr, arms: &[hir::MatchArm], t
                 ),
                 scrutinee,
                 scrut_flag,
-            )
-        }
+        ),
         // Guarded by sema (`match` requires a sum type); be defensive rather than panic.
         _ => b.terminate(Term::Goto(join_bb)),
     }
@@ -15555,12 +18533,10 @@ fn match_scrutinee_transfers_source_to_owner(e: &hir::Expr) -> bool {
         hir::ExprKind::Block(block)
         | hir::ExprKind::Unsafe(block)
         | hir::ExprKind::Arena(block)
-        | hir::ExprKind::NamedArena { block, .. } => {
-            block
+        | hir::ExprKind::NamedArena { block, .. } => block
                 .value
                 .as_deref()
-                .is_some_and(match_scrutinee_transfers_source_to_owner)
-        }
+            .is_some_and(match_scrutinee_transfers_source_to_owner),
         _ => false,
     }
 }
@@ -15586,7 +18562,10 @@ fn lower_match_enum(
     let (result_slot, result_flag, result_temp_flag, join_bb, borrow_result, scrut_owner) = target;
     // The default arm is the `_` wildcard (no variants); absent it, the last arm — exhaustiveness
     // guarantees the scrutinee must be one of its variants by the time control reaches it.
-    let default_idx = arms.iter().position(|a| a.variants.is_empty()).unwrap_or(arms.len() - 1);
+    let default_idx = arms
+        .iter()
+        .position(|a| a.variants.is_empty())
+        .unwrap_or(arms.len() - 1);
     // Bind a single-variant arm's payload (an or-pattern / wildcard binds nothing).
     let bind_payload = |b: &mut Builder, arm: &hir::MatchArm| {
         if let [v] = arm.variants[..] {
@@ -15598,7 +18577,17 @@ fn lower_match_enum(
                 {
                     continue;
                 }
-                bind_local(b, local, Rvalue::EnumPayload { enum_id, variant: v, slot: slot as u32, operand: scrut.clone() }, scrut_flag.clone());
+                bind_local(
+                    b,
+                    local,
+                    Rvalue::EnumPayload {
+                        enum_id,
+                        variant: v,
+                        slot: slot as u32,
+                        operand: scrut.clone(),
+                    },
+                    scrut_flag.clone(),
+                );
             }
         }
     };
@@ -15613,7 +18602,14 @@ fn lower_match_enum(
         let n = arm.variants.len();
         for (k, &v) in arm.variants.iter().enumerate() {
             let eq = b.fresh_value(Ty::Bool);
-            b.push(Stmt::Let(eq, Rvalue::EnumTagEq { enum_id, scrutinee: scrut.clone(), variant: v }));
+            b.push(Stmt::Let(
+                eq,
+                Rvalue::EnumTagEq {
+                    enum_id,
+                    scrutinee: scrut.clone(),
+                    variant: v,
+                },
+            ));
             if k + 1 == n {
                 b.terminate(Term::Branch(Operand::Value(eq), arm_bb, next_bb));
             } else {
@@ -15626,8 +18622,7 @@ fn lower_match_enum(
         enter_borrowed_match_arm(b, scrutinee, arm);
         bind_payload(b, arm);
         let transfers_payload = arm.bindings.iter().any(|local| {
-            !arm
-                .borrowed_bindings
+            !arm.borrowed_bindings
                 .iter()
                 .any(|projection| projection.binding_local == *local)
                 && b.slots.get(*local as usize).is_some_and(|ty| {
@@ -15641,7 +18636,15 @@ fn lower_match_enum(
         }
         let active_may_own = enum_match_arm_may_own(b, enum_id, arm);
         discharge_match_scrutinee(b, scrut_owner, transfers_payload, active_may_own);
-        finish_arm(b, &arm.body, result_slot, result_flag, result_temp_flag, join_bb, borrow_result);
+        finish_arm(
+            b,
+            &arm.body,
+            result_slot,
+            result_flag,
+            result_temp_flag,
+            join_bb,
+            borrow_result,
+        );
         leave_borrowed_match_arm(b, arm);
         b.cur = next_bb;
     }
@@ -15661,7 +18664,15 @@ fn lower_match_enum(
     }
     let active_may_own = enum_match_arm_may_own(b, enum_id, d);
     discharge_match_scrutinee(b, scrut_owner, transfers_payload, active_may_own);
-    finish_arm(b, &d.body, result_slot, result_flag, result_temp_flag, join_bb, borrow_result);
+    finish_arm(
+        b,
+        &d.body,
+        result_slot,
+        result_flag,
+        result_temp_flag,
+        join_bb,
+        borrow_result,
+    );
     leave_borrowed_match_arm(b, d);
 }
 
@@ -15686,13 +18697,29 @@ fn lower_match_binary(
 ) {
     let (result_slot, result_flag, result_temp_flag, join_bb, borrow_result, scrut_owner) = target;
     let wild = arms.iter().find(|a| a.variants.is_empty());
-    let pos = arms.iter().find(|a| a.variants.contains(&0)).or(wild).expect("exhaustive (sema)");
-    let neg = arms.iter().find(|a| a.variants.contains(&1)).or(wild).expect("exhaustive (sema)");
+    let pos = arms
+        .iter()
+        .find(|a| a.variants.contains(&0))
+        .or(wild)
+        .expect("exhaustive (sema)");
+    let neg = arms
+        .iter()
+        .find(|a| a.variants.contains(&1))
+        .or(wild)
+        .expect("exhaustive (sema)");
     // A lone `_` covers both variants — no test needed (and binds nothing, so no move to null).
     if std::ptr::eq(pos, neg) {
         let active_may_own = needs_drop_flag(ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types);
         discharge_match_scrutinee(b, scrut_owner, false, active_may_own);
-        finish_arm(b, &pos.body, result_slot, result_flag, result_temp_flag, join_bb, borrow_result);
+        finish_arm(
+            b,
+            &pos.body,
+            result_slot,
+            result_flag,
+            result_temp_flag,
+            join_bb,
+            borrow_result,
+        );
         return;
     }
     let cond = b.fresh_value(Ty::Bool);
@@ -15708,8 +18735,7 @@ fn lower_match_binary(
     enter_borrowed_match_arm(b, scrutinee, pos);
     bind_binary(b, ty, true, pos, scrut, scrut_flag.clone());
     let pos_transfers = pos.bindings.iter().any(|local| {
-        !pos
-            .borrowed_bindings
+        !pos.borrowed_bindings
             .iter()
             .any(|projection| projection.binding_local == *local)
             && b.slots.get(*local as usize).is_some_and(|ty| {
@@ -15723,14 +18749,21 @@ fn lower_match_binary(
     }
     let pos_may_own = binary_match_arm_may_own(b, ty, true);
     discharge_match_scrutinee(b, scrut_owner, pos_transfers, pos_may_own);
-    finish_arm(b, &pos.body, result_slot, result_flag, result_temp_flag, join_bb, borrow_result);
+    finish_arm(
+        b,
+        &pos.body,
+        result_slot,
+        result_flag,
+        result_temp_flag,
+        join_bb,
+        borrow_result,
+    );
     leave_borrowed_match_arm(b, pos);
     b.cur = neg_bb;
     enter_borrowed_match_arm(b, scrutinee, neg);
     bind_binary(b, ty, false, neg, scrut, scrut_flag);
     let neg_transfers = neg.bindings.iter().any(|local| {
-        !neg
-            .borrowed_bindings
+        !neg.borrowed_bindings
             .iter()
             .any(|projection| projection.binding_local == *local)
             && b.slots.get(*local as usize).is_some_and(|ty| {
@@ -15742,7 +18775,15 @@ fn lower_match_binary(
     }
     let neg_may_own = binary_match_arm_may_own(b, ty, false);
     discharge_match_scrutinee(b, scrut_owner, neg_transfers, neg_may_own);
-    finish_arm(b, &neg.body, result_slot, result_flag, result_temp_flag, join_bb, borrow_result);
+    finish_arm(
+        b,
+        &neg.body,
+        result_slot,
+        result_flag,
+        result_temp_flag,
+        join_bb,
+        borrow_result,
+    );
     leave_borrowed_match_arm(b, neg);
 }
 
@@ -15813,14 +18854,23 @@ fn binary_match_arm_may_own(b: &Builder, ty: Ty, positive: bool) -> bool {
 
 /// Bind the payload of an `Option`/`Result` arm: Some/Ok → the unwrapped value, Err → the error;
 /// None (and any `_` wildcard) binds nothing.
-fn bind_binary(b: &mut Builder, ty: Ty, is_pos: bool, arm: &hir::MatchArm, scrut: &Operand, scrut_flag: Option<Operand>) {
+fn bind_binary(
+    b: &mut Builder,
+    ty: Ty,
+    is_pos: bool,
+    arm: &hir::MatchArm,
+    scrut: &Operand,
+    scrut_flag: Option<Operand>,
+) {
     // A wildcard / or-pattern arm binds nothing (no bindings); only a single Some/Ok/Err arm does.
     if arm.bindings.is_empty() {
         return;
     }
-    if arm.borrowed_bindings.iter().any(|projection| {
-        projection.binding_local == arm.bindings[0]
-    }) {
+    if arm
+        .borrowed_bindings
+        .iter()
+        .any(|projection| projection.binding_local == arm.bindings[0])
+    {
         return;
     }
     let rv = match (ty, is_pos) {
@@ -15860,7 +18910,15 @@ fn finish_arm(
         lower_expr(b, body)
     };
     if lowering_continues(b) {
-        store_control_result(b, result_slot, result_flag, result_temp_flag, body, av, borrow_result);
+        store_control_result(
+            b,
+            result_slot,
+            result_flag,
+            result_temp_flag,
+            body,
+            av,
+            borrow_result,
+        );
         b.terminate(Term::Goto(join_bb));
     }
 }
@@ -15882,8 +18940,8 @@ fn lower_map_err(b: &mut Builder, result: &hir::Expr, f: &hir::Expr, out_ty: Ty)
     if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
     }
-    let source_flag = lowered_drop_flag(b, result, &rv)
-        .unwrap_or(Operand::Const(Const::Bool(false)));
+    let source_flag =
+        lowered_drop_flag(b, result, &rv).unwrap_or(Operand::Const(Const::Bool(false)));
     let fv = lower_expr(b, f);
     if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
@@ -16004,7 +19062,11 @@ fn lower_short_circuit(b: &mut Builder, op: BinOp, lhs: &hir::Expr, rhs: &hir::E
 /// `drop_locals` in declaration order — no fragile per-`ExprKind` walk that could miss a `let`
 /// nested in a call argument / tuple / operand.
 fn loop_iter_drops(b: &Builder, body_locals: &std::ops::Range<u32>) -> Vec<Slot> {
-    b.drop_locals.iter().copied().filter(|s| body_locals.contains(s)).collect()
+    b.drop_locals
+        .iter()
+        .copied()
+        .filter(|s| body_locals.contains(s))
+        .collect()
 }
 
 /// `loop { ... }` — a header block, the body, a back-edge to the header, and an exit block that
@@ -16018,7 +19080,12 @@ fn loop_iter_drops(b: &Builder, body_locals: &std::ops::Range<u32>) -> Vec<Slot>
 /// frame (a deep expression chain descends `lower_expr` once per level; see the `expr_depth` test).
 #[inline(never)]
 fn lower_loop(b: &mut Builder, e: &hir::Expr) -> Operand {
-    let hir::ExprKind::Loop { body, diverges, body_locals } = &e.kind else {
+    let hir::ExprKind::Loop {
+        body,
+        diverges,
+        body_locals,
+    } = &e.kind
+    else {
         unreachable!("lower_loop on a non-loop expression");
     };
     let (diverges, ty) = (*diverges, e.ty);
@@ -16028,7 +19095,11 @@ fn lower_loop(b: &mut Builder, e: &hir::Expr) -> Operand {
     let exit = b.new_block();
     b.terminate(Term::Goto(header));
     b.cur = header;
-    b.loops.push(LoopFrame { exit, result_slot, iter_drops });
+    b.loops.push(LoopFrame {
+        exit,
+        result_slot,
+        iter_drops,
+    });
     let _ = lower_block(b, body); // the body's trailing value is discarded each iteration
     // Fall-through end of an iteration: conditionally drop this pass's per-iteration owned locals
     // and clear their flags, then loop back.
@@ -16094,7 +19165,15 @@ fn lower_if(
         if let Some(op) = tv
             && let Some(value) = &then.value
         {
-            store_control_result(b, result_slot, result_flag, result_temp_flag, value, op, borrow_result);
+            store_control_result(
+                b,
+                result_slot,
+                result_flag,
+                result_temp_flag,
+                value,
+                op,
+                borrow_result,
+            );
         }
         b.terminate(Term::Goto(join_bb));
     }
@@ -16160,7 +19239,11 @@ pub fn ty_name(ty: Ty) -> String {
         | Ty::DynFixedArray(..)
         | Ty::DynFixedStructArray(..)) => format!(
             "array<{}>",
-            ty_name(ty.dyn_aggregate_array_element().expect("matched aggregate array").ty())
+            ty_name(
+                ty.dyn_aggregate_array_element()
+                    .expect("matched aggregate array")
+                    .ty()
+            )
         ),
         Ty::DynStructArray(id, _) => format!("array<struct#{id}>"),
         Ty::DynSliceArray(_) => "array<slice>".to_string(),
@@ -16174,14 +19257,21 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::Reader => "reader".to_string(),
         Ty::Buffer => "buffer".to_string(),
         Ty::ArrayBuilder(element) => {
-            format!("array_builder<{}>", ty_name(align_sema::scalar_to_ty(element)))
+            format!(
+                "array_builder<{}>",
+                ty_name(align_sema::scalar_to_ty(element))
+            )
         }
         ty @ (Ty::VecArrayBuilder(..)
         | Ty::MaskArrayBuilder(..)
         | Ty::FixedArrayBuilder(..)
         | Ty::FixedStructArrayBuilder(..)) => format!(
             "array_builder<{}>",
-            ty_name(ty.array_builder_element().expect("matched aggregate builder").ty())
+            ty_name(
+                ty.array_builder_element()
+                    .expect("matched aggregate builder")
+                    .ty()
+            )
         ),
         Ty::File => "file".to_string(),
         Ty::Rng => "rng".to_string(),
@@ -16248,7 +19338,10 @@ mod tests {
         let Some(z) = rendered.find("z_callback") else {
             panic!("second callback target missing: {rendered}");
         };
-        assert!(a < z, "callback effect metadata must render canonically: {rendered}");
+        assert!(
+            a < z,
+            "callback effect metadata must render canonically: {rendered}"
+        );
     }
 
     fn direct_program_name(call: &DirectCall) -> Option<&str> {
@@ -16462,9 +19555,16 @@ fn main() -> i32 {
             .iter()
             .flat_map(|block| &block.stmts)
             .find_map(|statement| match statement {
-                Stmt::Let(_, Rvalue::RawCall { callee, args, param_tys, ret_ty, signature }) => {
-                    Some((callee, args, param_tys, ret_ty, signature))
-                }
+                Stmt::Let(
+                    _,
+                    Rvalue::RawCall {
+                        callee,
+                        args,
+                        param_tys,
+                        ret_ty,
+                        signature,
+                    },
+                ) => Some((callee, args, param_tys, ret_ty, signature)),
                 _ => None,
             })
             .expect("command binder raw call");
@@ -16543,9 +19643,15 @@ fn main() -> i32 {
         let materialize = program
             .fns
             .iter()
-            .find(|function| function.name.as_str().starts_with("pkg.db$materialize_query$"))
+            .find(|function| {
+                function
+                    .name
+                    .as_str()
+                    .starts_with("pkg.db$materialize_query$")
+            })
             .expect("concrete QueryMeta materializer");
-        assert!(materialize
+        assert!(
+            materialize
             .blocks
             .iter()
             .flat_map(|block| &block.stmts)
@@ -16570,8 +19676,10 @@ fn main() -> i32 {
                         align_ast::ParamMode::ByValue,
                     ]
                 )
-            }));
-        assert!(materialize
+                })
+        );
+        assert!(
+            materialize
             .blocks
             .iter()
             .flat_map(|block| &block.stmts)
@@ -16586,13 +19694,15 @@ fn main() -> i32 {
                         }
                     )
                 )
-            }));
+                })
+        );
         let command_id = program
             .fns
             .iter()
             .find(|function| function.name.as_str().starts_with("pkg.db$command_id$"))
             .expect("concrete descriptor-id reader");
-        assert!(command_id
+        assert!(
+            command_id
             .blocks
             .iter()
             .flat_map(|block| &block.stmts)
@@ -16601,7 +19711,8 @@ fn main() -> i32 {
                     statement,
                     Stmt::Let(_, Rvalue::StaticDescriptorView { offset: 16, .. })
                 )
-            }));
+                })
+        );
 
         let mut malformed = hir.clone();
         let query_meta = malformed
@@ -16668,7 +19779,10 @@ fn main() -> i32 {
                 }
             }
         }
-        assert!(flipped, "fixture must contain a direct element-field view binding");
+        assert!(
+            flipped,
+            "fixture must contain a direct element-field view binding"
+        );
         assert!(
             !validate_hir::body_only_metadata_is_valid(&claimed_owned),
             "an element-field read typed as the owned string must fail before MIR lowering",
@@ -16808,11 +19922,11 @@ fn main() -> i32 {
             ("pkg.db.internal.descriptor", false, descriptor),
             ("main", true, main),
         ]);
-        assert!(diagnostics.iter().any(|diagnostic| {
-            diagnostic
-                .message
-                .contains("compiler-private to `pkg.db`")
-        }));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.message.contains("compiler-private to `pkg.db`") })
+        );
     }
 
     #[test]
@@ -17217,7 +20331,11 @@ fn main() -> i32 = 0
         let p = lower("fn main() -> i32 {\n  x := 1\n  return x\n}\n");
         let f = &p.fns[0];
         // entry stores the literal into x's slot; a later block returns the loaded value.
-        assert!(f.blocks.iter().any(|b| matches!(b.term, Term::Return(Some(_)))));
+        assert!(
+            f.blocks
+                .iter()
+                .any(|b| matches!(b.term, Term::Return(Some(_))))
+        );
     }
 
     #[test]
@@ -17267,10 +20385,9 @@ fn main() -> i32 {
                 .blocks
                 .iter()
                 .find(|block| {
-                    block
-                        .stmts
-                        .iter()
-                        .any(|statement| matches!(statement, Stmt::Let(value, _) if value == &capture))
+                    block.stmts.iter().any(
+                        |statement| matches!(statement, Stmt::Let(value, _) if value == &capture),
+                    )
                 })
                 .map(|block| block.id)
                 .expect("capture definition");
@@ -17341,10 +20458,10 @@ fn main() -> i32 {
             .find(|function| function.name.as_str() == "main")
             .expect("owned-source main");
         assert!(
-            owned_main
-                .blocks
+            owned_main.blocks.iter().any(|block| block
+                .stmts
                 .iter()
-                .any(|block| block.stmts.iter().any(|statement| matches!(statement, Stmt::Drop(_)))),
+                .any(|statement| matches!(statement, Stmt::Drop(_)))),
             "a completed owned source must be cleaned when a later init terminates: {owned_main:#?}"
         );
     }
@@ -17411,10 +20528,9 @@ fn main() -> i32 = 0
                 .blocks
                 .iter()
                 .find(|block| {
-                    block
-                        .stmts
-                        .iter()
-                        .any(|statement| matches!(statement, Stmt::Let(value, _) if value == &capture))
+                    block.stmts.iter().any(
+                        |statement| matches!(statement, Stmt::Let(value, _) if value == &capture),
+                    )
                 })
                 .map(|block| block.id)
                 .expect("capture definition");
@@ -17429,7 +20545,11 @@ fn main() -> i32 = 0
             .find(|function| function.name.as_str() == "selected")
             .expect("selected function");
         assert!(
-            selected.blocks.iter().filter(|block| block.id != selected.entry).all(|block| {
+            selected
+                .blocks
+                .iter()
+                .filter(|block| block.id != selected.entry)
+                .all(|block| {
                 block.stmts.iter().all(|statement| {
                     !matches!(statement, Stmt::DropFlagInit(slot) if *slot == 1 || *slot == 2)
                 })
@@ -17459,9 +20579,9 @@ fn bad() -> i32 {
         let file = parse_file(tokens, &mut diagnostics);
         let mut hir = check_file(&file, &mut diagnostics);
         assert!(
-            diagnostics.iter().any(|diagnostic| diagnostic.message.contains(
-                "`break` outside of a `loop`"
-            )),
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("`break` outside of a `loop`")),
             "the malformed-HIR fixture must contain a rejected checked break"
         );
 
@@ -17483,9 +20603,7 @@ fn bad() -> i32 {
             "a rejected checked break must terminate with Unreachable"
         );
         assert!(
-            bad.blocks
-                .iter()
-                .all(|block| block.stmts.is_empty()),
+            bad.blocks.iter().all(|block| block.stmts.is_empty()),
             "the rejected payload and following print/return must emit no MIR statements, stores, nulling, drops, cleanup, calls, or exit edges: {bad:#?}"
         );
         assert_eq!(
@@ -17587,12 +20705,14 @@ fn main() -> i32 = 0
                 .find(|function| function.name.as_str() == name)
                 .unwrap_or_else(|| panic!("{name} function"));
             assert!(
-                function.blocks.iter().flat_map(|block| &block.stmts).all(
-                    |statement| !matches!(
+                function
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.stmts)
+                    .all(|statement| !matches!(
                         statement,
                         Stmt::Store(_, Operand::Const(Const::Unit))
-                    )
-                ),
+                    )),
                 "{name} must not store a placeholder Unit after its payload terminated: {function:#?}"
             );
         }
@@ -17697,10 +20817,7 @@ fn main() -> i32 = 0
                 .find(|function| function.name.as_str() == name)
                 .unwrap_or_else(|| panic!("{name} function"));
             assert!(
-                function
-                    .blocks
-                    .iter()
-                    .any(|block| matches!(
+                function.blocks.iter().any(|block| matches!(
                         block.term,
                         Term::Return(Some(_)) | Term::ReturnWithCleanup(_)
                     )),
@@ -17712,7 +20829,8 @@ fn main() -> i32 = 0
     #[test]
     fn nested_tagged_ids_are_canonical_across_declaration_order() {
         let prefix = "Output { text: string }\nDbError { Decode(string) }\n";
-        let output = "fn output() -> Result<Option<Output>, DbError> = Err(DbError.Decode(\"x\".clone()))\n";
+        let output =
+            "fn output() -> Result<Option<Output>, DbError> = Err(DbError.Decode(\"x\".clone()))\n";
         let number = "fn number() -> Result<Option<i64>, DbError> = Ok(Some(1))\n";
         let suffix = "fn main() -> i32 = 0\n";
         let first = lower(&format!("{prefix}{output}{number}{suffix}"));
@@ -17807,12 +20925,7 @@ fn main() -> i32 = 0
             )],
             "the embedded closure ABI Result must survive while the unused generic template is omitted"
         );
-        let Stmt::Let(
-            _,
-            Rvalue::Closure {
-                capture_tys, ..
-            },
-        ) = &program.fns[0].blocks[0].stmts[0]
+        let Stmt::Let(_, Rvalue::Closure { capture_tys, .. }) = &program.fns[0].blocks[0].stmts[0]
         else {
             panic!("expected the closure fixture");
         };
@@ -17833,7 +20946,11 @@ fn main() -> i32 = 0
             "import std.process\nChoice { A, B }\nfn tail() -> i64 = 11\nfn explicit() -> i64 { return 12 }\nfn branch(flag: bool) -> i64 { if flag { return 13 } else { return 14 } }\nfn selected(value: Choice) -> i64 { result := match value { A => { return 15 } B => 16 }\nreturn result\n}\nfn loop_value() -> i64 = loop { break 17 }\nfn endless() -> i64 { loop {} }\nfn exits() -> i64 { process.exit(18)\n}\nfn aborts() -> i64 { process.abort()\n}\nfn unwrapped(value: Option<i64>) -> i64 { x := value else { return 20 }\nreturn x\n}\nfn tried(value: Result<i64, Error>) -> Result<i64, Error> { x := value?\nreturn Ok(x)\n}\nfn arena_return() -> i64 { arena { return 21 } }\nfn unsafe_return() -> i64 { unsafe { return 22 } }\nfn group_return() -> i64 { task_group { return 23 } }\nfn moved() -> string = \"owned\".clone()\nfn dead_tail() -> i64 { return 24\nprint(25)\n}\nfn main() -> i32 = 0\n",
         );
 
-        for function in program.fns.iter().filter(|function| function.ret != Ty::Unit) {
+        for function in program
+            .fns
+            .iter()
+            .filter(|function| function.ret != Ty::Unit)
+        {
             assert!(
                 function
                     .blocks
@@ -17845,17 +20962,28 @@ fn main() -> i32 = 0
                 print::function_to_string(function)
             );
         }
-        for name in ["tail", "explicit", "branch", "selected", "loop_value", "unwrapped", "tried", "arena_return", "unsafe_return", "group_return", "moved", "dead_tail", "main"] {
+        for name in [
+            "tail",
+            "explicit",
+            "branch",
+            "selected",
+            "loop_value",
+            "unwrapped",
+            "tried",
+            "arena_return",
+            "unsafe_return",
+            "group_return",
+            "moved",
+            "dead_tail",
+            "main",
+        ] {
             let function = program
                 .fns
                 .iter()
                 .find(|function| function.name.as_str() == name)
                 .unwrap_or_else(|| panic!("missing {name}"));
             assert!(
-                function
-                    .blocks
-                    .iter()
-                    .any(|block| {
+                function.blocks.iter().any(|block| {
                         matches!(
                             block.term,
                             Term::Return(Some(_)) | Term::ReturnWithCleanup(_)
@@ -17888,7 +21016,10 @@ fn main() -> i32 = 0
             "import core.json\nS { secret_field: i64 }\nfn main() -> Result<(), Error> {\n  s: S := json.decode(\"{}\")?\n  print(s.secret_field)\n  return Ok(())\n}\n",
         );
         let human = print::program_to_string(&p);
-        assert!(human.contains("json_decode(struct#0,"), "decode MIR must retain the target id:\n{human}");
+        assert!(
+            human.contains("json_decode(struct#0,"),
+            "decode MIR must retain the target id:\n{human}"
+        );
         assert!(
             !human.contains("secret_field"),
             "the human function view must not duplicate the target schema:\n{human}"
@@ -17904,7 +21035,11 @@ fn main() -> i32 = 0
         let p = lower(
             "fn u() {}\nfn take(x: ()) {}\nfn tail() { return u() }\nfn main() -> i32 {\n  a := u()\n  f := u\n  b := f()\n  empty := {}\n  looped := loop { break u() }\n  take(u())\n  take(empty)\n  take(looped)\n  tail()\n  return 0\n}\n",
         );
-        let main = p.fns.iter().find(|f| f.name.as_str() == "main").expect("main MIR");
+        let main = p
+            .fns
+            .iter()
+            .find(|f| f.name.as_str() == "main")
+            .expect("main MIR");
         let stmts: Vec<&Stmt> = main.blocks.iter().flat_map(|b| &b.stmts).collect();
         assert!(
             stmts.iter().any(|s| matches!(s, Stmt::Let(_, Rvalue::Call(name, _)) if direct_program_name(name) == Some("u"))),
@@ -17912,7 +21047,16 @@ fn main() -> i32 = 0
             print::function_to_string(main)
         );
         assert!(
-            stmts.iter().any(|s| matches!(s, Stmt::Let(_, Rvalue::CallIndirect { ret_ty: Ty::Unit, .. }))),
+            stmts.iter().any(|s| matches!(
+                s,
+                Stmt::Let(
+                    _,
+                    Rvalue::CallIndirect {
+                        ret_ty: Ty::Unit,
+                        ..
+                    }
+                )
+            )),
             "the indirect Unit call must remain for its effects:\n{}",
             print::function_to_string(main)
         );
@@ -17934,9 +21078,15 @@ fn main() -> i32 = 0
             "a Unit call argument must be Const::Unit:\n{}",
             print::function_to_string(main)
         );
-        let tail = p.fns.iter().find(|f| f.name.as_str() == "tail").expect("tail MIR");
+        let tail = p
+            .fns
+            .iter()
+            .find(|f| f.name.as_str() == "tail")
+            .expect("tail MIR");
         assert!(
-            tail.blocks.iter().any(|b| matches!(b.term, Term::Return(None))),
+            tail.blocks
+                .iter()
+                .any(|b| matches!(b.term, Term::Return(None))),
             "an explicit Unit return must keep the void ABI:\n{}",
             print::function_to_string(tail)
         );
@@ -17947,14 +21097,23 @@ fn main() -> i32 = 0
         let p = lower(
             "import std.process\nfn quit() {\n  s := \"x\".clone()\n  return process.abort()\n}\nfn main() -> i32 = 0\n",
         );
-        let quit = p.fns.iter().find(|f| f.name.as_str() == "quit").expect("quit MIR");
+        let quit = p
+            .fns
+            .iter()
+            .find(|f| f.name.as_str() == "quit")
+            .expect("quit MIR");
         assert!(
-            quit.blocks.iter().any(|b| matches!(b.term, Term::Unreachable)),
+            quit.blocks
+                .iter()
+                .any(|b| matches!(b.term, Term::Unreachable)),
             "process.abort must retain its diverging terminator:\n{}",
             print::function_to_string(quit)
         );
         assert!(
-            quit.blocks.iter().flat_map(|b| &b.stmts).all(|s| !matches!(s, Stmt::Drop(_))),
+            quit.blocks
+                .iter()
+                .flat_map(|b| &b.stmts)
+                .all(|s| !matches!(s, Stmt::Drop(_))),
             "process.abort must not gain return cleanup after it terminates:\n{}",
             print::function_to_string(quit)
         );
@@ -17972,12 +21131,15 @@ fn main() -> i32 = 0
             "partial_tuple",
             "partial_struct",
         ] {
-            let f = p.fns.iter().find(|f| f.name.as_str() == name).expect("call test MIR");
-            assert!(
-                f.blocks
+            let f = p
+                .fns
                     .iter()
-                    .flat_map(|b| &b.stmts)
-                    .any(|s| matches!(s, Stmt::Drop(slot) if f.slots[*slot as usize] == Ty::String)),
+                .find(|f| f.name.as_str() == name)
+                .expect("call test MIR");
+            assert!(
+                f.blocks.iter().flat_map(|b| &b.stmts).any(
+                    |s| matches!(s, Stmt::Drop(slot) if f.slots[*slot as usize] == Ty::String)
+                ),
                 "{name} must drop the earlier fresh string when a later argument returns:\n{}",
                 print::function_to_string(f)
             );
@@ -17993,12 +21155,2875 @@ fn main() -> i32 = 0
     }
 
     #[test]
+    fn staged_storage_generation_actions_follow_cleanup_boundaries() {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Shape {
+            Direct,
+            Aggregate,
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum First {
+            Bound,
+            Fresh,
+            Wrapped,
+    }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Completion {
+            Return,
+            Try,
+            Exit,
+            Abort,
+            Loop,
+            Success,
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum CallKind {
+            Program(&'static str),
+            Indirect,
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        struct Case {
+            name: &'static str,
+            shape: Shape,
+            first: First,
+            completion: Completion,
+            call: CallKind,
+        }
+
+        #[derive(Clone, Debug)]
+        struct OwnerState {
+            owner: Slot,
+            flag: Slot,
+            store: (BlockId, usize),
+            value: ValueId,
+            live: ValueId,
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        struct CleanupEdge {
+            guard_load: (BlockId, usize),
+            drop: BlockId,
+            next: BlockId,
+        }
+
+        fn function<'a>(program: &'a Program, name: &str) -> &'a Function {
+            program
+                .fns
+                .iter()
+                .find(|function| function.name.as_str() == name)
+                .unwrap_or_else(|| panic!("missing {name} MIR"))
+        }
+
+        fn outer_call_args(statement: &Stmt, call: CallKind) -> Option<&[Operand]> {
+            match (call, statement) {
+                (CallKind::Program(expected), Stmt::Let(_, Rvalue::Call(callee, args)))
+                    if direct_program_name(callee) == Some(expected) =>
+                {
+                    Some(args)
+                }
+                (CallKind::Program(expected), Stmt::Let(_, Rvalue::CallWithCleanup(site)))
+                    if site.target.as_str() == expected =>
+                {
+                    Some(&site.args)
+                }
+                (CallKind::Indirect, Stmt::Let(_, Rvalue::CallIndirect { args, .. })) => Some(args),
+                (CallKind::Indirect, Stmt::Let(_, Rvalue::CallIndirectWithCleanup(site))) => {
+                    Some(&site.args)
+                }
+                _ => None,
+            }
+        }
+
+        fn is_outer_call(statement: &Stmt, call: CallKind) -> bool {
+            outer_call_args(statement, call).is_some()
+        }
+
+        fn locations(
+            function: &Function,
+            predicate: impl Fn(&Stmt) -> bool,
+        ) -> Vec<(BlockId, usize)> {
+            function
+                .blocks
+                .iter()
+                .flat_map(|block| {
+                    block
+                        .stmts
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, statement)| {
+                            predicate(statement).then_some((block.id, index))
+                        })
+                })
+                .collect()
+        }
+
+        fn reachable_from(function: &Function, start: BlockId) -> Vec<bool> {
+            reachable_avoiding(function, start, None)
+        }
+
+        fn reachable_avoiding(
+            function: &Function,
+            start: BlockId,
+            avoided: Option<BlockId>,
+        ) -> Vec<bool> {
+            let mut reached = vec![false; function.blocks.len()];
+            let mut pending = vec![start];
+            while let Some(block) = pending.pop() {
+                if avoided == Some(block) {
+                    continue;
+                }
+                if std::mem::replace(&mut reached[block as usize], true) {
+                    continue;
+                }
+                match function.blocks[block as usize].term {
+                    Term::Goto(target) => pending.push(target),
+                    Term::Branch(_, then_block, else_block) => {
+                        pending.push(then_block);
+                        pending.push(else_block);
+                    }
+                    Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => {}
+                }
+            }
+            reached
+        }
+
+        fn block_dominates(function: &Function, dominator: BlockId, target: BlockId) -> bool {
+            let reachable = reachable_from(function, function.entry);
+            if !reachable[dominator as usize] || !reachable[target as usize] {
+                return false;
+            }
+            if dominator == target {
+                return true;
+            }
+            !reachable_avoiding(function, function.entry, Some(dominator))[target as usize]
+        }
+
+        fn block_inevitably_reaches(function: &Function, start: BlockId, target: BlockId) -> bool {
+            let mut inevitable = vec![false; function.blocks.len()];
+            inevitable[target as usize] = true;
+            loop {
+                let mut changed = false;
+                for block in function.blocks.iter().rev() {
+                    if inevitable[block.id as usize] {
+                        continue;
+                    }
+                    let reaches = match block.term {
+                        Term::Goto(next) => inevitable[next as usize],
+                        Term::Branch(_, then_block, else_block) => {
+                            inevitable[then_block as usize] && inevitable[else_block as usize]
+                        }
+                        Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => false,
+                    };
+                    if reaches {
+                        inevitable[block.id as usize] = true;
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            inevitable[start as usize]
+        }
+
+        fn location_precedes(
+            function: &Function,
+            before: (BlockId, usize),
+            after: (BlockId, usize),
+        ) -> bool {
+            if before.0 == after.0 {
+                before.1 < after.1
+            } else {
+                block_dominates(function, before.0, after.0)
+            }
+        }
+
+        fn location_inevitably_reaches(
+            function: &Function,
+            before: (BlockId, usize),
+            after: (BlockId, usize),
+        ) -> bool {
+            if before.0 == after.0 {
+                before.1 < after.1
+            } else {
+                block_inevitably_reaches(function, before.0, after.0)
+            }
+        }
+
+        fn value_definition(function: &Function, value: ValueId) -> (BlockId, usize, &Rvalue) {
+            let mut found = None;
+            for block in &function.blocks {
+                for (index, statement) in block.stmts.iter().enumerate() {
+                    if let Stmt::Let(defined, rvalue) = statement
+                        && *defined == value
+                    {
+                        assert!(
+                            found.is_none(),
+                            "v{value} has more than one MIR definition:\n{}",
+                            print::function_to_string(function)
+                        );
+                        found = Some((block.id, index, rvalue));
+                    }
+                }
+            }
+            found.unwrap_or_else(|| {
+                panic!(
+                    "v{value} has no MIR definition:\n{}",
+                    print::function_to_string(function)
+                )
+            })
+        }
+
+        fn string_owner_state(function: &Function) -> OwnerState {
+            let mut owners = locations(function, |statement| {
+                matches!(
+                    statement,
+                    Stmt::DropFlagInit(slot) if function.slots[*slot as usize] == Ty::String
+                )
+            })
+            .into_iter()
+            .filter_map(
+                |(block, index)| match function.blocks[block as usize].stmts[index] {
+                    Stmt::DropFlagInit(slot) => Some(slot),
+                    _ => None,
+                },
+            )
+            .collect::<Vec<_>>();
+            owners.sort_unstable();
+            owners.dedup();
+            assert_eq!(
+                owners.len(),
+                1,
+                "fixture must expose one completed string owner:\n{}",
+                print::function_to_string(function)
+            );
+            let owner = owners[0];
+
+            let mut flags = function
+                .blocks
+                .iter()
+                .flat_map(|block| block.stmts.windows(2))
+                .filter_map(|pair| match pair {
+                    [
+                        Stmt::DropFlagInit(initialized),
+                        Stmt::Store(flag, Operand::Const(Const::Bool(false))),
+                    ] if *initialized == owner && function.slots[*flag as usize] == Ty::Bool => {
+                        Some(*flag)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            flags.sort_unstable();
+            flags.dedup();
+            assert_eq!(
+                flags.len(),
+                1,
+                "completed owner must have one exact initialized cleanup bit:\n{}",
+                print::function_to_string(function)
+            );
+            let flag = flags[0];
+
+            let owner_inits = locations(
+                function,
+                |statement| matches!(statement, Stmt::DropFlagInit(slot) if *slot == owner),
+            );
+            for &(block, index) in &owner_inits {
+                assert!(
+                    matches!(
+                        function.blocks[block as usize].stmts.get(index + 1),
+                        Some(Stmt::Store(slot, Operand::Const(Const::Bool(false))))
+                            if *slot == flag
+                    ),
+                    "every owner initialization must clear its exact cleanup bit:\n{}",
+                    print::function_to_string(function)
+                );
+            }
+
+            let staged = function
+                .blocks
+                .iter()
+                .flat_map(|block| {
+                    block
+                        .stmts
+                        .windows(2)
+                        .enumerate()
+                        .filter_map(move |(index, pair)| match pair {
+                            [
+                                Stmt::Store(stored, Operand::Value(value)),
+                                Stmt::Store(stored_flag, Operand::Value(live)),
+                            ] if *stored == owner && *stored_flag == flag => {
+                                Some((block.id, index, *value, *live))
+                            }
+                            _ => None,
+                        })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                staged.len(),
+                1,
+                "completed owner must have one exact value/cleanup-bit staging pair:\n{}",
+                print::function_to_string(function)
+            );
+            let (block, index, value, live) = staged[0];
+            OwnerState {
+                owner,
+                flag,
+                store: (block, index),
+                value,
+                live,
+            }
+        }
+
+        fn assert_staged_provenance(function: &Function, state: &OwnerState, first: First) {
+            let rendered = print::function_to_string(function);
+            if first != First::Wrapped {
+                let (_, _, definition) = value_definition(function, state.value);
+                let Rvalue::CallWithCleanup(call) = definition else {
+                    panic!("staged value must come from one cleanup-carrying producer:\n{rendered}")
+                };
+                assert_eq!(
+                    state.live, call.cleanup,
+                    "staging must forward the producer's exact cleanup SSA value:\n{rendered}"
+                );
+                return;
+            }
+
+            let (joined_value_block, joined_value_index, joined_value_definition) =
+                value_definition(function, state.value);
+            let joined_value = (joined_value_block, joined_value_index);
+            let value_slot = match joined_value_definition {
+                Rvalue::Load(slot) => *slot,
+                _ => panic!("wrapped staging must load one joined value slot:\n{rendered}"),
+            };
+            let (joined_live_block, joined_live_index, joined_live_definition) =
+                value_definition(function, state.live);
+            let joined_live = (joined_live_block, joined_live_index);
+            let flag_slot = match joined_live_definition {
+                Rvalue::Load(slot) => *slot,
+                _ => panic!("wrapped staging must load one joined cleanup-bit slot:\n{rendered}"),
+            };
+            let arm_stores = locations(
+                function,
+                |statement| matches!(statement, Stmt::Store(slot, Operand::Value(_)) if *slot == value_slot),
+            );
+            assert_eq!(
+                arm_stores.len(),
+                2,
+                "wrapped staging must retain both value-producing arms:\n{rendered}"
+            );
+            assert_ne!(
+                arm_stores[0].0, arm_stores[1].0,
+                "wrapped staging arms must remain distinct CFG blocks:\n{rendered}"
+            );
+            for &(block, index) in &arm_stores {
+                let Stmt::Store(_, Operand::Value(arm_value)) =
+                    function.blocks[block as usize].stmts[index]
+                else {
+                    panic!("wrapped arm staging store must contain an SSA value:\n{rendered}")
+                };
+                let (_, _, definition) = value_definition(function, arm_value);
+                let Rvalue::CallWithCleanup(call) = definition else {
+                    panic!(
+                        "each wrapped arm must retain its cleanup-carrying producer:\n{rendered}"
+                    )
+                };
+                let arm_flag_stores = function.blocks[block as usize].stmts[..index]
+                    .iter()
+                    .filter(
+                        |statement| matches!(statement, Stmt::Store(slot, _) if *slot == flag_slot),
+                    )
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    arm_flag_stores.len(),
+                    1,
+                    "each wrapped arm must store its joined flag exactly once:\n{rendered}"
+                );
+                assert!(
+                    matches!(
+                        arm_flag_stores[0],
+                        Stmt::Store(_, Operand::Value(value)) if *value == call.cleanup
+                    ),
+                    "each wrapped arm must store its exact producer bit into the joined flag:\n{rendered}"
+                );
+                assert!(
+                    block_inevitably_reaches(function, block, joined_value.0)
+                        && block_inevitably_reaches(function, block, joined_live.0),
+                    "both wrapped arms must flow through the joined value and flag loads:\n{rendered}"
+                );
+            }
+            let flag_stores = locations(
+                function,
+                |statement| matches!(statement, Stmt::Store(slot, _) if *slot == flag_slot),
+            );
+            assert_eq!(
+                flag_stores.len(),
+                arm_stores.len(),
+                "wrapped staging must not overwrite its joined cleanup flag:\n{rendered}"
+            );
+            assert!(
+                location_precedes(function, joined_value, state.store)
+                    && location_precedes(function, joined_live, state.store),
+                "wrapped staging must load both joined components before arming its owner:\n{rendered}"
+            );
+            assert!(
+                function.blocks.iter().any(|block| {
+                    let Term::Branch(_, then_block, else_block) = block.term else {
+                        return false;
+                    };
+                    let then_reachable = reachable_from(function, then_block);
+                    let else_reachable = reachable_from(function, else_block);
+                    let left = arm_stores[0].0 as usize;
+                    let right = arm_stores[1].0 as usize;
+                    (then_reachable[left]
+                        && !else_reachable[left]
+                        && else_reachable[right]
+                        && !then_reachable[right])
+                        || (then_reachable[right]
+                            && !else_reachable[right]
+                            && else_reachable[left]
+                            && !then_reachable[left])
+                }),
+                "wrapped staging must join two mutually exclusive producer arms:\n{rendered}"
+            );
+        }
+
+        fn cleanup_edge(
+            function: &Function,
+            owner: Slot,
+            flag: Slot,
+            drop: (BlockId, usize),
+        ) -> CleanupEdge {
+            let rendered = print::function_to_string(function);
+            let drop_block = &function.blocks[drop.0 as usize];
+            assert_eq!(
+                drop.1, 0,
+                "cleanup Drop must start its true-edge block:\n{rendered}"
+            );
+            assert_eq!(
+                drop_block.stmts.len(),
+                2,
+                "cleanup Drop block must contain only Drop and its exact flag clear:\n{rendered}"
+            );
+            assert!(
+                matches!(drop_block.stmts[0], Stmt::Drop(slot) if slot == owner)
+                    && matches!(
+                        drop_block.stmts[1],
+                        Stmt::Store(slot, Operand::Const(Const::Bool(false))) if slot == flag
+                    ),
+                "cleanup must Drop the staged owner and clear the same flag:\n{rendered}"
+            );
+            let Term::Goto(next) = drop_block.term else {
+                panic!("cleanup Drop edge must rejoin its false edge:\n{rendered}")
+            };
+            let predecessors = function
+                .blocks
+                .iter()
+                .filter(|block| match block.term {
+                    Term::Goto(target) => target == drop.0,
+                    Term::Branch(_, then_block, else_block) => {
+                        then_block == drop.0 || else_block == drop.0
+                    }
+                    Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => false,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                predecessors.len(),
+                1,
+                "cleanup Drop must have one exact flag-guard predecessor:\n{rendered}"
+            );
+            let guard = predecessors[0];
+            let Some((guard_index, Stmt::Let(live, Rvalue::Load(loaded_flag)))) =
+                guard.stmts.iter().enumerate().next_back()
+            else {
+                panic!("cleanup guard must end in an exact flag load:\n{rendered}")
+            };
+            assert_eq!(
+                *loaded_flag, flag,
+                "cleanup guard must load the staged owner's exact flag:\n{rendered}"
+            );
+            match guard.term {
+                Term::Branch(Operand::Value(condition), then_block, else_block) => {
+                    assert_eq!(
+                        condition, *live,
+                        "cleanup branch must use the exact loaded flag value:\n{rendered}"
+                    );
+                    assert_eq!(
+                        then_block, drop.0,
+                        "cleanup flag's true edge must enter Drop(owner):\n{rendered}"
+                    );
+                    assert_eq!(
+                        else_block, next,
+                        "cleanup flag's false edge must rejoin after Drop(owner):\n{rendered}"
+                    );
+                }
+                Term::Goto(target) => {
+                    assert_eq!(
+                        target, drop.0,
+                        "a simplified known-live guard must enter Drop(owner):\n{rendered}"
+                    );
+                }
+                Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => {
+                    panic!("cleanup guard must lead to its Drop edge:\n{rendered}")
+                }
+                Term::Branch(_, _, _) => {
+                    panic!("cleanup guard must branch on an SSA flag value:\n{rendered}")
+                }
+            }
+            CleanupEdge {
+                guard_load: (guard.id, guard_index),
+                drop: drop.0,
+                next,
+            }
+        }
+
+        fn exact_bound_source_load(
+            function: &Function,
+            owner: Slot,
+        ) -> ((BlockId, usize), ValueId) {
+            let rendered = print::function_to_string(function);
+            let loads = function
+                .blocks
+                .iter()
+                .flat_map(|block| {
+                    block
+                        .stmts
+                        .iter()
+                        .enumerate()
+                        .filter_map(move |(index, statement)| match statement {
+                            Stmt::Let(value, Rvalue::Load(slot)) if *slot == owner => {
+                                Some(((block.id, index), *value))
+                            }
+                            _ => None,
+                        })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                loads.len(),
+                1,
+                "a bound storage operand must be read exactly once before its parent action:\n{rendered}"
+            );
+            loads[0]
+        }
+
+        fn exact_aggregate_slot(function: &Function) -> Slot {
+            let rendered = print::function_to_string(function);
+            let slots = function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .filter_map(|statement| match statement {
+                    Stmt::StoreField(slot, _, _)
+                        if matches!(function.slots[*slot as usize], Ty::Struct(_)) =>
+                    {
+                        Some(*slot)
+                    }
+                    _ => None,
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                slots.len(),
+                1,
+                "an aggregate fixture must stage exactly one struct slot:\n{rendered}"
+            );
+            let Some(slot) = slots.iter().next() else {
+                panic!("aggregate slot count was checked above:\n{rendered}")
+            };
+            *slot
+        }
+
+        fn aggregate_field_stores(
+            function: &Function,
+            slot: Slot,
+            field: u32,
+        ) -> Vec<(BlockId, usize)> {
+            locations(function, |statement| {
+                matches!(
+                    statement,
+                    Stmt::StoreField(stored, path, _)
+                        if *stored == slot && path.as_slice() == [field]
+                )
+            })
+        }
+
+        fn aggregate_materializations(
+            function: &Function,
+            slot: Slot,
+        ) -> Vec<((BlockId, usize), ValueId)> {
+            function
+                .blocks
+                .iter()
+                .flat_map(|block| {
+                    block
+                        .stmts
+                        .iter()
+                        .enumerate()
+                        .filter_map(move |(index, statement)| match statement {
+                            Stmt::Let(value, Rvalue::Load(loaded)) if *loaded == slot => {
+                                Some(((block.id, index), *value))
+                            }
+                            _ => None,
+                        })
+                })
+                .collect()
+        }
+
+        fn exact_mapped_status_error(function: &Function, status: ValueId) -> ValueId {
+            let rendered = print::function_to_string(function);
+            let errors = function
+                .blocks
+                .iter()
+                .flat_map(|block| {
+                    block.stmts.iter().filter_map(|statement| match statement {
+                        Stmt::Let(
+                            error,
+                            Rvalue::MakeError {
+                                tag: Operand::Value(tag),
+                                code: Operand::Value(code),
+                                ..
+                            },
+                        ) => Some((*error, *tag, *code)),
+                        _ => None,
+                    })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                errors.len(),
+                1,
+                "process.exec failure must construct one exact mapped Error:\n{rendered}"
+            );
+            let (error, tag, code) = errors[0];
+
+            let (_, _, tag_definition) = value_definition(function, tag);
+            let Rvalue::Select {
+                cond: Operand::Value(tag_condition),
+                a:
+                    Operand::Const(Const::Int(
+                        4,
+                        Ty::Int(IntTy {
+                            bits: 32,
+                            signed: true,
+                        }),
+                    )),
+                b: Operand::Value(status_minus_one),
+            } = tag_definition
+            else {
+                panic!("mapped Error tag must clamp status - 1 to four:\n{rendered}")
+            };
+            let (_, _, status_minus_one_definition) = value_definition(function, *status_minus_one);
+            assert!(
+                matches!(
+                    status_minus_one_definition,
+                    Rvalue::Bin(
+                        BinOp::Sub,
+                        Operand::Value(source),
+                        Operand::Const(Const::Int(
+                            1,
+                            Ty::Int(IntTy { bits: 32, signed: true })
+                        ))
+                    ) if *source == status
+                ),
+                "mapped Error tag must derive from the exact process.exec status:\n{rendered}"
+            );
+            let (_, _, tag_condition_definition) = value_definition(function, *tag_condition);
+            assert!(
+                matches!(
+                    tag_condition_definition,
+                    Rvalue::Bin(
+                        BinOp::Ge,
+                        Operand::Value(value),
+                        Operand::Const(Const::Int(
+                            4,
+                            Ty::Int(IntTy { bits: 32, signed: true })
+                        ))
+                    ) if *value == *status_minus_one
+                ),
+                "mapped Error tag clamp must test the exact status - 1 value:\n{rendered}"
+            );
+
+            let (_, _, code_definition) = value_definition(function, code);
+            let Rvalue::Select {
+                cond: Operand::Value(code_condition),
+                a: Operand::Value(status_minus_five),
+                b:
+                    Operand::Const(Const::Int(
+                        0,
+                        Ty::Int(IntTy {
+                            bits: 32,
+                            signed: true,
+                        }),
+                    )),
+            } = code_definition
+            else {
+                panic!("mapped Error code must clamp status - 5 to zero:\n{rendered}")
+            };
+            let (_, _, status_minus_five_definition) =
+                value_definition(function, *status_minus_five);
+            assert!(
+                matches!(
+                    status_minus_five_definition,
+                    Rvalue::Bin(
+                        BinOp::Sub,
+                        Operand::Value(source),
+                        Operand::Const(Const::Int(
+                            5,
+                            Ty::Int(IntTy { bits: 32, signed: true })
+                        ))
+                    ) if *source == status
+                ),
+                "mapped Error code must derive from the exact process.exec status:\n{rendered}"
+            );
+            let (_, _, code_condition_definition) = value_definition(function, *code_condition);
+            assert!(
+                matches!(
+                    code_condition_definition,
+                    Rvalue::Bin(
+                        BinOp::Ge,
+                        Operand::Value(value),
+                        Operand::Const(Const::Int(
+                            0,
+                            Ty::Int(IntTy { bits: 32, signed: true })
+                        ))
+                    ) if *value == *status_minus_five
+                ),
+                "mapped Error code clamp must test the exact status - 5 value:\n{rendered}"
+            );
+            error
+        }
+
+        fn inspect(function: &Function, case: Case) {
+            #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+            enum Clear {
+                Entry,
+                Cleanup,
+                Action,
+            }
+
+            let rendered = print::function_to_string(function);
+            let state = string_owner_state(function);
+            assert_staged_provenance(function, &state, case.first);
+            assert!(
+                reachable_from(function, function.entry)[state.store.0 as usize],
+                "{} must stage its first completed operand on an entry-reachable path:\n{rendered}",
+                case.name
+            );
+            let (owner, flag) = (state.owner, state.flag);
+            let outer_calls = locations(function, |statement| is_outer_call(statement, case.call));
+            let owner_drops = locations(
+                function,
+                |statement| matches!(statement, Stmt::Drop(slot) if *slot == owner),
+            );
+            let cleanup_edges = owner_drops
+                .iter()
+                .copied()
+                .map(|drop| cleanup_edge(function, owner, flag, drop))
+                .collect::<Vec<_>>();
+            let owner_inits = locations(
+                function,
+                |statement| matches!(statement, Stmt::DropFlagInit(slot) if *slot == owner),
+            );
+            let armed = locations(function, |statement| {
+                matches!(
+                    statement,
+                    Stmt::Store(slot, operand)
+                        if *slot == flag
+                            && !matches!(operand, Operand::Const(Const::Bool(false)))
+                )
+            });
+            assert_eq!(
+                armed,
+                vec![(state.store.0, state.store.1 + 1)],
+                "{} must arm exactly one completed first-operand owner:\n{rendered}",
+                case.name
+            );
+            let arm = armed[0];
+            let bound_source = (case.first == First::Bound).then(|| {
+                let source = exact_bound_source_load(function, owner);
+                assert!(
+                    location_precedes(function, arm, source.0),
+                    "{} must make the bound source live before reading the exact parent operand:\n{rendered}",
+                    case.name
+                );
+                source
+            });
+
+            let false_stores = locations(function, |statement| {
+                matches!(
+                    statement,
+                    Stmt::Store(slot, Operand::Const(Const::Bool(false))) if *slot == flag
+                )
+            });
+            let classified_clears = false_stores
+                .iter()
+                .map(|&(block_id, index)| {
+                    let block = &function.blocks[block_id as usize];
+                    let entry = block_id == function.entry
+                        && (arm.0 != function.entry || index < arm.1);
+                    let cleanup = index > 0
+                        && matches!(block.stmts[index - 1], Stmt::Drop(slot) if slot == owner);
+                    let action = !entry
+                        && !cleanup
+                        && block.stmts[index + 1..]
+                            .iter()
+                            .any(|statement| is_outer_call(statement, case.call));
+                    match (entry, cleanup, action) {
+                        (true, false, false) => Clear::Entry,
+                        (false, true, false) => Clear::Cleanup,
+                        (false, false, true) => Clear::Action,
+                        _ => panic!(
+                            "{} has a flag clear outside entry, cleanup, or the successful action at bb{block_id}[{index}]:\n{rendered}",
+                            case.name
+                        ),
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                classified_clears
+                    .iter()
+                    .filter(|clear| **clear == Clear::Entry)
+                    .count(),
+                1,
+                "{} must start with exactly one inert staging owner:\n{rendered}",
+                case.name
+            );
+
+            let (expected_calls, expected_drops, expected_cleanup_clears, expected_action_clears) =
+                match case.completion {
+                    Completion::Return | Completion::Exit => (0, 1, 1, 0),
+                    Completion::Try => (1, 1, 1, 1),
+                    Completion::Abort | Completion::Loop => (0, 0, 0, 0),
+                    Completion::Success => (1, 0, 0, 1),
+                };
+            assert_eq!(
+                outer_calls.len(),
+                expected_calls,
+                "{} emitted the wrong number of parent call actions:\n{rendered}",
+                case.name
+            );
+            assert_eq!(
+                owner_drops.len(),
+                expected_drops,
+                "{} must have exactly the cleanup-boundary Drop sites:\n{rendered}",
+                case.name
+            );
+            assert_eq!(
+                classified_clears
+                    .iter()
+                    .filter(|clear| **clear == Clear::Cleanup)
+                    .count(),
+                expected_cleanup_clears,
+                "{} must clear staging only after its cleanup Drop:\n{rendered}",
+                case.name
+            );
+            for edge in &cleanup_edges {
+                assert!(
+                    location_precedes(function, arm, edge.guard_load),
+                    "{} must complete staging before entering its exact cleanup guard:\n{rendered}",
+                    case.name
+                );
+            }
+            assert_eq!(
+                classified_clears
+                    .iter()
+                    .filter(|clear| **clear == Clear::Action)
+                    .count(),
+                expected_action_clears,
+                "{} must clear staging exactly at a successful action:\n{rendered}",
+                case.name
+            );
+
+            let aggregate_slots = function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .filter_map(|statement| match statement {
+                    Stmt::StoreField(slot, _, _)
+                        if matches!(function.slots[*slot as usize], Ty::Struct(_)) =>
+                    {
+                        Some(*slot)
+                    }
+                    _ => None,
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+            let aggregate_results = locations(function, |statement| {
+                matches!(
+                    statement,
+                    Stmt::Let(_, Rvalue::Load(slot)) if aggregate_slots.contains(slot)
+                )
+            });
+            let aggregate_field_stores = locations(function, |statement| {
+                matches!(
+                    statement,
+                    Stmt::StoreField(slot, _, _) if aggregate_slots.contains(slot)
+                )
+            });
+            match case.shape {
+                Shape::Direct => {
+                    assert!(
+                        aggregate_slots.is_empty()
+                            && aggregate_results.is_empty()
+                            && aggregate_field_stores.is_empty(),
+                        "{} is a direct-call fixture, not an aggregate action:\n{rendered}",
+                        case.name
+                    );
+                }
+                Shape::Aggregate => {
+                    assert_eq!(
+                        aggregate_slots.len(),
+                        1,
+                        "{} must partially stage one struct aggregate:\n{rendered}",
+                        case.name
+                    );
+                    let expected_results = usize::from(matches!(
+                        case.completion,
+                        Completion::Try | Completion::Success
+                    ));
+                    assert_eq!(
+                        aggregate_results.len(),
+                        expected_results,
+                        "{} must materialize the parent aggregate only when every child succeeds:\n{rendered}",
+                        case.name
+                    );
+                    let first_fields = aggregate_field_stores
+                        .iter()
+                        .copied()
+                        .filter(|&(block, index)| {
+                            matches!(
+                                &function.blocks[block as usize].stmts[index],
+                                Stmt::StoreField(_, path, _) if path.as_slice() == [0]
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        first_fields.len(),
+                        1,
+                        "{} must stage the exact text field once:\n{rendered}",
+                        case.name
+                    );
+                    let first_field = first_fields[0];
+                    let Stmt::StoreField(_, _, Operand::Value(first_value)) =
+                        &function.blocks[first_field.0 as usize].stmts[first_field.1]
+                    else {
+                        panic!("aggregate text field must receive one SSA value:\n{rendered}")
+                    };
+                    if case.first == First::Bound {
+                        let Some((source_load, source_value)) = bound_source else {
+                            panic!("bound aggregate fixture lost its source identity:\n{rendered}")
+                        };
+                        assert_eq!(
+                            *first_value, source_value,
+                            "{} must install the exact bound-source SSA value in field zero:\n{rendered}",
+                            case.name
+                        );
+                        let (_, _, definition) = value_definition(function, *first_value);
+                        assert!(
+                            matches!(definition, Rvalue::Load(slot) if *slot == owner),
+                            "{} must stage the exact bound text owner in field zero:\n{rendered}",
+                            case.name
+                        );
+                        assert!(
+                            location_precedes(function, source_load, first_field),
+                            "{} must read the bound source before installing field zero:\n{rendered}",
+                            case.name
+                        );
+                    } else {
+                        assert_eq!(
+                            *first_value, state.value,
+                            "{} must stage the exact protected text value in field zero:\n{rendered}",
+                            case.name
+                        );
+                    }
+                    assert!(
+                        location_precedes(function, arm, first_field),
+                        "{} must arm the text owner before installing field zero:\n{rendered}",
+                        case.name
+                    );
+
+                    let second_fields = aggregate_field_stores
+                        .iter()
+                        .copied()
+                        .filter(|&(block, index)| {
+                            matches!(
+                                &function.blocks[block as usize].stmts[index],
+                                Stmt::StoreField(_, path, _) if path.as_slice() == [1]
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let expected_second = usize::from(matches!(
+                        case.completion,
+                        Completion::Try | Completion::Success
+                    ));
+                    assert_eq!(
+                        second_fields.len(),
+                        expected_second,
+                        "{} must install field one exactly when its later operand falls through:\n{rendered}",
+                        case.name
+                    );
+                    assert_eq!(
+                        aggregate_field_stores.len(),
+                        1 + expected_second,
+                        "{} must not write an unexpected aggregate field or path:\n{rendered}",
+                        case.name
+                    );
+                    if case.completion == Completion::Success {
+                        let second_field = second_fields[0];
+                        assert!(
+                            matches!(
+                                &function.blocks[second_field.0 as usize].stmts[second_field.1],
+                                Stmt::StoreField(
+                                    _,
+                                    _,
+                                    Operand::Const(Const::Int(
+                                        0,
+                                        Ty::Int(IntTy {
+                                            bits: 64,
+                                            signed: true
+                                        })
+                                    ))
+                                )
+                            ),
+                            "{} must install the exact successful field-one value:\n{rendered}",
+                            case.name
+                        );
+                    }
+                    if let Some(&aggregate_result) = aggregate_results.first() {
+                        assert!(
+                            aggregate_field_stores.iter().all(|&field| {
+                                location_precedes(function, field, aggregate_result)
+                            }),
+                            "{} must install every aggregate field before materialization:\n{rendered}",
+                            case.name
+                        );
+                    }
+                }
+            }
+
+            let expected_inits = if case.first == First::Bound
+                && matches!(case.completion, Completion::Try | Completion::Success)
+            {
+                2
+            } else {
+                1
+            };
+            assert_eq!(
+                owner_inits.len(),
+                expected_inits,
+                "{} must null a bound source only at the successful action:\n{rendered}",
+                case.name
+            );
+
+            if matches!(case.completion, Completion::Try | Completion::Success) {
+                let call = outer_calls[0];
+                let action_clears = false_stores
+                    .iter()
+                    .zip(&classified_clears)
+                    .filter_map(|(location, clear)| (*clear == Clear::Action).then_some(*location))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    action_clears.len(),
+                    1,
+                    "{} must expose one exact action clear:\n{rendered}",
+                    case.name
+                );
+                let action_clear = action_clears[0];
+                assert_eq!(
+                    action_clear.0, call.0,
+                    "{} action clear and call must share one falling-through block:\n{rendered}",
+                    case.name
+                );
+                assert_eq!(
+                    action_clear.1 + 1,
+                    call.1,
+                    "{} must clear staging immediately before its parent action:\n{rendered}",
+                    case.name
+                );
+                assert!(
+                    location_precedes(function, (state.store.0, state.store.1 + 1), action_clear),
+                    "{} must arm staging before its successful action clear:\n{rendered}",
+                    case.name
+                );
+                if case.completion == Completion::Success {
+                    assert!(
+                        location_inevitably_reaches(function, arm, action_clear),
+                        "{} must not bypass its successful parent action:\n{rendered}",
+                        case.name
+                    );
+                }
+                if case.first == First::Bound {
+                    assert!(
+                        owner_inits
+                            .iter()
+                            .filter(|&&(block, index)| {
+                                block == action_clear.0 && index + 1 == action_clear.1
+                            })
+                            .count()
+                            == 1,
+                        "{} must null the bound source immediately before clearing it at the call action:\n{rendered}",
+                        case.name
+                    );
+                } else {
+                    assert!(
+                        action_clear.1 == 0
+                            || !matches!(
+                                function.blocks[action_clear.0 as usize].stmts[action_clear.1 - 1],
+                                Stmt::DropFlagInit(slot) if slot == owner
+                            ),
+                        "{} must not invent bound-source nulling for a fresh staged value:\n{rendered}",
+                        case.name
+                    );
+                }
+
+                let call_statement = &function.blocks[call.0 as usize].stmts[call.1];
+                let args = outer_call_args(call_statement, case.call).unwrap_or_else(|| {
+                    panic!(
+                        "{} lost its exact outer call action:\n{rendered}",
+                        case.name
+                    )
+                });
+                assert_eq!(
+                    args.len(),
+                    2,
+                    "{} outer call must retain both completed arguments:\n{rendered}",
+                    case.name
+                );
+                if case.completion == Completion::Success || case.shape == Shape::Aggregate {
+                    assert!(
+                        matches!(args[1], Operand::Const(Const::Unit)),
+                        "{} outer call must retain the exact later Unit argument:\n{rendered}",
+                        case.name
+                    );
+                }
+                let Some(Operand::Value(first_argument)) = args.first() else {
+                    panic!(
+                        "{} outer call must receive one SSA first argument:\n{rendered}",
+                        case.name
+                    )
+                };
+                match case.shape {
+                    Shape::Direct if case.first == First::Bound => {
+                        let Some((_, source_value)) = bound_source else {
+                            panic!("bound direct fixture lost its source identity:\n{rendered}")
+                        };
+                        assert_eq!(
+                            *first_argument, source_value,
+                            "{} must pass the exact bound-source SSA value to its action:\n{rendered}",
+                            case.name
+                        );
+                        let (_, _, definition) = value_definition(function, *first_argument);
+                        assert!(
+                            matches!(definition, Rvalue::Load(slot) if *slot == owner),
+                            "{} must transfer the nulled bound owner as its first call argument:\n{rendered}",
+                            case.name
+                        );
+                    }
+                    Shape::Direct => {
+                        assert_eq!(
+                            *first_argument, state.value,
+                            "{} must transfer the exact value protected by its staging owner:\n{rendered}",
+                            case.name
+                        );
+                    }
+                    Shape::Aggregate => {
+                        assert_eq!(
+                            aggregate_results.len(),
+                            1,
+                            "{} must expose one completed aggregate action value:\n{rendered}",
+                            case.name
+                        );
+                        let aggregate_result = aggregate_results[0];
+                        let Stmt::Let(result, Rvalue::Load(slot)) =
+                            function.blocks[aggregate_result.0 as usize].stmts[aggregate_result.1]
+                        else {
+                            panic!(
+                                "aggregate action result must be an exact slot load:\n{rendered}"
+                            )
+                        };
+                        assert!(aggregate_slots.contains(&slot));
+                        assert_eq!(
+                            *first_argument, result,
+                            "{} must pass the exact completed aggregate to the outer call:\n{rendered}",
+                            case.name
+                        );
+                        assert!(
+                            location_precedes(function, aggregate_result, action_clear),
+                            "{} must materialize its aggregate before transferring its staged leaves:\n{rendered}",
+                            case.name
+                        );
+                    }
+                }
+            }
+
+            match case.completion {
+                Completion::Try => {
+                    let expected_callee = match case.shape {
+                        Shape::Direct => "fail_unit",
+                        Shape::Aggregate => "fail_i64",
+                    };
+                    let try_calls = locations(function, |statement| {
+                        matches!(
+                            statement,
+                            Stmt::Let(_, Rvalue::Call(callee, _))
+                                if direct_program_name(callee) == Some(expected_callee)
+                        )
+                    });
+                    assert_eq!(
+                        try_calls.len(),
+                        1,
+                        "{} must retain one exact fallible later operand:\n{rendered}",
+                        case.name
+                    );
+                    let try_call = try_calls[0];
+                    let Stmt::Let(try_result, Rvalue::Call(_, _)) =
+                        function.blocks[try_call.0 as usize].stmts[try_call.1]
+                    else {
+                        panic!("fallible operand location must contain its exact call:\n{rendered}")
+                    };
+                    if case.shape == Shape::Direct {
+                        let outer_call = outer_calls[0];
+                        let args = outer_call_args(
+                            &function.blocks[outer_call.0 as usize].stmts[outer_call.1],
+                            case.call,
+                        )
+                        .unwrap_or_else(|| {
+                            panic!("direct Try fixture lost its exact outer call:\n{rendered}")
+                        });
+                        let Some(Operand::Value(later_value)) = args.get(1) else {
+                            panic!(
+                                "direct Try call must receive its unwrapped later value:\n{rendered}"
+                            )
+                        };
+                        let (_, _, later_definition) = value_definition(function, *later_value);
+                        assert!(
+                            matches!(
+                                later_definition,
+                                Rvalue::ResultUnwrapOk(Operand::Value(value))
+                                    if *value == try_result
+                            ),
+                            "{} parent call must receive the exact Ok payload as argument one:\n{rendered}",
+                            case.name
+                        );
+                    }
+                    assert!(
+                        location_precedes(function, arm, try_call),
+                        "{} must stage its first operand before evaluating the fallible later operand:\n{rendered}",
+                        case.name
+                    );
+                    let discriminants = locations(function, |statement| {
+                        matches!(
+                            statement,
+                            Stmt::Let(_, Rvalue::ResultIsOk(Operand::Value(value)))
+                                if *value == try_result
+                        )
+                    });
+                    assert_eq!(
+                        discriminants.len(),
+                        1,
+                        "{} must branch on the exact later operand result:\n{rendered}",
+                        case.name
+                    );
+                    let discriminant = discriminants[0];
+                    assert!(
+                        location_precedes(function, try_call, discriminant),
+                        "{} must test its later operand only after that call completes:\n{rendered}",
+                        case.name
+                    );
+                    assert!(
+                        location_inevitably_reaches(function, arm, discriminant),
+                        "{} must not bypass evaluation of its fallible later operand:\n{rendered}",
+                        case.name
+                    );
+                    let Stmt::Let(condition, Rvalue::ResultIsOk(_)) =
+                        function.blocks[discriminant.0 as usize].stmts[discriminant.1]
+                    else {
+                        panic!("try discriminant location must contain ResultIsOk:\n{rendered}")
+                    };
+                    let Term::Branch(Operand::Value(branch_condition), ok, err) =
+                        function.blocks[discriminant.0 as usize].term
+                    else {
+                        panic!("try discriminant must drive an exact SSA branch:\n{rendered}")
+                    };
+                    assert_eq!(
+                        branch_condition, condition,
+                        "try branch must use the exact ResultIsOk value:\n{rendered}"
+                    );
+                    assert_eq!(
+                        cleanup_edges.len(),
+                        1,
+                        "{} must retain one propagated-Err cleanup guard:\n{rendered}",
+                        case.name
+                    );
+                    let cleanup = cleanup_edges[0];
+                    let ok_reachable = reachable_from(function, ok);
+                    let err_reachable = reachable_from(function, err);
+                    assert!(
+                        outer_calls
+                            .iter()
+                            .all(|(block, _)| ok_reachable[*block as usize]
+                                && !err_reachable[*block as usize]),
+                        "{} must publish no call action on the propagated-Err edge:\n{rendered}",
+                        case.name
+                    );
+                    assert!(
+                        block_dominates(function, ok, outer_calls[0].0)
+                            && block_inevitably_reaches(function, ok, outer_calls[0].0),
+                        "{} Ok edge must inevitably reach the parent call action:\n{rendered}",
+                        case.name
+                    );
+                    assert!(
+                        err_reachable[cleanup.guard_load.0 as usize]
+                            && !ok_reachable[cleanup.guard_load.0 as usize]
+                            && block_dominates(function, err, cleanup.guard_load.0)
+                            && block_inevitably_reaches(function, err, cleanup.guard_load.0),
+                        "{} Err edge must exclusively and inevitably reach the exact cleanup guard:\n{rendered}",
+                        case.name
+                    );
+                    if case.shape == Shape::Aggregate {
+                        let second_fields = aggregate_field_stores
+                            .iter()
+                            .copied()
+                            .filter(|&(block, index)| {
+                                matches!(
+                                    &function.blocks[block as usize].stmts[index],
+                                    Stmt::StoreField(_, path, _) if path.as_slice() == [1]
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(
+                            second_fields.len(),
+                            1,
+                            "{} Ok edge must install one exact aggregate field-one value:\n{rendered}",
+                            case.name
+                        );
+                        let second_field = second_fields[0];
+                        let Stmt::StoreField(_, _, Operand::Value(second_value)) =
+                            &function.blocks[second_field.0 as usize].stmts[second_field.1]
+                        else {
+                            panic!(
+                                "fallible aggregate field must receive one SSA value:\n{rendered}"
+                            )
+                        };
+                        let (_, _, second_definition) = value_definition(function, *second_value);
+                        assert!(
+                            matches!(
+                                second_definition,
+                                Rvalue::ResultUnwrapOk(Operand::Value(value))
+                                    if *value == try_result
+                            ),
+                            "{} field one must receive the exact Ok payload:\n{rendered}",
+                            case.name
+                        );
+                        assert!(
+                            ok_reachable[second_field.0 as usize]
+                                && !err_reachable[second_field.0 as usize]
+                                && block_inevitably_reaches(function, ok, second_field.0),
+                            "{} Ok edge must inevitably install field one before its action:\n{rendered}",
+                            case.name
+                        );
+                    }
+                    assert!(
+                        aggregate_results.iter().all(|(block, _)| {
+                            ok_reachable[*block as usize]
+                                && !err_reachable[*block as usize]
+                                && block_dominates(function, ok, *block)
+                        }),
+                        "{} must publish no aggregate result on the propagated-Err edge:\n{rendered}",
+                        case.name
+                    );
+                    let err_returns = function
+                        .blocks
+                        .iter()
+                        .filter(|block| {
+                            err_reachable[block.id as usize]
+                                && !ok_reachable[block.id as usize]
+                                && matches!(
+                                    block.term,
+                                    Term::Return(_) | Term::ReturnWithCleanup(_)
+                                )
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        err_returns.len(),
+                        1,
+                        "{} propagated-Err edge must retain one return sink:\n{rendered}",
+                        case.name
+                    );
+                    assert!(
+                        block_dominates(function, cleanup.guard_load.0, err_returns[0].id)
+                            && block_inevitably_reaches(
+                                function,
+                                cleanup.guard_load.0,
+                                err_returns[0].id,
+                            ),
+                        "{} exact cleanup guard must inevitably reach the propagated-Err return:\n{rendered}",
+                        case.name
+                    );
+                }
+                Completion::Exit => {
+                    let exits = locations(function, |statement| {
+                        matches!(
+                            statement,
+                            Stmt::Let(
+                                _,
+                                Rvalue::Call(DirectCall::Runtime(RuntimeKey::ProcessExit), _)
+                            )
+                        )
+                    });
+                    assert_eq!(
+                        exits.len(),
+                        1,
+                        "{} must retain process.exit:\n{rendered}",
+                        case.name
+                    );
+                    assert_eq!(
+                        cleanup_edges.len(),
+                        1,
+                        "{} must retain one exact process.exit cleanup guard:\n{rendered}",
+                        case.name
+                    );
+                    let cleanup = cleanup_edges[0];
+                    let exit = exits[0];
+                    assert!(
+                        block_dominates(function, cleanup.guard_load.0, exit.0)
+                            && location_precedes(function, cleanup.guard_load, exit)
+                            && location_inevitably_reaches(function, arm, cleanup.guard_load)
+                            && location_inevitably_reaches(function, cleanup.guard_load, exit),
+                        "{} exact cleanup guard must inevitably precede process.exit:\n{rendered}",
+                        case.name
+                    );
+                    assert!(
+                        reachable_from(function, cleanup.drop)[exit.0 as usize]
+                            && reachable_from(function, cleanup.next)[exit.0 as usize],
+                        "{} both cleanup flag edges must rejoin before process.exit:\n{rendered}",
+                        case.name
+                    );
+                    let exit_block = &function.blocks[exit.0 as usize];
+                    assert_eq!(
+                        exit.1 + 1,
+                        exit_block.stmts.len(),
+                        "{} process.exit must be the final action in its block:\n{rendered}",
+                        case.name
+                    );
+                    assert!(
+                        matches!(exit_block.term, Term::Unreachable),
+                        "{} process.exit must retain its non-fallthrough terminator:\n{rendered}",
+                        case.name
+                    );
+                }
+                Completion::Abort => {
+                    let aborts = locations(function, |statement| {
+                        matches!(
+                            statement,
+                            Stmt::Let(
+                                _,
+                                Rvalue::Call(DirectCall::Runtime(RuntimeKey::ProcessAbort), _)
+                            )
+                        )
+                    });
+                    assert_eq!(
+                        aborts.len(),
+                        1,
+                        "{} must retain the no-cleanup process.abort sink:\n{rendered}",
+                        case.name
+                    );
+                    let abort = aborts[0];
+                    assert!(
+                        location_precedes(function, arm, abort)
+                            && location_inevitably_reaches(function, arm, abort),
+                        "{} must inevitably reach process.abort after completing staging:\n{rendered}",
+                        case.name
+                    );
+                    if let Some((source_load, _)) = bound_source {
+                        assert!(
+                            location_precedes(function, source_load, abort)
+                                && location_inevitably_reaches(function, source_load, abort),
+                            "{} must complete its exact bound storage operand before process.abort:\n{rendered}",
+                            case.name
+                        );
+                    }
+                    let abort_block = &function.blocks[abort.0 as usize];
+                    assert_eq!(
+                        abort.1 + 1,
+                        abort_block.stmts.len(),
+                        "{} process.abort must be the final action in its block:\n{rendered}",
+                        case.name
+                    );
+                    assert!(
+                        matches!(abort_block.term, Term::Unreachable),
+                        "{} process.abort must retain its no-successor terminator:\n{rendered}",
+                        case.name
+                    );
+                }
+                Completion::Loop => {
+                    let self_loops = function
+                        .blocks
+                        .iter()
+                        .filter(
+                            |block| matches!(block.term, Term::Goto(target) if target == block.id),
+                        )
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        self_loops.len(),
+                        1,
+                        "{} must retain a permanent no-cleanup loop sink:\n{rendered}",
+                        case.name
+                    );
+                    let loop_block = self_loops[0].id;
+                    assert!(
+                        (arm.0 == loop_block || block_dominates(function, arm.0, loop_block))
+                            && block_inevitably_reaches(function, arm.0, loop_block),
+                        "{} staged continuation must inevitably enter the exact permanent loop:\n{rendered}",
+                        case.name
+                    );
+                    if let Some((source_load, _)) = bound_source {
+                        assert!(
+                            (source_load.0 == loop_block
+                                || block_dominates(function, source_load.0, loop_block))
+                                && location_inevitably_reaches(
+                                    function,
+                                    source_load,
+                                    (loop_block, 0),
+                                ),
+                            "{} must complete its exact bound storage operand before the permanent loop:\n{rendered}",
+                            case.name
+                        );
+                    }
+                    let loop_reachable = reachable_from(function, loop_block);
+                    assert!(
+                        function.blocks.iter().all(|block| {
+                            !loop_reachable[block.id as usize]
+                                || (!matches!(
+                                    block.term,
+                                    Term::Return(_) | Term::ReturnWithCleanup(_)
+                                ) && block.stmts.iter().all(|statement| {
+                                    !is_outer_call(statement, case.call)
+                                        && !matches!(statement, Stmt::Drop(slot) if *slot == owner)
+                                }))
+                        }),
+                        "{} permanent loop must have no call, cleanup, or return successor:\n{rendered}",
+                        case.name
+                    );
+                }
+                Completion::Return => {
+                    assert_eq!(
+                        cleanup_edges.len(),
+                        1,
+                        "{} must retain one exact return cleanup guard:\n{rendered}",
+                        case.name
+                    );
+                    let cleanup = cleanup_edges[0];
+                    let returns = function
+                        .blocks
+                        .iter()
+                        .filter(|block| {
+                            matches!(block.term, Term::Return(_) | Term::ReturnWithCleanup(_))
+                                && reachable_from(function, cleanup.next)[block.id as usize]
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        returns.len(),
+                        1,
+                        "{} cleanup continuation must retain one return sink:\n{rendered}",
+                        case.name
+                    );
+                    assert!(
+                        location_inevitably_reaches(function, arm, cleanup.guard_load)
+                            && block_dominates(function, cleanup.guard_load.0, returns[0].id,)
+                            && block_inevitably_reaches(
+                                function,
+                                cleanup.guard_load.0,
+                                returns[0].id,
+                            ),
+                        "{} exact cleanup guard must inevitably reach its return sink:\n{rendered}",
+                        case.name
+                    );
+                }
+                Completion::Success => {}
+            }
+        }
+
+        fn inspect_bounds_trap(function: &Function, shape: Shape, call_kind: CallKind) {
+            let rendered = print::function_to_string(function);
+            let state = string_owner_state(function);
+            assert_staged_provenance(function, &state, First::Bound);
+            let arm = (state.store.0, state.store.1 + 1);
+            let (source_load, source_value) = exact_bound_source_load(function, state.owner);
+            assert!(
+                location_precedes(function, arm, source_load),
+                "the bound source must become live before the parent reads it:\n{rendered}"
+            );
+
+            let bounds_failures = locations(function, |statement| {
+                matches!(
+                    statement,
+                    Stmt::Let(
+                        _,
+                        Rvalue::Call(DirectCall::Runtime(RuntimeKey::BoundsFail), _)
+                    )
+                )
+            });
+            assert_eq!(
+                bounds_failures.len(),
+                1,
+                "the bounds fixture must retain one exact trap action:\n{rendered}"
+            );
+            let bounds_failure = bounds_failures[0];
+            let Stmt::Let(_, Rvalue::Call(_, bounds_args)) =
+                &function.blocks[bounds_failure.0 as usize].stmts[bounds_failure.1]
+            else {
+                panic!("bounds failure location must contain its runtime action:\n{rendered}")
+            };
+            assert_eq!(
+                bounds_args.len(),
+                2,
+                "bounds_fail must retain its exact index and length operands:\n{rendered}"
+            );
+            let (checked_index, checked_len) = (&bounds_args[0], &bounds_args[1]);
+            let Operand::Value(checked_index_value) = checked_index else {
+                panic!("the dynamic bounds fixture must retain one SSA index:\n{rendered}")
+            };
+            let Operand::Const(Const::Int(checked_len_value, checked_len_ty)) = checked_len else {
+                panic!(
+                    "the fixed-array bounds fixture must retain one constant length:\n{rendered}"
+                )
+            };
+            let trap_block = &function.blocks[bounds_failure.0 as usize];
+            assert_eq!(
+                (bounds_failure.1, trap_block.stmts.len()),
+                (0, 1),
+                "the trap edge must contain only its exact bounds_fail action:\n{rendered}"
+            );
+            assert!(
+                matches!(trap_block.term, Term::Unreachable),
+                "the bounds trap edge must remain a no-cleanup Unreachable sink:\n{rendered}"
+            );
+
+            let guard_predecessors = function
+                .blocks
+                .iter()
+                .filter(|block| match block.term {
+                    Term::Goto(target) => target == trap_block.id,
+                    Term::Branch(_, then_block, else_block) => {
+                        then_block == trap_block.id || else_block == trap_block.id
+                    }
+                    Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => false,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                guard_predecessors.len(),
+                1,
+                "the trap must have one exact bounds-guard predecessor:\n{rendered}"
+            );
+            let guard = guard_predecessors[0];
+            let Term::Branch(Operand::Value(branch_condition), trap, normal) = guard.term else {
+                panic!("the bounds guard must branch on one SSA condition:\n{rendered}")
+            };
+            assert_eq!(
+                trap, trap_block.id,
+                "the true out-of-bounds edge must enter bounds_fail:\n{rendered}"
+            );
+            assert_ne!(
+                normal, trap,
+                "the in-bounds continuation must remain distinct from the trap:\n{rendered}"
+            );
+            let (condition_block, condition_index, condition_definition) =
+                value_definition(function, branch_condition);
+            assert_eq!(
+                condition_block, guard.id,
+                "the bounds branch must use a condition defined in its own predecessor:\n{rendered}"
+            );
+            assert_eq!(
+                condition_index + 1,
+                guard.stmts.len(),
+                "the exact bounds condition must immediately drive its branch:\n{rendered}"
+            );
+            let Rvalue::Bin(
+                BinOp::Or,
+                Operand::Value(low_condition),
+                Operand::Value(high_condition),
+            ) = condition_definition
+            else {
+                panic!("the bounds condition must combine low and high guards:\n{rendered}")
+            };
+            let (_, _, low_definition) = value_definition(function, *low_condition);
+            let (_, _, high_definition) = value_definition(function, *high_condition);
+            assert!(
+                matches!(
+                    low_definition,
+                    Rvalue::Bin(
+                        BinOp::Lt,
+                        Operand::Value(index),
+                        Operand::Const(Const::Int(
+                            0,
+                            Ty::Int(IntTy { bits: 64, signed: true })
+                        ))
+                    ) if index == checked_index_value
+                ),
+                "the low guard must test the exact index sent to bounds_fail:\n{rendered}"
+            );
+            assert!(
+                matches!(
+                    high_definition,
+                    Rvalue::Bin(
+                        BinOp::Ge,
+                        Operand::Value(index),
+                        Operand::Const(Const::Int(len, ty))
+                    ) if index == checked_index_value
+                        && len == checked_len_value
+                        && ty == checked_len_ty
+                ),
+                "the high guard must test the exact index/length sent to bounds_fail:\n{rendered}"
+            );
+            assert!(
+                location_precedes(function, source_load, (condition_block, condition_index)),
+                "the bound storage operand must complete before its later bounds guard:\n{rendered}"
+            );
+
+            let index_loads = function
+                .blocks
+                .iter()
+                .flat_map(|block| {
+                    block
+                        .stmts
+                        .iter()
+                        .enumerate()
+                        .filter_map(move |(index, statement)| match statement {
+                            Stmt::Let(value, Rvalue::Index(_, Operand::Value(checked)))
+                                if checked == checked_index_value =>
+                            {
+                                Some(((block.id, index), *value))
+                            }
+                            _ => None,
+                        })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                index_loads.len(),
+                1,
+                "the normal edge must perform one exact guarded element action:\n{rendered}"
+            );
+            let (index_load, index_value) = index_loads[0];
+            let normal_reachable = reachable_from(function, normal);
+            let trap_reachable = reachable_from(function, trap);
+            assert!(
+                normal_reachable[index_load.0 as usize]
+                    && !trap_reachable[index_load.0 as usize]
+                    && block_dominates(function, normal, index_load.0),
+                "only the normal bounds edge may perform the guarded element action:\n{rendered}"
+            );
+
+            let calls = locations(function, |statement| is_outer_call(statement, call_kind));
+            assert_eq!(
+                calls.len(),
+                1,
+                "only the normal edge must retain one parent action:\n{rendered}"
+            );
+            let call = calls[0];
+            assert!(
+                normal_reachable[call.0 as usize]
+                    && !trap_reachable[call.0 as usize]
+                    && block_dominates(function, normal, call.0)
+                    && block_inevitably_reaches(function, normal, call.0),
+                "the normal edge must exclusively and inevitably reach the parent action:\n{rendered}"
+            );
+            assert!(
+                location_precedes(function, index_load, call),
+                "the guarded later operand must complete before the parent action:\n{rendered}"
+            );
+            let call_block = &function.blocks[call.0 as usize];
+            assert!(
+                call.1 >= 2
+                    && matches!(call_block.stmts[call.1 - 2], Stmt::DropFlagInit(slot) if slot == state.owner)
+                    && matches!(
+                        call_block.stmts[call.1 - 1],
+                        Stmt::Store(slot, Operand::Const(Const::Bool(false))) if slot == state.flag
+                    ),
+                "the successful parent action must null the exact bound source and its flag immediately before the call:\n{rendered}"
+            );
+            let owner_inits = locations(
+                function,
+                |statement| matches!(statement, Stmt::DropFlagInit(slot) if *slot == state.owner),
+            );
+            assert_eq!(
+                owner_inits.len(),
+                2,
+                "the bound source must be initialized once and nulled only at the successful action:\n{rendered}"
+            );
+            assert_eq!(
+                owner_inits[1],
+                (call.0, call.1 - 2),
+                "the second source initialization must be the exact action-time nulling:\n{rendered}"
+            );
+            let flag_clears = locations(function, |statement| {
+                matches!(
+                    statement,
+                    Stmt::Store(slot, Operand::Const(Const::Bool(false)))
+                        if *slot == state.flag
+                )
+            });
+            assert_eq!(
+                flag_clears.len(),
+                2,
+                "the source flag must be cleared only at initialization and the exact parent action:\n{rendered}"
+            );
+            assert!(
+                flag_clears.contains(&(call.0, call.1 - 1))
+                    && flag_clears
+                        .iter()
+                        .any(|&clear| location_precedes(function, clear, arm)),
+                "the exact action flag clear must remain distinct from the initial inert clear:\n{rendered}"
+            );
+            assert!(
+                locations(function, |statement| {
+                    matches!(statement, Stmt::Drop(slot) if *slot == state.owner)
+                })
+                .is_empty(),
+                "neither normal consumption nor a hard bounds trap may Drop the source:\n{rendered}"
+            );
+
+            let call_statement = &call_block.stmts[call.1];
+            let args = outer_call_args(call_statement, call_kind)
+                .unwrap_or_else(|| panic!("missing exact parent call arguments:\n{rendered}"));
+            assert_eq!(
+                args.len(),
+                2,
+                "the parent action must retain both exact operands:\n{rendered}"
+            );
+            assert!(
+                matches!(args[1], Operand::Const(Const::Unit)),
+                "the parent action must retain its exact later Unit operand:\n{rendered}"
+            );
+
+            match shape {
+                Shape::Direct => {
+                    assert!(
+                        matches!(args[0], Operand::Value(value) if value == source_value),
+                        "the direct action must consume the exact bound-source load:\n{rendered}"
+                    );
+                    assert!(
+                        function
+                            .blocks
+                            .iter()
+                            .flat_map(|block| &block.stmts)
+                            .all(|statement| {
+                                !matches!(
+                                    statement,
+                                    Stmt::StoreField(slot, _, _)
+                                        if matches!(function.slots[*slot as usize], Ty::Struct(_))
+                                )
+                            }),
+                        "the direct bounds fixture must not synthesize an aggregate action:\n{rendered}"
+                    );
+                }
+                Shape::Aggregate => {
+                    let aggregate = exact_aggregate_slot(function);
+                    let first_fields = aggregate_field_stores(function, aggregate, 0);
+                    let second_fields = aggregate_field_stores(function, aggregate, 1);
+                    assert_eq!(
+                        first_fields.len(),
+                        1,
+                        "the aggregate must stage its exact completed field zero once:\n{rendered}"
+                    );
+                    assert_eq!(
+                        second_fields.len(),
+                        1,
+                        "only the normal edge must install field one once:\n{rendered}"
+                    );
+                    let first_field = first_fields[0];
+                    let second_field = second_fields[0];
+                    assert!(
+                        matches!(
+                            function.blocks[first_field.0 as usize].stmts[first_field.1],
+                            Stmt::StoreField(_, _, Operand::Value(value)) if value == source_value
+                        ),
+                        "aggregate field zero must receive the exact bound-source load:\n{rendered}"
+                    );
+                    assert!(
+                        matches!(
+                            function.blocks[second_field.0 as usize].stmts[second_field.1],
+                            Stmt::StoreField(_, _, Operand::Value(value)) if value == index_value
+                        ),
+                        "aggregate field one must receive the exact guarded index result:\n{rendered}"
+                    );
+                    assert!(
+                        location_precedes(function, source_load, first_field)
+                            && location_precedes(
+                                function,
+                                first_field,
+                                (condition_block, condition_index),
+                            ),
+                        "field zero must be staged before evaluating the guarded field one:\n{rendered}"
+                    );
+                    assert!(
+                        normal_reachable[second_field.0 as usize]
+                            && !trap_reachable[second_field.0 as usize]
+                            && location_precedes(function, index_load, second_field),
+                        "only the normal edge may install the exact field-one result:\n{rendered}"
+                    );
+                    let materializations = aggregate_materializations(function, aggregate);
+                    assert_eq!(
+                        materializations.len(),
+                        1,
+                        "the normal edge must materialize the completed aggregate exactly once:\n{rendered}"
+                    );
+                    let (materialization, aggregate_value) = materializations[0];
+                    assert!(
+                        normal_reachable[materialization.0 as usize]
+                            && !trap_reachable[materialization.0 as usize]
+                            && location_precedes(function, second_field, materialization)
+                            && location_precedes(function, materialization, call),
+                        "aggregate materialization must stay after both fields and before its action:\n{rendered}"
+                    );
+                    assert!(
+                        matches!(args[0], Operand::Value(value) if value == aggregate_value),
+                        "the parent call must consume the exact completed aggregate value:\n{rendered}"
+                    );
+                    let all_fields = locations(
+                        function,
+                        |statement| matches!(statement, Stmt::StoreField(slot, _, _) if *slot == aggregate),
+                    );
+                    assert_eq!(
+                        all_fields.len(),
+                        2,
+                        "the aggregate action must not write an unexpected field or path:\n{rendered}"
+                    );
+                }
+            }
+
+            for block in function
+                .blocks
+                .iter()
+                .filter(|block| trap_reachable[block.id as usize])
+            {
+                assert!(
+                    block.stmts.iter().all(|statement| {
+                        !is_outer_call(statement, call_kind)
+                            && !matches!(statement, Stmt::Drop(slot) if *slot == state.owner)
+                            && !matches!(statement, Stmt::DropFlagInit(slot) if *slot == state.owner)
+                            && !matches!(
+                                statement,
+                                Stmt::Store(slot, Operand::Const(Const::Bool(false)))
+                                    if *slot == state.flag
+                            )
+                    }),
+                    "the trap edge must publish no Drop, source nulling, flag clear, or parent action:\n{rendered}"
+                );
+            }
+            assert!(
+                !normal_reachable[trap as usize] && !trap_reachable[normal as usize],
+                "normal and trap continuations must not bypass into each other:\n{rendered}"
+            );
+        }
+
+        fn inspect_process_exec_try(
+            function: &Function,
+            shape: Shape,
+            call_kind: CallKind,
+            expected_scope_cleanup: usize,
+        ) {
+            let rendered = print::function_to_string(function);
+            let state = string_owner_state(function);
+            assert_staged_provenance(function, &state, First::Bound);
+            let arm = (state.store.0, state.store.1 + 1);
+            let (source_load, source_value) = exact_bound_source_load(function, state.owner);
+            assert!(
+                location_precedes(function, arm, source_load),
+                "the bound source must become live before process.exec is evaluated:\n{rendered}"
+            );
+
+            let execs = function
+                .blocks
+                .iter()
+                .flat_map(|block| {
+                    block
+                        .stmts
+                        .iter()
+                        .enumerate()
+                        .filter_map(move |(index, statement)| match statement {
+                            Stmt::Let(code, Rvalue::ProcessExec { .. }) => {
+                                Some(((block.id, index), *code))
+                            }
+                            _ => None,
+                        })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                execs.len(),
+                1,
+                "the fixture must retain one exact process.exec action:\n{rendered}"
+            );
+            let (exec, status) = execs[0];
+            assert!(
+                location_precedes(function, source_load, exec),
+                "the staged storage operand must complete before process.exec:\n{rendered}"
+            );
+            let status_tests = function
+                .blocks
+                .iter()
+                .flat_map(|block| {
+                    block
+                        .stmts
+                        .iter()
+                        .enumerate()
+                        .filter_map(move |(index, statement)| match statement {
+                            Stmt::Let(
+                                condition,
+                                Rvalue::Bin(
+                                    BinOp::Eq,
+                                    Operand::Value(value),
+                                    Operand::Const(Const::Int(0, ty)),
+                                ),
+                            ) if *value == status && *ty == status_ty() => {
+                                Some(((block.id, index), *condition))
+                            }
+                            _ => None,
+                        })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                status_tests.len(),
+                1,
+                "process.exec must branch once on its exact zero-status success condition:\n{rendered}"
+            );
+            let (status_test, status_condition) = status_tests[0];
+            assert_eq!(
+                status_test,
+                (exec.0, exec.1 + 1),
+                "the exact zero-status test must immediately follow process.exec in the same block:\n{rendered}"
+            );
+            let status_block = &function.blocks[status_test.0 as usize];
+            assert_eq!(
+                status_test.1 + 1,
+                status_block.stmts.len(),
+                "the exact process.exec status test must immediately drive its branch:\n{rendered}"
+            );
+            let Term::Branch(Operand::Value(branch_condition), success, failure) =
+                status_block.term
+            else {
+                panic!("process.exec status must drive an exact SSA branch:\n{rendered}")
+            };
+            assert_eq!(
+                branch_condition, status_condition,
+                "process.exec must branch on the exact zero-status comparison:\n{rendered}"
+            );
+            let success_block = &function.blocks[success as usize];
+            assert!(
+                matches!(success_block.term, Term::Unreachable),
+                "a successful process.exec replaces the image and must be a no-cleanup Unreachable edge:\n{rendered}"
+            );
+            assert!(
+                success_block.stmts.is_empty(),
+                "the exec-success Unreachable block must contain no Drop, arena/task cleanup, or action:\n{rendered}"
+            );
+            let success_predecessors = function
+                .blocks
+                .iter()
+                .filter(|block| match block.term {
+                    Term::Goto(target) => target == success,
+                    Term::Branch(_, then_block, else_block) => {
+                        then_block == success || else_block == success
+                    }
+                    Term::Return(_) | Term::ReturnWithCleanup(_) | Term::Unreachable => false,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                success_predecessors.len(),
+                1,
+                "the exec-success sink must have only its exact status predecessor:\n{rendered}"
+            );
+            assert_eq!(
+                success_predecessors[0].id, status_block.id,
+                "the status-success edge must directly enter the Unreachable sink:\n{rendered}"
+            );
+
+            let outer_calls = locations(function, |statement| is_outer_call(statement, call_kind));
+            assert!(
+                outer_calls.is_empty(),
+                "neither process.exec outcome may publish the enclosing parent action:\n{rendered}"
+            );
+            let owner_drops = locations(
+                function,
+                |statement| matches!(statement, Stmt::Drop(slot) if *slot == state.owner),
+            );
+            assert_eq!(
+                owner_drops.len(),
+                1,
+                "only the returning exec-failure edge may Drop the staged storage:\n{rendered}"
+            );
+            let cleanup = cleanup_edge(function, state.owner, state.flag, owner_drops[0]);
+            let success_reachable = reachable_from(function, success);
+            let failure_reachable = reachable_from(function, failure);
+            let mapped_error = exact_mapped_status_error(function, status);
+            let (mapped_error_block, mapped_error_index, _) =
+                value_definition(function, mapped_error);
+            let mapped_error_location = (mapped_error_block, mapped_error_index);
+            assert!(
+                failure_reachable[mapped_error_block as usize]
+                    && !success_reachable[mapped_error_block as usize],
+                "only exec failure may construct the Error mapped from its exact status:\n{rendered}"
+            );
+            let failure_results = function
+                .blocks
+                .iter()
+                .flat_map(|block| {
+                    block
+                        .stmts
+                        .iter()
+                        .enumerate()
+                        .filter_map(move |(index, statement)| match statement {
+                            Stmt::Let(result, Rvalue::ResultErr(Operand::Value(error)))
+                                if *error == mapped_error =>
+                            {
+                                Some(((block.id, index), *result))
+                            }
+                            _ => None,
+                        })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                failure_results.len(),
+                1,
+                "the exact mapped Error must enter one process.exec ResultErr:\n{rendered}"
+            );
+            let (failure_result_location, failure_result) = failure_results[0];
+            assert!(
+                location_precedes(function, mapped_error_location, failure_result_location),
+                "process.exec must map its status before building the exact failure Result:\n{rendered}"
+            );
+            let unwrapped_errors = function
+                .blocks
+                .iter()
+                .flat_map(|block| {
+                    block
+                        .stmts
+                        .iter()
+                        .enumerate()
+                        .filter_map(move |(index, statement)| match statement {
+                            Stmt::Let(error, Rvalue::ResultUnwrapErr(Operand::Value(result)))
+                                if *result == failure_result =>
+                            {
+                                Some(((block.id, index), *error))
+                            }
+                            _ => None,
+                        })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                unwrapped_errors.len(),
+                1,
+                "`process.exec?` must unwrap the exact failure Result once:\n{rendered}"
+            );
+            let (unwrapped_error_location, unwrapped_error) = unwrapped_errors[0];
+            let scope_cleanup = locations(function, |statement| {
+                matches!(
+                    statement,
+                    Stmt::ArenaEnd(_) | Stmt::TgWait(_) | Stmt::TgEnd(_)
+                )
+            });
+            assert_eq!(
+                scope_cleanup.len(),
+                expected_scope_cleanup,
+                "the exec wrapper must retain exactly its declared failure-only scope cleanup:\n{rendered}"
+            );
+            for cleanup_location in &scope_cleanup {
+                assert!(
+                    failure_reachable[cleanup_location.0 as usize]
+                        && !success_reachable[cleanup_location.0 as usize]
+                        && location_precedes(function, failure_result_location, *cleanup_location,)
+                        && location_precedes(function, *cleanup_location, unwrapped_error_location,),
+                    "arena/task cleanup must occur only on exec failure before `?` propagation:\n{rendered}"
+                );
+            }
+            let propagated_results = function
+                .blocks
+                .iter()
+                .flat_map(|block| {
+                    block
+                        .stmts
+                        .iter()
+                        .enumerate()
+                        .filter_map(move |(index, statement)| match statement {
+                            Stmt::Let(result, Rvalue::ResultErr(Operand::Value(error)))
+                                if *error == unwrapped_error =>
+                            {
+                                Some(((block.id, index), *result))
+                            }
+                            _ => None,
+                        })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                propagated_results.len(),
+                1,
+                "`process.exec?` must propagate the exact unwrapped Error once:\n{rendered}"
+            );
+            let (propagated_result_location, propagated_result) = propagated_results[0];
+            assert!(
+                location_precedes(function, failure_result_location, unwrapped_error_location,)
+                    && location_precedes(
+                        function,
+                        unwrapped_error_location,
+                        propagated_result_location,
+                    )
+                    && location_precedes(function, propagated_result_location, cleanup.guard_load,),
+                "the exact exec failure must be mapped, unwrapped, rewrapped, then cleaned in order:\n{rendered}"
+            );
+            assert!(
+                failure_reachable[cleanup.guard_load.0 as usize]
+                    && !success_reachable[cleanup.guard_load.0 as usize]
+                    && block_dominates(function, failure, cleanup.guard_load.0)
+                    && block_inevitably_reaches(function, failure, cleanup.guard_load.0),
+                "only exec failure may exclusively and inevitably reach the exact cleanup guard:\n{rendered}"
+            );
+            let failure_returns = function
+                .blocks
+                .iter()
+                .filter(|block| {
+                    failure_reachable[block.id as usize]
+                        && !success_reachable[block.id as usize]
+                        && matches!(block.term, Term::Return(_) | Term::ReturnWithCleanup(_))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                failure_returns.len(),
+                1,
+                "the exec-failure cleanup must retain one exact propagated-Err return:\n{rendered}"
+            );
+            let returned_value = match &failure_returns[0].term {
+                Term::Return(Some(Operand::Value(value))) => *value,
+                Term::ReturnWithCleanup(returned) => match &returned.0 {
+                    Operand::Value(value) => *value,
+                    _ => panic!("exec failure must return one exact SSA ResultErr:\n{rendered}"),
+                },
+                _ => panic!("exec failure must return one exact SSA ResultErr:\n{rendered}"),
+            };
+            assert_eq!(
+                returned_value, propagated_result,
+                "exec failure must return the exact ResultErr rebuilt from its mapped status:\n{rendered}"
+            );
+            assert!(
+                block_dominates(function, cleanup.guard_load.0, failure_returns[0].id)
+                    && block_inevitably_reaches(
+                        function,
+                        cleanup.guard_load.0,
+                        failure_returns[0].id,
+                    ),
+                "the exact failure cleanup guard must inevitably reach its return:\n{rendered}"
+            );
+            let owner_inits = locations(
+                function,
+                |statement| matches!(statement, Stmt::DropFlagInit(slot) if *slot == state.owner),
+            );
+            assert_eq!(
+                owner_inits.len(),
+                1,
+                "process.exec must never perform successful parent-action source nulling:\n{rendered}"
+            );
+            let flag_clears = locations(function, |statement| {
+                matches!(
+                    statement,
+                    Stmt::Store(slot, Operand::Const(Const::Bool(false)))
+                        if *slot == state.flag
+                )
+            });
+            assert_eq!(
+                flag_clears.len(),
+                2,
+                "the source flag must be cleared only at initialization and exec-failure cleanup:\n{rendered}"
+            );
+            assert!(
+                flag_clears.contains(&(cleanup.drop, 1))
+                    && flag_clears
+                        .iter()
+                        .any(|&clear| location_precedes(function, clear, arm)),
+                "the exact failure cleanup clear must remain distinct from the initial inert clear:\n{rendered}"
+            );
+            for block in function
+                .blocks
+                .iter()
+                .filter(|block| success_reachable[block.id as usize])
+            {
+                assert!(
+                    block.stmts.iter().all(|statement| {
+                        !is_outer_call(statement, call_kind)
+                            && !matches!(statement, Stmt::Drop(slot) if *slot == state.owner)
+                            && !matches!(statement, Stmt::DropFlagInit(slot) if *slot == state.owner)
+                            && !matches!(
+                                statement,
+                                Stmt::Store(slot, Operand::Const(Const::Bool(false)))
+                                    if *slot == state.flag
+                            )
+                    }),
+                    "the exec-success sink must publish no cleanup or parent action:\n{rendered}"
+                );
+            }
+
+            match shape {
+                Shape::Direct => {
+                    assert!(
+                        function
+                            .blocks
+                            .iter()
+                            .flat_map(|block| &block.stmts)
+                            .all(|statement| {
+                                !matches!(
+                                    statement,
+                                    Stmt::StoreField(slot, _, _)
+                                        if matches!(function.slots[*slot as usize], Ty::Struct(_))
+                                )
+                            }),
+                        "the direct exec fixture must not synthesize an aggregate action:\n{rendered}"
+                    );
+                }
+                Shape::Aggregate => {
+                    let aggregate = exact_aggregate_slot(function);
+                    let first_fields = aggregate_field_stores(function, aggregate, 0);
+                    let second_fields = aggregate_field_stores(function, aggregate, 1);
+                    assert_eq!(
+                        first_fields.len(),
+                        1,
+                        "the aggregate must stage the completed field zero before process.exec:\n{rendered}"
+                    );
+                    assert!(
+                        matches!(
+                            function.blocks[first_fields[0].0 as usize].stmts[first_fields[0].1],
+                            Stmt::StoreField(_, _, Operand::Value(value)) if value == source_value
+                        ),
+                        "aggregate field zero must retain the exact bound-source identity:\n{rendered}"
+                    );
+                    assert!(
+                        location_precedes(function, source_load, first_fields[0])
+                            && location_precedes(function, first_fields[0], exec),
+                        "field zero must complete before process.exec starts:\n{rendered}"
+                    );
+                    assert!(
+                        second_fields.is_empty(),
+                        "neither process.exec edge may install the later aggregate field:\n{rendered}"
+                    );
+                    assert!(
+                        aggregate_materializations(function, aggregate).is_empty(),
+                        "neither process.exec edge may materialize the incomplete aggregate:\n{rendered}"
+                    );
+                    let all_fields = locations(
+                        function,
+                        |statement| matches!(statement, Stmt::StoreField(slot, _, _) if *slot == aggregate),
+                    );
+                    assert_eq!(
+                        all_fields, first_fields,
+                        "the exec fixture must retain only its exact completed field zero:\n{rendered}"
+                    );
+                }
+            }
+        }
+
+        let program = lower(
+            r#"
+import std.process
+Pair { text: string, n: i64 }
+fn make() -> string = "x".clone()
+fn take(s: string, x: ()) {}
+fn take_pair(p: Pair, x: ()) {}
+fn fail_unit() -> Result<(), Error> = Err(error(1))
+fn fail_i64() -> Result<i64, Error> = Err(error(2))
+
+fn direct_bound_return() -> i32 {
+  s := make()
+  take(s, { return 0; () })
+  return 1
+}
+fn direct_bound_success() -> i32 {
+  s := make()
+  take(s, ())
+  return 1
+}
+fn direct_bound_try() -> Result<i32, Error> {
+  s := make()
+  take(s, fail_unit()?)
+  return Ok(1)
+}
+fn direct_bound_abort() -> i32 {
+  s := make()
+  take(s, { process.abort(); () })
+  return 1
+}
+fn direct_bound_loop() -> i32 {
+  s := make()
+  take(s, loop {})
+  return 1
+}
+fn direct_bound_bounds(index: i64) -> i32 {
+  s := make()
+  values := [7]
+  take(s, { value := values[index]; () })
+  return 1
+}
+fn direct_bound_exec() -> Result<i32, Error> {
+  s := make()
+  take(s, process.exec("/bin/true", ["/bin/true"])?)
+  return Ok(1)
+}
+fn direct_bound_exec_block() -> Result<i32, Error> {
+  s := make()
+  take(s, { process.exec("/bin/true", ["/bin/true"]) }?)
+  return Ok(1)
+}
+fn direct_bound_exec_arena() -> Result<i32, Error> {
+  s := make()
+  take(s, arena { process.exec("/bin/true", ["/bin/true"]) }?)
+  return Ok(1)
+}
+fn aggregate_bound_return() -> i32 {
+  s := make()
+  take_pair(Pair { text: s, n: { return 0; 0 } }, ())
+  return 1
+}
+fn aggregate_bound_success() -> i32 {
+  s := make()
+  take_pair(Pair { text: s, n: 0 }, ())
+  return 1
+}
+fn aggregate_bound_try() -> Result<i32, Error> {
+  s := make()
+  take_pair(Pair { text: s, n: fail_i64()? }, ())
+  return Ok(1)
+}
+fn aggregate_bound_abort() -> i32 {
+  s := make()
+  take_pair(Pair { text: s, n: { process.abort(); 0 } }, ())
+  return 1
+}
+fn aggregate_bound_loop() -> i32 {
+  s := make()
+  take_pair(Pair { text: s, n: loop {} }, ())
+  return 1
+}
+fn aggregate_bound_bounds(index: i64) -> i32 {
+  s := make()
+  values := [7]
+  take_pair(Pair { text: s, n: values[index] }, ())
+  return 1
+}
+fn aggregate_bound_exec() -> Result<i32, Error> {
+  s := make()
+  take_pair(Pair {
+    text: s,
+    n: { process.exec("/bin/true", ["/bin/true"])?; 0 }
+  }, ())
+  return Ok(1)
+}
+fn aggregate_bound_exec_unsafe() -> Result<i32, Error> {
+  s := make()
+  take_pair(Pair {
+    text: s,
+    n: { unsafe { process.exec("/bin/true", ["/bin/true"]) }?; 0 }
+  }, ())
+  return Ok(1)
+}
+fn aggregate_bound_exec_task_group() -> Result<i32, Error> {
+  s := make()
+  take_pair(Pair {
+    text: s,
+    n: { task_group { process.exec("/bin/true", ["/bin/true"]) }?; 0 }
+  }, ())
+  return Ok(1)
+}
+
+fn direct_fresh_return() -> i32 {
+  take(make(), { return 0; () })
+  return 1
+}
+fn direct_fresh_try() -> Result<i32, Error> {
+  take(make(), fail_unit()?)
+  return Ok(1)
+}
+fn direct_fresh_exit() -> i32 {
+  take(make(), { process.exit(0); () })
+  return 1
+}
+fn direct_fresh_abort() -> i32 {
+  take(make(), { process.abort(); () })
+  return 1
+}
+fn direct_fresh_loop() -> i32 {
+  take(make(), loop {})
+  return 1
+}
+fn direct_fresh_success() -> i32 {
+  take(make(), ())
+  return 1
+}
+
+fn aggregate_fresh_return() -> i32 {
+  take_pair(Pair { text: make(), n: { return 0; 0 } }, ())
+  return 1
+}
+fn aggregate_fresh_try() -> Result<i32, Error> {
+  take_pair(Pair { text: make(), n: fail_i64()? }, ())
+  return Ok(1)
+}
+fn aggregate_fresh_exit() -> i32 {
+  take_pair(Pair { text: make(), n: { process.exit(0); 0 } }, ())
+  return 1
+}
+fn aggregate_fresh_abort() -> i32 {
+  take_pair(Pair { text: make(), n: { process.abort(); 0 } }, ())
+  return 1
+}
+fn aggregate_fresh_loop() -> i32 {
+  take_pair(Pair { text: make(), n: loop {} }, ())
+  return 1
+}
+fn aggregate_fresh_success() -> i32 {
+  take_pair(Pair { text: make(), n: 0 }, ())
+  return 1
+}
+
+fn direct_wrapped_return(flag: bool) -> i32 {
+  take(if flag { make() } else { make() }, { return 0; () })
+  return 1
+}
+fn direct_wrapped_success(flag: bool) -> i32 {
+  take(if flag { make() } else { make() }, ())
+  return 1
+}
+fn aggregate_wrapped_return(flag: bool) -> i32 {
+  take_pair(Pair { text: if flag { make() } else { make() }, n: { return 0; 0 } }, ())
+  return 1
+}
+fn aggregate_wrapped_success(flag: bool) -> i32 {
+  take_pair(Pair { text: if flag { make() } else { make() }, n: 0 }, ())
+  return 1
+}
+
+fn fn_value_fresh_return() -> i32 {
+  f := take
+  f(make(), { return 0; () })
+  return 1
+}
+fn fn_value_fresh_success() -> i32 {
+  f := take
+  f(make(), ())
+  return 1
+}
+fn main() -> i32 = 0
+"#,
+        );
+
+        let direct = CallKind::Program("take");
+        let aggregate = CallKind::Program("take_pair");
+        for case in [
+            Case {
+                name: "direct_bound_return",
+                shape: Shape::Direct,
+                first: First::Bound,
+                completion: Completion::Return,
+                call: direct,
+            },
+            Case {
+                name: "direct_bound_success",
+                shape: Shape::Direct,
+                first: First::Bound,
+                completion: Completion::Success,
+                call: direct,
+            },
+            Case {
+                name: "direct_bound_try",
+                shape: Shape::Direct,
+                first: First::Bound,
+                completion: Completion::Try,
+                call: direct,
+            },
+            Case {
+                name: "direct_bound_abort",
+                shape: Shape::Direct,
+                first: First::Bound,
+                completion: Completion::Abort,
+                call: direct,
+            },
+            Case {
+                name: "direct_bound_loop",
+                shape: Shape::Direct,
+                first: First::Bound,
+                completion: Completion::Loop,
+                call: direct,
+            },
+            Case {
+                name: "aggregate_bound_return",
+                shape: Shape::Aggregate,
+                first: First::Bound,
+                completion: Completion::Return,
+                call: aggregate,
+            },
+            Case {
+                name: "aggregate_bound_success",
+                shape: Shape::Aggregate,
+                first: First::Bound,
+                completion: Completion::Success,
+                call: aggregate,
+            },
+            Case {
+                name: "aggregate_bound_try",
+                shape: Shape::Aggregate,
+                first: First::Bound,
+                completion: Completion::Try,
+                call: aggregate,
+            },
+            Case {
+                name: "aggregate_bound_abort",
+                shape: Shape::Aggregate,
+                first: First::Bound,
+                completion: Completion::Abort,
+                call: aggregate,
+            },
+            Case {
+                name: "aggregate_bound_loop",
+                shape: Shape::Aggregate,
+                first: First::Bound,
+                completion: Completion::Loop,
+                call: aggregate,
+            },
+            Case {
+                name: "direct_fresh_return",
+                shape: Shape::Direct,
+                first: First::Fresh,
+                completion: Completion::Return,
+                call: direct,
+            },
+            Case {
+                name: "direct_fresh_try",
+                shape: Shape::Direct,
+                first: First::Fresh,
+                completion: Completion::Try,
+                call: direct,
+            },
+            Case {
+                name: "direct_fresh_exit",
+                shape: Shape::Direct,
+                first: First::Fresh,
+                completion: Completion::Exit,
+                call: direct,
+            },
+            Case {
+                name: "direct_fresh_abort",
+                shape: Shape::Direct,
+                first: First::Fresh,
+                completion: Completion::Abort,
+                call: direct,
+            },
+            Case {
+                name: "direct_fresh_loop",
+                shape: Shape::Direct,
+                first: First::Fresh,
+                completion: Completion::Loop,
+                call: direct,
+            },
+            Case {
+                name: "direct_fresh_success",
+                shape: Shape::Direct,
+                first: First::Fresh,
+                completion: Completion::Success,
+                call: direct,
+            },
+            Case {
+                name: "aggregate_fresh_return",
+                shape: Shape::Aggregate,
+                first: First::Fresh,
+                completion: Completion::Return,
+                call: aggregate,
+            },
+            Case {
+                name: "aggregate_fresh_try",
+                shape: Shape::Aggregate,
+                first: First::Fresh,
+                completion: Completion::Try,
+                call: aggregate,
+            },
+            Case {
+                name: "aggregate_fresh_exit",
+                shape: Shape::Aggregate,
+                first: First::Fresh,
+                completion: Completion::Exit,
+                call: aggregate,
+            },
+            Case {
+                name: "aggregate_fresh_abort",
+                shape: Shape::Aggregate,
+                first: First::Fresh,
+                completion: Completion::Abort,
+                call: aggregate,
+            },
+            Case {
+                name: "aggregate_fresh_loop",
+                shape: Shape::Aggregate,
+                first: First::Fresh,
+                completion: Completion::Loop,
+                call: aggregate,
+            },
+            Case {
+                name: "aggregate_fresh_success",
+                shape: Shape::Aggregate,
+                first: First::Fresh,
+                completion: Completion::Success,
+                call: aggregate,
+            },
+            Case {
+                name: "direct_wrapped_return",
+                shape: Shape::Direct,
+                first: First::Wrapped,
+                completion: Completion::Return,
+                call: direct,
+            },
+            Case {
+                name: "direct_wrapped_success",
+                shape: Shape::Direct,
+                first: First::Wrapped,
+                completion: Completion::Success,
+                call: direct,
+            },
+            Case {
+                name: "aggregate_wrapped_return",
+                shape: Shape::Aggregate,
+                first: First::Wrapped,
+                completion: Completion::Return,
+                call: aggregate,
+            },
+            Case {
+                name: "aggregate_wrapped_success",
+                shape: Shape::Aggregate,
+                first: First::Wrapped,
+                completion: Completion::Success,
+                call: aggregate,
+            },
+            Case {
+                name: "fn_value_fresh_return",
+                shape: Shape::Direct,
+                first: First::Fresh,
+                completion: Completion::Return,
+                call: CallKind::Indirect,
+            },
+            Case {
+                name: "fn_value_fresh_success",
+                shape: Shape::Direct,
+                first: First::Fresh,
+                completion: Completion::Success,
+                call: CallKind::Indirect,
+            },
+        ] {
+            inspect(function(&program, case.name), case);
+        }
+        for (name, shape, call) in [
+            ("direct_bound_bounds", Shape::Direct, direct),
+            ("aggregate_bound_bounds", Shape::Aggregate, aggregate),
+        ] {
+            inspect_bounds_trap(function(&program, name), shape, call);
+        }
+        for (name, shape, call, scope_cleanup) in [
+            ("direct_bound_exec", Shape::Direct, direct, 0),
+            ("direct_bound_exec_block", Shape::Direct, direct, 0),
+            ("direct_bound_exec_arena", Shape::Direct, direct, 1),
+            ("aggregate_bound_exec", Shape::Aggregate, aggregate, 0),
+            (
+                "aggregate_bound_exec_unsafe",
+                Shape::Aggregate,
+                aggregate,
+                0,
+            ),
+            (
+                "aggregate_bound_exec_task_group",
+                Shape::Aggregate,
+                aggregate,
+                2,
+            ),
+        ] {
+            inspect_process_exec_try(function(&program, name), shape, call, scope_cleanup);
+        }
+
+        let mut diagnostics = Diagnostics::new();
+        let dependency_source = "module dep\npub fn take(s: string, x: ()) {}\n";
+        let consumer_source = r#"
+module main
+import dep
+fn make() -> string = "x".clone()
+fn imported_fresh_return() -> i32 {
+  dep.take(make(), { return 0; () })
+  return 1
+}
+fn imported_fresh_success() -> i32 {
+  dep.take(make(), ())
+  return 1
+}
+fn main() -> i32 = 0
+"#;
+        let dependency_tokens = tokenize(0, dependency_source, &mut diagnostics);
+        let dependency = parse_file(dependency_tokens, &mut diagnostics);
+        let consumer_tokens = tokenize(1, consumer_source, &mut diagnostics);
+        let consumer = parse_file(consumer_tokens, &mut diagnostics);
+        let imported_hir = align_sema::check_program(
+            &[
+                align_sema::Module {
+                    path: "dep".to_owned(),
+                    file: &dependency,
+                    is_entry: false,
+                    interface_only: true,
+                },
+                align_sema::Module {
+                    path: "main".to_owned(),
+                    file: &consumer,
+                    is_entry: true,
+                    interface_only: false,
+                },
+            ],
+            &mut diagnostics,
+        );
+        assert!(
+            !diagnostics.has_errors(),
+            "imported staged-action fixture failed to check: {:?}",
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            imported_hir
+                .imported_fns
+                .iter()
+                .any(|function| function.name == "dep$take"),
+            "fixture must exercise a bodyless imported declaration"
+        );
+        let imported_program = lower_program_per_unit(&imported_hir);
+        for case in [
+            Case {
+                name: "imported_fresh_return",
+                shape: Shape::Direct,
+                first: First::Fresh,
+                completion: Completion::Return,
+                call: CallKind::Program("dep$take"),
+            },
+            Case {
+                name: "imported_fresh_success",
+                shape: Shape::Direct,
+                first: First::Fresh,
+                completion: Completion::Success,
+                call: CallKind::Program("dep$take"),
+            },
+        ] {
+            inspect(function(&imported_program, case.name), case);
+        }
+    }
+
+    #[test]
     fn task_group_tail_moves_clear_the_inner_source() {
         let p = lower(
             "fn make() -> string {\n  return task_group { s := \"hello\".clone(); s }\n}\nfn take(s: string) -> i64 = s.len()\nfn call() -> i64 = take(task_group { s := \"world\".clone(); s })\nfn main() -> i32 = 0\n",
         );
         for name in ["make", "call"] {
-            let f = p.fns.iter().find(|f| f.name.as_str() == name).expect("task_group move MIR");
+            let f = p
+                .fns
+                .iter()
+                .find(|f| f.name.as_str() == name)
+                .expect("task_group move MIR");
             let cleared_live_flag = f.slots.iter().enumerate().any(|(slot, ty)| {
                 *ty == Ty::Bool
                     && f.blocks
@@ -18027,7 +24052,6 @@ fn main() -> i32 = 0
                 print::function_to_string(f)
             );
         }
-
     }
 
     #[test]
@@ -18045,14 +24069,19 @@ fn main() -> i32 = 0
              }\n\
              fn main() -> i32 = mixed() as i32\n",
         );
-        let f = p.fns.iter().find(|f| f.name.as_str() == "mixed").expect("mixed match MIR");
+        let f = p
+            .fns
+            .iter()
+            .find(|f| f.name.as_str() == "mixed")
+            .expect("mixed match MIR");
         assert!(
-            f.blocks.iter().flat_map(|block| &block.stmts).any(
-                |stmt| matches!(
+            f.blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .any(|stmt| matches!(
                     stmt,
                     Stmt::Drop(slot) if matches!(f.slots[*slot as usize], Ty::Enum(_))
-                )
-            ),
+                )),
             "the wildcard arm must drop the hidden owner of the materialized Move enum:\n{}",
             print::function_to_string(f)
         );
@@ -18068,14 +24097,19 @@ fn main() -> i32 = 0
              }\n\
              fn main() -> i32 = wildcard() as i32\n",
         );
-        let f = p.fns.iter().find(|f| f.name.as_str() == "wildcard").expect("wildcard match MIR");
+        let f = p
+            .fns
+            .iter()
+            .find(|f| f.name.as_str() == "wildcard")
+            .expect("wildcard match MIR");
         assert!(
-            f.blocks.iter().flat_map(|block| &block.stmts).any(
-                |stmt| matches!(
+            f.blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .any(|stmt| matches!(
                     stmt,
                     Stmt::Drop(slot) if matches!(f.slots[*slot as usize], Ty::Option(_))
-                )
-            ),
+                )),
             "a lone wildcard must drop its fresh owned Option scrutinee:\n{}",
             print::function_to_string(f)
         );
@@ -18090,7 +24124,11 @@ fn main() -> i32 = 0
             ("partial", "direct struct let"),
             ("partial_array", "fixed Move-struct array let"),
         ] {
-            let partial = p.fns.iter().find(|f| f.name.as_str() == name).expect("partial aggregate MIR");
+            let partial = p
+                .fns
+                .iter()
+                .find(|f| f.name.as_str() == name)
+                .expect("partial aggregate MIR");
             assert!(
                 partial
                     .blocks
@@ -18102,7 +24140,11 @@ fn main() -> i32 = 0
             );
         }
 
-        let joined = p.fns.iter().find(|f| f.name.as_str() == "joined").expect("joined MIR");
+        let joined = p
+            .fns
+            .iter()
+            .find(|f| f.name.as_str() == "joined")
+            .expect("joined MIR");
         let forwards_runtime_flag = joined.blocks.iter().any(|block| {
             let stores_struct = block.stmts.iter().any(
                 |stmt| matches!(stmt, Stmt::Store(slot, Operand::Value(_)) if matches!(joined.slots[*slot as usize], Ty::Struct(_))),
@@ -18124,15 +24166,20 @@ fn main() -> i32 = 0
         let p = lower(
             "Wrap { xs: array<i64> }\nfn main() -> i32 {\n  return [Wrap { xs: [1, 2].to_array() }].count() as i32\n}\n",
         );
-        let main = p.fns.iter().find(|f| f.name.as_str() == "main").expect("main MIR");
+        let main = p
+            .fns
+            .iter()
+            .find(|f| f.name.as_str() == "main")
+            .expect("main MIR");
         assert!(
-            main.blocks.iter().flat_map(|block| &block.stmts).any(
-                |stmt| matches!(
+            main.blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .any(|stmt| matches!(
                     stmt,
                     Stmt::Drop(slot)
                         if matches!(main.slots[*slot as usize], Ty::StructArray(..))
-                )
-            ),
+                )),
             "an anonymous fixed Move-struct array source must be dropped after the pipeline:\n{}",
             print::function_to_string(main)
         );
@@ -18145,17 +24192,17 @@ fn main() -> i32 = 0
         );
 
         let assert_no_post_clear_reload = |name: &str, marker: &dyn Fn(&Stmt) -> bool| {
-            let f = p.fns.iter().find(|f| f.name.as_str() == name).expect("ownership test MIR");
+            let f = p
+                .fns
+                .iter()
+                .find(|f| f.name.as_str() == name)
+                .expect("ownership test MIR");
             let block = f
                 .blocks
                 .iter()
                 .find(|block| block.stmts.iter().any(marker))
                 .expect("marker block");
-            let marker_index = block
-                .stmts
-                .iter()
-                .position(marker)
-                .expect("marker");
+            let marker_index = block.stmts.iter().position(marker).expect("marker");
             let armed_index = block.stmts[..marker_index]
                 .iter()
                 .rposition(|stmt| {
@@ -18212,9 +24259,10 @@ fn main() -> i32 = 0
         assert_no_post_clear_reload("tupled", &|stmt| {
             matches!(stmt, Stmt::Let(_, Rvalue::MakeTuple { .. }))
         });
-        assert_no_post_clear_reload("structured", &|stmt| {
-            matches!(stmt, Stmt::Let(value, Rvalue::Load(_)) if p.fns.iter().find(|f| f.name.as_str() == "structured").is_some_and(|f| matches!(f.value_tys[*value as usize], Ty::Struct(_))))
-        });
+        assert_no_post_clear_reload(
+            "structured",
+            &|stmt| matches!(stmt, Stmt::Let(value, Rvalue::Load(_)) if p.fns.iter().find(|f| f.name.as_str() == "structured").is_some_and(|f| matches!(f.value_tys[*value as usize], Ty::Struct(_)))),
+        );
         assert_no_post_clear_reload("enumed", &|stmt| {
             matches!(stmt, Stmt::Let(_, Rvalue::MakeEnum { .. }))
         });
@@ -18222,7 +24270,11 @@ fn main() -> i32 = 0
             matches!(stmt, Stmt::Let(_, Rvalue::ResultIsOk(_)))
         });
 
-        let arena_exit = p.fns.iter().find(|f| f.name.as_str() == "arena_exit").expect("arena exit MIR");
+        let arena_exit = p
+            .fns
+            .iter()
+            .find(|f| f.name.as_str() == "arena_exit")
+            .expect("arena exit MIR");
         assert!(
             arena_exit.blocks.iter().any(|block| {
                 block.stmts.windows(2).any(|pair| {
@@ -18247,7 +24299,11 @@ fn main() -> i32 = 0
         let p = lower(
             "E { Bad }\nfn make() -> array<i64> = [1].to_array()\nfn load() -> Result<array<i64>, E> = Ok(make())\nfn convert(e: E) -> Error = Error.Code(1)\nfn early(c: bool) -> i32 {\n  mapped := load().map_err({\n    if c { return 0 }\n    convert\n  })\n  return 1\n}\nfn run(c: bool) -> Result<i64, Error> {\n  arena {\n    mut r: Result<array<i64>, E> := Ok(make())\n    if c {\n      r = Ok([2].to_array())\n    }\n    mapped := r.map_err(convert)\n    xs := mapped?\n    return Ok(xs.sum())\n  }\n}\nfn main() -> i32 = 0\n",
         );
-        let early = p.fns.iter().find(|f| f.name.as_str() == "early").expect("early MIR");
+        let early = p
+            .fns
+            .iter()
+            .find(|f| f.name.as_str() == "early")
+            .expect("early MIR");
         assert!(
             early
                 .blocks
@@ -18258,7 +24314,11 @@ fn main() -> i32 = 0
             print::function_to_string(early)
         );
 
-        let run = p.fns.iter().find(|f| f.name.as_str() == "run").expect("run MIR");
+        let run = p
+            .fns
+            .iter()
+            .find(|f| f.name.as_str() == "run")
+            .expect("run MIR");
         let stores_dynamic_result_flag = run.blocks.iter().any(|block| {
             block.stmts.windows(2).any(|pair| {
                 matches!(
@@ -18285,16 +24345,32 @@ fn main() -> i32 = 0
             "Content { Nums(array<i64>) }\nfn make() -> array<i64> = [1].to_array()\nfn take_tuple(t: (array<i64>, i64), x: ()) {}\nfn take_enum(e: Content, x: ()) {}\nfn take_mixed(t: (array<i64>, string), x: ()) {}\nfn tuple_exit() -> i32 {\n  take_tuple((make(), 0), { return 0 })\n  return 1\n}\nfn enum_exit() -> i32 {\n  take_enum(Content.Nums(make()), { return 0 })\n  return 1\n}\nfn mixed_exit() -> i32 {\n  take_mixed((make(), \"x\".clone()), { return 0 })\n  return 1\n}\nfn main() -> i32 = 0\n",
         );
         for (name, callee, owned_member_tys) in [
-            ("tuple_exit", "take_tuple", vec![Ty::DynArray(scalar_of(i64_ty()))]),
-            ("enum_exit", "take_enum", vec![Ty::DynArray(scalar_of(i64_ty()))]),
+            (
+                "tuple_exit",
+                "take_tuple",
+                vec![Ty::DynArray(scalar_of(i64_ty()))],
+            ),
+            (
+                "enum_exit",
+                "take_enum",
+                vec![Ty::DynArray(scalar_of(i64_ty()))],
+            ),
             (
                 "mixed_exit",
                 "take_mixed",
                 vec![Ty::DynArray(scalar_of(i64_ty())), Ty::String],
             ),
         ] {
-            let dynamic = p.fns.iter().find(|f| f.name.as_str() == name).expect("dynamic aggregate MIR");
-            let take = p.fns.iter().find(|f| f.name.as_str() == callee).expect("aggregate consumer MIR");
+            let dynamic = p
+                .fns
+                .iter()
+                .find(|f| f.name.as_str() == name)
+                .expect("dynamic aggregate MIR");
+            let take = p
+                .fns
+                .iter()
+                .find(|f| f.name.as_str() == callee)
+                .expect("aggregate consumer MIR");
             let aggregate_ty = take.slots[take.params[0] as usize];
             let has_aggregate_owner = dynamic.blocks.iter().any(|block| {
                 block.stmts.windows(2).any(|pair| {
@@ -18342,11 +24418,18 @@ fn main() -> i32 = 0
         let p = lower(
             "fn use(s: str) {}\nfn f() {\n  use(\"first\".clone())\n  use(\"second\".clone())\n}\nfn main() -> i32 = 0\n",
         );
-        let f = p.fns.iter().find(|f| f.name.as_str() == "f").expect("borrowed Unit call MIR");
+        let f = p
+            .fns
+            .iter()
+            .find(|f| f.name.as_str() == "f")
+            .expect("borrowed Unit call MIR");
         let rendered = print::function_to_string(f);
         let first_call = rendered.find("call program use").expect("first use call");
         let second_call = rendered.rfind("call program use").expect("second use call");
-        let first_drop = rendered[first_call..].find("drop ").map(|offset| first_call + offset).expect("first temporary drop");
+        let first_drop = rendered[first_call..]
+            .find("drop ")
+            .map(|offset| first_call + offset)
+            .expect("first temporary drop");
         assert!(
             first_call < first_drop && first_drop < second_call,
             "the first borrowed temporary must be released before the second Unit call:\n{rendered}"
@@ -18358,9 +24441,16 @@ fn main() -> i32 = 0
         let p = lower(
             "fn take() -> string {\n  s := \"x\".clone()\n  return s\n}\nfn main() -> i32 = take().len() as i32\n",
         );
-        let take = p.fns.iter().find(|f| f.name.as_str() == "take").expect("take MIR");
+        let take = p
+            .fns
+            .iter()
+            .find(|f| f.name.as_str() == "take")
+            .expect("take MIR");
         assert!(
-            take.blocks.iter().flat_map(|b| &b.stmts).all(|stmt| !matches!(stmt, Stmt::Drop(_))),
+            take.blocks
+                .iter()
+                .flat_map(|b| &b.stmts)
+                .all(|stmt| !matches!(stmt, Stmt::Drop(_))),
             "a definitely moved local must not retain a destructor edge:\n{}",
             print::function_to_string(take)
         );
@@ -18371,7 +24461,11 @@ fn main() -> i32 = 0
         let p = lower(
             "fn keep() -> i64 {\n  s := \"x\".clone()\n  return s.len()\n}\nfn main() -> i32 = keep() as i32\n",
         );
-        let keep = p.fns.iter().find(|f| f.name.as_str() == "keep").expect("keep MIR");
+        let keep = p
+            .fns
+            .iter()
+            .find(|f| f.name.as_str() == "keep")
+            .expect("keep MIR");
         assert_eq!(
             keep.blocks
                 .iter()
@@ -18395,7 +24489,13 @@ fn main() -> i32 = 0
         let f = &p.fns[0];
         let stmts: Vec<&Stmt> = f.blocks.iter().flat_map(|b| &b.stmts).collect();
         // Two field stores for the literal, two field loads for the reads.
-        assert_eq!(stmts.iter().filter(|s| matches!(s, Stmt::StoreField(..))).count(), 2);
+        assert_eq!(
+            stmts
+                .iter()
+                .filter(|s| matches!(s, Stmt::StoreField(..)))
+                .count(),
+            2
+        );
         assert_eq!(
             stmts
                 .iter()
@@ -18407,7 +24507,12 @@ fn main() -> i32 = 0
 
     /// Count, across every function (incl. lifted lambdas), how many statements match `pred`.
     fn count_stmts(p: &Program, pred: impl Fn(&Stmt) -> bool) -> usize {
-        p.fns.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.stmts).filter(|s| pred(s)).count()
+        p.fns
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.stmts)
+            .filter(|s| pred(s))
+            .count()
     }
 
     const BUILDER_WRITE_SRC: &str = "pub fn build() -> i64 {\n  b := builder()\n  b.write(\"item-\")\n  b.write_int(1)\n  b.write(\"-status \")\n  res := b.to_string()\n  return res.len()\n}\n";
@@ -18416,9 +24521,27 @@ fn main() -> i32 = 0
     fn builder_str_int_str_is_fused() {
         let p = lower(BUILDER_WRITE_SRC);
         // The `str,int,str` triple collapses to one fused write; the two component writes are gone.
-        assert_eq!(count_stmts(&p, |s| matches!(s, Stmt::Let(_, Rvalue::BuilderWriteStrIntStr(..)))), 1);
-        assert_eq!(count_stmts(&p, |s| matches!(s, Stmt::Let(_, Rvalue::BuilderWriteStr(..)))), 0);
-        assert_eq!(count_stmts(&p, |s| matches!(s, Stmt::Let(_, Rvalue::BuilderWriteInt(..)))), 0);
+        assert_eq!(
+            count_stmts(&p, |s| matches!(
+                s,
+                Stmt::Let(_, Rvalue::BuilderWriteStrIntStr(..))
+            )),
+            1
+        );
+        assert_eq!(
+            count_stmts(&p, |s| matches!(
+                s,
+                Stmt::Let(_, Rvalue::BuilderWriteStr(..))
+            )),
+            0
+        );
+        assert_eq!(
+            count_stmts(&p, |s| matches!(
+                s,
+                Stmt::Let(_, Rvalue::BuilderWriteInt(..))
+            )),
+            0
+        );
     }
 
     #[test]
@@ -18426,8 +24549,26 @@ fn main() -> i32 = 0
         // Wrong shape (`int,str,str`): the peephole only fuses `str,int,str`, so nothing collapses.
         let src = "pub fn build() -> i64 {\n  b := builder()\n  b.write_int(1)\n  b.write(\"-a-\")\n  b.write(\"-b-\")\n  res := b.to_string()\n  return res.len()\n}\n";
         let p = lower(src);
-        assert_eq!(count_stmts(&p, |s| matches!(s, Stmt::Let(_, Rvalue::BuilderWriteStrIntStr(..)))), 0);
-        assert_eq!(count_stmts(&p, |s| matches!(s, Stmt::Let(_, Rvalue::BuilderWriteInt(..)))), 1);
-        assert_eq!(count_stmts(&p, |s| matches!(s, Stmt::Let(_, Rvalue::BuilderWriteStr(..)))), 2);
+        assert_eq!(
+            count_stmts(&p, |s| matches!(
+                s,
+                Stmt::Let(_, Rvalue::BuilderWriteStrIntStr(..))
+            )),
+            0
+        );
+        assert_eq!(
+            count_stmts(&p, |s| matches!(
+                s,
+                Stmt::Let(_, Rvalue::BuilderWriteInt(..))
+            )),
+            1
+        );
+        assert_eq!(
+            count_stmts(&p, |s| matches!(
+                s,
+                Stmt::Let(_, Rvalue::BuilderWriteStr(..))
+            )),
+            2
+        );
     }
 }
