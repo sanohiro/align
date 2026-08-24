@@ -17349,10 +17349,11 @@ impl<'a> EscapeCheck<'a> {
                 ExprKind::JsonDecodeSoa { input, .. } => self.completed_escape_value(input),
                 _ => EscapeValueFact::default(),
             },
-            StorageContentInitializer::CloneIn => match &expression.kind {
-                ExprKind::CloneIn { value, .. } => self.completed_escape_value(value),
-                _ => EscapeValueFact::default(),
-            },
+            // `clone_in` recursively copies every view-bearing leaf into the named destination.
+            // Its fresh header/content therefore retain only that destination region, which the
+            // completion snapshot and generation directory already record; carrying the source
+            // value here would falsely keep a frame-local input alive through the explicit copy.
+            StorageContentInitializer::CloneIn => EscapeValueFact::default(),
             StorageContentInitializer::JsonDecoded => match &expression.kind {
                 ExprKind::JsonDecode { input, .. }
                 | ExprKind::JsonOwnedDecode { input, .. }
@@ -18891,6 +18892,11 @@ impl<'a> EscapeCheck<'a> {
                         ExprKind::RawCall { args, return_region, .. } => values.push(
                             !Self::return_region_selects_explicit_region(return_region, args),
                         ),
+                        // A dependent resource retains its parent's lifetime, but its own raw
+                        // handle still has an independent Drop hook. Borrow provenance must not
+                        // turn that cleanup bit off merely because `from_raw_borrowed` names a
+                        // frame-local parent.
+                        ExprKind::ResourceFromRaw { .. } => values.push(true),
                         ExprKind::OptionSome(inner)
                         | ExprKind::ResultOk(inner)
                         | ExprKind::ResultErr(inner)
@@ -19120,6 +19126,7 @@ impl<'a> EscapeCheck<'a> {
                         ExprKind::Call { .. }
                         | ExprKind::CallFnValue { .. }
                         | ExprKind::RawCall { .. } => values.push(true),
+                        ExprKind::ResourceFromRaw { .. } => values.push(true),
                         ExprKind::OptionSome(inner)
                         | ExprKind::ResultOk(inner)
                         | ExprKind::ResultErr(inner)
@@ -22055,6 +22062,16 @@ impl<'a> EscapeCheck<'a> {
             // local is only the linear header, so applying the ordinary local declaration cap
             // would turn a caller-region builder into false frame-local storage at every helper
             // call that retains its existing contents.
+            return value_region;
+        }
+        if matches!(argument.kind, ExprKind::CloneIn { .. })
+            || matches!(argument.kind, ExprKind::ArrayBuilderBuild(_))
+                && value_region.is_region_owned()
+        {
+            // These allocations have no frame-owned hidden release: `clone_in` always copies into
+            // its explicit capability, and a region builder freezes the same caller/arena chunks.
+            // Applying the generic unbound-expression frame cap would erase that destination and
+            // immediately reject the explicit copy at its first aggregate store.
             return value_region;
         }
         if self.indexed_backing_type(argument.ty) {
@@ -26839,17 +26856,6 @@ impl BorrowFact {
             .collect()
     }
 
-    fn local_storage_sources(&self) -> BorrowRoots {
-        self.flatten()
-            .into_iter()
-            .filter_map(|root| {
-                let source = root.ended_source().map_or(root, |(source, _)| source);
-                matches!(source, BorrowRoot::Local(_) | BorrowRoot::IterTemp(_))
-                    .then_some(source)
-            })
-            .collect()
-    }
-
     fn without_root_sources(mut self, excluded: &BorrowRoots) -> Self {
         let retain = |root: &BorrowRoot| {
             !excluded.contains(root)
@@ -29396,6 +29402,28 @@ impl<'a> MoveCheck<'a> {
             .iter()
             .map(|argument| self.completed_storage_fact(argument))
             .collect::<Vec<_>>();
+        // An exclusive borrow conflicts with a live dependent even when the callee's summary
+        // proves that it does not replace the value. Such a no-mutation summary suppresses the
+        // generation advance below, but it cannot weaken the source-level exclusivity contract.
+        let exclusive_roots = modes
+            .iter()
+            .enumerate()
+            .filter(|(_, mode)| **mode == ast::ParamMode::BorrowMut)
+            .filter_map(|(index, _)| {
+                args.get(index).map(|argument| {
+                    (
+                        argument.span,
+                        self.completed_borrow_mut_invalidation_roots(
+                            argument,
+                            &storage_argument_facts[index],
+                        ),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        for (span, roots) in exclusive_roots {
+            self.reject_live_resource_dependents_of_roots(&roots, moved, span);
+        }
         let mut header_argument_facts = args
             .iter()
             .map(|argument| self.completed_headers(argument))
@@ -29743,13 +29771,6 @@ impl<'a> MoveCheck<'a> {
             self.borrows.headers.insert(place.root, destination);
         }
 
-        for (index, mode, roots, _, _, _, _, _) in &destinations {
-            if *mode == ast::ParamMode::BorrowMut
-                && let Some(argument) = args.get(*index)
-            {
-                self.reject_live_resource_dependents_of_roots(roots, moved, argument.span);
-            }
-        }
         for (index, mode, _, _, _, _, _, _) in &destinations {
             if *mode == ast::ParamMode::BorrowMut
                 && let Some(argument) = args.get(*index)
@@ -32142,6 +32163,7 @@ impl<'a> MoveCheck<'a> {
                     self.completed_value_fact(argument)
                 };
                 if !borrowed
+                    && self.is_move_ty(argument.ty)
                     && signature.is_some_and(|signature| {
                         ty_is_move(
                             signature.ret,
@@ -32157,11 +32179,10 @@ impl<'a> MoveCheck<'a> {
                             self.tagged_types,
                         )
                     })
+                    && let Some(source) = self.direct_storage_move_source(argument)
                 {
                     fact = fact.without_root_sources(
-                        &self
-                            .completed_storage_fact(argument)
-                            .local_storage_sources(),
+                        &[BorrowRoot::Local(source)].into_iter().collect(),
                     );
                 }
                 (argument.ty, fact)
@@ -32636,15 +32657,10 @@ impl<'a> MoveCheck<'a> {
                     self.tuples,
                     self.enums,
                     self.tagged_types,
-                ) {
-                    let storage = self.normalize_borrow_fact(
-                        result.ty,
-                        self.completed_storage_fact(result),
-                    );
+                ) && let Some(source) = self.direct_storage_move_source(result)
+                {
                     input_error = input_error.without_root_sources(
-                        &storage
-                            .project_exact(BorrowProjection::ResultErr)
-                            .local_storage_sources(),
+                        &[BorrowRoot::Local(source)].into_iter().collect(),
                     );
                 }
                 let mapped_error = if selects_err {
@@ -32811,23 +32827,29 @@ impl<'a> MoveCheck<'a> {
                     roots.extend(self.completed_storage_fact(value).flatten());
                 } else {
                     let mut fact = self.completed_value_fact(value);
-                    if ty_is_move(
-                        result_ty,
-                        self.structs,
-                        self.tuples,
-                        self.enums,
-                        self.tagged_types,
-                    ) && ty_mentions_resource(
-                        result_ty,
-                        self.structs,
-                        self.tuples,
-                        self.enums,
-                        self.tagged_types,
-                    ) {
+                    // Only an owned argument transfers its local storage away. A Copy
+                    // `resource_ref` names a resource owner without consuming it, so stripping
+                    // that local here would lose the dependent result's lifetime and Drop
+                    // ordering provenance.
+                    if self.is_move_ty(value.ty)
+                        && ty_is_move(
+                            result_ty,
+                            self.structs,
+                            self.tuples,
+                            self.enums,
+                            self.tagged_types,
+                        )
+                        && ty_mentions_resource(
+                            result_ty,
+                            self.structs,
+                            self.tuples,
+                            self.enums,
+                            self.tagged_types,
+                        )
+                        && let Some(source) = self.direct_storage_move_source(value)
+                    {
                         fact = fact.without_root_sources(
-                            &self
-                                .completed_storage_fact(value)
-                                .local_storage_sources(),
+                            &[BorrowRoot::Local(source)].into_iter().collect(),
                         );
                     }
                     roots.extend(fact.flatten());
@@ -35923,6 +35945,18 @@ impl<'a> MoveCheck<'a> {
                             }
                         }
                     }
+                    // Freeze the result before its own ownership action consumes or transfers an
+                    // exact child. A later sibling must still invalidate this completion, but the
+                    // constructor itself is not a later eager operand. Mutable-call completions
+                    // are published after their action from `pending_call_completions`, so this
+                    // pre-action fallback does not erase a callee-installed replacement.
+                    let completion_fact = (falls_through && completion_snapshot).then(|| {
+                        if value_snapshot {
+                            self.borrow_fact(expression)
+                        } else {
+                            BorrowFact::default()
+                        }
+                    });
                     if falls_through {
                         self.finish_eager_move_action(
                             expression,
@@ -35933,11 +35967,7 @@ impl<'a> MoveCheck<'a> {
                     if !falls_through {
                         self.non_fallthrough.insert(expression.span);
                     } else if completion_snapshot {
-                        let fact = if value_snapshot {
-                            self.borrow_fact(expression)
-                        } else {
-                            BorrowFact::default()
-                        };
+                        let fact = completion_fact.expect("fallthrough completion fact");
                         self.record_value_completion(expression, fact);
                         if value_snapshot {
                             self.record_parent_value_snapshot(key);
@@ -65622,6 +65652,35 @@ fn main() -> i32 = 0
     }
 
     #[test]
+    fn result_constructor_transfers_its_resource_payload_without_self_invalidation() {
+        let internal = concat!(
+            "module pkg.resource.internal\n",
+            "pub fn drop_handle(value: raw) { unsafe { raw.free(value) } }\n",
+        );
+        let package = concat!(
+            "module pkg.resource\n",
+            "import pkg.resource.internal\n",
+            "pub Failure { Invalid }\n",
+            "pub resource Handle = pkg.resource.internal.drop_handle\n",
+            "pub fn open() -> Result<Handle, Failure> {\n",
+            "  unsafe {\n",
+            "    owner: Handle := resource.from_raw(raw.alloc(8))\n",
+            "    return Ok(owner)\n",
+            "  }\n",
+            "}\n",
+        );
+        let (_, diagnostics) = check_modules(&[
+            ("pkg.resource.internal", internal, false),
+            ("pkg.resource", package, true),
+        ]);
+        assert!(
+            !diagnostics.has_errors(),
+            "an aggregate's own resource transfer must not look like later eager invalidation: {:?}",
+            diagnostics.iter().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn static_descriptors_use_resolved_constructor_identity_and_canonical_item_ids() {
         let common = concat!(
             "module pkg.db\n",
@@ -69193,6 +69252,17 @@ fn exit_branch(flag: bool) -> i64 {
         assert!(
             !diagnostics.has_errors(),
             "a free-standing Move call result must retain legal by-value transfer"
+        );
+    }
+
+    #[test]
+    fn nested_clone_in_value_retains_only_the_destination_region() {
+        let source = "ByteView { bytes: slice<u8> }\nValue { Bytes(ByteView) }\nfn copy(view: slice<u8>, out: region) -> array<Value> {\n  mut values: array_builder<Value> := array_builder(out)\n  values.push(Value.Bytes(ByteView { bytes: view.clone_in(out) }))\n  return values.build()\n}\nfn main() -> i32 = 0\n";
+        let (_, diagnostics) = check(source);
+        assert!(
+            !diagnostics.has_errors(),
+            "clone_in recursively severs a nested view's source provenance: {:?}",
+            diagnostics.iter().collect::<Vec<_>>()
         );
     }
 
