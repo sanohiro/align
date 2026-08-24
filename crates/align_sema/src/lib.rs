@@ -33977,10 +33977,25 @@ impl<'a> MoveCheck<'a> {
         moved: &MovedSet,
         span: Span,
     ) {
+        self.reject_live_resource_dependents_of_root(
+            BorrowRoot::Local(owner),
+            owner,
+            moved,
+            span,
+        );
+    }
+
+    fn reject_live_resource_dependents_of_root(
+        &mut self,
+        root: BorrowRoot,
+        owner: LocalId,
+        moved: &MovedSet,
+        span: Span,
+    ) -> bool {
         let dependent = self.borrows.sources.iter().find_map(|(&borrower, roots)| {
             (borrower != owner
                 && !whole_moved(moved, borrower)
-                && roots.contains(&BorrowRoot::Local(owner))
+                && roots.contains(&root)
                 && self.f.locals.get(borrower as usize).is_some_and(|local| {
                     ty_mentions_resource(
                         local.ty,
@@ -34009,6 +34024,9 @@ impl<'a> MoveCheck<'a> {
                 ),
                 span,
             );
+            true
+        } else {
+            false
         }
     }
 
@@ -34018,9 +34036,22 @@ impl<'a> MoveCheck<'a> {
         moved: &MovedSet,
         span: Span,
     ) {
-        for root in roots {
-            if let BorrowRoot::Local(owner) = root {
-                self.reject_live_resource_dependents(*owner, moved, span);
+        for &root in roots {
+            let owner = match root {
+                BorrowRoot::Local(owner) => Some(owner),
+                BorrowRoot::Param(position) | BorrowRoot::ParamStorage(position) => {
+                    self.f.params.get(position as usize).copied()
+                }
+                BorrowRoot::IterTemp(_)
+                | BorrowRoot::EndedLocal(..)
+                | BorrowRoot::EndedIterTemp(..)
+                | BorrowRoot::EndedParam(..)
+                | BorrowRoot::EndedParamStorage(..) => None,
+            };
+            if let Some(owner) = owner
+                && self.reject_live_resource_dependents_of_root(root, owner, moved, span)
+            {
+                break;
             }
         }
     }
