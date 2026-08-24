@@ -34314,7 +34314,7 @@ impl<'a> MoveCheck<'a> {
             | BorrowRoot::EndedParam(..)
             | BorrowRoot::EndedParamStorage(..) => false,
         };
-        state.mark_matching_roots_ended(BorrowEnd::Dropped, &ended);
+        state.mark_matching_roots_ended(BorrowEnd::Dropped, ended);
         for &local in drops {
             state.end_local_releases(local, BorrowEnd::Dropped);
         }
